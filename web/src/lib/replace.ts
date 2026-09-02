@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, isCharacterWrapper, liftMarkerText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 
@@ -1911,7 +1911,13 @@ function reconcileMarkers(content: unknown, newPlain: string): SmartReplaceResul
   // Character wrappers (`\qs Selah\qs*`) are `type:"quote"` too, so
   // isInFlowMarker matches them — but they hold aligned content, not a line
   // break; keep them as content nodes or their wrapped word is dropped.
-  const contentNodes = cloned.filter((n) => !isInFlowMarker(n) || isCharacterWrapper(n));
+  // `\qa` acrostic headings are `type:"quote"` as well, and are NOT in
+  // MARKER_TOKEN_RE (they never enter the editable text) — so if they were
+  // dropped here they would never be rebuilt and the heading would be lost.
+  // Keep them as content nodes; their label rides along on `content` (#708).
+  const contentNodes = cloned.filter(
+    (n) => !isInFlowMarker(n) || isCharacterWrapper(n) || isAcrosticHeading(n),
+  );
 
   const countWords = (s: string): number => [...s.matchAll(WORD_RUN_RE)].length;
 

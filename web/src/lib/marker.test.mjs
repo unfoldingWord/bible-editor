@@ -8,9 +8,18 @@
 //
 // Not a test framework; failures exit non-zero. Mirrors src/lib/replace.test.mjs.
 
-import { PARAGRAPH_TAGS, isInFlowMarker, extractEditableText } from "./usfm.ts";
-import { tokenizeEditableText } from "./replace.ts";
+import {
+  PARAGRAPH_TAGS,
+  ACROSTIC_HEADING_TAGS,
+  isInFlowMarker,
+  isAcrosticHeading,
+  extractEditableText,
+  extractTrailingMarkers,
+  liftMarkerText,
+} from "./usfm.ts";
+import { tokenizeEditableText, smartEditVerse } from "./replace.ts";
 import { paragraphClass } from "./highlight.ts";
+import { renderHighlightedHTML, renderEditableHTML } from "./highlight.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -87,6 +96,68 @@ assert(paragraphClass("pmr").wrapper === "be-para be-pmr", "\\pmr → be-para be
 assert(paragraphClass("pr").wrapper === "be-para be-pr", "\\pr → be-para be-pr");
 assert(paragraphClass("cls").wrapper === "be-para be-pr", "\\cls → be-para be-pr");
 assert(paragraphClass("po").wrapper === "be-para be-p", "\\po → default paragraph (be-para be-p)");
+
+// ── 6. \qa acrostic headings (#708). usfm-js parses `\qa Aleph` as
+//       {tag:"qa", type:"quote", text:"Aleph"} — same type as a `\q1` poetry
+//       LINE, but its text is a heading LABEL. It must round-trip intact while
+//       NEVER becoming a draggable `\w` word, and must NOT be a canonical
+//       paragraph tag (its text is not alignable verse body).
+assert(!PARAGRAPH_TAGS.has("qa"), "\\qa is NOT in PARAGRAPH_TAGS (its label is not alignable body)");
+assert(ACROSTIC_HEADING_TAGS.has("qa") && isAcrosticHeading({ tag: "qa", type: "quote" }), "isAcrosticHeading recognizes \\qa");
+
+// liftMarkerText moves the label from `text` to `content` (invisible to the
+// word/diff walkers — the shape that keeps it out of the alignable stream),
+// keeping `type:"quote"` so the heading still drifts.
+{
+  const lifted = liftMarkerText([{ tag: "qa", type: "quote", text: "Aleph\n" }]);
+  assert(lifted.length === 1, "\\qa lift does NOT split its label into a sibling text node");
+  assert(lifted[0].content === "Aleph" && lifted[0].text === undefined, "\\qa label moves text → content on lift");
+  assert(lifted[0].type === "quote", "\\qa keeps type:quote after lift (still drifts)");
+}
+
+// The edit baseline skips the heading entirely: neither `\qa` nor its label
+// enters the editable text, so tokenizing that baseline yields no qa/Aleph word.
+const qaVerse = [
+  { tag: "qa", type: "quote", text: "Aleph\n" },
+  { tag: "q1", type: "quote", text: "" },
+  { type: "text", text: "Blessed are those\n" },
+];
+const qaEditable = extractEditableText(qaVerse);
+assert(!/qa|Aleph/.test(qaEditable), `\\qa + label absent from edit baseline (got: ${JSON.stringify(qaEditable)})`);
+const qaTokens = tokenizeEditableText(qaEditable);
+assert(
+  !qaTokens.some((n) => isWordNode(n) && (n.text === "qa" || n.text === "Aleph")),
+  "neither \\qa nor its \"Aleph\" label is minted as a draggable \\w word (#708)",
+);
+
+// Rendering: the READ view shows the heading label; the EDITABLE render omits
+// it (so the contenteditable capture — plain textContent — can't carry it).
+const qaDisplay = renderHighlightedHTML(qaVerse, new Set());
+const qaEdit = renderEditableHTML(qaVerse, new Set());
+assert(/be-qa"[^>]*>Aleph/.test(qaDisplay), "read view renders \\qa as a be-qa heading label");
+assert(!/Aleph/.test(qaEdit), "editable render OMITS the \\qa label (kept out of the DOM capture)");
+
+// Round-trip: a real body edit (Blessed → Happy) preserves the `\qa` heading and
+// its label, aligns the edited word, and never resurrects qa/Aleph as words.
+{
+  const res = smartEditVerse({ verseObjects: qaVerse }, qaEditable, qaEditable.replace("Blessed", "Happy"), {
+    capturedFromDom: true,
+  });
+  const vo = res.content.verseObjects;
+  const qa = vo.find((n) => n.tag === "qa");
+  assert(!!qa && (qa.content === "Aleph" || qa.text === "Aleph\n"), "\\qa heading + label survive a real edit round-trip");
+  assert(vo.some((n) => isWordNode(n) && n.text === "Happy"), "the edited word aligns");
+  assert(!vo.some((n) => isWordNode(n) && (n.text === "qa" || n.text === "Aleph")), "no qa/Aleph draggable word after save");
+}
+
+// The heading still DRIFTS to the verse it introduces (usfm-js attaches a
+// stanza-opening `\qa Beth` to the previous verse's trailing objects).
+assert(
+  extractTrailingMarkers([{ type: "text", text: "x\n" }, { tag: "qa", type: "quote", text: "Beth\n" }]).some(
+    (n) => n.tag === "qa",
+  ),
+  "\\qa drifts as a trailing marker to the verse it heads",
+);
 
 if (failed) {
   console.error(`\n${failed} assertion(s) FAILED`);

@@ -63,17 +63,44 @@ export function extractPlainText(verseObjects: unknown): string {
 // Coverage note: the `\p`-family embedded/margin/letter markers below are
 // the ones present in production ULT/UST (`\pm`, `\pmo`, `\pmc`) plus
 // their USFM 3.1 siblings (`\pmr`, `\po`, `\pr`, `\cls`), all of which
-// usfm-js parses as `type:"paragraph"` exactly like `\p`. Markers still
-// NOT covered (each needs its own handling — see #702 followups): `\qa`
-// acrostic headings (a heading LABEL, not verse body), the list family
-// `\li*`/`\lh`/`\lf`/`\lim*` (usfm-js gives them no `type` field), and
-// `\qr`/`\qc`/`\qd` poetry variants not seen in the current corpus.
+// usfm-js parses as `type:"paragraph"` exactly like `\p`. `\qa` acrostic
+// headings are handled OUT of this set (see isAcrosticHeading, #708): their
+// text is a heading LABEL, not alignable verse body, so they must never be
+// tokenized as `\w` words. Markers still NOT covered (each needs its own
+// handling — see #702 followups): the list family `\li*`/`\lh`/`\lf`/`\lim*`
+// (usfm-js gives them no `type` field, #709) and `\qr`/`\qc`/`\qd` poetry
+// variants not seen in the current corpus.
 export const PARAGRAPH_TAGS: ReadonlySet<string> = new Set([
   "p", "m", "mi", "nb", "pi", "pi1", "pi2", "pi3", "pc",
   "pm", "pmo", "pmc", "pmr", "po", "pr", "cls",
   "q", "q1", "q2", "q3", "q4", "qm", "qm1", "qm2", "qm3",
   "b",
 ]);
+
+// Acrostic heading markers. `\qa` labels the stanzas of an acrostic poem with
+// the Hebrew letter that begins them (Psalm 119's Aleph/Beth/…, the acrostics
+// of Lamentations). usfm-js parses `\qa Aleph` as `{type:"quote", tag:"qa",
+// text:"Aleph"}` — same `type:"quote"` as a `\q1` poetry LINE, which is why
+// isInFlowMarker matches it and it DRIFTS to the verse it introduces like any
+// line marker (that behaviour is kept). But its text is a heading LABEL, not
+// verse body: it must never be surfaced as editable text or minted into a
+// draggable `\w` word (the #702 failure, but here the payload is a label — see
+// #708). So `\qa` is deliberately OUT of PARAGRAPH_TAGS / LINE_TEXT_MARKER_TAGS
+// / MARKER_TOKEN_RE, and instead handled as a heading: liftMarkerText moves its
+// label to `content` (invisible to the word/diff walkers, exactly as `\s1`
+// section text lives in `content`), extractEditableText skips it, reconcileMarkers
+// keeps it as a content node, and the renderer draws it as a heading band.
+export const ACROSTIC_HEADING_TAGS: ReadonlySet<string> = new Set(["qa"]);
+
+// True iff `node` is a `\qa` acrostic heading. Tag-based (not type-based) so it
+// matches both the raw usfm-js shape (`type:"quote"`, label on `text`) and our
+// normalized shape (label moved to `content` by liftMarkerText).
+export function isAcrosticHeading(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  const tag = o["tag"];
+  return typeof tag === "string" && ACROSTIC_HEADING_TAGS.has(tag);
+}
 
 // Section heading tags that are translator-supplied and NOT alignable to
 // source words. Rendered as separate header bands above the verse body.
@@ -221,6 +248,24 @@ export function liftMarkerText(verseObjects: unknown[]): unknown[] {
   const out: unknown[] = [];
   for (const node of verseObjects) {
     const o = node as Record<string, unknown> | null;
+    // A `\qa` acrostic heading (`\qa Aleph`) is `type:"quote"` too, so
+    // isInFlowMarker matches it — but its `text` is a heading LABEL, not verse
+    // body. Move that label to `content` (mirroring how `\s1` section text
+    // lives in `content`) so it is INVISIBLE to the word/diff walkers that read
+    // `text` only (walkLeaves / rebuildRaw / extractPlainText) — the label can
+    // then never be minted into a draggable `\w` word on the edit round-trip
+    // (#708). Keep `type:"quote"` so the heading still drifts to the verse it
+    // introduces. Idempotent: a node already carrying its label on `content`
+    // (post-save, or a second lift) is passed through untouched.
+    if (o && isAcrosticHeading(o)) {
+      if (typeof o["text"] === "string" && o["text"] !== "") {
+        const { text, ...rest } = o;
+        out.push({ ...rest, content: String(text).replace(/\n+$/, "") });
+      } else {
+        out.push(node);
+      }
+      continue;
+    }
     // A character wrapper (`\qs Selah\qs*`) is `type:"quote"` so isInFlowMarker
     // matches it, but its `text` is CONTENT held between `\qs … \qs*`, not a
     // quote parked on a line marker. Lifting it would move the word OUTSIDE the
@@ -375,6 +420,13 @@ export function extractEditableText(verseObjects: unknown): string {
     for (const vo of vos ?? []) {
       if (!vo || typeof vo !== "object") continue;
       const v = vo as Record<string, unknown>;
+      // `\qa` acrostic headings are heading LABELS, not editable verse text.
+      // Skip them entirely (like the `\s*` section headers below) so neither the
+      // `\qa` marker nor its "Aleph"/"Beth" label enters the edit baseline — and
+      // so it stays consistent with the editable render, which draws the heading
+      // OUTSIDE the captured contenteditable text. The heading survives the save
+      // because reconcileMarkers keeps it as a content node (#708).
+      if (isAcrosticHeading(v)) continue;
       // Character-style wrappers (`\qs Selah\qs*`) are also `type:"quote"`, so
       // isInFlowMarker matches them — but they hold aligned verse CONTENT, not a
       // line break. Fall through to the generic text/children recursion below so

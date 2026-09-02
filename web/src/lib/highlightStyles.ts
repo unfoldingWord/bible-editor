@@ -101,6 +101,19 @@ function paragraphLayoutSx(mode: Mode) {
       fontSize: "0.95em",
       color: mode === "dark" ? "#bfd5e0" : "#345e74",
     },
+    // \qa acrostic heading (Psalm 119 / Lamentations stanza letters). A small,
+    // quiet heading label sitting above the poetry line it introduces — not a
+    // section band (those are translator-supplied prose headings), just the
+    // acrostic letter. Muted + letter-spaced so it reads as a label, not verse
+    // text; only ever rendered in the read views (#708).
+    "& .be-qa": {
+      fontSize: "0.8em",
+      fontWeight: 600,
+      letterSpacing: "0.08em",
+      textTransform: "uppercase",
+      color: mode === "dark" ? "#9fb6c2" : "#5b7a8a",
+      marginTop: "0.35em",
+    },
     "& span.be-tok": {
       display: "inline-block",
       padding: "0 4px",
