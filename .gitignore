@@ -43,3 +43,7 @@ scratch/
 # affects untracked files.
 *.usfm
 reports/
+
+# Local-only agent state: in-flight worktree status notes (see CLAUDE.md)
+# and the harness's own per-agent worktree checkouts. Never part of history.
+.claude/
