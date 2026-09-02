@@ -151,6 +151,10 @@ interface Props {
   onWordCreate: () => void;
   onWordFocus: (row: TwlRow) => void;
   onWordReorder: (draggedId: string, refId: string, position: WordDropPosition) => void;
+  // Retarget a word link to another verse of the current bridge (the Words
+  // table's "change reference" dropdown). Mirrors onNoteChangeVerse; the twl
+  // variant never spans, so it takes no verseEnd.
+  onWordChangeVerse?: (id: string, verse: number) => void;
   onQuestionSave: (
     id: string,
     patch: Partial<TqRow>,
@@ -364,6 +368,7 @@ export function ResourceColumn({
   onWordCreate,
   onWordFocus,
   onWordReorder,
+  onWordChangeVerse,
   onQuestionSave,
   onQuestionDelete,
   onQuestionCreate,
@@ -444,6 +449,18 @@ export function ResourceColumn({
     () => new Set(twlOrderLocks.map((l) => l.verse)),
     [twlOrderLocks],
   );
+  // Verses the current display bridge spans — the options for the Words "change
+  // reference" dropdown. A singleton verse yields [] so the picker stays hidden
+  // (no clutter on the dense word rows); only a real range surfaces it. The
+  // inclusive integer window matches how displayVerseRange is built (a
+  // contiguous span around the active verse). Memoized so WordsTable's compare
+  // sees a stable ref except when the bridge actually changes.
+  const twlBridgeVerses = useMemo(() => {
+    if (rangeEnd <= rangeStart) return [] as number[];
+    const out: number[] = [];
+    for (let v = rangeStart; v <= rangeEnd; v++) if (v > 0) out.push(v);
+    return out;
+  }, [rangeStart, rangeEnd]);
   // When a UST verse bridge widens the range to span multiple verses (e.g. ISA
   // 33:15-16, UST row verse=15/verse_end=16 while UHB/ULT keep them separate),
   // the union must render grouped by verse — all of v15 then all of v16 — not
@@ -985,7 +1002,7 @@ export function ResourceColumn({
                 ))
               )
             ) : (
-              renderTwlWords(activeVerse, twlForVerse)
+              renderTwlWords(activeVerse, twlForVerse, twlBridgeVerses)
             )}
             {/* Per-verse suggestions — only in the active-verse (unpinned) view.
                 refreshKey is the verse's current link set so adding/removing a
@@ -1156,7 +1173,7 @@ export function ResourceColumn({
   // The order-header + (optionally greyed) WordsTable for one verse — shared
   // by the pinned (chapter-wide) and unpinned (active-verse) Words renders,
   // which differ only in which verse/rows they pass in.
-  function renderTwlWords(verse: number, rows: TwlRow[]) {
+  function renderTwlWords(verse: number, rows: TwlRow[], bridgeVerses: number[] = []) {
     const previewing = previewTwlVerses.has(verse);
     const shownRows = previewing ? (automaticTwlByLockedVerse.get(verse) ?? rows) : rows;
     return (
@@ -1197,6 +1214,8 @@ export function ResourceColumn({
             activeQuoteBuildId={quoteBuildActiveWordId}
             quoteBuildSelectionCount={quoteBuildSelectionCount}
             onStartQuoteBuild={onStartWordQuoteBuild}
+            verseOptions={bridgeVerses}
+            onChangeVerse={onWordChangeVerse}
           />
         </Box>
       </>

@@ -3695,6 +3695,35 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveNoteId(null);
             setActiveQuestionId(null);
           }}
+          onWordChangeVerse={(id, verse) => {
+            // Retarget a word link to another verse of the current bridge — the
+            // Words "change reference" dropdown, mirroring onNoteChangeVerse. A
+            // twl never spans, so ref_raw is always a single verse. Read the live
+            // row (dataRef, not the render closure) so a rapid move carries the
+            // current version; recompute ref_raw + a fresh sort_order (end of the
+            // target verse) so the link lands in order there. `verse` is sent
+            // explicitly (TwlPatch keeps it authoritative) so grouping moves with
+            // the ref instead of waiting on the server to re-derive it.
+            const twl = dataRef.current?.twl ?? [];
+            const row = twl.find((r) => r.id === id);
+            if (!row) return;
+            const ref_raw =
+              chapter === 0
+                ? "front:intro"
+                : verse === 0
+                  ? `${chapter}:intro`
+                  : `${chapter}:${verse}`;
+            const effectiveVerse = chapter === 0 ? 0 : verse;
+            if (row.verse === effectiveVerse && row.ref_raw === ref_raw) return;
+            const sort_order = pickSortOrder(sortedForVerse(twl, effectiveVerse), null, "after");
+            enqueueRow("twl", row, { verse: effectiveVerse, ref_raw, sort_order });
+            // Follow the link to its new verse so it stays selected and the
+            // per-verse suggestions/exclusions realign to where it now lives.
+            setActiveVerse(effectiveVerse);
+            setActiveWordId(id);
+            setActiveNoteId(null);
+            setActiveQuestionId(null);
+          }}
           onWordReorder={async (draggedId, refId, position) => {
             // See onNoteReorder: live ref list, not the stale render closure.
             const twl = dataRef.current?.twl ?? [];

@@ -139,6 +139,12 @@ const TqPatch = z.object({
 
 const TwlPatch = z.object({
   ref_raw: z.string().optional(),
+  // Retarget a word link to a different verse — the "change reference" dropdown
+  // in the Words table, mirroring TnPatch. Sent alongside a recomputed ref_raw +
+  // sort_order; kept authoritative (never re-derived from ref_raw) so a move
+  // lands on exactly the chosen verse. Needed for verse bridges, where a link
+  // scanned/added under the leading verse actually belongs to a later one.
+  verse: z.number().int().nonnegative().optional(),
   tags: z.string().nullable().optional(),
   orig_words: z.string().nullable().optional(),
   occurrence: z.number().int().nullable().optional(),
