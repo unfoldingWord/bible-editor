@@ -6823,29 +6823,57 @@ async function accountOwnPublishDecline(
   sync: ResourceSyncState,
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
-  const prior = sync.declines ?? 0;
   try {
     if (!sync.pushedBlobSha) return; // content_differs implies a pushed render; defensive only
-    // The export PR opened for THE render pushed_blob_sha describes, stamped by
-    // the export onto the same row and guarded on that render's read time
-    // (exportWorkflow.ts recordPushedPr; migration 0061). NULL means the current
-    // push has no PR on record — creation failed, or it predates the column —
-    // and then there is no merge to look for. Not derived from export_snapshots
-    // by time: two overlapping exports can record their snapshots out of order,
-    // and the newest row after the read could be the OTHER export's PR (Codex
-    // verify pass on PR #704).
-    const pr = await env.DB.prepare(
-      `SELECT pushed_pr_number FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+    // ONE read of the row, taken now: the render (blob, read time), the counter,
+    // and the export PR stamped for that render (exportWorkflow.ts recordPushedPr;
+    // migration 0061). All from the same statement so an export landing between
+    // the comparison's earlier read of `sync` and this point cannot pair one
+    // render's blob with another render's PR (Codex verify pass on PR #704). The
+    // PR counts only when its pushed_pr_read_at equals the row's pushed_read_at:
+    // recordPushedRender advances the render without clearing the PR columns, so
+    // a mismatch means the PR on the row belongs to the PREVIOUS render — the
+    // current push has no PR on record (yet, or ever, if creation failed), and
+    // there is no merge to look for. Not derived from export_snapshots by time,
+    // either: two overlapping exports can record their snapshots out of order.
+    const row = await env.DB.prepare(
+      `SELECT pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number, pushed_pr_read_at
+         FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
     )
       .bind(book, resource)
-      .first<{ pushed_pr_number: number | null }>();
-    const prNumber = pr?.pushed_pr_number ?? null;
+      .first<{
+        pushed_blob_sha: string | null;
+        pushed_read_at: number | null;
+        own_publish_declines: number | null;
+        pushed_pr_number: number | null;
+        pushed_pr_read_at: number | null;
+      }>();
+    const pushedBlobSha = row?.pushed_blob_sha ?? null;
+    const pushedReadAt = row?.pushed_read_at ?? null;
+    const prior = row?.own_publish_declines ?? 0;
+    if (!pushedBlobSha) return;
+    // The comparison that declined ran against `sync`; if the row's render has
+    // moved since, tonight's `content_differs` was about a render that is no
+    // longer the one on the row — nothing to attribute to it.
+    if (pushedBlobSha !== sync.pushedBlobSha) {
+      console.log("reimport own-publish decline unmeasured: the pushed render moved during the run", {
+        book,
+        resource,
+        comparedBlobSha: sync.pushedBlobSha,
+        rowBlobSha: pushedBlobSha,
+      });
+      return;
+    }
+    const prNumber =
+      row?.pushed_pr_number != null && row.pushed_pr_read_at != null && row.pushed_pr_read_at === pushedReadAt
+        ? row.pushed_pr_number
+        : null;
     const page =
       walked ??
-      (sync.pushedReadAt == null
+      (pushedReadAt == null
         ? { commits: [], incomplete: true, incompleteReason: "no_pushed_read_at" }
         : await listMasterCommitsSince(env, file.repo, file.path, null, {
-            sinceTime: sync.pushedReadAt,
+            sinceTime: pushedReadAt,
             pageLimit: 2,
           }));
     const commits = page.commits.map(classifyMasterCommit);
@@ -6854,7 +6882,7 @@ async function accountOwnPublishDecline(
     const judged = judgeOwnPublishDecline({
       ourMerge,
       mergedBlobSha,
-      pushedBlobSha: sync.pushedBlobSha,
+      pushedBlobSha,
       newest: commits[0],
     });
 
@@ -6865,7 +6893,7 @@ async function accountOwnPublishDecline(
         reason: judged.reason,
         prNumber,
         measuredRewrites: prior,
-        pushedReadAt: sync.pushedReadAt,
+        pushedReadAt,
         walkedFrom: walked ? "lineage" : "pushed_read_at",
       });
       return;
@@ -6899,7 +6927,7 @@ async function accountOwnPublishDecline(
     // merge measured again — by a retried Workflow step tonight, or on later
     // nights when no new export pushed (locked book, nothing changed) — adds
     // nothing. Atomic in the same statement, so a retry cannot double-count.
-    const row = await env.DB.prepare(
+    const bumped = await env.DB.prepare(
       `UPDATE book_resource_syncs
           SET own_publish_declines = own_publish_declines + 1, own_publish_rewrite_sha = ?3
         WHERE book = ?1 AND resource = ?2 AND (own_publish_rewrite_sha IS NULL OR own_publish_rewrite_sha <> ?3)
@@ -6907,7 +6935,7 @@ async function accountOwnPublishDecline(
     )
       .bind(book, resource, judged.mergeSha)
       .first<{ own_publish_declines: number }>();
-    if (!row) {
+    if (!bumped) {
       console.log("reimport own-publish decline: this rewritten merge was already counted", {
         book,
         resource,
@@ -6916,7 +6944,7 @@ async function accountOwnPublishDecline(
       });
       return;
     }
-    const next = row.own_publish_declines;
+    const next = bumped.own_publish_declines;
     console.log("reimport own-publish decline measured as a rewrite: the merge of our push holds different bytes", {
       book,
       resource,

@@ -3371,13 +3371,13 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
   const SOURCE = `own_publish_inert:${BOOK}:tq`;
   // The export's own record of the push: pushed_blob_sha/read_at and the PR it
   // opened for that render (pushed_pr_number, 0061), all on the sync row.
-  const seedSync = (sqlite, declines, { prNumber = 859 } = {}) => {
+  const seedSync = (sqlite, declines, { prNumber = 859, prReadAt = READ_AT } = {}) => {
     sqlite
       .prepare(
-        `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number)
-         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?, ?)`,
+        `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number, pushed_pr_read_at)
+         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?, ?, ?)`,
       )
-      .run(BOOK, PUSHED, READ_AT, declines, prNumber);
+      .run(BOOK, PUSHED, READ_AT, declines, prNumber, prNumber == null ? null : prReadAt);
     return { sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: READ_AT, pushedEditId: null, declines };
   };
   const seedBanner = (sqlite) =>
@@ -3463,7 +3463,10 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
 
     // A NEW export (#861) whose merge is also rewritten: counts, banner NOT re-raised.
     sqlite
-      .prepare(`UPDATE book_resource_syncs SET pushed_pr_number = 861, pushed_read_at = ? WHERE book = ? AND resource = 'tq'`)
+      .prepare(
+        `UPDATE book_resource_syncs SET pushed_pr_number = 861, pushed_read_at = ?1, pushed_pr_read_at = ?1
+          WHERE book = ?2 AND resource = 'tq'`,
+      )
       .run(READ_AT + 86000, BOOK);
     const MERGE_861 = { ...OUR_MERGE, sha: "5555aaaa6666", message: "bible-editor: JER tq → master (#861)", date: "2026-09-02T05:40:00Z" };
     await withGitea(gitea([MERGE_861, BOT_PUSH, OUR_MERGE], "1111deadbeef00000000000000000000deadbeef"), () =>
@@ -3496,6 +3499,35 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
     eq(g.calls.trees, 0, "…and no tree read is spent on it");
   }
 
+  // (g) A STALE PR on the row (Codex verify, round 2): a newer render advanced
+  //     pushed_read_at/pushed_blob_sha, its PR is not stamped yet (or never will
+  //     be), and pushed_pr_number still names the PREVIOUS render's PR (#859),
+  //     whose merge IS on master. Comparing that merge's blob against the new
+  //     push would be a false rewrite; the read-time mismatch says "no PR for
+  //     this render" instead.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2, { prNumber: 859, prReadAt: READ_AT - 86400 });
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "a PR stamped for an earlier render is not this push's PR → counter unchanged");
+    eq(g.calls.trees, 0, "…and its merge's blob is never read");
+  }
+
+  // (h) The render moved between the comparison and the accounting (an export
+  //     landed mid-run): the decline was about a render no longer on the row.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    sqlite
+      .prepare(`UPDATE book_resource_syncs SET pushed_blob_sha = 'newer000', pushed_read_at = ? WHERE book = ? AND resource = 'tq'`)
+      .run(READ_AT + 600, BOOK);
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "a render that moved during the run is not attributed → counter unchanged");
+    eq(g.calls.commits + g.calls.trees, 0, "…and nothing is fetched for it");
+  }
+
   // (d) Unmeasured nights leave the counter alone, in both directions.
   {
     const { sqlite, env } = freshEnv();
@@ -3512,7 +3544,8 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
     const g2 = { calls: { commits: 0, trees: 0 }, fetchImpl: async (url) => (String(url).includes("/git/trees/") ? { ok: false, json: async () => ({}) } : giteaPage([BOT_PUSH, OUR_MERGE])()) };
     await withGitea(g2, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
     eq(readState(sqlite).declines, 2, "a failed tree read → counter unchanged");
-    // No read time recorded: nothing can be placed.
+    // No read time recorded on the row (half-written render): nothing can be placed.
+    sqlite.prepare(`UPDATE book_resource_syncs SET pushed_read_at = NULL WHERE book = ? AND resource = 'tq'`).run(BOOK);
     await withGitea(gitea([BOT_PUSH, OUR_MERGE], PUSHED), () =>
       accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, { ...sync, pushedReadAt: null }),
     );

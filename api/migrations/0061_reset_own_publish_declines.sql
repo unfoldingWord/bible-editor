@@ -31,4 +31,14 @@ ALTER TABLE book_resource_syncs ADD COLUMN own_publish_rewrite_sha TEXT;
 -- the master commit `<PR title> (#N)`, which is how the sync finds that render's
 -- merge and measures the bytes it landed. NULL = no PR on record for the current
 -- push (creation failed, or pushed before this column existed) → not measured.
+--
+-- pushed_pr_read_at — the pushed_read_at the PR number belongs to, written in the
+-- same statement. recordPushedRender advances pushed_blob_sha / pushed_read_at for
+-- a NEWER render without touching these two columns (that statement is the
+-- watermark stamp and must not depend on this migration), so between that
+-- advance and the new PR's stamp — or for good, if PR creation then fails — the
+-- PR number here belongs to the PREVIOUS render. The sync therefore trusts
+-- pushed_pr_number only when pushed_pr_read_at = pushed_read_at, read from the
+-- same row in one statement (Codex verify pass on PR #704, round 2).
 ALTER TABLE book_resource_syncs ADD COLUMN pushed_pr_number INTEGER;
+ALTER TABLE book_resource_syncs ADD COLUMN pushed_pr_read_at INTEGER;

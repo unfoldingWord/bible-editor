@@ -1660,12 +1660,18 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // must NOT stamp its PR over B's render, or the sync would compare A's merge
   // against B's blob and read a preserved merge as a rewrite (Codex verify pass
   // on PR #704: the snapshot-order lookup this replaces had exactly that hole).
-  // Best-effort: a failed stamp leaves the column NULL, which the sync reads as
-  // "no PR on record → nothing to measure", never as a match or a mismatch.
+  // `pushed_pr_read_at` is written alongside, so the sync can tell that the PR
+  // belongs to the render currently on the row: recordPushedRender advances
+  // pushed_read_at for a newer render WITHOUT clearing these two columns (that
+  // statement is the watermark stamp and must not depend on migration 0061), so
+  // until the newer PR is stamped — or for good, if its creation fails — the
+  // number here is the previous render's. Best-effort: a failed stamp leaves the
+  // columns as they were, which the sync reads as "no PR on record for this
+  // render → nothing to measure", never as a match or a mismatch.
   private async recordPushedPr(book: string, resource: Resource, readAt: number, prNumber: number): Promise<void> {
     try {
       await this.env.DB.prepare(
-        `UPDATE book_resource_syncs SET pushed_pr_number = ?3
+        `UPDATE book_resource_syncs SET pushed_pr_number = ?3, pushed_pr_read_at = ?4
           WHERE book = ?1 AND resource = ?2 AND pushed_read_at = ?4`,
       )
         .bind(book, resource, prNumber, readAt)
