@@ -1629,10 +1629,24 @@ export async function applyTsvRows(
   // Torn rows (issue #672): `ref_raw` parses (via refParts) to a chapter/verse
   // that disagrees with the row's own stored `chapter`/`verse` columns — an
   // in-app cross-chapter REF retype, which rows.ts deliberately never writes
-  // to `chapter`. Its own tiny batch: this rewrites ONLY chapter/verse to
-  // match the row's own ref_raw, independent of anything master's incoming
-  // row says, so it can't share a statement with `updates` (which writes
-  // master's content) or `reorders` (which is version-neutral).
+  // to `chapter`. Populated ONLY from the edited-candidate resolution below,
+  // and ONLY when that row ends up with nothing else to write (empty
+  // `fields`) — never alongside another write to the SAME row in the SAME
+  // pass. That restriction is load-bearing, not incidental: an earlier
+  // version detected this unconditionally, up front, and optimistically
+  // bumped an in-memory `cur.version` so a LATER write to the same row (e.g.
+  // `editedWrites`) would CAS against the post-heal version. If the heal's
+  // own CAS then lost to a genuine concurrent PATCH, the in-memory bump was
+  // already made — and the later write's CAS could then coincidentally match
+  // the version the CONCURRENT PATCH had advanced to, silently overwriting
+  // that PATCH with a merge decision computed off the stale pre-PATCH row
+  // (Codex review on PR #681). Two writes derived from one read must never
+  // land in two different batches; a row with a genuine OTHER write this pass
+  // (`updates`/`update_ai`/`resurrect`) needs no separate heal at all — those
+  // already write master's own (self-consistent) `chapter`/`verse` as part of
+  // their normal content write. A torn row with something ELSE to adopt/flag
+  // this pass simply isn't healed until a LATER run, once that write has
+  // landed and the row is a candidate with empty `fields` again.
   const refHeals: Array<{ id: string; oldVersion: number; chapter: number; verse: number }> = [];
   // AI-only rows to re-seed from master AND reclaim to master-owned (updated_by
   // → NULL). Written under a relaxed guard (version-CAS + protection re-assert)
@@ -1819,28 +1833,6 @@ export async function applyTsvRows(
         counts.skipped_edited++;
       }
       continue;
-    }
-    // Torn-row self-heal (issue #672). Reached for every LIVE row (the
-    // tombstone branch above always `continue`s), independent of this row's
-    // reimport fate below — a row can be torn whether it turns out noop,
-    // edited, or an ordinary update. Detected and (if torn) corrected against
-    // the row's OWN ref_raw, never against master's incoming row: this is D1
-    // fixing its own bookkeeping, not a merge decision. Patch `cur` in place
-    // so every classification below (tsvRowSignature, isReimportableRow,
-    // classifyTsvRefMove) sees the now-consistent chapter/verse rather than
-    // the stale ones, and bump `cur.version` to match the write queued below —
-    // safe because that write is always the first one to touch this row in
-    // this pass (nothing above this point wrote to it).
-    const torn = detectTornTsvRef(
-      (cur.ref_raw as string | null) ?? null,
-      Number(cur.chapter),
-      Number(cur.verse),
-    );
-    if (torn) {
-      refHeals.push({ id: row.id, oldVersion: Number(cur.version), chapter: torn.chapter, verse: torn.verse });
-      cur.chapter = torn.chapter;
-      cur.verse = torn.verse;
-      cur.version = Number(cur.version) + 1;
     }
     // Classify content vs sort_order independently. A divergent sort_order on a
     // content-identical tn/twl row that already carries an order is a local
@@ -2413,7 +2405,27 @@ export async function applyTsvRows(
         }
       }
 
+      // Torn-row self-heal (issue #672), folded in HERE rather than detected
+      // up front against `cur`'s freshly-read state: this is the one place in
+      // this row's resolution proven to have nothing else queued to write it
+      // this pass (fields is about to be checked empty) and to still hold
+      // `cur`'s TRUE, unmutated version — see refHeals' own declaration above
+      // for why that matters (an earlier version bumped an in-memory version
+      // optimistically and let a later write CAS against it, which could
+      // silently overwrite a concurrent PATCH — Codex review on PR #681). A
+      // row with something else to write this pass is left torn for a later
+      // run: `updates`/`update_ai`/`resurrect` already write master's own
+      // self-consistent chapter/verse, and one with non-empty `fields` here
+      // will be revisited once that write lands and it is a candidate again.
       if (Object.keys(fields).length === 0) {
+        const torn = detectTornTsvRef(
+          (cur.ref_raw as string | null) ?? null,
+          Number(cur.chapter),
+          Number(cur.verse),
+        );
+        if (torn) {
+          refHeals.push({ id: row.id, oldVersion: Number(cur.version), chapter: torn.chapter, verse: torn.verse });
+        }
         counts.skipped_edited++;
         continue;
       }

@@ -2504,9 +2504,16 @@ console.log("\n[issue #672: a torn row (ref_raw ahead of its own stored chapter/
   );
 
   eq(counts.ref_healed, 1, "the torn row's chapter/verse are healed to match its own ref_raw");
-  // Content already matched master once the tear is healed — a clean no-op,
-  // not a spurious edited/update purely because of the stale chapter/verse.
-  eq(counts.skipped_noop, 1, "no-op once the tear no longer manufactures a phantom difference");
+  // The row is human-owned (updated_by set — the retype PATCH set it), so it
+  // always takes the edited-candidate path, classified off its UNMUTATED
+  // stored chapter/verse (never patched in memory ahead of classification —
+  // see refHeals' own declaration for why: doing so once let a later write to
+  // this row CAS against an optimistic version nobody had confirmed landed).
+  // Content otherwise converges with master, so nothing is adopted or
+  // flagged — the row is a plain skipped_edited whose ONLY write this run is
+  // the heal itself, folded in at the point that skip is decided.
+  eq(counts.skipped_edited, 1, "edited-candidate path with nothing to adopt — the heal is the row's only write");
+  eq(counts.skipped_noop, 0, "NOT a no-op — classification never sees the healed chapter/verse, only the write does");
 
   const stored = sqlite.prepare(`SELECT chapter, verse, ref_raw, sort_order, version FROM tn_rows WHERE id='tn01'`).all()[0];
   eq(stored.chapter, 2, "stored chapter now matches ref_raw's own chapter");
@@ -2574,6 +2581,64 @@ console.log("\n[issue #672: an untorn row (ref_raw already agrees with its own c
   eq(counts.ref_healed, 0, "nothing to heal — chapter/verse already match ref_raw");
   const stored = sqlite.prepare(`SELECT version FROM tq_rows WHERE id='tq01'`).all()[0];
   eq(stored.version, 3, "no spurious version bump");
+}
+
+// Wrap env.DB so the FIRST batch matching the ref-heal write's distinctive SQL
+// shape (`SET chapter = ?1, verse = ?2, version = ?3`) is preceded by an
+// out-of-band write on the SAME row — exactly as a concurrent PATCH landing
+// between applyTsvRows' initial `existing` read and this batched write would
+// do. Same pattern as withReclaimRace above; drives a REAL CAS loss through
+// the real function rather than hand-asserting what "should" happen.
+function withHealRace(env, sqlite, table, id) {
+  let fired = false;
+  return {
+    ...env,
+    DB: {
+      ...env.DB,
+      async batch(stmts) {
+        if (!fired && stmts.some((s) => s.sql.includes("SET chapter = ?1, verse = ?2, version = ?3"))) {
+          fired = true;
+          sqlite
+            .prepare(`UPDATE ${table} SET note = 'concurrent edit', version = version + 1 WHERE id = ?`)
+            .run(id);
+        }
+        return env.DB.batch(stmts);
+      },
+    },
+  };
+}
+
+console.log("\n[issue #672 (Codex review on PR #681): a concurrent PATCH landing before the heal batch is never clobbered]");
+{
+  // The exact hazard the review flagged: an EARLIER version of this fix
+  // detected the tear up front and optimistically bumped an in-memory
+  // `cur.version`, so if the heal's own write then lost its CAS to a
+  // concurrent PATCH, a LATER write derived from that same stale `cur` could
+  // coincidentally CAS-match the version the concurrent PATCH had advanced
+  // to, silently overwriting it. This row has nothing else to write (content
+  // already converged), so the fixed design's only write IS the heal itself
+  // — proving the concurrent PATCH's content survives a lost heal CAS untouched.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, updated_by, version)
+       VALUES ('tn03', ?, 1, 5, '2:3', 'original note', 7, 3)`,
+    )
+    .run(BOOK);
+  const raced = withHealRace(env, sqlite, "tn_rows", "tn03");
+  const counts = await applyTsvRows(
+    raced, BOOK, "tn",
+    [{ id: "tn03", idCoerced: false, refRaw: "2:3", chapter: 2, verse: 3, occurrence: null, tags: null, quote: null, note: "original note", support_reference: null }],
+    null,
+  );
+
+  eq(counts.ref_healed, 0, "the heal LOST its version-CAS to the concurrent PATCH — must not count as healed");
+  const stored = sqlite.prepare(`SELECT chapter, verse, note, version FROM tn_rows WHERE id='tn03'`).all()[0];
+  eq(stored.chapter, 1, "chapter is STILL torn — the heal did not land this run (self-heals next run instead)");
+  eq(stored.verse, 5, "verse is still torn too");
+  eq(stored.note, "concurrent edit", "…and — the whole point — the concurrent PATCH's content survives, untouched by a phantom heal write");
+  eq(stored.version, 4, "version reflects ONLY the concurrent PATCH's own bump, never a heal write layered on top of it");
 }
 
 if (failed > 0) {

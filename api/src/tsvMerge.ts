@@ -247,6 +247,17 @@ export function classifyTsvRefMove(
 // treating that as a correction would relocate a row that has simply never had
 // its Reference set, which is the one direction this heal must never go
 // (manufacturing a wrong location is worse than leaving a real tear alone).
+//
+// A MALFORMED (non-blank) `ref_raw` is not torn either, for the same reason.
+// `refParts` is deliberately lenient — `parseInt(ch, 10) || 0` maps a garbage
+// chapter like "x" to 0, exactly the same fallback `front:intro` legitimately
+// produces — so trusting it here for anything but a well-formed reference
+// would "heal" a corrupted `ref_raw` like "x:3" into chapter 0 (chapter-front),
+// permanently misfiling the row instead of leaving it for a human to fix the
+// actual corruption (Codex review on PR #681). WELL_FORMED_REF mirrors exactly
+// the shapes refParts documents: `front:intro`, `1:intro`, `1:1`, `1:1-3`.
+const WELL_FORMED_REF = /^(?:front|\d+):(?:intro|\d+(?:-\d+)?)$/;
+
 export interface TornTsvRef {
   chapter: number;
   verse: number;
@@ -257,7 +268,7 @@ export function detectTornTsvRef(
   chapter: number,
   verse: number,
 ): TornTsvRef | null {
-  if (!refRaw || refRaw.trim() === "") return null;
+  if (!refRaw || !WELL_FORMED_REF.test(refRaw.trim())) return null;
   const [ch, vs] = refParts(refRaw);
   if (ch === chapter && vs === verse) return null;
   return { chapter: ch, verse: vs };

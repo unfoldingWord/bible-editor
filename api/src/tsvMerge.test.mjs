@@ -843,6 +843,25 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   eq(detectTornTsvRef(null, 0, 0), null, "a blank ref_raw on a chapter/verse-0 row is still not torn");
 }
 
+// A MALFORMED (non-blank) ref_raw must never be treated as torn either.
+// refParts is deliberately lenient for its OTHER callers (a garbage chapter
+// parses to 0, same fallback as a legitimate front:intro), so trusting it
+// here would "heal" a corrupted ref_raw like "x:3" into chapter 0 — silently
+// misfiling the row as chapter-front rather than leaving the actual
+// corruption for a human to fix (Codex review on PR #681).
+{
+  eq(detectTornTsvRef("x:3", 5, 3), null, "a non-numeric chapter is malformed, never healed to chapter 0");
+  eq(detectTornTsvRef("x:3", 0, 3), null, "…even when the row already happens to sit at chapter 0");
+  eq(detectTornTsvRef("2:x", 2, 5), null, "a non-numeric, non-'intro' verse is malformed, never healed to verse 0");
+  eq(detectTornTsvRef("2", 2, 5), null, "a reference with no ':' at all is malformed");
+  eq(detectTornTsvRef("2:", 2, 0), null, "a trailing ':' with no verse part is malformed");
+  eq(detectTornTsvRef(":3", 0, 3), null, "a leading ':' with no chapter part is malformed");
+  eq(detectTornTsvRef("front:1", 0, 1), null, "'front' only pairs with 'intro' — 'front:1' is malformed");
+  // Well-formed shapes still heal, confirming the guard is additive, not a
+  // regression on the cases already covered above.
+  deep(detectTornTsvRef("2:3", 1, 5), { chapter: 2, verse: 3 }, "a well-formed reference still heals normally");
+}
+
 // ── classifyTsvRefMove: torn-row robustness (issue #672 review gaps) ────────
 // Three shapes noted as untested in the #657 review. classifyTsvRefMove keys
 // attribution on ref_raw ALONE (#547 item 2) — chapter/verse are
