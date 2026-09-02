@@ -43,16 +43,19 @@ for (const tag of PARAGRAPH_TAGS) {
   assert(!leakedAsWord, `\\${tag} does NOT leak through as a \\w word "${tag}"`);
 }
 
-// ── 2. Glued marker (no space before the next word) still isn't a word:
-//       `\pmodestroy` must not become the single word "pmodestroy", and
-//       `\pmo` must not swallow into a `\p`. Uses the reported family.
+// ── 2. The p-family marker LEADS its segment — it is the first node the
+//       recognizer emits, ahead of the following word, so the marker never
+//       fuses with or trails behind verse text. Guards the reported family
+//       specifically (#702). `\pmo` must resolve to `pmo`, not `p` + "mo…".
 for (const tag of ["pmo", "pmc", "pmr", "pm", "po", "pr", "cls"]) {
   const nodes = tokenizeEditableText(`\\${tag} word`);
-  assert(isMarkerNode(nodes[0], tag), `\\${tag} recognized (p-family, #702)`);
+  assert(isMarkerNode(nodes[0], tag), `\\${tag} recognized as the leading marker (p-family, #702)`);
 }
 
-// ── 3. isInFlowMarker accepts a clean p-family node (display path renders it
-//       as a block break rather than inline content).
+// ── 3. Display-path sanity: isInFlowMarker (type-based, not tag-gated) accepts
+//       a clean p-family node, so the renderer emits a block break for it. This
+//       documents the contract; the drift GUARD for display is paragraphClass
+//       (§5) — isInFlowMarker keys off type alone and can't detect a missing tag.
 for (const tag of ["pm", "pmo", "pmc", "pmr", "po", "pr", "cls"]) {
   assert(isInFlowMarker({ type: "paragraph", tag }), `isInFlowMarker({type:"paragraph",tag:"${tag}"})`);
 }
