@@ -96,10 +96,31 @@ function paragraphLayoutSx(mode: Mode) {
     "& .be-pm": { paddingLeft: "1.5em" },
     "& .be-pmr": { paddingLeft: "1.5em", textAlign: "right" },
     "& .be-pr": { textAlign: "right" },
+    // \li*/\lim* list items — indent by level. \lh list header sits at the base
+    // margin (bold); \lf list footer indents one level like a first-level item.
+    "& .be-li-1": { paddingLeft: "1.5em" },
+    "& .be-li-2": { paddingLeft: "2.5em" },
+    "& .be-li-3": { paddingLeft: "3.5em" },
+    "& .be-li-4": { paddingLeft: "4.5em" },
+    "& .be-lh": { fontWeight: 600 },
+    "& .be-lf": { paddingLeft: "1.5em" },
     "& span.be-d": {
       fontStyle: "italic",
       fontSize: "0.95em",
       color: mode === "dark" ? "#bfd5e0" : "#345e74",
+    },
+    // \qa acrostic heading (Psalm 119 / Lamentations stanza letters). A small,
+    // quiet heading label sitting above the poetry line it introduces — not a
+    // section band (those are translator-supplied prose headings), just the
+    // acrostic letter. Muted + letter-spaced so it reads as a label, not verse
+    // text; only ever rendered in the read views (#708).
+    "& .be-qa": {
+      fontSize: "0.8em",
+      fontWeight: 600,
+      letterSpacing: "0.08em",
+      textTransform: "uppercase",
+      color: mode === "dark" ? "#9fb6c2" : "#5b7a8a",
+      marginTop: "0.35em",
     },
     "& span.be-tok": {
       display: "inline-block",
