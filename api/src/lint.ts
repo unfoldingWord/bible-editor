@@ -190,6 +190,12 @@ function reviewMasterSnapshot(row: Record<string, unknown>): Record<string, unkn
     // reserved top-level key, not nested inside a real field's value.
     const snapshot = { ...(parsed as Record<string, unknown>) };
     delete snapshot["_meta"];
+    // Nothing but `_meta` means there is no Door43 snapshot here at all — only
+    // bookkeeping. #683's auto-clear memo synthesizes exactly that container on
+    // a pre-#653 flag (which by definition never captured master's values), and
+    // handing back `{}` would render a Door43 side whose every field is blank:
+    // a claim about what Door43 holds that nobody measured. Absent stays absent.
+    if (Object.keys(snapshot).length === 0) return null;
     return snapshot;
   } catch {
     return null;
