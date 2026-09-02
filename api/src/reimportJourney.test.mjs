@@ -1011,6 +1011,7 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(row.response, "our response", "the app edit is KEPT — master's AI-authored value never lands");
     eq(counts.merge_kept_ai, 1, "…counted as merge_kept_ai, so the run summary still reports it");
     eq(counts.merge_adopted, 0, "…and never counted as an adoption");
+    eq(counts.merge_master_wins, 0, "…and NOT a master-wins flag: keep_ai_master is D1-wins, its own line (#706)");
     eq(counts.merge_refused, 0, "…and never as a refusal, which would freeze the export at 5");
     eq(counts.apply_incomplete, false, "…and does NOT withhold the watermark: the export must publish this");
     eq(row.review_kind, null, "…and the row is NOT flagged: the finding was measured, not inferred");
@@ -1069,6 +1070,8 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(row.response, "a maintainer's fix", "a human-authored master edit still wins the collision");
     eq(counts.merge_adopted, 1, "…counted as an adoption");
     eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
+    eq(counts.merge_conflicts, 1, "…one merge_conflicts row (the adopting write)");
+    eq(counts.merge_master_wins, 1, "…surfaced as a master-wins flag for review (#706)");
     eq(row.review_reason.includes("was merged over your app-side change"), true, "…with the pre-existing wording");
     // #684: HAS_HUMAN is the pre-#684 shape (shas, no identity), so the message
     // is byte-identical to what it was before this shipped.
@@ -1231,6 +1234,69 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(row.response, "a maintainer's fix", "…and when the evidence DOES name this row, master still wins there");
     eq(counts.merge_adopted, 1, "…counted as an adoption, same as the file-level HAS_HUMAN case");
     eq(counts.merge_kept_ai, 0, "…and never as a kept AI conflict");
+  }
+
+  // 8b. #706: a MIXED run — one master-wins conflict AND one kept-alone row in
+  //     the SAME applyTsvRows call, the exact shape that made the "Pull from
+  //     Door43" summary undercount. On the TSV side merge_conflicts is bumped
+  //     only for the adopting (master-wins) write, while the kept-alone row lands
+  //     in merge_kept_ai alone — so the old summary math,
+  //     `max(0, merge_conflicts - merge_kept_ai)`, cancelled the real flag to 0.
+  //     merge_master_wins counts the flagged row directly and must stay 1.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    // Two contested rows: both sides moved `response` on each.
+    //  - keep01 @ 1:2 — no human commit at its ref → keep_ai_master (D1 wins, kept alone)
+    //  - win01  @ 1:5 — a human commit AT its ref     → adopt_conflict (master wins, flagged)
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, sort_order, updated_by, version)
+         VALUES ('keep01', ?, 1, 2, '1:2', null, 'our question', 'our response A', 10, 7, 3),
+                ('win01',  ?, 1, 5, '1:5', null, 'our question', 'our response B', 20, 7, 3)`,
+      )
+      .run(BOOK, BOOK);
+    const e1 = sqlite
+      .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('tq', 'keep01', ?, 'create', ?, 100)`)
+      .run(BOOK, JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2", question: "our question", response: "base response A" }));
+    const e2 = sqlite
+      .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('tq', 'win01', ?, 'create', ?, 100)`)
+      .run(BOOK, JSON.stringify({ chapter: 1, verse: 5, ref_raw: "1:5", question: "our question", response: "base response B" }));
+    const boundary = Math.max(Number(e1.lastInsertRowid), Number(e2.lastInsertRowid));
+    const lineage = {
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 1, ai: 1, human: 1 }, humanShas: ["abc123"],
+      // Complete per-ref evidence naming ONLY win01's ref.
+      refsComplete: true, humanRefs: ["1:5"],
+    };
+    const mkRow = (id, ref, chapter, verse, response) => ({
+      id, idCoerced: false, refRaw: ref, chapter, verse,
+      occurrence: null, tags: null, quote: null, question: "our question", response,
+    });
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [mkRow("keep01", "1:2", 1, 2, "the AI run's response"), mkRow("win01", "1:5", 1, 5, "a maintainer's fix")],
+      null,
+      { confirmedAt: 200, editId: boundary, lineage },
+    );
+    const rows = Object.fromEntries(
+      sqlite.prepare(`SELECT id, response, review_kind FROM tq_rows WHERE id IN ('keep01','win01')`).all().map((r) => [r.id, r]),
+    );
+    eq(rows.keep01.response, "our response A", "the kept-alone row keeps D1's value");
+    eq(rows.keep01.review_kind, null, "…with no review flag (keep_ai_master mints none)");
+    eq(rows.win01.response, "a maintainer's fix", "the master-wins row adopts Door43's value");
+    eq(rows.win01.review_kind, "merge_conflict", "…and IS flagged for review");
+    eq(counts.merge_kept_ai, 1, "one kept-alone row");
+    eq(counts.merge_conflicts, 1, "one adopting (master-wins) write bumped merge_conflicts");
+    eq(counts.merge_adopted, 1, "…and merge_adopted");
+    eq(counts.merge_master_wins, 1, "merge_master_wins counts the flagged row directly");
+    // The regression itself: the counter the summary now reads does NOT cancel.
+    eq(
+      Math.max(0, counts.merge_conflicts - counts.merge_kept_ai),
+      0,
+      "the OLD summary math would have hidden the flag (this is the bug #706 fixes)",
+    );
+    eq(counts.merge_master_wins, 1, "…while merge_master_wins keeps the flag visible");
   }
 
   // 9. PR #644 review finding F2: the per-ref evidence is keyed to the ref AS
