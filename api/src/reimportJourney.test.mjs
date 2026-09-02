@@ -2504,6 +2504,36 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
     eq(logs.map((l) => l.row_key), ["cl01"], "…and only it gets an audit row — no phantom audit for the lost race");
   }
 
+  // 1c. A backlog larger than CLEAR_PAIR_BATCH (issue #705). Each clear travels
+  //     as TWO statements (the UPDATE and its paired audit INSERT), so the slice
+  //     must be half of WRITE_BATCH (45), not WRITE_BATCH itself — a 90-row
+  //     slice would build a 180-statement batch, over D1's 100-per-batch cap,
+  //     which throws and drops the whole slice (the flags stay standing). The
+  //     node:sqlite harness does not enforce the cap, so assert the batch size
+  //     directly: 60 clears must span >1 batch and no batch may exceed 100.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 60);
+    const realBatch = env.DB.batch.bind(env.DB);
+    let maxBatchStmts = 0;
+    let batchCount = 0;
+    env.DB.batch = async (stmts) => {
+      maxBatchStmts = Math.max(maxBatchStmts, stmts.length);
+      batchCount++;
+      return realBatch(stmts);
+    };
+    const cleared = await withFetch(sameTip(), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE),
+    );
+    eq(cleared, 60, "all 60 flags are retired across multiple slices");
+    eq(batchCount > 1, true, "…the clear spanned more than one batch");
+    eq(maxBatchStmts <= 100, true, "…and no batch exceeded D1's 100-statement cap");
+    const standing = sqlite.prepare(`SELECT COUNT(*) AS n FROM tq_rows WHERE review_kind IS NOT NULL`).all()[0];
+    eq(standing.n, 0, "no flag is left standing");
+    const logs = sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log WHERE action = 'sync_clear_review'`).all()[0];
+    eq(logs.n, 60, "…and every clear wrote its own audit row");
+  }
+
   // 2. A human commit in the same window -> nothing is cleared. This is the
   //    guard that keeps the auto-clear from erasing a real warning.
   {

@@ -4547,8 +4547,15 @@ async function clearResolvedMergeNoBase(
     };
     const byId = new Map(rs.results.map((r) => [r.id, r] as const));
     let cleared = 0;
-    for (let i = 0; i < clearable.length; i += WRITE_BATCH) {
-      const slice = clearable.slice(i, i + WRITE_BATCH);
+    // CLEAR_PAIR_BATCH (half of WRITE_BATCH): each clear travels as TWO
+    // statements (the UPDATE and its gatedLogEditStmt audit INSERT), so a
+    // full-WRITE_BATCH slice would be 180 statements — over D1's 100-per-batch
+    // cap, which would throw and drop the whole slice (the catch below returns
+    // 0 and the flags stay standing). Same halving as RECLAIM_PAIR_BATCH,
+    // PRISTINE_PAIR_BATCH, SWEEP_PAIR_BATCH and retireMergeKeptFlags.
+    const CLEAR_PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+    for (let i = 0; i < clearable.length; i += CLEAR_PAIR_BATCH) {
+      const slice = clearable.slice(i, i + CLEAR_PAIR_BATCH);
       const stmts: D1PreparedStatement[] = [];
       for (const id of slice) {
         stmts.push(
