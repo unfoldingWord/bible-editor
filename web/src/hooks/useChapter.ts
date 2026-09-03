@@ -20,6 +20,7 @@ import {
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
+import { applyBridged, applySplit, applyUpdated, reduceVerses, type ChapterData } from "../lib/verseStructure";
 
 type Status = "idle" | "loading" | "ready" | "error" | "retrying";
 
@@ -38,15 +39,29 @@ export interface UseChapterReturn {
     row: TnRow | TqRow | TwlRow,
     position?: { afterId?: string },
   ) => void;
+  /**
+   * This tab's own edit (optimistic, or the outbox's confirmed result for it):
+   * applied regardless of version, EXCEPT that it can never resurrect a verse
+   * another tab has already bridged away (tombstone — lib/verseStructure.ts).
+   */
   applyLocalVerse: (verse: VerseDto) => void;
+  /**
+   * A verse row from elsewhere (WS `verse.updated`, an outbox result): applied
+   * only if strictly newer than the local row and above the verse number's
+   * tombstone. Both checks live in the reducer so every caller agrees.
+   */
+  applyRemoteVerse: (verse: VerseDto) => void;
   /**
    * A verse-bridge was created: replace the start verse with the combined
    * bridge DTO, drop the absorbed verse's map key, and prune the now-orphaned
    * per-verse status / lane-checks for every absorbed verse. Applied after the
    * server confirms (a 409 must not leave a half-formed bridge), and reused by
-   * the WS `verse.bridged` handler for other tabs.
+   * the WS `verse.bridged` handler for other tabs. `removedVersion` (the
+   * deleted row's version) becomes the tombstone that lets a reordered
+   * `verse.updated` / `verse.split` for that verse be told apart from a real
+   * recreation (#729).
    */
-  applyLocalVerseBridge: (bridge: VerseDto, removedVerse: number, absorbedVerses: number[]) => void;
+  applyLocalVerseBridge: (bridge: VerseDto, removedVerse: number, absorbedVerses: number[], removedVersion?: number) => void;
   /**
    * A verse-bridge was broken: replace the start verse with the de-bridged DTO
    * and add the freshly-seeded singleton rows. Applied after the server
@@ -71,7 +86,9 @@ export interface UseChapterReturn {
 
 export function useChapter(book: string, chapter: number): UseChapterReturn {
   const [status, setStatus] = useState<Status>("idle");
-  const [data, setData] = useState<ChapterPayload | null>(null);
+  // ChapterData = the server payload + client-only verse tombstones. A fresh
+  // payload from refetch carries none, which is how tombstones get cleared.
+  const [data, setData] = useState<ChapterData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [retryAttempts, setRetryAttempts] = useState(0);
   const mounted = useRef(true);
@@ -195,44 +212,43 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     [],
   );
 
+  // The verse map is reduced by lib/verseStructure.ts so the WS reorder rules
+  // (version clock + per-verse tombstones) live in one pure, permutation-tested
+  // place rather than being re-derived in each updater below.
   const applyLocalVerse = useCallback<UseChapterReturn["applyLocalVerse"]>(
     (verse) => {
-      setData((prev) => {
-        if (!prev) return prev;
-        const byVersion = prev.verses[verse.bible_version] ?? {};
-        const nextVersion = { ...byVersion, [verse.verse]: verse };
-        return {
-          ...prev,
-          verses: { ...prev.verses, [verse.bible_version]: nextVersion },
-        };
-      });
+      setData((prev) =>
+        prev ? reduceVerses(prev, verse.bible_version, (s) => applyUpdated(s, verse, { force: true })) : prev,
+      );
+    },
+    [],
+  );
+
+  const applyRemoteVerse = useCallback<UseChapterReturn["applyRemoteVerse"]>(
+    (verse) => {
+      setData((prev) => (prev ? reduceVerses(prev, verse.bible_version, (s) => applyUpdated(s, verse)) : prev));
     },
     [],
   );
 
   const applyLocalVerseBridge = useCallback<UseChapterReturn["applyLocalVerseBridge"]>(
-    (bridge, removedVerse, absorbedVerses) => {
+    (bridge, removedVerse, absorbedVerses, removedVersion) => {
       setData((prev) => {
         if (!prev) return prev;
-        const byVersion = { ...(prev.verses[bridge.bible_version] ?? {}) };
-        // The STRUCTURAL change (remove the absorbed key, prune its status/lane
-        // checks) always applies — WS delivery can reorder a racing verse.updated
-        // ahead of this event, and dropping the whole thing on a version check
-        // would strand the absorbed verse in the other tab. Only the start row's
-        // CONTENT follows newer-wins, so a genuinely fresher edit isn't clobbered.
-        const existingStart = byVersion[bridge.verse];
-        delete byVersion[removedVerse];
-        if (!existingStart || bridge.version >= existingStart.version) byVersion[bridge.verse] = bridge;
+        const next = reduceVerses(prev, bridge.bible_version, (s) => applyBridged(s, bridge, removedVerse, removedVersion));
+        // Identity means the reducer already holds an equal-or-newer picture of
+        // this bridge (a duplicate echo, or a recreation that overtook it) — the
+        // prune below either already ran or would wrongly hit a live verse.
+        if (next === prev) return prev;
         const absorbed = new Set(absorbedVerses);
         return {
-          ...prev,
-          verses: { ...prev.verses, [bridge.bible_version]: byVersion },
+          ...next,
           // The absorbed verses no longer exist as rows; their per-verse
           // checkoff/status would orphan (and mislead if the bridge is later
           // split). verse_statuses/verse_lane_checks are not bible_version
           // scoped, so this prunes by verse number.
-          verseStatuses: prev.verseStatuses.filter((s) => !absorbed.has(s.verse)),
-          verseLaneChecks: prev.verseLaneChecks.filter((c) => !absorbed.has(c.verse)),
+          verseStatuses: next.verseStatuses.filter((s) => !absorbed.has(s.verse)),
+          verseLaneChecks: next.verseLaneChecks.filter((c) => !absorbed.has(c.verse)),
         };
       });
     },
@@ -241,23 +257,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
 
   const applyLocalVerseSplit = useCallback<UseChapterReturn["applyLocalVerseSplit"]>(
     (start, newVerses) => {
-      setData((prev) => {
-        if (!prev) return prev;
-        const byVersion = { ...(prev.verses[start.bible_version] ?? {}) };
-        // Adding the split-created verses always applies (they are new keys a
-        // racing verse.updated can't have introduced); each slot is newer-wins so
-        // a later same-row update isn't clobbered by a reordered split event.
-        const existingStart = byVersion[start.verse];
-        if (!existingStart || start.version >= existingStart.version) byVersion[start.verse] = start;
-        for (const nv of newVerses) {
-          const ex = byVersion[nv.verse];
-          if (!ex || nv.version >= ex.version) byVersion[nv.verse] = nv;
-        }
-        return {
-          ...prev,
-          verses: { ...prev.verses, [start.bible_version]: byVersion },
-        };
-      });
+      setData((prev) => (prev ? reduceVerses(prev, start.bible_version, (s) => applySplit(s, start, newVerses)) : prev));
     },
     [],
   );
@@ -369,7 +369,10 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       if (op.target.kind === "verse") {
         const v = result.updated as VerseDto;
         if (v && v.book === book && v.chapter === chapter) {
-          applyLocalVerse(v);
+          // Version-gated: the server's row for a save that raced a bridge/
+          // split must neither regress a newer row nor resurrect a tombstoned
+          // verse (#729).
+          applyRemoteVerse(v);
         }
         return;
       }
@@ -387,7 +390,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         }
       }
     });
-  }, [book, chapter, applyLocalRowReplacement, applyLocalVerse, applyLocalVerseStatus, applyLaneCheckers]);
+  }, [book, chapter, applyLocalRowReplacement, applyRemoteVerse, applyLocalVerseStatus, applyLaneCheckers]);
 
   return {
     status,
@@ -400,6 +403,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     applyLocalRowDelete,
     applyLocalRowInsert,
     applyLocalVerse,
+    applyRemoteVerse,
     applyLocalVerseBridge,
     applyLocalVerseSplit,
     applyLocalVerseStatus,

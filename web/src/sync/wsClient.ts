@@ -23,6 +23,12 @@ import { refreshAuthOnce } from "./api";
 export interface WsHandlers {
   onEvent: (event: unknown) => void;
   onOpen?: () => void;
+  // Fired on every `open` AFTER the first — i.e. only when a socket that had
+  // once been up came back. Events broadcast while the socket was down are
+  // gone (the room has no replay), so a subscriber that must not miss
+  // structural events (verse.bridged / verse.split) refetches here; the
+  // first open is deliberately excluded so mounting doesn't fetch twice.
+  onReconnect?: () => void;
   onError?: (e: Event) => void;
 }
 
@@ -51,6 +57,9 @@ export function openChapterRoom(
   let socket: WebSocket | null = null;
   let backoffMs = INITIAL_BACKOFF_MS;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Has any socket in this subscription's lifetime reached `open`? Distinguishes
+  // the first connection from a reconnect for onReconnect.
+  let everOpened = false;
 
   const scheduleReconnect = () => {
     if (disposed) return;
@@ -105,7 +114,10 @@ export function openChapterRoom(
     ws.addEventListener("open", () => {
       opened = true;
       backoffMs = INITIAL_BACKOFF_MS;
+      const isReconnect = everOpened;
+      everOpened = true;
       handlers.onOpen?.();
+      if (isReconnect) handlers.onReconnect?.();
       // Start the heartbeat once we know the connection actually opened.
       pingTimer = setInterval(() => {
         if (ws.readyState !== WebSocket.OPEN) return;

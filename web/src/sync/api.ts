@@ -96,11 +96,13 @@ export interface VerseDto {
 
 // Result of creating a verse bridge (merge-with-next). `verse` is the combined
 // bridge row; `removed_verse` is the absorbed row's start key to drop locally;
-// `absorbed_verses` are all the verse numbers that row covered (for pruning
-// orphaned status / lane checks).
+// `removed_version` is the version that row had when it was deleted (the
+// tombstone clock — see lib/verseStructure.ts); `absorbed_verses` are all the
+// verse numbers that row covered (for pruning orphaned status / lane checks).
 export interface MergeBridgeResult {
   verse: VerseDto;
   removed_verse: number;
+  removed_version: number;
   absorbed_verses: number[];
 }
 

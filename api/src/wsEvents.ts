@@ -41,10 +41,14 @@ export type WsEvent =
   | { type: "verse.updated"; verse: VerseDto }
   // Two adjacent verses were combined into a `\v a-b` bridge. `verse` is the new
   // bridge row (start verse, now carrying verse_end); `removedVerse` is the
-  // absorbed row's start key to drop from the verses map; `absorbedVerses` is
-  // every integer verse that row covered, so receivers also prune orphaned
-  // verse_statuses / verse_lane_checks for those numbers.
-  | { type: "verse.bridged"; verse: VerseDto; removedVerse: number; absorbedVerses: number[] }
+  // absorbed row's start key to drop from the verses map; `removedVersion` is
+  // the version that row had when it was deleted — receivers keep it as a
+  // tombstone so a reordered `verse.updated` / `verse.split` for that verse
+  // number at a version <= it is recognised as a stale echo of the dead row
+  // (#729; versions are strictly increasing across delete/recreate, see
+  // verseBridge.ts). `absorbedVerses` is every integer verse that row covered,
+  // so receivers also prune orphaned verse_statuses / verse_lane_checks.
+  | { type: "verse.bridged"; verse: VerseDto; removedVerse: number; removedVersion: number; absorbedVerses: number[] }
   // A `\v a-b` bridge was broken apart. `verse` is the de-bridged start row
   // (verse_end now null, all content retained); `newVerses` are the freshly
   // seeded, empty singleton rows for the verses past the start.
