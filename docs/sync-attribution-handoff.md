@@ -86,7 +86,7 @@ forever and never noticed, because it reads `commits[0]`.
 | kind | signal |
 |---|---|
 | ours | subject starts `bible-editor: {BOOK} {res} → master (#N)` **or** `bible-editor export: … → {BRANCH} (export-…)` — the `-be-` branch commit also appears in master's file history once merged |
-| ai | author email `bot@unfoldingword.org`, and/or `@api.bp-assistant` in the subject |
+| ai | bot author `bot@unfoldingword.org` **and** a pipeline-shaped subject (or a gated trailer) — since #550 the address alone is not enough — **or**, independently, `@api.bp-assistant` in a non-revert subject from an unrecognized (non-bot) author |
 | human | everything else |
 
 Traps, both real commits on master:
