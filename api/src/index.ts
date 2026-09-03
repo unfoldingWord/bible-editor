@@ -23,6 +23,7 @@ import { dcsCommits } from "./dcsCommits";
 import { books } from "./bookImport";
 import { bookLockGuard } from "./bookLockGuard";
 import { EDIT_LOG_SWEEP_SQL, EDIT_LOG_RETENTION_SECONDS } from "./editLogSweep";
+import { DCS_COMMITS_SWEEP_SQL, DCS_COMMITS_RETENTION_SECONDS } from "./dcsCommitsSweep";
 import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
 
 export interface Env {
@@ -383,6 +384,17 @@ export default {
             .run();
         } catch (e) {
           console.error("edit_log retention sweep failed", e instanceof Error ? e.message : String(e));
+        }
+        // Same slot, same reasoning, for the dcs_commits ledger (issue #692
+        // item 1): it grows without bound and nothing currently reads it for a
+        // gating decision (see dcsCommitsSweep.ts), so a plain age-based DELETE
+        // is safe today.
+        try {
+          await env.DB.prepare(DCS_COMMITS_SWEEP_SQL)
+            .bind(Math.floor(Date.now() / 1000) - DCS_COMMITS_RETENTION_SECONDS)
+            .run();
+        } catch (e) {
+          console.error("dcs_commits retention sweep failed", e instanceof Error ? e.message : String(e));
         }
       }
       return;

@@ -848,6 +848,16 @@ export interface TwlSuggestion {
   disambiguation: string[];
 }
 
+// A verse's worth of raw TWL suggestions, grouped for the verse-aware panel.
+// The Suggestions panel scans every verse of a verse bridge (each via the
+// per-verse route) and carries the verse alongside so "Add" can place the link
+// on the verse it was scanned from, and the committed-row alternatives merge
+// can grab the right verse's alignment.
+export interface TwlVerseSuggestions {
+  verse: number;
+  suggestions: TwlSuggestion[];
+}
+
 // TWL suggestion deny-lists from GET /api/twl-filters/:book. Mirrors
 // api/src/twlFilters.ts. `unlinked` is global (word+article never linked);
 // `deleted` is this book's deleted reference+quote pairs (article-agnostic).
