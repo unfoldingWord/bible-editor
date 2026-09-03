@@ -26,7 +26,7 @@
 // watermark advances. Asserting the OLD outcome is the point — a regression
 // test that only checks the new behavior can't tell you it was ever broken.
 
-import { gitBlobSha, recognizeOwnPublish } from "./ownPublish.ts";
+import { findOurMergeForPr, gitBlobSha, judgeOwnPublishDecline, recognizeOwnPublish } from "./ownPublish.ts";
 import { computeVerseMerge } from "./verseMerge.ts";
 
 let failed = 0;
@@ -288,9 +288,97 @@ const foreignMerge = computeVerseMerge({
 eq(foreignMerge.action, "adopt", "a real foreign edit is still adopted (the 1CH behavior is preserved)");
 eq(foreignMerge.adopt, true, "adopt -> master's out-of-band correction reaches D1");
 
+// --- findOurMergeAfterRead / judgeOwnPublishDecline ---------------------------
+//
+// PROD SHAPE UNDER TEST (2026-09-01/02, en_tq tq_JER.tsv): the bp-assistant bot
+// pushed a chapter every evening (23:49Z on 09-01) between our nightly merges
+// (05:38Z / 05:42Z), so the byte comparison declined three nights running and the
+// blind counter raised the "cannot tell them apart" banner — while the merge job
+// was measured landing our exact bytes every time (five PRs, three books; #859's
+// head blob IS the ba421e896eab the banner named). Shas, dates and blobs below
+// are the real ones.
+const READ_AT_0901 = Date.parse("2026-09-01T05:31:00Z") / 1000; // render read, night of 09-01
+const READ_AT_0902 = Date.parse("2026-09-02T05:31:00Z") / 1000;
+const PUSHED_0901 = "ba421e896eab"; // what we pushed on 09-01 (PR #859 head blob)
+const PUSHED_0902 = "f8bacfca3bb4"; // what we pushed on 09-02 (PR #864 head blob)
+const botPush = { sha: "863fbfa65119", kind: "ai", date: "2026-09-01T23:49:46Z", authorName: "BW Bot", message: "TQ: JER 10 [ju..7@api.bp-assistant]" };
+const ourMerge0901 = { sha: "22d652732b18", kind: "ours", date: "2026-09-01T05:38:03Z", authorName: "Benjamin Wright", message: "bible-editor: JER tq → master (#859)" };
+const ourMerge0902 = { sha: "744f2ee87f2a", kind: "ours", date: "2026-09-02T05:42:19Z", authorName: "Benjamin Wright", message: "bible-editor: JER tq → master (#864)" };
+const humanEdit = { sha: "dd522309086b", kind: "human", date: "2026-06-06T15:32:07Z", authorName: "Richard Mahn", message: "Richmahn reorder rows (#572)" };
+const humanRevert = { sha: "0badc0ffee00", kind: "human", date: "2026-09-02T07:00:00Z", authorName: "Someone", message: 'Revert "bible-editor: JER tq → master (#864)"' };
+
+// Step 1: which commit merged tonight's push? Matched by the export PR's number in
+// the squash commit's subject. Newest-first walks, as Gitea serves them.
+{
+  // 09-02 morning: PR #864's merge is on master.
+  const found = findOurMergeForPr([ourMerge0902, botPush, ourMerge0901], 864);
+  eq(found.found, true, "the merge carrying our PR's number is found");
+  eq(found.commit.sha, "744f2ee87f2a", "…and it is that commit");
+
+  // The JER tq night of 09-01 → 09-02: bot push on top of our 09-01 merge (#859).
+  // The merge is found UNDER the bot commit — position never mattered.
+  const under = findOurMergeForPr([botPush, ourMerge0901], 859);
+  eq(under.found, true, "our merge is found beneath a later bot push");
+  eq(under.commit.sha, "22d652732b18", "…the right one");
+
+  // Tonight's branch (#864) has not merged yet: only #859's merge is on master.
+  const pending = findOurMergeForPr([botPush, ourMerge0901], 864);
+  eq(pending.found, false, "no commit with our PR's number → nothing merged yet");
+  eq(pending.reason, "merge_pending", "…and says so");
+  // Codex finding on PR #704: two overlapping exports. Export A (#859) merged
+  // AFTER export B's render was read; B is #864 and still pending. Matching by
+  // date would have compared A's blob against B's push; by PR number it is pending.
+  eq(findOurMergeForPr([ourMerge0901], 864).reason, "merge_pending", "another export's later-landing merge is not mistaken for ours");
+  // Cold-review F2 shape: an old foreign commit newest, our new branch pending.
+  eq(findOurMergeForPr([humanEdit], 864).reason, "merge_pending", "a stale foreign commit as newest is NOT an explanation while our push is unmerged");
+  // A human revert of our merge carries the same "(#864)" but is not ours.
+  eq(findOurMergeForPr([humanRevert], 864).reason, "merge_pending", "a human revert quoting our PR number is never taken for the merge");
+  eq(findOurMergeForPr([humanRevert, ourMerge0902], 864).commit?.sha, "744f2ee87f2a", "…the real merge beneath it still is");
+
+  // Absence is named for what it is.
+  eq(findOurMergeForPr([], 864).reason, "no_commits", "an empty walk measures nothing");
+  eq(findOurMergeForPr([ourMerge0902], null).reason, "no_pr_number", "no PR on record for the push → nothing to look for");
+  eq(findOurMergeForPr([ourMerge0902], 0).reason, "no_pr_number", "…nor for a nonsense number");
+  eq(findOurMergeForPr([{ ...ourMerge0902, message: null }], 864).reason, "merge_pending", "an ours commit with no subject cannot be the match");
+  // Only the subject line is matched — a body mentioning another PR is not a match.
+  eq(findOurMergeForPr([{ ...ourMerge0901, message: "bible-editor: JER tq → master (#859)\n\nsupersedes (#864)" }], 864).reason, "merge_pending", "a PR number in the body does not match");
+}
+
+// Step 2: the verdict from the merge commit's blob.
+{
+  const merge0901 = findOurMergeForPr([botPush, ourMerge0901], 859);
+  // THE JER tq NIGHT, measured: the merge holds exactly what we pushed → preserved,
+  // and the bot's push is named as what moved the file afterwards.
+  const preserved = judgeOwnPublishDecline({ ourMerge: merge0901, mergedBlobSha: PUSHED_0901, pushedBlobSha: PUSHED_0901, newest: botPush });
+  eq(preserved.verdict, "preserved", "merge blob == pushed blob → the merge job kept our bytes");
+  eq(preserved.mergeSha, "22d652732b18", "…citing the merge");
+  eq(preserved.newest?.kind, "ai", "…and naming what landed after it as the bot's push");
+  eq(preserved.newest?.author, "BW Bot", "…by account");
+
+  // A rewrite, measured at the merge itself — even with the bot's push on top,
+  // which is exactly the case the first draft could not see (cold review F1).
+  const rewritten = judgeOwnPublishDecline({ ourMerge: merge0901, mergedBlobSha: "0000deadbeef", pushedBlobSha: PUSHED_0901, newest: botPush });
+  eq(rewritten.verdict, "rewritten", "merge blob != pushed blob → the merge changed our content, whatever came after");
+  eq(rewritten.mergedBlobSha, "0000deadbeef", "…citing what it holds");
+  eq(rewritten.mergeSha, "22d652732b18", "…and where");
+
+  // Our merge is itself the newest commit and matched: preserved with nothing to name
+  // (in practice recognition would have fired first; the judge stays honest anyway).
+  const merge0902 = findOurMergeForPr([ourMerge0902], 864);
+  eq(judgeOwnPublishDecline({ ourMerge: merge0902, mergedBlobSha: PUSHED_0902, pushedBlobSha: PUSHED_0902, newest: ourMerge0902 }).newest, null, "a matching merge that is also newest names no later commit");
+
+  // Absence is not evidence, in either direction.
+  const noBlob = judgeOwnPublishDecline({ ourMerge: merge0901, mergedBlobSha: null, pushedBlobSha: PUSHED_0901, newest: botPush });
+  eq(noBlob.verdict, "unmeasured", "a failed tree read measures nothing");
+  eq(noBlob.reason, "merge_blob_unknown", "…for the stated reason");
+  const notFound = judgeOwnPublishDecline({ ourMerge: { found: false, reason: "merge_pending" }, mergedBlobSha: null, pushedBlobSha: PUSHED_0902, newest: botPush });
+  eq(notFound.verdict, "unmeasured", "no merge to measure → unmeasured");
+  eq(notFound.reason, "merge_pending", "…carrying step 1's reason");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
 } else {
-  console.log("\nAll gitBlobSha / recognizeOwnPublish / AMOS-timeline checks passed.");
+  console.log("\nAll gitBlobSha / recognizeOwnPublish / judgeOwnPublishDecline / AMOS-timeline checks passed.");
 }
