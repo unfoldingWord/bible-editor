@@ -109,6 +109,12 @@ interface Props {
   twl: TwlRow[];
   onSelectVerse: (v: number) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
+  // Verse-bridge create/break (UST only, wired in the DocColumn/BookView verse
+  // toolbar). Both carry the chapter so book mode (variable chapter) and
+  // columns mode (this chapter) share one Shell handler. Absent for viewers /
+  // when editing is off.
+  onMergeVerseBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  onSplitVerseBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
   onModeChange: (mode: ScriptureMode) => void;
   onEnabledVersionsChange: (versions: string[]) => void;
   onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
@@ -228,6 +234,8 @@ function ScriptureColumnInner({
   twl,
   onSelectVerse,
   onOpenAligner,
+  onMergeVerseBridge,
+  onSplitVerseBridge,
   onModeChange,
   onEnabledVersionsChange,
   onEditVerse,
@@ -588,6 +596,8 @@ function ScriptureColumnInner({
               }}
               onOpenAligner={onOpenBookAligner}
               onEditSection={onEditBookSection}
+              onMergeBridge={onMergeVerseBridge}
+              onSplitBridge={onSplitVerseBridge}
               locked={effectiveLocked}
               textCheck={textCheck}
             />
@@ -624,6 +634,16 @@ function ScriptureColumnInner({
                   }
                 }}
                 onOpenAligner={(verseNum) => onOpenAligner(verseNum, v)}
+                onMergeBridge={
+                  v === "UST" && onMergeVerseBridge
+                    ? (verseNum) => onMergeVerseBridge(chapter, verseNum, "UST")
+                    : undefined
+                }
+                onSplitBridge={
+                  v === "UST" && onSplitVerseBridge
+                    ? (verseNum) => onSplitVerseBridge(chapter, verseNum, "UST")
+                    : undefined
+                }
               onEditSection={
                 onEditSection
                   ? (verseNum, change, base) => onEditSection(verseNum, v, change, base)

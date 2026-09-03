@@ -43,6 +43,10 @@ export type LastChangeAction =
   | "delete"
   /** A restore-from-history write. */
   | "restore"
+  /** Two adjacent verses combined into a `\v a-b` bridge (verse-bridge create). */
+  | "bridge"
+  /** A `\v a-b` bridge broken back into separate verses (verse-bridge break). */
+  | "split"
   /**
    * sort_order changed and nothing else, and BIBLE EDITOR decided the order —
    * the in-app drag fast path, the interactive order-lock dismiss, and the
@@ -81,6 +85,20 @@ export type LastChangeAction =
   | "sync_reseed"
   /** The nightly DCS sync soft-deleted a row master no longer carries. */
   | "sync_prune"
+  /**
+   * The nightly DCS sync made this verse row a `\v a-b` bridge (or widened one)
+   * because MASTER carries that bridge — a human bridged the verses on Door43
+   * after we last published (issue #728). The absorbed rows are deleted with an
+   * edit_log 'delete' row each. Contrast 'bridge', the in-app action.
+   */
+  | "sync_bridge"
+  /**
+   * The nightly DCS sync broke this verse row's `\v a-b` bridge (or narrowed
+   * it) because MASTER carries the verses separately — a human un-bridged them
+   * on Door43 after we last published (issue #728). The freed verses are
+   * recreated from master. Contrast 'split', the in-app action.
+   */
+  | "sync_split"
   /**
    * Only sort_order changed, and MASTER'S FILE ORDER is why — the nightly
    * reimport re-sequencing rows to match the TSV Door43 sent. Not the export's

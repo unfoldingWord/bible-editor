@@ -21,11 +21,14 @@ import {
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
+import { applySplit, applyStep, applyUpdated, reduceVerses, type ChapterData } from "../lib/verseStructure";
 
 export type ChapterState =
   | { kind: "unloaded" }
   | { kind: "loading" }
-  | { kind: "ready"; data: ChapterPayload }
+  // ChapterData = ChapterPayload + client-only verse tombstones; a fresh load
+  // carries none (see lib/verseStructure.ts).
+  | { kind: "ready"; data: ChapterData }
   | { kind: "error"; error: string };
 
 export interface UseBookReturn {
@@ -33,7 +36,14 @@ export interface UseBookReturn {
   summaryStatus: "idle" | "loading" | "ready" | "error";
   chapters: Map<number, ChapterState>;
   loadChapter: (ch: number) => void;
+  /** Book-mode twin of useChapter.applyLocalVerse (own edit; tombstone-aware). */
   applyLocalVerse: (verse: VerseDto) => void;
+  /** Book-mode twin of useChapter.applyRemoteVerse (version- and tombstone-gated). */
+  applyRemoteVerse: (verse: VerseDto) => void;
+  /** Book-mode twin of useChapter.applyLocalVerseBridge (verse-bridge create). */
+  applyLocalVerseBridge: (bridge: VerseDto, removedVerse: number, absorbedVerses: number[], removedVersion?: number) => void;
+  /** Book-mode twin of useChapter.applyLocalVerseSplit (verse-bridge break). */
+  applyLocalVerseSplit: (start: VerseDto, newVerses: VerseDto[]) => void;
   applyLocalRowPatch: (
     kind: "tn" | "tq" | "twl",
     chapter: number,
@@ -140,24 +150,68 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
     [book, enabled],
   );
 
-  const applyLocalVerse = useCallback<UseBookReturn["applyLocalVerse"]>((verse) => {
-    setChapters((prev) => {
-      const cur = prev.get(verse.chapter);
-      if (!cur || cur.kind !== "ready") return prev;
-      const data = cur.data;
-      const byVersion = data.verses[verse.bible_version] ?? {};
-      const nextByVersion = { ...byVersion, [verse.verse]: verse };
-      const next = new Map(prev);
-      next.set(verse.chapter, {
-        kind: "ready",
-        data: {
-          ...data,
-          verses: { ...data.verses, [verse.bible_version]: nextByVersion },
-        },
+  // Shared shape for the verse-map updaters: reduce one loaded chapter's data
+  // through lib/verseStructure.ts (the WS reorder rules live there, once) and
+  // return the previous Map untouched when the reducer reports a no-op.
+  const reduceChapter = useCallback(
+    (chapter: number, step: (data: ChapterData) => ChapterData) => {
+      setChapters((prev) => {
+        const cur = prev.get(chapter);
+        if (!cur || cur.kind !== "ready") return prev;
+        const data = step(cur.data);
+        if (data === cur.data) return prev;
+        const next = new Map(prev);
+        next.set(chapter, { kind: "ready", data });
+        return next;
       });
-      return next;
-    });
-  }, []);
+    },
+    [],
+  );
+
+  const applyLocalVerse = useCallback<UseBookReturn["applyLocalVerse"]>(
+    (verse) => {
+      reduceChapter(verse.chapter, (data) =>
+        reduceVerses(data, verse.bible_version, (s) => applyUpdated(s, verse, { force: true })),
+      );
+    },
+    [reduceChapter],
+  );
+
+  const applyRemoteVerse = useCallback<UseBookReturn["applyRemoteVerse"]>(
+    (verse) => {
+      reduceChapter(verse.chapter, (data) => reduceVerses(data, verse.bible_version, (s) => applyUpdated(s, verse)));
+    },
+    [reduceChapter],
+  );
+
+  const applyLocalVerseBridge = useCallback<UseBookReturn["applyLocalVerseBridge"]>(
+    (bridge, removedVerse, absorbedVerses, removedVersion) => {
+      // Same step as useChapter.applyLocalVerseBridge: applyStep owns the
+      // absorbed verses' status / lane-check prune (gated on the absorbed row
+      // actually leaving the map, not on a mere tombstone write), so the two
+      // hooks cannot drift.
+      reduceChapter(bridge.chapter, (data) =>
+        applyStep(data, {
+          type: "bridged",
+          bibleVersion: bridge.bible_version,
+          bridge,
+          removedVerse,
+          removedVersion,
+          absorbedVerses,
+        }),
+      );
+    },
+    [reduceChapter],
+  );
+
+  const applyLocalVerseSplit = useCallback<UseBookReturn["applyLocalVerseSplit"]>(
+    (start, newVerses) => {
+      reduceChapter(start.chapter, (data) =>
+        reduceVerses(data, start.bible_version, (s) => applySplit(s, start, newVerses)),
+      );
+    },
+    [reduceChapter],
+  );
 
   const applyLocalRowPatch = useCallback<UseBookReturn["applyLocalRowPatch"]>(
     (kind, chapter, id, patch) => {
@@ -184,7 +238,8 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
       if (result.kind !== "ok") return;
       if (op.target.kind === "verse") {
         const v = result.updated as VerseDto;
-        if (v && v.book === book) applyLocalVerse(v);
+        // Version-gated (see useChapter's outbox listener, #729).
+        if (v && v.book === book) applyRemoteVerse(v);
         return;
       }
       if (op.target.kind === "row") {
@@ -206,7 +261,17 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
         });
       }
     });
-  }, [book, enabled, applyLocalVerse]);
+  }, [book, enabled, applyRemoteVerse]);
 
-  return { summary, summaryStatus, chapters, loadChapter, applyLocalVerse, applyLocalRowPatch };
+  return {
+    summary,
+    summaryStatus,
+    chapters,
+    loadChapter,
+    applyLocalVerse,
+    applyRemoteVerse,
+    applyLocalVerseBridge,
+    applyLocalVerseSplit,
+    applyLocalRowPatch,
+  };
 }

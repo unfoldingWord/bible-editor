@@ -1,0 +1,352 @@
+// Verse bridges — combining two adjacent verses into a `\v 1-2` block, and
+// splitting one back apart. See verses.ts for the routes that drive these.
+//
+// A bridge is stored as ONE `verses` row: the start verse's row carries
+// `verse_end` (migration 0022) and `content_json` holds the combined
+// verseObjects; the interior verse rows do not exist. Import/export already
+// round-trip `\v a-b` through this same shape (import-book.mjs, export.ts).
+//
+// This module is PURE — no `hono`, no `Env`, no `D1`. `api/src/*.test.mjs`
+// runs under plain `node --experimental-strip-types`, which cannot resolve
+// `hono` from node_modules (STATE.md: "A module that imports hono cannot be
+// unit-tested"), so the merge/split math and the version-guarded SQL live here
+// where verseBridge.test.mjs can exercise them against real SQLite, and the
+// Hono route in verses.ts only wires them to the request. Same split as
+// verseMergeConflictSql.ts + verseMergeConflicts.ts.
+
+// The minimal shape this module needs off a verse row. Both VerseRow (server)
+// and VerseDto (client) satisfy it, so callers pass whichever they hold.
+export interface BridgeVerseRef {
+  verse: number;
+  verse_end: number | null;
+}
+
+// The inclusive end of a bridge (or the verse itself for a singleton).
+export function verseRangeEnd(row: BridgeVerseRef): number {
+  return row.verse_end ?? row.verse;
+}
+
+// True for a real multi-verse block (verse_end past the start). A row with
+// verse_end == verse is a degenerate singleton and is NOT a bridge.
+export function isBridge(row: BridgeVerseRef): boolean {
+  return row.verse_end != null && row.verse_end > row.verse;
+}
+
+// The verse number the "next" row must start at for a merge-with-next. For a
+// singleton verse V it is V+1; for a bridge V..E it is E+1 (extend the bridge).
+export function expectedNextStart(start: BridgeVerseRef): number {
+  return verseRangeEnd(start) + 1;
+}
+
+// The end the bridge gets after absorbing `next` — `next` may itself be a
+// bridge (extending 1-2 by a 3-4 block yields 1-4).
+export function computeBridgeEnd(next: BridgeVerseRef): number {
+  return verseRangeEnd(next);
+}
+
+// Every integer verse the absorbed `next` row covered — the keys whose
+// verse_statuses / verse_lane_checks orphan when its row is deleted, and the
+// keys other tabs must prune on a `verse.bridged` broadcast.
+export function absorbedVerseNumbers(next: BridgeVerseRef): number[] {
+  const out: number[] = [];
+  for (let v = next.verse; v <= verseRangeEnd(next); v++) out.push(v);
+  return out;
+}
+
+// The new singleton verse numbers a split mints — every verse past the start.
+// `[]` for a non-bridge (nothing to split).
+export function splitVerseNumbers(bridge: BridgeVerseRef): number[] {
+  const out: number[] = [];
+  for (let v = bridge.verse + 1; v <= verseRangeEnd(bridge); v++) out.push(v);
+  return out;
+}
+
+// The seed content for a verse a split emptied. NOT `[]`: an empty verseObjects
+// array is refused for a real verse (refusesEmptyVerseObjects in contentJson.ts
+// — "an empty tree would blank the verse text with no way to type it back"). A
+// single trailing-newline text node is the minimal valid tree: it renders as an
+// empty, editable cell and exports as a bare `\v N` with no body. Kept here as
+// the single source of truth so the route and the tests agree.
+export function splitSeedVerseObjects(): unknown[] {
+  return [{ type: "text", text: "\n" }];
+}
+
+// True when a parsed content tree is the expected `{ verseObjects: [...] }`
+// shape. A row whose content_json is valid JSON but NOT this shape (a bare
+// array, a typo'd key) must never be bridged: verseObjectsOf would silently
+// drop its content while BRIDGE_DELETE_NEXT_SQL still deletes the row. The merge
+// route refuses when either side fails this, mirroring the corrupt-JSON refusal
+// (which also never deletes). An empty `verseObjects: []` passes — that is a
+// legal, in-shape tree with nothing to lose, not an off-shape row.
+export function hasVerseObjectsArray(parsed: unknown): boolean {
+  return Array.isArray((parsed as { verseObjects?: unknown } | null)?.verseObjects);
+}
+
+// Concatenate the start verse's objects with the next verse's, with a single
+// space between so the two texts don't run together — the same separator
+// verseRange.ts's concatSourceRange uses to join a source range for the
+// aligner. Neither array is mutated. Occurrence renumbering across the combined
+// verse is the caller's job (recomputeTargetOccurrences in the route), kept out
+// of this pure module because it lives in importParsers.ts.
+export function mergeVerseObjects(startVos: unknown[], nextVos: unknown[]): unknown[] {
+  if (startVos.length === 0) return [...nextVos];
+  if (nextVos.length === 0) return [...startVos];
+  return [...startVos, { type: "text", text: " " }, ...nextVos];
+}
+
+// ---------------------------------------------------------------------------
+// SQL for the two structural writes. Exported as constants so verseBridge.test.mjs
+// can drive the EXACT `EXISTS` + `changes()` chaining against real SQLite — the
+// same anti-drift reason verseMergeConflictSql.ts's statements are shared
+// constants. A D1 batch is one transaction but does NOT roll back a statement
+// that matches zero rows (only an error rolls the batch back), so two
+// independent version-guarded writes could half-commit — a deleted verse-2 row
+// with no bridge. The two writes below are made mutually atomic instead: the
+// UPDATE carries BOTH version checks (its own on the start row, plus an EXISTS
+// on the next row's version), and every following statement chains on
+// `changes() > 0`, so the DELETE and the audit rows fire only when the UPDATE
+// landed with both versions matched. This is the same pattern verses.ts's PATCH
+// route already uses to seed its edit_log / resolve statements.
+// ---------------------------------------------------------------------------
+
+// MERGE statement 1 — rewrite the start row into the bridge, gated on BOTH the
+// start row's version AND the next row still being at the version we read.
+//
+// Binds, in order: (contentJson, verseEnd, updatedAt, updatedBy,
+// lastChangeAction, lastChangeSource, lastChangeActor, book, chapter, verse,
+// bibleVersion, startVersion, nextVerse, nextVersion, plainText). plainText is
+// the ?15 tail (appended rather than inserted so the version/EXISTS binds keep
+// their numbers) — the joined plain_text search cache for the merged verse.
+export const BRIDGE_UPDATE_START_SQL = `UPDATE verses
+   SET content_json = ?1, verse_end = ?2, plain_text = ?15, version = version + 1,
+       updated_at = ?3, updated_by = ?4,
+       last_change_action = ?5, last_change_source = ?6, last_change_actor = ?7
+ WHERE book = ?8 AND chapter = ?9 AND verse = ?10 AND bible_version = ?11
+   AND version = ?12
+   AND EXISTS (SELECT 1 FROM verses
+                WHERE book = ?8 AND chapter = ?9 AND verse = ?13 AND bible_version = ?11
+                  AND version = ?14)`;
+
+// MERGE statement 2 — delete the absorbed row, only if statement 1 landed.
+// Binds, in order: (book, chapter, nextVerse, bibleVersion).
+export const BRIDGE_DELETE_NEXT_SQL = `DELETE FROM verses
+  WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4
+    AND changes() > 0`;
+
+// SPLIT statement 1 — de-bridge the start row (drop verse_end, keep all
+// content), gated on its version and on it actually being a bridge.
+//
+// Binds, in order: (updatedAt, updatedBy, lastChangeAction, lastChangeSource,
+// lastChangeActor, book, chapter, verse, bibleVersion, expectedVersion).
+export const SPLIT_UPDATE_START_SQL = `UPDATE verses
+   SET verse_end = NULL, version = version + 1,
+       updated_at = ?1, updated_by = ?2,
+       last_change_action = ?3, last_change_source = ?4, last_change_actor = ?5
+ WHERE book = ?6 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9
+   AND version = ?10 AND verse_end IS NOT NULL AND verse_end > verse`;
+
+// ── Version floor for a re-minted verse row ──────────────────────────────────
+//
+// SQL expression (not a statement) that evaluates to the version a verse row
+// must be (re)created at: strictly above BOTH the highest `new_version` its
+// row_key ever reached in edit_log AND a caller-supplied floor. A verse row's
+// primary key can be deleted and re-minted (bridge → split; a bridge deleting a
+// verse master still carries, which the nightly reimport then recreates). A
+// fresh row at the column default `version = 1` would let a stale outbox PATCH
+// still holding a pre-deletion `If-Match` pass the numeric CAS and silently
+// overwrite the recreated content; starting above the high-water makes every
+// such stale If-Match strictly less than the new version, so its CAS fails 409.
+//
+// Every argument is a SQL fragment spliced verbatim — a positional bind
+// (`?1`), a column/CTE reference (`v`), or a literal (`0`). `chapter` and
+// `verse` are CAST to INTEGER before concatenation because a REAL-bound number
+// renders as "5.0" under `||` and would never match the stored row_key
+// (`book/chapter/verse/bibleVersion`). `floor` is the lowest acceptable
+// predecessor (the bridge row's own version for a split; `0` when there is no
+// live predecessor, as on a reimport INSERT).
+//
+// The same expression is deliberately reused for the row's `version` AND for
+// its 'create' audit row's `new_version` inside one batch: both read edit_log
+// as it stood before either statement (the audit row is what would raise the
+// high-water, and it does not exist yet), so they agree by construction.
+// Shared by verses.ts's split (via the SPLIT_* constants below) and
+// bookReimport.ts's applyVerseRows INSERT; issue #727.
+//
+// `COALESCE(new_version, prev_version)`, not `new_version` alone: the bridge
+// route's audit row for the ABSORBED verse is `action='delete'` with
+// `new_version = NULL` and the deleted row's version in `prev_version`
+// (verses.ts), and the bootstrap import writes no edit_log rows for verses at
+// all. So a verse imported at v1, never edited, then absorbed by a bridge has a
+// delete-only history — MAX(new_version) is NULL, and the reimport would have
+// recreated it at MAX(0, floor) + 1 = 1, the very version the deleted row held,
+// letting a stale `If-Match: 1` pass. For every non-delete row new_version >=
+// prev_version, so the COALESCE changes nothing else (verseBridge.test.mjs,
+// applyVerseRows.test.mjs cover the delete-only case).
+export function verseVersionFloorSql(ref: {
+  book: string;
+  chapter: string;
+  verse: string;
+  bibleVersion: string;
+  floor: string;
+}): string {
+  const rowKey = `${ref.book} || '/' || CAST(${ref.chapter} AS INTEGER) || '/' || CAST(${ref.verse} AS INTEGER) || '/' || ${ref.bibleVersion}`;
+  return `MAX(
+       COALESCE((SELECT MAX(COALESCE(new_version, prev_version)) FROM edit_log
+                  WHERE kind = 'verse'
+                    AND row_key = ${rowKey}), 0),
+       ${ref.floor}
+     ) + 1`;
+}
+
+// SPLIT — insert ALL the seeded singleton verses in ONE statement, only if the
+// preceding statement in the batch landed (so a lost CAS inserts nothing).
+//
+// A recursive CTE generates the verse numbers (startVerse+1 .. verseEnd) so the
+// statement count and bound-param count are FIXED regardless of how many verses
+// the bridge spans. This matters: the old one-INSERT-per-verse shape put
+// 2 + 2*(N-1) statements in the split batch, and D1 caps a batch at 100
+// statements / 100 params each — so splitting a bridge of 51+ verses (reachable
+// by repeatedly extending a bridge, or by an imported long bridge) overflowed
+// the batch and failed. Two fixed multi-row INSERTs keep the whole split at
+// exactly four statements, preserving the atomic all-or-nothing guarantee.
+//
+// The recreated verse's `version` is NOT a literal 1. A bridge→split cycle
+// re-mints a deleted verse's primary key, and a stale outbox PATCH still holding
+// a pre-bridge `If-Match` for that verse would pass the numeric CAS against a
+// fresh version=1 row and silently overwrite the seed with stale text. Start
+// each recreated verse ABOVE both (a) the highest version it ever reached in
+// edit_log and (b) the bridge row's current version (?12) — so any stale
+// If-Match a client could hold is strictly less than the new version and its CAS
+// fails with a 409 instead. The CAST mirrors the row_key format stored elsewhere
+// (a REAL-bound integer would concatenate as "5.0" and never match).
+//
+// Binds, in order: (book, chapter, bibleVersion, contentJson, updatedAt,
+// updatedBy, startVerse, verseEnd, lastChangeAction, lastChangeSource,
+// lastChangeActor, bridgeVersion).
+export const SPLIT_INSERT_VERSES_RANGE_SQL = `INSERT INTO verses
+     (book, chapter, verse, verse_end, bible_version, content_json, plain_text,
+      version, updated_at, updated_by, last_change_action, last_change_source, last_change_actor)
+   WITH RECURSIVE split_seq(v) AS (
+     SELECT ?7 + 1
+     UNION ALL SELECT v + 1 FROM split_seq WHERE v + 1 <= ?8
+   )
+   SELECT ?1, ?2, v, NULL, ?3, ?4, NULL,
+     ${verseVersionFloorSql({ book: "?1", chapter: "?2", verse: "v", bibleVersion: "?3", floor: "?12" })},
+     ?5, ?6, ?9, ?10, ?11
+     FROM split_seq
+    WHERE changes() > 0`;
+
+// SPLIT — the matching 'create' audit rows for the seeded verses, again in one
+// CTE-driven statement, chained on the verse INSERT above having landed.
+// row_key is `book/chapter/verse/bibleVersion`, built in SQL from the seq.
+//
+// Binds, in order: (book, chapter, bibleVersion, startVerse, verseEnd, userId,
+// payloadJson, bridgeVersion).
+// row_key must read `book/chapter/verse/bibleVersion` — the canonical form used
+// everywhere else (verseHistory, the merge route's JS-built keys). CAST chapter
+// and v to INTEGER before concatenating: SQLite string `||` renders a REAL-bound
+// number as "5.0", and drivers (node:sqlite, and D1 for a JS number) bind
+// integers as REAL — so without the CAST the key would be `book/5.0/2.0/bv` and
+// never match a lookup. The verse COLUMN is unaffected (INTEGER affinity coerces
+// on insert); only this text concatenation needs the cast.
+//
+// new_version MUST be the ACTUAL seeded version, not a literal 1: it is what
+// makes edit_log's high-water for this verse truthful. If it logged 1, a repeat
+// bridge→split cycle would read the stale pre-bridge max instead of the real
+// seeded version and re-mint the SAME number, re-opening the stale-If-Match
+// replay this whole mechanism exists to close. It is the identical expression
+// SPLIT_INSERT_VERSES_RANGE_SQL uses for the row's version — and evaluates to the
+// same value here, because this INSERT...SELECT reads edit_log as it stood before
+// this statement (no create row for this verse exists yet), exactly as the verses
+// insert did. So the audit's new_version == the row's version, always.
+export const SPLIT_INSERT_EDITLOG_RANGE_SQL = `INSERT INTO edit_log
+     (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+   WITH RECURSIVE split_seq(v) AS (
+     SELECT ?4 + 1
+     UNION ALL SELECT v + 1 FROM split_seq WHERE v + 1 <= ?5
+   )
+   SELECT 'verse', ?1 || '/' || CAST(?2 AS INTEGER) || '/' || CAST(v AS INTEGER) || '/' || ?3, ?1, ?6, NULL,
+     ${verseVersionFloorSql({ book: "?1", chapter: "?2", verse: "v", bibleVersion: "?3", floor: "?8" })},
+     'create', ?7
+     FROM split_seq
+    WHERE changes() > 0`;
+
+// Delete the orphaned per-verse checkoff/status for a contiguous absorbed range
+// [fromVerse, toVerse]. Run POST-CONFIRM (after the merge UPDATE is known to
+// have landed), NOT chained in the merge batch: these can legitimately match
+// zero rows (the verse was never checked), which would break a `changes() > 0`
+// chain for any statement after them. Best-effort cleanup — a surviving status
+// row keyed at a now-absent verse is simply unused until (and unless) the
+// bridge is split again.
+//
+// Binds, in order: (book, chapter, fromVerse, toVerse).
+export const DELETE_VERSE_STATUSES_RANGE_SQL = `DELETE FROM verse_statuses
+  WHERE book = ?1 AND chapter = ?2 AND verse >= ?3 AND verse <= ?4`;
+
+// Binds, in order: (book, chapter, fromVerse, toVerse).
+export const DELETE_VERSE_LANE_CHECKS_RANGE_SQL = `DELETE FROM verse_lane_checks
+  WHERE book = ?1 AND chapter = ?2 AND verse >= ?3 AND verse <= ?4`;
+
+// ── Range overlap detection (issue #727) ─────────────────────────────────────
+//
+// A chapter's verse rows must cover DISJOINT ranges: `[verse, verse_end ?? verse]`
+// of any two rows may not intersect. Nothing structural enforces that — the
+// verses primary key is (book, chapter, verse, bible_version), so a `1-2` bridge
+// row and a standalone `2` row coexist happily in D1 — and usfm-js renders both
+// keys ("1-2" and "2") in the same chapter object without complaint, shipping
+// `\v 1-2` followed by `\v 2` to Door43. Both the export (buildUsfm) and the
+// nightly reimport's post-apply audit (applyVerseRows) call this so the corrupt
+// shape is REFUSED and COUNTED rather than published. Pure, so both call sites
+// share one definition and it is unit-testable without D1.
+
+// The minimal row shape the check needs; any VerseRow / D1 read row satisfies it.
+export interface VerseRangeRef {
+  verse: number;
+  verse_end: number | null;
+}
+
+// Human-readable range: "5" for a singleton, "5-7" for a bridge. Used by the
+// error below and by the reimport's log line, so the two read the same.
+export function formatVerseRange(r: VerseRangeRef): string {
+  const end = verseRangeEnd(r);
+  return end > r.verse ? `${r.verse}-${end}` : String(r.verse);
+}
+
+// Every pair of rows (from ONE chapter) whose ranges intersect, each pair
+// ordered (earlier-start, later-start). Sorted sweep: after ordering by start,
+// a row overlaps iff its start is ≤ the largest end seen so far, and the
+// offender is whichever earlier row holds that end. O(n log n); returns [] for
+// a clean chapter. Input order is irrelevant. Callers pass one chapter's rows —
+// this function does not (and cannot) partition by chapter itself.
+export function findOverlappingRanges<T extends VerseRangeRef>(rows: T[]): Array<{ a: T; b: T }> {
+  const sorted = [...rows].sort((x, y) => x.verse - y.verse || verseRangeEnd(x) - verseRangeEnd(y));
+  const out: Array<{ a: T; b: T }> = [];
+  let reach: T | null = null;
+  for (const r of sorted) {
+    if (reach != null && r.verse <= verseRangeEnd(reach)) out.push({ a: reach, b: r });
+    if (reach == null || verseRangeEnd(r) > verseRangeEnd(reach)) reach = r;
+  }
+  return out;
+}
+
+// Thrown by the export when a chapter's rows overlap. Typed (name +
+// structured fields) so exportWorkflow's per-`book × resource` step fails
+// loudly with a message that names exactly what to fix, and so a log/alert
+// reader can tell it apart from a DCS or parse failure. Message shape:
+//   verse_range_overlap: ZEC UST chapter 5 — 1-2 ∩ 2
+export class VerseRangeOverlapError extends Error {
+  readonly book: string;
+  readonly bibleVersion: string;
+  readonly chapter: number;
+  // Each entry is "a ∩ b" using formatVerseRange, e.g. "1-2 ∩ 2".
+  readonly overlaps: string[];
+  constructor(book: string, bibleVersion: string, chapter: number, pairs: Array<{ a: VerseRangeRef; b: VerseRangeRef }>) {
+    const overlaps = pairs.map((p) => `${formatVerseRange(p.a)} ∩ ${formatVerseRange(p.b)}`);
+    super(`verse_range_overlap: ${book} ${bibleVersion} chapter ${chapter} — ${overlaps.join(", ")}`);
+    this.name = "VerseRangeOverlapError";
+    this.book = book;
+    this.bibleVersion = bibleVersion;
+    this.chapter = chapter;
+    this.overlaps = overlaps;
+  }
+}

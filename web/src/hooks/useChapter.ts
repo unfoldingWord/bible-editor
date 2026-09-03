@@ -20,8 +20,30 @@ import {
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
+import {
+  applyStep,
+  applyUpdated,
+  mergeRefetched,
+  reduceVerses,
+  replaySteps,
+  type ChapterData,
+  type StructureStep,
+} from "../lib/verseStructure";
 
 type Status = "idle" | "loading" | "ready" | "error" | "retrying";
+
+export interface RefetchOptions {
+  /**
+   * Merge the fetched payload with the current one instead of replacing it:
+   * a verse the tab holds at an equal-or-newer version stays (see
+   * lib/verseStructure.ts `mergeRefetched`). For the WS reconnect refetch,
+   * which races the outbox drain on the same `online` moment — a stale GET
+   * must not regress a verse the tab's own PATCH just advanced. Every other
+   * caller wants the plain replace (default): they refetch precisely because
+   * the server changed rows/versions out from under the tab.
+   */
+  keepNewerLocal?: boolean;
+}
 
 export interface UseChapterReturn {
   status: Status;
@@ -29,7 +51,7 @@ export interface UseChapterReturn {
   error: string | null;
   /** Incremented every failed attempt during the current retry loop. Useful for showing "reconnecting…". */
   retryAttempts: number;
-  refetch: () => Promise<void>;
+  refetch: (opts?: RefetchOptions) => Promise<void>;
   applyLocalRowPatch: (kind: "tn" | "tq" | "twl", id: string, patch: Partial<TnRow & TqRow & TwlRow>) => void;
   applyLocalRowReplacement: (kind: "tn" | "tq" | "twl", row: TnRow | TqRow | TwlRow) => void;
   applyLocalRowDelete: (kind: "tn" | "tq" | "twl", id: string) => void;
@@ -38,7 +60,35 @@ export interface UseChapterReturn {
     row: TnRow | TqRow | TwlRow,
     position?: { afterId?: string },
   ) => void;
+  /**
+   * This tab's own edit (optimistic, or the outbox's confirmed result for it):
+   * applied regardless of version, EXCEPT that it can never resurrect a verse
+   * another tab has already bridged away (tombstone — lib/verseStructure.ts).
+   */
   applyLocalVerse: (verse: VerseDto) => void;
+  /**
+   * A verse row from elsewhere (WS `verse.updated`, an outbox result): applied
+   * only if strictly newer than the local row and above the verse number's
+   * tombstone. Both checks live in the reducer so every caller agrees.
+   */
+  applyRemoteVerse: (verse: VerseDto) => void;
+  /**
+   * A verse-bridge was created: replace the start verse with the combined
+   * bridge DTO, drop the absorbed verse's map key, and prune the now-orphaned
+   * per-verse status / lane-checks for every absorbed verse. Applied after the
+   * server confirms (a 409 must not leave a half-formed bridge), and reused by
+   * the WS `verse.bridged` handler for other tabs. `removedVersion` (the
+   * deleted row's version) becomes the tombstone that lets a reordered
+   * `verse.updated` / `verse.split` for that verse be told apart from a real
+   * recreation (#729).
+   */
+  applyLocalVerseBridge: (bridge: VerseDto, removedVerse: number, absorbedVerses: number[], removedVersion?: number) => void;
+  /**
+   * A verse-bridge was broken: replace the start verse with the de-bridged DTO
+   * and add the freshly-seeded singleton rows. Applied after the server
+   * confirms; reused by the WS `verse.split` handler.
+   */
+  applyLocalVerseSplit: (start: VerseDto, newVerses: VerseDto[]) => void;
   applyLocalVerseStatus: (verse: number, done: boolean) => void;
   /** Optimistically add/remove my own stamp on a (verse, lane). */
   applyLocalLaneCheck: (verse: number, lane: CheckLane, userId: number, checked: boolean) => void;
@@ -57,18 +107,40 @@ export interface UseChapterReturn {
 
 export function useChapter(book: string, chapter: number): UseChapterReturn {
   const [status, setStatus] = useState<Status>("idle");
-  const [data, setData] = useState<ChapterPayload | null>(null);
+  // ChapterData = the server payload + client-only verse tombstones. A fresh
+  // payload from refetch carries none, which is how tombstones get cleared.
+  const [data, setData] = useState<ChapterData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [retryAttempts, setRetryAttempts] = useState(0);
   const mounted = useRef(true);
   const fetchCtrl = useRef<AbortController | null>(null);
+  // Reducer steps (WS bridged / split / updated, outbox results) that reach
+  // the tab while a `keepNewerLocal` refetch is in flight. Non-null exactly
+  // while such a refetch is pending. `mergeRefetched` can only judge verses
+  // the GET's snapshot contains, so a split that recreated a verse AFTER the
+  // snapshot but BEFORE the response landed would be silently discarded (the
+  // response has no row for it); replaying the queue over the merged map puts
+  // it back. Replay is idempotent — every step is version-gated (see
+  // lib/verseStructure.ts `StructureStep`).
+  //
+  // One queue, owned by the LATEST request: a second reconnect refetch while
+  // the first is in flight aborts the first (fetchCtrl) and inherits the
+  // queue — steps the first collected are either newer than the second GET's
+  // rows (and kept by the merge anyway) or stale echoes (no-ops on replay).
+  // A plain-replace refetch or a chapter change drops it; the resolving or
+  // failing latest request clears it.
+  const replayQueue = useRef<StructureStep[] | null>(null);
 
-  const refetch = useCallback(async () => {
+  const refetch = useCallback(async (opts?: RefetchOptions) => {
     // Abort any in-flight retry loop from a previous (book, chapter) before
     // starting a new one — otherwise stale data could land after navigation.
     fetchCtrl.current?.abort();
     const ctrl = new AbortController();
     fetchCtrl.current = ctrl;
+    // `=== true` so a caller that hands `refetch` straight to an event
+    // handler (receiving a truthy event object) still gets the replace.
+    const keepNewerLocal = opts?.keepNewerLocal === true;
+    replayQueue.current = keepNewerLocal ? (replayQueue.current ?? []) : null;
 
     setStatus("loading");
     setError(null);
@@ -87,11 +159,20 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         },
       );
       if (!mounted.current || fetchCtrl.current !== ctrl) return;
-      setData(payload);
+      // Take the queue synchronously, before the updater runs: a step that
+      // arrives after this point is applied by its own setData, which React
+      // orders after this one, so it must not also be replayed here.
+      const queued = replayQueue.current ?? [];
+      replayQueue.current = null;
+      setData((prev) => (keepNewerLocal ? replaySteps(mergeRefetched(prev, payload), queued) : payload));
       setStatus("ready");
       setRetryAttempts(0);
     } catch (e) {
+      // A superseded request (a newer refetch owns fetchCtrl and the queue)
+      // must leave the queue to its successor; only the latest request's
+      // failure drops it.
       if (!mounted.current || fetchCtrl.current !== ctrl) return;
+      replayQueue.current = null;
       if (ctrl.signal.aborted) return;
       setError(e instanceof ApiError ? `HTTP ${e.status}` : String(e));
       setStatus("error");
@@ -181,19 +262,57 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     [],
   );
 
+  // The verse map is reduced by lib/verseStructure.ts so the WS reorder rules
+  // (version clock + per-verse tombstones) live in one pure, permutation-tested
+  // place rather than being re-derived in each updater below.
   const applyLocalVerse = useCallback<UseChapterReturn["applyLocalVerse"]>(
     (verse) => {
-      setData((prev) => {
-        if (!prev) return prev;
-        const byVersion = prev.verses[verse.bible_version] ?? {};
-        const nextVersion = { ...byVersion, [verse.verse]: verse };
-        return {
-          ...prev,
-          verses: { ...prev.verses, [verse.bible_version]: nextVersion },
-        };
-      });
+      setData((prev) =>
+        prev ? reduceVerses(prev, verse.bible_version, (s) => applyUpdated(s, verse, { force: true })) : prev,
+      );
     },
     [],
+  );
+
+  // Every strictly-gated step (never the forced optimistic edit above) goes
+  // through here so it is both applied now and, while a keepNewerLocal refetch
+  // is in flight, recorded for replay over the merged payload. Recording
+  // happens at call time, not inside the updater: updaters may run twice
+  // (StrictMode) and run later than the call, and the refetch reads the queue
+  // synchronously when its response lands.
+  const dispatchStep = useCallback((step: StructureStep) => {
+    replayQueue.current?.push(step);
+    setData((prev) => (prev ? applyStep(prev, step) : prev));
+  }, []);
+
+  const applyRemoteVerse = useCallback<UseChapterReturn["applyRemoteVerse"]>(
+    (verse) => {
+      dispatchStep({ type: "updated", bibleVersion: verse.bible_version, verse });
+    },
+    [dispatchStep],
+  );
+
+  const applyLocalVerseBridge = useCallback<UseChapterReturn["applyLocalVerseBridge"]>(
+    (bridge, removedVerse, absorbedVerses, removedVersion) => {
+      // The absorbed verses' status / lane-check prune lives in applyStep, so a
+      // replayed bridge does exactly what the live one did.
+      dispatchStep({
+        type: "bridged",
+        bibleVersion: bridge.bible_version,
+        bridge,
+        removedVerse,
+        removedVersion,
+        absorbedVerses,
+      });
+    },
+    [dispatchStep],
+  );
+
+  const applyLocalVerseSplit = useCallback<UseChapterReturn["applyLocalVerseSplit"]>(
+    (start, newVerses) => {
+      dispatchStep({ type: "split", bibleVersion: start.bible_version, start, newVerses });
+    },
+    [dispatchStep],
   );
 
   const applyLocalVerseStatus = useCallback<UseChapterReturn["applyLocalVerseStatus"]>(
@@ -303,7 +422,10 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       if (op.target.kind === "verse") {
         const v = result.updated as VerseDto;
         if (v && v.book === book && v.chapter === chapter) {
-          applyLocalVerse(v);
+          // Version-gated: the server's row for a save that raced a bridge/
+          // split must neither regress a newer row nor resurrect a tombstoned
+          // verse (#729).
+          applyRemoteVerse(v);
         }
         return;
       }
@@ -321,7 +443,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         }
       }
     });
-  }, [book, chapter, applyLocalRowReplacement, applyLocalVerse, applyLocalVerseStatus, applyLaneCheckers]);
+  }, [book, chapter, applyLocalRowReplacement, applyRemoteVerse, applyLocalVerseStatus, applyLaneCheckers]);
 
   return {
     status,
@@ -334,6 +456,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     applyLocalRowDelete,
     applyLocalRowInsert,
     applyLocalVerse,
+    applyRemoteVerse,
+    applyLocalVerseBridge,
+    applyLocalVerseSplit,
     applyLocalVerseStatus,
     applyLocalLaneCheck,
     applyLaneCheckers,

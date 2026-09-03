@@ -1124,6 +1124,42 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
 }
 
 {
+  // Issue #728 review F5: 'keep_local_structure' is a STRUCTURE-dimension flag
+  // (the nightly sync kept D1's verse-bridge shape, wrote nothing). Landing on a
+  // verse whose UNRESOLVED adopt_conflict still waits for a human, it must not
+  // relabel that row and NULL the recovery pointer the human needs — the other
+  // keep actions do (they supersede the content decision); this one does not.
+  const d = verseDb();
+  d.prepare(`INSERT INTO verses (book, chapter, verse, bible_version, version) VALUES ('PSA', 21, 1, 'ULT', 6)`).run();
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "PSA", "ult", 21, 1, "adopt_conflict", "both_changed", 5, null, 1000, null, null,
+  );
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "PSA", "ult", 21, 1, "keep_local_structure", "master_moved_non_human", null, null, 2000, "ULT", 6,
+  );
+  let row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='PSA' AND chapter=21 AND verse=1`).get();
+  assert(row.action === "adopt_conflict" && row.reason === "both_changed",
+    "an UNRESOLVED adopt_conflict stays sticky against a later keep_local_structure");
+  assert(row.overwritten_version === 5, "…and keeps its overwritten_version recovery pointer");
+  assert(row.resolved_at === null && row.last_recorded_at === 2000, "…still active, and re-recorded tonight");
+
+  // A RESOLVED adopt_conflict is NOT held sticky: keep_local_structure's
+  // reactivation carve-out clears resolved_at (no CAS can make it lie), and
+  // doing that on a row still labelled adopt_conflict would falsely claim
+  // Door43 replaced the edit again. It becomes a keep_local_structure row like
+  // any other kept-D1 flag: pointer NULL, active.
+  d.prepare(`UPDATE verse_merge_conflicts SET resolved_at = 2500, resolved_by = 30 WHERE book='PSA'`).run();
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "PSA", "ult", 21, 1, "keep_local_structure", "master_moved_non_human", null, null, 3000, "ULT", 6,
+  );
+  row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='PSA' AND chapter=21 AND verse=1`).get();
+  assert(row.action === "keep_local_structure" && row.reason === "master_moved_non_human",
+    "a RESOLVED adopt_conflict gives way to the new keep_local_structure flag");
+  assert(row.overwritten_version === null, "…with a NULL pointer (nothing was replaced tonight)");
+  assert(row.resolved_at === null && row.resolved_by === null, "…reactivated, since the structural disagreement is live");
+}
+
+{
   // Re-saving the flagged verse resolves it, via the SAME action-agnostic
   // RESOLVE SQL every other conflict uses — no special path needed.
   const d = verseDb();

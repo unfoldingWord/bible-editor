@@ -468,6 +468,13 @@ Highlights that bite repeatedly:
   that have no counterpart here. **Next time this routine runs:** read their `docs/upstream-sync-*.md` first
   (it names the merge-base and what they've already absorbed from us), then diff commits after their latest
   sync doc's date rather than re-walking the full history back to `7f83a398`.
+- **A verse version floor computed as `MAX(new_version)` over `edit_log` is blind to imported-then-bridged
+  verses.** Bridge `'delete'` audit rows (written by the bridge route in `api/src/verses.ts` for the absorbed
+  verse) carry `new_version = NULL` and the deleted version only in `prev_version`, and the bootstrap import
+  writes no `edit_log` rows for verses at all — so a "next version must exceed history" floor sees nothing for
+  such a verse and re-mints version 1, letting a stale `If-Match: 1` pass CAS against the recreated row.
+  `verseVersionFloorSql` in `api/src/verseBridge.ts` therefore uses `MAX(COALESCE(new_version, prev_version))`;
+  any future version floor must do the same. Found by review of the #727 guards, fixed in the #728 commit.
 
 ## Stop conditions / goals
 

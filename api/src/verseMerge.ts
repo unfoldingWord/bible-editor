@@ -98,6 +98,22 @@ export interface VerseMergeInput {
    * flips step 6.
    */
   masterMayHoldHumanEdit?: boolean;
+  /**
+   * Issue #728. The content rule 4's alignment-shrink guard should measure
+   * `theirs` against, when it is NOT `theirs` itself. Set only by the nightly
+   * sync for the START row of a verse bridge master has SPLIT: `ours` is the
+   * bridge (every aligned word of verses a..b), `theirs` is master's verse a
+   * alone, and the rest of the words now live in master's recreated rows b..
+   * Compared verse-to-verse, every un-bridge would read as losing roughly half
+   * its alignment and be refused — freezing the export at five (see
+   * isSystemicMergeRefusal) for a change that lost nothing. Callers pass the
+   * concatenation of master's rows over the bridge's whole range, so the guard
+   * asks the question it means to: did master's text, taken as a whole, keep
+   * the alignment ours had? Adoption still writes `theirs`. OMITTED means
+   * `theirs` — today's behavior. Unparseable is treated exactly like an
+   * unparseable `theirs` (fail closed, keep_alignment_refused).
+   */
+  theirsForAlignment?: string;
 }
 
 export interface VerseMergeResult {
@@ -427,10 +443,12 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   // 4. Alignment guard: refuse to adopt master's content if doing so would
   // lose alignment on words neither side meant to touch. Either side failing
   // to parse makes the comparison itself untrustworthy — fail closed.
-  if (oursKey === null || theirsKey === null) {
+  const alignmentTheirs = input.theirsForAlignment ?? theirs;
+  const alignmentTheirsKey = alignmentTheirs === theirs ? theirsKey : stableKey(alignmentTheirs);
+  if (oursKey === null || theirsKey === null || alignmentTheirsKey === null) {
     return { action: "keep_alignment_refused", adopt: false, conflict: true, reason: "unparseable" };
   }
-  const delta = analyzeAlignmentDelta(JSON.parse(ours), JSON.parse(theirs));
+  const delta = analyzeAlignmentDelta(JSON.parse(ours), JSON.parse(alignmentTheirs));
   const lostWords = delta.unexpectedLosses.filter((loss) => loss.reason === "lost").map((loss) => loss.text);
   if (delta.afterAligned < delta.beforeAligned || lostWords.length > 0) {
     return {

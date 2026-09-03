@@ -27,10 +27,13 @@
 // ancestor to age and becomes permanently unadjudicable.
 //
 // WHAT IS EXEMPT — per verse (row_key = BOOK/chapter/verse/RESOURCE), at
-// most five rows outlive the retention window:
+// most seven rows outlive the retention window:
 //   1. The row today's merge picks as the ancestor: the newest
-//      'create'/'update' at/before the same boundary the merge itself cuts
-//      on (id boundary when stamped, timestamp watermark otherwise).
+//      'create'/'update'/'bridge'/'split' at/before the same boundary the
+//      merge itself cuts on (id boundary when stamped, timestamp watermark
+//      otherwise). 'bridge'/'split' joined this list with issue #727 (PR
+//      #731), when bookReimport.ts's base_payload sub-select started reading
+//      them as content-bearing ancestor candidates.
 //   2. The newest pre-watermark 'baseline' row, by created_at.
 //      pipelineImport.ts writes these holding the pre-AI content with
 //      created_at deliberately BACK-DATED to that content's own timestamp —
@@ -67,6 +70,39 @@
 //      but exempting them from an irreversible DELETE now is cheap (at most
 //      one row per verse per action present) and preserves the option;
 //      deleting first and reviewing later would not.
+//   7. issue #727/#728 (PR #731 review) — the GLOBAL newest 'bridge'/'split'
+//      row per verse, no boundary. The reimport now reads this row in four
+//      places: bookReimport.ts's `latest_source` (ownership — a human
+//      bridging an AI-drafted verse takes it over), `structural_edit_id` /
+//      `structural_edit_at` (verseStructure.ts's planner classifies a
+//      bridge as LOCAL iff the newest structural row on its start key is
+//      above the export boundary), the `start_before` ancestor fallback for
+//      a bootstrap-imported start verse, and base_payload via (1). Without
+//      this branch the reviewer's reproduction holds: an AI 'update' then a
+//      human 'bridge', both exported and aged out — (1)/(3) keep the AI row,
+//      (4) keeps nothing (the bridge is under the boundary), the bridge is
+//      deleted, `latest_source` reads `ai_pipeline`, and the human-owned
+//      bridge enters the wholesale AI-reseed path. The stalled-boundary
+//      variant misclassifies instead: a local bridge followed by a local
+//      content edit loses its 'bridge' row (the 'update' is (4)'s newest
+//      human row), the planner reads the structure as exported, and master's
+//      un-bridged shape is adopted over the translator's bridge.
+//   8. issue #727 — the GLOBAL newest 'delete' row per verse, no boundary AND
+//      no watermark join. Two readers: (a) verseBridge.ts's
+//      verseVersionFloorSql takes MAX(COALESCE(new_version, prev_version))
+//      over ALL of a key's rows so a recreated verse is minted strictly above
+//      any version a stale `If-Match` could hold; a bootstrap-imported verse
+//      absorbed by a bridge has a delete-only history (the import writes no
+//      audit rows), so sweeping that one row collapses the floor to 0 and the
+//      reimport's floor-0 INSERT re-mints version 1 — the exact hole #727
+//      closed. (b) bookReimport.ts's master_moved_under_local_bridge check
+//      reads the newest 'delete' payload (`{content, absorbed_into}`) as the
+//      absorbed verse's ancestor. Both the bridge route's human delete
+//      (source NULL) and step 7s's reimport delete (source 'dcs_reimport')
+//      have this shape. No watermark join because (a) is a CAS-safety
+//      invariant that does not depend on the book ever having exported, and
+//      a delete row's prev_version is by construction >= every new_version
+//      of the life it closed, so this one row carries the whole floor.
 //
 // Everything else older than the cutoff is deleted exactly as before —
 // post-watermark rows, books/resources with no watermark at all, and every
@@ -97,10 +133,11 @@
 //     merge picks survives either way (young rows are never candidates), and
 //     the overkept row is reclaimed by a later sweep once a newer
 //     pre-boundary row ages past the cutoff. Exempt survivors themselves
-//     remain candidates forever (at most five rows per verse: ancestor,
-//     baseline, global-newest-source, newest-post-boundary-human-edit, and
-//     one per #548 candidate-ancestor action class actually present), so the
-//     steady-state exempt set is bounded by corpus size, not by time.
+//     remain candidates forever (at most seven rows per verse: ancestor,
+//     baseline, global-newest-source, newest-post-boundary-human-edit,
+//     newest-structural-edit, newest-delete, and one per #548
+//     candidate-ancestor action class actually present), so the steady-state
+//     exempt set is bounded by corpus size, not by time.
 //   - The join recovers (book, resource) from row_key by pattern
 //     (`BOOK/%/RESOURCE`) — anchored both ends, and book codes / resource
 //     names carry no LIKE metacharacters — plus the merge's own book
@@ -134,10 +171,12 @@ export const EDIT_LOG_SWEEP_SQL = `
    WHERE created_at < ?1
      AND id NOT IN (
        SELECT keep_id FROM (
-         -- (1) today's merge ancestor: newest surviving 'create'/'update' at
-         -- or before the precise id boundary, or before the timestamp
-         -- watermark while master_confirmed_edit_id is still warming up —
-         -- the exact cut bookReimport.ts's base_payload sub-select makes.
+         -- (1) today's merge ancestor: newest surviving
+         -- 'create'/'update'/'bridge'/'split' at or before the precise id
+         -- boundary, or before the timestamp watermark while
+         -- master_confirmed_edit_id is still warming up — the exact action
+         -- list and cut bookReimport.ts's base_payload sub-select makes
+         -- (issue #727 added 'bridge'/'split' there).
          SELECT MAX(el.id) AS keep_id
            FROM edit_log el
            JOIN book_resource_syncs brs
@@ -145,7 +184,7 @@ export const EDIT_LOG_SWEEP_SQL = `
             AND (el.book = brs.book OR el.book IS NULL)
             AND brs.resource IN ('ult', 'ust')
           WHERE el.kind = 'verse'
-            AND el.action IN ('create', 'update')
+            AND el.action IN ('create', 'update', 'bridge', 'split')
             AND el.created_at < ?1
             AND ((brs.master_confirmed_edit_id IS NOT NULL
                     AND el.id <= brs.master_confirmed_edit_id)
@@ -271,5 +310,38 @@ export const EDIT_LOG_SWEEP_SQL = `
                  SELECT 1 FROM twl_rows r WHERE r.id = el.row_key AND r.book = el.book AND r.deleted_at IS NULL))
             )
           GROUP BY el.kind, el.book, el.row_key
+         UNION ALL
+         -- (7) issue #727/#728: the GLOBAL newest 'bridge'/'split' row per
+         -- verse, no boundary — the row bookReimport.ts reads as
+         -- structural_edit_id/structural_edit_at (structure planner), as the
+         -- newest content row for latest_source together with (3), and as the
+         -- start_before ancestor fallback. Same watermark join as (3): the
+         -- planner has no boundary to classify against without one.
+         SELECT MAX(el.id) AS keep_id
+           FROM edit_log el
+           JOIN book_resource_syncs brs
+             ON el.row_key LIKE brs.book || '/%/' || upper(brs.resource)
+            AND (el.book = brs.book OR el.book IS NULL)
+            AND brs.resource IN ('ult', 'ust')
+          WHERE el.kind = 'verse'
+            AND el.action IN ('bridge', 'split')
+            AND el.created_at < ?1
+            AND (brs.master_confirmed_edit_id IS NOT NULL OR brs.master_confirmed_at IS NOT NULL)
+          GROUP BY el.row_key
+         UNION ALL
+         -- (8) issue #727: the GLOBAL newest 'delete' row per verse — the
+         -- version floor verseVersionFloorSql folds (prev_version of the
+         -- absorbed verse; new_version is NULL on these rows) and the absorbed
+         -- verse's ancestor for master_moved_under_local_bridge. Deliberately
+         -- NO watermark join: the floor is a CAS-safety invariant on every
+         -- recreation path, exported book or not, and the row_key alone
+         -- identifies the verse. Bounded at one row per verse key ever
+         -- deleted.
+         SELECT MAX(el.id) AS keep_id
+           FROM edit_log el
+          WHERE el.kind = 'verse'
+            AND el.action = 'delete'
+            AND el.created_at < ?1
+          GROUP BY el.row_key
        )
      )`;

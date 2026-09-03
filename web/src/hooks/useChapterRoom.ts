@@ -34,12 +34,31 @@ interface WireEvent {
   verseNum?: number;
   lock?: TwlOrderLock | null;
   comment?: CommentDto;
+  // verse.bridged / verse.split
+  removedVerse?: number;
+  // Version the absorbed row had when it was deleted (tombstone clock, #729).
+  // Optional on the wire so an event from an older server still parses.
+  removedVersion?: number;
+  absorbedVerses?: number[];
+  newVerses?: VerseDto[];
 }
 
 export interface UseChapterRoomHandlers {
   onUpsert: (kind: RowKind, row: AnyRow) => void;
   onDelete: (kind: RowKind, id: string) => void;
   onVerseUpdate: (verse: VerseDto) => void;
+  // A verse bridge was created / broken in another tab. Whole-row structural
+  // changes (a key vanishes / new keys appear), so a stale tab must reconcile.
+  // `removedVersion` is the deleted row's version — the receiver's tombstone
+  // for that verse number (see lib/verseStructure.ts); undefined only from an
+  // older server.
+  onVerseBridged: (verse: VerseDto, removedVerse: number, absorbedVerses: number[], removedVersion?: number) => void;
+  onVerseSplit: (verse: VerseDto, newVerses: VerseDto[]) => void;
+  // The socket came back after a drop. Anything broadcast meanwhile is lost
+  // (the room has no replay), so the caller should refetch the chapter rather
+  // than trust its map — a missed verse.bridged would leave a phantom verse.
+  // Not fired on the first open (the mount fetch already covers that).
+  onReconnect?: () => void;
   onVerseStatusUpdate: (status: VerseStatus) => void;
   onLaneCheckUpdate: (check: LaneCheckState) => void;
   onLaneCheckBulkUpdate: (lane: CheckLane, checks: VerseLaneCheck[]) => void;
@@ -67,6 +86,7 @@ export function useChapterRoom(
 
   useEffect(() => {
     const cleanup = openChapterRoom(book, chapter, {
+      onReconnect: () => handlersRef.current.onReconnect?.(),
       onEvent: (raw) => {
         const ev = raw as WireEvent | null;
         if (!ev || typeof ev.type !== "string") return;
@@ -80,6 +100,19 @@ export function useChapterRoom(
         }
         if (ev.type === "verse.updated" && ev.verse) {
           handlersRef.current.onVerseUpdate(ev.verse);
+          return;
+        }
+        if (ev.type === "verse.bridged" && ev.verse && typeof ev.removedVerse === "number") {
+          handlersRef.current.onVerseBridged(
+            ev.verse,
+            ev.removedVerse,
+            ev.absorbedVerses ?? [],
+            typeof ev.removedVersion === "number" ? ev.removedVersion : undefined,
+          );
+          return;
+        }
+        if (ev.type === "verse.split" && ev.verse && Array.isArray(ev.newVerses)) {
+          handlersRef.current.onVerseSplit(ev.verse, ev.newVerses);
           return;
         }
         if (ev.type === "verse_status.updated" && ev.status) {
