@@ -252,6 +252,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalRowDelete,
     applyLocalRowInsert,
     applyLocalVerse,
+    applyRemoteVerse,
     applyLocalVerseBridge,
     applyLocalVerseSplit,
     applyLocalVerseStatus,
@@ -387,23 +388,29 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       scheduleLintRefetch();
     },
     onDelete: (kind, id) => applyLocalRowDelete(kind, id),
+    // Version-gated inside the hook (strictly newer than local AND above the
+    // verse's tombstone) so a verse.updated that reordered behind the bridge
+    // that deleted its row cannot resurrect it (#729).
     onVerseUpdate: (verse) => {
-      const existing = dataRef.current?.verses[verse.bible_version]?.[verse.verse];
-      if (!existing || verse.version > existing.version) {
-        applyLocalVerse(verse);
-      }
+      applyRemoteVerse(verse);
     },
-    // Apply unconditionally: the structural key-set change (remove absorbed /
-    // add split verses) must NOT be dropped by a racing verse.updated that
-    // reordered ahead of this event — otherwise the other tab strands the
-    // absorbed verse or never shows the split verses until reload. The apply
-    // helpers do the structural change always and keep the start-row CONTENT
-    // newer-wins internally, so a fresher edit is still not clobbered.
-    onVerseBridged: (verse, removedVerse, absorbedVerses) => {
-      applyLocalVerseBridge(verse, removedVerse, absorbedVerses);
+    // The room fans events out in arbitrary order, so the hook reconciles
+    // bridge/split against the row-version clock: `removedVersion` tombstones
+    // the absorbed verse, split-created rows apply only above that tombstone,
+    // and the start row stays newer-wins. See lib/verseStructure.ts, whose test
+    // folds every delivery permutation to the server's final rows.
+    onVerseBridged: (verse, removedVerse, absorbedVerses, removedVersion) => {
+      applyLocalVerseBridge(verse, removedVerse, absorbedVerses, removedVersion);
     },
     onVerseSplit: (verse, newVerses) => {
       applyLocalVerseSplit(verse, newVerses);
+    },
+    // Events broadcast while the socket was down are gone for good; a missed
+    // verse.bridged would leave a phantom verse whose next save 404s. Refetch
+    // (in place — `data` stays rendered while it loads) rather than trust the
+    // map. First open is excluded by the client, so mounting fetches once.
+    onReconnect: () => {
+      void refetch();
     },
     onVerseStatusUpdate: (status) => {
       applyLocalVerseStatus(status.verse, status.done === 1);
@@ -3066,8 +3073,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     try {
       const res = await api.mergeVerseBridge(book, chapterNum, verse, bibleVersion, start.version, next.version);
-      if (chapterNum === chapter) applyLocalVerseBridge(res.verse, res.removed_verse, res.absorbed_verses);
-      bookHook?.applyLocalVerseBridge(res.verse, res.removed_verse, res.absorbed_verses);
+      if (chapterNum === chapter) applyLocalVerseBridge(res.verse, res.removed_verse, res.absorbed_verses, res.removed_version);
+      bookHook?.applyLocalVerseBridge(res.verse, res.removed_verse, res.absorbed_verses, res.removed_version);
     } catch (e) {
       setBridgeToast(bridgeErrorMessage(e));
     }

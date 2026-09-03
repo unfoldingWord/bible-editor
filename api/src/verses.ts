@@ -773,10 +773,22 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/bridge", requireEditor, async 
   const bridgeDto = updated ? { ...updated, content: mergedContent } : null;
   c.executionCtx.waitUntil(
     (async () => {
-      // Prune the orphaned per-verse status/checkoff for the absorbed verses,
-      // then reopen the text lane on the bridge (its content changed), then tell
-      // open tabs. Best-effort, off the response path — same shape as the PATCH
-      // route's lane reopen.
+      // Tell open tabs FIRST, then prune the orphaned per-verse status/checkoff
+      // for the absorbed verses and reopen the text lane on the bridge (its
+      // content changed). The broadcast used to wait behind those two awaits
+      // while PATCH broadcasts immediately, which widened the window for a
+      // racing verse.updated / verse.split to overtake this event in the room
+      // (#729). Receivers tolerate any order via the removedVersion tombstone;
+      // this just makes the reorder rare. Best-effort, off the response path.
+      if (bridgeDto) {
+        await broadcastChapter(c.env, book, chapter, {
+          type: "verse.bridged",
+          verse: bridgeDto,
+          removedVerse: next.verse,
+          removedVersion: next.version,
+          absorbedVerses: absorbed,
+        });
+      }
       try {
         await c.env.DB.batch([
           c.env.DB.prepare(DELETE_VERSE_STATUSES_RANGE_SQL).bind(book, chapter, next.verse, bridgeEnd),
@@ -787,17 +799,11 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/bridge", requireEditor, async 
         // is simply unused until (unless) the bridge is split again.
       }
       await reopenLaneChecks(c.env, book, chapter, verse, ["text"]);
-      if (bridgeDto) {
-        await broadcastChapter(c.env, book, chapter, {
-          type: "verse.bridged",
-          verse: bridgeDto,
-          removedVerse: next.verse,
-          absorbedVerses: absorbed,
-        });
-      }
     })(),
   );
-  return c.json({ verse: bridgeDto, removed_verse: next.verse, absorbed_verses: absorbed });
+  // `removed_version` mirrors the WS event so the originating tab tombstones
+  // the absorbed verse exactly like every other tab.
+  return c.json({ verse: bridgeDto, removed_verse: next.verse, removed_version: next.version, absorbed_verses: absorbed });
 });
 
 // POST /:book/:chapter/:verse/:bibleVersion/split — break a `\v a-b` bridge back
@@ -891,7 +897,8 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
   }));
   c.executionCtx.waitUntil(
     (async () => {
-      await reopenLaneChecks(c.env, book, chapter, verse, ["text"]);
+      // Broadcast before the lane reopen — see the bridge route for why the
+      // structural event goes out first (#729).
       if (startDto) {
         await broadcastChapter(c.env, book, chapter, {
           type: "verse.split",
@@ -899,6 +906,7 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
           newVerses: newDtos,
         });
       }
+      await reopenLaneChecks(c.env, book, chapter, verse, ["text"]);
     })(),
   );
   return c.json({ verse: startDto, new_verses: newDtos });
