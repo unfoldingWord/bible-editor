@@ -22,6 +22,7 @@ import { buildVerseHistory, type VerseHistoryLogRow } from "./verseHistory.ts";
 import { lanesToReopenOnVerseEdit, reopenLaneChecks } from "./laneReopen.ts";
 import { RESOLVE_VERSE_MERGE_CONFLICT_SQL, VERSE_PATCH_UPDATE_SQL } from "./verseMergeConflictSql.ts";
 import { clearResolvedConflictBannerIfLast } from "./verseMergeConflicts.ts";
+import { provenanceValues, resolveActorUsername } from "./rowProvenance.ts";
 
 // Verse content can carry malformed/missing `\w` occurrence data — colliding
 // `(text, occurrence)` pairs from a bad import or AI alignment (ULT/UST), or no
@@ -36,7 +37,7 @@ function normalizeOccurrences(parsed: unknown): void {
   if (Array.isArray(vos)) recomputeTargetOccurrences(vos);
 }
 
-export const verses = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
+export const verses = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 
 // content must be the usfm-js verse-objects tree. The whole tree is replaced on
 // every PATCH; a malformed body that passed validation as `unknown` would brick
@@ -311,6 +312,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
       .first<{ ok: number }>();
     if (!sibling) return c.json({ error: "not_found", reason: "unknown_chapter" }, 404);
     const userId = currentUserId(c);
+    const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
     const now = Math.floor(Date.now() / 1000);
     const rowKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
     const contentJson = JSON.stringify(parsed.data.content);
@@ -320,10 +322,20 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
         c.env.DB
           .prepare(
             `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text,
-                                 version, updated_at, updated_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)`,
+                                 version, updated_at, updated_by, last_change_action, last_change_source, last_change_actor)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10, ?11)`,
           )
-          .bind(book, chapter, verse, bibleVersion, contentJson, parsed.data.plain_text ?? null, now, userId),
+          .bind(
+            book,
+            chapter,
+            verse,
+            bibleVersion,
+            contentJson,
+            parsed.data.plain_text ?? null,
+            now,
+            userId,
+            ...provenanceValues({ action: "create", source: "user", actor }),
+          ),
         c.env.DB
           .prepare(
             `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
@@ -419,6 +431,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   }
 
   const userId = currentUserId(c);
+  const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
   const now = Math.floor(Date.now() / 1000);
   const newVersion = expected + 1;
   const rowKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
@@ -438,6 +451,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
         parsed.data.plain_text ?? null,
         now,
         userId,
+        ...provenanceValues({ action: "update", source: "user", actor }),
         book,
         chapter,
         verse,
