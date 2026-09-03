@@ -3,7 +3,7 @@ import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip, Link } from 
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
-import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlOrderLock, CommentRowKind } from "../sync/api";
+import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, TwlOrderLock, CommentRowKind } from "../sync/api";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
@@ -201,26 +201,26 @@ interface Props {
   onStartQuoteBuild?: (noteId: string) => void;
   // Open the quote-builder for a TWL word row (writes orig_words + occurrence).
   onStartWordQuoteBuild?: (wordId: string) => void;
-  // Promote a per-verse TWL suggestion to a real link (resolve + createRow). When
-  // absent, the Suggestions section hides.
-  onAddTwlSuggestion?: (suggestion: TwlSuggestion, chosenArticleId: string) => void;
-  // Drop suggestions already linked on the active verse (resolved-OL identity).
-  isTwlSuggestionExcluded?: (suggestion: TwlSuggestion) => boolean;
+  // Promote a per-verse TWL suggestion to a real link (resolve + createRow) on
+  // the verse it was scanned from. When absent, the Suggestions section hides.
+  onAddTwlSuggestion?: (suggestion: TwlSuggestion, chosenArticleId: string, verse: number) => void;
+  // Drop suggestions already linked on their verse (resolved-OL identity).
+  isTwlSuggestionExcluded?: (suggestion: TwlSuggestion, verse: number) => boolean;
   // ULT verse objects for a given verse (current chapter), used to order TWL
   // links canonically by Hebrew/Greek word position. Stable identity (useCallback
   // in Shell keyed on the verse index) so the twl memos recompute only when the
   // ULT alignment changes, not on every render. Null when unavailable → order
   // falls back to sort_order.
   ultVerseObjectsFor?: (verse: number) => unknown[] | null;
-  // Report the raw (pre-exclusion) suggestion list up to Shell so it can merge
-  // the matcher's candidates onto committed rows (twlRowAlternatives).
-  onTwlSuggestions?: (suggestions: TwlSuggestion[]) => void;
+  // Report the raw (pre-exclusion) suggestions, grouped by verse, up to Shell so
+  // it can merge the matcher's candidates onto committed rows (twlRowAlternatives).
+  onTwlSuggestions?: (groups: TwlVerseSuggestions[]) => void;
   // Extra TW article ids the matcher proposes for a committed row's source word,
   // keyed by row id — merged into that row's disambiguation badge.
   twlRowAlternatives?: Map<string, string[]>;
   // Article ids the unlinked deny-list blocks for a suggestion's resolved quote
   // — pruned from its picker; the whole suggestion hides when all are blocked.
-  twlBlockedArticleIds?: (suggestion: TwlSuggestion, candidateIds?: string[]) => Set<string>;
+  twlBlockedArticleIds?: (suggestion: TwlSuggestion, verse: number, candidateIds?: string[]) => Set<string>;
   // Whether the TWL deny-lists have settled (loaded or failed). Suggestions hold
   // off rendering until then so a blocked link can't show before filters arrive.
   twlFiltersReady?: boolean;
@@ -461,6 +461,13 @@ export function ResourceColumn({
     for (let v = rangeStart; v <= rangeEnd; v++) if (v > 0) out.push(v);
     return out;
   }, [rangeStart, rangeEnd]);
+  // Verses the Suggestions panel scans: every verse of a bridge, or just the
+  // active verse otherwise. So a bridge surfaces each verse's suggested links
+  // (each addable to its own verse) instead of only the leading verse's.
+  const twlSuggestionVerses = useMemo(
+    () => (twlBridgeVerses.length > 0 ? twlBridgeVerses : [activeVerse]),
+    [twlBridgeVerses, activeVerse],
+  );
   // When a UST verse bridge widens the range to span multiple verses (e.g. ISA
   // 33:15-16, UST row verse=15/verse_end=16 while UHB/ULT keep them separate),
   // the union must render grouped by verse — all of v15 then all of v16 — not
@@ -1034,8 +1041,8 @@ export function ResourceColumn({
                 <TwlSuggestions
                   book={book}
                   chapter={chapter}
-                  verse={activeVerse}
-                  refreshKey={twlForVerse.map((r) => `${r.tw_link ?? ""}|${r.orig_words ?? ""}|${r.occurrence ?? 1}`).join("~")}
+                  verses={twlSuggestionVerses}
+                  refreshKey={twlForVerse.map((r) => `${r.verse}|${r.tw_link ?? ""}|${r.orig_words ?? ""}|${r.occurrence ?? 1}`).join("~")}
                   onAdd={onAddTwlSuggestion}
                   isExcluded={isTwlSuggestionExcluded}
                   onSuggestions={onTwlSuggestions}
