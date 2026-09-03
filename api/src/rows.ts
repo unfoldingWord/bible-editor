@@ -138,6 +138,14 @@ const TqPatch = z.object({
 });
 
 const TwlPatch = z.object({
+  // A word link's verse is retargeted via the Words-table "change reference"
+  // dropdown by sending a recomputed ref_raw (always a single verse for twl —
+  // links never span). `verse` is deliberately NOT accepted here: unlike TnPatch,
+  // a twl ref_raw carries the whole reference, so the verse re-derived from it
+  // (below) is exact, and ref_raw stays the single source of truth. Accepting an
+  // authoritative `verse` would let a `{ verse }`-only PATCH set the verse column
+  // while ref_raw stayed put — a torn row (grouped/ordered under one verse,
+  // exported under another), the same class #681 heals with ref_raw as truth.
   ref_raw: z.string().optional(),
   tags: z.string().nullable().optional(),
   orig_words: z.string().nullable().optional(),

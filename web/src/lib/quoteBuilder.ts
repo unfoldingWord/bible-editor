@@ -19,6 +19,7 @@ import {
   surfaceTotalsFromTokens,
   pinSourceOccurrences,
 } from "./highlight.ts";
+import { isCharacterWrapper } from "./usfm.ts";
 
 // Build a HighlightKey from a Hebrew/Greek string + 1-based occurrence.
 // All callers (picker + buildQuoteFromSelection + collectTargetTokens)
@@ -267,6 +268,18 @@ export function collectTargetTokens(
         // alignable verse body — descend, carrying the current ancestor
         // stack unchanged (it contributes no source of its own). Mirrors
         // collectMilestoneRuns / collectSourceWords.
+        walk((o["children"] as unknown[] | undefined) ?? [], stack);
+      } else if (isCharacterWrapper(o)) {
+        // \qs (Selah) is a character-style wrapper — usfm-js gives it
+        // type:"quote", not type:"word"/"milestone", so without this branch
+        // the walk simply skipped it (and everything nested inside), making
+        // the aligned qs -> zaln -> w Selah shape invisible to the picker
+        // even though the highlighter renders it. Descend with the stack
+        // unchanged, exactly like the \d branch above — the wrapper itself
+        // contributes no source ancestry, only its children do. A same-line
+        // `\qs Selah\qs*` with no children (unaligned, text parked on the
+        // node itself) has nothing to descend into and is correctly a no-op
+        // here, same as it always was.
         walk((o["children"] as unknown[] | undefined) ?? [], stack);
       } else if (o["type"] === "word" && o["tag"] === "w") {
         raw.push({

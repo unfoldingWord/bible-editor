@@ -28,7 +28,7 @@ import { useTwlFilters } from "../hooks/useTwlFilters";
 import { useUnsavedGuard } from "../hooks/useUnsavedGuard";
 import { outbox } from "../sync/outbox";
 import { api, ApiError, CHECK_LANES, setReadOnlyReason } from "../sync/api";
-import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, CommentRowKind, MentionUser } from "../sync/api";
+import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
 import { countThreads, rowKey, type CommentThread } from "../lib/commentsIndex";
 import { CommentsPopover } from "./CommentsPopover";
@@ -46,6 +46,7 @@ import {
 } from "../lib/laneChecks";
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
+import { shouldApplyUpsert } from "./rowUpsertGuard";
 import { drafts, verseKey, pinVerseBase, unpinVerseBaseIfIdle, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
@@ -359,23 +360,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     onUpsert: (kind, row) => {
       const list = dataRef.current?.[kind] as Array<TnRow | TqRow | TwlRow> | undefined;
       const existing = list?.find((r) => r.id === row.id);
-      if (!existing) {
-        applyLocalRowInsert(kind, row);
-      } else if (row.version > existing.version) {
-        applyLocalRowReplacement(kind, row);
-      } else if (
-        // Preserve/hint/trash toggles on TN rows don't bump version (they're
-        // state flips, not content — see api/src/rows.ts setTnBit /
-        // setTnTrashed). The version > existing.version guard above would drop
-        // these broadcasts, leaving other tabs stale until refetch. Same-
-        // version replace when an intent bit or the trash state differs.
-        kind === "tn" &&
-        row.version === existing.version &&
-        ((row as TnRow).preserve !== (existing as TnRow).preserve ||
-          (row as TnRow).hint !== (existing as TnRow).hint ||
-          (row as TnRow).trashed_at !== (existing as TnRow).trashed_at)
-      ) {
-        applyLocalRowReplacement(kind, row);
+      // shouldApplyUpsert (rowUpsertGuard.ts) covers: absent locally, a
+      // strictly higher version, or same-version-but-a-known-non-versioning-
+      // field-changed (tn's preserve/hint/trashed_at bit-toggles, and any
+      // kind's sort_order — issue #671: a reorder patches sort_order without
+      // bumping version, see the reorder-only fast path in api/src/rows.ts).
+      if (shouldApplyUpsert(kind, row, existing)) {
+        if (!existing) {
+          applyLocalRowInsert(kind, row);
+        } else {
+          applyLocalRowReplacement(kind, row);
+        }
       }
       // This room is scoped to the currently open {book, chapter}, so any
       // row.upserted event here is for this book — regardless of whether the
@@ -1654,9 +1649,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // empty — open the quote-builder on the new row so the editor confirms. Always
   // goes through createRow("twl") so chapter locks / concurrency are respected.
   const handleAddTwlSuggestion = useCallback(
-    async (s: TwlSuggestion, chosenArticleId: string) => {
+    async (s: TwlSuggestion, chosenArticleId: string, verse: number) => {
       if (!data) return;
-      const verse = activeVerse;
+      // `verse` is the verse the suggestion was scanned from — in a bridge that
+      // may not be the active/leading verse, which is the whole point: the link
+      // lands on the verse it belongs to, not wherever the cursor happens to be.
       const grab = (bv: string): unknown[] | undefined => {
         const vo = (verseIndexByVersion[bv]?.[verse]?.content as { verseObjects?: unknown[] } | null)
           ?.verseObjects;
@@ -1756,7 +1753,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         );
       }
     },
-    [data, activeVerse, verseIndexByVersion, book, chapter, twTitles, lockedTwlVerses],
+    [data, verseIndexByVersion, book, chapter, twTitles, lockedTwlVerses],
   );
 
   // Whether a per-verse suggestion is already covered on the active verse. Done
@@ -1768,9 +1765,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // occurrence 2 still gets suggested when only occurrence 1 is linked; multi-word
   // phrases are kept unless the identical phrase quote is already linked.
   const isTwlSuggestionExcluded = useCallback(
-    (s: TwlSuggestion): boolean => {
+    (s: TwlSuggestion, verse: number): boolean => {
       if (!data) return false;
-      const verse = activeVerse;
       const grab = (bv: string): unknown[] | undefined => {
         const vo = (verseIndexByVersion[bv]?.[verse]?.content as { verseObjects?: unknown[] } | null)
           ?.verseObjects;
@@ -1809,13 +1805,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         return false;
       });
     },
-    [data, activeVerse, verseIndexByVersion, chapter, twlFilters],
+    [data, verseIndexByVersion, chapter, twlFilters],
   );
 
   // Raw per-verse TWL suggestions for the active verse, reported up from the
   // Suggestions panel (before its exclusion filter). Used to merge the matcher's
   // candidate articles back onto committed rows — see twlRowAlternatives.
-  const [verseTwlSuggestions, setVerseTwlSuggestions] = useState<TwlSuggestion[]>([]);
+  const [verseTwlSuggestions, setVerseTwlSuggestions] = useState<TwlVerseSuggestions[]>([]);
 
   // Extra TW articles the per-verse matcher would propose for a committed row's
   // source word(s), keyed by row id. The committed-row disambiguation badge
@@ -1827,51 +1823,56 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const twlRowAlternatives = useMemo<Map<string, string[]>>(() => {
     const map = new Map<string, string[]>();
     if (!data || verseTwlSuggestions.length === 0) return map;
-    const verse = activeVerse;
-    const grab = (bv: string): unknown[] | undefined => {
-      const vo = (verseIndexByVersion[bv]?.[verse]?.content as { verseObjects?: unknown[] } | null)
-        ?.verseObjects;
-      return Array.isArray(vo) ? vo : undefined;
-    };
-    const ult = grab("ULT");
-    const uhb = grab("UHB") ?? grab("UGNT");
-    const rows = data.twl.filter((r) => r.verse === verse && r.deleted_at == null);
-    if (rows.length === 0) return map;
-    // Resolve each suggestion once to its source-key set + candidate ids, and
-    // reapply the same deny-lists the Suggestions panel uses — otherwise a word
-    // deleted-here, or a (word, article) pair a translator specifically
-    // unlinked, would resurface as a "suggested" alternative on the row.
-    const sugs = verseTwlSuggestions
-      .map((s) => {
-        const resolved = resolveSpanToSource(ult, uhb, s.matchedText, s.glOccurrence);
-        if (!resolved) return null;
-        if (twlFilters.isDeletedHere(`${chapter}:${verse}`, resolved.orig_words)) return null;
-        const keys = selectionFromQuote(uhb, resolved.orig_words, resolved.occurrence);
-        if (keys.size === 0) return null;
-        const ids = s.disambiguation.filter(
-          (id) => !twlFilters.isUnlinked(resolved.orig_words, `rc://*/tw/dict/bible/${id}`),
-        );
-        return ids.length > 0 ? { keys, ids } : null;
-      })
-      .filter((x): x is { keys: Set<string>; ids: string[] } => x != null);
-    for (const r of rows) {
-      const rowKeys = selectionFromQuote(uhb, r.orig_words, r.occurrence ?? 1);
-      if (rowKeys.size === 0) continue;
-      const ids = new Set<string>();
-      for (const s of sugs) {
-        let overlap = false;
-        for (const k of s.keys) {
-          if (rowKeys.has(k)) {
-            overlap = true;
-            break;
+    // Each group carries its own verse — resolve and match per verse so that in
+    // a bridge every verse's committed rows get alternatives from their OWN
+    // verse's matcher, not only the leading/active one. Row ids are unique
+    // across verses, so the accumulated map never collides.
+    for (const { verse, suggestions } of verseTwlSuggestions) {
+      const grab = (bv: string): unknown[] | undefined => {
+        const vo = (verseIndexByVersion[bv]?.[verse]?.content as { verseObjects?: unknown[] } | null)
+          ?.verseObjects;
+        return Array.isArray(vo) ? vo : undefined;
+      };
+      const ult = grab("ULT");
+      const uhb = grab("UHB") ?? grab("UGNT");
+      const rows = data.twl.filter((r) => r.verse === verse && r.deleted_at == null);
+      if (rows.length === 0) continue;
+      // Resolve each suggestion once to its source-key set + candidate ids, and
+      // reapply the same deny-lists the Suggestions panel uses — otherwise a word
+      // deleted-here, or a (word, article) pair a translator specifically
+      // unlinked, would resurface as a "suggested" alternative on the row.
+      const sugs = suggestions
+        .map((s) => {
+          const resolved = resolveSpanToSource(ult, uhb, s.matchedText, s.glOccurrence);
+          if (!resolved) return null;
+          if (twlFilters.isDeletedHere(`${chapter}:${verse}`, resolved.orig_words)) return null;
+          const keys = selectionFromQuote(uhb, resolved.orig_words, resolved.occurrence);
+          if (keys.size === 0) return null;
+          const ids = s.disambiguation.filter(
+            (id) => !twlFilters.isUnlinked(resolved.orig_words, `rc://*/tw/dict/bible/${id}`),
+          );
+          return ids.length > 0 ? { keys, ids } : null;
+        })
+        .filter((x): x is { keys: Set<string>; ids: string[] } => x != null);
+      for (const r of rows) {
+        const rowKeys = selectionFromQuote(uhb, r.orig_words, r.occurrence ?? 1);
+        if (rowKeys.size === 0) continue;
+        const ids = new Set<string>();
+        for (const s of sugs) {
+          let overlap = false;
+          for (const k of s.keys) {
+            if (rowKeys.has(k)) {
+              overlap = true;
+              break;
+            }
           }
+          if (overlap) for (const id of s.ids) ids.add(id);
         }
-        if (overlap) for (const id of s.ids) ids.add(id);
+        if (ids.size > 0) map.set(r.id, [...ids]);
       }
-      if (ids.size > 0) map.set(r.id, [...ids]);
     }
     return map;
-  }, [data, activeVerse, verseIndexByVersion, verseTwlSuggestions, twlFilters, chapter]);
+  }, [data, verseIndexByVersion, verseTwlSuggestions, twlFilters, chapter]);
 
   // Which of a suggestion's candidate articles the unlinked deny-list blocks for
   // its resolved OL quote. Returned to TwlSuggestions, which prunes them from the
@@ -1879,10 +1880,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // (word, article), so only the matching article is removed — e.g. kt/sonofgod
   // for a Hebrew "son" word, while kt/son survives. Unresolvable → block nothing.
   const twlBlockedArticleIds = useCallback(
-    (s: TwlSuggestion, candidateIds?: string[]): Set<string> => {
+    (s: TwlSuggestion, verse: number, candidateIds?: string[]): Set<string> => {
       const blocked = new Set<string>();
       if (!data) return blocked;
-      const verse = activeVerse;
       const grab = (bv: string): unknown[] | undefined => {
         const vo = (verseIndexByVersion[bv]?.[verse]?.content as { verseObjects?: unknown[] } | null)
           ?.verseObjects;
@@ -1904,7 +1904,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }
       return blocked;
     },
-    [data, activeVerse, verseIndexByVersion, twlFilters],
+    [data, verseIndexByVersion, twlFilters],
   );
 
   // Routes any verse / version / aligner-target change through the dirty
@@ -3692,6 +3692,35 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             }));
             applyLocalRowInsert("twl", created);
             setActiveWordId(created.id);
+            setActiveNoteId(null);
+            setActiveQuestionId(null);
+          }}
+          onWordChangeVerse={(id, verse) => {
+            // Retarget a word link to another verse of the current bridge — the
+            // Words "change reference" dropdown, mirroring onNoteChangeVerse. A
+            // twl never spans, so ref_raw is always a single verse. Read the live
+            // row (dataRef, not the render closure) so a rapid move carries the
+            // current version; recompute ref_raw + a fresh sort_order (end of the
+            // target verse) so the link lands in order there. `verse` is sent
+            // explicitly (TwlPatch keeps it authoritative) so grouping moves with
+            // the ref instead of waiting on the server to re-derive it.
+            const twl = dataRef.current?.twl ?? [];
+            const row = twl.find((r) => r.id === id);
+            if (!row) return;
+            const ref_raw =
+              chapter === 0
+                ? "front:intro"
+                : verse === 0
+                  ? `${chapter}:intro`
+                  : `${chapter}:${verse}`;
+            const effectiveVerse = chapter === 0 ? 0 : verse;
+            if (row.verse === effectiveVerse && row.ref_raw === ref_raw) return;
+            const sort_order = pickSortOrder(sortedForVerse(twl, effectiveVerse), null, "after");
+            enqueueRow("twl", row, { verse: effectiveVerse, ref_raw, sort_order });
+            // Follow the link to its new verse so it stays selected and the
+            // per-verse suggestions/exclusions realign to where it now lives.
+            setActiveVerse(effectiveVerse);
+            setActiveWordId(id);
             setActiveNoteId(null);
             setActiveQuestionId(null);
           }}

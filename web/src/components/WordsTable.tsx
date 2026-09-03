@@ -5,6 +5,7 @@ import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
 import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
+import ArrowDropDownIcon from "@mui/icons-material/ArrowDropDown";
 import TranslateIcon from "@mui/icons-material/Translate";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
 import UndoIcon from "@mui/icons-material/Undo";
@@ -130,6 +131,14 @@ interface Props {
   // link can reach a morphologically-correct alternative (e.g. other/lover for
   // "lovers"). A stable useMemo ref from Shell, so the memo below can compare it.
   suggestionAlternatives?: Map<string, string[]>;
+  // Verse-reference picker, mirroring NoteCard's "change reference" dropdown.
+  // Only populated (length > 1) when the visible unit is a verse BRIDGE — the
+  // verses it spans — so a link scanned/added under the leading verse can be
+  // reassigned to the one it actually belongs to. Empty/absent in the ordinary
+  // single-verse case, which keeps the dense word rows uncluttered. A stable
+  // useMemo ref from ResourceColumn so the memo below can compare it.
+  verseOptions?: number[];
+  onChangeVerse?: (id: string, verse: number) => void;
 }
 
 // The manual reorder gesture (drag grip + up/down arrows) was disabled for a
@@ -140,7 +149,7 @@ interface Props {
 // ordering skips locked verses on every surface. See Shell's onWordReorder for
 // the lock-then-move sequence, and twlDisplayOrder for the display split.
 
-function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, onReorderPreview, readOnly = false, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild, suggestionAlternatives }: Props) {
+function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, onReorderPreview, readOnly = false, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild, suggestionAlternatives, verseOptions, onChangeVerse }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
@@ -345,6 +354,8 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
               onStartQuoteBuild={onStartQuoteBuild ? () => onStartQuoteBuild(r.id) : undefined}
               onOpenArticle={setArticleId}
               suggestionAltIds={(suggestionAlternatives?.get(r.id) ?? []).join(",")}
+              verseOptions={verseOptions}
+              onChangeVerse={onChangeVerse ? (v) => onChangeVerse(r.id, v) : undefined}
             />
             {showAfter && <RowDropIndicator />}
           </Box>
@@ -369,7 +380,10 @@ export const WordsTable = memo(
     a.readOnly === b.readOnly &&
     a.activeQuoteBuildId === b.activeQuoteBuildId &&
     a.quoteBuildSelectionCount === b.quoteBuildSelectionCount &&
-    a.suggestionAlternatives === b.suggestionAlternatives,
+    a.suggestionAlternatives === b.suggestionAlternatives &&
+    // Referentially stable from ResourceColumn (useMemo), so entering/leaving a
+    // bridge — which flips the ref-picker on/off — flows through this compare.
+    a.verseOptions === b.verseOptions,
 );
 
 function RowDropIndicator() {
@@ -409,6 +423,8 @@ const WordRow = memo(function WordRow({
   flashArrow,
   onReorderHover,
   suggestionAltIds = "",
+  verseOptions,
+  onChangeVerse,
 }: {
   row: TwlRow;
   active: boolean;
@@ -442,6 +458,11 @@ const WordRow = memo(function WordRow({
   // Comma-joined short article ids the matcher proposes for this row's source
   // word, merged into the disambiguation badge. "" when none.
   suggestionAltIds?: string;
+  // Verse-bridge reference picker (see the table-level prop). The verses this
+  // bridge spans; the callback retargets THIS link to the chosen verse. The
+  // chip only shows when there is a real choice (length > 1).
+  verseOptions?: number[];
+  onChangeVerse?: (verse: number) => void;
 }) {
   const [quote, setQuote] = useState(row.orig_words ?? "");
   const [twLink, setTwLink] = useState<string | null>(row.tw_link);
@@ -485,6 +506,12 @@ const WordRow = memo(function WordRow({
     return list.length > 1 ? list : null;
   }, [twLink, catalogs.disambiguationIndex, catalogs.disambiguationGroups, suggestionAltIds]);
   const [disambigAnchor, setDisambigAnchor] = useState<HTMLElement | null>(null);
+  // Reference (verse) picker anchor — opened from the ref_raw chip. Only ever
+  // shown in a verse bridge (verseOptions.length > 1), so a link can be moved to
+  // the verse it belongs to. Unlike NoteCard there is no "span" mode: a word
+  // link points at one verse's original-language occurrence, never a range.
+  const [refMenuAnchor, setRefMenuAnchor] = useState<HTMLElement | null>(null);
+  const showRefPicker = !!onChangeVerse && (verseOptions?.length ?? 0) > 1;
 
   useEffect(() => setQuote(row.orig_words ?? ""), [row.id, row.version, row.orig_words]);
   useEffect(() => setTwLink(row.tw_link), [row.id, row.version, row.tw_link]);
@@ -744,24 +771,75 @@ const WordRow = memo(function WordRow({
           </Tooltip>
         )}
       </Box>
-      {gloss ? (
-        <Tooltip title="ULT words aligned to this quote (read-only)">
-          <Typography
-            variant="caption"
-            sx={{
-              gridArea: "gloss",
-              color: "text.secondary",
-              fontStyle: "italic",
-              lineHeight: 1.3,
-              pb: "2px",
-              whiteSpace: "normal",
-              wordBreak: "break-word",
+      {showRefPicker || gloss ? (
+        <Box
+          sx={{
+            gridArea: "gloss",
+            minWidth: 0,
+            display: "flex",
+            alignItems: "center",
+            gap: 0.75,
+            pb: "2px",
+          }}
+        >
+          {showRefPicker && (
+            <Tooltip title="change reference — which verse of this bridge the link belongs to">
+              <Chip
+                label={row.ref_raw}
+                size="small"
+                variant="outlined"
+                clickable
+                deleteIcon={<ArrowDropDownIcon />}
+                onDelete={(e) => {
+                  e.stopPropagation();
+                  setRefMenuAnchor(e.currentTarget.parentElement as HTMLElement);
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setRefMenuAnchor(e.currentTarget);
+                }}
+                sx={{ flexShrink: 0, fontFamily: "monospace", fontSize: 11, height: 20, color: "text.secondary" }}
+              />
+            </Tooltip>
+          )}
+          {gloss ? (
+            <Tooltip title="ULT words aligned to this quote (read-only)">
+              <Typography
+                variant="caption"
+                sx={{
+                  minWidth: 0,
+                  color: "text.secondary",
+                  fontStyle: "italic",
+                  lineHeight: 1.3,
+                  whiteSpace: "normal",
+                  wordBreak: "break-word",
+                }}
+              >
+                {gloss}
+              </Typography>
+            </Tooltip>
+          ) : null}
+        </Box>
+      ) : null}
+      <Menu
+        anchorEl={refMenuAnchor}
+        open={Boolean(refMenuAnchor)}
+        onClose={() => setRefMenuAnchor(null)}
+        slotProps={{ paper: { sx: { maxHeight: 320 } } }}
+      >
+        {(verseOptions ?? []).map((v) => (
+          <MenuItem
+            key={v}
+            selected={v === row.verse}
+            onClick={() => {
+              setRefMenuAnchor(null);
+              if (v !== row.verse) onChangeVerse?.(v);
             }}
           >
-            {gloss}
-          </Typography>
-        </Tooltip>
-      ) : null}
+            {v === 0 ? "intro" : `v${v}`}
+          </MenuItem>
+        ))}
+      </Menu>
       <Box sx={{ gridArea: "twarticle", minWidth: 0, display: "flex", alignItems: "center", gap: 0.5 }}>
         <CatalogPicker
           value={twLink}
@@ -885,7 +963,10 @@ const WordRow = memo(function WordRow({
   a.gloss === b.gloss &&
   a.quoteBuildMode === b.quoteBuildMode &&
   a.quoteBuildSelectionCount === b.quoteBuildSelectionCount &&
-  a.suggestionAltIds === b.suggestionAltIds);
+  a.suggestionAltIds === b.suggestionAltIds &&
+  // Bridge entry/exit flips the ref picker on/off; ref_raw/verse changes ride
+  // on `a.row` (a move bumps the row object). verseOptions is memoized upstream.
+  a.verseOptions === b.verseOptions);
 
 function twShort(link: string | null): string {
   if (!link) return "—";
