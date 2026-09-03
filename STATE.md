@@ -168,8 +168,10 @@ Highlights that bite repeatedly:
 
 - **Master's three commit producers are distinguishable, and two shapes are traps.** Ours:
   `bible-editor: {BOOK} {res} → master (#N)` AND `bible-editor export: … → {BRANCH} (export-…)` — the `-be-`
-  branch commit also appears in master's file history once the branch merges. AI: author `bot@unfoldingword.org`,
-  usually `@api.bp-assistant` in the subject. Human: everything else. Trap 1: `Revert "bible-editor: EZK ult →
+  branch commit also appears in master's file history once the branch merges. AI: bot author `bot@unfoldingword.org`
+  **and** a pipeline-shaped subject (or a gated trailer) — since #550 the bot address alone is not enough, it used
+  to stamp six hand-directed bot edits `ai`; `@api.bp-assistant` in a non-revert subject is a separate, independent
+  route to `ai` for an unrecognized (non-bot) author. Human: everything else. Trap 1: `Revert "bible-editor: EZK ult →
   master (#6711)" (#6716)` is a real **human** commit, so the prefix must be anchored at the start of the subject,
   never a substring test. Trap 2: `ULT: EZK 38 [pjoakes]` is bot-authored with a plain username in the bracket —
   the bot pushes on a human's behalf, and the content is still machine-written, so the **author** decides, not
