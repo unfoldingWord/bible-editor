@@ -330,6 +330,15 @@ export function buildMergeConflictGuidance(
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
   const keptSourceAttr = rows.filter((r) => r.action === "source_attr_divergent").length;
   const keptAiMaster = rows.filter((r) => r.action === "keep_ai_master").length;
+  // Issue #728: the app's verse-bridge STRUCTURE was kept where Door43's
+  // differs. Split by the one reason whose consequence differs: under a
+  // not-yet-exported bridge the export publishes the bridge OVER Door43's
+  // per-verse text (master_moved_under_local_bridge); every other reason kept
+  // an already-published structure, so the next export writes it back over
+  // Door43's re-structuring.
+  const keptStructureRows = rows.filter((r) => r.action === "keep_local_structure");
+  const keptStructureUnderLocal = keptStructureRows.filter((r) => r.reason === "master_moved_under_local_bridge").length;
+  const keptStructureOther = keptStructureRows.length - keptStructureUnderLocal;
   // Issue #633: name wording vs alignment on the admin sentence too. Split
   // recovery copy so an alignment-only overwrite never claims "replaced text".
   const overwriteAxes = describeOverwriteAxes(overwrittenRows.map((r) => r.reason));
@@ -368,6 +377,17 @@ export function buildMergeConflictGuidance(
         `or the unfoldingWord bot account — no commit from a Door43 editor's own account was found. Nothing of ` +
         `Door43's was taken, so the next export that runs for this resource writes the editor's version over ` +
         `Door43's. If Door43's version is the one you want, put it in the app before then.`
+      : "",
+    keptStructureOther > 0
+      ? `${keptStructureOther} kept the app's verse grouping (a \\v a-b bridge, or its split) where Door43 now groups ` +
+        `the verses differently: either no commit from a Door43 editor's own account was found behind Door43's ` +
+        `change, or the two groupings could not be reconciled automatically. Door43's grouping has NOT been ` +
+        `taken, so the next export that runs for this resource writes the app's grouping over it.`
+      : "",
+    keptStructureUnderLocal > 0
+      ? `${keptStructureUnderLocal} verse(s) changed on Door43 that a bridge made in the app (not yet exported) ` +
+        `has since absorbed — the next export publishes the bridge, and Door43's change to that verse's own text ` +
+        `will be written over unless it is carried into the bridged verse first.`
       : "",
     opts.recordingFailed
       ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +

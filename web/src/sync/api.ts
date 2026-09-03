@@ -96,11 +96,13 @@ export interface VerseDto {
 
 // Result of creating a verse bridge (merge-with-next). `verse` is the combined
 // bridge row; `removed_verse` is the absorbed row's start key to drop locally;
-// `absorbed_verses` are all the verse numbers that row covered (for pruning
-// orphaned status / lane checks).
+// `removed_version` is the version that row had when it was deleted (the
+// tombstone clock — see lib/verseStructure.ts); `absorbed_verses` are all the
+// verse numbers that row covered (for pruning orphaned status / lane checks).
 export interface MergeBridgeResult {
   verse: VerseDto;
   removed_verse: number;
+  removed_version: number;
   absorbed_verses: number[];
 }
 
@@ -1008,6 +1010,27 @@ export interface ReimportCounts {
   // api/src/bookReimport.ts's tombstone branch of applyTsvRows. Optional: an
   // older/cached response may omit it.
   tombstone_reclaimed?: number;
+  // Issue #727. Pairs of verse rows, in chapters this run touched, whose
+  // [verse, verse_end] ranges intersect (a `1-2` bridge beside a standalone `2`).
+  // The export refuses to render such a chapter, so nonzero is warning-grade
+  // (same fail-safe direction as merge_record_failed). verses only. Optional:
+  // an older/cached response may omit it.
+  structure_overlap?: number;
+  // Issue #728. Verse-bridge STRUCTURE reconciled against master as its own
+  // dimension, one count per connected component of intersecting ranges (not per
+  // verse). verses only. Optional: an older/cached response may omit them.
+  //   kept_local   — D1's structure is newer than the last export: kept, master's rows skipped.
+  //   adopted      — master's split or bridge landed in D1.
+  //   refused      — master's structure diverged from what we exported and was NOT
+  //                  taken (no human moved master, not a pure bridge/split, or the
+  //                  anchor's content merge refused); flagged keep_local_structure.
+  //                  Deliberately not folded into merge_refused (#726 decision D3).
+  //   unclassified — no watermark, so local vs exported cannot be told: kept D1,
+  //                  skipped master's rows (the mirror of merge_unavailable).
+  structure_kept_local?: number;
+  structure_adopted?: number;
+  structure_refused?: number;
+  structure_unclassified?: number;
   dcs_404: number;
   errors: string[];
 }

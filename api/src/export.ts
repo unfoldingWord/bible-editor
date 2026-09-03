@@ -11,6 +11,7 @@ import { normalizeNoteText, sortRowsByReference } from "./tsvFormat.ts";
 import { orderTwlRows } from "./twlCanonicalOrder.ts";
 import { renderOccurrence } from "./occurrenceRule.ts";
 import type { UsfmValidationIssue, UsfmValidationRule } from "./usfmValidate.ts";
+import { findOverlappingRanges, VerseRangeOverlapError } from "./verseBridge.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
 
@@ -1735,6 +1736,28 @@ function dropWordAttrResidue(verseObjects: unknown[]): number {
 }
 
 export function buildUsfm(input: UsfmInputs): string {
+  // Issue #727: refuse to render a chapter whose verse rows cover intersecting
+  // ranges. A `(verse=1, verse_end=2)` row beside a `(verse=2)` row would build
+  // the keys "1-2" AND "2" in the same chapter object below, and usfm-js emits
+  // both — `\v 1-2` followed by `\v 2` — as if it were valid USFM. The verses
+  // primary key cannot prevent that shape (it keys on the START verse only), so
+  // this is the export's own structural gate: throw, and the export step for
+  // this `book × resource` fails loudly instead of committing corrupt USFM to
+  // Door43. The nightly reimport runs the same check post-apply and withholds
+  // the watermark (bookReimport.ts applyVerseRows, counts.structure_overlap),
+  // so a chapter in this state is caught on the night it happens, not only when
+  // the export later refuses it.
+  const rowsByChapter = new Map<number, VerseRow[]>();
+  for (const v of input.verses) {
+    const list = rowsByChapter.get(v.chapter);
+    if (list) list.push(v);
+    else rowsByChapter.set(v.chapter, [v]);
+  }
+  for (const [chapter, rows] of rowsByChapter) {
+    const pairs = findOverlappingRanges(rows);
+    if (pairs.length > 0) throw new VerseRangeOverlapError(input.book, input.bibleVersion, chapter, pairs);
+  }
+
   // Group verses by chapter, parsing the stored JSON. Corrupt content fails
   // the export; a partial book is worse than no nightly snapshot.
   const chapters: Record<string, Record<string, unknown>> = {};

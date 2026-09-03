@@ -27,6 +27,8 @@ import {
   splitVerseNumbers,
   SPLIT_INSERT_EDITLOG_RANGE_SQL,
   SPLIT_INSERT_VERSES_RANGE_SQL,
+  findOverlappingRanges,
+  formatVerseRange,
   SPLIT_UPDATE_START_SQL,
   verseRangeEnd,
 } from "./verseBridge.ts";
@@ -58,6 +60,22 @@ eq(absorbedVerseNumbers({ verse: 2, verse_end: null }), [2], "absorbed singleton
 eq(absorbedVerseNumbers({ verse: 3, verse_end: 5 }), [3, 4, 5], "absorbed bridge range");
 eq(splitVerseNumbers({ verse: 1, verse_end: 2 }), [2], "split 1-2 mints verse 2");
 eq(splitVerseNumbers({ verse: 1, verse_end: 4 }), [2, 3, 4], "split 1-4 mints 2,3,4");
+
+// ── findOverlappingRanges (issue #727) ─────────────────────────────────────
+const R = (verse, verse_end = null) => ({ verse, verse_end });
+const pairs = (rows) => findOverlappingRanges(rows).map((p) => `${formatVerseRange(p.a)} ∩ ${formatVerseRange(p.b)}`);
+eq(formatVerseRange(R(5)), "5", "formatVerseRange singleton");
+eq(formatVerseRange(R(5, 7)), "5-7", "formatVerseRange bridge");
+eq(formatVerseRange(R(5, 5)), "5", "formatVerseRange degenerate verse_end==verse reads as singleton");
+eq(pairs([]), [], "empty chapter has no overlaps");
+eq(pairs([R(0), R(1), R(2, 3), R(4)]), [], "front matter + singleton + bridge + singleton, all disjoint");
+eq(pairs([R(1, 2), R(2)]), ["1-2 ∩ 2"], "the #727 shape: bridge 1-2 beside standalone 2");
+eq(pairs([R(2), R(1, 2)]), ["1-2 ∩ 2"], "…input order does not matter");
+eq(pairs([R(1, 3), R(2, 4)]), ["1-3 ∩ 2-4"], "two bridges sharing an interior verse");
+eq(pairs([R(1, 5), R(3), R(7)]), ["1-5 ∩ 3"], "a singleton inside a long bridge; the later singleton is clean");
+eq(pairs([R(1, 5), R(2), R(3)]), ["1-5 ∩ 2", "1-5 ∩ 3"], "every offender against the same reach is reported");
+eq(pairs([R(1, 2), R(3, 4), R(4)]), ["3-4 ∩ 4"], "the reach advances to the later bridge");
+eq(pairs([R(1), R(1, 2)]), ["1 ∩ 1-2"], "same start verse, singleton and bridge (impossible under the PK, still detected)");
 eq(splitVerseNumbers({ verse: 1, verse_end: null }), [], "splitting a non-bridge mints nothing");
 
 // mergeVerseObjects concatenates with a single space separator, mutating neither
@@ -281,6 +299,35 @@ function runSplit(d, { verse, verseEnd, expectedVersion, seed }) {
   assert(changed === 0, "stale split version does not split");
   assert(getVerse(d, 1).verse_end === 2, "bridge intact");
   assert(getVerse(d, 2) === undefined, "no verse minted on a lost CAS");
+}
+
+// split: a freed verse whose ONLY history is the bridge's 'delete' audit row
+// (new_version NULL, prev_version = the deleted row's version) is still minted
+// ABOVE that version. Before the COALESCE(new_version, prev_version) fix in
+// verseVersionFloorSql, MAX(new_version) over a delete-only history was NULL and
+// the verse came back at MAX(0, floor) + 1 — for a floor below the deleted
+// version, the very version the deleted row had held.
+{
+  const d = verseDb();
+  insertVerse(d, { verse: 1, verse_end: 2, version: 1 });
+  // Verse 2 was imported at v1 and never PATCHed (the bootstrap import writes no
+  // edit_log rows), then absorbed: its whole history is this one 'delete' row.
+  d.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+     VALUES ('verse', 'ZEC/5/2/UST', 'ZEC', 30, 1, NULL, 'delete', '{}')`,
+  ).run();
+  const seed = JSON.stringify({ verseObjects: splitSeedVerseObjects() });
+  // Driven by hand rather than through runSplit: floor 0 on purpose. With the
+  // bridge row at v1 the route's own floor (the bridge's version) would also be
+  // 1 and mask the bug; the reimport INSERT passes a literal 0, so this is the
+  // shape that exposed it.
+  const up = d.prepare(SPLIT_UPDATE_START_SQL).run(200, 30, "split", "user", "actor", "ZEC", 5, 1, "UST", 1);
+  assert(up.changes === 1, "split landed");
+  d.prepare(SPLIT_INSERT_VERSES_RANGE_SQL).run("ZEC", 5, "UST", seed, 200, 30, 1, 2, "split", "user", "actor", 0);
+  d.prepare(SPLIT_INSERT_EDITLOG_RANGE_SQL).run("ZEC", 5, "UST", 1, 2, 30, "{}", 0);
+  eq(getVerse(d, 2).version, 2, "the freed verse is minted at 2, above the deleted row's v1 (delete-only history)");
+  const audit = d.prepare(`SELECT new_version FROM edit_log WHERE row_key = 'ZEC/5/2/UST' AND action = 'create'`).get();
+  eq(audit.new_version, 2, "…and its 'create' audit row agrees");
 }
 
 // post-confirm cleanup: absorbed verses' status + lane checks are pruned by range

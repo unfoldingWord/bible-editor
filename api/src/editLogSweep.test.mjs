@@ -21,6 +21,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EDIT_LOG_SWEEP_SQL } from "./editLogSweep.ts";
+import { verseVersionFloorSql } from "./verseBridge.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -43,11 +44,14 @@ function freshDb() {
   return d;
 }
 
-function logRow(d, { id, kind = "verse", rowKey, book = null, action, createdAt, payload = null, source = null }) {
+function logRow(d, {
+  id, kind = "verse", rowKey, book = null, action, createdAt, payload = null, source = null,
+  prevVersion = null, newVersion = null,
+}) {
   d.prepare(
-    `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at, source)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, kind, rowKey, book, action, payload, createdAt, source);
+    `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at, source, prev_version, new_version)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, kind, rowKey, book, action, payload, createdAt, source, prevVersion, newVersion);
 }
 
 function syncRow(d, { book, resource, confirmedAt = null, editId = null }) {
@@ -459,6 +463,187 @@ console.log("\n[#653: tq and twl get the same shield, and one kind's row does no
   sweep(d, 100000);
 
   assert(survivingIds(d).join(",") === "7", "the tq row's create survives; the twl entry with no live row does not");
+}
+
+// ── issue #727/#728 (PR #731 review), branches (7) and (8) ──────────────────
+//
+// The reimport now reads 'bridge'/'split' rows (latest_source, base_payload,
+// the structure planner's structural_edit_id, the start_before ancestor
+// fallback) and 'delete' rows (verseVersionFloorSql's version floor, the
+// absorbed verse's master_moved_under_local_bridge ancestor). Each probe below
+// copies the SQL shape from bookReimport.ts / verseBridge.ts so survival is
+// proven against what production reads.
+
+// bookReimport.ts's latest_source sub-select (applyVerseRows and the
+// single-verse path share this exact action list).
+function latestSource(d, book, chapter, verse, bibleVersion) {
+  const row = d
+    .prepare(
+      `SELECT source FROM edit_log
+        WHERE kind = 'verse'
+          AND row_key = ?1 || '/' || ?3 || '/' || ?4 || '/' || ?2
+          AND (book = ?1 OR book IS NULL)
+          AND action IN ('create', 'update', 'bridge', 'split')
+        ORDER BY id DESC LIMIT 1`,
+    )
+    .get(book, bibleVersion, chapter, verse);
+  return row === undefined ? "NO_ROW" : row.source;
+}
+
+// bookReimport.ts's structural_edit_id sub-select — the planner's LOCAL vs
+// EXPORTED evidence for a bridge's start key.
+function structuralEditId(d, book, chapter, verse, bibleVersion) {
+  const row = d
+    .prepare(
+      `SELECT id FROM edit_log
+        WHERE kind = 'verse'
+          AND row_key = ?1 || '/' || ?3 || '/' || ?4 || '/' || ?2
+          AND (book = ?1 OR book IS NULL)
+          AND action IN ('bridge', 'split')
+        ORDER BY id DESC LIMIT 1`,
+    )
+    .get(book, bibleVersion, chapter, verse);
+  return row ? row.id : null;
+}
+
+// bookReimport.ts's base_payload sub-select (id boundary variant) with the
+// #727 action list — the union of content-bearing ancestor candidates.
+function mergeAncestorPayload727(d, book, chapter, verse, bibleVersion, masterEditId) {
+  const row = d
+    .prepare(
+      `SELECT payload_json FROM edit_log
+        WHERE kind = 'verse'
+          AND row_key = ?1 || '/' || ?3 || '/' || ?4 || '/' || ?2
+          AND (book = ?1 OR book IS NULL)
+          AND action IN ('create', 'update', 'bridge', 'split')
+          AND id <= ?5
+        ORDER BY created_at DESC, id DESC LIMIT 1`,
+    )
+    .get(book, bibleVersion, chapter, verse, masterEditId);
+  return row ? row.payload_json : null;
+}
+
+// The LITERAL floor expression the reimport's floor-0 INSERT and the split
+// route evaluate (verseBridge.ts) — the version a recreated verse is minted at.
+function recreatedVersion(d, book, chapter, verse, bibleVersion) {
+  const expr = verseVersionFloorSql({
+    book: `'${book}'`, chapter: `${chapter}`, verse: `${verse}`, bibleVersion: `'${bibleVersion}'`, floor: "0",
+  });
+  return d.prepare(`SELECT ${expr} AS v`).get().v;
+}
+
+// bookReimport.ts's absorbed-verse ancestor read (newest 'delete' per key).
+function newestDeletePayload(d, book, rowKey) {
+  const row = d
+    .prepare(
+      `SELECT payload_json FROM edit_log
+        WHERE kind = 'verse' AND action = 'delete' AND (book = ?1 OR book IS NULL) AND row_key = ?2
+        ORDER BY id DESC LIMIT 1`,
+    )
+    .get(book, rowKey);
+  return row ? row.payload_json : null;
+}
+
+console.log("\n[#731 review: AI 'update' then human 'bridge', both exported and aged out — the bridge survives, so latest_source stays human]");
+{
+  const d = freshDb();
+  // Export ran AFTER the bridge: both rows are under the id boundary, so
+  // branch (4)'s post-boundary human-edit shield cannot rescue the bridge.
+  syncRow(d, { book: "ZEC", resource: "ult", confirmedAt: 5000, editId: 5 });
+  const key = "ZEC/7/3/ULT";
+  logRow(d, { id: 1, rowKey: key, book: "ZEC", action: "update", createdAt: 1000, source: "ai_pipeline", prevVersion: 1, newVersion: 2, payload: '{"content":"ai draft"}' });
+  logRow(d, { id: 2, rowKey: key, book: "ZEC", action: "bridge", createdAt: 2000, prevVersion: 2, newVersion: 3, payload: '{"content":"bridged","verse_end":4,"start_before":"ai draft"}' }); // source NULL: a human
+
+  sweep(d, 100000);
+
+  assert(
+    survivingIds(d).join(",") === "1,2",
+    "the human bridge (2) survives beside the global-newest create/update (1) — pre-fix only 1 survived",
+  );
+  assert(
+    latestSource(d, "ZEC", "7", "3", "ULT") === null,
+    "latest_source reads the bridge's NULL source (human), not the AI row's 'ai_pipeline'",
+  );
+  assert(
+    mergeAncestorPayload727(d, "ZEC", "7", "3", "ULT", 5) === '{"content":"bridged","verse_end":4,"start_before":"ai draft"}',
+    "base_payload still recovers the bridge row as the under-boundary ancestor",
+  );
+}
+
+console.log("\n[#731 review: same shape with a human 'split' over an AI 'update']");
+{
+  const d = freshDb();
+  syncRow(d, { book: "ZEC", resource: "ust", confirmedAt: 5000, editId: 5 });
+  const key = "ZEC/7/3/UST";
+  logRow(d, { id: 1, rowKey: key, book: "ZEC", action: "update", createdAt: 1000, source: "ai_pipeline", prevVersion: 3, newVersion: 4, payload: '{"content":"ai bridged"}' });
+  logRow(d, { id: 2, rowKey: key, book: "ZEC", action: "split", createdAt: 2000, prevVersion: 4, newVersion: 5, payload: '{"content":"start only","verse_end":null}' });
+
+  sweep(d, 100000);
+
+  assert(survivingIds(d).join(",") === "1,2", "the human split (2) survives — pre-fix only 1 survived");
+  assert(latestSource(d, "ZEC", "7", "3", "UST") === null, "latest_source reads the split's NULL source (human)");
+  assert(structuralEditId(d, "ZEC", "7", "3", "UST") === 2, "structural_edit_id still resolves to the split row");
+}
+
+console.log("\n[#731 review: a LOCAL bridge followed by a local content edit on a stalled boundary keeps its 'bridge' row, so the planner still reads the structure as local]");
+{
+  const d = freshDb();
+  // Boundary stamped at id 1; the bridge and a later text fix both land above
+  // it and the book never re-exports (locked/published), so both age out.
+  // Branch (4) keeps only the NEWEST post-boundary human row — the 'update' —
+  // and pre-fix the bridge beneath it was swept, leaving structural_edit_id
+  // NULL: the planner would classify the translator's bridge as EXPORTED and
+  // adopt master's un-bridged shape over it.
+  syncRow(d, { book: "JON", resource: "ult", confirmedAt: 5000, editId: 1 });
+  const key = "JON/2/1/ULT";
+  logRow(d, { id: 1, rowKey: key, book: "JON", action: "create", createdAt: 1000, prevVersion: null, newVersion: 1, payload: '{"content":"ancestor"}' });
+  logRow(d, { id: 2, rowKey: key, book: "JON", action: "bridge", createdAt: 6000, prevVersion: 1, newVersion: 2, payload: '{"content":"bridged","verse_end":2}' });
+  logRow(d, { id: 3, rowKey: key, book: "JON", action: "update", createdAt: 7000, prevVersion: 2, newVersion: 3, payload: '{"content":"bridged, fixed"}' });
+
+  sweep(d, 100000);
+
+  assert(survivingIds(d).join(",") === "1,2,3", "ancestor (1), the bridge (2, branch 7) and the newest human edit (3) all survive — pre-fix 2 was swept");
+  assert(structuralEditId(d, "JON", "2", "1", "ULT") === 2, "structural_edit_id still resolves to the bridge row above the boundary");
+}
+
+console.log("\n[#727: an imported-then-bridged verse's only row is its 'delete' — it survives, so the version floor still mints above the deleted version]");
+{
+  const d = freshDb();
+  // Bootstrap import writes no edit_log rows; the bridge route's audit for the
+  // absorbed verse is 'delete' with prev_version = the deleted version and
+  // new_version NULL (verses.ts). Export ran after the bridge, so the row is
+  // under the boundary: no other branch shields it.
+  syncRow(d, { book: "ZEC", resource: "ult", confirmedAt: 5000, editId: 5 });
+  const key = "ZEC/8/2/ULT";
+  logRow(d, { id: 3, rowKey: key, book: "ZEC", action: "delete", createdAt: 2000, prevVersion: 1, newVersion: null, payload: '{"content":"absorbed text","absorbed_into":1}' });
+
+  sweep(d, 100000);
+
+  assert(survivingIds(d).join(",") === "3", "the delete row survives — pre-fix it was swept");
+  assert(
+    recreatedVersion(d, "ZEC", 8, 2, "ULT") === 2,
+    "verseVersionFloorSql still mints the recreated verse at deleted+1 = 2 (a swept row collapses this to 1, re-minting the deleted version)",
+  );
+  assert(
+    newestDeletePayload(d, "ZEC", key) === '{"content":"absorbed text","absorbed_into":1}',
+    "master_moved_under_local_bridge still finds the absorbed verse's ancestor payload",
+  );
+}
+
+console.log("\n[#727: step 7s's reimport-sourced 'delete' on a never-exported book survives too, and only the NEWEST delete per key is kept]");
+{
+  const d = freshDb();
+  // No watermark at all — the floor is a CAS invariant regardless of export
+  // state, so branch (8) deliberately has no watermark join.
+  syncRow(d, { book: "ECC", resource: "ult", confirmedAt: null, editId: null });
+  const key = "ECC/3/5/ULT";
+  logRow(d, { id: 2, rowKey: key, book: "ECC", action: "delete", createdAt: 1000, prevVersion: 1, newVersion: null, payload: '{"content":"first life"}' });
+  logRow(d, { id: 4, rowKey: key, book: "ECC", action: "delete", createdAt: 3000, source: "dcs_reimport", prevVersion: 3, newVersion: null, payload: '{"content":"second life","absorbed_into":4}' });
+
+  sweep(d, 100000);
+
+  assert(survivingIds(d).join(",") === "4", "only the newest delete (4) survives; the older delete (2) ages out — pre-fix both were swept");
+  assert(recreatedVersion(d, "ECC", 3, 5, "ULT") === 4, "the floor mints the recreated verse at 3+1 = 4 off the surviving delete's prev_version");
 }
 
 if (failed > 0) {
