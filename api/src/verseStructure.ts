@@ -178,7 +178,10 @@ function rangeSignature(rs: Array<{ start: number; end: number }>): string {
 }
 
 // Is this D1 structural edit newer than what master is confirmed to hold?
-function isAboveBoundary(edit: StructuralEdit, cutoff: StructureCutoff): boolean {
+// Exported for bookReimport.ts's master_moved_under_local_bridge ancestor
+// fallback, which must ask the same question of one row the planner asked of
+// the component.
+export function isAboveBoundary(edit: StructuralEdit, cutoff: StructureCutoff): boolean {
   if (cutoff.editId != null) return edit.id > cutoff.editId;
   return cutoff.confirmedAt != null && edit.createdAt >= cutoff.confirmedAt;
 }

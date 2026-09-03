@@ -159,11 +159,12 @@ import {
   findOverlappingRanges,
   formatVerseRange,
   hasVerseObjectsArray,
+  isBridge,
   mergeVerseObjects,
   verseRangeEnd,
   verseVersionFloorSql,
 } from "./verseBridge.ts";
-import { planStructure, structureKey, type StructureAdoption, type StructuralEdit } from "./verseStructure.ts";
+import { isAboveBoundary, planStructure, structureKey, type StructureAdoption, type StructuralEdit } from "./verseStructure.ts";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
 
@@ -5846,49 +5847,86 @@ async function applyVerseRows(
   // read in ONE query per ≤WRITE_BATCH keys and only when a local bridge exists
   // at all — a normal night pays nothing. No recoverable ancestor → no evidence
   // → no flag (the keep_no_base posture; the count still says a bridge was kept).
+  //
+  // Review F4: base_payload is NULL for a start verse the bootstrap import
+  // wrote (no edit_log row at all) and nobody edited before bridging — the
+  // common shape, since the import writes no audit rows. The same query then
+  // also fetches the newest 'bridge' row on that key: since this fix the bridge
+  // route stores `start_before`, the start row's content before the merge,
+  // which is that verse's last published state when nothing else was written
+  // below the boundary. Only taken when that row IS the key's newest structural
+  // edit and is itself local (isAboveBoundary — the planner's own test), so an
+  // exported bridge's pre-merge text can never pose as the ancestor of a master
+  // range that still agrees with it. A local edit above the boundary that
+  // preceded the bridge would make start_before post-edit text and a flag
+  // spurious — accepted: a spurious review flag on a kept structure is the
+  // fail-safe direction, a silent export over Door43's moved text is not.
+  // Pre-fix bridge rows carry no start_before → no evidence → no flag, as before.
   {
-    const absorbedLookups: Array<{ chapter: number; m: VerseExtract; coverVersion: number | null }> = [];
+    const lookups: Array<{
+      chapter: number; m: VerseExtract; observedVersion: number | null;
+      kind: "absorbed" | "start"; structuralEditId?: number;
+    }> = [];
     for (const kl of plan.keptLocal) {
       for (const m of kl.masterVerses) {
         const same = kl.d1Rows.find((r) => r.verse === m.verse);
         if (same) {
           const ancestor = verseContentJsonFromPayload(same.base_payload ?? null);
-          if (ancestor != null && !verseContentConverged(ancestor, m.contentJson)) {
-            mergeConflicts.push({
-              chapter: kl.chapter, verse: m.verse, action: "keep_local_structure",
-              reason: "master_moved_under_local_bridge", overwrittenVersion: null, alignment: null,
-              adopted: false, observedVersion: same.version,
-            });
+          if (ancestor != null) {
+            if (!verseContentConverged(ancestor, m.contentJson)) {
+              mergeConflicts.push({
+                chapter: kl.chapter, verse: m.verse, action: "keep_local_structure",
+                reason: "master_moved_under_local_bridge", overwrittenVersion: null, alignment: null,
+                adopted: false, observedVersion: same.version,
+              });
+            }
+          } else if (isBridge(same) && same.structural_edit_id != null && cutoff != null) {
+            const e = structuralEdits.get(structureKey(kl.chapter, same.verse));
+            if (e && isAboveBoundary(e, cutoff)) {
+              lookups.push({ chapter: kl.chapter, m, observedVersion: same.version, kind: "start", structuralEditId: e.id });
+            }
           }
         } else {
           const cover = kl.d1Rows.find((r) => r.verse < m.verse && verseRangeEnd(r) >= m.verse);
-          absorbedLookups.push({ chapter: kl.chapter, m, coverVersion: cover?.version ?? null });
+          lookups.push({ chapter: kl.chapter, m, observedVersion: cover?.version ?? null, kind: "absorbed" });
         }
       }
     }
-    if (absorbedLookups.length > 0) {
-      const deletePayloads = new Map<string, string | null>();
-      for (let i = 0; i < absorbedLookups.length; i += WRITE_BATCH) {
-        const slice = absorbedLookups.slice(i, i + WRITE_BATCH);
+    if (lookups.length > 0) {
+      // Newest row per (action, key): 'delete' for an absorbed verse, 'bridge'
+      // for a start verse. One row's action never answers for the other.
+      const payloads = new Map<string, { id: number; payload_json: string | null }>();
+      for (let i = 0; i < lookups.length; i += WRITE_BATCH) {
+        const slice = lookups.slice(i, i + WRITE_BATCH);
         const keys = slice.map((l) => `${book}/${l.chapter}/${l.m.verse}/${bibleVersion}`);
         const ph = keys.map((_, j) => `?${j + 2}`).join(", ");
         const rs = await env.DB.prepare(
-          `SELECT row_key, payload_json FROM edit_log
-            WHERE kind = 'verse' AND action = 'delete' AND (book = ?1 OR book IS NULL)
+          `SELECT id, action, row_key, payload_json FROM edit_log
+            WHERE kind = 'verse' AND action IN ('delete', 'bridge') AND (book = ?1 OR book IS NULL)
               AND row_key IN (${ph})
             ORDER BY id DESC`,
         )
           .bind(book, ...keys)
-          .all<{ row_key: string; payload_json: string | null }>();
-        for (const r of rs.results ?? []) if (!deletePayloads.has(r.row_key)) deletePayloads.set(r.row_key, r.payload_json);
+          .all<{ id: number; action: string; row_key: string; payload_json: string | null }>();
+        for (const r of rs.results ?? []) {
+          const k = `${r.action}|${r.row_key}`;
+          if (!payloads.has(k)) payloads.set(k, { id: Number(r.id), payload_json: r.payload_json });
+        }
       }
-      for (const l of absorbedLookups) {
-        const ancestor = verseContentJsonFromPayload(deletePayloads.get(`${book}/${l.chapter}/${l.m.verse}/${bibleVersion}`) ?? null);
+      for (const l of lookups) {
+        const rowKey = `${book}/${l.chapter}/${l.m.verse}/${bibleVersion}`;
+        let ancestor: string | null = null;
+        if (l.kind === "absorbed") {
+          ancestor = verseContentJsonFromPayload(payloads.get(`delete|${rowKey}`)?.payload_json ?? null);
+        } else {
+          const br = payloads.get(`bridge|${rowKey}`);
+          if (br && br.id === l.structuralEditId) ancestor = verseContentJsonFromPayload(br.payload_json, "start_before");
+        }
         if (ancestor != null && !verseContentConverged(ancestor, l.m.contentJson)) {
           mergeConflicts.push({
             chapter: l.chapter, verse: l.m.verse, action: "keep_local_structure",
             reason: "master_moved_under_local_bridge", overwrittenVersion: null, alignment: null,
-            adopted: false, observedVersion: l.coverVersion,
+            adopted: false, observedVersion: l.observedVersion,
           });
         }
       }
@@ -6798,6 +6836,7 @@ async function applyVerseRows(
   // next night's plain insert / absorb closes) — never two rows on one verse —
   // and is counted apply_incomplete so the watermark is withheld for the retry.
   const landedBridgeAdoptions: Array<StructureAdoption<ExistingVerseRow, VerseExtract>> = [];
+  const recordFailedAtStep7 = recordFailed;
   if (plan.adoptions.length > 0) {
     for (const a of masterAdoptions) {
       const k = structureKey(a.v.chapter, a.v.verse);
@@ -6849,8 +6888,6 @@ async function applyVerseRows(
           continue;
         }
       }
-      // Step 7's recordFailed branch already counted and reported these.
-      if (aw.mode === "merge" && recordFailed) continue;
       staged.push(aw);
     }
     if (lateFlags.length > 0) {
@@ -6863,6 +6900,31 @@ async function applyVerseRows(
         now,
       );
       if (!ok) recordFailed = true;
+    }
+    // Review F2: when conflict recording failed, write NOTHING structural this
+    // run — every mode, not just 'merge' (mirror of step 7). A bridge anchor in
+    // pristine / ai_reseed / converged mode still DELETEs its absorbed rows, and
+    // an absorbed row a human edited has only its speculative adopt_conflict
+    // pointer (structure_absorbed_human_edit, pushed before 6b) to say so; with
+    // that upsert lost, deleting the row would leave no recovery pointer and no
+    // way for the retry to re-detect it (the row is gone). merge_record_failed
+    // withholds the watermark, so the next run recomputes and retries. Anchors
+    // in 'merge' mode were already counted/reported by step 7's branch when it
+    // saw recordFailed; the rest (and all of them if only the lateFlags write
+    // failed) are counted here.
+    if (recordFailed && staged.length > 0) {
+      const uncounted = staged.filter((aw) => aw.mode !== "merge" || !recordFailedAtStep7);
+      if (uncounted.length > 0) {
+        counts.skipped_edited += uncounted.length;
+        counts.errors.push(
+          `verse structure-adoption batch skipped for ${uncounted.length} component(s) in ${book} ${bibleVersion}: ` +
+            `merge-conflict recording failed this run (see merge_record_failed)`,
+        );
+      }
+      console.error("reimport: skipping verse structure-adoption batch — merge-conflict recording failed this run (issue #728)", {
+        book, bibleVersion, skipped: staged.length,
+      });
+      staged.length = 0;
     }
 
     // Chunk whole components into ≤WRITE_BATCH-statement batches. A component
@@ -6897,12 +6959,14 @@ async function applyVerseRows(
           const k = structureKey(ad.chapter, ad.anchor.verse);
           if ((results[off]?.meta.changes ?? 0) === 0) {
             // Lost the anchor's CAS (or, for a bridge, an absorbed row moved):
-            // nothing in the component was written. Mirrors the content paths:
-            // skipped_edited everywhere; the merge path additionally withholds
-            // the watermark (step 7's Codex P1.2 rule) since master's change
-            // did not land and the export would otherwise revert it unretried.
+            // nothing in the component was written. skipped_edited like every
+            // lost-CAS content path, AND apply_incomplete in EVERY mode (review
+            // F1; step 7's Codex P1.2 rule): master's re-structuring did not
+            // land, so stamping the watermark would let the export republish
+            // D1's structure over Door43's with no retry — the mode the
+            // anchor's CONTENT was decided in says nothing about that.
             counts.skipped_edited++;
-            if (aw.mode === "merge") counts.apply_incomplete = true;
+            counts.apply_incomplete = true;
             console.warn("reimport: verse structure adoption lost its version-CAS race; nothing written (issue #728)", {
               book, bibleVersion, chapter: ad.chapter, verse: ad.anchor.verse, kind: ad.kind, mode: aw.mode,
             });
@@ -7020,13 +7084,19 @@ async function applyVerseRows(
   // handles on its own, disjoint ref set). See confirmAdoptedConflicts's and
   // verseMergeConflictSql.ts's UPSERT_VERSE_MERGE_CONFLICT_SQL doc comments
   // for the full incident this closes.
-  if (landedAdoptions.length > 0) {
-    await confirmAdoptedConflicts(
-      env,
-      book,
-      resource,
-      landedAdoptions.map((a) => ({ chapter: a.v.chapter, verse: a.v.verse })),
-    );
+  //
+  // Review F3: the confirm set is every speculative ADOPTED row whose write
+  // landed — the exact complement of 7b's deleteLostAdoptionConflicts filter
+  // below — not `landedAdoptions`, which only sees masterAdoptions. Step 7s adds
+  // an absorbed row's key to adoptionsApplied when its DELETE lands, and its
+  // structure_absorbed_human_edit pointer is an adopt_conflict like any other:
+  // left unconfirmed, a previously resolved row on that verse kept its stale
+  // resolved_at and the banner (resolved_at IS NULL) never showed the pointer.
+  const confirmRefs = mergeConflicts
+    .filter((mc) => mc.adopted && adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
+    .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
+  if (confirmRefs.length > 0) {
+    await confirmAdoptedConflicts(env, book, resource, confirmRefs);
   }
 
   const reopenEntries: Array<{ chapter: number; verse: number; lanes: CheckLane[] }> = [];

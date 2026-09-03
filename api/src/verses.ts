@@ -744,7 +744,13 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/bridge", requireEditor, async 
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
          SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'bridge', ?6 WHERE changes() > 0`,
       )
-      .bind(startKey, book, userId, startVersion, startVersion + 1, JSON.stringify({ content: mergedContent, verse_end: bridgeEnd })),
+      // `start_before` is the start row's content BEFORE the merge — the ancestor
+      // the nightly reimport compares master's start verse against when this
+      // bridge is still local and the key has no create/update row at or below
+      // the export boundary (a bootstrap-imported, never-edited verse; issue
+      // #728 review F4). verseHistory.ts reads only `content`, so the extra key
+      // is invisible to the timeline.
+      .bind(startKey, book, userId, startVersion, startVersion + 1, JSON.stringify({ content: mergedContent, verse_end: bridgeEnd, start_before: startParsed })),
     c.env.DB
       .prepare(
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)

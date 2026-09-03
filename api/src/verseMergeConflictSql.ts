@@ -211,15 +211,34 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- 'adopt_no_visible_change' (issue #633) is treated like 'adopt' here: it
      -- is audit-only and must not erase a prior adopt_conflict's recovery
      -- pointer / banner claim.
+     -- 'keep_local_structure' (issue #728 review) joins the carve-out for an
+     -- UNRESOLVED adopt_conflict only. It is a STRUCTURE-dimension flag that
+     -- can land on a verse whose CONTENT-dimension adopt_conflict (an earlier
+     -- night's real overwrite) is still waiting for a human; unlike the three
+     -- content-path keep actions below, it does not supersede that decision,
+     -- so it must not replace the pointer the human still needs. A RESOLVED
+     -- adopt_conflict is deliberately not held sticky: the reactivation
+     -- carve-out at the bottom clears resolved_at for keep_local_structure
+     -- (no CAS race can make it lie), and doing that on a row still labelled
+     -- adopt_conflict would be exactly the false "Door43 replaced your edit"
+     -- reactivation two-phase adoption exists to prevent.
      action = CASE
        WHEN excluded.action IN ('adopt', 'adopt_no_visible_change')
          AND verse_merge_conflicts.action = 'adopt_conflict'
+       THEN verse_merge_conflicts.action
+       WHEN excluded.action = 'keep_local_structure'
+         AND verse_merge_conflicts.action = 'adopt_conflict'
+         AND verse_merge_conflicts.resolved_at IS NULL
        THEN verse_merge_conflicts.action
        ELSE excluded.action
      END,
      reason = CASE
        WHEN excluded.action IN ('adopt', 'adopt_no_visible_change')
          AND verse_merge_conflicts.action = 'adopt_conflict'
+       THEN verse_merge_conflicts.reason
+       WHEN excluded.action = 'keep_local_structure'
+         AND verse_merge_conflicts.action = 'adopt_conflict'
+         AND verse_merge_conflicts.resolved_at IS NULL
        THEN verse_merge_conflicts.reason
        ELSE excluded.reason
      END,
@@ -232,6 +251,12 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- across a resolve -> new-conflict cycle on the SAME verse — worth a
      -- follow-up if that combination turns out to matter in practice.
      overwritten_version = CASE
+       -- Same unresolved-adopt_conflict carve-out as action above: the row
+       -- stays an adopt_conflict, so its recovery pointer stays with it.
+       WHEN excluded.action = 'keep_local_structure'
+         AND verse_merge_conflicts.action = 'adopt_conflict'
+         AND verse_merge_conflicts.resolved_at IS NULL
+       THEN verse_merge_conflicts.overwritten_version
        WHEN excluded.action IN ('keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master', 'keep_local_structure') THEN NULL
        ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
      END,

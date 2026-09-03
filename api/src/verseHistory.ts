@@ -83,7 +83,11 @@ function normalizeContent(raw: unknown): unknown | null {
 // absorbed identically here as they are for the version-history timeline.
 // Used by the nightly sync's verseMerge ancestor recovery (bookReimport.ts) —
 // see verseMerge.ts's header for why the ancestor comes from edit_log at all.
-export function verseContentJsonFromPayload(payloadJson: string | null): string | null {
+// `field` defaults to the payload's `content`; the bridge route's audit row
+// (verses.ts) also carries `start_before`, the start row's content before the
+// merge, which bookReimport.ts reads as the start verse's ancestor when the key
+// has no other content row at or below the export boundary (issue #728).
+export function verseContentJsonFromPayload(payloadJson: string | null, field: "content" | "start_before" = "content"): string | null {
   if (!payloadJson) return null;
   let payload: Record<string, unknown>;
   try {
@@ -91,7 +95,7 @@ export function verseContentJsonFromPayload(payloadJson: string | null): string 
   } catch {
     return null;
   }
-  const content = normalizeContent(payload["content"]);
+  const content = normalizeContent(payload[field]);
   return content != null ? JSON.stringify(content) : null;
 }
 
