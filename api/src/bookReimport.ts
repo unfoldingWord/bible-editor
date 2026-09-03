@@ -5388,6 +5388,30 @@ async function applyVerseRows(
   const existing = new Map<string, (typeof existingRs.results)[number]>();
   for (const r of existingRs.results) existing.set(`${r.chapter}:${r.verse}`, r);
 
+  // Bridge-awareness for the verse-bridge feature. A D1 verse bridge
+  // (verse=a, verse_end=b) is a LOCAL restructuring — it is not on Door43 master
+  // until the next export, so master still carries the SEPARATE verses a..b. The
+  // `existing` map above is keyed by start verse only, so a bridge 1-2 registers
+  // a key for 1 but NOT 2. Without this map, master's plain verse 2 misses the
+  // map and gets reinserted as a standalone row (overlapping `\v 1-2` + `\v 2` in
+  // the nightly USFM), and master's plain verse 1 routes into the adopt path and
+  // can clobber the bridge with its un-bridged text. Register every integer a D1
+  // bridge covers → the bridge's [start, end], so the loop below can skip a plain
+  // master verse that a bridge already covers. First-writer-wins on overlap
+  // (imports never emit overlapping ranges). Empty when no bridges exist.
+  const bridgeCover = new Map<string, { start: number; end: number }>();
+  for (const r of existingRs.results) {
+    if (r.verse_end != null && r.verse_end > r.verse) {
+      for (let vn = r.verse; vn <= r.verse_end; vn++) {
+        const k = `${r.chapter}:${vn}`;
+        if (!bridgeCover.has(k)) bridgeCover.set(k, { start: r.verse, end: r.verse_end });
+      }
+    }
+  }
+  // Refs skipped because a not-yet-exported D1 bridge already covers them.
+  // Diagnostic only (logged capped at the end, like suppressedRefs); gates nothing.
+  const bridgeCoveredRefs: string[] = [];
+
   // 2. Diff in memory. Stage a write only for verses that are new or
   //    pristine-and-changed; count no-ops / edited rows straight from the
   //    read. inserted/updated are tallied per-statement from meta.changes once
@@ -5482,6 +5506,17 @@ async function applyVerseRows(
     observedVersion: number | null;
   }> = [];
   for (const v of verses) {
+    // A not-yet-exported D1 bridge already covers this master verse. Skip a
+    // PLAIN master verse (verseEnd null) the bridge spans: reinserting an
+    // absorbed verse would emit an overlapping `\v N` beside `\v a-b`, and
+    // adopting master's un-bridged text would clobber the bridge. A master verse
+    // that is ITSELF a bridge here (verseEnd set) is left to the normal
+    // start-verse reconcile below (which compares verse_end). Once the bridge is
+    // exported, master carries `a-b` too and this no longer fires.
+    if (bridgeCover.get(`${v.chapter}:${v.verse}`) && (v.verseEnd == null || v.verseEnd <= v.verse)) {
+      bridgeCoveredRefs.push(`${v.chapter}:${v.verse}`);
+      continue;
+    }
     const ex = existing.get(`${v.chapter}:${v.verse}`);
     if (!ex) {
       const rowKey = `${book}/${v.chapter}/${v.verse}/${bibleVersion}`;
@@ -5782,6 +5817,12 @@ async function applyVerseRows(
   if (suppressedRefs.length > 0) {
     console.log("reimport: skipped verse write(s) the export would render identically (issue #609)", {
       book, bibleVersion, verses: suppressedRefs.slice(0, 10), total: suppressedRefs.length,
+    });
+  }
+
+  if (bridgeCoveredRefs.length > 0) {
+    console.log("reimport: skipped master verse(s) already covered by a not-yet-exported D1 bridge", {
+      book, bibleVersion, verses: bridgeCoveredRefs.slice(0, 10), total: bridgeCoveredRefs.length,
     });
   }
 

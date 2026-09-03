@@ -141,7 +141,7 @@ function runSplit(d, { verse, verseEnd, expectedVersion, seed }) {
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
      SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'split', ?6 WHERE changes() > 0`,
   ).run(`ZEC/5/${verse}/UST`, "ZEC", 30, expectedVersion, expectedVersion + 1, "{}");
-  d.prepare(SPLIT_INSERT_VERSES_RANGE_SQL).run("ZEC", 5, "UST", seed, 200, 30, verse, verseEnd, "split", "user", "actor");
+  d.prepare(SPLIT_INSERT_VERSES_RANGE_SQL).run("ZEC", 5, "UST", seed, 200, 30, verse, verseEnd, "split", "user", "actor", expectedVersion);
   d.prepare(SPLIT_INSERT_EDITLOG_RANGE_SQL).run("ZEC", 5, "UST", verse, verseEnd, 30, "{}");
   return up.changes;
 }
@@ -209,9 +209,24 @@ function runSplit(d, { verse, verseEnd, expectedVersion, seed }) {
   const v2 = getVerse(d, 2);
   assert(!!v2, "verse-2 row created");
   eq(v2.content_json, seed, "verse-2 seeded with the empty tree");
-  eq(v2.version, 1, "new verse starts at version 1");
+  // NOT version 1 — floored above the bridge version (4) so a stale pre-bridge
+  // If-Match can't pass CAS against the re-minted row (finding 6). max(0,4)+1 = 5.
+  eq(v2.version, 5, "recreated verse starts above the bridge version, not at 1");
   const audit = d.prepare(`SELECT COUNT(*) c FROM edit_log WHERE row_key='ZEC/5/2/UST' AND action='create'`).get().c;
   eq(audit, 1, "verse-2 got its create audit row");
+}
+
+// split version floors above the verse's OWN edit_log history too (finding 6):
+// if verse 2 had reached version 9 before it was bridged, the re-minted row must
+// start at 10 — not the bridge version — so a stale If-Match:9 can't match.
+{
+  const d = verseDb();
+  insertVerse(d, { verse: 1, verse_end: 2, version: 4 });
+  // Verse 2's pre-bridge history: it once reached new_version 9.
+  d.prepare(`INSERT INTO edit_log (kind, row_key, book, new_version, action) VALUES ('verse','ZEC/5/2/UST','ZEC',9,'update')`).run();
+  const seed = JSON.stringify({ verseObjects: splitSeedVerseObjects() });
+  runSplit(d, { verse: 1, verseEnd: 2, expectedVersion: 4, seed });
+  eq(getVerse(d, 2).version, 10, "recreated verse floors above its own edit_log max (9), not the bridge version (4)");
 }
 
 // split: 5:1-3 → 5:1 + 5:2 + 5:3

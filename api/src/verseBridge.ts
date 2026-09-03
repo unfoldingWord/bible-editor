@@ -157,9 +157,19 @@ export const SPLIT_UPDATE_START_SQL = `UPDATE verses
 // the batch and failed. Two fixed multi-row INSERTs keep the whole split at
 // exactly four statements, preserving the atomic all-or-nothing guarantee.
 //
+// The recreated verse's `version` is NOT a literal 1. A bridge→split cycle
+// re-mints a deleted verse's primary key, and a stale outbox PATCH still holding
+// a pre-bridge `If-Match` for that verse would pass the numeric CAS against a
+// fresh version=1 row and silently overwrite the seed with stale text. Start
+// each recreated verse ABOVE both (a) the highest version it ever reached in
+// edit_log and (b) the bridge row's current version (?12) — so any stale
+// If-Match a client could hold is strictly less than the new version and its CAS
+// fails with a 409 instead. The CAST mirrors the row_key format stored elsewhere
+// (a REAL-bound integer would concatenate as "5.0" and never match).
+//
 // Binds, in order: (book, chapter, bibleVersion, contentJson, updatedAt,
 // updatedBy, startVerse, verseEnd, lastChangeAction, lastChangeSource,
-// lastChangeActor).
+// lastChangeActor, bridgeVersion).
 export const SPLIT_INSERT_VERSES_RANGE_SQL = `INSERT INTO verses
      (book, chapter, verse, verse_end, bible_version, content_json, plain_text,
       version, updated_at, updated_by, last_change_action, last_change_source, last_change_actor)
@@ -167,7 +177,14 @@ export const SPLIT_INSERT_VERSES_RANGE_SQL = `INSERT INTO verses
      SELECT ?7 + 1
      UNION ALL SELECT v + 1 FROM split_seq WHERE v + 1 <= ?8
    )
-   SELECT ?1, ?2, v, NULL, ?3, ?4, NULL, 1, ?5, ?6, ?9, ?10, ?11
+   SELECT ?1, ?2, v, NULL, ?3, ?4, NULL,
+     MAX(
+       COALESCE((SELECT MAX(new_version) FROM edit_log
+                  WHERE kind = 'verse'
+                    AND row_key = ?1 || '/' || CAST(?2 AS INTEGER) || '/' || CAST(v AS INTEGER) || '/' || ?3), 0),
+       ?12
+     ) + 1,
+     ?5, ?6, ?9, ?10, ?11
      FROM split_seq
     WHERE changes() > 0`;
 

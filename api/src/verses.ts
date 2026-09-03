@@ -35,7 +35,6 @@ import {
   isBridge,
   mergeVerseObjects,
   splitSeedVerseObjects,
-  splitVerseNumbers,
   SPLIT_INSERT_EDITLOG_RANGE_SQL,
   SPLIT_INSERT_VERSES_RANGE_SQL,
   SPLIT_UPDATE_START_SQL,
@@ -829,7 +828,6 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
   }
   if (!isBridge(bridge)) return c.json({ error: "not_a_bridge" }, 400);
 
-  const newVerses = splitVerseNumbers(bridge);
   const bridgeEnd = bridge.verse_end as number; // isBridge above guarantees non-null
   const seedContent = { verseObjects: splitSeedVerseObjects() };
   const seedJson = JSON.stringify(seedContent);
@@ -856,7 +854,7 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
       .bind(startKey, book, userId, expected, expected + 1, JSON.stringify({ content: safeParseOrNull(bridge), verse_end: null })),
     c.env.DB
       .prepare(SPLIT_INSERT_VERSES_RANGE_SQL)
-      .bind(book, chapter, bibleVersion, seedJson, now, userId, verse, bridgeEnd, ...provenanceValues({ action: "split", source: "user", actor })),
+      .bind(book, chapter, bibleVersion, seedJson, now, userId, verse, bridgeEnd, ...provenanceValues({ action: "split", source: "user", actor }), expected),
     c.env.DB
       .prepare(SPLIT_INSERT_EDITLOG_RANGE_SQL)
       .bind(book, chapter, bibleVersion, verse, bridgeEnd, userId, JSON.stringify({ content: seedContent })),
@@ -868,16 +866,27 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
 
   const updated = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
   const startDto = updated ? { ...updated, content: safeParseOrNull(updated) } : null;
-  const newDtos: VerseDto[] = newVerses.map((v) => ({
+  // Re-read the recreated verses for their ACTUAL versions — the split no longer
+  // mints them at a literal 1 (see SPLIT_INSERT_VERSES_RANGE_SQL), so a hand-built
+  // `version: 1` DTO would leave the client with a stale expected_version and
+  // 409 its first edit. Rows are keyed verse > start AND verse <= bridgeEnd.
+  const createdRes = await c.env.DB.prepare(
+    `SELECT verse, version, updated_at, updated_by FROM verses
+      WHERE book = ?1 AND chapter = ?2 AND bible_version = ?3 AND verse > ?4 AND verse <= ?5
+      ORDER BY verse`,
+  )
+    .bind(book, chapter, bibleVersion, verse, bridgeEnd)
+    .all<{ verse: number; version: number; updated_at: number; updated_by: number | null }>();
+  const newDtos: VerseDto[] = createdRes.results.map((r) => ({
     book,
     chapter,
-    verse: v,
+    verse: r.verse,
     verse_end: null,
     bible_version: bibleVersion,
     plain_text: null,
-    version: 1,
-    updated_by: userId ?? null,
-    updated_at: now,
+    version: r.version,
+    updated_by: r.updated_by,
+    updated_at: r.updated_at,
     content: seedContent,
   }));
   c.executionCtx.waitUntil(

@@ -157,6 +157,50 @@ console.log("\n[a lost UPDATE race (updated_by set between read and write) is no
   eq(logRow.n, 0, "no phantom restorable version was logged for the write that never landed");
 }
 
+console.log("\n[a not-yet-exported D1 verse bridge is not corrupted by the pre-export reimport]");
+{
+  // The verse-bridge feature stores 5:1-2 as ONE row (verse=1, verse_end=2) and
+  // deletes the standalone verse-2 row — but the bridge isn't on Door43 master
+  // until the next export, so master still carries SEPARATE verses 1 and 2. The
+  // reconcile must NOT reinsert verse 2 (that would emit overlapping `\v 1-2` +
+  // `\v 2` in the nightly USFM) nor adopt master's un-bridged verse-1 text over
+  // the bridge. See the bridgeCover guard in applyVerseRows.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 5, 1, 2, ?, ?, ?, 3, 7)`,
+    )
+    .run(BOOK, VERSION, contentJson("combined one two"), "combined one two");
+  const master = [
+    verse(5, 1, "master verse one"),   // covered by the bridge → must be skipped
+    verse(5, 2, "master verse two"),   // absorbed → must NOT be reinserted
+    verse(5, 3, "master verse three"), // uncovered new verse → must reinsert normally
+  ];
+
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, master, null, null, false);
+
+  const v2 = sqlite
+    .prepare("SELECT COUNT(*) AS n FROM verses WHERE book=? AND bible_version=? AND chapter=5 AND verse=2")
+    .all(BOOK, VERSION);
+  eq(v2[0].n, 0, "master's plain verse 2 was NOT reinserted beside the bridge");
+
+  const bridge = sqlite
+    .prepare("SELECT verse_end, content_json, version FROM verses WHERE book=? AND bible_version=? AND chapter=5 AND verse=1")
+    .all(BOOK, VERSION)[0];
+  eq(bridge.verse_end, 2, "bridge still spans 1-2");
+  eq(JSON.parse(bridge.content_json).verseObjects[0].text, "combined one two", "bridge content not clobbered by master's un-bridged verse 1");
+  eq(bridge.version, 3, "bridge version not bumped");
+
+  const v3 = sqlite
+    .prepare("SELECT content_json FROM verses WHERE book=? AND bible_version=? AND chapter=5 AND verse=3")
+    .all(BOOK, VERSION);
+  eq(v3.length, 1, "an uncovered missing verse (5:3) still reinserts — the guard stays narrow");
+  eq(JSON.parse(v3[0].content_json).verseObjects[0].text, "master verse three", "5:3 got master's content");
+  eq(counts.inserted, 1, "only the uncovered verse counted inserted (the two bridge-covered verses were skipped, not written)");
+}
+
 console.log("\n[a plain no-op (nothing changed) is still counted skipped_noop, not inserted/updated]");
 {
   const { env } = freshEnv();
