@@ -862,6 +862,35 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   deep(detectTornTsvRef("2:3", 1, 5), { chapter: 2, verse: 3 }, "a well-formed reference still heals normally");
 }
 
+// Round 2 (Codex re-review on PR #681): a literal "0" chapter or verse must
+// never pass as well-formed — a bare \d+ would accept it, and refParts would
+// then resolve it to the SAME [0, …] shape front:intro legitimately produces,
+// silently misfiling the row at chapter-front exactly as a "x:3"-style
+// garbage chapter would.
+{
+  eq(detectTornTsvRef("0:1", 5, 1), null, "chapter '0' is malformed — the exact chapter-zero violation the guard exists to prevent");
+  eq(detectTornTsvRef("0:1", 0, 1), null, "…even when the row already happens to sit at chapter 0, verse 1");
+  eq(detectTornTsvRef("2:0", 2, 5), null, "a literal verse '0' is malformed outside the front/intro convention");
+  eq(detectTornTsvRef("2:1-0", 2, 5), null, "a bridge whose second half is '0' is malformed too");
+  // front:intro itself is untouched by the chapter/verse-zero exclusion — it's
+  // the one legitimate [0, 0] shape, reached through the literal word "front"
+  // and "intro", never through a numeral.
+  deep(detectTornTsvRef("front:intro", 1, 1), { chapter: 0, verse: 0 }, "front:intro itself still heals normally");
+}
+
+// Comma-list references are a REAL corpus shape (coveredVersesFromRef unions
+// them for exactly this reason — "1:2,4"), not a hypothetical, and refParts
+// already resolves them correctly to their leading verse. The guard accepts
+// them so a legitimate torn comma-list row still heals instead of being left
+// unhealed for no reason (Codex re-review on PR #681).
+{
+  deep(detectTornTsvRef("2:1,3", 1, 1), { chapter: 2, verse: 1 }, "a comma-list reference heals to its leading verse");
+  deep(detectTornTsvRef("2:1,3-5", 1, 1), { chapter: 2, verse: 1 }, "a comma-list with a bridge segment heals the same way");
+  deep(detectTornTsvRef("2:3,1", 1, 1), { chapter: 2, verse: 3 }, "leading verse is whichever segment is FIRST, not smallest — matching refParts' own parse");
+  eq(detectTornTsvRef("2:1,", 2, 1), null, "a trailing comma with an empty segment is malformed, not silently truncated");
+  eq(detectTornTsvRef("2:1,x", 2, 1), null, "a non-numeric second segment is malformed too");
+}
+
 // ── classifyTsvRefMove: torn-row robustness (issue #672 review gaps) ────────
 // Three shapes noted as untested in the #657 review. classifyTsvRefMove keys
 // attribution on ref_raw ALONE (#547 item 2) — chapter/verse are

@@ -254,9 +254,36 @@ export function classifyTsvRefMove(
 // produces — so trusting it here for anything but a well-formed reference
 // would "heal" a corrupted `ref_raw` like "x:3" into chapter 0 (chapter-front),
 // permanently misfiling the row instead of leaving it for a human to fix the
-// actual corruption (Codex review on PR #681). WELL_FORMED_REF mirrors exactly
-// the shapes refParts documents: `front:intro`, `1:intro`, `1:1`, `1:1-3`.
-const WELL_FORMED_REF = /^(?:front|\d+):(?:intro|\d+(?:-\d+)?)$/;
+// actual corruption (Codex review on PR #681, round 1).
+//
+// The chapter alternative is deliberately `[1-9]\d*`, NOT `\d+`: a bare `\d+`
+// also matches a literal "0", so a reference like "0:1" would pass as
+// "well-formed" and `detectTornTsvRef` would heal a torn row straight into
+// chapter 0 — the exact chapter-zero violation this guard exists to prevent,
+// since chapter 0 is reserved for chapter-front (`front:intro` -> `[0, 0]`),
+// not for a real chapter that merely parses to zero (round 2 of the same
+// review). Same reasoning for the verse alternative: a literal "0" verse
+// is never a real reference outside that front/intro convention, so each
+// verse segment requires a leading nonzero digit too.
+//
+// The verse alternative accepts a comma-separated list of segments, each a
+// single verse or a dash bridge (`1`, `1-3`, `1,3`, `1,3-5`, …) — this is a
+// real corpus shape, not a hypothetical: `coveredVersesFromRef` above unions
+// comma segments for exactly this reason ("1:2,4"). `refParts` already
+// resolves any of these correctly to their LEADING verse (`parseInt` stops at
+// the first non-digit), so excluding the comma form here would just leave a
+// legitimate torn comma-list row unhealed, never heal one wrong — but there's
+// no reason to leave that gap once the shape is confirmed real.
+//
+// `front` pairs ONLY with `intro` (its one documented shape). The chapter and
+// verse alternatives are therefore NOT independent: they are two whole
+// reference shapes, not a cross product — otherwise "front:1" would pass as
+// well-formed too, and refParts would happily heal it to chapter 0, a shape
+// nothing in this corpus actually produces.
+const VERSE_SEGMENT = "[1-9]\\d*(?:-[1-9]\\d*)?";
+const WELL_FORMED_REF = new RegExp(
+  `^(?:front:intro|[1-9]\\d*:(?:intro|${VERSE_SEGMENT}(?:,${VERSE_SEGMENT})*))$`,
+);
 
 export interface TornTsvRef {
   chapter: number;
