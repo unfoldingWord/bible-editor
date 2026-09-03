@@ -48,23 +48,21 @@ export function summarizeReimport(res: ReimportResponse): string {
   // Kept the app's version of a two-sided change, because no commit from a
   // Door43 editor's own account was found behind Door43's side (#540 item 2).
   //
-  // Subtracted from the conflict line rather than added beside it: on the verse
-  // side merge_kept_ai is a strict subset of merge_conflicts, so listing both
-  // reported the same three rows as six. `Math.max(0, …)` is not tidying a
-  // negative away — on the TSV side merge_conflicts is only incremented for a
-  // row that also ADOPTED a field, so a kept-only row is genuinely outside it,
-  // and the counters can legitimately cross.
+  // Read from merge_master_wins directly, NOT `merge_conflicts - merge_kept_ai`.
+  // That subtraction assumed merge_kept_ai is a subset of merge_conflicts — true
+  // on the verse side, but on the TSV side merge_conflicts counts only an adopting
+  // write and a kept-ALONE row lands in merge_kept_ai and nowhere in merge_conflicts,
+  // so one master-wins flag plus one kept-alone row cancelled to zero and hid a
+  // real flag (#706). The API now counts the flagged rows exactly, on both sides.
   const keptOverDoor43 = t.merge_kept_ai ?? 0;
-  const mergedFromDoor43 = Math.max(0, (t.merge_conflicts ?? 0) - keptOverDoor43);
+  const mergedFromDoor43 = t.merge_master_wins ?? 0;
   if (mergedFromDoor43) parts.push(`${mergedFromDoor43} flagged for review (merge conflict)`);
-  // Names the direction, like every other line in this list, and does not
-  // promise a publish it cannot schedule — the export is the nightly one, not
-  // something the reader of this snackbar triggers.
+  // Names the direction, like every other line in this list. No "check before
+  // the next export": these rows no longer carry a review flag (the outcome was
+  // measured, not inferred — see the keep_ai_master branch in bookReimport.ts),
+  // so there is nothing for the reader to go and check.
   if (keptOverDoor43)
-    parts.push(
-      `${keptOverDoor43} kept the app's version over Door43's (no Door43 editor's commit found) — ` +
-        `check before the next export`,
-    );
+    parts.push(`${keptOverDoor43} kept the app's version over Door43's (no Door43 editor's commit found)`);
   // Rows whose Reference disagrees between the app and Door43. Split by who
   // moved (api/src/tsvMerge.ts's classifyTsvRefMove) because only the held cases
   // need anyone's attention — a move the app made is an ordinary edit the export

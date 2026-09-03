@@ -217,6 +217,19 @@ export function dcsResourceFile(
   }
 }
 
+// Every resource the reimport/export path handles. Exported so a caller that
+// needs "all of them" iterates this instead of writing its own literal list.
+export const REIMPORT_RESOURCES: readonly ReimportResource[] = ["ult", "ust", "tn", "tq", "twl"];
+
+// The repos our exports target, DERIVED from dcsResourceFile above rather than
+// listed again (issue #685). A second hardcoded copy is exactly how the repo
+// set would silently drift the day a resource is added or renamed; the sentinel
+// book only picks a row out of BOOK_NUMBERS — the repo name in each row does
+// not depend on which book you ask for.
+export const TRACKED_DCS_REPOS: readonly string[] = Array.from(
+  new Set(REIMPORT_RESOURCES.map((r) => dcsResourceFile("GEN", r)!.repo)),
+);
+
 // Raw content URL for a repo/path. With no `ref`, resolves to git.door43.org's
 // web raw-branch route (unauthenticated) — "master's current tip" — which is
 // what dcsUrls() and the plain best-effort fetchText() import paths want: they
@@ -330,12 +343,67 @@ export interface MasterCommitPage {
   incompleteReason: string;
 }
 
-export async function listMasterCommitsSince(
+// TWO OPTIONAL WIDENINGS, both added for the dcs_commits ledger (issue #685)
+// and both inert for every pre-existing caller:
+//
+//   * `path === null` drops the `&path=` filter and walks the REPO's master
+//     history instead of one file's. The ledger's question is "what happened on
+//     Door43", which is not scoped to a book we happen to have imported. Note
+//     that repo-scoped history contains Gitea merge commits that path-scoped
+//     history mostly hides — a real difference in what the classifier sees, not
+//     just more rows.
+//   * `opts.files` flips the endpoint's own `files` flag on, populating
+//     MasterCommit.files. MEASURED on git.door43.org 2026-09-01: page 1 of
+//     en_ult/en_tn with `files=true` is 102,595 bytes against 100,445 with
+//     `files=false` (~2%), for ZERO extra subrequests — so this is the cheap
+//     route to a per-commit file list, and the per-commit fetch fanout the
+//     issue warned about is not needed. Default stays false so the nightly
+//     path's payload does not grow.
+// The git blob sha of ONE file as of a given commit, from the commit's root tree
+// (`GET /repos/{owner}/{repo}/git/trees/{commit sha}` — Gitea resolves a commit
+// sha to its tree; measured 2026-09-02 on en_tq 744f2ee8: 73 entries, `truncated:
+// false`, tq_JER.tsv → f8bacfca…). One subrequest, no file content transferred —
+// a `contents` read would ship the whole file base64'd to learn a 40-char hash.
+// Our resource files all sit at the repo root, so a single non-recursive tree
+// answers; anything else (nested path, truncated tree, HTTP failure, bad body)
+// returns null, which every caller treats as "not measured", never as a match.
+export async function fileBlobShaAtCommit(
   env: Env,
   repo: string,
   path: string,
+  commitSha: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<string | null> {
+  if (path.includes("/")) return null;
+  const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
+  const url =
+    `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
+    `/git/trees/${encodeURIComponent(commitSha)}?per_page=1000`;
+  try {
+    const r = await fetch(url, {
+      headers,
+      ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+    });
+    if (!r.ok) return null;
+    const body = (await r.json()) as Record<string, unknown>;
+    if (body.truncated === true || !Array.isArray(body.tree)) return null;
+    for (const raw of body.tree as Array<Record<string, unknown>>) {
+      if (raw.path === path && raw.type === "blob" && typeof raw.sha === "string") return raw.sha;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function listMasterCommitsSince(
+  env: Env,
+  repo: string,
+  path: string | null,
   sinceSha: string | null,
-  opts: { pageLimit?: number; sinceTime?: number | null } = {},
+  opts: { pageLimit?: number; sinceTime?: number | null; files?: boolean; timeoutMs?: number } = {},
 ): Promise<MasterCommitPage> {
   const pageLimit = opts.pageLimit ?? 5;
   // The watermark bound, in unix seconds. When present it REPLACES the sha as
@@ -356,12 +424,22 @@ export async function listMasterCommitsSince(
   for (let page = 1; page <= pageLimit; page++) {
     const url =
       `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
-      `/commits?sha=master&path=${encodeURIComponent(path)}` +
-      `&page=${page}&stat=false&verification=false&files=false`;
+      `/commits?sha=master` +
+      (path ? `&path=${encodeURIComponent(path)}` : "") +
+      `&page=${page}&stat=false&verification=false&files=${opts.files === true ? "true" : "false"}`;
     let batch: Array<Record<string, unknown>>;
     let lastPage: boolean;
     try {
-      const r = await fetch(url, { headers });
+      // `timeoutMs` is opt-in (issue #685 review): a hanging Door43 otherwise
+      // holds the whole Worker invocation, and the poller shares its cron tick
+      // with the pipeline poll and the hourly edit_log sweep. An abort lands in
+      // the catch below as `fetch_failed`, which is already the
+      // treat-as-incomplete path — no new failure mode. Existing callers pass
+      // nothing and keep today's unbounded wait.
+      const r = await fetch(url, {
+        headers,
+        ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+      });
       if (!r.ok) return { commits: out, incomplete: true, incompleteReason: `http_${r.status}` };
       const body = await r.json();
       if (!Array.isArray(body)) return { commits: out, incomplete: true, incompleteReason: "bad_body" };
@@ -389,6 +467,7 @@ export async function listMasterCommitsSince(
       if (!sha) return { commits: out, incomplete: true, incompleteReason: "commit_without_sha" };
       const commit = (raw.commit ?? {}) as Record<string, unknown>;
       const author = (commit.author ?? {}) as Record<string, unknown>;
+      const committer = (commit.committer ?? {}) as Record<string, unknown>;
       if (sinceTime == null) {
         // EXCLUSIVE: sinceSha is the ancestor itself, already accounted for.
         if (sha === sinceSha) return { commits: out, incomplete: false, incompleteReason: "" };
@@ -402,12 +481,34 @@ export async function listMasterCommitsSince(
           return { commits: out, incomplete: false, incompleteReason: "" };
         }
       }
+      // parents[0] — the commit's FIRST GIT PARENT, and nothing more than that
+      // (review finding F5 corrected an earlier comment here). It equals
+      // "master's previous tip" only for a commit made directly on master or for
+      // a merge commit; under repo-scoped history the list also contains commits
+      // that arrived on a feature branch, whose first parent is their own branch
+      // predecessor. A merge's SECOND parent (the merged branch) is deliberately
+      // not stored — first-parent is the line "walking master back" follows.
+      const parents = Array.isArray(raw.parents) ? (raw.parents as Array<Record<string, unknown>>) : [];
+      const parentSha = typeof parents[0]?.sha === "string" ? (parents[0].sha as string) : null;
+      // Only present when the caller asked (`files: true`); `null` distinguishes
+      // "asked and got none" from "never asked" (undefined).
+      const rawFiles = Array.isArray(raw.files) ? (raw.files as Array<Record<string, unknown>>) : null;
+      const files =
+        rawFiles == null
+          ? null
+          : rawFiles.map((f) => (typeof f.filename === "string" ? f.filename : null)).filter((f): f is string => f != null);
       out.push({
         sha,
         message: typeof commit.message === "string" ? commit.message : null,
         authorEmail: typeof author.email === "string" ? author.email : null,
         authorName: typeof author.name === "string" ? author.name : null,
         date: typeof author.date === "string" ? author.date : null,
+        // WHEN IT LANDED, which is a different question from when it was
+        // authored (rebase / cherry-pick / squash merge). Measured present on
+        // this endpoint alongside commit.author — see the ledger's committed_at.
+        committerDate: typeof committer.date === "string" ? committer.date : null,
+        parentSha,
+        ...(opts.files === true ? { files } : {}),
       });
     }
 

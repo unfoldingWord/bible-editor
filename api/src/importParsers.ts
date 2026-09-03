@@ -1097,7 +1097,7 @@ function rebuildChain(path: Record<string, unknown>[], kids: unknown[]): Record<
 // extractPlainText word-separator rule (plain_text would gain a space for every
 // divider, churning stored rows). Use isTsMilestone below where a `\ts\*` test is
 // what you actually want.
-function isInFlowMarker(node: unknown): boolean {
+export function isInFlowMarker(node: unknown): boolean {
   const o = node as Record<string, unknown> | null;
   if (!o) return false;
   const t = o["type"];
