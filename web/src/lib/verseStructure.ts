@@ -79,6 +79,65 @@ export function reduceVerses(
   return next;
 }
 
+/**
+ * Reconcile a refetched chapter payload with what the tab already holds.
+ *
+ * WHY. The reconnect refetch (Shell's `onReconnect`) fires on the same
+ * `online` moment that drains the outbox, so `GET chapter` and a pending
+ * `PATCH verse` are in flight together. D1 can serve the GET before the PATCH
+ * commits while the PATCH's 200 (v6) still reaches the tab before the GET's
+ * body (v5): an unconditional replace would then regress the verse to v5, and
+ * the tab's next edit would carry `If-Match: 5` into a 409 against the user's
+ * own save. Even without that jitter, a same-version fetched row would
+ * overwrite the tab's force-applied optimistic content until the PATCH lands.
+ *
+ * RULES (per bible_version, per verse):
+ *   - Start from `fetched`: a verse the server no longer has is dropped (the
+ *     whole point of the reconnect refetch — a missed verse.bridged must not
+ *     leave a phantom) and rows / statuses / locks are the fetched ones.
+ *   - A verse present in both keeps the LOCAL row when
+ *     `local.version >= fetched.version`: equal means identical or an
+ *     optimistic same-version edit whose PATCH is pending; higher means the
+ *     PATCH already landed and the GET is stale. Strictly newer fetched wins.
+ *   - A fetched row at or below a tombstone this tab holds is the deleted row
+ *     seen through a stale read (same clock argument as `applyUpdated`) and is
+ *     dropped rather than resurrected.
+ *   - Tombstones are cleared: the merged map is authoritative again, exactly
+ *     as after a plain refetch.
+ *
+ * Returns `fetched` itself when no local row is kept (a null `prev`, or one
+ * for another chapter, is a plain replace) — the refetch caller always wants
+ * the fresh non-verse data, so identity-with-`prev` is never the right no-op.
+ */
+export function mergeRefetched(prev: ChapterData | null, fetched: ChapterPayload): ChapterData {
+  if (!prev || prev.book !== fetched.book || prev.chapter !== fetched.chapter) return fetched;
+  let verses: ChapterPayload["verses"] | undefined;
+  for (const bibleVersion of Object.keys(fetched.verses)) {
+    const fetchedRows = fetched.verses[bibleVersion];
+    const localRows = prev.verses[bibleVersion];
+    const tombstones = prev.verseTombstones?.[bibleVersion];
+    if (!localRows && !tombstones) continue;
+    let rows: Record<number, VerseDto> | undefined;
+    for (const key of Object.keys(fetchedRows)) {
+      const n = Number(key);
+      const incoming = fetchedRows[n];
+      const local = localRows?.[n];
+      let keep: VerseDto | null = incoming;
+      if (local && local.version >= incoming.version) keep = local;
+      else if (tombstones && isTombstoned(tombstones, n, incoming.version)) keep = null;
+      if (keep === incoming) continue;
+      rows ??= { ...fetchedRows };
+      if (keep) rows[n] = keep;
+      else delete rows[n];
+    }
+    if (rows) {
+      verses ??= { ...fetched.verses };
+      verses[bibleVersion] = rows;
+    }
+  }
+  return verses ? { ...fetched, verses } : fetched;
+}
+
 /** bible_version → verse number → version the row had when it was deleted. */
 export type VerseTombstones = Record<string, Record<number, number>>;
 

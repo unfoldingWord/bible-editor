@@ -20,9 +20,29 @@ import {
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
-import { applyBridged, applySplit, applyUpdated, reduceVerses, type ChapterData } from "../lib/verseStructure";
+import {
+  applyBridged,
+  applySplit,
+  applyUpdated,
+  mergeRefetched,
+  reduceVerses,
+  type ChapterData,
+} from "../lib/verseStructure";
 
 type Status = "idle" | "loading" | "ready" | "error" | "retrying";
+
+export interface RefetchOptions {
+  /**
+   * Merge the fetched payload with the current one instead of replacing it:
+   * a verse the tab holds at an equal-or-newer version stays (see
+   * lib/verseStructure.ts `mergeRefetched`). For the WS reconnect refetch,
+   * which races the outbox drain on the same `online` moment — a stale GET
+   * must not regress a verse the tab's own PATCH just advanced. Every other
+   * caller wants the plain replace (default): they refetch precisely because
+   * the server changed rows/versions out from under the tab.
+   */
+  keepNewerLocal?: boolean;
+}
 
 export interface UseChapterReturn {
   status: Status;
@@ -30,7 +50,7 @@ export interface UseChapterReturn {
   error: string | null;
   /** Incremented every failed attempt during the current retry loop. Useful for showing "reconnecting…". */
   retryAttempts: number;
-  refetch: () => Promise<void>;
+  refetch: (opts?: RefetchOptions) => Promise<void>;
   applyLocalRowPatch: (kind: "tn" | "tq" | "twl", id: string, patch: Partial<TnRow & TqRow & TwlRow>) => void;
   applyLocalRowReplacement: (kind: "tn" | "tq" | "twl", row: TnRow | TqRow | TwlRow) => void;
   applyLocalRowDelete: (kind: "tn" | "tq" | "twl", id: string) => void;
@@ -94,7 +114,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   const mounted = useRef(true);
   const fetchCtrl = useRef<AbortController | null>(null);
 
-  const refetch = useCallback(async () => {
+  const refetch = useCallback(async (opts?: RefetchOptions) => {
     // Abort any in-flight retry loop from a previous (book, chapter) before
     // starting a new one — otherwise stale data could land after navigation.
     fetchCtrl.current?.abort();
@@ -118,7 +138,10 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         },
       );
       if (!mounted.current || fetchCtrl.current !== ctrl) return;
-      setData(payload);
+      // `=== true` so a caller that hands `refetch` straight to an event
+      // handler (receiving a truthy event object) still gets the replace.
+      const keepNewerLocal = opts?.keepNewerLocal === true;
+      setData((prev) => (keepNewerLocal ? mergeRefetched(prev, payload) : payload));
       setStatus("ready");
       setRetryAttempts(0);
     } catch (e) {

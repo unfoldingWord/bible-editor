@@ -3,7 +3,7 @@
 // any delivery order (#729). Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/verseStructure.test.mjs
 
-import { applyBridged, applySplit, applyUpdated } from "./verseStructure.ts";
+import { applyBridged, applySplit, applyUpdated, mergeRefetched } from "./verseStructure.ts";
 
 let failed = 0;
 let passed = 0;
@@ -267,6 +267,150 @@ for (const sc of scenarios) {
   assert(staleSplit === s, "split whose recreated 2@7 == tombstone is a full no-op (start 1@7 < 8 too)");
   const freshSplit = applySplit(s, v(1, 9), [v(2, 9)]);
   assert(freshSplit.verses[2]?.version === 9 && freshSplit.verses[1].version === 9, "later split above the tombstone applies");
+}
+
+// ---------------------------------------------------------------------------
+// mergeRefetched — the reconnect refetch must not regress rows this tab
+// already holds at an equal-or-newer version.
+//
+// The race: the browser goes `online`; the outbox drains (PATCH verse 2,
+// If-Match 5) and the WS reconnects (GET chapter) within the same moment. D1
+// serves the GET before the PATCH commits, but the PATCH's 200 (v6, C′)
+// reaches the tab first; the GET's v5/C lands second. An unconditional
+// `setData(payload)` then regresses verse 2 to v5/C, and the next edit goes
+// out with If-Match 5 → 409 against the user's own save.
+{
+  // Chapter-payload shaped fixtures. Only book/chapter/verses/tombstones and
+  // one non-verse list matter to the merge; the rest is filler.
+  const row = (verse, version, content, verse_end = null) => ({
+    verse,
+    version,
+    content,
+    verse_end,
+    bible_version: "ult",
+  });
+  const payload = (rows, extra = {}) => ({
+    book: "ZEC",
+    chapter: 1,
+    verses: { ult: map(...rows) },
+    tn: [],
+    tq: [],
+    twl: [],
+    verseStatuses: [],
+    verseLaneChecks: [],
+    ...extra,
+  });
+
+  // WITNESS: today's refetch is `setData(payload)` — an unconditional replace.
+  // Modelled here so the bug is pinned as a failing assertion against the
+  // model, not just as a passing one against the fix.
+  const hardReplace = (_prev, fetched) => fetched;
+  {
+    const local = payload([row(1, 3, "a"), row(2, 6, "C′")]);
+    const fetched = payload([row(1, 3, "a"), row(2, 5, "C")]);
+    const out = hardReplace(local, fetched);
+    assert(out.verses.ult[2].version === 5, "witness: unconditional replace regresses 2@6 → 2@5 (the bug)");
+  }
+
+  // 1. The interleaving above: local v6 vs fetched v5 → keep v6/C′.
+  {
+    const local = payload([row(1, 3, "a"), row(2, 6, "C′")]);
+    const fetched = payload([row(1, 3, "a"), row(2, 5, "C")]);
+    const out = mergeRefetched(local, fetched);
+    assert(out.verses.ult[2].version === 6 && out.verses.ult[2].content === "C′", "local 2@6 survives a stale fetched 2@5");
+    assert(out.verses.ult[2] === local.verses.ult[2], "the kept row is the local object itself");
+    // Equal version keeps the local object too: by version alone an identical
+    // row and a pending optimistic edit are indistinguishable, and keeping the
+    // local one is right in both cases.
+    assert(out.verses.ult[1] === local.verses.ult[1], "an equal-version row keeps the local object");
+  }
+
+  // 2. Equal version, optimistic content (force-applied edit whose PATCH is
+  //    still pending) → keep local.
+  {
+    const local = payload([row(2, 5, "C′ (pending)")]);
+    const fetched = payload([row(2, 5, "C")]);
+    const out = mergeRefetched(local, fetched);
+    assert(out.verses.ult[2].content === "C′ (pending)", "same-version optimistic local row is kept over the fetched row");
+  }
+
+  // 3. Fetched newer → take fetched.
+  {
+    const local = payload([row(2, 5, "C")]);
+    const fetched = payload([row(2, 7, "D")]);
+    const out = mergeRefetched(local, fetched);
+    assert(out.verses.ult[2].version === 7 && out.verses.ult[2].content === "D", "fetched 2@7 replaces local 2@5");
+  }
+
+  // 4. Phantom local verse absent from fetched (missed verse.bridged) → dropped.
+  {
+    const local = payload([row(1, 3, "a"), row(2, 4, "phantom")]);
+    const fetched = payload([row(1, 5, "a-b", 2)]);
+    const out = mergeRefetched(local, fetched);
+    assert(!(2 in out.verses.ult), "a verse the server no longer has is dropped — the whole point of the reconnect refetch");
+    assert(out.verses.ult[1].verse_end === 2 && out.verses.ult[1].version === 5, "the bridge row comes from the fetched payload");
+  }
+
+  // 5. Tombstones cleared: the merged map is authoritative again.
+  {
+    const local = payload([row(1, 5, "a-b", 2)], { verseTombstones: { ult: { 2: 4 } } });
+    const fetched = payload([row(1, 5, "a-b", 2)]);
+    const out = mergeRefetched(local, fetched);
+    assert(out.verseTombstones === undefined, "verseTombstones do not survive a merged refetch");
+  }
+
+  // 5b. …but a fetched row at or below a tombstone this tab holds is the
+  //     deleted row seen through a stale read (GET served before the bridge
+  //     committed; the bridge event then arrived over the fresh socket).
+  //     Dropping it is the same clock argument applyUpdated uses.
+  {
+    const local = payload([row(1, 6, "a-b", 2)], { verseTombstones: { ult: { 2: 5 } } });
+    const fetched = payload([row(1, 3, "a"), row(2, 5, "C")]);
+    const out = mergeRefetched(local, fetched);
+    assert(!(2 in out.verses.ult), "fetched 2@5 at the tombstone (2 deleted @5) is not resurrected");
+    assert(out.verses.ult[1].version === 6 && out.verses.ult[1].verse_end === 2, "the newer local bridge row 1@6 is kept over fetched 1@3");
+    const recreated = payload([row(1, 7, "a"), row(2, 7, "C2")]);
+    const out2 = mergeRefetched(local, recreated);
+    assert(out2.verses.ult[2]?.version === 7, "fetched 2@7 above the tombstone is a genuine recreation and is added");
+  }
+
+  // 6. New server verse (split while disconnected) → added.
+  {
+    const local = payload([row(1, 5, "a-b", 2)]);
+    const fetched = payload([row(1, 6, "a"), row(2, 6, "b")]);
+    const out = mergeRefetched(local, fetched);
+    assert(out.verses.ult[2]?.version === 6 && out.verses.ult[1].verse_end === null, "split-created verse 2 is added and the start row de-bridged");
+  }
+
+  // 7. Non-verse parts always come from the fetched payload.
+  {
+    const local = payload([row(2, 6, "C′")], { tn: [{ id: "old" }], verseStatuses: [{ verse: 2, done: 0 }] });
+    const fetched = payload([row(2, 5, "C")], { tn: [{ id: "new" }], verseStatuses: [{ verse: 2, done: 1 }] });
+    const out = mergeRefetched(local, fetched);
+    assert(out.tn === fetched.tn && out.verseStatuses === fetched.verseStatuses, "rows / statuses are the fetched ones even when a verse was kept");
+    assert(out.verses.ult[2].version === 6, "…while the newer local verse is still kept");
+  }
+
+  // 8. Identity: when no local row is kept the fetched object is returned as
+  //    is (fetched strictly newer on every overlapping verse, or no overlap);
+  //    a null / different-chapter prev is a plain replace.
+  {
+    const fetched = payload([row(1, 3, "a"), row(2, 5, "C")]);
+    assert(mergeRefetched(null, fetched) === fetched, "null prev → fetched itself");
+    assert(mergeRefetched(payload([row(1, 2, "a0"), row(2, 4, "C0")]), fetched) === fetched, "fetched strictly newer everywhere → fetched itself");
+    assert(mergeRefetched(payload([row(3, 9, "z")]), fetched) === fetched, "no overlapping verse → fetched itself");
+    const otherChapter = { ...payload([row(2, 9, "zzz")]), chapter: 2 };
+    assert(mergeRefetched(otherChapter, fetched) === fetched, "prev from another chapter never leaks rows into the fetched one");
+  }
+
+  // 9. A bible_version present locally but absent from the fetched payload is
+  //    dropped with its rows; one absent locally is taken whole.
+  {
+    const local = { ...payload([row(2, 6, "C′")]), verses: { ult: map(row(2, 6, "C′")), ust: map(row(2, 9, "ust")) } };
+    const fetched = { ...payload([row(2, 5, "C")]), verses: { ult: map(row(2, 5, "C")), ueb: map(row(2, 1, "ueb")) } };
+    const out = mergeRefetched(local, fetched);
+    assert(!("ust" in out.verses) && out.verses.ueb[2].version === 1 && out.verses.ult[2].version === 6, "bible_version keys follow the fetched payload; per-verse merge still applies");
+  }
 }
 
 console.log(`\nverseStructure: ${passed} passed, ${failed} failed`);
