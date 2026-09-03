@@ -105,29 +105,10 @@ const INCOMPLETE_LINEAGE = {
 // Commit pages for the auto-clear, in the MasterCommitPage shape
 // listMasterCommitsSince returns. Messages/authors are the real production
 // shapes classifyMasterCommit was verified against (see masterLineage.ts).
-//
-// DATES ARE NOW-RELATIVE, NOT HARDCODED (found triaging PR #718's CI). They
-// used to be fixed 2026-08-27/28 timestamps, which is exactly the mistake the
-// "#683" block below's own comment warns against ("the 30-day bound must be
-// exercised on purpose, never drifted into by the calendar") — every one of
-// this block's derived windows is computed from `Math.floor(Date.now() /
-// 1000)` (MINT_AT = NOW-5d, WATERMARK = NOW-11d), and a hardcoded commit date
-// is a fixed point real time eventually catches up to. It did: by 2026-09-03
-// "NOW - ~6 days" had drifted past 2026-08-28T00:00, so
-// listMasterCommitsSince's sinceTime cutoff (bounded by the derived window
-// start) started rejecting aaa1 as "too old" on its very first commit,
-// collapsing the walk/probe to zero commits and a null tip — which is what
-// let the (i3) memo-skip test's mm00 slip through uncleared (the memo check
-// is `tip != null && …`, so a null tip disables it entirely). Anchoring to
-// FIXTURE_NOW keeps these commits at a fixed 1-2 days old, always newer than
-// every window start in this file (the nearest is MINT_AT at 5 days back),
-// so the collision cannot recur.
-const FIXTURE_NOW = Math.floor(Date.now() / 1000);
-const isoHoursAgo = (hours) => new Date(FIXTURE_NOW * 1000 - hours * 3600 * 1000).toISOString();
 const OURS_AND_AI_PAGE = {
   commits: [
-    { sha: "aaa1", message: "bible-editor: 1CH tq → master (#7001)", authorEmail: "someone@example.com", authorName: "Someone", date: isoHoursAgo(24) },
-    { sha: "aaa2", message: "TQ: 1CH 3 [bp-assistant]", authorEmail: "bot@unfoldingword.org", authorName: "bot", date: isoHoursAgo(48) },
+    { sha: "aaa1", message: "bible-editor: 1CH tq → master (#7001)", authorEmail: "someone@example.com", authorName: "Someone", date: "2026-08-28T00:00:00Z" },
+    { sha: "aaa2", message: "TQ: 1CH 3 [bp-assistant]", authorEmail: "bot@unfoldingword.org", authorName: "bot", date: "2026-08-27T00:00:00Z" },
   ],
   incomplete: false,
   incompleteReason: "",
@@ -135,7 +116,7 @@ const OURS_AND_AI_PAGE = {
 const HUMAN_PAGE = {
   commits: [
     ...OURS_AND_AI_PAGE.commits,
-    { sha: "bbb1", message: "Fixes a typo in 1CH 3:2", authorEmail: "maintainer@example.com", authorName: "Maintainer", date: isoHoursAgo(36) },
+    { sha: "bbb1", message: "Fixes a typo in 1CH 3:2", authorEmail: "maintainer@example.com", authorName: "Maintainer", date: "2026-08-27T12:00:00Z" },
   ],
   incomplete: false,
   incompleteReason: "",
