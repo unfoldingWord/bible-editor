@@ -629,9 +629,13 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/bridge", requireEditor, async 
   const bibleVersion = c.req.param("bibleVersion").toUpperCase();
   if (!isAllowedBibleVersion(bibleVersion)) return c.json({ error: "invalid_bible_version" }, 400);
   if (!Number.isFinite(chapter) || !Number.isFinite(verse)) return c.json({ error: "invalid_params" }, 400);
-  if (bibleVersion === "UHB" || bibleVersion === "UGNT") {
-    return c.json({ error: "source_text_is_read_only" }, 403);
-  }
+  // Structural verse ops are UST-only (mirrors the UST-only toolbar) and must
+  // never touch the chapter-front pseudo-verse (verse 0): buildUsfm serializes
+  // verse 0 as usfm-js's "front" key IGNORING verse_end, so bridging there
+  // would silently drop the absorbed real verse from the export. The UST-only
+  // check also subsumes the UHB/UGNT read-only rejection.
+  if (bibleVersion !== "UST") return c.json({ error: "bridge_ust_only" }, 403);
+  if (verse < 1) return c.json({ error: "invalid_params", reason: "verse_must_be_positive" }, 400);
 
   let body: unknown;
   try {
@@ -796,9 +800,10 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
   const bibleVersion = c.req.param("bibleVersion").toUpperCase();
   if (!isAllowedBibleVersion(bibleVersion)) return c.json({ error: "invalid_bible_version" }, 400);
   if (!Number.isFinite(chapter) || !Number.isFinite(verse)) return c.json({ error: "invalid_params" }, 400);
-  if (bibleVersion === "UHB" || bibleVersion === "UGNT") {
-    return c.json({ error: "source_text_is_read_only" }, 403);
-  }
+  // UST-only, verse > 0 — same rationale as the bridge route above (verse 0 is
+  // the chapter-front pseudo-verse; the UST-only check subsumes UHB/UGNT).
+  if (bibleVersion !== "UST") return c.json({ error: "bridge_ust_only" }, 403);
+  if (verse < 1) return c.json({ error: "invalid_params", reason: "verse_must_be_positive" }, 400);
   const expected = parseIfMatch(c.req.header("if-match"));
   if (expected === null) return c.json({ error: "if_match_required" }, 428);
 
