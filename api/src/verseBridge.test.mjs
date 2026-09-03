@@ -20,6 +20,7 @@ import {
   DELETE_VERSE_LANE_CHECKS_RANGE_SQL,
   DELETE_VERSE_STATUSES_RANGE_SQL,
   expectedNextStart,
+  hasVerseObjectsArray,
   isBridge,
   mergeVerseObjects,
   splitSeedVerseObjects,
@@ -77,6 +78,15 @@ eq(splitVerseNumbers({ verse: 1, verse_end: null }), [], "splitting a non-bridge
 // splitSeedVerseObjects is a valid, non-empty tree (empty is refused for real
 // verses — refusesEmptyVerseObjects in contentJson.ts)
 assert(splitSeedVerseObjects().length > 0, "split seed is non-empty");
+
+// hasVerseObjectsArray — the merge route refuses when either side fails this so
+// an off-shape (but parseable) row can't be silently dropped while deleted.
+assert(hasVerseObjectsArray({ verseObjects: [] }), "empty verseObjects is in-shape (nothing to lose)");
+assert(hasVerseObjectsArray({ verseObjects: [{ type: "text", text: "hi" }] }), "populated verseObjects is in-shape");
+assert(!hasVerseObjectsArray(null), "null is off-shape");
+assert(!hasVerseObjectsArray([]), "a bare array is off-shape");
+assert(!hasVerseObjectsArray({ verseobjects: [] }), "a typo'd key is off-shape");
+assert(!hasVerseObjectsArray({ verseObjects: "nope" }), "a non-array verseObjects is off-shape");
 
 // ── real SQL against node:sqlite ─────────────────────────────────────────────
 function verseDb() {

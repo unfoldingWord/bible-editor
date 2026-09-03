@@ -31,6 +31,7 @@ import {
   DELETE_VERSE_LANE_CHECKS_RANGE_SQL,
   DELETE_VERSE_STATUSES_RANGE_SQL,
   expectedNextStart,
+  hasVerseObjectsArray,
   isBridge,
   mergeVerseObjects,
   splitSeedVerseObjects,
@@ -684,6 +685,16 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/bridge", requireEditor, async 
       return c.json(corruptContentJsonBody(err), 500);
     }
     throw err;
+  }
+
+  // A row whose content_json parsed but is NOT `{ verseObjects: [...] }` (a bare
+  // array, a typo'd key) would have its half silently dropped by verseObjectsOf
+  // while BRIDGE_DELETE_NEXT_SQL still deletes it. Refuse — same posture as the
+  // corrupt-JSON path above, which never deletes. Normal writes (PATCH, import)
+  // always produce the in-shape tree, so this only guards a pre-existing
+  // off-shape row.
+  if (!hasVerseObjectsArray(startParsed) || !hasVerseObjectsArray(nextParsed)) {
+    return c.json({ error: "invalid_content", reason: "missing_verse_objects" }, 422);
   }
 
   const mergedVos = mergeVerseObjects(verseObjectsOf(startParsed), verseObjectsOf(nextParsed));

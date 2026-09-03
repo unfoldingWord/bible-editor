@@ -3033,6 +3033,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     return "Could not update the verse bridge. Try again.";
   };
 
+  // Whether a verse has an unsaved keystroke draft in the outbox (a record with
+  // a plainText payload). Bridge/split operate on SERVER content and bump the
+  // row version, so an unsaved draft on an affected verse would be stranded —
+  // its row is deleted (merge) or re-versioned (split) out from under the draft,
+  // whose later save then 404s/409s. Refuse until the user saves.
+  const verseHasPendingDraft = async (chapterNum: number, verse: number, bibleVersion: string): Promise<boolean> => {
+    try {
+      const rec = await drafts.get(verseKey(book, chapterNum, verse, bibleVersion));
+      return typeof (rec?.payload as { plainText?: string } | undefined)?.plainText === "string";
+    } catch {
+      return false; // draft store unreadable → don't block the structural op
+    }
+  };
+
   // Create a verse bridge: combine `verse` with the following verse (5:1 + 5:2 →
   // 5:1-2). A deliberate POST the user awaits — not an outbox op. Applied locally
   // only on the server's 200 so a 409 never leaves a half-formed bridge.
@@ -3044,6 +3058,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const next = byVersion?.[nextStart];
     if (!next) {
       setBridgeToast("There is no following verse to merge with.");
+      return;
+    }
+    // Both verses' content is about to change server-side (start absorbs next,
+    // next is deleted) — an unsaved edit on either would be lost. Guard first.
+    if ((await verseHasPendingDraft(chapterNum, verse, bibleVersion)) || (await verseHasPendingDraft(chapterNum, nextStart, bibleVersion))) {
+      setBridgeToast("Save your edits to these verses before bridging them.");
       return;
     }
     try {
@@ -3062,6 +3082,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const byVersion = versesForChapterMap(chapterNum)?.[bibleVersion];
     const bridge = byVersion?.[verse];
     if (!bridge || bridge.verse_end == null || bridge.verse_end <= bridge.verse) return;
+    // Split bumps the bridge row's version; an unsaved draft on it would 409 its
+    // later save. Guard first (the newly-created verses don't exist yet, so only
+    // the bridge start can carry a draft).
+    if (await verseHasPendingDraft(chapterNum, verse, bibleVersion)) {
+      setBridgeToast("Save your edits to this verse before breaking the bridge.");
+      return;
+    }
     const later = Array.from({ length: bridge.verse_end - bridge.verse }, (_i, k) => bridge.verse + 1 + k).join(", ");
     if (
       !window.confirm(

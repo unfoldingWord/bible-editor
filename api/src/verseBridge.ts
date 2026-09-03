@@ -71,6 +71,17 @@ export function splitSeedVerseObjects(): unknown[] {
   return [{ type: "text", text: "\n" }];
 }
 
+// True when a parsed content tree is the expected `{ verseObjects: [...] }`
+// shape. A row whose content_json is valid JSON but NOT this shape (a bare
+// array, a typo'd key) must never be bridged: verseObjectsOf would silently
+// drop its content while BRIDGE_DELETE_NEXT_SQL still deletes the row. The merge
+// route refuses when either side fails this, mirroring the corrupt-JSON refusal
+// (which also never deletes). An empty `verseObjects: []` passes — that is a
+// legal, in-shape tree with nothing to lose, not an off-shape row.
+export function hasVerseObjectsArray(parsed: unknown): boolean {
+  return Array.isArray((parsed as { verseObjects?: unknown } | null)?.verseObjects);
+}
+
 // Concatenate the start verse's objects with the next verse's, with a single
 // space between so the two texts don't run together — the same separator
 // verseRange.ts's concatSourceRange uses to join a source range for the
