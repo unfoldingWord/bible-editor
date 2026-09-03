@@ -207,6 +207,37 @@ const lit = (vo, quote, occurrence, source) =>
   );
 }
 
+// --- 6b. ECC 2:14 / 3:14 (\b display bug): usfm-js parses a blank line
+// followed by real verse text (with no intervening \p/\q) as a `\b`
+// paragraph node then a bare text node. The blank segment discards its
+// html, so before the fix the following text vanished from the rich
+// render even though extractPlainText kept it. The text must survive on
+// its own line, and the \b must still emit its empty blank block.
+{
+  const verseObjects = [
+    { type: "text", text: "The wise, his eyes are in his head,\n" },
+    { type: "quote", tag: "q2", text: "but the fool in the darkness is walking.\n" },
+    { type: "paragraph", tag: "b", nextChar: "\n" },
+    { type: "text", text: "But I know, even I, that one happening will happen to both of them.\n" },
+    { type: "paragraph", tag: "b", nextChar: "\n" },
+  ];
+  const html = renderHighlightedHTML(verseObjects, new Set());
+  assert(
+    html.includes("But I know, even I, that one happening will happen to both of them."),
+    `text after \\b is rendered, not swallowed by the blank segment (got ${JSON.stringify(html)})`,
+  );
+  assert(
+    html.includes("be-blank"),
+    `\\b still emits its blank block (got ${JSON.stringify(html)})`,
+  );
+  // The post-\b text lands on its own line (unmarked continuation → be-line),
+  // not inside the be-blank block.
+  assert(
+    /<div class="be-line">But I know/.test(html),
+    `post-\\b text renders on its own be-line, outside the blank block (got ${JSON.stringify(html)})`,
+  );
+}
+
 // --- 7-11. DAN 6:3 (issue: note `fhez`). כָּל appears twice: כָּ⁠ל (with
 // U+2060 WORD JOINER) then bare כָּל. matchNorm strips the joiner, so both
 // UHB tokens — and both ULT `\zaln-s` milestones, each legitimately stamped

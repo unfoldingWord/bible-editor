@@ -51,6 +51,26 @@ export interface TnRow {
    * Computed at read time — there's no column on tn_rows.
    */
   latest_source?: string | null;
+  /**
+   * Row provenance (#686, migration 0060): what the last change to this row
+   * was, where it happened, and who did it — stamped in the SAME statement as
+   * every write, so it cannot be out of step with the write the way an
+   * edit_log-derived answer can (several write paths log nothing at all).
+   *
+   * `last_change_action` / `last_change_source` are the `LastChangeAction` /
+   * `LastChangeSource` unions in `rowProvenance.ts`; `last_change_actor` is a
+   * human-readable STRING, denormalized on purpose so it survives a user being
+   * renamed or removed ("justplainjane47", "AI pipeline (run by …)",
+   * "Door43 (commits by …)", "Door43 sync", "nightly trash finalize").
+   *
+   * ALL THREE NULL means "no change since 0060 shipped" — consult edit_log.
+   * It does NOT mean unedited, and it is NOT a substitute for `updated_by`,
+   * whose NULL-means-master-owns-it semantics the reimport's pristine
+   * predicate still depends on and which #686 deliberately did not touch.
+   */
+  last_change_action?: string | null;
+  last_change_source?: string | null;
+  last_change_actor?: string | null;
 }
 
 export interface TqRow {
@@ -77,6 +97,10 @@ export interface TqRow {
   review_reason: string | null;
   /** See TnRow.latest_source. */
   latest_source?: string | null;
+  /** See TnRow.last_change_action (#686). */
+  last_change_action?: string | null;
+  last_change_source?: string | null;
+  last_change_actor?: string | null;
 }
 
 export interface TwlRow {
@@ -100,6 +124,10 @@ export interface TwlRow {
    *  conflicted with an app-side edit. Never exported. */
   review_kind: string | null;
   review_reason: string | null;
+  /** See TnRow.last_change_action (#686). */
+  last_change_action?: string | null;
+  last_change_source?: string | null;
+  last_change_actor?: string | null;
 }
 
 export interface VerseRow {
@@ -115,6 +143,10 @@ export interface VerseRow {
   version: number;
   updated_by: number | null;
   updated_at: number;
+  /** See TnRow.last_change_action (#686). */
+  last_change_action?: string | null;
+  last_change_source?: string | null;
+  last_change_actor?: string | null;
 }
 
 export interface VerseStatus {

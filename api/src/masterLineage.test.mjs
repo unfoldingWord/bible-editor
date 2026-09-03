@@ -103,7 +103,12 @@ import { readFileSync } from "node:fs";
 import {
   classifyMasterCommit,
   compactLineage,
+  describeHumanCommits,
+  humanCommitEvidenceClause,
+  stripHumanCommitEvidence,
   LINEAGE_EVIDENCE_CAP,
+  LINEAGE_EVIDENCE_LEAD,
+  LINEAGE_NAMED_COMMITS_MAX,
   LINEAGE_REF_CAP,
   masterMayHoldHumanEdit,
   masterMayHoldHumanEditForVerse,
@@ -1481,6 +1486,230 @@ console.log("\n[PR #644 review F6: parseTsvRefColumn keys agree with refParts, t
         `so masterMayHoldHumanEditForVerse's lookup actually finds what this mapper claimed`,
     );
   }
+}
+
+// ── #684: the summary carries WHO, and says nothing when it did not measure it ─
+//
+// FIXTURE PROVENANCE. The two commit subjects, author names and dates below are
+// the two real prod commits named in issue #684 — the actual cause of the
+// tn_ISA.tsv flags dated 2026-08-15, which said only that something had moved.
+// The author EMAILS are a stand-in (the issue records the names, not the
+// addresses); nothing here turns on them beyond "not the bot", which is what
+// makes these commits classify `human` in the first place, and that rule is
+// already covered by its own fixtures above.
+console.log("\n[#684: naming the Door43 commit a flag measured]");
+
+// Author names are wrapped in bidi isolates (FSI…PDI) before they are
+// interpolated — see displayAuthor. The helper keeps the expectations below
+// readable instead of littering them with escapes.
+const iso = (name) => `\u2068${name}\u2069`;
+
+const ISA_HUMANS = [
+  {
+    sha: "7d1c9ab4e05f",
+    message: "justplainjane47 merged justplainjane47-tc-create-1 into master (#7502)",
+    authorEmail: "justplainjane47@example.door43.org",
+    authorName: "justplainjane47",
+    date: "2026-08-15T14:22:07Z",
+  },
+  {
+    sha: "b39f0c72aa18",
+    message: "Changed missed Ketiv-Qere (#7494)",
+    authorEmail: "stephen.wunrow@example.door43.org",
+    authorName: "Stephen Wunrow",
+    date: "2026-08-14T09:05:41Z",
+  },
+];
+
+{
+  const s = compactLineage(summarizeLineage(ISA_HUMANS.map(classifyMasterCommit)));
+  eq(s.counts.human, 2, "both prod commits classify human");
+  // The old field is not replaced. Anything still reading it reads the same
+  // thing it read before, in the same order.
+  eq(
+    JSON.stringify(s.humanShas),
+    JSON.stringify(["7d1c9ab4e05f", "b39f0c72aa18"]),
+    "humanShas is still populated, unchanged, for every existing reader",
+  );
+  eq(s.humanCommits.length, 2, "…and humanCommits carries the same commits");
+  eq(
+    JSON.stringify(s.humanCommits.map((c) => c.sha)),
+    JSON.stringify(s.humanShas),
+    "…in the same order, one-for-one with the shas",
+  );
+  eq(s.humanCommits[0].author, "justplainjane47", "the AUTHOR name Door43 reported");
+  // Cold review F6: the PERSISTED evidence keeps the full timestamp. This is
+  // the record an incident reconstruction reads six weeks later, and this
+  // repo's reconstructions hinge on intra-day ordering — a day-only field
+  // cannot say which of two commits on 2026-08-15 came first.
+  eq(s.humanCommits[0].date, "2026-08-15T14:22:07Z", "the FULL ISO timestamp is what gets persisted");
+  eq(
+    describeHumanCommits(s),
+    `${iso("justplainjane47")} on 2026-08-15 (7d1c9ab); ${iso("Stephen Wunrow")} on 2026-08-14 (b39f0c7)`,
+    "…and the DAY is applied at display: the person, the day and the short sha",
+  );
+  // The same answer off the UNCOMPACTED lineage, so a caller that holds one
+  // does not have to compact first to name anything.
+  eq(
+    describeHumanCommits(summarizeLineage(ISA_HUMANS.map(classifyMasterCommit))),
+    describeHumanCommits(s),
+    "a full lineage and its compaction describe the window identically",
+  );
+  // It rides a Workflow step return value and D1's master_lineage_json.
+  eq(
+    describeHumanCommits(JSON.parse(JSON.stringify(s))),
+    describeHumanCommits(s),
+    "…and survives the JSON round trip it is persisted through",
+  );
+}
+
+{
+  // BACKWARD COMPAT, the mandatory half. master_lineage_json is last-run-wins,
+  // so a summary persisted before #684 is what a reader gets tonight: it has
+  // humanShas and no identity at all. It must produce NO name, which is what
+  // keeps every message on the wording it had before this shipped.
+  const preFix = {
+    mayHoldHumanEdit: true,
+    hasHumanCommit: true,
+    incomplete: false,
+    incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 1 },
+    humanShas: ["7d1c9ab4e05f"],
+  };
+  eq(masterMayHoldHumanEdit(preFix), true, "a pre-#684 snapshot still answers the merge's question");
+  eq(
+    describeHumanCommits(preFix),
+    "",
+    "…and names nobody: identity was never measured, and an absent measurement may not be invented",
+  );
+  // The other three "say nothing" cases, each one a caller keeping its old text.
+  eq(describeHumanCommits(null), "", "no lineage at all names nobody");
+  eq(describeHumanCommits(undefined), "", "…nor does a field a memoized step does not carry");
+  eq(
+    describeHumanCommits(compactLineage(summarizeLineage(ISA_HUMANS.map(classifyMasterCommit), {
+      incomplete: true,
+      incompleteReason: "page_cap",
+    }))),
+    "",
+    "an INCOMPLETE walk names nobody even though it saw these commits — it has not established the cause",
+  );
+  eq(
+    describeHumanCommits(compactLineage(summarizeLineage([
+      classifyMasterCommit({ sha: "s1", message: "bible-editor: ISA tn → master (#815)", authorEmail: BW }),
+    ]))),
+    "",
+    "a complete walk that found no human commit names nobody",
+  );
+  eq(
+    describeHumanCommits({
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 0, ai: 0, human: 1 }, humanShas: ["abc1234"],
+      // Identity fields present but empty — a Gitea response with no author.
+      humanCommits: [{ sha: "abc1234", author: null, date: null }],
+    }),
+    "",
+    "a bare sha with neither author nor date names nobody: it would read as identity while carrying none",
+  );
+}
+
+{
+  // The display budget is smaller than the evidence cap (the chip clamps to two
+  // lines), and the overflow tail is computed from the AUTHORITATIVE count, not
+  // from the capped list — so it can never under-report how many there were.
+  const many = Array.from({ length: 9 }, (_, i) =>
+    classifyMasterCommit({
+      sha: `h${i}0000000`,
+      message: `a hand fix ${i}`,
+      authorEmail: RICH,
+      authorName: "Richard Mahn",
+      date: `2026-08-0${i + 1}T00:00:00Z`,
+    }),
+  );
+  const s = compactLineage(summarizeLineage(many));
+  eq(s.humanShas.length, LINEAGE_EVIDENCE_CAP, "the sha evidence is capped, as before");
+  eq(s.humanCommits.length, LINEAGE_EVIDENCE_CAP, "…and the identity list rides the SAME cap");
+  const text = describeHumanCommits(s);
+  eq(
+    (text.match(/\(h\d00000\)/g) ?? []).length,
+    LINEAGE_NAMED_COMMITS_MAX,
+    `only ${LINEAGE_NAMED_COMMITS_MAX} commits are named, plus the overflow tail`,
+  );
+  eq(text.endsWith("; +6 more"), true, "the tail counts against counts.human (9), not against the 5 carried");
+  eq(describeHumanCommits(s, 1).endsWith("; +8 more"), true, "…and tracks the caller's own budget");
+  // Cold review F4: nine commits by ONE person must not print that person nine
+  // (or three) times — the two-line chip would say nothing else.
+  eq(
+    text.startsWith(`${iso("Richard Mahn")} on 2026-08-01 (h000000), 2026-08-02 (h100000), 2026-08-03 (h200000)`),
+    true,
+    "a repeated author is named ONCE, with its dates gathered in the order the walk returned them",
+  );
+  eq(text.split(iso("Richard Mahn")).length - 1, 1, "…exactly once, however many of the named commits are theirs");
+  // The budget is still spent on COMMITS, so the "+N more" tail is unaffected
+  // by the grouping — 9 human commits, 3 named, 6 more, regardless of authors.
+  eq(text.includes("; +6 more"), true, "…and dedup never makes the tail under-report the window");
+}
+
+{
+  // Cold review F4: a commit author name is third-party text from Door43,
+  // interpolated into a message. Three hazards, all handled at display.
+  const mk = (author) => ({
+    mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+    counts: { ours: 0, ai: 0, human: 1 }, humanShas: ["abc1234"],
+    humanCommits: [{ sha: "abc1234def", author, date: "2026-08-15T14:22:07Z" }],
+  });
+  // 1. Clamped, so one long name cannot push the outcome and the remedy out of
+  //    the chip's two lines.
+  const long = "Bartholomew Maximilian Fitzgerald-Wellington the Third of Door43";
+  const clamped = describeHumanCommits(mk(long));
+  eq(clamped.includes(long), false, "an over-long author name is not carried whole");
+  eq(clamped.startsWith(`${iso("Bartholomew Maximilian Fitzgerald-Welli…")} on 2026-08-15`), true, "…it is clamped, with the cut marked");
+  eq(clamped.includes("(abc1234)"), true, "…and the date and sha still follow it");
+  // 2. Bidi isolated. An RTL name is an ordinary case in this domain, and
+  //    unisolated it visually reorders the date and sha that follow it.
+  const rtl = describeHumanCommits(mk("שם המתרגם"));
+  eq(rtl.startsWith("\u2068"), true, "an author name opens with FSI");
+  eq(rtl.includes(`\u2068שם המתרגם\u2069 on 2026-08-15`), true, "…and closes with PDI, so the name is its own bidi run");
+  // 3. No control characters, and no bidi control the name brought itself: a
+  //    newline alone would break the two-line clamp it is being written for.
+  const nasty = describeHumanCommits(mk("line one\nline two\u202egnitset"));
+  eq(/[\n\r]/.test(nasty), false, "a newline in the author name never reaches the message");
+  eq(nasty.includes("\u202e"), false, "…nor does an unterminated legacy bidi override");
+  eq(nasty.includes("line one line two"), true, "…and what is left of the name is still shown");
+  // 4. A name that is nothing but unsafe characters leaves no name at all —
+  //    and the commit is still described, by date and sha, without inventing one.
+  const empty = describeHumanCommits(mk("\u202e\u0007  "));
+  eq(empty.includes("a Door43 editor on 2026-08-15 (abc1234)"), true, "an illegible name degrades to the measured date and sha");
+  eq(empty.includes("\u2068"), false, "…and our own words are not bidi-isolated: the hazard is third-party text");
+}
+
+{
+  // Cold review F1: the delimiter a churn guard splits on. The identity clause
+  // drifts on its own — a new commit lands, or the watermark moves — so a guard
+  // comparing whole reasons would rewrite a flag, and bump a row's version, on
+  // a night when the FINDING did not change.
+  const base = "A Door43 edit to this row's note was merged over your app-side change. Please double-check it.";
+  const night1 = base + humanCommitEvidenceClause(compactLineage(summarizeLineage([classifyMasterCommit(ISA_HUMANS[1])])));
+  const night2 = base + humanCommitEvidenceClause(compactLineage(summarizeLineage(ISA_HUMANS.map(classifyMasterCommit))));
+  eq(night1.includes(LINEAGE_EVIDENCE_LEAD), true, "the clause carries the delimiter the guard splits on");
+  eq(night1 === night2, false, "one more human commit in the window renders DIFFERENT text…");
+  eq(
+    stripHumanCommitEvidence(night1),
+    stripHumanCommitEvidence(night2),
+    "…but the same finding, so a guard comparing stripped reasons sees no change",
+  );
+  eq(stripHumanCommitEvidence(night1), base, "…and what survives the strip is exactly the pre-#684 reason");
+  // A row with no flag yet: the mint must still write, and write the identity.
+  eq(stripHumanCommitEvidence(null) === stripHumanCommitEvidence(night1), false, "an unflagged row still mints");
+  eq(stripHumanCommitEvidence(undefined), "", "…and a null reason strips to the empty string, never throws");
+  // A reason that genuinely changed still compares as changed.
+  eq(
+    stripHumanCommitEvidence(base.replace("note", "quote and note")) === stripHumanCommitEvidence(night1),
+    false,
+    "a real change to the finding is still seen as a change",
+  );
+  // Nothing measured -> no clause at all -> the guard compares plain strings.
+  eq(humanCommitEvidenceClause(null), "", "no lineage produces no clause");
+  eq(stripHumanCommitEvidence(base), base, "…and a reason with no clause survives the strip untouched");
 }
 
 if (failed) {
