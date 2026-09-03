@@ -12,14 +12,16 @@
 // that batch depend on, without hand-copying a "simplified" stand-in that
 // could drift from the real WHERE clause.
 //
-// Binds, in order: (contentJson, plainText, updatedAt, updatedBy, book,
-// chapter, verse, bibleVersion, expectedVersion).
+// Binds, in order: (contentJson, plainText, updatedAt, updatedBy,
+// lastChangeAction, lastChangeSource, lastChangeActor, book, chapter, verse,
+// bibleVersion, expectedVersion). Bound at exactly one call site — verses.ts's
+// PATCH route (issue #686).
 // ---------------------------------------------------------------------------
 export const VERSE_PATCH_UPDATE_SQL = `UPDATE verses
    SET content_json = ?1, plain_text = COALESCE(?2, plain_text), version = version + 1,
-       updated_at = ?3, updated_by = ?4
- WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
-   AND version = ?9`;
+       updated_at = ?3, updated_by = ?4, last_change_action = ?5, last_change_source = ?6, last_change_actor = ?7
+ WHERE book = ?8 AND chapter = ?9 AND verse = ?10 AND bible_version = ?11
+   AND version = ?12`;
 
 // ---------------------------------------------------------------------------
 // verses.ts's PATCH route, statement 3 — marks a flagged conflict resolved

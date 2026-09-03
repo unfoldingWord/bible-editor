@@ -887,6 +887,13 @@ export interface ReimportCounts {
   // Verse flagged for human review after a merge (both D1 and master moved,
   // or adopting would have lost alignment). Optional, same reason as above.
   merge_conflicts?: number;
+  // The rows this run flagged for human review as a merge conflict — the number
+  // the "Pull from Door43" summary renders as "flagged for review (merge
+  // conflict)". Read this directly rather than subtracting merge_kept_ai from
+  // merge_conflicts: that subtraction only holds on the verse side, and cancelled
+  // a real TSV master-wins flag against an unrelated kept-alone row (#706). See
+  // bookReimport.ts for the exact set. Optional, same reason as above.
+  merge_master_wins?: number;
   // Merge refused to adopt master's edit specifically because it would have
   // lost alignment — a subset of merge_conflicts. Optional, diagnostic.
   merge_refused?: number;
