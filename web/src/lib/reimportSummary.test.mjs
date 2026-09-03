@@ -266,6 +266,97 @@ has(bothNoops, "2 identical once exported", "…and the lens-suppressed ones are
 // Absent (a Worker response predating the counter) must behave like 0.
 lacks(summarizeReimport(res({})), "identical once exported", "field absent -> no line");
 
+console.log("\n-- verse-range structure counters (issues #727 / #728) --");
+
+// Every one of the five is optional and 0-or-absent must print nothing — same
+// contract as the other optional counters, and the common case for a book with
+// no bridges at all.
+for (const key of [
+  "structure_overlap",
+  "structure_kept_local",
+  "structure_adopted",
+  "structure_refused",
+  "structure_unclassified",
+]) {
+  lacks(summarizeReimport(res({ [key]: 0 })), "verse range", `${key}: 0 -> no line`);
+  eq(
+    summarizeReimport(res({ [key]: 0 })),
+    "Imported AMO — no changes.",
+    `${key}: 0 alone -> the plain no-changes message`,
+  );
+}
+lacks(summarizeReimport(res({})), "verse range", "all five absent -> no structure line");
+lacks(summarizeReimport(res({})), "undefined", "absent structure counters never render undefined");
+
+// The warning: a chapter the export cannot render. Says only the measured
+// consequence (the export refuses that chapter) — not a watermark effect this
+// manual path does not have.
+const overlap = summarizeReimport(res({ structure_overlap: 2 }));
+has(
+  overlap,
+  "2 overlapping verse range(s) found (chapter cannot be exported until fixed)",
+  "structure_overlap is reported with its count",
+);
+lacks(overlap, "out of sync", "overlap line does NOT assert a watermark consequence");
+eq(
+  overlap,
+  "Imported AMO: 2 overlapping verse range(s) found (chapter cannot be exported until fixed).",
+  "overlap alone -> a complete sentence, not the no-changes message",
+);
+
+has(
+  summarizeReimport(res({ structure_refused: 1 })),
+  "1 kept the app's verse range(s) over Door43's (flagged for review)",
+  "structure_refused names the direction and the flag",
+);
+has(
+  summarizeReimport(res({ structure_adopted: 3 })),
+  "3 verse range(s) adopted from Door43 (split or bridge)",
+  "structure_adopted names the direction",
+);
+has(
+  summarizeReimport(res({ structure_kept_local: 4 })),
+  "4 verse range(s) kept from the app (not yet exported)",
+  "structure_kept_local is reported as in-flight app work",
+);
+has(
+  summarizeReimport(res({ structure_unclassified: 5 })),
+  "5 verse range(s) kept — not checked against Door43 (no export record)",
+  "structure_unclassified says the comparison did not happen",
+);
+
+// A run that only skipped Door43's rows for an unexported app-side bridge must
+// not report "no changes" — the pull did decline something.
+lacks(
+  summarizeReimport(res({ structure_kept_local: 1 })),
+  "no changes",
+  "kept_local alone never reports 'no changes'",
+);
+
+// Structure lines are their own dimension: they must NOT be folded into the
+// content merge lines (#726 decision D3 keeps structure_refused out of
+// merge_refused so the export is not frozen by it).
+const structAndMerge = summarizeReimport(
+  res({ merge_master_wins: 1, structure_refused: 1, structure_overlap: 1, own_publish_converged: 1 }),
+);
+has(structAndMerge, "1 flagged for review (merge conflict)", "content merge flag still reported");
+has(structAndMerge, "1 kept the app's verse range(s) over Door43's", "structure refusal reported separately");
+eq(
+  structAndMerge.indexOf("flagged for review (merge conflict)") < structAndMerge.indexOf("overlapping verse range"),
+  true,
+  "content lines come before the structure block, matching the existing actionable-first order",
+);
+eq(
+  structAndMerge.indexOf("overlapping verse range") < structAndMerge.indexOf("kept the app's verse range"),
+  true,
+  "the overlap warning leads the structure block",
+);
+eq(
+  structAndMerge.indexOf("kept the app's verse range") < structAndMerge.indexOf("confirmed as holding"),
+  true,
+  "structure lines sit before the informational converged tail",
+);
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
