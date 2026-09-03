@@ -170,8 +170,11 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
         if (!cur || cur.kind !== "ready") return prev;
         const data = cur.data;
         const byVersion = { ...(data.verses[bridge.bible_version] ?? {}) };
+        // Structural change always applies; start-row content is newer-wins — see
+        // useChapter.applyLocalVerseBridge for the WS-reorder rationale.
+        const existingStart = byVersion[bridge.verse];
         delete byVersion[removedVerse];
-        byVersion[bridge.verse] = bridge;
+        if (!existingStart || bridge.version >= existingStart.version) byVersion[bridge.verse] = bridge;
         const absorbed = new Set(absorbedVerses);
         const next = new Map(prev);
         next.set(bridge.chapter, {
@@ -196,8 +199,13 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
         if (!cur || cur.kind !== "ready") return prev;
         const data = cur.data;
         const byVersion = { ...(data.verses[start.bible_version] ?? {}) };
-        byVersion[start.verse] = start;
-        for (const nv of newVerses) byVersion[nv.verse] = nv;
+        // Adding split verses always applies (new keys); each slot newer-wins.
+        const existingStart = byVersion[start.verse];
+        if (!existingStart || start.version >= existingStart.version) byVersion[start.verse] = start;
+        for (const nv of newVerses) {
+          const ex = byVersion[nv.verse];
+          if (!ex || nv.version >= ex.version) byVersion[nv.verse] = nv;
+        }
         const next = new Map(prev);
         next.set(start.chapter, {
           kind: "ready",

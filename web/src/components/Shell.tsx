@@ -393,19 +393,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         applyLocalVerse(verse);
       }
     },
+    // Apply unconditionally: the structural key-set change (remove absorbed /
+    // add split verses) must NOT be dropped by a racing verse.updated that
+    // reordered ahead of this event — otherwise the other tab strands the
+    // absorbed verse or never shows the split verses until reload. The apply
+    // helpers do the structural change always and keep the start-row CONTENT
+    // newer-wins internally, so a fresher edit is still not clobbered.
     onVerseBridged: (verse, removedVerse, absorbedVerses) => {
-      // Newer-version-wins, same guard as onVerseUpdate — a lagging broadcast
-      // must not clobber a fresher local bridge row.
-      const existing = dataRef.current?.verses[verse.bible_version]?.[verse.verse];
-      if (!existing || verse.version > existing.version) {
-        applyLocalVerseBridge(verse, removedVerse, absorbedVerses);
-      }
+      applyLocalVerseBridge(verse, removedVerse, absorbedVerses);
     },
     onVerseSplit: (verse, newVerses) => {
-      const existing = dataRef.current?.verses[verse.bible_version]?.[verse.verse];
-      if (!existing || verse.version > existing.version) {
-        applyLocalVerseSplit(verse, newVerses);
-      }
+      applyLocalVerseSplit(verse, newVerses);
     },
     onVerseStatusUpdate: (status) => {
       applyLocalVerseStatus(status.verse, status.done === 1);

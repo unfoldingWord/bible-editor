@@ -857,7 +857,7 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
       .bind(book, chapter, bibleVersion, seedJson, now, userId, verse, bridgeEnd, ...provenanceValues({ action: "split", source: "user", actor }), expected),
     c.env.DB
       .prepare(SPLIT_INSERT_EDITLOG_RANGE_SQL)
-      .bind(book, chapter, bibleVersion, verse, bridgeEnd, userId, JSON.stringify({ content: seedContent })),
+      .bind(book, chapter, bibleVersion, verse, bridgeEnd, userId, JSON.stringify({ content: seedContent }), expected),
   ]);
   if (!updateRes.meta.changes) {
     const fresh = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);

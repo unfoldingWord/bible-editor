@@ -193,7 +193,7 @@ export const SPLIT_INSERT_VERSES_RANGE_SQL = `INSERT INTO verses
 // row_key is `book/chapter/verse/bibleVersion`, built in SQL from the seq.
 //
 // Binds, in order: (book, chapter, bibleVersion, startVerse, verseEnd, userId,
-// payloadJson).
+// payloadJson, bridgeVersion).
 // row_key must read `book/chapter/verse/bibleVersion` — the canonical form used
 // everywhere else (verseHistory, the merge route's JS-built keys). CAST chapter
 // and v to INTEGER before concatenating: SQLite string `||` renders a REAL-bound
@@ -201,13 +201,30 @@ export const SPLIT_INSERT_VERSES_RANGE_SQL = `INSERT INTO verses
 // integers as REAL — so without the CAST the key would be `book/5.0/2.0/bv` and
 // never match a lookup. The verse COLUMN is unaffected (INTEGER affinity coerces
 // on insert); only this text concatenation needs the cast.
+//
+// new_version MUST be the ACTUAL seeded version, not a literal 1: it is what
+// makes edit_log's high-water for this verse truthful. If it logged 1, a repeat
+// bridge→split cycle would read the stale pre-bridge max instead of the real
+// seeded version and re-mint the SAME number, re-opening the stale-If-Match
+// replay this whole mechanism exists to close. It is the identical expression
+// SPLIT_INSERT_VERSES_RANGE_SQL uses for the row's version — and evaluates to the
+// same value here, because this INSERT...SELECT reads edit_log as it stood before
+// this statement (no create row for this verse exists yet), exactly as the verses
+// insert did. So the audit's new_version == the row's version, always.
 export const SPLIT_INSERT_EDITLOG_RANGE_SQL = `INSERT INTO edit_log
      (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
    WITH RECURSIVE split_seq(v) AS (
      SELECT ?4 + 1
      UNION ALL SELECT v + 1 FROM split_seq WHERE v + 1 <= ?5
    )
-   SELECT 'verse', ?1 || '/' || CAST(?2 AS INTEGER) || '/' || CAST(v AS INTEGER) || '/' || ?3, ?1, ?6, NULL, 1, 'create', ?7
+   SELECT 'verse', ?1 || '/' || CAST(?2 AS INTEGER) || '/' || CAST(v AS INTEGER) || '/' || ?3, ?1, ?6, NULL,
+     MAX(
+       COALESCE((SELECT MAX(new_version) FROM edit_log
+                  WHERE kind = 'verse'
+                    AND row_key = ?1 || '/' || CAST(?2 AS INTEGER) || '/' || CAST(v AS INTEGER) || '/' || ?3), 0),
+       ?8
+     ) + 1,
+     'create', ?7
      FROM split_seq
     WHERE changes() > 0`;
 

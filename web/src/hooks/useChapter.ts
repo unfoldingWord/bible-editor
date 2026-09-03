@@ -215,8 +215,14 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       setData((prev) => {
         if (!prev) return prev;
         const byVersion = { ...(prev.verses[bridge.bible_version] ?? {}) };
+        // The STRUCTURAL change (remove the absorbed key, prune its status/lane
+        // checks) always applies — WS delivery can reorder a racing verse.updated
+        // ahead of this event, and dropping the whole thing on a version check
+        // would strand the absorbed verse in the other tab. Only the start row's
+        // CONTENT follows newer-wins, so a genuinely fresher edit isn't clobbered.
+        const existingStart = byVersion[bridge.verse];
         delete byVersion[removedVerse];
-        byVersion[bridge.verse] = bridge;
+        if (!existingStart || bridge.version >= existingStart.version) byVersion[bridge.verse] = bridge;
         const absorbed = new Set(absorbedVerses);
         return {
           ...prev,
@@ -238,8 +244,15 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       setData((prev) => {
         if (!prev) return prev;
         const byVersion = { ...(prev.verses[start.bible_version] ?? {}) };
-        byVersion[start.verse] = start;
-        for (const nv of newVerses) byVersion[nv.verse] = nv;
+        // Adding the split-created verses always applies (they are new keys a
+        // racing verse.updated can't have introduced); each slot is newer-wins so
+        // a later same-row update isn't clobbered by a reordered split event.
+        const existingStart = byVersion[start.verse];
+        if (!existingStart || start.version >= existingStart.version) byVersion[start.verse] = start;
+        for (const nv of newVerses) {
+          const ex = byVersion[nv.verse];
+          if (!ex || nv.version >= ex.version) byVersion[nv.verse] = nv;
+        }
         return {
           ...prev,
           verses: { ...prev.verses, [start.bible_version]: byVersion },

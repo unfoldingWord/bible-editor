@@ -142,7 +142,7 @@ function runSplit(d, { verse, verseEnd, expectedVersion, seed }) {
      SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'split', ?6 WHERE changes() > 0`,
   ).run(`ZEC/5/${verse}/UST`, "ZEC", 30, expectedVersion, expectedVersion + 1, "{}");
   d.prepare(SPLIT_INSERT_VERSES_RANGE_SQL).run("ZEC", 5, "UST", seed, 200, 30, verse, verseEnd, "split", "user", "actor", expectedVersion);
-  d.prepare(SPLIT_INSERT_EDITLOG_RANGE_SQL).run("ZEC", 5, "UST", verse, verseEnd, 30, "{}");
+  d.prepare(SPLIT_INSERT_EDITLOG_RANGE_SQL).run("ZEC", 5, "UST", verse, verseEnd, 30, "{}", expectedVersion);
   return up.changes;
 }
 
@@ -212,8 +212,13 @@ function runSplit(d, { verse, verseEnd, expectedVersion, seed }) {
   // NOT version 1 — floored above the bridge version (4) so a stale pre-bridge
   // If-Match can't pass CAS against the re-minted row (finding 6). max(0,4)+1 = 5.
   eq(v2.version, 5, "recreated verse starts above the bridge version, not at 1");
-  const audit = d.prepare(`SELECT COUNT(*) c FROM edit_log WHERE row_key='ZEC/5/2/UST' AND action='create'`).get().c;
-  eq(audit, 1, "verse-2 got its create audit row");
+  const auditRow = d.prepare(`SELECT COUNT(*) c, MAX(new_version) nv FROM edit_log WHERE row_key='ZEC/5/2/UST' AND action='create'`).get();
+  eq(auditRow.c, 1, "verse-2 got its create audit row");
+  // The create audit records the ACTUAL seeded version (5), not a literal 1 — so
+  // edit_log's high-water is truthful and a repeat bridge→split can't re-mint the
+  // same number and re-open the stale-If-Match replay (re-review finding 1).
+  eq(auditRow.nv, getVerse(d, 2).version, "create audit new_version == the seeded row version");
+  eq(auditRow.nv, 5, "…which is 5, not 1");
 }
 
 // split version floors above the verse's OWN edit_log history too (finding 6):
