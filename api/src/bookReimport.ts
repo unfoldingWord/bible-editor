@@ -153,6 +153,7 @@ import {
 // node; re-exported below so every existing internal/external reference keeps
 // working unchanged.
 import { REIMPORT_CHAPTER_CHUNK, reimportChunkBoundaries } from "./reimportChunkPlan";
+import { findOverlappingRanges, formatVerseRange, verseVersionFloorSql } from "./verseBridge.ts";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
 
@@ -559,6 +560,14 @@ export interface ReimportCounts {
   // the quiet one. See stale_base_holds.reason = 'stale_tc_reexport_overridden'
   // for the durable half.
   stale_base_overridden: number;
+  // Issue #727. Pairs of verse rows, in chapters this run touched, whose
+  // [verse, verse_end] ranges intersect (a `1-2` bridge beside a standalone `2`)
+  // as found by applyVerseRows's post-apply structural audit. The export refuses
+  // to render such a chapter (VerseRangeOverlapError), so any nonzero value
+  // withholds the (book, resource) watermark in shouldRecordResourceSync — the
+  // same fail-safe direction as merge_record_failed / apply_incomplete. Counted
+  // rather than boolean so the summary can say how many. verses only.
+  structure_overlap: number;
   dcs_404: number;
   errors: string[];
   // Set when this object (or an object folded into it via addCounts) was
@@ -594,6 +603,19 @@ export interface ReimportResult {
 }
 
 const REIMPORT_SOURCE = "dcs_reimport";
+
+// Issue #727: the version a reimport INSERT (re)creates a verse row at — see
+// verseVersionFloorSql in verseBridge.ts. Two spellings of ONE expression for
+// the two bind layouts it appears in (the verses INSERT binds book ?1, chapter
+// ?2, verse ?3, bible_version ?5; its audit row binds book ?2 and appends
+// chapter ?6, verse ?7, bible_version ?8 after its own five). No live
+// predecessor row exists on this path, so the floor is a literal 0.
+const REIMPORT_INSERT_VERSE_VERSION_SQL = verseVersionFloorSql({
+  book: "?1", chapter: "?2", verse: "?3", bibleVersion: "?5", floor: "0",
+});
+const REIMPORT_LOG_VERSE_VERSION_SQL = verseVersionFloorSql({
+  book: "?2", chapter: "?6", verse: "?7", bibleVersion: "?8", floor: "0",
+});
 
 // Cap on ReimportCounts.blocked_samples. Also caps the per-row console.warn at
 // each drop site: a mass id-reissue would otherwise emit one Workers log line
@@ -697,6 +719,7 @@ function zeroCounts(): ReimportCounts {
     merge_record_failed: false,
     stale_base_held: 0,
     stale_base_overridden: 0,
+    structure_overlap: 0,
     dcs_404: 0,
     errors: [],
     counts_incomplete: false,
@@ -942,6 +965,11 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   // launder an absent measurement into a green light.
   into.stale_base_held += from.stale_base_held ?? 0;
   into.stale_base_overridden += from.stale_base_overridden ?? 0;
+  // `?? 0` again for replayed pre-#727 chunk results. Safe here for the reason
+  // shouldRecordResourceSync's doc gives: this is a positive end-of-chunk
+  // measurement whose absence means "not measured on an older code path", and
+  // zero overlaps is the state the check exists to confirm, not to assume away.
+  into.structure_overlap += from.structure_overlap ?? 0;
   into.dcs_404 += from.dcs_404;
   if (from.errors.length) into.errors.push(...from.errors);
 }
@@ -5324,6 +5352,17 @@ async function applyVerseRows(
   // verses that were permanently `keep_no_base` recover a real ancestor this
   // way (see issue #537's comment thread for the corpus table).
   const baselineBoundaryParam = boundaryParam + 1;
+  // Issue #727: `'bridge'` and `'split'` (verses.ts) are content-bearing —
+  // their payload holds the verse's full content at that version, in the same
+  // object shape verseHistory.ts's normalizeContent already absorbs — and
+  // human-authored (source NULL). They belong in BOTH sub-selects: as an
+  // ancestor candidate for base_payload (a bridge's payload is the last state
+  // both sides agreed on when nothing else was written since), and as the
+  // newest content row for latest_source (a human bridging an AI-drafted verse
+  // takes ownership of it; left out, the AI 'update' beneath it was the newest
+  // visible row and the verse re-seeded wholesale from master, un-bridging it).
+  // The TSV latest_source copies elsewhere in this file are untouched — those
+  // actions never occur on tn/tq/twl rows.
   const mergeCols =
     lastExportAt != null
       ? `,
@@ -5332,7 +5371,7 @@ async function applyVerseRows(
                  AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
                  AND (book = ?1 OR book IS NULL)
                  AND (
-                   (action IN ('create', 'update') AND ${baseBoundary})
+                   (action IN ('create', 'update', 'bridge', 'split') AND ${baseBoundary})
                    OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
                  )
                ORDER BY created_at DESC, id DESC LIMIT 1) AS base_payload,
@@ -5367,7 +5406,7 @@ async function applyVerseRows(
                WHERE kind = 'verse'
                  AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
                  AND (book = ?1 OR book IS NULL)
-                 AND action IN ('create', 'update')
+                 AND action IN ('create', 'update', 'bridge', 'split')
                ORDER BY id DESC LIMIT 1) AS latest_source${mergeCols}
        FROM verses
       WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${chPlaceholders})`,
@@ -5525,10 +5564,20 @@ async function applyVerseRows(
         isInsert: true,
         // #686: verse absent from D1 entirely — sync_merge, attributed to
         // whichever Door43 author this run's lineage measured.
+        // Issue #727: `version` is NOT the column default. Before bridges no
+        // verse row was ever deleted and recreated except by a full import;
+        // now a bridge deletes the absorbed verse's row while master still
+        // carries it, and this INSERT is how it can come back. Recreated at 1,
+        // a stale `If-Match: 1` in a tab's outbox would pass CAS against it.
+        // Start strictly above the verse's edit_log high-water instead — the
+        // same expression SPLIT_INSERT_VERSES_RANGE_SQL uses (verseBridge.ts).
+        // A verse with no history still starts at MAX(0, 0) + 1 = 1.
         stmt: env.DB.prepare(
           `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text,
-             last_change_action, last_change_source, last_change_actor)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             version, last_change_action, last_change_source, last_change_actor)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+             ${REIMPORT_INSERT_VERSE_VERSION_SQL},
+             ?8, ?9, ?10)
            ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`,
         ).bind(
           book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText,
@@ -5537,11 +5586,19 @@ async function applyVerseRows(
         // Conditional on the INSERT actually landing: ON CONFLICT DO NOTHING
         // means a verse that already exists (created between our read and
         // this batch) inserts 0 rows — don't log a phantom restorable v1.
+        // new_version re-evaluates the same floor expression against edit_log
+        // as it stood before this batch (no create row exists yet), so it
+        // equals the row's version by construction — see verseVersionFloorSql.
         logStmt: env.DB.prepare(
           `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
-           SELECT 'verse', ?1, ?2, ?3, NULL, 1, 'create', ?4, ?5
+           SELECT 'verse', ?1, ?2, ?3, NULL,
+             ${REIMPORT_LOG_VERSE_VERSION_SQL},
+             'create', ?4, ?5
             WHERE changes() > 0`,
-        ).bind(rowKey, book, userId, JSON.stringify({ plain_text: v.plainText, content: v.contentJson }), REIMPORT_SOURCE),
+        ).bind(
+          rowKey, book, userId, JSON.stringify({ plain_text: v.plainText, content: v.contentJson }), REIMPORT_SOURCE,
+          v.chapter, v.verse, bibleVersion,
+        ),
       });
       continue;
     }
@@ -6452,6 +6509,34 @@ async function applyVerseRows(
   ).length;
   if (recordFailed) counts.merge_record_failed = true;
 
+  // 9. Issue #727: structural post-check. Every chapter this call touched must
+  //    still cover DISJOINT verse ranges — a `1-2` bridge beside a standalone
+  //    `2` would render as `\v 1-2` + `\v 2` (buildUsfm now refuses it with
+  //    VerseRangeOverlapError, so the export for this resource would fail every
+  //    night until someone noticed). Checked HERE, after every write batch, so
+  //    the night it happens is the night it is counted: `structure_overlap`
+  //    withholds the (book, resource) watermark in shouldRecordResourceSync.
+  //    ONE query per touched chapter (not per verse) — the same subrequest
+  //    budget every batch in this function is sized against. Read-only and
+  //    diagnostic: it never edits rows, since which of the two rows is the
+  //    corrupt one is a human call.
+  for (const ch of chapters) {
+    const rs = await env.DB.prepare(
+      `SELECT verse, verse_end FROM verses
+        WHERE book = ?1 AND bible_version = ?2 AND chapter = ?3
+        ORDER BY verse ASC, verse_end ASC`,
+    )
+      .bind(book, bibleVersion, ch)
+      .all<{ verse: number; verse_end: number | null }>();
+    const pairs = findOverlappingRanges(rs.results);
+    if (pairs.length === 0) continue;
+    counts.structure_overlap += pairs.length;
+    console.error("reimport: chapter left with OVERLAPPING verse ranges — watermark withheld (issue #727)", {
+      book, bibleVersion, chapter: ch,
+      overlaps: pairs.map((p) => `${formatVerseRange(p.a)} ∩ ${formatVerseRange(p.b)}`),
+    });
+  }
+
   return counts;
 }
 
@@ -6477,10 +6562,15 @@ async function applyVerseRowsPerRow(
       // (only reached when the batched applyVerseRows path threw) has no
       // MergeCutoff/lineage in scope — it is not worth threading one through
       // just to name an author on the rare fallback slice.
+      // Issue #727: same version floor as the batched INSERT above (see
+      // REIMPORT_INSERT_VERSE_VERSION_SQL) — this fallback re-mints the same
+      // rows and would otherwise re-open the stale-If-Match hole on them.
       const ins = await env.DB.prepare(
         `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text,
-           last_change_action, last_change_source, last_change_actor)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+           version, last_change_action, last_change_source, last_change_actor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+           ${REIMPORT_INSERT_VERSE_VERSION_SQL},
+           ?8, ?9, ?10)
          ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`,
       )
         .bind(
@@ -6490,10 +6580,18 @@ async function applyVerseRowsPerRow(
         .run();
       if ((ins.meta.changes ?? 0) > 0) {
         counts.inserted++;
+        // Read the minted version back so the audit row is truthful (the
+        // batched path computes it in SQL; here the INSERT has already landed,
+        // so the floor expression would now read one too high).
+        const minted = await env.DB.prepare(
+          `SELECT version FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
+        )
+          .bind(book, v.chapter, v.verse, bibleVersion)
+          .first<{ version: number }>();
         await logEdit(
           env, "verse",
           `${book}/${v.chapter}/${v.verse}/${bibleVersion}`,
-          book, userId, null, 1, "create",
+          book, userId, null, minted?.version ?? 1, "create",
           { plain_text: v.plainText, content: v.contentJson },
         );
         continue;
@@ -6509,7 +6607,7 @@ async function applyVerseRowsPerRow(
                    WHERE kind = 'verse'
                      AND row_key = ?1 || '/' || ?2 || '/' || ?3 || '/' || ?4
                      AND (book = ?1 OR book IS NULL)
-                     AND action IN ('create', 'update')
+                     AND action IN ('create', 'update', 'bridge', 'split')
                    ORDER BY id DESC LIMIT 1) AS latest_source
            FROM verses
           WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
@@ -8857,6 +8955,10 @@ export async function runChunkedReimport(
       // it in-sync and the export would revert master with no retry (Codex's
       // failed-adoption-write gate). Sibling to the other withhold conditions.
       const applyIncomplete = perResource[e.resource].apply_incomplete === true;
+      // Issue #727: `structure_overlap` (a chapter left with intersecting verse
+      // ranges) is NOT a separate line here — it rides inside
+      // shouldRecordResourceSync on the perResource aggregate, unconditionally,
+      // so the idBlockedOverride below cannot open it.
       // Issue #427: master rows this run dropped because a tombstone (or any
       // other holder) already owns their (book, id) primary key. Folded into
       // shouldRecordResourceSync rather than checked separately here, so the

@@ -16,6 +16,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { applyVerseRowsForTest } from "./bookReimport.ts";
+import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -1413,6 +1414,193 @@ console.log("\n[#609: a REAL master change on an AI-only verse still re-seeds an
   eq(row.version, 4, "the version DOES move");
   eq(row.content_json, realChange, "…master's bytes landed");
   eq(row.updated_by, null, "…and the verse is reclaimed to master-owned, exactly as before this guard");
+}
+
+// ── Issue #727: bridge-aware reimport guards ─────────────────────────────────
+
+console.log("\n[#727: a chapter left with overlapping verse ranges trips structure_overlap and the watermark gate refuses]");
+{
+  // Seed the corrupt shape directly: a pristine `1-2` bridge beside a pristine
+  // standalone verse 2 in the same chapter. Nothing in the reimport's own diff
+  // fixes this (master's verse 2 is bridge-covered and skipped), so the ONLY
+  // thing standing between it and `\v 1-2` + `\v 2` on Door43 is the post-apply
+  // structural check.
+  const { env, sqlite } = freshEnv();
+  const ins = sqlite.prepare(
+    `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+     VALUES (?, 30, ?, ?, ?, ?, ?, 1, NULL)`,
+  );
+  ins.run(BOOK, 1, 2, VERSION, contentJson("bridged one two"), "bridged one two");
+  ins.run(BOOK, 2, null, VERSION, contentJson("stray two"), "stray two");
+
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, [verse(30, 3, "verse three")], null, null, false);
+  eq(counts.inserted, 1, "the unrelated verse 3 still lands — the check is a post-apply audit, not a write refusal");
+  eq(counts.structure_overlap, 1, "the overlapping pair (1-2 ∩ 2) is counted once");
+  eq(shouldRecordResourceSync(counts), false, "…and the watermark gate refuses to stamp this run's counts");
+
+  // Control: the same chapter with a bridge and a non-overlapping neighbour.
+  const clean = freshEnv();
+  const ins2 = clean.sqlite.prepare(
+    `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+     VALUES (?, 30, ?, ?, ?, ?, ?, 1, NULL)`,
+  );
+  ins2.run(BOOK, 1, 2, VERSION, contentJson("bridged one two"), "bridged one two");
+  ins2.run(BOOK, 3, null, VERSION, contentJson("three"), "three");
+  const cleanCounts = await applyVerseRowsForTest(clean.env, BOOK, VERSION, [verse(30, 4, "verse four")], null, null, false);
+  eq(cleanCounts.structure_overlap, 0, "adjacent, non-intersecting ranges (1-2, 3, 4) are not an overlap");
+  eq(shouldRecordResourceSync(cleanCounts), true, "…and the gate stamps a structurally clean run");
+}
+
+console.log("\n[#727: a verse whose newest edit_log row is a 'bridge' (source NULL) is human-owned, not AI-only]");
+{
+  // History: the AI pipeline wrote v2 ('update', source ai_pipeline), then a
+  // human bridged it with verse 2 ('bridge', source NULL, v3), and the bridge
+  // has since been exported, so master carries `1-2` too. Tonight a maintainer
+  // corrected the bridged text on Door43. The ownership sub-select used to see
+  // only create/update, so the bridge row was invisible: the newest visible row
+  // was the AI 'update', the verse classified AI-only and took the wholesale
+  // re-seed path (master's bytes in, updated_by → NULL) instead of the
+  // human-owned merge/skip path. (Master carrying a PLAIN verse 1 here would
+  // never reach this classification — the bridgeCover skip from PR #721 drops
+  // it first — so the master row must itself be the bridge to test ownership.)
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 707, 'ai-writer')`).run();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  const bridged = contentJson("bridged one and two");
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 12, 1, 2, ?, ?, 'bridged one and two', 3, 1)`,
+    )
+    .run(BOOK, VERSION, bridged);
+  const key = `${BOOK}/12/1/${VERSION}`;
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+       VALUES ('verse', ?, ?, 7, 1, 2, 'update', ?, 'ai_pipeline', 100)`,
+    )
+    .run(key, BOOK, JSON.stringify({ plain_text: "ai one", content: contentJson("ai one") }));
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+       VALUES ('verse', ?, ?, 1, 2, 3, 'bridge', ?, NULL, 200)`,
+    )
+    .run(key, BOOK, JSON.stringify({ content: JSON.parse(bridged), verse_end: 2 }));
+
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 1, verseEnd: 2, contentJson: contentJson("master's corrected one and two"), plainText: "master's corrected one and two" }],
+    null, null, false,
+  );
+
+  eq(counts.reimported_ai, 0, "NOT re-seeded as AI-only");
+  eq(counts.skipped_edited, 1, "classified human-owned and left alone (no watermark → no merge attempt)");
+  eq(counts.inserted, 0, "nothing inserted");
+  const row = sqlite
+    .prepare("SELECT content_json, verse_end, version, updated_by FROM verses WHERE book = ? AND chapter = 12 AND verse = 1 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.verse_end, 2, "the bridge survives");
+  eq(row.version, 3, "…unbumped");
+  eq(row.content_json, bridged, "…with its bridged content intact");
+  eq(row.updated_by, 1, "…still owned by the translator");
+}
+
+console.log("\n[#727: a 'bridge' edit_log payload at/below the boundary is recoverable as the merge ancestor]");
+{
+  // Same shape as the #537 baseline case, but the ONLY pre-watermark
+  // content-bearing history for this verse is the 'bridge' row a human wrote
+  // (payload carries the full bridged content at that version). Pre-#727 the
+  // base_payload sub-select filtered to create/update, so this verse was
+  // permanently keep_no_base even though a perfectly good ancestor existed.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  const bridged = contentJson("bridged five and six");
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 7, 5, 6, ?, ?, 'bridged five and six', 4, 1)`,
+    )
+    .run(BOOK, VERSION, bridged);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 1, 3, 4, 'bridge', ?, 500)`,
+    )
+    .run(`${BOOK}/7/5/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(bridged), verse_end: 6 }));
+
+  // Master already carries the exported bridge (5-6) and a maintainer corrected
+  // its text out-of-band on Door43.
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 7, verse: 5, verseEnd: 6, contentJson: contentJson("master's corrected five and six"), plainText: "master's corrected five and six" }],
+    null,
+    { confirmedAt: 1000, editId: null },
+    false,
+  );
+
+  eq(counts.merge_no_base, 0, "NOT keep_no_base — the bridge row is a real ancestor");
+  eq(counts.merge_adopted, 1, "master's out-of-band correction is adopted");
+  const row = sqlite
+    .prepare("SELECT content_json, verse_end, version FROM verses WHERE book = ? AND chapter = 7 AND verse = 5 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(JSON.parse(row.content_json).verseObjects[0].text, "master's corrected five and six", "…and landed");
+  eq(row.verse_end, 6, "the bridge grouping is preserved through the adoption");
+  eq(row.version, 5, "the adoption wrote a new version");
+}
+
+console.log("\n[#727: a verse absent from D1 is recreated ABOVE its edit_log high-water, never at version 1]");
+{
+  // A verse that once existed (and reached version 7 through edits, a bridge
+  // and a split) is gone from D1 — the bridge→split lifecycle deletes and
+  // re-mints rows — and tonight master still carries it. The reimport INSERT
+  // used to take the column default (1) and log new_version = 1, so a stale
+  // `If-Match: 1` in a tab's outbox would pass CAS against the recreated row.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  const key = `${BOOK}/40/1/${VERSION}`;
+  const log = sqlite.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+     VALUES ('verse', ?, ?, 1, ?, ?, ?, '{}', ?)`,
+  );
+  log.run(key, BOOK, null, 1, "create", 100);
+  log.run(key, BOOK, 1, 2, "update", 110);
+  log.run(key, BOOK, 2, 3, "update", 120);
+  log.run(key, BOOK, 3, 4, "update", 130);
+  log.run(key, BOOK, 4, 5, "update", 140);
+  log.run(key, BOOK, 5, 6, "bridge", 150);
+  log.run(key, BOOK, 6, 7, "split", 160);
+  const before = sqlite.prepare("SELECT COUNT(*) AS n FROM edit_log WHERE row_key = ?").all(key)[0].n;
+
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, [verse(40, 1, "recreated text")], null, null, false);
+
+  eq(counts.inserted, 1, "the absent verse is inserted");
+  const row = sqlite
+    .prepare("SELECT version, content_json FROM verses WHERE book = ? AND chapter = 40 AND verse = 1 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.version, 8, "version starts strictly above the edit_log high-water (7), not at the column default");
+  const audit = sqlite
+    .prepare("SELECT action, prev_version, new_version FROM edit_log WHERE row_key = ? ORDER BY id DESC LIMIT 1")
+    .all(key)[0];
+  eq(audit.action, "create", "the audit row is a 'create'");
+  eq(audit.new_version, 8, "…whose new_version matches the row's actual version");
+  eq(audit.prev_version, null, "…with no predecessor version");
+  eq(
+    sqlite.prepare("SELECT COUNT(*) AS n FROM edit_log WHERE row_key = ?").all(key)[0].n,
+    before + 1,
+    "exactly one audit row added",
+  );
+
+  // Control: a verse with NO history still starts at 1.
+  const fresh = await applyVerseRowsForTest(env, BOOK, VERSION, [verse(40, 2, "brand new")], null, null, false);
+  eq(fresh.inserted, 1, "a never-seen verse inserts");
+  const row2 = sqlite
+    .prepare("SELECT version FROM verses WHERE book = ? AND chapter = 40 AND verse = 2 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row2.version, 1, "…at version 1 when edit_log holds nothing for it");
+  const audit2 = sqlite
+    .prepare("SELECT new_version FROM edit_log WHERE row_key = ? ORDER BY id DESC LIMIT 1")
+    .all(`${BOOK}/40/2/${VERSION}`)[0];
+  eq(audit2.new_version, 1, "…and its audit row says 1 too");
 }
 
 if (failed > 0) {

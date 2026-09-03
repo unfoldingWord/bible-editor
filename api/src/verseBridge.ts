@@ -145,6 +145,48 @@ export const SPLIT_UPDATE_START_SQL = `UPDATE verses
  WHERE book = ?6 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9
    AND version = ?10 AND verse_end IS NOT NULL AND verse_end > verse`;
 
+// ── Version floor for a re-minted verse row ──────────────────────────────────
+//
+// SQL expression (not a statement) that evaluates to the version a verse row
+// must be (re)created at: strictly above BOTH the highest `new_version` its
+// row_key ever reached in edit_log AND a caller-supplied floor. A verse row's
+// primary key can be deleted and re-minted (bridge → split; a bridge deleting a
+// verse master still carries, which the nightly reimport then recreates). A
+// fresh row at the column default `version = 1` would let a stale outbox PATCH
+// still holding a pre-deletion `If-Match` pass the numeric CAS and silently
+// overwrite the recreated content; starting above the high-water makes every
+// such stale If-Match strictly less than the new version, so its CAS fails 409.
+//
+// Every argument is a SQL fragment spliced verbatim — a positional bind
+// (`?1`), a column/CTE reference (`v`), or a literal (`0`). `chapter` and
+// `verse` are CAST to INTEGER before concatenation because a REAL-bound number
+// renders as "5.0" under `||` and would never match the stored row_key
+// (`book/chapter/verse/bibleVersion`). `floor` is the lowest acceptable
+// predecessor (the bridge row's own version for a split; `0` when there is no
+// live predecessor, as on a reimport INSERT).
+//
+// The same expression is deliberately reused for the row's `version` AND for
+// its 'create' audit row's `new_version` inside one batch: both read edit_log
+// as it stood before either statement (the audit row is what would raise the
+// high-water, and it does not exist yet), so they agree by construction.
+// Shared by verses.ts's split (via the SPLIT_* constants below) and
+// bookReimport.ts's applyVerseRows INSERT; issue #727.
+export function verseVersionFloorSql(ref: {
+  book: string;
+  chapter: string;
+  verse: string;
+  bibleVersion: string;
+  floor: string;
+}): string {
+  const rowKey = `${ref.book} || '/' || CAST(${ref.chapter} AS INTEGER) || '/' || CAST(${ref.verse} AS INTEGER) || '/' || ${ref.bibleVersion}`;
+  return `MAX(
+       COALESCE((SELECT MAX(new_version) FROM edit_log
+                  WHERE kind = 'verse'
+                    AND row_key = ${rowKey}), 0),
+       ${ref.floor}
+     ) + 1`;
+}
+
 // SPLIT — insert ALL the seeded singleton verses in ONE statement, only if the
 // preceding statement in the batch landed (so a lost CAS inserts nothing).
 //
@@ -178,12 +220,7 @@ export const SPLIT_INSERT_VERSES_RANGE_SQL = `INSERT INTO verses
      UNION ALL SELECT v + 1 FROM split_seq WHERE v + 1 <= ?8
    )
    SELECT ?1, ?2, v, NULL, ?3, ?4, NULL,
-     MAX(
-       COALESCE((SELECT MAX(new_version) FROM edit_log
-                  WHERE kind = 'verse'
-                    AND row_key = ?1 || '/' || CAST(?2 AS INTEGER) || '/' || CAST(v AS INTEGER) || '/' || ?3), 0),
-       ?12
-     ) + 1,
+     ${verseVersionFloorSql({ book: "?1", chapter: "?2", verse: "v", bibleVersion: "?3", floor: "?12" })},
      ?5, ?6, ?9, ?10, ?11
      FROM split_seq
     WHERE changes() > 0`;
@@ -218,12 +255,7 @@ export const SPLIT_INSERT_EDITLOG_RANGE_SQL = `INSERT INTO edit_log
      UNION ALL SELECT v + 1 FROM split_seq WHERE v + 1 <= ?5
    )
    SELECT 'verse', ?1 || '/' || CAST(?2 AS INTEGER) || '/' || CAST(v AS INTEGER) || '/' || ?3, ?1, ?6, NULL,
-     MAX(
-       COALESCE((SELECT MAX(new_version) FROM edit_log
-                  WHERE kind = 'verse'
-                    AND row_key = ?1 || '/' || CAST(?2 AS INTEGER) || '/' || CAST(v AS INTEGER) || '/' || ?3), 0),
-       ?8
-     ) + 1,
+     ${verseVersionFloorSql({ book: "?1", chapter: "?2", verse: "v", bibleVersion: "?3", floor: "?8" })},
      'create', ?7
      FROM split_seq
     WHERE changes() > 0`;
@@ -243,3 +275,67 @@ export const DELETE_VERSE_STATUSES_RANGE_SQL = `DELETE FROM verse_statuses
 // Binds, in order: (book, chapter, fromVerse, toVerse).
 export const DELETE_VERSE_LANE_CHECKS_RANGE_SQL = `DELETE FROM verse_lane_checks
   WHERE book = ?1 AND chapter = ?2 AND verse >= ?3 AND verse <= ?4`;
+
+// ── Range overlap detection (issue #727) ─────────────────────────────────────
+//
+// A chapter's verse rows must cover DISJOINT ranges: `[verse, verse_end ?? verse]`
+// of any two rows may not intersect. Nothing structural enforces that — the
+// verses primary key is (book, chapter, verse, bible_version), so a `1-2` bridge
+// row and a standalone `2` row coexist happily in D1 — and usfm-js renders both
+// keys ("1-2" and "2") in the same chapter object without complaint, shipping
+// `\v 1-2` followed by `\v 2` to Door43. Both the export (buildUsfm) and the
+// nightly reimport's post-apply audit (applyVerseRows) call this so the corrupt
+// shape is REFUSED and COUNTED rather than published. Pure, so both call sites
+// share one definition and it is unit-testable without D1.
+
+// The minimal row shape the check needs; any VerseRow / D1 read row satisfies it.
+export interface VerseRangeRef {
+  verse: number;
+  verse_end: number | null;
+}
+
+// Human-readable range: "5" for a singleton, "5-7" for a bridge. Used by the
+// error below and by the reimport's log line, so the two read the same.
+export function formatVerseRange(r: VerseRangeRef): string {
+  const end = verseRangeEnd(r);
+  return end > r.verse ? `${r.verse}-${end}` : String(r.verse);
+}
+
+// Every pair of rows (from ONE chapter) whose ranges intersect, each pair
+// ordered (earlier-start, later-start). Sorted sweep: after ordering by start,
+// a row overlaps iff its start is ≤ the largest end seen so far, and the
+// offender is whichever earlier row holds that end. O(n log n); returns [] for
+// a clean chapter. Input order is irrelevant. Callers pass one chapter's rows —
+// this function does not (and cannot) partition by chapter itself.
+export function findOverlappingRanges<T extends VerseRangeRef>(rows: T[]): Array<{ a: T; b: T }> {
+  const sorted = [...rows].sort((x, y) => x.verse - y.verse || verseRangeEnd(x) - verseRangeEnd(y));
+  const out: Array<{ a: T; b: T }> = [];
+  let reach: T | null = null;
+  for (const r of sorted) {
+    if (reach != null && r.verse <= verseRangeEnd(reach)) out.push({ a: reach, b: r });
+    if (reach == null || verseRangeEnd(r) > verseRangeEnd(reach)) reach = r;
+  }
+  return out;
+}
+
+// Thrown by the export when a chapter's rows overlap. Typed (name +
+// structured fields) so exportWorkflow's per-`book × resource` step fails
+// loudly with a message that names exactly what to fix, and so a log/alert
+// reader can tell it apart from a DCS or parse failure. Message shape:
+//   verse_range_overlap: ZEC UST chapter 5 — 1-2 ∩ 2
+export class VerseRangeOverlapError extends Error {
+  readonly book: string;
+  readonly bibleVersion: string;
+  readonly chapter: number;
+  // Each entry is "a ∩ b" using formatVerseRange, e.g. "1-2 ∩ 2".
+  readonly overlaps: string[];
+  constructor(book: string, bibleVersion: string, chapter: number, pairs: Array<{ a: VerseRangeRef; b: VerseRangeRef }>) {
+    const overlaps = pairs.map((p) => `${formatVerseRange(p.a)} ∩ ${formatVerseRange(p.b)}`);
+    super(`verse_range_overlap: ${book} ${bibleVersion} chapter ${chapter} — ${overlaps.join(", ")}`);
+    this.name = "VerseRangeOverlapError";
+    this.book = book;
+    this.bibleVersion = bibleVersion;
+    this.chapter = chapter;
+    this.overlaps = overlaps;
+  }
+}

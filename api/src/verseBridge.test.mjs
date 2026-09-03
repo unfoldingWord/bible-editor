@@ -27,6 +27,8 @@ import {
   splitVerseNumbers,
   SPLIT_INSERT_EDITLOG_RANGE_SQL,
   SPLIT_INSERT_VERSES_RANGE_SQL,
+  findOverlappingRanges,
+  formatVerseRange,
   SPLIT_UPDATE_START_SQL,
   verseRangeEnd,
 } from "./verseBridge.ts";
@@ -58,6 +60,22 @@ eq(absorbedVerseNumbers({ verse: 2, verse_end: null }), [2], "absorbed singleton
 eq(absorbedVerseNumbers({ verse: 3, verse_end: 5 }), [3, 4, 5], "absorbed bridge range");
 eq(splitVerseNumbers({ verse: 1, verse_end: 2 }), [2], "split 1-2 mints verse 2");
 eq(splitVerseNumbers({ verse: 1, verse_end: 4 }), [2, 3, 4], "split 1-4 mints 2,3,4");
+
+// ── findOverlappingRanges (issue #727) ─────────────────────────────────────
+const R = (verse, verse_end = null) => ({ verse, verse_end });
+const pairs = (rows) => findOverlappingRanges(rows).map((p) => `${formatVerseRange(p.a)} ∩ ${formatVerseRange(p.b)}`);
+eq(formatVerseRange(R(5)), "5", "formatVerseRange singleton");
+eq(formatVerseRange(R(5, 7)), "5-7", "formatVerseRange bridge");
+eq(formatVerseRange(R(5, 5)), "5", "formatVerseRange degenerate verse_end==verse reads as singleton");
+eq(pairs([]), [], "empty chapter has no overlaps");
+eq(pairs([R(0), R(1), R(2, 3), R(4)]), [], "front matter + singleton + bridge + singleton, all disjoint");
+eq(pairs([R(1, 2), R(2)]), ["1-2 ∩ 2"], "the #727 shape: bridge 1-2 beside standalone 2");
+eq(pairs([R(2), R(1, 2)]), ["1-2 ∩ 2"], "…input order does not matter");
+eq(pairs([R(1, 3), R(2, 4)]), ["1-3 ∩ 2-4"], "two bridges sharing an interior verse");
+eq(pairs([R(1, 5), R(3), R(7)]), ["1-5 ∩ 3"], "a singleton inside a long bridge; the later singleton is clean");
+eq(pairs([R(1, 5), R(2), R(3)]), ["1-5 ∩ 2", "1-5 ∩ 3"], "every offender against the same reach is reported");
+eq(pairs([R(1, 2), R(3, 4), R(4)]), ["3-4 ∩ 4"], "the reach advances to the later bridge");
+eq(pairs([R(1), R(1, 2)]), ["1 ∩ 1-2"], "same start verse, singleton and bridge (impossible under the PK, still detected)");
 eq(splitVerseNumbers({ verse: 1, verse_end: null }), [], "splitting a non-bridge mints nothing");
 
 // mergeVerseObjects concatenates with a single space separator, mutating neither
