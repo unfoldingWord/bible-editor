@@ -19,16 +19,20 @@
 // in api.ts; the backoff spacing caps it at one refresh per cycle).
 
 import { refreshAuthOnce } from "./api";
+import { notifyOpen, type WsOpenHandlers, type WsOpenInfo } from "./wsOpen";
 
-export interface WsHandlers {
+export type { WsOpenInfo };
+
+export interface WsHandlers extends WsOpenHandlers {
   onEvent: (event: unknown) => void;
-  onOpen?: () => void;
-  // Fired on every `open` AFTER the first — i.e. only when a socket that had
-  // once been up came back. Events broadcast while the socket was down are
-  // gone (the room has no replay), so a subscriber that must not miss
-  // structural events (verse.bridged / verse.split) refetches here; the
-  // first open is deliberately excluded so mounting doesn't fetch twice.
-  onReconnect?: () => void;
+  // `onOpen(info)` fires on EVERY successful open, the first included, with
+  // `info.reconnect` saying whether an earlier socket had been up. Events the
+  // room broadcast before this socket was up (or while it was down) are gone
+  // — the room has no replay — so a subscriber that must not miss structural
+  // events (verse.bridged / verse.split) reconciles on every open, not just
+  // reconnects: the mount GET runs independently of the socket, so a change
+  // committed between its snapshot and the first `open` is otherwise lost.
+  // See wsOpen.ts. `onReconnect` (recoveries only) is a legacy convenience.
   onError?: (e: Event) => void;
 }
 
@@ -57,8 +61,8 @@ export function openChapterRoom(
   let socket: WebSocket | null = null;
   let backoffMs = INITIAL_BACKOFF_MS;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  // Has any socket in this subscription's lifetime reached `open`? Distinguishes
-  // the first connection from a reconnect for onReconnect.
+  // Has any socket in this subscription's lifetime reached `open`? Becomes
+  // `info.reconnect` on the next open (see wsOpen.ts).
   let everOpened = false;
 
   const scheduleReconnect = () => {
@@ -112,12 +116,17 @@ export function openChapterRoom(
     socket = ws;
     let opened = false;
     ws.addEventListener("open", () => {
+      // A socket disposed while still CONNECTING must never report an open:
+      // the subscriber's onOpen refetches the chapter, and after a chapter
+      // change this handler would belong to the PREVIOUS chapter's room. The
+      // spec already fails a connection closed before it is established, so
+      // this guard is belt-and-braces — but the wrong-chapter refetch is bad
+      // enough that we do not rely on the reading.
+      if (disposed) return;
       opened = true;
       backoffMs = INITIAL_BACKOFF_MS;
-      const isReconnect = everOpened;
+      notifyOpen(handlers, everOpened);
       everOpened = true;
-      handlers.onOpen?.();
-      if (isReconnect) handlers.onReconnect?.();
       // Start the heartbeat once we know the connection actually opened.
       pingTimer = setInterval(() => {
         if (ws.readyState !== WebSocket.OPEN) return;

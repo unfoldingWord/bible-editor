@@ -7,7 +7,7 @@
 // chapter changes.
 
 import { useEffect, useRef } from "react";
-import { openChapterRoom } from "../sync/wsClient";
+import { openChapterRoom, type WsOpenInfo } from "../sync/wsClient";
 import type { TnRow, TqRow, TwlRow, VerseDto, VerseStatus, LaneCheckState, VerseLaneCheck, CheckLane, TwlOrderLock, CommentDto } from "../sync/api";
 
 type RowKind = "tn" | "tq" | "twl";
@@ -54,11 +54,19 @@ export interface UseChapterRoomHandlers {
   // older server.
   onVerseBridged: (verse: VerseDto, removedVerse: number, absorbedVerses: number[], removedVersion?: number) => void;
   onVerseSplit: (verse: VerseDto, newVerses: VerseDto[]) => void;
-  // The socket came back after a drop. Anything broadcast meanwhile is lost
-  // (the room has no replay), so the caller should refetch the chapter rather
-  // than trust its map — a missed verse.bridged would leave a phantom verse.
-  // Not fired on the first open (the mount fetch already covers that).
-  onReconnect?: () => void;
+  // The socket for this chapter reached `open` — on the FIRST connection
+  // (`reconnect: false`) and on every recovery after a drop (`reconnect:
+  // true`). Anything the room broadcast while this tab had no open socket is
+  // lost (no replay), so the caller should issue a merging refetch on every
+  // open rather than trust its map: a missed verse.bridged leaves a phantom
+  // verse whose next save 404s; a missed verse.split hides new verses. The
+  // first open is included deliberately — the mount GET does not cover it,
+  // because it runs independently of the socket (see sync/wsOpen.ts).
+  //
+  // Per chapter by construction: the effect below tears the socket down on
+  // (book, chapter) change and wsClient drops any open from a disposed
+  // socket, so this never fires for a chapter that is no longer in view.
+  onOpen?: (info: WsOpenInfo) => void;
   onVerseStatusUpdate: (status: VerseStatus) => void;
   onLaneCheckUpdate: (check: LaneCheckState) => void;
   onLaneCheckBulkUpdate: (lane: CheckLane, checks: VerseLaneCheck[]) => void;
@@ -86,7 +94,7 @@ export function useChapterRoom(
 
   useEffect(() => {
     const cleanup = openChapterRoom(book, chapter, {
-      onReconnect: () => handlersRef.current.onReconnect?.(),
+      onOpen: (info) => handlersRef.current.onOpen?.(info),
       onEvent: (raw) => {
         const ev = raw as WireEvent | null;
         if (!ev || typeof ev.type !== "string") return;

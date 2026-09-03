@@ -176,7 +176,8 @@ export function replaySteps(state: ChapterData, steps: readonly StructureStep[])
 /**
  * Reconcile a refetched chapter payload with what the tab already holds.
  *
- * WHY. The reconnect refetch (Shell's `onReconnect`) fires on the same
+ * WHY. The WS open refetch (Shell's `onOpen`, every open incl. the first)
+ * in its reconnect case fires on the same
  * `online` moment that drains the outbox, so `GET chapter` and a pending
  * `PATCH verse` are in flight together. D1 can serve the GET before the PATCH
  * commits while the PATCH's 200 (v6) still reaches the tab before the GET's

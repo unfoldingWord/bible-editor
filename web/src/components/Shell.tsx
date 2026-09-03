@@ -405,19 +405,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     onVerseSplit: (verse, newVerses) => {
       applyLocalVerseSplit(verse, newVerses);
     },
-    // Events broadcast while the socket was down are gone for good; a missed
-    // verse.bridged would leave a phantom verse whose next save 404s. Refetch
-    // (in place — `data` stays rendered while it loads) rather than trust the
-    // map. First open is excluded by the client, so mounting fetches once.
+    // Events broadcast while this tab had no open socket are gone for good; a
+    // missed verse.bridged would leave a phantom verse whose next save 404s, a
+    // missed verse.split would hide new verses. Refetch (in place — `data`
+    // stays rendered while it loads) rather than trust the map.
     //
-    // Merging, not replacing: this fires on the same `online` moment that
-    // drains the outbox, so the GET races the tab's own PATCHes. A verse held
-    // at an equal-or-newer version stays (the PATCH landed, or is pending with
-    // optimistic content); a stale GET body must not regress it into a 409
-    // against the user's own save. The other refetch callers (TWL order
+    // On EVERY open, the first included. The mount GET (useChapter) starts
+    // independently of the socket, so a structural change committed after
+    // its snapshot but before the socket's first `open` was invisible to the
+    // tab until a reload. Invariant: the verse map derives from a snapshot
+    // taken after the subscription was established, or is reconciled by a
+    // merging refetch issued after it. Cost: if the mount GET already landed
+    // when the socket opens, this is a second GET of the same chapter — the
+    // price of correctness, deliberately not avoided with timestamps. If the
+    // mount GET is still in flight, `refetch` aborts and restarts it, so the
+    // chapter is still fetched once (see useChapter.refetch).
+    //
+    // Merging, not replacing: a reconnect fires on the same `online` moment
+    // that drains the outbox, so the GET races the tab's own PATCHes. A verse
+    // held at an equal-or-newer version stays (the PATCH landed, or is pending
+    // with optimistic content); a stale GET body must not regress it into a
+    // 409 against the user's own save. The other refetch callers (TWL order
     // unlock, pipeline Refresh, Door43 import) keep the plain replace — they
     // refetch because the server changed versions out from under the tab.
-    onReconnect: () => {
+    onOpen: () => {
       void refetch({ keepNewerLocal: true });
     },
     onVerseStatusUpdate: (status) => {

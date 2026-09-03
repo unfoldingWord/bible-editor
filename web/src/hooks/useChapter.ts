@@ -36,9 +36,10 @@ export interface RefetchOptions {
   /**
    * Merge the fetched payload with the current one instead of replacing it:
    * a verse the tab holds at an equal-or-newer version stays (see
-   * lib/verseStructure.ts `mergeRefetched`). For the WS reconnect refetch,
-   * which races the outbox drain on the same `online` moment — a stale GET
-   * must not regress a verse the tab's own PATCH just advanced. Every other
+   * lib/verseStructure.ts `mergeRefetched`). For the WS open refetch (Shell's
+   * `onOpen`, every open incl. the first), whose reconnect case races the
+   * outbox drain on the same `online` moment — a stale GET must not regress a
+   * verse the tab's own PATCH just advanced. Every other
    * caller wants the plain replace (default): they refetch precisely because
    * the server changed rows/versions out from under the tab.
    */
@@ -123,7 +124,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // it back. Replay is idempotent — every step is version-gated (see
   // lib/verseStructure.ts `StructureStep`).
   //
-  // One queue, owned by the LATEST request: a second reconnect refetch while
+  // One queue, owned by the LATEST request: a second open refetch while
   // the first is in flight aborts the first (fetchCtrl) and inherits the
   // queue — steps the first collected are either newer than the second GET's
   // rows (and kept by the merge anyway) or stale echoes (no-ops on replay).
@@ -134,6 +135,17 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   const refetch = useCallback(async (opts?: RefetchOptions) => {
     // Abort any in-flight retry loop from a previous (book, chapter) before
     // starting a new one — otherwise stale data could land after navigation.
+    //
+    // This is also what makes the WS first-open refetch (Shell's `onOpen`)
+    // safe when it overlaps the mount fetch below: the mount GET is aborted
+    // here and this later request — issued after the room subscription was
+    // established — replaces it, so the chapter is still fetched once and
+    // the snapshot that lands postdates the subscription. The aborted
+    // request's `catch` sees `fetchCtrl.current !== ctrl` and returns without
+    // touching status/error (fetchWithRetry rethrows on abort, no retry), and
+    // this request drives `status` loading → ready, so there is no stuck
+    // spinner and no AbortError flash. With `prev` still null (the mount
+    // effect cleared it), `mergeRefetched` is a plain replace.
     fetchCtrl.current?.abort();
     const ctrl = new AbortController();
     fetchCtrl.current = ctrl;
