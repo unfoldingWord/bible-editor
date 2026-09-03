@@ -386,7 +386,8 @@ function verseDb() {
   );
   d.exec(`CREATE TABLE verses (
     book TEXT, chapter INTEGER, verse INTEGER, bible_version TEXT, version INTEGER,
-    content_json TEXT, plain_text TEXT, updated_at INTEGER, updated_by INTEGER
+    content_json TEXT, plain_text TEXT, updated_at INTEGER, updated_by INTEGER,
+    last_change_action TEXT, last_change_source TEXT, last_change_actor TEXT
   )`);
   // Migration 0023's real schema, for the #626 resolved-banner-clear tests below.
   d.exec(`CREATE TABLE system_alerts (
@@ -443,7 +444,7 @@ function clearResolvedBanner(d, book, resource, raceHook) {
 function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, now, contentJson = "{}" }) {
   const verseRes = d
     .prepare(VERSE_PATCH_UPDATE_SQL)
-    .run(contentJson, null, now, userId, book, chapter, verse, resource.toUpperCase(), matchVersion);
+    .run(contentJson, null, now, userId, "update", "user", "test-actor", book, chapter, verse, resource.toUpperCase(), matchVersion);
   const resolveRes = d
     .prepare(RESOLVE_VERSE_MERGE_CONFLICT_SQL)
     .run(now, userId, book, resource, chapter, verse);

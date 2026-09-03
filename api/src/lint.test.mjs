@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import usfm from "usfm-js";
-import { lintChapterOpeningMarkers, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint.ts";
+import { lintChapterOpeningMarkers, lintOrphanedBlankText, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint.ts";
 
 let passed = 0;
 function t(name, fn) {
@@ -674,6 +674,65 @@ t("corrupt intro content_json does not throw and still flags", () => {
   assert.equal(lintChapterOpeningMarkers(rows).length, 1);
 });
 
+// Orphaned text after a `\b` blank line (ECC 2:14 / 3:14). Built from real
+// usfm-js output so the node placement matches production: `\b` then bare text
+// parses as a `{type:"paragraph",tag:"b"}` node followed by a `{type:"text"}`
+// node with no `\p`/`\q` between them.
+const verseRow = (usfmText, { chapter = 2, verse = 14 } = {}) => {
+  const j = usfm.toJSON(`\\c ${chapter}\n\\v ${verse} ${usfmText}\n`);
+  const val = j.chapters[String(chapter)][String(verse)];
+  return [{ book: "ECC", chapter, verse, verse_end: null, bible_version: "ULT", version: 1,
+    content_json: JSON.stringify({ verseObjects: val.verseObjects }) }];
+};
+
+t("text after a \\b with no paragraph marker is flagged (ECC 2:14)", () => {
+  const rows = verseRow("The wise, his eyes are in his head,\n\\q2 but the fool in the darkness is walking.\n\\b\nBut I know, even I, that one happening will happen to both of them.\n\\b");
+  const i = lintOrphanedBlankText(rows);
+  assert.equal(i.length, 1);
+  assert.equal(i[0].check, "Blank line without paragraph");
+  assert.equal(i[0].bucket, "flag");
+  assert.equal(i[0].ref, "2:14");
+});
+t("a \\b followed by a real \\p (well-formed) does not flag", () => {
+  const rows = verseRow("first line\n\\b\n\\p second paragraph");
+  assert.equal(lintOrphanedBlankText(rows).length, 0);
+});
+t("a \\b followed by a \\q1 (well-formed poetry) does not flag", () => {
+  const rows = verseRow("first line\n\\b\n\\q1 a poetic line");
+  assert.equal(lintOrphanedBlankText(rows).length, 0);
+});
+t("a trailing \\b with nothing after it does not flag", () => {
+  const rows = verseRow("just some text\n\\b");
+  assert.equal(lintOrphanedBlankText(rows).length, 0);
+});
+t("ordinary text with no \\b does not flag", () => {
+  const rows = verseRow("\\q1 The wise, his eyes are in his head,\n\\q2 but the fool in the darkness is walking.");
+  assert.equal(lintOrphanedBlankText(rows).length, 0);
+});
+t("a \\ts\\* after the \\b opens a fresh line for the text, so it does not flag", () => {
+  // A chunk divider opens its own line for the following text, exactly as the
+  // renderer does (segmentByParagraphs pushes a fresh segment after \ts\*), so
+  // the text is not stranded in the blank block. All three divider shapes.
+  for (const ts of [{ tag: "ts\\*" }, { tag: "ts*" }, { tag: "ts", content: "\\*" }]) {
+    const rows = [{ book: "ECC", chapter: 2, verse: 14, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [
+        { type: "paragraph", tag: "b" },
+        ts,
+        { type: "text", text: "back on a real line" },
+      ] }) }];
+    assert.equal(lintOrphanedBlankText(rows).length, 0, `divider shape ${JSON.stringify(ts)} should open a fresh line`);
+  }
+});
+t("only one flag per verse even with several orphaned nodes", () => {
+  const rows = [{ book: "ECC", chapter: 3, verse: 14, verse_end: null, bible_version: "ULT", version: 1,
+    content_json: JSON.stringify({ verseObjects: [
+      { type: "paragraph", tag: "b" },
+      { type: "text", text: "orphan one " },
+      { type: "word", tag: "w", text: "orphan-two" },
+    ] }) }];
+  assert.equal(lintOrphanedBlankText(rows).length, 1);
+});
+
 // The export no longer HOLDs a book for a blank required field (DCS raises all
 // five at severity="warning" and merges anyway), so this in-app lint is the ONLY
 // thing that tells an editor the row is broken. Assert every kind still flags,
@@ -1028,6 +1087,19 @@ t("merge_no_base flags also carry dismissible + door43 + ours", () => {
   assert.ok(flag);
   assert.equal(flag.dismissible, true);
   assert.deepEqual(flag.door43, { note: "x" });
+});
+t("a snapshot holding only _meta bookkeeping yields door43 null, not a row of blanks (#683)", () => {
+  // #683's auto-clear memo synthesizes exactly this container on a pre-#653
+  // flag, which by definition never captured master's values. Returning `{}`
+  // would render a Door43 side whose every field is empty — a claim about what
+  // Door43 holds that nobody ever measured.
+  const i = lintTnRows([
+    tn({ review_kind: "merge_no_base", review_master_json: JSON.stringify({ _meta: { clear_blocked_sha: "abc123" } }) }),
+  ]);
+  const flag = i.find((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.door43, null);
+  assert.equal(flag.dismissible, true, "still dismissible — only the phantom Door43 side is suppressed");
 });
 t("non-review issues never carry dismissible/door43/ours", () => {
   const i = lintTnRows([tn({ note: "text] more", review_kind: null })]);

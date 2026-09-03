@@ -74,7 +74,13 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
-import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
+import {
+  runChunkedReimport,
+  storedResourceSha,
+  retireMergeKeptFlags,
+  sweepStaleMergeNoBase,
+  ALL_RESOURCES as REIMPORT_RESOURCES,
+} from "./bookReimport";
 import { dcsResourceFile, fetchDcsMasterText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import { gitBlobSha } from "./ownPublish";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
@@ -330,6 +336,58 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           } catch {
             /* alert is best-effort; never let it abort the export run */
           }
+        }
+      }
+
+      // 1b-ii. Retire stale merge_no_base flags on books this run never walked
+      //        (#683). The per-book work above only reaches #665's auto-clear
+      //        for a (book, resource) whose master file moved, so a book that
+      //        stops changing keeps showing translators an "Unmerged Door43
+      //        edit — verify" warning the system itself can measure false — 12
+      //        of them in prod on 2026-09-01, on AMO and ECC. This sweep asks
+      //        "which books still carry a flag" instead of "which did we sync";
+      //        see sweepStaleMergeNoBase for the budget cap and why it does NOT
+      //        subtract the run's own book list.
+      //
+      //        Its own step.do, at the same altitude as "locked-books" below:
+      //        one retryable unit, and once per run rather than per book. (Its
+      //        cost is small either way — a handful of D1 reads and at most
+      //        ~60 Gitea fetches; whether a step.do gets a fresh subrequest
+      //        budget is not something this repo has verified.)
+      //
+      //        TWO GATES beyond the enclosing one, both narrowing:
+      //
+      //        `!params.dryDcs` — the enclosing `dcsAllowed || reimportOnly`
+      //        lets a dryDcs + reimportOnly run through, and dryDcs means "do
+      //        not touch Door43 or push anything live". The sweep both walks
+      //        Door43 and writes D1, so it must not run there (Codex F6).
+      //
+      //        FULL NIGHTLY ONLY — no `book`, no `resource`, no `resources`.
+      //        The sweep's whole point is to reach pairs the run did NOT visit,
+      //        so under a scoped admin run ("Pull from Door43" for one book) it
+      //        would clear flags on up to ten unrelated pairs the operator
+      //        never asked about (Codex F7). Both crons (05:30 export, 08:00
+      //        self-heal) are unscoped and so both sweep; with the CAP-per-day
+      //        rotation stride they land on the same day's slice, and the memo
+      //        makes the second pass cheap — waste, not harm.
+      //
+      //        try/catch because a warning that failed to clear is not a reason
+      //        to abandon the export that follows.
+      const sweepScopeIsFullNightly = !params.book && !params.resource && !params.resources?.length;
+      if (!params.dryDcs && sweepScopeIsFullNightly) {
+        try {
+          await step.do("sweep-stale-review-flags", async () => {
+            const noBase = await sweepStaleMergeNoBase(this.env);
+            // Same gates, same step: `merge_kept` is a retired flag kind, and
+            // every standing one was minted on the measurement that retired it
+            // (see retireMergeKeptFlags). D1-only — no Door43 walk.
+            const kept = await retireMergeKeptFlags(this.env);
+            return { noBase, kept };
+          });
+        } catch (e) {
+          console.error("export stale review-flag sweep failed", {
+            error: e instanceof Error ? e.message : String(e),
+          });
         }
       }
     }
@@ -1252,6 +1310,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
 
     await this.recordSnapshot(book, resource, branch, dcsCommitSha, built.rowCount, dcsSkippedReason, prNumber, prError);
+    // The PR that will merge THE render recordPushedRender just recorded, tied to
+    // it by its readAt — see recordPushedPr for why a snapshot-time lookup is
+    // not a substitute.
+    if (prNumber != null) await this.recordPushedPr(book, resource, built.readAt, prNumber);
 
     return {
       book,
@@ -1460,7 +1522,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   ): Promise<void> {
     // Delegates to the shared helper (twlSortOrderApply.ts) so the export and the
     // reimport canonical post-pass write sort_order identically.
-    await applyTwlSortOrderUpdates(this.env.DB, book, updates);
+    //
+    // #686 review F2: 'system', NOT 'dcs_sync'. This order is computed HERE,
+    // from the ULT alignment in D1, by our own nightly — Door43 neither sent it
+    // nor asked for it, and the export writes it back before pushing. Labelling
+    // it a Door43 sync would tell a translator that Door43 reordered her rows
+    // when Bible Editor did, which is precisely the mislabel these columns
+    // exist to remove. 'reorder' rather than 'sync_reorder' for the same
+    // reason: 'sync_reorder' means "master's file order won", and this is not
+    // that. Unattended, so there is no username to name — the actor names the
+    // job instead.
+    await applyTwlSortOrderUpdates(this.env.DB, book, updates, {
+      action: "reorder",
+      source: "system",
+      actor: "nightly TWL canonical reorder",
+    });
   }
 
   // Delete branches this export's branch replaces. Sources:
@@ -1578,6 +1654,43 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       console.error("export conflict-recovery failed", { book, resource, repo, branch, error: detail });
       await this.recordPrConflictAlert(book, resource, repo, branch, detail.slice(0, 120));
       return null;
+    }
+  }
+
+  // Records which export PR carries the render recordPushedRender just stored
+  // (migration 0061's pushed_pr_number), so the nightly sync can find that
+  // render's MERGE on master by the `(#N)` Gitea appends to a squash commit and
+  // measure the bytes it landed (bookReimport.ts accountOwnPublishDecline).
+  //
+  // Guarded on `pushed_read_at = readAt`: two exports of the same pair can
+  // overlap and finish out of order — B's newer render wins recordPushedRender's
+  // monotonic guard, then slower A opens its PR and reaches here afterwards. A
+  // must NOT stamp its PR over B's render, or the sync would compare A's merge
+  // against B's blob and read a preserved merge as a rewrite (Codex verify pass
+  // on PR #704: the snapshot-order lookup this replaces had exactly that hole).
+  // `pushed_pr_read_at` is written alongside, so the sync can tell that the PR
+  // belongs to the render currently on the row: recordPushedRender advances
+  // pushed_read_at for a newer render WITHOUT clearing these two columns (that
+  // statement is the watermark stamp and must not depend on migration 0061), so
+  // until the newer PR is stamped — or for good, if its creation fails — the
+  // number here is the previous render's. Best-effort: a failed stamp leaves the
+  // columns as they were, which the sync reads as "no PR on record for this
+  // render → nothing to measure", never as a match or a mismatch.
+  private async recordPushedPr(book: string, resource: Resource, readAt: number, prNumber: number): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        `UPDATE book_resource_syncs SET pushed_pr_number = ?3, pushed_pr_read_at = ?4
+          WHERE book = ?1 AND resource = ?2 AND pushed_read_at = ?4`,
+      )
+        .bind(book, resource, prNumber, readAt)
+        .run();
+    } catch (e) {
+      console.error("export pushed-PR stamp failed (migration 0061 unapplied?)", {
+        book,
+        resource,
+        prNumber,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 

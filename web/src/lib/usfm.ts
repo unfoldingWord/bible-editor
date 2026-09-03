@@ -32,6 +32,15 @@ export function extractPlainText(verseObjects: unknown): string {
         if (typeof v.text === "string") parts.push(v.text);
         continue;
       }
+      // Header/reference/label nodes (`\s1`, `\sp`, `\sr`, `\r`, `\cl`, …)
+      // live in the header band (splitSectionHeaders), not the verse body —
+      // skip their label text here. Section-heading tags are already
+      // excluded by construction (their text is parked on `content`, which
+      // this walk never reads), but `\sp` parks its label on `text` exactly
+      // like a line marker's same-line text, so without this it leaks into
+      // plain_text. `\d` (Psalm superscription) is deliberately NOT in this
+      // set — its text IS alignable Hebrew and must keep flowing through.
+      if (isHeaderLabelNode(vo)) continue;
       if (typeof v.text === "string") parts.push(v.text);
       if (Array.isArray(v.children)) walk(v.children);
     }
@@ -47,14 +56,87 @@ export function extractPlainText(verseObjects: unknown): string {
 
 // In-flow paragraph / poetry / blank markers. These have no text payload
 // (they're position-anchors only) and survive verseObjects round-trips
-// as `{type:"paragraph", tag}` nodes. The display layer turns them into
-// visual line breaks / indents; the edit layer surfaces them as visible
-// literal `\p`/`\q1` tokens so users can add/remove them.
+// as `{type:"paragraph", tag}` (paragraph family) or `{type:"quote", tag}`
+// (poetry family) nodes. The display layer turns them into visual line
+// breaks / indents; the edit layer surfaces them as visible literal
+// `\p`/`\q1` tokens so users can add/remove them.
+//
+// This is the ONE canonical set. The other consumers that decide
+// "marker vs word" derive from it: alignment.ts's LINE_TEXT_MARKER_TAGS
+// IS this set, and replace.ts's MARKER_TOKEN_RE is asserted against it by
+// a consistency test (marker.test.mjs). When a marker in this class is
+// missing here it gets mistaken for an alignable word on the edit
+// round-trip — the `\pmo` bug (issue #702): a proofreader's embedded-text
+// marker showed up as a draggable word to align.
+//
+// Coverage note: the `\p`-family embedded/margin/letter markers below are
+// the ones present in production ULT/UST (`\pm`, `\pmo`, `\pmc`) plus
+// their USFM 3.1 siblings (`\pmr`, `\po`, `\pr`, `\cls`), all of which
+// usfm-js parses as `type:"paragraph"` exactly like `\p`. `\qa` acrostic
+// headings are handled OUT of this set (see isAcrosticHeading, #708): their
+// text is a heading LABEL, not alignable verse body, so they must never be
+// tokenized as `\w` words. The list family (`\li*`/`\lh`/`\lf`/`\lim*`) IS in
+// this set (see LIST_TAGS / #709): usfm-js gives those NO `type` field, so
+// liftMarkerText normalizes them to `type:"paragraph"` line markers first —
+// after that they behave exactly like `\p`. Markers still NOT covered:
+// `\qr`/`\qc`/`\qd` poetry variants not seen in the current corpus.
+//
+// List family (USFM 3.1). usfm-js parses these WITHOUT a `type` field —
+// `\li1 x` → {tag:"li1", content:"x"}, `\lh`/`\lf`/`\lim*` → {tag, text:"x"} —
+// so every type-based predicate skipped them and the marker was dropped (its
+// text lost or minted as `\w` words). liftMarkerText normalizes each to a
+// `type:"paragraph"` line marker plus a following text node, so they flow
+// through the same machinery as `\p` (render, edit round-trip, drift, export).
+export const LIST_TAGS: ReadonlySet<string> = new Set([
+  "li", "li1", "li2", "li3", "li4",
+  "lim", "lim1", "lim2", "lim3", "lim4",
+  "lh", "lf",
+]);
+
 export const PARAGRAPH_TAGS: ReadonlySet<string> = new Set([
   "p", "m", "mi", "nb", "pi", "pi1", "pi2", "pi3", "pc",
+  "pm", "pmo", "pmc", "pmr", "po", "pr", "cls",
   "q", "q1", "q2", "q3", "q4", "qm", "qm1", "qm2", "qm3",
+  "li", "li1", "li2", "li3", "li4",
+  "lim", "lim1", "lim2", "lim3", "lim4",
+  "lh", "lf",
   "b",
 ]);
+
+// The list-family tag of `node`, or null. Tag-based (usfm-js gives these no
+// `type`), so it matches the raw shape; after liftMarkerText normalizes them to
+// `type:"paragraph"` it still matches (idempotent — a re-lift is a no-op).
+export function listMarkerTag(node: unknown): string | null {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return null;
+  const tag = o["tag"];
+  return typeof tag === "string" && LIST_TAGS.has(tag) ? tag : null;
+}
+
+// Acrostic heading markers. `\qa` labels the stanzas of an acrostic poem with
+// the Hebrew letter that begins them (Psalm 119's Aleph/Beth/…, the acrostics
+// of Lamentations). usfm-js parses `\qa Aleph` as `{type:"quote", tag:"qa",
+// text:"Aleph"}` — same `type:"quote"` as a `\q1` poetry LINE, which is why
+// isInFlowMarker matches it and it DRIFTS to the verse it introduces like any
+// line marker (that behaviour is kept). But its text is a heading LABEL, not
+// verse body: it must never be surfaced as editable text or minted into a
+// draggable `\w` word (the #702 failure, but here the payload is a label — see
+// #708). So `\qa` is deliberately OUT of PARAGRAPH_TAGS / LINE_TEXT_MARKER_TAGS
+// / MARKER_TOKEN_RE, and instead handled as a heading: liftMarkerText moves its
+// label to `content` (invisible to the word/diff walkers, exactly as `\s1`
+// section text lives in `content`), extractEditableText skips it, reconcileMarkers
+// keeps it as a content node, and the renderer draws it as a heading band.
+export const ACROSTIC_HEADING_TAGS: ReadonlySet<string> = new Set(["qa"]);
+
+// True iff `node` is a `\qa` acrostic heading. Tag-based (not type-based) so it
+// matches both the raw usfm-js shape (`type:"quote"`, label on `text`) and our
+// normalized shape (label moved to `content` by liftMarkerText).
+export function isAcrosticHeading(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  const tag = o["tag"];
+  return typeof tag === "string" && ACROSTIC_HEADING_TAGS.has(tag);
+}
 
 // Section heading tags that are translator-supplied and NOT alignable to
 // source words. Rendered as separate header bands above the verse body.
@@ -62,6 +144,34 @@ export const PARAGRAPH_TAGS: ReadonlySet<string> = new Set([
 // alignable Hebrew — explicitly EXCLUDED from this set so it stays in
 // the verse body alongside its `\zaln-s` children.
 export const SECTION_HEADER_TAGS: ReadonlySet<string> = new Set(["s1", "s2", "s3", "s4", "ms", "ms1", "ms2"]);
+
+// Header/reference/label markers usfm-js parses WITHOUT a `type` field at
+// all (unlike `\s1`-`\s4`/`\ms*`, which carry `type:"section"`) — `\sp`
+// (speaker label, parked on `text`), `\sr` (section reference range),
+// `\r` (parallel passage reference), `\cl` (chapter label) — the latter
+// three parked on `content`. Same treatment as SECTION_HEADER_TAGS: hoisted
+// out of the verse body into the header-band affordance, never alignable
+// verse text. See #710. Deliberately EXCLUDES `\s5` (legacy chunk marker,
+// also typeless in some usfm-js shapes but structurally a chunk BOUNDARY,
+// not a label — bucketing it here would render an empty header band for
+// every occurrence).
+export const HEADER_LABEL_TAGS: ReadonlySet<string> = new Set(["sp", "sr", "r", "cl"]);
+
+// True iff `node` is a hoistable header/reference/label node — the union of
+// SECTION_HEADER_TAGS (`type:"section"`) and HEADER_LABEL_TAGS (no `type`
+// field). The ONE predicate every "this lives in the header band, not the
+// verse body" call site shares (splitSectionHeaders here, the editable-text
+// skip below, segmentByParagraphs in highlight.ts, saveSectionEdit in
+// Shell.tsx) so they can't drift apart the way the #702 p-family allowlists
+// did.
+export function isHeaderLabelNode(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o || typeof o["tag"] !== "string") return false;
+  const tag = o["tag"] as string;
+  if (o["type"] === "section") return SECTION_HEADER_TAGS.has(tag);
+  if (o["type"] !== undefined) return false;
+  return HEADER_LABEL_TAGS.has(tag);
+}
 
 export interface SectionHeader {
   tag: string;
@@ -74,8 +184,9 @@ export interface SplitContent {
 }
 
 // Split a verse's verseObjects into:
-//   - sections: leading `\s1`/`\s2`/`\s3` heading nodes, hoisted out
-//     for separate header-band rendering. Source-unalignable.
+//   - sections: leading `\s1`/`\s2`/`\s3` heading nodes (plus the typeless
+//     `\sp`/`\sr`/`\r`/`\cl` label family — see isHeaderLabelNode), hoisted
+//     out for separate header-band rendering. Source-unalignable.
 //   - body: everything else, preserved in original order (paragraph
 //     markers, words, milestones, `\d` Psalm superscriptions).
 // USFM places section headers before the verse they introduce, so in
@@ -87,15 +198,10 @@ export function splitSectionHeaders(verseObjects: unknown[] | undefined | null):
   if (!Array.isArray(verseObjects)) return { sections, body };
   for (const node of verseObjects) {
     const o = node as Record<string, unknown> | null;
-    if (
-      o &&
-      o["type"] === "section" &&
-      typeof o["tag"] === "string" &&
-      SECTION_HEADER_TAGS.has(o["tag"] as string)
-    ) {
+    if (o && isHeaderLabelNode(o)) {
       // usfm-js stores the heading text as `content` on \s* nodes (not
-      // `text`, which is what \d uses). Try both — strip trailing newline
-      // that usfm-js often appends.
+      // `text`, which is what \d uses); `\sp` parks its label on `text`.
+      // Try both — strip trailing newline that usfm-js often appends.
       const raw = String(o["content"] ?? o["text"] ?? "");
       sections.push({
         tag: o["tag"] as string,
@@ -202,6 +308,43 @@ export function liftMarkerText(verseObjects: unknown[]): unknown[] {
   const out: unknown[] = [];
   for (const node of verseObjects) {
     const o = node as Record<string, unknown> | null;
+    // A `\qa` acrostic heading (`\qa Aleph`) is `type:"quote"` too, so
+    // isInFlowMarker matches it — but its `text` is a heading LABEL, not verse
+    // body. Move that label to `content` (mirroring how `\s1` section text
+    // lives in `content`) so it is INVISIBLE to the word/diff walkers that read
+    // `text` only (walkLeaves / rebuildRaw / extractPlainText) — the label can
+    // then never be minted into a draggable `\w` word on the edit round-trip
+    // (#708). Keep `type:"quote"` so the heading still drifts to the verse it
+    // introduces. Idempotent: a node already carrying its label on `content`
+    // (post-save, or a second lift) is passed through untouched.
+    if (o && isAcrosticHeading(o)) {
+      if (typeof o["text"] === "string" && o["text"] !== "") {
+        const { text, ...rest } = o;
+        out.push({ ...rest, content: String(text).replace(/\n+$/, "") });
+      } else {
+        out.push(node);
+      }
+      continue;
+    }
+    // \li*/\lh/\lf/\lim* list family. usfm-js gives these NO `type` field, so
+    // every type-based predicate (isInFlowMarker, the renderer, the edit round-
+    // trip) skipped them — the marker was dropped and its text lost or minted as
+    // `\w` words (#709). Normalize to a `type:"paragraph"` line marker so all
+    // that machinery just works, exactly as the `\p`-family already does. The
+    // item text usfm-js parked on `content` (bare `\li1 text`) or `text`
+    // (`\lh`/`\lf`/`\lim*`) is lifted into a following text node so it is
+    // alignable verse body, like the text after a `\p`. A marker with neither
+    // (aligned content already broke out into sibling `\w`/`\zaln` nodes, or a
+    // standalone `\li1`) just gets its `type`. toUSFM round-trips all of these
+    // losslessly. Idempotent: a normalized `{type:"paragraph",tag:"li1"}` has no
+    // content/text, so a re-lift adds no sibling and leaves it unchanged.
+    if (o && listMarkerTag(o)) {
+      const { content, text, type: _type, ...rest } = o;
+      const label = typeof content === "string" ? content : typeof text === "string" ? text : "";
+      out.push({ ...rest, type: "paragraph" });
+      if (label !== "") out.push({ type: "text", text: label });
+      continue;
+    }
     // A character wrapper (`\qs Selah\qs*`) is `type:"quote"` so isInFlowMarker
     // matches it, but its `text` is CONTENT held between `\qs … \qs*`, not a
     // quote parked on a line marker. Lifting it would move the word OUTSIDE the
@@ -348,14 +491,37 @@ export function normalizeEditable(s: string): string {
 // the BASELINE for diffing edits in the active-verse contenteditable
 // when markers are surfaced as chips — the chip's textContent is
 // exactly "\p" / "\q1", so the captured textContent stream lines up
-// with this representation. Section-heading nodes (\s1/\s2/\s3) are
-// skipped — they live in a separate header band.
+// with this representation. Header/reference/label nodes (\s1/\s2/\s3,
+// \sp, \sr, \r, \cl, …) are skipped — they live in a separate header band.
 export function extractEditableText(verseObjects: unknown): string {
   const parts: string[] = [];
   const walk = (vos: unknown[]): void => {
     for (const vo of vos ?? []) {
       if (!vo || typeof vo !== "object") continue;
       const v = vo as Record<string, unknown>;
+      // `\qa` acrostic headings are heading LABELS, not editable verse text.
+      // Skip them entirely (like the `\s*` section headers below) so neither the
+      // `\qa` marker nor its "Aleph"/"Beth" label enters the edit baseline — and
+      // so it stays consistent with the editable render, which draws the heading
+      // OUTSIDE the captured contenteditable text. The heading survives the save
+      // because reconcileMarkers keeps it as a content node (#708).
+      if (isAcrosticHeading(v)) continue;
+      // \li*/\lh/\lf/\lim* list family (#709). usfm-js gives these no `type`, so
+      // the isInFlowMarker branch below misses them: emit the literal marker
+      // token here so the edit baseline matches the lifted editable render
+      // (segmentByParagraphs normalizes them to `type:"paragraph"` chips). The
+      // item text usfm-js parked on `content` (bare `\li1 text`) or `text`
+      // (`\lh`/`\lf`/`\lim*`) is surfaced as ordinary editable text — alignable
+      // verse body, like the text after a `\p`. A bare marker whose aligned
+      // content is in sibling `\w`/`\zaln` nodes carries neither here; those
+      // siblings emit their own text via the normal recursion below.
+      const listTag = listMarkerTag(v);
+      if (listTag) {
+        parts.push(`\\${listTag} `);
+        const label = typeof v["content"] === "string" ? v["content"] : typeof v["text"] === "string" ? v["text"] : "";
+        if (label) parts.push(String(label));
+        continue;
+      }
       // Character-style wrappers (`\qs Selah\qs*`) are also `type:"quote"`, so
       // isInFlowMarker matches them — but they hold aligned verse CONTENT, not a
       // line break. Fall through to the generic text/children recursion below so
@@ -376,13 +542,14 @@ export function extractEditableText(verseObjects: unknown): string {
         }
         continue;
       }
-      if (
-        v["type"] === "section" &&
-        typeof v["tag"] === "string" &&
-        SECTION_HEADER_TAGS.has(v["tag"] as string)
-      ) {
-        continue;
-      }
+      // Header/reference/label nodes (`\s1`, `\sp`, `\sr`, `\r`, `\cl`, …)
+      // live in a separate header band, edited through its own affordance
+      // (saveSectionEdit) — never through this contentEditable diff. `\sp`
+      // parks its label on `text` exactly like a marker's same-line text; the
+      // isHeaderLabelNode check must come BEFORE the generic `v["text"]` read
+      // below or that label leaks into the baseline with no marker token
+      // around it (the extractPlainText half of the same bug, #710).
+      if (isHeaderLabelNode(v)) continue;
       if (typeof v["text"] === "string") parts.push(v["text"] as string);
       if (Array.isArray(v["children"])) walk(v["children"] as unknown[]);
     }

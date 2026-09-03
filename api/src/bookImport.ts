@@ -22,12 +22,13 @@ import {
 import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
 import { reimportBookFromDcs, recordResourceSync, ALL_RESOURCES, type Resource } from "./bookReimport";
-import { lintChapterOpeningMarkers, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint";
+import { lintChapterOpeningMarkers, lintOrphanedBlankText, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint";
 import { effectiveBookLock, canManageLocks, requireAutoMergeConfirmation, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
 import { exportBranchOverrideValid, lockPushExportParams } from "./export";
 import { LockPushBody } from "./exportRequestBodies";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
+import { PROVENANCE_COLUMNS, provenanceValues, resolveActorUsername } from "./rowProvenance.ts";
 
 export const books = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 
@@ -409,6 +410,8 @@ books.get("/:book/lint", requireAuth, async (c) => {
     ...lintUsfmVerses(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
     ...lintChapterOpeningMarkers(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
     ...lintChapterOpeningMarkers(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
+    ...lintOrphanedBlankText(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
+    ...lintOrphanedBlankText(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
     ...lintVerseTextQuality(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
     ...lintVerseTextQuality(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
     ...lintPairedPunctuation(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
@@ -638,13 +641,19 @@ async function importBookFromDcs(
     },
   };
 
-  counts.verses += await insertVerses(env, book, "ULT", ultRaw);
-  counts.verses += await insertVerses(env, book, "UST", ustRaw);
-  counts.verses += await insertVerses(env, book, origVersion, origRaw);
+  // Resolved ONCE per import, not per row — these loops are chunked over an
+  // entire book. `import` is the whole-book bootstrap's own provenance source;
+  // the actor is the importing user's DCS username (JWT first, D1 fallback —
+  // see resolveActorUsername), never null.
+  const actor = await resolveActorUsername(env.DB, userId);
 
-  counts.tn = await insertTnRows(env, book, tnRaw, userId);
-  counts.tq = await insertTqRows(env, book, tqRaw, userId);
-  counts.twl = await insertTwlRows(env, book, twlRaw, userId);
+  counts.verses += await insertVerses(env, book, "ULT", ultRaw, actor);
+  counts.verses += await insertVerses(env, book, "UST", ustRaw, actor);
+  counts.verses += await insertVerses(env, book, origVersion, origRaw, actor);
+
+  counts.tn = await insertTnRows(env, book, tnRaw, userId, actor);
+  counts.tq = await insertTqRows(env, book, tqRaw, userId, actor);
+  counts.twl = await insertTwlRows(env, book, twlRaw, userId, actor);
 
   // Final marker — the read path keys off this row's presence.
   const sources = Object.entries(counts.fetched)
@@ -681,6 +690,7 @@ async function insertVerses(
   book: string,
   bibleVersion: string,
   rawUsfm: string | null,
+  actor: string,
 ): Promise<number> {
   if (!rawUsfm) return 0;
 
@@ -698,15 +708,20 @@ async function insertVerses(
   const verses = extractVersesForRange(rawUsfm, 1, 999);
   if (verses.length === 0) return 0;
 
+  // This is the ONE record the bootstrap import leaves for a verse row: unlike
+  // tn/tq/twl below, verses here get no `updated_by` and no edit_log entry at
+  // all. Before #686 a bootstrap-imported verse's provenance was simply
+  // unknowable from D1 alone.
   const stmt = env.DB.prepare(
-    `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+    `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, ${PROVENANCE_COLUMNS.join(", ")})
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
   );
+  const provenance = provenanceValues({ action: "import", source: "import", actor });
   for (let i = 0; i < verses.length; i += CHUNK) {
     const slice = verses.slice(i, i + CHUNK);
     await env.DB.batch(
       slice.map((v) =>
-        stmt.bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText),
+        stmt.bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText, ...provenance),
       ),
     );
   }
@@ -718,6 +733,7 @@ async function insertTnRows(
   book: string,
   raw: string | null,
   userId: number,
+  actor: string,
 ): Promise<number> {
   if (!raw) return 0;
   const { rows } = parseTsv(raw);
@@ -733,10 +749,11 @@ async function insertTnRows(
   // ON CONFLICT is the DB-level backstop).
   const insertStmt = env.DB.prepare(
     `INSERT INTO tn_rows
-       (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+       (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order, ${PROVENANCE_COLUMNS.join(", ")})
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
      ON CONFLICT(book, id) DO NOTHING`,
   );
+  const provenance = provenanceValues({ action: "import", source: "import", actor });
   const auditStmt = env.DB.prepare(
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
      VALUES ('tn', ?1, ?2, ?3, NULL, 1, 'create', ?4)`,
@@ -777,6 +794,7 @@ async function insertTnRows(
         id, book, ch, v, refRaw,
         payload.tags, payload.support_reference, payload.quote, payload.occurrence, payload.note,
         nextSort(ch, v),
+        ...provenance,
       ),
       auditStmt.bind(id, book, userId, JSON.stringify(payload)),
     );
@@ -792,6 +810,7 @@ async function insertTqRows(
   book: string,
   raw: string | null,
   userId: number,
+  actor: string,
 ): Promise<number> {
   if (!raw) return 0;
   const { rows } = parseTsv(raw);
@@ -801,10 +820,11 @@ async function insertTqRows(
   // `seen` skip so audit/count stay truthful; first-in wins).
   const insertStmt = env.DB.prepare(
     `INSERT INTO tq_rows
-       (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response, sort_order)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+       (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response, sort_order, ${PROVENANCE_COLUMNS.join(", ")})
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
      ON CONFLICT(book, id) DO NOTHING`,
   );
+  const provenance = provenanceValues({ action: "import", source: "import", actor });
   const auditStmt = env.DB.prepare(
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
      VALUES ('tq', ?1, ?2, ?3, NULL, 1, 'create', ?4)`,
@@ -845,6 +865,7 @@ async function insertTqRows(
         id, book, ch, v, refRaw,
         payload.tags, payload.quote, payload.occurrence, payload.question, payload.response,
         nextSort(ch, v),
+        ...provenance,
       ),
       auditStmt.bind(id, book, userId, JSON.stringify(payload)),
     );
@@ -860,6 +881,7 @@ async function insertTwlRows(
   book: string,
   raw: string | null,
   userId: number,
+  actor: string,
 ): Promise<number> {
   if (!raw) return 0;
   const { rows } = parseTsv(raw);
@@ -869,10 +891,11 @@ async function insertTwlRows(
   // `seen` skip so audit/count stay truthful; first-in wins).
   const insertStmt = env.DB.prepare(
     `INSERT INTO twl_rows
-       (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link, sort_order)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+       (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link, sort_order, ${PROVENANCE_COLUMNS.join(", ")})
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
      ON CONFLICT(book, id) DO NOTHING`,
   );
+  const provenance = provenanceValues({ action: "import", source: "import", actor });
   const auditStmt = env.DB.prepare(
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
      VALUES ('twl', ?1, ?2, ?3, NULL, 1, 'create', ?4)`,
@@ -912,6 +935,7 @@ async function insertTwlRows(
         id, book, ch, v, refRaw,
         payload.tags, payload.orig_words, payload.occurrence, payload.tw_link,
         nextSort(ch, v),
+        ...provenance,
       ),
       auditStmt.bind(id, book, userId, JSON.stringify(payload)),
     );

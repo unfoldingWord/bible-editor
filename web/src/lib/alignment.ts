@@ -26,7 +26,7 @@
 // alignment), unchanged for callers / UI.
 
 import { nfc } from "./hebrew.ts";
-import { extractPlainText } from "./usfm.ts";
+import { extractPlainText, PARAGRAPH_TAGS } from "./usfm.ts";
 import { tokenizeEditableText } from "./replace.ts";
 
 export interface SourceWord {
@@ -130,14 +130,17 @@ function nodeIsText(n: ParsedNode | undefined): boolean {
 }
 // Poetry / paragraph LINE markers whose same-line trailing text (which usfm-js
 // parks on the marker's own `text` field — `\q1 Some enemies watched` →
-// {tag:"q1",text:"Some…"}) is alignable verse body. Deliberately EXCLUDES
-// `\qa` (acrostic header label — not verse text, must not become a draggable
-// word) and `\qs` (character wrapper around its content, e.g. bare Selah — its
-// text is preserved verbatim, not tokenized).
-const LINE_TEXT_MARKER_TAGS = new Set<string>([
-  "q", "q1", "q2", "q3", "q4", "qm", "qm1", "qm2", "qm3",
-  "p", "m", "mi", "pi", "pi1", "pi2", "pi3", "pc", "nb", "b",
-]);
+// {tag:"q1",text:"Some…"}) is alignable verse body. This IS the canonical
+// PARAGRAPH_TAGS set (usfm.ts) — a paragraph/poetry line marker that BE
+// surfaces as an editable token is, by definition, one whose same-line text is
+// verse body. Sharing the set (rather than keeping a second copy) is what keeps
+// a marker from being recognized here but minted as a `\w` word on save, or
+// vice-versa — the drift that produced the `\pmo` bug (#702). Membership
+// deliberately EXCLUDES `\qa` (acrostic header label — not verse text, must not
+// become a draggable word) and `\qs` (character wrapper around its content,
+// e.g. bare Selah — its text is preserved verbatim, not tokenized); neither is
+// in PARAGRAPH_TAGS.
+const LINE_TEXT_MARKER_TAGS = PARAGRAPH_TAGS;
 function nodeIsLineTextMarker(n: ParsedNode | undefined): boolean {
   if (!n) return false;
   if (n["type"] !== "quote" && n["type"] !== "paragraph") return false;

@@ -29,6 +29,13 @@ import { newRowId, isValidRowId, coerceRowId, deriveAltRowId } from "./rowId.ts"
 import { tnContentKey } from "./tnDedup.ts";
 import { requiredOccurrence } from "./occurrenceRule.ts";
 import {
+  PROVENANCE_COLUMNS,
+  provenanceSet,
+  provenanceValues,
+  aiPipelineActor,
+  resolveActorUsername,
+} from "./rowProvenance.ts";
+import {
   IMPORT_CLAIM_STALE_SECONDS,
   shouldTouchClaim,
   tnSweepScope,
@@ -784,6 +791,11 @@ async function applyJobOutput(
     .first<{ user_id: number }>();
   if (!starter) throw new Error(`apply: pipeline_jobs row not found for ${job.jobId}`);
   const userId = starter.user_id;
+  // Resolved ONCE per apply run, not per row — these loops are chunked over
+  // many rows (DAN 11 ran ~150 proposals). `updated_by` above still holds the
+  // human who clicked run; `actor` is the separate #686 provenance string that
+  // says a MACHINE wrote the row, naming the human only as who asked it to.
+  const actor = aiPipelineActor(await resolveActorUsername(env.DB, userId));
 
   // All unresolved proposals for this job, in stable order so retries do
   // the same work in the same sequence.
@@ -837,7 +849,7 @@ async function applyJobOutput(
   // TN delete phase: only fires when this job produced TN proposals AND
   // there are unkept TNs in scope. Idempotent — re-running finds none left.
   if (tnProposals.length > 0) {
-    result.tnDeleted = await deleteUnkeptTns(env, job, userId, tnProposals, heartbeat);
+    result.tnDeleted = await deleteUnkeptTns(env, job, userId, actor, tnProposals, heartbeat);
     // A delete mutates whatever chapters this job re-proposed TN for; those are
     // exactly the chapters carried by tnProposals.
     if (result.tnDeleted > 0) for (const p of tnProposals) affected.add(p.chapter);
@@ -956,7 +968,7 @@ async function applyJobOutput(
       note: (payload.note as string | null | undefined) ?? null,
     });
 
-    const expanded = await applyTnHintExpansionIfMatch(env, p, job, userId);
+    const expanded = await applyTnHintExpansionIfMatch(env, p, job, userId, actor);
     if (expanded) {
       claimedTnKeys.add(contentKey);
       affected.add(p.chapter);
@@ -984,7 +996,7 @@ async function applyJobOutput(
     const k = verseKey(p);
     const sortOrder = (tnCounters.get(k) ?? tnBases.get(k) ?? 0) + 100;
     tnCounters.set(k, sortOrder);
-    await applyTnInsert(env, p, userId, sortOrder);
+    await applyTnInsert(env, p, userId, sortOrder, actor);
     affected.add(p.chapter);
     result.tnCreated += 1;
   }
@@ -1016,7 +1028,7 @@ async function applyJobOutput(
     tqPrevKey = k;
     const sortOrder = (tqCounters.get(k) ?? 0) + 100;
     tqCounters.set(k, sortOrder);
-    const action = await applyTqUpsert(env, p, userId, sortOrder, claimedTqIds);
+    const action = await applyTqUpsert(env, p, userId, sortOrder, claimedTqIds, actor);
     affected.add(p.chapter);
     if (action === "created") result.tqCreated += 1;
     else result.tqUpdated += 1;
@@ -1043,7 +1055,7 @@ async function applyJobOutput(
     const k = verseKey(p);
     if (k !== versePrevKey && (await maybeCheckCancelled(env, job.jobId, cancel))) break;
     versePrevKey = k;
-    await applyVerseUpdate(env, p, userId, uhbWordsByVerse);
+    await applyVerseUpdate(env, p, userId, uhbWordsByVerse, actor);
     affected.add(p.chapter);
     result.verseUpdated += 1;
     await maybeTouchClaim(env, job.jobId, heartbeat);
@@ -1082,6 +1094,7 @@ export async function deleteUnkeptTns(
   env: Env,
   job: ImportContext,
   userId: number,
+  actor: string,
   tnProposals: PendingImportRow[],
   heartbeat: ClaimHeartbeat,
 ): Promise<number> {
@@ -1235,13 +1248,26 @@ export async function deleteUnkeptTns(
             // the starter's updated_by, so that clause would abort every
             // legitimate AI-output delete.) Composite-key scoped so a
             // colliding-id row in another book is never touched.
+            // Provenance action is 'ai_apply', not 'delete': this delete and the
+            // insert that immediately replaces it (the TN insert loop below) are
+            // two halves of ONE AI-pipeline replace, and stamping both halves
+            // 'ai_apply' is what lets "the AI pipeline was the last thing that
+            // touched this row" read uniformly across the whole apply run.
             `UPDATE tn_rows
                SET deleted_at = ?1, version = version + 1,
-                   updated_at = ?1, updated_by = ?2
+                   updated_at = ?1, updated_by = ?2,
+                   ${provenanceSet(6)}
              WHERE id = ?3 AND book = ?4 AND deleted_at IS NULL
                AND trashed_at IS NULL AND preserve = 0 AND hint = 0 AND version = ?5`,
           )
-          .bind(now, userId, t.id, job.book, t.version),
+          .bind(
+            now,
+            userId,
+            t.id,
+            job.book,
+            t.version,
+            ...provenanceValues({ action: "ai_apply", source: "ai_pipeline", actor }),
+          ),
         env.DB
           .prepare(
             // Audit only if the UPDATE above actually tombstoned this row in
@@ -1292,6 +1318,7 @@ export async function applyTnHintExpansionIfMatch(
   p: PendingImportRow,
   job: ImportContext,
   userId: number,
+  actor: string,
 ): Promise<boolean> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const proposedId = typeof payload.id === "string" ? payload.id : null;
@@ -1343,6 +1370,10 @@ export async function applyTnHintExpansionIfMatch(
         // already carries the creator's id (createRow sets updated_by), so
         // that predicate would abort every legitimate expansion.
         // book-scoped so a colliding stub id in another book isn't clobbered.
+        // hint_expansion, not ai_apply: the row's standing authorship stays with
+        // whoever created the stub (see HINT_EXPANSION_SOURCE above) — the
+        // provenance action names this specific revision as an AI in-place
+        // rewrite, distinct from a fresh AI-created row.
         `UPDATE tn_rows
             SET quote = ?1,
                 support_reference = ?2,
@@ -1352,7 +1383,8 @@ export async function applyTnHintExpansionIfMatch(
                 tags = ?6,
                 hint = 0,
                 version = version + 1,
-                updated_at = ?7
+                updated_at = ?7,
+                ${provenanceSet(11)}
           WHERE id = ?8 AND book = ?9 AND deleted_at IS NULL
             AND hint = 1 AND version = ?10`,
       )
@@ -1367,6 +1399,7 @@ export async function applyTnHintExpansionIfMatch(
         stub.id,
         job.book,
         stub.version,
+        ...provenanceValues({ action: "hint_expansion", source: "ai_pipeline", actor }),
       ),
     env.DB
       .prepare(
@@ -1422,6 +1455,7 @@ async function applyTnInsert(
   p: PendingImportRow,
   userId: number,
   sortOrder: number,
+  actor: string,
 ): Promise<void> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const insertCols = [
@@ -1437,6 +1471,7 @@ async function applyTnInsert(
     "note",
     "updated_by",
     "sort_order",
+    ...PROVENANCE_COLUMNS,
   ];
 
   // PRESERVE bp-assistant's proposed id. It's the SAME id that lands on master,
@@ -1466,6 +1501,7 @@ async function applyTnInsert(
       payload.note ?? null,
       userId,
       sortOrder,
+      ...provenanceValues({ action: "ai_apply", source: "ai_pipeline", actor }),
     ];
     try {
       await env.DB.batch([
@@ -1507,6 +1543,7 @@ async function applyTqUpsert(
   userId: number,
   sortOrder: number,
   claimedIds: Set<string>,
+  actor: string,
 ): Promise<"created" | "updated"> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const rawId = typeof payload.id === "string" && payload.id.length > 0 ? payload.id : null;
@@ -1583,7 +1620,8 @@ async function applyTqUpsert(
             `UPDATE tq_rows
                 SET ref_raw = ?1, tags = ?2, quote = ?3, occurrence = ?4,
                     question = ?5, response = ?6, sort_order = ?7, verse = ?8,
-                    version = version + 1, updated_at = ?9, updated_by = ?10
+                    version = version + 1, updated_at = ?9, updated_by = ?10,
+                    ${provenanceSet(13)}
               WHERE id = ?11 AND book = ?12 AND deleted_at IS NULL`,
           )
           .bind(
@@ -1599,6 +1637,7 @@ async function applyTqUpsert(
             userId,
             id,
             p.book,
+            ...provenanceValues({ action: "ai_apply", source: "ai_pipeline", actor }),
           ),
         env.DB
           .prepare(
@@ -1637,7 +1676,7 @@ async function applyTqUpsert(
     // previously unguarded insert threw out of applyJobOutput and killed the
     // whole job, twice, terminally.)
     try {
-      await insertTqAtId(env, p, payload, id, userId, sortOrder);
+      await insertTqAtId(env, p, payload, id, userId, sortOrder, actor);
       claimedIds.add(id);
       return "created";
     } catch (e) {
@@ -1657,8 +1696,23 @@ async function insertTqAtId(
   id: string,
   userId: number,
   sortOrder: number,
+  actor: string,
 ): Promise<void> {
-  const cols = ["id", "book", "chapter", "verse", "ref_raw", "tags", "quote", "occurrence", "question", "response", "updated_by", "sort_order"];
+  const cols = [
+    "id",
+    "book",
+    "chapter",
+    "verse",
+    "ref_raw",
+    "tags",
+    "quote",
+    "occurrence",
+    "question",
+    "response",
+    "updated_by",
+    "sort_order",
+    ...PROVENANCE_COLUMNS,
+  ];
   // book/chapter/verse come from the pending_imports row, NOT the payload.
   // `p.book` is the job's book and is what the caller's liveness lookup, the
   // (book, id) collision guard, and the edit_log row below all key on; taking
@@ -1678,6 +1732,7 @@ async function insertTqAtId(
     payload.response ?? null,
     userId,
     sortOrder,
+    ...provenanceValues({ action: "ai_apply", source: "ai_pipeline", actor }),
   ];
   await env.DB.batch([
     env.DB
@@ -1750,6 +1805,7 @@ async function applyVerseUpdate(
   p: PendingImportRow,
   userId: number,
   uhbWordsByVerse: Map<number, SourceWord[]>,
+  actor: string,
 ): Promise<void> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const book = String(payload.book ?? p.book);
@@ -1871,10 +1927,22 @@ async function applyVerseUpdate(
         .prepare(
           `UPDATE verses
               SET content_json = ?1, plain_text = ?2, verse_end = ?3,
-                  version = version + 1, updated_at = ?4, updated_by = ?5
+                  version = version + 1, updated_at = ?4, updated_by = ?5,
+                  ${provenanceSet(10)}
             WHERE book = ?6 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9`,
         )
-        .bind(contentJson, plainText, verseEnd, now, userId, book, chapter, verse, bibleVersion),
+        .bind(
+          contentJson,
+          plainText,
+          verseEnd,
+          now,
+          userId,
+          book,
+          chapter,
+          verse,
+          bibleVersion,
+          ...provenanceValues({ action: "ai_apply", source: "ai_pipeline", actor }),
+        ),
       // Preserve the pre-AI content as a baseline at its own version, so verse
       // history can restore the state before the AI ran. Guarded: only when that
       // version was never logged (i.e. the original bootstrap import), so repeat
@@ -1919,10 +1987,20 @@ async function applyVerseUpdate(
   await env.DB.batch([
     env.DB
       .prepare(
-        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, updated_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, updated_by, ${PROVENANCE_COLUMNS.join(", ")})
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
       )
-      .bind(book, chapter, verse, verseEnd, bibleVersion, contentJson, plainText, userId),
+      .bind(
+        book,
+        chapter,
+        verse,
+        verseEnd,
+        bibleVersion,
+        contentJson,
+        plainText,
+        userId,
+        ...provenanceValues({ action: "ai_apply", source: "ai_pipeline", actor }),
+      ),
     env.DB
       .prepare(
         `INSERT INTO edit_log
