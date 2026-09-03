@@ -39,15 +39,37 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  accountOwnPublishDeclineForTest,
   applyTsvRows,
   clearResolvedMergeNoBaseForTest,
   recordResourceSync,
   recordWithheldSyncIfAbsent,
+  retireMergeKeptFlags,
   sweepStaleMergeNoBase,
 } from "./bookReimport.ts";
 import { contentPatchClearClauses } from "./contentPatchClauses.ts";
 import { lintTqRows } from "./lint.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
+
+// ── Hermetic clock ─────────────────────────────────────────────────────────
+// Every merge_no_base / auto-clear block below seeds its walk windows RELATIVE
+// to Date.now() (NOW, MINT_AT, WATERMARK), but the Door43 commit fixtures
+// (OURS_AND_AI_PAGE / HUMAN_PAGE) carry ABSOLUTE dates (2026-08-27/28). As the
+// real calendar advanced past those dates, the relative walk lower-bound
+// (sinceTime) slid past the fixed commit date, so listMasterCommitsSince
+// (dcsSources.ts) stopped returning `aaa1`; the sweep's probe then read tip=null
+// and flipped its clear/skip decision. The suite passed before 2026-09-03 and
+// failed after — date-flaky CI with no code change, red on every branch alike.
+//
+// Pin the wall clock to a fixed instant in the era these fixtures were authored
+// for, so every relative window straddles the fixed commit dates exactly as
+// intended, on any calendar day. This runs in the file's own test subprocess
+// (run-tests.mjs spawns one node process per file), so it affects nothing else.
+// The one block that drives its own two-adjacent-days clock (the rotation test)
+// saves and restores Date.now around its override, so it still works — its saved
+// baseline is simply this pinned value instead of the wall clock.
+const FIXED_NOW_MS = Date.parse("2026-09-01T00:00:00Z");
+Date.now = () => FIXED_NOW_MS;
 
 // Snapshot reader that tolerates a missing or garbled snapshot, so ablating the
 // snapshot write reports a FAILED ASSERTION instead of crashing the run.
@@ -855,7 +877,8 @@ console.log("\n[reference-move attribution at the caller]");
 
   // 7e. Every OTHER review_kind this codebase writes survives too — the guard is
   //     an equality on 'ref_moved', and a widened guard would silently drop these
-  //     (merge_kept and merge_no_base are both live writers).
+  //     (merge_no_base is a live writer; merge_kept is retired but may still sit
+  //     on rows until the nightly retire sweep reaches them).
   for (const kept of ["merge_kept", "merge_no_base"]) {
     const { sqlite, env } = freshEnv();
     seedMoved(sqlite, { reviewKind: kept });
@@ -992,53 +1015,67 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     sqlite.prepare(`SELECT response, review_kind, review_reason, version FROM tq_rows WHERE id='ai01'`).all()[0];
 
   // 1. The AMO 4:2 shape. Only our export and the pipeline moved master, so the
-  //    app edit wins — and it is still flagged, because a human should look.
+  //    app edit wins — and, since 2026-09-02, WITHOUT a review flag: the decision
+  //    rested on a complete lineage walk with no Door43 editor's commit, so there
+  //    is nothing for a translator to verify. (JER tq 3:6/3:8/3:19 sat under a
+  //    "Kept over Door43 — verify" chip for days against bp-assistant's own
+  //    evening push; the chip's text said no editor was involved.)
   {
     const { sqlite, env } = freshEnv();
     const boundary = seedContested(sqlite);
+    const versionBefore = readRow(sqlite).version;
     const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("the AI run's response")], null, {
       confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
     });
     const row = readRow(sqlite);
     eq(row.response, "our response", "the app edit is KEPT — master's AI-authored value never lands");
-    eq(counts.merge_kept_ai, 1, "…counted as merge_kept_ai");
+    eq(counts.merge_kept_ai, 1, "…counted as merge_kept_ai, so the run summary still reports it");
     eq(counts.merge_adopted, 0, "…and never counted as an adoption");
+    eq(counts.merge_master_wins, 0, "…and NOT a master-wins flag: keep_ai_master is D1-wins, its own line (#706)");
     eq(counts.merge_refused, 0, "…and never as a refusal, which would freeze the export at 5");
     eq(counts.apply_incomplete, false, "…and does NOT withhold the watermark: the export must publish this");
-    // A DISTINCT review_kind, not just distinct prose: the cleanup chip titles
-    // itself from this column, and "Merged Door43 edit" over a kept row is the
-    // reverse of what happened.
-    eq(row.review_kind, "merge_kept", "…the row is flagged for review, as a KEPT row");
-    eq(
-      row.review_reason.startsWith("Your response was kept over Door43's"),
-      true,
-      "…the reason leads with the outcome (the chip clamps to two lines)",
-    );
-    eq(
-      row.review_reason.includes("no commit from a Door43 editor's own account was found"),
-      true,
-      "…and states the measured cause, not an inferred one",
-    );
-    eq(
-      row.review_reason.includes("was merged over your app-side change"),
-      false,
-      "…never the opposite claim, that Door43's edit won",
-    );
-    eq(
-      row.review_reason.includes("will be published to Door43"),
-      false,
-      "…and never promises a publish this per-row code cannot schedule",
-    );
-    eq(row.version, 4, "…the flag write bumps the version once");
+    eq(row.review_kind, null, "…and the row is NOT flagged: the finding was measured, not inferred");
+    eq(row.review_reason, null, "…no reason text either");
+    // A kept-alone row makes no write at all — no flag-only write, so no
+    // version bump to 409 an open tab (#539).
+    eq(row.version, versionBefore, "…and no write happened: the version is untouched");
 
-    // 2. Re-running the same night's shape must not churn the version. The
-    //    condition recurs every sync until a human resolves it, and a flag-only
-    //    write is still a write (#539).
+    // 2. Re-running the same night's shape is equally silent. The condition
+    //    recurs every sync until the export publishes the kept value.
     const again = await applyTsvRows(env, BOOK, "tq", [masterRowAt("the AI run's response")], null, {
       confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
     });
     eq(again.merge_kept_ai, 1, "the conflict is still detected on the next run");
-    eq(readRow(sqlite).version, 4, "…but an unchanged flag is not re-written");
+    eq(readRow(sqlite).version, versionBefore, "…and still writes nothing");
+  }
+
+  // 2b. The MIXED row: master moved a field the translator never touched (question)
+  //     AND the contested field (response). The untouched field is adopted — a
+  //     real content write, with a version bump and an `update` audit row — while
+  //     the contested one is kept, and still no review flag results.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const versionBefore = readRow(sqlite).version;
+    const counts = await applyTsvRows(
+      env,
+      BOOK,
+      "tq",
+      [{ ...masterRowAt("the AI run's response"), question: "master's reworded question" }],
+      null,
+      { confirmedAt: 200, editId: boundary, lineage: AI_ONLY },
+    );
+    const row = sqlite
+      .prepare(`SELECT question, response, review_kind, version FROM tq_rows WHERE id='ai01'`)
+      .all()[0];
+    eq(row.response, "our response", "the contested field is kept");
+    eq(row.question, "master's reworded question", "…the field only master moved is adopted");
+    eq(counts.merge_kept_ai, 1, "…counted as kept");
+    eq(counts.merge_adopted, 1, "…and as an adoption");
+    eq(row.review_kind, null, "…and still no review flag");
+    eq(row.version, versionBefore + 1, "…the adoption is a real write: one version bump");
+    const audit = sqlite.prepare(`SELECT action FROM edit_log WHERE row_key = 'ai01' ORDER BY id DESC LIMIT 1`).all()[0];
+    eq(audit?.action, "update", "…with an update audit row behind it");
   }
 
   // 3. A human commit on master since the ancestor: unchanged behaviour, master
@@ -1053,6 +1090,8 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(row.response, "a maintainer's fix", "a human-authored master edit still wins the collision");
     eq(counts.merge_adopted, 1, "…counted as an adoption");
     eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
+    eq(counts.merge_conflicts, 1, "…one merge_conflicts row (the adopting write)");
+    eq(counts.merge_master_wins, 1, "…surfaced as a master-wins flag for review (#706)");
     eq(row.review_reason.includes("was merged over your app-side change"), true, "…with the pre-existing wording");
     // #684: HAS_HUMAN is the pre-#684 shape (shas, no identity), so the message
     // is byte-identical to what it was before this shipped.
@@ -1215,6 +1254,69 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(row.response, "a maintainer's fix", "…and when the evidence DOES name this row, master still wins there");
     eq(counts.merge_adopted, 1, "…counted as an adoption, same as the file-level HAS_HUMAN case");
     eq(counts.merge_kept_ai, 0, "…and never as a kept AI conflict");
+  }
+
+  // 8b. #706: a MIXED run — one master-wins conflict AND one kept-alone row in
+  //     the SAME applyTsvRows call, the exact shape that made the "Pull from
+  //     Door43" summary undercount. On the TSV side merge_conflicts is bumped
+  //     only for the adopting (master-wins) write, while the kept-alone row lands
+  //     in merge_kept_ai alone — so the old summary math,
+  //     `max(0, merge_conflicts - merge_kept_ai)`, cancelled the real flag to 0.
+  //     merge_master_wins counts the flagged row directly and must stay 1.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    // Two contested rows: both sides moved `response` on each.
+    //  - keep01 @ 1:2 — no human commit at its ref → keep_ai_master (D1 wins, kept alone)
+    //  - win01  @ 1:5 — a human commit AT its ref     → adopt_conflict (master wins, flagged)
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, sort_order, updated_by, version)
+         VALUES ('keep01', ?, 1, 2, '1:2', null, 'our question', 'our response A', 10, 7, 3),
+                ('win01',  ?, 1, 5, '1:5', null, 'our question', 'our response B', 20, 7, 3)`,
+      )
+      .run(BOOK, BOOK);
+    const e1 = sqlite
+      .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('tq', 'keep01', ?, 'create', ?, 100)`)
+      .run(BOOK, JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2", question: "our question", response: "base response A" }));
+    const e2 = sqlite
+      .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('tq', 'win01', ?, 'create', ?, 100)`)
+      .run(BOOK, JSON.stringify({ chapter: 1, verse: 5, ref_raw: "1:5", question: "our question", response: "base response B" }));
+    const boundary = Math.max(Number(e1.lastInsertRowid), Number(e2.lastInsertRowid));
+    const lineage = {
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 1, ai: 1, human: 1 }, humanShas: ["abc123"],
+      // Complete per-ref evidence naming ONLY win01's ref.
+      refsComplete: true, humanRefs: ["1:5"],
+    };
+    const mkRow = (id, ref, chapter, verse, response) => ({
+      id, idCoerced: false, refRaw: ref, chapter, verse,
+      occurrence: null, tags: null, quote: null, question: "our question", response,
+    });
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [mkRow("keep01", "1:2", 1, 2, "the AI run's response"), mkRow("win01", "1:5", 1, 5, "a maintainer's fix")],
+      null,
+      { confirmedAt: 200, editId: boundary, lineage },
+    );
+    const rows = Object.fromEntries(
+      sqlite.prepare(`SELECT id, response, review_kind FROM tq_rows WHERE id IN ('keep01','win01')`).all().map((r) => [r.id, r]),
+    );
+    eq(rows.keep01.response, "our response A", "the kept-alone row keeps D1's value");
+    eq(rows.keep01.review_kind, null, "…with no review flag (keep_ai_master mints none)");
+    eq(rows.win01.response, "a maintainer's fix", "the master-wins row adopts Door43's value");
+    eq(rows.win01.review_kind, "merge_conflict", "…and IS flagged for review");
+    eq(counts.merge_kept_ai, 1, "one kept-alone row");
+    eq(counts.merge_conflicts, 1, "one adopting (master-wins) write bumped merge_conflicts");
+    eq(counts.merge_adopted, 1, "…and merge_adopted");
+    eq(counts.merge_master_wins, 1, "merge_master_wins counts the flagged row directly");
+    // The regression itself: the counter the summary now reads does NOT cancel.
+    eq(
+      Math.max(0, counts.merge_conflicts - counts.merge_kept_ai),
+      0,
+      "the OLD summary math would have hidden the flag (this is the bug #706 fixes)",
+    );
+    eq(counts.merge_master_wins, 1, "…while merge_master_wins keeps the flag visible");
   }
 
   // 9. PR #644 review finding F2: the per-ref evidence is keyed to the ref AS
@@ -1805,14 +1907,13 @@ console.log("\n[#653: master AI-edited AFTER the import — a real conflict, res
   eq(counts.merge_kept_ai, 1, "both sides moved the question -> keep_ai_master, D1 wins");
   eq(counts.merge_no_base, 0, "…and it is NOT reported as unattributable");
   const row = sqlite.prepare(`SELECT review_kind, question, review_master_json FROM tq_rows WHERE id='ca02'`).all()[0];
-  eq(row.review_kind, "merge_kept", "the row is flagged merge_kept");
-  eq(row.question, "app question", "…the translator's question is kept");
   eq(
-    parseSnap(row.review_master_json).question,
-    "ai-rewritten question",
-    "…and Door43's own value is recorded with the flag (#653 piece 4)",
+    row.review_kind,
+    null,
+    "the row is NOT flagged: keep_ai_master rests on a complete no-human lineage, so there is nothing to verify",
   );
-  eq(parseSnap(row.review_master_json).ref_raw, "9:9", "…ref_raw rides in the snapshot too");
+  eq(row.question, "app question", "…the translator's question is kept");
+  eq(row.review_master_json, null, "…and no snapshot is written — a kept-alone row makes no write at all");
 }
 
 console.log("\n[#653: a create-as-ancestor base may EXONERATE but never CONVICT]");
@@ -1864,7 +1965,7 @@ console.log("\n[#653: a create-as-ancestor base may EXONERATE but never CONVICT]
 
   // 2. Same row, but the lineage EXPLICITLY rules out a human behind master.
   //    keep_ai_master is a D1-wins outcome, so it survives the floor — the
-  //    translator keeps her text and gets the merge_kept chip.
+  //    translator keeps her text, and with no chip: the outcome was measured.
   {
     const { sqlite, env } = freshEnv();
     const boundary = seedProvisional(sqlite, "pv02");
@@ -1874,7 +1975,7 @@ console.log("\n[#653: a create-as-ancestor base may EXONERATE but never CONVICT]
     eq(counts.merge_kept_ai, 1, "a D1-wins conflict still fires under a clean lineage");
     const row = sqlite.prepare(`SELECT question, review_kind FROM tq_rows WHERE id='pv02'`).all()[0];
     eq(row.question, "her newest edit", "…her text is kept");
-    eq(row.review_kind, "merge_kept", "…with the chip that says so");
+    eq(row.review_kind, null, "…with no review chip — a measured keep asks nothing of her");
   }
 
   // 3. Master moved a field the translator never touched. Adopting would be
@@ -2487,6 +2588,36 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
     eq(cleared, 1, "only the row that actually cleared is counted");
     const logs = sqlite.prepare(`SELECT row_key FROM edit_log WHERE action = 'sync_clear_review'`).all();
     eq(logs.map((l) => l.row_key), ["cl01"], "…and only it gets an audit row — no phantom audit for the lost race");
+  }
+
+  // 1c. A backlog larger than CLEAR_PAIR_BATCH (issue #705). Each clear travels
+  //     as TWO statements (the UPDATE and its paired audit INSERT), so the slice
+  //     must be half of WRITE_BATCH (45), not WRITE_BATCH itself — a 90-row
+  //     slice would build a 180-statement batch, over D1's 100-per-batch cap,
+  //     which throws and drops the whole slice (the flags stay standing). The
+  //     node:sqlite harness does not enforce the cap, so assert the batch size
+  //     directly: 60 clears must span >1 batch and no batch may exceed 100.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 60);
+    const realBatch = env.DB.batch.bind(env.DB);
+    let maxBatchStmts = 0;
+    let batchCount = 0;
+    env.DB.batch = async (stmts) => {
+      maxBatchStmts = Math.max(maxBatchStmts, stmts.length);
+      batchCount++;
+      return realBatch(stmts);
+    };
+    const cleared = await withFetch(sameTip(), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE),
+    );
+    eq(cleared, 60, "all 60 flags are retired across multiple slices");
+    eq(batchCount > 1, true, "…the clear spanned more than one batch");
+    eq(maxBatchStmts <= 100, true, "…and no batch exceeded D1's 100-statement cap");
+    const standing = sqlite.prepare(`SELECT COUNT(*) AS n FROM tq_rows WHERE review_kind IS NOT NULL`).all()[0];
+    eq(standing.n, 0, "no flag is left standing");
+    const logs = sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log WHERE action = 'sync_clear_review'`).all()[0];
+    eq(logs.n, 60, "…and every clear wrote its own audit row");
   }
 
   // 2. A human commit in the same window -> nothing is cleared. This is the
@@ -3354,6 +3485,286 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
       globalThis.fetch = realFetch;
     }
   }
+}
+
+console.log("\n[own-publish decline accounting: measured at the merge commit, real SQL, mocked Gitea]");
+{
+  // PROD SHAPE (JER tq, 2026-09-01/02): our nightly push merges at ~05:40Z, the
+  // bp-assistant bot pushes a chapter on top in the evening, and the next
+  // morning's byte comparison declines. The blind counter had reached 3 and raised
+  // the "cannot tell them apart" banner. Here the same night is measured.
+  const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000;
+  const PUSHED = "ba421e896eab0000000000000000000000000000";
+  const OUR_MERGE = { sha: "22d652732b18", message: "bible-editor: JER tq → master (#859)", authorEmail: "b@x", authorName: "Benjamin Wright", date: "2026-09-01T05:38:03Z" };
+  const BOT_PUSH = { sha: "863fbfa65119", message: "TQ: JER 10 [ju..7@api.bp-assistant]", authorEmail: "bot@bp-assistant", authorName: "BW Bot", date: "2026-09-01T23:49:46Z" };
+  const FILE = { repo: "en_tq", path: `tq_${BOOK}.tsv` };
+  const SOURCE = `own_publish_inert:${BOOK}:tq`;
+  // The export's own record of the push: pushed_blob_sha/read_at and the PR it
+  // opened for that render (pushed_pr_number, 0061), all on the sync row.
+  const seedSync = (sqlite, declines, { prNumber = 859, prReadAt = READ_AT } = {}) => {
+    sqlite
+      .prepare(
+        `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number, pushed_pr_read_at)
+         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?, ?, ?)`,
+      )
+      .run(BOOK, PUSHED, READ_AT, declines, prNumber, prNumber == null ? null : prReadAt);
+    return { sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: READ_AT, pushedEditId: null, declines };
+  };
+  const seedBanner = (sqlite) =>
+    sqlite
+      .prepare(`INSERT INTO system_alerts (username, severity, source, message) VALUES ('deferredreward', 'warning', ?, 'old blind banner')`)
+      .run(SOURCE);
+  const readState = (sqlite) => ({
+    declines: sqlite.prepare(`SELECT own_publish_declines AS d FROM book_resource_syncs WHERE book = ? AND resource = 'tq'`).get(BOOK).d,
+    banners: sqlite.prepare(`SELECT message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(SOURCE),
+  });
+  // A Gitea that serves the commit walk AND the merge commit's tree, counting each.
+  const gitea = (commits, blobAtMerge) => {
+    const calls = { commits: 0, trees: 0 };
+    const fetchImpl = async (url) => {
+      if (String(url).includes("/git/trees/")) {
+        calls.trees++;
+        return { ok: true, json: async () => ({ sha: OUR_MERGE.sha, truncated: false, tree: [{ path: FILE.path, type: "blob", sha: blobAtMerge }] }) };
+      }
+      calls.commits++;
+      return giteaPage(commits)();
+    };
+    return { calls, fetchImpl };
+  };
+  const withGitea = async (g, fn) => {
+    const real = globalThis.fetch;
+    globalThis.fetch = g.fetchImpl;
+    try {
+      return await fn();
+    } finally {
+      globalThis.fetch = real;
+    }
+  };
+
+  // (a) THE JER NIGHT, measured: the merge holds our exact bytes → preserved. The
+  //     blind-era counter (3) resets and the standing banner comes down.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 3);
+    seedBanner(sqlite);
+    const g = gitea([BOT_PUSH, OUR_MERGE], PUSHED);
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    const s = readState(sqlite);
+    eq(s.declines, 0, "merge blob == pushed blob resets the counter (the bot's push explains tonight's mismatch)");
+    eq(s.banners.length, 0, "…and the standing banner comes down");
+    eq(g.calls.commits, 1, "with no lineage walk to reuse, one commit walk from pushed_read_at was fetched");
+    eq(g.calls.trees, 1, "…and one tree read at the merge commit");
+  }
+
+  // (b) The same night with the lineage walk handed in: no second commit fetch.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    const g = gitea([BOT_PUSH, OUR_MERGE], PUSHED);
+    const walked = { commits: [BOT_PUSH, OUR_MERGE], incomplete: false, incompleteReason: "" };
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, walked, sync));
+    eq(readState(sqlite).declines, 0, "a reused walk reaches the same verdict");
+    eq(g.calls.commits, 0, "…without a second commit fetch");
+    eq(g.calls.trees, 1, "…paying only the tree read");
+  }
+
+  // (c) A REWRITE, under the bot's push: the merge commit holds other bytes. The
+  //     counter climbs, and on crossing the threshold the banner names the measurement.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    const s = readState(sqlite);
+    eq(s.declines, 3, "merge blob != pushed blob counts as a measured rewrite even with a bot push on top");
+    eq(s.banners.length, 1, "…and crossing the threshold raises the banner");
+    eq(s.banners[0].message.includes("holds blob 0000deadbeef"), true, "…which states the blob the merge holds");
+    eq(s.banners[0].message.includes("we pushed blob ba421e896eab"), true, "…and the blob we pushed");
+    eq(s.banners[0].message.includes("22d652732b18"), true, "…and the merge commit");
+    eq(s.banners[0].message.includes("cannot tell them apart"), false, "…and never the old two-explanations text");
+
+    // The SAME merge measured again — a retried step tonight, or a later night
+    // with no new push — adds nothing (0061's own_publish_rewrite_sha).
+    const sync2 = { ...sync, declines: 3 };
+    await withGitea(gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef"), () =>
+      accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync2),
+    );
+    eq(readState(sqlite).declines, 3, "re-measuring the same rewritten merge does not count it twice");
+
+    // A NEW export (#861) whose merge is also rewritten: counts, banner NOT re-raised.
+    sqlite
+      .prepare(
+        `UPDATE book_resource_syncs SET pushed_pr_number = 861, pushed_read_at = ?1, pushed_pr_read_at = ?1
+          WHERE book = ?2 AND resource = 'tq'`,
+      )
+      .run(READ_AT + 86000, BOOK);
+    const MERGE_861 = { ...OUR_MERGE, sha: "5555aaaa6666", message: "bible-editor: JER tq → master (#861)", date: "2026-09-02T05:40:00Z" };
+    await withGitea(gitea([MERGE_861, BOT_PUSH, OUR_MERGE], "1111deadbeef00000000000000000000deadbeef"), () =>
+      accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, { ...sync, pushedReadAt: READ_AT + 86000, declines: 3 }),
+    );
+    const s2 = readState(sqlite);
+    eq(s2.declines, 4, "a further rewritten merge (a different commit) keeps counting");
+    eq(s2.banners.length, 1, "…without a second banner (raise on the crossing only)");
+  }
+
+  // (e) Two overlapping exports (Codex finding on PR #704): export A (#859) merged
+  //     after export B's render was read, and B (#864) is still pending. By PR
+  //     number this is pending — A's blob is never compared against B's push.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2, { prNumber: 864 });
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "another export's merge is not measured as ours → counter unchanged");
+    eq(g.calls.trees, 0, "…and no tree read is spent on it");
+  }
+
+  // (f) The push has no PR on record (creation failed, or it predates 0061): nothing to look for.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2, { prNumber: null });
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "no PR recorded for this push → nothing to measure, counter unchanged");
+    eq(g.calls.trees, 0, "…and no tree read is spent on it");
+  }
+
+  // (g) A STALE PR on the row (Codex verify, round 2): a newer render advanced
+  //     pushed_read_at/pushed_blob_sha, its PR is not stamped yet (or never will
+  //     be), and pushed_pr_number still names the PREVIOUS render's PR (#859),
+  //     whose merge IS on master. Comparing that merge's blob against the new
+  //     push would be a false rewrite; the read-time mismatch says "no PR for
+  //     this render" instead.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2, { prNumber: 859, prReadAt: READ_AT - 86400 });
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "a PR stamped for an earlier render is not this push's PR → counter unchanged");
+    eq(g.calls.trees, 0, "…and its merge's blob is never read");
+  }
+
+  // (h) The render moved between the comparison and the accounting (an export
+  //     landed mid-run): the decline was about a render no longer on the row.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    sqlite
+      .prepare(`UPDATE book_resource_syncs SET pushed_blob_sha = 'newer000', pushed_read_at = ? WHERE book = ? AND resource = 'tq'`)
+      .run(READ_AT + 600, BOOK);
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "a render that moved during the run is not attributed → counter unchanged");
+    eq(g.calls.commits + g.calls.trees, 0, "…and nothing is fetched for it");
+  }
+
+  // (d) Unmeasured nights leave the counter alone, in both directions.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    seedBanner(sqlite);
+    // Tonight's branch (#859) has not merged: only an earlier export's merge (#854) is on master.
+    const older = { ...OUR_MERGE, sha: "0abeb26ff896", message: "bible-editor: JER tq → master (#854)", date: "2026-08-31T05:36:55Z" };
+    const g1 = gitea([older], PUSHED);
+    await withGitea(g1, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "merge pending → counter unchanged");
+    eq(g1.calls.trees, 0, "…and no tree read is spent on it");
+    eq(readState(sqlite).banners.length, 1, "…and a standing banner is left standing");
+    // The merge is there but the tree read fails.
+    const g2 = { calls: { commits: 0, trees: 0 }, fetchImpl: async (url) => (String(url).includes("/git/trees/") ? { ok: false, json: async () => ({}) } : giteaPage([BOT_PUSH, OUR_MERGE])()) };
+    await withGitea(g2, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "a failed tree read → counter unchanged");
+    // No read time recorded on the row (half-written render): nothing can be placed.
+    sqlite.prepare(`UPDATE book_resource_syncs SET pushed_read_at = NULL WHERE book = ? AND resource = 'tq'`).run(BOOK);
+    await withGitea(gitea([BOT_PUSH, OUR_MERGE], PUSHED), () =>
+      accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, { ...sync, pushedReadAt: null }),
+    );
+    eq(readState(sqlite).declines, 2, "no pushed_read_at → counter unchanged");
+  }
+}
+console.log("\n[merge_kept retire: standing flags come down, D1-only, and nothing else is touched]");
+{
+  // PROD SHAPE: JER tq 3:6 / 3:8 / 3:19, flagged merge_kept on 2026-08-29 against
+  // bp-assistant's own evening push — the flag kind is retired (see the
+  // keep_ai_master branch), and every standing one was minted on the very
+  // measurement that retired it, so the sweep needs no Door43 walk to justify
+  // the clear. Sibling kinds and tombstones must come through untouched.
+  const { sqlite, env } = freshEnv();
+  const seed = (id, kind, reason, deletedAt = null) =>
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version,
+                              review_kind, review_reason, review_master_json, updated_at, deleted_at)
+         VALUES (?, ?, 3, 6, '3:6', 'q', 'r', 4, ?, ?, ?, 1000, ?)`,
+      )
+      .run(id, BOOK, kind, reason, kind ? JSON.stringify({ ref_raw: "3:6", response: "Door43's AI response" }) : null, deletedAt);
+  seed("mk01", "merge_kept", "Your response was kept over Door43's, and the next export…");
+  seed("mk02", "merge_kept", "Your question was kept over Door43's, and the next export…");
+  seed("mk99", "merge_kept", "kept, on a tombstone", 999);
+  seed("mc01", "merge_conflict", "A Door43 edit to this row's response was merged over your app-side change.");
+  seed("nb01", "merge_no_base", "Nothing was overwritten. Check this row against Door43's version…");
+  seed("ok01", null, null);
+
+  let fetches = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetches++;
+    throw new Error("the retire must not walk Door43");
+  };
+  let result;
+  try {
+    result = await retireMergeKeptFlags(env);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  eq(result.flagged, 2, "the two live merge_kept rows are found (the tombstone is not)");
+  eq(result.cleared, 2, "…and both are retired");
+  eq(fetches, 0, "…without a single Gitea fetch: the mint was the measurement");
+
+  const byId = Object.fromEntries(
+    sqlite
+      .prepare(
+        `SELECT id, review_kind, review_reason, review_master_json, version, updated_at,
+                last_change_action, last_change_source, last_change_actor FROM tq_rows`,
+      )
+      .all()
+      .map((r) => [r.id, r]),
+  );
+  eq(byId.mk01.review_kind, null, "mk01's flag is gone");
+  eq(
+    [byId.mk01.last_change_action, byId.mk01.last_change_source, byId.mk01.last_change_actor],
+    ["review_clear", "system", "nightly merge_kept flag retirement"],
+    "…stamped as unattended housekeeping, not as a Door43 sync (Door43 had no part in it)",
+  );
+  eq(byId.ok01.last_change_source, null, "…and an untouched row's provenance is untouched");
+  eq(byId.mk01.review_reason, null, "…reason too");
+  eq(byId.mk01.review_master_json, null, "…and its snapshot");
+  eq(byId.mk02.review_kind, null, "mk02's flag is gone");
+  eq([byId.mk01.version, byId.mk02.version], [4, 4], "…with no version bump, so an open editor's If-Match still holds");
+  eq(byId.mk01.updated_at > 1000, true, "…updated_at moves, like every other flag clear");
+  eq(byId.mk99.review_kind, "merge_kept", "a tombstoned row is never touched");
+  eq(byId.mc01.review_kind, "merge_conflict", "a master-wins flag (a Door43 human may be behind it) stays");
+  eq(byId.nb01.review_kind, "merge_no_base", "an unattributable flag stays for its own clear");
+  eq(byId.ok01.updated_at, 1000, "an unflagged row is not written at all");
+
+  const logs = sqlite
+    .prepare(`SELECT row_key, payload_json FROM edit_log WHERE action = 'sync_clear_review' ORDER BY row_key`)
+    .all();
+  eq(logs.map((l) => l.row_key), ["mk01", "mk02"], "one audit row per retired flag");
+  const payload = JSON.parse(logs[0].payload_json);
+  eq(payload.review_kind, "merge_kept", "…naming the kind that was retired");
+  eq(JSON.parse(payload.review_master_json).response, "Door43's AI response", "…and carrying the snapshot the flag was about");
+  eq(payload.evidence.retired_kind, true, "…marked as a kind retirement, not a lineage-justified clear");
+
+  // Idempotent: the next night finds nothing and writes nothing.
+  const again = await retireMergeKeptFlags(env);
+  eq(again.flagged, 0, "a second pass finds no standing merge_kept flag");
+  eq(again.cleared, 0, "…and clears nothing");
+  eq(
+    sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log WHERE action = 'sync_clear_review'`).all()[0].n,
+    2,
+    "…and adds no audit rows",
+  );
 }
 
 if (failed > 0) {

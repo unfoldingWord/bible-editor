@@ -66,7 +66,15 @@ import {
   type HumanRefEvidence,
   type MasterLineageSummary,
 } from "./masterLineage.ts";
-import { gitBlobShaOrNull, recognizeOwnPublish, type OwnPublishResult } from "./ownPublish";
+import {
+  findOurMergeForPr,
+  gitBlobShaOrNull,
+  judgeOwnPublishDecline,
+  recognizeOwnPublish,
+  type OwnPublishDeclineVerdict,
+  type OwnPublishResult,
+} from "./ownPublish";
+import { fileBlobShaAtCommit } from "./dcsSources";
 import {
   collectSourceWords,
   extractVersesForRange,
@@ -363,6 +371,22 @@ export interface ReimportCounts {
   // review_kind/review_reason (migration 0047), surfaced by the cleanup chip
   // (lint.ts) rather than the verse banner.
   merge_conflicts: number;
+  // The rows this run flagged for HUMAN review as a merge conflict — exactly what
+  // the "Pull from Door43" summary renders as "flagged for review (merge
+  // conflict)". Its own counter, not merge_conflicts minus merge_kept_ai, because
+  // that subtraction is only valid on the verse side: there keep_ai_master IS a
+  // subset of merge_conflicts, but on the TSV side merge_conflicts counts only an
+  // adopting write while a kept-ALONE row lands in merge_kept_ai and nowhere in
+  // merge_conflicts — so one master-wins flag plus one kept-alone row cancelled to
+  // zero and hid a real flag (#706). Counts:
+  //   - TSV: an adopt_conflict write that actually landed (master won the
+  //     contested field), EXCLUDING a mixed row that also kept a contested field
+  //     for D1 (keptAiConflict) — that row mints no review flag.
+  //   - verses: every landed liveConflict except keep_ai_master, i.e. adopt_conflict
+  //     PLUS the D1-kept-but-flagged outcomes (keep_alignment_refused,
+  //     source_attr_divergent). This matches the pre-#706 render for verses exactly.
+  // Never counts keep_ai_master (that is merge_kept_ai, its own summary line).
+  merge_master_wins: number;
   // Verse whose merge resolved to "adopt", but the bytes that would actually be
   // STORED turned out identical to the bytes already stored — so nothing was
   // written at all (issue #539). Not folded into skipped_noop: a plain no-op
@@ -615,6 +639,9 @@ export const NO_BASE_EDITOR_REF_CAP = 200;
 // held row keeps a resource stuck, every other moved row in the book would
 // otherwise log an object every night; the counters carry the totals.
 const REF_MOVE_LOG_CAP = 20;
+// Same cap for the per-row "kept over Door43" log in applyTsvRows — see the
+// keep_ai_master branch; the run's merge_kept_ai counter is authoritative.
+const KEPT_LOG_CAP = 20;
 
 // Record one dropped row's identification, and log it, both capped. Kept as one
 // helper so the cap can never be applied to the list but forgotten on the log.
@@ -649,6 +676,7 @@ function zeroCounts(): ReimportCounts {
     twl_reordered: 0,
     merge_adopted: 0,
     merge_conflicts: 0,
+    merge_master_wins: 0,
     merge_noop_skipped: 0,
     merge_refused: 0,
     merge_kept_ai: 0,
@@ -868,6 +896,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.twl_reordered += from.twl_reordered;
   into.merge_adopted += from.merge_adopted ?? 0;
   into.merge_conflicts += from.merge_conflicts ?? 0;
+  into.merge_master_wins += from.merge_master_wins ?? 0;
   into.merge_noop_skipped += from.merge_noop_skipped ?? 0;
   into.merge_refused += from.merge_refused ?? 0;
   into.merge_kept_ai += from.merge_kept_ai ?? 0;
@@ -1241,13 +1270,18 @@ async function runReimport(
   // has already superseded. A resource recognized as our own publish is skipped
   // entirely: recognition means master did not move under us at all.
   const needsLineage = new Set<Resource>();
+  // The pairs whose decline was a measured byte difference, with the state the
+  // comparison ran against — handed to the walk so it can say why master differs
+  // (accountOwnPublishDecline). Same gate as the nightly path.
+  const ownDeclines = new Map<Resource, ResourceSyncState>();
   for (const resource of ALL_RESOURCES) {
     const raw = fetchedRaw[resource];
     if (!want.has(resource) || raw == null) continue;
     const state = await resourceSyncState(env, book, resource);
-    const own = await recognizePushedRender(env, book, resource, raw, state);
+    const own = await recognizePushedRender(raw, state);
     if (!own.recognized) {
       needsLineage.add(resource);
+      if (own.reason === "content_differs") ownDeclines.set(resource, state);
       continue;
     }
     const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, state.pushedEditId, null);
@@ -1276,7 +1310,15 @@ async function runReimport(
     // added once here rather than inside the per-chapter row loops.
     const stats = { noBaseCleared: 0 };
     const lineage = needsLineage.has(resource)
-      ? await loadMasterLineage(env, book, resource, cutoff.confirmedAt, cutoff.editId, stats)
+      ? await loadMasterLineage(
+          env,
+          book,
+          resource,
+          cutoff.confirmedAt,
+          cutoff.editId,
+          stats,
+          ownDeclines.get(resource) ?? null,
+        )
       : null;
     perResource[resource].merge_no_base_cleared += stats.noBaseCleared;
     return { ...cutoff, lineage };
@@ -1897,7 +1939,8 @@ export async function applyTsvRows(
       // bit-toggle"). Nothing about the row's content changed, and bumping the
       // version would invalidate an open editor's If-Match and cost a 409 for a
       // flag nobody needs to see. Guarded on 'ref_moved' so it can never drop an
-      // unacknowledged merge_conflict / merge_kept / merge_no_base.
+      // unacknowledged merge_conflict / merge_no_base (or a merge_kept still
+      // standing from before that kind was retired — the nightly sweep owns those).
       //
       // Applies to protected tn rows (trashed/preserve/hint) too: the protections
       // exist to stop master overwriting CONTENT, and this write touches none —
@@ -2258,7 +2301,7 @@ export async function applyTsvRows(
         // reported 2026-08-21.
         //
         // Guarded on 'ref_moved' exactly like the other clear, so it can never
-        // drop an unacknowledged merge_conflict / merge_kept.
+        // drop an unacknowledged merge_conflict (or a pre-retirement merge_kept).
         //
         // The condition is MEASURED agreement (tsvRefMoved with the protection
         // argument forced off), not the classifier's "none". For a protected tn
@@ -2350,75 +2393,64 @@ export async function applyTsvRows(
         }
       }
 
-      // A both-sides-changed conflict flags the row for in-app review (the
-      // cleanup chip, lint.ts) — atomic with the content write, so the flag can
-      // never be lost separately from the overwrite. The overwritten value is
-      // retained in edit_log (recoverable by an admin) — worded without promising
-      // a per-row history UI or naming internal columns (cold-review #5).
+      // A keep_ai_master conflict (#540 item 2) — both sides changed the field,
+      // and a COMPLETE lineage walk found no Door43 editor's commit behind
+      // master's side — is decided on evidence and asks nothing of a translator:
+      // the app-side edit stands, and the next export that runs for this file
+      // writes it to Door43. Until 2026-09-02 this minted a `merge_kept` review
+      // flag ("Kept over Door43 — verify") on every such row, and prod showed
+      // what that asked of a proofreader: JER tq 3:6, 3:8 and 3:19 sat flagged
+      // from 08-29, because bp-assistant's evening AI push of that chapter was
+      // master's side of the conflict — a fact the flag's own text stated while
+      // asking for a human "verify" anyway. The policy stands (the app-side edit
+      // is the human's, master's side is AI or our own render, so the human's
+      // version wins); what changes is that the outcome is no longer a per-row
+      // warning. It is still counted (merge_kept_ai, above) into the run summary,
+      // and logged per row here WITH master's values, so it can be checked from
+      // the nightly tail rather than believed — the same evidence the flag's
+      // review_master_json used to carry.
       //
-      // Runs BEFORE the "nothing to write" bail below, because a keep_ai_master
-      // conflict writes no content at all: leaving this where it was would have
-      // counted exactly the rows this policy protects as a plain skipped_edited
-      // and told nobody. It is also the ONLY write such a row makes, so it is
-      // guarded against re-writing an identical message — a flag-only write still
-      // bumps the row's version, and this condition recurs every night until a
-      // human resolves it (#539).
-      //
-      // A row the reference-move branch just flagged and HELD keeps that flag:
-      // the hold's message is the only thing telling the translator why this
-      // whole book+resource has stopped exporting, and a kept-conflict message
-      // that replaced it would both destroy that and describe an export that is
-      // not going to run. Scoped to the kept case deliberately — a master-wins
-      // adopt_conflict still overwrites the ref_moved flag exactly as before,
-      // because it also overwrote content and that is the more urgent story.
-      const heldByRefMove = keptAiConflict && fields.review_kind === "ref_moved";
-      if (conflict && !heldByRefMove) {
+      // A kept-ALONE row therefore writes nothing: no flag, no version bump, so
+      // it never 409s an open tab (#539) and recurs harmlessly each night until
+      // the export publishes it. A row that also adopted a field master moved on
+      // its own still writes that adoption. A row the reference-move branch just
+      // flagged and HELD keeps that flag, as before: the hold's message is the
+      // only thing telling the translator why this whole book+resource stopped
+      // exporting.
+      // Capped like the ref_moved_ours log (REF_MOVE_LOG_CAP): an AI re-run over
+      // a chapter of human-edited rows yields dozens of kept rows, every night
+      // until the export publishes them, and each line carries master's text.
+      // merge_kept_ai (already incremented above) is the authoritative count.
+      if (keptAiConflict && counts.merge_kept_ai <= KEPT_LOG_CAP) {
+        console.log("reimport merge kept the app's value over Door43's: no Door43 editor commit measured behind master", {
+          book,
+          kind,
+          id: row.id,
+          keptFields: conflictFields,
+          adoptedOtherFields: adopted,
+          master: masterReviewSnapshot(kind, row),
+        });
+      }
+      // A master-wins conflict flags the row for in-app review (the cleanup
+      // chip, lint.ts) — atomic with the content write, so the flag can never be
+      // lost separately from the overwrite. The overwritten value is retained in
+      // edit_log (recoverable by an admin) — worded without promising a per-row
+      // history UI or naming internal columns (cold-review #5).
+      if (conflict && !keptAiConflict) {
         const labels = conflictFields.map((f) => TSV_FIELD_LABELS[f] ?? f);
-        // Every clause here is bounded by what was actually measured, because
-        // the cheap version of each is a claim this system cannot support:
-        //  - "the note-writing pipeline" would be wrong — the `ai` rule matches
-        //    the unfoldingWord bot ACCOUNT, which also pushes ULT/UST scripture
-        //    and pushes on a named human's behalf (`ULT: EZK 38 [pjoakes]`).
-        //  - "no Door43 editor edited this" would be wrong for the same shape: a
-        //    maintainer may well have directed the change. What was measured is
-        //    narrower — no commit came from a Door43 editor's own account.
-        //  - "will be published" would be a promise this per-row code cannot
-        //    keep. The export is withheld for the WHOLE book+resource by any
-        //    held reference move, a lock, or a recording failure elsewhere in
-        //    the same file, so "the next export that runs for this file" is the
-        //    honest form.
-        //  - "since the last sync" would be the wrong boundary: the walk starts
-        //    at master_confirmed_at, the last publish positively confirmed on
-        //    master, which can be several syncs back.
-        // Outcome first, evidence second: the cleanup chip clamps this to two
-        // lines (BookLintIndicator), so a reader who sees only the opening must
-        // still learn which way it went and what to do about it.
-        const kindLabel = kind.toUpperCase();
-        // #684. Only the master-wins branch below uses it: the KEPT branch's
-        // whole measured claim is that NO Door43 editor's commit was found, so
-        // there is nobody to name there. Empty whenever identity was not
-        // measured (absent lineage, incomplete walk, pre-#684 snapshot), which
-        // leaves both messages byte-identical to what they were.
+        // #684: the identity behind master's side. Empty whenever identity was
+        // not measured (absent lineage, incomplete walk, pre-#684 snapshot),
+        // which leaves the message byte-identical to what it was.
+        //
+        // File-scoped, and said so: the walk sees commits to this book's file,
+        // not to this row. Naming them as this row's own edit would be a claim
+        // the measurement does not make.
         const whoConflict = humanCommitEvidenceClause(cutoff?.lineage);
-        const reason = keptAiConflict
-          ? `Your ${labels.join(" and ")} was kept over Door43's, and the next export that runs for this ` +
-            `file writes it to Door43. If Door43's version is the one you want, put it in here first. ` +
-            `Why: both sides changed this row since the last confirmed publish, and every Door43 commit to ` +
-            `this book's ${kindLabel} file since then came from Bible Editor's own export or the ` +
-            `unfoldingWord bot account — no commit from a Door43 editor's own account was found.` +
-            // A row can keep one contested field AND take another master moved
-            // on its own. Saying only the first would misdescribe the row.
-            (adopted ? ` Door43's changes to this row's other fields were taken.` : "")
-          : `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
-            `Please double-check it.` +
-            // File-scoped, and said so: the walk sees commits to this book's
-            // file, not to this row. Naming them as this row's own edit would
-            // be a claim the measurement does not make.
-            whoConflict;
-        // Distinct review_kind, not just distinct prose: the cleanup chip titles
-        // itself from this column, and "Merged Door43 edit" over a row whose
-        // edit was KEPT is the reverse of what happened (see reviewFlagTitle).
-        const reviewKind = keptAiConflict ? "merge_kept" : "merge_conflict";
+        const reason =
+          `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
+          `Please double-check it.` +
+          whoConflict;
+        const reviewKind = "merge_conflict";
         // The dedup guard compares the reason WITHOUT its #684 identity clause,
         // on both sides (cold review F1).
         //
@@ -2445,10 +2477,9 @@ export async function applyTsvRows(
         if (!sameFinding) {
           fields.review_kind = reviewKind;
           fields.review_reason = reason;
-          // #653: master's own values for the row, so "your value was kept over
-          // Door43's" / "Door43's edit was merged over yours" can be checked
-          // rather than believed. Inside the dedup guard for the same reason as
-          // flagRefMoved's.
+          // #653: master's own values for the row, so "Door43's edit was merged
+          // over yours" can be checked rather than believed. Inside the dedup
+          // guard for the same reason as flagRefMoved's.
           fields.review_master_json = masterReviewSnapshot(kind, row);
         }
       }
@@ -2775,7 +2806,14 @@ export async function applyTsvRows(
         if ((results[j]?.meta.changes ?? 0) > 0) {
           if (u.adopted) {
             counts.merge_adopted++;
-            if (u.conflict) counts.merge_conflicts++;
+            if (u.conflict) {
+              counts.merge_conflicts++;
+              // The merge_conflict review flag (set above only when
+              // `conflict && !keptAiConflict`) is what "flagged for review" counts.
+              // A mixed row that adopted one field but KEPT a contested one for D1
+              // mints no flag, so it must not inflate merge_master_wins (#706).
+              if (!u.keptAiConflict) counts.merge_master_wins++;
+            }
             // `keptConflict` distinguishes the mixed row: master's value landed
             // for a field we never touched, while a CONTESTED field on the same
             // row was kept from D1 (#540 item 2). Without it this line reads as
@@ -3853,10 +3891,25 @@ async function loadMasterLineage(
   // lineage summary that is persisted and serialized into Workflow steps —
   // carrying a per-run side-effect count on it would leak into both.
   stats?: { noBaseCleared: number },
+  // Non-null when own-publish recognition declined tonight with `content_differs`
+  // for this pair: the sync state that comparison ran against. The walk fetched
+  // here is the evidence that attributes the decline (accountOwnPublishDecline),
+  // so it is judged here rather than paying a second Gitea fetch for it.
+  ownDecline: ResourceSyncState | null = null,
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
-  if (!file || confirmedAt == null) return null;
+  if (!file) return null;
+  if (confirmedAt == null) {
+    // No watermark, so no lineage to compute — but the decline still has to be
+    // accounted for, on its own walk. A pair whose very first merge is being
+    // rewritten never GETS a watermark (recognition never fires), so gating the
+    // detector on one would leave it blind for exactly the pairs it exists for
+    // (cold review F3 / Codex P1 on this change).
+    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline);
+    return null;
+  }
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
+  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline);
   const commits = page.commits.map(classifyMasterCommit);
   // #557: narrow "a human touched this file" to "a human touched THIS verse",
   // but only where it is affordable and only where the file-level answer is
@@ -4519,8 +4572,15 @@ async function clearResolvedMergeNoBase(
     };
     const byId = new Map(rs.results.map((r) => [r.id, r] as const));
     let cleared = 0;
-    for (let i = 0; i < clearable.length; i += WRITE_BATCH) {
-      const slice = clearable.slice(i, i + WRITE_BATCH);
+    // CLEAR_PAIR_BATCH (half of WRITE_BATCH): each clear travels as TWO
+    // statements (the UPDATE and its gatedLogEditStmt audit INSERT), so a
+    // full-WRITE_BATCH slice would be 180 statements — over D1's 100-per-batch
+    // cap, which would throw and drop the whole slice (the catch below returns
+    // 0 and the flags stay standing). Same halving as RECLAIM_PAIR_BATCH,
+    // PRISTINE_PAIR_BATCH, SWEEP_PAIR_BATCH and retireMergeKeptFlags.
+    const CLEAR_PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+    for (let i = 0; i < clearable.length; i += CLEAR_PAIR_BATCH) {
+      const slice = clearable.slice(i, i + CLEAR_PAIR_BATCH);
       const stmts: D1PreparedStatement[] = [];
       for (const id of slice) {
         stmts.push(
@@ -4769,6 +4829,91 @@ export async function sweepStaleMergeNoBase(env: Env): Promise<{ pairs: number; 
   }
   console.log("merge_no_base sweep", { flaggedPairs: pairs.length, offset, swept, cleared });
   return { pairs: pairs.length, swept, cleared };
+}
+
+// Retire every standing `merge_kept` flag. The kind is no longer minted (see the
+// keep_ai_master branch in applyTsvRows): a kept-over-Door43 outcome was decided
+// on a complete lineage walk that found no Door43 editor's commit behind master's
+// side, so the flag asked a translator to verify a finding the system had already
+// measured — prod's three JER tq rows (3:6, 3:8, 3:19, flagged 2026-08-29 against
+// bp-assistant's evening AI push) are the case that retired it. Every row this
+// touches was minted under exactly that condition, which is why, unlike
+// clearResolvedMergeNoBase, no re-walk is needed to justify the clear: the mint
+// itself was the measurement.
+//
+// Same write shape as that clear: no version bump (nothing about the row's
+// content moves), guarded on the flag still being `merge_kept` so a stronger flag
+// raised in between 0-changes, never on a tombstone, and PAIRED with an edit_log
+// `sync_clear_review` row carrying the retired flag and its snapshot — a warning
+// that disappears with nothing but a console line behind it is the shape nobody
+// can audit later. Runs inside the nightly sweep step (exportWorkflow.ts), so it
+// is unscoped-nightly-only and skipped on dryDcs like the sweep it rides with.
+// Cheap and self-limiting: one SELECT per kind, one write batch per WRITE_BATCH
+// rows, and once the backlog is gone every night's SELECT comes back empty.
+const MERGE_KEPT_RETIRE_ACTOR = "nightly merge_kept flag retirement";
+
+export async function retireMergeKeptFlags(env: Env): Promise<{ flagged: number; cleared: number }> {
+  const kinds: TsvKind[] = ["tn", "tq", "twl"];
+  let flagged = 0;
+  let cleared = 0;
+  const now = Math.floor(Date.now() / 1000);
+  for (const kind of kinds) {
+    try {
+      const rs = await env.DB.prepare(
+        `SELECT id, book, review_reason, review_master_json FROM ${TSV_TABLE[kind]}
+          WHERE review_kind = 'merge_kept' AND deleted_at IS NULL`,
+      ).all<{ id: string; book: string; review_reason: string | null; review_master_json: string | null }>();
+      flagged += rs.results.length;
+      // Two statements per row (UPDATE + audit INSERT), so the slice is HALF
+      // WRITE_BATCH: D1 caps one batch() at 100 statements, and a 90-row slice
+      // would be 180 (Codex review). Same halving as RECLAIM_PAIR_BATCH.
+      const pairBatch = Math.floor(WRITE_BATCH / 2);
+      for (let i = 0; i < rs.results.length; i += pairBatch) {
+        const slice = rs.results.slice(i, i + pairBatch);
+        const stmts: D1PreparedStatement[] = [];
+        for (const r of slice) {
+          stmts.push(
+            env.DB.prepare(
+              // #686: review_clear by an unattended code-policy sweep. Door43 had
+              // no part in this write (nothing was walked, nothing on master is
+              // being reported), so `system` with the job named as actor — the
+              // same shape as the nightly TWL reorder — rather than the
+              // `dcs_sync` / "Door43 sync" the lineage-justified clears use.
+              `UPDATE ${TSV_TABLE[kind]}
+                  SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1, ${provenanceSet(4)}
+                WHERE id = ?2 AND book = ?3 AND review_kind = 'merge_kept' AND deleted_at IS NULL`,
+            ).bind(now, r.id, r.book, ...provenanceValues({ action: "review_clear", source: "system", actor: MERGE_KEPT_RETIRE_ACTOR })),
+          );
+          stmts.push(
+            gatedLogEditStmt(env, kind, r.id, r.book, null, null, 0, "sync_clear_review", {
+              review_kind: "merge_kept",
+              review_reason: r.review_reason,
+              review_master_json: r.review_master_json,
+              evidence: {
+                retired_kind: true,
+                reason:
+                  "merge_kept is no longer minted: the kept-over-Door43 outcome was decided on a complete " +
+                  "lineage walk with no Door43 editor commit behind master's side, so the flag asked a " +
+                  "translator to verify an already-measured finding",
+              },
+            }),
+          );
+        }
+        const results = await env.DB.batch(stmts);
+        // Two statements per row, UPDATE first: only the UPDATEs are counted.
+        results.forEach((r, j) => {
+          if (j % 2 === 0 && (r?.meta.changes ?? 0) > 0) cleared++;
+        });
+      }
+    } catch (e) {
+      console.error("merge_kept retire: failed", {
+        kind,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  if (flagged > 0) console.log("merge_kept retire", { flagged, cleared });
+  return { flagged, cleared };
 }
 
 // Durable counterpart to the console.log above — see 0054_master_lineage_snapshot.sql
@@ -6255,6 +6400,15 @@ async function applyVerseRows(
       mc.action !== "adopt_no_visible_change",
   );
   counts.merge_conflicts += liveConflicts.length;
+  // The rows a human must review — every landed conflict EXCEPT keep_ai_master,
+  // which is D1-wins and reported on its own summary line (#706). On verses this
+  // equals the old `merge_conflicts - merge_kept_ai` render exactly (keep_ai_master
+  // is a subset of liveConflicts here); it is a distinct counter so the TSV side,
+  // where the two counters do not nest, can report the same fact without the
+  // subtraction cancelling a real flag against an unrelated kept-alone row.
+  counts.merge_master_wins += liveConflicts.filter(
+    (mc) => mc.action !== "keep_ai_master",
+  ).length;
   if (recordFailed) counts.merge_record_failed = true;
 
   return counts;
@@ -6583,7 +6737,7 @@ export async function recordResourceSync(
 // method is shaped the way it is is the Cloudflare subrequest budget (see the
 // nightly-sync-subrequest-cap lesson in STATE.md) — this keeps the own-publish
 // recognition free of any extra D1 round trip.
-interface ResourceSyncState {
+export interface ResourceSyncState {
   sourceSha: string | null;
   // When we last stamped this pair's watermark, i.e. when D1 adopted
   // `sourceSha` (migration 0028, so present in every fallback tier below except
@@ -6721,12 +6875,14 @@ async function resourceSyncState(env: Env, book: string, resource: Resource): Pr
 // EXPORT_ALERT_USERNAME, both local copies for the same reason. Keep in sync.
 const OWN_PUBLISH_ALERT_USERNAME = "deferredreward";
 
-// Consecutive declines before we raise a banner. Three, not one: a single decline
-// is the ordinary healthy case (a real Door43 edit, or our branch simply hasn't
-// merged yet), and even two in a row is unremarkable for an actively-edited book.
-// Three consecutive nights where the comparison had something real to compare
-// against and still differed is the point where "the merge is rewriting our bytes,
-// so this whole fix is inert" becomes worth a human's attention.
+// Consecutive MEASURED rewrites (accountOwnPublishDecline's "rewritten" verdict:
+// our own merge is master's newest commit to the file and the bytes still differ)
+// before we raise a banner. Declines that a Door43 editor's or the bot's commit
+// explains no longer count at all — they were what tripped this banner for JER
+// tq on 2026-09-01, three nights of evening AI pushes in a row — so a single
+// rewrite is already strong evidence. Three stays as the bar anyway: one night's
+// verdict rests on one author date and one classification, and the banner asks a
+// human to act on it.
 const OWN_PUBLISH_INERT_THRESHOLD = 3;
 
 // The ONE place both entry paths run the byte comparison, so the nightly cron and
@@ -6734,80 +6890,216 @@ const OWN_PUBLISH_INERT_THRESHOLD = 3;
 // decided or accounted for. What each does with the verdict still differs, and
 // deliberately (see the call sites) — this owns the decision, not the response.
 //
-// Also owns the decline bookkeeping that makes the fix's own inertness visible:
-// a `content_differs` verdict increments the counter and, at the threshold, raises
-// a banner. A recognition resets the counter for free, inside the watermark UPDATE.
-async function recognizePushedRender(
-  env: Env,
-  book: string,
-  resource: Resource,
-  raw: string,
-  sync: ResourceSyncState,
-): Promise<OwnPublishResult> {
+// The decline bookkeeping that makes the fix's own inertness visible does NOT
+// live here any more: a `content_differs` verdict is attributed later the same
+// run, from the lineage walk (accountOwnPublishDecline, called by
+// loadMasterLineage), because only the walk can say WHY master differs. A
+// recognition still resets the counter for free, inside the watermark UPDATE.
+async function recognizePushedRender(raw: string, sync: ResourceSyncState): Promise<OwnPublishResult> {
   // Warm-up short-circuit: with nothing recorded to compare against the verdict is
   // fixed regardless of the bytes, so don't hash a whole book file to learn it.
   if (!sync.pushedBlobSha) return { recognized: false, readAt: null, reason: "no_pushed_render" };
 
-  const own = recognizeOwnPublish({
+  return recognizeOwnPublish({
     masterBlobSha: await gitBlobShaOrNull(raw),
     pushedBlobSha: sync.pushedBlobSha,
     pushedReadAt: sync.pushedReadAt,
   });
-
-  // Only `content_differs` counts. The other declines mean the comparison never
-  // really ran (unhashable master, half-written row), and counting "we couldn't
-  // measure" as "we measured a difference" is the absent-measurement-as-evidence
-  // mistake this codebase has a standing rule against.
-  if (own.reason === "content_differs") {
-    await noteOwnPublishDecline(env, book, resource, sync);
-  }
-  return own;
 }
 
-// Increment the consecutive-decline counter and, on crossing the threshold, raise
-// the banner. Best-effort throughout: this is observability, and it must never
-// fail a sync that is otherwise doing its job correctly.
-async function noteOwnPublishDecline(
+// Attribute tonight's `content_differs` decline by MEASURING the merge of our
+// push (findOurMergeAfterRead + judgeOwnPublishDecline in ownPublish.ts have the
+// argument), and keep the measured-rewrite counter that drives the inert banner:
+//   preserved  — the merge of our push holds exactly the bytes we pushed, so the
+//                merge job is proven not to be rewriting this file; tonight's
+//                mismatch is whatever landed after it (named from the walk).
+//                Counter to 0, and any standing banner comes down — this is the
+//                one observation that refutes the banner's claim.
+//   rewritten  — the merge of our push holds other bytes: the merge job changed
+//                what we pushed, measured directly, whatever landed afterwards.
+//                Counter +1; on crossing the threshold, the banner.
+//   unmeasured — nothing to say tonight (walk empty, tonight's branch not merged
+//                yet, missing dates, tree read failed). The counter does not move
+//                on absence, in either direction.
+// The walk is the lineage walk when the pair has one (its window starts at
+// master_confirmed_at, which is always older than pushed_read_at), and a fresh
+// one from pushed_read_at when it does not. The blob read is one tree fetch per
+// declining pair per night, only when a merge after the read exists.
+//
+// Only `content_differs` reaches here (the call sites gate on it). The other
+// declines mean the comparison never really ran (unhashable master, half-written
+// row), and counting "we couldn't measure" as "we measured a difference" is the
+// absent-measurement-as-evidence mistake this codebase has a standing rule
+// against. Best-effort throughout: this is observability, and it must never fail
+// a sync that is otherwise doing its job correctly.
+async function accountOwnPublishDecline(
   env: Env,
   book: string,
   resource: Resource,
+  file: { repo: string; path: string },
+  walked: MasterCommitPage | null,
   sync: ResourceSyncState,
 ): Promise<void> {
-  const next = (sync.declines ?? 0) + 1;
+  const source = `own_publish_inert:${book}:${resource}`;
   try {
-    await env.DB.prepare(
-      `UPDATE book_resource_syncs SET own_publish_declines = ?3 WHERE book = ?1 AND resource = ?2`,
+    if (!sync.pushedBlobSha) return; // content_differs implies a pushed render; defensive only
+    // ONE read of the row, taken now: the render (blob, read time), the counter,
+    // and the export PR stamped for that render (exportWorkflow.ts recordPushedPr;
+    // migration 0061). All from the same statement so an export landing between
+    // the comparison's earlier read of `sync` and this point cannot pair one
+    // render's blob with another render's PR (Codex verify pass on PR #704). The
+    // PR counts only when its pushed_pr_read_at equals the row's pushed_read_at:
+    // recordPushedRender advances the render without clearing the PR columns, so
+    // a mismatch means the PR on the row belongs to the PREVIOUS render — the
+    // current push has no PR on record (yet, or ever, if creation failed), and
+    // there is no merge to look for. Not derived from export_snapshots by time,
+    // either: two overlapping exports can record their snapshots out of order.
+    const row = await env.DB.prepare(
+      `SELECT pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number, pushed_pr_read_at
+         FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
     )
-      .bind(book, resource, next)
-      .run();
+      .bind(book, resource)
+      .first<{
+        pushed_blob_sha: string | null;
+        pushed_read_at: number | null;
+        own_publish_declines: number | null;
+        pushed_pr_number: number | null;
+        pushed_pr_read_at: number | null;
+      }>();
+    const pushedBlobSha = row?.pushed_blob_sha ?? null;
+    const pushedReadAt = row?.pushed_read_at ?? null;
+    const prior = row?.own_publish_declines ?? 0;
+    if (!pushedBlobSha) return;
+    // The comparison that declined ran against `sync`; if the row's render has
+    // moved since, tonight's `content_differs` was about a render that is no
+    // longer the one on the row — nothing to attribute to it.
+    if (pushedBlobSha !== sync.pushedBlobSha) {
+      console.log("reimport own-publish decline unmeasured: the pushed render moved during the run", {
+        book,
+        resource,
+        comparedBlobSha: sync.pushedBlobSha,
+        rowBlobSha: pushedBlobSha,
+      });
+      return;
+    }
+    const prNumber =
+      row?.pushed_pr_number != null && row.pushed_pr_read_at != null && row.pushed_pr_read_at === pushedReadAt
+        ? row.pushed_pr_number
+        : null;
+    const page =
+      walked ??
+      (pushedReadAt == null
+        ? { commits: [], incomplete: true, incompleteReason: "no_pushed_read_at" }
+        : await listMasterCommitsSince(env, file.repo, file.path, null, {
+            sinceTime: pushedReadAt,
+            pageLimit: 2,
+          }));
+    const commits = page.commits.map(classifyMasterCommit);
+    const ourMerge = findOurMergeForPr(commits, prNumber);
+    const mergedBlobSha = ourMerge.found ? await fileBlobShaAtCommit(env, file.repo, file.path, ourMerge.commit.sha) : null;
+    const judged = judgeOwnPublishDecline({
+      ourMerge,
+      mergedBlobSha,
+      pushedBlobSha,
+      newest: commits[0],
+    });
+
+    if (judged.verdict === "unmeasured") {
+      console.log("reimport own-publish decline unmeasured: counter unchanged", {
+        book,
+        resource,
+        reason: judged.reason,
+        prNumber,
+        measuredRewrites: prior,
+        pushedReadAt,
+        walkedFrom: walked ? "lineage" : "pushed_read_at",
+      });
+      return;
+    }
+    if (judged.verdict === "preserved") {
+      await env.DB.prepare(
+        `UPDATE book_resource_syncs SET own_publish_declines = 0, own_publish_rewrite_sha = NULL
+          WHERE book = ?1 AND resource = ?2 AND (own_publish_declines <> 0 OR own_publish_rewrite_sha IS NOT NULL)`,
+      )
+        .bind(book, resource)
+        .run();
+      await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+        .bind(OWN_PUBLISH_ALERT_USERNAME, source)
+        .run();
+      console.log("reimport own-publish decline explained: our merge landed our exact bytes; a later commit moved the file", {
+        book,
+        resource,
+        prNumber,
+        mergeSha: judged.mergeSha,
+        mergeDate: judged.mergeDate,
+        pushedBlobSha: sync.pushedBlobSha,
+        newestKind: judged.newest?.kind ?? null,
+        newestSha: judged.newest?.sha ?? null,
+        newestAuthor: judged.newest?.author ?? null,
+        newestDate: judged.newest?.date ?? null,
+        resetFrom: prior,
+      });
+      return;
+    }
+    // Count each rewritten MERGE once (0061's own_publish_rewrite_sha): the same
+    // merge measured again — by a retried Workflow step tonight, or on later
+    // nights when no new export pushed (locked book, nothing changed) — adds
+    // nothing. Atomic in the same statement, so a retry cannot double-count.
+    const bumped = await env.DB.prepare(
+      `UPDATE book_resource_syncs
+          SET own_publish_declines = own_publish_declines + 1, own_publish_rewrite_sha = ?3
+        WHERE book = ?1 AND resource = ?2 AND (own_publish_rewrite_sha IS NULL OR own_publish_rewrite_sha <> ?3)
+        RETURNING own_publish_declines`,
+    )
+      .bind(book, resource, judged.mergeSha)
+      .first<{ own_publish_declines: number }>();
+    if (!bumped) {
+      console.log("reimport own-publish decline: this rewritten merge was already counted", {
+        book,
+        resource,
+        mergeSha: judged.mergeSha,
+        measuredRewrites: prior,
+      });
+      return;
+    }
+    const next = bumped.own_publish_declines;
+    console.log("reimport own-publish decline measured as a rewrite: the merge of our push holds different bytes", {
+      book,
+      resource,
+      prNumber,
+      mergeSha: judged.mergeSha,
+      mergeDate: judged.mergeDate,
+      mergedBlobSha: judged.mergedBlobSha,
+      pushedBlobSha: sync.pushedBlobSha,
+      measuredRewrites: next,
+    });
+    // Raise on the CROSSING only (prior below, next at or above), so a standing
+    // state does not re-raise nightly — and a dismissed banner stays dismissed
+    // until a preserved/recognized night resets the count and it climbs again.
+    if (prior < OWN_PUBLISH_INERT_THRESHOLD && next >= OWN_PUBLISH_INERT_THRESHOLD) {
+      await raiseOwnPublishInertAlert(env, book, resource, next, sync, judged);
+    }
   } catch (e) {
-    console.error("reimport own-publish decline counter failed", {
+    console.error("reimport own-publish decline accounting failed", {
       book,
       resource,
       error: e instanceof Error ? e.message : String(e),
     });
-    return;
   }
-  console.log("reimport own-publish declined: master differs from our last render", {
-    book,
-    resource,
-    consecutiveDeclines: next,
-  });
-  if (next === OWN_PUBLISH_INERT_THRESHOLD) await raiseOwnPublishInertAlert(env, book, resource, next, sync);
 }
 
-// Banner for "recognition keeps declining." Fires ONCE, on the run that crosses
-// the threshold (`next === THRESHOLD`, not `>=`), so a book that stays in this
-// state doesn't rewrite the alert every night; the counter keeps climbing and a
-// single match clears it.
-//
-// The wording states ONLY what was measured. Two explanations fit these
-// observations and this code cannot tell them apart: continuous out-of-band Door43
-// editing (benign, expected for an actively-worked file) or Door43's merge
-// rewriting the bytes we pushed (which makes this entire fix inert and lets the
-// nightly reverts continue silently). Asserting either would repeat the mistake
-// this repo has a standing lesson about, so the message names both and gives the
-// one comparison that separates them.
+// Lets reimportJourney.test.mjs drive the REAL accounting (its SQL and its
+// Gitea reads, against a mocked fetch) — same rationale as the other *ForTest
+// aliases above.
+export const accountOwnPublishDeclineForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+  file: { repo: string; path: string },
+  walked: MasterCommitPage | null,
+  sync: ResourceSyncState,
+): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync);
+
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
 // a chapter lock clears when the AI job finishes, so that withhold releases
@@ -6876,8 +7168,10 @@ async function raiseKeptOverDoor43Alert(
     `account — no commit from a Door43 editor's own account was found. That is the intended policy ` +
     `(AI-written content on Door43 does not overwrite a later app edit), but at this many rows it is ` +
     `worth a look before the next export writes them to Door43: the same count would appear if the commit ` +
-    `classification were wrong — a second bot identity, or a rewritten history on Door43. Each affected ` +
-    `row is flagged in the app for review, and the verses are in ${book}'s merge-review banner.`;
+    `classification were wrong — a second bot identity, or a rewritten history on Door43. TSV rows carry ` +
+    `no review flag for this (the outcome was measured, not inferred); each is logged in the nightly tail ` +
+    `as "reimport merge kept the app's value over Door43's" with Door43's values. The verses are in ` +
+    `${book}'s merge-review banner.`;
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)
@@ -6997,23 +7291,41 @@ async function clearTombstoneBlockAlert(env: Env, book: string, resource: Resour
   }
 }
 
+// Banner for "the merge keeps changing our bytes." Raised by accountOwnPublishDecline
+// on the night the measured-rewrite counter CROSSES the threshold (once per climb —
+// the counter keeps climbing while the state persists, but the banner is not
+// rewritten nightly, and a dismissed one stays dismissed until the count resets and
+// climbs again). It comes down on the first byte match (markOwnPublishConverged) or
+// the first night the merge of our push is measured to hold our exact bytes
+// (accountOwnPublishDecline's `preserved`).
+//
+// The wording states ONLY what was measured, and this banner now has a measurement
+// to state: the file's blob sha at the master commit that merged our push is not
+// the blob sha we pushed. That is the merge job changing our content — whatever an
+// editor or the bot did afterwards — so the text names the cause, its consequence,
+// and the shas that let a human confirm it, instead of listing two explanations
+// and asking for a `git hash-object`. "Measured on N syncs" rather than "N in a
+// row": nights the merge had not landed yet, or the tree read failed, are not
+// counted either way and may sit between the measured ones.
 async function raiseOwnPublishInertAlert(
   env: Env,
   book: string,
   resource: Resource,
-  declines: number,
+  rewrites: number,
   sync: ResourceSyncState,
+  judged: Extract<OwnPublishDeclineVerdict, { verdict: "rewritten" }>,
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   const message =
-    `Benjamin — for ${declines} syncs in a row, Door43's ${book} ${resource.toUpperCase()} file has differed from ` +
-    `the exact bytes our export last pushed (our blob ${(sync.pushedBlobSha ?? "none").slice(0, 12)}). ` +
-    `Two things produce this and the sync cannot tell them apart: someone is editing that file on Door43 ` +
-    `between every run (normal for an actively-edited book), or Door43's validate-and-merge job is rewriting ` +
-    `our file when it merges — the second would mean the fix that stops the nightly sync reverting editor ` +
-    `work is silently doing nothing for this file. To tell them apart, compare Door43's current file against ` +
-    `our last push: \`git hash-object\` the file from master and check it against that blob sha. ` +
-    `This clears itself the first time they match.`;
+    `Benjamin — on ${rewrites} nightly syncs since the last time Door43's ${book} ${resource.toUpperCase()} file ` +
+    `matched our export, the merge of our own push has landed with different bytes from the ones we pushed. ` +
+    `Latest: master commit ${judged.mergeSha.slice(0, 12)}${judged.mergeDate ? ` (${judged.mergeDate.slice(0, 10)})` : ""} ` +
+    `holds blob ${judged.mergedBlobSha.slice(0, 12)}; we pushed blob ${(sync.pushedBlobSha ?? "none").slice(0, 12)}. ` +
+    `That is Door43's validate-and-merge job changing the file as it merges — measured at the merge commit itself, ` +
+    `so it is not an editor's or the bot's later commit. While that holds, master never reads as our own render, ` +
+    `the merge-ancestor watermark for this file stays frozen, and the protection against the nightly sync ` +
+    `reverting editor work is inert for it. Confirm with \`git hash-object\` on the file at that commit. This ` +
+    `clears itself the first night the merge of our push holds our exact bytes.`;
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)
@@ -7850,7 +8162,7 @@ async function planAndStageBookResources(
     // byte match against our own render is strictly stronger evidence of
     // completeness than that gate's row-count heuristic, and running first
     // saves its D1 count query on a converged resource.
-    const own = await recognizePushedRender(env, book, resource, raw, sync);
+    const own = await recognizePushedRender(raw, sync);
     if (own.recognized) {
       const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, sync.pushedEditId, masterSha);
       console.log("reimport recognized master's movement as our own publish", {
@@ -7889,18 +8201,15 @@ async function planAndStageBookResources(
       continue;
     }
     if (own.reason === "content_differs") {
-      // How we find out whether this fix is actually working in prod. A decline
-      // here is EITHER the correct answer (a genuine foreign commit on master,
-      // which is what the three-way merge is for) OR the one way this fix could
-      // be quietly inert: if the DCS validate-and-merge Action rewrites the file
-      // on merge — reformatting, re-encoding, normalizing line endings — master's
-      // bytes would never equal ours and recognition would never fire, with no
-      // symptom other than the AMOS reverts continuing. The two are
-      // indistinguishable from inside this function, so log the fact rather than
-      // assert a cause (standing rule: an alert may only state what it measured).
-      // `wrangler tail | grep own-publish` across a few nights separates them:
-      // all-declines on books nobody edits on Door43 means the bytes are being
-      // rewritten and the recognition needs to move to a normalized comparison.
+      // A decline here is EITHER the correct answer (a genuine foreign commit on
+      // master, which is what the three-way merge is for) OR the one way this fix
+      // could be quietly inert: if the DCS validate-and-merge Action rewrites the
+      // file on merge — reformatting, re-encoding, normalizing line endings —
+      // master's bytes would never equal ours and recognition would never fire,
+      // with no symptom other than the AMOS reverts continuing. The two are
+      // indistinguishable from the bytes alone, so this logs the fact and leaves
+      // the cause to the lineage walk below (loadMasterLineage →
+      // accountOwnPublishDecline), whose newest commit says which it was.
       console.log("reimport own-publish declined: master differs from our last render", {
         book,
         resource,
@@ -7995,6 +8304,9 @@ async function planAndStageBookResources(
       stageCutoff.confirmedAt,
       stageCutoff.editId,
       noBaseStats,
+      // Tonight's own-publish decline, for the walk to attribute — only the
+      // verdict that means "we measured a difference" (see accountOwnPublishDecline).
+      own.reason === "content_differs" ? sync : null,
     );
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);

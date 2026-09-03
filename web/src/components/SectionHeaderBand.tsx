@@ -1,9 +1,15 @@
-// A styled band that renders a section header (\s1, \s2, \s3) above
+// A styled band that renders a section header (\s1, \s2, \s3) — or one of
+// the header/reference/label markers (\sp, \sr, \r, \cl — see #710) — above
 // the verse it belongs to. These are translator-supplied editorial
-// headings — they are NOT aligned to Hebrew/Greek source words, so we
+// headings/labels — they are NOT aligned to Hebrew/Greek source words, so we
 // hoist them out of the verse body (see splitSectionHeaders in lib/usfm)
 // to make their non-alignable status visually obvious and to keep the
 // alignment panel from ever seeing them as word-level targets.
+//
+// The tag dropdown below only ever offers \s1-\s3 — retagging a \sp/\sr/\r/
+// \cl label through it turns it into a section heading (Shell.tsx's
+// saveSectionEdit adds the `type:"section"` field that requires); there is
+// no reverse path back to a specific label tag from here.
 //
 // `\d` Psalm superscriptions are also `type:"section"` in usfm-js but
 // ARE alignable Hebrew — they're rendered inline in the verse body, not
