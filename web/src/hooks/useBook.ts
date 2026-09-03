@@ -21,7 +21,7 @@ import {
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
-import { applyBridged, applySplit, applyUpdated, reduceVerses, type ChapterData } from "../lib/verseStructure";
+import { applySplit, applyStep, applyUpdated, reduceVerses, type ChapterData } from "../lib/verseStructure";
 
 export type ChapterState =
   | { kind: "unloaded" }
@@ -186,18 +186,20 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
 
   const applyLocalVerseBridge = useCallback<UseBookReturn["applyLocalVerseBridge"]>(
     (bridge, removedVerse, absorbedVerses, removedVersion) => {
-      reduceChapter(bridge.chapter, (data) => {
-        const next = reduceVerses(data, bridge.bible_version, (s) => applyBridged(s, bridge, removedVerse, removedVersion));
-        // Identity: an equal-or-newer picture of this bridge is already held —
-        // see useChapter.applyLocalVerseBridge.
-        if (next === data) return data;
-        const absorbed = new Set(absorbedVerses);
-        return {
-          ...next,
-          verseStatuses: next.verseStatuses.filter((s) => !absorbed.has(s.verse)),
-          verseLaneChecks: next.verseLaneChecks.filter((c) => !absorbed.has(c.verse)),
-        };
-      });
+      // Same step as useChapter.applyLocalVerseBridge: applyStep owns the
+      // absorbed verses' status / lane-check prune (gated on the absorbed row
+      // actually leaving the map, not on a mere tombstone write), so the two
+      // hooks cannot drift.
+      reduceChapter(bridge.chapter, (data) =>
+        applyStep(data, {
+          type: "bridged",
+          bibleVersion: bridge.bible_version,
+          bridge,
+          removedVerse,
+          removedVersion,
+          absorbedVerses,
+        }),
+      );
     },
     [reduceChapter],
   );

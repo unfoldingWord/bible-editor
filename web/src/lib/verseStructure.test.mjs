@@ -3,7 +3,7 @@
 // any delivery order (#729). Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/verseStructure.test.mjs
 
-import { applyBridged, applySplit, applyUpdated, mergeRefetched, replaySteps } from "./verseStructure.ts";
+import { applyBridged, applySplit, applyStep, applyUpdated, mergeRefetched, replaySteps } from "./verseStructure.ts";
 
 let failed = 0;
 let passed = 0;
@@ -473,11 +473,17 @@ for (const sc of scenarios) {
     const step = bridged(row(1, 8, "a-b", 2), 2, 7);
     const local = replaySteps(prev, [step]);
     assert(!(2 in local.verses.ult) && local.verseTombstones.ult[2] === 7, "setup: the bridge applied locally (2 removed, tombstone 7)");
-    const fetched = payload([row(1, 9, "a"), row(2, 9, "b2")]);
+    const fetched = payload([row(1, 9, "a"), row(2, 9, "b2")], {
+      verseStatuses: [{ verse: 1, done: 1 }, { verse: 2, done: 1 }],
+      verseLaneChecks: [{ verse: 2, lane: "x", checked_by: 1 }],
+    });
     const out = replaySteps(mergeRefetched(local, fetched), [step]);
     assert(out.verses.ult[2]?.version === 9 && out.verses.ult[2].content === "b2", "fetched recreated 2@9 survives the replayed bridge (rm 2@7)");
     assert(out.verses.ult[1].version === 9 && out.verses.ult[1].verse_end === null, "fetched 1@9 is not clobbered by the replayed bridge start 1-2@8");
     assert(out.verseTombstones?.ult?.[2] === 7, "the replayed bridge re-records its tombstone (harmless: 9 > 7)");
+    // Recording the tombstone alone must not prune: verse 2 is still a row.
+    assert(out.verseStatuses.length === 2 && out.verseStatuses.some((s) => s.verse === 2), "retained verse 2 keeps its status through the stale replayed bridge");
+    assert(out.verseLaneChecks.length === 1 && out.verseLaneChecks[0].verse === 2, "retained verse 2 keeps its lane check through the stale replayed bridge");
   }
 
   // 3. An empty queue is identical to mergeRefetched (identity).
@@ -529,6 +535,88 @@ for (const sc of scenarios) {
     assert(!(2 in out.verses.ult) && out.verses.ult[1].version === 6 && out.verses.ult[1].verse_end === 2, "replayed bridge over a pre-bridge snapshot removes 2@3 and keeps the local 1-2@6");
     assert(out.verseStatuses.length === 1 && out.verseStatuses[0].verse === 1, "absorbed verse 2's status is pruned on replay");
     assert(out.verseLaneChecks.length === 0, "absorbed verse 2's lane checks are pruned on replay");
+  }
+
+  // 7. A stale bridge that RETAINS the absorbed verse (local row newer than
+  //    removedVersion) records its tombstone but must not prune the verse's
+  //    status / lane checks — the row is still there, and its checkoffs with
+  //    it. Pre-fix, `applyStep` read "state changed" (the tombstone write) as
+  //    "bridge applied" and emptied both lists for a live verse.
+  const statused = (rows) =>
+    payload(rows, {
+      verseStatuses: [{ verse: 1, done: 1 }, { verse: 2, done: 1 }],
+      verseLaneChecks: [{ verse: 2, lane: "x", checked_by: 1 }, { verse: 1, lane: "y", checked_by: 1 }],
+    });
+  // 7a. Replay path: fetched verse 2@9, replayed bridge rm 2@7.
+  {
+    const prev = statused([row(1, 9, "a"), row(2, 9, "b2")]);
+    const fetched = statused([row(1, 9, "a"), row(2, 9, "b2")]);
+    const step = bridged(row(1, 8, "a-b", 2), 2, 7);
+    const out = replaySteps(mergeRefetched(prev, fetched), [step]);
+    assert(out.verses.ult[2]?.version === 9, "replay: verse 2@9 is retained over a stale bridge (rm 2@7)");
+    assert(out.verseTombstones?.ult?.[2] === 7, "replay: the stale bridge still records its tombstone");
+    assert(out.verseStatuses.length === 2 && out.verseStatuses.some((s) => s.verse === 2 && s.done === 1), "replay: retained verse 2 keeps its status");
+    assert(out.verseLaneChecks.length === 2 && out.verseLaneChecks.some((c) => c.verse === 2 && c.lane === "x"), "replay: retained verse 2 keeps its lane check");
+  }
+  // 7b. Live path (`applyStep` directly): a reordered stale verse.bridged event.
+  {
+    const prev = statused([row(1, 9, "a"), row(2, 9, "b2")]);
+    const out = applyStep(prev, bridged(row(1, 8, "a-b", 2), 2, 7));
+    assert(out !== prev, "live: the tombstone write changes state");
+    assert(out.verses.ult[2]?.version === 9 && out.verses.ult[1].version === 9, "live: neither row is touched by the stale bridge");
+    assert(out.verseTombstones?.ult?.[2] === 7, "live: the tombstone is recorded");
+    assert(out.verseStatuses === prev.verseStatuses, "live: verseStatuses untouched (same array) when no row was removed");
+    assert(out.verseLaneChecks === prev.verseLaneChecks, "live: verseLaneChecks untouched (same array) when no row was removed");
+  }
+  // 7c. Positive control: removedVersion >= local version → the row is deleted
+  //     AND its status / lane checks are pruned (live and replay agree).
+  {
+    const prev = statused([row(1, 5, "a"), row(2, 7, "b")]);
+    for (const [label, out] of [
+      ["live", applyStep(prev, bridged(row(1, 8, "a-b", 2), 2, 7))],
+      ["replay", replaySteps(mergeRefetched(prev, statused([row(1, 5, "a"), row(2, 7, "b")])), [bridged(row(1, 8, "a-b", 2), 2, 7)])],
+    ]) {
+      assert(!(2 in out.verses.ult) && out.verses.ult[1].verse_end === 2, `${label} control: 2@7 is removed by rm 2@7 and 1-2@8 lands`);
+      assert(out.verseStatuses.length === 1 && out.verseStatuses[0].verse === 1, `${label} control: absorbed verse 2's status is pruned`);
+      assert(out.verseLaneChecks.length === 1 && out.verseLaneChecks[0].verse === 1, `${label} control: absorbed verse 2's lane check is pruned`);
+    }
+  }
+  // 7d. Absorbing a bridge row prunes every verse it covered, keyed on the
+  //     removed row: 1-2@5 absorbs the 3-4@7 row (removedVerse 3, absorbed
+  //     [3, 4]) — verse 4 was never a row key but its status goes too.
+  {
+    const prev = payload([row(1, 5, "a-b", 2), row(3, 7, "c-d", 4)], {
+      verseStatuses: [{ verse: 1, done: 1 }, { verse: 3, done: 1 }, { verse: 4, done: 1 }],
+      verseLaneChecks: [{ verse: 4, lane: "x", checked_by: 1 }],
+    });
+    const out = applyStep(prev, bridged(row(1, 6, "a-b-c-d", 4), 3, 7, [3, 4]));
+    assert(!(3 in out.verses.ult) && out.verses.ult[1].verse_end === 4, "range control: the 3-4 row is removed and 1-4@6 lands");
+    assert(out.verseStatuses.length === 1 && out.verseStatuses[0].verse === 1, "range control: statuses for 3 and 4 are pruned");
+    assert(out.verseLaneChecks.length === 0, "range control: verse 4's lane check is pruned");
+    // …and the same bridge arriving stale (3-4 already recreated at 9) prunes nothing.
+    const newer = { ...prev, verses: { ult: map(row(1, 5, "a-b", 2), row(3, 9, "c-d", 4)) } };
+    const stale = applyStep(newer, bridged(row(1, 6, "a-b-c-d", 4), 3, 7, [3, 4]));
+    assert(stale.verses.ult[3]?.version === 9 && stale.verseTombstones?.ult?.[3] === 7, "range stale: 3-4@9 retained, tombstone 7 recorded");
+    assert(stale.verseStatuses === newer.verseStatuses && stale.verseLaneChecks === newer.verseLaneChecks, "range stale: statuses / lane checks untouched");
+  }
+  // 7e. Absent both before and after: a stale echo against a freshly loaded
+  //     bridge (no local row 2, no tombstone) writes only the tombstone, yet
+  //     verse 2's status is an orphan of a row that no longer exists and is
+  //     pruned (as the server does post-confirm). The retained-row case above
+  //     is the one that must never prune; this one has no live verse to harm.
+  {
+    const prev = statused([row(1, 6, "a-b", 2)]);
+    const out = applyStep(prev, bridged(row(1, 6, "a-b", 2), 2, 3));
+    assert(out !== prev && out.verseTombstones?.ult?.[2] === 3 && out.verses.ult[1] === prev.verses.ult[1], "absent-both: only the tombstone is written to the verse map");
+    assert(out.verseStatuses.length === 1 && out.verseStatuses[0].verse === 1, "absent-both: rowless verse 2's orphaned status is pruned");
+    assert(out.verseLaneChecks.length === 1 && out.verseLaneChecks[0].verse === 1, "absent-both: rowless verse 2's orphaned lane check is pruned");
+  }
+  // 7f. Compatibility (no removedVersion): the unconditional delete still prunes.
+  {
+    const prev = statused([row(1, 5, "a"), row(2, 3, "b")]);
+    const out = applyStep(prev, bridged(row(1, 6, "a-b", 2), 2, undefined));
+    assert(!(2 in out.verses.ult), "compat: absorbed row removed without removedVersion");
+    assert(out.verseStatuses.length === 1 && out.verseLaneChecks.length === 1 && out.verseLaneChecks[0].verse === 1, "compat: absorbed verse 2's status / lane check pruned");
   }
 }
 

@@ -113,10 +113,19 @@ export type StructureStep =
  *
  * The `bridged` arm also prunes the absorbed verses' status / lane-checks —
  * they no longer exist as rows, and stale checkoffs would mislead if the
- * bridge is later split. Pruning is skipped when the reducer reports identity:
- * that means the map already holds an equal-or-newer picture of this bridge
- * (a duplicate echo, or a recreation that overtook it), so the prune either
- * already ran or would wrongly hit a live verse. verse_statuses /
+ * bridge is later split. The prune is gated on the absorbed ROW being absent
+ * from the map AFTER the step, not on "state changed": `applyBridged` also
+ * changes state by merely recording the tombstone while RETAINING a local row
+ * newer than `removedVersion` (a recreation that overtook a reordered or
+ * replayed stale bridge), and pruning there emptied a live verse's status /
+ * lane-checks (review finding on #731). A retained row is never pruned. A row
+ * absent both before and after (a stale echo against a freshly loaded bridge,
+ * or a replay over a merge that already dropped the tombstoned fetched row)
+ * still prunes: those statuses are orphans of a row that no longer exists —
+ * the server deletes them post-confirm too — and would mislead on a later
+ * split. When pruning, every number in `absorbedVerses` goes — the absorbed
+ * row may itself have been a bridge (`3-4`, key 3, absorbed [3, 4]), so
+ * numbers past the key never were row keys. verse_statuses /
  * verse_lane_checks are not bible_version scoped, so the prune is by number.
  */
 export function applyStep(prev: ChapterData, step: StructureStep): ChapterData {
@@ -130,6 +139,7 @@ export function applyStep(prev: ChapterData, step: StructureStep): ChapterData {
         applyBridged(s, step.bridge, step.removedVerse, step.removedVersion),
       );
       if (next === prev) return prev;
+      if (next.verses[step.bibleVersion]?.[step.removedVerse] != null) return next;
       const absorbed = new Set(step.absorbedVerses);
       return {
         ...next,
