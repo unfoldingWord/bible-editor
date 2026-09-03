@@ -1698,28 +1698,6 @@ export async function applyTsvRows(
   // (issue #610). A row whose content also diverged still takes the full
   // `updates` write, order included.
   const reorders: Array<{ id: string; sortOrder: number; oldVersion: number }> = [];
-  // Torn rows (issue #672): `ref_raw` parses (via refParts) to a chapter/verse
-  // that disagrees with the row's own stored `chapter`/`verse` columns — an
-  // in-app cross-chapter REF retype, which rows.ts deliberately never writes
-  // to `chapter`. Populated ONLY from the edited-candidate resolution below,
-  // and ONLY when that row ends up with nothing else to write (empty
-  // `fields`) — never alongside another write to the SAME row in the SAME
-  // pass. That restriction is load-bearing, not incidental: an earlier
-  // version detected this unconditionally, up front, and optimistically
-  // bumped an in-memory `cur.version` so a LATER write to the same row (e.g.
-  // `editedWrites`) would CAS against the post-heal version. If the heal's
-  // own CAS then lost to a genuine concurrent PATCH, the in-memory bump was
-  // already made — and the later write's CAS could then coincidentally match
-  // the version the CONCURRENT PATCH had advanced to, silently overwriting
-  // that PATCH with a merge decision computed off the stale pre-PATCH row
-  // (Codex review on PR #681). Two writes derived from one read must never
-  // land in two different batches; a row with a genuine OTHER write this pass
-  // (`updates`/`update_ai`/`resurrect`) needs no separate heal at all — those
-  // already write master's own (self-consistent) `chapter`/`verse` as part of
-  // their normal content write. A torn row with something ELSE to adopt/flag
-  // this pass simply isn't healed until a LATER run, once that write has
-  // landed and the row is a candidate with empty `fields` again.
-  const refHeals: Array<{ id: string; oldVersion: number; chapter: number; verse: number }> = [];
   // AI-only rows to re-seed from master AND reclaim to master-owned (updated_by
   // → NULL). Written under a relaxed guard (version-CAS + protection re-assert)
   // in their own batch so the pristine UPDATE's `updated_by IS NULL` guard stays
@@ -1773,6 +1751,16 @@ export async function applyTsvRows(
     // was behind master's side (#540 item 2). Carried only so the adoption log
     // line can say a mixed row is mixed.
     keptAiConflict?: boolean;
+    // Issue #672: this write includes a torn-row chapter/verse correction
+    // (`fields.chapter`/`fields.verse`, sourced from the row's own ref_raw,
+    // never from master's). Drives ref_healed + the lost-CAS watermark
+    // withhold, same shape as `adopted`.
+    healedRef: boolean;
+    // The heal is the ONLY thing this write does — no adopted/flagged content,
+    // no heuristic merge. Selects the "ref_heal"/"system" provenance stamp
+    // instead of this batch's "sync_merge"/"dcs_sync"/door43 one, so a pure
+    // D1 self-correction is never misattributed to a Door43 commit.
+    pureHeal: boolean;
   }> = [];
   // Ids this pass has already INSERTED. `existing` is read once, before the
   // loop, and is never updated afterwards — so if master's own file carries the
@@ -2515,27 +2503,60 @@ export async function applyTsvRows(
         }
       }
 
-      // Torn-row self-heal (issue #672), folded in HERE rather than detected
-      // up front against `cur`'s freshly-read state: this is the one place in
-      // this row's resolution proven to have nothing else queued to write it
-      // this pass (fields is about to be checked empty) and to still hold
-      // `cur`'s TRUE, unmutated version — see refHeals' own declaration above
-      // for why that matters (an earlier version bumped an in-memory version
-      // optimistically and let a later write CAS against it, which could
-      // silently overwrite a concurrent PATCH — Codex review on PR #681). A
-      // row with something else to write this pass is left torn for a later
-      // run: `updates`/`update_ai`/`resurrect` already write master's own
-      // self-consistent chapter/verse, and one with non-empty `fields` here
-      // will be revisited once that write lands and it is a candidate again.
+      // Torn-row self-heal (issue #672). Detected HERE, at `cur`'s TRUE
+      // unmutated version, and folded into the SAME write this row already
+      // gets (or becomes one, if it would otherwise have had nothing to
+      // write) — never a separate write queued for later. Two Codex review
+      // rounds on PR #681 shaped this:
+      //   - round 1: an earlier version detected the tear up front and
+      //     bumped an in-memory `cur.version` optimistically, so a LATER
+      //     write derived from that same stale `cur` could CAS-match a
+      //     version a CONCURRENT PATCH had advanced to, silently overwriting
+      //     it. Detecting here, once, right before the one write this row's
+      //     resolution produces, removes the second write entirely — there
+      //     is nothing left for an optimistic version bump to mislead.
+      //   - round 2: an earlier version of THIS fix deferred the heal to a
+      //     later run whenever `fields` was already non-empty, reasoning
+      //     that `updates`/`update_ai`/`resurrect` write master's own
+      //     self-consistent chapter/verse as a side effect. True for THOSE
+      //     fates — but a torn row is always human-owned (the retype PATCH
+      //     set updated_by), so it can only ever reach fate "edited", never
+      //     "update"/"update_ai" (both require isReimportableRow). A
+      //     deferred heal therefore had nothing else to land on, and the
+      //     nightly staging gate skips a whole (book, resource) whose Door43
+      //     file SHA is unchanged (reimportStagedChunk) — so a row deferred
+      //     because it also had a genuine adopt/flag this run could go
+      //     PERMANENTLY unrevisited once master stopped moving, the exact
+      //     "permanent and silent" failure #672 is about. Folding into the
+      //     SAME write converges every torn row in the pass that finds it,
+      //     content question or not.
+      //
+      // Skipped for a PROTECTED tn row (trashed/preserve/hint): those bits
+      // are baked into buildTsvEditedWriteStmt's WHERE (this write shares the
+      // same protection predicate the three-way merge itself is gated on),
+      // so a heal attempted there would 0-change every single run — not a
+      // transient race, a standing block — and (per the apply_incomplete
+      // handling below) would withhold this resource's export watermark
+      // forever over a correction that can never land. Left torn instead,
+      // same as before this fix; nothing here makes a protected row worse.
+      const torn = protectedRow
+        ? null
+        : detectTornTsvRef((cur.ref_raw as string | null) ?? null, Number(cur.chapter), Number(cur.verse));
+      // A PURE heal — nothing else in `fields` yet — gets its own provenance
+      // (#686) rather than inheriting this batch's "sync_merge"/"dcs_sync"/
+      // door43 stamp below: no Door43 commit produced this correction, D1 is
+      // fixing its own bookkeeping, and stamping it as a Door43 sync would be
+      // exactly the kind of misattribution #686 exists to prevent. A row that
+      // ALSO adopts/flags a real master change keeps the sync_merge stamp —
+      // the heal rides along as a bonus correction, same as a heuristic
+      // tags/whitespace merge already does.
+      const pureHeal = torn !== null && Object.keys(fields).length === 0;
+      if (torn) {
+        fields.chapter = torn.chapter;
+        fields.verse = torn.verse;
+      }
+
       if (Object.keys(fields).length === 0) {
-        const torn = detectTornTsvRef(
-          (cur.ref_raw as string | null) ?? null,
-          Number(cur.chapter),
-          Number(cur.verse),
-        );
-        if (torn) {
-          refHeals.push({ id: row.id, oldVersion: Number(cur.version), chapter: torn.chapter, verse: torn.verse });
-        }
         counts.skipped_edited++;
         continue;
       }
@@ -2549,6 +2570,8 @@ export async function applyTsvRows(
         adopted,
         heuristic,
         keptAiConflict,
+        healedRef: torn !== null,
+        pureHeal,
       });
     }
   }
@@ -2620,54 +2643,6 @@ export async function applyTsvRows(
       });
     } catch (e) {
       counts.errors.push(`${kind} reorder batch: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
-  // Batch the torn-row heals (issue #672): rewrite ONLY chapter/verse to match
-  // the row's own ref_raw, with an edit_log entry so the correction is
-  // auditable. No protection predicate (preserve/hint/trashed) — this never
-  // touches content or ownership, only the row's own internal bookkeeping, so
-  // a protected row is healed exactly like any other. `deleted_at IS NULL`
-  // re-asserted (a concurrent delete between the read and this batch loses the
-  // CAS, same as everywhere else here) and version-CAS guards a concurrent
-  // content edit; either 0-changes and the row is left for next run.
-  for (let i = 0; i < refHeals.length; i += WRITE_BATCH) {
-    const slice = refHeals.slice(i, i + WRITE_BATCH);
-    try {
-      const results = await env.DB.batch(
-        slice.map((h) =>
-          env.DB.prepare(
-            `UPDATE ${TSV_TABLE[kind]} SET chapter = ?1, verse = ?2, version = ?3, updated_at = ?4
-               WHERE id = ?5 AND book = ?6 AND deleted_at IS NULL AND version = ?7`,
-          ).bind(h.chapter, h.verse, h.oldVersion + 1, now, h.id, book, h.oldVersion),
-        ),
-      );
-      const logs: D1PreparedStatement[] = [];
-      slice.forEach((h, j) => {
-        if ((results[j]?.meta.changes ?? 0) > 0) {
-          counts.ref_healed++;
-          console.log("reimport: healed a torn row's stored chapter/verse to match its own ref_raw", {
-            book,
-            kind,
-            id: h.id,
-            chapter: h.chapter,
-            verse: h.verse,
-          });
-          logs.push(
-            logEditStmt(env, kind, h.id, book, userId, h.oldVersion, h.oldVersion + 1, "update", {
-              chapter: h.chapter,
-              verse: h.verse,
-              reason: "torn_ref_heal",
-            }),
-          );
-        }
-        // A lost CAS here just means the row is left torn until the next run
-        // re-detects it — no counter, matching how a lost-race reorder/update
-        // silently retries rather than being reported as a failure.
-      });
-      if (logs.length) await env.DB.batch(logs);
-    } catch (e) {
-      counts.errors.push(`${kind} ref-heal batch: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -2891,13 +2866,15 @@ export async function applyTsvRows(
       const results = await env.DB.batch(
         // #686: the three-way merge / master-adoption write on a human-edited
         // row — the key attribution site. sync_merge, and the actor MUST be
-        // the measured author (never a fallback built here).
+        // the measured author (never a fallback built here). A PURE torn-row
+        // heal (#672) gets its own "ref_heal"/"system" stamp instead — D1
+        // correcting its own bookkeeping, not anything Door43 held, so
+        // crediting the Door43 commit author would misattribute it.
         slice.map((u) =>
-          buildTsvEditedWriteStmt(env, book, kind, u.id, u.fields, u.oldVersion, now, {
-            action: "sync_merge",
-            source: "dcs_sync",
-            actor: door43,
-          }),
+          buildTsvEditedWriteStmt(
+            env, book, kind, u.id, u.fields, u.oldVersion, now,
+            u.pureHeal ? { action: "ref_heal", source: "system", actor: null } : { action: "sync_merge", source: "dcs_sync", actor: door43 },
+          ),
         ),
       );
       const logs: D1PreparedStatement[] = [];
@@ -2927,6 +2904,14 @@ export async function applyTsvRows(
           // the pre-existing heuristic-merge tally must not be lost to the adoption
           // branch (Codex P3.7).
           if (u.heuristic) counts.merged_fields++;
+          // ref_healed is INDEPENDENT of both — a row can adopt a master field
+          // AND carry a chapter/verse correction in the same write (issue #672).
+          if (u.healedRef) {
+            counts.ref_healed++;
+            console.log("reimport: healed a torn row's stored chapter/verse to match its own ref_raw", {
+              book, kind, id: u.id, chapter: u.fields.chapter, verse: u.fields.verse,
+            });
+          }
           logs.push(logEditStmt(env, kind, u.id, book, userId, u.oldVersion, u.oldVersion + 1, "update", u.fields));
         } else {
           // Lost the version-CAS race — a human PATCH landed between the read and
@@ -2935,6 +2920,12 @@ export async function applyTsvRows(
           // field is still stale, so the watermark must be withheld or the export
           // reverts master with no retry (Codex P1.2 — the CAS-race twin of the
           // thrown-batch gate). A lost heuristic-only write is not data loss.
+          // A lost heal (#672) is the SAME shape as a lost adoption: the
+          // correction did not land, and — unlike a heuristic-only write —
+          // there is nothing else that will ever re-detect and retry it except
+          // the reimport itself, so it must withhold the watermark too, or the
+          // SHA-skip gate could make this the row's last chance for a long time
+          // (Codex re-review round 2 on PR #681).
           //
           // A `keep_ai_master` row (u.conflict true, u.adopted false — see the
           // `merge.conflict` block above) can lose this same race with NOTHING
@@ -2947,10 +2938,10 @@ export async function applyTsvRows(
           // edit that won this race resolved it — either way there is nothing
           // to retry, unlike an adoption's stale, unreachable-by-recompute field.
           counts.skipped_edited++;
-          if (u.adopted) {
+          if (u.adopted || u.healedRef) {
             counts.apply_incomplete = true;
-            console.warn("reimport: TSV master-adoption lost the version-CAS race; withholding watermark for retry", {
-              book, kind, id: u.id, chapter: u.chapter, verse: u.verse,
+            console.warn("reimport: TSV master-adoption or ref-heal lost the version-CAS race; withholding watermark for retry", {
+              book, kind, id: u.id, chapter: u.chapter, verse: u.verse, healedRef: u.healedRef,
             });
           }
         }
@@ -2967,8 +2958,12 @@ export async function applyTsvRows(
 
 // Columns buildTsvEditedWriteStmt may write per kind. An allowlist (not
 // Object.keys of caller input) so a stray/injected key can never reach the SQL.
-// Common to all kinds: tags, occurrence, and the review flags. `sort_order`,
-// identity, and updated_by are deliberately absent (never merged from master).
+// Common to all kinds: tags, occurrence, and the review flags. `sort_order`
+// and `updated_by` are deliberately absent (never merged from master).
+// `chapter`/`verse` ARE in this allowlist, but only ONE caller ever sets
+// them: the torn-row self-heal (issue #672), sourced from the row's OWN
+// ref_raw via detectTornTsvRef — never from master's incoming row. Identity
+// otherwise stays exactly what it always was here: never adopted FROM master.
 // Human-friendly names for the merge fields, for the conflict review_reason
 // (never expose a raw DB column name to a translator).
 const TSV_FIELD_LABELS: Record<string, string> = {
@@ -2982,9 +2977,9 @@ const TSV_FIELD_LABELS: Record<string, string> = {
 };
 
 const TSV_MERGE_WRITE_COLS: Record<TsvKind, Set<string>> = {
-  tn: new Set(["quote", "note", "occurrence", "support_reference", "tags", "review_kind", "review_reason", "review_master_json"]),
-  tq: new Set(["quote", "question", "response", "occurrence", "tags", "review_kind", "review_reason", "review_master_json"]),
-  twl: new Set(["orig_words", "tw_link", "occurrence", "tags", "review_kind", "review_reason", "review_master_json"]),
+  tn: new Set(["quote", "note", "occurrence", "support_reference", "tags", "review_kind", "review_reason", "review_master_json", "chapter", "verse"]),
+  tq: new Set(["quote", "question", "response", "occurrence", "tags", "review_kind", "review_reason", "review_master_json", "chapter", "verse"]),
+  twl: new Set(["orig_words", "tw_link", "occurrence", "tags", "review_kind", "review_reason", "review_master_json", "chapter", "verse"]),
 };
 
 // Build (don't run) the combined merge UPDATE for one edited TSV row, for
@@ -3027,9 +3022,12 @@ function buildTsvEditedWriteStmt(
   // content with master's, so the marker no longer describes the row and has to
   // go, or the chip keeps pointing a translator at a version whose text is no
   // longer what she is looking at (issue #539 item 4). Scoped to writes that
-  // actually move content: a review_kind/review_reason-only write changes no
-  // text, so the marker still describes the row correctly and must survive.
-  if (cols.some((c) => c !== "review_kind" && c !== "review_reason" && c !== "review_master_json")) {
+  // actually move TEXT content: a review_kind/review_reason-only write changes
+  // none, and neither does a torn-row chapter/verse correction (issue #672) —
+  // it relocates the row, it does not touch a single character of what the
+  // chip is describing — so both stay excluded and the marker survives.
+  const NON_CONTENT_COLS = new Set(["review_kind", "review_reason", "review_master_json", "chapter", "verse"]);
+  if (cols.some((c) => !NON_CONTENT_COLS.has(c))) {
     setClauses.push(`restored_from_version = NULL`);
   }
   const protection =

@@ -2871,21 +2871,29 @@ console.log("\n[issue #672: a torn row (ref_raw ahead of its own stored chapter/
   eq(counts.ref_healed, 1, "the torn row's chapter/verse are healed to match its own ref_raw");
   // The row is human-owned (updated_by set — the retype PATCH set it), so it
   // always takes the edited-candidate path, classified off its UNMUTATED
-  // stored chapter/verse (never patched in memory ahead of classification —
-  // see refHeals' own declaration for why: doing so once let a later write to
-  // this row CAS against an optimistic version nobody had confirmed landed).
+  // stored chapter/verse (never patched in memory ahead of classification).
   // Content otherwise converges with master, so nothing is adopted or
-  // flagged — the row is a plain skipped_edited whose ONLY write this run is
-  // the heal itself, folded in at the point that skip is decided.
-  eq(counts.skipped_edited, 1, "edited-candidate path with nothing to adopt — the heal is the row's only write");
-  eq(counts.skipped_noop, 0, "NOT a no-op — classification never sees the healed chapter/verse, only the write does");
+  // flagged — the heal is folded into what would otherwise have been an
+  // empty write, so it takes the editedWrites success path rather than the
+  // "nothing to write" skip (Codex re-review round 2 on PR #681: an earlier
+  // version deferred this case, which the SHA-skip gate could leave torn
+  // forever once master stopped moving).
+  eq(counts.skipped_edited, 0, "NOT skipped — the heal IS the write, not a reason to skip one");
+  eq(counts.skipped_noop, 0, "NOT a no-op either — classification runs off the unmutated, still-torn chapter/verse");
 
-  const stored = sqlite.prepare(`SELECT chapter, verse, ref_raw, sort_order, version FROM tn_rows WHERE id='tn01'`).all()[0];
+  const stored = sqlite.prepare(`SELECT chapter, verse, ref_raw, sort_order, version,
+                                         last_change_action, last_change_source, last_change_actor
+                                    FROM tn_rows WHERE id='tn01'`).all()[0];
   eq(stored.chapter, 2, "stored chapter now matches ref_raw's own chapter");
   eq(stored.verse, 3, "stored verse now matches ref_raw's own verse");
   eq(stored.ref_raw, "2:3", "ref_raw itself is untouched — only chapter/verse were corrected");
   eq(stored.sort_order, 555, "the in-app order is preserved, not reverted to master's file order (heal must not fight the reorder-preservation invariant)");
   eq(stored.version, 4, "version bumped by the heal write");
+  // #686 provenance: a PURE heal must never read as a Door43 sync — nothing
+  // Door43 held produced this correction.
+  eq(stored.last_change_action, "ref_heal", "provenance action is the dedicated ref_heal, not sync_merge");
+  eq(stored.last_change_source, "system", "…source is system, not dcs_sync");
+  eq(stored.last_change_actor, null, "…and no Door43 commit author is credited for it");
 
   const log = sqlite.prepare(`SELECT action, source, payload_json FROM edit_log WHERE kind='tn' AND row_key='tn01'`).all();
   eq(log.length, 1, "exactly one edit_log entry — the heal, and nothing else (the row otherwise no-ops)");
@@ -2893,15 +2901,14 @@ console.log("\n[issue #672: a torn row (ref_raw ahead of its own stored chapter/
   const payload = JSON.parse(log[0].payload_json);
   eq(payload.chapter, 2, "…payload records the healed chapter");
   eq(payload.verse, 3, "…and verse");
-  eq(payload.reason, "torn_ref_heal", "…tagged so the correction is distinguishable from an ordinary content update");
 }
 
 console.log("\n[issue #672: the heal is independent of the row's content classification]");
 {
   // Same tear, but this time content ALSO genuinely diverges from master and
-  // there is no watermark (no ancestor) to attribute it — the row should still
-  // be healed AND still fall through to a plain skipped_edited on the content
-  // question, exactly as an untorn edited row would.
+  // there is no watermark (no ancestor) to attribute it. Nothing is adopted
+  // (no ancestor to attribute the note difference against), so this is STILL
+  // a pure heal write — D1's note stands, only chapter/verse move.
   const { sqlite, env } = freshEnv();
   sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
   sqlite
@@ -2917,16 +2924,57 @@ console.log("\n[issue #672: the heal is independent of the row's content classif
   );
 
   eq(counts.ref_healed, 1, "still healed — the tear is unconditional, independent of what else diverges");
-  eq(counts.skipped_edited, 1, "content genuinely differs with no ancestor to attribute it — D1's note stands");
+  eq(counts.skipped_edited, 0, "the heal write lands — nothing left to skip");
 
   const stored = sqlite.prepare(`SELECT chapter, verse, note, version FROM tn_rows WHERE id='tn02'`).all()[0];
   eq(stored.chapter, 3, "chapter healed to match ref_raw");
   eq(stored.verse, 1, "verse healed to match ref_raw");
-  eq(stored.note, "our note", "the human's note is untouched — the heal never touches content");
-  eq(stored.version, 6, "version bumped exactly once, by the heal — the content question wrote nothing");
+  eq(stored.note, "our note", "the human's note is untouched — the heal never touches content, and nothing here adopted master's");
+  eq(stored.version, 6, "version bumped exactly once, by the heal");
 
   const log = sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log WHERE kind='tn' AND row_key='tn02'`).all()[0];
-  eq(log.n, 1, "only the heal's edit_log entry — the skipped content question logs nothing");
+  eq(log.n, 1, "only the heal's edit_log entry");
+}
+
+console.log("\n[issue #672: a torn row that ALSO adopts a genuine master field change heals in the SAME write]");
+{
+  // The convergence gap Codex re-review round 2 found: an earlier version of
+  // this fix deferred the heal whenever the row had something else to write,
+  // reasoning it would be revisited later — but a torn+adopting row can only
+  // ever reach fate "edited" (never "update"/"update_ai", both of which
+  // require isReimportableRow, and a torn row is always human-owned), so a
+  // deferred heal had nothing else to land on, and the SHA-skip gate could
+  // strand it. This pins the fix: the SAME write both adopts master's tags
+  // (tn/tq have no tags UI, so master always wins there) AND heals the tear.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, tags, updated_by, version)
+       VALUES ('tn04', ?, 1, 5, '2:3', 'same note', 'old-tag', 7, 3)`,
+    )
+    .run(BOOK);
+  const counts = await applyTsvRows(
+    env, BOOK, "tn",
+    [{ id: "tn04", idCoerced: false, refRaw: "2:3", chapter: 2, verse: 3, occurrence: null, tags: "new-tag", quote: null, note: "same note", support_reference: null }],
+    null,
+  );
+
+  eq(counts.ref_healed, 1, "healed in the same pass as the tags adoption — not deferred");
+  eq(counts.merged_fields, 1, "the tags heuristic merge still fires independently");
+  eq(counts.skipped_edited, 0, "nothing left to skip — one write did both jobs");
+
+  const stored = sqlite.prepare(`SELECT chapter, verse, tags, version,
+                                         last_change_action, last_change_source, last_change_actor
+                                    FROM tn_rows WHERE id='tn04'`).all()[0];
+  eq(stored.chapter, 2, "chapter healed");
+  eq(stored.verse, 3, "verse healed");
+  eq(stored.tags, "new-tag", "…and master's tags adopted, in the SAME write");
+  eq(stored.version, 4, "exactly one version bump for both changes");
+  // A MIXED write (adoption + heal) keeps the sync_merge stamp — the heal
+  // rides along as a bonus correction, same as the heuristic tags merge does.
+  eq(stored.last_change_action, "sync_merge", "a mixed write is NOT pureHeal — it keeps the sync_merge provenance");
+  eq(stored.last_change_source, "dcs_sync", "…dcs_sync source, since master's tags genuinely were adopted");
 }
 
 console.log("\n[issue #672: an untorn row (ref_raw already agrees with its own chapter/verse) is left alone]");
@@ -2948,12 +2996,13 @@ console.log("\n[issue #672: an untorn row (ref_raw already agrees with its own c
   eq(stored.version, 3, "no spurious version bump");
 }
 
-// Wrap env.DB so the FIRST batch matching the ref-heal write's distinctive SQL
-// shape (`SET chapter = ?1, verse = ?2, version = ?3`) is preceded by an
-// out-of-band write on the SAME row — exactly as a concurrent PATCH landing
-// between applyTsvRows' initial `existing` read and this batched write would
-// do. Same pattern as withReclaimRace above; drives a REAL CAS loss through
-// the real function rather than hand-asserting what "should" happen.
+// Wrap env.DB so the FIRST batch matching a PURE heal write's distinctive SQL
+// shape (chapter/verse as the first two SET columns, nothing else) is
+// preceded by an out-of-band write on the SAME row — exactly as a concurrent
+// PATCH landing between applyTsvRows' initial `existing` read and this
+// batched write would do. Same pattern as withReclaimRace above; drives a
+// REAL CAS loss through the real function rather than hand-asserting what
+// "should" happen.
 function withHealRace(env, sqlite, table, id) {
   let fired = false;
   return {
@@ -2961,7 +3010,7 @@ function withHealRace(env, sqlite, table, id) {
     DB: {
       ...env.DB,
       async batch(stmts) {
-        if (!fired && stmts.some((s) => s.sql.includes("SET chapter = ?1, verse = ?2, version = ?3"))) {
+        if (!fired && stmts.some((s) => s.sql.includes("chapter = ?1, verse = ?2, version = version + 1"))) {
           fired = true;
           sqlite
             .prepare(`UPDATE ${table} SET note = 'concurrent edit', version = version + 1 WHERE id = ?`)
@@ -2975,7 +3024,7 @@ function withHealRace(env, sqlite, table, id) {
 
 console.log("\n[issue #672 (Codex review on PR #681): a concurrent PATCH landing before the heal batch is never clobbered]");
 {
-  // The exact hazard the review flagged: an EARLIER version of this fix
+  // The exact hazard round 1 flagged: an EARLIER version of this fix
   // detected the tear up front and optimistically bumped an in-memory
   // `cur.version`, so if the heal's own write then lost its CAS to a
   // concurrent PATCH, a LATER write derived from that same stale `cur` could
@@ -2999,11 +3048,44 @@ console.log("\n[issue #672 (Codex review on PR #681): a concurrent PATCH landing
   );
 
   eq(counts.ref_healed, 0, "the heal LOST its version-CAS to the concurrent PATCH — must not count as healed");
+  // Round 2 (Codex re-review): a lost heal must withhold the watermark, or a
+  // book+resource whose master file stops moving could go permanently
+  // un-retried by the SHA-skip gate — the same convergence hazard as
+  // deferring, just reached through a lost race instead of a design choice.
+  eq(counts.apply_incomplete, true, "a lost heal CAS withholds the watermark so tomorrow's run retries it");
   const stored = sqlite.prepare(`SELECT chapter, verse, note, version FROM tn_rows WHERE id='tn03'`).all()[0];
   eq(stored.chapter, 1, "chapter is STILL torn — the heal did not land this run (self-heals next run instead)");
   eq(stored.verse, 5, "verse is still torn too");
   eq(stored.note, "concurrent edit", "…and — the whole point — the concurrent PATCH's content survives, untouched by a phantom heal write");
   eq(stored.version, 4, "version reflects ONLY the concurrent PATCH's own bump, never a heal write layered on top of it");
+}
+
+console.log("\n[issue #672: a torn PROTECTED tn row is left torn, never healed, never withholds the watermark]");
+{
+  // Protection (trashed/preserve/hint) is baked into buildTsvEditedWriteStmt's
+  // WHERE — a heal attempted there would 0-change EVERY run, not a transient
+  // race, and (per the apply_incomplete handling above) would withhold this
+  // resource's export watermark forever over a correction that can never
+  // land. So the heal is skipped outright for a protected row instead.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, updated_by, version, preserve)
+       VALUES ('tn05', ?, 1, 5, '2:3', 'same note', 7, 3, 1)`,
+    )
+    .run(BOOK);
+  const counts = await applyTsvRows(
+    env, BOOK, "tn",
+    [{ id: "tn05", idCoerced: false, refRaw: "2:3", chapter: 2, verse: 3, occurrence: null, tags: null, quote: null, note: "same note", support_reference: null }],
+    null,
+  );
+  eq(counts.ref_healed, 0, "a protected row is never healed — the WHERE predicate would 0-change it every run");
+  eq(counts.apply_incomplete, false, "…and this is a standing block, not a race, so it must NOT withhold the watermark");
+  eq(counts.skipped_edited, 1, "falls through to the ordinary skipped_edited a protected row always takes");
+  const stored = sqlite.prepare(`SELECT chapter, verse FROM tn_rows WHERE id='tn05'`).all()[0];
+  eq(stored.chapter, 1, "left exactly as torn as before — no partial correction attempted");
+  eq(stored.verse, 5, "…same for verse");
 }
 
 console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags get a derived window]");
