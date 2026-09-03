@@ -80,6 +80,90 @@ export function reduceVerses(
 }
 
 /**
+ * One reducer application, as data. The same discriminated union whichever
+ * way it reaches the hook (WS event, outbox result, the tab's own bridge /
+ * split result), so a step can be recorded while a refetch is in flight and
+ * re-applied by `replaySteps` after the fetched payload lands. Every arm is
+ * version-gated and monotone (see the RULES above), so re-applying a step
+ * that already applied is a no-op, and applying it to a state that has moved
+ * past it is also a no-op — replay is idempotent and safe.
+ *
+ * `updated` steps are always strict (never `force`): a forced optimistic edit
+ * carries the pre-save version by design, and replaying it over a merged map
+ * would overwrite the newer row its own PATCH just produced. The tab's
+ * optimistic content is protected by `mergeRefetched` instead (equal version
+ * keeps the local row), so force steps are simply not recorded.
+ */
+export type StructureStep =
+  | {
+      type: "bridged";
+      bibleVersion: string;
+      bridge: VerseDto;
+      removedVerse: number;
+      removedVersion: number | undefined;
+      /** Verses whose per-verse status / lane-checks are pruned once the bridge applies. */
+      absorbedVerses: number[];
+    }
+  | { type: "split"; bibleVersion: string; start: VerseDto; newVerses: VerseDto[] }
+  | { type: "updated"; bibleVersion: string; verse: VerseDto };
+
+/**
+ * Apply one `StructureStep` to a chapter payload. Returns `prev` itself when
+ * the step was a no-op (identity), so a React updater can skip the render.
+ *
+ * The `bridged` arm also prunes the absorbed verses' status / lane-checks —
+ * they no longer exist as rows, and stale checkoffs would mislead if the
+ * bridge is later split. Pruning is skipped when the reducer reports identity:
+ * that means the map already holds an equal-or-newer picture of this bridge
+ * (a duplicate echo, or a recreation that overtook it), so the prune either
+ * already ran or would wrongly hit a live verse. verse_statuses /
+ * verse_lane_checks are not bible_version scoped, so the prune is by number.
+ */
+export function applyStep(prev: ChapterData, step: StructureStep): ChapterData {
+  switch (step.type) {
+    case "updated":
+      return reduceVerses(prev, step.bibleVersion, (s) => applyUpdated(s, step.verse));
+    case "split":
+      return reduceVerses(prev, step.bibleVersion, (s) => applySplit(s, step.start, step.newVerses));
+    case "bridged": {
+      const next = reduceVerses(prev, step.bibleVersion, (s) =>
+        applyBridged(s, step.bridge, step.removedVerse, step.removedVersion),
+      );
+      if (next === prev) return prev;
+      const absorbed = new Set(step.absorbedVerses);
+      return {
+        ...next,
+        verseStatuses: next.verseStatuses.filter((s) => !absorbed.has(s.verse)),
+        verseLaneChecks: next.verseLaneChecks.filter((c) => !absorbed.has(c.verse)),
+      };
+    }
+  }
+}
+
+/**
+ * Re-apply, in arrival order, the steps that reached the tab while a refetch
+ * was in flight. Run over `mergeRefetched(prev, fetched)`.
+ *
+ * WHY. `mergeRefetched` starts from the fetched map and can only judge verses
+ * the server's snapshot contains. If the GET snapshotted the old `1-2` bridge
+ * and a `verse.split` then created local verse 2 (v8) before the response
+ * landed, verse 2 is absent from the response and the merge drops it, while
+ * the split's start row 1 (v8, verse_end null) is kept as newer — an
+ * impossible unbridged verse 1 with a gap until the next refresh. Replaying
+ * the split restores 2 (v8): its slot is empty in the merged map and v8 is
+ * above any tombstone. A phantom verse from a bridge missed while
+ * DISCONNECTED has no queued step and is still dropped by the merge; replay
+ * only concerns events the tab actually received during the fetch.
+ *
+ * An empty queue returns `state` itself.
+ */
+export function replaySteps(state: ChapterData, steps: readonly StructureStep[]): ChapterData {
+  let s = state;
+  for (const step of steps) s = applyStep(s, step);
+  return s;
+}
+
+/**
  * Reconcile a refetched chapter payload with what the tab already holds.
  *
  * WHY. The reconnect refetch (Shell's `onReconnect`) fires on the same
@@ -104,6 +188,9 @@ export function reduceVerses(
  *     dropped rather than resurrected.
  *   - Tombstones are cleared: the merged map is authoritative again, exactly
  *     as after a plain refetch.
+ *   - The merge can only judge verses the snapshot contains. Events that
+ *     arrived while the GET was in flight are re-applied over the result by
+ *     `replaySteps` (see there for the mid-GET split this covers).
  *
  * Returns `fetched` itself when no local row is kept (a null `prev`, or one
  * for another chapter, is a plain replace) — the refetch caller always wants

@@ -3,7 +3,7 @@
 // any delivery order (#729). Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/verseStructure.test.mjs
 
-import { applyBridged, applySplit, applyUpdated, mergeRefetched } from "./verseStructure.ts";
+import { applyBridged, applySplit, applyUpdated, mergeRefetched, replaySteps } from "./verseStructure.ts";
 
 let failed = 0;
 let passed = 0;
@@ -410,6 +410,125 @@ for (const sc of scenarios) {
     const fetched = { ...payload([row(2, 5, "C")]), verses: { ult: map(row(2, 5, "C")), ueb: map(row(2, 1, "ueb")) } };
     const out = mergeRefetched(local, fetched);
     assert(!("ust" in out.verses) && out.verses.ueb[2].version === 1 && out.verses.ult[2].version === 6, "bible_version keys follow the fetched payload; per-verse merge still applies");
+  }
+
+  // -------------------------------------------------------------------------
+  // replaySteps — events that arrive while the reconnect GET is in flight are
+  // re-applied over the merged payload.
+  //
+  // The race: the socket opens and the refetch starts; the GET snapshots the
+  // old `1-2` bridge (v7); a verse.split event then arrives over the fresh
+  // socket and creates local verse 2 (v8) BEFORE the GET body lands. Verse 2
+  // is absent from the response, so mergeRefetched (which can only judge
+  // verses the snapshot contains) drops it while keeping the newer local
+  // start row 1@8 (verse_end null): an impossible unbridged verse 1 with a
+  // gap. The hook records every strictly-gated step applied during the
+  // refetch and replays it over the merge.
+  const split = (start, newVerses) => ({ type: "split", bibleVersion: "ult", start, newVerses });
+  const bridged = (bridge, removedVerse, removedVersion, absorbedVerses = [removedVerse]) => ({
+    type: "bridged",
+    bibleVersion: "ult",
+    bridge,
+    removedVerse,
+    removedVersion,
+    absorbedVerses,
+  });
+  const updated = (verse) => ({ type: "updated", bibleVersion: "ult", verse });
+
+  // WITNESS: the merge alone reproduces the finding. Recorded pre-fix output
+  // (mergeRefetched only): {"1":{"verse":1,"version":8,"verse_end":null,…}}
+  // — verse 2@8 gone, verse 1 unbridged.
+  {
+    const fetched = payload([row(1, 7, "a-b", 2)]);
+    // Local after the split event applied to the 1-2@7 bridge.
+    const local = payload([row(1, 8, "a"), row(2, 8, "b")]);
+    const mergedOnly = mergeRefetched(local, fetched);
+    assert(mergedOnly.verses.ult[1].version === 8 && mergedOnly.verses.ult[1].verse_end === null, "witness: the merge keeps the split's de-bridged start row 1@8");
+    assert(!(2 in mergedOnly.verses.ult), "witness: the merge alone discards the split-created 2@8 (the finding)");
+  }
+
+  // 1. The finding, fixed: replay the split that landed mid-GET.
+  {
+    const prev = payload([row(1, 7, "a-b", 2)]);
+    const fetched = payload([row(1, 7, "a-b", 2)]);
+    const step = split(row(1, 8, "a"), [row(2, 8, "b")]);
+    // The step applied to state while the GET was in flight…
+    const local = replaySteps(prev, [step]);
+    assert(local.verses.ult[1].version === 8 && local.verses.ult[2]?.version === 8, "setup: the split applied locally before the response");
+    // …and is replayed over the merged payload when the response lands.
+    const out = replaySteps(mergeRefetched(local, fetched), [step]);
+    assert(out.verses.ult[1].version === 8 && out.verses.ult[1].verse_end === null, "after merge + replay: start row is 1@8, de-bridged");
+    assert(out.verses.ult[2]?.version === 8 && out.verses.ult[2].content === "b", "after merge + replay: verse 2@8 is restored — no gap");
+    assert(Object.keys(out.verses.ult).sort().join(",") === "1,2", "after merge + replay: exactly verses 1 and 2");
+    // Non-verse parts still come from the fetched payload.
+    assert(out.tn === fetched.tn && out.verseStatuses === fetched.verseStatuses, "replay leaves the fetched non-verse parts alone");
+  }
+
+  // 2. A stale bridged step queued during the refetch (its removedVersion is
+  //    below the fetched, recreated row) must not delete the fetched row. The
+  //    server bridged 1-2 (rm 2@7) and then split again (1@9, 2@9); the GET
+  //    snapshotted the final rows; the older bridge event arrived mid-GET.
+  {
+    const prev = payload([row(1, 7, "a"), row(2, 7, "b")]);
+    const step = bridged(row(1, 8, "a-b", 2), 2, 7);
+    const local = replaySteps(prev, [step]);
+    assert(!(2 in local.verses.ult) && local.verseTombstones.ult[2] === 7, "setup: the bridge applied locally (2 removed, tombstone 7)");
+    const fetched = payload([row(1, 9, "a"), row(2, 9, "b2")]);
+    const out = replaySteps(mergeRefetched(local, fetched), [step]);
+    assert(out.verses.ult[2]?.version === 9 && out.verses.ult[2].content === "b2", "fetched recreated 2@9 survives the replayed bridge (rm 2@7)");
+    assert(out.verses.ult[1].version === 9 && out.verses.ult[1].verse_end === null, "fetched 1@9 is not clobbered by the replayed bridge start 1-2@8");
+    assert(out.verseTombstones?.ult?.[2] === 7, "the replayed bridge re-records its tombstone (harmless: 9 > 7)");
+  }
+
+  // 3. An empty queue is identical to mergeRefetched (identity).
+  {
+    const local = payload([row(1, 3, "a"), row(2, 6, "C′")]);
+    const fetched = payload([row(1, 3, "a"), row(2, 5, "C")]);
+    const merged = mergeRefetched(local, fetched);
+    assert(replaySteps(merged, []) === merged, "replaySteps with no steps returns the merged object itself");
+    assert(replaySteps(fetched, []) === fetched, "replaySteps with no steps over a plain payload is identity");
+  }
+
+  // 4. The phantom-drop case still holds: a bridge missed while DISCONNECTED
+  //    has no queued step, so the merge's drop stands after replay too.
+  {
+    const local = payload([row(1, 3, "a"), row(2, 4, "phantom")]);
+    const fetched = payload([row(1, 5, "a-b", 2)]);
+    const out = replaySteps(mergeRefetched(local, fetched), []);
+    assert(!(2 in out.verses.ult), "phantom verse 2 (bridge missed while disconnected) is still dropped");
+    assert(out.verses.ult[1].verse_end === 2 && out.verses.ult[1].version === 5, "the fetched bridge row stands");
+  }
+
+  // 5. Idempotence: a step that already applied (and whose rows the fetched
+  //    snapshot DID include) replays as a no-op; a strict update below the
+  //    fetched row is likewise a no-op.
+  {
+    const prev = payload([row(1, 7, "a-b", 2)]);
+    const step = split(row(1, 8, "a"), [row(2, 8, "b")]);
+    const local = replaySteps(prev, [step]);
+    const fetched = payload([row(1, 8, "a"), row(2, 8, "b")]);
+    const merged = mergeRefetched(local, fetched);
+    assert(replaySteps(merged, [step]) === merged, "replaying a split the snapshot already reflects is identity");
+    const staleUpdate = updated(row(2, 7, "old"));
+    assert(replaySteps(merged, [staleUpdate]) === merged, "replaying an update older than the fetched row is identity");
+    const newerUpdate = updated(row(2, 9, "newer"));
+    assert(replaySteps(merged, [newerUpdate]).verses.ult[2].version === 9, "replaying an update newer than the fetched row applies");
+  }
+
+  // 6. Replayed bridge prunes the absorbed verse's status exactly like the live
+  //    application did (the fetched payload may predate the server's cleanup).
+  {
+    const prev = payload([row(1, 5, "a"), row(2, 3, "b")]);
+    const step = bridged(row(1, 6, "a-b", 2), 2, 3);
+    const local = replaySteps(prev, [step]);
+    const fetched = payload([row(1, 5, "a"), row(2, 3, "b")], {
+      verseStatuses: [{ verse: 1, done: 1 }, { verse: 2, done: 1 }],
+      verseLaneChecks: [{ verse: 2, lane: "x", checked_by: 1 }],
+    });
+    const out = replaySteps(mergeRefetched(local, fetched), [step]);
+    assert(!(2 in out.verses.ult) && out.verses.ult[1].version === 6 && out.verses.ult[1].verse_end === 2, "replayed bridge over a pre-bridge snapshot removes 2@3 and keeps the local 1-2@6");
+    assert(out.verseStatuses.length === 1 && out.verseStatuses[0].verse === 1, "absorbed verse 2's status is pruned on replay");
+    assert(out.verseLaneChecks.length === 0, "absorbed verse 2's lane checks are pruned on replay");
   }
 }
 

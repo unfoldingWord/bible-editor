@@ -21,12 +21,13 @@ import {
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
 import {
-  applyBridged,
-  applySplit,
+  applyStep,
   applyUpdated,
   mergeRefetched,
   reduceVerses,
+  replaySteps,
   type ChapterData,
+  type StructureStep,
 } from "../lib/verseStructure";
 
 type Status = "idle" | "loading" | "ready" | "error" | "retrying";
@@ -113,6 +114,22 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   const [retryAttempts, setRetryAttempts] = useState(0);
   const mounted = useRef(true);
   const fetchCtrl = useRef<AbortController | null>(null);
+  // Reducer steps (WS bridged / split / updated, outbox results) that reach
+  // the tab while a `keepNewerLocal` refetch is in flight. Non-null exactly
+  // while such a refetch is pending. `mergeRefetched` can only judge verses
+  // the GET's snapshot contains, so a split that recreated a verse AFTER the
+  // snapshot but BEFORE the response landed would be silently discarded (the
+  // response has no row for it); replaying the queue over the merged map puts
+  // it back. Replay is idempotent — every step is version-gated (see
+  // lib/verseStructure.ts `StructureStep`).
+  //
+  // One queue, owned by the LATEST request: a second reconnect refetch while
+  // the first is in flight aborts the first (fetchCtrl) and inherits the
+  // queue — steps the first collected are either newer than the second GET's
+  // rows (and kept by the merge anyway) or stale echoes (no-ops on replay).
+  // A plain-replace refetch or a chapter change drops it; the resolving or
+  // failing latest request clears it.
+  const replayQueue = useRef<StructureStep[] | null>(null);
 
   const refetch = useCallback(async (opts?: RefetchOptions) => {
     // Abort any in-flight retry loop from a previous (book, chapter) before
@@ -120,6 +137,10 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     fetchCtrl.current?.abort();
     const ctrl = new AbortController();
     fetchCtrl.current = ctrl;
+    // `=== true` so a caller that hands `refetch` straight to an event
+    // handler (receiving a truthy event object) still gets the replace.
+    const keepNewerLocal = opts?.keepNewerLocal === true;
+    replayQueue.current = keepNewerLocal ? (replayQueue.current ?? []) : null;
 
     setStatus("loading");
     setError(null);
@@ -138,14 +159,20 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         },
       );
       if (!mounted.current || fetchCtrl.current !== ctrl) return;
-      // `=== true` so a caller that hands `refetch` straight to an event
-      // handler (receiving a truthy event object) still gets the replace.
-      const keepNewerLocal = opts?.keepNewerLocal === true;
-      setData((prev) => (keepNewerLocal ? mergeRefetched(prev, payload) : payload));
+      // Take the queue synchronously, before the updater runs: a step that
+      // arrives after this point is applied by its own setData, which React
+      // orders after this one, so it must not also be replayed here.
+      const queued = replayQueue.current ?? [];
+      replayQueue.current = null;
+      setData((prev) => (keepNewerLocal ? replaySteps(mergeRefetched(prev, payload), queued) : payload));
       setStatus("ready");
       setRetryAttempts(0);
     } catch (e) {
+      // A superseded request (a newer refetch owns fetchCtrl and the queue)
+      // must leave the queue to its successor; only the latest request's
+      // failure drops it.
       if (!mounted.current || fetchCtrl.current !== ctrl) return;
+      replayQueue.current = null;
       if (ctrl.signal.aborted) return;
       setError(e instanceof ApiError ? `HTTP ${e.status}` : String(e));
       setStatus("error");
@@ -247,42 +274,45 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     [],
   );
 
+  // Every strictly-gated step (never the forced optimistic edit above) goes
+  // through here so it is both applied now and, while a keepNewerLocal refetch
+  // is in flight, recorded for replay over the merged payload. Recording
+  // happens at call time, not inside the updater: updaters may run twice
+  // (StrictMode) and run later than the call, and the refetch reads the queue
+  // synchronously when its response lands.
+  const dispatchStep = useCallback((step: StructureStep) => {
+    replayQueue.current?.push(step);
+    setData((prev) => (prev ? applyStep(prev, step) : prev));
+  }, []);
+
   const applyRemoteVerse = useCallback<UseChapterReturn["applyRemoteVerse"]>(
     (verse) => {
-      setData((prev) => (prev ? reduceVerses(prev, verse.bible_version, (s) => applyUpdated(s, verse)) : prev));
+      dispatchStep({ type: "updated", bibleVersion: verse.bible_version, verse });
     },
-    [],
+    [dispatchStep],
   );
 
   const applyLocalVerseBridge = useCallback<UseChapterReturn["applyLocalVerseBridge"]>(
     (bridge, removedVerse, absorbedVerses, removedVersion) => {
-      setData((prev) => {
-        if (!prev) return prev;
-        const next = reduceVerses(prev, bridge.bible_version, (s) => applyBridged(s, bridge, removedVerse, removedVersion));
-        // Identity means the reducer already holds an equal-or-newer picture of
-        // this bridge (a duplicate echo, or a recreation that overtook it) — the
-        // prune below either already ran or would wrongly hit a live verse.
-        if (next === prev) return prev;
-        const absorbed = new Set(absorbedVerses);
-        return {
-          ...next,
-          // The absorbed verses no longer exist as rows; their per-verse
-          // checkoff/status would orphan (and mislead if the bridge is later
-          // split). verse_statuses/verse_lane_checks are not bible_version
-          // scoped, so this prunes by verse number.
-          verseStatuses: next.verseStatuses.filter((s) => !absorbed.has(s.verse)),
-          verseLaneChecks: next.verseLaneChecks.filter((c) => !absorbed.has(c.verse)),
-        };
+      // The absorbed verses' status / lane-check prune lives in applyStep, so a
+      // replayed bridge does exactly what the live one did.
+      dispatchStep({
+        type: "bridged",
+        bibleVersion: bridge.bible_version,
+        bridge,
+        removedVerse,
+        removedVersion,
+        absorbedVerses,
       });
     },
-    [],
+    [dispatchStep],
   );
 
   const applyLocalVerseSplit = useCallback<UseChapterReturn["applyLocalVerseSplit"]>(
     (start, newVerses) => {
-      setData((prev) => (prev ? reduceVerses(prev, start.bible_version, (s) => applySplit(s, start, newVerses)) : prev));
+      dispatchStep({ type: "split", bibleVersion: start.bible_version, start, newVerses });
     },
-    [],
+    [dispatchStep],
   );
 
   const applyLocalVerseStatus = useCallback<UseChapterReturn["applyLocalVerseStatus"]>(
