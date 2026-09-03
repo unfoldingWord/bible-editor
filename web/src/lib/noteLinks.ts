@@ -26,12 +26,15 @@ export type NoteSegment =
 // Chapter/verse folder-and-file segments are 2 digits for every book except
 // PSA, whose chapter folder runs to 150 and is zero-padded to 3 (e.g.
 // "150/006.md") — so both groups accept 2 or 3 digits. The book segment, when
-// present, is a lowercase 3-letter USFM code (cross-book links use one extra
-// "../" to climb out of the chapter folder first, but the leading "../"s
-// themselves aren't load-bearing here, so the count isn't checked). Labels
-// exclude "]" and newlines; anything else (rc://, ta links, unmatched book
-// codes) is left untouched by falling through to a plain "text" segment.
-const NOTE_LINK_RE = /\[([^\]\n]*)\]\((?:\.\.\/)+(?:([a-z]{3})\/)?(\d{2,3})\/(\d{2,3})\.md\)/g;
+// present, is a lowercase USFM code: 3 letters for most books, but a
+// numbered book (1sa, 2sa, 1ki, 1co, 2co, 1jn, 2jn, 3jn, ...) is a leading
+// digit 1-3 plus 2 letters — so the group accepts an optional leading digit
+// before 2-3 letters (cross-book links use one extra "../" to climb out of
+// the chapter folder first, but the leading "../"s themselves aren't
+// load-bearing here, so the count isn't checked). Labels exclude "]" and
+// newlines; anything else (rc://, ta links, unmatched book codes) is left
+// untouched by falling through to a plain "text" segment.
+const NOTE_LINK_RE = /\[([^\]\n]*)\]\((?:\.\.\/)+(?:([1-3]?[a-z]{2,3})\/)?(\d{2,3})\/(\d{2,3})\.md\)/g;
 
 export function parseNoteSegments(text: string, currentBook: string): NoteSegment[] {
   const segments: NoteSegment[] = [];

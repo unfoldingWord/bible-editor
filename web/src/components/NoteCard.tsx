@@ -327,6 +327,16 @@ function NoteBodyReadView({
           key={i}
           ref={overlaps ? assignMarkRef() : undefined}
           title={`Go to ${seg.target.book} ${seg.target.chapter}:${seg.target.verse}`}
+          onMouseDown={(e: React.MouseEvent) => {
+            // The card's own activation (Paper's onMouseDown -> onFocus, see
+            // below) fires on mousedown, before click. On an inactive card
+            // that flips `active` true and swaps this read view for the
+            // editable textarea (see `showReadView`) — unmounting this very
+            // link before its click ever fires, so navigation silently never
+            // happens. Stop it here so the card stays put and the click below
+            // still lands on a mounted element.
+            e.stopPropagation();
+          }}
           onClick={(e: React.MouseEvent) => {
             // Don't also let this bubble into the outer Box's onActivate —
             // clicking a link navigates away, it doesn't mean "start editing".

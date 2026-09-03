@@ -49,6 +49,20 @@ function linksOf(text, book) {
     "cross-book link targets the named book/chapter/verse");
 }
 
+// ── numbered-book codes (leading digit) resolve — issue #717 review finding ──
+{
+  const cases = [
+    ["compare [1SA 2:5](../../1sa/02/05.md) here", "1SA"],
+    ["compare [2CO 3:1](../../2co/03/01.md) here", "2CO"],
+    ["compare [3JN 1:4](../../3jn/01/04.md) here", "3JN"],
+  ];
+  for (const [text, expectedBook] of cases) {
+    const links = linksOf(text, "ZEC");
+    assert(links.length === 1, `numbered-book cross-book link recognized: ${expectedBook}`);
+    assert(links[0]?.target.book === expectedBook, `numbered-book link resolves to ${expectedBook}`);
+  }
+}
+
 // ── PSA 3-digit chapter/verse ──
 {
   const links = linksOf("see [150:6](../150/006.md)", "PSA");
