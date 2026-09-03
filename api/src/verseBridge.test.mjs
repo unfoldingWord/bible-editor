@@ -24,7 +24,8 @@ import {
   mergeVerseObjects,
   splitSeedVerseObjects,
   splitVerseNumbers,
-  SPLIT_INSERT_VERSE_SQL,
+  SPLIT_INSERT_EDITLOG_RANGE_SQL,
+  SPLIT_INSERT_VERSES_RANGE_SQL,
   SPLIT_UPDATE_START_SQL,
   verseRangeEnd,
 } from "./verseBridge.ts";
@@ -95,6 +96,10 @@ function verseDb() {
     book TEXT, chapter INTEGER, verse INTEGER, lane TEXT, checked_by INTEGER, checked_at INTEGER,
     PRIMARY KEY (book, chapter, verse, lane, checked_by)
   )`);
+  d.exec(`CREATE TABLE edit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT, user_id INTEGER,
+    prev_version INTEGER, new_version INTEGER, action TEXT, payload_json TEXT
+  )`);
   return d;
 }
 function insertVerse(d, { verse, verse_end = null, version = 1, content = "{}", bv = "UST" }) {
@@ -115,13 +120,19 @@ function runMerge(d, { startVerse, startVersion, nextVerse, nextVersion, bridgeE
   d.prepare(BRIDGE_DELETE_NEXT_SQL).run("ZEC", 5, nextVerse, "UST");
   return up.changes;
 }
-function runSplit(d, { verse, expectedVersion, newVerses, seed }) {
+// Mirrors the route's four-statement batch: de-bridge, edit_log(split), then the
+// two CTE-driven range INSERTs. `verseEnd` drives the CTE, exactly as the route
+// passes bridge.verse_end. Returns statement-1's change count (the success flag).
+function runSplit(d, { verse, verseEnd, expectedVersion, seed }) {
   const up = d
     .prepare(SPLIT_UPDATE_START_SQL)
     .run(200, 30, "split", "user", "actor", "ZEC", 5, verse, "UST", expectedVersion);
-  for (const v of newVerses) {
-    d.prepare(SPLIT_INSERT_VERSE_SQL).run("ZEC", 5, v, "UST", seed, 200, 30, "split", "user", "actor");
-  }
+  d.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+     SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'split', ?6 WHERE changes() > 0`,
+  ).run(`ZEC/5/${verse}/UST`, "ZEC", 30, expectedVersion, expectedVersion + 1, "{}");
+  d.prepare(SPLIT_INSERT_VERSES_RANGE_SQL).run("ZEC", 5, "UST", seed, 200, 30, verse, verseEnd, "split", "user", "actor");
+  d.prepare(SPLIT_INSERT_EDITLOG_RANGE_SQL).run("ZEC", 5, "UST", verse, verseEnd, 30, "{}");
   return up.changes;
 }
 
@@ -179,7 +190,7 @@ function runSplit(d, { verse, expectedVersion, newVerses, seed }) {
   const d = verseDb();
   insertVerse(d, { verse: 1, verse_end: 2, version: 4, content: '{"all":"text"}' });
   const seed = JSON.stringify({ verseObjects: splitSeedVerseObjects() });
-  const changed = runSplit(d, { verse: 1, expectedVersion: 4, newVerses: splitVerseNumbers({ verse: 1, verse_end: 2 }), seed });
+  const changed = runSplit(d, { verse: 1, verseEnd: 2, expectedVersion: 4, seed });
   assert(changed === 1, "split landed");
   const start = getVerse(d, 1);
   eq(start.verse_end, null, "start de-bridged");
@@ -189,6 +200,8 @@ function runSplit(d, { verse, expectedVersion, newVerses, seed }) {
   assert(!!v2, "verse-2 row created");
   eq(v2.content_json, seed, "verse-2 seeded with the empty tree");
   eq(v2.version, 1, "new verse starts at version 1");
+  const audit = d.prepare(`SELECT COUNT(*) c FROM edit_log WHERE row_key='ZEC/5/2/UST' AND action='create'`).get().c;
+  eq(audit, 1, "verse-2 got its create audit row");
 }
 
 // split: 5:1-3 → 5:1 + 5:2 + 5:3
@@ -196,8 +209,25 @@ function runSplit(d, { verse, expectedVersion, newVerses, seed }) {
   const d = verseDb();
   insertVerse(d, { verse: 1, verse_end: 3, version: 1 });
   const seed = JSON.stringify({ verseObjects: splitSeedVerseObjects() });
-  runSplit(d, { verse: 1, expectedVersion: 1, newVerses: [2, 3], seed });
+  runSplit(d, { verse: 1, verseEnd: 3, expectedVersion: 1, seed });
   assert(getVerse(d, 1).verse_end === null && !!getVerse(d, 2) && !!getVerse(d, 3), "1-3 split into three rows");
+}
+
+// split: a 60-verse bridge (1-60) — the old one-INSERT-per-verse batch would
+// have been 2 + 2*59 = 120 statements and overflowed D1's 100-statement cap.
+// The CTE range INSERTs keep it at four statements and must mint all 59.
+{
+  const d = verseDb();
+  insertVerse(d, { verse: 1, verse_end: 60, version: 1 });
+  const seed = JSON.stringify({ verseObjects: splitSeedVerseObjects() });
+  const changed = runSplit(d, { verse: 1, verseEnd: 60, expectedVersion: 1, seed });
+  assert(changed === 1, "large split landed");
+  eq(getVerse(d, 1).verse_end, null, "start de-bridged");
+  const count = d.prepare(`SELECT COUNT(*) c FROM verses WHERE book='ZEC' AND chapter=5`).all()[0].c;
+  eq(count, 60, "all 60 rows present (start + 59 seeded)");
+  eq(getVerse(d, 60).content_json, seed, "last seeded verse present and seeded");
+  const audits = d.prepare(`SELECT COUNT(*) c FROM edit_log WHERE action='create'`).get().c;
+  eq(audits, 59, "one create audit row per seeded verse");
 }
 
 // split: not a bridge → UPDATE matches nothing, no rows minted
@@ -205,7 +235,9 @@ function runSplit(d, { verse, expectedVersion, newVerses, seed }) {
   const d = verseDb();
   insertVerse(d, { verse: 1, version: 1 }); // singleton, verse_end null
   const seed = JSON.stringify({ verseObjects: splitSeedVerseObjects() });
-  const changed = runSplit(d, { verse: 1, expectedVersion: 1, newVerses: [2], seed });
+  // Pass verseEnd=1 (route would never reach here for a non-bridge, but the CTE
+  // must still mint nothing because the CAS'd UPDATE changed 0 rows).
+  const changed = runSplit(d, { verse: 1, verseEnd: 1, expectedVersion: 1, seed });
   assert(changed === 0, "splitting a non-bridge changes nothing");
   assert(getVerse(d, 2) === undefined, "no phantom verse minted");
 }
@@ -215,7 +247,7 @@ function runSplit(d, { verse, expectedVersion, newVerses, seed }) {
   const d = verseDb();
   insertVerse(d, { verse: 1, verse_end: 2, version: 4 });
   const seed = JSON.stringify({ verseObjects: splitSeedVerseObjects() });
-  const changed = runSplit(d, { verse: 1, expectedVersion: 99, newVerses: [2], seed });
+  const changed = runSplit(d, { verse: 1, verseEnd: 2, expectedVersion: 99, seed });
   assert(changed === 0, "stale split version does not split");
   assert(getVerse(d, 1).verse_end === 2, "bridge intact");
   assert(getVerse(d, 2) === undefined, "no verse minted on a lost CAS");

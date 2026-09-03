@@ -35,7 +35,8 @@ import {
   mergeVerseObjects,
   splitSeedVerseObjects,
   splitVerseNumbers,
-  SPLIT_INSERT_VERSE_SQL,
+  SPLIT_INSERT_EDITLOG_RANGE_SQL,
+  SPLIT_INSERT_VERSES_RANGE_SQL,
   SPLIT_UPDATE_START_SQL,
 } from "./verseBridge.ts";
 
@@ -818,6 +819,7 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
   if (!isBridge(bridge)) return c.json({ error: "not_a_bridge" }, 400);
 
   const newVerses = splitVerseNumbers(bridge);
+  const bridgeEnd = bridge.verse_end as number; // isBridge above guarantees non-null
   const seedContent = { verseObjects: splitSeedVerseObjects() };
   const seedJson = JSON.stringify(seedContent);
 
@@ -826,10 +828,12 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
   const now = Math.floor(Date.now() / 1000);
   const startKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
 
-  // Batch: de-bridge the start row (CAS on version + still-a-bridge), then
-  // insert each seeded singleton chained on changes() > 0, each with its
-  // create audit row. A lost CAS mints nothing.
-  const stmts = [
+  // Exactly FOUR statements regardless of how many verses the bridge spans (D1
+  // caps a batch at 100 statements): de-bridge the start row (CAS on version +
+  // still-a-bridge), then two CTE-driven multi-row INSERTs — all seeded verses,
+  // then all their 'create' audit rows — each chained on changes() > 0 so a lost
+  // CAS mints nothing and the split stays atomic all-or-nothing.
+  const [updateRes] = await c.env.DB.batch([
     c.env.DB
       .prepare(SPLIT_UPDATE_START_SQL)
       .bind(now, userId, ...provenanceValues({ action: "split", source: "user", actor }), book, chapter, verse, bibleVersion, expected),
@@ -839,23 +843,13 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
          SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'split', ?6 WHERE changes() > 0`,
       )
       .bind(startKey, book, userId, expected, expected + 1, JSON.stringify({ content: safeParseOrNull(bridge), verse_end: null })),
-  ];
-  for (const v of newVerses) {
-    stmts.push(
-      c.env.DB
-        .prepare(SPLIT_INSERT_VERSE_SQL)
-        .bind(book, chapter, v, bibleVersion, seedJson, now, userId, ...provenanceValues({ action: "split", source: "user", actor })),
-    );
-    stmts.push(
-      c.env.DB
-        .prepare(
-          `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
-           SELECT 'verse', ?1, ?2, ?3, NULL, 1, 'create', ?4 WHERE changes() > 0`,
-        )
-        .bind(`${book}/${chapter}/${v}/${bibleVersion}`, book, userId, JSON.stringify({ content: seedContent })),
-    );
-  }
-  const [updateRes] = await c.env.DB.batch(stmts);
+    c.env.DB
+      .prepare(SPLIT_INSERT_VERSES_RANGE_SQL)
+      .bind(book, chapter, bibleVersion, seedJson, now, userId, verse, bridgeEnd, ...provenanceValues({ action: "split", source: "user", actor })),
+    c.env.DB
+      .prepare(SPLIT_INSERT_EDITLOG_RANGE_SQL)
+      .bind(book, chapter, bibleVersion, verse, bridgeEnd, userId, JSON.stringify({ content: seedContent })),
+  ]);
   if (!updateRes.meta.changes) {
     const fresh = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
     return c.json({ error: "version_mismatch", current: fresh ? { ...fresh, content: safeParseOrNull(fresh) } : null }, 409);

@@ -134,15 +134,53 @@ export const SPLIT_UPDATE_START_SQL = `UPDATE verses
  WHERE book = ?6 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9
    AND version = ?10 AND verse_end IS NOT NULL AND verse_end > verse`;
 
-// SPLIT statement N — insert one seeded singleton verse, only if the preceding
-// statement in the batch landed (so a lost CAS inserts nothing).
+// SPLIT — insert ALL the seeded singleton verses in ONE statement, only if the
+// preceding statement in the batch landed (so a lost CAS inserts nothing).
 //
-// Binds, in order: (book, chapter, verse, bibleVersion, contentJson, updatedAt,
-// updatedBy, lastChangeAction, lastChangeSource, lastChangeActor).
-export const SPLIT_INSERT_VERSE_SQL = `INSERT INTO verses
+// A recursive CTE generates the verse numbers (startVerse+1 .. verseEnd) so the
+// statement count and bound-param count are FIXED regardless of how many verses
+// the bridge spans. This matters: the old one-INSERT-per-verse shape put
+// 2 + 2*(N-1) statements in the split batch, and D1 caps a batch at 100
+// statements / 100 params each — so splitting a bridge of 51+ verses (reachable
+// by repeatedly extending a bridge, or by an imported long bridge) overflowed
+// the batch and failed. Two fixed multi-row INSERTs keep the whole split at
+// exactly four statements, preserving the atomic all-or-nothing guarantee.
+//
+// Binds, in order: (book, chapter, bibleVersion, contentJson, updatedAt,
+// updatedBy, startVerse, verseEnd, lastChangeAction, lastChangeSource,
+// lastChangeActor).
+export const SPLIT_INSERT_VERSES_RANGE_SQL = `INSERT INTO verses
      (book, chapter, verse, verse_end, bible_version, content_json, plain_text,
       version, updated_at, updated_by, last_change_action, last_change_source, last_change_actor)
-   SELECT ?1, ?2, ?3, NULL, ?4, ?5, NULL, 1, ?6, ?7, ?8, ?9, ?10
+   WITH RECURSIVE split_seq(v) AS (
+     SELECT ?7 + 1
+     UNION ALL SELECT v + 1 FROM split_seq WHERE v + 1 <= ?8
+   )
+   SELECT ?1, ?2, v, NULL, ?3, ?4, NULL, 1, ?5, ?6, ?9, ?10, ?11
+     FROM split_seq
+    WHERE changes() > 0`;
+
+// SPLIT — the matching 'create' audit rows for the seeded verses, again in one
+// CTE-driven statement, chained on the verse INSERT above having landed.
+// row_key is `book/chapter/verse/bibleVersion`, built in SQL from the seq.
+//
+// Binds, in order: (book, chapter, bibleVersion, startVerse, verseEnd, userId,
+// payloadJson).
+// row_key must read `book/chapter/verse/bibleVersion` — the canonical form used
+// everywhere else (verseHistory, the merge route's JS-built keys). CAST chapter
+// and v to INTEGER before concatenating: SQLite string `||` renders a REAL-bound
+// number as "5.0", and drivers (node:sqlite, and D1 for a JS number) bind
+// integers as REAL — so without the CAST the key would be `book/5.0/2.0/bv` and
+// never match a lookup. The verse COLUMN is unaffected (INTEGER affinity coerces
+// on insert); only this text concatenation needs the cast.
+export const SPLIT_INSERT_EDITLOG_RANGE_SQL = `INSERT INTO edit_log
+     (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+   WITH RECURSIVE split_seq(v) AS (
+     SELECT ?4 + 1
+     UNION ALL SELECT v + 1 FROM split_seq WHERE v + 1 <= ?5
+   )
+   SELECT 'verse', ?1 || '/' || CAST(?2 AS INTEGER) || '/' || CAST(v AS INTEGER) || '/' || ?3, ?1, ?6, NULL, 1, 'create', ?7
+     FROM split_seq
     WHERE changes() > 0`;
 
 // Delete the orphaned per-verse checkoff/status for a contiguous absorbed range
