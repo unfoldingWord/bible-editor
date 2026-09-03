@@ -39,6 +39,20 @@ export interface UseChapterReturn {
     position?: { afterId?: string },
   ) => void;
   applyLocalVerse: (verse: VerseDto) => void;
+  /**
+   * A verse-bridge was created: replace the start verse with the combined
+   * bridge DTO, drop the absorbed verse's map key, and prune the now-orphaned
+   * per-verse status / lane-checks for every absorbed verse. Applied after the
+   * server confirms (a 409 must not leave a half-formed bridge), and reused by
+   * the WS `verse.bridged` handler for other tabs.
+   */
+  applyLocalVerseBridge: (bridge: VerseDto, removedVerse: number, absorbedVerses: number[]) => void;
+  /**
+   * A verse-bridge was broken: replace the start verse with the de-bridged DTO
+   * and add the freshly-seeded singleton rows. Applied after the server
+   * confirms; reused by the WS `verse.split` handler.
+   */
+  applyLocalVerseSplit: (start: VerseDto, newVerses: VerseDto[]) => void;
   applyLocalVerseStatus: (verse: number, done: boolean) => void;
   /** Optimistically add/remove my own stamp on a (verse, lane). */
   applyLocalLaneCheck: (verse: number, lane: CheckLane, userId: number, checked: boolean) => void;
@@ -196,6 +210,45 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     [],
   );
 
+  const applyLocalVerseBridge = useCallback<UseChapterReturn["applyLocalVerseBridge"]>(
+    (bridge, removedVerse, absorbedVerses) => {
+      setData((prev) => {
+        if (!prev) return prev;
+        const byVersion = { ...(prev.verses[bridge.bible_version] ?? {}) };
+        delete byVersion[removedVerse];
+        byVersion[bridge.verse] = bridge;
+        const absorbed = new Set(absorbedVerses);
+        return {
+          ...prev,
+          verses: { ...prev.verses, [bridge.bible_version]: byVersion },
+          // The absorbed verses no longer exist as rows; their per-verse
+          // checkoff/status would orphan (and mislead if the bridge is later
+          // split). verse_statuses/verse_lane_checks are not bible_version
+          // scoped, so this prunes by verse number.
+          verseStatuses: prev.verseStatuses.filter((s) => !absorbed.has(s.verse)),
+          verseLaneChecks: prev.verseLaneChecks.filter((c) => !absorbed.has(c.verse)),
+        };
+      });
+    },
+    [],
+  );
+
+  const applyLocalVerseSplit = useCallback<UseChapterReturn["applyLocalVerseSplit"]>(
+    (start, newVerses) => {
+      setData((prev) => {
+        if (!prev) return prev;
+        const byVersion = { ...(prev.verses[start.bible_version] ?? {}) };
+        byVersion[start.verse] = start;
+        for (const nv of newVerses) byVersion[nv.verse] = nv;
+        return {
+          ...prev,
+          verses: { ...prev.verses, [start.bible_version]: byVersion },
+        };
+      });
+    },
+    [],
+  );
+
   const applyLocalVerseStatus = useCallback<UseChapterReturn["applyLocalVerseStatus"]>(
     (verse, done) => {
       setData((prev) => {
@@ -334,6 +387,8 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     applyLocalRowDelete,
     applyLocalRowInsert,
     applyLocalVerse,
+    applyLocalVerseBridge,
+    applyLocalVerseSplit,
     applyLocalVerseStatus,
     applyLocalLaneCheck,
     applyLaneCheckers,

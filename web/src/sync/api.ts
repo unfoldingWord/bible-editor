@@ -94,6 +94,23 @@ export interface VerseDto {
   content: unknown;
 }
 
+// Result of creating a verse bridge (merge-with-next). `verse` is the combined
+// bridge row; `removed_verse` is the absorbed row's start key to drop locally;
+// `absorbed_verses` are all the verse numbers that row covered (for pruning
+// orphaned status / lane checks).
+export interface MergeBridgeResult {
+  verse: VerseDto;
+  removed_verse: number;
+  absorbed_verses: number[];
+}
+
+// Result of breaking a verse bridge. `verse` is the de-bridged start row (all
+// content retained); `new_verses` are the freshly seeded empty singletons.
+export interface SplitBridgeResult {
+  verse: VerseDto;
+  new_verses: VerseDto[];
+}
+
 export type AlignmentIntent =
   | "text_edit"
   | "find_replace"
@@ -1826,6 +1843,36 @@ export const api = {
         method: "PATCH",
         headers: { "If-Match": String(expectedVersion) },
         body: JSON.stringify(payload),
+      },
+    ),
+
+  // Create a verse bridge: combine `verse` with the following verse into a
+  // `\v a-b` block. Both expected versions are sent (two rows are CAS'd) — a
+  // 409 echoes { current: { start, next } }. Deliberate POST, not an outbox op.
+  mergeVerseBridge: (
+    book: string,
+    chapter: number,
+    verse: number,
+    bibleVersion: string,
+    startVersion: number,
+    nextVersion: number,
+  ) =>
+    request<MergeBridgeResult>(
+      `/api/verses/${encodeURIComponent(book)}/${chapter}/${verse}/${encodeURIComponent(bibleVersion)}/bridge`,
+      {
+        method: "POST",
+        body: JSON.stringify({ start_version: startVersion, next_version: nextVersion }),
+      },
+    ),
+
+  // Break a verse bridge: split `verse` (a `\v a-b` row) back into separate
+  // verses, keeping all text in the first. Single-row CAS via If-Match.
+  splitVerseBridge: (book: string, chapter: number, verse: number, bibleVersion: string, expectedVersion: number) =>
+    request<SplitBridgeResult>(
+      `/api/verses/${encodeURIComponent(book)}/${chapter}/${verse}/${encodeURIComponent(bibleVersion)}/split`,
+      {
+        method: "POST",
+        headers: { "If-Match": String(expectedVersion) },
       },
     ),
 

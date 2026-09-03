@@ -43,6 +43,10 @@ export type LastChangeAction =
   | "delete"
   /** A restore-from-history write. */
   | "restore"
+  /** Two adjacent verses combined into a `\v a-b` bridge (verse-bridge create). */
+  | "bridge"
+  /** A `\v a-b` bridge broken back into separate verses (verse-bridge break). */
+  | "split"
   /**
    * sort_order changed and nothing else, and BIBLE EDITOR decided the order —
    * the in-app drag fast path, the interactive order-lock dismiss, and the

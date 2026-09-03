@@ -17,6 +17,7 @@ import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { FindMatch } from "./FindReplaceOverlay";
 import { formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
+import { VerseBridgeButtons } from "./VerseBridgeButtons";
 import {
   matchSourceVerse,
   renderFindMatchesByOffsets,
@@ -91,6 +92,10 @@ interface Props {
   // gets a small check control + a tinted verse-number underline. The
   // integrator wires this from Shell; absent in standalone/source columns.
   textCheck?: TextLaneCheck;
+  // UST-only verse-bridge create/break, wired from Shell (verse carried by the
+  // callback). Absent for other columns, viewers, and locked chapters.
+  onMergeBridge?: (verse: number) => void;
+  onSplitBridge?: (verse: number) => void;
 }
 
 // Continuous Word-style editor for one bible_version. Each verse is its
@@ -126,6 +131,8 @@ export function DocColumn({
   onOpenAligner,
   onEditSection,
   textCheck,
+  onMergeBridge,
+  onSplitBridge,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef<HTMLSpanElement | null>(null);
@@ -276,6 +283,12 @@ export function DocColumn({
                 onAlign={() => onOpenAligner(dto.verse)}
                 onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
                 onSave={(plain) => onSaveColumn([{ verseNum: dto.verse, plain, base: dto }])}
+                verseEnd={dto.verse_end}
+                // A following verse exists iff the expanded index has a row
+                // starting right after this one's span.
+                hasNextVerse={!!versesByVerseNum[(dto.verse_end ?? dto.verse) + 1]}
+                onMergeBridge={onMergeBridge}
+                onSplitBridge={onSplitBridge}
               />
               {/* `\s*` headings live in this verse's trailing verseObjects
                   but introduce the NEXT verse — render the band AFTER the
@@ -348,6 +361,10 @@ function VerseSpan({
   onAlign,
   onEdit,
   onSave,
+  verseEnd,
+  hasNextVerse,
+  onMergeBridge,
+  onSplitBridge,
 }: {
   book: string;
   chapter: number;
@@ -386,6 +403,14 @@ function VerseSpan({
   onAlign: () => void;
   onEdit: (plain: string) => void;
   onSave: (plain: string) => void;
+  // Inclusive range end for this row (null for singletons) — the bridge buttons
+  // need it to label "break bridge a-b" / decide merge vs extend.
+  verseEnd?: number | null;
+  // Whether a following verse row exists to merge into (UST bridge create).
+  hasNextVerse?: boolean;
+  // UST-only verse-bridge create/break. Absent for other columns / viewers.
+  onMergeBridge?: (verse: number) => void;
+  onSplitBridge?: (verse: number) => void;
 }) {
   const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   const activeRange = useMemo<{ start: number; end: number } | null>(() => {
@@ -690,6 +715,15 @@ function VerseSpan({
             <CheckIcon sx={{ fontSize: 14 }} />
           </IconButton>
         </Tooltip>
+      )}
+      {!readOnly && (onMergeBridge || onSplitBridge) && (
+        <VerseBridgeButtons
+          verse={verseNum}
+          verseEnd={verseEnd ?? null}
+          hasNextVerse={!!hasNextVerse}
+          onMergeBridge={onMergeBridge}
+          onSplitBridge={onSplitBridge}
+        />
       )}
       {!readOnly && hasDraft && (
         <Tooltip title={`undo edits to verse ${verseNum}`}>

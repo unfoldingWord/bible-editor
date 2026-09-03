@@ -34,6 +34,10 @@ export interface UseBookReturn {
   chapters: Map<number, ChapterState>;
   loadChapter: (ch: number) => void;
   applyLocalVerse: (verse: VerseDto) => void;
+  /** Book-mode twin of useChapter.applyLocalVerseBridge (verse-bridge create). */
+  applyLocalVerseBridge: (bridge: VerseDto, removedVerse: number, absorbedVerses: number[]) => void;
+  /** Book-mode twin of useChapter.applyLocalVerseSplit (verse-bridge break). */
+  applyLocalVerseSplit: (start: VerseDto, newVerses: VerseDto[]) => void;
   applyLocalRowPatch: (
     kind: "tn" | "tq" | "twl",
     chapter: number,
@@ -159,6 +163,52 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
     });
   }, []);
 
+  const applyLocalVerseBridge = useCallback<UseBookReturn["applyLocalVerseBridge"]>(
+    (bridge, removedVerse, absorbedVerses) => {
+      setChapters((prev) => {
+        const cur = prev.get(bridge.chapter);
+        if (!cur || cur.kind !== "ready") return prev;
+        const data = cur.data;
+        const byVersion = { ...(data.verses[bridge.bible_version] ?? {}) };
+        delete byVersion[removedVerse];
+        byVersion[bridge.verse] = bridge;
+        const absorbed = new Set(absorbedVerses);
+        const next = new Map(prev);
+        next.set(bridge.chapter, {
+          kind: "ready",
+          data: {
+            ...data,
+            verses: { ...data.verses, [bridge.bible_version]: byVersion },
+            verseStatuses: data.verseStatuses.filter((s) => !absorbed.has(s.verse)),
+            verseLaneChecks: data.verseLaneChecks.filter((c) => !absorbed.has(c.verse)),
+          },
+        });
+        return next;
+      });
+    },
+    [],
+  );
+
+  const applyLocalVerseSplit = useCallback<UseBookReturn["applyLocalVerseSplit"]>(
+    (start, newVerses) => {
+      setChapters((prev) => {
+        const cur = prev.get(start.chapter);
+        if (!cur || cur.kind !== "ready") return prev;
+        const data = cur.data;
+        const byVersion = { ...(data.verses[start.bible_version] ?? {}) };
+        byVersion[start.verse] = start;
+        for (const nv of newVerses) byVersion[nv.verse] = nv;
+        const next = new Map(prev);
+        next.set(start.chapter, {
+          kind: "ready",
+          data: { ...data, verses: { ...data.verses, [start.bible_version]: byVersion } },
+        });
+        return next;
+      });
+    },
+    [],
+  );
+
   const applyLocalRowPatch = useCallback<UseBookReturn["applyLocalRowPatch"]>(
     (kind, chapter, id, patch) => {
       setChapters((prev) => {
@@ -208,5 +258,14 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
     });
   }, [book, enabled, applyLocalVerse]);
 
-  return { summary, summaryStatus, chapters, loadChapter, applyLocalVerse, applyLocalRowPatch };
+  return {
+    summary,
+    summaryStatus,
+    chapters,
+    loadChapter,
+    applyLocalVerse,
+    applyLocalVerseBridge,
+    applyLocalVerseSplit,
+    applyLocalRowPatch,
+  };
 }

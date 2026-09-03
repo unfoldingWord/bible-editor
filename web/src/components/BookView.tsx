@@ -23,6 +23,7 @@ import { highlightsFor, isPaintableHtml, overlayFindMarks, renderEditableHTML, r
 import { markHighlightSx, bookTsDividerSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, extractTrailingDividers, stripTrailingDividers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
+import { VerseBridgeButtons } from "./VerseBridgeButtons";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
 import { AlignLinkButton } from "./AlignLinkButton";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
@@ -94,6 +95,8 @@ interface Props {
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
   // The active chapter is mid-pipeline. Locks editing on every chapter
   // displayed in book mode — simplest defensive choice; AI typically scopes
   // to one chapter so other chapters in view are still safe, but explaining
@@ -127,6 +130,8 @@ export function BookView({
   onSaveColumn,
   onOpenAligner,
   onEditSection,
+  onMergeBridge,
+  onSplitBridge,
   locked = false,
   textCheck,
 }: Props) {
@@ -303,6 +308,8 @@ export function BookView({
               onSaveVerse={handleSaveVerse}
               onOpenAligner={onOpenAligner}
               onEditSection={onEditSection}
+              onMergeBridge={onMergeBridge}
+              onSplitBridge={onSplitBridge}
               locked={locked}
               textCheck={textCheck}
             />
@@ -346,6 +353,8 @@ const ChapterBlock = memo(function ChapterBlock({
   onSaveVerse,
   onOpenAligner,
   onEditSection,
+  onMergeBridge,
+  onSplitBridge,
   locked,
   textCheck,
 }: {
@@ -376,6 +385,8 @@ const ChapterBlock = memo(function ChapterBlock({
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
@@ -526,6 +537,8 @@ const ChapterBlock = memo(function ChapterBlock({
             onSaveVerse={onSaveVerse}
             onOpenAligner={onOpenAligner}
             onEditSection={onEditSection}
+            onMergeBridge={onMergeBridge}
+            onSplitBridge={onSplitBridge}
             locked={locked}
             textCheck={textCheck}
           />
@@ -558,6 +571,8 @@ const VerseRow = memo(function VerseRow({
   onSaveVerse,
   onOpenAligner,
   onEditSection,
+  onMergeBridge,
+  onSplitBridge,
   locked,
   textCheck,
 }: {
@@ -587,6 +602,8 @@ const VerseRow = memo(function VerseRow({
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
@@ -608,6 +625,13 @@ const VerseRow = memo(function VerseRow({
             break;
           }
         }
+        // Only meaningful for the UST column (where the bridge buttons show).
+        // versesByVersion is verse_start-keyed, so a truthy lookup at the next
+        // start means a following verse/bridge row actually exists to merge into.
+        const hasNextVerse =
+          bv === "UST" && dto
+            ? !!versesByVersion["UST"]?.[(dto.verse_end ?? dto.verse) + 1]
+            : false;
         return (
           <Box
             key={bv}
@@ -646,6 +670,9 @@ const VerseRow = memo(function VerseRow({
               onEditVerse={onEditVerse}
               onSaveVerse={onSaveVerse}
               onEditSection={onEditSection}
+              onMergeBridge={onMergeBridge}
+              onSplitBridge={onSplitBridge}
+              hasNextVerse={hasNextVerse}
               locked={locked}
               textCheck={textCheck}
             />
@@ -677,6 +704,9 @@ const VerseCell = memo(function VerseCell({
   onEditVerse,
   onSaveVerse,
   onEditSection,
+  onMergeBridge,
+  onSplitBridge,
+  hasNextVerse,
   locked,
   textCheck,
 }: {
@@ -711,6 +741,9 @@ const VerseCell = memo(function VerseCell({
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  hasNextVerse?: boolean;
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
@@ -1043,6 +1076,22 @@ const VerseCell = memo(function VerseCell({
           </IconButton>
         </Tooltip>
       )}
+      {/* Verse-bridge create/break — UST column only, on the first row of a
+          range (dto.verse), never on read-only/locked cells. The callbacks
+          already carry chapter/verse/bibleVersion; VerseBridgeButtons decides
+          internally whether to show merge, split, or both. */}
+      {!readOnly &&
+        bibleVersion === "UST" &&
+        verseNum === dto.verse &&
+        (onMergeBridge || onSplitBridge) && (
+          <VerseBridgeButtons
+            verse={verseNum}
+            verseEnd={dto.verse_end ?? null}
+            hasNextVerse={!!hasNextVerse}
+            onMergeBridge={onMergeBridge ? (v) => onMergeBridge(chapter, v, "UST") : undefined}
+            onSplitBridge={onSplitBridge ? (v) => onSplitBridge(chapter, v, "UST") : undefined}
+          />
+        )}
       {!readOnly && hasDraft && (
         <Tooltip title={`undo edits to verse ${verseNum}`}>
           <IconButton

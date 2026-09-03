@@ -19,10 +19,12 @@
 -- untouched, deliberately, and must stay that way.
 --
 -- last_change_action — WHAT: 'create' | 'update' | 'delete' | 'restore' |
---   'reorder' | 'preserve' | 'unpreserve' | 'hint' | 'unhint' | 'trash' |
---   'untrash' | 'review_clear' | 'dismiss_review' | 'hint_expansion' |
---   'ai_apply' | 'import' | 'finalize_trash' | 'sync_merge' | 'sync_reseed' |
---   'sync_prune' | 'sync_reorder'.
+--   'bridge' | 'split' | 'reorder' | 'preserve' | 'unpreserve' | 'hint' |
+--   'unhint' | 'trash' | 'untrash' | 'review_clear' | 'dismiss_review' |
+--   'hint_expansion' | 'ai_apply' | 'import' | 'finalize_trash' |
+--   'sync_merge' | 'sync_reseed' | 'sync_prune' | 'sync_reorder'.
+--   'bridge'/'split': a verse combined into a `\v a-b` bridge, or a bridge
+--   broken back into separate verses (verseBridge.ts / verses.ts).
 --   Note 'reorder' vs 'sync_reorder': both mean "only sort_order moved", and
 --   they differ by WHO decided the order. 'reorder' is Bible Editor's own
 --   ordering (the in-app drag, the order-lock dismiss, and the nightly

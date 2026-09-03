@@ -251,6 +251,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalRowDelete,
     applyLocalRowInsert,
     applyLocalVerse,
+    applyLocalVerseBridge,
+    applyLocalVerseSplit,
     applyLocalVerseStatus,
     applyLocalLaneCheck,
     applyLaneCheckers,
@@ -270,6 +272,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Surfaced when taking a verse manual fails, so an aborted reorder is visible
   // rather than the drag just appearing to do nothing.
   const [twlOrderToast, setTwlOrderToast] = useState<string | null>(null);
+  // Surfaced when a verse-bridge create/break fails (409 conflict, no adjacent
+  // verse, not a bridge) so the button click doesn't just silently do nothing.
+  const [bridgeToast, setBridgeToast] = useState<string | null>(null);
 
   // "Use automatic": hand the verse back. The server also re-sequences that
   // verse's sort_order on the way out, which bumps each row's version — so
@@ -391,6 +396,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       const existing = dataRef.current?.verses[verse.bible_version]?.[verse.verse];
       if (!existing || verse.version > existing.version) {
         applyLocalVerse(verse);
+      }
+    },
+    onVerseBridged: (verse, removedVerse, absorbedVerses) => {
+      // Newer-version-wins, same guard as onVerseUpdate — a lagging broadcast
+      // must not clobber a fresher local bridge row.
+      const existing = dataRef.current?.verses[verse.bible_version]?.[verse.verse];
+      if (!existing || verse.version > existing.version) {
+        applyLocalVerseBridge(verse, removedVerse, absorbedVerses);
+      }
+    },
+    onVerseSplit: (verse, newVerses) => {
+      const existing = dataRef.current?.verses[verse.bible_version]?.[verse.verse];
+      if (!existing || verse.version > existing.version) {
+        applyLocalVerseSplit(verse, newVerses);
       }
     },
     onVerseStatusUpdate: (status) => {
@@ -2995,6 +3014,71 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       .catch(() => enqueueCapturedSave());
   };
 
+  // The verses map for a chapter, from the active useChapter cache when it's the
+  // open chapter, else the book-mode cache. Bridge create/break read both rows'
+  // versions from here to CAS the structural change.
+  const versesForChapterMap = (ch: number): Record<string, Record<number, VerseDto>> | undefined => {
+    if (ch === chapter) return dataRef.current?.verses;
+    const cs = bookHook?.chapters.get(ch);
+    return cs?.kind === "ready" ? cs.data.verses : undefined;
+  };
+
+  const bridgeErrorMessage = (e: unknown): string => {
+    if (e instanceof ApiError) {
+      if (e.status === 409) return "This verse changed elsewhere — reopen it and try again.";
+      if (e.status === 422) return "There is no following verse to merge with.";
+      if (e.status === 400) return "That verse isn't a bridge.";
+      if (e.status === 403) return "This column is read-only.";
+    }
+    return "Could not update the verse bridge. Try again.";
+  };
+
+  // Create a verse bridge: combine `verse` with the following verse (5:1 + 5:2 →
+  // 5:1-2). A deliberate POST the user awaits — not an outbox op. Applied locally
+  // only on the server's 200 so a 409 never leaves a half-formed bridge.
+  const mergeVerseWithNext = async (chapterNum: number, verse: number, bibleVersion: string) => {
+    const byVersion = versesForChapterMap(chapterNum)?.[bibleVersion];
+    const start = byVersion?.[verse];
+    if (!start) return;
+    const nextStart = (start.verse_end ?? start.verse) + 1;
+    const next = byVersion?.[nextStart];
+    if (!next) {
+      setBridgeToast("There is no following verse to merge with.");
+      return;
+    }
+    try {
+      const res = await api.mergeVerseBridge(book, chapterNum, verse, bibleVersion, start.version, next.version);
+      if (chapterNum === chapter) applyLocalVerseBridge(res.verse, res.removed_verse, res.absorbed_verses);
+      bookHook?.applyLocalVerseBridge(res.verse, res.removed_verse, res.absorbed_verses);
+    } catch (e) {
+      setBridgeToast(bridgeErrorMessage(e));
+    }
+  };
+
+  // Break a verse bridge: split `verse` (a `\v a-b` row) back into separate
+  // verses. All text stays in the first; the later verses become empty rows the
+  // translator fills in. Confirmed first because it moves text around.
+  const splitVerseBridge = async (chapterNum: number, verse: number, bibleVersion: string) => {
+    const byVersion = versesForChapterMap(chapterNum)?.[bibleVersion];
+    const bridge = byVersion?.[verse];
+    if (!bridge || bridge.verse_end == null || bridge.verse_end <= bridge.verse) return;
+    const later = Array.from({ length: bridge.verse_end - bridge.verse }, (_i, k) => bridge.verse + 1 + k).join(", ");
+    if (
+      !window.confirm(
+        `Break bridge ${chapterNum}:${bridge.verse}-${bridge.verse_end}?\n\nAll the text stays in verse ${bridge.verse}; verse${later.includes(",") ? "s" : ""} ${later} will become empty for you to fill in.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await api.splitVerseBridge(book, chapterNum, verse, bibleVersion, bridge.version);
+      if (chapterNum === chapter) applyLocalVerseSplit(res.verse, res.new_verses);
+      bookHook?.applyLocalVerseSplit(res.verse, res.new_verses);
+    } catch (e) {
+      setBridgeToast(bridgeErrorMessage(e));
+    }
+  };
+
   // Restore a previously-saved verse version (from the history dialog). Unlike
   // saveVerseDraft, there is no smartEditVerse pass — we re-save the exact
   // stored content tree verbatim (alignment milestones included). It routes
@@ -3393,6 +3477,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             saveSectionEdit(ch, verseNum, bibleVersion, change, base);
           }}
           onOpenAligner={(v, bv) => openAligner(chapter, v, bv)}
+          onMergeVerseBridge={(ch, v, bv) => mergeVerseWithNext(ch, v, bv)}
+          onSplitVerseBridge={(ch, v, bv) => splitVerseBridge(ch, v, bv)}
           scrollNonce={scrollNonce}
           onRequestScrollToActive={requestScrollToActive}
           searchNotes={getSearchNotes}
@@ -3965,6 +4051,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       >
         <Alert severity="warning" onClose={() => setTwlOrderToast(null)} variant="filled">
           {twlOrderToast}
+        </Alert>
+      </Snackbar>
+      <Snackbar
+        open={!!bridgeToast}
+        autoHideDuration={6000}
+        onClose={() => setBridgeToast(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="warning" onClose={() => setBridgeToast(null)} variant="filled">
+          {bridgeToast}
         </Alert>
       </Snackbar>
       <AiCompletionToasts

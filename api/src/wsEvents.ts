@@ -39,6 +39,16 @@ export type WsEvent =
   | { type: "row.upserted"; kind: RowKind; row: TnRow | TqRow | TwlRow }
   | { type: "row.deleted"; kind: RowKind; id: string; version: number }
   | { type: "verse.updated"; verse: VerseDto }
+  // Two adjacent verses were combined into a `\v a-b` bridge. `verse` is the new
+  // bridge row (start verse, now carrying verse_end); `removedVerse` is the
+  // absorbed row's start key to drop from the verses map; `absorbedVerses` is
+  // every integer verse that row covered, so receivers also prune orphaned
+  // verse_statuses / verse_lane_checks for those numbers.
+  | { type: "verse.bridged"; verse: VerseDto; removedVerse: number; absorbedVerses: number[] }
+  // A `\v a-b` bridge was broken apart. `verse` is the de-bridged start row
+  // (verse_end now null, all content retained); `newVerses` are the freshly
+  // seeded, empty singleton rows for the verses past the start.
+  | { type: "verse.split"; verse: VerseDto; newVerses: VerseDto[] }
   | { type: "verse_status.updated"; status: VerseStatus }
   | { type: "lane_check.updated"; check: LaneCheckState }
   // Bulk "I'm done with <lane> for this chapter": carries the full checker set

@@ -34,12 +34,20 @@ interface WireEvent {
   verseNum?: number;
   lock?: TwlOrderLock | null;
   comment?: CommentDto;
+  // verse.bridged / verse.split
+  removedVerse?: number;
+  absorbedVerses?: number[];
+  newVerses?: VerseDto[];
 }
 
 export interface UseChapterRoomHandlers {
   onUpsert: (kind: RowKind, row: AnyRow) => void;
   onDelete: (kind: RowKind, id: string) => void;
   onVerseUpdate: (verse: VerseDto) => void;
+  // A verse bridge was created / broken in another tab. Whole-row structural
+  // changes (a key vanishes / new keys appear), so a stale tab must reconcile.
+  onVerseBridged: (verse: VerseDto, removedVerse: number, absorbedVerses: number[]) => void;
+  onVerseSplit: (verse: VerseDto, newVerses: VerseDto[]) => void;
   onVerseStatusUpdate: (status: VerseStatus) => void;
   onLaneCheckUpdate: (check: LaneCheckState) => void;
   onLaneCheckBulkUpdate: (lane: CheckLane, checks: VerseLaneCheck[]) => void;
@@ -80,6 +88,14 @@ export function useChapterRoom(
         }
         if (ev.type === "verse.updated" && ev.verse) {
           handlersRef.current.onVerseUpdate(ev.verse);
+          return;
+        }
+        if (ev.type === "verse.bridged" && ev.verse && typeof ev.removedVerse === "number") {
+          handlersRef.current.onVerseBridged(ev.verse, ev.removedVerse, ev.absorbedVerses ?? []);
+          return;
+        }
+        if (ev.type === "verse.split" && ev.verse && Array.isArray(ev.newVerses)) {
+          handlersRef.current.onVerseSplit(ev.verse, ev.newVerses);
           return;
         }
         if (ev.type === "verse_status.updated" && ev.status) {
