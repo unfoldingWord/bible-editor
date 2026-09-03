@@ -943,6 +943,13 @@ export interface ReimportCounts {
   // precisely so a resolved flag never reads as a fresh divergence. Optional,
   // diagnostic.
   ref_moved_resolved?: number;
+  // A tn/tq/twl row whose `ref_raw` had already drifted from its own stored
+  // chapter/verse (an in-app cross-chapter REF retype, which the app
+  // deliberately never writes to `chapter` — see rows.ts) got its stored
+  // chapter/verse rewritten to match its own `ref_raw`. Independent of the
+  // ref_moved_* counters above: this is D1 healing its own bookkeeping, not
+  // an attribution of who moved what against master. Optional, diagnostic.
+  ref_healed?: number;
   merge_unavailable?: number;
   // A "keep_converged" verse whose RAW content_json actually differed — a
   // genuine, cosmetic-only Door43 edit that verseMerge.ts's whitespace-

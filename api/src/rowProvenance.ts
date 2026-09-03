@@ -88,7 +88,17 @@ export type LastChangeAction =
    * labelling our own computed order a Door43 sync is the mislabel this
    * column exists to remove).
    */
-  | "sync_reorder";
+  | "sync_reorder"
+  /**
+   * Only chapter/verse changed, and D1'S OWN ref_raw is why — the nightly
+   * reimport correcting a "torn" row (rows.ts's cross-chapter REF retype
+   * deliberately never writes chapter, so ref_raw and the stored chapter/verse
+   * can disagree) back into agreement with itself (issue #672). Deliberately
+   * NOT 'sync_merge': nothing Door43 held produced this value, so crediting a
+   * Door43 commit author would misattribute a D1-internal bookkeeping fix as
+   * an adopted master edit — source is always 'system', actor always null.
+   */
+  | "ref_heal";
 
 /** WHERE the change happened. */
 export type LastChangeSource =
