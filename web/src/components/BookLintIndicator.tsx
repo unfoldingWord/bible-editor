@@ -18,6 +18,7 @@ import {
   MenuItem,
   Portal,
   Snackbar,
+  ToggleButton,
   Tooltip,
   Typography,
 } from "@mui/material";
@@ -31,6 +32,9 @@ import {
   dismissibleKind,
   groupLintIssues,
   isGroupFullyDismissible,
+  sortLintIssues,
+  type LintGroupMode,
+  type LintSortMode,
 } from "./bookLintGrouping";
 
 // Kindle warning accent (#E59D33 from CLAUDE.md brand palette), matching the
@@ -117,8 +121,9 @@ export function BookLintIndicator({
 }: Props) {
   const anchorRef = useRef<HTMLDivElement | null>(null);
   const [open, setOpen] = useState(false);
-  // Which duplicate-issue groups (keyed by check+message) are expanded to show
-  // their individual refs. Starts empty — a run of duplicates opens collapsed.
+  // Which issue groups (keyed per groupLintIssues — see bookLintGrouping.ts)
+  // are expanded to show their individual refs. Starts empty — a run of
+  // duplicates opens collapsed.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // Optimistically-cleared issues (issue #653 direction 2 "Mark reviewed").
   // Filtered out of the local list immediately, BEFORE the server confirms.
@@ -143,6 +148,12 @@ export function BookLintIndicator({
   const [dismissBusy, setDismissBusy] = useState(false);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [dismissError, setDismissError] = useState<string | null>(null);
+  // Issue #700: how to group and order the menu's issue list. "duplicate"
+  // (default) collapses only genuine repeats; "type" groups every issue of
+  // one check together regardless of wording. "default" sort keeps
+  // first-seen/fetch order; "verse" orders by chapter:verse.
+  const [groupMode, setGroupMode] = useState<LintGroupMode>("duplicate");
+  const [sortMode, setSortMode] = useState<LintSortMode>("default");
 
   // Local expand state is keyed to THIS book's issue set. In practice
   // App.tsx keys <Shell> on `book`, so this component remounts (fresh
@@ -166,7 +177,7 @@ export function BookLintIndicator({
   // Nothing left to clean up — stay out of the way.
   if (displayFlagCount <= 0) return null;
 
-  const groups = groupLintIssues(visibleIssues);
+  const groups = groupLintIssues(sortLintIssues(visibleIssues, sortMode), groupMode);
 
   const tooltip = `${displayFlagCount} issue${displayFlagCount === 1 ? "" : "s"} to clean up in ${book}${
     escalateCount > 0 ? ` (+${escalateCount} integrity)` : ""
@@ -273,6 +284,64 @@ export function BookLintIndicator({
             {escalateCount > 0 ? ` · ${escalateCount} integrity` : ""}
           </Typography>
         </Box>
+        {visibleIssues.length > 1 && (
+          <Box sx={{ px: 2, pb: 1, display: "flex", gap: 2, flexWrap: "wrap" }}>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+              <Typography variant="caption" color="text.secondary">
+                Group:
+              </Typography>
+              <Tooltip title="Collapse only genuine repeats">
+                <ToggleButton
+                  value="duplicate"
+                  size="small"
+                  selected={groupMode === "duplicate"}
+                  onChange={() => setGroupMode("duplicate")}
+                  sx={{ px: 1, py: 0.25, fontSize: 11, textTransform: "none" }}
+                >
+                  Duplicates
+                </ToggleButton>
+              </Tooltip>
+              <Tooltip title="Group every issue of the same kind together, e.g. all 'Doubled space' findings">
+                <ToggleButton
+                  value="type"
+                  size="small"
+                  selected={groupMode === "type"}
+                  onChange={() => setGroupMode("type")}
+                  sx={{ px: 1, py: 0.25, fontSize: 11, textTransform: "none" }}
+                >
+                  Type
+                </ToggleButton>
+              </Tooltip>
+            </Box>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+              <Typography variant="caption" color="text.secondary">
+                Sort:
+              </Typography>
+              <Tooltip title="First-seen order">
+                <ToggleButton
+                  value="default"
+                  size="small"
+                  selected={sortMode === "default"}
+                  onChange={() => setSortMode("default")}
+                  sx={{ px: 1, py: 0.25, fontSize: 11, textTransform: "none" }}
+                >
+                  Default
+                </ToggleButton>
+              </Tooltip>
+              <Tooltip title="Order by chapter:verse">
+                <ToggleButton
+                  value="verse"
+                  size="small"
+                  selected={sortMode === "verse"}
+                  onChange={() => setSortMode("verse")}
+                  sx={{ px: 1, py: 0.25, fontSize: 11, textTransform: "none" }}
+                >
+                  Verse
+                </ToggleButton>
+              </Tooltip>
+            </Box>
+          </Box>
+        )}
         <Divider />
         {groups.flatMap((group) => {
           if (group.issues.length === 1) {
@@ -351,6 +420,12 @@ export function BookLintIndicator({
           const isExpanded = expanded.has(group.key);
           const fullyDismissible = isGroupFullyDismissible(group.issues);
           const groupSpinning = dismissBusy && busyKey === group.key;
+          // Grouping by reviewKind or by type can collapse issues whose exact
+          // message text differs — showing just group.message (the first
+          // issue's) would misrepresent the rest. Fall back to a neutral
+          // summary when the group isn't message-uniform; each issue's own
+          // message is still shown once expanded, below.
+          const messagesVary = group.issues.some((i) => i.message !== group.message);
           const items = [
             <MenuItem
               key={group.key}
@@ -371,7 +446,7 @@ export function BookLintIndicator({
                     color="text.secondary"
                     sx={isExpanded ? undefined : clampSx}
                   >
-                    {group.message}
+                    {messagesVary ? "Tap to see each — details vary by row." : group.message}
                   </Typography>
                 }
               />
@@ -432,6 +507,11 @@ export function BookLintIndicator({
                         {issue.resource}
                       </Typography>
                     </Box>
+                    {messagesVary && (
+                      <Typography variant="caption" color="text.secondary" sx={clampSx}>
+                        {issue.message}
+                      </Typography>
+                    )}
                     <DoorDiff issue={issue} />
                   </Box>
                   {issue.dismissible && issue.rowId && dismissibleKind(issue.resource) && (
