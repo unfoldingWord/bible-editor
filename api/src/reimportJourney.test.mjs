@@ -51,6 +51,26 @@ import { contentPatchClearClauses } from "./contentPatchClauses.ts";
 import { lintTqRows } from "./lint.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 
+// ── Hermetic clock ─────────────────────────────────────────────────────────
+// Every merge_no_base / auto-clear block below seeds its walk windows RELATIVE
+// to Date.now() (NOW, MINT_AT, WATERMARK), but the Door43 commit fixtures
+// (OURS_AND_AI_PAGE / HUMAN_PAGE) carry ABSOLUTE dates (2026-08-27/28). As the
+// real calendar advanced past those dates, the relative walk lower-bound
+// (sinceTime) slid past the fixed commit date, so listMasterCommitsSince
+// (dcsSources.ts) stopped returning `aaa1`; the sweep's probe then read tip=null
+// and flipped its clear/skip decision. The suite passed before 2026-09-03 and
+// failed after — date-flaky CI with no code change, red on every branch alike.
+//
+// Pin the wall clock to a fixed instant in the era these fixtures were authored
+// for, so every relative window straddles the fixed commit dates exactly as
+// intended, on any calendar day. This runs in the file's own test subprocess
+// (run-tests.mjs spawns one node process per file), so it affects nothing else.
+// The one block that drives its own two-adjacent-days clock (the rotation test)
+// saves and restores Date.now around its override, so it still works — its saved
+// baseline is simply this pinned value instead of the wall clock.
+const FIXED_NOW_MS = Date.parse("2026-09-01T00:00:00Z");
+Date.now = () => FIXED_NOW_MS;
+
 // Snapshot reader that tolerates a missing or garbled snapshot, so ablating the
 // snapshot write reports a FAILED ASSERTION instead of crashing the run.
 const parseSnap = (s) => {
