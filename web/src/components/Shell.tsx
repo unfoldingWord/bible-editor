@@ -50,7 +50,7 @@ import { shouldApplyUpsert } from "./rowUpsertGuard";
 import { drafts, verseKey, pinVerseBase, unpinVerseBaseIfIdle, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
-import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
+import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, SECTION_HEADER_TAGS } from "../lib/usfm";
 import { chapterOpensWithoutMarker, introEditBase } from "../lib/verseIntro";
 import { verseHasUnalignedWork, countUnalignedTargetWords } from "../lib/alignment";
 import {
@@ -3046,20 +3046,25 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     let sectionIdx = 0;
     for (const node of verseObjects) {
       const o = node as Record<string, unknown> | null;
-      if (
-        o &&
-        o["type"] === "section" &&
-        typeof o["tag"] === "string" &&
-        SECTION_HEADER_TAGS.has(o["tag"] as string)
-      ) {
+      if (o && isHeaderLabelNode(o)) {
         if (sectionIdx === change.index) {
           if (change.tag !== null) {
-            // usfm-js stores \s* heading text in `content` (with a
-            // trailing \n that the renderer/exporter expects).
-            // splitSectionHeaders prefers `content` over `text`, so we
-            // must write `content` for the change to round-trip.
-            const { text: _drop, ...rest } = o;
-            next.push({ ...rest, tag: change.tag, content: `${change.text}\n` });
+            // usfm-js stores \s* heading text (and `\sr`/`\r`/`\cl` label
+            // text) in `content` (with a trailing \n that the renderer/
+            // exporter expects); only `\sp` parks it on `text` instead —
+            // splitSectionHeaders/isHeaderLabelNode read either, but always
+            // WRITE `content` here so every tag round-trips the same way
+            // (usfm-js's toUSFM accepts `content` for all of them — #710).
+            // The edit dropdown only ever offers s1/s2/s3, so a `\sp`/`\sr`/
+            // `\r`/`\cl` label retagged through it becomes a section heading
+            // and must gain `type:"section"` — carrying the OLD node's
+            // (absent) type forward would make isHeaderLabelNode stop
+            // recognizing the result on the next render (it's typeless and
+            // "s1" isn't in HEADER_LABEL_TAGS), silently orphaning it from
+            // the header band even though the data itself stays intact.
+            const { text: _drop, type: _dropType, ...rest } = o;
+            const type = SECTION_HEADER_TAGS.has(change.tag) ? "section" : undefined;
+            next.push({ ...rest, ...(type ? { type } : {}), tag: change.tag, content: `${change.text}\n` });
           }
           // null tag → drop the node entirely.
           sectionIdx++;

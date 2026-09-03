@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test, request as apiRequest, type Page, type Locator } from "@playwright/test";
@@ -25,21 +26,27 @@ const BASE = process.env.BE_BASE_URL ?? "http://localhost:5173";
 
 const apiDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../api");
 
+// Resolve wrangler's own JS entry point instead of shelling out through `npx`
+// (which on Windows resolves to `npx.cmd`). Node >= 18.20 refuses to spawn a
+// .cmd/.bat file with shell:false (the CVE-2024-27980 mitigation), and
+// shell:true reopens the quoting problem this function used to dodge: a
+// `--command` value with spaces gets re-split on POSIX because shell:true
+// joins argv into a shell command line without quoting each argument.
+// Invoking `node <wrangler.js>` directly needs neither a shell nor a
+// platform-specific executable name, so the `--command` string reaches
+// wrangler as a single untouched argv entry on every platform.
+const wranglerBin = createRequire(resolve(apiDir, "package.json")).resolve(
+  "wrangler/bin/wrangler.js",
+);
+
 // Seed / clear a chapter-locking pipeline_jobs row directly in the LOCAL D1
 // SQLite file `wrangler dev` already has open (same mechanism global-setup.ts
 // uses to seed ZEC). This never touches DCS or a remote database — see
 // CLAUDE.md's dev/prod D1 split; `bible_editor_dev` is the local-only target.
-//
-// Deliberately NOT shell:true (global-setup.ts's pattern, needed there for
-// Windows' npx→npx.cmd resolution): with a `--command` value that contains
-// spaces, shell:true's argv-join-without-quoting on POSIX re-splits the SQL
-// on whitespace and wrangler sees garbage. Naming the platform's real npx
-// executable gets the same Windows .cmd resolution without a shell in the
-// middle to mangle quoting.
 function d1(sql: string): void {
   const res = spawnSync(
-    process.platform === "win32" ? "npx.cmd" : "npx",
-    ["wrangler", "d1", "execute", "bible_editor_dev", "--local", "--command", sql],
+    process.execPath,
+    [wranglerBin, "d1", "execute", "bible_editor_dev", "--local", "--command", sql],
     { cwd: apiDir, stdio: "pipe" },
   );
   if (res.status !== 0) {

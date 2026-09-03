@@ -71,6 +71,59 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **Door43's validate-and-merge job does NOT rewrite our bytes; own-publish declines are the bot's evening pushes.**
+  Measured 2026-09-02 against git.door43.org on five recent `bible-editor:` PRs across three books (en_tq #858,
+  #859, #863, #864, #865): the PR head's blob sha equalled master's blob sha at the squash commit every time — #859's
+  head was exactly the `ba421e896eab` the JER tq inert banner named. What tripped that banner three nights running
+  was `BW Bot` pushing a TQ chapter (`TQ: JER N [..@api.bp-assistant]`, squash-merged from an `AI TQ for JER N` PR)
+  between every one of our ~05:40Z merges (23:49Z, 01:16Z, 17:56Z …). What the code now encodes:
+  `accountOwnPublishDecline` MEASURES a `content_differs` decline — it finds the merge of our push (the `ours`
+  commit whose subject carries our export PR's `(#N)` — Gitea's squash appends it; the PR is stamped on the
+  pushed render as `pushed_pr_number`, guarded on its read time so overlapping exports cannot cross) and reads the
+  file's blob sha at that commit via Gitea's tree endpoint (`fileBlobShaAtCommit`). Equal to
+  `pushed_blob_sha` → preserved: counter 0, banner down, the later commit named. Different → a measured rewrite,
+  counted once per merge (`own_publish_rewrite_sha`), the only thing that counts toward the banner, even under a
+  later bot push. Do not infer this from the newest commit's author (a bot push on top of a real rewrite would
+  hide it) nor from dates (two overlapping exports would be compared against each other's push). (`merge_kept` is
+  retired as a flag kind on the sibling branch `fix/retire-merge-kept-flag`: a keep_ai_master outcome rests on a
+  complete human=0 lineage, so it asks nothing of a proofreader.) The deeper cause both symptoms share is still #658:
+  the own-publish watermark freezes whenever a bot push lands after our export, so every later app edit reads as
+  "both sides changed since the last confirmed publish". Also measured: a Gitea squash commit's author date is the
+  merge time (05:42:19Z for a branch committed 05:41:14Z), and Gitea reports our merged `-be-` PRs as
+  `merged: false` (closed by the Actions job's own commit), so `merged_at` is not a signal for our exports.
+
+- **A TSV row's `updated_at` is NOT the time its review flag was minted, and keying any flag-age decision on it is
+  unsafe in the one direction that matters.** The mint IS guarded on `cur.review_kind == null`, so the flag is
+  written once — but rows.ts's non-versioning fast paths (reorder drag `rows.ts:815`, preserve/hint toggles
+  `:1244`, trash toggles `:1317`/`:1338`) move `updated_at` and deliberately leave `review_kind` standing. So
+  `updated_at >= mint`, never `==`, and a walk window starting there can start *after* the Door43 human commit the
+  flag is about — reporting "no human found" over a range that never contained it, which is the one answer that
+  retires a true warning. Immutable mint evidence exists in two places instead: `review_master_json._meta.flag_at`
+  / `flag_since` for post-#653 flags, and the mint's own `edit_log` row (`action='update'`, payload carries
+  `"review_kind":"merge_no_base"`, `logEditStmt` at `bookReimport.ts:2668`) for older ones. Note that edit_log is
+  *not* forever: `editLogSweep.ts` deletes `update` rows past 180 days (only the newest `create` per live row is
+  exempt), so mint evidence expires. #683 (`sweepStaleMergeNoBase`) derives a pre-#653 flag's window from the mint
+  run's persisted lineage, admitted only when `master_lineage_computed_at <= mintAt` proves that lineage is the
+  mint's own and not a later overwrite.
+- **A column added by a migration is NULL for exactly the rows a backlog-draining fix cares about, because those
+  rows are stuck precisely for want of a later run to fill it.** #683's first cut derived its window from
+  `book_resource_syncs.master_lineage_confirmed_at` (migration 0058, deployed 2026-08-31). Measured read-only in
+  prod on 2026-09-01: NULL for all three stuck pairs (AMO tn, AMO tq, ECC tq) — the column only fills on a run
+  after that deploy, and "no run has visited this pair since" is the *definition* of the backlog. The fix needed a
+  second evidence tier over a column that predated the flags (`master_lineage_computed_at`, 0054). Before relying
+  on a recently-added column to heal historical rows, check whether those rows can ever have it.
+- **A per-book nightly step can only heal books the nightly visits, so any self-healing wired inside the sync
+  reaches exactly the books that did not need healing.** #665's merge_no_base auto-clear sat inside
+  `loadMasterLineage`, which runs only when a resource's master file moved; 12 flags on AMO and ECC therefore
+  survived it because those books had gone quiet. Fixed by a once-per-run sweep driven by "which rows still hold a
+  flag" rather than "which books did we sync" — the shape to reuse for any future row-state cleanup.
+- **A module that imports `hono` cannot be unit-tested.** `api/src/*.test.mjs` runs under plain
+  `node --experimental-strip-types`, which cannot resolve the `hono` package from `node_modules`
+  (`ERR_MODULE_NOT_FOUND … Did you mean to import "hono/dist/cjs/index.js"?`) — only wrangler's bundler can.
+  So keep testable logic in a Hono-free module and put the router beside it in its own file
+  (`dcsCommitPoll.ts` + `dcsCommits.ts` is the pattern). Runtime imports inside a `.ts` file that a test
+  traverses also need the explicit `.ts` extension; extensionless works for `tsc` but not for node.
+
 - **Marker chips are TEXT, and `smartEditVerse` rebuilds the verse's whole marker layout from the captured text
   alone — so a capture that loses the chips silently deletes every `\q` in the verse.** `reconcileMarkers`
   (`web/src/lib/replace.ts`) unconditionally drops every inert in-flow marker and re-inserts only the ones it
@@ -115,8 +168,10 @@ Highlights that bite repeatedly:
 
 - **Master's three commit producers are distinguishable, and two shapes are traps.** Ours:
   `bible-editor: {BOOK} {res} → master (#N)` AND `bible-editor export: … → {BRANCH} (export-…)` — the `-be-`
-  branch commit also appears in master's file history once the branch merges. AI: author `bot@unfoldingword.org`,
-  usually `@api.bp-assistant` in the subject. Human: everything else. Trap 1: `Revert "bible-editor: EZK ult →
+  branch commit also appears in master's file history once the branch merges. AI: bot author `bot@unfoldingword.org`
+  **and** a pipeline-shaped subject (or a gated trailer) — since #550 the bot address alone is not enough, it used
+  to stamp six hand-directed bot edits `ai`; `@api.bp-assistant` in a non-revert subject is a separate, independent
+  route to `ai` for an unrecognized (non-bot) author. Human: everything else. Trap 1: `Revert "bible-editor: EZK ult →
   master (#6711)" (#6716)` is a real **human** commit, so the prefix must be anchored at the start of the subject,
   never a substring test. Trap 2: `ULT: EZK 38 [pjoakes]` is bot-authored with a plain username in the bracket —
   the bot pushes on a human's behalf, and the content is still machine-written, so the **author** decides, not
