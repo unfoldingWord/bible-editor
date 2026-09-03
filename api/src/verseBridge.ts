@@ -171,6 +171,17 @@ export const SPLIT_UPDATE_START_SQL = `UPDATE verses
 // high-water, and it does not exist yet), so they agree by construction.
 // Shared by verses.ts's split (via the SPLIT_* constants below) and
 // bookReimport.ts's applyVerseRows INSERT; issue #727.
+//
+// `COALESCE(new_version, prev_version)`, not `new_version` alone: the bridge
+// route's audit row for the ABSORBED verse is `action='delete'` with
+// `new_version = NULL` and the deleted row's version in `prev_version`
+// (verses.ts), and the bootstrap import writes no edit_log rows for verses at
+// all. So a verse imported at v1, never edited, then absorbed by a bridge has a
+// delete-only history — MAX(new_version) is NULL, and the reimport would have
+// recreated it at MAX(0, floor) + 1 = 1, the very version the deleted row held,
+// letting a stale `If-Match: 1` pass. For every non-delete row new_version >=
+// prev_version, so the COALESCE changes nothing else (verseBridge.test.mjs,
+// applyVerseRows.test.mjs cover the delete-only case).
 export function verseVersionFloorSql(ref: {
   book: string;
   chapter: string;
@@ -180,7 +191,7 @@ export function verseVersionFloorSql(ref: {
 }): string {
   const rowKey = `${ref.book} || '/' || CAST(${ref.chapter} AS INTEGER) || '/' || CAST(${ref.verse} AS INTEGER) || '/' || ${ref.bibleVersion}`;
   return `MAX(
-       COALESCE((SELECT MAX(new_version) FROM edit_log
+       COALESCE((SELECT MAX(COALESCE(new_version, prev_version)) FROM edit_log
                   WHERE kind = 'verse'
                     AND row_key = ${rowKey}), 0),
        ${ref.floor}

@@ -153,7 +153,17 @@ import {
 // node; re-exported below so every existing internal/external reference keeps
 // working unchanged.
 import { REIMPORT_CHAPTER_CHUNK, reimportChunkBoundaries } from "./reimportChunkPlan";
-import { findOverlappingRanges, formatVerseRange, verseVersionFloorSql } from "./verseBridge.ts";
+import {
+  DELETE_VERSE_LANE_CHECKS_RANGE_SQL,
+  DELETE_VERSE_STATUSES_RANGE_SQL,
+  findOverlappingRanges,
+  formatVerseRange,
+  hasVerseObjectsArray,
+  mergeVerseObjects,
+  verseRangeEnd,
+  verseVersionFloorSql,
+} from "./verseBridge.ts";
+import { planStructure, structureKey, type StructureAdoption, type StructuralEdit } from "./verseStructure.ts";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
 
@@ -568,6 +578,31 @@ export interface ReimportCounts {
   // same fail-safe direction as merge_record_failed / apply_incomplete. Counted
   // rather than boolean so the summary can say how many. verses only.
   structure_overlap: number;
+  // Issue #728. Verse-bridge STRUCTURE reconciled against master as its own
+  // dimension (verseStructure.ts planStructure) per connected component of
+  // intersecting [verse, verse_end] ranges. One count per COMPONENT, not per
+  // verse. verses only.
+  //   structure_kept_local   — D1's structure is not yet exported (its newest
+  //                            'bridge'/'split' edit_log row is above the
+  //                            master-confirmed boundary): kept; master's rows skipped.
+  //   structure_adopted      — master's structure landed in D1 (a split or a bridge).
+  //   structure_refused      — master's structure diverged from what we exported
+  //                            and was NOT taken: the lineage proved no human moved
+  //                            master, the shape was not a pure bridge/split, or the
+  //                            anchor row's own content merge refused. Flagged
+  //                            keep_local_structure. Deliberately NOT folded into
+  //                            merge_refused (#726 decision D3, same reasoning as
+  //                            keep_ai_master): when we keep a local structure the
+  //                            export is how it reaches Door43, and freezing that
+  //                            export at five would strand it.
+  //   structure_unclassified — no watermark, so local vs exported cannot be told:
+  //                            kept D1 and skipped master's rows (the pre-#728
+  //                            bridgeCover behaviour), counted so it is visible —
+  //                            the mirror of merge_unavailable.
+  structure_kept_local: number;
+  structure_adopted: number;
+  structure_refused: number;
+  structure_unclassified: number;
   dcs_404: number;
   errors: string[];
   // Set when this object (or an object folded into it via addCounts) was
@@ -720,6 +755,10 @@ function zeroCounts(): ReimportCounts {
     stale_base_held: 0,
     stale_base_overridden: 0,
     structure_overlap: 0,
+    structure_kept_local: 0,
+    structure_adopted: 0,
+    structure_refused: 0,
+    structure_unclassified: 0,
     dcs_404: 0,
     errors: [],
     counts_incomplete: false,
@@ -970,6 +1009,12 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   // measurement whose absence means "not measured on an older code path", and
   // zero overlaps is the state the check exists to confirm, not to assume away.
   into.structure_overlap += from.structure_overlap ?? 0;
+  // Issue #728: same `?? 0` posture as structure_overlap (a replayed pre-#728
+  // chunk result never measured them); none of the four gates anything.
+  into.structure_kept_local += from.structure_kept_local ?? 0;
+  into.structure_adopted += from.structure_adopted ?? 0;
+  into.structure_refused += from.structure_refused ?? 0;
+  into.structure_unclassified += from.structure_unclassified ?? 0;
   into.dcs_404 += from.dcs_404;
   if (from.errors.length) into.errors.push(...from.errors);
 }
@@ -5275,6 +5320,211 @@ function exportRenderForVerse(
   }
 }
 
+// One row of applyVerseRows's `existing` read. The three optional columns are
+// present only when a watermark exists (see mergeCols there); structural_edit_*
+// (issue #728) is the newest 'bridge'/'split' edit_log row on the start key.
+interface ExistingVerseRow {
+  chapter: number;
+  verse: number;
+  content_json: string;
+  plain_text: string | null;
+  verse_end: number | null;
+  version: number;
+  updated_by: number | null;
+  latest_source: string | null;
+  base_payload?: string | null;
+  human_edit_after_export?: number | null;
+  structural_edit_id?: number | null;
+  structural_edit_at?: number | null;
+}
+
+// Issue #728: the anchor row of a structural adoption, with the content the
+// ordinary path DECIDED for it, lifted out of that path's batch so step 7s can
+// write it under guards that also hold the component's other rows still. `mode`
+// is which path decided (and which counter the landed write belongs to):
+// pristine (step 3), ai_reseed (step 5), merge (step 7), or converged — the
+// content merge found master's words lens-equal to ours and only the grouping
+// differs, so master's bytes are written for the structure alone.
+interface StructureAnchorWrite {
+  adoption: StructureAdoption<ExistingVerseRow, VerseExtract>;
+  v: VerseExtract;
+  oldVersion: number;
+  mode: "pristine" | "ai_reseed" | "merge" | "converged";
+  contentJson: string;
+  plainText: string | null;
+}
+
+// Master's rows over a split bridge's whole range, joined the way the bridge
+// route joins two verses (mergeVerseObjects) — what rule 4 of computeVerseMerge
+// measures alignment against for the anchor (VerseMergeInput.theirsForAlignment).
+// null when any part is not a { verseObjects: [...] } tree: the merge then
+// treats it as unparseable and refuses, the fail-closed direction.
+function joinVerseContentJson(parts: string[]): string | null {
+  let acc: unknown[] | null = null;
+  for (const p of parts) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(p);
+    } catch {
+      return null;
+    }
+    if (!hasVerseObjectsArray(parsed)) return null;
+    const vos = (parsed as { verseObjects: unknown[] }).verseObjects;
+    acc = acc === null ? [...vos] : mergeVerseObjects(acc, vos);
+  }
+  return acc === null ? null : JSON.stringify({ verseObjects: acc });
+}
+
+// Issue #728: the statements for ONE structural adoption, in batch order —
+// anchor UPDATE, its audit row, then (write, audit) per absorbed or recreated
+// row. See step 7s in applyVerseRows for the no-overlap argument these guards
+// carry, and verses.ts's bridge/split routes for the in-app twins.
+function buildStructureAdoptionStmts(
+  env: Env,
+  book: string,
+  bibleVersion: string,
+  userId: number | null,
+  now: number,
+  door43: string,
+  aw: StructureAnchorWrite,
+): D1PreparedStatement[] {
+  const ad = aw.adoption;
+  const action = ad.kind === "bridge" ? "sync_bridge" : "sync_split";
+  const anchorKey = `${book}/${ad.chapter}/${ad.anchor.verse}/${bibleVersion}`;
+  const newVersion = aw.oldVersion + 1;
+  const stmts: D1PreparedStatement[] = [];
+
+  // Anchor UPDATE. Binds: ?1 content ?2 plain ?3 verse_end ?4 now ?5 book ?6
+  // chapter ?7 verse ?8 bible_version ?9 read version ?10-12 provenance, then
+  // for a bridge (verse, version) per absorbed row from ?13. The pristine path's
+  // own guard (updated_by IS NULL) is kept on top of the version CAS; the
+  // AI-reseed path's reclaim (updated_by = NULL) is kept too.
+  const guards: string[] = [];
+  const extra: unknown[] = [];
+  if (aw.mode === "pristine") guards.push("AND updated_by IS NULL");
+  if (ad.kind === "bridge") {
+    let p = 13;
+    const inList: string[] = [];
+    for (const row of ad.absorbed) {
+      guards.push(
+        `AND EXISTS (SELECT 1 FROM verses WHERE book = ?5 AND chapter = ?6 AND bible_version = ?8 AND verse = ?${p} AND version = ?${p + 1})`,
+      );
+      inList.push(`?${p}`);
+      extra.push(row.verse, row.version);
+      p += 2;
+    }
+    // Nothing else may sit in the widened range: a row that appeared between
+    // the read and this batch is neither absorbed nor accounted for.
+    guards.push(
+      `AND NOT EXISTS (SELECT 1 FROM verses WHERE book = ?5 AND chapter = ?6 AND bible_version = ?8
+                         AND verse > ?7 AND verse <= ?3 AND verse NOT IN (${inList.join(", ")}))`,
+    );
+  }
+  const reclaim = aw.mode === "ai_reseed" ? "updated_by = NULL, " : "";
+  stmts.push(
+    env.DB.prepare(
+      `UPDATE verses
+          SET content_json = ?1, plain_text = ?2, verse_end = ?3, ${reclaim}version = version + 1,
+              updated_at = ?4, ${provenanceSet(10)}
+        WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
+          AND version = ?9 ${guards.join(" ")}`,
+    ).bind(
+      aw.contentJson, aw.plainText, ad.anchorMaster.verseEnd, now, book, ad.chapter, ad.anchor.verse, bibleVersion, aw.oldVersion,
+      ...provenanceValues({ action, source: "dcs_sync", actor: door43 }),
+      ...extra,
+    ),
+  );
+  // Anchor audit: 'update' like every reimport content write (the payload's
+  // verse_end records the grouping change). Deliberately NOT 'bridge'/'split':
+  // those actions mean a HUMAN restructured in the app, and are what
+  // planStructure reads to classify a structure as local.
+  stmts.push(
+    env.DB.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+       SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7 WHERE changes() > 0`,
+    ).bind(
+      anchorKey, book, userId, aw.oldVersion, newVersion,
+      JSON.stringify({ plain_text: aw.plainText, content: aw.contentJson, verse_end: ad.anchorMaster.verseEnd }),
+      REIMPORT_SOURCE,
+    ),
+  );
+
+  // Absorbed rows: DELETE under the row's own CAS AND the anchor now covering
+  // it at its new version; audit 'delete' with the content (mirror of
+  // verses.ts's bridge route — prev_version = the deleted version, new_version
+  // NULL, payload { content, absorbed_into }). source is the sync's, so a
+  // later recreation of this key never reads the row as a human edit.
+  for (const row of ad.absorbed) {
+    let content: unknown = row.content_json;
+    try {
+      content = JSON.parse(row.content_json);
+    } catch {
+      /* keep the raw string — still recoverable */
+    }
+    stmts.push(
+      env.DB.prepare(
+        `DELETE FROM verses
+          WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4 AND version = ?5
+            AND EXISTS (SELECT 1 FROM verses
+                         WHERE book = ?1 AND chapter = ?2 AND bible_version = ?4
+                           AND verse = ?6 AND version = ?7 AND verse_end >= ?8)`,
+      ).bind(book, ad.chapter, row.verse, bibleVersion, row.version, ad.anchor.verse, newVersion, verseRangeEnd(row)),
+    );
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+         SELECT 'verse', ?1, ?2, ?3, ?4, NULL, 'delete', ?5, ?6 WHERE changes() > 0`,
+      ).bind(
+        `${book}/${ad.chapter}/${row.verse}/${bibleVersion}`, book, userId, row.version,
+        JSON.stringify({ content, plain_text: row.plain_text, verse_end: row.verse_end, absorbed_into: ad.anchor.verse }),
+        REIMPORT_SOURCE,
+      ),
+    );
+  }
+
+  // Recreated rows: INSERT master's verse at the shared version floor (#727),
+  // only while the anchor at its new version no longer covers it and no other
+  // row does either. Binds ?1-?10 as the pristine INSERT (so
+  // REIMPORT_INSERT_VERSE_VERSION_SQL's ?1/?2/?3/?5 line up), then ?11 anchor
+  // verse, ?12 anchor new version. The audit row re-evaluates the same floor.
+  for (const m of ad.recreated) {
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text,
+           version, last_change_action, last_change_source, last_change_actor)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+           ${REIMPORT_INSERT_VERSE_VERSION_SQL},
+           ?8, ?9, ?10
+          WHERE EXISTS (SELECT 1 FROM verses
+                         WHERE book = ?1 AND chapter = ?2 AND bible_version = ?5
+                           AND verse = ?11 AND version = ?12 AND COALESCE(verse_end, verse) < ?3)
+            AND NOT EXISTS (SELECT 1 FROM verses
+                             WHERE book = ?1 AND chapter = ?2 AND bible_version = ?5
+                               AND verse <= COALESCE(?4, ?3) AND COALESCE(verse_end, verse) >= ?3)
+         ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`,
+      ).bind(
+        book, ad.chapter, m.verse, m.verseEnd, bibleVersion, m.contentJson, m.plainText,
+        ...provenanceValues({ action, source: "dcs_sync", actor: door43 }),
+        ad.anchor.verse, newVersion,
+      ),
+    );
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+         SELECT 'verse', ?1, ?2, ?3, NULL,
+           ${REIMPORT_LOG_VERSE_VERSION_SQL},
+           'create', ?4, ?5
+          WHERE changes() > 0`,
+      ).bind(
+        `${book}/${ad.chapter}/${m.verse}/${bibleVersion}`, book, userId,
+        JSON.stringify({ plain_text: m.plainText, content: m.contentJson }), REIMPORT_SOURCE,
+        ad.chapter, m.verse, bibleVersion,
+      ),
+    );
+  }
+  return stmts;
+}
+
 async function applyVerseRows(
   env: Env,
   book: string,
@@ -5394,7 +5644,19 @@ async function applyVerseRows(
                  -- deliberately INCLUDED, on its own timestamp boundary, above.
                  AND action <> 'baseline'
                  AND ${sinceBoundary}
-            ) AS human_edit_after_export`
+            ) AS human_edit_after_export,
+            (SELECT id FROM edit_log
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND action IN ('bridge', 'split')
+               ORDER BY id DESC LIMIT 1) AS structural_edit_id,
+            (SELECT created_at FROM edit_log
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND action IN ('bridge', 'split')
+               ORDER BY id DESC LIMIT 1) AS structural_edit_at`
       : "";
   const existingBind: unknown[] =
     lastExportAt != null
@@ -5412,44 +5674,10 @@ async function applyVerseRows(
       WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${chPlaceholders})`,
   )
     .bind(...existingBind)
-    .all<{
-      chapter: number;
-      verse: number;
-      content_json: string;
-      plain_text: string | null;
-      verse_end: number | null;
-      version: number;
-      updated_by: number | null;
-      latest_source: string | null;
-      base_payload?: string | null;
-      human_edit_after_export?: number | null;
-    }>();
-  const existing = new Map<string, (typeof existingRs.results)[number]>();
+    .all<ExistingVerseRow>();
+  const existing = new Map<string, ExistingVerseRow>();
   for (const r of existingRs.results) existing.set(`${r.chapter}:${r.verse}`, r);
 
-  // Bridge-awareness for the verse-bridge feature. A D1 verse bridge
-  // (verse=a, verse_end=b) is a LOCAL restructuring — it is not on Door43 master
-  // until the next export, so master still carries the SEPARATE verses a..b. The
-  // `existing` map above is keyed by start verse only, so a bridge 1-2 registers
-  // a key for 1 but NOT 2. Without this map, master's plain verse 2 misses the
-  // map and gets reinserted as a standalone row (overlapping `\v 1-2` + `\v 2` in
-  // the nightly USFM), and master's plain verse 1 routes into the adopt path and
-  // can clobber the bridge with its un-bridged text. Register every integer a D1
-  // bridge covers → the bridge's [start, end], so the loop below can skip a plain
-  // master verse that a bridge already covers. First-writer-wins on overlap
-  // (imports never emit overlapping ranges). Empty when no bridges exist.
-  const bridgeCover = new Map<string, { start: number; end: number }>();
-  for (const r of existingRs.results) {
-    if (r.verse_end != null && r.verse_end > r.verse) {
-      for (let vn = r.verse; vn <= r.verse_end; vn++) {
-        const k = `${r.chapter}:${vn}`;
-        if (!bridgeCover.has(k)) bridgeCover.set(k, { start: r.verse, end: r.verse_end });
-      }
-    }
-  }
-  // Refs skipped because a not-yet-exported D1 bridge already covers them.
-  // Diagnostic only (logged capped at the end, like suppressedRefs); gates nothing.
-  const bridgeCoveredRefs: string[] = [];
 
   // 2. Diff in memory. Stage a write only for verses that are new or
   //    pristine-and-changed; count no-ops / edited rows straight from the
@@ -5457,7 +5685,7 @@ async function applyVerseRows(
   //    each chunk's batch commits (see step 3) — never assumed up front, since
   //    an INSERT can lose an ON CONFLICT DO NOTHING race and an UPDATE can lose
   //    its `updated_by IS NULL` guard to a concurrent edit.
-  const pristineWrites: Array<{
+  let pristineWrites: Array<{
     v: VerseExtract;
     isInsert: boolean;
     stmt: D1PreparedStatement;
@@ -5479,7 +5707,7 @@ async function applyVerseRows(
   // human-edited) to re-seed fully from master + reclaim to master-owned. Written
   // in a version-CAS batch below (the main batch's UPDATE guards on
   // `updated_by IS NULL`, which an AI-only verse fails). Counted `reimported_ai`.
-  const aiReseeds: Array<{ v: VerseExtract; oldVersion: number }> = [];
+  let aiReseeds: Array<{ v: VerseExtract; oldVersion: number }> = [];
   // Edited verses whose content is being ADOPTED from master via
   // computeVerseMerge (master moved out-of-band on Door43, D1 did not — or
   // both moved and master wins with a flagged conflict). Written in a
@@ -5544,16 +5772,150 @@ async function applyVerseRows(
     // See issue #507's version guard on UPSERT_VERSE_MERGE_CONFLICT_SQL.
     observedVersion: number | null;
   }> = [];
+  // 2-pre. Issue #728: reconcile verse-bridge STRUCTURE as its own dimension,
+  // per chapter, BEFORE any content decision. See verseStructure.ts's header for
+  // the design (#726) and the four shapes. This replaces PR #721's `bridgeCover`
+  // skip, which handled only the local-bridge shape and could not tell a local
+  // bridge from an exported one a human had since un-bridged on Door43 — that
+  // edit was skipped here and silently reverted by the next export.
+  const structuralEdits = new Map<string, StructuralEdit>();
+  for (const r of existingRs.results) {
+    if (r.structural_edit_id != null) {
+      structuralEdits.set(structureKey(r.chapter, r.verse), {
+        id: Number(r.structural_edit_id),
+        createdAt: Number(r.structural_edit_at ?? 0),
+      });
+    }
+  }
+  const plan = planStructure(existingRs.results, verses, cutoff, structuralEdits);
+  counts.structure_unclassified += plan.unclassified;
+  counts.structure_kept_local += plan.keptLocal.length;
+  counts.structure_refused += plan.conflicts.length;
+  // Anchors — each adoption's start row — keyed like `existing`. The content
+  // loop below DECIDES each anchor through its ordinary path (pristine /
+  // AI-reseed / computeVerseMerge, so an un-bridge with unchanged words is a
+  // clean adopt and an app edit since the export keeps its adopt_conflict
+  // recovery pointer); step 7s then performs the write, under guards that hold
+  // the component's absorbed/recreated rows still at the same time.
+  const anchorByKey = new Map<string, StructureAdoption<ExistingVerseRow, VerseExtract>>();
+  for (const a of plan.adoptions) anchorByKey.set(structureKey(a.chapter, a.anchor.verse), a);
+  // For a 'split' anchor, what rule 4 of computeVerseMerge measures alignment
+  // against: master's rows over the bridge's WHOLE range, joined the way the
+  // bridge route joins verses. Verse-to-verse, every un-bridge would look like
+  // losing half its alignment — see VerseMergeInput.theirsForAlignment.
+  const structureAlignmentTheirs = new Map<string, string>();
+  for (const a of plan.adoptions) {
+    if (a.kind !== "split") continue;
+    const joined = joinVerseContentJson([a.anchorMaster, ...a.recreated].map((m) => m.contentJson));
+    if (joined != null) structureAlignmentTheirs.set(structureKey(a.chapter, a.anchor.verse), joined);
+  }
+  // Anchors whose content merge decided NOT to adopt, so step 7s can tell
+  // "the content path refused" from "the content path staged a write", and so
+  // a keep_converged anchor (same words, different grouping) still has its
+  // structure adopted.
+  const anchorKeep = new Map<string, VerseMergeResult>();
+  const structureSkippedRefs: string[] = [];
+  // keep_local_structure flags for refused components. PRECEDENCE with content
+  // flags — verse_merge_conflicts is unique per (book, resource, chapter, verse):
+  // a structure flag is only ever pushed for a verse the content loop SKIPS
+  // (a refused or kept-local component skips every master row it covers), or,
+  // for an anchor whose content merge refused (step 7s), only when the content
+  // path pushed no row of its own for that verse. The two never collide.
+  for (const c of plan.conflicts) {
+    mergeConflicts.push({
+      chapter: c.chapter,
+      verse: c.verse,
+      action: "keep_local_structure",
+      reason: c.reason,
+      overwrittenVersion: null,
+      alignment: null,
+      adopted: false,
+      observedVersion: c.observedVersion,
+    });
+    console.warn("reimport: kept D1's verse structure over master's (issue #728)", {
+      book, bibleVersion, chapter: c.chapter, verse: c.verse, verseEnd: c.verseEnd, reason: c.reason,
+    });
+  }
+  // master_moved_under_local_bridge. A LOCAL bridge hides master's per-verse
+  // rows until the export publishes it; if master's text for one of those
+  // verses moved meanwhile, the export writes the bridge over that edit and
+  // nothing would say so. Compare each hidden master verse to the ancestor we
+  // published: for the start verse that is the row's base_payload (newest
+  // content row at/below the boundary — pre-bridge, for a local bridge); for an
+  // absorbed verse it is the bridge's own 'delete' audit payload (verses.ts),
+  // read in ONE query per ≤WRITE_BATCH keys and only when a local bridge exists
+  // at all — a normal night pays nothing. No recoverable ancestor → no evidence
+  // → no flag (the keep_no_base posture; the count still says a bridge was kept).
+  {
+    const absorbedLookups: Array<{ chapter: number; m: VerseExtract; coverVersion: number | null }> = [];
+    for (const kl of plan.keptLocal) {
+      for (const m of kl.masterVerses) {
+        const same = kl.d1Rows.find((r) => r.verse === m.verse);
+        if (same) {
+          const ancestor = verseContentJsonFromPayload(same.base_payload ?? null);
+          if (ancestor != null && !verseContentConverged(ancestor, m.contentJson)) {
+            mergeConflicts.push({
+              chapter: kl.chapter, verse: m.verse, action: "keep_local_structure",
+              reason: "master_moved_under_local_bridge", overwrittenVersion: null, alignment: null,
+              adopted: false, observedVersion: same.version,
+            });
+          }
+        } else {
+          const cover = kl.d1Rows.find((r) => r.verse < m.verse && verseRangeEnd(r) >= m.verse);
+          absorbedLookups.push({ chapter: kl.chapter, m, coverVersion: cover?.version ?? null });
+        }
+      }
+    }
+    if (absorbedLookups.length > 0) {
+      const deletePayloads = new Map<string, string | null>();
+      for (let i = 0; i < absorbedLookups.length; i += WRITE_BATCH) {
+        const slice = absorbedLookups.slice(i, i + WRITE_BATCH);
+        const keys = slice.map((l) => `${book}/${l.chapter}/${l.m.verse}/${bibleVersion}`);
+        const ph = keys.map((_, j) => `?${j + 2}`).join(", ");
+        const rs = await env.DB.prepare(
+          `SELECT row_key, payload_json FROM edit_log
+            WHERE kind = 'verse' AND action = 'delete' AND (book = ?1 OR book IS NULL)
+              AND row_key IN (${ph})
+            ORDER BY id DESC`,
+        )
+          .bind(book, ...keys)
+          .all<{ row_key: string; payload_json: string | null }>();
+        for (const r of rs.results ?? []) if (!deletePayloads.has(r.row_key)) deletePayloads.set(r.row_key, r.payload_json);
+      }
+      for (const l of absorbedLookups) {
+        const ancestor = verseContentJsonFromPayload(deletePayloads.get(`${book}/${l.chapter}/${l.m.verse}/${bibleVersion}`) ?? null);
+        if (ancestor != null && !verseContentConverged(ancestor, l.m.contentJson)) {
+          mergeConflicts.push({
+            chapter: l.chapter, verse: l.m.verse, action: "keep_local_structure",
+            reason: "master_moved_under_local_bridge", overwrittenVersion: null, alignment: null,
+            adopted: false, observedVersion: l.coverVersion,
+          });
+        }
+      }
+    }
+  }
+  // Absorbed rows a human edited since the render: their text is about to be
+  // DELETED (recoverable from the 'delete' audit row step 7s writes), so leave
+  // the same adopt_conflict recovery pointer an overwritten verse gets. Pushed
+  // BEFORE step 6b so the row is written speculatively like every adoption's;
+  // step 7s adds the key to adoptionsApplied only when the DELETE lands, and 7b
+  // deletes the speculative row otherwise.
+  for (const a of plan.adoptions) {
+    for (const row of a.absorbed) {
+      if (Number(row.human_edit_after_export ?? 0) === 0) continue;
+      mergeConflicts.push({
+        chapter: a.chapter, verse: row.verse, action: "adopt_conflict", reason: "structure_absorbed_human_edit",
+        overwrittenVersion: row.version, alignment: null, adopted: true, observedVersion: row.version,
+      });
+    }
+  }
   for (const v of verses) {
-    // A not-yet-exported D1 bridge already covers this master verse. Skip a
-    // PLAIN master verse (verseEnd null) the bridge spans: reinserting an
-    // absorbed verse would emit an overlapping `\v N` beside `\v a-b`, and
-    // adopting master's un-bridged text would clobber the bridge. A master verse
-    // that is ITSELF a bridge here (verseEnd set) is left to the normal
-    // start-verse reconcile below (which compares verse_end). Once the bridge is
-    // exported, master carries `a-b` too and this no longer fires.
-    if (bridgeCover.get(`${v.chapter}:${v.verse}`) && (v.verseEnd == null || v.verseEnd <= v.verse)) {
-      bridgeCoveredRefs.push(`${v.chapter}:${v.verse}`);
+    // Issue #728: a master verse the structure planner owns — hidden under a
+    // kept-local / unclassified / refused component, or a range step 7s will
+    // INSERT itself. Writing it here would put a second row under a verse a D1
+    // bridge covers (the overlap shape the guards PR refuses to export).
+    if (plan.skipMasterKeys.has(structureKey(v.chapter, v.verse))) {
+      structureSkippedRefs.push(`${v.chapter}:${v.verse}`);
       continue;
     }
     const ex = existing.get(`${v.chapter}:${v.verse}`);
@@ -5684,7 +6046,15 @@ async function applyVerseRows(
             v.verse,
             v.verseEnd,
           ),
+          // Issue #728: set only for the anchor of a bridge master has split.
+          theirsForAlignment: structureAlignmentTheirs.get(structureKey(v.chapter, v.verse)),
         });
+        // Issue #728: an anchor the content merge did NOT adopt — step 7s decides
+        // whether the structure can still follow master (keep_converged) or the
+        // component is kept whole and counted structure_refused.
+        if (!merge.adopt && anchorByKey.has(structureKey(v.chapter, v.verse))) {
+          anchorKeep.set(structureKey(v.chapter, v.verse), merge);
+        }
         if (merge.action === "keep_no_base") {
           counts.merge_no_base++;
           // Name the verse, capped. keep_no_base writes no verse_merge_conflicts
@@ -5877,9 +6247,41 @@ async function applyVerseRows(
     });
   }
 
-  if (bridgeCoveredRefs.length > 0) {
-    console.log("reimport: skipped master verse(s) already covered by a not-yet-exported D1 bridge", {
-      book, bibleVersion, verses: bridgeCoveredRefs.slice(0, 10), total: bridgeCoveredRefs.length,
+  if (structureSkippedRefs.length > 0) {
+    console.log("reimport: skipped master verse(s) the structure planner kept from the content path (issue #728)", {
+      book, bibleVersion, verses: structureSkippedRefs.slice(0, 10), total: structureSkippedRefs.length,
+      keptLocal: plan.keptLocal.length, unclassified: plan.unclassified, refused: plan.conflicts.length,
+    });
+  }
+
+  // Issue #728: anchor writes the pristine and AI-reseed paths staged are lifted
+  // out of their batches — step 7s writes them, in the same batch() as the
+  // component's absorbed/recreated rows and gated on those rows' versions, so
+  // the anchor can never widen over a row that is not deleted in the same
+  // transaction (nor shrink without its freed verses being recreated). Merge-
+  // path anchors stay in masterAdoptions through steps 6 / 6b-pre / 6a and are
+  // collected at 7s.
+  const anchorWrites = new Map<string, StructureAnchorWrite>();
+  if (anchorByKey.size > 0) {
+    pristineWrites = pristineWrites.filter((w) => {
+      const k = structureKey(w.v.chapter, w.v.verse);
+      const ad = anchorByKey.get(k);
+      if (!ad || w.isInsert) return true;
+      anchorWrites.set(k, {
+        adoption: ad, v: w.v, oldVersion: ad.anchor.version, mode: "pristine",
+        contentJson: w.v.contentJson, plainText: w.v.plainText,
+      });
+      return false;
+    });
+    aiReseeds = aiReseeds.filter((u) => {
+      const k = structureKey(u.v.chapter, u.v.verse);
+      const ad = anchorByKey.get(k);
+      if (!ad) return true;
+      anchorWrites.set(k, {
+        adoption: ad, v: u.v, oldVersion: u.oldVersion, mode: "ai_reseed",
+        contentJson: u.v.contentJson, plainText: u.v.plainText,
+      });
+      return false;
     });
   }
 
@@ -6289,6 +6691,10 @@ async function applyVerseRows(
   // `counts.errors.push` / `counts.skipped_edited` bump right after this
   // log, added so they're accounted for rather than invisible (FIX 8).
   const adoptionsApplied = new Set<string>();
+  // Issue #728: anchors of a structural adoption are written by step 7s, not
+  // here; they stay in masterAdoptions so 7a/7b (lane reopen, lost-CAS cleanup)
+  // still see them through adoptionsApplied.
+  const contentOnlyAdoptions = masterAdoptions.filter((a) => !anchorByKey.has(structureKey(a.v.chapter, a.v.verse)));
   if (recordFailed && masterAdoptions.length > 0) {
     console.error("reimport: skipping master-adoption write batch — merge-conflict recording failed this run", {
       book, bibleVersion, skipped: masterAdoptions.length,
@@ -6306,8 +6712,8 @@ async function applyVerseRows(
         `merge-conflict recording failed this run (see merge_record_failed)`,
     );
   } else {
-    for (let i = 0; i < masterAdoptions.length; i += WRITE_BATCH) {
-      const slice = masterAdoptions.slice(i, i + WRITE_BATCH);
+    for (let i = 0; i < contentOnlyAdoptions.length; i += WRITE_BATCH) {
+      const slice = contentOnlyAdoptions.slice(i, i + WRITE_BATCH);
       try {
         const results = await env.DB.batch(
           // #686: master-adoption of an out-of-band Door43 correction over a
@@ -6366,6 +6772,200 @@ async function applyVerseRows(
         // and letting the export revert master with no retry.
         counts.apply_incomplete = true;
         counts.errors.push(`verse master-adoption batch: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+
+  // 7s. Issue #728: STRUCTURAL adoptions — master's verse grouping landing in
+  // D1. One component per unit, every statement version-CAS'd, audit rows
+  // adjacent and gated on changes() > 0 in the SAME batch() (the pristine-pair
+  // rule of step 3), apply_incomplete on a thrown batch (step 7's rule). Runs
+  // after every content batch because the anchor's CONTENT was decided there
+  // (and for the merge path, recorded speculatively in 6b); runs before 7a/7b so
+  // landed anchors join adoptionsApplied for the lane reopen and the lost-CAS
+  // cleanup exactly like a step-7 adoption.
+  //
+  // The no-overlap argument, per shape (see buildStructureAdoptionStmts):
+  //   bridge — the anchor UPDATE widens verse_end only if EVERY absorbed row is
+  //            still at its read version and nothing else sits in the widened
+  //            range; each DELETE then requires the anchor at its new version
+  //            covering it. Inside one D1 transaction those cannot diverge.
+  //   split  — the anchor UPDATE narrows verse_end under its own CAS; each
+  //            recreated INSERT requires the anchor at its new version NOT
+  //            covering the verse, and no other row covering it either.
+  // A lost anchor CAS writes nothing at all. A landed anchor whose sub-row
+  // did not land can only leave a GAP (a verse master still carries, which the
+  // next night's plain insert / absorb closes) — never two rows on one verse —
+  // and is counted apply_incomplete so the watermark is withheld for the retry.
+  const landedBridgeAdoptions: Array<StructureAdoption<ExistingVerseRow, VerseExtract>> = [];
+  if (plan.adoptions.length > 0) {
+    for (const a of masterAdoptions) {
+      const k = structureKey(a.v.chapter, a.v.verse);
+      const ad = anchorByKey.get(k);
+      if (ad && !anchorWrites.has(k)) {
+        anchorWrites.set(k, {
+          adoption: ad, v: a.v, oldVersion: a.oldVersion, mode: "merge",
+          contentJson: a.v.contentJson, plainText: a.plainText,
+        });
+      }
+    }
+    const staged: StructureAnchorWrite[] = [];
+    const lateFlags: typeof mergeConflicts = [];
+    for (const ad of plan.adoptions) {
+      const k = structureKey(ad.chapter, ad.anchor.verse);
+      let aw = anchorWrites.get(k);
+      if (!aw) {
+        const kept = anchorKeep.get(k);
+        const m = verses.find((v) => v.chapter === ad.chapter && v.verse === ad.anchor.verse);
+        if (kept?.action === "keep_converged" && m) {
+          // Same words, different grouping: master's content is lens-equal to
+          // D1's, so writing master's bytes with master's verse_end adopts the
+          // structure without changing anything a translator can see.
+          aw = {
+            adoption: ad, v: m, oldVersion: ad.anchor.version, mode: "converged",
+            contentJson: m.contentJson, plainText: m.plainText,
+          };
+        } else {
+          // The content merge refused the anchor (keep_alignment_refused /
+          // keep_ai_master / keep_no_base / keep_master_unchanged). A component
+          // cannot follow master's structure without its anchor, so it is kept
+          // whole — nothing structural is written, so no overlap can result. The
+          // content path's own flag (if it wrote one) takes precedence on this
+          // verse; otherwise a keep_local_structure flag names the merge action.
+          // Recorded now because step 6b has already run.
+          counts.structure_refused++;
+          if (!mergeConflicts.some((mc) => mc.chapter === ad.chapter && mc.verse === ad.anchor.verse)) {
+            const flag = {
+              chapter: ad.chapter, verse: ad.anchor.verse, action: "keep_local_structure",
+              reason: `anchor_${kept?.action ?? "unwritten"}`, overwrittenVersion: null,
+              alignment: null, adopted: false, observedVersion: ad.anchor.version,
+            };
+            mergeConflicts.push(flag);
+            lateFlags.push(flag);
+          }
+          console.warn("reimport: kept D1's verse structure — the anchor's content merge refused (issue #728)", {
+            book, bibleVersion, chapter: ad.chapter, verse: ad.anchor.verse, kind: ad.kind, merge: kept?.action ?? null,
+          });
+          continue;
+        }
+      }
+      // Step 7's recordFailed branch already counted and reported these.
+      if (aw.mode === "merge" && recordFailed) continue;
+      staged.push(aw);
+    }
+    if (lateFlags.length > 0) {
+      const ok = await recordVerseMergeConflicts(
+        env, book, resource, bibleVersion,
+        lateFlags.map((mc) => ({
+          chapter: mc.chapter, verse: mc.verse, action: mc.action, reason: mc.reason,
+          overwrittenVersion: mc.overwrittenVersion, alignment: mc.alignment, observedVersion: mc.observedVersion,
+        })),
+        now,
+      );
+      if (!ok) recordFailed = true;
+    }
+
+    // Chunk whole components into ≤WRITE_BATCH-statement batches. A component
+    // never straddles two batch() calls (its audit rows chain on changes()).
+    const groups: StructureAnchorWrite[][] = [];
+    let group: StructureAnchorWrite[] = [];
+    let groupSize = 0;
+    for (const aw of staged) {
+      const size = 2 + 2 * (aw.adoption.absorbed.length + aw.adoption.recreated.length);
+      if (group.length > 0 && groupSize + size > WRITE_BATCH) {
+        groups.push(group);
+        group = [];
+        groupSize = 0;
+      }
+      group.push(aw);
+      groupSize += size;
+    }
+    if (group.length > 0) groups.push(group);
+
+    for (const g of groups) {
+      const stmts: D1PreparedStatement[] = [];
+      const offsets: number[] = [];
+      for (const aw of g) {
+        offsets.push(stmts.length);
+        stmts.push(...buildStructureAdoptionStmts(env, book, bibleVersion, userId, now, door43, aw));
+      }
+      try {
+        const results = await env.DB.batch(stmts);
+        g.forEach((aw, gi) => {
+          const off = offsets[gi];
+          const ad = aw.adoption;
+          const k = structureKey(ad.chapter, ad.anchor.verse);
+          if ((results[off]?.meta.changes ?? 0) === 0) {
+            // Lost the anchor's CAS (or, for a bridge, an absorbed row moved):
+            // nothing in the component was written. Mirrors the content paths:
+            // skipped_edited everywhere; the merge path additionally withholds
+            // the watermark (step 7's Codex P1.2 rule) since master's change
+            // did not land and the export would otherwise revert it unretried.
+            counts.skipped_edited++;
+            if (aw.mode === "merge") counts.apply_incomplete = true;
+            console.warn("reimport: verse structure adoption lost its version-CAS race; nothing written (issue #728)", {
+              book, bibleVersion, chapter: ad.chapter, verse: ad.anchor.verse, kind: ad.kind, mode: aw.mode,
+            });
+            return;
+          }
+          if (aw.mode === "pristine") counts.updated++;
+          else if (aw.mode === "ai_reseed") counts.reimported_ai++;
+          else if (aw.mode === "merge") {
+            counts.merge_adopted++;
+            adoptionsApplied.add(k);
+          }
+          let subs = 0;
+          let landed = 0;
+          ad.absorbed.forEach((row, j) => {
+            subs++;
+            if ((results[off + 2 + 2 * j]?.meta.changes ?? 0) > 0) {
+              landed++;
+              adoptionsApplied.add(structureKey(ad.chapter, row.verse));
+            }
+          });
+          ad.recreated.forEach((_m, j) => {
+            subs++;
+            if ((results[off + 2 + 2 * (ad.absorbed.length + j)]?.meta.changes ?? 0) > 0) landed++;
+          });
+          if (landed === subs) {
+            counts.structure_adopted++;
+            if (ad.kind === "bridge") landedBridgeAdoptions.push(ad);
+          } else {
+            counts.apply_incomplete = true;
+            counts.errors.push(
+              `verse structure adoption ${book} ${bibleVersion} ${ad.chapter}:${ad.anchor.verse} (${ad.kind}): ` +
+                `anchor landed but ${subs - landed} of ${subs} structural row(s) did not`,
+            );
+          }
+          console.warn("reimport: adopted master's verse structure over D1's (issue #728)", {
+            book, bibleVersion, chapter: ad.chapter, verse: ad.anchor.verse, kind: ad.kind, mode: aw.mode,
+            verseEnd: ad.anchorMaster.verseEnd, absorbed: ad.absorbed.map((r) => r.verse), recreated: ad.recreated.map((m) => m.verse),
+          });
+        });
+      } catch (e) {
+        // Correctness-bearing, like step 7: master's re-structuring did not land
+        // and the export would revert it unretried without the taint.
+        counts.apply_incomplete = true;
+        counts.errors.push(`verse structure-adoption batch: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    // Post-confirm, best-effort, never chained (mirror of the bridge route):
+    // statuses and lane checks keyed at verses that no longer have a row.
+    if (landedBridgeAdoptions.length > 0) {
+      try {
+        await env.DB.batch(
+          landedBridgeAdoptions.flatMap((ad) => {
+            const from = ad.absorbed[0].verse;
+            const to = Math.max(...ad.absorbed.map((r) => verseRangeEnd(r)));
+            return [
+              env.DB.prepare(DELETE_VERSE_STATUSES_RANGE_SQL).bind(book, ad.chapter, from, to),
+              env.DB.prepare(DELETE_VERSE_LANE_CHECKS_RANGE_SQL).bind(book, ad.chapter, from, to),
+            ];
+          }),
+        );
+      } catch {
+        // orphan cleanup is non-critical — same posture as verses.ts's bridge route.
       }
     }
   }
@@ -6543,6 +7143,15 @@ async function applyVerseRows(
 // Per-row upsert fallback — the original, error-isolated implementation. Invoked
 // only when the batched applyVerseRows hits an atomic batch() error, so one bad
 // verse can't sink a whole chapter. Keys off each verse's own chapter.
+//
+// Issue #728: this path receives no MergeCutoff and does NOT run planStructure.
+// It is structure-safe by construction rather than by planning: the slice it
+// receives is the failed step-3 slice, from which applyVerseRows has already
+// removed every master verse the planner owns (skipMasterKeys) and every
+// structural anchor (lifted into step 7s). What remains are verses whose
+// components agreed on both sides, so copying verse_end from master here is a
+// no-op structurally. If a future caller ever hands this function raw master
+// verses, that guarantee is gone — plan first.
 async function applyVerseRowsPerRow(
   env: Env,
   book: string,
