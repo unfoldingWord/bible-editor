@@ -46,6 +46,7 @@ import {
 } from "../lib/laneChecks";
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
+import { shouldApplyUpsert } from "./rowUpsertGuard";
 import { drafts, verseKey, pinVerseBase, unpinVerseBaseIfIdle, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
@@ -359,23 +360,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     onUpsert: (kind, row) => {
       const list = dataRef.current?.[kind] as Array<TnRow | TqRow | TwlRow> | undefined;
       const existing = list?.find((r) => r.id === row.id);
-      if (!existing) {
-        applyLocalRowInsert(kind, row);
-      } else if (row.version > existing.version) {
-        applyLocalRowReplacement(kind, row);
-      } else if (
-        // Preserve/hint/trash toggles on TN rows don't bump version (they're
-        // state flips, not content — see api/src/rows.ts setTnBit /
-        // setTnTrashed). The version > existing.version guard above would drop
-        // these broadcasts, leaving other tabs stale until refetch. Same-
-        // version replace when an intent bit or the trash state differs.
-        kind === "tn" &&
-        row.version === existing.version &&
-        ((row as TnRow).preserve !== (existing as TnRow).preserve ||
-          (row as TnRow).hint !== (existing as TnRow).hint ||
-          (row as TnRow).trashed_at !== (existing as TnRow).trashed_at)
-      ) {
-        applyLocalRowReplacement(kind, row);
+      // shouldApplyUpsert (rowUpsertGuard.ts) covers: absent locally, a
+      // strictly higher version, or same-version-but-a-known-non-versioning-
+      // field-changed (tn's preserve/hint/trashed_at bit-toggles, and any
+      // kind's sort_order — issue #671: a reorder patches sort_order without
+      // bumping version, see the reorder-only fast path in api/src/rows.ts).
+      if (shouldApplyUpsert(kind, row, existing)) {
+        if (!existing) {
+          applyLocalRowInsert(kind, row);
+        } else {
+          applyLocalRowReplacement(kind, row);
+        }
       }
       // This room is scoped to the currently open {book, chapter}, so any
       // row.upserted event here is for this book — regardless of whether the

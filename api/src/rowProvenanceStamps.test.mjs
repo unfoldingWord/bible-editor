@@ -445,7 +445,7 @@ console.log("\n[BEHAVIOURAL 6: a row nobody has touched since migration 0060 shi
   eq(row.last_change_actor, null, "…last_change_actor is NULL — 'no change since 0060 shipped'");
 }
 
-console.log("\n[BEHAVIOURAL 7: applyTwlSortOrderUpdates stamps its CALLER's provenance, not a hardcoded one, and still bumps version]");
+console.log("\n[BEHAVIOURAL 7: applyTwlSortOrderUpdates stamps its CALLER's provenance, not a hardcoded one, and never bumps version (#687)]");
 {
   const { sqlite, env } = freshEnv();
   sqlite
@@ -473,7 +473,7 @@ console.log("\n[BEHAVIOURAL 7: applyTwlSortOrderUpdates stamps its CALLER's prov
       )
       .all(BOOK)[0];
     eq(row.sort_order, 100, "sort_order actually landed");
-    eq(row.version, 4, "…and version bumped exactly once (unchanged existing behavior — issue #687's separate question)");
+    eq(row.version, 3, "…and version is unchanged (issue #687: a reorder is not a versioned content edit)");
     eq(row.last_change_action, "sync_reorder", "the reimport caller: action='sync_reorder'");
     eq(row.last_change_source, "dcs_sync", "…source='dcs_sync'");
     eq(row.last_change_actor, "Door43 sync", "…actor='Door43 sync'");
@@ -493,7 +493,7 @@ console.log("\n[BEHAVIOURAL 7: applyTwlSortOrderUpdates stamps its CALLER's prov
       )
       .all(BOOK)[0];
     eq(row.sort_order, 200, "…second update also landed");
-    eq(row.version, 5, "…and bumped again");
+    eq(row.version, 3, "…and still unchanged");
     eq(row.last_change_action, "reorder", "the interactive caller: action='reorder', not 'sync_reorder'");
     eq(row.last_change_source, "user", "…source='user'");
     eq(row.last_change_actor, "benjamin", "…actor is the caller's own username, not the hardcoded 'Door43 sync'");
