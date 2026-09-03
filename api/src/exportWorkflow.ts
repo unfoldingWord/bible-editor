@@ -77,6 +77,7 @@ import { runPostExport, VALIDATORS } from "./postExport";
 import {
   runChunkedReimport,
   storedResourceSha,
+  retireMergeKeptFlags,
   sweepStaleMergeNoBase,
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
@@ -375,7 +376,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       const sweepScopeIsFullNightly = !params.book && !params.resource && !params.resources?.length;
       if (!params.dryDcs && sweepScopeIsFullNightly) {
         try {
-          await step.do("sweep-stale-review-flags", async () => sweepStaleMergeNoBase(this.env));
+          await step.do("sweep-stale-review-flags", async () => {
+            const noBase = await sweepStaleMergeNoBase(this.env);
+            // Same gates, same step: `merge_kept` is a retired flag kind, and
+            // every standing one was minted on the measurement that retired it
+            // (see retireMergeKeptFlags). D1-only — no Door43 walk.
+            const kept = await retireMergeKeptFlags(this.env);
+            return { noBase, kept };
+          });
         } catch (e) {
           console.error("export stale review-flag sweep failed", {
             error: e instanceof Error ? e.message : String(e),
@@ -1302,6 +1310,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
 
     await this.recordSnapshot(book, resource, branch, dcsCommitSha, built.rowCount, dcsSkippedReason, prNumber, prError);
+    // The PR that will merge THE render recordPushedRender just recorded, tied to
+    // it by its readAt — see recordPushedPr for why a snapshot-time lookup is
+    // not a substitute.
+    if (prNumber != null) await this.recordPushedPr(book, resource, built.readAt, prNumber);
 
     return {
       book,
@@ -1642,6 +1654,43 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       console.error("export conflict-recovery failed", { book, resource, repo, branch, error: detail });
       await this.recordPrConflictAlert(book, resource, repo, branch, detail.slice(0, 120));
       return null;
+    }
+  }
+
+  // Records which export PR carries the render recordPushedRender just stored
+  // (migration 0061's pushed_pr_number), so the nightly sync can find that
+  // render's MERGE on master by the `(#N)` Gitea appends to a squash commit and
+  // measure the bytes it landed (bookReimport.ts accountOwnPublishDecline).
+  //
+  // Guarded on `pushed_read_at = readAt`: two exports of the same pair can
+  // overlap and finish out of order — B's newer render wins recordPushedRender's
+  // monotonic guard, then slower A opens its PR and reaches here afterwards. A
+  // must NOT stamp its PR over B's render, or the sync would compare A's merge
+  // against B's blob and read a preserved merge as a rewrite (Codex verify pass
+  // on PR #704: the snapshot-order lookup this replaces had exactly that hole).
+  // `pushed_pr_read_at` is written alongside, so the sync can tell that the PR
+  // belongs to the render currently on the row: recordPushedRender advances
+  // pushed_read_at for a newer render WITHOUT clearing these two columns (that
+  // statement is the watermark stamp and must not depend on migration 0061), so
+  // until the newer PR is stamped — or for good, if its creation fails — the
+  // number here is the previous render's. Best-effort: a failed stamp leaves the
+  // columns as they were, which the sync reads as "no PR on record for this
+  // render → nothing to measure", never as a match or a mismatch.
+  private async recordPushedPr(book: string, resource: Resource, readAt: number, prNumber: number): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        `UPDATE book_resource_syncs SET pushed_pr_number = ?3, pushed_pr_read_at = ?4
+          WHERE book = ?1 AND resource = ?2 AND pushed_read_at = ?4`,
+      )
+        .bind(book, resource, prNumber, readAt)
+        .run();
+    } catch (e) {
+      console.error("export pushed-PR stamp failed (migration 0061 unapplied?)", {
+        book,
+        resource,
+        prNumber,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 

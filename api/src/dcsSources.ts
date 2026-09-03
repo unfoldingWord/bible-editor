@@ -359,6 +359,45 @@ export interface MasterCommitPage {
 //     route to a per-commit file list, and the per-commit fetch fanout the
 //     issue warned about is not needed. Default stays false so the nightly
 //     path's payload does not grow.
+// The git blob sha of ONE file as of a given commit, from the commit's root tree
+// (`GET /repos/{owner}/{repo}/git/trees/{commit sha}` — Gitea resolves a commit
+// sha to its tree; measured 2026-09-02 on en_tq 744f2ee8: 73 entries, `truncated:
+// false`, tq_JER.tsv → f8bacfca…). One subrequest, no file content transferred —
+// a `contents` read would ship the whole file base64'd to learn a 40-char hash.
+// Our resource files all sit at the repo root, so a single non-recursive tree
+// answers; anything else (nested path, truncated tree, HTTP failure, bad body)
+// returns null, which every caller treats as "not measured", never as a match.
+export async function fileBlobShaAtCommit(
+  env: Env,
+  repo: string,
+  path: string,
+  commitSha: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<string | null> {
+  if (path.includes("/")) return null;
+  const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
+  const url =
+    `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
+    `/git/trees/${encodeURIComponent(commitSha)}?per_page=1000`;
+  try {
+    const r = await fetch(url, {
+      headers,
+      ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+    });
+    if (!r.ok) return null;
+    const body = (await r.json()) as Record<string, unknown>;
+    if (body.truncated === true || !Array.isArray(body.tree)) return null;
+    for (const raw of body.tree as Array<Record<string, unknown>>) {
+      if (raw.path === path && raw.type === "blob" && typeof raw.sha === "string") return raw.sha;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export async function listMasterCommitsSince(
   env: Env,
   repo: string,
