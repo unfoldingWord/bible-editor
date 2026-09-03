@@ -472,6 +472,15 @@ async function main() {
         "human",
         null,
       ],
+      // Review finding on #699: title shape + bracket alone is not enough —
+      // a HUMAN who merges an unrelated PR that happens to carry this exact
+      // literal title, under their OWN account, must not classify ai.
+      [
+        "Merge pull request 'AI UST for EZK 39 [pjoakes]' (#4615) from ezk-39-ust-ai into master",
+        "rich.mahn@example.com",
+        "human",
+        null,
+      ],
     ];
     for (const [message, authorEmail, expectKind, expectReason] of cases) {
       const { rows } = ledgerRowsFromCommits("en_ult", [{ sha: "m", message, authorEmail, authorName: "x" }]);

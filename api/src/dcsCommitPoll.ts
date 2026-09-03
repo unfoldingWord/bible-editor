@@ -184,6 +184,20 @@ const MERGE_SUBJECT = /^Merge pull request\s+['"](.+)['"]\s*\(#\d+\)/;
 const AI_PIPELINE_MERGE_TITLE =
   /^AI\s+(?:ULT|UST|TN|TQ)\s+for\s+(?:[1-3][A-Z]{2}|[A-Z]{3})\s+\d+\s*\[[^\]]*\]\s*$/;
 
+// The account that performs every AI-pipeline PR's merge on Door43 (review
+// finding on #699: title shape + bracket alone still admits a human who
+// hand-merges a PR happening to carry this exact literal title under their
+// OWN account — nobody has done that, but the check should prove it rather
+// than assume it). Requiring this identity is what makes AI_PIPELINE_MERGE_TITLE
+// safe to accept at all: without it, the shape check is the ONLY signal.
+//
+// NEVER add this to masterLineage.ts's BOT_EMAILS — that set's own comment
+// says why (measured ZERO path-scoped commits under this identity; it is a
+// merge-only account, invisible to the corpus that shared classifier's rules
+// rest on). It belongs here, in the ledger-local merge-title fallback, not
+// there.
+const AI_PIPELINE_MERGE_BOT_EMAIL = "53472+bookpackagebot@noreply.door43.org";
+
 /**
  * LEDGER-LOCAL classification. Wraps classifyMasterCommit; never replaces it,
  * and does not touch it — the gating paths share that function and its rules
@@ -217,13 +231,17 @@ const AI_PIPELINE_MERGE_TITLE =
  * that shape is safe to accept here specifically, even though the shared
  * classifier deliberately excludes it for direct (non-merge) subjects. Tried
  * last, not alongside `ours`, so a merge classifyMasterCommit already
- * resolves via AI_MARKER keeps that more specific reason.
+ * resolves via AI_MARKER keeps that more specific reason. Gated on
+ * AI_PIPELINE_MERGE_BOT_EMAIL, not title shape alone (review finding on
+ * #699): the merge itself must be authored by the known merge-bot account,
+ * so a human who merges an unrelated PR that happens to carry this literal
+ * title under their OWN account is not swept in.
  *
  * The wrapper only ever moves a commit human → ours/ai, i.e. it can only ever
  * REMOVE our own machine's or the bot pipeline's pushes from the human
  * column. It cannot mask a real maintainer edit, because a maintainer's
  * subject does not contain our export prefix or the pipeline's PR-title
- * grammar inside a merge wrapper.
+ * grammar inside a merge wrapper authored by the bot account.
  */
 export function classifyForLedger(commit: MasterCommit): { kind: ClassifiedCommit["kind"]; reason: string } {
   const subject = subjectOf(commit.message) ?? "";
@@ -237,8 +255,15 @@ export function classifyForLedger(commit: MasterCommit): { kind: ClassifiedCommi
   // FULL subject (e.g. a bracket that itself quotes the bp-assistant address)
   // keeps that more specific reason. This only fires when the full-subject
   // rules found nothing, i.e. exactly the #696 gap: an inner subject with the
-  // pipeline's PR-title grammar but no marker text anywhere in the envelope.
-  if (merge && classified.kind === "human" && AI_PIPELINE_MERGE_TITLE.test(merge[1])) {
+  // pipeline's PR-title grammar but no marker text anywhere in the envelope,
+  // AND the merge itself was authored by the known merge-bot account.
+  const mergeAuthorEmail = (commit.authorEmail ?? "").trim().toLowerCase();
+  if (
+    merge &&
+    classified.kind === "human" &&
+    mergeAuthorEmail === AI_PIPELINE_MERGE_BOT_EMAIL &&
+    AI_PIPELINE_MERGE_TITLE.test(merge[1])
+  ) {
     return { kind: "ai", reason: "merge_of_ai_pipeline_pr" };
   }
   return { kind: classified.kind, reason: classified.reason };
