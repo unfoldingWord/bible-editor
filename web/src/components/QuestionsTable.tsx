@@ -311,35 +311,48 @@ const Row = memo(function Row({
         }}
         inputProps={{ style: { fontSize: 13, padding: "3px 6px" } }}
       />
-      <Tooltip
-        title={
-          row.restored_from_version != null
-            ? `v${row.restored_from_version} (restored)${isDirty ? " · unsaved edits" : ""} — currently at row v${row.version}; last update ${new Date(row.updated_at * 1000).toLocaleString()}. Click to view history.`
-            : `v${row.version}${isDirty ? " · unsaved edits" : ""} — saved ${row.version - 1} time${row.version - 1 === 1 ? "" : "s"}; last update ${new Date(row.updated_at * 1000).toLocaleString()}. Click to view history.`
-        }
-      >
-        <Chip
-          label={`v${effectiveVersion}${isDirty ? "*" : ""}`}
-          size="small"
-          variant="outlined"
-          clickable
-          onClick={(e) => {
-            e.stopPropagation();
-            setHistoryOpen(true);
-          }}
-          sx={{
-            gridArea: "ver",
-            fontFamily: "monospace",
-            fontSize: 10,
-            height: 20,
-            justifySelf: "center",
-            color: isDirty ? "warning.main" : "text.secondary",
-            borderColor: isDirty ? "warning.main" : "divider",
-            fontWeight: isDirty ? 600 : 400,
-            "& .MuiChip-label": { px: 0.5 },
-          }}
-        />
-      </Tooltip>
+      <Stack sx={{ gridArea: "ver", alignItems: "center", gap: 0.25, minWidth: 0 }}>
+        <Tooltip
+          title={
+            row.restored_from_version != null
+              ? `v${row.restored_from_version} (restored)${isDirty ? " · unsaved edits" : ""} — currently at row v${row.version}; last update ${new Date(row.updated_at * 1000).toLocaleString()}. Click to view history.`
+              : `v${row.version}${isDirty ? " · unsaved edits" : ""} — saved ${row.version - 1} time${row.version - 1 === 1 ? "" : "s"}; last update ${new Date(row.updated_at * 1000).toLocaleString()}. Click to view history.`
+          }
+        >
+          <Chip
+            label={`v${effectiveVersion}${isDirty ? "*" : ""}`}
+            size="small"
+            variant="outlined"
+            clickable
+            onClick={(e) => {
+              e.stopPropagation();
+              setHistoryOpen(true);
+            }}
+            sx={{
+              fontFamily: "monospace",
+              fontSize: 10,
+              height: 20,
+              color: isDirty ? "warning.main" : "text.secondary",
+              borderColor: isDirty ? "warning.main" : "divider",
+              fontWeight: isDirty ? 600 : 400,
+              "& .MuiChip-label": { px: 0.5 },
+            }}
+          />
+        </Tooltip>
+        {/* 4-char sticky ID (DCS convention). Tucked under the version chip so
+            it's visible without adding a column. At normal width the chip cell
+            runs shorter than the multiline question/response, so this fills
+            existing slack; on the narrow layout (question/response reflow to
+            their own rows) it adds a few px to the top row, which is acceptable. */}
+        <Tooltip title="Question ID">
+          <Typography
+            component="span"
+            sx={{ fontFamily: "monospace", fontSize: 10, lineHeight: 1, color: "text.disabled" }}
+          >
+            {row.id}
+          </Typography>
+        </Tooltip>
+      </Stack>
       {historyOpen && (
         <Suspense fallback={null}>
           <RowHistoryDialog
