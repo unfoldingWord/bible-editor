@@ -23,6 +23,7 @@ export function UhbStrip({
   hidden,
   onToggleHidden,
   hctx,
+  bodyHeight,
 }: {
   sourceVerse: VerseDto | null;
   sourceLabel: string;
@@ -32,6 +33,10 @@ export function UhbStrip({
   hidden: boolean;
   onToggleHidden: () => void;
   hctx: HighlightCtx;
+  // Optional drag-resizable cap for the token area (the side-by-side aligner
+  // passes one); the text scrolls past it. Omitted in the single-panel aligner,
+  // where the strip keeps sizing to its content.
+  bodyHeight?: number;
 }) {
   const sourceIsHebrew = sourceLabel === "UHB";
   return (
@@ -83,6 +88,7 @@ export function UhbStrip({
             lineHeight: 1.55,
             color: "text.primary",
             unicodeBidi: "isolate",
+            ...(bodyHeight != null ? { maxHeight: bodyHeight, overflowY: "auto" } : {}),
           }}
         >
           <SourceVerseTokens

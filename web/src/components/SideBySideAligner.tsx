@@ -2,6 +2,7 @@ import {
   forwardRef,
   type Ref,
   type MutableRefObject,
+  type MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -43,6 +44,111 @@ function writeHoverLink(v: boolean) {
   } catch {
     /* ignore */
   }
+}
+
+// ─── Resizable strip heights ────────────────────────────────────────────
+// The reading (English) and source (Hebrew) strips sit above the aligners as
+// fixed-height bands. Long verses used to be clipped by a hard 64px reading cap
+// with no way to grow it. Each band now carries an explicit, drag-resizable
+// pixel height that scrolls internally and persists per browser. The alignment
+// cards below are the flex remainder, so shrinking a band hands that space to
+// the cards; the unaligned-words tray keeps its own resize handle inside
+// AlignmentPanel.
+const LS_READING_HEIGHT = "be:dualReadingHeight";
+const LS_SOURCE_HEIGHT = "be:dualSourceHeight";
+const DEFAULT_READING_HEIGHT = 64; // matches the old hard cap
+const DEFAULT_SOURCE_HEIGHT = 132; // ~3–4 lines of Hebrew at fontSize 22
+const MIN_STRIP_HEIGHT = 40;
+const MAX_STRIP_HEIGHT = 640;
+
+function clampStripHeight(n: number): number {
+  if (!Number.isFinite(n)) return DEFAULT_READING_HEIGHT;
+  return Math.max(MIN_STRIP_HEIGHT, Math.min(MAX_STRIP_HEIGHT, Math.round(n)));
+}
+function readStripHeight(key: string, fallback: number): number {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw == null) return fallback;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? clampStripHeight(n) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function writeStripHeight(key: string, value: number) {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    /* ignore */
+  }
+}
+
+// A full-width drag bar that sits under a strip and resizes it. Dragging down
+// grows the strip above; double-click resets to `defaultHeight`. Mirrors the
+// ns-resize handle already used by the unaligned-words tray in AlignmentPanel.
+function StripResizeHandle({
+  height,
+  setHeight,
+  defaultHeight,
+  label,
+}: {
+  height: number;
+  setHeight: (h: number) => void;
+  defaultHeight: number;
+  label: string;
+}) {
+  const startResize = useCallback(
+    (e: ReactMouseEvent) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const startHeight = height;
+      const onMove = (ev: MouseEvent) => {
+        setHeight(clampStripHeight(startHeight + (ev.clientY - startY)));
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      document.body.style.cursor = "ns-resize";
+      document.body.style.userSelect = "none";
+    },
+    [height, setHeight],
+  );
+  return (
+    <Box
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label={label}
+      title="drag to resize · double-click to reset"
+      onMouseDown={startResize}
+      onDoubleClick={() => setHeight(defaultHeight)}
+      sx={{
+        flexShrink: 0,
+        height: 8,
+        cursor: "ns-resize",
+        bgcolor: "background.paper",
+        borderBottom: "1px solid",
+        borderColor: "divider",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        "&:hover .be-grip": { bgcolor: "primary.main" },
+        "& .be-grip": {
+          width: 40,
+          height: 3,
+          borderRadius: 2,
+          bgcolor: "divider",
+          transition: "background-color 0.12s",
+        },
+      }}
+    >
+      <Box className="be-grip" />
+    </Box>
+  );
 }
 
 // One side of the popup: its target verse + the wiring to save it. Mirrors the
@@ -243,6 +349,20 @@ export function SideBySideAligner({
   // by a same-side text edit. (Still forwards the upstream onDirtyChange.)
   const [leftDirty, setLeftDirty] = useState(false);
   const [rightDirty, setRightDirty] = useState(false);
+  // Drag-resizable heights for the reading (English) and source (Hebrew) bands,
+  // persisted per browser. See StripResizeHandle / clampStripHeight above.
+  const [readingHeight, setReadingHeight] = useState(() =>
+    readStripHeight(LS_READING_HEIGHT, DEFAULT_READING_HEIGHT),
+  );
+  const [sourceHeight, setSourceHeight] = useState(() =>
+    readStripHeight(LS_SOURCE_HEIGHT, DEFAULT_SOURCE_HEIGHT),
+  );
+  useEffect(() => {
+    writeStripHeight(LS_READING_HEIGHT, readingHeight);
+  }, [readingHeight]);
+  useEffect(() => {
+    writeStripHeight(LS_SOURCE_HEIGHT, sourceHeight);
+  }, [sourceHeight]);
   // Hover positions are verse-specific — a stale ring would attach to whatever
   // token happens to hold the same position after a verse nav.
   useEffect(() => {
@@ -422,6 +542,7 @@ export function SideBySideAligner({
             onSave={onSaveReading}
             onDirtyChange={left.onReadingDirtyChange}
             locked={leftDirty}
+            bodyHeight={readingHeight}
           />
           <ReadingLine
             ref={right.readingRef}
@@ -429,8 +550,15 @@ export function SideBySideAligner({
             onSave={onSaveReading}
             onDirtyChange={right.onReadingDirtyChange}
             locked={rightDirty}
+            bodyHeight={readingHeight}
           />
         </Box>
+        <StripResizeHandle
+          height={readingHeight}
+          setHeight={setReadingHeight}
+          defaultHeight={DEFAULT_READING_HEIGHT}
+          label="resize reading text"
+        />
 
         {/* one shared source strip — both sides align to the same Hebrew/Greek */}
         <SharedUhbStrip
@@ -444,6 +572,13 @@ export function SideBySideAligner({
           hoverLink={hoverLink}
           showSourceInfo={lexInfo}
           groupPositionsFor={groupPositionsFor}
+          bodyHeight={sourceHeight}
+        />
+        <StripResizeHandle
+          height={sourceHeight}
+          setHeight={setSourceHeight}
+          defaultHeight={DEFAULT_SOURCE_HEIGHT}
+          label="resize Hebrew source"
         />
 
         {/* the two aligners */}
@@ -490,12 +625,14 @@ function SharedUhbStrip({
   hoverLink,
   showSourceInfo,
   groupPositionsFor,
+  bodyHeight,
 }: {
   sourceVerse: VerseDto | null;
   sourceLabel: string;
   lexiconMap: Map<string, LexiconEntry | null>;
   twlForVerse: TwlRow[];
   verseNum: number;
+  bodyHeight: number;
   hover: HoverHighlight;
   onHover: (h: HoverHighlight) => void;
   hoverLink: boolean;
@@ -595,6 +732,7 @@ function SharedUhbStrip({
       hidden={hidden}
       onToggleHidden={() => setHidden((h) => !h)}
       hctx={hctx}
+      bodyHeight={bodyHeight}
     />
   );
 }
@@ -613,7 +751,13 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   // dirty-state note in SideBySideAligner). The translator saves/cancels the
   // alignment first, then the line unlocks.
   locked?: boolean;
-}>(function ReadingLine({ slot, onSave, onDirtyChange, locked = false }, ref) {
+  // Drag-resizable cap for the editable text box; it scrolls past this height.
+  // Shared by both reading lines so the two-column grid stays even.
+  bodyHeight?: number;
+}>(function ReadingLine(
+  { slot, onSave, onDirtyChange, locked = false, bodyHeight = DEFAULT_READING_HEIGHT },
+  ref,
+) {
   const { bibleVersion, verse } = slot;
   const editable = useMemo(() => (verse ? extractEditableText(verse.content) : ""), [verse]);
   const elRef = useRef<HTMLDivElement | null>(null);
@@ -768,7 +912,7 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             markDirty(normalizeEditable(value) !== normalizeEditable(editable));
           }}
           sx={{
-            maxHeight: 64,
+            maxHeight: bodyHeight,
             overflowY: "auto",
             fontFamily: '"Times New Roman", "Cardo", serif',
             fontSize: `calc(15px * var(--be-reading-scale, 1))`,
