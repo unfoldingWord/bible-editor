@@ -514,6 +514,16 @@ const ChapterBlock = memo(function ChapterBlock({
       </Box>
       {verseNums.map((v) => {
         const isActive = chapter === activeChapter && v === activeVerse;
+        // The UST bridge buttons sit on the bridge's start row (v). Keep them
+        // available for ANY active verse inside the bridge span — matching
+        // columns mode (DocColumn is range-aware) — not only when the start
+        // verse itself is active. Cheap per-row bool: it flips for the same rows
+        // `isActive` does, so the memo below stays tight.
+        const ustDto = data.verses["UST"]?.[v];
+        const bridgeActive =
+          chapter === activeChapter && ustDto?.verse_end != null && ustDto.verse_end > v
+            ? activeVerse >= v && activeVerse <= ustDto.verse_end
+            : isActive;
         return (
           <VerseRow
             key={`${chapter}-${v}`}
@@ -523,6 +533,7 @@ const ChapterBlock = memo(function ChapterBlock({
             enabledVersions={enabledVersions}
             versesByVersion={data.verses}
             isActive={isActive}
+            bridgeActive={bridgeActive}
             activeNoteQuote={isActive ? activeNoteQuote : null}
             activeNoteOccurrence={isActive ? activeNoteOccurrence : null}
             reorderHighlight={isActive ? reorderHighlight : null}
@@ -557,6 +568,7 @@ const VerseRow = memo(function VerseRow({
   enabledVersions,
   versesByVersion,
   isActive,
+  bridgeActive,
   activeNoteQuote,
   activeNoteOccurrence,
   reorderHighlight,
@@ -582,6 +594,9 @@ const VerseRow = memo(function VerseRow({
   enabledVersions: string[];
   versesByVersion: Record<string, Record<number, VerseDto>>;
   isActive: boolean;
+  // Range-aware active for the UST bridge buttons (true when the active verse
+  // is anywhere inside this row's bridge span); `isActive` for a non-bridge row.
+  bridgeActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   reorderHighlight: ReorderHighlight | null;
@@ -658,6 +673,7 @@ const VerseRow = memo(function VerseRow({
                 versesByVersion["UGNT"]?.[verseNum]?.content
               }
               isActive={isActive}
+              bridgeActive={bridgeActive}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
               reorderHighlight={reorderHighlight}
@@ -692,6 +708,7 @@ const VerseCell = memo(function VerseCell({
   prevDto,
   sourceContent,
   isActive,
+  bridgeActive,
   activeNoteQuote,
   activeNoteOccurrence,
   reorderHighlight,
@@ -723,6 +740,9 @@ const VerseCell = memo(function VerseCell({
   // broken link when a source word lacks a target. Absent on source columns.
   sourceContent?: unknown;
   isActive: boolean;
+  // Range-aware active for the bridge buttons (see VerseRow) — the active verse
+  // is inside this bridge's span, not necessarily its start row.
+  bridgeActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   reorderHighlight: ReorderHighlight | null;
@@ -1087,6 +1107,7 @@ const VerseCell = memo(function VerseCell({
           <VerseBridgeButtons
             verse={verseNum}
             verseEnd={dto.verse_end ?? null}
+            active={bridgeActive}
             hasNextVerse={!!hasNextVerse}
             onMergeBridge={onMergeBridge ? (v) => onMergeBridge(chapter, v, "UST") : undefined}
             onSplitBridge={onSplitBridge ? (v) => onSplitBridge(chapter, v, "UST") : undefined}

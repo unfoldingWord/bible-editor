@@ -3101,7 +3101,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   // Break a verse bridge: split `verse` (a `\v a-b` row) back into separate
   // verses. All text stays in the first; the later verses become empty rows the
-  // translator fills in. Confirmed first because it moves text around.
+  // translator fills in. The user has already confirmed via the VerseBridgeButtons
+  // dialog by the time this runs.
   const splitVerseBridge = async (chapterNum: number, verse: number, bibleVersion: string) => {
     const byVersion = versesForChapterMap(chapterNum)?.[bibleVersion];
     const bridge = byVersion?.[verse];
@@ -3113,14 +3114,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       setBridgeToast("Save your edits to this verse before breaking the bridge.");
       return;
     }
-    const later = Array.from({ length: bridge.verse_end - bridge.verse }, (_i, k) => bridge.verse + 1 + k).join(", ");
-    if (
-      !window.confirm(
-        `Break bridge ${chapterNum}:${bridge.verse}-${bridge.verse_end}?\n\nAll the text stays in verse ${bridge.verse}; verse${later.includes(",") ? "s" : ""} ${later} will become empty for you to fill in.`,
-      )
-    ) {
-      return;
-    }
+    // The confirm now lives in VerseBridgeButtons' MUI dialog (consistent with
+    // merge, and no native window.confirm double-prompt).
     try {
       const res = await api.splitVerseBridge(book, chapterNum, verse, bibleVersion, bridge.version);
       if (chapterNum === chapter) applyLocalVerseSplit(res.verse, res.new_verses);
