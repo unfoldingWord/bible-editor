@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Box, Button, CircularProgress, Link, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
 import { NotificationsMenu } from "./components/NotificationsMenu";
@@ -241,7 +241,11 @@ export function App() {
   // conditionally invoked across renders (loading → ready calls one extra
   // hook), which violates Rules of Hooks. The hook itself no-ops while
   // auth is not "ready".
-  const { alerts, fresh, ackFresh, dismiss, refresh: refreshAlerts } = useAlerts(auth.kind === "ready");
+  // Stops polling once the session is known dead: each tick would otherwise
+  // 401, re-drive a doomed refresh, and blank the bell under the snackbar.
+  const { alerts, fresh, ackFresh, dismiss, refresh: refreshAlerts } = useAlerts(
+    auth.kind === "ready" && !sessionExpired,
+  );
   // Two collapsed homes in the TopBar, no full-width banner (issues #385/#441
   // for comments, #458 for the rest):
   //   • comment mentions/replies  → the top-right notifications bell.
@@ -253,7 +257,6 @@ export function App() {
   // "comment".
   const warningAlerts = alerts.filter((a) => !a.source.startsWith("comment"));
   const notificationAlerts = alerts.filter((a) => a.source.startsWith("comment"));
-  const freshCommentAlerts = fresh.filter((a) => a.source.startsWith("comment"));
 
   // Root comment ids whose thread is open in the popover right now. Reported by
   // Shell; used to clear the alert for a reply the user is already reading
@@ -261,17 +264,41 @@ export function App() {
   const viewedThreadIdsRef = useRef<Set<number>>(new Set());
   const alertsRef = useRef<SystemAlert[]>(alerts);
   alertsRef.current = alerts;
+  // Each alert gets ONE automatic dismiss. Without this, a failing dismiss
+  // POST would refetch, find the alert still there, and dismiss again — a
+  // request loop for as long as the thread stayed open.
+  const autoDismissedRef = useRef<Set<number>>(new Set());
   const dismissViewedAlerts = useCallback(
     (list: SystemAlert[]) => {
       const viewed = viewedThreadIdsRef.current;
       if (viewed.size === 0) return;
       for (const a of list) {
         if (!a.source.startsWith("comment")) continue;
+        if (autoDismissedRef.current.has(a.id)) continue;
         const rootId = commentIdFromLink(a.linkUrl);
-        if (rootId != null && viewed.has(rootId)) void dismiss(a.id);
+        if (rootId != null && viewed.has(rootId)) {
+          autoDismissedRef.current.add(a.id);
+          void dismiss(a.id);
+        }
       }
     },
     [dismiss],
+  );
+  // Viewers cannot open comments at all (the API is editor-only), so a toast
+  // whose View button leads nowhere would only confuse them. Alerts for a
+  // thread already in view are filtered at render time, not just dismissed by
+  // the effect below, so they never paint even for one frame.
+  const commentsReadable = auth.kind === "ready" && auth.role !== "viewer";
+  const freshCommentAlerts = useMemo(
+    () =>
+      commentsReadable
+        ? fresh.filter((a) => {
+            if (!a.source.startsWith("comment")) return false;
+            const rootId = commentIdFromLink(a.linkUrl);
+            return rootId == null || !viewedThreadIdsRef.current.has(rootId);
+          })
+        : [],
+    [fresh, commentsReadable],
   );
   const handleThreadsViewed = useCallback(
     (rootIds: number[]) => {

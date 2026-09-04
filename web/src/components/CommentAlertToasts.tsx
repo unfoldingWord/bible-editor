@@ -4,16 +4,17 @@
 // alert until the user reads the thread or dismisses it. "View" follows the
 // same `?c=<id>` deep link the bell uses. Mirrors AiCompletionToasts.
 
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { Alert, Box, Button, IconButton, Stack } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import ChatBubbleOutlineIcon from "@mui/icons-material/ChatBubbleOutline";
 import type { SystemAlert } from "../sync/api";
+import type { FreshAlert } from "../hooks/useAlerts";
 
 const AUTO_HIDE_MS = 10_000;
 
 interface Props {
-  alerts: SystemAlert[];
+  alerts: FreshAlert[];
   // Toast closed or expired — the alert itself stays in the bell.
   onAck: (id: number) => void;
   // "View": follow the link and clear the alert.
@@ -21,19 +22,15 @@ interface Props {
 }
 
 export function CommentAlertToasts({ alerts, onAck, onView }: Props) {
-  const armed = useRef<Set<number>>(new Set());
+  // Re-arm every timer on each run from the alert's own seenAt, so a
+  // re-render mid-countdown (another toast arriving, a poll tick) shortens
+  // nothing and strands nothing. An "already armed" set would skip the
+  // re-arm after the cleanup cleared the timer and leave the toast stuck.
   useEffect(() => {
-    const timers: number[] = [];
-    for (const a of alerts) {
-      if (armed.current.has(a.id)) continue;
-      armed.current.add(a.id);
-      timers.push(
-        window.setTimeout(() => {
-          armed.current.delete(a.id);
-          onAck(a.id);
-        }, AUTO_HIDE_MS),
-      );
-    }
+    const now = Date.now();
+    const timers = alerts.map((a) =>
+      window.setTimeout(() => onAck(a.id), Math.max(0, AUTO_HIDE_MS - (now - a.seenAt))),
+    );
     return () => {
       timers.forEach((t) => clearTimeout(t));
     };
