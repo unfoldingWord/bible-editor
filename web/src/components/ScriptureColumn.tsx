@@ -614,6 +614,8 @@ function ScriptureColumnInner({
               onEditSection={onEditBookSection}
               onMergeBridge={onMergeVerseBridge}
               onSplitBridge={onSplitVerseBridge}
+              verseCommentCounts={verseCommentCounts}
+              onOpenVerseComments={onOpenVerseComments}
               locked={effectiveLocked}
               textCheck={textCheck}
             />
@@ -665,6 +667,11 @@ function ScriptureColumnInner({
                   ? (verseNum, change, base) => onEditSection(verseNum, v, change, base)
                   : undefined
               }
+              // Comments are verse-level (one thread per verse), so the badge
+              // lives on the leftmost enabled column only — otherwise it would
+              // repeat across every parallel version column.
+              verseCommentCounts={v === enabledVersions[0] ? verseCommentCounts : undefined}
+              onOpenVerseComments={v === enabledVersions[0] ? onOpenVerseComments : undefined}
               />
             ))}
           </Box>
