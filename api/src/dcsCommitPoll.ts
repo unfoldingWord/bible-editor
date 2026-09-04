@@ -95,6 +95,7 @@ export interface DcsPollStateRow {
   last_status: string | null;
   gap_since_sha: string | null;
   gap_at: number | null;
+  gap_from_sha: string | null;
 }
 
 /**
@@ -252,7 +253,9 @@ export function advancesDespiteIncomplete(reason: string): boolean {
   return reason === "page_cap" || reason === "source_sha_not_in_history";
 }
 
-const INSERT_COMMIT_SQL = `INSERT INTO dcs_commits
+// Exported so dcsCommitBackfill.ts (issue #692 item 2) writes the exact same
+// statement rather than a second copy that could drift from it.
+export const INSERT_COMMIT_SQL = `INSERT INTO dcs_commits
    (repo, sha, parent_sha, author_name, author_email, committed_at, message,
     classification, classification_reason, files_json, seen_at)
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -272,8 +275,8 @@ const CLAIM_ATTEMPT_SQL = `INSERT INTO dcs_repo_polls (repo, last_attempted_at)
 
 const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
-    last_status, gap_since_sha, gap_at)
- VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+    last_status, gap_since_sha, gap_at, gap_from_sha)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10)
  ON CONFLICT (repo) DO UPDATE SET
    -- ?9 = "the ingest completed, advance the mark". last_sha and
    -- last_committed_at move TOGETHER off that one flag (review finding F12):
@@ -290,14 +293,18 @@ const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    -- the other way and let each new gap overwrite the previous one, so a repo
    -- that hit its page cap twice reported only the second hole and looked more
    -- contiguous than it was. Coverage claims must err conservative: the field
-   -- means "history below this sha is not proven contiguous", and only a
-   -- backfill that actually closes the hole may clear it (no code clears it
-   -- today — that is the follow-up this table is shaped for). Set as a pair
-   -- with gap_at, for the same reason as last_sha/last_committed_at above.
+   -- means "history below this sha is not proven contiguous", and only the
+   -- backfill path (dcsCommitBackfill.ts, issue #692 item 2) that actually
+   -- closes the hole clears it. Set as a triple with gap_at and gap_from_sha,
+   -- for the same reason as last_sha/last_committed_at above — a regular poll
+   -- must never touch any of the three once an older gap already claimed them,
+   -- or it would silently move the backfill's resume point out from under it.
    gap_since_sha = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
                           THEN excluded.gap_since_sha ELSE dcs_repo_polls.gap_since_sha END,
    gap_at = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
-                   THEN excluded.gap_at ELSE dcs_repo_polls.gap_at END`;
+                   THEN excluded.gap_at ELSE dcs_repo_polls.gap_at END,
+   gap_from_sha = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
+                         THEN excluded.gap_from_sha ELSE dcs_repo_polls.gap_from_sha END`;
 
 export interface RepoPollResult {
   repo: string;
@@ -316,7 +323,7 @@ export interface RepoPollResult {
 export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): Promise<RepoPollResult> {
   const state = await env.DB.prepare(
     `SELECT repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
-            last_status, gap_since_sha, gap_at
+            last_status, gap_since_sha, gap_at, gap_from_sha
        FROM dcs_repo_polls WHERE repo = ?1`,
   )
     .bind(repo)
@@ -350,6 +357,14 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
     dropped > 0 || (page.incomplete && advancesDespiteIncomplete(page.incompleteReason))
       ? (sinceSha ?? rows[rows.length - 1]?.sha ?? null)
       : null;
+  // NEAR edge of the hole, for the backfill path (issue #692 item 2) to resume
+  // from: the parent of the oldest row THIS walk actually inserted. A backward
+  // walk starting there and stopping at `gapSince` fills exactly the range this
+  // poll skipped, nothing more. `rows` is newest-first, so `rows[rows.length -
+  // 1]` is the oldest row. Null only if that row is a repo root (no parent) —
+  // dcsCommitBackfill.ts treats a gap with no known start point as unresolvable
+  // and drops it rather than retrying forever with nothing to walk.
+  const gapFrom = gapSince != null ? (rows[rows.length - 1]?.parentSha ?? null) : null;
 
   // CHUNKED, because D1 caps a batch at 100 statements (documented at
   // bookImport.ts's CHUNK and bookReimport.ts's WRITE_BATCH). A single batch of
@@ -393,6 +408,9 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
     gapSince ? nowSeconds : null,
     // ?9 — advance the (last_sha, last_committed_at) pair, or leave both.
     advance ? 1 : 0,
+    // ?10 — gap_from_sha, part of the gap triple (only lands when this is the
+    // gap that wins, per the CASE guards above).
+    gapFrom,
   );
 
   // The poll upsert rides in the LAST chunk, so the watermark can only advance

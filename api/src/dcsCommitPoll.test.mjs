@@ -257,6 +257,32 @@ async function main() {
       "transport failures do NOT advance");
   }
 
+  // ── issue #692 item 2: a fresh page-cap gap also records its NEAR edge ────
+  // (gap_from_sha), so the backfill path knows where to resume without
+  // re-walking from the tip. It is the PARENT of the oldest row this walk
+  // actually inserted — everything at or above that row is already in the
+  // ledger; everything below it, down to gap_since_sha, is the hole.
+  {
+    const dPage = Array.from({ length: 50 }, (_, i) =>
+      i === 49 ? commit("d49", "hand fix d49", "h@x", { parent: "d-parent" }) : commit(`d${i}`, `hand fix d${i}`, "h@x"),
+    );
+    mockGitea([fullPage("a"), fullPage("b"), fullPage("c"), dPage, fullPage("e"), fullPage("f")]);
+    const db = mockDb({ repo: "en_tn", last_sha: "unreachable", last_attempted_at: NOW - 3600 });
+    await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    const upsert = pollUpsert(db);
+    assert(upsert.args[6] === "unreachable", "  ...gap_since_sha is still the far edge, unchanged");
+    assert(upsert.args[9] === "d-parent", "  ...and gap_from_sha is the oldest inserted row's parent — the near edge");
+  }
+
+  // ── a complete walk records no gap at all, on EITHER edge ────────────────
+  {
+    mockGitea([[commit("only1", "hand fix", "h@x"), commit("mark", "old", "h@x")]]);
+    const db = mockDb({ repo: "en_tq", last_sha: "mark", last_attempted_at: NOW - 3600 });
+    await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tq", NOW);
+    const upsert = pollUpsert(db);
+    assert(upsert.args[6] === null && upsert.args[9] === null, "a complete walk writes no gap_since_sha and no gap_from_sha");
+  }
+
   // ── a full 200-commit poll ingests COMPLETELY, in chunks under D1's cap ──
   // This is the bootstrap path (4 pages × 50), and the first version of the
   // poller sent all 201 statements in one batch — over D1's 100-statement cap,
@@ -530,6 +556,10 @@ async function main() {
     assert(
       /gap_at = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
       "  ...and gap_at is gated on the same condition, so the pair cannot split",
+    );
+    assert(
+      /gap_from_sha = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
+      "  ...and gap_from_sha too — it is a triple with gap_since_sha and gap_at, not a pair",
     );
   }
 

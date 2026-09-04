@@ -582,6 +582,31 @@ async function run() {
       assert(r.incomplete === true && r.incompleteReason === "no_source_sha", "no boundary at all is incomplete without fetching");
     }
 
+    // ── `fromSha` (issue #692 item 2): resume a walk at a HISTORICAL commit
+    // instead of master's live tip — what the gap backfill needs to fill a
+    // hole without re-walking everything above it.
+    {
+      let seenUrl = null;
+      globalThis.fetch = async (url) => {
+        seenUrl = url;
+        return commitsRes([commit("h2", "hand fix", "h@x"), commit("ancestor", "old", "h@x")], { pageCount: 1 });
+      };
+      const r = await listMasterCommitsSince({}, "en_ult", null, "ancestor", { fromSha: "gapfrom123" });
+      assert(new URL(seenUrl).searchParams.get("sha") === "gapfrom123", "`fromSha` replaces `sha=master` in the request");
+      assert(r.incomplete === false && r.commits.length === 1, "  ...and the walk otherwise behaves like any other: stops at the boundary");
+    }
+    {
+      // No `fromSha` at all — the default must still be "master", unchanged
+      // for every existing caller.
+      let seenUrl = null;
+      globalThis.fetch = async (url) => {
+        seenUrl = url;
+        return commitsRes([commit("ancestor", "old", "h@x")], { pageCount: 1 });
+      };
+      await listMasterCommitsSince({}, "en_ult", null, "ancestor");
+      assert(new URL(seenUrl).searchParams.get("sha") === "master", "omitting `fromSha` still walks from master's live tip");
+    }
+
     // ── The WATERMARK bound (#540 item 1). The sync passes master_confirmed_at,
     // not source_sha, because the two are different points in master's history
     // and source_sha is routinely newer — see the "WHICH BOUNDARY" note in
