@@ -24,6 +24,8 @@ import { markHighlightSx, bookTsDividerSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, extractTrailingDividers, stripTrailingDividers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { VerseBridgeButtons } from "./VerseBridgeButtons";
+import { CommentBadge } from "./CommentBadge";
+import type { CommentCounts } from "../lib/commentsIndex";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
 import { AlignLinkButton } from "./AlignLinkButton";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
@@ -50,6 +52,8 @@ interface SearchState {
 }
 
 const READ_ONLY = new Set(["UHB", "UGNT"]);
+
+const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
 
 // Stable placeholder so `chapters.get(ch) ?? UNLOADED_STATE` doesn't hand
 // ChapterBlock a fresh object every render and defeat its memo.
@@ -97,6 +101,11 @@ interface Props {
   ) => void;
   onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
   onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  // Verse-level internal comments (team notes) for the active chapter. Bound in
+  // Shell to the loaded chapter's index, so the badge is rendered only on the
+  // active verse (always in the active chapter) — where the counts are valid.
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
   // The active chapter is mid-pipeline. Locks editing on every chapter
   // displayed in book mode — simplest defensive choice; AI typically scopes
   // to one chapter so other chapters in view are still safe, but explaining
@@ -132,6 +141,8 @@ export function BookView({
   onEditSection,
   onMergeBridge,
   onSplitBridge,
+  verseCommentCounts,
+  onOpenVerseComments,
   locked = false,
   textCheck,
 }: Props) {
@@ -310,6 +321,8 @@ export function BookView({
               onEditSection={onEditSection}
               onMergeBridge={onMergeBridge}
               onSplitBridge={onSplitBridge}
+              verseCommentCounts={verseCommentCounts}
+              onOpenVerseComments={onOpenVerseComments}
               locked={locked}
               textCheck={textCheck}
             />
@@ -355,6 +368,8 @@ const ChapterBlock = memo(function ChapterBlock({
   onEditSection,
   onMergeBridge,
   onSplitBridge,
+  verseCommentCounts,
+  onOpenVerseComments,
   locked,
   textCheck,
 }: {
@@ -387,6 +402,8 @@ const ChapterBlock = memo(function ChapterBlock({
   ) => void;
   onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
   onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
@@ -550,6 +567,8 @@ const ChapterBlock = memo(function ChapterBlock({
             onEditSection={onEditSection}
             onMergeBridge={onMergeBridge}
             onSplitBridge={onSplitBridge}
+            verseCommentCounts={verseCommentCounts}
+            onOpenVerseComments={onOpenVerseComments}
             locked={locked}
             textCheck={textCheck}
           />
@@ -585,6 +604,8 @@ const VerseRow = memo(function VerseRow({
   onEditSection,
   onMergeBridge,
   onSplitBridge,
+  verseCommentCounts,
+  onOpenVerseComments,
   locked,
   textCheck,
 }: {
@@ -619,11 +640,16 @@ const VerseRow = memo(function VerseRow({
   ) => void;
   onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
   onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
   // Render is intentionally a row of N independent cells driven by the same
   // grid container above — placement is via CSS grid auto-flow.
+  // Verse-level comment badge lives on a single column: ULT, or the leftmost
+  // enabled version when ULT is hidden — so it doesn't repeat across columns.
+  const commentColumn = enabledVersions.includes("ULT") ? "ULT" : enabledVersions[0];
   return (
     <Fragment>
       {enabledVersions.map((bv, colIdx) => {
@@ -689,6 +715,8 @@ const VerseRow = memo(function VerseRow({
               onMergeBridge={onMergeBridge}
               onSplitBridge={onSplitBridge}
               hasNextVerse={hasNextVerse}
+              verseCommentCounts={bv === commentColumn ? verseCommentCounts : undefined}
+              onOpenComments={bv === commentColumn ? onOpenVerseComments : undefined}
               locked={locked}
               textCheck={textCheck}
             />
@@ -724,6 +752,8 @@ const VerseCell = memo(function VerseCell({
   onMergeBridge,
   onSplitBridge,
   hasNextVerse,
+  verseCommentCounts,
+  onOpenComments,
   locked,
   textCheck,
 }: {
@@ -764,6 +794,10 @@ const VerseCell = memo(function VerseCell({
   onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
   onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
   hasNextVerse?: boolean;
+  // Verse-level internal comments. Passed only to the leftmost column's cell,
+  // so the badge shows once per verse; rendered only when this cell is active.
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenComments?: (anchorEl: HTMLElement, verse: number) => void;
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
@@ -1058,6 +1092,22 @@ const VerseCell = memo(function VerseCell({
       >
         {verseNum === 0 ? "intro" : `${chapter}:${formatVerseLabel(dto)}`}
       </Typography>
+      {/* Internal-comment badge — active verse only, mirroring the bridge
+          buttons. stopPropagation keeps the click from re-selecting the verse
+          (which would re-render and detach the popover's anchor mid-open). */}
+      {isActive && onOpenComments && (
+        <Box
+          component="span"
+          onClick={(e) => e.stopPropagation()}
+          sx={{ display: "inline-flex", verticalAlign: "-4px" }}
+        >
+          <CommentBadge
+            counts={verseCommentCounts?.(verseNum) ?? EMPTY_COMMENT_COUNTS}
+            onOpen={(el) => onOpenComments(el, verseNum)}
+            titleWhenEmpty="Add an internal comment on this verse"
+          />
+        </Box>
+      )}
       {!readOnly && (
         <AlignLinkButton
           targetContent={dto.content}

@@ -413,6 +413,11 @@ function ScriptureColumnInner({
     [indexByVersion, activeVerse],
   );
 
+  // Verse-level comments are one thread per verse, so the badge lives on a
+  // single scripture column: ULT, or the leftmost enabled version when ULT is
+  // hidden. Keeps it from repeating across the parallel version columns.
+  const commentColumn = enabledVersions.includes("ULT") ? "ULT" : enabledVersions[0];
+
   return (
     <Box
       sx={{
@@ -614,6 +619,8 @@ function ScriptureColumnInner({
               onEditSection={onEditBookSection}
               onMergeBridge={onMergeVerseBridge}
               onSplitBridge={onSplitVerseBridge}
+              verseCommentCounts={verseCommentCounts}
+              onOpenVerseComments={onOpenVerseComments}
               locked={effectiveLocked}
               textCheck={textCheck}
             />
@@ -665,6 +672,9 @@ function ScriptureColumnInner({
                   ? (verseNum, change, base) => onEditSection(verseNum, v, change, base)
                   : undefined
               }
+              // Verse-level comment badge — see commentColumn above.
+              verseCommentCounts={v === commentColumn ? verseCommentCounts : undefined}
+              onOpenVerseComments={v === commentColumn ? onOpenVerseComments : undefined}
               />
             ))}
           </Box>
