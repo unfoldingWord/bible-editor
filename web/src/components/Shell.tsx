@@ -2128,10 +2128,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   // App keys Shell on book only, so a cross-chapter navigation (URL /
   // back-forward / TopBar / cross-chapter find) changes the chapter +
-  // initialVerse props WITHOUT remounting — useChapter keeps the prior
-  // chapter's data visible while the new payload loads, so there's no loading
-  // flash and find/book-view state survive. This effect does what the old
-  // remount used to: reset the per-chapter transient state. Keyed on
+  // initialVerse props WITHOUT remounting Shell itself. Note useChapter DOES
+  // null its payload on every (book, chapter) change (#531, to block editing
+  // stale content), so the `!data` gate below briefly unmounts ScriptureColumn
+  // and the Find overlay under it — Find survives that remount by reseeding
+  // from sessionStorage (see ../lib/findState), not by data being preserved.
+  // This effect does what the old remount used to: reset the per-chapter
+  // transient state. Keyed on
   // [chapter, initialVerse] — internal same-chapter verse selection sets
   // activeVerse directly without an URL push, so initialVerse doesn't change
   // and this won't clobber it. Skips the initial mount.

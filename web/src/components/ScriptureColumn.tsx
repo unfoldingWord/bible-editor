@@ -14,6 +14,7 @@ import { drafts, verseKey } from "../sync/drafts";
 import { DocColumn } from "./DocColumn";
 import type { TextLaneCheck } from "../lib/laneChecks";
 import type { FindMatch } from "./FindReplaceOverlay";
+import { clearFindState, loadFindOpen, saveFindOpen } from "../lib/findState";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
@@ -256,14 +257,18 @@ function ScriptureColumnInner({
   const effectiveLocked = locked || bookLocked;
   const activeRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  const [findOpen, setFindOpen] = useState(false);
+  // Seed from sessionStorage so a Find left open when a chapter change
+  // remounts this column (useChapter nulls its payload → Shell's `!data` gate
+  // unmounts us) comes back open instead of vanishing. See ../lib/findState.
+  const [findOpen, setFindOpen] = useState(() => loadFindOpen(book));
   // A book lock still lets translators search a locked book (to compare past
   // work) — only replace is a hard freeze, since the writes would appear to
   // work and then fail (423) for every match. FindReplaceOverlay itself
   // disables its replace controls when `bookLocked` is set; find stays open.
   const openFind = useCallback(() => {
     setFindOpen(true);
-  }, []);
+    saveFindOpen(book, true);
+  }, [book]);
   const [findQuery, setFindQuery] = useState<FindQuery | null>(null);
   // Set only when the overlay reports a user-initiated scroll target; the
   // BookView's scroll effect (book mode) and the bodyRef scroll effect
@@ -288,6 +293,10 @@ function ScriptureColumnInner({
   // marks (otherwise the previous query lingers as highlights).
   const closeFind = useCallback(() => {
     setFindOpen(false);
+    // A deliberate close forgets the persisted open flag + typed query so the
+    // next Ctrl/Cmd+F starts fresh; an involuntary remount (chapter change)
+    // never calls this, so it keeps them and the bar reopens with the query.
+    clearFindState();
     setFindQuery(null);
     setFindScrollTarget(null);
   }, []);
