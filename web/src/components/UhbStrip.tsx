@@ -20,7 +20,7 @@ export function UhbStrip({
   lexiconMap,
   twlForVerse,
   verseNum,
-  hidden,
+  hidden = false,
   onToggleHidden,
   hctx,
 }: {
@@ -29,8 +29,12 @@ export function UhbStrip({
   lexiconMap: Map<string, LexiconEntry | null>;
   twlForVerse: TwlRow[];
   verseNum: number;
-  hidden: boolean;
-  onToggleHidden: () => void;
+  // Self-collapse state + toggle. Used by the single-panel aligner. The
+  // side-by-side aligner omits both — it controls source visibility from a
+  // titlebar checkbox and simply doesn't render this strip when off — so the
+  // in-strip toggle button is hidden when onToggleHidden isn't provided.
+  hidden?: boolean;
+  onToggleHidden?: () => void;
   hctx: HighlightCtx;
 }) {
   const sourceIsHebrew = sourceLabel === "UHB";
@@ -61,15 +65,21 @@ export function UhbStrip({
           {sourceLabel} · source
         </Typography>
         <Box sx={{ flex: 1 }} />
-        <Tooltip title={hidden ? `show ${sourceLabel} source` : `hide ${sourceLabel} source`}>
-          <IconButton size="small" onClick={onToggleHidden} sx={{ p: 0.25, color: "text.disabled" }}>
-            {hidden ? (
-              <ExpandMoreIcon sx={{ fontSize: 18 }} />
-            ) : (
-              <ExpandLessIcon sx={{ fontSize: 18 }} />
-            )}
-          </IconButton>
-        </Tooltip>
+        {onToggleHidden && (
+          <Tooltip title={hidden ? `show ${sourceLabel} source` : `hide ${sourceLabel} source`}>
+            <IconButton
+              size="small"
+              onClick={onToggleHidden}
+              sx={{ p: 0.25, color: "text.disabled" }}
+            >
+              {hidden ? (
+                <ExpandMoreIcon sx={{ fontSize: 18 }} />
+              ) : (
+                <ExpandLessIcon sx={{ fontSize: 18 }} />
+              )}
+            </IconButton>
+          </Tooltip>
+        )}
       </Stack>
       {!hidden && (
         <Box
