@@ -720,6 +720,7 @@ function VerseSpan({
         <VerseBridgeButtons
           verse={verseNum}
           verseEnd={verseEnd ?? null}
+          active={isActive}
           hasNextVerse={!!hasNextVerse}
           onMergeBridge={onMergeBridge}
           onSplitBridge={onSplitBridge}

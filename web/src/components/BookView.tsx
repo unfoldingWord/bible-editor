@@ -1087,6 +1087,7 @@ const VerseCell = memo(function VerseCell({
           <VerseBridgeButtons
             verse={verseNum}
             verseEnd={dto.verse_end ?? null}
+            active={isActive}
             hasNextVerse={!!hasNextVerse}
             onMergeBridge={onMergeBridge ? (v) => onMergeBridge(chapter, v, "UST") : undefined}
             onSplitBridge={onSplitBridge ? (v) => onSplitBridge(chapter, v, "UST") : undefined}
