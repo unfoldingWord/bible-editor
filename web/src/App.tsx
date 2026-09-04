@@ -3,6 +3,7 @@ import { Alert, Box, Button, CircularProgress, Link, Snackbar, Stack, Typography
 import { Shell } from "./components/Shell";
 import { NotificationsMenu } from "./components/NotificationsMenu";
 import { SyncWarningsIndicator } from "./components/SyncWarningsIndicator";
+import { CommentAlertToasts } from "./components/CommentAlertToasts";
 import { useBook } from "./hooks/useBook";
 import { useAlerts } from "./hooks/useAlerts";
 import {
@@ -16,6 +17,7 @@ import {
   updateLastLocation,
   type MeResponse,
   type Role,
+  type SystemAlert,
 } from "./sync/api";
 import { setPipelineUser } from "./sync/pipelineStore";
 import { parseHashString, stripCommentParam, type Location } from "./lib/parseHash";
@@ -39,6 +41,12 @@ function parseHash(): Location {
 
 function isDefaultLoc(l: Location): boolean {
   return l.book === DEFAULT_BOOK && l.chapter === 1 && l.verse === 1 && l.commentId == null;
+}
+
+// Root comment id carried by a comment alert's deep link (`/#/GEN/1/3?c=42`).
+function commentIdFromLink(linkUrl: string | null): number | null {
+  const m = linkUrl?.match(/[?&]c=(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
 }
 
 // Auth gate. The API requires a valid Access cookie for every write, so we
@@ -233,7 +241,7 @@ export function App() {
   // conditionally invoked across renders (loading → ready calls one extra
   // hook), which violates Rules of Hooks. The hook itself no-ops while
   // auth is not "ready".
-  const { alerts, dismiss } = useAlerts(auth.kind === "ready");
+  const { alerts, fresh, ackFresh, dismiss, refresh: refreshAlerts } = useAlerts(auth.kind === "ready");
   // Two collapsed homes in the TopBar, no full-width banner (issues #385/#441
   // for comments, #458 for the rest):
   //   • comment mentions/replies  → the top-right notifications bell.
@@ -245,6 +253,51 @@ export function App() {
   // "comment".
   const warningAlerts = alerts.filter((a) => !a.source.startsWith("comment"));
   const notificationAlerts = alerts.filter((a) => a.source.startsWith("comment"));
+  const freshCommentAlerts = fresh.filter((a) => a.source.startsWith("comment"));
+
+  // Root comment ids whose thread is open in the popover right now. Reported by
+  // Shell; used to clear the alert for a reply the user is already reading
+  // (and to skip its toast), so the bell never nags about a thread in view.
+  const viewedThreadIdsRef = useRef<Set<number>>(new Set());
+  const alertsRef = useRef<SystemAlert[]>(alerts);
+  alertsRef.current = alerts;
+  const dismissViewedAlerts = useCallback(
+    (list: SystemAlert[]) => {
+      const viewed = viewedThreadIdsRef.current;
+      if (viewed.size === 0) return;
+      for (const a of list) {
+        if (!a.source.startsWith("comment")) continue;
+        const rootId = commentIdFromLink(a.linkUrl);
+        if (rootId != null && viewed.has(rootId)) void dismiss(a.id);
+      }
+    },
+    [dismiss],
+  );
+  const handleThreadsViewed = useCallback(
+    (rootIds: number[]) => {
+      viewedThreadIdsRef.current = new Set(rootIds);
+      dismissViewedAlerts(alertsRef.current);
+    },
+    [dismissViewedAlerts],
+  );
+  useEffect(() => {
+    dismissViewedAlerts(alerts);
+  }, [alerts, dismissViewedAlerts]);
+
+  // Tab-title count: the cheapest "something is waiting for you" signal that
+  // reaches a user who has the editor open in a background tab.
+  useEffect(() => {
+    const n = notificationAlerts.length;
+    document.title = n > 0 ? `(${n}) Bible Editor` : "Bible Editor";
+  }, [notificationAlerts.length]);
+
+  const viewCommentAlert = useCallback(
+    (a: SystemAlert) => {
+      if (a.linkUrl && a.linkUrl.startsWith("/#/")) location.hash = a.linkUrl.slice(2);
+      void dismiss(a.id);
+    },
+    [dismiss],
+  );
 
   useEffect(() => {
     setPipelineUser(auth.kind === "ready" ? auth.me?.userId ?? null : null);
@@ -406,6 +459,8 @@ export function App() {
           isViewer={isViewer}
           initialCommentId={loc.commentId}
           onCommentConsumed={handleCommentConsumed}
+          onCommentActivity={refreshAlerts}
+          onCommentThreadsViewed={handleThreadsViewed}
           authReady={auth.kind === "ready"}
           notificationsMenu={
             <NotificationsMenu alerts={notificationAlerts} onDismiss={dismiss} />
@@ -415,6 +470,7 @@ export function App() {
           }
         />
       </Box>
+      <CommentAlertToasts alerts={freshCommentAlerts} onAck={ackFresh} onView={viewCommentAlert} />
       <Snackbar
         open={sessionExpired}
         anchorOrigin={{ vertical: "top", horizontal: "center" }}
