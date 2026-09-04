@@ -647,6 +647,9 @@ const VerseRow = memo(function VerseRow({
 }) {
   // Render is intentionally a row of N independent cells driven by the same
   // grid container above — placement is via CSS grid auto-flow.
+  // Verse-level comment badge lives on a single column: ULT, or the leftmost
+  // enabled version when ULT is hidden — so it doesn't repeat across columns.
+  const commentColumn = enabledVersions.includes("ULT") ? "ULT" : enabledVersions[0];
   return (
     <Fragment>
       {enabledVersions.map((bv, colIdx) => {
@@ -712,8 +715,8 @@ const VerseRow = memo(function VerseRow({
               onMergeBridge={onMergeBridge}
               onSplitBridge={onSplitBridge}
               hasNextVerse={hasNextVerse}
-              verseCommentCounts={colIdx === 0 ? verseCommentCounts : undefined}
-              onOpenComments={colIdx === 0 ? onOpenVerseComments : undefined}
+              verseCommentCounts={bv === commentColumn ? verseCommentCounts : undefined}
+              onOpenComments={bv === commentColumn ? onOpenVerseComments : undefined}
               locked={locked}
               textCheck={textCheck}
             />
