@@ -33,6 +33,7 @@ import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import type { ChapterState } from "../hooks/useBook";
 import type { TnRow, VerseDto } from "../sync/api";
 import { smartReplaceVerse } from "../lib/replace";
+import { loadFindDraft, saveFindDraft } from "../lib/findState";
 import {
   classifySourceQuery,
   describeSourceMode,
@@ -197,15 +198,20 @@ export function FindReplaceOverlay({
   onActiveNoteMatchChange,
   bookLocked = false,
 }: Props) {
-  const [find, setFind] = useState("");
-  const [replace, setReplace] = useState("");
-  const [regex, setRegex] = useState(false);
-  const [caseSensitive, setCaseSensitive] = useState(false);
+  // Seed from the persisted draft (sessionStorage, per-book) so a chapter
+  // change that remounts this overlay restores the query instead of blanking
+  // it — otherwise the user retypes after every couple of matches. See
+  // ../lib/findState. Read once at mount.
+  const [draft0] = useState(() => loadFindDraft(book));
+  const [find, setFind] = useState(draft0.find);
+  const [replace, setReplace] = useState(draft0.replace);
+  const [regex, setRegex] = useState(draft0.regex);
+  const [caseSensitive, setCaseSensitive] = useState(draft0.caseSensitive);
   const [scope, setScope] = useState<FindScope>(() => loadScope());
   // Opt-in: interpret bare-digit queries as Strong's numbers. Off by default
   // because bible text has lots of numbers ("eighth month", "1:1") and the
   // user would expect those to hit. Toggle only appears when relevant.
-  const [strongs, setStrongs] = useState(false);
+  const [strongs, setStrongs] = useState(draft0.strongs);
   const [activeIdx, setActiveIdx] = useState(0);
   const showStrongsToggle = isBareNumberQuery(find) && !regex;
   const findInputRef = useRef<HTMLInputElement | null>(null);
@@ -226,6 +232,14 @@ export function FindReplaceOverlay({
     saveScope(next);
     wantsScrollRef.current = true;
   };
+
+  // Persist the query so it survives the remount a chapter change forces.
+  // ScriptureColumn's closeFind() wipes this store on a deliberate close, so a
+  // fresh open still starts blank. Scope is persisted separately (localStorage,
+  // cross-session) and is left to loadScope/saveScope.
+  useEffect(() => {
+    saveFindDraft(book, { find, replace, regex, caseSensitive, strongs });
+  }, [book, find, replace, regex, caseSensitive, strongs]);
 
   // Focus the find input when the overlay opens (Ctrl/Cmd+F flow).
   useEffect(() => {

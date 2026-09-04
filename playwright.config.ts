@@ -29,7 +29,16 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: {
+        ...devices["Desktop Chrome"],
+        // Escape hatch for hosts where the pinned Playwright build isn't the
+        // one on disk (e.g. a preinstalled Chromium in a cloud runner): point
+        // at it with BE_CHROMIUM_PATH. Unset → Playwright's own browser, as
+        // normal locally/CI.
+        ...(process.env.BE_CHROMIUM_PATH
+          ? { launchOptions: { executablePath: process.env.BE_CHROMIUM_PATH } }
+          : {}),
+      },
     },
   ],
   // Poll the API through Vite's proxy — proves BOTH servers (Vite + Wrangler)
