@@ -403,7 +403,7 @@ export async function listMasterCommitsSince(
   repo: string,
   path: string | null,
   sinceSha: string | null,
-  opts: { pageLimit?: number; sinceTime?: number | null; files?: boolean; timeoutMs?: number } = {},
+  opts: { pageLimit?: number; sinceTime?: number | null; files?: boolean; timeoutMs?: number; fromSha?: string } = {},
 ): Promise<MasterCommitPage> {
   const pageLimit = opts.pageLimit ?? 5;
   // The watermark bound, in unix seconds. When present it REPLACES the sha as
@@ -420,11 +420,19 @@ export async function listMasterCommitsSince(
   const headers: Record<string, string> = { Accept: "application/json" };
   if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
 
+  // `sha=` ordinarily names the branch to walk from master's live tip. Gitea's
+  // commits-list endpoint accepts any commit sha there too, listing that
+  // commit and its ancestors — which is what lets a caller resume a backward
+  // walk from a HISTORICAL point instead of always starting over at the tip
+  // (issue #692 item 2's gap backfill: `fromSha` is the near edge of a
+  // recorded hole, `sinceSha` its far edge).
+  const walkFrom = opts.fromSha ?? "master";
+
   const out: MasterCommit[] = [];
   for (let page = 1; page <= pageLimit; page++) {
     const url =
       `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
-      `/commits?sha=master` +
+      `/commits?sha=${encodeURIComponent(walkFrom)}` +
       (path ? `&path=${encodeURIComponent(path)}` : "") +
       `&page=${page}&stat=false&verification=false&files=${opts.files === true ? "true" : "false"}`;
     let batch: Array<Record<string, unknown>>;

@@ -91,7 +91,7 @@ dcsCommits.get("/", async (c) => {
 
   const polls = await c.env.DB.prepare(
     `SELECT repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
-            last_status, gap_since_sha, gap_at
+            last_status, gap_since_sha, gap_at, gap_from_sha
        FROM dcs_repo_polls ORDER BY repo`,
   ).all<DcsPollStateRow>();
 
@@ -126,6 +126,7 @@ dcsCommits.get("/", async (c) => {
       lastStatus: p.last_status,
       gapSinceSha: p.gap_since_sha,
       gapAt: p.gap_at,
+      gapFromSha: p.gap_from_sha,
     })),
   });
 });

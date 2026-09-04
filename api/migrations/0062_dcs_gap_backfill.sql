@@ -1,0 +1,17 @@
+-- Issue #692 item 2: a resume cursor for backfilling dcs_repo_polls'
+-- gap_since_sha holes.
+--
+-- gap_since_sha alone names the FAR (older) edge of a hole — the previous
+-- high-water mark a capped walk failed to reach — but not the NEAR (newer)
+-- edge, i.e. where a backward walk should start. Without that, a backfill
+-- pass would have to rediscover the start point every tick (by re-walking
+-- from master's tip, which is exactly the expensive walk the gap exists
+-- to avoid). gap_from_sha is that near edge: the parent of the oldest
+-- commit the capped walk actually inserted. A backward walk from
+-- gap_from_sha toward gap_since_sha fills exactly the hole and nothing else.
+--
+-- Same "oldest gap wins" discipline as gap_since_sha/gap_at (0059): set once
+-- when a gap opens, only ever moved OLDER (toward gap_since_sha) as a
+-- backfill pass makes progress, and cleared together with the other two the
+-- moment continuity is proven. See dcsCommitBackfill.ts.
+ALTER TABLE dcs_repo_polls ADD COLUMN gap_from_sha TEXT;
