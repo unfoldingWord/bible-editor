@@ -46,18 +46,17 @@ function writeHoverLink(v: boolean) {
   }
 }
 
-// ─── Resizable strip heights ────────────────────────────────────────────
-// The reading (English) and source (Hebrew) strips sit above the aligners as
-// fixed-height bands. Long verses used to be clipped by a hard 64px reading cap
-// with no way to grow it. Each band now carries an explicit, drag-resizable
-// pixel height that scrolls internally and persists per browser. The alignment
-// cards below are the flex remainder, so shrinking a band hands that space to
-// the cards; the unaligned-words tray keeps its own resize handle inside
-// AlignmentPanel.
+// ─── Resizable reading strip ────────────────────────────────────────────
+// The reading (English) strip sits above the aligners as a fixed-height band.
+// Long verses used to be clipped by a hard 64px cap with no way to grow it. It
+// now carries an explicit, drag-resizable pixel height that scrolls internally
+// and persists per browser. The alignment cards below are the flex remainder,
+// so shrinking the band hands that space to the cards; the unaligned-words tray
+// keeps its own resize handle inside AlignmentPanel. The source (Hebrew/Greek)
+// strip is show/hide-only (a titlebar checkbox) and sizes to its content.
 const LS_READING_HEIGHT = "be:dualReadingHeight";
-const LS_SOURCE_HEIGHT = "be:dualSourceHeight";
+const LS_SHOW_SOURCE = "be:dualShowSource";
 const DEFAULT_READING_HEIGHT = 64; // matches the old hard cap
-const DEFAULT_SOURCE_HEIGHT = 132; // ~3–4 lines of Hebrew at fontSize 22
 const MIN_STRIP_HEIGHT = 40;
 const MAX_STRIP_HEIGHT = 640;
 
@@ -349,20 +348,32 @@ export function SideBySideAligner({
   // by a same-side text edit. (Still forwards the upstream onDirtyChange.)
   const [leftDirty, setLeftDirty] = useState(false);
   const [rightDirty, setRightDirty] = useState(false);
-  // Drag-resizable heights for the reading (English) and source (Hebrew) bands,
-  // persisted per browser. See StripResizeHandle / clampStripHeight above.
+  // Drag-resizable height for the reading (English) band, persisted per browser.
+  // See StripResizeHandle / clampStripHeight above.
   const [readingHeight, setReadingHeight] = useState(() =>
     readStripHeight(LS_READING_HEIGHT, DEFAULT_READING_HEIGHT),
-  );
-  const [sourceHeight, setSourceHeight] = useState(() =>
-    readStripHeight(LS_SOURCE_HEIGHT, DEFAULT_SOURCE_HEIGHT),
   );
   useEffect(() => {
     writeStripHeight(LS_READING_HEIGHT, readingHeight);
   }, [readingHeight]);
+  // Whether the source (Hebrew/Greek) strip is shown at all. Off removes the
+  // whole band — header included — to reclaim vertical space. Persisted; the
+  // titlebar checkbox is the only control (the strip no longer self-collapses).
+  const sourceLang = sourceLabel === "UHB" ? "Hebrew" : "Greek";
+  const [showSource, setShowSource] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(LS_SHOW_SOURCE) !== "0";
+    } catch {
+      return true;
+    }
+  });
   useEffect(() => {
-    writeStripHeight(LS_SOURCE_HEIGHT, sourceHeight);
-  }, [sourceHeight]);
+    try {
+      localStorage.setItem(LS_SHOW_SOURCE, showSource ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, [showSource]);
   // Hover positions are verse-specific — a stale ring would attach to whatever
   // token happens to hold the same position after a verse nav.
   useEffect(() => {
@@ -491,10 +502,38 @@ export function SideBySideAligner({
           </Box>
           <Typography sx={{ fontWeight: 600, fontSize: 15 }}>Align side by side</Typography>
           <Typography sx={{ fontSize: 12, opacity: 0.82 }}>
-            {left.bibleVersion} ↔ {right.bibleVersion} · both aligned to {sourceLabel} · hover Hebrew to bridge
+            {left.bibleVersion} ↔ {right.bibleVersion} · both aligned to {sourceLabel} · hover{" "}
+            {sourceLang} to bridge
           </Typography>
           <Box sx={{ flex: 1 }} />
-          <Tooltip title="show the Hebrew lexicon tooltip on hover — turn off to see only what's aligned, without the popup covering the panels">
+          <Tooltip
+            title={`show the ${sourceLang} verse strip above the panels — turn off to reclaim that space`}
+          >
+            <Box
+              component="label"
+              sx={{
+                display: "flex",
+                alignItems: "center",
+                gap: 0.5,
+                fontSize: 12,
+                cursor: "pointer",
+                userSelect: "none",
+                color: "inherit",
+                mr: 0.5,
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={showSource}
+                onChange={(e) => setShowSource(e.target.checked)}
+                style={{ accentColor: "#fff", cursor: "pointer", margin: 0 }}
+              />
+              {sourceLang} verse
+            </Box>
+          </Tooltip>
+          <Tooltip
+            title={`show the ${sourceLang} lexicon tooltip on hover — turn off to see only what's aligned, without the popup covering the panels`}
+          >
             <Box
               component="label"
               sx={{
@@ -514,7 +553,7 @@ export function SideBySideAligner({
                 onChange={(e) => setLexInfo(e.target.checked)}
                 style={{ accentColor: "#fff", cursor: "pointer", margin: 0 }}
               />
-              Hebrew info
+              {sourceLang} info
             </Box>
           </Tooltip>
           <Tooltip title="close">
@@ -560,26 +599,22 @@ export function SideBySideAligner({
           label="resize reading text"
         />
 
-        {/* one shared source strip — both sides align to the same Hebrew/Greek */}
-        <SharedUhbStrip
-          sourceVerse={sourceVerse}
-          sourceLabel={sourceLabel}
-          lexiconMap={lexiconMap}
-          twlForVerse={twlForVerse}
-          verseNum={verseNum}
-          hover={hover}
-          onHover={setHover}
-          hoverLink={hoverLink}
-          showSourceInfo={lexInfo}
-          groupPositionsFor={groupPositionsFor}
-          bodyHeight={sourceHeight}
-        />
-        <StripResizeHandle
-          height={sourceHeight}
-          setHeight={setSourceHeight}
-          defaultHeight={DEFAULT_SOURCE_HEIGHT}
-          label="resize Hebrew source"
-        />
+        {/* one shared source strip — both sides align to the same Hebrew/Greek.
+            Hidden entirely (header and all) when the titlebar checkbox is off. */}
+        {showSource && (
+          <SharedUhbStrip
+            sourceVerse={sourceVerse}
+            sourceLabel={sourceLabel}
+            lexiconMap={lexiconMap}
+            twlForVerse={twlForVerse}
+            verseNum={verseNum}
+            hover={hover}
+            onHover={setHover}
+            hoverLink={hoverLink}
+            showSourceInfo={lexInfo}
+            groupPositionsFor={groupPositionsFor}
+          />
+        )}
 
         {/* the two aligners */}
         <Box sx={{ flex: 1, minHeight: 0, display: "flex" }}>
@@ -625,14 +660,12 @@ function SharedUhbStrip({
   hoverLink,
   showSourceInfo,
   groupPositionsFor,
-  bodyHeight,
 }: {
   sourceVerse: VerseDto | null;
   sourceLabel: string;
   lexiconMap: Map<string, LexiconEntry | null>;
   twlForVerse: TwlRow[];
   verseNum: number;
-  bodyHeight: number;
   hover: HoverHighlight;
   onHover: (h: HoverHighlight) => void;
   hoverLink: boolean;
@@ -642,7 +675,6 @@ function SharedUhbStrip({
   groupPositionsFor: (unionPos: number) => number[];
 }) {
   const themeMode = useTheme().palette.mode;
-  const [hidden, setHidden] = useState(false);
   // The strip renders the UNION span, so its walk positions ARE the
   // union-relative hover identity. It has no grouping of its own — hovering a
   // token seeds the lifted hover, which each panel resolves to its own groups.
@@ -729,10 +761,7 @@ function SharedUhbStrip({
       lexiconMap={lexiconMap}
       twlForVerse={twlForVerse}
       verseNum={verseNum}
-      hidden={hidden}
-      onToggleHidden={() => setHidden((h) => !h)}
       hctx={hctx}
-      bodyHeight={bodyHeight}
     />
   );
 }
