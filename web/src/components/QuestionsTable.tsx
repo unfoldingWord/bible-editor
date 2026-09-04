@@ -340,8 +340,10 @@ const Row = memo(function Row({
           />
         </Tooltip>
         {/* 4-char sticky ID (DCS convention). Tucked under the version chip so
-            it's visible without adding a column or a row — the chip cell already
-            has vertical slack from the taller multiline question/response. */}
+            it's visible without adding a column. At normal width the chip cell
+            runs shorter than the multiline question/response, so this fills
+            existing slack; on the narrow layout (question/response reflow to
+            their own rows) it adds a few px to the top row, which is acceptable. */}
         <Tooltip title="Question ID">
           <Typography
             component="span"
