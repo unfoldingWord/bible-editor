@@ -373,7 +373,31 @@ function NoteBodyReadView({
 
   return (
     <Box
-      onClick={onActivate}
+      onMouseDown={(e: React.MouseEvent) => {
+        // Fire on mousedown, not click. The Paper ancestor's own onMouseDown
+        // (-> onFocus -> active=true) runs in the SAME synthetic event via
+        // bubbling, so activation and entering edit mode land in one React
+        // batch/commit. Waiting for onClick let the first commit (active
+        // true, editingBody still false) unmount this read view — and with
+        // it the very element the click was headed for — before the click
+        // ever fired, wasting the first click (#725). Link segments above
+        // stopPropagation their own onMouseDown, so clicking a link never
+        // reaches here and still just navigates.
+        if (e.button !== 0) return;
+        // preventDefault matters here, not just cosmetically: this mousedown
+        // swaps this read-view DOM node out for the textarea (via the
+        // active+editingBody commit above), and the effect that focuses the
+        // fresh textarea runs synchronously right after. Without
+        // preventDefault, the browser's own default mousedown-focus handling
+        // — resolved against the ORIGINAL target, which by then no longer
+        // exists — blurs the textarea we just focused a couple of
+        // milliseconds later (observed via a MutationObserver: focus lands,
+        // then a focusout follows within ~2ms, with no JS-visible .blur()
+        // call). Suppressing the default action leaves our explicit focus()
+        // as the only thing deciding where focus ends up.
+        e.preventDefault();
+        onActivate();
+      }}
       title="click to edit"
       sx={{
         cursor: "text",
