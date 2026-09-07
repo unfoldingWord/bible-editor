@@ -147,6 +147,10 @@ const SCRIPTURE_MODE_KEY = "be:scriptureMode";
 const ENABLED_VERSIONS_KEY = "be:enabledVersions";
 const RAIL_COLLAPSED_KEY = "be:railCollapsed";
 const ENABLED_LANES_KEY = "be:enabledLanes";
+// Scripture/resources column divider position, persisted per scripture MODE
+// (rows/columns/book each want a different default split) — see the
+// colsVisible/mode reset effect near splitRatio below.
+const splitRatioKey = (mode: string) => `be:splitRatio:${mode}`;
 
 function loadFromStorage<T>(key: string, fallback: T): T {
   try {
@@ -1385,19 +1389,25 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         : undefined,
     [bookHook, mode, bookHook?.summary],
   );
-  useEffect(() => { setSplitRatio(null); }, [colsVisible, mode]);
+  // Restore a previously dragged ratio for the NEW mode/column-count (falling
+  // back to null → autoSplit if the user never dragged one for this shape) —
+  // still resets on every mode/colsVisible change, same as before persistence
+  // existed, just seeded from storage instead of unconditionally to null.
+  useEffect(() => { setSplitRatio(loadFromStorage<number | null>(splitRatioKey(mode), null)); }, [colsVisible, mode]);
   useEffect(() => () => { document.body.style.cursor = ""; document.body.style.userSelect = ""; }, []);
   const handleDividerMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     isDraggingRef.current = true;
     document.body.style.cursor = "ew-resize";
     document.body.style.userSelect = "none";
+    let lastRatio: number | null = null;
     const onMouseMove = (ev: MouseEvent) => {
       if (!isDraggingRef.current || !splitContainerRef.current) return;
       const rect = splitContainerRef.current.getBoundingClientRect();
       const available = rect.width - railWidth;
       const offset = ev.clientX - rect.left - railWidth;
-      setSplitRatio(Math.min(0.8, Math.max(0.2, offset / available)));
+      lastRatio = Math.min(0.8, Math.max(0.2, offset / available));
+      setSplitRatio(lastRatio);
     };
     const onMouseUp = () => {
       isDraggingRef.current = false;
@@ -1405,10 +1415,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       document.body.style.userSelect = "";
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
+      // Persist on drag-commit (not every mousemove) so the position survives
+      // reload/navigation for this mode — mirrors the aligner strips' own
+      // localStorage persistence (#738).
+      if (lastRatio != null) saveToStorage(splitRatioKey(mode), lastRatio);
     };
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
-  }, [railWidth]);
+  }, [railWidth, mode]);
 
   // Pre-load lexicon entries for every UHB Strong's in the loaded chapter
   // AND every loaded chapter in book mode, so the per-word tooltips in the

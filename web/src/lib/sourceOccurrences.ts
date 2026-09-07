@@ -30,6 +30,7 @@
 //     already-correct ones, are never touched, so clean data doesn't churn.
 
 import { nfc } from "./hebrew.ts";
+import { isCharacterWrapper } from "./usfm.ts";
 
 type Node = Record<string, unknown>;
 
@@ -51,9 +52,14 @@ function sourceTextTotals(sourceVerseObjects: unknown[]): Map<string, number> {
         totals.set(key, (totals.get(key) ?? 0) + 1);
       } else if (
         o["type"] === "milestone" ||
-        // \d (Psalm superscription) carries alignable verse body — descend like
-        // collectSourceWords / buildSourceIndexMap do.
-        (o["type"] === "section" && o["tag"] === "d")
+        // \d (Psalm superscription) carries alignable verse body — descend
+        // like collectSourceWords / buildSourceIndexMap do. Tag alone, not
+        // `type:"section"`: usfm-js emits a real `\d` with no `type` field
+        // at all, so the old predicate matched nothing real data has.
+        o["tag"] === "d" ||
+        // \qs (Selah) wraps its aligned content from OUTSIDE — not
+        // descending it undercounts the wrapped source word's total.
+        isCharacterWrapper(o)
       ) {
         walk((o["children"] as unknown[] | undefined) ?? []);
       }

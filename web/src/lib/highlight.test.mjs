@@ -7,6 +7,7 @@
 // in the UST and the 2nd/4th "not" dark in the ULT.
 
 import {
+  collectSourceWords,
   findTargetHighlights,
   isPaintableHtml,
   leadingBreakClass,
@@ -602,6 +603,95 @@ const JOIN = "⁠";
   assert(
     isPaintableHtml('<div class="be-q-1">​word</div>') === true,
     "a filler next to real text is still paintable",
+  );
+}
+
+// --- 25. \d (Psalm superscription): usfm-js 3.5.0 emits a real `\d` as
+// `{tag:"d", text}` with NO `type` field (only \s/\s1…\s5 get
+// `type:"section"`). The old `type:"section" && tag:"d"` gate in both the
+// renderer and the source-word matchers never matched real data, so a
+// superscription silently dropped out of render/highlighting entirely —
+// while extractEditableText (usfm.ts) still included its text — the classic
+// content-drop-on-save signature. Ported from downstream fixes #398/#410.
+{
+  const psalmTitle = { tag: "d", text: "For the director. A psalm of David." };
+  const verseObjects = [psalmTitle, { type: "text", text: " " }, tgt("word", 1)];
+
+  const rendered = renderHighlightedHTML(verseObjects, new Set());
+  assert(
+    rendered.includes('<span class="be-d">For the director. A psalm of David.</span>'),
+    `a real (typeless) \\d node renders inside .be-d instead of being dropped (got ${JSON.stringify(rendered)})`,
+  );
+  const editable = renderEditableHTML(verseObjects, new Set());
+  assert(
+    editable.includes("For the director. A psalm of David."),
+    `the editable render keeps the superscription text too (got ${JSON.stringify(editable)})`,
+  );
+
+  const sourceWithTitle = [{ tag: "d", children: [src("סֶלָה")] }];
+  const words = collectSourceWords(sourceWithTitle);
+  assert(
+    words.length === 1 && words[0].text === "סֶלָה",
+    `collectSourceWords descends a real \\d node's children (got ${JSON.stringify(words)})`,
+  );
+}
+
+// --- 26. \qs (Selah): usfm-js parses `\qs Selah\qs*` — or the production
+// ULT shape `\qs \zaln-s ... \w Selah\w* \zaln-e\* \qs*` — as `{type:"quote",
+// tag:"qs", ...}`, the SAME shape as a `\q1`/`\q2` poetry LINE marker.
+// isInFlowMarker matched \qs too, so before this fix it fell into the
+// generic marker branch, which `continue`s WITHOUT ever walking the node's
+// children — silently dropping "Selah" from both renders while
+// extractEditableText (which already special-cased isCharacterWrapper) kept
+// it. Ported from downstream fix #391 (docs/usfm-alignment-audit.md §1).
+{
+  const verseObjects = [
+    tgt("Praise", 1),
+    { type: "text", text: " " },
+    { type: "quote", tag: "qs", endTag: "qs*", children: [{ type: "text", text: "Selah" }] },
+  ];
+  const rendered = renderHighlightedHTML(verseObjects, new Set());
+  assert(
+    rendered.includes('<span class="be-qs">Selah</span>'),
+    `\\qs content renders inline inside .be-qs instead of opening an empty paragraph segment (got ${JSON.stringify(rendered)})`,
+  );
+  const editable = renderEditableHTML(verseObjects, new Set());
+  assert(editable.includes("Selah"), `the editable render keeps "Selah" too (got ${JSON.stringify(editable)})`);
+  assert(
+    extractEditableText({ verseObjects }).includes("Selah"),
+    "sanity: the edit baseline already included Selah before this fix (usfm.ts)",
+  );
+
+  const sourceSelah = [{ type: "quote", tag: "qs", endTag: "qs*", children: [src("סֶלָה")] }];
+  const words = collectSourceWords(sourceSelah);
+  assert(
+    words.length === 1 && words[0].text === "סֶלָה",
+    `collectSourceWords descends a \\qs wrapper's children (got ${JSON.stringify(words)})`,
+  );
+}
+
+// --- 27. \b / \ts\* trailing-space parity: extractEditableText emits a
+// trailing space after these markers ("\\b ", "\\ts\\* ") but the editable
+// chip renderer omitted it — one space short of the baseline, which can fire
+// a phantom PATCH with no real content change. Ported from downstream #400.
+{
+  const verseObjects = [tgt("before", 1), { type: "paragraph", tag: "b" }, tgt("after", 1)];
+  const editable = renderEditableHTML(verseObjects, new Set());
+  const baseline = extractEditableText({ verseObjects });
+  assert(baseline.includes("\\b "), `sanity: the baseline has a trailing space after \\b (got ${JSON.stringify(baseline)})`);
+  assert(
+    editable.includes('be-tok-b" data-tag="b">\\b</span> '),
+    `the \\b chip carries the same trailing space as the baseline (got ${JSON.stringify(editable)})`,
+  );
+}
+{
+  const verseObjects = [tgt("before", 1), { tag: "ts\\*" }, tgt("after", 1)];
+  const editable = renderEditableHTML(verseObjects, new Set());
+  const baseline = extractEditableText({ verseObjects });
+  assert(baseline.includes("\\ts\\* "), `sanity: the baseline has a trailing space after \\ts\\* (got ${JSON.stringify(baseline)})`);
+  assert(
+    editable.includes("\\ts\\*</span> "),
+    `the \\ts\\* chip carries the same trailing space as the baseline (got ${JSON.stringify(editable)})`,
   );
 }
 

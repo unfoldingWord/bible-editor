@@ -28,6 +28,7 @@ import {
   findSourceForTargetText,
 } from "./highlight";
 import { shortSupport } from "./supportReference";
+import { extractPlainText } from "./usfm";
 import { buildVerseIndex } from "./verseRange";
 
 const CONTEXT_WINDOW = 5;
@@ -40,27 +41,11 @@ function hasHebrew(s: string): boolean {
   return HEBREW_CHAR.test(s);
 }
 
-function extractPlainText(verseObjects: unknown[]): string {
-  let out = "";
-  function walk(nodes: unknown[]) {
-    for (const node of nodes ?? []) {
-      const o = node as Record<string, unknown> | null;
-      if (!o) continue;
-      const type = o["type"];
-      if (type === "text") {
-        out += String(o["text"] ?? "");
-      } else if (type === "word") {
-        out += String(o["text"] ?? "");
-      } else if (type === "milestone") {
-        const children = (o["children"] as unknown[] | undefined) ?? [];
-        walk(children);
-      }
-    }
-  }
-  walk(verseObjects);
-  return out.replace(/\s+/g, " ").trim();
-}
-
+// Fallback for when `v.plain_text` is missing — walks the raw verseObjects
+// tree with the SAME shared extractPlainText usfm.ts uses for the import
+// path and the alignment save path, so this rare fallback can't drift into
+// its own bugs (the previous local copy didn't descend `\d`/`\qs`, so a
+// Psalm superscription or Selah silently dropped out of the AI prompt).
 function plainOf(v: VerseDto | undefined): string {
   if (!v) return "";
   if (v.plain_text) return v.plain_text;

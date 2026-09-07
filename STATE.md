@@ -475,6 +475,30 @@ Highlights that bite repeatedly:
   such a verse and re-mints version 1, letting a stale `If-Match: 1` pass CAS against the recreated row.
   `verseVersionFloorSql` in `api/src/verseBridge.ts` therefore uses `MAX(COALESCE(new_version, prev_version))`;
   any future version floor must do the same. Found by review of the #727 guards, fixed in the #728 commit.
+- **Downstream-sync pass, 2026-09-07** (see the 2026-08-24/2026-08-28 entry above for the routine itself).
+  `deferredreward/bible-editor-multilingual`'s own newest triage doc was still `docs/upstream-sync-2026-08-28.md`
+  (no newer one as of this run) — their 30 own commits since that doc's sync commit (`6251e9a`..`1cbc6f3`) were
+  almost all their multi-tenant-only "flows"/workspaces/admin-review-state feature work (no counterpart here,
+  ruled not-applicable), except a real, shared bug: **our tree-walkers never treated `\qs` (Selah) as a
+  descendable wrapper, and one `\d` (Psalm superscription) gate was still the pre-#398 `type:"section"` shape
+  that real usfm-js output never matches.** Both are silent content-loss-on-save bugs (render/matcher drops the
+  node; `extractEditableText`/`extractPlainText` in usfm.ts already kept it) — directly the same defect as the
+  escalated `en_ust master PSA 24:6` Selah malformation above. Fixed in `highlight.ts` (`nodeIsPsalmTitle`,
+  `segmentByParagraphs`'s render branch, `collectSourceWords`/`collectSubtreeWords`), `alignment.ts`
+  (`collectAlignerSourceWords`), `sourceOccurrences.ts` (`sourceTextTotals`), and replaced a third, under-featured
+  duplicate `extractPlainText` in `tnQuickRequest.ts` with the shared `usfm.ts` one. Also fixed: the editable
+  `\b`/`\ts\*` chip render was one trailing space short of `extractEditableText`'s baseline (phantom-PATCH
+  risk); the "Notes" count badge in `ResourceColumn.tsx` counted trashed tn rows while the book-wide total in
+  `TopBar.tsx` (server book-summary query) didn't, so they disagreed by exactly the trashed count on any chapter
+  holding one; the scripture/resources column divider (`Shell.tsx` `splitRatio`) was never persisted to
+  localStorage, unlike the aligner's own strips (#738). Regression tests added to `highlight.test.mjs` and
+  `sourceOccurrences.test.mjs`. **Deferred, not done this pass** (real bugs, lower urgency / bigger surface):
+  `HebrewLine.tsx`'s read-only walk still doesn't descend `\d`/`\qs` at all (renders neither); three more
+  hand-rolled source-word-position walks in `UhbStrip.tsx`/`AlignmentPanel.tsx`/`Shell.tsx` (`countSourceWords`)
+  have the same `\qs`-blind gap as `collectAlignerSourceWords` did; `tnQuickRequest.ts`'s `buildTnQuickRequest`
+  never joins a bridged TN note's full covered-verse range into the AI prompt context (downstream's `#411`/`#406`
+  fix a bug in logic we don't have at all — the feature itself is the gap). **Next time:** check whether a newer
+  `docs/upstream-sync-*.md` exists downstream before re-diffing from `6251e9a`.
 
 ## Stop conditions / goals
 
