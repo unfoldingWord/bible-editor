@@ -18,7 +18,7 @@ import { alerts } from "./alerts";
 import { alignmentAttention } from "./alignmentAttention";
 import { verseMergeConflicts } from "./verseMergeConflicts";
 import { comments } from "./comments";
-import { pollDcsCommits } from "./dcsCommitPoll";
+import { pollDcsCommits, backfillDcsGaps } from "./dcsCommitPoll";
 import { dcsCommits } from "./dcsCommits";
 import { books } from "./bookImport";
 import { bookLockGuard } from "./bookLockGuard";
@@ -364,6 +364,21 @@ export default {
         await pollDcsCommits(env);
       } catch (e) {
         console.error("dcs commit poll tick failed", e instanceof Error ? e.message : String(e));
+      }
+      // Slow gap backfill (issue #692 item 2). Walks a FEW extra pages per
+      // tick, per repo, but only for a repo that currently has a recorded
+      // gap_since_sha — a repo with none costs one D1 read and zero fetches.
+      // Unlike pollDcsCommits above this is not gated to once per 30 minutes,
+      // so it makes steady progress on every tick that finds a gap; see the
+      // subrequest-budget arithmetic in dcsCommitPoll.ts's GAP BACKFILL
+      // comment for why that is still comfortably inside Cloudflare's ~1000
+      // subrequest cap for the whole invocation. Wrapped for the same reason
+      // as the poll above: this is observability, and Door43 being down must
+      // not fail the rest of this handler.
+      try {
+        await backfillDcsGaps(env);
+      } catch (e) {
+        console.error("dcs gap backfill tick failed", e instanceof Error ? e.message : String(e));
       }
       // Once-per-hour edit_log retention sweep. 180 days is defensive — we
       // don't have a real policy yet, but the table grows without bound

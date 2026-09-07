@@ -582,6 +582,36 @@ async function run() {
       assert(r.incomplete === true && r.incompleteReason === "no_source_sha", "no boundary at all is incomplete without fetching");
     }
 
+    // ── opts.startRef anchors page 1 at an arbitrary commit instead of
+    // `sha=master` (issue #692 item 2 — the mechanism the gap backfill's
+    // resumable BACKWARD walk needs). Inert when omitted: the default stays
+    // "master" for every pre-existing caller.
+    {
+      const seenUrls = [];
+      globalThis.fetch = async (url) => {
+        seenUrls.push(url);
+        return commitsRes([commit("cursor", "hand fix", "h@x"), commit("ancestor", "old", "h@x")], { pageCount: 1 });
+      };
+      const r = await listMasterCommitsSince({}, "en_tq", null, "ancestor", { startRef: "cursor-sha-123" });
+      assert(r.incomplete === false && r.commits.length === 1, "walking from a startRef still reaches the boundary normally");
+      assert(
+        seenUrls.every((u) => new URL(u).searchParams.get("sha") === "cursor-sha-123"),
+        "  ...and the request's sha= param is the supplied startRef, not master",
+      );
+    }
+    {
+      const seenUrls = [];
+      globalThis.fetch = async (url) => {
+        seenUrls.push(url);
+        return commitsRes([commit("a", "hand fix", "h@x")], { pageCount: 1 });
+      };
+      await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "a");
+      assert(
+        seenUrls.every((u) => new URL(u).searchParams.get("sha") === "master"),
+        "omitting startRef keeps every existing caller on sha=master",
+      );
+    }
+
     // ── The WATERMARK bound (#540 item 1). The sync passes master_confirmed_at,
     // not source_sha, because the two are different points in master's history
     // and source_sha is routinely newer — see the "WHICH BOUNDARY" note in

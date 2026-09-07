@@ -49,6 +49,43 @@
 //     here is the livelock: the same 200 commits would be re-fetched every
 //     interval forever and the ledger would never see a new commit again.
 //     Bounded, recorded loss beats an unbounded stall.
+//
+// ── GAP BACKFILL (issue #692 item 2) ────────────────────────────────────────
+// gap_since_sha above is recorded, never walked — until now.
+// backfillDcsGaps/backfillDcsRepoGap below make a FEW extra pages of progress
+// per due cron tick, per repo, ONLY for a repo that currently has an active
+// gap (dcs_repo_polls.gap_since_sha IS NOT NULL). A repo with no gap costs one
+// D1 read and zero fetches, same rate-limiting philosophy as the forward
+// poller. Unlike the forward poller, this is NOT gated to one attempt per
+// DCS_POLL_INTERVAL_SECONDS — it runs on every POLL_CRON tick that finds a
+// gap, because the whole point is to make steady, bounded progress without
+// waiting 30 minutes between each small step.
+//
+// TWO GAP SHAPES, recorded explicitly in gap_kind rather than inferred (see
+// migration 0062's comment for the full reasoning — this codebase's house
+// style is to make invariants explicit, per the last_sha/last_committed_at
+// pairing and "oldest gap wins" comments below):
+//   * 'range' — gap_since_sha is an EXISTING dcs_commits row (the previous
+//     high-water mark). The backfill walks from gap_backfill_sha toward it,
+//     using it as the SAME sinceSha boundary the forward poller uses, and
+//     proves continuity the moment the walk reports `incomplete: false`.
+//   * 'open'  — there was no prior high-water mark (bootstrap), so
+//     gap_since_sha is just the gap-creating walk's own frontier — there is no
+//     older sha to aim for. The backfill walks from gap_backfill_sha with NO
+//     lower bound (sinceTime pinned to 0, so it can never trigger early) until
+//     the walk itself reaches the true end of the repo's history.
+//
+// SUBREQUEST BUDGET. DCS_BACKFILL_PAGE_LIMIT (2) is smaller than the forward
+// poller's DCS_POLL_PAGE_LIMIT (4) precisely because this runs unthrottled: in
+// the worst case EVERY tracked repo has an open gap on EVERY 5-minute tick, so
+// the backfill alone can spend up to 5 repos × 2 pages = 10 subrequests per
+// tick — versus the forward poller's worst case of 5 × 4 = 20 (and its
+// steady-state of 5, since it IS interval-gated). Combined worst case for the
+// whole POLL_CRON tick is therefore ~20 (forward) + ~10 (backfill) + a handful
+// for the book-lock/edit_log/dcs_commits sweeps (each a single D1 statement,
+// no subrequests) — comfortably under Cloudflare's ~1000-subrequest cap, with
+// two full orders of magnitude of headroom for pollAllNonTerminal's own
+// budget on the same tick.
 
 import type { Env } from "./index";
 import { listMasterCommitsSince, TRACKED_DCS_REPOS } from "./dcsSources.ts";
@@ -79,6 +116,13 @@ export const DCS_POLL_FETCH_TIMEOUT_MS = 20_000;
 /** How far back a never-polled repo is seeded. */
 export const DCS_POLL_BOOTSTRAP_SECONDS = 30 * 86400;
 /**
+ * Pages per repo per POLL_CRON tick spent BACKFILLING an existing gap (issue
+ * #692 item 2). Smaller than DCS_POLL_PAGE_LIMIT (4) because this is not
+ * interval-gated the way the forward poll is — see the subrequest-budget
+ * arithmetic in the GAP BACKFILL comment block above.
+ */
+export const DCS_BACKFILL_PAGE_LIMIT = 2;
+/**
  * Max paths recorded in files_json. A normal push touches one file (measured:
  * every commit on en_tn page 1 touched exactly one). A mass rename or a repo-
  * wide reformat touches thousands, and the ledger is not the place to store
@@ -95,6 +139,12 @@ export interface DcsPollStateRow {
   last_status: string | null;
   gap_since_sha: string | null;
   gap_at: number | null;
+  /** 'range' | 'open' | null — see migration 0062 and the GAP BACKFILL comment above. */
+  gap_kind: string | null;
+  /** Backfill cursor: next sha to resume the backward walk from. */
+  gap_backfill_sha: string | null;
+  /** When the cursor last advanced. Observability only. */
+  gap_backfill_at: number | null;
 }
 
 /**
@@ -272,17 +322,17 @@ const CLAIM_ATTEMPT_SQL = `INSERT INTO dcs_repo_polls (repo, last_attempted_at)
 
 const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
-    last_status, gap_since_sha, gap_at)
- VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+    last_status, gap_since_sha, gap_at, gap_kind, gap_backfill_sha, gap_backfill_at)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
  ON CONFLICT (repo) DO UPDATE SET
-   -- ?9 = "the ingest completed, advance the mark". last_sha and
+   -- ?12 = "the ingest completed, advance the mark". last_sha and
    -- last_committed_at move TOGETHER off that one flag (review finding F12):
    -- COALESCEing them independently let a tip with an unparseable date write
    -- the new sha while keeping the PREVIOUS commit's timestamp, so the pair
    -- described two different commits. A null date for the current tip is the
    -- honest answer; a stale one from another commit is not.
-   last_sha = CASE WHEN ?9 = 1 THEN excluded.last_sha ELSE dcs_repo_polls.last_sha END,
-   last_committed_at = CASE WHEN ?9 = 1 THEN excluded.last_committed_at ELSE dcs_repo_polls.last_committed_at END,
+   last_sha = CASE WHEN ?12 = 1 THEN excluded.last_sha ELSE dcs_repo_polls.last_sha END,
+   last_committed_at = CASE WHEN ?12 = 1 THEN excluded.last_committed_at ELSE dcs_repo_polls.last_committed_at END,
    last_attempted_at = excluded.last_attempted_at,
    last_success_at = COALESCE(excluded.last_success_at, dcs_repo_polls.last_success_at),
    last_status = excluded.last_status,
@@ -291,13 +341,55 @@ const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    -- that hit its page cap twice reported only the second hole and looked more
    -- contiguous than it was. Coverage claims must err conservative: the field
    -- means "history below this sha is not proven contiguous", and only a
-   -- backfill that actually closes the hole may clear it (no code clears it
-   -- today — that is the follow-up this table is shaped for). Set as a pair
-   -- with gap_at, for the same reason as last_sha/last_committed_at above.
+   -- backfill that actually closes the hole may clear it. Set as a group with
+   -- gap_at, for the same reason as last_sha/last_committed_at above.
    gap_since_sha = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
                           THEN excluded.gap_since_sha ELSE dcs_repo_polls.gap_since_sha END,
    gap_at = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
-                   THEN excluded.gap_at ELSE dcs_repo_polls.gap_at END`;
+                   THEN excluded.gap_at ELSE dcs_repo_polls.gap_at END,
+   -- gap_kind / gap_backfill_sha / gap_backfill_at (issue #692 item 2) are
+   -- PART OF that same atomic group, gated on the identical condition — a
+   -- second, later gap-triggering poll on a repo that already has an open gap
+   -- must never overwrite an in-progress backfill's cursor (gap_backfill_sha)
+   -- with a fresh one, exactly as it must never overwrite gap_since_sha
+   -- itself. backfillDcsRepoGap below is the ONLY code that ever advances
+   -- gap_backfill_sha once a gap is open, or clears any of these five columns
+   -- back to NULL.
+   gap_kind = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
+                     THEN excluded.gap_kind ELSE dcs_repo_polls.gap_kind END,
+   gap_backfill_sha = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
+                             THEN excluded.gap_backfill_sha ELSE dcs_repo_polls.gap_backfill_sha END,
+   gap_backfill_at = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
+                            THEN excluded.gap_backfill_at ELSE dcs_repo_polls.gap_backfill_at END`;
+
+type PreparedStatement = ReturnType<Env["DB"]["prepare"]>;
+
+/**
+ * Shared by pollDcsRepo and backfillDcsRepoGap: chunk `insertStatements` so no
+ * single env.DB.batch() call exceeds D1's 100-statement cap (DCS_POLL_WRITE_BATCH
+ * leaves headroom for the trailing statement — see DCS_POLL_WRITE_BATCH's own
+ * comment), append `trailingStatement` (if any) to the LAST chunk so a
+ * watermark/cursor write can only land in the same transaction that finishes
+ * the ingest it describes, and run the chunks in order. A chunk failing part
+ * way through leaves whatever landed before it — safe, because every insert is
+ * ON CONFLICT DO NOTHING and a re-run re-inserts only what's missing.
+ */
+async function writeChunked(
+  env: Env,
+  insertStatements: PreparedStatement[],
+  trailingStatement: PreparedStatement | null,
+): Promise<void> {
+  const chunks: PreparedStatement[][] = [];
+  for (let i = 0; i < insertStatements.length; i += DCS_POLL_WRITE_BATCH) {
+    chunks.push(insertStatements.slice(i, i + DCS_POLL_WRITE_BATCH));
+  }
+  if (chunks.length === 0) chunks.push([]);
+  if (trailingStatement) chunks[chunks.length - 1].push(trailingStatement);
+  for (const chunk of chunks) {
+    if (chunk.length === 0) continue;
+    await env.DB.batch(chunk);
+  }
+}
 
 export interface RepoPollResult {
   repo: string;
@@ -316,7 +408,7 @@ export interface RepoPollResult {
 export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): Promise<RepoPollResult> {
   const state = await env.DB.prepare(
     `SELECT repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
-            last_status, gap_since_sha, gap_at
+            last_status, gap_since_sha, gap_at, gap_kind, gap_backfill_sha, gap_backfill_at
        FROM dcs_repo_polls WHERE repo = ?1`,
   )
     .bind(repo)
@@ -346,10 +438,18 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
   const advance = dropped > 0 || !page.incomplete || advancesDespiteIncomplete(page.incompleteReason);
   // The tip is rows[0] — the walk is newest-first.
   const tip = rows[0] ?? null;
-  const gapSince =
-    dropped > 0 || (page.incomplete && advancesDespiteIncomplete(page.incompleteReason))
-      ? (sinceSha ?? rows[rows.length - 1]?.sha ?? null)
-      : null;
+  const gapTriggered = dropped > 0 || (page.incomplete && advancesDespiteIncomplete(page.incompleteReason));
+  // The oldest commit THIS walk actually inserted — the frontier a resuming
+  // backfill starts from. Same expression whichever gap shape this turns out
+  // to be (see the GAP BACKFILL comment above): a 'range' gap's frontier is
+  // simply the near edge of the hole it just opened; an 'open' gap's frontier
+  // IS gap_since_sha, because there was never anything else to point at.
+  const gapFrontier = rows[rows.length - 1]?.sha ?? null;
+  const gapSince = gapTriggered ? (sinceSha ?? gapFrontier) : null;
+  // 'range' when this walk had a stored sha to aim for (steady state);
+  // 'open' when it was bounded by the bootstrap time window instead.
+  const gapKind = gapTriggered ? (sinceSha != null ? "range" : "open") : null;
+  const gapBackfillSha = gapTriggered ? gapFrontier : null;
 
   // CHUNKED, because D1 caps a batch at 100 statements (documented at
   // bookImport.ts's CHUNK and bookReimport.ts's WRITE_BATCH). A single batch of
@@ -382,8 +482,8 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
   );
   const pollStatement = env.DB.prepare(UPSERT_POLL_SQL).bind(
     repo,
-    // The pair travels together and the ?9 flag below decides whether it lands
-    // — see UPSERT_POLL_SQL. `tip?.committedAt` may legitimately be null.
+    // The pair travels together and the ?12 flag below decides whether it
+    // lands — see UPSERT_POLL_SQL. `tip?.committedAt` may legitimately be null.
     tip?.sha ?? null,
     tip?.committedAt ?? null,
     nowSeconds,
@@ -391,7 +491,12 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
     status,
     gapSince,
     gapSince ? nowSeconds : null,
-    // ?9 — advance the (last_sha, last_committed_at) pair, or leave both.
+    gapKind,
+    gapBackfillSha,
+    // Cursor "last advanced" at creation time is the same moment the gap
+    // itself was recorded.
+    gapSince ? nowSeconds : null,
+    // ?12 — advance the (last_sha, last_committed_at) pair, or leave both.
     advance ? 1 : 0,
   );
 
@@ -403,15 +508,7 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
   // alternative (stamping a watermark per chunk) would need its own partial
   // status vocabulary to earn nothing: a chunk failing here means D1 is
   // erroring, and re-walking is the right answer to that anyway.
-  const chunks: (typeof pollStatement)[][] = [];
-  for (let i = 0; i < insertStatements.length; i += DCS_POLL_WRITE_BATCH) {
-    chunks.push(insertStatements.slice(i, i + DCS_POLL_WRITE_BATCH));
-  }
-  if (chunks.length === 0) chunks.push([]);
-  chunks[chunks.length - 1].push(pollStatement);
-  for (const chunk of chunks) {
-    await env.DB.batch(chunk);
-  }
+  await writeChunked(env, insertStatements, pollStatement);
 
   return {
     repo,
@@ -449,6 +546,162 @@ export async function pollDcsCommits(env: Env, nowSeconds?: number): Promise<Rep
     } catch (e) {
       console.error("dcs commit poll failed", repo, e instanceof Error ? e.message : String(e));
       out.push({ repo, polled: true, fetched: 0, inserted: 0, status: "error", advanced: false, gapSince: null });
+    }
+  }
+  return out;
+}
+
+const CLEAR_GAP_SQL = `UPDATE dcs_repo_polls
+   SET gap_since_sha = NULL, gap_at = NULL, gap_kind = NULL,
+       gap_backfill_sha = NULL, gap_backfill_at = NULL
+ WHERE repo = ?1`;
+
+const ADVANCE_BACKFILL_CURSOR_SQL = `UPDATE dcs_repo_polls
+   SET gap_backfill_sha = ?2, gap_backfill_at = ?3
+ WHERE repo = ?1`;
+
+export interface GapBackfillResult {
+  repo: string;
+  /** True iff this repo had an active gap and the step actually did work. */
+  active: boolean;
+  fetched: number;
+  inserted: number;
+  /** 'no_gap' | 'missing_cursor' | 'resolved' | 'gave_up_unreachable' | 'page_cap' | a transport incompleteReason */
+  status: string;
+  /** True when all five gap_* columns were cleared this step — either continuity was proven, or the target was given up on as unreachable. False for progress-but-still-open or a transport failure. */
+  gapClosed: boolean;
+}
+
+/**
+ * Backfill step for ONE repo's recorded gap. See the GAP BACKFILL comment
+ * block near the top of this file for the two gap shapes and the subrequest
+ * budget. A repo with no gap costs one D1 read and returns immediately — no
+ * fetch, no other write.
+ *
+ * Exported for a targeted admin/manual run; the cron entry point is
+ * backfillDcsGaps below.
+ */
+export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: number): Promise<GapBackfillResult> {
+  const state = await env.DB.prepare(
+    `SELECT gap_since_sha, gap_kind, gap_backfill_sha
+       FROM dcs_repo_polls WHERE repo = ?1`,
+  )
+    .bind(repo)
+    .first<Pick<DcsPollStateRow, "gap_since_sha" | "gap_kind" | "gap_backfill_sha">>();
+
+  if (!state || !state.gap_since_sha) {
+    return { repo, active: false, fetched: 0, inserted: 0, status: "no_gap", gapClosed: false };
+  }
+  if (!state.gap_backfill_sha) {
+    // A gap recorded before this migration added gap_backfill_sha (or, in
+    // principle, any other loss of the cursor) has no known frontier to
+    // resume from. Guessing one risks declaring continuity proven from the
+    // wrong point, which is worse than doing nothing — leave it, it ages out
+    // under dcsCommitsSweep.ts's retention window like every other row
+    // eventually does.
+    return { repo, active: false, fetched: 0, inserted: 0, status: "missing_cursor", gapClosed: false };
+  }
+
+  const isRange = state.gap_kind === "range";
+  // 'range': walk toward the recorded far edge (already a dcs_commits row) —
+  // continuity is proven the instant the walk reports it. 'open': no far edge
+  // exists (bootstrap); walk with sinceTime pinned to 0 (a bound that can
+  // never trigger) until the walk itself reaches the true end of history.
+  const page = await listMasterCommitsSince(env, repo, null, isRange ? state.gap_since_sha : null, {
+    startRef: state.gap_backfill_sha,
+    pageLimit: DCS_BACKFILL_PAGE_LIMIT,
+    sinceTime: isRange ? null : 0,
+    files: true,
+    timeoutMs: DCS_POLL_FETCH_TIMEOUT_MS,
+  });
+
+  const { rows, dropped } = ledgerRowsFromCommits(repo, page.commits);
+  // Nearest-anchor-first: gap_backfill_sha is the trusted edge (already
+  // contiguous with the rest of dcs_commits), and listMasterCommitsSince
+  // returns commits newest-first starting AT that anchor — i.e. already in
+  // "anchor first, extending into the unknown" order. Unlike pollDcsRepo
+  // above (whose trusted anchor sits at the OLD/bottom edge of ITS fetch, so
+  // it reverses to oldest-first), this walk's anchor is the NEW/top edge of
+  // its own fetch, so inserting in the walk's own order is what leaves a
+  // mid-batch failure as a contiguous extension of existing coverage rather
+  // than an island.
+  const insertStatements = rows.map((r) =>
+    env.DB.prepare(INSERT_COMMIT_SQL).bind(
+      r.repo,
+      r.sha,
+      r.parentSha,
+      r.authorName,
+      r.authorEmail,
+      r.committedAt,
+      r.subject,
+      r.classification,
+      r.reason,
+      r.filesJson,
+      nowSeconds,
+    ),
+  );
+
+  const resolved = dropped === 0 && !page.incomplete;
+  // source_sha_not_in_history only ever comes back for a 'range' walk (an
+  // 'open' walk never passes a sinceSha, so it can't hit that branch in
+  // listMasterCommitsSince) — Door43 history under the target sha was
+  // rewritten out from under us. Per this file's own "bounded, recorded loss
+  // beats an unbounded stall" philosophy: give up on THIS gap rather than
+  // retry an impossible walk every tick forever.
+  const unreachable = !resolved && page.incompleteReason === "source_sha_not_in_history";
+  // page_cap / a defensive row-cap truncation both represent real progress —
+  // move the cursor to resume from here. Anything else left (a transport
+  // failure: fetch_failed / http_* / bad_body / commit_without_sha) makes NO
+  // cursor claim — whatever partial rows arrived are still inserted (keyed,
+  // safe), but the next tick retries the exact same range rather than resuming
+  // from a page we're not sure we saw in full.
+  const progressed = !resolved && !unreachable && (dropped > 0 || advancesDespiteIncomplete(page.incompleteReason));
+
+  let trailingStatement: PreparedStatement | null = null;
+  if (resolved || unreachable) {
+    if (unreachable) {
+      console.error("dcs gap backfill: target unreachable, giving up on this gap", {
+        repo,
+        gapSince: state.gap_since_sha,
+        gapKind: state.gap_kind,
+        cursor: state.gap_backfill_sha,
+      });
+    }
+    trailingStatement = env.DB.prepare(CLEAR_GAP_SQL).bind(repo);
+  } else if (progressed) {
+    const newCursor = rows[rows.length - 1]?.sha ?? state.gap_backfill_sha;
+    trailingStatement = env.DB.prepare(ADVANCE_BACKFILL_CURSOR_SQL).bind(repo, newCursor, nowSeconds);
+  }
+  // else: transport failure — no trailing statement, cursor untouched.
+
+  await writeChunked(env, insertStatements, trailingStatement);
+
+  return {
+    repo,
+    active: true,
+    fetched: page.commits.length,
+    inserted: rows.length,
+    status: resolved ? "resolved" : unreachable ? "gave_up_unreachable" : page.incompleteReason || "incomplete",
+    gapClosed: resolved || unreachable,
+  };
+}
+
+/**
+ * Cron entry point for the gap backfill (issue #692 item 2). Mirrors
+ * pollDcsCommits's shape: sequential (no concurrency need, keeps subrequest
+ * pressure flat — see the budget arithmetic near the top of this file), and
+ * each repo is wrapped so one failure doesn't skip the rest. Unlike
+ * pollDcsCommits this is NOT interval-gated — see backfillDcsRepoGap.
+ */
+export async function backfillDcsGaps(env: Env, nowSeconds?: number): Promise<GapBackfillResult[]> {
+  const now = nowSeconds ?? Math.floor(Date.now() / 1000);
+  const out: GapBackfillResult[] = [];
+  for (const repo of TRACKED_DCS_REPOS) {
+    try {
+      out.push(await backfillDcsRepoGap(env, repo, now));
+    } catch (e) {
+      console.error("dcs gap backfill failed", repo, e instanceof Error ? e.message : String(e));
+      out.push({ repo, active: true, fetched: 0, inserted: 0, status: "error", gapClosed: false });
     }
   }
   return out;

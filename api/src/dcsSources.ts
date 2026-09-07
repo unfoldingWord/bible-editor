@@ -343,8 +343,9 @@ export interface MasterCommitPage {
   incompleteReason: string;
 }
 
-// TWO OPTIONAL WIDENINGS, both added for the dcs_commits ledger (issue #685)
-// and both inert for every pre-existing caller:
+// THREE OPTIONAL WIDENINGS, added for the dcs_commits ledger (issue #685) and
+// its gap-backfill follow-up (issue #692 item 2) — all inert for every
+// pre-existing caller:
 //
 //   * `path === null` drops the `&path=` filter and walks the REPO's master
 //     history instead of one file's. The ledger's question is "what happened on
@@ -359,6 +360,15 @@ export interface MasterCommitPage {
 //     route to a per-commit file list, and the per-commit fetch fanout the
 //     issue warned about is not needed. Default stays false so the nightly
 //     path's payload does not grow.
+//   * `opts.startRef` anchors the walk's page-1 `sha=` at an arbitrary commit
+//     instead of always `sha=master` — the mechanism a resumable BACKWARD walk
+//     needs (dcsCommitPoll.ts's gap backfill starts paging from a stored
+//     cursor sha, not from master's live tip). The returned commits still page
+//     newest-first from that point, and the boundary check (`sinceSha` /
+//     `sinceTime`) is unchanged — a backfill walk anchored at its own cursor
+//     and bounded by the recorded gap sha behaves exactly like the forward
+//     poller's steady-state resume, just starting somewhere other than the
+//     branch tip.
 // The git blob sha of ONE file as of a given commit, from the commit's root tree
 // (`GET /repos/{owner}/{repo}/git/trees/{commit sha}` — Gitea resolves a commit
 // sha to its tree; measured 2026-09-02 on en_tq 744f2ee8: 73 entries, `truncated:
@@ -403,7 +413,13 @@ export async function listMasterCommitsSince(
   repo: string,
   path: string | null,
   sinceSha: string | null,
-  opts: { pageLimit?: number; sinceTime?: number | null; files?: boolean; timeoutMs?: number } = {},
+  opts: {
+    pageLimit?: number;
+    sinceTime?: number | null;
+    files?: boolean;
+    timeoutMs?: number;
+    startRef?: string;
+  } = {},
 ): Promise<MasterCommitPage> {
   const pageLimit = opts.pageLimit ?? 5;
   // The watermark bound, in unix seconds. When present it REPLACES the sha as
@@ -424,7 +440,7 @@ export async function listMasterCommitsSince(
   for (let page = 1; page <= pageLimit; page++) {
     const url =
       `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
-      `/commits?sha=master` +
+      `/commits?sha=${encodeURIComponent(opts.startRef ?? "master")}` +
       (path ? `&path=${encodeURIComponent(path)}` : "") +
       `&page=${page}&stat=false&verification=false&files=${opts.files === true ? "true" : "false"}`;
     let batch: Array<Record<string, unknown>>;

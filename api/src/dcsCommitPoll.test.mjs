@@ -251,6 +251,10 @@ async function main() {
       upsert.args[6] === "unreachable" && upsert.args[7] === NOW,
       "  ...and records gap_since_sha, so the coverage hole is visible instead of absorbed",
     );
+    assert(
+      upsert.args[8] === "range" && upsert.args[9] === "d49" && upsert.args[10] === NOW,
+      "  ...a stored last_sha bound classifies as a 'range' gap, cursor seeded at this walk's own oldest-fetched sha",
+    );
     assert(advancesDespiteIncomplete("page_cap") && advancesDespiteIncomplete("source_sha_not_in_history"),
       "page_cap and a force-pushed mark both advance");
     assert(!advancesDespiteIncomplete("fetch_failed") && !advancesDespiteIncomplete("http_502"),
@@ -305,7 +309,11 @@ async function main() {
     assert(res.status === "http_502", "a 502 mid-walk is reported as http_502");
     assert(inserts(db).length === 50, "  ...page 1's commits are still recorded (rows are keyed, so this is safe)");
     const upsert = pollUpsert(db);
-    assert(upsert.args[8] === 0, "  ...the advance flag is 0, so the high-water mark is NOT moved");
+    assert(upsert.args[11] === 0, "  ...the advance flag is 0, so the high-water mark is NOT moved");
+    assert(
+      upsert.args[6] === null && upsert.args[8] === null && upsert.args[9] === null,
+      "  ...a transport failure is not a gap: gap_since_sha/gap_kind/gap_backfill_sha all stay null",
+    );
     assert(upsert.args[4] === null, "  ...and last_success_at is left alone");
     assert(upsert.args[3] === NOW, "  ...while last_attempted_at moves, so we retry per interval not per tick");
   }
@@ -509,9 +517,9 @@ async function main() {
     await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
     const upsert = pollUpsert(db);
     assert(upsert.args[1] === "n1" && upsert.args[2] === null, "an unparseable tip date writes sha + NULL, as a pair");
-    assert(upsert.args[8] === 1, "  ...and still advances (the walk completed)");
+    assert(upsert.args[11] === 1, "  ...and still advances (the walk completed)");
     assert(
-      /last_sha = CASE WHEN \?9 = 1/.test(upsert.sql) && /last_committed_at = CASE WHEN \?9 = 1/.test(upsert.sql),
+      /last_sha = CASE WHEN \?12 = 1/.test(upsert.sql) && /last_committed_at = CASE WHEN \?12 = 1/.test(upsert.sql),
       "  ...both driven by the same advance flag, not COALESCEd independently",
     );
   }
@@ -530,6 +538,19 @@ async function main() {
     assert(
       /gap_at = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
       "  ...and gap_at is gated on the same condition, so the pair cannot split",
+    );
+    assert(
+      /gap_kind = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql) &&
+        /gap_backfill_sha = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql) &&
+        /gap_backfill_at = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
+      "  ...and gap_kind/gap_backfill_sha/gap_backfill_at (issue #692 item 2) are gated on the SAME condition — a second, later gap-triggering walk must never clobber an in-progress backfill's cursor",
+    );
+    // The walk's OWN newly-computed values are still what's bound (?9/?10/?11)
+    // even though the CASE above will discard them at write time — the same
+    // shape as gap_since_sha/gap_at already had before this change.
+    assert(
+      upsert.args[8] === "range" && typeof upsert.args[9] === "string" && upsert.args[10] === NOW,
+      "  ...this walk's own gap_kind/gap_backfill_sha/gap_backfill_at are still bound, ready to be discarded by the CASE",
     );
   }
 

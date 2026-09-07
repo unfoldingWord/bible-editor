@@ -1,0 +1,49 @@
+-- Issue #692 item 2: a slow backfill path for dcs_repo_polls.gap_since_sha.
+--
+-- gap_since_sha (0059) records the FAR edge of a coverage hole and nothing
+-- ever walks it — that migration's own comment says as much: "that backfill
+-- is the follow-up this table is shaped for." These three columns are the
+-- durable, resumable state that backfill needs, because the backfill only
+-- makes a few pages of progress per 5-minute cron tick (see
+-- DCS_BACKFILL_PAGE_LIMIT in dcsCommitPoll.ts) and must pick up exactly where
+-- it left off on the NEXT tick rather than re-deriving where that is.
+--
+-- Two gap SHAPES exist, and a resuming backfill must be able to tell them
+-- apart without inferring it from other columns (this codebase's house style
+-- — see the last_sha/last_committed_at pairing comment and the "oldest gap
+-- wins" comment on gap_since_sha/gap_at, both in 0059, for why implicit
+-- inference is exactly the kind of thing that has caused bugs here before):
+--
+--   * 'range' — the poll had a stored last_sha (steady state) and hit its
+--     page cap before reaching it. gap_since_sha is that last_sha, which is
+--     ALREADY a row in dcs_commits. Continuity is proven the moment a walk
+--     starting at gap_backfill_sha reaches gap_since_sha again.
+--   * 'open'  — the poll had no last_sha (bootstrap; a time window was used
+--     instead) and hit its page cap. There is no older known-good sha to aim
+--     for — gap_since_sha is set to the SAME value as the walk's own
+--     frontier (there is nothing else to point it at). Continuity is proven
+--     when a walk from gap_backfill_sha, with no lower bound, reaches the
+--     true end of the repository's history.
+--
+-- gap_kind: which of the two shapes above. NULL exactly when there is no
+-- active gap (gap_since_sha IS NULL) — kept in lockstep with it.
+--
+-- gap_backfill_sha: the cursor. Initialized to the gap-creating walk's own
+-- frontier (the oldest commit sha that walk actually inserted) at the moment
+-- the gap is first recorded, then moves strictly OLDER as each backfill tick
+-- makes progress, until the gap closes and all of these columns (plus
+-- gap_since_sha/gap_at) are cleared back to NULL together.
+--
+-- gap_backfill_at: when the cursor last moved. Observability only (so
+-- `wrangler tail`-less debugging can see a stalled backfill), never read for
+-- a correctness decision.
+--
+-- ATOMIC GROUP, same discipline as gap_since_sha/gap_at in 0059: these three
+-- columns move ONLY together with gap_since_sha/gap_at, gated on the same
+-- "oldest gap wins" condition in dcsCommitPoll.ts's UPSERT_POLL_SQL — a
+-- second, later gap-triggering poll on a repo that already has an open gap
+-- must never clobber an in-progress backfill's cursor with a fresh one.
+ALTER TABLE dcs_repo_polls ADD COLUMN gap_kind TEXT
+  CHECK (gap_kind IS NULL OR gap_kind IN ('range', 'open'));
+ALTER TABLE dcs_repo_polls ADD COLUMN gap_backfill_sha TEXT;
+ALTER TABLE dcs_repo_polls ADD COLUMN gap_backfill_at INTEGER;
