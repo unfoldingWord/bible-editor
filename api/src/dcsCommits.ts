@@ -36,6 +36,17 @@ function parseFiles(json: string | null): string[] | null {
   }
 }
 
+/** Same guard as parseFiles, for gap_frontier_json (issue #692 item 2). */
+function parseFrontier(json: string | null): string[] | null {
+  if (json == null) return null;
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? (parsed as string[]) : null;
+  } catch {
+    return null;
+  }
+}
+
 dcsCommits.get("/", async (c) => {
   const repo = (c.req.query("repo") ?? "").trim();
   if (repo && !TRACKED_DCS_REPOS.includes(repo)) {
@@ -91,7 +102,7 @@ dcsCommits.get("/", async (c) => {
 
   const polls = await c.env.DB.prepare(
     `SELECT repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
-            last_status, gap_since_sha, gap_at, gap_from_sha
+            last_status, gap_since_sha, gap_at, gap_frontier_json
        FROM dcs_repo_polls ORDER BY repo`,
   ).all<DcsPollStateRow>();
 
@@ -126,7 +137,7 @@ dcsCommits.get("/", async (c) => {
       lastStatus: p.last_status,
       gapSinceSha: p.gap_since_sha,
       gapAt: p.gap_at,
-      gapFromSha: p.gap_from_sha,
+      gapFrontier: parseFrontier(p.gap_frontier_json),
     })),
   });
 });

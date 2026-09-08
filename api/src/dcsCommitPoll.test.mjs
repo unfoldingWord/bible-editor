@@ -23,6 +23,7 @@ import {
   DCS_POLL_WRITE_BATCH,
   advancesDespiteIncomplete,
   classifyForLedger,
+  computeGapFrontier,
   ledgerRowsFromCommits,
   pollBounds,
   pollDcsRepo,
@@ -71,14 +72,23 @@ function mockGitea(pages, { fail = null } = {}) {
   return seenUrls;
 }
 
-function commit(sha, message, email, { name = "Someone", date = "2026-08-30T12:00:00Z", parent = null, files = ["tn_ZEC.tsv"] } = {}) {
+function commit(
+  sha,
+  message,
+  email,
+  { name = "Someone", date = "2026-08-30T12:00:00Z", parent = null, parents = null, files = ["tn_ZEC.tsv"] } = {},
+) {
+  // `parents` (plural) is a merge commit's full parent list, for frontier
+  // tests (issue #692 item 2) — `parent` stays as the single-parent shorthand
+  // every other test already uses.
+  const parentShas = parents ?? (parent ? [parent] : []);
   return {
     sha,
     commit: { message, author: { email, name, date } },
     // Measured: null on plenty of commits, human ones included. Nothing in the
     // poller may read it.
     author: null,
-    parents: parent ? [{ sha: parent }] : [],
+    parents: parentShas.map((p) => ({ sha: p })),
     files: files == null ? undefined : files.map((f) => ({ filename: f, status: "modified" })),
   };
 }
@@ -257,9 +267,10 @@ async function main() {
       "transport failures do NOT advance");
   }
 
-  // ── issue #692 item 2: a fresh page-cap gap also records its NEAR edge ────
-  // (gap_from_sha), so the backfill path knows where to resume without
-  // re-walking from the tip. It is the PARENT of the oldest row this walk
+  // ── issue #692 item 2: a fresh page-cap gap also records its NEAR edge(s) ─
+  // (gap_frontier_json), so the backfill path knows where to resume without
+  // re-walking from the tip. On an ordinary (merge-free) range it is a
+  // single-entry array holding the PARENT of the oldest row this walk
   // actually inserted — everything at or above that row is already in the
   // ledger; everything below it, down to gap_since_sha, is the hole.
   {
@@ -271,7 +282,30 @@ async function main() {
     await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
     const upsert = pollUpsert(db);
     assert(upsert.args[6] === "unreachable", "  ...gap_since_sha is still the far edge, unchanged");
-    assert(upsert.args[9] === "d-parent", "  ...and gap_from_sha is the oldest inserted row's parent — the near edge");
+    assert(upsert.args[9] === '["d-parent"]', "  ...and gap_frontier_json is [the oldest inserted row's parent] — the near edge");
+  }
+
+  // ── issue #692 item 2 (Codex review, P1): a merge commit anywhere in the
+  // capped range yields a MULTI-entry frontier, not just the oldest row's
+  // first parent. Otherwise the second parent's whole branch is silently
+  // unreachable from any resume point derived from first-parent alone.
+  {
+    // d25 is a merge commit strictly newer than the oldest row (d49) — its
+    // SECOND parent ("side-branch-tip") is not an ancestor of d49 at all in
+    // this fixture, so a first-parent-only frontier would never see it.
+    const dPage = Array.from({ length: 50 }, (_, i) => {
+      if (i === 49) return commit("d49", "hand fix d49", "h@x", { parent: "d-parent" });
+      if (i === 25) return commit("d25", "Merge pull request '…' (#1) from x into master", "h@x", { parents: ["d26", "side-branch-tip"] });
+      return commit(`d${i}`, `hand fix d${i}`, "h@x", i > 0 && i !== 26 ? { parent: `d${i - 1}` } : undefined);
+    });
+    mockGitea([fullPage("a"), fullPage("b"), fullPage("c"), dPage, fullPage("e"), fullPage("f")]);
+    const db = mockDb({ repo: "en_tn", last_sha: "unreachable", last_attempted_at: NOW - 3600 });
+    await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    const upsert = pollUpsert(db);
+    const frontier = JSON.parse(upsert.args[9]);
+    assert(frontier.includes("side-branch-tip"), "a merge commit's second parent lands in the frontier");
+    assert(frontier.includes("d-parent"), "  ...alongside the mainline continuation, not instead of it");
+    assert(frontier.length === 2, "  ...and nothing else — every other parent in the range was itself visited");
   }
 
   // ── a complete walk records no gap at all, on EITHER edge ────────────────
@@ -280,7 +314,7 @@ async function main() {
     const db = mockDb({ repo: "en_tq", last_sha: "mark", last_attempted_at: NOW - 3600 });
     await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tq", NOW);
     const upsert = pollUpsert(db);
-    assert(upsert.args[6] === null && upsert.args[9] === null, "a complete walk writes no gap_since_sha and no gap_from_sha");
+    assert(upsert.args[6] === null && upsert.args[9] === null, "a complete walk writes no gap_since_sha and no gap_frontier_json");
   }
 
   // ── a full 200-commit poll ingests COMPLETELY, in chunks under D1's cap ──
@@ -525,6 +559,55 @@ async function main() {
     assert(rows[0].sha === "s0", "  ...keeping the NEWEST, so the tip stays contiguous with the mark");
   }
 
+  // ── ledgerRowsFromCommits carries EVERY parent, not just the first ───────
+  // (issue #692 item 2) — parentShas is what computeGapFrontier reads;
+  // parentSha (the stored column) stays first-parent-only, unchanged.
+  {
+    const { rows } = ledgerRowsFromCommits("en_tn", [
+      { sha: "m", message: "merge", authorEmail: "h@x", date: "2026-08-30T12:00:00Z", parentSha: "p0", allParentShas: ["p0", "p1"] },
+      { sha: "o", message: "ordinary", authorEmail: "h@x", date: "2026-08-30T12:00:00Z", parentSha: "p2" },
+    ]);
+    assert(rows[0].parentSha === "p0" && rows[0].parentShas.join(",") === "p0,p1", "a merge row keeps both parents in parentShas");
+    assert(
+      rows[1].parentSha === "p2" && rows[1].parentShas.join(",") === "p2",
+      "  ...and a row whose caller never asked for allParentShas falls back to the single parentSha it already had",
+    );
+  }
+
+  // ── computeGapFrontier (issue #692 item 2, Codex review P1) ───────────────
+  // The pure function in isolation: every not-yet-visited parent across every
+  // visited row, deduplicated, excluding gapSinceSha itself.
+  {
+    const row = (sha, parentShas) => ({ sha, parentShas });
+
+    assert(
+      computeGapFrontier([row("a", ["b"])], "z").join(",") === "b",
+      "a single row's unvisited parent is the whole frontier",
+    );
+    assert(
+      computeGapFrontier([row("a", ["b"]), row("b", ["c"])], "z").join(",") === "c",
+      "a chain's frontier is only the OLDEST unvisited parent — b is visited, so it drops out",
+    );
+    assert(
+      computeGapFrontier([row("a", ["z"])], "z").length === 0,
+      "a parent equal to gapSinceSha is not a frontier entry — it is the target, already known",
+    );
+    assert(
+      computeGapFrontier([row("merge", ["mainline", "side-branch"]), row("mainline", ["older"])], "z").sort().join(",") ===
+        "older,side-branch",
+      "a merge commit's SECOND parent survives into the frontier alongside the mainline continuation — the whole point of #734's fix",
+    );
+    assert(
+      computeGapFrontier([row("a", ["shared"]), row("b", ["shared"])], "z").join(",") === "shared",
+      "the same unvisited parent reached from two different rows appears once, not twice",
+    );
+    assert(computeGapFrontier([], "z").length === 0, "no rows visited means no frontier");
+    assert(
+      computeGapFrontier([row("a", [null, "b"])], "z").join(",") === "b",
+      "a missing parent (root commit slipped into a multi-parent list) is skipped, not stored as a frontier entry",
+    );
+  }
+
   // ── F12: last_sha and last_committed_at move as a PAIR ──────────────────
   // A tip whose date will not parse must write a NULL timestamp beside its sha,
   // never keep the previous commit's timestamp — that pair would describe two
@@ -558,8 +641,8 @@ async function main() {
       "  ...and gap_at is gated on the same condition, so the pair cannot split",
     );
     assert(
-      /gap_from_sha = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
-      "  ...and gap_from_sha too — it is a triple with gap_since_sha and gap_at, not a pair",
+      /gap_frontier_json = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
+      "  ...and gap_frontier_json too — it is a triple with gap_since_sha and gap_at, not a pair",
     );
   }
 

@@ -494,10 +494,14 @@ export async function listMasterCommitsSince(
       // "master's previous tip" only for a commit made directly on master or for
       // a merge commit; under repo-scoped history the list also contains commits
       // that arrived on a feature branch, whose first parent is their own branch
-      // predecessor. A merge's SECOND parent (the merged branch) is deliberately
-      // not stored — first-parent is the line "walking master back" follows.
+      // predecessor. `parentSha` (below) stores ONLY this — first-parent is the
+      // line "walking master back" has always meant, matching dcs_commits.parent_sha.
+      // `allParentShas` keeps every parent — a merge's second (and any further)
+      // parent, discarded until issue #692 item 2 needed them to compute a gap
+      // backfill's frontier correctly (see MasterCommit.allParentShas).
       const parents = Array.isArray(raw.parents) ? (raw.parents as Array<Record<string, unknown>>) : [];
-      const parentSha = typeof parents[0]?.sha === "string" ? (parents[0].sha as string) : null;
+      const allParentShas = parents.map((p) => p?.sha).filter((s): s is string => typeof s === "string");
+      const parentSha = allParentShas[0] ?? null;
       // Only present when the caller asked (`files: true`); `null` distinguishes
       // "asked and got none" from "never asked" (undefined).
       const rawFiles = Array.isArray(raw.files) ? (raw.files as Array<Record<string, unknown>>) : null;
@@ -516,6 +520,7 @@ export async function listMasterCommitsSince(
         // this endpoint alongside commit.author — see the ledger's committed_at.
         committerDate: typeof committer.date === "string" ? committer.date : null,
         parentSha,
+        allParentShas,
         ...(opts.files === true ? { files } : {}),
       });
     }

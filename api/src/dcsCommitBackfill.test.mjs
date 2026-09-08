@@ -43,12 +43,13 @@ function mockGitea(pages) {
   return seenUrls;
 }
 
-function commit(sha, message, email, { name = "Someone", date = "2026-08-30T12:00:00Z", parent = null } = {}) {
+function commit(sha, message, email, { name = "Someone", date = "2026-08-30T12:00:00Z", parent = null, parents = null } = {}) {
+  const parentShas = parents ?? (parent ? [parent] : []);
   return {
     sha,
     commit: { message, author: { email, name, date } },
     author: null,
-    parents: parent ? [{ sha: parent }] : [],
+    parents: parentShas.map((p) => ({ sha: p })),
     files: [{ filename: "tn_ZEC.tsv", status: "modified" }],
   };
 }
@@ -101,20 +102,24 @@ function mockDb(stateRow) {
   };
 }
 
+function state(gapSinceSha, frontier) {
+  return { gap_since_sha: gapSinceSha, gap_frontier_json: frontier == null ? null : JSON.stringify(frontier) };
+}
+
 function inserts(db) {
   return db.executed.filter((e) => e.sql === INSERT_COMMIT_SQL);
 }
 function clearRun(db) {
   return db.runs.find((r) => r.sql.includes("SET gap_since_sha = NULL"));
 }
-function advanceRun(db) {
-  return db.runs.find((r) => r.sql.includes("SET gap_from_sha ="));
+function frontierRun(db) {
+  return db.runs.find((r) => r.sql.includes("SET gap_frontier_json ="));
 }
 
 async function main() {
   // ── no gap: cheap no-op, no fetch at all ──────────────────────────────────
   {
-    const db = mockDb({ gap_since_sha: null, gap_from_sha: null });
+    const db = mockDb(state(null, null));
     let fetched = false;
     globalThis.fetch = async () => {
       fetched = true;
@@ -125,25 +130,25 @@ async function main() {
     assert(!fetched, "  ...and costs zero Door43 fetches — just the one D1 read");
   }
 
-  // ── gap_from_sha missing (defensive: pre-migration row, or a root gap) ────
+  // ── an empty frontier (defensive: pre-migration row, or a root gap) ──────
   {
-    const db = mockDb({ gap_since_sha: "far-edge", gap_from_sha: null });
+    const db = mockDb(state("far-edge", []));
     let fetched = false;
     globalThis.fetch = async () => {
       fetched = true;
       throw new Error("must not be called");
     };
     const res = await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
-    assert(res.resolved === true && res.status === "no_from_sha", "a gap with no known start point is dropped, not retried forever");
+    assert(res.resolved === true && res.status === "no_frontier", "a gap with no frontier entries is dropped, not retried forever");
     assert(!fetched, "  ...without spending a fetch, since there is nowhere to start walking from");
     const clr = clearRun(db);
     assert(clr && clr.args[0] === "en_tn" && clr.args[1] === "far-edge", "  ...clearing all three gap columns for this exact gap");
   }
 
-  // ── the hole fits in one tick's budget: reaches gap_since_sha and resolves ─
+  // ── a single-entry frontier that fits in one tick's budget: resolves ─────
   {
     mockGitea([[commit("h1", "hand fix", "h@x"), commit("far-edge", "old", "h@x")]]);
-    const db = mockDb({ gap_since_sha: "far-edge", gap_from_sha: "near-edge" });
+    const db = mockDb(state("far-edge", ["near-edge"]));
     const res = await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
     assert(res.resolved === true && res.status === "ok", "reaching gap_since_sha resolves the gap");
     assert(res.inserted === 1 && inserts(db).length === 1, "  ...inserting exactly the one commit inside the hole");
@@ -151,65 +156,101 @@ async function main() {
     assert(clr && clr.args[1] === "far-edge", "  ...and clears the gap, guarded on the gap_since_sha it walked against");
   }
 
-  // ── the hole is bigger than one tick's budget: page_cap, resume recorded ──
-  // Only the LAST page fetched (the DCS_BACKFILL_PAGE_LIMIT-th) supplies the
-  // oldest row, so that is the one whose parent becomes the new frontier —
-  // an earlier page's last commit is irrelevant here.
+  // ── single entry, page_cap, ordinary (merge-free) continuation: the
+  // frontier is REPLACED by the one new entry, still a single-entry array ──
   {
     const pages = Array.from({ length: DCS_BACKFILL_PAGE_LIMIT + 1 }, (_, i) =>
       i === DCS_BACKFILL_PAGE_LIMIT - 1 ? fullPage(`p${i}`, { lastParent: "the-frontier" }) : fullPage(`p${i}`),
     );
     const urls = mockGitea(pages);
-    const db = mockDb({ gap_since_sha: "far-edge", gap_from_sha: "near-edge" });
+    const db = mockDb(state("far-edge", ["near-edge"]));
     const res = await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
     assert(urls.length === DCS_BACKFILL_PAGE_LIMIT, `spends only ${DCS_BACKFILL_PAGE_LIMIT} pages per repo per tick`);
     assert(res.resolved === false && res.status === "page_cap", "did not reach the far edge this tick");
     assert(res.inserted === DCS_BACKFILL_PAGE_LIMIT * 50, "  ...but still inserts everything it DID walk");
     assert(!clearRun(db), "  ...and does NOT clear the gap — the hole is still open");
-    const adv = advanceRun(db);
-    assert(adv && adv.args[2] === "the-frontier", "  ...instead moving gap_from_sha to the new frontier for next tick");
-    assert(adv.args[0] === "en_tn" && adv.args[1] === "far-edge" && adv.args[3] === "near-edge", "  ...guarded on both the gap and the OLD gap_from_sha");
+    const fr = frontierRun(db);
+    assert(fr && JSON.parse(fr.args[2]).join(",") === "the-frontier", "  ...instead replacing the frontier for next tick");
+    assert(
+      fr.args[0] === "en_tn" && fr.args[1] === "far-edge" && fr.args[3] === JSON.stringify(["near-edge"]),
+      "  ...guarded on both the gap and the exact OLD frontier JSON",
+    );
   }
 
-  // ── a bootstrap-shaped gap: gap_since_sha is never an ancestor of the chain
-  // being walked (see dcsCommitBackfill.ts's BOOTSTRAP GAPS), so the walk runs
-  // to the true end of history and resolves via source_sha_not_in_history —
-  // the same signal a force-pushed far edge would produce.
+  // ── issue #692 item 2 (Codex review P1), the actual bug this rewrite
+  // fixes: a page-capped sub-walk that itself crosses a merge commit
+  // produces MULTIPLE new frontier entries, not one — a single-sha resume
+  // point would have silently dropped the second parent's branch. ─────────
+  {
+    const pages = Array.from({ length: DCS_BACKFILL_PAGE_LIMIT + 1 }, (_, i) => {
+      if (i !== DCS_BACKFILL_PAGE_LIMIT - 1) return fullPage(`p${i}`);
+      // The LAST fetched page: its oldest commit (index 49) is a merge with
+      // two parents, neither reachable from the other.
+      return Array.from({ length: 50 }, (_, j) =>
+        j === 49 ? commit("merge49", "Merge pull request '…' (#1) from x into master", "h@x", { parents: ["mainline-cont", "side-branch"] }) : commit(`q${j}`, "hand fix", "h@x"),
+      );
+    });
+    mockGitea(pages);
+    const db = mockDb(state("far-edge", ["near-edge"]));
+    const res = await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
+    assert(res.resolved === false && res.status === "page_cap", "still open — two new branches to walk, not zero");
+    const fr = frontierRun(db);
+    const next = JSON.parse(fr.args[2]);
+    assert(next.includes("mainline-cont") && next.includes("side-branch"), "both of the merge's parents enter the frontier");
+    assert(next.length === 2, "  ...and nothing else — the ORIGINAL single entry (near-edge) is fully consumed, not carried forward");
+  }
+
+  // ── a MULTI-entry frontier: only the FIRST entry is spent this tick; the
+  // rest wait untouched for a later tick (bounded per-tick budget) ────────
+  {
+    mockGitea([[commit("h1", "hand fix", "h@x"), commit("far-edge", "old", "h@x")]]);
+    const db = mockDb(state("far-edge", ["branch-a", "branch-b", "branch-c"]));
+    const res = await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
+    assert(res.resolved === false, "resolving branch-a alone does not close the whole gap — branch-b/c are still open");
+    const fr = frontierRun(db);
+    assert(JSON.parse(fr.args[2]).join(",") === "branch-b,branch-c", "branch-a is dropped (resolved); branch-b/c are carried forward untouched, in order");
+  }
+
+  // ── a bootstrap-shaped entry: gap_since_sha is never an ancestor of the
+  // chain being walked (see dcsCommitBackfill.ts's BOOTSTRAP GAPS), so the
+  // walk runs to history's end and resolves via source_sha_not_in_history —
+  // the same signal a force-pushed far edge would produce. ────────────────
   {
     mockGitea([[commit("root", "genesis", "h@x")]]);
-    const db = mockDb({ gap_since_sha: "never-an-ancestor", gap_from_sha: "root" });
+    const db = mockDb(state("never-an-ancestor", ["root"]));
     const res = await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
     assert(res.resolved === true && res.status === "source_sha_not_in_history", "reaching true history root resolves the gap too");
     assert(res.inserted === 1, "  ...having inserted the root commit itself");
     assert(clearRun(db), "  ...and clears the gap: nothing more exists below it to find");
   }
 
-  // ── page_cap where the oldest row IS a repo root (no parent): nowhere left
-  // to advance to, so resolve rather than retry a walk that can never move ──
+  // ── page_cap whose own sub-walk finds NO further parents (every visited
+  // row's parent is itself visited, or a root sits among them): nowhere left
+  // to advance to, so this entry resolves rather than retrying forever ────
   {
-    // One page beyond the budget so the server's own "more pages exist"
-    // signal stays true through the last FETCHED page — the walk stops on
-    // the BUDGET (page_cap), not on the server's own end-of-history — even
-    // though that fetched page's last commit happens to have no parent.
     const pages = Array.from({ length: DCS_BACKFILL_PAGE_LIMIT + 1 }, (_, i) =>
       i === DCS_BACKFILL_PAGE_LIMIT - 1 ? fullPage(`p${i}`, { lastParent: null }) : fullPage(`p${i}`),
     );
     mockGitea(pages);
-    const db = mockDb({ gap_since_sha: "far-edge", gap_from_sha: "near-edge" });
+    const db = mockDb(state("far-edge", ["near-edge"]));
     const res = await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
     assert(res.resolved === true && res.status === "reached_root", "a full page ending in a parentless commit resolves as reached_root");
     assert(clearRun(db), "  ...clearing the gap rather than looping on a frontier that cannot move");
   }
 
-  // ── transport failure: nothing resolved, nothing advanced, safe to retry ──
+  // ── transport failure: the frontier is put back EXACTLY as it was,
+  // current entry included — safe to retry, and untouched entries are not
+  // reordered or lost ───────────────────────────────────────────────────
   {
     globalThis.fetch = async () => {
       throw new Error("network");
     };
-    const db = mockDb({ gap_since_sha: "far-edge", gap_from_sha: "near-edge" });
+    const db = mockDb(state("far-edge", ["near-edge", "branch-b"]));
     const res = await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
     assert(res.resolved === false && res.status === "fetch_failed", "a thrown fetch reports fetch_failed, not a resolution");
-    assert(!clearRun(db) && !advanceRun(db), "  ...and touches neither gap column — the next tick retries the same range");
+    assert(!clearRun(db), "  ...and does not clear the gap");
+    const fr = frontierRun(db);
+    assert(!fr, "  ...nor does it write a new frontier — the row is left exactly as it was for the next tick to retry");
   }
 
   // ── D1's 100-statement batch cap is respected even at the backfill's own
@@ -218,7 +259,7 @@ async function main() {
   {
     const pages = [fullPage("x"), fullPage("y")];
     mockGitea(pages);
-    const db = mockDb({ gap_since_sha: "far-edge", gap_from_sha: "near-edge" });
+    const db = mockDb(state("far-edge", ["near-edge"]));
     await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
     assert(inserts(db).length === 100, "both full pages are inserted");
     assert(DCS_BACKFILL_PAGE_LIMIT * 50 > DCS_POLL_WRITE_BATCH, "  ...sanity: this scenario really does exceed one write-batch chunk");
@@ -227,7 +268,7 @@ async function main() {
   // ── ordering: inserts land oldest-first, same discipline as the poller ───
   {
     mockGitea([[commit("new", "hand fix", "h@x"), commit("old", "hand fix", "h@x")]]);
-    const db = mockDb({ gap_since_sha: "far-edge", gap_from_sha: "old-plus-one" });
+    const db = mockDb(state("far-edge", ["old-plus-one"]));
     await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
     const ins = inserts(db);
     assert(ins[0].args[1] === "old" && ins[1].args[1] === "new", "inserts go out oldest-first");
@@ -238,12 +279,6 @@ async function main() {
     globalThis.fetch = async () => {
       throw new Error("boom");
     };
-    const dbs = {};
-    const envs = {};
-    for (const repo of TRACKED_DCS_REPOS) {
-      dbs[repo] = mockDb(repo === "en_ult" ? { gap_since_sha: null, gap_from_sha: null } : { gap_since_sha: "g", gap_from_sha: "f" });
-      envs[repo] = { DB: dbs[repo] };
-    }
     // backfillDcsGaps takes ONE env, so exercise it against a single DB whose
     // `.first()` cycles through repos in TRACKED_DCS_REPOS order — mirroring
     // how the real cron entry point is called once per invocation with one
@@ -261,7 +296,7 @@ async function main() {
           },
           async first() {
             const repo = TRACKED_DCS_REPOS[callIndex++];
-            return repo === "en_ult" ? { gap_since_sha: null, gap_from_sha: null } : { gap_since_sha: "g", gap_from_sha: "f" };
+            return repo === "en_ult" ? state(null, null) : state("g", ["f"]);
           },
           async run() {
             return { success: true };
