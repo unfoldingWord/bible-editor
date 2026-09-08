@@ -12,8 +12,10 @@ import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import type { ChapterPayload, TnRow, TwlRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { DocColumn } from "./DocColumn";
+import { VerseBridgeButtons } from "./VerseBridgeButtons";
 import type { TextLaneCheck } from "../lib/laneChecks";
 import type { FindMatch } from "./FindReplaceOverlay";
+import { clearFindState, loadFindOpen, saveFindOpen } from "../lib/findState";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
@@ -256,14 +258,18 @@ function ScriptureColumnInner({
   const effectiveLocked = locked || bookLocked;
   const activeRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  const [findOpen, setFindOpen] = useState(false);
+  // Seed from sessionStorage so a Find left open when a chapter change
+  // remounts this column (useChapter nulls its payload → Shell's `!data` gate
+  // unmounts us) comes back open instead of vanishing. See ../lib/findState.
+  const [findOpen, setFindOpen] = useState(() => loadFindOpen(book));
   // A book lock still lets translators search a locked book (to compare past
   // work) — only replace is a hard freeze, since the writes would appear to
   // work and then fail (423) for every match. FindReplaceOverlay itself
   // disables its replace controls when `bookLocked` is set; find stays open.
   const openFind = useCallback(() => {
     setFindOpen(true);
-  }, []);
+    saveFindOpen(book, true);
+  }, [book]);
   const [findQuery, setFindQuery] = useState<FindQuery | null>(null);
   // Set only when the overlay reports a user-initiated scroll target; the
   // BookView's scroll effect (book mode) and the bodyRef scroll effect
@@ -288,6 +294,10 @@ function ScriptureColumnInner({
   // marks (otherwise the previous query lingers as highlights).
   const closeFind = useCallback(() => {
     setFindOpen(false);
+    // A deliberate close forgets the persisted open flag + typed query so the
+    // next Ctrl/Cmd+F starts fresh; an involuntary remount (chapter change)
+    // never calls this, so it keeps them and the bar reopens with the query.
+    clearFindState();
     setFindQuery(null);
     setFindScrollTarget(null);
   }, []);
@@ -402,6 +412,11 @@ function ScriptureColumnInner({
     () => (indexByVersion["UHB"] ?? indexByVersion["UGNT"])?.[activeVerse]?.content,
     [indexByVersion, activeVerse],
   );
+
+  // Verse-level comments are one thread per verse, so the badge lives on a
+  // single scripture column: ULT, or the leftmost enabled version when ULT is
+  // hidden. Keeps it from repeating across the parallel version columns.
+  const commentColumn = enabledVersions.includes("ULT") ? "ULT" : enabledVersions[0];
 
   return (
     <Box
@@ -567,6 +582,12 @@ function ScriptureColumnInner({
             verseCommentCounts={verseCommentCounts}
             onOpenVerseComments={onOpenVerseComments}
             onEditSection={onEditSection}
+            onMergeBridge={
+              onMergeVerseBridge ? (verseNum) => onMergeVerseBridge(chapter, verseNum, "UST") : undefined
+            }
+            onSplitBridge={
+              onSplitVerseBridge ? (verseNum) => onSplitVerseBridge(chapter, verseNum, "UST") : undefined
+            }
             locked={effectiveLocked}
           />
         ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onSaveBookVerse && onOpenBookAligner ? (
@@ -598,6 +619,8 @@ function ScriptureColumnInner({
               onEditSection={onEditBookSection}
               onMergeBridge={onMergeVerseBridge}
               onSplitBridge={onSplitVerseBridge}
+              verseCommentCounts={verseCommentCounts}
+              onOpenVerseComments={onOpenVerseComments}
               locked={effectiveLocked}
               textCheck={textCheck}
             />
@@ -649,6 +672,9 @@ function ScriptureColumnInner({
                   ? (verseNum, change, base) => onEditSection(verseNum, v, change, base)
                   : undefined
               }
+              // Verse-level comment badge — see commentColumn above.
+              verseCommentCounts={v === commentColumn ? verseCommentCounts : undefined}
+              onOpenVerseComments={v === commentColumn ? onOpenVerseComments : undefined}
               />
             ))}
           </Box>
@@ -739,6 +765,8 @@ function StackedBody({
   verseCommentCounts,
   onOpenVerseComments,
   onEditSection,
+  onMergeBridge,
+  onSplitBridge,
   locked,
 }: {
   book: string;
@@ -774,6 +802,11 @@ function StackedBody({
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  // Verse-bridge create/break for the active card's UST line. Chapter is fixed
+  // (stacked mode is always the current chapter), so these take just the verse.
+  // Absent for viewers / when editing is off.
+  onMergeBridge?: (verse: number) => void;
+  onSplitBridge?: (verse: number) => void;
   locked: boolean;
 }) {
   const ult = indexByVersion["ULT"] ?? EMPTY_COLUMN;
@@ -938,6 +971,16 @@ function StackedBody({
                   ustV && onEditSection
                     ? (change) => onEditSection(ustStart, "UST", change, ustV)
                     : undefined
+                }
+                verseEnd={ustV?.verse_end ?? null}
+                hasNextVerse={!!ust[(ustV?.verse_end ?? ustStart) + 1]}
+                onMergeBridge={
+                  // Bridges apply only to a real UST verse, never the chapter
+                  // intro (verse 0). Absent otherwise ⇒ no merge button.
+                  ustV && ustStart >= 1 ? onMergeBridge : undefined
+                }
+                onSplitBridge={
+                  ustV && ustStart >= 1 ? onSplitBridge : undefined
                 }
               />
               {uhbV && (
@@ -1224,6 +1267,10 @@ function ActiveLine({
   onEditSection,
   version,
   onRestoreVersion,
+  verseEnd,
+  hasNextVerse,
+  onMergeBridge,
+  onSplitBridge,
   lexiconMap,
   twl,
 }: {
@@ -1276,6 +1323,15 @@ function ActiveLine({
   // (alignment included) through the normal verse pipe. Wired only for editable
   // ULT/UST lines; the chip + dialog mount only when this is present.
   onRestoreVersion?: (content: unknown, plainText: string | null) => void;
+  // Verse-bridge create/break, rendered in this line's toolbar. Wired only for
+  // the editable UST line in the active card (bridges are UST-only). verseEnd
+  // marks a `\v a-b` range so the split button knows when to show; hasNextVerse
+  // gates the merge button off the chapter's last verse. Both callbacks absent
+  // for viewers / other versions ⇒ no bridge buttons.
+  verseEnd?: number | null;
+  hasNextVerse?: boolean;
+  onMergeBridge?: (verse: number) => void;
+  onSplitBridge?: (verse: number) => void;
   lexiconMap?: Map<string, LexiconEntry | null>;
   twl?: TwlRow[];
 }) {
@@ -1604,6 +1660,16 @@ function ActiveLine({
               <UndoIcon sx={{ fontSize: 22 }} />
             </IconButton>
           </Tooltip>
+        )}
+        {editable && !readOnly && (onMergeBridge || onSplitBridge) && (
+          <VerseBridgeButtons
+            verse={verseNum}
+            verseEnd={verseEnd ?? null}
+            active
+            hasNextVerse={!!hasNextVerse}
+            onMergeBridge={onMergeBridge}
+            onSplitBridge={onSplitBridge}
+          />
         )}
       </Stack>
       {editable && !readOnly && !rtl && (

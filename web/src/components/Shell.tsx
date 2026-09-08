@@ -221,6 +221,13 @@ interface Props {
   // clears both the `?c=` param and its own location state — Shell rewriting
   // the hash itself fired no hashchange, leaving App's state stale.
   onCommentConsumed?: () => void;
+  // Someone else's comment landed on this chapter's socket. App refetches the
+  // alert feed so a reply to a thread you are in reaches the bell at once
+  // instead of on the next poll.
+  onCommentActivity?: () => void;
+  // Root ids of the threads the comments popover is showing ([] when closed).
+  // App clears the alerts for threads the user is looking at.
+  onCommentThreadsViewed?: (rootIds: number[]) => void;
   // True once auth is confirmed ready (App's auth gate has minted/refreshed
   // the token). Gates the book-locks fetch — see useBookLocks.
   authReady?: boolean;
@@ -233,7 +240,7 @@ interface Props {
   syncWarnings?: ReactNode;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, authReady = false, notificationsMenu, syncWarnings }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, onCommentActivity, onCommentThreadsViewed, authReady = false, notificationsMenu, syncWarnings }: Props) {
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -445,7 +452,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
     // applyWsComment is a stable useCallback, so passing it straight through is
     // safe even though this handlers object isn't memoized.
-    onCommentUpdate: applyWsComment,
+    onCommentUpdate: (comment) => {
+      applyWsComment(comment);
+      if (comment.authorId !== meUserId) onCommentActivity?.();
+    },
     onPipelineApplied: (_book, _chapter, pipelineType) => {
       // This socket only carries events for the chapter in view, so any hint
       // that arrives is for the open chapter — offer a refresh. Covers
@@ -557,6 +567,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         : commentsIndex.threadsByRow.get(rowKey(commentTarget.rowKind, commentTarget.rowId));
     return list ?? EMPTY_COMMENT_THREADS;
   }, [commentTarget, commentsIndex]);
+
+  useEffect(() => {
+    onCommentThreadsViewed?.(commentTarget ? commentThreads.map((t) => t.root.id) : []);
+  }, [commentTarget, commentThreads, onCommentThreadsViewed]);
 
   // Memoized on the index so ScriptureColumn's comparator sees a NEW identity
   // exactly when comments changed (and a stable one otherwise — a fresh arrow
@@ -2128,10 +2142,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   // App keys Shell on book only, so a cross-chapter navigation (URL /
   // back-forward / TopBar / cross-chapter find) changes the chapter +
-  // initialVerse props WITHOUT remounting — useChapter keeps the prior
-  // chapter's data visible while the new payload loads, so there's no loading
-  // flash and find/book-view state survive. This effect does what the old
-  // remount used to: reset the per-chapter transient state. Keyed on
+  // initialVerse props WITHOUT remounting Shell itself. Note useChapter DOES
+  // null its payload on every (book, chapter) change (#531, to block editing
+  // stale content), so the `!data` gate below briefly unmounts ScriptureColumn
+  // and the Find overlay under it — Find survives that remount by reseeding
+  // from sessionStorage (see ../lib/findState), not by data being preserved.
+  // This effect does what the old remount used to: reset the per-chapter
+  // transient state. Keyed on
   // [chapter, initialVerse] — internal same-chapter verse selection sets
   // activeVerse directly without an URL push, so initialVerse doesn't change
   // and this won't clobber it. Skips the initial mount.
@@ -3101,7 +3118,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   // Break a verse bridge: split `verse` (a `\v a-b` row) back into separate
   // verses. All text stays in the first; the later verses become empty rows the
-  // translator fills in. Confirmed first because it moves text around.
+  // translator fills in. The user has already confirmed via the VerseBridgeButtons
+  // dialog by the time this runs.
   const splitVerseBridge = async (chapterNum: number, verse: number, bibleVersion: string) => {
     const byVersion = versesForChapterMap(chapterNum)?.[bibleVersion];
     const bridge = byVersion?.[verse];
@@ -3113,14 +3131,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       setBridgeToast("Save your edits to this verse before breaking the bridge.");
       return;
     }
-    const later = Array.from({ length: bridge.verse_end - bridge.verse }, (_i, k) => bridge.verse + 1 + k).join(", ");
-    if (
-      !window.confirm(
-        `Break bridge ${chapterNum}:${bridge.verse}-${bridge.verse_end}?\n\nAll the text stays in verse ${bridge.verse}; verse${later.includes(",") ? "s" : ""} ${later} will become empty for you to fill in.`,
-      )
-    ) {
-      return;
-    }
+    // The confirm now lives in VerseBridgeButtons' MUI dialog (consistent with
+    // merge, and no native window.confirm double-prompt).
     try {
       const res = await api.splitVerseBridge(book, chapterNum, verse, bibleVersion, bridge.version);
       if (chapterNum === chapter) applyLocalVerseSplit(res.verse, res.new_verses);
