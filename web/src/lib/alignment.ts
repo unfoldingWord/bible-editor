@@ -157,15 +157,20 @@ function isAlignmentWrapper(n: ParsedNode | undefined): boolean {
   const children = n["children"];
   return Array.isArray(children) && children.length > 0;
 }
-// \d (Psalm superscription) is `type:"section"` — not `type:"quote"`, so
-// isAlignmentWrapper can't cover it — but its content IS alignable verse
-// body (see highlight.ts's renderer special case). When it arrives with
+// \d (Psalm superscription) is not `type:"quote"`, so isAlignmentWrapper
+// can't cover it — but its content IS alignable verse body (see
+// highlight.ts's renderer special case). A real \d node usfm-js emits
+// carries NO `type` field at all; some shapes carry the legacy
+// `type:"section"` instead (#746 — the target-side gate here required
+// `type:"section"` and so never matched a real typeless \d, even though
+// the aligner's source-word walk already matched on tag alone). Match on
+// tag regardless of type so both shapes work. When it arrives with
 // children, descend like a \qs wrapper so the inner zaln / word nodes
 // enter the alignment stream; a childless \d (bare marker or text-only)
 // stays opaque and rides along verbatim.
 function isPsalmTitleWrapper(n: ParsedNode | undefined): boolean {
   if (!n || typeof n !== "object") return false;
-  if (n["type"] !== "section" || n["tag"] !== "d") return false;
+  if (n["tag"] !== "d") return false;
   const children = n["children"];
   return Array.isArray(children) && children.length > 0;
 }
@@ -828,10 +833,13 @@ function collectAlignerSourceWords(verseObjects: unknown[]): CollectedSourceWord
         });
       } else if (
         o["type"] === "milestone" ||
-        // \d (Psalm superscription) is type:"section" but its content IS
-        // alignable verse body — descend like a milestone so its \w tokens
-        // are covered. Mirrors collectMilestoneRuns in highlight.ts.
-        (o["type"] === "section" && o["tag"] === "d")
+        // \d (Psalm superscription) content IS alignable verse body —
+        // descend like a milestone so its \w tokens are covered. Mirrors
+        // isPsalmTitleWrapper / collectMilestoneRuns in highlight.ts. A real
+        // \d node usfm-js emits carries NO `type` field; some shapes carry
+        // the legacy `type:"section"` instead — match on tag alone so both
+        // are covered (#746).
+        o["tag"] === "d"
       ) {
         walkSrc((o["children"] as unknown[] | undefined) ?? []);
       }
