@@ -42,5 +42,14 @@ t("non-numeric garbage is rejected", () => {
   assert.equal(isValidTwlRefRaw("abc", 3), false);
   assert.equal(isValidTwlRefRaw("3:5a", 3), false);
 });
+t("a verse above Number.MAX_SAFE_INTEGER is rejected, not silently rounded", () => {
+  assert.equal(isValidTwlRefRaw("3:9007199254740993", 3), false);
+});
+t("a chapter above Number.MAX_SAFE_INTEGER is rejected, not silently rounded", () => {
+  assert.equal(isValidTwlRefRaw("9007199254740993:5", 9007199254740993), false);
+});
+t("a wildly oversized verse (parseInt -> Infinity) is rejected", () => {
+  assert.equal(isValidTwlRefRaw(`3:${"9".repeat(400)}`, 3), false);
+});
 
 console.log(`${passed} passed`);

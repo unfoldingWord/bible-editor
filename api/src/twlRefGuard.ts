@@ -27,5 +27,16 @@ export function isValidTwlRefRaw(refRaw: string, currentChapter: number): boolea
   if (!m) return false;
   const chapter = parseInt(m[1], 10);
   const verse = parseInt(m[2], 10);
-  return chapter === currentChapter && chapter > 0 && verse > 0;
+  // An all-digit verse/chapter above Number.MAX_SAFE_INTEGER still passes a
+  // bare `> 0` check, but parseInt has already rounded it — the numeric
+  // column would then diverge from ref_raw's original (unrounded) text,
+  // recreating the exact torn-row shape this guard exists to prevent. Guard
+  // on a safe, bounded integer rather than trusting the regex's \d+ alone.
+  return (
+    Number.isSafeInteger(chapter) &&
+    Number.isSafeInteger(verse) &&
+    chapter === currentChapter &&
+    chapter > 0 &&
+    verse > 0
+  );
 }
