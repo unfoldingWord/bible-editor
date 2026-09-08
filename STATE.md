@@ -416,6 +416,18 @@ Highlights that bite repeatedly:
   order; milestones come out NFC. Skipping this silently breaks alignment matching.
 - **`usfm-js` parks leading punctuation/markers on the node's `text`** — markers can carry text; opening
   quotes after a marker live on the marker node, not as a sibling.
+- **A real `\d` (Psalm superscription) node from `usfm-js@3.5.0` never carries a `type` field, and — measured
+  directly against the repo's pinned version, not assumed — when `\zaln-s`/`\w` alignment markup follows `\d`
+  on the same or next line, `usfm-js` does NOT nest that markup as `\d`'s `children`: `\d` parses to a bare
+  `{tag:"d", nextChar}` marker chip, and the zaln milestones become ordinary top-level SIBLINGS after it in the
+  same `verseObjects` array (only a `\d` with no other markup — plain-text title only — gets `{tag:"d", text}`).
+  Fixed in #746/#747: `isPsalmTitleWrapper` and `collectAlignerSourceWords`'s `\d` branch in `alignment.ts` now
+  match on `tag==="d"` alone (dropping a `type==="section"` requirement neither shape ever satisfies). Left
+  unresolved: the pre-existing `type:"section", tag:"d", children:[<zaln>, …]` wrapper shape modeled throughout
+  `alignment.ts`/`highlight.ts` (`isAcrosticHeading`-style helpers, Case 29/30 in `alignment.test.mjs`) does not
+  match either real shape just described — worth an explicit re-verification against actual DCS-fetched Psalm
+  content (door43/D1 access this session didn't have) before trusting that any `\d` alignment/highlight code
+  path is exercised by real content rather than only by its own synthetic test fixtures.
 - **Export USFM puts punctuation outside `\w` (`\w earth\w*.`) on purpose** — correct uW form, not churn; don't "fix" it.
 
 - **Chapter-front `\p` can pile up +1 per nightly export (EZK 8/11, 2026-07).** bp-assistant's out-of-band
