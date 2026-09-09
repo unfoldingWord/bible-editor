@@ -77,13 +77,20 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 // Same for 'adopt_no_visible_change' (issue #633): both sides moved by stableKey
 // but plain text and alignment groups match, so the write is cosmetic — audit
 // only, never a banner claiming Door43 replaced the editor's work.
+// 'keep_local_structure' (issue #728) is a fourth kept-D1 action: the nightly
+// sync kept D1's verse-bridge STRUCTURE (a `\v a-b` row, or its split) where
+// master's differs — reasons master_moved_non_human, master_structure_complex,
+// master_moved_under_local_bridge, or anchor_<merge action>. Like the other
+// keep actions it has no CAS write, so it joins their overwritten_version→NULL
+// and re-detection reactivation carve-outs below. This list is duplicated in
+// the two CLEAR_* statements — keep all three in step.
 //
 // Binds, in order: (book, resource).
 // ---------------------------------------------------------------------------
 export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment, detected_at
      FROM verse_merge_conflicts
     WHERE book = ?1 AND resource = ?2
-      AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master')
+      AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master', 'keep_local_structure')
       AND resolved_at IS NULL
     ORDER BY chapter ASC, verse ASC`;
 
@@ -109,7 +116,7 @@ export const CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL = `DELETE FROM system_aler
     WHERE source = ?1 AND dismissed_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
                        WHERE book = ?2 AND resource = ?3
-                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master')
+                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master', 'keep_local_structure')
                          AND resolved_at IS NULL)`;
 
 // Binds, in order: (username, source, book, resource).
@@ -117,7 +124,7 @@ export const CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `DELETE FROM system_alerts
     WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
                        WHERE book = ?3 AND resource = ?4
-                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master')
+                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master', 'keep_local_structure')
                          AND resolved_at IS NULL)`;
 
 // ---------------------------------------------------------------------------
@@ -204,15 +211,34 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- 'adopt_no_visible_change' (issue #633) is treated like 'adopt' here: it
      -- is audit-only and must not erase a prior adopt_conflict's recovery
      -- pointer / banner claim.
+     -- 'keep_local_structure' (issue #728 review) joins the carve-out for an
+     -- UNRESOLVED adopt_conflict only. It is a STRUCTURE-dimension flag that
+     -- can land on a verse whose CONTENT-dimension adopt_conflict (an earlier
+     -- night's real overwrite) is still waiting for a human; unlike the three
+     -- content-path keep actions below, it does not supersede that decision,
+     -- so it must not replace the pointer the human still needs. A RESOLVED
+     -- adopt_conflict is deliberately not held sticky: the reactivation
+     -- carve-out at the bottom clears resolved_at for keep_local_structure
+     -- (no CAS race can make it lie), and doing that on a row still labelled
+     -- adopt_conflict would be exactly the false "Door43 replaced your edit"
+     -- reactivation two-phase adoption exists to prevent.
      action = CASE
        WHEN excluded.action IN ('adopt', 'adopt_no_visible_change')
          AND verse_merge_conflicts.action = 'adopt_conflict'
+       THEN verse_merge_conflicts.action
+       WHEN excluded.action = 'keep_local_structure'
+         AND verse_merge_conflicts.action = 'adopt_conflict'
+         AND verse_merge_conflicts.resolved_at IS NULL
        THEN verse_merge_conflicts.action
        ELSE excluded.action
      END,
      reason = CASE
        WHEN excluded.action IN ('adopt', 'adopt_no_visible_change')
          AND verse_merge_conflicts.action = 'adopt_conflict'
+       THEN verse_merge_conflicts.reason
+       WHEN excluded.action = 'keep_local_structure'
+         AND verse_merge_conflicts.action = 'adopt_conflict'
+         AND verse_merge_conflicts.resolved_at IS NULL
        THEN verse_merge_conflicts.reason
        ELSE excluded.reason
      END,
@@ -225,7 +251,13 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- across a resolve -> new-conflict cycle on the SAME verse — worth a
      -- follow-up if that combination turns out to matter in practice.
      overwritten_version = CASE
-       WHEN excluded.action IN ('keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master') THEN NULL
+       -- Same unresolved-adopt_conflict carve-out as action above: the row
+       -- stays an adopt_conflict, so its recovery pointer stays with it.
+       WHEN excluded.action = 'keep_local_structure'
+         AND verse_merge_conflicts.action = 'adopt_conflict'
+         AND verse_merge_conflicts.resolved_at IS NULL
+       THEN verse_merge_conflicts.overwritten_version
+       WHEN excluded.action IN ('keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master', 'keep_local_structure') THEN NULL
        ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
      END,
      alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),
@@ -268,7 +300,7 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- production always supplies one for all three of these actions (see
      -- verseMergeConflicts.ts's recordVerseMergeConflicts).
      resolved_at = CASE
-       WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master')
+       WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master', 'keep_local_structure')
          AND (?11 IS NULL OR ?11 = (
            SELECT version FROM verses WHERE book = ?1 AND bible_version = ?10 AND chapter = ?3 AND verse = ?4
          ))
@@ -276,7 +308,7 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
        ELSE verse_merge_conflicts.resolved_at
      END,
      resolved_by = CASE
-       WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master')
+       WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master', 'keep_local_structure')
          AND (?11 IS NULL OR ?11 = (
            SELECT version FROM verses WHERE book = ?1 AND bible_version = ?10 AND chapter = ?3 AND verse = ?4
          ))

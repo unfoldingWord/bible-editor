@@ -106,8 +106,9 @@
 //    one route that still recognizes a future bot pushing under an author
 //    BOT_EMAILS does not know (see the constant's own note) — but do not
 //    credit it with doing work today. (issue #612)
-//    RE-MEASURED 2026-08-30 (issue #647), asking the narrower question note 4
-//    left open: not "does AI_MARKER fire on a non-revert subject" (it can, by
+//    RE-DERIVED 2026-08-30 from note 4's own count (issue #647) — not a fresh
+//    corpus scan; see below — asking the narrower question note 4 left open:
+//    not "does AI_MARKER fire on a non-revert subject" (it can, by
 //    construction — the regex has no author or revert check) but "has it EVER
 //    fired on the shape that would actually hurt", i.e. a human's own edit
 //    message that happens to quote the marker outside a revert (the issue's
@@ -118,13 +119,29 @@
 //    about, and — independently — Gitea's path-scoped history simplification
 //    drops every one of the 339 before this classifier ever sees it. So the
 //    measured count of "non-bot, non-revert, marker-quoting, classifier-
-//    visible" commits across the full 46,802-commit corpus is ZERO, and per
-//    this issue's own decision rule ("if that count is 0 ... the decision is
-//    leave it, with the number written down") the answer is: leave AI_MARKER
-//    as a bare subject match, do not add an author check. An author check
-//    would also cost something real — it is the one route that still catches
-//    an UNKNOWN future bot (see the constant's own comment) — so paying that
-//    cost against a shape that has never once occurred is the wrong trade.
+//    visible" commits across the full 46,802-commit corpus is ZERO.
+//    THE TWO NUMBERS, STATED TOGETHER so a future reader does not mistake the
+//    0 above for an error against the issue's own 339: issue #647's LITERAL
+//    query — AI_MARKER matches the subject, author is non-bot, subject is
+//    non-revert, nothing else — is exactly the 339 already cited two
+//    sentences up (every one of them is `Merge pull request …`-shaped, which
+//    passes all three of those filters). The 0 is that SAME 339 run through
+//    two more filters this note actually needs answered: subject shape is
+//    "ordinary sentence" rather than `Merge pull request …`, AND the commit
+//    is path-scoped (i.e. classifier-visible — merge commits never are, per
+//    note 4). Both filters, independently, already eliminate all 339 (see
+//    the two clauses just above), so the two counts are not in tension: the
+//    0 is not a different corpus or a stricter reading of the same query, it
+//    is the literal 339 with two more named filters applied, and PR #655's
+//    own commit message records exactly that derivation rather than a fresh
+//    scan — hence RE-DERIVED, not RE-MEASURED, above.
+//    And per this issue's own decision rule ("if that count is 0 ... the
+//    decision is leave it, with the number written down") the answer is:
+//    leave AI_MARKER as a bare subject match, do not add an author check. An
+//    author check would also cost something real — it is the one route that
+//    still catches an UNKNOWN future bot (see the constant's own comment) —
+//    so paying that cost against a shape that has never once occurred is the
+//    wrong trade.
 //    masterLineage.test.mjs pins the residual gap this leaves (a non-bot,
 //    non-revert subject that quotes the marker still classifies `ai`) so it
 //    stays visible rather than silently relied upon; re-open this note the day

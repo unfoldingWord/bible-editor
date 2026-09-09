@@ -16,6 +16,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { applyVerseRowsForTest } from "./bookReimport.ts";
+import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
+import { SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL, UPSERT_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictSql.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -49,9 +51,14 @@ function makeDb(sqlite) {
     },
   });
   const batchCalls = { count: 0, sizes: [] };
+  // `_beforeBatch` hooks see each batch's statements before they run — the
+  // #728 review cases use one to land a concurrent PATCH-like write (or throw)
+  // between applyVerseRows's read and a specific write batch.
+  const beforeBatch = [];
   return {
     prepare: (sql) => mk(sql, []),
     async batch(stmts) {
+      for (const h of beforeBatch) h(stmts);
       batchCalls.count++;
       batchCalls.sizes.push(stmts.length);
       const out = [];
@@ -59,6 +66,7 @@ function makeDb(sqlite) {
       return out;
     },
     _batchCalls: batchCalls,
+    _beforeBatch: beforeBatch,
   };
 }
 
@@ -155,6 +163,55 @@ console.log("\n[a lost UPDATE race (updated_by set between read and write) is no
     .prepare("SELECT COUNT(*) AS n FROM edit_log WHERE kind = 'verse' AND action = 'update' AND book = ?")
     .all(BOOK)[0];
   eq(logRow.n, 0, "no phantom restorable version was logged for the write that never landed");
+}
+
+console.log("\n[a not-yet-exported D1 verse bridge is not corrupted by the pre-export reimport]");
+{
+  // The verse-bridge feature stores 5:1-2 as ONE row (verse=1, verse_end=2) and
+  // deletes the standalone verse-2 row — but the bridge isn't on Door43 master
+  // until the next export, so master still carries SEPARATE verses 1 and 2. The
+  // reconcile must NOT reinsert verse 2 (that would emit overlapping `\v 1-2` +
+  // `\v 2` in the nightly USFM) nor adopt master's un-bridged verse-1 text over
+  // the bridge. See the bridgeCover guard in applyVerseRows.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 5, 1, 2, ?, ?, ?, 3, 7)`,
+    )
+    .run(BOOK, VERSION, contentJson("combined one two"), "combined one two");
+  const master = [
+    verse(5, 1, "master verse one"),   // covered by the bridge → must be skipped
+    verse(5, 2, "master verse two"),   // absorbed → must NOT be reinserted
+    verse(5, 3, "master verse three"), // uncovered new verse → must reinsert normally
+  ];
+
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, master, null, null, false);
+
+  const v2 = sqlite
+    .prepare("SELECT COUNT(*) AS n FROM verses WHERE book=? AND bible_version=? AND chapter=5 AND verse=2")
+    .all(BOOK, VERSION);
+  eq(v2[0].n, 0, "master's plain verse 2 was NOT reinserted beside the bridge");
+
+  const bridge = sqlite
+    .prepare("SELECT verse_end, content_json, version FROM verses WHERE book=? AND bible_version=? AND chapter=5 AND verse=1")
+    .all(BOOK, VERSION)[0];
+  eq(bridge.verse_end, 2, "bridge still spans 1-2");
+  eq(JSON.parse(bridge.content_json).verseObjects[0].text, "combined one two", "bridge content not clobbered by master's un-bridged verse 1");
+  eq(bridge.version, 3, "bridge version not bumped");
+
+  const v3 = sqlite
+    .prepare("SELECT content_json FROM verses WHERE book=? AND bible_version=? AND chapter=5 AND verse=3")
+    .all(BOOK, VERSION);
+  eq(v3.length, 1, "an uncovered missing verse (5:3) still reinserts — the guard stays narrow");
+  eq(JSON.parse(v3[0].content_json).verseObjects[0].text, "master verse three", "5:3 got master's content");
+  eq(counts.inserted, 1, "only the uncovered verse counted inserted (the two bridge-covered verses were skipped, not written)");
+  // Issue #728: with no watermark (cutoff null) the planner cannot tell a local
+  // bridge from an exported one — the skip above is the fail-safe, and it is
+  // COUNTED so "never classified" is never indistinguishable from "agreed".
+  eq(counts.structure_unclassified, 1, "…and the skipped component is counted structure_unclassified (#728)");
+  eq(counts.structure_overlap, 0, "…leaving the chapter structurally clean");
 }
 
 console.log("\n[a plain no-op (nothing changed) is still counted skipped_noop, not inserted/updated]");
@@ -1369,6 +1426,750 @@ console.log("\n[#609: a REAL master change on an AI-only verse still re-seeds an
   eq(row.version, 4, "the version DOES move");
   eq(row.content_json, realChange, "…master's bytes landed");
   eq(row.updated_by, null, "…and the verse is reclaimed to master-owned, exactly as before this guard");
+}
+
+// ── Issue #727: bridge-aware reimport guards ─────────────────────────────────
+
+console.log("\n[#727: a chapter left with overlapping verse ranges trips structure_overlap and the watermark gate refuses]");
+{
+  // Seed the corrupt shape directly: a pristine `1-2` bridge beside a pristine
+  // standalone verse 2 in the same chapter. Nothing in the reimport's own diff
+  // fixes this (master's verse 2 is bridge-covered and skipped), so the ONLY
+  // thing standing between it and `\v 1-2` + `\v 2` on Door43 is the post-apply
+  // structural check.
+  const { env, sqlite } = freshEnv();
+  const ins = sqlite.prepare(
+    `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+     VALUES (?, 30, ?, ?, ?, ?, ?, 1, NULL)`,
+  );
+  ins.run(BOOK, 1, 2, VERSION, contentJson("bridged one two"), "bridged one two");
+  ins.run(BOOK, 2, null, VERSION, contentJson("stray two"), "stray two");
+
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, [verse(30, 3, "verse three")], null, null, false);
+  eq(counts.inserted, 1, "the unrelated verse 3 still lands — the check is a post-apply audit, not a write refusal");
+  eq(counts.structure_overlap, 1, "the overlapping pair (1-2 ∩ 2) is counted once");
+  eq(shouldRecordResourceSync(counts), false, "…and the watermark gate refuses to stamp this run's counts");
+
+  // Control: the same chapter with a bridge and a non-overlapping neighbour.
+  const clean = freshEnv();
+  const ins2 = clean.sqlite.prepare(
+    `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+     VALUES (?, 30, ?, ?, ?, ?, ?, 1, NULL)`,
+  );
+  ins2.run(BOOK, 1, 2, VERSION, contentJson("bridged one two"), "bridged one two");
+  ins2.run(BOOK, 3, null, VERSION, contentJson("three"), "three");
+  const cleanCounts = await applyVerseRowsForTest(clean.env, BOOK, VERSION, [verse(30, 4, "verse four")], null, null, false);
+  eq(cleanCounts.structure_overlap, 0, "adjacent, non-intersecting ranges (1-2, 3, 4) are not an overlap");
+  eq(shouldRecordResourceSync(cleanCounts), true, "…and the gate stamps a structurally clean run");
+}
+
+console.log("\n[#727: a verse whose newest edit_log row is a 'bridge' (source NULL) is human-owned, not AI-only]");
+{
+  // History: the AI pipeline wrote v2 ('update', source ai_pipeline), then a
+  // human bridged it with verse 2 ('bridge', source NULL, v3), and the bridge
+  // has since been exported, so master carries `1-2` too. Tonight a maintainer
+  // corrected the bridged text on Door43. The ownership sub-select used to see
+  // only create/update, so the bridge row was invisible: the newest visible row
+  // was the AI 'update', the verse classified AI-only and took the wholesale
+  // re-seed path (master's bytes in, updated_by → NULL) instead of the
+  // human-owned merge/skip path. (Master carrying a PLAIN verse 1 here would
+  // never reach this classification — the bridgeCover skip from PR #721 drops
+  // it first — so the master row must itself be the bridge to test ownership.)
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 707, 'ai-writer')`).run();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  const bridged = contentJson("bridged one and two");
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 12, 1, 2, ?, ?, 'bridged one and two', 3, 1)`,
+    )
+    .run(BOOK, VERSION, bridged);
+  const key = `${BOOK}/12/1/${VERSION}`;
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+       VALUES ('verse', ?, ?, 7, 1, 2, 'update', ?, 'ai_pipeline', 100)`,
+    )
+    .run(key, BOOK, JSON.stringify({ plain_text: "ai one", content: contentJson("ai one") }));
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+       VALUES ('verse', ?, ?, 1, 2, 3, 'bridge', ?, NULL, 200)`,
+    )
+    .run(key, BOOK, JSON.stringify({ content: JSON.parse(bridged), verse_end: 2 }));
+
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 1, verseEnd: 2, contentJson: contentJson("master's corrected one and two"), plainText: "master's corrected one and two" }],
+    null, null, false,
+  );
+
+  eq(counts.reimported_ai, 0, "NOT re-seeded as AI-only");
+  eq(counts.skipped_edited, 1, "classified human-owned and left alone (no watermark → no merge attempt)");
+  eq(counts.inserted, 0, "nothing inserted");
+  const row = sqlite
+    .prepare("SELECT content_json, verse_end, version, updated_by FROM verses WHERE book = ? AND chapter = 12 AND verse = 1 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.verse_end, 2, "the bridge survives");
+  eq(row.version, 3, "…unbumped");
+  eq(row.content_json, bridged, "…with its bridged content intact");
+  eq(row.updated_by, 1, "…still owned by the translator");
+}
+
+console.log("\n[#727: a 'bridge' edit_log payload at/below the boundary is recoverable as the merge ancestor]");
+{
+  // Same shape as the #537 baseline case, but the ONLY pre-watermark
+  // content-bearing history for this verse is the 'bridge' row a human wrote
+  // (payload carries the full bridged content at that version). Pre-#727 the
+  // base_payload sub-select filtered to create/update, so this verse was
+  // permanently keep_no_base even though a perfectly good ancestor existed.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  const bridged = contentJson("bridged five and six");
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 7, 5, 6, ?, ?, 'bridged five and six', 4, 1)`,
+    )
+    .run(BOOK, VERSION, bridged);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 1, 3, 4, 'bridge', ?, 500)`,
+    )
+    .run(`${BOOK}/7/5/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(bridged), verse_end: 6 }));
+
+  // Master already carries the exported bridge (5-6) and a maintainer corrected
+  // its text out-of-band on Door43.
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 7, verse: 5, verseEnd: 6, contentJson: contentJson("master's corrected five and six"), plainText: "master's corrected five and six" }],
+    null,
+    { confirmedAt: 1000, editId: null },
+    false,
+  );
+
+  eq(counts.merge_no_base, 0, "NOT keep_no_base — the bridge row is a real ancestor");
+  eq(counts.merge_adopted, 1, "master's out-of-band correction is adopted");
+  const row = sqlite
+    .prepare("SELECT content_json, verse_end, version FROM verses WHERE book = ? AND chapter = 7 AND verse = 5 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(JSON.parse(row.content_json).verseObjects[0].text, "master's corrected five and six", "…and landed");
+  eq(row.verse_end, 6, "the bridge grouping is preserved through the adoption");
+  eq(row.version, 5, "the adoption wrote a new version");
+}
+
+console.log("\n[#727: a verse absent from D1 is recreated ABOVE its edit_log high-water, never at version 1]");
+{
+  // A verse that once existed (and reached version 7 through edits, a bridge
+  // and a split) is gone from D1 — the bridge→split lifecycle deletes and
+  // re-mints rows — and tonight master still carries it. The reimport INSERT
+  // used to take the column default (1) and log new_version = 1, so a stale
+  // `If-Match: 1` in a tab's outbox would pass CAS against the recreated row.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  const key = `${BOOK}/40/1/${VERSION}`;
+  const log = sqlite.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+     VALUES ('verse', ?, ?, 1, ?, ?, ?, '{}', ?)`,
+  );
+  log.run(key, BOOK, null, 1, "create", 100);
+  log.run(key, BOOK, 1, 2, "update", 110);
+  log.run(key, BOOK, 2, 3, "update", 120);
+  log.run(key, BOOK, 3, 4, "update", 130);
+  log.run(key, BOOK, 4, 5, "update", 140);
+  log.run(key, BOOK, 5, 6, "bridge", 150);
+  log.run(key, BOOK, 6, 7, "split", 160);
+  const before = sqlite.prepare("SELECT COUNT(*) AS n FROM edit_log WHERE row_key = ?").all(key)[0].n;
+
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, [verse(40, 1, "recreated text")], null, null, false);
+
+  eq(counts.inserted, 1, "the absent verse is inserted");
+  const row = sqlite
+    .prepare("SELECT version, content_json FROM verses WHERE book = ? AND chapter = 40 AND verse = 1 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.version, 8, "version starts strictly above the edit_log high-water (7), not at the column default");
+  const audit = sqlite
+    .prepare("SELECT action, prev_version, new_version FROM edit_log WHERE row_key = ? ORDER BY id DESC LIMIT 1")
+    .all(key)[0];
+  eq(audit.action, "create", "the audit row is a 'create'");
+  eq(audit.new_version, 8, "…whose new_version matches the row's actual version");
+  eq(audit.prev_version, null, "…with no predecessor version");
+  eq(
+    sqlite.prepare("SELECT COUNT(*) AS n FROM edit_log WHERE row_key = ?").all(key)[0].n,
+    before + 1,
+    "exactly one audit row added",
+  );
+
+  // Control: a verse with NO history still starts at 1.
+  const fresh = await applyVerseRowsForTest(env, BOOK, VERSION, [verse(40, 2, "brand new")], null, null, false);
+  eq(fresh.inserted, 1, "a never-seen verse inserts");
+  const row2 = sqlite
+    .prepare("SELECT version FROM verses WHERE book = ? AND chapter = 40 AND verse = 2 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row2.version, 1, "…at version 1 when edit_log holds nothing for it");
+  const audit2 = sqlite
+    .prepare("SELECT new_version FROM edit_log WHERE row_key = ? ORDER BY id DESC LIMIT 1")
+    .all(`${BOOK}/40/2/${VERSION}`)[0];
+  eq(audit2.new_version, 1, "…and its audit row says 1 too");
+}
+
+// ── Issue #728: verse-bridge STRUCTURE reconciled as its own dimension ────────
+//
+// Shared fixtures for the T1–T6 cases from the issue. `cutoff.editId` is the
+// edit_log id boundary master is confirmed to hold (book_resource_syncs.
+// master_confirmed_edit_id); every case seeds its edit_log rows and captures
+// that boundary explicitly so "above" / "below" is exact, not timing-based.
+const HUMAN_LINEAGE_728 = {
+  mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+  counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+};
+const AI_ONLY_LINEAGE_728 = {
+  mayHoldHumanEdit: false, hasHumanCommit: false, incomplete: false, incompleteReason: "",
+  counts: { ours: 1, ai: 2, human: 0 }, humanShas: [],
+};
+const CH = 21;
+const key728 = (v) => `${BOOK}/${CH}/${v}/${VERSION}`;
+const bridgedVerse = (chapter, start, end, text) => ({
+  chapter, verse: start, verseEnd: end, contentJson: contentJson(text), plainText: text,
+});
+const insertVerse728 = (sqlite, { verse, verseEnd = null, text, version = 1, updatedBy = null }) =>
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(BOOK, CH, verse, verseEnd, VERSION, contentJson(text), text, version, updatedBy);
+const insertLog728 = (sqlite, { verse, action, prev, next, payload, source = null, userId = 7, createdAt = 100 }) =>
+  Number(
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+         VALUES ('verse', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(key728(verse), BOOK, userId, prev, next, action, JSON.stringify(payload), source, createdAt).lastInsertRowid,
+  );
+const rows728 = (sqlite) =>
+  sqlite
+    .prepare(
+      `SELECT verse, verse_end, content_json, plain_text, version, updated_by, last_change_action
+         FROM verses WHERE book = ? AND bible_version = ? AND chapter = ? ORDER BY verse`,
+    )
+    .all(BOOK, VERSION, CH)
+    .map((r) => ({ ...r, text: JSON.parse(r.content_json).verseObjects[0].text }));
+const conflicts728 = (sqlite) =>
+  sqlite
+    .prepare(
+      `SELECT verse, action, reason, overwritten_version FROM verse_merge_conflicts
+        WHERE book = ? AND resource = ? AND chapter = ? ORDER BY verse`,
+    )
+    .all(BOOK, VERSION.toLowerCase(), CH);
+const logs728 = (sqlite, verse) =>
+  sqlite
+    .prepare(`SELECT action, prev_version, new_version, payload_json, source FROM edit_log WHERE row_key = ? ORDER BY id`)
+    .all(key728(verse));
+// Every #728 case must leave the chapter structurally clean: the guards PR's
+// post-apply check must never fire on a run this planner shaped.
+const assertClean728 = (counts, label) => {
+  eq(counts.structure_overlap, 0, `${label}: structure_overlap never fires`);
+  eq(counts.errors, [], `${label}: no batch errors`);
+};
+
+// A verse-bridge exported and confirmed on master: the 'bridge' row on the
+// start key and the 'delete' row on the absorbed key both sit AT/BELOW the
+// boundary. Returns the boundary id.
+function seedExportedBridge(sqlite, { startText = "combined one two", startVersion = 3 } = {}) {
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, verseEnd: 2, text: startText, version: startVersion, updatedBy: 7 });
+  insertLog728(sqlite, { verse: 1, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("verse one")) }, source: "dcs_reimport", userId: null, createdAt: 10 });
+  insertLog728(sqlite, { verse: 2, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("verse two")) }, source: "dcs_reimport", userId: null, createdAt: 10 });
+  insertLog728(sqlite, { verse: 1, action: "update", prev: 1, next: 2, payload: { content: JSON.parse(contentJson("verse one edited")) }, createdAt: 20 });
+  insertLog728(sqlite, { verse: 2, action: "update", prev: 1, next: 2, payload: { content: JSON.parse(contentJson("verse two edited")) }, createdAt: 20 });
+  insertLog728(sqlite, { verse: 1, action: "bridge", prev: 2, next: 3, payload: { content: JSON.parse(contentJson(startText)), verse_end: 2 }, createdAt: 30 });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "delete", prev: 2, next: null, payload: { content: JSON.parse(contentJson("verse two edited")), absorbed_into: 1 }, createdAt: 30 });
+  return boundary;
+}
+
+console.log("\n[#728 T1: a LOCAL bridge (structural rows above the boundary) is kept; master's plain rows are skipped and a moved absorbed text is flagged]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, verseEnd: 2, text: "combined one two", version: 3, updatedBy: 7 });
+  // Ancestors master is confirmed to hold: verse 1 "verse one", verse 2 "verse two".
+  insertLog728(sqlite, { verse: 1, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("verse one")) }, source: "dcs_reimport", userId: null, createdAt: 10 });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("verse two")) }, source: "dcs_reimport", userId: null, createdAt: 10 });
+  // The bridge happened AFTER the confirmed render: structural rows above the boundary.
+  insertLog728(sqlite, { verse: 1, action: "bridge", prev: 2, next: 3, payload: { content: JSON.parse(contentJson("combined one two")), verse_end: 2 }, createdAt: 300 });
+  insertLog728(sqlite, { verse: 2, action: "delete", prev: 1, next: null, payload: { content: JSON.parse(contentJson("verse two")), absorbed_into: 1 }, createdAt: 300 });
+
+  const master = [
+    verse(CH, 1, "verse one"),                 // unchanged on master → hidden by the bridge, no flag
+    verse(CH, 2, "master changed verse two"),  // MOVED on master under our unexported bridge → flag
+    verse(CH, 3, "verse three"),               // uncovered → inserts normally
+  ];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  const rows = rows728(sqlite);
+  eq(rows.map((r) => [r.verse, r.verse_end, r.text, r.version]), [[1, 2, "combined one two", 3], [3, null, "verse three", 1]],
+    "the local bridge is kept intact and verse 2 is NOT reinserted; 3 still inserts");
+  eq(counts.structure_kept_local, 1, "the component is counted structure_kept_local");
+  eq(counts.structure_adopted, 0, "…not adopted");
+  eq(counts.structure_refused, 0, "…not refused");
+  eq(counts.structure_unclassified, 0, "…and not unclassified (a watermark exists)");
+  eq(counts.inserted, 1, "only verse 3 inserted");
+  eq(conflicts728(sqlite), [{ verse: 2, action: "keep_local_structure", reason: "master_moved_under_local_bridge", overwritten_version: null }],
+    "master's moved verse-2 text (differs from the bridge's 'delete' payload) is flagged on verse 2 only");
+  assertClean728(counts, "T1");
+}
+
+console.log("\n[#728 T2: an EXPORTED bridge that a human un-bridged on Door43 is split to match master]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedExportedBridge(sqlite);
+  const master = [verse(CH, 1, "master verse one"), verse(CH, 2, "master verse two")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  const rows = rows728(sqlite);
+  eq(rows.map((r) => [r.verse, r.verse_end, r.text]), [[1, null, "master verse one"], [2, null, "master verse two"]],
+    "D1 now holds master's two plain verses");
+  eq(rows[0].version, 4, "the start row's version bumped once");
+  eq(rows[0].last_change_action, "sync_split", "…stamped as a Door43-driven split");
+  eq((rows[1]?.version ?? 0) > 2, true, `verse 2 is recreated ABOVE its edit_log high-water (2), got ${rows[1]?.version}`);
+  eq(rows[1]?.last_change_action, "sync_split", "…and carries the same structural provenance");
+  const l1 = logs728(sqlite, 1).slice(-1)[0];
+  eq([l1.action, l1.prev_version, l1.new_version], ["update", 3, 4], "start row audit: update 3 → 4");
+  const l2 = logs728(sqlite, 2).slice(-1)[0];
+  eq([l2?.action, l2?.prev_version, l2?.new_version], ["create", null, rows[1]?.version], "recreated row audit: create at its minted version");
+  eq(counts.structure_adopted, 1, "the component is counted structure_adopted");
+  eq(counts.merge_adopted, 1, "the start row went through the normal merge and adopted cleanly");
+  eq(counts.structure_kept_local, 0, "not kept local");
+  eq(counts.structure_refused, 0, "not refused");
+  eq(conflicts728(sqlite).map((c) => [c.verse, c.action]), [[1, "adopt"]], "a clean adopt audit row on the start verse, nothing on 2");
+  assertClean728(counts, "T2");
+}
+
+console.log("\n[#728 T2b: …but when the lineage PROVES no human moved master, the bridge is kept and flagged]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedExportedBridge(sqlite);
+  const master = [verse(CH, 1, "bot verse one"), verse(CH, 2, "bot verse two")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: AI_ONLY_LINEAGE_728 }, false,
+  );
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.text, r.version]), [[1, 2, "combined one two", 3]], "the bridge is untouched");
+  eq(counts.structure_refused, 1, "counted structure_refused");
+  eq(counts.structure_adopted, 0, "…not adopted");
+  eq(counts.merge_refused, 0, "…and NOT folded into merge_refused (that freezes the export at 5)");
+  eq(conflicts728(sqlite), [{ verse: 1, action: "keep_local_structure", reason: "master_moved_non_human", overwritten_version: null }],
+    "a keep_local_structure / master_moved_non_human flag on the start verse");
+  assertClean728(counts, "T2b");
+}
+
+console.log("\n[#728 T3: an exported bridge a human ALSO edited in the app since, un-bridged on Door43: structure adopted, content flagged adopt_conflict]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedExportedBridge(sqlite);
+  // App edit above the boundary (source NULL = human).
+  insertLog728(sqlite, { verse: 1, action: "update", prev: 3, next: 4, payload: { content: JSON.parse(contentJson("combined one two, app-edited")) }, createdAt: 400 });
+  sqlite.prepare(`UPDATE verses SET content_json = ?, plain_text = ?, version = 4 WHERE book = ? AND chapter = ? AND verse = 1 AND bible_version = ?`)
+    .run(contentJson("combined one two, app-edited"), "combined one two, app-edited", BOOK, CH, VERSION);
+  const master = [verse(CH, 1, "master verse one"), verse(CH, 2, "master verse two")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  const rows = rows728(sqlite);
+  eq(rows.map((r) => [r.verse, r.verse_end, r.text]), [[1, null, "master verse one"], [2, null, "master verse two"]], "master's structure and text adopted");
+  eq(rows[0].version, 5, "start row bumped from 4 to 5");
+  const c = conflicts728(sqlite);
+  eq(c.map((x) => [x.verse, x.action, x.overwritten_version]), [[1, "adopt_conflict", 4]],
+    "adopt_conflict on the start verse with the overwritten version as the recovery pointer");
+  eq(counts.structure_adopted, 1, "structure counted adopted");
+  eq(counts.merge_conflicts, 1, "…and the content collision counted as a merge conflict");
+  assertClean728(counts, "T3");
+}
+
+console.log("\n[#728 T4: master BRIDGED two pristine D1 verses (human lineage): D1's second row is absorbed, never left overlapping]");
+{
+  const { env, sqlite } = freshEnv();
+  insertVerse728(sqlite, { verse: 1, text: "one" });
+  insertVerse728(sqlite, { verse: 2, text: "two" });
+  insertVerse728(sqlite, { verse: 3, text: "three" });
+  const boundary = insertLog728(sqlite, { verse: 3, action: "create", prev: null, next: 1, payload: {}, source: "dcs_reimport", userId: null });
+  const master = [bridgedVerse(CH, 1, 2, "one two"), verse(CH, 3, "three")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  const rows = rows728(sqlite);
+  eq(rows.map((r) => [r.verse, r.verse_end, r.text, r.version]), [[1, 2, "one two", 2], [3, null, "three", 1]],
+    "one `1-2` row carrying master's text; D1's standalone 2 is gone; 3 untouched");
+  eq(rows[0].last_change_action, "sync_bridge", "the start row is stamped as a Door43-driven bridge");
+  const del = logs728(sqlite, 2).slice(-1)[0];
+  eq([del?.action, del?.prev_version, del?.new_version], ["delete", 1, null], "the absorbed row's 'delete' audit row mirrors the bridge route");
+  const payload = JSON.parse(del?.payload_json ?? "{}");
+  eq(payload.content?.verseObjects?.[0]?.text, "two", "…and carries the absorbed content so the text stays recoverable");
+  eq(payload.absorbed_into, 1, "…naming the row that absorbed it");
+  eq(del?.source, "dcs_reimport", "…attributed to the sync, not to a human");
+  eq(counts.structure_adopted, 1, "counted structure_adopted");
+  eq(counts.updated, 1, "the pristine start row counted updated");
+  eq(counts.skipped_noop, 1, "verse 3 is a no-op");
+  eq(conflicts728(sqlite), [], "no review flag: nothing human-owned was overwritten");
+  assertClean728(counts, "T4");
+}
+
+console.log("\n[#728 T4b: an absorbed row a human edited since the render is deleted WITH an adopt_conflict recovery pointer]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, text: "one" });
+  insertVerse728(sqlite, { verse: 2, text: "two, app-edited", version: 2, updatedBy: 7 });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("two")) }, source: "dcs_reimport", userId: null });
+  insertLog728(sqlite, { verse: 2, action: "update", prev: 1, next: 2, payload: { content: JSON.parse(contentJson("two, app-edited")) }, createdAt: 400 });
+  const master = [bridgedVerse(CH, 1, 2, "one two")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.text]), [[1, 2, "one two"]], "absorbed into one `1-2` row");
+  eq(conflicts728(sqlite), [{ verse: 2, action: "adopt_conflict", reason: "structure_absorbed_human_edit", overwritten_version: 2 }],
+    "the absorbed human-edited row leaves an adopt_conflict pointer at its last version");
+  eq(counts.structure_adopted, 1, "counted structure_adopted");
+  eq(counts.merge_conflicts, 1, "…and one live merge conflict for the reviewer");
+  assertClean728(counts, "T4b");
+}
+
+console.log("\n[#728 T5: D1 SPLIT a bridge after the export ('split' row above the boundary) while master still carries it: D1 keeps its plain rows]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, text: "one two", version: 3, updatedBy: 7 });
+  insertVerse728(sqlite, { verse: 2, text: "\n", version: 1, updatedBy: 7 });
+  const boundary = insertLog728(sqlite, { verse: 1, action: "bridge", prev: 1, next: 2, payload: { content: JSON.parse(contentJson("one two")), verse_end: 2 }, createdAt: 10 });
+  insertLog728(sqlite, { verse: 1, action: "split", prev: 2, next: 3, payload: { content: JSON.parse(contentJson("one two")), verse_end: null }, createdAt: 300 });
+  insertLog728(sqlite, { verse: 2, action: "create", prev: null, next: 1, payload: {}, createdAt: 300 });
+  const master = [bridgedVerse(CH, 1, 2, "one two")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.version]), [[1, null, 3], [2, null, 1]], "both plain rows untouched, verse_end stays NULL");
+  eq(counts.structure_kept_local, 1, "counted structure_kept_local");
+  eq([counts.updated, counts.inserted, counts.merge_adopted, counts.reimported_ai], [0, 0, 0, 0], "nothing written");
+  assertClean728(counts, "T5");
+}
+
+console.log("\n[#728 T6: with NO watermark the structure cannot be classified: keep D1, skip covered master rows, count structure_unclassified]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, verseEnd: 2, text: "combined one two", version: 3, updatedBy: 7 });
+  const master = [verse(CH, 1, "master verse one"), verse(CH, 2, "master verse two"), verse(CH, 3, "three")];
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, master, null, null, false);
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.text, r.version]), [[1, 2, "combined one two", 3], [3, null, "three", 1]], "bridge kept, 2 not reinserted, 3 inserted");
+  eq(counts.structure_unclassified, 1, "counted structure_unclassified");
+  eq(counts.structure_kept_local, 0, "…not as kept_local (no evidence either way)");
+  eq(conflicts728(sqlite), [], "no flag without a watermark to compare against");
+  assertClean728(counts, "T6");
+}
+
+console.log("\n[#728: a component that is neither a pure bridge nor a pure split is refused, flagged, and left structurally intact]");
+{
+  const { env, sqlite } = freshEnv();
+  insertVerse728(sqlite, { verse: 1, verseEnd: 2, text: "one two" });
+  insertVerse728(sqlite, { verse: 3, text: "three" });
+  const boundary = insertLog728(sqlite, { verse: 3, action: "create", prev: null, next: 1, payload: {}, source: "dcs_reimport", userId: null });
+  // Master re-bridged differently: 1 | 2-3. Adopting would need a shrink AND a delete AND an insert at once.
+  const master = [verse(CH, 1, "one"), bridgedVerse(CH, 2, 3, "two three")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.version]), [[1, 2, 1], [3, null, 1]], "nothing written");
+  eq(counts.structure_refused, 1, "counted structure_refused");
+  eq(conflicts728(sqlite).map((c) => [c.verse, c.action, c.reason]), [[1, "keep_local_structure", "master_structure_complex"]], "flagged on the component's first verse");
+  assertClean728(counts, "complex");
+}
+
+console.log("\n[#728: an exported bridge master still carries is structurally AGREED — the normal content merge runs on it]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedExportedBridge(sqlite);
+  const master = [bridgedVerse(CH, 1, 2, "master's corrected one two")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.text, r.version]), [[1, 2, "master's corrected one two", 4]], "content adopted, bridge kept");
+  eq([counts.structure_adopted, counts.structure_kept_local, counts.structure_refused, counts.structure_unclassified], [0, 0, 0, 0], "no structural decision was needed");
+  eq(counts.merge_adopted, 1, "the ordinary merge adopted master's text");
+  assertClean728(counts, "agreed");
+}
+
+console.log("\n[#727 follow-up: a verse whose ONLY history is a bridge's 'delete' row is recreated ABOVE the deleted version]");
+{
+  // Imported at v1 (the bootstrap import writes no edit_log rows), never
+  // PATCHed, then absorbed by an in-app bridge: verses.ts logs the absorbed row
+  // as 'delete' with new_version NULL and the deleted version in prev_version.
+  // verseVersionFloorSql used to take MAX(new_version) — NULL here — and mint
+  // the recreated row at 1, the very version the deleted row held, so a stale
+  // `If-Match: 1` in a tab's outbox would have passed CAS against it.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  const key = `${BOOK}/41/5/${VERSION}`;
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 41, 5, NULL, ?, ?, 'five', 1, NULL)`,
+    )
+    .run(BOOK, VERSION, contentJson("five"));
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 1, 1, NULL, 'delete', ?, 100)`,
+    )
+    .run(key, BOOK, JSON.stringify({ content: JSON.parse(contentJson("five")), absorbed_into: 4 }));
+  sqlite.prepare(`DELETE FROM verses WHERE book = ? AND chapter = 41 AND verse = 5 AND bible_version = ?`).run(BOOK, VERSION);
+
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, [verse(41, 5, "five again")], null, null, false);
+  eq(counts.inserted, 1, "the absent verse is inserted");
+  const row = sqlite
+    .prepare("SELECT version FROM verses WHERE book = ? AND chapter = 41 AND verse = 5 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.version, 2, "version 2: strictly above the deleted row's v1, read from the 'delete' row's prev_version");
+  const audit = sqlite
+    .prepare("SELECT action, new_version FROM edit_log WHERE row_key = ? ORDER BY id DESC LIMIT 1")
+    .all(key)[0];
+  eq([audit.action, audit.new_version], ["create", 2], "…and the 'create' audit row agrees");
+}
+
+console.log("\n[#728 T2 (delete-only history): the verse a split recreates is minted above the version its 'delete' row records]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, verseEnd: 2, text: "combined one two", version: 2, updatedBy: 7 });
+  // Verse 2's WHOLE history is the bridge's 'delete' row (imported, never edited, absorbed).
+  insertLog728(sqlite, { verse: 1, action: "bridge", prev: 1, next: 2, payload: { content: JSON.parse(contentJson("combined one two")), verse_end: 2 }, createdAt: 30 });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "delete", prev: 1, next: null, payload: { content: JSON.parse(contentJson("verse two")), absorbed_into: 1 }, createdAt: 30 });
+  const master = [verse(CH, 1, "master verse one"), verse(CH, 2, "master verse two")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  const rows = rows728(sqlite);
+  eq(rows.map((r) => [r.verse, r.verse_end, r.text, r.version]), [[1, null, "master verse one", 3], [2, null, "master verse two", 2]],
+    "verse 2 comes back at 2 (above the deleted v1), not at the column default");
+  const l2 = logs728(sqlite, 2).slice(-1)[0];
+  eq([l2?.action, l2?.new_version], ["create", 2], "…and its audit row says 2");
+  eq(counts.structure_adopted, 1, "structure adopted");
+  assertClean728(counts, "T2 delete-only");
+}
+
+console.log("\n[#728 T2 (aligned words): un-bridging on Door43 is NOT read as an alignment loss on the start row]");
+{
+  // The bridge carries both verses' aligned words; master's verse 1 alone
+  // carries half of them. Verse-to-verse, rule 4 of computeVerseMerge would call
+  // that alignment_shrink and refuse (and five such refusals freeze the export).
+  // The planner hands the merge master's rows over the WHOLE bridge range for
+  // the alignment question (theirsForAlignment), so nothing is "lost".
+  const w = (text) => ({ type: "word", tag: "w", text, occurrence: "1", occurrences: "1" });
+  const zaln = (strong, children) => ({ type: "milestone", tag: "zaln", strong, occurrence: "1", occurrences: "1", content: strong, children });
+  const tree = (vos) => JSON.stringify({ verseObjects: vos });
+  const bridged = tree([zaln("H1", [w("one")]), { type: "text", text: " " }, zaln("H2", [w("two")])]);
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, ?, 1, 2, ?, ?, 'one two', 3, 7)`,
+    )
+    .run(BOOK, CH, VERSION, bridged);
+  insertLog728(sqlite, { verse: 1, action: "bridge", prev: 2, next: 3, payload: { content: JSON.parse(bridged), verse_end: 2 }, createdAt: 30 });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "delete", prev: 2, next: null, payload: { content: { verseObjects: [zaln("H2", [w("two")])] }, absorbed_into: 1 }, createdAt: 30 });
+  const master = [
+    { chapter: CH, verse: 1, verseEnd: null, contentJson: tree([zaln("H1", [w("one")])]), plainText: "one" },
+    { chapter: CH, verse: 2, verseEnd: null, contentJson: tree([zaln("H2", [w("two")])]), plainText: "two" },
+  ];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  eq(counts.merge_refused, 0, "no alignment refusal");
+  eq(counts.merge_adopted, 1, "the start row adopted master's verse 1 cleanly");
+  eq(counts.structure_adopted, 1, "…and the structure followed");
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.plain_text]), [[1, null, "one"], [2, null, "two"]], "two plain aligned verses");
+  eq(conflicts728(sqlite).map((c) => [c.verse, c.action]), [[1, "adopt"]], "a clean adopt audit row, no keep_alignment_refused");
+  assertClean728(counts, "T2 aligned");
+}
+
+console.log("\n[#728: same words, different grouping — a keep_converged anchor still has its structure adopted]");
+{
+  // D1's bridge holds exactly master's verse-1 text (verse 2 was empty when
+  // bridged); master split it back into 1 + an empty 2. The content merge sees
+  // ours == theirs (keep_converged) and stages nothing — but the grouping DID
+  // change, and leaving it would revert Door43's split on export.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, verseEnd: 2, text: "one", version: 3, updatedBy: 7 });
+  insertLog728(sqlite, { verse: 1, action: "bridge", prev: 2, next: 3, payload: { content: JSON.parse(contentJson("one")), verse_end: 2 }, createdAt: 30 });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "delete", prev: 1, next: null, payload: { content: JSON.parse(contentJson("\n")), absorbed_into: 1 }, createdAt: 30 });
+  const master = [verse(CH, 1, "one"), verse(CH, 2, "\n")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.text, r.version]), [[1, null, "one", 4], [2, null, "\n", 2]], "1 un-bridged, 2 recreated");
+  eq(counts.structure_adopted, 1, "structure adopted");
+  eq(counts.merge_adopted, 0, "…without claiming a content adoption (the words did not change)");
+  eq(conflicts728(sqlite), [], "…and nothing for a human to review");
+  assertClean728(counts, "converged");
+}
+
+// ── #728 review findings ──────────────────────────────────────────────────────
+// Step 7s's structure batch is the one whose statements carry the sync_bridge /
+// sync_split provenance on a verses UPDATE.
+const isStructureBatch728 = (stmts) =>
+  stmts.some((s) => /UPDATE verses/.test(s.sql) && s.args.some((a) => a === "sync_bridge" || a === "sync_split"));
+
+console.log("\n[#728 review F1: a lost anchor CAS on a PRISTINE bridge adoption taints apply_incomplete, so the watermark is withheld and Door43's restructure is retried]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, text: "one" });
+  insertVerse728(sqlite, { verse: 2, text: "two" });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "create", prev: null, next: 1, payload: {}, source: "dcs_reimport", userId: null });
+  // A PATCH lands on the absorbed row between the planner's read and the 7s batch.
+  env.DB._beforeBatch.push((stmts) => {
+    if (!isStructureBatch728(stmts)) return;
+    sqlite.prepare(`UPDATE verses SET version = version + 1, content_json = ?, plain_text = ?, updated_by = 7 WHERE book = ? AND chapter = ? AND verse = 2`)
+      .run(contentJson("two, edited"), "two, edited", BOOK, CH);
+  });
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [bridgedVerse(CH, 1, 2, "one two")], null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.text, r.version]), [[1, null, "one", 1], [2, null, "two, edited", 2]],
+    "the anchor's guarded UPDATE wrote nothing: both plain rows stand, the concurrent edit intact");
+  eq(counts.skipped_edited, 1, "counted skipped_edited (an honest lost race)");
+  eq(counts.structure_adopted, 0, "…not adopted");
+  eq(counts.apply_incomplete, true, "…AND apply_incomplete: master's bridge did not land, so the watermark must be withheld for the retry");
+  assertClean728(counts, "review F1");
+}
+
+console.log("\n[#728 review F2: when conflict recording fails, a PRISTINE anchor's absorbed human-edited row is NOT deleted (no pointer could have been left for it)]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, text: "one" });
+  insertVerse728(sqlite, { verse: 2, text: "two, app-edited", version: 2, updatedBy: 7 });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("two")) }, source: "dcs_reimport", userId: null });
+  insertLog728(sqlite, { verse: 2, action: "update", prev: 1, next: 2, payload: { content: JSON.parse(contentJson("two, app-edited")) }, createdAt: 400 });
+  // Step 6b's speculative conflict upsert (the structure_absorbed_human_edit
+  // pointer for verse 2) fails; recordVerseMergeConflicts returns false.
+  env.DB._beforeBatch.push((stmts) => {
+    if (stmts.some((s) => s.sql === UPSERT_VERSE_MERGE_CONFLICT_SQL)) throw new Error("simulated D1 failure on conflict upsert");
+  });
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [bridgedVerse(CH, 1, 2, "one two")], null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.text, r.version]), [[1, null, "one", 1], [2, null, "two, app-edited", 2]],
+    "nothing structural was written: the human-edited row 2 survives for the retry to re-detect");
+  eq(logs728(sqlite, 2).map((l) => l.action), ["create", "update"], "…and no 'delete' audit row was written for it");
+  eq(conflicts728(sqlite), [], "no pointer exists (the upsert failed) — which is exactly why the row must stay");
+  eq(counts.merge_record_failed, true, "merge_record_failed is set, withholding the watermark");
+  eq(counts.structure_adopted, 0, "not counted adopted");
+  eq(counts.updated, 0, "…nor updated");
+  eq(counts.skipped_edited, 1, "the skipped component is counted skipped_edited");
+  eq(counts.errors.some((e) => /structure-adoption batch skipped/.test(e)), true, "…and reported in errors");
+  eq(counts.structure_overlap, 0, "review F2: structure_overlap never fires");
+}
+
+console.log("\n[#728 review F3: an absorbed row's structure_absorbed_human_edit pointer is CONFIRMED when its DELETE lands, so a previously resolved conflict on that verse becomes visible again]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, text: "one" });
+  insertVerse728(sqlite, { verse: 2, text: "two, app-edited", version: 2, updatedBy: 7 });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("two")) }, source: "dcs_reimport", userId: null });
+  insertLog728(sqlite, { verse: 2, action: "update", prev: 1, next: 2, payload: { content: JSON.parse(contentJson("two, app-edited")) }, createdAt: 400 });
+  // An earlier night's adopt_conflict on verse 2, resolved by a human.
+  sqlite.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, last_recorded_at, resolved_at, resolved_by)
+     VALUES (?, 'ult', ?, 2, 'adopt_conflict', 'both_changed', 1, 50, 50, 60, 7)`,
+  ).run(BOOK, CH);
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [bridgedVerse(CH, 1, 2, "one two")], null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+  );
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.text]), [[1, 2, "one two"]], "absorbed into one `1-2` row");
+  const row = sqlite
+    .prepare(`SELECT action, reason, overwritten_version, resolved_at, resolved_by FROM verse_merge_conflicts WHERE book = ? AND resource = 'ult' AND chapter = ? AND verse = 2`)
+    .all(BOOK, CH)[0];
+  eq([row.action, row.reason], ["adopt_conflict", "structure_absorbed_human_edit"], "the pointer row carries tonight's reason");
+  eq([row.resolved_at, row.resolved_by], [null, null], "…and is CONFIRMED (resolved_at/resolved_by cleared) because the DELETE landed");
+  // The upsert keeps the EARLIEST pointer across a resolve → new-conflict cycle
+  // (verseMergeConflictSql.ts's documented "known narrower follow-on"); what this
+  // case guards is visibility, not which of the two versions the pointer names.
+  eq(row.overwritten_version, 1, "the recovery pointer is present (earliest-pointer rule, documented)");
+  eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult").map((r) => [r.verse, r.action]), [[2, "adopt_conflict"]],
+    "…so the banner's active-conflict filter (the real constant) shows it");
+  eq(counts.structure_adopted, 1, "counted structure_adopted");
+  assertClean728(counts, "review F3");
+}
+
+console.log("\n[#728 review F4: master_moved_under_local_bridge fires for the bridge's START verse when it was imported and never edited — ancestor from the bridge audit's start_before]");
+{
+  // Bootstrap import writes no edit_log rows, so verse 1 has no create/update
+  // row at or below the boundary (base_payload NULL). The bridge route now
+  // stores `start_before` (the start row's content before the merge) on its
+  // 'bridge' audit row; that is verse 1's last published state here.
+  const seed = (sqlite) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+    insertVerse728(sqlite, { verse: 1, verseEnd: 2, text: "one two", version: 2, updatedBy: 7 });
+    const boundary = insertLog728(sqlite, { verse: 9, action: "create", prev: null, next: 1, payload: {}, source: "dcs_reimport", userId: null, createdAt: 10 });
+    insertLog728(sqlite, {
+      verse: 1, action: "bridge", prev: 1, next: 2, createdAt: 300,
+      payload: { content: JSON.parse(contentJson("one two")), verse_end: 2, start_before: JSON.parse(contentJson("one")) },
+    });
+    insertLog728(sqlite, { verse: 2, action: "delete", prev: 1, next: null, payload: { content: JSON.parse(contentJson("two")), absorbed_into: 1 }, createdAt: 300 });
+    return boundary;
+  };
+  {
+    const { env, sqlite } = freshEnv();
+    const boundary = seed(sqlite);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(CH, 1, "master moved one"), verse(CH, 2, "two"), verse(CH, 9, "nine")], null,
+      { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+    );
+    eq(rows728(sqlite).map((r) => [r.verse, r.verse_end, r.text]), [[1, 2, "one two"], [9, null, "nine"]], "the local bridge is kept; 9 inserts (above its #727 floor)");
+    eq(rows728(sqlite)[0].version, 2, "…untouched");
+    eq(counts.structure_kept_local, 1, "counted structure_kept_local");
+    eq(conflicts728(sqlite), [{ verse: 1, action: "keep_local_structure", reason: "master_moved_under_local_bridge", overwritten_version: null }],
+      "master's moved START-verse text (differs from the bridge's start_before) is flagged on verse 1");
+    assertClean728(counts, "review F4 moved");
+  }
+  {
+    const { env, sqlite } = freshEnv();
+    const boundary = seed(sqlite);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(CH, 1, "one"), verse(CH, 2, "two"), verse(CH, 9, "nine")], null,
+      { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+    );
+    eq(counts.structure_kept_local, 1, "kept local again");
+    eq(conflicts728(sqlite), [], "…and an UNCHANGED master verse 1 is not flagged");
+    assertClean728(counts, "review F4 unchanged");
+  }
+  {
+    // An EXPORTED bridge (its 'bridge' row at/below the boundary) whose
+    // component is local only through a later split elsewhere must not use
+    // its pre-merge text as the ancestor of a master range that still agrees.
+    const { env, sqlite } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+    insertVerse728(sqlite, { verse: 1, verseEnd: 2, text: "one two", version: 2, updatedBy: 7 });
+    insertLog728(sqlite, {
+      verse: 1, action: "bridge", prev: 1, next: 2, createdAt: 30,
+      payload: { content: JSON.parse(contentJson("one two")), verse_end: 2, start_before: JSON.parse(contentJson("one")) },
+    });
+    const boundary = insertLog728(sqlite, { verse: 2, action: "delete", prev: 1, next: null, payload: { content: JSON.parse(contentJson("two")), absorbed_into: 1 }, createdAt: 30 });
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [bridgedVerse(CH, 1, 2, "one two")], null, { confirmedAt: 200, editId: boundary, lineage: HUMAN_LINEAGE_728 }, false,
+    );
+    eq(counts.structure_kept_local, 0, "an agreed exported bridge is not a kept-local component");
+    eq(conflicts728(sqlite), [], "…and start_before is never consulted for it");
+    assertClean728(counts, "review F4 exported");
+  }
 }
 
 if (failed > 0) {

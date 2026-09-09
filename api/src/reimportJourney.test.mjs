@@ -41,6 +41,7 @@ import { fileURLToPath } from "node:url";
 import {
   accountOwnPublishDeclineForTest,
   applyTsvRows,
+  applyVerseRowsForTest,
   clearResolvedMergeNoBaseForTest,
   recordResourceSync,
   recordWithheldSyncIfAbsent,
@@ -50,6 +51,7 @@ import {
 import { contentPatchClearClauses } from "./contentPatchClauses.ts";
 import { lintTqRows } from "./lint.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
+import { BRIDGE_DELETE_NEXT_SQL, BRIDGE_UPDATE_START_SQL } from "./verseBridge.ts";
 
 // ── Hermetic clock ─────────────────────────────────────────────────────────
 // Every merge_no_base / auto-clear block below seeds its walk windows RELATIVE
@@ -3765,6 +3767,114 @@ console.log("\n[merge_kept retire: standing flags come down, D1-only, and nothin
     2,
     "…and adds no audit rows",
   );
+}
+
+// ── Issue #728 journey: bridge in the app → export confirms → un-bridged on ──
+// Door43 → the reimport splits D1 to match and the watermark advances.
+//
+// Drives the REAL route SQL for the bridge (verseBridge.ts's constants, the
+// exact four-statement batch verses.ts issues, edit_log rows with NULL source),
+// the REAL book_resource_syncs columns the export stamps, and the REAL
+// applyVerseRows. This is the HIGH row of the #728 table — before #728 the
+// bridgeCover skip fired here and the human's Door43 un-bridge was silently
+// reverted by the next export.
+console.log("\n[#728 journey: an exported bridge a human un-bridged on Door43 is split back, and the watermark moves]");
+{
+  const { env, sqlite } = freshEnv();
+  const CH = 3;
+  const ULT = "ULT";
+  const text = (t) => JSON.stringify({ verseObjects: [{ type: "text", text: t }] });
+  const rows = () =>
+    sqlite
+      .prepare(`SELECT verse, verse_end, plain_text, version, last_change_action FROM verses WHERE book = ? AND bible_version = ? AND chapter = ? ORDER BY verse`)
+      .all(BOOK, ULT, CH);
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  // (1) Imported plain verses — the bootstrap import writes no edit_log rows.
+  const ins = sqlite.prepare(
+    `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version)
+     VALUES (?, ?, ?, NULL, ?, ?, ?, 1)`,
+  );
+  ins.run(BOOK, CH, 1, ULT, text("one"), "one");
+  ins.run(BOOK, CH, 2, ULT, text("two"), "two");
+
+  // (2) A translator bridges 1+2 in the app — verses.ts's batch, verbatim shape.
+  const merged = JSON.stringify({ verseObjects: [{ type: "text", text: "one" }, { type: "text", text: " " }, { type: "text", text: "two" }] });
+  const startKey = `${BOOK}/${CH}/1/${ULT}`;
+  const nextKey = `${BOOK}/${CH}/2/${ULT}`;
+  const up = sqlite
+    .prepare(BRIDGE_UPDATE_START_SQL)
+    .run(merged, 2, 1000, 7, "bridge", "user", "translator", BOOK, CH, 1, ULT, 1, 2, 1, "one two");
+  sqlite.prepare(BRIDGE_DELETE_NEXT_SQL).run(BOOK, CH, 2, ULT);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+       SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'bridge', ?6 WHERE changes() > 0`,
+    )
+    .run(startKey, BOOK, 7, 1, 2, JSON.stringify({ content: JSON.parse(merged), verse_end: 2 }));
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+       SELECT 'verse', ?1, ?2, ?3, ?4, NULL, 'delete', ?5 WHERE changes() > 0`,
+    )
+    .run(nextKey, BOOK, 7, 1, JSON.stringify({ content: JSON.parse(text("two")), absorbed_into: 1 }));
+  eq(up.changes, 1, "the in-app bridge landed");
+  eq(rows().map((r) => [r.verse, r.verse_end, r.version]), [[1, 2, 2]], "D1 holds one 1-2 row at v2");
+
+  // (3) The export ships it and is later CONFIRMED on master: the boundary is
+  // MAX(edit_log.id) at that export's D1 read (exportWorkflow.ts buildResource
+  // → recordPushedRender), stamped with master_confirmed_at.
+  const boundary = sqlite.prepare(`SELECT MAX(id) AS m FROM edit_log`).get().m;
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin, master_confirmed_at, master_confirmed_edit_id)
+       VALUES (?, 'ult', 'sha-before', ?, 'export', ?, ?)`,
+    )
+    .run(BOOK, Math.floor(FIXED_NOW_MS / 1000) - 3600, Math.floor(FIXED_NOW_MS / 1000) - 3600, boundary);
+
+  // (4) A human un-bridges on Door43 (their commit is in the lineage), and the
+  // nightly reimport arrives with the watermark read the way getMasterConfirmedAt does.
+  const wm = sqlite
+    .prepare(`SELECT master_confirmed_at, master_confirmed_edit_id FROM book_resource_syncs WHERE book = ? AND resource = 'ult'`)
+    .get(BOOK);
+  const cutoff = { confirmedAt: wm.master_confirmed_at, editId: wm.master_confirmed_edit_id, lineage: HUMAN_LINEAGE };
+  const master = [
+    { chapter: CH, verse: 1, verseEnd: null, contentJson: text("one, corrected"), plainText: "one, corrected" },
+    { chapter: CH, verse: 2, verseEnd: null, contentJson: text("two"), plainText: "two" },
+  ];
+  const counts = await applyVerseRowsForTest(env, BOOK, ULT, master, null, cutoff, false);
+
+  eq(rows().map((r) => [r.verse, r.verse_end, r.plain_text, r.version, r.last_change_action]),
+    [[1, null, "one, corrected", 3, "sync_split"], [2, null, "two", 2, "sync_split"]],
+    "D1 is split back to master's two verses; 2 comes back ABOVE its deleted v1");
+  eq(counts.structure_adopted, 1, "one structural adoption");
+  eq(counts.merge_adopted, 1, "the start row's text adopted through the ordinary merge");
+  eq(counts.structure_overlap, 0, "the chapter is structurally clean");
+  eq(counts.apply_incomplete ?? false, false, "nothing was left half-applied");
+  eq(counts.errors, [], "no batch errors");
+  const audit2 = sqlite.prepare(`SELECT action, prev_version, new_version FROM edit_log WHERE row_key = ? ORDER BY id`).all(nextKey);
+  eq(audit2.map((a) => [a.action, a.prev_version, a.new_version]), [["delete", 1, null], ["create", null, 2]],
+    "verse 2's history: absorbed by the app, recreated by the sync above the deleted version");
+  const flags = sqlite.prepare(`SELECT verse, action FROM verse_merge_conflicts WHERE book = ? AND resource = 'ult' ORDER BY verse`).all(BOOK);
+  eq(flags, [{ verse: 1, action: "adopt" }], "a clean adopt audit row on the start verse only");
+
+  // (5) The watermark advances: the gate accepts these counts and the stored
+  // row records the new SHA as a reimport.
+  eq(shouldRecordResourceSync(counts), true, "the sync gate accepts the run");
+  await recordResourceSync(env, BOOK, "ult", "sha-after", "reimport");
+  const stored = sqlite.prepare(`SELECT source_sha, origin FROM book_resource_syncs WHERE book = ? AND resource = 'ult'`).get(BOOK);
+  eq([stored.source_sha, stored.origin], ["sha-after", "reimport"], "…and the stored watermark moved");
+
+  // (6) The next night finds both sides agreeing and writes nothing. Verse 1
+  // stays translator-owned after the adoption (step 7 leaves updated_by set on
+  // purpose), so it routes through the merge as keep_converged → skipped_edited;
+  // the recreated verse 2 is master-owned and a plain skipped_noop.
+  const again = await applyVerseRowsForTest(env, BOOK, ULT, master, null, cutoff, false);
+  eq(
+    [again.skipped_noop, again.skipped_edited, again.updated, again.inserted, again.merge_adopted, again.structure_adopted],
+    [1, 1, 0, 0, 0, 0],
+    "idempotent: one no-op, one converged edited row, no structural decision",
+  );
+  eq(rows().map((r) => r.version), [3, 2], "…and no version moved");
 }
 
 if (failed > 0) {
