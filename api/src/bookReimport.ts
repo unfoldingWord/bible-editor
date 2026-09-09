@@ -117,6 +117,7 @@ import type { TwlRow, VerseRow, CheckLane } from "./types";
 import {
   collapseWhitespaceForCompare,
   computeVerseMerge,
+  type VerseMergeAction,
   verseContentConverged,
   type VerseMergeResult,
 } from "./verseMerge.ts";
@@ -355,6 +356,12 @@ export interface ReimportCounts {
   // reconciled (master ambiguous for the source key). Left as-is, logged so the
   // residual potential clobber is visible. Normally zero.
   source_attr_divergent: number;
+  // Issue #641: edited verses whose master copy had not moved since our own
+  // confirmed publish (keep_master_unchanged / keep_converged), so the
+  // source-attr reconcile was skipped. Counted so the suppression stays
+  // visible: a spike here means ancestor recovery is over-reporting
+  // "master unchanged", not that there was nothing to reconcile.
+  source_attr_reconcile_skipped: number;
   // twl rows whose sort_order was rewritten by the canonical post-pass to match
   // the ULT-position ordering (the same order the nightly export computes). Lets
   // the reimport adopt canonical order back into D1 for content-identical rows
@@ -731,6 +738,7 @@ function zeroCounts(): ReimportCounts {
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
+    source_attr_reconcile_skipped: 0,
     twl_reordered: 0,
     merge_adopted: 0,
     merge_conflicts: 0,
@@ -956,6 +964,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.resurrected += from.resurrected;
   into.source_attr_reconciled += from.source_attr_reconciled;
   into.source_attr_divergent += from.source_attr_divergent;
+  into.source_attr_reconcile_skipped += from.source_attr_reconcile_skipped;
   into.twl_reordered += from.twl_reordered;
   into.merge_adopted += from.merge_adopted ?? 0;
   into.merge_conflicts += from.merge_conflicts ?? 0;
@@ -6064,7 +6073,7 @@ async function applyVerseRows(
       }
       // Issue #641: the merge outcome, kept for the source-attr reconcile gate
       // below. null when no cutoff exists (no merge ran).
-      let mergeAction: string | null = null;
+      let mergeAction: VerseMergeAction | null = null;
       if (lastExportAt != null) {
         const merge = computeVerseMerge({
           base: verseContentJsonFromPayload(ex.base_payload ?? null),
@@ -6200,6 +6209,7 @@ async function applyVerseRows(
       // movement (the NUM 20–22 combining-mark fix) keep today's behavior.
       if (mergeAction === "keep_master_unchanged" || mergeAction === "keep_converged") {
         counts.skipped_edited++;
+        counts.source_attr_reconcile_skipped++;
         continue;
       }
       const rec = reconcileEditedVerseSourceAttrs(ex.content_json, v.contentJson);

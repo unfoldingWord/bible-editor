@@ -2244,6 +2244,7 @@ console.log("\n[#641: no source-attr reconcile when master has not moved since o
     );
     eq(counts.source_attr_divergent, 0, "master unchanged since our publish: no source-attr divergence is measured");
     eq(counts.skipped_edited, 1, "…the verse is a plain edited skip");
+    eq(counts.source_attr_reconcile_skipped, 1, "…and the suppression is counted, so it stays visible in the run summary");
     eq(conflictActions(sqlite), [], "…and NO source_attr_divergent review row is minted");
     const row = readRow(sqlite);
     eq(row.version, 4, "…the version does not move");
@@ -2276,6 +2277,23 @@ console.log("\n[#641: no source-attr reconcile when master has not moved since o
     // lands after keep_ai_master's and is the one the banner shows.
     eq(conflictActions(sqlite).includes("source_attr_divergent"), true, "…and still records the ambiguous-attr review row");
     eq(readRow(sqlite).content_json, oursJson, "…while the translator's text is still kept");
+  }
+
+  {
+    // Control 2: no cutoff at all (no merge ran, mergeAction stays null). The
+    // pre-fix behavior is preserved: the reconcile runs and measures the
+    // ambiguity, exactly as before this gate existed.
+    const { env, sqlite } = freshEnv();
+    const oursJson = JSON.stringify(tree(D1_FORM, ["he", "created"]));
+    const masterJson = JSON.stringify(tree(OLD_FORM, ["he", "created"]));
+    seed(sqlite, oursJson, masterJson);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, "ULT",
+      [{ chapter: 6, verse: 1, verseEnd: null, contentJson: masterJson, plainText: "he created" }],
+      null, null, false,
+    );
+    eq(counts.source_attr_divergent > 0, true, "no cutoff: the reconcile still runs (pre-fix behavior preserved)");
+    eq(counts.source_attr_reconcile_skipped, 0, "…and the gate did not fire");
   }
 }
 
