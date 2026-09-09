@@ -221,6 +221,13 @@ interface Props {
   // clears both the `?c=` param and its own location state — Shell rewriting
   // the hash itself fired no hashchange, leaving App's state stale.
   onCommentConsumed?: () => void;
+  // Someone else's comment landed on this chapter's socket. App refetches the
+  // alert feed so a reply to a thread you are in reaches the bell at once
+  // instead of on the next poll.
+  onCommentActivity?: () => void;
+  // Root ids of the threads the comments popover is showing ([] when closed).
+  // App clears the alerts for threads the user is looking at.
+  onCommentThreadsViewed?: (rootIds: number[]) => void;
   // True once auth is confirmed ready (App's auth gate has minted/refreshed
   // the token). Gates the book-locks fetch — see useBookLocks.
   authReady?: boolean;
@@ -233,7 +240,7 @@ interface Props {
   syncWarnings?: ReactNode;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, authReady = false, notificationsMenu, syncWarnings }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, onCommentActivity, onCommentThreadsViewed, authReady = false, notificationsMenu, syncWarnings }: Props) {
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -252,6 +259,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalRowDelete,
     applyLocalRowInsert,
     applyLocalVerse,
+    applyRemoteVerse,
+    applyLocalVerseBridge,
+    applyLocalVerseSplit,
     applyLocalVerseStatus,
     applyLocalLaneCheck,
     applyLaneCheckers,
@@ -271,6 +281,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Surfaced when taking a verse manual fails, so an aborted reorder is visible
   // rather than the drag just appearing to do nothing.
   const [twlOrderToast, setTwlOrderToast] = useState<string | null>(null);
+  // Surfaced when a verse-bridge create/break fails (409 conflict, no adjacent
+  // verse, not a bridge) so the button click doesn't just silently do nothing.
+  const [bridgeToast, setBridgeToast] = useState<string | null>(null);
 
   // "Use automatic": hand the verse back. The server also re-sequences that
   // verse's sort_order on the way out, which bumps each row's version — so
@@ -382,11 +395,48 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       scheduleLintRefetch();
     },
     onDelete: (kind, id) => applyLocalRowDelete(kind, id),
+    // Version-gated inside the hook (strictly newer than local AND above the
+    // verse's tombstone) so a verse.updated that reordered behind the bridge
+    // that deleted its row cannot resurrect it (#729).
     onVerseUpdate: (verse) => {
-      const existing = dataRef.current?.verses[verse.bible_version]?.[verse.verse];
-      if (!existing || verse.version > existing.version) {
-        applyLocalVerse(verse);
-      }
+      applyRemoteVerse(verse);
+    },
+    // The room fans events out in arbitrary order, so the hook reconciles
+    // bridge/split against the row-version clock: `removedVersion` tombstones
+    // the absorbed verse, split-created rows apply only above that tombstone,
+    // and the start row stays newer-wins. See lib/verseStructure.ts, whose test
+    // folds every delivery permutation to the server's final rows.
+    onVerseBridged: (verse, removedVerse, absorbedVerses, removedVersion) => {
+      applyLocalVerseBridge(verse, removedVerse, absorbedVerses, removedVersion);
+    },
+    onVerseSplit: (verse, newVerses) => {
+      applyLocalVerseSplit(verse, newVerses);
+    },
+    // Events broadcast while this tab had no open socket are gone for good; a
+    // missed verse.bridged would leave a phantom verse whose next save 404s, a
+    // missed verse.split would hide new verses. Refetch (in place — `data`
+    // stays rendered while it loads) rather than trust the map.
+    //
+    // On EVERY open, the first included. The mount GET (useChapter) starts
+    // independently of the socket, so a structural change committed after
+    // its snapshot but before the socket's first `open` was invisible to the
+    // tab until a reload. Invariant: the verse map derives from a snapshot
+    // taken after the subscription was established, or is reconciled by a
+    // merging refetch issued after it. Cost: if the mount GET already landed
+    // when the socket opens, this is a second GET of the same chapter — the
+    // price of correctness, deliberately not avoided with timestamps. If the
+    // mount GET is still in flight, `refetch` aborts and restarts it, so the
+    // chapter is still fetched once (see useChapter.refetch).
+    //
+    // Merging, not replacing: a reconnect fires on the same `online` moment
+    // that drains the outbox, so the GET races the tab's own PATCHes. A verse
+    // held at an equal-or-newer version stays (the PATCH landed, or is pending
+    // with optimistic content); a stale GET body must not regress it into a
+    // 409 against the user's own save. The other refetch callers (TWL order
+    // unlock, pipeline Refresh, Door43 import) keep the plain replace — they
+    // refetch because the server changed versions out from under the tab.
+    onOpen: () => {
+      void refetch({ keepNewerLocal: true });
     },
     onVerseStatusUpdate: (status) => {
       applyLocalVerseStatus(status.verse, status.done === 1);
@@ -402,7 +452,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
     // applyWsComment is a stable useCallback, so passing it straight through is
     // safe even though this handlers object isn't memoized.
-    onCommentUpdate: applyWsComment,
+    onCommentUpdate: (comment) => {
+      applyWsComment(comment);
+      if (comment.authorId !== meUserId) onCommentActivity?.();
+    },
     onPipelineApplied: (_book, _chapter, pipelineType) => {
       // This socket only carries events for the chapter in view, so any hint
       // that arrives is for the open chapter — offer a refresh. Covers
@@ -514,6 +567,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         : commentsIndex.threadsByRow.get(rowKey(commentTarget.rowKind, commentTarget.rowId));
     return list ?? EMPTY_COMMENT_THREADS;
   }, [commentTarget, commentsIndex]);
+
+  useEffect(() => {
+    onCommentThreadsViewed?.(commentTarget ? commentThreads.map((t) => t.root.id) : []);
+  }, [commentTarget, commentThreads, onCommentThreadsViewed]);
 
   // Memoized on the index so ScriptureColumn's comparator sees a NEW identity
   // exactly when comments changed (and a stable one otherwise — a fresh arrow
@@ -2085,10 +2142,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   // App keys Shell on book only, so a cross-chapter navigation (URL /
   // back-forward / TopBar / cross-chapter find) changes the chapter +
-  // initialVerse props WITHOUT remounting — useChapter keeps the prior
-  // chapter's data visible while the new payload loads, so there's no loading
-  // flash and find/book-view state survive. This effect does what the old
-  // remount used to: reset the per-chapter transient state. Keyed on
+  // initialVerse props WITHOUT remounting Shell itself. Note useChapter DOES
+  // null its payload on every (book, chapter) change (#531, to block editing
+  // stale content), so the `!data` gate below briefly unmounts ScriptureColumn
+  // and the Find overlay under it — Find survives that remount by reseeding
+  // from sessionStorage (see ../lib/findState), not by data being preserved.
+  // This effect does what the old remount used to: reset the per-chapter
+  // transient state. Keyed on
   // [chapter, initialVerse] — internal same-chapter verse selection sets
   // activeVerse directly without an URL push, so initialVerse doesn't change
   // and this won't clobber it. Skips the initial mount.
@@ -2995,6 +3055,93 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       .catch(() => enqueueCapturedSave());
   };
 
+  // The verses map for a chapter, from the active useChapter cache when it's the
+  // open chapter, else the book-mode cache. Bridge create/break read both rows'
+  // versions from here to CAS the structural change.
+  const versesForChapterMap = (ch: number): Record<string, Record<number, VerseDto>> | undefined => {
+    if (ch === chapter) return dataRef.current?.verses;
+    const cs = bookHook?.chapters.get(ch);
+    return cs?.kind === "ready" ? cs.data.verses : undefined;
+  };
+
+  const bridgeErrorMessage = (e: unknown): string => {
+    if (e instanceof ApiError) {
+      if (e.status === 409) return "This verse changed elsewhere — reopen it and try again.";
+      if (e.status === 422) return "There is no following verse to merge with.";
+      if (e.status === 400) return "That verse isn't a bridge.";
+      if (e.status === 403) return "This column is read-only.";
+    }
+    return "Could not update the verse bridge. Try again.";
+  };
+
+  // Whether a verse has an unsaved keystroke draft in the outbox (a record with
+  // a plainText payload). Bridge/split operate on SERVER content and bump the
+  // row version, so an unsaved draft on an affected verse would be stranded —
+  // its row is deleted (merge) or re-versioned (split) out from under the draft,
+  // whose later save then 404s/409s. Refuse until the user saves.
+  const verseHasPendingDraft = async (chapterNum: number, verse: number, bibleVersion: string): Promise<boolean> => {
+    try {
+      const rec = await drafts.get(verseKey(book, chapterNum, verse, bibleVersion));
+      return typeof (rec?.payload as { plainText?: string } | undefined)?.plainText === "string";
+    } catch {
+      return false; // draft store unreadable → don't block the structural op
+    }
+  };
+
+  // Create a verse bridge: combine `verse` with the following verse (5:1 + 5:2 →
+  // 5:1-2). A deliberate POST the user awaits — not an outbox op. Applied locally
+  // only on the server's 200 so a 409 never leaves a half-formed bridge.
+  const mergeVerseWithNext = async (chapterNum: number, verse: number, bibleVersion: string) => {
+    const byVersion = versesForChapterMap(chapterNum)?.[bibleVersion];
+    const start = byVersion?.[verse];
+    if (!start) return;
+    const nextStart = (start.verse_end ?? start.verse) + 1;
+    const next = byVersion?.[nextStart];
+    if (!next) {
+      setBridgeToast("There is no following verse to merge with.");
+      return;
+    }
+    // Both verses' content is about to change server-side (start absorbs next,
+    // next is deleted) — an unsaved edit on either would be lost. Guard first.
+    if ((await verseHasPendingDraft(chapterNum, verse, bibleVersion)) || (await verseHasPendingDraft(chapterNum, nextStart, bibleVersion))) {
+      setBridgeToast("Save your edits to these verses before bridging them.");
+      return;
+    }
+    try {
+      const res = await api.mergeVerseBridge(book, chapterNum, verse, bibleVersion, start.version, next.version);
+      if (chapterNum === chapter) applyLocalVerseBridge(res.verse, res.removed_verse, res.absorbed_verses, res.removed_version);
+      bookHook?.applyLocalVerseBridge(res.verse, res.removed_verse, res.absorbed_verses, res.removed_version);
+    } catch (e) {
+      setBridgeToast(bridgeErrorMessage(e));
+    }
+  };
+
+  // Break a verse bridge: split `verse` (a `\v a-b` row) back into separate
+  // verses. All text stays in the first; the later verses become empty rows the
+  // translator fills in. The user has already confirmed via the VerseBridgeButtons
+  // dialog by the time this runs.
+  const splitVerseBridge = async (chapterNum: number, verse: number, bibleVersion: string) => {
+    const byVersion = versesForChapterMap(chapterNum)?.[bibleVersion];
+    const bridge = byVersion?.[verse];
+    if (!bridge || bridge.verse_end == null || bridge.verse_end <= bridge.verse) return;
+    // Split bumps the bridge row's version; an unsaved draft on it would 409 its
+    // later save. Guard first (the newly-created verses don't exist yet, so only
+    // the bridge start can carry a draft).
+    if (await verseHasPendingDraft(chapterNum, verse, bibleVersion)) {
+      setBridgeToast("Save your edits to this verse before breaking the bridge.");
+      return;
+    }
+    // The confirm now lives in VerseBridgeButtons' MUI dialog (consistent with
+    // merge, and no native window.confirm double-prompt).
+    try {
+      const res = await api.splitVerseBridge(book, chapterNum, verse, bibleVersion, bridge.version);
+      if (chapterNum === chapter) applyLocalVerseSplit(res.verse, res.new_verses);
+      bookHook?.applyLocalVerseSplit(res.verse, res.new_verses);
+    } catch (e) {
+      setBridgeToast(bridgeErrorMessage(e));
+    }
+  };
+
   // Restore a previously-saved verse version (from the history dialog). Unlike
   // saveVerseDraft, there is no smartEditVerse pass — we re-save the exact
   // stored content tree verbatim (alignment milestones included). It routes
@@ -3393,6 +3540,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             saveSectionEdit(ch, verseNum, bibleVersion, change, base);
           }}
           onOpenAligner={(v, bv) => openAligner(chapter, v, bv)}
+          onMergeVerseBridge={(ch, v, bv) => mergeVerseWithNext(ch, v, bv)}
+          onSplitVerseBridge={(ch, v, bv) => splitVerseBridge(ch, v, bv)}
           scrollNonce={scrollNonce}
           onRequestScrollToActive={requestScrollToActive}
           searchNotes={getSearchNotes}
@@ -3994,6 +4143,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       >
         <Alert severity="warning" onClose={() => setTwlOrderToast(null)} variant="filled">
           {twlOrderToast}
+        </Alert>
+      </Snackbar>
+      <Snackbar
+        open={!!bridgeToast}
+        autoHideDuration={6000}
+        onClose={() => setBridgeToast(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="warning" onClose={() => setBridgeToast(null)} variant="filled">
+          {bridgeToast}
         </Alert>
       </Snackbar>
       <AiCompletionToasts

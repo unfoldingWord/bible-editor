@@ -101,6 +101,22 @@
 // deleting them from master. See idBlockedOverrideAllowed for the narrow
 // gating and bookReimport.ts's raiseTombstoneBlockAlert for the durable
 // record this override must leave behind.
+//
+// ── Fifth withhold condition (issue #727): `structure_overlap` ──────────────
+//
+// applyVerseRows's post-apply structural audit found, in a chapter this run
+// touched, two verse rows whose [verse, verse_end] ranges intersect (a `1-2`
+// bridge beside a standalone `2`). buildUsfm now refuses to render that chapter
+// (VerseRangeOverlapError, verseBridge.ts), so stamping would only hand tonight's
+// export a guaranteed failure for this resource — and, worse, would certify as
+// "in sync" a D1 whose structure is not something master can even express.
+// Withheld UNCONDITIONALLY: `idBlockedOverride` consents to Door43 losing
+// specific rows, not to publishing an overlapping chapter, so it does not open
+// this. Read with `?? 0` (absence is benign) rather than the presence check the
+// lock counters get: this is a positive measurement made at the END of a chunk
+// that ran to completion, like apply_incomplete / merge_record_failed — a
+// replayed pre-#727 chunk result simply never measured it, and there is no
+// laundering path because zero overlaps IS the safe default the check confirms.
 export function shouldRecordResourceSync(
   counts: {
     chapters_locked?: number;
@@ -108,6 +124,7 @@ export function shouldRecordResourceSync(
     conflict_skipped?: number;
     tombstone_blocked?: number;
     counts_incomplete?: boolean;
+    structure_overlap?: number;
   },
   idBlockedOverride: boolean = false,
 ): boolean {
@@ -126,6 +143,7 @@ export function shouldRecordResourceSync(
   // replay guard.
   if (counts.conflict_skipped === undefined || counts.tombstone_blocked === undefined) return false;
   if (counts.counts_incomplete === true) return false;
+  if ((counts.structure_overlap ?? 0) > 0) return false;
   return (
     counts.chapters_locked === 0 &&
     counts.prune_locked === 0 &&

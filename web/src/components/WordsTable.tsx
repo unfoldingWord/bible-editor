@@ -841,6 +841,23 @@ const WordRow = memo(function WordRow({
         ))}
       </Menu>
       <Box sx={{ gridArea: "twarticle", minWidth: 0, display: "flex", alignItems: "center", gap: 0.5 }}>
+        {/* 4-char sticky ID (DCS convention). A tiny monospace tag at the head
+            of the article cell — the picker label truncates, so this shows the
+            id without adding a column or growing the row. */}
+        <Tooltip title="Word link ID">
+          <Typography
+            component="span"
+            sx={{
+              fontFamily: "monospace",
+              fontSize: 10,
+              lineHeight: 1,
+              color: "text.disabled",
+              flexShrink: 0,
+            }}
+          >
+            {row.id}
+          </Typography>
+        </Tooltip>
         <CatalogPicker
           value={twLink}
           options={catalogs.twLinks}

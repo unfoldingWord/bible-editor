@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
-import type { VerseRow } from "./types";
+import type { VerseDto, VerseRow } from "./types";
 import { currentUserId, requireEditor } from "./auth";
 import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 import { broadcastChapter } from "./wsEvents";
@@ -23,6 +23,22 @@ import { lanesToReopenOnVerseEdit, reopenLaneChecks } from "./laneReopen.ts";
 import { RESOLVE_VERSE_MERGE_CONFLICT_SQL, VERSE_PATCH_UPDATE_SQL } from "./verseMergeConflictSql.ts";
 import { clearResolvedConflictBannerIfLast } from "./verseMergeConflicts.ts";
 import { provenanceValues, resolveActorUsername } from "./rowProvenance.ts";
+import {
+  absorbedVerseNumbers,
+  BRIDGE_DELETE_NEXT_SQL,
+  BRIDGE_UPDATE_START_SQL,
+  computeBridgeEnd,
+  DELETE_VERSE_LANE_CHECKS_RANGE_SQL,
+  DELETE_VERSE_STATUSES_RANGE_SQL,
+  expectedNextStart,
+  hasVerseObjectsArray,
+  isBridge,
+  mergeVerseObjects,
+  splitSeedVerseObjects,
+  SPLIT_INSERT_EDITLOG_RANGE_SQL,
+  SPLIT_INSERT_VERSES_RANGE_SQL,
+  SPLIT_UPDATE_START_SQL,
+} from "./verseBridge.ts";
 
 // Verse content can carry malformed/missing `\w` occurrence data — colliding
 // `(text, occurrence)` pairs from a bad import or AI alignment (ULT/UST), or no
@@ -584,3 +600,332 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   }
   return c.json(updated ? { ...updated, content: updatedParsed } : null);
 });
+
+// ─── Verse bridges (create / break) ──────────────────────────────────────────
+// A verse bridge is a `\v a-b` block stored as ONE row (start verse carries
+// verse_end; see verseBridge.ts). These two routes are the only way to set or
+// clear verse_end from the app. They are deliberate, whole-verse structural
+// operations (not per-keystroke), so they are plain POSTs the client awaits,
+// NOT durable-outbox PATCHes — the outbox's per-row silent auto-heal is wrong
+// for a two-row atomic change. Both mirror the PATCH route's guards.
+
+// The verseObjects array off a parsed content tree, or [] if malformed.
+function verseObjectsOf(parsed: unknown): unknown[] {
+  const vos = (parsed as { verseObjects?: unknown[] } | null)?.verseObjects;
+  return Array.isArray(vos) ? vos : [];
+}
+
+const BridgeBodySchema = z.object({
+  start_version: z.number().int().nonnegative(),
+  next_version: z.number().int().nonnegative(),
+});
+
+// POST /:book/:chapter/:verse/:bibleVersion/bridge — combine this verse with the
+// immediately following verse (or, if this is already a bridge, extend it by the
+// next block). Body carries BOTH expected versions because two rows are CAS'd.
+verses.post("/:book/:chapter/:verse/:bibleVersion/bridge", requireEditor, async (c) => {
+  const book = c.req.param("book").toUpperCase();
+  const chapter = parseInt(c.req.param("chapter"), 10);
+  const verse = parseInt(c.req.param("verse"), 10);
+  const bibleVersion = c.req.param("bibleVersion").toUpperCase();
+  if (!isAllowedBibleVersion(bibleVersion)) return c.json({ error: "invalid_bible_version" }, 400);
+  if (!Number.isFinite(chapter) || !Number.isFinite(verse)) return c.json({ error: "invalid_params" }, 400);
+  // Structural verse ops are UST-only (mirrors the UST-only toolbar) and must
+  // never touch the chapter-front pseudo-verse (verse 0): buildUsfm serializes
+  // verse 0 as usfm-js's "front" key IGNORING verse_end, so bridging there
+  // would silently drop the absorbed real verse from the export. The UST-only
+  // check also subsumes the UHB/UGNT read-only rejection.
+  if (bibleVersion !== "UST") return c.json({ error: "bridge_ust_only" }, 403);
+  if (verse < 1) return c.json({ error: "invalid_params", reason: "verse_must_be_positive" }, 400);
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_body" }, 400);
+  }
+  const parsed = BridgeBodySchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
+  const { start_version: startVersion, next_version: nextVersion } = parsed.data;
+
+  // Same lock as a verse edit: an AI scripture run's auto-apply would race a
+  // structural rewrite of this chapter's verse rows.
+  const lock = await activePipelineForChapter(c.env, book, chapter, "verse");
+  if (lock) return c.json(lockedResponseBody(lock), 409);
+
+  const start = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
+  if (!start) return c.json({ error: "not_found" }, 404);
+  const nextVerse = expectedNextStart(start);
+  const next = await loadVerseRow(c.env.DB, book, chapter, nextVerse, bibleVersion);
+  if (!next) return c.json({ error: "no_adjacent_verse" }, 422);
+
+  // Pre-check versions for a clean 409 (the SQL's CAS/EXISTS is the real guard).
+  if (start.version !== startVersion || next.version !== nextVersion) {
+    return c.json(
+      {
+        error: "version_mismatch",
+        current: {
+          start: { ...start, content: safeParseOrNull(start) },
+          next: { ...next, content: safeParseOrNull(next) },
+        },
+      },
+      409,
+    );
+  }
+
+  let startParsed: unknown;
+  let nextParsed: unknown;
+  try {
+    startParsed = parseVerseContentJson(start);
+    nextParsed = parseVerseContentJson(next);
+  } catch (err) {
+    if (err instanceof CorruptContentJsonError) {
+      logCorruptContentJson(err);
+      return c.json(corruptContentJsonBody(err), 500);
+    }
+    throw err;
+  }
+
+  // A row whose content_json parsed but is NOT `{ verseObjects: [...] }` (a bare
+  // array, a typo'd key) would have its half silently dropped by verseObjectsOf
+  // while BRIDGE_DELETE_NEXT_SQL still deletes it. Refuse — same posture as the
+  // corrupt-JSON path above, which never deletes. Normal writes (PATCH, import)
+  // always produce the in-shape tree, so this only guards a pre-existing
+  // off-shape row.
+  if (!hasVerseObjectsArray(startParsed) || !hasVerseObjectsArray(nextParsed)) {
+    return c.json({ error: "invalid_content", reason: "missing_verse_objects" }, 422);
+  }
+
+  const mergedVos = mergeVerseObjects(verseObjectsOf(startParsed), verseObjectsOf(nextParsed));
+  const mergedContent = { verseObjects: mergedVos };
+  // Keep `${text}|${occurrence}` consistent across the now-combined verse (a
+  // word repeated across the two halves must renumber) — same self-heal the
+  // PATCH path runs (STATE.md's occurrence-collision lesson).
+  normalizeOccurrences(mergedContent);
+  const mergedJson = JSON.stringify(mergedContent);
+  const bridgeEnd = computeBridgeEnd(next);
+  const absorbed = absorbedVerseNumbers(next);
+  const mergedPlain = [start.plain_text, next.plain_text].filter(Boolean).join(" ") || null;
+
+  const userId = currentUserId(c);
+  const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
+  const now = Math.floor(Date.now() / 1000);
+  const startKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
+  const nextKey = `${book}/${chapter}/${nextVerse}/${bibleVersion}`;
+
+  // One atomic batch. Statement 1 CAS's the start row AND requires the next row
+  // to still be at nextVersion (EXISTS); every later statement chains on
+  // changes() > 0, so a lost race on EITHER version deletes/writes nothing (a
+  // D1 batch does NOT roll back a zero-match statement, only an error — see
+  // verseBridge.ts's SQL header). Status/lane cleanup is deliberately NOT in
+  // this chain: it can legitimately match zero rows, which would break the
+  // chain — it runs post-confirm below.
+  const [updateRes] = await c.env.DB.batch([
+    c.env.DB
+      .prepare(BRIDGE_UPDATE_START_SQL)
+      .bind(
+        mergedJson,
+        bridgeEnd,
+        now,
+        userId,
+        ...provenanceValues({ action: "bridge", source: "user", actor }),
+        book,
+        chapter,
+        verse,
+        bibleVersion,
+        startVersion,
+        nextVerse,
+        nextVersion,
+        mergedPlain,
+      ),
+    c.env.DB.prepare(BRIDGE_DELETE_NEXT_SQL).bind(book, chapter, nextVerse, bibleVersion),
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+         SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'bridge', ?6 WHERE changes() > 0`,
+      )
+      // `start_before` is the start row's content BEFORE the merge — the ancestor
+      // the nightly reimport compares master's start verse against when this
+      // bridge is still local and the key has no create/update row at or below
+      // the export boundary (a bootstrap-imported, never-edited verse; issue
+      // #728 review F4). verseHistory.ts reads only `content`, so the extra key
+      // is invisible to the timeline.
+      .bind(startKey, book, userId, startVersion, startVersion + 1, JSON.stringify({ content: mergedContent, verse_end: bridgeEnd, start_before: startParsed })),
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+         SELECT 'verse', ?1, ?2, ?3, ?4, NULL, 'delete', ?5 WHERE changes() > 0`,
+      )
+      .bind(nextKey, book, userId, next.version, JSON.stringify({ content: nextParsed, absorbed_into: verse })),
+  ]);
+
+  if (!updateRes.meta.changes) {
+    // Lost the race between the pre-check read and the batch. Re-read and 409.
+    const freshStart = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
+    const freshNext = await loadVerseRow(c.env.DB, book, chapter, nextVerse, bibleVersion);
+    return c.json(
+      {
+        error: "version_mismatch",
+        current: {
+          start: freshStart ? { ...freshStart, content: safeParseOrNull(freshStart) } : null,
+          next: freshNext ? { ...freshNext, content: safeParseOrNull(freshNext) } : null,
+        },
+      },
+      409,
+    );
+  }
+
+  const updated = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
+  const bridgeDto = updated ? { ...updated, content: mergedContent } : null;
+  c.executionCtx.waitUntil(
+    (async () => {
+      // Tell open tabs FIRST, then prune the orphaned per-verse status/checkoff
+      // for the absorbed verses and reopen the text lane on the bridge (its
+      // content changed). The broadcast used to wait behind those two awaits
+      // while PATCH broadcasts immediately, which widened the window for a
+      // racing verse.updated / verse.split to overtake this event in the room
+      // (#729). Receivers tolerate any order via the removedVersion tombstone;
+      // this just makes the reorder rare. Best-effort, off the response path.
+      if (bridgeDto) {
+        await broadcastChapter(c.env, book, chapter, {
+          type: "verse.bridged",
+          verse: bridgeDto,
+          removedVerse: next.verse,
+          removedVersion: next.version,
+          absorbedVerses: absorbed,
+        });
+      }
+      try {
+        await c.env.DB.batch([
+          c.env.DB.prepare(DELETE_VERSE_STATUSES_RANGE_SQL).bind(book, chapter, next.verse, bridgeEnd),
+          c.env.DB.prepare(DELETE_VERSE_LANE_CHECKS_RANGE_SQL).bind(book, chapter, next.verse, bridgeEnd),
+        ]);
+      } catch {
+        // orphan cleanup is non-critical; a stale row keyed at an absent verse
+        // is simply unused until (unless) the bridge is split again.
+      }
+      await reopenLaneChecks(c.env, book, chapter, verse, ["text"]);
+    })(),
+  );
+  // `removed_version` mirrors the WS event so the originating tab tombstones
+  // the absorbed verse exactly like every other tab.
+  return c.json({ verse: bridgeDto, removed_verse: next.verse, removed_version: next.version, absorbed_verses: absorbed });
+});
+
+// POST /:book/:chapter/:verse/:bibleVersion/split — break a `\v a-b` bridge back
+// into separate verses. ALL content stays in the first verse; the later verses
+// are (re)created empty for the translator to redistribute by hand. Single row
+// CAS → If-Match, exactly like PATCH.
+verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (c) => {
+  const book = c.req.param("book").toUpperCase();
+  const chapter = parseInt(c.req.param("chapter"), 10);
+  const verse = parseInt(c.req.param("verse"), 10);
+  const bibleVersion = c.req.param("bibleVersion").toUpperCase();
+  if (!isAllowedBibleVersion(bibleVersion)) return c.json({ error: "invalid_bible_version" }, 400);
+  if (!Number.isFinite(chapter) || !Number.isFinite(verse)) return c.json({ error: "invalid_params" }, 400);
+  // UST-only, verse > 0 — same rationale as the bridge route above (verse 0 is
+  // the chapter-front pseudo-verse; the UST-only check subsumes UHB/UGNT).
+  if (bibleVersion !== "UST") return c.json({ error: "bridge_ust_only" }, 403);
+  if (verse < 1) return c.json({ error: "invalid_params", reason: "verse_must_be_positive" }, 400);
+  const expected = parseIfMatch(c.req.header("if-match"));
+  if (expected === null) return c.json({ error: "if_match_required" }, 428);
+
+  const lock = await activePipelineForChapter(c.env, book, chapter, "verse");
+  if (lock) return c.json(lockedResponseBody(lock), 409);
+
+  const bridge = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
+  if (!bridge) return c.json({ error: "not_found" }, 404);
+  if (bridge.version !== expected) {
+    return c.json({ error: "version_mismatch", current: { ...bridge, content: safeParseOrNull(bridge) } }, 409);
+  }
+  if (!isBridge(bridge)) return c.json({ error: "not_a_bridge" }, 400);
+
+  const bridgeEnd = bridge.verse_end as number; // isBridge above guarantees non-null
+  const seedContent = { verseObjects: splitSeedVerseObjects() };
+  const seedJson = JSON.stringify(seedContent);
+
+  const userId = currentUserId(c);
+  const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
+  const now = Math.floor(Date.now() / 1000);
+  const startKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
+
+  // Exactly FOUR statements regardless of how many verses the bridge spans (D1
+  // caps a batch at 100 statements): de-bridge the start row (CAS on version +
+  // still-a-bridge), then two CTE-driven multi-row INSERTs — all seeded verses,
+  // then all their 'create' audit rows — each chained on changes() > 0 so a lost
+  // CAS mints nothing and the split stays atomic all-or-nothing.
+  const [updateRes] = await c.env.DB.batch([
+    c.env.DB
+      .prepare(SPLIT_UPDATE_START_SQL)
+      .bind(now, userId, ...provenanceValues({ action: "split", source: "user", actor }), book, chapter, verse, bibleVersion, expected),
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+         SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'split', ?6 WHERE changes() > 0`,
+      )
+      .bind(startKey, book, userId, expected, expected + 1, JSON.stringify({ content: safeParseOrNull(bridge), verse_end: null })),
+    c.env.DB
+      .prepare(SPLIT_INSERT_VERSES_RANGE_SQL)
+      .bind(book, chapter, bibleVersion, seedJson, now, userId, verse, bridgeEnd, ...provenanceValues({ action: "split", source: "user", actor }), expected),
+    c.env.DB
+      .prepare(SPLIT_INSERT_EDITLOG_RANGE_SQL)
+      .bind(book, chapter, bibleVersion, verse, bridgeEnd, userId, JSON.stringify({ content: seedContent }), expected),
+  ]);
+  if (!updateRes.meta.changes) {
+    const fresh = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
+    return c.json({ error: "version_mismatch", current: fresh ? { ...fresh, content: safeParseOrNull(fresh) } : null }, 409);
+  }
+
+  const updated = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
+  const startDto = updated ? { ...updated, content: safeParseOrNull(updated) } : null;
+  // Re-read the recreated verses for their ACTUAL versions — the split no longer
+  // mints them at a literal 1 (see SPLIT_INSERT_VERSES_RANGE_SQL), so a hand-built
+  // `version: 1` DTO would leave the client with a stale expected_version and
+  // 409 its first edit. Rows are keyed verse > start AND verse <= bridgeEnd.
+  const createdRes = await c.env.DB.prepare(
+    `SELECT verse, version, updated_at, updated_by FROM verses
+      WHERE book = ?1 AND chapter = ?2 AND bible_version = ?3 AND verse > ?4 AND verse <= ?5
+      ORDER BY verse`,
+  )
+    .bind(book, chapter, bibleVersion, verse, bridgeEnd)
+    .all<{ verse: number; version: number; updated_at: number; updated_by: number | null }>();
+  const newDtos: VerseDto[] = createdRes.results.map((r) => ({
+    book,
+    chapter,
+    verse: r.verse,
+    verse_end: null,
+    bible_version: bibleVersion,
+    plain_text: null,
+    version: r.version,
+    updated_by: r.updated_by,
+    updated_at: r.updated_at,
+    content: seedContent,
+  }));
+  c.executionCtx.waitUntil(
+    (async () => {
+      // Broadcast before the lane reopen — see the bridge route for why the
+      // structural event goes out first (#729).
+      if (startDto) {
+        await broadcastChapter(c.env, book, chapter, {
+          type: "verse.split",
+          verse: startDto,
+          newVerses: newDtos,
+        });
+      }
+      await reopenLaneChecks(c.env, book, chapter, verse, ["text"]);
+    })(),
+  );
+  return c.json({ verse: startDto, new_verses: newDtos });
+});
+
+// Parse a verse row's content_json, returning null on corruption rather than
+// throwing — used only when building a 409/echo body where a corrupt row must
+// not mask the real (version) error. The primary write paths above still use
+// parseVerseContentJson so a corrupt row on the happy path 500s loudly.
+function safeParseOrNull(row: VerseRow): unknown {
+  try {
+    return parseVerseContentJson(row);
+  } catch {
+    return null;
+  }
+}

@@ -17,6 +17,9 @@ import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { FindMatch } from "./FindReplaceOverlay";
 import { formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
+import { VerseBridgeButtons } from "./VerseBridgeButtons";
+import { CommentBadge } from "./CommentBadge";
+import type { CommentCounts } from "../lib/commentsIndex";
 import {
   matchSourceVerse,
   renderFindMatchesByOffsets,
@@ -28,6 +31,8 @@ interface SearchState {
   re: RegExp | null;
   sourceQuery: SourceQueryKind;
 }
+
+const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
 
 interface Props {
   book: string;
@@ -91,6 +96,15 @@ interface Props {
   // gets a small check control + a tinted verse-number underline. The
   // integrator wires this from Shell; absent in standalone/source columns.
   textCheck?: TextLaneCheck;
+  // UST-only verse-bridge create/break, wired from Shell (verse carried by the
+  // callback). Absent for other columns, viewers, and locked chapters.
+  onMergeBridge?: (verse: number) => void;
+  onSplitBridge?: (verse: number) => void;
+  // Verse-level internal comments (team notes). Wired only into the leftmost
+  // enabled column so the badge shows once per verse, and only rendered on the
+  // active verse — mirroring the bridge buttons. Absent on the other columns.
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
 }
 
 // Continuous Word-style editor for one bible_version. Each verse is its
@@ -126,6 +140,10 @@ export function DocColumn({
   onOpenAligner,
   onEditSection,
   textCheck,
+  onMergeBridge,
+  onSplitBridge,
+  verseCommentCounts,
+  onOpenVerseComments,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef<HTMLSpanElement | null>(null);
@@ -276,6 +294,14 @@ export function DocColumn({
                 onAlign={() => onOpenAligner(dto.verse)}
                 onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
                 onSave={(plain) => onSaveColumn([{ verseNum: dto.verse, plain, base: dto }])}
+                verseEnd={dto.verse_end}
+                // A following verse exists iff the expanded index has a row
+                // starting right after this one's span.
+                hasNextVerse={!!versesByVerseNum[(dto.verse_end ?? dto.verse) + 1]}
+                onMergeBridge={onMergeBridge}
+                onSplitBridge={onSplitBridge}
+                verseCommentCounts={verseCommentCounts}
+                onOpenComments={onOpenVerseComments}
               />
               {/* `\s*` headings live in this verse's trailing verseObjects
                   but introduce the NEXT verse — render the band AFTER the
@@ -348,6 +374,12 @@ function VerseSpan({
   onAlign,
   onEdit,
   onSave,
+  verseEnd,
+  hasNextVerse,
+  onMergeBridge,
+  onSplitBridge,
+  verseCommentCounts,
+  onOpenComments,
 }: {
   book: string;
   chapter: number;
@@ -386,6 +418,19 @@ function VerseSpan({
   onAlign: () => void;
   onEdit: (plain: string) => void;
   onSave: (plain: string) => void;
+  // Inclusive range end for this row (null for singletons) — the bridge buttons
+  // need it to label "break bridge a-b" / decide merge vs extend.
+  verseEnd?: number | null;
+  // Whether a following verse row exists to merge into (UST bridge create).
+  hasNextVerse?: boolean;
+  // UST-only verse-bridge create/break. Absent for other columns / viewers.
+  onMergeBridge?: (verse: number) => void;
+  onSplitBridge?: (verse: number) => void;
+  // Verse-level internal comments. The badge renders only on the active verse
+  // (see below), matching the bridge buttons; the column that gets these props
+  // is chosen upstream so only one column shows it per verse.
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenComments?: (anchorEl: HTMLElement, verse: number) => void;
 }) {
   const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   const activeRange = useMemo<{ start: number; end: number } | null>(() => {
@@ -653,6 +698,22 @@ function VerseSpan({
       >
         {verseNum === 0 ? "intro" : `${chapter}:${verseLabel}`}
       </span>
+      {/* Internal-comment badge — active verse only, mirroring the bridge
+          buttons. stopPropagation keeps the click from re-selecting the verse
+          (which would re-render and detach the popover's anchor mid-open). */}
+      {isActive && onOpenComments && (
+        <Box
+          component="span"
+          onClick={(e) => e.stopPropagation()}
+          sx={{ display: "inline-flex", verticalAlign: "-4px" }}
+        >
+          <CommentBadge
+            counts={verseCommentCounts?.(verseNum) ?? EMPTY_COMMENT_COUNTS}
+            onOpen={(el) => onOpenComments(el, verseNum)}
+            titleWhenEmpty="Add an internal comment on this verse"
+          />
+        </Box>
+      )}
       {!readOnly && (
         <AlignLinkButton
           targetContent={content}
@@ -690,6 +751,16 @@ function VerseSpan({
             <CheckIcon sx={{ fontSize: 14 }} />
           </IconButton>
         </Tooltip>
+      )}
+      {!readOnly && (onMergeBridge || onSplitBridge) && (
+        <VerseBridgeButtons
+          verse={verseNum}
+          verseEnd={verseEnd ?? null}
+          active={isActive}
+          hasNextVerse={!!hasNextVerse}
+          onMergeBridge={onMergeBridge}
+          onSplitBridge={onSplitBridge}
+        />
       )}
       {!readOnly && hasDraft && (
         <Tooltip title={`undo edits to verse ${verseNum}`}>

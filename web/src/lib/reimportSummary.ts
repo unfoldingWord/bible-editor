@@ -82,6 +82,42 @@ export function summarizeReimport(res: ReimportResponse): string {
     (t.ref_moved_unattributable ?? 0) +
     (t.ref_moved_ours_conflict ?? 0);
   if (refHeld) parts.push(`${refHeld} flagged for review (reference differs between here and Door43)`);
+  // Verse-range STRUCTURE (issues #727/#728) — bridges like `1-2` and splits —
+  // reconciled against Door43 as its own dimension, apart from verse content.
+  // Counted per group of overlapping ranges, not per verse, so the noun is
+  // "verse range(s)" rather than "verse(s)".
+  //
+  // The overlap line comes first because it is the warning: a chapter left with
+  // two rows whose ranges intersect cannot be rendered by the export at all
+  // (VerseRangeOverlapError), so nothing from that chapter reaches Door43 until
+  // someone fixes it. Says only what was measured — the export's refusal — and
+  // not "book marked out of sync", for the same reason as the blocked-ID line
+  // below: this snackbar also serves the manual path, which never stamps the
+  // watermark.
+  if (t.structure_overlap) {
+    parts.push(
+      `${t.structure_overlap} overlapping verse range(s) found (chapter cannot be exported until fixed)`,
+    );
+  }
+  // Kept the app's structure over a diverging Door43 structure and flagged it.
+  // Names the direction like merge_kept_ai, but not a single cause: the API
+  // refuses for three measured reasons (no human moved master, the shape was not
+  // a plain bridge/split, or the anchor verse's own content merge refused), and
+  // the per-row flag carries which one.
+  if (t.structure_refused) {
+    parts.push(`${t.structure_refused} kept the app's verse range(s) over Door43's (flagged for review)`);
+  }
+  if (t.structure_adopted) parts.push(`${t.structure_adopted} verse range(s) adopted from Door43 (split or bridge)`);
+  // An app-side bridge/split the nightly export has not published yet — ordinary
+  // in-flight work, reported so a pull that skipped Door43's rows for it does not
+  // read as "no changes".
+  if (t.structure_kept_local) parts.push(`${t.structure_kept_local} verse range(s) kept from the app (not yet exported)`);
+  // No export watermark for the file, so the sync could not tell an unexported app
+  // edit from an exported one; it kept the app's rows unchecked (the mirror of
+  // merge_unavailable). Worded as "not checked" — the sync measured nothing here.
+  if (t.structure_unclassified) {
+    parts.push(`${t.structure_unclassified} verse range(s) kept — not checked against Door43 (no export record)`);
+  }
   // Door43 held exactly the file our last export pushed, so its changes were our
   // own merged export rather than anyone else's edit. The pull still ran; what
   // changed is that those edits are no longer mistaken for someone else's work
