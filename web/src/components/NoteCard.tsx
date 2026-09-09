@@ -1283,15 +1283,25 @@ function NoteCardInner({
   if (supportRef !== savedRef.current.support_reference) rowDiff.support_reference = supportRef;
   const hasRowDiff = Object.keys(rowDiff).length > 0;
   const draftKey = rowKey("tn", row.book, row.id);
-  // Show the read view (plain text + clickable note links) except while the
-  // card is actively being edited: either the user clicked in (editingBody),
-  // or it's the focused card and there's no find match holding it in the read
-  // view for highlighting. An inactive card always reads as plain text/links
-  // regardless of editingBody — leaving the note (active → false) resets
-  // editingBody above, so a re-visited note shows its links again rather than
-  // staying pinned to the textarea it was last edited through.
+  // Show the read view (plain text + clickable note links, or — with the
+  // Preview toggle on — rendered markdown; see showMarkdownPreview below)
+  // except while the card is actively being edited: either the user clicked
+  // in (editingBody), or it's the focused card with previewMode off and no
+  // find match holding it in the read view for highlighting. An inactive
+  // card always reads as plain text/links regardless of editingBody —
+  // leaving the note (active → false) resets editingBody above, so a
+  // re-visited note shows its links again rather than staying pinned to the
+  // textarea it was last edited through.
   const findHighlightActive = !!findQuery && activeMatchOccurrence != null;
-  const showReadView = !editingBody && (!active || findHighlightActive);
+  // previewMode also earns a read view on an ACTIVE card (not just inactive
+  // ones): otherwise the toggle would visibly do nothing while the user is
+  // focused on the very note they're trying to preview (#752 review — an
+  // active card used to always fall through to the raw textarea regardless
+  // of the toggle). It still yields to editingBody (clicking into the body
+  // itself always means "edit now") and to a live find match, which needs
+  // the plain-text highlighter and — per the toggle's own disabled state
+  // below — wins over previewMode no matter what the user last chose.
+  const showReadView = !editingBody && (!active || findHighlightActive || previewMode);
   // The markdown-rendered view stands in for NoteBodyReadView only when no
   // find match needs the plain-text highlighter — a live find hit always
   // wins, regardless of the toggle, so "here I am" scrolling/marking keeps
@@ -1824,39 +1834,56 @@ function NoteCardInner({
               </Button>
             </span>
           </Tooltip>
-          <Tooltip title={previewMode ? "show raw markdown text" : "preview as rendered markdown"}>
-            <IconButton
-              size="small"
-              // Preview is meant to work on an INACTIVE card (showReadView is
-              // forced false whenever active — an active note always shows
-              // the raw textarea, since you can't edit rendered markdown).
-              // The Paper ancestor activates on onFocus (bound to both
-              // onMouseDown and the native onFocus), and a native <button>
-              // takes focus on click by default — a focus event React
-              // re-dispatches up through onFocus handlers regardless of
-              // whether the originating mousedown's propagation was
-              // stopped. preventDefault on mousedown suppresses that
-              // default focus-on-click behavior (mirrors the preventDefault
-              // in NoteBodyReadView's own onMouseDown, for the same reason:
-              // controlling activation precisely instead of leaving it to
-              // the browser's default), while stopPropagation keeps the
-              // mousedown itself from ever reaching Paper's onMouseDown.
-              onMouseDown={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-              }}
-              onClick={(e) => {
-                e.stopPropagation();
-                setPreviewMode((v) => !v);
-              }}
-              sx={{ p: 0.25, color: previewMode ? "primary.main" : "text.secondary" }}
-            >
-              {previewMode ? (
-                <VisibilityOffOutlinedIcon sx={{ fontSize: 16 }} />
-              ) : (
-                <VisibilityOutlinedIcon sx={{ fontSize: 16 }} />
-              )}
-            </IconButton>
+          <Tooltip
+            title={
+              findHighlightActive
+                ? "preview is disabled while a find match is highlighted in this note"
+                : previewMode
+                  ? "show raw markdown text"
+                  : "preview as rendered markdown"
+            }
+          >
+            <span>
+              <IconButton
+                size="small"
+                // A live find match always wins the read view (it needs the
+                // plain-text highlighter — see showReadView above), so the
+                // toggle would otherwise sit enabled while silently doing
+                // nothing until the match clears (#752 review). Disabling it
+                // makes that latency visible instead of letting a click
+                // change the icon with no visible effect.
+                disabled={findHighlightActive}
+                // Preview also works on an ACTIVE card now (see showReadView
+                // above), but clicking this toggle must never itself BE the
+                // click that activates the card or starts editing. The Paper
+                // ancestor activates on onFocus (bound to both onMouseDown
+                // and the native onFocus), and a native <button> takes focus
+                // on click by default — a focus event React re-dispatches up
+                // through onFocus handlers regardless of whether the
+                // originating mousedown's propagation was stopped.
+                // preventDefault on mousedown suppresses that default
+                // focus-on-click behavior (mirrors the preventDefault in
+                // NoteBodyReadView's own onMouseDown, for the same reason:
+                // controlling activation precisely instead of leaving it to
+                // the browser's default), while stopPropagation keeps the
+                // mousedown itself from ever reaching Paper's onMouseDown.
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setPreviewMode((v) => !v);
+                }}
+                sx={{ p: 0.25, color: previewMode ? "primary.main" : "text.secondary" }}
+              >
+                {previewMode ? (
+                  <VisibilityOffOutlinedIcon sx={{ fontSize: 16 }} />
+                ) : (
+                  <VisibilityOutlinedIcon sx={{ fontSize: 16 }} />
+                )}
+              </IconButton>
+            </span>
           </Tooltip>
         </Stack>
         {showMarkdownPreview ? (
