@@ -509,76 +509,104 @@ export function BookLintIndicator({
           ];
           if (isExpanded) {
             items.push(
-              ...group.issues.map((issue, i) => (
-                <MenuItem
-                  key={`${group.key}-${issue.resource}-${issue.ref}-${issue.rowId ?? ""}-${i}`}
-                  onClick={() => {
-                    setOpen(false);
-                    onGoToIssue(issue);
-                  }}
-                  sx={{ pl: 4, py: 0.5, alignItems: "flex-start" }}
-                >
-                  <Box sx={{ flex: 1, minWidth: 0 }}>
-                    <Box>
-                      <Typography
-                        variant="body2"
-                        component="span"
-                        sx={{ fontFamily: "monospace", fontWeight: 600, whiteSpace: "nowrap" }}
-                      >
-                        {issue.ref}
-                      </Typography>
+              ...group.issues.map((issue, i) => {
+                // Duplicate-group sub-items previously rendered only ref +
+                // resource with no reason text at all (issue #648) — a
+                // translator who expanded a group still had no explanation
+                // for any individual row in it. Issues sharing a group no
+                // longer necessarily share the exact same message (issue
+                // #700: review-flag issues group by check+reviewKind, and
+                // "type" mode groups by check alone, so per-row wording can
+                // differ within a group) — always showing each issue's own
+                // message here keeps this correct under every grouping mode.
+                // A codex review on #723 caught that the un-clamped text is
+                // NOT "one click away via the group header" when
+                // `messagesVary`: the header shows a neutral placeholder in
+                // that case (see below), not any row's real text, so a
+                // clamp with no way to lift it left long reasons unreadable
+                // before dismissing. Give each row its own chevron, keyed by
+                // `issueKey` (a different string shape than any `group.key`,
+                // so it can't collide with the group-level toggles that
+                // reuse this same `expanded` Set).
+                const rowKey = issueKey(issue);
+                const isRowMessageExpanded = expanded.has(rowKey);
+                return (
+                  <MenuItem
+                    key={`${group.key}-${issue.resource}-${issue.ref}-${issue.rowId ?? ""}-${i}`}
+                    onClick={() => {
+                      setOpen(false);
+                      onGoToIssue(issue);
+                    }}
+                    sx={{ pl: 4, py: 0.5, alignItems: "flex-start" }}
+                  >
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      <Box>
+                        <Typography
+                          variant="body2"
+                          component="span"
+                          sx={{ fontFamily: "monospace", fontWeight: 600, whiteSpace: "nowrap" }}
+                        >
+                          {issue.ref}
+                        </Typography>
+                        <Typography
+                          variant="caption"
+                          component="span"
+                          color="text.secondary"
+                          sx={{ textTransform: "uppercase", ml: 1 }}
+                        >
+                          {issue.resource}
+                        </Typography>
+                      </Box>
                       <Typography
                         variant="caption"
-                        component="span"
                         color="text.secondary"
-                        sx={{ textTransform: "uppercase", ml: 1 }}
+                        sx={isRowMessageExpanded ? { mt: 0.25 } : { ...clampSx, mt: 0.25 }}
                       >
-                        {issue.resource}
+                        {issue.message}
                       </Typography>
+                      <DoorDiff issue={issue} />
                     </Box>
-                    {/* Duplicate-group sub-items previously rendered only
-                        ref + resource with no reason text at all (issue
-                        #648) — a translator who expanded a group still had
-                        no explanation for any individual row in it. Issues
-                        sharing a group no longer necessarily share the exact
-                        same message (issue #700: review-flag issues group by
-                        check+reviewKind, and "type" mode groups by check
-                        alone, so per-row wording can differ within a group)
-                        — always showing each issue's own message here, not
-                        just when it happens to differ from the group
-                        header's, keeps this correct under every grouping
-                        mode. Clamped like every other message in this menu
-                        rather than given its own expand toggle, since the
-                        un-clamped text is already one click away via the
-                        group header above. */}
-                    <Typography variant="caption" color="text.secondary" sx={{ ...clampSx, mt: 0.25 }}>
-                      {issue.message}
-                    </Typography>
-                    <DoorDiff issue={issue} />
-                  </Box>
-                  {issue.dismissible && issue.rowId && dismissibleKind(issue.resource) && (
-                    <Tooltip title="Mark reviewed — clears this flag without changing the row">
-                      <span>
-                        <IconButton
-                          size="small"
-                          disabled={dismissBusy}
-                          sx={{ ml: 0.5 }}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void dismissOne(issue);
-                          }}
-                        >
-                          {busyKey === issueKey(issue) ? (
-                            <CircularProgress size={16} />
-                          ) : (
-                            <CheckCircleOutlineIcon fontSize="small" />
-                          )}
-                        </IconButton>
-                      </span>
+                    <Tooltip title={isRowMessageExpanded ? "Show less" : "Show full message"}>
+                      <IconButton
+                        size="small"
+                        aria-label={isRowMessageExpanded ? "Show less" : "Show full message"}
+                        sx={{ ml: 0.5 }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleExpanded(rowKey);
+                        }}
+                      >
+                        {isRowMessageExpanded ? (
+                          <ExpandLessIcon fontSize="small" />
+                        ) : (
+                          <ExpandMoreIcon fontSize="small" />
+                        )}
+                      </IconButton>
                     </Tooltip>
-                  )}
-                </MenuItem>
-              )),
+                    {issue.dismissible && issue.rowId && dismissibleKind(issue.resource) && (
+                      <Tooltip title="Mark reviewed — clears this flag without changing the row">
+                        <span>
+                          <IconButton
+                            size="small"
+                            disabled={dismissBusy}
+                            sx={{ ml: 0.5 }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void dismissOne(issue);
+                            }}
+                          >
+                            {busyKey === issueKey(issue) ? (
+                              <CircularProgress size={16} />
+                            ) : (
+                              <CheckCircleOutlineIcon fontSize="small" />
+                            )}
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                    )}
+                  </MenuItem>
+                );
+              }),
             );
           }
           return items;
