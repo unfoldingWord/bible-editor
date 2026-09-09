@@ -156,6 +156,29 @@ async function main() {
     assert(clr && clr.args[1] === "far-edge", "  ...and clears the gap, guarded on the gap_since_sha it walked against");
   }
 
+  // ── issue #692 item 2 (Codex review round 2, P1), the bug this rewrite
+  // fixes: REACHING gap_since_sha does not mean this entry is fully
+  // resolved if a merge sat along the way — the merge's OTHER parent was
+  // never fetched (the walk stopped the moment it saw gap_since_sha) and
+  // must survive into the new frontier, not be dropped alongside `current`.
+  {
+    mockGitea([
+      [
+        commit("start", "hand fix", "h@x", { parent: "merge1" }),
+        commit("merge1", "Merge pull request '…' (#1) from x into master", "h@x", { parents: ["far-edge", "side-branch"] }),
+        commit("far-edge", "old", "h@x"),
+      ],
+    ]);
+    const db = mockDb(state("far-edge", ["start"]));
+    const res = await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
+    assert(res.resolved === false, "reaching gap_since_sha along ONE branch of a merge does not resolve the whole entry");
+    assert(res.status === "ok", "  ...the walk itself still reports success — it really did reach the target");
+    assert(res.inserted === 2, "  ...having inserted both start and the merge commit");
+    assert(!clearRun(db), "  ...so the gap must NOT be cleared");
+    const fr = frontierRun(db);
+    assert(fr && JSON.parse(fr.args[2]).join(",") === "side-branch", "  ...and the merge's UNFETCHED second parent becomes the new frontier");
+  }
+
   // ── single entry, page_cap, ordinary (merge-free) continuation: the
   // frontier is REPLACED by the one new entry, still a single-entry array ──
   {

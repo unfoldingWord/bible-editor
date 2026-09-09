@@ -299,6 +299,21 @@ export function computeGapFrontier(rows: LedgerRow[], gapSinceSha: string | null
   return Array.from(frontier);
 }
 
+/**
+ * Never throws: a malformed or non-array gap_frontier_json reads as empty.
+ * Exported so dcsCommitBackfill.ts and dcsCommits.ts share one parser rather
+ * than three copies that could drift.
+ */
+export function parseGapFrontier(json: string | null): string[] {
+  if (json == null) return [];
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 // Exported so dcsCommitBackfill.ts (issue #692 item 2) writes the exact same
 // statement rather than a second copy that could drift from it.
 export const INSERT_COMMIT_SQL = `INSERT INTO dcs_commits
@@ -341,16 +356,27 @@ const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    -- contiguous than it was. Coverage claims must err conservative: the field
    -- means "history below this sha is not proven contiguous", and only the
    -- backfill path (dcsCommitBackfill.ts, issue #692 item 2) that actually
-   -- closes the hole clears it. Set as a triple with gap_at and
-   -- gap_frontier_json, for the same reason as last_sha/last_committed_at
-   -- above — a regular poll must never touch any of the three once an older
-   -- gap already claimed them, or it would silently discard the backfill's
-   -- resume progress out from under it.
+   -- closes the hole clears it. gap_since_sha/gap_at are a pair that must
+   -- never move once an older gap already claimed them, for the same reason
+   -- as last_sha/last_committed_at above — a regular poll touching either
+   -- would silently discard the backfill's target out from under it.
    gap_since_sha = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
                           THEN excluded.gap_since_sha ELSE dcs_repo_polls.gap_since_sha END,
    gap_at = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
                    THEN excluded.gap_at ELSE dcs_repo_polls.gap_at END,
-   gap_frontier_json = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
+   -- gap_frontier_json is DIFFERENT (Codex review round 2, P1): it is not
+   -- "keep old, ignore new" but "keep old, ADD new". The caller has already
+   -- unioned any prior frontier into excluded.gap_frontier_json (see the
+   -- comment on gapFrontier in pollDcsRepo) whenever THIS poll also found
+   -- a fresh capped range, so the only case that must fall back to the
+   -- existing column is "this poll completed cleanly and found nothing new
+   -- to add" — recognisable because the caller binds NULL there (no new gap
+   -- this tick). Discarding a newer hole's frontier the way the old CASE did
+   -- (mirroring gap_since_sha's guard) meant backfill — which only ever
+   -- walks the frontier it has — could never reach a hole that opened after
+   -- an older one was already in progress; clearing the older gap would
+   -- then report full coverage with those commits still missing.
+   gap_frontier_json = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL OR excluded.gap_frontier_json IS NOT NULL
                               THEN excluded.gap_frontier_json ELSE dcs_repo_polls.gap_frontier_json END`;
 
 export interface RepoPollResult {
@@ -412,7 +438,22 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
   // is gapSince itself — dcsCommitBackfill.ts treats an empty frontier as
   // unresolvable and drops the gap rather than retrying forever with
   // nothing to walk.
-  const gapFrontier = gapSince != null ? computeGapFrontier(rows, gapSince) : [];
+  //
+  // UNIONED with whatever frontier is ALREADY on the row (Codex review round
+  // 2, P1). "Oldest gap wins" keeps gap_since_sha/gap_at at the FIRST gap's
+  // boundary when a second one opens while backfill hasn't finished the
+  // first — correct, since that boundary is the more conservative (older)
+  // claim. But the ORIGINAL version of this fix then discarded the NEW
+  // gap's frontier outright (same CASE guard, applied to all three
+  // columns): backfill only ever walks the OLD frontier toward the OLD
+  // target, so it can never discover a hole that opened later and closer to
+  // the tip — clearing the old gap would then report full coverage with
+  // those commits still missing. Every entry, old and new, walks toward the
+  // SAME (oldest) gap_since_sha; a newer entry just has farther to walk,
+  // which costs extra (harmless, ON-CONFLICT-DO-NOTHING) re-insertion of
+  // already-covered ground on the way, not a correctness gap.
+  const priorFrontier = state?.gap_since_sha != null ? parseGapFrontier(state.gap_frontier_json) : [];
+  const gapFrontier = gapSince != null ? Array.from(new Set([...priorFrontier, ...computeGapFrontier(rows, gapSince)])) : [];
   const gapFrontierJson = gapSince != null ? JSON.stringify(gapFrontier) : null;
 
   // CHUNKED, because D1 caps a batch at 100 statements (documented at

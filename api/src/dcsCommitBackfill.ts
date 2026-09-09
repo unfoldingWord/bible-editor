@@ -37,16 +37,23 @@
 // (the same listMasterCommitsSince the forward poll uses, anchored at that
 // entry via `fromSha` instead of master's live tip). Whatever the walk
 // finds gets inserted (rows are keyed (repo, sha), so re-walking already-
-// covered ground is inert); then:
-//   * the walk reaches gap_since_sha, OR runs out of history entirely (see
-//     BOOTSTRAP GAPS) → this entry is fully resolved; drop it from the
-//     frontier.
-//   * the walk is cut short by its own page budget → replace this entry
-//     with WHATEVER NEW FRONTIER ITS OWN WALK DISCOVERED (computeGapFrontier
-//     again, over just this sub-walk's rows) — one entry for an ordinary
-//     chain, more than one if this sub-walk itself crossed a merge. If that
-//     sub-frontier is empty (the oldest row this sub-walk saw is itself a
-//     repo root), this entry resolves too — there is nothing older to find.
+// covered ground is inert); then, REGARDLESS of how the walk ended,
+// computeGapFrontier runs again over exactly the rows THIS sub-walk
+// visited, and `current` is replaced by whatever it finds:
+//   * the walk reaches gap_since_sha, or runs out of history entirely (see
+//     BOOTSTRAP GAPS) → normally empty, so `current` simply drops. But NOT
+//     always (Codex review round 2, P1): reaching gap_since_sha proves only
+//     that the specific chain this walk followed is covered — if a merge
+//     commit sat anywhere in the visited rows, its OTHER parent is neither
+//     visited nor (in general) gap_since_sha, and computeGapFrontier still
+//     finds it. The first version of this fix dropped `current`
+//     unconditionally on "reached the target", which silently lost that
+//     branch exactly as PR #734's FIRST review round found for the forward
+//     poll's own gap computation.
+//   * the walk is cut short by its own page budget → the sub-frontier is
+//     one entry for an ordinary chain, more than one if this sub-walk
+//     itself crossed a merge, or empty if the oldest row it saw is itself a
+//     repo root (nothing older to find — this entry resolves too).
 //   * a transport failure → leave the frontier untouched; the next tick
 //     retries the same entry.
 // The overall gap clears the moment the frontier is empty — every branch
@@ -86,6 +93,7 @@ import {
   INSERT_COMMIT_SQL,
   computeGapFrontier,
   ledgerRowsFromCommits,
+  parseGapFrontier,
 } from "./dcsCommitPoll.ts";
 
 /** Pages per repo per tick, spent on ONE frontier entry. */
@@ -104,17 +112,6 @@ export interface BackfillResult {
   /** The OVERALL gap is closed: the frontier is now empty. */
   resolved: boolean;
   status: string;
-}
-
-/** Never throws: a malformed or non-array gap_frontier_json reads as empty. */
-function parseFrontier(json: string | null): string[] {
-  if (json == null) return [];
-  try {
-    const parsed = JSON.parse(json);
-    return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string") : [];
-  } catch {
-    return [];
-  }
 }
 
 const CLEAR_GAP_SQL = `UPDATE dcs_repo_polls
@@ -145,7 +142,7 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
   }
 
   const frontierJson = state.gap_frontier_json;
-  const frontier = parseFrontier(frontierJson);
+  const frontier = parseGapFrontier(frontierJson);
 
   // An empty frontier with a gap still open — either a defensive case (the
   // walk that opened this gap found nothing to resume from at all), or a row
@@ -193,37 +190,44 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
   // finding it (force-push under the hole, or — the common case — a
   // bootstrap gap, whose gap_since_sha is never reachable by an older-only
   // walk in the first place; see BOOTSTRAP GAPS above). Both mean "nothing
-  // more to find down this branch".
+  // more to find ALONG THE PATH THIS WALK ACTUALLY TOOK" — NOT "this entry
+  // is fully resolved". Codex review round 2 (P1): reaching gap_since_sha
+  // only proves the specific chain this walk followed is covered; if a
+  // merge commit sat anywhere in `rows`, its OTHER parent is neither
+  // visited nor (in general) equal to gap_since_sha, and dropping `current`
+  // outright — the original version of this fix — silently lost that
+  // branch exactly as PR #734's FIRST review round found for the forward
+  // poll. So: compute this sub-walk's own frontier UNCONDITIONALLY, the
+  // same function the page-cap path already used, regardless of how the
+  // walk ended. On an ordinary merge-free range this is empty and `current`
+  // simply drops, same behavior as before.
   const reachedTarget = !page.incomplete;
   const reachedHistoryEnd = page.incompleteReason === "source_sha_not_in_history";
+  const isTransportFailure = page.incomplete && !reachedHistoryEnd && page.incompleteReason !== "page_cap";
 
   let status: string;
   let newFrontier: string[];
-  if (reachedTarget || reachedHistoryEnd) {
-    status = reachedTarget ? "ok" : "source_sha_not_in_history";
-    newFrontier = rest;
-  } else if (page.incompleteReason === "page_cap") {
-    // This entry's own walk may itself have crossed a merge — recompute the
-    // frontier over exactly the rows THIS sub-walk visited, same function
-    // the original poll uses.
-    const subFrontier = computeGapFrontier(rows, state.gap_since_sha);
-    if (subFrontier.length === 0) {
-      // A full page whose visited rows' every parent is already visited or
-      // absent (a repo root among them) — nowhere left to go down this
-      // branch. Resolve rather than retry a walk that can never move.
-      status = "reached_root";
-      newFrontier = rest;
-    } else {
-      status = "page_cap";
-      newFrontier = [...rest, ...subFrontier];
-    }
-  } else {
-    // Transport failure: put `current` back unchanged. The rows fetched
-    // before the failure (if any) are still inserted above — the next tick
-    // resumes the same entry, exactly like a mid-walk transport failure in
-    // the regular poll.
+  if (isTransportFailure) {
+    // Put `current` (and every other untouched entry) back unchanged. The
+    // rows fetched before the failure (if any) are still inserted above —
+    // the next tick resumes the same entry, exactly like a mid-walk
+    // transport failure in the regular poll.
     status = page.incompleteReason;
     newFrontier = frontier;
+  } else {
+    const subFrontier = computeGapFrontier(rows, state.gap_since_sha);
+    newFrontier = [...rest, ...subFrontier];
+    status = reachedTarget
+      ? "ok"
+      : reachedHistoryEnd
+        ? "source_sha_not_in_history"
+        : subFrontier.length === 0
+          ? // A full page whose visited rows' every parent is already visited
+            // or absent (a repo root among them) — nowhere left to go down
+            // this branch. Resolve rather than retry a walk that can never
+            // move.
+            "reached_root"
+          : "page_cap";
   }
 
   if (newFrontier.length === 0) {

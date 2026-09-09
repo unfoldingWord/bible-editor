@@ -625,7 +625,7 @@ async function main() {
     );
   }
 
-  // ── F3: the OLDEST unresolved gap survives a later one ──────────────────
+  // ── F3: the OLDEST unresolved gap's SHA/AT survive a later one ───────────
   {
     const pages = [fullPage("a"), fullPage("b"), fullPage("c"), fullPage("d"), fullPage("e")];
     mockGitea(pages);
@@ -634,16 +634,64 @@ async function main() {
     const upsert = pollUpsert(db);
     assert(
       /gap_since_sha = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
-      "the gap upsert keeps an existing hole rather than overwriting it with a newer one",
+      "the gap upsert keeps an existing hole's gap_since_sha rather than overwriting it with a newer one",
     );
     assert(
       /gap_at = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
       "  ...and gap_at is gated on the same condition, so the pair cannot split",
     );
-    assert(
-      /gap_frontier_json = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
-      "  ...and gap_frontier_json too — it is a triple with gap_since_sha and gap_at, not a pair",
+  }
+
+  // ── issue #692 item 2 (Codex review round 2, P1): a NEW gap opening while
+  // an OLDER one is still open must not silently vanish. gap_since_sha/
+  // gap_at stay pinned to the OLD (more conservative) boundary — proven
+  // above — but gap_frontier_json is a UNION, not a second "keep old,
+  // discard new" guard: the old CASE guard, mirrored across all three
+  // columns, meant backfill (which only ever walks the frontier it has)
+  // could never discover a hole that opened later and closer to the tip;
+  // clearing the older gap would then report full coverage with those
+  // commits still missing. ───────────────────────────────────────────────
+  {
+    const dPage = Array.from({ length: 50 }, (_, i) =>
+      i === 49 ? commit("d49", "hand fix d49", "h@x", { parent: "new-frontier" }) : commit(`d${i}`, `hand fix d${i}`, "h@x"),
     );
+    mockGitea([fullPage("a"), fullPage("b"), fullPage("c"), dPage, fullPage("e"), fullPage("f")]);
+    const db = mockDb({
+      repo: "en_tn",
+      last_sha: "unreachable",
+      gap_since_sha: "older-hole",
+      gap_frontier_json: JSON.stringify(["old-frontier"]),
+      last_attempted_at: NOW - 3600,
+    });
+    await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    const upsert = pollUpsert(db);
+    const boundFrontier = JSON.parse(upsert.args[9]);
+    assert(
+      boundFrontier.includes("old-frontier") && boundFrontier.includes("new-frontier"),
+      "a fresh page-cap gap's frontier is UNIONED with the already-open gap's frontier, not discarded",
+    );
+    assert(
+      /gap_frontier_json = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL OR excluded\.gap_frontier_json IS NOT NULL/.test(upsert.sql),
+      "  ...and the SQL guard applies that union even when an older gap already claimed gap_since_sha/gap_at",
+    );
+  }
+
+  // ── ...but when THIS poll completes cleanly (finds nothing new to add),
+  // the bound value is NULL, so the guard correctly falls back to keeping
+  // whatever frontier the still-open older gap already has — a clean poll
+  // must never look like "no gap" and wipe it. ────────────────────────────
+  {
+    mockGitea([[commit("h1", "hand fix", "h@x"), commit("unreachable", "old", "h@x")]]);
+    const db = mockDb({
+      repo: "en_tn",
+      last_sha: "unreachable",
+      gap_since_sha: "older-hole",
+      gap_frontier_json: JSON.stringify(["old-frontier"]),
+      last_attempted_at: NOW - 3600,
+    });
+    await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    const upsert = pollUpsert(db);
+    assert(upsert.args[9] === null, "a clean poll (no new gap) binds NULL for gap_frontier_json, never an empty-array union");
   }
 
   console.log("dcsCommitPoll: all assertions passed");
