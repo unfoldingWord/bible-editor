@@ -1838,7 +1838,7 @@ function NoteCardInner({
             title={
               findHighlightActive
                 ? "preview is disabled while a find match is highlighted in this note"
-                : previewMode
+                : showMarkdownPreview
                   ? "show raw markdown text"
                   : "preview as rendered markdown"
             }
@@ -1873,11 +1873,31 @@ function NoteCardInner({
                 }}
                 onClick={(e) => {
                   e.stopPropagation();
-                  setPreviewMode((v) => !v);
+                  // Keyed on showMarkdownPreview — what's actually ON
+                  // SCREEN right now — rather than toggling the raw
+                  // previewMode preference blindly. Those two can diverge:
+                  // clicking into the rendered body (onActivate) latches
+                  // editingBody true, which forces the raw view regardless
+                  // of previewMode, so previewMode can still read true while
+                  // raw text is what's showing. Blindly flipping previewMode
+                  // in that state would turn the PREFERENCE off (since it
+                  // was already on) while the screen stayed raw either way —
+                  // the toggle would visibly do nothing, then need a SECOND
+                  // click to actually restore preview (#752 review). Acting
+                  // on showMarkdownPreview instead makes one click always do
+                  // what the icon/tooltip say: currently previewing -> go
+                  // raw; currently raw for any reason -> preview (and clear
+                  // editingBody so that preference actually takes effect).
+                  if (showMarkdownPreview) {
+                    setPreviewMode(false);
+                  } else {
+                    setPreviewMode(true);
+                    setEditingBody(false);
+                  }
                 }}
-                sx={{ p: 0.25, color: previewMode ? "primary.main" : "text.secondary" }}
+                sx={{ p: 0.25, color: showMarkdownPreview ? "primary.main" : "text.secondary" }}
               >
-                {previewMode ? (
+                {showMarkdownPreview ? (
                   <VisibilityOffOutlinedIcon sx={{ fontSize: 16 }} />
                 ) : (
                   <VisibilityOutlinedIcon sx={{ fontSize: 16 }} />
