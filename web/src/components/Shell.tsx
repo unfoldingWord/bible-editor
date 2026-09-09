@@ -1139,14 +1139,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       if (!byVerse) return false;
       return chapterOpensWithoutMarker(getVO(byVerse[0]), getVO(byVerse[1]));
     });
+    //
+    // The book-intro chapter (chapter 0) always gets the slot: the summary now
+    // lists chapter 0 even when its only note is trashed or gone (see
+    // api/src/chapterSummary.ts), and without a tile the rail is blank and
+    // activeVerse stays at a verse 1 that does not exist there.
     const tiles: VerseTile[] = [];
-    if (introHasResource || introHasScripture || introMarkerMissing) {
+    if (chapter === 0 || introHasResource || introHasScripture || introMarkerMissing) {
       tiles.push({ verse: 0, has: false, lanes: buildLanes(0) });
     }
     const verseNums = [...versesWithSomething].filter((v) => v > 0).sort((a, b) => a - b);
     for (const v of verseNums) tiles.push({ verse: v, has: hasUnalignedFor(v), lanes: buildLanes(v) });
     return tiles;
-  }, [versesForTiles, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl]);
+  }, [chapter, versesForTiles, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl]);
 
   // Which alignment-attention refs (from the last nightly export) are already
   // fixed in the currently loaded chapter — re-parsed against live verse
