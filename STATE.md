@@ -168,8 +168,10 @@ Highlights that bite repeatedly:
 
 - **Master's three commit producers are distinguishable, and two shapes are traps.** Ours:
   `bible-editor: {BOOK} {res} → master (#N)` AND `bible-editor export: … → {BRANCH} (export-…)` — the `-be-`
-  branch commit also appears in master's file history once the branch merges. AI: author `bot@unfoldingword.org`,
-  usually `@api.bp-assistant` in the subject. Human: everything else. Trap 1: `Revert "bible-editor: EZK ult →
+  branch commit also appears in master's file history once the branch merges. AI: bot author `bot@unfoldingword.org`
+  **and** a pipeline-shaped subject (or a gated trailer) — since #550 the bot address alone is not enough, it used
+  to stamp six hand-directed bot edits `ai`; `@api.bp-assistant` in a non-revert subject is a separate, independent
+  route to `ai` for an unrecognized (non-bot) author. Human: everything else. Trap 1: `Revert "bible-editor: EZK ult →
   master (#6711)" (#6716)` is a real **human** commit, so the prefix must be anchored at the start of the subject,
   never a substring test. Trap 2: `ULT: EZK 38 [pjoakes]` is bot-authored with a plain username in the bracket —
   the bot pushes on a human's behalf, and the content is still machine-written, so the **author** decides, not
@@ -466,6 +468,13 @@ Highlights that bite repeatedly:
   that have no counterpart here. **Next time this routine runs:** read their `docs/upstream-sync-*.md` first
   (it names the merge-base and what they've already absorbed from us), then diff commits after their latest
   sync doc's date rather than re-walking the full history back to `7f83a398`.
+- **A verse version floor computed as `MAX(new_version)` over `edit_log` is blind to imported-then-bridged
+  verses.** Bridge `'delete'` audit rows (written by the bridge route in `api/src/verses.ts` for the absorbed
+  verse) carry `new_version = NULL` and the deleted version only in `prev_version`, and the bootstrap import
+  writes no `edit_log` rows for verses at all — so a "next version must exceed history" floor sees nothing for
+  such a verse and re-mints version 1, letting a stale `If-Match: 1` pass CAS against the recreated row.
+  `verseVersionFloorSql` in `api/src/verseBridge.ts` therefore uses `MAX(COALESCE(new_version, prev_version))`;
+  any future version floor must do the same. Found by review of the #727 guards, fixed in the #728 commit.
 
 ## Stop conditions / goals
 

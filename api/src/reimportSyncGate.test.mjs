@@ -243,6 +243,34 @@ eq(
   "reclaims do not offset a genuine block — a run with both still withholds",
 );
 
+// ── Issue #727: structure_overlap withholds ─────────────────────────────────
+// applyVerseRows's post-apply structural check found two verse rows in one
+// chapter whose [verse, verse_end] ranges intersect (a `1-2` bridge beside a
+// standalone `2`). The export would render `\v 1-2` + `\v 2`; stamping the
+// watermark would let tonight's export try. Withhold unconditionally — the
+// idBlocked override consents to Door43 LOSING rows, not to publishing an
+// overlapping chapter, so it must not open this.
+eq(
+  shouldRecordResourceSync(counts({ structure_overlap: 1 })),
+  false,
+  "a chapter left with overlapping verse ranges withholds the watermark",
+);
+eq(
+  shouldRecordResourceSync(counts({ structure_overlap: 0 })),
+  true,
+  "a measured zero overlaps stamps",
+);
+eq(
+  shouldRecordResourceSync(counts({ structure_overlap: 2 }), true),
+  false,
+  "the idBlocked override does NOT open the structure_overlap check",
+);
+eq(
+  shouldRecordResourceSync(counts({ structure_overlap: 1, chapters_locked: 0, prune_locked: 0, conflict_skipped: 0, tombstone_blocked: 0 })),
+  false,
+  "…and it withholds even when every other gate is clean",
+);
+
 console.log("\n[isSystemicMergeRefusal]");
 
 // Below threshold: fine, don't withhold.

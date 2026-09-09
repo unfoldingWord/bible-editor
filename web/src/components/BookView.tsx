@@ -23,6 +23,9 @@ import { highlightsFor, isPaintableHtml, overlayFindMarks, renderEditableHTML, r
 import { markHighlightSx, bookTsDividerSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, extractTrailingDividers, stripTrailingDividers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
+import { VerseBridgeButtons } from "./VerseBridgeButtons";
+import { CommentBadge } from "./CommentBadge";
+import type { CommentCounts } from "../lib/commentsIndex";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
 import { AlignLinkButton } from "./AlignLinkButton";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
@@ -49,6 +52,8 @@ interface SearchState {
 }
 
 const READ_ONLY = new Set(["UHB", "UGNT"]);
+
+const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
 
 // Stable placeholder so `chapters.get(ch) ?? UNLOADED_STATE` doesn't hand
 // ChapterBlock a fresh object every render and defeat its memo.
@@ -94,6 +99,13 @@ interface Props {
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  // Verse-level internal comments (team notes) for the active chapter. Bound in
+  // Shell to the loaded chapter's index, so the badge is rendered only on the
+  // active verse (always in the active chapter) — where the counts are valid.
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
   // The active chapter is mid-pipeline. Locks editing on every chapter
   // displayed in book mode — simplest defensive choice; AI typically scopes
   // to one chapter so other chapters in view are still safe, but explaining
@@ -127,6 +139,10 @@ export function BookView({
   onSaveColumn,
   onOpenAligner,
   onEditSection,
+  onMergeBridge,
+  onSplitBridge,
+  verseCommentCounts,
+  onOpenVerseComments,
   locked = false,
   textCheck,
 }: Props) {
@@ -303,6 +319,10 @@ export function BookView({
               onSaveVerse={handleSaveVerse}
               onOpenAligner={onOpenAligner}
               onEditSection={onEditSection}
+              onMergeBridge={onMergeBridge}
+              onSplitBridge={onSplitBridge}
+              verseCommentCounts={verseCommentCounts}
+              onOpenVerseComments={onOpenVerseComments}
               locked={locked}
               textCheck={textCheck}
             />
@@ -346,6 +366,10 @@ const ChapterBlock = memo(function ChapterBlock({
   onSaveVerse,
   onOpenAligner,
   onEditSection,
+  onMergeBridge,
+  onSplitBridge,
+  verseCommentCounts,
+  onOpenVerseComments,
   locked,
   textCheck,
 }: {
@@ -376,6 +400,10 @@ const ChapterBlock = memo(function ChapterBlock({
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
@@ -503,6 +531,16 @@ const ChapterBlock = memo(function ChapterBlock({
       </Box>
       {verseNums.map((v) => {
         const isActive = chapter === activeChapter && v === activeVerse;
+        // The UST bridge buttons sit on the bridge's start row (v). Keep them
+        // available for ANY active verse inside the bridge span — matching
+        // columns mode (DocColumn is range-aware) — not only when the start
+        // verse itself is active. Cheap per-row bool: it flips for the same rows
+        // `isActive` does, so the memo below stays tight.
+        const ustDto = data.verses["UST"]?.[v];
+        const bridgeActive =
+          chapter === activeChapter && ustDto?.verse_end != null && ustDto.verse_end > v
+            ? activeVerse >= v && activeVerse <= ustDto.verse_end
+            : isActive;
         return (
           <VerseRow
             key={`${chapter}-${v}`}
@@ -512,6 +550,7 @@ const ChapterBlock = memo(function ChapterBlock({
             enabledVersions={enabledVersions}
             versesByVersion={data.verses}
             isActive={isActive}
+            bridgeActive={bridgeActive}
             activeNoteQuote={isActive ? activeNoteQuote : null}
             activeNoteOccurrence={isActive ? activeNoteOccurrence : null}
             reorderHighlight={isActive ? reorderHighlight : null}
@@ -526,6 +565,10 @@ const ChapterBlock = memo(function ChapterBlock({
             onSaveVerse={onSaveVerse}
             onOpenAligner={onOpenAligner}
             onEditSection={onEditSection}
+            onMergeBridge={onMergeBridge}
+            onSplitBridge={onSplitBridge}
+            verseCommentCounts={verseCommentCounts}
+            onOpenVerseComments={onOpenVerseComments}
             locked={locked}
             textCheck={textCheck}
           />
@@ -544,6 +587,7 @@ const VerseRow = memo(function VerseRow({
   enabledVersions,
   versesByVersion,
   isActive,
+  bridgeActive,
   activeNoteQuote,
   activeNoteOccurrence,
   reorderHighlight,
@@ -558,6 +602,10 @@ const VerseRow = memo(function VerseRow({
   onSaveVerse,
   onOpenAligner,
   onEditSection,
+  onMergeBridge,
+  onSplitBridge,
+  verseCommentCounts,
+  onOpenVerseComments,
   locked,
   textCheck,
 }: {
@@ -567,6 +615,9 @@ const VerseRow = memo(function VerseRow({
   enabledVersions: string[];
   versesByVersion: Record<string, Record<number, VerseDto>>;
   isActive: boolean;
+  // Range-aware active for the UST bridge buttons (true when the active verse
+  // is anywhere inside this row's bridge span); `isActive` for a non-bridge row.
+  bridgeActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   reorderHighlight: ReorderHighlight | null;
@@ -587,11 +638,18 @@ const VerseRow = memo(function VerseRow({
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
   // Render is intentionally a row of N independent cells driven by the same
   // grid container above — placement is via CSS grid auto-flow.
+  // Verse-level comment badge lives on a single column: ULT, or the leftmost
+  // enabled version when ULT is hidden — so it doesn't repeat across columns.
+  const commentColumn = enabledVersions.includes("ULT") ? "ULT" : enabledVersions[0];
   return (
     <Fragment>
       {enabledVersions.map((bv, colIdx) => {
@@ -608,6 +666,13 @@ const VerseRow = memo(function VerseRow({
             break;
           }
         }
+        // Only meaningful for the UST column (where the bridge buttons show).
+        // versesByVersion is verse_start-keyed, so a truthy lookup at the next
+        // start means a following verse/bridge row actually exists to merge into.
+        const hasNextVerse =
+          bv === "UST" && dto
+            ? !!versesByVersion["UST"]?.[(dto.verse_end ?? dto.verse) + 1]
+            : false;
         return (
           <Box
             key={bv}
@@ -634,6 +699,7 @@ const VerseRow = memo(function VerseRow({
                 versesByVersion["UGNT"]?.[verseNum]?.content
               }
               isActive={isActive}
+              bridgeActive={bridgeActive}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
               reorderHighlight={reorderHighlight}
@@ -646,6 +712,11 @@ const VerseRow = memo(function VerseRow({
               onEditVerse={onEditVerse}
               onSaveVerse={onSaveVerse}
               onEditSection={onEditSection}
+              onMergeBridge={onMergeBridge}
+              onSplitBridge={onSplitBridge}
+              hasNextVerse={hasNextVerse}
+              verseCommentCounts={bv === commentColumn ? verseCommentCounts : undefined}
+              onOpenComments={bv === commentColumn ? onOpenVerseComments : undefined}
               locked={locked}
               textCheck={textCheck}
             />
@@ -665,6 +736,7 @@ const VerseCell = memo(function VerseCell({
   prevDto,
   sourceContent,
   isActive,
+  bridgeActive,
   activeNoteQuote,
   activeNoteOccurrence,
   reorderHighlight,
@@ -677,6 +749,11 @@ const VerseCell = memo(function VerseCell({
   onEditVerse,
   onSaveVerse,
   onEditSection,
+  onMergeBridge,
+  onSplitBridge,
+  hasNextVerse,
+  verseCommentCounts,
+  onOpenComments,
   locked,
   textCheck,
 }: {
@@ -693,6 +770,9 @@ const VerseCell = memo(function VerseCell({
   // broken link when a source word lacks a target. Absent on source columns.
   sourceContent?: unknown;
   isActive: boolean;
+  // Range-aware active for the bridge buttons (see VerseRow) — the active verse
+  // is inside this bridge's span, not necessarily its start row.
+  bridgeActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   reorderHighlight: ReorderHighlight | null;
@@ -711,6 +791,13 @@ const VerseCell = memo(function VerseCell({
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
+  hasNextVerse?: boolean;
+  // Verse-level internal comments. Passed only to the leftmost column's cell,
+  // so the badge shows once per verse; rendered only when this cell is active.
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenComments?: (anchorEl: HTMLElement, verse: number) => void;
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
@@ -1005,6 +1092,22 @@ const VerseCell = memo(function VerseCell({
       >
         {verseNum === 0 ? "intro" : `${chapter}:${formatVerseLabel(dto)}`}
       </Typography>
+      {/* Internal-comment badge — active verse only, mirroring the bridge
+          buttons. stopPropagation keeps the click from re-selecting the verse
+          (which would re-render and detach the popover's anchor mid-open). */}
+      {isActive && onOpenComments && (
+        <Box
+          component="span"
+          onClick={(e) => e.stopPropagation()}
+          sx={{ display: "inline-flex", verticalAlign: "-4px" }}
+        >
+          <CommentBadge
+            counts={verseCommentCounts?.(verseNum) ?? EMPTY_COMMENT_COUNTS}
+            onOpen={(el) => onOpenComments(el, verseNum)}
+            titleWhenEmpty="Add an internal comment on this verse"
+          />
+        </Box>
+      )}
       {!readOnly && (
         <AlignLinkButton
           targetContent={dto.content}
@@ -1043,6 +1146,23 @@ const VerseCell = memo(function VerseCell({
           </IconButton>
         </Tooltip>
       )}
+      {/* Verse-bridge create/break — UST column only, on the first row of a
+          range (dto.verse), never on read-only/locked cells. The callbacks
+          already carry chapter/verse/bibleVersion; VerseBridgeButtons decides
+          internally whether to show merge, split, or both. */}
+      {!readOnly &&
+        bibleVersion === "UST" &&
+        verseNum === dto.verse &&
+        (onMergeBridge || onSplitBridge) && (
+          <VerseBridgeButtons
+            verse={verseNum}
+            verseEnd={dto.verse_end ?? null}
+            active={bridgeActive}
+            hasNextVerse={!!hasNextVerse}
+            onMergeBridge={onMergeBridge ? (v) => onMergeBridge(chapter, v, "UST") : undefined}
+            onSplitBridge={onSplitBridge ? (v) => onSplitBridge(chapter, v, "UST") : undefined}
+          />
+        )}
       {!readOnly && hasDraft && (
         <Tooltip title={`undo edits to verse ${verseNum}`}>
           <IconButton
