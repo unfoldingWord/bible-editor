@@ -71,6 +71,12 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **A `source_attr_ambiguous` verse flag in a chapter Door43 did not touch is the app comparing against its own
+  stale export, not a Door43 source fix.** Measured 2026-09-09 (EZK UST 22:26 / 33:9 / 45:11-12): the edited-verse
+  reconcile was a two-way D1-vs-master attr compare with no base check, so it ran even on `keep_master_unchanged`.
+  Gated in PR for #641. Triage rule: per-chapter-diff the Door43 commits since our last export first — the bot's
+  `UST/ULT: BOOK N` pushes touch only chapter N (measured on EZK 30, EZK 46, JER 47).
+
 - **Door43's validate-and-merge job does NOT rewrite our bytes; own-publish declines are the bot's evening pushes.**
   Measured 2026-09-02 against git.door43.org on five recent `bible-editor:` PRs across three books (en_tq #858,
   #859, #863, #864, #865): the PR head's blob sha equalled master's blob sha at the squash commit every time — #859's
