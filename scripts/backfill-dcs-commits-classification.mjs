@@ -17,6 +17,18 @@
 // current classifier is a no-op, so re-running after a partial apply, or
 // after a future classifyForLedger change, is safe to do again.
 //
+// SKIPPED, DELIBERATELY: rows whose STORED classification_reason is
+// `bot_author_pipeline_trailer` (review finding on #699). ledgerRowsFromCommits
+// stores only the SUBJECT in dcs_commits.message (subjectOf(c.message) —
+// dcsCommitPoll.ts), but that reason is reached only via
+// classifyMasterCommit's AI_PIPELINE_TRAILER check, which reads the message
+// BODY (the `X-AI-Pipeline: bp-assistant/...` trailer, masterLineage.ts).
+// Replaying such a row from the stored subject alone loses the trailer the
+// classification depended on and would downgrade an already-correct `ai` row
+// to `human` — silent data corruption once applied to prod (#701). No such
+// row exists to legitimately need reclassifying under THIS backfill anyway:
+// #696 only ever moved human -> ai, never touched the trailer route.
+//
 // Usage:
 //   1. dump (read-only SELECT; never --file against --remote)
 //      cd api
@@ -54,7 +66,15 @@ const q = (v) => `'${String(v).replace(/'/g, "''")}'`;
 
 const statements = [];
 let changed = 0;
+let skipped = 0;
 for (const row of rows) {
+  // See the module comment: this reason can only have been reached by reading
+  // the message BODY, which the ledger never stored. Reclassifying from the
+  // stored subject alone risks downgrading an already-correct `ai` row.
+  if (row.classification_reason === "bot_author_pipeline_trailer") {
+    skipped++;
+    continue;
+  }
   const next = classifyForLedger({ sha: row.sha, message: row.message, authorEmail: row.author_email });
   if (next.kind === row.classification && next.reason === row.classification_reason) continue;
   changed++;
@@ -70,4 +90,7 @@ for (const row of rows) {
 
 mkdirSync(dirname(outPath), { recursive: true });
 writeFileSync(outPath, statements.length ? statements.join("\n") + "\n" : "-- no rows to change\n");
-console.log(`\n${changed} of ${rows.length} rows would change. SQL written to ${outPath}.`);
+console.log(
+  `\n${changed} of ${rows.length} rows would change (${skipped} bot_author_pipeline_trailer row(s) ` +
+    `skipped — body-dependent, not safe to replay from the stored subject). SQL written to ${outPath}.`,
+);
