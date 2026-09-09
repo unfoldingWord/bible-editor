@@ -59,6 +59,9 @@ function unchanged(text, msg) {
   unchanged("# Heading\n\ntext\n\n> quote", "headings and quotes untouched");
   unchanged("```\n3. literal\n9. literal\n  1. literal\n```\n\n1. a\n2. b", "fenced code is literal: list-shaped lines inside ``` are not renumbered or re-indented (Codex review)");
   unchanged("~~~\n    1. literal\n~~~", "tilde fences are fences too");
+  unchanged("````\n```\n3. literal\n9. literal\n```\n````\n", "a 4-backtick fence is not closed by a 3-backtick line inside it (Codex verify)");
+  unchanged("```\n3. literal\n~~~\n9. literal\n```", "a tilde line does not close a backtick fence");
+  eq(normalizeLists("```js\n3. x\n```\n1. a\n1. b"), "```js\n3. x\n```\n1. a\n2. b", "an opener with an info string still opens a fence; content after the real close normalises");
   eq(normalizeLists("1. a\n```\ncode\n```\n1. b"), "1. a\n```\ncode\n```\n1. b", "a fence closes the list; the next list starts fresh with its own number");
 }
 
@@ -81,9 +84,14 @@ function unchanged(text, msg) {
   );
   eq(normalizeLists("1. a\n        1. b"), "1. a\n    1. b", "an item can't skip a level: 8 spaces directly under a top-level item is its child");
   eq(normalizeLists("- a\n  - b\n    - c\n- d"), "- a\n    - b\n        - c\n- d", "2-space nested bullets keep their nesting, rewritten at 4 spaces per level");
-  eq(normalizeLists("    1. all\n    2. indented\n        1. child"), "1. all\n2. indented\n    1. child", "an outline written entirely indented is read relatively: first line is the top level");
-  eq(normalizeLists("        1. orphan\n1. b"), "1. orphan\n2. b", "a shallower line after the first item rebases the top level and continues its count");
-  eq(normalizeLists("1. a\n    1. b\nprose\n        1. c"), "1. a\n    1. b\nprose\n1. c", "prose closes the outline; the next item starts a fresh top level");
+  unchanged("    1. all\n    2. indented\n        1. child", "an outline written entirely at 4+ spaces with no list open is an indented code block in Markdown and is left alone (Codex verify)");
+  unchanged("para\n\n    1. literal\n    2. literal\n\n    still code", "indented code block after prose: untouched, blank lines inside it do not end it");
+  eq(normalizeLists("para\n\n    1. literal\n\nafter\n1. a\n1. b"), "para\n\n    1. literal\n\nafter\n1. a\n2. b", "a list after an indented code block still normalises; the code block does not");
+  eq(normalizeLists("1. a\n\n    1. b\n    1. c"), "1. a\n\n    1. b\n    2. c", "4-space lines while a list is open are nested items, not code (CommonMark reads them the same way)");
+  unchanged("        1. orphan\n1. b", "an 8-space line with no list open is an indented code block, so it and the list after it are left alone");
+  eq(normalizeLists("  1. orphan\n1. b"), "1. orphan\n2. b", "a shallower (0–3 space) line after the first item rebases the top level and continues its count");
+  unchanged("1. a\n    1. b\nprose\n        1. c", "prose closes the outline; an 8-space line after it is code, not a list");
+  eq(normalizeLists("1. a\n    1. b\nprose\n  1. c"), "1. a\n    1. b\nprose\n1. c", "prose closes the outline; the next (0–3 space) item starts a fresh top level");
   eq(normalizeLists("  1. a\n\n    1. b"), "1. a\n\n    1. b", "loose ISA-style list normalises the same way");
   eq(normalizeLists("plain text").split("\n").length, 1, "never adds lines");
   const twice = normalizeLists(normalizeLists(isa5));
@@ -135,7 +143,11 @@ function unchanged(text, msg) {
 
   eq(outdentLines("x", 0, 0).value, "x", "outdent on an unindented line is a no-op");
   eq(indentLines("a\n\nb", 0, 4).value, "    a\n\n    b", "blank lines inside the selection stay blank");
-  eq(indentLines("  1. a", 6, 6).value, "1. a", "a lone item has no parent to nest under, so indenting it leaves it top level");
+  eq(indentLines("  1. a", 6, 6).value, "1. a", "a lone item has no parent to nest under: it is not indented (which would make it a code block), only normalised");
+  eq(indentLines("1. a", 4, 4).value, "1. a", "…and on an already-clean lone item the whole action is a no-op, so Tab falls through to the browser");
+  eq(indentLines("intro\n\n1. a\n2. b", 8, 8).value, "intro\n\n1. a\n2. b", "the first item of a list after prose is also a no-op");
+  eq(indentLines("1. a\n\n2. b", 8, 8).value, "1. a\n\n    1. b", "a blank line between items does not hide the parent");
+  eq(indentLines("1. a\nplain", 7, 7).value, "1. a\n    plain", "a non-list line still indents (continuation text under an item)");
   eq(indentLines("1. p\n  1. a", 10, 10).value, "1. p\n    1. a", "indenting an ISA-style 2-space item under a parent lands on a clean 4-space level");
   eq(indentLines("3. a\n4. b", 5, 5).value, "3. a\n    1. b", "indenting under a list that starts at 3 keeps the parent's start and restarts the child at 1");
 }

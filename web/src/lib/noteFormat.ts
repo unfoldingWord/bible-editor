@@ -31,9 +31,12 @@ export function normalizeLists(text: string): string {
   // Raw indent of each open level (index = level) and each level's last number.
   const stack: number[] = [];
   const counters: number[] = [];
-  // Fenced code is literal text — a `3. literal` line inside ``` must not be
-  // read as a list item.
-  let inFence = false;
+  // Code is literal text — a `3. literal` line inside a ``` fence, or in an
+  // indented code block (four-plus spaces with no list open), must not be
+  // read as a list item. A fence closes only on the same character, at least
+  // as long as the opener, with nothing else on the line.
+  let fence: { ch: string; len: number } | null = null;
+  let inIndentedCode = false;
   const closeTo = (indent: number, keepEqual: boolean) => {
     while (stack.length && (stack[stack.length - 1] > indent || (!keepEqual && stack[stack.length - 1] === indent))) {
       stack.pop();
@@ -54,13 +57,26 @@ export function normalizeLists(text: string): string {
   return text
     .split("\n")
     .map((line) => {
-      if (/^ {0,3}(`{3,}|~{3,})/.test(line)) {
-        inFence = !inFence;
+      const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (fence) {
+        if (f && f[1][0] === fence.ch && f[1].length >= fence.len && f[2].trim() === "") fence = null;
+        return line;
+      }
+      if (f) {
+        fence = { ch: f[1][0], len: f[1].length };
         stack.length = 0;
         counters.length = 0;
         return line;
       }
-      if (inFence) return line;
+      const indent = line.length - line.trimStart().length;
+      if (line.trim() === "") return line;
+      if (inIndentedCode) {
+        if (indent >= INDENT.length) return line;
+        inIndentedCode = false;
+      } else if (!stack.length && indent >= INDENT.length) {
+        inIndentedCode = true;
+        return line;
+      }
       const o = ORDERED_RE.exec(line);
       if (o) {
         const level = levelFor(o[1].length);
@@ -77,9 +93,8 @@ export function normalizeLists(text: string): string {
         counters.length = level + 1;
         return `${INDENT.repeat(level)}${b[2]} ${b[3]}`;
       }
-      if (line.trim() === "") return line;
       // Prose closes every list level at or deeper than its own indent.
-      closeTo(line.length - line.trimStart().length, false);
+      closeTo(indent, false);
       return line;
     })
     .join("\n");
@@ -109,7 +124,7 @@ function mapSelectedLines(
   value: string,
   selStart: number,
   selEnd: number,
-  fn: (line: string) => string,
+  fn: (line: string, index: number, lines: string[]) => string,
 ): FormatResult {
   const lines = value.split("\n");
   const a = lineIndexAt(lines, selStart);
@@ -117,7 +132,7 @@ function mapSelectedLines(
   // next, empty line — but the newline itself stays selected afterwards.
   const endsAfterNewline = selEnd > selStart && value[selEnd - 1] === "\n";
   const b = lineIndexAt(lines, endsAfterNewline ? selEnd - 1 : selEnd);
-  const changed = lines.map((line, i) => (i >= a.idx && i <= b.idx ? fn(line) : line));
+  const changed = lines.map((line, i) => (i >= a.idx && i <= b.idx ? fn(line, i, lines) : line));
   const out = normalizeLists(changed.join("\n")).split("\n");
   const newStart = offsetOf(out, a.idx, a.col + (out[a.idx].length - lines[a.idx].length));
   const newEnd =
@@ -166,9 +181,16 @@ function restartNumber(line: string): string {
 }
 
 export function indentLines(value: string, selStart: number, selEnd: number): FormatResult {
-  return mapSelectedLines(value, selStart, selEnd, (line) =>
-    line.trim() === "" ? line : restartNumber(INDENT + line),
-  );
+  return mapSelectedLines(value, selStart, selEnd, (line, i, lines) => {
+    if (line.trim() === "") return line;
+    // A list item with no list line above it has nothing to nest under;
+    // indenting it would only turn it into an indented code block.
+    let p = i - 1;
+    while (p >= 0 && lines[p].trim() === "") p--;
+    const hasParent = p >= 0 && (ORDERED_RE.test(lines[p]) || BULLET_RE.test(lines[p]));
+    if ((ORDERED_RE.test(line) || BULLET_RE.test(line)) && !hasParent) return line;
+    return restartNumber(INDENT + line);
+  });
 }
 
 export function outdentLines(value: string, selStart: number, selEnd: number): FormatResult {
