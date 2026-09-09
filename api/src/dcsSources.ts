@@ -266,6 +266,20 @@ export function dcsRawUrl(env: Env, repo: string, path: string, ref?: string): s
 // what we last synced). Sends the service token when present so private repos
 // and rate limits are handled the same way the export path is.
 export async function fileCommitSha(env: Env, repo: string, path: string): Promise<string | null> {
+  return (await fileHeadCommit(env, repo, path))?.sha ?? null;
+}
+
+// Same call as fileCommitSha, but also carries the head commit's message and
+// author identity — enough for masterLineage.ts's classifyMasterCommit — so a
+// caller that needs to know WHOSE commit master's head is (checkMasterFreshness,
+// issue #748: is master's move our own just-merged export, not a foreign
+// edit?) doesn't need a second request just to read what this endpoint already
+// returned. fileCommitSha keeps its sha-only contract for its other callers.
+export async function fileHeadCommit(
+  env: Env,
+  repo: string,
+  path: string,
+): Promise<{ sha: string; message: string | null; authorEmail: string | null } | null> {
   const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
   const url =
     `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
@@ -275,8 +289,17 @@ export async function fileCommitSha(env: Env, repo: string, path: string): Promi
     if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
     const r = await fetch(url, { headers });
     if (!r.ok) return null;
-    const commits = (await r.json()) as Array<{ sha?: string }>;
-    return commits[0]?.sha ?? null;
+    const commits = (await r.json()) as Array<Record<string, unknown>>;
+    const raw = commits[0];
+    const sha = typeof raw?.sha === "string" ? raw.sha : null;
+    if (!sha) return null;
+    const commit = (raw?.commit ?? {}) as Record<string, unknown>;
+    const author = (commit.author ?? {}) as Record<string, unknown>;
+    return {
+      sha,
+      message: typeof commit.message === "string" ? commit.message : null,
+      authorEmail: typeof author.email === "string" ? author.email : null,
+    };
   } catch {
     return null;
   }

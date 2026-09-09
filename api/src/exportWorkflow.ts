@@ -81,8 +81,9 @@ import {
   sweepStaleMergeNoBase,
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
-import { dcsResourceFile, fetchDcsMasterText, fileCommitSha, type ReimportResource } from "./dcsSources";
-import { gitBlobSha } from "./ownPublish";
+import { dcsResourceFile, fetchDcsMasterText, fileHeadCommit, type ReimportResource } from "./dcsSources";
+import { gitBlobSha, findOurMergeForPr } from "./ownPublish";
+import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
 import { hardRejectRows } from "./hardRejectGuard";
@@ -1759,10 +1760,34 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (!file) return { ok: true, detail: "no_file", masterSha: null, watermark: null };
     const watermark = await storedResourceSha(this.env, book, resource);
     if (!watermark) return { ok: true, detail: "no_watermark", masterSha: null, watermark: null };
-    const masterSha = await fileCommitSha(this.env, file.repo, file.path);
-    if (!masterSha) return { ok: false, detail: "master_sha_unknown", masterSha: null, watermark };
-    if (masterSha === watermark) return { ok: true, detail: "current", masterSha, watermark };
-    return { ok: false, detail: "master_ahead", masterSha, watermark };
+    const head = await fileHeadCommit(this.env, file.repo, file.path);
+    if (!head) return { ok: false, detail: "master_sha_unknown", masterSha: null, watermark };
+    if (head.sha === watermark) return { ok: true, detail: "current", masterSha: head.sha, watermark };
+
+    // Master moved past the watermark. Normally that means a foreign commit
+    // landed and the export must not clobber it (stale_master:master_ahead,
+    // below) — but this gate runs BEFORE the export, and source_sha only
+    // advances on the NEXT successful sync, so a second export shortly after
+    // the FIRST one's PR merges sees exactly this: master's head is our own
+    // just-merged squash commit, not a foreign edit (issue #748, measured on
+    // DAN TN 2026-09-08 — a real export followed 36s later by a false
+    // export_stale alert that a later sync healed on its own). Recognize it
+    // the same way accountOwnPublishDecline already does for the reimport
+    // side (PR #704): the head's subject carries the export PR's number,
+    // which recordPushedPr stamped onto book_resource_syncs for exactly the
+    // render that just merged. Never loosen this for any other author —
+    // findOurMergeForPr only matches an `ours`-classified commit whose
+    // subject quotes that specific PR number.
+    const pushedPr = await this.env.DB.prepare(
+      `SELECT pushed_pr_number FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource)
+      .first<{ pushed_pr_number: number | null }>();
+    const headCommit: MasterCommit = { sha: head.sha, message: head.message, authorEmail: head.authorEmail };
+    const ownMerge = findOurMergeForPr([classifyMasterCommit(headCommit)], pushedPr?.pushed_pr_number ?? null);
+    if (ownMerge.found) return { ok: true, detail: "own_publish", masterSha: head.sha, watermark };
+
+    return { ok: false, detail: "master_ahead", masterSha: head.sha, watermark };
   }
 
   // Banner alert when the freshness gate skips an export to avoid clobbering
