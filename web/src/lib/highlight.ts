@@ -24,7 +24,7 @@
 // matches raw with no further work.
 
 import { nfc } from "./hebrew.ts";
-import { isAcrosticHeading, isHeaderLabelNode, isInFlowMarker, isTsMilestone, liftMarkerText } from "./usfm.ts";
+import { isAcrosticHeading, isCharacterWrapper, isHeaderLabelNode, isInFlowMarker, isTsMilestone, liftMarkerText } from "./usfm.ts";
 
 // U+2060 WORD JOINER glues UHB clitic morphemes to their host word
 // (הָ⁠אֶ֧בֶן); U+200D ZERO WIDTH JOINER plays the same role in some corpora.
@@ -124,13 +124,17 @@ function nodeIsWord(n: unknown): n is Record<string, unknown> {
   return !!o && o["type"] === "word" && o["tag"] === "w";
 }
 
-// \d (Psalm superscription) is `type:"section"` but its content IS
-// alignable Hebrew verse body — the renderer already descends into it
-// (see segmentByParagraphs); the matchers must too or a quote on a
-// superscription word never highlights.
+// \d (Psalm superscription) content IS alignable Hebrew verse body — the
+// renderer already descends into it (see segmentByParagraphs); the matchers
+// must too or a quote on a superscription word never highlights. Gate on the
+// TAG alone, not `type:"section"`: usfm-js 3.5.0 parses a real `\d` as
+// `{tag:"d", text}` with NO type (only \s/\s1…\s5 get `type:"section"`), so
+// the old `type:"section"` predicate matched nothing usfm-js actually emits
+// and every superscription silently failed to match here. Tag-only is a
+// superset that still covers any legacy `{type:"section", tag:"d"}` rows.
 function nodeIsPsalmTitle(n: unknown): n is Record<string, unknown> {
   const o = n as Record<string, unknown> | null;
-  return !!o && o["type"] === "section" && o["tag"] === "d";
+  return !!o && o["tag"] === "d";
 }
 
 // Collect every `\w` token in a subtree (descending through nested milestones
@@ -148,7 +152,7 @@ function collectSubtreeWords(children: unknown[]): WordToken[] {
           occurrence:
             parseInt(String((c as Record<string, unknown>)["occurrence"] ?? "1"), 10) || 1,
         });
-      } else if (nodeIsMilestone(c) || nodeIsPsalmTitle(c)) {
+      } else if (nodeIsMilestone(c) || nodeIsPsalmTitle(c) || isCharacterWrapper(c)) {
         walk(((c as Record<string, unknown>)["children"] as unknown[] | undefined) ?? []);
       }
     }
@@ -477,9 +481,14 @@ export function collectSourceWords(verseObjects: unknown[]): SourceWordToken[] {
         // maqqef / inter-word space as a bare text sibling of the \w tokens.
         const prev = out[out.length - 1];
         if (prev) prev.trailing += String(o["text"] ?? "");
-      } else if (o["type"] === "milestone" || nodeIsPsalmTitle(o)) {
-        // \d (Psalm superscription) is `type:"section"` but its content IS
-        // alignable verse body — descend it like the highlight matchers do.
+      } else if (o["type"] === "milestone" || nodeIsPsalmTitle(o) || isCharacterWrapper(o)) {
+        // \d (Psalm superscription) content IS alignable verse body —
+        // descend it like the highlight matchers do. \qs (Selah) wraps its
+        // aligned content from OUTSIDE (production ULT: `\qs \zaln-s ... \w
+        // Selah\w* \zaln-e\* \qs*`) — not descending it drops the wrapped
+        // source word, and because `position`/`surfaceOccurrence` are
+        // counted here, silently shifts the index of every word after it
+        // too (docs/usfm-alignment-audit.md §1 Bug 1/4).
         walk((o["children"] as unknown[] | undefined) ?? []);
       }
     }
@@ -997,6 +1006,29 @@ function segmentByParagraphs(
         segments.push(current);
         continue;
       }
+      // \qs (Selah) is a character-style wrapper — usfm-js gives it the SAME
+      // `type:"quote"` shape as a real `\q1`/`\q2` poetry LINE marker, so
+      // isInFlowMarker below also matches it. Unlike a line marker, though,
+      // it holds inline verse CONTENT (its own `text`, or aligned
+      // `\zaln-s`/`\w` children), not a line break. Checked first (mirrors
+      // isCharacterWrapper's own doc comment in usfm.ts, which
+      // extractPlainText/extractEditableText already special-case) so the
+      // content renders inline with `.be-qs` styling instead of falling into
+      // the generic marker branch, which opens a spurious new paragraph
+      // segment and `continue`s WITHOUT ever walking this node's children —
+      // silently dropping "Selah" (and any alignment on it) from the render
+      // while extractEditableText still includes it, the classic
+      // content-drop-on-save signature also fixed for `\d` below.
+      if (isCharacterWrapper(o)) {
+        current.html += '<span class="be-qs">';
+        if (Array.isArray(o["children"]) && (o["children"] as unknown[]).length > 0) {
+          walk(o["children"] as unknown[]);
+        } else if (typeof o["text"] === "string") {
+          current.html += escapeHtml(String(o["text"]));
+        }
+        current.html += "</span>";
+        continue;
+      }
       if (isInFlowMarker(o)) {
         // Collapse every `\ts\*` node shape to the canonical "ts" tag before it
         // reaches the segment logic. usfm-js 3.5.0 parks the marker in the tag
@@ -1029,10 +1061,17 @@ function segmentByParagraphs(
       if (isHeaderLabelNode(o)) {
         continue;
       }
-      // \d (Psalm superscription) is `type:"section"` but its text IS
-      // alignable Hebrew. Render inline with `.be-d` styling so children
-      // (\zaln-s milestones, \w words) still walk and align.
-      if (o["type"] === "section" && o["tag"] === "d") {
+      // \d (Psalm superscription) — its text IS alignable Hebrew. Render
+      // inline with `.be-d` styling so children (\zaln-s milestones, \w
+      // words) still walk and align. Gate on the TAG alone, not
+      // `type:"section"`: usfm-js 3.5.0 parses a real `\d` as `{tag:"d",
+      // text}` with NO type (only \s/\s1…\s5 get `type:"section"`), so the
+      // old `type:"section"` predicate matched nothing usfm-js actually
+      // emits and the superscription fell through this whole walk — dropped
+      // from the render while extractEditableText kept it, the classic
+      // silent-content-drop-on-save signature. Tag-only is a superset that
+      // still covers any legacy `{type:"section", tag:"d"}` rows.
+      if (o["tag"] === "d") {
         current.html += '<span class="be-d">';
         if (Array.isArray(o["children"]) && (o["children"] as unknown[]).length > 0) {
           walk(o["children"] as unknown[]);
@@ -1104,7 +1143,11 @@ function segmentsToHtml(segments: Segment[], emitChips: boolean): string {
     }
     const cls = seg.wrapper || "be-line";
     if (seg.isBlank) {
-      out.push(`<div class="${cls}">${emitChips && seg.tag ? chipForTag(seg.tag) : "&nbsp;"}</div>`);
+      // The chip must carry the SAME trailing space extractEditableText emits
+      // for `\b` (`"\\b "`) or the editable render's captured text is one
+      // space short of the baseline — a phantom diff that can fire a PATCH
+      // with no real change (and re-queue on every subsequent no-op save).
+      out.push(`<div class="${cls}">${emitChips && seg.tag ? chipForTag(seg.tag) + " " : "&nbsp;"}</div>`);
       continue;
     }
     if (seg.tag === "ts") {
@@ -1120,7 +1163,9 @@ function segmentsToHtml(segments: Segment[], emitChips: boolean): string {
       // the line break) intact. Book mode restates `div.be-ts` wholesale and
       // therefore keeps its label: it draws the divider at the top of the verse
       // the marker introduces, which is the whole point of that treatment.
-      const chip = emitChips ? chipForTag("ts") : `<span class="be-tok be-tok-ts">\\ts\\*</span>`;
+      // Same trailing-space parity as the \b case above: extractEditableText
+      // emits `"\\ts\\* "` (trailing space) for this marker.
+      const chip = emitChips ? chipForTag("ts") + " " : `<span class="be-tok be-tok-ts">\\ts\\*</span>`;
       out.push(`<div class="${cls}${emitChips ? "" : " be-ts-quiet"}">${chip}</div>`);
       continue;
     }
