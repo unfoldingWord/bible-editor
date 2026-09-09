@@ -31,6 +31,9 @@ export function normalizeLists(text: string): string {
   // Raw indent of each open level (index = level) and each level's last number.
   const stack: number[] = [];
   const counters: number[] = [];
+  // Fenced code is literal text — a `3. literal` line inside ``` must not be
+  // read as a list item.
+  let inFence = false;
   const closeTo = (indent: number, keepEqual: boolean) => {
     while (stack.length && (stack[stack.length - 1] > indent || (!keepEqual && stack[stack.length - 1] === indent))) {
       stack.pop();
@@ -51,6 +54,13 @@ export function normalizeLists(text: string): string {
   return text
     .split("\n")
     .map((line) => {
+      if (/^ {0,3}(`{3,}|~{3,})/.test(line)) {
+        inFence = !inFence;
+        stack.length = 0;
+        counters.length = 0;
+        return line;
+      }
+      if (inFence) return line;
       const o = ORDERED_RE.exec(line);
       if (o) {
         const level = levelFor(o[1].length);
@@ -186,10 +196,14 @@ export function isListLine(value: string, pos: number): boolean {
 // the end of a list line so the textarea's default Enter applies.
 export function continueListOnEnter(value: string, selStart: number, selEnd: number): FormatResult | null {
   if (selStart !== selEnd) return null;
-  const lines = value.split("\n");
-  const { idx, col } = lineIndexAt(lines, selStart);
+  const rawLines = value.split("\n");
+  const { idx, col } = lineIndexAt(rawLines, selStart);
+  if (col !== rawLines[idx].length) return null;
+  if (!ORDERED_RE.test(rawLines[idx]) && !BULLET_RE.test(rawLines[idx])) return null;
+  // Work on the normalised outline so a legacy mixed-indent note (`1.` / `  1.`
+  // / `    1.`) outdents by one *level*, not by four raw spaces.
+  const lines = normalizeLists(value).split("\n");
   const line = lines[idx];
-  if (col !== line.length) return null;
   const o = ORDERED_RE.exec(line);
   const b = BULLET_RE.exec(line);
   if (!o && !b) return null;
@@ -197,11 +211,8 @@ export function continueListOnEnter(value: string, selStart: number, selEnd: num
   const marker = o ? "1. " : `${b![2]} `;
   let caretLine: number;
   if (m[3].trim() === "") {
-    // Nested (per the normalised outline, so ISA-style raw indents read
-    // correctly): outdent one level. Top level: end the list.
-    const normalizedLine = normalizeLists(lines.join("\n")).split("\n")[idx];
-    const nested = normalizedLine.length - normalizedLine.trimStart().length >= INDENT.length;
-    lines[idx] = nested ? `${m[1].slice(INDENT.length)}${marker}` : "";
+    // Nested: outdent one level. Top level: end the list.
+    lines[idx] = m[1].length >= INDENT.length ? `${m[1].slice(INDENT.length)}${marker}` : "";
     caretLine = idx;
   } else {
     lines.splice(idx + 1, 0, `${m[1]}${marker}`);
@@ -215,11 +226,13 @@ export function continueListOnEnter(value: string, selStart: number, selEnd: num
 // Wraps the selection in `**`, or unwraps it when already bold.
 export function toggleBold(value: string, selStart: number, selEnd: number): FormatResult {
   const sel = value.slice(selStart, selEnd);
-  if (sel.startsWith("**") && sel.endsWith("**") && sel.length >= 4) {
+  // Unwrap only a single bold span: `**one** and **two**` selected whole must
+  // not lose its outer markers and flip the emphasis onto " and ".
+  if (sel.startsWith("**") && sel.endsWith("**") && sel.length >= 4 && !sel.slice(2, -2).includes("**")) {
     const inner = sel.slice(2, -2);
     return { value: value.slice(0, selStart) + inner + value.slice(selEnd), selStart, selEnd: selStart + inner.length };
   }
-  if (value.slice(selStart - 2, selStart) === "**" && value.slice(selEnd, selEnd + 2) === "**") {
+  if (value.slice(selStart - 2, selStart) === "**" && value.slice(selEnd, selEnd + 2) === "**" && !sel.includes("**")) {
     return {
       value: value.slice(0, selStart - 2) + sel + value.slice(selEnd + 2),
       selStart: selStart - 2,

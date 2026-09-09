@@ -56,7 +56,10 @@ function unchanged(text, msg) {
   unchanged("This is prose.\n5. is the verse where it happens.\nMore prose.", "a prose line that merely begins with `5. ` is left alone");
   unchanged("* x\n* y", "bullets untouched");
   unchanged("para\n\n    code block", "non-list indented lines are left alone");
-  unchanged("# Heading\n\ntext\n\n> quote\n\n```\n1. not a list\n```", "headings, quotes and fenced code untouched (fence body has no list marker shape)");
+  unchanged("# Heading\n\ntext\n\n> quote", "headings and quotes untouched");
+  unchanged("```\n3. literal\n9. literal\n  1. literal\n```\n\n1. a\n2. b", "fenced code is literal: list-shaped lines inside ``` are not renumbered or re-indented (Codex review)");
+  unchanged("~~~\n    1. literal\n~~~", "tilde fences are fences too");
+  eq(normalizeLists("1. a\n```\ncode\n```\n1. b"), "1. a\n```\ncode\n```\n1. b", "a fence closes the list; the next list starts fresh with its own number");
 }
 
 // ── normalizeLists: nesting (issue #753) ──
@@ -171,6 +174,9 @@ function unchanged(text, msg) {
   eq(emptyNested?.selStart, 8, "caret after the outdented marker");
   const emptyNestedBullet = continueListOnEnter("* a\n    * ", 10, 10);
   eq(emptyNestedBullet?.value, "* a\n* ", "empty nested bullet outdents to a top-level bullet");
+  const mixed = continueListOnEnter("1. a\n  1. b\n    1. ", 19, 19);
+  eq(mixed?.value, "1. a\n    1. b\n    2. ", "legacy mixed-indent outline: Enter on the empty third-level item outdents one LEVEL (to a sibling of b), not four raw spaces to the top (Codex review)");
+  eq(mixed?.selStart, mixed?.value.length, "caret after the outdented marker");
   const wide = continueListOnEnter("1. a\n2. b\n3. c\n4. d\n5. e\n6. f\n7. g\n8. h\n9. i", 44, 44);
   eq(wide?.value.slice(-4), "10. ", "continuation past 9 writes a two-digit marker");
   eq(wide?.selStart, wide?.value.length, "caret sits after the two-digit marker");
@@ -207,6 +213,10 @@ function unchanged(text, msg) {
   const caret = toggleBold("abc", 1, 1);
   eq(caret.value, "a****bc", "empty selection inserts an empty bold pair");
   eq(caret.selStart, 3, "caret between the pair");
+  const two = toggleBold("**one** and **two**", 0, 19);
+  eq(two.value, "****one** and **two****", "a selection spanning two bold spans is wrapped, not stripped of its outer markers (Codex review)");
+  const twoInside = toggleBold("x **one** and **two** y", 4, 19);
+  eq(twoInside.value, "x ****one** and **two**** y", "surrounding markers around a multi-span selection do not count as one bold span");
   const ws = toggleBold("say hello now", 3, 10);
   eq(ws.value, "say **hello** now", "edge whitespace in the selection stays outside the markers (`** hello **` is not emphasis)");
   eq(ws.selStart, 6, "selection tightens to the word (start)");
