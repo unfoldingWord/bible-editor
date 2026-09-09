@@ -8,7 +8,7 @@
 // book code) must fall through as plain text so NoteCard never renders a dead
 // link or drops real note content.
 
-import { parseNoteSegments } from "./noteLinks.ts";
+import { parseNoteSegments, resolveNoteLinkHref } from "./noteLinks.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -119,6 +119,34 @@ function linksOf(text, book) {
     cursor = seg.end;
   }
   assert(cursor === text.length, "segments cover the entire string with no trailing gap");
+}
+
+// ── resolveNoteLinkHref: same shape, but given only the href (as react-markdown
+// hands its `a` component), not the full `[label](href)` markdown source. ──
+{
+  const t = resolveNoteLinkHref("../01/03.md", "ZEC");
+  assert(t?.book === "ZEC" && t.chapter === 1 && t.verse === 3, "same-book href resolves");
+}
+{
+  const t = resolveNoteLinkHref("../../zec/02/05.md", "MAL");
+  assert(t?.book === "ZEC" && t.chapter === 2 && t.verse === 5, "cross-book href resolves");
+}
+{
+  const t = resolveNoteLinkHref("../../1sa/02/05.md", "ZEC");
+  assert(t?.book === "1SA" && t.chapter === 2 && t.verse === 5, "numbered-book href resolves");
+}
+{
+  const t = resolveNoteLinkHref("../150/006.md", "PSA");
+  assert(t?.book === "PSA" && t.chapter === 150 && t.verse === 6, "3-digit PSA href resolves");
+}
+{
+  assert(resolveNoteLinkHref("../../xyz/01/01.md", "ZEC") === null, "unresolvable book code yields null");
+}
+{
+  assert(resolveNoteLinkHref("https://example.com/x", "ZEC") === null, "an external http(s) href is not a note link");
+}
+{
+  assert(resolveNoteLinkHref("rc://*/ta/man/translate/figs-metaphor", "ZEC") === null, "an rc:// href is not a note link");
 }
 
 if (failed > 0) {

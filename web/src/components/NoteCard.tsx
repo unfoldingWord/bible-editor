@@ -22,7 +22,10 @@ import {
   ListItemText,
   ListSubheader,
   Divider,
+  Link,
 } from "@mui/material";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
 import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
@@ -38,6 +41,8 @@ import UndoIcon from "@mui/icons-material/Undo";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import ArrowDropDownIcon from "@mui/icons-material/ArrowDropDown";
+import VisibilityOutlinedIcon from "@mui/icons-material/VisibilityOutlined";
+import VisibilityOffOutlinedIcon from "@mui/icons-material/VisibilityOffOutlined";
 import type { TnRow } from "../sync/api";
 import { isReadOnly } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
@@ -55,7 +60,7 @@ import {
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
-import { parseNoteSegments } from "../lib/noteLinks";
+import { parseNoteSegments, resolveNoteLinkHref } from "../lib/noteLinks";
 
 const NoteHistoryDialog = lazy(() =>
   import("./NoteHistoryDialog").then((m) => ({ default: m.NoteHistoryDialog })),
@@ -421,6 +426,131 @@ function NoteBodyReadView({
   );
 }
 
+// Rendered-markdown preview of a note body — the "Preview" toggle's ON state.
+// Same click-to-edit chrome as NoteBodyReadView (border, padding, reading
+// font) so switching the toggle doesn't jump the card's footprint; unlike
+// NoteBodyReadView it does not do find-highlighting (callers gate the toggle
+// off whenever a find match is live — see showMarkdownPreview below) and its
+// "see how you translated this" links come from react-markdown's own link
+// parsing rather than parseNoteSegments (react-markdown hands the `a`
+// component only the href, so resolveNoteLinkHref — the href-only sibling of
+// parseNoteSegments' target resolution — is what recognizes them here).
+// Deliberately no rehype-raw/allowDangerousHtml (mirrors TwArticleDialog):
+// note bodies round-trip through TSV/DCS with no sanitization upstream, so
+// embedded raw HTML must stay inert rather than execute.
+function NoteBodyMarkdownView({
+  text,
+  book,
+  onActivate,
+}: {
+  text: string;
+  book: string;
+  onActivate: () => void;
+}) {
+  const LinkComponent = useMemo(() => {
+    function NoteMdLink({ href, children }: { href?: string; children?: React.ReactNode }) {
+      if (!href) return <>{children}</>;
+      const target = resolveNoteLinkHref(href, book);
+      if (target) {
+        return (
+          <Box
+            component="span"
+            title={`Go to ${target.book} ${target.chapter}:${target.verse}`}
+            onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              location.hash = `#/${target.book}/${target.chapter}/${target.verse}`;
+            }}
+            sx={{
+              color: "primary.main",
+              textDecoration: "underline",
+              textDecorationStyle: "dotted",
+              textUnderlineOffset: "2px",
+              cursor: "pointer",
+              "&:hover": { textDecorationStyle: "solid" },
+            }}
+          >
+            {children}
+          </Box>
+        );
+      }
+      // Anything else (rc:// / ta man links, a relative path that isn't one
+      // of our own note-link hrefs) renders inert rather than navigable —
+      // same rule TwArticleDialog's mdLink applies to non-http(s) hrefs.
+      if (/^https?:\/\//.test(href)) {
+        return (
+          <Link
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          >
+            {children}
+          </Link>
+        );
+      }
+      return <>{children}</>;
+    }
+    return NoteMdLink;
+  }, [book]);
+
+  return (
+    <Box
+      onMouseDown={(e: React.MouseEvent) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        onActivate();
+      }}
+      title="click to edit"
+      sx={{
+        cursor: "text",
+        minHeight: 56,
+        px: "14px",
+        py: "8.5px",
+        border: "1px solid",
+        borderColor: "divider",
+        borderRadius: 1,
+        fontSize: `calc(15px * var(--be-reading-scale, 1))`,
+        lineHeight: 1.55,
+        fontFamily: '"Source Serif Pro","Cambria","Times New Roman",serif',
+        "&:hover": { borderColor: "text.primary" },
+        "& > :first-of-type": { mt: 0 },
+        "& > :last-child": { mb: 0 },
+        "& h1": { fontSize: "1.25em", fontWeight: 700, mt: 1, mb: 0.5 },
+        "& h2": { fontSize: "1.15em", fontWeight: 700, mt: 1, mb: 0.5 },
+        "& h3, & h4, & h5, & h6": { fontSize: "1.05em", fontWeight: 600, mt: 1, mb: 0.5 },
+        "& p": { my: 0.75 },
+        "& ul, & ol": { pl: 3, my: 0.5 },
+        "& li": { my: 0.25 },
+        "& blockquote": {
+          borderLeft: "3px solid",
+          borderColor: "divider",
+          pl: 1.5,
+          ml: 0,
+          color: "text.secondary",
+        },
+        "& code": {
+          fontFamily: "monospace",
+          fontSize: "0.9em",
+          bgcolor: "grey.100",
+          borderRadius: "3px",
+          px: "3px",
+        },
+        "& hr": { borderColor: "divider" },
+      }}
+    >
+      {text.trim() ? (
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: LinkComponent }}>
+          {text}
+        </ReactMarkdown>
+      ) : (
+        " "
+      )}
+    </Box>
+  );
+}
+
 function NoteCardInner({
   row,
   active,
@@ -493,6 +623,17 @@ function NoteCardInner({
   // near the render call below for the combined condition.
   const noteTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [editingBody, setEditingBody] = useState(false);
+  // "Preview" toggle: renders the note body as actual markdown (headings,
+  // lists, bold, the "see how you translated this" link) instead of the
+  // plain-text/find-highlight read view. Defaults ON for chapter/book intro
+  // rows (verse 0) — those bodies are prose written in real Markdown, the uW
+  // book/chapter-intro convention (`# heading`, blank-line paragraphs,
+  // numbered outlines) — and OFF for ordinary verse notes, which are usually
+  // short and actively edited. Manual toggle either way; computed once at
+  // mount rather than re-derived, so retargeting an already-open note to a
+  // different verse (onChangeVerse) doesn't yank the toggle out from under
+  // the user mid-session.
+  const [previewMode, setPreviewMode] = useState(row.verse === 0);
   // A new find target (different occurrence / note) always returns to the read
   // view so the highlight shows; clicking sets editingBody back to true.
   useEffect(() => {
@@ -1149,7 +1290,13 @@ function NoteCardInner({
   // regardless of editingBody — leaving the note (active → false) resets
   // editingBody above, so a re-visited note shows its links again rather than
   // staying pinned to the textarea it was last edited through.
-  const showReadView = !editingBody && (!active || (!!findQuery && activeMatchOccurrence != null));
+  const findHighlightActive = !!findQuery && activeMatchOccurrence != null;
+  const showReadView = !editingBody && (!active || findHighlightActive);
+  // The markdown-rendered view stands in for NoteBodyReadView only when no
+  // find match needs the plain-text highlighter — a live find hit always
+  // wins, regardless of the toggle, so "here I am" scrolling/marking keeps
+  // working on a note the user has switched to Preview.
+  const showMarkdownPreview = showReadView && previewMode && !findHighlightActive;
   const pendingAtRender = pendingRef.current;
   useEffect(() => {
     if (readOnly) return;
@@ -1677,8 +1824,48 @@ function NoteCardInner({
               </Button>
             </span>
           </Tooltip>
+          <Tooltip title={previewMode ? "show raw markdown text" : "preview as rendered markdown"}>
+            <IconButton
+              size="small"
+              // Preview is meant to work on an INACTIVE card (showReadView is
+              // forced false whenever active — an active note always shows
+              // the raw textarea, since you can't edit rendered markdown).
+              // The Paper ancestor activates on onFocus (bound to both
+              // onMouseDown and the native onFocus), and a native <button>
+              // takes focus on click by default — a focus event React
+              // re-dispatches up through onFocus handlers regardless of
+              // whether the originating mousedown's propagation was
+              // stopped. preventDefault on mousedown suppresses that
+              // default focus-on-click behavior (mirrors the preventDefault
+              // in NoteBodyReadView's own onMouseDown, for the same reason:
+              // controlling activation precisely instead of leaving it to
+              // the browser's default), while stopPropagation keeps the
+              // mousedown itself from ever reaching Paper's onMouseDown.
+              onMouseDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+              onClick={(e) => {
+                e.stopPropagation();
+                setPreviewMode((v) => !v);
+              }}
+              sx={{ p: 0.25, color: previewMode ? "primary.main" : "text.secondary" }}
+            >
+              {previewMode ? (
+                <VisibilityOffOutlinedIcon sx={{ fontSize: 16 }} />
+              ) : (
+                <VisibilityOutlinedIcon sx={{ fontSize: 16 }} />
+              )}
+            </IconButton>
+          </Tooltip>
         </Stack>
-        {showReadView ? (
+        {showMarkdownPreview ? (
+          <NoteBodyMarkdownView
+            text={note}
+            book={row.book}
+            onActivate={() => setEditingBody(true)}
+          />
+        ) : showReadView ? (
           <NoteBodyReadView
             text={note}
             book={row.book}
