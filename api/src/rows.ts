@@ -14,6 +14,7 @@ import { requiredOccurrence } from "./occurrenceRule";
 import { findRawTabField } from "./rawTabGuard";
 import { isValidChapterZeroRef } from "./chapterZeroGuard";
 import { normalizeBookCode, CHAPTER_EXISTS_SQL } from "./rowsCreateGuard";
+import { isValidTwlRefRaw } from "./twlRefGuard";
 import { boundHistoryToLastCreate } from "./rowHistoryBoundary";
 import {
   PROVENANCE_COLUMNS,
@@ -667,6 +668,23 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
       },
       400,
     );
+  }
+
+  // TWL ref_raw format guard (see twlRefGuard.ts — issue #724). A word link
+  // is single-verse and same-chapter only, unlike tn/tq's legitimately
+  // spanning ref_raw — so a range, an empty string, or a cross-chapter
+  // reference has no valid rendering and must not be allowed to leave the
+  // stored chapter/verse columns torn from what ref_raw says.
+  if (kind === "twl" && "ref_raw" in patch) {
+    if (typeof patch.ref_raw !== "string" || !isValidTwlRefRaw(patch.ref_raw, current.chapter)) {
+      return c.json(
+        {
+          error: "invalid_body",
+          message: `twl ref_raw must be a single same-chapter verse reference like "${current.chapter}:N" (got ${JSON.stringify(patch.ref_raw)}).`,
+        },
+        400,
+      );
+    }
   }
 
   // Backstop for the blank-note data-loss bug (NUM 22:10 v4→v5). The client
