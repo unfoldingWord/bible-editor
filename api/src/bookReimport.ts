@@ -6062,6 +6062,9 @@ async function applyVerseRows(
       if (lastExportAt == null) {
         if (ex.content_json !== v.contentJson) counts.merge_unavailable++;
       }
+      // Issue #641: the merge outcome, kept for the source-attr reconcile gate
+      // below. null when no cutoff exists (no merge ran).
+      let mergeAction: string | null = null;
       if (lastExportAt != null) {
         const merge = computeVerseMerge({
           base: verseContentJsonFromPayload(ex.base_payload ?? null),
@@ -6087,6 +6090,7 @@ async function applyVerseRows(
           // Issue #728: set only for the anchor of a bridge master has split.
           theirsForAlignment: structureAlignmentTheirs.get(structureKey(v.chapter, v.verse)),
         });
+        mergeAction = merge.action;
         // Issue #728: an anchor the content merge did NOT adopt — step 7s decides
         // whether the structure can still follow master (keep_converged) or the
         // component is kept whole and counted structure_refused.
@@ -6182,6 +6186,22 @@ async function applyVerseRows(
       // isn't reverted when the nightly export re-renders this verse. Staged into
       // a separate version-CAS batch below; if nothing reconciled it stays a plain
       // edited skip. (verses analogue of the TWL-PSA / Hebrew-NFC clobber class.)
+      // Issue #641: master has not moved since our own confirmed publish
+      // (`keep_master_unchanged`: theirs == base) or already matches D1
+      // (`keep_converged`). Nothing on master can be a Door43 source fix in
+      // either case — master's `\zaln-s` attrs ARE our own last render — so the
+      // two-way reconcile below would only be comparing the translator's in-app
+      // alignment against our stale bytes. With a repeated source word that
+      // read as "Door43's fix could not be placed" and minted a
+      // source_attr_ambiguous flag the editor could never clear (their next save
+      // resolved it, the next nightly re-minted it): EZK UST 22:26 / 33:9 /
+      // 45:11–12 on 2026-09-09, chapters no Door43 commit had touched. Skip the
+      // reconcile; `keep_no_base` (no ancestor, can't tell) and real master
+      // movement (the NUM 20–22 combining-mark fix) keep today's behavior.
+      if (mergeAction === "keep_master_unchanged" || mergeAction === "keep_converged") {
+        counts.skipped_edited++;
+        continue;
+      }
       const rec = reconcileEditedVerseSourceAttrs(ex.content_json, v.contentJson);
       if (rec.divergent > 0) {
         counts.source_attr_divergent += rec.divergent;
