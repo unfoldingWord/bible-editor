@@ -196,13 +196,21 @@ export interface ExistingAlertState {
 //   - 'keep_alignment_refused' -> kept D1; adopting would have cost alignment.
 //   - 'source_attr_divergent'  -> kept D1; master's original-language source fix
 //                                 couldn't be placed (repeated source word).
-//   - 'keep_ai_master'         -> kept D1; both sides moved, but the commit
-//                                 lineage found no human commit behind master's
-//                                 side (#540 item 2).
-// The first two kept-D1 outcomes carry the same warning: nothing was taken, so
-// tonight's export will still write D1 back over master until a human resolves
-// it. 'keep_ai_master' is the one that does NOT — publishing D1 is the intended
-// outcome there, so its sentence must not borrow their warning.
+// Both kept-D1 outcomes carry the same warning: nothing was taken, so tonight's
+// export will still write D1 back over master until a human resolves it.
+//
+// 'keep_ai_master' (#540 item 2 — kept D1; both sides moved, but a complete
+// commit-lineage walk found no Door43 editor's commit behind master's side) had
+// a fourth sentence here until issue #749, and it was the one that could NOT
+// borrow that warning: publishing D1 is the intended outcome there, nothing is
+// waiting to be reverted, and there is nothing for a human to do. That is why
+// the action is no longer recorded in verse_merge_conflicts at all (see
+// bookReimport.ts's applyVerseRows, and retireVerseKeptAiMasterFlags for the
+// standing rows), so no row carrying it can reach this function — the sentence
+// is removed rather than left as a branch that can never fire. The per-run,
+// dismissable ADMIN alert for the same outcome at scale
+// (reimportSyncGate.ts / raiseKeptOverDoor43Alert, `reimport_kept_over_door43`)
+// is a separate surface and is deliberately untouched.
 
 // Cap on how many no-ancestor refs the sentence lists inline, matching the
 // `+N more` shape raiseVerseMergeConflictAlert already uses for its conflict
@@ -329,7 +337,6 @@ export function buildMergeConflictGuidance(
   const overwritten = overwrittenRows.length;
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
   const keptSourceAttr = rows.filter((r) => r.action === "source_attr_divergent").length;
-  const keptAiMaster = rows.filter((r) => r.action === "keep_ai_master").length;
   // Issue #728: the app's verse-bridge STRUCTURE was kept where Door43's
   // differs. Split by the one reason whose consequence differs: under a
   // not-yet-exported bridge the export publishes the bridge OVER Door43's
@@ -359,25 +366,11 @@ export function buildMergeConflictGuidance(
         `on \\zaln-s) could not be placed unambiguously — the same source word repeats in the verse — so Door43's ` +
         `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`
       : "",
-    // Bounded to what was measured, and to what will actually happen — see the
-    // matching note over the TSV reason in bookReimport.ts for each clause:
-    // "the unfoldingWord bot account" (not "the note pipeline" — the rule is an
-    // author email, and that account also pushes scripture and pushes on a
-    // human's behalf); "no commit from a Door43 editor's own account" (not "no
-    // maintainer edit" — a maintainer may have directed it); "the next export
-    // that runs for this resource" (not "tonight's export" — the watermark is
-    // withheld for the whole book+resource by a systemic refusal, a lock, or a
-    // recording failure, any of which can be described in this same banner);
-    // "since the last confirmed publish" (not "since the last sync" — the walk
-    // starts at master_confirmed_at). Past tense on the measurement because
-    // these rows survive across runs until a human resolves them.
-    keptAiMaster > 0
-      ? `${keptAiMaster} kept the editor's version even though Door43 changed too: when these were checked, ` +
-        `every Door43 commit to this file since the last confirmed publish came from Bible Editor's own export ` +
-        `or the unfoldingWord bot account — no commit from a Door43 editor's own account was found. Nothing of ` +
-        `Door43's was taken, so the next export that runs for this resource writes the editor's version over ` +
-        `Door43's. If Door43's version is the one you want, put it in the app before then.`
-      : "",
+    // A 'keep_ai_master' sentence sat here until issue #749. It is gone with the
+    // action itself: nothing of Door43's was taken, the next export publishes
+    // the kept version, and there was nothing this banner could ask of anyone —
+    // it just kept the verse in the "Sync flagged N verse(s)" count until
+    // somebody edited or dismissed it. See this function's header comment.
     keptStructureOther > 0
       ? `${keptStructureOther} kept the app's verse grouping (a \\v a-b bridge, or its split) where Door43 now groups ` +
         `the verses differently: either no commit from a Door43 editor's own account was found behind Door43's ` +
