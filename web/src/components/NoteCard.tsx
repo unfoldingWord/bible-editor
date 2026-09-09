@@ -691,6 +691,13 @@ function NoteCardInner({
     if (!ta || readOnly) return false;
     const result = fn(ta.value, ta.selectionStart, ta.selectionEnd);
     if (!result) return false;
+    if (result.value === ta.value) {
+      // No text change means no re-render, so the [note] effect below would
+      // never fire and a stashed selection would misplace the caret on the
+      // next keystroke. Callers treat false as "let the default happen".
+      ta.setSelectionRange(result.selStart, result.selEnd);
+      return false;
+    }
     setNote(result.value);
     pendingRef.current = { ...pendingRef.current, note: result.value };
     pendingSelRef.current = { start: result.selStart, end: result.selEnd };
@@ -2039,14 +2046,16 @@ function NoteCardInner({
               pendingRef.current = { ...pendingRef.current, note: e.target.value };
             }}
             onKeyDown={(e) => {
-              if (row.verse !== 0 || readOnly) return;
+              if (row.verse !== 0 || readOnly || e.nativeEvent.isComposing) return;
               const ta = noteTextareaRef.current;
               if (!ta) return;
               if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
                 if (applyFormat(continueListOnEnter)) e.preventDefault();
               } else if (e.key === "Tab" && isListLine(ta.value, ta.selectionStart)) {
-                e.preventDefault();
-                applyFormat(e.shiftKey ? outdentLines : indentLines);
+                // Only swallow Tab when it actually re-indents; a no-op (first
+                // item of a list, Shift+Tab at the top level) keeps the
+                // browser's focus move so the textarea is never a keyboard trap.
+                if (applyFormat(e.shiftKey ? outdentLines : indentLines)) e.preventDefault();
               }
             }}
             multiline

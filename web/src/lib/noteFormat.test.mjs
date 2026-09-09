@@ -4,9 +4,12 @@
 //
 // Pins the Word-style list behaviour on intro notes: numbered/bulleted list
 // toggle, indent/outdent by one four-space level, list continuation on Enter,
-// and normalisation so raw text reads 1. 2. 3. at every nesting level with
-// children indented a full four spaces (the 2-space top-level convention in
-// existing ISA intros made children render as run-on text — issue #753).
+// and normalisation of the outline (relative nesting written at four spaces
+// per level, sequential numbering that keeps each list's start number).
+// The 2-space top-level convention in existing ISA intros made children
+// render as run-on text (issue #753); MAT/ROM intros start outlines at the
+// chapter's position in the book outline (`2. Jesus' Sermon…`), so start
+// numbers are data and must survive.
 
 import {
   continueListOnEnter,
@@ -31,8 +34,11 @@ function assert(cond, msg) {
 function eq(actual, expected, msg) {
   assert(actual === expected, `${msg}\n    expected: ${JSON.stringify(expected)}\n    actual:   ${JSON.stringify(actual)}`);
 }
+function unchanged(text, msg) {
+  eq(normalizeLists(text), text, msg);
+}
 
-// ── normalizeLists: renumbering ──
+// ── normalizeLists: numbering ──
 {
   eq(
     normalizeLists("1. a\n1. b\n    1. c\n    1. d\n1. e"),
@@ -40,34 +46,45 @@ function eq(actual, expected, msg) {
     "nested levels count independently; parent resumes after nested block",
   );
   eq(normalizeLists("1. a\n\n1. b"), "1. a\n\n2. b", "blank line between items keeps the count (loose list)");
-  eq(normalizeLists("1. a\nprose\n1. b"), "1. a\nprose\n1. b", "unindented prose ends the list; count restarts");
-  eq(normalizeLists("3. a\n7. b"), "1. a\n2. b", "arbitrary source numbers normalise to 1. 2.");
-  eq(normalizeLists("* x\n* y"), "* x\n* y", "bullets untouched");
-  eq(normalizeLists("para\n\n    code block"), "para\n\n    code block", "non-list indented lines are left alone");
+  unchanged("1. a\nprose\n1. b", "unindented prose ends the list; the next list starts fresh");
+  eq(normalizeLists("3. a\n7. b"), "3. a\n4. b", "a list keeps its start number; later items count on from it");
+  unchanged("1. a\n2. b\n\nA paragraph between.\n\n3. c\n4. d", "a list resuming after prose keeps its start number (CommonMark renders 3)");
+  unchanged(
+    "## Outline\n\n2. Jesus’ Sermon on the Mount ([5:1–7:28](../05/01.md))\n    1. The Beatitudes\n3. Healings",
+    "MAT-style intro outline starting at the chapter's book-outline position is left alone",
+  );
+  unchanged("This is prose.\n5. is the verse where it happens.\nMore prose.", "a prose line that merely begins with `5. ` is left alone");
+  unchanged("* x\n* y", "bullets untouched");
+  unchanged("para\n\n    code block", "non-list indented lines are left alone");
+  unchanged("# Heading\n\ntext\n\n> quote\n\n```\n1. not a list\n```", "headings, quotes and fenced code untouched (fence body has no list marker shape)");
 }
 
-// ── normalizeLists: indentation (issue #753) ──
+// ── normalizeLists: nesting (issue #753) ──
 {
   const isa5 =
     "  1. Seventh oracle\n    1. The Song of the Vineyard\n  2. First six woes\n    1. Woe one\n    2. Woe two\n1. Present punishments\n    1. Devouring flame";
   eq(
     normalizeLists(isa5),
     "1. Seventh oracle\n    1. The Song of the Vineyard\n2. First six woes\n    1. Woe one\n    2. Woe two\n3. Present punishments\n    1. Devouring flame",
-    "ISA-style 2-space parents snap to column 0 so their 4-space children nest; the stray 0-space item joins the sequence",
+    "ISA-style 2-space parents snap to column 0 so their 4-space children nest; the shallower `1.` is still the same list and counts as 3",
   );
-  eq(normalizeLists("1. a\n   1. b"), "1. a\n    1. b", "a valid 3-space child (CommonMark-nested) becomes a 4-space child, not top level");
-  eq(normalizeLists("1. a\n      * b"), "1. a\n    * b", "6-space bullet snaps down to one level");
-  eq(normalizeLists("1. a\n    1. b\n        1. c"), "1. a\n    1. b\n        1. c", "8 spaces under a 4-space parent is a real third level and stays");
-  eq(normalizeLists("1. a\n        1. b"), "1. a\n    1. b", "an item can't skip a level: 8 spaces directly under a top-level item becomes its child");
+  unchanged("1. a\n    1. b\n        1. c\n2. d", "the 0/4/8 convention (ZEC, MAT, ROM, LEV on Door43) is a fixed point");
+  eq(normalizeLists("1. a\n   1. b"), "1. a\n    1. b", "a valid 3-space child becomes a 4-space child");
+  eq(normalizeLists("1. a\n      * b"), "1. a\n    * b", "a 6-space bullet directly under a top-level item is one level deep");
   eq(
     normalizeLists("1. Seventh\n       1. The Song\n2. Woes"),
     "1. Seventh\n    1. The Song\n2. Woes",
-    "the case from browser testing: 7 stray spaces under a top-level item become a clean 4-space child, not an orphaned grandchild",
+    "the case from browser testing: 7 stray spaces under a top-level item become a clean child, not an orphaned grandchild",
   );
-  eq(normalizeLists("        1. orphan\n1. b"), "1. orphan\n2. b", "a deeply indented first item has no parent, so it is top level");
+  eq(normalizeLists("1. a\n        1. b"), "1. a\n    1. b", "an item can't skip a level: 8 spaces directly under a top-level item is its child");
+  eq(normalizeLists("- a\n  - b\n    - c\n- d"), "- a\n    - b\n        - c\n- d", "2-space nested bullets keep their nesting, rewritten at 4 spaces per level");
+  eq(normalizeLists("    1. all\n    2. indented\n        1. child"), "1. all\n2. indented\n    1. child", "an outline written entirely indented is read relatively: first line is the top level");
+  eq(normalizeLists("        1. orphan\n1. b"), "1. orphan\n2. b", "a shallower line after the first item rebases the top level and continues its count");
   eq(normalizeLists("1. a\n    1. b\nprose\n        1. c"), "1. a\n    1. b\nprose\n1. c", "prose closes the outline; the next item starts a fresh top level");
   eq(normalizeLists("  1. a\n\n    1. b"), "1. a\n\n    1. b", "loose ISA-style list normalises the same way");
   eq(normalizeLists("plain text").split("\n").length, 1, "never adds lines");
+  const twice = normalizeLists(normalizeLists(isa5));
+  eq(twice, normalizeLists(isa5), "normalisation is idempotent");
 }
 
 // ── toggleList ──
@@ -95,6 +112,10 @@ function eq(actual, expected, msg) {
   const afterIsa = toggleList("  1. a\n    1. b\nc", 17, 17, "ordered");
   eq(afterIsa.value, "1. a\n    1. b\n2. c", "marking a line also normalises the ISA-style lines above it and continues their count");
   eq(afterIsa.selStart, afterIsa.value.length, "caret follows its own line even when earlier lines shrank");
+
+  const withNl = toggleList("a\nb\nc", 0, 4, "bullet");
+  eq(withNl.value, "* a\n* b\nc", "a selection ending just after a newline does not mark the next line");
+  eq(withNl.selEnd, 8, "…but the selection still ends after that newline");
 }
 
 // ── indent / outdent ──
@@ -111,8 +132,9 @@ function eq(actual, expected, msg) {
 
   eq(outdentLines("x", 0, 0).value, "x", "outdent on an unindented line is a no-op");
   eq(indentLines("a\n\nb", 0, 4).value, "    a\n\n    b", "blank lines inside the selection stay blank");
-  eq(indentLines("  1. a", 6, 6).value, "1. a", "a lone item has no parent to nest under, so indenting it leaves it top level (nested-with-no-parent renders as a code block)");
+  eq(indentLines("  1. a", 6, 6).value, "1. a", "a lone item has no parent to nest under, so indenting it leaves it top level");
   eq(indentLines("1. p\n  1. a", 10, 10).value, "1. p\n    1. a", "indenting an ISA-style 2-space item under a parent lands on a clean 4-space level");
+  eq(indentLines("3. a\n4. b", 5, 5).value, "3. a\n    1. b", "indenting under a list that starts at 3 keeps the parent's start and restarts the child at 1");
 }
 
 // ── tidyLists ──
@@ -121,6 +143,8 @@ function eq(actual, expected, msg) {
   eq(t.value, "intro\n\n1. a\n    1. b\n2. c", "tidy normalises the whole note without touching content");
   eq(t.selStart, 20, "caret stays at the same column of its line, shifted by that line's indent change");
   eq(normalizeLists(t.value), t.value, "tidy output is a fixed point");
+  const clean = "2. Sermon\n    1. Beatitudes\n3. Healings";
+  eq(tidyLists(clean, 0, 0).value, clean, "tidy on a clean MAT-style outline changes nothing (so the button never appears for it)");
 }
 
 // ── Enter continuation ──
@@ -134,6 +158,9 @@ function eq(actual, expected, msg) {
 
   const bullet = continueListOnEnter("* a", 3, 3);
   eq(bullet?.value, "* a\n* ", "Enter on a bullet continues with a bullet");
+
+  const started = continueListOnEnter("3. a", 4, 4);
+  eq(started?.value, "3. a\n4. ", "Enter continues from the list's own start number");
 
   const empty = continueListOnEnter("1. a\n2. ", 8, 8);
   eq(empty?.value, "1. a\n", "Enter on an empty item removes the marker (exits the list)");
@@ -180,6 +207,10 @@ function eq(actual, expected, msg) {
   const caret = toggleBold("abc", 1, 1);
   eq(caret.value, "a****bc", "empty selection inserts an empty bold pair");
   eq(caret.selStart, 3, "caret between the pair");
+  const ws = toggleBold("say hello now", 3, 10);
+  eq(ws.value, "say **hello** now", "edge whitespace in the selection stays outside the markers (`** hello **` is not emphasis)");
+  eq(ws.selStart, 6, "selection tightens to the word (start)");
+  eq(ws.selEnd, 11, "selection tightens to the word (end)");
 }
 
 if (failed) {
