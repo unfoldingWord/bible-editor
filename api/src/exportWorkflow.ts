@@ -81,6 +81,7 @@ import {
   sweepStaleMergeNoBase,
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
+import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
 import { dcsResourceFile, fetchDcsMasterText, fileBlobShaAtCommit, fileHeadCommit, type ReimportResource } from "./dcsSources";
 import { gitBlobSha, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
 import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
@@ -383,7 +384,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             // every standing one was minted on the measurement that retired it
             // (see retireMergeKeptFlags). D1-only — no Door43 walk.
             const kept = await retireMergeKeptFlags(this.env);
-            return { noBase, kept };
+            // Issue #749, the VERSE analogue of the line above: 'keep_ai_master'
+            // verse_merge_conflicts rows rest on the same complete no-human
+            // lineage and are no longer recorded, so the standing ones are pure
+            // banner backlog. Same gates, same step, also D1-only — no Door43
+            // walk. It swallows its own failure (returning 0) so a banner row
+            // that would not come down cannot cost the export its sweep step.
+            const keptVerses = await retireVerseKeptAiMasterFlags(this.env);
+            return { noBase, kept, keptVerses };
           });
         } catch (e) {
           console.error("export stale review-flag sweep failed", {
