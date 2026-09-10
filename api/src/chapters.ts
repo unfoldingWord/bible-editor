@@ -27,6 +27,7 @@ import {
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { resolveActorUsername } from "./rowProvenance.ts";
+import { withChapterZero, type ChapterSummaryRow } from "./chapterSummary";
 
 export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 type AppContext = Context<{ Bindings: Env; Variables: { userId?: number; username?: string } }>;
@@ -549,6 +550,6 @@ chapters.get("/:book", async (c) => {
        GROUP BY chapter ORDER BY chapter`,
     )
     .bind(book)
-    .all<{ chapter: number; verses: number; tn: number; tq: number; twl: number }>();
-  return c.json({ book, chapters: summary.results });
+    .all<ChapterSummaryRow>();
+  return c.json({ book, chapters: withChapterZero(summary.results) });
 });

@@ -43,6 +43,12 @@ import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import ArrowDropDownIcon from "@mui/icons-material/ArrowDropDown";
 import VisibilityOutlinedIcon from "@mui/icons-material/VisibilityOutlined";
 import VisibilityOffOutlinedIcon from "@mui/icons-material/VisibilityOffOutlined";
+import FormatBoldIcon from "@mui/icons-material/FormatBold";
+import FormatListNumberedIcon from "@mui/icons-material/FormatListNumbered";
+import FormatListBulletedIcon from "@mui/icons-material/FormatListBulleted";
+import FormatIndentIncreaseIcon from "@mui/icons-material/FormatIndentIncrease";
+import FormatIndentDecreaseIcon from "@mui/icons-material/FormatIndentDecrease";
+import AutoFixHighOutlinedIcon from "@mui/icons-material/AutoFixHighOutlined";
 import type { TnRow } from "../sync/api";
 import { isReadOnly } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
@@ -61,6 +67,17 @@ import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { parseNoteSegments, resolveNoteLinkHref } from "../lib/noteLinks";
+import {
+  continueListOnEnter,
+  indentLines,
+  isListLine,
+  normalizeLists,
+  outdentLines,
+  tidyLists,
+  toggleBold,
+  toggleList,
+  type FormatResult,
+} from "../lib/noteFormat";
 
 const NoteHistoryDialog = lazy(() =>
   import("./NoteHistoryDialog").then((m) => ({ default: m.NoteHistoryDialog })),
@@ -522,6 +539,11 @@ function NoteBodyMarkdownView({
         "& h3, & h4, & h5, & h6": { fontSize: "1.05em", fontWeight: 600, mt: 1, mb: 0.5 },
         "& p": { my: 0.75 },
         "& ul, & ol": { pl: 3, my: 0.5 },
+        // Outline convention the TN team writes intros in: 1. 2. 3. at the top
+        // level, A. B. C. beneath. CommonMark can only store `1.` markers, so
+        // the letters exist only in this rendering.
+        "& ol ol": { listStyleType: "upper-alpha" },
+        "& ol ol ol": { listStyleType: "lower-roman" },
         "& li": { my: 0.25 },
         "& blockquote": {
           borderLeft: "3px solid",
@@ -656,6 +678,39 @@ function NoteCardInner({
       ta.setSelectionRange(len, len);
     }
   }, [editingBody]);
+  // Toolbar / key-driven formatting: compute the new text from the live
+  // textarea selection, push it through the same state + pendingRef path a
+  // keystroke uses, then restore the caret once React has re-rendered the
+  // value (setting it synchronously would be clobbered by the controlled
+  // input's own update).
+  const pendingSelRef = useRef<{ start: number; end: number } | null>(null);
+  const applyFormat = (
+    fn: (value: string, selStart: number, selEnd: number) => FormatResult | null,
+  ) => {
+    const ta = noteTextareaRef.current;
+    if (!ta || readOnly) return false;
+    const result = fn(ta.value, ta.selectionStart, ta.selectionEnd);
+    if (!result) return false;
+    if (result.value === ta.value) {
+      // No text change means no re-render, so the [note] effect below would
+      // never fire and a stashed selection would misplace the caret on the
+      // next keystroke. Callers treat false as "let the default happen".
+      ta.setSelectionRange(result.selStart, result.selEnd);
+      return false;
+    }
+    setNote(result.value);
+    pendingRef.current = { ...pendingRef.current, note: result.value };
+    pendingSelRef.current = { start: result.selStart, end: result.selEnd };
+    return true;
+  };
+  useEffect(() => {
+    const sel = pendingSelRef.current;
+    const ta = noteTextareaRef.current;
+    if (!sel || !ta) return;
+    pendingSelRef.current = null;
+    ta.focus();
+    ta.setSelectionRange(sel.start, sel.end);
+  }, [note]);
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [aiConfirmOpen, setAiConfirmOpen] = useState(false);
@@ -1921,12 +1976,87 @@ function NoteCardInner({
             onActivate={() => setEditingBody(true)}
           />
         ) : (
+          <>
+            {!readOnly && (
+              <Stack direction="row" spacing={0.25} sx={{ mb: 0.5 }} data-testid="note-format-toolbar">
+                {(
+                  [
+                    { title: "Bold", Icon: FormatBoldIcon, fn: toggleBold, introOnly: false },
+                    {
+                      title: "Numbered list",
+                      Icon: FormatListNumberedIcon,
+                      fn: (v: string, s: number, e: number) => toggleList(v, s, e, "ordered"),
+                      introOnly: true,
+                    },
+                    {
+                      title: "Bulleted list",
+                      Icon: FormatListBulletedIcon,
+                      fn: (v: string, s: number, e: number) => toggleList(v, s, e, "bullet"),
+                      introOnly: true,
+                    },
+                    { title: "Decrease indent (Shift+Tab)", Icon: FormatIndentDecreaseIcon, fn: outdentLines, introOnly: true },
+                    { title: "Increase indent (Tab)", Icon: FormatIndentIncreaseIcon, fn: indentLines, introOnly: true },
+                    // Existing intros written with 2-space parents render their
+                    // children as run-on text (#753); offer the repair only
+                    // while the note actually needs it.
+                    ...(row.verse === 0 && normalizeLists(note) !== note
+                      ? [
+                          {
+                            title: "Tidy outline: fix list numbering and nesting",
+                            Icon: AutoFixHighOutlinedIcon,
+                            fn: tidyLists,
+                            introOnly: true,
+                          },
+                        ]
+                      : []),
+                  ] as const
+                )
+                  // Lists and indent are the chapter/book-intro outline
+                  // convention; ordinary verse notes only ever use bold.
+                  .filter((b) => !b.introOnly || row.verse === 0)
+                  .map(({ title, Icon, fn }) => (
+                    <Tooltip key={title} title={title}>
+                      <IconButton
+                        size="small"
+                        aria-label={title}
+                        color={fn === tidyLists ? "warning" : "default"}
+                        // mousedown default would move focus (and drop the
+                        // selection) off the textarea before the click runs.
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          applyFormat(fn);
+                        }}
+                        sx={{ p: 0.25, ...(fn === tidyLists ? {} : { color: "text.secondary" }) }}
+                      >
+                        <Icon sx={{ fontSize: 18 }} />
+                      </IconButton>
+                    </Tooltip>
+                  ))}
+              </Stack>
+            )}
           <TextField
             value={note}
             inputRef={noteTextareaRef}
             onChange={(e) => {
               setNote(e.target.value);
               pendingRef.current = { ...pendingRef.current, note: e.target.value };
+            }}
+            onKeyDown={(e) => {
+              if (row.verse !== 0 || readOnly || e.nativeEvent.isComposing) return;
+              const ta = noteTextareaRef.current;
+              if (!ta) return;
+              if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+                if (applyFormat(continueListOnEnter)) e.preventDefault();
+              } else if (e.key === "Tab" && isListLine(ta.value, ta.selectionStart)) {
+                // Only swallow Tab when it actually re-indents; a no-op (first
+                // item of a list, Shift+Tab at the top level) keeps the
+                // browser's focus move so the textarea is never a keyboard trap.
+                if (applyFormat(e.shiftKey ? outdentLines : indentLines)) e.preventDefault();
+              }
             }}
             multiline
             fullWidth
@@ -1946,6 +2076,7 @@ function NoteCardInner({
               },
             }}
           />
+          </>
         )}
       </Box>
 
