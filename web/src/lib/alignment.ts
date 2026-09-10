@@ -833,13 +833,18 @@ function collectAlignerSourceWords(verseObjects: unknown[]): CollectedSourceWord
         });
       } else if (
         o["type"] === "milestone" ||
-        // \d (Psalm superscription) content IS alignable verse body —
-        // descend like a milestone so its \w tokens are covered. Mirrors
-        // isPsalmTitleWrapper / collectMilestoneRuns in highlight.ts. A real
-        // \d node usfm-js emits carries NO `type` field; some shapes carry
-        // the legacy `type:"section"` instead — match on tag alone so both
-        // are covered (#746).
-        o["tag"] === "d"
+        // \d (Psalm superscription) — tag alone, not `type:"section"`:
+        // usfm-js parses a real `\d` as `{tag:"d", text}` with NO type
+        // field (only \s/\s1…\s5 get `type:"section"`), so the old
+        // `type:"section"` predicate matched nothing usfm-js actually
+        // emits. Descend like a milestone so its \w tokens are covered.
+        // Mirrors collectMilestoneRuns / nodeIsPsalmTitle in highlight.ts.
+        o["tag"] === "d" ||
+        // \qs (Selah) wraps its aligned \zaln-s content from OUTSIDE — not
+        // descending it drops the wrapped source word (and shifts
+        // `position` for every word after it in this verse). Mirrors
+        // isAlignmentWrapper's own use in parseAlignment above.
+        isAlignmentWrapper(o)
       ) {
         walkSrc((o["children"] as unknown[] | undefined) ?? []);
       }
