@@ -323,6 +323,14 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
 //    UHB has `הָ⁠אֶ֧בֶן הַ⁠בְּדִ֛יל`. Restoring the two joiners makes it match,
 //    so it gets its own message rather than a generic "not found".
 
+// The gap markers a quote may use between discontiguous parts. MUST stay in
+// step with GAP in web/src/lib/highlight.ts — the highlighter already accepts
+// "…" and "..." alongside "&", and REV 18:7 `r208` uses "…" in prod. Splitting
+// on "&" alone reported that working quote as unresolvable, and (worse) the
+// "..." spelling came back `confident`, so --repair would have rewritten a
+// correct quote.
+const QUOTE_GAP = /[&…]+|\.{3}/;
+
 // Separators carrying no letter content. Word joiner is deliberately absent.
 const QUOTE_SEPARATORS = /[־׀׃,.;··:!?"“”'’‘()[\]{}—–-]+/g;
 const INVISIBLE_JOINERS = /[⁠‍﻿]/g;
@@ -335,6 +343,30 @@ function quoteNorm(s: string): string {
 /** quoteNorm, plus invisible joiners removed — the LOOKUP fold only. */
 function quoteBare(s: string): string {
   return quoteNorm(s).replace(INVISIBLE_JOINERS, "");
+}
+
+/**
+ * NO folding at all — byte equality against the source `\w` surface.
+ *
+ * The DATA says this is what translationCore counts. Two worked examples, both
+ * from the prod corpus, both declaring `1/1` on each member of a visually
+ * identical pair:
+ *   DAN 2:10  `כָּ⁠ל` (U+2060 between prefix and stem) and bare `כָּל`
+ *   1CH 22:19 `הָֽ⁠אֱלֹהִ֔ים` twice, differing only in combining-mark ORDER
+ * If tC folded either difference away it would have numbered them 1/2 and 2/2.
+ * It did not, so each byte-distinct surface carries its own occurrence
+ * sequence — and any fold here invents a second occurrence and flags a verse
+ * with nothing wrong with it. A joiner-stripping fold produced 99 such flags;
+ * an NFC fold kept the combining-mark half of them.
+ *
+ * Note this diverges from `sourceTextTotals` in web/src/lib/sourceOccurrences.ts,
+ * which counts under `nfc()`. That function drives the REPAIR, and its folding
+ * only ever makes it more conservative (a folded count > 1 falls outside its
+ * appears-once rule, so it declines to touch the row). Worth reconciling, but
+ * the flag a translator sees must not be a phantom.
+ */
+function alignFold(s: string): string {
+  return s;
 }
 
 /** A source word plus the separator that FOLLOWS it in the source text. */
@@ -392,35 +424,64 @@ export function sourceWordsByRef(sourceVerses: VerseRow[]): Map<string, SourceTo
 }
 
 /**
- * Last verse a tn row covers. The row itself stores only the START verse
- * (`refParts` takes `vs.split("-")[0]`); the range lives in `ref_raw`, e.g.
- * `1:5-6`. Ignoring it made a quote spanning DEU 1:5-6 get checked against
- * verse 5 alone, so every word from verse 6 read as "not in the verse" — 185
- * false positives corpus-wide, dwarfing the 65 real ones.
+ * Every verse a tn row covers, in order.
+ *
+ * The row stores only the START verse (`refParts` takes `vs.split("-")[0]`);
+ * the real span lives in `ref_raw`. Two shapes occur and BOTH are live:
+ *   `1:5-6`      a range  — ignoring it checked a two-verse quote against
+ *                verse 5 alone, 185 false positives corpus-wide.
+ *   `5:1,3,8,12` a list   — PSA 5:1 row `sbh4` really is this, and searching
+ *                only verse 1 reported a correct quote as unresolvable.
+ * A chapter-qualified end (`1:5-1:6`) is accepted too; anything unparseable
+ * degrades to the single start verse rather than guessing.
  */
-function refEndVerse(refRaw: string | null | undefined, fallback: number): number {
-  const vs = (refRaw ?? "").split(":")[1];
-  if (!vs) return fallback;
-  const end = vs.split("-")[1];
-  const n = end ? parseInt(end, 10) : NaN;
-  return Number.isFinite(n) && n >= fallback ? n : fallback;
+function refVerseList(refRaw: string | null | undefined, fallback: number): number[] {
+  // Everything after the FIRST colon. `split(":")[1]` truncates a
+  // chapter-qualified end: "1:5-1:6" would yield "5-1" and lose the 6.
+  const raw = refRaw ?? "";
+  const colon = raw.indexOf(":");
+  const vs = colon < 0 ? "" : raw.slice(colon + 1);
+  if (!vs) return [fallback];
+  const out: number[] = [];
+  for (const piece of vs.split(",")) {
+    const [rawStart, rawEnd] = piece.split("-");
+    // "1:5-1:6" — an end written as chapter:verse; take its verse half.
+    const start = parseInt((rawStart ?? "").split(":").pop() ?? "", 10);
+    if (!Number.isFinite(start)) continue;
+    const end = rawEnd === undefined ? start : parseInt(rawEnd.split(":").pop() ?? "", 10);
+    if (!Number.isFinite(end) || end < start || end - start > 200) { out.push(start); continue; }
+    for (let n = start; n <= end; n++) out.push(n);
+  }
+  if (!out.length) return [fallback];
+  if (!out.includes(fallback)) out.unshift(fallback);
+  return [...new Set(out)].sort((a, b) => a - b);
 }
 
-/** Source words for a tn row, concatenated across every verse it covers. */
+/**
+ * Source tokens for a tn row, concatenated across every verse it covers.
+ *
+ * A bridged source verse is registered under each verse of its span, so a
+ * ranged ref that lands inside one bridge would otherwise concatenate the same
+ * token array once per covered verse — tripling a 3-word verse and making every
+ * surface look repeated. Identity de-duplication keeps one copy.
+ */
 export function wordsForRow(
   byRef: Map<string, SourceToken[]>,
   chapter: number,
   verse: number,
   refRaw: string | null | undefined,
 ): SourceToken[] {
-  const end = refEndVerse(refRaw, verse);
-  if (end === verse) return byRef.get(`${chapter}:${verse}`) ?? [];
+  const verses = refVerseList(refRaw, verse);
+  if (verses.length === 1) return byRef.get(`${chapter}:${verses[0]}`) ?? [];
   const out: SourceToken[] = [];
-  for (let n = verse; n <= end; n++) {
+  const seen = new Set<SourceToken[]>();
+  for (const n of verses) {
     const w = byRef.get(`${chapter}:${n}`);
-    // A gap in the middle of a range means we cannot faithfully reconstruct
-    // the span — bail rather than flag against a hole.
+    // A gap in the middle of the span means we cannot faithfully reconstruct
+    // it — bail rather than flag against a hole.
     if (!w) return [];
+    if (seen.has(w)) continue;
+    seen.add(w);
     out.push(...w);
   }
   return out;
@@ -471,7 +532,7 @@ export function resolveTnQuote(
   );
   const words = tokens.map((t) => t.text);
   const hay = ` ${words.map(quoteNorm).join(" ")} `;
-  const parts = quote.split("&").map((p) => p.trim()).filter(Boolean);
+  const parts = quote.split(QUOTE_GAP).map((p) => p.trim()).filter(Boolean);
 
   let cursor = 0;
   let contiguousOk = true;
@@ -576,8 +637,11 @@ const QUOTE_MESSAGES: Record<QuoteFailureKind, string> = {
  * Rows whose verse is missing from `sourceVerses` are SKIPPED, not flagged —
  * absence of a source verse is a different problem and would drown this one.
  */
-export function lintTnQuotes(rows: TnRow[], sourceVerses: VerseRow[]): LintIssue[] {
-  const byRef = sourceWordsByRef(sourceVerses);
+export function lintTnQuotes(
+  rows: TnRow[],
+  source: VerseRow[] | Map<string, SourceToken[]>,
+): LintIssue[] {
+  const byRef = source instanceof Map ? source : sourceWordsByRef(source);
   const issues: LintIssue[] = [];
   for (const r of rows) {
     const quote = r.quote?.trim();
@@ -618,16 +682,25 @@ export function lintTnQuotes(rows: TnRow[], sourceVerses: VerseRow[]): LintIssue
 // Repeated milestones for ONE occurrence are legitimate (discontinuous
 // alignment — canonizeHebrew.ts handles them), so this counts DISTINCT
 // occurrence values, never milestone instances.
-export function lintAlignmentOccurrences(verses: VerseRow[], sourceVerses: VerseRow[]): LintIssue[] {
-  const byRef = sourceWordsByRef(sourceVerses);
+export function lintAlignmentOccurrences(
+  verses: VerseRow[],
+  source: VerseRow[] | Map<string, SourceToken[]>,
+): LintIssue[] {
+  const byRef = source instanceof Map ? source : sourceWordsByRef(source);
   const issues: LintIssue[] = [];
   for (const v of verses) {
     const vo = verseObjectsOf(v);
     if (!vo.length) continue;
-    const toks = byRef.get(`${v.chapter}:${v.verse}`);
-    if (!toks || !toks.length) continue;
+    // A bridged TARGET verse (` 14-15`) spans several source verses. Counting
+    // its milestones against only the first one reports a word that legitimately
+    // appears once per verse as over-declared. The source side already handles
+    // bridges; this is the matching target-side span.
+    const toks = wordsForRow(byRef, v.chapter, v.verse, `${v.chapter}:${v.verse}${
+      v.verse_end && v.verse_end > v.verse ? `-${v.verse_end}` : ""
+    }`);
+    if (!toks.length) continue;
     const counts = new Map<string, number>();
-    for (const t of toks) counts.set(quoteBare(t.text), (counts.get(quoteBare(t.text)) ?? 0) + 1);
+    for (const t of toks) counts.set(alignFold(t.text), (counts.get(alignFold(t.text)) ?? 0) + 1);
 
     // content → { declared totals seen, occurrence indices seen }
     const groups = new Map<string, { totals: Set<number>; occs: Set<number> }>();
@@ -638,12 +711,20 @@ export function lintAlignmentOccurrences(verses: VerseRow[], sourceVerses: Verse
         if (isZalnMilestone(o)) {
           const content = typeof o["content"] === "string" ? (o["content"] as string) : null;
           if (content) {
-            const g = groups.get(content) ?? { totals: new Set<number>(), occs: new Set<number>() };
+            // Key by the counting fold, not the raw bytes: two milestones whose
+            // content differs only in NFC form would otherwise form separate
+            // groups and each be compared against the merged count.
+            const key = alignFold(content);
+            const g = groups.get(key) ?? { totals: new Set<number>(), occs: new Set<number>() };
             const occ = Number(o["occurrence"]);
             const tot = Number(o["occurrences"]);
             if (Number.isFinite(occ)) g.occs.add(occ);
+            // A milestone with NO x-occurrences is UNKNOWN, not wrong. Reporting
+            // it as "x-occurrences=?" turns missing metadata into a defect the
+            // translator cannot act on — the same reasoning zalnLintKey applies
+            // to a missing x-occurrence.
             if (Number.isFinite(tot)) g.totals.add(tot);
-            groups.set(content, g);
+            groups.set(key, g);
           }
         }
         if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
@@ -652,11 +733,15 @@ export function lintAlignmentOccurrences(verses: VerseRow[], sourceVerses: Verse
     walk(vo);
 
     for (const [content, g] of groups) {
-      const actual = counts.get(quoteBare(content)) ?? 0;
+      const actual = counts.get(alignFold(content)) ?? 0;
       // x-content not in the source verse at all is a different defect; the
       // quote/canonize paths own that one.
       if (!actual) continue;
       const totals = [...g.totals];
+      // No milestone in this group declared x-occurrences at all — unknown, not
+      // wrong. Reporting "x-occurrences=?" turns missing metadata into a defect
+      // a translator cannot act on.
+      if (!totals.length) continue;
       if (totals.length !== 1 || totals[0] !== actual) {
         issues.push({
           check: "Alignment declares the wrong occurrence count",

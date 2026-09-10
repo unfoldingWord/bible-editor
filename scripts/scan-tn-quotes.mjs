@@ -23,11 +23,11 @@
 // Workflow:
 //   1. Dump rows to JSON (run from api/):
 //        npx wrangler d1 execute bible_editor --remote --env production \
-//          --command "SELECT id,book,chapter,verse,quote,version FROM tn_rows
+//          --command "SELECT id,book,chapter,verse,ref_raw,quote,version FROM tn_rows
 //                     WHERE deleted_at IS NULL AND trashed_at IS NULL" \
 //          --json > ../scripts/out/tn-dump.json
 //        npx wrangler d1 execute bible_editor --remote --env production \
-//          --command "SELECT book,chapter,verse,bible_version,content_json FROM verses
+//          --command "SELECT book,chapter,verse,verse_end,bible_version,content_json FROM verses
 //                     WHERE bible_version IN ('UHB','UGNT')" \
 //          --json > ../scripts/out/src-dump.json
 //      (local dev: bible_editor_dev --local)
@@ -88,6 +88,13 @@ const wordsByBook = new Map();
 for (const [book, rows] of srcByBook) wordsByBook.set(book, sourceWordsByRef(rows));
 
 const sqlEscape = (s) => s.replace(/'/g, "''");
+
+// A `-- comment` line ends at the first newline, so a stored quote containing
+// one would push the rest of itself out as a top-level statement in a file we
+// hand to `wrangler d1 execute --file=`. Nothing in prod has a newline in a
+// quote today (measured: 0 of 78,696), and the schema does not forbid one —
+// the AI pipeline writes this column too. Flatten to one line before printing.
+const sqlComment = (s) => String(s).replace(/[\r\n]+/g, " \u23ce ");
 
 let checked = 0;
 const failures = [];
@@ -172,12 +179,22 @@ const lines = [
   `-- ${repairable.length} row(s); ${manual.length} left for manual review.`,
   "",
 ];
+const unusable = repairable.filter((f) => !Number.isFinite(Number(f.row.version)));
+if (unusable.length) {
+  console.error(`
+refusing to emit SQL: ${unusable.length} row(s) have no usable version — ` +
+    "the dump must include the version column, or the optimistic-concurrency guard " +
+    "would be written as the bare token NaN and fail mid-file after earlier UPDATEs committed.");
+  for (const f of unusable) console.error(`  ${f.row.book} ${f.row.id}`);
+  process.exit(1);
+}
+
 for (const f of repairable) {
   lines.push(
-    `-- ${f.row.book} ${f.row.chapter}:${f.row.verse} ${f.row.id} [${f.verdict.kind}]`,
-    `--   was: ${f.row.quote}`,
+    `-- ${sqlComment(f.row.book)} ${f.row.chapter}:${f.row.verse} ${sqlComment(f.row.id)} [${f.verdict.kind}]`,
+    `--   was: ${sqlComment(f.row.quote)}`,
     `UPDATE tn_rows SET quote = '${sqlEscape(f.verdict.suggestion)}', version = version + 1, updated_at = unixepoch()`,
-    `  WHERE book = '${sqlEscape(f.row.book)}' AND id = '${sqlEscape(f.row.id)}' AND version = ${Number(f.row.version)};`,
+    `  WHERE book = '${sqlEscape(f.row.book)}' AND id = '${sqlEscape(f.row.id)}' AND version = ${Number(f.row.version)} AND deleted_at IS NULL AND trashed_at IS NULL;`,
     // Audit row, same shape the app writes for a quote edit (a PARTIAL payload
     // of just the changed fields — see edit_log for kind='tn'). A direct SQL
     // repair would otherwise be the one kind of change with no history entry,

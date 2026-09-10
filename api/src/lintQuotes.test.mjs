@@ -227,6 +227,76 @@ const only = (rows, src) => lintTnQuotes(rows, src);
   assert(resolveTnQuote("כִּֽי", words).ok === true, "the corrected `כִּֽי` resolves");
 }
 
+// ── Review findings: false positives found on real prod data ───────────
+{
+  // Comma references are legal and live: PSA 5:1 row `sbh4` is "5:1,3,8,12".
+  // Splitting only on "-" searched verse 1 alone and called a correct quote
+  // unresolvable.
+  const src = [sourceVerse(5, 1, ["יְֽהוָ֗ה"]), sourceVerse(5, 3, ["בֹּ֗קֶר"]), sourceVerse(5, 8, ["נְחֵ֥⁠נִי"])];
+  const row = { ...tn("sbh4", 5, 1, "יְֽהוָ֗ה & בֹּ֗קֶר & נְחֵ֥⁠נִי"), ref_raw: "5:1,3,8,12" };
+  assert(lintTnQuotes([row], src).length === 0, "a comma reference searches every listed verse");
+
+  // A chapter-qualified range end must not derail the parse.
+  const src2 = [sourceVerse(1, 5, ["הוֹאִ֣יל"]), sourceVerse(1, 6, ["יְהוָ֧ה"])];
+  const row2 = { ...tn("q", 1, 5, "הוֹאִ֣יל יְהוָ֧ה"), ref_raw: "1:5-1:6" };
+  assert(lintTnQuotes([row2], src2).length === 0, "a chapter-qualified range end (1:5-1:6) parses");
+}
+{
+  // The app's highlighter accepts "…" and "..." as gap markers (GAP in
+  // highlight.ts). REV 18:7 `r208` uses "…" in prod; splitting on "&" alone
+  // called it unresolvable, and the "..." spelling came back CONFIDENT, so the
+  // repair would have rewritten a working quote.
+  const words = ["ἐν", "τῇ", "καρδίᾳ", "αὐτῆς", "λέγει", "χήρα", "οὐκ", "εἰμί"];
+  for (const [label, q] of [
+    ["ellipsis", "ἐν τῇ καρδίᾳ αὐτῆς λέγει… χήρα οὐκ εἰμί"],
+    ["three dots", "ἐν τῇ καρδίᾳ αὐτῆς λέγει... χήρα οὐκ εἰμί"],
+    ["ampersand", "ἐν τῇ καρδίᾳ αὐτῆς λέγει & χήρα οὐκ εἰμί"],
+  ]) {
+    assert(resolveTnQuote(q, words).ok === true, `"${label}" is accepted as a gap marker`);
+  }
+}
+{
+  // A source verse bridge registered under each verse it spans must not be
+  // concatenated once per verse for a ranged ref.
+  const bridge = [{ ...sourceVerse(2, 6, ["אָז", "יִבָּקַע", "שַׁחַר"]), verse_end: 7 }];
+  const row = { ...tn("b", 2, 6, "אָז יִבָּקַע"), ref_raw: "2:6-7" };
+  assert(lintTnQuotes([row], bridge).length === 0,
+    "a ranged ref inside one source bridge counts the bridge's words once");
+}
+
+// ── Review findings: alignment counting ─────────────────────────────
+{
+  const WJ = "⁠";
+  // DAN 2:10: the UHB really does hold both spellings, each aligned 1/1.
+  // Folding the joiner away counted 2 and flagged a correct verse.
+  const src = [sourceVerse(2, 10, ["כָּ" + WJ + "ל", "אֱנָשָׁא", "כָּל"])];
+  const aligned = [alignedVerse(2, 10, "ULT", [
+    { content: "כָּ" + WJ + "ל", occurrence: 1, occurrences: 1, words: ["any"] },
+    { content: "כָּל", occurrence: 1, occurrences: 1, words: ["all"] },
+  ])];
+  assert(lintAlignmentOccurrences(aligned, src).length === 0,
+    "two source words differing only by a word joiner are counted separately");
+
+  // 1CH 22:19 shape: differ only in combining-mark ORDER, so NFC merges them.
+  const a = "ה" + "ֽ" + "ָ" + "ם";
+  const b = "ה" + "ָ" + "ֽ" + "ם";
+  assert(a !== b && a.normalize("NFC") === b.normalize("NFC"), "fixture differs only in mark order");
+  const src2 = [sourceVerse(22, 19, [a, b])];
+  const aligned2 = [alignedVerse(22, 19, "ULT", [
+    { content: a, occurrence: 1, occurrences: 1, words: ["the"] },
+    { content: b, occurrence: 1, occurrences: 1, words: ["God"] },
+  ])];
+  assert(lintAlignmentOccurrences(aligned2, src2).length === 0,
+    "two source words differing only in combining-mark order are counted separately");
+}
+{
+  // A milestone with no x-occurrences is UNKNOWN, not wrong.
+  const src = [sourceVerse(3, 1, ["דָבָר"])];
+  const aligned = [alignedVerse(3, 1, "ULT", [{ content: "דָבָר", occurrence: 1, occurrences: undefined, words: ["word"] }])];
+  assert(lintAlignmentOccurrences(aligned, src).length === 0,
+    "a milestone with no x-occurrences is not reported as a defect");
+}
+
 // ── Alignment occurrence invariant (#764) ───────────────────────────────────
 {
   const src = [sourceVerse(8, 1, ["וַ⁠יְהִ֛י", "דְּבַר", "יְהוָ֥ה", "צְבָא֖וֹת", "לֵ⁠אמֹֽר"])];

@@ -61,11 +61,16 @@ for (const r of rowsOf(tnPath)) {
   const after = resolveTnQuote(v.suggestion, words);
   if (!after.ok) problems.push(`repaired quote STILL fails (${after.kind})`);
 
-  // Multiset comparison, order-independent.
-  const before = wordsOf(quote).sort();
-  const fixed = wordsOf(v.suggestion).sort();
-  const added = fixed.filter((w) => !before.includes(w));
-  const dropped = before.filter((w) => !fixed.includes(w));
+  // A real multiset comparison. `Array.includes` would make this a SET
+  // comparison, and a repair that drops one of two identical words would pass
+  // unnoticed — the exact failure mode this check exists to catch.
+  const tally = (ws) => ws.reduce((m, w) => m.set(w, (m.get(w) ?? 0) + 1), new Map());
+  const before = tally(wordsOf(quote));
+  const fixed = tally(wordsOf(v.suggestion));
+  const added = [];
+  const dropped = [];
+  for (const [w, n] of fixed) if (n > (before.get(w) ?? 0)) added.push(`${w} x${n - (before.get(w) ?? 0)}`);
+  for (const [w, n] of before) if (n > (fixed.get(w) ?? 0)) dropped.push(`${w} x${n - (fixed.get(w) ?? 0)}`);
   if (added.length) problems.push(`ADDS word(s) the note never quoted: ${added.join(", ")}`);
   if (dropped.length) problems.push(`DROPS quoted word(s): ${dropped.join(", ")}`);
 
