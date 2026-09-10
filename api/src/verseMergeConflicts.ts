@@ -91,6 +91,7 @@ import {
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
+  SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
 } from "./verseMergeConflictSql.ts";
 
@@ -311,16 +312,47 @@ export async function deleteLostAdoptionConflicts(
 // NULL, and that pair IS the audit trail (a human resolve always carries a
 // non-null resolved_by).
 //
+// Issue #760 (#754 P1 follow-up): retiring the ROWS is not enough — the
+// "Sync flagged N verse(s)" banner is a MATERIALIZED system_alerts row, only
+// re-derived by raiseVerseMergeConflictAlert, which this sweep does not call
+// (it runs for every (book, resource) pair, including ones this run never
+// reimported and whose Door43 SHA is unchanged). Left alone, a resource whose
+// only standing conflicts were keep_ai_master keeps its banner up forever
+// even though nothing behind it is actionable anymore. So: read the distinct
+// (book, resource) pairs this retire is about to touch BEFORE the UPDATE,
+// then run clearResolvedConflictBannerIfLast for each — it re-checks (inside
+// its own DELETE) whether any OTHER alertable conflict still justifies the
+// banner, so a pair that also carries a live adopt_conflict/
+// keep_alignment_refused/source_attr_divergent/keep_local_structure row, or a
+// keep_no_base warning, correctly keeps its banner up.
+//
 // Best-effort, like every other write in this file: it runs inside the nightly
 // sweep step, and a banner row that failed to come down is not a reason to
 // abandon the export that follows. Idempotent — the second night matches nothing
-// and reports 0.
+// (no pairs read, nothing to retire, nothing to clear) and reports 0.
 export async function retireVerseKeptAiMasterFlags(env: Env): Promise<{ cleared: number }> {
   const now = Math.floor(Date.now() / 1000);
+  let pairs: Array<{ book: string; resource: string }> = [];
+  try {
+    const rs = await env.DB.prepare(SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL).all<{
+      book: string;
+      resource: string;
+    }>();
+    pairs = rs.results ?? [];
+  } catch (e) {
+    console.error("verse keep_ai_master retire: pair lookup failed", {
+      error: e instanceof Error ? e.message : String(e),
+    });
+    // Fall through and still attempt the retire UPDATE below — the banner
+    // clear is a best-effort bonus, not a precondition for retiring the rows.
+  }
   try {
     const res = await env.DB.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).bind(now).run();
     const cleared = res?.meta?.changes ?? 0;
     if (cleared > 0) console.log("verse keep_ai_master retire", { cleared });
+    for (const { book, resource } of pairs) {
+      await clearResolvedConflictBannerIfLast(env, book, resource);
+    }
     return { cleared };
   } catch (e) {
     console.error("verse keep_ai_master retire: failed", {

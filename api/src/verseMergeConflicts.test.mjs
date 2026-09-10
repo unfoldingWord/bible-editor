@@ -79,6 +79,7 @@ import {
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
+  SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
   VERSE_PATCH_UPDATE_SQL,
 } from "./verseMergeConflictSql.ts";
@@ -1152,6 +1153,104 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   const active = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ust");
   assert(!active.some((r) => r.action === "keep_ai_master"), "no keep_ai_master row remains in the banner filter");
   assert(active.length === 4, "…and the four genuinely alertable rows still are");
+}
+
+{
+  // Issue #760 (#754 P1 follow-up). Retiring the ROWS above is not enough: the
+  // "Sync flagged N verse(s)" banner is a MATERIALIZED system_alerts row that
+  // only raiseVerseMergeConflictAlert re-derives, and the unscoped nightly
+  // sweep never calls it for a resource whose Door43 SHA didn't change this
+  // run. retireVerseKeptAiMasterFlags now reads the distinct (book, resource)
+  // pairs it's about to retire BEFORE the UPDATE
+  // (SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL) and runs
+  // clearResolvedConflictBannerIfLast (replicated here by clearResolvedBanner,
+  // against the ACTUAL SQL constants) for each. This block drives that exact
+  // sequence and asserts all three cases from the issue's success check.
+
+  // Case 1: a standing keep_ai_master row plus its banner, for a resource that
+  // is NOT reimported this run (nothing else outstanding) — banner must come
+  // down along with the row.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('JER','ult',3,5,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:JER:ult','Sync flagged 1 verse(s) in JER ULT...',100)`,
+    ).run();
+
+    const pairs = d.prepare(SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL).all();
+    assert(pairs.length === 1 && pairs[0].book === "JER" && pairs[0].resource === "ult",
+      "the pair lookup finds JER/ult before the retire UPDATE runs");
+
+    d.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).run(9000);
+    for (const p of pairs) clearResolvedBanner(d, p.book, p.resource);
+
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`)
+      .all()[0].n;
+    assert(remaining === 0, "a pure keep_ai_master-backlog banner is cleared by the retire sweep");
+  }
+
+  // Case 2: a keep_ai_master row retired alongside a REAL alertable conflict
+  // (adopt_conflict) sharing the same banner source — the banner must survive,
+  // still naming the genuinely outstanding row.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('JER','ust',3,5,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('JER','ust',4,1,'adopt_conflict','both_changed',7,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:JER:ust','Sync flagged 1 verse(s) in JER UST...',100)`,
+    ).run();
+
+    const pairs = d.prepare(SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL).all();
+    d.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).run(9000);
+    for (const p of pairs) clearResolvedBanner(d, p.book, p.resource);
+
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ust'`)
+      .all()[0].n;
+    assert(remaining === 1, "a banner with a real outstanding adopt_conflict row survives the retire sweep");
+    const kept = d
+      .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='JER' AND resource='ust' AND verse=5`)
+      .all()[0];
+    assert(kept.resolved_at === 9000, "…even though the keep_ai_master row itself was still retired");
+  }
+
+  // Case 3: a banner carrying a keep_no_base warning (no verse_merge_conflicts
+  // row at all — it lives only in the message, see
+  // alertMessageCarriesNoBaseWarning) must be preserved, same as
+  // clearResolvedConflictBannerIfLast's own per-username carve-out.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('NUM','ult',9,2,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:NUM:ult',
+               'Sync flagged 0 verse(s) in NUM ULT for adjudicated review. 1 verse(s) could not be adjudicated: no ancestor was recoverable for them from before this sync (9:9).',100)`,
+    ).run();
+
+    const pairs = d.prepare(SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL).all();
+    d.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).run(9000);
+    for (const p of pairs) clearResolvedBanner(d, p.book, p.resource);
+
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:NUM:ult'`)
+      .all()[0].n;
+    assert(remaining === 1, "a keep_no_base warning banner is preserved by the retire sweep, not erased");
+  }
 }
 
 {
