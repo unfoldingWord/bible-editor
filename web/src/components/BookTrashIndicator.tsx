@@ -26,13 +26,27 @@ import { api, type BookTrashRow } from "../sync/api";
 interface Props {
   book: string;
   onNavigate: (book: string, chapter: number, verse?: number) => void;
+  // Bumped by Shell whenever handleTrashNote/handleRestoreNote succeeds
+  // (anywhere in the book, not just the currently open chapter) — the only
+  // signal this indicator has that the list needs refetching. Without it, a
+  // book with nothing trashed at mount renders nothing (see the total === 0
+  // early return below) and never gets another chance to notice a note
+  // trashed afterward, since opening the menu is the *other* refresh trigger
+  // and there'd be no icon left to click.
+  refreshSignal: number;
+  // Routes through Shell's handleRestoreNote so a restore here gets the same
+  // optimistic local patch, lint-chip refresh, and failure toast (including a
+  // viewer's read_only 403, which api.ts throws client-side) as the note
+  // card's own Restore button — rather than a second, thinner copy of that
+  // logic that silently swallows errors.
+  onRestore: (id: string) => void | Promise<void>;
 }
 
 function refLabel(row: BookTrashRow): string {
   return row.chapter === 0 && row.verse === 0 ? "intro" : `${row.chapter}:${row.verse}`;
 }
 
-export function BookTrashIndicator({ book, onNavigate }: Props) {
+export function BookTrashIndicator({ book, onNavigate, refreshSignal, onRestore }: Props) {
   const anchorRef = useRef<HTMLButtonElement | null>(null);
   const [open, setOpen] = useState(false);
   const [rows, setRows] = useState<BookTrashRow[]>([]);
@@ -45,8 +59,9 @@ export function BookTrashIndicator({ book, onNavigate }: Props) {
       .catch(() => setRows([]));
   };
 
-  // Refetch on book change, and again each time the menu opens so a note
-  // trashed in another chapter this session shows up without a reload.
+  // Refetch on book change and on every trash/restore anywhere in the book
+  // (refreshSignal), and again each time the menu opens so a note trashed by
+  // someone else this session shows up without a reload.
   useEffect(() => {
     setRows([]);
     let cancelled = false;
@@ -57,22 +72,21 @@ export function BookTrashIndicator({ book, onNavigate }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [book]);
+  }, [book, refreshSignal]);
 
   const total = rows.length;
   if (total === 0) return null;
 
   const tooltip = `${total} trashed note${total === 1 ? "" : "s"} in ${book}`;
 
+  // No optimistic removal here: onRestore swallows its own errors (it toasts
+  // instead of rethrowing, matching the note card's own Restore button), so
+  // this can't tell success from failure. The refreshSignal bump on success
+  // reconciles the list for both; a failure just leaves the row listed.
   const restore = async (row: BookTrashRow) => {
     setRestoringId(row.id);
     try {
-      await api.restoreNote(row.id, book);
-      setRows((prev) => prev.filter((r) => r.id !== row.id));
-    } catch {
-      // Leave the row listed — the server is the source of truth, and a
-      // failed restore (e.g. the row was finalized between the list load and
-      // the click) surfaces the next time the menu opens.
+      await onRestore(row.id);
     } finally {
       setRestoringId(null);
     }
