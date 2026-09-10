@@ -81,6 +81,7 @@ import { ExportUsfmButton } from "./ExportUsfmButton";
 import { BookLintIndicator } from "./BookLintIndicator";
 import { AlignAttentionIndicator } from "./AlignAttentionIndicator";
 import { BookNotesIndicator } from "./BookNotesIndicator";
+import { BookTrashIndicator } from "./BookTrashIndicator";
 import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
@@ -3322,6 +3323,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }
         notesIndicator={
           <BookNotesIndicator
+            book={book}
+            onNavigate={(b, c, v) => {
+              runWithDirtyGate(() => {
+                setActiveVerse(v ?? 1);
+                setActiveNoteId(null);
+                setActiveWordId(null);
+                setActiveQuestionId(null);
+                onNavigate?.(b, c, v);
+              });
+            }}
+          />
+        }
+        trashIndicator={
+          <BookTrashIndicator
             book={book}
             onNavigate={(b, c, v) => {
               runWithDirtyGate(() => {

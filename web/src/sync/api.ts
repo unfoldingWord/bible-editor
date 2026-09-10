@@ -1357,6 +1357,22 @@ export interface BookCommentSummary {
   total: number;
 }
 
+// A trashed tn row, as listed by GET /api/chapters/:book/trash (issue #755).
+export interface BookTrashRow {
+  id: string;
+  chapter: number;
+  verse: number;
+  ref_raw: string;
+  note_preview: string;
+  last_change_actor: string | null;
+  trashed_at: number;
+}
+
+export interface BookTrashSummary {
+  book: string;
+  rows: BookTrashRow[];
+}
+
 // ── Admin panel (see web/src/components/AdminPanel.tsx) ────────────────────
 // Types mirror the backend contract in AdminPanel's task spec; the two sides
 // are being built together against that shared contract.
@@ -1590,6 +1606,11 @@ export interface ExportInstanceStatus {
 export const api = {
   getBookSummary: (book: string, signal?: AbortSignal) =>
     request<BookSummary>(`/api/chapters/${encodeURIComponent(book)}`, { signal }),
+
+  // Every trashed-but-not-yet-finalized tn row for the book, regardless of
+  // which chapter is currently open (issue #755).
+  getBookTrash: (book: string, signal?: AbortSignal) =>
+    request<BookTrashSummary>(`/api/chapters/${encodeURIComponent(book)}/trash`, { signal }),
 
   getChapter: (book: string, chapter: number, signal?: AbortSignal) =>
     request<ChapterPayload>(
