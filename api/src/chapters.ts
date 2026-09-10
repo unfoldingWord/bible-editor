@@ -32,6 +32,42 @@ import { withChapterZero, type ChapterSummaryRow } from "./chapterSummary";
 export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 type AppContext = Context<{ Bindings: Env; Variables: { userId?: number; username?: string } }>;
 
+// Book-level trash list (issue #755). A trashed tn row (trashed_at set) is
+// otherwise only reachable by navigating to its own verse — the nightly
+// finalize promotes every trashed_at to a permanent deleted_at with no
+// warning, so a note trashed in a chapter nobody revisits that day is
+// silently gone the next morning. This lets the client list every trashed
+// row for the book regardless of which chapter is currently open, with
+// enough to render a Restore action inline.
+//
+// Registered ahead of "/:book/:chapter" below: Hono's router picks whichever
+// registered route matches first, and ":chapter" would otherwise swallow the
+// literal "trash" segment as its param (parseInt("trash") fails there,
+// yielding a 400 instead of ever reaching this handler).
+export interface BookTrashRow {
+  id: string;
+  chapter: number;
+  verse: number;
+  ref_raw: string;
+  note_preview: string;
+  last_change_actor: string | null;
+  trashed_at: number;
+}
+chapters.get("/:book/trash", async (c) => {
+  const book = c.req.param("book").toUpperCase();
+  const rs = await c.env.DB.prepare(
+    `SELECT id, chapter, verse, ref_raw,
+            substr(COALESCE(note, ''), 1, 80) AS note_preview,
+            last_change_actor, trashed_at
+       FROM tn_rows
+      WHERE book = ?1 AND trashed_at IS NOT NULL AND deleted_at IS NULL
+      ORDER BY trashed_at DESC`,
+  )
+    .bind(book)
+    .all<BookTrashRow>();
+  return c.json({ book, rows: rs.results ?? [] });
+});
+
 // Bulk read everything for a chapter.
 chapters.get("/:book/:chapter", async (c) => {
   const book = c.req.param("book").toUpperCase();

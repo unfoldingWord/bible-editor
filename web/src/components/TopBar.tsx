@@ -133,6 +133,7 @@ interface Props {
   lintIndicator?: ReactNode;
   alignIndicator?: ReactNode;
   notesIndicator?: ReactNode;
+  trashIndicator?: ReactNode;
   notificationsMenu?: ReactNode;
   exportMenu?: ReactNode;
   bookLocksButton?: ReactNode;
@@ -153,6 +154,7 @@ export function TopBar({
   lintIndicator,
   alignIndicator,
   notesIndicator,
+  trashIndicator,
   notificationsMenu,
   exportMenu,
   bookLocksButton,
@@ -461,6 +463,7 @@ export function TopBar({
       {lintIndicator}
       {alignIndicator}
       {notesIndicator}
+      {trashIndicator}
       {notificationsMenu}
       <VersionIndicator onRequestReload={onRequestReload} />
       <SyncStatusBar onNavigate={onNavigate} />
