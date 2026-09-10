@@ -337,12 +337,20 @@ console.log("\n[#540 item 2: an AI-only master movement never overwrites a later
     eq(counts.merge_adopted, 0, "…no adoption is counted");
     eq(counts.merge_kept_ai, 1, "…it is counted as merge_kept_ai");
     eq(counts.merge_refused, 0, "…never as a refusal, which at 5 freezes the whole resource's export");
-    const conflict = sqlite
-      .prepare("SELECT action, reason, overwritten_version FROM verse_merge_conflicts WHERE book = ? AND chapter = 4")
-      .all(BOOK)[0];
-    eq(conflict.action, "keep_ai_master", "…and a review row is recorded so a human still sees the collision");
-    eq(conflict.reason, "both_changed_ai_master", "…with the measured reason");
-    eq(conflict.overwritten_version, null, "…and no recovery pointer, because nothing was overwritten");
+    // Issue #749: NO durable review row. The outcome rests on a complete lineage
+    // walk that found no Door43 editor's commit behind master's side, so nothing
+    // was taken from Door43 and the next export publishes the kept version —
+    // there is nothing for a translator to recover or decide, yet a
+    // verse_merge_conflicts row would have sat in the "Sync flagged N verse(s)"
+    // banner until somebody edited or dismissed the verse. The run summary's
+    // merge_kept_ai counter (asserted above) and the capped log line are what
+    // report it now.
+    const conflicts = sqlite
+      .prepare("SELECT action, reason FROM verse_merge_conflicts WHERE book = ? AND chapter = 4")
+      .all(BOOK);
+    eq(conflicts, [], "…and NO verse_merge_conflicts row is recorded (#749)");
+    eq(counts.merge_conflicts, 0, "…so it is not counted as a conflict needing review either");
+    eq(counts.merge_master_wins, 0, "…and never as a master-wins flag: it is a D1-wins outcome");
   }
 
   {
@@ -2171,6 +2179,134 @@ console.log("\n[#728 review F4: master_moved_under_local_bridge fires for the br
     assertClean728(counts, "review F4 exported");
   }
 }
+
+// ── Issue #641: the source-attr reconcile must not run against our own render ──
+//
+// THE SHAPE. An edited verse (updated_by set) whose translator re-aligned in
+// the app. Its `\zaln-s` content bytes now come from D1's UHB copy; master's
+// copy of the same verse is OUR OWN last export, carrying the older form. The
+// merge correctly says `keep_master_unchanged` (theirs == base) — Door43 has
+// not moved. Pre-fix the code then fell through to the two-way D1-vs-master
+// attr reconcile anyway; with the same source word repeated in the verse the
+// key is ambiguous, so it minted `source_attr_ambiguous` claiming "Door43's
+// source fix could not be placed". The editor's next save resolved the row and
+// the next nightly re-minted it (EZK UST 22:26 / 33:9 / 45:11–12, 2026-09-09,
+// chapters no Door43 commit had touched).
+console.log("\n[#641: no source-attr reconcile when master has not moved since our own publish]");
+{
+  const D1_FORM = "בָּרָ֣א"; // the app's alignment carries D1's UHB bytes
+  const OLD_FORM = "בּרא"; // our older render carried a different form of the same word
+  // Two milestones on the SAME source key (strong|occurrence|occurrences) —
+  // the ambiguity that made reconcileSourceAttrsFromMaster report `divergent`.
+  const tree = (content, words) => ({
+    verseObjects: [
+      {
+        tag: "zaln", type: "milestone", strong: "H1254", occurrence: "1", occurrences: "1",
+        lemma: "בָּרָא", morph: "He,Vqp3ms", content,
+        children: [{ tag: "w", type: "word", text: words[0] }],
+      },
+      { type: "text", text: " " },
+      {
+        tag: "zaln", type: "milestone", strong: "H1254", occurrence: "1", occurrences: "1",
+        lemma: "בָּרָא", morph: "He,Vqp3ms", content,
+        children: [{ tag: "w", type: "word", text: words[1] }],
+      },
+    ],
+  });
+  const AI_ONLY = {
+    mayHoldHumanEdit: false, hasHumanCommit: false, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 0 }, humanShas: [],
+  };
+  const seed = (sqlite, oursJson, baseJson) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 909, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+         VALUES (?, 6, 1, NULL, 'ULT', ?, 'he created', 4, 9)`,
+      )
+      .run(BOOK, oursJson);
+    // The ancestor: what we published, logged before the watermark boundary.
+    const anc = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+         VALUES ('verse', ?, ?, 9, 3, 4, 'update', ?, 100)`,
+      )
+      .run(`${BOOK}/6/1/ULT`, BOOK, JSON.stringify({ plain_text: "he created", content: baseJson }));
+    return Number(anc.lastInsertRowid);
+  };
+  const conflictActions = (sqlite) =>
+    sqlite.prepare("SELECT action FROM verse_merge_conflicts WHERE book = ? ORDER BY action").all(BOOK).map((r) => r.action);
+  const readRow = (sqlite) =>
+    sqlite.prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 6 AND verse = 1 AND bible_version = 'ULT'").all(BOOK)[0];
+
+  {
+    // master == base: only the app moved. THE case this fix exists for.
+    const { env, sqlite } = freshEnv();
+    const oursJson = JSON.stringify(tree(D1_FORM, ["he", "created"]));
+    const masterJson = JSON.stringify(tree(OLD_FORM, ["he", "created"]));
+    const boundary = seed(sqlite, oursJson, masterJson);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, "ULT",
+      [{ chapter: 6, verse: 1, verseEnd: null, contentJson: masterJson, plainText: "he created" }],
+      null, { confirmedAt: 200, editId: boundary, lineage: AI_ONLY }, false,
+    );
+    eq(counts.source_attr_divergent, 0, "master unchanged since our publish: no source-attr divergence is measured");
+    eq(counts.skipped_edited, 1, "…the verse is a plain edited skip");
+    eq(counts.source_attr_reconcile_skipped, 1, "…and the suppression is counted, so it stays visible in the run summary");
+    eq(conflictActions(sqlite), [], "…and NO source_attr_divergent review row is minted");
+    const row = readRow(sqlite);
+    eq(row.version, 4, "…the version does not move");
+    eq(row.content_json, oursJson, "…and the translator's alignment bytes are untouched");
+    eq(
+      sqlite.prepare("SELECT COUNT(*) AS n FROM edit_log WHERE row_key = ?").all(`${BOOK}/6/1/ULT`)[0].n,
+      1,
+      "…no edit_log row beyond the seeded ancestor",
+    );
+  }
+
+  {
+    // Control: master DID move (both sides changed; AI-only lineage keeps ours as
+    // keep_ai_master). The reconcile must still run there and still surface the
+    // ambiguous attr — "stop reconciling" must not be satisfiable by never
+    // reconciling.
+    const { env, sqlite } = freshEnv();
+    const oursJson = JSON.stringify(tree(D1_FORM, ["he", "created"]));
+    const baseJson = JSON.stringify(tree(OLD_FORM, ["he", "made"]));
+    const masterJson = JSON.stringify(tree(OLD_FORM, ["he", "formed"]));
+    const boundary = seed(sqlite, oursJson, baseJson);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, "ULT",
+      [{ chapter: 6, verse: 1, verseEnd: null, contentJson: masterJson, plainText: "he formed" }],
+      null, { confirmedAt: 200, editId: boundary, lineage: AI_ONLY }, false,
+    );
+    eq(counts.merge_kept_ai, 1, "control: both changed, AI-only master → keep_ai_master");
+    eq(counts.source_attr_divergent > 0, true, "…and the reconcile STILL runs against a master that moved");
+    // Since #749 the keep_ai_master outcome pushes nothing, so the
+    // source_attr_divergent row is the ONLY one this verse records — and it must
+    // still be recorded: a source-owned fix that could not be placed is a real
+    // thing for a human to do, unrelated to who won the target text.
+    eq(conflictActions(sqlite), ["source_attr_divergent"], "…and still records the ambiguous-attr review row, alone");
+    eq(readRow(sqlite).content_json, oursJson, "…while the translator's text is still kept");
+  }
+
+  {
+    // Control 2: no cutoff at all (no merge ran, mergeAction stays null). The
+    // pre-fix behavior is preserved: the reconcile runs and measures the
+    // ambiguity, exactly as before this gate existed.
+    const { env, sqlite } = freshEnv();
+    const oursJson = JSON.stringify(tree(D1_FORM, ["he", "created"]));
+    const masterJson = JSON.stringify(tree(OLD_FORM, ["he", "created"]));
+    seed(sqlite, oursJson, masterJson);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, "ULT",
+      [{ chapter: 6, verse: 1, verseEnd: null, contentJson: masterJson, plainText: "he created" }],
+      null, null, false,
+    );
+    eq(counts.source_attr_divergent > 0, true, "no cutoff: the reconcile still runs (pre-fix behavior preserved)");
+    eq(counts.source_attr_reconcile_skipped, 0, "…and the gate did not fire");
+  }
+}
+
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);

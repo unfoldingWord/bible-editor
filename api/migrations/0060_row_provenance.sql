@@ -23,7 +23,7 @@
 --   'unhint' | 'trash' | 'untrash' | 'review_clear' | 'dismiss_review' |
 --   'hint_expansion' | 'ai_apply' | 'import' | 'finalize_trash' |
 --   'sync_merge' | 'sync_reseed' | 'sync_prune' | 'sync_reorder' |
---   'sync_bridge' | 'sync_split'.
+--   'sync_bridge' | 'sync_split' | 'ref_heal'.
 --   'bridge'/'split': a verse combined into a `\v a-b` bridge, or a bridge
 --   broken back into separate verses (verseBridge.ts / verses.ts).
 --   'sync_bridge'/'sync_split' (issue #728, comment-only addition — no schema
@@ -33,7 +33,10 @@
 --   they differ by WHO decided the order. 'reorder' is Bible Editor's own
 --   ordering (the in-app drag, the order-lock dismiss, and the nightly
 --   export's canonical pass, which computes order here from the ULT
---   alignment); 'sync_reorder' is master's file order winning.
+--   alignment); 'sync_reorder' is master's file order winning. 'ref_heal'
+--   (issue #672) is the sibling for chapter/verse: only they moved, and D1's
+--   own ref_raw is why — a torn row (an in-app cross-chapter REF retype never
+--   writes chapter) healed back into agreement with itself, never Door43's.
 -- last_change_source — WHERE: 'user' | 'ai_pipeline' | 'dcs_sync' | 'import' |
 --   'system'.
 -- last_change_actor — WHO, human-readable and DENORMALIZED ON PURPOSE: the DCS
