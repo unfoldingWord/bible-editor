@@ -394,18 +394,20 @@ export interface ReimportCounts {
   // The rows this run flagged for HUMAN review as a merge conflict — exactly what
   // the "Pull from Door43" summary renders as "flagged for review (merge
   // conflict)". Its own counter, not merge_conflicts minus merge_kept_ai, because
-  // that subtraction is only valid on the verse side: there keep_ai_master IS a
-  // subset of merge_conflicts, but on the TSV side merge_conflicts counts only an
-  // adopting write while a kept-ALONE row lands in merge_kept_ai and nowhere in
-  // merge_conflicts — so one master-wins flag plus one kept-alone row cancelled to
-  // zero and hid a real flag (#706). Counts:
+  // that subtraction was never valid on the TSV side: there merge_conflicts counts
+  // only an adopting write while a kept-ALONE row lands in merge_kept_ai and
+  // nowhere in merge_conflicts — so one master-wins flag plus one kept-alone row
+  // cancelled to zero and hid a real flag (#706). Counts:
   //   - TSV: an adopt_conflict write that actually landed (master won the
   //     contested field), EXCLUDING a mixed row that also kept a contested field
   //     for D1 (keptAiConflict) — that row mints no review flag.
-  //   - verses: every landed liveConflict except keep_ai_master, i.e. adopt_conflict
-  //     PLUS the D1-kept-but-flagged outcomes (keep_alignment_refused,
-  //     source_attr_divergent). This matches the pre-#706 render for verses exactly.
+  //   - verses: every landed liveConflict, i.e. adopt_conflict PLUS the
+  //     D1-kept-but-flagged outcomes (keep_alignment_refused,
+  //     source_attr_divergent, keep_local_structure). This matches the pre-#706
+  //     render for verses exactly.
   // Never counts keep_ai_master (that is merge_kept_ai, its own summary line).
+  // Since #749 the verse side no longer records that action at all, so both sides
+  // now agree: a kept-alone outcome is in merge_kept_ai and nowhere else.
   merge_master_wins: number;
   // Verse whose merge resolved to "adopt", but the bytes that would actually be
   // STORED turned out identical to the bytes already stored — so nothing was
@@ -437,10 +439,12 @@ export interface ReimportCounts {
   // export at 5 (see isSystemicMergeRefusal — freezing here would strand the very
   // edit this outcome protected). verses AND tsv.
   //
-  // Relationship to merge_conflicts differs by side, so do not describe it as a
-  // plain subset: for VERSES it is one, but on the TSV side merge_conflicts is
-  // incremented only for a write that also adopted a field, and a kept-only row
-  // adopts nothing. It also counts DECISIONS, incremented before the write — a
+  // It is NOT a subset of merge_conflicts on either side. On the TSV side
+  // merge_conflicts is incremented only for a write that also adopted a field,
+  // and a kept-only row adopts nothing; on the verse side it WAS a subset until
+  // issue #749 stopped recording the outcome in verse_merge_conflicts (nothing
+  // is taken from Door43, so there was nothing for the banner to ask), and it is
+  // now excluded there too. It also counts DECISIONS, incremented before the write — a
   // row that then loses the version-CAS race, or whose flag text is unchanged
   // from last night and so writes nothing, is counted here and skipped_edited
   // too.
@@ -6243,7 +6247,43 @@ async function applyVerseRows(
         // relies on (the NUM 20–22 combining-mark correction is the case that
         // reconcile exists for). Refusing the target text is not a reason to also
         // refuse an unrelated, source-owned correction on the same verse.
-        if (merge.action === "keep_ai_master") counts.merge_kept_ai++;
+        if (merge.action === "keep_ai_master") {
+          counts.merge_kept_ai++;
+          // Issue #749, the verse analogue of #703's TSV change (see the
+          // keep_ai_master branch in applyTsvRows, and retireVerseKeptAiMasterFlags
+          // for the retirement of the rows this used to mint). Until now this
+          // outcome ALSO wrote a verse_merge_conflicts row, so it stood in the
+          // "Sync flagged N verse(s)" banner forever — a row only leaves that
+          // banner when a human edits or dismisses the verse. But the outcome
+          // rests on a COMPLETE lineage walk that found no Door43 editor's commit
+          // behind master's side, and the banner's own sentence said exactly
+          // that while asking a translator to look anyway. Nothing was taken from
+          // Door43, so there is nothing to recover; the next export publishes D1
+          // over master, which is the intended result. Prod on 2026-09-09: EZK
+          // ULT 19 rows standing since 08-19, EZK UST 15 since 08-26, JER ULT 3
+          // since 09-03 — the majority of that banner, re-raised every time an
+          // unrelated flag changed the message.
+          //
+          // The outcome is still COUNTED (merge_kept_ai, the authoritative
+          // number, its own summary line) and logged per verse here, capped by
+          // the same KEPT_LOG_CAP the TSV side uses, so it stays checkable from
+          // the nightly tail rather than asked of a translator. Cheap by design:
+          // the ref and the measured reason, no verse content and no extra read
+          // — an AI re-run over a chapter of human-edited verses yields dozens of
+          // these every night until the export publishes them.
+          if (counts.merge_kept_ai <= KEPT_LOG_CAP) {
+            console.log(
+              "reimport merge kept the app's verse over Door43's: no Door43 editor commit measured behind master",
+              {
+                book,
+                resource: bibleVersion,
+                ref: `${v.chapter}:${v.verse}`,
+                reason: merge.reason,
+                version: ex.version,
+              },
+            );
+          }
+        }
         // FIX 5: converged-per-stableKey but the raw bytes differed — a real,
         // cosmetic-only edit this comparison silently discards. See
         // verseMerge.ts's FIX 5 correction and the field's own doc comment.
@@ -6254,7 +6294,14 @@ async function applyVerseRows(
         // not just the conflicted ones — see mergeConflicts's declaration
         // above for why. merge.conflict alone would miss the clean "adopt"
         // case (master moved, we didn't); merge.adopt covers it.
-        if (merge.conflict || merge.adopt) {
+        //
+        // Issue #749: `keep_ai_master` is the one excluded action. It reports
+        // `conflict: true` (verseMerge.ts) because a human's edit collided with
+        // master's, and that stays true — but the collision was already
+        // adjudicated on complete evidence with nothing taken from Door43, so
+        // it mints no durable row for a translator to clear. See the counter +
+        // log above; the run summary still carries it as merge_kept_ai.
+        if ((merge.conflict || merge.adopt) && merge.action !== "keep_ai_master") {
           mergeConflicts.push({
             chapter: v.chapter,
             verse: v.verse,
@@ -6265,9 +6312,9 @@ async function applyVerseRows(
             adopted: merge.adopt,
             // See issue #507: the version this verse's merge outcome was
             // detected at, so the speculative upsert's reactivation carve-out
-            // (keep_alignment_refused / keep_ai_master) can tell a stale
-            // re-detection from a fresh one. Unused (and harmless) for
-            // 'adopt' / 'adopt_conflict'.
+            // (keep_alignment_refused / source_attr_divergent /
+            // keep_local_structure) can tell a stale re-detection from a fresh
+            // one. Unused (and harmless) for 'adopt' / 'adopt_conflict'.
             observedVersion: ex.version,
           });
         }
@@ -6999,6 +7046,15 @@ async function applyVerseRows(
           // content path's own flag (if it wrote one) takes precedence on this
           // verse; otherwise a keep_local_structure flag names the merge action.
           // Recorded now because step 6b has already run.
+          //
+          // Issue #749 note: a keep_ai_master anchor now writes no content flag,
+          // so such a verse falls to the `otherwise` and mints
+          // keep_local_structure with reason `anchor_keep_ai_master`. That is the
+          // intended reading, not a leak of the retired flag: the STRUCTURE
+          // dimension is separate from who won the target text, D1's grouping
+          // still differs from Door43's, and the next export writes ours over
+          // theirs — the same live condition `master_moved_non_human` already
+          // reports. Reachable only when master actually re-grouped the verses.
           counts.structure_refused++;
           if (!mergeConflicts.some((mc) => mc.chapter === ad.chapter && mc.verse === ad.anchor.verse)) {
             const flag = {
@@ -7296,11 +7352,15 @@ async function applyVerseRows(
   );
   counts.merge_conflicts += liveConflicts.length;
   // The rows a human must review — every landed conflict EXCEPT keep_ai_master,
-  // which is D1-wins and reported on its own summary line (#706). On verses this
-  // equals the old `merge_conflicts - merge_kept_ai` render exactly (keep_ai_master
-  // is a subset of liveConflicts here); it is a distinct counter so the TSV side,
-  // where the two counters do not nest, can report the same fact without the
-  // subtraction cancelling a real flag against an unrelated kept-alone row.
+  // which is D1-wins and reported on its own summary line (#706). Since #749
+  // that action never enters `mergeConflicts` in the first place (see the push
+  // above), so this filter matches nothing on the verse side today; it is kept
+  // as a belt-and-braces guard, because the counter's contract is "conflicts a
+  // human must review" and a future caller pushing the action back in must not
+  // silently inflate it. It stays a distinct counter (rather than
+  // `merge_conflicts - merge_kept_ai`) so the TSV side, where the two counters
+  // do not nest, can report the same fact without the subtraction cancelling a
+  // real flag against an unrelated kept-alone row.
   counts.merge_master_wins += liveConflicts.filter(
     (mc) => mc.action !== "keep_ai_master",
   ).length;

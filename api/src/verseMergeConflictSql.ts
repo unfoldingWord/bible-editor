@@ -63,15 +63,17 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 //                              impossible to place unambiguously (the EZK 40
 //                              repeated-architecture-terms case). Same
 //                              export-reverts-until-resolved shape as a refusal.
-//   'keep_ai_master'         — kept D1 (nothing overwritten): both sides moved,
-//                              but every commit that moved master's file since
-//                              the ancestor came from our own export or the
-//                              unfoldingWord bot account, so the app edit won
-//                              (#540 item 2). Unlike the two above, the export —
-//                              when it next runs for this resource — PUBLISHES
-//                              D1 here, which is the point, so what a human is
-//                              asked to check is the kept value, not a revert
-//                              waiting to happen.
+// 'keep_ai_master' was a fifth entry until issue #749 and is deliberately GONE:
+// that outcome (both sides moved, but a COMPLETE lineage walk found every commit
+// that moved master's file since the ancestor came from our own export or the
+// unfoldingWord bot account, so the app edit won — #540 item 2) is adjudicated
+// on evidence, takes nothing from Door43, and is published by the next export.
+// Listing it here put rows in the "Sync flagged N verse(s)" banner that no human
+// could usefully act on and that only left it on a manual edit or dismiss (prod
+// 2026-09-09: 37 such rows across EZK ULT/UST and JER ULT, some standing three
+// weeks). bookReimport.ts no longer records the row at all, and
+// retireVerseKeptAiMasterFlags retires the standing ones. This is the verse
+// analogue of #703's retirement of the TSV `merge_kept` review flag.
 // A clean 'adopt' (master moved, we didn't) is deliberately EXCLUDED — it needs
 // no judgement and stays in the table purely as an audit trail.
 // Same for 'adopt_no_visible_change' (issue #633): both sides moved by stableKey
@@ -90,7 +92,7 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment, detected_at
      FROM verse_merge_conflicts
     WHERE book = ?1 AND resource = ?2
-      AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master', 'keep_local_structure')
+      AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
       AND resolved_at IS NULL
     ORDER BY chapter ASC, verse ASC`;
 
@@ -116,7 +118,7 @@ export const CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL = `DELETE FROM system_aler
     WHERE source = ?1 AND dismissed_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
                        WHERE book = ?2 AND resource = ?3
-                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master', 'keep_local_structure')
+                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
                          AND resolved_at IS NULL)`;
 
 // Binds, in order: (username, source, book, resource).
@@ -124,7 +126,7 @@ export const CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `DELETE FROM system_alerts
     WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
                        WHERE book = ?3 AND resource = ?4
-                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master', 'keep_local_structure')
+                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
                          AND resolved_at IS NULL)`;
 
 // ---------------------------------------------------------------------------
@@ -142,9 +144,9 @@ export const CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `DELETE FROM system_alerts
 //
 // This statement does NOT touch resolved_at/resolved_by for any ADOPTION
 // action (adopt / adopt_conflict) — see the 'source_attr_divergent' /
-// 'keep_alignment_refused' / 'keep_ai_master' reactivation carve-out at the
-// bottom of the SET clause for the deliberately safe exceptions (none has a CAS
-// write, so the failure mode below cannot arise for either). The first
+// 'keep_alignment_refused' / 'keep_local_structure' reactivation carve-out at
+// the bottom of the SET clause for the deliberately safe exceptions (none has a
+// CAS write, so the failure mode below cannot arise for either). The first
 // version of this fix (2026-08-14) cleared them here unconditionally, on the
 // theory that any fresh conflict detection should make the row visible
 // again. Codex's second-opinion review found the real bug in that: this
@@ -198,16 +200,19 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- A row needing human judgement must never be DOWNGRADED by a later
      -- routine adoption — see recordVerseMergeConflicts's own doc comment for
      -- the full Night-1/Night-2 walkthrough this anti-downgrade protects.
-     -- 'keep_ai_master' is deliberately NOT in this carve-out, unlike
+     -- The kept-D1 CONTENT actions ('keep_alignment_refused',
+     -- 'source_attr_divergent') are deliberately NOT in this carve-out, unlike
      -- 'adopt_conflict'. The two need opposite treatment: an adopt_conflict
      -- leaves a human something to RECOVER, which a later routine adoption must
-     -- not hide, whereas a keep_ai_master overwrote nothing, and a later clean
+     -- not hide, whereas a kept-D1 row overwrote nothing, and a later clean
      -- 'adopt' means master's value was taken after all — the disagreement is
      -- over. Keeping it sticky would leave the banner asserting "the editor's
-     -- version was kept and the export will publish it" about a verse that has
-     -- since adopted master's. Nothing else un-sticks it: CONFIRM_ADOPTED_
-     -- CONFLICT_SQL below matches only ('adopt','adopt_conflict',
-     -- 'adopt_no_visible_change').
+     -- version was kept" about a verse that has since adopted master's. Nothing
+     -- else un-sticks it: CONFIRM_ADOPTED_CONFLICT_SQL below matches only
+     -- ('adopt','adopt_conflict','adopt_no_visible_change'). ('keep_ai_master'
+     -- was the original subject of this paragraph; issue #749 retired it — no
+     -- new row of that action is ever written, so it can no longer be the
+     -- surviving action here.)
      -- 'adopt_no_visible_change' (issue #633) is treated like 'adopt' here: it
      -- is audit-only and must not erase a prior adopt_conflict's recovery
      -- pointer / banner claim.
@@ -257,13 +262,13 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
          AND verse_merge_conflicts.action = 'adopt_conflict'
          AND verse_merge_conflicts.resolved_at IS NULL
        THEN verse_merge_conflicts.overwritten_version
-       WHEN excluded.action IN ('keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master', 'keep_local_structure') THEN NULL
+       WHEN excluded.action IN ('keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure') THEN NULL
        ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
      END,
      alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),
      last_recorded_at = excluded.last_recorded_at,
      -- REACTIVATION carve-out, 'source_attr_divergent', 'keep_alignment_refused',
-     -- and 'keep_ai_master' ONLY. Every other action leaves
+     -- and 'keep_local_structure' ONLY. Every other action leaves
      -- resolved_at/resolved_by untouched (the ELSE), preserving the two-phase
      -- adoption invariant documented above. These three actions are the
      -- exception because they are safe to be: none has a CAS write that
@@ -281,7 +286,12 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- surface. 'keep_alignment_refused' was originally left out of this
      -- carve-out (only partially masked by the merge_refused systemic
      -- freeze) — see issue #457, closed here. 'keep_ai_master' (#540 item 2)
-     -- shares the exact same no-CAS-race shape, so it gets the same carve-out.
+     -- shared the same no-CAS-race shape and was carved out here too, until
+     -- issue #749 stopped recording it: nothing takes anything from Door43 in
+     -- that outcome, so there is no silent revert for a reactivation to
+     -- surface. No new row of that action is written, and
+     -- retireVerseKeptAiMasterFlags retires the standing ones, so it is gone
+     -- from every list in this statement.
      --
      -- VERSION GUARD (issue #507): the condition this run's re-upsert acts on
      -- was read from verses.content_json EARLIER in the same applyVerseRows
@@ -300,7 +310,7 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- production always supplies one for all three of these actions (see
      -- verseMergeConflicts.ts's recordVerseMergeConflicts).
      resolved_at = CASE
-       WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master', 'keep_local_structure')
+       WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_local_structure')
          AND (?11 IS NULL OR ?11 = (
            SELECT version FROM verses WHERE book = ?1 AND bible_version = ?10 AND chapter = ?3 AND verse = ?4
          ))
@@ -308,7 +318,7 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
        ELSE verse_merge_conflicts.resolved_at
      END,
      resolved_by = CASE
-       WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master', 'keep_local_structure')
+       WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_local_structure')
          AND (?11 IS NULL OR ?11 = (
            SELECT version FROM verses WHERE book = ?1 AND bible_version = ?10 AND chapter = ?3 AND verse = ?4
          ))
@@ -369,3 +379,42 @@ export const DELETE_LOST_ADOPTION_CONFLICT_SQL = `DELETE FROM verse_merge_confli
       AND action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')
       AND resolved_at IS NULL
       AND last_recorded_at = ?5`;
+
+// ---------------------------------------------------------------------------
+// verseMergeConflicts.ts's retireVerseKeptAiMasterFlags — issue #749, the verse
+// analogue of #703's retireMergeKeptFlags. Retires every STANDING
+// 'keep_ai_master' row: the action is no longer recorded (bookReimport.ts's
+// applyVerseRows), so the rows still in the banner are pure backlog, and every
+// one of them was minted under exactly the condition that retires it — a
+// COMPLETE lineage walk that found no Door43 editor's commit behind master's
+// side. The mint WAS the measurement, so unlike clearResolvedMergeNoBase this
+// needs no re-walk and touches Door43 not at all: D1 only, one statement.
+//
+// It also needs no separate audit-log INSERT, which is the one place this
+// deliberately differs from the TSV side (whose `sync_clear_review` edit_log row
+// is the only trace a cleared review flag leaves). Here the ROW IS the audit
+// trail: verse_merge_conflicts rows are never deleted, only stamped resolved
+// (migration 0049), so a retired row survives with
+// `resolved_at = <this run>, resolved_by = NULL`. That pair is unambiguous —
+// a real human resolve always carries a non-null resolved_by (see
+// RESOLVE_VERSE_MERGE_CONFLICT_SQL, bound with the saving user's id), so
+// `resolved_by IS NULL AND resolved_at IS NOT NULL` reads as "system-retired"
+// and can never be confused with someone's resolution.
+//
+// `resolved_at IS NULL` keeps it idempotent and non-destructive: a row a human
+// already resolved keeps THEIR resolved_at/resolved_by, and the second night
+// finds nothing (0 changes). No batching: D1 applies one UPDATE to every
+// matching row in a single round trip, so unlike retireMergeKeptFlags there is
+// no SELECT-then-write-in-slices to size against the 100-statement batch cap.
+// `action` is not indexed (see migrations 0044/0049 — the indexes are on `book`,
+// on (book, resource, chapter, verse), and the partial (book, resource) WHERE
+// resolved_at IS NULL), so this scans; the table holds one row per adjudicated
+// verse and the scan is a one-per-night cost, shrinking to nothing once the
+// backlog is cleared.
+//
+// Binds, in order: (resolvedAt).
+// ---------------------------------------------------------------------------
+export const RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL = `UPDATE verse_merge_conflicts
+    SET resolved_at = ?1, resolved_by = NULL
+  WHERE action = 'keep_ai_master'
+    AND resolved_at IS NULL`;
