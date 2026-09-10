@@ -62,6 +62,13 @@ function unchanged(text, msg) {
   unchanged("````\n```\n3. literal\n9. literal\n```\n````\n", "a 4-backtick fence is not closed by a 3-backtick line inside it (Codex verify)");
   unchanged("```\n3. literal\n~~~\n9. literal\n```", "a tilde line does not close a backtick fence");
   eq(normalizeLists("```js\n3. x\n```\n1. a\n1. b"), "```js\n3. x\n```\n1. a\n2. b", "an opener with an info string still opens a fence; content after the real close normalises");
+  unchanged("1. item\n    ```\n    3. literal\n    9. literal\n    ```\n2. next", "a fence nested under a list item (4+ spaces) is recognised; its literal lines stay and the list continues as 2 (Codex verify 2)");
+  eq(
+    normalizeLists("1. item\n    ```\n    3. literal\n    ```\n1. next"),
+    "1. item\n    ```\n    3. literal\n    ```\n2. next",
+    "a nested fence leaves the enclosing list open, so the item after it continues the count",
+  );
+  eq(normalizeLists("1. a\n```\n3. literal\n```\n1. b"), "1. a\n```\n3. literal\n```\n1. b", "a column-0 fence ends the list; the item after it keeps its own start number");
   eq(normalizeLists("1. a\n```\ncode\n```\n1. b"), "1. a\n```\ncode\n```\n1. b", "a fence closes the list; the next list starts fresh with its own number");
 }
 

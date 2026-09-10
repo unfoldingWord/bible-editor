@@ -57,18 +57,21 @@ export function normalizeLists(text: string): string {
   return text
     .split("\n")
     .map((line) => {
-      const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      // Any indent: a fence can sit inside a list item, indented under it.
+      const f = /^( *)(`{3,}|~{3,})(.*)$/.exec(line);
       if (fence) {
-        if (f && f[1][0] === fence.ch && f[1].length >= fence.len && f[2].trim() === "") fence = null;
-        return line;
-      }
-      if (f) {
-        fence = { ch: f[1][0], len: f[1].length };
-        stack.length = 0;
-        counters.length = 0;
+        if (f && f[2][0] === fence.ch && f[2].length >= fence.len && f[3].trim() === "") fence = null;
         return line;
       }
       const indent = line.length - line.trimStart().length;
+      if (f) {
+        fence = { ch: f[2][0], len: f[2].length };
+        // Like prose: a fence closes the list levels at or deeper than its
+        // own indent, so one at column 0 ends the outline while one nested
+        // under an item leaves that item's list open.
+        closeTo(indent, false);
+        return line;
+      }
       if (line.trim() === "") return line;
       if (inIndentedCode) {
         if (indent >= INDENT.length) return line;
