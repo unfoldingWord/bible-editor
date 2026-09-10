@@ -178,6 +178,14 @@ for (const f of repairable) {
     `--   was: ${f.row.quote}`,
     `UPDATE tn_rows SET quote = '${sqlEscape(f.verdict.suggestion)}', version = version + 1, updated_at = unixepoch()`,
     `  WHERE book = '${sqlEscape(f.row.book)}' AND id = '${sqlEscape(f.row.id)}' AND version = ${Number(f.row.version)};`,
+    // Audit row, same shape the app writes for a quote edit (a PARTIAL payload
+    // of just the changed fields — see edit_log for kind='tn'). A direct SQL
+    // repair would otherwise be the one kind of change with no history entry,
+    // and the version-history dialog would show the quote changing from
+    // nowhere. Guarded by the same version so it only lands if the UPDATE did.
+    `INSERT INTO edit_log (kind, row_key, book, prev_version, new_version, action, payload_json)`,
+    `  SELECT 'tn', id, book, version - 1, version, 'repair-quote-source-order', json_object('quote', quote)`,
+    `    FROM tn_rows WHERE book = '${sqlEscape(f.row.book)}' AND id = '${sqlEscape(f.row.id)}' AND version = ${Number(f.row.version) + 1};`,
     "",
   );
 }
