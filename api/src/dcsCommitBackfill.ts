@@ -114,9 +114,21 @@ export interface BackfillResult {
   status: string;
 }
 
+// Guarded on gap_frontier_json too (Codex re-review, P1) — not just
+// gap_since_sha. Without it, a concurrent poll that appends a fresh entry to
+// the frontier (see the UNION in pollDcsRepo's gap_frontier_json comment)
+// between this function's read and this write is silently overwritten: the
+// clear still matches on gap_since_sha alone, nulls the whole gap, and the
+// newly-appended commits — already past last_sha, so never revisited — are
+// gone from the ledger with no marker recording the loss. The scheduled poll
+// and backfill run back-to-back in the same handler, but nothing prevents
+// two overlapping scheduled invocations (see pollDcsCommits's own NO IN-
+// FLIGHT LOCK note). Binding the exact frontier this walk started from turns
+// that race into a no-op clear instead: the CAS fails, the gap survives with
+// whatever the concurrent write left it, and the next tick picks it up.
 const CLEAR_GAP_SQL = `UPDATE dcs_repo_polls
    SET gap_since_sha = NULL, gap_frontier_json = NULL, gap_at = NULL
- WHERE repo = ?1 AND gap_since_sha = ?2`;
+ WHERE repo = ?1 AND gap_since_sha = ?2 AND gap_frontier_json = ?3`;
 
 // Replaces ONLY gap_frontier_json, and only while it is still the exact
 // value this walk started from — the same "don't clobber a concurrent
@@ -151,7 +163,7 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
   // the same "bounded, recorded loss beats an unbounded stall" call
   // dcsCommitPoll.ts already makes for a page-cap gap it cannot avoid.
   if (frontier.length === 0) {
-    await env.DB.prepare(CLEAR_GAP_SQL).bind(repo, state.gap_since_sha).run();
+    await env.DB.prepare(CLEAR_GAP_SQL).bind(repo, state.gap_since_sha, frontierJson).run();
     return { repo, attempted: true, fetched: 0, inserted: 0, resolved: true, status: "no_frontier" };
   }
 
@@ -231,7 +243,7 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
   }
 
   if (newFrontier.length === 0) {
-    await env.DB.prepare(CLEAR_GAP_SQL).bind(repo, state.gap_since_sha).run();
+    await env.DB.prepare(CLEAR_GAP_SQL).bind(repo, state.gap_since_sha, frontierJson).run();
     return { repo, attempted: true, fetched: page.commits.length, inserted: rows.length, resolved: true, status };
   }
 

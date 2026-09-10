@@ -69,9 +69,17 @@ function fullPage(prefix, { lastParent = null } = {}) {
 // not testing what production would actually do.
 const D1_MAX_BATCH_STATEMENTS = 100;
 
+// STATEFUL: `.run()` actually evaluates the WHERE clause of the two gap
+// UPDATEs against a tracked "current row", the same compare-and-swap
+// semantics real D1/SQLite gives them. Every other test in this file only
+// cares "was a clear/update issued with the right args", which `runs` still
+// answers regardless of whether the CAS applied — but the concurrent-write
+// race test below needs the mock to actually decide whether a write landed,
+// not just record that it was attempted.
 function mockDb(stateRow) {
   const executed = [];
   const runs = [];
+  let current = stateRow ? { ...stateRow } : null;
   const stmt = (sql) => ({
     sql,
     args: null,
@@ -79,16 +87,34 @@ function mockDb(stateRow) {
       return { ...this, args };
     },
     async first() {
-      return stateRow ?? null;
+      return current ? { ...current } : null;
     },
     async run() {
       runs.push({ sql: this.sql, args: this.args });
+      if (current && this.sql.includes("SET gap_since_sha = NULL")) {
+        const [, sinceGuard, frontierGuard] = this.args;
+        if (current.gap_since_sha === sinceGuard && current.gap_frontier_json === frontierGuard) {
+          current = { ...current, gap_since_sha: null, gap_frontier_json: null, gap_at: null };
+        }
+      } else if (current && this.sql.includes("SET gap_frontier_json =")) {
+        const [, sinceGuard, newJson, oldGuard] = this.args;
+        if (current.gap_since_sha === sinceGuard && current.gap_frontier_json === oldGuard) {
+          current = { ...current, gap_frontier_json: newJson };
+        }
+      }
       return { success: true };
     },
   });
   return {
     executed,
     runs,
+    get currentState() {
+      return current;
+    },
+    /** Test-only hook: simulate a concurrent write landing mid-backfill. */
+    mutate(patch) {
+      if (current) current = { ...current, ...patch };
+    },
     prepare(sql) {
       return stmt(sql);
     },
@@ -154,6 +180,40 @@ async function main() {
     assert(res.inserted === 1 && inserts(db).length === 1, "  ...inserting exactly the one commit inside the hole");
     const clr = clearRun(db);
     assert(clr && clr.args[1] === "far-edge", "  ...and clears the gap, guarded on the gap_since_sha it walked against");
+    assert(clr.args[2] === JSON.stringify(["near-edge"]), "  ...and on the exact frontier this walk started from, not just gap_since_sha");
+  }
+
+  // ── issue #692 item 2 (Codex re-review, P1): the clear must be a real
+  // compare-and-swap on gap_frontier_json, not just gap_since_sha, or a
+  // concurrent poll's append between this function's read and its final
+  // write is silently erased — reopening the exact hole this PR exists to
+  // close. Simulated here via the fetch mock: it mutates the tracked "DB
+  // row" mid-backfill, the same window a genuinely overlapping scheduled
+  // invocation (pollDcsCommits carries no in-flight lock — see its own doc
+  // comment) would race through. ─────────────────────────────────────────
+  {
+    const db = mockDb(state("far-edge", ["near-edge"]));
+    globalThis.fetch = async (url) => {
+      // A concurrent poll appended "concurrent-entry" to the SAME gap's
+      // frontier (the UNION in pollDcsRepo) after this backfill call already
+      // read the row but before it writes back.
+      db.mutate({ gap_frontier_json: JSON.stringify(["near-edge", "concurrent-entry"]) });
+      const page = Number(new URL(url).searchParams.get("page"));
+      const body = page === 1 ? [commit("h1", "hand fix", "h@x"), commit("far-edge", "old", "h@x")] : [];
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (k) => (k.toLowerCase() === "x-hasmore" ? "false" : null) },
+        json: async () => body,
+      };
+    };
+    const res = await backfillDcsRepoGap({ DB: db }, "en_tn", NOW);
+    assert(res.resolved === true && res.status === "ok", "the walk itself still reports success and resolved — it can't see the race");
+    assert(clearRun(db), "  ...and DOES attempt the clear");
+    assert(
+      db.currentState.gap_since_sha === "far-edge" && db.currentState.gap_frontier_json === JSON.stringify(["near-edge", "concurrent-entry"]),
+      "  ...but the CAS fails against the mutated row, so the gap survives with the concurrently-added entry intact, not silently erased",
+    );
   }
 
   // ── issue #692 item 2 (Codex review round 2, P1), the bug this rewrite
