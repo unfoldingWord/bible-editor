@@ -81,6 +81,7 @@ import { ExportUsfmButton } from "./ExportUsfmButton";
 import { BookLintIndicator } from "./BookLintIndicator";
 import { AlignAttentionIndicator } from "./AlignAttentionIndicator";
 import { BookNotesIndicator } from "./BookNotesIndicator";
+import { BookTrashIndicator } from "./BookTrashIndicator";
 import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
@@ -993,6 +994,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         // Trash bypasses the outbox, so refresh the lint chip directly — a
         // trashed note leaves the lint set (trashed_at IS NULL filter).
         scheduleLintRefetch();
+        // The book-level trash indicator (#755) has no other way to learn a
+        // row changed state — it lists the whole book, not just this chapter.
+        setTrashRefreshSignal((n) => n + 1);
       } catch (e) {
         applyLocalRowPatch("tn", id, { trashed_at: null });
         // The blank-stub auto-discard losing its race is the guard doing its
@@ -1007,6 +1011,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [book, applyLocalRowPatch, applyLocalRowReplacement, pushPipelineToast, scheduleLintRefetch],
   );
 
+  // Shared restore path for both the note card's own Restore button and the
+  // book-level trash indicator (#755) — one place applies the optimistic
+  // local patch, re-adds the row to the lint set, and surfaces a failure
+  // (including a viewer's read_only 403, which api.ts throws client-side
+  // before ever reaching the server) as a toast instead of a silent no-op.
   const handleRestoreNote = useCallback(
     async (id: string) => {
       applyLocalRowPatch("tn", id, { trashed_at: null });
@@ -1016,6 +1025,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         // Restore re-adds the note to the lint set — refresh the chip (the
         // outbox listener won't fire for this direct API call).
         scheduleLintRefetch();
+        setTrashRefreshSignal((n) => n + 1);
       } catch (e) {
         applyLocalRowPatch("tn", id, { trashed_at: Math.floor(Date.now() / 1000) });
         const msg = e instanceof Error ? e.message : "unknown error";
@@ -1190,6 +1200,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // the JSX render further down (both scripture/resource columns need it).
   const bookLocks = useBookLocks(authReady);
   const [bookLocksDialogOpen, setBookLocksDialogOpen] = useState(false);
+  // Bumped by handleTrashNote/handleRestoreNote so BookTrashIndicator (#755),
+  // which lists trashed rows across the whole book rather than just this
+  // chapter, knows to refetch — it has no other signal that a row changed.
+  const [trashRefreshSignal, setTrashRefreshSignal] = useState(0);
   const currentBookLock = bookLocks.books.find((b) => b.book === book) ?? null;
 
   // Module-level flag that blocks the actual write (api.ts throws on
@@ -3323,6 +3337,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         notesIndicator={
           <BookNotesIndicator
             book={book}
+            onNavigate={(b, c, v) => {
+              runWithDirtyGate(() => {
+                setActiveVerse(v ?? 1);
+                setActiveNoteId(null);
+                setActiveWordId(null);
+                setActiveQuestionId(null);
+                onNavigate?.(b, c, v);
+              });
+            }}
+          />
+        }
+        trashIndicator={
+          <BookTrashIndicator
+            book={book}
+            refreshSignal={trashRefreshSignal}
+            onRestore={handleRestoreNote}
             onNavigate={(b, c, v) => {
               runWithDirtyGate(() => {
                 setActiveVerse(v ?? 1);
