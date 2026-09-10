@@ -536,7 +536,12 @@ export function ResourceColumn({
     [pinned.words, twl, ultVerseObjectsFor, twTitles, lockedTwlVerses],
   );
 
-  const totalTn = pinned.notes ? tn.length : tnForVerse.length;
+  // Trashed notes stay visible in `tn`/`tnForVerse` (sorted to the bottom via
+  // sortBySortOrder, restorable) but must not count toward the "Notes" badge —
+  // the book-wide total in TopBar sums the server's book-summary query, which
+  // excludes `trashed_at`. Counting raw array length here disagreed with that
+  // total by exactly the trashed count for any chapter holding a trashed note.
+  const totalTn = (pinned.notes ? tn : tnForVerse).filter((r) => r.trashed_at == null).length;
   const totalTwl = pinned.words ? twl.length : twlForVerse.length;
   const totalTq = pinned.questions ? tq.length : tqForVerse.length;
 

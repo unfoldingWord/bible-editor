@@ -100,6 +100,7 @@ import {
   classifyTsvRefMove,
   tsvRefMoved,
   computeTsvMerge,
+  detectTornTsvRef,
   foldTsvBase,
   foldTsvRefBase,
   type TsvMergeSide,
@@ -117,6 +118,7 @@ import type { TwlRow, VerseRow, CheckLane } from "./types";
 import {
   collapseWhitespaceForCompare,
   computeVerseMerge,
+  type VerseMergeAction,
   verseContentConverged,
   type VerseMergeResult,
 } from "./verseMerge.ts";
@@ -355,6 +357,12 @@ export interface ReimportCounts {
   // reconciled (master ambiguous for the source key). Left as-is, logged so the
   // residual potential clobber is visible. Normally zero.
   source_attr_divergent: number;
+  // Issue #641: edited verses whose master copy had not moved since our own
+  // confirmed publish (keep_master_unchanged / keep_converged), so the
+  // source-attr reconcile was skipped. Counted so the suppression stays
+  // visible: a spike here means ancestor recovery is over-reporting
+  // "master unchanged", not that there was nothing to reconcile.
+  source_attr_reconcile_skipped: number;
   // twl rows whose sort_order was rewritten by the canonical post-pass to match
   // the ULT-position ordering (the same order the nightly export computes). Lets
   // the reimport adopt canonical order back into D1 for content-identical rows
@@ -386,18 +394,20 @@ export interface ReimportCounts {
   // The rows this run flagged for HUMAN review as a merge conflict — exactly what
   // the "Pull from Door43" summary renders as "flagged for review (merge
   // conflict)". Its own counter, not merge_conflicts minus merge_kept_ai, because
-  // that subtraction is only valid on the verse side: there keep_ai_master IS a
-  // subset of merge_conflicts, but on the TSV side merge_conflicts counts only an
-  // adopting write while a kept-ALONE row lands in merge_kept_ai and nowhere in
-  // merge_conflicts — so one master-wins flag plus one kept-alone row cancelled to
-  // zero and hid a real flag (#706). Counts:
+  // that subtraction was never valid on the TSV side: there merge_conflicts counts
+  // only an adopting write while a kept-ALONE row lands in merge_kept_ai and
+  // nowhere in merge_conflicts — so one master-wins flag plus one kept-alone row
+  // cancelled to zero and hid a real flag (#706). Counts:
   //   - TSV: an adopt_conflict write that actually landed (master won the
   //     contested field), EXCLUDING a mixed row that also kept a contested field
   //     for D1 (keptAiConflict) — that row mints no review flag.
-  //   - verses: every landed liveConflict except keep_ai_master, i.e. adopt_conflict
-  //     PLUS the D1-kept-but-flagged outcomes (keep_alignment_refused,
-  //     source_attr_divergent). This matches the pre-#706 render for verses exactly.
+  //   - verses: every landed liveConflict, i.e. adopt_conflict PLUS the
+  //     D1-kept-but-flagged outcomes (keep_alignment_refused,
+  //     source_attr_divergent, keep_local_structure). This matches the pre-#706
+  //     render for verses exactly.
   // Never counts keep_ai_master (that is merge_kept_ai, its own summary line).
+  // Since #749 the verse side no longer records that action at all, so both sides
+  // now agree: a kept-alone outcome is in merge_kept_ai and nowhere else.
   merge_master_wins: number;
   // Verse whose merge resolved to "adopt", but the bytes that would actually be
   // STORED turned out identical to the bytes already stored — so nothing was
@@ -429,10 +439,12 @@ export interface ReimportCounts {
   // export at 5 (see isSystemicMergeRefusal — freezing here would strand the very
   // edit this outcome protected). verses AND tsv.
   //
-  // Relationship to merge_conflicts differs by side, so do not describe it as a
-  // plain subset: for VERSES it is one, but on the TSV side merge_conflicts is
-  // incremented only for a write that also adopted a field, and a kept-only row
-  // adopts nothing. It also counts DECISIONS, incremented before the write — a
+  // It is NOT a subset of merge_conflicts on either side. On the TSV side
+  // merge_conflicts is incremented only for a write that also adopted a field,
+  // and a kept-only row adopts nothing; on the verse side it WAS a subset until
+  // issue #749 stopped recording the outcome in verse_merge_conflicts (nothing
+  // is taken from Door43, so there was nothing for the banner to ask), and it is
+  // now excluded there too. It also counts DECISIONS, incremented before the write — a
   // row that then loses the version-CAS race, or whose flag text is unchanged
   // from last night and so writes nothing, is counted here and skipped_edited
   // too.
@@ -507,6 +519,12 @@ export interface ReimportCounts {
   // skipped_edited on a lost CAS), and double-counting it would make this number
   // stop meaning "chips that disappeared for free".
   ref_moved_resolved: number;
+  // A row whose `ref_raw` had already drifted from its own stored `chapter`/
+  // `verse` (issue #672) — an in-app cross-chapter REF retype, which rows.ts
+  // deliberately never writes to `chapter` — got its stored columns rewritten
+  // to match `ref_raw`. Independent of ref_moved_*: this is D1 healing its own
+  // bookkeeping, not an attribution of who moved what against master.
+  ref_healed: number;
   // Human-edited verse that DIFFERS from master but could not be adjudicated
   // at all, because this book+resource has no `master_confirmed_at` watermark
   // yet (migration 0045 adds the column and does not backfill it — only the
@@ -731,6 +749,7 @@ function zeroCounts(): ReimportCounts {
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
+    source_attr_reconcile_skipped: 0,
     twl_reordered: 0,
     merge_adopted: 0,
     merge_conflicts: 0,
@@ -749,6 +768,7 @@ function zeroCounts(): ReimportCounts {
     ref_moved_both: 0,
     ref_moved_unattributable: 0,
     ref_moved_resolved: 0,
+    ref_healed: 0,
     merge_unavailable: 0,
     merge_cosmetic_ignored: 0,
     own_publish_converged: 0,
@@ -956,6 +976,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.resurrected += from.resurrected;
   into.source_attr_reconciled += from.source_attr_reconciled;
   into.source_attr_divergent += from.source_attr_divergent;
+  into.source_attr_reconcile_skipped += from.source_attr_reconcile_skipped;
   into.twl_reordered += from.twl_reordered;
   into.merge_adopted += from.merge_adopted ?? 0;
   into.merge_conflicts += from.merge_conflicts ?? 0;
@@ -993,6 +1014,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.ref_moved_both += from.ref_moved_both ?? 0;
   into.ref_moved_unattributable += from.ref_moved_unattributable ?? 0;
   into.ref_moved_resolved += from.ref_moved_resolved ?? 0;
+  into.ref_healed += from.ref_healed ?? 0;
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
   into.own_publish_converged += from.own_publish_converged ?? 0;
@@ -1816,6 +1838,16 @@ export async function applyTsvRows(
     // was behind master's side (#540 item 2). Carried only so the adoption log
     // line can say a mixed row is mixed.
     keptAiConflict?: boolean;
+    // Issue #672: this write includes a torn-row chapter/verse correction
+    // (`fields.chapter`/`fields.verse`, sourced from the row's own ref_raw,
+    // never from master's). Drives ref_healed + the lost-CAS watermark
+    // withhold, same shape as `adopted`.
+    healedRef: boolean;
+    // The heal is the ONLY thing this write does — no adopted/flagged content,
+    // no heuristic merge. Selects the "ref_heal"/"system" provenance stamp
+    // instead of this batch's "sync_merge"/"dcs_sync"/door43 one, so a pure
+    // D1 self-correction is never misattributed to a Door43 commit.
+    pureHeal: boolean;
   }> = [];
   // Ids this pass has already INSERTED. `existing` is read once, before the
   // loop, and is never updated afterwards — so if master's own file carries the
@@ -2558,6 +2590,59 @@ export async function applyTsvRows(
         }
       }
 
+      // Torn-row self-heal (issue #672). Detected HERE, at `cur`'s TRUE
+      // unmutated version, and folded into the SAME write this row already
+      // gets (or becomes one, if it would otherwise have had nothing to
+      // write) — never a separate write queued for later. Two Codex review
+      // rounds on PR #681 shaped this:
+      //   - round 1: an earlier version detected the tear up front and
+      //     bumped an in-memory `cur.version` optimistically, so a LATER
+      //     write derived from that same stale `cur` could CAS-match a
+      //     version a CONCURRENT PATCH had advanced to, silently overwriting
+      //     it. Detecting here, once, right before the one write this row's
+      //     resolution produces, removes the second write entirely — there
+      //     is nothing left for an optimistic version bump to mislead.
+      //   - round 2: an earlier version of THIS fix deferred the heal to a
+      //     later run whenever `fields` was already non-empty, reasoning
+      //     that `updates`/`update_ai`/`resurrect` write master's own
+      //     self-consistent chapter/verse as a side effect. True for THOSE
+      //     fates — but a torn row is always human-owned (the retype PATCH
+      //     set updated_by), so it can only ever reach fate "edited", never
+      //     "update"/"update_ai" (both require isReimportableRow). A
+      //     deferred heal therefore had nothing else to land on, and the
+      //     nightly staging gate skips a whole (book, resource) whose Door43
+      //     file SHA is unchanged (reimportStagedChunk) — so a row deferred
+      //     because it also had a genuine adopt/flag this run could go
+      //     PERMANENTLY unrevisited once master stopped moving, the exact
+      //     "permanent and silent" failure #672 is about. Folding into the
+      //     SAME write converges every torn row in the pass that finds it,
+      //     content question or not.
+      //
+      // Skipped for a PROTECTED tn row (trashed/preserve/hint): those bits
+      // are baked into buildTsvEditedWriteStmt's WHERE (this write shares the
+      // same protection predicate the three-way merge itself is gated on),
+      // so a heal attempted there would 0-change every single run — not a
+      // transient race, a standing block — and (per the apply_incomplete
+      // handling below) would withhold this resource's export watermark
+      // forever over a correction that can never land. Left torn instead,
+      // same as before this fix; nothing here makes a protected row worse.
+      const torn = protectedRow
+        ? null
+        : detectTornTsvRef((cur.ref_raw as string | null) ?? null, Number(cur.chapter), Number(cur.verse));
+      // A PURE heal — nothing else in `fields` yet — gets its own provenance
+      // (#686) rather than inheriting this batch's "sync_merge"/"dcs_sync"/
+      // door43 stamp below: no Door43 commit produced this correction, D1 is
+      // fixing its own bookkeeping, and stamping it as a Door43 sync would be
+      // exactly the kind of misattribution #686 exists to prevent. A row that
+      // ALSO adopts/flags a real master change keeps the sync_merge stamp —
+      // the heal rides along as a bonus correction, same as a heuristic
+      // tags/whitespace merge already does.
+      const pureHeal = torn !== null && Object.keys(fields).length === 0;
+      if (torn) {
+        fields.chapter = torn.chapter;
+        fields.verse = torn.verse;
+      }
+
       if (Object.keys(fields).length === 0) {
         counts.skipped_edited++;
         continue;
@@ -2572,6 +2657,8 @@ export async function applyTsvRows(
         adopted,
         heuristic,
         keptAiConflict,
+        healedRef: torn !== null,
+        pureHeal,
       });
     }
   }
@@ -2866,13 +2953,15 @@ export async function applyTsvRows(
       const results = await env.DB.batch(
         // #686: the three-way merge / master-adoption write on a human-edited
         // row — the key attribution site. sync_merge, and the actor MUST be
-        // the measured author (never a fallback built here).
+        // the measured author (never a fallback built here). A PURE torn-row
+        // heal (#672) gets its own "ref_heal"/"system" stamp instead — D1
+        // correcting its own bookkeeping, not anything Door43 held, so
+        // crediting the Door43 commit author would misattribute it.
         slice.map((u) =>
-          buildTsvEditedWriteStmt(env, book, kind, u.id, u.fields, u.oldVersion, now, {
-            action: "sync_merge",
-            source: "dcs_sync",
-            actor: door43,
-          }),
+          buildTsvEditedWriteStmt(
+            env, book, kind, u.id, u.fields, u.oldVersion, now,
+            u.pureHeal ? { action: "ref_heal", source: "system", actor: null } : { action: "sync_merge", source: "dcs_sync", actor: door43 },
+          ),
         ),
       );
       const logs: D1PreparedStatement[] = [];
@@ -2902,6 +2991,14 @@ export async function applyTsvRows(
           // the pre-existing heuristic-merge tally must not be lost to the adoption
           // branch (Codex P3.7).
           if (u.heuristic) counts.merged_fields++;
+          // ref_healed is INDEPENDENT of both — a row can adopt a master field
+          // AND carry a chapter/verse correction in the same write (issue #672).
+          if (u.healedRef) {
+            counts.ref_healed++;
+            console.log("reimport: healed a torn row's stored chapter/verse to match its own ref_raw", {
+              book, kind, id: u.id, chapter: u.fields.chapter, verse: u.fields.verse,
+            });
+          }
           logs.push(logEditStmt(env, kind, u.id, book, userId, u.oldVersion, u.oldVersion + 1, "update", u.fields));
         } else {
           // Lost the version-CAS race — a human PATCH landed between the read and
@@ -2910,6 +3007,12 @@ export async function applyTsvRows(
           // field is still stale, so the watermark must be withheld or the export
           // reverts master with no retry (Codex P1.2 — the CAS-race twin of the
           // thrown-batch gate). A lost heuristic-only write is not data loss.
+          // A lost heal (#672) is the SAME shape as a lost adoption: the
+          // correction did not land, and — unlike a heuristic-only write —
+          // there is nothing else that will ever re-detect and retry it except
+          // the reimport itself, so it must withhold the watermark too, or the
+          // SHA-skip gate could make this the row's last chance for a long time
+          // (Codex re-review round 2 on PR #681).
           //
           // A `keep_ai_master` row (u.conflict true, u.adopted false — see the
           // `merge.conflict` block above) can lose this same race with NOTHING
@@ -2922,10 +3025,10 @@ export async function applyTsvRows(
           // edit that won this race resolved it — either way there is nothing
           // to retry, unlike an adoption's stale, unreachable-by-recompute field.
           counts.skipped_edited++;
-          if (u.adopted) {
+          if (u.adopted || u.healedRef) {
             counts.apply_incomplete = true;
-            console.warn("reimport: TSV master-adoption lost the version-CAS race; withholding watermark for retry", {
-              book, kind, id: u.id, chapter: u.chapter, verse: u.verse,
+            console.warn("reimport: TSV master-adoption or ref-heal lost the version-CAS race; withholding watermark for retry", {
+              book, kind, id: u.id, chapter: u.chapter, verse: u.verse, healedRef: u.healedRef,
             });
           }
         }
@@ -2942,8 +3045,12 @@ export async function applyTsvRows(
 
 // Columns buildTsvEditedWriteStmt may write per kind. An allowlist (not
 // Object.keys of caller input) so a stray/injected key can never reach the SQL.
-// Common to all kinds: tags, occurrence, and the review flags. `sort_order`,
-// identity, and updated_by are deliberately absent (never merged from master).
+// Common to all kinds: tags, occurrence, and the review flags. `sort_order`
+// and `updated_by` are deliberately absent (never merged from master).
+// `chapter`/`verse` ARE in this allowlist, but only ONE caller ever sets
+// them: the torn-row self-heal (issue #672), sourced from the row's OWN
+// ref_raw via detectTornTsvRef — never from master's incoming row. Identity
+// otherwise stays exactly what it always was here: never adopted FROM master.
 // Human-friendly names for the merge fields, for the conflict review_reason
 // (never expose a raw DB column name to a translator).
 const TSV_FIELD_LABELS: Record<string, string> = {
@@ -2957,9 +3064,9 @@ const TSV_FIELD_LABELS: Record<string, string> = {
 };
 
 const TSV_MERGE_WRITE_COLS: Record<TsvKind, Set<string>> = {
-  tn: new Set(["quote", "note", "occurrence", "support_reference", "tags", "review_kind", "review_reason", "review_master_json"]),
-  tq: new Set(["quote", "question", "response", "occurrence", "tags", "review_kind", "review_reason", "review_master_json"]),
-  twl: new Set(["orig_words", "tw_link", "occurrence", "tags", "review_kind", "review_reason", "review_master_json"]),
+  tn: new Set(["quote", "note", "occurrence", "support_reference", "tags", "review_kind", "review_reason", "review_master_json", "chapter", "verse"]),
+  tq: new Set(["quote", "question", "response", "occurrence", "tags", "review_kind", "review_reason", "review_master_json", "chapter", "verse"]),
+  twl: new Set(["orig_words", "tw_link", "occurrence", "tags", "review_kind", "review_reason", "review_master_json", "chapter", "verse"]),
 };
 
 // Build (don't run) the combined merge UPDATE for one edited TSV row, for
@@ -3002,9 +3109,12 @@ function buildTsvEditedWriteStmt(
   // content with master's, so the marker no longer describes the row and has to
   // go, or the chip keeps pointing a translator at a version whose text is no
   // longer what she is looking at (issue #539 item 4). Scoped to writes that
-  // actually move content: a review_kind/review_reason-only write changes no
-  // text, so the marker still describes the row correctly and must survive.
-  if (cols.some((c) => c !== "review_kind" && c !== "review_reason" && c !== "review_master_json")) {
+  // actually move TEXT content: a review_kind/review_reason-only write changes
+  // none, and neither does a torn-row chapter/verse correction (issue #672) —
+  // it relocates the row, it does not touch a single character of what the
+  // chip is describing — so both stay excluded and the marker survives.
+  const NON_CONTENT_COLS = new Set(["review_kind", "review_reason", "review_master_json", "chapter", "verse"]);
+  if (cols.some((c) => !NON_CONTENT_COLS.has(c))) {
     setClauses.push(`restored_from_version = NULL`);
   }
   const protection =
@@ -6062,6 +6172,9 @@ async function applyVerseRows(
       if (lastExportAt == null) {
         if (ex.content_json !== v.contentJson) counts.merge_unavailable++;
       }
+      // Issue #641: the merge outcome, kept for the source-attr reconcile gate
+      // below. null when no cutoff exists (no merge ran).
+      let mergeAction: VerseMergeAction | null = null;
       if (lastExportAt != null) {
         const merge = computeVerseMerge({
           base: verseContentJsonFromPayload(ex.base_payload ?? null),
@@ -6087,6 +6200,7 @@ async function applyVerseRows(
           // Issue #728: set only for the anchor of a bridge master has split.
           theirsForAlignment: structureAlignmentTheirs.get(structureKey(v.chapter, v.verse)),
         });
+        mergeAction = merge.action;
         // Issue #728: an anchor the content merge did NOT adopt — step 7s decides
         // whether the structure can still follow master (keep_converged) or the
         // component is kept whole and counted structure_refused.
@@ -6133,7 +6247,43 @@ async function applyVerseRows(
         // relies on (the NUM 20–22 combining-mark correction is the case that
         // reconcile exists for). Refusing the target text is not a reason to also
         // refuse an unrelated, source-owned correction on the same verse.
-        if (merge.action === "keep_ai_master") counts.merge_kept_ai++;
+        if (merge.action === "keep_ai_master") {
+          counts.merge_kept_ai++;
+          // Issue #749, the verse analogue of #703's TSV change (see the
+          // keep_ai_master branch in applyTsvRows, and retireVerseKeptAiMasterFlags
+          // for the retirement of the rows this used to mint). Until now this
+          // outcome ALSO wrote a verse_merge_conflicts row, so it stood in the
+          // "Sync flagged N verse(s)" banner forever — a row only leaves that
+          // banner when a human edits or dismisses the verse. But the outcome
+          // rests on a COMPLETE lineage walk that found no Door43 editor's commit
+          // behind master's side, and the banner's own sentence said exactly
+          // that while asking a translator to look anyway. Nothing was taken from
+          // Door43, so there is nothing to recover; the next export publishes D1
+          // over master, which is the intended result. Prod on 2026-09-09: EZK
+          // ULT 19 rows standing since 08-19, EZK UST 15 since 08-26, JER ULT 3
+          // since 09-03 — the majority of that banner, re-raised every time an
+          // unrelated flag changed the message.
+          //
+          // The outcome is still COUNTED (merge_kept_ai, the authoritative
+          // number, its own summary line) and logged per verse here, capped by
+          // the same KEPT_LOG_CAP the TSV side uses, so it stays checkable from
+          // the nightly tail rather than asked of a translator. Cheap by design:
+          // the ref and the measured reason, no verse content and no extra read
+          // — an AI re-run over a chapter of human-edited verses yields dozens of
+          // these every night until the export publishes them.
+          if (counts.merge_kept_ai <= KEPT_LOG_CAP) {
+            console.log(
+              "reimport merge kept the app's verse over Door43's: no Door43 editor commit measured behind master",
+              {
+                book,
+                resource: bibleVersion,
+                ref: `${v.chapter}:${v.verse}`,
+                reason: merge.reason,
+                version: ex.version,
+              },
+            );
+          }
+        }
         // FIX 5: converged-per-stableKey but the raw bytes differed — a real,
         // cosmetic-only edit this comparison silently discards. See
         // verseMerge.ts's FIX 5 correction and the field's own doc comment.
@@ -6144,7 +6294,14 @@ async function applyVerseRows(
         // not just the conflicted ones — see mergeConflicts's declaration
         // above for why. merge.conflict alone would miss the clean "adopt"
         // case (master moved, we didn't); merge.adopt covers it.
-        if (merge.conflict || merge.adopt) {
+        //
+        // Issue #749: `keep_ai_master` is the one excluded action. It reports
+        // `conflict: true` (verseMerge.ts) because a human's edit collided with
+        // master's, and that stays true — but the collision was already
+        // adjudicated on complete evidence with nothing taken from Door43, so
+        // it mints no durable row for a translator to clear. See the counter +
+        // log above; the run summary still carries it as merge_kept_ai.
+        if ((merge.conflict || merge.adopt) && merge.action !== "keep_ai_master") {
           mergeConflicts.push({
             chapter: v.chapter,
             verse: v.verse,
@@ -6155,9 +6312,9 @@ async function applyVerseRows(
             adopted: merge.adopt,
             // See issue #507: the version this verse's merge outcome was
             // detected at, so the speculative upsert's reactivation carve-out
-            // (keep_alignment_refused / keep_ai_master) can tell a stale
-            // re-detection from a fresh one. Unused (and harmless) for
-            // 'adopt' / 'adopt_conflict'.
+            // (keep_alignment_refused / source_attr_divergent /
+            // keep_local_structure) can tell a stale re-detection from a fresh
+            // one. Unused (and harmless) for 'adopt' / 'adopt_conflict'.
             observedVersion: ex.version,
           });
         }
@@ -6182,6 +6339,23 @@ async function applyVerseRows(
       // isn't reverted when the nightly export re-renders this verse. Staged into
       // a separate version-CAS batch below; if nothing reconciled it stays a plain
       // edited skip. (verses analogue of the TWL-PSA / Hebrew-NFC clobber class.)
+      // Issue #641: master has not moved since our own confirmed publish
+      // (`keep_master_unchanged`: theirs == base) or already matches D1
+      // (`keep_converged`). Nothing on master can be a Door43 source fix in
+      // either case — master's `\zaln-s` attrs ARE our own last render — so the
+      // two-way reconcile below would only be comparing the translator's in-app
+      // alignment against our stale bytes. With a repeated source word that
+      // read as "Door43's fix could not be placed" and minted a
+      // source_attr_ambiguous flag the editor could never clear (their next save
+      // resolved it, the next nightly re-minted it): EZK UST 22:26 / 33:9 /
+      // 45:11–12 on 2026-09-09, chapters no Door43 commit had touched. Skip the
+      // reconcile; `keep_no_base` (no ancestor, can't tell) and real master
+      // movement (the NUM 20–22 combining-mark fix) keep today's behavior.
+      if (mergeAction === "keep_master_unchanged" || mergeAction === "keep_converged") {
+        counts.skipped_edited++;
+        counts.source_attr_reconcile_skipped++;
+        continue;
+      }
       const rec = reconcileEditedVerseSourceAttrs(ex.content_json, v.contentJson);
       if (rec.divergent > 0) {
         counts.source_attr_divergent += rec.divergent;
@@ -6872,6 +7046,15 @@ async function applyVerseRows(
           // content path's own flag (if it wrote one) takes precedence on this
           // verse; otherwise a keep_local_structure flag names the merge action.
           // Recorded now because step 6b has already run.
+          //
+          // Issue #749 note: a keep_ai_master anchor now writes no content flag,
+          // so such a verse falls to the `otherwise` and mints
+          // keep_local_structure with reason `anchor_keep_ai_master`. That is the
+          // intended reading, not a leak of the retired flag: the STRUCTURE
+          // dimension is separate from who won the target text, D1's grouping
+          // still differs from Door43's, and the next export writes ours over
+          // theirs — the same live condition `master_moved_non_human` already
+          // reports. Reachable only when master actually re-grouped the verses.
           counts.structure_refused++;
           if (!mergeConflicts.some((mc) => mc.chapter === ad.chapter && mc.verse === ad.anchor.verse)) {
             const flag = {
@@ -7169,11 +7352,15 @@ async function applyVerseRows(
   );
   counts.merge_conflicts += liveConflicts.length;
   // The rows a human must review — every landed conflict EXCEPT keep_ai_master,
-  // which is D1-wins and reported on its own summary line (#706). On verses this
-  // equals the old `merge_conflicts - merge_kept_ai` render exactly (keep_ai_master
-  // is a subset of liveConflicts here); it is a distinct counter so the TSV side,
-  // where the two counters do not nest, can report the same fact without the
-  // subtraction cancelling a real flag against an unrelated kept-alone row.
+  // which is D1-wins and reported on its own summary line (#706). Since #749
+  // that action never enters `mergeConflicts` in the first place (see the push
+  // above), so this filter matches nothing on the verse side today; it is kept
+  // as a belt-and-braces guard, because the counter's contract is "conflicts a
+  // human must review" and a future caller pushing the action back in must not
+  // silently inflate it. It stays a distinct counter (rather than
+  // `merge_conflicts - merge_kept_ai`) so the TSV side, where the two counters
+  // do not nest, can report the same fact without the subtraction cancelling a
+  // real flag against an unrelated kept-alone row.
   counts.merge_master_wins += liveConflicts.filter(
     (mc) => mc.action !== "keep_ai_master",
   ).length;

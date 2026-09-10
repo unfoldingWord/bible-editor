@@ -22,7 +22,10 @@ import {
   ListItemText,
   ListSubheader,
   Divider,
+  Link,
 } from "@mui/material";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
 import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
@@ -38,6 +41,14 @@ import UndoIcon from "@mui/icons-material/Undo";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import ArrowDropDownIcon from "@mui/icons-material/ArrowDropDown";
+import VisibilityOutlinedIcon from "@mui/icons-material/VisibilityOutlined";
+import VisibilityOffOutlinedIcon from "@mui/icons-material/VisibilityOffOutlined";
+import FormatBoldIcon from "@mui/icons-material/FormatBold";
+import FormatListNumberedIcon from "@mui/icons-material/FormatListNumbered";
+import FormatListBulletedIcon from "@mui/icons-material/FormatListBulleted";
+import FormatIndentIncreaseIcon from "@mui/icons-material/FormatIndentIncrease";
+import FormatIndentDecreaseIcon from "@mui/icons-material/FormatIndentDecrease";
+import AutoFixHighOutlinedIcon from "@mui/icons-material/AutoFixHighOutlined";
 import type { TnRow } from "../sync/api";
 import { isReadOnly } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
@@ -55,7 +66,18 @@ import {
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
-import { parseNoteSegments } from "../lib/noteLinks";
+import { parseNoteSegments, resolveNoteLinkHref } from "../lib/noteLinks";
+import {
+  continueListOnEnter,
+  indentLines,
+  isListLine,
+  normalizeLists,
+  outdentLines,
+  tidyLists,
+  toggleBold,
+  toggleList,
+  type FormatResult,
+} from "../lib/noteFormat";
 
 const NoteHistoryDialog = lazy(() =>
   import("./NoteHistoryDialog").then((m) => ({ default: m.NoteHistoryDialog })),
@@ -421,6 +443,136 @@ function NoteBodyReadView({
   );
 }
 
+// Rendered-markdown preview of a note body — the "Preview" toggle's ON state.
+// Same click-to-edit chrome as NoteBodyReadView (border, padding, reading
+// font) so switching the toggle doesn't jump the card's footprint; unlike
+// NoteBodyReadView it does not do find-highlighting (callers gate the toggle
+// off whenever a find match is live — see showMarkdownPreview below) and its
+// "see how you translated this" links come from react-markdown's own link
+// parsing rather than parseNoteSegments (react-markdown hands the `a`
+// component only the href, so resolveNoteLinkHref — the href-only sibling of
+// parseNoteSegments' target resolution — is what recognizes them here).
+// Deliberately no rehype-raw/allowDangerousHtml (mirrors TwArticleDialog):
+// note bodies round-trip through TSV/DCS with no sanitization upstream, so
+// embedded raw HTML must stay inert rather than execute.
+function NoteBodyMarkdownView({
+  text,
+  book,
+  onActivate,
+}: {
+  text: string;
+  book: string;
+  onActivate: () => void;
+}) {
+  const LinkComponent = useMemo(() => {
+    function NoteMdLink({ href, children }: { href?: string; children?: React.ReactNode }) {
+      if (!href) return <>{children}</>;
+      const target = resolveNoteLinkHref(href, book);
+      if (target) {
+        return (
+          <Box
+            component="span"
+            title={`Go to ${target.book} ${target.chapter}:${target.verse}`}
+            onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
+            onClick={(e: React.MouseEvent) => {
+              e.stopPropagation();
+              location.hash = `#/${target.book}/${target.chapter}/${target.verse}`;
+            }}
+            sx={{
+              color: "primary.main",
+              textDecoration: "underline",
+              textDecorationStyle: "dotted",
+              textUnderlineOffset: "2px",
+              cursor: "pointer",
+              "&:hover": { textDecorationStyle: "solid" },
+            }}
+          >
+            {children}
+          </Box>
+        );
+      }
+      // Anything else (rc:// / ta man links, a relative path that isn't one
+      // of our own note-link hrefs) renders inert rather than navigable —
+      // same rule TwArticleDialog's mdLink applies to non-http(s) hrefs.
+      if (/^https?:\/\//.test(href)) {
+        return (
+          <Link
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          >
+            {children}
+          </Link>
+        );
+      }
+      return <>{children}</>;
+    }
+    return NoteMdLink;
+  }, [book]);
+
+  return (
+    <Box
+      onMouseDown={(e: React.MouseEvent) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        onActivate();
+      }}
+      title="click to edit"
+      sx={{
+        cursor: "text",
+        minHeight: 56,
+        px: "14px",
+        py: "8.5px",
+        border: "1px solid",
+        borderColor: "divider",
+        borderRadius: 1,
+        fontSize: `calc(15px * var(--be-reading-scale, 1))`,
+        lineHeight: 1.55,
+        fontFamily: '"Source Serif Pro","Cambria","Times New Roman",serif',
+        "&:hover": { borderColor: "text.primary" },
+        "& > :first-of-type": { mt: 0 },
+        "& > :last-child": { mb: 0 },
+        "& h1": { fontSize: "1.25em", fontWeight: 700, mt: 1, mb: 0.5 },
+        "& h2": { fontSize: "1.15em", fontWeight: 700, mt: 1, mb: 0.5 },
+        "& h3, & h4, & h5, & h6": { fontSize: "1.05em", fontWeight: 600, mt: 1, mb: 0.5 },
+        "& p": { my: 0.75 },
+        "& ul, & ol": { pl: 3, my: 0.5 },
+        // Outline convention the TN team writes intros in: 1. 2. 3. at the top
+        // level, A. B. C. beneath. CommonMark can only store `1.` markers, so
+        // the letters exist only in this rendering.
+        "& ol ol": { listStyleType: "upper-alpha" },
+        "& ol ol ol": { listStyleType: "lower-roman" },
+        "& li": { my: 0.25 },
+        "& blockquote": {
+          borderLeft: "3px solid",
+          borderColor: "divider",
+          pl: 1.5,
+          ml: 0,
+          color: "text.secondary",
+        },
+        "& code": {
+          fontFamily: "monospace",
+          fontSize: "0.9em",
+          bgcolor: "grey.100",
+          borderRadius: "3px",
+          px: "3px",
+        },
+        "& hr": { borderColor: "divider" },
+      }}
+    >
+      {text.trim() ? (
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: LinkComponent }}>
+          {text}
+        </ReactMarkdown>
+      ) : (
+        " "
+      )}
+    </Box>
+  );
+}
+
 function NoteCardInner({
   row,
   active,
@@ -493,6 +645,17 @@ function NoteCardInner({
   // near the render call below for the combined condition.
   const noteTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [editingBody, setEditingBody] = useState(false);
+  // "Preview" toggle: renders the note body as actual markdown (headings,
+  // lists, bold, the "see how you translated this" link) instead of the
+  // plain-text/find-highlight read view. Defaults ON for chapter/book intro
+  // rows (verse 0) — those bodies are prose written in real Markdown, the uW
+  // book/chapter-intro convention (`# heading`, blank-line paragraphs,
+  // numbered outlines) — and OFF for ordinary verse notes, which are usually
+  // short and actively edited. Manual toggle either way; computed once at
+  // mount rather than re-derived, so retargeting an already-open note to a
+  // different verse (onChangeVerse) doesn't yank the toggle out from under
+  // the user mid-session.
+  const [previewMode, setPreviewMode] = useState(row.verse === 0);
   // A new find target (different occurrence / note) always returns to the read
   // view so the highlight shows; clicking sets editingBody back to true.
   useEffect(() => {
@@ -515,6 +678,39 @@ function NoteCardInner({
       ta.setSelectionRange(len, len);
     }
   }, [editingBody]);
+  // Toolbar / key-driven formatting: compute the new text from the live
+  // textarea selection, push it through the same state + pendingRef path a
+  // keystroke uses, then restore the caret once React has re-rendered the
+  // value (setting it synchronously would be clobbered by the controlled
+  // input's own update).
+  const pendingSelRef = useRef<{ start: number; end: number } | null>(null);
+  const applyFormat = (
+    fn: (value: string, selStart: number, selEnd: number) => FormatResult | null,
+  ) => {
+    const ta = noteTextareaRef.current;
+    if (!ta || readOnly) return false;
+    const result = fn(ta.value, ta.selectionStart, ta.selectionEnd);
+    if (!result) return false;
+    if (result.value === ta.value) {
+      // No text change means no re-render, so the [note] effect below would
+      // never fire and a stashed selection would misplace the caret on the
+      // next keystroke. Callers treat false as "let the default happen".
+      ta.setSelectionRange(result.selStart, result.selEnd);
+      return false;
+    }
+    setNote(result.value);
+    pendingRef.current = { ...pendingRef.current, note: result.value };
+    pendingSelRef.current = { start: result.selStart, end: result.selEnd };
+    return true;
+  };
+  useEffect(() => {
+    const sel = pendingSelRef.current;
+    const ta = noteTextareaRef.current;
+    if (!sel || !ta) return;
+    pendingSelRef.current = null;
+    ta.focus();
+    ta.setSelectionRange(sel.start, sel.end);
+  }, [note]);
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [aiConfirmOpen, setAiConfirmOpen] = useState(false);
@@ -1142,14 +1338,30 @@ function NoteCardInner({
   if (supportRef !== savedRef.current.support_reference) rowDiff.support_reference = supportRef;
   const hasRowDiff = Object.keys(rowDiff).length > 0;
   const draftKey = rowKey("tn", row.book, row.id);
-  // Show the read view (plain text + clickable note links) except while the
-  // card is actively being edited: either the user clicked in (editingBody),
-  // or it's the focused card and there's no find match holding it in the read
-  // view for highlighting. An inactive card always reads as plain text/links
-  // regardless of editingBody — leaving the note (active → false) resets
-  // editingBody above, so a re-visited note shows its links again rather than
-  // staying pinned to the textarea it was last edited through.
-  const showReadView = !editingBody && (!active || (!!findQuery && activeMatchOccurrence != null));
+  // Show the read view (plain text + clickable note links, or — with the
+  // Preview toggle on — rendered markdown; see showMarkdownPreview below)
+  // except while the card is actively being edited: either the user clicked
+  // in (editingBody), or it's the focused card with previewMode off and no
+  // find match holding it in the read view for highlighting. An inactive
+  // card always reads as plain text/links regardless of editingBody —
+  // leaving the note (active → false) resets editingBody above, so a
+  // re-visited note shows its links again rather than staying pinned to the
+  // textarea it was last edited through.
+  const findHighlightActive = !!findQuery && activeMatchOccurrence != null;
+  // previewMode also earns a read view on an ACTIVE card (not just inactive
+  // ones): otherwise the toggle would visibly do nothing while the user is
+  // focused on the very note they're trying to preview (#752 review — an
+  // active card used to always fall through to the raw textarea regardless
+  // of the toggle). It still yields to editingBody (clicking into the body
+  // itself always means "edit now") and to a live find match, which needs
+  // the plain-text highlighter and — per the toggle's own disabled state
+  // below — wins over previewMode no matter what the user last chose.
+  const showReadView = !editingBody && (!active || findHighlightActive || previewMode);
+  // The markdown-rendered view stands in for NoteBodyReadView only when no
+  // find match needs the plain-text highlighter — a live find hit always
+  // wins, regardless of the toggle, so "here I am" scrolling/marking keeps
+  // working on a note the user has switched to Preview.
+  const showMarkdownPreview = showReadView && previewMode && !findHighlightActive;
   const pendingAtRender = pendingRef.current;
   useEffect(() => {
     if (readOnly) return;
@@ -1677,8 +1889,85 @@ function NoteCardInner({
               </Button>
             </span>
           </Tooltip>
+          <Tooltip
+            title={
+              findHighlightActive
+                ? "preview is disabled while a find match is highlighted in this note"
+                : showMarkdownPreview
+                  ? "show raw markdown text"
+                  : "preview as rendered markdown"
+            }
+          >
+            <span>
+              <IconButton
+                size="small"
+                // A live find match always wins the read view (it needs the
+                // plain-text highlighter — see showReadView above), so the
+                // toggle would otherwise sit enabled while silently doing
+                // nothing until the match clears (#752 review). Disabling it
+                // makes that latency visible instead of letting a click
+                // change the icon with no visible effect.
+                disabled={findHighlightActive}
+                // Preview also works on an ACTIVE card now (see showReadView
+                // above), but clicking this toggle must never itself BE the
+                // click that activates the card or starts editing. The Paper
+                // ancestor activates on onFocus (bound to both onMouseDown
+                // and the native onFocus), and a native <button> takes focus
+                // on click by default — a focus event React re-dispatches up
+                // through onFocus handlers regardless of whether the
+                // originating mousedown's propagation was stopped.
+                // preventDefault on mousedown suppresses that default
+                // focus-on-click behavior (mirrors the preventDefault in
+                // NoteBodyReadView's own onMouseDown, for the same reason:
+                // controlling activation precisely instead of leaving it to
+                // the browser's default), while stopPropagation keeps the
+                // mousedown itself from ever reaching Paper's onMouseDown.
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  // Keyed on showMarkdownPreview — what's actually ON
+                  // SCREEN right now — rather than toggling the raw
+                  // previewMode preference blindly. Those two can diverge:
+                  // clicking into the rendered body (onActivate) latches
+                  // editingBody true, which forces the raw view regardless
+                  // of previewMode, so previewMode can still read true while
+                  // raw text is what's showing. Blindly flipping previewMode
+                  // in that state would turn the PREFERENCE off (since it
+                  // was already on) while the screen stayed raw either way —
+                  // the toggle would visibly do nothing, then need a SECOND
+                  // click to actually restore preview (#752 review). Acting
+                  // on showMarkdownPreview instead makes one click always do
+                  // what the icon/tooltip say: currently previewing -> go
+                  // raw; currently raw for any reason -> preview (and clear
+                  // editingBody so that preference actually takes effect).
+                  if (showMarkdownPreview) {
+                    setPreviewMode(false);
+                  } else {
+                    setPreviewMode(true);
+                    setEditingBody(false);
+                  }
+                }}
+                sx={{ p: 0.25, color: showMarkdownPreview ? "primary.main" : "text.secondary" }}
+              >
+                {showMarkdownPreview ? (
+                  <VisibilityOffOutlinedIcon sx={{ fontSize: 16 }} />
+                ) : (
+                  <VisibilityOutlinedIcon sx={{ fontSize: 16 }} />
+                )}
+              </IconButton>
+            </span>
+          </Tooltip>
         </Stack>
-        {showReadView ? (
+        {showMarkdownPreview ? (
+          <NoteBodyMarkdownView
+            text={note}
+            book={row.book}
+            onActivate={() => setEditingBody(true)}
+          />
+        ) : showReadView ? (
           <NoteBodyReadView
             text={note}
             book={row.book}
@@ -1687,12 +1976,87 @@ function NoteCardInner({
             onActivate={() => setEditingBody(true)}
           />
         ) : (
+          <>
+            {!readOnly && (
+              <Stack direction="row" spacing={0.25} sx={{ mb: 0.5 }} data-testid="note-format-toolbar">
+                {(
+                  [
+                    { title: "Bold", Icon: FormatBoldIcon, fn: toggleBold, introOnly: false },
+                    {
+                      title: "Numbered list",
+                      Icon: FormatListNumberedIcon,
+                      fn: (v: string, s: number, e: number) => toggleList(v, s, e, "ordered"),
+                      introOnly: true,
+                    },
+                    {
+                      title: "Bulleted list",
+                      Icon: FormatListBulletedIcon,
+                      fn: (v: string, s: number, e: number) => toggleList(v, s, e, "bullet"),
+                      introOnly: true,
+                    },
+                    { title: "Decrease indent (Shift+Tab)", Icon: FormatIndentDecreaseIcon, fn: outdentLines, introOnly: true },
+                    { title: "Increase indent (Tab)", Icon: FormatIndentIncreaseIcon, fn: indentLines, introOnly: true },
+                    // Existing intros written with 2-space parents render their
+                    // children as run-on text (#753); offer the repair only
+                    // while the note actually needs it.
+                    ...(row.verse === 0 && normalizeLists(note) !== note
+                      ? [
+                          {
+                            title: "Tidy outline: fix list numbering and nesting",
+                            Icon: AutoFixHighOutlinedIcon,
+                            fn: tidyLists,
+                            introOnly: true,
+                          },
+                        ]
+                      : []),
+                  ] as const
+                )
+                  // Lists and indent are the chapter/book-intro outline
+                  // convention; ordinary verse notes only ever use bold.
+                  .filter((b) => !b.introOnly || row.verse === 0)
+                  .map(({ title, Icon, fn }) => (
+                    <Tooltip key={title} title={title}>
+                      <IconButton
+                        size="small"
+                        aria-label={title}
+                        color={fn === tidyLists ? "warning" : "default"}
+                        // mousedown default would move focus (and drop the
+                        // selection) off the textarea before the click runs.
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          applyFormat(fn);
+                        }}
+                        sx={{ p: 0.25, ...(fn === tidyLists ? {} : { color: "text.secondary" }) }}
+                      >
+                        <Icon sx={{ fontSize: 18 }} />
+                      </IconButton>
+                    </Tooltip>
+                  ))}
+              </Stack>
+            )}
           <TextField
             value={note}
             inputRef={noteTextareaRef}
             onChange={(e) => {
               setNote(e.target.value);
               pendingRef.current = { ...pendingRef.current, note: e.target.value };
+            }}
+            onKeyDown={(e) => {
+              if (row.verse !== 0 || readOnly || e.nativeEvent.isComposing) return;
+              const ta = noteTextareaRef.current;
+              if (!ta) return;
+              if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+                if (applyFormat(continueListOnEnter)) e.preventDefault();
+              } else if (e.key === "Tab" && isListLine(ta.value, ta.selectionStart)) {
+                // Only swallow Tab when it actually re-indents; a no-op (first
+                // item of a list, Shift+Tab at the top level) keeps the
+                // browser's focus move so the textarea is never a keyboard trap.
+                if (applyFormat(e.shiftKey ? outdentLines : indentLines)) e.preventDefault();
+              }
             }}
             multiline
             fullWidth
@@ -1712,6 +2076,7 @@ function NoteCardInner({
               },
             }}
           />
+          </>
         )}
       </Box>
 
