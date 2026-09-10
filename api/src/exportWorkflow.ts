@@ -82,8 +82,9 @@ import {
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
 import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
-import { dcsResourceFile, fetchDcsMasterText, fileCommitSha, type ReimportResource } from "./dcsSources";
-import { gitBlobSha } from "./ownPublish";
+import { dcsResourceFile, fetchDcsMasterText, fileBlobShaAtCommit, fileHeadCommit, type ReimportResource } from "./dcsSources";
+import { gitBlobSha, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
+import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
 import { hardRejectRows } from "./hardRejectGuard";
@@ -1767,10 +1768,53 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (!file) return { ok: true, detail: "no_file", masterSha: null, watermark: null };
     const watermark = await storedResourceSha(this.env, book, resource);
     if (!watermark) return { ok: true, detail: "no_watermark", masterSha: null, watermark: null };
-    const masterSha = await fileCommitSha(this.env, file.repo, file.path);
-    if (!masterSha) return { ok: false, detail: "master_sha_unknown", masterSha: null, watermark };
-    if (masterSha === watermark) return { ok: true, detail: "current", masterSha, watermark };
-    return { ok: false, detail: "master_ahead", masterSha, watermark };
+    const head = await fileHeadCommit(this.env, file.repo, file.path);
+    if (!head) return { ok: false, detail: "master_sha_unknown", masterSha: null, watermark };
+    if (head.sha === watermark) return { ok: true, detail: "current", masterSha: head.sha, watermark };
+
+    // Master moved past the watermark. Normally that means a foreign commit
+    // landed and the export must not clobber it (stale_master:master_ahead,
+    // below) — but this gate runs BEFORE the export, and source_sha only
+    // advances on the NEXT successful sync, so a second export shortly after
+    // the FIRST one's PR merges sees exactly this: master's head is our own
+    // just-merged squash commit, not a foreign edit (issue #748, measured on
+    // DAN TN 2026-09-08 — a real export followed 36s later by a false
+    // export_stale alert that a later sync healed on its own). Recognize it
+    // the same way accountOwnPublishDecline already does for the reimport
+    // side (PR #704): the head's subject carries the export PR's number,
+    // which recordPushedPr stamped onto book_resource_syncs for exactly the
+    // render that just merged.
+    //
+    // The subject/PR-number match alone is NOT proof — Door43's merge job, or
+    // a manual branch edit, could land that same PR number with DIFFERENT
+    // bytes (a rewrite), and treating that as "nothing to revert" would be
+    // exactly the stale-D1-silently-reverts-master failure mode this whole
+    // gate exists to prevent (PR #750 review). So the match is only a
+    // candidate; judgeOwnPublishDecline's byte comparison against
+    // pushed_blob_sha — the SAME check accountOwnPublishDecline already makes
+    // for the reimport side — decides for real. Only a `preserved` verdict
+    // (merge landed exactly the bytes we pushed) counts as current; anything
+    // else, including `rewritten`, falls through to master_ahead unchanged.
+    const pushedPr = await this.env.DB.prepare(
+      `SELECT pushed_pr_number, pushed_blob_sha FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource)
+      .first<{ pushed_pr_number: number | null; pushed_blob_sha: string | null }>();
+    const headCommit: MasterCommit = { sha: head.sha, message: head.message, authorEmail: head.authorEmail };
+    const classifiedHead = classifyMasterCommit(headCommit);
+    const ownMerge = findOurMergeForPr([classifiedHead], pushedPr?.pushed_pr_number ?? null);
+    if (ownMerge.found && pushedPr?.pushed_blob_sha) {
+      const mergedBlobSha = await fileBlobShaAtCommit(this.env, file.repo, file.path, head.sha);
+      const judged = judgeOwnPublishDecline({
+        ourMerge: ownMerge,
+        mergedBlobSha,
+        pushedBlobSha: pushedPr.pushed_blob_sha,
+        newest: classifiedHead,
+      });
+      if (judged.verdict === "preserved") return { ok: true, detail: "own_publish", masterSha: head.sha, watermark };
+    }
+
+    return { ok: false, detail: "master_ahead", masterSha: head.sha, watermark };
   }
 
   // Banner alert when the freshness gate skips an export to avoid clobbering

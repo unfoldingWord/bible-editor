@@ -12,6 +12,8 @@ import {
   fetchDcsMasterTextVerified,
   fetchHumanTouchedRefs,
   fetchText,
+  fileCommitSha,
+  fileHeadCommit,
   listMasterCommitsSince,
 } from "./dcsSources.ts";
 import { LINEAGE_REFINE_MAX_HUMAN_COMMITS } from "./masterLineage.ts";
@@ -888,8 +890,71 @@ async function run() {
     }
   }
 
+  // ── fileHeadCommit / fileCommitSha — issue #748 ─────────────────────────
+  // checkMasterFreshness (exportWorkflow.ts) needs master's head commit's
+  // message/author, not just its sha, to recognize its own just-merged
+  // export PR. fileHeadCommit is the one fetch both fileCommitSha and that
+  // recognition now share.
+  console.log("\n-- fileHeadCommit / fileCommitSha --");
+  // The fetchHumanTouchedRefs block above swaps globalThis.fetch for its own
+  // `serve()` router; restore the queue-based stub these tests expect.
+  globalThis.fetch = async () => {
+    calls++;
+    if (queue.length === 0) throw new Error("fetch called more times than queued");
+    return queue.shift();
+  };
+  {
+    // A well-formed Gitea commits-list response: sha + commit.message +
+    // commit.author.email, same shape listMasterCommitsSince already parses.
+    queue = [
+      jsonRes({
+        body: [
+          {
+            sha: "b5ccb926aaaa",
+            commit: {
+              message: "bible-editor: DAN tn → master (#7624)",
+              author: { email: "deferredreward@users.noreply.git.door43.org" },
+            },
+          },
+        ],
+      }),
+    ];
+    calls = 0;
+    const head = await fileHeadCommit(env, "en_tn", "tn_DAN.tsv");
+    assert(head?.sha === "b5ccb926aaaa", "fileHeadCommit: sha parsed");
+    assert(head?.message === "bible-editor: DAN tn → master (#7624)", "  ...message parsed");
+    assert(head?.authorEmail === "deferredreward@users.noreply.git.door43.org", "  ...author email parsed");
+    assert(calls === 1, "  ...single fetch");
+  }
+  {
+    // fileCommitSha delegates to fileHeadCommit and keeps its sha-only
+    // contract for its other (pre-existing) callers.
+    queue = [jsonRes({ body: [{ sha: "abc123", commit: { message: "msg", author: {} } }] })];
+    assert((await fileCommitSha(env, "en_tn", "tn_DAN.tsv")) === "abc123", "fileCommitSha: still sha-only");
+  }
+  {
+    // Empty history / 404 → null, not a throw.
+    queue = [jsonRes({ body: [] })];
+    assert((await fileHeadCommit(env, "en_tn", "tn_DAN.tsv")) === null, "fileHeadCommit: no commits → null");
+  }
+  {
+    queue = [jsonRes({ ok: false, body: [] })];
+    assert((await fileHeadCommit(env, "en_tn", "tn_DAN.tsv")) === null, "fileHeadCommit: non-ok → null");
+  }
+  {
+    globalThis.fetch = async () => {
+      throw new Error("network down");
+    };
+    assert((await fileHeadCommit(env, "en_tn", "tn_DAN.tsv")) === null, "fileHeadCommit: network error → null");
+    globalThis.fetch = async () => {
+      calls++;
+      if (queue.length === 0) throw new Error("fetch called more times than queued");
+      return queue.shift();
+    };
+  }
+
   console.log(
-    "dcsSources/fetchText + fetchDcsMasterText + listMasterCommitsSince + fetchHumanTouchedRefs: all assertions passed",
+    "dcsSources/fetchText + fetchDcsMasterText + listMasterCommitsSince + fetchHumanTouchedRefs + fileHeadCommit: all assertions passed",
   );
 }
 
