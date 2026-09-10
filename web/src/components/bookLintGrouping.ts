@@ -1,10 +1,26 @@
-// Groups BookLintIndicator's flag issues by (check, message) so a run of
-// identical entries - e.g. issue #653's 63 "Unmerged Door43 edit - verify" TN
-// rows in JER, every one carrying the exact same generic hedge because
-// there's no per-row detail the merge could give - collapses into one
-// entry with a count instead of forcing a translator to scroll past dozens
-// of indistinguishable items. A group of size 1 renders exactly as before.
+// Groups BookLintIndicator's flag issues so a run of near-identical entries
+// - e.g. issue #653's 63 "Unmerged Door43 edit - verify" TN rows in JER,
+// every one carrying the exact same generic hedge because there's no
+// per-row detail the merge could give - collapses into one entry with a
+// count instead of forcing a translator to scroll past dozens of
+// indistinguishable items. A group of size 1 renders exactly as before.
 // Order is first-seen (stable), so the popup's overall ordering doesn't churn.
+//
+// Two grouping modes (issue #700):
+// - "duplicate" (default): review-flag issues (those carrying a
+//   `reviewKind`, e.g. "Kept over Door43 - verify") group by check+reviewKind
+//   rather than by the free-text `message`. Once per-row detail (a field
+//   list, a "who/when" commit clause) was folded into that message, keying
+//   on its exact text left rows that share the same finding — the same
+//   `reviewKind` — ungrouped whenever their wording happened to differ, e.g.
+//   a solo "Kept over Door43" note sitting next to an otherwise-identical
+//   group of 3. Non-review-flag issues (mechanical checks like "Doubled
+//   space") have no `reviewKind` and keep keying on check+message, since
+//   their message embeds a unique excerpt by design — only true exact
+//   duplicates of those should collapse.
+// - "type": groups by `check` alone, ignoring message/reviewKind entirely,
+//   so every issue of one kind (e.g. every "Straight quote" finding) sits in
+//   one group regardless of where each occurrence's text differs.
 
 import type { BookLintIssue, RowKind } from "../sync/api";
 
@@ -15,11 +31,22 @@ export interface LintIssueGroup {
   issues: BookLintIssue[];
 }
 
-export function groupLintIssues(issues: BookLintIssue[]): LintIssueGroup[] {
+export type LintGroupMode = "duplicate" | "type";
+
+function groupKeyFor(issue: BookLintIssue, mode: LintGroupMode): string {
+  if (mode === "type") return issue.check;
+  if (issue.reviewKind !== undefined) return issue.check + "|" + issue.reviewKind;
+  return issue.check + "|" + issue.message;
+}
+
+export function groupLintIssues(
+  issues: BookLintIssue[],
+  mode: LintGroupMode = "duplicate",
+): LintIssueGroup[] {
   const groups: LintIssueGroup[] = [];
   const byKey = new Map<string, LintIssueGroup>();
   for (const issue of issues) {
-    const key = issue.check + "|" + issue.message;
+    const key = groupKeyFor(issue, mode);
     let group = byKey.get(key);
     if (!group) {
       group = { key, check: issue.check, message: issue.message, issues: [] };
@@ -29,6 +56,30 @@ export function groupLintIssues(issues: BookLintIssue[]): LintIssueGroup[] {
     group.issues.push(issue);
   }
   return groups;
+}
+
+// Ref is always built server-side as `${chapter}:${verse}` for lint issues
+// (see api/src/lint.ts) — no bridges or "intro" markers in this field, so a
+// plain numeric parse is enough. An unparseable ref sorts last rather than
+// throwing, so a future format change degrades gracefully instead of
+// breaking the whole sort.
+function refSortKey(ref: string): [number, number] {
+  const m = /^(\d+):(\d+)/.exec(ref);
+  if (!m) return [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER];
+  return [Number(m[1]), Number(m[2])];
+}
+
+export type LintSortMode = "default" | "verse";
+
+// "default" returns `issues` unchanged (first-seen/fetch order) rather than a
+// copy, so callers doing referential-identity checks aren't surprised.
+export function sortLintIssues(issues: BookLintIssue[], mode: LintSortMode): BookLintIssue[] {
+  if (mode === "default") return issues;
+  return [...issues].sort((a, b) => {
+    const [ac, av] = refSortKey(a.ref);
+    const [bc, bv] = refSortKey(b.ref);
+    return ac - bc || av - bv;
+  });
 }
 
 // --- Door43-vs-here diff (issue #653 direction 2) ---
