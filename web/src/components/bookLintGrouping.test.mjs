@@ -9,6 +9,7 @@ import {
   dismissibleKind,
   groupLintIssues,
   isGroupFullyDismissible,
+  sortLintIssues,
 } from "./bookLintGrouping.ts";
 
 let passed = 0;
@@ -64,7 +65,7 @@ console.log("[the #653 shape: many identical (check, message) issues collapse in
   );
 }
 
-console.log("[same check, different message: NOT grouped together]");
+console.log("[same check, different message, no reviewKind: NOT grouped together]");
 {
   const issues = [
     issue({ ref: "2:1", check: "Unmerged Door43 edit — verify", message: "custom reason A" }),
@@ -72,6 +73,94 @@ console.log("[same check, different message: NOT grouped together]");
   ];
   const groups = groupLintIssues(issues);
   check(groups.length === 2, "differing message text keeps issues in separate groups");
+}
+
+console.log("[issue #700: same check+reviewKind, different message: grouped together]");
+{
+  // The "solo 'kept over door43' note next to an otherwise-identical group of
+  // 3" shape from the issue — per-row detail (field lists, commit clauses)
+  // makes message vary even though it's the same finding.
+  const issues = [
+    issue({
+      ref: "3:1",
+      check: "Kept over Door43 — verify",
+      reviewKind: "merge_kept",
+      message: "Door43 changed Quote — kept this row's version.",
+    }),
+    issue({
+      ref: "3:2",
+      check: "Kept over Door43 — verify",
+      reviewKind: "merge_kept",
+      message: "Door43 changed Note — kept this row's version.",
+    }),
+    issue({
+      ref: "3:3",
+      check: "Kept over Door43 — verify",
+      reviewKind: "merge_kept",
+      message: "Door43 changed Quote and Note — kept this row's version.",
+    }),
+  ];
+  const groups = groupLintIssues(issues);
+  check(groups.length === 1, `same check+reviewKind groups despite differing message (got ${groups.length})`);
+  check(groups[0].issues.length === 3, "the group holds all 3 issues");
+}
+
+console.log("[same check, different reviewKind: NOT grouped together]");
+{
+  const issues = [
+    issue({ ref: "4:1", check: "Needs review", reviewKind: "merge_kept", message: "m" }),
+    issue({ ref: "4:2", check: "Needs review", reviewKind: "merge_conflict", message: "m" }),
+  ];
+  const groups = groupLintIssues(issues);
+  check(groups.length === 2, "differing reviewKind keeps issues in separate groups even with identical message");
+}
+
+console.log('[groupLintIssues mode "type": groups by check alone, ignoring message]');
+{
+  const issues = [
+    issue({ ref: "5:1", check: "Doubled space", message: "excerpt A" }),
+    issue({ ref: "5:2", check: "Doubled space", message: "excerpt B" }),
+    issue({ ref: "5:3", check: "Straight quote", message: "excerpt C" }),
+  ];
+  const groups = groupLintIssues(issues, "type");
+  check(groups.length === 2, `"type" mode groups by check alone (got ${groups.length})`);
+  check(
+    groups[0].issues.length === 2 && groups[1].issues.length === 1,
+    "the two 'Doubled space' issues share a group despite differing messages",
+  );
+}
+
+console.log("[sortLintIssues: 'default' mode is a no-op, preserving fetch order]");
+{
+  const issues = [issue({ ref: "3:5" }), issue({ ref: "1:1" }), issue({ ref: "2:9" })];
+  const sorted = sortLintIssues(issues, "default");
+  check(sorted === issues, "'default' returns the same array reference, unmodified order");
+}
+
+console.log("[sortLintIssues: 'verse' mode orders by chapter:verse]");
+{
+  const issues = [
+    issue({ ref: "3:5" }),
+    issue({ ref: "1:12" }),
+    issue({ ref: "1:2" }),
+    issue({ ref: "10:1" }),
+  ];
+  const sorted = sortLintIssues(issues, "verse");
+  check(
+    sorted.map((i) => i.ref).join(",") === "1:2,1:12,3:5,10:1",
+    `'verse' mode orders numerically, not lexically (got ${sorted.map((i) => i.ref).join(",")})`,
+  );
+  check(sorted !== issues, "'verse' mode returns a new array, leaving the input untouched");
+}
+
+console.log("[sortLintIssues: unparseable refs sort last rather than throwing]");
+{
+  const issues = [issue({ ref: "2:1" }), issue({ ref: "intro" }), issue({ ref: "1:1" })];
+  const sorted = sortLintIssues(issues, "verse");
+  check(
+    sorted.map((i) => i.ref).join(",") === "1:1,2:1,intro",
+    `unparseable ref sorts last (got ${sorted.map((i) => i.ref).join(",")})`,
+  );
 }
 
 console.log("[same check+message across resources: grouped together, resources preserved]");
