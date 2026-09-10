@@ -117,6 +117,7 @@ import type { TwlRow, VerseRow, CheckLane } from "./types";
 import {
   collapseWhitespaceForCompare,
   computeVerseMerge,
+  type VerseMergeAction,
   verseContentConverged,
   type VerseMergeResult,
 } from "./verseMerge.ts";
@@ -355,6 +356,12 @@ export interface ReimportCounts {
   // reconciled (master ambiguous for the source key). Left as-is, logged so the
   // residual potential clobber is visible. Normally zero.
   source_attr_divergent: number;
+  // Issue #641: edited verses whose master copy had not moved since our own
+  // confirmed publish (keep_master_unchanged / keep_converged), so the
+  // source-attr reconcile was skipped. Counted so the suppression stays
+  // visible: a spike here means ancestor recovery is over-reporting
+  // "master unchanged", not that there was nothing to reconcile.
+  source_attr_reconcile_skipped: number;
   // twl rows whose sort_order was rewritten by the canonical post-pass to match
   // the ULT-position ordering (the same order the nightly export computes). Lets
   // the reimport adopt canonical order back into D1 for content-identical rows
@@ -731,6 +738,7 @@ function zeroCounts(): ReimportCounts {
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
+    source_attr_reconcile_skipped: 0,
     twl_reordered: 0,
     merge_adopted: 0,
     merge_conflicts: 0,
@@ -956,6 +964,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.resurrected += from.resurrected;
   into.source_attr_reconciled += from.source_attr_reconciled;
   into.source_attr_divergent += from.source_attr_divergent;
+  into.source_attr_reconcile_skipped += from.source_attr_reconcile_skipped;
   into.twl_reordered += from.twl_reordered;
   into.merge_adopted += from.merge_adopted ?? 0;
   into.merge_conflicts += from.merge_conflicts ?? 0;
@@ -6062,6 +6071,9 @@ async function applyVerseRows(
       if (lastExportAt == null) {
         if (ex.content_json !== v.contentJson) counts.merge_unavailable++;
       }
+      // Issue #641: the merge outcome, kept for the source-attr reconcile gate
+      // below. null when no cutoff exists (no merge ran).
+      let mergeAction: VerseMergeAction | null = null;
       if (lastExportAt != null) {
         const merge = computeVerseMerge({
           base: verseContentJsonFromPayload(ex.base_payload ?? null),
@@ -6087,6 +6099,7 @@ async function applyVerseRows(
           // Issue #728: set only for the anchor of a bridge master has split.
           theirsForAlignment: structureAlignmentTheirs.get(structureKey(v.chapter, v.verse)),
         });
+        mergeAction = merge.action;
         // Issue #728: an anchor the content merge did NOT adopt — step 7s decides
         // whether the structure can still follow master (keep_converged) or the
         // component is kept whole and counted structure_refused.
@@ -6182,6 +6195,23 @@ async function applyVerseRows(
       // isn't reverted when the nightly export re-renders this verse. Staged into
       // a separate version-CAS batch below; if nothing reconciled it stays a plain
       // edited skip. (verses analogue of the TWL-PSA / Hebrew-NFC clobber class.)
+      // Issue #641: master has not moved since our own confirmed publish
+      // (`keep_master_unchanged`: theirs == base) or already matches D1
+      // (`keep_converged`). Nothing on master can be a Door43 source fix in
+      // either case — master's `\zaln-s` attrs ARE our own last render — so the
+      // two-way reconcile below would only be comparing the translator's in-app
+      // alignment against our stale bytes. With a repeated source word that
+      // read as "Door43's fix could not be placed" and minted a
+      // source_attr_ambiguous flag the editor could never clear (their next save
+      // resolved it, the next nightly re-minted it): EZK UST 22:26 / 33:9 /
+      // 45:11–12 on 2026-09-09, chapters no Door43 commit had touched. Skip the
+      // reconcile; `keep_no_base` (no ancestor, can't tell) and real master
+      // movement (the NUM 20–22 combining-mark fix) keep today's behavior.
+      if (mergeAction === "keep_master_unchanged" || mergeAction === "keep_converged") {
+        counts.skipped_edited++;
+        counts.source_attr_reconcile_skipped++;
+        continue;
+      }
       const rec = reconcileEditedVerseSourceAttrs(ex.content_json, v.contentJson);
       if (rec.divergent > 0) {
         counts.source_attr_divergent += rec.divergent;

@@ -109,6 +109,14 @@ function paragraphLayoutSx(mode: Mode) {
       fontSize: "0.95em",
       color: mode === "dark" ? "#bfd5e0" : "#345e74",
     },
+    // \qs (Selah) character wrapper — same muted-italic treatment as \d,
+    // since both are inline liturgical asides rather than ordinary verse
+    // prose.
+    "& span.be-qs": {
+      fontStyle: "italic",
+      fontSize: "0.95em",
+      color: mode === "dark" ? "#bfd5e0" : "#345e74",
+    },
     // \qa acrostic heading (Psalm 119 / Lamentations stanza letters). A small,
     // quiet heading label sitting above the poetry line it introduces — not a
     // section band (those are translator-supplied prose headings), just the

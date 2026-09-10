@@ -117,6 +117,36 @@ const srcWord = (text) => ({ text, tag: "w", type: "word", strong: "H0000", occu
   assert(verseObjects[0].occurrences === "1" && verseObjects[0].children[0].occurrences === "1", "outer and inner now occurrences=1");
 }
 
+// ─── Case 7: source \qs (Selah) wrapper is descended ────────────────────────
+// Production UHB wraps Selah's \zaln-s from OUTSIDE with `\qs` (docs/usfm-
+// alignment-audit.md §3). Before this fix, sourceTextTotals's walk only
+// descended `type:"milestone"` and a stale `type:"section" && tag:"d"` \d
+// check — a `\qs`-wrapped source word was never counted, so `trueTotal` came
+// back `undefined` for it and the appears-once correction below could never
+// fire, even though סֶלָה genuinely appears once in this source verse.
+{
+  console.log("\n[Case 7] source word wrapped in \\qs (Selah) is counted");
+  const source = [{ type: "quote", tag: "qs", endTag: "qs*", children: [srcWord("סֶלָה")] }];
+  const target = [zaln("סֶלָה", 2, 2, "Selah")];
+  const { changed, corrections, verseObjects } = correctSourceOccurrences(target, source);
+  assert(changed === true, "a \\qs-wrapped, appears-once source word is still corrected");
+  assert(corrections.length === 1, `one correction (got ${corrections.length})`);
+  assert(verseObjects[0].occurrence === "1" && verseObjects[0].occurrences === "1", "clamped to 1/1");
+}
+
+// ─── Case 8: real (typeless) \d Psalm superscription is descended ──────────
+// usfm-js 3.5.0 parses a real `\d` as `{tag:"d", text}` with NO `type` field
+// at all — the old `type:"section" && tag:"d"` gate matched nothing usfm-js
+// actually emits.
+{
+  console.log("\n[Case 8] source word inside a real (typeless) \\d is counted");
+  const source = [{ tag: "d", children: [srcWord("דָּוִד")] }];
+  const target = [zaln("דָּוִד", 2, 2, "David")];
+  const { changed, verseObjects } = correctSourceOccurrences(target, source);
+  assert(changed === true, "a \\d-wrapped, appears-once source word is still corrected");
+  assert(verseObjects[0].occurrence === "1" && verseObjects[0].occurrences === "1", "clamped to 1/1");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

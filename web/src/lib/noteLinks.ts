@@ -36,6 +36,28 @@ export type NoteSegment =
 // untouched by falling through to a plain "text" segment.
 const NOTE_LINK_RE = /\[([^\]\n]*)\]\((?:\.\.\/)+(?:([1-3]?[a-z]{2,3})\/)?(\d{2,3})\/(\d{2,3})\.md\)/g;
 
+// Matches the bare href of a "see how you translated this" link — e.g.
+// "../01/03.md" or "../../zec/02/05.md" — independent of its label. Used by
+// the markdown-preview renderer (NoteCard's react-markdown `a` component),
+// which only receives the href: react-markdown has already parsed
+// `[label](href)` into an element, so the label text isn't available to key
+// off of the way parseNoteSegments does. Same book/chapter/verse-code rules
+// as NOTE_LINK_RE above, kept as a separate literal regex rather than shared
+// so each stays a plain, independently-readable pattern.
+const NOTE_LINK_HREF_RE = /^(?:\.\.\/)+(?:([1-3]?[a-z]{2,3})\/)?(\d{2,3})\/(\d{2,3})\.md$/;
+
+export function resolveNoteLinkHref(href: string, currentBook: string): NoteLinkTarget | null {
+  const m = NOTE_LINK_HREF_RE.exec(href);
+  if (!m) return null;
+  const [, bookCode, chapterStr, verseStr] = m;
+  const targetBook = bookCode ? resolveBook(bookCode) : currentBook.toUpperCase();
+  if (!targetBook) return null;
+  const chapter = parseInt(chapterStr, 10);
+  const verse = parseInt(verseStr, 10);
+  if (chapter < 1 || verse < 1) return null;
+  return { book: targetBook, chapter, verse };
+}
+
 export function parseNoteSegments(text: string, currentBook: string): NoteSegment[] {
   const segments: NoteSegment[] = [];
   const re = new RegExp(NOTE_LINK_RE.source, NOTE_LINK_RE.flags);
