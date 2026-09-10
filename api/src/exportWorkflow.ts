@@ -81,8 +81,8 @@ import {
   sweepStaleMergeNoBase,
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
-import { dcsResourceFile, fetchDcsMasterText, fileHeadCommit, type ReimportResource } from "./dcsSources";
-import { gitBlobSha, findOurMergeForPr } from "./ownPublish";
+import { dcsResourceFile, fetchDcsMasterText, fileBlobShaAtCommit, fileHeadCommit, type ReimportResource } from "./dcsSources";
+import { gitBlobSha, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
 import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
@@ -1775,17 +1775,36 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // the same way accountOwnPublishDecline already does for the reimport
     // side (PR #704): the head's subject carries the export PR's number,
     // which recordPushedPr stamped onto book_resource_syncs for exactly the
-    // render that just merged. Never loosen this for any other author —
-    // findOurMergeForPr only matches an `ours`-classified commit whose
-    // subject quotes that specific PR number.
+    // render that just merged.
+    //
+    // The subject/PR-number match alone is NOT proof — Door43's merge job, or
+    // a manual branch edit, could land that same PR number with DIFFERENT
+    // bytes (a rewrite), and treating that as "nothing to revert" would be
+    // exactly the stale-D1-silently-reverts-master failure mode this whole
+    // gate exists to prevent (PR #750 review). So the match is only a
+    // candidate; judgeOwnPublishDecline's byte comparison against
+    // pushed_blob_sha — the SAME check accountOwnPublishDecline already makes
+    // for the reimport side — decides for real. Only a `preserved` verdict
+    // (merge landed exactly the bytes we pushed) counts as current; anything
+    // else, including `rewritten`, falls through to master_ahead unchanged.
     const pushedPr = await this.env.DB.prepare(
-      `SELECT pushed_pr_number FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+      `SELECT pushed_pr_number, pushed_blob_sha FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
     )
       .bind(book, resource)
-      .first<{ pushed_pr_number: number | null }>();
+      .first<{ pushed_pr_number: number | null; pushed_blob_sha: string | null }>();
     const headCommit: MasterCommit = { sha: head.sha, message: head.message, authorEmail: head.authorEmail };
-    const ownMerge = findOurMergeForPr([classifyMasterCommit(headCommit)], pushedPr?.pushed_pr_number ?? null);
-    if (ownMerge.found) return { ok: true, detail: "own_publish", masterSha: head.sha, watermark };
+    const classifiedHead = classifyMasterCommit(headCommit);
+    const ownMerge = findOurMergeForPr([classifiedHead], pushedPr?.pushed_pr_number ?? null);
+    if (ownMerge.found && pushedPr?.pushed_blob_sha) {
+      const mergedBlobSha = await fileBlobShaAtCommit(this.env, file.repo, file.path, head.sha);
+      const judged = judgeOwnPublishDecline({
+        ourMerge: ownMerge,
+        mergedBlobSha,
+        pushedBlobSha: pushedPr.pushed_blob_sha,
+        newest: classifiedHead,
+      });
+      if (judged.verdict === "preserved") return { ok: true, detail: "own_publish", masterSha: head.sha, watermark };
+    }
 
     return { ok: false, detail: "master_ahead", masterSha: head.sha, watermark };
   }
