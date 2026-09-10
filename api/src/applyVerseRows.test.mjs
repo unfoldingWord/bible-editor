@@ -337,12 +337,20 @@ console.log("\n[#540 item 2: an AI-only master movement never overwrites a later
     eq(counts.merge_adopted, 0, "…no adoption is counted");
     eq(counts.merge_kept_ai, 1, "…it is counted as merge_kept_ai");
     eq(counts.merge_refused, 0, "…never as a refusal, which at 5 freezes the whole resource's export");
-    const conflict = sqlite
-      .prepare("SELECT action, reason, overwritten_version FROM verse_merge_conflicts WHERE book = ? AND chapter = 4")
-      .all(BOOK)[0];
-    eq(conflict.action, "keep_ai_master", "…and a review row is recorded so a human still sees the collision");
-    eq(conflict.reason, "both_changed_ai_master", "…with the measured reason");
-    eq(conflict.overwritten_version, null, "…and no recovery pointer, because nothing was overwritten");
+    // Issue #749: NO durable review row. The outcome rests on a complete lineage
+    // walk that found no Door43 editor's commit behind master's side, so nothing
+    // was taken from Door43 and the next export publishes the kept version —
+    // there is nothing for a translator to recover or decide, yet a
+    // verse_merge_conflicts row would have sat in the "Sync flagged N verse(s)"
+    // banner until somebody edited or dismissed the verse. The run summary's
+    // merge_kept_ai counter (asserted above) and the capped log line are what
+    // report it now.
+    const conflicts = sqlite
+      .prepare("SELECT action, reason FROM verse_merge_conflicts WHERE book = ? AND chapter = 4")
+      .all(BOOK);
+    eq(conflicts, [], "…and NO verse_merge_conflicts row is recorded (#749)");
+    eq(counts.merge_conflicts, 0, "…so it is not counted as a conflict needing review either");
+    eq(counts.merge_master_wins, 0, "…and never as a master-wins flag: it is a D1-wins outcome");
   }
 
   {
@@ -2273,9 +2281,11 @@ console.log("\n[#641: no source-attr reconcile when master has not moved since o
     );
     eq(counts.merge_kept_ai, 1, "control: both changed, AI-only master → keep_ai_master");
     eq(counts.source_attr_divergent > 0, true, "…and the reconcile STILL runs against a master that moved");
-    // One verse_merge_conflicts row per verse: the source_attr_divergent push
-    // lands after keep_ai_master's and is the one the banner shows.
-    eq(conflictActions(sqlite).includes("source_attr_divergent"), true, "…and still records the ambiguous-attr review row");
+    // Since #749 the keep_ai_master outcome pushes nothing, so the
+    // source_attr_divergent row is the ONLY one this verse records — and it must
+    // still be recorded: a source-owned fix that could not be placed is a real
+    // thing for a human to do, unrelated to who won the target text.
+    eq(conflictActions(sqlite), ["source_attr_divergent"], "…and still records the ambiguous-attr review row, alone");
     eq(readRow(sqlite).content_json, oursJson, "…while the translator's text is still kept");
   }
 
