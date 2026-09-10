@@ -23,16 +23,26 @@ import {
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import { api, type BookTrashRow } from "../sync/api";
 
+// Same interval useAlerts.ts polls system_alerts on, for the same reason: no
+// realtime path covers this. The chapter WebSocket only fans out events for
+// the chapter currently in view, so a collaborator trashing a note in a
+// DIFFERENT chapter of this book has no socket to notify this tab on. Without
+// a poll, a tab that mounted (or last refetched) with nothing trashed stays
+// on `total === 0` — which renders null, per below — forever: refreshSignal
+// only bumps for THIS tab's own trash/restore calls, and there is no icon
+// left to click to trigger the menu-open refetch either. The poll runs via
+// the effect below regardless of what this component currently renders
+// (hooks run every mount independent of the early return), so it's the one
+// path that can take `total` from 0 back to something visible.
+const POLL_MS = 30_000;
+
 interface Props {
   book: string;
   onNavigate: (book: string, chapter: number, verse?: number) => void;
   // Bumped by Shell whenever handleTrashNote/handleRestoreNote succeeds
-  // (anywhere in the book, not just the currently open chapter) — the only
-  // signal this indicator has that the list needs refetching. Without it, a
-  // book with nothing trashed at mount renders nothing (see the total === 0
-  // early return below) and never gets another chance to notice a note
-  // trashed afterward, since opening the menu is the *other* refresh trigger
-  // and there'd be no icon left to click.
+  // (anywhere in the book, not just the currently open chapter). A fast path
+  // for this tab's own actions — the poll above is what covers everyone
+  // else's.
   refreshSignal: number;
   // Routes through Shell's handleRestoreNote so a restore here gets the same
   // optimistic local patch, lint-chip refresh, and failure toast (including a
@@ -59,7 +69,7 @@ export function BookTrashIndicator({ book, onNavigate, refreshSignal, onRestore 
       .catch(() => setRows([]));
   };
 
-  // Refetch on book change and on every trash/restore anywhere in the book
+  // Refetch on book change and on every trash/restore this tab made
   // (refreshSignal), and again each time the menu opens so a note trashed by
   // someone else this session shows up without a reload.
   useEffect(() => {
@@ -73,6 +83,26 @@ export function BookTrashIndicator({ book, onNavigate, refreshSignal, onRestore 
       cancelled = true;
     };
   }, [book, refreshSignal]);
+
+  // Poll while the tab is visible, and refetch immediately on regaining
+  // visibility — the only path that notices a COLLABORATOR's trash (see the
+  // POLL_MS comment above). Deliberately keyed on `book` alone, not
+  // `refreshSignal`: restarting this interval on every local trash/restore
+  // would just waste a request, since that path already refetches above.
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible") load();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") load();
+    }, POLL_MS);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [book]);
 
   const total = rows.length;
   if (total === 0) return null;
