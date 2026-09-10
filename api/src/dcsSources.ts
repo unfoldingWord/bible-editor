@@ -426,7 +426,7 @@ export async function listMasterCommitsSince(
   repo: string,
   path: string | null,
   sinceSha: string | null,
-  opts: { pageLimit?: number; sinceTime?: number | null; files?: boolean; timeoutMs?: number } = {},
+  opts: { pageLimit?: number; sinceTime?: number | null; files?: boolean; timeoutMs?: number; fromSha?: string } = {},
 ): Promise<MasterCommitPage> {
   const pageLimit = opts.pageLimit ?? 5;
   // The watermark bound, in unix seconds. When present it REPLACES the sha as
@@ -443,11 +443,19 @@ export async function listMasterCommitsSince(
   const headers: Record<string, string> = { Accept: "application/json" };
   if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
 
+  // `sha=` ordinarily names the branch to walk from master's live tip. Gitea's
+  // commits-list endpoint accepts any commit sha there too, listing that
+  // commit and its ancestors — which is what lets a caller resume a backward
+  // walk from a HISTORICAL point instead of always starting over at the tip
+  // (issue #692 item 2's gap backfill: `fromSha` is the near edge of a
+  // recorded hole, `sinceSha` its far edge).
+  const walkFrom = opts.fromSha ?? "master";
+
   const out: MasterCommit[] = [];
   for (let page = 1; page <= pageLimit; page++) {
     const url =
       `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
-      `/commits?sha=master` +
+      `/commits?sha=${encodeURIComponent(walkFrom)}` +
       (path ? `&path=${encodeURIComponent(path)}` : "") +
       `&page=${page}&stat=false&verification=false&files=${opts.files === true ? "true" : "false"}`;
     let batch: Array<Record<string, unknown>>;
@@ -509,10 +517,14 @@ export async function listMasterCommitsSince(
       // "master's previous tip" only for a commit made directly on master or for
       // a merge commit; under repo-scoped history the list also contains commits
       // that arrived on a feature branch, whose first parent is their own branch
-      // predecessor. A merge's SECOND parent (the merged branch) is deliberately
-      // not stored — first-parent is the line "walking master back" follows.
+      // predecessor. `parentSha` (below) stores ONLY this — first-parent is the
+      // line "walking master back" has always meant, matching dcs_commits.parent_sha.
+      // `allParentShas` keeps every parent — a merge's second (and any further)
+      // parent, discarded until issue #692 item 2 needed them to compute a gap
+      // backfill's frontier correctly (see MasterCommit.allParentShas).
       const parents = Array.isArray(raw.parents) ? (raw.parents as Array<Record<string, unknown>>) : [];
-      const parentSha = typeof parents[0]?.sha === "string" ? (parents[0].sha as string) : null;
+      const allParentShas = parents.map((p) => p?.sha).filter((s): s is string => typeof s === "string");
+      const parentSha = allParentShas[0] ?? null;
       // Only present when the caller asked (`files: true`); `null` distinguishes
       // "asked and got none" from "never asked" (undefined).
       const rawFiles = Array.isArray(raw.files) ? (raw.files as Array<Record<string, unknown>>) : null;
@@ -531,6 +543,7 @@ export async function listMasterCommitsSince(
         // this endpoint alongside commit.author — see the ledger's committed_at.
         committerDate: typeof committer.date === "string" ? committer.date : null,
         parentSha,
+        allParentShas,
         ...(opts.files === true ? { files } : {}),
       });
     }

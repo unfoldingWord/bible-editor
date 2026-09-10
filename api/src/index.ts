@@ -19,6 +19,7 @@ import { alignmentAttention } from "./alignmentAttention";
 import { verseMergeConflicts } from "./verseMergeConflicts";
 import { comments } from "./comments";
 import { pollDcsCommits } from "./dcsCommitPoll";
+import { backfillDcsGaps } from "./dcsCommitBackfill";
 import { dcsCommits } from "./dcsCommits";
 import { books } from "./bookImport";
 import { bookLockGuard } from "./bookLockGuard";
@@ -364,6 +365,16 @@ export default {
         await pollDcsCommits(env);
       } catch (e) {
         console.error("dcs commit poll tick failed", e instanceof Error ? e.message : String(e));
+      }
+      // Slow backfill of any coverage hole the poll above (or a past one)
+      // recorded on dcs_repo_polls.gap_since_sha — issue #692 item 2. A few
+      // extra pages per repo per tick, same wrapping as the poll itself: this
+      // is ledger completeness, not a gating dependency yet, so it must never
+      // fail the rest of the cron tick.
+      try {
+        await backfillDcsGaps(env);
+      } catch (e) {
+        console.error("dcs commit backfill tick failed", e instanceof Error ? e.message : String(e));
       }
       // Once-per-hour edit_log retention sweep. 180 days is defensive — we
       // don't have a real policy yet, but the table grows without bound

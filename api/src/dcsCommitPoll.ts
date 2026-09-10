@@ -95,6 +95,8 @@ export interface DcsPollStateRow {
   last_status: string | null;
   gap_since_sha: string | null;
   gap_at: number | null;
+  /** JSON array of shas — see computeGapFrontier. Null/empty means no gap. */
+  gap_frontier_json: string | null;
 }
 
 /**
@@ -143,6 +145,12 @@ export interface LedgerRow {
   repo: string;
   sha: string;
   parentSha: string | null;
+  /**
+   * EVERY parent (see MasterCommit.allParentShas). Transient — never written
+   * to dcs_commits, which stores only `parentSha` (first-parent, unchanged).
+   * Used solely to compute a gap's frontier (computeGapFrontier below).
+   */
+  parentShas: string[];
   authorName: string | null;
   authorEmail: string | null;
   committedAt: number | null;
@@ -298,6 +306,10 @@ export function ledgerRowsFromCommits(
       repo,
       sha: c.sha,
       parentSha: c.parentSha ?? null,
+      // Falls back to a single-entry array when a caller (or a stubbed test
+      // fixture predating issue #692 item 2's rework) supplied only
+      // `parentSha` — never fewer parents than the field we've always had.
+      parentShas: c.allParentShas ?? (c.parentSha ? [c.parentSha] : []),
       authorName: c.authorName ?? null,
       authorEmail: c.authorEmail ?? null,
       committedAt: Number.isFinite(at) ? Math.floor(at / 1000) : null,
@@ -319,7 +331,59 @@ export function advancesDespiteIncomplete(reason: string): boolean {
   return reason === "page_cap" || reason === "source_sha_not_in_history";
 }
 
-const INSERT_COMMIT_SQL = `INSERT INTO dcs_commits
+/**
+ * The FRONTIER of a capped walk: every parent of a visited row that is not
+ * ITSELF visited (and is not the far edge we already know about). Issue #692
+ * item 2's Codex review (P1, PR #734) found the original single-sha
+ * `gap_from_sha` design wrong: it took only the OLDEST row's FIRST parent,
+ * which is correct for a simple chain but silently drops history the moment
+ * a merge commit sits anywhere in the walked range — repo-scoped history is
+ * ~26% merge commits (see classifyForLedger's doc comment above), so this is
+ * the common case, not an edge one. A merge commit's second (or later)
+ * parent leads to a branch whose own history may extend arbitrarily far
+ * past the point where the mainline parent chain was cut, and resuming from
+ * only the mainline parent can never reach it — the walk would eventually
+ * report `source_sha_not_in_history` (having exhausted the mainline's own
+ * root) and the caller would read that as "fully backfilled", while the
+ * other branch's commits were never fetched at all.
+ *
+ * A single sha cannot represent an arbitrary DAG cut, so the frontier is a
+ * SET: every not-yet-visited parent across every row this walk visited. For
+ * an ordinary linear range (the common case in practice) this is exactly
+ * the one entry the old code computed; it only grows past one entry when a
+ * merge is actually present in the range, which is exactly when a single
+ * entry would have been wrong.
+ */
+export function computeGapFrontier(rows: LedgerRow[], gapSinceSha: string | null): string[] {
+  const visited = new Set(rows.map((r) => r.sha));
+  const frontier = new Set<string>();
+  for (const r of rows) {
+    for (const p of r.parentShas) {
+      if (!p || visited.has(p) || p === gapSinceSha) continue;
+      frontier.add(p);
+    }
+  }
+  return Array.from(frontier);
+}
+
+/**
+ * Never throws: a malformed or non-array gap_frontier_json reads as empty.
+ * Exported so dcsCommitBackfill.ts and dcsCommits.ts share one parser rather
+ * than three copies that could drift.
+ */
+export function parseGapFrontier(json: string | null): string[] {
+  if (json == null) return [];
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+// Exported so dcsCommitBackfill.ts (issue #692 item 2) writes the exact same
+// statement rather than a second copy that could drift from it.
+export const INSERT_COMMIT_SQL = `INSERT INTO dcs_commits
    (repo, sha, parent_sha, author_name, author_email, committed_at, message,
     classification, classification_reason, files_json, seen_at)
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -339,8 +403,8 @@ const CLAIM_ATTEMPT_SQL = `INSERT INTO dcs_repo_polls (repo, last_attempted_at)
 
 const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
-    last_status, gap_since_sha, gap_at)
- VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+    last_status, gap_since_sha, gap_at, gap_frontier_json)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10)
  ON CONFLICT (repo) DO UPDATE SET
    -- ?9 = "the ingest completed, advance the mark". last_sha and
    -- last_committed_at move TOGETHER off that one flag (review finding F12):
@@ -357,14 +421,30 @@ const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    -- the other way and let each new gap overwrite the previous one, so a repo
    -- that hit its page cap twice reported only the second hole and looked more
    -- contiguous than it was. Coverage claims must err conservative: the field
-   -- means "history below this sha is not proven contiguous", and only a
-   -- backfill that actually closes the hole may clear it (no code clears it
-   -- today — that is the follow-up this table is shaped for). Set as a pair
-   -- with gap_at, for the same reason as last_sha/last_committed_at above.
+   -- means "history below this sha is not proven contiguous", and only the
+   -- backfill path (dcsCommitBackfill.ts, issue #692 item 2) that actually
+   -- closes the hole clears it. gap_since_sha/gap_at are a pair that must
+   -- never move once an older gap already claimed them, for the same reason
+   -- as last_sha/last_committed_at above — a regular poll touching either
+   -- would silently discard the backfill's target out from under it.
    gap_since_sha = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
                           THEN excluded.gap_since_sha ELSE dcs_repo_polls.gap_since_sha END,
    gap_at = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
-                   THEN excluded.gap_at ELSE dcs_repo_polls.gap_at END`;
+                   THEN excluded.gap_at ELSE dcs_repo_polls.gap_at END,
+   -- gap_frontier_json is DIFFERENT (Codex review round 2, P1): it is not
+   -- "keep old, ignore new" but "keep old, ADD new". The caller has already
+   -- unioned any prior frontier into excluded.gap_frontier_json (see the
+   -- comment on gapFrontier in pollDcsRepo) whenever THIS poll also found
+   -- a fresh capped range, so the only case that must fall back to the
+   -- existing column is "this poll completed cleanly and found nothing new
+   -- to add" — recognisable because the caller binds NULL there (no new gap
+   -- this tick). Discarding a newer hole's frontier the way the old CASE did
+   -- (mirroring gap_since_sha's guard) meant backfill — which only ever
+   -- walks the frontier it has — could never reach a hole that opened after
+   -- an older one was already in progress; clearing the older gap would
+   -- then report full coverage with those commits still missing.
+   gap_frontier_json = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL OR excluded.gap_frontier_json IS NOT NULL
+                              THEN excluded.gap_frontier_json ELSE dcs_repo_polls.gap_frontier_json END`;
 
 export interface RepoPollResult {
   repo: string;
@@ -383,7 +463,7 @@ export interface RepoPollResult {
 export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): Promise<RepoPollResult> {
   const state = await env.DB.prepare(
     `SELECT repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
-            last_status, gap_since_sha, gap_at
+            last_status, gap_since_sha, gap_at, gap_frontier_json
        FROM dcs_repo_polls WHERE repo = ?1`,
   )
     .bind(repo)
@@ -417,6 +497,31 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
     dropped > 0 || (page.incomplete && advancesDespiteIncomplete(page.incompleteReason))
       ? (sinceSha ?? rows[rows.length - 1]?.sha ?? null)
       : null;
+  // NEAR edge(s) of the hole, for the backfill path (issue #692 item 2) to
+  // resume from — see computeGapFrontier for why this is a SET, not the
+  // single oldest-row's-first-parent the original version of this used
+  // (Codex review, PR #734: wrong the moment a merge sits in the walked
+  // range). Empty only if every parent in this walk was already visited or
+  // is gapSince itself — dcsCommitBackfill.ts treats an empty frontier as
+  // unresolvable and drops the gap rather than retrying forever with
+  // nothing to walk.
+  //
+  // UNIONED with whatever frontier is ALREADY on the row (Codex review round
+  // 2, P1). "Oldest gap wins" keeps gap_since_sha/gap_at at the FIRST gap's
+  // boundary when a second one opens while backfill hasn't finished the
+  // first — correct, since that boundary is the more conservative (older)
+  // claim. But the ORIGINAL version of this fix then discarded the NEW
+  // gap's frontier outright (same CASE guard, applied to all three
+  // columns): backfill only ever walks the OLD frontier toward the OLD
+  // target, so it can never discover a hole that opened later and closer to
+  // the tip — clearing the old gap would then report full coverage with
+  // those commits still missing. Every entry, old and new, walks toward the
+  // SAME (oldest) gap_since_sha; a newer entry just has farther to walk,
+  // which costs extra (harmless, ON-CONFLICT-DO-NOTHING) re-insertion of
+  // already-covered ground on the way, not a correctness gap.
+  const priorFrontier = state?.gap_since_sha != null ? parseGapFrontier(state.gap_frontier_json) : [];
+  const gapFrontier = gapSince != null ? Array.from(new Set([...priorFrontier, ...computeGapFrontier(rows, gapSince)])) : [];
+  const gapFrontierJson = gapSince != null ? JSON.stringify(gapFrontier) : null;
 
   // CHUNKED, because D1 caps a batch at 100 statements (documented at
   // bookImport.ts's CHUNK and bookReimport.ts's WRITE_BATCH). A single batch of
@@ -460,6 +565,9 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
     gapSince ? nowSeconds : null,
     // ?9 — advance the (last_sha, last_committed_at) pair, or leave both.
     advance ? 1 : 0,
+    // ?10 — gap_frontier_json, part of the gap triple (only lands when this
+    // is the gap that wins, per the CASE guards above).
+    gapFrontierJson,
   );
 
   // The poll upsert rides in the LAST chunk, so the watermark can only advance

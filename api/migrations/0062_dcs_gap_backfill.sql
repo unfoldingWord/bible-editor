@@ -1,0 +1,32 @@
+-- Issue #692 item 2: a resume cursor for backfilling dcs_repo_polls'
+-- gap_since_sha holes.
+--
+-- gap_since_sha alone names the FAR (older) edge of a hole — the previous
+-- high-water mark a capped walk failed to reach — but not the NEAR (newer)
+-- edge, i.e. where a backward walk should start. Without that, a backfill
+-- pass would have to rediscover the start point every tick (by re-walking
+-- from master's tip, which is exactly the expensive walk the gap exists
+-- to avoid).
+--
+-- gap_frontier_json is that near edge — a JSON array of shas, not a single
+-- one. An earlier version of this migration added a single-sha
+-- `gap_from_sha` (the oldest inserted commit's FIRST parent); PR #734's
+-- review (Codex, P1) found that wrong the moment a merge commit sits in the
+-- capped range: a merge's second parent leads to a branch whose own history
+-- can extend arbitrarily past where the first-parent chain was cut, and a
+-- single resume sha can never reach it. Repo-scoped Door43 history is
+-- measured ~26% merge commits (dcsCommitPoll.ts's classifyForLedger doc
+-- comment), so this is the common case, not an edge one. The frontier is
+-- therefore every not-yet-visited parent of every row a capped walk visited
+-- (dcsCommitPoll.ts's computeGapFrontier) — for an ordinary linear range
+-- this is exactly the one entry the old column held; it only grows past one
+-- when a merge is actually present, which is exactly when one entry would
+-- have been wrong. This migration was never released (caught in review
+-- before merge), so it replaces the column outright rather than adding a
+-- second one to migrate away from.
+--
+-- Same "oldest gap wins" discipline as gap_since_sha/gap_at (0059): set once
+-- when a gap opens, entries removed (and any new ones a sub-walk discovers
+-- added) as a backfill pass makes progress, and cleared together with the
+-- other two the moment the frontier is empty. See dcsCommitBackfill.ts.
+ALTER TABLE dcs_repo_polls ADD COLUMN gap_frontier_json TEXT;

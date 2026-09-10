@@ -215,6 +215,20 @@ export interface MasterCommit {
    */
   parentSha?: string | null;
   /**
+   * EVERY parent sha (1 for an ordinary commit, 2+ for a merge — Gitea's
+   * `parents` array verbatim). `parentSha` above is just this array's first
+   * element, kept as its own field because it is what "walking master back"
+   * has always meant and every existing reader expects a single value.
+   * `allParentShas` exists ONLY for issue #692 item 2's gap backfill: a
+   * capped walk's frontier is every visited row's parents that are not
+   * themselves visited, and a merge commit's SECOND parent is a real,
+   * common (measured ~26% of repo-scoped history is merge commits — see
+   * dcsCommitPoll.ts) way for a whole branch's history to go missing if the
+   * frontier is tracked as first-parent only. Never classified on; absent
+   * unless the caller asked (mirrors `files` above).
+   */
+  allParentShas?: string[];
+  /**
    * In-repo paths the commit touched, from the list endpoint's own
    * `files=true`. Requested only by callers that pass `{ files: true }` to
    * listMasterCommitsSince; undefined means "not requested", null means
