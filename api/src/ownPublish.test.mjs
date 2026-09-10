@@ -27,6 +27,7 @@
 // test that only checks the new behavior can't tell you it was ever broken.
 
 import { findOurMergeForPr, gitBlobSha, judgeOwnPublishDecline, recognizeOwnPublish } from "./ownPublish.ts";
+import { classifyMasterCommit } from "./masterLineage.ts";
 import { computeVerseMerge } from "./verseMerge.ts";
 
 let failed = 0;
@@ -374,6 +375,72 @@ const humanRevert = { sha: "0badc0ffee00", kind: "human", date: "2026-09-02T07:0
   const notFound = judgeOwnPublishDecline({ ourMerge: { found: false, reason: "merge_pending" }, mergedBlobSha: null, pushedBlobSha: PUSHED_0902, newest: botPush });
   eq(notFound.verdict, "unmeasured", "no merge to measure → unmeasured");
   eq(notFound.reason, "merge_pending", "…carrying step 1's reason");
+}
+
+// --- issue #748: checkMasterFreshness's own-publish recognition --------------
+//
+// exportWorkflow.ts's checkMasterFreshness runs BEFORE the export, so a second
+// export shortly after the first one's PR merges sees master's head as ITS OWN
+// just-merged squash commit — book_resource_syncs.source_sha only advances on
+// the NEXT successful sync. Reproduces the DAN TN 2026-09-08 case: master
+// b5ccb926 (subject `bible-editor: DAN tn → master (#7624)`) vs the stale
+// watermark 9584662b, with pushed_pr_number = 7624 on record. classifyMasterCommit
+// + findOurMergeForPr — exactly what checkMasterFreshness calls on the single
+// head commit it fetches — must recognize this as `own_publish`, not
+// `master_ahead`; a foreign author's commit quoting the same tag must not.
+{
+  const danHead = classifyMasterCommit({
+    sha: "b5ccb926",
+    message: "bible-editor: DAN tn → master (#7624)",
+    authorEmail: "deferredreward@users.noreply.git.door43.org",
+  });
+  eq(danHead.kind, "ours", "sanity: the squash commit classifies ours");
+  const recognized = findOurMergeForPr([danHead], 7624);
+  eq(recognized.found, true, "DAN TN 09-08: master's head is recognized as our own just-merged export");
+  eq(recognized.commit?.sha, "b5ccb926", "…citing that exact commit");
+
+  // A real Door43 commit on top must still read as master_ahead — the whole
+  // point of matching on OUR pr number is to never loosen this for anyone else.
+  const foreignHead = classifyMasterCommit({
+    sha: "deadbeef01",
+    message: "Richmahn hand-edit DAN 3:12",
+    authorEmail: "richmahn@example.test",
+  });
+  eq(findOurMergeForPr([foreignHead], 7624).found, false, "a foreign commit is never mistaken for our merge");
+
+  // No PR on record for the current push (creation failed, or nothing synced
+  // yet) → decline, same as any other unmeasured case.
+  eq(findOurMergeForPr([danHead], null).found, false, "no pushed_pr_number on record → nothing to recognize");
+
+  // The subject/PR-number match is only a CANDIDATE, never proof by itself
+  // (PR #750 review, P1): Door43's merge job — or a manual branch edit —
+  // could land that same PR number with bytes OTHER than what we pushed, and
+  // treating that as "nothing to revert" is exactly the stale-D1-reverts-master
+  // failure mode the freshness gate exists to prevent. checkMasterFreshness
+  // must run the byte check too, via judgeOwnPublishDecline — the SAME
+  // pushed_blob_sha comparison accountOwnPublishDecline already makes for
+  // the reimport side.
+  const ownMerge = findOurMergeForPr([danHead], 7624);
+  const preserved = judgeOwnPublishDecline({
+    ourMerge: ownMerge,
+    mergedBlobSha: "f8bacfca3bb4", // matches what we pushed
+    pushedBlobSha: "f8bacfca3bb4",
+    newest: danHead,
+  });
+  eq(preserved.verdict, "preserved", "merge landed exactly the bytes we pushed → safe to treat master as current");
+
+  const rewritten = judgeOwnPublishDecline({
+    ourMerge: ownMerge,
+    mergedBlobSha: "0000deadbeef", // the merge job (or a hand edit) changed the bytes
+    pushedBlobSha: "f8bacfca3bb4",
+    newest: danHead,
+  });
+  eq(
+    rewritten.verdict,
+    "rewritten",
+    "the P1 case: same PR number, DIFFERENT bytes on master → must NOT be recognized as own_publish " +
+      "(an export now would silently revert master's real content)",
+  );
 }
 
 if (failed > 0) {
