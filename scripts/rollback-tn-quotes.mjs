@@ -51,12 +51,21 @@ let missing = 0;
 for (const { book, id } of targets.values()) {
   const r = byKey.get(`${book}|${id}`);
   if (!r) { missing++; out.push(`-- NOT IN DUMP, cannot restore: ${book} ${id}`); continue; }
+  // Guarded on the version the repair LEFT the row at. Without it, a rollback
+  // run after a translator has edited the row would silently discard their
+  // quote and rewind the version — and reusing an already-issued version number
+  // lets the next edit produce a duplicate version-history entry. With the
+  // guard, a row that has moved on is simply left alone (and reported by the
+  // count mismatch below).
   out.push(
-    `UPDATE tn_rows SET quote = '${esc(r.quote)}', version = ${Number(r.version)}`,
-    `  WHERE book = '${esc(book)}' AND id = '${esc(id)}';`,
+    `UPDATE tn_rows SET quote = '${esc(r.quote)}', version = ${Number(r.version)}, updated_at = unixepoch()`,
+    `  WHERE book = '${esc(book)}' AND id = '${esc(id)}' AND version = ${Number(r.version) + 1};`,
   );
 }
 const outDir = resolve(repoRoot, "scripts/out");
 if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
 writeFileSync(resolve(outDir, "rollback-tn-quotes.sql"), out.join("\n"), "utf8");
 console.log(`wrote rollback for ${targets.size - missing} row(s)` + (missing ? `; ${missing} not found in the dump` : ""));
+console.log("each UPDATE is guarded on the post-repair version — compare the reported");
+console.log("`changes` against this count when applying; a shortfall means those rows");
+console.log("were edited after the repair and were deliberately left untouched.");

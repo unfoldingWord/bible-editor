@@ -49,6 +49,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveTnQuote, sourceWordsByRef, wordsForRow } from "../api/src/lint.ts";
+import { PUBLISHED_BOOKS } from "../api/src/publishedGuard.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -87,6 +88,19 @@ for (const r of srcRows) {
 const wordsByBook = new Map();
 for (const [book, rows] of srcByBook) wordsByBook.set(book, sourceWordsByRef(rows));
 
+// A LOCKED book is published; bible-editor is no longer its source of truth and
+// must not write to it. Those findings go to an admin to apply on Door43 by
+// hand (scripts/split-fixes-by-lock.mjs builds the worksheet). Mirrors
+// effectiveBookLock: an explicit book_locks row wins either way, otherwise a
+// published book is locked by default. With no locks dump we fail CLOSED and
+// treat every published book as locked, because guessing the other way writes
+// to a published book.
+const lockRows = process.env.BOOK_LOCKS && existsSync(resolve(repoRoot, process.env.BOOK_LOCKS))
+  ? rowsOf(process.env.BOOK_LOCKS)
+  : [];
+const explicitLock = new Map(lockRows.map((r) => [r.book, Number(r.locked) === 1]));
+const isLocked = (book) => (explicitLock.has(book) ? explicitLock.get(book) : PUBLISHED_BOOKS.has(book));
+
 const sqlEscape = (s) => s.replace(/'/g, "''");
 
 // A `-- comment` line ends at the first newline, so a stored quote containing
@@ -116,14 +130,17 @@ for (const r of tnRows) {
 // Repair ONLY confident suggestions. An unconfident one had to re-use a source
 // position already claimed by an earlier quote word, so de-duplicating it can
 // delete a real word (see the 2KI 16:17 note on QuoteVerdict.confident).
-const repairable = failures.filter((f) => f.verdict.suggestion && f.verdict.confident);
+const confident = failures.filter((f) => f.verdict.suggestion && f.verdict.confident);
+const repairable = confident.filter((f) => !isLocked(f.row.book));
+const lockedOut = confident.filter((f) => isLocked(f.row.book));
 const manual = failures.filter((f) => !f.verdict.suggestion || !f.verdict.confident);
 
 const byBook = new Map();
 for (const f of failures) byBook.set(f.row.book, (byBook.get(f.row.book) ?? 0) + 1);
 
 console.log(`checked ${checked} tn rows with a source verse`);
-console.log(`unresolvable: ${failures.length}  (repairable ${repairable.length}, manual ${manual.length})`);
+console.log(`unresolvable: ${failures.length}  (repairable ${repairable.length}, manual ${manual.length}` +
+  (lockedOut.length ? `, ${lockedOut.length} withheld: locked book` : "") + ")");
 console.log("\nby book:");
 for (const [book, n] of [...byBook].sort((a, b) => b[1] - a[1])) {
   console.log(`  ${book.padEnd(5)} ${n}`);
@@ -198,11 +215,21 @@ for (const f of repairable) {
     // Audit row, same shape the app writes for a quote edit (a PARTIAL payload
     // of just the changed fields — see edit_log for kind='tn'). A direct SQL
     // repair would otherwise be the one kind of change with no history entry,
-    // and the version-history dialog would show the quote changing from
-    // nowhere. Guarded by the same version so it only lands if the UPDATE did.
+    // and the version-history dialog would show the quote changing from nowhere.
+    //
+    // action is 'update', NOT a bespoke verb: the history replay and the
+    // reimport ancestor reconstruction only consume create / update / restore,
+    // so a custom action would be silently skipped — an audit row that exists
+    // but is invisible is worse than none.
+    //
+    // Gated on `changes()`, NOT on the row's version. Testing `version = old+1`
+    // would also match a row that an ordinary concurrent edit had independently
+    // advanced to that number, filing someone else's edit as a quote repair.
+    // changes() reflects the immediately preceding UPDATE on this connection,
+    // which is the same guard the app's write path uses.
     `INSERT INTO edit_log (kind, row_key, book, prev_version, new_version, action, payload_json)`,
-    `  SELECT 'tn', id, book, version - 1, version, 'repair-quote-source-order', json_object('quote', quote)`,
-    `    FROM tn_rows WHERE book = '${sqlEscape(f.row.book)}' AND id = '${sqlEscape(f.row.id)}' AND version = ${Number(f.row.version) + 1};`,
+    `  SELECT 'tn', id, book, version - 1, version, 'update', json_object('quote', quote)`,
+    `    FROM tn_rows WHERE book = '${sqlEscape(f.row.book)}' AND id = '${sqlEscape(f.row.id)}' AND changes() > 0;`,
     "",
   );
 }
