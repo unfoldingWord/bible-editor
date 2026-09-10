@@ -51,6 +51,16 @@
 // need nobody's attention, so they stay in the table (audit trail) but never
 // in the count a human sees.
 //
+// 'keep_ai_master' (#540 item 2) used to land here as a sixth action — both
+// sides moved, but a COMPLETE lineage walk found no Door43 editor's commit
+// behind master's, so the app edit won. Issue #749 stopped recording it: it
+// takes nothing from Door43 and the next export publishes the kept version, so
+// there was nothing for the banner to ask of anyone, yet the row sat there until
+// a human edited or dismissed the verse. bookReimport.ts no longer pushes it and
+// retireVerseKeptAiMasterFlags (below) retires the standing rows. This mirrors
+// #703, which retired the TSV side's `merge_kept` review flag for the same
+// outcome.
+//
 // overwritten_version is the D1 `verses.version` that was replaced — the old
 // text is recoverable from that verse's version history
 // (GET /api/verses/.../history) at that version. It is **NULL for
@@ -79,6 +89,7 @@ import {
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
+  RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
 } from "./verseMergeConflictSql.ts";
@@ -278,6 +289,44 @@ export async function deleteLostAdoptionConflicts(
       resource,
       error: e instanceof Error ? e.message : String(e),
     });
+  }
+}
+
+// Issue #749, the verse analogue of bookReimport.ts's retireMergeKeptFlags
+// (#703). Retires every STANDING 'keep_ai_master' row so the "Sync flagged N
+// verse(s)" banner stops carrying an outcome nobody can act on: nothing was
+// taken from Door43, and the next export publishes the kept version. The action
+// is no longer recorded at all (see applyVerseRows), so what this clears is pure
+// backlog — prod on 2026-09-09 held 37 such rows across EZK ULT/UST and JER ULT,
+// the oldest standing three weeks.
+//
+// D1-only, no Door43 walk: every row this touches was minted on a COMPLETE
+// lineage walk that found no Door43 editor's commit behind master's side, so the
+// mint itself was the measurement that justifies the clear (the same argument
+// retireMergeKeptFlags rests on).
+//
+// One statement, no batching — see RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL for why
+// that is enough here and why, unlike the TSV side, no separate audit-log row is
+// written: the retired row survives with `resolved_at` set and `resolved_by`
+// NULL, and that pair IS the audit trail (a human resolve always carries a
+// non-null resolved_by).
+//
+// Best-effort, like every other write in this file: it runs inside the nightly
+// sweep step, and a banner row that failed to come down is not a reason to
+// abandon the export that follows. Idempotent — the second night matches nothing
+// and reports 0.
+export async function retireVerseKeptAiMasterFlags(env: Env): Promise<{ cleared: number }> {
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const res = await env.DB.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).bind(now).run();
+    const cleared = res?.meta?.changes ?? 0;
+    if (cleared > 0) console.log("verse keep_ai_master retire", { cleared });
+    return { cleared };
+  } catch (e) {
+    console.error("verse keep_ai_master retire: failed", {
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return { cleared: 0 };
   }
 }
 
