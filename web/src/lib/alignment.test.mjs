@@ -2187,6 +2187,67 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(bareEqual, "text-only \\d (no children) round-trips verbatim through the opaque path");
 }
 
+// ─── Case: typeless \d (real usfm-js shape) wraps alignable zaln children ─
+//
+// #746 — usfm-js emits a real \d Psalm superscription with NO `type` field
+// at all; Case 30 above only covers the legacy `type:"section"` shape.
+// isPsalmTitleWrapper previously required type==="section", so a typeless
+// \d fell through to the opaque path: source Hebrew words showed in the
+// aligner dialog (collectAlignerSourceWords already matched on tag alone)
+// but no target groups/words to align them to. Mirrors Case 30(a)/(b).
+{
+  console.log("\n[Case] typeless \\d superscription wraps alignable zaln children");
+  const { deepStrictEqual } = await import("node:assert");
+  const dVerseTypeless = [
+    {
+      tag: "d",
+      children: [
+        {
+          tag: "zaln", type: "milestone", strong: "H4210", lemma: "מִזְמוֹר", morph: "He,Ncmsa",
+          occurrence: "1", occurrences: "1", content: "מִזְמ֥וֹר",
+          children: [
+            { text: "A", tag: "w", type: "word", occurrence: "1", occurrences: "1" },
+            { type: "text", text: " " },
+            { text: "psalm", tag: "w", type: "word", occurrence: "1", occurrences: "1" },
+          ],
+          endTag: "zaln-e\\*",
+        },
+        { type: "text", text: ".\n" },
+      ],
+    },
+    { tag: "q1", nextChar: " ", type: "quote" },
+    {
+      tag: "zaln", type: "milestone", strong: "H3068",
+      occurrence: "1", occurrences: "1", content: "יְהוָה",
+      children: [{ text: "Yahweh", tag: "w", type: "word", occurrence: "1", occurrences: "1" }],
+      endTag: "zaln-e\\*",
+    },
+  ];
+  const state = parseAlignment(dVerseTypeless, null);
+
+  // (a) The superscription's zaln/\w entered the alignment stream — target
+  // groups exist, matching the source words the aligner's source-word walk
+  // (collectAlignerSourceWords) already produces for this same node.
+  const psalmGroup = state.groups.find((g) => g.source.some((s) => s.strong === "H4210"));
+  assert(!!psalmGroup, "source group exists for the typeless \\d-wrapped H4210");
+  assert(
+    psalmGroup?.targets.map((t) => t.text).join(" ") === "A psalm",
+    `typeless \\d targets derive in stream order (got ${JSON.stringify(psalmGroup?.targets.map((t) => t.text))})`,
+  );
+  assert(state.unaligned.length === 0, `every word (including typeless \\d words) is aligned (got ${state.unaligned.length} unaligned)`);
+
+  // (b) Deep-equal round-trip — the byte-clean gate, same as Case 30(b).
+  let deepEqual = true;
+  let diff = "";
+  try {
+    deepStrictEqual(serializeAlignment(state), dVerseTypeless);
+  } catch (e) {
+    deepEqual = false;
+    diff = String(e.message).slice(0, 400);
+  }
+  assert(deepEqual, `typeless \\d parse -> serialize round-trips deeply equal${diff ? ` (${diff})` : ""}`);
+}
+
 // ─── Case 31: withSourceCoverage totals keyed by NFC (textKey) ────────────
 //
 // collectAlignerSourceWords counts textOccurrence per NFC textKey, but the

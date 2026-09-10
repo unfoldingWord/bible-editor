@@ -77,6 +77,7 @@ import {
   RESOLVE_VERSE_MERGE_CONFLICT_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
+  RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
   VERSE_PATCH_UPDATE_SQL,
@@ -529,18 +530,23 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
 
 {
   // The measured case from the issue: JER ULT had 3 active conflicts; a
-  // human resolves the only source_attr_ambiguous one; two both_changed_ai_master
-  // rows remain. The banner must NOT be cleared — a partially-stale banner
-  // (still correctly naming the two survivors, if stale on the exact count)
-  // beats fabricating a fresh count from a fragment.
+  // human resolves one of them; two alertable rows remain. The banner must NOT
+  // be cleared — a partially-stale banner (still correctly naming the two
+  // survivors, if stale on the exact count) beats fabricating a fresh count from
+  // a fragment.
+  //
+  // The two survivors were both_changed_ai_master rows when this case was
+  // written; issue #749 took that action out of the alertable set (nothing is
+  // waiting to be reverted there), so the survivors here are the alignment
+  // refusal — which still is one — and the shape under test is unchanged.
   const d = verseDb();
   d.prepare(
     `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
-     VALUES ('JER', 'ult', 42, 6, 'keep_ai_master', 'both_changed_ai_master', NULL, 100, NULL)`,
+     VALUES ('JER', 'ult', 42, 6, 'keep_alignment_refused', 'alignment_shrink', NULL, 100, NULL)`,
   ).run();
   d.prepare(
     `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
-     VALUES ('JER', 'ult', 42, 11, 'keep_ai_master', 'both_changed_ai_master', NULL, 100, NULL)`,
+     VALUES ('JER', 'ult', 42, 11, 'keep_alignment_refused', 'alignment_shrink', NULL, 100, NULL)`,
   ).run();
   d.prepare(
     `INSERT INTO system_alerts (username, severity, source, message)
@@ -1046,16 +1052,35 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   assert(rows[0].verse === 21 && rows[0].action === "source_attr_divergent",
     "…which is the unresolved source_attr_divergent row (not the audit-only 'adopt', not the resolved one)");
 
-  // #540 item 2. A keep_ai_master row is alertable too — it is the one outcome
-  // whose whole purpose is to be looked at before the export publishes it.
-  // Missing from this filter, the policy would fire silently.
+  // Issue #749 (was #540 item 2): a keep_ai_master row is NOT alertable. The
+  // outcome rests on a complete lineage walk that found no Door43 editor's
+  // commit behind master's side — nothing was taken, the next export publishes
+  // the kept version, and the banner's own sentence said so while asking a
+  // translator to look anyway. No new row is written (bookReimport.ts), and any
+  // standing one stays out of the banner until the nightly retire stamps it
+  // resolved. Prod 2026-09-09: 37 such rows, the oldest three weeks old.
   d.prepare(
     `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
      VALUES ('EZK','ult',40,24,'keep_ai_master','both_changed_ai_master',NULL,100)`,
   ).run();
   const withAi = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ult");
-  assert(withAi.some((r) => r.verse === 24 && r.action === "keep_ai_master"),
-    "the banner filter surfaces a keep_ai_master row");
+  assert(!withAi.some((r) => r.verse === 24),
+    "the banner filter no longer surfaces a keep_ai_master row (#749)");
+  assert(withAi.length === 1 && withAi[0].verse === 21,
+    "…without dropping the source_attr_divergent row beside it");
+
+  // The kept-D1 actions that DO still need a human are untouched by that removal
+  // — the regression this pass most needs to not cause. (source_attr_divergent
+  // is already proved alertable by the row at verse 21 above.)
+  for (const [verse, action] of [[26, "keep_alignment_refused"], [27, "keep_local_structure"]]) {
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('EZK','ult',40,?,?,'reason',NULL,100)`,
+    ).run(verse, action);
+  }
+  const withKeeps = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ult");
+  assert(withKeeps.some((r) => r.action === "keep_alignment_refused"), "keep_alignment_refused is still alertable");
+  assert(withKeeps.some((r) => r.action === "keep_local_structure"), "keep_local_structure is still alertable");
 
   // Issue #633: adopt_no_visible_change is audit-only, same as clean adopt —
   // wording + alignment groups matched, so it must never reach the banner.
@@ -1066,48 +1091,129 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   const withSilent = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ult");
   assert(!withSilent.some((r) => r.verse === 25),
     "adopt_no_visible_change is excluded from the banner filter (audit only)");
-  assert(withSilent.some((r) => r.verse === 24),
+  assert(withSilent.some((r) => r.verse === 21),
     "…without dropping other alertable rows");
 }
 
 {
-  // #540 item 2, the two upsert rules a keep_ai_master row shares with the other
-  // kept-D1 outcomes: it never carries an overwritten_version pointer (nothing
-  // was overwritten, so the pointer would misdirect a reviewer), and
-  // re-detecting it REACTIVATES a row a human resolved without fixing the
-  // underlying disagreement — the condition is still live, and unlike an
-  // adoption there is no CAS that could lose its race and falsely reactivate.
+  // Issue #749: the nightly retire. Every STANDING keep_ai_master row comes down
+  // — D1-only, one statement, no Door43 walk, because the mint itself was the
+  // complete measurement that justifies the clear (same argument as #703's
+  // retireMergeKeptFlags on the TSV side).
+  const d = verseDb();
+  const seed = (chapter, verse, action, resolvedAt = null, resolvedBy = null) =>
+    d
+      .prepare(
+        `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version,
+                                            detected_at, resolved_at, resolved_by)
+         VALUES ('EZK','ust',?,?,?,'reason',NULL,100,?,?)`,
+      )
+      .run(chapter, verse, action, resolvedAt, resolvedBy);
+  seed(22, 26, "keep_ai_master");
+  seed(33, 9, "keep_ai_master");
+  seed(45, 11, "keep_ai_master", 150, 30); // already resolved BY A HUMAN
+  seed(40, 21, "source_attr_divergent");
+  seed(40, 22, "keep_alignment_refused");
+  seed(40, 23, "adopt_conflict");
+  seed(40, 24, "keep_local_structure");
+
+  const first = d.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).run(9000);
+  assert(Number(first.changes) === 2, "the two standing keep_ai_master rows are retired");
+
+  const byRef = Object.fromEntries(
+    d
+      .prepare(`SELECT chapter, verse, action, resolved_at, resolved_by FROM verse_merge_conflicts`)
+      .all()
+      .map((r) => [`${r.chapter}:${r.verse}`, r]),
+  );
+  assert(byRef["22:26"].resolved_at === 9000 && byRef["22:26"].resolved_by === null,
+    "a retired row is stamped resolved_at with resolved_by NULL — the system-retired signature");
+  assert(byRef["33:9"].resolved_at === 9000 && byRef["33:9"].resolved_by === null, "…for every standing row");
+  assert(byRef["22:26"].action === "keep_ai_master",
+    "…and the action is preserved: the row IS the audit trail, so it is never rewritten or deleted");
+  // resolved_by IS NULL AND resolved_at IS NOT NULL is what makes a retirement
+  // distinguishable from a human resolve forever after. A human resolve always
+  // carries the saving user's id (RESOLVE_VERSE_MERGE_CONFLICT_SQL).
+  assert(byRef["45:11"].resolved_at === 150 && byRef["45:11"].resolved_by === 30,
+    "a row a human already resolved keeps THEIR resolution — the retire never overwrites it");
+  for (const ref of ["40:21", "40:22", "40:23", "40:24"]) {
+    assert(byRef[ref].resolved_at === null, `${byRef[ref].action} at ${ref} is untouched by the retire`);
+  }
+
+  // Idempotent: once the backlog is gone, every later night matches nothing.
+  const second = d.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).run(9999);
+  assert(Number(second.changes) === 0, "a second pass retires nothing (idempotent)");
+  assert(
+    d.prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE chapter = 22 AND verse = 26`).get().resolved_at === 9000,
+    "…and does not re-stamp the rows the first pass retired",
+  );
+
+  // And the retired rows are out of the banner, which is the point of all this.
+  const active = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ust");
+  assert(!active.some((r) => r.action === "keep_ai_master"), "no keep_ai_master row remains in the banner filter");
+  assert(active.length === 4, "…and the four genuinely alertable rows still are");
+}
+
+{
+  // The two upsert rules the kept-D1 CONTENT outcomes share: such a row never
+  // carries an overwritten_version pointer (nothing was overwritten, so the
+  // pointer would misdirect a reviewer), and re-detecting it REACTIVATES a row a
+  // human resolved without fixing the underlying disagreement — the condition is
+  // still live, and unlike an adoption there is no CAS that could lose its race
+  // and falsely reactivate.
+  //
+  // Issue #749: this block used to drive 'keep_ai_master' through both rules.
+  // That action is retired (no new row is ever written), so the coverage moves
+  // to 'source_attr_divergent', which shares the same carve-outs and IS still
+  // written. The keep_ai_master-specific assertion that remains is the one that
+  // matters now: it is no longer in either CASE list.
   const d = verseDb();
   d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
     "AMO", "ult", 4, 2, "adopt_conflict", "both_changed", 9, null, 1000,
   );
   d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
-    "AMO", "ult", 4, 2, "keep_ai_master", "both_changed_ai_master", null, null, 2000,
+    "AMO", "ult", 4, 2, "source_attr_divergent", "source_attr_ambiguous", null, null, 2000,
   );
   let row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
-  assert(row.action === "keep_ai_master" && row.overwritten_version === null,
-    "a verse that becomes keep_ai_master drops any prior overwritten_version pointer");
+  assert(row.action === "source_attr_divergent" && row.overwritten_version === null,
+    "a verse that becomes a kept-D1 content outcome drops any prior overwritten_version pointer");
 
   d.prepare(`UPDATE verse_merge_conflicts SET resolved_at=1500, resolved_by=30 WHERE book='AMO'`).run();
   d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
-    "AMO", "ult", 4, 2, "keep_ai_master", "both_changed_ai_master", null, null, 3000,
+    "AMO", "ult", 4, 2, "source_attr_divergent", "source_attr_ambiguous", null, null, 3000,
   );
   row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
   assert(row.resolved_at === null && row.resolved_by === null,
-    "re-detecting keep_ai_master reactivates a row resolved while the disagreement persists");
+    "re-detecting a kept-D1 content outcome reactivates a row resolved while the disagreement persists");
 
-  // But a later clean 'adopt' DOES take it out of the banner — the opposite of
-  // adopt_conflict's anti-downgrade rule, and deliberately so: nothing was
-  // overwritten, so there is nothing to recover, and master's value having been
-  // adopted since means the disagreement resolved. Left sticky, the banner would
-  // keep claiming the editor's version was kept and is about to be published,
-  // about a verse that has since taken master's.
+  // …and 'keep_ai_master' is out of both CASE lists (#749). Were a row of that
+  // action to arrive now, it would neither NULL a live recovery pointer nor
+  // reactivate a human's resolution — nothing writes it, and the nightly retire
+  // is what takes the standing ones down.
+  const d3 = verseDb();
+  d3.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 6, 3, "adopt_conflict", "both_changed", 9, null, 1000,
+  );
+  d3.prepare(`UPDATE verse_merge_conflicts SET resolved_at=1500, resolved_by=30 WHERE book='AMO'`).run();
+  d3.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 6, 3, "keep_ai_master", "both_changed_ai_master", null, null, 2000,
+  );
+  const aiRow = d3.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=6 AND verse=3`).get();
+  assert(aiRow.overwritten_version === 9,
+    "keep_ai_master no longer NULLs a recovery pointer (it is out of the overwritten_version CASE)");
+  assert(aiRow.resolved_at === 1500 && aiRow.resolved_by === 30,
+    "…and no longer reactivates a human's resolution (it is out of the reactivation carve-out)");
+
+  // A later clean 'adopt' still takes a kept-D1 content row out of the banner —
+  // the opposite of adopt_conflict's anti-downgrade rule, and deliberately so:
+  // nothing was overwritten, so there is nothing to recover, and master's value
+  // having been adopted since means the disagreement resolved.
   d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
     "AMO", "ult", 4, 2, "adopt", "master_only", 11, null, 4000,
   );
   row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
   assert(row.action === "adopt",
-    "a later clean 'adopt' retires a keep_ai_master row from the banner");
+    "a later clean 'adopt' retires a kept-D1 content row from the banner");
 
   // …while adopt_conflict's own anti-downgrade is untouched by that.
   const d2 = verseDb();
@@ -1333,25 +1439,27 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
 }
 
 {
-  // Same race scenario, for 'keep_ai_master' (#540 item 2) — the third action
-  // the reactivation carve-out (and therefore the version guard) applies to.
-  // Same no-CAS-race shape as the other two, so it must get the same protection.
+  // Same race scenario, for 'keep_local_structure' (#728) — the third action the
+  // reactivation carve-out (and therefore the version guard) applies to. Same
+  // no-CAS-race shape as the other two, so it must get the same protection.
+  // (This case covered 'keep_ai_master' until #749 retired that action out of
+  // the carve-out entirely; the block above proves it is gone from it.)
   const d = verseDb();
   d.prepare(
     `INSERT INTO verses (book, chapter, verse, bible_version, version) VALUES ('AMO', 4, 2, 'ULT', 6)`,
   ).run();
   d.prepare(
     `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by, last_recorded_at)
-     VALUES ('AMO','ult',4,2,'keep_ai_master','both_changed_ai_master',NULL,100,150,30,100)`,
+     VALUES ('AMO','ult',4,2,'keep_local_structure','master_moved_non_human',NULL,100,150,30,100)`,
   ).run();
   upsertConflict(d, {
     book: "AMO", resource: "ult", chapter: 4, verse: 2,
-    action: "keep_ai_master", reason: "both_changed_ai_master", overwrittenVersion: null,
+    action: "keep_local_structure", reason: "master_moved_non_human", overwrittenVersion: null,
     now: 2000, bibleVersion: "ULT", observedVersion: 5,
   });
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
   assert(row.resolved_at === 150 && row.resolved_by === 30,
-    "keep_ai_master: stale detection also withholds reactivation, preserving the fresh resolution");
+    "keep_local_structure: stale detection also withholds reactivation, preserving the fresh resolution");
 }
 
 {
@@ -1377,36 +1485,23 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   assert(mixed.includes("1 kept D1 because Door43's original-language source fix"),
     "source_attr_divergent counted as a source-attr divergence, separately from the alignment refusal");
 
-  // #540 item 2. keep_ai_master is also a kept-D1 outcome, but the OPPOSITE one
-  // where the export is concerned: nothing is waiting to be reverted, the export
-  // is about to publish the kept version. Borrowing the other two's warning
-  // would send a human to fight for a change that is already winning.
+  // Issue #749: keep_ai_master no longer has a sentence here, because it no
+  // longer has a row. It was the one kept-D1 outcome where nothing is waiting to
+  // be reverted — the export publishes the kept version — so the banner had
+  // nothing to ask, yet the verse stayed in the flagged count until a human
+  // edited or dismissed it. The dead branch is removed rather than left inert.
   const ai = buildMergeConflictGuidance([{ action: "keep_ai_master" }]);
-  assert(ai.includes("1 kept the editor's version even though Door43 changed too"),
-    "keep_ai_master gets its own sentence");
-  // The measured cause, stated narrowly. Not "no maintainer edit" — the bot
-  // account pushes on a named human's behalf, so a maintainer may well have
-  // directed the change; what was measured is that no commit came from a Door43
-  // editor's own account.
-  assert(ai.includes("no commit from a Door43 editor's own account was found"),
-    "…stating the measured cause, and only that");
-  assert(!ai.includes("no maintainer edit"), "…never the stronger claim about intent");
-  assert(!ai.includes("took Door43's version"), "…and never reports it as an overwrite");
-  assert(!ai.includes("will still write over it"),
-    "…and never borrows the refusal's warning: here the export publishes the kept version");
-  // …but it must not promise a publish either. The watermark is withheld for the
-  // whole book+resource by a systemic refusal, a lock, or a recording failure —
-  // any of which can be described in this same banner.
-  assert(!ai.includes("Tonight's export publishes"),
-    "…and never promises tonight's export, which this banner itself may be reporting as held");
-  assert(ai.includes("the next export that runs for this resource"),
-    "…it says which export, conditionally");
+  assert(ai === "", "a keep_ai_master row produces no guidance sentence at all (#749)");
 
   const withAi = buildMergeConflictGuidance([{ action: "adopt_conflict" }, { action: "keep_ai_master" }]);
   assert(withAi.includes("1 took Door43's version"),
-    "a keep_ai_master row does not absorb the adopt_conflict count");
-  assert(withAi.includes("1 kept the editor's version even though Door43 changed too"),
-    "…and is counted separately from it");
+    "…and its presence does not disturb the adopt_conflict count beside it");
+  assert(!withAi.includes("kept the editor's version even though Door43 changed too"),
+    "…with no kept-over-Door43 sentence added for it");
+
+  // The per-run admin alert for the same outcome at scale
+  // (reimportSyncGate.ts's `reimport_kept_over_door43`) is a separate,
+  // dismissable surface and is deliberately out of scope here.
 }
 
 {

@@ -447,6 +447,40 @@ async function main() {
         "human",
         null,
       ],
+      // ── issue #696: AI-pipeline PR merges, live prod samples (2026-09-01,
+      // minutes after the ledger's own deploy) ────────────────────────────
+      // Neither carries our export prefix nor the bp-assistant marker
+      // anywhere in the full subject (the bracket names the requesting
+      // translator, not the bot), so before #696 both fell through to human.
+      [
+        "Merge pull request 'AI UST for EZK 39 [pjoakes]' (#4615) from ezk-39-ust-ai into master",
+        "53472+bookpackagebot@noreply.door43.org",
+        "ai",
+        "merge_of_ai_pipeline_pr",
+      ],
+      [
+        "Merge pull request 'AI ULT for EZK 39 [pjoakes]' (#6796) from ezk-39-ult-ai into master",
+        "53472+bookpackagebot@noreply.door43.org",
+        "ai",
+        "merge_of_ai_pipeline_pr",
+      ],
+      // A subject that merely resembles the pipeline grammar — missing the
+      // required bracket — must not be swept in by a looser match.
+      [
+        "Merge pull request 'AI UST for EZK 39 discussion' (#4700) from ezk-39-notes into master",
+        "53472+bookpackagebot@noreply.door43.org",
+        "human",
+        null,
+      ],
+      // Review finding on #699: title shape + bracket alone is not enough —
+      // a HUMAN who merges an unrelated PR that happens to carry this exact
+      // literal title, under their OWN account, must not classify ai.
+      [
+        "Merge pull request 'AI UST for EZK 39 [pjoakes]' (#4615) from ezk-39-ust-ai into master",
+        "rich.mahn@example.com",
+        "human",
+        null,
+      ],
     ];
     for (const [message, authorEmail, expectKind, expectReason] of cases) {
       const { rows } = ledgerRowsFromCommits("en_ult", [{ sha: "m", message, authorEmail, authorName: "x" }]);
@@ -459,6 +493,19 @@ async function main() {
     assert(
       classifyForLedger({ sha: "x", message: "bible-editor: AMO tq → master", authorEmail: "h@x" }).kind === "ours",
       "a plain (unwrapped) export subject still classifies ours through the wrapper",
+    );
+    // The #696 grammar is checked ONLY inside the merge-unwrap branch —
+    // classifyMasterCommit itself must stay untouched (masterLineage.ts's own
+    // AI_PIPELINE_SUBJECT deliberately excludes this vocabulary for direct,
+    // unwrapped subjects; see that constant's comment). A bare, non-merge
+    // commit carrying the identical text must still classify human.
+    assert(
+      classifyForLedger({
+        sha: "y",
+        message: "AI UST for EZK 39 [pjoakes]",
+        authorEmail: "53472+bookpackagebot@noreply.door43.org",
+      }).kind === "human",
+      "the same subject text, NOT merge-wrapped, is untouched by #696 and still classifies human",
     );
   }
 

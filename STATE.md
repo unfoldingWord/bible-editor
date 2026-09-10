@@ -71,6 +71,12 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **A `source_attr_ambiguous` verse flag in a chapter Door43 did not touch is the app comparing against its own
+  stale export, not a Door43 source fix.** Measured 2026-09-09 (EZK UST 22:26 / 33:9 / 45:11-12): the edited-verse
+  reconcile was a two-way D1-vs-master attr compare with no base check, so it ran even on `keep_master_unchanged`.
+  Gated in PR for #641. Triage rule: per-chapter-diff the Door43 commits since our last export first — the bot's
+  `UST/ULT: BOOK N` pushes touch only chapter N (measured on EZK 30, EZK 46, JER 47).
+
 - **Door43's validate-and-merge job does NOT rewrite our bytes; own-publish declines are the bot's evening pushes.**
   Measured 2026-09-02 against git.door43.org on five recent `bible-editor:` PRs across three books (en_tq #858,
   #859, #863, #864, #865): the PR head's blob sha equalled master's blob sha at the squash commit every time — #859's
@@ -416,6 +422,18 @@ Highlights that bite repeatedly:
   order; milestones come out NFC. Skipping this silently breaks alignment matching.
 - **`usfm-js` parks leading punctuation/markers on the node's `text`** — markers can carry text; opening
   quotes after a marker live on the marker node, not as a sibling.
+- **A real `\d` (Psalm superscription) node from `usfm-js@3.5.0` never carries a `type` field, and — measured
+  directly against the repo's pinned version, not assumed — when `\zaln-s`/`\w` alignment markup follows `\d`
+  on the same or next line, `usfm-js` does NOT nest that markup as `\d`'s `children`: `\d` parses to a bare
+  `{tag:"d", nextChar}` marker chip, and the zaln milestones become ordinary top-level SIBLINGS after it in the
+  same `verseObjects` array (only a `\d` with no other markup — plain-text title only — gets `{tag:"d", text}`).
+  Fixed in #746/#747: `isPsalmTitleWrapper` and `collectAlignerSourceWords`'s `\d` branch in `alignment.ts` now
+  match on `tag==="d"` alone (dropping a `type==="section"` requirement neither shape ever satisfies). Left
+  unresolved: the pre-existing `type:"section", tag:"d", children:[<zaln>, …]` wrapper shape modeled throughout
+  `alignment.ts`/`highlight.ts` (`isAcrosticHeading`-style helpers, Case 29/30 in `alignment.test.mjs`) does not
+  match either real shape just described — worth an explicit re-verification against actual DCS-fetched Psalm
+  content (door43/D1 access this session didn't have) before trusting that any `\d` alignment/highlight code
+  path is exercised by real content rather than only by its own synthetic test fixtures.
 - **Export USFM puts punctuation outside `\w` (`\w earth\w*.`) on purpose** — correct uW form, not churn; don't "fix" it.
 
 - **Chapter-front `\p` can pile up +1 per nightly export (EZK 8/11, 2026-07).** bp-assistant's out-of-band
@@ -475,6 +493,30 @@ Highlights that bite repeatedly:
   such a verse and re-mints version 1, letting a stale `If-Match: 1` pass CAS against the recreated row.
   `verseVersionFloorSql` in `api/src/verseBridge.ts` therefore uses `MAX(COALESCE(new_version, prev_version))`;
   any future version floor must do the same. Found by review of the #727 guards, fixed in the #728 commit.
+- **Downstream-sync pass, 2026-09-07** (see the 2026-08-24/2026-08-28 entry above for the routine itself).
+  `deferredreward/bible-editor-multilingual`'s own newest triage doc was still `docs/upstream-sync-2026-08-28.md`
+  (no newer one as of this run) — their 30 own commits since that doc's sync commit (`6251e9a`..`1cbc6f3`) were
+  almost all their multi-tenant-only "flows"/workspaces/admin-review-state feature work (no counterpart here,
+  ruled not-applicable), except a real, shared bug: **our tree-walkers never treated `\qs` (Selah) as a
+  descendable wrapper, and one `\d` (Psalm superscription) gate was still the pre-#398 `type:"section"` shape
+  that real usfm-js output never matches.** Both are silent content-loss-on-save bugs (render/matcher drops the
+  node; `extractEditableText`/`extractPlainText` in usfm.ts already kept it) — directly the same defect as the
+  escalated `en_ust master PSA 24:6` Selah malformation above. Fixed in `highlight.ts` (`nodeIsPsalmTitle`,
+  `segmentByParagraphs`'s render branch, `collectSourceWords`/`collectSubtreeWords`), `alignment.ts`
+  (`collectAlignerSourceWords`), `sourceOccurrences.ts` (`sourceTextTotals`), and replaced a third, under-featured
+  duplicate `extractPlainText` in `tnQuickRequest.ts` with the shared `usfm.ts` one. Also fixed: the editable
+  `\b`/`\ts\*` chip render was one trailing space short of `extractEditableText`'s baseline (phantom-PATCH
+  risk); the "Notes" count badge in `ResourceColumn.tsx` counted trashed tn rows while the book-wide total in
+  `TopBar.tsx` (server book-summary query) didn't, so they disagreed by exactly the trashed count on any chapter
+  holding one; the scripture/resources column divider (`Shell.tsx` `splitRatio`) was never persisted to
+  localStorage, unlike the aligner's own strips (#738). Regression tests added to `highlight.test.mjs` and
+  `sourceOccurrences.test.mjs`. **Deferred, not done this pass** (real bugs, lower urgency / bigger surface):
+  `HebrewLine.tsx`'s read-only walk still doesn't descend `\d`/`\qs` at all (renders neither); three more
+  hand-rolled source-word-position walks in `UhbStrip.tsx`/`AlignmentPanel.tsx`/`Shell.tsx` (`countSourceWords`)
+  have the same `\qs`-blind gap as `collectAlignerSourceWords` did; `tnQuickRequest.ts`'s `buildTnQuickRequest`
+  never joins a bridged TN note's full covered-verse range into the AI prompt context (downstream's `#411`/`#406`
+  fix a bug in logic we don't have at all — the feature itself is the gap). **Next time:** check whether a newer
+  `docs/upstream-sync-*.md` exists downstream before re-diffing from `6251e9a`.
 
 ## Stop conditions / goals
 
