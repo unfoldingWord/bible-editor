@@ -452,6 +452,17 @@ function refVerseList(
   // chapter-qualified end: "1:5-1:6" would yield "5-1" and lose the 6.
   const raw = refRaw ?? "";
   const colon = raw.indexOf(":");
+  // The ref's OWN leading chapter (before the first colon) must match this
+  // row's chapter. A torn row (chapter=1 but ref_raw="2:6") would otherwise
+  // have its "2:" silently sliced off below and be searched as 1:6 — a
+  // confident repair against the WRONG chapter, the same #769 failure the
+  // per-piece guard below catches for later pieces. parseInt tolerates a
+  // verse-only ref (no colon → colon<0, skipped) and junk (NaN → not finite
+  // → degrade rather than bail).
+  if (colon > 0) {
+    const leadChapter = parseInt(raw.slice(0, colon), 10);
+    if (Number.isFinite(leadChapter) && leadChapter !== chapter) return null;
+  }
   const vs = colon < 0 ? "" : raw.slice(colon + 1);
   if (!vs) return [fallback];
   const out: number[] = [];

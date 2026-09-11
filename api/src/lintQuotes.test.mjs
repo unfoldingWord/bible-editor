@@ -236,6 +236,16 @@ const only = (rows, src) => lintTnQuotes(rows, src);
     "the comma-form fixture also reproduces a confident order-fix against the wrongly-merged span");
   assert(lintTnQuotes([commaForm], src3).length === 0,
     "a comma-separated cross-chapter piece (1:6,2:1) also bails on the whole ref, not just the dash-range form");
+
+  // The LEADING chapter must be validated before it is sliced off (codex
+  // review, 2nd pass on PR #773): a torn row whose own chapter is 1 but whose
+  // ref_raw is "2:6" had its "2:" stripped by `raw.slice(colon+1)` BEFORE any
+  // per-piece cross-chapter check ran, so wordsForRow searched 1:6 — the same
+  // wrong-chapter confident repair, reached via the leading qualifier. The
+  // whole ref must bail. (src's verse 6 is chapter 1; the ref points at 2:6.)
+  const tornLead = { ...tn("x4", 1, 6, "דָּבָ֑ר רֵאשִׁ֖ית"), ref_raw: "2:6" };
+  assert(lintTnQuotes([tornLead], src).length === 0,
+    "a ref whose leading chapter differs from the row's own chapter (row 1, ref 2:6) bails, not searched as 1:6");
 }
 
 // ── Confidence gate: never auto-repair an ambiguous match ───────────────────
