@@ -202,8 +202,8 @@ const html = `<title>Door43 quote fixes</title>
 </div>`;
 
 // ── Strip locked books out of the occurrence repair SQL ─────────────────────
-// scan-source-occurrences.mjs has no lock rule of its own, so filter its output
-// here rather than leaving the operator to notice. Sections are delimited by
+// scan-source-occurrences.mjs applies the same lock rule itself; this second
+// pass over the combined file is belt and braces. Sections are delimited by
 // the "-- ===== BOOK" headers the driver writes — exactly a 3-char book code
 // and nothing else. Anything that is not that shape (a suffix, a preamble, a
 // stray statement before the first header) is REFUSED rather than kept: a

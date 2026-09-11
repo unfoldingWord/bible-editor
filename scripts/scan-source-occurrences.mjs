@@ -87,8 +87,9 @@ const rows = loadRows(dumpPath);
 // cannot see an admin's explicit lock on an unpublished book.
 const locksArg = process.env.BOOK_LOCKS ?? "";
 let lockRows = null;
-if (locksArg && existsSync(resolve(repoRoot, locksArg))) {
-  lockRows = loadRows(resolve(repoRoot, locksArg));
+// Resolved against cwd, like the dump path — the two must not disagree.
+if (locksArg && existsSync(resolve(locksArg))) {
+  lockRows = loadRows(resolve(locksArg));
   if (lockRows.some((r) => typeof r.book !== "string" || !("locked" in r))) {
     console.error(`BOOK_LOCKS ${locksArg} is not a book_locks dump (need book, locked columns)`);
     process.exit(1);
@@ -221,7 +222,8 @@ if (doRepair && repairable.length > 0) {
     console.error("refusing to emit SQL: REPAIR_ACTOR must be a users.id (e.g. REPAIR_ACTOR=2) — see header");
     process.exit(1);
   }
-  const unversioned = repairable.filter((f) => !Number.isInteger(Number(f.rowVersion)));
+  // Checked on the RAW value: Number(null) is 0 and would pass an isInteger test.
+  const unversioned = repairable.filter((f) => !(Number.isInteger(f.rowVersion) && f.rowVersion >= 1));
   if (unversioned.length) {
     console.error(
       `refusing to emit SQL: ${unversioned.length} flagged verse(s) have no usable version — the dump must ` +
