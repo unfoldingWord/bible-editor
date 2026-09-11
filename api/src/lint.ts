@@ -432,10 +432,20 @@ export function sourceWordsByRef(sourceVerses: VerseRow[]): Map<string, SourceTo
  *                verse 5 alone, 185 false positives corpus-wide.
  *   `5:1,3,8,12` a list   — PSA 5:1 row `sbh4` really is this, and searching
  *                only verse 1 reported a correct quote as unresolvable.
- * A chapter-qualified end (`1:5-1:6`) is accepted too; anything unparseable
- * degrades to the single start verse rather than guessing.
+ * A chapter-qualified end (`1:5-1:6`) is accepted too, as long as it names
+ * THIS row's own chapter. When it names a DIFFERENT chapter (`1:6-2:1`) the
+ * ref genuinely spans two chapters and no same-chapter verse-number list can
+ * represent it faithfully — returning `null` for the WHOLE call (not just the
+ * offending piece) rather than silently degrading to the start verse, which
+ * previously let a confident-looking repair be computed against a too-small
+ * word list. Anything else unparseable still degrades to the single start
+ * verse rather than guessing.
  */
-function refVerseList(refRaw: string | null | undefined, fallback: number): number[] {
+function refVerseList(
+  chapter: number,
+  refRaw: string | null | undefined,
+  fallback: number,
+): number[] | null {
   // Everything after the FIRST colon. `split(":")[1]` truncates a
   // chapter-qualified end: "1:5-1:6" would yield "5-1" and lose the 6.
   const raw = refRaw ?? "";
@@ -445,7 +455,15 @@ function refVerseList(refRaw: string | null | undefined, fallback: number): numb
   const out: number[] = [];
   for (const piece of vs.split(",")) {
     const [rawStart, rawEnd] = piece.split("-");
-    // "1:5-1:6" — an end written as chapter:verse; take its verse half.
+    // "1:5-1:6" — an end written as chapter:verse; take its verse half, but
+    // first check whether it names a DIFFERENT chapter than this row's own —
+    // e.g. "1:6-2:1". A same-chapter verse-number list cannot represent that
+    // span at all, so bail on the whole ref rather than parse a wrong number
+    // out of it (the old bug: `"2:1".split(":").pop()` silently yielded `1`).
+    if (rawEnd !== undefined && rawEnd.split(":").length > 1) {
+      const endChapter = parseInt(rawEnd.split(":")[0], 10);
+      if (Number.isFinite(endChapter) && endChapter !== chapter) return null;
+    }
     const start = parseInt((rawStart ?? "").split(":").pop() ?? "", 10);
     if (!Number.isFinite(start)) continue;
     const end = rawEnd === undefined ? start : parseInt(rawEnd.split(":").pop() ?? "", 10);
@@ -471,7 +489,11 @@ export function wordsForRow(
   verse: number,
   refRaw: string | null | undefined,
 ): SourceToken[] {
-  const verses = refVerseList(refRaw, verse);
+  const verses = refVerseList(chapter, refRaw, verse);
+  // A ref that genuinely spans a different chapter (`1:6-2:1`) cannot be
+  // faithfully represented as verse numbers within THIS chapter — bail rather
+  // than search a truncated span and risk a confident-looking false match.
+  if (verses === null) return [];
   if (verses.length === 1) return byRef.get(`${chapter}:${verses[0]}`) ?? [];
   const out: SourceToken[] = [];
   const seen = new Set<SourceToken[]>();
