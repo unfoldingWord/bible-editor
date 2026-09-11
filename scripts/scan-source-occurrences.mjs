@@ -22,8 +22,21 @@
 //   2. Scan (report only):
 //        node --experimental-strip-types --no-warnings scripts/scan-source-occurrences.mjs scripts/out/verses-dump.json
 //   3. Emit repair SQL for flagged verses:
-//        node --experimental-strip-types --no-warnings scripts/scan-source-occurrences.mjs scripts/out/verses-dump.json --repair
+//        REPAIR_ACTOR=<users.id> node --experimental-strip-types --no-warnings \
+//          scripts/scan-source-occurrences.mjs scripts/out/verses-dump.json --repair
 //      → scripts/out/repair-source-occurrences.sql   (apply with wrangler d1 execute --file=…)
+//
+// Each UPDATE is guarded on the `version` the dump saw, so a verse a translator
+// edited between dump and apply is left alone (a shortfall in the reported
+// `changes` count means "re-dump and re-scan", never "clobbered"). The dump
+// MUST include the version column. --repair also needs REPAIR_ACTOR: the
+// nightly DCS→D1 sync treats updated_by IS NULL as "pristine, master owns
+// this row" (reimportClassify.ts isReimportableRow), so a repair that left it
+// NULL would be reverted from master the next night the USFM changed upstream,
+// before the export ever pushed the fix.
+//
+// This script has NO lock rule. scripts/split-fixes-by-lock.mjs strips locked
+// books out of the combined output; apply only the *-unlocked.sql it writes.
 //
 // Optional: limit to one book with BOOK=JER, and printed-row count with
 // SCAN_PRINT_LIMIT=N.
@@ -115,6 +128,7 @@ for (const r of rows) {
         chapter: r.chapter,
         verse: r.verse,
         version: r.bible_version,
+        rowVersion: r.version,
         corrections,
         newContent,
       });
@@ -147,21 +161,41 @@ if (doRepair && flagged.length > 0) {
     if (typeof v === "number") return String(v);
     return `'${String(v).replace(/'/g, "''")}'`;
   };
+  const actor = Number(process.env.REPAIR_ACTOR);
+  if (!(Number.isInteger(actor) && actor > 0)) {
+    console.error("refusing to emit SQL: REPAIR_ACTOR must be a users.id (e.g. REPAIR_ACTOR=2) — see header");
+    process.exit(1);
+  }
+  const unversioned = flagged.filter((f) => !Number.isInteger(Number(f.rowVersion)));
+  if (unversioned.length) {
+    console.error(
+      `refusing to emit SQL: ${unversioned.length} flagged verse(s) have no usable version — the dump must ` +
+        "include the version column, or the optimistic-concurrency guard cannot be written.",
+    );
+    process.exit(1);
+  }
   const now = Math.floor(Date.now() / 1000);
   const lines = [
     `-- Repair over-counted alignment source occurrences. Generated ${new Date().toISOString()}`,
     `-- ${flagged.length} verse(s). Renumbers \\zaln-s x-occurrence/x-occurrences to the source`,
     `-- verse's true token count, bumps version (stale-client refetch), and logs an edit_log row.`,
+    `-- Each UPDATE is guarded on the dumped version; compare the reported changes count with ${flagged.length}.`,
     `-- No BEGIN/COMMIT: remote D1 rejects explicit transactions and wraps the file atomically itself.`,
   ];
   for (const f of flagged) {
     const key = `${f.book}/${f.chapter}/${f.verse}/${f.version}`;
+    // Same audit shape the app writes for a verse PATCH (verses.ts): action
+    // 'update' — history replay consumes only create / update / restore, so a
+    // bespoke verb is an invisible audit row — a payload of { content } like
+    // parsed.data, and gated on changes() so a skipped UPDATE (version moved
+    // on) leaves no orphan history entry.
+    const payload = JSON.stringify({ content: JSON.parse(f.newContent) });
     lines.push(
-      `UPDATE verses SET content_json = ${q(f.newContent)}, version = version + 1, updated_at = ${now}`,
-      ` WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)};`,
-      `INSERT INTO edit_log (kind, row_key, prev_version, new_version, action, payload_json)`,
-      `  SELECT 'verse', ${q(key)}, version - 1, version, 'normalize-source-occurrences', ${q(f.newContent)}`,
-      `    FROM verses WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)};`,
+      `UPDATE verses SET content_json = ${q(f.newContent)}, version = version + 1, updated_at = ${now}, updated_by = ${actor}`,
+      ` WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)} AND version = ${Number(f.rowVersion)};`,
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)`,
+      `  SELECT 'verse', ${q(key)}, ${q(f.book)}, ${actor}, version - 1, version, 'update', ${q(payload)}`,
+      `    FROM verses WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)} AND changes() > 0;`,
     );
   }
   const outDir = resolve(repoRoot, "scripts/out");

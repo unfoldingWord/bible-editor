@@ -28,8 +28,8 @@ import { readdirSync } from "node:fs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const [tnPath, srcPath, locksPath, alignedDir] = process.argv.slice(2);
-if (!tnPath || !srcPath) {
-  console.error("usage: node scripts/split-fixes-by-lock.mjs <tn-dump> <src-dump> [book-locks-dump]");
+if (!tnPath || !srcPath || !locksPath) {
+  console.error("usage: node scripts/split-fixes-by-lock.mjs <tn-dump> <src-dump> <book-locks-dump> [aligned-dir]");
   process.exit(1);
 }
 const rowsOf = (p) => {
@@ -38,10 +38,20 @@ const rowsOf = (p) => {
   return raw.results ?? raw;
 };
 
-// book -> true(locked) / false(explicitly unlocked)
+// book -> true(locked) / false(explicitly unlocked). The dump is REQUIRED: this
+// script decides which SQL may be applied, and the published-book fallback
+// alone cannot see an admin's explicit lock on an unpublished book.
+if (!existsSync(resolve(repoRoot, locksPath))) {
+  console.error(`book_locks dump not found: ${locksPath}`);
+  process.exit(1);
+}
 const explicit = new Map();
-if (locksPath && existsSync(resolve(repoRoot, locksPath))) {
-  for (const r of rowsOf(locksPath)) explicit.set(r.book, Number(r.locked) === 1);
+for (const r of rowsOf(locksPath)) {
+  if (typeof r.book !== "string" || !("locked" in r)) {
+    console.error(`${locksPath} is not a book_locks dump (need book, locked columns)`);
+    process.exit(1);
+  }
+  explicit.set(r.book, Number(r.locked) === 1);
 }
 const isLocked = (book) => (explicit.has(book) ? explicit.get(book) : PUBLISHED_BOOKS.has(book));
 
@@ -194,14 +204,23 @@ const html = `<title>Door43 quote fixes</title>
 // ── Strip locked books out of the occurrence repair SQL ─────────────────────
 // scan-source-occurrences.mjs has no lock rule of its own, so filter its output
 // here rather than leaving the operator to notice. Sections are delimited by
-// the "-- ===== BOOK" headers the driver writes.
+// the "-- ===== BOOK" headers the driver writes — exactly a 3-char book code
+// and nothing else. Anything that is not that shape (a suffix, a preamble, a
+// stray statement before the first header) is REFUSED rather than kept: a
+// chunk we cannot attribute to a book cannot be proven unlocked.
 const occAll = resolve(repoRoot, "scripts/out/repair-source-occurrences-all.sql");
 if (existsSync(occAll)) {
   const parts = readFileSync(occAll, "utf8").split(/^-- ===== /m).filter((p) => p.trim());
   const kept = [];
   const dropped = new Map();
   for (const part of parts) {
-    const book = part.split("\n")[0].trim();
+    const header = part.split("\n")[0].trim();
+    const m = /^([1-3A-Z]{3})$/.exec(header);
+    if (!m) {
+      console.error(`refusing to split repair-source-occurrences-all.sql: unrecognised section header "${header.slice(0, 60)}"`);
+      process.exit(1);
+    }
+    const book = m[1];
     const n = (part.match(/^UPDATE verses/gm) ?? []).length;
     if (isLocked(book)) { dropped.set(book, n); continue; }
     kept.push("-- ===== " + part.replace(/\s+$/, "") + "\n");
