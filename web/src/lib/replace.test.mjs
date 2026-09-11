@@ -2736,6 +2736,30 @@ function countAllMilestones(nodes) {
   assert(extractEditableText(r.content) === after, `editable text === newPlain (got ${JSON.stringify(extractEditableText(r.content))})`);
 }
 
+// ─── Case 78 (F2): smartReplaceVerse's plainText must match the hoisted content ──
+// JER-31:18-shaped fixture: H1's own trailing text already carries a stranded
+// opener (", ‘") and a `\n` sibling separates it from H2 — smartReplaceVerse
+// re-hoists its WHOLE output unconditionally (see the wrapper's own comment),
+// so even an edit far from the punctuation (here, "disciplined"->"corrected")
+// re-glues the opener to H2 and drops the space the pre-hoist plain text still
+// carried. Before the F2 fix this wrapper returned the STALE pre-hoist
+// plainText, which would drift from content_json's actual text.
+{
+  console.log("\n[Case 78] smartReplaceVerse's plainText matches the re-hoisted content (F2)");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("himself"), t(", ‘")]),
+      t("\n"),
+      zaln("H2", [w("You"), t(" "), w("disciplined"), t(" "), w("me")]),
+    ],
+  };
+  const plain = "himself, ‘ You disciplined me";
+  const idx = plain.indexOf("disciplined");
+  const r = smartReplaceVerse(verse, plain, /disciplined/g, idx, "disciplined".length, "corrected");
+  assert(r.plainText === extractPlainText(r.content), `plainText matches the derived text of the hoisted content (got plainText=${JSON.stringify(r.plainText)}, derived=${JSON.stringify(extractPlainText(r.content))})`);
+  assert(!/‘ [a-zA-Z]/.test(r.plainText), `plainText no longer has a space between the opener and the following word (got ${JSON.stringify(r.plainText)})`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

@@ -6,7 +6,7 @@
 // Not a test framework; failures exit non-zero. Mirrors src/lib/replace.test.mjs.
 
 import usfm from "usfm-js";
-import { hoistOpeningPunctuation, OPENING_PUNCT_RE } from "./openingPunct.ts";
+import { hoistOpeningPunctuation, OPENING_PUNCT_RE, concatVerseText } from "./openingPunct.ts";
 
 let failed = 0;
 let ran = 0;
@@ -210,6 +210,47 @@ function countMilestones(nodes) {
   const rendered = usfm.toUSFM({ chapters: { "1": { "1": { verseObjects: hoisted } } } }, { forcedNewLines: true });
   assert(rendered.includes("\\zaln-e\\*, ‘\\zaln-s"), `rendered USFM keeps the opener on the same line as the \\zaln-e\\* it follows (got ${JSON.stringify(rendered)})`);
   assert(!/[“‘(\[{]\s*\\zaln-e\\\*/.test(rendered), `no opener immediately precedes a \\zaln-e\\* close (got ${JSON.stringify(rendered)})`);
+}
+
+// ─── Case h (F1): whitespace-only sibling must not hide a \q1 guard ────────
+{
+  console.log("\n[Case h] whitespace-only text sibling before a \\q1 marker still blocks the hoist (F1)");
+  const before = {
+    verseObjects: [
+      zaln("H1", [w("say"), t(", ‘")]),
+      t("\n"),
+      { type: "quote", tag: "q1" },
+      zaln("H2", [w("The")]),
+    ],
+  };
+  const after = hoistOpeningPunctuation(before.verseObjects);
+  assert(JSON.stringify(after) === JSON.stringify(before.verseObjects), "tree is deep-equal to the input (no-op)");
+}
+
+// ─── Case i (F5): nested chain within one OUTER — INNER1's opener bubbles ──
+// only as far as INNER2, since OUTER's own trailing text (after its last
+// word, inside INNER2) is then empty.
+{
+  console.log(
+    "[Case i] nested chain OUTER[INNER1[say, ‘], INNER2[The]]: INNER1's opener hoists to a text node between the two INNERs (F5)",
+  );
+  const before = {
+    verseObjects: [
+      zaln("OUTER", [zaln("INNER1", [w("say"), t(", ‘")]), zaln("INNER2", [w("The")])]),
+    ],
+  };
+  const beforeText = concatVerseText(before.verseObjects);
+  const after = hoistOpeningPunctuation(before.verseObjects);
+  assert(!milestoneTrailingHasOpener(after), "no milestone's trailing leaf matches OPENING_PUNCT_RE after hoist");
+  assert(concatVerseText(after) === beforeText, "concatenated text round-trips exactly");
+  assert(after.length === 1 && after[0].tag === "zaln" && after[0].strong === "OUTER", "OUTER stays the sole top-level node");
+  const outerChildren = after[0].children;
+  assert(outerChildren.length === 3, "a new text node was inserted between INNER1 and INNER2 (got length " + outerChildren.length + ")");
+  assert(outerChildren[0].tag === "zaln" && outerChildren[0].strong === "INNER1", "INNER1 stays first");
+  assert(outerChildren[1].type === "text" && outerChildren[1].text === ", ‘", "hoisted text lands between the two INNER milestones");
+  assert(outerChildren[2].tag === "zaln" && outerChildren[2].strong === "INNER2", "INNER2 stays last");
+  const rendered = usfm.toUSFM({ chapters: { "1": { "1": { verseObjects: after } } } }, { forcedNewLines: true });
+  assert(rendered.includes("\\zaln-e\\*, ‘\\zaln-s"), `renders as \\zaln-e\\*, ‘\\zaln-s (got ${JSON.stringify(rendered)})`);
 }
 
 console.log(`\n${ran} assertion(s) ran, ${failed} failed.`);

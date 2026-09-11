@@ -47,6 +47,11 @@ assert(
   "a milestone with no word leaf at all is not flagged",
 );
 
+assert(
+  hasOpeningPunctInsideMilestone([zaln([zaln([w("say"), t(", ‘")]), zaln([w("The")])])]) === true,
+  "flags an INNER milestone's own trailing opener even when a LATER sibling milestone's word masks it at the outer level (F5)",
+);
+
 assert(hasOpeningPunctInsideMilestone([]) === false, "an empty verse is not flagged");
 assert(hasOpeningPunctInsideMilestone([t("plain text only")]) === false, "a verse with no milestones is not flagged");
 

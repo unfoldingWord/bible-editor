@@ -77,18 +77,37 @@ function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-// Returns a NEW verseObjects array (does not mutate the input) with every
-// top-level `\zaln` milestone's stranded trailing opener moved to a top-level
-// text node right after it. Idempotent, and preserves the verse's
-// concatenated text exactly, except that an opener may step over the
-// following sibling's leading whitespace (see below) so it stays glued to
-// the next `\zaln-s`.
-export function hoistOpeningPunctuation(verseObjects: unknown[]): unknown[] {
-  if (!Array.isArray(verseObjects)) return verseObjects;
-  const clone = deepClone(verseObjects) as unknown[];
+// True for a `{type:"text", ...}` node whose text is empty or whitespace-only
+// (and has no children). Used to look PAST such a node when deciding whether
+// the next real thing after a milestone is an in-flow marker — usfm-js parks
+// a structural `\n` between milestones as its own text node, and that node
+// must not hide an `\q1`/`\p` line-break marker one slot further on.
+function isWhitespaceOnlyText(n: unknown): boolean {
+  const o = n as Record<string, unknown> | null;
+  return !!o && o["type"] === "text" && !o["children"] && /^\s*$/u.test(String(o["text"] ?? ""));
+}
 
-  for (let i = 0; i < clone.length; i++) {
-    const node = clone[i] as Record<string, unknown> | null;
+// Hoists stranded trailing openers within one array of sibling nodes
+// (mutates `nodes` and the objects in it in place — callers own the clone).
+// Recurses into each `\zaln` milestone's children FIRST, then processes
+// milestones at the current level exactly as before. A multi-source
+// alignment can nest milestones (`OUTER[ INNER1[say, "‘"], INNER2[The] ]`)
+// with no trailing text after OUTER's own last word, so without the
+// recursion INNER1's stranded opener is invisible from OUTER's level. A
+// trailing opener hoisted out of an INNER milestone becomes a new sibling
+// inside OUTER's children; if that sibling is itself now OUTER's own
+// trailing text, the current-level pass below picks it up and bubbles it
+// further — intended.
+function hoistLevel(nodes: unknown[]): void {
+  for (const n of nodes) {
+    const o = n as Record<string, unknown> | null;
+    if (o && o["type"] === "milestone" && o["tag"] === "zaln" && Array.isArray(o["children"])) {
+      hoistLevel(o["children"] as unknown[]);
+    }
+  }
+
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i] as Record<string, unknown> | null;
     if (!node || node["type"] !== "milestone" || node["tag"] !== "zaln") continue;
     const children = node["children"];
     if (!Array.isArray(children)) continue;
@@ -97,10 +116,21 @@ export function hoistOpeningPunctuation(verseObjects: unknown[]): unknown[] {
     if (!info.hasWord || info.text === "") continue;
     if (!OPENING_PUNCT_RE.test(info.text)) continue;
 
-    const next = clone[i + 1] as Record<string, unknown> | undefined;
-    // Never move text across a line-break marker (\q1/\p/\b/\m-style). A
-    // character wrapper (\qs) holds content, not a line break, so it's fine.
-    if (next && isInFlowMarker(next) && !isCharacterWrapper(next)) continue;
+    // The guard looks PAST whitespace-only text siblings (usfm-js parks a
+    // structural `\n` between milestones as its own text node) to find the
+    // first real thing following the milestone. Never move text across a
+    // line-break marker (\q1/\p/\b/\m-style) found there. A character
+    // wrapper (\qs) holds content, not a line break, so it's fine. If
+    // nothing follows (the milestone is last), there's nothing to guard
+    // against — still hoist.
+    let guardIdx = i + 1;
+    while (guardIdx < nodes.length && isWhitespaceOnlyText(nodes[guardIdx])) guardIdx++;
+    const guard = nodes[guardIdx] as Record<string, unknown> | undefined;
+    if (guard && isInFlowMarker(guard) && !isCharacterWrapper(guard)) continue;
+
+    // The prepend/step-over logic below keeps targeting the IMMEDIATE
+    // sibling, not the (possibly further) guard node.
+    const next = nodes[i + 1] as Record<string, unknown> | undefined;
 
     for (const leaf of info.leaves) {
       const existing = leaf.arr[leaf.idx] as Record<string, unknown>;
@@ -127,9 +157,36 @@ export function hoistOpeningPunctuation(verseObjects: unknown[]): unknown[] {
       const opener = info.text.slice(openerAt);
       next["text"] = closing + lead + opener + nextText.slice(lead.length);
     } else {
-      clone.splice(i + 1, 0, { type: "text", text: info.text });
+      nodes.splice(i + 1, 0, { type: "text", text: info.text });
     }
   }
+}
 
+// Returns a NEW verseObjects array (does not mutate the input) with every
+// `\zaln` milestone's (at any depth) stranded trailing opener moved to a
+// top-level (relative to its own array) text node right after it. Idempotent,
+// and preserves the verse's concatenated text exactly, except that an opener
+// may step over the following sibling's leading whitespace (see below) so it
+// stays glued to the next `\zaln-s`.
+export function hoistOpeningPunctuation(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  const clone = deepClone(verseObjects) as unknown[];
+  hoistLevel(clone);
   return clone;
+}
+
+// Concatenate every `text` field in a verseObjects tree, recursing into
+// children — no whitespace collapsing, no marker-separator rules. Used to
+// detect whether a hoist actually changed the verse's raw text (it can, by
+// stepping an opener over a sibling's leading whitespace) so callers know
+// whether a cached plain_text needs recomputing.
+export function concatVerseText(nodes: unknown[]): string {
+  let out = "";
+  for (const n of nodes ?? []) {
+    const o = n as Record<string, unknown> | null;
+    if (!o) continue;
+    if (typeof o["text"] === "string") out += o["text"];
+    if (Array.isArray(o["children"])) out += concatVerseText(o["children"] as unknown[]);
+  }
+  return out;
 }

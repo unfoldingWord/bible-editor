@@ -43,6 +43,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hoistOpeningPunctuation } from "../web/src/lib/openingPunct.ts";
 import { PUBLISHED_BOOKS } from "../api/src/publishedGuard.ts";
+import { extractPlainText } from "../api/src/importParsers.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -145,7 +146,8 @@ for (const r of rows) {
   const before = trailingGapsWithOpener(vo);
   if (before.length > 0) {
     const hoisted = hoistOpeningPunctuation(vo);
-    const newContent = JSON.stringify({ ...content, verseObjects: hoisted });
+    const newContentObj = { ...content, verseObjects: hoisted };
+    const newContent = JSON.stringify(newContentObj);
     // Guard: only report a real byte-level change.
     if (newContent !== r.content_json) {
       st.corrected++;
@@ -157,6 +159,12 @@ for (const r of rows) {
         rowVersion: r.version,
         before,
         newContent,
+        // Re-derived from the hoisted content the same way applyVerseUpdate
+        // (api/src/pipelineImport.ts) re-derives plain_text after a mutation
+        // pass — the hoist can shift where whitespace sits (see F2 in
+        // web/src/lib/openingPunct.ts), so the stored plain_text must be
+        // recomputed rather than left pointing at the pre-repair text.
+        newPlainText: extractPlainText(newContentObj),
       });
     }
   }
@@ -226,7 +234,8 @@ if (doRepair && repairable.length > 0) {
   const lines = [
     `-- Repair opening punctuation stranded inside an alignment milestone. Generated ${new Date().toISOString()}`,
     `-- ${repairable.length} verse(s) in unlocked books (${withheld.length} withheld in locked books). Hoists the`,
-    `-- opener to a top-level text node, bumps version (stale-client refetch), and logs an edit_log row.`,
+    `-- opener to a top-level text node, refreshes plain_text, bumps version (stale-client`,
+    `-- refetch), and logs an edit_log row.`,
     `-- Each UPDATE is guarded on the dumped version; compare the reported changes count with ${repairable.length}.`,
     `-- No BEGIN/COMMIT: remote D1 rejects explicit transactions and wraps the file atomically itself.`,
   ];
@@ -234,12 +243,12 @@ if (doRepair && repairable.length > 0) {
     const key = `${f.book}/${f.chapter}/${f.verse}/${f.version}`;
     // Same audit shape the app writes for a verse PATCH (verses.ts): action
     // 'update' — history replay consumes only create / update / restore, so a
-    // bespoke verb is an invisible audit row — a payload of { content } like
-    // parsed.data, and gated on changes() so a skipped UPDATE (version moved
-    // on) leaves no orphan history entry.
-    const payload = JSON.stringify({ content: JSON.parse(f.newContent) });
+    // bespoke verb is an invisible audit row — a payload of { content,
+    // plain_text } like parsed.data, and gated on changes() so a skipped
+    // UPDATE (version moved on) leaves no orphan history entry.
+    const payload = JSON.stringify({ content: JSON.parse(f.newContent), plain_text: f.newPlainText });
     lines.push(
-      `UPDATE verses SET content_json = ${q(f.newContent)}, version = version + 1, updated_at = ${now}, updated_by = ${actor}`,
+      `UPDATE verses SET content_json = ${q(f.newContent)}, plain_text = ${q(f.newPlainText)}, version = version + 1, updated_at = ${now}, updated_by = ${actor}`,
       ` WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)} AND version = ${Number(f.rowVersion)};`,
       `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)`,
       `  SELECT 'verse', ${q(key)}, ${q(f.book)}, ${actor}, version - 1, version, 'update', ${q(payload)}`,

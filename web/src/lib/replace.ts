@@ -19,10 +19,10 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText, extractPlainText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
-import { hoistOpeningPunctuation } from "./openingPunct.ts";
+import { hoistOpeningPunctuation, concatVerseText } from "./openingPunct.ts";
 
 export interface SmartReplaceResult {
   content: unknown;
@@ -1132,7 +1132,15 @@ export function smartReplaceVerse(
   const result = smartReplaceVerseImpl(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText);
   const verseObjectsOut = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (Array.isArray(verseObjectsOut)) {
-    return { ...result, content: { verseObjects: pruneEmptyText(hoistOpeningPunctuation(verseObjectsOut)) } };
+    const hoisted = pruneEmptyText(hoistOpeningPunctuation(verseObjectsOut));
+    const newContent = { verseObjects: hoisted };
+    // The hoist can change the verse's raw text (stepping an opener over a
+    // sibling's leading whitespace — see openingPunct.ts), so `result.plainText`
+    // (computed before the hoist ran) can go stale. Only recompute when the
+    // text actually changed, so every unaffected verse's plainText stays
+    // byte-identical to today.
+    const textChanged = concatVerseText(verseObjectsOut) !== concatVerseText(hoisted);
+    return { ...result, content: newContent, plainText: textChanged ? extractPlainText(newContent) : result.plainText };
   }
   return result;
 }
@@ -2359,9 +2367,15 @@ export function smartEditVerse(
     const normalized = pruneEmptyText(
       pruneDeadMilestones(hoistOpeningPunctuation(normalizeWordPunctuation(verseObjects))),
     );
+    const newContent = { verseObjects: normalized };
+    // See smartReplaceVerse's identical guard: the hoist inside this pass can
+    // change the verse's raw text (stepping an opener over a sibling's leading
+    // whitespace), which would otherwise leave `result.plainText` stale.
+    const textChanged = concatVerseText(verseObjects) !== concatVerseText(normalized);
     return {
       ...result,
-      content: { verseObjects: normalized },
+      content: newContent,
+      plainText: textChanged ? extractPlainText(newContent) : result.plainText,
       ...(captureDroppedMarkers ? { markerCaptureGuarded: true } : {}),
     };
   }

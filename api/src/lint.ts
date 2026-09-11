@@ -1510,7 +1510,7 @@ export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
         check: "Opening punctuation inside alignment",
         bucket: "flag",
         ref,
-        message: "Opening quote or bracket stored inside the preceding word's alignment; Door43 renders a stray space after it. Any text edit saved in the editor heals it (a save with no text change is a no-op); or run scripts/scan-opening-punct.mjs.",
+        message: "Opening quote or bracket stored inside the preceding word's alignment; Door43 renders a stray space after it. Fix by editing the verse in the editor (any text change re-lays it) or with scripts/scan-opening-punct.mjs; if a line-break marker (\\q, \\p) follows it, move the quote by hand.",
       });
     }
   }

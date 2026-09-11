@@ -50,8 +50,14 @@ function trailingTextAfterLastWord(nodes: unknown[]): string | null {
     .join("");
 }
 
-// True when any TOP-LEVEL `\zaln` milestone's trailing text (after its last
-// `\w`, anywhere in its subtree) matches an opening quote/bracket.
+// True when any `\zaln` milestone AT ANY DEPTH has its own trailing text
+// (after its own last `\w`) matching an opening quote/bracket.
+//
+// Recurses into each milestone's children FIRST: a multi-source alignment can
+// nest milestones (`OUTER[ INNER1[say, trailing "‘"], INNER2[The] ]`), and
+// INNER1's trailing text is masked at OUTER's level because OUTER's own last
+// word (inside INNER2) comes after it — trailingTextAfterLastWord finds no
+// trailing text at all in that case. Checking INNER1 on its own catches it.
 export function hasOpeningPunctInsideMilestone(nodes: unknown[]): boolean {
   if (!Array.isArray(nodes)) return false;
   for (const n of nodes) {
@@ -60,6 +66,7 @@ export function hasOpeningPunctInsideMilestone(nodes: unknown[]): boolean {
     if (o["type"] === "milestone" && o["tag"] === "zaln") {
       const children = o["children"];
       if (Array.isArray(children)) {
+        if (hasOpeningPunctInsideMilestone(children)) return true;
         const trailing = trailingTextAfterLastWord(children);
         if (trailing != null && OPENING_PUNCT_RE.test(trailing)) return true;
       }
