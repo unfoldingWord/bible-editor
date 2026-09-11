@@ -24,10 +24,21 @@
 // is reported as a warning (the dump is stale relative to what was repaired)
 // rather than crashing.
 //
+// A sidecar row this script CANNOT check (its (book,id) missing from the tn
+// dump, its book missing from the source dump entirely, or its ref resolving
+// to no source words — e.g. a genuinely cross-chapter ref, see #769) is an
+// UNVERIFIED repair, not a verified-clean one. This is the gate run before
+// applying production repair SQL, so by default any unverified row fails the
+// run (nonzero exit) exactly like a row that failed a safety property — a run
+// that skipped every row and printed "0 failed" must not read as "verified
+// clean". Pass --allow-stale when an operator has already confirmed the gap is
+// expected (e.g. a deliberately old dump) and wants to proceed anyway; skipped
+// rows are still listed either way.
+//
 // Usage:
 //   node --experimental-strip-types --no-warnings \
 //     scripts/verify-tn-quote-repair.mjs scripts/out/dump/tn.json scripts/out/dump/src-all.json \
-//     [scripts/out/repair-tn-quotes.json]
+//     [scripts/out/repair-tn-quotes.json] [--allow-stale]
 
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
@@ -35,10 +46,12 @@ import { fileURLToPath } from "node:url";
 import { resolveTnQuote, sourceWordsByRef, wordsForRow, QUOTE_GAP } from "../api/src/lint.ts";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const [tnPath, srcPath, sidecarPathArg] = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+const allowStale = rawArgs.includes("--allow-stale");
+const [tnPath, srcPath, sidecarPathArg] = rawArgs.filter((a) => a !== "--allow-stale");
 if (!tnPath || !srcPath) {
   console.error(
-    "usage: node scripts/verify-tn-quote-repair.mjs <tn-dump.json> <src-dump.json> [sidecar.json]",
+    "usage: node scripts/verify-tn-quote-repair.mjs <tn-dump.json> <src-dump.json> [sidecar.json] [--allow-stale]",
   );
   process.exit(1);
 }
@@ -96,23 +109,35 @@ console.log(
     (sidecar.generatedAt ? ` (run ${sidecar.generatedAt}${sidecar.book ? ` BOOK=${sidecar.book}` : ""})` : ""),
 );
 
-let repairs = 0, bad = 0, stale = 0;
+let repairs = 0, bad = 0, stale = 0, unverifiable = 0;
 for (const s of sidecarRows) {
   const dumpRow = tnByKey.get(tnKey(s.book, s.id));
   if (!dumpRow) {
     stale++;
+    unverifiable++;
     console.log(
       `\n?? ${s.book} ${s.id} — in the repair sidecar but missing from the tn dump ` +
-        "(the dump is stale relative to what was repaired; skipping, not crashing)",
+        "(the dump is stale relative to what was repaired; UNVERIFIED, not crashing)",
     );
     continue;
   }
   const byRef = wordsByBook.get(s.book);
-  if (!byRef) continue;
+  if (!byRef) {
+    unverifiable++;
+    console.log(`\n?? ${s.book} ${s.id} — no source (UHB/UGNT) rows for this book in the src dump; UNVERIFIED`);
+    continue;
+  }
   // ref_raw comes from the CURRENT tn dump row, not the sidecar (which only
   // carries chapter/verse) — needed for ranged/listed references ("1:5-6").
   const words = wordsForRow(byRef, s.chapter, s.verse, dumpRow.ref_raw);
-  if (!words.length) continue;
+  if (!words.length) {
+    unverifiable++;
+    console.log(
+      `\n?? ${s.book} ${dumpRow.ref_raw ?? `${s.chapter}:${s.verse}`} ${s.id} — ref resolves to no source words ` +
+        "(a hole in the span, or a genuinely cross-chapter ref — see #769); UNVERIFIED",
+    );
+    continue;
+  }
   repairs++;
 
   const problems = [];
@@ -143,7 +168,13 @@ for (const s of sidecarRows) {
   }
 }
 console.log(
-  `\nchecked ${repairs} repair(s) from the sidecar (${stale} stale/missing from the tn dump); ` +
-    `${bad} failed a safety property`,
+  `\nchecked ${repairs} repair(s) from the sidecar (${stale} stale/missing from the tn dump, ` +
+    `${unverifiable} total unverified); ${bad} failed a safety property`,
 );
-process.exit(bad ? 1 : 0);
+if (unverifiable && !allowStale) {
+  console.error(
+    `\nrefusing to exit 0: ${unverifiable} sidecar row(s) could not be verified at all — ` +
+      "pass --allow-stale to proceed anyway once you've confirmed the gap is expected.",
+  );
+}
+process.exit(bad || (unverifiable && !allowStale) ? 1 : 0);
