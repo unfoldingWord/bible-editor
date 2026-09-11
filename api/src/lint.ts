@@ -27,6 +27,7 @@
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
 import { extractPlainText, isInFlowMarker, isTsMilestone } from "./importParsers.ts";
+import { findOpeningPunctInAlignment } from "./openingPunct.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
 
 export type IssueBucket = "flag" | "escalate";
@@ -1459,7 +1460,8 @@ function quoteIssues(verses: VerseRow[]): LintIssue[] {
 }
 
 // USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes,
-// joiner-glued alignment milestones, and unmatched curly quotation marks.
+// joiner-glued alignment milestones, opening punctuation trapped inside an
+// alignment milestone, and unmatched curly quotation marks.
 // Footnotes/glued-milestones/reused-tokens are genuinely per-verse; quotation
 // marks are not (see quoteIssues) and are checked once across the whole call,
 // not inside this per-verse loop. (Verse-coverage / chapter-count are guarded
@@ -1501,6 +1503,25 @@ export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
         bucket: "flag",
         ref,
         message: "the same source word is aligned in more than one group (renders as doubled Hebrew); re-align the verse.",
+      });
+    }
+    // An opening quote/bracket parked in the trailing text of an alignment
+    // milestone that is immediately followed by another one. usfm-js emits a
+    // newline between those two milestones, Door43 renders it as a space, and
+    // the reader sees `say, ‘ The one…` (en_ult JER 31:10 / 31:18, #777).
+    // `flag`, not `escalate`: the USFM is well formed and the words are all
+    // there — it is a rendering/copy defect, and the fix (re-saving the verse
+    // through the editor, or scripts/scan-opening-punct.mjs) is in-app work.
+    // Detection is shared with the pipeline self-heal and the repair script so
+    // a repair can never leave a row the lint still rejects.
+    for (const found of findOpeningPunctInAlignment(vos)) {
+      issues.push({
+        check: "Opening punctuation inside alignment",
+        bucket: "flag",
+        ref,
+        message:
+          `opening punctuation ${JSON.stringify(found.text)} is stored inside the preceding alignment ` +
+          "milestone; Door43 renders it followed by a stray space. Re-save the verse to move it out.",
       });
     }
   }

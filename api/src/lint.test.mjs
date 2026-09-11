@@ -188,6 +188,33 @@ t("intra-word U+2060 joiner is NOT flagged as glued", () => {
   assert.equal(i.filter((x) => x.check === "Glued alignment").length, 0);
 });
 
+// Opening punctuation trapped in a milestone's trailing text (#777). The
+// detector itself is unit-tested in openingPunct.test.mjs; these pin that the
+// check is registered, flags rather than escalates, and does not fire on the
+// correct shape.
+const openingPunctIssues = (issues) => issues.filter((x) => x.check === "Opening punctuation inside alignment");
+t("opening quote inside the preceding milestone is flagged", () => {
+  const i = openingPunctIssues(lintUsfmVerses([verseFromUsfm(
+    `\\c 1\n\\p\n\\v 1 \\zaln-s |x-strong="H1" x-content="א"\\*\\w say\\w*, ‘\\zaln-e\\*\\zaln-s |x-strong="H2" x-content="ב"\\*\\w The\\w*\\zaln-e\\*\n`,
+  )]));
+  assert.equal(i.length, 1);
+  assert.equal(i[0].bucket, "flag");
+  assert.equal(i[0].ref, "1:1");
+  assert.match(i[0].message, /stray space/);
+});
+t("the same gap as a TOP-LEVEL text node is NOT flagged", () => {
+  const i = openingPunctIssues(lintUsfmVerses([verseFromUsfm(
+    `\\c 1\n\\p\n\\v 1 \\zaln-s |x-strong="H1" x-content="א"\\*\\w say\\w*\\zaln-e\\*, ‘\\zaln-s |x-strong="H2" x-content="ב"\\*\\w The\\w*\\zaln-e\\*\n`,
+  )]));
+  assert.equal(i.length, 0);
+});
+t("closing-only trailing punctuation is NOT flagged", () => {
+  const i = openingPunctIssues(lintUsfmVerses([verseFromUsfm(
+    `\\c 1\n\\p\n\\v 1 \\zaln-s |x-strong="H1" x-content="א"\\*\\w say\\w*, \\zaln-e\\*\\zaln-s |x-strong="H2" x-content="ב"\\*\\w The\\w*\\zaln-e\\*\n`,
+  )]));
+  assert.equal(i.length, 0);
+});
+
 // Multi-verse variant of verseFromUsfm: returns one VerseRow per \v in the
 // given text, across however many \c chapters it contains (verseFromUsfm only
 // ever returns chapter 1 verse 1). Shared by the quote-pairing tests here and
