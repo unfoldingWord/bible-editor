@@ -57,6 +57,7 @@
 // split as chapterLock.test.mjs.
 
 import { DatabaseSync } from "node:sqlite";
+import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
@@ -1250,6 +1251,62 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
       .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:NUM:ult'`)
       .all()[0].n;
     assert(remaining === 1, "a keep_no_base warning banner is preserved by the retire sweep, not erased");
+  }
+
+  // Case 4 (Codex review on #761): the pair lookup must fail CLOSED. If
+  // SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL throws, the retire
+  // UPDATE must NOT run at all this call — running it anyway (with an empty
+  // pairs list, so no banner clear) would stamp resolved_at on every
+  // standing row, and the pairs SELECT's own `resolved_at IS NULL` filter
+  // then means no LATER night's lookup can ever find those rows again,
+  // permanently losing the banner clear. Drives the REAL async
+  // retireVerseKeptAiMasterFlags (not the SQL-replica pattern above) against
+  // a minimal D1 shim so the throw actually exercises its try/catch control
+  // flow, not just a hand replica of it.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('MIC','ust',5,14,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:MIC:ust','Sync flagged 1 verse(s) in MIC UST...',100)`,
+    ).run();
+
+    const env = {
+      DB: {
+        prepare(sql) {
+          const isPairLookup = sql === SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL;
+          return {
+            bind: (...args) => ({
+              all: async () => ({ results: d.prepare(sql).all(...args) }),
+              run: async () => {
+                const r = d.prepare(sql).run(...args);
+                return { meta: { changes: Number(r.changes) } };
+              },
+            }),
+            all: async () => {
+              if (isPairLookup) throw new Error("simulated transient D1 error");
+              return { results: d.prepare(sql).all() };
+            },
+          };
+        },
+      },
+    };
+
+    const result = await retireVerseKeptAiMasterFlags(env);
+    assert(result.cleared === 0, "a failed pair lookup reports 0 cleared, never a partial retire");
+
+    const row = d
+      .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='MIC' AND resource='ust' AND verse=14`)
+      .all()[0];
+    assert(row.resolved_at === null,
+      "the retire UPDATE never ran — the row is left standing so the next sweep can find it again");
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:MIC:ust'`)
+      .all()[0].n;
+    assert(remaining === 1, "…and the banner is untouched too, consistent with the row it names still standing");
   }
 }
 

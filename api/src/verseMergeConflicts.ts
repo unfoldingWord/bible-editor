@@ -326,13 +326,27 @@ export async function deleteLostAdoptionConflicts(
 // keep_alignment_refused/source_attr_divergent/keep_local_structure row, or a
 // keep_no_base warning, correctly keeps its banner up.
 //
-// Best-effort, like every other write in this file: it runs inside the nightly
-// sweep step, and a banner row that failed to come down is not a reason to
-// abandon the export that follows. Idempotent — the second night matches nothing
-// (no pairs read, nothing to retire, nothing to clear) and reports 0.
+// Best-effort, like every other write in this file — EXCEPT for the pair
+// lookup below, which must fail CLOSED rather than open (Codex review on
+// #761). The rows-vs-banner ordering the rest of this function relies on
+// (read the pairs, THEN retire) is unrecoverable if it runs backwards: the
+// retire UPDATE stamps resolved_at on every standing row, and the pairs
+// SELECT filters resolved_at IS NULL — so a transient failure that let the
+// UPDATE run anyway with an empty pairs list would retire the rows, skip
+// their banner clears, and then never find those (now-resolved) rows again
+// on any later night. That reproduces the exact #760 symptom, permanently.
+// So: if the lookup itself fails, stop before the UPDATE runs at all — the
+// rows stay standing, and the NEXT sweep retries the whole thing (lookup +
+// retire + clear) against them, same as if nothing had happened tonight.
+//
+// The UPDATE and the per-pair clear loop stay best-effort as before: a
+// banner row that failed to come down (or a retire that partially failed)
+// is not a reason to abandon the export that follows. Idempotent — a night
+// with nothing standing reads zero pairs, retires nothing, and clears
+// nothing.
 export async function retireVerseKeptAiMasterFlags(env: Env): Promise<{ cleared: number }> {
   const now = Math.floor(Date.now() / 1000);
-  let pairs: Array<{ book: string; resource: string }> = [];
+  let pairs: Array<{ book: string; resource: string }>;
   try {
     const rs = await env.DB.prepare(SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL).all<{
       book: string;
@@ -343,13 +357,18 @@ export async function retireVerseKeptAiMasterFlags(env: Env): Promise<{ cleared:
     console.error("verse keep_ai_master retire: pair lookup failed", {
       error: e instanceof Error ? e.message : String(e),
     });
-    // Fall through and still attempt the retire UPDATE below — the banner
-    // clear is a best-effort bonus, not a precondition for retiring the rows.
+    // Fail CLOSED: do not run the retire UPDATE this run. Leaving the rows
+    // standing means the next sweep sees them again and can complete the
+    // pair-lookup + retire + banner-clear sequence properly.
+    return { cleared: 0 };
   }
   try {
     const res = await env.DB.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).bind(now).run();
     const cleared = res?.meta?.changes ?? 0;
     if (cleared > 0) console.log("verse keep_ai_master retire", { cleared });
+    // clearResolvedConflictBannerIfLast is itself best-effort (its own
+    // try/catch, logs and returns on failure) — one pair's transient failure
+    // does not throw, so it never skips the rest of this loop.
     for (const { book, resource } of pairs) {
       await clearResolvedConflictBannerIfLast(env, book, resource);
     }
