@@ -339,10 +339,12 @@ export async function deleteLostAdoptionConflicts(
 // rows stay standing, and the NEXT sweep retries the whole thing (lookup +
 // retire + clear) against them, same as if nothing had happened tonight.
 //
-// The UPDATE and the per-pair clear loop stay best-effort as before: a
-// banner row that failed to come down (or a retire that partially failed)
-// is not a reason to abandon the export that follows. Idempotent — a night
-// with nothing standing reads zero pairs, retires nothing, and clears
+// The retire UPDATE and every banner clear then commit as ONE atomic D1
+// batch (see the body): all-or-nothing, so a failure leaves the rows STANDING
+// and the whole sequence retries next sweep rather than stranding a resolved
+// row whose banner never came down. Still non-fatal to the export that
+// follows — a thrown batch is caught and logged, not rethrown. Idempotent — a
+// night with nothing standing reads zero pairs, retires nothing, clears
 // nothing.
 export async function retireVerseKeptAiMasterFlags(env: Env): Promise<{ cleared: number }> {
   const now = Math.floor(Date.now() / 1000);
@@ -363,15 +365,35 @@ export async function retireVerseKeptAiMasterFlags(env: Env): Promise<{ cleared:
     return { cleared: 0 };
   }
   try {
-    const res = await env.DB.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).bind(now).run();
-    const cleared = res?.meta?.changes ?? 0;
-    if (cleared > 0) console.log("verse keep_ai_master retire", { cleared });
-    // clearResolvedConflictBannerIfLast is itself best-effort (its own
-    // try/catch, logs and returns on failure) — one pair's transient failure
-    // does not throw, so it never skips the rest of this loop.
+    // Decide each pair's banner-clear DELETE(s) up front (these are pure reads;
+    // if any fails we fall to the catch and retire nothing, so the rows stay
+    // standing for the next sweep). Then commit the retire UPDATE and every
+    // clear as ONE atomic D1 batch. That atomicity is the fix for the window
+    // Codex flagged on the first pass of this PR: previously the retire UPDATE
+    // committed on its own and the per-pair clears ran afterwards, so a crash
+    // — or a clear that failed and was swallowed — between the two left the
+    // rows resolved_at-stamped but their banners still up, and NO later sweep
+    // could find them again (the pairs SELECT filters resolved_at IS NULL),
+    // reproducing the exact #760 stuck-banner symptom permanently. All-or-
+    // nothing means any failure leaves the rows STANDING and the whole
+    // lookup+retire+clear sequence is retried next sweep, unchanged.
+    //
+    // Order within the batch is immaterial to correctness: keep_ai_master is
+    // NOT one of SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL's actions, so each
+    // clear's `NOT EXISTS (... active alertable conflict ...)` guard does not
+    // depend on the retire having stamped these rows first. A pair that still
+    // carries a real adopt_conflict / keep_* row keeps its banner (the DELETE
+    // matches nothing), exactly as before.
+    const clearStmts: D1PreparedStatement[] = [];
     for (const { book, resource } of pairs) {
-      await clearResolvedConflictBannerIfLast(env, book, resource);
+      clearStmts.push(...(await resolvedBannerClearStmts(env, book, resource)));
     }
+    const batch = await env.DB.batch([
+      env.DB.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).bind(now),
+      ...clearStmts,
+    ]);
+    const cleared = batch[0]?.meta?.changes ?? 0;
+    if (cleared > 0) console.log("verse keep_ai_master retire", { cleared });
     return { cleared };
   } catch (e) {
     console.error("verse keep_ai_master retire: failed", {
@@ -379,6 +401,39 @@ export async function retireVerseKeptAiMasterFlags(env: Env): Promise<{ cleared:
     });
     return { cleared: 0 };
   }
+}
+
+// The banner-clear DELETEs retireVerseKeptAiMasterFlags folds into its atomic
+// retire batch, decided from the same reads clearResolvedConflictBannerIfLast
+// makes but RETURNED rather than executed, so they commit in one transaction
+// with the retire UPDATE. Mirrors that function's decision exactly: skip the
+// pair entirely when another alertable conflict still justifies the banner, or
+// when every undismissed alert still carries a keep_no_base warning; otherwise
+// one source-wide DELETE when every undismissed alert is conflict-only, else a
+// per-username DELETE for each that is. Both DELETEs re-assert the "no active
+// alertable conflict" predicate in SQL, so a reimport landing between these
+// reads and the batch cannot have its fresh banner wrongly cleared.
+async function resolvedBannerClearStmts(
+  env: Env,
+  book: string,
+  resource: string,
+): Promise<D1PreparedStatement[]> {
+  const source = `verse_merge_conflict:${book}:${resource}`;
+  const active = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).bind(book, resource).all();
+  if ((active.results?.length ?? 0) > 0) return []; // other conflicts still justify the banner
+  const alerts = await env.DB.prepare(
+    `SELECT username, message FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`,
+  )
+    .bind(source)
+    .all<{ username: string; message: string }>();
+  const toClear = (alerts.results ?? []).filter((a) => !alertMessageCarriesNoBaseWarning(a.message));
+  if (toClear.length === 0) return []; // nothing undismissed, or every row still carries keep_no_base
+  if (toClear.length === (alerts.results?.length ?? 0)) {
+    return [env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).bind(source, book, resource)];
+  }
+  return toClear.map((a) =>
+    env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL).bind(a.username, source, book, resource),
+  );
 }
 
 interface StoredConflictRow {
