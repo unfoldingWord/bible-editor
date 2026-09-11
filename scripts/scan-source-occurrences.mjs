@@ -46,7 +46,7 @@
 // Optional: limit to one book with BOOK=JER, and printed-row count with
 // SCAN_PRINT_LIMIT=N.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { correctSourceOccurrences } from "../web/src/lib/sourceOccurrences.ts";
@@ -195,6 +195,21 @@ if (withheld.length) {
     [...byBook].map(([b, n]) => `${b} ${n}`).join(", "));
 }
 
+// Any earlier run's SQL is removed FIRST, whether or not this run writes a new
+// one. Otherwise a run whose every finding was withheld (all in locked books)
+// would leave a stale file behind that still carries those locked-book UPDATEs
+// — and an operator applying "the output" would write exactly what the lock
+// rule exists to prevent. (Codex review of PR #772.)
+const outDir = resolve(repoRoot, "scripts/out");
+const outPath = resolve(outDir, "repair-source-occurrences.sql");
+if (doRepair && existsSync(outPath)) {
+  unlinkSync(outPath);
+  console.log(`removed stale ${outPath}`);
+}
+if (doRepair && repairable.length === 0) {
+  console.log("\nNothing to repair in unlocked books — no SQL written.");
+}
+
 if (doRepair && repairable.length > 0) {
   const q = (v) => {
     if (v === null || v === undefined) return "NULL";
@@ -239,9 +254,7 @@ if (doRepair && repairable.length > 0) {
       `    FROM verses WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)} AND changes() > 0;`,
     );
   }
-  const outDir = resolve(repoRoot, "scripts/out");
   if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
-  const outPath = resolve(outDir, "repair-source-occurrences.sql");
   writeFileSync(outPath, lines.join("\n") + "\n", "utf8");
   console.log(`\nWrote repair SQL for ${repairable.length} verse(s): ${outPath}`);
 }
