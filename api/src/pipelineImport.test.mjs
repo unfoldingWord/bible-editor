@@ -3247,4 +3247,314 @@ await (async () => {
   }
 })();
 
+// ─── #775: applyVerseUpdate / applyTqUpsert must CAS on version, not clobber
+//    a concurrent write ────────────────────────────────────────────────────
+// Both write paths read `existing.version` (for the audit row) but, before
+// the fix, never bound it into the UPDATE's WHERE clause — an unconditional
+// overwrite. The guarded UPDATE and its audit-log/accept bookkeeping are one
+// D1 batch (one transaction); the bookkeeping statements self-gate in SQL on
+// `version = <newVersion> AND last_change_source = 'ai_pipeline'` rather than
+// JS deciding whether to send them, since a D1 batch has no way to make one
+// statement conditional on an earlier one's result. These drive
+// importJobOutput end-to-end against a fake D1 whose guarded UPDATE reports
+// changes:0 (as it would if a translator's PATCH won the race first) and
+// whose edit_log/accept statements accordingly report changes:0 too (as real
+// SQLite would, since their EXISTS gate can never be true when the guarded
+// UPDATE never landed) — asserting the loss is a skip, not a silent clobber:
+// no edit_log audit row lands, no pending_imports accept lands, the outcome
+// surfaces in the ApplyResult, and the bookkeeping SQL actually carries the
+// gate (a regression guard against the gate text being simplified away).
+
+await (async () => {
+  const dbState = { claimedAt: 7000 };
+  let verseUpdateAttempted = false;
+  let editLogSql = null;
+  let pendingAcceptSql = null;
+
+  function dispatch(sql, args) {
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /import_claimed_at\s*=\s*\?2/.test(sql)) {
+      dbState.claimedAt += 1;
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { staged_at: 999999 } };
+    }
+    if (/SELECT state, error_kind FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { state: "running", error_kind: null } };
+    }
+    if (/SELECT user_id FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { user_id: 1 } };
+    }
+    if (/ORDER BY kind, chapter, verse, id/.test(sql)) {
+      return {
+        changes: 0,
+        rows: [
+          {
+            id: 1,
+            kind: "verse",
+            book: "GEN",
+            chapter: 1,
+            verse: 1,
+            bible_version: "ULT",
+            payload_json: JSON.stringify({ content_json: JSON.stringify({ verseObjects: [] }), plain_text: "" }),
+          },
+        ],
+        single: null,
+      };
+    }
+    if (/MAX\(sort_order\)/.test(sql)) {
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/SELECT chapter, verse, content_json FROM verses/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // no UHB/UGNT source rows loaded
+    }
+    if (/SELECT version, content_json, plain_text, updated_at FROM verses/.test(sql)) {
+      // A live row exists at version 5 — a concurrent write already moved past
+      // the version the pipeline is about to write with.
+      return { changes: 0, rows: [], single: { version: 5, content_json: "{}", plain_text: "", updated_at: 1000 } };
+    }
+    if (/UPDATE verses\s+SET content_json/.test(sql)) {
+      verseUpdateAttempted = true;
+      // The guarded UPDATE's WHERE clause requires version = 5 (the value read
+      // above); simulate that a concurrent write already bumped it past that,
+      // so this CAS'd UPDATE matches zero rows — exactly what D1 would report.
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/INSERT INTO edit_log/.test(sql)) {
+      editLogSql = sql;
+      // Real SQLite would evaluate this statement's own EXISTS(...) gate
+      // (version = newVersion AND last_change_source = 'ai_pipeline' on the
+      // verses row) as false here, since the guarded UPDATE above never
+      // landed — so it inserts nothing. Mirror that instead of the naive
+      // "every INSERT succeeds" default other fakes in this file use.
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) {
+      pendingAcceptSql = sql;
+      // Same reasoning: its EXISTS gate is false too.
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/UPDATE pipeline_jobs SET import_aborted_at/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    throw new Error(`fakeVerseConflictDb: unhandled SQL: ${sql}`);
+  }
+
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              sql,
+              args,
+              async run() {
+                const res = dispatch(sql, args);
+                return { meta: { changes: res.changes }, results: res.rows };
+              },
+              async first() {
+                return dispatch(sql, args).single;
+              },
+              async all() {
+                return { results: dispatch(sql, args).rows };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts) {
+        const results = [];
+        for (const s of stmts) {
+          const res = dispatch(s.sql, s.args);
+          results.push({ meta: { changes: res.changes }, results: res.rows });
+        }
+        return results;
+      },
+    },
+  };
+
+  const originalConsoleWarn = console.warn;
+  let warned = false;
+  console.warn = () => {
+    warned = true;
+  };
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-verse-conflict", pipelineType: "generate", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.warn = originalConsoleWarn;
+  }
+
+  assert(verseUpdateAttempted, "#775 verse CAS: the guarded UPDATE was attempted");
+  assert(editLogSql !== null, "#775 verse CAS: the edit_log statement was sent (self-gated, not JS-skipped)");
+  assert(
+    /EXISTS[\s\S]*last_change_source = 'ai_pipeline'/.test(editLogSql),
+    "#775 verse CAS: the edit_log INSERT self-gates on the row actually landing as an AI write, not just a version number",
+  );
+  assert(pendingAcceptSql !== null, "#775 verse CAS: the pending_imports accept statement was sent (self-gated, not JS-skipped)");
+  assert(
+    /EXISTS[\s\S]*last_change_source = 'ai_pipeline'/.test(pendingAcceptSql),
+    "#775 verse CAS: the pending_imports accept self-gates the same way",
+  );
+  assert(result.applied?.verseUpdated === 0, `#775 verse CAS: verseUpdated stays 0 on a lost CAS (got ${result.applied?.verseUpdated})`);
+  assert(
+    result.applied?.verseSkippedConflict === 1,
+    `#775 verse CAS: the skip is counted in verseSkippedConflict (got ${result.applied?.verseSkippedConflict})`,
+  );
+  assert(warned, "#775 verse CAS: a conflict is logged for observability");
+})();
+
+await (async () => {
+  const dbState = { claimedAt: 8000 };
+  let tqUpdateAttempted = false;
+  let editLogSql = null;
+  let pendingAcceptSql = null;
+
+  function dispatch(sql, args) {
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /import_claimed_at\s*=\s*\?2/.test(sql)) {
+      dbState.claimedAt += 1;
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { staged_at: 999999 } };
+    }
+    if (/SELECT state, error_kind FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { state: "running", error_kind: null } };
+    }
+    if (/SELECT user_id FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { user_id: 1 } };
+    }
+    if (/ORDER BY kind, chapter, verse, id/.test(sql)) {
+      return {
+        changes: 0,
+        rows: [
+          {
+            id: 1,
+            kind: "tq",
+            book: "GEN",
+            chapter: 1,
+            verse: 1,
+            bible_version: null,
+            payload_json: JSON.stringify({ id: "abc1", question: "q?", response: "r." }),
+          },
+        ],
+        single: null,
+      };
+    }
+    if (/MAX\(sort_order\)/.test(sql)) {
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/SELECT version, chapter, verse FROM tq_rows/.test(sql)) {
+      // The proposed id is live, in this chapter, at attempt 0 — "ours" to
+      // adopt — but at a version already ahead of what a concurrent edit left.
+      return { changes: 0, rows: [{ version: 3, chapter: 1, verse: 1 }], single: { version: 3, chapter: 1, verse: 1 } };
+    }
+    if (/UPDATE tq_rows\s+SET/.test(sql)) {
+      tqUpdateAttempted = true;
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/INSERT INTO edit_log/.test(sql)) {
+      editLogSql = sql;
+      // Real SQLite would evaluate this statement's own EXISTS(...) gate
+      // (version = newVersion AND last_change_source = 'ai_pipeline' on the
+      // tq_rows row) as false here, since the guarded UPDATE above never
+      // landed — so it inserts nothing.
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) {
+      pendingAcceptSql = sql;
+      // Same reasoning: its EXISTS gate is false too.
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/UPDATE pipeline_jobs SET import_aborted_at/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    throw new Error(`fakeTqConflictDb: unhandled SQL: ${sql}`);
+  }
+
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              sql,
+              args,
+              async run() {
+                const res = dispatch(sql, args);
+                return { meta: { changes: res.changes }, results: res.rows };
+              },
+              async first() {
+                return dispatch(sql, args).single;
+              },
+              async all() {
+                return { results: dispatch(sql, args).rows };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts) {
+        const results = [];
+        for (const s of stmts) {
+          const res = dispatch(s.sql, s.args);
+          results.push({ meta: { changes: res.changes }, results: res.rows });
+        }
+        return results;
+      },
+    },
+  };
+
+  const originalConsoleWarn = console.warn;
+  let warned = false;
+  console.warn = () => {
+    warned = true;
+  };
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-tq-conflict", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.warn = originalConsoleWarn;
+  }
+
+  assert(tqUpdateAttempted, "#775 tq CAS: the guarded UPDATE was attempted");
+  assert(editLogSql !== null, "#775 tq CAS: the edit_log statement was sent (self-gated, not JS-skipped)");
+  assert(
+    /EXISTS[\s\S]*last_change_source = 'ai_pipeline'/.test(editLogSql),
+    "#775 tq CAS: the edit_log INSERT self-gates on the row actually landing as an AI write, not just a version number",
+  );
+  assert(pendingAcceptSql !== null, "#775 tq CAS: the pending_imports accept statement was sent (self-gated, not JS-skipped)");
+  assert(
+    /EXISTS[\s\S]*last_change_source = 'ai_pipeline'/.test(pendingAcceptSql),
+    "#775 tq CAS: the pending_imports accept self-gates the same way",
+  );
+  assert(result.applied?.tqUpdated === 0, `#775 tq CAS: tqUpdated stays 0 on a lost CAS (got ${result.applied?.tqUpdated})`);
+  assert(result.applied?.tqCreated === 0, `#775 tq CAS: the conflict does not fall through to a fresh INSERT (got tqCreated=${result.applied?.tqCreated})`);
+  assert(
+    result.applied?.tqSkippedConflict === 1,
+    `#775 tq CAS: the skip is counted in tqSkippedConflict (got ${result.applied?.tqSkippedConflict})`,
+  );
+  assert(warned, "#775 tq CAS: a conflict is logged for observability");
+})();
+
 console.log("pipelineImport (claim guard): all assertions passed");
