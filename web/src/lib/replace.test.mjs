@@ -16,6 +16,9 @@ import {
 } from "./replace.ts";
 import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
+// Case 76 asserts on the EXPORTED bytes (api/src/export.ts buildUsfm renders
+// through this same serializer), not just on the tree shape.
+import usfm from "usfm-js";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -2628,6 +2631,143 @@ function countAligned(content) {
     !r.markerCaptureGuarded,
     `the #606 marker-capture guard does NOT catch a relocation (got ${JSON.stringify(r.markerCaptureGuarded)}, warnings ${JSON.stringify(warnings)})`,
   );
+}
+
+// --- Case 76: an edit must not park an opening quote inside the preceding
+// \zaln milestone (#777, en_ult JER 31:10 / 31:18).
+//
+// Companion to the JER_29_31 fixture used by Case 66: there the `,\n‘` gap is a
+// TOP-LEVEL text node between two milestones, which is the shape real uW data
+// uses and the shape that renders correctly. The defect is the other one — the
+// gap living as the trailing text child INSIDE the preceding milestone:
+//
+//   \w say|…\w*, ‘\zaln-e\*
+//   \zaln-s |…\*\w The…
+//
+// usfm-js emits that newline between any two ADJACENT top-level milestones and
+// Door43 renders it as a space, so the reader sees `say, ‘ The one…`. The AI
+// wrote the opener correctly (leading the FOLLOWING milestone); a bible-editor
+// save moved it, because every relayout tier treats an inter-word gap as one
+// atom and writes it into the first text leaf of that gap — the trailing child
+// of the milestone before it. Both an unrelated WORD edit and an unrelated
+// PUNCTUATION edit re-lay every gap in the verse, so both are exercised here.
+{
+  console.log("\n[Case 76] JER 31:10: an unrelated edit does not park the opening quote inside the previous \\zaln");
+  const makeVerse = () => ({
+    verseObjects: [
+      zaln("H8085", [w("Hear"), t(" "), w("the"), t(" "), w("word")]),
+      t(" "),
+      // The AI's shape: the comma trails `say` inside its milestone, the opener
+      // LEADS the next milestone. Renders `say, ‘The one…` on Door43.
+      zaln("H0559", [w("and"), t(" "), w("say"), t(", ")]),
+      zaln("H6908", [t("‘"), w("The"), t(" "), w("one"), t(" "), w("who"), t(" "), w("scattered")]),
+      t(" "),
+      zaln("H8104", [w("will"), t(" "), w("guard"), t(" "), w("him")]),
+      t("."),
+    ],
+  });
+  // Render a verse through usfm-js exactly as api/src/export.ts buildUsfm does,
+  // so the assertions are about the bytes that actually reach Door43 rather
+  // than about our own idea of the tree.
+  const renderUsfm = (content) =>
+    usfm.toUSFM(
+      { headers: [{ tag: "id", content: "JER" }], chapters: { 31: { 10: content } } },
+      { chunk: true },
+    );
+  // …and read those bytes back the way a renderer does. The stray space IS the
+  // `\zaln-e\*`→`\zaln-s` newline, so it only becomes visible after a
+  // round-trip; asserting on the tree alone would miss the whole defect.
+  const renderedText = (content) => extractPlainText(usfm.toJSON(renderUsfm(content)).chapters["31"]["10"]);
+
+  // Pin the MECHANISM first, on a hand-built tree in the broken shape: this is
+  // what en_ult JER 31:10 holds on master today, and it is the only thing that
+  // makes `say, ‘ The` appear. If usfm-js ever stops emitting that newline this
+  // assertion fails and the whole case can be retired.
+  {
+    const broken = {
+      verseObjects: [
+        zaln("H0559", [w("and"), t(" "), w("say"), t(", ‘")]),
+        zaln("H6908", [w("The"), t(" "), w("one")]),
+        t("."),
+      ],
+    };
+    assert(
+      renderedText(broken) === "and say, ‘ The one.",
+      `precondition: the trapped shape really does render a stray space (got ${JSON.stringify(renderedText(broken))})`,
+    );
+  }
+
+  // Precondition: the stored (correct) tree renders clean.
+  assert(
+    renderedText(makeVerse()) === "Hear the word and say, ‘The one who scattered will guard him.",
+    `fixture starts clean (got ${JSON.stringify(renderedText(makeVerse()))})`,
+  );
+
+  for (const [label, edit] of [
+    ["word edit (guard→protect)", (s) => s.replace("guard", "protect")],
+    ["punctuation edit (.→!)", (s) => s.replace(/\.$/, "!")],
+  ]) {
+    const verse = makeVerse();
+    const old = extractEditableText(verse);
+    const next = edit(old);
+    const r = smartEditVerse(verse, old, next);
+    assert(r.plainText === next, `${label}: plainText reconstructs the typed text (got ${JSON.stringify(r.plainText)})`);
+    const out = renderUsfm(r.content);
+    // The defect, stated as bytes: an opening quote immediately before a
+    // closing milestone marker. This is what shipped to master twice.
+    assert(
+      !/[“‘"'([{]\\zaln-e/.test(out),
+      `${label}: no opening punctuation is left sitting before a \\zaln-e\\* (got ${JSON.stringify(out.slice(out.indexOf("\\v 10")))})`,
+    );
+    // …and what that buys: the exported USFM reads back byte-for-byte as what
+    // the translator typed, with no stray space after the opener.
+    assert(
+      renderedText(r.content) === next,
+      `${label}: the exported USFM reads back as typed — no stray space (got ${JSON.stringify(renderedText(r.content))})`,
+    );
+    // Cosmetic only: no word may lose (or change) its alignment for this.
+    const delta = analyzeAlignmentDelta(makeVerse(), r.content);
+    const collateral = delta.unexpectedLosses.filter((l) => l.text !== "guard");
+    assert(
+      collateral.length === 0,
+      `${label}: the hoist costs no alignment (got ${JSON.stringify(collateral.map((l) => l.text))})`,
+    );
+  }
+
+  // The punctuation edit is the one that re-lays the gap into the preceding
+  // milestone (relayoutUnchangedWords writes the whole gap into its first text
+  // leaf), so it is the one that proves the hoist ran. Pin the uW shape it
+  // produces — the same `\zaln-e\*, ‘\zaln-s` one-liner the JER_29_31 fixture
+  // carries — rather than only the negative form above.
+  {
+    const verse = makeVerse();
+    const old = extractEditableText(verse);
+    const r = smartEditVerse(verse, old, old.replace(/\.$/, "!"));
+    assert(
+      renderUsfm(r.content).includes("\\zaln-e\\*, ‘\\zaln-s"),
+      `the re-laid gap renders as \\zaln-e\\*, ‘\\zaln-s on one line (got ${JSON.stringify(renderUsfm(r.content))})`,
+    );
+  }
+
+  // A verse whose gap is ALREADY correct must not be churned by an edit — the
+  // pass is a no-op on the shape it produces, so a save cannot oscillate.
+  {
+    const verse = {
+      verseObjects: [
+        zaln("H0559", [w("and"), t(" "), w("say")]),
+        t(", ‘"),
+        zaln("H6908", [w("The"), t(" "), w("one")]),
+        t("."),
+      ],
+    };
+    const old = extractEditableText(verse);
+    const r = smartEditVerse(verse, old, old.replace(/\.$/, "!"));
+    const vos = r.content.verseObjects;
+    assert(
+      vos.filter((n) => n.type === "text" && n.text === ", ‘").length === 1,
+      `an already-correct gap stays one top-level text node (got ${JSON.stringify(vos.map((n) => n.text ?? `<${n.strong}>`))})`,
+    );
+  }
 }
 
 if (failed > 0) {

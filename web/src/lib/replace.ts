@@ -20,6 +20,7 @@
 // flow through the localized rewrite path too.
 
 import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText } from "./usfm.ts";
+import { hoistOpeningPunctuation } from "./openingPunct.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 
@@ -2334,9 +2335,18 @@ export function smartEditVerse(
     // alignment on disk. smartRebuildRange prunes its own output, but the other
     // tiers don't, so prune globally here. Then clear any empty text it exposes.
     const normalized = pruneEmptyText(pruneDeadMilestones(normalizeWordPunctuation(verseObjects)));
+    // Last: pull an opening quote/bracket back OUT of the milestone whose
+    // trailing text a gap relayout just parked it in. Every tier above treats
+    // an inter-word gap as one atom and writes it into the first text leaf of
+    // that gap — which for `say, ‘The` is the text child INSIDE the `say`
+    // milestone — and usfm-js then emits a newline between the two adjacent
+    // milestones that Door43 renders as `say, ‘ The` (#777, JER 31:10/31:18).
+    // Raw-text preserving and a no-op on every verse that doesn't have the
+    // shape; see openingPunct.ts for the measured serializer behavior.
+    const hoisted = hoistOpeningPunctuation(normalized);
     return {
       ...result,
-      content: { verseObjects: normalized },
+      content: { verseObjects: hoisted },
       ...(captureDroppedMarkers ? { markerCaptureGuarded: true } : {}),
     };
   }

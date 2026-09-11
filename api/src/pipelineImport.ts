@@ -24,6 +24,7 @@ import {
   type VerseExtract,
 } from "./importParsers.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
+import { hoistOpeningPunctuation } from "./openingPunct.ts";
 import { NT_BOOKS } from "./dcsSources.ts";
 import { newRowId, isValidRowId, coerceRowId, deriveAltRowId } from "./rowId.ts";
 import { tnContentKey } from "./tnDedup.ts";
@@ -1922,6 +1923,21 @@ async function applyVerseUpdate(
         // exists to prevent. Curling first means the recompute below always
         // sees the FINAL text.
         curlifyVerseObjects(parsed.verseObjects);
+        // Pull an opening quote/bracket back OUT of the trailing text of the
+        // milestone before it, so usfm-js cannot emit the `\zaln-e\*\n\zaln-s`
+        // newline that Door43 renders as a stray space (`say, ‘ The`) — the
+        // en_ult JER 31:10/31:18 shape (#777). Belt-and-braces: bp-assistant
+        // emits the correct shape today, so this is a no-op on current output;
+        // the web edit engine runs the same pass at the end of smartEditVerse
+        // and this is the matching guard on the pipeline's write path (#778).
+        //
+        // AFTER curlifyVerseObjects, not before: curling only ever swaps a
+        // straight `'`/`"` for its curly form IN PLACE, never moving a node, so
+        // running the position fix second means it sees the FINAL characters
+        // and its opening-bracket test can't miss a quote that was still
+        // straight when it looked. Raw-text preserving, so plain_text (re-
+        // derived below) and recomputeTargetOccurrences are both unaffected.
+        parsed.verseObjects = hoistOpeningPunctuation(parsed.verseObjects);
         recomputeTargetOccurrences(parsed.verseObjects);
         contentJson = JSON.stringify(parsed);
         // Re-derive plain_text from the FINAL corrected tree. Every pass
