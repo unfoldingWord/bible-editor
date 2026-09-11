@@ -122,6 +122,11 @@ function trailingGapsWithOpener(nodes) {
       flat.forEach((s, i) => { if (s.kind === "word") lastWord = i; });
       const trailing = flat.slice(lastWord + 1).filter((s) => s.kind === "text").map((s) => s.text).join("");
       if (OPENING_PUNCT_RE.test(trailing)) gaps.push(trailing);
+      // Nested chains: an opener stranded in an INNER milestone that is
+      // followed by another inner milestone is invisible from this level
+      // (the later inner word masks it) — mirror hoistOpeningPunctuation /
+      // hasOpeningPunctInsideMilestone and look inside.
+      gaps.push(...trailingGapsWithOpener(n.children));
     }
   }
   return gaps;
