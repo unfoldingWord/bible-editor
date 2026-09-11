@@ -182,6 +182,72 @@ const only = (rows, src) => lintTnQuotes(rows, src);
     "a note inside a \\v 6-9 source bridge finds the bridge's words");
 }
 
+// ── Cross-chapter refs must bail entirely, not degrade to the start verse ──
+// (#769) `refVerseList` used to strip a chapter-qualified end down to its
+// verse digit even when that chapter differed from the row's own — "1:6-2:1"
+// parsed the "2:1" end as verse 1, saw 1 < 6, and gave up by returning just
+// [6]. That's tolerable for the lint (an incomplete word list just makes a
+// real match look unresolvable) but unsafe for --repair: if the row's actual
+// defect is a word-order problem, checking it against verse 6 ALONE can
+// still find every word and resolve CONFIDENTLY, computed against a source
+// span the ref never actually promised. The fix bails the whole ref (returns
+// no tokens) whenever any piece is genuinely cross-chapter.
+{
+  // Both words of ref "1:6-2:1" spelled out of source order — a real
+  // "order"-kind, confident=true defect if verse 6 alone were searched. This
+  // is the issue's own reproduction.
+  const src = [sourceVerse(1, 6, ["רֵאשִׁ֖ית", "דָּבָ֑ר"])];
+  const outOfOrder = { ...tn("x1", 1, 6, "דָּבָ֑ר רֵאשִׁ֖ית"), ref_raw: "1:6-2:1" };
+  // Sanity: searched against verse 6 alone, this WOULD resolve confidently —
+  // proving the fixture really does reproduce the issue's failure mode.
+  const bogus = resolveTnQuote("דָּבָ֑ר רֵאשִׁ֖ית", ["רֵאשִׁ֖ית", "דָּבָ֑ר"]);
+  assert(bogus.ok === false && bogus.kind === "order" && bogus.confident === true,
+    "fixture reproduces a confident order-fix when checked against verse 6 alone");
+  assert(lintTnQuotes([outOfOrder], src).length === 0,
+    "a genuinely cross-chapter ref (1:6-2:1) is skipped entirely, not flagged against a truncated span");
+
+  // Same shape, but with a trailing in-chapter comma item ("...,3") alongside
+  // the cross-chapter piece. The whole ref must still bail — resolving
+  // partially against just verse 3 is exactly the per-segment leniency
+  // coveredVersesFromRef uses (skip only the bad segment), which is too
+  // permissive here: resolveTnQuote needs the COMPLETE intended span or
+  // none of it, never a partial one that could accidentally look confident.
+  const src2 = [...src, sourceVerse(1, 3, ["מִלָּ֑ה"])];
+  const mixed = { ...tn("x2", 1, 6, "דָּבָ֑ר רֵאשִׁ֖ית"), ref_raw: "1:6-2:1,3" };
+  assert(lintTnQuotes([mixed], src2).length === 0,
+    "a ref mixing a cross-chapter piece with an in-chapter comma item also bails on the whole ref");
+
+  // Same failure mode, reached via the COMMA path instead of the dash-range
+  // path (codex review on PR #773): "1:6,2:1" has no "-" in its second piece
+  // at all, so rawEnd is undefined and the dash-range guard above never
+  // fires — rawSTART itself ("2:1") carries the chapter qualifier here, and
+  // must be checked too, or "2:1" silently misreads as THIS chapter's verse 1
+  // and gets MERGED with the real verse 6 (unlike the dash form, which just
+  // degrades to verse 6 alone — the comma form's unpatched bug adds a whole
+  // extra, wrong verse into the token list rather than dropping one).
+  const src3 = [...src, sourceVerse(1, 1, ["א"])];
+  const commaForm = { ...tn("x3", 1, 6, "דָּבָ֑ר רֵאשִׁ֖ית"), ref_raw: "1:6,2:1" };
+  // Sanity: merged against the buggy [verse 1, verse 6] token list (what the
+  // unpatched code would hand resolveTnQuote), this still resolves as a
+  // confident order-fix — proving the fixture reproduces the danger even
+  // with the extra, wrong verse-1 word mixed in.
+  const bogusComma = resolveTnQuote("דָּבָ֑ר רֵאשִׁ֖ית", ["א", "רֵאשִׁ֖ית", "דָּבָ֑ר"]);
+  assert(bogusComma.ok === false && bogusComma.kind === "order" && bogusComma.confident === true,
+    "the comma-form fixture also reproduces a confident order-fix against the wrongly-merged span");
+  assert(lintTnQuotes([commaForm], src3).length === 0,
+    "a comma-separated cross-chapter piece (1:6,2:1) also bails on the whole ref, not just the dash-range form");
+
+  // The LEADING chapter must be validated before it is sliced off (codex
+  // review, 2nd pass on PR #773): a torn row whose own chapter is 1 but whose
+  // ref_raw is "2:6" had its "2:" stripped by `raw.slice(colon+1)` BEFORE any
+  // per-piece cross-chapter check ran, so wordsForRow searched 1:6 — the same
+  // wrong-chapter confident repair, reached via the leading qualifier. The
+  // whole ref must bail. (src's verse 6 is chapter 1; the ref points at 2:6.)
+  const tornLead = { ...tn("x4", 1, 6, "דָּבָ֑ר רֵאשִׁ֖ית"), ref_raw: "2:6" };
+  assert(lintTnQuotes([tornLead], src).length === 0,
+    "a ref whose leading chapter differs from the row's own chapter (row 1, ref 2:6) bails, not searched as 1:6");
+}
+
 // ── Confidence gate: never auto-repair an ambiguous match ───────────────────
 // Real 2KI 16:17. The source has אֶת at position 4 and ו⁠את at position 9; the
 // quote spells BOTH object markers ו⁠את. The first is a drifted spelling of

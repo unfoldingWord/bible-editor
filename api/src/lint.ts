@@ -432,20 +432,56 @@ export function sourceWordsByRef(sourceVerses: VerseRow[]): Map<string, SourceTo
  *                verse 5 alone, 185 false positives corpus-wide.
  *   `5:1,3,8,12` a list   — PSA 5:1 row `sbh4` really is this, and searching
  *                only verse 1 reported a correct quote as unresolvable.
- * A chapter-qualified end (`1:5-1:6`) is accepted too; anything unparseable
- * degrades to the single start verse rather than guessing.
+ * A chapter-qualified piece (`1:5-1:6`, or a comma entry like `1:6,1:8`) is
+ * accepted too, as long as it names THIS row's own chapter. When ANY piece
+ * names a DIFFERENT chapter — a dash-range end (`1:6-2:1`) or a bare comma
+ * entry (`1:6,2:1`) — the ref genuinely spans two chapters and no
+ * same-chapter verse-number list can represent it faithfully — returning
+ * `null` for the WHOLE call (not just the offending piece) rather than
+ * silently degrading to the start verse, which previously let a
+ * confident-looking repair be computed against a too-small word list.
+ * Anything else unparseable still degrades to the single start verse rather
+ * than guessing.
  */
-function refVerseList(refRaw: string | null | undefined, fallback: number): number[] {
+function refVerseList(
+  chapter: number,
+  refRaw: string | null | undefined,
+  fallback: number,
+): number[] | null {
   // Everything after the FIRST colon. `split(":")[1]` truncates a
   // chapter-qualified end: "1:5-1:6" would yield "5-1" and lose the 6.
   const raw = refRaw ?? "";
   const colon = raw.indexOf(":");
+  // The ref's OWN leading chapter (before the first colon) must match this
+  // row's chapter. A torn row (chapter=1 but ref_raw="2:6") would otherwise
+  // have its "2:" silently sliced off below and be searched as 1:6 — a
+  // confident repair against the WRONG chapter, the same #769 failure the
+  // per-piece guard below catches for later pieces. parseInt tolerates a
+  // verse-only ref (no colon → colon<0, skipped) and junk (NaN → not finite
+  // → degrade rather than bail).
+  if (colon > 0) {
+    const leadChapter = parseInt(raw.slice(0, colon), 10);
+    if (Number.isFinite(leadChapter) && leadChapter !== chapter) return null;
+  }
   const vs = colon < 0 ? "" : raw.slice(colon + 1);
   if (!vs) return [fallback];
   const out: number[] = [];
   for (const piece of vs.split(",")) {
     const [rawStart, rawEnd] = piece.split("-");
-    // "1:5-1:6" — an end written as chapter:verse; take its verse half.
+    // Either half of a piece may itself be chapter-qualified — not just a
+    // dash-range end ("1:5-1:6"/"1:6-2:1"), but also a bare COMMA entry with
+    // no dash at all ("1:6,2:1": the second piece is "2:1" with rawEnd
+    // undefined, so rawStart alone carries the qualifier). Check every part
+    // that has a colon against this row's own chapter; a DIFFERENT chapter
+    // means a same-chapter verse-number list cannot represent this span at
+    // all, so bail on the WHOLE ref rather than parse a wrong number out of
+    // it (the old bug: `"2:1".split(":").pop()` silently yielded `1`).
+    for (const part of rawEnd === undefined ? [rawStart] : [rawStart, rawEnd]) {
+      if (part && part.split(":").length > 1) {
+        const partChapter = parseInt(part.split(":")[0], 10);
+        if (Number.isFinite(partChapter) && partChapter !== chapter) return null;
+      }
+    }
     const start = parseInt((rawStart ?? "").split(":").pop() ?? "", 10);
     if (!Number.isFinite(start)) continue;
     const end = rawEnd === undefined ? start : parseInt(rawEnd.split(":").pop() ?? "", 10);
@@ -471,7 +507,11 @@ export function wordsForRow(
   verse: number,
   refRaw: string | null | undefined,
 ): SourceToken[] {
-  const verses = refVerseList(refRaw, verse);
+  const verses = refVerseList(chapter, refRaw, verse);
+  // A ref that genuinely spans a different chapter (`1:6-2:1`) cannot be
+  // faithfully represented as verse numbers within THIS chapter — bail rather
+  // than search a truncated span and risk a confident-looking false match.
+  if (verses === null) return [];
   if (verses.length === 1) return byRef.get(`${chapter}:${verses[0]}`) ?? [];
   const out: SourceToken[] = [];
   const seen = new Set<SourceToken[]>();
