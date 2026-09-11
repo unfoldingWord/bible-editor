@@ -28,6 +28,7 @@ import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
 import { extractPlainText, isInFlowMarker, isTsMilestone } from "./importParsers.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
+import { hasOpeningPunctInsideMilestone } from "./openingPunct.ts";
 
 export type IssueBucket = "flag" | "escalate";
 
@@ -1459,12 +1460,13 @@ function quoteIssues(verses: VerseRow[]): LintIssue[] {
 }
 
 // USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes,
-// joiner-glued alignment milestones, and unmatched curly quotation marks.
-// Footnotes/glued-milestones/reused-tokens are genuinely per-verse; quotation
-// marks are not (see quoteIssues) and are checked once across the whole call,
-// not inside this per-verse loop. (Verse-coverage / chapter-count are guarded
-// by the export shrink guard and validated whole-file downstream; not
-// duplicated here.)
+// joiner-glued alignment milestones, reused source tokens, opening punctuation
+// stranded inside an alignment milestone, and unmatched curly quotation marks.
+// Footnotes/glued-milestones/reused-tokens/opening-punctuation are genuinely
+// per-verse; quotation marks are not (see quoteIssues) and are checked once
+// across the whole call, not inside this per-verse loop. (Verse-coverage /
+// chapter-count are guarded by the export shrink guard and validated
+// whole-file downstream; not duplicated here.)
 export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
   const issues: LintIssue[] = [...quoteIssues(verses)];
   for (const v of verses) {
@@ -1501,6 +1503,14 @@ export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
         bucket: "flag",
         ref,
         message: "the same source word is aligned in more than one group (renders as doubled Hebrew); re-align the verse.",
+      });
+    }
+    if (hasOpeningPunctInsideMilestone(vos)) {
+      issues.push({
+        check: "Opening punctuation inside alignment",
+        bucket: "flag",
+        ref,
+        message: "Opening quote or bracket stored inside the preceding word's alignment; Door43 renders a stray space after it. Any text edit saved in the editor heals it (a save with no text change is a no-op); or run scripts/scan-opening-punct.mjs.",
       });
     }
   }

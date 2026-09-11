@@ -22,6 +22,7 @@
 import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
+import { hoistOpeningPunctuation } from "./openingPunct.ts";
 
 export interface SmartReplaceResult {
   content: unknown;
@@ -1117,7 +1118,26 @@ function smartRebuildRange(
 // Smart replace: given the verse content, the plain text the match was
 // found in, the regex used, and the literal active-match info, produce a
 // new content + plain text. Tries to keep alignment when possible.
+// FindReplaceOverlay calls this directly (not through smartEditVerse), so it
+// needs its own opening-punctuation hoist rather than relying on
+// smartEditVerse's final defense-in-depth block. See JER 31:10 / #777.
 export function smartReplaceVerse(
+  content: unknown,
+  plainText: string,
+  regex: RegExp,
+  matchStartInPlain: number,
+  matchLenInPlain: number,
+  replaceText: string,
+): SmartReplaceResult {
+  const result = smartReplaceVerseImpl(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText);
+  const verseObjectsOut = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (Array.isArray(verseObjectsOut)) {
+    return { ...result, content: { verseObjects: pruneEmptyText(hoistOpeningPunctuation(verseObjectsOut)) } };
+  }
+  return result;
+}
+
+function smartReplaceVerseImpl(
   content: unknown,
   plainText: string,
   regex: RegExp,
@@ -2333,7 +2353,12 @@ export function smartEditVerse(
     // serializes a dangling `\zaln-s …\*,\zaln-e\*` around bare text — corrupt
     // alignment on disk. smartRebuildRange prunes its own output, but the other
     // tiers don't, so prune globally here. Then clear any empty text it exposes.
-    const normalized = pruneEmptyText(pruneDeadMilestones(normalizeWordPunctuation(verseObjects)));
+    // Hoist any opening quote/bracket the relayout tiers stranded inside the
+    // preceding word's \zaln milestone out to a top-level text node — Door43
+    // renders a stray space after it otherwise (see JER 31:10 / #777).
+    const normalized = pruneEmptyText(
+      pruneDeadMilestones(hoistOpeningPunctuation(normalizeWordPunctuation(verseObjects))),
+    );
     return {
       ...result,
       content: { verseObjects: normalized },

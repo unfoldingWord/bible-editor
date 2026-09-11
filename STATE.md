@@ -71,6 +71,17 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **An OPENING quote/bracket must be stored glued to the word that FOLLOWS it, never as the trailing text of the
+  preceding `\zaln` milestone.** usfm-js puts every `\zaln-s` on its own line, so `\w say\w*, ‘\zaln-e\*` renders on
+  Door43 with a space after the `‘` (JER 31:10 / 31:18 ULT, #777). The relayout tiers in `replace.ts` treat an
+  inter-word gap as one atom and write it into the preceding milestone; `hoistOpeningPunctuation`
+  (`web/src/lib/openingPunct.ts`) now moves such a gap to a top-level text node after the milestone, stepping the
+  opener over a stored `\n` sibling (usfm-js keeps inter-milestone newlines as text nodes) so it lands as
+  `\zaln-e\*,` ⏎ `‘\zaln-s …`. Closing punctuation before `\zaln-e\*` is accepted form and is left alone. The app UI
+  cannot fix a stored instance (moving punctuation across a milestone boundary changes no plain text → no-op
+  save); repair with `scripts/scan-opening-punct.mjs` or by hand on Door43. The AI pipeline stores the opener
+  correctly (leading child of the following milestone); this was ours.
+
 - **A direct-SQL data repair that leaves `updated_by` NULL is undone by the nightly sync.** `reimportClassify.ts
   isReimportableRow` reads `updated_by IS NULL` as "pristine, master owns this row", so on the next night the
   upstream file changes, the pre-export DCS→D1 sync writes master's old bytes back over the repair before the export
