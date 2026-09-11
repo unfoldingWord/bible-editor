@@ -39,6 +39,7 @@
 //   3. Emit repair SQL for the recoverable rows:
 //        REPAIR_ACTOR=<users.id> … same command … --repair
 //      → scripts/out/repair-tn-quotes.sql   (apply with wrangler d1 execute --file=…)
+//      → scripts/out/repair-tn-quotes.json  (what each row held BEFORE — the rollback reads this)
 //
 // --repair REFUSES to run without both BOOK_LOCKS (the real book_locks dump —
 // see the lock rule below) and REPAIR_ACTOR (the users.id the repair is
@@ -281,4 +282,20 @@ const outDir = resolve(repoRoot, "scripts/out");
 if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
 const outFile = resolve(outDir, "repair-tn-quotes.sql");
 writeFileSync(outFile, lines.join("\n"), "utf8");
-console.log(`\nwrote ${outFile} (${repairable.length} UPDATE statement(s))`);
+// Sidecar for scripts/rollback-tn-quotes.mjs: exact pre-repair bytes and the
+// exact quote the repair writes, so the rollback can prove the row still holds
+// OUR value before touching it (a version number alone cannot — see there).
+const sidecar = resolve(outDir, "repair-tn-quotes.json");
+writeFileSync(
+  sidecar,
+  JSON.stringify(
+    repairable.map((f) => ({
+      book: f.row.book, id: f.row.id, chapter: f.row.chapter, verse: f.row.verse,
+      oldVersion: Number(f.row.version), oldQuote: f.row.quote, newQuote: f.verdict.suggestion,
+    })),
+    null,
+    2,
+  ),
+  "utf8",
+);
+console.log(`\nwrote ${outFile} (${repairable.length} UPDATE statement(s)) and ${sidecar}`);
