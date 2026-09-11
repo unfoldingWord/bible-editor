@@ -1308,6 +1308,87 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
       .all()[0].n;
     assert(remaining === 1, "…and the banner is untouched too, consistent with the row it names still standing");
   }
+
+  // Cases 5 & 6 (Codex 2nd-pass review on #761): the retire UPDATE and the
+  // banner clears now commit as ONE atomic D1 batch, so a failure after the
+  // retire can no longer strand a resolved row whose banner never came down.
+  // Both drive the REAL async retireVerseKeptAiMasterFlags against a D1 shim
+  // whose .batch() runs the statements (or, with failBatch, throws before
+  // applying any of them — the way an all-or-nothing D1 batch rolls back).
+  const mkBatchEnv = (d, failBatch = false) => {
+    const make = (sql) => ({
+      bind: (...args) => ({
+        _sql: sql,
+        _args: args,
+        all: async () => ({ results: d.prepare(sql).all(...args) }),
+        run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+      }),
+      all: async () => ({ results: d.prepare(sql).all() }),
+      run: async () => ({ meta: { changes: Number(d.prepare(sql).run().changes) } }),
+    });
+    return {
+      DB: {
+        prepare: (sql) => make(sql),
+        batch: async (stmts) => {
+          if (failBatch) throw new Error("simulated transient D1 batch error");
+          return stmts.map((s) => ({ meta: { changes: Number(d.prepare(s._sql).run(...(s._args ?? [])).changes) } }));
+        },
+      },
+    };
+  };
+
+  // Case 5 — happy path: a pure keep_ai_master backlog row + its banner are
+  // retired and cleared together in the batch.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('HAG','ult',2,9,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:HAG:ult','Sync flagged 1 verse(s) in HAG ULT...',100)`,
+    ).run();
+
+    const result = await retireVerseKeptAiMasterFlags(mkBatchEnv(d));
+    assert(result.cleared === 1, "the atomic batch retires the one standing keep_ai_master row");
+    const row = d
+      .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='HAG' AND resource='ult' AND verse=9`)
+      .all()[0];
+    assert(row.resolved_at !== null, "the row is marked resolved by the batch's retire UPDATE");
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:HAG:ult'`)
+      .all()[0].n;
+    assert(remaining === 0, "…and its banner is cleared in the SAME batch");
+  }
+
+  // Case 6 — atomicity: if the batch fails, NOTHING commits. The row stays
+  // standing (resolved_at NULL) so the next sweep finds it again, and the
+  // banner stays up — never the resolved-row-with-live-banner limbo the first
+  // pass of this PR could leave on a post-UPDATE failure.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('HAG','ult',2,9,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:HAG:ult','Sync flagged 1 verse(s) in HAG ULT...',100)`,
+    ).run();
+
+    const result = await retireVerseKeptAiMasterFlags(mkBatchEnv(d, true));
+    assert(result.cleared === 0, "a failed batch reports 0 cleared");
+    const row = d
+      .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='HAG' AND resource='ult' AND verse=9`)
+      .all()[0];
+    assert(row.resolved_at === null,
+      "the row is left STANDING on a batch failure — retryable next sweep, not stranded resolved");
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:HAG:ult'`)
+      .all()[0].n;
+    assert(remaining === 1, "…and the banner is still up, consistent with the still-standing row");
+  }
 }
 
 {
