@@ -432,14 +432,16 @@ export function sourceWordsByRef(sourceVerses: VerseRow[]): Map<string, SourceTo
  *                verse 5 alone, 185 false positives corpus-wide.
  *   `5:1,3,8,12` a list   — PSA 5:1 row `sbh4` really is this, and searching
  *                only verse 1 reported a correct quote as unresolvable.
- * A chapter-qualified end (`1:5-1:6`) is accepted too, as long as it names
- * THIS row's own chapter. When it names a DIFFERENT chapter (`1:6-2:1`) the
- * ref genuinely spans two chapters and no same-chapter verse-number list can
- * represent it faithfully — returning `null` for the WHOLE call (not just the
- * offending piece) rather than silently degrading to the start verse, which
- * previously let a confident-looking repair be computed against a too-small
- * word list. Anything else unparseable still degrades to the single start
- * verse rather than guessing.
+ * A chapter-qualified piece (`1:5-1:6`, or a comma entry like `1:6,1:8`) is
+ * accepted too, as long as it names THIS row's own chapter. When ANY piece
+ * names a DIFFERENT chapter — a dash-range end (`1:6-2:1`) or a bare comma
+ * entry (`1:6,2:1`) — the ref genuinely spans two chapters and no
+ * same-chapter verse-number list can represent it faithfully — returning
+ * `null` for the WHOLE call (not just the offending piece) rather than
+ * silently degrading to the start verse, which previously let a
+ * confident-looking repair be computed against a too-small word list.
+ * Anything else unparseable still degrades to the single start verse rather
+ * than guessing.
  */
 function refVerseList(
   chapter: number,
@@ -455,14 +457,19 @@ function refVerseList(
   const out: number[] = [];
   for (const piece of vs.split(",")) {
     const [rawStart, rawEnd] = piece.split("-");
-    // "1:5-1:6" — an end written as chapter:verse; take its verse half, but
-    // first check whether it names a DIFFERENT chapter than this row's own —
-    // e.g. "1:6-2:1". A same-chapter verse-number list cannot represent that
-    // span at all, so bail on the whole ref rather than parse a wrong number
-    // out of it (the old bug: `"2:1".split(":").pop()` silently yielded `1`).
-    if (rawEnd !== undefined && rawEnd.split(":").length > 1) {
-      const endChapter = parseInt(rawEnd.split(":")[0], 10);
-      if (Number.isFinite(endChapter) && endChapter !== chapter) return null;
+    // Either half of a piece may itself be chapter-qualified — not just a
+    // dash-range end ("1:5-1:6"/"1:6-2:1"), but also a bare COMMA entry with
+    // no dash at all ("1:6,2:1": the second piece is "2:1" with rawEnd
+    // undefined, so rawStart alone carries the qualifier). Check every part
+    // that has a colon against this row's own chapter; a DIFFERENT chapter
+    // means a same-chapter verse-number list cannot represent this span at
+    // all, so bail on the WHOLE ref rather than parse a wrong number out of
+    // it (the old bug: `"2:1".split(":").pop()` silently yielded `1`).
+    for (const part of rawEnd === undefined ? [rawStart] : [rawStart, rawEnd]) {
+      if (part && part.split(":").length > 1) {
+        const partChapter = parseInt(part.split(":")[0], 10);
+        if (Number.isFinite(partChapter) && partChapter !== chapter) return null;
+      }
     }
     const start = parseInt((rawStart ?? "").split(":").pop() ?? "", 10);
     if (!Number.isFinite(start)) continue;

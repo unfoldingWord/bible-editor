@@ -216,6 +216,26 @@ const only = (rows, src) => lintTnQuotes(rows, src);
   const mixed = { ...tn("x2", 1, 6, "דָּבָ֑ר רֵאשִׁ֖ית"), ref_raw: "1:6-2:1,3" };
   assert(lintTnQuotes([mixed], src2).length === 0,
     "a ref mixing a cross-chapter piece with an in-chapter comma item also bails on the whole ref");
+
+  // Same failure mode, reached via the COMMA path instead of the dash-range
+  // path (codex review on PR #773): "1:6,2:1" has no "-" in its second piece
+  // at all, so rawEnd is undefined and the dash-range guard above never
+  // fires — rawSTART itself ("2:1") carries the chapter qualifier here, and
+  // must be checked too, or "2:1" silently misreads as THIS chapter's verse 1
+  // and gets MERGED with the real verse 6 (unlike the dash form, which just
+  // degrades to verse 6 alone — the comma form's unpatched bug adds a whole
+  // extra, wrong verse into the token list rather than dropping one).
+  const src3 = [...src, sourceVerse(1, 1, ["א"])];
+  const commaForm = { ...tn("x3", 1, 6, "דָּבָ֑ר רֵאשִׁ֖ית"), ref_raw: "1:6,2:1" };
+  // Sanity: merged against the buggy [verse 1, verse 6] token list (what the
+  // unpatched code would hand resolveTnQuote), this still resolves as a
+  // confident order-fix — proving the fixture reproduces the danger even
+  // with the extra, wrong verse-1 word mixed in.
+  const bogusComma = resolveTnQuote("דָּבָ֑ר רֵאשִׁ֖ית", ["א", "רֵאשִׁ֖ית", "דָּבָ֑ר"]);
+  assert(bogusComma.ok === false && bogusComma.kind === "order" && bogusComma.confident === true,
+    "the comma-form fixture also reproduces a confident order-fix against the wrongly-merged span");
+  assert(lintTnQuotes([commaForm], src3).length === 0,
+    "a comma-separated cross-chapter piece (1:6,2:1) also bails on the whole ref, not just the dash-range form");
 }
 
 // ── Confidence gate: never auto-repair an ambiguous match ───────────────────
