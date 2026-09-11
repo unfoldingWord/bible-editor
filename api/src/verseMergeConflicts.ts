@@ -89,7 +89,7 @@ import {
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
-  RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL,
+  RETIRE_KEPT_AI_MASTER_CONFLICTS_FOR_PAIR_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
@@ -339,13 +339,14 @@ export async function deleteLostAdoptionConflicts(
 // rows stay standing, and the NEXT sweep retries the whole thing (lookup +
 // retire + clear) against them, same as if nothing had happened tonight.
 //
-// The retire UPDATE and every banner clear then commit as ONE atomic D1
-// batch (see the body): all-or-nothing, so a failure leaves the rows STANDING
-// and the whole sequence retries next sweep rather than stranding a resolved
-// row whose banner never came down. Still non-fatal to the export that
-// follows — a thrown batch is caught and logged, not rethrown. Idempotent — a
-// night with nothing standing reads zero pairs, retires nothing, clears
-// nothing.
+// Each pair's scoped retire and its banner clears then commit as ONE atomic D1
+// batch PER PAIR (see the body): all-or-nothing per pair, so a failure leaves
+// that pair's rows STANDING and it retries next sweep rather than stranding a
+// resolved row whose banner never came down. Per pair, not one global batch, so
+// the statement count stays under D1's 100-per-batch cap however large the
+// backlog grows. Still non-fatal to the export that follows — a thrown batch is
+// caught and logged per pair, not rethrown. Idempotent — a night with nothing
+// standing reads zero pairs, retires nothing, clears nothing.
 export async function retireVerseKeptAiMasterFlags(env: Env): Promise<{ cleared: number }> {
   const now = Math.floor(Date.now() / 1000);
   let pairs: Array<{ book: string; resource: string }>;
@@ -364,43 +365,56 @@ export async function retireVerseKeptAiMasterFlags(env: Env): Promise<{ cleared:
     // pair-lookup + retire + banner-clear sequence properly.
     return { cleared: 0 };
   }
-  try {
-    // Decide each pair's banner-clear DELETE(s) up front (these are pure reads;
-    // if any fails we fall to the catch and retire nothing, so the rows stay
-    // standing for the next sweep). Then commit the retire UPDATE and every
-    // clear as ONE atomic D1 batch. That atomicity is the fix for the window
-    // Codex flagged on the first pass of this PR: previously the retire UPDATE
-    // committed on its own and the per-pair clears ran afterwards, so a crash
-    // — or a clear that failed and was swallowed — between the two left the
-    // rows resolved_at-stamped but their banners still up, and NO later sweep
-    // could find them again (the pairs SELECT filters resolved_at IS NULL),
-    // reproducing the exact #760 stuck-banner symptom permanently. All-or-
-    // nothing means any failure leaves the rows STANDING and the whole
-    // lookup+retire+clear sequence is retried next sweep, unchanged.
-    //
-    // Order within the batch is immaterial to correctness: keep_ai_master is
-    // NOT one of SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL's actions, so each
-    // clear's `NOT EXISTS (... active alertable conflict ...)` guard does not
-    // depend on the retire having stamped these rows first. A pair that still
-    // carries a real adopt_conflict / keep_* row keeps its banner (the DELETE
-    // matches nothing), exactly as before.
-    const clearStmts: D1PreparedStatement[] = [];
-    for (const { book, resource } of pairs) {
-      clearStmts.push(...(await resolvedBannerClearStmts(env, book, resource)));
+  // Retire each pair in its OWN atomic D1 batch: [that pair's scoped retire,
+  // ...that pair's banner clears]. The atomicity is the fix for the window
+  // Codex flagged on the first pass of this PR — previously the retire UPDATE
+  // committed on its own and the clears ran afterwards, so a crash (or a clear
+  // that failed and was swallowed) between the two left the rows
+  // resolved_at-stamped but their banners still up, and NO later sweep could
+  // find them again (the pairs SELECT filters resolved_at IS NULL),
+  // reproducing the exact #760 stuck-banner symptom permanently. Committing a
+  // pair's retire and clears together means either both land or neither does,
+  // and a pair that fails is left STANDING to retry next sweep.
+  //
+  // Why PER PAIR rather than one global batch (2nd-pass Codex review): a single
+  // batch of the global retire + every pair's DELETEs is unbounded and can
+  // breach D1's 100-statement cap once enough pairs (or per-username fan-out
+  // DELETEs) accumulate — and an over-cap batch fails and then retries the same
+  // oversized batch forever, retiring nothing. One small batch per pair keeps
+  // every batch well under the cap and, as a bonus, isolates a failing pair
+  // from the rest instead of stranding the whole sweep.
+  //
+  // Order within each batch is immaterial to correctness: keep_ai_master is
+  // NOT one of SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL's actions, so each clear's
+  // `NOT EXISTS (... active alertable conflict ...)` guard does not depend on
+  // the retire having stamped these rows first. A pair that still carries a
+  // real adopt_conflict / keep_* row keeps its banner (the DELETE matches
+  // nothing), exactly as before.
+  let cleared = 0;
+  for (const { book, resource } of pairs) {
+    try {
+      // resolvedBannerClearStmts's reads are inside the try so a transient read
+      // failure leaves THIS pair standing (retried next sweep) without retiring
+      // it — never a resolved row whose banner never came down.
+      const clearStmts = await resolvedBannerClearStmts(env, book, resource);
+      const batch = await env.DB.batch([
+        env.DB.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_FOR_PAIR_SQL).bind(now, book, resource),
+        ...clearStmts,
+      ]);
+      cleared += batch[0]?.meta?.changes ?? 0;
+    } catch (e) {
+      // Best-effort per pair: leave this pair standing and keep going, so one
+      // pair's transient failure neither retires it without clearing its banner
+      // nor aborts the other pairs (or the export that follows).
+      console.error("verse keep_ai_master retire: pair failed, left standing for next sweep", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
-    const batch = await env.DB.batch([
-      env.DB.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).bind(now),
-      ...clearStmts,
-    ]);
-    const cleared = batch[0]?.meta?.changes ?? 0;
-    if (cleared > 0) console.log("verse keep_ai_master retire", { cleared });
-    return { cleared };
-  } catch (e) {
-    console.error("verse keep_ai_master retire: failed", {
-      error: e instanceof Error ? e.message : String(e),
-    });
-    return { cleared: 0 };
   }
+  if (cleared > 0) console.log("verse keep_ai_master retire", { cleared });
+  return { cleared };
 }
 
 // The banner-clear DELETEs retireVerseKeptAiMasterFlags folds into its atomic
