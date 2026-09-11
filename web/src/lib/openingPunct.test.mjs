@@ -188,7 +188,7 @@ function countMilestones(nodes) {
   };
   const after = hoistOpeningPunctuation(before.verseObjects);
   assert(after.length === 3, "no new node inserted (got length " + after.length + ")");
-  assert(after[1].type === "text" && after[1].text === ", \n‘", `closing part, then the newline, then the opener (got ${JSON.stringify(after[1].text)})`);
+  assert(after[1].type === "text" && after[1].text === ",\n‘", `closing part (trailing space dropped), then the newline, then the opener (got ${JSON.stringify(after[1].text)})`);
   assert(!milestoneTrailingHasOpener(after), "opener no longer inside the milestone");
   const rendered = usfm.toUSFM({ chapters: { 1: { 1: { verseObjects: after } } } }, { forcedNewLines: true });
   assert(/\\zaln-e\\\*,\s*\n‘\\zaln-s/.test(rendered), `renders as \\zaln-e\\*, ⏎ ‘\\zaln-s (got ${JSON.stringify(rendered)})`);

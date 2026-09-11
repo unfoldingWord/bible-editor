@@ -120,7 +120,10 @@ export function hoistOpeningPunctuation(verseObjects: unknown[]): unknown[] {
       const nextText = String(next["text"] ?? "");
       const lead = nextText.match(/^\s*/u)?.[0] ?? "";
       const openerAt = info.text.search(OPENING_PUNCT_RE);
-      const closing = info.text.slice(0, openerAt);
+      // When the sibling already supplies whitespace, drop the closing part's
+      // own trailing whitespace so the bytes come out as the canonical
+      // `\zaln-e\*,` ⏎ `‘\zaln-s` rather than `, ` ⏎ `‘`.
+      const closing = lead ? info.text.slice(0, openerAt).replace(/\s+$/u, "") : info.text.slice(0, openerAt);
       const opener = info.text.slice(openerAt);
       next["text"] = closing + lead + opener + nextText.slice(lead.length);
     } else {
