@@ -3251,17 +3251,25 @@ await (async () => {
 //    a concurrent write ────────────────────────────────────────────────────
 // Both write paths read `existing.version` (for the audit row) but, before
 // the fix, never bound it into the UPDATE's WHERE clause — an unconditional
-// overwrite. These drive importJobOutput end-to-end against a fake D1 whose
-// guarded UPDATE reports changes:0 (as it would if a translator's PATCH won
-// the race first), and assert the loss is a skip-and-retry-later, not a
-// silent clobber: no edit_log audit row, no pending_imports accept (so the
-// next poll re-proposes it), and the outcome surfaces in the ApplyResult.
+// overwrite. The guarded UPDATE and its audit-log/accept bookkeeping are one
+// D1 batch (one transaction); the bookkeeping statements self-gate in SQL on
+// `version = <newVersion> AND last_change_source = 'ai_pipeline'` rather than
+// JS deciding whether to send them, since a D1 batch has no way to make one
+// statement conditional on an earlier one's result. These drive
+// importJobOutput end-to-end against a fake D1 whose guarded UPDATE reports
+// changes:0 (as it would if a translator's PATCH won the race first) and
+// whose edit_log/accept statements accordingly report changes:0 too (as real
+// SQLite would, since their EXISTS gate can never be true when the guarded
+// UPDATE never landed) — asserting the loss is a skip, not a silent clobber:
+// no edit_log audit row lands, no pending_imports accept lands, the outcome
+// surfaces in the ApplyResult, and the bookkeeping SQL actually carries the
+// gate (a regression guard against the gate text being simplified away).
 
 await (async () => {
   const dbState = { claimedAt: 7000 };
   let verseUpdateAttempted = false;
-  let editLogInserted = false;
-  let pendingAccepted = false;
+  let editLogSql = null;
+  let pendingAcceptSql = null;
 
   function dispatch(sql, args) {
     if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
@@ -3316,12 +3324,18 @@ await (async () => {
       return { changes: 0, rows: [], single: null };
     }
     if (/INSERT INTO edit_log/.test(sql)) {
-      editLogInserted = true;
-      return { changes: 1, rows: [], single: null };
+      editLogSql = sql;
+      // Real SQLite would evaluate this statement's own EXISTS(...) gate
+      // (version = newVersion AND last_change_source = 'ai_pipeline' on the
+      // verses row) as false here, since the guarded UPDATE above never
+      // landed — so it inserts nothing. Mirror that instead of the naive
+      // "every INSERT succeeds" default other fakes in this file use.
+      return { changes: 0, rows: [], single: null };
     }
     if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) {
-      pendingAccepted = true;
-      return { changes: 1, rows: [], single: null };
+      pendingAcceptSql = sql;
+      // Same reasoning: its EXISTS gate is false too.
+      return { changes: 0, rows: [], single: null };
     }
     if (/UPDATE pipeline_jobs SET import_aborted_at/.test(sql)) {
       return { changes: 1, rows: [], single: null };
@@ -3382,8 +3396,16 @@ await (async () => {
   }
 
   assert(verseUpdateAttempted, "#775 verse CAS: the guarded UPDATE was attempted");
-  assert(!editLogInserted, "#775 verse CAS: a lost CAS writes NO edit_log row — the clobber never happened");
-  assert(!pendingAccepted, "#775 verse CAS: a lost CAS leaves pending_imports unaccepted, so the next poll retries");
+  assert(editLogSql !== null, "#775 verse CAS: the edit_log statement was sent (self-gated, not JS-skipped)");
+  assert(
+    /EXISTS[\s\S]*last_change_source = 'ai_pipeline'/.test(editLogSql),
+    "#775 verse CAS: the edit_log INSERT self-gates on the row actually landing as an AI write, not just a version number",
+  );
+  assert(pendingAcceptSql !== null, "#775 verse CAS: the pending_imports accept statement was sent (self-gated, not JS-skipped)");
+  assert(
+    /EXISTS[\s\S]*last_change_source = 'ai_pipeline'/.test(pendingAcceptSql),
+    "#775 verse CAS: the pending_imports accept self-gates the same way",
+  );
   assert(result.applied?.verseUpdated === 0, `#775 verse CAS: verseUpdated stays 0 on a lost CAS (got ${result.applied?.verseUpdated})`);
   assert(
     result.applied?.verseSkippedConflict === 1,
@@ -3395,8 +3417,8 @@ await (async () => {
 await (async () => {
   const dbState = { claimedAt: 8000 };
   let tqUpdateAttempted = false;
-  let editLogInserted = false;
-  let pendingAccepted = false;
+  let editLogSql = null;
+  let pendingAcceptSql = null;
 
   function dispatch(sql, args) {
     if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
@@ -3445,12 +3467,17 @@ await (async () => {
       return { changes: 0, rows: [], single: null };
     }
     if (/INSERT INTO edit_log/.test(sql)) {
-      editLogInserted = true;
-      return { changes: 1, rows: [], single: null };
+      editLogSql = sql;
+      // Real SQLite would evaluate this statement's own EXISTS(...) gate
+      // (version = newVersion AND last_change_source = 'ai_pipeline' on the
+      // tq_rows row) as false here, since the guarded UPDATE above never
+      // landed — so it inserts nothing.
+      return { changes: 0, rows: [], single: null };
     }
     if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) {
-      pendingAccepted = true;
-      return { changes: 1, rows: [], single: null };
+      pendingAcceptSql = sql;
+      // Same reasoning: its EXISTS gate is false too.
+      return { changes: 0, rows: [], single: null };
     }
     if (/UPDATE pipeline_jobs SET import_aborted_at/.test(sql)) {
       return { changes: 1, rows: [], single: null };
@@ -3511,8 +3538,16 @@ await (async () => {
   }
 
   assert(tqUpdateAttempted, "#775 tq CAS: the guarded UPDATE was attempted");
-  assert(!editLogInserted, "#775 tq CAS: a lost CAS writes NO edit_log row — the clobber never happened");
-  assert(!pendingAccepted, "#775 tq CAS: a lost CAS leaves pending_imports unaccepted, so the next poll retries");
+  assert(editLogSql !== null, "#775 tq CAS: the edit_log statement was sent (self-gated, not JS-skipped)");
+  assert(
+    /EXISTS[\s\S]*last_change_source = 'ai_pipeline'/.test(editLogSql),
+    "#775 tq CAS: the edit_log INSERT self-gates on the row actually landing as an AI write, not just a version number",
+  );
+  assert(pendingAcceptSql !== null, "#775 tq CAS: the pending_imports accept statement was sent (self-gated, not JS-skipped)");
+  assert(
+    /EXISTS[\s\S]*last_change_source = 'ai_pipeline'/.test(pendingAcceptSql),
+    "#775 tq CAS: the pending_imports accept self-gates the same way",
+  );
   assert(result.applied?.tqUpdated === 0, `#775 tq CAS: tqUpdated stays 0 on a lost CAS (got ${result.applied?.tqUpdated})`);
   assert(result.applied?.tqCreated === 0, `#775 tq CAS: the conflict does not fall through to a fresh INSERT (got tqCreated=${result.applied?.tqCreated})`);
   assert(
