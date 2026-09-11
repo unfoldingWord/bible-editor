@@ -22,16 +22,35 @@
 //   2. Scan (report only):
 //        node --experimental-strip-types --no-warnings scripts/scan-source-occurrences.mjs scripts/out/verses-dump.json
 //   3. Emit repair SQL for flagged verses:
-//        node --experimental-strip-types --no-warnings scripts/scan-source-occurrences.mjs scripts/out/verses-dump.json --repair
+//        REPAIR_ACTOR=<users.id> node --experimental-strip-types --no-warnings \
+//          scripts/scan-source-occurrences.mjs scripts/out/verses-dump.json --repair
 //      → scripts/out/repair-source-occurrences.sql   (apply with wrangler d1 execute --file=…)
+//
+// Each UPDATE is guarded on the `version` the dump saw, so a verse a translator
+// edited between dump and apply is left alone (a shortfall in the reported
+// `changes` count means "re-dump and re-scan", never "clobbered"). The dump
+// MUST include the version column. --repair also needs REPAIR_ACTOR: the
+// nightly DCS→D1 sync treats updated_by IS NULL as "pristine, master owns
+// this row" (reimportClassify.ts isReimportableRow), so a repair that left it
+// NULL would be reverted from master the next night the USFM changed upstream,
+// before the export ever pushed the fix.
+//
+// A LOCKED book is published and bible-editor is no longer its source of truth,
+// so --repair never emits SQL for one. It needs BOOK_LOCKS=<book_locks dump>
+// (`SELECT book, locked FROM book_locks` as --json) and refuses without it;
+// the rule mirrors effectiveBookLock (explicit row wins, else a published book
+// is locked). Withheld verses are printed so an admin can fix them on Door43.
+// scripts/split-fixes-by-lock.mjs applies the same rule a second time when it
+// combines per-book output; the two are belt and braces, not alternatives.
 //
 // Optional: limit to one book with BOOK=JER, and printed-row count with
 // SCAN_PRINT_LIMIT=N.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { correctSourceOccurrences } from "../web/src/lib/sourceOccurrences.ts";
+import { PUBLISHED_BOOKS } from "../api/src/publishedGuard.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -62,6 +81,32 @@ function sourceVersionFor(hasUhb, hasUgnt) {
 }
 
 const rows = loadRows(dumpPath);
+
+// Lock rule — see header. Report mode runs on the published-book fallback with
+// a warning; --repair refuses without the real dump, because the fallback
+// cannot see an admin's explicit lock on an unpublished book.
+const locksArg = process.env.BOOK_LOCKS ?? "";
+let lockRows = null;
+// Resolved against cwd, like the dump path — the two must not disagree.
+if (locksArg && existsSync(resolve(locksArg))) {
+  lockRows = loadRows(resolve(locksArg));
+  if (lockRows.some((r) => typeof r.book !== "string" || !("locked" in r))) {
+    console.error(`BOOK_LOCKS ${locksArg} is not a book_locks dump (need book, locked columns)`);
+    process.exit(1);
+  }
+}
+if (!lockRows) {
+  if (doRepair) {
+    console.error(
+      "refusing to emit SQL: BOOK_LOCKS is unset or unreadable. --repair needs the real book_locks dump " +
+        "(see the header) so a locked book is never written to.",
+    );
+    process.exit(1);
+  }
+  console.warn("BOOK_LOCKS unset or unreadable — treating only PUBLISHED_BOOKS as locked; --repair would refuse.");
+}
+const explicitLock = new Map((lockRows ?? []).map((r) => [r.book, Number(r.locked) === 1]));
+const isLocked = (book) => (explicitLock.has(book) ? explicitLock.get(book) : PUBLISHED_BOOKS.has(book));
 
 // Index every verse by book/chapter/verse for source pairing.
 const byKey = new Map(); // `${book}/${ch}/${v}` -> { [version]: row }
@@ -115,6 +160,7 @@ for (const r of rows) {
         chapter: r.chapter,
         verse: r.verse,
         version: r.bible_version,
+        rowVersion: r.version,
         corrections,
         newContent,
       });
@@ -141,32 +187,76 @@ for (const f of flagged.slice(0, PRINT_LIMIT)) {
 if (flagged.length > PRINT_LIMIT) console.log(`  … and ${flagged.length - PRINT_LIMIT} more.`);
 
 // ─── Repair ──────────────────────────────────────────────────────────────────
-if (doRepair && flagged.length > 0) {
+const withheld = flagged.filter((f) => isLocked(f.book));
+const repairable = flagged.filter((f) => !isLocked(f.book));
+if (withheld.length) {
+  const byBook = new Map();
+  for (const f of withheld) byBook.set(f.book, (byBook.get(f.book) ?? 0) + 1);
+  console.log(`\nWithheld ${withheld.length} verse(s) in LOCKED books (fix on Door43 by hand): ` +
+    [...byBook].map(([b, n]) => `${b} ${n}`).join(", "));
+}
+
+// Any earlier run's SQL is removed FIRST, whether or not this run writes a new
+// one. Otherwise a run whose every finding was withheld (all in locked books)
+// would leave a stale file behind that still carries those locked-book UPDATEs
+// — and an operator applying "the output" would write exactly what the lock
+// rule exists to prevent. (Codex review of PR #772.)
+const outDir = resolve(repoRoot, "scripts/out");
+const outPath = resolve(outDir, "repair-source-occurrences.sql");
+if (doRepair && existsSync(outPath)) {
+  unlinkSync(outPath);
+  console.log(`removed stale ${outPath}`);
+}
+if (doRepair && repairable.length === 0) {
+  console.log("\nNothing to repair in unlocked books — no SQL written.");
+}
+
+if (doRepair && repairable.length > 0) {
   const q = (v) => {
     if (v === null || v === undefined) return "NULL";
     if (typeof v === "number") return String(v);
     return `'${String(v).replace(/'/g, "''")}'`;
   };
+  const actor = Number(process.env.REPAIR_ACTOR);
+  if (!(Number.isInteger(actor) && actor > 0)) {
+    console.error("refusing to emit SQL: REPAIR_ACTOR must be a users.id (e.g. REPAIR_ACTOR=2) — see header");
+    process.exit(1);
+  }
+  // Checked on the RAW value: Number(null) is 0 and would pass an isInteger test.
+  const unversioned = repairable.filter((f) => !(Number.isInteger(f.rowVersion) && f.rowVersion >= 1));
+  if (unversioned.length) {
+    console.error(
+      `refusing to emit SQL: ${unversioned.length} flagged verse(s) have no usable version — the dump must ` +
+        "include the version column, or the optimistic-concurrency guard cannot be written.",
+    );
+    process.exit(1);
+  }
   const now = Math.floor(Date.now() / 1000);
   const lines = [
     `-- Repair over-counted alignment source occurrences. Generated ${new Date().toISOString()}`,
-    `-- ${flagged.length} verse(s). Renumbers \\zaln-s x-occurrence/x-occurrences to the source`,
-    `-- verse's true token count, bumps version (stale-client refetch), and logs an edit_log row.`,
+    `-- ${repairable.length} verse(s) in unlocked books (${withheld.length} withheld in locked books). Renumbers`,
+    `-- \\zaln-s x-occurrence/x-occurrences to the source verse's true token count, bumps version`,
+    `-- (stale-client refetch), and logs an edit_log row.`,
+    `-- Each UPDATE is guarded on the dumped version; compare the reported changes count with ${repairable.length}.`,
     `-- No BEGIN/COMMIT: remote D1 rejects explicit transactions and wraps the file atomically itself.`,
   ];
-  for (const f of flagged) {
+  for (const f of repairable) {
     const key = `${f.book}/${f.chapter}/${f.verse}/${f.version}`;
+    // Same audit shape the app writes for a verse PATCH (verses.ts): action
+    // 'update' — history replay consumes only create / update / restore, so a
+    // bespoke verb is an invisible audit row — a payload of { content } like
+    // parsed.data, and gated on changes() so a skipped UPDATE (version moved
+    // on) leaves no orphan history entry.
+    const payload = JSON.stringify({ content: JSON.parse(f.newContent) });
     lines.push(
-      `UPDATE verses SET content_json = ${q(f.newContent)}, version = version + 1, updated_at = ${now}`,
-      ` WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)};`,
-      `INSERT INTO edit_log (kind, row_key, prev_version, new_version, action, payload_json)`,
-      `  SELECT 'verse', ${q(key)}, version - 1, version, 'normalize-source-occurrences', ${q(f.newContent)}`,
-      `    FROM verses WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)};`,
+      `UPDATE verses SET content_json = ${q(f.newContent)}, version = version + 1, updated_at = ${now}, updated_by = ${actor}`,
+      ` WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)} AND version = ${Number(f.rowVersion)};`,
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)`,
+      `  SELECT 'verse', ${q(key)}, ${q(f.book)}, ${actor}, version - 1, version, 'update', ${q(payload)}`,
+      `    FROM verses WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)} AND changes() > 0;`,
     );
   }
-  const outDir = resolve(repoRoot, "scripts/out");
   if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
-  const outPath = resolve(outDir, "repair-source-occurrences.sql");
   writeFileSync(outPath, lines.join("\n") + "\n", "utf8");
-  console.log(`\nWrote repair SQL for ${flagged.length} verse(s): ${outPath}`);
+  console.log(`\nWrote repair SQL for ${repairable.length} verse(s): ${outPath}`);
 }

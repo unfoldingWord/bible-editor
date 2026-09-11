@@ -71,6 +71,17 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **A direct-SQL data repair that leaves `updated_by` NULL is undone by the nightly sync.** `reimportClassify.ts
+  isReimportableRow` reads `updated_by IS NULL` as "pristine, master owns this row", so on the next night the
+  upstream file changes, the pre-export DCS→D1 sync writes master's old bytes back over the repair before the export
+  can push it. Found 2026-09-10 reviewing #765's repair scripts; `scan-tn-quotes.mjs` and
+  `scan-source-occurrences.mjs` now require `REPAIR_ACTOR=<users.id>` and stamp it (precedent:
+  `heal-align-1ch-num.mjs` uses `updated_by=2`). Every ad-hoc repair SQL must do the same, must carry an
+  `AND version = <dumped>` guard so a translator's edit between dump and apply is a no-op rather than a clobber, and
+  must write its audit row as `action='update'` gated on `changes() > 0` — history replay only reads
+  create/update/restore, and a version-matched gate can file a concurrent edit as the repair. Locked books are never
+  written by a repair; their fixes go to an admin via `scripts/out/door43-fixes.html` (`split-fixes-by-lock.mjs`).
+
 - **A `source_attr_ambiguous` verse flag in a chapter Door43 did not touch is the app comparing against its own
   stale export, not a Door43 source fix.** Measured 2026-09-09 (EZK UST 22:26 / 33:9 / 45:11-12): the edited-verse
   reconcile was a two-way D1-vs-master attr compare with no base check, so it ran even on `keep_master_unchanged`.

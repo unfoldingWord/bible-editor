@@ -294,6 +294,477 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
   return issues;
 }
 
+// ── Quote resolution against the source verse (#763) ────────────────────────
+//
+// A tn `quote` must actually be findable in the UHB/UGNT verse it points at.
+// Nothing checked this before, which is how 65 unresolvable quotes reached
+// Door43 and sat there for two months: the nightly export renders whatever D1
+// holds, and unfoldingWord's occurrence checker only sees them post-publish
+// (`Occurrence 1 not found for "…"`).
+//
+// MATCHING RULES — every one of these is calibrated, not guessed. A matcher
+// that is too strict buries the real defects in false positives: the first two
+// drafts of this check reported 162 and then 6,387 failures across the corpus
+// because they mishandled maqqef and then Hebrew paseq / Greek commas. The
+// rules below yield 65, and independently reproduce all 10 errors unfoldingWord
+// reported for ZEC.
+//
+//  * Parts split on `&` must each match a CONTIGUOUS run of source words, and
+//    must appear in increasing order — that is what `&` means.
+//  * Maqqef (U+05BE), paseq (U+05C0), sof pasuq (U+05C3) and ordinary
+//    punctuation are separators EQUIVALENT TO A SPACE. en_tn routinely writes a
+//    space where the UHB has a maqqef (ZEC 6:8 `אֶל אֶ֣רֶץ` vs UHB
+//    `אֶל־אֶ֣רֶץ`); flagging that would be noise, not signal.
+//  * Compare NFC-folded. The UHB stores combining marks in legacy
+//    dagesh-before-vowel order while quotes are frequently NFC — visually
+//    identical, byte-different (see canonizeHebrew.ts and hebrew.ts `nfc()`).
+//  * Do NOT fold away U+2060 WORD JOINER. It is a real difference and is the
+//    entire reason ZEC 4:10 fails: the quote is `הָאֶ֧בֶן הַבְּדִ֛יל` where the
+//    UHB has `הָ⁠אֶ֧בֶן הַ⁠בְּדִ֛יל`. Restoring the two joiners makes it match,
+//    so it gets its own message rather than a generic "not found".
+
+// The gap markers a quote may use between discontiguous parts. MUST stay in
+// step with GAP in web/src/lib/highlight.ts — the highlighter already accepts
+// "…" and "..." alongside "&", and REV 18:7 `r208` uses "…" in prod. Splitting
+// on "&" alone reported that working quote as unresolvable, and (worse) the
+// "..." spelling came back `confident`, so --repair would have rewritten a
+// correct quote.
+const QUOTE_GAP = /[&…]+|\.{3}/;
+
+// Separators carrying no letter content. Word joiner is deliberately absent.
+const QUOTE_SEPARATORS = /[־׀׃,.;··:!?"“”'’‘()[\]{}—–-]+/g;
+const INVISIBLE_JOINERS = /[⁠‍﻿]/g;
+
+/** NFC, punctuation → single space. Keeps invisible joiners significant. */
+function quoteNorm(s: string): string {
+  return s.normalize("NFC").replace(QUOTE_SEPARATORS, " ").replace(/\s+/g, " ").trim();
+}
+
+/** quoteNorm, plus invisible joiners removed — the LOOKUP fold only. */
+function quoteBare(s: string): string {
+  return quoteNorm(s).replace(INVISIBLE_JOINERS, "");
+}
+
+/**
+ * NO folding at all — byte equality against the source `\w` surface.
+ *
+ * The DATA says this is what translationCore counts. Two worked examples, both
+ * from the prod corpus, both declaring `1/1` on each member of a visually
+ * identical pair:
+ *   DAN 2:10  `כָּ⁠ל` (U+2060 between prefix and stem) and bare `כָּל`
+ *   1CH 22:19 `הָֽ⁠אֱלֹהִ֔ים` twice, differing only in combining-mark ORDER
+ * If tC folded either difference away it would have numbered them 1/2 and 2/2.
+ * It did not, so each byte-distinct surface carries its own occurrence
+ * sequence — and any fold here invents a second occurrence and flags a verse
+ * with nothing wrong with it. A joiner-stripping fold produced 99 such flags;
+ * an NFC fold kept the combining-mark half of them.
+ *
+ * Note this diverges from `sourceTextTotals` in web/src/lib/sourceOccurrences.ts,
+ * which counts under `nfc()`. That function drives the REPAIR, and its folding
+ * only ever makes it more conservative (a folded count > 1 falls outside its
+ * appears-once rule, so it declines to touch the row). Worth reconciling, but
+ * the flag a translator sees must not be a phantom.
+ */
+function alignFold(s: string): string {
+  return s;
+}
+
+/** A source word plus the separator that FOLLOWS it in the source text. */
+export interface SourceToken {
+  text: string;
+  /** " " or "־" (maqqef). Preserved so a rebuilt quote keeps the source's own
+   *  joining — rebuilding everything space-joined turned `וְ⁠רַב־חֶ֔סֶד` into
+   *  `וְ⁠רַב חֶ֔סֶד` in 37 repairs, which resolves fine but needlessly rewrites
+   *  the conventional rendering translators read. */
+  sep: string;
+}
+
+/** Words plus their following separators, in document order. */
+function tokensOf(verseObjects: unknown[]): SourceToken[] {
+  const out: SourceToken[] = [];
+  const walk = (nodes: unknown[]): void => {
+    for (const node of nodes) {
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      if (o["type"] === "word" && o["tag"] === "w" && typeof o["text"] === "string") {
+        out.push({ text: o["text"] as string, sep: " " });
+      } else if (o["type"] === "text" && typeof o["text"] === "string") {
+        // The separator lives in the text node BETWEEN two words.
+        if (out.length && (o["text"] as string).includes("־")) out[out.length - 1].sep = "־";
+      } else if (Array.isArray(o["children"])) {
+        walk(o["children"] as unknown[]);
+      }
+    }
+  };
+  walk(verseObjects);
+  return out;
+}
+
+/**
+ * Source tokens for a verse key, in document order.
+ *
+ * A source verse that is itself a bridge (` 6-9` → verse=6, verse_end=9) is
+ * registered under EVERY verse it covers, so a note anchored at verse 7 finds
+ * the bridge that contains it instead of reading as "no source verse".
+ */
+export function sourceWordsByRef(sourceVerses: VerseRow[]): Map<string, SourceToken[]> {
+  const out = new Map<string, SourceToken[]>();
+  for (const v of sourceVerses) {
+    const vo = verseObjectsOf(v);
+    if (!vo.length) continue;
+    const toks = tokensOf(vo);
+    if (!toks.length) continue;
+    const last = Math.max(v.verse, v.verse_end ?? v.verse);
+    for (let n = v.verse; n <= last; n++) {
+      const key = `${v.chapter}:${n}`;
+      if (n === v.verse || !out.has(key)) out.set(key, toks);
+    }
+  }
+  return out;
+}
+
+/**
+ * Every verse a tn row covers, in order.
+ *
+ * The row stores only the START verse (`refParts` takes `vs.split("-")[0]`);
+ * the real span lives in `ref_raw`. Two shapes occur and BOTH are live:
+ *   `1:5-6`      a range  — ignoring it checked a two-verse quote against
+ *                verse 5 alone, 185 false positives corpus-wide.
+ *   `5:1,3,8,12` a list   — PSA 5:1 row `sbh4` really is this, and searching
+ *                only verse 1 reported a correct quote as unresolvable.
+ * A chapter-qualified end (`1:5-1:6`) is accepted too; anything unparseable
+ * degrades to the single start verse rather than guessing.
+ */
+function refVerseList(refRaw: string | null | undefined, fallback: number): number[] {
+  // Everything after the FIRST colon. `split(":")[1]` truncates a
+  // chapter-qualified end: "1:5-1:6" would yield "5-1" and lose the 6.
+  const raw = refRaw ?? "";
+  const colon = raw.indexOf(":");
+  const vs = colon < 0 ? "" : raw.slice(colon + 1);
+  if (!vs) return [fallback];
+  const out: number[] = [];
+  for (const piece of vs.split(",")) {
+    const [rawStart, rawEnd] = piece.split("-");
+    // "1:5-1:6" — an end written as chapter:verse; take its verse half.
+    const start = parseInt((rawStart ?? "").split(":").pop() ?? "", 10);
+    if (!Number.isFinite(start)) continue;
+    const end = rawEnd === undefined ? start : parseInt(rawEnd.split(":").pop() ?? "", 10);
+    if (!Number.isFinite(end) || end < start || end - start > 200) { out.push(start); continue; }
+    for (let n = start; n <= end; n++) out.push(n);
+  }
+  if (!out.length) return [fallback];
+  if (!out.includes(fallback)) out.unshift(fallback);
+  return [...new Set(out)].sort((a, b) => a - b);
+}
+
+/**
+ * Source tokens for a tn row, concatenated across every verse it covers.
+ *
+ * A bridged source verse is registered under each verse of its span, so a
+ * ranged ref that lands inside one bridge would otherwise concatenate the same
+ * token array once per covered verse — tripling a 3-word verse and making every
+ * surface look repeated. Identity de-duplication keeps one copy.
+ */
+export function wordsForRow(
+  byRef: Map<string, SourceToken[]>,
+  chapter: number,
+  verse: number,
+  refRaw: string | null | undefined,
+): SourceToken[] {
+  const verses = refVerseList(refRaw, verse);
+  if (verses.length === 1) return byRef.get(`${chapter}:${verses[0]}`) ?? [];
+  const out: SourceToken[] = [];
+  const seen = new Set<SourceToken[]>();
+  for (const n of verses) {
+    const w = byRef.get(`${chapter}:${n}`);
+    // A gap in the middle of the span means we cannot faithfully reconstruct
+    // it — bail rather than flag against a hole.
+    if (!w) return [];
+    if (seen.has(w)) continue;
+    seen.add(w);
+    out.push(...w);
+  }
+  return out;
+}
+
+export type QuoteFailureKind = "joiners" | "order" | "duplicate" | "gap" | "absent";
+
+export type QuoteVerdict =
+  | { ok: true }
+  | {
+      ok: false;
+      kind: QuoteFailureKind;
+      detail: string;
+      /** Quote rebuilt in source order. Empty when nothing can be proposed. */
+      suggestion: string;
+      /**
+       * False when a quote word could only be matched by RE-USING a source
+       * position already claimed by an earlier word — the mapping is then a
+       * guess, and `suggestion` may silently drop a word. 2KI 16:17 is the
+       * worked example: the source reads `…אֶת הַ⁠מִּסְגְּרוֹת… ו⁠את הַ⁠כִּיֹּר…`,
+       * and the quote spells BOTH object markers `ו⁠את`. The first is a drifted
+       * spelling of `אֶת` at position 4, but it matches only position 9, so the
+       * pair looks like a duplicate and de-duplicating deletes a real word.
+       *
+       * In practice this is false for EVERY duplicate, including ones we
+       * understand (ZEC 8:1, where the ULT's "And" and "came" both align to
+       * וַיְהִי). Nothing in the data separates "the English repeated it" from
+       * "this is a misspelling of the word next door", and guessing wrong
+       * deletes scripture text — so all 10 corpus-wide duplicates go to a
+       * human with the proposal printed. Callers that WRITE must repair only
+       * when this is true.
+       */
+      confident: boolean;
+    };
+
+// Resolve one quote against a verse's source words. Returns the FIRST reason it
+// fails, chosen to be actionable rather than merely true.
+//
+// Exported so scripts/scan-tn-quotes.mjs repairs with the SAME rules the lint
+// flags by. Two implementations would drift, and the repair would then "fix"
+// rows into a shape the lint still rejects.
+export function resolveTnQuote(
+  quote: string,
+  source: ReadonlyArray<string | SourceToken>,
+): QuoteVerdict {
+  const tokens: SourceToken[] = source.map((w) =>
+    typeof w === "string" ? { text: w, sep: " " } : w,
+  );
+  const words = tokens.map((t) => t.text);
+  const hay = ` ${words.map(quoteNorm).join(" ")} `;
+  const parts = quote.split(QUOTE_GAP).map((p) => p.trim()).filter(Boolean);
+
+  let cursor = 0;
+  let contiguousOk = true;
+  for (const part of parts) {
+    const needle = ` ${quoteNorm(part)} `;
+    const at = hay.indexOf(needle, cursor);
+    if (at < 0) { contiguousOk = false; break; }
+    cursor = at + needle.length - 1;
+  }
+  if (contiguousOk) return { ok: true };
+
+  // Failed. Work out WHY by locating each quote word in the verse.
+  const bareWords = words.map(quoteBare);
+  const qWords = parts.flatMap((p) => quoteNorm(p).split(" ")).filter(Boolean);
+  const positions: number[] = [];
+  const used = new Set<number>();
+  const missing: string[] = [];
+  let joinerDrift = false;
+  let reusedPosition = false;
+  for (const qw of qWords) {
+    let pos = bareWords.findIndex((w, i) => !used.has(i) && w === quoteBare(qw));
+    if (pos < 0) {
+      pos = bareWords.indexOf(quoteBare(qw));
+      if (pos >= 0) reusedPosition = true;
+    }
+    if (pos < 0) { missing.push(qw); continue; }
+    used.add(pos);
+    positions.push(pos);
+    if (quoteNorm(words[pos]) !== qw) joinerDrift = true;
+  }
+
+  if (missing.length)
+    return {
+      ok: false, kind: "absent", suggestion: "", confident: false,
+      detail: `not in the verse: ${missing.join(", ")}`,
+    };
+
+  const sorted = [...positions].sort((a, b) => a - b);
+  const duplicated = new Set(positions).size !== positions.length;
+  const misordered = positions.some((p, i) => p !== sorted[i]);
+
+  // Every word present, correct order, no repeats — so the quote is a set of
+  // DISCONTIGUOUS spans written as one part. It needs a ` & ` at each gap.
+  const suggestion = suggestQuote(positions, tokens);
+  // A surface that occurs MORE often in the verse than in the quote means we
+  // had to CHOOSE which physical token the quote meant, and the greedy
+  // first-unused pick can be wrong in a way no self-check catches. EZK 40:6 is
+  // the worked example: the verse has סַ֣ף at positions 12 and 18, the quote
+  // uses it once, and picking 12 orphans it away from its neighbours and
+  // invents an ` & ` split — where reading it as 18 makes the whole quote one
+  // contiguous run. Both "resolve" and both use the same words, so only this
+  // check separates them. Ambiguous assignment → a human decides.
+  let ambiguousSurface = false;
+  const quoteCounts = new Map<string, number>();
+  for (const qw of qWords) quoteCounts.set(quoteBare(qw), (quoteCounts.get(quoteBare(qw)) ?? 0) + 1);
+  for (const [surface, inQuote] of quoteCounts) {
+    let inVerse = 0;
+    for (const w of bareWords) if (w === surface) inVerse++;
+    if (inVerse > 1 && inVerse > inQuote) { ambiguousSurface = true; break; }
+  }
+
+  const confident = !reusedPosition && !ambiguousSurface;
+  if (duplicated)
+    return { ok: false, kind: "duplicate", suggestion, confident, detail: `a source word is quoted twice; expected: ${suggestion}` };
+  if (misordered)
+    return { ok: false, kind: "order", suggestion, confident, detail: `words are not in source order; expected: ${suggestion}` };
+  if (joinerDrift)
+    return { ok: false, kind: "joiners", suggestion, confident, detail: `differs from the source only by invisible word joiners; expected: ${suggestion}` };
+  return { ok: false, kind: "gap", suggestion, confident, detail: `discontiguous — separate the parts with " & ": ${suggestion}` };
+}
+
+// Rebuild the quote the way quoteBuilder.ts would: unique positions, document
+// order, consecutive runs joined by a space, gaps by " & ".
+function suggestQuote(positions: number[], tokens: SourceToken[]): string {
+  const uniq = [...new Set(positions)].sort((a, b) => a - b);
+  if (!uniq.length) return "";
+  const runs: number[][] = [];
+  let run = [uniq[0]];
+  for (let i = 1; i < uniq.length; i++) {
+    if (uniq[i] === uniq[i - 1] + 1) run.push(uniq[i]);
+    else { runs.push(run); run = [uniq[i]]; }
+  }
+  runs.push(run);
+  // Inside a run, rejoin with the separator the SOURCE uses between those two
+  // words (space or maqqef); between runs, the gap marker.
+  return runs
+    .map((r) => r.map((p, i) => (i === r.length - 1 ? tokens[p].text : tokens[p].text + tokens[p].sep)).join(""))
+    .join(" & ");
+}
+
+const QUOTE_MESSAGES: Record<QuoteFailureKind, string> = {
+  joiners: "Quote is missing word joiners present in the source",
+  order: "Quote words are not in source order",
+  duplicate: "Quote repeats a source word",
+  gap: "Quote parts are discontiguous but not separated by &",
+  absent: "Quote does not appear in the source verse",
+};
+
+/**
+ * Flag tn rows whose quote cannot be resolved against the UHB/UGNT verse.
+ * `sourceVerses` are the `verses` rows for bible_version UHB (OT) or UGNT (NT).
+ * Rows whose verse is missing from `sourceVerses` are SKIPPED, not flagged —
+ * absence of a source verse is a different problem and would drown this one.
+ */
+export function lintTnQuotes(
+  rows: TnRow[],
+  source: VerseRow[] | Map<string, SourceToken[]>,
+): LintIssue[] {
+  const byRef = source instanceof Map ? source : sourceWordsByRef(source);
+  const issues: LintIssue[] = [];
+  for (const r of rows) {
+    const quote = r.quote?.trim();
+    if (!quote || quote === "*") continue;
+    // English support text typed into the quote field is a separate check.
+    if (!/[֐-׿Ͱ-Ͽἀ-῿]/.test(quote)) continue;
+    const tokens = wordsForRow(byRef, r.chapter, r.verse, r.ref_raw);
+    if (!tokens.length) continue;
+    const verdict = resolveTnQuote(quote, tokens);
+    if (verdict.ok) continue;
+    issues.push({
+      check: QUOTE_MESSAGES[verdict.kind],
+      bucket: "flag",
+      ref: `${r.chapter}:${r.verse}`,
+      rowId: r.id,
+      message: `Quote does not resolve against the source verse — ${verdict.detail}.`,
+    });
+  }
+  return issues;
+}
+
+// ── Alignment occurrence invariant (#764) ───────────────────────────────────
+//
+// For each distinct `x-content` in a verse, `x-occurrences` must equal how many
+// times that exact source word occurs in the source verse, and every
+// `x-occurrence` must fall in 1..N. Two real defect shapes violate it:
+//
+//   ULT ZEC 8:1 — `וַ⁠יְהִ֛י` carries occ=1/1 AND occ=2/1. The English needs
+//   both "And" and "came", so the aligner invented a second occurrence of a
+//   word the UHB has once. That is the upstream cause of the duplicated tn
+//   quotes this file's quote lint reports.
+//
+//   UST ZEC 1:16 — `יְהוָ֗ה` declares x-occurrences=2, but that exact string
+//   occurs once; the verse's other Yahweh is spelled with a different accent.
+//   UST counts accent-insensitively where the UHB and ULT do not, so a TWL row
+//   asking for occurrence 1 misses and reads as "nothing is aligned to it".
+//
+// Repeated milestones for ONE occurrence are legitimate (discontinuous
+// alignment — canonizeHebrew.ts handles them), so this counts DISTINCT
+// occurrence values, never milestone instances.
+export function lintAlignmentOccurrences(
+  verses: VerseRow[],
+  source: VerseRow[] | Map<string, SourceToken[]>,
+): LintIssue[] {
+  const byRef = source instanceof Map ? source : sourceWordsByRef(source);
+  const issues: LintIssue[] = [];
+  for (const v of verses) {
+    const vo = verseObjectsOf(v);
+    if (!vo.length) continue;
+    // A bridged TARGET verse (` 14-15`) spans several source verses. Counting
+    // its milestones against only the first one reports a word that legitimately
+    // appears once per verse as over-declared. The source side already handles
+    // bridges; this is the matching target-side span.
+    const toks = wordsForRow(byRef, v.chapter, v.verse, `${v.chapter}:${v.verse}${
+      v.verse_end && v.verse_end > v.verse ? `-${v.verse_end}` : ""
+    }`);
+    if (!toks.length) continue;
+    const counts = new Map<string, number>();
+    for (const t of toks) counts.set(alignFold(t.text), (counts.get(alignFold(t.text)) ?? 0) + 1);
+
+    // content → { declared totals seen, occurrence indices seen }
+    const groups = new Map<string, { totals: Set<number>; occs: Set<number> }>();
+    const walk = (nodes: unknown[]): void => {
+      for (const node of nodes) {
+        if (!node || typeof node !== "object") continue;
+        const o = node as Record<string, unknown>;
+        if (isZalnMilestone(o)) {
+          const content = typeof o["content"] === "string" ? (o["content"] as string) : null;
+          if (content) {
+            // Key by the counting fold, not the raw bytes: two milestones whose
+            // content differs only in NFC form would otherwise form separate
+            // groups and each be compared against the merged count.
+            const key = alignFold(content);
+            const g = groups.get(key) ?? { totals: new Set<number>(), occs: new Set<number>() };
+            const occ = Number(o["occurrence"]);
+            const tot = Number(o["occurrences"]);
+            if (Number.isFinite(occ)) g.occs.add(occ);
+            // A milestone with NO x-occurrences is UNKNOWN, not wrong. Reporting
+            // it as "x-occurrences=?" turns missing metadata into a defect the
+            // translator cannot act on — the same reasoning zalnLintKey applies
+            // to a missing x-occurrence.
+            if (Number.isFinite(tot)) g.totals.add(tot);
+            groups.set(key, g);
+          }
+        }
+        if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
+      }
+    };
+    walk(vo);
+
+    for (const [content, g] of groups) {
+      const actual = counts.get(alignFold(content)) ?? 0;
+      // x-content not in the source verse at all is a different defect; the
+      // quote/canonize paths own that one.
+      if (!actual) continue;
+      const totals = [...g.totals];
+      // No milestone in this group declared x-occurrences at all — unknown, not
+      // wrong. Reporting "x-occurrences=?" turns missing metadata into a defect
+      // a translator cannot act on.
+      if (!totals.length) continue;
+      if (totals.length !== 1 || totals[0] !== actual) {
+        issues.push({
+          check: "Alignment declares the wrong occurrence count",
+          bucket: "flag",
+          ref: `${v.chapter}:${v.verse}`,
+          message: `${v.bible_version} aligns "${content}" with x-occurrences=${totals.join("/") || "?"}, but the source verse contains it ${actual} time(s).`,
+        });
+        continue;
+      }
+      const bad = [...g.occs].filter((o) => o < 1 || o > actual).sort((a, b) => a - b);
+      if (bad.length) {
+        issues.push({
+          check: "Alignment occurrence out of range",
+          bucket: "flag",
+          ref: `${v.chapter}:${v.verse}`,
+          message: `${v.bible_version} aligns "${content}" at x-occurrence ${bad.join(", ")}, but the source verse contains it only ${actual} time(s).`,
+        });
+      }
+    }
+  }
+  return issues;
+}
+
 // tq rows: both question and response are REQUIRED. As with the tn note above,
 // DCS's `validate_tq_files.py` reports a blank one at severity="warning", so it
 // publishes rather than blocks — this lint is the only thing that flags it. (tq
