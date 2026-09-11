@@ -1309,13 +1309,15 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
     assert(remaining === 1, "…and the banner is untouched too, consistent with the row it names still standing");
   }
 
-  // Cases 5 & 6 (Codex 2nd-pass review on #761): the retire UPDATE and the
-  // banner clears now commit as ONE atomic D1 batch, so a failure after the
-  // retire can no longer strand a resolved row whose banner never came down.
-  // Both drive the REAL async retireVerseKeptAiMasterFlags against a D1 shim
-  // whose .batch() runs the statements (or, with failBatch, throws before
-  // applying any of them — the way an all-or-nothing D1 batch rolls back).
-  const mkBatchEnv = (d, failBatch = false) => {
+  // Cases 5-7 (Codex 2nd-pass review on #761): each pair's scoped retire and its
+  // banner clears commit as ONE atomic D1 batch PER PAIR, so a failure after the
+  // retire can no longer strand a resolved row whose banner never came down, and
+  // no single batch grows past D1's 100-statement cap. All drive the REAL async
+  // retireVerseKeptAiMasterFlags against a D1 shim whose .batch() runs the
+  // statements (or, with failBatch, throws before applying any of them — the way
+  // an all-or-nothing D1 batch rolls back; or, with capLimit, throws when a batch
+  // exceeds the cap — the way real D1 rejects an over-limit batch).
+  const mkBatchEnv = (d, failBatch = false, capLimit = Infinity) => {
     const make = (sql) => ({
       bind: (...args) => ({
         _sql: sql,
@@ -1331,6 +1333,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
         prepare: (sql) => make(sql),
         batch: async (stmts) => {
           if (failBatch) throw new Error("simulated transient D1 batch error");
+          if (stmts.length > capLimit) throw new Error(`batch of ${stmts.length} exceeds D1 cap ${capLimit}`);
           return stmts.map((s) => ({ meta: { changes: Number(d.prepare(s._sql).run(...(s._args ?? [])).changes) } }));
         },
       },
@@ -1388,6 +1391,35 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
       .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:HAG:ult'`)
       .all()[0].n;
     assert(remaining === 1, "…and the banner is still up, consistent with the still-standing row");
+  }
+
+  // Case 7 — batch cap: with 150 distinct (book, resource) pairs, a single
+  // global batch (retire + 150 DELETEs) would be 151 statements and breach
+  // D1's 100-statement cap, failing forever. Per-pair batching keeps every
+  // batch at 2 statements, so all 150 retire and clear. The shim throws if any
+  // batch exceeds 100, so this test FAILS against a one-global-batch impl.
+  {
+    const d = verseDb();
+    for (let i = 0; i < 150; i++) {
+      const book = `B${i}`;
+      d.prepare(
+        `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+         VALUES (?, 'ult', 1, 1, 'keep_ai_master', 'both_changed_ai_master', NULL, 100)`,
+      ).run(book);
+      d.prepare(
+        `INSERT INTO system_alerts (username, severity, source, message, created_at)
+         VALUES ('deferredreward', 'warning', ?, 'Sync flagged 1 verse(s)...', 100)`,
+      ).run(`verse_merge_conflict:${book}:ult`);
+    }
+
+    const result = await retireVerseKeptAiMasterFlags(mkBatchEnv(d, false, 100));
+    assert(result.cleared === 150, "all 150 pairs retire under the 100-statement batch cap (per-pair batching)");
+    const standing = d
+      .prepare(`SELECT COUNT(*) AS n FROM verse_merge_conflicts WHERE action='keep_ai_master' AND resolved_at IS NULL`)
+      .all()[0].n;
+    assert(standing === 0, "no keep_ai_master row is left standing");
+    const banners = d.prepare(`SELECT COUNT(*) AS n FROM system_alerts`).all()[0].n;
+    assert(banners === 0, "every pair's banner is cleared");
   }
 }
 

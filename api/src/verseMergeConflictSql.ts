@@ -419,6 +419,19 @@ export const RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL = `UPDATE verse_merge_conflicts
   WHERE action = 'keep_ai_master'
     AND resolved_at IS NULL`;
 
+// Pair-scoped retire: the same UPDATE narrowed to ONE (book, resource), so
+// retireVerseKeptAiMasterFlags can batch each pair's retire atomically with
+// that pair's banner clears WITHOUT one unbounded batch. A single global batch
+// (retire + every pair's DELETEs) can breach D1's 100-statement cap once enough
+// pairs (or per-username fan-out DELETEs) accumulate, and then fails and retries
+// the same oversized batch forever (#761 Codex review, 2nd pass). Binds:
+// (resolvedAt, book, resource).
+export const RETIRE_KEPT_AI_MASTER_CONFLICTS_FOR_PAIR_SQL = `UPDATE verse_merge_conflicts
+    SET resolved_at = ?1, resolved_by = NULL
+  WHERE action = 'keep_ai_master'
+    AND resolved_at IS NULL
+    AND book = ?2 AND resource = ?3`;
+
 // ---------------------------------------------------------------------------
 // Issue #760 (#754 P1 follow-up). Read BEFORE RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL
 // runs, so retireVerseKeptAiMasterFlags knows which (book, resource) pairs it is
