@@ -20,9 +20,9 @@ import {
   refParts,
 } from "./importParsers";
 import { requireAuth, requireEditor, currentUserId } from "./auth";
-import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
+import { BOOK_NUMBERS, NT_BOOKS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
 import { reimportBookFromDcs, recordResourceSync, ALL_RESOURCES, type Resource } from "./bookReimport";
-import { lintChapterOpeningMarkers, lintOrphanedBlankText, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint";
+import { lintAlignmentOccurrences, sourceWordsByRef, lintChapterOpeningMarkers, lintOrphanedBlankText, lintPairedPunctuation, lintTnQuotes, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint";
 import { effectiveBookLock, canManageLocks, requireAutoMergeConfirmation, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
 import { exportBranchOverrideValid, lockPushExportParams } from "./export";
@@ -402,8 +402,26 @@ books.get("/:book/lint", requireAuth, async (c) => {
     .bind(book)
     .all<VerseRow>();
 
+  // Source verses (UHB for OT, UGNT for NT) back the quote-resolution and
+  // alignment-occurrence checks. Both SKIP a verse that isn't present here, so
+  // a missing source verse degrades to "not checked", never a false flag.
+  const srcVersion = NT_BOOKS.has(book) ? "UGNT" : "UHB";
+  const src = await c.env.DB.prepare(
+    `SELECT * FROM verses WHERE book = ?1 AND bible_version = ?2 ORDER BY chapter, verse`,
+  )
+    .bind(book, srcVersion)
+    .all<VerseRow>();
+
+  // Parse the source book ONCE. Passing the raw rows to all three lints made
+  // each re-walk every verse's content_json (three full passes over the largest
+  // book for no gain).
+  const srcWords = sourceWordsByRef(src.results ?? []);
+
   const issues = [
     ...lintTnRows(tn.results ?? []).map((i) => ({ ...i, resource: "tn" })),
+    ...lintTnQuotes(tn.results ?? [], srcWords).map((i) => ({ ...i, resource: "tn" })),
+    ...lintAlignmentOccurrences(ult.results ?? [], srcWords).map((i) => ({ ...i, resource: "ult" })),
+    ...lintAlignmentOccurrences(ust.results ?? [], srcWords).map((i) => ({ ...i, resource: "ust" })),
     ...lintTqRows(tq.results ?? []).map((i) => ({ ...i, resource: "tq" })),
     ...lintTwlRows(twl.results ?? []).map((i) => ({ ...i, resource: "twl" })),
     ...lintUsfmVerses(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
