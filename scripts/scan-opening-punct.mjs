@@ -129,7 +129,9 @@ function trailingGapsWithOpener(nodes) {
       gaps.push(...trailingGapsWithOpener(n.children));
     }
   }
-  return gaps;
+  // An inner opener that is also the outer chain's trailing text is seen at
+  // both levels; report each distinct gap once (diagnostic text only).
+  return [...new Set(gaps)];
 }
 
 for (const r of rows) {
