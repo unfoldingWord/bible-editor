@@ -751,7 +751,14 @@ export interface ApplyResult {
   tnSkippedDup: number;
   tqCreated: number;
   tqUpdated: number;
+  // A tq_rows UPDATE lost its version CAS to a concurrent write (e.g. a
+  // translator's edit) — the proposal is left unaccepted for a later pass to
+  // re-apply, not silently clobbered. See applyTqUpsert.
+  tqSkippedConflict: number;
   verseUpdated: number;
+  // A verses UPDATE lost its version CAS to a concurrent write — same
+  // skip-and-retry-later semantics as tqSkippedConflict. See applyVerseUpdate.
+  verseSkippedConflict: number;
   // Distinct chapters that actually received a write, so the caller can fan out
   // one "chapter is stale" hint per changed chapter (not one per row).
   affectedChapters: number[];
@@ -821,7 +828,9 @@ async function applyJobOutput(
     tnSkippedDup: 0,
     tqCreated: 0,
     tqUpdated: 0,
+    tqSkippedConflict: 0,
     verseUpdated: 0,
+    verseSkippedConflict: 0,
     affectedChapters: [],
   };
 
@@ -1029,9 +1038,13 @@ async function applyJobOutput(
     const sortOrder = (tqCounters.get(k) ?? 0) + 100;
     tqCounters.set(k, sortOrder);
     const action = await applyTqUpsert(env, p, userId, sortOrder, claimedTqIds, actor);
-    affected.add(p.chapter);
-    if (action === "created") result.tqCreated += 1;
-    else result.tqUpdated += 1;
+    if (action === "conflict") {
+      result.tqSkippedConflict += 1;
+    } else {
+      affected.add(p.chapter);
+      if (action === "created") result.tqCreated += 1;
+      else result.tqUpdated += 1;
+    }
     await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
@@ -1055,9 +1068,13 @@ async function applyJobOutput(
     const k = verseKey(p);
     if (k !== versePrevKey && (await maybeCheckCancelled(env, job.jobId, cancel))) break;
     versePrevKey = k;
-    await applyVerseUpdate(env, p, userId, uhbWordsByVerse, actor);
-    affected.add(p.chapter);
-    result.verseUpdated += 1;
+    const outcome = await applyVerseUpdate(env, p, userId, uhbWordsByVerse, actor);
+    if (outcome === "conflict") {
+      result.verseSkippedConflict += 1;
+    } else {
+      affected.add(p.chapter);
+      result.verseUpdated += 1;
+    }
     await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
@@ -1544,7 +1561,7 @@ async function applyTqUpsert(
   sortOrder: number,
   claimedIds: Set<string>,
   actor: string,
-): Promise<"created" | "updated"> {
+): Promise<"created" | "updated" | "conflict"> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const rawId = typeof payload.id === "string" && payload.id.length > 0 ? payload.id : null;
 
@@ -1609,36 +1626,60 @@ async function applyTqUpsert(
         question: payload.question ?? null,
         response: payload.response ?? null,
       };
+      // CAS-guarded: `version = ?16` must still hold at write time — this row
+      // is live editable content (TQ has no active-pipeline PATCH guard the way
+      // tn does, so a translator edit can land here at any point), and without
+      // the guard this UPDATE would unconditionally overwrite it. Run standalone
+      // (not batched with the audit rows below) so `meta.changes` reports
+      // whether THIS write actually matched a row, rather than a post-hoc
+      // fingerprint a same-shaped concurrent write could satisfy just as well.
+      const updateRes = await env.DB
+        .prepare(
+          // sort_order is refreshed too: TQ has no preserve/keep semantics —
+          // each run fully reorders the verse to match the incoming file.
+          // `verse` is rewritten alongside ref_raw so a question the run
+          // moved to another verse of this chapter can't end up filed under
+          // its old verse while displaying the new reference.
+          `UPDATE tq_rows
+              SET ref_raw = ?1, tags = ?2, quote = ?3, occurrence = ?4,
+                  question = ?5, response = ?6, sort_order = ?7, verse = ?8,
+                  version = version + 1, updated_at = ?9, updated_by = ?10,
+                  ${provenanceSet(13)}
+            WHERE id = ?11 AND book = ?12 AND deleted_at IS NULL AND version = ?16`,
+        )
+        .bind(
+          patch.ref_raw,
+          patch.tags,
+          patch.quote,
+          patch.occurrence,
+          patch.question,
+          patch.response,
+          sortOrder,
+          p.verse,
+          now,
+          userId,
+          id,
+          p.book,
+          ...provenanceValues({ action: "ai_apply", source: "ai_pipeline", actor }),
+          existing.version,
+        )
+        .run();
+      if ((updateRes.meta.changes ?? 0) === 0) {
+        // Lost the race: someone edited this exact row between our SELECT and
+        // this UPDATE. Leave pending_imports unaccepted so the next pipeline
+        // poll re-proposes it for a later pass, mirroring the app's own 409
+        // re-queue behavior — no edit_log is written for a write that never
+        // happened, and the id is NOT claimed (nothing of ours landed on it).
+        console.warn("pipeline apply: tq CAS conflict — row changed since read, skipping (will retry next tick)", {
+          id,
+          book: p.book,
+          chapter: p.chapter,
+          verse: p.verse,
+          expectedVersion: existing.version,
+        });
+        return "conflict";
+      }
       await env.DB.batch([
-        env.DB
-          .prepare(
-            // sort_order is refreshed too: TQ has no preserve/keep semantics —
-            // each run fully reorders the verse to match the incoming file.
-            // `verse` is rewritten alongside ref_raw so a question the run
-            // moved to another verse of this chapter can't end up filed under
-            // its old verse while displaying the new reference.
-            `UPDATE tq_rows
-                SET ref_raw = ?1, tags = ?2, quote = ?3, occurrence = ?4,
-                    question = ?5, response = ?6, sort_order = ?7, verse = ?8,
-                    version = version + 1, updated_at = ?9, updated_by = ?10,
-                    ${provenanceSet(13)}
-              WHERE id = ?11 AND book = ?12 AND deleted_at IS NULL`,
-          )
-          .bind(
-            patch.ref_raw,
-            patch.tags,
-            patch.quote,
-            patch.occurrence,
-            patch.question,
-            patch.response,
-            sortOrder,
-            p.verse,
-            now,
-            userId,
-            id,
-            p.book,
-            ...provenanceValues({ action: "ai_apply", source: "ai_pipeline", actor }),
-          ),
         env.DB
           .prepare(
             `INSERT INTO edit_log
@@ -1806,7 +1847,7 @@ async function applyVerseUpdate(
   userId: number,
   uhbWordsByVerse: Map<number, SourceWord[]>,
   actor: string,
-): Promise<void> {
+): Promise<"applied" | "conflict"> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const book = String(payload.book ?? p.book);
   const chapter = Number(payload.chapter ?? p.chapter);
@@ -1922,27 +1963,55 @@ async function applyVerseUpdate(
   const now = Math.floor(Date.now() / 1000);
   if (existing) {
     const newVersion = existing.version + 1;
+    // CAS-guarded: `version = ?13` must still hold at write time. This is the
+    // AI pipeline's own verse-content write — the exact path `PATCH
+    // /api/verses/...` guards with If-Match/409 on the app side (see CLAUDE.md's
+    // "Save protocol") — so without this guard a translator's concurrent edit
+    // (or another script/pipeline write) landing between the SELECT above and
+    // here would be silently overwritten. Run standalone (not batched with the
+    // audit rows below) so `meta.changes` reports whether THIS write actually
+    // matched a row, rather than relying on a post-hoc fingerprint that a
+    // same-shaped concurrent write (e.g. a human CAS starting from the same
+    // version) could satisfy just as well as ours.
+    const updateRes = await env.DB
+      .prepare(
+        `UPDATE verses
+            SET content_json = ?1, plain_text = ?2, verse_end = ?3,
+                version = version + 1, updated_at = ?4, updated_by = ?5,
+                ${provenanceSet(10)}
+          WHERE book = ?6 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9
+            AND version = ?13`,
+      )
+      .bind(
+        contentJson,
+        plainText,
+        verseEnd,
+        now,
+        userId,
+        book,
+        chapter,
+        verse,
+        bibleVersion,
+        ...provenanceValues({ action: "ai_apply", source: "ai_pipeline", actor }),
+        existing.version,
+      )
+      .run();
+    if ((updateRes.meta.changes ?? 0) === 0) {
+      // Lost the race: someone else's write landed between our SELECT and this
+      // UPDATE. Leave pending_imports unaccepted (no accepted_at) so the next
+      // pipeline poll re-proposes this row for a later pass to re-apply against
+      // the now-current content, mirroring the app's own 409 re-queue behavior
+      // — no edit_log/baseline is written for a write that never happened.
+      console.warn("pipeline apply: verse CAS conflict — row changed since read, skipping (will retry next tick)", {
+        book,
+        chapter,
+        verse,
+        bibleVersion,
+        expectedVersion: existing.version,
+      });
+      return "conflict";
+    }
     await env.DB.batch([
-      env.DB
-        .prepare(
-          `UPDATE verses
-              SET content_json = ?1, plain_text = ?2, verse_end = ?3,
-                  version = version + 1, updated_at = ?4, updated_by = ?5,
-                  ${provenanceSet(10)}
-            WHERE book = ?6 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9`,
-        )
-        .bind(
-          contentJson,
-          plainText,
-          verseEnd,
-          now,
-          userId,
-          book,
-          chapter,
-          verse,
-          bibleVersion,
-          ...provenanceValues({ action: "ai_apply", source: "ai_pipeline", actor }),
-        ),
       // Preserve the pre-AI content as a baseline at its own version, so verse
       // history can restore the state before the AI ran. Guarded: only when that
       // version was never logged (i.e. the original bootstrap import), so repeat
@@ -1979,7 +2048,7 @@ async function applyVerseUpdate(
         )
         .bind(p.id, userId),
     ]);
-    return;
+    return "applied";
   }
 
   // The verse should exist from the initial book import; this branch is the
@@ -2014,4 +2083,5 @@ async function applyVerseUpdate(
       )
       .bind(p.id, userId),
   ]);
+  return "applied";
 }
