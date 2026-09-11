@@ -56,6 +56,45 @@
 // from the verse entirely (Ketiv/Qere mismatches, a quote carrying a trailing
 // section marker `׃ס`, a stray backtick, an ellipsis used instead of `&`, a
 // dropped accent, a truncated word). Guessing at those would be inventing text.
+//
+// VISIBLE SIDE EFFECT (#768): the generated UPDATE also stamps
+// last_change_action='update', last_change_source='system',
+// last_change_actor='scan-tn-quotes' (see rowProvenance.ts) alongside
+// updated_by. A row that showed an "AI-drafted" chip before the repair (driven
+// by latest_source in rows.ts's chapter read path, ultimately sourced from
+// this same provenance) STOPS showing that chip after the repair runs, even
+// though the row's content is otherwise unchanged apart from the fixed quote.
+// This is deliberate and correct — a human-authorized script touched the row,
+// so its last-change provenance should say so — not a regression to chase.
+//
+// PIPELINE WRITE-PATH SAFETY (#771). This script's UPDATE is guarded by
+// `AND version = <dumped version>`, which protects against a concurrent
+// TRANSLATOR edit (rows.ts's PATCH path bumps version on every write). Does it
+// ALSO protect against a concurrent AI PIPELINE write racing the repair?
+// Independently read api/src/pipelineImport.ts end to end: every write it
+// makes to an EXISTING tn_rows row is itself CAS-guarded on a version read
+// immediately beforehand, in the SAME function that writes it — never a
+// version cached from earlier in a multi-step job:
+//   - deleteUnkeptTns's SELECT (WHERE ... preserve = 0 AND hint = 0 ...) reads
+//     `id, version` for the rows about to be swept, then its UPDATE re-asserts
+//     `AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0
+//      AND hint = 0 AND version = ?5` using that just-read version.
+//   - applyTnHintExpansionIfMatch SELECTs the hint stub's `id, version`, then
+//     its UPDATE requires `WHERE id = ?8 AND book = ?9 AND deleted_at IS NULL
+//      AND hint = 1 AND version = ?10` against that same read.
+//   - applyTnInsert only INSERTs a fresh row (a proposed id that collides with
+//     a LIVE row is treated as a PRIMARY KEY failure and retried with a newly
+//     minted id — see the UNIQUE/PRIMARY KEY catch there — so it never
+//     overwrites an existing row's content).
+// So every tn_rows write this pipeline can make either (a) fails to match the
+// repair's row (different id/version) and simply no-ops, or (b) is itself
+// guarded and no-ops if the repair moved the row first. CAS makes the race
+// safe in both directions: a pipeline write landing after this repair becomes
+// a no-op once the version it expects no longer matches, and this repair
+// landing mid-pipeline is safe for the same reason in reverse. No
+// activePipelineForChapter-equivalent lockout is needed here — unlike
+// scripts/scan-source-occurrences.mjs's `verses` target, see that script's
+// header for a write path that is NOT similarly guarded.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
@@ -258,7 +297,7 @@ for (const f of repairable) {
   lines.push(
     `-- ${sqlComment(f.row.book)} ${f.row.chapter}:${f.row.verse} ${sqlComment(f.row.id)} [${f.verdict.kind}]`,
     `--   was: ${sqlComment(f.row.quote)}`,
-    `UPDATE tn_rows SET quote = '${sqlEscape(f.verdict.suggestion)}', version = version + 1, updated_at = unixepoch(), updated_by = ${actor}`,
+    `UPDATE tn_rows SET quote = '${sqlEscape(f.verdict.suggestion)}', version = version + 1, updated_at = unixepoch(), updated_by = ${actor}, last_change_action = 'update', last_change_source = 'system', last_change_actor = 'scan-tn-quotes'`,
     `  WHERE book = '${sqlEscape(f.row.book)}' AND id = '${sqlEscape(f.row.id)}' AND version = ${Number(f.row.version)} AND deleted_at IS NULL AND trashed_at IS NULL;`,
     // Audit row, same shape the app writes for a quote edit (a PARTIAL payload
     // of just the changed fields — see edit_log for kind='tn'). A direct SQL

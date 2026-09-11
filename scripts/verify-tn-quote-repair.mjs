@@ -10,21 +10,40 @@
 //      `confident` flag alone does not: `confident` only rules out RE-USING a
 //      position, not choosing the wrong one among several identical surfaces.
 //
+// Checks EXACTLY the rows the repair actually wrote, not every row in the tn
+// dump that happens to look unresolvable: the SET of rows to verify comes from
+// the JSON sidecar scan-tn-quotes.mjs --repair writes (the same one
+// rollback-tn-quotes.mjs reads), so a BOOK=-filtered or lock-filtered run is
+// verified as what it actually did, not as a fresh independent re-scan. Each
+// row's own oldQuote/newQuote from the sidecar is what gets compared — nothing
+// is re-derived from the tn dump's CURRENT quote value, which may already have
+// moved on (post-repair dump) or may not yet reflect the repair (pre-repair
+// dump). The tn dump is used only to look up each row's ref_raw (the sidecar
+// doesn't carry it) so its source-word span is resolved correctly for ranged/
+// listed references; a sidecar row whose (book,id) the dump no longer carries
+// is reported as a warning (the dump is stale relative to what was repaired)
+// rather than crashing.
+//
 // Usage:
 //   node --experimental-strip-types --no-warnings \
-//     scripts/verify-tn-quote-repair.mjs scripts/out/dump/tn.json scripts/out/dump/src-all.json
+//     scripts/verify-tn-quote-repair.mjs scripts/out/dump/tn.json scripts/out/dump/src-all.json \
+//     [scripts/out/repair-tn-quotes.json]
 
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveTnQuote, sourceWordsByRef, wordsForRow } from "../api/src/lint.ts";
+import { resolveTnQuote, sourceWordsByRef, wordsForRow, QUOTE_GAP } from "../api/src/lint.ts";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const [tnPath, srcPath] = process.argv.slice(2);
+const [tnPath, srcPath, sidecarPathArg] = process.argv.slice(2);
 if (!tnPath || !srcPath) {
-  console.error("usage: node scripts/verify-tn-quote-repair.mjs <tn-dump.json> <src-dump.json>");
+  console.error(
+    "usage: node scripts/verify-tn-quote-repair.mjs <tn-dump.json> <src-dump.json> [sidecar.json]",
+  );
   process.exit(1);
 }
+const sidecarPath = sidecarPathArg ?? "scripts/out/repair-tn-quotes.json";
+
 function rowsOf(p) {
   const raw = JSON.parse(readFileSync(resolve(repoRoot, p), "utf8"));
   if (Array.isArray(raw) && Array.isArray(raw[0]?.results)) return raw[0].results;
@@ -35,7 +54,11 @@ const JOINERS = /[⁠‍﻿]/g;
 const SEPS = /[־׀׃,.;··:!?"“”'’‘()[\]{}—–-]+/g;
 const norm = (s) => s.normalize("NFC").replace(SEPS, " ").replace(/\s+/g, " ").trim();
 const bare = (s) => norm(s).replace(JOINERS, "");
-const wordsOf = (q) => q.split("&").flatMap((p) => norm(p).split(" ")).filter(Boolean).map(bare);
+// Split on the SAME gap-marker set resolveTnQuote does (`&`, `…`, or literal
+// `...`) — not the bare literal "&". A failing quote written with an ellipsis
+// gap marker used to tally as one giant "word" here, making a clean repair
+// look like it ADDS/DROPS words it never touched.
+const wordsOf = (q) => q.split(QUOTE_GAP).flatMap((p) => norm(p).split(" ")).filter(Boolean).map(bare);
 
 const srcByBook = new Map();
 for (const r of rowsOf(srcPath)) {
@@ -45,28 +68,65 @@ for (const r of rowsOf(srcPath)) {
 const wordsByBook = new Map();
 for (const [b, rows] of srcByBook) wordsByBook.set(b, sourceWordsByRef(rows));
 
-let repairs = 0, bad = 0;
-for (const r of rowsOf(tnPath)) {
-  const quote = (r.quote ?? "").trim();
-  if (!quote || !/[֐-׿Ͱ-Ͽἀ-῿]/.test(quote)) continue;
-  const byRef = wordsByBook.get(r.book);
+// Index the tn dump by "book/id" — composite key, same reason scan-tn-quotes.mjs
+// keys its UPDATEs that way: tn `id` is NOT globally unique across books. "/"
+// is a safe separator: neither a book code nor a row id ever contains one.
+const tnKey = (book, id) => `${book}/${id}`;
+const tnByKey = new Map();
+for (const r of rowsOf(tnPath)) tnByKey.set(tnKey(r.book, r.id), r);
+
+const sidecarFile = resolve(repoRoot, sidecarPath);
+let sidecar;
+try {
+  sidecar = JSON.parse(readFileSync(sidecarFile, "utf8"));
+} catch (err) {
+  console.error(`cannot read sidecar ${sidecarFile}: ${err.message}`);
+  process.exit(1);
+}
+const sidecarRows = Array.isArray(sidecar?.rows) ? sidecar.rows : null;
+if (!sidecarRows) {
+  console.error(
+    `sidecar ${sidecarFile} is malformed (expected { generatedAt, book, rows: [...] }) — ` +
+      "regenerate it with scan-tn-quotes.mjs --repair",
+  );
+  process.exit(1);
+}
+console.log(
+  `verifying ${sidecarRows.length} row(s) from sidecar ${sidecarFile}` +
+    (sidecar.generatedAt ? ` (run ${sidecar.generatedAt}${sidecar.book ? ` BOOK=${sidecar.book}` : ""})` : ""),
+);
+
+let repairs = 0, bad = 0, stale = 0;
+for (const s of sidecarRows) {
+  const dumpRow = tnByKey.get(tnKey(s.book, s.id));
+  if (!dumpRow) {
+    stale++;
+    console.log(
+      `\n?? ${s.book} ${s.id} — in the repair sidecar but missing from the tn dump ` +
+        "(the dump is stale relative to what was repaired; skipping, not crashing)",
+    );
+    continue;
+  }
+  const byRef = wordsByBook.get(s.book);
   if (!byRef) continue;
-  const words = wordsForRow(byRef, r.chapter, r.verse, r.ref_raw);
+  // ref_raw comes from the CURRENT tn dump row, not the sidecar (which only
+  // carries chapter/verse) — needed for ranged/listed references ("1:5-6").
+  const words = wordsForRow(byRef, s.chapter, s.verse, dumpRow.ref_raw);
   if (!words.length) continue;
-  const v = resolveTnQuote(quote, words);
-  if (v.ok || !v.suggestion || !v.confident) continue;
   repairs++;
 
   const problems = [];
-  const after = resolveTnQuote(v.suggestion, words);
+  // Property 1: the repaired (sidecar) quote resolves against the source verse.
+  const after = resolveTnQuote(s.newQuote, words);
   if (!after.ok) problems.push(`repaired quote STILL fails (${after.kind})`);
 
-  // A real multiset comparison. `Array.includes` would make this a SET
+  // Property 2: a real multiset comparison of the sidecar's own before/after —
+  // NOT re-derived from the dump. `Array.includes` would make this a SET
   // comparison, and a repair that drops one of two identical words would pass
   // unnoticed — the exact failure mode this check exists to catch.
   const tally = (ws) => ws.reduce((m, w) => m.set(w, (m.get(w) ?? 0) + 1), new Map());
-  const before = tally(wordsOf(quote));
-  const fixed = tally(wordsOf(v.suggestion));
+  const before = tally(wordsOf(s.oldQuote));
+  const fixed = tally(wordsOf(s.newQuote));
   const added = [];
   const dropped = [];
   for (const [w, n] of fixed) if (n > (before.get(w) ?? 0)) added.push(`${w} x${n - (before.get(w) ?? 0)}`);
@@ -76,11 +136,14 @@ for (const r of rowsOf(tnPath)) {
 
   if (problems.length) {
     bad++;
-    console.log(`\n!! ${r.book} ${r.ref_raw} ${r.id} [${v.kind}]`);
-    console.log(`   was: ${quote}`);
-    console.log(`   fix: ${v.suggestion}`);
+    console.log(`\n!! ${s.book} ${dumpRow.ref_raw ?? `${s.chapter}:${s.verse}`} ${s.id}`);
+    console.log(`   was: ${s.oldQuote}`);
+    console.log(`   fix: ${s.newQuote}`);
     for (const p of problems) console.log(`   -> ${p}`);
   }
 }
-console.log(`\nchecked ${repairs} proposed repair(s); ${bad} failed a safety property`);
+console.log(
+  `\nchecked ${repairs} repair(s) from the sidecar (${stale} stale/missing from the tn dump); ` +
+    `${bad} failed a safety property`,
+);
 process.exit(bad ? 1 : 0);
