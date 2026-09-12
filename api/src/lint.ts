@@ -1018,28 +1018,37 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 // app's own concatSourceRange. Any future figure quoted here must come from that
 // fixed script.
 //
-// The 10 that remain are DELIBERATELY still flagged: 1CH 8:8, 1CH 8:12,
-// 1CH 22:19, ACT 1:24, JOS 14:3, LEV 24:10, MAT 7:13, PSA 71:9, REV 4:9 all
-// stamp two genuinely distinct source tokens with the same x-occurrence, so
-// telling them apart needs the real occurrence reform this check cannot run;
-// and HAB 1:3 is the reversed-nesting case below. Lint cries wolf on these BY
-// CHOICE — see the reverted-suppression note next for what the cheap
-// alternative cost.
+// UPDATE (#421): the 10 that were DELIBERATELY still flagged — 1CH 8:8,
+// 1CH 8:12, 1CH 22:19, ACT 1:24, JOS 14:3, LEV 24:10, MAT 7:13, PSA 71:9,
+// REV 4:9 (each stamping two genuinely distinct source tokens with the same
+// x-occurrence) plus HAB 1:3 (reversed nesting, below) — are now down to at
+// most HAB 1:3. This check now runs the real occurrence reform whenever a
+// caller supplies `sourceVerses`/a source map (see resolveChainPositions,
+// mirroring web/src/lib/alignment.ts's renumberSourceOccurrences), so a
+// resolved key is a real, verse-unique position rather than a raw, possibly
+// stale x-occurrence — closing all 9 of the "distinct tokens, same raw
+// occurrence" false positives. HAB 1:3 is untouched by design: reform only
+// replaces the OCCURRENCE component of a key, and its two chains carry
+// different x-content in reversed order, so their (order-sensitive) chain
+// signatures still genuinely differ — see the HAB 1:3 note below. Without a
+// source (older callers, or a verse with no resolvable UHB/UGNT row) this
+// check is exactly as it was: raw (content|occurrence) identity only.
+// scan-reused-token-visibility.mjs --remote against prod is how the
+// corpus-wide lintOnly/uiOnly figures above get re-measured; not run from
+// this cloud session (no prod D1 access) — the last confirmed figures were
+// lintOnly=11, uiOnly=26, flaggedButUnrendered=0 (issue #421, 2026-08-16).
 //
 // A source-token-count suppression (count real source `\w` tokens per NFC
 // content, suppress when the source holds at least as many as there are chains
 // claiming it) was tried and REVERTED, because it silenced lint on verses the
-// marker still flags as real. **Its evidence is only partly re-verified.** With
-// the fixed script, 1CH 6:78 UST is still a genuine defect it would suppress
-// (source has וְאֶת three times, the target stamps FOUR milestones, marker
-// flags 4 words) — but LEV 24:10 UST, the other verse originally cited, is
-// NOT a real defect at all (marker flags 0; it is one of the 10 lint-only
-// false positives above). So the revert rests on 1CH 6:78 alone and has not
-// been re-measured end to end against the fixed script. Do not treat "the
-// suppressor is definitively wrong" as settled: re-measure both directions
-// before either restoring or re-rejecting it. The two regression tests below
-// (LEV 24:10 / 1CH 6:78 shapes) pin the LINT behaviour for those shapes, which
-// is stable either way — but the LEV one is NOT evidence of a real defect.
+// marker still flags as real: 1CH 6:78 UST is a genuine defect it would
+// suppress (source has וְאֶת three times, the target stamps FOUR milestones,
+// marker flags 4 words), while LEV 24:10 UST — the other verse originally
+// cited — was NOT a real defect (marker flags 0; it was one of the false
+// positives the reform above now closes). The two regression tests below
+// (LEV 24:10 / 1CH 6:78 shapes) still pin the pre-reform (no source supplied)
+// behaviour for both shapes; separate reform-aware tests confirm the reform
+// closes LEV 24:10 while 1CH 6:78 stays flagged.
 // The occurrence-insensitive signature has a KNOWN HOLE, and it is accepted
 // deliberately, as a CLASS: any two chains whose unique-key lists agree on
 // content sequence but differ in one or more occurrence numbers now sign
@@ -1153,8 +1162,173 @@ function stripOccurrenceSuffix(key: string): string {
   return i === -1 ? key : key.slice(0, i);
 }
 
-function hasReusedSourceToken(nodes: unknown[]): boolean {
-  const chains = findTopLevelZalns(nodes).map(collectZalnChainKeys);
+// A chain word carrying everything resolveChainPositions needs: the raw
+// (content|occurrence) identity zalnLintKey already computes, plus the parsed
+// occurrence/occurrences needed to re-derive a real source position. Built by
+// walking the SAME chain shape as collectZalnChainKeys (self, then nested
+// zalns reached through non-zaln wrapper children) — see zalnLintKey for why a
+// word with no content or no occurrence contributes nothing.
+interface ReusedTokenWord {
+  content: string; // NFC
+  occurrence: number;
+  occurrences: string | undefined;
+  rawKey: string; // zalnLintKey(node) — the pre-reform identity
+}
+function collectZalnChainWords(node: Record<string, unknown>): ReusedTokenWord[] {
+  const out: ReusedTokenWord[] = [];
+  const rawKey = zalnLintKey(node);
+  if (rawKey !== null) {
+    const occurrences = node["occurrences"];
+    out.push({
+      content: (node["content"] as string).normalize("NFC"),
+      occurrence: parseInt(String(node["occurrence"]), 10) || 0,
+      occurrences: occurrences === undefined || occurrences === null ? undefined : String(occurrences),
+      rawKey,
+    });
+  }
+  const children = node["children"];
+  if (Array.isArray(children)) out.push(...collectZalnChainWordsFromList(children));
+  return out;
+}
+function collectZalnChainWordsFromList(nodes: unknown[]): ReusedTokenWord[] {
+  const out: ReusedTokenWord[] = [];
+  for (const n of nodes) {
+    if (isZalnMilestone(n)) {
+      out.push(...collectZalnChainWords(n as Record<string, unknown>));
+      continue;
+    }
+    const children = (n as Record<string, unknown> | null)?.["children"];
+    if (Array.isArray(children)) out.push(...collectZalnChainWordsFromList(children));
+  }
+  return out;
+}
+
+// Re-derive real source POSITIONS for each chain's words, exactly the way
+// web/src/lib/alignment.ts's renumberSourceOccurrences + pickBestAssignment do
+// for the aligner's own reused-source-word marker (api/ cannot import web/ —
+// CLAUDE.md). Simplified for what lint's chain identity actually carries: a
+// zalnLintKey has no strong/lemma, only content, so there is no strong-number
+// fallback and no synthetic source-coverage augmentation — content-keyed
+// candidate resolution against the verse's real UHB/UGNT tokens is the whole
+// of it. See the scope comment on hasReusedSourceToken for why this exists.
+//
+// Returns one key list per chain, same shape hasReusedSourceToken always
+// consumed: a reformed key is `content|@position` (a real, verse-unique
+// physical token); a chain that could not be reformed (no source supplied, or
+// a word whose content matches no real source token) falls back to its raw
+// (content|occurrence) identity — byte-identical to pre-reform behaviour.
+function resolveChainPositions(chains: ReusedTokenWord[][], srcTokens: string[]): string[][] {
+  if (srcTokens.length === 0) return chains.map((words) => words.map((w) => w.rawKey));
+
+  const positionsByContent = new Map<string, number[]>();
+  srcTokens.forEach((text, i) => {
+    const key = text.normalize("NFC");
+    const list = positionsByContent.get(key);
+    if (list) list.push(i);
+    else positionsByContent.set(key, [i]);
+  });
+
+  // Highest position already claimed for each surface by an EARLIER chain in
+  // this verse (document order) — mirrors renumberSourceOccurrences's cursor,
+  // so consecutive chains for a repeated surface walk forward through its
+  // tokens instead of piling onto one.
+  const cursor = new Map<string, number>();
+  const advance = (resolved: { content: string; position: number }[]) => {
+    for (const r of resolved) cursor.set(r.content, Math.max(cursor.get(r.content) ?? -1, r.position));
+  };
+
+  return chains.map((words) => {
+    if (words.length === 0) return [];
+    const candidates = words.map((w) => positionsByContent.get(w.content) ?? []);
+    // No anchor for at least one word — never guess; keep the chain's raw
+    // identity untouched, same fallback direction as renumberSourceOccurrences.
+    if (candidates.some((c) => c.length === 0)) return words.map((w) => w.rawKey);
+
+    // "Current" fast path: a chain's OWN stated occurrence/occurrences are
+    // trusted as-is when they already validly index a real, distinct source
+    // position — exactly renumberSourceOccurrences's `current` check. This is
+    // what lets a chain that is genuinely wrong (its total disagrees with the
+    // real source count) fall through to full resolution below, while a
+    // chain whose claim already happens to be correct is left alone.
+    const current = words.map((w, i) => {
+      const pos = candidates[i][w.occurrence - 1];
+      if (pos === undefined) return null;
+      if (w.occurrences === undefined || w.occurrences !== String(candidates[i].length)) return null;
+      return pos;
+    });
+    const currentOk = current.every((p) => p !== null) && new Set(current).size === current.length;
+
+    let positions: number[];
+    if (currentOk) {
+      positions = current as number[];
+    } else {
+      const picked = pickBestPositions(candidates, words.map((w) => w.content), cursor);
+      if (!picked) return words.map((w) => w.rawKey); // pathological search space — never guess
+      positions = picked;
+    }
+    advance(words.map((w, i) => ({ content: w.content, position: positions[i] })));
+    return words.map((w, i) => `${w.content}|@${positions[i]}`);
+  });
+}
+
+// Exhaustive search over one chain's candidate positions, ranked exactly as
+// web/src/lib/alignment.ts's pickBestAssignment: contiguous span first (a card
+// covers one contiguous source run), then no back-step behind an earlier
+// same-surface claim, then most words moved past the cursor, then leftmost.
+// Chains are 1-3 words with a handful of candidates each, so the search is
+// trivial; it refuses (returns null) rather than searching a pathological
+// space.
+function pickBestPositions(
+  candidates: number[][],
+  contents: string[],
+  cursor: Map<string, number>,
+): number[] | null {
+  let space = 1;
+  for (const c of candidates) space *= c.length;
+  if (space > 4096) return null;
+
+  let best: number[] | null = null;
+  let bestScore: number[] | null = null;
+  const chosen: number[] = [];
+  const used = new Set<number>();
+
+  const better = (a: number[], b: number[]) => {
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] < b[i];
+    return false;
+  };
+
+  const recurse = (i: number) => {
+    if (i === candidates.length) {
+      const span = Math.max(...chosen) - Math.min(...chosen);
+      let behind = 0;
+      let ahead = 0;
+      for (let j = 0; j < chosen.length; j++) {
+        const seen = cursor.get(contents[j]) ?? -1;
+        if (chosen[j] < seen) behind++;
+        else if (chosen[j] > seen) ahead++;
+      }
+      const score = [span, behind, -ahead, Math.min(...chosen)];
+      if (!bestScore || better(score, bestScore)) {
+        bestScore = score;
+        best = [...chosen];
+      }
+      return;
+    }
+    for (const pos of candidates[i]) {
+      if (used.has(pos)) continue;
+      used.add(pos);
+      chosen.push(pos);
+      recurse(i + 1);
+      chosen.pop();
+      used.delete(pos);
+    }
+  };
+  recurse(0);
+  return best;
+}
+
+function hasReusedSourceToken(nodes: unknown[], srcTokens: string[] = []): boolean {
+  const chains = resolveChainPositions(findTopLevelZalns(nodes).map(collectZalnChainWords), srcTokens);
   const chainKeysByToken = new Map<string, Set<string>>();
   for (const keys of chains) {
     // De-duplicate WITHIN the chain before taking its identity, exactly as
@@ -1173,8 +1347,8 @@ function hasReusedSourceToken(nodes: unknown[]): boolean {
     // is the AI doubled-source-milestone defect: the source holds A once, the
     // marker dedups it to one position and stays silent, and lint flags a
     // false positive in a class this check explicitly disclaims owning. Not
-    // fixed here; some of the 10 remaining lint-only verses may be this shape
-    // (not verified per-verse).
+    // fixed here (and unaffected by the #421 occurrence reform above, which
+    // only changes what "occurrence" a key carries, not this dedup step).
     const uniqueKeys = [...new Set(keys)];
     // The chain SIGNATURE strips occurrence before joining (deliberately NOT
     // deduped again — positional multiplicity must survive, so [A|1, A|2]
@@ -1467,7 +1641,15 @@ function quoteIssues(verses: VerseRow[]): LintIssue[] {
 // across the whole call, not inside this per-verse loop. (Verse-coverage /
 // chapter-count are guarded by the export shrink guard and validated
 // whole-file downstream; not duplicated here.)
-export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
+export function lintUsfmVerses(
+  verses: VerseRow[],
+  source?: VerseRow[] | Map<string, SourceToken[]>,
+): LintIssue[] {
+  // Optional: without it, "Reused source token" falls back to raw
+  // (content|occurrence) identity exactly as before this parameter existed
+  // (see resolveChainPositions). With it, that check re-derives real source
+  // positions the same way the aligner's own marker does (#421).
+  const byRef = source ? (source instanceof Map ? source : sourceWordsByRef(source)) : null;
   const issues: LintIssue[] = [...quoteIssues(verses)];
   for (const v of verses) {
     if (v.verse === 0) continue;
@@ -1480,6 +1662,15 @@ export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
     const vos = (parsed as { verseObjects?: unknown[] })?.verseObjects;
     if (!Array.isArray(vos)) continue;
     const ref = `${v.chapter}:${v.verse}`;
+    // Bridged verse ranges resolve the same way lintAlignmentOccurrences does.
+    const srcTokens = byRef
+      ? wordsForRow(
+          byRef,
+          v.chapter,
+          v.verse,
+          `${v.chapter}:${v.verse}${v.verse_end && v.verse_end > v.verse ? `-${v.verse_end}` : ""}`,
+        ).map((t) => t.text.normalize("NFC"))
+      : [];
     const delta = footnoteDelta(vos);
     if (delta !== 0) {
       issues.push({
@@ -1497,7 +1688,7 @@ export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
         message: "alignment milestone x-content spans a maqqef/minus (two source words glued into one).",
       });
     }
-    if (hasReusedSourceToken(vos)) {
+    if (hasReusedSourceToken(vos, srcTokens)) {
       issues.push({
         check: "Reused source token",
         bucket: "flag",
