@@ -43,6 +43,49 @@
 // scripts/split-fixes-by-lock.mjs applies the same rule a second time when it
 // combines per-book output; the two are belt and braces, not alternatives.
 //
+// VISIBLE SIDE EFFECT (#768): the generated UPDATE also stamps
+// last_change_action='update', last_change_source='system',
+// last_change_actor='scan-source-occurrences' (see rowProvenance.ts) alongside
+// updated_by. A verse that showed an "AI-drafted" chip before the repair
+// (driven by latest_source in rows.ts's chapter read path, ultimately sourced
+// from this same provenance) STOPS showing that chip after the repair runs,
+// even though the verse's content is otherwise unchanged apart from the fixed
+// occurrence numbering. This is deliberate and correct — a human-authorized
+// script touched the row — not a regression to chase.
+//
+// PIPELINE WRITE-PATH SAFETY (#771). This script's UPDATE is guarded by
+// `AND version = <dumped version>`, protecting against a concurrent
+// TRANSLATOR edit. Independently reading api/src/pipelineImport.ts end to end
+// turned up a REAL GAP for this script's target table specifically:
+// applyVerseUpdate's UPDATE to an EXISTING verses row —
+//   UPDATE verses SET content_json = ?1, plain_text = ?2, verse_end = ?3,
+//       version = version + 1, updated_at = ?4, updated_by = ?5, ...
+//     WHERE book = ?6 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9
+// — carries NO `AND version = ?` predicate, even though the function reads the
+// row's version immediately beforehand (`existing.version`, used only to
+// compute the audit log's prev/new version, never bound into the WHERE
+// clause). So an AI pipeline `generate` run can silently overwrite whatever
+// this repair (or a translator) just wrote to a verse in its chapter range,
+// unconditionally, with no CAS check at all — unlike every tn_rows write path
+// (see scan-tn-quotes.mjs's header: those ARE all fully version-guarded) and
+// unlike applyTqUpsert's tq_rows UPDATE, which is *also* missing a version
+// predicate but is not this script's concern since this script never writes
+// tq_rows.
+//
+// Because the gap is real, this script implements Option 2 rather than
+// documentation-only: an optional PIPELINE_JOBS dump
+// (`SELECT book, start_chapter, end_chapter FROM pipeline_jobs
+//   WHERE state NOT IN ('done', 'cancelled')` as --json — the non-terminal set
+// mirrors ACTIVE_STATES/NON_TERMINAL_STATES in api/src/pipelines.ts, widened to
+// include 'failed' since a failed run gets one held-open retry) lets --repair
+// see every chapter range an AI pipeline job is still active on, and withholds
+// any flagged verse in one of those ranges — printed the same way LOCKED-book
+// verses are, so an admin can re-scan once the job finishes. Mirrors the
+// BOOK_LOCKS dump pattern, but deliberately does NOT refuse when unset: unlike
+// a locked/published book (a hard invariant), this is defense-in-depth on top
+// of the version guard that already protects every OTHER writer, so a missing
+// dump degrades to a warning rather than blocking the run.
+//
 // Optional: limit to one book with BOOK=JER, and printed-row count with
 // SCAN_PRINT_LIMIT=N.
 
@@ -107,6 +150,43 @@ if (!lockRows) {
 }
 const explicitLock = new Map((lockRows ?? []).map((r) => [r.book, Number(r.locked) === 1]));
 const isLocked = (book) => (explicitLock.has(book) ? explicitLock.get(book) : PUBLISHED_BOOKS.has(book));
+
+// PIPELINE_JOBS dump (#771) — see header for why `verses` specifically needs
+// this (applyVerseUpdate's existing-row UPDATE has no version guard, so an AI
+// pipeline write racing this repair is not caught by our own `AND version =`
+// predicate the way a translator edit is). Optional and non-refusing, unlike
+// BOOK_LOCKS: this is defense-in-depth on top of the version guard that
+// protects every other writer, not a hard invariant.
+const pipelineJobsArg = process.env.PIPELINE_JOBS ?? "";
+let pipelineJobRows = null;
+if (pipelineJobsArg && existsSync(resolve(pipelineJobsArg))) {
+  pipelineJobRows = loadRows(resolve(pipelineJobsArg));
+  if (
+    pipelineJobRows.some(
+      (r) => typeof r.book !== "string" || !("start_chapter" in r) || !("end_chapter" in r),
+    )
+  ) {
+    console.error(
+      `PIPELINE_JOBS ${pipelineJobsArg} is not a pipeline_jobs dump ` +
+        "(need book, start_chapter, end_chapter columns)",
+    );
+    process.exit(1);
+  }
+}
+if (!pipelineJobRows) {
+  console.warn(
+    "PIPELINE_JOBS unset or unreadable — a concurrent AI pipeline write to an in-scope verse cannot be " +
+      "detected (see header, #771); proceeding without this check.",
+  );
+}
+const activeRangesByBook = new Map();
+for (const r of pipelineJobRows ?? []) {
+  const list = activeRangesByBook.get(r.book) ?? [];
+  list.push([Number(r.start_chapter), Number(r.end_chapter)]);
+  activeRangesByBook.set(r.book, list);
+}
+const hasActivePipeline = (book, chapter) =>
+  (activeRangesByBook.get(book) ?? []).some(([start, end]) => chapter >= start && chapter <= end);
 
 // Index every verse by book/chapter/verse for source pairing.
 const byKey = new Map(); // `${book}/${ch}/${v}` -> { [version]: row }
@@ -188,12 +268,26 @@ if (flagged.length > PRINT_LIMIT) console.log(`  … and ${flagged.length - PRIN
 
 // ─── Repair ──────────────────────────────────────────────────────────────────
 const withheld = flagged.filter((f) => isLocked(f.book));
-const repairable = flagged.filter((f) => !isLocked(f.book));
+// #771: also withhold a verse in a chapter with an active (non-terminal) AI
+// pipeline job — see header. Checked on the same flagged set MINUS locked
+// books, so a locked+active verse is reported once, under the lock reason.
+const pipelineWithheld = flagged.filter((f) => !isLocked(f.book) && hasActivePipeline(f.book, f.chapter));
+const repairable = flagged.filter(
+  (f) => !isLocked(f.book) && !hasActivePipeline(f.book, f.chapter),
+);
 if (withheld.length) {
   const byBook = new Map();
   for (const f of withheld) byBook.set(f.book, (byBook.get(f.book) ?? 0) + 1);
   console.log(`\nWithheld ${withheld.length} verse(s) in LOCKED books (fix on Door43 by hand): ` +
     [...byBook].map(([b, n]) => `${b} ${n}`).join(", "));
+}
+if (pipelineWithheld.length) {
+  const byBook = new Map();
+  for (const f of pipelineWithheld) byBook.set(f.book, (byBook.get(f.book) ?? 0) + 1);
+  console.log(
+    `\nWithheld ${pipelineWithheld.length} verse(s) with an ACTIVE AI pipeline job in scope ` +
+      "(re-scan once the job finishes): " + [...byBook].map(([b, n]) => `${b} ${n}`).join(", "),
+  );
 }
 
 // Any earlier run's SQL is removed FIRST, whether or not this run writes a new
@@ -234,7 +328,8 @@ if (doRepair && repairable.length > 0) {
   const now = Math.floor(Date.now() / 1000);
   const lines = [
     `-- Repair over-counted alignment source occurrences. Generated ${new Date().toISOString()}`,
-    `-- ${repairable.length} verse(s) in unlocked books (${withheld.length} withheld in locked books). Renumbers`,
+    `-- ${repairable.length} verse(s) in unlocked books (${withheld.length} withheld: locked; ` +
+      `${pipelineWithheld.length} withheld: active AI pipeline job). Renumbers`,
     `-- \\zaln-s x-occurrence/x-occurrences to the source verse's true token count, bumps version`,
     `-- (stale-client refetch), and logs an edit_log row.`,
     `-- Each UPDATE is guarded on the dumped version; compare the reported changes count with ${repairable.length}.`,
@@ -249,7 +344,7 @@ if (doRepair && repairable.length > 0) {
     // on) leaves no orphan history entry.
     const payload = JSON.stringify({ content: JSON.parse(f.newContent) });
     lines.push(
-      `UPDATE verses SET content_json = ${q(f.newContent)}, version = version + 1, updated_at = ${now}, updated_by = ${actor}`,
+      `UPDATE verses SET content_json = ${q(f.newContent)}, version = version + 1, updated_at = ${now}, updated_by = ${actor}, last_change_action = 'update', last_change_source = 'system', last_change_actor = 'scan-source-occurrences'`,
       ` WHERE book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)} AND version = ${Number(f.rowVersion)};`,
       `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)`,
       `  SELECT 'verse', ${q(key)}, ${q(f.book)}, ${actor}, version - 1, version, 'update', ${q(payload)}`,

@@ -330,7 +330,7 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
 // on "&" alone reported that working quote as unresolvable, and (worse) the
 // "..." spelling came back `confident`, so --repair would have rewritten a
 // correct quote.
-const QUOTE_GAP = /[&…]+|\.{3}/;
+export const QUOTE_GAP = /[&…]+|\.{3}/;
 
 // Separators carrying no letter content. Word joiner is deliberately absent.
 const QUOTE_SEPARATORS = /[־׀׃,.;··:!?"“”'’‘()[\]{}—–-]+/g;
