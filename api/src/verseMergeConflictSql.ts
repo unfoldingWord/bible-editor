@@ -418,3 +418,39 @@ export const RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL = `UPDATE verse_merge_conflicts
     SET resolved_at = ?1, resolved_by = NULL
   WHERE action = 'keep_ai_master'
     AND resolved_at IS NULL`;
+
+// Pair-scoped retire: the same UPDATE narrowed to ONE (book, resource), so
+// retireVerseKeptAiMasterFlags can batch each pair's retire atomically with
+// that pair's banner clears WITHOUT one unbounded batch. A single global batch
+// (retire + every pair's DELETEs) can breach D1's 100-statement cap once enough
+// pairs (or per-username fan-out DELETEs) accumulate, and then fails and retries
+// the same oversized batch forever (#761 Codex review, 2nd pass). Binds:
+// (resolvedAt, book, resource).
+export const RETIRE_KEPT_AI_MASTER_CONFLICTS_FOR_PAIR_SQL = `UPDATE verse_merge_conflicts
+    SET resolved_at = ?1, resolved_by = NULL
+  WHERE action = 'keep_ai_master'
+    AND resolved_at IS NULL
+    AND book = ?2 AND resource = ?3`;
+
+// ---------------------------------------------------------------------------
+// Issue #760 (#754 P1 follow-up). Read BEFORE RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL
+// runs, so retireVerseKeptAiMasterFlags knows which (book, resource) pairs it is
+// about to retire rows for — the sweep is unscoped (every pair, not just the
+// ones this run reimported), so a resource whose Door43 SHA didn't change this
+// run never gets its "Sync flagged N verse(s)" banner re-derived by
+// raiseVerseMergeConflictAlert, and the retire UPDATE alone never touches
+// system_alerts. Each returned pair is a candidate for
+// clearResolvedConflictBannerIfLast, which re-checks (atomically, in its own
+// DELETE) whether any OTHER alertable conflict still justifies keeping the
+// banner up — so a pair with a live adopt_conflict/keep_alignment_refused/
+// source_attr_divergent/keep_local_structure row alongside its retired
+// keep_ai_master rows correctly keeps its banner.
+//
+// DISTINCT, not a plain SELECT: a resource can carry many standing
+// keep_ai_master rows (EZK ULT/UST alone held 37) and the caller only needs
+// the (book, resource) shape once each.
+// ---------------------------------------------------------------------------
+export const SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL = `SELECT DISTINCT book, resource
+    FROM verse_merge_conflicts
+   WHERE action = 'keep_ai_master'
+     AND resolved_at IS NULL`;

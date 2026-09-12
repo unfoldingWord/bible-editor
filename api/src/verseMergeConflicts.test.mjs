@@ -57,6 +57,7 @@
 // split as chapterLock.test.mjs.
 
 import { DatabaseSync } from "node:sqlite";
+import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
@@ -79,6 +80,7 @@ import {
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
+  SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
   VERSE_PATCH_UPDATE_SQL,
 } from "./verseMergeConflictSql.ts";
@@ -1152,6 +1154,273 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   const active = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ust");
   assert(!active.some((r) => r.action === "keep_ai_master"), "no keep_ai_master row remains in the banner filter");
   assert(active.length === 4, "…and the four genuinely alertable rows still are");
+}
+
+{
+  // Issue #760 (#754 P1 follow-up). Retiring the ROWS above is not enough: the
+  // "Sync flagged N verse(s)" banner is a MATERIALIZED system_alerts row that
+  // only raiseVerseMergeConflictAlert re-derives, and the unscoped nightly
+  // sweep never calls it for a resource whose Door43 SHA didn't change this
+  // run. retireVerseKeptAiMasterFlags now reads the distinct (book, resource)
+  // pairs it's about to retire BEFORE the UPDATE
+  // (SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL) and runs
+  // clearResolvedConflictBannerIfLast (replicated here by clearResolvedBanner,
+  // against the ACTUAL SQL constants) for each. This block drives that exact
+  // sequence and asserts all three cases from the issue's success check.
+
+  // Case 1: a standing keep_ai_master row plus its banner, for a resource that
+  // is NOT reimported this run (nothing else outstanding) — banner must come
+  // down along with the row.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('JER','ult',3,5,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:JER:ult','Sync flagged 1 verse(s) in JER ULT...',100)`,
+    ).run();
+
+    const pairs = d.prepare(SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL).all();
+    assert(pairs.length === 1 && pairs[0].book === "JER" && pairs[0].resource === "ult",
+      "the pair lookup finds JER/ult before the retire UPDATE runs");
+
+    d.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).run(9000);
+    for (const p of pairs) clearResolvedBanner(d, p.book, p.resource);
+
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`)
+      .all()[0].n;
+    assert(remaining === 0, "a pure keep_ai_master-backlog banner is cleared by the retire sweep");
+  }
+
+  // Case 2: a keep_ai_master row retired alongside a REAL alertable conflict
+  // (adopt_conflict) sharing the same banner source — the banner must survive,
+  // still naming the genuinely outstanding row.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('JER','ust',3,5,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('JER','ust',4,1,'adopt_conflict','both_changed',7,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:JER:ust','Sync flagged 1 verse(s) in JER UST...',100)`,
+    ).run();
+
+    const pairs = d.prepare(SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL).all();
+    d.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).run(9000);
+    for (const p of pairs) clearResolvedBanner(d, p.book, p.resource);
+
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ust'`)
+      .all()[0].n;
+    assert(remaining === 1, "a banner with a real outstanding adopt_conflict row survives the retire sweep");
+    const kept = d
+      .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='JER' AND resource='ust' AND verse=5`)
+      .all()[0];
+    assert(kept.resolved_at === 9000, "…even though the keep_ai_master row itself was still retired");
+  }
+
+  // Case 3: a banner carrying a keep_no_base warning (no verse_merge_conflicts
+  // row at all — it lives only in the message, see
+  // alertMessageCarriesNoBaseWarning) must be preserved, same as
+  // clearResolvedConflictBannerIfLast's own per-username carve-out.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('NUM','ult',9,2,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:NUM:ult',
+               'Sync flagged 0 verse(s) in NUM ULT for adjudicated review. 1 verse(s) could not be adjudicated: no ancestor was recoverable for them from before this sync (9:9).',100)`,
+    ).run();
+
+    const pairs = d.prepare(SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL).all();
+    d.prepare(RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL).run(9000);
+    for (const p of pairs) clearResolvedBanner(d, p.book, p.resource);
+
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:NUM:ult'`)
+      .all()[0].n;
+    assert(remaining === 1, "a keep_no_base warning banner is preserved by the retire sweep, not erased");
+  }
+
+  // Case 4 (Codex review on #761): the pair lookup must fail CLOSED. If
+  // SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL throws, the retire
+  // UPDATE must NOT run at all this call — running it anyway (with an empty
+  // pairs list, so no banner clear) would stamp resolved_at on every
+  // standing row, and the pairs SELECT's own `resolved_at IS NULL` filter
+  // then means no LATER night's lookup can ever find those rows again,
+  // permanently losing the banner clear. Drives the REAL async
+  // retireVerseKeptAiMasterFlags (not the SQL-replica pattern above) against
+  // a minimal D1 shim so the throw actually exercises its try/catch control
+  // flow, not just a hand replica of it.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('MIC','ust',5,14,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:MIC:ust','Sync flagged 1 verse(s) in MIC UST...',100)`,
+    ).run();
+
+    const env = {
+      DB: {
+        prepare(sql) {
+          const isPairLookup = sql === SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL;
+          return {
+            bind: (...args) => ({
+              all: async () => ({ results: d.prepare(sql).all(...args) }),
+              run: async () => {
+                const r = d.prepare(sql).run(...args);
+                return { meta: { changes: Number(r.changes) } };
+              },
+            }),
+            all: async () => {
+              if (isPairLookup) throw new Error("simulated transient D1 error");
+              return { results: d.prepare(sql).all() };
+            },
+          };
+        },
+      },
+    };
+
+    const result = await retireVerseKeptAiMasterFlags(env);
+    assert(result.cleared === 0, "a failed pair lookup reports 0 cleared, never a partial retire");
+
+    const row = d
+      .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='MIC' AND resource='ust' AND verse=14`)
+      .all()[0];
+    assert(row.resolved_at === null,
+      "the retire UPDATE never ran — the row is left standing so the next sweep can find it again");
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:MIC:ust'`)
+      .all()[0].n;
+    assert(remaining === 1, "…and the banner is untouched too, consistent with the row it names still standing");
+  }
+
+  // Cases 5-7 (Codex 2nd-pass review on #761): each pair's scoped retire and its
+  // banner clears commit as ONE atomic D1 batch PER PAIR, so a failure after the
+  // retire can no longer strand a resolved row whose banner never came down, and
+  // no single batch grows past D1's 100-statement cap. All drive the REAL async
+  // retireVerseKeptAiMasterFlags against a D1 shim whose .batch() runs the
+  // statements (or, with failBatch, throws before applying any of them — the way
+  // an all-or-nothing D1 batch rolls back; or, with capLimit, throws when a batch
+  // exceeds the cap — the way real D1 rejects an over-limit batch).
+  const mkBatchEnv = (d, failBatch = false, capLimit = Infinity) => {
+    const make = (sql) => ({
+      bind: (...args) => ({
+        _sql: sql,
+        _args: args,
+        all: async () => ({ results: d.prepare(sql).all(...args) }),
+        run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+      }),
+      all: async () => ({ results: d.prepare(sql).all() }),
+      run: async () => ({ meta: { changes: Number(d.prepare(sql).run().changes) } }),
+    });
+    return {
+      DB: {
+        prepare: (sql) => make(sql),
+        batch: async (stmts) => {
+          if (failBatch) throw new Error("simulated transient D1 batch error");
+          if (stmts.length > capLimit) throw new Error(`batch of ${stmts.length} exceeds D1 cap ${capLimit}`);
+          return stmts.map((s) => ({ meta: { changes: Number(d.prepare(s._sql).run(...(s._args ?? [])).changes) } }));
+        },
+      },
+    };
+  };
+
+  // Case 5 — happy path: a pure keep_ai_master backlog row + its banner are
+  // retired and cleared together in the batch.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('HAG','ult',2,9,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:HAG:ult','Sync flagged 1 verse(s) in HAG ULT...',100)`,
+    ).run();
+
+    const result = await retireVerseKeptAiMasterFlags(mkBatchEnv(d));
+    assert(result.cleared === 1, "the atomic batch retires the one standing keep_ai_master row");
+    const row = d
+      .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='HAG' AND resource='ult' AND verse=9`)
+      .all()[0];
+    assert(row.resolved_at !== null, "the row is marked resolved by the batch's retire UPDATE");
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:HAG:ult'`)
+      .all()[0].n;
+    assert(remaining === 0, "…and its banner is cleared in the SAME batch");
+  }
+
+  // Case 6 — atomicity: if the batch fails, NOTHING commits. The row stays
+  // standing (resolved_at NULL) so the next sweep finds it again, and the
+  // banner stays up — never the resolved-row-with-live-banner limbo the first
+  // pass of this PR could leave on a post-UPDATE failure.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('HAG','ult',2,9,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:HAG:ult','Sync flagged 1 verse(s) in HAG ULT...',100)`,
+    ).run();
+
+    const result = await retireVerseKeptAiMasterFlags(mkBatchEnv(d, true));
+    assert(result.cleared === 0, "a failed batch reports 0 cleared");
+    const row = d
+      .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='HAG' AND resource='ult' AND verse=9`)
+      .all()[0];
+    assert(row.resolved_at === null,
+      "the row is left STANDING on a batch failure — retryable next sweep, not stranded resolved");
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:HAG:ult'`)
+      .all()[0].n;
+    assert(remaining === 1, "…and the banner is still up, consistent with the still-standing row");
+  }
+
+  // Case 7 — batch cap: with 150 distinct (book, resource) pairs, a single
+  // global batch (retire + 150 DELETEs) would be 151 statements and breach
+  // D1's 100-statement cap, failing forever. Per-pair batching keeps every
+  // batch at 2 statements, so all 150 retire and clear. The shim throws if any
+  // batch exceeds 100, so this test FAILS against a one-global-batch impl.
+  {
+    const d = verseDb();
+    for (let i = 0; i < 150; i++) {
+      const book = `B${i}`;
+      d.prepare(
+        `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+         VALUES (?, 'ult', 1, 1, 'keep_ai_master', 'both_changed_ai_master', NULL, 100)`,
+      ).run(book);
+      d.prepare(
+        `INSERT INTO system_alerts (username, severity, source, message, created_at)
+         VALUES ('deferredreward', 'warning', ?, 'Sync flagged 1 verse(s)...', 100)`,
+      ).run(`verse_merge_conflict:${book}:ult`);
+    }
+
+    const result = await retireVerseKeptAiMasterFlags(mkBatchEnv(d, false, 100));
+    assert(result.cleared === 150, "all 150 pairs retire under the 100-statement batch cap (per-pair batching)");
+    const standing = d
+      .prepare(`SELECT COUNT(*) AS n FROM verse_merge_conflicts WHERE action='keep_ai_master' AND resolved_at IS NULL`)
+      .all()[0].n;
+    assert(standing === 0, "no keep_ai_master row is left standing");
+    const banners = d.prepare(`SELECT COUNT(*) AS n FROM system_alerts`).all()[0].n;
+    assert(banners === 0, "every pair's banner is cleared");
+  }
 }
 
 {
