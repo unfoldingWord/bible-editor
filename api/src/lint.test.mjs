@@ -489,6 +489,131 @@ t("1CH 6:78 shape (differing x-occurrences on the shared token) still flags", ()
   assert.equal(reusedChecks(i).length, 1);
 });
 
+// ── Occurrence reform (#421): with a real UHB/UGNT source supplied, "Reused
+// source token" re-derives actual positions instead of comparing raw
+// x-occurrence, closing the 9 "two distinct source tokens, same stale raw
+// occurrence" false positives (1CH 22:19 shape) while leaving genuine reuse
+// (1CH 6:78) and the HAB 1:3 reversed-nesting disagreement untouched. Without
+// a source (all tests above), behaviour is byte-identical to before this
+// existed. See resolveChainPositions / the scope comment on
+// hasReusedSourceToken.
+
+/** A source (UHB/UGNT) verse row of plain \w words, in document order. */
+function srcVerse(chapter, verse, words) {
+  return {
+    book: "1CH", chapter, verse, verse_end: null, bible_version: "UHB",
+    content_json: JSON.stringify({ verseObjects: words.map((text) => ({ type: "word", tag: "w", text })) }),
+  };
+}
+
+t("reform: 1CH 22:19 shape — יְהוָה/הָאֱלֹהִים both stamped occurrence 1 resolve to distinct positions once the real UHB is supplied", () => {
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    `\\zaln-s |x-strong="H3068" x-occurrence="1" x-occurrences="1" x-content="יְהוָה"\\*` +
+    `\\zaln-s |x-strong="H430" x-occurrence="1" x-occurrences="2" x-content="הָאֱלֹהִים"\\*` +
+    `\\w him\\w* \\w your\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    `\\zaln-s |x-strong="H430" x-occurrence="1" x-occurrences="1" x-content="הָאֱלֹהִים"\\*\\w priests\\w*\\zaln-e\\*\n`;
+  const v = { ...verseFromUsfm(usfmText), chapter: 22, verse: 19 };
+  // Without a real source, lint cannot tell these apart — raw identity collides.
+  assert.equal(reusedChecks(lintUsfmVerses([v])).length, 1);
+  // The real UHB has הָאֱלֹהִים TWICE. The first chain's occurrences="2" is
+  // already correct; the second chain's occurrences="1" is stale (the real
+  // defect this issue traces). Supplying the source lets the reform resolve
+  // each chain to its own real position instead of both claiming the first.
+  const src = [srcVerse(22, 19, ["יְהוָה", "הָאֱלֹהִים", "filler", "הָאֱלֹהִים"])];
+  assert.equal(reusedChecks(lintUsfmVerses([v], src)).length, 0);
+});
+
+t("reform: LEV-24:10-shaped false positive (standalone + compound sharing a mis-totaled token) is closed once the real source is supplied", () => {
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="2" x-content="A"\\*\\w x1\\w*\\zaln-e\\* ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="A"\\*` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*` +
+    `\\zaln-s |x-strong="H3" x-occurrence="1" x-occurrences="1" x-content="C"\\*` +
+    `\\w x2\\w* \\w x3\\w* \\w x4\\w*\\zaln-e\\*\\zaln-e\\*\\zaln-e\\*\n`;
+  const v = verseFromUsfm(usfmText);
+  assert.equal(reusedChecks(lintUsfmVerses([v])).length, 1);
+  // Real source holds "A" TWICE. The compound's stated occurrences="1" for A
+  // is wrong; B and C sit next to the SECOND "A", so resolving against the
+  // real source separates the compound from the standalone's first claim.
+  const src = [srcVerse(1, 1, ["A", "f1", "f2", "A", "B", "C"])];
+  assert.equal(reusedChecks(lintUsfmVerses([v], src)).length, 0);
+});
+
+t("reform: 1CH-6:78-shaped real defect (impossible x-occurrences, genuine double-claim) stays flagged with the real source supplied", () => {
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="3" x-content="A"\\*\\w x1\\w*\\zaln-e\\* ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="4" x-content="A"\\*` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*` +
+    `\\w x2\\w* \\w x3\\w*\\zaln-e\\*\\zaln-e\\*\n`;
+  const v = verseFromUsfm(usfmText);
+  assert.equal(reusedChecks(lintUsfmVerses([v])).length, 1);
+  // Real source holds "A" three times (matching the FIRST chain's correct
+  // total); the second chain's claimed occurrences="4" is impossible. "B"
+  // sits right after the FIRST "A", so resolving against the real source
+  // still lands the second chain on the SAME "A" the first already claimed —
+  // this one is a genuine double-claim, not just a stale number.
+  const src = [srcVerse(1, 1, ["A", "B", "f1", "A", "f2", "A"])];
+  assert.equal(reusedChecks(lintUsfmVerses([v], src)).length, 1);
+});
+
+t("reform: AMO-3:2-shaped real defect (compound + standalone reusing one key) stays flagged with the real source supplied", () => {
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="A"\\*` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*` +
+    `\\zaln-s |x-strong="H3" x-occurrence="1" x-occurrences="1" x-content="C"\\*` +
+    `\\w x1\\w* \\w x2\\w* \\w x3\\w*\\zaln-e\\*\\zaln-e\\*\\zaln-e\\* ` +
+    `\\zaln-s |x-strong="H3" x-occurrence="1" x-occurrences="1" x-content="C"\\*\\w x4\\w*\\zaln-e\\*\n`;
+  const v = verseFromUsfm(usfmText);
+  assert.equal(reusedChecks(lintUsfmVerses([v])).length, 1);
+  const src = [srcVerse(1, 1, ["A", "B", "C"])];
+  assert.equal(reusedChecks(lintUsfmVerses([v], src)).length, 1);
+});
+
+t("reform: HAB-1:3-shaped reversed nesting still flags with the real source supplied (Shape 2, unaffected by the reform)", () => {
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="A"\\*` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*` +
+    `\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="A"\\*` +
+    `\\w x3\\w* \\w x4\\w*\\zaln-e\\*\\zaln-e\\*\n`;
+  const v = verseFromUsfm(usfmText);
+  assert.equal(reusedChecks(lintUsfmVerses([v])).length, 1);
+  const src = [srcVerse(1, 1, ["A", "B"])];
+  assert.equal(reusedChecks(lintUsfmVerses([v], src)).length, 1);
+});
+
+t("reform: no source supplied behaves exactly as before (fallback is a no-op)", () => {
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="A"\\*` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*` +
+    `\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*\\w x3\\w*\\zaln-e\\*\n`;
+  const v = verseFromUsfm(usfmText);
+  assert.deepEqual(lintUsfmVerses([v]), lintUsfmVerses([v], undefined));
+  assert.equal(reusedChecks(lintUsfmVerses([v])).length, 1);
+});
+
+t("reform: a verse with no resolvable source row (missing from the map) falls back to raw identity, same as no source at all", () => {
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="A"\\*` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*` +
+    `\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*\\w x3\\w*\\zaln-e\\*\n`;
+  const v = verseFromUsfm(usfmText);
+  // sourceVerses supplied, but for a DIFFERENT verse (2:5) — this verse (1:1)
+  // has nothing to resolve against.
+  const src = [srcVerse(2, 5, ["A", "B"])];
+  assert.equal(reusedChecks(lintUsfmVerses([v], src)).length, 1);
+});
+
 // ── Blank required-field checks (the manual review_kind='blank-note' stamps,
 // now computed dynamically). tn note, tq question/response, twl OrigWords/TWLink.
 t("empty tn note flagged with chapter:verse ref + rowId", () => {
