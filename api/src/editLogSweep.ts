@@ -517,9 +517,22 @@ export async function raiseEditLogSweepBoundaryAlerts(env: Env, now: number = Ma
     )
       .bind(ALARM_ALERT_USERNAME, ALARM_SOURCE_PREFIX)
       .all<{ source: string; message: string; dismissed_at: number | null }>();
-    const existing = new Map<string, ExistingAlertState>(
-      (existingRs.results ?? []).map((r) => [r.source, { message: r.message, dismissedAt: r.dismissed_at }]),
-    );
+    // A source can carry BOTH a dismissed historical row and an active one (a
+    // user dismissed the alert, then its message changed while the boundary
+    // stayed stale, so a fresh active row was inserted alongside the dismissed
+    // one). planSystemAlertWrites decides the ACTIVE alert's fate, so collapse
+    // to the undismissed row when both exist — keeping the dismissed one would
+    // make it insert a duplicate active alert every run and never clear a
+    // healed boundary's active rows (Codex #781 review P2). A blind Map(entries)
+    // kept whichever row the query returned last, which the system_alerts_active
+    // index made the dismissed one.
+    const existing = new Map<string, ExistingAlertState>();
+    for (const r of existingRs.results ?? []) {
+      const prev = existing.get(r.source);
+      if (!prev || (prev.dismissedAt != null && r.dismissed_at == null)) {
+        existing.set(r.source, { message: r.message, dismissedAt: r.dismissed_at });
+      }
+    }
 
     const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
     if (toDelete.length === 0 && toInsert.length === 0) return;

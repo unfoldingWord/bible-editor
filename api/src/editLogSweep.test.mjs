@@ -821,6 +821,35 @@ console.log("\n[raiseEditLogSweepBoundaryAlerts: a refresh's DELETE and INSERT s
   assert(live.length === N, `all ${N} alerts present after the refresh (got ${live.length}) — none deleted-and-not-replaced`);
 }
 
+console.log("\n[raiseEditLogSweepBoundaryAlerts: a source with a dismissed row AND a changed active alert doesn't duplicate, and still clears on heal (Codex #781 P2)]");
+{
+  const d = freshDb();
+  const now = 20_000_000;
+  const source = "edit_log_sweep_boundary_stale:JER:ust";
+  const activeCount = () => alertRows(d, source).filter((r) => r.dismissed_at == null).length;
+  const stale1 = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 2 * 86400);
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: stale1, editId: 1 });
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now); // active alert, message M1
+  d.prepare(`UPDATE system_alerts SET dismissed_at = ?1 WHERE source = ?2`).run(now, source); // dismiss it
+  // Message changes (date shifts) while the boundary stays stale → a fresh
+  // active row is inserted alongside the dismissed one.
+  d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book='JER' AND resource='ust'`).run(stale1 - 3 * 86400);
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 1, `one active alert after the message change (got ${activeCount()})`);
+  // Re-run unchanged: must NOT insert a duplicate active alert (the bug: the
+  // existing-map kept the dismissed row, so the planner re-inserted every run).
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 1, `re-running does not duplicate the active alert (got ${activeCount()})`);
+  assert(
+    alertRows(d, source).filter((r) => r.dismissed_at != null).length === 1,
+    "the dismissed historical row is preserved",
+  );
+  // Heal the boundary: the active alert must clear despite the dismissed row.
+  d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book='JER' AND resource='ust'`).run(now - 86400);
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 0, "a healed boundary clears the active alert even with a dismissed row present");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
