@@ -341,7 +341,14 @@ function applyPlanSql(entry, verse, heal) {
   lines.push(
     `UPDATE verses SET content_json='${sqlEscape(contentJson)}', ` +
       `plain_text='${sqlEscape(plainText)}', version=version+1, ` +
-      `updated_at=unixepoch(), updated_by=2 ` +
+      `updated_at=unixepoch(), updated_by=2, ` +
+      // Migration 0060 provenance columns (#768) — this script predates that
+      // migration and had no last_change_* stamping at all. updated_by=2
+      // (hardcoded known-good user) is left untouched; source='system' matches
+      // bookReimport.ts's own nightly-housekeeping category — an unattended
+      // path with no human directly behind THIS write, run by a human operator
+      // under explicit approval (see the header).
+      `last_change_action='update', last_change_source='system', last_change_actor='heal-align-1ch-num' ` +
       `WHERE ${rowMatch} AND version=<OLD_VERSION>;`,
   );
   // audit row guarded on OUR heal having landed: it fires only if the row is now
