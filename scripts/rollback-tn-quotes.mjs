@@ -28,6 +28,14 @@
 // (the history route orders by new_version and warns that duplicates break
 // it). Re-running the scan afterwards still sees the original quote; only the
 // version number is higher.
+//
+// VISIBLE SIDE EFFECT (#768, mirrored here for #786): the generated UPDATE
+// also stamps last_change_action='update', last_change_source='system',
+// last_change_actor='rollback-tn-quotes' (see rowProvenance.ts) alongside
+// updated_by. Without this, a rolled-back row still carries the repair's
+// provenance ('scan-tn-quotes'), which is wrong once the rollback is what
+// actually last touched it — the row's "AI-drafted" chip state should follow
+// whichever script (repair or rollback) is the true last writer.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
@@ -79,7 +87,7 @@ const out = [
 ];
 for (const e of entries) {
   out.push(
-    `UPDATE tn_rows SET quote = '${esc(e.oldQuote)}', version = version + 1, updated_at = unixepoch(), updated_by = ${actor}`,
+    `UPDATE tn_rows SET quote = '${esc(e.oldQuote)}', version = version + 1, updated_at = unixepoch(), updated_by = ${actor}, last_change_action = 'update', last_change_source = 'system', last_change_actor = 'rollback-tn-quotes'`,
     `  WHERE book = '${esc(e.book)}' AND id = '${esc(e.id)}' AND version = ${e.oldVersion + 1} AND quote = '${esc(e.newQuote)}'`,
     `    AND deleted_at IS NULL AND trashed_at IS NULL;`,
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)`,
