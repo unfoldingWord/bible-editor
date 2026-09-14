@@ -9,7 +9,13 @@
 // no word changed. It must now reopen only 'text' for such edits (HOS 12:11 /
 // HOS 8 report from Beth Oakes).
 
-import { lanesToReopenOnVerseEdit, lanesForAdoption } from "./laneReopen.ts";
+import { DatabaseSync } from "node:sqlite";
+import {
+  lanesToReopenOnVerseEdit,
+  lanesForAdoption,
+  reopenLaneChecks,
+  reopenLaneChecksBulk,
+} from "./laneReopen.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -96,6 +102,175 @@ console.log("\n[lanesForAdoption]");
     ["text", "tw"],
     "genuine word-boundary change reopens both 'text' and 'tw' on ULT",
   );
+}
+
+console.log("\n[#686 item 3: reopenLaneChecks / reopenLaneChecksBulk leave an edit_log audit trail]");
+{
+  // Minimal D1 shim over node:sqlite — same shape twlSortOrderApply.test.mjs
+  // uses. Both functions here only need .prepare().bind().run() via .batch().
+  function makeDb(sqlite) {
+    const mk = (sql, args) => ({
+      sql,
+      args,
+      bind: (...a) => mk(sql, a),
+      run() {
+        const r = sqlite.prepare(sql).run(...args);
+        return { success: true, meta: { changes: Number(r.changes) } };
+      },
+    });
+    return {
+      prepare: (sql) => mk(sql, []),
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(s.run());
+        return out;
+      },
+    };
+  }
+
+  function freshDb() {
+    const sqlite = new DatabaseSync(":memory:");
+    sqlite.exec(`
+      CREATE TABLE verse_lane_checks (
+        book TEXT NOT NULL, chapter INTEGER NOT NULL, verse INTEGER NOT NULL,
+        lane TEXT NOT NULL, checked_by INTEGER NOT NULL, checked_at INTEGER NOT NULL,
+        PRIMARY KEY (book, chapter, verse, lane, checked_by)
+      );
+      CREATE TABLE edit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL, row_key TEXT NOT NULL, book TEXT,
+        user_id INTEGER, prev_version INTEGER, new_version INTEGER,
+        action TEXT NOT NULL, payload_json TEXT, source TEXT,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      );
+    `);
+    return sqlite;
+  }
+
+  const BOOK = "ZEC";
+
+  console.log("  reopenLaneChecks: a checkoff that actually clears gets exactly one edit_log row");
+  {
+    const sqlite = freshDb();
+    sqlite
+      .prepare(
+        `INSERT INTO verse_lane_checks (book, chapter, verse, lane, checked_by, checked_at) VALUES (?, 8, 3, 'text', 42, 100)`,
+      )
+      .run(BOOK);
+    const env = { DB: makeDb(sqlite) };
+    await reopenLaneChecks(env, BOOK, 8, 3, ["text", "tw"], false);
+
+    eq(sqlite.prepare(`SELECT COUNT(*) AS n FROM verse_lane_checks`).all()[0].n, 0, "the checkoff row was deleted");
+    const logRows = sqlite
+      .prepare(`SELECT kind, row_key, book, user_id, action, source, payload_json FROM edit_log`)
+      .all();
+    eq(logRows.length, 1, "exactly one edit_log row was written");
+    eq(logRows[0].kind, "verse_lane", "kind is 'verse_lane'");
+    eq(logRows[0].row_key, `${BOOK}/8/3`, "row_key is book/chapter/verse");
+    eq(logRows[0].book, BOOK, "book column is stamped (previously omitted — #686 item 3)");
+    eq(logRows[0].user_id, null, "user_id is NULL — a content-save side effect, not a user's own action");
+    eq(logRows[0].source, "lane_reopen", "source is 'lane_reopen'");
+    eq(JSON.parse(logRows[0].payload_json).lanes, ["text", "tw"], "payload records which lanes were reopened");
+  }
+
+  console.log("  reopenLaneChecks: a no-op reopen (nothing was checked) writes no edit_log row");
+  {
+    const sqlite = freshDb();
+    const env = { DB: makeDb(sqlite) };
+    await reopenLaneChecks(env, BOOK, 8, 3, ["text"], false);
+    eq(sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log`).all()[0].n, 0, "no edit_log row when the DELETE matched nothing");
+  }
+
+  console.log("  reopenLaneChecksBulk: one edit_log row per verse actually cleared, none for a no-op verse");
+  {
+    const sqlite = freshDb();
+    sqlite
+      .prepare(
+        `INSERT INTO verse_lane_checks (book, chapter, verse, lane, checked_by, checked_at) VALUES (?, 8, 3, 'text', 42, 100)`,
+      )
+      .run(BOOK);
+    const env = { DB: makeDb(sqlite) };
+    await reopenLaneChecksBulk(
+      env,
+      BOOK,
+      [
+        { chapter: 8, verse: 3, lanes: ["text"] },
+        { chapter: 8, verse: 4, lanes: ["text"] }, // nothing checked here — must not log
+      ],
+      false,
+    );
+    const logRows = sqlite.prepare(`SELECT row_key, book, source FROM edit_log ORDER BY row_key`).all();
+    eq(logRows.length, 1, "only the verse whose checkoff actually cleared got an edit_log row");
+    eq(logRows[0].row_key, `${BOOK}/8/3`, "row_key names the cleared verse, not the no-op one");
+    eq(logRows[0].book, BOOK, "book column is stamped");
+    eq(logRows[0].source, "lane_reopen", "source is 'lane_reopen'");
+  }
+
+  console.log("  reopenLaneChecksBulk: a large adoption stays under D1's 100-statement batch cap (Codex #785 P1)");
+  {
+    // 60 verses, each with a live checkoff. Each entry emits TWO statements
+    // (DELETE + audit INSERT), so one 60-entry slice would be 120 statements —
+    // over D1's 100-statement cap. With a too-large REOPEN_WRITE_BATCH the whole
+    // slice's batch is rejected and reopenLaneChecksBulk's catch swallows it,
+    // leaving all 60 checkoffs signed off and unaudited.
+    const sqlite = freshDb();
+    for (let v = 1; v <= 60; v++) {
+      sqlite
+        .prepare(`INSERT INTO verse_lane_checks (book, chapter, verse, lane, checked_by, checked_at) VALUES (?, 9, ?, 'text', 42, 100)`)
+        .run(BOOK, v);
+    }
+    // Shim whose batch() throws when a slice exceeds D1's 100-statement cap, the
+    // way real D1 rejects an over-limit batch.
+    const mk = (sql, args) => ({
+      sql,
+      args,
+      bind: (...a) => mk(sql, a),
+      run() {
+        const r = sqlite.prepare(sql).run(...args);
+        return { success: true, meta: { changes: Number(r.changes) } };
+      },
+    });
+    const env = {
+      DB: {
+        prepare: (sql) => mk(sql, []),
+        async batch(stmts) {
+          if (stmts.length > 100) throw new Error(`batch of ${stmts.length} exceeds D1's 100-statement cap`);
+          const out = [];
+          for (const s of stmts) out.push(s.run());
+          return out;
+        },
+      },
+    };
+    const entries = [];
+    for (let v = 1; v <= 60; v++) entries.push({ chapter: 9, verse: v, lanes: ["text"] });
+    await reopenLaneChecksBulk(env, BOOK, entries, false);
+    eq(
+      sqlite.prepare(`SELECT COUNT(*) AS n FROM verse_lane_checks`).all()[0].n,
+      0,
+      "all 60 checkoffs reopened — no slice breached the 100-statement cap",
+    );
+    eq(sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log`).all()[0].n, 60, "all 60 reopens are audited");
+  }
+}
+
+console.log("\n[#686 item 3, source check] chapters.ts's three edit_log INSERTs (verse_status, verse_lane x2) carry book");
+{
+  // chapters.ts imports Hono (routes), so it cannot be driven directly under
+  // plain `node --experimental-strip-types` (STATE.md: "a module that imports
+  // hono cannot be unit-tested") — same limitation rowProvenanceStamps.test.mjs
+  // documents for rows.ts/bookImport.ts. Assert the SOURCE TEXT instead: this
+  // proves the three edit_log writes are wired to stamp book, not that they
+  // land correctly at runtime.
+  const { readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const chaptersTs = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "chapters.ts"), "utf8");
+
+  const withBook = "INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)";
+  const withoutBook = "INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)";
+  const occurrences = chaptersTs.split(withBook).length - 1;
+  eq(occurrences, 3, "[source] all 3 edit_log INSERTs (verse_status, single lane, bulk lane) include the book column");
+  eq(chaptersTs.includes(withoutBook), false, "[source] no edit_log INSERT in chapters.ts still omits book");
 }
 
 if (failed > 0) {
