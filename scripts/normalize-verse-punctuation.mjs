@@ -29,6 +29,14 @@ import {
   normalizeWordPunctuation,
   splitGluedAlignmentWords,
 } from "../api/src/importParsers.ts";
+// Issue #686 item 5: a direct-SQL repair must not leave a row claiming its
+// PREVIOUS provenance (e.g. still reading as a Door43-pristine or in-app
+// human edit after a script rewrote its content_json). Same vocabulary
+// scan-tn-quotes.mjs / scan-source-occurrences.mjs use for this class of fix
+// (issue #768): action 'update', source 'system', actor named for the script.
+import { PROVENANCE_COLUMNS, provenanceValues } from "../api/src/rowProvenance.ts";
+
+const PROVENANCE = provenanceValues({ action: "update", source: "system", actor: "normalize-verse-punctuation" });
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -74,6 +82,9 @@ const q = (v) => {
   return `'${String(v).replace(/'/g, "''")}'`;
 };
 
+// Constant across every repaired row, so build the SET/VALUES fragments once.
+const PROVENANCE_SET_SQL = PROVENANCE_COLUMNS.map((col, i) => `${col} = ${q(PROVENANCE[i])}`).join(", ");
+
 const updates = [];
 let scanned = 0;
 let changed = 0;
@@ -98,7 +109,16 @@ for (const row of rows) {
   const newContent = { ...parsedContent, verseObjects: after };
   const newPlain = extractPlainText(newContent);
   updates.push(
-    `UPDATE verses SET content_json = ${q(JSON.stringify(newContent))}, plain_text = ${q(newPlain)} WHERE book = ${q(book)} AND chapter = ${q(chapter)} AND verse = ${q(verse)} AND bible_version = ${q(bible_version)};`,
+    `UPDATE verses SET content_json = ${q(JSON.stringify(newContent))}, plain_text = ${q(newPlain)}, ${PROVENANCE_SET_SQL} WHERE book = ${q(book)} AND chapter = ${q(chapter)} AND verse = ${q(verse)} AND bible_version = ${q(bible_version)};`,
+  );
+  // Issue #686 item 5: a script rewriting content_json with no edit_log row
+  // left the history dialog silently missing this step, and the row's own
+  // provenance stamp above is otherwise the only trace it happened. row_key
+  // matches the live PATCH path's format (verses.ts) so both land in the same
+  // kind='verse' history query.
+  const rowKey = `${book}/${chapter}/${verse}/${bible_version}`;
+  updates.push(
+    `INSERT INTO edit_log (kind, row_key, book, action, payload_json) SELECT 'verse', ${q(rowKey)}, ${q(book)}, 'update', ${q(JSON.stringify({ content: newContent, plain_text: newPlain }))} WHERE changes() > 0;`,
   );
 }
 

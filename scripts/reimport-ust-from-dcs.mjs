@@ -20,9 +20,20 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import usfm from "usfm-js";
+// Issue #686 item 5: this script wipes + reinserts a whole book/version's
+// verses straight from Door43, leaving every row's provenance columns at
+// whatever they held before the DELETE (or NULL, on a fresh table) — the row
+// then claims a prior human/AI edit, or "never touched", when in fact a
+// script just rewrote it. Same convention as the bulk import path
+// (api/src/bookImport.ts's insertVerses — provenance stamped, no per-row
+// edit_log; #768's rationale for repair scripts covers the action/source
+// choice for a re-import that is not a fresh bootstrap).
+import { PROVENANCE_COLUMNS, provenanceValues } from "../api/src/rowProvenance.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
+
+const PROVENANCE = provenanceValues({ action: "update", source: "system", actor: "reimport-ust-from-dcs" });
 
 const args = process.argv.slice(2);
 const allMode = args.includes("--all");
@@ -107,6 +118,10 @@ const q = (v) => {
   return `'${String(v).replace(/'/g, "''")}'`;
 };
 
+// Constant across every reinserted row, so build the columns/values fragments once.
+const PROVENANCE_COLS_SQL = PROVENANCE_COLUMNS.join(", ");
+const PROVENANCE_VALS_SQL = PROVENANCE.map(q).join(", ");
+
 function urlFor(book, num, version) {
   const fname = `${num}-${book}.usfm`;
   switch (version) {
@@ -178,7 +193,7 @@ async function reimportVersion(book, num, version) {
       const text = extractPlainText(normalized);
       const json_blob = JSON.stringify(normalized);
       lines.push(
-        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text) VALUES (${q(book)}, ${q(chNum)}, ${q(vNum)}, ${q(vEnd)}, ${q(version)}, ${q(json_blob)}, ${q(text)});`,
+        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, ${PROVENANCE_COLS_SQL}) VALUES (${q(book)}, ${q(chNum)}, ${q(vNum)}, ${q(vEnd)}, ${q(version)}, ${q(json_blob)}, ${q(text)}, ${PROVENANCE_VALS_SQL});`,
       );
       count++;
     }
