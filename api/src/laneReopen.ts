@@ -124,13 +124,29 @@ export async function reopenLaneChecks(
   if (lanes.length === 0) return;
   try {
     const placeholders = lanes.map((_l, i) => `?${i + 4}`).join(", ");
-    const res = await env.DB
-      .prepare(
-        `DELETE FROM verse_lane_checks
-          WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND lane IN (${placeholders})`,
-      )
-      .bind(book, chapter, verse, ...lanes)
-      .run();
+    // #686 item 3: this DELETE used to leave no trace at all — a checkoff
+    // could vanish with nothing in edit_log explaining why. Paired in one
+    // batch with a conditional audit INSERT, same `WHERE changes() > 0`
+    // idiom rows.ts's PATCH path uses (D1 batch() runs both on one
+    // connection, sequentially, so changes() in the second statement reads
+    // the DELETE's own row count) — so a no-op reopen (nothing was checked)
+    // writes nothing. user_id is NULL: this is a side effect of a content
+    // save, not itself a user action on the checkoff.
+    const [res] = await env.DB.batch([
+      env.DB
+        .prepare(
+          `DELETE FROM verse_lane_checks
+            WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND lane IN (${placeholders})`,
+        )
+        .bind(book, chapter, verse, ...lanes),
+      env.DB
+        .prepare(
+          `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+           SELECT 'verse_lane', ?1, ?2, NULL, NULL, NULL, 'update', ?3, 'lane_reopen'
+            WHERE changes() > 0`,
+        )
+        .bind(`${book}/${chapter}/${verse}`, book, JSON.stringify({ lanes, reason: "content_edit_reopen" })),
+    ]);
     // Nothing was checked here → nothing reopened → no need to notify anyone.
     if (!res.meta.changes || !broadcast) return;
     for (const lane of lanes) {
@@ -173,15 +189,32 @@ export async function reopenLaneChecksBulk(
   for (let i = 0; i < withLanes.length; i += REOPEN_WRITE_BATCH) {
     const slice = withLanes.slice(i, i + REOPEN_WRITE_BATCH);
     try {
-      const results = await env.DB.batch(
-        slice.map((e) => {
-          const placeholders = e.lanes.map((_l, j) => `?${j + 4}`).join(", ");
-          return env.DB.prepare(
+      // #686 item 3: interleave each DELETE with its own conditional audit
+      // INSERT (same `WHERE changes() > 0` idiom as reopenLaneChecks above),
+      // so a bulk master-adoption reopen leaves the same trace a single-verse
+      // reopen does. D1 batch() runs the whole array sequentially on one
+      // connection, so changes() in each INSERT reads its immediately
+      // preceding DELETE's row count, not some other slice member's.
+      const stmts = slice.flatMap((e) => {
+        const placeholders = e.lanes.map((_l, j) => `?${j + 4}`).join(", ");
+        return [
+          env.DB.prepare(
             `DELETE FROM verse_lane_checks
               WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND lane IN (${placeholders})`,
-          ).bind(book, e.chapter, e.verse, ...e.lanes);
-        }),
-      );
+          ).bind(book, e.chapter, e.verse, ...e.lanes),
+          env.DB
+            .prepare(
+              `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+               SELECT 'verse_lane', ?1, ?2, NULL, NULL, NULL, 'update', ?3, 'lane_reopen'
+                WHERE changes() > 0`,
+            )
+            .bind(`${book}/${e.chapter}/${e.verse}`, book, JSON.stringify({ lanes: e.lanes, reason: "content_edit_reopen" })),
+        ];
+      });
+      const batchResults = await env.DB.batch(stmts);
+      // Every entry contributed exactly 2 statements (DELETE, INSERT); the
+      // DELETE's result is at the even index.
+      const results = slice.map((_e, j) => batchResults[j * 2]);
       if (!broadcast) continue;
       for (let j = 0; j < slice.length; j++) {
         // Nothing was checked for this verse → nothing reopened → no need to
