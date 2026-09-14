@@ -161,9 +161,15 @@ export async function reopenLaneChecks(
   }
 }
 
-// D1 caps a batch at 100 statements / 100 params each; 90 stays safely under
-// both — same convention as bookReimport.ts's WRITE_BATCH.
-const REOPEN_WRITE_BATCH = 90;
+// D1 caps a batch at 100 statements / 100 params each. reopenLaneChecksBulk
+// emits TWO statements per entry (the DELETE plus its #686-item-3 audit INSERT),
+// so the slice size must stay at or below 50 to keep a full slice under the
+// 100-statement cap; 45 (→ 90 statements) keeps the same safety margin the
+// single-statement convention (bookReimport.ts's WRITE_BATCH) had at 90. A
+// larger slice would build a >100-statement batch that D1 rejects wholesale —
+// and reopenLaneChecksBulk's per-slice catch would swallow it, silently leaving
+// those lane checkoffs signed off and unaudited (Codex #785 review P1).
+const REOPEN_WRITE_BATCH = 45;
 
 // Bulk variant for a caller reopening lanes for MANY verses from one run
 // (bookReimport.ts's applyVerseRows master-adoption reopen). FIX 3: the

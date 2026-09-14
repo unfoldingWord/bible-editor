@@ -205,6 +205,52 @@ console.log("\n[#686 item 3: reopenLaneChecks / reopenLaneChecksBulk leave an ed
     eq(logRows[0].book, BOOK, "book column is stamped");
     eq(logRows[0].source, "lane_reopen", "source is 'lane_reopen'");
   }
+
+  console.log("  reopenLaneChecksBulk: a large adoption stays under D1's 100-statement batch cap (Codex #785 P1)");
+  {
+    // 60 verses, each with a live checkoff. Each entry emits TWO statements
+    // (DELETE + audit INSERT), so one 60-entry slice would be 120 statements —
+    // over D1's 100-statement cap. With a too-large REOPEN_WRITE_BATCH the whole
+    // slice's batch is rejected and reopenLaneChecksBulk's catch swallows it,
+    // leaving all 60 checkoffs signed off and unaudited.
+    const sqlite = freshDb();
+    for (let v = 1; v <= 60; v++) {
+      sqlite
+        .prepare(`INSERT INTO verse_lane_checks (book, chapter, verse, lane, checked_by, checked_at) VALUES (?, 9, ?, 'text', 42, 100)`)
+        .run(BOOK, v);
+    }
+    // Shim whose batch() throws when a slice exceeds D1's 100-statement cap, the
+    // way real D1 rejects an over-limit batch.
+    const mk = (sql, args) => ({
+      sql,
+      args,
+      bind: (...a) => mk(sql, a),
+      run() {
+        const r = sqlite.prepare(sql).run(...args);
+        return { success: true, meta: { changes: Number(r.changes) } };
+      },
+    });
+    const env = {
+      DB: {
+        prepare: (sql) => mk(sql, []),
+        async batch(stmts) {
+          if (stmts.length > 100) throw new Error(`batch of ${stmts.length} exceeds D1's 100-statement cap`);
+          const out = [];
+          for (const s of stmts) out.push(s.run());
+          return out;
+        },
+      },
+    };
+    const entries = [];
+    for (let v = 1; v <= 60; v++) entries.push({ chapter: 9, verse: v, lanes: ["text"] });
+    await reopenLaneChecksBulk(env, BOOK, entries, false);
+    eq(
+      sqlite.prepare(`SELECT COUNT(*) AS n FROM verse_lane_checks`).all()[0].n,
+      0,
+      "all 60 checkoffs reopened — no slice breached the 100-statement cap",
+    );
+    eq(sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log`).all()[0].n, 60, "all 60 reopens are audited");
+  }
 }
 
 console.log("\n[#686 item 3, source check] chapters.ts's three edit_log INSERTs (verse_status, verse_lane x2) carry book");
