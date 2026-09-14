@@ -71,6 +71,21 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **A verse cell's "hydrate from a saved draft" branch must never run for a draft the user is creating right
+  now.** All three verse views (`ScriptureColumn` `ActiveLine`, `BookView` `VerseCell`, `DocColumn`) subscribe to
+  the draft store and push a pre-existing draft's `plainText` into the contentEditable once. The latch used to
+  arm only on `!hydrated && rec`, so the first draft ever written for a cell — the one the user's own first
+  keystrokes produce — also qualified; `notify()`'s `getAll` can resolve before the latest `put` lands, so a
+  stale snapshot was written back over the live text, dropping the newest characters and collapsing the caret to
+  the start of the cell (the "have to click several times before it lets me edit" report; #533's comment claimed
+  this guard existed but the code didn't have it). Snapshot `dirtyRef` before mirroring it and latch hydrated
+  without touching the DOM when it was already true. Companion Find lessons from the same report: a Find scroll
+  effect must be keyed on a one-shot navigation token, never on `activeVerse`/`onSelectVerse` (Shell passes a
+  fresh arrow every render, so any dep on it re-fires the effect on the re-render a manual verse click causes and
+  snaps the user back to the match), and the typed query must be debounced and only *peek* (scroll) at the
+  nearest hit — only explicit Enter/next may promote the match verse to the editing focus.
+  `tests/concurrency/s12-find-edit-flow.spec.ts` locks all three in through the real UI.
+
 - **An OPENING quote/bracket must be stored glued to the word that FOLLOWS it, never as the trailing text of the
   preceding `\zaln` milestone.** usfm-js puts every `\zaln-s` on its own line, so `\w say\w*, ‘\zaln-e\*` renders on
   Door43 with a space after the `‘` (JER 31:10 / 31:18 ULT, #777). The relayout tiers in `replace.ts` treat an

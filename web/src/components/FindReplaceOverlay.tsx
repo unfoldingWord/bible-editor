@@ -47,6 +47,19 @@ import {
 // will fatally fail.
 const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT"]);
 
+// How long the typed query sits before it drives matching, highlighting and
+// the auto-jump. Long enough that a normal keystroke burst settles into one
+// rescan of the loaded corpus (and one scroll) instead of one per character;
+// short enough to still read as live search.
+const FIND_DEBOUNCE_MS = 180;
+
+// What the next matches-reshape should do once it lands. `activate` promotes
+// the match verse to the editing focus (explicit prev/next/replace); the
+// auto-jump while typing / toggling scope only peeks. `nearest` re-anchors the
+// active result to the first hit at or after the verse the user is on, instead
+// of keeping whatever index prev/next had reached for the previous query.
+type PendingNav = { activate: boolean; nearest: boolean };
+
 export interface FindMatch {
   chapter: number;
   verse: number;
@@ -150,7 +163,16 @@ interface Props {
   // next, replace-this). Typing in a verse cell while the overlay is open
   // reshapes the match list but should NOT pull the user away — those
   // reshapes only update the internal "X of Y" label.
-  onScrollToMatch: (match: FindMatch | null) => void;
+  onScrollToMatch: (match: FindMatch | null, opts?: { activate?: boolean }) => void;
+  // The active verse in the active chapter. A new query lands on the first
+  // hit at or after it (falling back to the first hit in the book) so typing
+  // never yanks the user from where they are reading to the top of the book.
+  activeVerse?: number;
+  // Focus + select the query input when the overlay opens. Off for the
+  // involuntary remount a chapter change forces while Find is already open —
+  // stealing the caret out of a verse cell there is exactly the "jumps" a
+  // user feels.
+  autoFocus?: boolean;
   // Lift the query state up so VerseCell can paint inline marks alongside the
   // existing note-quote highlights.
   onQueryChange: (
@@ -179,11 +201,29 @@ interface Props {
   bookLocked?: boolean;
 }
 
+// First result at or after the user's position (chapter, verse), wrapping to
+// the first result when everything sits above them. Results are already sorted
+// chapter → verse. Without a verse, any hit in the active chapter counts.
+export function nearestResultIdx(
+  results: ReadonlyArray<{ chapter: number; verse: number }>,
+  activeChapter: number,
+  activeVerse: number | undefined,
+): number {
+  const idx = results.findIndex(
+    (r) =>
+      r.chapter > activeChapter ||
+      (r.chapter === activeChapter && (activeVerse == null || r.verse >= activeVerse)),
+  );
+  return idx === -1 ? 0 : idx;
+}
+
 export function FindReplaceOverlay({
   open,
   onClose,
   book,
   activeChapter,
+  activeVerse,
+  autoFocus = true,
   chapters,
   chapterList,
   onLoadChapter,
@@ -204,6 +244,21 @@ export function FindReplaceOverlay({
   // ../lib/findState. Read once at mount.
   const [draft0] = useState(() => loadFindDraft(book));
   const [find, setFind] = useState(draft0.find);
+  // Debounced mirror of `find`. The input stays bound to `find` so typing is
+  // instant; everything downstream (regex, match list, cell marks, auto-jump)
+  // keys off `query` so a burst of keystrokes settles before the corpus is
+  // rescanned and the view moves. Clearing propagates immediately so marks
+  // vanish as you delete.
+  const [query, setQuery] = useState(draft0.find);
+  useEffect(() => {
+    if (find === query) return;
+    if (!find) {
+      setQuery("");
+      return;
+    }
+    const t = window.setTimeout(() => setQuery(find), FIND_DEBOUNCE_MS);
+    return () => window.clearTimeout(t);
+  }, [find, query]);
   const [replace, setReplace] = useState(draft0.replace);
   const [regex, setRegex] = useState(draft0.regex);
   const [caseSensitive, setCaseSensitive] = useState(draft0.caseSensitive);
@@ -217,11 +272,11 @@ export function FindReplaceOverlay({
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const replaceInputRef = useRef<HTMLInputElement | null>(null);
   // Set right before any user action that should pull the active match
-  // into view (prev/next, replace-this, find query change). The next
-  // matches-reshape effect consumes the flag and fires onScrollToMatch.
+  // into view (replace-this, find query / scope change). The next
+  // matches-reshape effect consumes it and fires onScrollToMatch.
   // External content edits never set this, so the user isn't yanked away
-  // while they're typing.
-  const wantsScrollRef = useRef(false);
+  // while they're typing. (prev/next navigate directly, not through here.)
+  const wantsScrollRef = useRef<PendingNav | null>(null);
 
   // Flip a scope checkbox. Refuse to turn the last one off (the box would
   // search nothing). Treat a scope change as user navigation so results settle
@@ -230,7 +285,7 @@ export function FindReplaceOverlay({
     if (!next.bible && !next.tn) return;
     setScope(next);
     saveScope(next);
-    wantsScrollRef.current = true;
+    wantsScrollRef.current = { activate: false, nearest: true };
   };
 
   // Persist the query so it survives the remount a chapter change forces.
@@ -241,13 +296,14 @@ export function FindReplaceOverlay({
     saveFindDraft(book, { find, replace, regex, caseSensitive, strongs });
   }, [book, find, replace, regex, caseSensitive, strongs]);
 
-  // Focus the find input when the overlay opens (Ctrl/Cmd+F flow).
+  // Focus the find input when the overlay opens on a user gesture (Ctrl/Cmd+F,
+  // toolbar button) — not when a chapter change remounts it mid-edit.
   useEffect(() => {
-    if (open) {
+    if (open && autoFocus) {
       findInputRef.current?.focus();
       findInputRef.current?.select();
     }
-  }, [open]);
+  }, [open, autoFocus]);
 
   // Clear note-highlight state when the overlay unmounts (find closed) — the
   // conditional render means the `null` branches of the lift effects won't fire
@@ -268,26 +324,26 @@ export function FindReplaceOverlay({
     // BEFORE the Bible-scope early return so a TN-only search (Bible unchecked,
     // TN checked) still auto-jumps to its first note hit. Only suppress when
     // there's nothing to search.
-    if (open && find && (scope.bible || scope.tn)) {
-      wantsScrollRef.current = true;
+    if (open && query && (scope.bible || scope.tn)) {
+      wantsScrollRef.current = { activate: false, nearest: true };
     }
     // Only paint scripture cells when the Bible scope is on — TN-only searches
     // shouldn't light up verse text.
-    if (!open || !find || !scope.bible) {
+    if (!open || !query || !scope.bible) {
       onQueryChange(null);
       return;
     }
-    onQueryChange({ find, regex, caseSensitive, strongs });
-  }, [open, find, regex, caseSensitive, strongs, scope.bible, scope.tn, onQueryChange]);
+    onQueryChange({ find: query, regex, caseSensitive, strongs });
+  }, [open, query, regex, caseSensitive, strongs, scope.bible, scope.tn, onQueryChange]);
 
-  const compiled = useMemo(() => buildSearchRegex(find, regex, caseSensitive), [find, regex, caseSensitive]);
-  const regexInvalid = !!find && compiled.error;
+  const compiled = useMemo(() => buildSearchRegex(query, regex, caseSensitive), [query, regex, caseSensitive]);
+  const regexInvalid = !!query && compiled.error;
   // In regex mode the user wants a literal JS regex against plain_text — skip
   // source-language classification so a Hebrew query in regex mode goes through
   // the existing path unmodified.
   const sourceQuery = useMemo<SourceQueryKind>(
-    () => (regex ? { kind: "english" } : classifySourceQuery(find, book, strongs)),
-    [find, regex, book, strongs],
+    () => (regex ? { kind: "english" } : classifySourceQuery(query, book, strongs)),
+    [query, regex, book, strongs],
   );
 
   // Mirror onQueryChange for notes: lift the query so note cards mark every
@@ -295,12 +351,12 @@ export function FindReplaceOverlay({
   // shouldn't light up notes), and not in source/Strong's mode (those query
   // Hebrew/Greek; English note text would never match anyway).
   useEffect(() => {
-    if (!open || !find || !scope.tn || sourceQuery.kind !== "english") {
+    if (!open || !query || !scope.tn || sourceQuery.kind !== "english") {
       onNoteQueryChange(null);
       return;
     }
-    onNoteQueryChange({ find, regex, caseSensitive });
-  }, [open, find, regex, caseSensitive, scope.tn, sourceQuery.kind, onNoteQueryChange]);
+    onNoteQueryChange({ find: query, regex, caseSensitive });
+  }, [open, query, regex, caseSensitive, scope.tn, sourceQuery.kind, onNoteQueryChange]);
 
   const bibleMatches = useMemo<FindMatch[]>(() => {
     if (!open || !scope.bible) return [];
@@ -326,9 +382,9 @@ export function FindReplaceOverlay({
   const [noteOverrides, setNoteOverrides] = useState<Map<string, string>>(() => new Map());
 
   const noteMatches = useMemo<NoteMatch[]>(() => {
-    if (!open || !scope.tn || !find) return [];
+    if (!open || !scope.tn || !query) return [];
     return collectNoteMatches(searchNotes(), compiled.re, noteOverrides);
-  }, [open, scope.tn, find, compiled.re, searchNotes, chapters, noteOverrides]);
+  }, [open, scope.tn, query, compiled.re, searchNotes, chapters, noteOverrides]);
 
   // Merge + order both scopes by chapter then verse, bible before note within
   // the same verse, so prev/next walks the document top-to-bottom.
@@ -397,14 +453,17 @@ export function FindReplaceOverlay({
   // Route the active result to the right surface: scripture cells scroll +
   // highlight via onScrollToMatch; notes navigate + activate via
   // onScrollToNoteMatch (and clear any scripture active-mark).
-  function navTo(idx: number) {
+  // `activate` (default: explicit navigation) promotes the match verse to the
+  // editing focus in stacked mode; the auto-jump while typing passes false so
+  // it only scrolls the hit into view.
+  function navTo(idx: number, activate = true) {
     const r = results[idx];
     if (!r) {
       onScrollToMatch(null);
       return;
     }
     if (r.kind === "bible") {
-      onScrollToMatch(r.match);
+      onScrollToMatch(r.match, { activate });
     } else {
       onScrollToMatch(null);
       onScrollToNoteMatch(r.match.chapter, r.match.verse, r.match.noteId);
@@ -413,20 +472,26 @@ export function FindReplaceOverlay({
 
   // Clamp activeIdx whenever the result list reshapes. Only navigate if a user
   // action flagged that they want the scroll — ambient reshapes (external
-  // typing) clamp silently.
+  // typing) clamp silently. A new query re-anchors to the hit nearest the
+  // user's position rather than keeping the index prev/next had reached for
+  // the previous query (which used to land on, say, the 7th "then" after the
+  // user had stepped to the 7th "the").
   useEffect(() => {
     if (results.length === 0) {
       setActiveIdx(0);
       if (wantsScrollRef.current) {
-        wantsScrollRef.current = false;
+        wantsScrollRef.current = null;
         onScrollToMatch(null);
       }
       return;
     }
-    const idx = Math.min(activeIdx, results.length - 1);
+    const pending = wantsScrollRef.current;
+    const idx = pending?.nearest
+      ? nearestResultIdx(results, activeChapter, activeVerse)
+      : Math.min(activeIdx, results.length - 1);
     if (idx !== activeIdx) setActiveIdx(idx);
-    if (wantsScrollRef.current) {
-      wantsScrollRef.current = false;
+    if (pending) {
+      wantsScrollRef.current = null;
       // Auto-jump (typing / scope toggle) must NOT trigger a disruptive
       // cross-chapter navigation. The book-intro note (chapter 0) sorts first
       // and matches common words, so the very first keystroke would otherwise
@@ -437,7 +502,7 @@ export function FindReplaceOverlay({
       // deliberately.
       const r = results[idx];
       const crossChapterNote = r?.kind === "note" && r.chapter !== activeChapter;
-      if (!crossChapterNote) navTo(idx);
+      if (!crossChapterNote) navTo(idx, pending.activate);
     }
     // navTo closes over the current results; onScrollToMatch is the stable
     // dep that matters here (mirrors the original effect's dep list).
@@ -512,7 +577,7 @@ export function FindReplaceOverlay({
     });
     // The replace will trigger a matches reshape (the current match is
     // gone); flag the upcoming reshape so we scroll to whatever's next.
-    wantsScrollRef.current = true;
+    wantsScrollRef.current = { activate: true, nearest: false };
     onReplaceVerse(m.chapter, m.verse, m.bibleVersion, result.content, result.plainText, verse);
   };
 
@@ -608,7 +673,7 @@ export function FindReplaceOverlay({
       });
       return;
     }
-    wantsScrollRef.current = true;
+    wantsScrollRef.current = { activate: true, nearest: false };
     onReplaceNote(row, newNote);
     setNoteOverrides((prev) => new Map(prev).set(row.id, newNote));
     setReplaceSummary({
@@ -732,6 +797,13 @@ export function FindReplaceOverlay({
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
+              // Enter inside the debounce window means "search now": flush the
+              // typed text and let the reshape land on the nearest hit, rather
+              // than stepping through the previous query's stale results.
+              if (find !== query) {
+                setQuery(find);
+                return;
+              }
               if (e.shiftKey) goPrev();
               else goNext();
             } else if (e.key === "Escape") {
@@ -843,6 +915,7 @@ export function FindReplaceOverlay({
             <span>
               <IconButton
                 size="small"
+                aria-label="previous match"
                 onClick={goPrev}
                 disabled={results.length === 0}
                 sx={{
@@ -864,6 +937,7 @@ export function FindReplaceOverlay({
             <span>
               <IconButton
                 size="small"
+                aria-label="next match"
                 onClick={goNext}
                 disabled={results.length === 0}
                 sx={{
@@ -911,7 +985,7 @@ export function FindReplaceOverlay({
           </Tooltip>
         )}
         <Tooltip title="close (Esc)">
-          <IconButton size="small" onClick={onClose}>
+          <IconButton size="small" aria-label="close find" onClick={onClose}>
             <CloseIcon fontSize="small" />
           </IconButton>
         </Tooltip>

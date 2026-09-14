@@ -836,8 +836,17 @@ const VerseCell = memo(function VerseCell({
     return drafts.subscribe((all) => {
       const rec = all.find((d) => d.key === draftKey);
       setHasDraft(!!rec);
+      // Snapshot BEFORE the mirror below overwrites it: true means the user has
+      // already typed into this cell, so any draft record arriving now is the
+      // one their own keystrokes are creating. Hydrating from it would push a
+      // possibly-stale snapshot (the store's getAll can resolve before the
+      // latest put lands) back over the live text — dropping the newest
+      // characters and collapsing the caret to the start of the cell. Latch
+      // hydrated without touching the DOM instead.
+      const typingHere = dirtyRef.current;
       // Keep the synchronous dirty mirror in lockstep with draft existence.
       dirtyRef.current = !!rec;
+      if (typingHere && rec) hydratedFromDraftRef.current = true;
       // Hydrate from a PRE-EXISTING draft exactly once — the ref only
       // latches after an actual hydrate (#533), so this can fire on any
       // callback, not just the first (mount-snapshot) one, if the draft
