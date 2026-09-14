@@ -74,17 +74,20 @@
 //
 // Because the gap is real, this script implements Option 2 rather than
 // documentation-only: an optional PIPELINE_JOBS dump
-// (`SELECT book, start_chapter, end_chapter, pipeline_type FROM pipeline_jobs
-//   WHERE state NOT IN ('done', 'cancelled')` as --json — the non-terminal set
-// mirrors ACTIVE_STATES/NON_TERMINAL_STATES in api/src/pipelines.ts, widened to
-// include 'failed' since a failed run gets one held-open retry) lets --repair
-// see every chapter range a verse-writing pipeline job is still active on, and
-// withholds any flagged verse in one of those ranges — printed the same way
-// LOCKED-book verses are, so an admin can re-scan once the job finishes. Only
-// `generate` jobs are considered: they are the only type that writes `verses`
-// (notes→tn_rows, tqs→tq_rows; see resourcesWrittenBy in api/src/chapterLock.ts),
-// so a stuck notes/tqs job can never race this repair and must not block it.
-// Mirrors the
+// (`SELECT book, start_chapter, end_chapter, pipeline_type, follow_up_chain
+//   FROM pipeline_jobs WHERE state NOT IN ('done', 'cancelled')` as --json —
+// the non-terminal set mirrors ACTIVE_STATES/NON_TERMINAL_STATES in
+// api/src/pipelines.ts, widened to include 'failed' since a failed run gets one
+// held-open retry) lets --repair see every chapter range a verse-writing
+// pipeline job is still active on, and withholds any flagged verse in one of
+// those ranges — printed the same way LOCKED-book verses are, so an admin can
+// re-scan once the job finishes. A job blocks a verse repair only when it (or a
+// pending step on its follow_up_chain) writes `verses` — decided by the app's
+// own `resourcesLockedByJob` (api/src/chapterLock.ts), the single source of
+// truth also used by activePipelineForChapter. So a standalone notes/tqs job
+// (writes tn_rows/tq_rows only) never blocks a verse repair, but a
+// notes→generate or tqs→generate chain — which the API locks `verse` on for the
+// whole run — still does. Mirrors the
 // BOOK_LOCKS dump pattern, but deliberately does NOT refuse when unset: unlike
 // a locked/published book (a hard invariant), this is defense-in-depth on top
 // of the version guard that already protects every OTHER writer, so a missing
@@ -98,6 +101,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { correctSourceOccurrences } from "../web/src/lib/sourceOccurrences.ts";
 import { PUBLISHED_BOOKS } from "../api/src/publishedGuard.ts";
+import { resourcesLockedByJob } from "../api/src/chapterLock.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -171,12 +175,13 @@ if (pipelineJobsArg && existsSync(resolve(pipelineJobsArg))) {
         typeof r.book !== "string" ||
         !("start_chapter" in r) ||
         !("end_chapter" in r) ||
-        !("pipeline_type" in r),
+        !("pipeline_type" in r) ||
+        !("follow_up_chain" in r),
     )
   ) {
     console.error(
       `PIPELINE_JOBS ${pipelineJobsArg} is not a pipeline_jobs dump ` +
-        "(need book, start_chapter, end_chapter, pipeline_type columns)",
+        "(need book, start_chapter, end_chapter, pipeline_type, follow_up_chain columns)",
     );
     process.exit(1);
   }
@@ -189,10 +194,12 @@ if (!pipelineJobRows) {
 }
 const activeRangesByBook = new Map();
 for (const r of pipelineJobRows ?? []) {
-  // Only `generate` jobs write `verses` (notes→tn_rows, tqs→tq_rows; see
-  // resourcesWrittenBy in api/src/chapterLock.ts), so a non-terminal notes/tqs
-  // job cannot race this verse repair and must not withhold it.
-  if (r.pipeline_type !== "generate") continue;
+  // Only jobs that write `verses` can race this verse repair. Decide with the
+  // app's own lock logic (resourcesLockedByJob in api/src/chapterLock.ts) so a
+  // standalone notes/tqs job (tn_rows/tq_rows only) never blocks a verse
+  // repair, while a notes→generate / tqs→generate chain — which the API locks
+  // `verse` on for the whole run — still does.
+  if (!resourcesLockedByJob(r.pipeline_type, r.follow_up_chain ?? null).has("verse")) continue;
   const list = activeRangesByBook.get(r.book) ?? [];
   list.push([Number(r.start_chapter), Number(r.end_chapter)]);
   activeRangesByBook.set(r.book, list);
