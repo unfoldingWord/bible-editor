@@ -74,13 +74,17 @@
 //
 // Because the gap is real, this script implements Option 2 rather than
 // documentation-only: an optional PIPELINE_JOBS dump
-// (`SELECT book, start_chapter, end_chapter FROM pipeline_jobs
+// (`SELECT book, start_chapter, end_chapter, pipeline_type FROM pipeline_jobs
 //   WHERE state NOT IN ('done', 'cancelled')` as --json — the non-terminal set
 // mirrors ACTIVE_STATES/NON_TERMINAL_STATES in api/src/pipelines.ts, widened to
 // include 'failed' since a failed run gets one held-open retry) lets --repair
-// see every chapter range an AI pipeline job is still active on, and withholds
-// any flagged verse in one of those ranges — printed the same way LOCKED-book
-// verses are, so an admin can re-scan once the job finishes. Mirrors the
+// see every chapter range a verse-writing pipeline job is still active on, and
+// withholds any flagged verse in one of those ranges — printed the same way
+// LOCKED-book verses are, so an admin can re-scan once the job finishes. Only
+// `generate` jobs are considered: they are the only type that writes `verses`
+// (notes→tn_rows, tqs→tq_rows; see resourcesWrittenBy in api/src/chapterLock.ts),
+// so a stuck notes/tqs job can never race this repair and must not block it.
+// Mirrors the
 // BOOK_LOCKS dump pattern, but deliberately does NOT refuse when unset: unlike
 // a locked/published book (a hard invariant), this is defense-in-depth on top
 // of the version guard that already protects every OTHER writer, so a missing
@@ -163,12 +167,16 @@ if (pipelineJobsArg && existsSync(resolve(pipelineJobsArg))) {
   pipelineJobRows = loadRows(resolve(pipelineJobsArg));
   if (
     pipelineJobRows.some(
-      (r) => typeof r.book !== "string" || !("start_chapter" in r) || !("end_chapter" in r),
+      (r) =>
+        typeof r.book !== "string" ||
+        !("start_chapter" in r) ||
+        !("end_chapter" in r) ||
+        !("pipeline_type" in r),
     )
   ) {
     console.error(
       `PIPELINE_JOBS ${pipelineJobsArg} is not a pipeline_jobs dump ` +
-        "(need book, start_chapter, end_chapter columns)",
+        "(need book, start_chapter, end_chapter, pipeline_type columns)",
     );
     process.exit(1);
   }
@@ -181,6 +189,10 @@ if (!pipelineJobRows) {
 }
 const activeRangesByBook = new Map();
 for (const r of pipelineJobRows ?? []) {
+  // Only `generate` jobs write `verses` (notes→tn_rows, tqs→tq_rows; see
+  // resourcesWrittenBy in api/src/chapterLock.ts), so a non-terminal notes/tqs
+  // job cannot race this verse repair and must not withhold it.
+  if (r.pipeline_type !== "generate") continue;
   const list = activeRangesByBook.get(r.book) ?? [];
   list.push([Number(r.start_chapter), Number(r.end_chapter)]);
   activeRangesByBook.set(r.book, list);
