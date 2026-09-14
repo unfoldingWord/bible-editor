@@ -16,6 +16,7 @@ import {
 } from "./replace.ts";
 import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
+import { OPENING_PUNCT_RE } from "./openingPunct.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -2628,6 +2629,135 @@ function countAligned(content) {
     !r.markerCaptureGuarded,
     `the #606 marker-capture guard does NOT catch a relocation (got ${JSON.stringify(r.markerCaptureGuarded)}, warnings ${JSON.stringify(warnings)})`,
   );
+}
+
+// True if any top-level (or nested) \zaln milestone's trailing text — after
+// its own last \w word leaf, across its whole subtree — matches an opening
+// quote/bracket. Mirrors the detector in openingPunct.ts's own test, kept
+// independent here so this file doesn't depend on openingPunct.ts internals.
+function milestoneTrailingHasOpener(nodes) {
+  for (const n of nodes ?? []) {
+    if (!n || typeof n !== "object") continue;
+    if (n.type === "milestone" && n.tag === "zaln" && Array.isArray(n.children)) {
+      const flat = [];
+      const flatten = (kids) => {
+        for (const k of kids) {
+          if (!k || typeof k !== "object") continue;
+          if (k.type === "word" && k.tag === "w") flat.push({ kind: "word" });
+          else if (k.type === "text") flat.push({ kind: "text", text: k.text ?? "" });
+          else if (Array.isArray(k.children)) flatten(k.children);
+        }
+      };
+      flatten(n.children);
+      let lastWord = -1;
+      flat.forEach((s, i) => { if (s.kind === "word") lastWord = i; });
+      const trailing = flat.slice(lastWord + 1).filter((s) => s.kind === "text").map((s) => s.text).join("");
+      if (OPENING_PUNCT_RE.test(trailing)) return true;
+      if (milestoneTrailingHasOpener(n.children)) return true;
+    }
+  }
+  return false;
+}
+
+function countAllMilestones(nodes) {
+  let n2 = 0;
+  for (const n of nodes ?? []) {
+    if (!n || typeof n !== "object") continue;
+    if (n.type === "milestone" && n.tag === "zaln") {
+      n2++;
+      if (Array.isArray(n.children)) n2 += countAllMilestones(n.children);
+    }
+  }
+  return n2;
+}
+
+// ─── Case 76: JER 31:18 shape — pure punctuation edit hoists the opener ─────
+// AI-correct input shape (opening quote as the leading child of the
+// FOLLOWING milestone — the shape the AI pipeline originally stored): a
+// straight-quote-to-curly-quote edit is the smallest possible punctuation
+// change and exercises the engine's relayout tiers, which historically wrote
+// the whole gap (comma + opener) into the PRECEDING milestone's trailing
+// text (see JER 31:18 on en_ult master). See JER 31:10 / #<issue tbd>.
+{
+  console.log("\n[Case 76] JER 31:18 shape: pure punctuation edit ('->‘) never strands an opener inside a milestone");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("himself"), t(",")]),
+      t(" "),
+      zaln("H2", [t("'"), w("You"), t(" "), w("disciplined"), t(" "), w("me")]),
+    ],
+  };
+  const before = countAllMilestones(verse.verseObjects);
+  const old = extractEditableText(verse);
+  assert(old === "himself, 'You disciplined me", `fixture's editable text is the expected baseline (got ${JSON.stringify(old)})`);
+  const after = old.replace("'", "‘");
+  const r = smartEditVerse(verse, old, after);
+  assert(!milestoneTrailingHasOpener(r.content.verseObjects), "no milestone's trailing leaf matches OPENING_PUNCT_RE");
+  const topLevelText = r.content.verseObjects.filter((n) => n && n.type === "text").map((n) => n.text).join("");
+  assert(topLevelText.includes("‘"), `the opener lands as top-level text between the milestones (got ${JSON.stringify(r.content.verseObjects)})`);
+  assert(countAllMilestones(r.content.verseObjects) === before, `milestone count unchanged (got ${countAllMilestones(r.content.verseObjects)} vs ${before})`);
+  assert(extractEditableText(r.content) === after, `editable text === newPlain (got ${JSON.stringify(extractEditableText(r.content))})`);
+}
+
+// ─── Case 77: JER 31:10 shape — punctuation edit + a word change together ───
+// Same defect class as Case 76, but in the same save as a genuine word edit
+// elsewhere in the verse (like JER 31:10's guard->protect) — the combined
+// word+punctuation tier (smartRebuildRange) must ALSO avoid stranding the
+// opener.
+{
+  console.log("[Case 77] JER 31:10 shape: punctuation edit + word change in the same save never strands an opener");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("and"), t(" "), w("say"), t(",")]),
+      t(" "),
+      zaln("H2", [t("'"), w("The"), t(" "), w("one"), t(" "), w("scattering")]),
+      t(" "),
+      zaln("H3", [w("Israel")]),
+      t(" "),
+      zaln("H4", [w("will"), t(" "), w("gather"), t(" "), w("him")]),
+      t(" "),
+      zaln("H5", [w("and"), t(" "), w("he"), t(" "), w("will"), t(" "), w("guard"), t(" "), w("him")]),
+      t(" "),
+      zaln("H6", [w("like"), t(" "), w("a"), t(" "), w("shepherd"), t(" "), w("of")]),
+      t(" "),
+      zaln("H7", [w("his"), t(" "), w("flock")]),
+      t(".'"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  const expectedOld =
+    "and say, 'The one scattering Israel will gather him and he will guard him like a shepherd of his flock.'";
+  assert(old === expectedOld, `fixture's editable text is the expected baseline (got ${JSON.stringify(old)})`);
+  const after = old.replace("'The", "‘The").replace("guard", "protect");
+  const r = smartEditVerse(verse, old, after);
+  assert(!milestoneTrailingHasOpener(r.content.verseObjects), "no milestone's trailing leaf matches OPENING_PUNCT_RE");
+  const topLevelText = r.content.verseObjects.filter((n) => n && n.type === "text").map((n) => n.text).join("");
+  assert(topLevelText.includes("‘"), `the opener lands as top-level text between the milestones (got ${JSON.stringify(r.content.verseObjects)})`);
+  assert(extractEditableText(r.content) === after, `editable text === newPlain (got ${JSON.stringify(extractEditableText(r.content))})`);
+}
+
+// ─── Case 78 (F2): smartReplaceVerse's plainText must match the hoisted content ──
+// JER-31:18-shaped fixture: H1's own trailing text already carries a stranded
+// opener (", ‘") and a `\n` sibling separates it from H2 — smartReplaceVerse
+// re-hoists its WHOLE output unconditionally (see the wrapper's own comment),
+// so even an edit far from the punctuation (here, "disciplined"->"corrected")
+// re-glues the opener to H2 and drops the space the pre-hoist plain text still
+// carried. Before the F2 fix this wrapper returned the STALE pre-hoist
+// plainText, which would drift from content_json's actual text.
+{
+  console.log("\n[Case 78] smartReplaceVerse's plainText matches the re-hoisted content (F2)");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("himself"), t(", ‘")]),
+      t("\n"),
+      zaln("H2", [w("You"), t(" "), w("disciplined"), t(" "), w("me")]),
+    ],
+  };
+  const plain = "himself, ‘ You disciplined me";
+  const idx = plain.indexOf("disciplined");
+  const r = smartReplaceVerse(verse, plain, /disciplined/g, idx, "disciplined".length, "corrected");
+  assert(r.plainText === extractPlainText(r.content), `plainText matches the derived text of the hoisted content (got plainText=${JSON.stringify(r.plainText)}, derived=${JSON.stringify(extractPlainText(r.content))})`);
+  assert(!/‘ [a-zA-Z]/.test(r.plainText), `plainText no longer has a space between the opener and the following word (got ${JSON.stringify(r.plainText)})`);
 }
 
 if (failed > 0) {
