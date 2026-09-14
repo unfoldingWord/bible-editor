@@ -4,6 +4,12 @@
 // blankStub.ts stands alone for blankStubTrash.test.mjs. Every statement here
 // is imported by BOTH the production code and the test, so the two cannot
 // silently drift apart.
+//
+// The one import below is another pure-leaf module (verseMergeEditorAlerts has
+// zero imports of its own), so it keeps this module's leaf property intact while
+// letting the no-base DELETE guards reference the single-source-of-truth
+// fingerprint constants rather than re-hardcoding them.
+import { NO_BASE_ADMIN_FINGERPRINT, NO_BASE_EDITOR_FINGERPRINT } from "./verseMergeEditorAlerts.ts";
 
 // ---------------------------------------------------------------------------
 // verses.ts's PATCH route, statement 1 of its `env.DB.batch([...])` array —
@@ -113,9 +119,20 @@ export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, act
 // they land afterwards and the reimport's own alert is written after we are
 // done. Either way the surviving banner reflects the real conflict set.
 //
+// The two `message NOT LIKE` guards exclude any undismissed alert still carrying
+// a keep_no_base warning (#761 3rd-pass Codex review P1). keep_no_base writes NO
+// verse_merge_conflicts row, so the NOT EXISTS guard above cannot see it — a
+// no-base warning that lands in the read→DELETE race window would otherwise be
+// erased by the source-wide form, losing the only durable carrier of that
+// warning before export (the same invariant alertMessageCarriesNoBaseWarning
+// enforces in JS; these fingerprints contain no SQL wildcards, so LIKE '%x%'
+// matches exactly includes(x)). Narrowing only — can never delete more.
+//
 // Binds, in order: (source, book, resource).
 export const CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL = `DELETE FROM system_alerts
     WHERE source = ?1 AND dismissed_at IS NULL
+      AND message NOT LIKE '%${NO_BASE_ADMIN_FINGERPRINT}%'
+      AND message NOT LIKE '%${NO_BASE_EDITOR_FINGERPRINT}%'
       AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
                        WHERE book = ?2 AND resource = ?3
                          AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
@@ -124,6 +141,8 @@ export const CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL = `DELETE FROM system_aler
 // Binds, in order: (username, source, book, resource).
 export const CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `DELETE FROM system_alerts
     WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL
+      AND message NOT LIKE '%${NO_BASE_ADMIN_FINGERPRINT}%'
+      AND message NOT LIKE '%${NO_BASE_EDITOR_FINGERPRINT}%'
       AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
                        WHERE book = ?3 AND resource = ?4
                          AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
@@ -418,3 +437,39 @@ export const RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL = `UPDATE verse_merge_conflicts
     SET resolved_at = ?1, resolved_by = NULL
   WHERE action = 'keep_ai_master'
     AND resolved_at IS NULL`;
+
+// Pair-scoped retire: the same UPDATE narrowed to ONE (book, resource), so
+// retireVerseKeptAiMasterFlags can batch each pair's retire atomically with
+// that pair's banner clears WITHOUT one unbounded batch. A single global batch
+// (retire + every pair's DELETEs) can breach D1's 100-statement cap once enough
+// pairs (or per-username fan-out DELETEs) accumulate, and then fails and retries
+// the same oversized batch forever (#761 Codex review, 2nd pass). Binds:
+// (resolvedAt, book, resource).
+export const RETIRE_KEPT_AI_MASTER_CONFLICTS_FOR_PAIR_SQL = `UPDATE verse_merge_conflicts
+    SET resolved_at = ?1, resolved_by = NULL
+  WHERE action = 'keep_ai_master'
+    AND resolved_at IS NULL
+    AND book = ?2 AND resource = ?3`;
+
+// ---------------------------------------------------------------------------
+// Issue #760 (#754 P1 follow-up). Read BEFORE RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL
+// runs, so retireVerseKeptAiMasterFlags knows which (book, resource) pairs it is
+// about to retire rows for — the sweep is unscoped (every pair, not just the
+// ones this run reimported), so a resource whose Door43 SHA didn't change this
+// run never gets its "Sync flagged N verse(s)" banner re-derived by
+// raiseVerseMergeConflictAlert, and the retire UPDATE alone never touches
+// system_alerts. Each returned pair is a candidate for
+// clearResolvedConflictBannerIfLast, which re-checks (atomically, in its own
+// DELETE) whether any OTHER alertable conflict still justifies keeping the
+// banner up — so a pair with a live adopt_conflict/keep_alignment_refused/
+// source_attr_divergent/keep_local_structure row alongside its retired
+// keep_ai_master rows correctly keeps its banner.
+//
+// DISTINCT, not a plain SELECT: a resource can carry many standing
+// keep_ai_master rows (EZK ULT/UST alone held 37) and the caller only needs
+// the (book, resource) shape once each.
+// ---------------------------------------------------------------------------
+export const SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL = `SELECT DISTINCT book, resource
+    FROM verse_merge_conflicts
+   WHERE action = 'keep_ai_master'
+     AND resolved_at IS NULL`;

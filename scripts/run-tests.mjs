@@ -61,6 +61,10 @@ const EXTRA_IMPORTS = new Map([
   ["src/aiRowDiffGate.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/masterLineagePersist.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/staleBaseGate.test.mjs", "./src/tsResolveHook.mjs"],
+  // verseMergeConflicts.test.mjs now imports retireVerseKeptAiMasterFlags
+  // directly from verseMergeConflicts.ts (issue #760 fail-closed regression
+  // test), which in turn imports "./auth" and "./index" without extensions.
+  ["src/verseMergeConflicts.test.mjs", "./src/tsResolveHook.mjs"],
 ]);
 
 function findTestFiles(dir) {
