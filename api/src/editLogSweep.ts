@@ -524,33 +524,54 @@ export async function raiseEditLogSweepBoundaryAlerts(env: Env, now: number = Ma
     const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
     if (toDelete.length === 0 && toInsert.length === 0) return;
 
-    // Fold delete+insert into ONE batch (same reasoning as
+    // Fold each source's delete+insert into ONE batch (same reasoning as
     // raiseVerseMergeConflictAlert's own FIX for this exact shape: a
     // transient failure between a bare DELETE and a separate INSERT batch
-    // could delete an alert and never replace it).
-    const stmts = [
-      ...toDelete.map((source) =>
+    // could delete an alert and never replace it). Group BY SOURCE so a
+    // refresh's DELETE and INSERT can never land in different batches once
+    // chunking kicks in — the split a flat [...deletes, ...inserts] list would
+    // suffer at >90 statements, which would commit a source's delete in an
+    // earlier batch and lose its alert if the later insert batch failed
+    // (Codex #781 review P2). DELETE is pushed before INSERT within each group
+    // so a refresh replaces rather than duplicates.
+    const bySource = new Map<string, D1PreparedStatement[]>();
+    for (const source of toDelete) {
+      const group = bySource.get(source) ?? [];
+      group.push(
         env.DB
           .prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
           .bind(ALARM_ALERT_USERNAME, source),
-      ),
-      ...toInsert.map(({ username: source, message }) =>
+      );
+      bySource.set(source, group);
+    }
+    for (const { username: source, message } of toInsert) {
+      const group = bySource.get(source) ?? [];
+      group.push(
         env.DB
           .prepare(
             `INSERT INTO system_alerts (username, severity, source, message, link_url)
              VALUES (?1, 'warning', ?2, ?3, NULL)`,
           )
           .bind(ALARM_ALERT_USERNAME, source, message),
-      ),
-    ];
-    // Small by construction (bounded by book x {ult,ust}, well under 200
-    // possible sources total, and only the changed subset lands here), but
-    // batch anyway — same discipline every other multi-row writer in this
-    // codebase follows (verseMergeConflicts.ts / bookReimport.ts's WRITE_BATCH).
-    const WRITE_BATCH = 90;
-    for (let i = 0; i < stmts.length; i += WRITE_BATCH) {
-      await env.DB.batch(stmts.slice(i, i + WRITE_BATCH));
+      );
+      bySource.set(source, group);
     }
+    // Small by construction (bounded by book x {ult,ust}, well under 200
+    // possible sources total, and only the changed subset lands here), but pack
+    // into <=90-statement batches anyway — never splitting a source's group —
+    // so a partial failure leaves each not-yet-committed source's existing alert
+    // intact rather than deleted-and-not-replaced. Each group is <=2 statements,
+    // so 90 is comfortably under D1's 100-statement cap.
+    const WRITE_BATCH = 90;
+    let batch: D1PreparedStatement[] = [];
+    for (const group of bySource.values()) {
+      if (batch.length > 0 && batch.length + group.length > WRITE_BATCH) {
+        await env.DB.batch(batch);
+        batch = [];
+      }
+      batch.push(...group);
+    }
+    if (batch.length > 0) await env.DB.batch(batch);
   } catch (e) {
     console.error("edit_log sweep boundary alarm failed", e instanceof Error ? e.message : String(e));
   }

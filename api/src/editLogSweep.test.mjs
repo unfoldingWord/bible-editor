@@ -779,6 +779,48 @@ console.log("\n[raiseEditLogSweepBoundaryAlerts: writes a warning naming the boo
   assert(rows.length === 0, "an undismissed alert for a boundary that healed is cleared, not left stale forever");
 }
 
+console.log("\n[raiseEditLogSweepBoundaryAlerts: a refresh's DELETE and INSERT stay in one batch across the 90-statement chunk boundary (Codex #781 P2)]");
+{
+  const d = freshDb();
+  const now = 20_000_000;
+  const staleBase = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 2 * 86400);
+  const N = 46; // 46 refreshes = 46 DELETEs + 46 INSERTs = 92 statements > one 90-statement batch
+  for (let i = 0; i < N; i++) syncRow(d, { book: `B${i}`, resource: "ult", confirmedAt: staleBase, editId: 1 });
+  // First run creates the N alerts.
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  // Shift every boundary's date so its message changes — the next run must
+  // DELETE the old alert and INSERT the new one for each source (a refresh).
+  for (let i = 0; i < N; i++) {
+    d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book = ?2 AND resource = 'ult'`).run(
+      staleBase - 86400,
+      `B${i}`,
+    );
+  }
+  // Recording shim: capture, per batch, the (op, source) of every statement.
+  const base = makeD1(d);
+  const batches = [];
+  const recording = {
+    prepare: base.prepare,
+    async batch(stmts) {
+      batches.push(stmts.map((s) => ({ op: s.sql.trim().startsWith("DELETE") ? "del" : "ins", source: s.args[1] })));
+      return base.batch(stmts);
+    },
+  };
+  await raiseEditLogSweepBoundaryAlerts({ DB: recording }, now);
+  assert(batches.length >= 2, `the refresh spanned more than one batch (got ${batches.length}) — exercises the chunk path`);
+  const batchOf = (op, source) => batches.findIndex((b) => b.some((s) => s.op === op && s.source === source));
+  let split = 0;
+  for (let i = 0; i < N; i++) {
+    const src = `edit_log_sweep_boundary_stale:B${i}:ult`;
+    const dB = batchOf("del", src);
+    const iB = batchOf("ins", src);
+    if (dB !== -1 && iB !== -1 && dB !== iB) split++;
+  }
+  assert(split === 0, `no source's DELETE and INSERT were split across batches (got ${split} split)`);
+  const live = alertRows(d, "edit_log_sweep_boundary_stale:%").filter((r) => r.dismissed_at == null);
+  assert(live.length === N, `all ${N} alerts present after the refresh (got ${live.length}) — none deleted-and-not-replaced`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
