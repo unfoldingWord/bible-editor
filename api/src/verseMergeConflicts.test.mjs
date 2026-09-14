@@ -69,6 +69,7 @@ import {
   groupNoBaseVersesByEditor,
   groupOverwrittenVersesByEditor,
   MERGE_CONFLICT_REFS_DISPLAY,
+  NO_BASE_ADMIN_FINGERPRINT,
   NO_BASE_REF_DISPLAY,
   planSystemAlertWrites,
 } from "./verseMergeEditorAlerts.ts";
@@ -1420,6 +1421,71 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
     assert(standing === 0, "no keep_ai_master row is left standing");
     const banners = d.prepare(`SELECT COUNT(*) AS n FROM system_alerts`).all()[0].n;
     assert(banners === 0, "every pair's banner is cleared");
+  }
+
+  // Case 8 — P1 (Codex #761 3rd-pass review): the source-wide clear must NOT
+  // erase a keep_no_base warning that lands in the read→batch race window.
+  // keep_no_base writes no verse_merge_conflicts row, so the DELETE's NOT EXISTS
+  // guard cannot see it; the message-fingerprint guards are what protect it.
+  // Driven at the SQL level (like clearResolvedBanner above) so it pins the
+  // exact production DELETE text: a source with one conflict-only alert and one
+  // no-base alert, no active conflict row — the DELETE removes only the
+  // conflict-only one.
+  {
+    const d = verseDb();
+    const source = "verse_merge_conflict:HAG:ult";
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('editorA','warning',?, 'Sync flagged 1 verse(s) in HAG ULT that were overwritten.',100)`,
+    ).run(source);
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning',?, ?,100)`,
+    ).run(source, `2 verse(s) could not be adjudicated: ${NO_BASE_ADMIN_FINGERPRINT} for them.`);
+    const changes = d.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).run(source, "HAG", "ult").changes;
+    assert(changes === 1, "source-wide clear deletes exactly the conflict-only alert");
+    const rows = d.prepare(`SELECT message FROM system_alerts WHERE source = ?`).all(source);
+    assert(
+      rows.length === 1 && alertMessageCarriesNoBaseWarning(rows[0].message),
+      "the keep_no_base warning survives the source-wide clear (P1)",
+    );
+  }
+
+  // Case 9 — P2 (Codex #761 3rd-pass review): a single high-fan-out pair — one
+  // no-base alert plus 100+ conflict-only alerts — must still retire and clear
+  // under D1's 100-statement cap. The old mixed branch emitted one DELETE per
+  // conflict-only username, so retire + 120 DELETEs = 121 statements breached
+  // the cap, failed, and retried the same oversized batch forever. One
+  // source-wide DELETE (now no-base-safe) keeps the batch at 2 statements. The
+  // shim throws if any batch exceeds 100, so this FAILS against the old impl.
+  {
+    const d = verseDb();
+    const source = "verse_merge_conflict:HAG:ult";
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('HAG','ult',2,9,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('nobaseuser','warning',?, ?,100)`,
+    ).run(source, `1 verse(s) could not be adjudicated: ${NO_BASE_ADMIN_FINGERPRINT}.`);
+    for (let i = 0; i < 120; i++) {
+      d.prepare(
+        `INSERT INTO system_alerts (username, severity, source, message, created_at)
+         VALUES (?, 'warning', ?, 'Sync flagged 1 verse(s) overwritten.', 100)`,
+      ).run(`ed${i}`, source);
+    }
+
+    const result = await retireVerseKeptAiMasterFlags(mkBatchEnv(d, false, 100));
+    assert(
+      result.cleared === 1,
+      "the pair retires under the 100-statement cap despite 120 conflict alerts + a no-base alert (P2)",
+    );
+    const remaining = d.prepare(`SELECT message FROM system_alerts WHERE source = ?`).all(source);
+    assert(
+      remaining.length === 1 && alertMessageCarriesNoBaseWarning(remaining[0].message),
+      "only the no-base warning remains; all 120 conflict-only alerts cleared in one source-wide DELETE",
+    );
   }
 }
 

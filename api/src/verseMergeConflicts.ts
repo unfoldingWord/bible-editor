@@ -417,16 +417,19 @@ export async function retireVerseKeptAiMasterFlags(env: Env): Promise<{ cleared:
   return { cleared };
 }
 
-// The banner-clear DELETEs retireVerseKeptAiMasterFlags folds into its atomic
+// The banner-clear DELETE retireVerseKeptAiMasterFlags folds into its atomic
 // retire batch, decided from the same reads clearResolvedConflictBannerIfLast
-// makes but RETURNED rather than executed, so they commit in one transaction
-// with the retire UPDATE. Mirrors that function's decision exactly: skip the
-// pair entirely when another alertable conflict still justifies the banner, or
-// when every undismissed alert still carries a keep_no_base warning; otherwise
-// one source-wide DELETE when every undismissed alert is conflict-only, else a
-// per-username DELETE for each that is. Both DELETEs re-assert the "no active
-// alertable conflict" predicate in SQL, so a reimport landing between these
-// reads and the batch cannot have its fresh banner wrongly cleared.
+// makes but RETURNED rather than executed, so it commits in one transaction with
+// the retire UPDATE. Skip the pair entirely when another alertable conflict
+// still justifies the banner, or when every undismissed alert still carries a
+// keep_no_base warning; otherwise return exactly ONE source-wide DELETE. That
+// DELETE re-asserts the "no active alertable conflict" predicate in SQL (so a
+// reimport landing between these reads and the batch cannot have its fresh
+// banner wrongly cleared) AND excludes keep_no_base messages in SQL — so it is
+// safe even when some undismissed alerts still carry a no-base warning, which is
+// why this returns one statement rather than the per-username fan-out
+// clearResolvedConflictBannerIfLast still uses (this path runs inside a bounded
+// D1 batch; that one runs statements individually — see the P2 note below).
 async function resolvedBannerClearStmts(
   env: Env,
   book: string,
@@ -442,12 +445,17 @@ async function resolvedBannerClearStmts(
     .all<{ username: string; message: string }>();
   const toClear = (alerts.results ?? []).filter((a) => !alertMessageCarriesNoBaseWarning(a.message));
   if (toClear.length === 0) return []; // nothing undismissed, or every row still carries keep_no_base
-  if (toClear.length === (alerts.results?.length ?? 0)) {
-    return [env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).bind(source, book, resource)];
-  }
-  return toClear.map((a) =>
-    env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL).bind(a.username, source, book, resource),
-  );
+  // One source-wide DELETE, always. It now excludes keep_no_base messages in SQL
+  // (see CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL), so it is safe even when some
+  // undismissed alerts still carry a no-base warning — no need to fan out to a
+  // per-username DELETE to spare them. That pins this pair's retire batch at two
+  // statements (the retire UPDATE + this one clear) however many editors have
+  // conflict alerts for the source, so it can never breach D1's 100-statement
+  // batch cap (#761 3rd-pass Codex review P2: a single high-fan-out pair — one
+  // no-base alert plus 100+ conflict-only alerts — previously emitted 100+
+  // per-username DELETEs, and the over-cap batch failed then retried the same
+  // oversized batch every sweep, so the pair never cleared).
+  return [env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).bind(source, book, resource)];
 }
 
 interface StoredConflictRow {
