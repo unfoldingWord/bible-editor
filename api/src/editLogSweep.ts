@@ -529,8 +529,25 @@ export async function raiseEditLogSweepBoundaryAlerts(env: Env, now: number = Ma
     const existing = new Map<string, ExistingAlertState>();
     for (const r of existingRs.results ?? []) {
       const prev = existing.get(r.source);
-      if (!prev || (prev.dismissedAt != null && r.dismissed_at == null)) {
-        existing.set(r.source, { message: r.message, dismissedAt: r.dismissed_at });
+      const row = { message: r.message, dismissedAt: r.dismissed_at };
+      if (!prev) {
+        existing.set(r.source, row);
+        continue;
+      }
+      // An active row always wins — planSystemAlertWrites decides the active
+      // alert's fate. Otherwise, among several dismissed rows (dismiss → message
+      // change → dismiss again leaves more than one), keep the one whose message
+      // MATCHES the current desired message, so a still-dismissed unchanged
+      // alert stays sticky rather than being recreated because we happened to
+      // keep an older dismissed message (Codex #781 review 2nd/3rd pass).
+      if (prev.dismissedAt == null) continue; // already holding an active row
+      if (row.dismissedAt == null) {
+        existing.set(r.source, row);
+        continue;
+      }
+      const want = desired.get(r.source);
+      if (want !== undefined && prev.message !== want && row.message === want) {
+        existing.set(r.source, row);
       }
     }
 

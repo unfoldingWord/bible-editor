@@ -850,6 +850,28 @@ console.log("\n[raiseEditLogSweepBoundaryAlerts: a source with a dismissed row A
   assert(activeCount() === 0, "a healed boundary clears the active alert even with a dismissed row present");
 }
 
+console.log("\n[raiseEditLogSweepBoundaryAlerts: two dismissed rows for one boundary — the current message stays dismissed, not resurrected (Codex #781 3rd pass)]");
+{
+  const d = freshDb();
+  const now = 20_000_000;
+  const source = "edit_log_sweep_boundary_stale:JER:ust";
+  const activeCount = () => alertRows(d, source).filter((r) => r.dismissed_at == null).length;
+  const stale1 = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 2 * 86400);
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: stale1, editId: 1 });
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now); // active M1
+  d.prepare(`UPDATE system_alerts SET dismissed_at = ?1 WHERE source = ?2 AND dismissed_at IS NULL`).run(now, source); // dismiss M1
+  // Message changes → active M2 alongside dismissed M1.
+  d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book='JER' AND resource='ust'`).run(stale1 - 3 * 86400);
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  d.prepare(`UPDATE system_alerts SET dismissed_at = ?1 WHERE source = ?2 AND dismissed_at IS NULL`).run(now, source); // dismiss M2 too
+  assert(activeCount() === 0, "both alerts dismissed for this boundary");
+  // Re-run with the boundary still stale at the M2 message: the older dismissed
+  // M1 row must not fool the planner into recreating an active alert — the
+  // current (M2) message is still dismissed and must stay sticky.
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 0, "the current message stays dismissed — an older dismissed message doesn't resurrect it");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
