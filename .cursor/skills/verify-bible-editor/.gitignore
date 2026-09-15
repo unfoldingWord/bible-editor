@@ -1,0 +1,4 @@
+# Verification run state and proof artifacts — never commit.
+run/
+artifacts/
+*.log
