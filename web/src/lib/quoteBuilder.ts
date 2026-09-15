@@ -97,16 +97,6 @@ export function selectionFromQuote(
   return out;
 }
 
-// ─── Multi-verse picker (bridged TN refs like "48:11-12") ─────────────────
-//
-// A spanning note still stores one Quote string, but its Hebrew may come from
-// more than one verse. The picker therefore keys selections as
-// `${verse}<US>${tokenKey}` so the same surface form at occurrence 1 in two
-// verses does not collide in the Set. On commit, each verse builds its own
-// sub-quote (preserving that verse's occurrence numbering / maqqef joins) and
-// the sub-quotes are joined with " & " — the same gap marker within-verse
-// discontinuous quotes already use.
-
 const VERSE_KEY_SEP = "\u001f";
 
 export function verseScopedKey(verse: number, key: HighlightKey): HighlightKey {
@@ -130,9 +120,6 @@ export interface QuoteBuildSegment {
   ust: unknown[] | null;
 }
 
-// Gap-split a quote into contiguous word-group strings (joined with a single
-// space inside each group). Mirrors highlight.ts's quoteGroups shape but keeps
-// the group as a rebuildable sub-quote string for per-verse matching.
 function quoteGroupStrings(quote: string): string[] {
   if (!quote) return [];
   return quote
@@ -147,11 +134,6 @@ function quoteGroupStrings(quote: string): string[] {
     .filter((g) => g.length > 0);
 }
 
-// Pre-seed a multi-verse picker: walk covered verses in order and greedily
-// consume the longest leading run of `&`-groups that fully resolve in that
-// verse. The first verse that contributes uses `occurrence`; later verses
-// always match at occurrence 1 (subsequent groups are unique by construction
-// once earlier groups have been claimed).
 export function selectionFromSegments(
   segments: QuoteBuildSegment[],
   quote: string | null | undefined,
@@ -177,20 +159,12 @@ export function selectionFromSegments(
       matched = true;
       break;
     }
-    if (!matched) {
-      // This verse contributes nothing; keep trying later verses with the
-      // same remaining groups (discontinuous refs like "1:2,4").
-      continue;
-    }
+    if (!matched) continue;
   }
   return out;
 }
 
-// Build a Quote from a verse-scoped selection. Each segment that has selected
-// keys builds independently (so occurrence numbering stays per-verse), then
-// non-empty sub-quotes are joined with " & ". The stored Occurrence is the
-// first contributing segment's — Door43's Occurrence column describes the
-// leading phrase.
+// Door43's Occurrence column describes the leading phrase.
 export function buildQuoteFromSegments(
   segments: QuoteBuildSegment[],
   selectedKeys: Set<HighlightKey>,
@@ -202,14 +176,7 @@ export function buildQuoteFromSegments(
     const local = new Set<HighlightKey>();
     for (const scoped of selectedKeys) {
       const parsed = parseVerseScopedKey(scoped);
-      if (parsed) {
-        if (parsed.verse === seg.verse) local.add(parsed.key);
-      } else if (segments.length === 1) {
-        // Unscoped keys: only legal when the picker is single-verse (the
-        // legacy Shell path / unit tests). Multi-verse MUST scope or the
-        // same surface|occ in two verses would alias.
-        local.add(scoped);
-      }
+      if (parsed && parsed.verse === seg.verse) local.add(parsed.key);
     }
     if (local.size === 0) continue;
     const built = buildQuoteFromSelection(seg.uhb, local);

@@ -124,8 +124,7 @@ function buildAlignerSlice(sourceData: ChapterPayload, verse: number, bibleVersi
 }
 
 // Bundle UHB(/UGNT) + ULT + UST verseObjects for every verse a quote-build
-// target covers. TN uses noteCoveredVerses so a bridged ref ("48:11-12")
-// yields both; TWL never spans, so it is always a singleton at row.verse.
+// target covers.
 function quoteBuildSegmentsForRow(
   row: { verse: number; ref_raw?: string | null },
   kind: "tn" | "twl",
@@ -1643,17 +1642,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const startQuoteBuild = useCallback(
     (target: { kind: "tn" | "twl"; id: string }) => {
       setQuoteBuildTarget(target);
-      // Pre-seed the selection from the row's existing quote so the translator
-      // can ADD to it instead of starting over. Resolves the stored quote +
-      // occurrence against every verse the row covers (a bridged TN ref like
-      // "48:11-12" yields both verses); an unresolvable quote (e.g. hand-typed
-      // English) yields an empty set and the picker starts fresh.
       const row =
         target.kind === "tn"
           ? data?.tn.find((r) => r.id === target.id)
           : data?.twl.find((r) => r.id === target.id);
       const segments = row ? quoteBuildSegmentsForRow(row, target.kind, verseIndexByVersion) : [];
-      // TN stores its source quote in `quote`; TWL stores it in `orig_words`.
       const existingQuote =
         target.kind === "tn"
           ? (row as TnRow | undefined)?.quote
@@ -1685,11 +1678,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setQuoteBuildAnchor(document.querySelector<HTMLElement>(selector));
   }, [quoteBuildTarget]);
 
-  // Verse objects bundled for the picker — one segment per covered verse.
-  // Bridged TN refs ("48:11-12") contribute every verse in the span so the
-  // translator can pick Hebrew from either; TWL is always a singleton.
-  // UHB always preferred, UGNT as NT fallback; ULT/UST may be absent so the
-  // picker shows an empty-state hint for those rows.
   const quoteBuildContext = useMemo(() => {
     if (!quoteBuildTarget || !data) return null;
     const row =
@@ -1702,9 +1690,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     };
   }, [quoteBuildTarget, data, verseIndexByVersion]);
 
-  // Materialize the in-flight quote-build selection into a row patch and
-  // fire the existing note save pipe. Builds per covered verse (so occurrence
-  // numbering stays per-verse) and joins sub-quotes with " & ".
   const commitQuoteBuild = useCallback(() => {
     if (!quoteBuildTarget || !data) return;
     const row =
@@ -1856,9 +1841,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // the anchor effect pick the row up on the next render.
       if (!resolved || !resolved.confident || !resolved.orig_words) {
         setQuoteBuildTarget({ kind: "twl", id: created.id });
-        // Verse-scoped keys — the picker always scopes by verse so the same
-        // surface|occ in two verses of a bridged TN doesn't collide. TWL is
-        // single-verse, but the popper path is shared.
         const seeded = selectionFromQuote(uhb, resolved?.orig_words, resolved?.occurrence);
         setQuoteBuildSelectedKeys(
           new Set([...seeded].map((k) => verseScopedKey(verse, k))),

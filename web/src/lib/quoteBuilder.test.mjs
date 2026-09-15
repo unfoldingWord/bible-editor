@@ -105,8 +105,6 @@ const sourceWord = (text) => ({ type: "word", tag: "w", text });
 }
 
 // ─── Multi-verse: pick Hebrew from two verses of a bridged TN ref ─────────
-// A note spanning 11-12 must be able to select a word from each verse without
-// the two `surface|1` keys colliding, and commit must join them with " & ".
 {
   console.log("\n[multi-verse] buildQuoteFromSegments joins per-verse sub-quotes with &");
   const v11 = [sourceWord("Alpha"), t(" "), sourceWord("Beta")];
@@ -129,8 +127,6 @@ const sourceWord = (text) => ({ type: "word", tag: "w", text });
   assert(built.occurrence === 1, `occurrence from first contributing verse (got ${built?.occurrence})`);
 }
 
-// Same surface form at occurrence 1 in BOTH verses must not alias — selecting
-// only v12's copy must not also light v11's.
 {
   console.log("\n[multi-verse] verse-scoped keys keep same-surface|occ from colliding");
   const v11 = [sourceWord("Same")];
@@ -147,7 +143,6 @@ const sourceWord = (text) => ({ type: "word", tag: "w", text });
   );
 }
 
-// Pre-seed a stored cross-verse quote back onto both segments.
 {
   console.log("\n[multi-verse] selectionFromSegments pre-seeds across verses");
   const v11 = [sourceWord("Alpha"), t(" "), sourceWord("Beta")];
@@ -166,7 +161,6 @@ const sourceWord = (text) => ({ type: "word", tag: "w", text });
   assert(!seeded.has(verseScopedKey(12, tokenKey("Gamma", 1))), "unselected Gamma stays off");
 }
 
-// Single-verse path through segments still works (length-1 span).
 {
   console.log("\n[multi-verse] single-segment path is unchanged");
   const v5 = [sourceWord("Only")];

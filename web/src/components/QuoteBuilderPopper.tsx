@@ -8,11 +8,11 @@
 // instance of this token I mean," especially for repeated words (the
 // three "the"s in NUM 20:1 each map to a different Hebrew word).
 //
-// Selection is keyed by `${text}|${occurrence}` against the UHB tokens —
-// the same shape buildQuoteFromSelection consumes. Clicking a UHB chip
-// toggles its key directly; clicking an ULT/UST chip toggles its FULL
-// ancestor chain (outer-to-inner zaln milestones), so a click on "first"
-// inside zaln(בַחֹדֶשׁ) > zaln(הָרִאשׁוֹן) toggles both Hebrew words at once.
+// Selection keys are verse-scoped (`verseScopedKey`) against the UHB tokens.
+// Clicking a UHB chip toggles its key directly; clicking an ULT/UST chip
+// toggles its FULL ancestor chain (outer-to-inner zaln milestones), so a
+// click on "first" inside zaln(בַחֹדֶשׁ) > zaln(הָרִאשׁוֹן) toggles both
+// Hebrew words at once.
 
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -43,8 +43,6 @@ import type { SourceWord } from "../lib/alignment";
 import { isHebrewBook } from "../lib/sourceSearch";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 
-// Which row a shift-click range is anchored in. A range never spans rows OR
-// verses — multi-verse pickers keep each verse's chip list independent.
 type Row = "src" | "ult" | "ust";
 
 interface Props {
@@ -52,18 +50,10 @@ interface Props {
   anchorEl: HTMLElement | null;
   book: string;
   chapter: number;
-  // One entry per verse the note covers. Singletons are length 1; a bridged
-  // TN ref like "48:11-12" hands over both verses so the translator can pick
-  // Hebrew from either. Selection keys are verse-scoped (see verseScopedKey).
   segments: QuoteBuildSegment[];
-  // Pre-loaded Strong's → lexicon entry map. Shell already maintains this
-  // for the scripture column's HebrewLine hover tooltips; the picker
-  // reuses it so the UHB chips show the same gloss/morphology card.
   lexiconMap: Map<string, LexiconEntry | null>;
   selectedKeys: Set<HighlightKey>;
   onToggleKey: (key: HighlightKey) => void;
-  // Additive range select for shift-click — adds every key in the range
-  // without toggling already-selected words off.
   onSelectKeys: (keys: HighlightKey[]) => void;
   onCancel: () => void;
   onCommit: () => void;
@@ -94,17 +84,11 @@ export function QuoteBuilderPopper({
     return `${segments[0].verse}–${segments[segments.length - 1].verse}`;
   }, [segments]);
 
-  // Preview of the would-be quote string. Re-runs cheaply on every toggle
-  // since collectUhbChips / matchGroupsAt scan an in-memory tree.
   const preview = useMemo(
     () => buildQuoteFromSegments(segments, selectedKeys),
     [segments, selectedKeys],
   );
 
-  // Anchor for shift-click range selection — the last chip clicked without
-  // shift. Scoped to (verse, row) so a shift-click only extends a range
-  // within the same chip list it was started in. Reset whenever the picker
-  // re-targets a different span so a stale index can't span the wrong list.
   const [anchor, setAnchor] = useState<{ verse: number; row: Row; index: number } | null>(null);
   const segmentKey = segments.map((s) => s.verse).join(",");
   useEffect(() => {
@@ -270,8 +254,6 @@ function VerseBlock({
   const scope = (key: HighlightKey) => verseScopedKey(verse, key);
   const scopeSources = (sources: SourceAncestor[]) => sources.map((s) => scope(s.key));
 
-  // UHB/UGNT source row: plain click toggles one word; shift-click adds the
-  // inclusive range from the anchor to the clicked chip (same verse only).
   const handleSourceClick = (index: number, e: React.MouseEvent) => {
     const tok = uhbTokens[index];
     const key = scope(tokenKey(tok.text, tok.occurrence));
@@ -286,8 +268,6 @@ function VerseBlock({
     setAnchor({ verse, row: "src", index });
   };
 
-  // ULT/UST target row: plain click toggles the clicked word's full source
-  // chain; shift-click adds the union of source chains across the range.
   const handleTargetClick = (
     row: "ult" | "ust",
     tokens: TargetToken[],
@@ -300,17 +280,13 @@ function VerseBlock({
       const [lo, hi] = anchor.index <= index ? [anchor.index, index] : [index, anchor.index];
       onSelectKeys(tokens.slice(lo, hi + 1).flatMap((t) => scopeSources(t.sources)));
     } else {
-      handleEnglishClick(tok.sources);
+      toggleFullSourceChain(tok.sources);
     }
     setAnchor({ verse, row, index });
   };
 
-  const handleEnglishClick = (sources: SourceAncestor[]) => {
+  const toggleFullSourceChain = (sources: SourceAncestor[]) => {
     if (sources.length === 0) return;
-    // Compute current chain coverage. If every ancestor is already in the
-    // set, treat the click as "remove the chain"; otherwise add the
-    // missing pieces. Avoids the awkward middle state where one click adds
-    // some and the next click toggles them back individually.
     const keys = scopeSources(sources);
     const allPresent = keys.every((k) => selectedKeys.has(k));
     for (const k of keys) {
@@ -342,15 +318,11 @@ function VerseBlock({
         </Typography>
       )}
 
-      {/* Source row — UHB or UGNT */}
       <Section label={sourceLabel} rtl={sourceIsHebrew}>
         {uhbTokens.length === 0 ? (
           <EmptyHint>no source words for this verse</EmptyHint>
         ) : (
           uhbTokens.map((tok, i) => {
-            // Always use nfc-normalized keys — UHB \w text drifts from
-            // zaln x-content in combining-mark order, so a raw
-            // `${text}|${occ}` comparison would miss cross-row matches.
             const key = scope(tokenKey(tok.text, tok.occurrence));
             const selected = selectedKeys.has(key);
             const src: SourceWord = {
@@ -382,7 +354,6 @@ function VerseBlock({
         )}
       </Section>
 
-      {/* ULT row */}
       <Section label="ULT">
         {ultTokens.length === 0 ? (
           <EmptyHint>no ULT alignment for this verse</EmptyHint>
@@ -405,7 +376,6 @@ function VerseBlock({
         )}
       </Section>
 
-      {/* UST row */}
       <Section label="UST">
         {ustTokens.length === 0 ? (
           <EmptyHint>no UST alignment for this verse</EmptyHint>
