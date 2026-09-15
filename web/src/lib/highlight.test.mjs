@@ -731,6 +731,39 @@ const JOIN = "⁠";
     soft.length === 0,
     `partialGroups still requires full groups (typo group must not soft-match; got ${JSON.stringify(soft)})`,
   );
+
+  // occurrence -1 = every match of groups present in this verse (ULT/UST
+  // OL-join uses surfaceOccurrence, so repeats must all be selected).
+  const v11Repeat = [
+    src("שַׁאֲנַ֣ן"),
+    src("מוֹאָ֔ב"),
+    src("מִנְּעוּרָ֑יו"),
+    src("שַׁאֲנַ֣ן"),
+    src("מוֹאָ֔ב"),
+    src("מִנְּעוּרָ֑יו"),
+  ];
+  const v11Target = [
+    zaln("שַׁאֲנַ֣ן", 1, 2, [tgt("quiet1")]),
+    zaln("מוֹאָ֔ב", 1, 2, [tgt("Moab1")]),
+    zaln("מִנְּעוּרָ֑יו", 1, 2, [tgt("youth1")]),
+    zaln("שַׁאֲנַ֣ן", 2, 2, [tgt("quiet2")]),
+    zaln("מוֹאָ֔ב", 2, 2, [tgt("Moab2")]),
+    zaln("מִנְּעוּרָ֑יו", 2, 2, [tgt("youth2")]),
+  ];
+  const lit1 = [...findTargetHighlights(v11Target, spanQuote, 1, v11Repeat, true)].map(
+    (x) => x.split("|")[0],
+  );
+  const litAll = [...findTargetHighlights(v11Target, spanQuote, -1, v11Repeat, true)].map(
+    (x) => x.split("|")[0],
+  );
+  assert(
+    lit1.length === 3 && lit1.includes("quiet1") && !lit1.includes("quiet2"),
+    `occurrence 1 lights only the first first-group match (got ${JSON.stringify(lit1)})`,
+  );
+  assert(
+    litAll.length === 6 && litAll.includes("quiet1") && litAll.includes("quiet2"),
+    `occurrence -1 lights every first-group match (got ${JSON.stringify(litAll)})`,
+  );
 }
 
 if (failed) {

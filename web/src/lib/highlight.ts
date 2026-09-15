@@ -855,6 +855,8 @@ function matchSourceGroupsInVerse(
     )
     .filter((g) => g.length > 0);
   if (groups.length <= 1) return [];
+  // `occurrence: -1` means every match (TSV), same as matchSourceTokens.
+  const allOcc = (occurrence | 0) === -1;
   const wantOcc = Math.max(1, occurrence | 0);
   const tokens = collectBareWords(verseObjects);
   const normTokens = tokens.map((t) => matchNorm(t.text));
@@ -874,6 +876,12 @@ function matchSourceGroupsInVerse(
         groupMatches.push(Array.from({ length: normGroup.length }, (_, wi) => start + wi));
       }
     }
+    if (allOcc) {
+      for (const pick of groupMatches) for (const i of pick) union.add(i);
+      continue;
+    }
+    // Occurrence indexes the first quote group; later groups take their first
+    // hit in this verse (they live on the other half of a span).
     const pick = gi === 0 ? groupMatches[wantOcc - 1] : groupMatches[0];
     if (pick) for (const i of pick) union.add(i);
   }
