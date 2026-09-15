@@ -37,4 +37,26 @@ for (const tag of ["p", "q1", "q2"]) {
   assert.ok(overlayFindMarks(html, /good/g, { start: 6, end: 10 }).includes("be-find-active"));
   assert.ok(overlayFindMarks(html, /ALEPH/g, { start: 0, end: 5 }).includes("be-find-active"));
 }
+// A match that begins on the synthetic block separator belongs to no text run,
+// so it cannot be decorated — but consuming it must not strand the scan. Before
+// the fix the scan froze on that hit and every later hit in the cell, including
+// ordinary in-run ones, silently stopped painting.
+for (const render of [renderHighlightedHTML, renderEditableHTML]) {
+  const verseObjects = [
+    { type: "text", text: "aa" },
+    { type: "paragraph", tag: "p" },
+    { type: "text", text: "bb cc bb dd" },
+  ];
+  const html = render(verseObjects, new Set());
+  assert.equal(extractPlainText({ verseObjects }), "aa bb cc bb dd");
+  // Two " bb" hits in plain_text: 2-5 straddles the block boundary, 8-11 sits
+  // wholly inside the second run. The second must still paint, and be active.
+  const marked = overlayFindMarks(html, / bb/gi, { start: 8, end: 11 });
+  assert.equal((marked.match(/be-find-active/g) ?? []).length, 1,
+    "later in-run hit survives a separator-anchored hit");
+  assert.equal(marked.replace(/<mark[^>]*>|<\/mark>/g, ""), html, "decoration preserves markup/text");
+  // Same for a hit the separator match would otherwise have swallowed.
+  assert.ok(overlayFindMarks(html, / |dd/g, { start: 12, end: 14 }).includes("be-find-active"),
+    "a separator hit does not swallow the rest of the cell");
+}
 console.log("readonly Find: paragraph/poetry active offsets, no phantom cross-block hits, editable parity passed");

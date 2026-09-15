@@ -1557,17 +1557,20 @@ export function overlayFindMarks(
     }
     const nodeStart = starts[i];
     const nodeEnd = nodeStart + text.length;
-    // Every hit's start falls in exactly one run (runs partition `full`
-    // contiguously). One that also ends within this run is fully contained
-    // and gets decorated; one that starts here but ends past `nodeEnd`
-    // crosses into the next tag/run — skip decorating it (its tail bytes
-    // just render as plain text in whichever run they land in) but still
-    // consume it so a later run doesn't try to re-match its start.
+    // Runs do NOT partition `full` contiguously: a block separator (see
+    // `blockStart` above) adds a synthetic space that belongs to no run. A hit
+    // is decorated only when it lies wholly inside this run; one that starts
+    // in a separator, or that runs past `nodeEnd` into the next tag/run, is
+    // consumed without decoration (its bytes just render as plain text in
+    // whichever run they land in). Consuming by `start < nodeEnd` rather than
+    // by run containment is what keeps `hitIdx` moving — gating on
+    // `start >= nodeStart` would strand a separator-anchored hit forever and
+    // silently drop every later hit in the cell.
     const mine: Array<{ start: number; end: number; isActive: boolean }> = [];
-    while (hitIdx < hits.length && hits[hitIdx].start >= nodeStart && hits[hitIdx].start < nodeEnd) {
+    while (hitIdx < hits.length && hits[hitIdx].start < nodeEnd) {
       const h = hits[hitIdx];
       hitIdx++;
-      if (h.end <= nodeEnd) mine.push(h);
+      if (h.start >= nodeStart && h.end <= nodeEnd) mine.push(h);
     }
     // Untouched runs go back verbatim, so entity spellings this module emits
     // (`&#8203;`, `&nbsp;`) survive the round trip byte-for-byte.
