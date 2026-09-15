@@ -1568,7 +1568,7 @@ function NoteCardInner({
                 e.stopPropagation();
                 setRefMenuAnchor(e.currentTarget);
               }}
-              sx={{ fontFamily: "monospace", fontSize: 11, height: 22, color: "text.secondary" }}
+              sx={{ fontFamily: "monospace", fontSize: 11, height: 24, color: "text.secondary" }}
             />
           </Tooltip>
         ) : (
