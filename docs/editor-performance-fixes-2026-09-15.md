@@ -1,6 +1,7 @@
 # Editor performance and viewport fixes
 
-Branch: `fix/editor-performance`, based on `origin/main` at `5aefcc22`.
+Branch: `fix/editor-performance`, initially based on `origin/main` at `5aefcc22`;
+subsequently merged `e8fb508c` (quote-picker PR #804) for PR #805 review.
 
 ## Scope
 
@@ -88,3 +89,18 @@ the project's `verify-bible-editor` launch/doctor/evidence/cleanup workflow.
 Screenshots, before/after ARIA snapshots, timings, readback, and race result are
 under `.cursor/skills/verify-bible-editor/artifacts/20260915-170416/` (local,
 generated evidence; not release source).
+
+## Main-branch integration
+
+Resolved the stacked-row renderer overlap with PR #804 by retaining spanning-note
+highlight sets and paragraph-preserving Find. Matching Find takes priority over
+note marks, as in columns/book mode, so note word tags cannot split multi-word
+search matches. Closing Find restores spanning-note highlights.
+
+The merged code passed all 46 web and 75 API unit-test files and the production
+build. The original seven browser regression tests passed again. Added s13
+covering spanning notes plus multi-word Find in all three modes, unchanged
+geometry, restored note marks, and both source verses in the quote picker.
+The final combined s9/s10/s12/s13 run passed all eight tests in 1.3 minutes.
+Local integration evidence is under
+`.cursor/skills/verify-bible-editor/artifacts/20260915-174117/`.
