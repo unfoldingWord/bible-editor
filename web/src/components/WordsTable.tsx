@@ -877,7 +877,7 @@ const WordRow = memo(function WordRow({
                 color="warning"
                 variant="outlined"
                 onClick={(e) => setDisambigAnchor(e.currentTarget)}
-                sx={{ height: 20, cursor: "pointer", flexShrink: 0, "& .MuiChip-label": { px: 0.5, fontSize: 11 } }}
+                sx={{ height: 24, cursor: "pointer", flexShrink: 0, "& .MuiChip-label": { px: 0.5, fontSize: 11 } }}
               />
             </Tooltip>
             <Menu
