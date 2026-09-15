@@ -53,6 +53,11 @@ interface Props {
   rtl?: boolean;
   activeNoteQuote?: string | null;
   activeNoteOccurrence?: number | null;
+  // Bridged TN refs: paint quote groups on every covered verse, not only the
+  // navigated one. Also switches highlightsFor into per-group matching.
+  activeNoteQuotePartialGroups?: boolean;
+  // Verses in the active TN ref; with partialGroups, only these paint.
+  activeNoteCoveredVerses?: readonly number[];
   // Transient reorder stoplight for the active verse (drag held / ~3s after an
   // arrow move): the moved note's candidate prev (green underline) + next (red
   // overline), on channels separate from the yellow active fill.
@@ -127,6 +132,8 @@ export function DocColumn({
   rtl,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeNoteQuotePartialGroups = false,
+  activeNoteCoveredVerses,
   reorderHighlight,
   activeSourceContent,
   scrollNonce,
@@ -230,20 +237,31 @@ export function DocColumn({
           // range. For singletons this reduces to v === activeVerse.
           const isActive = activeVerse >= dto.verse && activeVerse <= (dto.verse_end ?? dto.verse);
           // During a preview the yellow follows the moved/hovered note; else the
-          // active note.
+          // active note. Bridged TN quotes also paint on non-active covered verses.
           const aQuote = reorderHighlight?.movedQuote ?? activeNoteQuote;
           const aOcc = reorderHighlight?.movedQuote ? reorderHighlight.movedOccurrence : activeNoteOccurrence;
-          const highlights = isActive
-            ? highlightsFor(bibleVersion, dto.content, aQuote, aOcc, activeSourceContent)
+          const covered =
+            !!activeNoteQuotePartialGroups &&
+            !!activeNoteCoveredVerses?.some(
+              (cv) => cv >= dto.verse && cv <= (dto.verse_end ?? dto.verse),
+            );
+          const paintQuote = !!aQuote && (isActive || covered);
+          const partial = !reorderHighlight?.movedQuote && covered;
+          // OL-anchor against THIS verse's source — activeSourceContent is only
+          // the navigated verse and would mis-join a v12 ULT highlight.
+          const sourceContent =
+            sourceByVerseNum?.[dto.verse]?.content ?? activeSourceContent;
+          const highlights = paintQuote
+            ? highlightsFor(bibleVersion, dto.content, aQuote, aOcc, sourceContent, partial)
             : null;
           // Reorder stoplight neighbour sets (active verse only, while live).
           const prevHighlights =
             isActive && reorderHighlight?.prevQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, activeSourceContent)
+              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, sourceContent)
               : null;
           const nextHighlights =
             isActive && reorderHighlight?.nextQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, activeSourceContent)
+              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, sourceContent)
               : null;
           // Lift any \s1/\s2/\s3 section headers in this verse's content
           // into block-level bands rendered AFTER the inline verse span

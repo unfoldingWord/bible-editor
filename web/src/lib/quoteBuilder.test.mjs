@@ -8,8 +8,11 @@
 import {
   collectTargetTokens,
   buildQuoteFromSelection,
+  buildQuoteFromSegments,
   selectionFromQuote,
+  selectionFromSegments,
   tokenKey,
+  verseScopedKey,
 } from "./quoteBuilder.ts";
 
 let failed = 0;
@@ -99,6 +102,74 @@ const sourceWord = (text) => ({ type: "word", tag: "w", text });
     preseeded.size === 1 && preseeded.has(selah.sources[0].key),
     `selectionFromQuote pre-seeds the qs-nested word's key (got ${JSON.stringify([...preseeded])})`,
   );
+}
+
+// ─── Multi-verse: pick Hebrew from two verses of a bridged TN ref ─────────
+{
+  console.log("\n[multi-verse] buildQuoteFromSegments joins per-verse sub-quotes with &");
+  const v11 = [sourceWord("Alpha"), t(" "), sourceWord("Beta")];
+  const v12 = [sourceWord("Gamma"), t(" "), sourceWord("Delta")];
+  const segments = [
+    { verse: 11, uhb: v11, ult: null, ust: null },
+    { verse: 12, uhb: v12, ult: null, ust: null },
+  ];
+  const selected = new Set([
+    verseScopedKey(11, tokenKey("Alpha", 1)),
+    verseScopedKey(11, tokenKey("Beta", 1)),
+    verseScopedKey(12, tokenKey("Delta", 1)),
+  ]);
+  const built = buildQuoteFromSegments(segments, selected);
+  assert(!!built, "multi-verse build returns a quote");
+  assert(
+    built.quote === "Alpha Beta & Delta",
+    `joined quote is "Alpha Beta & Delta" (got ${JSON.stringify(built?.quote)})`,
+  );
+  assert(built.occurrence === 1, `occurrence from first contributing verse (got ${built?.occurrence})`);
+}
+
+{
+  console.log("\n[multi-verse] verse-scoped keys keep same-surface|occ from colliding");
+  const v11 = [sourceWord("Same")];
+  const v12 = [sourceWord("Same")];
+  const segments = [
+    { verse: 11, uhb: v11, ult: null, ust: null },
+    { verse: 12, uhb: v12, ult: null, ust: null },
+  ];
+  const selected = new Set([verseScopedKey(12, tokenKey("Same", 1))]);
+  const built = buildQuoteFromSegments(segments, selected);
+  assert(
+    !!built && built.quote === "Same",
+    `only the scoped verse contributes (got ${JSON.stringify(built)})`,
+  );
+}
+
+{
+  console.log("\n[multi-verse] selectionFromSegments pre-seeds across verses");
+  const v11 = [sourceWord("Alpha"), t(" "), sourceWord("Beta")];
+  const v12 = [sourceWord("Gamma"), t(" "), sourceWord("Delta")];
+  const segments = [
+    { verse: 11, uhb: v11, ult: null, ust: null },
+    { verse: 12, uhb: v12, ult: null, ust: null },
+  ];
+  const seeded = selectionFromSegments(segments, "Alpha Beta & Delta", 1);
+  assert(
+    seeded.has(verseScopedKey(11, tokenKey("Alpha", 1))) &&
+      seeded.has(verseScopedKey(11, tokenKey("Beta", 1))) &&
+      seeded.has(verseScopedKey(12, tokenKey("Delta", 1))),
+    `pre-seed covers both verses (got ${JSON.stringify([...seeded])})`,
+  );
+  assert(!seeded.has(verseScopedKey(12, tokenKey("Gamma", 1))), "unselected Gamma stays off");
+}
+
+{
+  console.log("\n[multi-verse] single-segment path is unchanged");
+  const v5 = [sourceWord("Only")];
+  const segments = [{ verse: 5, uhb: v5, ult: null, ust: null }];
+  const selected = new Set([verseScopedKey(5, tokenKey("Only", 1))]);
+  const built = buildQuoteFromSegments(segments, selected);
+  assert(!!built && built.quote === "Only" && built.occurrence === 1, `singleton via segments (got ${JSON.stringify(built)})`);
+  const seeded = selectionFromSegments(segments, "Only", 1);
+  assert(seeded.has(verseScopedKey(5, tokenKey("Only", 1))), "singleton pre-seed scopes the key");
 }
 
 if (failed > 0) {

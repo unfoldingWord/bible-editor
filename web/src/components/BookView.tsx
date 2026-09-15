@@ -68,6 +68,10 @@ interface Props {
   activeVerse: number;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  activeNoteQuotePartialGroups?: boolean;
+  // Verses in the active TN ref (same chapter as activeChapter). With
+  // partialGroups, only these rows paint the quote — not the whole book.
+  activeNoteCoveredVerses?: readonly number[];
   // Transient reorder stoplight for the active verse (drag held / ~3s after an
   // arrow move): the moved note's candidate prev (green) + next (red).
   reorderHighlight?: ReorderHighlight | null;
@@ -127,6 +131,8 @@ export function BookView({
   activeVerse,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeNoteQuotePartialGroups = false,
+  activeNoteCoveredVerses,
   reorderHighlight,
   activeSourceContent,
   scrollNonce,
@@ -307,6 +313,8 @@ export function BookView({
               activeVerse={activeVerse}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
+              activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
+              activeNoteCoveredVerses={activeNoteCoveredVerses}
               reorderHighlight={reorderHighlight ?? null}
               activeSourceContent={activeSourceContent}
               activeRowRef={activeRowRef}
@@ -354,6 +362,8 @@ const ChapterBlock = memo(function ChapterBlock({
   activeVerse,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeNoteQuotePartialGroups = false,
+  activeNoteCoveredVerses,
   reorderHighlight,
   activeSourceContent,
   activeRowRef,
@@ -382,6 +392,8 @@ const ChapterBlock = memo(function ChapterBlock({
   activeVerse: number;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  activeNoteQuotePartialGroups?: boolean;
+  activeNoteCoveredVerses?: readonly number[];
   reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   activeRowRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -541,6 +553,10 @@ const ChapterBlock = memo(function ChapterBlock({
           chapter === activeChapter && ustDto?.verse_end != null && ustDto.verse_end > v
             ? activeVerse >= v && activeVerse <= ustDto.verse_end
             : isActive;
+        const coverHighlight =
+          chapter === activeChapter &&
+          !!activeNoteQuotePartialGroups &&
+          !!activeNoteCoveredVerses?.includes(v);
         return (
           <VerseRow
             key={`${chapter}-${v}`}
@@ -551,8 +567,11 @@ const ChapterBlock = memo(function ChapterBlock({
             versesByVersion={data.verses}
             isActive={isActive}
             bridgeActive={bridgeActive}
-            activeNoteQuote={isActive ? activeNoteQuote : null}
-            activeNoteOccurrence={isActive ? activeNoteOccurrence : null}
+            activeNoteQuote={isActive || coverHighlight ? activeNoteQuote : null}
+            activeNoteOccurrence={
+              isActive || coverHighlight ? activeNoteOccurrence : null
+            }
+            activeNoteQuotePartialGroups={coverHighlight}
             reorderHighlight={isActive ? reorderHighlight : null}
             activeSourceContent={isActive ? activeSourceContent : undefined}
             rowRef={isActive ? activeRowRef : null}
@@ -590,6 +609,7 @@ const VerseRow = memo(function VerseRow({
   bridgeActive,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeNoteQuotePartialGroups = false,
   reorderHighlight,
   activeSourceContent,
   rowRef,
@@ -620,6 +640,7 @@ const VerseRow = memo(function VerseRow({
   bridgeActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  activeNoteQuotePartialGroups?: boolean;
   reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   rowRef: React.MutableRefObject<HTMLDivElement | null> | null;
@@ -702,6 +723,7 @@ const VerseRow = memo(function VerseRow({
               bridgeActive={bridgeActive}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
+              activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
               reorderHighlight={reorderHighlight}
               activeSourceContent={activeSourceContent}
               search={search}
@@ -739,6 +761,7 @@ const VerseCell = memo(function VerseCell({
   bridgeActive,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeNoteQuotePartialGroups = false,
   reorderHighlight,
   activeSourceContent,
   search,
@@ -775,6 +798,7 @@ const VerseCell = memo(function VerseCell({
   bridgeActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  activeNoteQuotePartialGroups?: boolean;
   reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   search: SearchState | null;
@@ -917,13 +941,27 @@ const VerseCell = memo(function VerseCell({
   }, [search, sourceHits, dto?.plain_text, isSource, activeRange]);
 
   const highlights = useMemo<Set<HighlightKey> | null>(() => {
-    if (findHTML || !isActive || !dto?.content) return null;
-    // During a preview the yellow follows the moved/hovered note; else active.
+    if (findHTML || !dto?.content) return null;
     const aQuote = reorderHighlight?.movedQuote ?? activeNoteQuote;
     const aOcc = reorderHighlight?.movedQuote ? reorderHighlight.movedOccurrence : activeNoteOccurrence;
     if (!aQuote) return null;
-    return highlightsFor(bibleVersion, dto.content, aQuote, aOcc, activeSourceContent);
-  }, [findHTML, isActive, activeNoteQuote, activeNoteOccurrence, reorderHighlight, bibleVersion, dto?.content, activeSourceContent]);
+    const paint = isActive || activeNoteQuotePartialGroups;
+    if (!paint) return null;
+    const partial = !reorderHighlight?.movedQuote && activeNoteQuotePartialGroups;
+    const ol = sourceContent ?? activeSourceContent;
+    return highlightsFor(bibleVersion, dto.content, aQuote, aOcc, ol, partial);
+  }, [
+    findHTML,
+    isActive,
+    activeNoteQuote,
+    activeNoteOccurrence,
+    activeNoteQuotePartialGroups,
+    reorderHighlight,
+    bibleVersion,
+    dto?.content,
+    sourceContent,
+    activeSourceContent,
+  ]);
 
   // Reorder stoplight neighbour sets (green underline / red overline), active
   // verse only and only while a drag / recent arrow-move is live.

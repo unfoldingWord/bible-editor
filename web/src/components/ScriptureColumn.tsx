@@ -61,6 +61,13 @@ interface Props {
   activeVerse: number;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  // Bridged TN refs ("48:11-12"): match each `&`/newline quote group per
+  // verse so both halves highlight. False for singleton notes / TWL.
+  activeNoteQuotePartialGroups?: boolean;
+  // Verses covered by the active TN ref. Used with partialGroups so a
+  // spanning quote paints only 11+12, not every chapter verse that
+  // happens to share a Hebrew word.
+  activeNoteCoveredVerses?: readonly number[];
   // Transient reorder "stoplight": while a note is dragged (or for ~3s after an
   // arrow move) the active verse also lights the moved note's candidate
   // predecessor (green underline) and successor (red overline) on channels
@@ -191,6 +198,7 @@ const EMPTY_COLUMN: Record<number, VerseDto> = {};
 
 // Stable zero-counts for a verse with no threads (see NoteCard for the twin).
 const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
+const EMPTY_COVERED: readonly number[] = [];
 
 const INTRO_TOOLTIP =
   "Chapter intro — chapter-level translation notes, Psalm superscriptions (\\d), and the paragraph / poetry markers that introduce verse 1.";
@@ -213,6 +221,8 @@ function ScriptureColumnInner({
   activeVerse,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeNoteQuotePartialGroups = false,
+  activeNoteCoveredVerses = EMPTY_COVERED,
   reorderHighlight,
   mode,
   enabledVersions,
@@ -606,6 +616,8 @@ function ScriptureColumnInner({
             isHebrew={isHebrew}
             activeNoteQuote={activeNoteQuote}
             activeNoteOccurrence={activeNoteOccurrence}
+            activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
+            activeNoteCoveredVerses={activeNoteCoveredVerses}
             reorderHighlight={reorderHighlight ?? null}
             lexiconMap={lexiconMap}
             twl={twl}
@@ -638,6 +650,8 @@ function ScriptureColumnInner({
               activeVerse={activeVerse}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
+              activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
+              activeNoteCoveredVerses={activeNoteCoveredVerses}
               reorderHighlight={reorderHighlight ?? null}
               activeSourceContent={activeSourceContent}
               scrollNonce={scrollNonce}
@@ -679,6 +693,8 @@ function ScriptureColumnInner({
                 rtl={v === "UHB"}
                 activeNoteQuote={activeNoteQuote}
                 activeNoteOccurrence={activeNoteOccurrence}
+                activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
+                activeNoteCoveredVerses={activeNoteCoveredVerses}
                 reorderHighlight={reorderHighlight ?? null}
                 activeSourceContent={activeSourceContent}
                 scrollNonce={scrollNonce}
@@ -738,6 +754,8 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     a.activeVerse === b.activeVerse &&
     a.activeNoteQuote === b.activeNoteQuote &&
     a.activeNoteOccurrence === b.activeNoteOccurrence &&
+    a.activeNoteQuotePartialGroups === b.activeNoteQuotePartialGroups &&
+    a.activeNoteCoveredVerses === b.activeNoteCoveredVerses &&
     a.reorderHighlight === b.reorderHighlight &&
     a.mode === b.mode &&
     a.enabledVersions === b.enabledVersions &&
@@ -789,6 +807,8 @@ function StackedBody({
   isHebrew,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeNoteQuotePartialGroups = false,
+  activeNoteCoveredVerses = EMPTY_COVERED,
   reorderHighlight,
   lexiconMap,
   twl,
@@ -815,6 +835,8 @@ function StackedBody({
   isHebrew: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  activeNoteQuotePartialGroups?: boolean;
+  activeNoteCoveredVerses?: readonly number[];
   reorderHighlight: ReorderHighlight | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   twl: TwlRow[];
@@ -873,9 +895,10 @@ function StackedBody({
           const ro = reorderHighlight;
           const aQuote = ro?.movedQuote ?? activeNoteQuote;
           const aOcc = ro?.movedQuote ? ro.movedOccurrence : activeNoteOccurrence;
-          const ultHL = highlightsFor("ULT", ultV?.content, aQuote, aOcc, uhbV?.content);
-          const ustHL = highlightsFor("UST", ustV?.content, aQuote, aOcc, uhbV?.content);
-          const uhbHL = highlightsFor(uhbLabel, uhbV?.content, aQuote, aOcc);
+          const partial = !ro?.movedQuote && activeNoteQuotePartialGroups;
+          const ultHL = highlightsFor("ULT", ultV?.content, aQuote, aOcc, uhbV?.content, partial);
+          const ustHL = highlightsFor("UST", ustV?.content, aQuote, aOcc, uhbV?.content, partial);
+          const uhbHL = highlightsFor(uhbLabel, uhbV?.content, aQuote, aOcc, undefined, partial);
           // Reorder stoplight: the moved note's candidate neighbours, resolved
           // per version (ULT/UST OL-anchored on UHB, like the active set).
           // Undefined unless a drag / hover / recent arrow-move is in flight.
@@ -1046,7 +1069,12 @@ function StackedBody({
         }
         // Inactive rows are memoized (InactiveVerseRow) so selecting a verse
         // re-renders only the two rows whose active state actually flips — the
-        // rest of the chapter's verse list is skipped.
+        // rest of the chapter's verse list is skipped. Bridged TN refs still
+        // paint quote highlights on covered non-active verses.
+        const coverHighlight =
+          !!activeNoteQuotePartialGroups &&
+          !!activeNoteCoveredVerses.includes(v) &&
+          !!activeNoteQuote;
         return (
           <InactiveVerseRow
             key={v}
@@ -1054,6 +1082,10 @@ function StackedBody({
             chapter={chapter}
             ult={ult}
             ust={ust}
+            uhb={uhb}
+            noteQuote={coverHighlight ? activeNoteQuote : null}
+            noteOccurrence={coverHighlight ? activeNoteOccurrence : null}
+            notePartial={coverHighlight}
             search={search}
             findActiveMatch={findActiveMatch}
             onSelectVerse={onSelectVerse}
@@ -1078,6 +1110,10 @@ const InactiveVerseRow = memo(
     chapter,
     ult,
     ust,
+    uhb,
+    noteQuote,
+    noteOccurrence,
+    notePartial,
     search,
     findActiveMatch,
     onSelectVerse,
@@ -1088,6 +1124,10 @@ const InactiveVerseRow = memo(
     chapter: number;
     ult: Record<number, VerseDto>;
     ust: Record<number, VerseDto>;
+    uhb: Record<number, VerseDto>;
+    noteQuote: string | null;
+    noteOccurrence: number | null;
+    notePartial: boolean;
     search: SearchState | null;
     findActiveMatch: FindMatch | null;
     onSelectVerse: (v: number) => void;
@@ -1096,6 +1136,13 @@ const InactiveVerseRow = memo(
   }) {
     const ultV = ult[v];
     const ustV = ust[v];
+    const uhbV = uhb[v];
+    const ultHL = noteQuote
+      ? highlightsFor("ULT", ultV?.content, noteQuote, noteOccurrence, uhbV?.content, notePartial)
+      : null;
+    const ustHL = noteQuote
+      ? highlightsFor("UST", ustV?.content, noteQuote, noteOccurrence, uhbV?.content, notePartial)
+      : null;
     // Only render this version's cell when it's the start of its row's span —
     // keeps a UST 6-9 block from re-rendering on every verse 7,8,9 row
     // underneath it. For singletons, dto.verse === v always.
@@ -1207,6 +1254,7 @@ const InactiveVerseRow = memo(
                 dto={ultV}
                 prevDto={findPrevRowInColumn(ult, ultV.verse)}
                 search={search}
+                highlights={ultHL}
                 activeRange={
                   findActiveMatch &&
                   findActiveMatch.chapter === chapter &&
@@ -1250,6 +1298,7 @@ const InactiveVerseRow = memo(
                 dto={ustV}
                 prevDto={findPrevRowInColumn(ust, ustV.verse)}
                 search={search}
+                highlights={ustHL}
                 activeRange={
                   findActiveMatch &&
                   findActiveMatch.chapter === chapter &&
@@ -1271,6 +1320,10 @@ const InactiveVerseRow = memo(
     a.chapter === b.chapter &&
     a.ult === b.ult &&
     a.ust === b.ust &&
+    a.uhb === b.uhb &&
+    a.noteQuote === b.noteQuote &&
+    a.noteOccurrence === b.noteOccurrence &&
+    a.notePartial === b.notePartial &&
     a.search === b.search &&
     a.findActiveMatch === b.findActiveMatch &&
     // By value — StackedBody calls verseCommentCounts(v) per render, so the
@@ -1969,11 +2022,13 @@ function StackedRowBody({
   dto,
   prevDto,
   search,
+  highlights,
   activeRange,
 }: {
   dto: VerseDto;
   prevDto: VerseDto | null;
   search: SearchState | null;
+  highlights?: Set<HighlightKey> | null;
   activeRange?: { start: number; end: number } | null;
 }) {
   const verseObjects = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
@@ -2005,8 +2060,9 @@ function StackedRowBody({
     // so rendering them here too would double a text-bearing `\qa` acrostic.
     const body = stripTrailingMarkers(verseObjects);
     const composed = drift.length > 0 ? [...drift, ...body] : body;
-    // Skip the marker renderer if there's no structure to show — the
-    // FindAwareText fallback below paints find marks for plain prose.
+    const hlSet = highlights ?? (new Set() as Set<HighlightKey>);
+    // Skip the marker renderer if there's no structure to show — unless a
+    // spanning TN quote needs yellow paint (plain FindAwareText can't do that).
     const hasStructure =
       drift.length > 0 ||
       verseObjects.some((n) => {
@@ -2015,9 +2071,9 @@ function StackedRowBody({
         const t = o["type"];
         return t === "paragraph" || t === "quote" || t === "section";
       });
-    if (!hasStructure) return null;
-    return renderHighlightedHTML(composed, new Set());
-  }, [verseObjects, drift, search, activeRange, dto.plain_text]);
+    if (!hasStructure && hlSet.size === 0) return null;
+    return renderHighlightedHTML(composed, hlSet);
+  }, [verseObjects, drift, search, activeRange, dto.plain_text, highlights]);
 
   if (html !== null) {
     return <span dangerouslySetInnerHTML={{ __html: html }} />;
