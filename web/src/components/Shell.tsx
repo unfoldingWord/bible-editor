@@ -231,6 +231,7 @@ const TAB_FOR_ROW_KIND = {
 // Stable empty list so the popover's `threads` prop doesn't churn identity while
 // a target has no threads yet.
 const EMPTY_COMMENT_THREADS: CommentThread[] = [];
+const EMPTY_COVERED_VERSES: number[] = [];
 
 interface Props {
   book: string;
@@ -1406,8 +1407,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }
       }
     }
+    // Bridged TN refs ("48:11-12"): keep every covered verse on screen so
+    // both halves of the quote can highlight without navigating away.
+    if (activeNoteId && data) {
+      const note = data.tn.find((r) => r.id === activeNoteId);
+      if (note) {
+        const covered = noteCoveredVerses(note);
+        if (covered.length > 1) {
+          start = Math.min(start, covered[0]);
+          end = Math.max(end, covered[covered.length - 1]);
+        }
+      }
+    }
     return [start, end] as const;
-  }, [versesForTiles, activeVerse]);
+  }, [versesForTiles, activeVerse, activeNoteId, data]);
 
   const visibleVersions = useMemo(
     () => enabledVersions.filter((v) => availableVersions.includes(v)),
@@ -1508,18 +1521,37 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // highlight source. Notes and words are mutually exclusive; clicking one
   // clears the other. Words use `orig_words` (Hebrew source words) which the
   // same matcher handles directly for UHB and via \zaln-s for ULT/UST.
-  const { activeQuote, activeOccurrence } = useMemo(() => {
-    if (!data) return { activeQuote: null, activeOccurrence: null };
-    if (activeNoteId) {
-      const r = data.tn.find((r) => r.id === activeNoteId);
-      return { activeQuote: r?.quote ?? null, activeOccurrence: r?.occurrence ?? null };
-    }
-    if (activeWordId) {
-      const r = data.twl.find((r) => r.id === activeWordId);
-      return { activeQuote: r?.orig_words ?? null, activeOccurrence: r?.occurrence ?? null };
-    }
-    return { activeQuote: null, activeOccurrence: null };
-  }, [activeNoteId, activeWordId, data]);
+  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses } =
+    useMemo(() => {
+      const empty = {
+        activeQuote: null as string | null,
+        activeOccurrence: null as number | null,
+        activeQuotePartialGroups: false,
+        activeQuoteCoveredVerses: EMPTY_COVERED_VERSES,
+      };
+      if (!data) return empty;
+      if (activeNoteId) {
+        const r = data.tn.find((row) => row.id === activeNoteId);
+        if (!r) return empty;
+        const covered = noteCoveredVerses(r);
+        return {
+          activeQuote: r.quote ?? null,
+          activeOccurrence: r.occurrence ?? null,
+          activeQuotePartialGroups: covered.length > 1,
+          activeQuoteCoveredVerses: covered,
+        };
+      }
+      if (activeWordId) {
+        const r = data.twl.find((row) => row.id === activeWordId);
+        return {
+          activeQuote: r?.orig_words ?? null,
+          activeOccurrence: r?.occurrence ?? null,
+          activeQuotePartialGroups: false,
+          activeQuoteCoveredVerses: r ? [r.verse] : EMPTY_COVERED_VERSES,
+        };
+      }
+      return empty;
+    }, [activeNoteId, activeWordId, data]);
 
   // Reorder "stoplight": while a note is dragged (or for ~3s after an arrow
   // move) ResourceColumn reports the moved note's candidate neighbours; we
@@ -3503,6 +3535,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeVerse={activeVerse}
           activeNoteQuote={activeQuote}
           activeNoteOccurrence={activeOccurrence}
+          activeNoteQuotePartialGroups={activeQuotePartialGroups}
+          activeNoteCoveredVerses={activeQuoteCoveredVerses}
           reorderHighlight={reorderHighlight}
           mode={mode}
           enabledVersions={displayedVersions}

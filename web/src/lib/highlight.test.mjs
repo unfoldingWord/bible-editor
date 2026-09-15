@@ -8,6 +8,7 @@
 
 import {
   collectSourceWords,
+  findSourceHighlights,
   findTargetHighlights,
   isPaintableHtml,
   leadingBreakClass,
@@ -692,6 +693,43 @@ const JOIN = "⁠";
   assert(
     editable.includes("\\ts\\*</span> "),
     `the \\ts\\* chip carries the same trailing space as the baseline (got ${JSON.stringify(editable)})`,
+  );
+}
+
+// --- 28. Spanning TN quote ("A & B"): per-group match lights only groups
+// present in THIS verse. Singleton typos stay dark (partialGroups off).
+{
+  const v11 = [src("שַׁאֲנַ֣ן"), src("מוֹאָ֔ב"), src("מִנְּעוּרָ֑יו")];
+  const v12 = [src("לָכֵ֛ן"), src("הִנֵּֽה"), src("יָמִ֥ים")];
+  const spanQuote = "שַׁאֲנַ֣ן מוֹאָ֔ב מִנְּעוּרָ֑יו & לָכֵ֛ן הִנֵּֽה יָמִ֥ים";
+  const pasteQuote = "שַׁאֲנַ֣ן מוֹאָ֔ב מִנְּעוּרָ֑יו\nלָכֵ֛ן הִנֵּֽה יָמִ֥ים";
+
+  const lit11 = [...findSourceHighlights(v11, spanQuote, 1, true)].map((x) => x.split("|")[0]);
+  const lit12 = [...findSourceHighlights(v12, spanQuote, 1, true)].map((x) => x.split("|")[0]);
+  assert(
+    lit11.length === 3 && lit11.includes("שַׁאֲנַ֣ן") && !lit11.includes("לָכֵ֛ן"),
+    `v11 lights its group only (got ${JSON.stringify(lit11)})`,
+  );
+  assert(
+    lit12.length === 3 && lit12.includes("לָכֵ֛ן") && !lit12.includes("מוֹאָ֔ב"),
+    `v12 lights its group only (got ${JSON.stringify(lit12)})`,
+  );
+
+  const paste12 = [...findSourceHighlights(v12, pasteQuote, 1, true)].map((x) => x.split("|")[0]);
+  assert(
+    paste12.length === 3 && paste12.includes("יָמִ֥ים"),
+    `newline-separated paste lights v12 group (got ${JSON.stringify(paste12)})`,
+  );
+
+  const typo = "שַׁאֲנַ֣ן מוֹאָ֔ב ZZZ מִנְּעוּרָ֑יו";
+  assert(
+    findSourceHighlights(v11, typo, 1, false).size === 0,
+    "singleton typo with partialGroups off stays dark",
+  );
+  const soft = [...findSourceHighlights(v11, typo, 1, true)].map((x) => x.split("|")[0]);
+  assert(
+    soft.length === 0,
+    `partialGroups still requires full groups (typo group must not soft-match; got ${JSON.stringify(soft)})`,
   );
 }
 

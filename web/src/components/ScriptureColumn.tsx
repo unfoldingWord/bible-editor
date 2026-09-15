@@ -61,6 +61,13 @@ interface Props {
   activeVerse: number;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  // Bridged TN refs ("48:11-12"): match each `&`/newline quote group per
+  // verse so both halves highlight. False for singleton notes / TWL.
+  activeNoteQuotePartialGroups?: boolean;
+  // Verses covered by the active TN ref. Used with partialGroups so a
+  // spanning quote paints only 11+12, not every chapter verse that
+  // happens to share a Hebrew word.
+  activeNoteCoveredVerses?: readonly number[];
   // Transient reorder "stoplight": while a note is dragged (or for ~3s after an
   // arrow move) the active verse also lights the moved note's candidate
   // predecessor (green underline) and successor (red overline) on channels
@@ -191,6 +198,7 @@ const EMPTY_COLUMN: Record<number, VerseDto> = {};
 
 // Stable zero-counts for a verse with no threads (see NoteCard for the twin).
 const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
+const EMPTY_COVERED: readonly number[] = [];
 
 const INTRO_TOOLTIP =
   "Chapter intro — chapter-level translation notes, Psalm superscriptions (\\d), and the paragraph / poetry markers that introduce verse 1.";
@@ -213,6 +221,8 @@ function ScriptureColumnInner({
   activeVerse,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeNoteQuotePartialGroups = false,
+  activeNoteCoveredVerses = EMPTY_COVERED,
   reorderHighlight,
   mode,
   enabledVersions,
@@ -606,6 +616,7 @@ function ScriptureColumnInner({
             isHebrew={isHebrew}
             activeNoteQuote={activeNoteQuote}
             activeNoteOccurrence={activeNoteOccurrence}
+            activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
             reorderHighlight={reorderHighlight ?? null}
             lexiconMap={lexiconMap}
             twl={twl}
@@ -638,6 +649,8 @@ function ScriptureColumnInner({
               activeVerse={activeVerse}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
+              activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
+              activeNoteCoveredVerses={activeNoteCoveredVerses}
               reorderHighlight={reorderHighlight ?? null}
               activeSourceContent={activeSourceContent}
               scrollNonce={scrollNonce}
@@ -679,6 +692,8 @@ function ScriptureColumnInner({
                 rtl={v === "UHB"}
                 activeNoteQuote={activeNoteQuote}
                 activeNoteOccurrence={activeNoteOccurrence}
+                activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
+                activeNoteCoveredVerses={activeNoteCoveredVerses}
                 reorderHighlight={reorderHighlight ?? null}
                 activeSourceContent={activeSourceContent}
                 scrollNonce={scrollNonce}
@@ -738,6 +753,8 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     a.activeVerse === b.activeVerse &&
     a.activeNoteQuote === b.activeNoteQuote &&
     a.activeNoteOccurrence === b.activeNoteOccurrence &&
+    a.activeNoteQuotePartialGroups === b.activeNoteQuotePartialGroups &&
+    a.activeNoteCoveredVerses === b.activeNoteCoveredVerses &&
     a.reorderHighlight === b.reorderHighlight &&
     a.mode === b.mode &&
     a.enabledVersions === b.enabledVersions &&
@@ -789,6 +806,7 @@ function StackedBody({
   isHebrew,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeNoteQuotePartialGroups = false,
   reorderHighlight,
   lexiconMap,
   twl,
@@ -815,6 +833,7 @@ function StackedBody({
   isHebrew: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  activeNoteQuotePartialGroups?: boolean;
   reorderHighlight: ReorderHighlight | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   twl: TwlRow[];
@@ -873,9 +892,10 @@ function StackedBody({
           const ro = reorderHighlight;
           const aQuote = ro?.movedQuote ?? activeNoteQuote;
           const aOcc = ro?.movedQuote ? ro.movedOccurrence : activeNoteOccurrence;
-          const ultHL = highlightsFor("ULT", ultV?.content, aQuote, aOcc, uhbV?.content);
-          const ustHL = highlightsFor("UST", ustV?.content, aQuote, aOcc, uhbV?.content);
-          const uhbHL = highlightsFor(uhbLabel, uhbV?.content, aQuote, aOcc);
+          const partial = !ro?.movedQuote && activeNoteQuotePartialGroups;
+          const ultHL = highlightsFor("ULT", ultV?.content, aQuote, aOcc, uhbV?.content, partial);
+          const ustHL = highlightsFor("UST", ustV?.content, aQuote, aOcc, uhbV?.content, partial);
+          const uhbHL = highlightsFor(uhbLabel, uhbV?.content, aQuote, aOcc, undefined, partial);
           // Reorder stoplight: the moved note's candidate neighbours, resolved
           // per version (ULT/UST OL-anchored on UHB, like the active set).
           // Undefined unless a drag / hover / recent arrow-move is in flight.
