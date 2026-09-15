@@ -330,8 +330,8 @@ const Row = memo(function Row({
             }}
             sx={{
               fontFamily: "monospace",
-              fontSize: 10,
-              height: 20,
+              fontSize: 11,
+              height: 24,
               color: isDirty ? "warning.main" : "text.secondary",
               borderColor: isDirty ? "warning.main" : "divider",
               fontWeight: isDirty ? 600 : 400,
