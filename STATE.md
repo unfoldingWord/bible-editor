@@ -83,8 +83,13 @@ Highlights that bite repeatedly:
   effect must be keyed on a one-shot navigation token, never on `activeVerse`/`onSelectVerse` (Shell passes a
   fresh arrow every render, so any dep on it re-fires the effect on the re-render a manual verse click causes and
   snaps the user back to the match), and the typed query must be debounced and only *peek* (scroll) at the
-  nearest hit — only explicit Enter/next may promote the match verse to the editing focus.
-  `tests/concurrency/s12-find-edit-flow.spec.ts` locks all three in through the real UI.
+  nearest hit — only explicit Enter/next may promote the match verse to the editing focus (the note branch
+  too: a TN hit in another verse can only be shown by activating that verse, so a peek skips it). The one-shot
+  token must also be marked consumed — `ScriptureColumn` is not remounted on a rows↔columns toggle, so an
+  effect keyed on `[findNav, mode]` replays the last activation. And a "focus the box on open" flag must be a
+  state nonce, not a ref read in render: `setFindOpen(true)` on an already-open bar bails out, so Ctrl/Cmd+F
+  after a chapter-change remount silently did nothing. `tests/concurrency/s12-find-edit-flow.spec.ts` locks
+  these in through the real UI.
 
 - **An OPENING quote/bracket must be stored glued to the word that FOLLOWS it, never as the trailing text of the
   preceding `\zaln` milestone.** usfm-js puts every `\zaln-s` on its own line, so `\w say\w*, ‘\zaln-e\*` renders on

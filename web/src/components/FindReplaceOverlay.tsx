@@ -60,6 +60,12 @@ const FIND_DEBOUNCE_MS = 180;
 // of keeping whatever index prev/next had reached for the previous query.
 type PendingNav = { activate: boolean; nearest: boolean };
 
+// The prev/next IconButtons sit inside a disabled-wrapper <span>, so MUI's
+// Tooltip stamps its derived aria-label on the span, not the button — give the
+// buttons the same string explicitly (repo convention: label === tooltip).
+const PREV_TITLE = "previous match (Shift+Enter)";
+const NEXT_TITLE = "next match (Enter)";
+
 export interface FindMatch {
   chapter: number;
   verse: number;
@@ -168,11 +174,13 @@ interface Props {
   // hit at or after it (falling back to the first hit in the book) so typing
   // never yanks the user from where they are reading to the top of the book.
   activeVerse?: number;
-  // Focus + select the query input when the overlay opens. Off for the
-  // involuntary remount a chapter change forces while Find is already open —
-  // stealing the caret out of a verse cell there is exactly the "jumps" a
-  // user feels.
-  autoFocus?: boolean;
+  // Focus + select the query input whenever this changes to a non-zero value
+  // — the caller bumps it on each user gesture that opens or re-summons Find
+  // (so Ctrl/Cmd+F while already open still lands in the box). Left at 0 by
+  // the involuntary remount a chapter change forces while Find is already
+  // open — stealing the caret out of a verse cell there is exactly the
+  // "jumps" a user feels.
+  focusSeq?: number;
   // Lift the query state up so VerseCell can paint inline marks alongside the
   // existing note-quote highlights.
   onQueryChange: (
@@ -223,7 +231,7 @@ export function FindReplaceOverlay({
   book,
   activeChapter,
   activeVerse,
-  autoFocus = true,
+  focusSeq = 1,
   chapters,
   chapterList,
   onLoadChapter,
@@ -277,6 +285,11 @@ export function FindReplaceOverlay({
   // External content edits never set this, so the user isn't yanked away
   // while they're typing. (prev/next navigate directly, not through here.)
   const wantsScrollRef = useRef<PendingNav | null>(null);
+  // True while the current result has only been peeked at (see goNext).
+  const peekedRef = useRef(false);
+  // Enter pressed inside the debounce window: flush the typed text AND treat
+  // the landing as explicit navigation, so one Enter searches and goes there.
+  const enterPendingRef = useRef(false);
 
   // Flip a scope checkbox. Refuse to turn the last one off (the box would
   // search nothing). Treat a scope change as user navigation so results settle
@@ -299,11 +312,11 @@ export function FindReplaceOverlay({
   // Focus the find input when the overlay opens on a user gesture (Ctrl/Cmd+F,
   // toolbar button) — not when a chapter change remounts it mid-edit.
   useEffect(() => {
-    if (open && autoFocus) {
+    if (open && focusSeq > 0) {
       findInputRef.current?.focus();
       findInputRef.current?.select();
     }
-  }, [open, autoFocus]);
+  }, [open, focusSeq]);
 
   // Clear note-highlight state when the overlay unmounts (find closed) — the
   // conditional render means the `null` branches of the lift effects won't fire
@@ -319,14 +332,21 @@ export function FindReplaceOverlay({
   // Push query down to the caller so verse cells can paint match marks.
   // Any change to the search inputs counts as user navigation — once the
   // new matches settle, scroll to the first hit.
+  const queryEffectRanRef = useRef(false);
   useEffect(() => {
     // A new query is user navigation regardless of scope — flag the scroll
     // BEFORE the Bible-scope early return so a TN-only search (Bible unchecked,
     // TN checked) still auto-jumps to its first note hit. Only suppress when
-    // there's nothing to search.
-    if (open && query && (scope.bible || scope.tn)) {
-      wantsScrollRef.current = { activate: false, nearest: true };
+    // there's nothing to search — and on the very first run: a query seeded
+    // from the persisted draft (the chapter-change remount) is not a new
+    // search, so the view stays where the user navigated to instead of
+    // scrolling off to the nearest leftover hit.
+    const firstRun = !queryEffectRanRef.current;
+    queryEffectRanRef.current = true;
+    if (open && query && (scope.bible || scope.tn) && !firstRun) {
+      wantsScrollRef.current = { activate: enterPendingRef.current, nearest: true };
     }
+    enterPendingRef.current = false;
     // Only paint scripture cells when the Bible scope is on — TN-only searches
     // shouldn't light up verse text.
     if (!open || !query || !scope.bible) {
@@ -462,10 +482,17 @@ export function FindReplaceOverlay({
       onScrollToMatch(null);
       return;
     }
+    peekedRef.current = !activate;
     if (r.kind === "bible") {
       onScrollToMatch(r.match, { activate });
     } else {
       onScrollToMatch(null);
+      // The resource column only shows the active verse's notes, so
+      // navigating to a note in another verse necessarily changes the active
+      // verse. A peek (typing) must not do that — it only focuses the note
+      // when the hit is already in the verse the user is on; otherwise the
+      // count updates and Enter takes them there.
+      if (!activate && (r.match.chapter !== activeChapter || r.match.verse !== activeVerse)) return;
       onScrollToNoteMatch(r.match.chapter, r.match.verse, r.match.noteId);
     }
   }
@@ -509,14 +536,26 @@ export function FindReplaceOverlay({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [results, activeIdx, onScrollToMatch]);
 
+  // The active result was only peeked at (typing / scope change scrolled it
+  // into view without activating). The first explicit prev/next then commits
+  // to THAT hit — the one the user sees highlighted — instead of stepping
+  // past it to a neighbour they never visited.
   const goPrev = () => {
     if (results.length === 0) return;
+    if (peekedRef.current) {
+      navTo(activeIdx);
+      return;
+    }
     const next = (activeIdx - 1 + results.length) % results.length;
     setActiveIdx(next);
     navTo(next);
   };
   const goNext = () => {
     if (results.length === 0) return;
+    if (peekedRef.current) {
+      navTo(activeIdx);
+      return;
+    }
     const next = (activeIdx + 1) % results.length;
     setActiveIdx(next);
     navTo(next);
@@ -797,10 +836,12 @@ export function FindReplaceOverlay({
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
-              // Enter inside the debounce window means "search now": flush the
-              // typed text and let the reshape land on the nearest hit, rather
-              // than stepping through the previous query's stale results.
+              // Enter inside the debounce window means "search now and go
+              // there": flush the typed text and let the reshape land on —
+              // and activate — the nearest hit, rather than stepping through
+              // the previous query's stale results.
               if (find !== query) {
+                enterPendingRef.current = true;
                 setQuery(find);
                 return;
               }
@@ -911,11 +952,11 @@ export function FindReplaceOverlay({
             opacity: results.length === 0 ? 0.45 : 1,
           }}
         >
-          <Tooltip title="previous match (Shift+Enter)">
+          <Tooltip title={PREV_TITLE}>
             <span>
               <IconButton
                 size="small"
-                aria-label="previous match"
+                aria-label={PREV_TITLE}
                 onClick={goPrev}
                 disabled={results.length === 0}
                 sx={{
@@ -933,11 +974,11 @@ export function FindReplaceOverlay({
               </IconButton>
             </span>
           </Tooltip>
-          <Tooltip title="next match (Enter)">
+          <Tooltip title={NEXT_TITLE}>
             <span>
               <IconButton
                 size="small"
-                aria-label="next match"
+                aria-label={NEXT_TITLE}
                 onClick={goNext}
                 disabled={results.length === 0}
                 sx={{
@@ -985,7 +1026,7 @@ export function FindReplaceOverlay({
           </Tooltip>
         )}
         <Tooltip title="close (Esc)">
-          <IconButton size="small" aria-label="close find" onClick={onClose}>
+          <IconButton size="small" onClick={onClose}>
             <CloseIcon fontSize="small" />
           </IconButton>
         </Tooltip>

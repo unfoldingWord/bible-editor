@@ -266,13 +266,14 @@ function ScriptureColumnInner({
   // work) — only replace is a hard freeze, since the writes would appear to
   // work and then fail (423) for every match. FindReplaceOverlay itself
   // disables its replace controls when `bookLocked` is set; find stays open.
-  // True once THIS mount opened Find on a user gesture (Ctrl/Cmd+F, toolbar
-  // button). A remount that reseeds `findOpen` from sessionStorage (chapter
-  // change) leaves it false, so the overlay doesn't steal focus from the
+  // Bumped on every user gesture that opens (or re-summons) Find — Ctrl/Cmd+F,
+  // the toolbar button — so the overlay focuses its input each time, even when
+  // it is already open. A remount that reseeds `findOpen` from sessionStorage
+  // (chapter change) starts at 0, so the overlay doesn't steal focus from the
   // verse the user is editing just because the chapter rolled over.
-  const findOpenedByUserRef = useRef(false);
+  const [findFocusSeq, setFindFocusSeq] = useState(0);
   const openFind = useCallback(() => {
-    findOpenedByUserRef.current = true;
+    setFindFocusSeq((s) => s + 1);
     setFindOpen(true);
     saveFindOpen(book, true);
   }, [book]);
@@ -280,15 +281,14 @@ function ScriptureColumnInner({
   // Set only when the overlay reports a user-initiated navigation; the
   // BookView's scroll effect (book mode) and the bodyRef scroll effect
   // (stacked/columns) key off this so external content changes don't yank
-  // the user to the next match. `seq` makes every navigation a fresh object
-  // so the scroll effect runs once per request and never again — it must
-  // NOT re-fire when the user later clicks a different verse (that used to
-  // snap them straight back to the match). `activate` is set for explicit
+  // the user to the next match. Every navigation stores a fresh object so
+  // the scroll effect runs once per request and never again — it must NOT
+  // re-fire when the user later clicks a different verse (that used to snap
+  // them straight back to the match). `activate` is set for explicit
   // prev/next; the auto-jump while typing only peeks (scrolls) so the
   // active verse — and the editing focus with it — stays where the user
   // left it.
-  const findNavSeqRef = useRef(0);
-  const [findNav, setFindNav] = useState<{ match: FindMatch; activate: boolean; seq: number } | null>(null);
+  const [findNav, setFindNav] = useState<{ match: FindMatch; activate: boolean } | null>(null);
   const findScrollTarget = findNav?.match ?? null;
 
   // Ctrl/Cmd+F opens the find overlay in any mode. Esc inside the
@@ -319,8 +319,7 @@ function ScriptureColumnInner({
   // Stable callback identities so the overlay's effect deps don't churn.
   const onFindQueryChange = useCallback((q: FindQuery | null) => setFindQuery(q), []);
   const onFindScrollToMatch = useCallback((m: FindMatch | null, opts?: { activate?: boolean }) => {
-    findNavSeqRef.current += 1;
-    setFindNav(m ? { match: m, activate: !!opts?.activate, seq: findNavSeqRef.current } : null);
+    setFindNav(m ? { match: m, activate: !!opts?.activate } : null);
   }, []);
 
   // Synthesize a one-chapter cache for stacked/columns modes so the
@@ -379,15 +378,22 @@ function ScriptureColumnInner({
   // arrow on every render, so keeping it (or activeVerse) in the deps made
   // this re-fire on the very re-render a manual verse click causes and pull
   // the user straight back to the match. In stacked mode an explicit
-  // prev/next promotes the match
-  // verse to "active" so its full editable card expands; the active-verse
+  // prev/next promotes the match verse to "active" so its full editable
+  // card expands; the active-verse
   // effect below then scrolls the expanded card into view. The auto-jump
   // while typing only scrolls the (still inactive, but visible and
   // highlighted) row into view.
   const findNavCtxRef = useRef({ activeVerse, chapter, onSelectVerse });
   findNavCtxRef.current = { activeVerse, chapter, onSelectVerse };
+  // The token stays in state until the next navigation, so remember which one
+  // we've acted on — otherwise a rows↔columns toggle (this column is NOT
+  // remounted on a mode change) would replay the last activation and snap
+  // the user back to a match they left minutes ago.
+  const consumedFindNavRef = useRef<typeof findNav>(null);
   useEffect(() => {
     if (!findNav || mode === "book") return;
+    if (consumedFindNavRef.current === findNav) return;
+    consumedFindNavRef.current = findNav;
     const { match, activate } = findNav;
     const ctx = findNavCtxRef.current;
     if (match.chapter !== ctx.chapter) return;
@@ -572,7 +578,7 @@ function ScriptureColumnInner({
               book={book}
               activeChapter={chapter}
               activeVerse={activeVerse}
-              autoFocus={findOpenedByUserRef.current}
+              focusSeq={findFocusSeq}
               chapters={overlayChapters}
               chapterList={overlayChapterList}
               onLoadChapter={overlayLoadChapter}
