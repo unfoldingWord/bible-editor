@@ -1568,7 +1568,7 @@ function NoteCardInner({
                 e.stopPropagation();
                 setRefMenuAnchor(e.currentTarget);
               }}
-              sx={{ fontFamily: "monospace", fontSize: 11, height: 22, color: "text.secondary" }}
+              sx={{ fontFamily: "monospace", fontSize: 11, height: 24, color: "text.secondary" }}
             />
           </Tooltip>
         ) : (
@@ -1611,7 +1611,7 @@ function NoteCardInner({
             sx={{
               fontFamily: "monospace",
               fontSize: 11,
-              height: 22,
+              height: 24,
               color: hasRowDiff ? "warning.main" : "text.secondary",
               borderColor: hasRowDiff ? "warning.main" : "divider",
               fontWeight: hasRowDiff ? 600 : 400,
@@ -1628,7 +1628,7 @@ function NoteCardInner({
               sx={{
                 fontFamily: "monospace",
                 fontSize: 11,
-                height: 22,
+                height: 24,
                 color: "secondary.main",
                 borderColor: "secondary.main",
                 "& .MuiChip-icon": { color: "secondary.main", ml: 0.5, mr: -0.25 },
@@ -1717,7 +1717,7 @@ function NoteCardInner({
               size="small"
               color="default"
               variant="outlined"
-              sx={{ height: 22, fontSize: 11, color: "text.secondary", borderColor: "divider" }}
+              sx={{ height: 24, fontSize: 11, color: "text.secondary", borderColor: "divider" }}
             />
             <Tooltip title="restore this note (otherwise removed tonight)">
               <IconButton size="small" onClick={onRestore} color="primary" sx={{ p: 0.25 }}>
