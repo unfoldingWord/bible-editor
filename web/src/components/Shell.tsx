@@ -62,7 +62,13 @@ import { buildVerseIndex, concatSourceRange, formatVerseLabel, noteCoveredVerses
 import { runSaveChain } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
-import { buildQuoteFromSelection, selectionFromQuote } from "../lib/quoteBuilder";
+import {
+  buildQuoteFromSegments,
+  selectionFromSegments,
+  selectionFromQuote,
+  verseScopedKey,
+  type QuoteBuildSegment,
+} from "../lib/quoteBuilder";
 import { resolveSpanToSource } from "../lib/twlResolve";
 import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
@@ -115,6 +121,28 @@ function buildAlignerSlice(sourceData: ChapterPayload, verse: number, bibleVersi
       : sourceData.verses[sourceLabel]?.[rangeStart] ?? null;
   const twlForVerse = sourceData.twl.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd);
   return { sourceLabel, targetVerse, sourceVerse, twlForVerse, rangeStart, rangeEnd };
+}
+
+// Bundle UHB(/UGNT) + ULT + UST verseObjects for every verse a quote-build
+// target covers. TN uses noteCoveredVerses so a bridged ref ("48:11-12")
+// yields both; TWL never spans, so it is always a singleton at row.verse.
+function quoteBuildSegmentsForRow(
+  row: { verse: number; ref_raw?: string | null },
+  kind: "tn" | "twl",
+  verseIndexByVersion: Record<string, Record<number, VerseDto>>,
+): QuoteBuildSegment[] {
+  const verses = kind === "tn" ? noteCoveredVerses(row) : [row.verse];
+  const grab = (bv: string, verse: number): unknown[] | null => {
+    const dto = verseIndexByVersion[bv]?.[verse];
+    const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    return Array.isArray(vo) ? vo : null;
+  };
+  return verses.map((verse) => ({
+    verse,
+    uhb: grab("UHB", verse) ?? grab("UGNT", verse),
+    ult: grab("ULT", verse),
+    ust: grab("UST", verse),
+  }));
 }
 
 // Word-token count of one source verse row — text/punctuation nodes excluded,
@@ -1617,21 +1645,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       setQuoteBuildTarget(target);
       // Pre-seed the selection from the row's existing quote so the translator
       // can ADD to it instead of starting over. Resolves the stored quote +
-      // occurrence against the UHB/UGNT verse; an unresolvable quote (e.g.
-      // hand-typed English) yields an empty set and the picker starts fresh.
+      // occurrence against every verse the row covers (a bridged TN ref like
+      // "48:11-12" yields both verses); an unresolvable quote (e.g. hand-typed
+      // English) yields an empty set and the picker starts fresh.
       const row =
         target.kind === "tn"
           ? data?.tn.find((r) => r.id === target.id)
           : data?.twl.find((r) => r.id === target.id);
-      const uhb = row
-        ? verseIndexByVersion["UHB"]?.[row.verse] ?? verseIndexByVersion["UGNT"]?.[row.verse]
-        : undefined;
-      const verseObjects = (uhb?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+      const segments = row ? quoteBuildSegmentsForRow(row, target.kind, verseIndexByVersion) : [];
       // TN stores its source quote in `quote`; TWL stores it in `orig_words`.
       const existingQuote =
-        target.kind === "tn" ? (row as TnRow | undefined)?.quote : (row as TwlRow | undefined)?.orig_words;
+        target.kind === "tn"
+          ? (row as TnRow | undefined)?.quote
+          : (row as TwlRow | undefined)?.orig_words;
       setQuoteBuildSelectedKeys(
-        row ? selectionFromQuote(verseObjects, existingQuote, row.occurrence) : new Set(),
+        row ? selectionFromSegments(segments, existingQuote, row.occurrence) : new Set(),
       );
     },
     [data, verseIndexByVersion],
@@ -1657,9 +1685,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setQuoteBuildAnchor(document.querySelector<HTMLElement>(selector));
   }, [quoteBuildTarget]);
 
-  // Verse objects bundled for the picker — UHB always; ULT/UST may be
-  // absent for OT-only or NT-only deployments, so default to null and
-  // let the picker show an empty-state hint.
+  // Verse objects bundled for the picker — one segment per covered verse.
+  // Bridged TN refs ("48:11-12") contribute every verse in the span so the
+  // translator can pick Hebrew from either; TWL is always a singleton.
+  // UHB always preferred, UGNT as NT fallback; ULT/UST may be absent so the
+  // picker shows an empty-state hint for those rows.
   const quoteBuildContext = useMemo(() => {
     if (!quoteBuildTarget || !data) return null;
     const row =
@@ -1667,23 +1697,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         ? data.tn.find((r) => r.id === quoteBuildTarget.id)
         : data.twl.find((r) => r.id === quoteBuildTarget.id);
     if (!row) return null;
-    const grab = (bv: string): unknown[] | null => {
-      const dto = verseIndexByVersion[bv]?.[row.verse];
-      const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-      return Array.isArray(vo) ? vo : null;
-    };
     return {
-      verse: row.verse,
-      uhb: grab("UHB") ?? grab("UGNT"),
-      ult: grab("ULT"),
-      ust: grab("UST"),
+      segments: quoteBuildSegmentsForRow(row, quoteBuildTarget.kind, verseIndexByVersion),
     };
   }, [quoteBuildTarget, data, verseIndexByVersion]);
 
   // Materialize the in-flight quote-build selection into a row patch and
-  // fire the existing note save pipe. Pulls UHB verseObjects for the
-  // current verse — the buildQuoteFromSelection helper does the grouping
-  // and " & " join + occurrence calculation.
+  // fire the existing note save pipe. Builds per covered verse (so occurrence
+  // numbering stays per-verse) and joins sub-quotes with " & ".
   const commitQuoteBuild = useCallback(() => {
     if (!quoteBuildTarget || !data) return;
     const row =
@@ -1691,11 +1712,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         ? data.tn.find((r) => r.id === quoteBuildTarget.id)
         : data.twl.find((r) => r.id === quoteBuildTarget.id);
     if (!row) return;
-    const uhb = verseIndexByVersion["UHB"]?.[row.verse] ?? verseIndexByVersion["UGNT"]?.[row.verse];
-    const verseObjects =
-      (uhb?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-    if (!Array.isArray(verseObjects)) return;
-    const built = buildQuoteFromSelection(verseObjects, quoteBuildSelectedKeys);
+    const segments = quoteBuildSegmentsForRow(row, quoteBuildTarget.kind, verseIndexByVersion);
+    const built = buildQuoteFromSegments(segments, quoteBuildSelectedKeys);
     if (!built) return;
     // Only enqueue a save when the build actually changes the stored quote +
     // occurrence — re-running "build from source" over an unchanged selection
@@ -1838,8 +1856,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // the anchor effect pick the row up on the next render.
       if (!resolved || !resolved.confident || !resolved.orig_words) {
         setQuoteBuildTarget({ kind: "twl", id: created.id });
+        // Verse-scoped keys — the picker always scopes by verse so the same
+        // surface|occ in two verses of a bridged TN doesn't collide. TWL is
+        // single-verse, but the popper path is shared.
+        const seeded = selectionFromQuote(uhb, resolved?.orig_words, resolved?.occurrence);
         setQuoteBuildSelectedKeys(
-          selectionFromQuote(uhb, resolved?.orig_words, resolved?.occurrence),
+          new Set([...seeded].map((k) => verseScopedKey(verse, k))),
         );
       }
     },
@@ -4263,10 +4285,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           anchorEl={quoteBuildAnchor}
           book={book}
           chapter={chapter}
-          verse={quoteBuildContext.verse}
-          uhbVerseObjects={quoteBuildContext.uhb}
-          ultVerseObjects={quoteBuildContext.ult}
-          ustVerseObjects={quoteBuildContext.ust}
+          segments={quoteBuildContext.segments}
           lexiconMap={lexiconMap}
           selectedKeys={quoteBuildSelectedKeys}
           onToggleKey={toggleQuoteBuildWord}

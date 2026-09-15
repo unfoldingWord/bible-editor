@@ -598,7 +598,7 @@ export function findTargetHighlights(
   // milestones by (content, occurrence). Split-gloss duplicates share a key,
   // so every fragment of a discontinuous gloss lights up together.
   if (Array.isArray(sourceVerseObjects)) {
-    const olTokens = matchSourceTokens(sourceVerseObjects, quote, occurrence);
+    const olTokens = softMatchSourceGroups(sourceVerseObjects, quote, occurrence);
     if (olTokens.length > 0) {
       const olKeys = new Set(
         olTokens.map((t) => `${matchNorm(t.text)}|${t.surfaceOccurrence ?? t.occurrence}`),
@@ -828,6 +828,51 @@ export function matchSourceTokens(
   return chosen.map((i) => tokens[i]);
 }
 
+// Soft per-group fallback for cross-verse quotes. A bridged TN ref
+// ("48:11-12") stores one Quote whose `&`-groups live in different verses;
+// matching the FULL pattern against any single verse fails. When that
+// happens, still highlight whichever groups DO resolve here so the scripture
+// column isn't blank while the note is active. Kept OUT of matchSourceTokens
+// itself — the quote-builder pre-seed (selectionFromSegments) walks verses
+// greedily and must treat a partial match as a miss, or it would consume
+// later groups against the wrong verse.
+function softMatchSourceGroups(
+  verseObjects: unknown[],
+  quote: string,
+  occurrence: number,
+): WordToken[] {
+  const strict = matchSourceTokens(verseObjects, quote, occurrence);
+  if (strict.length > 0) return strict;
+  const groups = quoteGroups(quote);
+  if (groups.length <= 1) return [];
+  const tokens = collectBareWords(verseObjects);
+  if (tokens.length === 0) return [];
+  const wantOcc = Math.max(1, occurrence | 0);
+  const normGroups = groups.map((g) => g.map(matchNorm));
+  const normTokens = tokens.map((t) => matchNorm(t.text));
+  const union = new Set<number>();
+  for (let gi = 0; gi < normGroups.length; gi++) {
+    const g = normGroups[gi];
+    const groupMatches: number[][] = [];
+    for (let start = 0; start + g.length <= tokens.length; start++) {
+      let ok = true;
+      for (let wi = 0; wi < g.length; wi++) {
+        if (normTokens[start + wi] !== g[wi]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        groupMatches.push(Array.from({ length: g.length }, (_, wi) => start + wi));
+      }
+    }
+    const pick = gi === 0 ? groupMatches[wantOcc - 1] : groupMatches[0];
+    if (pick) for (const i of pick) union.add(i);
+  }
+  if (union.size === 0) return [];
+  return [...union].sort((a, b) => a - b).map((i) => tokens[i]);
+}
+
 // For UHB/UGNT: returns source-word keys that should be highlighted. Keys carry
 // RAW text — HebrewLine / renderHighlightedHTML read from the same tree.
 export function findSourceHighlights(
@@ -836,7 +881,7 @@ export function findSourceHighlights(
   occurrence: number,
 ): Set<HighlightKey> {
   const out = new Set<HighlightKey>();
-  for (const t of matchSourceTokens(verseObjects, quote, occurrence)) {
+  for (const t of softMatchSourceGroups(verseObjects, quote, occurrence)) {
     out.add(k(t.text, t.occurrence));
   }
   return out;

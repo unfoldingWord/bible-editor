@@ -29,16 +29,22 @@ import {
   Tooltip,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
-import { collectTargetTokens, buildQuoteFromSelection, tokenKey } from "../lib/quoteBuilder";
+import {
+  collectTargetTokens,
+  buildQuoteFromSegments,
+  tokenKey,
+  verseScopedKey,
+} from "../lib/quoteBuilder";
 import type { HighlightKey } from "../lib/highlight";
 import { collectSourceWords } from "../lib/highlight";
-import type { SourceAncestor, TargetToken } from "../lib/quoteBuilder";
+import type { QuoteBuildSegment, SourceAncestor, TargetToken } from "../lib/quoteBuilder";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
 import { isHebrewBook } from "../lib/sourceSearch";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 
-// Which row a shift-click range is anchored in. A range never spans rows.
+// Which row a shift-click range is anchored in. A range never spans rows OR
+// verses — multi-verse pickers keep each verse's chip list independent.
 type Row = "src" | "ult" | "ust";
 
 interface Props {
@@ -46,10 +52,10 @@ interface Props {
   anchorEl: HTMLElement | null;
   book: string;
   chapter: number;
-  verse: number;
-  uhbVerseObjects: unknown[] | null;
-  ultVerseObjects: unknown[] | null;
-  ustVerseObjects: unknown[] | null;
+  // One entry per verse the note covers. Singletons are length 1; a bridged
+  // TN ref like "48:11-12" hands over both verses so the translator can pick
+  // Hebrew from either. Selection keys are verse-scoped (see verseScopedKey).
+  segments: QuoteBuildSegment[];
   // Pre-loaded Strong's → lexicon entry map. Shell already maintains this
   // for the scripture column's HebrewLine hover tooltips; the picker
   // reuses it so the UHB chips show the same gloss/morphology card.
@@ -68,10 +74,7 @@ export function QuoteBuilderPopper({
   anchorEl,
   book,
   chapter,
-  verse,
-  uhbVerseObjects,
-  ultVerseObjects,
-  ustVerseObjects,
+  segments,
   lexiconMap,
   selectedKeys,
   onToggleKey,
@@ -79,89 +82,34 @@ export function QuoteBuilderPopper({
   onCancel,
   onCommit,
 }: Props) {
-  const uhbTokens = useMemo(() => collectUhbChips(uhbVerseObjects), [uhbVerseObjects]);
-  const ultTokens = useMemo(
-    () => collectTargetTokens(ultVerseObjects, uhbVerseObjects),
-    [ultVerseObjects, uhbVerseObjects],
-  );
-  const ustTokens = useMemo(
-    () => collectTargetTokens(ustVerseObjects, uhbVerseObjects),
-    [ustVerseObjects, uhbVerseObjects],
-  );
-
   // OT books read their source from UHB (Hebrew, RTL); NT books from UGNT
   // (Greek, LTR). Shell hands us whichever exists, so label and direction
   // derive from the book code rather than hardcoding Hebrew.
   const sourceIsHebrew = isHebrewBook(book);
   const sourceLabel = sourceIsHebrew ? "UHB" : "UGNT";
 
+  const verseLabel = useMemo(() => {
+    if (segments.length === 0) return "";
+    if (segments.length === 1) return String(segments[0].verse);
+    return `${segments[0].verse}–${segments[segments.length - 1].verse}`;
+  }, [segments]);
+
   // Preview of the would-be quote string. Re-runs cheaply on every toggle
   // since collectUhbChips / matchGroupsAt scan an in-memory tree.
   const preview = useMemo(
-    () => buildQuoteFromSelection(uhbVerseObjects, selectedKeys),
-    [uhbVerseObjects, selectedKeys],
+    () => buildQuoteFromSegments(segments, selectedKeys),
+    [segments, selectedKeys],
   );
 
   // Anchor for shift-click range selection — the last chip clicked without
-  // shift. Scoped to a row ("src" | "ult" | "ust") so a shift-click only
-  // extends a range within the same row it was started in. Reset whenever the
-  // picker re-targets a different verse so a stale index can't span the wrong
-  // token list.
-  const [anchor, setAnchor] = useState<{ row: Row; index: number } | null>(null);
+  // shift. Scoped to (verse, row) so a shift-click only extends a range
+  // within the same chip list it was started in. Reset whenever the picker
+  // re-targets a different span so a stale index can't span the wrong list.
+  const [anchor, setAnchor] = useState<{ verse: number; row: Row; index: number } | null>(null);
+  const segmentKey = segments.map((s) => s.verse).join(",");
   useEffect(() => {
     setAnchor(null);
-  }, [book, chapter, verse]);
-
-  // UHB/UGNT source row: plain click toggles one word; shift-click adds the
-  // inclusive range from the anchor to the clicked chip.
-  const handleSourceClick = (index: number, e: React.MouseEvent) => {
-    const tok = uhbTokens[index];
-    const key = tokenKey(tok.text, tok.occurrence);
-    if (e.shiftKey && anchor?.row === "src") {
-      const [lo, hi] = anchor.index <= index ? [anchor.index, index] : [index, anchor.index];
-      onSelectKeys(uhbTokens.slice(lo, hi + 1).map((t) => tokenKey(t.text, t.occurrence)));
-    } else {
-      onToggleKey(key);
-    }
-    setAnchor({ row: "src", index });
-  };
-
-  // ULT/UST target row: plain click toggles the clicked word's full source
-  // chain (handleEnglishClick); shift-click adds the union of source chains
-  // across the inclusive range from the anchor to the clicked chip.
-  const handleTargetClick = (
-    row: "ult" | "ust",
-    tokens: TargetToken[],
-    index: number,
-    e: React.MouseEvent,
-  ) => {
-    const tok = tokens[index];
-    if (tok.sources.length === 0) return;
-    if (e.shiftKey && anchor?.row === row) {
-      const [lo, hi] = anchor.index <= index ? [anchor.index, index] : [index, anchor.index];
-      onSelectKeys(tokens.slice(lo, hi + 1).flatMap((t) => t.sources.map((s) => s.key)));
-    } else {
-      handleEnglishClick(tok.sources);
-    }
-    setAnchor({ row, index });
-  };
-
-  const handleEnglishClick = (sources: SourceAncestor[]) => {
-    if (sources.length === 0) return;
-    // Compute current chain coverage. If every ancestor is already in the
-    // set, treat the click as "remove the chain"; otherwise add the
-    // missing pieces. Avoids the awkward middle state where one click adds
-    // some and the next click toggles them back individually.
-    // Keys are nfc-normalized via tokenKey() so they match what
-    // buildQuoteFromSelection's UhbWord lookup expects.
-    const keys = sources.map((a) => a.key);
-    const allPresent = keys.every((k) => selectedKeys.has(k));
-    for (const k of keys) {
-      const present = selectedKeys.has(k);
-      if (allPresent && present) onToggleKey(k);
-      else if (!allPresent && !present) onToggleKey(k);
-    }
-  };
+  }, [book, chapter, segmentKey]);
 
   return (
     <Popper
@@ -201,7 +149,7 @@ export function QuoteBuilderPopper({
               variant="caption"
               sx={{ fontFamily: "monospace", color: "primary.main", fontWeight: 700 }}
             >
-              Build quote · {book} {chapter}:{verse}
+              Build quote · {book} {chapter}:{verseLabel}
             </Typography>
             <Box sx={{ flex: 1 }} />
             <Typography variant="caption" color="text.secondary" sx={{ mr: 1 }}>
@@ -212,91 +160,24 @@ export function QuoteBuilderPopper({
             </IconButton>
           </Stack>
 
-          {/* Source row — UHB or UGNT */}
-          <Section label={sourceLabel} rtl={sourceIsHebrew}>
-            {uhbTokens.length === 0 ? (
-              <EmptyHint>no source words for this verse</EmptyHint>
-            ) : (
-              uhbTokens.map((tok, i) => {
-                // Always use nfc-normalized keys — UHB \w text drifts from
-                // zaln x-content in combining-mark order, so a raw
-                // `${text}|${occ}` comparison would miss cross-row matches.
-                const key = tokenKey(tok.text, tok.occurrence);
-                const selected = selectedKeys.has(key);
-                const src: SourceWord = {
-                  id: "",
-                  strong: tok.strong,
-                  lemma: tok.lemma,
-                  morph: tok.morph,
-                  occurrence: String(tok.occurrence),
-                  occurrences: String(tok.occurrences),
-                  content: tok.text,
-                };
-                return (
-                  <SourceChip
-                    key={`${key}|${tok.position}`}
-                    text={tok.text}
-                    occurrence={tok.occurrence}
-                    selected={selected}
-                    rtl={sourceIsHebrew}
-                    onClick={(e) => handleSourceClick(i, e)}
-                    lexiconBody={
-                      <SourceTooltipBody
-                        source={src}
-                        lex={lexiconMap.get(tok.strong) ?? null}
-                      />
-                    }
-                  />
-                );
-              })
-            )}
-          </Section>
-
-          {/* ULT row */}
-          <Section label="ULT">
-            {ultTokens.length === 0 ? (
-              <EmptyHint>no ULT alignment for this verse</EmptyHint>
-            ) : (
-              ultTokens.map((tok, i) => (
-                <TargetChip
-                  key={`ult|${tok.position}`}
-                  text={tok.text}
-                  occurrence={tok.occurrence}
-                  selected={chainSelected(tok.sources, selectedKeys)}
-                  hasChain={tok.sources.length > 0}
-                  onClick={(e) => handleTargetClick("ult", ultTokens, i, e)}
-                  tooltip={
-                    tok.sources.length === 0
-                      ? "no Hebrew alignment for this word"
-                      : tok.sources.map((s) => s.content).join(" › ")
-                  }
-                />
-              ))
-            )}
-          </Section>
-
-          {/* UST row */}
-          <Section label="UST">
-            {ustTokens.length === 0 ? (
-              <EmptyHint>no UST alignment for this verse</EmptyHint>
-            ) : (
-              ustTokens.map((tok, i) => (
-                <TargetChip
-                  key={`ust|${tok.position}`}
-                  text={tok.text}
-                  occurrence={tok.occurrence}
-                  selected={chainSelected(tok.sources, selectedKeys)}
-                  hasChain={tok.sources.length > 0}
-                  onClick={(e) => handleTargetClick("ust", ustTokens, i, e)}
-                  tooltip={
-                    tok.sources.length === 0
-                      ? "no Hebrew alignment for this word"
-                      : tok.sources.map((s) => s.content).join(" › ")
-                  }
-                />
-              ))
-            )}
-          </Section>
+          {segments.map((seg) => (
+            <VerseBlock
+              key={seg.verse}
+              verse={seg.verse}
+              showVerseHeader={segments.length > 1}
+              sourceLabel={sourceLabel}
+              sourceIsHebrew={sourceIsHebrew}
+              uhbVerseObjects={seg.uhb}
+              ultVerseObjects={seg.ult}
+              ustVerseObjects={seg.ust}
+              lexiconMap={lexiconMap}
+              selectedKeys={selectedKeys}
+              anchor={anchor}
+              setAnchor={setAnchor}
+              onToggleKey={onToggleKey}
+              onSelectKeys={onSelectKeys}
+            />
+          ))}
 
           <Divider />
 
@@ -344,6 +225,209 @@ export function QuoteBuilderPopper({
         </Paper>
       </ClickAwayListener>
     </Popper>
+  );
+}
+
+function VerseBlock({
+  verse,
+  showVerseHeader,
+  sourceLabel,
+  sourceIsHebrew,
+  uhbVerseObjects,
+  ultVerseObjects,
+  ustVerseObjects,
+  lexiconMap,
+  selectedKeys,
+  anchor,
+  setAnchor,
+  onToggleKey,
+  onSelectKeys,
+}: {
+  verse: number;
+  showVerseHeader: boolean;
+  sourceLabel: string;
+  sourceIsHebrew: boolean;
+  uhbVerseObjects: unknown[] | null;
+  ultVerseObjects: unknown[] | null;
+  ustVerseObjects: unknown[] | null;
+  lexiconMap: Map<string, LexiconEntry | null>;
+  selectedKeys: Set<HighlightKey>;
+  anchor: { verse: number; row: Row; index: number } | null;
+  setAnchor: (a: { verse: number; row: Row; index: number } | null) => void;
+  onToggleKey: (key: HighlightKey) => void;
+  onSelectKeys: (keys: HighlightKey[]) => void;
+}) {
+  const uhbTokens = useMemo(() => collectUhbChips(uhbVerseObjects), [uhbVerseObjects]);
+  const ultTokens = useMemo(
+    () => collectTargetTokens(ultVerseObjects, uhbVerseObjects),
+    [ultVerseObjects, uhbVerseObjects],
+  );
+  const ustTokens = useMemo(
+    () => collectTargetTokens(ustVerseObjects, uhbVerseObjects),
+    [ustVerseObjects, uhbVerseObjects],
+  );
+
+  const scope = (key: HighlightKey) => verseScopedKey(verse, key);
+  const scopeSources = (sources: SourceAncestor[]) => sources.map((s) => scope(s.key));
+
+  // UHB/UGNT source row: plain click toggles one word; shift-click adds the
+  // inclusive range from the anchor to the clicked chip (same verse only).
+  const handleSourceClick = (index: number, e: React.MouseEvent) => {
+    const tok = uhbTokens[index];
+    const key = scope(tokenKey(tok.text, tok.occurrence));
+    if (e.shiftKey && anchor?.verse === verse && anchor.row === "src") {
+      const [lo, hi] = anchor.index <= index ? [anchor.index, index] : [index, anchor.index];
+      onSelectKeys(
+        uhbTokens.slice(lo, hi + 1).map((t) => scope(tokenKey(t.text, t.occurrence))),
+      );
+    } else {
+      onToggleKey(key);
+    }
+    setAnchor({ verse, row: "src", index });
+  };
+
+  // ULT/UST target row: plain click toggles the clicked word's full source
+  // chain; shift-click adds the union of source chains across the range.
+  const handleTargetClick = (
+    row: "ult" | "ust",
+    tokens: TargetToken[],
+    index: number,
+    e: React.MouseEvent,
+  ) => {
+    const tok = tokens[index];
+    if (tok.sources.length === 0) return;
+    if (e.shiftKey && anchor?.verse === verse && anchor.row === row) {
+      const [lo, hi] = anchor.index <= index ? [anchor.index, index] : [index, anchor.index];
+      onSelectKeys(tokens.slice(lo, hi + 1).flatMap((t) => scopeSources(t.sources)));
+    } else {
+      handleEnglishClick(tok.sources);
+    }
+    setAnchor({ verse, row, index });
+  };
+
+  const handleEnglishClick = (sources: SourceAncestor[]) => {
+    if (sources.length === 0) return;
+    // Compute current chain coverage. If every ancestor is already in the
+    // set, treat the click as "remove the chain"; otherwise add the
+    // missing pieces. Avoids the awkward middle state where one click adds
+    // some and the next click toggles them back individually.
+    const keys = scopeSources(sources);
+    const allPresent = keys.every((k) => selectedKeys.has(k));
+    for (const k of keys) {
+      const present = selectedKeys.has(k);
+      if (allPresent && present) onToggleKey(k);
+      else if (!allPresent && !present) onToggleKey(k);
+    }
+  };
+
+  return (
+    <Box>
+      {showVerseHeader && (
+        <Typography
+          variant="caption"
+          sx={{
+            display: "block",
+            px: 1.5,
+            pt: 1,
+            pb: 0.25,
+            fontFamily: "monospace",
+            fontWeight: 700,
+            color: "text.secondary",
+            bgcolor: "action.hover",
+            borderBottom: "1px solid",
+            borderColor: "divider",
+          }}
+        >
+          v{verse}
+        </Typography>
+      )}
+
+      {/* Source row — UHB or UGNT */}
+      <Section label={sourceLabel} rtl={sourceIsHebrew}>
+        {uhbTokens.length === 0 ? (
+          <EmptyHint>no source words for this verse</EmptyHint>
+        ) : (
+          uhbTokens.map((tok, i) => {
+            // Always use nfc-normalized keys — UHB \w text drifts from
+            // zaln x-content in combining-mark order, so a raw
+            // `${text}|${occ}` comparison would miss cross-row matches.
+            const key = scope(tokenKey(tok.text, tok.occurrence));
+            const selected = selectedKeys.has(key);
+            const src: SourceWord = {
+              id: "",
+              strong: tok.strong,
+              lemma: tok.lemma,
+              morph: tok.morph,
+              occurrence: String(tok.occurrence),
+              occurrences: String(tok.occurrences),
+              content: tok.text,
+            };
+            return (
+              <SourceChip
+                key={`${key}|${tok.position}`}
+                text={tok.text}
+                occurrence={tok.occurrence}
+                selected={selected}
+                rtl={sourceIsHebrew}
+                onClick={(e) => handleSourceClick(i, e)}
+                lexiconBody={
+                  <SourceTooltipBody
+                    source={src}
+                    lex={lexiconMap.get(tok.strong) ?? null}
+                  />
+                }
+              />
+            );
+          })
+        )}
+      </Section>
+
+      {/* ULT row */}
+      <Section label="ULT">
+        {ultTokens.length === 0 ? (
+          <EmptyHint>no ULT alignment for this verse</EmptyHint>
+        ) : (
+          ultTokens.map((tok, i) => (
+            <TargetChip
+              key={`ult|${verse}|${tok.position}`}
+              text={tok.text}
+              occurrence={tok.occurrence}
+              selected={chainSelected(scopeSources(tok.sources), selectedKeys)}
+              hasChain={tok.sources.length > 0}
+              onClick={(e) => handleTargetClick("ult", ultTokens, i, e)}
+              tooltip={
+                tok.sources.length === 0
+                  ? "no Hebrew alignment for this word"
+                  : tok.sources.map((s) => s.content).join(" › ")
+              }
+            />
+          ))
+        )}
+      </Section>
+
+      {/* UST row */}
+      <Section label="UST">
+        {ustTokens.length === 0 ? (
+          <EmptyHint>no UST alignment for this verse</EmptyHint>
+        ) : (
+          ustTokens.map((tok, i) => (
+            <TargetChip
+              key={`ust|${verse}|${tok.position}`}
+              text={tok.text}
+              occurrence={tok.occurrence}
+              selected={chainSelected(scopeSources(tok.sources), selectedKeys)}
+              hasChain={tok.sources.length > 0}
+              onClick={(e) => handleTargetClick("ust", ustTokens, i, e)}
+              tooltip={
+                tok.sources.length === 0
+                  ? "no Hebrew alignment for this word"
+                  : tok.sources.map((s) => s.content).join(" › ")
+              }
+            />
+          ))
+        )}
+      </Section>
+    </Box>
   );
 }
 
@@ -496,11 +580,11 @@ function TargetChip({
 }
 
 function chainSelected(
-  sources: SourceAncestor[],
+  scopedKeys: HighlightKey[],
   selectedKeys: Set<HighlightKey>,
 ): boolean {
-  if (sources.length === 0) return false;
-  return sources.every((a) => selectedKeys.has(a.key));
+  if (scopedKeys.length === 0) return false;
+  return scopedKeys.every((k) => selectedKeys.has(k));
 }
 
 // The picker's UHB row, decorated from the SHARED source-word walk

@@ -97,6 +97,132 @@ export function selectionFromQuote(
   return out;
 }
 
+// ─── Multi-verse picker (bridged TN refs like "48:11-12") ─────────────────
+//
+// A spanning note still stores one Quote string, but its Hebrew may come from
+// more than one verse. The picker therefore keys selections as
+// `${verse}<US>${tokenKey}` so the same surface form at occurrence 1 in two
+// verses does not collide in the Set. On commit, each verse builds its own
+// sub-quote (preserving that verse's occurrence numbering / maqqef joins) and
+// the sub-quotes are joined with " & " — the same gap marker within-verse
+// discontinuous quotes already use.
+
+const VERSE_KEY_SEP = "\u001f";
+
+export function verseScopedKey(verse: number, key: HighlightKey): HighlightKey {
+  return `${verse}${VERSE_KEY_SEP}${key}`;
+}
+
+export function parseVerseScopedKey(
+  scoped: HighlightKey,
+): { verse: number; key: HighlightKey } | null {
+  const i = scoped.indexOf(VERSE_KEY_SEP);
+  if (i <= 0) return null;
+  const verse = parseInt(scoped.slice(0, i), 10);
+  if (!Number.isFinite(verse)) return null;
+  return { verse, key: scoped.slice(i + VERSE_KEY_SEP.length) };
+}
+
+export interface QuoteBuildSegment {
+  verse: number;
+  uhb: unknown[] | null;
+  ult: unknown[] | null;
+  ust: unknown[] | null;
+}
+
+// Gap-split a quote into contiguous word-group strings (joined with a single
+// space inside each group). Mirrors highlight.ts's quoteGroups shape but keeps
+// the group as a rebuildable sub-quote string for per-verse matching.
+function quoteGroupStrings(quote: string): string[] {
+  if (!quote) return [];
+  return quote
+    .split(/[&…]+|\.{3}/g)
+    .map((segment) =>
+      segment
+        .split(/[\s־]+/)
+        .map((w) => w.trim())
+        .filter((w) => w.length > 0)
+        .join(" "),
+    )
+    .filter((g) => g.length > 0);
+}
+
+// Pre-seed a multi-verse picker: walk covered verses in order and greedily
+// consume the longest leading run of `&`-groups that fully resolve in that
+// verse. The first verse that contributes uses `occurrence`; later verses
+// always match at occurrence 1 (subsequent groups are unique by construction
+// once earlier groups have been claimed).
+export function selectionFromSegments(
+  segments: QuoteBuildSegment[],
+  quote: string | null | undefined,
+  occurrence: number | null | undefined,
+): Set<HighlightKey> {
+  const out = new Set<HighlightKey>();
+  if (!quote || segments.length === 0) return out;
+  let remaining = quoteGroupStrings(quote);
+  if (remaining.length === 0) return out;
+  let firstContrib = true;
+  for (const seg of segments) {
+    if (remaining.length === 0) break;
+    if (!Array.isArray(seg.uhb)) continue;
+    let matched = false;
+    for (let n = remaining.length; n >= 1; n--) {
+      const subQuote = remaining.slice(0, n).join(" & ");
+      const occ = firstContrib ? (occurrence ?? 1) : 1;
+      const local = selectionFromQuote(seg.uhb, subQuote, occ);
+      if (local.size === 0) continue;
+      for (const k of local) out.add(verseScopedKey(seg.verse, k));
+      remaining = remaining.slice(n);
+      firstContrib = false;
+      matched = true;
+      break;
+    }
+    if (!matched) {
+      // This verse contributes nothing; keep trying later verses with the
+      // same remaining groups (discontinuous refs like "1:2,4").
+      continue;
+    }
+  }
+  return out;
+}
+
+// Build a Quote from a verse-scoped selection. Each segment that has selected
+// keys builds independently (so occurrence numbering stays per-verse), then
+// non-empty sub-quotes are joined with " & ". The stored Occurrence is the
+// first contributing segment's — Door43's Occurrence column describes the
+// leading phrase.
+export function buildQuoteFromSegments(
+  segments: QuoteBuildSegment[],
+  selectedKeys: Set<HighlightKey>,
+): BuiltQuote | null {
+  if (segments.length === 0 || selectedKeys.size === 0) return null;
+  const parts: BuiltQuote[] = [];
+  for (const seg of segments) {
+    if (!Array.isArray(seg.uhb)) continue;
+    const local = new Set<HighlightKey>();
+    for (const scoped of selectedKeys) {
+      const parsed = parseVerseScopedKey(scoped);
+      if (parsed) {
+        if (parsed.verse === seg.verse) local.add(parsed.key);
+      } else if (segments.length === 1) {
+        // Unscoped keys: only legal when the picker is single-verse (the
+        // legacy Shell path / unit tests). Multi-verse MUST scope or the
+        // same surface|occ in two verses would alias.
+        local.add(scoped);
+      }
+    }
+    if (local.size === 0) continue;
+    const built = buildQuoteFromSelection(seg.uhb, local);
+    if (built) parts.push(built);
+  }
+  if (parts.length === 0) return null;
+  if (parts.length === 1) return parts[0];
+  return {
+    quote: parts.map((p) => p.quote).join(" & "),
+    occurrence: parts[0].occurrence,
+  };
+}
+
 // Separator to place after `w` when rejoining it with the next word in the
 // same run. A maqqef in the trailing text wins (joined Hebrew word); anything
 // else is a plain space.
