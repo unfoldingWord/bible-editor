@@ -30,6 +30,17 @@ import { extractPlainText, isInFlowMarker, isTsMilestone } from "./importParsers
 import { parseRefOrderKey } from "./tsvFormat.ts";
 import { hasOpeningPunctInsideMilestone } from "./openingPunct.ts";
 
+// Lint checks only read their trees. Keep at most one row's parsed tree while
+// running the per-verse checks together; retaining a whole large book's trees
+// alongside D1's JSON strings can exceed a Worker's memory limit.
+let parsedRow: { row: VerseRow; json: string; value: unknown } | undefined;
+function parseLintVerse(row: VerseRow): unknown {
+  if (parsedRow?.row === row && parsedRow.json === row.content_json) return parsedRow.value;
+  const value = parseVerseContentJson(row);
+  parsedRow = { row, json: row.content_json, value };
+  return value;
+}
+
 export type IssueBucket = "flag" | "escalate";
 
 export interface LintIssue {
@@ -1442,7 +1453,7 @@ function verseObjectsOf(row: VerseRow | undefined): unknown[] {
   if (!row) return [];
   let parsed: unknown;
   try {
-    parsed = parseVerseContentJson(row);
+    parsed = parseLintVerse(row);
   } catch {
     return [];
   }
@@ -1599,7 +1610,7 @@ function quoteIssues(verses: VerseRow[]): LintIssue[] {
     if (v.verse === 0) continue;
     let parsed: unknown;
     try {
-      parsed = parseVerseContentJson(v);
+      parsed = parseLintVerse(v);
     } catch {
       continue;
     }
@@ -1645,17 +1656,49 @@ export function lintUsfmVerses(
   verses: VerseRow[],
   source?: VerseRow[] | Map<string, SourceToken[]>,
 ): LintIssue[] {
+  return [...quoteIssues(verses), ...lintUsfmVerseRows(verses, source)];
+}
+
+/** Same issue groups/order as the individual checks, with one JSON parse per
+ * row for the independent checks. Book-spanning checks still see every verse. */
+export function lintTranslationRows(verses: VerseRow[], source: Map<string, SourceToken[]>) {
+  const alignment: LintIssue[] = [];
+  const usfm: LintIssue[] = quoteIssues(verses);
+  const orphaned: LintIssue[] = [];
+  const quality: LintIssue[] = [];
+  try {
+    for (const row of verses) {
+      const rows = [row];
+      alignment.push(...lintAlignmentOccurrences(rows, source));
+      usfm.push(...lintUsfmVerseRows(rows, source));
+      orphaned.push(...lintOrphanedBlankText(rows));
+      quality.push(...lintVerseTextQuality(rows));
+    }
+    return {
+      alignment, usfm, orphaned, quality,
+      opening: lintChapterOpeningMarkers(verses),
+      punctuation: lintPairedPunctuation(verses),
+    };
+  } finally {
+    parsedRow = undefined;
+  }
+}
+
+function lintUsfmVerseRows(
+  verses: VerseRow[],
+  source?: VerseRow[] | Map<string, SourceToken[]>,
+): LintIssue[] {
   // Optional: without it, "Reused source token" falls back to raw
   // (content|occurrence) identity exactly as before this parameter existed
   // (see resolveChainPositions). With it, that check re-derives real source
   // positions the same way the aligner's own marker does (#421).
   const byRef = source ? (source instanceof Map ? source : sourceWordsByRef(source)) : null;
-  const issues: LintIssue[] = [...quoteIssues(verses)];
+  const issues: LintIssue[] = [];
   for (const v of verses) {
     if (v.verse === 0) continue;
     let parsed: unknown;
     try {
-      parsed = parseVerseContentJson(v);
+      parsed = parseLintVerse(v);
     } catch {
       continue;
     }

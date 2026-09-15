@@ -83,7 +83,7 @@ interface Props {
   // The single active find match (the one prev/next navigates to). The cell
   // containing it paints with the stronger be-find-active style.
   findActiveMatch?: FindMatch | null;
-  onSelectVerse: (v: number) => void;
+  onSelectVerse: (v: number, onAccepted?: () => void) => void;
   onEditVerse: (verseNum: number, plain: string, base: VerseDto) => void;
   // Save every dirty draft in this column (one PATCH per verse). The
   // header button calls this; per-verse undo handles single-verse rollback.
@@ -154,8 +154,15 @@ export function DocColumn({
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef<HTMLSpanElement | null>(null);
+  const localSelectionRef = useRef<number | null>(null);
+  const previousScrollNonce = useRef(scrollNonce);
 
   useEffect(() => {
+    const explicitScroll = previousScrollNonce.current !== scrollNonce;
+    previousScrollNonce.current = scrollNonce;
+    const localSelection = localSelectionRef.current === activeVerse;
+    localSelectionRef.current = null;
+    if (localSelection && !explicitScroll) return;
     activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [activeVerse, scrollNonce]);
 
@@ -308,7 +315,11 @@ export function DocColumn({
                 findActiveMatch={findActiveMatch ?? null}
                 spanRef={isActive ? activeRef : null}
                 textCheck={textCheck}
-                onClick={() => onSelectVerse(dto.verse)}
+                onClick={() => {
+                  onSelectVerse(dto.verse, () => {
+                    if (dto.verse !== activeVerse) localSelectionRef.current = dto.verse;
+                  });
+                }}
                 onAlign={() => onOpenAligner(dto.verse)}
                 onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
                 onSave={(plain) => onSaveColumn([{ verseNum: dto.verse, plain, base: dto }])}
@@ -483,8 +494,7 @@ function VerseSpan({
       setHasDraft(false);
       return;
     }
-    return drafts.subscribe((all) => {
-      const rec = all.find((d) => d.key === draftKey);
+    return drafts.subscribeKey(draftKey, (rec) => {
       setHasDraft(!!rec);
       // Snapshot BEFORE the mirror below overwrites it: true means the user has
       // already typed into this cell, so any draft record arriving now is the
@@ -595,11 +605,11 @@ function VerseSpan({
       }
       return chipHtml;
     }
-    if (findHTML) return findHTML;
+    if (findHTML && search?.sourceQuery.kind !== "english") return findHTML;
     // A verse with plain_text but no content tree still paints find
     // highlighting above; only past that point is there nothing to render.
-    if (!content) return null;
-    if (!Array.isArray(verseObjects)) return null;
+    if (!content) return findHTML;
+    if (!Array.isArray(verseObjects)) return findHTML;
     // Compose any drifted-down markers (from the previous verse's
     // trailing `\q1`/`\p` etc.) at the front so the visual break
     // introduces this verse, matching USFM intent.
@@ -611,7 +621,10 @@ function VerseSpan({
       : body;
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents even without an active highlight set.
-    return renderHighlightedHTML(drifted, highlights ?? new Set(), roles);
+    const rendered = renderHighlightedHTML(drifted, findHTML ? new Set() : (highlights ?? new Set()), findHTML ? undefined : roles);
+    return search?.re && search.sourceQuery.kind === "english"
+      ? overlayFindMarks(rendered, search.re, activeRange)
+      : rendered;
   }, [findHTML, content, highlights, precedingMarkers, isActive, readOnly, roles, search, isSource, activeRange]);
 
   // Resync the editable span when (a) text changes from outside and the user
@@ -700,7 +713,7 @@ function VerseSpan({
       style={{
         display: "inline",
         borderRadius: 4,
-        padding: isActive ? "1px 2px" : 0,
+        padding: "1px 2px",
         backgroundColor: isActive ? "rgba(49,173,227,0.14)" : "transparent",
         // RTL only: isolate each verse as its own bidi unit. In the continuous
         // columns flow the bare LTR verse marker ("6:3") otherwise reorders
@@ -789,7 +802,7 @@ function VerseSpan({
           onSplitBridge={onSplitBridge}
         />
       )}
-      {!readOnly && hasDraft && (
+      {!readOnly && (isActive || hasDraft) && (
         <Tooltip title={`undo edits to verse ${verseNum}`}>
           <IconButton
             onClick={(e) => {
@@ -814,7 +827,7 @@ function VerseSpan({
               }
             }}
             size="small"
-            sx={{ color: "warning.main", p: 0.25, verticalAlign: "-3px" }}
+            sx={{ visibility: hasDraft ? "visible" : "hidden", color: "warning.main", p: 0.25, verticalAlign: "-3px" }}
           >
             <UndoIcon sx={{ fontSize: 14 }} />
           </IconButton>
@@ -827,7 +840,7 @@ function VerseSpan({
           between verses. Gating on `isActive` makes ScriptureColumn's
           precondition (the chip render is guaranteed in the DOM at click) hold
           here too. */}
-      {isActive && !readOnly && hasDraft && (
+      {isActive && !readOnly && (
         <Tooltip title={`save verse ${verseNum}`}>
           <IconButton
             onClick={(e) => {
@@ -844,7 +857,7 @@ function VerseSpan({
               onSave(elRef.current?.textContent ?? lastTextRef.current);
             }}
             size="small"
-            sx={{ color: "primary.main", p: 0.25, ml: 0.75, verticalAlign: "-3px" }}
+            sx={{ visibility: hasDraft ? "visible" : "hidden", color: "primary.main", p: 0.25, ml: 0.75, verticalAlign: "-3px" }}
           >
             <SaveIcon sx={{ fontSize: 14 }} />
           </IconButton>
