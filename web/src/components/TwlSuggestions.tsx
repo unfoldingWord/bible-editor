@@ -318,7 +318,7 @@ function TwlSuggestionsInner({ book, chapter, verses, refreshKey, onAdd, isExclu
             ))}
           </Select>
         ) : (
-          <Chip label={twShort(selected)} size="small" variant="outlined" sx={{ height: 20, fontSize: 11 }} />
+          <Chip label={twShort(selected)} size="small" variant="outlined" sx={{ height: 24, fontSize: 11 }} />
         )}
         <Tooltip title="add this link">
           <span>
