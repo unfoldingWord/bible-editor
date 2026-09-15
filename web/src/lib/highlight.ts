@@ -1378,7 +1378,13 @@ export function overlayFindMarks(
     }
     decoded.push(null);
     inChip.push(false);
-    starts.push(-1);
+    // Read-only paragraph/poetry blocks have no chip label or literal space
+    // between them, but extractPlainText emits a separating space. Include a
+    // synthetic separator in the search string without altering rendered HTML.
+    // This also prevents a regex from consuming a phantom cross-block word.
+    const blockStart = /^<div(?:\s|>)/i.test(tok.tag) && full.length > 0 && !/\s$/.test(full);
+    starts.push(blockStart ? full.length : -1);
+    if (blockStart) full += " ";
     const info = classifyTag(tok.tag);
     if (info.kind === "open") {
       openIsChip.push(info.isChip);
@@ -1397,7 +1403,16 @@ export function overlayFindMarks(
     let chipJustClosed = false;
     for (let i = 0; i < tokens.length; i++) {
       const text = decoded[i];
-      if (text === null) continue;
+      if (text === null) {
+        if (starts[i] >= 0) {
+          plainOffsets[starts[i]] = plainLen;
+          if (!lastWasSpace) {
+            plainLen++;
+            lastWasSpace = true;
+          }
+        }
+        continue;
+      }
       const base = starts[i];
       if (inChip[i]) {
         // The literal "\q1" label exists only in the chip render.

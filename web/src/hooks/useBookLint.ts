@@ -8,13 +8,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type BookLintIssue, type BookLintReport } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
+import { createLintRefreshQueue } from "./lintRefreshQueue";
 
 export interface UseBookLintReturn {
   status: "idle" | "loading" | "ready" | "error";
   flagIssues: BookLintIssue[];
   flagCount: number;
   escalateCount: number;
-  // Returns the in-flight fetch's completion (resolves whether it lands,
+  // Returns completion of a fetch STARTED after this invalidation (resolves whether it lands,
   // fails, or is aborted) so a caller can await "the report I asked for has
   // now either landed or given up" — e.g. BookLintIndicator's dismiss flows
   // bound an optimistic key's lifetime to this promise rather than to a
@@ -25,26 +26,11 @@ export interface UseBookLintReturn {
 export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   const [report, setReport] = useState<BookLintReport | null>(null);
   const [status, setStatus] = useState<UseBookLintReturn["status"]>("idle");
-  const fetchCtrl = useRef<AbortController | null>(null);
+  const queue = useRef<ReturnType<typeof createLintRefreshQueue> | null>(null);
 
   const load = useCallback((): Promise<void> => {
-    if (!enabled) return Promise.resolve();
-    fetchCtrl.current?.abort();
-    const ctrl = new AbortController();
-    fetchCtrl.current = ctrl;
-    setStatus("loading");
-    return fetchWithRetry((signal) => api.getBookLint(book, signal), { signal: ctrl.signal })
-      .then((r) => {
-        if (ctrl.signal.aborted) return;
-        setReport(r);
-        setStatus("ready");
-      })
-      .catch((e) => {
-        if (ctrl.signal.aborted) return;
-        if (e instanceof DOMException && e.name === "AbortError") return;
-        setStatus("error");
-      });
-  }, [book, enabled]);
+    return queue.current?.refresh() ?? Promise.resolve();
+  }, []);
 
   // Refetch on book change (and reset when disabled) — lint is per-book.
   useEffect(() => {
@@ -54,11 +40,26 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
       return;
     }
     setReport(null);
-    void load();
+    const ctrl = new AbortController();
+    const current = createLintRefreshQueue(async () => {
+      setStatus("loading");
+      try {
+        const r = await fetchWithRetry((signal) => api.getBookLint(book, signal), { signal: ctrl.signal });
+        if (ctrl.signal.aborted) return;
+        setReport(r);
+        setStatus("ready");
+      } catch {
+        if (!ctrl.signal.aborted) setStatus("error");
+      }
+    });
+    queue.current = current;
+    void current.refresh();
     return () => {
-      fetchCtrl.current?.abort();
+      queue.current = null;
+      current.dispose();
+      ctrl.abort();
     };
-  }, [book, enabled, load]);
+  }, [book, enabled]);
 
   // Only the flag bucket needs a human decision; escalate (footnotes) is a
   // secondary count. Recompute the list from the report so the dropdown and the

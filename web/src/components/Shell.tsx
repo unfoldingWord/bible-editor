@@ -69,6 +69,7 @@ import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
+import type { BookViewportRestore } from "./BookView";
 import { ResourceColumn, type AlignmentTabProps, type PanelMode, type ReorderPreview, type ResourceCheckoff, type ResourceLane } from "./ResourceColumn";
 import type { AlignmentPanelHandle } from "./AlignmentPanel";
 import {
@@ -246,6 +247,7 @@ interface Props {
 }
 
 export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, onCommentActivity, onCommentThreadsViewed, authReady = false, notificationsMenu, syncWarnings }: Props) {
+  const bookViewportRestoreRef = useRef<BookViewportRestore | null>(null);
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -2024,8 +2026,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   }, []);
 
   const requestSelectVerse = useCallback(
-    (v: number) => {
+    (v: number, onAccepted?: () => void) => {
       runWithDirtyGate(() => {
+        onAccepted?.();
         setActiveVerse(v);
         setActiveNoteId(null);
         setActiveWordId(null);
@@ -3505,14 +3508,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           availableVersions={availableVersions}
           bookChapterList={bookChapterList}
           bookChapters={bookHook && mode === "book" ? bookHook.chapters : undefined}
+          bookViewportRestoreRef={bookViewportRestoreRef}
           onLoadBookChapter={bookHook ? bookHook.loadChapter : undefined}
-          onSelectBookVerse={(ch, v) => {
+          onSelectBookVerse={(ch, v, viewport, onAccepted) => {
             // Verse click in book mode navigates via URL so the chapter
             // payload + resources reload through the existing useChapter
             // flow. App.tsx lifts the useBook cache so this round-trip is
             // cheap.
             runWithDirtyGate(() => {
+              onAccepted?.();
               if (ch !== chapter) {
+                bookViewportRestoreRef.current = viewport ? { chapter: ch, verse: v, ...viewport } : null;
                 onNavigate?.(book, ch, v);
               } else {
                 setActiveVerse(v);
@@ -3564,7 +3570,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               restored_from_version: null,
             });
           }}
-          onSelectVerse={(v) => requestSelectVerse(v)}
+          onSelectVerse={requestSelectVerse}
           onModeChange={(m) => {
             setMode(m);
             saveToStorage(SCRIPTURE_MODE_KEY, m);

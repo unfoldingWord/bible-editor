@@ -47,17 +47,11 @@ import {
 // will fatally fail.
 const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT"]);
 
-// How long the typed query sits before it drives matching, highlighting and
-// the auto-jump. Long enough that a normal keystroke burst settles into one
-// rescan of the loaded corpus (and one scroll) instead of one per character;
-// short enough to still read as live search.
+// Debounce corpus scans and highlights; typing never requests a scroll.
 const FIND_DEBOUNCE_MS = 180;
 
-// What the next matches-reshape should do once it lands. `activate` promotes
-// the match verse to the editing focus (explicit prev/next/replace); the
-// auto-jump while typing / toggling scope only peeks. `nearest` re-anchors the
-// active result to the first hit at or after the verse the user is on, instead
-// of keeping whatever index prev/next had reached for the previous query.
+// A query change silently chooses the nearest candidate. Explicit navigation
+// also activates it. Replacement retains the index to advance to the next hit.
 type PendingNav = { activate: boolean; nearest: boolean };
 
 // The prev/next IconButtons sit inside a disabled-wrapper <span>, so MUI's
@@ -141,9 +135,7 @@ interface Props {
   // Active book code (e.g. "ZEC" / "MAT"). Used to disambiguate bare
   // Strong's queries — "559" in an OT book → H559, in an NT book → G559.
   book: string;
-  // The currently-active chapter (the one the URL points at). The auto-jump
-  // path uses it to avoid yanking the user across chapters on a keystroke —
-  // see the clamp effect below.
+  // The currently-active chapter (the one the URL points at).
   activeChapter: number;
   chapters: Map<number, ChapterState>;
   chapterList: number[];
@@ -165,14 +157,13 @@ interface Props {
   // both are off-limits). Shell carries the live row's version into the
   // outbox If-Match and dual-applies to the current chapter + book caches.
   onReplaceNote: (row: TnRow, newNote: string) => void;
-  // Fires only on user-initiated navigation (find/regex/case change, prev,
-  // next, replace-this). Typing in a verse cell while the overlay is open
+  // Fires only on explicit navigation (Enter, prev/next, replace-this).
+  // Typing in a verse cell while the overlay is open
   // reshapes the match list but should NOT pull the user away — those
   // reshapes only update the internal "X of Y" label.
   onScrollToMatch: (match: FindMatch | null, opts?: { activate?: boolean }) => void;
-  // The active verse in the active chapter. A new query lands on the first
-  // hit at or after it (falling back to the first hit in the book) so typing
-  // never yanks the user from where they are reading to the top of the book.
+  // A new query chooses the first hit at or after this verse as the candidate
+  // for the first Enter (falling back to the first hit in the book).
   activeVerse?: number;
   // Focus + select the query input whenever this changes to a non-zero value
   // — the caller bumps it on each user gesture that opens or re-summons Find
@@ -253,9 +244,9 @@ export function FindReplaceOverlay({
   const [draft0] = useState(() => loadFindDraft(book));
   const [find, setFind] = useState(draft0.find);
   // Debounced mirror of `find`. The input stays bound to `find` so typing is
-  // instant; everything downstream (regex, match list, cell marks, auto-jump)
+  // instant; everything downstream (regex, match list, cell marks)
   // keys off `query` so a burst of keystrokes settles before the corpus is
-  // rescanned and the view moves. Clearing propagates immediately so marks
+  // rescanned. Clearing propagates immediately so marks
   // vanish as you delete.
   const [query, setQuery] = useState(draft0.find);
   useEffect(() => {
@@ -279,26 +270,21 @@ export function FindReplaceOverlay({
   const showStrongsToggle = isBareNumberQuery(find) && !regex;
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const replaceInputRef = useRef<HTMLInputElement | null>(null);
-  // Set right before any user action that should pull the active match
-  // into view (replace-this, find query / scope change). The next
-  // matches-reshape effect consumes it and fires onScrollToMatch.
-  // External content edits never set this, so the user isn't yanked away
-  // while they're typing. (prev/next navigate directly, not through here.)
+  // Consumed when the result list reshapes. Query changes re-anchor silently;
+  // only explicit navigation and replacement request scrolling.
   const wantsScrollRef = useRef<PendingNav | null>(null);
-  // True while the current result has only been peeked at (see goNext).
-  const peekedRef = useRef(false);
+  // True until explicit navigation visits the current query's candidate.
+  const candidateUnvisitedRef = useRef(true);
   // Enter pressed inside the debounce window: flush the typed text AND treat
   // the landing as explicit navigation, so one Enter searches and goes there.
   const enterPendingRef = useRef(false);
 
   // Flip a scope checkbox. Refuse to turn the last one off (the box would
-  // search nothing). Treat a scope change as user navigation so results settle
-  // and we scroll to the first hit.
+  // search nothing). Like typing, scope changes never move the viewport.
   const updateScope = (next: FindScope) => {
     if (!next.bible && !next.tn) return;
     setScope(next);
     saveScope(next);
-    wantsScrollRef.current = { activate: false, nearest: true };
   };
 
   // Persist the query so it survives the remount a chapter change forces.
@@ -324,27 +310,26 @@ export function FindReplaceOverlay({
   useEffect(
     () => () => {
       onNoteQueryChange(null);
-      onActiveNoteMatchChange(null);
     },
-    [onNoteQueryChange, onActiveNoteMatchChange],
+    [onNoteQueryChange],
   );
 
   // Push query down to the caller so verse cells can paint match marks.
-  // Any change to the search inputs counts as user navigation — once the
-  // new matches settle, scroll to the first hit.
+  // Query changes clear the old active mark without navigating. Note active
+  // marks can themselves scroll their card, so they are also explicit-only.
   const queryEffectRanRef = useRef(false);
   useEffect(() => {
-    // A new query is user navigation regardless of scope — flag the scroll
-    // BEFORE the Bible-scope early return so a TN-only search (Bible unchecked,
-    // TN checked) still auto-jumps to its first note hit. Only suppress when
-    // there's nothing to search — and on the very first run: a query seeded
-    // from the persisted draft (the chapter-change remount) is not a new
-    // search, so the view stays where the user navigated to instead of
-    // scrolling off to the nearest leftover hit.
+    // Re-anchor before the Bible-scope return so TN-only search behaves the
+    // same. Restoring a persisted query also stays still.
     const firstRun = !queryEffectRanRef.current;
     queryEffectRanRef.current = true;
-    if (open && query && (scope.bible || scope.tn) && !firstRun) {
+    if (open && query && (scope.bible || scope.tn)) {
       wantsScrollRef.current = { activate: enterPendingRef.current, nearest: true };
+      candidateUnvisitedRef.current = true;
+    }
+    if (!firstRun) {
+      onScrollToMatch(null);
+      onActiveNoteMatchChange(null);
     }
     enterPendingRef.current = false;
     // Only paint scripture cells when the Bible scope is on — TN-only searches
@@ -354,7 +339,7 @@ export function FindReplaceOverlay({
       return;
     }
     onQueryChange({ find: query, regex, caseSensitive, strongs });
-  }, [open, query, regex, caseSensitive, strongs, scope.bible, scope.tn, onQueryChange]);
+  }, [open, query, regex, caseSensitive, strongs, scope.bible, scope.tn, onQueryChange, onScrollToMatch, onActiveNoteMatchChange]);
 
   const compiled = useMemo(() => buildSearchRegex(query, regex, caseSensitive), [query, regex, caseSensitive]);
   const regexInvalid = !!query && compiled.error;
@@ -458,41 +443,24 @@ export function FindReplaceOverlay({
     results[activeIdx]?.kind === "note" &&
     (results[activeIdx] as Extract<SearchResult, { kind: "note" }>).match.field === "note";
 
-  // Lift the active note body match so its card can emphasize that one
-  // occurrence ("here I am"). Tracks the active result continuously (nav,
-  // reshape, scope change) so the orange mark follows prev/next.
-  useEffect(() => {
-    const r = results[activeIdx];
-    if (open && scope.tn && r?.kind === "note" && r.match.field === "note") {
-      onActiveNoteMatchChange({ noteId: r.match.noteId, occurrence: r.match.occurrence });
-    } else {
-      onActiveNoteMatchChange(null);
-    }
-  }, [open, scope.tn, results, activeIdx, onActiveNoteMatchChange]);
-
   // Route the active result to the right surface: scripture cells scroll +
   // highlight via onScrollToMatch; notes navigate + activate via
   // onScrollToNoteMatch (and clear any scripture active-mark).
-  // `activate` (default: explicit navigation) promotes the match verse to the
-  // editing focus in stacked mode; the auto-jump while typing passes false so
-  // it only scrolls the hit into view.
-  function navTo(idx: number, activate = true) {
+  // Called only by explicit navigation or replacement.
+  function navTo(idx: number) {
     const r = results[idx];
     if (!r) {
       onScrollToMatch(null);
       return;
     }
-    peekedRef.current = !activate;
+    candidateUnvisitedRef.current = false;
+    onActiveNoteMatchChange(r.kind === "note" && r.match.field === "note"
+      ? { noteId: r.match.noteId, occurrence: r.match.occurrence }
+      : null);
     if (r.kind === "bible") {
-      onScrollToMatch(r.match, { activate });
+      onScrollToMatch(r.match, { activate: true });
     } else {
       onScrollToMatch(null);
-      // The resource column only shows the active verse's notes, so
-      // navigating to a note in another verse necessarily changes the active
-      // verse. A peek (typing) must not do that — it only focuses the note
-      // when the hit is already in the verse the user is on; otherwise the
-      // count updates and Enter takes them there.
-      if (!activate && (r.match.chapter !== activeChapter || r.match.verse !== activeVerse)) return;
       onScrollToNoteMatch(r.match.chapter, r.match.verse, r.match.noteId);
     }
   }
@@ -519,30 +487,25 @@ export function FindReplaceOverlay({
     if (idx !== activeIdx) setActiveIdx(idx);
     if (pending) {
       wantsScrollRef.current = null;
-      // Auto-jump (typing / scope toggle) must NOT trigger a disruptive
-      // cross-chapter navigation. The book-intro note (chapter 0) sorts first
-      // and matches common words, so the very first keystroke would otherwise
-      // yank the user from the chapter they're reading over to ZEC/0. Bible
-      // matches scroll in-view harmlessly and same-chapter notes just re-focus,
-      // so only the cross-chapter note case is suppressed here — explicit
-      // prev/next (goPrev/goNext call navTo directly) may still cross chapters
-      // deliberately.
-      const r = results[idx];
-      const crossChapterNote = r?.kind === "note" && r.chapter !== activeChapter;
-      if (!crossChapterNote) navTo(idx, pending.activate);
+      // A changed query only chooses the next candidate. Enter, next/prev,
+      // and replace are the only actions that move either scripture or notes.
+      if (pending.activate) navTo(idx);
     }
     // navTo closes over the current results; onScrollToMatch is the stable
     // dep that matters here (mirrors the original effect's dep list).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [results, activeIdx, onScrollToMatch]);
 
-  // The active result was only peeked at (typing / scope change scrolled it
-  // into view without activating). The first explicit prev/next then commits
-  // to THAT hit — the one the user sees highlighted — instead of stepping
-  // past it to a neighbour they never visited.
+  // The first explicit prev/next visits the candidate; subsequent requests
+  // step through the list. Flush a pending query before either button acts.
   const goPrev = () => {
+    if (find !== query) {
+      enterPendingRef.current = true;
+      setQuery(find);
+      return;
+    }
     if (results.length === 0) return;
-    if (peekedRef.current) {
+    if (candidateUnvisitedRef.current) {
       navTo(activeIdx);
       return;
     }
@@ -551,8 +514,13 @@ export function FindReplaceOverlay({
     navTo(next);
   };
   const goNext = () => {
+    if (find !== query) {
+      enterPendingRef.current = true;
+      setQuery(find);
+      return;
+    }
     if (results.length === 0) return;
-    if (peekedRef.current) {
+    if (candidateUnvisitedRef.current) {
       navTo(activeIdx);
       return;
     }

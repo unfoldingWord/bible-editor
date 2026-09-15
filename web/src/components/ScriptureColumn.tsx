@@ -1,6 +1,7 @@
-import { lazy, Suspense, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, Paper, IconButton, Tooltip, ToggleButton, ToggleButtonGroup, Button, Chip } from "@mui/material";
 import HistoryIcon from "@mui/icons-material/History";
+import type { BookViewportPosition, BookViewportRestore } from "./BookView";
 import { AlignLinkButton } from "./AlignLinkButton";
 import ViewColumnIcon from "@mui/icons-material/ViewColumn";
 import ViewStreamIcon from "@mui/icons-material/ViewStream";
@@ -74,7 +75,7 @@ interface Props {
   bookChapterList?: number[];
   bookChapters?: Map<number, ChapterState>;
   onLoadBookChapter?: (ch: number) => void;
-  onSelectBookVerse?: (chapter: number, verse: number) => void;
+  onSelectBookVerse?: (chapter: number, verse: number, viewport?: BookViewportPosition, onAccepted?: () => void) => void;
   onEditBookVerse?: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   // Per-verse save callback for book mode. Same semantics as onSaveVerse but
   // chapter is variable (book view spans the whole book).
@@ -91,6 +92,7 @@ interface Props {
   // click, and shipped to ResourceColumn so it can scroll the active
   // note/word/verse-group into view alongside the scripture.
   scrollNonce: number;
+  bookViewportRestoreRef?: React.MutableRefObject<BookViewportRestore | null>;
   onRequestScrollToActive: () => void;
   // Find-overlay TN search: a stable getter for the notes currently in scope
   // (forwarded to the overlay), plus a callback to navigate to + activate a
@@ -109,7 +111,7 @@ interface Props {
   // the same "tW" link the aligner does. Book mode sources its own per-chapter
   // TWL from bookChapters instead.
   twl: TwlRow[];
-  onSelectVerse: (v: number) => void;
+  onSelectVerse: (v: number, onAccepted?: () => void) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
   // Verse-bridge create/break (UST only, wired in the DocColumn/BookView verse
   // toolbar). Both carry the chapter so book mode (variable chapter) and
@@ -227,6 +229,7 @@ function ScriptureColumnInner({
   onReplaceVerse,
   onReplaceNote,
   scrollNonce,
+  bookViewportRestoreRef,
   onRequestScrollToActive,
   searchNotes,
   onScrollToNoteMatch,
@@ -284,10 +287,8 @@ function ScriptureColumnInner({
   // the user to the next match. Every navigation stores a fresh object so
   // the scroll effect runs once per request and never again — it must NOT
   // re-fire when the user later clicks a different verse (that used to snap
-  // them straight back to the match). `activate` is set for explicit
-  // prev/next; the auto-jump while typing only peeks (scrolls) so the
-  // active verse — and the editing focus with it — stays where the user
-  // left it.
+  // them straight back to the match). Query typing updates highlights only;
+  // Enter, prev/next, and replacement create a navigation request.
   const [findNav, setFindNav] = useState<{ match: FindMatch; activate: boolean } | null>(null);
   const findScrollTarget = findNav?.match ?? null;
 
@@ -314,7 +315,8 @@ function ScriptureColumnInner({
     clearFindState();
     setFindQuery(null);
     setFindNav(null);
-  }, []);
+    onActiveNoteMatchChange(null);
+  }, [onActiveNoteMatchChange]);
 
   // Stable callback identities so the overlay's effect deps don't churn.
   const onFindQueryChange = useCallback((q: FindQuery | null) => setFindQuery(q), []);
@@ -385,6 +387,29 @@ function ScriptureColumnInner({
   // highlighted) row into view.
   const findNavCtxRef = useRef({ activeVerse, chapter, onSelectVerse });
   findNavCtxRef.current = { activeVerse, chapter, onSelectVerse };
+  const localSelectionRef = useRef<number | null>(null);
+  const localRowAnchorRef = useRef<{ top: number; scroller: HTMLElement } | null>(null);
+  const selectLocalVerse = useCallback((verse: number, onAccepted?: () => void) => {
+    const ctx = findNavCtxRef.current;
+    ctx.onSelectVerse(verse, () => {
+      onAccepted?.();
+      if (verse !== findNavCtxRef.current.activeVerse) {
+        localSelectionRef.current = verse;
+        const row = bodyRef.current?.querySelector<HTMLElement>(`[data-scripture-verse="${verse}"]`);
+        localRowAnchorRef.current = row?.parentElement
+          ? { top: row.getBoundingClientRect().top, scroller: row.parentElement }
+          : null;
+      }
+    });
+  }, []);
+  // Rows mode replaces the compact row with a larger editing card. Keep its
+  // top at the click location when the old card above it collapses.
+  useLayoutEffect(() => {
+    const anchor = localRowAnchorRef.current;
+    localRowAnchorRef.current = null;
+    if (mode !== "stacked" || localSelectionRef.current !== activeVerse || !anchor || !activeRef.current) return;
+    anchor.scroller.scrollTop += activeRef.current.getBoundingClientRect().top - anchor.top;
+  }, [activeVerse, mode]);
   // The token stays in state until the next navigation, so remember which one
   // we've acted on — otherwise a rows↔columns toggle (this column is NOT
   // remounted on a mode change) would replay the last activation and snap
@@ -407,6 +432,9 @@ function ScriptureColumnInner({
   }, [findNav, mode]);
 
   useEffect(() => {
+    const localSelection = localSelectionRef.current === activeVerse;
+    localSelectionRef.current = null;
+    if (localSelection) return;
     if (mode === "stacked") {
       activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
     }
@@ -611,7 +639,7 @@ function ScriptureColumnInner({
             twl={twl}
             search={search}
             findActiveMatch={findScrollTarget}
-            onSelectVerse={onSelectVerse}
+            onSelectVerse={selectLocalVerse}
             onOpenAligner={onOpenAligner}
             onEditVerse={onEditVerse}
             onSaveVerse={onSaveVerse}
@@ -641,6 +669,7 @@ function ScriptureColumnInner({
               reorderHighlight={reorderHighlight ?? null}
               activeSourceContent={activeSourceContent}
               scrollNonce={scrollNonce}
+              viewportRestoreRef={bookViewportRestoreRef}
               findQuery={findQuery}
               findActiveMatch={findScrollTarget}
               lexiconMap={lexiconMap}
@@ -686,7 +715,7 @@ function ScriptureColumnInner({
                 twl={v === "UHB" ? twl : undefined}
                 search={search}
                 findActiveMatch={findScrollTarget}
-                onSelectVerse={onSelectVerse}
+                onSelectVerse={selectLocalVerse}
                 onEditVerse={(verseNum, plain, base) => onEditVerse(verseNum, v, plain, base)}
                 onSaveColumn={(payload) => {
                   for (const item of payload) {
@@ -745,6 +774,7 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     a.bookChapterList === b.bookChapterList &&
     a.bookChapters === b.bookChapters &&
     a.scrollNonce === b.scrollNonce &&
+    a.bookViewportRestoreRef === b.bookViewportRestoreRef &&
     a.lexiconMap === b.lexiconMap &&
     // twl feeds the UHB hover tooltips' tW hint; a new ref means a TWL edit,
     // so re-render to keep the hint current (the row subtrees stay memoized,
@@ -904,6 +934,7 @@ function StackedBody({
           return (
             <Paper
               ref={activeRef}
+              data-scripture-verse={v}
               key={v}
               elevation={0}
               sx={{
@@ -1103,6 +1134,7 @@ const InactiveVerseRow = memo(
     const showUst = ustV && isFirstOfRange(ustV, v);
     return (
       <Box
+        data-scripture-verse={v}
         onClick={() => onSelectVerse(v)}
         sx={{
           display: "grid",
@@ -1424,8 +1456,7 @@ function ActiveLine({
       setHasDraft(false);
       return;
     }
-    return drafts.subscribe((all) => {
-      const rec = all.find((d) => d.key === draftKey);
+    return drafts.subscribeKey(draftKey, (rec) => {
       setHasDraft(!!rec);
       // Snapshot BEFORE the mirror below overwrites it: true means the user has
       // already typed into this cell, so any draft record arriving now is the
@@ -1679,7 +1710,7 @@ function ActiveLine({
             </span>
           </Tooltip>
         )}
-        {editable && !readOnly && hasDraft && draftKey && (
+        {editable && !readOnly && draftKey && (
           <Tooltip title="undo edits to this verse">
             <IconButton
               size="small"
@@ -1701,7 +1732,7 @@ function ActiveLine({
                   lastSetRef.current = paintable ?? editableText;
                 }
               }}
-              sx={{ p: 0.5, color: "warning.main" }}
+              sx={{ visibility: hasDraft ? "visible" : "hidden", p: 0.5, color: "warning.main" }}
             >
               <UndoIcon sx={{ fontSize: 22 }} />
             </IconButton>
@@ -1985,21 +2016,6 @@ function StackedRowBody({
     [prevDto?.content],
   );
   const html = useMemo(() => {
-    // Find marks win over poetry/paragraph layout while the overlay is open —
-    // the same precedence DocColumn/BookView use. Without this, structured
-    // (poetry) verses fall to renderHighlightedHTML below, which ignores
-    // `search`, so their matches paint no highlight and "disappear" from an
-    // inactive row (only the active card + plain-prose rows lit up). The flat
-    // text loses its indents while searching — an accepted trade so every
-    // match is visible. Source-language queries never match ULT/UST cells, so
-    // this is gated to English mode.
-    if (search?.re && search.sourceQuery.kind === "english") {
-      const text = dto.plain_text ?? "";
-      if (text) {
-        const findHtml = renderFindMatchesHTML(text, search.re, activeRange);
-        if (findHtml.includes("be-find")) return findHtml;
-      }
-    }
     if (!Array.isArray(verseObjects)) return null;
     // Strip THIS verse's own trailing markers — they drift to the next verse,
     // so rendering them here too would double a text-bearing `\qa` acrostic.
@@ -2016,7 +2032,12 @@ function StackedRowBody({
         return t === "paragraph" || t === "quote" || t === "section";
       });
     if (!hasStructure) return null;
-    return renderHighlightedHTML(composed, new Set());
+    const rendered = renderHighlightedHTML(composed, new Set());
+    // Paint onto the existing paragraph/poetry structure. Substituting flat
+    // plain_text only on matching rows changed their height on every query.
+    return search?.re && search.sourceQuery.kind === "english"
+      ? overlayFindMarks(rendered, search.re, activeRange)
+      : rendered;
   }, [verseObjects, drift, search, activeRange, dto.plain_text]);
 
   if (html !== null) {

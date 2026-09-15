@@ -9,7 +9,7 @@
 // column alignment, which is what makes find/replace and side-by-side
 // comparison readable when the scroll spans an entire book.
 
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip, CircularProgress } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
 import UndoIcon from "@mui/icons-material/Undo";
@@ -59,6 +59,17 @@ const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total:
 // ChapterBlock a fresh object every render and defeat its memo.
 const UNLOADED_STATE: ChapterState = { kind: "unloaded" };
 
+// Kept by Shell, which survives the chapter-loading gate that remounts this
+// view. Only an accepted local verse click creates a restoration request.
+export interface BookViewportPosition {
+  scrollTop: number;
+  verseTop: number;
+}
+export interface BookViewportRestore extends BookViewportPosition {
+  chapter: number;
+  verse: number;
+}
+
 interface Props {
   book: string;
   chapterList: number[];
@@ -76,11 +87,12 @@ interface Props {
   // reordered English translation still highlights. Ignored for UHB/UGNT.
   activeSourceContent?: unknown;
   scrollNonce?: number;
+  viewportRestoreRef?: React.MutableRefObject<BookViewportRestore | null>;
   findQuery: FindQuery | null;
   findActiveMatch: FindMatch | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   onLoadChapter: (ch: number) => void;
-  onSelectVerse: (chapter: number, verse: number) => void;
+  onSelectVerse: (chapter: number, verse: number, viewport?: BookViewportPosition, onAccepted?: () => void) => void;
   onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   // Flush all drafts in one bibleVersion column. Triggered by the header
   // Save button; each item maps to a single PATCH.
@@ -130,6 +142,7 @@ export function BookView({
   reorderHighlight,
   activeSourceContent,
   scrollNonce,
+  viewportRestoreRef,
   findQuery,
   findActiveMatch,
   lexiconMap,
@@ -148,6 +161,26 @@ export function BookView({
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRowRef = useRef<HTMLDivElement | null>(null);
+  const localSelectionRef = useRef<string | null>(null);
+  const previousScrollNonce = useRef(scrollNonce);
+  const firstLayoutRef = useRef(true);
+  const restoredTargetRef = useRef<string | null>(null);
+  const selectionContextRef = useRef({ activeChapter, activeVerse, onSelectVerse });
+  selectionContextRef.current = { activeChapter, activeVerse, onSelectVerse };
+  const selectLocalVerse = useCallback((chapter: number, verse: number) => {
+    const current = selectionContextRef.current;
+    const container = containerRef.current;
+    const target = container?.querySelector<HTMLElement>(`[data-find-cell^="${chapter}-${verse}-"]`);
+    const viewport = container && target
+      ? { scrollTop: container.scrollTop, verseTop: target.getBoundingClientRect().top - container.getBoundingClientRect().top }
+      : undefined;
+    current.onSelectVerse(chapter, verse, viewport, () => {
+      if (chapter !== current.activeChapter || verse !== current.activeVerse) {
+        localSelectionRef.current = `${chapter}:${verse}`;
+        setScrollPending(false);
+      }
+    });
+  }, []);
   // Set on any deliberate scroll-to-active request (navigation or the
   // toolbar button). Held until the active chapter is loaded and centered —
   // see the scroll effect below.
@@ -162,9 +195,50 @@ export function BookView({
   // Book mode lazy-loads chapters, so the active chapter's row may not be
   // mounted yet; a bare scrollIntoView would no-op against a null ref. Mark
   // the request pending and let the effect below load + center it.
-  useEffect(() => {
+  useLayoutEffect(() => {
+    const firstLayout = firstLayoutRef.current;
+    firstLayoutRef.current = false;
+    const explicitScroll = previousScrollNonce.current !== scrollNonce;
+    previousScrollNonce.current = scrollNonce;
+    const targetKey = `${activeChapter}:${activeVerse}`;
+    if (restoredTargetRef.current === targetKey && !explicitScroll) return;
+    restoredTargetRef.current = null;
+    const localSelection = localSelectionRef.current === targetKey;
+    localSelectionRef.current = null;
+    const restore = viewportRestoreRef?.current;
+    if (firstLayout && restore && viewportRestoreRef) {
+      // One-shot: a later external navigation must not replay this position.
+      viewportRestoreRef.current = null;
+      if (!explicitScroll && restore.chapter === activeChapter && restore.verse === activeVerse && containerRef.current) {
+        const container = containerRef.current;
+        const oldAnchor = container.style.overflowAnchor;
+        container.style.overflowAnchor = "none";
+        // Verse spans populate their HTML in passive effects. Restoring an
+        // absolute offset before that targets a different chapter in the short
+        // empty layout, then native anchoring follows that wrong chapter.
+        requestAnimationFrame(() => {
+          container.style.overflowAnchor = oldAnchor;
+          if (!container.isConnected || restoredTargetRef.current !== targetKey) return;
+          const target = container.querySelector<HTMLElement>(`[data-find-cell^="${activeChapter}-${activeVerse}-"]`);
+          container.scrollTop = target
+            ? container.scrollTop + target.getBoundingClientRect().top - container.getBoundingClientRect().top - restore.verseTop
+            : restore.scrollTop;
+        });
+        restoredTargetRef.current = targetKey;
+        setScrollPending(false);
+        return;
+      }
+    }
+    if (restore?.chapter === activeChapter && !explicitScroll) {
+      setScrollPending(false);
+      return;
+    }
+    if (localSelection && !explicitScroll) {
+      setScrollPending(false);
+      return;
+    }
     setScrollPending(true);
-  }, [activeChapter, activeVerse, scrollNonce]);
+  }, [activeChapter, activeVerse, scrollNonce, viewportRestoreRef]);
 
   // Resolve a pending scroll-to-active. Eagerly load the active chapter plus
   // the two rows above it so the rows above the target render at full height.
@@ -174,6 +248,7 @@ export function BookView({
   // in-flight loads settle, heights are stable and a single scroll lands true.
   useEffect(() => {
     if (!scrollPending) return;
+    if (restoredTargetRef.current === `${activeChapter}:${activeVerse}` || viewportRestoreRef?.current?.chapter === activeChapter) return;
     for (const c of [activeChapter - 2, activeChapter - 1, activeChapter, activeChapter + 1]) {
       if (!chapterList.includes(c)) continue;
       const s = chapters.get(c);
@@ -188,7 +263,7 @@ export function BookView({
     // we only scroll once heights have settled, the jump lands true.
     activeRowRef.current?.scrollIntoView({ behavior: "auto", block: "center" });
     setScrollPending(false);
-  }, [scrollPending, chapters, activeChapter, activeVerse, chapterList, onLoadChapter]);
+  }, [scrollPending, chapters, activeChapter, activeVerse, chapterList, onLoadChapter, viewportRestoreRef]);
 
   // Scroll to find's active match without changing the actual active verse —
   // navigation between matches shouldn't blow away the user's editing focus.
@@ -314,7 +389,7 @@ export function BookView({
               findActiveMatch={findActiveMatch}
               lexiconMap={lexiconMap}
               onLoadChapter={onLoadChapter}
-              onSelectVerse={onSelectVerse}
+              onSelectVerse={selectLocalVerse}
               onEditVerse={onEditVerse}
               onSaveVerse={handleSaveVerse}
               onOpenAligner={onOpenAligner}
@@ -833,8 +908,7 @@ const VerseCell = memo(function VerseCell({
       setHasDraft(false);
       return;
     }
-    return drafts.subscribe((all) => {
-      const rec = all.find((d) => d.key === draftKey);
+    return drafts.subscribeKey(draftKey, (rec) => {
       setHasDraft(!!rec);
       // Snapshot BEFORE the mirror below overwrites it: true means the user has
       // already typed into this cell, so any draft record arriving now is the
@@ -961,8 +1035,8 @@ const VerseCell = memo(function VerseCell({
       }
       return chipHtml;
     }
-    if (findHTML) return findHTML;
-    if (!Array.isArray(verseObjects)) return null;
+    if (findHTML && search?.sourceQuery.kind !== "english") return findHTML;
+    if (!Array.isArray(verseObjects)) return findHTML;
     // Drift trailing `\q1`/`\p` etc. from the previous verse so the
     // visual break introduces this verse — usfm-js attaches markers
     // to the prior verse (per USFM convention `\q1 \v N+1`).
@@ -991,7 +1065,10 @@ const VerseCell = memo(function VerseCell({
     const composed = lead.length > 0 ? [...lead, ...body] : body;
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents in book view even without active highlights.
-    return renderHighlightedHTML(composed, highlights ?? new Set(), roles);
+    const rendered = renderHighlightedHTML(composed, findHTML ? new Set() : (highlights ?? new Set()), findHTML ? undefined : roles);
+    return search?.re && search.sourceQuery.kind === "english"
+      ? overlayFindMarks(rendered, search.re, activeRange)
+      : rendered;
   }, [findHTML, dto?.content, highlights, prevDto?.content, isActive, readOnly, roles, search, isSource, activeRange]);
 
   // Markers that drifted from the previous verse, for the lookback band. The
@@ -1172,7 +1249,7 @@ const VerseCell = memo(function VerseCell({
             onSplitBridge={onSplitBridge ? (v) => onSplitBridge(chapter, v, "UST") : undefined}
           />
         )}
-      {!readOnly && hasDraft && (
+      {!readOnly && (isActive || hasDraft) && (
         <Tooltip title={`undo edits to verse ${verseNum}`}>
           <IconButton
             onClick={(e) => {
@@ -1197,7 +1274,7 @@ const VerseCell = memo(function VerseCell({
               }
             }}
             size="small"
-            sx={{ color: "warning.main", p: 0.25, verticalAlign: "-3px" }}
+            sx={{ visibility: hasDraft ? "visible" : "hidden", color: "warning.main", p: 0.25, verticalAlign: "-3px" }}
           >
             <UndoIcon sx={{ fontSize: 14 }} />
           </IconButton>
@@ -1210,7 +1287,7 @@ const VerseCell = memo(function VerseCell({
           between verses. Gating on `isActive` makes ScriptureColumn's
           precondition (the chip render is guaranteed in the DOM at click) hold
           here too. */}
-      {isActive && !readOnly && hasDraft && dto && (
+      {isActive && !readOnly && dto && (
         <Tooltip title={`save verse ${verseNum}`}>
           <IconButton
             onClick={(e) => {
@@ -1227,7 +1304,7 @@ const VerseCell = memo(function VerseCell({
               onSaveVerse(bibleVersion, chapter, verseNum, elRef.current?.textContent ?? lastTextRef.current, dto);
             }}
             size="small"
-            sx={{ color: "primary.main", p: 0.25, ml: 0.75, verticalAlign: "-3px" }}
+            sx={{ visibility: hasDraft ? "visible" : "hidden", color: "primary.main", p: 0.25, ml: 0.75, verticalAlign: "-3px" }}
           >
             <SaveIcon sx={{ fontSize: 14 }} />
           </IconButton>
