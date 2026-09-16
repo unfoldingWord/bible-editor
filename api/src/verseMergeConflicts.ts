@@ -89,6 +89,7 @@ import {
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
+  RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL,
   RETIRE_KEPT_AI_MASTER_CONFLICTS_FOR_PAIR_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL,
@@ -290,6 +291,86 @@ export async function deleteLostAdoptionConflicts(
       resource,
       error: e instanceof Error ? e.message : String(e),
     });
+  }
+}
+
+// Issue #789. Called from bookReimport.ts's applyVerseRows once per call,
+// with the (chapter, verse) refs THIS run measured as `keep_converged` /
+// `keep_master_unchanged` for this (book, resource) — computeVerseMerge's two
+// clean outcomes, which never mint or re-record a verse_merge_conflicts row
+// (see RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL's doc comment). Resolving
+// these INSIDE the same run that measured the convergence, rather than a
+// periodic sweep like retireVerseKeptAiMasterFlags below, means the banner
+// clears on the very next reimport instead of waiting for a separate sweep to
+// notice.
+//
+// Reads this (book, resource)'s open backlog of the three kept-D1 actions
+// ONCE — the same SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL
+// raiseVerseMergeConflictAlert derives the banner from, so "is there anything
+// to resolve" costs one cheap, indexed read regardless of how many verses
+// converged this call — and intersects it against `convergedRefs` in memory,
+// so the UPDATE below only ever runs for a verse ACTUALLY carrying an open
+// row. Deliberately NOT one speculative UPDATE per converged verse: on a
+// typical night the vast majority of a book's verses are
+// keep_converged/keep_master_unchanged (nothing changed), and firing a no-op
+// write per verse would spend D1 subrequests for nothing (see WRITE_BATCH's
+// header on the nightly-sync subrequest cap this file and bookReimport.ts
+// both guard).
+//
+// Best-effort, like every other write in this file — a failure here must
+// never fail the reimport that measured the convergence; the next run's
+// backlog read just finds the same standing rows and tries again.
+export async function resolveConvergedVerseMergeConflicts(
+  env: Env,
+  book: string,
+  resource: string,
+  convergedRefs: Array<{ chapter: number; verse: number }>,
+): Promise<{ resolved: number }> {
+  if (convergedRefs.length === 0) return { resolved: 0 };
+  try {
+    const rs = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL)
+      .bind(book, resource)
+      .all<{ chapter: number; verse: number; action: string }>();
+    const backlog = new Set(
+      (rs.results ?? [])
+        .filter(
+          (r) =>
+            r.action === "keep_alignment_refused" ||
+            r.action === "source_attr_divergent" ||
+            r.action === "keep_local_structure",
+        )
+        .map((r) => `${r.chapter}:${r.verse}`),
+    );
+    if (backlog.size === 0) return { resolved: 0 };
+    const toResolve = convergedRefs.filter((r) => backlog.has(`${r.chapter}:${r.verse}`));
+    if (toResolve.length === 0) return { resolved: 0 };
+    const now = Math.floor(Date.now() / 1000);
+    let resolved = 0;
+    for (let i = 0; i < toResolve.length; i += WRITE_BATCH) {
+      const slice = toResolve.slice(i, i + WRITE_BATCH);
+      const results = await env.DB.batch(
+        slice.map((r) =>
+          env.DB.prepare(RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL).bind(now, book, resource, r.chapter, r.verse),
+        ),
+      );
+      for (const r of results) resolved += r?.meta?.changes ?? 0;
+    }
+    if (resolved > 0) {
+      // Same shape as #760: retiring rows alone leaves the MATERIALIZED
+      // system_alerts banner stale until raiseVerseMergeConflictAlert next
+      // re-derives it — this re-checks (inside its own DELETE) whether any
+      // OTHER alertable conflict still justifies the banner before clearing.
+      await clearResolvedConflictBannerIfLast(env, book, resource);
+      console.log("verse merge conflict(s) resolved on convergence", { book, resource, resolved });
+    }
+    return { resolved };
+  } catch (e) {
+    console.error("verseMergeConflicts: resolve-on-convergence failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return { resolved: 0 };
   }
 }
 

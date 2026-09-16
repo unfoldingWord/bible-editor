@@ -134,6 +134,7 @@ import {
   confirmAdoptedConflicts,
   deleteLostAdoptionConflicts,
   raiseVerseMergeConflictAlert,
+  resolveConvergedVerseMergeConflicts,
 } from "./verseMergeConflicts.ts";
 import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
@@ -543,6 +544,16 @@ export interface ReimportCounts {
   // this class exists and can't be "handled on the export side" as an
   // earlier, false comment claimed. verses only.
   merge_cosmetic_ignored: number;
+  // Issue #789: standing `keep_alignment_refused` / `source_attr_divergent` /
+  // `keep_local_structure` verse_merge_conflicts rows this run RESOLVED
+  // because the verse converged with master (`keep_converged` /
+  // `keep_master_unchanged` — see resolveConvergedVerseMergeConflicts). Those
+  // three outcomes never re-record a row on their own, so without this a
+  // standing refusal sat in the "Sync flagged" banner long after the sync
+  // stopped disagreeing about that verse. Counted so a night that quietly
+  // cleared backlog is visible in the summary, not just inferable from the
+  // banner's count dropping. verses only.
+  merge_conflicts_resolved_on_convergence: number;
   // Master's bytes for this (book, resource) were EXACTLY the render the export
   // last pushed, so master moved because our own `-be-` branch merged and the
   // merge ancestor cutoff (master_confirmed_at) was advanced to that render's
@@ -771,6 +782,7 @@ function zeroCounts(): ReimportCounts {
     ref_healed: 0,
     merge_unavailable: 0,
     merge_cosmetic_ignored: 0,
+    merge_conflicts_resolved_on_convergence: 0,
     own_publish_converged: 0,
     merge_record_failed: false,
     stale_base_held: 0,
@@ -1017,6 +1029,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.ref_healed += from.ref_healed ?? 0;
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
+  into.merge_conflicts_resolved_on_convergence += from.merge_conflicts_resolved_on_convergence ?? 0;
   into.own_publish_converged += from.own_publish_converged ?? 0;
   into.merge_record_failed = Boolean(into.merge_record_failed || from.merge_record_failed);
   into.apply_incomplete = Boolean(into.apply_incomplete || from.apply_incomplete);
@@ -5883,6 +5896,16 @@ async function applyVerseRows(
     // See issue #507's version guard on UPSERT_VERSE_MERGE_CONFLICT_SQL.
     observedVersion: number | null;
   }> = [];
+  // Issue #789: verses this run measured as `keep_converged` /
+  // `keep_master_unchanged` — computeVerseMerge's two clean outcomes, which
+  // (unlike every action pushed to mergeConflicts above) never mint or
+  // re-record a verse_merge_conflicts row of their own. Passed to
+  // resolveConvergedVerseMergeConflicts after the loop below, which resolves
+  // any STANDING keep_alignment_refused / source_attr_divergent /
+  // keep_local_structure row for exactly these refs — see that function's doc
+  // comment for why the whole set is collected here rather than checked
+  // per-verse against the backlog inline.
+  const convergedRefs: Array<{ chapter: number; verse: number }> = [];
   // 2-pre. Issue #728: reconcile verse-bridge STRUCTURE as its own dimension,
   // per chapter, BEFORE any content decision. See verseStructure.ts's header for
   // the design (#726) and the four shapes. This replaces PR #721's `bridgeCover`
@@ -6354,6 +6377,10 @@ async function applyVerseRows(
       if (mergeAction === "keep_master_unchanged" || mergeAction === "keep_converged") {
         counts.skipped_edited++;
         counts.source_attr_reconcile_skipped++;
+        // Issue #789: this verse converged with master, so any standing
+        // keep_alignment_refused / source_attr_divergent / keep_local_structure
+        // row for it is stale — resolved (if one exists) after the loop below.
+        convergedRefs.push({ chapter: v.chapter, verse: v.verse });
         continue;
       }
       const rec = reconcileEditedVerseSourceAttrs(ex.content_json, v.contentJson);
@@ -6451,6 +6478,17 @@ async function applyVerseRows(
         ).bind(rowKey, book, userId, ex.version, ex.version + 1, JSON.stringify({ plain_text: v.plainText, content: v.contentJson }), REIMPORT_SOURCE),
       });
     }
+  }
+
+  // Issue #789: resolve any standing keep_alignment_refused /
+  // source_attr_divergent / keep_local_structure row for a verse this run
+  // measured as converged. Independent of every write batch below (no CAS,
+  // no recordFailed gate) — a fresh conflict this SAME run would have pushed
+  // the verse into masterAdoptions/mergeConflicts instead of convergedRefs,
+  // so there is no ordering dependency to protect.
+  if (convergedRefs.length > 0) {
+    const { resolved } = await resolveConvergedVerseMergeConflicts(env, book, resource, convergedRefs);
+    counts.merge_conflicts_resolved_on_convergence += resolved;
   }
 
   if (suppressedRefs.length > 0) {
