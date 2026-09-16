@@ -75,12 +75,16 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 // keeps this idempotent — a row already resolved, by a human or an earlier
 // run, is left untouched (0 changes).
 //
-// Binds, in order: (resolvedAt, book, resource, chapter, verse).
+// `recorded_generation` is an optimistic token: a concurrent upsert increments
+// it, so a cleanup based on an older backlog read cannot retire fresh evidence.
+// Binds, in order: (resolvedAt, book, resource, chapter, verse, action,
+// recordedGeneration).
 // ---------------------------------------------------------------------------
 export const RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
     SET resolved_at = ?1, resolved_by = NULL
   WHERE book = ?2 AND resource = ?3 AND chapter = ?4 AND verse = ?5
-    AND action IN ('keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
+    AND action = ?6
+    AND recorded_generation = ?7
     AND resolved_at IS NULL`;
 
 // ---------------------------------------------------------------------------
@@ -126,7 +130,7 @@ export const RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_co
 //
 // Binds, in order: (book, resource).
 // ---------------------------------------------------------------------------
-export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment, detected_at
+export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment, detected_at, recorded_generation
      FROM verse_merge_conflicts
     WHERE book = ?1 AND resource = ?2
       AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
@@ -317,6 +321,7 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      END,
      alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),
      last_recorded_at = excluded.last_recorded_at,
+     recorded_generation = verse_merge_conflicts.recorded_generation + 1,
      -- REACTIVATION carve-out, 'source_attr_divergent', 'keep_alignment_refused',
      -- and 'keep_local_structure' ONLY. Every other action leaves
      -- resolved_at/resolved_by untouched (the ELSE), preserving the two-phase
