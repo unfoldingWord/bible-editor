@@ -34,6 +34,7 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   // whichever run() the queue picks up next (the queue's own coalescing).
   const runner = useRef<() => Promise<void>>(() => Promise.resolve());
   const queue = useRef<ReturnType<typeof createLintRefreshQueue>>();
+  const disposed = useRef(false);
   if (queue.current === undefined) {
     queue.current = createLintRefreshQueue(() => runner.current());
   }
@@ -43,8 +44,21 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   }, []);
 
   // Dispose only on actual unmount — the queue itself outlives book changes.
+  // React StrictMode replays effects (setup → cleanup → setup) in dev, so the
+  // first cleanup disposes the retained queue while the ref survives; revive
+  // it on the replayed setup or every later refresh() (lint load, dismiss,
+  // edit) would silently no-op against a permanently-disposed queue. This
+  // effect is declared before the book-change effect, so its replayed setup
+  // recreates the queue before that effect's refresh() runs against it.
   useEffect(() => {
-    return () => queue.current!.dispose();
+    if (disposed.current) {
+      queue.current = createLintRefreshQueue(() => runner.current());
+      disposed.current = false;
+    }
+    return () => {
+      queue.current!.dispose();
+      disposed.current = true;
+    };
   }, []);
 
   // Refetch on book change (and reset when disabled) — lint is per-book.
