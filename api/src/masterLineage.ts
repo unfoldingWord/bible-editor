@@ -1404,6 +1404,38 @@ export function refEvidenceTouches(refs: string[], chapter: number, verse: numbe
   return refs.includes(`${chapter}:*`) || refs.includes(`${chapter}:${verse}`);
 }
 
+/**
+ * Positive-evidence counterpart to masterMayHoldHumanEditForVerse.
+ *
+ * This may authorize an exact master-byte adoption, so uncertainty must return
+ * false rather than the protective true used by the master-wins question. The
+ * entire ref set is validated by refsFrom; one malformed entry invalidates it.
+ */
+export function completeHumanRefEvidenceTouches(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+  chapter: number,
+  verse: number,
+  verseEnd?: number | null,
+): boolean {
+  if (
+    lineage == null ||
+    !("mayHoldHumanEdit" in lineage) ||
+    lineage.mayHoldHumanEdit !== true ||
+    lineage.incomplete !== false ||
+    lineage.hasHumanCommit !== true
+  ) return false;
+  if (!Number.isInteger(chapter) || !Number.isInteger(verse) || chapter < 0 || verse < 0) return false;
+  const ev = refsFrom(lineage);
+  if (ev === null || ev.refs.length === 0) return false;
+  let end = verse;
+  if (verseEnd != null) {
+    if (!Number.isInteger(verseEnd) || verseEnd < verse || verseEnd - verse > MAX_BRIDGE_WIDTH) return false;
+    end = verseEnd;
+  }
+  for (let v = verse; v <= end; v++) if (refEvidenceTouches(ev.refs, chapter, v)) return true;
+  return false;
+}
+
 // The per-verse form of masterMayHoldHumanEdit — what the verse merge asks now.
 //
 // It can only ever return the file-level answer or a NARROWER one, and only on

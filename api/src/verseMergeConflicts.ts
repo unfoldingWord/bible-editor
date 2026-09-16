@@ -24,9 +24,12 @@
 //   'adopt_conflict'         — both D1 and master moved since the last
 //                              published ancestor; master won, and the
 //                              overwritten D1 edit may need recovery. Reason
-//                              may be narrowed to both_changed_wording /
-//                              both_changed_alignment / both_changed when the
-//                              visible axes actually differ (issue #633).
+//                              is narrowed to an explicit combination of
+//                              wording / punctuation / alignment axes when
+//                              those visible axes actually differ (issues
+//                              #633 / #788). Legacy both_changed remains
+//                              readable as wording + alignment; punctuation is
+//                              claimed only by the new explicit reasons.
 //   'adopt_no_visible_change'— both sides moved by stableKey, but plain text
 //                              and alignment groups match (issue #633). Audit
 //                              trail only — excluded from banners like 'adopt'.

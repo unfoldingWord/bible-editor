@@ -19,10 +19,9 @@ export interface OverwrittenVerseRef {
   verse: number;
   overwrittenVersion: number;
   /**
-   * verse_merge_conflicts.reason for this overwrite (issue #633). Names what a
-   * reader can see changed — wording, alignment, or both — so the editor
-   * message can say which, instead of always implying Door43 replaced their
-   * text with someone else's work.
+   * verse_merge_conflicts.reason for this overwrite (issue #633 / #788).
+   * Names the independently-measured wording, punctuation, and alignment axes
+   * so the editor message does not call a comma correction a wording change.
    */
   reason?: string;
 }
@@ -68,36 +67,60 @@ export function buildEditorLookupQuery(
   return { sql, keys };
 }
 
-// Issue #633 axes — string compares stay local so this module keeps its
+// Issue #633 / #788 axes — string compares stay local so this module keeps its
 // zero-import contract (see file header). Reasons are minted by
 // visibleAdoptionChange.ts's refineAdoptConflictForVisibleChange.
+// Keep this table explicit instead of `startsWith("both_changed")`: an unknown
+// future/malformed reason must keep the prior fail-safe wording+alignment
+// warning, not accidentally inherit a partial meaning from its spelling.
+// Legacy `both_changed` predates the punctuation axis, so neither case may
+// invent a punctuation claim that was never measured.
+type OverwriteAxes = { wording: boolean; punctuation: boolean; alignment: boolean };
+const LEGACY_SAFE_OVERWRITE_AXES: OverwriteAxes = { wording: true, punctuation: false, alignment: true };
+const ALL_OVERWRITE_AXES: OverwriteAxes = { wording: true, punctuation: true, alignment: true };
+const REASON_OVERWRITE_AXES: Record<string, OverwriteAxes> = {
+  both_changed: LEGACY_SAFE_OVERWRITE_AXES,
+  both_changed_wording: { wording: true, punctuation: false, alignment: false },
+  both_changed_punctuation: { wording: false, punctuation: true, alignment: false },
+  both_changed_alignment: { wording: false, punctuation: false, alignment: true },
+  both_changed_wording_punctuation: { wording: true, punctuation: true, alignment: false },
+  both_changed_wording_alignment: { wording: true, punctuation: false, alignment: true },
+  both_changed_punctuation_alignment: { wording: false, punctuation: true, alignment: true },
+  both_changed_wording_punctuation_alignment: ALL_OVERWRITE_AXES,
+  both_changed_no_visible: { wording: false, punctuation: false, alignment: false },
+};
+
+function overwriteAxesForReason(reason: string | undefined): OverwriteAxes {
+  if (reason == null || reason === "") return LEGACY_SAFE_OVERWRITE_AXES;
+  return Object.hasOwn(REASON_OVERWRITE_AXES, reason)
+    ? REASON_OVERWRITE_AXES[reason]
+    : LEGACY_SAFE_OVERWRITE_AXES;
+}
+
 function reasonImpliesWordingChange(reason: string | undefined): boolean {
-  if (reason == null || reason === "") return true;
-  if (reason === "both_changed_alignment" || reason === "both_changed_no_visible") return false;
-  return (
-    reason === "both_changed" ||
-    reason === "both_changed_wording" ||
-    reason.startsWith("both_changed")
-  );
+  return overwriteAxesForReason(reason).wording;
+}
+
+function reasonImpliesPunctuationChange(reason: string | undefined): boolean {
+  return overwriteAxesForReason(reason).punctuation;
 }
 
 function reasonImpliesAlignmentChange(reason: string | undefined): boolean {
-  if (reason == null || reason === "") return true;
-  if (reason === "both_changed_wording" || reason === "both_changed_no_visible") return false;
-  return (
-    reason === "both_changed" ||
-    reason === "both_changed_alignment" ||
-    reason.startsWith("both_changed")
-  );
+  return overwriteAxesForReason(reason).alignment;
 }
 
-/** What-changed clause for an overwrite alert (issue #633). */
+/** What-changed clause for an overwrite alert (issue #633 / #788). */
 export function describeOverwriteAxes(reasons: Array<string | undefined>): string {
   const wording = reasons.some((r) => reasonImpliesWordingChange(r));
+  const punctuation = reasons.some((r) => reasonImpliesPunctuationChange(r));
   const alignment = reasons.some((r) => reasonImpliesAlignmentChange(r));
-  if (wording && alignment) return "The wording and the alignment changed.";
+  if (wording && punctuation && alignment) return "The wording, punctuation, and alignment changed.";
+  if (wording && punctuation) return "The wording and punctuation changed.";
+  if (wording && alignment) return "The wording and alignment changed.";
+  if (punctuation && alignment) return "The punctuation and alignment changed.";
   if (wording) return "The wording changed.";
-  if (alignment) return "The alignment changed (the wording did not).";
+  if (punctuation) return "The punctuation changed (the wording did not).";
+  if (alignment) return "The alignment changed (the wording and punctuation did not).";
   // Unreachable for alertable adopt_conflict rows; keep a neutral fallback.
   return "Door43's version was taken.";
 }
@@ -131,15 +154,21 @@ export function groupOverwrittenVersesByEditor(
     // verseMergeConflicts.ts already made this exact correction (its own
     // "FIX I"), and this message must not reintroduce the same overclaim.
     //
-    // Issue #633: name what actually differs (wording vs alignment). The
-    // version-history recovery sentence stays when wording changed; when only
-    // alignment changed, point at the previous alignment rather than implying
-    // the words were replaced — and never tell the editor to re-save.
+    // Issue #633 / #788: name what actually differs and point at the matching
+    // version-history material: text, punctuation, alignment, or their measured
+    // combination. No branch tells the editor to re-save.
     const axes = describeOverwriteAxes(reasons);
     const wording = reasons.some((r) => reasonImpliesWordingChange(r));
-    const recovery = wording
-      ? `Your replaced text is still recoverable from each verse's version history, at the version number given after @v.`
-      : `Your previous alignment is still recoverable from each verse's version history, at the version number given after @v.`;
+    const punctuation = reasons.some((r) => reasonImpliesPunctuationChange(r));
+    const alignment = reasons.some((r) => reasonImpliesAlignmentChange(r));
+    const recoverable = wording
+      ? "replaced text"
+      : punctuation && alignment
+        ? "previous punctuation and alignment"
+        : punctuation
+          ? "previous punctuation"
+          : "previous alignment";
+    const recovery = `Your ${recoverable} is still recoverable from each verse's version history, at the version number given after @v.`;
     const message =
       `Door43's sync overwrote your edit${refs.length === 1 ? "" : "s"} in ${book} ` +
       `${resource.toUpperCase()} at ${refs.length} verse(s) with Door43's version: ${refs.join(", ")}. ` +
@@ -346,13 +375,20 @@ export function buildMergeConflictGuidance(
   const keptStructureRows = rows.filter((r) => r.action === "keep_local_structure");
   const keptStructureUnderLocal = keptStructureRows.filter((r) => r.reason === "master_moved_under_local_bridge").length;
   const keptStructureOther = keptStructureRows.length - keptStructureUnderLocal;
-  // Issue #633: name wording vs alignment on the admin sentence too. Split
-  // recovery copy so an alignment-only overwrite never claims "replaced text".
+  // Issue #633 / #788: name wording, punctuation, and alignment in the admin
+  // sentence too, and make its recovery noun match the measured axes.
   const overwriteAxes = describeOverwriteAxes(overwrittenRows.map((r) => r.reason));
   const overwriteWording = overwrittenRows.some((r) => reasonImpliesWordingChange(r.reason));
-  const overwriteRecovery = overwriteWording
-    ? `the replaced text is still in that verse's version history, at the version number given after @v in its ref above.`
-    : `the previous alignment is still in that verse's version history, at the version number given after @v in its ref above.`;
+  const overwritePunctuation = overwrittenRows.some((r) => reasonImpliesPunctuationChange(r.reason));
+  const overwriteAlignment = overwrittenRows.some((r) => reasonImpliesAlignmentChange(r.reason));
+  const overwriteRecoverable = overwriteWording
+    ? "the replaced text"
+    : overwritePunctuation && overwriteAlignment
+      ? "the previous punctuation and alignment"
+      : overwritePunctuation
+        ? "the previous punctuation"
+        : "the previous alignment";
+  const overwriteRecovery = `${overwriteRecoverable} is still in that verse's version history, at the version number given after @v in its ref above.`;
   return [
     overwritten > 0
       ? `${overwritten} took Door43's version over the editor's — ${overwriteAxes} ${overwriteRecovery}`

@@ -499,10 +499,10 @@ console.log("\n[#537 fallout: a GENUINE human edit after export still blocks cle
     "adopt_conflict",
     "the real post-export human edit still blocks the clean-adopt path (case 5), landing on the flagged both_changed path instead",
   );
-  // Issue #633: record-time refinement narrows both_changed to what a reader
-  // can see. This fixture only changes plain text (no alignment groups), so
-  // the stored reason is both_changed_wording — still alertable adopt_conflict.
-  eq(conflict.reason, "both_changed_wording", "…for the right (visible-axes) reason");
+  // Issue #633 / #788: record-time refinement names every visible axis. This
+  // fixture changes wording and punctuation (no alignment groups), so the
+  // stored reason is the explicit combined canonical reason.
+  eq(conflict.reason, "both_changed_wording_punctuation", "…for the right (visible-axes) reason");
   eq(counts.merge_adopted, 1, "still adopts (master wins on both_changed by default), but AS a flagged conflict, not silently");
 }
 
@@ -1067,6 +1067,174 @@ console.log("\n[render round-trip churn on an edited verse writes nothing (held 
     .all(BOOK)[0];
   eq(row.version, 4, "the version does not move");
   eq(row.content_json, oursJson, "…and the stored bytes are untouched");
+}
+
+// ── Issue #788: a positively-attributed human cosmetic edit is preserved ───
+//
+// stableKey intentionally collapses intra-text whitespace, normally so an
+// export/reparse artifact does not churn a human-owned row forever. That also
+// hides a real human Door43 punctuation/spacing correction. The exception is
+// intentionally much narrower than "a human somewhere touched the file": the
+// lineage walk and its ref map must both be complete, the mapped refs must touch
+// this verse/range, no later app edit may exist, and structure must be unchanged.
+const COSMETIC_OURS = contentJson("—");
+const COSMETIC_MASTER = contentJson("—\n");
+const cosmeticHumanLineage = (refs, { complete = true } = {}) => ({
+  mayHoldHumanEdit: true,
+  hasHumanCommit: true,
+  incomplete: !complete,
+  incompleteReason: complete ? "" : "page_cap",
+  counts: { ours: 0, ai: 0, human: 1 },
+  humanShas: ["human-cosmetic"],
+  refsComplete: complete,
+  humanRefs: refs,
+  refsReason: complete ? "" : "page_cap",
+});
+
+function seedCosmeticVerse(sqlite, { chapter = 12, verse = 3, verseEnd = null } = {}) {
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (91, 901, 'translator91')`).run();
+  sqlite.prepare(
+    `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 4, 91)`,
+  ).run(BOOK, chapter, verse, verseEnd, VERSION, COSMETIC_OURS, "—");
+  const ancestor = sqlite.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+     VALUES ('verse', ?, ?, 91, 3, 4, 'update', ?, 100)`,
+  ).run(
+    `${BOOK}/${chapter}/${verse}/${VERSION}`,
+    BOOK,
+    JSON.stringify({ content: JSON.parse(COSMETIC_OURS), plain_text: "—" }),
+  );
+  return Number(ancestor.lastInsertRowid);
+}
+
+console.log("\n[#788: complete human ref evidence adopts exact cosmetic master bytes without an editor alert]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite);
+  let sawAtomicWriteAuditPair = false;
+  env.DB._beforeBatch.push((stmts) => {
+    for (let i = 0; i + 1 < stmts.length; i++) {
+      if (
+        /UPDATE verses\s+SET content_json/.test(stmts[i].sql) &&
+        /INSERT INTO edit_log[\s\S]*WHERE changes\(\) > 0/.test(stmts[i + 1].sql)
+      ) sawAtomicWriteAuditPair = true;
+    }
+  });
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 3, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    { confirmedAt: 200, editId: boundary, lineage: cosmeticHumanLineage(["12:3"]) },
+    false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, plain_text, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 3`).get(BOOK);
+  eq([row.content_json, row.plain_text, row.version], [COSMETIC_MASTER, "—\n", 5], "exact JER-shaped em-dash/newline master bytes land through the normal CAS adoption lane");
+  eq(sawAtomicWriteAuditPair, true, "the verse write and changes()-gated history row share one transactional batch");
+  eq([counts.merge_adopted, counts.merge_cosmetic_adopted, counts.merge_cosmetic_ignored], [1, 1, 0], "the landed exception is counted separately from ignored cosmetic differences");
+  eq(
+    sqlite.prepare(`SELECT action, reason, overwritten_version FROM verse_merge_conflicts WHERE book = ? AND resource = 'ult' AND chapter = 12 AND verse = 3`).get(BOOK),
+    { action: "adopt", reason: "cosmetic_human", overwritten_version: 4 },
+    "the durable audit says clean adopt / cosmetic_human and preserves the recovery pointer",
+  );
+  eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult"), [], "a clean cosmetic adoption produces no editor-facing alert");
+}
+
+console.log("\n[#788: absent or incomplete per-ref evidence remains fail-closed]");
+for (const [label, lineage] of [
+  ["absent", null],
+  ["incomplete", cosmeticHumanLineage(["12:3"], { complete: false })],
+  ["complete but a different ref", cosmeticHumanLineage(["12:4"])],
+  ["matching ref beside malformed evidence", cosmeticHumanLineage(["12:3", "not-a-ref"])],
+  ["malformed positive verdict", { ...cosmeticHumanLineage(["12:3"]), mayHoldHumanEdit: 1 }],
+  ["missing positive verdict", (() => {
+    const { mayHoldHumanEdit: _drop, ...rest } = cosmeticHumanLineage(["12:3"]);
+    return rest;
+  })()],
+]) {
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite);
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 3, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    { confirmedAt: 200, editId: boundary, lineage }, false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 3`).get(BOOK);
+  eq([row.content_json, row.version], [COSMETIC_OURS, 4], `${label}: D1 is retained`);
+  eq([counts.merge_cosmetic_adopted, counts.merge_cosmetic_ignored], [0, 1], `${label}: no evidence cannot open the cosmetic adoption lane`);
+}
+
+console.log("\n[#788: a later app edit closes the cosmetic lane even with an exact complete master ref]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite);
+  sqlite.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+     VALUES ('verse', ?, ?, 91, 4, 4, 'update', ?, 300)`,
+  ).run(`${BOOK}/12/3/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(COSMETIC_OURS) }));
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 3, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    { confirmedAt: 200, editId: boundary, lineage: cosmeticHumanLineage(["12:3"]) }, false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 3`).get(BOOK);
+  eq([row.content_json, row.version], [COSMETIC_OURS, 4], "a post-export app edit wins; cosmetic master bytes are not adopted");
+  eq([counts.merge_cosmetic_adopted, counts.merge_cosmetic_ignored], [0, 1], "the blocked attempt remains visible as ignored cosmetic drift");
+}
+
+console.log("\n[#788: a human ref in the second half of an unchanged bridge authorizes the whole bridged row]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite, { chapter: 13, verse: 1, verseEnd: 2 });
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 13, verse: 1, verseEnd: 2, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    { confirmedAt: 200, editId: boundary, lineage: cosmeticHumanLineage(["13:2"]) }, false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, verse_end, version FROM verses WHERE book = ? AND chapter = 13 AND verse = 1`).get(BOOK);
+  eq([row.content_json, row.verse_end, row.version], [COSMETIC_MASTER, 2, 5], "the second covered ref is evidence for the unchanged bridge's exact master bytes");
+  eq(counts.merge_cosmetic_adopted, 1, "bridge-range evidence is counted as a cosmetic adoption");
+}
+
+console.log("\n[#788: a structural difference cannot enter the cosmetic content-adoption lane]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite, { chapter: 14, verse: 1, verseEnd: null });
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 14, verse: 1, verseEnd: 2, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    { confirmedAt: 200, editId: boundary, lineage: cosmeticHumanLineage(["14:1"]) }, false,
+  );
+  eq(counts.merge_cosmetic_adopted, 0, "the #788 byte-only counter stays zero when grouping differs");
+  eq(counts.merge_cosmetic_ignored, 1, "the raw difference remains fail-closed on the content path");
+}
+
+console.log("\n[#788: a cosmetic adoption that loses its version-CAS race does not count or overwrite]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite, { chapter: 15, verse: 1 });
+  let raced = false;
+  env.DB._beforeBatch.push((stmts) => {
+    if (raced || !stmts.some((s) => /UPDATE verses\s+SET content_json/.test(s.sql))) return;
+    raced = true;
+    sqlite.prepare(`UPDATE verses SET version = version + 1, content_json = ?, plain_text = ? WHERE book = ? AND chapter = 15 AND verse = 1`)
+      .run(contentJson("translator concurrent edit"), "translator concurrent edit", BOOK);
+  });
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 15, verse: 1, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    { confirmedAt: 200, editId: boundary, lineage: cosmeticHumanLineage(["15:1"]) }, false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, version FROM verses WHERE book = ? AND chapter = 15 AND verse = 1`).get(BOOK);
+  eq([row.content_json, row.version], [contentJson("translator concurrent edit"), 5], "the concurrent translator write survives the lost CAS");
+  eq([counts.merge_adopted, counts.merge_cosmetic_adopted, counts.apply_incomplete], [0, 0, true], "a lost cosmetic adoption is not counted and withholds the watermark for retry");
+  eq(sqlite.prepare(`SELECT COUNT(*) AS n FROM verse_merge_conflicts WHERE book = ? AND chapter = 15 AND verse = 1`).get(BOOK).n, 0,
+    "the speculative cosmetic audit is removed when the CAS did not overwrite anything");
 }
 
 // ── Issue #609: the PRISTINE / AI-only writers get the same lens ────────────

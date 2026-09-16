@@ -152,16 +152,19 @@ function assert(cond, msg) {
 }
 
 {
-  // Issue #633: name what differs. Wording-only must still offer text recovery;
-  // alignment-only must NOT claim the words were replaced or tell them to re-save.
+  // Issue #633 / #788: name what differs. Wording/punctuation are text-side
+  // recovery; alignment-only must not claim the words were replaced.
   const wordingOnly = [{ chapter: 40, verse: 5, overwrittenVersion: 8, reason: "both_changed_wording" }];
+  const punctuationOnly = [{ chapter: 40, verse: 6, overwrittenVersion: 9, reason: "both_changed_punctuation" }];
   const alignmentOnly = [{ chapter: 41, verse: 6, overwrittenVersion: 5, reason: "both_changed_alignment" }];
-  const both = [{ chapter: 40, verse: 10, overwrittenVersion: 6, reason: "both_changed" }];
+  const allAxes = [{ chapter: 40, verse: 10, overwrittenVersion: 6, reason: "both_changed_wording_punctuation_alignment" }];
   const keyW = editLogKey("JER", "ult", wordingOnly[0]);
+  const keyP = editLogKey("JER", "ult", punctuationOnly[0]);
   const keyA = editLogKey("JER", "ult", alignmentOnly[0]);
-  const keyB = editLogKey("JER", "ult", both[0]);
+  const keyB = editLogKey("JER", "ult", allAxes[0]);
   const users = new Map([
     [keyW, "translator"],
+    [keyP, "translator"],
     [keyA, "translator"],
     [keyB, "translator"],
   ]);
@@ -171,26 +174,41 @@ function assert(cond, msg) {
   assert(wMsg.includes("replaced text is still recoverable"), "wording-only still points at text recovery");
   assert(!wMsg.includes("re-save"), "overwrite alert never tells the editor to re-save");
 
+  const pMsg = groupOverwrittenVersesByEditor("JER", "ult", punctuationOnly, users).get("translator").message;
+  assert(pMsg.includes("The punctuation changed (the wording did not)."), "punctuation-only names punctuation, not wording");
+  assert(pMsg.includes("previous punctuation is still recoverable"), "punctuation-only points at punctuation recovery");
+
   const aMsg = groupOverwrittenVersesByEditor("JER", "ult", alignmentOnly, users).get("translator").message;
-  assert(aMsg.includes("The alignment changed (the wording did not)."), "alignment-only names alignment");
+  assert(aMsg.includes("The alignment changed (the wording and punctuation did not)."), "alignment-only names alignment");
   assert(aMsg.includes("previous alignment is still recoverable"), "alignment-only recovers alignment, not 'replaced text'");
   assert(!aMsg.includes("replaced text"), "alignment-only must not claim the words were replaced");
   assert(!aMsg.includes("re-save"), "alignment-only never tells the editor to re-save");
 
-  const bMsg = groupOverwrittenVersesByEditor("JER", "ult", both, users).get("translator").message;
-  assert(bMsg.includes("The wording and the alignment changed."), "both-axes names both");
+  const bMsg = groupOverwrittenVersesByEditor("JER", "ult", allAxes, users).get("translator").message;
+  assert(bMsg.includes("The wording, punctuation, and alignment changed."), "all axes name all three");
 }
 
 {
-  // Issue #633 admin guidance: same wording vs alignment distinction.
+  // Issue #633 / #788 admin guidance: same text-side vs alignment distinction.
   const w = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_wording" }]);
   assert(w.includes("The wording changed."), "admin wording-only names wording");
   assert(w.includes("replaced text is still"), "admin wording-only keeps text recovery");
 
+  const p = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_punctuation" }]);
+  assert(p.includes("The punctuation changed (the wording did not)."), "admin punctuation-only names punctuation");
+  assert(p.includes("previous punctuation is still"), "admin punctuation-only keeps punctuation recovery");
+
   const a = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_alignment" }]);
-  assert(a.includes("The alignment changed (the wording did not)."), "admin alignment-only names alignment");
+  assert(a.includes("The alignment changed (the wording and punctuation did not)."), "admin alignment-only names alignment");
   assert(a.includes("previous alignment is still"), "admin alignment-only recovers alignment");
   assert(!a.includes("replaced text"), "admin alignment-only must not claim replaced text");
+
+  const legacy = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed" }]);
+  assert(legacy.includes("The wording and alignment changed."), "legacy both_changed keeps its original two-axis meaning");
+  assert(!legacy.includes("punctuation"), "legacy both_changed does not invent a punctuation claim");
+
+  const prototypeKey = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "__proto__" }]);
+  assert(prototypeKey.includes("The wording and alignment changed."), "prototype-key reason takes the fail-safe warning");
 
   // adopt_no_visible_change is not alertable — if it somehow reached guidance
   // it is not an adopt_conflict, so it must not count as an overwrite.

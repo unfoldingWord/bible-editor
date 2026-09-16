@@ -63,6 +63,7 @@ import {
   masterMayHoldHumanEdit,
   masterMayHoldHumanEditForVerse,
   summarizeLineage,
+  completeHumanRefEvidenceTouches,
   type HumanRefEvidence,
   type MasterLineageSummary,
 } from "./masterLineage.ts";
@@ -545,6 +546,13 @@ export interface ReimportCounts {
   // this class exists and can't be "handled on the export side" as an
   // earlier, false comment claimed. verses only.
   merge_cosmetic_ignored: number;
+  // A raw-byte-only Door43 change that would otherwise have been ignored, but
+  // whose exact verse/range was positively attributed to a human Door43 edit
+  // by a COMPLETE lineage ref map. The exact master bytes were adopted through
+  // the normal version-CAS lane; this is deliberately separate from
+  // merge_adopted so the small, evidence-gated exception stays observable.
+  // verses only.
+  merge_cosmetic_adopted: number;
   // Issue #789: standing `keep_alignment_refused` / `source_attr_divergent` /
   // `keep_local_structure` verse_merge_conflicts rows this run RESOLVED
   // because the verse converged with master (`keep_converged` /
@@ -783,6 +791,7 @@ function zeroCounts(): ReimportCounts {
     ref_healed: 0,
     merge_unavailable: 0,
     merge_cosmetic_ignored: 0,
+    merge_cosmetic_adopted: 0,
     merge_conflicts_resolved_on_convergence: 0,
     own_publish_converged: 0,
     merge_record_failed: false,
@@ -1030,6 +1039,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.ref_healed += from.ref_healed ?? 0;
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
+  into.merge_cosmetic_adopted += from.merge_cosmetic_adopted ?? 0;
   into.merge_conflicts_resolved_on_convergence += from.merge_conflicts_resolved_on_convergence ?? 0;
   into.own_publish_converged += from.own_publish_converged ?? 0;
   into.merge_record_failed = Boolean(into.merge_record_failed || from.merge_record_failed);
@@ -4035,6 +4045,26 @@ interface MergeCutoff {
   lineage?: MasterLineageSummary | null;
 }
 
+// Issue #788: stableKey intentionally treats whitespace-only content changes as
+// converged, which is the right default for render/reparse churn. There is one
+// narrow exception: a complete lineage walk can positively prove that a human
+// Door43 commit touched this exact verse (or one verse covered by its bridge).
+// Only then may we preserve the human's exact master bytes instead of exporting
+// D1's cosmetic form back over them. Every absent, old, incomplete, malformed,
+// or non-matching evidence shape returns false: the ordinary
+// merge_cosmetic_ignored path is the fail-closed default.
+function hasCompleteHumanRefEvidenceForVerse(
+  lineage: MasterLineageSummary | null | undefined,
+  chapter: number,
+  verse: number,
+  verseEnd: number | null | undefined,
+): boolean {
+  // The shared helper validates the ENTIRE ref set, not just the matching
+  // entry. One malformed ref means the evidence is incomplete and cannot
+  // authorize an overwrite.
+  return completeHumanRefEvidenceTouches(lineage, chapter, verse, verseEnd);
+}
+
 async function readPushedBlobText(env: Env, repo: string, sha: string): Promise<string | null> {
   // Gitea's git-blob endpoint requires the full object id. Refuse abbreviated
   // or malformed values rather than letting a provider resolve a different
@@ -5967,6 +5997,10 @@ async function applyVerseRows(
     v: VerseExtract;
     oldVersion: number;
     merge: VerseMergeResult;
+    // #788's evidence-gated exception for a human Door43 whitespace-only edit.
+    // Kept explicit rather than inferred from merge.reason when the CAS lands,
+    // so the counter remains tied to an actual write, never just a decision.
+    cosmeticHuman: boolean;
     plainText: string | null;
     // FIX 8: D1's content before this adoption, so the lane-reopen decision
     // (lanesToReopenOnVerseEdit) can tell whether the adoption actually
@@ -6463,10 +6497,20 @@ async function applyVerseRows(
             );
           }
         }
-        // FIX 5: converged-per-stableKey but the raw bytes differed — a real,
-        // cosmetic-only edit this comparison silently discards. See
-        // verseMerge.ts's FIX 5 correction and the field's own doc comment.
-        if (merge.action === "keep_converged" && ex.content_json !== v.contentJson) {
+        // #788: converged-per-stableKey but raw bytes differ is normally the
+        // render/reparse-churn case, so keep D1. The sole exception requires
+        // positive, COMPLETE evidence that a human Door43 commit touched this
+        // exact verse/range, no human app edit landed after the export boundary,
+        // and the grouping is exactly unchanged. This preserves a maintainer's
+        // intentional punctuation/spacing bytes without opening a generic
+        // cosmetic-write lane that would churn checkoffs or race a translator.
+        const cosmeticHumanAdopt =
+          merge.action === "keep_converged" &&
+          ex.content_json !== v.contentJson &&
+          (ex.verse_end ?? null) === (v.verseEnd ?? null) &&
+          Number(ex.human_edit_after_export ?? 0) === 0 &&
+          hasCompleteHumanRefEvidenceForVerse(cutoff?.lineage, v.chapter, v.verse, v.verseEnd);
+        if (merge.action === "keep_converged" && ex.content_json !== v.contentJson && !cosmeticHumanAdopt) {
           counts.merge_cosmetic_ignored++;
         }
         // FIX 2: record EVERY landed adoption ("adopt" | "adopt_conflict"),
@@ -6480,15 +6524,17 @@ async function applyVerseRows(
         // adjudicated on complete evidence with nothing taken from Door43, so
         // it mints no durable row for a translator to clear. See the counter +
         // log above; the run summary still carries it as merge_kept_ai.
-        if ((merge.conflict || merge.adopt) && merge.action !== "keep_ai_master") {
+        if ((merge.conflict || merge.adopt || cosmeticHumanAdopt) && merge.action !== "keep_ai_master") {
           mergeConflicts.push({
             chapter: v.chapter,
             verse: v.verse,
-            action: merge.action,
-            reason: merge.reason,
-            overwrittenVersion: merge.adopt ? ex.version : null,
+            // This is an audit-only `adopt`, deliberately excluded from the
+            // alertable-action query just like every clean master adoption.
+            action: cosmeticHumanAdopt ? "adopt" : merge.action,
+            reason: cosmeticHumanAdopt ? "cosmetic_human" : merge.reason,
+            overwrittenVersion: (merge.adopt || cosmeticHumanAdopt) ? ex.version : null,
             alignment: merge.alignment ?? null,
-            adopted: merge.adopt,
+            adopted: merge.adopt || cosmeticHumanAdopt,
             // See issue #507: the version this verse's merge outcome was
             // detected at, so the speculative upsert's reactivation carve-out
             // (keep_alignment_refused / source_attr_divergent /
@@ -6497,11 +6543,14 @@ async function applyVerseRows(
             observedVersion: ex.version,
           });
         }
-        if (merge.adopt) {
+        if (merge.adopt || cosmeticHumanAdopt) {
           masterAdoptions.push({
             v,
             oldVersion: ex.version,
-            merge,
+            merge: cosmeticHumanAdopt
+              ? { ...merge, action: "adopt", adopt: true, conflict: false, reason: "cosmetic_human" }
+              : merge,
+            cosmeticHuman: cosmeticHumanAdopt,
             plainText: v.plainText,
             beforeContentJson: ex.content_json,
             beforePlainText: ex.plain_text,
@@ -7121,8 +7170,14 @@ async function applyVerseRows(
         `merge-conflict recording failed this run (see merge_record_failed)`,
     );
   } else {
-    for (let i = 0; i < contentOnlyAdoptions.length; i += WRITE_BATCH) {
-      const slice = contentOnlyAdoptions.slice(i, i + WRITE_BATCH);
+    // Each version-CAS write is immediately followed by its changes()-gated
+    // edit_log row in the SAME transactional D1 batch. The audit payload is a
+    // recovery boundary, not optional telemetry: a write batch followed by a
+    // separate log batch can commit the new verse bytes and then lose history
+    // permanently. Pairing also guarantees a lost CAS mints no phantom log.
+    const ADOPTION_PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+    for (let i = 0; i < contentOnlyAdoptions.length; i += ADOPTION_PAIR_BATCH) {
+      const slice = contentOnlyAdoptions.slice(i, i + ADOPTION_PAIR_BATCH);
       try {
         const results = await env.DB.batch(
           // #686: master-adoption of an out-of-band Door43 correction over a
@@ -7130,7 +7185,7 @@ async function applyVerseRows(
           // and the actor MUST be the measured commit author (never a
           // fallback built here) — this is the write computeVerseMerge only
           // reaches when the human's own edit did NOT explain the difference.
-          slice.map((a) =>
+          slice.flatMap((a) => [
             env.DB.prepare(
               `UPDATE verses
                   SET content_json = ?1, plain_text = ?2, verse_end = ?3,
@@ -7141,24 +7196,25 @@ async function applyVerseRows(
               a.v.contentJson, a.plainText, a.v.verseEnd, now, book, a.v.chapter, a.v.verse, bibleVersion, a.oldVersion,
               ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43 }),
             ),
-          ),
+            gatedLogEditStmt(
+              env, "verse",
+              `${book}/${a.v.chapter}/${a.v.verse}/${bibleVersion}`,
+              book, userId, a.oldVersion, a.oldVersion + 1, "update",
+              { plain_text: a.plainText, content: a.v.contentJson },
+            ),
+          ]),
         );
-        const logs: D1PreparedStatement[] = [];
         slice.forEach((a, j) => {
-          if ((results[j]?.meta.changes ?? 0) > 0) {
+          if ((results[j * 2]?.meta.changes ?? 0) > 0) {
             counts.merge_adopted++;
+            if (a.cosmeticHuman) counts.merge_cosmetic_adopted++;
             adoptionsApplied.add(`${a.v.chapter}:${a.v.verse}`);
-            console.warn("reimport: adopted master's out-of-band correction over D1 (verseMerge)", {
+            console.warn(a.cosmeticHuman
+              ? "reimport: adopted a positively-attributed human cosmetic Door43 edit over D1 (issue #788)"
+              : "reimport: adopted master's out-of-band correction over D1 (verseMerge)", {
               book, bibleVersion, chapter: a.v.chapter, verse: a.v.verse, action: a.merge.action, reason: a.merge.reason,
+              ...(a.cosmeticHuman ? { candidateHumanShas: cutoff?.lineage?.humanShas ?? [] } : {}),
             });
-            logs.push(
-              logEditStmt(
-                env, "verse",
-                `${book}/${a.v.chapter}/${a.v.verse}/${bibleVersion}`,
-                book, userId, a.oldVersion, a.oldVersion + 1, "update",
-                { plain_text: a.plainText, content: a.v.contentJson },
-              ),
-            );
           } else {
             // Lost the version-CAS race — a human wrote this verse between our
             // read and this batch. Master's correction did NOT land, so D1 is
@@ -7172,7 +7228,6 @@ async function applyVerseRows(
             });
           }
         });
-        if (logs.length) await env.DB.batch(logs);
       } catch (e) {
         // Correctness-bearing: this batch adopts a maintainer's out-of-band
         // Door43 correction into D1. A thrown batch leaves D1 stale — taint so
