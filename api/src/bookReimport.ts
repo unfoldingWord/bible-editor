@@ -50,6 +50,7 @@ import {
   fetchDcsMasterTextVerified,
   fetchHumanTouchedRefs,
   listMasterCommitsSince,
+  repoHeadCommitSha,
   NT_BOOKS,
   type MasterCommitPage,
 } from "./dcsSources";
@@ -67,6 +68,7 @@ import {
   type HumanRefEvidence,
   type MasterLineageSummary,
 } from "./masterLineage.ts";
+import { readLedgerMasterLineage } from "./masterLineageLedger.ts";
 import {
   findOurMergeForPr,
   gitBlobShaOrNull,
@@ -4249,6 +4251,69 @@ async function loadMasterLineage(
     // (cold review F3 / Codex P1 on this change).
     if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline);
     return null;
+  }
+  // Prefer the repo-scoped ledger when it can prove a current, gap-free,
+  // complete window. The live path below remains the fallback: old ledger
+  // rows, a stale poll tip, a gap, or any malformed/capped file list must not
+  // become a false "no human" answer. The repo-head probe is necessary because
+  // this resource's file head can be older than a human edit to another file in
+  // the same tracked repo.
+  try {
+    const repoHead = await repoHeadCommitSha(env, file.repo);
+    const ledger = await readLedgerMasterLineage(env.DB, file.repo, file.path, confirmedAt, repoHead);
+    if (ledger.usable && ledger.lineage) {
+      const classified = ledger.lineage.commits;
+      const ledgerPage: MasterCommitPage = {
+        commits: classified,
+        incomplete: false,
+        incompleteReason: "",
+      };
+      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline);
+      const humans = classified.filter((c) => c.kind === "human");
+      let humanRefs: HumanRefEvidence | null = null;
+      if (humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
+        humanRefs = await fetchHumanTouchedRefs(env, file.repo, file.path, humans);
+      }
+      const summary = compactLineage(summarizeLineage(classified, {
+        incomplete: false,
+        incompleteReason: "",
+        humanRefs,
+      }));
+      console.log("reimport master lineage", {
+        book,
+        resource,
+        source: "ledger",
+        confirmedAt,
+        mayHoldHumanEdit: summary.mayHoldHumanEdit,
+        ...summary.counts,
+        incomplete: summary.incomplete,
+        incompleteReason: summary.incompleteReason,
+        humanShas: summary.humanShas,
+        refsComplete: summary.refsComplete,
+        refCount: summary.humanRefs?.length ?? 0,
+      });
+      const asOfSha = classified[0]?.sha ?? null;
+      await persistMasterLineage(env, book, resource, summary, asOfSha, confirmedEditId, confirmedAt);
+      if (resource === "tn" || resource === "tq" || resource === "twl") {
+        const cleared = await clearResolvedMergeNoBase(env, book, resource, confirmedAt, ledgerPage, file, asOfSha);
+        if (stats) stats.noBaseCleared += cleared;
+      }
+      return summary;
+    }
+    console.log("reimport master lineage ledger unavailable; using live walk", {
+      book,
+      resource,
+      reason: ledger.reason,
+    });
+  } catch (error) {
+    // A ledger migration/read failure must never disable the established live
+    // attribution path. This is deliberately fail-closed for ledger use, not
+    // fail-open for the merge decision.
+    console.warn("reimport master lineage ledger read failed; using live walk", {
+      book,
+      resource,
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
   if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline);
