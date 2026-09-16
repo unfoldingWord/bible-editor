@@ -5933,6 +5933,23 @@ async function applyVerseRows(
   // the component's absorbed/recreated rows still at the same time.
   const anchorByKey = new Map<string, StructureAdoption<ExistingVerseRow, VerseExtract>>();
   for (const a of plan.adoptions) anchorByKey.set(structureKey(a.chapter, a.anchor.verse), a);
+  // A standing keep_local_structure row must retire when the two sides later
+  // have the same range again, even if this verse is pristine and therefore
+  // never enters computeVerseMerge's edited-row convergence branch. Any key
+  // owned by the plan is still divergent or being adopted and is excluded.
+  const structurallyConvergedRefs: Array<{ chapter: number; verse: number }> = [];
+  for (const v of verses) {
+    const key = structureKey(v.chapter, v.verse);
+    const ex = existing.get(key);
+    if (
+      ex != null &&
+      (ex.verse_end ?? null) === (v.verseEnd ?? null) &&
+      !plan.skipMasterKeys.has(key) &&
+      !anchorByKey.has(key)
+    ) {
+      structurallyConvergedRefs.push({ chapter: v.chapter, verse: v.verse });
+    }
+  }
   // For a 'split' anchor, what rule 4 of computeVerseMerge measures alignment
   // against: master's rows over the bridge's WHOLE range, joined the way the
   // bridge route joins verses. Verse-to-verse, every un-bridge would look like
@@ -6486,8 +6503,11 @@ async function applyVerseRows(
   // no recordFailed gate) — a fresh conflict this SAME run would have pushed
   // the verse into masterAdoptions/mergeConflicts instead of convergedRefs,
   // so there is no ordering dependency to protect.
-  if (convergedRefs.length > 0) {
-    const { resolved } = await resolveConvergedVerseMergeConflicts(env, book, resource, convergedRefs);
+  const allConvergedRefs = [...new Map(
+    [...structurallyConvergedRefs, ...convergedRefs].map((r) => [structureKey(r.chapter, r.verse), r]),
+  ).values()];
+  if (allConvergedRefs.length > 0) {
+    const { resolved } = await resolveConvergedVerseMergeConflicts(env, book, resource, allConvergedRefs);
     counts.merge_conflicts_resolved_on_convergence += resolved;
   }
 

@@ -330,8 +330,8 @@ export async function resolveConvergedVerseMergeConflicts(
   try {
     const rs = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL)
       .bind(book, resource)
-      .all<{ chapter: number; verse: number; action: string }>();
-    const backlog = new Set(
+      .all<{ chapter: number; verse: number; action: string; recorded_generation: number }>();
+    const backlog = new Map(
       (rs.results ?? [])
         .filter(
           (r) =>
@@ -339,10 +339,15 @@ export async function resolveConvergedVerseMergeConflicts(
             r.action === "source_attr_divergent" ||
             r.action === "keep_local_structure",
         )
-        .map((r) => `${r.chapter}:${r.verse}`),
+        .map((r) => [
+          `${r.chapter}:${r.verse}`,
+          { action: r.action, generation: Number(r.recorded_generation ?? 0) },
+        ] as const),
     );
     if (backlog.size === 0) return { resolved: 0 };
-    const toResolve = convergedRefs.filter((r) => backlog.has(`${r.chapter}:${r.verse}`));
+    const toResolve = convergedRefs
+      .map((r) => ({ ...r, conflict: backlog.get(`${r.chapter}:${r.verse}`) }))
+      .filter((r): r is typeof r & { conflict: { action: string; generation: number } } => r.conflict != null);
     if (toResolve.length === 0) return { resolved: 0 };
     const now = Math.floor(Date.now() / 1000);
     let resolved = 0;
@@ -350,7 +355,9 @@ export async function resolveConvergedVerseMergeConflicts(
       const slice = toResolve.slice(i, i + WRITE_BATCH);
       const results = await env.DB.batch(
         slice.map((r) =>
-          env.DB.prepare(RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL).bind(now, book, resource, r.chapter, r.verse),
+          env.DB.prepare(RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL).bind(
+            now, book, resource, r.chapter, r.verse, r.conflict.action, r.conflict.generation,
+          ),
         ),
       );
       for (const r of results) resolved += r?.meta?.changes ?? 0;

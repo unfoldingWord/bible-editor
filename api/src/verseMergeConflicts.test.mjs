@@ -380,7 +380,8 @@ function verseDb() {
   d.exec(`CREATE TABLE verse_merge_conflicts (
     id INTEGER PRIMARY KEY AUTOINCREMENT, book TEXT, resource TEXT, chapter INTEGER,
     verse INTEGER, action TEXT, reason TEXT, overwritten_version INTEGER, alignment TEXT,
-    detected_at INTEGER, resolved_at INTEGER, resolved_by INTEGER, last_recorded_at INTEGER
+    detected_at INTEGER, resolved_at INTEGER, resolved_by INTEGER, last_recorded_at INTEGER,
+    recorded_generation INTEGER NOT NULL DEFAULT 0
   )`);
   // Required for UPSERT_VERSE_MERGE_CONFLICT_SQL's `ON CONFLICT (book,
   // resource, chapter, verse)` clause to have anything to conflict against —
@@ -2059,7 +2060,7 @@ function ts(dateStr) {
 
 {
   const mkEnv = (d, opts = {}) => {
-    const { failBatch = false } = opts;
+    const { failBatch = false, beforeBatch = null } = opts;
     const make = (sql) => ({
       bind: (...args) => ({
         _sql: sql,
@@ -2075,6 +2076,7 @@ function ts(dateStr) {
         prepare: (sql) => make(sql),
         batch: async (stmts) => {
           if (failBatch) throw new Error("simulated transient D1 batch error");
+          if (beforeBatch) beforeBatch();
           return stmts.map((s) => ({ meta: { changes: Number(d.prepare(s._sql).run(...(s._args ?? [])).changes) } }));
         },
       },
@@ -2236,6 +2238,37 @@ function ts(dateStr) {
       .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='EZK' AND chapter=44 AND verse=18`)
       .get();
     assert(row.resolved_at === null, "…and the row is left standing, retried on the next run");
+  }
+
+  // Case 9: a concurrent reimport re-recording the same key after the backlog
+  // read increments its generation. The stale cleanup CAS must not resolve it.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts
+         (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, last_recorded_at)
+       VALUES ('EZK','ust',47,1,'keep_alignment_refused','alignment_shrink',NULL,100,100)`,
+    ).run();
+
+    const result = await resolveConvergedVerseMergeConflicts(
+      mkEnv(d, {
+        beforeBatch: () => d.prepare(
+          `UPDATE verse_merge_conflicts
+              SET last_recorded_at = 200, recorded_generation = recorded_generation + 1
+            WHERE book='EZK' AND resource='ust' AND chapter=47 AND verse=1`,
+        ).run(),
+      }),
+      "EZK",
+      "ust",
+      [{ chapter: 47, verse: 1 }],
+    );
+    assert(result.resolved === 0, "a concurrently re-recorded conflict defeats the stale cleanup CAS");
+    const row = d.prepare(
+      `SELECT resolved_at, recorded_generation FROM verse_merge_conflicts
+        WHERE book='EZK' AND resource='ust' AND chapter=47 AND verse=1`,
+    ).get();
+    assert(row.resolved_at === null && row.recorded_generation === 1,
+      "the fresh conflict remains active at its newer generation");
   }
 }
 
