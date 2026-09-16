@@ -1431,7 +1431,13 @@ async function runReimport(
         )
       : null;
     perResource[resource].merge_no_base_cleared += stats.noBaseCleared;
-    return { ...cutoff, lineage };
+    // #658 may advance the boundary inside loadMasterLineage. Re-read verse
+    // resources afterward so this same user-triggered run sees it, and attach
+    // #790's exact confirmed-render bases once for all chapter calls.
+    const current = resource === "ult" || resource === "ust"
+      ? await getMasterConfirmedAt(env, book, resource, true)
+      : cutoff;
+    return { ...current, lineage };
   };
 
   const masterConfirmedAtUlt = await withLineage(
@@ -4011,6 +4017,10 @@ function sourceWordsForVerseRange(
 interface MergeCutoff {
   confirmedAt: number | null;
   editId: number | null;
+  // #790: exact per-verse content parsed from the pushed render whose
+  // read/edit boundary is identical to this confirmed boundary. Absent means
+  // the artifact could not be proven/read; callers then keep keep_no_base.
+  confirmedVerseBases?: Map<string, string> | null;
   /**
    * WHO moved master's file for this (book, resource) since the ancestor —
    * issue #540 item 1. Fetched once per pair per run at the only place that
@@ -4025,34 +4035,138 @@ interface MergeCutoff {
   lineage?: MasterLineageSummary | null;
 }
 
-async function getMasterConfirmedAt(env: Env, book: string, resource: string): Promise<MergeCutoff> {
+async function readPushedBlobText(env: Env, repo: string, sha: string): Promise<string | null> {
+  // Gitea's git-blob endpoint requires the full object id. Refuse abbreviated
+  // or malformed values rather than letting a provider resolve a different
+  // object than the one recordPushedRender measured.
+  if (!/^[0-9a-f]{40}$/i.test(sha)) return null;
+  try {
+    const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+    const response = await fetch(
+      `${base}/api/v1/repos/unfoldingWord/${encodeURIComponent(repo)}/git/blobs/${sha}`,
+      env.DCS_SERVICE_TOKEN ? { headers: { Authorization: `token ${env.DCS_SERVICE_TOKEN}` } } : undefined,
+    );
+    if (!response.ok) return null;
+    const body = await response.json<{ content?: string; encoding?: string }>();
+    if (body.encoding !== "base64" || typeof body.content !== "string") return null;
+    const binary = atob(body.content.replace(/\s/g, ""));
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    return new TextDecoder("utf-8").decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+async function confirmedVerseBases(
+  env: Env,
+  book: string,
+  resource: "ult" | "ust",
+  row: {
+    master_confirmed_at: number | null;
+    master_confirmed_edit_id: number | null;
+    pushed_blob_sha: string | null;
+    pushed_read_at: number | null;
+    pushed_edit_id: number | null;
+    pushed_r2_key: string | null;
+  },
+): Promise<Map<string, string> | null> {
+  if (
+    row.master_confirmed_at == null ||
+    row.pushed_read_at !== row.master_confirmed_at ||
+    row.pushed_edit_id !== row.master_confirmed_edit_id ||
+    row.pushed_blob_sha == null
+  ) return null;
+
+  let raw = row.pushed_r2_key ? await readStaged(env, row.pushed_r2_key) : null;
+  if (raw == null) {
+    const file = dcsResourceFile(book, resource);
+    raw = file ? await readPushedBlobText(env, file.repo, row.pushed_blob_sha) : null;
+  }
+  if (raw == null) return null;
+  try {
+    const bases = new Map<string, string>();
+    for (const verse of extractVersesForRange(raw, 0, 999)) {
+      bases.set(`${verse.chapter}:${verse.verse}`, verse.contentJson);
+    }
+    return bases.size > 0 ? bases : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getMasterConfirmedAt(
+  env: Env,
+  book: string,
+  resource: string,
+  includeConfirmedVerseBases: boolean = false,
+): Promise<MergeCutoff> {
   try {
     const row = await env.DB.prepare(
-      `SELECT master_confirmed_at, master_confirmed_edit_id FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+      `SELECT master_confirmed_at, master_confirmed_edit_id, pushed_blob_sha, pushed_read_at,
+              pushed_edit_id, pushed_r2_key
+         FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
     )
       .bind(book, resource)
-      .first<{ master_confirmed_at: number | null; master_confirmed_edit_id: number | null }>();
-    return { confirmedAt: row?.master_confirmed_at ?? null, editId: row?.master_confirmed_edit_id ?? null };
+      .first<{
+        master_confirmed_at: number | null;
+        master_confirmed_edit_id: number | null;
+        pushed_blob_sha: string | null;
+        pushed_read_at: number | null;
+        pushed_edit_id: number | null;
+        pushed_r2_key: string | null;
+      }>();
+    const cutoff: MergeCutoff = {
+      confirmedAt: row?.master_confirmed_at ?? null,
+      editId: row?.master_confirmed_edit_id ?? null,
+    };
+    if (includeConfirmedVerseBases && row && (resource === "ult" || resource === "ust")) {
+      cutoff.confirmedVerseBases = await confirmedVerseBases(env, book, resource, row);
+    }
+    return cutoff;
   } catch (e) {
-    // 0050 not applied yet (deploy raced its migration — the "missing migration
-    // = prod 500s" class). Degrade to the timestamp cutoff rather than fail the
-    // whole reimport: fall back to master_confirmed_at alone with editId null, so
-    // the merge keeps running on the pre-P1.3 `created_at` boundary until 0050
-    // lands. Logged loudly — a silently-disabled precision is how the original
-    // watermark bug hid for months.
-    console.error("reimport: master_confirmed_edit_id read failed (migration 0050 unapplied?) — merge boundary degraded to the second-granularity timestamp", {
+    // 0064 may lag the Worker during a deploy. Preserve 0050's precise edit-id
+    // boundary and disable only the confirmed-render fallback until the new
+    // column lands; dropping straight to timestamps would unnecessarily reopen
+    // the same-second attribution hole 0050 closed.
+    console.error("reimport: pushed_r2_key read failed (migration 0064 unapplied?) — confirmed-render fallback disabled", {
       book,
       resource,
       error: e instanceof Error ? e.message : String(e),
     });
-    const row = await env.DB.prepare(
-      `SELECT master_confirmed_at FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
-    )
-      .bind(book, resource)
-      .first<{ master_confirmed_at: number | null }>();
-    return { confirmedAt: row?.master_confirmed_at ?? null, editId: null };
+    try {
+      const row = await env.DB.prepare(
+        `SELECT master_confirmed_at, master_confirmed_edit_id
+           FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+      )
+        .bind(book, resource)
+        .first<{ master_confirmed_at: number | null; master_confirmed_edit_id: number | null }>();
+      return {
+        confirmedAt: row?.master_confirmed_at ?? null,
+        editId: row?.master_confirmed_edit_id ?? null,
+      };
+    } catch (e2) {
+      // 0050 itself has not landed: retain the older timestamp-only fallback.
+      console.error("reimport: master_confirmed_edit_id read failed (migration 0050 unapplied?) — merge boundary degraded to the second-granularity timestamp", {
+        book,
+        resource,
+        error: e2 instanceof Error ? e2.message : String(e2),
+      });
+      const row = await env.DB.prepare(
+        `SELECT master_confirmed_at FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+      )
+        .bind(book, resource)
+        .first<{ master_confirmed_at: number | null }>();
+      return { confirmedAt: row?.master_confirmed_at ?? null, editId: null };
+    }
   }
 }
+
+export const getMasterConfirmedAtForTest = (
+  env: Env,
+  book: string,
+  resource: string,
+  includeConfirmedVerseBases: boolean = false,
+): Promise<MergeCutoff> => getMasterConfirmedAt(env, book, resource, includeConfirmedVerseBases);
 
 // Who moved master's file for this (book, resource) since the merge's ancestor
 // (#540 item 1). One Gitea call per page, default budget 5 pages (~250 commits)
@@ -5458,6 +5572,7 @@ interface ExistingVerseRow {
   updated_by: number | null;
   latest_source: string | null;
   base_payload?: string | null;
+  base_row_exists?: number | null;
   human_edit_after_export?: number | null;
   structural_edit_id?: number | null;
   structural_edit_at?: number | null;
@@ -5748,8 +5863,18 @@ async function applyVerseRows(
                  AND (
                    (action IN ('create', 'update', 'bridge', 'split') AND ${baseBoundary})
                    OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
-                 )
+               )
                ORDER BY created_at DESC, id DESC LIMIT 1) AS base_payload,
+            EXISTS (
+              SELECT 1 FROM edit_log
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND (
+                   (action IN ('create', 'update', 'bridge', 'split') AND ${baseBoundary})
+                   OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
+                 )
+            ) AS base_row_exists,
             EXISTS (
               SELECT 1 FROM edit_log
                WHERE kind = 'verse'
@@ -6022,7 +6147,11 @@ async function applyVerseRows(
       for (const m of kl.masterVerses) {
         const same = kl.d1Rows.find((r) => r.verse === m.verse);
         if (same) {
-          const ancestor = verseContentJsonFromPayload(same.base_payload ?? null);
+          const loggedAncestor = verseContentJsonFromPayload(same.base_payload ?? null);
+          const renderedAncestor = Number(same.base_row_exists ?? 0) === 0
+            ? cutoff?.confirmedVerseBases?.get(`${kl.chapter}:${m.verse}`) ?? null
+            : null;
+          const ancestor = loggedAncestor ?? renderedAncestor;
           if (ancestor != null) {
             if (!verseContentConverged(ancestor, m.contentJson)) {
               mergeConflicts.push({
@@ -6217,8 +6346,17 @@ async function applyVerseRows(
       // below. null when no cutoff exists (no merge ran).
       let mergeAction: VerseMergeAction | null = null;
       if (lastExportAt != null) {
+        // #790: bootstrap import writes no verse audit rows. If this verse's
+        // first content row landed only after the confirmed boundary, the
+        // ordinary fold has no ancestor even though the exact confirmed render
+        // does. Use that render only when SQL proves there was NO eligible row
+        // at/below the boundary; a present-but-bad payload must remain unknown.
+        const loggedBase = verseContentJsonFromPayload(ex.base_payload ?? null);
+        const confirmedBase = Number(ex.base_row_exists ?? 0) === 0
+          ? cutoff?.confirmedVerseBases?.get(`${v.chapter}:${v.verse}`) ?? null
+          : null;
         const merge = computeVerseMerge({
-          base: verseContentJsonFromPayload(ex.base_payload ?? null),
+          base: loggedBase ?? confirmedBase,
           ours: ex.content_json,
           theirs: v.contentJson,
           humanEditedSinceExport: Number(ex.human_edit_after_export ?? 0) !== 0,
@@ -7713,6 +7851,10 @@ interface StagedResource {
   // shipped; masterMayHoldHumanEdit reads that absence as "a human may have",
   // which is the pre-existing behavior.
   lineage?: MasterLineageSummary | null;
+  // #790: ref -> content_json map parsed once in the plan step from the exact
+  // render at the confirmed boundary. Chunk steps consume this compact JSON
+  // instead of reparsing a historical whole-book USFM file.
+  confirmedBaseR2Key?: string | null;
   // #653: merge_no_base flags the SAME walk retired for this (book, resource).
   // Seeded into the run summary from the plan, not from a chunk — the clear is
   // per pair and happens at staging time, so counting it in a chunk would
@@ -9477,6 +9619,25 @@ async function planAndStageBookResources(
       // verdict that means "we measured a difference" (see accountOwnPublishDecline).
       own.reason === "content_differs" ? sync : null,
     );
+    let confirmedBaseR2Key: string | null = null;
+    if (resource === "ult" || resource === "ust") {
+      // loadMasterLineage may have advanced the boundary via #658. Parse the
+      // exact confirmed render once now, then stage only its compact verse map
+      // for all later chunk steps.
+      const confirmed = await getMasterConfirmedAt(env, book, resource, true);
+      if (confirmed.confirmedVerseBases?.size) {
+        confirmedBaseR2Key = `reimport-stage/${instanceId}/${book}/${resource}-confirmed-bases`;
+        await env.BLOBS.put(
+          confirmedBaseR2Key,
+          JSON.stringify({
+            confirmedAt: confirmed.confirmedAt,
+            editId: confirmed.editId,
+            bases: Object.fromEntries(confirmed.confirmedVerseBases),
+          }),
+          { httpMetadata: { contentType: "application/json" } },
+        );
+      }
+    }
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
     entries.push({
@@ -9486,6 +9647,7 @@ async function planAndStageBookResources(
       r2Key,
       verifiedComplete,
       lineage,
+      confirmedBaseR2Key,
       noBaseCleared: noBaseStats.noBaseCleared,
       // Null on every ordinary night. Non-null ONLY on a force-released
       // stale-base adoption — see the gate above and staleBaseOverridden below.
@@ -9494,6 +9656,17 @@ async function planAndStageBookResources(
   }
   return { maxChapter, entries };
 }
+
+function confirmedBasesForCutoff(
+  stagedBase: { confirmedAt: number | null; editId: number | null; bases: Map<string, string> } | undefined,
+  cutoff: { confirmedAt: number | null; editId: number | null },
+): Map<string, string> | null {
+  return stagedBase && stagedBase.confirmedAt === cutoff.confirmedAt && stagedBase.editId === cutoff.editId
+    ? stagedBase.bases
+    : null;
+}
+
+export const confirmedBasesForCutoffForTest = confirmedBasesForCutoff;
 
 // Reimport one chapter range from staged files. Reads each staged file once,
 // then loops chapters. TSV chapters absent from changedTsv[kind] are skipped.
@@ -9516,6 +9689,34 @@ async function reimportStagedChunk(
     if (!e.changed || !e.r2Key) continue;
     const raw = await readStaged(env, e.r2Key);
     if (raw != null) rawByResource[e.resource] = raw;
+  }
+
+  const confirmedBasesByResource: Partial<Record<"ult" | "ust", {
+    confirmedAt: number | null;
+    editId: number | null;
+    bases: Map<string, string>;
+  }>> = {};
+  for (const resource of ["ult", "ust"] as const) {
+    const key = staged.find((e) => e.resource === resource)?.confirmedBaseR2Key;
+    if (!key) continue;
+    const json = await readStaged(env, key);
+    if (json == null) continue;
+    try {
+      const parsed = JSON.parse(json) as { confirmedAt?: unknown; editId?: unknown; bases?: unknown };
+      if ((typeof parsed.confirmedAt !== "number" && parsed.confirmedAt !== null) ||
+          (typeof parsed.editId !== "number" && parsed.editId !== null) ||
+          parsed.bases == null || typeof parsed.bases !== "object" || Array.isArray(parsed.bases)) continue;
+      confirmedBasesByResource[resource] = {
+        confirmedAt: parsed.confirmedAt,
+        editId: parsed.editId,
+        bases: new Map(
+          Object.entries(parsed.bases as Record<string, unknown>)
+            .filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+        ),
+      };
+    } catch {
+      // Fail closed: an unreadable staged base leaves keep_no_base unchanged.
+    }
   }
 
   // USFM: one parse of the chunk range per version, grouped by chapter.
@@ -9570,7 +9771,15 @@ async function reimportStagedChunk(
   const lineageOf = (resource: Resource): MasterLineageSummary | null =>
     staged.find((e) => e.resource === resource)?.lineage ?? null;
   const withLineage = (cutoff: MergeCutoff | null, resource: Resource): MergeCutoff | null =>
-    cutoff == null ? null : { ...cutoff, lineage: lineageOf(resource) };
+    cutoff == null
+      ? null
+      : {
+          ...cutoff,
+          lineage: lineageOf(resource),
+          confirmedVerseBases: resource === "ult" || resource === "ust"
+            ? confirmedBasesForCutoff(confirmedBasesByResource[resource], cutoff)
+            : undefined,
+        };
 
   const masterConfirmedAtUlt = withLineage(
     versesByChapter.ult ? await getMasterConfirmedAt(env, book, "ult") : null,
@@ -10079,6 +10288,9 @@ export async function runChunkedReimport(
     let cleaned = 0;
     for (const e of plan.entries) {
       if (e.r2Key) { try { await env.BLOBS.delete(e.r2Key); cleaned++; } catch { /* best-effort */ } }
+      if (e.confirmedBaseR2Key) {
+        try { await env.BLOBS.delete(e.confirmedBaseR2Key); cleaned++; } catch { /* best-effort */ }
+      }
     }
     return { cleaned };
   });

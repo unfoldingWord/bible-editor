@@ -1147,6 +1147,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         built.content,
         built.readAt,
         built.editBoundary,
+        r2Key,
         commit.contentSha,
         isMasterConfirmed(commit),
       );
@@ -2333,6 +2334,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // master_confirmed_edit_id on the same confirmMaster gate as
     // master_confirmed_at. null only when edit_log is empty.
     editBoundary: number | null,
+    // #790: R2 object containing these exact render bytes. Guarded by the
+    // same pushed_read_at comparison as the blob/read/edit trio below.
+    r2Key: string,
     giteaBlobSha: string,
     confirmMaster: boolean,
   ): Promise<void> {
@@ -2366,6 +2370,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 -- recognizes this render on master (the steady-state path).
                 pushed_edit_id =
                   CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?6 ELSE pushed_edit_id END,
+                pushed_r2_key =
+                  CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?7 ELSE pushed_r2_key END,
                 master_confirmed_at =
                   CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END,
                 -- Shadow master_confirmed_at, but ONLY when this render is the
@@ -2387,7 +2393,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                        ELSE master_confirmed_edit_id END
           WHERE book = ?1 AND resource = ?2`,
       )
-        .bind(book, resource, blobSha, readAt, confirmMaster ? 1 : 0, editBoundary)
+        .bind(book, resource, blobSha, readAt, confirmMaster ? 1 : 0, editBoundary, r2Key)
         .run();
       if ((result.meta?.changes ?? 0) === 0) {
         // No book_resource_syncs row yet. UPDATE-only is deliberate (origin is NOT
