@@ -43,6 +43,7 @@ import {
   applyTsvRows,
   applyVerseRowsForTest,
   clearResolvedMergeNoBaseForTest,
+  getMasterConfirmedAtForTest,
   recordResourceSync,
   recordWithheldSyncIfAbsent,
   retireMergeKeptFlags,
@@ -3731,6 +3732,55 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
     } finally {
       globalThis.fetch = realFetch;
     }
+  }
+}
+
+console.log("\n[#790 confirmed-render source: exact boundary, R2 first, full-blob fallback]");
+{
+  const { sqlite, env } = freshEnv();
+  const SHA = "1234567890abcdef1234567890abcdef12345678";
+  const KEY = "exports/run/1CH/ult/13-1CH.usfm";
+  const USFM = "\\id 1CH\n\\usfm 3.0\n\n\\c 7\n\\p\n\\v 3 published ancestor\n";
+  sqlite.prepare(
+    `INSERT INTO book_resource_syncs
+       (book, resource, source_sha, origin, master_confirmed_at, master_confirmed_edit_id,
+        pushed_blob_sha, pushed_read_at, pushed_edit_id, pushed_r2_key)
+     VALUES (?, 'ult', 'master', 'reimport', 500, 77, ?, 500, 77, ?)`,
+  ).run(BOOK, SHA, KEY);
+  let r2Reads = 0;
+  env.BLOBS = {
+    get: async (key) => {
+      r2Reads++;
+      return key === KEY ? { text: async () => USFM } : null;
+    },
+  };
+  const fromR2 = await getMasterConfirmedAtForTest(env, BOOK, "ult", true);
+  eq(fromR2.confirmedAt, 500, "confirmed time is returned");
+  eq(fromR2.editId, 77, "confirmed edit boundary is returned");
+  eq(JSON.stringify(JSON.parse(fromR2.confirmedVerseBases.get("7:3"))).includes("published ancestor"), true,
+    "the exact confirmed R2 render is parsed into a verse ancestor");
+  eq(r2Reads, 1, "R2 is preferred and read once");
+
+  sqlite.prepare(`UPDATE book_resource_syncs SET master_confirmed_edit_id = 76 WHERE book = ? AND resource = 'ult'`).run(BOOK);
+  const mismatch = await getMasterConfirmedAtForTest(env, BOOK, "ult", true);
+  eq(mismatch.confirmedVerseBases, null, "a pushed/confirmed boundary mismatch refuses the artifact");
+  eq(r2Reads, 1, "…without even reading R2");
+
+  sqlite.prepare(
+    `UPDATE book_resource_syncs SET master_confirmed_edit_id = 77, pushed_r2_key = 'missing' WHERE book = ? AND resource = 'ult'`,
+  ).run(BOOK);
+  const realFetch = globalThis.fetch;
+  let blobUrl = "";
+  globalThis.fetch = async (url) => {
+    blobUrl = String(url);
+    return { ok: true, json: async () => ({ encoding: "base64", content: btoa(USFM) }) };
+  };
+  try {
+    const fromBlob = await getMasterConfirmedAtForTest(env, BOOK, "ult", true);
+    eq(fromBlob.confirmedVerseBases.has("7:3"), true, "a missing R2 object falls back to the pushed git blob");
+    eq(blobUrl.endsWith(`/git/blobs/${SHA}`), true, "the fallback requests the full 40-character blob id");
+  } finally {
+    globalThis.fetch = realFetch;
   }
 }
 

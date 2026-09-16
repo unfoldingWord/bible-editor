@@ -15,7 +15,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { applyVerseRowsForTest } from "./bookReimport.ts";
+import { applyVerseRowsForTest, confirmedBasesForCutoffForTest } from "./bookReimport.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 import { SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL, UPSERT_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictSql.ts";
 
@@ -548,6 +548,101 @@ console.log("\n[keep_no_base collects an editor ref carrying the verse's CURRENT
     .all(BOOK, 7, 3)[0];
   eq(JSON.parse(row.content_json).verseObjects[0].text, "app's own text", "D1's content is untouched");
   eq(row.version, 5, "D1's version is untouched — nothing was written");
+}
+
+console.log("\n[#790: first edit after watermark recovers the exact confirmed-render ancestor]");
+{
+  const stagedBases = new Map([["7:3", contentJson("published")]]);
+  eq(
+    confirmedBasesForCutoffForTest({ confirmedAt: 100, editId: 5, bases: stagedBases }, { confirmedAt: 100, editId: 5 }) === stagedBases,
+    true,
+    "a staged ancestor map is accepted only at its exact confirmation boundary",
+  );
+  eq(
+    confirmedBasesForCutoffForTest({ confirmedAt: 100, editId: 5, bases: stagedBases }, { confirmedAt: 101, editId: 6 }),
+    null,
+    "a newer confirmation between planning and chunk apply rejects the stale map",
+  );
+  const AI_ONLY = {
+    mayHoldHumanEdit: false, hasHumanCommit: false, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 1, human: 0 }, humanShas: [], refsComplete: false,
+    humanRefs: [], refsReason: "not_measured",
+  };
+  const seed = () => {
+    const { env, sqlite } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 900, 'translator9')`).run();
+    sqlite.prepare(
+      `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 7, 3, ?, ?, 'app edit', 2, 9)`,
+    ).run(BOOK, VERSION, contentJson("app edit"));
+    const boundary = sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, source)
+       VALUES ('verse', ?, ?, 'create', ?, 'dcs_reimport')`,
+    ).run(`${BOOK}/9/9/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("other verse")) }));
+    sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+       VALUES ('verse', ?, ?, 9, 1, 2, 'update', ?)`,
+    ).run(`${BOOK}/7/3/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("app edit")) }));
+    return { env, sqlite, boundary: Number(boundary.lastInsertRowid) };
+  };
+  const cutoff = (boundary, bases) => ({
+    confirmedAt: 1000,
+    editId: boundary,
+    lineage: AI_ONLY,
+    confirmedVerseBases: bases,
+  });
+
+  {
+    const { env, sqlite, boundary } = seed();
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(7, 3, "published")], null,
+      cutoff(boundary, new Map([["7:3", contentJson("published")]])), false,
+    );
+    eq(counts.merge_no_base, 0, "stored render removes the false no-base outcome");
+    eq(counts.skipped_edited, 1, "master unchanged from the recovered base keeps the app edit");
+    eq(sqlite.prepare(`SELECT COUNT(*) AS n FROM verse_merge_conflicts WHERE book = ?`).get(BOOK).n, 0,
+      "…and creates no review warning");
+  }
+
+  {
+    const { env, sqlite, boundary } = seed();
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(7, 3, "AI changed master")], null,
+      cutoff(boundary, new Map([["7:3", contentJson("published")]])), false,
+    );
+    eq(counts.merge_no_base, 0, "master moving on this verse is adjudicated with the recovered base");
+    eq(counts.merge_kept_ai, 1, "…and complete AI-only lineage keeps the translator's app edit");
+  }
+
+  {
+    const { env, boundary } = seed();
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(7, 3, "published")], null,
+      cutoff(boundary, null), false,
+    );
+    eq(counts.merge_no_base, 1, "missing stored render remains keep_no_base (never guessed)");
+  }
+
+  {
+    const { env, boundary } = seed();
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(7, 3, "published")], null,
+      cutoff(boundary, new Map([["7:4", contentJson("another verse")]])), false,
+    );
+    eq(counts.merge_no_base, 1, "a stored book missing this verse remains keep_no_base");
+  }
+
+  {
+    const { env, sqlite, boundary } = seed();
+    sqlite.prepare(
+      `UPDATE edit_log SET row_key = ?, payload_json = '{"bad":true}' WHERE id = ?`,
+    ).run(`${BOOK}/7/3/${VERSION}`, boundary);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(7, 3, "published")], null,
+      cutoff(boundary, new Map([["7:3", contentJson("published")]])), false,
+    );
+    eq(counts.merge_no_base, 1, "a present but unusable under-boundary log is not replaced by the render fallback");
+  }
 }
 
 // ── Issue #539: a merge adoption that would store the bytes already stored ──
@@ -2123,13 +2218,17 @@ console.log("\n[#728 review F4: master_moved_under_local_bridge fires for the br
   // row at or below the boundary (base_payload NULL). The bridge route now
   // stores `start_before` (the start row's content before the merge) on its
   // 'bridge' audit row; that is verse 1's last published state here.
-  const seed = (sqlite) => {
+  const seed = (sqlite, { includeStartBefore = true } = {}) => {
     sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
     insertVerse728(sqlite, { verse: 1, verseEnd: 2, text: "one two", version: 2, updatedBy: 7 });
     const boundary = insertLog728(sqlite, { verse: 9, action: "create", prev: null, next: 1, payload: {}, source: "dcs_reimport", userId: null, createdAt: 10 });
     insertLog728(sqlite, {
       verse: 1, action: "bridge", prev: 1, next: 2, createdAt: 300,
-      payload: { content: JSON.parse(contentJson("one two")), verse_end: 2, start_before: JSON.parse(contentJson("one")) },
+      payload: {
+        content: JSON.parse(contentJson("one two")),
+        verse_end: 2,
+        ...(includeStartBefore ? { start_before: JSON.parse(contentJson("one")) } : {}),
+      },
     });
     insertLog728(sqlite, { verse: 2, action: "delete", prev: 1, next: null, payload: { content: JSON.parse(contentJson("two")), absorbed_into: 1 }, createdAt: 300 });
     return boundary;
@@ -2147,6 +2246,26 @@ console.log("\n[#728 review F4: master_moved_under_local_bridge fires for the br
     eq(conflicts728(sqlite), [{ verse: 1, action: "keep_local_structure", reason: "master_moved_under_local_bridge", overwritten_version: null }],
       "master's moved START-verse text (differs from the bridge's start_before) is flagged on verse 1");
     assertClean728(counts, "review F4 moved");
+  }
+  {
+    // A bridge audit written before start_before shipped still gets the exact
+    // published start verse from #790's confirmed render.
+    const { env, sqlite } = freshEnv();
+    const boundary = seed(sqlite, { includeStartBefore: false });
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(CH, 1, "master moved one"), verse(CH, 2, "two"), verse(CH, 9, "nine")], null,
+      {
+        confirmedAt: 200,
+        editId: boundary,
+        lineage: HUMAN_LINEAGE_728,
+        confirmedVerseBases: new Map([[`${CH}:1`, contentJson("one")]]),
+      },
+      false,
+    );
+    eq(counts.structure_kept_local, 1, "legacy local bridge remains kept");
+    eq(conflicts728(sqlite), [{ verse: 1, action: "keep_local_structure", reason: "master_moved_under_local_bridge", overwritten_version: null }],
+      "…and its moved start verse is flagged from the confirmed-render ancestor even without start_before");
+    assertClean728(counts, "review F4 confirmed render");
   }
   {
     const { env, sqlite } = freshEnv();
