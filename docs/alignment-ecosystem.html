@@ -1119,18 +1119,27 @@ this.setVerseFinished(chapter, verse, false);
       <li>
         <span class="rank">1</span>
         <div>
-          <h3>An explicit “alignment done” flag</h3>
+          <h3>An explicit “alignment done” flag, with a confirm — not a block</h3>
           <p>
             Add a translator-asserted completion mark, stored additively (absent means not done, never
-            <code>false</code>), outranked by any subsequent edit, and ignored by the export renderer.
+            <code>false</code>), cleared by any subsequent edit, and ignored by the export renderer.
             Drive the chain icon from <code>done</code> rather than from an empty word bank; keep
             <code>verseHasUnalignedWork</code> as the auto-set trigger, not as the verdict.
+          </p>
+          <p>
+            When a translator marks a verse done and we still detect unaligned work, <b>ask, then
+            defer to them</b>: “You’ve left <em>N</em> word(s) unaligned. Was that intentional?” If
+            they confirm, the mark stands and the verse reads as complete. The prompt exists because
+            they may have genuinely missed something — not because the system gets a veto.
           </p>
           <p class="why">
             <b>Precedent:</b> tC3’s “Alignment Complete” toggle and tc4’s D73, which names our exact
             heuristic as the thing it replaced. <b>Why now:</b> it is the clean answer to a translator
             who deliberately leaves a word unaligned, and it aligns the indicator with the standing
             ruling that an unaligned word or two is no reason to hold back a sync.
+            <b>Shape:</b> this is the same confirm-then-proceed pattern the aligner panel already uses
+            before an intentional unalign, so it reuses a dialog idiom translators have seen — and it
+            is deliberately softer than tc4, which lets <code>done</code> be set with no prompt at all.
           </p>
         </div>
       </li>
