@@ -163,4 +163,35 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
   assert.equal(later.at(-1)?.payload.plainText, "durable typing");
   assert.equal(lists.at(-1).length, 1);
 }
+// A recorded failure for one key must not freeze the whole-list view when a
+// different key refreshes successfully afterward, and must not make the
+// failed key itself publish absence.
+{
+  const persisted = new Map([["b", record("b", "b typing")]]);
+  const cache = createDraftSnapshot(async () => [], async (key) => {
+    if (key === "a") throw new Error("key a read failed");
+    return persisted.get(key);
+  });
+  const seenA = [];
+  const lists = [];
+  cache.subscribeKey("a", (r) => seenA.push(r));
+  cache.subscribe((all) => lists.push(all));
+  await turn();
+  seenA.length = 0;
+  lists.length = 0;
+  await assert.rejects(cache.refresh("a"), /key a read failed/);
+  await turn();
+  assert.deepEqual(seenA, [], "a failed key must stay silent, not publish absence");
+  assert.deepEqual(lists, [], "a's own failed refresh alone must not notify the whole list");
+  const seenB = [];
+  cache.subscribeKey("b", (r) => seenB.push(r));
+  await cache.refresh("b");
+  await turn();
+  assert.equal(seenB.at(-1)?.payload.plainText, "b typing", "refresh(b) must still deliver to subscribeKey(b)");
+  assert.ok(
+    lists.length > 0 && lists.at(-1).some((r) => r.key === "b"),
+    "refresh(b) must still deliver to the whole-list subscriber despite a's recorded failure",
+  );
+  assert.deepEqual(seenA, [], "a must still stay silent after an unrelated key's successful refresh");
+}
 console.log("draftSnapshot: hydration, typing, save/clear ordering, read failures and targeted notifications passed");
