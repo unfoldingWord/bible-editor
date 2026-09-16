@@ -48,6 +48,20 @@ function reason(ours, theirs) {
 }
 
 {
+  // Standard usfm-js paragraph/poetry markers are legitimate marker-only
+  // nodes. They must not make byte-identical content fail closed as all axes.
+  const content = verse(
+    { type: "paragraph", tag: "q1", nextChar: "" },
+    word("Hello", { strong: "H1", content: "א" }),
+  );
+  assert.deepEqual(
+    classifyVisibleAdoptionChange(content, structuredClone(content)),
+    { wordingChanged: false, punctuationChanged: false, alignmentChanged: false },
+    "marker-only paragraph nodes remain valid visible content",
+  );
+}
+
+{
   // NFC means decomposed vs composed accents do not create a false wording axis.
   const ours = verse({ type: "text", text: "cafe\u0301" });
   const theirs = verse({ type: "text", text: "caf\u00e9" });

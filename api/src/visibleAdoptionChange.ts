@@ -32,16 +32,18 @@ function validNodes(nodes: unknown[], depth: number = 0): boolean {
   for (const node of nodes) {
     if (node == null || typeof node !== "object" || Array.isArray(node)) return false;
     const obj = node as Record<string, unknown>;
-    // A node must expose content one of the readers can actually inspect.
-    // `type`/`tag` alone is not enough: `{type:"opaque", value:"changed"}`
-    // extracts as empty text on both sides and would falsely suppress an alert.
-    // Rejecting a marker-only node is deliberately conservative (over-warn),
-    // while accepting text and recursively-validated children covers the
-    // verse-object shapes that carry reader-visible content.
-    if (!("text" in obj) && !("children" in obj)) return false;
+    // A node must expose content one of the readers can inspect, OR be one of
+    // usfm-js's legitimate marker-only shapes. Paragraph/quote/section nodes
+    // routinely carry only `{type, tag, nextChar?}`; extractPlainText uses
+    // their tag as an in-flow separator, so rejecting them would turn nearly
+    // every real verse into a false all-axes warning. Conversely an arbitrary
+    // `{type:"opaque", value:"changed"}` remains uninspectable and fails closed.
+    const markerOnlyType = obj.type === "paragraph" || obj.type === "quote" || obj.type === "section" || obj.type === "milestone";
+    if (!("text" in obj) && !("children" in obj) && !(markerOnlyType && typeof obj.tag === "string")) return false;
     if ("type" in obj && typeof obj.type !== "string") return false;
     if ("tag" in obj && typeof obj.tag !== "string") return false;
     if ("text" in obj && typeof obj.text !== "string") return false;
+    if ("nextChar" in obj && typeof obj.nextChar !== "string") return false;
     if ("children" in obj) {
       if (!Array.isArray(obj.children) || !validNodes(obj.children, depth + 1)) return false;
     }
