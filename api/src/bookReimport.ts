@@ -8019,30 +8019,40 @@ async function accountOwnPublishDecline(
     // there is no merge to look for. Not derived from export_snapshots by time,
     // either: two overlapping exports can record their snapshots out of order.
     const row = await env.DB.prepare(
-      `SELECT pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number, pushed_pr_read_at
+      `SELECT pushed_blob_sha, pushed_read_at, pushed_edit_id, own_publish_declines, pushed_pr_number, pushed_pr_read_at
          FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
     )
       .bind(book, resource)
       .first<{
         pushed_blob_sha: string | null;
         pushed_read_at: number | null;
+        pushed_edit_id: number | null;
         own_publish_declines: number | null;
         pushed_pr_number: number | null;
         pushed_pr_read_at: number | null;
       }>();
     const pushedBlobSha = row?.pushed_blob_sha ?? null;
     const pushedReadAt = row?.pushed_read_at ?? null;
+    const pushedEditId = row?.pushed_edit_id ?? null;
     const prior = row?.own_publish_declines ?? 0;
     if (!pushedBlobSha) return;
     // The comparison that declined ran against `sync`; if the row's render has
     // moved since, tonight's `content_differs` was about a render that is no
     // longer the one on the row — nothing to attribute to it.
-    if (pushedBlobSha !== sync.pushedBlobSha) {
+    if (
+      pushedBlobSha !== sync.pushedBlobSha ||
+      pushedReadAt !== sync.pushedReadAt ||
+      pushedEditId !== sync.pushedEditId
+    ) {
       console.log("reimport own-publish decline unmeasured: the pushed render moved during the run", {
         book,
         resource,
         comparedBlobSha: sync.pushedBlobSha,
         rowBlobSha: pushedBlobSha,
+        comparedReadAt: sync.pushedReadAt,
+        rowReadAt: pushedReadAt,
+        comparedEditId: sync.pushedEditId,
+        rowEditId: pushedEditId,
       });
       return;
     }
@@ -8081,6 +8091,23 @@ async function accountOwnPublishDecline(
       return;
     }
     if (judged.verdict === "preserved") {
+      // #658: a preserved own merge plus a complete human-free walk proves the
+      // pushed render is a safe ancestor even though a later AI commit made the
+      // current whole-file bytes differ. Use the pushed render's captured edit
+      // boundary, never an edit id observed during reimport. This happens before
+      // getMasterConfirmedAt is re-read for chunk apply, so tonight's merge can
+      // recover the newly confirmed ancestor. Absent/incomplete/human evidence
+      // deliberately declines to the existing conservative behavior.
+      const lineageConfirmed =
+        !page.incomplete &&
+        commits.every((commit) => commit.kind !== "human") &&
+        pushedReadAt != null
+          ? await markLineageConfirmedConverged(env, book, resource, {
+              pushedBlobSha,
+              pushedReadAt,
+              pushedEditId,
+            })
+          : false;
       await env.DB.prepare(
         `UPDATE book_resource_syncs SET own_publish_declines = 0, own_publish_rewrite_sha = NULL
           WHERE book = ?1 AND resource = ?2 AND (own_publish_declines <> 0 OR own_publish_rewrite_sha IS NOT NULL)`,
@@ -8102,6 +8129,9 @@ async function accountOwnPublishDecline(
         newestAuthor: judged.newest?.author ?? null,
         newestDate: judged.newest?.date ?? null,
         resetFrom: prior,
+        lineageComplete: !page.incomplete,
+        lineageHumanCommits: commits.filter((commit) => commit.kind === "human").length,
+        lineageConfirmed,
       });
       return;
     }
@@ -8529,6 +8559,60 @@ async function markOwnPublishConverged(
     return false;
   }
 }
+
+// #658. Byte equality is the strongest own-publish proof, but it legitimately
+// fails when an AI commit lands after our merge. When a COMPLETE, human-free
+// lineage walk also proves that our merge preserved the exact pushed blob, that
+// render is an equally sound ancestor. Stamp it before base reconstruction so
+// the current run can use it. The exact pushed-render CAS prevents a concurrent
+// export from pairing one render's timestamp with another render's edit id.
+async function markLineageConfirmedConverged(
+  env: Env,
+  book: string,
+  resource: Resource,
+  candidate: {
+    pushedBlobSha: string;
+    pushedReadAt: number;
+    pushedEditId: number | null;
+  },
+): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `UPDATE book_resource_syncs
+        SET master_confirmed_at = MAX(COALESCE(master_confirmed_at, 0), ?3),
+            master_confirmed_edit_id =
+              CASE WHEN ?4 IS NOT NULL AND ?3 >= COALESCE(master_confirmed_at, 0)
+                   THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?4)
+                   ELSE master_confirmed_edit_id END,
+            own_publish_declines = 0,
+            own_publish_rewrite_sha = NULL
+      WHERE book = ?1 AND resource = ?2
+        AND pushed_blob_sha = ?5
+        AND pushed_read_at = ?3
+        AND pushed_edit_id IS ?4`,
+  )
+    .bind(
+      book,
+      resource,
+      candidate.pushedReadAt,
+      candidate.pushedEditId,
+      candidate.pushedBlobSha,
+    )
+    .run();
+  const stamped = (result.meta?.changes ?? 0) > 0;
+  if (stamped) {
+    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+      .bind(OWN_PUBLISH_ALERT_USERNAME, `own_publish_inert:${book}:${resource}`)
+      .run();
+  }
+  return stamped;
+}
+
+export const markLineageConfirmedConvergedForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+  candidate: { pushedBlobSha: string; pushedReadAt: number; pushedEditId: number | null },
+): Promise<boolean> => markLineageConfirmedConverged(env, book, resource, candidate);
 
 export async function storedResourceSha(env: Env, book: string, resource: Resource): Promise<string | null> {
   const row = await env.DB.prepare(

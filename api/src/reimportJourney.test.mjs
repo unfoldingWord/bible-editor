@@ -3741,6 +3741,7 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
   // morning's byte comparison declines. The blind counter had reached 3 and raised
   // the "cannot tell them apart" banner. Here the same night is measured.
   const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000;
+  const PUSHED_EDIT_ID = 77;
   const PUSHED = "ba421e896eab0000000000000000000000000000";
   const OUR_MERGE = { sha: "22d652732b18", message: "bible-editor: JER tq → master (#859)", authorEmail: "b@x", authorName: "Benjamin Wright", date: "2026-09-01T05:38:03Z" };
   const BOT_PUSH = { sha: "863fbfa65119", message: "TQ: JER 10 [ju..7@api.bp-assistant]", authorEmail: "bot@bp-assistant", authorName: "BW Bot", date: "2026-09-01T23:49:46Z" };
@@ -3751,18 +3752,25 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
   const seedSync = (sqlite, declines, { prNumber = 859, prReadAt = READ_AT } = {}) => {
     sqlite
       .prepare(
-        `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number, pushed_pr_read_at)
-         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?, ?, ?)`,
+        `INSERT INTO book_resource_syncs
+           (book, resource, source_sha, origin, master_confirmed_at, master_confirmed_edit_id,
+            pushed_blob_sha, pushed_read_at, pushed_edit_id, own_publish_declines,
+            pushed_pr_number, pushed_pr_read_at)
+         VALUES (?, 'tq', 'sha0', 'reimport', 1000, 11, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(BOOK, PUSHED, READ_AT, declines, prNumber, prNumber == null ? null : prReadAt);
-    return { sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: READ_AT, pushedEditId: null, declines };
+      .run(BOOK, PUSHED, READ_AT, PUSHED_EDIT_ID, declines, prNumber, prNumber == null ? null : prReadAt);
+    return { sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: READ_AT, pushedEditId: PUSHED_EDIT_ID, declines };
   };
   const seedBanner = (sqlite) =>
     sqlite
       .prepare(`INSERT INTO system_alerts (username, severity, source, message) VALUES ('deferredreward', 'warning', ?, 'old blind banner')`)
       .run(SOURCE);
   const readState = (sqlite) => ({
-    declines: sqlite.prepare(`SELECT own_publish_declines AS d FROM book_resource_syncs WHERE book = ? AND resource = 'tq'`).get(BOOK).d,
+    ...sqlite.prepare(
+      `SELECT own_publish_declines AS declines, master_confirmed_at AS confirmedAt,
+              master_confirmed_edit_id AS confirmedEditId, source_sha AS sourceSha, origin
+         FROM book_resource_syncs WHERE book = ? AND resource = 'tq'`,
+    ).get(BOOK),
     banners: sqlite.prepare(`SELECT message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(SOURCE),
   });
   // A Gitea that serves the commit walk AND the merge commit's tree, counting each.
@@ -3793,14 +3801,45 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
   {
     const { sqlite, env } = freshEnv();
     const sync = seedSync(sqlite, 3);
+    // A translator PATCH interleaved after the export read. The watermark must
+    // remain the pushed render's 77, never the current edit_log maximum (78).
+    sqlite.prepare(
+      `INSERT INTO edit_log (id, kind, row_key, book, action) VALUES (78, 'tq', 'late', ?, 'update')`,
+    ).run(BOOK);
     seedBanner(sqlite);
     const g = gitea([BOT_PUSH, OUR_MERGE], PUSHED);
     await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
     const s = readState(sqlite);
     eq(s.declines, 0, "merge blob == pushed blob resets the counter (the bot's push explains tonight's mismatch)");
     eq(s.banners.length, 0, "…and the standing banner comes down");
+    eq(s.confirmedAt, READ_AT, "complete human=0 lineage advances to the pushed render time");
+    eq(s.confirmedEditId, PUSHED_EDIT_ID, "…using the captured pushed edit id, not a concurrent edit_log id");
+    eq(s.sourceSha, "sha0", "…without claiming master's current tip was already synced");
+    eq(s.origin, "reimport", "…or misreporting the source watermark's origin");
     eq(g.calls.commits, 1, "with no lineage walk to reuse, one commit walk from pushed_read_at was fetched");
     eq(g.calls.trees, 1, "…and one tree read at the merge commit");
+  }
+
+  // (a2) Missing certainty never advances: an incomplete walk and a complete
+  //      walk containing a human commit both keep the old ancestor boundary.
+  for (const [label, walked] of [
+    ["incomplete", { commits: [BOT_PUSH, OUR_MERGE], incomplete: true, incompleteReason: "page_cap" }],
+    ["human", {
+      commits: [
+        { sha: "human123", message: "proofreader edit", authorEmail: "editor@example.com", authorName: "Editor", date: "2026-09-01T23:55:00Z" },
+        OUR_MERGE,
+      ],
+      incomplete: false,
+      incompleteReason: "",
+    }],
+  ]) {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    const g = gitea(walked.commits, PUSHED);
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, walked, sync));
+    const s = readState(sqlite);
+    eq(s.confirmedAt, 1000, `${label} lineage does not advance master_confirmed_at`);
+    eq(s.confirmedEditId, 11, `${label} lineage does not advance master_confirmed_edit_id`);
   }
 
   // (b) The same night with the lineage walk handed in: no second commit fetch.
