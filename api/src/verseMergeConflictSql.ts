@@ -53,6 +53,37 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
     AND changes() > 0`;
 
 // ---------------------------------------------------------------------------
+// bookReimport.ts's applyVerseRows (issue #789) — resolves a
+// `keep_alignment_refused` / `source_attr_divergent` / `keep_local_structure`
+// row for a verse the SAME reimport run measured as `keep_converged` or
+// `keep_master_unchanged` (computeVerseMerge's two clean outcomes — `adopt:
+// false, conflict: false` — which write NO verse_merge_conflicts row of their
+// own; see verseMerge.ts). Until this statement existed, none of the three
+// actions above was ever re-recorded once the underlying D1-vs-master
+// difference resolved itself, so a standing row from an old refusal sat in
+// the "Sync flagged N verse(s)" banner with its original `first flagged` date
+// long after the sync stopped disagreeing about that verse (prod 2026-09-14:
+// rows stale three to four weeks across EZK ULT/UST, JER UST, DAN UST).
+//
+// `resolved_by = NULL` is the documented system-retired marker — see
+// RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL's doc comment above for why that pair
+// is unambiguous against a real human resolve (RESOLVE_VERSE_MERGE_CONFLICT_SQL
+// above always binds a non-null resolved_by). Deliberately excludes `adopt`,
+// `adopt_conflict`, and `adopt_no_visible_change`: those record a landed
+// adoption a human is meant to look at, and only a human's own save
+// (RESOLVE_VERSE_MERGE_CONFLICT_SQL) resolves them. `resolved_at IS NULL`
+// keeps this idempotent — a row already resolved, by a human or an earlier
+// run, is left untouched (0 changes).
+//
+// Binds, in order: (resolvedAt, book, resource, chapter, verse).
+// ---------------------------------------------------------------------------
+export const RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
+    SET resolved_at = ?1, resolved_by = NULL
+  WHERE book = ?2 AND resource = ?3 AND chapter = ?4 AND verse = ?5
+    AND action IN ('keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
+    AND resolved_at IS NULL`;
+
+// ---------------------------------------------------------------------------
 // verseMergeConflicts.ts's raiseVerseMergeConflictAlert — the active,
 // human-actionable conflict rows for one (book, resource). Exported (not
 // inline) so verseMergeConflicts.test.mjs can prove the exact `action IN (...)`
