@@ -381,6 +381,29 @@ export async function resolveConvergedVerseMergeConflicts(
   }
 }
 
+// A SHA-unchanged resource normally never reaches applyVerseRows. An active
+// kept-D1 backlog is the narrow exception: #789 must remeasure those verses or
+// rows created before the fix can remain active forever behind the fast path.
+// Let query failures throw so the Workflow retries instead of treating an
+// unreadable backlog as empty and silently skipping it.
+export async function activeKeptVerseMergeConflictRefs(
+  env: Env,
+  book: string,
+  resource: string,
+): Promise<Array<{ chapter: number; verse: number }>> {
+  const rs = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL)
+    .bind(book, resource)
+    .all<{ chapter: number; verse: number; action: string }>();
+  return (rs.results ?? [])
+    .filter(
+      (r) =>
+        r.action === "keep_alignment_refused" ||
+        r.action === "source_attr_divergent" ||
+        r.action === "keep_local_structure",
+    )
+    .map((r) => ({ chapter: Number(r.chapter), verse: Number(r.verse) }));
+}
+
 // Issue #749, the verse analogue of bookReimport.ts's retireMergeKeptFlags
 // (#703). Retires every STANDING 'keep_ai_master' row so the "Sync flagged N
 // verse(s)" banner stops carrying an outcome nobody can act on: nothing was

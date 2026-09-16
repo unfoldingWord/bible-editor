@@ -477,6 +477,49 @@ console.log("\n6b. F6 — release on the SHA-match convergence path");
   }
 }
 
+// ── 6c. #789: an active kept-D1 backlog bypasses the SHA fast path ────────
+// The first production run after #794 proved that otherwise no old row is ever
+// remeasured: stage 1 had already advanced source_sha, so all 114 rows exited
+// before applyVerseRows. A normal run must fetch/stage this one resource.
+console.log("\n6c. #789 — SHA match with active conflict backlog is remeasured");
+{
+  const realFetch4c = globalThis.fetch;
+  try {
+    const { sqlite, env } = freshEnv();
+    sqlite.exec(
+      `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version)
+       VALUES ('2CH', 4, 11, 'ULT', '{"a":1}', 'a', 2)`,
+    );
+    sqlite.prepare(
+      `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin)
+       VALUES ('2CH','ult',?,?,'reimport')`,
+    ).run(MASTER_SHA, SYNCED_AT);
+    sqlite.exec(
+      `INSERT INTO verse_merge_conflicts
+         (book, resource, chapter, verse, action, reason, detected_at, last_recorded_at)
+       VALUES ('2CH','ult',4,11,'keep_alignment_refused','alignment_shrink',100,100)`,
+    );
+
+    let rawFetches = 0;
+    stubFetch({
+      masterSha: MASTER_SHA,
+      masterBody: bodyWith(PREV_ID_LINE),
+      prevBodyBySha: { [MASTER_SHA]: bodyWith(PREV_ID_LINE) },
+    });
+    const inner = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      if (String(u).includes("/raw/")) rawFetches++;
+      return inner(u);
+    };
+
+    const plan = await planAndStageBookResourcesForTest(env, "2CH", ["ult"], "inst-789");
+    eq(plan.entries[0].changed, true, "active kept-D1 row bypasses the SHA-match skip and stages for remeasurement");
+    eq(rawFetches > 0, true, "the unchanged master file is fetched instead of leaving the backlog frozen");
+  } finally {
+    globalThis.fetch = realFetch4c;
+  }
+}
+
 // ── 7. The force-released banner is a different sentence, not a suffix ───────
 console.log("\n7. force-released banner");
 {

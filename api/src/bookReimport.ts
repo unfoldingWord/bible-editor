@@ -135,6 +135,7 @@ import {
   deleteLostAdoptionConflicts,
   raiseVerseMergeConflictAlert,
   resolveConvergedVerseMergeConflicts,
+  activeKeptVerseMergeConflictRefs,
 } from "./verseMergeConflicts.ts";
 import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
@@ -9120,8 +9121,16 @@ async function planAndStageBookResources(
 
     const masterSha = await fileCommitSha(env, file.repo, file.path);
     const sync = await resourceSyncState(env, book, resource);
+    const shaMatches = Boolean(masterSha && sync.sourceSha && masterSha === sync.sourceSha);
+    // #789 production verification: a normal reimport after the cleanup fix
+    // still skipped every old row because the resource SHA was already current.
+    // Pay one indexed read only for SHA-matched verse resources; a non-empty
+    // backlog bypasses the fast path and gets remeasured through applyVerseRows.
+    const convergenceBacklog = shaMatches && !isTsv
+      ? await activeKeptVerseMergeConflictRefs(env, book, resource)
+      : [];
     // Skip ONLY on a positive SHA match (fail-open: null/unknown → reimport).
-    if (masterSha && sync.sourceSha && masterSha === sync.sourceSha) {
+    if (shaMatches && convergenceBacklog.length === 0) {
       // Issue #604: a SHA-unchanged TSV resource is otherwise permanently
       // invisible to the tombstone sweep — runChunkedReimport only ever looks
       // at staged entries, and this resource has nothing staged. Pay for a
@@ -9228,6 +9237,19 @@ async function planAndStageBookResources(
     const own = await recognizePushedRender(raw, sync);
     if (own.recognized) {
       const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, sync.pushedEditId, masterSha);
+      // Whole-file equality to our pushed render is stronger than per-verse
+      // convergence: no foreign master value remains for any kept-D1 warning
+      // to protect. Retire the backlog even though this branch correctly skips
+      // applyVerseRows, then rederive the banner if other conflict classes stay.
+      if (convergenceBacklog.length > 0) {
+        await resolveConvergedVerseMergeConflicts(env, book, resource, convergenceBacklog);
+        await raiseVerseMergeConflictAlert(env, book, resource, {
+          recordingFailed: false,
+          noBaseCount: 0,
+          noBaseRefs: [],
+          noBaseEditorRefs: [],
+        });
+      }
       console.log("reimport recognized master's movement as our own publish", {
         book,
         resource,
