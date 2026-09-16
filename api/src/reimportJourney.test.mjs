@@ -135,7 +135,11 @@ const giteaPage = (commits) => async () => ({
   json: async () =>
     commits.map((c) => ({
       sha: c.sha,
-      commit: { message: c.message, author: { email: c.authorEmail, name: c.authorName, date: c.date } },
+      commit: {
+        message: c.message,
+        author: { email: c.authorEmail, name: c.authorName, date: c.date },
+        committer: { date: c.committerDate ?? c.date },
+      },
     })),
 });
 // Every clear that reaches its write now re-reads master's tip first and abandons
