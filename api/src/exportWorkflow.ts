@@ -447,12 +447,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // Chunked + SHA-gated + diff-aware reimport — steps through chapters so
           // a large book can't blow the 10-min step limit, and skips files whose
           // DCS commit SHA is unchanged. See bookReimport.ts:runChunkedReimport.
-          await runChunkedReimport(this.env, step, book, instanceId, reimportResources, {
+          const res = await runChunkedReimport(this.env, step, book, instanceId, reimportResources, {
             mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
           });
-          reimportOutcomes.push({ book, ok: true });
+          // runChunkedReimport can catch a correctness-bearing write failure
+          // internally — it sets totals.apply_incomplete (a batch that threw) or
+          // pushes to totals.errors and withholds the sync watermark, yet
+          // resolves normally. Count that as a failed self-heal item, not a
+          // clean one, so a reimport-only run isn't reported green when a write
+          // actually failed (#833 review).
+          const reimportOk = !(res.totals.apply_incomplete || res.totals.errors.length > 0);
+          reimportOutcomes.push({ book, ok: reimportOk });
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
           // this book's D1 is now possibly stale relative to master. The
