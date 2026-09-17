@@ -80,9 +80,12 @@ export function resourcesLockedByJob(
 
 // Returns the first non-terminal job covering this (book, chapter) that will
 // write `resource` (itself or via a pending chain step), or null if that
-// resource is unlocked. Omit `resource` to ask "is anything running here?"
-// (book reimport, which rewrites everything). Locks are global across users —
-// any translator's pipeline locks the resource for everyone, by design.
+// resource is unlocked. Omitting `resource` asks "is anything running here?" —
+// no production caller does any more (the reimport moved to
+// lockedResourcesForChapter in #828; every rows.ts / verses.ts guard passes its
+// own kind), so treat the unscoped form as a convenience, not a pattern to copy.
+// Locks are global across users — any translator's pipeline locks the resource
+// for everyone, by design.
 //
 // The chain filter can't be expressed in SQL (it lives in a JSON column), so
 // the query fetches the chapter's non-terminal jobs and the match runs here.
@@ -141,4 +144,112 @@ export function lockedResponseBody(lock: ActiveLock): ChapterLockedError {
     pipelineType: lock.pipelineType,
     startedAt: lock.startedAt,
   };
+}
+
+// Which resources are locked for one chapter, in ONE query — the set form of
+// activePipelineForChapter, for callers that need the answer for several
+// resources at once (the reimport's per-chapter loops). Asking
+// activePipelineForChapter once per resource would multiply the reimport's D1
+// reads by four on every chapter of every book; unioning here keeps the cost
+// exactly what the resource-blind call already paid.
+//
+// Fail-closed the same way resourcesLockedByJob is: an unrecognized
+// pipeline_type or an unparseable follow_up_chain contributes every resource.
+//
+// WHOLE CHAIN, NOT THE REMAINDER. enqueueFollowUpFromChain (pipelines.ts) pops
+// the chain head when it fires the next link, so a running `tqs` at the end of a
+// generate→notes→tqs macro carries follow_up_chain = null and
+// resourcesLockedByJob answers `{tq}` alone. The verses and notes the EARLIER
+// links wrote are in D1 and have NOT reached Door43 yet — the export that
+// publishes them runs after this reimport — so answering `{tq}` would let the
+// same night's sync overwrite the new ULT with master's older revision and let
+// the tombstone prune soft-delete the AI's brand-new tn rows (neither id exists
+// in master's file). The chain's links share a job_id lineage
+// (`<root>`, `<root>:chain1`, `<root>:chain2`, …), so the root prefix recovers
+// the links that already ran; the whole macro stays locked until its last link
+// leaves a non-terminal state.
+//
+// Cost: one query when nothing is running on this chapter (the common case, and
+// exactly what the resource-blind call paid), a second only when something is.
+//
+// ASSUMPTION, worth naming: PIPELINE_WRITES is a declaration. pipelineImport.ts
+// routes a job's output by REPO tail, not by pipeline_type, so a job whose
+// output carries an unexpected repo would write outside its declared lock. That
+// was already true for the rows.ts/verses.ts edit guards; this is the first
+// nightly path to rely on it.
+export async function lockedResourcesForChapter(
+  env: Env,
+  book: string,
+  chapter: number,
+): Promise<Set<LockedResource>> {
+  const statePlaceholders = NON_TERMINAL.map((_, i) => `?${i + 3}`).join(", ");
+  const active = await env.DB.prepare(
+    `SELECT job_id, pipeline_type, follow_up_chain
+       FROM pipeline_jobs
+      WHERE book = ?1
+        AND start_chapter <= ?2 AND end_chapter >= ?2
+        AND state IN (${statePlaceholders})`,
+  )
+    .bind(book.toUpperCase(), chapter, ...NON_TERMINAL)
+    .all<{ job_id: string; pipeline_type: string; follow_up_chain: string | null }>();
+  const locked = new Set<LockedResource>();
+  const roots = new Set<string>();
+  for (const row of active.results ?? []) {
+    for (const r of resourcesLockedByJob(row.pipeline_type, row.follow_up_chain)) locked.add(r);
+    // Only a CHAIN LINK can have predecessors — a job whose id carries no
+    // `:chain` suffix IS the root, and nothing ran before it. Collecting roots
+    // only from links is what keeps the second query off the common path: a
+    // lone `tqs` run (the JER 25 incident) costs exactly one query, the same as
+    // the resource-blind call this replaced, and a wide job spanning 150
+    // chapters does not double the reimport's lock reads.
+    const root = chainRootJobId(row.job_id ?? "");
+    if (root !== (row.job_id ?? "")) roots.add(root);
+  }
+  if (roots.size === 0) return locked;
+
+  // The already-finished links of every running macro. Any state: a link that
+  // errored still wrote whatever it had applied before it stopped. (A
+  // `cancelled` link never dispatched and wrote nothing, so counting it
+  // over-locks slightly — the safe direction, and not worth a second state
+  // list to shave.)
+  //
+  // Chapter-scoped, which is exact only because enqueueFollowUpFromChain copies
+  // the parent's [start_chapter, end_chapter] verbatim. If a chain step ever
+  // narrows its own range, the earlier links' chapters would unlock here.
+  const siblings = await env.DB.prepare(
+    `SELECT job_id, pipeline_type
+       FROM pipeline_jobs
+      WHERE book = ?1
+        AND start_chapter <= ?2 AND end_chapter >= ?2`,
+  )
+    .bind(book.toUpperCase(), chapter)
+    .all<{ job_id: string; pipeline_type: string }>();
+  for (const row of siblings.results ?? []) {
+    if (!roots.has(chainRootJobId(row.job_id ?? ""))) continue;
+    for (const r of resourcesWrittenBy(row.pipeline_type)) locked.add(r);
+  }
+  return locked;
+}
+
+// The job_id every link of one chained run shares. enqueueFollowUpFromChain
+// mints a child as `${parentJobId}:chain${depth}`, so stripping at the first
+// `:chain` yields the macro's root for any link, and for an unchained job
+// yields the job itself. A root is a crypto.randomUUID() — no colons — so
+// `:chain` can only ever be a chain suffix and two macros cannot share a root.
+//
+// A `:followup` child (enqueueFollowUpFromChain's sibling path) is deliberately
+// its own root: follow_up_options and follow_up_chain are mutually exclusive, so
+// a followup is never a chain link, and both ends of a followup pair write the
+// same resource anyway.
+export function chainRootJobId(jobId: string): string {
+  const i = jobId.indexOf(":chain");
+  return i === -1 ? jobId : jobId.slice(0, i);
+}
+
+// Export resource name → the lock namespace it lives in. ult and ust are both
+// written by the `generate` pipeline and share the single "verse" lock; the
+// three TSV kinds are their own. Keeping this one function means a reimport
+// call site can never invent its own mapping and drift from PIPELINE_WRITES.
+export function lockedResourceFor(resource: "ult" | "ust" | "tn" | "tq" | "twl"): LockedResource {
+  return resource === "ult" || resource === "ust" ? "verse" : resource;
 }
