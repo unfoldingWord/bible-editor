@@ -28,6 +28,7 @@ import {
   tnPayload,
   tqPayload,
   applyTnHintExpansionIfMatch,
+  outputKindAllowedFor,
 } from "./pipelineImport.ts";
 import { ROW_ID_RE, coerceRowId, deriveAltRowId } from "./rowId.ts";
 
@@ -3556,5 +3557,29 @@ await (async () => {
   );
   assert(warned, "#775 tq CAS: a conflict is logged for observability");
 })();
+
+// ── #828: the chapter lock's PIPELINE_WRITES declaration is ENFORCED here ──
+//
+// classify() routes an output entry by repo tail and never looked at the job's
+// type, so a `tqs` job emitting an en_ult output would write scripture that
+// nothing had locked — a translator could be editing that verse, and since the
+// nightly reimport's lock became resource-scoped, the same night's Door43 sync
+// could overwrite it too. Refuse the entry instead. An unrecognized type still
+// writes everything, so this only bites a KNOWN type breaking its own contract.
+{
+  assert(outputKindAllowedFor("tqs", "tq"), "a questions run may write tq");
+  assert(!outputKindAllowedFor("tqs", "verse"), "a questions run may NOT write scripture");
+  assert(!outputKindAllowedFor("tqs", "tn"), "a questions run may NOT write notes");
+  assert(outputKindAllowedFor("notes", "tn"), "a notes run may write tn");
+  assert(!outputKindAllowedFor("notes", "tq"), "a notes run may NOT write tq");
+  assert(outputKindAllowedFor("generate", "verse"), "a generate run may write scripture");
+  assert(!outputKindAllowedFor("generate", "tn"), "a generate run may NOT write notes");
+  for (const kind of ["verse", "tn", "tq"]) {
+    assert(
+      outputKindAllowedFor("some-new-pipeline", kind),
+      `an unrecognized pipeline type still writes ${kind} (fails closed, as before)`,
+    );
+  }
+}
 
 console.log("pipelineImport (claim guard): all assertions passed");

@@ -28,6 +28,7 @@ import { NT_BOOKS } from "./dcsSources.ts";
 import { newRowId, isValidRowId, coerceRowId, deriveAltRowId } from "./rowId.ts";
 import { tnContentKey } from "./tnDedup.ts";
 import { requiredOccurrence } from "./occurrenceRule.ts";
+import { resourcesWrittenBy } from "./chapterLock.ts";
 import {
   PROVENANCE_COLUMNS,
   provenanceSet,
@@ -207,6 +208,20 @@ function versePayload(book: string, bibleVersion: "ULT" | "UST", v: VerseExtract
   };
 }
 
+// What this pipeline type declares it will overwrite, as the chapter lock
+// promises it. Re-exported here as the single name the import path uses, so a
+// future caller cannot reach for a different map.
+export function declaredWrites(pipelineType: string): readonly string[] {
+  return resourcesWrittenBy(pipelineType);
+}
+
+// May a job of this type apply an output entry that classified as this kind?
+// An unrecognized pipeline_type writes everything (resourcesWrittenBy fails
+// closed), so only a KNOWN type stepping outside its own contract is refused.
+export function outputKindAllowedFor(pipelineType: string, kind: "verse" | "tn" | "tq"): boolean {
+  return declaredWrites(pipelineType).includes(kind);
+}
+
 async function parseOutputEntry(
   ctx: ImportContext,
   entry: OutputEntry,
@@ -215,6 +230,34 @@ async function parseOutputEntry(
   const cls = classify(entry);
   if (cls.kind === "unknown") {
     return { staged: [], skipReason: `unrecognized repo: ${entry.repo ?? "(none)"}` };
+  }
+  // PIPELINE_WRITES is what the chapter lock promises a run will overwrite —
+  // the editor guards (rows.ts / verses.ts) and, since #828, the nightly
+  // reimport's per-resource lock both trust it. Classification here is by REPO
+  // TAIL and never consulted the job's type, so a `tqs` job emitting an en_ult
+  // output would write scripture nobody had locked: a translator could be
+  // editing that verse, or the same night's Door43 sync could overwrite what
+  // this import just wrote. Refuse the entry instead, so the declaration is
+  // enforced rather than merely believed. An unrecognized pipeline_type writes
+  // everything (resourcesWrittenBy fails closed), so this only ever refuses a
+  // KNOWN type going outside its own contract — which is a bug in the bot or a
+  // stale map, and either way must be seen rather than silently applied. The
+  // reason rides `skipped`, which the job result already surfaces.
+  const allowed = declaredWrites(ctx.pipelineType);
+  if (!outputKindAllowedFor(ctx.pipelineType, cls.kind)) {
+    console.error("pipeline import: output repo is outside this job's declared writes", {
+      jobId: ctx.jobId,
+      pipelineType: ctx.pipelineType,
+      repo: entry.repo,
+      classifiedAs: cls.kind,
+      declared: [...allowed],
+    });
+    return {
+      staged: [],
+      skipReason:
+        `refused ${entry.repo ?? "(none)"}: a ${ctx.pipelineType} run does not write ${cls.kind} ` +
+        `(declared: ${[...allowed].join(", ")}) — nothing locks it, so it is not safe to apply`,
+    };
   }
 
   const raw = await fetchText(entry.rawUrl);
