@@ -47,7 +47,7 @@ function commit(sha, message, email, { name = "Someone", date = "2026-08-30T12:0
   const parentShas = parents ?? (parent ? [parent] : []);
   return {
     sha,
-    commit: { message, author: { email, name, date } },
+    commit: { message, author: { email, name, date }, committer: { date } },
     author: null,
     parents: parentShas.map((p) => ({ sha: p })),
     files: [{ filename: "tn_ZEC.tsv", status: "modified" }],

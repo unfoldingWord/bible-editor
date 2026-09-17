@@ -119,7 +119,7 @@ async function openDualAlignerReadingLine(page: Page, bibleVersion: "ULT" | "UST
   await sideBySideBtn.waitFor({ state: "visible" });
   await sideBySideBtn.click();
   const idx = bibleVersion === "ULT" ? 0 : 1;
-  const line = page.locator('.MuiDialog-root [contenteditable="true"]:visible').nth(idx);
+  const line = page.getByRole("dialog").locator('[contenteditable="true"]:visible').nth(idx);
   await line.waitFor({ state: "visible" });
   return line;
 }
@@ -135,12 +135,11 @@ async function appendAndSaveReadingLine(
   text: string,
 ): Promise<void> {
   await line.click();
-  await page.keyboard.press("End");
+  await page.keyboard.press("ControlOrMeta+End");
   await page.keyboard.type(text);
-  await page
-    .locator(".MuiDialog-root button:visible", { hasText: `Save ${bibleVersion}` })
-    .first()
-    .click();
+  // The reading line and alignment grid each have a Save ULT/UST button.
+  // Scope to this line's own container, not the grid's independent control.
+  await line.locator("..").getByRole("button", { name: `Save ${bibleVersion}`, exact: true }).click();
 }
 
 // The SyncStatusBar chip that appears the moment any op reaches "conflict"
@@ -219,6 +218,7 @@ test.describe("S9 — cross-tab verse pin release (#565 / #569 / #571)", () => {
 
     await tabB.goto(`${BASE}/#/ZEC/${CHAPTER}/${VERSE}`);
     await tabB.locator("[data-note-id]").first().waitFor();
+    await tabB.locator(`[data-note-id="${decoyRow!.id}"]`).getByTitle("click to edit", { exact: true }).click();
     await noteTextarea(tabB, decoyRow!.id).fill(`decoy ${Date.now()}`);
     await saveNote(tabB, decoyRow!.id);
 
@@ -378,6 +378,11 @@ test.describe("S9 — cross-tab verse pin release (#565 / #569 / #571)", () => {
     const VERSE = 1;
     const BV = "ULT";
     const JOB_ID = "s9-verse-pin-release-lock";
+    // Local verification can reuse its fixture; distinguish this attempt
+    // from text deliberately saved by a previous successful run.
+    const attempt = Date.now();
+    const lockedText = `LOCKED-EDIT-${attempt}`;
+    const unlockedText = `AFTER-LOCK-EDIT-${attempt}`;
 
     const { context, auth } = await newUserContext(browser, "pinrelease-b");
     const page = await context.newPage();
@@ -400,7 +405,7 @@ test.describe("S9 — cross-tab verse pin release (#565 / #569 / #571)", () => {
       await page.goto(`${BASE}/#/ZEC/${CHAPTER}/${VERSE}`);
       await page.locator("[data-note-id]").first().waitFor();
       const line = await openDualAlignerReadingLine(page, BV);
-      await appendAndSaveReadingLine(page, line, BV, " LOCKED-EDIT");
+      await appendAndSaveReadingLine(page, line, BV, ` ${lockedText}`);
 
       // "locked" deletes the op in the SAME transaction as the rejection —
       // there is no intermediate persisted "locked" status to observe, only
@@ -430,7 +435,7 @@ test.describe("S9 — cross-tab verse pin release (#565 / #569 / #571)", () => {
       const duringLock = await fetchChapter(serverCtx, serverAuth.token, "ZEC", CHAPTER);
       // @ts-expect-error — see the note in check (a).
       const ultDuringLock = duringLock.verses[BV][VERSE];
-      expect(ultDuringLock.plain_text as string).not.toContain("LOCKED-EDIT");
+      expect(ultDuringLock.plain_text as string).not.toContain(lockedText);
       const versionDuringLock = ultDuringLock.version as number;
 
       // Clear the lock, then save the SAME verse again — the issue's own
@@ -438,7 +443,7 @@ test.describe("S9 — cross-tab verse pin release (#565 / #569 / #571)", () => {
       d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
       await page.waitForTimeout(300);
 
-      await appendAndSaveReadingLine(page, line, BV, " AFTER-LOCK-EDIT");
+      await appendAndSaveReadingLine(page, line, BV, ` ${unlockedText}`);
       await expect
         .poll(async () => !findVerseOp(await readOutboxOps(page), "ZEC", CHAPTER, VERSE, BV), {
           message: "the post-lock save never drained",
@@ -450,7 +455,7 @@ test.describe("S9 — cross-tab verse pin release (#565 / #569 / #571)", () => {
       const afterUnlock = await fetchChapter(serverCtx, serverAuth.token, "ZEC", CHAPTER);
       // @ts-expect-error — see the note in check (a).
       const ultAfterUnlock = afterUnlock.verses[BV][VERSE];
-      expect(ultAfterUnlock.plain_text as string).toContain("AFTER-LOCK-EDIT");
+      expect(ultAfterUnlock.plain_text as string).toContain(unlockedText);
       expect(ultAfterUnlock.version as number).toBe(versionDuringLock + 1);
 
       await serverCtx.dispose();

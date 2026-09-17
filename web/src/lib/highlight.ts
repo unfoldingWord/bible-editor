@@ -582,6 +582,7 @@ export function findTargetHighlights(
   quote: string,
   occurrence: number,
   sourceVerseObjects?: unknown[],
+  partialGroups = false,
 ): Set<HighlightKey> {
   const sourceTokens = Array.isArray(sourceVerseObjects)
     ? collectBareWords(sourceVerseObjects)
@@ -598,7 +599,9 @@ export function findTargetHighlights(
   // milestones by (content, occurrence). Split-gloss duplicates share a key,
   // so every fragment of a discontinuous gloss lights up together.
   if (Array.isArray(sourceVerseObjects)) {
-    const olTokens = matchSourceTokens(sourceVerseObjects, quote, occurrence);
+    const olTokens = partialGroups
+      ? matchSourceGroupsInVerse(sourceVerseObjects, quote, occurrence)
+      : matchSourceTokens(sourceVerseObjects, quote, occurrence);
     if (olTokens.length > 0) {
       const olKeys = new Set(
         olTokens.map((t) => `${matchNorm(t.text)}|${t.surfaceOccurrence ?? t.occurrence}`),
@@ -828,15 +831,77 @@ export function matchSourceTokens(
   return chosen.map((i) => tokens[i]);
 }
 
+// Per-group match for bridged TN quotes ("48:11-12"). The full `&`-joined
+// pattern cannot resolve in any single verse, so highlight only the groups
+// that fully appear HERE — never a partial word run inside a group, and never
+// used for singleton notes (those stay on matchSourceTokens so a typo mid-
+// quote blanks the verse instead of lighting the survivors). Newlines count
+// as group gaps too: a paste of v11 Hebrew then v12 Hebrew on separate lines
+// is the same shape the picker emits with " & ".
+function matchSourceGroupsInVerse(
+  verseObjects: unknown[],
+  quote: string,
+  occurrence: number,
+): WordToken[] {
+  const strict = matchSourceTokens(verseObjects, quote, occurrence);
+  if (strict.length > 0) return strict;
+  const groups = quote
+    .split(/[&…]+|\.{3}|\n+/g)
+    .map((segment) =>
+      segment
+        .split(/[\s־]+/)
+        .map((w) => w.trim())
+        .filter((w) => w.length > 0),
+    )
+    .filter((g) => g.length > 0);
+  if (groups.length <= 1) return [];
+  // `occurrence: -1` means every match (TSV), same as matchSourceTokens.
+  const allOcc = (occurrence | 0) === -1;
+  const wantOcc = Math.max(1, occurrence | 0);
+  const tokens = collectBareWords(verseObjects);
+  const normTokens = tokens.map((t) => matchNorm(t.text));
+  const union = new Set<number>();
+  for (let gi = 0; gi < groups.length; gi++) {
+    const normGroup = groups[gi].map(matchNorm);
+    const groupMatches: number[][] = [];
+    for (let start = 0; start + normGroup.length <= tokens.length; start++) {
+      let ok = true;
+      for (let wi = 0; wi < normGroup.length; wi++) {
+        if (normTokens[start + wi] !== normGroup[wi]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        groupMatches.push(Array.from({ length: normGroup.length }, (_, wi) => start + wi));
+      }
+    }
+    if (allOcc) {
+      for (const pick of groupMatches) for (const i of pick) union.add(i);
+      continue;
+    }
+    // Occurrence indexes the first quote group; later groups take their first
+    // hit in this verse (they live on the other half of a span).
+    const pick = gi === 0 ? groupMatches[wantOcc - 1] : groupMatches[0];
+    if (pick) for (const i of pick) union.add(i);
+  }
+  if (union.size === 0) return [];
+  return [...union].sort((a, b) => a - b).map((i) => tokens[i]!);
+}
+
 // For UHB/UGNT: returns source-word keys that should be highlighted. Keys carry
 // RAW text — HebrewLine / renderHighlightedHTML read from the same tree.
 export function findSourceHighlights(
   verseObjects: unknown[],
   quote: string,
   occurrence: number,
+  partialGroups = false,
 ): Set<HighlightKey> {
   const out = new Set<HighlightKey>();
-  for (const t of matchSourceTokens(verseObjects, quote, occurrence)) {
+  const matched = partialGroups
+    ? matchSourceGroupsInVerse(verseObjects, quote, occurrence)
+    : matchSourceTokens(verseObjects, quote, occurrence);
+  for (const t of matched) {
     out.add(k(t.text, t.occurrence));
   }
   return out;
@@ -1258,16 +1323,23 @@ export function highlightsFor(
   quote: string | null | undefined,
   occurrence: number | null | undefined,
   sourceContent?: unknown,
+  partialGroups = false,
 ): Set<HighlightKey> {
   if (!quote) return new Set();
   const verseObjects = (verseContent as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(verseObjects)) return new Set();
   const occ = occurrence ?? 1;
   if (bibleVersion === "UHB" || bibleVersion === "UGNT") {
-    return findSourceHighlights(verseObjects, quote, occ);
+    return findSourceHighlights(verseObjects, quote, occ, partialGroups);
   }
   const sourceVo = (sourceContent as { verseObjects?: unknown[] } | null)?.verseObjects;
-  return findTargetHighlights(verseObjects, quote, occ, Array.isArray(sourceVo) ? sourceVo : undefined);
+  return findTargetHighlights(
+    verseObjects,
+    quote,
+    occ,
+    Array.isArray(sourceVo) ? sourceVo : undefined,
+    partialGroups,
+  );
 }
 
 // Splits an HTML string into a flat sequence of `<tag ...>` tokens and raw
@@ -1378,7 +1450,13 @@ export function overlayFindMarks(
     }
     decoded.push(null);
     inChip.push(false);
-    starts.push(-1);
+    // Read-only paragraph/poetry blocks have no chip label or literal space
+    // between them, but extractPlainText emits a separating space. Include a
+    // synthetic separator in the search string without altering rendered HTML.
+    // This also prevents a regex from consuming a phantom cross-block word.
+    const blockStart = /^<div(?:\s|>)/i.test(tok.tag) && full.length > 0 && !/\s$/.test(full);
+    starts.push(blockStart ? full.length : -1);
+    if (blockStart) full += " ";
     const info = classifyTag(tok.tag);
     if (info.kind === "open") {
       openIsChip.push(info.isChip);
@@ -1397,7 +1475,16 @@ export function overlayFindMarks(
     let chipJustClosed = false;
     for (let i = 0; i < tokens.length; i++) {
       const text = decoded[i];
-      if (text === null) continue;
+      if (text === null) {
+        if (starts[i] >= 0) {
+          plainOffsets[starts[i]] = plainLen;
+          if (!lastWasSpace) {
+            plainLen++;
+            lastWasSpace = true;
+          }
+        }
+        continue;
+      }
       const base = starts[i];
       if (inChip[i]) {
         // The literal "\q1" label exists only in the chip render.
@@ -1470,17 +1557,20 @@ export function overlayFindMarks(
     }
     const nodeStart = starts[i];
     const nodeEnd = nodeStart + text.length;
-    // Every hit's start falls in exactly one run (runs partition `full`
-    // contiguously). One that also ends within this run is fully contained
-    // and gets decorated; one that starts here but ends past `nodeEnd`
-    // crosses into the next tag/run — skip decorating it (its tail bytes
-    // just render as plain text in whichever run they land in) but still
-    // consume it so a later run doesn't try to re-match its start.
+    // Runs do NOT partition `full` contiguously: a block separator (see
+    // `blockStart` above) adds a synthetic space that belongs to no run. A hit
+    // is decorated only when it lies wholly inside this run; one that starts
+    // in a separator, or that runs past `nodeEnd` into the next tag/run, is
+    // consumed without decoration (its bytes just render as plain text in
+    // whichever run they land in). Consuming by `start < nodeEnd` rather than
+    // by run containment is what keeps `hitIdx` moving — gating on
+    // `start >= nodeStart` would strand a separator-anchored hit forever and
+    // silently drop every later hit in the cell.
     const mine: Array<{ start: number; end: number; isActive: boolean }> = [];
-    while (hitIdx < hits.length && hits[hitIdx].start >= nodeStart && hits[hitIdx].start < nodeEnd) {
+    while (hitIdx < hits.length && hits[hitIdx].start < nodeEnd) {
       const h = hits[hitIdx];
       hitIdx++;
-      if (h.end <= nodeEnd) mine.push(h);
+      if (h.start >= nodeStart && h.end <= nodeEnd) mine.push(h);
     }
     // Untouched runs go back verbatim, so entity spellings this module emits
     // (`&#8203;`, `&nbsp;`) survive the round trip byte-for-byte.

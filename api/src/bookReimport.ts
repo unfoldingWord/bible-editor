@@ -50,6 +50,7 @@ import {
   fetchDcsMasterTextVerified,
   fetchHumanTouchedRefs,
   listMasterCommitsSince,
+  repoHeadCommitSha,
   NT_BOOKS,
   type MasterCommitPage,
 } from "./dcsSources";
@@ -63,9 +64,11 @@ import {
   masterMayHoldHumanEdit,
   masterMayHoldHumanEditForVerse,
   summarizeLineage,
+  completeHumanRefEvidenceTouches,
   type HumanRefEvidence,
   type MasterLineageSummary,
 } from "./masterLineage.ts";
+import { readLedgerMasterLineage } from "./masterLineageLedger.ts";
 import {
   findOurMergeForPr,
   gitBlobShaOrNull,
@@ -134,9 +137,12 @@ import {
   confirmAdoptedConflicts,
   deleteLostAdoptionConflicts,
   raiseVerseMergeConflictAlert,
+  resolveConvergedVerseMergeConflicts,
+  activeKeptVerseMergeConflictRefs,
 } from "./verseMergeConflicts.ts";
 import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
+import { appendSystemRecord, reconcileReviewAlert, resolveReviewAlert, reviewConditionKey } from "./reviewAlerts.ts";
 // Issue #686: the row-level "what/where/who" provenance columns (migration
 // 0060). `door43Actor` is the ONLY way this file names a Door43 commit author —
 // never build that string by hand — and it is measured-or-nothing: it names an
@@ -543,6 +549,23 @@ export interface ReimportCounts {
   // this class exists and can't be "handled on the export side" as an
   // earlier, false comment claimed. verses only.
   merge_cosmetic_ignored: number;
+  // A raw-byte-only Door43 change that would otherwise have been ignored, but
+  // whose exact verse/range was positively attributed to a human Door43 edit
+  // by a COMPLETE lineage ref map. The exact master bytes were adopted through
+  // the normal version-CAS lane; this is deliberately separate from
+  // merge_adopted so the small, evidence-gated exception stays observable.
+  // verses only.
+  merge_cosmetic_adopted: number;
+  // Issue #789: standing `keep_alignment_refused` / `source_attr_divergent` /
+  // `keep_local_structure` verse_merge_conflicts rows this run RESOLVED
+  // because the verse converged with master (`keep_converged` /
+  // `keep_master_unchanged` — see resolveConvergedVerseMergeConflicts). Those
+  // three outcomes never re-record a row on their own, so without this a
+  // standing refusal sat in the "Sync flagged" banner long after the sync
+  // stopped disagreeing about that verse. Counted so a night that quietly
+  // cleared backlog is visible in the summary, not just inferable from the
+  // banner's count dropping. verses only.
+  merge_conflicts_resolved_on_convergence: number;
   // Master's bytes for this (book, resource) were EXACTLY the render the export
   // last pushed, so master moved because our own `-be-` branch merged and the
   // merge ancestor cutoff (master_confirmed_at) was advanced to that render's
@@ -771,6 +794,8 @@ function zeroCounts(): ReimportCounts {
     ref_healed: 0,
     merge_unavailable: 0,
     merge_cosmetic_ignored: 0,
+    merge_cosmetic_adopted: 0,
+    merge_conflicts_resolved_on_convergence: 0,
     own_publish_converged: 0,
     merge_record_failed: false,
     stale_base_held: 0,
@@ -798,7 +823,8 @@ export const raiseTombstoneBlockAlertForTest = (
   resource: Resource,
   counts: ReimportCounts,
   overridden: boolean = false,
-): Promise<void> => raiseTombstoneBlockAlert(env, book, resource, counts, overridden);
+  observedAt = Date.now(),
+): Promise<void> => raiseTombstoneBlockAlert(env, book, resource, counts, overridden, observedAt);
 // aiRowDiffGate.test.mjs (issue #485 P1 follow-up): softDeleteRemovedTsvRows is
 // the prune half of the diff gate — this alias lets the test drive the REAL
 // prune against the real SQL (same rationale as the aliases above) to confirm
@@ -875,7 +901,8 @@ export const clearTombstoneBlockAlertForTest = (
   env: Env,
   book: string,
   resource: Resource,
-): Promise<void> => clearTombstoneBlockAlert(env, book, resource);
+  observedAt = Date.now(),
+): Promise<void> => clearTombstoneBlockAlert(env, book, resource, observedAt);
 // persistMasterLineage's own DB write, exposed directly so
 // masterLineagePersist.test.mjs can drive the UPSERT (both the update-existing-
 // row path and the insert-when-absent fallback) against a real SQLite-backed
@@ -1017,6 +1044,8 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.ref_healed += from.ref_healed ?? 0;
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
+  into.merge_cosmetic_adopted += from.merge_cosmetic_adopted ?? 0;
+  into.merge_conflicts_resolved_on_convergence += from.merge_conflicts_resolved_on_convergence ?? 0;
   into.own_publish_converged += from.own_publish_converged ?? 0;
   into.merge_record_failed = Boolean(into.merge_record_failed || from.merge_record_failed);
   into.apply_incomplete = Boolean(into.apply_incomplete || from.apply_incomplete);
@@ -1173,6 +1202,7 @@ async function runReimport(
   // rules out.
   staleBaseOverrideResource?: Resource,
 ): Promise<ReimportResult> {
+  const alertObservedAt = Date.now();
   const urls = dcsUrls(env, book)!;
 
   // Fetch each requested resource once at the book level. ULT/UST/TN/TQ/TWL
@@ -1300,7 +1330,7 @@ async function runReimport(
       overridden ? "stale_tc_reexport_overridden" : "stale_tc_reexport",
       now,
     );
-    await raiseStaleBaseHoldAlert(env, hold, !ok, overridden);
+    await raiseStaleBaseHoldAlert(env, hold, !ok, overridden, alertObservedAt);
     console.warn("reimport (user pull): master file is a wholesale re-export from a stale translationCore base (#639)", {
       book,
       resource,
@@ -1380,7 +1410,15 @@ async function runReimport(
       if (own.reason === "content_differs") ownDeclines.set(resource, state);
       continue;
     }
-    const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, state.pushedEditId, null);
+    const stamped = await markOwnPublishConverged(
+      env,
+      book,
+      resource,
+      own.readAt,
+      state.pushedEditId,
+      null,
+      alertObservedAt,
+    );
     if (stamped) perResource[resource].own_publish_converged++;
     console.log("reimport recognized master's movement as our own publish", {
       book,
@@ -1414,10 +1452,17 @@ async function runReimport(
           cutoff.editId,
           stats,
           ownDeclines.get(resource) ?? null,
+          alertObservedAt,
         )
       : null;
     perResource[resource].merge_no_base_cleared += stats.noBaseCleared;
-    return { ...cutoff, lineage };
+    // #658 may advance the boundary inside loadMasterLineage. Re-read verse
+    // resources afterward so this same user-triggered run sees it, and attach
+    // #790's exact confirmed-render bases once for all chapter calls.
+    const current = resource === "ult" || resource === "ust"
+      ? await getMasterConfirmedAt(env, book, resource, true)
+      : cutoff;
+    return { ...current, lineage };
   };
 
   const masterConfirmedAtUlt = await withLineage(
@@ -1532,6 +1577,7 @@ async function runReimport(
       noBaseCount: perResource.ult.merge_no_base,
       noBaseRefs: perResource.ult.merge_no_base_refs,
       noBaseEditorRefs: perResource.ult.merge_no_base_editor_refs,
+      observedAt: alertObservedAt,
     });
   }
   if (want.has("ust")) {
@@ -1540,6 +1586,7 @@ async function runReimport(
       noBaseCount: perResource.ust.merge_no_base,
       noBaseRefs: perResource.ust.merge_no_base_refs,
       noBaseEditorRefs: perResource.ust.merge_no_base_editor_refs,
+      observedAt: alertObservedAt,
     });
   }
 
@@ -3997,6 +4044,10 @@ function sourceWordsForVerseRange(
 interface MergeCutoff {
   confirmedAt: number | null;
   editId: number | null;
+  // #790: exact per-verse content parsed from the pushed render whose
+  // read/edit boundary is identical to this confirmed boundary. Absent means
+  // the artifact could not be proven/read; callers then keep keep_no_base.
+  confirmedVerseBases?: Map<string, string> | null;
   /**
    * WHO moved master's file for this (book, resource) since the ancestor —
    * issue #540 item 1. Fetched once per pair per run at the only place that
@@ -4011,34 +4062,158 @@ interface MergeCutoff {
   lineage?: MasterLineageSummary | null;
 }
 
-async function getMasterConfirmedAt(env: Env, book: string, resource: string): Promise<MergeCutoff> {
+// Issue #788: stableKey intentionally treats whitespace-only content changes as
+// converged, which is the right default for render/reparse churn. There is one
+// narrow exception: a complete lineage walk can positively prove that a human
+// Door43 commit touched this exact verse (or one verse covered by its bridge).
+// Only then may we preserve the human's exact master bytes instead of exporting
+// D1's cosmetic form back over them. Every absent, old, incomplete, malformed,
+// or non-matching evidence shape returns false: the ordinary
+// merge_cosmetic_ignored path is the fail-closed default.
+function hasCompleteHumanRefEvidenceForVerse(
+  lineage: MasterLineageSummary | null | undefined,
+  chapter: number,
+  verse: number,
+  verseEnd: number | null | undefined,
+): boolean {
+  // The shared helper validates the ENTIRE ref set, not just the matching
+  // entry. One malformed ref means the evidence is incomplete and cannot
+  // authorize an overwrite.
+  return completeHumanRefEvidenceTouches(lineage, chapter, verse, verseEnd);
+}
+
+async function readPushedBlobText(env: Env, repo: string, sha: string): Promise<string | null> {
+  // Gitea's git-blob endpoint requires the full object id. Refuse abbreviated
+  // or malformed values rather than letting a provider resolve a different
+  // object than the one recordPushedRender measured.
+  if (!/^[0-9a-f]{40}$/i.test(sha)) return null;
+  try {
+    const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+    const response = await fetch(
+      `${base}/api/v1/repos/unfoldingWord/${encodeURIComponent(repo)}/git/blobs/${sha}`,
+      env.DCS_SERVICE_TOKEN ? { headers: { Authorization: `token ${env.DCS_SERVICE_TOKEN}` } } : undefined,
+    );
+    if (!response.ok) return null;
+    const body = await response.json<{ content?: string; encoding?: string }>();
+    if (body.encoding !== "base64" || typeof body.content !== "string") return null;
+    const binary = atob(body.content.replace(/\s/g, ""));
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    return new TextDecoder("utf-8").decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+async function confirmedVerseBases(
+  env: Env,
+  book: string,
+  resource: "ult" | "ust",
+  row: {
+    master_confirmed_at: number | null;
+    master_confirmed_edit_id: number | null;
+    pushed_blob_sha: string | null;
+    pushed_read_at: number | null;
+    pushed_edit_id: number | null;
+    pushed_r2_key: string | null;
+  },
+): Promise<Map<string, string> | null> {
+  if (
+    row.master_confirmed_at == null ||
+    row.pushed_read_at !== row.master_confirmed_at ||
+    row.pushed_edit_id !== row.master_confirmed_edit_id ||
+    row.pushed_blob_sha == null
+  ) return null;
+
+  let raw = row.pushed_r2_key ? await readStaged(env, row.pushed_r2_key) : null;
+  if (raw == null) {
+    const file = dcsResourceFile(book, resource);
+    raw = file ? await readPushedBlobText(env, file.repo, row.pushed_blob_sha) : null;
+  }
+  if (raw == null) return null;
+  try {
+    const bases = new Map<string, string>();
+    for (const verse of extractVersesForRange(raw, 0, 999)) {
+      bases.set(`${verse.chapter}:${verse.verse}`, verse.contentJson);
+    }
+    return bases.size > 0 ? bases : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getMasterConfirmedAt(
+  env: Env,
+  book: string,
+  resource: string,
+  includeConfirmedVerseBases: boolean = false,
+): Promise<MergeCutoff> {
   try {
     const row = await env.DB.prepare(
-      `SELECT master_confirmed_at, master_confirmed_edit_id FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+      `SELECT master_confirmed_at, master_confirmed_edit_id, pushed_blob_sha, pushed_read_at,
+              pushed_edit_id, pushed_r2_key
+         FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
     )
       .bind(book, resource)
-      .first<{ master_confirmed_at: number | null; master_confirmed_edit_id: number | null }>();
-    return { confirmedAt: row?.master_confirmed_at ?? null, editId: row?.master_confirmed_edit_id ?? null };
+      .first<{
+        master_confirmed_at: number | null;
+        master_confirmed_edit_id: number | null;
+        pushed_blob_sha: string | null;
+        pushed_read_at: number | null;
+        pushed_edit_id: number | null;
+        pushed_r2_key: string | null;
+      }>();
+    const cutoff: MergeCutoff = {
+      confirmedAt: row?.master_confirmed_at ?? null,
+      editId: row?.master_confirmed_edit_id ?? null,
+    };
+    if (includeConfirmedVerseBases && row && (resource === "ult" || resource === "ust")) {
+      cutoff.confirmedVerseBases = await confirmedVerseBases(env, book, resource, row);
+    }
+    return cutoff;
   } catch (e) {
-    // 0050 not applied yet (deploy raced its migration — the "missing migration
-    // = prod 500s" class). Degrade to the timestamp cutoff rather than fail the
-    // whole reimport: fall back to master_confirmed_at alone with editId null, so
-    // the merge keeps running on the pre-P1.3 `created_at` boundary until 0050
-    // lands. Logged loudly — a silently-disabled precision is how the original
-    // watermark bug hid for months.
-    console.error("reimport: master_confirmed_edit_id read failed (migration 0050 unapplied?) — merge boundary degraded to the second-granularity timestamp", {
+    // 0064 may lag the Worker during a deploy. Preserve 0050's precise edit-id
+    // boundary and disable only the confirmed-render fallback until the new
+    // column lands; dropping straight to timestamps would unnecessarily reopen
+    // the same-second attribution hole 0050 closed.
+    console.error("reimport: pushed_r2_key read failed (migration 0064 unapplied?) — confirmed-render fallback disabled", {
       book,
       resource,
       error: e instanceof Error ? e.message : String(e),
     });
-    const row = await env.DB.prepare(
-      `SELECT master_confirmed_at FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
-    )
-      .bind(book, resource)
-      .first<{ master_confirmed_at: number | null }>();
-    return { confirmedAt: row?.master_confirmed_at ?? null, editId: null };
+    try {
+      const row = await env.DB.prepare(
+        `SELECT master_confirmed_at, master_confirmed_edit_id
+           FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+      )
+        .bind(book, resource)
+        .first<{ master_confirmed_at: number | null; master_confirmed_edit_id: number | null }>();
+      return {
+        confirmedAt: row?.master_confirmed_at ?? null,
+        editId: row?.master_confirmed_edit_id ?? null,
+      };
+    } catch (e2) {
+      // 0050 itself has not landed: retain the older timestamp-only fallback.
+      console.error("reimport: master_confirmed_edit_id read failed (migration 0050 unapplied?) — merge boundary degraded to the second-granularity timestamp", {
+        book,
+        resource,
+        error: e2 instanceof Error ? e2.message : String(e2),
+      });
+      const row = await env.DB.prepare(
+        `SELECT master_confirmed_at FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+      )
+        .bind(book, resource)
+        .first<{ master_confirmed_at: number | null }>();
+      return { confirmedAt: row?.master_confirmed_at ?? null, editId: null };
+    }
   }
 }
+
+export const getMasterConfirmedAtForTest = (
+  env: Env,
+  book: string,
+  resource: string,
+  includeConfirmedVerseBases: boolean = false,
+): Promise<MergeCutoff> => getMasterConfirmedAt(env, book, resource, includeConfirmedVerseBases);
 
 // Who moved master's file for this (book, resource) since the merge's ancestor
 // (#540 item 1). One Gitea call per page, default budget 5 pages (~250 commits)
@@ -4080,6 +4255,7 @@ async function loadMasterLineage(
   // here is the evidence that attributes the decline (accountOwnPublishDecline),
   // so it is judged here rather than paying a second Gitea fetch for it.
   ownDecline: ResourceSyncState | null = null,
+  observedAt = Date.now(),
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
   if (!file) return null;
@@ -4089,11 +4265,74 @@ async function loadMasterLineage(
     // rewritten never GETS a watermark (recognition never fires), so gating the
     // detector on one would leave it blind for exactly the pairs it exists for
     // (cold review F3 / Codex P1 on this change).
-    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline);
+    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline, observedAt);
     return null;
   }
+  // Prefer the repo-scoped ledger when it can prove a current, gap-free,
+  // complete window. The live path below remains the fallback: old ledger
+  // rows, a stale poll tip, a gap, or any malformed/capped file list must not
+  // become a false "no human" answer. The repo-head probe is necessary because
+  // this resource's file head can be older than a human edit to another file in
+  // the same tracked repo.
+  try {
+    const repoHead = await repoHeadCommitSha(env, file.repo);
+    const ledger = await readLedgerMasterLineage(env.DB, file.repo, file.path, confirmedAt, repoHead);
+    if (ledger.usable && ledger.lineage) {
+      const classified = ledger.lineage.commits;
+      const ledgerPage: MasterCommitPage = {
+        commits: classified,
+        incomplete: false,
+        incompleteReason: "",
+      };
+      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt);
+      const humans = classified.filter((c) => c.kind === "human");
+      let humanRefs: HumanRefEvidence | null = null;
+      if (humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
+        humanRefs = await fetchHumanTouchedRefs(env, file.repo, file.path, humans);
+      }
+      const summary = compactLineage(summarizeLineage(classified, {
+        incomplete: false,
+        incompleteReason: "",
+        humanRefs,
+      }));
+      console.log("reimport master lineage", {
+        book,
+        resource,
+        source: "ledger",
+        confirmedAt,
+        mayHoldHumanEdit: summary.mayHoldHumanEdit,
+        ...summary.counts,
+        incomplete: summary.incomplete,
+        incompleteReason: summary.incompleteReason,
+        humanShas: summary.humanShas,
+        refsComplete: summary.refsComplete,
+        refCount: summary.humanRefs?.length ?? 0,
+      });
+      const asOfSha = classified[0]?.sha ?? null;
+      await persistMasterLineage(env, book, resource, summary, asOfSha, confirmedEditId, confirmedAt);
+      if (resource === "tn" || resource === "tq" || resource === "twl") {
+        const cleared = await clearResolvedMergeNoBase(env, book, resource, confirmedAt, ledgerPage, file, asOfSha);
+        if (stats) stats.noBaseCleared += cleared;
+      }
+      return summary;
+    }
+    console.log("reimport master lineage ledger unavailable; using live walk", {
+      book,
+      resource,
+      reason: ledger.reason,
+    });
+  } catch (error) {
+    // A ledger migration/read failure must never disable the established live
+    // attribution path. This is deliberately fail-closed for ledger use, not
+    // fail-open for the merge decision.
+    console.warn("reimport master lineage ledger read failed; using live walk", {
+      book,
+      resource,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
-  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline);
+  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline, observedAt);
   const commits = page.commits.map(classifyMasterCommit);
   // #557: narrow "a human touched this file" to "a human touched THIS verse",
   // but only where it is affordable and only where the file-level answer is
@@ -5444,6 +5683,7 @@ interface ExistingVerseRow {
   updated_by: number | null;
   latest_source: string | null;
   base_payload?: string | null;
+  base_row_exists?: number | null;
   human_edit_after_export?: number | null;
   structural_edit_id?: number | null;
   structural_edit_at?: number | null;
@@ -5734,8 +5974,18 @@ async function applyVerseRows(
                  AND (
                    (action IN ('create', 'update', 'bridge', 'split') AND ${baseBoundary})
                    OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
-                 )
+               )
                ORDER BY created_at DESC, id DESC LIMIT 1) AS base_payload,
+            EXISTS (
+              SELECT 1 FROM edit_log
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND (
+                   (action IN ('create', 'update', 'bridge', 'split') AND ${baseBoundary})
+                   OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
+                 )
+            ) AS base_row_exists,
             EXISTS (
               SELECT 1 FROM edit_log
                WHERE kind = 'verse'
@@ -5828,6 +6078,10 @@ async function applyVerseRows(
     v: VerseExtract;
     oldVersion: number;
     merge: VerseMergeResult;
+    // #788's evidence-gated exception for a human Door43 whitespace-only edit.
+    // Kept explicit rather than inferred from merge.reason when the CAS lands,
+    // so the counter remains tied to an actual write, never just a decision.
+    cosmeticHuman: boolean;
     plainText: string | null;
     // FIX 8: D1's content before this adoption, so the lane-reopen decision
     // (lanesToReopenOnVerseEdit) can tell whether the adoption actually
@@ -5883,6 +6137,16 @@ async function applyVerseRows(
     // See issue #507's version guard on UPSERT_VERSE_MERGE_CONFLICT_SQL.
     observedVersion: number | null;
   }> = [];
+  // Issue #789: verses this run measured as `keep_converged` /
+  // `keep_master_unchanged` — computeVerseMerge's two clean outcomes, which
+  // (unlike every action pushed to mergeConflicts above) never mint or
+  // re-record a verse_merge_conflicts row of their own. Passed to
+  // resolveConvergedVerseMergeConflicts after the loop below, which resolves
+  // any STANDING keep_alignment_refused / source_attr_divergent /
+  // keep_local_structure row for exactly these refs — see that function's doc
+  // comment for why the whole set is collected here rather than checked
+  // per-verse against the backlog inline.
+  const convergedRefs: Array<{ chapter: number; verse: number }> = [];
   // 2-pre. Issue #728: reconcile verse-bridge STRUCTURE as its own dimension,
   // per chapter, BEFORE any content decision. See verseStructure.ts's header for
   // the design (#726) and the four shapes. This replaces PR #721's `bridgeCover`
@@ -5910,6 +6174,23 @@ async function applyVerseRows(
   // the component's absorbed/recreated rows still at the same time.
   const anchorByKey = new Map<string, StructureAdoption<ExistingVerseRow, VerseExtract>>();
   for (const a of plan.adoptions) anchorByKey.set(structureKey(a.chapter, a.anchor.verse), a);
+  // A standing keep_local_structure row must retire when the two sides later
+  // have the same range again, even if this verse is pristine and therefore
+  // never enters computeVerseMerge's edited-row convergence branch. Any key
+  // owned by the plan is still divergent or being adopted and is excluded.
+  const structurallyConvergedRefs: Array<{ chapter: number; verse: number }> = [];
+  for (const v of verses) {
+    const key = structureKey(v.chapter, v.verse);
+    const ex = existing.get(key);
+    if (
+      ex != null &&
+      (ex.verse_end ?? null) === (v.verseEnd ?? null) &&
+      !plan.skipMasterKeys.has(key) &&
+      !anchorByKey.has(key)
+    ) {
+      structurallyConvergedRefs.push({ chapter: v.chapter, verse: v.verse });
+    }
+  }
   // For a 'split' anchor, what rule 4 of computeVerseMerge measures alignment
   // against: master's rows over the bridge's WHOLE range, joined the way the
   // bridge route joins verses. Verse-to-verse, every un-bridge would look like
@@ -5981,7 +6262,11 @@ async function applyVerseRows(
       for (const m of kl.masterVerses) {
         const same = kl.d1Rows.find((r) => r.verse === m.verse);
         if (same) {
-          const ancestor = verseContentJsonFromPayload(same.base_payload ?? null);
+          const loggedAncestor = verseContentJsonFromPayload(same.base_payload ?? null);
+          const renderedAncestor = Number(same.base_row_exists ?? 0) === 0
+            ? cutoff?.confirmedVerseBases?.get(`${kl.chapter}:${m.verse}`) ?? null
+            : null;
+          const ancestor = loggedAncestor ?? renderedAncestor;
           if (ancestor != null) {
             if (!verseContentConverged(ancestor, m.contentJson)) {
               mergeConflicts.push({
@@ -6176,8 +6461,17 @@ async function applyVerseRows(
       // below. null when no cutoff exists (no merge ran).
       let mergeAction: VerseMergeAction | null = null;
       if (lastExportAt != null) {
+        // #790: bootstrap import writes no verse audit rows. If this verse's
+        // first content row landed only after the confirmed boundary, the
+        // ordinary fold has no ancestor even though the exact confirmed render
+        // does. Use that render only when SQL proves there was NO eligible row
+        // at/below the boundary; a present-but-bad payload must remain unknown.
+        const loggedBase = verseContentJsonFromPayload(ex.base_payload ?? null);
+        const confirmedBase = Number(ex.base_row_exists ?? 0) === 0
+          ? cutoff?.confirmedVerseBases?.get(`${v.chapter}:${v.verse}`) ?? null
+          : null;
         const merge = computeVerseMerge({
-          base: verseContentJsonFromPayload(ex.base_payload ?? null),
+          base: loggedBase ?? confirmedBase,
           ours: ex.content_json,
           theirs: v.contentJson,
           humanEditedSinceExport: Number(ex.human_edit_after_export ?? 0) !== 0,
@@ -6284,10 +6578,20 @@ async function applyVerseRows(
             );
           }
         }
-        // FIX 5: converged-per-stableKey but the raw bytes differed — a real,
-        // cosmetic-only edit this comparison silently discards. See
-        // verseMerge.ts's FIX 5 correction and the field's own doc comment.
-        if (merge.action === "keep_converged" && ex.content_json !== v.contentJson) {
+        // #788: converged-per-stableKey but raw bytes differ is normally the
+        // render/reparse-churn case, so keep D1. The sole exception requires
+        // positive, COMPLETE evidence that a human Door43 commit touched this
+        // exact verse/range, no human app edit landed after the export boundary,
+        // and the grouping is exactly unchanged. This preserves a maintainer's
+        // intentional punctuation/spacing bytes without opening a generic
+        // cosmetic-write lane that would churn checkoffs or race a translator.
+        const cosmeticHumanAdopt =
+          merge.action === "keep_converged" &&
+          ex.content_json !== v.contentJson &&
+          (ex.verse_end ?? null) === (v.verseEnd ?? null) &&
+          Number(ex.human_edit_after_export ?? 0) === 0 &&
+          hasCompleteHumanRefEvidenceForVerse(cutoff?.lineage, v.chapter, v.verse, v.verseEnd);
+        if (merge.action === "keep_converged" && ex.content_json !== v.contentJson && !cosmeticHumanAdopt) {
           counts.merge_cosmetic_ignored++;
         }
         // FIX 2: record EVERY landed adoption ("adopt" | "adopt_conflict"),
@@ -6301,15 +6605,17 @@ async function applyVerseRows(
         // adjudicated on complete evidence with nothing taken from Door43, so
         // it mints no durable row for a translator to clear. See the counter +
         // log above; the run summary still carries it as merge_kept_ai.
-        if ((merge.conflict || merge.adopt) && merge.action !== "keep_ai_master") {
+        if ((merge.conflict || merge.adopt || cosmeticHumanAdopt) && merge.action !== "keep_ai_master") {
           mergeConflicts.push({
             chapter: v.chapter,
             verse: v.verse,
-            action: merge.action,
-            reason: merge.reason,
-            overwrittenVersion: merge.adopt ? ex.version : null,
+            // This is an audit-only `adopt`, deliberately excluded from the
+            // alertable-action query just like every clean master adoption.
+            action: cosmeticHumanAdopt ? "adopt" : merge.action,
+            reason: cosmeticHumanAdopt ? "cosmetic_human" : merge.reason,
+            overwrittenVersion: (merge.adopt || cosmeticHumanAdopt) ? ex.version : null,
             alignment: merge.alignment ?? null,
-            adopted: merge.adopt,
+            adopted: merge.adopt || cosmeticHumanAdopt,
             // See issue #507: the version this verse's merge outcome was
             // detected at, so the speculative upsert's reactivation carve-out
             // (keep_alignment_refused / source_attr_divergent /
@@ -6318,11 +6624,14 @@ async function applyVerseRows(
             observedVersion: ex.version,
           });
         }
-        if (merge.adopt) {
+        if (merge.adopt || cosmeticHumanAdopt) {
           masterAdoptions.push({
             v,
             oldVersion: ex.version,
-            merge,
+            merge: cosmeticHumanAdopt
+              ? { ...merge, action: "adopt", adopt: true, conflict: false, reason: "cosmetic_human" }
+              : merge,
+            cosmeticHuman: cosmeticHumanAdopt,
             plainText: v.plainText,
             beforeContentJson: ex.content_json,
             beforePlainText: ex.plain_text,
@@ -6354,6 +6663,10 @@ async function applyVerseRows(
       if (mergeAction === "keep_master_unchanged" || mergeAction === "keep_converged") {
         counts.skipped_edited++;
         counts.source_attr_reconcile_skipped++;
+        // Issue #789: this verse converged with master, so any standing
+        // keep_alignment_refused / source_attr_divergent / keep_local_structure
+        // row for it is stale — resolved (if one exists) after the loop below.
+        convergedRefs.push({ chapter: v.chapter, verse: v.verse });
         continue;
       }
       const rec = reconcileEditedVerseSourceAttrs(ex.content_json, v.contentJson);
@@ -6451,6 +6764,20 @@ async function applyVerseRows(
         ).bind(rowKey, book, userId, ex.version, ex.version + 1, JSON.stringify({ plain_text: v.plainText, content: v.contentJson }), REIMPORT_SOURCE),
       });
     }
+  }
+
+  // Issue #789: resolve any standing keep_alignment_refused /
+  // source_attr_divergent / keep_local_structure row for a verse this run
+  // measured as converged. Independent of every write batch below (no CAS,
+  // no recordFailed gate) — a fresh conflict this SAME run would have pushed
+  // the verse into masterAdoptions/mergeConflicts instead of convergedRefs,
+  // so there is no ordering dependency to protect.
+  const allConvergedRefs = [...new Map(
+    [...structurallyConvergedRefs, ...convergedRefs].map((r) => [structureKey(r.chapter, r.verse), r]),
+  ).values()];
+  if (allConvergedRefs.length > 0) {
+    const { resolved } = await resolveConvergedVerseMergeConflicts(env, book, resource, allConvergedRefs);
+    counts.merge_conflicts_resolved_on_convergence += resolved;
   }
 
   if (suppressedRefs.length > 0) {
@@ -6924,8 +7251,14 @@ async function applyVerseRows(
         `merge-conflict recording failed this run (see merge_record_failed)`,
     );
   } else {
-    for (let i = 0; i < contentOnlyAdoptions.length; i += WRITE_BATCH) {
-      const slice = contentOnlyAdoptions.slice(i, i + WRITE_BATCH);
+    // Each version-CAS write is immediately followed by its changes()-gated
+    // edit_log row in the SAME transactional D1 batch. The audit payload is a
+    // recovery boundary, not optional telemetry: a write batch followed by a
+    // separate log batch can commit the new verse bytes and then lose history
+    // permanently. Pairing also guarantees a lost CAS mints no phantom log.
+    const ADOPTION_PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+    for (let i = 0; i < contentOnlyAdoptions.length; i += ADOPTION_PAIR_BATCH) {
+      const slice = contentOnlyAdoptions.slice(i, i + ADOPTION_PAIR_BATCH);
       try {
         const results = await env.DB.batch(
           // #686: master-adoption of an out-of-band Door43 correction over a
@@ -6933,7 +7266,7 @@ async function applyVerseRows(
           // and the actor MUST be the measured commit author (never a
           // fallback built here) — this is the write computeVerseMerge only
           // reaches when the human's own edit did NOT explain the difference.
-          slice.map((a) =>
+          slice.flatMap((a) => [
             env.DB.prepare(
               `UPDATE verses
                   SET content_json = ?1, plain_text = ?2, verse_end = ?3,
@@ -6944,24 +7277,25 @@ async function applyVerseRows(
               a.v.contentJson, a.plainText, a.v.verseEnd, now, book, a.v.chapter, a.v.verse, bibleVersion, a.oldVersion,
               ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43 }),
             ),
-          ),
+            gatedLogEditStmt(
+              env, "verse",
+              `${book}/${a.v.chapter}/${a.v.verse}/${bibleVersion}`,
+              book, userId, a.oldVersion, a.oldVersion + 1, "update",
+              { plain_text: a.plainText, content: a.v.contentJson },
+            ),
+          ]),
         );
-        const logs: D1PreparedStatement[] = [];
         slice.forEach((a, j) => {
-          if ((results[j]?.meta.changes ?? 0) > 0) {
+          if ((results[j * 2]?.meta.changes ?? 0) > 0) {
             counts.merge_adopted++;
+            if (a.cosmeticHuman) counts.merge_cosmetic_adopted++;
             adoptionsApplied.add(`${a.v.chapter}:${a.v.verse}`);
-            console.warn("reimport: adopted master's out-of-band correction over D1 (verseMerge)", {
+            console.warn(a.cosmeticHuman
+              ? "reimport: adopted a positively-attributed human cosmetic Door43 edit over D1 (issue #788)"
+              : "reimport: adopted master's out-of-band correction over D1 (verseMerge)", {
               book, bibleVersion, chapter: a.v.chapter, verse: a.v.verse, action: a.merge.action, reason: a.merge.reason,
+              ...(a.cosmeticHuman ? { candidateHumanShas: cutoff?.lineage?.humanShas ?? [] } : {}),
             });
-            logs.push(
-              logEditStmt(
-                env, "verse",
-                `${book}/${a.v.chapter}/${a.v.verse}/${bibleVersion}`,
-                book, userId, a.oldVersion, a.oldVersion + 1, "update",
-                { plain_text: a.plainText, content: a.v.contentJson },
-              ),
-            );
           } else {
             // Lost the version-CAS race — a human wrote this verse between our
             // read and this batch. Master's correction did NOT land, so D1 is
@@ -6975,7 +7309,6 @@ async function applyVerseRows(
             });
           }
         });
-        if (logs.length) await env.DB.batch(logs);
       } catch (e) {
         // Correctness-bearing: this batch adopts a maintainer's out-of-band
         // Door43 correction into D1. A thrown batch leaves D1 stale — taint so
@@ -7654,6 +7987,10 @@ interface StagedResource {
   // shipped; masterMayHoldHumanEdit reads that absence as "a human may have",
   // which is the pre-existing behavior.
   lineage?: MasterLineageSummary | null;
+  // #790: ref -> content_json map parsed once in the plan step from the exact
+  // render at the confirmed boundary. Chunk steps consume this compact JSON
+  // instead of reparsing a historical whole-book USFM file.
+  confirmedBaseR2Key?: string | null;
   // #653: merge_no_base flags the SAME walk retired for this (book, resource).
   // Seeded into the run summary from the plan, not from a chunk — the clear is
   // per pair and happens at staging time, so counting it in a chunk would
@@ -7944,6 +8281,7 @@ async function accountOwnPublishDecline(
   file: { repo: string; path: string },
   walked: MasterCommitPage | null,
   sync: ResourceSyncState,
+  observedAt = Date.now(),
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   try {
@@ -7960,30 +8298,40 @@ async function accountOwnPublishDecline(
     // there is no merge to look for. Not derived from export_snapshots by time,
     // either: two overlapping exports can record their snapshots out of order.
     const row = await env.DB.prepare(
-      `SELECT pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number, pushed_pr_read_at
+      `SELECT pushed_blob_sha, pushed_read_at, pushed_edit_id, own_publish_declines, pushed_pr_number, pushed_pr_read_at
          FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
     )
       .bind(book, resource)
       .first<{
         pushed_blob_sha: string | null;
         pushed_read_at: number | null;
+        pushed_edit_id: number | null;
         own_publish_declines: number | null;
         pushed_pr_number: number | null;
         pushed_pr_read_at: number | null;
       }>();
     const pushedBlobSha = row?.pushed_blob_sha ?? null;
     const pushedReadAt = row?.pushed_read_at ?? null;
+    const pushedEditId = row?.pushed_edit_id ?? null;
     const prior = row?.own_publish_declines ?? 0;
     if (!pushedBlobSha) return;
     // The comparison that declined ran against `sync`; if the row's render has
     // moved since, tonight's `content_differs` was about a render that is no
     // longer the one on the row — nothing to attribute to it.
-    if (pushedBlobSha !== sync.pushedBlobSha) {
+    if (
+      pushedBlobSha !== sync.pushedBlobSha ||
+      pushedReadAt !== sync.pushedReadAt ||
+      pushedEditId !== sync.pushedEditId
+    ) {
       console.log("reimport own-publish decline unmeasured: the pushed render moved during the run", {
         book,
         resource,
         comparedBlobSha: sync.pushedBlobSha,
         rowBlobSha: pushedBlobSha,
+        comparedReadAt: sync.pushedReadAt,
+        rowReadAt: pushedReadAt,
+        comparedEditId: sync.pushedEditId,
+        rowEditId: pushedEditId,
       });
       return;
     }
@@ -8022,15 +8370,30 @@ async function accountOwnPublishDecline(
       return;
     }
     if (judged.verdict === "preserved") {
+      // #658: a preserved own merge plus a complete human-free walk proves the
+      // pushed render is a safe ancestor even though a later AI commit made the
+      // current whole-file bytes differ. Use the pushed render's captured edit
+      // boundary, never an edit id observed during reimport. This happens before
+      // getMasterConfirmedAt is re-read for chunk apply, so tonight's merge can
+      // recover the newly confirmed ancestor. Absent/incomplete/human evidence
+      // deliberately declines to the existing conservative behavior.
+      const lineageConfirmed =
+        !page.incomplete &&
+        commits.every((commit) => commit.kind !== "human") &&
+        pushedReadAt != null
+          ? await markLineageConfirmedConverged(env, book, resource, {
+              pushedBlobSha,
+              pushedReadAt,
+              pushedEditId,
+            }, observedAt)
+          : false;
       await env.DB.prepare(
         `UPDATE book_resource_syncs SET own_publish_declines = 0, own_publish_rewrite_sha = NULL
           WHERE book = ?1 AND resource = ?2 AND (own_publish_declines <> 0 OR own_publish_rewrite_sha IS NOT NULL)`,
       )
         .bind(book, resource)
         .run();
-      await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-        .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-        .run();
+      await resolveReviewAlert(env, source, undefined, OWN_PUBLISH_ALERT_USERNAME, observedAt);
       console.log("reimport own-publish decline explained: our merge landed our exact bytes; a later commit moved the file", {
         book,
         resource,
@@ -8043,6 +8406,9 @@ async function accountOwnPublishDecline(
         newestAuthor: judged.newest?.author ?? null,
         newestDate: judged.newest?.date ?? null,
         resetFrom: prior,
+        lineageComplete: !page.incomplete,
+        lineageHumanCommits: commits.filter((commit) => commit.kind === "human").length,
+        lineageConfirmed,
       });
       return;
     }
@@ -8082,7 +8448,7 @@ async function accountOwnPublishDecline(
     // state does not re-raise nightly — and a dismissed banner stays dismissed
     // until a preserved/recognized night resets the count and it climbs again.
     if (prior < OWN_PUBLISH_INERT_THRESHOLD && next >= OWN_PUBLISH_INERT_THRESHOLD) {
-      await raiseOwnPublishInertAlert(env, book, resource, next, sync, judged);
+      await raiseOwnPublishInertAlert(env, book, resource, next, sync, judged, observedAt);
     }
   } catch (e) {
     console.error("reimport own-publish decline accounting failed", {
@@ -8103,7 +8469,8 @@ export const accountOwnPublishDeclineForTest = (
   file: { repo: string; path: string },
   walked: MasterCommitPage | null,
   sync: ResourceSyncState,
-): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync);
+  observedAt = Date.now(),
+): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync, observedAt);
 
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
@@ -8149,10 +8516,10 @@ export const accountOwnPublishDeclineForTest = (
 // actual reclaim WRITE rather than merely a freeze — see isReissuedTombstone's
 // KNOWN FALSE POSITIVE note in reimportClassify.ts for what that means.
 
-// #540 item 2's scale alarm. A handful of kept-over-Door43 rows is the policy
+// #540 item 2's scale telemetry. A handful of kept-over-Door43 rows is the policy
 // working; a book-full of them has the shape of every incident this area exists
 // to prevent — and unlike a refusal, this outcome PUBLISHES over Door43 rather
-// than holding. See isKeptOverDoor43AtScale for why it alerts instead of
+// than holding. See isKeptOverDoor43AtScale for why it records instead of
 // freezing.
 //
 // Claims only the measurement: how many rows, in which (book, resource), and
@@ -8163,6 +8530,7 @@ async function raiseKeptOverDoor43Alert(
   book: string,
   resource: Resource,
   kept: number,
+  eventKey?: string,
 ): Promise<void> {
   const source = `reimport_kept_over_door43:${book}:${resource}`;
   const res = resource.toUpperCase();
@@ -8178,16 +8546,17 @@ async function raiseKeptOverDoor43Alert(
     `as "reimport merge kept the app's value over Door43's" with Door43's values. The verses are in ` +
     `${book}'s merge-review banner.`;
   try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-      .run();
-    await env.DB.prepare(
-      `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
-    )
-      .bind(OWN_PUBLISH_ALERT_USERNAME, "warning", source, message, null)
-      .run();
+    if (kept > 0) {
+      await appendSystemRecord(env, {
+        username: OWN_PUBLISH_ALERT_USERNAME,
+        source,
+        message,
+        severity: "warning",
+        eventKey,
+      });
+    }
   } catch (e) {
-    // Best-effort, like every other alert helper here: a failed banner must
+    // Best-effort, like every other telemetry helper here: a failed record must
     // never fail the reimport, and this one gates nothing.
     console.error("reimport kept-over-Door43 alert failed", {
       book,
@@ -8209,6 +8578,7 @@ async function raiseTombstoneBlockAlert(
   resource: Resource,
   counts: ReimportCounts,
   overridden: boolean = false,
+  observedAt = Date.now(),
 ): Promise<void> {
   const blocked = counts.tombstone_blocked ?? 0;
   const conflicts = counts.conflict_skipped ?? 0;
@@ -8248,14 +8618,18 @@ async function raiseTombstoneBlockAlert(
       ` An explicit-override escape hatch exists (allowIdBlocked on POST /api/exports/run) for a ` +
       `verified-genuine reissue — see GitHub issue #473.`;
   try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-      .run();
-    await env.DB.prepare(
-      `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
-    )
-      .bind(OWN_PUBLISH_ALERT_USERNAME, overridden ? "warning" : "error", source, message, null)
-      .run();
+    await reconcileReviewAlert(env, {
+      username: OWN_PUBLISH_ALERT_USERNAME,
+      source,
+      conditionKey: reviewConditionKey("reimport_id_blocked", { book, resource }, {
+        tombstoneRace: blocked > 0,
+        idCollision: conflicts > 0,
+        overridden,
+      }),
+      message,
+      severity: overridden ? "warning" : "error",
+      observedAt,
+    });
   } catch (e) {
     // Best-effort, exactly like every other alert helper here: a failed banner
     // must never fail the reimport. The withhold itself already happened.
@@ -8271,7 +8645,7 @@ async function raiseTombstoneBlockAlert(
 // once its sync actually succeeds and a watermark is recorded. The alert's
 // own text promises the reclaim-race half of the count "usually clears on
 // its own next sync" — but until this function existed, the ONLY place that
-// DELETE ran was inside raiseTombstoneBlockAlert itself, which fires only
+// resolved the alert was inside raiseTombstoneBlockAlert itself, which fires only
 // while the resource is STILL withheld. A resource that recovers next run
 // never calls it again, so a resolved alert stayed active in the banner
 // forever, falsely claiming the resource was still out of sync (Codex review
@@ -8280,13 +8654,11 @@ async function raiseTombstoneBlockAlert(
 // clearTombstoneBlockAlertForTest for the reimportJourney.test.mjs coverage.
 // Best-effort like every other alert helper here: a failed cleanup must
 // never fail the reimport, and clearing an alert that doesn't exist (the
-// common case — most resources never had one) is a harmless no-op DELETE.
-async function clearTombstoneBlockAlert(env: Env, book: string, resource: Resource): Promise<void> {
+// common case — most resources never had one) is a harmless no-op resolve.
+async function clearTombstoneBlockAlert(env: Env, book: string, resource: Resource, observedAt = Date.now()): Promise<void> {
   const source = `reimport_id_blocked:${book}:${resource}`;
   try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-      .run();
+    await resolveReviewAlert(env, source, undefined, OWN_PUBLISH_ALERT_USERNAME, observedAt);
   } catch (e) {
     console.error("reimport tombstone-block alert clear failed", {
       book,
@@ -8319,6 +8691,7 @@ async function raiseOwnPublishInertAlert(
   rewrites: number,
   sync: ResourceSyncState,
   judged: Extract<OwnPublishDeclineVerdict, { verdict: "rewritten" }>,
+  observedAt = Date.now(),
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   const message =
@@ -8332,14 +8705,16 @@ async function raiseOwnPublishInertAlert(
     `reverting editor work is inert for it. Confirm with \`git hash-object\` on the file at that commit. This ` +
     `clears itself the first night the merge of our push holds our exact bytes.`;
   try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-      .run();
-    await env.DB.prepare(
-      `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
-    )
-      .bind(OWN_PUBLISH_ALERT_USERNAME, "warning", source, message, null)
-      .run();
+    await reconcileReviewAlert(env, {
+      username: OWN_PUBLISH_ALERT_USERNAME,
+      source,
+      conditionKey: reviewConditionKey("own_publish_inert", { book, resource }, {
+        rewrittenMerge: judged.mergeSha,
+      }),
+      message,
+      severity: "warning",
+      observedAt,
+    });
   } catch (e) {
     console.error("reimport own-publish inert alert failed", {
       book,
@@ -8410,6 +8785,7 @@ async function markOwnPublishConverged(
   // leaves the boundary untouched -> reconstruction falls back to the timestamp.
   pushedEditId: number | null,
   masterSha: string | null,
+  observedAt = Date.now(),
 ): Promise<boolean> {
   try {
     const result = await env.DB.prepare(
@@ -8454,9 +8830,7 @@ async function markOwnPublishConverged(
     // Clear any standing inertness banner — the counter is back to 0, so the
     // banner's premise ("keeps differing") is no longer true. Best-effort.
     try {
-      await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-        .bind(OWN_PUBLISH_ALERT_USERNAME, `own_publish_inert:${book}:${resource}`)
-        .run();
+      await resolveReviewAlert(env, `own_publish_inert:${book}:${resource}`, undefined, OWN_PUBLISH_ALERT_USERNAME, observedAt);
     } catch {
       /* the banner is stale, not wrong-headed; never fail a good sync over it */
     }
@@ -8470,6 +8844,59 @@ async function markOwnPublishConverged(
     return false;
   }
 }
+
+// #658. Byte equality is the strongest own-publish proof, but it legitimately
+// fails when an AI commit lands after our merge. When a COMPLETE, human-free
+// lineage walk also proves that our merge preserved the exact pushed blob, that
+// render is an equally sound ancestor. Stamp it before base reconstruction so
+// the current run can use it. The exact pushed-render CAS prevents a concurrent
+// export from pairing one render's timestamp with another render's edit id.
+async function markLineageConfirmedConverged(
+  env: Env,
+  book: string,
+  resource: Resource,
+  candidate: {
+    pushedBlobSha: string;
+    pushedReadAt: number;
+    pushedEditId: number | null;
+  },
+  observedAt = Date.now(),
+): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `UPDATE book_resource_syncs
+        SET master_confirmed_at = MAX(COALESCE(master_confirmed_at, 0), ?3),
+            master_confirmed_edit_id =
+              CASE WHEN ?4 IS NOT NULL AND ?3 >= COALESCE(master_confirmed_at, 0)
+                   THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?4)
+                   ELSE master_confirmed_edit_id END,
+            own_publish_declines = 0,
+            own_publish_rewrite_sha = NULL
+      WHERE book = ?1 AND resource = ?2
+        AND pushed_blob_sha = ?5
+        AND pushed_read_at = ?3
+        AND pushed_edit_id IS ?4`,
+  )
+    .bind(
+      book,
+      resource,
+      candidate.pushedReadAt,
+      candidate.pushedEditId,
+      candidate.pushedBlobSha,
+    )
+    .run();
+  const stamped = (result.meta?.changes ?? 0) > 0;
+  if (stamped) {
+    await resolveReviewAlert(env, `own_publish_inert:${book}:${resource}`, undefined, OWN_PUBLISH_ALERT_USERNAME, observedAt);
+  }
+  return stamped;
+}
+
+export const markLineageConfirmedConvergedForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+  candidate: { pushedBlobSha: string; pushedReadAt: number; pushedEditId: number | null },
+): Promise<boolean> => markLineageConfirmedConverged(env, book, resource, candidate);
 
 export async function storedResourceSha(env: Env, book: string, resource: Resource): Promise<string | null> {
   const row = await env.DB.prepare(
@@ -9041,6 +9468,7 @@ async function planAndStageBookResources(
   // staleBaseOverrideAllowed for the narrow gating and for why the record is
   // written anyway rather than skipped because an operator approved.
   staleBaseOverrideResource?: Resource,
+  alertObservedAt = Date.now(),
 ): Promise<ReimportPlan> {
   const maxRow = await env.DB
     .prepare(`SELECT MAX(chapter) AS m FROM verses WHERE book = ?1`)
@@ -9062,8 +9490,16 @@ async function planAndStageBookResources(
 
     const masterSha = await fileCommitSha(env, file.repo, file.path);
     const sync = await resourceSyncState(env, book, resource);
+    const shaMatches = Boolean(masterSha && sync.sourceSha && masterSha === sync.sourceSha);
+    // #789 production verification: a normal reimport after the cleanup fix
+    // still skipped every old row because the resource SHA was already current.
+    // Pay one indexed read only for SHA-matched verse resources; a non-empty
+    // backlog bypasses the fast path and gets remeasured through applyVerseRows.
+    const convergenceBacklog = shaMatches && !isTsv
+      ? await activeKeptVerseMergeConflictRefs(env, book, resource)
+      : [];
     // Skip ONLY on a positive SHA match (fail-open: null/unknown → reimport).
-    if (masterSha && sync.sourceSha && masterSha === sync.sourceSha) {
+    if (shaMatches && convergenceBacklog.length === 0) {
       // Issue #604: a SHA-unchanged TSV resource is otherwise permanently
       // invisible to the tombstone sweep — runChunkedReimport only ever looks
       // at staged entries, and this resource has nothing staged. Pay for a
@@ -9109,7 +9545,7 @@ async function planAndStageBookResources(
       // Both mean "master and D1 agree", which is the same convergence the sync
       // step's clear responds to. Verse resources only — there are no TSV holds.
       if (resource === "ult" || resource === "ust") {
-        await clearStaleBaseHold(env, book, resource, Math.floor(Date.now() / 1000));
+        await clearStaleBaseHold(env, book, resource, Math.floor(Date.now() / 1000), alertObservedAt);
       }
       entries.push({ resource, changed: false, masterSha, r2Key: null, verifiedComplete: false });
       continue;
@@ -9169,7 +9605,29 @@ async function planAndStageBookResources(
     // saves its D1 count query on a converged resource.
     const own = await recognizePushedRender(raw, sync);
     if (own.recognized) {
-      const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, sync.pushedEditId, masterSha);
+      const stamped = await markOwnPublishConverged(
+        env,
+        book,
+        resource,
+        own.readAt,
+        sync.pushedEditId,
+        masterSha,
+        alertObservedAt,
+      );
+      // Whole-file equality to our pushed render is stronger than per-verse
+      // convergence: no foreign master value remains for any kept-D1 warning
+      // to protect. Retire the backlog even though this branch correctly skips
+      // applyVerseRows, then rederive the banner if other conflict classes stay.
+      if (convergenceBacklog.length > 0) {
+        await resolveConvergedVerseMergeConflicts(env, book, resource, convergenceBacklog);
+        await raiseVerseMergeConflictAlert(env, book, resource, {
+          recordingFailed: false,
+          noBaseCount: 0,
+          noBaseRefs: [],
+          noBaseEditorRefs: [],
+          observedAt: alertObservedAt,
+        });
+      }
       console.log("reimport recognized master's movement as our own publish", {
         book,
         resource,
@@ -9312,7 +9770,27 @@ async function planAndStageBookResources(
       // Tonight's own-publish decline, for the walk to attribute — only the
       // verdict that means "we measured a difference" (see accountOwnPublishDecline).
       own.reason === "content_differs" ? sync : null,
+      alertObservedAt,
     );
+    let confirmedBaseR2Key: string | null = null;
+    if (resource === "ult" || resource === "ust") {
+      // loadMasterLineage may have advanced the boundary via #658. Parse the
+      // exact confirmed render once now, then stage only its compact verse map
+      // for all later chunk steps.
+      const confirmed = await getMasterConfirmedAt(env, book, resource, true);
+      if (confirmed.confirmedVerseBases?.size) {
+        confirmedBaseR2Key = `reimport-stage/${instanceId}/${book}/${resource}-confirmed-bases`;
+        await env.BLOBS.put(
+          confirmedBaseR2Key,
+          JSON.stringify({
+            confirmedAt: confirmed.confirmedAt,
+            editId: confirmed.editId,
+            bases: Object.fromEntries(confirmed.confirmedVerseBases),
+          }),
+          { httpMetadata: { contentType: "application/json" } },
+        );
+      }
+    }
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
     entries.push({
@@ -9322,6 +9800,7 @@ async function planAndStageBookResources(
       r2Key,
       verifiedComplete,
       lineage,
+      confirmedBaseR2Key,
       noBaseCleared: noBaseStats.noBaseCleared,
       // Null on every ordinary night. Non-null ONLY on a force-released
       // stale-base adoption — see the gate above and staleBaseOverridden below.
@@ -9330,6 +9809,17 @@ async function planAndStageBookResources(
   }
   return { maxChapter, entries };
 }
+
+function confirmedBasesForCutoff(
+  stagedBase: { confirmedAt: number | null; editId: number | null; bases: Map<string, string> } | undefined,
+  cutoff: { confirmedAt: number | null; editId: number | null },
+): Map<string, string> | null {
+  return stagedBase && stagedBase.confirmedAt === cutoff.confirmedAt && stagedBase.editId === cutoff.editId
+    ? stagedBase.bases
+    : null;
+}
+
+export const confirmedBasesForCutoffForTest = confirmedBasesForCutoff;
 
 // Reimport one chapter range from staged files. Reads each staged file once,
 // then loops chapters. TSV chapters absent from changedTsv[kind] are skipped.
@@ -9352,6 +9842,34 @@ async function reimportStagedChunk(
     if (!e.changed || !e.r2Key) continue;
     const raw = await readStaged(env, e.r2Key);
     if (raw != null) rawByResource[e.resource] = raw;
+  }
+
+  const confirmedBasesByResource: Partial<Record<"ult" | "ust", {
+    confirmedAt: number | null;
+    editId: number | null;
+    bases: Map<string, string>;
+  }>> = {};
+  for (const resource of ["ult", "ust"] as const) {
+    const key = staged.find((e) => e.resource === resource)?.confirmedBaseR2Key;
+    if (!key) continue;
+    const json = await readStaged(env, key);
+    if (json == null) continue;
+    try {
+      const parsed = JSON.parse(json) as { confirmedAt?: unknown; editId?: unknown; bases?: unknown };
+      if ((typeof parsed.confirmedAt !== "number" && parsed.confirmedAt !== null) ||
+          (typeof parsed.editId !== "number" && parsed.editId !== null) ||
+          parsed.bases == null || typeof parsed.bases !== "object" || Array.isArray(parsed.bases)) continue;
+      confirmedBasesByResource[resource] = {
+        confirmedAt: parsed.confirmedAt,
+        editId: parsed.editId,
+        bases: new Map(
+          Object.entries(parsed.bases as Record<string, unknown>)
+            .filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+        ),
+      };
+    } catch {
+      // Fail closed: an unreadable staged base leaves keep_no_base unchanged.
+    }
   }
 
   // USFM: one parse of the chunk range per version, grouped by chapter.
@@ -9406,7 +9924,15 @@ async function reimportStagedChunk(
   const lineageOf = (resource: Resource): MasterLineageSummary | null =>
     staged.find((e) => e.resource === resource)?.lineage ?? null;
   const withLineage = (cutoff: MergeCutoff | null, resource: Resource): MergeCutoff | null =>
-    cutoff == null ? null : { ...cutoff, lineage: lineageOf(resource) };
+    cutoff == null
+      ? null
+      : {
+          ...cutoff,
+          lineage: lineageOf(resource),
+          confirmedVerseBases: resource === "ult" || resource === "ust"
+            ? confirmedBasesForCutoff(confirmedBasesByResource[resource], cutoff)
+            : undefined,
+        };
 
   const masterConfirmedAtUlt = withLineage(
     versesByChapter.ult ? await getMasterConfirmedAt(env, book, "ult") : null,
@@ -9521,11 +10047,21 @@ export async function runChunkedReimport(
   } = {},
 ): Promise<ReimportResult> {
   const chunkSize = opts.chunk ?? REIMPORT_CHAPTER_CHUNK;
+  // Persist the measurement generation as its own Workflow step. `run()` can
+  // be replayed after an eviction, so a plain Date.now() outside step.do would
+  // change during the same logical run and could let a replay look newer than
+  // a genuinely later workflow. The durable step returns the original token
+  // on replay; a later-finishing older run therefore cannot replace a newer
+  // run's alert state.
+  const alertObservedAt = await step.do(
+    `reimport-alert-observed-${book}`,
+    async () => Date.now(),
+  );
 
   const plan = await step.do(
     `reimport-fetch-${book}`,
     { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-    async () => planAndStageBookResources(env, book, resources, instanceId, opts.staleBaseOverrideResource),
+    async () => planAndStageBookResources(env, book, resources, instanceId, opts.staleBaseOverrideResource, alertObservedAt),
   );
 
   // Own-publish recognition already ran inside planAndStageBookResources (it
@@ -9584,7 +10120,7 @@ export async function runChunkedReimport(
         const overridden = e.staleBaseOverridden != null;
         const hold = (e.staleBaseHold ?? e.staleBaseOverridden) as StaleBaseHold;
         const ok = await recordStaleBaseHold(env, hold, overridden ? "stale_tc_reexport_overridden" : "stale_tc_reexport", now);
-        await raiseStaleBaseHoldAlert(env, hold, !ok, overridden);
+        await raiseStaleBaseHoldAlert(env, hold, !ok, overridden, alertObservedAt);
         recorded.push(`${e.resource}:${overridden ? "force_released" : "refused"}:${ok ? "recorded" : "record_failed"}`);
       }
       console.warn("reimport stale-base gate fired (#639)", { book, recorded });
@@ -9679,6 +10215,7 @@ export async function runChunkedReimport(
         noBaseCount: perResource[e.resource].merge_no_base,
         noBaseRefs: perResource[e.resource].merge_no_base_refs,
         noBaseEditorRefs: perResource[e.resource].merge_no_base_editor_refs,
+        observedAt: alertObservedAt,
       });
     }
   });
@@ -9795,12 +10332,25 @@ export async function runChunkedReimport(
         undefined,
         refusalOverride,
       );
-      // #540 item 2's scale alarm, raised OUTSIDE the withhold branch below and
-      // gating nothing: keeping the app's version at scale does not make the
-      // resource unsafe to export — it makes it worth a human's eye BEFORE the
-      // export publishes those rows to Door43. See isKeptOverDoor43AtScale.
-      if (isKeptOverDoor43AtScale(perResource[e.resource].merge_kept_ai ?? 0)) {
-        await raiseKeptOverDoor43Alert(env, book, e.resource, perResource[e.resource].merge_kept_ai ?? 0);
+      // The recording-failure bit is needed below both for the withhold gate
+      // and for deciding whether a zero kept count is measured. An incomplete
+      // aggregate must not clear a standing alert.
+      const mergeRecordFailed = perResource[e.resource].merge_record_failed === true;
+      // #540 item 2's scale telemetry, recorded OUTSIDE the withhold branch
+      // below and gating nothing: keeping the app's version at scale does not
+      // make the resource unsafe to export — it records what was measured
+      // before the export publishes those rows to Door43.
+      const keptOverDoor43 = perResource[e.resource].merge_kept_ai ?? 0;
+      if (!mergeRecordFailed && perResource[e.resource].counts_incomplete !== true) {
+        if (isKeptOverDoor43AtScale(keptOverDoor43)) {
+          await raiseKeptOverDoor43Alert(
+            env,
+            book,
+            e.resource,
+            keptOverDoor43,
+            `${instanceId}:reimport_kept_over_door43:${book}:${e.resource}`,
+          );
+        }
       }
       // FIX 1: withhold the watermark when this run's merge-conflict
       // recording failed for this resource (applyVerseRows step 6b —
@@ -9814,7 +10364,6 @@ export async function runChunkedReimport(
       // fileCommitSha === stored check matches), so there would never be a
       // retry. See applyVerseRows's FIX 1 comment at the `masterAdoptions`
       // skip site for the other half of this fix.
-      const mergeRecordFailed = perResource[e.resource].merge_record_failed === true;
       // Withhold when a correctness-bearing adoption WRITE threw this run
       // (apply_incomplete) — verse master-adoption / source-attr reconcile /
       // TSV three-way merge. D1 is stale for those rows; stamping would certify
@@ -9846,7 +10395,7 @@ export async function runChunkedReimport(
       ) {
         withheld.push(e.resource);
         if (dropped > 0) {
-          await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource]);
+          await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource], false, alertObservedAt);
         }
         // FIX B: a book whose (book, resource) has NO existing watermark row
         // (e.g. seeded by scripts/import-book.mjs, or whose import-time SHA
@@ -9867,10 +10416,10 @@ export async function runChunkedReimport(
       // will lose these rows" alert instead of clearing it. Ordered AFTER
       // recordResourceSync (so the durable record reflects what actually
       // happened) and INSTEAD OF clearTombstoneBlockAlert below (which would
-      // otherwise immediately delete the very alert this just wrote — both
+      // otherwise immediately resolve the very alert this just wrote — both
       // share the same `reimport_id_blocked:${book}:${resource}` source).
       if (idBlockedOverride && dropped > 0) {
-        await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource], true);
+        await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource], true, alertObservedAt);
         continue;
       }
       // The resource just synced cleanly (it reached here, so it was NOT
@@ -9878,7 +10427,7 @@ export async function runChunkedReimport(
       // past run's tombstone_blocked/conflict_skipped count. See
       // clearTombstoneBlockAlert's doc comment for why this can't live inside
       // raiseTombstoneBlockAlert itself.
-      await clearTombstoneBlockAlert(env, book, e.resource);
+      await clearTombstoneBlockAlert(env, book, e.resource, alertObservedAt);
       // Issue #639: same shape, same reason. This resource reached a clean
       // stamp, so master no longer presents the stale replacement — either it
       // was repaired upstream or a newer revision superseded it. Release the
@@ -9893,7 +10442,7 @@ export async function runChunkedReimport(
       // will publish this" banner the stale-base step wrote moments ago, and
       // resolve the record of the override along with it.
       if ((e.resource === "ult" || e.resource === "ust") && e.staleBaseOverridden == null) {
-        await clearStaleBaseHold(env, book, e.resource, Math.floor(Date.now() / 1000));
+        await clearStaleBaseHold(env, book, e.resource, Math.floor(Date.now() / 1000), alertObservedAt);
       }
     }
     if (withheld.length) {
@@ -9915,6 +10464,9 @@ export async function runChunkedReimport(
     let cleaned = 0;
     for (const e of plan.entries) {
       if (e.r2Key) { try { await env.BLOBS.delete(e.r2Key); cleaned++; } catch { /* best-effort */ } }
+      if (e.confirmedBaseR2Key) {
+        try { await env.BLOBS.delete(e.confirmedBaseR2Key); cleaned++; } catch { /* best-effort */ }
+      }
     }
     return { cleaned };
   });

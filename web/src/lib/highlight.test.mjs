@@ -8,6 +8,7 @@
 
 import {
   collectSourceWords,
+  findSourceHighlights,
   findTargetHighlights,
   isPaintableHtml,
   leadingBreakClass,
@@ -692,6 +693,76 @@ const JOIN = "⁠";
   assert(
     editable.includes("\\ts\\*</span> "),
     `the \\ts\\* chip carries the same trailing space as the baseline (got ${JSON.stringify(editable)})`,
+  );
+}
+
+// --- 28. Spanning TN quote ("A & B"): per-group match lights only groups
+// present in THIS verse. Singleton typos stay dark (partialGroups off).
+{
+  const v11 = [src("שַׁאֲנַ֣ן"), src("מוֹאָ֔ב"), src("מִנְּעוּרָ֑יו")];
+  const v12 = [src("לָכֵ֛ן"), src("הִנֵּֽה"), src("יָמִ֥ים")];
+  const spanQuote = "שַׁאֲנַ֣ן מוֹאָ֔ב מִנְּעוּרָ֑יו & לָכֵ֛ן הִנֵּֽה יָמִ֥ים";
+  const pasteQuote = "שַׁאֲנַ֣ן מוֹאָ֔ב מִנְּעוּרָ֑יו\nלָכֵ֛ן הִנֵּֽה יָמִ֥ים";
+
+  const lit11 = [...findSourceHighlights(v11, spanQuote, 1, true)].map((x) => x.split("|")[0]);
+  const lit12 = [...findSourceHighlights(v12, spanQuote, 1, true)].map((x) => x.split("|")[0]);
+  assert(
+    lit11.length === 3 && lit11.includes("שַׁאֲנַ֣ן") && !lit11.includes("לָכֵ֛ן"),
+    `v11 lights its group only (got ${JSON.stringify(lit11)})`,
+  );
+  assert(
+    lit12.length === 3 && lit12.includes("לָכֵ֛ן") && !lit12.includes("מוֹאָ֔ב"),
+    `v12 lights its group only (got ${JSON.stringify(lit12)})`,
+  );
+
+  const paste12 = [...findSourceHighlights(v12, pasteQuote, 1, true)].map((x) => x.split("|")[0]);
+  assert(
+    paste12.length === 3 && paste12.includes("יָמִ֥ים"),
+    `newline-separated paste lights v12 group (got ${JSON.stringify(paste12)})`,
+  );
+
+  const typo = "שַׁאֲנַ֣ן מוֹאָ֔ב ZZZ מִנְּעוּרָ֑יו";
+  assert(
+    findSourceHighlights(v11, typo, 1, false).size === 0,
+    "singleton typo with partialGroups off stays dark",
+  );
+  const soft = [...findSourceHighlights(v11, typo, 1, true)].map((x) => x.split("|")[0]);
+  assert(
+    soft.length === 0,
+    `partialGroups still requires full groups (typo group must not soft-match; got ${JSON.stringify(soft)})`,
+  );
+
+  // occurrence -1 = every match of groups present in this verse (ULT/UST
+  // OL-join uses surfaceOccurrence, so repeats must all be selected).
+  const v11Repeat = [
+    src("שַׁאֲנַ֣ן"),
+    src("מוֹאָ֔ב"),
+    src("מִנְּעוּרָ֑יו"),
+    src("שַׁאֲנַ֣ן"),
+    src("מוֹאָ֔ב"),
+    src("מִנְּעוּרָ֑יו"),
+  ];
+  const v11Target = [
+    zaln("שַׁאֲנַ֣ן", 1, 2, [tgt("quiet1")]),
+    zaln("מוֹאָ֔ב", 1, 2, [tgt("Moab1")]),
+    zaln("מִנְּעוּרָ֑יו", 1, 2, [tgt("youth1")]),
+    zaln("שַׁאֲנַ֣ן", 2, 2, [tgt("quiet2")]),
+    zaln("מוֹאָ֔ב", 2, 2, [tgt("Moab2")]),
+    zaln("מִנְּעוּרָ֑יו", 2, 2, [tgt("youth2")]),
+  ];
+  const lit1 = [...findTargetHighlights(v11Target, spanQuote, 1, v11Repeat, true)].map(
+    (x) => x.split("|")[0],
+  );
+  const litAll = [...findTargetHighlights(v11Target, spanQuote, -1, v11Repeat, true)].map(
+    (x) => x.split("|")[0],
+  );
+  assert(
+    lit1.length === 3 && lit1.includes("quiet1") && !lit1.includes("quiet2"),
+    `occurrence 1 lights only the first first-group match (got ${JSON.stringify(lit1)})`,
+  );
+  assert(
+    litAll.length === 6 && litAll.includes("quiet1") && litAll.includes("quiet2"),
+    `occurrence -1 lights every first-group match (got ${JSON.stringify(litAll)})`,
   );
 }
 
