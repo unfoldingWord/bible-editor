@@ -1,6 +1,6 @@
-// Smoke test for staleSkipRemedy — the export_stale banner's remedy text
-// (issue #829). Run from api/:
-//   node --experimental-strip-types --no-warnings src/syncWithholds.test.mjs
+// Smoke test for staleSkipRemedy and the sync_withholds read/write pair —
+// the export_stale banner's remedy text (issue #829). Run from api/:
+//   node --experimental-sqlite --experimental-strip-types --no-warnings src/syncWithholds.test.mjs
 //
 // Not a test framework; failures exit non-zero. Mirrors reimportSyncGate.test.mjs.
 //
@@ -12,8 +12,24 @@
 // staleSkipRemedy renders the actual measured cause instead, and honestly
 // says "no reason on record" rather than guessing one when nothing was
 // persisted.
+//
+// Second regression under test (codex review of PR #834): recordSyncWithhold/
+// clearSyncWithhold only run from the reimport-sync step's per-resource loop,
+// so a resource THIS run's reimport never reaches that loop for (a book-level
+// reimport failure, or a stale-base hold decided at staging time) leaves a
+// PREVIOUS run's row untouched. Without a generation check, tonight's
+// recordStaleSkipAlert could read yesterday's reason as though it were
+// measured tonight — the exact "asserts an unmeasured cause" bug #829 exists
+// to end, just moved one layer down. readSyncWithhold's `runId` parameter is
+// the fix: it must return null, not a stale row, when the row's run_id
+// doesn't match the caller's own run.
 
-import { staleSkipRemedy } from "./syncWithholds.ts";
+import { DatabaseSync } from "node:sqlite";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { staleSkipRemedy, recordSyncWithhold, clearSyncWithhold, readSyncWithhold } from "./syncWithholds.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -101,9 +117,90 @@ eq(
   "a zero count is omitted from the rendered text, not printed as '0 '",
 );
 
+console.log("\n[recordSyncWithhold / readSyncWithhold / clearSyncWithhold — real schema]");
+
+// Minimal D1 shim over node:sqlite — same shape as dismissReview.test.mjs.
+function makeDb(sqlite) {
+  const mk = (sql, args) => ({
+    bind: (...a) => mk(sql, a),
+    first() {
+      const r = sqlite.prepare(sql).all(...args);
+      return r.length ? r[0] : null;
+    },
+    run() {
+      const r = sqlite.prepare(sql).run(...args);
+      return { success: true, meta: { changes: Number(r.changes) } };
+    },
+  });
+  return { prepare: (sql) => mk(sql, []) };
+}
+
+function freshEnv() {
+  const sqlite = new DatabaseSync(":memory:");
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    sqlite.exec(readFileSync(join(dir, f), "utf8"));
+  }
+  return { DB: makeDb(sqlite) };
+}
+
+{
+  const env = freshEnv();
+  const ok = await recordSyncWithhold(env, "JER", "ult", "chapters_locked", 2, 1_700_000_000_000, "run-A");
+  eq(ok, true, "recordSyncWithhold against the real migrated schema succeeds");
+  const read = await readSyncWithhold(env, "JER", "ult", "run-A");
+  eq(read?.reason, "chapters_locked", "readSyncWithhold with the SAME runId returns the recorded reason");
+  eq(read?.count, 2, "…and the recorded count");
+}
+
+{
+  // THE BUG this section exists to catch: a row recorded by run-A must not be
+  // handed to run-B as though run-B measured it — this is the codex-review
+  // fix (misattributing a previous run's withhold to tonight's skip).
+  const env = freshEnv();
+  await recordSyncWithhold(env, "JER", "ult", "chapters_locked", 2, 1_700_000_000_000, "run-A");
+  const read = await readSyncWithhold(env, "JER", "ult", "run-B");
+  eq(read, null, "readSyncWithhold with a DIFFERENT runId returns null, not run-A's stale reason");
+  eq(
+    staleSkipRemedy(read),
+    "D1 is behind master; this run recorded no reason.",
+    "…so the banner honestly says no reason was recorded, rather than naming yesterday's cause",
+  );
+}
+
+{
+  // A later run for the SAME resource overwrites the row (and its runId) —
+  // the table holds "what did the MOST RECENT run measure", not a history.
+  const env = freshEnv();
+  await recordSyncWithhold(env, "JER", "ult", "chapters_locked", 2, 1_700_000_000_000, "run-A");
+  await recordSyncWithhold(env, "JER", "ult", "systemic_refusal", 0, 1_700_000_100_000, "run-B");
+  eq(await readSyncWithhold(env, "JER", "ult", "run-A"), null, "run-A's now-overwritten row no longer matches run-A");
+  eq(
+    (await readSyncWithhold(env, "JER", "ult", "run-B"))?.reason,
+    "systemic_refusal",
+    "run-B reads its own freshly-recorded reason",
+  );
+}
+
+{
+  // Once a pair syncs cleanly, clearSyncWithhold releases the row outright —
+  // even a same-run read must not resurrect a cleared reason.
+  const env = freshEnv();
+  await recordSyncWithhold(env, "JER", "ult", "chapters_locked", 2, 1_700_000_000_000, "run-A");
+  await clearSyncWithhold(env, "JER", "ult");
+  eq(await readSyncWithhold(env, "JER", "ult", "run-A"), null, "a cleared row reads as null even for its own run");
+}
+
+{
+  // Different (book, resource) pairs are independent rows.
+  const env = freshEnv();
+  await recordSyncWithhold(env, "JER", "ult", "chapters_locked", 1, 1_700_000_000_000, "run-A");
+  eq(await readSyncWithhold(env, "JER", "ust", "run-A"), null, "a withhold on ult does not leak onto ust");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
 } else {
-  console.log("\nAll staleSkipRemedy checks passed.");
+  console.log("\nAll staleSkipRemedy / sync_withholds checks passed.");
 }

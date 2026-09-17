@@ -13,15 +13,17 @@ export interface SyncWithhold {
   reason: WithholdReason;
   count: number;
   occurredAt: number;
+  runId: string;
 }
 
 const UPSERT_SQL = `
-  INSERT INTO sync_withholds (book, resource, reason, count, occurred_at)
-  VALUES (?1, ?2, ?3, ?4, ?5)
+  INSERT INTO sync_withholds (book, resource, reason, count, occurred_at, run_id)
+  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
   ON CONFLICT (book, resource) DO UPDATE SET
     reason = excluded.reason,
     count = excluded.count,
-    occurred_at = excluded.occurred_at`;
+    occurred_at = excluded.occurred_at,
+    run_id = excluded.run_id`;
 
 /**
  * Best-effort, like every other durable-record write beside this run's
@@ -29,6 +31,10 @@ const UPSERT_SQL = `
  * here must not fail the reimport. It IS logged loudly, because a silent
  * failure leaves recordStaleSkipAlert with nothing to read and no way to tell
  * "no reason was measured" from "the reason failed to persist".
+ *
+ * `runId`: exportWorkflow.ts's `instanceId` for the Workflow instance this
+ * reimport step is running inside — see readSyncWithhold's doc for why this
+ * is required, not optional.
  */
 export async function recordSyncWithhold(
   env: Env,
@@ -37,9 +43,10 @@ export async function recordSyncWithhold(
   reason: WithholdReason,
   count: number,
   occurredAt: number,
+  runId: string,
 ): Promise<boolean> {
   try {
-    await env.DB.prepare(UPSERT_SQL).bind(book, resource, reason, count, occurredAt).run();
+    await env.DB.prepare(UPSERT_SQL).bind(book, resource, reason, count, occurredAt, runId).run();
     return true;
   } catch (e) {
     console.error("sync withhold record failed", {
@@ -67,15 +74,40 @@ export async function clearSyncWithhold(env: Env, book: string, resource: string
   }
 }
 
-export async function readSyncWithhold(env: Env, book: string, resource: string): Promise<SyncWithhold | null> {
+/**
+ * Read the withhold reason for a (book, resource) — but ONLY if it was
+ * recorded by THIS run. `runId` must be the caller's own
+ * exportWorkflow.ts `instanceId`; a row whose `run_id` doesn't match is a
+ * PREVIOUS run's leftover, not this run's measurement, and is treated
+ * exactly like no row at all.
+ *
+ * This generation guard exists because recordSyncWithhold/clearSyncWithhold
+ * only run from the reimport-sync step's per-resource loop — a resource this
+ * run's reimport never reaches that loop for (a stale-base hold decided at
+ * STAGING time before the resource is even staged, or the whole book's
+ * reimport throwing and never running the sync step at all) leaves a prior
+ * run's row untouched. Without this check, tonight's export_stale banner
+ * could name YESTERDAY's cause as though it were measured tonight — the
+ * exact "asserts an unmeasured cause" failure #829 exists to end, just moved
+ * one layer down. See #836 for widening computeWithholdReason itself to
+ * cover the staging-time stale-base path.
+ */
+export async function readSyncWithhold(env: Env, book: string, resource: string, runId: string): Promise<SyncWithhold | null> {
   try {
     const row = await env.DB.prepare(
-      `SELECT reason, count, occurred_at FROM sync_withholds WHERE book = ?1 AND resource = ?2`,
+      `SELECT reason, count, occurred_at, run_id FROM sync_withholds WHERE book = ?1 AND resource = ?2`,
     )
       .bind(book, resource)
-      .first<{ reason: string; count: number; occurred_at: number }>();
-    if (!row) return null;
-    return { book, resource, reason: row.reason as WithholdReason, count: row.count, occurredAt: row.occurred_at };
+      .first<{ reason: string; count: number; occurred_at: number; run_id: string }>();
+    if (!row || row.run_id !== runId) return null;
+    return {
+      book,
+      resource,
+      reason: row.reason as WithholdReason,
+      count: row.count,
+      occurredAt: row.occurred_at,
+      runId: row.run_id,
+    };
   } catch (e) {
     // Table not yet migrated, or a genuine D1 fault: either way, "no reason on
     // record" is the fail-safe read — staleSkipRemedy then says so honestly

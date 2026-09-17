@@ -26,5 +26,17 @@ CREATE TABLE sync_withholds (
   -- Epoch millis — this run's alertObservedAt (bookReimport.ts), the same
   -- per-run token the sibling alert writers in this step use.
   occurred_at INTEGER NOT NULL,
+  -- exportWorkflow.ts's `instanceId` — deterministic per Workflow instance
+  -- (derived from event.timestamp, so replay-stable) and shared by BOTH the
+  -- reimport-sync step that writes this row and the export step that reads
+  -- it, since both run inside the same runCore() call. Read-side generation
+  -- guard (issue #829 codex follow-up): a resource this run's reimport never
+  -- reaches the sync-step record for — a book-level reimport failure, or a
+  -- stale-base hold decided at STAGING time before the sync loop even sees
+  -- the resource — must not have export_stale attribute a PREVIOUS run's
+  -- leftover row to tonight's skip. readSyncWithhold only trusts a row whose
+  -- run_id matches the run asking; a mismatched or absent row reads as "no
+  -- reason recorded", never a stale one.
+  run_id TEXT NOT NULL,
   PRIMARY KEY (book, resource)
 );
