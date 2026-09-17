@@ -527,6 +527,13 @@ export async function raiseEditLogSweepBoundaryAlerts(env: Env, now: number = Ma
     // kept whichever row the query returned last, which the system_alerts_active
     // index made the dismissed one.
     const existing = new Map<string, ExistingAlertState>();
+    // #792: nothing in the schema stops a concurrent/retried cron run from
+    // double-inserting a second ACTIVE row for the same source (no unique
+    // index on active (username, source)). Track any source seen with more
+    // than one active row so it can be forced through the delete+reinsert
+    // path below, even when one of the duplicates' message happens to match
+    // `desired` — see the sentinel note after this loop.
+    const duplicateActiveSources = new Set<string>();
     for (const r of existingRs.results ?? []) {
       const prev = existing.get(r.source);
       const row = { message: r.message, dismissedAt: r.dismissed_at };
@@ -540,7 +547,10 @@ export async function raiseEditLogSweepBoundaryAlerts(env: Env, now: number = Ma
       // MATCHES the current desired message, so a still-dismissed unchanged
       // alert stays sticky rather than being recreated because we happened to
       // keep an older dismissed message (Codex #781 review 2nd/3rd pass).
-      if (prev.dismissedAt == null) continue; // already holding an active row
+      if (prev.dismissedAt == null) {
+        if (row.dismissedAt == null) duplicateActiveSources.add(r.source);
+        continue; // already holding an active row
+      }
       if (row.dismissedAt == null) {
         existing.set(r.source, row);
         continue;
@@ -549,6 +559,18 @@ export async function raiseEditLogSweepBoundaryAlerts(env: Env, now: number = Ma
       if (want !== undefined && prev.message !== want && row.message === want) {
         existing.set(r.source, row);
       }
+    }
+    // Force every duplicate-active source through planSystemAlertWrites'
+    // delete+reinsert branch: a sentinel message that can never equal a real
+    // `desired` message (real messages are plain English sentences) defeats
+    // the "message already matches, no-op" sticky check that would otherwise
+    // leave the extra active row live forever whenever the arbitrarily-kept
+    // duplicate's message happened to already match. The resulting DELETE
+    // (`WHERE username=? AND source=? AND dismissed_at IS NULL`) removes ALL
+    // active rows for the source, so both duplicates are cleared together and
+    // replaced by the single fresh INSERT.
+    for (const source of duplicateActiveSources) {
+      existing.set(source, { message: "#792 duplicate active alert", dismissedAt: null });
     }
 
     const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
