@@ -422,12 +422,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     //     wrapped in try/catch so a single book's failure can't abort the whole
     //     export instance — same shape as the post-export reimport loop. Gated
     //     on dcsAllowed: a dry run / no-token run shouldn't mutate D1.
-    // Per-book reimport outcomes, surfaced in the run's terminal ledger status
-    // (#827 review): a reimport-only (08:00 self-heal) run whose per-book syncs
-    // fail is caught below and never reaches the export results, so without
-    // this the ledger would always record it as a clean "completed".
-    let reimportSuccessCount = 0;
-    let reimportFailureCount = 0;
+    // Per-book reimport outcomes, surfaced in the run's terminal ledger (#827
+    // review): a reimport-only (08:00 self-heal) run whose per-book syncs fail
+    // is caught below and never reaches the export results, so without this the
+    // ledger would report a clean "completed" and the dashboard's Items/Failed
+    // columns (derived from item_terminal events) would show 0/0.
+    const reimportOutcomes: Array<{ book: string; ok: boolean }> = [];
     if (dcsAllowed || params.reimportOnly) {
       // Scope the reimport to `resources` when the caller named specific ones
       // (the admin "Pull from Door43" control), else fall back to the
@@ -452,7 +452,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
           });
-          reimportSuccessCount++;
+          reimportOutcomes.push({ book, ok: true });
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
           // this book's D1 is now possibly stale relative to master. The
@@ -460,7 +460,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // commit a stale render, so a failed sync no longer reverts master —
           // it just skips this book's export until a later sync succeeds. Alert
           // so the failure is visible rather than silently swallowed.
-          reimportFailureCount++;
+          reimportOutcomes.push({ book, ok: false });
           const msg = e instanceof Error ? e.message : String(e);
           console.error("export pre-reimport failed", { book, error: msg });
           try {
@@ -536,11 +536,38 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // Self-heal mode (08:00 REIMPORT_CRON): D1 is now synced from DCS; there's
     // nothing to render or commit, so stop before the export steps below.
     if (params.reimportOnly) {
+      // A reimport-only self-heal renders no export items, so record one terminal
+      // item per book — the dashboard's Items/Failed columns are summed from
+      // item_terminal events (admin.ts /sync-runs), and without these a failed
+      // self-heal would show 0/0. Per book (not per (book, resource)) keeps a
+      // full ~66-book self-heal well under the subrequest budget. Best-effort,
+      // like every other ledger write.
+      for (const o of reimportOutcomes) {
+        try {
+          await step.do(`ledger-reimport-${o.book}-terminal`, async () =>
+            appendSyncRunEvent(this.env, {
+              runId: workflowRunId,
+              eventKey: syncRunEventKey(workflowRunId, "item_terminal", o.book),
+              eventType: "item_terminal",
+              occurredAt: Date.now(),
+              status: o.ok ? "success" : "failure",
+              book: o.book,
+              details: { reimportOnly: true },
+            }),
+          );
+        } catch (e) {
+          console.error("ledger reimport item record failed", {
+            book: o.book,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+      const failureCount = reimportOutcomes.filter((o) => !o.ok).length;
       return {
         instanceId,
         totalSteps: 0,
         results: [],
-        reimport: { successCount: reimportSuccessCount, failureCount: reimportFailureCount },
+        reimport: { successCount: reimportOutcomes.length - failureCount, failureCount },
       };
     }
 
@@ -674,11 +701,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       console.error("export lint-escalate failed", { error: e instanceof Error ? e.message : String(e) });
     }
 
+    const reimportFailureCount = reimportOutcomes.filter((o) => !o.ok).length;
     return {
       instanceId,
       totalSteps: results.length,
       results,
-      reimport: { successCount: reimportSuccessCount, failureCount: reimportFailureCount },
+      reimport: {
+        successCount: reimportOutcomes.length - reimportFailureCount,
+        failureCount: reimportFailureCount,
+      },
     };
   }
 
