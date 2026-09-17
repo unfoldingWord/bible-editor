@@ -134,10 +134,21 @@
 //   • Each UPDATE is version-CAS'd; the paired edit_log row is an
 //     INSERT...SELECT gated on the post-update state (version+1 AND the
 //     exact new content_json), so a skipped UPDATE can never leave an audit
-//     row behind for a write that didn't happen. `updated_by` is left NULL —
-//     the restore is attributed via edit_log.source='data_repair' +
-//     action='restore_master_verse' + a payload identifying the incident,
-//     never to a translator's user id.
+//     row behind for a write that didn't happen. A row with no owner
+//     (`updated_by IS NULL`) is excluded up front (EXCLUDE_NO_OWNER) rather
+//     than restored pristine, because a pristine row reads as fair game for
+//     the very next nightly reimport to overwrite wholesale from master
+//     before the fix is ever exported (#822). Every written row therefore
+//     keeps its existing non-NULL `updated_by` untouched — never a
+//     translator's user id, never nulled. The edit_log row uses
+//     action='update' (so the reimport's ancestor/latest-source sub-selects,
+//     which only recognize 'create'/'update'/'bridge'/'split', can see it)
+//     and source=NULL (so the human_edit_after_export probe, which requires
+//     `source IS NULL`, sees it as a real post-export touch); the repair's
+//     own provenance (incident, source commit, 'data_repair' origin) lives
+//     in the payload instead, alongside `content`/`plain_text` so the row is
+//     recoverable as a merge ancestor and restorable in the version-history
+//     dialog once superseded.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
@@ -827,6 +838,7 @@ function updateStatements(f, nowTs, expectedVersion) {
     plain_text: f.proposedPlainText,
     verse_end: f.proposed.verseEnd,
     incident,
+    repair_source: "data_repair",
     source_commit: humanResolved.sha,
     from: f.d1PlainText,
   });
@@ -839,10 +851,21 @@ function updateStatements(f, nowTs, expectedVersion) {
     ` AND bible_version = ${sqlStr(bibleVersion)} AND version = ${expectedVersion}` +
     ` AND updated_at < ${cutoff} AND updated_by IS NOT NULL` +
     ` AND content_json = ${sqlStr(f.d1.content_json)};`;
+  // `source` is deliberately NULL, not 'data_repair': bookReimport.ts's
+  // human_edit_after_export EXISTS probe (the merge's FIX D undo-then-redo
+  // guard, api/src/verseMerge.ts step 5) requires `source IS NULL AND
+  // action <> 'baseline'` to recognize a post-export write as human-touched.
+  // A non-NULL source here is invisible to that probe, so a repair that
+  // happens to reconstruct the pre-repair ancestor's exact bytes on some
+  // later run would read as "ours never moved" and adopt master silently
+  // instead of flagging for review (#822). The 'data_repair' provenance
+  // this used to carry lives in the payload's `repair_source` key instead —
+  // isReimportableRow/isHumanIntentRemoval never read the edit_log.source
+  // column for a content 'update' row, only payload consumers do.
   const log =
     `INSERT INTO edit_log (kind,row_key,book,user_id,prev_version,new_version,action,payload_json,source,created_at)` +
     ` SELECT 'verse',${sqlStr(rowKey)},${sqlStr(book)},NULL,${expectedVersion},${expectedVersion + 1},'update',` +
-    `${sqlStr(payload)},'data_repair',${nowTs}` +
+    `${sqlStr(payload)},NULL,${nowTs}` +
     ` WHERE changes() > 0;`;
   return [upd, log];
 }

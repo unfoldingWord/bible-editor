@@ -142,6 +142,7 @@ import {
 } from "./verseMergeConflicts.ts";
 import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
+import { appendSystemRecord, reconcileReviewAlert, resolveReviewAlert, reviewConditionKey } from "./reviewAlerts.ts";
 // Issue #686: the row-level "what/where/who" provenance columns (migration
 // 0060). `door43Actor` is the ONLY way this file names a Door43 commit author —
 // never build that string by hand — and it is measured-or-nothing: it names an
@@ -822,7 +823,8 @@ export const raiseTombstoneBlockAlertForTest = (
   resource: Resource,
   counts: ReimportCounts,
   overridden: boolean = false,
-): Promise<void> => raiseTombstoneBlockAlert(env, book, resource, counts, overridden);
+  observedAt = Date.now(),
+): Promise<void> => raiseTombstoneBlockAlert(env, book, resource, counts, overridden, observedAt);
 // aiRowDiffGate.test.mjs (issue #485 P1 follow-up): softDeleteRemovedTsvRows is
 // the prune half of the diff gate — this alias lets the test drive the REAL
 // prune against the real SQL (same rationale as the aliases above) to confirm
@@ -899,7 +901,8 @@ export const clearTombstoneBlockAlertForTest = (
   env: Env,
   book: string,
   resource: Resource,
-): Promise<void> => clearTombstoneBlockAlert(env, book, resource);
+  observedAt = Date.now(),
+): Promise<void> => clearTombstoneBlockAlert(env, book, resource, observedAt);
 // persistMasterLineage's own DB write, exposed directly so
 // masterLineagePersist.test.mjs can drive the UPSERT (both the update-existing-
 // row path and the insert-when-absent fallback) against a real SQLite-backed
@@ -1199,6 +1202,7 @@ async function runReimport(
   // rules out.
   staleBaseOverrideResource?: Resource,
 ): Promise<ReimportResult> {
+  const alertObservedAt = Date.now();
   const urls = dcsUrls(env, book)!;
 
   // Fetch each requested resource once at the book level. ULT/UST/TN/TQ/TWL
@@ -1326,7 +1330,7 @@ async function runReimport(
       overridden ? "stale_tc_reexport_overridden" : "stale_tc_reexport",
       now,
     );
-    await raiseStaleBaseHoldAlert(env, hold, !ok, overridden);
+    await raiseStaleBaseHoldAlert(env, hold, !ok, overridden, alertObservedAt);
     console.warn("reimport (user pull): master file is a wholesale re-export from a stale translationCore base (#639)", {
       book,
       resource,
@@ -1406,7 +1410,15 @@ async function runReimport(
       if (own.reason === "content_differs") ownDeclines.set(resource, state);
       continue;
     }
-    const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, state.pushedEditId, null);
+    const stamped = await markOwnPublishConverged(
+      env,
+      book,
+      resource,
+      own.readAt,
+      state.pushedEditId,
+      null,
+      alertObservedAt,
+    );
     if (stamped) perResource[resource].own_publish_converged++;
     console.log("reimport recognized master's movement as our own publish", {
       book,
@@ -1440,6 +1452,7 @@ async function runReimport(
           cutoff.editId,
           stats,
           ownDeclines.get(resource) ?? null,
+          alertObservedAt,
         )
       : null;
     perResource[resource].merge_no_base_cleared += stats.noBaseCleared;
@@ -1564,6 +1577,7 @@ async function runReimport(
       noBaseCount: perResource.ult.merge_no_base,
       noBaseRefs: perResource.ult.merge_no_base_refs,
       noBaseEditorRefs: perResource.ult.merge_no_base_editor_refs,
+      observedAt: alertObservedAt,
     });
   }
   if (want.has("ust")) {
@@ -1572,6 +1586,7 @@ async function runReimport(
       noBaseCount: perResource.ust.merge_no_base,
       noBaseRefs: perResource.ust.merge_no_base_refs,
       noBaseEditorRefs: perResource.ust.merge_no_base_editor_refs,
+      observedAt: alertObservedAt,
     });
   }
 
@@ -4240,6 +4255,7 @@ async function loadMasterLineage(
   // here is the evidence that attributes the decline (accountOwnPublishDecline),
   // so it is judged here rather than paying a second Gitea fetch for it.
   ownDecline: ResourceSyncState | null = null,
+  observedAt = Date.now(),
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
   if (!file) return null;
@@ -4249,7 +4265,7 @@ async function loadMasterLineage(
     // rewritten never GETS a watermark (recognition never fires), so gating the
     // detector on one would leave it blind for exactly the pairs it exists for
     // (cold review F3 / Codex P1 on this change).
-    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline);
+    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline, observedAt);
     return null;
   }
   // Prefer the repo-scoped ledger when it can prove a current, gap-free,
@@ -4268,7 +4284,7 @@ async function loadMasterLineage(
         incomplete: false,
         incompleteReason: "",
       };
-      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline);
+      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt);
       const humans = classified.filter((c) => c.kind === "human");
       let humanRefs: HumanRefEvidence | null = null;
       if (humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
@@ -4316,7 +4332,7 @@ async function loadMasterLineage(
     });
   }
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
-  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline);
+  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline, observedAt);
   const commits = page.commits.map(classifyMasterCommit);
   // #557: narrow "a human touched this file" to "a human touched THIS verse",
   // but only where it is affordable and only where the file-level answer is
@@ -8265,6 +8281,7 @@ async function accountOwnPublishDecline(
   file: { repo: string; path: string },
   walked: MasterCommitPage | null,
   sync: ResourceSyncState,
+  observedAt = Date.now(),
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   try {
@@ -8368,7 +8385,7 @@ async function accountOwnPublishDecline(
               pushedBlobSha,
               pushedReadAt,
               pushedEditId,
-            })
+            }, observedAt)
           : false;
       await env.DB.prepare(
         `UPDATE book_resource_syncs SET own_publish_declines = 0, own_publish_rewrite_sha = NULL
@@ -8376,9 +8393,7 @@ async function accountOwnPublishDecline(
       )
         .bind(book, resource)
         .run();
-      await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-        .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-        .run();
+      await resolveReviewAlert(env, source, undefined, OWN_PUBLISH_ALERT_USERNAME, observedAt);
       console.log("reimport own-publish decline explained: our merge landed our exact bytes; a later commit moved the file", {
         book,
         resource,
@@ -8433,7 +8448,7 @@ async function accountOwnPublishDecline(
     // state does not re-raise nightly — and a dismissed banner stays dismissed
     // until a preserved/recognized night resets the count and it climbs again.
     if (prior < OWN_PUBLISH_INERT_THRESHOLD && next >= OWN_PUBLISH_INERT_THRESHOLD) {
-      await raiseOwnPublishInertAlert(env, book, resource, next, sync, judged);
+      await raiseOwnPublishInertAlert(env, book, resource, next, sync, judged, observedAt);
     }
   } catch (e) {
     console.error("reimport own-publish decline accounting failed", {
@@ -8454,7 +8469,8 @@ export const accountOwnPublishDeclineForTest = (
   file: { repo: string; path: string },
   walked: MasterCommitPage | null,
   sync: ResourceSyncState,
-): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync);
+  observedAt = Date.now(),
+): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync, observedAt);
 
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
@@ -8500,10 +8516,10 @@ export const accountOwnPublishDeclineForTest = (
 // actual reclaim WRITE rather than merely a freeze — see isReissuedTombstone's
 // KNOWN FALSE POSITIVE note in reimportClassify.ts for what that means.
 
-// #540 item 2's scale alarm. A handful of kept-over-Door43 rows is the policy
+// #540 item 2's scale telemetry. A handful of kept-over-Door43 rows is the policy
 // working; a book-full of them has the shape of every incident this area exists
 // to prevent — and unlike a refusal, this outcome PUBLISHES over Door43 rather
-// than holding. See isKeptOverDoor43AtScale for why it alerts instead of
+// than holding. See isKeptOverDoor43AtScale for why it records instead of
 // freezing.
 //
 // Claims only the measurement: how many rows, in which (book, resource), and
@@ -8514,6 +8530,7 @@ async function raiseKeptOverDoor43Alert(
   book: string,
   resource: Resource,
   kept: number,
+  eventKey?: string,
 ): Promise<void> {
   const source = `reimport_kept_over_door43:${book}:${resource}`;
   const res = resource.toUpperCase();
@@ -8529,16 +8546,17 @@ async function raiseKeptOverDoor43Alert(
     `as "reimport merge kept the app's value over Door43's" with Door43's values. The verses are in ` +
     `${book}'s merge-review banner.`;
   try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-      .run();
-    await env.DB.prepare(
-      `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
-    )
-      .bind(OWN_PUBLISH_ALERT_USERNAME, "warning", source, message, null)
-      .run();
+    if (kept > 0) {
+      await appendSystemRecord(env, {
+        username: OWN_PUBLISH_ALERT_USERNAME,
+        source,
+        message,
+        severity: "warning",
+        eventKey,
+      });
+    }
   } catch (e) {
-    // Best-effort, like every other alert helper here: a failed banner must
+    // Best-effort, like every other telemetry helper here: a failed record must
     // never fail the reimport, and this one gates nothing.
     console.error("reimport kept-over-Door43 alert failed", {
       book,
@@ -8560,6 +8578,7 @@ async function raiseTombstoneBlockAlert(
   resource: Resource,
   counts: ReimportCounts,
   overridden: boolean = false,
+  observedAt = Date.now(),
 ): Promise<void> {
   const blocked = counts.tombstone_blocked ?? 0;
   const conflicts = counts.conflict_skipped ?? 0;
@@ -8599,14 +8618,18 @@ async function raiseTombstoneBlockAlert(
       ` An explicit-override escape hatch exists (allowIdBlocked on POST /api/exports/run) for a ` +
       `verified-genuine reissue — see GitHub issue #473.`;
   try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-      .run();
-    await env.DB.prepare(
-      `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
-    )
-      .bind(OWN_PUBLISH_ALERT_USERNAME, overridden ? "warning" : "error", source, message, null)
-      .run();
+    await reconcileReviewAlert(env, {
+      username: OWN_PUBLISH_ALERT_USERNAME,
+      source,
+      conditionKey: reviewConditionKey("reimport_id_blocked", { book, resource }, {
+        tombstoneRace: blocked > 0,
+        idCollision: conflicts > 0,
+        overridden,
+      }),
+      message,
+      severity: overridden ? "warning" : "error",
+      observedAt,
+    });
   } catch (e) {
     // Best-effort, exactly like every other alert helper here: a failed banner
     // must never fail the reimport. The withhold itself already happened.
@@ -8622,7 +8645,7 @@ async function raiseTombstoneBlockAlert(
 // once its sync actually succeeds and a watermark is recorded. The alert's
 // own text promises the reclaim-race half of the count "usually clears on
 // its own next sync" — but until this function existed, the ONLY place that
-// DELETE ran was inside raiseTombstoneBlockAlert itself, which fires only
+// resolved the alert was inside raiseTombstoneBlockAlert itself, which fires only
 // while the resource is STILL withheld. A resource that recovers next run
 // never calls it again, so a resolved alert stayed active in the banner
 // forever, falsely claiming the resource was still out of sync (Codex review
@@ -8631,13 +8654,11 @@ async function raiseTombstoneBlockAlert(
 // clearTombstoneBlockAlertForTest for the reimportJourney.test.mjs coverage.
 // Best-effort like every other alert helper here: a failed cleanup must
 // never fail the reimport, and clearing an alert that doesn't exist (the
-// common case — most resources never had one) is a harmless no-op DELETE.
-async function clearTombstoneBlockAlert(env: Env, book: string, resource: Resource): Promise<void> {
+// common case — most resources never had one) is a harmless no-op resolve.
+async function clearTombstoneBlockAlert(env: Env, book: string, resource: Resource, observedAt = Date.now()): Promise<void> {
   const source = `reimport_id_blocked:${book}:${resource}`;
   try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-      .run();
+    await resolveReviewAlert(env, source, undefined, OWN_PUBLISH_ALERT_USERNAME, observedAt);
   } catch (e) {
     console.error("reimport tombstone-block alert clear failed", {
       book,
@@ -8670,6 +8691,7 @@ async function raiseOwnPublishInertAlert(
   rewrites: number,
   sync: ResourceSyncState,
   judged: Extract<OwnPublishDeclineVerdict, { verdict: "rewritten" }>,
+  observedAt = Date.now(),
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   const message =
@@ -8683,14 +8705,16 @@ async function raiseOwnPublishInertAlert(
     `reverting editor work is inert for it. Confirm with \`git hash-object\` on the file at that commit. This ` +
     `clears itself the first night the merge of our push holds our exact bytes.`;
   try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-      .run();
-    await env.DB.prepare(
-      `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
-    )
-      .bind(OWN_PUBLISH_ALERT_USERNAME, "warning", source, message, null)
-      .run();
+    await reconcileReviewAlert(env, {
+      username: OWN_PUBLISH_ALERT_USERNAME,
+      source,
+      conditionKey: reviewConditionKey("own_publish_inert", { book, resource }, {
+        rewrittenMerge: judged.mergeSha,
+      }),
+      message,
+      severity: "warning",
+      observedAt,
+    });
   } catch (e) {
     console.error("reimport own-publish inert alert failed", {
       book,
@@ -8761,6 +8785,7 @@ async function markOwnPublishConverged(
   // leaves the boundary untouched -> reconstruction falls back to the timestamp.
   pushedEditId: number | null,
   masterSha: string | null,
+  observedAt = Date.now(),
 ): Promise<boolean> {
   try {
     const result = await env.DB.prepare(
@@ -8805,9 +8830,7 @@ async function markOwnPublishConverged(
     // Clear any standing inertness banner — the counter is back to 0, so the
     // banner's premise ("keeps differing") is no longer true. Best-effort.
     try {
-      await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-        .bind(OWN_PUBLISH_ALERT_USERNAME, `own_publish_inert:${book}:${resource}`)
-        .run();
+      await resolveReviewAlert(env, `own_publish_inert:${book}:${resource}`, undefined, OWN_PUBLISH_ALERT_USERNAME, observedAt);
     } catch {
       /* the banner is stale, not wrong-headed; never fail a good sync over it */
     }
@@ -8837,6 +8860,7 @@ async function markLineageConfirmedConverged(
     pushedReadAt: number;
     pushedEditId: number | null;
   },
+  observedAt = Date.now(),
 ): Promise<boolean> {
   const result = await env.DB.prepare(
     `UPDATE book_resource_syncs
@@ -8862,9 +8886,7 @@ async function markLineageConfirmedConverged(
     .run();
   const stamped = (result.meta?.changes ?? 0) > 0;
   if (stamped) {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(OWN_PUBLISH_ALERT_USERNAME, `own_publish_inert:${book}:${resource}`)
-      .run();
+    await resolveReviewAlert(env, `own_publish_inert:${book}:${resource}`, undefined, OWN_PUBLISH_ALERT_USERNAME, observedAt);
   }
   return stamped;
 }
@@ -9446,6 +9468,7 @@ async function planAndStageBookResources(
   // staleBaseOverrideAllowed for the narrow gating and for why the record is
   // written anyway rather than skipped because an operator approved.
   staleBaseOverrideResource?: Resource,
+  alertObservedAt = Date.now(),
 ): Promise<ReimportPlan> {
   const maxRow = await env.DB
     .prepare(`SELECT MAX(chapter) AS m FROM verses WHERE book = ?1`)
@@ -9522,7 +9545,7 @@ async function planAndStageBookResources(
       // Both mean "master and D1 agree", which is the same convergence the sync
       // step's clear responds to. Verse resources only — there are no TSV holds.
       if (resource === "ult" || resource === "ust") {
-        await clearStaleBaseHold(env, book, resource, Math.floor(Date.now() / 1000));
+        await clearStaleBaseHold(env, book, resource, Math.floor(Date.now() / 1000), alertObservedAt);
       }
       entries.push({ resource, changed: false, masterSha, r2Key: null, verifiedComplete: false });
       continue;
@@ -9582,7 +9605,15 @@ async function planAndStageBookResources(
     // saves its D1 count query on a converged resource.
     const own = await recognizePushedRender(raw, sync);
     if (own.recognized) {
-      const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, sync.pushedEditId, masterSha);
+      const stamped = await markOwnPublishConverged(
+        env,
+        book,
+        resource,
+        own.readAt,
+        sync.pushedEditId,
+        masterSha,
+        alertObservedAt,
+      );
       // Whole-file equality to our pushed render is stronger than per-verse
       // convergence: no foreign master value remains for any kept-D1 warning
       // to protect. Retire the backlog even though this branch correctly skips
@@ -9594,6 +9625,7 @@ async function planAndStageBookResources(
           noBaseCount: 0,
           noBaseRefs: [],
           noBaseEditorRefs: [],
+          observedAt: alertObservedAt,
         });
       }
       console.log("reimport recognized master's movement as our own publish", {
@@ -9738,6 +9770,7 @@ async function planAndStageBookResources(
       // Tonight's own-publish decline, for the walk to attribute — only the
       // verdict that means "we measured a difference" (see accountOwnPublishDecline).
       own.reason === "content_differs" ? sync : null,
+      alertObservedAt,
     );
     let confirmedBaseR2Key: string | null = null;
     if (resource === "ult" || resource === "ust") {
@@ -10014,11 +10047,21 @@ export async function runChunkedReimport(
   } = {},
 ): Promise<ReimportResult> {
   const chunkSize = opts.chunk ?? REIMPORT_CHAPTER_CHUNK;
+  // Persist the measurement generation as its own Workflow step. `run()` can
+  // be replayed after an eviction, so a plain Date.now() outside step.do would
+  // change during the same logical run and could let a replay look newer than
+  // a genuinely later workflow. The durable step returns the original token
+  // on replay; a later-finishing older run therefore cannot replace a newer
+  // run's alert state.
+  const alertObservedAt = await step.do(
+    `reimport-alert-observed-${book}`,
+    async () => Date.now(),
+  );
 
   const plan = await step.do(
     `reimport-fetch-${book}`,
     { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-    async () => planAndStageBookResources(env, book, resources, instanceId, opts.staleBaseOverrideResource),
+    async () => planAndStageBookResources(env, book, resources, instanceId, opts.staleBaseOverrideResource, alertObservedAt),
   );
 
   // Own-publish recognition already ran inside planAndStageBookResources (it
@@ -10077,7 +10120,7 @@ export async function runChunkedReimport(
         const overridden = e.staleBaseOverridden != null;
         const hold = (e.staleBaseHold ?? e.staleBaseOverridden) as StaleBaseHold;
         const ok = await recordStaleBaseHold(env, hold, overridden ? "stale_tc_reexport_overridden" : "stale_tc_reexport", now);
-        await raiseStaleBaseHoldAlert(env, hold, !ok, overridden);
+        await raiseStaleBaseHoldAlert(env, hold, !ok, overridden, alertObservedAt);
         recorded.push(`${e.resource}:${overridden ? "force_released" : "refused"}:${ok ? "recorded" : "record_failed"}`);
       }
       console.warn("reimport stale-base gate fired (#639)", { book, recorded });
@@ -10172,6 +10215,7 @@ export async function runChunkedReimport(
         noBaseCount: perResource[e.resource].merge_no_base,
         noBaseRefs: perResource[e.resource].merge_no_base_refs,
         noBaseEditorRefs: perResource[e.resource].merge_no_base_editor_refs,
+        observedAt: alertObservedAt,
       });
     }
   });
@@ -10288,12 +10332,25 @@ export async function runChunkedReimport(
         undefined,
         refusalOverride,
       );
-      // #540 item 2's scale alarm, raised OUTSIDE the withhold branch below and
-      // gating nothing: keeping the app's version at scale does not make the
-      // resource unsafe to export — it makes it worth a human's eye BEFORE the
-      // export publishes those rows to Door43. See isKeptOverDoor43AtScale.
-      if (isKeptOverDoor43AtScale(perResource[e.resource].merge_kept_ai ?? 0)) {
-        await raiseKeptOverDoor43Alert(env, book, e.resource, perResource[e.resource].merge_kept_ai ?? 0);
+      // The recording-failure bit is needed below both for the withhold gate
+      // and for deciding whether a zero kept count is measured. An incomplete
+      // aggregate must not clear a standing alert.
+      const mergeRecordFailed = perResource[e.resource].merge_record_failed === true;
+      // #540 item 2's scale telemetry, recorded OUTSIDE the withhold branch
+      // below and gating nothing: keeping the app's version at scale does not
+      // make the resource unsafe to export — it records what was measured
+      // before the export publishes those rows to Door43.
+      const keptOverDoor43 = perResource[e.resource].merge_kept_ai ?? 0;
+      if (!mergeRecordFailed && perResource[e.resource].counts_incomplete !== true) {
+        if (isKeptOverDoor43AtScale(keptOverDoor43)) {
+          await raiseKeptOverDoor43Alert(
+            env,
+            book,
+            e.resource,
+            keptOverDoor43,
+            `${instanceId}:reimport_kept_over_door43:${book}:${e.resource}`,
+          );
+        }
       }
       // FIX 1: withhold the watermark when this run's merge-conflict
       // recording failed for this resource (applyVerseRows step 6b —
@@ -10307,7 +10364,6 @@ export async function runChunkedReimport(
       // fileCommitSha === stored check matches), so there would never be a
       // retry. See applyVerseRows's FIX 1 comment at the `masterAdoptions`
       // skip site for the other half of this fix.
-      const mergeRecordFailed = perResource[e.resource].merge_record_failed === true;
       // Withhold when a correctness-bearing adoption WRITE threw this run
       // (apply_incomplete) — verse master-adoption / source-attr reconcile /
       // TSV three-way merge. D1 is stale for those rows; stamping would certify
@@ -10339,7 +10395,7 @@ export async function runChunkedReimport(
       ) {
         withheld.push(e.resource);
         if (dropped > 0) {
-          await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource]);
+          await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource], false, alertObservedAt);
         }
         // FIX B: a book whose (book, resource) has NO existing watermark row
         // (e.g. seeded by scripts/import-book.mjs, or whose import-time SHA
@@ -10360,10 +10416,10 @@ export async function runChunkedReimport(
       // will lose these rows" alert instead of clearing it. Ordered AFTER
       // recordResourceSync (so the durable record reflects what actually
       // happened) and INSTEAD OF clearTombstoneBlockAlert below (which would
-      // otherwise immediately delete the very alert this just wrote — both
+      // otherwise immediately resolve the very alert this just wrote — both
       // share the same `reimport_id_blocked:${book}:${resource}` source).
       if (idBlockedOverride && dropped > 0) {
-        await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource], true);
+        await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource], true, alertObservedAt);
         continue;
       }
       // The resource just synced cleanly (it reached here, so it was NOT
@@ -10371,7 +10427,7 @@ export async function runChunkedReimport(
       // past run's tombstone_blocked/conflict_skipped count. See
       // clearTombstoneBlockAlert's doc comment for why this can't live inside
       // raiseTombstoneBlockAlert itself.
-      await clearTombstoneBlockAlert(env, book, e.resource);
+      await clearTombstoneBlockAlert(env, book, e.resource, alertObservedAt);
       // Issue #639: same shape, same reason. This resource reached a clean
       // stamp, so master no longer presents the stale replacement — either it
       // was repaired upstream or a newer revision superseded it. Release the
@@ -10386,7 +10442,7 @@ export async function runChunkedReimport(
       // will publish this" banner the stale-base step wrote moments ago, and
       // resolve the record of the override along with it.
       if ((e.resource === "ult" || e.resource === "ust") && e.staleBaseOverridden == null) {
-        await clearStaleBaseHold(env, book, e.resource, Math.floor(Date.now() / 1000));
+        await clearStaleBaseHold(env, book, e.resource, Math.floor(Date.now() / 1000), alertObservedAt);
       }
     }
     if (withheld.length) {

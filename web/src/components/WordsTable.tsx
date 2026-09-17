@@ -798,7 +798,7 @@ const WordRow = memo(function WordRow({
                   e.stopPropagation();
                   setRefMenuAnchor(e.currentTarget);
                 }}
-                sx={{ flexShrink: 0, fontFamily: "monospace", fontSize: 11, height: 22, color: "text.secondary" }}
+                sx={{ flexShrink: 0, fontFamily: "monospace", fontSize: 11, height: 24, color: "text.secondary" }}
               />
             </Tooltip>
           )}

@@ -1432,6 +1432,38 @@ export interface AdminSyncActivityResponse {
   entries: AdminSyncActivityEntry[];
 }
 
+export interface AdminSyncRunSummary {
+  runId: string;
+  startedAt: number | null;
+  completedAt: number | null;
+  status: string | null;
+  itemCount: number;
+  successCount: number;
+  skipCount: number;
+  failureCount: number;
+}
+
+export interface AdminSyncRunsResponse {
+  runs: AdminSyncRunSummary[];
+}
+
+export interface AdminSyncRunEvent {
+  id: number;
+  eventKey: string;
+  eventType: string;
+  status: string | null;
+  book: string | null;
+  resource: string | null;
+  occurredAt: number;
+  createdAt: number;
+  details: Record<string, unknown> | null;
+}
+
+export interface AdminSyncRunDetailResponse {
+  runId: string;
+  events: AdminSyncRunEvent[];
+}
+
 export type AdminCheckState = "success" | "failure" | "pending" | null;
 
 export interface AdminPr {
@@ -2074,6 +2106,12 @@ export const api = {
 
   getAdminSyncActivity: (signal?: AbortSignal) =>
     request<AdminSyncActivityResponse>(`/api/admin/sync-activity`, { signal }),
+
+  getAdminSyncRuns: (limit = 50, signal?: AbortSignal) =>
+    request<AdminSyncRunsResponse>(`/api/admin/sync-runs?limit=${limit}`, { signal }),
+
+  getAdminSyncRun: (runId: string, signal?: AbortSignal) =>
+    request<AdminSyncRunDetailResponse>(`/api/admin/sync-runs/${encodeURIComponent(runId)}`, { signal }),
 
   // `checks` defaults true server-side; the panel's "skip check status
   // (faster)" toggle passes checks=0 to skip the per-PR Gitea status calls.

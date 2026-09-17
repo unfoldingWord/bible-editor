@@ -872,6 +872,50 @@ console.log("\n[raiseEditLogSweepBoundaryAlerts: two dismissed rows for one boun
   assert(activeCount() === 0, "the current message stays dismissed — an older dismissed message doesn't resurrect it");
 }
 
+console.log("\n[raiseEditLogSweepBoundaryAlerts: two ACTIVE rows for one source normalize to one, even when one already matches (issue #792)]");
+{
+  const d = freshDb();
+  const now = 20_000_000;
+  const source = "edit_log_sweep_boundary_stale:JER:ust";
+  const activeCount = () => alertRows(d, source).filter((r) => r.dismissed_at == null).length;
+  const stale1 = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 2 * 86400);
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: stale1, editId: 1 });
+
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now); // one active row, message M1
+  assert(activeCount() === 1, "sanity: exactly one active row after the first run");
+  const m1 = alertRows(d, source)[0]?.message;
+
+  // Simulate a concurrent/retried cron double-insert (no unique index on
+  // active (username, source) — the schema gap #792 is filed against):
+  // a second active row, BYTE-IDENTICAL to the first, alongside it.
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES ('deferredreward', 'warning', ?1, ?2, NULL)`,
+  ).run(source, m1);
+  assert(activeCount() === 2, "sanity: two active rows now exist for the same source");
+
+  // Pre-fix bug: the existing-map build kept the first active row it saw and
+  // skipped the second outright; since that kept row's message already
+  // matched `desired`, planSystemAlertWrites treated it as a no-op sticky
+  // alert and scheduled no delete — the duplicate persisted forever.
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 1, `duplicate active rows collapse to one (got ${activeCount()})`);
+  assert(alertRows(d, source)[0]?.message === m1, "the surviving row still carries the correct message");
+
+  // Re-running again must not reintroduce a duplicate or churn the row.
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 1, "re-running after normalization stays at one active row");
+
+  // A duplicate that heals (boundary no longer stale) must still collapse to
+  // zero, not get stuck at one because of the sentinel mismatch.
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES ('deferredreward', 'warning', ?1, ?2, NULL)`,
+  ).run(source, m1);
+  assert(activeCount() === 2, "sanity: two active rows again before healing");
+  d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book = 'JER' AND resource = 'ust'`).run(now - 86400);
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 0, "duplicate active rows for a healed boundary both clear, not just one");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
