@@ -297,9 +297,9 @@ function SyncStatusTab() {
 
 // ── Tab: Sync activity ───────────────────────────────────────────────────
 
-// `source` for these entries is always `export_revert:${book}:${resource}` or
-// `mechanical_overwrite:${book}:${resource}` today (see admin.ts's
-// /sync-activity route) — parsed just for a compact Book/Resource column;
+// `source` for these entries currently includes export_revert,
+// mechanical_overwrite, and reimport_kept_over_door43 book/resource events
+// (see admin.ts's /sync-activity route) — parsed for a compact column;
 // falls back to showing the raw source if a future source doesn't fit that
 // shape rather than hiding the row.
 function parseActivitySource(source: string): { label: string; book: string | null } {
@@ -340,9 +340,10 @@ function SyncActivityTab() {
   return (
     <Stack spacing={2}>
       <Typography variant="body2" color="text.secondary">
-        Non-blocking export/sync records that need no action — "master was overwritten as expected"
-        and similar. Actionable alerts (a stale sync, a blocked export, a merge conflict needing
-        review) still show up as banners for the affected user; this is just the log.
+        Non-blocking export and reimport records that need no action — for example, an export
+        overwrote master as designed, or the merge safely kept the app&apos;s newer edit. Actionable
+        conditions (a stale sync, a blocked export, or a merge conflict needing review) still show
+        up as banners for the affected user; this is just the history.
       </Typography>
       <Stack direction="row" spacing={2} alignItems="center">
         <TextField

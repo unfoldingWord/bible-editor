@@ -53,6 +53,41 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
     AND changes() > 0`;
 
 // ---------------------------------------------------------------------------
+// bookReimport.ts's applyVerseRows (issue #789) — resolves a
+// `keep_alignment_refused` / `source_attr_divergent` / `keep_local_structure`
+// row for a verse the SAME reimport run measured as `keep_converged` or
+// `keep_master_unchanged` (computeVerseMerge's two clean outcomes — `adopt:
+// false, conflict: false` — which write NO verse_merge_conflicts row of their
+// own; see verseMerge.ts). Until this statement existed, none of the three
+// actions above was ever re-recorded once the underlying D1-vs-master
+// difference resolved itself, so a standing row from an old refusal sat in
+// the "Sync flagged N verse(s)" banner with its original `first flagged` date
+// long after the sync stopped disagreeing about that verse (prod 2026-09-14:
+// rows stale three to four weeks across EZK ULT/UST, JER UST, DAN UST).
+//
+// `resolved_by = NULL` is the documented system-retired marker — see
+// RETIRE_KEPT_AI_MASTER_CONFLICTS_SQL's doc comment above for why that pair
+// is unambiguous against a real human resolve (RESOLVE_VERSE_MERGE_CONFLICT_SQL
+// above always binds a non-null resolved_by). Deliberately excludes `adopt`,
+// `adopt_conflict`, and `adopt_no_visible_change`: those record a landed
+// adoption a human is meant to look at, and only a human's own save
+// (RESOLVE_VERSE_MERGE_CONFLICT_SQL) resolves them. `resolved_at IS NULL`
+// keeps this idempotent — a row already resolved, by a human or an earlier
+// run, is left untouched (0 changes).
+//
+// `recorded_generation` is an optimistic token: a concurrent upsert increments
+// it, so a cleanup based on an older backlog read cannot retire fresh evidence.
+// Binds, in order: (resolvedAt, book, resource, chapter, verse, action,
+// recordedGeneration).
+// ---------------------------------------------------------------------------
+export const RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
+    SET resolved_at = ?1, resolved_by = NULL
+  WHERE book = ?2 AND resource = ?3 AND chapter = ?4 AND verse = ?5
+    AND action = ?6
+    AND recorded_generation = ?7
+    AND resolved_at IS NULL`;
+
+// ---------------------------------------------------------------------------
 // verseMergeConflicts.ts's raiseVerseMergeConflictAlert — the active,
 // human-actionable conflict rows for one (book, resource). Exported (not
 // inline) so verseMergeConflicts.test.mjs can prove the exact `action IN (...)`
@@ -95,7 +130,7 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 //
 // Binds, in order: (book, resource).
 // ---------------------------------------------------------------------------
-export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment, detected_at
+export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment, detected_at, recorded_generation
      FROM verse_merge_conflicts
     WHERE book = ?1 AND resource = ?2
       AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
@@ -141,6 +176,29 @@ export const CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL = `DELETE FROM system_aler
 // Binds, in order: (username, source, book, resource).
 export const CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `DELETE FROM system_alerts
     WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL
+      AND message NOT LIKE '%${NO_BASE_ADMIN_FINGERPRINT}%'
+      AND message NOT LIKE '%${NO_BASE_EDITOR_FINGERPRINT}%'
+      AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
+                       WHERE book = ?3 AND resource = ?4
+                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
+                         AND resolved_at IS NULL)`;
+
+// Stage 7 counterpart used by production clear paths. Keep the legacy DELETE
+// exports above for pre-0066 compatibility callers/tests, but new transitions
+// resolve rows so recurrence can mint a new alert without erasing history.
+export const RESOLVE_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL = `UPDATE system_alerts
+    SET resolved_at = unixepoch()
+    WHERE source = ?1 AND resolved_at IS NULL AND kind = 'review'
+      AND message NOT LIKE '%${NO_BASE_ADMIN_FINGERPRINT}%'
+      AND message NOT LIKE '%${NO_BASE_EDITOR_FINGERPRINT}%'
+      AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
+                       WHERE book = ?2 AND resource = ?3
+                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
+                         AND resolved_at IS NULL)`;
+
+export const RESOLVE_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `UPDATE system_alerts
+    SET resolved_at = unixepoch()
+    WHERE username = ?1 AND source = ?2 AND resolved_at IS NULL AND kind = 'review'
       AND message NOT LIKE '%${NO_BASE_ADMIN_FINGERPRINT}%'
       AND message NOT LIKE '%${NO_BASE_EDITOR_FINGERPRINT}%'
       AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
@@ -286,6 +344,7 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      END,
      alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),
      last_recorded_at = excluded.last_recorded_at,
+     recorded_generation = verse_merge_conflicts.recorded_generation + 1,
      -- REACTIVATION carve-out, 'source_attr_divergent', 'keep_alignment_refused',
      -- and 'keep_local_structure' ONLY. Every other action leaves
      -- resolved_at/resolved_by untouched (the ELSE), preserving the two-phase

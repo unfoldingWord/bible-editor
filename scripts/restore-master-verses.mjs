@@ -587,6 +587,7 @@ const BUCKETS = [
   "NOT_REVERTED",
   "NEWER_EDIT_KEPT",
   "NO_TIMESTAMP",
+  "EXCLUDE_NO_OWNER",
   "MISSING_IN_D1",
   "EXCLUDE_ALIGNMENT_SHRINK",
   "EXCLUDE_EDITED_TODAY",
@@ -657,6 +658,16 @@ for (const [key, proposed] of humanProposed) {
   }
   if (d1.updated_at >= tcDate.getTime() / 1000) {
     findings.push({ ...base, bucket: "NEWER_EDIT_KEPT" });
+    continue;
+  }
+  // A repair row must remain human-owned after the write. Leaving a row with
+  // updated_by=NULL makes it look pristine to the nightly reimport, which can
+  // immediately replace the repaired content from a still-stale master. This
+  // generic tool has no authority to invent an owner, so fail closed; a caller
+  // that needs to repair an unowned row must first choose an explicit actor in
+  // a separately reviewed repair.
+  if (d1.updated_by == null) {
+    findings.push({ ...base, bucket: "EXCLUDE_NO_OWNER" });
     continue;
   }
   // Candidate RESTORE — now run the guards, in order, reporting the first failure.
@@ -786,6 +797,7 @@ console.log(`  RESTORE (writable)                       : ${restoreCandidates.le
 }
 console.log(`  NEWER_EDIT_KEPT (correctly not restored) : ${findings.filter((f) => f.bucket === "NEWER_EDIT_KEPT").length}`);
 console.log(`  NO_TIMESTAMP (needs a human)              : ${findings.filter((f) => f.bucket === "NO_TIMESTAMP").length}`);
+console.log(`  EXCLUDE_NO_OWNER (would remain pristine)  : ${findings.filter((f) => f.bucket === "EXCLUDE_NO_OWNER").length}`);
 console.log(`  EXCLUDE_EDITED_TODAY                      : ${findings.filter((f) => f.bucket === "EXCLUDE_EDITED_TODAY").length}`);
 console.log(`  EXCLUDE_EMPTY                              : ${findings.filter((f) => f.bucket === "EXCLUDE_EMPTY").length}`);
 console.log(`  EXCLUDE_ALIGNMENT_SHRINK                  : ${findings.filter((f) => f.bucket === "EXCLUDE_ALIGNMENT_SHRINK").length}`);
@@ -811,25 +823,27 @@ function sqlEscape(s) {
 function updateStatements(f, nowTs, expectedVersion) {
   const rowKey = `${book}/${f.chapter}/${f.verse}/${bibleVersion}`;
   const payload = JSON.stringify({
+    content: JSON.parse(f.proposed.contentJson),
+    plain_text: f.proposedPlainText,
+    verse_end: f.proposed.verseEnd,
     incident,
-    sourceCommit: humanResolved.sha,
-    chapter: f.chapter,
-    verse: f.verse,
+    source_commit: humanResolved.sha,
     from: f.d1PlainText,
-    to: f.proposedPlainText,
   });
+  const cutoff = Math.floor(tcDate.getTime() / 1000);
   const upd =
     `UPDATE verses SET content_json = ${sqlStr(f.proposed.contentJson)}, plain_text = ${sqlStr(f.proposed.plainText)},` +
-    ` verse_end = ${f.proposed.verseEnd == null ? "NULL" : f.proposed.verseEnd}, version = version + 1, updated_at = ${nowTs}` +
+    ` verse_end = ${f.proposed.verseEnd == null ? "NULL" : f.proposed.verseEnd}, version = version + 1, updated_at = ${nowTs},` +
+    ` last_change_action = 'update', last_change_source = 'system', last_change_actor = ${sqlStr(`data repair ${incident}`)}` +
     ` WHERE book = ${sqlStr(book)} AND chapter = ${f.chapter} AND verse = ${f.verse}` +
-    ` AND bible_version = ${sqlStr(bibleVersion)} AND version = ${expectedVersion};`;
+    ` AND bible_version = ${sqlStr(bibleVersion)} AND version = ${expectedVersion}` +
+    ` AND updated_at < ${cutoff} AND updated_by IS NOT NULL` +
+    ` AND content_json = ${sqlStr(f.d1.content_json)};`;
   const log =
     `INSERT INTO edit_log (kind,row_key,book,user_id,prev_version,new_version,action,payload_json,source,created_at)` +
-    ` SELECT 'verse',${sqlStr(rowKey)},${sqlStr(book)},NULL,${expectedVersion},${expectedVersion + 1},'restore_master_verse',` +
+    ` SELECT 'verse',${sqlStr(rowKey)},${sqlStr(book)},NULL,${expectedVersion},${expectedVersion + 1},'update',` +
     `${sqlStr(payload)},'data_repair',${nowTs}` +
-    ` FROM verses WHERE book = ${sqlStr(book)} AND chapter = ${f.chapter} AND verse = ${f.verse}` +
-    ` AND bible_version = ${sqlStr(bibleVersion)} AND version = ${expectedVersion + 1}` +
-    ` AND content_json = ${sqlStr(f.proposed.contentJson)};`;
+    ` WHERE changes() > 0;`;
   return [upd, log];
 }
 

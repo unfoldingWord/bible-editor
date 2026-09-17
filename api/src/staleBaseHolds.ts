@@ -8,7 +8,7 @@
 
 import type { Env } from "./index";
 import type { StaleBaseHold } from "./staleBaseGate";
-import { planSystemAlertWrites, type ExistingAlertState } from "./verseMergeEditorAlerts";
+import { reconcileReviewAlert, resolveReviewAlert, reviewConditionKey } from "./reviewAlerts";
 
 // Same single recipient every other book-level reimport banner in this codebase
 // uses (bookReimport.ts's OWN_PUBLISH_ALERT_USERNAME,
@@ -151,31 +151,27 @@ export async function raiseStaleBaseHoldAlert(
   hold: StaleBaseHold,
   recordFailed: boolean,
   overridden = false,
+  observedAt = Date.now(),
 ): Promise<void> {
   const source = staleBaseAlertSource(hold.book, hold.resource);
   try {
-    const rs = await env.DB.prepare(`SELECT username, message, dismissed_at FROM system_alerts WHERE source = ?1`)
-      .bind(source)
-      .all<{ username: string; message: string; dismissed_at: number | null }>();
-    const existing = new Map<string, ExistingAlertState>(
-      (rs.results ?? []).map((r): [string, ExistingAlertState] => [
-        r.username,
-        { message: r.message, dismissedAt: r.dismissed_at },
-      ]),
-    );
-    const desired = new Map<string, string>([[ALERT_USERNAME, staleBaseAlertMessage(hold, recordFailed, overridden)]]);
-    const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
-    const stmts = [
-      ...toDelete.map((u) =>
-        env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`).bind(u, source),
-      ),
-      ...toInsert.map(({ username, message }) =>
-        env.DB.prepare(
-          `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
-        ).bind(username, "error", source, message, null),
-      ),
-    ];
-    if (stmts.length) await env.DB.batch(stmts);
+    await reconcileReviewAlert(env, {
+      username: ALERT_USERNAME,
+      source,
+      conditionKey: reviewConditionKey("reimport_stale_base", { book: hold.book, resource: hold.resource }, {
+        masterSha: hold.masterSha,
+        previousSha: hold.previousSha,
+        incomingTcExportAt: hold.incomingTcExportAt,
+        overridden,
+      }),
+      message: staleBaseAlertMessage(hold, recordFailed, overridden),
+      severity: "error",
+      // The hold itself is measured even when its durable companion record
+      // failed; recordFailed changes wording, not whether the stale master
+      // revision is still standing.
+      measured: true,
+      observedAt,
+    });
   } catch (e) {
     console.error("stale-base hold alert failed", {
       book: hold.book,
@@ -198,7 +194,7 @@ export async function raiseStaleBaseHoldAlert(
  * clear here — a dismissed row is a record of what a human saw and is never
  * removed on their behalf.
  */
-export async function clearStaleBaseHold(env: Env, book: string, resource: string, now: number): Promise<void> {
+export async function clearStaleBaseHold(env: Env, book: string, resource: string, now: number, observedAt = Date.now()): Promise<void> {
   const source = staleBaseAlertSource(book, resource);
   // F8: two SEPARATE statements, deliberately NOT one env.DB.batch().
   //
@@ -210,9 +206,7 @@ export async function clearStaleBaseHold(env: Env, book: string, resource: strin
   // atomicity requirement between them (releasing a row and dropping a banner
   // are independently correct), so they must not share a transaction's failure.
   try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(ALERT_USERNAME, source)
-      .run();
+    await resolveReviewAlert(env, source, now, undefined, observedAt);
   } catch (e) {
     console.error("stale-base banner clear failed", { book, resource, error: e instanceof Error ? e.message : String(e) });
   }
