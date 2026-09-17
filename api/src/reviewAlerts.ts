@@ -258,7 +258,7 @@ export async function resolveReviewAlert(
   const args = username == null ? [now, source, observedAt] : [now, source, username, observedAt];
   try {
     await env.DB.prepare(
-      `UPDATE system_alerts SET resolved_at = ?1
+      `UPDATE system_alerts SET resolved_at = ?1, condition_observed_at = ?${username == null ? "3" : "4"}
          WHERE ${predicate} AND resolved_at IS NULL AND kind = 'review'
            AND (condition_observed_at IS NULL OR condition_observed_at <= ?${username == null ? "3" : "4"})`,
     )

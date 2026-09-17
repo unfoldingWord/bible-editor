@@ -44,7 +44,7 @@ function fresh() {
   return { db, env: { DB: makeD1(db) } };
 }
 const key = (n) => reviewConditionKey("test", { book: "JER", resource: "ult" }, { n });
-const rows = (db) => db.prepare(`SELECT username, source, message, condition_key, dismissed_at, resolved_at
+const rows = (db) => db.prepare(`SELECT username, source, message, condition_key, dismissed_at, resolved_at, condition_observed_at
   FROM system_alerts ORDER BY id`).all();
 
 console.log("\n[Stage 7: same measured condition updates in place]");
@@ -162,6 +162,19 @@ console.log("\n[Stage 7: an older run cannot resurrect after a newer clean measu
   await reconcileReviewAlert(env, { username: "ben", source: "s", conditionKey: key(1), message: "late old", now: 10, observedAt: 10 });
   const r = rows(db);
   ok(r.length === 1 && r[0].resolved_at === 21, "resolved newer history prevents a delayed older condition from resurfacing");
+}
+
+console.log("\n[Stage 7: a clean observation advances ordering beyond the condition it resolved]");
+{
+  const { db, env } = fresh();
+  await reconcileReviewAlert(env, { username: "ben", source: "s", conditionKey: key(1), message: "original", now: 10, observedAt: 10 });
+  await resolveReviewAlert(env, "s", 30, "ben", 30);
+  await reconcileReviewAlert(env, { username: "ben", source: "s", conditionKey: key(2), message: "delayed middle run", now: 20, observedAt: 20 });
+  const r = rows(db);
+  ok(
+    r.length === 1 && r[0].resolved_at === 30 && r[0].condition_observed_at === 30,
+    "the clean generation is retained, so a run newer than the old alert but older than the clean check cannot resurrect it",
+  );
 }
 
 console.log("\n[Stage 7 producer semantics: editor episodes are independently keyed]");

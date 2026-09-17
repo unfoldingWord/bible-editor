@@ -74,7 +74,7 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
-import { appendSystemRecord, reconcileReviewAlert, reviewConditionKey } from "./reviewAlerts.ts";
+import { appendSystemRecord, reconcileReviewAlert, resolveReviewAlert, reviewConditionKey } from "./reviewAlerts.ts";
 import { appendSyncRunEvent, syncRunEventKey } from "./syncRunLog.ts";
 import {
   CLAIM_EXPORT_REVERT_GENERATION_SQL,
@@ -499,6 +499,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 ? "skip"
                 : "success";
           reimportOutcomes.push({ book, status });
+          // A fully successful, watermark-stamping reimport proves that the
+          // earlier exceptional `export_sync_fail` condition is gone. A
+          // normally returned skip/failure still withheld at least one
+          // watermark, so it is not evidence strong enough to clear the old
+          // warning.
+          if (status === "success") {
+            await step.do(`reimport-clear-fail-alert-${book}`, async () =>
+              this.resolveExportAlert(`export_sync_fail:${book}`, alertObservedAt, {
+                book,
+                resource: null,
+                action: "clear_sync_failure",
+              }),
+            );
+          }
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
           // this book's D1 is now possibly stale relative to master. The
@@ -511,7 +525,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           console.error("export pre-reimport failed", { book, error: msg });
           try {
             await step.do(`reimport-fail-alert-${book}`, async () =>
-              this.recordSyncFailureAlert(book, msg),
+              this.recordSyncFailureAlert(book, msg, alertObservedAt),
             );
           } catch {
             /* alert is best-effort; never let it abort the export run */
@@ -998,7 +1012,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // to R2 only and can't clobber anything.
     const fresh = dcsAllowed ? await this.checkMasterFreshness(book, resource) : { ok: true as const, detail: "dry", masterSha: null, watermark: null };
     if (!fresh.ok) {
-      await this.recordStaleSkipAlert(book, resource, fresh.masterSha, fresh.watermark);
+      await this.recordStaleSkipAlert(book, resource, fresh.masterSha, fresh.watermark, alertObservedAt);
       const reason = `stale_master:${fresh.detail}`;
       await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
       return {
@@ -1014,6 +1028,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         prNumber: null,
         prReason: null,
       };
+    }
+
+    // Only an actual, positive Door43 freshness measurement retires the stale
+    // banner. A dry run, missing file, or absent watermark cannot establish
+    // that the formerly divergent sides caught up. `own_publish` is safe here:
+    // checkMasterFreshness already verified the merged blob byte-for-byte.
+    if (dcsAllowed && (fresh.detail === "current" || fresh.detail === "own_publish")) {
+      await this.resolveExportAlert(`export_stale:${book}:${resource}`, alertObservedAt, {
+        book,
+        resource,
+        action: "clear_stale_export",
+        freshness: fresh.detail,
+      });
     }
 
     // Shrink guard — refuse to commit a TSV render that would delete a large
@@ -1044,11 +1071,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         // deleted row. Leaving a banner up that recommends the one destructive
         // wrong move is worse than leaving no banner. Mirrors the raise/clear
         // idiom in escalateIntegrityIssues.
-        await this.env.DB.prepare(
-          `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
-        )
-          .bind(EXPORT_ALERT_USERNAME, `export_shrink:${book}:${resource}`)
-          .run();
+        await this.resolveExportAlert(`export_shrink:${book}:${resource}`, alertObservedAt, {
+          book,
+          resource,
+          action: "clear_overridden_shrink",
+        });
         // Durable record of the bypass. A console.log lives only as long as a
         // `wrangler tail` session, and the whole point of the override is that a
         // human authorized a destructive push — that decision needs to outlive
@@ -1093,11 +1120,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         // deleted on the strength of an automatic count-and-tombstone
         // check — yet it used to get only a console.log. Give it the same
         // durable, non-error (severity "info") record.
-        await this.env.DB.prepare(
-          `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
-        )
-          .bind(EXPORT_ALERT_USERNAME, `export_shrink:${book}:${resource}`)
-          .run();
+        await this.resolveExportAlert(`export_shrink:${book}:${resource}`, alertObservedAt, {
+          book,
+          resource,
+          action: "clear_credited_shrink",
+        });
         // Worded for what is true HERE, same discipline as the allowShrink
         // alert: the guard was cleared. The export can still be stopped
         // further down by the alignment-shrink backstop, USFM validation, or a
@@ -1112,7 +1139,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           "info",
         );
       } else if (!guard.ok) {
-        await this.recordShrinkSkipAlert(book, resource, built.rowCount, guard.masterRows, guard.detail, guard.explained, guard.unexplained);
+        await this.recordShrinkSkipAlert(book, resource, built.rowCount, guard.masterRows, guard.detail, alertObservedAt, guard.explained, guard.unexplained);
         const reason = `shrink_guard:${guard.detail}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
@@ -1128,6 +1155,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           prNumber: null,
           prReason: null,
         };
+      } else if (guard.detail === "ok") {
+        await this.resolveExportAlert(`export_shrink:${book}:${resource}`, alertObservedAt, {
+          book,
+          resource,
+          action: "clear_clean_shrink",
+        });
       }
     }
 
@@ -1189,7 +1222,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (dcsAllowed && (resource === "tn" || resource === "twl")) {
       const rejects = hardRejectRows(resource, built.content);
       if (rejects.length > 0) {
-        await this.recordHardRejectAlert(book, resource, rejects);
+        await this.recordHardRejectAlert(book, resource, rejects, alertObservedAt);
         const reason = `hard_reject_guard:${rejects.length}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
@@ -1205,6 +1238,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           prNumber: null,
           prReason: null,
         };
+      } else {
+        await this.resolveExportAlert(`export_hard_reject:${book}:${resource}`, alertObservedAt, {
+          book,
+          resource,
+          action: "clear_hard_reject",
+        });
       }
     }
 
@@ -1235,7 +1274,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         // app's sticky indicator goes away. `detail === "ok"` (not just
         // `guard.ok`) excludes "no_file" (the book has no ult/ust file at
         // all, so nothing was actually checked) from counting as clean.
-        await this.clearAlignmentAttention(book, resource);
+        await this.clearAlignmentAttention(book, resource, alertObservedAt);
       }
       if (!guard.ok) {
         const severity = classifyAlignmentLossSeverity(guard.offenders ?? []);
@@ -1245,6 +1284,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           guard.detail,
           guard.offenders ?? [],
           severity.block,
+          alertObservedAt,
         );
         if (!severity.block) {
           // A night where the guard found loss and shipped anyway should be
@@ -1295,7 +1335,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       const issues = validateUsfm(built.content);
       if (issues.length > 0) {
         const summary = summarizeUsfmIssues(issues);
-        await this.recordUsfmInvalidSkipAlert(book, resource, issues);
+        await this.recordUsfmInvalidSkipAlert(book, resource, issues, alertObservedAt);
         const reason = `usfm_invalid_guard:${issues.length}:${summary}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
@@ -1311,6 +1351,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           prNumber: null,
           prReason: null,
         };
+      } else {
+        await this.resolveExportAlert(`export_usfm_invalid:${book}:${resource}`, alertObservedAt, {
+          book,
+          resource,
+          action: "clear_usfm_invalid",
+        });
       }
     }
 
@@ -1427,6 +1473,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
       if (!commit.branchTouched) {
         dcsSkippedReason = "unchanged";
+        // The rendered bytes are already on master, so neither an earlier PR
+        // creation failure nor an old conflicted export branch remains an
+        // actionable obstacle for this pair.
+        await this.resolveExportAlert(`export_pr:${target.repo}:${book}:${resource}`, alertObservedAt, {
+          book,
+          resource,
+          action: "clear_unneeded_pr",
+        });
+        await this.resolveLegacyPrAlert(book, resource, target.repo, alertObservedAt);
+        await this.resolveExportAlert(
+          `export_conflict:${target.repo}:${book}:${resource}`,
+          alertObservedAt,
+          { book, resource, action: "clear_unneeded_pr_conflict" },
+        );
       } else {
         // Prune branches this export superseded: any prior {book}-be-* branch for
         // this (book, resource) whose name changed because the contributor set
@@ -1489,6 +1549,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                   `was requested, not the reason.`
               : `Auto-opened by the bible-editor nightly export so the DCS validate-and-merge workflow can process \`${branch}\`. Holds the latest ${resource.toUpperCase()} edits for ${book}.`,
           );
+          await this.resolveExportAlert(`export_pr:${target.repo}:${book}:${resource}`, alertObservedAt, {
+            book,
+            resource,
+            action: "clear_pr_failure",
+          });
+          await this.resolveLegacyPrAlert(book, resource, target.repo, alertObservedAt);
           prNumber = pr.number;
           prReason = pr.reason;
           if (pr.number != null) {
@@ -1502,7 +1568,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 { baseUrl: dcsCfg.baseUrl, token: dcsCfg.token, owner, repo: target.repo },
                 pr.number,
               );
-              if (!upd.ok) {
+              if (upd.ok) {
+                await this.resolveExportAlert(
+                  `export_conflict:${target.repo}:${book}:${resource}`,
+                  alertObservedAt,
+                  { book, resource, action: "clear_pr_conflict" },
+                );
+              } else {
                 console.log("export PR update-branch skipped", {
                   book, resource, repo: target.repo, pr: pr.number, status: upd.status, detail: upd.detail,
                 });
@@ -1518,6 +1590,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 if (upd.status === 409) {
                   const recovered = await this.recoverConflictedBranch(
                     book, resource, owner, target.repo, branch, dcsCfg, filename, built.content, message,
+                    alertObservedAt,
                   );
                   if (recovered) {
                     prNumber = recovered.prNumber;
@@ -1536,6 +1609,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 error: e instanceof Error ? e.message : String(e),
               });
             }
+          } else {
+            // ensureDcsPr measured that no open PR is needed (normally
+            // `no_diff`; a successful create response without a number is
+            // likewise no longer evidence of the old merge conflict).
+            await this.resolveExportAlert(
+              `export_conflict:${target.repo}:${book}:${resource}`,
+              alertObservedAt,
+              { book, resource, action: "clear_pr_conflict_without_pr" },
+            );
           }
         } catch (e) {
           prReason = "error";
@@ -1547,7 +1629,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             branch,
             error: prError,
           });
-          await this.recordPrFailureAlert(book, resource, target.repo, branch, prError);
+          await this.recordPrFailureAlert(book, resource, target.repo, branch, prError, alertObservedAt);
         }
       }
     }
@@ -1859,10 +1941,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     filename: string,
     content: string,
     message: string,
+    observedAt: number,
   ): Promise<{ prNumber: number | null; prReason: string; commitSha: string | null } | null> {
     const adminToken = this.env.DCS_TOKEN;
     if (!adminToken) {
-      await this.recordPrConflictAlert(book, resource, repo, branch, "no_admin_token");
+      await this.recordPrConflictAlert(book, resource, repo, branch, "no_admin_token", observedAt);
       return null;
     }
     try {
@@ -1874,7 +1957,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         branch,
       });
       if (!res.rebuilt) {
-        await this.recordPrConflictAlert(book, resource, repo, branch, res.detail);
+        await this.recordPrConflictAlert(book, resource, repo, branch, res.detail, observedAt);
         return null;
       }
       // Branch is now master HEAD. Re-commit the rendered D1 file (forceBranch:
@@ -1890,12 +1973,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           `the authoritative D1 render of ${book} ${resource.toUpperCase()}. Any rows present only on ` +
           `master (not in D1) are intentionally dropped — D1 is authoritative.`,
       );
+      await this.resolveExportAlert(`export_conflict:${repo}:${book}:${resource}`, observedAt, {
+        book,
+        resource,
+        action: "clear_rebuilt_pr_conflict",
+      });
       await this.recordBranchRebuiltAlert(book, resource, repo, branch, pr.number);
       return { prNumber: pr.number, prReason: `rebuilt:${pr.reason}`, commitSha: recommit.commitSha || null };
     } catch (e) {
       const detail = e instanceof Error ? e.message : String(e);
       console.error("export conflict-recovery failed", { book, resource, repo, branch, error: detail });
-      await this.recordPrConflictAlert(book, resource, repo, branch, detail.slice(0, 120));
+      await this.recordPrConflictAlert(book, resource, repo, branch, detail.slice(0, 120), observedAt);
       return null;
     }
   }
@@ -2058,13 +2146,34 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     resource: Resource,
     masterSha: string | null,
     watermark: string | null,
+    observedAt: number,
   ): Promise<void> {
     const source = `export_stale:${book}:${resource}`;
     const message =
       `Benjamin — nightly export skipped ${book} ${resource.toUpperCase()} to avoid reverting master ` +
       `(D1 is behind: master ${(masterSha ?? "unknown").slice(0, 8)} vs synced ${(watermark ?? "none").slice(0, 8)}). ` +
       `The pre-export sync didn't catch up; re-run the sync for ${book}, then re-export.`;
-    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+    try {
+      await reconcileReviewAlert(this.env, {
+        username: EXPORT_ALERT_USERNAME,
+        source,
+        conditionKey: reviewConditionKey(
+          "export_stale",
+          { book, resource },
+          { masterSha: masterSha ?? "unknown", watermark: watermark ?? "none" },
+        ),
+        message,
+        severity: "error",
+        linkUrl: `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        observedAt,
+      });
+    } catch (e) {
+      console.error("export stale alert write failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 
   // Fetch master's current TSV row count and decide whether this render would
@@ -2341,6 +2450,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     detail: string,
     offenders: AlignmentShrinkResult["offenders"],
     blocking: boolean,
+    observedAt: number,
   ): Promise<void> {
     const source = `export_align_shrink:${book}:${resource}`;
     const label = `${book} ${resource.toUpperCase()}`;
@@ -2359,13 +2469,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       provenance,
       blocking,
     });
-    await this.writeAlert(
+    await this.reconcileExportAlert(
       source,
+      reviewConditionKey("export_align_shrink", { book, resource }, { detail, blocking }),
       message,
-      `${this.env.DCS_BASE_URL}/unfoldingWord`,
+      observedAt,
       blocking ? "error" : "warning",
     );
-    await this.recordAlignmentAttention(book, resource, offenders, provenance);
+    await this.recordAlignmentAttention(book, resource, offenders, provenance, observedAt);
   }
 
   // Persist this export's alignment-shrink offenders so the app can render a
@@ -2380,6 +2491,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     resource: Resource,
     offenders: AlignmentShrinkResult["offenders"],
     provenance: Map<string, OffenderProvenance>,
+    observedAt: number,
   ): Promise<void> {
     // Drop the synthetic `ref: "*"` sentinels (export.ts's unparseable_render /
     // empty_render). They mean OUR OWN render was broken, so no verse was ever
@@ -2400,10 +2512,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (perVerse.length === 0) return;
     try {
       const statements = [
-        this.env.DB.prepare(`DELETE FROM alignment_attention WHERE book = ?1 AND resource = ?2`).bind(
-          book,
-          resource,
-        ),
+        this.env.DB.prepare(
+          `DELETE FROM alignment_attention
+            WHERE book = ?1 AND resource = ?2
+              AND EXISTS (
+                SELECT 1 FROM system_alerts
+                 WHERE username = ?3 AND source = ?4 AND kind = 'review'
+                   AND resolved_at IS NULL
+                   AND condition_observed_at = ?5
+              )`,
+        ).bind(book, resource, EXPORT_ALERT_USERNAME, `export_align_shrink:${book}:${resource}`, observedAt),
         ...perVerse.map((o) =>
           this.env.DB.prepare(
             // OR REPLACE, not plain INSERT: the batch is one transaction, so a
@@ -2413,8 +2531,23 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             // console.error. A repeated ref should cost us that one row, not
             // the whole book's findings.
             `INSERT OR REPLACE INTO alignment_attention (book, resource, ref, lost_words, provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5)`,
-          ).bind(book, resource, o.ref, JSON.stringify(o.lostWords), provenance.get(o.ref) ?? null),
+             SELECT ?1, ?2, ?3, ?4, ?5
+              WHERE EXISTS (
+                SELECT 1 FROM system_alerts
+                 WHERE username = ?6 AND source = ?7 AND kind = 'review'
+                   AND resolved_at IS NULL
+                   AND condition_observed_at = ?8
+              )`,
+          ).bind(
+            book,
+            resource,
+            o.ref,
+            JSON.stringify(o.lostWords),
+            provenance.get(o.ref) ?? null,
+            EXPORT_ALERT_USERNAME,
+            `export_align_shrink:${book}:${resource}`,
+            observedAt,
+          ),
         ),
       ];
       // Batched (not one .run() per offender) — this file has already hit
@@ -2435,10 +2568,23 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // disappear outside of a fresh offender list replacing them — without it,
   // a translator who fixes every flagged verse would never see the sticky
   // indicator go away. Best-effort, same rationale as recordAlignmentAttention.
-  private async clearAlignmentAttention(book: string, resource: Resource): Promise<void> {
+  private async clearAlignmentAttention(book: string, resource: Resource, observedAt: number): Promise<void> {
+    await this.resolveExportAlert(`export_align_shrink:${book}:${resource}`, observedAt, {
+      book,
+      resource,
+      action: "clear_alignment_shrink",
+    });
     try {
-      await this.env.DB.prepare(`DELETE FROM alignment_attention WHERE book = ?1 AND resource = ?2`)
-        .bind(book, resource)
+      await this.env.DB.prepare(
+        `DELETE FROM alignment_attention
+          WHERE book = ?1 AND resource = ?2
+            AND NOT EXISTS (
+              SELECT 1 FROM system_alerts
+               WHERE username = ?3 AND source = ?4 AND kind = 'review'
+                 AND condition_observed_at > ?5
+            )`,
+      )
+        .bind(book, resource, EXPORT_ALERT_USERNAME, `export_align_shrink:${book}:${resource}`, observedAt)
         .run();
     } catch (e) {
       console.error("export alignment attention clear failed", {
@@ -2962,6 +3108,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     issues: UsfmValidationIssue[],
+    observedAt: number,
   ): Promise<void> {
     const source = `export_usfm_invalid:${book}:${resource}`;
     // Wording lives in export.ts so it is unit-testable, and so the alert names
@@ -2971,7 +3118,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       label: `${book} ${resource.toUpperCase()}`,
       issues,
     });
-    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+    await this.reconcileExportAlert(
+      source,
+      reviewConditionKey("export_usfm_invalid", { book, resource }, {
+        count: issues.length,
+        summary: summarizeUsfmIssues(issues),
+      }),
+      message,
+      observedAt,
+    );
   }
 
   // Banner alert when the shrink guard blocks an export to avoid mass-deleting
@@ -2983,6 +3138,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     renderedRows: number,
     masterRows: number | null,
     detail: string,
+    observedAt: number,
     explained?: number,
     unexplained?: number,
   ): Promise<void> {
@@ -3020,7 +3176,18 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const message =
       `Benjamin — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the render has ${renderedRows} rows ` +
       `but master has ${masterRows ?? "?"} (${detail}). ${signature} Refusing to shrink master. ${remedy}`;
-    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+    await this.reconcileExportAlert(
+      source,
+      reviewConditionKey("export_shrink", { book, resource }, {
+        renderedRows,
+        masterRows,
+        detail,
+        explained: explained ?? null,
+        unexplained: unexplained ?? null,
+      }),
+      message,
+      observedAt,
+    );
   }
 
   // Banner alert when the hard-reject gate holds an export because the render
@@ -3033,6 +3200,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     rejects: Array<{ ref: string; rowId: string; reason: string }>,
+    observedAt: number,
   ): Promise<void> {
     const source = `export_hard_reject:${book}:${resource}`;
     const shown = rejects
@@ -3046,18 +3214,130 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `${shown}${more}. Fix the Occurrence on those rows (or delete them) in the editor and re-export; every other ` +
       `edit in ${book} ${resource.toUpperCase()} is waiting on it. Blank notes/questions/OrigWords/TWLink do NOT ` +
       `cause this — those are validator warnings and ship normally.`;
-    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+    await this.reconcileExportAlert(
+      source,
+      reviewConditionKey("export_hard_reject", { book, resource }, {
+        count: rejects.length,
+        sample: rejects.slice(0, 6),
+      }),
+      message,
+      observedAt,
+    );
   }
 
   // Banner alert when the pre-export sync for a book failed outright (e.g. the
   // Cloudflare subrequest cap). The export will skip any book left stale, so
   // this is the heads-up that a manual re-sync is needed.
-  private async recordSyncFailureAlert(book: string, detail: string): Promise<void> {
+  private async recordSyncFailureAlert(book: string, detail: string, observedAt: number): Promise<void> {
     const source = `export_sync_fail:${book}`;
     const message =
       `Benjamin — nightly pre-export sync failed for ${book}: ${detail.slice(0, 160)}. ` +
       `Any book left behind master is skipped by the freshness gate (not reverted); re-sync ${book} and re-export.`;
-    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+    try {
+      await reconcileReviewAlert(this.env, {
+        username: EXPORT_ALERT_USERNAME,
+        source,
+        conditionKey: reviewConditionKey("export_sync_fail", { book }, { detail: detail.slice(0, 160) }),
+        message,
+        severity: "error",
+        linkUrl: `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        observedAt,
+      });
+    } catch (e) {
+      console.error("export sync failure alert write failed", {
+        book,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  // Resolve a transient export-side condition without ever turning alert
+  // housekeeping into a failed/retried publish. `observedAt` is the workflow
+  // event time, so reviewAlerts' observation CAS prevents a delayed older run
+  // from clearing or resurrecting a newer condition.
+  private async resolveExportAlert(
+    source: string,
+    observedAt: number,
+    context: { book: string; resource: Resource | null; action: string; freshness?: string },
+  ): Promise<void> {
+    try {
+      await resolveReviewAlert(
+        this.env,
+        source,
+        Math.floor(observedAt / 1000),
+        EXPORT_ALERT_USERNAME,
+        observedAt,
+      );
+    } catch (e) {
+      console.error("export alert clear failed", {
+        ...context,
+        source,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  // PR-failure alerts predating the per-(repo,book,resource) source key used a
+  // repo-wide source. Retire that legacy row only when its own message names
+  // the pair whose ensure call just succeeded; success for another book in the
+  // same repo must not hide a still-failing export.
+  private async resolveLegacyPrAlert(
+    book: string,
+    resource: Resource,
+    repo: string,
+    observedAt: number,
+  ): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        `UPDATE system_alerts
+            SET resolved_at = ?1, condition_observed_at = ?2
+          WHERE username = ?3 AND source = ?4 AND kind = 'review'
+            AND resolved_at IS NULL
+            AND message LIKE ?5
+            AND (condition_observed_at IS NULL OR condition_observed_at <= ?2)`,
+      )
+        .bind(
+          Math.floor(observedAt / 1000),
+          observedAt,
+          EXPORT_ALERT_USERNAME,
+          `export_pr:${repo}`,
+          `Benjamin fix this — nightly export couldn't ensure a PR for ${book} ${resource} (%`,
+        )
+        .run();
+    } catch (e) {
+      console.error("legacy export PR alert clear failed", {
+        book,
+        resource,
+        repo,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  private async reconcileExportAlert(
+    source: string,
+    conditionKey: string,
+    message: string,
+    observedAt: number,
+    severity: "error" | "warning" = "error",
+    linkUrl = `${this.env.DCS_BASE_URL}/unfoldingWord`,
+  ): Promise<void> {
+    try {
+      await reconcileReviewAlert(this.env, {
+        username: EXPORT_ALERT_USERNAME,
+        source,
+        conditionKey,
+        message,
+        severity,
+        linkUrl,
+        observedAt,
+      });
+    } catch (e) {
+      console.error("export alert write failed", {
+        source,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 
   // Non-blocking published-release drift detector. Fetches the latest STABLE
@@ -3294,28 +3574,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     repo: string,
     branch: string,
     detail: string,
+    observedAt: number,
   ): Promise<void> {
-    const source = `export_pr:${repo}`;
+    const source = `export_pr:${repo}:${book}:${resource}`;
     const message = `Benjamin fix this — nightly export couldn't ensure a PR for ${book} ${resource} (\`${branch}\` on ${repo}): ${detail.slice(0, 160)}`;
     const linkUrl = `${this.env.DCS_BASE_URL}/${this.env.DCS_EXPORT_OWNER ?? "unfoldingWord"}/${repo}/pulls`;
-    try {
-      await this.env.DB.prepare(
-        `DELETE FROM system_alerts
-          WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
-      )
-        .bind(EXPORT_ALERT_USERNAME, source)
-        .run();
-      await this.env.DB.prepare(
-        `INSERT INTO system_alerts (username, severity, source, message, link_url)
-         VALUES (?1, 'error', ?2, ?3, ?4)`,
-      )
-        .bind(EXPORT_ALERT_USERNAME, source, message, linkUrl)
-        .run();
-    } catch (e) {
-      console.error("export PR alert write failed", {
-        book, resource, repo, error: e instanceof Error ? e.message : String(e),
-      });
-    }
+    await this.reconcileExportAlert(
+      source,
+      reviewConditionKey("export_pr", { repo, book, resource }, { branch, detail: detail.slice(0, 160) }),
+      message,
+      observedAt,
+      "error",
+      linkUrl,
+    );
   }
 
   // Error banner when an export PR conflicted but we could NOT auto-recover —
@@ -3327,6 +3598,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     repo: string,
     branch: string,
     detail: string,
+    observedAt: number,
   ): Promise<void> {
     const source = `export_conflict:${repo}:${book}:${resource}`;
     const message =
@@ -3335,7 +3607,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `(merge master, \`git checkout --ours\` the file = D1's render, push), or provision DCS_TOKEN so the ` +
       `export can rebuild the branch automatically.`;
     const linkUrl = `${this.env.DCS_BASE_URL}/${this.env.DCS_EXPORT_OWNER ?? "unfoldingWord"}/${repo}/pulls`;
-    await this.writeAlert(source, message, linkUrl, "error");
+    await this.reconcileExportAlert(
+      source,
+      reviewConditionKey("export_conflict", { repo, book, resource }, { branch, detail }),
+      message,
+      observedAt,
+      "error",
+      linkUrl,
+    );
   }
 
   // Informational banner when an export PR conflict WAS auto-recovered by
