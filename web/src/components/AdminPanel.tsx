@@ -42,6 +42,8 @@ import {
   type AdminPr,
   type AdminResourceSyncStatus,
   type AdminSyncActivityEntry,
+  type AdminSyncRunEvent,
+  type AdminSyncRunSummary,
   type AdminUser,
   type ExportSnapshotRow,
   type ExportInstanceStatus,
@@ -313,16 +315,23 @@ function parseActivitySource(source: string): { label: string; book: string | nu
 
 function SyncActivityTab() {
   const [entries, setEntries] = useState<AdminSyncActivityEntry[]>([]);
+  const [runs, setRuns] = useState<AdminSyncRunSummary[]>([]);
+  const [runEvents, setRunEvents] = useState<AdminSyncRunEvent[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [runLoading, setRunLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
-    api
-      .getAdminSyncActivity()
-      .then((res) => setEntries(res.entries))
+    Promise.all([api.getAdminSyncActivity(), api.getAdminSyncRuns()])
+      .then(([activity, ledger]) => {
+        setEntries(activity.entries);
+        setRuns(ledger.runs);
+      })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }, []);
@@ -336,6 +345,18 @@ function SyncActivityTab() {
       (e) => e.source.toLowerCase().includes(f) || e.message.toLowerCase().includes(f),
     );
   }, [entries, filter]);
+
+  const showRun = useCallback((runId: string) => {
+    setSelectedRunId(runId);
+    setRunLoading(true);
+    setRunError(null);
+    api.getAdminSyncRun(runId)
+      .then((res) => setRunEvents(res.events))
+      .catch((e) => setRunError(String(e)))
+      .finally(() => setRunLoading(false));
+  }, []);
+
+  const fmtRunTime = (ms: number | null) => ms == null ? "—" : new Date(ms).toLocaleString();
 
   return (
     <Stack spacing={2}>
@@ -356,6 +377,46 @@ function SyncActivityTab() {
           <RefreshIcon fontSize="small" />
         </IconButton>
       </Stack>
+      <Typography variant="h6">Overnight runs</Typography>
+      {runs.length === 0 ? (
+        <Typography variant="body2" color="text.secondary">No ledger runs recorded yet.</Typography>
+      ) : (
+        <TableContainer component={Paper} variant="outlined">
+          <Table size="small">
+            <TableHead><TableRow>
+              <TableCell>Started</TableCell><TableCell>Completed</TableCell><TableCell>Status</TableCell><TableCell>Items</TableCell>
+              <TableCell>Success</TableCell><TableCell>Skip</TableCell><TableCell>Failed</TableCell><TableCell />
+            </TableRow></TableHead>
+            <TableBody>{runs.map((run) => (
+              <TableRow key={run.runId} selected={run.runId === selectedRunId}>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{fmtRunTime(run.startedAt)}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{fmtRunTime(run.completedAt)}</TableCell>
+                <TableCell>{run.status ?? "running"}</TableCell>
+                <TableCell>{run.itemCount}</TableCell><TableCell>{run.successCount}</TableCell>
+                <TableCell>{run.skipCount}</TableCell><TableCell>{run.failureCount}</TableCell>
+                <TableCell><Button size="small" onClick={() => showRun(run.runId)}>Details</Button></TableCell>
+              </TableRow>
+            ))}</TableBody>
+          </Table>
+        </TableContainer>
+      )}
+      {selectedRunId && (
+        <Paper variant="outlined" sx={{ p: 2 }}>
+          <Typography variant="subtitle1">Run details: {selectedRunId}</Typography>
+          {runError && <Alert severity="error">Failed to load run: {runError}</Alert>}
+          {runLoading ? <CircularProgress size={20} /> : runEvents.map((event) => (
+            <Box key={event.id} sx={{ py: 1, borderBottom: "1px solid", borderColor: "divider" }}>
+              <Typography variant="body2">
+                {fmtRunTime(event.occurredAt)} · {event.eventType} · {event.status ?? "—"}
+                {event.book ? ` · ${event.book}` : ""}{event.resource ? ` / ${event.resource.toUpperCase()}` : ""}
+              </Typography>
+              {event.details && <Typography component="pre" variant="caption" sx={{ whiteSpace: "pre-wrap", m: 0 }}>
+                {JSON.stringify(event.details)}
+              </Typography>}
+            </Box>
+          ))}
+        </Paper>
+      )}
       {error && <Alert severity="error">Failed to load sync activity: {error}</Alert>}
       {loading ? (
         <Box sx={{ display: "flex", justifyContent: "center", p: 4 }}>

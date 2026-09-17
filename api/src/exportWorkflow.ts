@@ -75,6 +75,7 @@ import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
 import { appendSystemRecord, reconcileReviewAlert, reviewConditionKey } from "./reviewAlerts.ts";
+import { appendSyncRunEvent, syncRunEventKey } from "./syncRunLog.ts";
 import {
   CLAIM_EXPORT_REVERT_GENERATION_SQL,
   DELETE_EXPORT_REVERTS_FOR_GENERATION_SQL,
@@ -221,12 +222,101 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     totalSteps: number;
     results: StepResult[];
   }> {
-    const params = event.payload ?? {};
+    const workflowRunId = event.instanceId;
     const instanceId = `export-${new Date(event.timestamp).toISOString().replace(/[:.]/g, "-")}`;
-    // Workflow retries replay the same event timestamp. Use it as the
-    // observation generation for export-revert persistence alerts so a late
-    // step from an older workflow cannot resolve or overwrite a newer run.
-    const alertObservedAt = event.timestamp.getTime();
+    const observedAt = event.timestamp.getTime();
+    const params = event.payload ?? {};
+    await appendSyncRunEvent(this.env, {
+      runId: workflowRunId,
+      eventKey: syncRunEventKey(workflowRunId, "run_started"),
+      eventType: "run_started",
+      occurredAt: observedAt,
+      status: "started",
+      details: {
+        book: params.book ?? null,
+        resource: params.resource ?? null,
+        resources: params.resources ?? null,
+        reimportOnly: params.reimportOnly === true,
+        validateAndMerge: params.validateAndMerge === true,
+        dryDcs: params.dryDcs === true,
+      },
+    });
+    try {
+      const result = await this.runCore(event, step, instanceId, observedAt, workflowRunId);
+      const counts = this.ledgerCounts(result.results);
+      await appendSyncRunEvent(this.env, {
+        runId: workflowRunId,
+        eventKey: syncRunEventKey(workflowRunId, "run_completed"),
+        eventType: "run_completed",
+        occurredAt: Date.now(),
+        status: counts.failureCount ? "completed_with_failures" : "completed",
+        details: { ...counts, totalSteps: result.totalSteps },
+      });
+      return result;
+    } catch (error) {
+      await appendSyncRunEvent(this.env, {
+        runId: workflowRunId,
+        eventKey: syncRunEventKey(workflowRunId, "run_completed"),
+        eventType: "run_completed",
+        occurredAt: Date.now(),
+        status: "failed",
+        details: { error: (error instanceof Error ? error.message : String(error)).slice(0, 180) },
+      });
+      throw error;
+    }
+  }
+
+  private ledgerCounts(results: StepResult[]) {
+    let successCount = 0;
+    let skipCount = 0;
+    let failureCount = 0;
+    for (const result of results) {
+      if ((result.dcsSkippedReason ?? "").startsWith("error:")) failureCount++;
+      else if (result.dcsSkippedReason) skipCount++;
+      else successCount++;
+    }
+    return { itemCount: results.length, successCount, skipCount, failureCount };
+  }
+
+  private async recordLedgerItem(runId: string, occurredAt: number, result: StepResult, status?: "success" | "skip" | "failure") {
+    const itemStatus = status ?? ((result.dcsSkippedReason ?? "").startsWith("error:")
+      ? "failure"
+      : result.dcsSkippedReason
+        ? "skip"
+        : "success");
+    await appendSyncRunEvent(this.env, {
+      runId,
+      eventKey: syncRunEventKey(runId, "item_terminal", result.book, result.resource),
+      eventType: "item_terminal",
+      occurredAt,
+      status: itemStatus,
+      book: result.book,
+      resource: result.resource,
+      details: {
+        rowCount: result.rowCount,
+        bytes: result.bytes,
+        dcsChanged: result.dcsChanged,
+        dcsSkippedReason: result.dcsSkippedReason,
+        branch: result.branch,
+        dcsCommitSha: result.dcsCommitSha,
+        prNumber: result.prNumber,
+        prReason: result.prReason,
+      },
+    });
+  }
+
+  private async runCore(
+    event: WorkflowEvent<ExportParams>,
+    step: WorkflowStep,
+    instanceId: string,
+    alertObservedAt: number,
+    workflowRunId: string,
+  ): Promise<{
+    instanceId: string;
+    totalSteps: number;
+    results: StepResult[];
+  }> {
+    const params = event.payload ?? {};
 
     // 1. Resolve the books list.
     const books = await step.do("list-books", async () => {
@@ -479,6 +569,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
               ),
           );
           results.push(result);
+          await this.recordLedgerItem(workflowRunId, Date.now(), result);
         } catch (e) {
           // A single (book, resource) failure — most commonly a corrupt/dangling
           // DCS branch ref that ensureBranchVisible can't heal — must not abort
@@ -509,6 +600,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             prNumber: null,
             prReason: null,
           });
+          await this.recordLedgerItem(workflowRunId, Date.now(), results[results.length - 1], "failure");
         }
       }
       // Post-export validate-and-merge is opt-in via params.validateAndMerge.
