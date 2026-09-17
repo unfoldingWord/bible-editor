@@ -142,7 +142,7 @@ import {
 } from "./verseMergeConflicts.ts";
 import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
-import { reconcileReviewAlert, resolveReviewAlert, reviewConditionKey } from "./reviewAlerts.ts";
+import { appendSystemRecord, reconcileReviewAlert, resolveReviewAlert, reviewConditionKey } from "./reviewAlerts.ts";
 // Issue #686: the row-level "what/where/who" provenance columns (migration
 // 0060). `door43Actor` is the ONLY way this file names a Door43 commit author —
 // never build that string by hand — and it is measured-or-nothing: it names an
@@ -8516,10 +8516,10 @@ export const accountOwnPublishDeclineForTest = (
 // actual reclaim WRITE rather than merely a freeze — see isReissuedTombstone's
 // KNOWN FALSE POSITIVE note in reimportClassify.ts for what that means.
 
-// #540 item 2's scale alarm. A handful of kept-over-Door43 rows is the policy
+// #540 item 2's scale telemetry. A handful of kept-over-Door43 rows is the policy
 // working; a book-full of them has the shape of every incident this area exists
 // to prevent — and unlike a refusal, this outcome PUBLISHES over Door43 rather
-// than holding. See isKeptOverDoor43AtScale for why it alerts instead of
+// than holding. See isKeptOverDoor43AtScale for why it records instead of
 // freezing.
 //
 // Claims only the measurement: how many rows, in which (book, resource), and
@@ -8530,7 +8530,7 @@ async function raiseKeptOverDoor43Alert(
   book: string,
   resource: Resource,
   kept: number,
-  observedAt = Date.now(),
+  eventKey?: string,
 ): Promise<void> {
   const source = `reimport_kept_over_door43:${book}:${resource}`;
   const res = resource.toUpperCase();
@@ -8547,22 +8547,16 @@ async function raiseKeptOverDoor43Alert(
     `${book}'s merge-review banner.`;
   try {
     if (kept > 0) {
-      await reconcileReviewAlert(env, {
+      await appendSystemRecord(env, {
         username: OWN_PUBLISH_ALERT_USERNAME,
         source,
-        // The alert is an at-scale episode. Counts are volatile display
-        // evidence, not a new condition; a dismissed episode must not reopen
-        // merely because tonight's count changed from 5 to 6.
-        conditionKey: reviewConditionKey("reimport_kept_over_door43", { book, resource }, { atScale: true }),
         message,
         severity: "warning",
-        observedAt,
+        eventKey,
       });
-    } else {
-      await resolveReviewAlert(env, source, undefined, undefined, observedAt);
     }
   } catch (e) {
-    // Best-effort, like every other alert helper here: a failed banner must
+    // Best-effort, like every other telemetry helper here: a failed record must
     // never fail the reimport, and this one gates nothing.
     console.error("reimport kept-over-Door43 alert failed", {
       book,
@@ -10342,16 +10336,20 @@ export async function runChunkedReimport(
       // and for deciding whether a zero kept count is measured. An incomplete
       // aggregate must not clear a standing alert.
       const mergeRecordFailed = perResource[e.resource].merge_record_failed === true;
-      // #540 item 2's scale alarm, raised OUTSIDE the withhold branch below and
-      // gating nothing: keeping the app's version at scale does not make the
-      // resource unsafe to export — it makes it worth a human's eye BEFORE the
-      // export publishes those rows to Door43. See isKeptOverDoor43AtScale.
+      // #540 item 2's scale telemetry, recorded OUTSIDE the withhold branch
+      // below and gating nothing: keeping the app's version at scale does not
+      // make the resource unsafe to export — it records what was measured
+      // before the export publishes those rows to Door43.
       const keptOverDoor43 = perResource[e.resource].merge_kept_ai ?? 0;
       if (!mergeRecordFailed && perResource[e.resource].counts_incomplete !== true) {
         if (isKeptOverDoor43AtScale(keptOverDoor43)) {
-          await raiseKeptOverDoor43Alert(env, book, e.resource, keptOverDoor43, alertObservedAt);
-        } else {
-          await resolveReviewAlert(env, `reimport_kept_over_door43:${book}:${e.resource}`, undefined, undefined, alertObservedAt);
+          await raiseKeptOverDoor43Alert(
+            env,
+            book,
+            e.resource,
+            keptOverDoor43,
+            `${instanceId}:reimport_kept_over_door43:${book}:${e.resource}`,
+          );
         }
       }
       // FIX 1: withhold the watermark when this run's merge-conflict
