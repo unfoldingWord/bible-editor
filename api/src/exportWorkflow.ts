@@ -226,42 +226,48 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const instanceId = `export-${new Date(event.timestamp).toISOString().replace(/[:.]/g, "-")}`;
     const observedAt = event.timestamp.getTime();
     const params = event.payload ?? {};
-    await appendSyncRunEvent(this.env, {
-      runId: workflowRunId,
-      eventKey: syncRunEventKey(workflowRunId, "run_started"),
-      eventType: "run_started",
-      occurredAt: observedAt,
-      status: "started",
-      details: {
-        book: params.book ?? null,
-        resource: params.resource ?? null,
-        resources: params.resources ?? null,
-        reimportOnly: params.reimportOnly === true,
-        validateAndMerge: params.validateAndMerge === true,
-        dryDcs: params.dryDcs === true,
-      },
-    });
+    await step.do("ledger-run-started", async () =>
+      appendSyncRunEvent(this.env, {
+        runId: workflowRunId,
+        eventKey: syncRunEventKey(workflowRunId, "run_started"),
+        eventType: "run_started",
+        occurredAt: observedAt,
+        status: "started",
+        details: {
+          book: params.book ?? null,
+          resource: params.resource ?? null,
+          resources: params.resources ?? null,
+          reimportOnly: params.reimportOnly === true,
+          validateAndMerge: params.validateAndMerge === true,
+          dryDcs: params.dryDcs === true,
+        },
+      }),
+    );
     try {
       const result = await this.runCore(event, step, instanceId, observedAt, workflowRunId);
       const counts = this.ledgerCounts(result.results);
-      await appendSyncRunEvent(this.env, {
-        runId: workflowRunId,
-        eventKey: syncRunEventKey(workflowRunId, "run_completed"),
-        eventType: "run_completed",
-        occurredAt: Date.now(),
-        status: counts.failureCount ? "completed_with_failures" : "completed",
-        details: { ...counts, totalSteps: result.totalSteps },
-      });
+      await step.do("ledger-run-completed", async () =>
+        appendSyncRunEvent(this.env, {
+          runId: workflowRunId,
+          eventKey: syncRunEventKey(workflowRunId, "run_completed"),
+          eventType: "run_completed",
+          occurredAt: Date.now(),
+          status: counts.failureCount ? "completed_with_failures" : "completed",
+          details: { ...counts, totalSteps: result.totalSteps },
+        }),
+      );
       return result;
     } catch (error) {
-      await appendSyncRunEvent(this.env, {
-        runId: workflowRunId,
-        eventKey: syncRunEventKey(workflowRunId, "run_completed"),
-        eventType: "run_completed",
-        occurredAt: Date.now(),
-        status: "failed",
-        details: { error: (error instanceof Error ? error.message : String(error)).slice(0, 180) },
-      });
+      await step.do("ledger-run-completed", async () =>
+        appendSyncRunEvent(this.env, {
+          runId: workflowRunId,
+          eventKey: syncRunEventKey(workflowRunId, "run_completed"),
+          eventType: "run_completed",
+          occurredAt: Date.now(),
+          status: "failed",
+          details: { error: (error instanceof Error ? error.message : String(error)).slice(0, 180) },
+        }),
+      );
       throw error;
     }
   }
@@ -278,31 +284,40 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     return { itemCount: results.length, successCount, skipCount, failureCount };
   }
 
-  private async recordLedgerItem(runId: string, occurredAt: number, result: StepResult, status?: "success" | "skip" | "failure") {
+  private async recordLedgerItem(
+    step: WorkflowStep,
+    stepName: string,
+    runId: string,
+    occurredAt: number,
+    result: StepResult,
+    status?: "success" | "skip" | "failure",
+  ) {
     const itemStatus = status ?? ((result.dcsSkippedReason ?? "").startsWith("error:")
       ? "failure"
       : result.dcsSkippedReason
         ? "skip"
         : "success");
-    await appendSyncRunEvent(this.env, {
-      runId,
-      eventKey: syncRunEventKey(runId, "item_terminal", result.book, result.resource),
-      eventType: "item_terminal",
-      occurredAt,
-      status: itemStatus,
-      book: result.book,
-      resource: result.resource,
-      details: {
-        rowCount: result.rowCount,
-        bytes: result.bytes,
-        dcsChanged: result.dcsChanged,
-        dcsSkippedReason: result.dcsSkippedReason,
-        branch: result.branch,
-        dcsCommitSha: result.dcsCommitSha,
-        prNumber: result.prNumber,
-        prReason: result.prReason,
-      },
-    });
+    await step.do(`ledger-${stepName}-terminal`, async () =>
+      appendSyncRunEvent(this.env, {
+        runId,
+        eventKey: syncRunEventKey(runId, "item_terminal", result.book, result.resource),
+        eventType: "item_terminal",
+        occurredAt,
+        status: itemStatus,
+        book: result.book,
+        resource: result.resource,
+        details: {
+          rowCount: result.rowCount,
+          bytes: result.bytes,
+          dcsChanged: result.dcsChanged,
+          dcsSkippedReason: result.dcsSkippedReason,
+          branch: result.branch,
+          dcsCommitSha: result.dcsCommitSha,
+          prNumber: result.prNumber,
+          prReason: result.prReason,
+        },
+      }),
+    );
   }
 
   private async runCore(
@@ -569,7 +584,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
               ),
           );
           results.push(result);
-          await this.recordLedgerItem(workflowRunId, Date.now(), result);
+          await this.recordLedgerItem(step, stepName, workflowRunId, Date.now(), result);
         } catch (e) {
           // A single (book, resource) failure — most commonly a corrupt/dangling
           // DCS branch ref that ensureBranchVisible can't heal — must not abort
@@ -600,7 +615,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             prNumber: null,
             prReason: null,
           });
-          await this.recordLedgerItem(workflowRunId, Date.now(), results[results.length - 1], "failure");
+          await this.recordLedgerItem(step, stepName, workflowRunId, Date.now(), results[results.length - 1], "failure");
         }
       }
       // Post-export validate-and-merge is opt-in via params.validateAndMerge.
