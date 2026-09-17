@@ -310,6 +310,17 @@ function ThreadView({
 
   return (
     <Box sx={{ mb: 1.5 }}>
+      {thread.orphaned && (
+        // The row this comment was anchored to (a tn/tq/twl row, or a since-
+        // regenerated chapter intro with no current intro row) no longer
+        // exists — see #818. Floated here to the verse level rather than
+        // dropped, so flag it as displaced.
+        <Chip
+          size="small"
+          label="Used to belong to a note here"
+          sx={{ mb: 0.5, height: 20, fontSize: 11 }}
+        />
+      )}
       <CommentCard
         comment={root}
         kind={root.kind}
