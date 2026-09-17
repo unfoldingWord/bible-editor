@@ -2366,6 +2366,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       pushPipelineToast("That comment is no longer available.", "info");
       return;
     }
+    // A row-anchored deep link needs the chapter's live rows to resolve a
+    // possibly-relocated target. If comments loaded before chapter data,
+    // commentLiveRows is still undefined — wait rather than consume the link
+    // against the stale row now (which the stale-target cleanup would then
+    // close, while the consumed-key guard blocks reopening, so the alert would
+    // appear to do nothing). The effect re-runs once data arrives (#824 review).
+    if (comment.rowKind != null && !commentLiveRows) return;
     consumedCommentKeyRef.current = key;
     // Resolve to where indexComments actually filed the thread — a comment whose
     // row was deleted/replaced (or a stale chapter-intro comment) is relocated
