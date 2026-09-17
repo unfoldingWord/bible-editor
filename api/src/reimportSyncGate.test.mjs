@@ -25,6 +25,7 @@ import {
   KEPT_OVER_DOOR43_ALERT_THRESHOLD,
   mergeRefusalOverrideAllowed,
   idBlockedOverrideAllowed,
+  classifyReimportOutcome,
 } from "./reimportSyncGate.ts";
 
 let failed = 0;
@@ -533,9 +534,77 @@ eq(
   "999 kept-over-Door43 rows still stamp the watermark — this outcome never withholds",
 );
 
+console.log("\n[classifyReimportOutcome]");
+
+// Book-level totals shape used by exportWorkflow.ts's reimport ledger — a
+// superset of the (book, resource) `counts()` helper above, folding in the
+// fields classifyReimportOutcome also inspects.
+function reimportTotals(overrides = {}) {
+  return {
+    ...counts(),
+    merge_record_failed: false,
+    structure_overlap: 0,
+    merge_refused: 0,
+    apply_incomplete: false,
+    ...overrides,
+  };
+}
+
+eq(classifyReimportOutcome(reimportTotals()), "success", "clean totals → success");
+
+// Issue #836: this classifier used to omit isSystemicMergeRefusal entirely,
+// so a book withheld SOLELY because its alignment-refused verses crossed the
+// systemic threshold was recorded `success` — a false green in the ledger,
+// even though the (book, resource) watermark was withheld.
+eq(
+  classifyReimportOutcome(reimportTotals({ merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD })),
+  "failure",
+  "systemic_refusal alone (merge_refused at threshold) → failure, not success",
+);
+eq(
+  classifyReimportOutcome(reimportTotals({ merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD - 1 })),
+  "success",
+  "merge_refused just under the systemic threshold → still success",
+);
+
+// The pre-existing failure/skip conditions must keep working unchanged.
+eq(
+  classifyReimportOutcome(reimportTotals({ apply_incomplete: true })),
+  "failure",
+  "apply_incomplete → failure",
+);
+eq(classifyReimportOutcome(reimportTotals({ errors: ["boom"] })), "failure", "a batch error → failure");
+eq(
+  classifyReimportOutcome(reimportTotals({ merge_record_failed: true })),
+  "failure",
+  "merge_record_failed → failure",
+);
+eq(
+  classifyReimportOutcome(reimportTotals({ structure_overlap: 1 })),
+  "failure",
+  "structure_overlap > 0 → failure",
+);
+eq(
+  classifyReimportOutcome(reimportTotals({ chapters_locked: 1 })),
+  "skip",
+  "chapters_locked (no failure condition) → skip",
+);
+eq(
+  classifyReimportOutcome(reimportTotals({ counts_incomplete: true })),
+  "skip",
+  "counts_incomplete (no failure condition) → skip",
+);
+// A failure condition alongside a skip condition must still read as failure —
+// mirrors the isSystemicMergeRefusal-first ordering above.
+eq(
+  classifyReimportOutcome(reimportTotals({ chapters_locked: 1, apply_incomplete: true })),
+  "failure",
+  "failure condition takes priority over a simultaneous skip condition",
+);
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
 } else {
-  console.log("\nAll shouldRecordResourceSync / isSystemicMergeRefusal checks passed.");
+  console.log("\nAll shouldRecordResourceSync / isSystemicMergeRefusal / classifyReimportOutcome checks passed.");
 }
