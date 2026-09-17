@@ -2109,7 +2109,7 @@ function NoteCardInner({
                 onSetPreserve(next);
                 if (next && isHint) onSetHint?.(false);
               }}
-              sx={{ fontSize: 11, height: 22, cursor: "pointer" }}
+              sx={{ fontSize: 11, height: 24, cursor: "pointer" }}
             />
           </Tooltip>
         )}
@@ -2126,7 +2126,7 @@ function NoteCardInner({
                 onSetHint(next);
                 if (next && isPreserved) onSetPreserve?.(false);
               }}
-              sx={{ fontSize: 11, height: 22, cursor: "pointer" }}
+              sx={{ fontSize: 11, height: 24, cursor: "pointer" }}
             />
           </Tooltip>
         )}
@@ -2148,7 +2148,7 @@ function NoteCardInner({
               sx={{
                 fontFamily: "monospace",
                 fontSize: 11,
-                height: 22,
+                height: 24,
                 borderStyle: "dashed",
                 color: "primary.main",
                 borderColor: "primary.light",
@@ -2172,7 +2172,7 @@ function NoteCardInner({
               sx={{
                 fontFamily: "monospace",
                 fontSize: 11,
-                height: 22,
+                height: 24,
                 borderStyle: "dashed",
                 color: "primary.main",
                 borderColor: "primary.light",
@@ -2188,7 +2188,7 @@ function NoteCardInner({
           label={row.id}
           size="small"
           variant="outlined"
-          sx={{ fontFamily: "monospace", fontSize: 11, height: 22 }}
+          sx={{ fontFamily: "monospace", fontSize: 11, height: 24 }}
         />
       </Stack>
       {historyOpen && (
