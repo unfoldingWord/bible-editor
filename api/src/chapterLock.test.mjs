@@ -295,6 +295,33 @@ const job = (pipeline_type, state = "running", follow_up_chain = null) => ({
 
   assert(chainRootJobId("j1:chain2") === "j1", "chainRootJobId strips the chain suffix");
   assert(chainRootJobId("j1") === "j1", "an unchained job is its own root");
+  assert(chainRootJobId("j1:chain1:chain2") === "j1", "nesting strips at the FIRST suffix");
+  assert(chainRootJobId("j1:followup") === "j1:followup", "a followup child is its own root");
+
+  // The sibling lookup is the only extra D1 read this function can make, and
+  // the nightly reimport calls it once per chapter of every book — a book-wide
+  // job would otherwise double the run's lock reads against a subrequest budget
+  // bookReimport.ts already documents as tight. It must fire only when an
+  // active job is actually a chain LINK (an unchained job has no predecessors).
+  const counting = (jobs) => {
+    let queries = 0;
+    const inner = fakeEnv(jobs);
+    return {
+      env: { DB: { prepare: (sql) => { queries++; return inner.DB.prepare(sql); } } },
+      count: () => queries,
+    };
+  };
+  const lone = counting([link("u-u-i-d", "tqs", "running", null)]);
+  await lockedResourcesForChapter(lone.env, "ZEC", 2);
+  assert(lone.count() === 1, "an unchained running job costs exactly one query");
+
+  const quiet = counting([]);
+  await lockedResourcesForChapter(quiet.env, "ZEC", 2);
+  assert(quiet.count() === 1, "a chapter with nothing running costs exactly one query");
+
+  const chained = counting([link("u-u-i-d:chain2", "tqs", "running", null)]);
+  await lockedResourcesForChapter(chained.env, "ZEC", 2);
+  assert(chained.count() === 2, "a running chain link pays the sibling lookup");
 }
 
 // ─── Export resource → lock namespace ─────────────────────────────────────
@@ -320,7 +347,10 @@ const job = (pipeline_type, state = "running", follow_up_chain = null) => ({
   const src = readSourceSync(joinPath(dirName(toPath(import.meta.url)), "bookReimport.ts"), "utf8");
   assert(!/activePipelineForChapter\s*\(/.test(src),
     "bookReimport.ts makes no resource-blind activePipelineForChapter call");
-  assert((src.match(/lockedResourcesForChapter\s*\(/g) ?? []).length === 3,
+  // >= 3, not == 3: the invariant is "no site asks the blind question" (the
+  // assertion above), not "there are exactly three sites" — a legitimate fourth
+  // call site should not fail a test about something else.
+  assert((src.match(/lockedResourcesForChapter\s*\(/g) ?? []).length >= 3,
     "all three reimport lock sites use lockedResourcesForChapter");
   assert((src.match(/lockedResourceFor\s*\(/g) ?? []).length >= 3,
     "the lock sites map their resource through lockedResourceFor");
