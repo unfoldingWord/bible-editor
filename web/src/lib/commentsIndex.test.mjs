@@ -1,7 +1,7 @@
 // Smoke test for commentsIndex.ts. Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/commentsIndex.test.mjs
 
-import { rowKey, indexComments, countThreads } from "./commentsIndex.ts";
+import { rowKey, indexComments, countThreads, resolveCommentLocation } from "./commentsIndex.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -163,6 +163,32 @@ function mkComment(overrides = {}) {
   const floated = idx.threadsByVerse.get(0) ?? [];
   assert(floated.length === 1 && floated[0].root.id === stale.id, "intro comment with no current intro row floats to verse 0");
   assert(floated[0].orphaned === true, "floated intro comment is flagged orphaned");
+}
+{
+  // Multiple LIVE verse-0 TN rows: each comment stays on its own card — a
+  // comment on a live secondary intro note must not collapse onto the first
+  // intro row (#824 review).
+  const first = mkComment({ verse: 0, rowKind: "tn", rowId: "intro-A" });
+  const second = mkComment({ verse: 0, rowKind: "tn", rowId: "intro-B" });
+  const idx = indexComments([first, second], { rowIds: new Set(["tn:intro-A", "tn:intro-B"]), introRowId: "intro-A" });
+  assert(idx.threadsByRow.get("tn:intro-A")?.length === 1 && idx.threadsByRow.get("tn:intro-A")[0].root.id === first.id, "first live intro note stays on its own row");
+  assert(idx.threadsByRow.get("tn:intro-B")?.length === 1 && idx.threadsByRow.get("tn:intro-B")[0].root.id === second.id, "second live intro note stays on its own card, not collapsed onto the first");
+  assert((idx.threadsByVerse.get(0) ?? []).length === 0, "no live intro note floats to verse 0");
+}
+
+// --- resolveCommentLocation resolves the deep-link/open target the same way ---
+{
+  const live = { verse: 5, rowKind: "tq", rowId: "live1" };
+  const dead = { verse: 5, rowKind: "tq", rowId: "gone" };
+  const rows = { rowIds: new Set(["tq:live1"]), introRowId: null };
+  assert(JSON.stringify(resolveCommentLocation(live, rows)) === JSON.stringify({ verse: 5, rowKind: "tq", rowId: "live1" }), "live row resolves to its own row");
+  assert(JSON.stringify(resolveCommentLocation(dead, rows)) === JSON.stringify({ verse: 5, rowKind: null, rowId: null }), "dead row resolves to its verse (float)");
+  const staleIntro = { verse: 0, rowKind: "tn", rowId: "intro-old" };
+  assert(JSON.stringify(resolveCommentLocation(staleIntro, { rowIds: new Set(["tn:intro-new"]), introRowId: "intro-new" })) === JSON.stringify({ verse: 0, rowKind: "tn", rowId: "intro-new" }), "stale intro resolves to the current intro row");
+  const verseAnchored = { verse: 3, rowKind: null, rowId: null };
+  assert(JSON.stringify(resolveCommentLocation(verseAnchored, rows)) === JSON.stringify({ verse: 3, rowKind: null, rowId: null }), "verse-anchored resolves to its verse");
+  // No liveRows: row-anchored resolves to its own row (orphan detection off).
+  assert(JSON.stringify(resolveCommentLocation(dead)) === JSON.stringify({ verse: 5, rowKind: "tq", rowId: "gone" }), "without liveRows a row-anchored comment resolves to its own row");
 }
 
 if (failed) {

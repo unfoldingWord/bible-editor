@@ -30,7 +30,7 @@ import { outbox } from "../sync/outbox";
 import { api, ApiError, CHECK_LANES, setReadOnlyReason } from "../sync/api";
 import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
-import { countThreads, rowKey, type CommentThread, type LiveRows } from "../lib/commentsIndex";
+import { countThreads, resolveCommentLocation, rowKey, type CommentThread, type LiveRows } from "../lib/commentsIndex";
 import { CommentsPopover } from "./CommentsPopover";
 import type { CommentTarget, NewCommentDraft, OpenCommentsFn } from "./commentsTarget";
 import { targetKey, targetsMatch } from "./commentsTarget";
@@ -1106,6 +1106,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // "always applicable", but verse 0 outside the Psalms usually has none, so the
   // rail should show a "nothing to check" dash there rather than a checkbox.
   const introHasTwl = useMemo(() => !!data && data.twl.some((r) => r.verse === 0), [data]);
+  // Surface the intro tile when verse 0 carries a comment thread but no resource
+  // row, scripture, or missing-marker condition would otherwise render it —
+  // e.g. an intro comment whose only verse-0 TN row was deleted floats to verse
+  // 0 (see resolveCommentLocation) and would have no badge to open it (#824
+  // review). A stable boolean so tileSet doesn't recompute on comment text edits.
+  const introHasComment = useMemo(
+    () => commentsEnabled && (commentsIndex.threadsByVerse.get(0)?.length ?? 0) > 0,
+    [commentsEnabled, commentsIndex],
+  );
 
   // tileSet runs verseHasUnalignedWork (a full alignment parse) for EVERY
   // verse, so it must not recompute when only a TN/TQ/TWL row changed. Keying
@@ -1199,13 +1208,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // api/src/chapterSummary.ts), and without a tile the rail is blank and
     // activeVerse stays at a verse 1 that does not exist there.
     const tiles: VerseTile[] = [];
-    if (chapter === 0 || introHasResource || introHasScripture || introMarkerMissing) {
+    if (chapter === 0 || introHasResource || introHasScripture || introMarkerMissing || introHasComment) {
       tiles.push({ verse: 0, has: false, lanes: buildLanes(0) });
     }
     const verseNums = [...versesWithSomething].filter((v) => v > 0).sort((a, b) => a - b);
     for (const v of verseNums) tiles.push({ verse: v, has: hasUnalignedFor(v), lanes: buildLanes(v) });
     return tiles;
-  }, [chapter, versesForTiles, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl]);
+  }, [chapter, versesForTiles, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl, introHasComment]);
 
   // Which alignment-attention refs (from the last nightly export) are already
   // fixed in the currently loaded chapter — re-parsed against live verse
@@ -2358,21 +2367,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       return;
     }
     consumedCommentKeyRef.current = key;
-    setActiveVerse(comment.verse);
-    // Set the focus id matching the comment's row kind and clear the other two
+    // Resolve to where indexComments actually filed the thread — a comment whose
+    // row was deleted/replaced (or a stale chapter-intro comment) is relocated
+    // to its verse or the current intro row, so opening/highlighting its
+    // ORIGINAL rowKind/rowId would show an empty popover and silently consume
+    // the alert (#824 review).
+    const loc = resolveCommentLocation(comment, commentLiveRows);
+    setActiveVerse(loc.verse);
+    // Set the focus id matching the RESOLVED row kind and clear the other two
     // — the trio must stay consistent (same rule goToLintIssue follows), or a
-    // stale question/word highlight lingers from wherever focus was before.
-    setActiveNoteId(comment.rowKind === "tn" ? comment.rowId : null);
-    setActiveQuestionId(comment.rowKind === "tq" ? comment.rowId : null);
-    setActiveWordId(comment.rowKind === "twl" ? comment.rowId : null);
+    // stale question/word highlight lingers from wherever focus was before. A
+    // floated (orphaned) comment resolves to a null rowKind, clearing all three.
+    setActiveNoteId(loc.rowKind === "tn" ? loc.rowId : null);
+    setActiveQuestionId(loc.rowKind === "tq" ? loc.rowId : null);
+    setActiveWordId(loc.rowKind === "twl" ? loc.rowId : null);
     // No clicked element on a deep-link arrival, so anchor stays null and the
     // popover falls back to the centred anchor.
     setCommentPanel({
       anchor: null,
       target:
-        comment.rowKind != null && comment.rowId != null
-          ? { verse: comment.verse, rowKind: comment.rowKind, rowId: comment.rowId }
-          : { verse: comment.verse },
+        loc.rowKind != null && loc.rowId != null
+          ? { verse: loc.verse, rowKind: loc.rowKind, rowId: loc.rowId }
+          : { verse: loc.verse },
     });
     setHighlightCommentId(comment.id);
     setScrollNonce((n) => n + 1);
@@ -2382,7 +2398,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // stayed set, this effect's deps never changed, and clicking the SAME alert
     // again was silently ignored (verified).
     onCommentConsumed?.();
-  }, [commentsIndex, commentsLoading, commentsLoadedKey, commentsError, book, chapter, initialCommentId, onCommentConsumed, pushPipelineToast]);
+  }, [commentsIndex, commentLiveRows, commentsLoading, commentsLoadedKey, commentsError, book, chapter, initialCommentId, onCommentConsumed, pushPipelineToast]);
 
   // Keep the alignment target's verse in step with the active verse while
   // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
