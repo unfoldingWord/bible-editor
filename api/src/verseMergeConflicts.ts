@@ -83,7 +83,6 @@ import {
   EDITOR_LOOKUP_CHUNK,
   groupNoBaseVersesByEditor,
   groupOverwrittenVersesByEditor,
-  planSystemAlertWrites,
   type NoBaseVerseRef,
   type OverwrittenVerseRef,
 } from "./verseMergeEditorAlerts.ts";
@@ -92,12 +91,21 @@ import {
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
+  RESOLVE_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
+  RESOLVE_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL,
   RETIRE_KEPT_AI_MASTER_CONFLICTS_FOR_PAIR_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
 } from "./verseMergeConflictSql.ts";
+import {
+  activeReviewAlertUsernames,
+  reconcileReviewAlert,
+  resolveReviewAlert,
+  reviewConditionKey,
+  verseMergeEditorConditionKey,
+} from "./reviewAlerts.ts";
 
 // Same maintainer the export alerts target (exportWorkflow.ts's
 // EXPORT_ALERT_USERNAME) — that file is owned by a concurrent change, so this
@@ -552,13 +560,24 @@ async function resolvedBannerClearStmts(
   const source = `verse_merge_conflict:${book}:${resource}`;
   const active = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).bind(book, resource).all();
   if ((active.results?.length ?? 0) > 0) return []; // other conflicts still justify the banner
+  // Preserve the pre-0066 rolling-deploy path: the retire batch must still be
+  // usable while the alert columns have not reached this D1 instance.
+  let transitionsAvailable = true;
+  try {
+    await env.DB.prepare(`SELECT resolved_at FROM system_alerts LIMIT 0`).all();
+  } catch (error) {
+    if (!/no such column|has no column named/i.test(error instanceof Error ? error.message : String(error))) throw error;
+    transitionsAvailable = false;
+  }
   const alerts = await env.DB.prepare(
-    `SELECT username, message FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`,
+    transitionsAvailable
+      ? `SELECT username, message FROM system_alerts WHERE source = ?1 AND resolved_at IS NULL`
+      : `SELECT username, message FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`,
   )
     .bind(source)
     .all<{ username: string; message: string }>();
   const toClear = (alerts.results ?? []).filter((a) => !alertMessageCarriesNoBaseWarning(a.message));
-  if (toClear.length === 0) return []; // nothing undismissed, or every row still carries keep_no_base
+  if (toClear.length === 0) return []; // nothing standing, or every row still carries keep_no_base
   // One source-wide DELETE, always. It now excludes keep_no_base messages in SQL
   // (see CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL), so it is safe even when some
   // undismissed alerts still carry a no-base warning — no need to fan out to a
@@ -569,7 +588,9 @@ async function resolvedBannerClearStmts(
   // no-base alert plus 100+ conflict-only alerts — previously emitted 100+
   // per-username DELETEs, and the over-cap batch failed then retried the same
   // oversized batch every sweep, so the pair never cleared).
-  return [env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).bind(source, book, resource)];
+  return [
+    env.DB.prepare(transitionsAvailable ? RESOLVE_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL : CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).bind(source, book, resource),
+  ];
 }
 
 interface StoredConflictRow {
@@ -628,23 +649,6 @@ async function lookupEditorUsernames(
   return usernameByKey;
 }
 
-// Shared statement builder for "clear an UNDISMISSED alert" — the one
-// invariant every clear in this function must respect: a dismissed row is
-// never touched, or dismissing would be pointless (it would just come back
-// undismissed on the next run). Parameterized by an optional `username` so
-// the same helper covers both shapes this function needs: clearing every
-// username at once for this source (nothing left to report — see the
-// early-return branch below) and clearing one specific username (the
-// per-user replan below, via planSystemAlertWrites).
-function clearUndismissedAlertsStmt(env: Env, source: string, username?: string): D1PreparedStatement {
-  if (username != null) {
-    return env.DB.prepare(
-      `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
-    ).bind(username, source);
-  }
-  return env.DB.prepare(`DELETE FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`).bind(source);
-}
-
 // Issue #626: raiseVerseMergeConflictAlert only reruns from a reimport (the
 // nightly cron or a user-triggered POST /:book/reimport), so a banner it
 // wrote stays frozen at that run's content until the next one — up to a
@@ -679,11 +683,22 @@ export async function clearResolvedConflictBannerIfLast(env: Env, book: string, 
   try {
     const rs = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).bind(book, resource).all();
     if ((rs.results?.length ?? 0) > 0) return; // other conflicts still outstanding — leave the banner for the next sync
-    const alerts = await env.DB.prepare(
-      `SELECT username, message FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`,
-    )
-      .bind(source)
-      .all<{ username: string; message: string }>();
+    let alerts: { results?: Array<{ username: string; message: string }> };
+    try {
+      alerts = await env.DB.prepare(
+        `SELECT username, message FROM system_alerts WHERE source = ?1 AND resolved_at IS NULL`,
+      )
+        .bind(source)
+        .all();
+    } catch (error) {
+      // A rolling deploy can invoke this best-effort cleanup before 0066.
+      if (!/no such column|has no column named/i.test(error instanceof Error ? error.message : String(error))) throw error;
+      alerts = await env.DB.prepare(
+        `SELECT username, message FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`,
+      )
+        .bind(source)
+        .all();
+    }
     const toClear = (alerts.results ?? []).filter((a) => !alertMessageCarriesNoBaseWarning(a.message));
     if (toClear.length === 0) return; // nothing undismissed, or every row still carries keep_no_base
     // Prefer one source-wide clear when every undismissed row is conflict-only
@@ -694,11 +709,21 @@ export async function clearResolvedConflictBannerIfLast(env: Env, book: string, 
     // are the raise/replan path, which deletes-then-reinserts precisely WHILE
     // conflicts are active, so the guard would make them no-ops.
     if (toClear.length === (alerts.results?.length ?? 0)) {
-      await env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).bind(source, book, resource).run();
+      try {
+        await env.DB.prepare(RESOLVE_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).bind(source, book, resource).run();
+      } catch (error) {
+        if (!/no such column|has no column named/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        await env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).bind(source, book, resource).run();
+      }
       return;
     }
     for (const a of toClear) {
-      await env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL).bind(a.username, source, book, resource).run();
+      try {
+        await env.DB.prepare(RESOLVE_CONFLICT_ONLY_ALERTS_BY_USER_SQL).bind(a.username, source, book, resource).run();
+      } catch (error) {
+        if (!/no such column|has no column named/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        await env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL).bind(a.username, source, book, resource).run();
+      }
     }
   } catch (e) {
     console.error("verseMergeConflicts: resolved-banner clear failed", {
@@ -743,6 +768,7 @@ export async function raiseVerseMergeConflictAlert(
     noBaseCount?: number;
     noBaseRefs?: string[];
     noBaseEditorRefs?: NoBaseVerseRef[];
+    observedAt?: number;
   } = {},
 ): Promise<void> {
   const source = `verse_merge_conflict:${book}:${resource}`;
@@ -803,7 +829,7 @@ export async function raiseVerseMergeConflictAlert(
       // editor alert from an earlier run (see the editor fan-out below) named
       // by this same source must also disappear once this book+resource has
       // nothing left to report, or it would sit stale forever.
-      await clearUndismissedAlertsStmt(env, source).run();
+      await resolveReviewAlert(env, source, undefined, undefined, opts.observedAt);
     } catch (e) {
       console.error("verseMergeConflicts: alert clear failed", {
         book,
@@ -905,41 +931,55 @@ export async function raiseVerseMergeConflictAlert(
   // entry per affected editor.
   const desired = new Map<string, string>([[ALERT_USERNAME, message], ...editorMessages.entries()]);
 
-  try {
-    // Read the CURRENT state for this exact source (every username, any
-    // dismissal state) so planSystemAlertWrites can tell "identical content
-    // already dismissed — leave it" apart from "stale or changed — rewrite
-    // it". Without this read, every run unconditionally deletes+reinserts,
-    // which is exactly what made a dismissed alert reappear the very next
-    // run (six-angle review DEFECT: "dismissal stickiness").
-    const existingRs = await env.DB.prepare(
-      `SELECT username, message, dismissed_at FROM system_alerts WHERE source = ?1`,
-    )
-      .bind(source)
-      .all<{ username: string; message: string; dismissed_at: number | null }>();
-    const existing = new Map(
-      (existingRs.results ?? []).map((r) => [r.username, { message: r.message, dismissedAt: r.dismissed_at }]),
-    );
-    const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
+  // The condition is the measured set of adjudication-needed rows, not the
+  // prose/count formatting. Sort every collection so traversal order and
+  // capped display samples cannot create a new alert transition.
+  const condition = reviewConditionKey(
+    "verse_merge_conflict",
+    { book, resource },
+    {
+      rows: rows
+        .map((r) => ({
+          chapter: r.chapter,
+          verse: r.verse,
+          action: r.action,
+          reason: r.reason,
+          overwrittenVersion: r.overwrittenVersion,
+        }))
+        .sort((a, b) => `${a.chapter}:${a.verse}:${a.action}:${a.reason}`.localeCompare(`${b.chapter}:${b.verse}:${b.action}:${b.reason}`)),
+      noBase: noBaseEditorRefs
+        .map((r) => ({ chapter: r.chapter, verse: r.verse, version: r.version }))
+        .sort((a, b) => `${a.chapter}:${a.verse}`.localeCompare(`${b.chapter}:${b.verse}`)),
+      noBaseCount: opts.noBaseCount ?? 0,
+      recordingFailed: Boolean(opts.recordingFailed),
+    },
+  );
+  const conditionForUser = (username: string): string => {
+    if (username === ALERT_USERNAME) return condition;
+    const refs = [perEditor.get(username)?.refs ?? [], perEditorNoBase.get(username)?.refs ?? []]
+      .flat()
+      .sort();
+    return verseMergeEditorConditionKey(book, resource, username, refs);
+  };
 
-    // FIX (six-angle review, item 5): fold every delete and insert this run
-    // needs into ONE batch (chunked at WRITE_BATCH, same as every other
-    // multi-row write in this file) instead of one bare DELETE followed by a
-    // separate INSERT batch — the old two-call shape meant a transient
-    // failure between them could delete an alert and never replace it.
-    const stmts = [
-      ...toDelete.map((username) => clearUndismissedAlertsStmt(env, source, username)),
-      ...toInsert.map(({ username, message: msg }) =>
-        env.DB
-          .prepare(
-            `INSERT INTO system_alerts (username, severity, source, message, link_url)
-             VALUES (?1, ?2, ?3, ?4, ?5)`,
-          )
-          .bind(username, "warning", source, msg, null),
-      ),
-    ];
-    for (let i = 0; i < stmts.length; i += WRITE_BATCH) {
-      await env.DB.batch(stmts.slice(i, i + WRITE_BATCH));
+  try {
+    if (opts.recordingFailed) return; // incomplete measurement cannot reconcile state
+    for (const [username, msg] of desired) {
+      await reconcileReviewAlert(env, {
+        username,
+        source,
+        conditionKey: conditionForUser(username),
+        message: msg,
+        severity: "warning",
+        observedAt: opts.observedAt,
+      });
+    }
+    // Fan-out recipients whose conflicts resolved are transitioned too;
+    // dismissed standing rows are marked resolved as well, so a later
+    // recurrence can mint a fresh transition without resurrecting this one.
+    const desiredUsers = new Set(desired.keys());
+    for (const username of await activeReviewAlertUsernames(env, source)) {
+      if (!desiredUsers.has(username)) await resolveReviewAlert(env, source, undefined, username, opts.observedAt);
     }
   } catch (e) {
     console.error("verseMergeConflicts: alert write failed", {
