@@ -214,6 +214,25 @@ export interface StepResult {
   prReason: string | null;
 }
 
+// Tally per-book reimport outcomes for the run's terminal ledger (#833 review):
+// success = clean sync, skip = deferred (lock / id-block, retried next run),
+// failure = a real error (a thrown/errored write that left D1 stale). Only
+// failure gates the run's completed_with_failures status; skip is neither green
+// nor red.
+function summarizeReimport(
+  outcomes: Array<{ status: "success" | "skip" | "failure" }>,
+): { successCount: number; skipCount: number; failureCount: number } {
+  let successCount = 0;
+  let skipCount = 0;
+  let failureCount = 0;
+  for (const o of outcomes) {
+    if (o.status === "failure") failureCount++;
+    else if (o.status === "skip") skipCount++;
+    else successCount++;
+  }
+  return { successCount, skipCount, failureCount };
+}
+
 const isResource = (s: string): s is Resource => (ALL_RESOURCES as string[]).includes(s);
 
 export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
@@ -335,7 +354,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     instanceId: string;
     totalSteps: number;
     results: StepResult[];
-    reimport: { successCount: number; failureCount: number };
+    reimport: { successCount: number; skipCount: number; failureCount: number };
   }> {
     const params = event.payload ?? {};
 
@@ -427,7 +446,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // is caught below and never reaches the export results, so without this the
     // ledger would report a clean "completed" and the dashboard's Items/Failed
     // columns (derived from item_terminal events) would show 0/0.
-    const reimportOutcomes: Array<{ book: string; ok: boolean }> = [];
+    const reimportOutcomes: Array<{ book: string; status: "success" | "skip" | "failure" }> = [];
     if (dcsAllowed || params.reimportOnly) {
       // Scope the reimport to `resources` when the caller named specific ones
       // (the admin "Pull from Door43" control), else fall back to the
@@ -452,14 +471,27 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
           });
-          // runChunkedReimport can catch a correctness-bearing write failure
-          // internally — it sets totals.apply_incomplete (a batch that threw) or
-          // pushes to totals.errors and withholds the sync watermark, yet
-          // resolves normally. Count that as a failed self-heal item, not a
-          // clean one, so a reimport-only run isn't reported green when a write
-          // actually failed (#833 review).
-          const reimportOk = !(res.totals.apply_incomplete || res.totals.errors.length > 0);
-          reimportOutcomes.push({ book, ok: reimportOk });
+          // runChunkedReimport resolves normally in three distinct outcomes and
+          // the ledger must tell them apart (#833 review):
+          //   • FAILURE — a correctness-bearing write batch threw
+          //     (totals.apply_incomplete) or a batch errored (totals.errors);
+          //     D1 is stale and the watermark withheld: a real failed heal.
+          //   • SKIP — the sync was DEFERRED, not broken: a pipeline lock held
+          //     the chapter (chapters_locked / prune_locked / skipped_locked) or
+          //     an id conflict blocked a row (conflict_skipped / tombstone_
+          //     blocked). The watermark is withheld and the next run retries;
+          //     the export freshness gate keeps stale D1 off master meanwhile.
+          //     Healthy — flagging it a FAILURE would be false-RED noise, but
+          //     reporting it a SUCCESS would overstate the heal.
+          //   • SUCCESS — a clean, fully-applied sync.
+          const t = res.totals;
+          const status: "success" | "skip" | "failure" =
+            t.apply_incomplete || t.errors.length > 0
+              ? "failure"
+              : t.chapters_locked || t.prune_locked || t.skipped_locked || t.conflict_skipped || t.tombstone_blocked
+                ? "skip"
+                : "success";
+          reimportOutcomes.push({ book, status });
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
           // this book's D1 is now possibly stale relative to master. The
@@ -467,7 +499,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // commit a stale render, so a failed sync no longer reverts master —
           // it just skips this book's export until a later sync succeeds. Alert
           // so the failure is visible rather than silently swallowed.
-          reimportOutcomes.push({ book, ok: false });
+          reimportOutcomes.push({ book, status: "failure" });
           const msg = e instanceof Error ? e.message : String(e);
           console.error("export pre-reimport failed", { book, error: msg });
           try {
@@ -557,7 +589,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
               eventKey: syncRunEventKey(workflowRunId, "item_terminal", o.book),
               eventType: "item_terminal",
               occurredAt: Date.now(),
-              status: o.ok ? "success" : "failure",
+              status: o.status,
               book: o.book,
               details: { reimportOnly: true },
             }),
@@ -569,12 +601,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           });
         }
       }
-      const failureCount = reimportOutcomes.filter((o) => !o.ok).length;
       return {
         instanceId,
         totalSteps: 0,
         results: [],
-        reimport: { successCount: reimportOutcomes.length - failureCount, failureCount },
+        reimport: summarizeReimport(reimportOutcomes),
       };
     }
 
@@ -708,15 +739,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       console.error("export lint-escalate failed", { error: e instanceof Error ? e.message : String(e) });
     }
 
-    const reimportFailureCount = reimportOutcomes.filter((o) => !o.ok).length;
     return {
       instanceId,
       totalSteps: results.length,
       results,
-      reimport: {
-        successCount: reimportOutcomes.length - reimportFailureCount,
-        failureCount: reimportFailureCount,
-      },
+      reimport: summarizeReimport(reimportOutcomes),
     };
   }
 
