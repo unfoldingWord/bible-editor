@@ -25,6 +25,7 @@ export const TA_SUPPORT_REFERENCE_IDS: string[] = [
   "figs-events",
   "figs-exclamations",
   "figs-exclusive",
+  "figs-exmetaphor",
   "figs-explicit",
   "figs-explicitinfo",
   "figs-extrainfo",

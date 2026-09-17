@@ -305,6 +305,27 @@ export async function fileHeadCommit(
   }
 }
 
+// Latest commit SHA on a repo's master branch, regardless of which file it
+// touched. The dcs_commits ledger is repo-scoped, so a file-head probe cannot
+// establish that its high-water mark is current when another file changed last.
+// Callers use null as an explicit fail-closed result.
+export async function repoHeadCommitSha(env: Env, repo: string): Promise<string | null> {
+  const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+  const url =
+    `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
+    `/commits?sha=master&limit=1&stat=false&verification=false&files=false`;
+  try {
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
+    const r = await fetch(url, { headers });
+    if (!r.ok) return null;
+    const commits = (await r.json()) as Array<Record<string, unknown>>;
+    return typeof commits[0]?.sha === "string" ? commits[0].sha : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Master commit lineage (issue #540 item 1) ───────────────────────────────
 //
 // fileCommitSha above asks the same endpoint for the newest sha and throws the
@@ -502,12 +523,32 @@ export async function listMasterCommitsSince(
       if (sinceTime == null) {
         // EXCLUSIVE: sinceSha is the ancestor itself, already accounted for.
         if (sha === sinceSha) return { commits: out, incomplete: false, incompleteReason: "" };
+        // Repo-ledger polls request file metadata. They also need an exact
+        // landing time for every row: a later ledger read is time-bounded, so
+        // storing an author-date fallback here could hide a newly-landed,
+        // backdated human commit. Live SHA-bounded callers that do not build
+        // the ledger retain their historical behavior.
+        if (opts.files === true) {
+          const at = typeof committer.date === "string" ? Date.parse(committer.date) : NaN;
+          if (!Number.isFinite(at)) {
+            return { commits: out, incomplete: true, incompleteReason: "commit_committer_time_unknown" };
+          }
+        }
       } else {
         // The first commit STRICTLY older than the watermark is the far side of
-        // the range; everything above it is in. A date we cannot parse does not
-        // end the walk — an unreadable timestamp is not evidence that we have
-        // gone far enough, and walking on costs at most one more page.
-        const at = typeof author.date === "string" ? Date.parse(author.date) : NaN;
+        // the range; everything above it is in. Use COMMITTER date here: this
+        // walk is about when a change landed on master, and a rebased or
+        // cherry-picked commit can carry an author date older than the entire
+        // ledger window.
+        // A time-bounded ledger walk must know when every included commit
+        // landed. The author date is not an equivalent boundary: rebases and
+        // cherry-picks deliberately preserve it. Missing or malformed
+        // committer metadata is therefore an uncovered range, not a reason
+        // to keep walking and later claim a complete answer.
+        const at = typeof committer.date === "string" ? Date.parse(committer.date) : NaN;
+        if (!Number.isFinite(at)) {
+          return { commits: out, incomplete: true, incompleteReason: "commit_committer_time_unknown" };
+        }
         if (Number.isFinite(at) && Math.floor(at / 1000) < sinceTime) {
           return { commits: out, incomplete: false, incompleteReason: "" };
         }
@@ -522,7 +563,29 @@ export async function listMasterCommitsSince(
       // `allParentShas` keeps every parent — a merge's second (and any further)
       // parent, discarded until issue #692 item 2 needed them to compute a gap
       // backfill's frontier correctly (see MasterCommit.allParentShas).
-      const parents = Array.isArray(raw.parents) ? (raw.parents as Array<Record<string, unknown>>) : [];
+      const rawParents = raw.parents;
+      // The poller needs every parent to compute a merge gap frontier. A
+      // missing array, or an array containing anything other than a usable
+      // parent object/SHA, must not collapse into [] — only an explicit [] is
+      // evidence that this commit is a root. Keep the older live callers'
+      // SHA-bounded behavior unchanged; they do not use parent metadata.
+      if (opts.files === true && !Array.isArray(rawParents)) {
+        return { commits: out, incomplete: true, incompleteReason: "commit_parents_unknown" };
+      }
+      const parents = Array.isArray(rawParents) ? (rawParents as Array<Record<string, unknown>>) : [];
+      if (opts.files === true) {
+        for (const parent of parents) {
+          if (
+            parent == null ||
+            typeof parent !== "object" ||
+            Array.isArray(parent) ||
+            typeof parent.sha !== "string" ||
+            parent.sha.trim() === ""
+          ) {
+            return { commits: out, incomplete: true, incompleteReason: "commit_parent_unknown" };
+          }
+        }
+      }
       const allParentShas = parents.map((p) => p?.sha).filter((s): s is string => typeof s === "string");
       const parentSha = allParentShas[0] ?? null;
       // Only present when the caller asked (`files: true`); `null` distinguishes
@@ -689,7 +752,44 @@ export async function fetchHumanTouchedRefs(
       parts.push({ complete: false, refs: [], reason: "revision_fetch_failed" });
       break;
     }
-    const mapped = isUsfm ? refsTouchedInUsfm(text, parsed.hunks) : refsTouchedInTsv(text, parsed.hunks);
+    // Protect both sides of a ref move. Mapping only the new side misses the
+    // old row when a human moves it and a later commit moves it back; that can
+    // make the lineage look unrelated to the row the merge is deciding about.
+    // The old side is mapped against the parent revision, whose line numbers
+    // are the old ranges from this exact diff. A missing parent is incomplete
+    // whenever the diff has old-side lines; only a root-file creation (all
+    // old-side ranges are zero) can be mapped without a parent revision.
+    const newMapped = isUsfm ? refsTouchedInUsfm(text, parsed.hunks) : refsTouchedInTsv(text, parsed.hunks);
+    if (newMapped.complete !== true) {
+      parts.push(newMapped);
+      break;
+    }
+    let oldMapped: HumanRefEvidence = { complete: true, refs: [], reason: "" };
+    const needsOld = parsed.hunks.some((h) => h.oldCount > 0);
+    if (needsOld) {
+      const parent = typeof c.parentSha === "string" ? c.parentSha.toLowerCase() : "";
+      if (!FULL_SHA_RE.test(parent)) {
+        parts.push({ complete: false, refs: [], reason: "parent_revision_unavailable" });
+        break;
+      }
+      const oldText = await fetchCappedText(env, dcsRawUrl(env, repo, path, parent), MAX_REVISION_FILE_BYTES);
+      if (oldText == null) {
+        parts.push({ complete: false, refs: [], reason: "parent_revision_fetch_failed" });
+        break;
+      }
+      const oldHunks = parsed.hunks.map((h) => ({
+        newStart: h.oldStart,
+        newCount: h.oldCount,
+        oldStart: h.oldStart,
+        oldCount: h.oldCount,
+      }));
+      oldMapped = isUsfm ? refsTouchedInUsfm(oldText, oldHunks) : refsTouchedInTsv(oldText, oldHunks);
+      if (oldMapped.complete !== true) {
+        parts.push(oldMapped);
+        break;
+      }
+    }
+    const mapped = mergeRefEvidence([newMapped, oldMapped]);
     parts.push(mapped);
     if (mapped.complete !== true) break;
   }

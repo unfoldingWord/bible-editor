@@ -43,6 +43,7 @@ import {
   applyTsvRows,
   applyVerseRowsForTest,
   clearResolvedMergeNoBaseForTest,
+  getMasterConfirmedAtForTest,
   recordResourceSync,
   recordWithheldSyncIfAbsent,
   retireMergeKeptFlags,
@@ -134,7 +135,11 @@ const giteaPage = (commits) => async () => ({
   json: async () =>
     commits.map((c) => ({
       sha: c.sha,
-      commit: { message: c.message, author: { email: c.authorEmail, name: c.authorName, date: c.date } },
+      commit: {
+        message: c.message,
+        author: { email: c.authorEmail, name: c.authorName, date: c.date },
+        committer: { date: c.committerDate ?? c.date },
+      },
     })),
 });
 // Every clear that reaches its write now re-reads master's tip first and abandons
@@ -1429,8 +1434,25 @@ console.log("\n[(e) a RECOVERED resource clears its stale reimport_id_blocked al
   const raced = withReclaimRace(env, sqlite, BOOK, ID);
   const staleCounts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
   await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", staleCounts);
+  const firstAlert = sqlite
+    .prepare(`SELECT id, condition_key FROM system_alerts WHERE source = ? ORDER BY id DESC LIMIT 1`)
+    .get(`reimport_id_blocked:${BOOK}:tq`);
+  // Counts and samples are volatile detail, not a new blocked episode.
+  await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", { ...staleCounts, tombstone_blocked: 2 });
+  const refreshedAlert = sqlite
+    .prepare(`SELECT id, condition_key FROM system_alerts WHERE source = ? ORDER BY id DESC LIMIT 1`)
+    .get(`reimport_id_blocked:${BOOK}:tq`);
+  eq(refreshedAlert.id, firstAlert.id, "a changed blocked-row count refreshes the same alert episode");
+  eq(refreshedAlert.condition_key, firstAlert.condition_key, "the tombstone condition key excludes volatile counts");
+  sqlite.prepare(`UPDATE system_alerts SET dismissed_at = 123 WHERE id = ?`).run(firstAlert.id);
+  await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", { ...staleCounts, tombstone_blocked: 3 });
+  const dismissed = sqlite
+    .prepare(`SELECT dismissed_at, resolved_at FROM system_alerts WHERE id = ?`)
+    .get(firstAlert.id);
+  eq(dismissed.dismissed_at, 123, "a dismissed blocked episode stays dismissed when its count changes");
+  eq(dismissed.resolved_at, null, "a still-measured blocked episode remains unresolved until clean");
   const before = sqlite
-    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND resolved_at IS NULL`)
     .all(`reimport_id_blocked:${BOOK}:tq`)[0];
   eq(Number(before.n), 1, "sanity: the stale alert exists before recovery");
 
@@ -1446,12 +1468,16 @@ console.log("\n[(e) a RECOVERED resource clears its stale reimport_id_blocked al
   await clearTombstoneBlockAlertForTest(env, BOOK, "tq");
 
   const after = sqlite
-    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL AND resolved_at IS NULL`)
     .all(`reimport_id_blocked:${BOOK}:tq`)[0];
   eq(Number(after.n), 0, "the recovered resource's alert is cleared");
+  const history = sqlite
+    .prepare(`SELECT resolved_at FROM system_alerts WHERE id = ?`)
+    .get(firstAlert.id);
+  eq(history.resolved_at != null, true, "clean recovery resolves the dismissed row without deleting history");
 
   const otherStillOpen = sqlite
-    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL AND resolved_at IS NULL`)
     .all(`reimport_id_blocked:AMO:tn`)[0];
   eq(Number(otherStillOpen.n), 1, "a DIFFERENT (book, resource)'s alert is untouched — clearing is scoped, not a blanket wipe");
 
@@ -3734,6 +3760,55 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
   }
 }
 
+console.log("\n[#790 confirmed-render source: exact boundary, R2 first, full-blob fallback]");
+{
+  const { sqlite, env } = freshEnv();
+  const SHA = "1234567890abcdef1234567890abcdef12345678";
+  const KEY = "exports/run/1CH/ult/13-1CH.usfm";
+  const USFM = "\\id 1CH\n\\usfm 3.0\n\n\\c 7\n\\p\n\\v 3 published ancestor\n";
+  sqlite.prepare(
+    `INSERT INTO book_resource_syncs
+       (book, resource, source_sha, origin, master_confirmed_at, master_confirmed_edit_id,
+        pushed_blob_sha, pushed_read_at, pushed_edit_id, pushed_r2_key)
+     VALUES (?, 'ult', 'master', 'reimport', 500, 77, ?, 500, 77, ?)`,
+  ).run(BOOK, SHA, KEY);
+  let r2Reads = 0;
+  env.BLOBS = {
+    get: async (key) => {
+      r2Reads++;
+      return key === KEY ? { text: async () => USFM } : null;
+    },
+  };
+  const fromR2 = await getMasterConfirmedAtForTest(env, BOOK, "ult", true);
+  eq(fromR2.confirmedAt, 500, "confirmed time is returned");
+  eq(fromR2.editId, 77, "confirmed edit boundary is returned");
+  eq(JSON.stringify(JSON.parse(fromR2.confirmedVerseBases.get("7:3"))).includes("published ancestor"), true,
+    "the exact confirmed R2 render is parsed into a verse ancestor");
+  eq(r2Reads, 1, "R2 is preferred and read once");
+
+  sqlite.prepare(`UPDATE book_resource_syncs SET master_confirmed_edit_id = 76 WHERE book = ? AND resource = 'ult'`).run(BOOK);
+  const mismatch = await getMasterConfirmedAtForTest(env, BOOK, "ult", true);
+  eq(mismatch.confirmedVerseBases, null, "a pushed/confirmed boundary mismatch refuses the artifact");
+  eq(r2Reads, 1, "…without even reading R2");
+
+  sqlite.prepare(
+    `UPDATE book_resource_syncs SET master_confirmed_edit_id = 77, pushed_r2_key = 'missing' WHERE book = ? AND resource = 'ult'`,
+  ).run(BOOK);
+  const realFetch = globalThis.fetch;
+  let blobUrl = "";
+  globalThis.fetch = async (url) => {
+    blobUrl = String(url);
+    return { ok: true, json: async () => ({ encoding: "base64", content: btoa(USFM) }) };
+  };
+  try {
+    const fromBlob = await getMasterConfirmedAtForTest(env, BOOK, "ult", true);
+    eq(fromBlob.confirmedVerseBases.has("7:3"), true, "a missing R2 object falls back to the pushed git blob");
+    eq(blobUrl.endsWith(`/git/blobs/${SHA}`), true, "the fallback requests the full 40-character blob id");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 console.log("\n[own-publish decline accounting: measured at the merge commit, real SQL, mocked Gitea]");
 {
   // PROD SHAPE (JER tq, 2026-09-01/02): our nightly push merges at ~05:40Z, the
@@ -3741,6 +3816,7 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
   // morning's byte comparison declines. The blind counter had reached 3 and raised
   // the "cannot tell them apart" banner. Here the same night is measured.
   const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000;
+  const PUSHED_EDIT_ID = 77;
   const PUSHED = "ba421e896eab0000000000000000000000000000";
   const OUR_MERGE = { sha: "22d652732b18", message: "bible-editor: JER tq → master (#859)", authorEmail: "b@x", authorName: "Benjamin Wright", date: "2026-09-01T05:38:03Z" };
   const BOT_PUSH = { sha: "863fbfa65119", message: "TQ: JER 10 [ju..7@api.bp-assistant]", authorEmail: "bot@bp-assistant", authorName: "BW Bot", date: "2026-09-01T23:49:46Z" };
@@ -3751,19 +3827,26 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
   const seedSync = (sqlite, declines, { prNumber = 859, prReadAt = READ_AT } = {}) => {
     sqlite
       .prepare(
-        `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number, pushed_pr_read_at)
-         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?, ?, ?)`,
+        `INSERT INTO book_resource_syncs
+           (book, resource, source_sha, origin, master_confirmed_at, master_confirmed_edit_id,
+            pushed_blob_sha, pushed_read_at, pushed_edit_id, own_publish_declines,
+            pushed_pr_number, pushed_pr_read_at)
+         VALUES (?, 'tq', 'sha0', 'reimport', 1000, 11, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(BOOK, PUSHED, READ_AT, declines, prNumber, prNumber == null ? null : prReadAt);
-    return { sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: READ_AT, pushedEditId: null, declines };
+      .run(BOOK, PUSHED, READ_AT, PUSHED_EDIT_ID, declines, prNumber, prNumber == null ? null : prReadAt);
+    return { sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: READ_AT, pushedEditId: PUSHED_EDIT_ID, declines };
   };
   const seedBanner = (sqlite) =>
     sqlite
       .prepare(`INSERT INTO system_alerts (username, severity, source, message) VALUES ('deferredreward', 'warning', ?, 'old blind banner')`)
       .run(SOURCE);
   const readState = (sqlite) => ({
-    declines: sqlite.prepare(`SELECT own_publish_declines AS d FROM book_resource_syncs WHERE book = ? AND resource = 'tq'`).get(BOOK).d,
-    banners: sqlite.prepare(`SELECT message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(SOURCE),
+    ...sqlite.prepare(
+      `SELECT own_publish_declines AS declines, master_confirmed_at AS confirmedAt,
+              master_confirmed_edit_id AS confirmedEditId, source_sha AS sourceSha, origin
+         FROM book_resource_syncs WHERE book = ? AND resource = 'tq'`,
+    ).get(BOOK),
+              banners: sqlite.prepare(`SELECT message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL AND resolved_at IS NULL`).all(SOURCE),
   });
   // A Gitea that serves the commit walk AND the merge commit's tree, counting each.
   const gitea = (commits, blobAtMerge) => {
@@ -3793,14 +3876,45 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
   {
     const { sqlite, env } = freshEnv();
     const sync = seedSync(sqlite, 3);
+    // A translator PATCH interleaved after the export read. The watermark must
+    // remain the pushed render's 77, never the current edit_log maximum (78).
+    sqlite.prepare(
+      `INSERT INTO edit_log (id, kind, row_key, book, action) VALUES (78, 'tq', 'late', ?, 'update')`,
+    ).run(BOOK);
     seedBanner(sqlite);
     const g = gitea([BOT_PUSH, OUR_MERGE], PUSHED);
     await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
     const s = readState(sqlite);
     eq(s.declines, 0, "merge blob == pushed blob resets the counter (the bot's push explains tonight's mismatch)");
     eq(s.banners.length, 0, "…and the standing banner comes down");
+    eq(s.confirmedAt, READ_AT, "complete human=0 lineage advances to the pushed render time");
+    eq(s.confirmedEditId, PUSHED_EDIT_ID, "…using the captured pushed edit id, not a concurrent edit_log id");
+    eq(s.sourceSha, "sha0", "…without claiming master's current tip was already synced");
+    eq(s.origin, "reimport", "…or misreporting the source watermark's origin");
     eq(g.calls.commits, 1, "with no lineage walk to reuse, one commit walk from pushed_read_at was fetched");
     eq(g.calls.trees, 1, "…and one tree read at the merge commit");
+  }
+
+  // (a2) Missing certainty never advances: an incomplete walk and a complete
+  //      walk containing a human commit both keep the old ancestor boundary.
+  for (const [label, walked] of [
+    ["incomplete", { commits: [BOT_PUSH, OUR_MERGE], incomplete: true, incompleteReason: "page_cap" }],
+    ["human", {
+      commits: [
+        { sha: "human123", message: "proofreader edit", authorEmail: "editor@example.com", authorName: "Editor", date: "2026-09-01T23:55:00Z" },
+        OUR_MERGE,
+      ],
+      incomplete: false,
+      incompleteReason: "",
+    }],
+  ]) {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    const g = gitea(walked.commits, PUSHED);
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, walked, sync));
+    const s = readState(sqlite);
+    eq(s.confirmedAt, 1000, `${label} lineage does not advance master_confirmed_at`);
+    eq(s.confirmedEditId, 11, `${label} lineage does not advance master_confirmed_edit_id`);
   }
 
   // (b) The same night with the lineage walk handed in: no second commit fetch.
