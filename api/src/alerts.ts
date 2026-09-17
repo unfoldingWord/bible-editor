@@ -29,14 +29,30 @@ alerts.get("/me", async (c) => {
   // that already happened as expected, with nothing for this user to decide —
   // it belongs in the admin panel's activity log (GET /api/admin/sync-activity),
   // not this personal banner feed.
-  const rs = await c.env.DB.prepare(
-    `SELECT id, severity, source, message, link_url, created_at
-       FROM system_alerts
-      WHERE username = ?1 AND dismissed_at IS NULL AND kind = 'review'
-      ORDER BY created_at DESC`,
-  )
-    .bind(username)
-    .all<AlertRow>();
+  let rs;
+  try {
+    rs = await c.env.DB.prepare(
+      `SELECT id, severity, source, message, link_url, created_at
+         FROM system_alerts
+        WHERE username = ?1 AND dismissed_at IS NULL AND resolved_at IS NULL AND kind = 'review'
+        ORDER BY created_at DESC`,
+    )
+      .bind(username)
+      .all<AlertRow>();
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error);
+    if (!/no such column|has no column named/i.test(text) || !/resolved_at/i.test(text)) throw error;
+    // The Worker can become live moments before migration 0066 reaches D1.
+    // Keep the existing feed available during that rolling-deploy window.
+    rs = await c.env.DB.prepare(
+      `SELECT id, severity, source, message, link_url, created_at
+         FROM system_alerts
+        WHERE username = ?1 AND dismissed_at IS NULL AND kind = 'review'
+        ORDER BY created_at DESC`,
+    )
+      .bind(username)
+      .all<AlertRow>();
+  }
   // `source` lets the SPA route comment mentions/replies to the small top-right
   // notifications menu instead of the full-width banner (issues #385/#441).
   const list = (rs.results ?? []).map((r) => ({

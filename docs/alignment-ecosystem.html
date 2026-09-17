@@ -1,0 +1,1375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>unfoldingWord Alignment Stack</title>
+<style>
+  :root {
+    color-scheme: light;
+
+    /* unfoldingWord brand */
+    --ocean:     #014263;
+    --inspire:   #31ADE3;
+    --cultivate: #70C9CC;
+    --kindle:    #E59D33;
+    --tech:      #231F20;
+
+    /* surfaces — neutrals biased toward Ocean */
+    --bg:        #F7F9FB;
+    --surface:   #FFFFFF;
+    --surface-2: #EDF2F6;
+    --rule:      #D4DEE6;
+    --rule-soft: #E4EBF1;
+
+    /* text */
+    --ink:       #1B2227;
+    --ink-2:     #47606F;
+    --ink-3:     #6F8595;
+
+    /* semantic (separate from the accent) */
+    --good:      #1E7A54;
+    --good-bg:   #E4F3EC;
+    --warn:      #A4691A;
+    --warn-bg:   #FBF0DC;
+    --crit:      #A42B2B;
+    --crit-bg:   #F8E6E6;
+
+    --code-bg:   #EEF3F7;
+    --code-ink:  #0E3A52;
+
+    --shadow: 0 1px 2px rgba(1,66,99,.06), 0 8px 24px -12px rgba(1,66,99,.18);
+
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg:        #0C1419;
+      --surface:   #121D24;
+      --surface-2: #17242D;
+      --rule:      #263945;
+      --rule-soft: #1E2E38;
+      --ink:       #E4EDF3;
+      --ink-2:     #A3BCCB;
+      --ink-3:     #7A94A4;
+      --ocean:     #58A9CE;
+      --good:      #59C494;
+      --good-bg:   #10261E;
+      --warn:      #E3A94E;
+      --warn-bg:   #2B2013;
+      --crit:      #E88080;
+      --crit-bg:   #2B1616;
+      --code-bg:   #0E1A21;
+      --code-ink:  #9BD2EC;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.7);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg:        #0C1419;
+    --surface:   #121D24;
+    --surface-2: #17242D;
+    --rule:      #263945;
+    --rule-soft: #1E2E38;
+    --ink:       #E4EDF3;
+    --ink-2:     #A3BCCB;
+    --ink-3:     #7A94A4;
+    --ocean:     #58A9CE;
+    --good:      #59C494;
+    --good-bg:   #10261E;
+    --warn:      #E3A94E;
+    --warn-bg:   #2B2013;
+    --crit:      #E88080;
+    --crit-bg:   #2B1616;
+    --code-bg:   #0E1A21;
+    --code-ink:  #9BD2EC;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.7);
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+  }
+  img { max-width: 100%; }
+
+  .wrap {
+    max-width: 62rem;
+    margin: 0 auto;
+    padding-inline: 20px;
+    padding-block: 0 5rem;
+  }
+
+  /* ---------- masthead ---------- */
+  .masthead {
+    border-bottom: 1px solid var(--rule);
+    background:
+      linear-gradient(180deg, color-mix(in srgb, var(--inspire) 9%, transparent), transparent 70%),
+      var(--surface);
+  }
+  .masthead .wrap { padding-block: 3.25rem 2.5rem; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: .72rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--ocean);
+    margin: 0 0 1rem;
+  }
+  h1 {
+    font-family: var(--serif);
+    font-weight: 600;
+    font-size: clamp(2.1rem, 5.5vw, 3.4rem);
+    line-height: 1.08;
+    letter-spacing: -.015em;
+    margin: 0 0 1rem;
+    text-wrap: balance;
+  }
+  .standfirst {
+    font-size: clamp(1.02rem, 2.2vw, 1.18rem);
+    color: var(--ink-2);
+    max-width: 44em;
+    margin: 0 0 1.75rem;
+  }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: .5rem 1.5rem;
+    font-family: var(--mono); font-size: .76rem; color: var(--ink-3);
+    padding-top: 1.25rem; border-top: 1px solid var(--rule-soft);
+  }
+  .meta b { color: var(--ink-2); font-weight: 600; }
+
+  /* ---------- sections ---------- */
+  section { padding-top: 3.5rem; scroll-margin-top: 1rem; }
+  h2 {
+    font-family: var(--serif);
+    font-size: clamp(1.5rem, 3.4vw, 2rem);
+    font-weight: 600;
+    line-height: 1.15;
+    letter-spacing: -.01em;
+    margin: 0 0 .35rem;
+    text-wrap: balance;
+  }
+  h2 .num {
+    font-family: var(--mono);
+    font-size: .68em;
+    color: var(--inspire);
+    font-weight: 500;
+    margin-right: .6em;
+    letter-spacing: 0;
+  }
+  h3 {
+    font-size: 1.06rem; font-weight: 700; letter-spacing: -.005em;
+    margin: 2.25rem 0 .5rem; color: var(--ink);
+  }
+  h4 {
+    font-family: var(--mono); font-size: .76rem; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-3);
+    margin: 1.75rem 0 .5rem;
+  }
+  .lede { color: var(--ink-2); max-width: 44em; margin: 0 0 1.5rem; }
+  p { max-width: 44em; }
+  section > p, section > ul, section > ol { margin-block: 0 1rem; }
+  ul, ol { padding-left: 1.25rem; }
+  li { margin-bottom: .45rem; max-width: 44em; }
+  a { color: var(--ocean); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--inspire); outline-offset: 2px; border-radius: 3px; }
+  hr.div { border: 0; border-top: 1px solid var(--rule-soft); margin: 3rem 0 0; }
+
+  code {
+    font-family: var(--mono); font-size: .855em;
+    background: var(--code-bg); color: var(--code-ink);
+    padding: .1em .38em; border-radius: 3px;
+    overflow-wrap: anywhere;
+  }
+  pre {
+    background: var(--code-bg); color: var(--code-ink);
+    border: 1px solid var(--rule-soft); border-left: 3px solid var(--inspire);
+    border-radius: 4px; padding: 1rem 1.1rem; margin: 1rem 0;
+    overflow-x: auto; font-size: .82rem; line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; font-size: 1em; }
+  .cite {
+    display: block; font-family: var(--mono); font-size: .72rem;
+    color: var(--ink-3); margin-top: .4rem;
+  }
+
+  /* ---------- tables ---------- */
+  .scroller { overflow-x: auto; margin: 1.25rem 0 1.5rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: .87rem; min-width: 40rem; }
+  th, td { text-align: left; padding: .65rem .85rem; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+  thead th {
+    background: var(--surface-2); color: var(--ink-2);
+    font-family: var(--mono); font-size: .7rem; letter-spacing: .07em;
+    text-transform: uppercase; font-weight: 600; white-space: nowrap;
+    position: sticky; top: 0;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody th { font-weight: 650; color: var(--ink); white-space: nowrap; }
+  td.num, th.num { font-variant-numeric: tabular-nums; }
+
+  /* ---------- system identity ---------- */
+  .sys { display: inline-flex; align-items: center; gap: .4em; white-space: nowrap; font-weight: 600; }
+  .sys::before { content: ""; width: .58em; height: .58em; border-radius: 2px; flex: none; background: var(--dot, var(--ink-3)); }
+  .s-tc3  { --dot: #8E6BB5; }
+  .s-ge   { --dot: var(--kindle); }
+  .s-tc4  { --dot: var(--cultivate); }
+  .s-be   { --dot: var(--inspire); }
+
+  /* ---------- profile cards ---------- */
+  .profiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+  .profile {
+    background: var(--surface); border: 1px solid var(--rule);
+    border-top: 3px solid var(--dot, var(--inspire));
+    border-radius: 6px; padding: 1.1rem 1.15rem 1.2rem;
+    display: flex; flex-direction: column; gap: .5rem;
+  }
+  .profile.p-tc3 { --dot: #8E6BB5; }
+  .profile.p-ge  { --dot: var(--kindle); }
+  .profile.p-tc4 { --dot: var(--cultivate); }
+  .profile.p-be  { --dot: var(--inspire); }
+  .profile h3 { margin: 0; font-size: 1.02rem; }
+  .profile .repo { font-family: var(--mono); font-size: .71rem; color: var(--ink-3); word-break: break-all; }
+  .profile dl { margin: .35rem 0 0; display: grid; grid-template-columns: max-content 1fr; gap: .3rem .7rem; font-size: .83rem; }
+  .profile dt { font-family: var(--mono); font-size: .68rem; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); padding-top: .18em; }
+  .profile dd { margin: 0; color: var(--ink-2); }
+
+  /* ---------- callouts ---------- */
+  .note {
+    border-radius: 5px; padding: .9rem 1.1rem; margin: 1.25rem 0;
+    border: 1px solid var(--rule); background: var(--surface-2);
+    font-size: .92rem;
+  }
+  .note > :first-child { margin-top: 0; }
+  .note > :last-child { margin-bottom: 0; }
+  .note p { max-width: none; }
+  .note.warn { background: var(--warn-bg); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+  .note.crit { background: var(--crit-bg); border-color: color-mix(in srgb, var(--crit) 35%, transparent); }
+  .note.good { background: var(--good-bg); border-color: color-mix(in srgb, var(--good) 35%, transparent); }
+  .note .tag {
+    display: block; font-family: var(--mono); font-size: .68rem;
+    letter-spacing: .1em; text-transform: uppercase; margin-bottom: .4rem; font-weight: 600;
+  }
+  .note.warn .tag { color: var(--warn); }
+  .note.crit .tag { color: var(--crit); }
+  .note.good .tag { color: var(--good); }
+  .note:not(.warn):not(.crit):not(.good) .tag { color: var(--ink-3); }
+
+  /* ---------- verdict pills ---------- */
+  .pill {
+    display: inline-block; font-family: var(--mono); font-size: .67rem;
+    letter-spacing: .06em; text-transform: uppercase; font-weight: 600;
+    padding: .12em .5em; border-radius: 3px; white-space: nowrap;
+  }
+  .pill.v  { background: var(--good-bg); color: var(--good); }
+  .pill.w  { background: var(--warn-bg); color: var(--warn); }
+  .pill.x  { background: var(--crit-bg); color: var(--crit); }
+  .pill.n  { background: var(--surface-2); color: var(--ink-3); }
+
+  /* ---------- recommendation list ---------- */
+  .recs { list-style: none; padding: 0; margin: 1.5rem 0; display: flex; flex-direction: column; gap: 1rem; }
+  .recs > li {
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 1.1rem 1.2rem; margin: 0; max-width: none;
+    display: grid; grid-template-columns: 2.4rem 1fr; gap: .1rem 1rem; align-items: start;
+  }
+  .recs .rank {
+    font-family: var(--mono); font-size: 1.5rem; font-weight: 600;
+    color: var(--inspire); line-height: 1.1; grid-row: 1 / span 3;
+    font-variant-numeric: tabular-nums;
+  }
+  .recs h3 { margin: 0 0 .3rem; font-size: 1rem; }
+  .recs p { margin: 0 0 .5rem; font-size: .93rem; max-width: 46em; }
+  .recs .why { font-size: .85rem; color: var(--ink-2); margin: 0; }
+  .recs .why b { color: var(--ink); }
+
+  /* ---------- toc ---------- */
+  .toc {
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 1.1rem 1.25rem; margin: 2.5rem 0 0; box-shadow: var(--shadow);
+  }
+  .toc h4 { margin-top: 0; }
+  .toc ol { margin: 0; padding-left: 1.4rem; columns: 2; column-gap: 2rem; font-size: .9rem; }
+  .toc li { margin-bottom: .35rem; break-inside: avoid; }
+  @media (max-width: 560px) { .toc ol { columns: 1; } }
+
+  footer {
+    margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--rule);
+    font-size: .82rem; color: var(--ink-3);
+  }
+  footer p { max-width: 46em; }
+
+  @media print {
+    body { background: #fff; }
+    .toc, .scroller { box-shadow: none; }
+    section { page-break-inside: auto; }
+  }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <p class="eyebrow">bible-editor · docs · research</p>
+    <h1>unfoldingWord Alignment Stack</h1>
+    <p class="standfirst">
+      Four generations of word-alignment software, read side by side: translationCore&nbsp;3,
+      gateway-edit, translationCore&nbsp;4, and this repository. What each one stores, what each
+      one does when a translator edits an aligned verse, and what bible-editor should take from them.
+    </p>
+    <div class="meta">
+      <span><b>Prepared</b> 2026-09-16</span>
+      <span><b>Method</b> direct source reading, 9 repositories</span>
+      <span><b>Status</b> research only — no code changed</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <nav class="toc" aria-label="Contents">
+    <h4>Contents</h4>
+    <ol>
+      <li><a href="#answer">The short answer</a></li>
+      <li><a href="#substrate">The shared substrate</a></li>
+      <li><a href="#systems">The four systems</a></li>
+      <li><a href="#matrix">Comparison matrix</a></li>
+      <li><a href="#edits">What happens when text is edited</a></li>
+      <li><a href="#suggestions">Suggestion engines</a></li>
+      <li><a href="#complete">Completeness and validation</a></li>
+      <li><a href="#guards">Data-loss guards</a></li>
+      <li><a href="#ui">Interaction models</a></li>
+      <li><a href="#tests">Test posture</a></li>
+      <li><a href="#adopt">What to adopt</a></li>
+      <li><a href="#reject">What not to adopt</a></li>
+      <li><a href="#limits">Limits of this review</a></li>
+      <li><a href="#sources">Source index</a></li>
+    </ol>
+  </nav>
+
+  <!-- ================================================================= -->
+  <section id="answer">
+    <h2><span class="num">01</span>The short answer</h2>
+
+    <p class="lede">
+      Every unfoldingWord aligner ever shipped identifies a word by the triple
+      <code>(text, occurrence, occurrences)</code>. That single choice determines everything else,
+      because <code>occurrences</code> is a verse-global count: typing one extra <em>the</em> rewrites
+      the identity of every other <em>the</em> in the verse. All four systems are, at bottom, four
+      different answers to the damage that causes.
+    </p>
+
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr><th>System</th><th>Answer to “the verse text changed”</th><th>Consequence for the translator</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th><span class="sys s-tc3">translationCore&nbsp;3</span></th>
+            <td><b>Detect and reset.</b> The library refuses to merge and throws <code>InvalidatedAlignments</code>; the tool attempts a position remap but still flags the verse invalid and clears “complete”.</td>
+            <td>Broken-chain icon; verse must be revisited. At export, unresolvable verses are blank-reset one at a time, with consent.</td>
+          </tr>
+          <tr>
+            <th><span class="sys s-ge">gateway-edit</span></th>
+            <td><b>Diff, renumber, and flatten on failure.</b> A sequential word diff renumbers occurrences; if anything throws, the verse USFM is replaced wholesale with plain text.</td>
+            <td>Alignment silently disappears. The caller receives no signal that it happened.</td>
+          </tr>
+          <tr>
+            <th><span class="sys s-tc4">translationCore&nbsp;4</span></th>
+            <td><b>Reflow what survives, invalidate the rest.</b> Links whose <code>word+occurrence</code> survives are kept and renumbered; anything else leaves the record untouched and marked stale.</td>
+            <td>Honest: the record is preserved but marked not-valid. No link is ever invented.</td>
+          </tr>
+          <tr>
+            <th><span class="sys s-be">bible-editor</span></th>
+            <td><b>Repair in place, five tiers, fail closed.</b> Alignment lives inside the verse tree and is rewritten locally; if no tier can prove the result, the save is refused.</td>
+            <td>Alignment usually survives an edit untouched. When it cannot, the save is blocked rather than silently lossy.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note good">
+      <span class="tag">Headline</span>
+      <p>
+        bible-editor’s edit engine is the strongest of the four on the axis that matters most —
+        preserving alignment through an ordinary text edit — and it is the only one of the four with
+        a <em>save guard</em> that refuses a lossy write on both client and server. Where it is
+        behind is suggestions (gateway-edit and tc4 run a trained statistical model; we run
+        precomputed frequency tables) and translator-asserted completeness (tc4 has an explicit
+        “done” flag; we infer completeness from an empty word bank, which tc4 abandoned for cause).
+      </p>
+    </div>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="substrate">
+    <h2><span class="num">02</span>The shared substrate</h2>
+
+    <p class="lede">
+      All four systems read and write the same wire format and share the same word-identity model.
+      The differences are entirely in what they do between reading and writing.
+    </p>
+
+    <h3>USFM 3 milestones</h3>
+    <p>
+      Alignment on disk at Door43 is USFM 3 milestone markup: a <code>\zaln-s</code> milestone carries
+      the original-language word’s attributes (<code>x-strong</code>, <code>x-lemma</code>,
+      <code>x-morph</code>, <code>x-occurrence</code>, <code>x-occurrences</code>, <code>x-content</code>),
+      wraps one or more target-language <code>\w</code> words, and closes with <code>\zaln-e\*</code>.
+      Milestones nest, so a phrase aligned to a phrase is a chain of nested <code>\zaln-s</code> markers.
+      Non-contiguous alignment is expressed as repeated milestone pairs over the same source words.
+    </p>
+    <p>
+      Every system parses this with <code>usfm-js</code>. Three of the four then convert it into
+      something else in memory; only bible-editor keeps working on the milestone tree itself.
+    </p>
+
+    <h3>The identity triple, and why it is the root cause</h3>
+    <p>
+      A word is identified by its surface text, which instance of that text it is in the verse
+      (<code>occurrence</code>, 1-based), and how many instances exist
+      (<code>occurrences</code>). No system stores a stable token id.
+    </p>
+    <pre><code>// word-aligner: occurrence is clamped at tokenization time
+if (occurrence &gt; occurrences) occurrence = occurrences;</code></pre>
+    <span class="cite">word-aligner/src/js/utils/verseObjects.js:205</span>
+
+    <p>
+      Because <code>occurrences</code> is a verse-global count, inserting or deleting any duplicate of
+      a word rewrites the identity triple of every other instance of that word — including instances
+      the translator never touched. That is the structural reason edit-invalidation is so aggressive
+      across the whole family, and why every system needs some form of fuzzy re-matching.
+    </p>
+
+    <div class="note">
+      <span class="tag">Design observation</span>
+      <p>
+        tC3’s on-disk format stores <em>only</em> the triple — no positions — which forces a
+        position-recovery pass on every load, acknowledged in the tool’s own comment: “The pain point
+        here is due to the current alignment file format we cannot reliably assume token order.
+        Therefore we must include a frame of reference.”
+        <span class="cite">wordAlignment/src/state/actions/index.js:75-77</span>
+        tc4 has the same gap by choice; its own contract document lists “tC4 stores no token position”
+        as a known divergence from the RCL’s requirements. bible-editor sidesteps it: because the
+        milestones stay in the verse tree, position <em>is</em> the structure.
+      </p>
+    </div>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="systems">
+    <h2><span class="num">03</span>The four systems</h2>
+    <p class="lede">
+      Each is really a stack, and in three of the four cases the alignment logic lives in a different
+      repository from the application. Knowing where the logic actually is matters, because two of
+      these stacks resolve <em>different versions of the same helper module</em> with materially
+      different behavior.
+    </p>
+
+    <div class="profiles">
+      <article class="profile p-tc3">
+        <h3>translationCore 3</h3>
+        <p class="repo">unfoldingWord/translationCore @ 5729aa7b · v3.7.2</p>
+        <dl>
+          <dt>Shell</dt><dd>Electron desktop app</dd>
+          <dt>Host</dt><dd>Owns the on-disk format, USFM import/export, migrations, progress</dd>
+          <dt>Aligner</dt><dd><code>unfoldingWord/wordAlignment</code> git submodule (v1.0.0), mounted via <code>tc-tool</code></dd>
+          <dt>Core</dt><dd><code>word-aligner</code> — the tool pins 0.2.12; the host uses 1.1.1</dd>
+          <dt>At rest</dt><dd>Sidecar <code>alignmentData/&lt;BOOK&gt;/&lt;ch&gt;.json</code>, one file per chapter</dd>
+        </dl>
+      </article>
+
+      <article class="profile p-ge">
+        <h3>gateway-edit</h3>
+        <p class="repo">unfoldingWord/gateway-edit @ 293b9cd · v2.4.13</p>
+        <dl>
+          <dt>Shell</dt><dd>Next.js web app (also shipped as Electron)</dd>
+          <dt>Host</dt><dd>A thin host: a draggable dialog, a worker factory, and a config object</dd>
+          <dt>Aligner</dt><dd><code>word-aligner-rcl</code> 1.3.7 — UI and the edit-preservation engine</dd>
+          <dt>Engine</dt><dd><code>enhanced-word-aligner-rcl</code> 1.4.8 — wordMAP suggestions</dd>
+          <dt>At rest</dt><dd>Inline <code>\zaln</code> in USFM, committed to a DCS user branch</dd>
+        </dl>
+      </article>
+
+      <article class="profile p-tc4">
+        <h3>translationCore 4</h3>
+        <p class="repo">unfoldingWord/translationCore4 @ be5423c · v4.0.0-alpha.6</p>
+        <dl>
+          <dt>Shell</dt><dd>Vite + React web app, Scripture Burrito project layout</dd>
+          <dt>Aligner</dt><dd>Design-native — <code>src/views/Align.jsx</code>, no RCL embedded</dd>
+          <dt>Engine</dt><dd><code>uw-wordmapbooster</code> 1.0.5 in a browser Web Worker</dd>
+          <dt>At rest</dt><dd>Sidecar <code>checking/alignments/&lt;BOOK&gt;.json</code>, one per book, atop an event journal</dd>
+          <dt>Invariant</dt><dd><b>No <code>\zaln</code> at rest</b> — its host editor destroys milestone markup on save</dd>
+        </dl>
+      </article>
+
+      <article class="profile p-be">
+        <h3>bible-editor</h3>
+        <p class="repo">unfoldingWord/bible-editor — this repository</p>
+        <dl>
+          <dt>Shell</dt><dd>React + Vite SPA on Cloudflare Workers + D1</dd>
+          <dt>Aligner</dt><dd>Bespoke HTML5 drag-and-drop; single-panel and dual ULT↔UST</dd>
+          <dt>Engine</dt><dd>Precomputed D1 frequency tables + a client-side weighted blend</dd>
+          <dt>At rest</dt><dd>Inline <code>\zaln</code> inside the verse’s <code>content_json</code> in D1</dd>
+          <dt>Sync</dt><dd>IndexedDB outbox → <code>PATCH</code> with <code>If-Match</code> → nightly DCS export</dd>
+        </dl>
+      </article>
+    </div>
+
+    <div class="note warn">
+      <span class="tag">Version trap</span>
+      <p>
+        <code>word-aligner-lib</code> and <code>word-aligner-rcl</code> both export a module named
+        <code>AlignmentHelpers</code> with a function named
+        <code>updateAlignmentsToTargetVerse</code>, and they are <em>not</em> the same algorithm.
+        The <code>-lib</code> copy (632 lines) is the older generation: it has no
+        <code>findWordChanges</code>, no <code>adjustTargetOccurrences</code>, no ordered change list,
+        and no repeated-word fixup — just two heuristics that append added words to the word bank and
+        splice out target words whose occurrence no longer resolves. The <code>-rcl</code> copy
+        (1,237 lines) is the current one. Anything resolving <code>AlignmentHelpers</code> from
+        <code>-lib</code> silently gets materially worse occurrence renumbering on repeated words.
+      </p>
+      <span class="cite">word-aligner-lib/src/helpers/alignmentHelpers.js:363-487 vs word-aligner-rcl/src/helpers/alignmentHelpers.js:785-946</span>
+    </div>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="matrix">
+    <h2><span class="num">04</span>Comparison matrix</h2>
+    <p class="lede">Read down a column for one system; read across a row to see the range of answers to one question.</p>
+
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr>
+            <th>Dimension</th>
+            <th><span class="sys s-tc3">tC3</span></th>
+            <th><span class="sys s-ge">gateway-edit</span></th>
+            <th><span class="sys s-tc4">tc4</span></th>
+            <th><span class="sys s-be">bible-editor</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th>At-rest format</th>
+            <td>Sidecar JSON per chapter; plain text elsewhere</td>
+            <td>Inline <code>\zaln</code> in USFM on DCS</td>
+            <td>Sidecar JSON per book; <b>no <code>\zaln</code> at rest</b></td>
+            <td>Inline <code>\zaln</code> in verse JSON in D1</td>
+          </tr>
+          <tr>
+            <th>In-memory model</th>
+            <td>Redux: <code>sourceTokens</code>/<code>targetTokens</code> arrays + alignments as <b>index arrays</b></td>
+            <td><code>sourceNgram</code>/<code>targetNgram</code> with 0-based <code>index</code>, plus a whole-verse <code>targetWords</code> list with <code>disabled</code> flags</td>
+            <td><code>topWords</code>/<code>bottomWords</code> + <code>wordBank</code> — exactly what <code>word-aligner</code> emits</td>
+            <td>Document-order stream of words with <code>alignedTo</code>, plus a detached source-group list</td>
+          </tr>
+          <tr>
+            <th>Milestone nesting</th>
+            <td>Flattened to <code>topWords</code>; rebuilt at merge</td>
+            <td>Flattened to ngrams; rebuilt at merge</td>
+            <td>Flattened; rebuilt at export</td>
+            <td><b>Preserved in situ</b> — never flattened</td>
+          </tr>
+          <tr>
+            <th>Non-contiguous alignment</th>
+            <td>Handled by <code>sameMilestone</code> matching at unmerge</td>
+            <td>Supported in the render layer</td>
+            <td>Inherited from <code>word-aligner</code></td>
+            <td>One logical group; re-split into contiguous runs at serialize</td>
+          </tr>
+          <tr>
+            <th>Edit response</th>
+            <td>Repair + flag invalid + un-complete</td>
+            <td>Diff/renumber, else <b>flatten</b></td>
+            <td>Reflow survivors, else invalidate-and-retain</td>
+            <td>Five-tier repair ladder, <b>fail closed</b></td>
+          </tr>
+          <tr>
+            <th>Can an edit silently lose alignment?</th>
+            <td><span class="pill w">Flagged</span> reset is visible and consented</td>
+            <td><span class="pill x">Yes</span> console warning only</td>
+            <td><span class="pill v">No</span> record retained, marked invalid</td>
+            <td><span class="pill v">No</span> save refused by guard</td>
+          </tr>
+          <tr>
+            <th>Suggestion engine</th>
+            <td>wordMAP 0.4.x, alignment memory only, no corpus</td>
+            <td>wordMAP + <code>uw-wordmapbooster</code>, trained in a Web Worker</td>
+            <td><code>MorphJLBoostWordMap</code> in a Web Worker, project’s own alignments</td>
+            <td>Precomputed D1 frequency tables + client-side weighted blend</td>
+          </tr>
+          <tr>
+            <th>Suggestion corpus</th>
+            <td>Current book (minus current verse) + tN/tW selections + <b>all other projects</b> of the same language</td>
+            <td>Whole-book source + target USFM, plus other books; complexity-capped</td>
+            <td>The project’s own confirmed alignments, per testament</td>
+            <td>Gold <code>\zaln</code> in the published canonical ULT/UST</td>
+          </tr>
+          <tr>
+            <th>Cold start</th>
+            <td>Needs prior aligned projects</td>
+            <td>Needs an aligned book</td>
+            <td><b>Zero suggestions</b> until the translator aligns</td>
+            <td><span class="pill v">Works from verse one</span></td>
+          </tr>
+          <tr>
+            <th>Completeness model</th>
+            <td>Word bank empty <em>or</em> explicit “Alignment Complete” toggle</td>
+            <td><code>areAlgnmentsComplete</code> — display only, never blocks save</td>
+            <td><b>Explicit <code>done</code> flag</b>, outranked by a staleness hash</td>
+            <td>Word bank empty <em>and</em> no empty source group — inferred only</td>
+          </tr>
+          <tr>
+            <th>Save guard against loss</th>
+            <td><span class="pill n">None</span> validation is post-hoc</td>
+            <td><span class="pill n">None</span></td>
+            <td><span class="pill w">Hash</span> staleness marks, doesn’t block</td>
+            <td><span class="pill v">Client + server</span> LCS delta guard</td>
+          </tr>
+          <tr>
+            <th>Drag-and-drop</th>
+            <td><code>react-dnd</code> 2.5.4 + HTML5 backend</td>
+            <td>Native HTML5 DnD (in the RCL)</td>
+            <td>Native HTML5 DnD (bespoke)</td>
+            <td>Native HTML5 DnD (bespoke), 3 MIME channels</td>
+          </tr>
+          <tr>
+            <th>Phrase alignment</th>
+            <td>Merge/unmerge source words; multi-select target</td>
+            <td>Merge/split cards; multi-select target</td>
+            <td>Merge/split, non-adjacent merge rejected</td>
+            <td>Merge cards; source re-canonicalized to verse order</td>
+          </tr>
+          <tr>
+            <th>Alignment tests</th>
+            <td>~7k lines across reducer/render/repair suites</td>
+            <td><span class="pill x">None in the app</span> 23 scenarios in the RCL</td>
+            <td>9 suites + a conformance harness over a real corpus</td>
+            <td>~7.4k lines; every edit-path bug gets a regression case</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="edits">
+    <h2><span class="num">05</span>What happens when text is edited</h2>
+    <p class="lede">
+      This is the axis on which these four systems genuinely differ, and the one that decides whether
+      a translator loses work. Four philosophies, in the order they were built.
+    </p>
+
+    <h3>tC3 — detect, repair, but still declare invalid</h3>
+    <p>
+      tC3 splits the job between two components that do not talk to each other. The
+      <code>word-aligner</code> library never repairs: <code>merge()</code> validates stored alignments
+      against the verse string and throws at three separate sites when they disagree — a word in the
+      verse that the alignment data doesn’t know, a word in the word bank that the verse no longer has,
+      and an aligned target word missing from the verse.
+    </p>
+    <pre><code>if (verseObjectsNotInAlignmentData.length &gt; 0) {
+  if (hasAlignments(alignments)) {
+    throw {
+      message: `The words "${verseWordsJoined}" from the target language verse are not in the alignment data.`,
+      type: 'InvalidatedAlignments',
+    };
+  } else {
+    return useVerseText ? unalignedOrdered : null;
+  }
+}</code></pre>
+    <span class="cite">word-aligner/src/js/aligner.js:159-169 — all three throws are gated on the verse having alignments at all</span>
+
+    <p>
+      The aligner tool answers the same problem independently, in Redux, and it <em>does</em> repair.
+      <code>REPAIR_VERSE_ALIGNMENTS</code> builds an old-position → new-position map using a three-step
+      matcher: exact match, then same-occurrence match, then a fuzzy fallback that accepts a
+      <code>looksLike</code> match if the position is unassigned and adjacent to the previously assigned
+      one. That is what lets a spelling correction keep its alignment. But removing a source word
+      destroys its alignment outright — “TRICKY: removing a source token automatically breaks the
+      alignment” — and, critically, a successful repair still does this:
+    </p>
+    <pre><code>let isVerseInvalidated = (wasChanged || isAligned || isAlignmentComplete);
+if (isVerseInvalidated) { this.setVerseInvalid(chapter, verse, true, silent); }
+this.setVerseFinished(chapter, verse, false);
+// TRICKY: if there were no alignments we fix silently</code></pre>
+    <span class="cite">wordAlignment/src/Api.js:424-441</span>
+    <p>
+      So any verse that <em>was</em> aligned or complete gets the broken-chain icon and loses its
+      completion the moment its text changes, whether or not the repair preserved everything. Only a
+      verse with no alignments at all is fixed silently. At export time, the host’s only remedy for a
+      verse the library still refuses is a blank reset, one verse per pass, behind a confirmation
+      dialog.
+    </p>
+
+    <h3>gateway-edit — diff and renumber, then flatten</h3>
+    <p>
+      <code>word-aligner-rcl</code> replaced tC3’s repair with a real sequential diff.
+      <code>updateAlignmentsToTargetVerse</code> serializes the verse to USFM, unmerges it into cards,
+      tokenizes the new text, runs <code>findWordChanges</code> (a two-pointer diff producing ordered
+      <code>added</code>/<code>deleted</code> lists with a repeated-word anchor fixup), renumbers every
+      target occurrence against the new text, and re-merges. That part is a genuine advance over tC3.
+    </p>
+    <p>Then there is the fallback:</p>
+    <pre><code>try {
+  adjustTargetOccurrences(wordChanges, verseAlignments)
+  targetVerseUsfm = addAlignmentsToVerseUSFM(newTargetTokens, verseAlignments, newTargetVerse);
+  if (targetVerseUsfm === null) {
+    console.warn(`updateAlignmentsToTargetVerse() - alignment FAILED for ${newTargetVerse}, removing all alignments`);
+    targetVerseUsfm = newTargetVerse;
+  }
+} catch (e) {
+  console.error(`updateAlignmentsToTargetVerse - error thrown finding changes, removing alignments`, e)
+  targetVerseUsfm = newTargetVerse
+}</code></pre>
+    <span class="cite">word-aligner-rcl/src/helpers/alignmentHelpers.js:930-940 (v1.3.7) — verified still present, same line numbers as v1.3.6</span>
+
+    <div class="note crit">
+      <span class="tag">The failure mode this project exists to avoid</span>
+      <p>
+        <code>newTargetVerse</code> is the caller’s raw plain text: no <code>\zaln</code>, no
+        <code>\w</code>. Both branches replace the entire verse with it — every milestone in the verse
+        is destroyed, including alignment on words the edit never touched. There is a
+        <code>console.warn</code>, and <b>the return value gives the caller no way to tell this
+        happened</b>: it returns the same <code>{targetVerseObjects, targetVerseText}</code> shape
+        either way. A third, quieter degradation sits inside the differ itself, whose own try/catch
+        returns an empty change set on any throw, so occurrences are never renumbered.
+        <span class="cite">alignmentHelpers.js:905-908</span>
+      </p>
+      <p>
+        No test in the RCL exercises the flatten path. Our
+        <code>web/src/lib/alignmentReassembly.ts</code> ported the algorithm’s <em>shape</em> and
+        deliberately refused this branch; that judgment is confirmed against the current release.
+      </p>
+    </div>
+
+    <h3>tc4 — reflow what survives, invalidate the rest</h3>
+    <p>
+      tc4 calls it <em>reflow</em>, and it is deliberately modest. A link is kept only if its
+      <code>word + occurrence</code> key survives in the new text; survivors get their occurrence
+      counts recomputed; everything else is rebuilt into the word bank. The source side is never
+      touched and <b>no link is ever created</b>. When it cannot help — the record is absent, already
+      invalid, has no placed word, is not stale, or the new text has no words — it returns
+      <code>null</code> and the caller changes nothing:
+    </p>
+    <div class="note">
+      <span class="tag">tc4 · src/data/align/edit.ts:266-268</span>
+      <p>
+        “In every null case the caller leaves the record exactly as it is: invalidate-and-retain (D36)
+        stays the outcome the I-3 hash already produces.”
+      </p>
+    </div>
+    <p>
+      The I-3 hash is an md5 of the target verse text stored on the alignment record. When it no longer
+      matches the draft, the verse reads as stale — and staleness, along with an explicit
+      <code>invalid</code> flag, outranks the translator’s <code>done</code> mark. Verse-span changes
+      write an <em>empty record with <code>invalid: true</code></em> rather than re-keying, under a
+      ruling that reads: “alignments and decisions on the affected verses are
+      <code>invalidate-retain</code>, never re-keyed. The translator re-aligns and re-checks the span.”
+    </p>
+    <p>
+      This is weaker than what we do — a translator who edits a word loses that alignment where our
+      engine would have kept it — but it is honest. Nothing is invented, nothing is silently dropped,
+      and the record survives to be repaired by hand.
+    </p>
+
+    <h3>bible-editor — five tiers, degrade locally, fail closed</h3>
+    <p>
+      Because alignment stays inside the verse tree, an edit is a tree rewrite rather than a
+      reconstruction. <code>smartEditVerse</code> runs a ladder and takes the first tier that can prove
+      its result:
+    </p>
+    <ol>
+      <li><b>No-op</b> — normalized plain text is unchanged.</li>
+      <li><b>Marker split</b> — inline markers (<code>\p</code>, <code>\q1</code>, <code>\ts*</code>) are stripped from both sides so they cannot move the diff anchors, then re-placed afterwards.</li>
+      <li><b>Relayout</b> — the word sequence is 1:1 unchanged, so only punctuation moves; every <code>\w</code> and <code>\zaln</code> stays put.</li>
+      <li><b>Reassembly</b> — the primary engine: unmerge to pivot words carrying their full milestone ancestry, LCS word-diff, re-merge survivors in their <em>exact original</em> milestone chain. Gated so it only fires on genuinely multi-region edits, with a self-check that the rebuilt raw text equals the requested text and that every structural node survives unaltered.</li>
+      <li><b>Localized rewrite</b> — the last resort: nodes outside the change range pass through verbatim; an overlapped milestone is split into before/after halves so surviving children keep their source alignment.</li>
+    </ol>
+    <p>
+      Inside the replacement tier there is a further preserve path: when the change spans full words
+      with matching word counts and an element-wise identical punctuation skeleton, each affected
+      <code>\w</code> leaf is rewritten in place and <em>only that word</em> is lifted out of its
+      <code>\zaln</code> ancestors — the translator’s edit invalidates that word’s alignment, and
+      unchanged neighbours stay aligned.
+    </p>
+    <div class="note good">
+      <span class="tag">The structural difference</span>
+      <p>
+        There is no whole-verse fallback. When no tier can prove its output, the result is refused and
+        the save is blocked. The other three systems all have a terminal state in which the verse’s
+        alignment is discarded; this one’s terminal state is “don’t write”.
+      </p>
+    </div>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="suggestions">
+    <h2><span class="num">06</span>Suggestion engines</h2>
+    <p class="lede">
+      Three of the four run some flavour of wordMAP. They differ most in <em>what they train on</em>,
+      which decides whether the feature works on a translator’s first day.
+    </p>
+
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr><th>&nbsp;</th><th>tC3</th><th>gateway-edit</th><th>tc4</th><th>bible-editor</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>Model</th><td><code>WordMap</code> 0.4.x</td><td><code>MorphJLBoostWordMap</code></td><td><code>MorphJLBoostWordMap</code></td><td>None — weighted blend over count tables</td></tr>
+          <tr><th>Where it runs</th><td>Main thread</td><td>Web Worker</td><td>Web Worker, one model per testament</td><td>Cloudflare Worker lookup + client blend</td></tr>
+          <tr><th>Corpus indexed?</th><td><span class="pill x">No</span> alignment memory only</td><td>Yes, whole-book source + target USFM</td><td>Yes, the project’s own verses</td><td>Offline — gold ULT/UST alignments</td></tr>
+          <tr><th>n-gram lengths</th><td>target 5, source default</td><td>source 3, target 5</td><td>source 3, target 5</td><td>n/a</td></tr>
+          <tr><th>Train steps</th><td>library default</td><td class="num">1000</td><td class="num">1000</td><td>n/a</td></tr>
+          <tr><th>Complexity cap</th><td>none</td><td>adaptive, 10k–300k, retargeting an 8-minute train</td><td>100k NT / 50k OT, fixed</td><td>n/a</td></tr>
+          <tr><th>Confidence gate</th><td>hard-coded <code>&gt;= 1</code></td><td>none (maxSuggestions 1)</td><td>none (maxSuggestions 1)</td><td>blend of 3 weighted signals</td></tr>
+          <tr><th>Caching</th><td>in-memory <code>SimpleCache</code></td><td>IndexedDB <code>app-state/dataStore</code>, SHA-256 invalidated</td><td>module-scope in the worker</td><td>module-level fetch cache</td></tr>
+          <tr><th>Auto-train</th><td>on verse open</td><td><span class="pill n">off</span> manual Train button</td><td>debounced 3s after each confirmed save</td><td>n/a — trained offline</td></tr>
+          <tr><th>Published accuracy</th><td><span class="pill n">none</span></td><td><span class="pill n">none</span></td><td><span class="pill n">none</span> (timings only)</td><td><b>p@1 61.7, recall@5 ≈81%</b></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>The measurement that matters</h3>
+    <p>
+      tc4 publishes a training bench: NT, 7,958 aligned verses, <b>273 s to train, 101 ms per
+      prediction</b>; OT (Genesis + Psalms), 3,994 verses, 137 s / 56 ms. gateway-edit targets an
+      8-minute train and adapts its complexity budget up or down to hit it, with a 10-minute worker
+      timeout and a low-memory warning reading “Running in Browser — Alignment Training may be slow or
+      crash.”
+    </p>
+    <div class="note warn">
+      <span class="tag">This contradicts one of our stated reasons</span>
+      <p>
+        <code>api/src/align.ts:5-8</code> says “The engine (‘wordMAP’) never runs in the Worker” —
+        correct, and unavoidable in a 128 MB Cloudflare Worker with no filesystem. But
+        <code>docs/alignment-suggestions.md</code> generalizes that into the anti-goal “don’t move
+        inference to the client.” tc4 and gateway-edit both run the full engine in a <em>browser</em>
+        Web Worker, with published timings. The constraint we reasoned from is a server constraint;
+        the client one was never measured here.
+      </p>
+      <p>
+        That does not mean wordMAP would beat our numbers. Ours are the only measured accuracy figures
+        anywhere in this family — 61.7 precision@1 after the morph phase, against a 57.5 frequency-only
+        baseline — and neither wordMAP implementation publishes any. It means the question is open,
+        and the corpus difference cuts our way: theirs cold-start at zero, ours works from verse one
+        because it is trained on the gold canonical alignments.
+      </p>
+    </div>
+
+    <h3>Acceptance discipline worth copying</h3>
+    <p>
+      tc4’s bridge layer is stricter than ours in three specific ways, each of which is a small,
+      self-contained rule:
+    </p>
+    <ul>
+      <li>A prediction whose source words span two cards is <b>dropped entirely rather than truncated</b> — a partial suggestion is worse than none.</li>
+      <li><code>rebindSuggestions</code> re-finds a live proposal’s card by the predicted <em>original word</em>, so a merge or split mid-session cannot misplace it.</li>
+      <li>“Mark valid” is <b>refused while any suggestion still stands</b> — you cannot certify a verse you haven’t answered.</li>
+    </ul>
+    <p>
+      The RCL has the same instinct expressed differently: a card is wholly suggested or wholly manual,
+      with the comment “We can’t add in suggested additional targets because we can’t represent a
+      mixture of suggested and manual.” Touching a suggested card promotes it to manual immediately.
+    </p>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="complete">
+    <h2><span class="num">07</span>Completeness and validation</h2>
+
+    <p class="lede">
+      Every system needs to answer “is this verse finished?” Three of the four learned that an empty
+      word bank is the wrong answer. We are the one that hasn’t.
+    </p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>System</th><th>“Aligned” means</th><th>Translator can assert done?</th><th>What outranks it</th></tr></thead>
+        <tbody>
+          <tr>
+            <th><span class="sys s-tc3">tC3</span></th>
+            <td>Every alignment has ≥1 target word <em>and</em> every target token is used</td>
+            <td><span class="pill v">Yes</span> “Alignment Complete” toggle, auto-set when the last word lands</td>
+            <td>Any alignment mutation clears it; a text edit clears it</td>
+          </tr>
+          <tr>
+            <th><span class="sys s-ge">gateway-edit</span></th>
+            <td><code>areAlgnmentsComplete</code>: every target word <code>disabled</code>, no source-only card</td>
+            <td><span class="pill x">No</span></td>
+            <td>n/a — display-only icon, never blocks save</td>
+          </tr>
+          <tr>
+            <th><span class="sys s-tc4">tc4</span></th>
+            <td><code>isFullyAligned</code>: empty word bank + ≥1 real alignment</td>
+            <td><span class="pill v">Yes</span> <code>done</code>, stored additively, never as <code>false</code></td>
+            <td>The I-3 staleness hash and the <code>invalid</code> flag both outrank it; export ignores it</td>
+          </tr>
+          <tr>
+            <th><span class="sys s-be">bible-editor</span></th>
+            <td><code>verseHasUnalignedWork</code>: any unaligned target word <em>or</em> any source group with no targets</td>
+            <td><span class="pill x">No</span></td>
+            <td>n/a — drives the red/green chain icon directly</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note warn">
+      <span class="tag">tc4 decision D73, verbatim context</span>
+      <p>
+        “The Align tool derived ‘valid’ from ‘the word bank is empty’” — which fails a translator who
+        legitimately leaves words unaligned. The replacement rules: all-aligned implies done; “Mark
+        valid” behaves like other checks; <b>any edit takes it back</b>; the field is additive so the
+        schema version doesn’t move; and the <code>\zaln</code> export ignores it entirely. tC3 had
+        already reached the same design a decade earlier with its “Alignment Complete” toggle.
+      </p>
+      <p>
+        Our <code>verseHasUnalignedWork</code> is precisely the heuristic both of them abandoned. It
+        is why the chain icon reads red on verses a translator considers finished — and it is the
+        same class of problem as JER 36:11, where a deliberate human alignment choice reads to the
+        system as damage.
+      </p>
+    </div>
+
+    <h3>Defect detection beyond completeness</h3>
+    <p>
+      bible-editor is alone in shipping data-defect detectors that are separate from completeness:
+      reused source tokens (one Hebrew word claimed by two distinct position sequences), doubled source
+      milestones, glued milestones spanning a maqqef, occurrence counts out of range. These surface as
+      red chips in the panel and as server-side lint checks. tC3’s nearest equivalent is a
+      <code>console.error</code> in its render validator; gateway-edit has none.
+    </p>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="guards">
+    <h2><span class="num">08</span>Data-loss guards</h2>
+
+    <p class="lede">
+      The question here is narrow: can a write leave the store with less alignment than it had, without
+      anyone being told?
+    </p>
+
+    <ul>
+      <li><b>tC3</b> — no guard at write time. The tool rewrites every chapter of the book on every state change (“TRICKY: we validate the entire book so we must write all chapters”). Protection is post-hoc: validation on load, and the export-time reset dialog.</li>
+      <li><b>gateway-edit</b> — none. The completeness icon is display-only, Save is never disabled, and the only confirmation is “do you want to accept the suggested alignments.” The flatten path writes through.</li>
+      <li><b>tc4</b> — the I-3 hash marks a record stale but never blocks a write. Writes go through a compare-and-swap on the file’s md5, which protects against <em>concurrent</em> loss, not <em>semantic</em> loss.</li>
+      <li><b>bible-editor</b> — an LCS-based delta analysis runs on both client and server. It links before/after words and reports <code>lost</code> (a previously aligned word is now bare) or <code>changed_source</code>; <code>guardBlocksSave</code> refuses the write unless the intent is <code>alignment_edit</code> or <code>confirmed_text_edit</code>. The aligner panel additionally prompts before an intentional unalign, and the nightly export carries a severity-classified shrink backstop.</li>
+    </ul>
+
+    <div class="note">
+      <span class="tag">A hard-won rule worth restating</span>
+      <p>
+        Our guard carries an explicit warning against re-adding a <code>wordSequenceUnchanged</code>
+        narrowing, naming the commit and the 1CH 4:21 / NUM 24 incident. The lesson generalizes to
+        anything in this document: <em>use a signal like that for the wording of an alert, never to
+        narrow the refusal decision.</em> That exemption is what let collateral alignment loss ship.
+      </p>
+    </div>
+
+    <div class="note warn">
+      <span class="tag">Our own blind spot, for symmetry</span>
+      <p>
+        The guard covers alignment, not markers. Issue #606: a DOM capture that lost its marker chips
+        deleted every <code>\q</code> in three HOS verses while every word round-tripped perfectly — so
+        <code>preservedAlignment</code> stayed true, the guard didn’t fire, the unaligned-word toast
+        didn’t fire, and the nightly export carried the loss to Door43 for a fortnight. None of the
+        other three systems would have caught it either, but it is the shape of failure our guard is
+        blind to.
+      </p>
+    </div>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="ui">
+    <h2><span class="num">09</span>Interaction models</h2>
+
+    <p class="lede">
+      Three of the four aligners are bespoke. That is a stronger signal than it first appears.
+    </p>
+
+    <p>
+      tC3 uses <code>react-dnd</code> 2.5.4 with the HTML5 backend, and pays for it: left-side
+      un-merging is dead code, blocked on a <code>react-dnd</code> bug, and multi-word drag previews are
+      <em>static PNG images</em> (<code>multi_drag_preview_2</code> … <code>_15</code>) because “react-dnd’s
+      custom drag layer has very poor performance.” Everything since has used native HTML5 drag-and-drop.
+    </p>
+    <p>
+      More interesting: <b>tc4 declares <code>@gabrielaillet/word-aligner-rcl</code> as a devDependency
+      and never imports it</b>. Its own evidence document is blunt — “<code>git log -S'word-aligner-rcl'
+      -- src</code> prints nothing: no source file ever imported it” — and its architecture note states
+      that “the check and alignment surfaces are design-native.” The fork is retained purely as a
+      written contract. Two independent teams, working on the same problem at the same time, both
+      concluded the shared aligner component was not worth embedding. Our own decision to build a
+      custom aligner rather than use <code>enhanced-word-aligner-rcl</code> sits in good company.
+    </p>
+
+    <h4>Feature comparison</h4>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Capability</th><th>tC3</th><th>gateway-edit</th><th>tc4</th><th>bible-editor</th></tr></thead>
+        <tbody>
+          <tr><th>Multi-select target words</th><td>shift-click range</td><td>yes</td><td>—</td><td>shift-click</td></tr>
+          <tr><th>Card-onto-card merge</th><td>drag source word</td><td>drag source word</td><td>yes, adjacent only</td><td>drag whole card</td></tr>
+          <tr><th>Split a merged card</th><td>right-hand placeholder only</td><td><code>startNew</code> on drop</td><td>yes</td><td><code>clearGroup</code> splits to singletons</td></tr>
+          <tr><th>Keyboard shortcuts</th><td>7 hotkeys</td><td>—</td><td>—</td><td>—</td></tr>
+          <tr><th>Suggestion chips</th><td>green card + per-token accept</td><td>green card, accept-all</td><td>dashed chip</td><td>ghost chip, accept-all + dismiss</td></tr>
+          <tr><th>Lexicon on hover</th><td>yes</td><td>yes</td><td>yes</td><td>yes, UHAL + UGL</td></tr>
+          <tr><th>Dual ULT ↔ UST</th><td>—</td><td>—</td><td>—</td><td><span class="pill v">yes</span></td></tr>
+          <tr><th>Crash-draft recovery</th><td>—</td><td>—</td><td>journal</td><td><span class="pill v">separate IndexedDB store</span></td></tr>
+          <tr><th>Touch support</th><td>—</td><td>—</td><td>—</td><td>— (mouse only)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="tests">
+    <h2><span class="num">10</span>Test posture</h2>
+
+    <p class="lede">
+      The spread here is wider than anywhere else in the comparison, and it correlates with how much
+      damage each system’s failure mode does.
+    </p>
+
+    <ul>
+      <li>
+        <b>gateway-edit</b> has <span class="pill x">zero</span> alignment tests. Its jest config
+        excludes <code>components</code>, so the two aligner components are untestable by design, and
+        <code>collectCoverageFrom</code> uses a single-star glob that doesn’t recurse. The RCL beneath
+        it has a good data-driven suite — 23 edit scenarios, several multi-step, asserting exact USFM
+        round-trip, word conservation, and non-mutation of the input — but <b>no test exercises the
+        flatten fallback</b>.
+      </li>
+      <li>
+        <b>tC3’s tool</b> has the largest reducer suite in the family: ~2.3k lines on alignment
+        reducers including a dedicated “repair alignments” block whose cases are the real invariants
+        (“edits target token from the midst of identical tokens”, “removes duplicate tokens”), ~2.3k
+        more on suggestions, and an API suite that pins the exact invalidation matrix. Its
+        <code>word-aligner</code> core, however, has <b>no test for any of the three
+        <code>InvalidatedAlignments</code> throws</b> — the entire contract callers depend on is
+        unexercised.
+      </li>
+      <li>
+        <b>tc4</b> has nine focused suites plus something the others lack: a <em>conformance
+        harness</em> that runs the real libraries over a real corpus, proving round-trip on every
+        sidecar verse and that full-book aligned USFM can be produced from stored data alone.
+      </li>
+      <li>
+        <b>bible-editor</b> has ~7.4k lines across <code>alignment.test.mjs</code> (≈60 named cases),
+        <code>replace.test.mjs</code> (78+ cases), and the delta-guard suites, under a standing rule
+        that every edit-path bug gets a regression case. The cases are named after real verses —
+        1CH 4:21, NUM 24:19, JER 29:31, ZEC 6:13 — which is the same discipline tc4 applies via
+        fixtures.
+      </li>
+    </ul>
+
+    <div class="note">
+      <span class="tag">The one test idea we don’t have</span>
+      <p>
+        tc4’s conformance harness runs against a real corpus rather than synthetic fixtures. Our
+        <code>STATE.md</code> already records a case where that distinction bites: the
+        <code>\d</code> Psalm-superscription wrapper shape modelled throughout
+        <code>alignment.ts</code> “does not match either real shape,” so those code paths may be
+        exercised only by their own fixtures. A corpus gate over actual DCS-fetched content is the
+        kind of test that finds that class of bug.
+      </p>
+    </div>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="adopt">
+    <h2><span class="num">11</span>What to adopt</h2>
+    <p class="lede">Ranked by value per unit of risk. Each is independently shippable.</p>
+
+    <ol class="recs">
+      <li>
+        <span class="rank">1</span>
+        <div>
+          <h3>An explicit “alignment done” flag, with a confirm — not a block</h3>
+          <p>
+            Add a translator-asserted completion mark, stored additively (absent means not done, never
+            <code>false</code>), cleared by any subsequent edit, and ignored by the export renderer.
+            Drive the chain icon from <code>done</code> rather than from an empty word bank; keep
+            <code>verseHasUnalignedWork</code> as the auto-set trigger, not as the verdict.
+          </p>
+          <p>
+            When a translator marks a verse done and we still detect unaligned work, <b>ask, then
+            defer to them</b>: “You’ve left <em>N</em> word(s) unaligned. Was that intentional?” If
+            they confirm, the mark stands and the verse reads as complete. The prompt exists because
+            they may have genuinely missed something — not because the system gets a veto.
+          </p>
+          <p class="why">
+            <b>Precedent:</b> tC3’s “Alignment Complete” toggle and tc4’s D73, which names our exact
+            heuristic as the thing it replaced. <b>Why now:</b> it is the clean answer to a translator
+            who deliberately leaves a word unaligned, and it aligns the indicator with the standing
+            ruling that an unaligned word or two is no reason to hold back a sync.
+            <b>Shape:</b> this is the same confirm-then-proceed pattern the aligner panel already uses
+            before an intentional unalign, so it reuses a dialog idiom translators have seen — and it
+            is deliberately softer than tc4, which lets <code>done</code> be set with no prompt at all.
+          </p>
+        </div>
+      </li>
+
+      <li>
+        <span class="rank">2</span>
+        <div>
+          <h3>A conformance gate over real content</h3>
+          <p>
+            A harness that round-trips every verse of a real DCS-fetched book through
+            <code>parseAlignment</code> → <code>serializeAlignment</code> and asserts byte-equality,
+            plus a full-book export rendered from stored data alone. Run it in CI over a fixed corpus
+            that includes Psalms with superscriptions and the Hebrew books that exercise
+            normalization.
+          </p>
+          <p class="why">
+            <b>Precedent:</b> tc4’s <code>conformance/validate.mjs</code>. <b>Why now:</b> the
+            unresolved <code>\d</code> wrapper question in <code>STATE.md</code> is exactly what this
+            catches, and we already have the importer to build the corpus.
+          </p>
+        </div>
+      </li>
+
+      <li>
+        <span class="rank">3</span>
+        <div>
+          <h3>Suggestion-acceptance discipline</h3>
+          <p>
+            Three rules from tc4’s bridge: drop a cross-card prediction entirely rather than truncating
+            it; re-bind live ghosts to their card by the predicted source word so a merge or split
+            can’t misplace them; and refuse to mark a verse done while an unanswered suggestion stands.
+          </p>
+          <p class="why">
+            <b>Precedent:</b> tc4 <code>suggest.ts</code>; the RCL reaches the same conclusion from the
+            other direction (a card is wholly suggested or wholly manual). <b>Why now:</b> our
+            <code>computeGhosts</code> claims words greedily across two passes, and nothing was found
+            that re-binds a ghost through a mid-session card merge. Pairs naturally with #1.
+          </p>
+        </div>
+      </li>
+
+      <li>
+        <span class="rank">4</span>
+        <div>
+          <h3>Settle the in-browser wordMAP question with a measurement</h3>
+          <p>
+            Run <code>uw-wordmapbooster</code> in a Web Worker against a held-out book and score it
+            with the existing <code>scripts/eval-aligner.mjs</code> harness. Compare precision@1 and
+            false-positive rate against the shipped 61.7 / 6.1. If it wins, the interesting shape is a
+            hybrid: our D1 prior for cold start, a locally trained booster as the translator aligns.
+          </p>
+          <p class="why">
+            <b>Precedent:</b> tc4 (273 s train, 101 ms predict) and gateway-edit (8-minute target,
+            adaptive complexity) both prove it runs in a browser. <b>Why now:</b> our written anti-goal
+            generalized a Cloudflare Worker constraint into a client one that was never measured — and
+            we are the only party in this family with an accuracy harness to settle it.
+          </p>
+        </div>
+      </li>
+
+      <li>
+        <span class="rank">5</span>
+        <div>
+          <h3>A tokenizer-agreement test</h3>
+          <p>
+            We keep <code>WORD_CHAR</code>/<code>WORD_RUN_RE</code> byte-identical between
+            <code>replace.ts</code> and <code>alignmentReassembly.ts</code> by comment and discipline.
+            Make it an assertion: one fixture corpus, token-for-token <em>and</em>
+            occurrence-for-occurrence agreement between every tokenizer in the codebase.
+          </p>
+          <p class="why">
+            <b>Precedent:</b> tc4 named this as an unmeasured risk in its platform notes and closed it
+            with <code>test/align-tokenize.test.ts</code>. <b>Why now:</b> cheap, and the failure it
+            prevents is silent misalignment rather than a crash.
+          </p>
+        </div>
+      </li>
+
+      <li>
+        <span class="rank">6</span>
+        <div>
+          <h3>Keyboard shortcuts in the aligner</h3>
+          <p>
+            tC3 ships seven: refresh suggestions, accept, reject, clear, toggle complete, and
+            navigation. Our aligner is mouse-only, with no touch or pointer fallback either.
+          </p>
+          <p class="why">
+            <b>Precedent:</b> <code>wordAlignment/src/components/Container.js</code> via
+            <code>react-hotkeys</code>. <b>Why now:</b> aligning a book is thousands of repetitions;
+            it is the one place in the app where shortcuts pay for themselves outright.
+          </p>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="reject">
+    <h2><span class="num">12</span>What not to adopt</h2>
+
+    <ul>
+      <li>
+        <b>Sidecar storage.</b> Both translationCore generations store alignment outside the text.
+        tc4’s reason is specific and does not apply to us: its host’s drafting editor destroys
+        milestone markup on save, so “no <code>\zaln</code> at rest” is a defensive invariant against
+        a platform it doesn’t control. We own our editor. Keeping milestones in the verse tree is what
+        makes position structural rather than reconstructed, and it is the reason our edit engine can
+        degrade locally at all.
+      </li>
+      <li>
+        <b>The whole-verse flatten fallback.</b> Already refused in
+        <code>alignmentReassembly.ts</code>, and the refusal is now verified against the current
+        release rather than a remembered line number. Nothing here changes that judgment.
+      </li>
+      <li>
+        <b>Invalidate-and-retain as the primary edit response.</b> tc4’s reflow keeps a link only on
+        exact <code>word + occurrence</code> survival and otherwise hands the verse back to the human.
+        Our ladder is materially stronger. Adopt tc4’s <em>honesty</em> (the <code>done</code> flag,
+        the staleness hash) without adopting its weaker repair.
+      </li>
+      <li>
+        <b>Rejecting non-adjacent merges.</b> tc4 refuses them so that flattened <code>topWords</code>
+        stay in verse order for export. We solve the same constraint better with
+        <code>canonicalizeSource</code>, which re-sorts a merged chain into verse order regardless of
+        drag direction.
+      </li>
+      <li>
+        <b><code>react-dnd</code>.</b> tC3’s experience is a closed case: a blocked feature and static
+        PNG drag previews. Every system built since uses native HTML5 drag-and-drop.
+      </li>
+      <li>
+        <b>Whole-book rewrites on every state change.</b> tC3 writes every chapter of the book on each
+        Redux change, flagged in its own comments as a performance smell. Our per-verse outbox with
+        <code>If-Match</code> is the right model.
+      </li>
+    </ul>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="limits">
+    <h2><span class="num">13</span>Limits of this review</h2>
+
+    <ul>
+      <li>
+        <b>Nothing was executed.</b> No test suite was run, no app was launched, no benchmark was
+        reproduced. Every claim is from reading source at the commits listed below. Performance and
+        accuracy numbers attributed to other projects are <em>their</em> published figures, not our
+        measurements.
+      </li>
+      <li>
+        <b><code>node_modules</code> was not installed anywhere.</b> Package-internal behavior was read
+        from each package’s own repository at its current HEAD, which may be ahead of the version the
+        consuming app pins. This matters most for tC3: its aligner tool pins
+        <code>word-aligner@0.2.12</code>, and the library repository read here is 1.1.1.
+      </li>
+      <li>
+        <b>Two gateway-edit conversion claims are unverified.</b> That its alignment lives inline in
+        <code>\zaln</code> and that scripture saves follow the same user-branch → PR flow as its
+        resource cards are both consistent with what the app does, but the writers live in
+        <code>single-scripture-rcl</code>, which was not read.
+      </li>
+      <li>
+        <b>tc4’s export path may be unwired.</b> <code>mergeVerseToZalnUsfm</code> has no caller in
+        <code>src/</code> at the commit read; it is proven only by the conformance harness.
+      </li>
+      <li>
+        <b>No accuracy figures exist for any wordMAP implementation in this family.</b> Any claim that
+        an in-browser engine would beat our 61.7 precision@1 is speculation until recommendation #4 is
+        run.
+      </li>
+      <li>
+        <b>Project canon was not consulted.</b> The <code>oddkit</code> MCP server this project uses as
+        its epistemic guide is not configured in the session that produced this document, and
+        <code>graft</code> failed to connect. Nothing here was checked against recorded decisions or
+        constraints beyond what is in this repository’s own files.
+      </li>
+    </ul>
+  </section>
+
+  <hr class="div">
+
+  <!-- ================================================================= -->
+  <section id="sources">
+    <h2><span class="num">14</span>Source index</h2>
+    <p class="lede">Every repository read, at the commit read. All clones were shallow and read-only.</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Repository</th><th>Version</th><th>Commit</th><th>Role in this review</th></tr></thead>
+        <tbody>
+          <tr><td><code>unfoldingWord/translationCore</code></td><td>3.7.2</td><td><code>5729aa7b</code></td><td>tC3 host: on-disk format, USFM conversion, migrations, export</td></tr>
+          <tr><td><code>unfoldingWord/wordAlignment</code></td><td>1.0.0</td><td>shallow HEAD</td><td>tC3 aligner tool: DnD, Redux, repair, wordMAP</td></tr>
+          <tr><td><code>unfoldingWord/word-aligner</code></td><td>1.1.1</td><td>shallow HEAD</td><td><code>merge</code>/<code>unmerge</code>, <code>InvalidatedAlignments</code></td></tr>
+          <tr><td><code>unfoldingWord/gateway-edit</code></td><td>2.4.13</td><td><code>293b9cd</code></td><td>Host app, dialog, worker factory, suggestion config</td></tr>
+          <tr><td><code>unfoldingWord/word-aligner-rcl</code></td><td>1.3.7</td><td><code>f1fa5a5c</code></td><td>Edit-preservation engine, aligner UI, the flatten fallback</td></tr>
+          <tr><td><code>unfoldingWord/enhanced-word-aligner-rcl</code></td><td>1.4.8</td><td><code>ed3ee92f</code></td><td>wordMAP training, worker protocol, IndexedDB caching</td></tr>
+          <tr><td><code>unfoldingWord/word-aligner-lib</code></td><td>1.1.1</td><td><code>d40188bb</code></td><td>Older generation of the same helpers — the version trap</td></tr>
+          <tr><td><code>unfoldingWord/translationCore4</code></td><td>4.0.0-alpha.6</td><td><code>be5423c</code></td><td>Sidecar model, reflow, <code>done</code> flag, conformance harness</td></tr>
+          <tr><td><code>unfoldingWord/bible-editor</code></td><td>—</td><td><code>bc19afb</code></td><td>This repository</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h4>Key files, for anyone continuing this work</h4>
+    <ul>
+      <li><code>word-aligner-rcl/src/helpers/alignmentHelpers.js:785-946</code> — the differ and the flatten fallback</li>
+      <li><code>word-aligner/src/js/aligner.js:150-252</code> — <code>merge</code> and its three throws</li>
+      <li><code>wordAlignment/src/state/reducers/alignments/verse.js:275-357</code> — tC3’s repair</li>
+      <li><code>wordAlignment/src/Api.js:391-442</code> — tC3’s validate-and-invalidate</li>
+      <li><code>translationCore4/src/data/align/edit.ts:269-296</code> — tc4’s reflow</li>
+      <li><code>translationCore4/docs/DECISIONS.md:1397-1422</code> — D73, the <code>done</code> flag</li>
+      <li><code>translationCore4/docs/evidence/word-aligner-rcl-contract-2026-09-05.md</code> — field-by-field mapping between tc4’s model and the RCL’s</li>
+      <li><code>enhanced-word-aligner-rcl/src/hooks/useAlignmentSuggestions.ts</code> — training lifecycle, complexity adaptation, IndexedDB keys</li>
+      <li><code>web/src/lib/alignmentReassembly.ts:1-35</code> — our port note, and the list of what was deliberately not ported</li>
+    </ul>
+  </section>
+
+  <footer>
+    <p>
+      Research document for the bible-editor project. Prepared 2026-09-16 by reading source only;
+      no code in any repository was modified. Figures attributed to other projects are their own
+      published measurements. Corrections belong in this file — durable cross-session facts belong in
+      <code>STATE.md</code>.
+    </p>
+  </footer>
+
+</div>
+</body>
+</html>

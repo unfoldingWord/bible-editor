@@ -97,6 +97,8 @@ export interface DcsPollStateRow {
   gap_at: number | null;
   /** JSON array of shas — see computeGapFrontier. Null/empty means no gap. */
   gap_frontier_json: string | null;
+  /** Oldest timestamp this ledger has proven continuously covered. */
+  coverage_since: number | null;
 }
 
 /**
@@ -119,18 +121,11 @@ export function repoNeedsPoll(
 /**
  * The boundary to walk to: the stored sha, or the bootstrap time window.
  *
- * KNOWN LIMIT OF THE TIME BOUND (review finding F2, documented not fixed).
- * listMasterCommitsSince ends a time-bounded walk at the first commit whose
- * AUTHOR date predates `sinceTime`, and repo-scoped history is not sorted by
- * author date — a rebased or cherry-picked commit carries an old author date
- * while sitting near the tip. So a bootstrap walk can terminate early, on that
- * one commit, and report `incomplete: false`: no gap is recorded, because the
- * walker genuinely believes it reached the far side of the range. The blast
- * radius is bounded to BOOTSTRAP only (every later poll uses the sha bound,
- * which is exact) and the loss is old history, never a new commit. Fixing it
- * properly means bounding on committer date, which the walker cannot do without
- * changing what gating reads — hence a follow-up issue rather than a change
- * here.
+ * The time bound is evaluated on committer date by listMasterCommitsSince.
+ * This is intentional: a rebased or cherry-picked commit can carry an old
+ * author date while landing near the tip, and using author date would stop a
+ * bootstrap walk before that commit. Later polls use the sha bound, which is
+ * exact.
  */
 export function pollBounds(
   state: DcsPollStateRow | null | undefined,
@@ -298,9 +293,10 @@ export function ledgerRowsFromCommits(
     // COMMITTER date first (review finding F6): the ledger's question is "when
     // did this land on master", and author date answers "when was it first
     // written" — different on every rebase, cherry-pick and squash merge, which
-    // is most of how work reaches these repos. Author date is the fallback for
-    // a payload without a committer block.
-    const at = Date.parse(c.committerDate ?? c.date ?? "");
+    // is most of how work reaches these repos. The poller refuses missing
+    // committer metadata before this conversion; retaining NULL here makes the
+    // pure helper fail closed for any other caller too.
+    const at = Date.parse(c.committerDate ?? "");
     const files = c.files;
     return {
       repo,
@@ -403,8 +399,8 @@ const CLAIM_ATTEMPT_SQL = `INSERT INTO dcs_repo_polls (repo, last_attempted_at)
 
 const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
-    last_status, gap_since_sha, gap_at, gap_frontier_json)
- VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10)
+    last_status, gap_since_sha, gap_at, gap_frontier_json, coverage_since)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10, ?11)
  ON CONFLICT (repo) DO UPDATE SET
    -- ?9 = "the ingest completed, advance the mark". last_sha and
    -- last_committed_at move TOGETHER off that one flag (review finding F12):
@@ -444,7 +440,11 @@ const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    -- an older one was already in progress; clearing the older gap would
    -- then report full coverage with those commits still missing.
    gap_frontier_json = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL OR excluded.gap_frontier_json IS NOT NULL
-                              THEN excluded.gap_frontier_json ELSE dcs_repo_polls.gap_frontier_json END`;
+                              THEN excluded.gap_frontier_json ELSE dcs_repo_polls.gap_frontier_json END,
+   -- A clean post-migration poll establishes the floor once. Never advance it
+   -- on later polls: moving it forward would make an older proven window
+   -- unexpectedly fall back to live Gitea.
+   coverage_since = COALESCE(dcs_repo_polls.coverage_since, excluded.coverage_since)`;
 
 export interface RepoPollResult {
   repo: string;
@@ -463,7 +463,7 @@ export interface RepoPollResult {
 export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): Promise<RepoPollResult> {
   const state = await env.DB.prepare(
     `SELECT repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
-            last_status, gap_since_sha, gap_at, gap_frontier_json
+            last_status, gap_since_sha, gap_at, gap_frontier_json, coverage_since
        FROM dcs_repo_polls WHERE repo = ?1`,
   )
     .bind(repo)
@@ -522,6 +522,11 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
   const priorFrontier = state?.gap_since_sha != null ? parseGapFrontier(state.gap_frontier_json) : [];
   const gapFrontier = gapSince != null ? Array.from(new Set([...priorFrontier, ...computeGapFrontier(rows, gapSince)])) : [];
   const gapFrontierJson = gapSince != null ? JSON.stringify(gapFrontier) : null;
+  // Existing rows predate the floor and remain untrusted. The first exact
+  // successful walk after migration establishes a conservative floor at its
+  // start time; transport/page-cap walks never claim coverage. The upsert
+  // preserves an already-established floor on later polls.
+  const coverageSince = !page.incomplete && dropped === 0 ? nowSeconds : null;
 
   // CHUNKED, because D1 caps a batch at 100 statements (documented at
   // bookImport.ts's CHUNK and bookReimport.ts's WRITE_BATCH). A single batch of
@@ -568,6 +573,8 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
     // ?10 — gap_frontier_json, part of the gap triple (only lands when this
     // is the gap that wins, per the CASE guards above).
     gapFrontierJson,
+    // ?11 — coverage floor, established only by an exact successful walk.
+    coverageSince,
   );
 
   // The poll upsert rides in the LAST chunk, so the watermark can only advance

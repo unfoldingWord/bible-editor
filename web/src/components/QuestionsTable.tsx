@@ -279,7 +279,7 @@ const Row = memo(function Row({
             ...(isDirty ? { "data-dirty": "true" } : {}),
           }}
           inputProps={{
-            style: { fontSize: 12, padding: "3px 6px", fontFamily: "monospace" },
+            style: { fontSize: 12, padding: "5px 6px", fontFamily: "monospace" },
           }}
         />
       </Stack>
