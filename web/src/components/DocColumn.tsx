@@ -53,6 +53,11 @@ interface Props {
   rtl?: boolean;
   activeNoteQuote?: string | null;
   activeNoteOccurrence?: number | null;
+  // Bridged TN refs: paint quote groups on every covered verse, not only the
+  // navigated one. Also switches highlightsFor into per-group matching.
+  activeNoteQuotePartialGroups?: boolean;
+  // Verses in the active TN ref; with partialGroups, only these paint.
+  activeNoteCoveredVerses?: readonly number[];
   // Transient reorder stoplight for the active verse (drag held / ~3s after an
   // arrow move): the moved note's candidate prev (green underline) + next (red
   // overline), on channels separate from the yellow active fill.
@@ -78,7 +83,7 @@ interface Props {
   // The single active find match (the one prev/next navigates to). The cell
   // containing it paints with the stronger be-find-active style.
   findActiveMatch?: FindMatch | null;
-  onSelectVerse: (v: number) => void;
+  onSelectVerse: (v: number, onAccepted?: () => void) => void;
   onEditVerse: (verseNum: number, plain: string, base: VerseDto) => void;
   // Save every dirty draft in this column (one PATCH per verse). The
   // header button calls this; per-verse undo handles single-verse rollback.
@@ -127,6 +132,8 @@ export function DocColumn({
   rtl,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeNoteQuotePartialGroups = false,
+  activeNoteCoveredVerses,
   reorderHighlight,
   activeSourceContent,
   scrollNonce,
@@ -147,8 +154,15 @@ export function DocColumn({
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef<HTMLSpanElement | null>(null);
+  const localSelectionRef = useRef<number | null>(null);
+  const previousScrollNonce = useRef(scrollNonce);
 
   useEffect(() => {
+    const explicitScroll = previousScrollNonce.current !== scrollNonce;
+    previousScrollNonce.current = scrollNonce;
+    const localSelection = localSelectionRef.current === activeVerse;
+    localSelectionRef.current = null;
+    if (localSelection && !explicitScroll) return;
     activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [activeVerse, scrollNonce]);
 
@@ -230,20 +244,31 @@ export function DocColumn({
           // range. For singletons this reduces to v === activeVerse.
           const isActive = activeVerse >= dto.verse && activeVerse <= (dto.verse_end ?? dto.verse);
           // During a preview the yellow follows the moved/hovered note; else the
-          // active note.
+          // active note. Bridged TN quotes also paint on non-active covered verses.
           const aQuote = reorderHighlight?.movedQuote ?? activeNoteQuote;
           const aOcc = reorderHighlight?.movedQuote ? reorderHighlight.movedOccurrence : activeNoteOccurrence;
-          const highlights = isActive
-            ? highlightsFor(bibleVersion, dto.content, aQuote, aOcc, activeSourceContent)
+          const covered =
+            !!activeNoteQuotePartialGroups &&
+            !!activeNoteCoveredVerses?.some(
+              (cv) => cv >= dto.verse && cv <= (dto.verse_end ?? dto.verse),
+            );
+          const paintQuote = !!aQuote && (isActive || covered);
+          const partial = !reorderHighlight?.movedQuote && covered;
+          // OL-anchor against THIS verse's source — activeSourceContent is only
+          // the navigated verse and would mis-join a v12 ULT highlight.
+          const sourceContent =
+            sourceByVerseNum?.[dto.verse]?.content ?? activeSourceContent;
+          const highlights = paintQuote
+            ? highlightsFor(bibleVersion, dto.content, aQuote, aOcc, sourceContent, partial)
             : null;
           // Reorder stoplight neighbour sets (active verse only, while live).
           const prevHighlights =
             isActive && reorderHighlight?.prevQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, activeSourceContent)
+              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, sourceContent)
               : null;
           const nextHighlights =
             isActive && reorderHighlight?.nextQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, activeSourceContent)
+              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, sourceContent)
               : null;
           // Lift any \s1/\s2/\s3 section headers in this verse's content
           // into block-level bands rendered AFTER the inline verse span
@@ -290,7 +315,11 @@ export function DocColumn({
                 findActiveMatch={findActiveMatch ?? null}
                 spanRef={isActive ? activeRef : null}
                 textCheck={textCheck}
-                onClick={() => onSelectVerse(dto.verse)}
+                onClick={() => {
+                  onSelectVerse(dto.verse, () => {
+                    if (dto.verse !== activeVerse) localSelectionRef.current = dto.verse;
+                  });
+                }}
                 onAlign={() => onOpenAligner(dto.verse)}
                 onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
                 onSave={(plain) => onSaveColumn([{ verseNum: dto.verse, plain, base: dto }])}
@@ -465,8 +494,7 @@ function VerseSpan({
       setHasDraft(false);
       return;
     }
-    return drafts.subscribe((all) => {
-      const rec = all.find((d) => d.key === draftKey);
+    return drafts.subscribeKey(draftKey, (rec) => {
       setHasDraft(!!rec);
       // Snapshot BEFORE the mirror below overwrites it: true means the user has
       // already typed into this cell, so any draft record arriving now is the
@@ -577,11 +605,11 @@ function VerseSpan({
       }
       return chipHtml;
     }
-    if (findHTML) return findHTML;
+    if (findHTML && search?.sourceQuery.kind !== "english") return findHTML;
     // A verse with plain_text but no content tree still paints find
     // highlighting above; only past that point is there nothing to render.
-    if (!content) return null;
-    if (!Array.isArray(verseObjects)) return null;
+    if (!content) return findHTML;
+    if (!Array.isArray(verseObjects)) return findHTML;
     // Compose any drifted-down markers (from the previous verse's
     // trailing `\q1`/`\p` etc.) at the front so the visual break
     // introduces this verse, matching USFM intent.
@@ -593,7 +621,10 @@ function VerseSpan({
       : body;
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents even without an active highlight set.
-    return renderHighlightedHTML(drifted, highlights ?? new Set(), roles);
+    const rendered = renderHighlightedHTML(drifted, findHTML ? new Set() : (highlights ?? new Set()), findHTML ? undefined : roles);
+    return search?.re && search.sourceQuery.kind === "english"
+      ? overlayFindMarks(rendered, search.re, activeRange)
+      : rendered;
   }, [findHTML, content, highlights, precedingMarkers, isActive, readOnly, roles, search, isSource, activeRange]);
 
   // Resync the editable span when (a) text changes from outside and the user
@@ -682,7 +713,7 @@ function VerseSpan({
       style={{
         display: "inline",
         borderRadius: 4,
-        padding: isActive ? "1px 2px" : 0,
+        padding: "1px 2px",
         backgroundColor: isActive ? "rgba(49,173,227,0.14)" : "transparent",
         // RTL only: isolate each verse as its own bidi unit. In the continuous
         // columns flow the bare LTR verse marker ("6:3") otherwise reorders
@@ -771,7 +802,7 @@ function VerseSpan({
           onSplitBridge={onSplitBridge}
         />
       )}
-      {!readOnly && hasDraft && (
+      {!readOnly && (isActive || hasDraft) && (
         <Tooltip title={`undo edits to verse ${verseNum}`}>
           <IconButton
             onClick={(e) => {
@@ -796,7 +827,7 @@ function VerseSpan({
               }
             }}
             size="small"
-            sx={{ color: "warning.main", p: 0.25, verticalAlign: "-3px" }}
+            sx={{ visibility: hasDraft ? "visible" : "hidden", color: "warning.main", p: 0.25, verticalAlign: "-3px" }}
           >
             <UndoIcon sx={{ fontSize: 14 }} />
           </IconButton>
@@ -809,7 +840,7 @@ function VerseSpan({
           between verses. Gating on `isActive` makes ScriptureColumn's
           precondition (the chip render is guaranteed in the DOM at click) hold
           here too. */}
-      {isActive && !readOnly && hasDraft && (
+      {isActive && !readOnly && (
         <Tooltip title={`save verse ${verseNum}`}>
           <IconButton
             onClick={(e) => {
@@ -826,7 +857,7 @@ function VerseSpan({
               onSave(elRef.current?.textContent ?? lastTextRef.current);
             }}
             size="small"
-            sx={{ color: "primary.main", p: 0.25, ml: 0.75, verticalAlign: "-3px" }}
+            sx={{ visibility: hasDraft ? "visible" : "hidden", color: "primary.main", p: 0.25, ml: 0.75, verticalAlign: "-3px" }}
           >
             <SaveIcon sx={{ fontSize: 14 }} />
           </IconButton>

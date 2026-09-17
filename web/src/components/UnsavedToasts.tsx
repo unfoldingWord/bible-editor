@@ -43,39 +43,65 @@ export function UnsavedToasts({ book, onSaveVerseDraft, onJumpTo }: Props) {
   useEffect(() => drafts.subscribe(setDraftList), []);
   useEffect(() => outbox.subscribe(setOps), []);
 
-  // Re-arm IntersectionObservers whenever the draft set changes. Drafts
-  // whose corresponding cell isn't in the DOM are treated as off-screen
-  // (their editor isn't mounted in the current view).
+  // Payload/generation changes on every keystroke, but observer targets do not.
+  const visibilityTargets = JSON.stringify(draftList
+    .filter((d) => d.meta.kind === "verse" && d.meta.book === book)
+    .map((d) => [d.key, `${d.meta.chapter}-${d.meta.verse}-${d.meta.kind === "verse" ? d.meta.bibleVersion : ""}`])
+    .sort(([a], [b]) => a.localeCompare(b)));
   useEffect(() => {
-    const observers: IntersectionObserver[] = [];
-    const initialVisible = new Set<string>();
-    for (const d of draftList) {
-      if (d.meta.kind !== "verse") continue;
-      const sel = `[data-find-cell="${d.meta.chapter}-${d.meta.verse}-${d.meta.bibleVersion}"]`;
-      const el = document.querySelector<HTMLElement>(sel);
-      if (!el) continue;
-      // Optimistically count the cell as visible until the observer says
-      // otherwise — avoids a one-frame flash of the toast on mount.
-      initialVisible.add(d.key);
-      const obs = new IntersectionObserver(
-        (entries) => {
-          for (const entry of entries) {
-            setVisibleKeys((prev) => {
-              const next = new Set(prev);
-              if (entry.isIntersecting) next.add(d.key);
-              else next.delete(d.key);
-              return next;
-            });
-          }
-        },
-        { threshold: 0.05 },
-      );
-      obs.observe(el);
-      observers.push(obs);
+    const targets = JSON.parse(visibilityTargets) as [string, string][];
+    if (!targets.length) {
+      setVisibleKeys((prev) => prev.size ? new Set() : prev);
+      return;
     }
-    setVisibleKeys(initialVisible);
-    return () => observers.forEach((o) => o.disconnect());
-  }, [draftList]);
+    const observed = new Map<Element, string>();
+    const observer = new IntersectionObserver((entries) => {
+      setVisibleKeys((prev) => {
+        const next = new Set(prev);
+        for (const entry of entries) {
+          const key = observed.get(entry.target);
+          if (!key) continue;
+          if (entry.isIntersecting) next.add(key);
+          else next.delete(key);
+        }
+        return next.size === prev.size && [...next].every((key) => prev.has(key)) ? prev : next;
+      });
+    }, { threshold: 0.05 });
+    const reconcile = () => {
+      const current = new Map<Element, string>();
+      for (const [key, cell] of targets) {
+        const element = document.querySelector(`[data-find-cell="${cell}"]`);
+        if (element) current.set(element, key);
+      }
+      for (const element of observed.keys()) {
+        if (!current.has(element)) { observer.unobserve(element); observed.delete(element); }
+      }
+      const added: string[] = [];
+      for (const [element, key] of current) {
+        if (observed.has(element)) continue;
+        observed.set(element, key);
+        added.push(key);
+        observer.observe(element);
+      }
+      setVisibleKeys((prev) => {
+        const mounted = new Set(current.values());
+        const next = new Set([...prev].filter((key) => mounted.has(key)));
+        // Avoid a flash while the first intersection measurement is pending.
+        for (const key of added) next.add(key);
+        return next.size === prev.size && [...next].every((key) => prev.has(key)) ? prev : next;
+      });
+    };
+    reconcile();
+    // Mode/chapter changes may replace editor nodes without changing drafts.
+    // Ignore text mutations from ordinary typing.
+    const domObserver = new MutationObserver((mutations) => {
+      if (mutations.some((mutation) => [...mutation.addedNodes, ...mutation.removedNodes]
+        .some((node) => node instanceof Element &&
+          (node.matches("[data-find-cell]") || node.querySelector("[data-find-cell]"))))) reconcile();
+    });
+    domObserver.observe(document.body, { childList: true, subtree: true });
+    return () => { observer.disconnect(); domObserver.disconnect(); };
+  }, [visibilityTargets]);
 
   const offscreenDrafts = useMemo(() => {
     return draftList.filter(

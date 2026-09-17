@@ -134,10 +134,21 @@
 //   • Each UPDATE is version-CAS'd; the paired edit_log row is an
 //     INSERT...SELECT gated on the post-update state (version+1 AND the
 //     exact new content_json), so a skipped UPDATE can never leave an audit
-//     row behind for a write that didn't happen. `updated_by` is left NULL —
-//     the restore is attributed via edit_log.source='data_repair' +
-//     action='restore_master_verse' + a payload identifying the incident,
-//     never to a translator's user id.
+//     row behind for a write that didn't happen. A row with no owner
+//     (`updated_by IS NULL`) is excluded up front (EXCLUDE_NO_OWNER) rather
+//     than restored pristine, because a pristine row reads as fair game for
+//     the very next nightly reimport to overwrite wholesale from master
+//     before the fix is ever exported (#822). Every written row therefore
+//     keeps its existing non-NULL `updated_by` untouched — never a
+//     translator's user id, never nulled. The edit_log row uses
+//     action='update' (so the reimport's ancestor/latest-source sub-selects,
+//     which only recognize 'create'/'update'/'bridge'/'split', can see it)
+//     and source=NULL (so the human_edit_after_export probe, which requires
+//     `source IS NULL`, sees it as a real post-export touch); the repair's
+//     own provenance (incident, source commit, 'data_repair' origin) lives
+//     in the payload instead, alongside `content`/`plain_text` so the row is
+//     recoverable as a merge ancestor and restorable in the version-history
+//     dialog once superseded.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
@@ -587,6 +598,7 @@ const BUCKETS = [
   "NOT_REVERTED",
   "NEWER_EDIT_KEPT",
   "NO_TIMESTAMP",
+  "EXCLUDE_NO_OWNER",
   "MISSING_IN_D1",
   "EXCLUDE_ALIGNMENT_SHRINK",
   "EXCLUDE_EDITED_TODAY",
@@ -657,6 +669,16 @@ for (const [key, proposed] of humanProposed) {
   }
   if (d1.updated_at >= tcDate.getTime() / 1000) {
     findings.push({ ...base, bucket: "NEWER_EDIT_KEPT" });
+    continue;
+  }
+  // A repair row must remain human-owned after the write. Leaving a row with
+  // updated_by=NULL makes it look pristine to the nightly reimport, which can
+  // immediately replace the repaired content from a still-stale master. This
+  // generic tool has no authority to invent an owner, so fail closed; a caller
+  // that needs to repair an unowned row must first choose an explicit actor in
+  // a separately reviewed repair.
+  if (d1.updated_by == null) {
+    findings.push({ ...base, bucket: "EXCLUDE_NO_OWNER" });
     continue;
   }
   // Candidate RESTORE — now run the guards, in order, reporting the first failure.
@@ -786,6 +808,7 @@ console.log(`  RESTORE (writable)                       : ${restoreCandidates.le
 }
 console.log(`  NEWER_EDIT_KEPT (correctly not restored) : ${findings.filter((f) => f.bucket === "NEWER_EDIT_KEPT").length}`);
 console.log(`  NO_TIMESTAMP (needs a human)              : ${findings.filter((f) => f.bucket === "NO_TIMESTAMP").length}`);
+console.log(`  EXCLUDE_NO_OWNER (would remain pristine)  : ${findings.filter((f) => f.bucket === "EXCLUDE_NO_OWNER").length}`);
 console.log(`  EXCLUDE_EDITED_TODAY                      : ${findings.filter((f) => f.bucket === "EXCLUDE_EDITED_TODAY").length}`);
 console.log(`  EXCLUDE_EMPTY                              : ${findings.filter((f) => f.bucket === "EXCLUDE_EMPTY").length}`);
 console.log(`  EXCLUDE_ALIGNMENT_SHRINK                  : ${findings.filter((f) => f.bucket === "EXCLUDE_ALIGNMENT_SHRINK").length}`);
@@ -811,25 +834,39 @@ function sqlEscape(s) {
 function updateStatements(f, nowTs, expectedVersion) {
   const rowKey = `${book}/${f.chapter}/${f.verse}/${bibleVersion}`;
   const payload = JSON.stringify({
+    content: JSON.parse(f.proposed.contentJson),
+    plain_text: f.proposedPlainText,
+    verse_end: f.proposed.verseEnd,
     incident,
-    sourceCommit: humanResolved.sha,
-    chapter: f.chapter,
-    verse: f.verse,
+    repair_source: "data_repair",
+    source_commit: humanResolved.sha,
     from: f.d1PlainText,
-    to: f.proposedPlainText,
   });
+  const cutoff = Math.floor(tcDate.getTime() / 1000);
   const upd =
     `UPDATE verses SET content_json = ${sqlStr(f.proposed.contentJson)}, plain_text = ${sqlStr(f.proposed.plainText)},` +
-    ` verse_end = ${f.proposed.verseEnd == null ? "NULL" : f.proposed.verseEnd}, version = version + 1, updated_at = ${nowTs}` +
+    ` verse_end = ${f.proposed.verseEnd == null ? "NULL" : f.proposed.verseEnd}, version = version + 1, updated_at = ${nowTs},` +
+    ` last_change_action = 'update', last_change_source = 'system', last_change_actor = ${sqlStr(`data repair ${incident}`)}` +
     ` WHERE book = ${sqlStr(book)} AND chapter = ${f.chapter} AND verse = ${f.verse}` +
-    ` AND bible_version = ${sqlStr(bibleVersion)} AND version = ${expectedVersion};`;
+    ` AND bible_version = ${sqlStr(bibleVersion)} AND version = ${expectedVersion}` +
+    ` AND updated_at < ${cutoff} AND updated_by IS NOT NULL` +
+    ` AND content_json = ${sqlStr(f.d1.content_json)};`;
+  // `source` is deliberately NULL, not 'data_repair': bookReimport.ts's
+  // human_edit_after_export EXISTS probe (the merge's FIX D undo-then-redo
+  // guard, api/src/verseMerge.ts step 5) requires `source IS NULL AND
+  // action <> 'baseline'` to recognize a post-export write as human-touched.
+  // A non-NULL source here is invisible to that probe, so a repair that
+  // happens to reconstruct the pre-repair ancestor's exact bytes on some
+  // later run would read as "ours never moved" and adopt master silently
+  // instead of flagging for review (#822). The 'data_repair' provenance
+  // this used to carry lives in the payload's `repair_source` key instead —
+  // isReimportableRow/isHumanIntentRemoval never read the edit_log.source
+  // column for a content 'update' row, only payload consumers do.
   const log =
     `INSERT INTO edit_log (kind,row_key,book,user_id,prev_version,new_version,action,payload_json,source,created_at)` +
-    ` SELECT 'verse',${sqlStr(rowKey)},${sqlStr(book)},NULL,${expectedVersion},${expectedVersion + 1},'restore_master_verse',` +
-    `${sqlStr(payload)},'data_repair',${nowTs}` +
-    ` FROM verses WHERE book = ${sqlStr(book)} AND chapter = ${f.chapter} AND verse = ${f.verse}` +
-    ` AND bible_version = ${sqlStr(bibleVersion)} AND version = ${expectedVersion + 1}` +
-    ` AND content_json = ${sqlStr(f.proposed.contentJson)};`;
+    ` SELECT 'verse',${sqlStr(rowKey)},${sqlStr(book)},NULL,${expectedVersion},${expectedVersion + 1},'update',` +
+    `${sqlStr(payload)},NULL,${nowTs}` +
+    ` WHERE changes() > 0;`;
   return [upd, log];
 }
 

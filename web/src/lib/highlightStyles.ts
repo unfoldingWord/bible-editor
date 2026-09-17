@@ -49,7 +49,7 @@ function roleMarkSx(mode: Mode) {
     "& mark.be-hl-prev:not(.be-hl), & mark.be-hl-next:not(.be-hl)": {
       backgroundColor: "transparent",
       color: "inherit",
-      padding: "0 2px",
+      padding: 0,
     },
     "& mark.be-hl-prev": { ...roleLineSx(mode, true, false), borderRadius: 0 },
     "& mark.be-hl-next": { ...roleLineSx(mode, false, true), borderRadius: 0 },
@@ -223,14 +223,14 @@ export function markHighlightSx(mode: Mode) {
       ...roleMarkSx(mode),
       "& mark.be-hl": {
         backgroundColor: "rgba(255, 244, 138, 0.22)",
-        padding: "0 2px",
+        padding: 0,
         borderRadius: 0.5,
         color: "inherit",
       },
       "& mark.be-find": {
         backgroundColor: "rgba(255, 217, 102, 0.28)",
         outline: "1px solid rgba(251, 191, 36, 0.9)",
-        padding: "0 1px",
+        padding: 0,
         borderRadius: 0.5,
         color: "inherit",
       },
@@ -245,14 +245,14 @@ export function markHighlightSx(mode: Mode) {
     ...roleMarkSx(mode),
     "& mark.be-hl": {
       backgroundColor: "#fff48a",
-      padding: "0 2px",
+      padding: 0,
       borderRadius: 0.5,
       color: "inherit",
     },
     "& mark.be-find": {
       backgroundColor: "#ffd966",
       outline: "1px solid #d97706",
-      padding: "0 1px",
+      padding: 0,
       borderRadius: 0.5,
       color: "inherit",
     },
@@ -270,19 +270,19 @@ export function wordHighlightStyles(mode: Mode) {
     return {
       hl: {
         backgroundColor: "rgba(255, 244, 138, 0.22)",
-        padding: "0 2px",
+        padding: 0,
         borderRadius: 0.5,
       },
       find: {
         backgroundColor: "rgba(255, 217, 102, 0.28)",
         outline: "1px solid rgba(251, 191, 36, 0.9)",
-        padding: "0 1px",
+        padding: 0,
         borderRadius: 0.5,
       },
       findActive: {
         backgroundColor: "rgba(251, 146, 60, 0.4)",
         outline: "2px solid #fb923c",
-        padding: "0 1px",
+        padding: 0,
         borderRadius: 0.5,
       },
     };
@@ -290,19 +290,19 @@ export function wordHighlightStyles(mode: Mode) {
   return {
     hl: {
       backgroundColor: "#fff48a",
-      padding: "0 2px",
+      padding: 0,
       borderRadius: 0.5,
     },
     find: {
       backgroundColor: "#ffd966",
       outline: "1px solid #d97706",
-      padding: "0 1px",
+      padding: 0,
       borderRadius: 0.5,
     },
     findActive: {
       backgroundColor: "#fb923c",
       outline: "2px solid #c2410c",
-      padding: "0 1px",
+      padding: 0,
       borderRadius: 0.5,
     },
   };

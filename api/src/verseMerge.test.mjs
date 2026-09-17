@@ -229,6 +229,71 @@ console.log("\n[#540 item 2: an AI-only master movement never beats a later huma
   eq(r.reason, "unparseable", "…with the refusal's own reason, not the policy's");
 }
 
+console.log("\n[#787: an AI-only master excursion is decided before the shrink check spends alignment protection on it]");
+
+// The EZK UST shape (issue #787): base has no aligned word at all, D1's
+// translator later aligned it, and master is still sitting on a stale bare
+// render of the same word from before our own earlier export. Both sides
+// moved since the ancestor, and the lineage says every commit that moved
+// master since then was ours/the pipeline's, so #540 item 2's "AI never
+// beats a human" policy should decide this outright. Before #787, the
+// shrink guard ran first, saw ours (aligned) losing alignment against theirs
+// (bare), and returned keep_alignment_refused — which the systemic-refusal
+// gate then counted toward freezing the WHOLE book's nightly export, even
+// though D1 was always going to be kept here either way.
+{
+  const base = text("no word here yet");
+  const ours = content([zaln("H1", [w("Lord")])]); // translator aligned it
+  const theirs = content([w("Lord")]); // master's stale bare render
+  const r = computeVerseMerge({ base, ours, theirs, humanEditedSinceExport: false, masterMayHoldHumanEdit: false });
+  eq(r.action, "keep_ai_master", "both moved + AI-only master lineage → keep_ai_master, not a shrink refusal");
+  eq(r.adopt, false, "keep_ai_master: adopt false");
+  eq(r.conflict, true, "keep_ai_master: conflict true");
+  eq(r.reason, "both_changed_ai_master", "keep_ai_master: reason slug, not alignment_shrink");
+  eq(r.alignment, undefined, "keep_ai_master here: the shrink check never ran, so no alignment detail is attached");
+}
+
+// Same shape, but the lineage says master's side MAY hold a human edit — the
+// shrink guard must still run and refuse, exactly as before #787.
+{
+  const base = text("no word here yet");
+  const ours = content([zaln("H1", [w("Lord")])]);
+  const theirs = content([w("Lord")]);
+  const r = computeVerseMerge({ base, ours, theirs, humanEditedSinceExport: false, masterMayHoldHumanEdit: true });
+  eq(r.action, "keep_alignment_refused", "master may hold a human edit → the shrink guard still refuses");
+  eq(r.reason, "alignment_shrink", "…with its own reason");
+  eq(r.alignment?.lostWords?.[0], "Lord", "…naming the word that would lose alignment");
+}
+
+// masterMayHoldHumanEdit omitted (nobody looked) must read exactly like
+// `true` here too — the #787 branch may only ever ride on a measured false.
+{
+  const base = text("no word here yet");
+  const ours = content([zaln("H1", [w("Lord")])]);
+  const theirs = content([w("Lord")]);
+  const r = computeVerseMerge({ base, ours, theirs, humanEditedSinceExport: false });
+  eq(r.action, "keep_alignment_refused", "masterMayHoldHumanEdit omitted → still refuses, never keep_ai_master");
+}
+
+// ours === base ("master moved, we did not") is item 1 of #787's approach:
+// the shrink refusal stays exactly as-is, regardless of lineage, because the
+// new branch's guard is `!keysEqual(oursKey, baseKey)` — it can never fire
+// when ours === base. This is the same shape as the "bare survivor" test
+// above (base === ours there too); confirm the lineage flag has no effect.
+{
+  const aligned = content([zaln("H1", [w("home")])]);
+  const bare = content([w("home")]);
+  const r = computeVerseMerge({
+    base: aligned,
+    ours: aligned,
+    theirs: bare,
+    humanEditedSinceExport: false,
+    masterMayHoldHumanEdit: false,
+  });
+  eq(r.action, "keep_alignment_refused", "ours === base: the #787 branch never fires, lineage or not");
+  eq(r.reason, "alignment_shrink", "…and the shrink guard still runs, per #787 item 1");
+}
+
 console.log("\n[stableKey: key-order-only differences do not manufacture false diffs]");
 
 // Regression: base and ours can arrive from different writers with different
