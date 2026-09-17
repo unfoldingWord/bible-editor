@@ -2,7 +2,7 @@
 //   GET    /api/admin/sync-status        — D1-only view of pull/export state per book x resource.
 //   GET    /api/admin/prs                — live DCS read: open `-be-` export PRs across all 5 repos.
 //   GET    /api/admin/sync-activity      — durable log of "record"-kind system_alerts (issue #535):
-//                                           non-blocking, no-action-needed export/sync records that
+//                                           non-blocking, no-action-needed export/reimport records that
 //                                           used to show up as a personal alert on the admin's account.
 //   GET    /api/admin/users              — list the editor/admin allowlist (user_roles).
 //   POST   /api/admin/users              — upsert a user's role.
@@ -248,9 +248,10 @@ admin.get("/prs", async (c) => {
 // ── GET /sync-activity ───────────────────────────────────────────────────
 
 // Durable admin-only log of "record"-kind system_alerts (issue #535): rows
-// written by exportWorkflow.ts's recordExportRevertReport for a night's
-// "shipped to Door43 and overwrote master's content" / mechanical-overwrite
-// records. These are non-blocking and need no human decision, so
+// written by exportWorkflow.ts's recordExportRevertReport and
+// bookReimport.ts's kept-over-Door43 measurement for a night's
+// "shipped to Door43 and overwrote master's content" / mechanical-overwrite /
+// app-kept-at-scale records. These are non-blocking and need no human decision, so
 // GET /api/alerts/me deliberately excludes them (kind != 'review') — this is
 // their only home. Deliberately NOT filtered by dismissed_at: this is a log
 // of what happened, not a to-do list, so a dismissed row (dismissal only

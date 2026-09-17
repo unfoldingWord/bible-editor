@@ -953,10 +953,14 @@ export interface HumanRefEvidence {
   reason: string;
 }
 
-/** One unified-diff hunk, new-side only — that is the side the fetched file is. */
+/** One unified-diff hunk, retaining both old and new sides for ref moves. */
 export interface HunkRange {
+  /** New-side range, as before. */
   newStart: number;
   newCount: number;
+  /** Old-side range from the same unified-diff header. */
+  oldStart: number;
+  oldCount: number;
 }
 
 const REF_INCOMPLETE = (reason: string): HumanRefEvidence => ({ complete: false, refs: [], reason });
@@ -1057,8 +1061,9 @@ export function parseDiffHunksForPath(
       const oldCount = h[2] === undefined ? 1 : Number(h[2]);
       const newStart = Number(h[3]);
       const newCount = h[4] === undefined ? 1 : Number(h[4]);
+      const oldStart = Number(h[1]);
       open = {
-        range: { newStart, newCount },
+        range: { oldStart, oldCount, newStart, newCount },
         oldCount,
         newCount,
         ctx: 0,
@@ -1402,6 +1407,38 @@ function refsFrom(lineage: MasterLineage | MasterLineageSummary): HumanRefEviden
 /** Does this evidence claim (chapter, verse)? "c:*" claims the whole chapter. */
 export function refEvidenceTouches(refs: string[], chapter: number, verse: number): boolean {
   return refs.includes(`${chapter}:*`) || refs.includes(`${chapter}:${verse}`);
+}
+
+/**
+ * Positive-evidence counterpart to masterMayHoldHumanEditForVerse.
+ *
+ * This may authorize an exact master-byte adoption, so uncertainty must return
+ * false rather than the protective true used by the master-wins question. The
+ * entire ref set is validated by refsFrom; one malformed entry invalidates it.
+ */
+export function completeHumanRefEvidenceTouches(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+  chapter: number,
+  verse: number,
+  verseEnd?: number | null,
+): boolean {
+  if (
+    lineage == null ||
+    !("mayHoldHumanEdit" in lineage) ||
+    lineage.mayHoldHumanEdit !== true ||
+    lineage.incomplete !== false ||
+    lineage.hasHumanCommit !== true
+  ) return false;
+  if (!Number.isInteger(chapter) || !Number.isInteger(verse) || chapter < 0 || verse < 0) return false;
+  const ev = refsFrom(lineage);
+  if (ev === null || ev.refs.length === 0) return false;
+  let end = verse;
+  if (verseEnd != null) {
+    if (!Number.isInteger(verseEnd) || verseEnd < verse || verseEnd - verse > MAX_BRIDGE_WIDTH) return false;
+    end = verseEnd;
+  }
+  for (let v = verse; v <= end; v++) if (refEvidenceTouches(ev.refs, chapter, v)) return true;
+  return false;
 }
 
 // The per-verse form of masterMayHoldHumanEdit — what the verse merge asks now.

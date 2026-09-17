@@ -471,9 +471,53 @@ console.log("\n6b. F6 — release on the SHA-match convergence path");
     eq(plan.entries[0].changed, false, "SHA-match → nothing staged (unchanged behavior)");
     eq(rawFetches, 0, "…and no file is fetched, so the gate never runs — which is why the clear must live here");
     eq(sqlite.prepare(`SELECT COUNT(*) c FROM stale_base_holds WHERE resolved_at IS NULL`).all()[0].c, 0, "F6: the stale hold is released on convergence");
-    eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(src)[0].c, 0, "F6: …and the banner is dropped");
+    eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL AND resolved_at IS NULL`).all(src)[0].c, 0, "F6: …and no standing banner remains");
+    eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND resolved_at IS NOT NULL`).all(src)[0].c, 1, "F6: …while preserving the resolved transition in history");
   } finally {
     globalThis.fetch = realFetch4;
+  }
+}
+
+// ── 6c. #789: an active kept-D1 backlog bypasses the SHA fast path ────────
+// The first production run after #794 proved that otherwise no old row is ever
+// remeasured: stage 1 had already advanced source_sha, so all 114 rows exited
+// before applyVerseRows. A normal run must fetch/stage this one resource.
+console.log("\n6c. #789 — SHA match with active conflict backlog is remeasured");
+{
+  const realFetch4c = globalThis.fetch;
+  try {
+    const { sqlite, env } = freshEnv();
+    sqlite.exec(
+      `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version)
+       VALUES ('2CH', 4, 11, 'ULT', '{"a":1}', 'a', 2)`,
+    );
+    sqlite.prepare(
+      `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin)
+       VALUES ('2CH','ult',?,?,'reimport')`,
+    ).run(MASTER_SHA, SYNCED_AT);
+    sqlite.exec(
+      `INSERT INTO verse_merge_conflicts
+         (book, resource, chapter, verse, action, reason, detected_at, last_recorded_at)
+       VALUES ('2CH','ult',4,11,'keep_alignment_refused','alignment_shrink',100,100)`,
+    );
+
+    let rawFetches = 0;
+    stubFetch({
+      masterSha: MASTER_SHA,
+      masterBody: bodyWith(PREV_ID_LINE),
+      prevBodyBySha: { [MASTER_SHA]: bodyWith(PREV_ID_LINE) },
+    });
+    const inner = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      if (String(u).includes("/raw/")) rawFetches++;
+      return inner(u);
+    };
+
+    const plan = await planAndStageBookResourcesForTest(env, "2CH", ["ult"], "inst-789");
+    eq(plan.entries[0].changed, true, "active kept-D1 row bypasses the SHA-match skip and stages for remeasurement");
+    eq(rawFetches > 0, true, "the unchanged master file is fetched instead of leaving the backlog frozen");
+  } finally {
+    globalThis.fetch = realFetch4c;
   }
 }
 
@@ -551,7 +595,8 @@ console.log("\n5. durable record + banner");
   sqlite.prepare(`UPDATE system_alerts SET dismissed_at = NULL WHERE source = ?`).run(src);
   await clearStaleBaseHold(env, "2CH", "ult", t2 + 172800);
   eq(sqlite.prepare(`SELECT COUNT(*) c FROM stale_base_holds WHERE resolved_at IS NULL`).all()[0].c, 0, "clean sync releases every active hold");
-  eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(src)[0].c, 0, "…and clears the banner");
+  eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL AND resolved_at IS NULL`).all(src)[0].c, 0, "…and clears the standing banner");
+  eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND resolved_at IS NOT NULL`).all(src)[0].c, 1, "…while preserving the resolved transition in history");
 }
 
 // ── 8. F2: the admin "Pull from Door43" route runs the same gate ────────────

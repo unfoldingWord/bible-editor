@@ -448,6 +448,19 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   if (oursKey === null || theirsKey === null || alignmentTheirsKey === null) {
     return { action: "keep_alignment_refused", adopt: false, conflict: true, reason: "unparseable" };
   }
+
+  // #787: both sides have genuinely moved since the ancestor (ours != base —
+  // the "master only" case below is untouched) and the lineage says master's
+  // excursion is provably AI/ours-only. Step 6 would keep D1 here regardless
+  // of alignment, so decide that now, before spending the shrink check on the
+  // side we're about to discard: a shrink on master's rejected content is not
+  // a reason to refuse and count toward isSystemicMergeRefusal, which is what
+  // was freezing the nightly export at the systemic-refusal threshold (see
+  // reimportSyncGate.ts) even though D1 was always going to win this verse.
+  if (!keysEqual(oursKey, baseKey) && masterMayHoldHumanEdit === false) {
+    return { action: "keep_ai_master", adopt: false, conflict: true, reason: "both_changed_ai_master" };
+  }
+
   const delta = analyzeAlignmentDelta(JSON.parse(ours), JSON.parse(alignmentTheirs));
   const lostWords = delta.unexpectedLosses.filter((loss) => loss.reason === "lost").map((loss) => loss.text);
   if (delta.afterAligned < delta.beforeAligned || lostWords.length > 0) {
@@ -509,6 +522,12 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   // Nothing is written here, so nothing is lost either way: the export still
   // publishes D1 over master, which is the point — that is how the human's edit
   // reaches Door43 instead of being reverted by it.
+  //
+  // #787: the common "ours != base" shape of this now returns earlier (ahead
+  // of the alignment guard, above). This check still matters for the FIX D
+  // corner it was already covering — humanEditedSinceExport true with ours
+  // reconstructing base's bytes (undo-then-redo) — where the guard runs as
+  // before and this is the first place masterMayHoldHumanEdit gets asked.
   if (masterMayHoldHumanEdit === false) {
     return { action: "keep_ai_master", adopt: false, conflict: true, reason: "both_changed_ai_master" };
   }

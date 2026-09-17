@@ -617,7 +617,7 @@ async function run() {
     {
       const at = (iso, sha, message, email) => ({
         sha,
-        commit: { message, author: { email, name: "x", date: iso } },
+        commit: { message, author: { email, name: "x", date: iso }, committer: { date: iso } },
       });
       const W = Math.floor(Date.parse("2026-08-10T00:00:00Z") / 1000);
 
@@ -666,20 +666,68 @@ async function run() {
         assert(r.commits.length === 1, "  ...having walked everything the file has");
       }
 
-      // An unparseable date does not end the walk. "I cannot read this
-      // timestamp" is not evidence of having gone far enough, so it walks on and
-      // reports page_cap rather than a confident short range.
+      // An unparseable COMMITTER date is not evidence of having gone far
+      // enough. It must fail closed immediately; using the author date or
+      // walking onward to a false complete answer would hide coverage loss.
       {
-        let n = 0;
-        globalThis.fetch = async () => {
-          n++;
-          return commitsRes([at("not a date", `s${n}`, "hand fix", "rich@x")], { hasMore: true });
-        };
+        globalThis.fetch = async () =>
+          commitsRes(
+            [{
+              sha: "bad-time",
+              commit: {
+                message: "hand fix",
+                author: { email: "rich@x", name: "x", date: "2026-08-12T00:00:00Z" },
+                committer: { date: "not a date" },
+              },
+            }],
+            { hasMore: true },
+          );
         const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", null, { sinceTime: W, pageLimit: 2 });
-        assert(n === 2, "an unreadable commit date does not end a time-bounded walk");
-        assert(r.incomplete === true && r.incompleteReason === "page_cap", "  ...it runs to the page cap and says so");
+        assert(r.incomplete === true && r.incompleteReason === "commit_committer_time_unknown", "an unreadable committer date fails a time-bounded walk closed");
+        assert(r.commits.length === 0, "  ...and does not admit a commit whose landing time is unknown");
+      }
+      {
+        globalThis.fetch = async () =>
+          commitsRes(
+            [{
+              sha: "missing-time",
+              commit: {
+                message: "hand fix",
+                author: { email: "rich@x", name: "x", date: "2026-08-12T00:00:00Z" },
+              },
+            }],
+            { hasMore: false },
+          );
+        const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", null, { sinceTime: W });
+        assert(r.incomplete === true && r.incompleteReason === "commit_committer_time_unknown", "a missing committer date also fails closed");
       }
     }
+  }
+
+  // A late push can carry an old AUTHOR date but a current COMMITTER date.
+  // The ledger window is about when it landed on master, so the committer
+  // timestamp must keep it in the range (issue #691).
+  {
+    const W = 100;
+    const at = (sha, authorDate, committerDate) => ({
+      sha,
+      commit: {
+        message: "hand fix",
+        author: { email: "h@x", name: "x", date: authorDate },
+        committer: { date: committerDate },
+      },
+    });
+    globalThis.fetch = async () => ({
+      ok: true,
+      headers: { get: (key) => key.toLowerCase() === "x-pagecount" ? "1" : null },
+      json: async () => [
+        at("late", "1970-01-01T00:00:01Z", "1970-01-01T00:03:20Z"),
+        at("old", "1970-01-01T00:00:02Z", "1970-01-01T00:01:00Z"),
+      ],
+    });
+    const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", null, { sinceTime: W });
+    assert(r.incomplete === false && r.commits.some((c) => c.sha === "late") && !r.commits.some((c) => c.sha === "old"),
+      "a backdated author date does not hide a commit whose committer date landed in the window");
   }
 
   // ── fetchHumanTouchedRefs (issue #557) ────────────────────────────────────
@@ -704,6 +752,7 @@ async function run() {
 
     // url -> response, so the assertions can also check WHAT was asked for.
     let asked = [];
+    const PARENT = "1111111111111111111111111111111111111111";
     const serve = (map) => {
       asked = [];
       globalThis.fetch = async (url) => {
@@ -713,18 +762,59 @@ async function run() {
       };
     };
     const commit = (sha) => ({ sha, message: "Fixes USFM", authorEmail: "rich.mahn@unfoldingword.org" });
+    const withParent = (sha) => ({ ...commit(sha), parentSha: PARENT });
 
     {
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: DIFF, contentLength: DIFF.length })],
+        [`raw/${PATH}?ref=${SHA}`, () => res({ body: USFM, contentLength: USFM.length })],
+        [`raw/${PATH}?ref=${PARENT}`, () => res({ body: USFM, contentLength: USFM.length })],
+      ]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [withParent(SHA)]);
+      assert(ev.complete === true, "a mappable human commit yields complete evidence");
+      assert(ev.refs.includes("40:2"), "  ...naming the verse its hunk landed in");
+      assert(asked.length === 3, "  ...for exactly three subrequests: diff plus both revision sides");
+      assert(asked[0].includes(`/git/commits/${SHA}.diff`), "  ...the commit's own diff");
+      assert(asked[1].includes(`ref=${SHA}`), "  ...and the new file PINNED to that commit, not master's tip");
+    }
+    {
+      // A moved row has two meaningful refs. Read the old range from the
+      // parent revision as well as the new range from the commit revision, so
+      // a later move-back cannot make the original human edit disappear from
+      // ref-scoped lineage.
+      const OLD = ["\\id JER", "\\c 40", "\\v 1 old", ""].join("\n");
+      const NEXT = ["\\id JER", "\\c 40", "\\v 2 new", ""].join("\n");
+      const movedDiff = [
+        `diff --git a/${PATH} b/${PATH}`,
+        `--- a/${PATH}`,
+        `+++ b/${PATH}`,
+        "@@ -3 +3 @@",
+        "-\\v 1 old",
+        "+\\v 2 new",
+        "",
+      ].join("\n");
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: movedDiff, contentLength: movedDiff.length })],
+        [`raw/${PATH}?ref=${SHA}`, () => res({ body: NEXT, contentLength: NEXT.length })],
+        [`raw/${PATH}?ref=${PARENT}`, () => res({ body: OLD, contentLength: OLD.length })],
+      ]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [
+        withParent(SHA),
+      ]);
+      assert(ev.complete === true, "a ref move with a parent revision maps completely");
+      assert(ev.refs.includes("40:1") && ev.refs.includes("40:2"), "  ...including both old and new refs");
+      assert(asked.length === 3, "  ...fetching the diff plus both pinned revisions");
+    }
+    {
+      // A non-creation hunk without a parent revision cannot identify the old
+      // ref. It must not silently narrow the protective file-level answer.
       serve([
         [`git/commits/${SHA}.diff`, () => res({ body: DIFF, contentLength: DIFF.length })],
         [`raw/${PATH}`, () => res({ body: USFM, contentLength: USFM.length })],
       ]);
       const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
-      assert(ev.complete === true, "a mappable human commit yields complete evidence");
-      assert(ev.refs.includes("40:2"), "  ...naming the verse its hunk landed in");
-      assert(asked.length === 2, "  ...for exactly two subrequests: the diff and the file at that revision");
-      assert(asked[0].includes(`/git/commits/${SHA}.diff`), "  ...the commit's own diff");
-      assert(asked[1].includes(`ref=${SHA}`), "  ...and the file PINNED to that commit, not master's tip");
+      assert(ev.complete === false && ev.reason === "parent_revision_unavailable",
+        "a missing parent for an old-side hunk is incomplete, never new-side-only evidence");
     }
     {
       // THE PRODUCTION SHAPE, and the one this file did not cover at first:
@@ -734,9 +824,10 @@ async function run() {
       // prove nothing — the diff body's own hunk counts are the proof instead.
       serve([
         [`git/commits/${SHA}.diff`, () => res({ body: DIFF })], // no content-length
-        [`raw/${PATH}`, () => res({ body: USFM, contentLength: USFM.length })],
+        [`raw/${PATH}?ref=${SHA}`, () => res({ body: USFM, contentLength: USFM.length })],
+        [`raw/${PATH}?ref=${PARENT}`, () => res({ body: USFM, contentLength: USFM.length })],
       ]);
-      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [withParent(SHA)]);
       assert(ev.complete === true, "a header-less diff (production's actual shape) is still mapped");
       assert(ev.refs.includes("40:2"), "  ...to the right verse");
     }
@@ -762,9 +853,10 @@ async function run() {
       // and the short-read check must still fire on the second.
       serve([
         [`git/commits/${SHA}.diff`, () => res({ body: DIFF })],
-        [`raw/${PATH}`, () => res({ body: USFM })],
+        [`raw/${PATH}?ref=${SHA}`, () => res({ body: USFM })],
+        [`raw/${PATH}?ref=${PARENT}`, () => res({ body: USFM })],
       ]);
-      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [withParent(SHA)]);
       assert(ev.complete === true, "a header-less revision body is accepted (unverifiable at this layer)");
       serve([
         [`git/commits/${SHA}.diff`, () => res({ body: DIFF })],
@@ -844,13 +936,14 @@ async function run() {
       ].join("\n");
       serve([
         [`git/commits/${SHA}.diff`, () => res({ body: TSV_DIFF, contentLength: TSV_DIFF.length })],
-        [`raw/${TSV_PATH}`, () => res({ body: TSV, contentLength: TSV.length })],
+        [`raw/${TSV_PATH}?ref=${SHA}`, () => res({ body: TSV, contentLength: TSV.length })],
+        [`raw/${TSV_PATH}?ref=${PARENT}`, () => res({ body: TSV, contentLength: TSV.length })],
       ]);
-      const ev = await fetchHumanTouchedRefs(env, "en_tn", TSV_PATH, [commit(SHA)]);
+      const ev = await fetchHumanTouchedRefs(env, "en_tn", TSV_PATH, [withParent(SHA)]);
       assert(ev.complete === true, "a mappable TSV human commit yields complete evidence");
       assert(ev.refs.includes("40:2"), "  ...naming the ref its hunk landed in");
       assert(!ev.refs.includes("40:1") && !ev.refs.includes("40:3"), "  ...and only that ref, not its neighbors");
-      assert(asked.length === 2, "  ...for exactly two subrequests: the diff and the file at that revision");
+      assert(asked.length === 3, "  ...for exactly three subrequests: diff plus both revision sides");
       assert(asked[1].includes(`ref=${SHA}`), "  ...the file PINNED to that commit, not master's tip");
     }
     {

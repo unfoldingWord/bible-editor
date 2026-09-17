@@ -84,7 +84,7 @@ function commit(
   const parentShas = parents ?? (parent ? [parent] : []);
   return {
     sha,
-    commit: { message, author: { email, name, date } },
+    commit: { message, author: { email, name, date }, committer: { date } },
     // Measured: null on plenty of commits, human ones included. Nothing in the
     // poller may read it.
     author: null,
@@ -216,6 +216,11 @@ async function main() {
     const upsert = pollUpsert(db);
     assert(upsert.args[1] === "a0", "advances the high-water mark to the NEW tip (newest-first walk)");
     assert(upsert.args[5] === "ok" && upsert.args[6] === null, "  ...with no gap recorded on a complete walk");
+    assert(upsert.args[10] === NOW, "  ...establishing the post-migration coverage floor on an exact successful poll");
+    assert(
+      /coverage_since = COALESCE\(dcs_repo_polls\.coverage_since, excluded\.coverage_since\)/.test(upsert.sql),
+      "  ...preserving an already-established coverage floor on later exact polls",
+    );
   }
 
   // ── high-water-mark resume: steady state is ONE page ──────────────────────
@@ -368,6 +373,7 @@ async function main() {
     assert(upsert.args[8] === 0, "  ...the advance flag is 0, so the high-water mark is NOT moved");
     assert(upsert.args[4] === null, "  ...and last_success_at is left alone");
     assert(upsert.args[3] === NOW, "  ...while last_attempted_at moves, so we retry per interval not per tick");
+    assert(upsert.args[10] === null, "  ...and never establishing a coverage floor from a transport failure");
   }
 
   // ── classification is a PASS-THROUGH of classifyMasterCommit ─────────────
@@ -379,6 +385,7 @@ async function main() {
         authorEmail: "someone@example.com",
         authorName: "Someone",
         date: "2026-08-14T01:00:00Z",
+        committerDate: "2026-08-14T01:00:00Z",
       },
       {
         // The anchoring trap: a HUMAN revert quoting our own subject. A
@@ -389,6 +396,7 @@ async function main() {
         authorEmail: "rich.mahn@example.com",
         authorName: "Richard Mahn",
         date: "2026-08-14T02:00:00Z",
+        committerDate: "2026-08-14T02:00:00Z",
       },
       {
         sha: "s3",
@@ -396,6 +404,7 @@ async function main() {
         authorEmail: "bot@unfoldingword.org",
         authorName: "BW Bot",
         date: "2026-08-14T03:00:00Z",
+        committerDate: "2026-08-14T03:00:00Z",
       },
     ]);
     assert(rows[0].classification === "ours", "an anchored `bible-editor:` subject classifies ours");
@@ -418,6 +427,55 @@ async function main() {
     assert(row.args[2] === "p1", "parent_sha comes from parents[0].sha (the FIRST GIT PARENT — not necessarily master's previous tip)");
     assert(row.args[3] === "Someone" && row.args[4] === "h@x", "identity is commit.author.{name,email}, never author.login");
     assert(row.args[9] === '["tn_ZEC.tsv","tn_AMO.tsv"]', "files_json holds the list endpoint's own filenames");
+  }
+
+  // Parent metadata is part of poll coverage, not optional decoration. A
+  // missing/malformed parents array used to become [] and make a non-root
+  // commit look like a root, dropping a branch from the gap frontier. Only an
+  // explicit [] is valid root evidence; every other shape keeps the poll
+  // incomplete and cannot establish/clear coverage.
+  {
+    const cases = [
+      ["missing parents", (c) => delete c.parents, "commit_parents_unknown"],
+      ["non-array parents", (c) => { c.parents = {}; }, "commit_parents_unknown"],
+      ["parent without sha", (c) => { c.parents = [{}]; }, "commit_parent_unknown"],
+      ["parent with non-string sha", (c) => { c.parents = [{ sha: null }]; }, "commit_parent_unknown"],
+      ["parent with empty sha", (c) => { c.parents = [{ sha: "  " }]; }, "commit_parent_unknown"],
+    ];
+    for (const [label, corrupt, reason] of cases) {
+      const bad = commit("bad-parent", "hand fix", "h@x", { files: ["tn_ZEC.tsv"] });
+      corrupt(bad);
+      mockGitea([[bad]]);
+      const db = mockDb({
+        repo: "en_tn",
+        last_sha: "old-mark",
+        last_attempted_at: NOW - 3600,
+        gap_since_sha: "old-gap",
+      });
+      const result = await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+      const upsert = pollUpsert(db);
+      assert(result.status === reason, `${label} makes poll coverage incomplete (${reason})`);
+      assert(upsert.args[8] === 0 && upsert.args[10] === null, `  ...${label} neither advances nor establishes a coverage floor`);
+      assert(upsert.args[6] === null, `  ...${label} does not submit a replacement gap that could clear the existing one`);
+      assert(
+        /gap_since_sha = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
+        `  ...${label} remains protected by the existing-gap preservation guard`,
+      );
+    }
+  }
+
+  // The steady-state poll is SHA-bounded, but its rows are later queried by
+  // time. A missing committer timestamp must therefore stop the poll rather
+  // than be replaced with a potentially backdated author timestamp.
+  {
+    const bad = commit("bad-time", "hand fix", "h@x", { files: ["tn_ZEC.tsv"] });
+    delete bad.commit.committer;
+    mockGitea([[bad]]);
+    const db = mockDb({ repo: "en_tn", last_sha: "old-mark", last_attempted_at: NOW - 3600 });
+    const result = await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    const upsert = pollUpsert(db);
+    assert(result.status === "commit_committer_time_unknown", "a SHA-bounded ledger poll refuses missing committer time");
+    assert(upsert.args[8] === 0 && upsert.args[10] === null, "  ...without advancing or establishing coverage");
   }
 
   // ── a commit with no files in the response stores NULL, not "[]" ─────────
@@ -588,8 +646,8 @@ async function main() {
       "committed_at stores when the commit LANDED, not when it was authored",
     );
     assert(
-      rows[1].committedAt === Math.floor(Date.parse("2026-06-01T00:00:00Z") / 1000),
-      "  ...falling back to the author date when the payload has no committer",
+      rows[1].committedAt === null,
+      "  ...and a missing committer date stays unknown rather than borrowing the author date",
     );
   }
 
@@ -655,20 +713,21 @@ async function main() {
     );
   }
 
-  // ── F12: last_sha and last_committed_at move as a PAIR ──────────────────
-  // A tip whose date will not parse must write a NULL timestamp beside its sha,
-  // never keep the previous commit's timestamp — that pair would describe two
-  // different commits.
+  // ── F12: an unknown landing time cannot advance ledger coverage ─────────
+  // A tip whose committer date will not parse must leave the previous
+  // high-water pair in place. Advancing the SHA while storing an unusable time
+  // would allow a later poll to look current while the time-window read omits
+  // this commit.
   {
     mockGitea([[commit("n1", "hand fix", "h@x", { date: "not-a-date" }), commit("tip", "old", "h@x")]]);
     const db = mockDb({ repo: "en_tn", last_sha: "tip", last_committed_at: 12345, last_attempted_at: NOW - 3600 });
-    await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    const result = await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
     const upsert = pollUpsert(db);
-    assert(upsert.args[1] === "n1" && upsert.args[2] === null, "an unparseable tip date writes sha + NULL, as a pair");
-    assert(upsert.args[8] === 1, "  ...and still advances (the walk completed)");
+    assert(result.status === "commit_committer_time_unknown", "an unparseable tip committer date fails coverage closed");
+    assert(upsert.args[8] === 0, "  ...and does not advance the stored high-water pair");
     assert(
       /last_sha = CASE WHEN \?9 = 1/.test(upsert.sql) && /last_committed_at = CASE WHEN \?9 = 1/.test(upsert.sql),
-      "  ...both driven by the same advance flag, not COALESCEd independently",
+      "  ...with both fields still governed by the same advance flag",
     );
   }
 
