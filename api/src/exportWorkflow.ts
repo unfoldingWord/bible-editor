@@ -74,6 +74,15 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
+import { appendSystemRecord, reconcileReviewAlert, reviewConditionKey } from "./reviewAlerts.ts";
+import {
+  CLAIM_EXPORT_REVERT_GENERATION_SQL,
+  DELETE_EXPORT_REVERTS_FOR_GENERATION_SQL,
+  INSERT_EXPORT_REVERT_FOR_GENERATION_SQL,
+  INSERT_EXPORT_RECORD_FOR_GENERATION_SQL,
+  RESOLVE_EXPORT_REVERT_PERSISTENCE_FOR_GENERATION_SQL,
+  SELECT_EXPORT_REVERT_GENERATION_SQL,
+} from "./exportRevertGeneration.ts";
 import {
   runChunkedReimport,
   storedResourceSha,
@@ -214,6 +223,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   }> {
     const params = event.payload ?? {};
     const instanceId = `export-${new Date(event.timestamp).toISOString().replace(/[:.]/g, "-")}`;
+    // Workflow retries replay the same event timestamp. Use it as the
+    // observation generation for export-revert persistence alerts so a late
+    // step from an older workflow cannot resolve or overwrite a newer run.
+    const alertObservedAt = event.timestamp.getTime();
 
     // 1. Resolve the books list.
     const books = await step.do("list-books", async () => {
@@ -462,6 +475,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 lockedBooks,
                 lockOverride,
                 branchOverride,
+                alertObservedAt,
               ),
           );
           results.push(result);
@@ -586,6 +600,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     lockedBooks: Set<string>,
     allowLocked: boolean,
     branchOverride: string | null = null,
+    alertObservedAt = Date.now(),
   ): Promise<StepResult> {
     // Clear any undismissed banner the removed blank-field HOLD gate left behind
     // (see the long note further down for why that gate is gone). Its text says
@@ -1179,7 +1194,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
         const report = usfmRevertReport(built.content, usfmMasterContentForRevertReport as string);
-        await this.recordExportRevertReport(book, resource, "usfm", report.entries, mechanical, branch);
+        await this.recordExportRevertReport(book, resource, "usfm", report.entries, mechanical, branch, instanceId, alertObservedAt);
       } else if (
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
@@ -1189,7 +1204,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           tsvMasterContentForRevertReport as string,
           resource as "tn" | "tq" | "twl",
         );
-        await this.recordExportRevertReport(book, resource, "tsv", report.entries, mechanical, branch);
+        await this.recordExportRevertReport(book, resource, "tsv", report.entries, mechanical, branch, instanceId, alertObservedAt);
       }
 
       if (!commit.branchTouched) {
@@ -2236,21 +2251,45 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // throw and the `catch` below would silently log it while the alert still
   // told the operator the report was recorded. There is no single-transaction
   // way to keep that atomicity AND stay under D1's per-batch statement cap, so
-  // this now chunks: the DELETE runs alone first (it must land before any
-  // INSERT — a stale delete-less write would leave last night's rows mixed
-  // with tonight's), then each chunk of inserts is its own `.batch()` call. A
-  // chunk failing partway leaves the table holding only the entries from
-  // chunks that already committed — a real partial write, not a silently
-  // truncated one, because the caller is told `false` and must say so.
+  // this now chunks under a per-(book,resource) generation claim. Every DELETE
+  // and INSERT rechecks the claim, so an overlapping older workflow cannot
+  // erase or mix rows into a newer snapshot. A chunk failure remains a visible
+  // partial write: the caller receives `failed` and raises the distinct
+  // persistence condition rather than claiming the report is complete.
+  private async claimExportRevertGeneration(
+    book: string,
+    resource: Resource,
+    generation: string,
+    observedAt: number,
+  ): Promise<"claimed" | "superseded" | "failed"> {
+    try {
+      const result = await this.env.DB.prepare(CLAIM_EXPORT_REVERT_GENERATION_SQL)
+        .bind(book, resource, generation, observedAt)
+        .run();
+      return (result.meta?.changes ?? 0) > 0 ? "claimed" : "superseded";
+    } catch (e) {
+      console.error("export revert generation claim failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return "failed";
+    }
+  }
+
   private async recordExportReverts(
     book: string,
     resource: Resource,
     entries: Array<UsfmRevertEntry | TsvRevertEntry>,
-  ): Promise<boolean> {
-    if (entries.length === 0) return true;
+    generation: string,
+    observedAt: number,
+  ): Promise<"recorded" | "superseded" | "failed"> {
+    if (entries.length === 0) return "recorded";
+    const claim = await this.claimExportRevertGeneration(book, resource, generation, observedAt);
+    if (claim !== "claimed") return claim;
     try {
-      await this.env.DB.prepare(`DELETE FROM export_reverts WHERE book = ?1 AND resource = ?2`)
-        .bind(book, resource)
+      await this.env.DB.prepare(DELETE_EXPORT_REVERTS_FOR_GENERATION_SQL)
+        .bind(book, resource, generation, observedAt)
         .run();
     } catch (e) {
       console.error("export revert report delete failed", {
@@ -2260,7 +2299,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       });
       // Old rows (if any) are left standing — stale, but not silently wrong:
       // the caller must not claim this run's findings were recorded.
-      return false;
+      return "failed";
     }
     for (let i = 0; i < entries.length; i += REVERT_WRITE_BATCH) {
       const slice = entries.slice(i, i + REVERT_WRITE_BATCH);
@@ -2272,9 +2311,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
               // so a duplicate ref within THIS chunk would otherwise violate
               // the unique index and roll back the rest of the chunk — same
               // rationale as recordAlignmentAttention's INSERT.
-              `INSERT OR REPLACE INTO export_reverts (book, resource, ref, class, fields)
-               VALUES (?1, ?2, ?3, ?4, ?5)`,
-            ).bind(book, resource, e.ref, e.class, "fields" in e && e.fields ? JSON.stringify(e.fields) : null),
+              INSERT_EXPORT_REVERT_FOR_GENERATION_SQL,
+            ).bind(
+              book,
+              resource,
+              e.ref,
+              e.class,
+              "fields" in e && e.fields ? JSON.stringify(e.fields) : null,
+              generation,
+              observedAt,
+            ),
           ),
         );
       } catch (e) {
@@ -2285,10 +2331,22 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           chunkSize: slice.length,
           error: e instanceof Error ? e.message : String(e),
         });
-        return false;
+        return "failed";
       }
     }
-    return true;
+    try {
+      const current = await this.env.DB.prepare(SELECT_EXPORT_REVERT_GENERATION_SQL)
+        .bind(book, resource, generation, observedAt)
+        .first<{ ok: number }>();
+      return current ? "recorded" : "superseded";
+    } catch (e) {
+      console.error("export revert generation verify failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return "failed";
+    }
   }
 
   // Record the render we just handed to Door43 for this (book, resource)
@@ -2418,13 +2476,81 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // unreadable), which must NOT clear yesterday's real findings. Callers are
   // responsible for only invoking this when master was readable AND the
   // report came back with 0 entries.
-  private async clearExportReverts(book: string, resource: Resource): Promise<void> {
+  private async clearExportReverts(
+    book: string,
+    resource: Resource,
+    generation: string,
+    observedAt: number,
+  ): Promise<"recorded" | "superseded" | "failed"> {
+    const claim = await this.claimExportRevertGeneration(book, resource, generation, observedAt);
+    if (claim !== "claimed") return claim;
     try {
-      await this.env.DB.prepare(`DELETE FROM export_reverts WHERE book = ?1 AND resource = ?2`)
-        .bind(book, resource)
+      await this.env.DB.prepare(DELETE_EXPORT_REVERTS_FOR_GENERATION_SQL)
+        .bind(book, resource, generation, observedAt)
         .run();
+      const current = await this.env.DB.prepare(SELECT_EXPORT_REVERT_GENERATION_SQL)
+        .bind(book, resource, generation, observedAt)
+        .first<{ ok: number }>();
+      return current ? "recorded" : "superseded";
     } catch (e) {
       console.error("export revert report clear failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return "failed";
+    }
+  }
+
+  private async resolveExportRevertPersistence(
+    book: string,
+    resource: Resource,
+    generation: string,
+    observedAt: number,
+  ): Promise<void> {
+    try {
+      await this.env.DB.prepare(RESOLVE_EXPORT_REVERT_PERSISTENCE_FOR_GENERATION_SQL)
+        .bind(
+          EXPORT_ALERT_USERNAME,
+          `export_revert_persistence:${book}:${resource}`,
+          observedAt,
+          book,
+          resource,
+          generation,
+        )
+        .run();
+    } catch (e) {
+      // This is banner housekeeping after the DCS commit. Never retry an
+      // already-successful publish because the best-effort clear failed.
+      console.error("export revert persistence alert clear failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  private async recordExportRevertPersistenceFailure(
+    book: string,
+    resource: Resource,
+    detail: string,
+    observedAt: number,
+  ): Promise<void> {
+    const label = `${book} ${resource.toUpperCase()}`;
+    try {
+      await reconcileReviewAlert(this.env, {
+        username: EXPORT_ALERT_USERNAME,
+        source: `export_revert_persistence:${book}:${resource}`,
+        conditionKey: reviewConditionKey("export_revert_persistence", { book, resource }, { writeFailed: true }),
+        message:
+          `${label}: export-revert reporting failed to ${detail} (see worker logs for the D1 error) — ` +
+          `the report may now be missing rows or stale. This does not block the export.`,
+        severity: "warning",
+        linkUrl: `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        observedAt,
+      });
+    } catch (e) {
+      console.error("export revert persistence alert failed", {
         book,
         resource,
         error: e instanceof Error ? e.message : String(e),
@@ -2448,27 +2574,34 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     entries: Array<UsfmRevertEntry | TsvRevertEntry>,
     mechanical: boolean,
     branch: string,
+    generation: string,
+    observedAt = Date.now(),
   ): Promise<void> {
     if (entries.length === 0) {
-      await this.clearExportReverts(book, resource);
+      const cleared = await this.clearExportReverts(book, resource, generation, observedAt);
+      if (cleared === "recorded") {
+        await this.resolveExportRevertPersistence(book, resource, generation, observedAt);
+      } else if (cleared === "failed") {
+        await this.recordExportRevertPersistenceFailure(book, resource, "clear the previous export-revert rows", observedAt);
+      }
       return;
     }
-    const recorded = await this.recordExportReverts(book, resource, entries);
+    const recorded = await this.recordExportReverts(book, resource, entries, generation, observedAt);
     const label = `${book} ${resource.toUpperCase()}`;
-    if (!recorded) {
+    if (recorded === "failed") {
       // recordExportReverts already logged the underlying error; the alert
       // must not go on to claim these findings were recorded (see its own
       // comment on why a failed/partial write must not read as success).
-      await this.writeAlert(
-        `export_revert:${book}:${resource}`,
-        `${label}: computed ${entries.length} export-revert finding(s) but failed to fully write them to ` +
-          `export_reverts (see worker logs for the D1 error) — this book+resource's revert report may now be ` +
-          `missing rows or stale. This does not block the export.`,
-        `${this.env.DCS_BASE_URL}/unfoldingWord`,
-        "warning",
+      await this.recordExportRevertPersistenceFailure(
+        book,
+        resource,
+        `write ${entries.length} computed finding(s) to export_reverts`,
+        observedAt,
       );
       return;
     }
+    if (recorded === "superseded") return;
+    await this.resolveExportRevertPersistence(book, resource, generation, observedAt);
     const byClass = new Map<string, number>();
     for (const e of entries) byClass.set(e.class, (byClass.get(e.class) ?? 0) + 1);
     const breakdown = [...byClass.entries()].map(([cls, n]) => `${n} ${cls}`).join(", ");
@@ -2489,6 +2622,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       "warning",
       "record",
+      `${generation}:export_revert:${book}:${resource}`,
+      { book, resource, generation, observedAt },
     );
 
     // Second, distinct alert: "mechanical" means no HUMAN contributor was
@@ -2514,6 +2649,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           `${this.env.DCS_BASE_URL}/unfoldingWord`,
           "warning",
           "record",
+          `${generation}:mechanical_overwrite:${book}:${resource}`,
+          { book, resource, generation, observedAt },
         );
       }
     } catch (e) {
@@ -2863,8 +3000,38 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     linkUrl: string,
     severity: "error" | "warning" | "info" = "error",
     kind: "review" | "record" = "review",
+    eventKey?: string,
+    exportGeneration?: { book: string; resource: Resource; generation: string; observedAt: number },
   ): Promise<void> {
     try {
+      if (kind === "record") {
+        if (exportGeneration) {
+          await this.env.DB.prepare(INSERT_EXPORT_RECORD_FOR_GENERATION_SQL)
+            .bind(
+              EXPORT_ALERT_USERNAME,
+              severity,
+              source,
+              message,
+              linkUrl,
+              eventKey ?? null,
+              exportGeneration.book,
+              exportGeneration.resource,
+              exportGeneration.generation,
+              exportGeneration.observedAt,
+            )
+            .run();
+        } else {
+          await appendSystemRecord(this.env, {
+            username: EXPORT_ALERT_USERNAME,
+            source,
+            message,
+            linkUrl,
+            severity,
+            eventKey,
+          });
+        }
+        return;
+      }
       // Respect a prior dismissal of the *same* condition. Each nightly export
       // re-runs this for still-failing books; if we blindly re-inserted, an
       // alert the user already dismissed would reappear every morning and read

@@ -6,6 +6,7 @@ import {
   reconcileReviewAlert,
   resolveReviewAlert,
   activeReviewAlertUsernames,
+  appendSystemRecord,
   reviewConditionKey,
   verseMergeEditorConditionKey,
 } from "./reviewAlerts.ts";
@@ -34,10 +35,12 @@ function fresh() {
     id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, severity TEXT NOT NULL,
     source TEXT NOT NULL, message TEXT NOT NULL, link_url TEXT, created_at INTEGER NOT NULL DEFAULT 1,
     dismissed_at INTEGER, kind TEXT NOT NULL DEFAULT 'review', condition_key TEXT, resolved_at INTEGER,
-    condition_observed_at INTEGER
+    condition_observed_at INTEGER, event_key TEXT
   );
   CREATE UNIQUE INDEX standing ON system_alerts(username, source)
-    WHERE condition_key IS NOT NULL AND dismissed_at IS NULL AND resolved_at IS NULL;`);
+    WHERE condition_key IS NOT NULL AND dismissed_at IS NULL AND resolved_at IS NULL;
+  CREATE UNIQUE INDEX record_event ON system_alerts(event_key)
+    WHERE kind = 'record' AND event_key IS NOT NULL;`);
   return { db, env: { DB: makeD1(db) } };
 }
 const key = (n) => reviewConditionKey("test", { book: "JER", resource: "ult" }, { n });
@@ -51,6 +54,24 @@ console.log("\n[Stage 7: same measured condition updates in place]");
   await reconcileReviewAlert(env, { username: "ben", source: "verse_merge_conflict:JER:ult", conditionKey: key(1), message: "refreshed count", now: 11 });
   const r = rows(db);
   ok(r.length === 1 && r[0].message === "refreshed count", "same key refreshes details without a new row");
+}
+
+console.log("\n[Stage 8: expected telemetry is append-only record history]");
+{
+  const { db, env } = fresh();
+  const input = {
+    username: "deferredreward",
+    source: "export_revert:JER:ust",
+    message: "export overwrote one verse",
+    severity: "warning",
+    eventKey: "night-1:export_revert:JER:ust",
+  };
+  await appendSystemRecord(env, input);
+  await appendSystemRecord(env, input);
+  await appendSystemRecord(env, { ...input, message: "export overwrote two verses", eventKey: "night-2:export_revert:JER:ust" });
+  const records = db.prepare(`SELECT kind, message, dismissed_at, resolved_at FROM system_alerts WHERE source = ? ORDER BY id`).all(input.source);
+  ok(records.length === 2, "replay is idempotent while a genuinely later telemetry event appends");
+  ok(records.every((r) => r.kind === "record" && r.dismissed_at == null && r.resolved_at == null), "telemetry rows are non-actionable record history");
 }
 
 console.log("\n[Stage 7: dismissal and transition semantics]");
@@ -178,15 +199,22 @@ console.log("\n[Stage 7 migration: legacy duplicates are retained as history and
   );`);
   db.prepare(`INSERT INTO system_alerts (username,severity,source,message) VALUES ('ben','warning','s','old')`).run();
   db.prepare(`INSERT INTO system_alerts (username,severity,source,message) VALUES ('ben','warning','s','new')`).run();
+  db.prepare(`INSERT INTO system_alerts (username,severity,source,message) VALUES ('deferredreward','warning','reimport_kept_over_door43:JER:ust','kept 5')`).run();
   db.prepare(`INSERT INTO system_alerts (username,severity,source,message) VALUES ('ben','info','comment_mention','mention')`).run();
   db.prepare(`INSERT INTO system_alerts (username,severity,source,message,kind) VALUES ('ben','info','record','event','record')`).run();
   const migration = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "migrations", "0066_review_alert_transitions.sql"), "utf8");
   db.exec(migration);
+  db.exec(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "migrations", "0067_sync_record_alerts.sql"), "utf8"));
   const migrated = db.prepare(`SELECT source,kind,condition_key,resolved_at FROM system_alerts ORDER BY id`).all();
   ok(migrated[0].resolved_at != null && migrated[1].resolved_at == null, "legacy duplicate review rows collapse to the newest standing row");
   ok(String(migrated[1].condition_key).startsWith("legacy:v1:"), "surviving legacy review rows receive an explicit opaque history key");
-  ok(migrated[2].resolved_at == null && migrated[2].condition_key == null, "comment notifications are untouched by legacy cleanup/backfill");
-  ok(migrated[3].resolved_at == null && migrated[3].condition_key == null, "record telemetry is untouched by legacy cleanup/backfill");
+  const comment = migrated.find((r) => r.source === "comment_mention");
+  const record = migrated.find((r) => r.source === "record");
+  ok(comment?.resolved_at == null && comment?.condition_key == null, "comment notifications are untouched by legacy cleanup/backfill");
+  ok(record?.resolved_at == null && record?.condition_key == null, "record telemetry is untouched by legacy cleanup/backfill");
+  const kept = migrated.find((r) => r.source === "reimport_kept_over_door43:JER:ust");
+  ok(kept?.kind === "record", "legacy kept-over-Door43 rows are backfilled as non-actionable telemetry");
+  ok(kept?.condition_key == null, "telemetry backfill does not invent a review condition key");
 }
 
 if (failed) process.exitCode = 1;

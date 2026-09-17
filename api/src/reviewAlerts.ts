@@ -43,6 +43,42 @@ export interface ReviewAlertInput {
   observedAt?: number;
 }
 
+export interface SystemRecordInput {
+  username: string;
+  source: string;
+  message: string;
+  severity?: string;
+  linkUrl?: string | null;
+  /** Durable producer identity; replaying the same event becomes a no-op. */
+  eventKey?: string | null;
+}
+
+/**
+ * Append a non-actionable telemetry row. Records are an event log, not a
+ * standing condition: repeated observations must remain separate rows and
+ * must never be dismissed, resolved, or replaced by a later message.
+ */
+export async function appendSystemRecord(env: Env, input: SystemRecordInput): Promise<boolean> {
+  try {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO system_alerts (username, severity, source, message, link_url, kind, event_key)
+       VALUES (?1, ?2, ?3, ?4, ?5, 'record', ?6)`,
+    )
+      .bind(input.username, input.severity ?? "info", input.source, input.message, input.linkUrl ?? null, input.eventKey ?? null)
+      .run();
+    return true;
+  } catch (error) {
+    // A record is observability only. In particular, a deploy that outruns
+    // migration 0053 must not turn an expected event into an actionable
+    // default-kind review row, so fail closed and leave the sync untouched.
+    console.error("system record append failed", {
+      source: input.source,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
 /**
  * Reconcile one standing review condition without delete/reinsert churn.
  * D1's partial unique index is the last line of defence when two workflows
