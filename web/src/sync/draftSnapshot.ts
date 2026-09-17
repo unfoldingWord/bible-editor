@@ -26,9 +26,12 @@ export function createDraftSnapshot<T extends { key: string; updatedAt: number }
         ? [...pending.values(), ...[...mutations.values()].flatMap((set) => [...set])]
         : [...(pending.has(key) ? [pending.get(key)!] : []), ...mutations.get(key) ?? []];
       if (!waits.length) {
-        if (key === undefined ? failures.size : failures.has(key)) {
-          throw key === undefined ? failures.values().next().value : failures.get(key);
-        }
+        // A recorded failure only withholds the *keyed* view for its own key
+        // (absence there is misread as "clear dirty, release the edit
+        // session"). The whole-list view is a snapshot of what we do know;
+        // inheriting one key's failure would freeze every other key's
+        // notifications until that exact key is retried.
+        if (key !== undefined && failures.has(key)) throw failures.get(key);
         return;
       }
       await Promise.all(waits);
