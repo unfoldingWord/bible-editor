@@ -348,17 +348,19 @@ function SyncActivityTab() {
 
   // Guards the run-detail fetch against a request race: selecting run A then run
   // B before A resolves must not let A's later response overwrite B's events
-  // under B's heading. Only the most recently requested runId applies its result.
-  const latestRunReq = useRef<string | null>(null);
+  // under B's heading. A monotonic token (not the runId) identifies each request
+  // instance, so even A → B → A only lets the newest request apply its result —
+  // relevant for an in-progress run whose event list grows between clicks.
+  const runReqSeq = useRef(0);
   const showRun = useCallback((runId: string) => {
     setSelectedRunId(runId);
     setRunLoading(true);
     setRunError(null);
-    latestRunReq.current = runId;
+    const token = ++runReqSeq.current;
     api.getAdminSyncRun(runId)
-      .then((res) => { if (latestRunReq.current === runId) setRunEvents(res.events); })
-      .catch((e) => { if (latestRunReq.current === runId) setRunError(String(e)); })
-      .finally(() => { if (latestRunReq.current === runId) setRunLoading(false); });
+      .then((res) => { if (runReqSeq.current === token) setRunEvents(res.events); })
+      .catch((e) => { if (runReqSeq.current === token) setRunError(String(e)); })
+      .finally(() => { if (runReqSeq.current === token) setRunLoading(false); });
   }, []);
 
   const fmtRunTime = (ms: number | null) => ms == null ? "—" : new Date(ms).toLocaleString();
