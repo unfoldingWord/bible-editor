@@ -4,6 +4,8 @@
 //   GET    /api/admin/sync-activity      — durable log of "record"-kind system_alerts (issue #535):
 //                                           non-blocking, no-action-needed export/reimport records that
 //                                           used to show up as a personal alert on the admin's account.
+//   GET    /api/admin/sync-runs           — append-only overnight run summaries.
+//   GET    /api/admin/sync-runs/:runId    — terminal events for one overnight run.
 //   GET    /api/admin/users              — list the editor/admin allowlist (user_roles).
 //   POST   /api/admin/users              — upsert a user's role.
 //   DELETE /api/admin/users/:username    — remove a user from the allowlist.
@@ -286,6 +288,90 @@ admin.get("/sync-activity", async (c) => {
     createdAt: r.created_at,
   }));
   return c.json({ entries });
+});
+
+// Append-only export workflow ledger. This is deliberately separate from
+// sync-activity: records describe data transitions, while this answers the
+// operational question "did the run finish, and which book/resource failed?".
+admin.get("/sync-runs", async (c) => {
+  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50", 10) || 50, 1), 100);
+  const rs = await c.env.DB.prepare(
+    `SELECT run_id,
+            MIN(CASE WHEN event_type = 'run_started' THEN occurred_at END) AS started_at,
+            MAX(CASE WHEN event_type = 'run_completed' THEN occurred_at END) AS completed_at,
+            MAX(CASE WHEN event_type = 'run_completed' THEN status END) AS status,
+            SUM(CASE WHEN event_type = 'item_terminal' THEN 1 ELSE 0 END) AS item_count,
+            SUM(CASE WHEN event_type = 'item_terminal' AND status = 'success' THEN 1 ELSE 0 END) AS success_count,
+            SUM(CASE WHEN event_type = 'item_terminal' AND status = 'skip' THEN 1 ELSE 0 END) AS skip_count,
+            SUM(CASE WHEN event_type = 'item_terminal' AND status = 'failure' THEN 1 ELSE 0 END) AS failure_count
+       FROM sync_run_log
+      GROUP BY run_id
+      ORDER BY started_at DESC, run_id DESC
+      LIMIT ?1`,
+  ).bind(limit).all<{
+    run_id: string;
+    started_at: number | null;
+    completed_at: number | null;
+    status: string | null;
+    item_count: number | null;
+    success_count: number | null;
+    skip_count: number | null;
+    failure_count: number | null;
+  }>();
+  return c.json({ runs: (rs.results ?? []).map((r) => ({
+    runId: r.run_id,
+    startedAt: r.started_at,
+    completedAt: r.completed_at,
+    status: r.status,
+    itemCount: r.item_count ?? 0,
+    successCount: r.success_count ?? 0,
+    skipCount: r.skip_count ?? 0,
+    failureCount: r.failure_count ?? 0,
+  })) });
+});
+
+admin.get("/sync-runs/:runId", async (c) => {
+  const runId = c.req.param("runId");
+  if (!runId || runId.length > 200) return c.json({ error: "invalid_run_id" }, 400);
+  const rs = await c.env.DB.prepare(
+    `SELECT id, event_key, event_type, status, book, resource, details_json, occurred_at, created_at
+       FROM sync_run_log
+      WHERE run_id = ?1
+      ORDER BY occurred_at ASC, id ASC`,
+  ).bind(runId).all<{
+    id: number;
+    event_key: string;
+    event_type: string;
+    status: string | null;
+    book: string | null;
+    resource: string | null;
+    details_json: string | null;
+    occurred_at: number;
+    created_at: number;
+  }>();
+  const events = (rs.results ?? []).map((r) => {
+    let details: Record<string, unknown> | null = null;
+    if (r.details_json) {
+      try {
+        const parsed: unknown = JSON.parse(r.details_json);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) details = parsed as Record<string, unknown>;
+      } catch {
+        // Preserve the event even if a future writer stored malformed details.
+      }
+    }
+    return {
+      id: r.id,
+      eventKey: r.event_key,
+      eventType: r.event_type,
+      status: r.status,
+      book: r.book,
+      resource: r.resource,
+      occurredAt: r.occurred_at,
+      createdAt: r.created_at,
+      details,
+    };
+  });
+  return c.json({ runId, events });
 });
 
 // ── User role management ─────────────────────────────────────────────────
