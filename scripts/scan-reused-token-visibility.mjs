@@ -66,7 +66,7 @@ import {
   unrenderedFlaggedTokenKeys,
 } from "../web/src/lib/alignmentHover.ts";
 import { concatSourceRange } from "../web/src/lib/verseRange.ts";
-import { lintUsfmVerses } from "../api/src/lint.ts";
+import { lintUsfmVerses, sourceWordsByRef } from "../api/src/lint.ts";
 
 const argv = process.argv.slice(2);
 const remote = argv.includes("--remote");
@@ -147,6 +147,13 @@ for (const bk of books) {
     byStart[r.verse] = { ...r, content };
     sourceByChapter.set(r.chapter, byStart);
   }
+  // Same UHB/UGNT rows, indexed the way lintUsfmVerses's own `source` param
+  // expects (chapter:verse -> SourceToken[]), so the census's api-side lint
+  // call takes the real reform path instead of the raw-occurrence fallback —
+  // the same map api/src/bookImport.ts builds from `src.results` (#793).
+  const srcTokensByRef = sourceWordsByRef(
+    rows.filter((r) => r.bible_version === "UHB" || r.bible_version === "UGNT"),
+  );
   let bookHits = 0;
   for (const r of rows) {
     if (r.bible_version !== "ULT" && r.bible_version !== "UST") continue;
@@ -204,7 +211,7 @@ for (const bk of books) {
         updated_by: r.updated_by,
         updated_at: 0,
       },
-    ]).some((i) => i.check === "Reused source token");
+    ], srcTokensByRef).some((i) => i.check === "Reused source token");
 
     // Panel side: the detector's verdict, and how much of it survives to render.
     const state = parseAlignment(vos, src);
