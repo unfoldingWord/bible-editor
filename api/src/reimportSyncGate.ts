@@ -201,6 +201,61 @@ export function isSystemicMergeRefusal(
   return refusedCount >= threshold;
 }
 
+// ── Per-book reimport ledger classification (issue #836) ────────────────────
+//
+// The export run's terminal ledger (#833) records one success/skip/failure
+// outcome per book, folded from that book's reimport totals across all its
+// resources. This must mirror the SAME withhold conditions as
+// shouldRecordResourceSync / isSystemicMergeRefusal above, so "recorded
+// success" and "watermark stamped" never diverge:
+//   • FAILURE — a real error left D1 stale and the watermark withheld: a
+//     write batch threw (apply_incomplete), a batch errored (errors), the
+//     conflict record failed (merge_record_failed), a structural overlap
+//     fail-safe fired (structure_overlap), or this run's alignment-refused
+//     verses looked systemic across the book's resources
+//     (isSystemicMergeRefusal — a maintainer's work being reverted at scale,
+//     the same shape as the other "something went wrong" withholds; the
+//     original classifier omitted this and recorded such a run as `success`,
+//     a false green). These are the "something went wrong" withholds.
+//   • SKIP — the sync was DEFERRED, not broken, and the watermark was
+//     withheld for a benign, retriable reason: a pipeline lock
+//     (chapters_locked / prune_locked), an id conflict blocking a row
+//     (conflict_skipped / tombstone_blocked), or an unmeasurable chunk
+//     (counts_incomplete). The next run retries and the export freshness
+//     gate keeps stale D1 off master meanwhile — flagging these as FAILURE
+//     would be false-RED noise.
+//   • SUCCESS — a clean, fully-applied sync (watermark stamped).
+//
+// Takes a structural subset of bookReimport.ts's ReimportCounts rather than
+// importing that type, since this module has no imports of its own (every
+// decision here is pure) and bookReimport.ts already imports FROM this file.
+export function classifyReimportOutcome(t: {
+  apply_incomplete?: boolean;
+  errors: string[];
+  merge_record_failed?: boolean;
+  structure_overlap: number;
+  merge_refused: number;
+  chapters_locked: number;
+  prune_locked: number;
+  conflict_skipped: number;
+  tombstone_blocked: number;
+  counts_incomplete?: boolean;
+}): "success" | "skip" | "failure" {
+  if (
+    t.apply_incomplete ||
+    t.errors.length > 0 ||
+    t.merge_record_failed ||
+    t.structure_overlap > 0 ||
+    isSystemicMergeRefusal(t.merge_refused ?? 0)
+  ) {
+    return "failure";
+  }
+  if (t.chapters_locked || t.prune_locked || t.conflict_skipped || t.tombstone_blocked || t.counts_incomplete) {
+    return "skip";
+  }
+  return "success";
+}
+
 // ── Kept-over-Door43 scale alarm (#540 item 2's "keep_ai_master") ───────────
 //
 // The gate above FREEZES a resource's export once refusals look systemic. This

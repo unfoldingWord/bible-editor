@@ -101,7 +101,12 @@ import { hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
-import { mergeRefusalOverrideAllowed, idBlockedOverrideAllowed, staleBaseOverrideAllowed } from "./reimportSyncGate";
+import {
+  mergeRefusalOverrideAllowed,
+  idBlockedOverrideAllowed,
+  staleBaseOverrideAllowed,
+  classifyReimportOutcome,
+} from "./reimportSyncGate";
 import { lockedBooksIn } from "./bookLock";
 import {
   PUBLISHED_RELEASE_TAG,
@@ -472,32 +477,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
           });
           // runChunkedReimport resolves normally in three distinct outcomes and
-          // the ledger must tell them apart (#833 review). The split mirrors
-          // shouldRecordResourceSync (reimportSyncGate.ts), the authority on
-          // whether the watermark was stamped, so SUCCESS ⟺ watermark stamped:
-          //   • FAILURE — a real error left D1 stale and the watermark withheld:
-          //     a write batch threw (apply_incomplete), a batch errored
-          //     (errors), the conflict record failed (merge_record_failed), or a
-          //     structural overlap fail-safe fired (structure_overlap). These
-          //     are the "something went wrong" withholds.
-          //   • SKIP — the sync was DEFERRED, not broken, and the watermark was
-          //     withheld for a benign, retriable reason: a pipeline lock
-          //     (chapters_locked / prune_locked), an id conflict blocking a row
-          //     (conflict_skipped / tombstone_blocked), or an unmeasurable chunk
-          //     (counts_incomplete). The next run retries and the export
-          //     freshness gate keeps stale D1 off master meanwhile — flagging
-          //     these as FAILURE would be false-RED noise. NOTE: skipped_locked
-          //     is deliberately excluded — it is a row-level counter that
-          //     shouldRecordResourceSync ignores, so it does NOT withhold the
-          //     watermark and must not force a skip.
-          //   • SUCCESS — a clean, fully-applied sync (watermark stamped).
-          const t = res.totals;
-          const status: "success" | "skip" | "failure" =
-            t.apply_incomplete || t.errors.length > 0 || t.merge_record_failed || t.structure_overlap > 0
-              ? "failure"
-              : t.chapters_locked || t.prune_locked || t.conflict_skipped || t.tombstone_blocked || t.counts_incomplete
-                ? "skip"
-                : "success";
+          // the ledger must tell them apart (#833 review) — see
+          // classifyReimportOutcome (reimportSyncGate.ts) for the split.
+          const status = classifyReimportOutcome(res.totals);
           reimportOutcomes.push({ book, status });
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
