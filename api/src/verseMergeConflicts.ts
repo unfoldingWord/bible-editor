@@ -963,7 +963,6 @@ export async function raiseVerseMergeConflictAlert(
   };
 
   try {
-    if (opts.recordingFailed) return; // incomplete measurement cannot reconcile state
     for (const [username, msg] of desired) {
       await reconcileReviewAlert(env, {
         username,
@@ -977,9 +976,14 @@ export async function raiseVerseMergeConflictAlert(
     // Fan-out recipients whose conflicts resolved are transitioned too;
     // dismissed standing rows are marked resolved as well, so a later
     // recurrence can mint a fresh transition without resurrecting this one.
-    const desiredUsers = new Set(desired.keys());
-    for (const username of await activeReviewAlertUsernames(env, source)) {
-      if (!desiredUsers.has(username)) await resolveReviewAlert(env, source, undefined, username, opts.observedAt);
+    // A recording failure makes the known rows an undercount: emit the
+    // explicit incomplete-report warning above, but never infer that an
+    // omitted recipient's condition resolved.
+    if (!opts.recordingFailed) {
+      const desiredUsers = new Set(desired.keys());
+      for (const username of await activeReviewAlertUsernames(env, source)) {
+        if (!desiredUsers.has(username)) await resolveReviewAlert(env, source, undefined, username, opts.observedAt);
+      }
     }
   } catch (e) {
     console.error("verseMergeConflicts: alert write failed", {

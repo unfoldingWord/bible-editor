@@ -57,7 +57,7 @@
 // split as chapterLock.test.mjs.
 
 import { DatabaseSync } from "node:sqlite";
-import { retireVerseKeptAiMasterFlags, resolveConvergedVerseMergeConflicts } from "./verseMergeConflicts.ts";
+import { raiseVerseMergeConflictAlert, retireVerseKeptAiMasterFlags, resolveConvergedVerseMergeConflicts } from "./verseMergeConflicts.ts";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
@@ -2288,6 +2288,44 @@ function ts(dateStr) {
     assert(row.resolved_at === null && row.recorded_generation === 1,
       "the fresh conflict remains active at its newer generation");
   }
+}
+
+// Stage 7: a failed conflict-recording batch is itself actionable measured
+// state. It must raise the explicit incomplete-report warning while preserving
+// fan-out recipients that may be absent only because the table write failed.
+{
+  const d = verseDb();
+  d.exec(`ALTER TABLE system_alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    ALTER TABLE system_alerts ADD COLUMN condition_key TEXT;
+    ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
+    ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
+    CREATE UNIQUE INDEX system_alerts_one_standing_review_test
+      ON system_alerts(username, source)
+      WHERE kind='review' AND condition_key IS NOT NULL AND dismissed_at IS NULL AND resolved_at IS NULL;`);
+  d.prepare(
+    `INSERT INTO system_alerts
+       (username,severity,source,message,kind,condition_key,condition_observed_at)
+     VALUES ('bethoakes','warning','verse_merge_conflict:JER:ult','prior editor condition','review','old-editor',50)`,
+  ).run();
+  const make = (sql, args = []) => ({
+    bind: (...next) => make(sql, next),
+    all: async () => ({ results: d.prepare(sql).all(...args) }),
+    run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+  });
+  await raiseVerseMergeConflictAlert({ DB: { prepare: (sql) => make(sql) } }, "JER", "ult", {
+    recordingFailed: true,
+    observedAt: 100,
+  });
+  const admin = d.prepare(
+    `SELECT message FROM system_alerts
+      WHERE username='deferredreward' AND source='verse_merge_conflict:JER:ult' AND resolved_at IS NULL`,
+  ).get();
+  assert(admin?.message.includes("recording failed"), "a recording failure raises the explicit incomplete-report warning");
+  const editor = d.prepare(
+    `SELECT resolved_at FROM system_alerts
+      WHERE username='bethoakes' AND source='verse_merge_conflict:JER:ult'`,
+  ).get();
+  assert(editor?.resolved_at === null, "an incomplete run does not retire an omitted editor recipient");
 }
 
 if (failed) {
