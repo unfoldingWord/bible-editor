@@ -11,6 +11,7 @@
 
 import {
   activePipelineForChapter,
+  chainRootJobId,
   lockedResourceFor,
   lockedResourcesForChapter,
   resourcesLockedByJob,
@@ -39,7 +40,12 @@ function fakeEnv(jobs) {
   return {
     DB: {
       prepare(sql) {
-        if (!/state IN \(\?3, \?4, \?5, \?6\)/.test(sql)) {
+        // Two shapes now. The state-filtered one is the original question ("what
+        // is running here"); the unfiltered one is #828's chain-sibling lookup,
+        // which must see finished links too and therefore must NOT carry a state
+        // predicate. Anything else is a query the tests do not model.
+        const stateFiltered = /state IN \(\?3, \?4, \?5, \?6\)/.test(sql);
+        if (!stateFiltered && !/SELECT job_id, pipeline_type\s+FROM pipeline_jobs/.test(sql)) {
           throw new Error(`unexpected state predicate in SQL:\n${sql}`);
         }
         if (/pipeline_type\s+IN/.test(sql)) {
@@ -47,7 +53,7 @@ function fakeEnv(jobs) {
         }
         return {
           bind(book, chapter, ...states) {
-            const allowed = new Set(states);
+            const allowed = stateFiltered ? new Set(states) : null;
             return {
               async all() {
                 return {
@@ -57,7 +63,7 @@ function fakeEnv(jobs) {
                         j.book === book &&
                         j.start_chapter <= chapter &&
                         j.end_chapter >= chapter &&
-                        allowed.has(j.state),
+                        (allowed === null || allowed.has(j.state)),
                     )
                     .sort((a, b) => a.created_at - b.created_at),
                 };
@@ -236,6 +242,59 @@ const job = (pipeline_type, state = "running", follow_up_chain = null) => ({
     "a job on chapters 1-3 does not lock chapter 9");
   assert(set(await lockedResourcesForChapter(fakeEnv([job("tqs")]), "HOS", 2)) === "",
     "a JER job does not lock another book");
+}
+
+// ─── A chained macro stays locked for what EARLIER links already wrote ────
+//
+// enqueueFollowUpFromChain pops the chain head, so the last link of a
+// generate→notes→tqs macro carries follow_up_chain = null and its own
+// pipeline_type alone. The verses and notes the earlier links wrote are in D1
+// and have NOT been exported yet — the export runs after the nightly reimport —
+// so answering `{tq}` would let that same night's sync overwrite the new ULT
+// with master's older revision and let the tombstone prune soft-delete the
+// AI's new tn rows. The links share a job_id root.
+{
+  console.log("\n[chain lineage keeps finished links locked]");
+  const set = (s) => [...s].sort().join(",");
+  const link = (id, type, state, chain = null) => ({
+    ...job(type, state, chain),
+    job_id: id,
+  });
+
+  const macro = [
+    link("j1", "generate", "done", JSON.stringify([{ pipelineType: "notes" }, { pipelineType: "tqs" }])),
+    link("j1:chain1", "notes", "done", JSON.stringify([{ pipelineType: "tqs" }])),
+    link("j1:chain2", "tqs", "running", null),
+  ];
+  assert(set(await lockedResourcesForChapter(fakeEnv(macro), "ZEC", 2)) === "tn,tq,verse",
+    "the last link still locks the verses and notes its earlier links wrote");
+
+  // Mid-macro: the notes link is running, generate already wrote verses.
+  const midMacro = [
+    link("j1", "generate", "done", JSON.stringify([{ pipelineType: "notes" }, { pipelineType: "tqs" }])),
+    link("j1:chain1", "notes", "running", JSON.stringify([{ pipelineType: "tqs" }])),
+  ];
+  assert(set(await lockedResourcesForChapter(fakeEnv(midMacro), "ZEC", 2)) === "tn,tq,verse",
+    "mid-macro locks the finished generate plus the pending tqs");
+
+  // A finished link of a macro that is fully done locks nothing.
+  const finished = [
+    link("j1", "generate", "done", null),
+    link("j1:chain1", "notes", "done", null),
+  ];
+  assert(set(await lockedResourcesForChapter(fakeEnv(finished), "ZEC", 2)) === "",
+    "a completed macro locks nothing");
+
+  // An unrelated job that merely shares a prefix is not a chain link.
+  const unrelated = [
+    link("j1", "tqs", "running", null),
+    link("j10", "generate", "done", null),
+  ];
+  assert(set(await lockedResourcesForChapter(fakeEnv(unrelated), "ZEC", 2)) === "tq",
+    "a different job id is not swept in by prefix");
+
+  assert(chainRootJobId("j1:chain2") === "j1", "chainRootJobId strips the chain suffix");
+  assert(chainRootJobId("j1") === "j1", "an unchained job is its own root");
 }
 
 // ─── Export resource → lock namespace ─────────────────────────────────────

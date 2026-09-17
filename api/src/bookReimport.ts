@@ -9964,33 +9964,31 @@ async function reimportStagedChunk(
     // write, and the nightly export then skipped JER TN/ULT/UST as stale. One
     // query per chapter, same cost as the resource-blind call this replaces.
     const lockedRes = await lockedResourcesForChapter(env, book, chapter);
-    if (lockedRes.size > 0) {
-      for (const e of staged) {
-        if (!e.changed) continue;
-        if (!lockedRes.has(lockedResourceFor(e.resource))) continue;
-        perResource[e.resource].skipped_locked++;
-        // chapters_locked gates the sync watermark (shouldRecordResourceSync)
-        // — it must be truthful, or a lock on a chapter with no real work for
-        // a given resource would stall that resource's watermark for nothing
-        // (over-withholding: up to 5 export_stale alerts/night for 1 locked
-        // chapter). For the TSV kinds we can check EXACTLY what the row loop
-        // below would have done: it skips a chapter when `changedSets[kind]`
-        // exists and doesn't contain the chapter (line ~1968's `continue`).
-        // Mirror that condition here — increment only when this kind actually
-        // had work in the locked chapter.
-        //
-        // ult/ust are deliberately left unconditional (fail-safe): unlike a
-        // TSV kind's precomputed changed-chapter set, "did this chapter have
-        // any verses to write" isn't available here as an equally exact
-        // check, and the safe direction on uncertainty is to withhold, not
-        // to stamp.
-        if (e.resource === "ult" || e.resource === "ust") {
-          perResource[e.resource].chapters_locked++;
-          continue;
-        }
-        const set = changedSets[e.resource as TsvKind];
-        if (!set || set.has(chapter)) perResource[e.resource].chapters_locked++;
+    for (const e of staged) {
+      if (!e.changed) continue;
+      if (!lockedRes.has(lockedResourceFor(e.resource))) continue;
+      perResource[e.resource].skipped_locked++;
+      // chapters_locked gates the sync watermark (shouldRecordResourceSync)
+      // — it must be truthful, or a lock on a chapter with no real work for
+      // a given resource would stall that resource's watermark for nothing
+      // (over-withholding: up to 5 export_stale alerts/night for 1 locked
+      // chapter). For the TSV kinds we can check EXACTLY what the row loop
+      // below would have done: it skips a chapter when `changedSets[kind]`
+      // exists and doesn't contain the chapter (line ~1968's `continue`).
+      // Mirror that condition here — increment only when this kind actually
+      // had work in the locked chapter.
+      //
+      // ult/ust are deliberately left unconditional (fail-safe): unlike a
+      // TSV kind's precomputed changed-chapter set, "did this chapter have
+      // any verses to write" isn't available here as an equally exact
+      // check, and the safe direction on uncertainty is to withhold, not
+      // to stamp.
+      if (e.resource === "ult" || e.resource === "ust") {
+        perResource[e.resource].chapters_locked++;
+        continue;
       }
+      const set = changedSets[e.resource as TsvKind];
+      if (!set || set.has(chapter)) perResource[e.resource].chapters_locked++;
     }
     for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
       if (lockedRes.has(kind)) continue;  // #828: a job that writes this kind owns the chapter
