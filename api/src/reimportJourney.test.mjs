@@ -1434,8 +1434,25 @@ console.log("\n[(e) a RECOVERED resource clears its stale reimport_id_blocked al
   const raced = withReclaimRace(env, sqlite, BOOK, ID);
   const staleCounts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
   await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", staleCounts);
+  const firstAlert = sqlite
+    .prepare(`SELECT id, condition_key FROM system_alerts WHERE source = ? ORDER BY id DESC LIMIT 1`)
+    .get(`reimport_id_blocked:${BOOK}:tq`);
+  // Counts and samples are volatile detail, not a new blocked episode.
+  await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", { ...staleCounts, tombstone_blocked: 2 });
+  const refreshedAlert = sqlite
+    .prepare(`SELECT id, condition_key FROM system_alerts WHERE source = ? ORDER BY id DESC LIMIT 1`)
+    .get(`reimport_id_blocked:${BOOK}:tq`);
+  eq(refreshedAlert.id, firstAlert.id, "a changed blocked-row count refreshes the same alert episode");
+  eq(refreshedAlert.condition_key, firstAlert.condition_key, "the tombstone condition key excludes volatile counts");
+  sqlite.prepare(`UPDATE system_alerts SET dismissed_at = 123 WHERE id = ?`).run(firstAlert.id);
+  await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", { ...staleCounts, tombstone_blocked: 3 });
+  const dismissed = sqlite
+    .prepare(`SELECT dismissed_at, resolved_at FROM system_alerts WHERE id = ?`)
+    .get(firstAlert.id);
+  eq(dismissed.dismissed_at, 123, "a dismissed blocked episode stays dismissed when its count changes");
+  eq(dismissed.resolved_at, null, "a still-measured blocked episode remains unresolved until clean");
   const before = sqlite
-    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND resolved_at IS NULL`)
     .all(`reimport_id_blocked:${BOOK}:tq`)[0];
   eq(Number(before.n), 1, "sanity: the stale alert exists before recovery");
 
@@ -1451,12 +1468,16 @@ console.log("\n[(e) a RECOVERED resource clears its stale reimport_id_blocked al
   await clearTombstoneBlockAlertForTest(env, BOOK, "tq");
 
   const after = sqlite
-    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL AND resolved_at IS NULL`)
     .all(`reimport_id_blocked:${BOOK}:tq`)[0];
   eq(Number(after.n), 0, "the recovered resource's alert is cleared");
+  const history = sqlite
+    .prepare(`SELECT resolved_at FROM system_alerts WHERE id = ?`)
+    .get(firstAlert.id);
+  eq(history.resolved_at != null, true, "clean recovery resolves the dismissed row without deleting history");
 
   const otherStillOpen = sqlite
-    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL AND resolved_at IS NULL`)
     .all(`reimport_id_blocked:AMO:tn`)[0];
   eq(Number(otherStillOpen.n), 1, "a DIFFERENT (book, resource)'s alert is untouched — clearing is scoped, not a blanket wipe");
 
@@ -3825,7 +3846,7 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
               master_confirmed_edit_id AS confirmedEditId, source_sha AS sourceSha, origin
          FROM book_resource_syncs WHERE book = ? AND resource = 'tq'`,
     ).get(BOOK),
-    banners: sqlite.prepare(`SELECT message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(SOURCE),
+              banners: sqlite.prepare(`SELECT message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL AND resolved_at IS NULL`).all(SOURCE),
   });
   // A Gitea that serves the commit walk AND the merge commit's tree, counting each.
   const gitea = (commits, blobAtMerge) => {
