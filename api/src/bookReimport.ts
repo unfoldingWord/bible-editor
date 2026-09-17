@@ -89,7 +89,7 @@ import {
   type SourceWord,
   type VerseExtract,
 } from "./importParsers";
-import { activePipelineForChapter } from "./chapterLock";
+import { lockedResourcesForChapter, lockedResourceFor } from "./chapterLock";
 import { coerceRowId } from "./rowId";
 import { planTnContentDedup } from "./tnDedup";
 import { isCatastrophicTsvShrink } from "./shrinkGuard";
@@ -1502,17 +1502,22 @@ async function runReimport(
   // one call over all non-locked chapters' rows yields the same result at a fixed
   // read cost. Verses stay per-chapter: applyVerseRows folds its ancestor via a
   // sub-select in the row read (no separate reconstruction read to hoist).
-  const nonLockedChapters = new Set<number>();
+  // Issue #828: per-RESOURCE, not per-chapter — a `tqs` run owns tq and nothing
+  // else. One set per TSV kind, because collectTsvRows below filters each kind's
+  // rows independently and a chapter can be locked for one kind and open for
+  // another.
+  const nonLockedChapters: Record<TsvKind, Set<number>> = { tn: new Set(), tq: new Set(), twl: new Set() };
   for (const chapter of chapters) {
-    const lock = await activePipelineForChapter(env, book, chapter);
-    if (lock) {
-      for (const r of resources) {
-        perResource[r].skipped_locked++;
-        perResource[r].chapters_locked++;
-      }
-      continue;
+    const lockedRes = await lockedResourcesForChapter(env, book, chapter);
+    for (const r of resources) {
+      if (!lockedRes.has(lockedResourceFor(r))) continue;
+      perResource[r].skipped_locked++;
+      perResource[r].chapters_locked++;
     }
-    nonLockedChapters.add(chapter);
+    for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
+      if (!lockedRes.has(kind)) nonLockedChapters[kind].add(chapter);
+    }
+    if (lockedRes.has("verse")) continue;
 
     if (want.has("ult") && ultRaw) {
       const c = await reimportVersesForChapter(env, book, chapter, ultRaw, "ULT", userId, masterConfirmedAtUlt);
@@ -1532,7 +1537,7 @@ async function runReimport(
     const rows: ParsedTsvRow[] = [];
     for (const r of parseTsv(raw).rows) {
       const p = parseTsvRow(r, kind);
-      if (p && nonLockedChapters.has(p.chapter)) rows.push(p);
+      if (p && nonLockedChapters[kind].has(p.chapter)) rows.push(p);
     }
     return rows;
   };
@@ -9227,7 +9232,8 @@ async function softDeleteRemovedTsvRows(
   let skippedLocked = 0;
   for (const ch of candidateChapters) {
     if (!coveredChapters.has(ch)) continue;
-    if (await activePipelineForChapter(env, book, ch)) {
+    // #828: only a job that writes THIS kind blocks pruning it.
+    if ((await lockedResourcesForChapter(env, book, ch)).has(lockedResourceFor(kind))) {
       skippedLocked++;
       continue;
     }
@@ -9951,10 +9957,17 @@ async function reimportStagedChunk(
   };
 
   for (let chapter = startChapter; chapter <= endChapter; chapter++) {
-    const lock = await activePipelineForChapter(env, book, chapter);
-    if (lock) {
+    // Issue #828: the lock is per RESOURCE, not per chapter. A `tqs` run writes
+    // tq_rows and nothing else (PIPELINE_WRITES), so it must not stop ult/ust/tn
+    // from absorbing master — on 2026-09-17 a JER 25 tqs job left open for ten
+    // hours withheld the watermark for exactly the three resources it does not
+    // write, and the nightly export then skipped JER TN/ULT/UST as stale. One
+    // query per chapter, same cost as the resource-blind call this replaces.
+    const lockedRes = await lockedResourcesForChapter(env, book, chapter);
+    if (lockedRes.size > 0) {
       for (const e of staged) {
         if (!e.changed) continue;
+        if (!lockedRes.has(lockedResourceFor(e.resource))) continue;
         perResource[e.resource].skipped_locked++;
         // chapters_locked gates the sync watermark (shouldRecordResourceSync)
         // — it must be truthful, or a lock on a chapter with no real work for
@@ -9978,9 +9991,9 @@ async function reimportStagedChunk(
         const set = changedSets[e.resource as TsvKind];
         if (!set || set.has(chapter)) perResource[e.resource].chapters_locked++;
       }
-      continue;
     }
     for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
+      if (lockedRes.has(kind)) continue;  // #828: a job that writes this kind owns the chapter
       const byCh = rowsByChapter[kind];
       if (!byCh) continue;
       const set = changedSets[kind];
@@ -9992,7 +10005,7 @@ async function reimportStagedChunk(
     // has a tab open at 05:30 UTC, so the live-tab notification is skipped
     // entirely here; the checkoff-reopening DELETE still runs regardless.
     // See applyVerseRows's parameter doc.
-    if (versesByChapter.ult) {
+    if (versesByChapter.ult && !lockedRes.has("verse")) {
       addCounts(
         perResource.ult,
         await applyVerseRows(
@@ -10000,7 +10013,7 @@ async function reimportStagedChunk(
         ),
       );
     }
-    if (versesByChapter.ust) {
+    if (versesByChapter.ust && !lockedRes.has("verse")) {
       addCounts(
         perResource.ust,
         await applyVerseRows(

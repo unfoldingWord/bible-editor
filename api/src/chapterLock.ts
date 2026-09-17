@@ -142,3 +142,42 @@ export function lockedResponseBody(lock: ActiveLock): ChapterLockedError {
     startedAt: lock.startedAt,
   };
 }
+
+// Which resources are locked for one chapter, in ONE query — the set form of
+// activePipelineForChapter, for callers that need the answer for several
+// resources at once (the reimport's per-chapter loops). Asking
+// activePipelineForChapter once per resource would multiply the reimport's D1
+// reads by four on every chapter of every book; unioning here keeps the cost
+// exactly what the resource-blind call already paid.
+//
+// Fail-closed the same way resourcesLockedByJob is: an unrecognized
+// pipeline_type or an unparseable follow_up_chain contributes every resource.
+export async function lockedResourcesForChapter(
+  env: Env,
+  book: string,
+  chapter: number,
+): Promise<Set<LockedResource>> {
+  const statePlaceholders = NON_TERMINAL.map((_, i) => `?${i + 3}`).join(", ");
+  const rs = await env.DB.prepare(
+    `SELECT pipeline_type, follow_up_chain
+       FROM pipeline_jobs
+      WHERE book = ?1
+        AND start_chapter <= ?2 AND end_chapter >= ?2
+        AND state IN (${statePlaceholders})`,
+  )
+    .bind(book.toUpperCase(), chapter, ...NON_TERMINAL)
+    .all<{ pipeline_type: string; follow_up_chain: string | null }>();
+  const locked = new Set<LockedResource>();
+  for (const row of rs.results ?? []) {
+    for (const r of resourcesLockedByJob(row.pipeline_type, row.follow_up_chain)) locked.add(r);
+  }
+  return locked;
+}
+
+// Export resource name → the lock namespace it lives in. ult and ust are both
+// written by the `generate` pipeline and share the single "verse" lock; the
+// three TSV kinds are their own. Keeping this one function means a reimport
+// call site can never invent its own mapping and drift from PIPELINE_WRITES.
+export function lockedResourceFor(resource: "ult" | "ust" | "tn" | "tq" | "twl"): LockedResource {
+  return resource === "ult" || resource === "ust" ? "verse" : resource;
+}

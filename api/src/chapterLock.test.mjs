@@ -11,9 +11,14 @@
 
 import {
   activePipelineForChapter,
+  lockedResourceFor,
+  lockedResourcesForChapter,
   resourcesLockedByJob,
   resourcesWrittenBy,
 } from "./chapterLock.ts";
+import { readFileSync as readSourceSync } from "node:fs";
+import { join as joinPath, dirname as dirName } from "node:path";
+import { fileURLToPath as toPath } from "node:url";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -187,6 +192,79 @@ const job = (pipeline_type, state = "running", follow_up_chain = null) => ({
     (await activePipelineForChapter(env, "ZEC", 2))?.jobId === "job-tqs",
     "any running job answers the unscoped question",
   );
+}
+
+
+// ─── The set form the reimport uses (issue #828) ──────────────────────────
+//
+// The nightly reimport asks "which resources are locked in this chapter" once
+// and answers for all five export resources. Before #828 it asked the
+// RESOURCE-BLIND question and withheld every resource's watermark, so a JER 25
+// `tqs` run held back TN, ULT and UST — the three resources it does not write —
+// and the export skipped them as stale for a whole night.
+{
+  console.log("\n[lockedResourcesForChapter]");
+  const set = (s) => [...s].sort().join(",");
+
+  assert(set(await lockedResourcesForChapter(fakeEnv([job("tqs")]), "ZEC", 2)) === "tq",
+    "a questions run locks tq and nothing else");
+  assert(set(await lockedResourcesForChapter(fakeEnv([job("notes")]), "ZEC", 2)) === "tn",
+    "a notes run locks tn only");
+  assert(set(await lockedResourcesForChapter(fakeEnv([job("generate")]), "ZEC", 2)) === "verse",
+    "a generate run locks verse only");
+  assert(set(await lockedResourcesForChapter(fakeEnv([job("tqs"), job("generate")]), "ZEC", 2)) === "tq,verse",
+    "two running jobs union their locks");
+
+  // Fail-closed, both shapes — an unknown pipeline type and an unparseable
+  // chain each lock everything, exactly as resourcesLockedByJob does.
+  assert(set(await lockedResourcesForChapter(fakeEnv([job("brand-new-kind")]), "ZEC", 2)) === "tn,tq,twl,verse",
+    "an unrecognized pipeline type locks every resource");
+  assert(set(await lockedResourcesForChapter(fakeEnv([job("notes", "running", "{not json")]), "ZEC", 2)) === "tn,tq,twl,verse",
+    "an unparseable follow_up_chain locks every resource");
+
+  // A chained run locks what the chain will still write.
+  const chained = job("generate", "running", JSON.stringify([{ pipelineType: "notes" }]));
+  assert(set(await lockedResourcesForChapter(fakeEnv([chained]), "ZEC", 2)) === "tn,verse",
+    "a chained generate→notes run locks verse and tn");
+
+  // Nothing running, wrong chapter, wrong book, terminal state → empty.
+  assert(set(await lockedResourcesForChapter(fakeEnv([]), "ZEC", 2)) === "",
+    "no jobs → nothing locked");
+  assert(set(await lockedResourcesForChapter(fakeEnv([job("tqs", "done")]), "ZEC", 2)) === "",
+    "a finished job locks nothing");
+  assert(set(await lockedResourcesForChapter(fakeEnv([job("tqs")]), "ZEC", 9)) === "",
+    "a job on chapters 1-3 does not lock chapter 9");
+  assert(set(await lockedResourcesForChapter(fakeEnv([job("tqs")]), "HOS", 2)) === "",
+    "a JER job does not lock another book");
+}
+
+// ─── Export resource → lock namespace ─────────────────────────────────────
+{
+  console.log("\n[lockedResourceFor]");
+  assert(lockedResourceFor("ult") === "verse", "ult lives in the verse lock");
+  assert(lockedResourceFor("ust") === "verse", "ust lives in the verse lock");
+  assert(lockedResourceFor("tn") === "tn", "tn is its own lock");
+  assert(lockedResourceFor("tq") === "tq", "tq is its own lock");
+  assert(lockedResourceFor("twl") === "twl", "twl is its own lock");
+}
+
+// ─── The reimport must never ask the resource-blind question (#828) ───────
+//
+// A source guard, deliberately: the three reimport call sites are inside a
+// 10k-line file whose surrounding machinery (staged R2 plans, Workflow steps,
+// live DCS fetches) cannot be stood up here, so the invariant is stated where
+// it can actually be checked. What it asserts is exact — bookReimport.ts asks
+// "which resources are locked", never "is anything running" — and it fails the
+// moment a call site regresses to the blind form.
+{
+  console.log("\n[bookReimport asks the scoped question]");
+  const src = readSourceSync(joinPath(dirName(toPath(import.meta.url)), "bookReimport.ts"), "utf8");
+  assert(!/activePipelineForChapter\s*\(/.test(src),
+    "bookReimport.ts makes no resource-blind activePipelineForChapter call");
+  assert((src.match(/lockedResourcesForChapter\s*\(/g) ?? []).length === 3,
+    "all three reimport lock sites use lockedResourcesForChapter");
+  assert((src.match(/lockedResourceFor\s*\(/g) ?? []).length >= 3,
+    "the lock sites map their resource through lockedResourceFor");
 }
 
 if (failed) {
