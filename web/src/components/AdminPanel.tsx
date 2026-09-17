@@ -3,7 +3,7 @@
 // spec in the PR description / CLAUDE.md session notes for the full API
 // contract this codes against — the backend is built to the same contract in
 // parallel.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Box,
@@ -346,14 +346,19 @@ function SyncActivityTab() {
     );
   }, [entries, filter]);
 
+  // Guards the run-detail fetch against a request race: selecting run A then run
+  // B before A resolves must not let A's later response overwrite B's events
+  // under B's heading. Only the most recently requested runId applies its result.
+  const latestRunReq = useRef<string | null>(null);
   const showRun = useCallback((runId: string) => {
     setSelectedRunId(runId);
     setRunLoading(true);
     setRunError(null);
+    latestRunReq.current = runId;
     api.getAdminSyncRun(runId)
-      .then((res) => setRunEvents(res.events))
-      .catch((e) => setRunError(String(e)))
-      .finally(() => setRunLoading(false));
+      .then((res) => { if (latestRunReq.current === runId) setRunEvents(res.events); })
+      .catch((e) => { if (latestRunReq.current === runId) setRunError(String(e)); })
+      .finally(() => { if (latestRunReq.current === runId) setRunLoading(false); });
   }, []);
 
   const fmtRunTime = (ms: number | null) => ms == null ? "—" : new Date(ms).toLocaleString();

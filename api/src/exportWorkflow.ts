@@ -246,14 +246,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     try {
       const result = await this.runCore(event, step, instanceId, observedAt, workflowRunId);
       const counts = this.ledgerCounts(result.results);
+      // A reimport-only self-heal run produces no export results, so its per-book
+      // sync failures are caught inside runCore and surfaced only via this
+      // summary — fold them into the terminal status so the dashboard never
+      // reports a failed self-heal as a clean "completed" (#827 review).
+      const failureCount = counts.failureCount + result.reimport.failureCount;
       await step.do("ledger-run-completed", async () =>
         appendSyncRunEvent(this.env, {
           runId: workflowRunId,
           eventKey: syncRunEventKey(workflowRunId, "run_completed"),
           eventType: "run_completed",
           occurredAt: Date.now(),
-          status: counts.failureCount ? "completed_with_failures" : "completed",
-          details: { ...counts, totalSteps: result.totalSteps },
+          status: failureCount ? "completed_with_failures" : "completed",
+          details: { ...counts, reimport: result.reimport, totalSteps: result.totalSteps },
         }),
       );
       return result;
@@ -330,6 +335,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     instanceId: string;
     totalSteps: number;
     results: StepResult[];
+    reimport: { successCount: number; failureCount: number };
   }> {
     const params = event.payload ?? {};
 
@@ -416,6 +422,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     //     wrapped in try/catch so a single book's failure can't abort the whole
     //     export instance — same shape as the post-export reimport loop. Gated
     //     on dcsAllowed: a dry run / no-token run shouldn't mutate D1.
+    // Per-book reimport outcomes, surfaced in the run's terminal ledger status
+    // (#827 review): a reimport-only (08:00 self-heal) run whose per-book syncs
+    // fail is caught below and never reaches the export results, so without
+    // this the ledger would always record it as a clean "completed".
+    let reimportSuccessCount = 0;
+    let reimportFailureCount = 0;
     if (dcsAllowed || params.reimportOnly) {
       // Scope the reimport to `resources` when the caller named specific ones
       // (the admin "Pull from Door43" control), else fall back to the
@@ -440,6 +452,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
           });
+          reimportSuccessCount++;
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
           // this book's D1 is now possibly stale relative to master. The
@@ -447,6 +460,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // commit a stale render, so a failed sync no longer reverts master —
           // it just skips this book's export until a later sync succeeds. Alert
           // so the failure is visible rather than silently swallowed.
+          reimportFailureCount++;
           const msg = e instanceof Error ? e.message : String(e);
           console.error("export pre-reimport failed", { book, error: msg });
           try {
@@ -522,7 +536,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // Self-heal mode (08:00 REIMPORT_CRON): D1 is now synced from DCS; there's
     // nothing to render or commit, so stop before the export steps below.
     if (params.reimportOnly) {
-      return { instanceId, totalSteps: 0, results: [] };
+      return {
+        instanceId,
+        totalSteps: 0,
+        results: [],
+        reimport: { successCount: reimportSuccessCount, failureCount: reimportFailureCount },
+      };
     }
 
     // 1c. Resolve which books are currently locked (published, or explicitly
@@ -566,6 +585,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     for (const resource of resources) {
       for (const book of books) {
         const stepName = `export-${book}-${resource}`;
+        let itemResult: StepResult;
         try {
           const result = await step.do(
             stepName,
@@ -584,7 +604,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
               ),
           );
           results.push(result);
-          await this.recordLedgerItem(step, stepName, workflowRunId, Date.now(), result);
+          itemResult = result;
         } catch (e) {
           // A single (book, resource) failure — most commonly a corrupt/dangling
           // DCS branch ref that ensureBranchVisible can't heal — must not abort
@@ -602,7 +622,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           } catch {
             /* recording the failure is best-effort; never let it abort the run */
           }
-          results.push({
+          itemResult = {
             book,
             resource,
             rowCount: 0,
@@ -614,8 +634,22 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             dcsSkippedReason: `error:${reason.slice(0, 180)}`,
             prNumber: null,
             prReason: null,
+          };
+          results.push(itemResult);
+        }
+        // Ledger item_terminal is recorded OUTSIDE the export try/catch above:
+        // a telemetry failure here must not re-enter the catch (which would
+        // fabricate a second, error-flagged result for an export that actually
+        // succeeded) nor abort the run. Best-effort, like every other ledger
+        // call. recordLedgerItem derives success/skip/failure from the result.
+        try {
+          await this.recordLedgerItem(step, stepName, workflowRunId, Date.now(), itemResult);
+        } catch (e) {
+          console.error("export ledger item record failed", {
+            book,
+            resource,
+            error: e instanceof Error ? e.message : String(e),
           });
-          await this.recordLedgerItem(step, stepName, workflowRunId, Date.now(), results[results.length - 1], "failure");
         }
       }
       // Post-export validate-and-merge is opt-in via params.validateAndMerge.
@@ -640,7 +674,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       console.error("export lint-escalate failed", { error: e instanceof Error ? e.message : String(e) });
     }
 
-    return { instanceId, totalSteps: results.length, results };
+    return {
+      instanceId,
+      totalSteps: results.length,
+      results,
+      reimport: { successCount: reimportSuccessCount, failureCount: reimportFailureCount },
+    };
   }
 
   // Lint each book's rendered scripture for footnote imbalance and raise/clear an
