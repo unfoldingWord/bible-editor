@@ -953,10 +953,14 @@ export interface HumanRefEvidence {
   reason: string;
 }
 
-/** One unified-diff hunk, new-side only — that is the side the fetched file is. */
+/** One unified-diff hunk, retaining both old and new sides for ref moves. */
 export interface HunkRange {
+  /** New-side range, as before. */
   newStart: number;
   newCount: number;
+  /** Old-side range from the same unified-diff header. */
+  oldStart: number;
+  oldCount: number;
 }
 
 const REF_INCOMPLETE = (reason: string): HumanRefEvidence => ({ complete: false, refs: [], reason });
@@ -1057,8 +1061,9 @@ export function parseDiffHunksForPath(
       const oldCount = h[2] === undefined ? 1 : Number(h[2]);
       const newStart = Number(h[3]);
       const newCount = h[4] === undefined ? 1 : Number(h[4]);
+      const oldStart = Number(h[1]);
       open = {
-        range: { newStart, newCount },
+        range: { oldStart, oldCount, newStart, newCount },
         oldCount,
         newCount,
         ctx: 0,

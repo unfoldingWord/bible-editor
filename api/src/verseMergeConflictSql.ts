@@ -183,6 +183,29 @@ export const CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `DELETE FROM system_alerts
                          AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
                          AND resolved_at IS NULL)`;
 
+// Stage 7 counterpart used by production clear paths. Keep the legacy DELETE
+// exports above for pre-0066 compatibility callers/tests, but new transitions
+// resolve rows so recurrence can mint a new alert without erasing history.
+export const RESOLVE_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL = `UPDATE system_alerts
+    SET resolved_at = unixepoch()
+    WHERE source = ?1 AND resolved_at IS NULL AND kind = 'review'
+      AND message NOT LIKE '%${NO_BASE_ADMIN_FINGERPRINT}%'
+      AND message NOT LIKE '%${NO_BASE_EDITOR_FINGERPRINT}%'
+      AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
+                       WHERE book = ?2 AND resource = ?3
+                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
+                         AND resolved_at IS NULL)`;
+
+export const RESOLVE_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `UPDATE system_alerts
+    SET resolved_at = unixepoch()
+    WHERE username = ?1 AND source = ?2 AND resolved_at IS NULL AND kind = 'review'
+      AND message NOT LIKE '%${NO_BASE_ADMIN_FINGERPRINT}%'
+      AND message NOT LIKE '%${NO_BASE_EDITOR_FINGERPRINT}%'
+      AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
+                       WHERE book = ?3 AND resource = ?4
+                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure')
+                         AND resolved_at IS NULL)`;
+
 // ---------------------------------------------------------------------------
 // TWO-PHASE REACTIVATION (2026-08-15 Codex second-opinion review fix,
 // superseding the first six-angle review's "reset resolved_at

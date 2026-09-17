@@ -26,10 +26,39 @@ export interface UseBookLintReturn {
 export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   const [report, setReport] = useState<BookLintReport | null>(null);
   const [status, setStatus] = useState<UseBookLintReturn["status"]>("idle");
-  const queue = useRef<ReturnType<typeof createLintRefreshQueue> | null>(null);
+  // Created once for the hook's lifetime so `load()` never observes a null
+  // queue — neither on first render (before the mount effect runs) nor
+  // between a book change's effect cleanup and its replacement effect. The
+  // effect below swaps `runner.current` instead of recreating the queue, so
+  // an in-flight refresh() from before a book change still resolves against
+  // whichever run() the queue picks up next (the queue's own coalescing).
+  const runner = useRef<() => Promise<void>>(() => Promise.resolve());
+  const queue = useRef<ReturnType<typeof createLintRefreshQueue>>();
+  const disposed = useRef(false);
+  if (queue.current === undefined) {
+    queue.current = createLintRefreshQueue(() => runner.current());
+  }
 
   const load = useCallback((): Promise<void> => {
-    return queue.current?.refresh() ?? Promise.resolve();
+    return queue.current!.refresh();
+  }, []);
+
+  // Dispose only on actual unmount — the queue itself outlives book changes.
+  // React StrictMode replays effects (setup → cleanup → setup) in dev, so the
+  // first cleanup disposes the retained queue while the ref survives; revive
+  // it on the replayed setup or every later refresh() (lint load, dismiss,
+  // edit) would silently no-op against a permanently-disposed queue. This
+  // effect is declared before the book-change effect, so its replayed setup
+  // recreates the queue before that effect's refresh() runs against it.
+  useEffect(() => {
+    if (disposed.current) {
+      queue.current = createLintRefreshQueue(() => runner.current());
+      disposed.current = false;
+    }
+    return () => {
+      queue.current!.dispose();
+      disposed.current = true;
+    };
   }, []);
 
   // Refetch on book change (and reset when disabled) — lint is per-book.
@@ -37,11 +66,12 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
     if (!enabled) {
       setReport(null);
       setStatus("idle");
+      runner.current = () => Promise.resolve();
       return;
     }
     setReport(null);
     const ctrl = new AbortController();
-    const current = createLintRefreshQueue(async () => {
+    runner.current = async () => {
       setStatus("loading");
       try {
         const r = await fetchWithRetry((signal) => api.getBookLint(book, signal), { signal: ctrl.signal });
@@ -51,12 +81,9 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
       } catch {
         if (!ctrl.signal.aborted) setStatus("error");
       }
-    });
-    queue.current = current;
-    void current.refresh();
+    };
+    void queue.current!.refresh();
     return () => {
-      queue.current = null;
-      current.dispose();
       ctrl.abort();
     };
   }, [book, enabled]);

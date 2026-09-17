@@ -471,7 +471,8 @@ console.log("\n6b. F6 — release on the SHA-match convergence path");
     eq(plan.entries[0].changed, false, "SHA-match → nothing staged (unchanged behavior)");
     eq(rawFetches, 0, "…and no file is fetched, so the gate never runs — which is why the clear must live here");
     eq(sqlite.prepare(`SELECT COUNT(*) c FROM stale_base_holds WHERE resolved_at IS NULL`).all()[0].c, 0, "F6: the stale hold is released on convergence");
-    eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(src)[0].c, 0, "F6: …and the banner is dropped");
+    eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL AND resolved_at IS NULL`).all(src)[0].c, 0, "F6: …and no standing banner remains");
+    eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND resolved_at IS NOT NULL`).all(src)[0].c, 1, "F6: …while preserving the resolved transition in history");
   } finally {
     globalThis.fetch = realFetch4;
   }
@@ -594,7 +595,8 @@ console.log("\n5. durable record + banner");
   sqlite.prepare(`UPDATE system_alerts SET dismissed_at = NULL WHERE source = ?`).run(src);
   await clearStaleBaseHold(env, "2CH", "ult", t2 + 172800);
   eq(sqlite.prepare(`SELECT COUNT(*) c FROM stale_base_holds WHERE resolved_at IS NULL`).all()[0].c, 0, "clean sync releases every active hold");
-  eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(src)[0].c, 0, "…and clears the banner");
+  eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL AND resolved_at IS NULL`).all(src)[0].c, 0, "…and clears the standing banner");
+  eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND resolved_at IS NOT NULL`).all(src)[0].c, 1, "…while preserving the resolved transition in history");
 }
 
 // ── 8. F2: the admin "Pull from Door43" route runs the same gate ────────────
