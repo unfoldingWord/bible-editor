@@ -116,6 +116,55 @@ function mkComment(overrides = {}) {
   assert(JSON.stringify(countThreads(undefined)) === JSON.stringify({ openQuestions: 0, notes: 0, total: 0 }), "undefined input");
 }
 
+// --- orphaned row comments float to the verse (#818) ---
+{
+  // No liveRows passed: orphan detection is off, exactly like every test above.
+  const root = mkComment({ verse: 5, rowKind: "tq", rowId: "gone" });
+  const idx = indexComments([root]);
+  assert(idx.threadsByRow.get("tq:gone")?.length === 1, "without liveRows, row-anchored root indexes under its own id regardless of liveness");
+}
+{
+  const live = mkComment({ verse: 5, rowKind: "tq", rowId: "live1" });
+  const dead = mkComment({ verse: 5, rowKind: "tq", rowId: "deleted1" });
+  const idx = indexComments([live, dead], { rowIds: new Set(["tq:live1"]), introRowId: null });
+  assert(idx.threadsByRow.get("tq:live1")?.length === 1, "live row-anchored root still indexes under its rowId");
+  assert(!idx.threadsByRow.has("tq:deleted1"), "dead row-anchored root does not index under its stale rowId");
+  const floated = idx.threadsByVerse.get(5) ?? [];
+  assert(floated.length === 1 && floated[0].root.id === dead.id, "dead row-anchored root floats to its verse instead");
+  assert(floated[0].orphaned === true, "floated thread is flagged orphaned");
+}
+{
+  const live = mkComment({ verse: 5, rowKind: "tq", rowId: "live1" });
+  const idx = indexComments([live], { rowIds: new Set(["tq:live1"]), introRowId: null });
+  const thread = idx.threadsByRow.get("tq:live1")[0];
+  assert(!thread.orphaned, "a live row-anchored thread is not flagged orphaned");
+}
+
+// --- chapter intro comments redirect to the current intro row (#818) ---
+{
+  // Comment was created against an intro row that has since been replaced.
+  const stale = mkComment({ verse: 0, rowKind: "tn", rowId: "intro-old" });
+  const idx = indexComments([stale], { rowIds: new Set(["tn:intro-new"]), introRowId: "intro-new" });
+  assert(idx.threadsByRow.get("tn:intro-new")?.[0]?.root.id === stale.id, "stale intro comment lands under the CURRENT intro row's id");
+  assert(!idx.threadsByRow.has("tn:intro-old"), "stale intro comment does not index under its original (deleted) rowId");
+  assert((idx.threadsByVerse.get(0) ?? []).length === 0, "redirected intro comment is not also floated to verse 0");
+}
+{
+  // Comment created against the still-current intro row: no change in behavior.
+  const current = mkComment({ verse: 0, rowKind: "tn", rowId: "intro-new" });
+  const idx = indexComments([current], { rowIds: new Set(["tn:intro-new"]), introRowId: "intro-new" });
+  assert(idx.threadsByRow.get("tn:intro-new")?.[0]?.root.id === current.id, "current intro comment still lands under the intro row's id");
+}
+{
+  // No intro row exists right now at all: falls back to the orphan path
+  // (floats to verse 0) rather than disappearing.
+  const stale = mkComment({ verse: 0, rowKind: "tn", rowId: "intro-old" });
+  const idx = indexComments([stale], { rowIds: new Set(), introRowId: null });
+  const floated = idx.threadsByVerse.get(0) ?? [];
+  assert(floated.length === 1 && floated[0].root.id === stale.id, "intro comment with no current intro row floats to verse 0");
+  assert(floated[0].orphaned === true, "floated intro comment is flagged orphaned");
+}
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);

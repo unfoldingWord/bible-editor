@@ -8,10 +8,16 @@ import type { CommentDto, CommentRowKind } from "../sync/api";
 export interface CommentThread {
   root: CommentDto;
   replies: CommentDto[];
+  // True when this thread was originally anchored to a tn/tq/twl row that no
+  // longer exists (the row was deleted/replaced, typically by an AI
+  // regeneration) and has floated down to the verse level as a fallback. See
+  // issue #818: without this, a comment on a swept row becomes permanently
+  // invisible — nothing renders a card for a row id nobody holds anymore.
+  orphaned?: boolean;
 }
 
 export interface CommentsIndex {
-  threadsByVerse: Map<number, CommentThread[]>; // verse-anchored only (rowKind === null)
+  threadsByVerse: Map<number, CommentThread[]>; // verse-anchored only (rowKind === null), plus orphaned row threads
   threadsByRow: Map<string, CommentThread[]>; // key = `${rowKind}:${rowId}`
   byId: Map<number, CommentDto>;
 }
@@ -20,7 +26,21 @@ export function rowKey(rowKind: CommentRowKind, rowId: string): string {
   return `${rowKind}:${rowId}`;
 }
 
-export function indexComments(list: CommentDto[]): CommentsIndex {
+// What indexComments needs to know about the chapter's CURRENT rows to tell a
+// live row-anchored comment from an orphaned one (#818). Optional: omitting it
+// (e.g. existing callers/tests) disables orphan detection entirely and every
+// row-anchored root indexes under its own rowId exactly as before.
+export interface LiveRows {
+  // `${rowKind}:${rowId}` for every tn/tq/twl row currently in the chapter.
+  rowIds: Set<string>;
+  // id of the chapter's current chapter-intro tn row (verse 0), if any. There
+  // is exactly one per chapter, so any tn/verse=0 comment is redirected here
+  // regardless of which (possibly since-deleted) intro row it was created
+  // against — the intro is a "there's only ever one of these" anchor.
+  introRowId: string | null;
+}
+
+export function indexComments(list: CommentDto[], liveRows?: LiveRows): CommentsIndex {
   const live = list.filter((c) => c.deletedAt == null);
   const byId = new Map<number, CommentDto>();
   for (const c of live) byId.set(c.id, c);
@@ -49,21 +69,41 @@ export function indexComments(list: CommentDto[]): CommentsIndex {
   const threadsByVerse = new Map<number, CommentThread[]>();
   const threadsByRow = new Map<string, CommentThread[]>();
 
+  const pushByVerse = (verse: number, thread: CommentThread) => {
+    const arr = threadsByVerse.get(verse);
+    if (arr) arr.push(thread);
+    else threadsByVerse.set(verse, [thread]);
+  };
+  const pushByRow = (key: string, thread: CommentThread) => {
+    const arr = threadsByRow.get(key);
+    if (arr) arr.push(thread);
+    else threadsByRow.set(key, [thread]);
+  };
+
   for (const root of roots) {
     const thread: CommentThread = {
       root,
       replies: repliesByRoot.get(root.id) ?? [],
     };
     if (root.rowKind == null) {
-      const arr = threadsByVerse.get(root.verse);
-      if (arr) arr.push(thread);
-      else threadsByVerse.set(root.verse, [thread]);
-    } else {
-      const key = rowKey(root.rowKind, root.rowId!);
-      const arr = threadsByRow.get(key);
-      if (arr) arr.push(thread);
-      else threadsByRow.set(key, [thread]);
+      pushByVerse(root.verse, thread);
+      continue;
     }
+    // Chapter intro: always land on whichever tn row is the CURRENT intro for
+    // this chapter, not the (possibly stale) rowId the comment was created
+    // against. See LiveRows.introRowId.
+    if (root.rowKind === "tn" && root.verse === 0 && liveRows?.introRowId) {
+      pushByRow(rowKey("tn", liveRows.introRowId), thread);
+      continue;
+    }
+    // Ordinary row-anchored comment whose row no longer exists (or, for an
+    // intro comment, no intro row exists at all right now): float it to the
+    // verse it was created on, flagged, rather than let it vanish.
+    if (liveRows && !liveRows.rowIds.has(rowKey(root.rowKind, root.rowId!))) {
+      pushByVerse(root.verse, { ...thread, orphaned: true });
+      continue;
+    }
+    pushByRow(rowKey(root.rowKind, root.rowId!), thread);
   }
 
   return { threadsByVerse, threadsByRow, byId };

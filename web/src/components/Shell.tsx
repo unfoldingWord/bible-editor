@@ -30,7 +30,7 @@ import { outbox } from "../sync/outbox";
 import { api, ApiError, CHECK_LANES, setReadOnlyReason } from "../sync/api";
 import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
-import { countThreads, rowKey, type CommentThread } from "../lib/commentsIndex";
+import { countThreads, rowKey, type CommentThread, type LiveRows } from "../lib/commentsIndex";
 import { CommentsPopover } from "./CommentsPopover";
 import type { CommentTarget, NewCommentDraft, OpenCommentsFn } from "./commentsTarget";
 import { targetKey, targetsMatch } from "./commentsTarget";
@@ -364,6 +364,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Declared above useChapterRoom because that hook's handler object wires
   // applyWsComment straight through.
   const commentsEnabled = !isViewer;
+  // The chapter's live rows, for the orphan/intro-redirect logic in
+  // indexComments (#818) — lets a comment anchored to a since-deleted tn/tq/twl
+  // row stay visible (floated to the verse) instead of vanishing, and lets a
+  // chapter-intro comment always land on whichever tn row is the CURRENT
+  // intro rather than the one it was created against.
+  const commentLiveRows = useMemo<LiveRows | undefined>(() => {
+    if (!data) return undefined;
+    const rowIds = new Set<string>();
+    for (const r of data.tn) rowIds.add(rowKey("tn", r.id));
+    for (const r of data.tq) rowIds.add(rowKey("tq", r.id));
+    for (const r of data.twl) rowIds.add(rowKey("twl", r.id));
+    const introRow = data.tn.find((r) => r.verse === 0);
+    return { rowIds, introRowId: introRow ? introRow.id : null };
+  }, [data]);
   const {
     index: commentsIndex,
     loading: commentsLoading,
@@ -375,7 +389,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     removeComment,
     applyWsComment,
     reload: reloadComments,
-  } = useComments(book, chapter, commentsEnabled);
+  } = useComments(book, chapter, commentsEnabled, commentLiveRows);
 
   // Live cross-tab updates. The server broadcasts row writes via the
   // ChapterRoom DO; we dedupe by version so the originating user's tab

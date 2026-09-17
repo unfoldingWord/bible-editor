@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, type CommentDto, type NewCommentInput } from "../sync/api";
-import { indexComments, type CommentsIndex } from "../lib/commentsIndex";
+import { indexComments, type CommentsIndex, type LiveRows } from "../lib/commentsIndex";
 
 // Stable empty array so the derived `comments` identity doesn't change on every
 // render while a chapter's fetch is still in flight (keeps useMemo honest).
@@ -13,6 +13,10 @@ export function useComments(
   book: string,
   chapter: number,
   enabled: boolean,
+  // The chapter's current tn/tq/twl row ids, for orphan detection (#818).
+  // Omit to disable it (every row-anchored comment indexes under its own
+  // rowId regardless of whether that row still exists).
+  liveRows?: LiveRows,
 ): {
   comments: CommentDto[];
   index: CommentsIndex;
@@ -142,7 +146,7 @@ export function useComments(
     [key],
   );
 
-  const index = useMemo(() => indexComments(comments), [comments]);
+  const index = useMemo(() => indexComments(comments, liveRows), [comments, liveRows]);
 
   return {
     comments,
