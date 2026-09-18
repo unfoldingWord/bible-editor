@@ -32,6 +32,13 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # eslint.config.js: react-hooks/rules-of-hooks (error, expected 0
+      # findings) + react-hooks/exhaustive-deps (warn-only, ~400 existing
+      # call sites not yet triaged — see issue #842). No --max-warnings 0:
+      # the warn-level findings are intentionally non-blocking for now.
+      - name: Lint
+        run: npm run lint
+
       # Alignment / replace / morph / conflict regression suites — the real
       # safety net for the edit engine (see CLAUDE.md).
       - name: Web unit tests
