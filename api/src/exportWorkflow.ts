@@ -113,6 +113,7 @@ import {
   releaseSetUsable,
   describePublishedDrift,
   lockOverrideAllowed,
+  DcsReleaseListSchema,
   type DcsRelease,
 } from "./publishedGuard";
 import { BOOK_NUMBERS } from "./dcsSources";
@@ -3173,7 +3174,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       if (this.env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${this.env.DCS_SERVICE_TOKEN}`;
       const r = await fetch(url, { headers });
       if (!r.ok) return null;
-      return (await r.json()) as DcsRelease[];
+      const parsed = DcsReleaseListSchema.safeParse(await r.json());
+      if (!parsed.success) return null;
+      return parsed.data;
     } catch {
       return null;
     }

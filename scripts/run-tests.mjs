@@ -65,6 +65,9 @@ const EXTRA_IMPORTS = new Map([
   // directly from verseMergeConflicts.ts (issue #760 fail-closed regression
   // test), which in turn imports "./auth" and "./index" without extensions.
   ["src/verseMergeConflicts.test.mjs", "./src/tsResolveHook.mjs"],
+  // postExport.test.mjs imports postExport.ts (issue #841 schema tests),
+  // which imports "./bookReimport" without an extension.
+  ["src/postExport.test.mjs", "./src/tsResolveHook.mjs"],
 ]);
 
 function findTestFiles(dir) {
