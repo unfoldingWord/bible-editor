@@ -136,6 +136,7 @@ interface Props {
   trashIndicator?: ReactNode;
   notificationsMenu?: ReactNode;
   exportMenu?: ReactNode;
+  printPreview?: ReactNode;
   bookLocksButton?: ReactNode;
   railCollapsed?: boolean;
   onToggleRail?: () => void;
@@ -157,6 +158,7 @@ export function TopBar({
   trashIndicator,
   notificationsMenu,
   exportMenu,
+  printPreview,
   bookLocksButton,
   railCollapsed,
   onToggleRail,
@@ -468,6 +470,7 @@ export function TopBar({
       <VersionIndicator onRequestReload={onRequestReload} />
       <SyncStatusBar onNavigate={onNavigate} />
       {exportMenu}
+      {printPreview}
       <FontSizeControl />
       <Tooltip title={mode === "dark" ? "switch to light mode" : "switch to dark mode"}>
         <IconButton size="small" onClick={toggle} aria-label="toggle color mode">

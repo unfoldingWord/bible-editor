@@ -85,6 +85,7 @@ import {
 } from "./SideBySideAligner";
 import { TopBar } from "./TopBar";
 import { ExportUsfmButton } from "./ExportUsfmButton";
+import { PrintPreviewButton } from "./PrintPreviewButton";
 import { BookLintIndicator } from "./BookLintIndicator";
 import { AlignAttentionIndicator } from "./AlignAttentionIndicator";
 import { BookNotesIndicator } from "./BookNotesIndicator";
@@ -3444,6 +3445,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         syncWarnings={syncWarnings}
         exportMenu={
           <ExportUsfmButton
+            book={book}
+            chapter={chapter}
+            enabledVersions={displayedVersions}
+            chapterVersesFor={(version) =>
+              data ? Object.values(data.verses[version] ?? {}) : []
+            }
+          />
+        }
+        printPreview={
+          <PrintPreviewButton
             book={book}
             chapter={chapter}
             enabledVersions={displayedVersions}
