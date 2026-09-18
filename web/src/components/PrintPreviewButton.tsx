@@ -29,6 +29,10 @@ import type { VerseDto } from "../sync/api";
 import { fetchBookVerses } from "../lib/bookVerses";
 import { PRINT_PREVIEW_CSS, buildPrintPreviewDocument, renderPrintPreviewHtml } from "../lib/printPreview";
 
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 interface Props {
   book: string;
   chapter: number;
@@ -80,19 +84,22 @@ interface DialogProps {
 function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose }: DialogProps) {
   const [version, setVersion] = useState(versions[0]);
   const [scope, setScope] = useState<Scope>("chapter");
-  // Whole-book verses, fetched once per version while the dialog is open.
+  // Paratext-style "standard" view: tiny grey USFM markers inline.
+  const [showMarkers, setShowMarkers] = useState(false);
+  // Whole-book verses, fetched once per book+version while the dialog is open.
   const [bookVerses, setBookVerses] = useState<Record<string, VerseDto[]>>({});
+  const bookKey = `${book}:${version}`;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (scope !== "book" || bookVerses[version]) return;
+    if (scope !== "book" || bookVerses[bookKey]) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
     fetchBookVerses(book, version)
       .then((verses) => {
-        if (!cancelled) setBookVerses((prev) => ({ ...prev, [version]: verses }));
+        if (!cancelled) setBookVerses((prev) => ({ ...prev, [bookKey]: verses }));
       })
       .catch((e: unknown) => {
         if (!cancelled) setError(`Could not load ${book}: ${e instanceof Error ? e.message : String(e)}`);
@@ -101,11 +108,14 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
         if (!cancelled) setLoading(false);
       });
     return () => {
+      // Leaving book scope mid-fetch must also drop the spinner — nothing else
+      // will, since no new effect run follows for chapter scope.
       cancelled = true;
+      setLoading(false);
     };
-  }, [scope, version, book, bookVerses]);
+  }, [scope, version, book, bookKey, bookVerses]);
 
-  const verses = scope === "chapter" ? chapterVersesFor(version) : (bookVerses[version] ?? null);
+  const verses = scope === "chapter" ? chapterVersesFor(version) : (bookVerses[bookKey] ?? null);
   const html = useMemo(
     () => (verses ? renderPrintPreviewHtml({ book, bibleVersion: version, verses }) : null),
     [verses, book, version],
@@ -123,7 +133,8 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
       return;
     }
     w.document.open();
-    w.document.write(buildPrintPreviewDocument(title, html));
+    setError(null);
+    w.document.write(buildPrintPreviewDocument(title, html, showMarkers));
     w.document.close();
     w.focus();
     // document.write'd pages don't reliably fire `load`; give fonts a beat.
@@ -139,7 +150,10 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
           exclusive
           value={version}
           onChange={(_e, v: string | null) => {
-            if (v) setVersion(v);
+            if (v) {
+              setVersion(v);
+              setError(null);
+            }
           }}
         >
           {versions.map((v) => (
@@ -153,12 +167,20 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
           exclusive
           value={scope}
           onChange={(_e, s: Scope | null) => {
-            if (s) setScope(s);
+            if (s) {
+              setScope(s);
+              setError(null);
+            }
           }}
         >
           <ToggleButton value="chapter">Chapter {chapter}</ToggleButton>
           <ToggleButton value="book">Whole book</ToggleButton>
         </ToggleButtonGroup>
+        <Tooltip title="Show USFM markers inline (Paratext standard view)">
+          <ToggleButton size="small" value="markers" selected={showMarkers} onChange={() => setShowMarkers((m) => !m)}>
+            Markers
+          </ToggleButton>
+        </Tooltip>
         <Stack direction="row" spacing={1} sx={{ ml: "auto", alignItems: "center" }}>
           <Button size="small" startIcon={<OpenInNewIcon />} onClick={() => openWindow(false)} disabled={html === null}>
             Open in tab
@@ -186,7 +208,10 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
         )}
         {html !== null && (
           <Box sx={{ my: 2 }}>
-            <div className="print-preview" dangerouslySetInnerHTML={{ __html: `<h2 class="print-preview-title">${title}</h2>${html}` }} />
+            <div
+              className={showMarkers ? "print-preview show-markers" : "print-preview"}
+              dangerouslySetInnerHTML={{ __html: `<h2 class="print-preview-title">${escapeHtml(title)}</h2>${html}` }}
+            />
           </Box>
         )}
       </DialogContent>
