@@ -6,23 +6,32 @@
 // editLogSweep.ts, and the same "once per hour, gated on minute-of-hour" cron
 // slot in index.ts's scheduled() handles it.
 //
-// WHY THIS ONE NEEDS NO ANCESTOR EXEMPTION, UNLIKE edit_log's SWEEP. The
-// edit_log sweep exempts specific rows because the three-way verse/TSV merge
-// actively reads edit_log as its ancestor source — deleting the wrong row
-// there makes a verse permanently unadjudicable. dcs_commits has no reader
-// like that (yet): dcsCommitPoll.ts's own polling walk never reads this
-// table — pollBounds() bounds the NEXT Door43 walk by
-// dcs_repo_polls.last_sha, a plain string compared against Door43's live
-// API response, not by looking up a row here. GET /api/dcs-commits
-// (dcsCommits.ts) is a read-only audit view. And per #685's migration
-// comment, "nothing reads this table to make a gating decision yet" — that
-// follow-up is #692 item 3, deliberately NOT done by this sweep (see its
-// own issue text: wiring lineage reads to the ledger should wait until the
-// ledger has PROVEN coverage, which is an ongoing property, not something a
-// one-time backfill establishes). So today every row is equally disposable
-// once it ages out; when #692 item 3 lands, whatever it adds must get its
-// own exemption here, the same way #537 added one to editLogSweep — but
-// that is that change's job, not this one's.
+// NO PER-ROW ANCESTOR EXEMPTION, UNLIKE edit_log's SWEEP — but a coverage-
+// floor RAISE is required, which is what DCS_COMMITS_SWEEP_COVERAGE_SQL is
+// for. The edit_log sweep exempts specific rows because the three-way
+// verse/TSV merge reads edit_log as its ancestor source by picking out
+// individual rows; losing the wrong one makes a verse permanently
+// unadjudicable. dcs_commits has no reader that picks individual rows out —
+// masterLineageLedger.ts's readLedgerMasterLineage (#692 item 3, landed)
+// instead reads the WHOLE window `committed_at >= confirmedAt` and trusts it
+// completely whenever `confirmedAt >= dcs_repo_polls.coverage_since`. That
+// trust is only honest as long as coverage_since never claims a floor older
+// than what dcs_commits actually still holds. dcsCommitPoll.ts's own upsert
+// deliberately never ADVANCES coverage_since ("moving it forward would make
+// an older proven window unexpectedly fall back to live Gitea") — polling
+// only ever extends coverage backward-in-history, so the floor it already
+// proved stays proved. This sweep runs in the opposite direction: it removes
+// rows the floor was vouching for. Left unraised, a book/resource whose
+// export watermark (confirmedAt) stalls past the retention window would
+// still pass the `confirmedAt >= coverage_since` check on a coverage_since
+// stamped back when the repo was bootstrapped, while the rows between that
+// old floor and today's cutoff are gone — readLedgerMasterLineage would
+// report `usable: true` over a silently truncated commit list instead of
+// falling back to the live walk, which is exactly the "reads as no human"
+// failure mode this ledger exists to avoid. So every sweep tick also raises
+// coverage_since up to its own cutoff for any repo whose floor sits below
+// it — never inventing a floor where none was proven (NULL stays NULL), only
+// tightening an existing one to match what was just deleted.
 //
 // COALESCE(committed_at, seen_at): committed_at is Door43's clock and can be
 // NULL when a commit's date failed to parse (ledgerRowsFromCommits already
@@ -35,3 +44,14 @@ export const DCS_COMMITS_RETENTION_SECONDS = 548 * 86400; // ~18 months
 export const DCS_COMMITS_SWEEP_SQL = `
   DELETE FROM dcs_commits
    WHERE COALESCE(committed_at, seen_at) < ?1`;
+
+// Companion to DCS_COMMITS_SWEEP_SQL, run with the SAME ?1 cutoff (ideally in
+// the same batch, so the floor raise and the deletion it accounts for commit
+// together): raises any repo's proven-coverage floor up to the cutoff when it
+// currently claims an older one, and leaves a repo with no proven floor
+// (coverage_since IS NULL) alone — this sweep never establishes coverage that
+// was never proven, it only retracts a floor to match what it just deleted.
+export const DCS_COMMITS_SWEEP_COVERAGE_SQL = `
+  UPDATE dcs_repo_polls
+     SET coverage_since = ?1
+   WHERE coverage_since IS NOT NULL AND coverage_since < ?1`;
