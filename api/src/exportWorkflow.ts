@@ -193,6 +193,15 @@ export interface ExportParams {
   // resources for one book in one go, and firing one Workflow instance per
   // resource would race on the same book's D1 rows.
   resources?: Resource[];
+  // Issue #686 item 7: who asked for this reimport, distinct from the Door43
+  // commit author `dcs_sync` writes already carry as `last_change_actor`. Set
+  // by the admin "Pull from Door43" whole-book dispatch (reimportWorkflowParams
+  // in admin.ts) to the clicking operator's user id; absent/null on every cron
+  // path (the 05:30 export and the 08:00 REIMPORT_CRON self-heal both create
+  // this Workflow with no `userId` at all — see index.ts's `scheduled()`), so
+  // edit_log.user_id can finally tell "an operator triggered this sync" apart
+  // from "nobody was watching" instead of both reading as the same NULL.
+  userId?: number | null;
 }
 
 export interface StepResult {
@@ -470,6 +479,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
+            userId: params.userId ?? null,
           });
           // runChunkedReimport resolves normally in three distinct outcomes and
           // the ledger must tell them apart (#833 review). The split mirrors
