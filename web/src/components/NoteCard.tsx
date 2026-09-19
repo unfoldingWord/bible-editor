@@ -67,6 +67,7 @@ import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { parseNoteSegments, resolveNoteLinkHref } from "../lib/noteLinks";
+import { directionForText } from "../lib/direction";
 import {
   continueListOnEnter,
   indentLines,
@@ -227,21 +228,6 @@ interface Props {
 // data in D1 transitions to true newlines as users edit.
 function tsvToDisplay(s: string | null): string {
   return (s ?? "").replace(/\\n/g, "\n");
-}
-
-// Detect the primary script of a string for directing RTL/LTR rendering and
-// showing the translate icon. Only Hebrew (U+0590–U+05FF) is RTL; Greek is
-// LTR and is grouped with Latin for detection purposes.
-const RTL_CHAR = /[֐-׿]/;
-const LTR_CHAR = /[a-zA-ZͰ-Ͽἀ-῿]/;
-
-type QuoteScript = "empty" | "rtl" | "ltr";
-
-function detectQuoteScript(text: string): QuoteScript {
-  if (!text.trim()) return "empty";
-  if (RTL_CHAR.test(text)) return "rtl";
-  if (LTR_CHAR.test(text)) return "ltr";
-  return "empty";
 }
 
 interface SessionSnapshot {
@@ -1204,7 +1190,7 @@ function NoteCardInner({
 
   const aiPrereqsMet = !!supportRef && quote.trim().length > 0;
 
-  const quoteScript = detectQuoteScript(quote);
+  const quoteScript = directionForText(quote);
   const showTranslateIcon = quoteScript === "ltr" && !readOnly && !!onTranslateQuote;
 
   const handleTranslateQuote = () => {

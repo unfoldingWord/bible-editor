@@ -17,24 +17,9 @@ import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
 import { TwArticleDialog } from "./TwArticleDialog";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
+import { directionForText } from "../lib/direction";
 
 export type WordDropPosition = "before" | "after";
-
-// Mirrors the NoteCard quote-script detector: Hebrew (U+0590–U+05FF) is
-// RTL, Greek + Latin are LTR. We only show the translate icon when the
-// user has typed English (LTR) into a field that normally holds the
-// source-language Hebrew/Greek.
-const RTL_CHAR = /[֐-׿]/;
-const LTR_CHAR = /[a-zA-ZͰ-Ͽἀ-῿]/;
-
-type QuoteScript = "empty" | "rtl" | "ltr";
-
-function detectQuoteScript(text: string): QuoteScript {
-  if (!text.trim()) return "empty";
-  if (RTL_CHAR.test(text)) return "rtl";
-  if (LTR_CHAR.test(text)) return "ltr";
-  return "empty";
-}
 
 // Container-query breakpoint: under this table width the quote + TW-article
 // columns plus three action buttons get too cramped, so the layout reflows to
@@ -569,7 +554,7 @@ const WordRow = memo(function WordRow({
     return e.clientY < rect.top + rect.height / 2 ? "before" : "after";
   };
 
-  const quoteScript = detectQuoteScript(quote);
+  const quoteScript = directionForText(quote);
   const showTranslateIcon = quoteScript === "ltr" && !!onTranslateQuote;
 
   const handleTranslateQuote = () => {
