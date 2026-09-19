@@ -253,6 +253,41 @@ console.log("\n[#686 item 3: reopenLaneChecks / reopenLaneChecksBulk leave an ed
   }
 }
 
+console.log("\n[#686 item 3 (remainder): verse_statuses.updated_by, migration 0069]");
+{
+  // Same SQL chapters.ts's status-toggle route runs (cross-checked against the
+  // real source below) against real SQLite, proving the upsert branch actually
+  // stamps updated_by on both a first toggle and a later re-toggle by a
+  // different user — not just that the source text mentions the column.
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`
+    CREATE TABLE verse_statuses (
+      book TEXT NOT NULL, chapter INTEGER NOT NULL, verse INTEGER NOT NULL,
+      done INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_by INTEGER,
+      PRIMARY KEY (book, chapter, verse)
+    );
+  `);
+  const toggle = (book, chapter, verse, done, now, userId) =>
+    sqlite
+      .prepare(
+        `INSERT INTO verse_statuses (book, chapter, verse, done, updated_at, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(book, chapter, verse) DO UPDATE SET done = ?4, updated_at = ?5, updated_by = ?6`,
+      )
+      .run(book, chapter, verse, done, now, userId);
+
+  toggle("ZEC", 5, 3, 1, 100, 7);
+  let row = sqlite.prepare(`SELECT done, updated_by FROM verse_statuses WHERE book='ZEC' AND chapter=5 AND verse=3`).get();
+  eq(row.done, 1, "first toggle sets done");
+  eq(row.updated_by, 7, "first toggle stamps the toggling user");
+
+  toggle("ZEC", 5, 3, 0, 200, 9);
+  row = sqlite.prepare(`SELECT done, updated_by FROM verse_statuses WHERE book='ZEC' AND chapter=5 AND verse=3`).get();
+  eq(row.done, 0, "re-toggle by a different user updates done");
+  eq(row.updated_by, 9, "re-toggle overwrites updated_by with the new toggling user, not the original");
+}
+
 console.log("\n[#686 item 3, source check] chapters.ts's three edit_log INSERTs (verse_status, verse_lane x2) carry book");
 {
   // chapters.ts imports Hono (routes), so it cannot be driven directly under
@@ -271,6 +306,16 @@ console.log("\n[#686 item 3, source check] chapters.ts's three edit_log INSERTs 
   const occurrences = chaptersTs.split(withBook).length - 1;
   eq(occurrences, 3, "[source] all 3 edit_log INSERTs (verse_status, single lane, bulk lane) include the book column");
   eq(chaptersTs.includes(withoutBook), false, "[source] no edit_log INSERT in chapters.ts still omits book");
+
+  // #686 item 3 (remainder, migration 0069): the verse_statuses row itself
+  // had no actor column at all — PR #785 explicitly deferred this half.
+  // Same source-text limitation as above; assert the toggle route stamps
+  // updated_by on both the insert and the upsert branch.
+  const statusInsert = "INSERT INTO verse_statuses (book, chapter, verse, done, updated_at, updated_by)";
+  const statusUpsert = "ON CONFLICT(book, chapter, verse) DO UPDATE SET done = ?4, updated_at = ?5, updated_by = ?6";
+  eq(chaptersTs.includes(statusInsert), true, "[source] verse_statuses INSERT stamps updated_by");
+  eq(chaptersTs.includes(statusUpsert), true, "[source] verse_statuses upsert branch stamps updated_by");
+  eq(chaptersTs.includes(".bind(book, chapter, verse, done, now, userId)"), true, "[source] the insert binds userId as updated_by");
 }
 
 if (failed > 0) {
