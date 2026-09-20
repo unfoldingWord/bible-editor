@@ -4529,11 +4529,31 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // one — so the slack is free in the only direction that matters. A day also
 // absorbs modest author-date backdating.
 //
-// A SHARED LIMIT, NOT THIS TIER'S: every walk in this system bounds by
-// `author.date` (listMasterCommitsSince's sinceTime compares it), so a commit
-// PUSHED later carrying an author date older than the window start is invisible
-// to the mint gate, to #665's clear, and to tier 1 alike — this derivation is no
-// more exposed to it than the code it extends. Tracked as issue #691.
+// A SHARED LIMIT, NOT THIS TIER'S — NARROWED BY #691, NOT CLOSED. Every
+// date-bounded walk here (listMasterCommitsSince's sinceTime) compares
+// COMMITTER date, not author date (see that function's own comment), which
+// already closes the rebase/cherry-pick class of backdating: those move the
+// committer date to landing time even though the author date stays old. The
+// walk below (whichever tier supplied `windowStart`) now also tries the
+// dcs_commits ledger first — the same pattern loadMasterLineage (above)
+// already uses for the mint gate — which buys the same committer-date answer
+// from a store PROVEN gap-free by sha-continuity polling, without a live
+// Gitea round trip and its failure modes (timeouts, page caps). What neither
+// the live walk NOR the ledger can catch, even so: a PLAIN late push, where
+// the commit is locally authored AND committed days before it reaches
+// Door43, so neither timestamp ever moves. The dcs_commits row for such a
+// commit DOES exist once the poller's sha-continuity walk discovers it
+// (`seen_at` records exactly when) — but readLedgerMasterLineage's own read
+// filters on `committed_at`, the same field the live walk keys on, not on
+// `seen_at`. VERIFIED directly: a ledger with full, gap-free coverage
+// starting well before `windowStart` still returns zero commits for a row
+// whose `committed_at` itself predates `windowStart`. Closing that fully
+// would mean widening readLedgerMasterLineage's own comparison to admit a row
+// on `seen_at` too — a change to that shared, separately-audited module,
+// which this fix does not make (see the PR that introduced this comment for
+// why). So the honest residual is: a plain late push is invisible to every
+// walk here, live or ledger-backed, regardless of how current the ledger's
+// coverage is. Tracked as issue #691.
 interface NoBaseFallbackWindow {
   /** Where the walk must start: see the tier notes above. */
   windowStart: number;
@@ -4651,6 +4671,44 @@ const MINT_LOOKUP_BATCH = 90;
 // the flag's own `_meta`, so re-running against an unchanged master costs zero
 // fetches. Never throws: a failure here must not take down a reimport, and the
 // flags simply stand for another night.
+//
+// Ledger-first, live-fallback (#691), the one Gitea-facing helper this walk
+// needs. Split out of clearResolvedMergeNoBase itself so the ledger attempt's
+// own try/catch cannot weaken the caller's null-narrowing of `walk` — the
+// caller does one unconditional `walk = await this(...)`, exactly the shape
+// it already relied on before this existed. See its call site's comment for
+// what the ledger buys and what it still cannot prove.
+async function masterCommitsSinceViaLedgerOrLive(
+  env: Env,
+  file: { repo: string; path: string },
+  windowStart: number,
+  book: string,
+  kind: TsvKind,
+): Promise<MasterCommitPage> {
+  try {
+    const repoHead = await repoHeadCommitSha(env, file.repo);
+    const ledger = await readLedgerMasterLineage(env.DB, file.repo, file.path, windowStart, repoHead);
+    if (ledger.usable && ledger.lineage) {
+      console.log("reimport merge_no_base clear: walk source", { book, kind, source: "ledger" });
+      return { commits: ledger.lineage.commits, incomplete: false, incompleteReason: "" };
+    }
+    console.log("reimport merge_no_base clear: ledger unavailable for walk; using live walk", {
+      book,
+      kind,
+      reason: ledger.reason,
+    });
+  } catch (error) {
+    // Same fail-closed-for-ledger-use posture as loadMasterLineage: a ledger
+    // read failure must never disable the established live attribution path.
+    console.warn("reimport merge_no_base clear: ledger read failed; using live walk", {
+      book,
+      kind,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: windowStart });
+}
+
 async function clearResolvedMergeNoBase(
   env: Env,
   book: string,
@@ -4798,7 +4856,19 @@ async function clearResolvedMergeNoBase(
     // empty page and read "no commits" as "the tip moved".
     let walkSince = walkStart ?? windowStart;
     if (walk == null || walkStart == null || walkStart > windowStart) {
-      walk = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: windowStart });
+      // Ledger-first, live-fallback (#691) — the exact pattern already proven
+      // for the mint gate in loadMasterLineage, above. readLedgerMasterLineage
+      // fails closed on anything but a current, gap-free ledger whose coverage
+      // reaches back to windowStart, so trying it here is always safe: worst
+      // case it refuses and the live walk below runs exactly as it always has.
+      // What it buys when it IS usable: the same committer-date answer the
+      // live walk would give, but from a store already proven gap-free by
+      // sha-continuity polling — so this survives a live Gitea hiccup (a
+      // timeout or page cap) that would otherwise force a refusal. See
+      // NoBaseFallbackWindow's comment for the honest limit: neither this nor
+      // the live walk can see a PLAIN late push (author and committer date
+      // both unmoved).
+      walk = await masterCommitsSinceViaLedgerOrLive(env, file, windowStart, book, kind);
       walkSince = windowStart;
     }
     // A blocked outcome is recorded on the rows themselves, keyed by master's
@@ -4933,10 +5003,12 @@ async function clearResolvedMergeNoBase(
     //     `keep_no_base` (:1999). What (b) really guarantees is that the human's
     //     commit becomes VISIBLE to the next run's gate — restoring the
     //     protection the flag stood for — not that the identical flag reappears.
-    //   · The revisit's walk inherits the author-date bound described in
-    //     NoBaseFallbackWindow: a commit authored before the watermark but
-    //     pushed after it is invisible to that walk exactly as it is to every
-    //     other walk here (issue #691).
+    //   · The revisit's walk inherits the narrowed residual described in
+    //     NoBaseFallbackWindow's #691 note: committer-date backdating (a
+    //     rebase or cherry-pick) is caught, live or via the ledger the
+    //     revisit's own gate already tries first; a PLAIN late push — author
+    //     AND committer date both unmoved — is invisible to both, exactly as
+    //     for every other walk here (issue #691).
     const walkTip = walk.commits[0]?.sha ?? null;
     const recheck = await listMasterCommitsSince(env, file.repo, file.path, null, {
       sinceTime: walkSince,
@@ -5085,15 +5157,18 @@ export const clearResolvedMergeNoBaseForTest = (
 //   D1:    1 lineage read (book_resource_syncs) + 1 flagged-row read + 1
 //          mint-time read (only for flags with no window of their own) + one
 //          write batch per WRITE_BATCH slice of rows it clears or memoizes.
-//   Gitea: 0 on a pair with nothing walkable; otherwise THREE components —
+//   Gitea: 0 on a pair with nothing walkable; otherwise FOUR components —
 //          1 tip probe (the memo key, always paid once a pair has candidates)
-//          + up to listMasterCommitsSince's 5-page walk (skipped entirely on a
-//          memo hit) + 1 pre-write tip recheck (only for a pair that survives
-//          every gate and reaches the write). So 7 at worst per pair, 1 on a
-//          memo hit.
+//          + 1 repo-head probe for the ledger-first attempt (#691; the ledger
+//          read itself is a D1 read, already counted above, but proving it
+//          usable needs the live repo head) + up to listMasterCommitsSince's
+//          5-page walk when the ledger is not usable (skipped entirely on a
+//          memo hit, or when the ledger supplies the walk) + 1 pre-write tip
+//          recheck (only for a pair that survives every gate and reaches the
+//          write). So 8 at worst per pair, 1 on a memo hit.
 //
 // So a full sweep is bounded at roughly 30 D1 reads, a handful of write batches,
-// and up to 70 Gitea fetches (10 pairs x 7) however many books hold flags. Plus the three
+// and up to 80 Gitea fetches (10 pairs x 8) however many books hold flags. Plus the three
 // DISTINCT-book queries that find the pairs in the first place. The nightly has
 // already died once on Cloudflare's ~1000-subrequest cap, and this runs in its
 // own Workflow step (exportWorkflow.ts) so none of it is spent from a book's

@@ -2871,6 +2871,145 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
   }
 }
 
+console.log("\n[issue #691: clearResolvedMergeNoBase consults the dcs_commits ledger before a live walk]");
+{
+  // Real schema, real tables: dcs_repo_polls / dcs_commits (migrations 0059 +
+  // 0065) exactly as readLedgerMasterLineage reads them, and the real
+  // clearResolvedMergeNoBase (via its *ForTest alias) — not a re-typed mock of
+  // either.
+  const NOW = Math.floor(Date.now() / 1000);
+  const FILE = { repo: "en_tq", path: "tq_1CH.tsv" };
+  const WINDOW_START = NOW - 5 * 86400;
+  const REPO_HEAD = "ledgertip1";
+
+  const seedLedgerPoll = (
+    sqlite,
+    { lastSha = REPO_HEAD, coverageSince = WINDOW_START - 86400, lastSuccessAt = NOW - 60 } = {},
+  ) => {
+    sqlite
+      .prepare(
+        `INSERT INTO dcs_repo_polls (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
+                                      last_status, gap_since_sha, gap_at, coverage_since)
+         VALUES (?, ?, ?, ?, ?, 'ok', NULL, NULL, ?)`,
+      )
+      .run(FILE.repo, lastSha, NOW, NOW, lastSuccessAt, coverageSince);
+  };
+
+  const seedLedgerCommit = (sqlite, { sha, committedAt, classification, message, authorEmail = "maintainer@example.com" }) => {
+    sqlite
+      .prepare(
+        `INSERT INTO dcs_commits (repo, sha, parent_sha, author_name, author_email, committed_at, message,
+                                   classification, classification_reason, files_json, seen_at)
+         VALUES (?, ?, NULL, 'Someone', ?, ?, ?, ?, 'unrecognized', ?, ?)`,
+      )
+      .run(FILE.repo, sha, authorEmail, committedAt, message, classification, JSON.stringify([FILE.path]), NOW - 30);
+  };
+
+  const seedFlaggedRow = (sqlite, id) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by,
+                              updated_at, review_kind, review_reason, review_master_json)
+         VALUES (?, ?, 3, 1, '3:1', 'app question', 'r', 4, 1, ?, 'merge_no_base', 'some earlier reason', ?)`,
+      )
+      .run(
+        id,
+        BOOK,
+        WINDOW_START + 100,
+        JSON.stringify({ question: "master q", _meta: { flag_at: WINDOW_START + 100, flag_since: WINDOW_START } }),
+      );
+  };
+
+  // A fetch stub that distinguishes repoHeadCommitSha's own probe (no `path=`
+  // in its URL — it asks for the repo's live tip, not one file's history) from
+  // an actual listMasterCommitsSince walk/probe/recheck (always `path=`).
+  // `onWalk` fires only for the latter, so a test can prove whether a live
+  // walk ever ran.
+  const ledgerAwareFetch = (repoHeadSha, walkCommits, onWalk) => async (url) => {
+    if (!String(url).includes("path=")) {
+      return { ok: true, headers: { get: () => null }, json: async () => [{ sha: repoHeadSha }] };
+    }
+    if (onWalk) onWalk();
+    return giteaPage(walkCommits)();
+  };
+
+  // (a) The ledger alone proves a human commit landed inside the window — a
+  //     commit an AUTHOR-DATE-bounded walk would miss (its author date, if it
+  //     had one modeled here, sits before WINDOW_START; what the ledger
+  //     actually keys on, committer date via `committed_at`, sits after it —
+  //     the shape a rebase or cherry-pick produces). The live-walk stub below
+  //     would answer "clean" if it were ever asked, so a false clear can only
+  //     mean the ledger path was skipped.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691a");
+    seedLedgerPoll(sqlite);
+    seedLedgerCommit(sqlite, {
+      sha: "latehuman",
+      committedAt: WINDOW_START + 3600,
+      classification: "human",
+      message: "Fixes a typo pushed late",
+    });
+    const realFetch = globalThis.fetch;
+    let liveWalkCalled = 0;
+    globalThis.fetch = ledgerAwareFetch(REPO_HEAD, OURS_AND_AI_PAGE.commits, () => liveWalkCalled++);
+    let cleared;
+    try {
+      // walkStart/walked both null (no run walk to reuse, the sweep's own
+      // shape) and an explicit masterSha so PASS B's tip probe is skipped —
+      // isolating the walk-fetch branch this change touches.
+      cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(cleared, 0, "a human commit the ledger alone proves in-window blocks the clear");
+    eq(liveWalkCalled, 0, "…found via the ledger, never falling back to a live Gitea walk");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id = 'lg691a'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "…the flag stands");
+  }
+
+  // (b) The ledger is load-bearing both ways: proving zero human commits (only
+  //     our own export in range) lets the clear proceed, entirely from the
+  //     ledger's data — the pre-write tip recheck is the only live fetch this
+  //     path still needs, and it must see the ledger's own newest commit held
+  //     steady.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691b");
+    seedLedgerPoll(sqlite);
+    seedLedgerCommit(sqlite, {
+      sha: "ourexport1",
+      committedAt: WINDOW_START + 3600,
+      classification: "ours",
+      message: "bible-editor: 1CH tq → master (#1)",
+      authorEmail: "someone@example.com",
+    });
+    const recheckCommit = [{
+      sha: "ourexport1",
+      message: "bible-editor: 1CH tq → master (#1)",
+      authorEmail: "someone@example.com",
+      authorName: "Someone",
+      date: new Date((WINDOW_START + 3600) * 1000).toISOString(),
+    }];
+    const cleared = await withFetch(ledgerAwareFetch(REPO_HEAD, recheckCommit), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip"),
+    );
+    eq(cleared, 1, "a ledger showing zero human commits still lets the clear proceed");
+  }
+
+  // (c) No ledger poll recorded for this repo at all: falls back to the live
+  //     walk exactly as #665 shipped it, unchanged by this addition.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691c");
+    const cleared = await withFetch(ledgerAwareFetch(REPO_HEAD, OURS_AND_AI_PAGE.commits), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip"),
+    );
+    eq(cleared, 1, "no ledger poll recorded: falls back to the live walk, unchanged");
+  }
+}
+
 console.log("\n[issue #672: a torn row (ref_raw ahead of its own stored chapter/verse) self-heals]");
 {
   // The shape rows.ts's cross-chapter REF retype produces: ref_raw already
@@ -3474,7 +3613,9 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
   //     subrequest limit, so one sweep hands at most NO_BASE_SWEEP_MAX_PAIRS
   //     (10) pairs to the clear however many books hold flags. Every book here
   //     is walkable, so the number of pairs that reached a walk is exactly the
-  //     number of first-page fetches.
+  //     number of first-page fetches: one tip probe, one repo-head probe for
+  //     the ledger attempt (#691 — it fails closed on "network down" and the
+  //     walk falls back to live, same as before), and one live walk attempt.
   {
     const { sqlite, env } = freshEnv();
     const books = ["1CH", "2CH", "AMO", "DAN", "ECC", "EZK", "HAB", "HOS", "ISA", "JER", "JOB", "JOL", "JON", "LAM", "MIC"];
@@ -3490,7 +3631,11 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
       const result = await sweepStaleMergeNoBase(env);
       eq(result.pairs, 15, "every flagged pair is found…");
       eq(result.swept, 10, "…but only the night's ration is handed to the clear");
-      eq(called, 20, "…so the Gitea budget is bounded too: one tip probe plus one walk per rationed pair");
+      eq(
+        called,
+        30,
+        "…so the Gitea budget is bounded too: one tip probe, one ledger repo-head probe, one walk per rationed pair",
+      );
     } finally {
       globalThis.fetch = realFetch;
     }
