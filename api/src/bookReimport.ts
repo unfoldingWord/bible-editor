@@ -2409,7 +2409,37 @@ export async function applyTsvRows(
       // never ship it, so the same wrong flag returned every night (AMO tq,
       // blocked from 2026-08-17). See classifyTsvRefMove.
       const refBase = bases.get(row.id)?.ref ?? null;
-      const refMove = classifyTsvRefMove(cur, row, refBase, protectedRow);
+      let refMove = classifyTsvRefMove(cur, row, refBase, protectedRow);
+      // #547 item 1: classifyTsvRefMove is a single-snapshot three-way compare
+      // and cannot see master moving away from the ancestor and back to it
+      // within one watermark window. Concretely: a maintainer moves master
+      // 1:2 -> 1:6, the nightly copies 1:6 into D1 before the boundary
+      // advances, the maintainer reverts master to 1:2. Master's CURRENT
+      // ref_raw now equals the ancestor's, so `theirsMoved` reads false and
+      // the whole thing classifies `ours_moved` — the one outcome that lets
+      // the export publish D1's location over master's, so it would silently
+      // undo the maintainer's deliberate revert.
+      //
+      // The same evidence this run's commit-lineage walk already gathers for
+      // the content merge (masterMayHoldHumanEditForVerse) answers this too: a
+      // COMPLETE human-commit diff that actually touched the ancestor's own
+      // (chapter, verse) is exactly the fingerprint a revert-to-base commit
+      // leaves behind. Escalate to `both_moved` — needs a human, same as a
+      // real two-sided move — only on that positive proof.
+      // completeHumanRefEvidenceTouches returns false on absent or incomplete
+      // evidence by contract (its own uncertainty-returns-false rule), so a
+      // run with no lineage or an incomplete walk keeps today's `ours_moved`
+      // behavior, and the AMO tq livelock (#540 item 3) this classifier exists
+      // to fix stays fixed.
+      if (
+        refMove === "ours_moved" &&
+        refBase != null &&
+        Number.isInteger(refBase.chapter) &&
+        Number.isInteger(refBase.verse) &&
+        completeHumanRefEvidenceTouches(cutoff?.lineage, refBase.chapter as number, refBase.verse as number)
+      ) {
+        refMove = "both_moved";
+      }
       // Do the two sides actually hold the same reference? Asked separately from
       // the attribution above, and with the protection argument forced off, so the
       // answer is a measurement even for a protected row (see the stale-flag clear

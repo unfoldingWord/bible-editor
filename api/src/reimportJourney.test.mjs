@@ -975,6 +975,66 @@ console.log("\n[reference-move attribution at the caller]");
     const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01'`).all()[0];
     eq(row.review_kind, "merge_conflict", "a merge_conflict survives an agreed-reference run");
   }
+
+  // 9. Master moved away and back within one watermark window (#547 item 1).
+  //    Shaped exactly like case 1 (D1 at 1:6, master reporting 1:2, same as
+  //    the ancestor) — a two-way/ancestor compare cannot tell this apart from
+  //    a pure app-side move, because master's CURRENT ref agrees with the
+  //    ancestor either way. Positive lineage evidence that a human commit
+  //    actually touched the ancestor's own (chapter, verse) — the fingerprint
+  //    a revert-to-base commit leaves — must escalate it to both_moved
+  //    instead of silently publishing D1's stale copy of master's transient
+  //    move back over the maintainer's deliberate revert.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite);
+    const lineage = {
+      mayHoldHumanEdit: true,
+      hasHumanCommit: true,
+      incomplete: false,
+      incompleteReason: "",
+      counts: { ours: 0, ai: 0, human: 1 },
+      humanShas: ["a".repeat(40)],
+      refsComplete: true,
+      humanRefs: ["1:2"],
+      refsReason: "",
+    };
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:2", 1, 2)], null, {
+      confirmedAt: 200, editId: boundary, lineage,
+    });
+    eq(counts.ref_moved_ours, 0, "NOT silently attributed to us — the lineage proves master had activity here");
+    eq(counts.ref_moved_both, 1, "…escalated to both_moved instead");
+    eq(counts.apply_incomplete, true, "…and the resource watermark is withheld, same as any real two-sided move");
+    const row = sqlite.prepare(`SELECT review_kind, review_reason FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, "ref_moved", "…and the row is flagged for a human");
+    eq(row.review_reason.includes("AND on Door43"), true, "…with the both-sides wording, not the app-only one");
+  }
+
+  // 10. Same shape, but the lineage evidence is INCOMPLETE — must NOT
+  //     escalate. completeHumanRefEvidenceTouches returns false on
+  //     uncertainty by contract, which is what keeps today's `ours_moved`
+  //     attribution (and the AMO tq livelock fix, #540 item 3) intact for
+  //     every night that has no positive reason to suspect a revert.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite);
+    const incompleteLineage = {
+      mayHoldHumanEdit: true,
+      hasHumanCommit: true,
+      incomplete: true,
+      incompleteReason: "commit_page_incomplete",
+      counts: { ours: 0, ai: 0, human: 1 },
+      humanShas: ["b".repeat(40)],
+      refsComplete: false,
+      humanRefs: [],
+      refsReason: "too_many_human_commits",
+    };
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:2", 1, 2)], null, {
+      confirmedAt: 200, editId: boundary, lineage: incompleteLineage,
+    });
+    eq(counts.ref_moved_ours, 1, "an incomplete walk keeps the ordinary app-side-move attribution");
+    eq(counts.apply_incomplete, false, "…and does not withhold the watermark");
+  }
 }
 
 // ── AI-vs-human conflict policy at the caller (#540 item 2) ─────────────────
