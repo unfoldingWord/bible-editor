@@ -29,6 +29,8 @@ import {
   lockedBooksIn,
 } from "./bookLock.ts";
 import { broadcastChapter } from "./wsEvents.ts";
+import { resolveIntroHintComments } from "./comments.ts";
+import { buildIntroHints, type IntroHintCommentRow } from "./introHints.ts";
 
 export const pipelines = new Hono<{
   Bindings: Env;
@@ -1710,7 +1712,46 @@ pipelines.post("/start", requireEditor, async (c) => {
       seed: r.note,
     }));
     if (hints.length > 0) {
-      mergedOptions = { ...(parsed.data.options ?? {}), hints };
+      mergedOptions = { ...(mergedOptions ?? {}), hints };
+    }
+
+    // Chapter-intro hints (issue #819): unresolved free-text comments an
+    // editor left on a chapter's intro (verse 0, no row — the existing
+    // "comment on this verse" affordance, not a new UI) in the chapter
+    // range. Forwarded as options.introHints alongside options.hints; see
+    // introHints.ts for why the wire shape differs from a verse hint.
+    const introCommentRows = await c.env.DB.prepare(
+      `SELECT id, chapter, body
+         FROM comments
+        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
+          AND verse = 0 AND row_kind IS NULL AND parent_id IS NULL
+          AND kind = 'note' AND resolved_at IS NULL AND deleted_at IS NULL
+        ORDER BY chapter, created_at ASC`,
+    )
+      .bind(book, startChapter, endChapter)
+      .all<IntroHintCommentRow>();
+    const introHintRows = introCommentRows.results ?? [];
+    const introHints = buildIntroHints(introHintRows);
+    if (introHints.length > 0) {
+      mergedOptions = { ...(mergedOptions ?? {}), introHints };
+      // Consume now, at the same D1-state-at-start-time point hints above are
+      // captured — not gated on the job actually completing, since (unlike a
+      // verse hint) there's no id round-trip to correlate a future apply
+      // against. An editor who wants to add more just leaves a new comment,
+      // or reopens one of these from the comments panel.
+      const resolvedComments = await resolveIntroHintComments(
+        c.env.DB,
+        introHintRows.map((r) => r.id),
+        userId,
+      );
+      for (const comment of resolvedComments) {
+        c.executionCtx.waitUntil(
+          broadcastChapter(c.env, comment.book, comment.chapter, {
+            type: "comment.updated",
+            comment,
+          }),
+        );
+      }
     }
   }
 
