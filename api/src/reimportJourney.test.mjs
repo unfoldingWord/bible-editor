@@ -3008,6 +3008,44 @@ console.log("\n[issue #691: clearResolvedMergeNoBase consults the dcs_commits le
     );
     eq(cleared, 1, "no ledger poll recorded: falls back to the live walk, unchanged");
   }
+
+  // (d) 2026-09-21 review finding: a ledger row is already classified by
+  //     classifyForLedger (dcsCommitPoll.ts), which unwraps a Gitea merge-commit
+  //     wrapper before deciding — repo-scoped ledger history is full of these
+  //     (measured ~26%, classifyForLedger's own doc), and path-scoped Gitea
+  //     history (what the live walk sees) mostly hides them. Blindly re-running
+  //     the FULL-subject-only classifyMasterCommit on a ledger row throws that
+  //     unwrap away: classifyForLedger's own doc example —
+  //     `Merge pull request 'bible-editor: LAM ult → master' (#6555) from
+  //     LAM-be into master` — is stored `ours`, but classifyMasterCommit alone
+  //     (OURS_PREFIX is anchored at the subject's start, so a "Merge pull
+  //     request '…'" envelope never matches it) reclassifies it `human`. A
+  //     `human` verdict blocks the clear; `ours` does not — so this is a
+  //     differential test, not just a classification check. Before the
+  //     classifyOrKeep fix this cleared 0 (blocked); it must clear the flag.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691d");
+    seedLedgerPoll(sqlite);
+    seedLedgerCommit(sqlite, {
+      sha: "mergewrap1",
+      committedAt: WINDOW_START + 3600,
+      classification: "ours",
+      message: "Merge pull request 'bible-editor: LAM ult → master' (#6555) from LAM-be into master",
+      authorEmail: "someone@example.com",
+    });
+    const recheckCommit = [{
+      sha: "mergewrap1",
+      message: "Merge pull request 'bible-editor: LAM ult → master' (#6555) from LAM-be into master",
+      authorEmail: "someone@example.com",
+      authorName: "Someone",
+      date: new Date((WINDOW_START + 3600) * 1000).toISOString(),
+    }];
+    const cleared = await withFetch(ledgerAwareFetch(REPO_HEAD, recheckCommit), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip"),
+    );
+    eq(cleared, 1, "a merge-wrapper commit the ledger already classified `ours` is not re-derived as `human`");
+  }
 }
 
 console.log("\n[issue #672: a torn row (ref_raw ahead of its own stored chapter/verse) self-heals]");

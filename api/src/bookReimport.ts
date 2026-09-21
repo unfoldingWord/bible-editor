@@ -65,7 +65,9 @@ import {
   masterMayHoldHumanEditForVerse,
   summarizeLineage,
   completeHumanRefEvidenceTouches,
+  type ClassifiedCommit,
   type HumanRefEvidence,
+  type MasterCommit,
   type MasterLineageSummary,
 } from "./masterLineage.ts";
 import { readLedgerMasterLineage } from "./masterLineageLedger.ts";
@@ -4709,6 +4711,33 @@ async function masterCommitsSinceViaLedgerOrLive(
   return listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: windowStart });
 }
 
+// A page from masterCommitsSinceViaLedgerOrLive can be EITHER source, and the
+// two disagree about merge-commit wrappers. A live listMasterCommitsSince page
+// is always raw MasterCommits that classifyMasterCommit has never seen — that
+// classifier has no merge-wrapper unwrapping (that logic lives only in
+// classifyForLedger, dcsCommitPoll.ts), which is fine for path-scoped history
+// because Gitea's path-scoped simplification mostly drops merge commits
+// already. A ledger-sourced page is REPO-scoped and DOES carry merge
+// wrappers (~26% of history per classifyForLedger's own doc), pre-classified
+// by classifyForLedger and stored as each row's `kind`/`reason`
+// (masterLineageLedger.ts's classifyStored). Blindly re-running
+// classifyMasterCommit on an already-classified commit throws that stored
+// verdict away and re-derives one with the wrong classifier — a bot-authored
+// `Merge pull request 'AI UST for EZK 39 …'`, stored `ai`, comes back `human`
+// (classifyMasterCommit has no OURS_PREFIX/AI_PIPELINE match for a "Merge
+// pull request …" subject), which blocks a #683 sweep clear the ledger path
+// was supposed to make cheaper, not more conservative than the live walk it
+// replaces. Fails safe (a wrongly-`human` commit only keeps a flag standing,
+// never clears one it shouldn't), but defeats the point of using the ledger
+// here. So: keep a commit's own kind/reason when its page already computed
+// one, and classify only the ones that did not (found 2026-09-21 review).
+function classifyOrKeep(c: MasterCommit): ClassifiedCommit {
+  const maybe = c as Partial<ClassifiedCommit>;
+  return typeof maybe.kind === "string" && typeof maybe.reason === "string"
+    ? (maybe as ClassifiedCommit)
+    : classifyMasterCommit(c);
+}
+
 async function clearResolvedMergeNoBase(
   env: Env,
   book: string,
@@ -4916,7 +4945,7 @@ async function clearResolvedMergeNoBase(
       await memoBlocked(`incomplete:${walk.incompleteReason}`);
       return 0;
     }
-    const humans = walk.commits.map(classifyMasterCommit).filter((c) => c.kind === "human");
+    const humans = walk.commits.map(classifyOrKeep).filter((c) => c.kind === "human");
     if (humans.length > 0) {
       console.log("reimport merge_no_base clear: skipped, a human commit is in the window", {
         book,
@@ -5056,7 +5085,7 @@ async function clearResolvedMergeNoBase(
     // — the two ancestor folds take create/update/restore, the verse fold adds
     // baseline — so an audit row can never be mistaken for row content.
     const kindCounts = { ours: 0, ai: 0, human: 0 };
-    for (const c of walk.commits.map(classifyMasterCommit)) kindCounts[c.kind]++;
+    for (const c of walk.commits.map(classifyOrKeep)) kindCounts[c.kind]++;
     const evidence = {
       window_start: windowStart,
       walked_sha: tip,
