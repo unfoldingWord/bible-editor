@@ -253,7 +253,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     results: StepResult[];
   }> {
     const workflowRunId = event.instanceId;
-    const instanceId = `export-${new Date(event.timestamp).toISOString().replace(/[:.]/g, "-")}`;
+    // Issue #858 item 6: the timestamp alone is millisecond-resolution, so two
+    // Workflow instances triggered in the same millisecond (a manual re-run
+    // racing the cron, say) would mint the identical instanceId. That id is
+    // sync_withholds.run_id's generation token (readSyncWithhold/
+    // clearSyncWithhold) and clearSyncWithhold now also compares it
+    // lexicographically to order overlapping runs — a collision there is a
+    // false "same run" match. Appending the real Workflow instance id
+    // (globally unique, and — like the timestamp — stable across a replay of
+    // this same instance) makes the whole string collision-proof while
+    // keeping the human-readable timestamp prefix, and preserves
+    // chronological string ordering: two different timestamps still diverge
+    // before either suffix is reached.
+    const instanceId = `export-${new Date(event.timestamp).toISOString().replace(/[:.]/g, "-")}-${workflowRunId}`;
     const observedAt = event.timestamp.getTime();
     const params = event.payload ?? {};
     await step.do("ledger-run-started", async () =>
