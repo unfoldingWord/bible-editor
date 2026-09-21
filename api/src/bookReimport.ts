@@ -98,6 +98,7 @@ import {
   isReimportableRow,
   computeEditedFieldMerge,
   isReissuedTombstone,
+  AI_SOURCE,
 } from "./reimportClassify";
 import {
   classifyTsvRefMove,
@@ -110,7 +111,13 @@ import {
   type TsvRefSide,
   type TsvEditLogEntry,
 } from "./tsvMerge.ts";
-import { shouldRecordResourceSync, isSystemicMergeRefusal, isKeptOverDoor43AtScale } from "./reimportSyncGate";
+import {
+  shouldRecordResourceSync,
+  isSystemicMergeRefusal,
+  isKeptOverDoor43AtScale,
+  computeWithholdReason,
+} from "./reimportSyncGate";
+import { recordSyncWithhold, clearSyncWithhold } from "./syncWithholds";
 import { evaluateStaleBaseReplacement, type StaleBaseHold } from "./staleBaseGate";
 import { recordStaleBaseHold, raiseStaleBaseHoldAlert, clearStaleBaseHold } from "./staleBaseHolds";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
@@ -839,8 +846,13 @@ export const softDeleteRemovedTsvRowsForTest = (
   // verified-complete widened-coverage case AND the unverified conservative
   // fallback case against the REAL function — see softDeleteRemovedTsvRows.
   verifiedComplete: boolean,
+  // Issue #832: the (book, kind) merge-ancestor cutoff, so the test can drive
+  // both the "already exported" and "not yet exported" AI-only-row cases
+  // against the REAL function. Required (no default) so a test can't
+  // silently fall back to "never confirmed" without saying so.
+  cutoff: MergeCutoff | null,
 ): Promise<{ deleted: number; skippedLocked: number }> =>
-  softDeleteRemovedTsvRows(env, book, kind, rawTsv, candidateChapters, verifiedComplete);
+  softDeleteRemovedTsvRows(env, book, kind, rawTsv, candidateChapters, verifiedComplete, cutoff);
 // tombstoneSweep.test.mjs (issue #427 option 3): same rationale as the alias
 // above — lets the test drive the REAL sweepObsoleteTombstones (hard-delete +
 // gated audit row) against the real SQL instead of proving only that SQLite
@@ -1609,11 +1621,27 @@ async function runReimport(
     tq: tqVerifiedComplete,
     twl: twlVerifiedComplete,
   };
+  // Issue #832: the same merge-ancestor cutoffs already hoisted above for
+  // applyTsvRows' three-way merge, reused here so the prune can tell whether
+  // an AI-only row's newest edit has actually reached a confirmed export yet.
+  const tsvCutoffByKind: Record<TsvKind, MergeCutoff | null> = {
+    tn: masterConfirmedAtTn,
+    tq: masterConfirmedAtTq,
+    twl: masterConfirmedAtTwl,
+  };
   for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
     const raw = tsvRawByKind[kind];
     if (!want.has(kind) || !raw) continue;
     try {
-      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chapters, tsvVerifiedByKind[kind]);
+      const res = await softDeleteRemovedTsvRows(
+        env,
+        book,
+        kind,
+        raw,
+        chapters,
+        tsvVerifiedByKind[kind],
+        tsvCutoffByKind[kind],
+      );
       perResource[kind].deleted += res.deleted;
       perResource[kind].skipped_locked += res.skippedLocked;
     } catch (e) {
@@ -9133,6 +9161,24 @@ export async function changedTsvChapters(
 // updated_by → NULL reclaims the tombstone to reimport-owned. The id
 // comparison is against the WHOLE file's id set so a row the update path just
 // moved to another chapter isn't mistaken for removed.
+// Issue #832: has an AI-only row's newest content edit actually reached a
+// CONFIRMED export yet? Mirrors the id/timestamp fallback applyVerseRows'
+// baseBoundary already uses for the verse three-way merge: the precise
+// edit_log id boundary (0050's master_confirmed_edit_id) when available,
+// else the coarser confirmedAt timestamp. `cutoff` null (this (book, resource)
+// has never been positively confirmed on master at all) and the row's latest
+// edit landing AFTER whichever boundary IS available both mean "D1 holds
+// content master has not had the chance to see yet" — must NOT be pruned.
+function aiRowContentIsExported(
+  cutoff: MergeCutoff | null,
+  latestEditId: number | null,
+  latestEditCreatedAt: number | null,
+): boolean {
+  if (cutoff == null || cutoff.confirmedAt == null) return false;
+  if (cutoff.editId != null) return latestEditId != null && latestEditId <= cutoff.editId;
+  return latestEditCreatedAt != null && latestEditCreatedAt < cutoff.confirmedAt;
+}
+
 async function softDeleteRemovedTsvRows(
   env: Env,
   book: string,
@@ -9145,6 +9191,12 @@ async function softDeleteRemovedTsvRows(
   // without it, tsvFetchLooksTruncated's loss-percentage heuristic alone is not
   // enough to trust "absent from the body" as "master emptied this chapter".
   verifiedComplete: boolean,
+  // Issue #832: this (book, kind)'s merge-ancestor cutoff (getMasterConfirmedAt),
+  // the same one applyTsvRows uses for the three-way edited-row merge. Used
+  // ONLY to gate pruning an AI-only row (see aiRowContentIsExported below) — a
+  // pristine row was never written by anything this run needs to protect, so
+  // it prunes exactly as before regardless of `cutoff`.
+  cutoff: MergeCutoff | null,
 ): Promise<{ deleted: number; skippedLocked: number }> {
   const incomingIds = new Set<string>();
   const coveredChapters = new Set<number>();
@@ -9243,15 +9295,32 @@ async function softDeleteRemovedTsvRows(
                  WHERE kind = ?3 AND row_key = ${kind}_rows.id
                    AND (book = ?1 OR book IS NULL)
                    AND action IN ('create', 'update')
-                 ORDER BY id DESC LIMIT 1) AS latest_source
+                 ORDER BY id DESC LIMIT 1) AS latest_source,
+              (SELECT id FROM edit_log
+                 WHERE kind = ?3 AND row_key = ${kind}_rows.id
+                   AND (book = ?1 OR book IS NULL)
+                   AND action IN ('create', 'update')
+                 ORDER BY id DESC LIMIT 1) AS latest_edit_id,
+              (SELECT created_at FROM edit_log
+                 WHERE kind = ?3 AND row_key = ${kind}_rows.id
+                   AND (book = ?1 OR book IS NULL)
+                   AND action IN ('create', 'update')
+                 ORDER BY id DESC LIMIT 1) AS latest_edit_created_at
          FROM ${kind}_rows WHERE book = ?1 AND chapter = ?2 AND ${selectProtections}`,
     )
       .bind(book, ch, kind)
-      .all<{ id: string; version: number; updated_by: number | null; latest_source: string | null }>();
-    const targets = (rs.results ?? []).filter(
-      (r) =>
-        !incomingIds.has(r.id) &&
-        isReimportableRow({
+      .all<{
+        id: string;
+        version: number;
+        updated_by: number | null;
+        latest_source: string | null;
+        latest_edit_id: number | null;
+        latest_edit_created_at: number | null;
+      }>();
+    const targets = (rs.results ?? []).filter((r) => {
+      if (incomingIds.has(r.id)) return false;
+      if (
+        !isReimportableRow({
           updated_by: r.updated_by,
           latestSource: r.latest_source ?? null,
           deleted_at: null,
@@ -9259,15 +9328,25 @@ async function softDeleteRemovedTsvRows(
           preserve: 0,
           hint: 0,
           kind,
-        }),
-    );
+        })
+      )
+        return false;
+      // Issue #832: an AI-only row (pristine rows have nothing pending) is
+      // prunable only once ITS own newest content edit has reached a
+      // confirmed export — otherwise this would delete content master has
+      // never had the chance to see.
+      if (r.latest_source === AI_SOURCE) {
+        return aiRowContentIsExported(cutoff, r.latest_edit_id, r.latest_edit_created_at);
+      }
+      return true;
+    });
     for (const t of targets) {
       // updated_by → NULL reclaims the tombstone to reimport-owned; version-CAS
       // (?4) + the re-asserted protections abort if a human touched the row
       // between the SELECT and here (bumps version → 0 rows changed).
-      // #686: sync_prune. This function has no lineage in scope (it is not
-      // handed a MergeCutoff — see the caller chain) and does not thread one
-      // through solely to name an author here, so DOOR43_ACTOR_UNMEASURED.
+      // #686: sync_prune. `cutoff` (issue #832) only gates AI-only eligibility
+      // above — it carries no per-row lineage/author signal, so there is still
+      // nothing here to name an author from, hence DOOR43_ACTOR_UNMEASURED.
       const upd = await env.DB.prepare(
         `UPDATE ${kind}_rows
             SET deleted_at = ?1, updated_by = NULL, version = version + 1, updated_at = ?1, ${provenanceSet(5)}
@@ -10050,11 +10129,19 @@ export async function runChunkedReimport(
   // gate decides at STAGING time (it is what withholds the file from the chunk
   // steps in the first place), so a sync-step-only override would leave D1
   // un-updated while stamping the watermark — the worst of both.
+  // `userId` — issue #686 item 7: attributed to the operator who dispatched
+  // this run (admin.ts's `reimportWorkflowParams`, whole-book "Pull from
+  // Door43"), null/undefined on every cron path. Threaded only into the
+  // edit_log `user_id` column via reimportStagedChunk — it never reaches a
+  // row's own `updated_by`/pristine columns (sync writes clear or leave those
+  // alone regardless of who triggered the run), so this cannot affect
+  // isPristineTsv or any pristine-write predicate.
   opts: {
     chunk?: number;
     mergeRefusalOverrideResource?: Resource;
     idBlockedOverrideResource?: Resource;
     staleBaseOverrideResource?: Resource;
+    userId?: number | null;
   } = {},
 ): Promise<ReimportResult> {
   const chunkSize = opts.chunk ?? REIMPORT_CHAPTER_CHUNK;
@@ -10207,7 +10294,7 @@ export async function runChunkedReimport(
     const counts = await step.do(
       `reimport-${book}-ch${start}-${end}`,
       { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, null),
+      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, opts.userId ?? null),
     );
     mergePerResource(perResource, counts);
   }
@@ -10245,7 +10332,13 @@ export async function runChunkedReimport(
     const res = await step.do(`reimport-prune-${book}-${kind}`, async () => {
       const raw = await readStaged(env, r2Key);
       if (raw == null) return { deleted: 0, skippedLocked: 0 };
-      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs, verifiedComplete);
+      // Issue #832: this step runs after the chunk-apply steps above (which
+      // hoist their own cutoff inside reimportStagedChunk's separate call), so
+      // it re-reads the same (book, kind) merge-ancestor cutoff here rather
+      // than threading one through every chunk — one extra read per changed
+      // TSV kind, not per chapter.
+      const cutoff = await getMasterConfirmedAt(env, book, kind);
+      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs, verifiedComplete, cutoff);
       if (res.deleted > 0 || res.skippedLocked > 0) {
         console.log("reimport pruned rows removed on master", { book, resource: kind, ...res });
       }
@@ -10398,6 +10491,17 @@ export async function runChunkedReimport(
       const idBlockedOverride = opts.idBlockedOverrideResource === e.resource;
       const dropped =
         (perResource[e.resource].conflict_skipped ?? 0) + (perResource[e.resource].tombstone_blocked ?? 0);
+      // Issue #829: same four conditions as the `if` below, computed as WHICH
+      // one fired rather than just whether one did — see computeWithholdReason's
+      // doc for why this mirrors, rather than replaces, the gate immediately
+      // after it.
+      const withholdReason = computeWithholdReason(
+        perResource[e.resource],
+        idBlockedOverride,
+        systemicRefusals,
+        mergeRecordFailed,
+        applyIncomplete,
+      );
       if (
         !shouldRecordResourceSync(perResource[e.resource], idBlockedOverride) ||
         systemicRefusals ||
@@ -10417,11 +10521,27 @@ export async function runChunkedReimport(
         // has something to refuse against. No-op when a real (or previously
         // withheld) row already exists — see recordWithheldSyncIfAbsent.
         await recordWithheldSyncIfAbsent(env, book, e.resource);
+        // Issue #829: persist WHY, so recordStaleSkipAlert can name the real
+        // cause instead of guessing. withholdReason is always non-null here —
+        // it mirrors the `if` above exactly — but a defensive fallback keeps
+        // this write from ever asserting a cause it didn't measure.
+        await recordSyncWithhold(
+          env,
+          book,
+          e.resource,
+          withholdReason?.reason ?? "counts_incomplete",
+          withholdReason?.count ?? 0,
+          alertObservedAt,
+          instanceId,
+        );
         continue;
       }
       if (!e.masterSha) continue;
       await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");
       recorded++;
+      // This pair just reached a clean stamp, so it was NOT withheld above —
+      // release any reason left over from a past run (issue #829).
+      await clearSyncWithhold(env, book, e.resource);
       // Issue #473 option A: the override let a nonzero drop count through to
       // a recorded sync above — raise the distinct "force-released, Door43
       // will lose these rows" alert instead of clearing it. Ordered AFTER

@@ -34,6 +34,7 @@ import type { FindQuery } from "./ScriptureColumn";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { formatVerseLabel, isRangeRow } from "../lib/verseRange";
+import { directionForVersion } from "../lib/direction";
 import {
   classifySourceQuery,
   matchSourceVerse,
@@ -901,7 +902,7 @@ const VerseCell = memo(function VerseCell({
   textCheck?: TextLaneCheck;
 }) {
   const readOnly = READ_ONLY.has(bibleVersion) || locked;
-  const rtl = bibleVersion === "UHB";
+  const rtl = directionForVersion(bibleVersion) === "rtl";
   const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   // The active match is at most one cell; this is non-null only on that cell.
   const activeRange = useMemo<{ start: number; end: number } | null>(() => {

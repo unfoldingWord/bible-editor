@@ -29,6 +29,7 @@ import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
 import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
+import { directionForBook, directionForVersion } from "../lib/direction";
 import {
   classifySourceQuery,
   matchSourceVerse,
@@ -462,7 +463,7 @@ function ScriptureColumnInner({
     }
   }, [scrollNonce, mode]);
 
-  const isHebrew = !!versesByVersion["UHB"];
+  const isHebrew = directionForBook(book) === "rtl";
 
   // Per-version expansion: verses[bv][7] resolves to the 6-9 range row when
   // the user navigates to verse 7 inside a UST multi-verse block. The wire
@@ -719,7 +720,7 @@ function ScriptureColumnInner({
                 activeVerse={activeVerse}
                 readOnly={READ_ONLY_VERSIONS.has(v) || effectiveLocked}
                 textCheck={READ_ONLY_VERSIONS.has(v) ? undefined : textCheck}
-                rtl={v === "UHB"}
+                rtl={directionForVersion(v) === "rtl"}
                 activeNoteQuote={activeNoteQuote}
                 activeNoteOccurrence={activeNoteOccurrence}
                 activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
@@ -1822,6 +1823,10 @@ function ActiveLine({
             direction: "rtl",
             textAlign: "right",
             fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
+            // Rows mode was the one scripture mode with no bidi isolation on
+            // this cell (DocColumn / BookView both set it on their
+            // equivalent wrapper) — see #843.
+            unicodeBidi: "isolate",
           }}
         >
           <HebrewLine
@@ -1872,6 +1877,7 @@ function ActiveLine({
             fontFamily: rtl
               ? '"Times New Roman","SBL Hebrew","Cardo",serif'
               : '"Source Serif Pro","Cambria","Times New Roman",serif',
+            unicodeBidi: rtl ? "isolate" : undefined,
             outline: "none",
             ...markHighlightSx(theme.palette.mode),
             // Orange border when this row has unsaved typing and isn't

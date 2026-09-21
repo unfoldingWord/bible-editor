@@ -20,11 +20,24 @@ import {
 } from "@mui/material";
 import { api, type RowHistoryEntry, type RowKind } from "../sync/api";
 import { diffWords } from "../lib/wordDiff";
+import { directionForText } from "../lib/direction";
 import {
   defaultPreviousHistoryVersion,
   type HistoryFieldSpec,
   type RowSnapshot,
 } from "./rowHistoryFields";
+
+// Direction for an `autoDirection` field: sniff the shown value(s) for their
+// script, preferring a non-empty result. Falls back to rtl when every value
+// is empty — matching NoteCard's own quote input, whose resting state
+// (nothing typed yet) is a Hebrew/Greek source quote, not English.
+function autoRtl(...values: Array<string | null>): boolean {
+  for (const v of values) {
+    const script = directionForText(v);
+    if (script !== "empty") return script === "rtl";
+  }
+  return true;
+}
 
 interface Props {
   open: boolean;
@@ -343,13 +356,16 @@ export function RowHistoryDialog({
                             label={f.label}
                             from={show(selectedSnapshot[f.key])}
                             to={show(effectiveSnapshot![f.key])}
-                            rtl={f.rtl}
+                            rtl={
+                              f.autoDirection &&
+                              autoRtl(show(effectiveSnapshot![f.key]), show(selectedSnapshot[f.key]))
+                            }
                           />
                         ) : (
                           <FieldPreview
                             label={f.label}
                             value={show(selectedSnapshot[f.key])}
-                            rtl={f.rtl}
+                            rtl={f.autoDirection && autoRtl(show(selectedSnapshot[f.key]))}
                           />
                         )}
                       </Box>

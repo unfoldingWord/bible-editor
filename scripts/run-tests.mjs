@@ -46,6 +46,7 @@ const SQLITE_FILES = new Set([
   "src/bookLock.test.mjs",
   "src/staleBaseGate.test.mjs",
   "src/reviewFlagBroadcast.test.mjs",
+  "src/syncWithholds.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([

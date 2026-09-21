@@ -102,6 +102,7 @@ import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
 import { mergeRefusalOverrideAllowed, idBlockedOverrideAllowed, staleBaseOverrideAllowed } from "./reimportSyncGate";
+import { readSyncWithhold, staleSkipRemedy } from "./syncWithholds";
 import { lockedBooksIn } from "./bookLock";
 import {
   PUBLISHED_RELEASE_TAG,
@@ -194,6 +195,15 @@ export interface ExportParams {
   // resources for one book in one go, and firing one Workflow instance per
   // resource would race on the same book's D1 rows.
   resources?: Resource[];
+  // Issue #686 item 7: who asked for this reimport, distinct from the Door43
+  // commit author `dcs_sync` writes already carry as `last_change_actor`. Set
+  // by the admin "Pull from Door43" whole-book dispatch (reimportWorkflowParams
+  // in admin.ts) to the clicking operator's user id; absent/null on every cron
+  // path (the 05:30 export and the 08:00 REIMPORT_CRON self-heal both create
+  // this Workflow with no `userId` at all — see index.ts's `scheduled()`), so
+  // edit_log.user_id can finally tell "an operator triggered this sync" apart
+  // from "nobody was watching" instead of both reading as the same NULL.
+  userId?: number | null;
 }
 
 export interface StepResult {
@@ -471,6 +481,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
+            userId: params.userId ?? null,
           });
           // runChunkedReimport resolves normally in three distinct outcomes and
           // the ledger must tell them apart (#833 review). The split mirrors
@@ -999,7 +1010,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // to R2 only and can't clobber anything.
     const fresh = dcsAllowed ? await this.checkMasterFreshness(book, resource) : { ok: true as const, detail: "dry", masterSha: null, watermark: null };
     if (!fresh.ok) {
-      await this.recordStaleSkipAlert(book, resource, fresh.masterSha, fresh.watermark);
+      await this.recordStaleSkipAlert(book, resource, fresh.masterSha, fresh.watermark, instanceId);
       const reason = `stale_master:${fresh.detail}`;
       await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
       return {
@@ -2054,17 +2065,32 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
   // Banner alert when the freshness gate skips an export to avoid clobbering
   // master. Same replace-undismissed shape as recordPrFailureAlert.
+  //
+  // Issue #829: the remedy sentence used to assert an unmeasured cause ("the
+  // pre-export sync didn't catch up; re-run the sync") for every skip, even a
+  // deliberate withhold (a locked chapter, a systemic-refusal freeze, …) whose
+  // own step already knows exactly why and where re-running changes nothing.
+  // Reads this SAME run's withhold reason — the reimport-sync step that ran
+  // moments earlier in this instance persisted it (bookReimport.ts,
+  // syncWithholds.ts) — and states that measured cause instead. Absent a
+  // recorded reason, says so rather than guessing one (staleSkipRemedy's `null`
+  // branch).
   private async recordStaleSkipAlert(
     book: string,
     resource: Resource,
     masterSha: string | null,
     watermark: string | null,
+    instanceId: string,
   ): Promise<void> {
     const source = `export_stale:${book}:${resource}`;
+    // readSyncWithhold only trusts a row THIS run wrote — see its doc for why
+    // a mismatched instanceId (a stale row from a previous night) must read
+    // as "no reason recorded", not as tonight's measured cause.
+    const withhold = await readSyncWithhold(this.env, book, resource, instanceId);
     const message =
       `Benjamin — nightly export skipped ${book} ${resource.toUpperCase()} to avoid reverting master ` +
       `(D1 is behind: master ${(masterSha ?? "unknown").slice(0, 8)} vs synced ${(watermark ?? "none").slice(0, 8)}). ` +
-      `The pre-export sync didn't catch up; re-run the sync for ${book}, then re-export.`;
+      staleSkipRemedy(withhold);
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
