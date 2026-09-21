@@ -539,16 +539,27 @@ export function staleBaseOverrideForRequest(
  * returns before any export step, and the reimport resolves its own resource
  * list from `resources`. Omitted otherwise so an ordinary multi-resource pull is
  * byte-for-byte the dispatch it always was.
+ *
+ * `userId` always rides along (issue #686 item 7): without it, every write this
+ * run makes lands in edit_log with `user_id NULL`, which is byte-identical to
+ * the unattended 05:30/08:00 crons (see index.ts's `scheduled()`, which creates
+ * this same Workflow with no `userId` at all). That collapsed "an operator
+ * clicked Pull from Door43" and "nobody was watching" into one indistinguishable
+ * row. The inline (chapters-scoped) sibling path already passed its real
+ * userId straight to `reimportBookFromDcs` — this closes the same gap for the
+ * whole-book Workflow dispatch.
  */
 export function reimportWorkflowParams(
   book: string,
   resources: readonly string[],
   staleBaseOverrideResource: ReimportResource | undefined,
+  userId: number | null,
 ): Record<string, unknown> {
   return {
     book,
     resources,
     reimportOnly: true,
+    userId,
     ...(staleBaseOverrideResource ? { allowStaleBase: true, resource: staleBaseOverrideResource } : {}),
   };
 }
@@ -642,7 +653,7 @@ admin.post("/import", bookLockGuard, async (c) => {
     const instance = await c.env.EXPORT_WORKFLOW.create({
       id,
       // Issue #639 (Codex finding 2) — see reimportWorkflowParams.
-      params: reimportWorkflowParams(book, resources, staleBaseOverrideResource),
+      params: reimportWorkflowParams(book, resources, staleBaseOverrideResource, userId),
     });
     return c.json({ mode: "workflow", id: instance.id }, 202);
   } catch (e) {

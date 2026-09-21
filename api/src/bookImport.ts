@@ -662,9 +662,9 @@ async function importBookFromDcs(
   // see resolveActorUsername), never null.
   const actor = await resolveActorUsername(env.DB, userId);
 
-  counts.verses += await insertVerses(env, book, "ULT", ultRaw, actor);
-  counts.verses += await insertVerses(env, book, "UST", ustRaw, actor);
-  counts.verses += await insertVerses(env, book, origVersion, origRaw, actor);
+  counts.verses += await insertVerses(env, book, "ULT", ultRaw, userId, actor);
+  counts.verses += await insertVerses(env, book, "UST", ustRaw, userId, actor);
+  counts.verses += await insertVerses(env, book, origVersion, origRaw, userId, actor);
 
   counts.tn = await insertTnRows(env, book, tnRaw, userId, actor);
   counts.tq = await insertTqRows(env, book, tqRaw, userId, actor);
@@ -705,6 +705,7 @@ async function insertVerses(
   book: string,
   bibleVersion: string,
   rawUsfm: string | null,
+  userId: number,
   actor: string,
 ): Promise<number> {
   if (!rawUsfm) return 0;
@@ -723,23 +724,38 @@ async function insertVerses(
   const verses = extractVersesForRange(rawUsfm, 1, 999);
   if (verses.length === 0) return 0;
 
-  // This is the ONE record the bootstrap import leaves for a verse row: unlike
-  // tn/tq/twl below, verses here get no `updated_by` and no edit_log entry at
-  // all. Before #686 a bootstrap-imported verse's provenance was simply
-  // unknowable from D1 alone.
+  // Stamps both the row's own provenance columns (updated_by / last_change_*,
+  // #686) AND a paired kind='verse' edit_log 'create' row, matching the
+  // tn/tq/twl inserts below — before #686 review, a bootstrap-imported verse's
+  // provenance was unknowable from D1 alone (no updated_by, no edit_log row),
+  // so the version-history timeline started blank and verseMerge's ancestor
+  // recovery had nothing to read for a never-edited bootstrap verse.
   const stmt = env.DB.prepare(
     `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, ${PROVENANCE_COLUMNS.join(", ")})
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
   );
+  const auditStmt = env.DB.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+     VALUES ('verse', ?1, ?2, ?3, NULL, 1, 'create', ?4)`,
+  );
   const provenance = provenanceValues({ action: "import", source: "import", actor });
-  for (let i = 0; i < verses.length; i += CHUNK) {
-    const slice = verses.slice(i, i + CHUNK);
-    await env.DB.batch(
-      slice.map((v) =>
-        stmt.bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText, ...provenance),
-      ),
+
+  let batch: D1PreparedStatement[] = [];
+  const flush = async () => {
+    if (batch.length === 0) return;
+    await env.DB.batch(batch);
+    batch = [];
+  };
+  for (const v of verses) {
+    const rowKey = `${book}/${v.chapter}/${v.verse}/${bibleVersion}`;
+    const payload = JSON.stringify({ content: v.contentJson, plain_text: v.plainText });
+    batch.push(
+      stmt.bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText, ...provenance),
+      auditStmt.bind(rowKey, book, userId, payload),
     );
+    if (batch.length >= CHUNK) await flush();
   }
+  await flush();
   return verses.length;
 }
 
