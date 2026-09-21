@@ -12,7 +12,13 @@
 
 import { Hono } from "hono";
 import { SignJWT } from "jose";
-import { attachAuth, requireCsrf, currentUserId } from "./auth.ts";
+import {
+  attachAuth,
+  requireCsrf,
+  currentUserId,
+  DcsUserSchema,
+  DcsOrgMembershipsSchema,
+} from "./auth.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -108,6 +114,52 @@ async function run() {
     assert(res.status === 200, `expired cookie no longer shadows a valid Bearer header (got ${res.status})`);
     const body = await res.json();
     assert(body.userId === 11, "the Bearer token's userId wins once the cookie is rejected");
+  }
+
+  // ─── Issue #841: the DCS `/api/v1/user` and `/orgs` responses are
+  // schema-validated rather than trusted on a bare `as` cast ────────────────
+  {
+    console.log("\n[DcsUserSchema] issue #841 — the signed-in user's identity");
+    assert(
+      DcsUserSchema.safeParse({ id: 7, login: "someone" }).success,
+      "id + login is enough (full_name is optional)",
+    );
+    assert(
+      DcsUserSchema.safeParse({ id: 7, login: "someone", full_name: "Some One" }).success,
+      "full_name, when present, is accepted",
+    );
+    assert(
+      !DcsUserSchema.safeParse({ login: "someone" }).success,
+      "a missing id is rejected — this repo has no fallback identity to mint a user from",
+    );
+    assert(
+      !DcsUserSchema.safeParse({ id: "7", login: "someone" }).success,
+      "id as a string (not a number) is rejected rather than propagating a NaN id",
+    );
+    assert(
+      !DcsUserSchema.safeParse({ id: 7 }).success,
+      "a missing login is rejected",
+    );
+  }
+
+  {
+    console.log("\n[DcsOrgMembershipsSchema] issue #841 — org-membership list");
+    assert(
+      DcsOrgMembershipsSchema.safeParse([{ username: "unfoldingWord" }]).success,
+      "a normal org list parses",
+    );
+    assert(
+      DcsOrgMembershipsSchema.safeParse([]).success,
+      "an empty org list parses (a user in no orgs)",
+    );
+    assert(
+      !DcsOrgMembershipsSchema.safeParse({ error: "not found" }).success,
+      "a non-array body (e.g. an error object) is rejected up front, instead of relying on '.some is not a function' throwing",
+    );
+    assert(
+      !DcsOrgMembershipsSchema.safeParse(null).success,
+      "a null body is rejected",
+    );
   }
 
   console.log(failed === 0 ? "\nAll auth.test.mjs checks passed." : `\n${failed} check(s) failed.`);
