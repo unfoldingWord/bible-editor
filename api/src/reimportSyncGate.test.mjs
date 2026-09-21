@@ -25,6 +25,7 @@ import {
   KEPT_OVER_DOOR43_ALERT_THRESHOLD,
   mergeRefusalOverrideAllowed,
   idBlockedOverrideAllowed,
+  computeWithholdReason,
 } from "./reimportSyncGate.ts";
 
 let failed = 0;
@@ -533,9 +534,129 @@ eq(
   "999 kept-over-Door43 rows still stamp the watermark — this outcome never withholds",
 );
 
+console.log("\n[computeWithholdReason] (issue #829)");
+
+// Agreement property: computeWithholdReason must return null exactly when the
+// reimport-sync step's full withhold condition (shouldRecordResourceSync OR
+// systemicRefusal OR mergeRecordFailed OR applyIncomplete) is false, and
+// non-null exactly when it is true. Exercised across the same matrix
+// shouldRecordResourceSync's own tests above use, plus the three sibling
+// flags, so the two can never silently disagree about WHETHER to withhold.
+function agrees(c, idBlockedOverride, systemicRefusal, mergeRecordFailed, applyIncomplete) {
+  const gate = Boolean(
+    !shouldRecordResourceSync(c, idBlockedOverride) || systemicRefusal || mergeRecordFailed || applyIncomplete,
+  );
+  const reason = computeWithholdReason(c, idBlockedOverride, systemicRefusal, mergeRecordFailed, applyIncomplete);
+  return gate === (reason !== null);
+}
+
+eq(agrees(counts()), true, "ordinary clean run: gate and reason agree (both say stamp)");
+eq(
+  computeWithholdReason(counts()),
+  null,
+  "ordinary clean run → no withhold reason",
+);
+
+// One case per reason, matching shouldRecordResourceSync's own cases above —
+// each must name the SPECIFIC condition that fired, not just "withheld".
+eq(
+  computeWithholdReason(counts({ chapters_locked: 3 }))?.reason,
+  "chapters_locked",
+  "chapters_locked > 0 → reason names chapters_locked",
+);
+eq(computeWithholdReason(counts({ chapters_locked: 3 }))?.count, 3, "…and carries the measured count");
+eq(agrees(counts({ chapters_locked: 3 })), true, "chapters_locked case: gate and reason agree");
+
+eq(
+  computeWithholdReason(counts({ prune_locked: 2 }))?.reason,
+  "prune_locked",
+  "prune_locked > 0 (chapters_locked clean) → reason names prune_locked",
+);
+eq(agrees(counts({ prune_locked: 2 })), true, "prune_locked case: gate and reason agree");
+
+eq(
+  computeWithholdReason(counts({ conflict_skipped: 1 }))?.reason,
+  "conflict_skipped",
+  "conflict_skipped > 0 → reason names conflict_skipped",
+);
+eq(agrees(counts({ conflict_skipped: 1 })), true, "conflict_skipped case: gate and reason agree");
+
+eq(
+  computeWithholdReason(counts({ tombstone_blocked: 6 }))?.reason,
+  "tombstone_blocked",
+  "tombstone_blocked > 0 (the 1CH 23 tQ shape) → reason names tombstone_blocked",
+);
+eq(agrees(counts({ tombstone_blocked: 6 })), true, "tombstone_blocked case: gate and reason agree");
+
+// idBlockedOverride opens conflict_skipped/tombstone_blocked, same as the gate.
+eq(
+  computeWithholdReason(counts({ conflict_skipped: 1 }), true),
+  null,
+  "idBlockedOverride opens conflict_skipped, same as the gate → no withhold reason",
+);
+eq(
+  computeWithholdReason(counts({ tombstone_blocked: 1 }), true),
+  null,
+  "idBlockedOverride opens tombstone_blocked, same as the gate → no withhold reason",
+);
+
+eq(
+  computeWithholdReason(counts({ structure_overlap: 1 }))?.reason,
+  "structure_overlap",
+  "structure_overlap > 0 → reason names structure_overlap",
+);
+// idBlockedOverride must NOT open structure_overlap — same as the gate.
+eq(
+  computeWithholdReason(counts({ structure_overlap: 1 }), true)?.reason,
+  "structure_overlap",
+  "idBlockedOverride does not open structure_overlap, same as the gate",
+);
+
+eq(
+  computeWithholdReason(counts({ counts_incomplete: true }))?.reason,
+  "counts_incomplete",
+  "counts_incomplete flag → reason names counts_incomplete",
+);
+eq(
+  computeWithholdReason({})?.reason,
+  "counts_incomplete",
+  "counts object missing chapters_locked/prune_locked entirely → reason names counts_incomplete (fail-safe, not a lock)",
+);
+eq(
+  computeWithholdReason({ chapters_locked: 0, prune_locked: 0 })?.reason,
+  "counts_incomplete",
+  "counts object missing conflict_skipped/tombstone_blocked → reason names counts_incomplete",
+);
+
+// The three sibling flags the call site ORs in beside shouldRecordResourceSync —
+// only reachable once every measured counter is clean, same order as the `if`.
+eq(
+  computeWithholdReason(counts(), false, true)?.reason,
+  "systemic_refusal",
+  "clean counts + systemicRefusal → reason names systemic_refusal",
+);
+eq(
+  computeWithholdReason(counts(), false, false, true)?.reason,
+  "merge_record_failed",
+  "clean counts + mergeRecordFailed → reason names merge_record_failed",
+);
+eq(
+  computeWithholdReason(counts(), false, false, false, true)?.reason,
+  "apply_incomplete",
+  "clean counts + applyIncomplete → reason names apply_incomplete",
+);
+// A measured counter takes priority over the sibling flags — matches the `if`
+// condition's evaluation order (shouldRecordResourceSync checked first).
+eq(
+  computeWithholdReason(counts({ chapters_locked: 1 }), false, true, true, true)?.reason,
+  "chapters_locked",
+  "chapters_locked outranks every sibling flag, same as the gate's own precedence",
+);
+eq(agrees(counts({ chapters_locked: 1 }), false, true, true, true), true, "combined case: gate and reason agree");
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
 } else {
-  console.log("\nAll shouldRecordResourceSync / isSystemicMergeRefusal checks passed.");
+  console.log("\nAll shouldRecordResourceSync / isSystemicMergeRefusal / computeWithholdReason checks passed.");
 }
