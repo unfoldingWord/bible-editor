@@ -9,6 +9,7 @@ import { Box, Divider, Fade } from "@mui/material";
 import type { SourceWord } from "../lib/alignment";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { decodeMorph, morphemeText } from "../lib/morph";
+import { directionForText } from "../lib/direction";
 
 interface Props {
   source: SourceWord;
@@ -83,6 +84,11 @@ export function SourceTooltipBody({ source, lex, twHint, pinHint }: Props) {
   // In-context morphology from the word's x-morph — distinct from the lemma POS
   // above. The chain skips the pronominal suffix (called out separately below).
   const decoded = decodeMorph(source.morph);
+  // The lemma is the one Hebrew-or-Greek run inside an otherwise LTR (English
+  // labels/glosses) tooltip; its own script decides its direction so a
+  // Hebrew lemma isolates correctly wherever this tooltip is used (#843).
+  const lemmaScript = directionForText(lemma);
+  const lemmaDir = lemmaScript === "rtl" ? "rtl" : "ltr";
   const morphChain = decoded
     ? decoded.morphemes.filter((m) => !m.pronoun).map(morphemeText).filter(Boolean).join("  +  ")
     : "";
@@ -91,11 +97,13 @@ export function SourceTooltipBody({ source, lex, twHint, pinHint }: Props) {
     <Box sx={{ fontSize: 14, maxWidth: 340, lineHeight: 1.5, p: 0.25 }}>
       <Box sx={{ textAlign: "center", mb: 0.75 }}>
         <Box
+          dir={lemmaDir}
           sx={{
             fontFamily: '"Times New Roman","SBL Hebrew",serif',
             fontSize: 26,
             lineHeight: 1.1,
             mb: 0.5,
+            unicodeBidi: "isolate",
           }}
         >
           {lemma}

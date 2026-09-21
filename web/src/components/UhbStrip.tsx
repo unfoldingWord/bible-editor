@@ -7,6 +7,7 @@ import type { TwlRow, VerseDto } from "../sync/api";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { type HighlightCtx, hoverShadow } from "../lib/highlightTypes";
 import { nfc } from "../lib/hebrew";
+import { directionForVersion } from "../lib/direction";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 import { PinnedLexBox } from "./PinnedLexBox";
 
@@ -37,7 +38,7 @@ export function UhbStrip({
   onToggleHidden?: () => void;
   hctx: HighlightCtx;
 }) {
-  const sourceIsHebrew = sourceLabel === "UHB";
+  const sourceIsHebrew = directionForVersion(sourceLabel) === "rtl";
   return (
     <Box
       sx={{

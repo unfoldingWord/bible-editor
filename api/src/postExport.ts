@@ -13,8 +13,24 @@
 // out to en_tq / en_twl / en_ult / en_ust.
 
 import type { WorkflowStep } from "cloudflare:workers";
+import { z } from "zod";
 import type { Env } from "./index";
 import { reimportBookFromDcs, type Resource } from "./bookReimport";
+
+// DCS `GET .../pulls` — only the fields ensureSnapshotPr reads. Array-ness
+// wasn't checked before iterating; a non-array body (an error object) would
+// have thrown at `.find()` instead of failing through this file's normal
+// `throw new Error(...)` error path.
+export const DcsPullListSchema = z.array(
+  z.object({
+    number: z.number(),
+    head: z.object({ ref: z.string().optional() }).optional(),
+    base: z.object({ ref: z.string().optional() }).optional(),
+  }),
+);
+
+// DCS `POST .../pulls` on success — the one field this file reads.
+export const DcsCreatedPullSchema = z.object({ number: z.number() });
 
 export interface ValidatorConfig {
   resource: Resource;
@@ -241,11 +257,11 @@ async function ensureSnapshotPr(
   if (!listRes.ok) {
     throw new Error(`pulls_list_failed: ${listRes.status} ${await listRes.text()}`);
   }
-  const pulls = (await listRes.json()) as Array<{
-    number: number;
-    head?: { ref?: string };
-    base?: { ref?: string };
-  }>;
+  const parsedPulls = DcsPullListSchema.safeParse(await listRes.json());
+  if (!parsedPulls.success) {
+    throw new Error(`pulls_list_failed: malformed body (${parsedPulls.error.issues.length} issues)`);
+  }
+  const pulls = parsedPulls.data;
   const existing = pulls.find(
     (p) => p.head?.ref === headBranch && p.base?.ref === baseBranch,
   );
@@ -263,8 +279,13 @@ async function ensureSnapshotPr(
     }),
   });
   if (createRes.ok) {
-    const created = (await createRes.json()) as { number: number };
-    return { number: created.number, created: true, reason: "created" };
+    const parsedCreated = DcsCreatedPullSchema.safeParse(await createRes.json());
+    if (!parsedCreated.success) {
+      throw new Error(
+        `pull_create_failed: malformed response body (${parsedCreated.error.issues.length} issues)`,
+      );
+    }
+    return { number: parsedCreated.data.number, created: true, reason: "created" };
   }
   const errText = await createRes.text();
   // Idempotency / common no-op outcomes that we treat as soft-success:
@@ -275,15 +296,13 @@ async function ensureSnapshotPr(
     // there's nothing to merge.
     const r2 = await fetch(listUrl, { method: "GET", headers: dcsHeaders(env) });
     if (r2.ok) {
-      const ps = (await r2.json()) as Array<{
-        number: number;
-        head?: { ref?: string };
-        base?: { ref?: string };
-      }>;
-      const ex = ps.find(
-        (p) => p.head?.ref === headBranch && p.base?.ref === baseBranch,
-      );
-      if (ex) return { number: ex.number, created: false, reason: "raced" };
+      const parsedPs = DcsPullListSchema.safeParse(await r2.json());
+      if (parsedPs.success) {
+        const ex = parsedPs.data.find(
+          (p) => p.head?.ref === headBranch && p.base?.ref === baseBranch,
+        );
+        if (ex) return { number: ex.number, created: false, reason: "raced" };
+      }
     }
     return { number: null, created: false, reason: `no_op:${errText.slice(0, 200)}` };
   }
