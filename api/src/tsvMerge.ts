@@ -183,12 +183,12 @@ export type TsvRefMoveOutcome =
 // The reference columns as of the ancestor. A key is ABSENT when no surviving
 // edit_log payload before the watermark ever recorded that column — the same
 // "absent means unattributable" convention TsvMergeSide uses for content.
-// `chapter`/`verse` feed the caller's ref-move log line (bookReimport.ts) and,
-// since issue #547 item 1, the lineage-evidence check that upgrades a
-// move-and-revert from `ours_moved` to `both_moved` — attribution below
-// (issue #547 item 2) still keys on `ref_raw` alone for the MOVE compare
-// itself, since that is the only reference data the export actually
-// publishes; see tsvRefMoved's comment for why.
+// `chapter`/`verse` are folded and kept here purely for diagnostics (the
+// caller's ref-move log line, bookReimport.ts) — attribution below (issue #547
+// item 2) keys on `ref_raw` alone, since that is the only reference data the
+// export actually publishes; see tsvRefMoved's comment for why. (An #547
+// item 1 escalation keyed on these was tried and reverted — see the comment
+// above classifyTsvRefMove's call site in bookReimport.ts for why.)
 export interface TsvRefSide {
   chapter?: number;
   verse?: number;

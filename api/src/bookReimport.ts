@@ -2409,37 +2409,29 @@ export async function applyTsvRows(
       // never ship it, so the same wrong flag returned every night (AMO tq,
       // blocked from 2026-08-17). See classifyTsvRefMove.
       const refBase = bases.get(row.id)?.ref ?? null;
-      let refMove = classifyTsvRefMove(cur, row, refBase, protectedRow);
-      // #547 item 1: classifyTsvRefMove is a single-snapshot three-way compare
+      const refMove = classifyTsvRefMove(cur, row, refBase, protectedRow);
+      // #547 item 1 (attempted, then reverted — PR #854 multi-model review,
+      // 2026-09-21): classifyTsvRefMove is a single-snapshot ancestor compare
       // and cannot see master moving away from the ancestor and back to it
-      // within one watermark window. Concretely: a maintainer moves master
-      // 1:2 -> 1:6, the nightly copies 1:6 into D1 before the boundary
-      // advances, the maintainer reverts master to 1:2. Master's CURRENT
-      // ref_raw now equals the ancestor's, so `theirsMoved` reads false and
-      // the whole thing classifies `ours_moved` — the one outcome that lets
-      // the export publish D1's location over master's, so it would silently
-      // undo the maintainer's deliberate revert.
-      //
-      // The same evidence this run's commit-lineage walk already gathers for
-      // the content merge (masterMayHoldHumanEditForVerse) answers this too: a
-      // COMPLETE human-commit diff that actually touched the ancestor's own
-      // (chapter, verse) is exactly the fingerprint a revert-to-base commit
-      // leaves behind. Escalate to `both_moved` — needs a human, same as a
-      // real two-sided move — only on that positive proof.
-      // completeHumanRefEvidenceTouches returns false on absent or incomplete
-      // evidence by contract (its own uncertainty-returns-false rule), so a
-      // run with no lineage or an incomplete walk keeps today's `ours_moved`
-      // behavior, and the AMO tq livelock (#540 item 3) this classifier exists
-      // to fix stays fixed.
-      if (
-        refMove === "ours_moved" &&
-        refBase != null &&
-        Number.isInteger(refBase.chapter) &&
-        Number.isInteger(refBase.verse) &&
-        completeHumanRefEvidenceTouches(cutoff?.lineage, refBase.chapter as number, refBase.verse as number)
-      ) {
-        refMove = "both_moved";
-      }
+      // within one watermark window (a maintainer's 1:2 -> 1:6 -> 1:2 leaves
+      // master's CURRENT ref_raw equal to the ancestor's, so this still reads
+      // as a pure `ours_moved` app-side move). An escalation keyed on
+      // completeHumanRefEvidenceTouches(cutoff?.lineage, refBase.chapter,
+      // refBase.verse) was tried here, but that evidence is VERSE-scoped, not
+      // ROW-scoped: refsTouchedInTsv (masterLineage.ts) maps a human commit's
+      // diff to every TSV line's Reference column with no id filter, so it
+      // fires just as reliably when a Door43 editor touches a DIFFERENT
+      // row/note that happens to share this row's ancestor verse — routine
+      // for tn/tq, which carry several rows per verse. That escalation would
+      // falsely hold THIS row's legitimate app-side move every night the
+      // unrelated neighbor stays in the lineage window — the same livelock
+      // shape as the AMO tq incident this classifier exists to prevent (#540
+      // item 3), just relocated. A correct fix needs per-row lineage evidence
+      // (the id each human commit's diff actually touched, not merely the
+      // ref), which the current evidence-gathering pipeline does not carry —
+      // a deliberate addition to shared, persisted lineage infrastructure,
+      // not a safe change to make here. Left as an open follow-up on #547
+      // item 1; do not reintroduce a ref-level-only escalation.
       // Do the two sides actually hold the same reference? Asked separately from
       // the attribution above, and with the protection argument forced off, so the
       // answer is a measurement even for a protected row (see the stale-flag clear
@@ -2482,6 +2474,15 @@ export async function applyTsvRows(
         // only from its damage. Capped: while one held row keeps the resource
         // stuck, every other moved row in the book would otherwise log nightly.
         if (counts.ref_moved_ours < REF_MOVE_LOG_CAP) {
+          // `possibleMasterActivityAtAncestorRef`: best-effort visibility only
+          // (see the comment above classifyTsvRefMove's call) — VERSE-scoped
+          // evidence, not proof this row's own history has an intermediate
+          // move. Never used to change the outcome.
+          const possibleMasterActivityAtAncestorRef =
+            refBase != null &&
+            Number.isInteger(refBase.chapter) &&
+            Number.isInteger(refBase.verse) &&
+            completeHumanRefEvidenceTouches(cutoff?.lineage, refBase.chapter as number, refBase.verse as number);
           console.log("reimport: reference move attributed to the app; publishing it", {
             book,
             kind,
@@ -2489,6 +2490,7 @@ export async function applyTsvRows(
             ours: `${cur.chapter}:${cur.verse} ${(cur.ref_raw as string | null) ?? ""}`,
             theirs: `${row.chapter}:${row.verse} ${row.refRaw ?? ""}`,
             base: refBase,
+            possibleMasterActivityAtAncestorRef,
           });
         }
         // Clear a flag a previous run raised by mis-attributing this same move —
