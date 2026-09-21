@@ -155,7 +155,7 @@ export interface VerseStatus {
   verse: number;
   done: 0 | 1;
   updated_at: number;
-  /** Migration 0069 (#686 item 3) — who last toggled `done`. Null pre-migration. */
+  /** Migration 0070 (#686 item 3) — who last toggled `done`. Null pre-migration. */
   updated_by: number | null;
 }
 

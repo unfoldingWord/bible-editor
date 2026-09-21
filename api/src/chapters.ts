@@ -218,7 +218,7 @@ chapters.patch("/:book/:chapter/:verse/status", requireEditor, async (c) => {
   await c.env.DB.batch([
     c.env.DB
       .prepare(
-        // #686 item 3: updated_by (migration 0069) is the verse_statuses actor
+        // #686 item 3: updated_by (migration 0070) is the verse_statuses actor
         // column PR #785 deferred — the toggle has exactly one writer (a
         // signed-in human via this route), so it's always 'user', never NULL.
         `INSERT INTO verse_statuses (book, chapter, verse, done, updated_at, updated_by)

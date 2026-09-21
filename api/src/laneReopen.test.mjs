@@ -253,7 +253,7 @@ console.log("\n[#686 item 3: reopenLaneChecks / reopenLaneChecksBulk leave an ed
   }
 }
 
-console.log("\n[#686 item 3 (remainder): verse_statuses.updated_by, migration 0069]");
+console.log("\n[#686 item 3 (remainder): verse_statuses.updated_by, migration 0070]");
 {
   // Same SQL chapters.ts's status-toggle route runs (cross-checked against the
   // real source below) against real SQLite, proving the upsert branch actually
@@ -307,7 +307,7 @@ console.log("\n[#686 item 3, source check] chapters.ts's three edit_log INSERTs 
   eq(occurrences, 3, "[source] all 3 edit_log INSERTs (verse_status, single lane, bulk lane) include the book column");
   eq(chaptersTs.includes(withoutBook), false, "[source] no edit_log INSERT in chapters.ts still omits book");
 
-  // #686 item 3 (remainder, migration 0069): the verse_statuses row itself
+  // #686 item 3 (remainder, migration 0070): the verse_statuses row itself
   // had no actor column at all — PR #785 explicitly deferred this half.
   // Same source-text limitation as above; assert the toggle route stamps
   // updated_by on both the insert and the upsert branch.
