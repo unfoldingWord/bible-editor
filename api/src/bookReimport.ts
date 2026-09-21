@@ -10056,11 +10056,19 @@ export async function runChunkedReimport(
   // gate decides at STAGING time (it is what withholds the file from the chunk
   // steps in the first place), so a sync-step-only override would leave D1
   // un-updated while stamping the watermark — the worst of both.
+  // `userId` — issue #686 item 7: attributed to the operator who dispatched
+  // this run (admin.ts's `reimportWorkflowParams`, whole-book "Pull from
+  // Door43"), null/undefined on every cron path. Threaded only into the
+  // edit_log `user_id` column via reimportStagedChunk — it never reaches a
+  // row's own `updated_by`/pristine columns (sync writes clear or leave those
+  // alone regardless of who triggered the run), so this cannot affect
+  // isPristineTsv or any pristine-write predicate.
   opts: {
     chunk?: number;
     mergeRefusalOverrideResource?: Resource;
     idBlockedOverrideResource?: Resource;
     staleBaseOverrideResource?: Resource;
+    userId?: number | null;
   } = {},
 ): Promise<ReimportResult> {
   const chunkSize = opts.chunk ?? REIMPORT_CHAPTER_CHUNK;
@@ -10213,7 +10221,7 @@ export async function runChunkedReimport(
     const counts = await step.do(
       `reimport-${book}-ch${start}-${end}`,
       { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, null),
+      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, opts.userId ?? null),
     );
     mergePerResource(perResource, counts);
   }
