@@ -581,6 +581,20 @@ console.log("\n[source] bookImport.ts's four whole-book INSERTs (verses, tn, tq,
   );
 }
 
+console.log("\n[source] bookImport.ts's insertVerses pairs each verse INSERT with a kind='verse' edit_log 'create' row (#686 item 4)");
+{
+  eq(
+    /INSERT INTO edit_log \(kind, row_key, book, user_id, prev_version, new_version, action, payload_json\)\s*\n\s*VALUES \('verse', \?1, \?2, \?3, NULL, 1, 'create', \?4\)/.test(bookImportTs),
+    true,
+    "[source] insertVerses's auditStmt inserts a kind='verse' edit_log 'create' row",
+  );
+  const fnStart = bookImportTs.indexOf("async function insertVerses(");
+  eq(fnStart >= 0, true, "[source] insertVerses function found");
+  const fnEnd = bookImportTs.indexOf("\nasync function insertTnRows(", fnStart);
+  const fnBody = bookImportTs.slice(fnStart, fnEnd >= 0 ? fnEnd : undefined);
+  eq(fnBody.includes("auditStmt.bind(rowKey, book, userId, payload)"), true, "[source] insertVerses binds the audit row per verse, inside the batch loop");
+}
+
 console.log("\n[source] index.ts's nightly trash finalize stamps finalize_trash / system / 'nightly trash finalize'");
 {
   eq(
