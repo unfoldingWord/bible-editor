@@ -39,6 +39,7 @@ const SQLITE_FILES = new Set([
   "src/tombstoneReclaim.test.mjs",
   "src/tombstoneSweep.test.mjs",
   "src/aiRowDiffGate.test.mjs",
+  "src/alignmentAttentionGeneration.test.mjs",
   "src/masterLineagePersist.test.mjs",
   "src/rowRestoreNoop.test.mjs",
   "src/bookTrashSummary.test.mjs",
