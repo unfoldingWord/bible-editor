@@ -8053,6 +8053,20 @@ interface StagedResource {
   // an override that consents to a risk must leave a record of having been
   // used, exactly like idBlockedOverride's raise-instead-of-clear.
   staleBaseOverridden?: StaleBaseHold | null;
+  // Issue #857: the SAME (book, resource) merge-ancestor cutoff
+  // (getMasterConfirmedAt) already fetched a few lines below in this same
+  // staging iteration — at the one instant the staged file's bytes and this
+  // cutoff are guaranteed to describe the same moment. Carried into the prune
+  // step (runChunkedReimport's `reimport-prune-*` loop) so it compares the
+  // staged file against the cutoff that was true when that file was staged,
+  // not one re-read after the chunk-apply steps have run — a concurrent
+  // export advancing this pair's watermark in between could otherwise make
+  // the prune conclude an AI-only row was exported (aiRowContentIsExported)
+  // and delete it, when the staged file predates that export.
+  // Absent (undefined) only on a plan replayed from a Workflow instance that
+  // started before this shipped; the prune step falls back to a fresh read in
+  // that case, same as its pre-#857 behavior.
+  stagedCutoff?: MergeCutoff;
 }
 
 interface ReimportPlan {
@@ -9886,6 +9900,7 @@ async function planAndStageBookResources(
       verifiedComplete,
       lineage,
       confirmedBaseR2Key,
+      stagedCutoff: stageCutoff,
       noBaseCleared: noBaseStats.noBaseCleared,
       // Null on every ordinary night. Non-null ONLY on a force-released
       // stale-base adoption — see the gate above and staleBaseOverridden below.
@@ -10329,15 +10344,23 @@ export async function runChunkedReimport(
     if (!chs || chs.length === 0) continue;
     const r2Key = e.r2Key;
     const verifiedComplete = e.verifiedComplete;
+    const stagedCutoff = e.stagedCutoff;
     const res = await step.do(`reimport-prune-${book}-${kind}`, async () => {
       const raw = await readStaged(env, r2Key);
       if (raw == null) return { deleted: 0, skippedLocked: 0 };
-      // Issue #832: this step runs after the chunk-apply steps above (which
-      // hoist their own cutoff inside reimportStagedChunk's separate call), so
-      // it re-reads the same (book, kind) merge-ancestor cutoff here rather
-      // than threading one through every chunk — one extra read per changed
-      // TSV kind, not per chapter.
-      const cutoff = await getMasterConfirmedAt(env, book, kind);
+      // Issue #857: use the SAME (book, kind) merge-ancestor cutoff that was
+      // read at staging time, alongside the file this prune is about to
+      // compare against it — not a fresh read here. This step runs after the
+      // chunk-apply steps above, so a re-read here can observe a LATER
+      // watermark than the one the staged file actually reflects (a
+      // concurrent export for this same pair can advance
+      // master_confirmed_edit_id in between); comparing that later cutoff
+      // against the older staged file could make an AI-only row look exported
+      // and already-removed-on-master when it is neither, and prune it.
+      // `stagedCutoff` is only absent on a plan replayed from a Workflow
+      // instance that started before this shipped, so this falls back to the
+      // pre-#857 live read (issue #832) in that one case.
+      const cutoff = stagedCutoff ?? (await getMasterConfirmedAt(env, book, kind));
       const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs, verifiedComplete, cutoff);
       if (res.deleted > 0 || res.skippedLocked > 0) {
         console.log("reimport pruned rows removed on master", { book, resource: kind, ...res });
