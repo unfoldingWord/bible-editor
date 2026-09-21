@@ -85,18 +85,33 @@ For your awareness (already implemented):
   UI (`CommentsPopover`), anchored to the chapter's verse-0 "intro" row with
   no `rowKind`/`rowId` (a verse-level comment, `kind: "note"`) — the same
   affordance already used for "add a comment on this verse," not a new UI
-  surface.
+  surface. The comment body must start with an `AI:` marker (case-
+  insensitive, e.g. `AI: mention the covenant theme`) to opt in — an
+  ordinary, unmarked discussion note on the intro (`"looks good"`, an
+  unrelated remark) is never swept into generation guidance. The marker is
+  stripped before the note text is forwarded.
 - **Outbound** (`api/src/pipelines.ts`): at `/api/pipelines/start` time, for
   `pipelineType: "notes"`, the proxy selects all unresolved, non-reply,
-  verse-0, row-less, `kind = "note"` comments in the requested chapter range
-  and folds them into `options.introHints` (see `api/src/introHints.ts`).
-- **Consumption**: sent hints are marked resolved immediately at the same
-  D1-read-at-start-time point the verse hints are captured (see
-  `resolveIntroHintComments`, `api/src/comments.ts`) — not gated on the job
-  finishing, since there's no id to correlate a future apply against. An
-  editor who wants to add more guidance just leaves a new comment (or
-  reopens a resolved one from the comments panel); either way it's picked
-  up by the next run.
+  verse-0, row-less, `kind = "note"` comments in the requested chapter range,
+  keeps only the `AI:`-marked ones, and folds them into `options.introHints`
+  (see `api/src/introHints.ts`).
+- **Consumption**: **not** auto-resolved. Sending a hint doesn't mark its
+  source comment resolved — an editor does that themselves, from the
+  comments panel, once they've confirmed the guidance took effect (exactly
+  how they'd resolve any other comment thread). This was a deliberate
+  design change from an earlier version of this contract that auto-resolved
+  on dispatch: doing so before the job was known to be accepted — let alone
+  before bp-assistant actually consumes this key — could mark a hint
+  "consumed" when nothing ever read it. The cost is a marked hint gets
+  re-sent on every subsequent run for its chapter until resolved; that's
+  cheap given it's an explicit opt-in, not a blanket sweep.
+- **Resume**: `introHints` is stripped from a resumed run's replayed options
+  (`resumeOptionsFromJson`, `api/src/pipelines.ts`), the same way the
+  existing `fresh` option already is — the bot's resume schema doesn't
+  recognize the key yet and rejects unknown keys, so replaying it would 400
+  the whole resume. This means a resumed run doesn't re-send its original
+  `introHints` — acceptable since the hint comment is still there,
+  unresolved, and will be picked up by the next fresh run.
 
 ## Verification
 
@@ -110,12 +125,13 @@ bp-assistant smoke test (once the intro skill consumes `introHints`):
 
 bible-editor smoke test (already testable against `main`):
 
-1. Add one or more internal comments (kind: note) on a chapter's intro
-   (verse 0), leaving them unresolved.
+1. Add an internal comment (kind: note) on a chapter's intro (verse 0)
+   starting with `AI:`, plus a second, unmarked comment in the same spot
+   (ordinary discussion).
 2. Trigger the notes pipeline for that chapter.
 3. Confirm: `pipeline_jobs.options_json` for the created job contains
-   `introHints` with the expected `(chapter, note)` pairs; the source
-   comments are now resolved (and attributed to the user who triggered the
-   run) in the comments panel; triggering the pipeline again for the same
-   chapter sends no `introHints` (nothing left unresolved) unless a new
-   comment was added.
+   `introHints` with the `AI:`-marked comment's text (marker stripped) and
+   nothing from the unmarked one; both comments remain unresolved in the
+   comments panel; triggering the pipeline again for the same chapter sends
+   the same `introHints` again (nothing auto-clears it) until an editor
+   manually resolves the comment.

@@ -31,7 +31,14 @@
 // SQLite engine (see the `wrangler d1 execute --local` verification run
 // alongside this PR), not this stub.
 
-import { forceStopPhrase, forceFailJob, pollPipelineJob, dispatchNext, pollAllNonTerminal } from "./pipelines.ts";
+import {
+  forceStopPhrase,
+  forceFailJob,
+  pollPipelineJob,
+  dispatchNext,
+  pollAllNonTerminal,
+  resumeOptionsFromJson,
+} from "./pipelines.ts";
 import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim.ts";
 
 let failed = 0;
@@ -1188,6 +1195,48 @@ await (async () => {
     `the dispatching-sweep binds exactly 3 args (its threshold + the ambiguous-marker exclusion pair) (got ${dispatchSweep.args.length})`,
   );
 })();
+
+// ─── resumeOptionsFromJson ──────────────────────────────────────────────────
+// Issue #819 review: introHints must be stripped on resume the same way
+// `fresh` already is — the bot's resume schema doesn't recognize either key
+// (fresh because it would destroy the checkpoint being resumed; introHints
+// because bp-assistant doesn't implement it at all yet), and rejects unknown
+// keys, so replaying either would 400 the whole resume.
+{
+  console.log("\n[resumeOptionsFromJson]");
+
+  assert(
+    JSON.stringify(resumeOptionsFromJson(null, "job-1")) === JSON.stringify({}),
+    "no stored options is authoritative empty, not unknown",
+  );
+  assert(
+    resumeOptionsFromJson("not json", "job-1") === undefined,
+    "unparseable options_json is unknown (undefined), not silently empty",
+  );
+  assert(
+    resumeOptionsFromJson("[1,2,3]", "job-1") === undefined,
+    "an array (not an object) is unknown",
+  );
+
+  const withFreshAndHints = JSON.stringify({
+    fresh: true,
+    hints: [{ rowId: "ab12", verse: 3, quote: "x", supportReference: null, seed: null }],
+    introHints: [{ chapter: 3, note: "mention the covenant" }],
+    contentTypes: ["ult"],
+  });
+  const replayed = resumeOptionsFromJson(withFreshAndHints, "job-1");
+  assert(replayed !== undefined, "well-formed options_json resumes with a defined object");
+  assert(!("fresh" in replayed), "fresh is stripped (pre-existing behavior, unregressed)");
+  assert(!("introHints" in replayed), "introHints is stripped — the fix for this review finding");
+  assert(
+    Array.isArray(replayed.hints) && replayed.hints.length === 1,
+    "hints (the already-bot-supported verse-hint key) is NOT stripped — only fresh/introHints are",
+  );
+  assert(
+    Array.isArray(replayed.contentTypes) && replayed.contentTypes[0] === "ult",
+    "ordinary options survive resume untouched",
+  );
+}
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);

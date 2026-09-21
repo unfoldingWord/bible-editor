@@ -29,7 +29,6 @@ import {
   lockedBooksIn,
 } from "./bookLock.ts";
 import { broadcastChapter } from "./wsEvents.ts";
-import { resolveIntroHintComments } from "./comments.ts";
 import { buildIntroHints, type IntroHintCommentRow } from "./introHints.ts";
 
 export const pipelines = new Hono<{
@@ -241,7 +240,14 @@ interface PolledJob {
 // options_json), but the bot's resume schema omits it AND rejects unknown keys,
 // because on the resume path `fresh` would destroy the very checkpoint being
 // resumed. Sending it would 400 the whole resume.
-function resumeOptionsFromJson(
+//
+// `introHints` (issue #819) is stripped for a different reason: it isn't part
+// of the bot's resume schema at all yet (docs/bp-assistant-intro-hints-
+// contract.md is "Proposed", not implemented), so an unrecognized key would
+// 400 the resume the same way a stray `fresh` would. Drop it here rather than
+// gate it at the call site — resumeOptionsFromJson is the one place that must
+// agree with the bot's resume schema, and the /start path is unaffected.
+export function resumeOptionsFromJson(
   optionsJson: string | null,
   jobId: string,
 ): Record<string, unknown> | undefined {
@@ -261,7 +267,7 @@ function resumeOptionsFromJson(
     console.error(`[pipelineResume] job=${jobId} options_json is not an object — cannot replay`);
     return undefined;
   }
-  const { fresh: _fresh, ...rest } = parsed as Record<string, unknown>;
+  const { fresh: _fresh, introHints: _introHints, ...rest } = parsed as Record<string, unknown>;
   return rest;
 }
 
@@ -1715,11 +1721,24 @@ pipelines.post("/start", requireEditor, async (c) => {
       mergedOptions = { ...(mergedOptions ?? {}), hints };
     }
 
-    // Chapter-intro hints (issue #819): unresolved free-text comments an
-    // editor left on a chapter's intro (verse 0, no row — the existing
-    // "comment on this verse" affordance, not a new UI) in the chapter
-    // range. Forwarded as options.introHints alongside options.hints; see
-    // introHints.ts for why the wire shape differs from a verse hint.
+    // Chapter-intro hints (issue #819): free-text comments an editor left on
+    // a chapter's intro (verse 0, no row — the existing "comment on this
+    // verse" affordance, not a new UI) in the chapter range, opted in with a
+    // leading "AI:" marker (see introHints.ts — an ordinary unmarked
+    // discussion note on the intro must not silently become generation
+    // guidance). Forwarded as options.introHints alongside options.hints.
+    //
+    // Deliberately NOT auto-resolved: bp-assistant doesn't consume this key
+    // yet (docs/bp-assistant-intro-hints-contract.md is "Proposed"), and even
+    // once it does, resolving here — before the job is known to have been
+    // accepted, let alone completed — would mark a hint "consumed" when
+    // nothing may have read it (a D1 error on the INSERT below, or the bot
+    // rejecting the dispatch, both leave it resolved with no run carrying
+    // it). An editor resolves it themselves, the same way they already
+    // resolve any other comment thread, once they've checked the guidance
+    // took effect. The cost is a marked hint gets re-sent on every
+    // subsequent run for the chapter until then — harmless, since it's an
+    // explicit opt-in, not a leak of arbitrary comments.
     const introCommentRows = await c.env.DB.prepare(
       `SELECT id, chapter, body
          FROM comments
@@ -1730,28 +1749,9 @@ pipelines.post("/start", requireEditor, async (c) => {
     )
       .bind(book, startChapter, endChapter)
       .all<IntroHintCommentRow>();
-    const introHintRows = introCommentRows.results ?? [];
-    const introHints = buildIntroHints(introHintRows);
+    const introHints = buildIntroHints(introCommentRows.results ?? []);
     if (introHints.length > 0) {
       mergedOptions = { ...(mergedOptions ?? {}), introHints };
-      // Consume now, at the same D1-state-at-start-time point hints above are
-      // captured — not gated on the job actually completing, since (unlike a
-      // verse hint) there's no id round-trip to correlate a future apply
-      // against. An editor who wants to add more just leaves a new comment,
-      // or reopens one of these from the comments panel.
-      const resolvedComments = await resolveIntroHintComments(
-        c.env.DB,
-        introHintRows.map((r) => r.id),
-        userId,
-      );
-      for (const comment of resolvedComments) {
-        c.executionCtx.waitUntil(
-          broadcastChapter(c.env, comment.book, comment.chapter, {
-            type: "comment.updated",
-            comment,
-          }),
-        );
-      }
     }
   }
 

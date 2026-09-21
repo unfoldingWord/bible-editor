@@ -89,7 +89,7 @@ function mapRow(row: CommentRow): CommentDto {
   };
 }
 
-export async function loadComment(db: D1Database, id: number): Promise<CommentDto | null> {
+async function loadComment(db: D1Database, id: number): Promise<CommentDto | null> {
   const row = await db
     .prepare(`${SELECT_COMMENT} WHERE c.id = ?1`)
     .bind(id)
@@ -436,41 +436,6 @@ comments.post("/:id/resolve", async (c) => {
   );
   return c.json(comment);
 });
-
-// Server-triggered counterpart to POST /:id/resolve, called by the notes
-// pipeline dispatcher (pipelines.ts) once a chapter's open intro-hint
-// comments (issue #819) have been folded into an outbound run, so they don't
-// get re-sent on every future regeneration. Attributed to the editor who
-// triggered the run rather than a popover click — mirrors pipelineImport.ts's
-// convention that an AI-driven write is attributed to the human who started
-// it, not left actorless. Returns the resolved comments (already reloaded
-// with their join-derived fields) so the caller can broadcast without a
-// second D1 round trip per id.
-//
-// Kept D1-only (no Hono `c` dependency) so it's testable with the fake-D1
-// stub pattern already used for this Hono-importing file's routes (see
-// pipelinesForceFail.test.mjs) instead of needing the request context.
-export async function resolveIntroHintComments(
-  db: D1Database,
-  ids: number[],
-  userId: number,
-): Promise<CommentDto[]> {
-  if (ids.length === 0) return [];
-  const placeholders = ids.map((_, i) => `?${i + 2}`).join(", ");
-  await db
-    .prepare(
-      `UPDATE comments SET resolved_at = unixepoch(), resolved_by = ?1, updated_at = unixepoch()
-         WHERE id IN (${placeholders}) AND deleted_at IS NULL AND resolved_at IS NULL`,
-    )
-    .bind(userId, ...ids)
-    .run();
-  const resolved: CommentDto[] = [];
-  for (const id of ids) {
-    const comment = await loadComment(db, id);
-    if (comment) resolved.push(comment);
-  }
-  return resolved;
-}
 
 comments.delete("/:id", async (c) => {
   const id = parseInt(c.req.param("id"), 10);

@@ -65,16 +65,6 @@ const EXTRA_IMPORTS = new Map([
   // directly from verseMergeConflicts.ts (issue #760 fail-closed regression
   // test), which in turn imports "./auth" and "./index" without extensions.
   ["src/verseMergeConflicts.test.mjs", "./src/tsResolveHook.mjs"],
-  // commentsIntroHints.test.mjs imports resolveIntroHintComments from
-  // comments.ts (issue #819), which imports "./auth" and "./mentions"
-  // without extensions.
-  ["src/commentsIntroHints.test.mjs", "./src/tsResolveHook.mjs"],
-  // pipelines.ts now imports comments.ts (issue #819's introHints wiring),
-  // which imports "./auth" and "./mentions" without extensions — so both
-  // existing tests that import real functions from pipelines.ts need the
-  // hook too, even though neither touches comments.ts directly.
-  ["src/pipelineDispatchTimeout.test.mjs", "./src/tsResolveHook.mjs"],
-  ["src/pipelinesForceFail.test.mjs", "./src/tsResolveHook.mjs"],
 ]);
 
 function findTestFiles(dir) {
