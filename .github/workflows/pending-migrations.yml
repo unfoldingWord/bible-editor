@@ -1,0 +1,59 @@
+name: Check for pending D1 migrations
+
+# Issue #831: migrations 0066/0067 merged into main and sat unapplied on prod
+# D1 for days. Nothing in the repo surfaced the gap — it was only noticed by
+# someone running `wrangler d1 migrations list` by hand. `deploy.yml` already
+# applies migrations before every deploy, but it is manual-only (deliberately
+# — see its own header), so a merge that nobody follows with a "Run workflow"
+# click leaves prod behind with no signal. This is the "durable part" #831
+# asked for: a loud, visible failure the moment main outruns prod's schema,
+# rather than a silent one nobody notices until a query breaks.
+#
+# Read-only. This workflow never applies a migration — it only lists what
+# prod is missing. Fixing a reported gap is still `npx wrangler d1 migrations
+# apply bible_editor --remote --env production` (or the "Deploy to
+# production" Actions workflow, which chains that before deploying).
+#
+# Deliberately separate from ci.yml: this must never gate a pull request (a
+# migration merged by someone else, or a slow operator, is not this PR's
+# fault), so it only runs on push to main, after the merge has already
+# happened.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: pending-migrations-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: List unapplied prod migrations
+        working-directory: api
+        run: |
+          set -o pipefail
+          output=$(npx wrangler d1 migrations list bible_editor --remote --env production 2>&1)
+          echo "$output"
+          if echo "$output" | grep -q "Migrations to be applied:"; then
+            echo "::error::main has D1 migration(s) merged but not yet applied to production. Run the 'Deploy to production' Actions workflow (it applies migrations before deploying), or from api/: npx wrangler d1 migrations apply bible_editor --remote --env production"
+            exit 1
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

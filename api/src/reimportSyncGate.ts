@@ -201,59 +201,154 @@ export function isSystemicMergeRefusal(
   return refusedCount >= threshold;
 }
 
+// ── Withhold reason (issue #829) ─────────────────────────────────────────────
+//
+// shouldRecordResourceSync above answers "may the watermark be stamped" —
+// this answers "if not, WHICH measured condition said no". The reimport-sync
+// step (bookReimport.ts) persists the answer (syncWithholds.ts) so a later
+// export_stale banner (exportWorkflow.ts's recordStaleSkipAlert) can name the
+// real, measured cause instead of asserting one it never checked: before this,
+// EVERY withhold — a deliberate chapters_locked hold included — got the same
+// "the pre-export sync didn't catch up; re-run the sync" remedy, which for a
+// deliberate hold is not just unmeasured but actively wrong (re-running hits
+// the same hold and changes nothing).
+//
+// Mirrors shouldRecordResourceSync's own precedence exactly, condition for
+// condition, so the two can never disagree about WHETHER to withhold — only
+// this one also says which one fired first. `systemicRefusal` /
+// `mergeRecordFailed` / `applyIncomplete` are the three conditions the
+// reimport-sync step ORs in BESIDE shouldRecordResourceSync (see its call
+// site); they are not part of `counts` because they come from different
+// measurements (isSystemicMergeRefusal, applyVerseRows) this module does not
+// own, so they are checked last, after every condition shouldRecordResourceSync
+// itself would have refused on.
+export type WithholdReason =
+  | "chapters_locked"
+  | "prune_locked"
+  | "conflict_skipped"
+  | "tombstone_blocked"
+  | "counts_incomplete"
+  | "structure_overlap"
+  | "systemic_refusal"
+  | "merge_record_failed"
+  | "apply_incomplete";
+
+export function computeWithholdReason(
+  counts: {
+    chapters_locked?: number;
+    prune_locked?: number;
+    conflict_skipped?: number;
+    tombstone_blocked?: number;
+    counts_incomplete?: boolean;
+    structure_overlap?: number;
+  },
+  idBlockedOverride: boolean = false,
+  systemicRefusal: boolean = false,
+  mergeRecordFailed: boolean = false,
+  applyIncomplete: boolean = false,
+): { reason: WithholdReason; count: number } | null {
+  if (counts.chapters_locked === undefined || counts.prune_locked === undefined) {
+    return { reason: "counts_incomplete", count: 0 };
+  }
+  if (counts.conflict_skipped === undefined || counts.tombstone_blocked === undefined) {
+    return { reason: "counts_incomplete", count: 0 };
+  }
+  if (counts.counts_incomplete === true) return { reason: "counts_incomplete", count: 0 };
+  if ((counts.structure_overlap ?? 0) > 0) {
+    return { reason: "structure_overlap", count: counts.structure_overlap ?? 0 };
+  }
+  if (counts.chapters_locked > 0) return { reason: "chapters_locked", count: counts.chapters_locked };
+  if (counts.prune_locked > 0) return { reason: "prune_locked", count: counts.prune_locked };
+  if (!idBlockedOverride && counts.conflict_skipped > 0) {
+    return { reason: "conflict_skipped", count: counts.conflict_skipped };
+  }
+  if (!idBlockedOverride && counts.tombstone_blocked > 0) {
+    return { reason: "tombstone_blocked", count: counts.tombstone_blocked };
+  }
+  // Every condition shouldRecordResourceSync itself checks is clear — fall
+  // through to the three sibling gates the call site ORs in beside it.
+  if (systemicRefusal) return { reason: "systemic_refusal", count: 0 };
+  if (mergeRecordFailed) return { reason: "merge_record_failed", count: 0 };
+  if (applyIncomplete) return { reason: "apply_incomplete", count: 0 };
+  return null;
+}
+
 // ── Per-book reimport ledger classification (issue #836) ────────────────────
 //
 // The export run's terminal ledger (#833) records one success/skip/failure
-// outcome per book, folded from that book's reimport totals across all its
-// resources. This must mirror the SAME withhold conditions as
-// shouldRecordResourceSync / isSystemicMergeRefusal above, so "recorded
-// success" and "watermark stamped" never diverge:
-//   • FAILURE — a real error left D1 stale and the watermark withheld: a
-//     write batch threw (apply_incomplete), a batch errored (errors), the
-//     conflict record failed (merge_record_failed), a structural overlap
-//     fail-safe fired (structure_overlap), or this run's alignment-refused
-//     verses looked systemic across the book's resources
-//     (isSystemicMergeRefusal — a maintainer's work being reverted at scale,
-//     the same shape as the other "something went wrong" withholds; the
-//     original classifier omitted this and recorded such a run as `success`,
-//     a false green). These are the "something went wrong" withholds.
-//   • SKIP — the sync was DEFERRED, not broken, and the watermark was
-//     withheld for a benign, retriable reason: a pipeline lock
-//     (chapters_locked / prune_locked), an id conflict blocking a row
-//     (conflict_skipped / tombstone_blocked), or an unmeasurable chunk
-//     (counts_incomplete). The next run retries and the export freshness
-//     gate keeps stale D1 off master meanwhile — flagging these as FAILURE
-//     would be false-RED noise.
-//   • SUCCESS — a clean, fully-applied sync (watermark stamped).
+// outcome per book. The FIRST version of this function (#836's initial fix)
+// re-derived it from the book's reimport totals SUMMED across all five
+// resources — which broke the "SUCCESS ⟺ watermark stamped" invariant two
+// ways a multi-model PR review caught before merge:
 //
-// Takes a structural subset of bookReimport.ts's ReimportCounts rather than
-// importing that type, since this module has no imports of its own (every
-// decision here is pure) and bookReimport.ts already imports FROM this file.
-export function classifyReimportOutcome(t: {
-  apply_incomplete?: boolean;
-  errors: string[];
-  merge_record_failed?: boolean;
-  structure_overlap: number;
-  merge_refused: number;
-  chapters_locked: number;
-  prune_locked: number;
-  conflict_skipped: number;
-  tombstone_blocked: number;
-  counts_incomplete?: boolean;
-}): "success" | "skip" | "failure" {
-  if (
-    t.apply_incomplete ||
-    t.errors.length > 0 ||
-    t.merge_record_failed ||
-    t.structure_overlap > 0 ||
-    isSystemicMergeRefusal(t.merge_refused ?? 0)
-  ) {
-    return "failure";
+//   1. isSystemicMergeRefusal compares a THRESHOLD (SYSTEMIC_MERGE_REFUSAL_
+//      THRESHOLD, currently 5), not a "any nonzero" check like the other
+//      counters. Summing merge_refused across resources before comparing
+//      against that same threshold can trip it on a book where every
+//      INDIVIDUAL resource stayed under threshold and every watermark was
+//      actually stamped (ult: 3, ust: 2 → sums to 5, but the real gate
+//      (bookReimport.ts's reimport-sync step) checks each resource's own
+//      count and withheld nothing) — a false RED.
+//   2. `mergeRefusalOverrideAllowed`'s escape hatch (FIX H) is scoped to one
+//      resource and forces isSystemicMergeRefusal's gate open for it. A
+//      summed-totals re-derivation has no way to know which resource that
+//      was, so it reported failure at the exact moment a maintainer verified
+//      and overrode a real watermark stamp.
+//
+// The fix: classify from the SAME per-resource decision the reimport-sync
+// step actually made, via computeWithholdReason (this function's sibling,
+// just above) applied to EACH resource's own counts — never a book-level
+// sum. `errors` is intentionally checked outside computeWithholdReason
+// (its own doc notes it does not consider that field) per the issue's
+// explicit guidance.
+export function classifyReimportOutcome(
+  perResource: Record<
+    string,
+    {
+      chapters_locked?: number;
+      prune_locked?: number;
+      conflict_skipped?: number;
+      tombstone_blocked?: number;
+      counts_incomplete?: boolean;
+      structure_overlap?: number;
+      merge_refused?: number;
+      merge_record_failed?: boolean;
+      apply_incomplete?: boolean;
+      errors?: string[];
+    }
+  >,
+  // The one resource (if any) this run's overrides apply to — mirrors
+  // mergeRefusalOverrideResource / idBlockedOverrideResource in
+  // runChunkedReimport's opts, both scoped to a single named resource.
+  mergeRefusalOverrideResource?: string,
+  idBlockedOverrideResource?: string,
+): "success" | "skip" | "failure" {
+  const FAILURE_REASONS: ReadonlySet<WithholdReason> = new Set([
+    "apply_incomplete",
+    "merge_record_failed",
+    "structure_overlap",
+    "systemic_refusal",
+  ]);
+  let sawSkip = false;
+  for (const [resource, t] of Object.entries(perResource)) {
+    if ((t.errors?.length ?? 0) > 0) return "failure";
+    const systemicRefusal = isSystemicMergeRefusal(
+      t.merge_refused ?? 0,
+      undefined,
+      resource === mergeRefusalOverrideResource,
+    );
+    const withhold = computeWithholdReason(
+      t,
+      resource === idBlockedOverrideResource,
+      systemicRefusal,
+      t.merge_record_failed === true,
+      t.apply_incomplete === true,
+    );
+    if (!withhold) continue;
+    if (FAILURE_REASONS.has(withhold.reason)) return "failure";
+    sawSkip = true;
   }
-  if (t.chapters_locked || t.prune_locked || t.conflict_skipped || t.tombstone_blocked || t.counts_incomplete) {
-    return "skip";
-  }
-  return "success";
+  return sawSkip ? "skip" : "success";
 }
 
 // ── Kept-over-Door43 scale alarm (#540 item 2's "keep_ai_master") ───────────

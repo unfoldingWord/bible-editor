@@ -25,6 +25,7 @@ import {
   KEPT_OVER_DOOR43_ALERT_THRESHOLD,
   mergeRefusalOverrideAllowed,
   idBlockedOverrideAllowed,
+  computeWithholdReason,
   classifyReimportOutcome,
 } from "./reimportSyncGate.ts";
 
@@ -534,77 +535,269 @@ eq(
   "999 kept-over-Door43 rows still stamp the watermark — this outcome never withholds",
 );
 
+console.log("\n[computeWithholdReason] (issue #829)");
+
+// Agreement property: computeWithholdReason must return null exactly when the
+// reimport-sync step's full withhold condition (shouldRecordResourceSync OR
+// systemicRefusal OR mergeRecordFailed OR applyIncomplete) is false, and
+// non-null exactly when it is true. Exercised across the same matrix
+// shouldRecordResourceSync's own tests above use, plus the three sibling
+// flags, so the two can never silently disagree about WHETHER to withhold.
+function agrees(c, idBlockedOverride, systemicRefusal, mergeRecordFailed, applyIncomplete) {
+  const gate = Boolean(
+    !shouldRecordResourceSync(c, idBlockedOverride) || systemicRefusal || mergeRecordFailed || applyIncomplete,
+  );
+  const reason = computeWithholdReason(c, idBlockedOverride, systemicRefusal, mergeRecordFailed, applyIncomplete);
+  return gate === (reason !== null);
+}
+
+eq(agrees(counts()), true, "ordinary clean run: gate and reason agree (both say stamp)");
+eq(
+  computeWithholdReason(counts()),
+  null,
+  "ordinary clean run → no withhold reason",
+);
+
+// One case per reason, matching shouldRecordResourceSync's own cases above —
+// each must name the SPECIFIC condition that fired, not just "withheld".
+eq(
+  computeWithholdReason(counts({ chapters_locked: 3 }))?.reason,
+  "chapters_locked",
+  "chapters_locked > 0 → reason names chapters_locked",
+);
+eq(computeWithholdReason(counts({ chapters_locked: 3 }))?.count, 3, "…and carries the measured count");
+eq(agrees(counts({ chapters_locked: 3 })), true, "chapters_locked case: gate and reason agree");
+
+eq(
+  computeWithholdReason(counts({ prune_locked: 2 }))?.reason,
+  "prune_locked",
+  "prune_locked > 0 (chapters_locked clean) → reason names prune_locked",
+);
+eq(agrees(counts({ prune_locked: 2 })), true, "prune_locked case: gate and reason agree");
+
+eq(
+  computeWithholdReason(counts({ conflict_skipped: 1 }))?.reason,
+  "conflict_skipped",
+  "conflict_skipped > 0 → reason names conflict_skipped",
+);
+eq(agrees(counts({ conflict_skipped: 1 })), true, "conflict_skipped case: gate and reason agree");
+
+eq(
+  computeWithholdReason(counts({ tombstone_blocked: 6 }))?.reason,
+  "tombstone_blocked",
+  "tombstone_blocked > 0 (the 1CH 23 tQ shape) → reason names tombstone_blocked",
+);
+eq(agrees(counts({ tombstone_blocked: 6 })), true, "tombstone_blocked case: gate and reason agree");
+
+// idBlockedOverride opens conflict_skipped/tombstone_blocked, same as the gate.
+eq(
+  computeWithholdReason(counts({ conflict_skipped: 1 }), true),
+  null,
+  "idBlockedOverride opens conflict_skipped, same as the gate → no withhold reason",
+);
+eq(
+  computeWithholdReason(counts({ tombstone_blocked: 1 }), true),
+  null,
+  "idBlockedOverride opens tombstone_blocked, same as the gate → no withhold reason",
+);
+
+eq(
+  computeWithholdReason(counts({ structure_overlap: 1 }))?.reason,
+  "structure_overlap",
+  "structure_overlap > 0 → reason names structure_overlap",
+);
+// idBlockedOverride must NOT open structure_overlap — same as the gate.
+eq(
+  computeWithholdReason(counts({ structure_overlap: 1 }), true)?.reason,
+  "structure_overlap",
+  "idBlockedOverride does not open structure_overlap, same as the gate",
+);
+
+eq(
+  computeWithholdReason(counts({ counts_incomplete: true }))?.reason,
+  "counts_incomplete",
+  "counts_incomplete flag → reason names counts_incomplete",
+);
+eq(
+  computeWithholdReason({})?.reason,
+  "counts_incomplete",
+  "counts object missing chapters_locked/prune_locked entirely → reason names counts_incomplete (fail-safe, not a lock)",
+);
+eq(
+  computeWithholdReason({ chapters_locked: 0, prune_locked: 0 })?.reason,
+  "counts_incomplete",
+  "counts object missing conflict_skipped/tombstone_blocked → reason names counts_incomplete",
+);
+
+// The three sibling flags the call site ORs in beside shouldRecordResourceSync —
+// only reachable once every measured counter is clean, same order as the `if`.
+eq(
+  computeWithholdReason(counts(), false, true)?.reason,
+  "systemic_refusal",
+  "clean counts + systemicRefusal → reason names systemic_refusal",
+);
+eq(
+  computeWithholdReason(counts(), false, false, true)?.reason,
+  "merge_record_failed",
+  "clean counts + mergeRecordFailed → reason names merge_record_failed",
+);
+eq(
+  computeWithholdReason(counts(), false, false, false, true)?.reason,
+  "apply_incomplete",
+  "clean counts + applyIncomplete → reason names apply_incomplete",
+);
+// A measured counter takes priority over the sibling flags — matches the `if`
+// condition's evaluation order (shouldRecordResourceSync checked first).
+eq(
+  computeWithholdReason(counts({ chapters_locked: 1 }), false, true, true, true)?.reason,
+  "chapters_locked",
+  "chapters_locked outranks every sibling flag, same as the gate's own precedence",
+);
+eq(agrees(counts({ chapters_locked: 1 }), false, true, true, true), true, "combined case: gate and reason agree");
+
 console.log("\n[classifyReimportOutcome]");
 
-// Book-level totals shape used by exportWorkflow.ts's reimport ledger — a
-// superset of the (book, resource) `counts()` helper above, folding in the
-// fields classifyReimportOutcome also inspects.
-function reimportTotals(overrides = {}) {
+// Per-resource counts shape — classifyReimportOutcome's callers hand it
+// res.perResource (bookReimport.ts), a Record<Resource, ReimportCounts>, so
+// tests build the same shape keyed by whatever resource names matter to the
+// case rather than a single book-level totals object.
+function resourceCounts(overrides = {}) {
   return {
     ...counts(),
+    merge_refused: 0,
     merge_record_failed: false,
     structure_overlap: 0,
-    merge_refused: 0,
     apply_incomplete: false,
     ...overrides,
   };
 }
 
-eq(classifyReimportOutcome(reimportTotals()), "success", "clean totals → success");
-
-// Issue #836: this classifier used to omit isSystemicMergeRefusal entirely,
-// so a book withheld SOLELY because its alignment-refused verses crossed the
-// systemic threshold was recorded `success` — a false green in the ledger,
-// even though the (book, resource) watermark was withheld.
 eq(
-  classifyReimportOutcome(reimportTotals({ merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD })),
-  "failure",
-  "systemic_refusal alone (merge_refused at threshold) → failure, not success",
-);
-eq(
-  classifyReimportOutcome(reimportTotals({ merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD - 1 })),
+  classifyReimportOutcome({ ult: resourceCounts(), ust: resourceCounts() }),
   "success",
-  "merge_refused just under the systemic threshold → still success",
+  "every resource clean → success",
 );
 
-// The pre-existing failure/skip conditions must keep working unchanged.
+// Issue #836's original gap: a book withheld solely for a systemic merge
+// refusal must record failure, not success.
 eq(
-  classifyReimportOutcome(reimportTotals({ apply_incomplete: true })),
+  classifyReimportOutcome({ ult: resourceCounts({ merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD }) }),
+  "failure",
+  "one resource at the systemic-refusal threshold → failure",
+);
+
+// PR REVIEW FINDING 1: a book-level SUM across resources must never be
+// compared to the (per-resource) systemic threshold. Two resources each
+// under threshold, summing to it or past it, is not a systemic refusal in
+// either resource — the real gate (bookReimport.ts) evaluates each
+// resource's own merge_refused count, and BOTH of these watermarks were
+// actually stamped.
+eq(
+  classifyReimportOutcome({
+    ult: resourceCounts({ merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD - 2 }),
+    ust: resourceCounts({ merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD - 3 }),
+  }),
+  "success",
+  "merge_refused split across resources, summing to/past the threshold, neither resource individually systemic → success (not the book-sum false RED)",
+);
+// The contrast case: the SAME split, but one resource alone now reaches the
+// threshold — that resource's watermark really was withheld.
+eq(
+  classifyReimportOutcome({
+    ult: resourceCounts({ merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD }),
+    ust: resourceCounts({ merge_refused: 1 }),
+  }),
+  "failure",
+  "one resource alone crosses the threshold → failure, regardless of a clean sibling",
+);
+
+// PR REVIEW FINDING 2: mergeRefusalOverrideAllowed's escape hatch is scoped
+// to ONE resource and must be honoured — a maintainer who verified and
+// overrode a real refusal sees the ledger agree with the watermark that was
+// actually stamped.
+eq(
+  classifyReimportOutcome(
+    { ult: resourceCounts({ merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD }) },
+    "ult",
+  ),
+  "success",
+  "override matches the refusing resource → success (the watermark WAS stamped)",
+);
+eq(
+  classifyReimportOutcome(
+    {
+      ult: resourceCounts({ merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD }),
+      ust: resourceCounts(),
+    },
+    "ust",
+  ),
+  "failure",
+  "override for a DIFFERENT resource than the one refusing → still failure (override never leaks across resources)",
+);
+
+// The pre-existing failure/skip conditions must keep working per-resource.
+eq(
+  classifyReimportOutcome({ ult: resourceCounts({ apply_incomplete: true }) }),
   "failure",
   "apply_incomplete → failure",
 );
-eq(classifyReimportOutcome(reimportTotals({ errors: ["boom"] })), "failure", "a batch error → failure");
 eq(
-  classifyReimportOutcome(reimportTotals({ merge_record_failed: true })),
+  classifyReimportOutcome({ ult: resourceCounts({ errors: ["boom"] }) }),
+  "failure",
+  "a batch error → failure (computeWithholdReason does not see errors, so this is checked independently)",
+);
+eq(
+  classifyReimportOutcome({ ult: resourceCounts({ merge_record_failed: true }) }),
   "failure",
   "merge_record_failed → failure",
 );
 eq(
-  classifyReimportOutcome(reimportTotals({ structure_overlap: 1 })),
+  classifyReimportOutcome({ ult: resourceCounts({ structure_overlap: 1 }) }),
   "failure",
   "structure_overlap > 0 → failure",
 );
 eq(
-  classifyReimportOutcome(reimportTotals({ chapters_locked: 1 })),
+  classifyReimportOutcome({ ult: resourceCounts({ chapters_locked: 1 }) }),
   "skip",
   "chapters_locked (no failure condition) → skip",
 );
 eq(
-  classifyReimportOutcome(reimportTotals({ counts_incomplete: true })),
+  classifyReimportOutcome({ ult: resourceCounts({ counts_incomplete: true }) }),
   "skip",
   "counts_incomplete (no failure condition) → skip",
 );
-// A failure condition alongside a skip condition must still read as failure —
-// mirrors the isSystemicMergeRefusal-first ordering above.
+// A failure condition in one resource must win over a simultaneous skip
+// condition in a different resource — mirrors classifyReimportOutcome's
+// return-on-first-failure ordering.
 eq(
-  classifyReimportOutcome(reimportTotals({ chapters_locked: 1, apply_incomplete: true })),
+  classifyReimportOutcome({
+    ult: resourceCounts({ chapters_locked: 1 }),
+    ust: resourceCounts({ apply_incomplete: true }),
+  }),
   "failure",
-  "failure condition takes priority over a simultaneous skip condition",
+  "a failure condition in one resource outranks a skip condition in another",
+);
+
+// Bonus consistency fix alongside the review's two findings: idBlockedOverride
+// (FIX 1, issue #473 option A) is ALSO scoped to one resource and was
+// likewise ignored by the book-sum version — classifyReimportOutcome now
+// threads it through computeWithholdReason exactly like the real gate does.
+eq(
+  classifyReimportOutcome({ ult: resourceCounts({ conflict_skipped: 1 }) }, undefined, "ult"),
+  "success",
+  "idBlockedOverride for the blocked resource → success (the watermark WAS stamped)",
+);
+eq(
+  classifyReimportOutcome({ ult: resourceCounts({ conflict_skipped: 1 }) }),
+  "skip",
+  "same case with no override → skip (conflict_skipped withholds, but is not a failure-class reason)",
 );
 
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
 } else {
-  console.log("\nAll shouldRecordResourceSync / isSystemicMergeRefusal / classifyReimportOutcome checks passed.");
+  console.log(
+    "\nAll shouldRecordResourceSync / isSystemicMergeRefusal / computeWithholdReason / classifyReimportOutcome checks passed.",
+  );
 }
