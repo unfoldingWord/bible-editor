@@ -74,6 +74,16 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
+import { appendSystemRecord, reconcileReviewAlert, reviewConditionKey } from "./reviewAlerts.ts";
+import { appendSyncRunEvent, syncRunEventKey } from "./syncRunLog.ts";
+import {
+  CLAIM_EXPORT_REVERT_GENERATION_SQL,
+  DELETE_EXPORT_REVERTS_FOR_GENERATION_SQL,
+  INSERT_EXPORT_REVERT_FOR_GENERATION_SQL,
+  INSERT_EXPORT_RECORD_FOR_GENERATION_SQL,
+  RESOLVE_EXPORT_REVERT_PERSISTENCE_FOR_GENERATION_SQL,
+  SELECT_EXPORT_REVERT_GENERATION_SQL,
+} from "./exportRevertGeneration.ts";
 import {
   runChunkedReimport,
   storedResourceSha,
@@ -204,6 +214,25 @@ export interface StepResult {
   prReason: string | null;
 }
 
+// Tally per-book reimport outcomes for the run's terminal ledger (#833 review):
+// success = clean sync, skip = deferred (lock / id-block, retried next run),
+// failure = a real error (a thrown/errored write that left D1 stale). Only
+// failure gates the run's completed_with_failures status; skip is neither green
+// nor red.
+function summarizeReimport(
+  outcomes: Array<{ status: "success" | "skip" | "failure" }>,
+): { successCount: number; skipCount: number; failureCount: number } {
+  let successCount = 0;
+  let skipCount = 0;
+  let failureCount = 0;
+  for (const o of outcomes) {
+    if (o.status === "failure") failureCount++;
+    else if (o.status === "skip") skipCount++;
+    else successCount++;
+  }
+  return { successCount, skipCount, failureCount };
+}
+
 const isResource = (s: string): s is Resource => (ALL_RESOURCES as string[]).includes(s);
 
 export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
@@ -212,8 +241,122 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     totalSteps: number;
     results: StepResult[];
   }> {
-    const params = event.payload ?? {};
+    const workflowRunId = event.instanceId;
     const instanceId = `export-${new Date(event.timestamp).toISOString().replace(/[:.]/g, "-")}`;
+    const observedAt = event.timestamp.getTime();
+    const params = event.payload ?? {};
+    await step.do("ledger-run-started", async () =>
+      appendSyncRunEvent(this.env, {
+        runId: workflowRunId,
+        eventKey: syncRunEventKey(workflowRunId, "run_started"),
+        eventType: "run_started",
+        occurredAt: observedAt,
+        status: "started",
+        details: {
+          book: params.book ?? null,
+          resource: params.resource ?? null,
+          resources: params.resources ?? null,
+          reimportOnly: params.reimportOnly === true,
+          validateAndMerge: params.validateAndMerge === true,
+          dryDcs: params.dryDcs === true,
+        },
+      }),
+    );
+    try {
+      const result = await this.runCore(event, step, instanceId, observedAt, workflowRunId);
+      const counts = this.ledgerCounts(result.results);
+      // A reimport-only self-heal run produces no export results, so its per-book
+      // sync failures are caught inside runCore and surfaced only via this
+      // summary — fold them into the terminal status so the dashboard never
+      // reports a failed self-heal as a clean "completed" (#827 review).
+      const failureCount = counts.failureCount + result.reimport.failureCount;
+      await step.do("ledger-run-completed", async () =>
+        appendSyncRunEvent(this.env, {
+          runId: workflowRunId,
+          eventKey: syncRunEventKey(workflowRunId, "run_completed"),
+          eventType: "run_completed",
+          occurredAt: Date.now(),
+          status: failureCount ? "completed_with_failures" : "completed",
+          details: { ...counts, reimport: result.reimport, totalSteps: result.totalSteps },
+        }),
+      );
+      return result;
+    } catch (error) {
+      await step.do("ledger-run-completed", async () =>
+        appendSyncRunEvent(this.env, {
+          runId: workflowRunId,
+          eventKey: syncRunEventKey(workflowRunId, "run_completed"),
+          eventType: "run_completed",
+          occurredAt: Date.now(),
+          status: "failed",
+          details: { error: (error instanceof Error ? error.message : String(error)).slice(0, 180) },
+        }),
+      );
+      throw error;
+    }
+  }
+
+  private ledgerCounts(results: StepResult[]) {
+    let successCount = 0;
+    let skipCount = 0;
+    let failureCount = 0;
+    for (const result of results) {
+      if ((result.dcsSkippedReason ?? "").startsWith("error:")) failureCount++;
+      else if (result.dcsSkippedReason) skipCount++;
+      else successCount++;
+    }
+    return { itemCount: results.length, successCount, skipCount, failureCount };
+  }
+
+  private async recordLedgerItem(
+    step: WorkflowStep,
+    stepName: string,
+    runId: string,
+    occurredAt: number,
+    result: StepResult,
+    status?: "success" | "skip" | "failure",
+  ) {
+    const itemStatus = status ?? ((result.dcsSkippedReason ?? "").startsWith("error:")
+      ? "failure"
+      : result.dcsSkippedReason
+        ? "skip"
+        : "success");
+    await step.do(`ledger-${stepName}-terminal`, async () =>
+      appendSyncRunEvent(this.env, {
+        runId,
+        eventKey: syncRunEventKey(runId, "item_terminal", result.book, result.resource),
+        eventType: "item_terminal",
+        occurredAt,
+        status: itemStatus,
+        book: result.book,
+        resource: result.resource,
+        details: {
+          rowCount: result.rowCount,
+          bytes: result.bytes,
+          dcsChanged: result.dcsChanged,
+          dcsSkippedReason: result.dcsSkippedReason,
+          branch: result.branch,
+          dcsCommitSha: result.dcsCommitSha,
+          prNumber: result.prNumber,
+          prReason: result.prReason,
+        },
+      }),
+    );
+  }
+
+  private async runCore(
+    event: WorkflowEvent<ExportParams>,
+    step: WorkflowStep,
+    instanceId: string,
+    alertObservedAt: number,
+    workflowRunId: string,
+  ): Promise<{
+    instanceId: string;
+    totalSteps: number;
+    results: StepResult[];
+    reimport: { successCount: number; skipCount: number; failureCount: number };
+  }> {
+    const params = event.payload ?? {};
 
     // 1. Resolve the books list.
     const books = await step.do("list-books", async () => {
@@ -298,6 +441,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     //     wrapped in try/catch so a single book's failure can't abort the whole
     //     export instance — same shape as the post-export reimport loop. Gated
     //     on dcsAllowed: a dry run / no-token run shouldn't mutate D1.
+    // Per-book reimport outcomes, surfaced in the run's terminal ledger (#827
+    // review): a reimport-only (08:00 self-heal) run whose per-book syncs fail
+    // is caught below and never reaches the export results, so without this the
+    // ledger would report a clean "completed" and the dashboard's Items/Failed
+    // columns (derived from item_terminal events) would show 0/0.
+    const reimportOutcomes: Array<{ book: string; status: "success" | "skip" | "failure" }> = [];
     if (dcsAllowed || params.reimportOnly) {
       // Scope the reimport to `resources` when the caller named specific ones
       // (the admin "Pull from Door43" control), else fall back to the
@@ -317,11 +466,39 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // Chunked + SHA-gated + diff-aware reimport — steps through chapters so
           // a large book can't blow the 10-min step limit, and skips files whose
           // DCS commit SHA is unchanged. See bookReimport.ts:runChunkedReimport.
-          await runChunkedReimport(this.env, step, book, instanceId, reimportResources, {
+          const res = await runChunkedReimport(this.env, step, book, instanceId, reimportResources, {
             mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
           });
+          // runChunkedReimport resolves normally in three distinct outcomes and
+          // the ledger must tell them apart (#833 review). The split mirrors
+          // shouldRecordResourceSync (reimportSyncGate.ts), the authority on
+          // whether the watermark was stamped, so SUCCESS ⟺ watermark stamped:
+          //   • FAILURE — a real error left D1 stale and the watermark withheld:
+          //     a write batch threw (apply_incomplete), a batch errored
+          //     (errors), the conflict record failed (merge_record_failed), or a
+          //     structural overlap fail-safe fired (structure_overlap). These
+          //     are the "something went wrong" withholds.
+          //   • SKIP — the sync was DEFERRED, not broken, and the watermark was
+          //     withheld for a benign, retriable reason: a pipeline lock
+          //     (chapters_locked / prune_locked), an id conflict blocking a row
+          //     (conflict_skipped / tombstone_blocked), or an unmeasurable chunk
+          //     (counts_incomplete). The next run retries and the export
+          //     freshness gate keeps stale D1 off master meanwhile — flagging
+          //     these as FAILURE would be false-RED noise. NOTE: skipped_locked
+          //     is deliberately excluded — it is a row-level counter that
+          //     shouldRecordResourceSync ignores, so it does NOT withhold the
+          //     watermark and must not force a skip.
+          //   • SUCCESS — a clean, fully-applied sync (watermark stamped).
+          const t = res.totals;
+          const status: "success" | "skip" | "failure" =
+            t.apply_incomplete || t.errors.length > 0 || t.merge_record_failed || t.structure_overlap > 0
+              ? "failure"
+              : t.chapters_locked || t.prune_locked || t.conflict_skipped || t.tombstone_blocked || t.counts_incomplete
+                ? "skip"
+                : "success";
+          reimportOutcomes.push({ book, status });
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
           // this book's D1 is now possibly stale relative to master. The
@@ -329,6 +506,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // commit a stale render, so a failed sync no longer reverts master —
           // it just skips this book's export until a later sync succeeds. Alert
           // so the failure is visible rather than silently swallowed.
+          reimportOutcomes.push({ book, status: "failure" });
           const msg = e instanceof Error ? e.message : String(e);
           console.error("export pre-reimport failed", { book, error: msg });
           try {
@@ -404,7 +582,38 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // Self-heal mode (08:00 REIMPORT_CRON): D1 is now synced from DCS; there's
     // nothing to render or commit, so stop before the export steps below.
     if (params.reimportOnly) {
-      return { instanceId, totalSteps: 0, results: [] };
+      // A reimport-only self-heal renders no export items, so record one terminal
+      // item per book — the dashboard's Items/Failed columns are summed from
+      // item_terminal events (admin.ts /sync-runs), and without these a failed
+      // self-heal would show 0/0. Per book (not per (book, resource)) keeps a
+      // full ~66-book self-heal well under the subrequest budget. Best-effort,
+      // like every other ledger write.
+      for (const o of reimportOutcomes) {
+        try {
+          await step.do(`ledger-reimport-${o.book}-terminal`, async () =>
+            appendSyncRunEvent(this.env, {
+              runId: workflowRunId,
+              eventKey: syncRunEventKey(workflowRunId, "item_terminal", o.book),
+              eventType: "item_terminal",
+              occurredAt: Date.now(),
+              status: o.status,
+              book: o.book,
+              details: { reimportOnly: true },
+            }),
+          );
+        } catch (e) {
+          console.error("ledger reimport item record failed", {
+            book: o.book,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+      return {
+        instanceId,
+        totalSteps: 0,
+        results: [],
+        reimport: summarizeReimport(reimportOutcomes),
+      };
     }
 
     // 1c. Resolve which books are currently locked (published, or explicitly
@@ -448,6 +657,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     for (const resource of resources) {
       for (const book of books) {
         const stepName = `export-${book}-${resource}`;
+        let itemResult: StepResult;
         try {
           const result = await step.do(
             stepName,
@@ -462,9 +672,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 lockedBooks,
                 lockOverride,
                 branchOverride,
+                alertObservedAt,
               ),
           );
           results.push(result);
+          itemResult = result;
         } catch (e) {
           // A single (book, resource) failure — most commonly a corrupt/dangling
           // DCS branch ref that ensureBranchVisible can't heal — must not abort
@@ -482,7 +694,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           } catch {
             /* recording the failure is best-effort; never let it abort the run */
           }
-          results.push({
+          itemResult = {
             book,
             resource,
             rowCount: 0,
@@ -494,6 +706,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             dcsSkippedReason: `error:${reason.slice(0, 180)}`,
             prNumber: null,
             prReason: null,
+          };
+          results.push(itemResult);
+        }
+        // Ledger item_terminal is recorded OUTSIDE the export try/catch above:
+        // a telemetry failure here must not re-enter the catch (which would
+        // fabricate a second, error-flagged result for an export that actually
+        // succeeded) nor abort the run. Best-effort, like every other ledger
+        // call. recordLedgerItem derives success/skip/failure from the result.
+        try {
+          await this.recordLedgerItem(step, stepName, workflowRunId, Date.now(), itemResult);
+        } catch (e) {
+          console.error("export ledger item record failed", {
+            book,
+            resource,
+            error: e instanceof Error ? e.message : String(e),
           });
         }
       }
@@ -519,7 +746,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       console.error("export lint-escalate failed", { error: e instanceof Error ? e.message : String(e) });
     }
 
-    return { instanceId, totalSteps: results.length, results };
+    return {
+      instanceId,
+      totalSteps: results.length,
+      results,
+      reimport: summarizeReimport(reimportOutcomes),
+    };
   }
 
   // Lint each book's rendered scripture for footnote imbalance and raise/clear an
@@ -586,6 +818,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     lockedBooks: Set<string>,
     allowLocked: boolean,
     branchOverride: string | null = null,
+    alertObservedAt = Date.now(),
   ): Promise<StepResult> {
     // Clear any undismissed banner the removed blank-field HOLD gate left behind
     // (see the long note further down for why that gate is gone). Its text says
@@ -1147,6 +1380,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         built.content,
         built.readAt,
         built.editBoundary,
+        r2Key,
         commit.contentSha,
         isMasterConfirmed(commit),
       );
@@ -1178,7 +1412,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
         const report = usfmRevertReport(built.content, usfmMasterContentForRevertReport as string);
-        await this.recordExportRevertReport(book, resource, "usfm", report.entries, mechanical, branch);
+        await this.recordExportRevertReport(book, resource, "usfm", report.entries, mechanical, branch, instanceId, alertObservedAt);
       } else if (
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
@@ -1188,7 +1422,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           tsvMasterContentForRevertReport as string,
           resource as "tn" | "tq" | "twl",
         );
-        await this.recordExportRevertReport(book, resource, "tsv", report.entries, mechanical, branch);
+        await this.recordExportRevertReport(book, resource, "tsv", report.entries, mechanical, branch, instanceId, alertObservedAt);
       }
 
       if (!commit.branchTouched) {
@@ -2235,21 +2469,45 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // throw and the `catch` below would silently log it while the alert still
   // told the operator the report was recorded. There is no single-transaction
   // way to keep that atomicity AND stay under D1's per-batch statement cap, so
-  // this now chunks: the DELETE runs alone first (it must land before any
-  // INSERT — a stale delete-less write would leave last night's rows mixed
-  // with tonight's), then each chunk of inserts is its own `.batch()` call. A
-  // chunk failing partway leaves the table holding only the entries from
-  // chunks that already committed — a real partial write, not a silently
-  // truncated one, because the caller is told `false` and must say so.
+  // this now chunks under a per-(book,resource) generation claim. Every DELETE
+  // and INSERT rechecks the claim, so an overlapping older workflow cannot
+  // erase or mix rows into a newer snapshot. A chunk failure remains a visible
+  // partial write: the caller receives `failed` and raises the distinct
+  // persistence condition rather than claiming the report is complete.
+  private async claimExportRevertGeneration(
+    book: string,
+    resource: Resource,
+    generation: string,
+    observedAt: number,
+  ): Promise<"claimed" | "superseded" | "failed"> {
+    try {
+      const result = await this.env.DB.prepare(CLAIM_EXPORT_REVERT_GENERATION_SQL)
+        .bind(book, resource, generation, observedAt)
+        .run();
+      return (result.meta?.changes ?? 0) > 0 ? "claimed" : "superseded";
+    } catch (e) {
+      console.error("export revert generation claim failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return "failed";
+    }
+  }
+
   private async recordExportReverts(
     book: string,
     resource: Resource,
     entries: Array<UsfmRevertEntry | TsvRevertEntry>,
-  ): Promise<boolean> {
-    if (entries.length === 0) return true;
+    generation: string,
+    observedAt: number,
+  ): Promise<"recorded" | "superseded" | "failed"> {
+    if (entries.length === 0) return "recorded";
+    const claim = await this.claimExportRevertGeneration(book, resource, generation, observedAt);
+    if (claim !== "claimed") return claim;
     try {
-      await this.env.DB.prepare(`DELETE FROM export_reverts WHERE book = ?1 AND resource = ?2`)
-        .bind(book, resource)
+      await this.env.DB.prepare(DELETE_EXPORT_REVERTS_FOR_GENERATION_SQL)
+        .bind(book, resource, generation, observedAt)
         .run();
     } catch (e) {
       console.error("export revert report delete failed", {
@@ -2259,7 +2517,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       });
       // Old rows (if any) are left standing — stale, but not silently wrong:
       // the caller must not claim this run's findings were recorded.
-      return false;
+      return "failed";
     }
     for (let i = 0; i < entries.length; i += REVERT_WRITE_BATCH) {
       const slice = entries.slice(i, i + REVERT_WRITE_BATCH);
@@ -2271,9 +2529,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
               // so a duplicate ref within THIS chunk would otherwise violate
               // the unique index and roll back the rest of the chunk — same
               // rationale as recordAlignmentAttention's INSERT.
-              `INSERT OR REPLACE INTO export_reverts (book, resource, ref, class, fields)
-               VALUES (?1, ?2, ?3, ?4, ?5)`,
-            ).bind(book, resource, e.ref, e.class, "fields" in e && e.fields ? JSON.stringify(e.fields) : null),
+              INSERT_EXPORT_REVERT_FOR_GENERATION_SQL,
+            ).bind(
+              book,
+              resource,
+              e.ref,
+              e.class,
+              "fields" in e && e.fields ? JSON.stringify(e.fields) : null,
+              generation,
+              observedAt,
+            ),
           ),
         );
       } catch (e) {
@@ -2284,10 +2549,22 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           chunkSize: slice.length,
           error: e instanceof Error ? e.message : String(e),
         });
-        return false;
+        return "failed";
       }
     }
-    return true;
+    try {
+      const current = await this.env.DB.prepare(SELECT_EXPORT_REVERT_GENERATION_SQL)
+        .bind(book, resource, generation, observedAt)
+        .first<{ ok: number }>();
+      return current ? "recorded" : "superseded";
+    } catch (e) {
+      console.error("export revert generation verify failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return "failed";
+    }
   }
 
   // Record the render we just handed to Door43 for this (book, resource)
@@ -2333,6 +2610,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // master_confirmed_edit_id on the same confirmMaster gate as
     // master_confirmed_at. null only when edit_log is empty.
     editBoundary: number | null,
+    // #790: R2 object containing these exact render bytes. Guarded by the
+    // same pushed_read_at comparison as the blob/read/edit trio below.
+    r2Key: string,
     giteaBlobSha: string,
     confirmMaster: boolean,
   ): Promise<void> {
@@ -2366,6 +2646,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 -- recognizes this render on master (the steady-state path).
                 pushed_edit_id =
                   CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?6 ELSE pushed_edit_id END,
+                pushed_r2_key =
+                  CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?7 ELSE pushed_r2_key END,
                 master_confirmed_at =
                   CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END,
                 -- Shadow master_confirmed_at, but ONLY when this render is the
@@ -2387,7 +2669,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                        ELSE master_confirmed_edit_id END
           WHERE book = ?1 AND resource = ?2`,
       )
-        .bind(book, resource, blobSha, readAt, confirmMaster ? 1 : 0, editBoundary)
+        .bind(book, resource, blobSha, readAt, confirmMaster ? 1 : 0, editBoundary, r2Key)
         .run();
       if ((result.meta?.changes ?? 0) === 0) {
         // No book_resource_syncs row yet. UPDATE-only is deliberate (origin is NOT
@@ -2412,13 +2694,81 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // unreadable), which must NOT clear yesterday's real findings. Callers are
   // responsible for only invoking this when master was readable AND the
   // report came back with 0 entries.
-  private async clearExportReverts(book: string, resource: Resource): Promise<void> {
+  private async clearExportReverts(
+    book: string,
+    resource: Resource,
+    generation: string,
+    observedAt: number,
+  ): Promise<"recorded" | "superseded" | "failed"> {
+    const claim = await this.claimExportRevertGeneration(book, resource, generation, observedAt);
+    if (claim !== "claimed") return claim;
     try {
-      await this.env.DB.prepare(`DELETE FROM export_reverts WHERE book = ?1 AND resource = ?2`)
-        .bind(book, resource)
+      await this.env.DB.prepare(DELETE_EXPORT_REVERTS_FOR_GENERATION_SQL)
+        .bind(book, resource, generation, observedAt)
         .run();
+      const current = await this.env.DB.prepare(SELECT_EXPORT_REVERT_GENERATION_SQL)
+        .bind(book, resource, generation, observedAt)
+        .first<{ ok: number }>();
+      return current ? "recorded" : "superseded";
     } catch (e) {
       console.error("export revert report clear failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return "failed";
+    }
+  }
+
+  private async resolveExportRevertPersistence(
+    book: string,
+    resource: Resource,
+    generation: string,
+    observedAt: number,
+  ): Promise<void> {
+    try {
+      await this.env.DB.prepare(RESOLVE_EXPORT_REVERT_PERSISTENCE_FOR_GENERATION_SQL)
+        .bind(
+          EXPORT_ALERT_USERNAME,
+          `export_revert_persistence:${book}:${resource}`,
+          observedAt,
+          book,
+          resource,
+          generation,
+        )
+        .run();
+    } catch (e) {
+      // This is banner housekeeping after the DCS commit. Never retry an
+      // already-successful publish because the best-effort clear failed.
+      console.error("export revert persistence alert clear failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  private async recordExportRevertPersistenceFailure(
+    book: string,
+    resource: Resource,
+    detail: string,
+    observedAt: number,
+  ): Promise<void> {
+    const label = `${book} ${resource.toUpperCase()}`;
+    try {
+      await reconcileReviewAlert(this.env, {
+        username: EXPORT_ALERT_USERNAME,
+        source: `export_revert_persistence:${book}:${resource}`,
+        conditionKey: reviewConditionKey("export_revert_persistence", { book, resource }, { writeFailed: true }),
+        message:
+          `${label}: export-revert reporting failed to ${detail} (see worker logs for the D1 error) — ` +
+          `the report may now be missing rows or stale. This does not block the export.`,
+        severity: "warning",
+        linkUrl: `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        observedAt,
+      });
+    } catch (e) {
+      console.error("export revert persistence alert failed", {
         book,
         resource,
         error: e instanceof Error ? e.message : String(e),
@@ -2442,27 +2792,34 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     entries: Array<UsfmRevertEntry | TsvRevertEntry>,
     mechanical: boolean,
     branch: string,
+    generation: string,
+    observedAt = Date.now(),
   ): Promise<void> {
     if (entries.length === 0) {
-      await this.clearExportReverts(book, resource);
+      const cleared = await this.clearExportReverts(book, resource, generation, observedAt);
+      if (cleared === "recorded") {
+        await this.resolveExportRevertPersistence(book, resource, generation, observedAt);
+      } else if (cleared === "failed") {
+        await this.recordExportRevertPersistenceFailure(book, resource, "clear the previous export-revert rows", observedAt);
+      }
       return;
     }
-    const recorded = await this.recordExportReverts(book, resource, entries);
+    const recorded = await this.recordExportReverts(book, resource, entries, generation, observedAt);
     const label = `${book} ${resource.toUpperCase()}`;
-    if (!recorded) {
+    if (recorded === "failed") {
       // recordExportReverts already logged the underlying error; the alert
       // must not go on to claim these findings were recorded (see its own
       // comment on why a failed/partial write must not read as success).
-      await this.writeAlert(
-        `export_revert:${book}:${resource}`,
-        `${label}: computed ${entries.length} export-revert finding(s) but failed to fully write them to ` +
-          `export_reverts (see worker logs for the D1 error) — this book+resource's revert report may now be ` +
-          `missing rows or stale. This does not block the export.`,
-        `${this.env.DCS_BASE_URL}/unfoldingWord`,
-        "warning",
+      await this.recordExportRevertPersistenceFailure(
+        book,
+        resource,
+        `write ${entries.length} computed finding(s) to export_reverts`,
+        observedAt,
       );
       return;
     }
+    if (recorded === "superseded") return;
+    await this.resolveExportRevertPersistence(book, resource, generation, observedAt);
     const byClass = new Map<string, number>();
     for (const e of entries) byClass.set(e.class, (byClass.get(e.class) ?? 0) + 1);
     const breakdown = [...byClass.entries()].map(([cls, n]) => `${n} ${cls}`).join(", ");
@@ -2483,6 +2840,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       "warning",
       "record",
+      `${generation}:export_revert:${book}:${resource}`,
+      { book, resource, generation, observedAt },
     );
 
     // Second, distinct alert: "mechanical" means no HUMAN contributor was
@@ -2508,6 +2867,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           `${this.env.DCS_BASE_URL}/unfoldingWord`,
           "warning",
           "record",
+          `${generation}:mechanical_overwrite:${book}:${resource}`,
+          { book, resource, generation, observedAt },
         );
       }
     } catch (e) {
@@ -2857,8 +3218,38 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     linkUrl: string,
     severity: "error" | "warning" | "info" = "error",
     kind: "review" | "record" = "review",
+    eventKey?: string,
+    exportGeneration?: { book: string; resource: Resource; generation: string; observedAt: number },
   ): Promise<void> {
     try {
+      if (kind === "record") {
+        if (exportGeneration) {
+          await this.env.DB.prepare(INSERT_EXPORT_RECORD_FOR_GENERATION_SQL)
+            .bind(
+              EXPORT_ALERT_USERNAME,
+              severity,
+              source,
+              message,
+              linkUrl,
+              eventKey ?? null,
+              exportGeneration.book,
+              exportGeneration.resource,
+              exportGeneration.generation,
+              exportGeneration.observedAt,
+            )
+            .run();
+        } else {
+          await appendSystemRecord(this.env, {
+            username: EXPORT_ALERT_USERNAME,
+            source,
+            message,
+            linkUrl,
+            severity,
+            eventKey,
+          });
+        }
+        return;
+      }
       // Respect a prior dismissal of the *same* condition. Each nightly export
       // re-runs this for still-failing books; if we blindly re-inserted, an
       // alert the user already dismissed would reappear every morning and read

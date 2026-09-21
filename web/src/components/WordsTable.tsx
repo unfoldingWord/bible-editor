@@ -798,7 +798,7 @@ const WordRow = memo(function WordRow({
                   e.stopPropagation();
                   setRefMenuAnchor(e.currentTarget);
                 }}
-                sx={{ flexShrink: 0, fontFamily: "monospace", fontSize: 11, height: 20, color: "text.secondary" }}
+                sx={{ flexShrink: 0, fontFamily: "monospace", fontSize: 11, height: 24, color: "text.secondary" }}
               />
             </Tooltip>
           )}
@@ -877,7 +877,7 @@ const WordRow = memo(function WordRow({
                 color="warning"
                 variant="outlined"
                 onClick={(e) => setDisambigAnchor(e.currentTarget)}
-                sx={{ height: 20, cursor: "pointer", flexShrink: 0, "& .MuiChip-label": { px: 0.5, fontSize: 11 } }}
+                sx={{ height: 24, cursor: "pointer", flexShrink: 0, "& .MuiChip-label": { px: 0.5, fontSize: 11 } }}
               />
             </Tooltip>
             <Menu

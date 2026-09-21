@@ -22,7 +22,7 @@ import {
 import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, NT_BOOKS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
 import { reimportBookFromDcs, recordResourceSync, ALL_RESOURCES, type Resource } from "./bookReimport";
-import { lintAlignmentOccurrences, sourceWordsByRef, lintChapterOpeningMarkers, lintOrphanedBlankText, lintPairedPunctuation, lintTnQuotes, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint";
+import { sourceWordsByRef, lintTranslationRows, lintTnQuotes, lintTnRows, lintTqRows, lintTwlRows } from "./lint";
 import { effectiveBookLock, canManageLocks, requireAutoMergeConfirmation, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
 import { exportBranchOverrideValid, lockPushExportParams } from "./export";
@@ -372,68 +372,65 @@ books.get("/:book/lint", requireAuth, async (c) => {
   const book = c.req.param("book").toUpperCase();
   if (!BOOK_NUMBERS[book]) return c.json({ error: "unknown_book", book }, 400);
 
-  const tn = await c.env.DB.prepare(
-    `SELECT * FROM tn_rows WHERE book = ?1 AND deleted_at IS NULL AND trashed_at IS NULL
-       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
-  )
-    .bind(book)
-    .all<TnRow>();
-  // tq/twl have no trashed_at column (only tn does), so filter deleted_at only.
-  const tq = await c.env.DB.prepare(
-    `SELECT * FROM tq_rows WHERE book = ?1 AND deleted_at IS NULL
-       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
-  )
-    .bind(book)
-    .all<TqRow>();
-  const twl = await c.env.DB.prepare(
-    `SELECT * FROM twl_rows WHERE book = ?1 AND deleted_at IS NULL
-       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
-  )
-    .bind(book)
-    .all<TwlRow>();
-  const ult = await c.env.DB.prepare(
-    `SELECT * FROM verses WHERE book = ?1 AND bible_version = 'ULT' ORDER BY chapter, verse`,
-  )
-    .bind(book)
-    .all<VerseRow>();
-  const ust = await c.env.DB.prepare(
-    `SELECT * FROM verses WHERE book = ?1 AND bible_version = 'UST' ORDER BY chapter, verse`,
-  )
-    .bind(book)
-    .all<VerseRow>();
-
-  // Source verses (UHB for OT, UGNT for NT) back the quote-resolution and
-  // alignment-occurrence checks. Both SKIP a verse that isn't present here, so
-  // a missing source verse degrades to "not checked", never a false flag.
   const srcVersion = NT_BOOKS.has(book) ? "UGNT" : "UHB";
-  const src = await c.env.DB.prepare(
-    `SELECT * FROM verses WHERE book = ?1 AND bible_version = ?2 ORDER BY chapter, verse`,
-  )
-    .bind(book, srcVersion)
-    .all<VerseRow>();
+  // One D1 round trip; all checks use the same transactional read snapshot.
+  const results = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `SELECT * FROM tn_rows WHERE book = ?1 AND deleted_at IS NULL AND trashed_at IS NULL
+       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
+    ).bind(book),
+    // tq/twl have no trashed_at column (only tn does), so filter deleted_at only.
+    c.env.DB.prepare(
+      `SELECT * FROM tq_rows WHERE book = ?1 AND deleted_at IS NULL
+       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
+    ).bind(book),
+    c.env.DB.prepare(
+      `SELECT * FROM twl_rows WHERE book = ?1 AND deleted_at IS NULL
+       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
+    ).bind(book),
+    c.env.DB.prepare(
+      `SELECT * FROM verses WHERE book = ?1 AND bible_version = 'ULT' ORDER BY chapter, verse`,
+    ).bind(book),
+    c.env.DB.prepare(
+      `SELECT * FROM verses WHERE book = ?1 AND bible_version = 'UST' ORDER BY chapter, verse`,
+    ).bind(book),
+
+    // Source verses (UHB for OT, UGNT for NT) back the quote-resolution and
+    // alignment-occurrence checks. Both SKIP a verse that isn't present here, so
+    // a missing source verse degrades to "not checked", never a false flag.
+    c.env.DB.prepare(
+      `SELECT * FROM verses WHERE book = ?1 AND bible_version = ?2 ORDER BY chapter, verse`,
+    ).bind(book, srcVersion),
+  ]);
+  const [tn, tq, twl, ult, ust, src] = results as [
+    D1Result<TnRow>, D1Result<TqRow>, D1Result<TwlRow>,
+    D1Result<VerseRow>, D1Result<VerseRow>, D1Result<VerseRow>,
+  ];
 
   // Parse the source book ONCE. Passing the raw rows to all three lints made
   // each re-walk every verse's content_json (three full passes over the largest
   // book for no gain).
   const srcWords = sourceWordsByRef(src.results ?? []);
+  const ultLint = lintTranslationRows(ult.results ?? [], srcWords);
+  const ustLint = lintTranslationRows(ust.results ?? [], srcWords);
 
   const issues = [
     ...lintTnRows(tn.results ?? []).map((i) => ({ ...i, resource: "tn" })),
     ...lintTnQuotes(tn.results ?? [], srcWords).map((i) => ({ ...i, resource: "tn" })),
-    ...lintAlignmentOccurrences(ult.results ?? [], srcWords).map((i) => ({ ...i, resource: "ult" })),
-    ...lintAlignmentOccurrences(ust.results ?? [], srcWords).map((i) => ({ ...i, resource: "ust" })),
+    ...ultLint.alignment.map((i) => ({ ...i, resource: "ult" })),
+    ...ustLint.alignment.map((i) => ({ ...i, resource: "ust" })),
     ...lintTqRows(tq.results ?? []).map((i) => ({ ...i, resource: "tq" })),
     ...lintTwlRows(twl.results ?? []).map((i) => ({ ...i, resource: "twl" })),
-    ...lintUsfmVerses(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
-    ...lintUsfmVerses(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
-    ...lintChapterOpeningMarkers(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
-    ...lintChapterOpeningMarkers(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
-    ...lintOrphanedBlankText(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
-    ...lintOrphanedBlankText(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
-    ...lintVerseTextQuality(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
-    ...lintVerseTextQuality(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
-    ...lintPairedPunctuation(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
-    ...lintPairedPunctuation(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
+    ...ultLint.usfm.map((i) => ({ ...i, resource: "ult" })),
+    ...ustLint.usfm.map((i) => ({ ...i, resource: "ust" })),
+    ...ultLint.opening.map((i) => ({ ...i, resource: "ult" })),
+    ...ustLint.opening.map((i) => ({ ...i, resource: "ust" })),
+    ...ultLint.orphaned.map((i) => ({ ...i, resource: "ult" })),
+    ...ustLint.orphaned.map((i) => ({ ...i, resource: "ust" })),
+    ...ultLint.quality.map((i) => ({ ...i, resource: "ult" })),
+    ...ustLint.quality.map((i) => ({ ...i, resource: "ust" })),
+    ...ultLint.punctuation.map((i) => ({ ...i, resource: "ult" })),
+    ...ustLint.punctuation.map((i) => ({ ...i, resource: "ust" })),
   ];
   const flagCount = issues.filter((i) => i.bucket === "flag").length;
   const escalateCount = issues.filter((i) => i.bucket === "escalate").length;
@@ -665,9 +662,9 @@ async function importBookFromDcs(
   // see resolveActorUsername), never null.
   const actor = await resolveActorUsername(env.DB, userId);
 
-  counts.verses += await insertVerses(env, book, "ULT", ultRaw, actor);
-  counts.verses += await insertVerses(env, book, "UST", ustRaw, actor);
-  counts.verses += await insertVerses(env, book, origVersion, origRaw, actor);
+  counts.verses += await insertVerses(env, book, "ULT", ultRaw, userId, actor);
+  counts.verses += await insertVerses(env, book, "UST", ustRaw, userId, actor);
+  counts.verses += await insertVerses(env, book, origVersion, origRaw, userId, actor);
 
   counts.tn = await insertTnRows(env, book, tnRaw, userId, actor);
   counts.tq = await insertTqRows(env, book, tqRaw, userId, actor);
@@ -708,6 +705,7 @@ async function insertVerses(
   book: string,
   bibleVersion: string,
   rawUsfm: string | null,
+  userId: number,
   actor: string,
 ): Promise<number> {
   if (!rawUsfm) return 0;
@@ -726,23 +724,38 @@ async function insertVerses(
   const verses = extractVersesForRange(rawUsfm, 1, 999);
   if (verses.length === 0) return 0;
 
-  // This is the ONE record the bootstrap import leaves for a verse row: unlike
-  // tn/tq/twl below, verses here get no `updated_by` and no edit_log entry at
-  // all. Before #686 a bootstrap-imported verse's provenance was simply
-  // unknowable from D1 alone.
+  // Stamps both the row's own provenance columns (updated_by / last_change_*,
+  // #686) AND a paired kind='verse' edit_log 'create' row, matching the
+  // tn/tq/twl inserts below — before #686 review, a bootstrap-imported verse's
+  // provenance was unknowable from D1 alone (no updated_by, no edit_log row),
+  // so the version-history timeline started blank and verseMerge's ancestor
+  // recovery had nothing to read for a never-edited bootstrap verse.
   const stmt = env.DB.prepare(
     `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, ${PROVENANCE_COLUMNS.join(", ")})
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
   );
+  const auditStmt = env.DB.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+     VALUES ('verse', ?1, ?2, ?3, NULL, 1, 'create', ?4)`,
+  );
   const provenance = provenanceValues({ action: "import", source: "import", actor });
-  for (let i = 0; i < verses.length; i += CHUNK) {
-    const slice = verses.slice(i, i + CHUNK);
-    await env.DB.batch(
-      slice.map((v) =>
-        stmt.bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText, ...provenance),
-      ),
+
+  let batch: D1PreparedStatement[] = [];
+  const flush = async () => {
+    if (batch.length === 0) return;
+    await env.DB.batch(batch);
+    batch = [];
+  };
+  for (const v of verses) {
+    const rowKey = `${book}/${v.chapter}/${v.verse}/${bibleVersion}`;
+    const payload = JSON.stringify({ content: v.contentJson, plain_text: v.plainText });
+    batch.push(
+      stmt.bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText, ...provenance),
+      auditStmt.bind(rowKey, book, userId, payload),
     );
+    if (batch.length >= CHUNK) await flush();
   }
+  await flush();
   return verses.length;
 }
 

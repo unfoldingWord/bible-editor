@@ -57,7 +57,7 @@
 // split as chapterLock.test.mjs.
 
 import { DatabaseSync } from "node:sqlite";
-import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
+import { raiseVerseMergeConflictAlert, retireVerseKeptAiMasterFlags, resolveConvergedVerseMergeConflicts } from "./verseMergeConflicts.ts";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
@@ -152,16 +152,19 @@ function assert(cond, msg) {
 }
 
 {
-  // Issue #633: name what differs. Wording-only must still offer text recovery;
-  // alignment-only must NOT claim the words were replaced or tell them to re-save.
+  // Issue #633 / #788: name what differs. Wording/punctuation are text-side
+  // recovery; alignment-only must not claim the words were replaced.
   const wordingOnly = [{ chapter: 40, verse: 5, overwrittenVersion: 8, reason: "both_changed_wording" }];
+  const punctuationOnly = [{ chapter: 40, verse: 6, overwrittenVersion: 9, reason: "both_changed_punctuation" }];
   const alignmentOnly = [{ chapter: 41, verse: 6, overwrittenVersion: 5, reason: "both_changed_alignment" }];
-  const both = [{ chapter: 40, verse: 10, overwrittenVersion: 6, reason: "both_changed" }];
+  const allAxes = [{ chapter: 40, verse: 10, overwrittenVersion: 6, reason: "both_changed_wording_punctuation_alignment" }];
   const keyW = editLogKey("JER", "ult", wordingOnly[0]);
+  const keyP = editLogKey("JER", "ult", punctuationOnly[0]);
   const keyA = editLogKey("JER", "ult", alignmentOnly[0]);
-  const keyB = editLogKey("JER", "ult", both[0]);
+  const keyB = editLogKey("JER", "ult", allAxes[0]);
   const users = new Map([
     [keyW, "translator"],
+    [keyP, "translator"],
     [keyA, "translator"],
     [keyB, "translator"],
   ]);
@@ -171,26 +174,41 @@ function assert(cond, msg) {
   assert(wMsg.includes("replaced text is still recoverable"), "wording-only still points at text recovery");
   assert(!wMsg.includes("re-save"), "overwrite alert never tells the editor to re-save");
 
+  const pMsg = groupOverwrittenVersesByEditor("JER", "ult", punctuationOnly, users).get("translator").message;
+  assert(pMsg.includes("The punctuation changed (the wording did not)."), "punctuation-only names punctuation, not wording");
+  assert(pMsg.includes("previous punctuation is still recoverable"), "punctuation-only points at punctuation recovery");
+
   const aMsg = groupOverwrittenVersesByEditor("JER", "ult", alignmentOnly, users).get("translator").message;
-  assert(aMsg.includes("The alignment changed (the wording did not)."), "alignment-only names alignment");
+  assert(aMsg.includes("The alignment changed (the wording and punctuation did not)."), "alignment-only names alignment");
   assert(aMsg.includes("previous alignment is still recoverable"), "alignment-only recovers alignment, not 'replaced text'");
   assert(!aMsg.includes("replaced text"), "alignment-only must not claim the words were replaced");
   assert(!aMsg.includes("re-save"), "alignment-only never tells the editor to re-save");
 
-  const bMsg = groupOverwrittenVersesByEditor("JER", "ult", both, users).get("translator").message;
-  assert(bMsg.includes("The wording and the alignment changed."), "both-axes names both");
+  const bMsg = groupOverwrittenVersesByEditor("JER", "ult", allAxes, users).get("translator").message;
+  assert(bMsg.includes("The wording, punctuation, and alignment changed."), "all axes name all three");
 }
 
 {
-  // Issue #633 admin guidance: same wording vs alignment distinction.
+  // Issue #633 / #788 admin guidance: same text-side vs alignment distinction.
   const w = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_wording" }]);
   assert(w.includes("The wording changed."), "admin wording-only names wording");
   assert(w.includes("replaced text is still"), "admin wording-only keeps text recovery");
 
+  const p = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_punctuation" }]);
+  assert(p.includes("The punctuation changed (the wording did not)."), "admin punctuation-only names punctuation");
+  assert(p.includes("previous punctuation is still"), "admin punctuation-only keeps punctuation recovery");
+
   const a = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_alignment" }]);
-  assert(a.includes("The alignment changed (the wording did not)."), "admin alignment-only names alignment");
+  assert(a.includes("The alignment changed (the wording and punctuation did not)."), "admin alignment-only names alignment");
   assert(a.includes("previous alignment is still"), "admin alignment-only recovers alignment");
   assert(!a.includes("replaced text"), "admin alignment-only must not claim replaced text");
+
+  const legacy = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed" }]);
+  assert(legacy.includes("The wording and alignment changed."), "legacy both_changed keeps its original two-axis meaning");
+  assert(!legacy.includes("punctuation"), "legacy both_changed does not invent a punctuation claim");
+
+  const prototypeKey = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "__proto__" }]);
+  assert(prototypeKey.includes("The wording and alignment changed."), "prototype-key reason takes the fail-safe warning");
 
   // adopt_no_visible_change is not alertable — if it somehow reached guidance
   // it is not an adopt_conflict, so it must not count as an overwrite.
@@ -380,7 +398,8 @@ function verseDb() {
   d.exec(`CREATE TABLE verse_merge_conflicts (
     id INTEGER PRIMARY KEY AUTOINCREMENT, book TEXT, resource TEXT, chapter INTEGER,
     verse INTEGER, action TEXT, reason TEXT, overwritten_version INTEGER, alignment TEXT,
-    detected_at INTEGER, resolved_at INTEGER, resolved_by INTEGER, last_recorded_at INTEGER
+    detected_at INTEGER, resolved_at INTEGER, resolved_by INTEGER, last_recorded_at INTEGER,
+    recorded_generation INTEGER NOT NULL DEFAULT 0
   )`);
   // Required for UPSERT_VERSE_MERGE_CONFLICT_SQL's `ON CONFLICT (book,
   // resource, chapter, verse)` clause to have anything to conflict against —
@@ -2043,6 +2062,270 @@ function ts(dateStr) {
   assert(clause.includes(`1:${MERGE_CONFLICT_REFS_DISPLAY}`), "default cap lists up to MERGE_CONFLICT_REFS_DISPLAY refs");
   assert(!clause.includes(`1:${MERGE_CONFLICT_REFS_DISPLAY + 1}`), "…and no further");
   assert(clause.includes("+1 more"), "…and reports the one remaining row, inside the group it belongs to");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part 9 (issue #789): resolveConvergedVerseMergeConflicts. A standing
+// keep_alignment_refused / source_attr_divergent / keep_local_structure row
+// is only ever resolved by a human saving that verse — nothing resolves it
+// when the SAME verse later converges with master (computeVerseMerge's
+// keep_converged / keep_master_unchanged outcomes write no
+// verse_merge_conflicts row of their own). Driven against the REAL async
+// function with a D1 shim (mkBatchEnv-style, local to this Part), so these
+// exercise the actual backlog-read + intersect + batched-UPDATE + banner-clear
+// control flow, not a hand replica of it.
+// ─────────────────────────────────────────────────────────────────────────
+
+{
+  const mkEnv = (d, opts = {}) => {
+    const { failBatch = false, beforeBatch = null } = opts;
+    const make = (sql) => ({
+      bind: (...args) => ({
+        _sql: sql,
+        _args: args,
+        all: async () => ({ results: d.prepare(sql).all(...args) }),
+        run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+      }),
+      all: async () => ({ results: d.prepare(sql).all() }),
+      run: async () => ({ meta: { changes: Number(d.prepare(sql).run().changes) } }),
+    });
+    return {
+      DB: {
+        prepare: (sql) => make(sql),
+        batch: async (stmts) => {
+          if (failBatch) throw new Error("simulated transient D1 batch error");
+          if (beforeBatch) beforeBatch();
+          return stmts.map((s) => ({ meta: { changes: Number(d.prepare(s._sql).run(...(s._args ?? [])).changes) } }));
+        },
+      },
+    };
+  };
+
+  // Case 1 (the issue's own success check, first bullet): a verse converges
+  // with master (keep_converged/keep_master_unchanged) — its open
+  // keep_alignment_refused row is resolved, system-retired
+  // (resolved_by NULL), not left for a human to clear.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('EZK','ult',37,21,'keep_alignment_refused','alignment_shrink',NULL,100)`,
+    ).run();
+
+    const result = await resolveConvergedVerseMergeConflicts(mkEnv(d), "EZK", "ult", [{ chapter: 37, verse: 21 }]);
+    assert(result.resolved === 1, "the one converged verse's backlog row is resolved");
+
+    const row = d
+      .prepare(`SELECT resolved_at, resolved_by FROM verse_merge_conflicts WHERE book='EZK' AND chapter=37 AND verse=21`)
+      .get();
+    assert(row.resolved_at !== null, "resolved_at is stamped");
+    assert(row.resolved_by === null, "resolved_by is NULL — the documented system-retired marker, never a human id");
+  }
+
+  // Case 2 (second bullet): a verse that still shrinks (still conflicted) is
+  // never passed in convergedRefs at all — the same shape bookReimport.ts's
+  // loop produces (it only pushes a ref when mergeAction is keep_converged /
+  // keep_master_unchanged). The row stays open exactly as recordVerseMergeConflicts
+  // left it.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, last_recorded_at)
+       VALUES ('EZK','ult',46,9,'keep_alignment_refused','alignment_shrink',NULL,100,100)`,
+    ).run();
+
+    // Some OTHER verse converged this run; 46:9 did not, so it is absent from
+    // convergedRefs — mirroring what the real loop would produce.
+    const result = await resolveConvergedVerseMergeConflicts(mkEnv(d), "EZK", "ult", [{ chapter: 1, verse: 1 }]);
+    assert(result.resolved === 0, "a verse absent from convergedRefs resolves nothing");
+
+    const row = d
+      .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='EZK' AND chapter=46 AND verse=9`)
+      .get();
+    assert(row.resolved_at === null, "the still-refused row stays open");
+  }
+
+  // Case 3 (third bullet): an adopt_conflict row must never be touched here —
+  // that action records a landed adoption a human is meant to review, and
+  // only their own save resolves it. Proven even when the verse is (wrongly,
+  // defensively) included in convergedRefs: SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL
+  // returns adopt_conflict rows too, but the action filter this function
+  // applies on top of that read excludes them from the backlog set entirely.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('JER','ust',31,29,'adopt_conflict','both_changed',12,100)`,
+    ).run();
+
+    const result = await resolveConvergedVerseMergeConflicts(mkEnv(d), "JER", "ust", [{ chapter: 31, verse: 29 }]);
+    assert(result.resolved === 0, "an adopt_conflict row is never counted as resolved by this path");
+
+    const row = d
+      .prepare(`SELECT resolved_at, action FROM verse_merge_conflicts WHERE book='JER' AND chapter=31 AND verse=29`)
+      .get();
+    assert(row.resolved_at === null && row.action === "adopt_conflict",
+      "the adopt_conflict row is completely untouched — still open, still its original action");
+  }
+
+  // Case 4: the banner follows — once the LAST active alertable conflict for
+  // a (book, resource) resolves this way, the materialized "Sync flagged"
+  // banner clears too (same shape as #760's keep_ai_master retirement).
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('DAN','ust',5,7,'keep_alignment_refused','alignment_shrink',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:DAN:ust','Sync flagged 1 verse(s) in DAN UST...',100)`,
+    ).run();
+
+    const result = await resolveConvergedVerseMergeConflicts(mkEnv(d), "DAN", "ust", [{ chapter: 5, verse: 7 }]);
+    assert(result.resolved === 1, "the sole standing row resolves");
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:DAN:ust'`)
+      .get().n;
+    assert(remaining === 0, "…and its banner clears in the same call, not left for a later sweep");
+  }
+
+  // Case 5: the banner must NOT clear while another active conflict for the
+  // same (book, resource) survives — clearResolvedConflictBannerIfLast's own
+  // re-check, exercised end to end through this function.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('JER','ust',38,2,'keep_alignment_refused','alignment_shrink',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('JER','ust',45,5,'source_attr_divergent','source_attr_ambiguous',NULL,100)`,
+    ).run();
+    d.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, created_at)
+       VALUES ('deferredreward','warning','verse_merge_conflict:JER:ust','Sync flagged 2 verse(s) in JER UST...',100)`,
+    ).run();
+
+    // Only 38:2 converged this run; 45:5 is still standing.
+    const result = await resolveConvergedVerseMergeConflicts(mkEnv(d), "JER", "ust", [{ chapter: 38, verse: 2 }]);
+    assert(result.resolved === 1, "the converged verse's row resolves");
+    const remaining = d
+      .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ust'`)
+      .get().n;
+    assert(remaining === 1, "…but the banner stays up — 45:5 still justifies it");
+  }
+
+  // Case 6: no backlog at all for the (book, resource) — the cheap common
+  // case (most books never had a refusal). No UPDATE is attempted.
+  {
+    const d = verseDb();
+    const result = await resolveConvergedVerseMergeConflicts(mkEnv(d), "MAL", "ult", [
+      { chapter: 1, verse: 1 },
+      { chapter: 1, verse: 2 },
+    ]);
+    assert(result.resolved === 0, "an empty backlog resolves nothing, without error");
+  }
+
+  // Case 7: no converged refs at all this call — short-circuits before even
+  // reading the backlog (bookReimport.ts only calls this when convergedRefs
+  // is non-empty, but the function must be safe called either way).
+  {
+    const d = verseDb();
+    const result = await resolveConvergedVerseMergeConflicts(mkEnv(d), "MAL", "ult", []);
+    assert(result.resolved === 0, "an empty convergedRefs list is a no-op");
+  }
+
+  // Case 8: best-effort — a batch failure must not throw out of this
+  // function (it runs inline in applyVerseRows, which must not fail the
+  // whole reimport over banner housekeeping), and must leave the row
+  // standing for the next run to retry.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+       VALUES ('EZK','ust',44,18,'source_attr_divergent','source_attr_ambiguous',NULL,100)`,
+    ).run();
+
+    const result = await resolveConvergedVerseMergeConflicts(mkEnv(d, { failBatch: true }), "EZK", "ust", [
+      { chapter: 44, verse: 18 },
+    ]);
+    assert(result.resolved === 0, "a failed batch reports 0 resolved rather than throwing");
+    const row = d
+      .prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book='EZK' AND chapter=44 AND verse=18`)
+      .get();
+    assert(row.resolved_at === null, "…and the row is left standing, retried on the next run");
+  }
+
+  // Case 9: a concurrent reimport re-recording the same key after the backlog
+  // read increments its generation. The stale cleanup CAS must not resolve it.
+  {
+    const d = verseDb();
+    d.prepare(
+      `INSERT INTO verse_merge_conflicts
+         (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, last_recorded_at)
+       VALUES ('EZK','ust',47,1,'keep_alignment_refused','alignment_shrink',NULL,100,100)`,
+    ).run();
+
+    const result = await resolveConvergedVerseMergeConflicts(
+      mkEnv(d, {
+        beforeBatch: () => d.prepare(
+          `UPDATE verse_merge_conflicts
+              SET last_recorded_at = 200, recorded_generation = recorded_generation + 1
+            WHERE book='EZK' AND resource='ust' AND chapter=47 AND verse=1`,
+        ).run(),
+      }),
+      "EZK",
+      "ust",
+      [{ chapter: 47, verse: 1 }],
+    );
+    assert(result.resolved === 0, "a concurrently re-recorded conflict defeats the stale cleanup CAS");
+    const row = d.prepare(
+      `SELECT resolved_at, recorded_generation FROM verse_merge_conflicts
+        WHERE book='EZK' AND resource='ust' AND chapter=47 AND verse=1`,
+    ).get();
+    assert(row.resolved_at === null && row.recorded_generation === 1,
+      "the fresh conflict remains active at its newer generation");
+  }
+}
+
+// Stage 7: a failed conflict-recording batch is itself actionable measured
+// state. It must raise the explicit incomplete-report warning while preserving
+// fan-out recipients that may be absent only because the table write failed.
+{
+  const d = verseDb();
+  d.exec(`ALTER TABLE system_alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    ALTER TABLE system_alerts ADD COLUMN condition_key TEXT;
+    ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
+    ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
+    CREATE UNIQUE INDEX system_alerts_one_standing_review_test
+      ON system_alerts(username, source)
+      WHERE kind='review' AND condition_key IS NOT NULL AND dismissed_at IS NULL AND resolved_at IS NULL;`);
+  d.prepare(
+    `INSERT INTO system_alerts
+       (username,severity,source,message,kind,condition_key,condition_observed_at)
+     VALUES ('bethoakes','warning','verse_merge_conflict:JER:ult','prior editor condition','review','old-editor',50)`,
+  ).run();
+  const make = (sql, args = []) => ({
+    bind: (...next) => make(sql, next),
+    all: async () => ({ results: d.prepare(sql).all(...args) }),
+    run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+  });
+  await raiseVerseMergeConflictAlert({ DB: { prepare: (sql) => make(sql) } }, "JER", "ult", {
+    recordingFailed: true,
+    observedAt: 100,
+  });
+  const admin = d.prepare(
+    `SELECT message FROM system_alerts
+      WHERE username='deferredreward' AND source='verse_merge_conflict:JER:ult' AND resolved_at IS NULL`,
+  ).get();
+  assert(admin?.message.includes("recording failed"), "a recording failure raises the explicit incomplete-report warning");
+  const editor = d.prepare(
+    `SELECT resolved_at FROM system_alerts
+      WHERE username='bethoakes' AND source='verse_merge_conflict:JER:ult'`,
+  ).get();
+  assert(editor?.resolved_at === null, "an incomplete run does not retire an omitted editor recipient");
 }
 
 if (failed) {

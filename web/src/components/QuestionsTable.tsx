@@ -279,7 +279,7 @@ const Row = memo(function Row({
             ...(isDirty ? { "data-dirty": "true" } : {}),
           }}
           inputProps={{
-            style: { fontSize: 12, padding: "3px 6px", fontFamily: "monospace" },
+            style: { fontSize: 12, padding: "5px 6px", fontFamily: "monospace" },
           }}
         />
       </Stack>
@@ -330,8 +330,8 @@ const Row = memo(function Row({
             }}
             sx={{
               fontFamily: "monospace",
-              fontSize: 10,
-              height: 20,
+              fontSize: 11,
+              height: 24,
               color: isDirty ? "warning.main" : "text.secondary",
               borderColor: isDirty ? "warning.main" : "divider",
               fontWeight: isDirty ? 600 : 400,

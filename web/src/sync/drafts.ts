@@ -17,6 +17,7 @@ import {
   type VerseOpExitInfo,
 } from "./draftSaveState";
 import { peekPinnedVerseBase, unpinVerseBase } from "./versePin";
+import { createDraftSnapshot } from "./draftSnapshot";
 export { pinVerseBase, peekPinnedVerseBase } from "./versePin";
 
 const DB_NAME = "bible-editor-drafts";
@@ -80,11 +81,9 @@ function db() {
   return dbp;
 }
 
-const subscribers = new Set<Subscriber>();
-
 // Synchronous mirror of "a draft was written this session and not yet cleared".
 // The subscription-driven signal (useUnsavedGuard's hasDrafts) only updates
-// after an async listAll()+notify round-trip, which lags the set() call — a
+// after an async persistence/notification round-trip, which lags the set() call — a
 // reload in that window (before the IndexedDB write even commits) would slip
 // past the unsaved-work guard. set()/clear() keep this Set in lockstep
 // synchronously so beforeunload can read a live answer. It only covers drafts
@@ -122,10 +121,23 @@ async function listAll(): Promise<DraftRecord[]> {
   return all;
 }
 
-async function notify() {
-  if (subscribers.size === 0) return;
-  const all = await listAll();
-  for (const s of subscribers) s(all);
+const snapshot = createDraftSnapshot<DraftRecord>(listAll, async (key) =>
+  (await db()).get(STORE, key));
+const draftChannel = typeof BroadcastChannel !== "undefined"
+  ? new BroadcastChannel("be-draft-changes") : null;
+draftChannel?.addEventListener("message", (event: MessageEvent) => {
+  if (typeof event.data === "string") refreshSnapshot(event.data);
+});
+function refreshSnapshot(key: string) {
+  void snapshot.refresh(key).catch((error) => {
+    // A notification failure must never turn a persisted dirty draft into an
+    // apparent absence. Keep the last known state; the next commit can retry.
+    console.warn("Unable to refresh draft notification", error);
+  });
+}
+function notify(key: string) {
+  refreshSnapshot(key);
+  try { draftChannel?.postMessage(key); } catch { /* best-effort */ }
 }
 
 export function verseKey(
@@ -147,9 +159,11 @@ export function rowKey(rowKind: RowKind, book: string, id: string): string {
 
 export const drafts = {
   subscribe(fn: Subscriber): () => void {
-    subscribers.add(fn);
-    void listAll().then(fn);
-    return () => subscribers.delete(fn);
+    return snapshot.subscribe(fn);
+  },
+
+  subscribeKey(key: string, fn: (draft: DraftRecord | undefined) => void): () => void {
+    return snapshot.subscribeKey(key, fn);
   },
 
   async set(
@@ -172,8 +186,11 @@ export const drafts = {
       generation,
       meta,
     };
-    await (await db()).put(STORE, rec);
-    void notify();
+    const release = snapshot.beginMutation(key);
+    try {
+      await (await db()).put(STORE, rec);
+      notify(key);
+    } finally { release(); }
   },
 
   async get(key: string): Promise<DraftRecord | undefined> {
@@ -198,7 +215,8 @@ export const drafts = {
     pendingKeys.add(key);
     await idb.put(STORE, migrated);
     await idb.delete(STORE, legacyKey);
-    void notify();
+    notify(legacyKey);
+    notify(key);
     return migrated;
   },
 
@@ -206,8 +224,11 @@ export const drafts = {
     pendingKeys.delete(key);
     latestGenerationByKey.delete(key);
     unpinVerseBase(key);
-    await (await db()).delete(STORE, key);
-    void notify();
+    const release = snapshot.beginMutation(key);
+    try {
+      await (await db()).delete(STORE, key);
+      notify(key);
+    } finally { release(); }
   },
 
   // Delete only the exact draft generation that produced a successful save.
@@ -230,7 +251,7 @@ export const drafts = {
       pendingKeys.delete(key);
       unpinVerseBase(key);
     }
-    void notify();
+    notify(key);
     return true;
   },
 

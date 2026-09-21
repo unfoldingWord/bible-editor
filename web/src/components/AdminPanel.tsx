@@ -3,7 +3,7 @@
 // spec in the PR description / CLAUDE.md session notes for the full API
 // contract this codes against — the backend is built to the same contract in
 // parallel.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Box,
@@ -42,6 +42,8 @@ import {
   type AdminPr,
   type AdminResourceSyncStatus,
   type AdminSyncActivityEntry,
+  type AdminSyncRunEvent,
+  type AdminSyncRunSummary,
   type AdminUser,
   type ExportSnapshotRow,
   type ExportInstanceStatus,
@@ -297,9 +299,9 @@ function SyncStatusTab() {
 
 // ── Tab: Sync activity ───────────────────────────────────────────────────
 
-// `source` for these entries is always `export_revert:${book}:${resource}` or
-// `mechanical_overwrite:${book}:${resource}` today (see admin.ts's
-// /sync-activity route) — parsed just for a compact Book/Resource column;
+// `source` for these entries currently includes export_revert,
+// mechanical_overwrite, and reimport_kept_over_door43 book/resource events
+// (see admin.ts's /sync-activity route) — parsed for a compact column;
 // falls back to showing the raw source if a future source doesn't fit that
 // shape rather than hiding the row.
 function parseActivitySource(source: string): { label: string; book: string | null } {
@@ -313,16 +315,23 @@ function parseActivitySource(source: string): { label: string; book: string | nu
 
 function SyncActivityTab() {
   const [entries, setEntries] = useState<AdminSyncActivityEntry[]>([]);
+  const [runs, setRuns] = useState<AdminSyncRunSummary[]>([]);
+  const [runEvents, setRunEvents] = useState<AdminSyncRunEvent[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [runLoading, setRunLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
-    api
-      .getAdminSyncActivity()
-      .then((res) => setEntries(res.entries))
+    Promise.all([api.getAdminSyncActivity(), api.getAdminSyncRuns()])
+      .then(([activity, ledger]) => {
+        setEntries(activity.entries);
+        setRuns(ledger.runs);
+      })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }, []);
@@ -337,12 +346,32 @@ function SyncActivityTab() {
     );
   }, [entries, filter]);
 
+  // Guards the run-detail fetch against a request race: selecting run A then run
+  // B before A resolves must not let A's later response overwrite B's events
+  // under B's heading. A monotonic token (not the runId) identifies each request
+  // instance, so even A → B → A only lets the newest request apply its result —
+  // relevant for an in-progress run whose event list grows between clicks.
+  const runReqSeq = useRef(0);
+  const showRun = useCallback((runId: string) => {
+    setSelectedRunId(runId);
+    setRunLoading(true);
+    setRunError(null);
+    const token = ++runReqSeq.current;
+    api.getAdminSyncRun(runId)
+      .then((res) => { if (runReqSeq.current === token) setRunEvents(res.events); })
+      .catch((e) => { if (runReqSeq.current === token) setRunError(String(e)); })
+      .finally(() => { if (runReqSeq.current === token) setRunLoading(false); });
+  }, []);
+
+  const fmtRunTime = (ms: number | null) => ms == null ? "—" : new Date(ms).toLocaleString();
+
   return (
     <Stack spacing={2}>
       <Typography variant="body2" color="text.secondary">
-        Non-blocking export/sync records that need no action — "master was overwritten as expected"
-        and similar. Actionable alerts (a stale sync, a blocked export, a merge conflict needing
-        review) still show up as banners for the affected user; this is just the log.
+        Non-blocking export and reimport records that need no action — for example, an export
+        overwrote master as designed, or the merge safely kept the app&apos;s newer edit. Actionable
+        conditions (a stale sync, a blocked export, or a merge conflict needing review) still show
+        up as banners for the affected user; this is just the history.
       </Typography>
       <Stack direction="row" spacing={2} alignItems="center">
         <TextField
@@ -355,6 +384,46 @@ function SyncActivityTab() {
           <RefreshIcon fontSize="small" />
         </IconButton>
       </Stack>
+      <Typography variant="h6">Overnight runs</Typography>
+      {runs.length === 0 ? (
+        <Typography variant="body2" color="text.secondary">No ledger runs recorded yet.</Typography>
+      ) : (
+        <TableContainer component={Paper} variant="outlined">
+          <Table size="small">
+            <TableHead><TableRow>
+              <TableCell>Started</TableCell><TableCell>Completed</TableCell><TableCell>Status</TableCell><TableCell>Items</TableCell>
+              <TableCell>Success</TableCell><TableCell>Skip</TableCell><TableCell>Failed</TableCell><TableCell />
+            </TableRow></TableHead>
+            <TableBody>{runs.map((run) => (
+              <TableRow key={run.runId} selected={run.runId === selectedRunId}>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{fmtRunTime(run.startedAt)}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{fmtRunTime(run.completedAt)}</TableCell>
+                <TableCell>{run.status ?? "running"}</TableCell>
+                <TableCell>{run.itemCount}</TableCell><TableCell>{run.successCount}</TableCell>
+                <TableCell>{run.skipCount}</TableCell><TableCell>{run.failureCount}</TableCell>
+                <TableCell><Button size="small" onClick={() => showRun(run.runId)}>Details</Button></TableCell>
+              </TableRow>
+            ))}</TableBody>
+          </Table>
+        </TableContainer>
+      )}
+      {selectedRunId && (
+        <Paper variant="outlined" sx={{ p: 2 }}>
+          <Typography variant="subtitle1">Run details: {selectedRunId}</Typography>
+          {runError && <Alert severity="error">Failed to load run: {runError}</Alert>}
+          {runLoading ? <CircularProgress size={20} /> : runEvents.map((event) => (
+            <Box key={event.id} sx={{ py: 1, borderBottom: "1px solid", borderColor: "divider" }}>
+              <Typography variant="body2">
+                {fmtRunTime(event.occurredAt)} · {event.eventType} · {event.status ?? "—"}
+                {event.book ? ` · ${event.book}` : ""}{event.resource ? ` / ${event.resource.toUpperCase()}` : ""}
+              </Typography>
+              {event.details && <Typography component="pre" variant="caption" sx={{ whiteSpace: "pre-wrap", m: 0 }}>
+                {JSON.stringify(event.details)}
+              </Typography>}
+            </Box>
+          ))}
+        </Paper>
+      )}
       {error && <Alert severity="error">Failed to load sync activity: {error}</Alert>}
       {loading ? (
         <Box sx={{ display: "flex", justifyContent: "center", p: 4 }}>

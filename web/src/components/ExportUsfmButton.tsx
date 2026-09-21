@@ -2,7 +2,8 @@
 // for any enabled bible version, in an aligned (\zaln/\w kept) or plain
 // (alignment stripped) variant. Chapter export renders from data already in
 // hand; book export fetches every chapter for the chosen version client-side
-// (no export API endpoint). See web/src/lib/exportUsfm.ts for the renderer.
+// (no export API endpoint; see web/src/lib/bookVerses.ts). See
+// web/src/lib/exportUsfm.ts for the renderer.
 
 import { useState } from "react";
 import {
@@ -17,8 +18,9 @@ import {
   Tooltip,
 } from "@mui/material";
 import DownloadIcon from "@mui/icons-material/Download";
-import { api, type VerseDto } from "../sync/api";
+import type { VerseDto } from "../sync/api";
 import { buildUsfmFromVerses } from "../lib/exportUsfm";
+import { fetchBookVerses } from "../lib/bookVerses";
 
 interface Props {
   book: string;
@@ -35,10 +37,6 @@ type Scope = "chapter" | "book";
 // upstream, read-only resources, not translation output the user edits here.
 const SOURCE_VERSIONS = new Set(["UHB", "UGNT"]);
 
-// Cap on concurrent chapter fetches for a whole-book export so a large book
-// (e.g. Psalms, 150 chapters) doesn't dispatch every request in one burst.
-const FETCH_CONCURRENCY = 6;
-
 function download(filename: string, contents: string): void {
   const blob = new Blob([contents], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -49,30 +47,6 @@ function download(filename: string, contents: string): void {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
-}
-
-// Run `task` over `items` with a bounded number in flight at once, preserving
-// input order in the results.
-async function mapLimit<T, R>(items: T[], limit: number, task: (item: T) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
-  let aborted = false;
-  async function worker(): Promise<void> {
-    // Stop pulling new work once any task has failed — otherwise the sibling
-    // workers keep fetching the rest of the book after the export already failed.
-    while (next < items.length && !aborted) {
-      const i = next++;
-      try {
-        results[i] = await task(items[i]);
-      } catch (e) {
-        aborted = true;
-        throw e;
-      }
-    }
-  }
-  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
-  await Promise.all(workers);
-  return results;
 }
 
 export function ExportUsfmButton({ book, chapter, enabledVersions, chapterVersesFor }: Props) {
@@ -88,18 +62,7 @@ export function ExportUsfmButton({ book, chapter, enabledVersions, chapterVerses
 
   async function versesFor(scope: Scope, version: string): Promise<VerseDto[]> {
     if (scope === "chapter") return chapterVersesFor(version);
-    const summary = await api.getBookSummary(book);
-    // The summary can list chapter 0 (book-intro notes live there), but the
-    // verses table has no chapter-0 scripture, so skip it — no verse rows to
-    // fetch and it would never contribute to the export.
-    const chapters = summary.chapters.filter((c) => c.chapter > 0);
-    const payloads = await mapLimit(chapters, FETCH_CONCURRENCY, (c) => api.getChapter(book, c.chapter));
-    const out: VerseDto[] = [];
-    for (const p of payloads) {
-      const byVerse = p.verses[version];
-      if (byVerse) out.push(...Object.values(byVerse));
-    }
-    return out;
+    return fetchBookVerses(book, version);
   }
 
   async function handleExport(scope: Scope, version: string, aligned: boolean): Promise<void> {

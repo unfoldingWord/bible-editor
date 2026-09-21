@@ -345,3 +345,286 @@ export const EDIT_LOG_SWEEP_SQL = `
           GROUP BY el.row_key
        )
      )`;
+
+// ---------------------------------------------------------------------------
+// Issue #573 part 1 (kept per #611, recovered from the closed PR #594): alarm
+// on a stalling master-confirmed boundary.
+//
+// This is a SEPARATE concern from everything above. The WHAT IS EXEMPT
+// shields (items 1-8) are what actually keep a stalled boundary's rows
+// recoverable — that is the reason this file exists, and they cover both of
+// the merge inputs a stall could otherwise starve (latest_source,
+// human_edit_after_export) plus the pending-ancestor action classes. Being
+// shielded is not the same as being healthy, though: a `master_confirmed_at`
+// that stops advancing means a book+resource's export is STUCK — a lock, a
+// jammed `-be-` branch, a published/frozen book — and nothing shielded here
+// tells anyone that is happening. Concrete precedent that stalls persist for
+// months without anyone noticing: STATE.md's JER ULT export blocked since
+// 2026-07-31, and docs/triggered-export-merge.md's NUM ult/ust unmerged since
+// June 6. This alarm exists to close that visibility gap. It shields no rows
+// and changes no merge behavior; it only warns a human that the boundary has
+// stopped moving, while there is still runway before EDIT_LOG_SWEEP_SQL's
+// retention window would start to bite.
+
+import type { Env } from "./index";
+import { planSystemAlertWrites, type ExistingAlertState } from "./verseMergeEditorAlerts.ts";
+
+// How much runway to alarm with, ahead of the point a stalled boundary's
+// own age would put it at risk from EDIT_LOG_SWEEP_SQL (i.e. before ANY row
+// created right at the boundary would already be old enough to sweep). Two
+// weeks is enough time for someone to notice the alert, diagnose why a
+// book+resource's export stopped advancing master_confirmed_at (a lock, a
+// stuck `-be-` branch, a published/frozen book), and fix it — while staying
+// well clear of 0 days' notice.
+export const EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS = 14 * 86400;
+
+// The admin target for this alarm — same fixed username every other
+// non-per-user system alert in this codebase uses (verseMergeConflicts.ts's
+// ALERT_USERNAME, bookReimport.ts's OWN_PUBLISH_ALERT_USERNAME). A local
+// copy rather than an import for the same reason those two give: each file
+// that needs it is owned by a potentially-concurrent change, so importing
+// across them just to save one string invites an unrelated merge conflict.
+const ALARM_ALERT_USERNAME = "deferredreward";
+
+// Every alert this alarm writes shares this source prefix (see
+// raiseEditLogSweepBoundaryAlerts for why the whole prefix, not just one
+// exact source, is cleared each run).
+const ALARM_SOURCE_PREFIX = "edit_log_sweep_boundary_stale";
+
+function alarmSource(book: string, resource: string): string {
+  return `${ALARM_SOURCE_PREFIX}:${book}:${resource}`;
+}
+
+// The exact SQL text for finding at-risk boundaries, exported (not just used
+// inline below) so editLogSweep.test.mjs can run this literal query against
+// real SQLite — same "export the exact query" reasoning EDIT_LOG_SWEEP_SQL
+// itself documents at the top of this file.
+//
+// ?1 — the alarm threshold as unix seconds: a book+resource alarms once its
+// master_confirmed_at is older than this. Bound once by the caller as
+// `now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS)`
+// — i.e. EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS of runway before the boundary's
+// own age would reach EDIT_LOG_RETENTION_SECONDS. Scoped to 'ult'/'ust' —
+// the only resources the verse merge (and therefore human_edit_after_export
+// / latest_source) ever reads; tn/tq/twl watermark rows are irrelevant here.
+export const EDIT_LOG_SWEEP_ALARM_QUERY_SQL = `
+  SELECT book, resource, master_confirmed_at
+    FROM book_resource_syncs
+   WHERE resource IN ('ult', 'ust')
+     AND master_confirmed_at IS NOT NULL
+     AND master_confirmed_at < ?1
+   ORDER BY master_confirmed_at ASC`;
+
+export interface StaleSweepBoundary {
+  book: string;
+  resource: string;
+  masterConfirmedAt: number;
+  /** Whole days of runway left before the boundary's age reaches EDIT_LOG_RETENTION_SECONDS. Never negative — a boundary already past the retention window clamps to 0 ("no runway left"), not a misleading negative count. */
+  daysRemaining: number;
+}
+
+// Pure translation of one query row into the alarm's own units, split out
+// so the day-math is unit-testable without D1.
+export function toStaleSweepBoundary(
+  row: { book: string; resource: string; master_confirmed_at: number },
+  now: number,
+): StaleSweepBoundary {
+  const ageSeconds = now - row.master_confirmed_at;
+  const remainingSeconds = EDIT_LOG_RETENTION_SECONDS - ageSeconds;
+  return {
+    book: row.book,
+    resource: row.resource,
+    masterConfirmedAt: row.master_confirmed_at,
+    daysRemaining: Math.max(0, Math.floor(remainingSeconds / 86400)),
+  };
+}
+
+export async function findStaleSweepBoundaries(env: Env, now: number): Promise<StaleSweepBoundary[]> {
+  const threshold = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS);
+  const rs = await env.DB.prepare(EDIT_LOG_SWEEP_ALARM_QUERY_SQL)
+    .bind(threshold)
+    .all<{ book: string; resource: string; master_confirmed_at: number }>();
+  return (rs.results ?? []).map((r) => toStaleSweepBoundary(r, now));
+}
+
+// The message must stay BYTE-STABLE for as long as the condition persists, or
+// the dismissal stickiness this alarm reuses planSystemAlertWrites for (see
+// that function's header, and the block comment below) is silently defeated:
+// its only dismissal shield is an equality test on the message text, so a
+// message carrying "hasn't advanced in N day(s)" or "N day(s) of runway left"
+// reads as fresh content on the very next daily run — N ticks by one while
+// `masterConfirmedAt` does not — and a dismissed alert gets reinserted
+// undismissed alongside its dismissed copy every single day until the boundary
+// heals.
+//
+// Both facts are therefore stated as the FIXED dates they derive from.
+// `masterConfirmedAt` is frozen while the boundary is stale (that IS the
+// staleness condition), so both dates hold still across runs. No information is
+// lost: an absolute deadline is what the reader acts on anyway, and elapsed
+// days are the difference between the stated date and today.
+function boundaryMessage(s: StaleSweepBoundary): string {
+  const res = s.resource.toUpperCase();
+  const day = (epochSeconds: number) => new Date(epochSeconds * 1000).toISOString().slice(0, 10);
+  return (
+    `Benjamin — ${s.book} ${res}'s master-confirmed export watermark hasn't advanced since ` +
+    `${day(s.masterConfirmedAt)}. ` +
+    `The edit_log retention sweep (180 days) is heading toward this boundary: once the boundary itself ` +
+    `is older than 180 days, a translator's post-boundary edit to ${s.book} ${res} could age out before ` +
+    `the nightly Door43 merge ever sees it, and the merge could then silently adopt master over that edit ` +
+    `(see issue #573). That boundary passes 180 days on ` +
+    `${day(s.masterConfirmedAt + EDIT_LOG_RETENTION_SECONDS)} — after that date the runway is gone. ` +
+    `Nothing has been lost yet — this ` +
+    `is early warning. Find out why ${s.book} ${res}'s export stopped advancing the watermark (a lock, a ` +
+    `stuck -be- branch, a published/frozen book) and unblock it.`
+  );
+}
+
+// Writes (or refreshes) one system_alerts row per stale book+resource, and
+// clears any previously-alerted book+resource that is no longer stale (its
+// export got unstuck, or a fresh export re-confirmed the watermark) so the
+// alarm doesn't outlive the condition it's reporting.
+//
+// Unlike every single-source alert helper elsewhere in this codebase
+// (postExport.ts, bookReimport.ts's raise*Alert helpers), this alarm can
+// name a VARYING SET of sources across runs — a book+resource only has a
+// row while it's actually stale — so a plain "delete the one exact source,
+// then unconditionally insert" would reintroduce the exact dismissal bug
+// verseMergeConflicts.ts's raiseVerseMergeConflictAlert was fixed for
+// (2026-08-14 six-angle review, "dismissal stickiness" — see
+// verseMergeEditorAlerts.ts's header): every run re-deriving its desired
+// state from scratch and unconditionally deleting+reinserting means a human
+// who dismisses the alert sees it reappear THE VERY NEXT RUN, because the
+// dismissed row is untouched (dismissed_at IS NOT NULL) but a fresh
+// undismissed one gets inserted right alongside it regardless. Reusing
+// planSystemAlertWrites here (keyed on `source` instead of `username` — the
+// function only cares that its map key is a stable identity, not what it
+// represents) gets the same fix for free: a dismissed row with
+// byte-identical content is left alone, an undismissed row is only
+// replaced when its content actually changed, and a source that dropped
+// out of `desired` (its boundary healed) has its undismissed row cleared
+// while any dismissed copy is kept as history.
+//
+// Best-effort, like every other alert helper in this codebase: a failure
+// here must never break the caller's cron tick.
+export async function raiseEditLogSweepBoundaryAlerts(env: Env, now: number = Math.floor(Date.now() / 1000)): Promise<void> {
+  try {
+    const stale = await findStaleSweepBoundaries(env, now);
+    const desired = new Map<string, string>(stale.map((s) => [alarmSource(s.book, s.resource), boundaryMessage(s)]));
+
+    const existingRs = await env.DB.prepare(
+      `SELECT source, message, dismissed_at FROM system_alerts
+        WHERE username = ?1 AND source LIKE ?2 || ':%'`,
+    )
+      .bind(ALARM_ALERT_USERNAME, ALARM_SOURCE_PREFIX)
+      .all<{ source: string; message: string; dismissed_at: number | null }>();
+    // A source can carry BOTH a dismissed historical row and an active one (a
+    // user dismissed the alert, then its message changed while the boundary
+    // stayed stale, so a fresh active row was inserted alongside the dismissed
+    // one). planSystemAlertWrites decides the ACTIVE alert's fate, so collapse
+    // to the undismissed row when both exist — keeping the dismissed one would
+    // make it insert a duplicate active alert every run and never clear a
+    // healed boundary's active rows (Codex #781 review P2). A blind Map(entries)
+    // kept whichever row the query returned last, which the system_alerts_active
+    // index made the dismissed one.
+    const existing = new Map<string, ExistingAlertState>();
+    // #792: nothing in the schema stops a concurrent/retried cron run from
+    // double-inserting a second ACTIVE row for the same source (no unique
+    // index on active (username, source)). Track any source seen with more
+    // than one active row so it can be forced through the delete+reinsert
+    // path below, even when one of the duplicates' message happens to match
+    // `desired` — see the sentinel note after this loop.
+    const duplicateActiveSources = new Set<string>();
+    for (const r of existingRs.results ?? []) {
+      const prev = existing.get(r.source);
+      const row = { message: r.message, dismissedAt: r.dismissed_at };
+      if (!prev) {
+        existing.set(r.source, row);
+        continue;
+      }
+      // An active row always wins — planSystemAlertWrites decides the active
+      // alert's fate. Otherwise, among several dismissed rows (dismiss → message
+      // change → dismiss again leaves more than one), keep the one whose message
+      // MATCHES the current desired message, so a still-dismissed unchanged
+      // alert stays sticky rather than being recreated because we happened to
+      // keep an older dismissed message (Codex #781 review 2nd/3rd pass).
+      if (prev.dismissedAt == null) {
+        if (row.dismissedAt == null) duplicateActiveSources.add(r.source);
+        continue; // already holding an active row
+      }
+      if (row.dismissedAt == null) {
+        existing.set(r.source, row);
+        continue;
+      }
+      const want = desired.get(r.source);
+      if (want !== undefined && prev.message !== want && row.message === want) {
+        existing.set(r.source, row);
+      }
+    }
+    // Force every duplicate-active source through planSystemAlertWrites'
+    // delete+reinsert branch: a sentinel message that can never equal a real
+    // `desired` message (real messages are plain English sentences) defeats
+    // the "message already matches, no-op" sticky check that would otherwise
+    // leave the extra active row live forever whenever the arbitrarily-kept
+    // duplicate's message happened to already match. The resulting DELETE
+    // (`WHERE username=? AND source=? AND dismissed_at IS NULL`) removes ALL
+    // active rows for the source, so both duplicates are cleared together and
+    // replaced by the single fresh INSERT.
+    for (const source of duplicateActiveSources) {
+      existing.set(source, { message: "#792 duplicate active alert", dismissedAt: null });
+    }
+
+    const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
+    if (toDelete.length === 0 && toInsert.length === 0) return;
+
+    // Fold each source's delete+insert into ONE batch (same reasoning as
+    // raiseVerseMergeConflictAlert's own FIX for this exact shape: a
+    // transient failure between a bare DELETE and a separate INSERT batch
+    // could delete an alert and never replace it). Group BY SOURCE so a
+    // refresh's DELETE and INSERT can never land in different batches once
+    // chunking kicks in — the split a flat [...deletes, ...inserts] list would
+    // suffer at >90 statements, which would commit a source's delete in an
+    // earlier batch and lose its alert if the later insert batch failed
+    // (Codex #781 review P2). DELETE is pushed before INSERT within each group
+    // so a refresh replaces rather than duplicates.
+    const bySource = new Map<string, D1PreparedStatement[]>();
+    for (const source of toDelete) {
+      const group = bySource.get(source) ?? [];
+      group.push(
+        env.DB
+          .prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+          .bind(ALARM_ALERT_USERNAME, source),
+      );
+      bySource.set(source, group);
+    }
+    for (const { username: source, message } of toInsert) {
+      const group = bySource.get(source) ?? [];
+      group.push(
+        env.DB
+          .prepare(
+            `INSERT INTO system_alerts (username, severity, source, message, link_url)
+             VALUES (?1, 'warning', ?2, ?3, NULL)`,
+          )
+          .bind(ALARM_ALERT_USERNAME, source, message),
+      );
+      bySource.set(source, group);
+    }
+    // Small by construction (bounded by book x {ult,ust}, well under 200
+    // possible sources total, and only the changed subset lands here), but pack
+    // into <=90-statement batches anyway — never splitting a source's group —
+    // so a partial failure leaves each not-yet-committed source's existing alert
+    // intact rather than deleted-and-not-replaced. Each group is <=2 statements,
+    // so 90 is comfortably under D1's 100-statement cap.
+    const WRITE_BATCH = 90;
+    let batch: D1PreparedStatement[] = [];
+    for (const group of bySource.values()) {
+      if (batch.length > 0 && batch.length + group.length > WRITE_BATCH) {
+        await env.DB.batch(batch);
+        batch = [];
+      }
+      batch.push(...group);
+    }
+    if (batch.length > 0) await env.DB.batch(batch);
+  } catch (e) {
+    console.error("edit_log sweep boundary alarm failed", e instanceof Error ? e.message : String(e));
+  }
+}

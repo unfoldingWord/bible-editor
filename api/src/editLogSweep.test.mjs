@@ -20,7 +20,14 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EDIT_LOG_SWEEP_SQL } from "./editLogSweep.ts";
+import {
+  EDIT_LOG_SWEEP_SQL,
+  EDIT_LOG_RETENTION_SECONDS,
+  EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS,
+  toStaleSweepBoundary,
+  findStaleSweepBoundaries,
+  raiseEditLogSweepBoundaryAlerts,
+} from "./editLogSweep.ts";
 import { verseVersionFloorSql } from "./verseBridge.ts";
 
 let failed = 0;
@@ -644,6 +651,269 @@ console.log("\n[#727: step 7s's reimport-sourced 'delete' on a never-exported bo
 
   assert(survivingIds(d).join(",") === "4", "only the newest delete (4) survives; the older delete (2) ages out — pre-fix both were swept");
   assert(recreatedVersion(d, "ECC", 3, 5, "ULT") === 4, "the floor mints the recreated verse at 3+1 = 4 off the surviving delete's prev_version");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #573 part 1 (#611): the stale-boundary alarm.
+
+// Minimal D1 shim over node:sqlite — same shape as applyVerseRows.test.mjs's
+// makeDb (prepare().bind().all()/.run(), and batch()), reused here so
+// findStaleSweepBoundaries / raiseEditLogSweepBoundaryAlerts can run against
+// this file's own freshDb() without a second, drifting copy of the schema
+// setup.
+function makeD1(sqlite) {
+  const mk = (sql, args) => ({
+    sql,
+    args,
+    bind: (...a) => mk(sql, a),
+    all() {
+      return { results: sqlite.prepare(sql).all(...args), success: true };
+    },
+    run() {
+      const r = sqlite.prepare(sql).run(...args);
+      return { success: true, meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };
+    },
+  });
+  return {
+    prepare: (sql) => mk(sql, []),
+    async batch(stmts) {
+      const out = [];
+      for (const s of stmts) out.push(s.run());
+      return out;
+    },
+  };
+}
+
+function alertRows(sqlite, source) {
+  return sqlite
+    .prepare(`SELECT username, severity, source, message, dismissed_at FROM system_alerts WHERE source LIKE ? ORDER BY source`)
+    .all(source);
+}
+
+console.log("\n[toStaleSweepBoundary: day math]");
+{
+  const now = 1_000_000;
+  const s = toStaleSweepBoundary({ book: "ZEC", resource: "ult", master_confirmed_at: now - EDIT_LOG_RETENTION_SECONDS + 5 * 86400 }, now);
+  assert(s.daysRemaining === 5, `boundary 5 days from the retention cutoff reports 5 days remaining (got ${s.daysRemaining})`);
+  const past = toStaleSweepBoundary({ book: "ZEC", resource: "ult", master_confirmed_at: now - EDIT_LOG_RETENTION_SECONDS - 100 }, now);
+  assert(past.daysRemaining === 0, "a boundary already past the retention window clamps to 0, never negative");
+}
+
+console.log("\n[findStaleSweepBoundaries: a fresh watermark produces no alarm; a watermark older than the threshold does]");
+{
+  const d = freshDb();
+  const env = { DB: makeD1(d) };
+  const now = 20_000_000;
+  syncRow(d, { book: "ZEC", resource: "ult", confirmedAt: now - 10 * 86400, editId: 1 });
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 86400), editId: 1 });
+  syncRow(d, { book: "ECC", resource: "ult", confirmedAt: null, editId: null });
+  syncRow(d, { book: "ZEC", resource: "tn", confirmedAt: now - EDIT_LOG_RETENTION_SECONDS * 2, editId: null });
+
+  const stale = await findStaleSweepBoundaries(env, now);
+
+  assert(stale.length === 1, `exactly one stale boundary found (got ${stale.length})`);
+  assert(stale[0]?.book === "JER" && stale[0]?.resource === "ust", "the stale boundary is JER ust");
+  assert(stale[0]?.daysRemaining < EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS / 86400, "the stale boundary reports less than the full margin's worth of days remaining");
+}
+
+console.log("\n[raiseEditLogSweepBoundaryAlerts: writes a warning naming the book+resource and runway, dismissing it and re-running doesn't duplicate it, and a healed boundary clears its alert]");
+{
+  const d = freshDb();
+  const env = { DB: makeD1(d) };
+  const now = 20_000_000;
+  const staleAt = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 2 * 86400);
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: staleAt, editId: 1 });
+
+  await raiseEditLogSweepBoundaryAlerts(env, now);
+
+  let rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
+  assert(rows.length === 1, `exactly one alert row written (got ${rows.length})`);
+  assert(rows[0]?.severity === "warning", "severity is 'warning', not 'error' — nothing has been lost yet");
+  assert(rows[0]?.source === "edit_log_sweep_boundary_stale:JER:ust", "source names the specific book+resource");
+  assert(rows[0]?.message.includes("JER") && rows[0]?.message.includes("UST"), "message names the specific book+resource");
+  assert(
+    rows[0]?.message.includes(new Date((staleAt + EDIT_LOG_RETENTION_SECONDS) * 1000).toISOString().slice(0, 10)),
+    "message states the DATE the boundary passes 180 days, so the reader still knows the runway",
+  );
+  assert(
+    !/\d+ day\(s\)/.test(rows[0]?.message ?? ""),
+    "message carries no day-counter — a count that ticks daily reads as new content and defeats dismissal (see boundaryMessage)",
+  );
+
+  // Re-running with nothing changed must not create a second row for the
+  // same still-undismissed alert.
+  await raiseEditLogSweepBoundaryAlerts(env, now);
+  rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
+  assert(rows.length === 1, "re-running with an unchanged stale boundary does not duplicate the alert");
+
+  // Dismiss it, then re-run with the SAME still-stale boundary: the
+  // dismissed row must survive as a historical record and must NOT be
+  // resurrected as a fresh undismissed row.
+  d.prepare(`UPDATE system_alerts SET dismissed_at = ?1 WHERE source = 'edit_log_sweep_boundary_stale:JER:ust'`).run(now);
+  await raiseEditLogSweepBoundaryAlerts(env, now);
+  rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
+  assert(rows.length === 1, "still exactly one row after dismiss+re-run (no duplicate created)");
+  assert(rows[0]?.dismissed_at != null, "the dismissed alert is left dismissed rather than being resurrected while the SAME condition persists");
+
+  // ...and re-run again a DAY LATER, which is what production actually does:
+  // this alarm fires once per day, so the run after a dismissal is never the
+  // same `now`. planSystemAlertWrites' only dismissal shield is byte-equality
+  // on the message, so a message embedding elapsed-days or days-remaining
+  // would differ here and resurrect the alert every single day until the
+  // boundary healed. The two assertions above cannot catch that — they re-run
+  // at the identical `now` and so compare identical text no matter what the
+  // message is built from.
+  await raiseEditLogSweepBoundaryAlerts(env, now + 86400);
+  rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
+  assert(rows.length === 1, "a day later, still exactly one row — the dismissed alert is not resurrected by the passage of time");
+  assert(rows[0]?.dismissed_at != null, "the day-later row is still the dismissed one, not a fresh undismissed copy");
+
+  // Heal the boundary (a fresh export re-confirms it) and re-run: any
+  // lingering UNDISMISSED alert for a now-healthy boundary must clear. Reset
+  // dismissed_at first so we're testing the "healed" clear path specifically,
+  // not the dismissal-survives path just proven above.
+  d.prepare(`UPDATE system_alerts SET dismissed_at = NULL WHERE source = 'edit_log_sweep_boundary_stale:JER:ust'`).run();
+  d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book = 'JER' AND resource = 'ust'`).run(now - 86400);
+  await raiseEditLogSweepBoundaryAlerts(env, now);
+  rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
+  assert(rows.length === 0, "an undismissed alert for a boundary that healed is cleared, not left stale forever");
+}
+
+console.log("\n[raiseEditLogSweepBoundaryAlerts: a refresh's DELETE and INSERT stay in one batch across the 90-statement chunk boundary (Codex #781 P2)]");
+{
+  const d = freshDb();
+  const now = 20_000_000;
+  const staleBase = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 2 * 86400);
+  const N = 46; // 46 refreshes = 46 DELETEs + 46 INSERTs = 92 statements > one 90-statement batch
+  for (let i = 0; i < N; i++) syncRow(d, { book: `B${i}`, resource: "ult", confirmedAt: staleBase, editId: 1 });
+  // First run creates the N alerts.
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  // Shift every boundary's date so its message changes — the next run must
+  // DELETE the old alert and INSERT the new one for each source (a refresh).
+  for (let i = 0; i < N; i++) {
+    d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book = ?2 AND resource = 'ult'`).run(
+      staleBase - 86400,
+      `B${i}`,
+    );
+  }
+  // Recording shim: capture, per batch, the (op, source) of every statement.
+  const base = makeD1(d);
+  const batches = [];
+  const recording = {
+    prepare: base.prepare,
+    async batch(stmts) {
+      batches.push(stmts.map((s) => ({ op: s.sql.trim().startsWith("DELETE") ? "del" : "ins", source: s.args[1] })));
+      return base.batch(stmts);
+    },
+  };
+  await raiseEditLogSweepBoundaryAlerts({ DB: recording }, now);
+  assert(batches.length >= 2, `the refresh spanned more than one batch (got ${batches.length}) — exercises the chunk path`);
+  const batchOf = (op, source) => batches.findIndex((b) => b.some((s) => s.op === op && s.source === source));
+  let split = 0;
+  for (let i = 0; i < N; i++) {
+    const src = `edit_log_sweep_boundary_stale:B${i}:ult`;
+    const dB = batchOf("del", src);
+    const iB = batchOf("ins", src);
+    if (dB !== -1 && iB !== -1 && dB !== iB) split++;
+  }
+  assert(split === 0, `no source's DELETE and INSERT were split across batches (got ${split} split)`);
+  const live = alertRows(d, "edit_log_sweep_boundary_stale:%").filter((r) => r.dismissed_at == null);
+  assert(live.length === N, `all ${N} alerts present after the refresh (got ${live.length}) — none deleted-and-not-replaced`);
+}
+
+console.log("\n[raiseEditLogSweepBoundaryAlerts: a source with a dismissed row AND a changed active alert doesn't duplicate, and still clears on heal (Codex #781 P2)]");
+{
+  const d = freshDb();
+  const now = 20_000_000;
+  const source = "edit_log_sweep_boundary_stale:JER:ust";
+  const activeCount = () => alertRows(d, source).filter((r) => r.dismissed_at == null).length;
+  const stale1 = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 2 * 86400);
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: stale1, editId: 1 });
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now); // active alert, message M1
+  d.prepare(`UPDATE system_alerts SET dismissed_at = ?1 WHERE source = ?2`).run(now, source); // dismiss it
+  // Message changes (date shifts) while the boundary stays stale → a fresh
+  // active row is inserted alongside the dismissed one.
+  d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book='JER' AND resource='ust'`).run(stale1 - 3 * 86400);
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 1, `one active alert after the message change (got ${activeCount()})`);
+  // Re-run unchanged: must NOT insert a duplicate active alert (the bug: the
+  // existing-map kept the dismissed row, so the planner re-inserted every run).
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 1, `re-running does not duplicate the active alert (got ${activeCount()})`);
+  assert(
+    alertRows(d, source).filter((r) => r.dismissed_at != null).length === 1,
+    "the dismissed historical row is preserved",
+  );
+  // Heal the boundary: the active alert must clear despite the dismissed row.
+  d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book='JER' AND resource='ust'`).run(now - 86400);
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 0, "a healed boundary clears the active alert even with a dismissed row present");
+}
+
+console.log("\n[raiseEditLogSweepBoundaryAlerts: two dismissed rows for one boundary — the current message stays dismissed, not resurrected (Codex #781 3rd pass)]");
+{
+  const d = freshDb();
+  const now = 20_000_000;
+  const source = "edit_log_sweep_boundary_stale:JER:ust";
+  const activeCount = () => alertRows(d, source).filter((r) => r.dismissed_at == null).length;
+  const stale1 = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 2 * 86400);
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: stale1, editId: 1 });
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now); // active M1
+  d.prepare(`UPDATE system_alerts SET dismissed_at = ?1 WHERE source = ?2 AND dismissed_at IS NULL`).run(now, source); // dismiss M1
+  // Message changes → active M2 alongside dismissed M1.
+  d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book='JER' AND resource='ust'`).run(stale1 - 3 * 86400);
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  d.prepare(`UPDATE system_alerts SET dismissed_at = ?1 WHERE source = ?2 AND dismissed_at IS NULL`).run(now, source); // dismiss M2 too
+  assert(activeCount() === 0, "both alerts dismissed for this boundary");
+  // Re-run with the boundary still stale at the M2 message: the older dismissed
+  // M1 row must not fool the planner into recreating an active alert — the
+  // current (M2) message is still dismissed and must stay sticky.
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 0, "the current message stays dismissed — an older dismissed message doesn't resurrect it");
+}
+
+console.log("\n[raiseEditLogSweepBoundaryAlerts: two ACTIVE rows for one source normalize to one, even when one already matches (issue #792)]");
+{
+  const d = freshDb();
+  const now = 20_000_000;
+  const source = "edit_log_sweep_boundary_stale:JER:ust";
+  const activeCount = () => alertRows(d, source).filter((r) => r.dismissed_at == null).length;
+  const stale1 = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 2 * 86400);
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: stale1, editId: 1 });
+
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now); // one active row, message M1
+  assert(activeCount() === 1, "sanity: exactly one active row after the first run");
+  const m1 = alertRows(d, source)[0]?.message;
+
+  // Simulate a concurrent/retried cron double-insert (no unique index on
+  // active (username, source) — the schema gap #792 is filed against):
+  // a second active row, BYTE-IDENTICAL to the first, alongside it.
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES ('deferredreward', 'warning', ?1, ?2, NULL)`,
+  ).run(source, m1);
+  assert(activeCount() === 2, "sanity: two active rows now exist for the same source");
+
+  // Pre-fix bug: the existing-map build kept the first active row it saw and
+  // skipped the second outright; since that kept row's message already
+  // matched `desired`, planSystemAlertWrites treated it as a no-op sticky
+  // alert and scheduled no delete — the duplicate persisted forever.
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 1, `duplicate active rows collapse to one (got ${activeCount()})`);
+  assert(alertRows(d, source)[0]?.message === m1, "the surviving row still carries the correct message");
+
+  // Re-running again must not reintroduce a duplicate or churn the row.
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 1, "re-running after normalization stays at one active row");
+
+  // A duplicate that heals (boundary no longer stale) must still collapse to
+  // zero, not get stuck at one because of the sentinel mismatch.
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES ('deferredreward', 'warning', ?1, ?2, NULL)`,
+  ).run(source, m1);
+  assert(activeCount() === 2, "sanity: two active rows again before healing");
+  d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book = 'JER' AND resource = 'ust'`).run(now - 86400);
+  await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
+  assert(activeCount() === 0, "duplicate active rows for a healed boundary both clear, not just one");
 }
 
 if (failed > 0) {

@@ -30,7 +30,7 @@ import { outbox } from "../sync/outbox";
 import { api, ApiError, CHECK_LANES, setReadOnlyReason } from "../sync/api";
 import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
-import { countThreads, rowKey, type CommentThread } from "../lib/commentsIndex";
+import { countThreads, resolveCommentLocation, rowKey, type CommentThread, type LiveRows } from "../lib/commentsIndex";
 import { CommentsPopover } from "./CommentsPopover";
 import type { CommentTarget, NewCommentDraft, OpenCommentsFn } from "./commentsTarget";
 import { targetKey, targetsMatch } from "./commentsTarget";
@@ -62,13 +62,20 @@ import { buildVerseIndex, concatSourceRange, formatVerseLabel, noteCoveredVerses
 import { runSaveChain } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
-import { buildQuoteFromSelection, selectionFromQuote } from "../lib/quoteBuilder";
+import {
+  buildQuoteFromSegments,
+  selectionFromSegments,
+  selectionFromQuote,
+  verseScopedKey,
+  type QuoteBuildSegment,
+} from "../lib/quoteBuilder";
 import { resolveSpanToSource } from "../lib/twlResolve";
 import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
+import type { BookViewportRestore } from "./BookView";
 import { ResourceColumn, type AlignmentTabProps, type PanelMode, type ReorderPreview, type ResourceCheckoff, type ResourceLane } from "./ResourceColumn";
 import type { AlignmentPanelHandle } from "./AlignmentPanel";
 import {
@@ -78,6 +85,7 @@ import {
 } from "./SideBySideAligner";
 import { TopBar } from "./TopBar";
 import { ExportUsfmButton } from "./ExportUsfmButton";
+import { PrintPreviewButton } from "./PrintPreviewButton";
 import { BookLintIndicator } from "./BookLintIndicator";
 import { AlignAttentionIndicator } from "./AlignAttentionIndicator";
 import { BookNotesIndicator } from "./BookNotesIndicator";
@@ -115,6 +123,27 @@ function buildAlignerSlice(sourceData: ChapterPayload, verse: number, bibleVersi
       : sourceData.verses[sourceLabel]?.[rangeStart] ?? null;
   const twlForVerse = sourceData.twl.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd);
   return { sourceLabel, targetVerse, sourceVerse, twlForVerse, rangeStart, rangeEnd };
+}
+
+// Bundle UHB(/UGNT) + ULT + UST verseObjects for every verse a quote-build
+// target covers.
+function quoteBuildSegmentsForRow(
+  row: { verse: number; ref_raw?: string | null },
+  kind: "tn" | "twl",
+  verseIndexByVersion: Record<string, Record<number, VerseDto>>,
+): QuoteBuildSegment[] {
+  const verses = kind === "tn" ? noteCoveredVerses(row) : [row.verse];
+  const grab = (bv: string, verse: number): unknown[] | null => {
+    const dto = verseIndexByVersion[bv]?.[verse];
+    const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    return Array.isArray(vo) ? vo : null;
+  };
+  return verses.map((verse) => ({
+    verse,
+    uhb: grab("UHB", verse) ?? grab("UGNT", verse),
+    ult: grab("ULT", verse),
+    ust: grab("UST", verse),
+  }));
 }
 
 // Word-token count of one source verse row — text/punctuation nodes excluded,
@@ -204,6 +233,7 @@ const TAB_FOR_ROW_KIND = {
 // Stable empty list so the popover's `threads` prop doesn't churn identity while
 // a target has no threads yet.
 const EMPTY_COMMENT_THREADS: CommentThread[] = [];
+const EMPTY_COVERED_VERSES: number[] = [];
 
 interface Props {
   book: string;
@@ -246,6 +276,7 @@ interface Props {
 }
 
 export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, onCommentActivity, onCommentThreadsViewed, authReady = false, notificationsMenu, syncWarnings }: Props) {
+  const bookViewportRestoreRef = useRef<BookViewportRestore | null>(null);
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -334,6 +365,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Declared above useChapterRoom because that hook's handler object wires
   // applyWsComment straight through.
   const commentsEnabled = !isViewer;
+  // The chapter's live rows, for the orphan/intro-redirect logic in
+  // indexComments (#818) — lets a comment anchored to a since-deleted tn/tq/twl
+  // row stay visible (floated to the verse) instead of vanishing, and lets a
+  // chapter-intro comment always land on whichever tn row is the CURRENT
+  // intro rather than the one it was created against.
+  const commentLiveRows = useMemo<LiveRows | undefined>(() => {
+    if (!data) return undefined;
+    const rowIds = new Set<string>();
+    for (const r of data.tn) rowIds.add(rowKey("tn", r.id));
+    for (const r of data.tq) rowIds.add(rowKey("tq", r.id));
+    for (const r of data.twl) rowIds.add(rowKey("twl", r.id));
+    const introRow = data.tn.find((r) => r.verse === 0);
+    return { rowIds, introRowId: introRow ? introRow.id : null };
+  }, [data]);
   const {
     index: commentsIndex,
     loading: commentsLoading,
@@ -345,7 +390,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     removeComment,
     applyWsComment,
     reload: reloadComments,
-  } = useComments(book, chapter, commentsEnabled);
+  } = useComments(book, chapter, commentsEnabled, commentLiveRows);
 
   // Live cross-tab updates. The server broadcasts row writes via the
   // ChapterRoom DO; we dedupe by version so the originating user's tab
@@ -1062,6 +1107,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // "always applicable", but verse 0 outside the Psalms usually has none, so the
   // rail should show a "nothing to check" dash there rather than a checkbox.
   const introHasTwl = useMemo(() => !!data && data.twl.some((r) => r.verse === 0), [data]);
+  // Surface the intro tile when verse 0 carries a comment thread but no resource
+  // row, scripture, or missing-marker condition would otherwise render it —
+  // e.g. an intro comment whose only verse-0 TN row was deleted floats to verse
+  // 0 (see resolveCommentLocation) and would have no badge to open it (#824
+  // review). A stable boolean so tileSet doesn't recompute on comment text edits.
+  const introHasComment = useMemo(
+    () => commentsEnabled && (commentsIndex.threadsByVerse.get(0)?.length ?? 0) > 0,
+    [commentsEnabled, commentsIndex],
+  );
 
   // tileSet runs verseHasUnalignedWork (a full alignment parse) for EVERY
   // verse, so it must not recompute when only a TN/TQ/TWL row changed. Keying
@@ -1155,13 +1209,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // api/src/chapterSummary.ts), and without a tile the rail is blank and
     // activeVerse stays at a verse 1 that does not exist there.
     const tiles: VerseTile[] = [];
-    if (chapter === 0 || introHasResource || introHasScripture || introMarkerMissing) {
+    if (chapter === 0 || introHasResource || introHasScripture || introMarkerMissing || introHasComment) {
       tiles.push({ verse: 0, has: false, lanes: buildLanes(0) });
     }
     const verseNums = [...versesWithSomething].filter((v) => v > 0).sort((a, b) => a - b);
     for (const v of verseNums) tiles.push({ verse: v, has: hasUnalignedFor(v), lanes: buildLanes(v) });
     return tiles;
-  }, [chapter, versesForTiles, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl]);
+  }, [chapter, versesForTiles, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl, introHasComment]);
 
   // Which alignment-attention refs (from the last nightly export) are already
   // fixed in the currently loaded chapter — re-parsed against live verse
@@ -1379,8 +1433,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }
       }
     }
+    // Bridged TN refs ("48:11-12"): keep every covered verse on screen so
+    // both halves of the quote can highlight without navigating away.
+    if (activeNoteId && data) {
+      const note = data.tn.find((r) => r.id === activeNoteId);
+      if (note) {
+        const covered = noteCoveredVerses(note);
+        if (covered.length > 1) {
+          start = Math.min(start, covered[0]);
+          end = Math.max(end, covered[covered.length - 1]);
+        }
+      }
+    }
     return [start, end] as const;
-  }, [versesForTiles, activeVerse]);
+  }, [versesForTiles, activeVerse, activeNoteId, data]);
 
   const visibleVersions = useMemo(
     () => enabledVersions.filter((v) => availableVersions.includes(v)),
@@ -1481,18 +1547,37 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // highlight source. Notes and words are mutually exclusive; clicking one
   // clears the other. Words use `orig_words` (Hebrew source words) which the
   // same matcher handles directly for UHB and via \zaln-s for ULT/UST.
-  const { activeQuote, activeOccurrence } = useMemo(() => {
-    if (!data) return { activeQuote: null, activeOccurrence: null };
-    if (activeNoteId) {
-      const r = data.tn.find((r) => r.id === activeNoteId);
-      return { activeQuote: r?.quote ?? null, activeOccurrence: r?.occurrence ?? null };
-    }
-    if (activeWordId) {
-      const r = data.twl.find((r) => r.id === activeWordId);
-      return { activeQuote: r?.orig_words ?? null, activeOccurrence: r?.occurrence ?? null };
-    }
-    return { activeQuote: null, activeOccurrence: null };
-  }, [activeNoteId, activeWordId, data]);
+  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses } =
+    useMemo(() => {
+      const empty = {
+        activeQuote: null as string | null,
+        activeOccurrence: null as number | null,
+        activeQuotePartialGroups: false,
+        activeQuoteCoveredVerses: EMPTY_COVERED_VERSES,
+      };
+      if (!data) return empty;
+      if (activeNoteId) {
+        const r = data.tn.find((row) => row.id === activeNoteId);
+        if (!r) return empty;
+        const covered = noteCoveredVerses(r);
+        return {
+          activeQuote: r.quote ?? null,
+          activeOccurrence: r.occurrence ?? null,
+          activeQuotePartialGroups: covered.length > 1,
+          activeQuoteCoveredVerses: covered,
+        };
+      }
+      if (activeWordId) {
+        const r = data.twl.find((row) => row.id === activeWordId);
+        return {
+          activeQuote: r?.orig_words ?? null,
+          activeOccurrence: r?.occurrence ?? null,
+          activeQuotePartialGroups: false,
+          activeQuoteCoveredVerses: r ? [r.verse] : EMPTY_COVERED_VERSES,
+        };
+      }
+      return empty;
+    }, [activeNoteId, activeWordId, data]);
 
   // Reorder "stoplight": while a note is dragged (or for ~3s after an arrow
   // move) ResourceColumn reports the moved note's candidate neighbours; we
@@ -1615,23 +1700,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const startQuoteBuild = useCallback(
     (target: { kind: "tn" | "twl"; id: string }) => {
       setQuoteBuildTarget(target);
-      // Pre-seed the selection from the row's existing quote so the translator
-      // can ADD to it instead of starting over. Resolves the stored quote +
-      // occurrence against the UHB/UGNT verse; an unresolvable quote (e.g.
-      // hand-typed English) yields an empty set and the picker starts fresh.
       const row =
         target.kind === "tn"
           ? data?.tn.find((r) => r.id === target.id)
           : data?.twl.find((r) => r.id === target.id);
-      const uhb = row
-        ? verseIndexByVersion["UHB"]?.[row.verse] ?? verseIndexByVersion["UGNT"]?.[row.verse]
-        : undefined;
-      const verseObjects = (uhb?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-      // TN stores its source quote in `quote`; TWL stores it in `orig_words`.
+      const segments = row ? quoteBuildSegmentsForRow(row, target.kind, verseIndexByVersion) : [];
       const existingQuote =
-        target.kind === "tn" ? (row as TnRow | undefined)?.quote : (row as TwlRow | undefined)?.orig_words;
+        target.kind === "tn"
+          ? (row as TnRow | undefined)?.quote
+          : (row as TwlRow | undefined)?.orig_words;
       setQuoteBuildSelectedKeys(
-        row ? selectionFromQuote(verseObjects, existingQuote, row.occurrence) : new Set(),
+        row ? selectionFromSegments(segments, existingQuote, row.occurrence) : new Set(),
       );
     },
     [data, verseIndexByVersion],
@@ -1657,9 +1736,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setQuoteBuildAnchor(document.querySelector<HTMLElement>(selector));
   }, [quoteBuildTarget]);
 
-  // Verse objects bundled for the picker — UHB always; ULT/UST may be
-  // absent for OT-only or NT-only deployments, so default to null and
-  // let the picker show an empty-state hint.
   const quoteBuildContext = useMemo(() => {
     if (!quoteBuildTarget || !data) return null;
     const row =
@@ -1667,23 +1743,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         ? data.tn.find((r) => r.id === quoteBuildTarget.id)
         : data.twl.find((r) => r.id === quoteBuildTarget.id);
     if (!row) return null;
-    const grab = (bv: string): unknown[] | null => {
-      const dto = verseIndexByVersion[bv]?.[row.verse];
-      const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-      return Array.isArray(vo) ? vo : null;
-    };
     return {
-      verse: row.verse,
-      uhb: grab("UHB") ?? grab("UGNT"),
-      ult: grab("ULT"),
-      ust: grab("UST"),
+      segments: quoteBuildSegmentsForRow(row, quoteBuildTarget.kind, verseIndexByVersion),
     };
   }, [quoteBuildTarget, data, verseIndexByVersion]);
 
-  // Materialize the in-flight quote-build selection into a row patch and
-  // fire the existing note save pipe. Pulls UHB verseObjects for the
-  // current verse — the buildQuoteFromSelection helper does the grouping
-  // and " & " join + occurrence calculation.
   const commitQuoteBuild = useCallback(() => {
     if (!quoteBuildTarget || !data) return;
     const row =
@@ -1691,11 +1755,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         ? data.tn.find((r) => r.id === quoteBuildTarget.id)
         : data.twl.find((r) => r.id === quoteBuildTarget.id);
     if (!row) return;
-    const uhb = verseIndexByVersion["UHB"]?.[row.verse] ?? verseIndexByVersion["UGNT"]?.[row.verse];
-    const verseObjects =
-      (uhb?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-    if (!Array.isArray(verseObjects)) return;
-    const built = buildQuoteFromSelection(verseObjects, quoteBuildSelectedKeys);
+    const segments = quoteBuildSegmentsForRow(row, quoteBuildTarget.kind, verseIndexByVersion);
+    const built = buildQuoteFromSegments(segments, quoteBuildSelectedKeys);
     if (!built) return;
     // Only enqueue a save when the build actually changes the stored quote +
     // occurrence — re-running "build from source" over an unchanged selection
@@ -1838,8 +1899,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // the anchor effect pick the row up on the next render.
       if (!resolved || !resolved.confident || !resolved.orig_words) {
         setQuoteBuildTarget({ kind: "twl", id: created.id });
+        const seeded = selectionFromQuote(uhb, resolved?.orig_words, resolved?.occurrence);
         setQuoteBuildSelectedKeys(
-          selectionFromQuote(uhb, resolved?.orig_words, resolved?.occurrence),
+          new Set([...seeded].map((k) => verseScopedKey(verse, k))),
         );
       }
     },
@@ -2024,8 +2086,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   }, []);
 
   const requestSelectVerse = useCallback(
-    (v: number) => {
+    (v: number, onAccepted?: () => void) => {
       runWithDirtyGate(() => {
+        onAccepted?.();
         setActiveVerse(v);
         setActiveNoteId(null);
         setActiveWordId(null);
@@ -2304,22 +2367,36 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       pushPipelineToast("That comment is no longer available.", "info");
       return;
     }
+    // A row-anchored deep link needs the chapter's live rows to resolve a
+    // possibly-relocated target. If comments loaded before chapter data,
+    // commentLiveRows is still undefined — wait rather than consume the link
+    // against the stale row now (which the stale-target cleanup would then
+    // close, while the consumed-key guard blocks reopening, so the alert would
+    // appear to do nothing). The effect re-runs once data arrives (#824 review).
+    if (comment.rowKind != null && !commentLiveRows) return;
     consumedCommentKeyRef.current = key;
-    setActiveVerse(comment.verse);
-    // Set the focus id matching the comment's row kind and clear the other two
+    // Resolve to where indexComments actually filed the thread — a comment whose
+    // row was deleted/replaced (or a stale chapter-intro comment) is relocated
+    // to its verse or the current intro row, so opening/highlighting its
+    // ORIGINAL rowKind/rowId would show an empty popover and silently consume
+    // the alert (#824 review).
+    const loc = resolveCommentLocation(comment, commentLiveRows);
+    setActiveVerse(loc.verse);
+    // Set the focus id matching the RESOLVED row kind and clear the other two
     // — the trio must stay consistent (same rule goToLintIssue follows), or a
-    // stale question/word highlight lingers from wherever focus was before.
-    setActiveNoteId(comment.rowKind === "tn" ? comment.rowId : null);
-    setActiveQuestionId(comment.rowKind === "tq" ? comment.rowId : null);
-    setActiveWordId(comment.rowKind === "twl" ? comment.rowId : null);
+    // stale question/word highlight lingers from wherever focus was before. A
+    // floated (orphaned) comment resolves to a null rowKind, clearing all three.
+    setActiveNoteId(loc.rowKind === "tn" ? loc.rowId : null);
+    setActiveQuestionId(loc.rowKind === "tq" ? loc.rowId : null);
+    setActiveWordId(loc.rowKind === "twl" ? loc.rowId : null);
     // No clicked element on a deep-link arrival, so anchor stays null and the
     // popover falls back to the centred anchor.
     setCommentPanel({
       anchor: null,
       target:
-        comment.rowKind != null && comment.rowId != null
-          ? { verse: comment.verse, rowKind: comment.rowKind, rowId: comment.rowId }
-          : { verse: comment.verse },
+        loc.rowKind != null && loc.rowId != null
+          ? { verse: loc.verse, rowKind: loc.rowKind, rowId: loc.rowId }
+          : { verse: loc.verse },
     });
     setHighlightCommentId(comment.id);
     setScrollNonce((n) => n + 1);
@@ -2329,7 +2406,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // stayed set, this effect's deps never changed, and clicking the SAME alert
     // again was silently ignored (verified).
     onCommentConsumed?.();
-  }, [commentsIndex, commentsLoading, commentsLoadedKey, commentsError, book, chapter, initialCommentId, onCommentConsumed, pushPipelineToast]);
+  }, [commentsIndex, commentLiveRows, commentsLoading, commentsLoadedKey, commentsError, book, chapter, initialCommentId, onCommentConsumed, pushPipelineToast]);
 
   // Keep the alignment target's verse in step with the active verse while
   // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
@@ -3376,6 +3453,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             }
           />
         }
+        printPreview={
+          <PrintPreviewButton
+            book={book}
+            chapter={chapter}
+            enabledVersions={displayedVersions}
+            chapterVersesFor={(version) =>
+              data ? Object.values(data.verses[version] ?? {}) : []
+            }
+          />
+        }
         bookLocksButton={
           <Tooltip title="Book locks">
             <IconButton
@@ -3499,20 +3586,25 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeVerse={activeVerse}
           activeNoteQuote={activeQuote}
           activeNoteOccurrence={activeOccurrence}
+          activeNoteQuotePartialGroups={activeQuotePartialGroups}
+          activeNoteCoveredVerses={activeQuoteCoveredVerses}
           reorderHighlight={reorderHighlight}
           mode={mode}
           enabledVersions={displayedVersions}
           availableVersions={availableVersions}
           bookChapterList={bookChapterList}
           bookChapters={bookHook && mode === "book" ? bookHook.chapters : undefined}
+          bookViewportRestoreRef={bookViewportRestoreRef}
           onLoadBookChapter={bookHook ? bookHook.loadChapter : undefined}
-          onSelectBookVerse={(ch, v) => {
+          onSelectBookVerse={(ch, v, viewport, onAccepted) => {
             // Verse click in book mode navigates via URL so the chapter
             // payload + resources reload through the existing useChapter
             // flow. App.tsx lifts the useBook cache so this round-trip is
             // cheap.
             runWithDirtyGate(() => {
+              onAccepted?.();
               if (ch !== chapter) {
+                bookViewportRestoreRef.current = viewport ? { chapter: ch, verse: v, ...viewport } : null;
                 onNavigate?.(book, ch, v);
               } else {
                 setActiveVerse(v);
@@ -3564,7 +3656,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               restored_from_version: null,
             });
           }}
-          onSelectVerse={(v) => requestSelectVerse(v)}
+          onSelectVerse={requestSelectVerse}
           onModeChange={(m) => {
             setMode(m);
             saveToStorage(SCRIPTURE_MODE_KEY, m);
@@ -4263,10 +4355,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           anchorEl={quoteBuildAnchor}
           book={book}
           chapter={chapter}
-          verse={quoteBuildContext.verse}
-          uhbVerseObjects={quoteBuildContext.uhb}
-          ultVerseObjects={quoteBuildContext.ult}
-          ustVerseObjects={quoteBuildContext.ust}
+          segments={quoteBuildContext.segments}
           lexiconMap={lexiconMap}
           selectedKeys={quoteBuildSelectedKeys}
           onToggleKey={toggleQuoteBuildWord}
