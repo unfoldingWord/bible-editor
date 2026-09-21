@@ -111,7 +111,13 @@ import {
   type TsvRefSide,
   type TsvEditLogEntry,
 } from "./tsvMerge.ts";
-import { shouldRecordResourceSync, isSystemicMergeRefusal, isKeptOverDoor43AtScale } from "./reimportSyncGate";
+import {
+  shouldRecordResourceSync,
+  isSystemicMergeRefusal,
+  isKeptOverDoor43AtScale,
+  computeWithholdReason,
+} from "./reimportSyncGate";
+import { recordSyncWithhold, clearSyncWithhold } from "./syncWithholds";
 import { evaluateStaleBaseReplacement, type StaleBaseHold } from "./staleBaseGate";
 import { recordStaleBaseHold, raiseStaleBaseHoldAlert, clearStaleBaseHold } from "./staleBaseHolds";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
@@ -10123,11 +10129,19 @@ export async function runChunkedReimport(
   // gate decides at STAGING time (it is what withholds the file from the chunk
   // steps in the first place), so a sync-step-only override would leave D1
   // un-updated while stamping the watermark — the worst of both.
+  // `userId` — issue #686 item 7: attributed to the operator who dispatched
+  // this run (admin.ts's `reimportWorkflowParams`, whole-book "Pull from
+  // Door43"), null/undefined on every cron path. Threaded only into the
+  // edit_log `user_id` column via reimportStagedChunk — it never reaches a
+  // row's own `updated_by`/pristine columns (sync writes clear or leave those
+  // alone regardless of who triggered the run), so this cannot affect
+  // isPristineTsv or any pristine-write predicate.
   opts: {
     chunk?: number;
     mergeRefusalOverrideResource?: Resource;
     idBlockedOverrideResource?: Resource;
     staleBaseOverrideResource?: Resource;
+    userId?: number | null;
   } = {},
 ): Promise<ReimportResult> {
   const chunkSize = opts.chunk ?? REIMPORT_CHAPTER_CHUNK;
@@ -10280,7 +10294,7 @@ export async function runChunkedReimport(
     const counts = await step.do(
       `reimport-${book}-ch${start}-${end}`,
       { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, null),
+      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, opts.userId ?? null),
     );
     mergePerResource(perResource, counts);
   }
@@ -10477,6 +10491,17 @@ export async function runChunkedReimport(
       const idBlockedOverride = opts.idBlockedOverrideResource === e.resource;
       const dropped =
         (perResource[e.resource].conflict_skipped ?? 0) + (perResource[e.resource].tombstone_blocked ?? 0);
+      // Issue #829: same four conditions as the `if` below, computed as WHICH
+      // one fired rather than just whether one did — see computeWithholdReason's
+      // doc for why this mirrors, rather than replaces, the gate immediately
+      // after it.
+      const withholdReason = computeWithholdReason(
+        perResource[e.resource],
+        idBlockedOverride,
+        systemicRefusals,
+        mergeRecordFailed,
+        applyIncomplete,
+      );
       if (
         !shouldRecordResourceSync(perResource[e.resource], idBlockedOverride) ||
         systemicRefusals ||
@@ -10496,11 +10521,27 @@ export async function runChunkedReimport(
         // has something to refuse against. No-op when a real (or previously
         // withheld) row already exists — see recordWithheldSyncIfAbsent.
         await recordWithheldSyncIfAbsent(env, book, e.resource);
+        // Issue #829: persist WHY, so recordStaleSkipAlert can name the real
+        // cause instead of guessing. withholdReason is always non-null here —
+        // it mirrors the `if` above exactly — but a defensive fallback keeps
+        // this write from ever asserting a cause it didn't measure.
+        await recordSyncWithhold(
+          env,
+          book,
+          e.resource,
+          withholdReason?.reason ?? "counts_incomplete",
+          withholdReason?.count ?? 0,
+          alertObservedAt,
+          instanceId,
+        );
         continue;
       }
       if (!e.masterSha) continue;
       await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");
       recorded++;
+      // This pair just reached a clean stamp, so it was NOT withheld above —
+      // release any reason left over from a past run (issue #829).
+      await clearSyncWithhold(env, book, e.resource);
       // Issue #473 option A: the override let a nonzero drop count through to
       // a recorded sync above — raise the distinct "force-released, Door43
       // will lose these rows" alert instead of clearing it. Ordered AFTER
