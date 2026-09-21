@@ -23,9 +23,10 @@ import { splitGluedAlignmentWords } from "../api/src/importParsers.ts";
 // Issue #686 item 5: this bootstrap importer left every row's 0060
 // provenance columns NULL and its edit_log 'create' rows carrying no `book`
 // — indistinguishable from "never touched" and, for the edit_log rows, not
-// even scoped to a book. Mirrors api/src/bookImport.ts's live import path:
-// tn/tq/twl get provenance + edit_log, verses get provenance only (no
-// per-row edit_log — same volume rationale as the live path's insertVerses).
+// even scoped to a book. Mirrors api/src/bookImport.ts's live import path,
+// including verses (#686 item 4, PR #855): every insert — verses, tn, tq,
+// twl — gets both the row-level provenance stamp and a paired kind-scoped
+// edit_log 'create' row.
 import { PROVENANCE_COLUMNS, provenanceValues } from "../api/src/rowProvenance.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -155,6 +156,14 @@ function importVerses(bibleVersion, srcPath) {
       lines.push(
         `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, ${PROVENANCE_COLS_SQL}) VALUES (${q(book)}, ${q(chNum)}, ${q(vNum)}, ${q(vEnd)}, ${q(bibleVersion)}, ${q(json_blob)}, ${q(text)}, ${PROVENANCE_VALS_SQL});`,
       );
+      // Paired kind='verse' edit_log 'create' row (#686 item 4 parity, PR
+      // #855) — row_key matches the live PATCH path's format (verses.ts) and
+      // bookImport.ts's own new insertVerses pairing, so a bootstrap-imported
+      // verse's version history isn't blank.
+      emitEditLogCreate("verse", `${book}/${chNum}/${vNum}/${bibleVersion}`, book, {
+        content: json_blob,
+        plain_text: text,
+      });
       count++;
     }
   }
@@ -247,11 +256,11 @@ function refParts(refRaw) {
   return [chNum, vsNum];
 }
 
-// Each TSV row also gets a matching edit_log v1 entry. Without this, the
-// history endpoint has no record of the imported baseline — so anyone who
-// later edits an imported row would lose the ability to view (or revert
-// to) the original content. The payload is the same shape the API stores
-// for a `create` action via POST /api/rows.
+// Every inserted row (verses above, each TSV row below) also gets a matching
+// edit_log v1 entry. Without this, the history endpoint has no record of the
+// imported baseline — so anyone who later edits an imported row would lose
+// the ability to view (or revert to) the original content. The payload
+// shapes mirror what the corresponding live write path stores.
 //
 // `book` is included (issue #686 item 5) so the entry is scoped like every
 // other write path's edit_log rows — previously omitted entirely, leaving

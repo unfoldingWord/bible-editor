@@ -114,12 +114,13 @@ for (const row of rows) {
   // Deliberately NO edit_log row (codex review on PR #784). Both history
   // readers (verses.ts, rows.ts) filter `new_version IS NOT NULL`, and this
   // script does not bump `version` (see the header comment on why: avoiding
-  // spurious 409s for concurrent translators). An edit_log row here would
-  // carry `new_version = NULL` and be silently invisible to the history
-  // dialog — dead data claiming to be an audit trail. The provenance stamp
-  // above is the real, durable trace of this repair, matching the same
-  // no-edit_log choice already made for bulk verse writes elsewhere
-  // (api/src/bookImport.ts's insertVerses, scripts/reimport-ust-from-dcs.mjs).
+  // spurious 409s for concurrent translators). Unlike import-book.mjs's and
+  // reimport-ust-from-dcs.mjs's fresh inserts — which pair a real version-1
+  // edit_log row — an edit_log row for THIS repair would carry
+  // `new_version = NULL` (there is no new version; the row already exists)
+  // and would be silently invisible to the history dialog: dead data
+  // claiming to be an audit trail. The provenance stamp above is the real,
+  // durable trace of this repair.
 }
 
 const lines = [];
