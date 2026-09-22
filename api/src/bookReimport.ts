@@ -8053,16 +8053,18 @@ interface StagedResource {
   // an override that consents to a risk must leave a record of having been
   // used, exactly like idBlockedOverride's raise-instead-of-clear.
   staleBaseOverridden?: StaleBaseHold | null;
-  // Issue #857: the SAME (book, resource) merge-ancestor cutoff
-  // (getMasterConfirmedAt) already fetched a few lines below in this same
-  // staging iteration — at the one instant the staged file's bytes and this
-  // cutoff are guaranteed to describe the same moment. Carried into the prune
-  // step (runChunkedReimport's `reimport-prune-*` loop) so it compares the
-  // staged file against the cutoff that was true when that file was staged,
-  // not one re-read after the chunk-apply steps have run — a concurrent
-  // export advancing this pair's watermark in between could otherwise make
-  // the prune conclude an AI-only row was exported (aiRowContentIsExported)
-  // and delete it, when the staged file predates that export.
+  // Issue #857: this (book, resource)'s merge-ancestor cutoff
+  // (getMasterConfirmedAt), read during THIS staging call — after
+  // loadMasterLineage returns, not before (see the F2 comment at that call
+  // site: loadMasterLineage can itself advance the boundary via #658, so a
+  // pre-lineage read can already be stale by the time staging finishes).
+  // Carried into the prune step (runChunkedReimport's `reimport-prune-*`
+  // loop) so it compares the staged file against the cutoff that was true
+  // when staging for THIS run finished, not one re-read after the
+  // chunk-apply steps have run — a DIFFERENT concurrent Workflow instance
+  // advancing this pair's watermark in between could otherwise make the
+  // prune conclude an AI-only row was exported (aiRowContentIsExported) and
+  // delete it, when the staged file predates that other run's export.
   // Absent (undefined) only on a plan replayed from a Workflow instance that
   // started before this shipped; the prune step falls back to a fresh read in
   // that case, same as its pre-#857 behavior.
@@ -9872,11 +9874,28 @@ async function planAndStageBookResources(
       alertObservedAt,
     );
     let confirmedBaseR2Key: string | null = null;
+    // Issue #857 follow-up (Codex review on #866, finding F2): `stageCutoff`
+    // above was read BEFORE loadMasterLineage, but loadMasterLineage can
+    // itself advance master_confirmed_at/master_confirmed_edit_id from THIS
+    // SAME call, via #658's own-publish-decline convergence
+    // (accountOwnPublishDecline -> markLineageConfirmedConverged). Threading
+    // the pre-lineage `stageCutoff` into StagedResource.stagedCutoff would
+    // freeze the PRUNE step to a boundary already stale by the time staging
+    // finished — a row this run's own lineage step just confirmed exported
+    // would misread as "not yet exported" and survive a prune it should
+    // pass, reintroducing the #485/#832 resurrection failure mode (a row
+    // master genuinely deleted gets kept in D1 and re-exported the next
+    // night). So re-read fresh here, after loadMasterLineage returns,
+    // instead of reusing `stageCutoff`. For ult/ust this is the SAME read
+    // the confirmed-base fetch below already needed for #658; for TSV kinds
+    // (the only ones the prune actually touches) it's a new one-time read.
+    let stagedCutoff: MergeCutoff = stageCutoff;
     if (resource === "ult" || resource === "ust") {
       // loadMasterLineage may have advanced the boundary via #658. Parse the
       // exact confirmed render once now, then stage only its compact verse map
       // for all later chunk steps.
       const confirmed = await getMasterConfirmedAt(env, book, resource, true);
+      stagedCutoff = confirmed;
       if (confirmed.confirmedVerseBases?.size) {
         confirmedBaseR2Key = `reimport-stage/${instanceId}/${book}/${resource}-confirmed-bases`;
         await env.BLOBS.put(
@@ -9889,6 +9908,8 @@ async function planAndStageBookResources(
           { httpMetadata: { contentType: "application/json" } },
         );
       }
+    } else {
+      stagedCutoff = await getMasterConfirmedAt(env, book, resource);
     }
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
@@ -9900,7 +9921,7 @@ async function planAndStageBookResources(
       verifiedComplete,
       lineage,
       confirmedBaseR2Key,
-      stagedCutoff: stageCutoff,
+      stagedCutoff,
       noBaseCleared: noBaseStats.noBaseCleared,
       // Null on every ordinary night. Non-null ONLY on a force-released
       // stale-base adoption — see the gate above and staleBaseOverridden below.
