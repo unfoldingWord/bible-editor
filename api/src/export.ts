@@ -1202,6 +1202,34 @@ export function shouldRecordRevertReport(dcsChanged: boolean, masterContent: str
   return dcsChanged && masterContent != null;
 }
 
+// Did master stand, byte for byte, on the render WE last published — i.e. has
+// nobody else's edit landed on it since?
+//
+// This is the base check the revert report was missing. Without it the report
+// flags every difference between our new render and master, which on a book
+// nobody else touches is just *our own translators' work since last night* —
+// exactly what the export exists to ship. Measured 2026-09-22: ECC UST raised
+// "overwrote master's current content on 23 row(s) ... systemic_23_substantive
+// _reverts" while `git.door43.org` history showed the only commits to
+// `21-ECC.usfm` between our 09-20 and 09-22 exports were our own. Nothing was
+// at risk; the 23 rows were one translator's evening in ECC 7.
+//
+// The report's whole stated purpose is "in case a hand-edit there was lost".
+// If master holds precisely the bytes we last pushed, no hand-edit exists there
+// outside our own lineage, so there is nothing to lose and nothing to report.
+//
+// Fails OPEN — both shas must be present AND equal to suppress. A missing
+// `pushedBlobSha` (never published, or migration 0048 unapplied) or an
+// unhashable master keeps today's behaviour, because an unknown base cannot
+// prove master is safe to overwrite. That direction matters: a false alarm
+// costs attention, a missed revert costs someone's work.
+export function masterIsOurLastPublish(
+  masterBlobSha: string | null,
+  pushedBlobSha: string | null,
+): boolean {
+  return masterBlobSha != null && pushedBlobSha != null && masterBlobSha === pushedBlobSha;
+}
+
 // Does the number of substantive reverts this export is about to make justify
 // escalating the alert's wording beyond routine? This NEVER blocks the export
 // — there is no `block` field, only `escalate` — because a revert report is

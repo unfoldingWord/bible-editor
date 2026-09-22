@@ -46,6 +46,7 @@ import {
   usfmRevertReport,
   tsvRevertReport,
   shouldRecordRevertReport,
+  masterIsOurLastPublish,
   classifyRevertSeverity,
   mechanicalOverwriteAlert,
   isMasterConfirmed,
@@ -93,7 +94,7 @@ import {
 } from "./bookReimport";
 import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
 import { dcsResourceFile, fetchDcsMasterText, fileBlobShaAtCommit, fileHeadCommit, type ReimportResource } from "./dcsSources";
-import { gitBlobSha, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
+import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
 import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
@@ -1033,6 +1034,29 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // Only when we'd actually commit (dcsAllowed) and only for TSV resources,
     // whose row==line model makes the count exact. This is what would have
     // stopped the twl_PSA clobber (4880 rows shipped over master's 7776).
+    // The base for the export-revert report: the blob sha of the render we
+    // published LAST time. Read here, before recordPushedRender below replaces
+    // it with tonight's render — by the time the report runs, the column no
+    // longer holds the previous publish. See masterIsOurLastPublish.
+    let priorPushedBlobSha: string | null = null;
+    if (dcsAllowed) {
+      try {
+        const prior = await this.env.DB.prepare(
+          `SELECT pushed_blob_sha FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+        )
+          .bind(book, resource)
+          .first<{ pushed_blob_sha: string | null }>();
+        priorPushedBlobSha = prior?.pushed_blob_sha ?? null;
+      } catch (e) {
+        // Fail open — an unreadable base just means we report as before.
+        console.error("export: prior pushed_blob_sha read failed; revert report keeps its unfiltered behaviour", {
+          book,
+          resource,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+
     let tsvMasterContentForRevertReport: string | null = null;
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
       const guard = await this.checkTsvShrink(book, resource, built.rowCount, built.content, fresh.masterSha);
@@ -1419,13 +1443,34 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // recorded it. Still no second fetch: usfmMasterContentForRevertReport
       // / tsvMasterContentForRevertReport are the same raw content the
       // shrink/alignment guards captured earlier in this method.
+      //
+      // Base check (masterIsOurLastPublish): if master still holds exactly the
+      // bytes we published last time, nobody else's edit is sitting there, so
+      // this export overwrites only our own prior render — there is no hand-edit
+      // to have lost and nothing to report. Without it, every night's ordinary
+      // translator work on an otherwise-untouched book raised a "overwrote
+      // master's current content" alert.
+      const masterContentForRevertReport =
+        resource === "ult" || resource === "ust"
+          ? usfmMasterContentForRevertReport
+          : tsvMasterContentForRevertReport;
+      const masterBlobSha =
+        masterContentForRevertReport != null ? await gitBlobShaOrNull(masterContentForRevertReport) : null;
+      const masterUntouchedSinceOurPublish = masterIsOurLastPublish(masterBlobSha, priorPushedBlobSha);
+      if (masterUntouchedSinceOurPublish) {
+        console.log(
+          `export: revert report skipped for ${book} ${resource} — master still holds our last publish (${(priorPushedBlobSha ?? "").slice(0, 12)})`,
+        );
+      }
       if (
+        !masterUntouchedSinceOurPublish &&
         (resource === "ult" || resource === "ust") &&
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
         const report = usfmRevertReport(built.content, usfmMasterContentForRevertReport as string);
         await this.recordExportRevertReport(book, resource, "usfm", report.entries, mechanical, branch, instanceId, alertObservedAt);
       } else if (
+        !masterUntouchedSinceOurPublish &&
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
       ) {
