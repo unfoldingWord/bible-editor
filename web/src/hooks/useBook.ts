@@ -99,6 +99,12 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
   // load (the effect above already clears the cache).
   useEffect(() => {
     return () => {
+      // Deliberately reads the LIVE ref at cleanup time: loadChapter (below)
+      // keeps adding controllers to this map for as long as the effect is
+      // mounted, so a snapshot taken at setup would miss every controller
+      // added after that — exactly the in-flight loads this cleanup exists to
+      // cancel on a book change.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
       for (const ctrl of chapterCtrls.current.values()) ctrl.abort();
       chapterCtrls.current.clear();
     };
