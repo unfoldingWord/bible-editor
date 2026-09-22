@@ -2499,6 +2499,69 @@ function utf8Base64(s) {
   );
 }
 
+// --- three-way revert report (#870): report only where master moved off base ---
+// #869 suppresses the whole report when master's bytes equal our last publish.
+// When master DID move (a bot merged one JER chapter), the report used to list
+// every row that differed, most of them just our own translators' work. With
+// the base render supplied, a row is reported only when master also differs
+// from base there.
+{
+  const verseUsfm = (verses) => `\\id JER\n\\c 1\n\\p\n` + verses.map(([v, t]) => `\\v ${v} ${t}\n`).join("");
+  const base = verseUsfm([[1, "base one"], [2, "base two"]]);
+  // v1: master moved (bot edit) and we differ -> report. v2: master == base,
+  // we changed it -> suppress.
+  const master = verseUsfm([[1, "bot one"], [2, "base two"]]);
+  const rendered = verseUsfm([[1, "ours one"], [2, "ours two"]]);
+  const r = usfmRevertReport(rendered, master, base);
+  assert(
+    r.entries.length === 1 && r.entries[0].ref === "1:1" && r.entries[0].class === "substantive",
+    `usfm: only the verse where master moved off base is reported, with today's class; got ${JSON.stringify(r.entries)}`,
+  );
+  assert(
+    usfmRevertReport(rendered, master).entries.length === 2,
+    `usfm: no base -> every differing verse reported, exactly as before #870`,
+  );
+  assert(
+    usfmRevertReport(rendered, master, null).entries.length === 2,
+    `usfm: base unreadable (null) -> fail open, report every differing verse`,
+  );
+  // A verse new on master (absent from base) counts as moved.
+  const masterNew = verseUsfm([[1, "base one"], [2, "base two"], [3, "bot three"]]);
+  const renderedNew = verseUsfm([[1, "ours one"], [2, "base two"], [3, "ours three"]]);
+  const rNew = usfmRevertReport(renderedNew, masterNew, base);
+  assert(
+    rNew.entries.length === 1 && rNew.entries[0].ref === "1:3",
+    `usfm: a verse absent from base is master movement -> reported; got ${JSON.stringify(rNew.entries)}`,
+  );
+
+  const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
+  const tnRow = (ref, id, note) => `${ref}\t${id}\t\t\tword\t1\t${note}`;
+  const tsv = (rows) => `${TN_HEADER}\n${rows.join("\n")}\n`;
+  const tBase = tsv([tnRow("1:1", "ab01", "base"), tnRow("1:2", "ab02", "base")]);
+  const tMaster = tsv([tnRow("1:1", "ab01", "bot"), tnRow("1:2", "ab02", "base"), tnRow("1:3", "ab03", "bot new")]);
+  const tRendered = tsv([tnRow("1:1", "ab01", "ours"), tnRow("1:2", "ab02", "ours"), tnRow("1:3", "ab03", "ours new")]);
+  const t = tsvRevertReport(tRendered, tMaster, "tn", tBase);
+  assert(
+    t.entries.map((e) => e.ref).join(",") === "1:1,1:3" && t.entries.every((e) => e.class === "substantive"),
+    `tsv: rows where master moved (ab01) or is new (ab03) reported; ab02 (master == base) suppressed; got ${JSON.stringify(t.entries)}`,
+  );
+  assert(
+    tsvRevertReport(tRendered, tMaster, "tn", null).entries.length === 3,
+    `tsv: base unreadable (null) -> fail open, report every differing row`,
+  );
+  assert(
+    tsvRevertReport(tRendered, tMaster, "tn", "garbage without an ID header").entries.length === 3,
+    `tsv: unparseable base -> fail open, report every differing row`,
+  );
+  // A Reference-only move on master is still movement.
+  const tMasterMoved = tsv([tnRow("1:9", "ab01", "base"), tnRow("1:2", "ab02", "base")]);
+  const tMoved = tsvRevertReport(tRendered, tMasterMoved, "tn", tBase);
+  assert(
+    tMoved.entries.length === 1 && tMoved.entries[0].ref === "1:9",
+    `tsv: master changing only Reference counts as moved -> reported; got ${JSON.stringify(tMoved.entries)}`,
+  );
+}
+
 // --- isMasterConfirmed: the ONLY commitToDcs outcome that proves master
 // holds our content ---
 // branchTouched:false fires from exactly one place in commitToDcs — its own

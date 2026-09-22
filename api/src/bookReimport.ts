@@ -4170,6 +4170,25 @@ async function readPushedBlobText(env: Env, repo: string, sha: string): Promise<
   }
 }
 
+// The exact bytes of the render book_resource_syncs says we last pushed: the
+// R2 copy (#790) first, Door43's blob by sha when that key is missing. Also
+// the base for the export-revert report's three-way diff (#870). null when
+// neither is readable; callers fail open on that.
+export async function readPushedRenderText(
+  env: Env,
+  book: string,
+  resource: Resource,
+  r2Key: string | null,
+  blobSha: string | null,
+): Promise<string | null> {
+  let raw = r2Key ? await readStaged(env, r2Key) : null;
+  if (raw == null && blobSha) {
+    const file = dcsResourceFile(book, resource);
+    raw = file ? await readPushedBlobText(env, file.repo, blobSha) : null;
+  }
+  return raw;
+}
+
 async function confirmedVerseBases(
   env: Env,
   book: string,
@@ -4190,11 +4209,7 @@ async function confirmedVerseBases(
     row.pushed_blob_sha == null
   ) return null;
 
-  let raw = row.pushed_r2_key ? await readStaged(env, row.pushed_r2_key) : null;
-  if (raw == null) {
-    const file = dcsResourceFile(book, resource);
-    raw = file ? await readPushedBlobText(env, file.repo, row.pushed_blob_sha) : null;
-  }
+  const raw = await readPushedRenderText(env, book, resource, row.pushed_r2_key, row.pushed_blob_sha);
   if (raw == null) return null;
   try {
     const bases = new Map<string, string>();

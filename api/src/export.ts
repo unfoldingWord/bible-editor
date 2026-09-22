@@ -1078,9 +1078,24 @@ export interface UsfmRevertReport {
 // reported — that is new/removed content, the shrink guard's territory, not a
 // "we overwrote something" finding. This NEVER decides whether to ship; it
 // runs only after the shrink/alignment guards have already allowed the commit.
-export function usfmRevertReport(renderedUsfm: string, masterUsfm: string): UsfmRevertReport {
+//
+// `baseUsfm` (#870) is the render we published LAST time (book_resource_syncs
+// .pushed_r2_key). When given, a differing verse is reported only if master
+// ALSO differs from base there: master == base means master never moved at
+// that verse since our last publish, so the difference is our own work since
+// then and overwriting it loses nothing. Without this, a book where a bot
+// merged one chapter reported every verse our translators had touched across
+// the whole book. Equality with base is exact (same parsed structure), not
+// canonicalized, so a cosmetic-only move on master still reports. Fails open:
+// a null or unparseable base reports every differing verse, as before.
+export function usfmRevertReport(
+  renderedUsfm: string,
+  masterUsfm: string,
+  baseUsfm: string | null = null,
+): UsfmRevertReport {
   const rendered = verseTextByRef(renderedUsfm);
   const master = verseTextByRef(masterUsfm);
+  const base = baseUsfm == null ? null : verseTextByRef(baseUsfm);
   // Either side failing to parse leaves us with no reliable comparison — this
   // report is observational only, so decline to report rather than guess.
   if (rendered === null || master === null) return { entries: [], totalVerses: 0 };
@@ -1089,6 +1104,7 @@ export function usfmRevertReport(renderedUsfm: string, masterUsfm: string): Usfm
     const renderedText = rendered.get(ref);
     if (renderedText === undefined) continue; // verse absent from render — not our concern here
     if (renderedText === masterText) continue; // byte-identical, nothing overwritten
+    if (base !== null && base.get(ref) === masterText) continue; // master never moved here — the difference is ours
     const same = canonicalizeForRevertCompare(masterText) === canonicalizeForRevertCompare(renderedText);
     entries.push({ ref, class: same ? "formatting" : "substantive" });
   }
@@ -1138,21 +1154,31 @@ function parseTsvRowsById(raw: string): Map<string, string[]> | null {
 // field" for classification purposes — Reference just supplies the ref for
 // the report (master's own Reference value for that ID), and ID is the join
 // key, not content.
+//
+// `baseTsv` (#870): same three-way filter as usfmRevertReport's `baseUsfm` —
+// a differing row is reported only if master's row also differs from our last
+// publish's row (every cell, Reference included, compared exactly). A row
+// absent from base is new on master, so it counts as moved. Fails open on a
+// null or unparseable base.
 export function tsvRevertReport(
   renderedTsv: string,
   masterTsv: string,
   kind: "tn" | "tq" | "twl",
+  baseTsv: string | null = null,
 ): TsvRevertReport {
   const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
   const refIdx = headers.indexOf("Reference");
   const idIdx = headers.indexOf("ID");
   const rendered = parseTsvRowsById(renderedTsv);
   const master = parseTsvRowsById(masterTsv);
+  const base = baseTsv == null ? null : parseTsvRowsById(baseTsv);
   if (rendered === null || master === null) return { entries: [], totalRows: 0 };
   const entries: TsvRevertEntry[] = [];
   for (const [id, masterCells] of master) {
     const renderedCells = rendered.get(id);
     if (!renderedCells) continue; // row absent from render — not our concern here
+    const baseCells = base?.get(id);
+    if (baseCells && baseCells.join("\t") === masterCells.join("\t")) continue; // master never moved here — the difference is ours
     const diffFields: string[] = [];
     for (let i = 0; i < headers.length; i++) {
       if (i === refIdx || i === idIdx) continue;
