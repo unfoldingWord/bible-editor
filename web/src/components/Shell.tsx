@@ -1001,7 +1001,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         pushPipelineToast(`Couldn't update Preserve: ${msg}`, "error");
       }
     },
-    [applyLocalRowPatch, pushPipelineToast],
+    [book, applyLocalRowPatch, pushPipelineToast],
   );
 
   const handleSetNoteHint = useCallback(
@@ -1020,7 +1020,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         pushPipelineToast(`Couldn't update Hint: ${msg}`, "error");
       }
     },
-    [applyLocalRowPatch, pushPipelineToast],
+    [book, applyLocalRowPatch, pushPipelineToast],
   );
 
   // The note delete button. Trash is a reversible, visible soft-delete (the
@@ -1385,6 +1385,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }
     }
     return [...set];
+    // `bookHook` itself is deliberately excluded: useBook returns a fresh object
+    // every render, so depending on it would make this memo recompute (and hand
+    // ScriptureColumn a fresh array) on every render — exactly what the comment
+    // above says this memo exists to avoid. `bookHook?.chapters` is the stable,
+    // actually-changing signal (a new Map only when chapters are added/updated).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [versesForTiles, mode, bookHook?.chapters]);
 
   // Range-aware lookup: ChapterPayload.verses is keyed by verse_start, so a
@@ -1472,7 +1478,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bookHook && mode === "book"
         ? (bookHook.summary?.chapters ?? []).map((c) => c.chapter)
         : undefined,
-    [bookHook, mode, bookHook?.summary],
+    // `bookHook` already covers `bookHook.summary` (it's a plain object useBook
+    // returns fresh every render, so this memo already recomputes every render
+    // regardless — that's a pre-existing perf gap in useBook's return value, not
+    // something this dependency list can fix; see #842).
+    [bookHook, mode],
   );
   // Restore a previously dragged ratio for the NEW mode/column-count (falling
   // back to null → autoSplit if the user never dragged one for this shape) —
@@ -1530,6 +1540,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }
     }
     return [...set];
+    // `bookHook` excluded for the same reason as availableVersions above: it's a
+    // fresh object every render, and `bookHook?.chapters` is the stable signal.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data?.verses, bookHook?.chapters]);
   const lexiconMapRaw = useLexicon(uhbStrongs);
   // useLexicon hands back a fresh Map every render; stabilize its identity so
@@ -1792,6 +1805,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     setQuoteBuildTarget(null);
     setQuoteBuildSelectedKeys(new Set());
+    // `enqueueRow` excluded: it's recreated every render (not itself a stable
+    // useCallback), so listing it here would in turn make every consumer of
+    // this callback's identity churn on every render too.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [quoteBuildTarget, quoteBuildSelectedKeys, data, verseIndexByVersion]);
 
   // Promote a per-verse TWL suggestion to a real link. Resolve its matched ULT
@@ -1905,7 +1922,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         );
       }
     },
-    [data, verseIndexByVersion, book, chapter, twTitles, lockedTwlVerses],
+    [data, verseIndexByVersion, book, chapter, twTitles, lockedTwlVerses, applyLocalRowInsert],
   );
 
   // Whether a per-verse suggestion is already covered on the active verse. Done
@@ -2782,6 +2799,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             )
         : undefined,
     };
+    // `restoreVerse` excluded: it's recreated every render, so listing it here
+    // would make this memoized props object churn every render too.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [alignerTarget, data, chapter, bookHook, book, openDualAligner, applyLocalVerse, enqueueVerseSafely]);
 
   // Props for the side-by-side popup: ULT + UST slices against one shared
