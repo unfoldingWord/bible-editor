@@ -1030,6 +1030,129 @@ await withFetch(
   },
 );
 
+// ─── #875: a 'done' body whose only output[] entry names a repo classify()
+// doesn't recognize must NOT silently finalize as done ─────────────────────
+// Drives the REAL pollPipelineJob -> importJobOutput -> stageJobOutput/
+// applyJobOutput chain (same rationale as the #402 test above: a dedicated
+// fake D1 is needed, not fakePollEnv, so the import claim can actually
+// succeed and staging/apply can actually run to completion). Unlike the #402
+// fixture, the live "SELECT state, error_kind" re-reads here always report a
+// healthy state — this run must reach importJobOutput's ordinary, non-aborted
+// return so the finalize-vs-retry decision under test is the one
+// pollPipelineJob itself makes on `importResult.allOutputReposUnrecognized`.
+const doneUnrecognizedRepoOutput = JSON.stringify({
+  state: "done",
+  output: [{ type: "unknown", repo: "unfoldingWord/en_unrecognized", rawUrl: "https://example/raw" }],
+});
+await withFetch(
+  async () => new Response(doneUnrecognizedRepoOutput, { status: 200 }),
+  async () => {
+    console.log("\n[#875: done body with only an unrecognized-repo output entry does not finalize as done]");
+    const dbState = { claimedAt: 3000 };
+    let guardedUpdateArgs = null;
+
+    function dispatch(sql, args) {
+      if (/SELECT dcs_username FROM users/.test(sql)) {
+        return { changes: 0, rows: [], single: { dcs_username: "translator" } };
+      }
+      if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
+        return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+      }
+      if (/SELECT state, error_kind FROM pipeline_jobs WHERE job_id = \?1/.test(sql)) {
+        // Always healthy — this run must never abort mid-apply (unlike the
+        // #402 fixture above), so it reaches the ordinary return path.
+        return { changes: 0, rows: [], single: { state: "running", error_kind: null } };
+      }
+      if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) {
+        return { changes: 0, rows: [], single: { staged_at: null } }; // fresh stage
+      }
+      if (/DELETE FROM pending_imports/.test(sql)) {
+        return { changes: 0, rows: [], single: null };
+      }
+      if (/UPDATE pipeline_jobs SET staged_at = unixepoch\(\)/.test(sql)) {
+        return { changes: 1, rows: [], single: null };
+      }
+      if (/SELECT user_id FROM pipeline_jobs/.test(sql)) {
+        return { changes: 0, rows: [], single: { user_id: 1 } };
+      }
+      if (/ORDER BY kind, chapter, verse, id/.test(sql)) {
+        return { changes: 0, rows: [], single: null }; // nothing staged (the only entry is unrecognized)
+      }
+      // The poll's own guarded final UPDATE — this is the one under test.
+      if (/SET\s*\n\s*state = \?2,[\s\S]*last_polled_at = unixepoch\(\)/.test(sql)) {
+        guardedUpdateArgs = args;
+        return { changes: 1, rows: [], single: null };
+      }
+      return { changes: 0, rows: [], single: null };
+    }
+
+    const queries = [];
+    const env = {
+      BT_API_TOKEN: "tok",
+      queries,
+      DB: {
+        prepare(sql) {
+          queries.push(sql);
+          return {
+            bind(...args) {
+              return {
+                sql,
+                args,
+                async run() {
+                  const res = dispatch(sql, args);
+                  return { meta: { changes: res.changes }, results: res.rows };
+                },
+                async first() {
+                  return dispatch(sql, args).single;
+                },
+                async all() {
+                  return { results: dispatch(sql, args).rows };
+                },
+              };
+            },
+          };
+        },
+        async batch(stmts) {
+          return stmts.map((s) => {
+            const res = dispatch(s.sql, s.args);
+            return { meta: { changes: res.changes }, results: res.rows };
+          });
+        },
+      },
+    };
+
+    const result = await pollPipelineJob(env, {
+      ...forceStoppedMidPollJob,
+      job_id: "job-unrecognized-repo",
+      follow_up_job_id: null,
+      error_kind: null,
+    });
+
+    assert(result.kind === "ok", "poll completes without throwing");
+    assert(guardedUpdateArgs !== null, "the poll's own guarded state UPDATE was issued");
+    assert(
+      guardedUpdateArgs?.[1] === "running",
+      `state is held at 'running' (retry), not written as upstream's 'done' (got ${JSON.stringify(guardedUpdateArgs?.[1])})`,
+    );
+    assert(
+      guardedUpdateArgs?.[4] === "import_failed",
+      `error_kind is 'import_failed', routing through the same retry-then-fail path as a thrown import error (got ${JSON.stringify(guardedUpdateArgs?.[4])})`,
+    );
+    assert(
+      typeof guardedUpdateArgs?.[5] === "string" && guardedUpdateArgs[5].includes("unrecognized repo"),
+      `error_message explains the cause (got ${JSON.stringify(guardedUpdateArgs?.[5])})`,
+    );
+    assert(
+      guardedUpdateArgs?.[6] === null,
+      "output_json is NOT written — the next poll re-fetches and re-evaluates upstream output, same as any other import failure",
+    );
+    assert(
+      !queries.some((q) => /INSERT INTO pipeline_jobs/.test(q)),
+      "the follow-up job was NEVER enqueued for a run that imported nothing",
+    );
+  },
+);
+
 // ─── F6: the CAS UPDATE runs before the upstream stop call, and the final
 // error_message UPDATE runs after it ─────────────────────────────────────
 // Order matters: the old code called upstream /stop BEFORE the CAS, so a CAS

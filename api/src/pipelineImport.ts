@@ -83,6 +83,14 @@ export interface ImportResult {
   aborted?: boolean;
   abortState?: string | null;
   abortErrorKind?: string | null;
+  // True when at least one output[] entry carried a rawUrl (so it reached
+  // classify()) but NONE of those entries named a repo classify() recognizes.
+  // Distinguishes "the bot's done body is unimportable" (issue #875) from the
+  // ordinary, expected case of a mixed batch where some entries are usable —
+  // see parseOutputEntry/stageJobOutput below for how it's computed, and
+  // pollPipelineJob for how it's used (retry-then-fail instead of a silent
+  // 'done' that imported nothing).
+  allOutputReposUnrecognized?: boolean;
 }
 
 // Classify a single output[] entry into the resource kind we know how to
@@ -226,11 +234,15 @@ export function outputKindAllowedFor(pipelineType: string, kind: "verse" | "tn" 
 async function parseOutputEntry(
   ctx: ImportContext,
   entry: OutputEntry,
-): Promise<{ staged: StagedRow[]; skipReason?: string }> {
+): Promise<{ staged: StagedRow[]; skipReason?: string; repoUnrecognized?: boolean }> {
   if (!entry.rawUrl) return { staged: [], skipReason: "missing rawUrl" };
   const cls = classify(entry);
   if (cls.kind === "unknown") {
-    return { staged: [], skipReason: `unrecognized repo: ${entry.repo ?? "(none)"}` };
+    return {
+      staged: [],
+      skipReason: `unrecognized repo: ${entry.repo ?? "(none)"}`,
+      repoUnrecognized: true,
+    };
   }
   // PIPELINE_WRITES is what the chapter lock promises a run will overwrite —
   // the editor guards (rows.ts / verses.ts) and, since #828, the nightly
@@ -707,11 +719,23 @@ async function stageJobOutput(
 
   const skipped: string[] = [];
   const allStaged: StagedRow[] = [];
+  // Tracked alongside the loop (not re-derived from `skipped`'s strings
+  // afterward) so the signal stays tied to entries that actually reached
+  // classify() — an entry skipped for missing rawUrl never calls classify()
+  // and must not count as "recognized" OR "unrecognized" here. See
+  // ImportResult.allOutputReposUnrecognized.
+  let sawRawUrlEntry = false;
+  let sawRecognizedRepo = false;
   for (const entry of outputs) {
-    const { staged, skipReason } = await parseOutputEntry(job, entry);
+    const { staged, skipReason, repoUnrecognized } = await parseOutputEntry(job, entry);
     if (skipReason) skipped.push(skipReason);
+    if (entry.rawUrl) {
+      sawRawUrlEntry = true;
+      if (!repoUnrecognized) sawRecognizedRepo = true;
+    }
     allStaged.push(...staged);
   }
+  const allOutputReposUnrecognized = sawRawUrlEntry && !sawRecognizedRepo;
 
   // Batch insert in chunks. D1 batch() caps at 100 statements per call.
   const stmt = env.DB.prepare(
@@ -781,7 +805,7 @@ async function stageJobOutput(
       .run();
   }
 
-  return { inserted, byKind, skipped };
+  return { inserted, byKind, skipped, allOutputReposUnrecognized };
 }
 
 // ── Apply phase ───────────────────────────────────────────────────────────
