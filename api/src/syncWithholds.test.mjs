@@ -236,6 +236,21 @@ function freshEnv() {
 }
 
 {
+  // Issue #873: a Workflow replay reuses the SAME instanceId across attempts
+  // (deliberately — it's stable across replay). An attempt that first
+  // recorded a withhold and then, on a later successful step, clears it must
+  // be able to delete its OWN row (run_id === runId). Under a strict `<`
+  // guard this row would be stranded — a stale reason surviving until some
+  // unrelated later run happened to touch the same (book, resource) — which
+  // is a self-inflicted version of the exact bug the ordering guard exists
+  // to prevent.
+  const env = freshEnv();
+  await recordSyncWithhold(env, "JER", "ult", "chapters_locked", 2, 1_700_000_000_000, "run-A");
+  await clearSyncWithhold(env, "JER", "ult", "run-A");
+  eq(await readSyncWithhold(env, "JER", "ult", "run-A"), null, "a run can clear its own just-recorded row (same runId)");
+}
+
+{
   // Issue #858 item 5: two overlapping Workflow instances on the SAME
   // (book, resource) despite the resource-scoped locks meant to prevent it.
   // run-B (started AFTER run-A) records its own fresh withhold; run-A then

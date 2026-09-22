@@ -67,7 +67,7 @@ export async function recordSyncWithhold(
  * there, so any standing reason is not yet known to be stale).
  *
  * `runId`: this run's own exportWorkflow.ts `instanceId`, guarding the DELETE
- * to `run_id < ?3`. Without it, an unconditional delete-by-key is a race: two
+ * to `run_id <= ?3`. Without it, an unconditional delete-by-key is a race: two
  * Workflow instances can overlap on the same (book, resource) despite the
  * resource-scoped chapter locks (#830) that are meant to prevent it, and an
  * OLDER instance calling this AFTER a NEWER one has already recorded its own
@@ -75,12 +75,23 @@ export async function recordSyncWithhold(
  * (readSyncWithhold) then sees no reason on record for a cause it measured
  * moments ago. `instanceId` is a fixed-width ISO timestamp (plus a
  * collision-proofing suffix — see exportWorkflow.ts), so lexicographic order
- * matches start-time order: `run_id < runId` only ever matches a row from a
- * run that started strictly before this one, never a concurrent or later one.
+ * matches start-time order: a STRICTLY newer row's run_id is never `<=` this
+ * one's, so it always survives.
+ *
+ * `<=` rather than `<` (issue #873, codex review of this fix): a Workflow
+ * replay reuses the same instanceId across attempts (deliberately — it's
+ * stable across replay), so an attempt that first recorded a withhold and
+ * then, on a later successful step, clears it needs to delete its OWN row
+ * (`run_id === runId`). Strict `<` would leave that row stranded — a stale
+ * reason surviving until some later run happens to touch the same
+ * (book, resource) — which is a self-inflicted version of the exact bug this
+ * guard exists to prevent. `<=` closes that without reopening the item-5 race:
+ * a row from a run that is actually newer still has `run_id > runId`, so it
+ * is never `<=` and is never touched.
  */
 export async function clearSyncWithhold(env: Env, book: string, resource: string, runId: string): Promise<void> {
   try {
-    await env.DB.prepare(`DELETE FROM sync_withholds WHERE book = ?1 AND resource = ?2 AND run_id < ?3`)
+    await env.DB.prepare(`DELETE FROM sync_withholds WHERE book = ?1 AND resource = ?2 AND run_id <= ?3`)
       .bind(book, resource, runId)
       .run();
   } catch (e) {
