@@ -778,6 +778,34 @@ eq(
   "a failure condition in one resource outranks a skip condition in another",
 );
 
+// Scheduled codex-review-and-merge pass regression: the SAME resource
+// carrying BOTH a skip-class condition and a failure-class condition (a
+// chapter lock from one chunk, an apply_incomplete CAS race from a later
+// one) must classify as failure. Routing this through computeWithholdReason
+// used to mask it, because that function's precedence checks chapters_locked
+// before apply_incomplete and returns only its first match.
+eq(
+  classifyReimportOutcome({
+    ult: resourceCounts({ chapters_locked: 1, apply_incomplete: true }),
+  }),
+  "failure",
+  "one resource with BOTH chapters_locked and apply_incomplete → failure, not masked by the co-occurring skip condition",
+);
+eq(
+  classifyReimportOutcome({
+    ult: resourceCounts({ conflict_skipped: 1, merge_record_failed: true }),
+  }),
+  "failure",
+  "one resource with BOTH conflict_skipped and merge_record_failed → failure",
+);
+eq(
+  classifyReimportOutcome({
+    ult: resourceCounts({ prune_locked: 1, merge_refused: SYSTEMIC_MERGE_REFUSAL_THRESHOLD }),
+  }),
+  "failure",
+  "one resource with BOTH prune_locked and a systemic refusal → failure",
+);
+
 // Bonus consistency fix alongside the review's two findings: idBlockedOverride
 // (FIX 1, issue #473 option A) is ALSO scoped to one resource and was
 // likewise ignored by the book-sum version — classifyReimportOutcome now
