@@ -513,8 +513,11 @@ Highlights that bite repeatedly:
   de-alignment from a revision mismatch — **for wording only.** Never let it narrow the refusal *decision*:
   that exemption is exactly what let the 1CH 4:21 collateral loss ship (see the warning comment in
   `alignmentDelta.ts`).
-- **The `deferredreward/bible-editor-multilingual` downstream fork is not a source of unmerged fixes for us —
-  check their own sync doc before re-triaging from scratch.** It forked at `7f83a398` (2026-07-13) and has
+- **The downstream fork is not a source of unmerged fixes for us — check their own sync doc before
+  re-triaging from scratch.** (Repo moved 2026-09: `deferredreward/bible-editor-multilingual` is now
+  [`unfoldingWord-box3/bptranslate`](https://github.com/unfoldingWord-box3/bptranslate) — same history,
+  old URL still redirects. Older references below predate the move.)
+  It forked at `7f83a398` (2026-07-13) and has
   since rearchitected into a multi-tenant product (workspaces, per-org config, an `aquifer`/articles import
   pipeline, an AI-provider BYO-key system, a "flows" UI) with no equivalent surface here. Their own
   `docs/upstream-sync-2026-08-21.md` (in their repo, not ours) records that they actively triage *our* commits
@@ -538,7 +541,7 @@ Highlights that bite repeatedly:
   `verseVersionFloorSql` in `api/src/verseBridge.ts` therefore uses `MAX(COALESCE(new_version, prev_version))`;
   any future version floor must do the same. Found by review of the #727 guards, fixed in the #728 commit.
 - **Downstream-sync pass, 2026-09-07** (see the 2026-08-24/2026-08-28 entry above for the routine itself).
-  `deferredreward/bible-editor-multilingual`'s own newest triage doc was still `docs/upstream-sync-2026-08-28.md`
+  The downstream fork's own newest triage doc was still `docs/upstream-sync-2026-08-28.md`
   (no newer one as of this run) — their 30 own commits since that doc's sync commit (`6251e9a`..`1cbc6f3`) were
   almost all their multi-tenant-only "flows"/workspaces/admin-review-state feature work (no counterpart here,
   ruled not-applicable), except a real, shared bug: **our tree-walkers never treated `\qs` (Selah) as a
@@ -561,6 +564,14 @@ Highlights that bite repeatedly:
   never joins a bridged TN note's full covered-verse range into the AI prompt context (downstream's `#411`/`#406`
   fix a bug in logic we don't have at all — the feature itself is the gap). **Next time:** check whether a newer
   `docs/upstream-sync-*.md` exists downstream before re-diffing from `6251e9a`.
+- **The downstream-sync routine now runs unattended from a Linux box, and its prompt lives in this repo** at
+  [`.claude/routines/downstream-sync.md`](.claude/routines/downstream-sync.md). It is deliberately in-repo
+  rather than on that machine: the prompt names test commands, `STATE.md` conventions and file layout, so it
+  goes stale *with the codebase* — keeping it here means a PR that renames a test script can fix the routine in
+  the same commit, and the routine picks the change up on its next `git fetch`. The machinery around it (wrapper
+  script, systemd timer, secrets) is personal infrastructure and stays on that box, out of this repo. If you
+  change how the test suites are invoked, how `STATE.md` is structured, or where the downstream fork lives,
+  update that prompt too — nothing else will tell the routine.
 
 ## Stop conditions / goals
 
