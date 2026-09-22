@@ -441,7 +441,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // lint-relevant state (e.g. a no-op review-flag clear, which doesn't
       // touch row content or version — see api/src/rows.ts). The lint chip is
       // drawn from a separate fetch (useBookLint), so nudge it via the same
-      // debounced refetch the outbox listener below uses.
+      // debounced refetch the outbox listener below uses. Every RowKind counts:
+      // tq and twl rows carry lint issues too (lintTqRows / lintTwlRows in
+      // api/src/lint.ts), so no kind filter here (#887).
       scheduleLintRefetch();
     },
     onDelete: (kind, id) => applyLocalRowDelete(kind, id),
@@ -693,18 +695,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // only edits the lint covers (TN flags + ULT/UST footnote integrity) —
   // debounced so a burst of saves coalesces into one request.
   const bookLintRefetch = bookLint.refetch;
+  const bookLintSettledAt = bookLint.lastSettledAt;
   const lintRefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Set when a lint-relevant change was skipped because the tab was hidden;
+  // the focus/visibility handler below then refetches regardless of age.
+  const lintStaleWhileHidden = useRef(false);
   // Debounced lint refetch — coalesces a burst of edits into one request.
   // Used by the outbox listener below AND by the trash/restore handlers, which
   // bypass the outbox (direct API calls) yet change the lint set: the lint
   // endpoint filters `trashed_at IS NULL`, so trashing a flagged note drops the
   // count and restoring one adds it back.
+  // A hidden tab can't see the chip, so defer to its return (#887).
   const scheduleLintRefetch = useCallback(() => {
+    if (document.hidden) {
+      lintStaleWhileHidden.current = true;
+      return;
+    }
     if (lintRefetchTimer.current) clearTimeout(lintRefetchTimer.current);
     lintRefetchTimer.current = setTimeout(() => {
       lintRefetchTimer.current = null;
       bookLintRefetch();
-    }, 1000);
+    }, 3000);
   }, [bookLintRefetch]);
   useEffect(() => {
     const unsub = onOutboxResult((op, result) => {
@@ -728,10 +739,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // in another tab, on another device, or via an out-of-band fix) otherwise
   // shows a frozen count until a manual reload — the symptom that flagged-note
   // saves "weren't clearing." Reuses the debounced refetch, so a quick blur/
-  // focus flurry coalesces into one request.
+  // focus flurry coalesces into one request. Skipped when the last fetch
+  // settled under 60 s ago — translators alt-tab constantly and each refetch
+  // reads the whole book (#887) — unless a change was deferred while hidden.
   useEffect(() => {
     const refresh = () => {
-      if (document.visibilityState === "visible") scheduleLintRefetch();
+      if (document.visibilityState !== "visible") return;
+      if (!lintStaleWhileHidden.current && Date.now() - bookLintSettledAt() < 60_000) return;
+      lintStaleWhileHidden.current = false;
+      scheduleLintRefetch();
     };
     window.addEventListener("focus", refresh);
     document.addEventListener("visibilitychange", refresh);
@@ -739,7 +755,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", refresh);
     };
-  }, [scheduleLintRefetch]);
+  }, [scheduleLintRefetch, bookLintSettledAt]);
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeWordId, setActiveWordId] = useState<string | null>(null);
