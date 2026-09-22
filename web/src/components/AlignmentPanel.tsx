@@ -439,6 +439,13 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       return () => {
         cancelled = true;
       };
+      // `initial` excluded deliberately: it's only ever set by this same effect
+      // (setInitial above), and it's read here only to detect an in-progress
+      // drag (stateRef.current === initial) at the moment this effect fires.
+      // Listing it would make the effect re-run immediately after its own
+      // setInitial call, on every rebase/reset — a self-triggered feedback loop
+      // in alignment-critical code.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [computedInitial, verse, book, chapter, verseNum, bibleVersion, sourceVerseObjects]);
 
     // Dismissals are per (verse, version) and only for this session — reset when

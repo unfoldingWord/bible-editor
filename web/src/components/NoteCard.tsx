@@ -1136,6 +1136,12 @@ function NoteCardInner({
   useEffect(() => {
     return () => {
       if (!wasActiveRef.current) return;
+      // Deliberately reads the LIVE ref value at cleanup time, not a snapshot
+      // from setup — see the comment above: ResourceColumn updates
+      // activeLocRef during ITS render, before this cleanup can run, and that
+      // latest value (not the one captured when this effect was set up) is
+      // what "did the user actually leave this row's verse" has to check.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
       if (!hasLeftNoteTarget(rowAtUnmountRef.current, activeLocRef.current)) return;
       discardIfAbandonedStubRef.current();
     };
