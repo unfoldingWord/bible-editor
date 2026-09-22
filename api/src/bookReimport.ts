@@ -5091,7 +5091,15 @@ async function clearResolvedMergeNoBase(
     // — the two ancestor folds take create/update/restore, the verse fold adds
     // baseline — so an audit row can never be mistaken for row content.
     const kindCounts = { ours: 0, ai: 0, human: 0 };
-    for (const c of walk.commits.map(classifyMasterCommit)) kindCounts[c.kind]++;
+    // #861: same reclassification hazard as the `humans` filter above — a
+    // ledger-sourced walk's commits are ALREADY correctly classified (via
+    // classifyForLedger's merge-wrapper unwrap), so re-running plain
+    // classifyMasterCommit on them here would count our own nightly export
+    // merge as `human` and stamp this audit row's evidence with a human commit
+    // the decision above deliberately did not see. Trust the stored
+    // classification for a ledger-sourced walk, exactly as the filter does.
+    for (const c of ledgerSourcedWalk ? (walk.commits as ClassifiedCommit[]) : walk.commits.map(classifyMasterCommit))
+      kindCounts[c.kind]++;
     const evidence = {
       window_start: windowStart,
       walked_sha: tip,
