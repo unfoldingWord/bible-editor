@@ -1728,30 +1728,49 @@ pipelines.post("/start", requireEditor, async (c) => {
     // discussion note on the intro must not silently become generation
     // guidance). Forwarded as options.introHints alongside options.hints.
     //
-    // Deliberately NOT auto-resolved: bp-assistant doesn't consume this key
-    // yet (docs/bp-assistant-intro-hints-contract.md is "Proposed"), and even
-    // once it does, resolving here — before the job is known to have been
-    // accepted, let alone completed — would mark a hint "consumed" when
-    // nothing may have read it (a D1 error on the INSERT below, or the bot
-    // rejecting the dispatch, both leave it resolved with no run carrying
-    // it). An editor resolves it themselves, the same way they already
-    // resolve any other comment thread, once they've checked the guidance
-    // took effect. The cost is a marked hint gets re-sent on every
-    // subsequent run for the chapter until then — harmless, since it's an
-    // explicit opt-in, not a leak of arbitrary comments.
-    const introCommentRows = await c.env.DB.prepare(
-      `SELECT id, chapter, body
-         FROM comments
-        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
-          AND verse = 0 AND row_kind IS NULL AND parent_id IS NULL
-          AND kind = 'note' AND resolved_at IS NULL AND deleted_at IS NULL
-        ORDER BY chapter, created_at ASC`,
-    )
-      .bind(book, startChapter, endChapter)
-      .all<IntroHintCommentRow>();
-    const introHints = buildIntroHints(introCommentRows.results ?? []);
-    if (introHints.length > 0) {
-      mergedOptions = { ...(mergedOptions ?? {}), introHints };
+    // Gated on INTRO_HINTS_ENABLED (see index.ts's Env): a 2026-09-22 review
+    // found the bp-assistant-side contract genuinely unverified from here —
+    // one review pass judged an unknown options key harmless on /start,
+    // another judged the bot's schema strict enough to 400 the WHOLE notes
+    // job over it. With the flag off (the default everywhere until someone
+    // confirms which is true), this block is a no-op, so either claim is
+    // harmless. Turn it on only once verified — see
+    // docs/bp-assistant-intro-hints-contract.md.
+    //
+    // Known gap while this stays gated: a "Generate everything" chain's
+    // notes step is enqueued by enqueueFollowUpFromChain from options
+    // captured on the ORIGINAL /start call (pipelineType "generate" here),
+    // so this block — reached only when pipelineType is itself "notes" —
+    // never runs for it; a chained notes step currently never carries
+    // introHints even once the flag is on. Left unaddressed: the same
+    // review flagged it as needing its own design decision (should a
+    // chained notes step even receive per-chapter intro guidance the same
+    // way a direct /start does?), not a quick patch.
+    //
+    // Deliberately NOT auto-resolved: resolving here — before the job is
+    // known to have been accepted, let alone completed — would mark a hint
+    // "consumed" when nothing may have read it (a D1 error on the INSERT
+    // below, or the bot rejecting the dispatch, both leave it resolved with
+    // no run carrying it). An editor resolves it themselves, the same way
+    // they already resolve any other comment thread, once they've checked
+    // the guidance took effect. The cost is a marked hint gets re-sent on
+    // every subsequent run for the chapter until then — harmless, since
+    // it's an explicit opt-in, not a leak of arbitrary comments.
+    if (c.env.INTRO_HINTS_ENABLED) {
+      const introCommentRows = await c.env.DB.prepare(
+        `SELECT id, chapter, body
+           FROM comments
+          WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
+            AND verse = 0 AND row_kind IS NULL AND parent_id IS NULL
+            AND kind = 'note' AND resolved_at IS NULL AND deleted_at IS NULL
+          ORDER BY chapter, created_at ASC`,
+      )
+        .bind(book, startChapter, endChapter)
+        .all<IntroHintCommentRow>();
+      const introHints = buildIntroHints(introCommentRows.results ?? []);
+      if (introHints.length > 0) {
+        mergedOptions = { ...(mergedOptions ?? {}), introHints };
+      }
     }
   }
 

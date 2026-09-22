@@ -70,6 +70,18 @@ export interface Env {
   // GET /api/pipeline/:jobId). Defaults to the prod bot at uw-bt-bot.fly.dev
   // when unset.
   PIPELINE_API_BASE?: string;
+  // Gates whether options.introHints (issue #819, chapter-intro hint
+  // comments) is ever included in a notes-pipeline dispatch. Deliberately
+  // absent (falsy) everywhere until bp-assistant's side is confirmed to
+  // accept the key: a 2026-09-22 review of this PR found the two
+  // possibilities genuinely contested (one review pass said the bot ignores
+  // an unknown options key on /start; a later pass said its schema is
+  // strict and 400s the WHOLE job) — with the gate off, either claim being
+  // true is harmless, since nothing is ever sent. Flip to "true" (e.g. via
+  // `wrangler secret put INTRO_HINTS_ENABLED` or a `[vars]` entry) only
+  // once that's verified against the real bot, per
+  // docs/bp-assistant-intro-hints-contract.md.
+  INTRO_HINTS_ENABLED?: string;
 }
 
 // Cron patterns must match the [env.production.triggers] crons list in

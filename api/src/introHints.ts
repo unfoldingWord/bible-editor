@@ -27,6 +27,17 @@
 
 const HINT_MARKER = /^ai:\s*/i;
 
+// Review finding: an unbounded set of marked comments (each up to the
+// internal-comment body's 5000-char cap) could push the outbound request
+// past bp-assistant's ~32 KiB body limit and 413 the whole job. There's no
+// per-run cap on how many intro-hint comments can exist, so bound the total
+// forwarded here instead — well under that limit, with room left for the
+// rest of the request body (book/chapters/the existing options.hints[]).
+// Hints beyond the budget are dropped, not truncated mid-sentence; earliest
+// (by chapter, then created_at — the row order buildIntroHints receives)
+// wins, so the drop is deterministic.
+const MAX_TOTAL_HINT_CHARS = 8000;
+
 export interface IntroHintCommentRow {
   id: number;
   chapter: number;
@@ -54,9 +65,13 @@ export function isIntroHintComment(body: string): boolean {
 
 export function buildIntroHints(rows: IntroHintCommentRow[]): IntroHint[] {
   const hints: IntroHint[] = [];
+  let totalChars = 0;
   for (const r of rows) {
     const note = stripIntroHintMarker(r.body);
-    if (note !== null) hints.push({ chapter: r.chapter, note });
+    if (note === null) continue;
+    if (totalChars + note.length > MAX_TOTAL_HINT_CHARS) break;
+    hints.push({ chapter: r.chapter, note });
+    totalChars += note.length;
   }
   return hints;
 }

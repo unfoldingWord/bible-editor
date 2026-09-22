@@ -76,6 +76,36 @@ function assert(cond, msg) {
   );
 }
 
+// ─── size bound ─────────────────────────────────────────────────────────────
+{
+  console.log("\n[buildIntroHints: size bound]");
+
+  // Review finding: an unbounded set of marked comments (each up to the
+  // internal-comment body's 5000-char cap) risks exceeding bp-assistant's
+  // request-body limit and 413ing the whole job. 7 comments at ~5000 chars
+  // is the reviewer's own example.
+  const bigRows = Array.from({ length: 7 }, (_, i) => ({
+    id: i + 1,
+    chapter: 3,
+    body: `AI: ${"x".repeat(4995)}`, // ~5000 chars each, matching CreateBody's cap
+  }));
+  const bigHints = buildIntroHints(bigRows);
+  const totalChars = bigHints.reduce((sum, h) => sum + h.note.length, 0);
+  assert(bigHints.length < bigRows.length, `7 maxed-out comments are not all forwarded (got ${bigHints.length})`);
+  assert(totalChars <= 8000, `combined forwarded note text stays under budget (got ${totalChars} chars)`);
+  assert(bigHints.length >= 1, "at least the earliest hint still gets through");
+
+  // A normal, small batch is completely unaffected by the bound.
+  const smallRows = [
+    { id: 1, chapter: 3, body: "AI: short note one" },
+    { id: 2, chapter: 3, body: "AI: short note two" },
+  ];
+  assert(
+    buildIntroHints(smallRows).length === 2,
+    "an ordinary small batch is not truncated by the size bound",
+  );
+}
+
 // ─── pipelines.ts wiring (source-text) ──────────────────────────────────────
 {
   console.log("\n[pipelines.ts /start intro-hints wiring]");
@@ -115,6 +145,19 @@ function assert(cond, msg) {
   assert(
     resumeMatch !== null,
     "introHints is stripped in resumeOptionsFromJson alongside fresh — the bot's resume schema doesn't know the key and 400s on an unknown one",
+  );
+
+  // Review finding (2026-09-22): the bp-assistant-side contract for this key
+  // is unverified — sending it could 400 the whole job if the bot's start
+  // schema is as strict as that review judged. Gate the whole block behind
+  // an explicit flag defaulting off, so this PR can't cause that regression
+  // before someone confirms it's safe.
+  const gateIndex = src.indexOf("if (c.env.INTRO_HINTS_ENABLED) {");
+  assert(gateIndex !== -1, "the intro-hints block is gated behind INTRO_HINTS_ENABLED");
+  const selectIndex = src.indexOf("SELECT id, chapter, body");
+  assert(
+    gateIndex !== -1 && selectIndex !== -1 && gateIndex < selectIndex,
+    "the gate wraps the SELECT (and therefore everything downstream of it), not just part of the block",
   );
 }
 

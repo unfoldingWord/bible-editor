@@ -2,12 +2,33 @@
 
 ## Status
 
-**Proposed.** bible-editor's side is implemented (issue #819): the notes
-pipeline gathers unresolved chapter-intro hint comments and sends them as
-`options.introHints`. This needs a matching change on the bp-assistant side
-(`tn-writer`/the intro-generation skill) to actually weave the hints into its
-intro prompt — the wire is live and harmless to ignore in the meantime
-(`introHints` simply won't affect output until consumed).
+**Proposed, and gated off by default.** bible-editor's side is implemented
+(issue #819): the notes pipeline can gather unresolved, `AI:`-marked
+chapter-intro hint comments and send them as `options.introHints`. This
+needs a matching change on the bp-assistant side (`tn-writer`/the
+intro-generation skill) to actually weave the hints into its intro prompt.
+
+Two things are unresolved and block turning this on:
+
+1. **Whether an unrecognized `options` key breaks the whole `/start` call.**
+   A 2026-09-22 review of the bible-editor PR found this genuinely
+   contested: one review pass judged the bot lenient (an unknown key is
+   simply ignored); a later pass judged the bot's start schema strict,
+   returning HTTP 400 for the whole job over an unrecognized `introHints`
+   key. bible-editor cannot verify either claim from its own repo — it
+   needs a real request against the bot, or someone who can read its
+   schema, to settle it.
+2. **The "Generate everything" chain.** A chained `notes` step (queued from
+   options captured on the ORIGINAL `/start` call, whose `pipelineType` is
+   `generate`) never gathers `introHints` at all today — see
+   `api/src/pipelines.ts`'s intro-hints block. Whether a chained `notes`
+   step should even receive intro guidance the same way a direct `/start`
+   does is its own design question, not addressed here.
+
+Until both are resolved, `api/src/index.ts`'s `INTRO_HINTS_ENABLED` env var
+keeps the whole block a no-op (`options.introHints` is never sent, from
+either path) — safe regardless of which of the two possibilities above turns
+out true. Flip it on only once (1) is verified against the real bot.
 
 This is a sibling to, not a replacement for,
 [`docs/bp-assistant-tn-hints-contract.md`](./bp-assistant-tn-hints-contract.md).
@@ -29,8 +50,9 @@ the full background.
 ## What bible-editor sends
 
 `POST /api/pipeline/start` body's existing optional `options` object gains
-`introHints`, sent only for `pipelineType: "notes"` runs and only when at
-least one hint exists in the requested chapter range:
+`introHints`, sent only when `INTRO_HINTS_ENABLED` is set (see Status
+above — unset everywhere today), for `pipelineType: "notes"` runs, and only
+when at least one hint exists in the requested chapter range:
 
 ```json
 {
@@ -58,6 +80,12 @@ Field semantics:
 - `note` — string, 1-5000 chars (matches the internal-comment body limit).
   Free-form editor guidance — no schema beyond that. May be anything from a
   one-line reminder to several sentences.
+
+The whole array is also capped at 8000 combined `note` characters per
+request (`MAX_TOTAL_HINT_CHARS`, `api/src/introHints.ts`) — a defensive
+bound against an unbounded number of marked comments pushing the request
+past bp-assistant's body-size limit. Hints beyond the budget are dropped
+outright (not truncated mid-sentence), earliest first.
 
 `introHints` may be empty or absent on any run (omitted, not an empty array,
 when there is nothing to send). When absent, behave exactly as today.
@@ -90,11 +118,14 @@ For your awareness (already implemented):
   ordinary, unmarked discussion note on the intro (`"looks good"`, an
   unrelated remark) is never swept into generation guidance. The marker is
   stripped before the note text is forwarded.
-- **Outbound** (`api/src/pipelines.ts`): at `/api/pipelines/start` time, for
-  `pipelineType: "notes"`, the proxy selects all unresolved, non-reply,
-  verse-0, row-less, `kind = "note"` comments in the requested chapter range,
-  keeps only the `AI:`-marked ones, and folds them into `options.introHints`
-  (see `api/src/introHints.ts`).
+- **Outbound** (`api/src/pipelines.ts`): at `/api/pipelines/start` time, when
+  `INTRO_HINTS_ENABLED` is set and `pipelineType: "notes"`, the proxy selects
+  all unresolved, non-reply, verse-0, row-less, `kind = "note"` comments in
+  the requested chapter range, keeps only the `AI:`-marked ones (bounded to
+  8000 combined characters), and folds them into `options.introHints` (see
+  `api/src/introHints.ts`). A chained `notes` step from a "Generate
+  everything" run does not go through this code path at all and never gets
+  `introHints` — see Status above.
 - **Consumption**: **not** auto-resolved. Sending a hint doesn't mark its
   source comment resolved — an editor does that themselves, from the
   comments panel, once they've confirmed the guidance took effect (exactly
@@ -123,7 +154,9 @@ bp-assistant smoke test (once the intro skill consumes `introHints`):
    chapter's intro reflects its own note only; a chapter with no hints
    generates its normal, unguided intro.
 
-bible-editor smoke test (already testable against `main`):
+bible-editor smoke test (requires `INTRO_HINTS_ENABLED` set — e.g.
+`wrangler dev --var INTRO_HINTS_ENABLED:true` locally; not testable as-is
+against `main`'s deployed default, which leaves it unset):
 
 1. Add an internal comment (kind: note) on a chapter's intro (verse 0)
    starting with `AI:`, plus a second, unmarked comment in the same spot
