@@ -1521,8 +1521,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           const raw = await readPushedRenderText(this.env, book, resource, priorPushedR2Key, priorPushedBlobSha);
           if (raw != null && (await gitBlobShaOrNull(raw)) === priorPushedBlobSha) {
             revertBase = raw;
-          } else if (raw != null) {
-            console.warn(`export: last-publish base for ${book} ${resource} does not hash to pushed_blob_sha; ignoring it`);
+          } else if (raw != null && priorPushedR2Key != null) {
+            // R2 held a different render than the sha describes; Door43 still
+            // serves the exact blob by sha, so fetch it there instead.
+            console.warn(`export: R2 last-publish base for ${book} ${resource} does not hash to pushed_blob_sha; trying Door43`);
+            const fromDcs = await readPushedRenderText(this.env, book, resource, null, priorPushedBlobSha);
+            if (fromDcs != null && (await gitBlobShaOrNull(fromDcs)) === priorPushedBlobSha) revertBase = fromDcs;
           }
         } catch (e) {
           console.error("export: last-publish base read failed; revert report lists every differing row", {
