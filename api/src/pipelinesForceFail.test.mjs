@@ -38,6 +38,7 @@ import {
   dispatchNext,
   pollAllNonTerminal,
   resumeOptionsFromJson,
+  StatusResponseSchema,
 } from "./pipelines.ts";
 import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim.ts";
 
@@ -1235,6 +1236,86 @@ await (async () => {
   assert(
     Array.isArray(replayed.contentTypes) && replayed.contentTypes[0] === "ult",
     "ordinary options survive resume untouched",
+  );
+}
+
+// ─── Issue #841: pollPipelineJob schema-validates the upstream status body ──
+// instead of trusting a bare `as StatusResponse` cast. A shape that fails
+// validation must surface as the existing "malformed" kind — the same path
+// an unparseable JSON body already takes — never propagate a value with the
+// wrong runtime type (`state` as a number here) into the state-transition
+// logic below it.
+await withFetch(
+  async () => new Response(JSON.stringify({ state: 42 }), { status: 200 }),
+  async () => {
+    console.log("\n[#841: malformed upstream status body is rejected, not cast through]");
+    const env = fakePollEnv({ pollChanges: 1 });
+    const job = {
+      job_id: "job-schema-841",
+      upstream_job_id: "stream_841_upstream",
+      user_id: 1,
+      pipeline_type: "notes",
+      book: "NUM",
+      start_chapter: 27,
+      end_chapter: 27,
+      session_key: "sess-841",
+      follow_up_options: null,
+      follow_up_chain: null,
+      follow_up_job_id: null,
+      no_output_yet: 0,
+      error_kind: null,
+      updated_at: Math.floor(Date.now() / 1000),
+      resume_attempt_count: 0,
+      last_resume_at: null,
+      resume_accepted_at: null,
+      options_json: null,
+    };
+    const result = await pollPipelineJob(env, job);
+    assert(
+      result.kind === "malformed",
+      `a body whose 'state' field is the wrong type is reported malformed, not cast through (got kind=${result?.kind})`,
+    );
+    assert(
+      !env.queries.some((q) => /SET state = \?2,[\s\S]*last_polled_at = unixepoch\(\)/.test(q)),
+      "the poll's own guarded state UPDATE was NEVER issued for a malformed body",
+    );
+  },
+);
+
+// ─── StatusResponseSchema itself, directly ─────────────────────────────────
+// The malformed-body test above proves pollPipelineJob's wiring; these prove
+// the schema's own boundary — what it accepts leniently (job-control fields
+// this codebase never reads for a decision) vs. what it still refuses
+// (state present with the wrong type, or an output[] entry that isn't an
+// object at all).
+{
+  console.log("\n[StatusResponseSchema]");
+  assert(
+    StatusResponseSchema.safeParse({ state: "running" }).success,
+    "a body with only 'state' parses (jobId/pipelineType/scope/timestamps are optional — see the schema's own comment for why)",
+  );
+  assert(
+    StatusResponseSchema.safeParse({
+      state: "done",
+      output: [{ repo: "unfoldingWord/en_tn" }],
+    }).success,
+    "an output[] entry with only some fields set still parses (lenient, matches pipelineImport.ts's OutputEntry)",
+  );
+  assert(
+    !StatusResponseSchema.safeParse({ state: 1 }).success,
+    "'state' as a number is rejected",
+  );
+  assert(
+    !StatusResponseSchema.safeParse({ state: "running", output: "not-an-array" }).success,
+    "a non-array 'output' is rejected",
+  );
+  assert(
+    !StatusResponseSchema.safeParse({ state: "running", output: ["not-an-object"] }).success,
+    "an output[] entry that isn't an object is rejected",
+  );
+  assert(
+    !StatusResponseSchema.safeParse(null).success,
+    "a non-object body (null) is rejected",
   );
 }
 

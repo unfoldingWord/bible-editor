@@ -132,26 +132,52 @@ interface StartResponse {
   queuePosition?: number;
 }
 
-interface StatusResponse {
-  jobId: string;
-  pipelineType: string;
-  scope: { book: string; startChapter: number; endChapter: number };
-  state: string;
-  current?: {
-    chapter: number;
-    skill: string;
-    status: string;
-    // OPTIONAL, verified against the real bot: serializeCheckpoint
-    // (bp-assistant/src/api/pipeline.js) only spreads startedAt when the
-    // checkpoint carries one, so a run that parked before its first timing
-    // stamp omits the key entirely.
-    startedAt?: string;
-    errorKind?: string;
-    error?: string;
-  };
-  updatedAt: string;
-  createdAt: string;
-  interrupted?: boolean;
+// Strict on `state` (the one top-level field pollPipelineJob actually
+// branches on — shouldImport, effectiveState, the paused/interrupted checks
+// all read it directly) and on the shapes of `current`/`resume`/`output[]`.
+// Lenient (optional) on jobId/pipelineType/scope/updatedAt/createdAt: nothing
+// in this function reads them to make a decision — they're only spread
+// verbatim (`...data`) into a rewritten response body when the local apply
+// disagrees with upstream — so requiring their presence would reject a
+// payload this function can otherwise process correctly, and would diverge
+// from how this repo's own tests already model bot responses (every
+// `pollPipelineJob` fixture in pipelinesForceFail.test.mjs sends only the
+// fields each test exercises, e.g. `{state: "done"}`).
+//
+// `output[]` itself stays fully optional-fielded, mirroring
+// pipelineImport.ts's own `OutputEntry`, which already narrows/guards each
+// field itself (missing rawUrl short-circuits the entry, unrecognized repo is
+// refused, etc). A stricter output schema risks rejecting real bot payloads
+// the import layer already handles fine (see issue #841's "uncertainty to
+// resolve" — the bot's exact shape isn't contract-tested from here).
+export const StatusResponseSchema = z.object({
+  jobId: z.string().optional(),
+  pipelineType: z.string().optional(),
+  scope: z
+    .object({
+      book: z.string(),
+      startChapter: z.number(),
+      endChapter: z.number(),
+    })
+    .optional(),
+  state: z.string(),
+  current: z
+    .object({
+      chapter: z.number(),
+      skill: z.string(),
+      status: z.string(),
+      // OPTIONAL, verified against the real bot: serializeCheckpoint
+      // (bp-assistant/src/api/pipeline.js) only spreads startedAt when the
+      // checkpoint carries one, so a run that parked before its first timing
+      // stamp omits the key entirely.
+      startedAt: z.string().optional(),
+      errorKind: z.string().optional(),
+      error: z.string().optional(),
+    })
+    .optional(),
+  updatedAt: z.string().optional(),
+  createdAt: z.string().optional(),
+  interrupted: z.boolean().optional(),
   // Both additive, and both may be absent — the bot ships them only from the
   // resume-contract release onwards, so every read must tolerate undefined.
   // resume: what a resume would pick back up (chapter + skill). pausedAt: when
@@ -160,19 +186,28 @@ interface StatusResponse {
   // `skill` is NULLABLE, verified against the real bot: it serializes
   // `skill: cp.resume.skill ?? null`, so a checkpoint that knows the chapter to
   // resume but not the step reports an explicit null.
-  resume?: { chapter: number; skill: string | null } | null;
-  pausedAt?: string;
-  output?: Array<{
-    type: string;
-    repo: string;
-    branch: string;
-    path: string;
-    rawUrl: string;
-    prNumber: number;
-    mergedAt: string;
-    commitSha: string;
-  }>;
-}
+  resume: z
+    .object({ chapter: z.number(), skill: z.string().nullable() })
+    .nullable()
+    .optional(),
+  pausedAt: z.string().optional(),
+  output: z
+    .array(
+      z.object({
+        type: z.string().optional(),
+        repo: z.string().optional(),
+        branch: z.string().optional(),
+        path: z.string().optional(),
+        rawUrl: z.string().optional(),
+        prNumber: z.number().optional(),
+        mergedAt: z.string().optional(),
+        commitSha: z.string().optional(),
+      }),
+    )
+    .optional(),
+});
+
+type StatusResponse = z.infer<typeof StatusResponseSchema>;
 
 function upstreamBase(env: Env): string {
   return env.PIPELINE_API_BASE || DEFAULT_BASE;
@@ -970,12 +1005,21 @@ export async function pollPipelineJob(
     return { kind: "non_ok", text, status: upstream.status };
   }
 
-  let data: StatusResponse | null = null;
+  let parsedJson: unknown;
   try {
-    data = JSON.parse(text) as StatusResponse;
+    parsedJson = JSON.parse(text);
   } catch {
     return { kind: "malformed", text };
   }
+  const parsedStatus = StatusResponseSchema.safeParse(parsedJson);
+  if (!parsedStatus.success) {
+    console.error("[pollPipelineJob] upstream status response failed schema validation", {
+      jobId: job.job_id,
+      issues: parsedStatus.error.issues,
+    });
+    return { kind: "malformed", text };
+  }
+  const data: StatusResponse = parsedStatus.data;
 
   // `job` is a snapshot taken when this poll started, and the upstream fetch
   // above can take a while — long enough for the owner to force-stop the run in

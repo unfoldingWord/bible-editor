@@ -24,7 +24,7 @@ import { dcsCommits } from "./dcsCommits";
 import { books } from "./bookImport";
 import { bookLockGuard } from "./bookLockGuard";
 import { EDIT_LOG_SWEEP_SQL, EDIT_LOG_RETENTION_SECONDS, raiseEditLogSweepBoundaryAlerts } from "./editLogSweep";
-import { DCS_COMMITS_SWEEP_SQL, DCS_COMMITS_RETENTION_SECONDS } from "./dcsCommitsSweep";
+import { DCS_COMMITS_SWEEP_SQL, DCS_COMMITS_SWEEP_COVERAGE_SQL, DCS_COMMITS_RETENTION_SECONDS } from "./dcsCommitsSweep";
 import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
 
 export interface Env {
@@ -420,13 +420,18 @@ export default {
           console.error("edit_log retention sweep failed", e instanceof Error ? e.message : String(e));
         }
         // Same slot, same reasoning, for the dcs_commits ledger (issue #692
-        // item 1): it grows without bound and nothing currently reads it for a
-        // gating decision (see dcsCommitsSweep.ts), so a plain age-based DELETE
-        // is safe today.
+        // item 1): it grows without bound, so a plain age-based DELETE reclaims
+        // it. readLedgerMasterLineage (item 3, landed) now trusts this table
+        // over a window bounded by dcs_repo_polls.coverage_since, so the
+        // deletion and the coverage-floor raise that keeps that trust honest
+        // (see dcsCommitsSweep.ts's header) run in one batch — never a DELETE
+        // committed without its accounting UPDATE alongside it.
         try {
-          await env.DB.prepare(DCS_COMMITS_SWEEP_SQL)
-            .bind(Math.floor(Date.now() / 1000) - DCS_COMMITS_RETENTION_SECONDS)
-            .run();
+          const cutoff = Math.floor(Date.now() / 1000) - DCS_COMMITS_RETENTION_SECONDS;
+          await env.DB.batch([
+            env.DB.prepare(DCS_COMMITS_SWEEP_SQL).bind(cutoff),
+            env.DB.prepare(DCS_COMMITS_SWEEP_COVERAGE_SQL).bind(cutoff),
+          ]);
         } catch (e) {
           console.error("dcs_commits retention sweep failed", e instanceof Error ? e.message : String(e));
         }

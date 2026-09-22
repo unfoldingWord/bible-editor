@@ -118,6 +118,7 @@ function verseDb() {
   )`);
   d.exec(`CREATE TABLE verse_statuses (
     book TEXT, chapter INTEGER, verse INTEGER, done INTEGER DEFAULT 0, updated_at INTEGER,
+    updated_by INTEGER,
     PRIMARY KEY (book, chapter, verse)
   )`);
   d.exec(`CREATE TABLE verse_lane_checks (

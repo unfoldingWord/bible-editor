@@ -69,6 +69,7 @@ import {
 } from "../lib/alignmentSuggest";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 import { UhbStrip, buildTwHintMap, twHintFromMap } from "./UhbStrip";
+import { directionForVersion } from "../lib/direction";
 import {
   type HoverHighlight,
   type HighlightCtx,
@@ -232,6 +233,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     ref,
   ) {
     const [historyOpen, setHistoryOpen] = useState(false);
+    // The source language's own direction (UHB rtl / UGNT ltr) — see the
+    // `rtl` prop on AlignmentCards for why this can no longer be hardcoded.
+    const sourceRtl = directionForVersion(sourceLabel) === "rtl";
     // Extracted so the crash-draft hydration effect re-parses against the same
     // source tree computedInitial uses (parse needs the UHB/UGNT to re-anchor
     // milestones).
@@ -1008,6 +1012,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
                 sourcePos={posMaps.sourcePosById}
                 posOffset={posOffset}
                 reusedSourceIds={posMaps.reusedSourceIds}
+                rtl={sourceRtl}
               />
             </Box>
             <ActionBar
@@ -1529,6 +1534,7 @@ function AlignmentCards({
   sourcePos,
   posOffset,
   reusedSourceIds,
+  rtl,
 }: {
   groups: AlignmentGroup[];
   ghostByGroup: Map<string, Ghost>;
@@ -1554,6 +1560,12 @@ function AlignmentCards({
   // findReusedSourceWordIds in ../lib/alignment). Keyed by id, not position,
   // because chips resolve their own `pos` through the fallback chain.
   reusedSourceIds: Set<string>;
+  // The SOURCE language's own direction — UHB (Hebrew) is rtl, UGNT (Greek)
+  // is ltr. Was hardcoded "rtl" with no Greek/NT branch (#843); this panel
+  // is reachable for NT books (ResourceColumn's Alignment tab has no
+  // book-code gate), so a Greek verse's card order and source-word runs
+  // were previously mirrored backwards.
+  rtl: boolean;
 }) {
   // Precompute the per-verse TWL hint lookup once (see buildTwHintMap) so each
   // hover re-render isn't O(sourceWords × twlRows) of re-split + re-nfc work.
@@ -1568,10 +1580,11 @@ function AlignmentCards({
         flexWrap: "wrap",
         gap: 1,
         alignContent: "flex-start",
-        // Card visual order follows Hebrew reading flow (RTL) — the cards
-        // are sorted by source position by displayGroups, and RTL lays the
-        // first card to the right.
-        direction: "rtl",
+        // Card visual order follows the source language's reading flow —
+        // the cards are sorted by source position by displayGroups, and rtl
+        // lays the first card to the right (Hebrew); ltr lays it to the
+        // left (Greek).
+        direction: rtl ? "rtl" : "ltr",
         pt: 0.5,
       }}
     >
@@ -1593,7 +1606,7 @@ function AlignmentCards({
           onGroupDragEnd={onGroupDragEnd}
         >
           <Box
-            dir="rtl"
+            dir={rtl ? "rtl" : "ltr"}
             sx={{
               display: "flex",
               flexWrap: "wrap",

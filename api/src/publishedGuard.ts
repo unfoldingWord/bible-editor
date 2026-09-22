@@ -35,6 +35,7 @@
 // Runbook: when vNN ships, bump PUBLISHED_RELEASE_TAG and PUBLISHED_BOOKS in
 // this file, then run `npm --workspace api run test`.
 
+import { z } from "zod";
 import { RESOURCE_TARGETS, type Resource } from "./export.ts";
 
 export const PUBLISHED_RELEASE_TAG = "v90";
@@ -60,6 +61,24 @@ export interface DcsRelease {
   published_at?: string | null;
   created_at?: string | null;
 }
+
+// Every field here is already read defensively (pickLatestStableRelease
+// treats a missing/malformed field as "not stable"/"oldest"), so this schema
+// exists to guard the one thing nothing downstream checks: that the DCS
+// releases endpoint actually returned an array. A non-array body (an error
+// object, an HTML error page parsed as JSON, etc.) previously reached callers
+// as `DcsRelease[]` via a bare cast and would throw the first time something
+// iterated it.
+export const DcsReleaseSchema = z.object({
+  tag_name: z.string().optional(),
+  draft: z.boolean().optional(),
+  prerelease: z.boolean().optional(),
+  target_commitish: z.string().optional(),
+  published_at: z.string().nullable().optional(),
+  created_at: z.string().nullable().optional(),
+});
+
+export const DcsReleaseListSchema = z.array(DcsReleaseSchema);
 
 // Picks the release that actually represents "what's published." NEVER sort
 // by tag name — string comparison puts "v9" after "v10" ("v9" > "v10"
