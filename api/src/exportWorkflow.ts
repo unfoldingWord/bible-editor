@@ -46,6 +46,8 @@ import {
   usfmRevertReport,
   tsvRevertReport,
   shouldRecordRevertReport,
+  shouldComputeRevertEntries,
+  masterIsOurLastPublish,
   classifyRevertSeverity,
   mechanicalOverwriteAlert,
   isMasterConfirmed,
@@ -93,7 +95,7 @@ import {
 } from "./bookReimport";
 import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
 import { dcsResourceFile, fetchDcsMasterText, fileBlobShaAtCommit, fileHeadCommit, type ReimportResource } from "./dcsSources";
-import { gitBlobSha, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
+import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
 import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
@@ -119,6 +121,7 @@ import {
   releaseSetUsable,
   describePublishedDrift,
   lockOverrideAllowed,
+  DcsReleaseListSchema,
   type DcsRelease,
 } from "./publishedGuard";
 import { BOOK_NUMBERS } from "./dcsSources";
@@ -199,6 +202,15 @@ export interface ExportParams {
   // resources for one book in one go, and firing one Workflow instance per
   // resource would race on the same book's D1 rows.
   resources?: Resource[];
+  // Issue #686 item 7: who asked for this reimport, distinct from the Door43
+  // commit author `dcs_sync` writes already carry as `last_change_actor`. Set
+  // by the admin "Pull from Door43" whole-book dispatch (reimportWorkflowParams
+  // in admin.ts) to the clicking operator's user id; absent/null on every cron
+  // path (the 05:30 export and the 08:00 REIMPORT_CRON self-heal both create
+  // this Workflow with no `userId` at all — see index.ts's `scheduled()`), so
+  // edit_log.user_id can finally tell "an operator triggered this sync" apart
+  // from "nobody was watching" instead of both reading as the same NULL.
+  userId?: number | null;
 }
 
 export interface StepResult {
@@ -476,6 +488,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
+            userId: params.userId ?? null,
           });
           // runChunkedReimport resolves normally in three distinct outcomes and
           // the ledger must tell them apart (#833 review) — see
@@ -1365,6 +1378,29 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // `built.readAt` for both, not "now": FIX D — the time D1 was actually READ,
       // so an edit landing between the read and this commit is dated after the
       // watermark instead of being swallowed into the merge ancestor.
+      // The base for the export-revert report below: the blob sha of the render
+      // we published LAST time. Read HERE — after every early-bail gate, so a
+      // night that holds the export never pays for it, and immediately before
+      // recordPushedRender replaces the column with tonight's render. By the
+      // time the report runs, this row no longer holds the previous publish.
+      // See masterIsOurLastPublish.
+      let priorPushedBlobSha: string | null = null;
+      try {
+        const prior = await this.env.DB.prepare(
+          `SELECT pushed_blob_sha FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+        )
+          .bind(book, resource)
+          .first<{ pushed_blob_sha: string | null }>();
+        priorPushedBlobSha = prior?.pushed_blob_sha ?? null;
+      } catch (e) {
+        // Fail open — an unreadable base just means we report as before.
+        console.error("export: prior pushed_blob_sha read failed; revert report keeps its unfiltered behaviour", {
+          book,
+          resource,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+
       await this.recordPushedRender(
         book,
         resource,
@@ -1398,22 +1434,68 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // recorded it. Still no second fetch: usfmMasterContentForRevertReport
       // / tsvMasterContentForRevertReport are the same raw content the
       // shrink/alignment guards captured earlier in this method.
+      //
+      // Base check (masterIsOurLastPublish): if master still holds exactly the
+      // bytes we published last time, nobody else's edit is sitting there, so
+      // this export overwrites only our own prior render — there is no hand-edit
+      // to have lost and nothing to report. Without it, every night's ordinary
+      // translator work on an otherwise-untouched book raised a "overwrote
+      // master's current content" alert.
+      const masterContentForRevertReport =
+        resource === "ult" || resource === "ust"
+          ? usfmMasterContentForRevertReport
+          : tsvMasterContentForRevertReport;
+      // Hash only when a report is actually on the table. `dcsChanged` is false
+      // on every unchanged night — the common steady state — and SHA-1 over a
+      // multi-MB USFM or a 7776-row TSV is not free on a Worker this file
+      // already treats as CPU- and subrequest-constrained.
+      const masterBlobSha =
+        dcsChanged && masterContentForRevertReport != null
+          ? await gitBlobShaOrNull(masterContentForRevertReport)
+          : null;
+      // Suppression records ZERO entries rather than skipping the reporter:
+      // recordExportRevertReport's empty-list path is the only thing that clears
+      // stale export_reverts rows and resolves a standing
+      // export_revert_persistence alert, so skipping the call outright would
+      // leave a banner stuck forever on exactly the books this check quiets.
+      const computeEntries = shouldComputeRevertEntries(
+        dcsChanged,
+        masterContentForRevertReport,
+        masterBlobSha,
+        priorPushedBlobSha,
+      );
+      // Log only a suppression that really happened: without the ship gate this
+      // would announce "suppressed" on nights where no report was ever going to
+      // run, which is exactly the unmeasured-cause claim this file forbids.
+      if (
+        shouldRecordRevertReport(dcsChanged, masterContentForRevertReport) &&
+        !computeEntries &&
+        masterIsOurLastPublish(masterBlobSha, priorPushedBlobSha)
+      ) {
+        console.log(
+          `export: revert entries suppressed for ${book} ${resource} — master still holds our last publish (${(priorPushedBlobSha ?? "").slice(0, 12)})`,
+        );
+      }
       if (
         (resource === "ult" || resource === "ust") &&
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
-        const report = usfmRevertReport(built.content, usfmMasterContentForRevertReport as string);
-        await this.recordExportRevertReport(book, resource, "usfm", report.entries, mechanical, branch, instanceId, alertObservedAt);
+        const entries = computeEntries
+          ? usfmRevertReport(built.content, usfmMasterContentForRevertReport as string).entries
+          : [];
+        await this.recordExportRevertReport(book, resource, "usfm", entries, mechanical, branch, instanceId, alertObservedAt);
       } else if (
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
       ) {
-        const report = tsvRevertReport(
-          built.content,
-          tsvMasterContentForRevertReport as string,
-          resource as "tn" | "tq" | "twl",
-        );
-        await this.recordExportRevertReport(book, resource, "tsv", report.entries, mechanical, branch, instanceId, alertObservedAt);
+        const entries = computeEntries
+          ? tsvRevertReport(
+              built.content,
+              tsvMasterContentForRevertReport as string,
+              resource as "tn" | "tq" | "twl",
+            ).entries
+          : [];
+        await this.recordExportRevertReport(book, resource, "tsv", entries, mechanical, branch, instanceId, alertObservedAt);
       }
 
       if (!commit.branchTouched) {
@@ -2694,12 +2776,18 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
   }
 
-  // Clear stale export_reverts rows for a book+resource that was actually
-  // compared against master this run and found to have zero reverts — the
-  // genuinely-clean case, distinct from "we never compared" (master
-  // unreadable), which must NOT clear yesterday's real findings. Callers are
-  // responsible for only invoking this when master was readable AND the
-  // report came back with 0 entries.
+  // Clear stale export_reverts rows for a book+resource with nothing to report
+  // this run — distinct from "we never compared" (master unreadable), which
+  // must NOT clear yesterday's real findings. Callers are responsible for only
+  // invoking this when master was readable AND there is nothing to report.
+  //
+  // Two ways to reach "nothing to report", both legitimate: the comparison ran
+  // and found zero reverts, or shouldComputeRevertEntries declined to compute
+  // because master still holds our own last publish, so any difference is our
+  // own work and there is nothing of anyone else's to record. Either way the
+  // clear states something measured — and the rows are replaced wholesale on
+  // every reporting night anyway (recordExportReverts opens with the same
+  // DELETE), so a suppressed night destroys nothing a normal night would keep.
   private async clearExportReverts(
     book: string,
     resource: Resource,
@@ -3179,7 +3267,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       if (this.env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${this.env.DCS_SERVICE_TOKEN}`;
       const r = await fetch(url, { headers });
       if (!r.ok) return null;
-      return (await r.json()) as DcsRelease[];
+      const parsed = DcsReleaseListSchema.safeParse(await r.json());
+      if (!parsed.success) return null;
+      return parsed.data;
     } catch {
       return null;
     }

@@ -32,6 +32,13 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # eslint.config.js: react-hooks/rules-of-hooks (error, expected 0
+      # findings) + react-hooks/exhaustive-deps (warn-only, ~400 existing
+      # call sites not yet triaged — see issue #842). No --max-warnings 0:
+      # the warn-level findings are intentionally non-blocking for now.
+      - name: Lint
+        run: npm run lint
+
       # Alignment / replace / morph / conflict regression suites — the real
       # safety net for the edit engine (see CLAUDE.md).
       - name: Web unit tests
@@ -41,6 +48,13 @@ jobs:
       # regression tests in api/ protected nothing automatically.
       - name: API unit tests
         run: npm --workspace api run test
+
+      # Number-split repair core regression suite (issue #452). Pure
+      # functions over synthetic fixtures — no servers, no production dump.
+      # scripts/run-tests.mjs only globs <workspace>/src, so this file isn't
+      # auto-discovered by the steps above; gate it explicitly (see #840).
+      - name: Script unit tests
+        run: npm run test:scripts
 
       # api typecheck + web vite build -> web/dist. Catches bundling breaks.
       - name: Build
