@@ -65,6 +65,7 @@ import {
   masterMayHoldHumanEditForVerse,
   summarizeLineage,
   completeHumanRefEvidenceTouches,
+  type ClassifiedCommit,
   type HumanRefEvidence,
   type MasterLineageSummary,
 } from "./masterLineage.ts";
@@ -4376,7 +4377,17 @@ async function loadMasterLineage(
       const asOfSha = classified[0]?.sha ?? null;
       await persistMasterLineage(env, book, resource, summary, asOfSha, confirmedEditId, confirmedAt);
       if (resource === "tn" || resource === "tq" || resource === "twl") {
-        const cleared = await clearResolvedMergeNoBase(env, book, resource, confirmedAt, ledgerPage, file, asOfSha);
+        const cleared = await clearResolvedMergeNoBase(
+          env,
+          book,
+          resource,
+          confirmedAt,
+          ledgerPage,
+          file,
+          asOfSha,
+          null,
+          repoHead,
+        );
         if (stats) stats.noBaseCleared += cleared;
       }
       return summary;
@@ -4730,6 +4741,17 @@ async function clearResolvedMergeNoBase(
   // from, and under what proof. See NoBaseFallbackWindow. Absent (the visited
   // path) leaves this function's behavior byte-for-byte what #665 shipped.
   fallback: NoBaseFallbackWindow | null = null,
+  // Issue #861: non-null ONLY when `walked` came from readLedgerMasterLineage
+  // (repo-scoped Gitea history, which — unlike the path-scoped history
+  // listMasterCommitsSince fetches — includes Gitea merge-wrapper commits).
+  // `walked.commits[0]?.sha` can then be a merge sha that path-scoped history
+  // never shows at all (see masterLineage.ts note 4), so comparing it against
+  // a path-scoped recheck spuriously reads as "master moved" every time. The
+  // caller already fetched this exact sha to validate the ledger read
+  // (readLedgerMasterLineage requires it to equal dcs_repo_polls.last_sha), so
+  // passing it through costs nothing extra and lets both halves of the
+  // walk/recheck comparison stay in the same (repo-scoped) history.
+  ledgerRepoHead: string | null = null,
 ): Promise<number> {
   try {
     const rs = await env.DB.prepare(
@@ -4805,8 +4827,12 @@ async function clearResolvedMergeNoBase(
     // learn master's current tip for this file, and that is the memo key for
     // both the read below and any write later. It is a single subrequest, taken
     // only when a pair actually has candidates, and it buys the right to skip
-    // the up-to-5-page walk entirely on a memo hit.
-    let tip = masterSha;
+    // the up-to-5-page walk entirely on a memo hit. Prefer `ledgerRepoHead`
+    // over `masterSha` when both are available: `masterSha` on the ledger path
+    // is the ledger's own repo-scoped file sha (issue #861 — same scope
+    // mismatch as `walkTip`/`tipNow` below), while `ledgerRepoHead` is the
+    // repo head the caller already validated the ledger read against.
+    let tip = ledgerRepoHead ?? masterSha;
     if (tip == null && candidates.length > 0) {
       const probe = await listMasterCommitsSince(env, file.repo, file.path, null, {
         sinceTime: Math.min(...candidates.map((c) => c.since)),
@@ -4857,9 +4883,17 @@ async function clearResolvedMergeNoBase(
     // `windowStart` — and a recheck bounded by `windowStart` would then see an
     // empty page and read "no commits" as "the tip moved".
     let walkSince = walkStart ?? windowStart;
+    // Whether `walk`, AS ACTUALLY USED BELOW, is the repo-scoped ledger page —
+    // not merely whether the caller passed one. The branch just below can
+    // replace `walk` with a fresh path-scoped live fetch even when `walked` was
+    // ledger-sourced (a flag whose own window starts earlier than the ledger
+    // read's confirmedAt bound), and in that case the walk actually being used
+    // is path-scoped again, so the #861 fix below must not fire for it.
+    let ledgerSourcedWalk = ledgerRepoHead != null;
     if (walk == null || walkStart == null || walkStart > windowStart) {
       walk = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: windowStart });
       walkSince = windowStart;
+      ledgerSourcedWalk = false;
     }
     // A blocked outcome is recorded on the rows themselves, keyed by master's
     // tip, so tonight's answer is not re-bought tomorrow for an unchanged file.
@@ -4906,7 +4940,24 @@ async function clearResolvedMergeNoBase(
       await memoBlocked(`incomplete:${walk.incompleteReason}`);
       return 0;
     }
-    const humans = walk.commits.map(classifyMasterCommit).filter((c) => c.kind === "human");
+    // #861 (found while fixing the walkTip/tipNow scope mismatch below): a
+    // ledger-sourced walk's commits are ALREADY classified — correctly, via
+    // classifyForLedger, which unwraps a Gitea merge-wrapper subject
+    // ("Merge pull request 'bible-editor: …' from … into master") before
+    // testing it — and stored as such in dcs_commits.classification. Re-running
+    // plain classifyMasterCommit on it (as this line did) reclassifies from the
+    // WRAPPER subject alone, which OURS_PREFIX never matches, so the routine
+    // "our own nightly export merge" commit that is the whole reason #861 exists
+    // fails safe to `human` here and blocks the clear before it ever reaches the
+    // walkTip/tipNow comparison — the same fail-safe direction as everywhere
+    // else in this function, just one check too early. loadMasterLineage's own
+    // ledger branch (a few dozen lines above this function, same file) already
+    // gets this right — `classified.filter((c) => c.kind === "human")`, no
+    // reclassification — so a live/path-scoped walk (which per masterLineage.ts
+    // note 4 never contains a merge-wrapper commit at all) is the only case
+    // that needs classifyMasterCommit run fresh.
+    const humans = (ledgerSourcedWalk ? (walk.commits as ClassifiedCommit[]) : walk.commits.map(classifyMasterCommit))
+      .filter((c) => c.kind === "human");
     if (humans.length > 0) {
       console.log("reimport merge_no_base clear: skipped, a human commit is in the window", {
         book,
@@ -4997,22 +5048,50 @@ async function clearResolvedMergeNoBase(
     //     NoBaseFallbackWindow: a commit authored before the watermark but
     //     pushed after it is invisible to that walk exactly as it is to every
     //     other walk here (issue #691).
-    const walkTip = walk.commits[0]?.sha ?? null;
-    const recheck = await listMasterCommitsSince(env, file.repo, file.path, null, {
-      sinceTime: walkSince,
-      // Only the newest commit is needed, so this never pays the 5-page budget.
-      pageLimit: 1,
-    });
-    if (recheck.commits.length === 0 && recheck.incomplete) {
-      console.log("reimport merge_no_base clear: skipped, master tip could not be re-read before the write", {
-        book,
-        kind,
-        flagged,
-        reason: recheck.incompleteReason,
+    //
+    // #861: when `walk` is the repo-scoped ledger page, `walk.commits[0]?.sha`
+    // can be a Gitea merge-wrapper commit — exactly the shape our own nightly
+    // export merges take (see masterLineage.ts note 4) — which path-scoped
+    // history (what listMasterCommitsSince fetches) never shows at all. That
+    // made this recheck compare two shas from different Gitea history scopes
+    // and spuriously read "master moved" on the common case of a window whose
+    // newest relevant activity is one of our own merges. So when the walk is
+    // ledger-sourced, keep BOTH sides of the comparison in that same
+    // repo-scoped history: walkTip is the repo head the caller already proved
+    // the ledger read against, and the recheck re-probes that same repo head
+    // live rather than asking path-scoped history for a sha it may not carry.
+    let walkTip: string | null;
+    let tipNow: string | null;
+    if (ledgerSourcedWalk) {
+      walkTip = ledgerRepoHead;
+      tipNow = await repoHeadCommitSha(env, file.repo);
+      if (tipNow == null) {
+        console.log("reimport merge_no_base clear: skipped, master tip could not be re-read before the write", {
+          book,
+          kind,
+          flagged,
+          reason: "repo_head_unavailable",
+        });
+        return 0;
+      }
+    } else {
+      walkTip = walk.commits[0]?.sha ?? null;
+      const recheck = await listMasterCommitsSince(env, file.repo, file.path, null, {
+        sinceTime: walkSince,
+        // Only the newest commit is needed, so this never pays the 5-page budget.
+        pageLimit: 1,
       });
-      return 0;
+      if (recheck.commits.length === 0 && recheck.incomplete) {
+        console.log("reimport merge_no_base clear: skipped, master tip could not be re-read before the write", {
+          book,
+          kind,
+          flagged,
+          reason: recheck.incompleteReason,
+        });
+        return 0;
+      }
+      tipNow = recheck.commits[0]?.sha ?? null;
     }
-    const tipNow = recheck.commits[0]?.sha ?? null;
     if (tipNow !== walkTip) {
       console.log("reimport merge_no_base clear: skipped, master moved between the walk and the write", {
         book,
@@ -5044,7 +5123,15 @@ async function clearResolvedMergeNoBase(
     // — the two ancestor folds take create/update/restore, the verse fold adds
     // baseline — so an audit row can never be mistaken for row content.
     const kindCounts = { ours: 0, ai: 0, human: 0 };
-    for (const c of walk.commits.map(classifyMasterCommit)) kindCounts[c.kind]++;
+    // #861: same reclassification hazard as the `humans` filter above — a
+    // ledger-sourced walk's commits are ALREADY correctly classified (via
+    // classifyForLedger's merge-wrapper unwrap), so re-running plain
+    // classifyMasterCommit on them here would count our own nightly export
+    // merge as `human` and stamp this audit row's evidence with a human commit
+    // the decision above deliberately did not see. Trust the stored
+    // classification for a ledger-sourced walk, exactly as the filter does.
+    for (const c of ledgerSourcedWalk ? (walk.commits as ClassifiedCommit[]) : walk.commits.map(classifyMasterCommit))
+      kindCounts[c.kind]++;
     const evidence = {
       window_start: windowStart,
       walked_sha: tip,
@@ -5136,7 +5223,9 @@ export const clearResolvedMergeNoBaseForTest = (
   file: { repo: string; path: string },
   masterSha: string | null = null,
   fallback: NoBaseFallbackWindow | null = null,
-): Promise<number> => clearResolvedMergeNoBase(env, book, kind, walkStart, walked, file, masterSha, fallback);
+  ledgerRepoHead: string | null = null,
+): Promise<number> =>
+  clearResolvedMergeNoBase(env, book, kind, walkStart, walked, file, masterSha, fallback, ledgerRepoHead);
 
 // How many (book, kind) pairs one sweep will hand to the clear. THE BUDGET
 // GUARANTEE, and the reason the sweep can be unconditional. Measured cost of one
@@ -10572,8 +10661,10 @@ export async function runChunkedReimport(
       await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");
       recorded++;
       // This pair just reached a clean stamp, so it was NOT withheld above —
-      // release any reason left over from a past run (issue #829).
-      await clearSyncWithhold(env, book, e.resource);
+      // release any reason left over from a past run (issue #829). `instanceId`
+      // guards the delete against an overlapping older run's clear stomping on
+      // a newer run's already-recorded reason — see clearSyncWithhold's doc.
+      await clearSyncWithhold(env, book, e.resource, instanceId);
       // Issue #473 option A: the override let a nonzero drop count through to
       // a recorded sync above — raise the distinct "force-released, Door43
       // will lose these rows" alert instead of clearing it. Ordered AFTER

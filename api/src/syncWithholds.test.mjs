@@ -117,6 +117,48 @@ eq(
   "a zero count is omitted from the rendered text, not printed as '0 '",
 );
 
+// Issue #858: each remedy sentence must claim only what its counter measured.
+eq(
+  staleSkipRemedy(withhold({ reason: "structure_overlap", count: 2 })).includes("2 overlapping verse-range pair(s)"),
+  true,
+  "structure_overlap → names PAIRS (the counter's actual unit), not chapters",
+);
+eq(
+  staleSkipRemedy(withhold({ reason: "structure_overlap", count: 2 })).includes("chapter(s)"),
+  false,
+  "structure_overlap → no longer asserts a chapter count it never measured",
+);
+eq(
+  staleSkipRemedy(withhold({ reason: "merge_record_failed" })).includes("nothing from this run was applied"),
+  false,
+  "merge_record_failed → no longer claims the whole run was withheld",
+);
+eq(
+  /pending master-adoption edits were withheld/.test(staleSkipRemedy(withhold({ reason: "merge_record_failed" }))),
+  true,
+  "merge_record_failed → names only the adoption batch as withheld",
+);
+eq(
+  /human/.test(staleSkipRemedy(withhold({ reason: "tombstone_blocked", count: 1 }))),
+  false,
+  "tombstone_blocked → no longer asserts human intervention is required",
+);
+eq(
+  /self-heals/.test(staleSkipRemedy(withhold({ reason: "tombstone_blocked", count: 1 }))),
+  true,
+  "tombstone_blocked → says it usually self-heals on retry (the lost-CAS-race case it now fires for)",
+);
+eq(
+  staleSkipRemedy(withhold({ reason: "conflict_skipped", count: 4 })).includes("belongs to a different row"),
+  false,
+  "conflict_skipped → no longer asserts an ownership fact the counter never measured",
+);
+eq(
+  staleSkipRemedy(withhold({ reason: "conflict_skipped", count: 4 })).includes("already occupied in the app at insert time"),
+  true,
+  "conflict_skipped → states only what ON CONFLICT DO NOTHING actually measured",
+);
+
 console.log("\n[recordSyncWithhold / readSyncWithhold / clearSyncWithhold — real schema]");
 
 // Minimal D1 shim over node:sqlite — same shape as dismissReview.test.mjs.
@@ -184,11 +226,54 @@ function freshEnv() {
 
 {
   // Once a pair syncs cleanly, clearSyncWithhold releases the row outright —
-  // even a same-run read must not resurrect a cleared reason.
+  // even a same-run read must not resurrect a cleared reason. A same-or-later
+  // runId clears unconditionally (the ordering guard only ever protects a
+  // STRICTLY newer row from a STRICTLY older clear).
   const env = freshEnv();
   await recordSyncWithhold(env, "JER", "ult", "chapters_locked", 2, 1_700_000_000_000, "run-A");
-  await clearSyncWithhold(env, "JER", "ult");
+  await clearSyncWithhold(env, "JER", "ult", "run-B");
   eq(await readSyncWithhold(env, "JER", "ult", "run-A"), null, "a cleared row reads as null even for its own run");
+}
+
+{
+  // Issue #873: a Workflow replay reuses the SAME instanceId across attempts
+  // (deliberately — it's stable across replay). An attempt that first
+  // recorded a withhold and then, on a later successful step, clears it must
+  // be able to delete its OWN row (run_id === runId). Under a strict `<`
+  // guard this row would be stranded — a stale reason surviving until some
+  // unrelated later run happened to touch the same (book, resource) — which
+  // is a self-inflicted version of the exact bug the ordering guard exists
+  // to prevent.
+  const env = freshEnv();
+  await recordSyncWithhold(env, "JER", "ult", "chapters_locked", 2, 1_700_000_000_000, "run-A");
+  await clearSyncWithhold(env, "JER", "ult", "run-A");
+  eq(await readSyncWithhold(env, "JER", "ult", "run-A"), null, "a run can clear its own just-recorded row (same runId)");
+}
+
+{
+  // Issue #858 item 5: two overlapping Workflow instances on the SAME
+  // (book, resource) despite the resource-scoped locks meant to prevent it.
+  // run-B (started AFTER run-A) records its own fresh withhold; run-A then
+  // reaches its own clear call LATER in wall-clock time (it was simply
+  // slower). Without the run_id ordering guard, run-A's unconditional delete
+  // would blow away run-B's just-recorded row, and run-B's own later read
+  // would see "no reason on record" for a cause it measured moments ago.
+  const env = freshEnv();
+  await recordSyncWithhold(env, "JER", "ult", "chapters_locked", 2, 1_700_000_000_000, "run-A");
+  await recordSyncWithhold(env, "JER", "ult", "systemic_refusal", 0, 1_700_000_050_000, "run-B");
+  await clearSyncWithhold(env, "JER", "ult", "run-A");
+  eq(
+    (await readSyncWithhold(env, "JER", "ult", "run-B"))?.reason,
+    "systemic_refusal",
+    "an older run's late clear does not delete a newer run's already-recorded withhold",
+  );
+
+  // The mirror image: a later run (run-C) clearing after ITS OWN sync
+  // succeeded still removes run-B's now-leftover row — that is the ordinary,
+  // ongoing-operation case this guard must not block, only the
+  // older-clearing-after-newer race above.
+  await clearSyncWithhold(env, "JER", "ult", "run-C");
+  eq(await readSyncWithhold(env, "JER", "ult", "run-B"), null, "a later run's own clear still releases a leftover row");
 }
 
 {

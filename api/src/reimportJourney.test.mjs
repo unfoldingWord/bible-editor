@@ -2903,6 +2903,83 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
     const rows = sqlite.prepare(`SELECT id, review_kind FROM tq_rows ORDER BY id`).all();
     eq(rows.map((r) => r.review_kind), ["merge_conflict", null], "…an unacknowledged merge_conflict stands");
   }
+
+  // 7. Issue #861: a ledger-sourced walk (repo-scoped Gitea history) whose
+  //    newest relevant commit is one of OUR OWN nightly export merges — the
+  //    common case, since we export nightly — must not spuriously abort.
+  //    `readLedgerMasterLineage` narrows repo-scoped history to one path, but
+  //    the commits it returns can still be Gitea MERGE-WRAPPER commits
+  //    (classifyForLedger's own doc comment: `Merge pull request 'bible-editor:
+  //    …' from … into master`), which Gitea's PATH-scoped history (what
+  //    listMasterCommitsSince fetches) never shows at all (masterLineage.ts
+  //    note 4). Two bugs compounded here, both fixed together: (1) the
+  //    human-commit check re-derived `kind` from the wrapper subject alone via
+  //    classifyMasterCommit, which OURS_PREFIX never matches, misreading our
+  //    own merge as human; (2) the pre-write tip recheck compared that same
+  //    merge sha against path-scoped history's answer for the same window,
+  //    which — once (1) is fixed — never carries the merge sha at all.
+  {
+    const MERGE_SHA = "22d652732b18";
+    // The exact production shape classifyForLedger documents: a Gitea merge
+    // commit wrapping our own export's PR title. Already correctly classified
+    // `ours` by the ledger at poll time (masterLineageLedger.ts's
+    // classifyStored reads dcs_commits.classification, never reclassifying) —
+    // this fixture models that stored, already-correct shape.
+    const LEDGER_MERGE_COMMIT = {
+      sha: MERGE_SHA,
+      message: "Merge pull request 'bible-editor: 1CH tq -> master (#7001)' from 1CH-tq-be into master",
+      authorEmail: "someone@example.com",
+      authorName: "Someone",
+      date: "2026-08-28T00:00:00Z",
+      kind: "ours",
+      reason: "merge_of_bible_editor_export",
+    };
+    const LEDGER_PAGE = { commits: [LEDGER_MERGE_COMMIT], incomplete: false, incompleteReason: "" };
+    // A Gitea double that answers the repo-head probe (no `&path=` — see
+    // repoHeadCommitSha) with a given sha, and every PATH-scoped call (every
+    // other request this function makes, which all carry `&path=`) with an
+    // EMPTY page — modeling Gitea's own path-history simplification dropping
+    // the merge commit from that scope entirely.
+    const gitea = (repoHeadSha) => async (url) => {
+      if (String(url).includes("&path=")) return giteaPage([])();
+      return giteaPage([{ ...LEDGER_MERGE_COMMIT, sha: repoHeadSha }])();
+    };
+
+    // 7a. Without passing ledgerRepoHead (the pre-#861 call shape), the same
+    //     ledger page spuriously blocks: classifyMasterCommit alone misreads
+    //     the wrapper subject as human.
+    {
+      const { sqlite, env } = freshEnv();
+      seedFlagged(sqlite);
+      const cleared = await withFetch(gitea(MERGE_SHA), () =>
+        clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, LEDGER_PAGE, FILE, MERGE_SHA),
+      );
+      eq(cleared, 0, "pre-#861 call shape: ledger page misread as a human commit, clear blocked");
+    }
+
+    // 7b. With ledgerRepoHead, both fixes apply: the merge is recognized as
+    //     `ours` (no reclassification) and the recheck re-probes the repo head
+    //     instead of path-scoped history — so the flag clears.
+    {
+      const { sqlite, env } = freshEnv();
+      seedFlagged(sqlite);
+      const cleared = await withFetch(gitea(MERGE_SHA), () =>
+        clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, LEDGER_PAGE, FILE, MERGE_SHA, null, MERGE_SHA),
+      );
+      eq(cleared, 2, "both flags retired: the ledger-sourced merge clears against a repo-head recheck");
+    }
+
+    // 7c. A GENUINE master move since the ledger read is still caught: the
+    //     repo-head probe now answers with a different sha.
+    {
+      const { sqlite, env } = freshEnv();
+      seedFlagged(sqlite);
+      const cleared = await withFetch(gitea("newsha000000"), () =>
+        clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, LEDGER_PAGE, FILE, MERGE_SHA, null, MERGE_SHA),
+      );
+      eq(cleared, 0, "a real repo-head move between the ledger read and the write still blocks the clear");
+    }
+  }
 }
 
 console.log("\n[issue #672: a torn row (ref_raw ahead of its own stored chapter/verse) self-heals]");
