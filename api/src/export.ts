@@ -1230,6 +1230,44 @@ export function masterIsOurLastPublish(
   return masterBlobSha != null && pushedBlobSha != null && masterBlobSha === pushedBlobSha;
 }
 
+// Are there reverts worth COMPUTING for this publish? Both call sites in
+// exportOne consult this rather than composing the two predicates inline, so
+// the composition itself is covered by tests — an inverted `!` on the base
+// check would otherwise blank every report on every book and no unit test
+// would notice.
+//
+// Note what this does NOT gate: whether recordExportRevertReport is called at
+// all. It still is, with an empty entry list, because the zero-entry path is
+// the only thing that clears stale export_reverts rows and resolves a standing
+// export_revert_persistence alert. Skipping the call outright would leave both
+// stuck forever on any book that reaches the steady state this check detects.
+//
+// Two bounds worth stating, both of which merely cost suppression (the alert
+// fires as it does today) rather than hiding anything:
+//
+//  - `masterBlobSha` hashes the snapshot the shrink guards captured, pinned to
+//    the SHA the freshness gate resolved BEFORE commitToDcs ran. A commit
+//    landing on master inside that window is invisible here — but it is equally
+//    invisible to the unfiltered comparison this gate wraps, which diffs
+//    against that same pinned snapshot. Neither sees it.
+//  - `pushedBlobSha` advances every night whether or not the export PR merged,
+//    so master lagging behind an unmerged PR reads as "moved" and still reports.
+//
+// And what suppression cannot hide: rows or verses present on master but absent
+// from our render are skipped by usfmRevertReport/tsvRevertReport outright
+// ("not our concern here"), so a render that DELETES master content was never
+// this report's job — the shrink guards own that, and mechanicalOverwriteAlert
+// owns the zero-contributor render. Both are untouched by this check.
+export function shouldComputeRevertEntries(
+  dcsChanged: boolean,
+  masterContent: string | null,
+  masterBlobSha: string | null,
+  pushedBlobSha: string | null,
+): boolean {
+  if (!shouldRecordRevertReport(dcsChanged, masterContent)) return false;
+  return !masterIsOurLastPublish(masterBlobSha, pushedBlobSha);
+}
+
 // Does the number of substantive reverts this export is about to make justify
 // escalating the alert's wording beyond routine? This NEVER blocks the export
 // — there is no `block` field, only `escalate` — because a revert report is

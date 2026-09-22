@@ -46,6 +46,7 @@ import {
   usfmRevertReport,
   tsvRevertReport,
   shouldRecordRevertReport,
+  shouldComputeRevertEntries,
   masterIsOurLastPublish,
   classifyRevertSeverity,
   mechanicalOverwriteAlert,
@@ -1456,30 +1457,42 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           : tsvMasterContentForRevertReport;
       const masterBlobSha =
         masterContentForRevertReport != null ? await gitBlobShaOrNull(masterContentForRevertReport) : null;
-      const masterUntouchedSinceOurPublish = masterIsOurLastPublish(masterBlobSha, priorPushedBlobSha);
-      if (masterUntouchedSinceOurPublish) {
+      // Suppression records ZERO entries rather than skipping the reporter:
+      // recordExportRevertReport's empty-list path is the only thing that clears
+      // stale export_reverts rows and resolves a standing
+      // export_revert_persistence alert, so skipping the call outright would
+      // leave a banner stuck forever on exactly the books this check quiets.
+      const computeEntries = shouldComputeRevertEntries(
+        dcsChanged,
+        masterContentForRevertReport,
+        masterBlobSha,
+        priorPushedBlobSha,
+      );
+      if (!computeEntries && masterIsOurLastPublish(masterBlobSha, priorPushedBlobSha)) {
         console.log(
-          `export: revert report skipped for ${book} ${resource} — master still holds our last publish (${(priorPushedBlobSha ?? "").slice(0, 12)})`,
+          `export: revert entries suppressed for ${book} ${resource} — master still holds our last publish (${(priorPushedBlobSha ?? "").slice(0, 12)})`,
         );
       }
       if (
-        !masterUntouchedSinceOurPublish &&
         (resource === "ult" || resource === "ust") &&
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
-        const report = usfmRevertReport(built.content, usfmMasterContentForRevertReport as string);
-        await this.recordExportRevertReport(book, resource, "usfm", report.entries, mechanical, branch, instanceId, alertObservedAt);
+        const entries = computeEntries
+          ? usfmRevertReport(built.content, usfmMasterContentForRevertReport as string).entries
+          : [];
+        await this.recordExportRevertReport(book, resource, "usfm", entries, mechanical, branch, instanceId, alertObservedAt);
       } else if (
-        !masterUntouchedSinceOurPublish &&
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
       ) {
-        const report = tsvRevertReport(
-          built.content,
-          tsvMasterContentForRevertReport as string,
-          resource as "tn" | "tq" | "twl",
-        );
-        await this.recordExportRevertReport(book, resource, "tsv", report.entries, mechanical, branch, instanceId, alertObservedAt);
+        const entries = computeEntries
+          ? tsvRevertReport(
+              built.content,
+              tsvMasterContentForRevertReport as string,
+              resource as "tn" | "tq" | "twl",
+            ).entries
+          : [];
+        await this.recordExportRevertReport(book, resource, "tsv", entries, mechanical, branch, instanceId, alertObservedAt);
       }
 
       if (!commit.branchTouched) {

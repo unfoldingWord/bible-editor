@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, shouldRecordRevertReport, shouldComputeRevertEntries, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -2462,6 +2462,40 @@ function utf8Base64(s) {
   assert(
     masterIsOurLastPublish(null, null) === false,
     `neither side known -> fail OPEN`,
+  );
+}
+
+// --- shouldComputeRevertEntries: the composition, covered ---
+// Both exportOne call sites consult this rather than composing the ship gate
+// and the base check inline. An inverted `!` on the base check would otherwise
+// suppress every report on every book with no unit test noticing.
+{
+  assert(
+    shouldComputeRevertEntries(true, "master", "sha-moved", "sha-ours") === true,
+    `shipped, master readable, and master moved off our last publish -> record`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, "master", "sha-ours", "sha-ours") === false,
+    `shipped and master readable, but master IS our last publish -> compute nothing; the only ` +
+      `differences are our own edits since the sync, which is what the export exists to ship. ` +
+      `exportOne still CALLS recordExportRevertReport with the empty list, so the clear/resolve ` +
+      `path keeps running`,
+  );
+  assert(
+    shouldComputeRevertEntries(false, "master", "sha-moved", "sha-ours") === false,
+    `nothing shipped -> the ship gate still decides first, base check cannot resurrect it`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, null, null, "sha-ours") === false,
+    `master unreadable -> the ship gate declines, same as before this check existed`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, "master", "sha-ours", null) === true,
+    `no recorded publish -> fail OPEN, record exactly as the unfiltered gate did`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, "master", null, "sha-ours") === true,
+    `master unhashable -> fail OPEN; an unknown master cannot prove it is safe to overwrite`,
   );
 }
 
