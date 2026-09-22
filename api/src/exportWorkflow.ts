@@ -1506,13 +1506,24 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // Per-row base for the three-way diff (#870): master moved somewhere, so
       // report only the rows where it moved, not every row our own translators
       // changed since our last publish. Fetched only here, after the file-level
-      // check above declined to suppress — one R2 read (Door43 blob fallback
-      // when the render predates pushed_r2_key) on a subrequest-constrained
+      // check above declined to suppress — one R2 read, plus a Door43 blob
+      // fetch only when the R2 copy is missing — on a subrequest-constrained
       // workflow. Fails open: no base means every differing row is reported.
+      //
+      // The bytes must hash to pushed_blob_sha before they may suppress
+      // anything. The R2 key is per-instance and a step.do retry can rewrite it
+      // after recordPushedRender stored the sha, so the key alone does not
+      // prove it holds the render the sha describes; a mismatched base could
+      // hide a foreign edit, which is the one failure this report cannot have.
       let revertBase: string | null = null;
-      if (computeEntries && (priorPushedR2Key != null || priorPushedBlobSha != null)) {
+      if (computeEntries && priorPushedBlobSha != null) {
         try {
-          revertBase = await readPushedRenderText(this.env, book, resource, priorPushedR2Key, priorPushedBlobSha);
+          const raw = await readPushedRenderText(this.env, book, resource, priorPushedR2Key, priorPushedBlobSha);
+          if (raw != null && (await gitBlobShaOrNull(raw)) === priorPushedBlobSha) {
+            revertBase = raw;
+          } else if (raw != null) {
+            console.warn(`export: last-publish base for ${book} ${resource} does not hash to pushed_blob_sha; ignoring it`);
+          }
         } catch (e) {
           console.error("export: last-publish base read failed; revert report lists every differing row", {
             book,

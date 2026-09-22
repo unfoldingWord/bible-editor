@@ -1095,10 +1095,10 @@ export function usfmRevertReport(
 ): UsfmRevertReport {
   const rendered = verseTextByRef(renderedUsfm);
   const master = verseTextByRef(masterUsfm);
-  const base = baseUsfm == null ? null : verseTextByRef(baseUsfm);
   // Either side failing to parse leaves us with no reliable comparison — this
   // report is observational only, so decline to report rather than guess.
   if (rendered === null || master === null) return { entries: [], totalVerses: 0 };
+  const base = baseUsfm == null ? null : verseTextByRef(baseUsfm);
   const entries: UsfmRevertEntry[] = [];
   for (const [ref, masterText] of master) {
     const renderedText = rendered.get(ref);
@@ -1171,8 +1171,8 @@ export function tsvRevertReport(
   const idIdx = headers.indexOf("ID");
   const rendered = parseTsvRowsById(renderedTsv);
   const master = parseTsvRowsById(masterTsv);
-  const base = baseTsv == null ? null : parseTsvRowsById(baseTsv);
   if (rendered === null || master === null) return { entries: [], totalRows: 0 };
+  const base = baseTsv == null ? null : parseTsvRowsById(baseTsv);
   const entries: TsvRevertEntry[] = [];
   for (const [id, masterCells] of master) {
     const renderedCells = rendered.get(id);

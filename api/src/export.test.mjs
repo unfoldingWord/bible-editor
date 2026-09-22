@@ -2517,6 +2517,13 @@ function utf8Base64(s) {
     r.entries.length === 1 && r.entries[0].ref === "1:1" && r.entries[0].class === "substantive",
     `usfm: only the verse where master moved off base is reported, with today's class; got ${JSON.stringify(r.entries)}`,
   );
+  // The case the report exists for: our render still carries the base text,
+  // master moved (a foreign edit), so this export reverts it -> reported.
+  const rRevert = usfmRevertReport(base, master, base);
+  assert(
+    rRevert.entries.length === 1 && rRevert.entries[0].ref === "1:1" && rRevert.entries[0].class === "substantive",
+    `usfm: render == base while master moved -> we are reverting a foreign edit, reported; got ${JSON.stringify(rRevert.entries)}`,
+  );
   assert(
     usfmRevertReport(rendered, master).entries.length === 2,
     `usfm: no base -> every differing verse reported, exactly as before #870`,
@@ -2544,6 +2551,11 @@ function utf8Base64(s) {
   assert(
     t.entries.map((e) => e.ref).join(",") === "1:1,1:3" && t.entries.every((e) => e.class === "substantive"),
     `tsv: rows where master moved (ab01) or is new (ab03) reported; ab02 (master == base) suppressed; got ${JSON.stringify(t.entries)}`,
+  );
+  const tRevert = tsvRevertReport(tBase, tMaster, "tn", tBase);
+  assert(
+    tRevert.entries.length === 1 && tRevert.entries[0].ref === "1:1",
+    `tsv: render == base while master moved -> reverting a foreign edit, reported; got ${JSON.stringify(tRevert.entries)}`,
   );
   assert(
     tsvRevertReport(tRendered, tMaster, "tn", null).entries.length === 3,
