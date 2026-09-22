@@ -71,6 +71,7 @@ import {
   type MasterLineageSummary,
 } from "./masterLineage.ts";
 import { readLedgerMasterLineage } from "./masterLineageLedger.ts";
+import { DCS_POLL_FETCH_TIMEOUT_MS } from "./dcsCommitPoll.ts";
 import {
   findOurMergeForPr,
   gitBlobShaOrNull,
@@ -4688,7 +4689,13 @@ async function masterCommitsSinceViaLedgerOrLive(
   kind: TsvKind,
 ): Promise<MasterCommitPage> {
   try {
-    const repoHead = await repoHeadCommitSha(env, file.repo);
+    // Timeout required, not opt-in (review finding on #853): this sweep shares
+    // its Workflow step's runtime budget across up to NO_BASE_SWEEP_MAX_PAIRS
+    // pairs, so an unbounded probe here — Door43 accepting the connection and
+    // then stalling, never erroring — would stall the whole step short of its
+    // promised live fallback rather than just costing one more fetch. Same
+    // ceiling as the ledger poller's own fetches (DCS_POLL_FETCH_TIMEOUT_MS).
+    const repoHead = await repoHeadCommitSha(env, file.repo, { timeoutMs: DCS_POLL_FETCH_TIMEOUT_MS });
     const ledger = await readLedgerMasterLineage(env.DB, file.repo, file.path, windowStart, repoHead);
     if (ledger.usable && ledger.lineage) {
       console.log("reimport merge_no_base clear: walk source", { book, kind, source: "ledger" });
@@ -5184,19 +5191,22 @@ export const clearResolvedMergeNoBaseForTest = (
 // swept pair, worst case:
 //
 //   D1:    1 lineage read (book_resource_syncs) + 1 flagged-row read + 1
-//          mint-time read (only for flags with no window of their own) + one
+//          mint-time read (only for flags with no window of their own) + up to
+//          2 ledger reads (readLedgerMasterLineage's dcs_repo_polls +
+//          dcs_commits queries, #691, paid whenever the ledger-first attempt
+//          runs — the same condition as the repo-head probe below) + one
 //          write batch per WRITE_BATCH slice of rows it clears or memoizes.
 //   Gitea: 0 on a pair with nothing walkable; otherwise FOUR components —
 //          1 tip probe (the memo key, always paid once a pair has candidates)
 //          + 1 repo-head probe for the ledger-first attempt (#691; the ledger
-//          read itself is a D1 read, already counted above, but proving it
-//          usable needs the live repo head) + up to listMasterCommitsSince's
-//          5-page walk when the ledger is not usable (skipped entirely on a
-//          memo hit, or when the ledger supplies the walk) + 1 pre-write tip
+//          read itself is a D1 read, counted above, but proving it usable
+//          needs the live repo head) + up to listMasterCommitsSince's 5-page
+//          walk when the ledger is not usable (skipped entirely on a memo
+//          hit, or when the ledger supplies the walk) + 1 pre-write tip
 //          recheck (only for a pair that survives every gate and reaches the
 //          write). So 8 at worst per pair, 1 on a memo hit.
 //
-// So a full sweep is bounded at roughly 30 D1 reads, a handful of write batches,
+// So a full sweep is bounded at roughly 50 D1 reads, a handful of write batches,
 // and up to 80 Gitea fetches (10 pairs x 8) however many books hold flags. Plus the three
 // DISTINCT-book queries that find the pairs in the first place. The nightly has
 // already died once on Cloudflare's ~1000-subrequest cap, and this runs in its
