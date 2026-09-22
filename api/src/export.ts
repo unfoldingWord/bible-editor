@@ -1202,6 +1202,72 @@ export function shouldRecordRevertReport(dcsChanged: boolean, masterContent: str
   return dcsChanged && masterContent != null;
 }
 
+// Did master stand, byte for byte, on the render WE last published — i.e. has
+// nobody else's edit landed on it since?
+//
+// This is the base check the revert report was missing. Without it the report
+// flags every difference between our new render and master, which on a book
+// nobody else touches is just *our own translators' work since last night* —
+// exactly what the export exists to ship. Measured 2026-09-22: ECC UST raised
+// "overwrote master's current content on 23 row(s) ... systemic_23_substantive
+// _reverts" while `git.door43.org` history showed the only commits to
+// `21-ECC.usfm` between our 09-20 and 09-22 exports were our own. Nothing was
+// at risk; the 23 rows were one translator's evening in ECC 7.
+//
+// The report's whole stated purpose is "in case a hand-edit there was lost".
+// If master holds precisely the bytes we last pushed, no hand-edit exists there
+// outside our own lineage, so there is nothing to lose and nothing to report.
+//
+// Fails OPEN — both shas must be present AND equal to suppress. A missing
+// `pushedBlobSha` (never published, or migration 0048 unapplied) or an
+// unhashable master keeps today's behaviour, because an unknown base cannot
+// prove master is safe to overwrite. That direction matters: a false alarm
+// costs attention, a missed revert costs someone's work.
+export function masterIsOurLastPublish(
+  masterBlobSha: string | null,
+  pushedBlobSha: string | null,
+): boolean {
+  return masterBlobSha != null && pushedBlobSha != null && masterBlobSha === pushedBlobSha;
+}
+
+// Are there reverts worth COMPUTING for this publish? Both call sites in
+// exportOne consult this rather than composing the two predicates inline, so
+// the composition itself is covered by tests — an inverted `!` on the base
+// check would otherwise blank every report on every book and no unit test
+// would notice.
+//
+// Note what this does NOT gate: whether recordExportRevertReport is called at
+// all. It still is, with an empty entry list, because the zero-entry path is
+// the only thing that clears stale export_reverts rows and resolves a standing
+// export_revert_persistence alert. Skipping the call outright would leave both
+// stuck forever on any book that reaches the steady state this check detects.
+//
+// Two bounds worth stating, both of which merely cost suppression (the alert
+// fires as it does today) rather than hiding anything:
+//
+//  - `masterBlobSha` hashes the snapshot the shrink guards captured, pinned to
+//    the SHA the freshness gate resolved BEFORE commitToDcs ran. A commit
+//    landing on master inside that window is invisible here — but it is equally
+//    invisible to the unfiltered comparison this gate wraps, which diffs
+//    against that same pinned snapshot. Neither sees it.
+//  - `pushedBlobSha` advances every night whether or not the export PR merged,
+//    so master lagging behind an unmerged PR reads as "moved" and still reports.
+//
+// And what suppression cannot hide: rows or verses present on master but absent
+// from our render are skipped by usfmRevertReport/tsvRevertReport outright
+// ("not our concern here"), so a render that DELETES master content was never
+// this report's job — the shrink guards own that, and mechanicalOverwriteAlert
+// owns the zero-contributor render. Both are untouched by this check.
+export function shouldComputeRevertEntries(
+  dcsChanged: boolean,
+  masterContent: string | null,
+  masterBlobSha: string | null,
+  pushedBlobSha: string | null,
+): boolean {
+  if (!shouldRecordRevertReport(dcsChanged, masterContent)) return false;
+  return !masterIsOurLastPublish(masterBlobSha, pushedBlobSha);
+}
+
 // Does the number of substantive reverts this export is about to make justify
 // escalating the alert's wording beyond routine? This NEVER blocks the export
 // — there is no `block` field, only `escalate` — because a revert report is

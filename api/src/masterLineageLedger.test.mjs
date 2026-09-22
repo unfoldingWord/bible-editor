@@ -101,5 +101,40 @@ for (const [name, setup] of [
   ok(result.usable && result.lineage?.commits[0].kind === "ours", "stored merge-aware classification remains ours");
 }
 
+// Issue #856: the hourly dcs_commits retention sweep can delete rows and
+// raise coverage_since between this function's poll-floor read and its
+// commit-window read. Simulate that interleaving directly: the mock answers
+// the poll query with the OLD floor (which confirmedAt satisfies), then jumps
+// coverage_since forward as a side effect of the commit query resolving —
+// standing in for the sweep landing in between. Without the re-read this fix
+// adds, the stale poll answer alone would let a truncated window through as
+// "ledger_complete".
+{
+  let coverageSince = 100;
+  const raceDb = {
+    prepare(sql) {
+      return {
+        bind() {
+          return {
+            async first() {
+              if (!sql.includes("dcs_repo_polls")) return null;
+              return { last_sha: "tip", last_status: "ok", gap_since_sha: null, last_success_at: 200, coverage_since: coverageSince };
+            },
+            async all() {
+              coverageSince = 5000; // the sweep lands "during" this query
+              return { results: [row("old_human", files, 200, "human")] };
+            },
+          };
+        },
+      };
+    },
+  };
+  const result = await readLedgerMasterLineage(raceDb, "en_ust", "24-JER.usfm", 200, "tip");
+  ok(
+    !result.usable && result.reason === "ledger_floor_moved",
+    "a coverage floor raised between the poll read and the commit read is caught, not silently trusted",
+  );
+}
+
 if (failed) process.exit(1);
 console.log("masterLineageLedger: all assertions passed");

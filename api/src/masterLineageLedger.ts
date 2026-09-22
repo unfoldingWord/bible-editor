@@ -146,6 +146,22 @@ export async function readLedgerMasterLineage(
     )
     .bind(repo, confirmedAt)
     .all<LedgerLineageRow>();
+
+  // The hourly dcs_commits retention sweep (api/src/index.ts) can delete rows
+  // older than its cutoff and raise coverage_since to that same cutoff. If it
+  // runs between the poll read above and the commit read just issued, this
+  // reader's confirmedAt may have satisfied the OLD floor while the window it
+  // just read has already lost its oldest commits to the sweep — a truncated
+  // read that would otherwise report itself complete. Re-reading the floor
+  // now and rejecting if it moved past confirmedAt closes that gap.
+  const recheckPoll = await db
+    .prepare(`SELECT coverage_since FROM dcs_repo_polls WHERE repo = ?1`)
+    .bind(repo)
+    .first<{ coverage_since: number | null }>();
+  if (recheckPoll?.coverage_since != null && confirmedAt < recheckPoll.coverage_since) {
+    return EMPTY("ledger_floor_moved");
+  }
+
   const raw = rows.results ?? [];
   const commits: ClassifiedCommit[] = [];
   for (const row of raw) {
