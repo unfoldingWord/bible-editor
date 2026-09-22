@@ -10629,8 +10629,10 @@ export async function runChunkedReimport(
       await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");
       recorded++;
       // This pair just reached a clean stamp, so it was NOT withheld above —
-      // release any reason left over from a past run (issue #829).
-      await clearSyncWithhold(env, book, e.resource);
+      // release any reason left over from a past run (issue #829). `instanceId`
+      // guards the delete against an overlapping older run's clear stomping on
+      // a newer run's already-recorded reason — see clearSyncWithhold's doc.
+      await clearSyncWithhold(env, book, e.resource, instanceId);
       // Issue #473 option A: the override let a nonzero drop count through to
       // a recorded sync above — raise the distinct "force-released, Door43
       // will lose these rows" alert instead of clearing it. Ordered AFTER
