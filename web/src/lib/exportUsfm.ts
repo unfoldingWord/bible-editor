@@ -133,7 +133,11 @@ export function buildUsfmFromVerses(
       verseObjects = structuredClone(verseObjects);
       if (isTarget) recomputeTargetOccurrences(verseObjects);
     } else {
-      verseObjects = stripAlignmentNodes(verseObjects);
+      // Clone first: stripAlignmentNodes pushes leaf nodes it doesn't transform
+      // (anything that isn't a \zaln milestone or \w word) through by reference,
+      // and usfm.toUSFM mutates those nodes in place (trims/deletes text props),
+      // which would otherwise rewrite the cached verse DTO as a side effect.
+      verseObjects = stripAlignmentNodes(structuredClone(verseObjects));
     }
     const ch = String(v.chapter);
     if (!chapters[ch]) chapters[ch] = {};
