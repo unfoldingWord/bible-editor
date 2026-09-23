@@ -12,9 +12,10 @@ import type { NoteLinkTarget } from "../lib/noteLinks";
 import { buildVerseIndex } from "../lib/verseRange";
 import { shortSupport } from "../lib/supportReference";
 
-// The chapter Shell has open, as useChapter holds it: optimistic local edits
-// included. A link into that chapter previews this rather than a server copy,
-// so the comparison shows what the translator just typed, not the last save.
+// The chapter Shell has open, as useChapter holds it. A link into that
+// chapter previews this rather than a server copy, so saved edits show at once
+// even before the server round-trip (and there is no extra fetch). A note body
+// still being typed is not here: it lives in the card's draft until Save.
 const OpenChapterContext = createContext<ChapterPayload | null>(null);
 
 export function OpenChapterProvider({ data, children }: { data: ChapterPayload | null; children: ReactNode }) {
@@ -67,8 +68,9 @@ function tsvToDisplay(s: string | null): string {
 
 function PreviewBody({ target, supportRef }: { target: NoteLinkTarget; supportRef: string | null }) {
   const open = useContext(OpenChapterContext);
-  const live =
-    open && open.book.toUpperCase() === target.book.toUpperCase() && open.chapter === target.chapter ? open : null;
+  const isTarget = (d: ChapterPayload | null) =>
+    d != null && d.book.toUpperCase() === target.book.toUpperCase() && d.chapter === target.chapter;
+  const live = isTarget(open) ? open : null;
   const [fetched, setFetched] = useState<ChapterPayload | null>(
     () => freshEntry(target.book, target.chapter)?.value ?? null,
   );
@@ -94,7 +96,10 @@ function PreviewBody({ target, supportRef }: { target: NoteLinkTarget; supportRe
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target.book, target.chapter, live == null]);
 
-  const data = live ?? fetched;
+  // `fetched` can still hold the previous target's chapter for the one render
+  // before the effect resets it (a reused tooltip whose link changed); never
+  // show it under the new reference.
+  const data = live ?? (isTarget(fetched) ? fetched : null);
   const ref = `${target.book} ${target.chapter}:${target.verse}`;
   if (error && !data) {
     return <Typography variant="body2" color="error">Couldn't load {ref}.</Typography>;
@@ -128,7 +133,7 @@ function PreviewBody({ target, supportRef }: { target: NoteLinkTarget; supportRe
       </Box>
       <Box>
         <Typography sx={label}>
-          {notes.length <= 1 ? "Note" : matchedSupport ? `Notes (${notes.length})` : `Notes on this verse (${notes.length})`}
+          {notes.length === 0 ? "Notes" : notes.length === 1 ? "Note" : matchedSupport ? `Notes (${notes.length})` : `Notes on this verse (${notes.length})`}
         </Typography>
         {notes.length === 0 ? (
           <Typography variant="body2" color="text.secondary">No notes on this verse.</Typography>
@@ -176,13 +181,15 @@ export function NoteLinkPreview({
         <PreviewBody target={target} supportRef={supportRef} />
       }
       slotProps={{
-        tooltip: {
-          // React events bubble through the portal to the note card; stop them
-          // on the tooltip element itself (not an inner wrapper) so a click on
-          // its padding or a drag of its scrollbar can't flip the card into
-          // edit mode or navigate either.
+        // React events bubble through the portal to the note card; stop them on
+        // the popper, the outermost element, so a click anywhere in the preview
+        // (its padding, its scrollbar, the gap MUI leaves between link and
+        // tooltip) can't flip the card into edit mode or navigate either.
+        popper: {
           onMouseDown: (e: React.MouseEvent) => e.stopPropagation(),
           onClick: (e: React.MouseEvent) => e.stopPropagation(),
+        },
+        tooltip: {
           sx: {
             bgcolor: "background.paper",
             color: "text.primary",
