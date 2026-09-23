@@ -2397,6 +2397,12 @@ function areNotePropsEqual(a: Props, b: Props): boolean {
     a.bookLocked === b.bookLocked &&
     a.quoteBuildMode === b.quoteBuildMode &&
     a.quoteBuildSelectionCount === b.quoteBuildSelectionCount &&
+    // Load-bearing: the quote-build "apply now" effect (below) is keyed on
+    // this prop. Without it here, a memo-skipped card whose bump arrived in
+    // the same render as an otherwise-unchanged prop set would never re-run
+    // the effect and pick up the newly-applied quote (STATE.md: any prop an
+    // effect needs goes in the comparator).
+    (a.quoteBuildAppliedAt ?? null) === (b.quoteBuildAppliedAt ?? null) &&
     (a.flashArrow ?? null) === (b.flashArrow ?? null) &&
     // Compared BY VALUE: ResourceColumn derives these from the comments index
     // per render, so a fresh object arrives every time and a reference check
