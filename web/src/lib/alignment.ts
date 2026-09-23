@@ -770,8 +770,10 @@ export function parseAlignment(
 // Result cache for verseHasUnalignedWork, keyed on the identity of the target
 // then the source verseObjects arrays. Every ULT/UST cell in book and columns
 // mode asks this on mount, and Shell asks it for the whole chapter on each
-// save; a verse's content arrays are replaced (never mutated) when it changes,
-// so the same pair of arrays always gives the same answer. WeakMaps let entries
+// save; a verse's content arrays are replaced (not mutated) when it changes,
+// so the same pair of arrays always gives the same answer. (The one known
+// in-place write, usfm-js trimming whitespace during unaligned export, #932,
+// can't change it: whitespace holds no words.) WeakMaps let entries
 // die with the arrays, so there is no eviction to manage. NO_SOURCE stands in
 // for a null/absent source, which a WeakMap can't key on.
 const NO_SOURCE: object = {};
