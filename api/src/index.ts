@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { routePath } from "hono/route";
 import { chapters } from "./chapters";
 import { rows } from "./rows";
 import { verses } from "./verses";
@@ -99,6 +100,39 @@ const DEFAULT_DEV_ORIGINS = [
   "http://localhost:8787",
   "http://127.0.0.1:8787",
 ];
+
+// Per-request timing (issue #885), mounted first so `total` covers every
+// middleware below. Adds `Server-Timing: total;dur=<ms>, db;desc="n=<count>"`
+// and logs one JSON line per request for `wrangler tail`. `p` is the route
+// PATTERN of the handler that produced the response (e.g.
+// `/api/rows/:kind/:id`), read after next() so it names the real route rather
+// than this middleware's `/api/*`; patterns keep IDs out of the logs and let
+// lines group. A 404, or a request a middleware short-circuits (CSRF 403,
+// book-lock 423), logs that middleware's pattern, usually `/*`. `n` counts D1 statements prepared
+// through c.env.DB during the request (a batch's statements are prepared
+// individually, so they count too); the counting wrapper is a per-request
+// copy of env, never a mutation of the shared one. Skipped for WebSocket
+// upgrades: a 101 has no meaningful duration, and its response is the DO's.
+app.use("/api/*", async (c, next) => {
+  if (c.req.header("upgrade")?.toLowerCase() === "websocket") return next();
+  const start = Date.now();
+  let statements = 0;
+  const db = c.env.DB;
+  c.env = {
+    ...c.env,
+    DB: new Proxy(db, {
+      get(target, prop) {
+        if (prop === "prepare") statements++;
+        const v = Reflect.get(target, prop, target);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    }),
+  };
+  await next();
+  const ms = Date.now() - start;
+  c.res.headers.append("Server-Timing", `total;dur=${ms}, db;desc="n=${statements}"`);
+  console.log(JSON.stringify({ m: c.req.method, p: routePath(c), s: c.res.status, ms, db: statements }));
+});
 
 app.use("*", (c, next) => {
   const allowed = (c.env.ALLOWED_ORIGINS ?? "")
@@ -400,10 +434,16 @@ export default {
         // try/catch (same shape as the pipeline_jobs cleanup above): a failed
         // or D1-timed-out sweep must not fail the whole cron invocation — the
         // sweep is retention housekeeping, and the next hour retries it.
+        // Timed (issue #885): the sweep's multi-branch LIKE join may take
+        // seconds on prod-sized edit_log, which would stall requests after
+        // each :00 UTC. `ms` is wall time around the one D1 call; `rows` is
+        // how many edit_log rows it deleted.
         try {
-          await env.DB.prepare(EDIT_LOG_SWEEP_SQL)
+          const start = Date.now();
+          const res = await env.DB.prepare(EDIT_LOG_SWEEP_SQL)
             .bind(Math.floor(Date.now() / 1000) - EDIT_LOG_RETENTION_SECONDS)
             .run();
+          console.log(JSON.stringify({ job: "edit_log_sweep", ms: Date.now() - start, rows: res.meta.changes }));
         } catch (e) {
           console.error("edit_log retention sweep failed", e instanceof Error ? e.message : String(e));
         }
