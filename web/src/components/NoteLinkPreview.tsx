@@ -155,7 +155,7 @@ function PreviewBody({ target, supportRef }: { target: NoteLinkTarget; supportRe
           ))
         )}
       </Box>
-      <Typography sx={{ fontSize: 11, color: "text.secondary" }}>Click the link to go there.</Typography>
+      <Typography sx={{ fontSize: 11, color: "text.secondary" }}>Click to go there.</Typography>
     </Box>
   );
 }
