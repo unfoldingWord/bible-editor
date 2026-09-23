@@ -17,7 +17,7 @@ import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { type ChapterCopyBlock } from "../lib/chapterCopy";
 import { CopyChapterButton } from "./CopyChapterButton";
-import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
+import { LANE_FILL, type LaneShade, type TextLaneCheck } from "../lib/laneChecks";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, isPaintableHtml, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx, bookTsDividerSx } from "../lib/highlightStyles";
@@ -55,6 +55,11 @@ interface SearchState {
 const READ_ONLY = new Set(["UHB", "UGNT"]);
 
 const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
+
+// Handed to every cell that never reads the lexicon (only the RTL source
+// column's HebrewLine does), so a lexicon batch landing — or a new chapter
+// loading — does not re-render every loaded cell (#890).
+const EMPTY_LEX: Map<string, LexiconEntry | null> = new Map();
 
 // Stable placeholder so `chapters.get(ch) ?? UNLOADED_STATE` doesn't hand
 // ChapterBlock a fresh object every render and defeat its memo.
@@ -141,8 +146,8 @@ interface Props {
   locked?: boolean;
   // Optional per-verse Text-lane check. When present and canCheck, each verse
   // cell gets a small check control + a tinted verse-number underline. Wired
-  // from Shell; absent in standalone use. Same value for every cell, so it
-  // stays referentially stable and the memoized subtrees still skip.
+  // from Shell; absent in standalone use. It is the active chapter's data, so
+  // only the active chapter's cells get the control.
   textCheck?: TextLaneCheck;
 }
 
@@ -240,9 +245,38 @@ export function BookView({
     };
   }, [chapterObserver]);
 
-  const handleSaveVerse = useCallback((bv: string, ch: number, v: number, plain: string, base: VerseDto) => {
-    onSaveColumn(bv, [{ chapter: ch, verse: v, plain, base }]);
-  }, [onSaveColumn]);
+  // Shell and ScriptureColumn pass these as fresh arrows every render, which
+  // would re-render every memoized cell. Cells only call them from event
+  // handlers, so route each through a ref to its latest value and hand the
+  // cells one stable function apiece (#890). Presence still passes through:
+  // an omitted optional callback stays undefined below.
+  const latestCallbacksRef = useRef({
+    onEditVerse, onSaveColumn, onOpenAligner, onEditSection, onMergeBridge, onSplitBridge, onOpenVerseComments, textCheck,
+  });
+  latestCallbacksRef.current = {
+    onEditVerse, onSaveColumn, onOpenAligner, onEditSection, onMergeBridge, onSplitBridge, onOpenVerseComments, textCheck,
+  };
+  const stableCallbacks = useMemo(() => {
+    const cur = () => latestCallbacksRef.current;
+    return {
+      editVerse: (ch: number, v: number, bv: string, plain: string, base: VerseDto) =>
+        cur().onEditVerse(ch, v, bv, plain, base),
+      saveVerse: (bv: string, ch: number, v: number, plain: string, base: VerseDto) =>
+        cur().onSaveColumn(bv, [{ chapter: ch, verse: v, plain, base }]),
+      openAligner: (ch: number, v: number, bv: string) => cur().onOpenAligner(ch, v, bv),
+      editSection: (
+        ch: number,
+        v: number,
+        bv: string,
+        change: { index: number; tag: string | null; text: string },
+        base: VerseDto,
+      ) => cur().onEditSection?.(ch, v, bv, change, base),
+      mergeBridge: (ch: number, v: number, bv: string) => cur().onMergeBridge?.(ch, v, bv),
+      splitBridge: (ch: number, v: number, bv: string) => cur().onSplitBridge?.(ch, v, bv),
+      openVerseComments: (anchorEl: HTMLElement, v: number) => cur().onOpenVerseComments?.(anchorEl, v),
+      toggleText: (v: number) => cur().textCheck?.onToggle(v),
+    };
+  }, []);
 
   // Scroll the active verse into view — on navigation (activeChapter /
   // activeVerse) and on the toolbar "go to active" click (scrollNonce).
@@ -346,7 +380,16 @@ export function BookView({
     }
   }, [findQuery, book]);
 
+  // Shell rebuilds this array whenever chapter data changes (loading any
+  // chapter), which re-rendered every ChapterBlock and VerseRow. Hand the
+  // blocks one identity per distinct list (#890).
+  const enabledVersionsKey = enabledVersions.join(",");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stableEnabledVersions = useMemo(() => enabledVersions, [enabledVersionsKey]);
   const cols = enabledVersions.length;
+  // Only an RTL source column (UHB) reads the lexicon; without one shown, a
+  // lexicon change has nothing to re-render.
+  const cellLexiconMap = enabledVersions.some((v) => directionForVersion(v) === "rtl") ? lexiconMap : EMPTY_LEX;
   const gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
 
   return (
@@ -424,40 +467,50 @@ export function BookView({
         })}
       >
         <Box sx={{ display: "grid", gridTemplateColumns, gap: 1, px: 1.5, py: 1 }}>
-          {chapterList.map((ch) => (
-            <ChapterBlock
-              key={ch}
-              book={book}
-              chapter={ch}
-              state={chapters.get(ch) ?? UNLOADED_STATE}
-              enabledVersions={enabledVersions}
-              cols={cols}
-              activeChapter={activeChapter}
-              activeVerse={activeVerse}
-              activeNoteQuote={activeNoteQuote}
-              activeNoteOccurrence={activeNoteOccurrence}
-              activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
-              activeNoteCoveredVerses={activeNoteCoveredVerses}
-              reorderHighlight={reorderHighlight ?? null}
-              activeSourceContent={activeSourceContent}
-              activeRowRef={activeRowRef}
-              search={search}
-              findActiveMatch={findActiveMatch}
-              lexiconMap={lexiconMap}
-              chapterObserver={chapterObserver}
-              onSelectVerse={selectLocalVerse}
-              onEditVerse={onEditVerse}
-              onSaveVerse={handleSaveVerse}
-              onOpenAligner={onOpenAligner}
-              onEditSection={onEditSection}
-              onMergeBridge={onMergeBridge}
-              onSplitBridge={onSplitBridge}
-              verseCommentCounts={verseCommentCounts}
-              onOpenVerseComments={onOpenVerseComments}
-              locked={locked}
-              textCheck={textCheck}
-            />
-          ))}
+          {chapterList.map((ch) => {
+            // Everything about the active verse, the active note, and the
+            // Text-lane check belongs to the active chapter alone, so every
+            // other block gets fixed placeholders and its memo holds (#890).
+            // The Text-lane check is the active chapter's data (Shell's
+            // laneIndex and toggleLane are both scoped to it), so offering it
+            // on other chapters showed and wrote the wrong chapter's verse.
+            const isActiveChapter = ch === activeChapter;
+            return (
+              <ChapterBlock
+                key={ch}
+                book={book}
+                chapter={ch}
+                state={chapters.get(ch) ?? UNLOADED_STATE}
+                enabledVersions={stableEnabledVersions}
+                cols={cols}
+                isActiveChapter={isActiveChapter}
+                activeVerse={isActiveChapter ? activeVerse : -1}
+                activeNoteQuote={isActiveChapter ? activeNoteQuote : null}
+                activeNoteOccurrence={isActiveChapter ? activeNoteOccurrence : null}
+                activeNoteQuotePartialGroups={isActiveChapter && activeNoteQuotePartialGroups}
+                activeNoteCoveredVerses={isActiveChapter ? activeNoteCoveredVerses : undefined}
+                reorderHighlight={isActiveChapter ? reorderHighlight ?? null : null}
+                activeSourceContent={isActiveChapter ? activeSourceContent : undefined}
+                activeRowRef={activeRowRef}
+                search={search}
+                findActiveMatch={findActiveMatch?.chapter === ch ? findActiveMatch : null}
+                lexiconMap={cellLexiconMap}
+                chapterObserver={chapterObserver}
+                onSelectVerse={selectLocalVerse}
+                onEditVerse={stableCallbacks.editVerse}
+                onSaveVerse={stableCallbacks.saveVerse}
+                onOpenAligner={stableCallbacks.openAligner}
+                onEditSection={onEditSection ? stableCallbacks.editSection : undefined}
+                onMergeBridge={onMergeBridge ? stableCallbacks.mergeBridge : undefined}
+                onSplitBridge={onSplitBridge ? stableCallbacks.splitBridge : undefined}
+                verseCommentCounts={isActiveChapter ? verseCommentCounts : undefined}
+                onOpenVerseComments={onOpenVerseComments ? stableCallbacks.openVerseComments : undefined}
+                locked={locked}
+                textCheck={isActiveChapter ? textCheck : undefined}
+                onToggleText={stableCallbacks.toggleText}
+              />
+            );
+          })}
         </Box>
       </Box>
     </Box>
@@ -481,7 +534,7 @@ const ChapterBlock = memo(function ChapterBlock({
   state,
   enabledVersions,
   cols,
-  activeChapter,
+  isActiveChapter,
   activeVerse,
   activeNoteQuote,
   activeNoteOccurrence,
@@ -505,13 +558,15 @@ const ChapterBlock = memo(function ChapterBlock({
   onOpenVerseComments,
   locked,
   textCheck,
+  onToggleText,
 }: {
   book: string;
   chapter: number;
   state: ChapterState;
   enabledVersions: string[];
   cols: number;
-  activeChapter: number;
+  isActiveChapter: boolean;
+  // -1 on every chapter but the active one.
   activeVerse: number;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
@@ -540,7 +595,10 @@ const ChapterBlock = memo(function ChapterBlock({
   verseCommentCounts?: (verse: number) => CommentCounts;
   onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
   locked: boolean;
+  // Active chapter only. Resolved to per-verse primitives below so a check
+  // toggle re-renders just the toggled row.
   textCheck?: TextLaneCheck;
+  onToggleText: (verse: number) => void;
 }) {
   // Sentinel registered with BookView's shared observer — fires loadChapter
   // when the chapter comes within 800px of the scroll container's visible area.
@@ -567,6 +625,13 @@ const ChapterBlock = memo(function ChapterBlock({
     }
     return [...set].sort((a, b) => a - b);
   }, [readyData, enabledVersions]);
+  // One CommentCounts object per comments change, not per render: Shell's
+  // verseCommentCounts builds a fresh object on every call, which would
+  // re-render the active row on any render of this block.
+  const activeCommentCounts = useMemo(
+    () => (activeVerse >= 0 ? verseCommentCounts?.(activeVerse) : undefined),
+    [verseCommentCounts, activeVerse],
+  );
 
   if (state.kind === "unloaded" || state.kind === "loading") {
     return (
@@ -653,7 +718,7 @@ const ChapterBlock = memo(function ChapterBlock({
         )}
       </Box>
       {verseNums.map((v) => {
-        const isActive = chapter === activeChapter && v === activeVerse;
+        const isActive = isActiveChapter && v === activeVerse;
         // The UST bridge buttons sit on the bridge's start row (v). Keep them
         // available for ANY active verse inside the bridge span — matching
         // columns mode (DocColumn is range-aware) — not only when the start
@@ -661,11 +726,11 @@ const ChapterBlock = memo(function ChapterBlock({
         // `isActive` does, so the memo below stays tight.
         const ustDto = data.verses["UST"]?.[v];
         const bridgeActive =
-          chapter === activeChapter && ustDto?.verse_end != null && ustDto.verse_end > v
+          isActiveChapter && ustDto?.verse_end != null && ustDto.verse_end > v
             ? activeVerse >= v && activeVerse <= ustDto.verse_end
             : isActive;
         const coverHighlight =
-          chapter === activeChapter &&
+          isActiveChapter &&
           !!activeNoteQuotePartialGroups &&
           !!activeNoteCoveredVerses?.includes(v);
         return (
@@ -687,7 +752,7 @@ const ChapterBlock = memo(function ChapterBlock({
             activeSourceContent={isActive ? activeSourceContent : undefined}
             rowRef={isActive ? activeRowRef : null}
             search={search}
-            findActiveMatch={findActiveMatch}
+            findActiveMatch={findActiveMatch?.verse === v ? findActiveMatch : null}
             lexiconMap={lexiconMap}
             twl={data.twl}
             onSelectVerse={onSelectVerse}
@@ -697,10 +762,12 @@ const ChapterBlock = memo(function ChapterBlock({
             onEditSection={onEditSection}
             onMergeBridge={onMergeBridge}
             onSplitBridge={onSplitBridge}
-            verseCommentCounts={verseCommentCounts}
+            commentCounts={isActive ? activeCommentCounts : undefined}
             onOpenVerseComments={onOpenVerseComments}
             locked={locked}
-            textCheck={textCheck}
+            textShade={textCheck ? textCheck.shade(v) : "open"}
+            textCheckTitle={textCheck?.canCheck ? `Text — ${textCheck.attribution(v)}` : null}
+            onToggleText={onToggleText}
           />
         );
       })}
@@ -735,10 +802,12 @@ const VerseRow = memo(function VerseRow({
   onEditSection,
   onMergeBridge,
   onSplitBridge,
-  verseCommentCounts,
+  commentCounts,
   onOpenVerseComments,
   locked,
-  textCheck,
+  textShade,
+  textCheckTitle,
+  onToggleText,
 }: {
   book: string;
   chapter: number;
@@ -772,10 +841,15 @@ const VerseRow = memo(function VerseRow({
   ) => void;
   onMergeBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
   onSplitBridge?: (chapter: number, verse: number, bibleVersion: string) => void;
-  verseCommentCounts?: (verse: number) => CommentCounts;
+  // Active verse only (undefined elsewhere).
+  commentCounts?: CommentCounts;
   onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
   locked: boolean;
-  textCheck?: TextLaneCheck;
+  // Text-lane check, resolved per verse by ChapterBlock. A null title means
+  // no check control (not the active chapter, or the viewer can't check).
+  textShade: LaneShade;
+  textCheckTitle: string | null;
+  onToggleText: (verse: number) => void;
 }) {
   // Render is intentionally a row of N independent cells driven by the same
   // grid container above — placement is via CSS grid auto-flow.
@@ -838,8 +912,8 @@ const VerseRow = memo(function VerseRow({
               reorderHighlight={reorderHighlight}
               activeSourceContent={activeSourceContent}
               search={search}
-              findActiveMatch={findActiveMatch}
-              lexiconMap={lexiconMap}
+              findActiveMatch={findActiveMatch?.bibleVersion === bv ? findActiveMatch : null}
+              lexiconMap={directionForVersion(bv) === "rtl" ? lexiconMap : EMPTY_LEX}
               twl={twl}
               onOpenAligner={onOpenAligner}
               onEditVerse={onEditVerse}
@@ -848,10 +922,12 @@ const VerseRow = memo(function VerseRow({
               onMergeBridge={onMergeBridge}
               onSplitBridge={onSplitBridge}
               hasNextVerse={hasNextVerse}
-              verseCommentCounts={bv === commentColumn ? verseCommentCounts : undefined}
+              commentCounts={bv === commentColumn ? commentCounts : undefined}
               onOpenComments={bv === commentColumn ? onOpenVerseComments : undefined}
               locked={locked}
-              textCheck={textCheck}
+              textShade={textShade}
+              textCheckTitle={textCheckTitle}
+              onToggleText={onToggleText}
             />
           </Box>
         );
@@ -886,10 +962,12 @@ const VerseCell = memo(function VerseCell({
   onMergeBridge,
   onSplitBridge,
   hasNextVerse,
-  verseCommentCounts,
+  commentCounts,
   onOpenComments,
   locked,
-  textCheck,
+  textShade,
+  textCheckTitle,
+  onToggleText,
 }: {
   book: string;
   chapter: number;
@@ -931,10 +1009,14 @@ const VerseCell = memo(function VerseCell({
   hasNextVerse?: boolean;
   // Verse-level internal comments. Passed only to the leftmost column's cell,
   // so the badge shows once per verse; rendered only when this cell is active.
-  verseCommentCounts?: (verse: number) => CommentCounts;
+  commentCounts?: CommentCounts;
   onOpenComments?: (anchorEl: HTMLElement, verse: number) => void;
   locked: boolean;
-  textCheck?: TextLaneCheck;
+  // Text-lane check, resolved per verse by ChapterBlock. A null title means
+  // no check control (not the active chapter, or the viewer can't check).
+  textShade: LaneShade;
+  textCheckTitle: string | null;
+  onToggleText: (verse: number) => void;
 }) {
   const readOnly = READ_ONLY.has(bibleVersion) || locked;
   const rtl = directionForVersion(bibleVersion) === "rtl";
@@ -1232,8 +1314,7 @@ const VerseCell = memo(function VerseCell({
 
   // Text-lane check state for this cell (when wired). The tinted underline on
   // the verse marker keeps the checked state visible even with controls hidden.
-  const textShade = textCheck ? textCheck.shade(verseNum) : "open";
-  const showTextCheck = !!textCheck?.canCheck && !readOnly;
+  const showTextCheck = textCheckTitle != null && !readOnly;
 
   return (
     <Box sx={{ lineHeight: 1.6 }}>
@@ -1262,7 +1343,7 @@ const VerseCell = memo(function VerseCell({
           sx={{ display: "inline-flex", verticalAlign: "-4px" }}
         >
           <CommentBadge
-            counts={verseCommentCounts?.(verseNum) ?? EMPTY_COMMENT_COUNTS}
+            counts={commentCounts ?? EMPTY_COMMENT_COUNTS}
             onOpen={(el) => onOpenComments(el, verseNum)}
             titleWhenEmpty="Add an internal comment on this verse"
           />
@@ -1282,11 +1363,11 @@ const VerseCell = memo(function VerseCell({
         />
       )}
       {showTextCheck && (
-        <Tooltip title={`Text — ${textCheck!.attribution(verseNum)}`}>
+        <Tooltip title={textCheckTitle}>
           <IconButton
             onClick={(e) => {
               e.stopPropagation();
-              textCheck!.onToggle(verseNum);
+              onToggleText(verseNum);
             }}
             size="small"
             sx={{
