@@ -133,6 +133,17 @@ export function rangeSize(dto: VerseDto): number {
 // emits these naturally but we'd be combining post-parse, so we just splice
 // them together verbatim with a separator text node. The aligner doesn't
 // care about verse boundaries inside the combined source.
+//
+// Memoized per (map identity, start, end) so a Shell re-render that rebuilds
+// the aligner props hands AlignmentPanel the SAME sourceVerse object, and its
+// parseAlignment memo + rebase effect stay put (#889). A hit also requires
+// every per-verse row to be the identical object it was built from, so a map
+// updated in place (a row replaced under the same map) can't serve stale data.
+const concatCache = new WeakMap<
+  Record<number, VerseDto>,
+  Map<string, { rows: Array<VerseDto | undefined>; out: VerseDto | null }>
+>();
+
 export function concatSourceRange(
   sourceByVerseStart: Record<number, VerseDto> | undefined,
   start: number,
@@ -143,10 +154,29 @@ export function concatSourceRange(
   if (!first) return null;
   if (start === end) return first;
 
+  const rows: Array<VerseDto | undefined> = [];
+  for (let v = start; v <= end; v++) rows.push(sourceByVerseStart[v]);
+  const key = `${start}-${end}`;
+  let byRange = concatCache.get(sourceByVerseStart);
+  const hit = byRange?.get(key);
+  if (hit && hit.rows.every((r, i) => r === rows[i])) return hit.out;
+  const out = buildSourceRange(first, rows, end);
+  if (!byRange) {
+    byRange = new Map();
+    concatCache.set(sourceByVerseStart, byRange);
+  }
+  byRange.set(key, { rows, out });
+  return out;
+}
+
+function buildSourceRange(
+  first: VerseDto,
+  rows: Array<VerseDto | undefined>,
+  end: number,
+): VerseDto | null {
   const combined: unknown[] = [];
   let lastVerseSeen: VerseDto | null = null;
-  for (let v = start; v <= end; v++) {
-    const row = sourceByVerseStart[v];
+  for (const row of rows) {
     if (!row) continue;
     lastVerseSeen = row;
     const content = row.content as { verseObjects?: unknown[] } | null;

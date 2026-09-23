@@ -1407,11 +1407,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }
     }
     return [...set];
-    // `bookHook` itself is deliberately excluded: useBook returns a fresh object
-    // every render, so depending on it would make this memo recompute (and hand
-    // ScriptureColumn a fresh array) on every render — exactly what the comment
-    // above says this memo exists to avoid. `bookHook?.chapters` is the stable,
-    // actually-changing signal (a new Map only when chapters are added/updated).
+    // `bookHook?.chapters` rather than `bookHook`: narrower — the hook object
+    // also changes on summary/summaryStatus, which don't affect this set.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [versesForTiles, mode, bookHook?.chapters]);
 
@@ -1500,10 +1497,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bookHook && mode === "book"
         ? (bookHook.summary?.chapters ?? []).map((c) => c.chapter)
         : undefined,
-    // `bookHook` already covers `bookHook.summary` (it's a plain object useBook
-    // returns fresh every render, so this memo already recomputes every render
-    // regardless — that's a pre-existing perf gap in useBook's return value, not
-    // something this dependency list can fix; see #842).
     [bookHook, mode],
   );
   // Restore a previously dragged ratio for the NEW mode/column-count (falling
@@ -1562,8 +1555,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }
     }
     return [...set];
-    // `bookHook` excluded for the same reason as availableVersions above: it's a
-    // fresh object every render, and `bookHook?.chapters` is the stable signal.
+    // `bookHook?.chapters` rather than `bookHook`: narrower, as in availableVersions above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data?.verses, bookHook?.chapters]);
   const lexiconMapRaw = useLexicon(uhbStrongs);
