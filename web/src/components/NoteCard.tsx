@@ -49,6 +49,7 @@ import FormatListBulletedIcon from "@mui/icons-material/FormatListBulleted";
 import FormatIndentIncreaseIcon from "@mui/icons-material/FormatIndentIncrease";
 import FormatIndentDecreaseIcon from "@mui/icons-material/FormatIndentDecrease";
 import AutoFixHighOutlinedIcon from "@mui/icons-material/AutoFixHighOutlined";
+import YoutubeSearchedForIcon from "@mui/icons-material/YoutubeSearchedFor";
 import type { TnRow } from "../sync/api";
 import { isReadOnly } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
@@ -67,6 +68,7 @@ import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { parseNoteSegments, resolveNoteLinkHref } from "../lib/noteLinks";
+import type { NoteLinkTarget } from "../lib/noteLinks";
 import { NoteLinkPreview } from "./NoteLinkPreview";
 import { directionForText } from "../lib/direction";
 import {
@@ -704,6 +706,22 @@ function NoteCardInner({
     ta.setSelectionRange(sel.start, sel.end);
   }, [note]);
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
+  // "See how" link targets in the body, one per distinct verse. Clicking the
+  // card to read it switches the body to the editor, where the links (and
+  // their hover preview) are gone; the footer's look-back icon keeps the
+  // preview reachable while editing.
+  const seeHowTargets = useMemo(() => {
+    const seen = new Set<string>();
+    const out: NoteLinkTarget[] = [];
+    for (const seg of parseNoteSegments(note, row.book)) {
+      if (seg.type !== "link") continue;
+      const key = `${seg.target.book}/${seg.target.chapter}/${seg.target.verse}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(seg.target);
+    }
+    return out;
+  }, [note, row.book]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [aiConfirmOpen, setAiConfirmOpen] = useState(false);
   // Open when a save would blank out a previously-substantive note; see the
@@ -2181,6 +2199,29 @@ function NoteCardInner({
             />
           </span>
         </Tooltip>
+        {seeHowTargets.map((t) => (
+          <NoteLinkPreview key={`${t.book}/${t.chapter}/${t.verse}`} target={t} supportRef={supportRef}>
+            <IconButton
+              size="small"
+              aria-label={`Look back at ${t.book} ${t.chapter}:${t.verse}`}
+              // preventDefault too: a button takes focus on mousedown, and
+              // Paper's onFocus would activate this card (and its verse) on
+              // the way to navigating somewhere else. Same trap as the
+              // preview toggle above.
+              onMouseDown={(e: React.MouseEvent) => {
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+              onClick={(e: React.MouseEvent) => {
+                e.stopPropagation();
+                location.hash = `#/${t.book}/${t.chapter}/${t.verse}`;
+              }}
+              sx={{ p: 0.25, color: "primary.main" }}
+            >
+              <YoutubeSearchedForIcon sx={{ fontSize: 18 }} />
+            </IconButton>
+          </NoteLinkPreview>
+        ))}
 
         <Box sx={{ flex: 1 }} />
 
