@@ -67,6 +67,7 @@ import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { parseNoteSegments, resolveNoteLinkHref } from "../lib/noteLinks";
+import { NoteLinkPreview } from "./NoteLinkPreview";
 import { directionForText } from "../lib/direction";
 import {
   continueListOnEnter,
@@ -265,12 +266,14 @@ function buildNoteFindRegex(q: {
 function NoteBodyReadView({
   text,
   book,
+  supportRef,
   query,
   activeOccurrence,
   onActivate,
 }: {
   text: string;
   book: string;
+  supportRef: string | null;
   query: { find: string; regex: boolean; caseSensitive: boolean } | null;
   activeOccurrence: number | null;
   onActivate: () => void;
@@ -330,39 +333,39 @@ function NoteBodyReadView({
     const overlaps = range != null && seg.start < range.end && range.start < seg.end;
     if (seg.type === "link") {
       return (
-        <Box
-          component="span"
-          key={i}
-          ref={overlaps ? assignMarkRef() : undefined}
-          title={`Go to ${seg.target.book} ${seg.target.chapter}:${seg.target.verse}`}
-          onMouseDown={(e: React.MouseEvent) => {
-            // The card's own activation (Paper's onMouseDown -> onFocus, see
-            // below) fires on mousedown, before click. On an inactive card
-            // that flips `active` true and swaps this read view for the
-            // editable textarea (see `showReadView`) — unmounting this very
-            // link before its click ever fires, so navigation silently never
-            // happens. Stop it here so the card stays put and the click below
-            // still lands on a mounted element.
-            e.stopPropagation();
-          }}
-          onClick={(e: React.MouseEvent) => {
-            // Don't also let this bubble into the outer Box's onActivate —
-            // clicking a link navigates away, it doesn't mean "start editing".
-            e.stopPropagation();
-            location.hash = `#/${seg.target.book}/${seg.target.chapter}/${seg.target.verse}`;
-          }}
-          sx={{
-            color: "primary.main",
-            textDecoration: "underline",
-            textDecorationStyle: "dotted",
-            textUnderlineOffset: "2px",
-            cursor: "pointer",
-            "&:hover": { textDecorationStyle: "solid" },
-            ...(overlaps ? markSx : null),
-          }}
-        >
-          {seg.text}
-        </Box>
+        <NoteLinkPreview key={i} target={seg.target} supportRef={supportRef}>
+          <Box
+            component="span"
+            ref={overlaps ? assignMarkRef() : undefined}
+            onMouseDown={(e: React.MouseEvent) => {
+              // The card's own activation (Paper's onMouseDown -> onFocus, see
+              // below) fires on mousedown, before click. On an inactive card
+              // that flips `active` true and swaps this read view for the
+              // editable textarea (see `showReadView`) — unmounting this very
+              // link before its click ever fires, so navigation silently never
+              // happens. Stop it here so the card stays put and the click below
+              // still lands on a mounted element.
+              e.stopPropagation();
+            }}
+            onClick={(e: React.MouseEvent) => {
+              // Don't also let this bubble into the outer Box's onActivate —
+              // clicking a link navigates away, it doesn't mean "start editing".
+              e.stopPropagation();
+              location.hash = `#/${seg.target.book}/${seg.target.chapter}/${seg.target.verse}`;
+            }}
+            sx={{
+              color: "primary.main",
+              textDecoration: "underline",
+              textDecorationStyle: "dotted",
+              textUnderlineOffset: "2px",
+              cursor: "pointer",
+              "&:hover": { textDecorationStyle: "solid" },
+              ...(overlaps ? markSx : null),
+            }}
+          >
+            {seg.text}
+          </Box>
+        </NoteLinkPreview>
       );
     }
     if (!overlaps) return <span key={i}>{seg.text}</span>;
@@ -444,10 +447,12 @@ function NoteBodyReadView({
 function NoteBodyMarkdownView({
   text,
   book,
+  supportRef,
   onActivate,
 }: {
   text: string;
   book: string;
+  supportRef: string | null;
   onActivate: () => void;
 }) {
   const LinkComponent = useMemo(() => {
@@ -456,25 +461,26 @@ function NoteBodyMarkdownView({
       const target = resolveNoteLinkHref(href, book);
       if (target) {
         return (
-          <Box
-            component="span"
-            title={`Go to ${target.book} ${target.chapter}:${target.verse}`}
-            onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
-            onClick={(e: React.MouseEvent) => {
-              e.stopPropagation();
-              location.hash = `#/${target.book}/${target.chapter}/${target.verse}`;
-            }}
-            sx={{
-              color: "primary.main",
-              textDecoration: "underline",
-              textDecorationStyle: "dotted",
-              textUnderlineOffset: "2px",
-              cursor: "pointer",
-              "&:hover": { textDecorationStyle: "solid" },
-            }}
-          >
-            {children}
-          </Box>
+          <NoteLinkPreview target={target} supportRef={supportRef}>
+            <Box
+              component="span"
+              onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
+              onClick={(e: React.MouseEvent) => {
+                e.stopPropagation();
+                location.hash = `#/${target.book}/${target.chapter}/${target.verse}`;
+              }}
+              sx={{
+                color: "primary.main",
+                textDecoration: "underline",
+                textDecorationStyle: "dotted",
+                textUnderlineOffset: "2px",
+                cursor: "pointer",
+                "&:hover": { textDecorationStyle: "solid" },
+              }}
+            >
+              {children}
+            </Box>
+          </NoteLinkPreview>
         );
       }
       // Anything else (rc:// / ta man links, a relative path that isn't one
@@ -496,7 +502,7 @@ function NoteBodyMarkdownView({
       return <>{children}</>;
     }
     return NoteMdLink;
-  }, [book]);
+  }, [book, supportRef]);
 
   return (
     <Box
@@ -1957,12 +1963,14 @@ function NoteCardInner({
           <NoteBodyMarkdownView
             text={note}
             book={row.book}
+            supportRef={supportRef}
             onActivate={() => setEditingBody(true)}
           />
         ) : showReadView ? (
           <NoteBodyReadView
             text={note}
             book={row.book}
+            supportRef={supportRef}
             query={findQuery}
             activeOccurrence={activeMatchOccurrence}
             onActivate={() => setEditingBody(true)}
