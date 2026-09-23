@@ -101,6 +101,20 @@ export function noteCoveredVerses(row: { verse: number; ref_raw?: string | null 
   return [...covered].sort((x, y) => x - y);
 }
 
+// Every verse any of `rows` covers, as a sorted comma-joined key ("1,2,5").
+// A string, so a caller can memo on it: the rows array is new on every note
+// edit, but the key only changes when a verse gains or loses its last row.
+export function coveredVersesKey(rows: readonly { verse: number; ref_raw?: string | null }[]): string {
+  const s = new Set<number>();
+  for (const r of rows) for (const v of noteCoveredVerses(r)) s.add(v);
+  return [...s].sort((x, y) => x - y).join(",");
+}
+
+// Inverse of coveredVersesKey.
+export function versesFromKey(key: string): Set<number> {
+  return new Set(key ? key.split(",").map(Number) : []);
+}
+
 // True when a note/question row covers any verse in the inclusive display
 // window [rangeStart, rangeEnd]. Reduces to `verse in [start,end]` for singletons.
 export function noteOverlapsRange(

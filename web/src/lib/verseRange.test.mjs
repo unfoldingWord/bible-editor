@@ -10,6 +10,8 @@ import {
   rangeSize,
   concatSourceRange,
   noteCoveredVerses,
+  coveredVersesKey,
+  versesFromKey,
   noteOverlapsRange,
 } from "./verseRange.ts";
 
@@ -162,6 +164,22 @@ function mkVerse(verse, verseEnd, voCount = 1) {
   assert(cv(0, "1:intro") === "[0]", "intro ref → [0]");
   // Malformed huge range from free-text input is bounded (no runaway loop).
   assert(noteCoveredVerses({ verse: 1, ref_raw: "1:1-1000000000" }).length <= 402, "huge range is bounded");
+}
+
+// --- coveredVersesKey / versesFromKey ---
+{
+  const rows = [
+    { verse: 5, ref_raw: "1:5" },
+    { verse: 2, ref_raw: "1:2-3" },
+    { verse: 5, ref_raw: "1:5" },
+    { verse: 0, ref_raw: "1:intro" },
+  ];
+  assert(coveredVersesKey(rows) === "0,2,3,5", "key is sorted, unique, bridges expanded");
+  // Row order / note text don't matter — only which verses are covered.
+  assert(coveredVersesKey([...rows].reverse()) === coveredVersesKey(rows), "key ignores row order");
+  assert(coveredVersesKey([]) === "", "no rows → empty key");
+  assert(JSON.stringify([...versesFromKey("0,2,3,5")]) === "[0,2,3,5]", "versesFromKey round-trips");
+  assert(versesFromKey("").size === 0, "empty key → empty set (not {0})");
 }
 
 // --- noteOverlapsRange ---
