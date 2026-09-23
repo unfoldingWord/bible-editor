@@ -114,7 +114,7 @@ const DEFAULT_DEV_ORIGINS = [
 // copy of env, never a mutation of the shared one. Skipped for WebSocket
 // upgrades: a 101 has no meaningful duration, and its response is the DO's.
 app.use("/api/*", async (c, next) => {
-  if (c.req.header("upgrade") === "websocket") return next();
+  if (c.req.header("upgrade")?.toLowerCase() === "websocket") return next();
   const start = Date.now();
   let statements = 0;
   const db = c.env.DB;
