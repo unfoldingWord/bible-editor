@@ -3793,6 +3793,60 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   assert(unresolved.size === 0, "unresolved source positions produce no owners");
 }
 
+// ─── verseHasUnalignedWork result cache (#894) ──────────────────────────
+// The answer is cached per (target array, source array) identity. Content
+// arrays are replaced, never mutated, when a verse changes, so a new array
+// must get a fresh answer and the same arrays must not be re-parsed.
+{
+  console.log("\n[Case] verseHasUnalignedWork caches by array identity (#894)");
+  const target = String.raw`\id PSA
+\c 3
+\v 8 \zaln-s |x-strong="H3068" x-content="יְהוָה"\*\w Yahweh|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`;
+  const source = String.raw`\id PSA
+\c 3
+\v 8 \w יְהוָה|x-strong="H3068" x-occurrence="1"\w*
+`;
+  const widerSource = String.raw`\id PSA
+\c 3
+\v 8 \w יְהוָה|x-strong="H3068" x-occurrence="1"\w* \w סֶלָה|x-strong="H5542" x-occurrence="1"\w*
+`;
+  const freshTarget = () => usfm.toJSON(target).chapters["3"]["8"].verseObjects;
+  const svo = usfm.toJSON(source).chapters["3"]["8"].verseObjects;
+  const wideSvo = usfm.toJSON(widerSource).chapters["3"]["8"].verseObjects;
+  const bareWords = { type: "text", text: " extra bare words" };
+
+  // (1) Same objects, same answer.
+  const tvo = freshTarget();
+  assert(!verseHasUnalignedWork(tvo, svo), "fully-aligned verse: false");
+  assert(!verseHasUnalignedWork(tvo, svo), "same arrays again: still false");
+
+  // Control: the in-place edit below really does parse as unaligned on a
+  // fresh array, so the next check proves caching, not a no-op edit.
+  const control = freshTarget();
+  control.push(bareWords);
+  assert(verseHasUnalignedWork(control, svo), "control: target with bare words parses as unaligned");
+
+  // (2) Cached: an in-place edit to an already-asked array is not re-parsed.
+  tvo.push(bareWords);
+  assert(!verseHasUnalignedWork(tvo, svo), "same array edited in place returns the cached answer");
+
+  // (3) A new target array gets a fresh answer.
+  const tvo2 = freshTarget();
+  tvo2.push(bareWords);
+  assert(verseHasUnalignedWork(tvo2, svo), "new target array is parsed afresh");
+
+  // (4) A new source array gets a fresh answer, and null is its own slot.
+  const tvo3 = freshTarget();
+  assert(!verseHasUnalignedWork(tvo3, svo), "target vs its matching source: false");
+  assert(verseHasUnalignedWork(tvo3, wideSvo), "same target vs a wider source: unaligned source word → true");
+  assert(!verseHasUnalignedWork(tvo3, svo), "original source slot still cached as false");
+  assert(!verseHasUnalignedWork(tvo3, null), "null source: false (no source coverage check)");
+  assert(!verseHasUnalignedWork(tvo3, undefined), "undefined source shares the null slot");
+  assert(verseHasUnalignedWork(tvo3, wideSvo), "wider source slot still cached as true");
+  assert(!verseHasUnalignedWork(null, svo), "non-array target: false");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
