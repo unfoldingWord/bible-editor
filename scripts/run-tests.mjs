@@ -47,6 +47,7 @@ const SQLITE_FILES = new Set([
   "src/staleBaseGate.test.mjs",
   "src/reviewFlagBroadcast.test.mjs",
   "src/syncWithholds.test.mjs",
+  "src/catalogs.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
@@ -69,6 +70,9 @@ const EXTRA_IMPORTS = new Map([
   // postExport.test.mjs imports postExport.ts (issue #841 schema tests),
   // which imports "./bookReimport" without an extension.
   ["src/postExport.test.mjs", "./src/tsResolveHook.mjs"],
+  // catalogs.ts imports "./twlMatcher" and "./taSupportReferences" without
+  // extensions.
+  ["src/catalogs.test.mjs", "./src/tsResolveHook.mjs"],
 ]);
 
 function findTestFiles(dir) {

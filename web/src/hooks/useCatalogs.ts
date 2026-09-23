@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { api, type Catalogs } from "../sync/api";
+import { createResourceCache } from "./resourceCache";
 
 // Persisted alongside the in-memory cache so an F5 while offline still shows
 // type-ahead suggestions. Single payload, ~50-100KB — localStorage is the
@@ -9,6 +10,11 @@ import { api, type Catalogs } from "../sync/api";
 // stale-while-revalidate — which would silently disagree with the export
 // until the background refresh landed. The old v1 key is left alone.
 const STORAGE_KEY = "bible-editor.catalogs.v2";
+
+// #886: catalogs change on the scale of a tw_articles/tw import, not on every
+// verse click — re-share the last fetch for this long instead of refetching
+// on every NoteCard/WordRow mount.
+const CACHE_TTL_MS = 10 * 60 * 1000;
 
 function readPersisted(): Catalogs | null {
   try {
@@ -39,25 +45,24 @@ function writePersisted(c: Catalogs) {
 // Single in-module cache so every NoteCard/WordsTable shares the same fetch.
 // Hydrate synchronously from localStorage so first render shows real data
 // even if we're currently offline.
-let cache: Catalogs | null = readPersisted();
-let inflight: Promise<Catalogs> | null = null;
-const subscribers = new Set<(c: Catalogs) => void>();
+const resourceCache = createResourceCache<Catalogs>({
+  fetcher: () => api.getCatalogs(),
+  read: readPersisted,
+  write: writePersisted,
+  ttlMs: CACHE_TTL_MS,
+});
 
-function load(): Promise<Catalogs> {
-  if (inflight) return inflight;
-  inflight = api.getCatalogs().then((c) => {
-    cache = c;
-    inflight = null;
-    writePersisted(c);
-    for (const s of subscribers) s(c);
-    return c;
-  }).catch((err) => {
-    // Don't cache the rejection — a failed first fetch must retry on the
-    // next mount, not leave pickers empty for the whole session.
-    inflight = null;
-    throw err;
-  });
-  return inflight;
+// twTitles arrives as a plain Record; every consumer wants it as a Map. Built
+// once per distinct record (module scope, keyed by reference) instead of once
+// per hook call, so mounting N NoteCards/WordRows doesn't rebuild an ~950
+// entry Map N times over.
+let twTitlesMemo: { rec: Record<string, string> | undefined; map: Map<string, string> } | null =
+  null;
+function getTwTitlesMap(rec: Record<string, string> | undefined): Map<string, string> {
+  if (twTitlesMemo && twTitlesMemo.rec === rec) return twTitlesMemo.map;
+  const map = new Map(Object.entries(rec ?? {}));
+  twTitlesMemo = { rec, map };
+  return map;
 }
 
 // twTitles arrives from the API as a Record and is handed on as a Map (what
@@ -66,24 +71,28 @@ function load(): Promise<Catalogs> {
 // both a Record and a Map, which nothing can satisfy.
 export function useCatalogs(): Omit<Catalogs, "twTitles"> & { twTitles: Map<string, string> } {
   const [val, setVal] = useState<Catalogs>(
-    () => cache ?? { supportReferences: [], twLinks: [] },
+    () => resourceCache.getCached() ?? { supportReferences: [], twLinks: [] },
   );
   useEffect(() => {
     let mounted = true;
     // Stale-while-revalidate: render the cached value synchronously (above),
-    // and kick off a background refresh. If the refresh fails (e.g. offline),
-    // we keep showing the cached value — no error surface.
-    load().then((c) => {
-      if (mounted) setVal(c);
-    }).catch(() => { /* keep cached value */ });
-    subscribers.add(setVal);
+    // and kick off a background refresh (a no-op network call within the TTL
+    // of the last one). If the refresh fails (e.g. offline), we keep showing
+    // the cached value — no error surface.
+    resourceCache
+      .load()
+      .then((c) => {
+        if (mounted) setVal(c);
+      })
+      .catch(() => {
+        /* keep cached value */
+      });
+    const unsubscribe = resourceCache.subscribe(setVal);
     return () => {
       mounted = false;
-      subscribers.delete(setVal);
+      unsubscribe();
     };
   }, []);
-  // Memoized so callers (e.g. canonicalTwlOrder call sites) don't rebuild the
-  // Map on every render — only when the underlying record actually changes.
-  const twTitles = useMemo(() => new Map(Object.entries(val.twTitles ?? {})), [val.twTitles]);
+  const twTitles = getTwTitlesMap(val.twTitles);
   return { ...val, twTitles };
 }

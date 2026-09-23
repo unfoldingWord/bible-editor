@@ -7,6 +7,18 @@ export const catalogs = new Hono<{ Bindings: Env }>();
 
 const TW_LINK_PREFIX = "rc://*/tw/dict/bible/";
 
+// #886: every NoteCard/WordRow mount used to trigger a fresh GET, each of
+// which ran a full twl_rows GROUP BY scan plus the disambiguation build. The
+// client (useCatalogs.ts) now shares one fetch per browser session via its
+// own TTL, but a hard reload, a new tab, or many editors online at once still
+// hit this route directly — so also memoize the body at isolate scope for a
+// while, same idea as twlSuggest.ts's trie cache. A tw_articles import (or a
+// twl_rows edit changing the usage-derived ordering) is picked up within the
+// TTL below, not instantly — acceptable per the issue, since this catalog
+// already tolerates the client's own TTL-bounded staleness.
+const CACHE_TTL_MS = 10 * 60 * 1000;
+let memo: { body: string; expiresAt: number } | null = null;
+
 // First heading line, minus the leading "# " — the synonym list a translator
 // reads to tell sibling articles apart (e.g. "call (speak), called, calling").
 function cleanTitle(title: string | null): string {
@@ -63,6 +75,16 @@ function buildDisambiguation(articles: TwArticleLite[]) {
 // and fall back to / union with usage-derived links so nothing regresses before
 // the first import and any in-use-but-not-canonical link still autocompletes.
 catalogs.get("/", async (c) => {
+  const now = Date.now();
+  if (memo && memo.expiresAt > now) {
+    return new Response(memo.body, {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "private, max-age=300",
+      },
+    });
+  }
+
   // Canonical en_tw articles (empty until the first import). id + title also
   // feed the disambiguation groups below.
   const canonical = await c.env.DB.prepare(
@@ -111,11 +133,18 @@ catalogs.get("/", async (c) => {
     if (r.value && r.title) twTitles[r.value] = r.title;
   }
 
-  return c.json({
+  const body = JSON.stringify({
     supportReferences: TA_SUPPORT_REFERENCES,
     twLinks,
     twTitles,
     disambiguationGroups: disambiguation.groups,
     disambiguationIndex: disambiguation.index,
+  });
+  memo = { body, expiresAt: now + CACHE_TTL_MS };
+  return new Response(body, {
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "private, max-age=300",
+    },
   });
 });
