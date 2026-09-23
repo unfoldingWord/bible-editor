@@ -60,6 +60,17 @@ const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total:
 // ChapterBlock a fresh object every render and defeat its memo.
 const UNLOADED_STATE: ChapterState = { kind: "unloaded" };
 
+// One IntersectionObserver per BookView, rooted at its scroll container, that
+// every unloaded chapter's sentinel registers with. The root matters:
+// rootMargin only grows the root, so with the default (viewport) root the
+// container's own clipping kept the 800px pre-load from ever firing (#891).
+// Sentinels can register before the observer exists (child effects run before
+// the parent's), so registrations are kept in a Map and replayed onto it.
+interface ChapterObserver {
+  observe: (el: Element, chapter: number) => void;
+  unobserve: (el: Element) => void;
+}
+
 // Kept by Shell, which survives the chapter-loading gate that remounts this
 // view. Only an accepted local verse click creates a restoration request.
 export interface BookViewportPosition {
@@ -192,6 +203,42 @@ export function BookView({
   // toolbar button). Held until the active chapter is loaded and centered —
   // see the scroll effect below.
   const [scrollPending, setScrollPending] = useState(false);
+
+  const onLoadChapterRef = useRef(onLoadChapter);
+  onLoadChapterRef.current = onLoadChapter;
+  const observerRef = useRef<IntersectionObserver | null>(null);
+  const sentinelTargetsRef = useRef(new Map<Element, number>());
+  const chapterObserver = useMemo<ChapterObserver>(() => ({
+    observe: (el, chapter) => {
+      sentinelTargetsRef.current.set(el, chapter);
+      observerRef.current?.observe(el);
+    },
+    unobserve: (el) => {
+      sentinelTargetsRef.current.delete(el);
+      observerRef.current?.unobserve(el);
+    },
+  }), []);
+  useEffect(() => {
+    const targets = sentinelTargetsRef.current;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (!e.isIntersecting) continue;
+          const ch = targets.get(e.target);
+          if (ch === undefined) continue;
+          chapterObserver.unobserve(e.target);
+          onLoadChapterRef.current(ch);
+        }
+      },
+      { root: containerRef.current, rootMargin: "800px 0px" },
+    );
+    observerRef.current = obs;
+    for (const el of targets.keys()) obs.observe(el);
+    return () => {
+      obs.disconnect();
+      observerRef.current = null;
+    };
+  }, [chapterObserver]);
 
   const handleSaveVerse = useCallback((bv: string, ch: number, v: number, plain: string, base: VerseDto) => {
     onSaveColumn(bv, [{ chapter: ch, verse: v, plain, base }]);
@@ -397,7 +444,7 @@ export function BookView({
               search={search}
               findActiveMatch={findActiveMatch}
               lexiconMap={lexiconMap}
-              onLoadChapter={onLoadChapter}
+              chapterObserver={chapterObserver}
               onSelectVerse={selectLocalVerse}
               onEditVerse={onEditVerse}
               onSaveVerse={handleSaveVerse}
@@ -446,7 +493,7 @@ const ChapterBlock = memo(function ChapterBlock({
   search,
   findActiveMatch,
   lexiconMap,
-  onLoadChapter,
+  chapterObserver,
   onSelectVerse,
   onEditVerse,
   onSaveVerse,
@@ -476,7 +523,7 @@ const ChapterBlock = memo(function ChapterBlock({
   search: SearchState | null;
   findActiveMatch: FindMatch | null;
   lexiconMap: Map<string, LexiconEntry | null>;
-  onLoadChapter: (ch: number) => void;
+  chapterObserver: ChapterObserver;
   onSelectVerse: (chapter: number, verse: number) => void;
   onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   onSaveVerse: (bv: string, chapter: number, verse: number, plain: string, base: VerseDto) => void;
@@ -495,29 +542,17 @@ const ChapterBlock = memo(function ChapterBlock({
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
-  // Sentinel observed by IntersectionObserver — fires loadChapter when the
-  // chapter is near (within ~one viewport of) the visible area.
+  // Sentinel registered with BookView's shared observer — fires loadChapter
+  // when the chapter comes within 800px of the scroll container's visible area.
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const isUnloaded = state.kind === "unloaded";
   useEffect(() => {
     if (!isUnloaded) return;
     const el = sentinelRef.current;
     if (!el) return;
-    const obs = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting) {
-            onLoadChapter(chapter);
-            obs.disconnect();
-            break;
-          }
-        }
-      },
-      { rootMargin: "800px 0px" },
-    );
-    obs.observe(el);
-    return () => obs.disconnect();
-  }, [isUnloaded, chapter, onLoadChapter]);
+    chapterObserver.observe(el, chapter);
+    return () => chapterObserver.unobserve(el);
+  }, [isUnloaded, chapter, chapterObserver]);
 
   // Verse-number list pulled from the ready payload — unconditional so the
   // hook count stays stable across loading/error/ready transitions.
