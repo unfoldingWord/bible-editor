@@ -112,9 +112,18 @@
 // exempted here.)
 //
 // SQL shape notes:
-//   - The exempt set is an UNCORRELATED subquery: computed once per sweep,
-//     never re-evaluated per candidate row (a correlated NOT EXISTS over the
-//     whole table per row is the shape to avoid on D1).
+//   - The exempt set is eight uncorrelated `NOT IN` subqueries, one per
+//     branch, deliberately NOT one `NOT IN` over a `UNION ALL` of them: D1
+//     caps compound-SELECT terms at 5 (measured 2026-09-23 — a 6-term
+//     UNION ALL fails with "too many terms in compound SELECT"), so the
+//     8-term UNION ALL form was rejected on every hourly tick in prod
+//     (#918). node:sqlite allows 500, which is why editLogSweep.test.mjs
+//     never saw it; editLogSweepD1Limits.test.mjs guards the text instead.
+//     `x NOT IN (A ∪ B)` equals `x NOT IN A AND x NOT IN B` because every
+//     list is NULL-free (see below). Each subquery is still computed once
+//     per sweep into an ephemeral index, never re-evaluated per candidate
+//     row (a correlated NOT EXISTS over the whole table per row is the
+//     shape to avoid on D1).
 //   - Cost (measured via EXPLAIN QUERY PLAN on the real schema): each branch
 //     walks the kind='verse' slice of edit_log via the edit_log_row (kind=…)
 //     index, filtering `created_at < ?1` as a residual — so the fixed cost is
@@ -164,13 +173,12 @@ export const EDIT_LOG_RETENTION_SECONDS = 180 * 86400;
 
 // ?1 — the retention cutoff as unix seconds; rows strictly older are
 // deletion candidates. Bound once by the caller (index.ts computes
-// now - EDIT_LOG_RETENTION_SECONDS) so the outer DELETE and the exempt
+// now - EDIT_LOG_RETENTION_SECONDS) so the outer DELETE and every exempt
 // subquery are guaranteed to cut at the same instant.
 export const EDIT_LOG_SWEEP_SQL = `
   DELETE FROM edit_log
    WHERE created_at < ?1
      AND id NOT IN (
-       SELECT keep_id FROM (
          -- (1) today's merge ancestor: newest surviving
          -- 'create'/'update'/'bridge'/'split' at or before the precise id
          -- boundary, or before the timestamp watermark while
@@ -192,7 +200,8 @@ export const EDIT_LOG_SWEEP_SQL = `
                     AND brs.master_confirmed_at IS NOT NULL
                     AND el.created_at < brs.master_confirmed_at))
           GROUP BY el.row_key
-         UNION ALL
+     )
+     AND id NOT IN (
          -- (2) the newest pre-watermark 'baseline' payload, by content time
          -- (created_at is back-dated on these; id order only breaks ties
          -- within the same content second — see issue #603).
@@ -214,7 +223,8 @@ export const EDIT_LOG_SWEEP_SQL = `
               AND el.created_at < brs.master_confirmed_at
          )
          WHERE rn = 1
-         UNION ALL
+     )
+     AND id NOT IN (
          -- (3) issue #573 gap 1a: the GLOBAL newest 'create'/'update' row per
          -- verse, no boundary — protects bookReimport.ts's latest_source,
          -- which reads this row unconditionally. Still requires a watermark
@@ -231,7 +241,8 @@ export const EDIT_LOG_SWEEP_SQL = `
             AND el.created_at < ?1
             AND (brs.master_confirmed_edit_id IS NOT NULL OR brs.master_confirmed_at IS NOT NULL)
           GROUP BY el.row_key
-         UNION ALL
+     )
+     AND id NOT IN (
          -- (4) issue #573 gap 1b: the newest POST-boundary row per verse with
          -- source IS NULL and action <> 'baseline' — protects
          -- bookReimport.ts's human_edit_after_export EXISTS probe. Mirrors
@@ -252,7 +263,8 @@ export const EDIT_LOG_SWEEP_SQL = `
                     AND brs.master_confirmed_at IS NOT NULL
                     AND el.created_at >= brs.master_confirmed_at))
           GROUP BY el.row_key
-         UNION ALL
+     )
+     AND id NOT IN (
          -- (5) issue #573 gap 2: the newest pre-watermark row per verse per
          -- action, for #548's other not-yet-wired candidate-ancestor action
          -- classes. Same shape as (2), partitioned by (row_key, action)
@@ -279,7 +291,8 @@ export const EDIT_LOG_SWEEP_SQL = `
               AND el.created_at < brs.master_confirmed_at
          )
          WHERE rn = 1
-         UNION ALL
+     )
+     AND id NOT IN (
          -- (6) issue #653: the newest book-known 'create' per LIVE tn/tq/twl
          -- row. bookReimport.ts's reconstructTsvBases now falls back to exactly
          -- this row when a row's bounded history is empty — which is the state
@@ -310,7 +323,8 @@ export const EDIT_LOG_SWEEP_SQL = `
                  SELECT 1 FROM twl_rows r WHERE r.id = el.row_key AND r.book = el.book AND r.deleted_at IS NULL))
             )
           GROUP BY el.kind, el.book, el.row_key
-         UNION ALL
+     )
+     AND id NOT IN (
          -- (7) issue #727/#728: the GLOBAL newest 'bridge'/'split' row per
          -- verse, no boundary — the row bookReimport.ts reads as
          -- structural_edit_id/structural_edit_at (structure planner), as the
@@ -328,7 +342,8 @@ export const EDIT_LOG_SWEEP_SQL = `
             AND el.created_at < ?1
             AND (brs.master_confirmed_edit_id IS NOT NULL OR brs.master_confirmed_at IS NOT NULL)
           GROUP BY el.row_key
-         UNION ALL
+     )
+     AND id NOT IN (
          -- (8) issue #727: the GLOBAL newest 'delete' row per verse — the
          -- version floor verseVersionFloorSql folds (prev_version of the
          -- absorbed verse; new_version is NULL on these rows) and the absorbed
@@ -343,7 +358,6 @@ export const EDIT_LOG_SWEEP_SQL = `
             AND el.action = 'delete'
             AND el.created_at < ?1
           GROUP BY el.row_key
-       )
      )`;
 
 // ---------------------------------------------------------------------------
