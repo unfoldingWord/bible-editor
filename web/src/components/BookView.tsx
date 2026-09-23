@@ -9,7 +9,7 @@
 // column alignment, which is what makes find/replace and side-by-side
 // comparison readable when the scroll spans an entire book.
 
-import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip, CircularProgress } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
 import UndoIcon from "@mui/icons-material/Undo";
@@ -59,6 +59,19 @@ const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total:
 // Stable placeholder so `chapters.get(ch) ?? UNLOADED_STATE` doesn't hand
 // ChapterBlock a fresh object every render and defeat its memo.
 const UNLOADED_STATE: ChapterState = { kind: "unloaded" };
+
+// One IntersectionObserver shared by every unloaded ChapterBlock's sentinel,
+// rooted at BookView's own scroll container. `rootMargin` only grows the
+// *root* (the viewport by default) — with no `root`, the 800px pre-load
+// margin was never applied against this intermediate scroll box, so a
+// chapter loaded only once its placeholder was already visible. A per-block
+// observer would also mean one live observer per unloaded chapter (150+ for
+// a book like PSA); this context gives BookView a single instance instead.
+interface BookScrollObserverApi {
+  observe: (el: Element, chapter: number) => void;
+  unobserve: (el: Element) => void;
+}
+const BookScrollObserverContext = createContext<BookScrollObserverApi | null>(null);
 
 // Kept by Shell, which survives the chapter-loading gate that remounts this
 // view. Only an accepted local verse click creates a restoration request.
@@ -169,6 +182,49 @@ export function BookView({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRowRef = useRef<HTMLDivElement | null>(null);
   const localSelectionRef = useRef<string | null>(null);
+
+  // Shared IntersectionObserver for chapter pre-loading — see
+  // BookScrollObserverContext above. Created lazily on first `observe()` call
+  // so `root` can be `containerRef.current`, which is only set once this
+  // component has committed (refs attach before effects run, so it's already
+  // populated by the time any ChapterBlock's mount effect calls in).
+  const onLoadChapterRef = useRef(onLoadChapter);
+  onLoadChapterRef.current = onLoadChapter;
+  const scrollObserverRef = useRef<IntersectionObserver | null>(null);
+  const observedChaptersRef = useRef<Map<Element, number>>(new Map());
+  const observeSentinel = useCallback((el: Element, chapter: number) => {
+    observedChaptersRef.current.set(el, chapter);
+    if (!scrollObserverRef.current) {
+      scrollObserverRef.current = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            const ch = observedChaptersRef.current.get(entry.target);
+            scrollObserverRef.current?.unobserve(entry.target);
+            observedChaptersRef.current.delete(entry.target);
+            if (ch != null) onLoadChapterRef.current(ch);
+          }
+        },
+        { root: containerRef.current, rootMargin: "800px 0px" },
+      );
+    }
+    scrollObserverRef.current.observe(el);
+  }, []);
+  const unobserveSentinel = useCallback((el: Element) => {
+    scrollObserverRef.current?.unobserve(el);
+    observedChaptersRef.current.delete(el);
+  }, []);
+  useEffect(() => {
+    return () => {
+      scrollObserverRef.current?.disconnect();
+      scrollObserverRef.current = null;
+      observedChaptersRef.current.clear();
+    };
+  }, []);
+  const scrollObserverApi = useMemo<BookScrollObserverApi>(
+    () => ({ observe: observeSentinel, unobserve: unobserveSentinel }),
+    [observeSentinel, unobserveSentinel],
+  );
   const previousScrollNonce = useRef(scrollNonce);
   const firstLayoutRef = useRef(true);
   const restoredTargetRef = useRef<string | null>(null);
@@ -377,40 +433,41 @@ export function BookView({
         })}
       >
         <Box sx={{ display: "grid", gridTemplateColumns, gap: 1, px: 1.5, py: 1 }}>
-          {chapterList.map((ch) => (
-            <ChapterBlock
-              key={ch}
-              book={book}
-              chapter={ch}
-              state={chapters.get(ch) ?? UNLOADED_STATE}
-              enabledVersions={enabledVersions}
-              cols={cols}
-              activeChapter={activeChapter}
-              activeVerse={activeVerse}
-              activeNoteQuote={activeNoteQuote}
-              activeNoteOccurrence={activeNoteOccurrence}
-              activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
-              activeNoteCoveredVerses={activeNoteCoveredVerses}
-              reorderHighlight={reorderHighlight ?? null}
-              activeSourceContent={activeSourceContent}
-              activeRowRef={activeRowRef}
-              search={search}
-              findActiveMatch={findActiveMatch}
-              lexiconMap={lexiconMap}
-              onLoadChapter={onLoadChapter}
-              onSelectVerse={selectLocalVerse}
-              onEditVerse={onEditVerse}
-              onSaveVerse={handleSaveVerse}
-              onOpenAligner={onOpenAligner}
-              onEditSection={onEditSection}
-              onMergeBridge={onMergeBridge}
-              onSplitBridge={onSplitBridge}
-              verseCommentCounts={verseCommentCounts}
-              onOpenVerseComments={onOpenVerseComments}
-              locked={locked}
-              textCheck={textCheck}
-            />
-          ))}
+          <BookScrollObserverContext.Provider value={scrollObserverApi}>
+            {chapterList.map((ch) => (
+              <ChapterBlock
+                key={ch}
+                book={book}
+                chapter={ch}
+                state={chapters.get(ch) ?? UNLOADED_STATE}
+                enabledVersions={enabledVersions}
+                cols={cols}
+                activeChapter={activeChapter}
+                activeVerse={activeVerse}
+                activeNoteQuote={activeNoteQuote}
+                activeNoteOccurrence={activeNoteOccurrence}
+                activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
+                activeNoteCoveredVerses={activeNoteCoveredVerses}
+                reorderHighlight={reorderHighlight ?? null}
+                activeSourceContent={activeSourceContent}
+                activeRowRef={activeRowRef}
+                search={search}
+                findActiveMatch={findActiveMatch}
+                lexiconMap={lexiconMap}
+                onSelectVerse={selectLocalVerse}
+                onEditVerse={onEditVerse}
+                onSaveVerse={handleSaveVerse}
+                onOpenAligner={onOpenAligner}
+                onEditSection={onEditSection}
+                onMergeBridge={onMergeBridge}
+                onSplitBridge={onSplitBridge}
+                verseCommentCounts={verseCommentCounts}
+                onOpenVerseComments={onOpenVerseComments}
+                locked={locked}
+                textCheck={textCheck}
+              />
+            ))}
+          </BookScrollObserverContext.Provider>
         </Box>
       </Box>
     </Box>
@@ -446,7 +503,6 @@ const ChapterBlock = memo(function ChapterBlock({
   search,
   findActiveMatch,
   lexiconMap,
-  onLoadChapter,
   onSelectVerse,
   onEditVerse,
   onSaveVerse,
@@ -476,7 +532,6 @@ const ChapterBlock = memo(function ChapterBlock({
   search: SearchState | null;
   findActiveMatch: FindMatch | null;
   lexiconMap: Map<string, LexiconEntry | null>;
-  onLoadChapter: (ch: number) => void;
   onSelectVerse: (chapter: number, verse: number) => void;
   onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   onSaveVerse: (bv: string, chapter: number, verse: number, plain: string, base: VerseDto) => void;
@@ -495,29 +550,19 @@ const ChapterBlock = memo(function ChapterBlock({
   locked: boolean;
   textCheck?: TextLaneCheck;
 }) {
-  // Sentinel observed by IntersectionObserver — fires loadChapter when the
-  // chapter is near (within ~one viewport of) the visible area.
+  // Sentinel registered with BookView's shared IntersectionObserver — fires
+  // loadChapter when the chapter is near (within ~one viewport of) the
+  // visible area. See BookScrollObserverContext above.
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const isUnloaded = state.kind === "unloaded";
+  const scrollObserver = useContext(BookScrollObserverContext);
   useEffect(() => {
-    if (!isUnloaded) return;
+    if (!isUnloaded || !scrollObserver) return;
     const el = sentinelRef.current;
     if (!el) return;
-    const obs = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting) {
-            onLoadChapter(chapter);
-            obs.disconnect();
-            break;
-          }
-        }
-      },
-      { rootMargin: "800px 0px" },
-    );
-    obs.observe(el);
-    return () => obs.disconnect();
-  }, [isUnloaded, chapter, onLoadChapter]);
+    scrollObserver.observe(el, chapter);
+    return () => scrollObserver.unobserve(el);
+  }, [isUnloaded, chapter, scrollObserver]);
 
   // Verse-number list pulled from the ready payload — unconditional so the
   // hook count stays stable across loading/error/ready transitions.
