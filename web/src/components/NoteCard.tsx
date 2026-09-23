@@ -2204,7 +2204,14 @@ function NoteCardInner({
             <IconButton
               size="small"
               aria-label={`Look back at ${t.book} ${t.chapter}:${t.verse}`}
-              onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
+              // preventDefault too: a button takes focus on mousedown, and
+              // Paper's onFocus would activate this card (and its verse) on
+              // the way to navigating somewhere else. Same trap as the
+              // preview toggle above.
+              onMouseDown={(e: React.MouseEvent) => {
+                e.preventDefault();
+                e.stopPropagation();
+              }}
               onClick={(e: React.MouseEvent) => {
                 e.stopPropagation();
                 location.hash = `#/${t.book}/${t.chapter}/${t.verse}`;
