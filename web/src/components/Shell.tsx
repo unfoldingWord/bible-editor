@@ -1578,8 +1578,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     for (const v of lexiconMapRaw.values()) if (v) c++;
     return c;
   }, [lexiconMapRaw]);
+  // Keyed on the Strong's list's CONTENT: uhbStrongs is a new array on every
+  // save and every book-mode chapter load even when no Strong's changed, and
+  // each new map re-rendered every scripture cell that receives it (#890).
+  const uhbStrongsKey = uhbStrongs.join(",");
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const lexiconMap = useMemo(() => lexiconMapRaw, [uhbStrongs, lexiconLoadedCount]);
+  const lexiconMap = useMemo(() => lexiconMapRaw, [uhbStrongsKey, lexiconLoadedCount]);
 
   // When a tn note OR a twl word row is "active", treat its quote as the
   // highlight source. Notes and words are mutually exclusive; clicking one
