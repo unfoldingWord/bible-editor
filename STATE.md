@@ -71,6 +71,14 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **D1 allows at most 5 terms in a compound SELECT (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`); node:sqlite allows
+  500.** A 6-term `UNION ALL` fails on local workerd and remote D1 with `too many terms in compound SELECT`
+  (measured 2026-09-23). SQL that passes a node:sqlite unit test can therefore be rejected on every prod run: the
+  hourly edit_log sweep's 8-term union did exactly that (#918). Join exempt sets with separate `NOT IN` predicates
+  instead, and prove new SQL with `wrangler d1 execute … --command "EXPLAIN …"`, which is read-only even on prod.
+  Also: an ad-hoc diagnostic query that re-runs a heavy query as a subquery can hit D1's CPU limit and reset the
+  prod DB (`code 7429`); keep prod diagnostics narrow.
+
 - **A verse cell's "hydrate from a saved draft" branch must never run for a draft the user is creating right
   now.** All three verse views (`ScriptureColumn` `ActiveLine`, `BookView` `VerseCell`, `DocColumn`) subscribe to
   the draft store and push a pre-existing draft's `plainText` into the contentEditable once. The latch used to
