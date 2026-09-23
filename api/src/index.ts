@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { requestTiming } from "./requestTiming";
 import { chapters } from "./chapters";
 import { rows } from "./rows";
 import { verses } from "./verses";
@@ -86,6 +87,11 @@ const POLL_CRON = "*/5 * * * *";
 const REIMPORT_CRON = "0 8 * * *";
 
 const app = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
+
+// Per-request timing (issue #885) — the success check every other API perf
+// issue in the #884 audit measures against. Registered first so "total"
+// covers CORS/auth/book-lock middleware too, not just the route handler.
+app.use("/api/*", requestTiming());
 
 // CORS — strict allowlist sourced from the ALLOWED_ORIGINS env var (comma
 // separated). The previous origin echo + credentials:true combination was a
@@ -400,10 +406,16 @@ export default {
         // try/catch (same shape as the pipeline_jobs cleanup above): a failed
         // or D1-timed-out sweep must not fail the whole cron invocation — the
         // sweep is retention housekeeping, and the next hour retries it.
+        // Duration logged per issue #885 ("also measure") — the sweep joins
+        // verse edit_log rows against book_resource_syncs across ~6 UNION
+        // branches, and this is the only way to see if that's ever slow
+        // enough in prod to matter for the request right after it.
         try {
+          const sweepStart = Date.now();
           await env.DB.prepare(EDIT_LOG_SWEEP_SQL)
             .bind(Math.floor(Date.now() / 1000) - EDIT_LOG_RETENTION_SECONDS)
             .run();
+          console.log(JSON.stringify({ m: "cron", p: "edit_log_sweep", ms: Date.now() - sweepStart }));
         } catch (e) {
           console.error("edit_log retention sweep failed", e instanceof Error ? e.message : String(e));
         }
