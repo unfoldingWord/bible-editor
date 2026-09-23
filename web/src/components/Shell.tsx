@@ -17,6 +17,7 @@ import {
 import GridViewIcon from "@mui/icons-material/GridView";
 import LockIcon from "@mui/icons-material/Lock";
 import { useChapter } from "../hooks/useChapter";
+import { OpenChapterProvider } from "./NoteLinkPreview";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
@@ -3404,6 +3405,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   };
 
   return (
+    <OpenChapterProvider data={data}>
     <Box sx={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
       <TopBar
         book={book}
@@ -4449,6 +4451,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         />
       )}
     </Box>
+    </OpenChapterProvider>
   );
 }
 
