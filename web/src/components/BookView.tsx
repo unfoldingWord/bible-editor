@@ -625,6 +625,13 @@ const ChapterBlock = memo(function ChapterBlock({
     }
     return [...set].sort((a, b) => a - b);
   }, [readyData, enabledVersions]);
+  // One CommentCounts object per comments change, not per render: Shell's
+  // verseCommentCounts builds a fresh object on every call, which would
+  // re-render the active row on any render of this block.
+  const activeCommentCounts = useMemo(
+    () => (activeVerse >= 0 ? verseCommentCounts?.(activeVerse) : undefined),
+    [verseCommentCounts, activeVerse],
+  );
 
   if (state.kind === "unloaded" || state.kind === "loading") {
     return (
@@ -755,7 +762,7 @@ const ChapterBlock = memo(function ChapterBlock({
             onEditSection={onEditSection}
             onMergeBridge={onMergeBridge}
             onSplitBridge={onSplitBridge}
-            commentCounts={isActive ? verseCommentCounts?.(v) : undefined}
+            commentCounts={isActive ? activeCommentCounts : undefined}
             onOpenVerseComments={onOpenVerseComments}
             locked={locked}
             textShade={textCheck ? textCheck.shade(v) : "open"}

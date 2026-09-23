@@ -1571,19 +1571,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   }, [data?.verses, bookHook?.chapters]);
   const lexiconMapRaw = useLexicon(uhbStrongs);
   // useLexicon hands back a fresh Map every render; stabilize its identity so
-  // ScriptureColumn's memo can compare it. The map's CONTENT only changes when
-  // a Strong's entry resolves, which bumps lexiconLoadedCount and rebases it.
-  const lexiconLoadedCount = useMemo(() => {
-    let c = 0;
-    for (const v of lexiconMapRaw.values()) if (v) c++;
-    return c;
+  // ScriptureColumn's and BookView's memos can compare it. Keyed on CONTENT —
+  // which entry each Strong's resolved to — not on uhbStrongs' identity, which
+  // is new on every save and every book-mode chapter load even when nothing
+  // changed, re-rendering every scripture cell that receives the map (#890).
+  // A count of resolved entries is not enough: 'H2148a' can first resolve to
+  // the cached base 'H2148' entry, then switch to its exact entry without the
+  // count moving.
+  const lexiconKey = useMemo(() => {
+    let key = "";
+    for (const [raw, v] of lexiconMapRaw) key += `${raw}=${v ? `${v.resource}:${v.strong}` : ""},`;
+    return key;
   }, [lexiconMapRaw]);
-  // Keyed on the Strong's list's CONTENT: uhbStrongs is a new array on every
-  // save and every book-mode chapter load even when no Strong's changed, and
-  // each new map re-rendered every scripture cell that receives it (#890).
-  const uhbStrongsKey = uhbStrongs.join(",");
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const lexiconMap = useMemo(() => lexiconMapRaw, [uhbStrongsKey, lexiconLoadedCount]);
+  const lexiconMap = useMemo(() => lexiconMapRaw, [lexiconKey]);
 
   // When a tn note OR a twl word row is "active", treat its quote as the
   // highlight source. Notes and words are mutually exclusive; clicking one
