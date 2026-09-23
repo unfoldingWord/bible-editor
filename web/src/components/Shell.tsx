@@ -714,6 +714,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     if (lintRefetchTimer.current) clearTimeout(lintRefetchTimer.current);
     lintRefetchTimer.current = setTimeout(() => {
       lintRefetchTimer.current = null;
+      // Hidden since the timer was armed: defer to the tab's return instead.
+      if (document.hidden) {
+        lintStaleWhileHidden.current = true;
+        return;
+      }
       bookLintRefetch();
     }, 3000);
   }, [bookLintRefetch]);
@@ -740,8 +745,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // shows a frozen count until a manual reload — the symptom that flagged-note
   // saves "weren't clearing." Reuses the debounced refetch, so a quick blur/
   // focus flurry coalesces into one request. Skipped when the last fetch
-  // settled under 60 s ago — translators alt-tab constantly and each refetch
-  // reads the whole book (#887) — unless a change was deferred while hidden.
+  // landed under 60 s ago — translators alt-tab constantly and each refetch
+  // reads the whole book (#887) — unless a change was deferred while hidden,
+  // so a change from another tab or device can take up to 60 s to show here.
   useEffect(() => {
     const refresh = () => {
       if (document.visibilityState !== "visible") return;

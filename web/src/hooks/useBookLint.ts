@@ -21,9 +21,9 @@ export interface UseBookLintReturn {
   // bound an optimistic key's lifetime to this promise rather than to a
   // shared reset effect.
   refetch: () => Promise<void>;
-  // Date.now() when the last fetch settled (landed or gave up); 0 before the
-  // first. Lets the caller skip a focus-driven refetch that would re-pull a
-  // report it just got (#887).
+  // Date.now() when the last fetch landed; 0 before the first and after a
+  // failed one, so a failure never suppresses the next retry. Lets the caller
+  // skip a focus-driven refetch that would re-pull a report it just got (#887).
   lastSettledAt: () => number;
 }
 
@@ -98,7 +98,7 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
         setStatus("ready");
       } catch {
         if (ctrl.signal.aborted) return;
-        settledAt.current = Date.now();
+        settledAt.current = 0;
         setStatus("error");
       }
     };
