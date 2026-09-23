@@ -1,0 +1,6 @@
+# Workers Static Assets custom headers (copied into web/dist by Vite).
+# Vite content-hashes every file under /assets/, so a URL there never changes
+# content: cache it for a year. index.html and version.json stay at the
+# default max-age=0 so the update prompt (useAppVersion) sees new deploys.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
