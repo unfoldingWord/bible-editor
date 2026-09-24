@@ -29,6 +29,7 @@ import {
   lockedBooksIn,
 } from "./bookLock.ts";
 import { broadcastChapter } from "./wsEvents.ts";
+import { buildIntroHints, type IntroHintCommentRow } from "./introHints.ts";
 
 export const pipelines = new Hono<{
   Bindings: Env;
@@ -274,7 +275,14 @@ interface PolledJob {
 // options_json), but the bot's resume schema omits it AND rejects unknown keys,
 // because on the resume path `fresh` would destroy the very checkpoint being
 // resumed. Sending it would 400 the whole resume.
-function resumeOptionsFromJson(
+//
+// `introHints` (issue #819) is stripped for a different reason: it isn't part
+// of the bot's resume schema at all yet (docs/bp-assistant-intro-hints-
+// contract.md is "Proposed", not implemented), so an unrecognized key would
+// 400 the resume the same way a stray `fresh` would. Drop it here rather than
+// gate it at the call site — resumeOptionsFromJson is the one place that must
+// agree with the bot's resume schema, and the /start path is unaffected.
+export function resumeOptionsFromJson(
   optionsJson: string | null,
   jobId: string,
 ): Record<string, unknown> | undefined {
@@ -294,7 +302,7 @@ function resumeOptionsFromJson(
     console.error(`[pipelineResume] job=${jobId} options_json is not an object — cannot replay`);
     return undefined;
   }
-  const { fresh: _fresh, ...rest } = parsed as Record<string, unknown>;
+  const { fresh: _fresh, introHints: _introHints, ...rest } = parsed as Record<string, unknown>;
   return rest;
 }
 
@@ -1754,7 +1762,59 @@ pipelines.post("/start", requireEditor, async (c) => {
       seed: r.note,
     }));
     if (hints.length > 0) {
-      mergedOptions = { ...(parsed.data.options ?? {}), hints };
+      mergedOptions = { ...(mergedOptions ?? {}), hints };
+    }
+
+    // Chapter-intro hints (issue #819): free-text comments an editor left on
+    // a chapter's intro (verse 0, no row — the existing "comment on this
+    // verse" affordance, not a new UI) in the chapter range, opted in with a
+    // leading "AI:" marker (see introHints.ts — an ordinary unmarked
+    // discussion note on the intro must not silently become generation
+    // guidance). Forwarded as options.introHints alongside options.hints.
+    //
+    // Gated on INTRO_HINTS_ENABLED (see index.ts's Env): a 2026-09-22 review
+    // found the bp-assistant-side contract genuinely unverified from here —
+    // one review pass judged an unknown options key harmless on /start,
+    // another judged the bot's schema strict enough to 400 the WHOLE notes
+    // job over it. With the flag off (the default everywhere until someone
+    // confirms which is true), this block is a no-op, so either claim is
+    // harmless. Turn it on only once verified — see
+    // docs/bp-assistant-intro-hints-contract.md.
+    //
+    // Known gap while this stays gated: a "Generate everything" chain's
+    // notes step is enqueued by enqueueFollowUpFromChain from options
+    // captured on the ORIGINAL /start call (pipelineType "generate" here),
+    // so this block — reached only when pipelineType is itself "notes" —
+    // never runs for it; a chained notes step currently never carries
+    // introHints even once the flag is on. Left unaddressed: the same
+    // review flagged it as needing its own design decision (should a
+    // chained notes step even receive per-chapter intro guidance the same
+    // way a direct /start does?), not a quick patch.
+    //
+    // Deliberately NOT auto-resolved: resolving here — before the job is
+    // known to have been accepted, let alone completed — would mark a hint
+    // "consumed" when nothing may have read it (a D1 error on the INSERT
+    // below, or the bot rejecting the dispatch, both leave it resolved with
+    // no run carrying it). An editor resolves it themselves, the same way
+    // they already resolve any other comment thread, once they've checked
+    // the guidance took effect. The cost is a marked hint gets re-sent on
+    // every subsequent run for the chapter until then — harmless, since
+    // it's an explicit opt-in, not a leak of arbitrary comments.
+    if (c.env.INTRO_HINTS_ENABLED) {
+      const introCommentRows = await c.env.DB.prepare(
+        `SELECT id, chapter, body
+           FROM comments
+          WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
+            AND verse = 0 AND row_kind IS NULL AND parent_id IS NULL
+            AND kind = 'note' AND resolved_at IS NULL AND deleted_at IS NULL
+          ORDER BY chapter, created_at ASC`,
+      )
+        .bind(book, startChapter, endChapter)
+        .all<IntroHintCommentRow>();
+      const introHints = buildIntroHints(introCommentRows.results ?? []);
+      if (introHints.length > 0) {
+        mergedOptions = { ...(mergedOptions ?? {}), introHints };
+      }
     }
   }
 
