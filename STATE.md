@@ -24,6 +24,12 @@
 
 ## Escalated / blocked on a human (not a code change Claude can land alone)
 
+- **9 qere-pointing alignment milestones in locked books (issue #956)** — HAB 3:14 ULT+UST (×2 each), OBA 1:11
+  ULT, PSA 39:0 + 77:0 ULT+UST. Each `\zaln-s x-content` holds the qere, which since hbo_uhb `aad8ce31` sits only
+  in a UHB footnote, so the English word never highlights. `repair-canonize-alignment.mjs --qere-ketiv` computes
+  the ketiv replacement but reports rather than writes locked books. Fix on Door43 (admin), or unlock, re-dump,
+  and re-run. The unlocked EZK/1CH ten are covered by that script's SQL.
+
 - **Prod `DEU 27:22` TN content-dup** — 2 live PRISTINE notes, same content (occ 1, quote `שֹׁכֵב֙ עִם`,
   note "See how you translated 'lies with'…") under ids `y3oq` + `oi0y` (both valid ids — a pure
   doubling, not a digit-first id). The new reimport Guard 2 PREVENTS new doubles but does NOT remediate

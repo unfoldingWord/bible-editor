@@ -17,6 +17,8 @@ import {
   rowIdentityProblem,
   dedupeRows,
   commentSafe,
+  parseFootnoteWords,
+  repointQereVerse,
 } from "./canonizeAlignment.mjs";
 
 let passed = 0;
@@ -237,6 +239,109 @@ console.log("\ncomment safety");
   assert(safe.includes("\\u000A") && safe.includes("\\u000D"), "and shows them as escapes");
   assert(!/[\r\n]/.test(uEscape(evil)), "uEscape also escapes ASCII control characters");
   assert(commentSafe("-- א ok") === "-- א ok", "commentSafe leaves printable text (including Hebrew) alone");
+}
+
+// ── qere → ketiv (issue #956) ──────────────────────────────────────────────
+
+// EZK 43:15, from the prod UHB row (2026-09-24): ketiv in the main text, qere
+// in the footnote that follows it.
+const ARIEL_KETIV = "וּ⁠מֵ⁠הָ⁠אֲרִאֵ֣יל";
+const ARIEL_QERE = "וּמֵהָאֲרִיאֵ֣ל";
+const ARIEL_STRONG = "c:m:d:H0741";
+const ARIEL_LEMMA = "אֲרִיאֵל";
+const HARL = "וְ⁠הַֽ⁠הַרְאֵ֖ל";
+const qereNote = (text, strong, lemma, morph) => ({
+  tag: "f", type: "footnote", endTag: "f*", nextChar: " ",
+  content: `+ \\ft Q \\+w ${text}|lemma="${lemma}" strong="${strong}" x-morph="${morph}"\\+w*`,
+});
+const ezkUhb = (verse = 15) =>
+  uhbRow(43, verse, [
+    srcW(HARL, "c:d:H2025", "x"), t(" "),
+    { ...srcW(ARIEL_KETIV, ARIEL_STRONG, ARIEL_LEMMA), morph: "He,C:R:Td:Ncmsa" }, t("\n"),
+    qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "He,C:R:Td:Ncmsa"),
+  ]);
+const ezkUlt = (content = ARIEL_QERE, strong = ARIEL_STRONG) =>
+  JSON.stringify({ verseObjects: [t("and "), zaln(strong, ARIEL_LEMMA, content, [w("from"), t(" "), w("the"), t(" "), w("hearth")])] });
+
+console.log("\nqere footnote parsing");
+{
+  const q = parseFootnoteWords(qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "He,Ncmsa").content);
+  assert(q.length === 1 && q[0].text === ARIEL_QERE && q[0].strong === ARIEL_STRONG && q[0].morph === "He,Ncmsa", "reads text, strong and x-morph from a \\+w in the footnote");
+  const index = buildSourceIndex([ezkUhb()]);
+  const qs = index.qeres.get("43:15");
+  assert(qs.length === 1 && qs[0].ketivIndex === 1, "the qere points at the \\w right before the footnote");
+  const k = buildSourceIndex([uhbRow(43, 15, [srcW(HARL, "H1", "x"), { tag: "f", type: "footnote", content: "+ \\ft K \\+w x|strong=\"H1\"\\+w*" }])]);
+  assert(k.qeres.get("43:15").length === 0, "a footnote that is not a Q note is ignored");
+  const orphan = buildSourceIndex([uhbRow(43, 15, [qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m"), srcW(HARL, "H1", "x")])]);
+  assert(!orphan.unusable.has("43:15") && orphan.qeres.get("43:15")[0].ketivIndex === -1, "a qere footnote with no \\w before it is untied (-1); the verse stays usable for #945");
+  const multi = { tag: "f", type: "footnote", content: `+ \\ft Q \\+w ${ARIEL_QERE}|strong="${ARIEL_STRONG}"\\+w* \\+w ${HARL}|strong="H1"\\+w*` };
+  const m = buildSourceIndex([uhbRow(9, 4, [srcW(ARIEL_KETIV, ARIEL_STRONG, ARIEL_LEMMA), multi])]);
+  assert(m.qeres.get("9:4").length === 2 && m.qeres.get("9:4").every((q) => q.ketivIndex === -1), "1CH 9:4 shape: a footnote with several \\+w words is untied");
+  const misplaced = buildSourceIndex([uhbRow(30, 3, [srcW(ARIEL_KETIV, ARIEL_STRONG, ARIEL_LEMMA), srcW(HARL, "H0953", "x"), qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m")])]);
+  assert(misplaced.qeres.get("30:3")[0].ketivIndex === -1, "PSA 30:3 shape: a footnote after a word with a different Strong's is untied");
+  const cm = sourceCoverage(misplaced, 30, 3, null);
+  const rm = repointQereVerse(ezkUlt(), cm.words, cm.qeres);
+  assert(rm.status === "clean" && /cannot be tied/.test(rm.declined[0]?.reason ?? ""), "a milestone on an untied qere is declined, never re-pointed");
+}
+
+console.log("\nEZK 43:15 ULT — qere milestone re-pointed to the ketiv \\w");
+{
+  const cov = sourceCoverage(buildSourceIndex([ezkUhb()]), 43, 15, null);
+  const r = repointQereVerse(ezkUlt(), cov.words, cov.qeres);
+  assert(r.status === "repaired" && r.changes.length === 1, `one milestone repaired (got ${r.status})`);
+  assert(r.changes[0].content.after === ARIEL_KETIV, `content becomes the ketiv bytes (${uEscape(r.changes[0].content.after)})`);
+  assert(r.changes[0].morph?.after === "He,C:R:Td:Ncmsa", "morph adopts the ketiv's morph");
+  assert(!r.changes[0].lemma && !r.changes[0].strongChange, "unchanged lemma and strong are not reported");
+  assert(r.changes[0].kind === "qere_ketiv", "classified qere_ketiv");
+  const again = repointQereVerse(r.newContentJson, cov.words, cov.qeres);
+  assert(again.status === "clean" && again.declined.length === 0, "idempotent, and nothing is left unhighlightable");
+  assert(repointQereVerse(ezkUlt(ARIEL_KETIV), cov.words, cov.qeres).status === "clean", "a milestone already on the ketiv is left alone");
+}
+
+console.log("\nqere repoint — fail closed");
+{
+  const cov = sourceCoverage(buildSourceIndex([ezkUhb()]), 43, 15, null);
+  const wrongStrong = repointQereVerse(ezkUlt(ARIEL_QERE, "H9999"), cov.words, cov.qeres);
+  assert(wrongStrong.status === "clean" && /neither/.test(wrongStrong.declined[0]?.reason ?? ""), "a Strong's matching neither qere nor ketiv is declined, not written");
+  const twoKetiv = uhbRow(43, 15, [
+    srcW(ARIEL_KETIV, ARIEL_STRONG, ARIEL_LEMMA), qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m"), t(" "),
+    srcW(HARL, ARIEL_STRONG, ARIEL_LEMMA), qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m"),
+  ]);
+  const c2 = sourceCoverage(buildSourceIndex([twoKetiv]), 43, 15, null);
+  const amb = repointQereVerse(ezkUlt(), c2.words, c2.qeres);
+  assert(amb.status === "clean" && /ambiguous/.test(amb.declined[0]?.reason ?? ""), "two ketiv words carrying the same qere are declined");
+  const collide = uhbRow(46, 9, [
+    srcW(ARIEL_KETIV, ARIEL_STRONG, ARIEL_LEMMA), qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m"), t(" "),
+    srcW(ARIEL_QERE + "֙", "H3318", "x"),
+  ]);
+  const c3 = sourceCoverage(buildSourceIndex([collide]), 46, 9, null);
+  const col = repointQereVerse(ezkUlt(), c3.words, c3.qeres);
+  assert(col.status === "clean" && /both/.test(col.declined[0]?.reason ?? ""), "EZK 46:9 shape: a qere whose skeleton also matches another \\w is reported, not written");
+  const stray = repointQereVerse(ezkUlt("אבג"), cov.words, cov.qeres);
+  assert(stray.status === "clean" && stray.declined.length === 1, "a milestone matching neither a \\w nor a qere is reported as declined");
+}
+
+console.log("\nqere repoint — verse bridge: ketiv index and occurrence count span the bridge");
+{
+  // 1CH 8:22-25 shape: the ketiv sits in the bridge's third verse, and the
+  // same ketiv text also occurs in its first verse.
+  const rows = [
+    uhbRow(8, 22, [srcW(ARIEL_KETIV, ARIEL_STRONG, ARIEL_LEMMA)]),
+    uhbRow(8, 23, [srcW(HARL, "H1", "x")]),
+    uhbRow(8, 24, [srcW(ARIEL_KETIV, ARIEL_STRONG, ARIEL_LEMMA), qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m")]),
+  ];
+  const cov = sourceCoverage(buildSourceIndex(rows), 8, 22, 24);
+  assert(cov.qeres.length === 1 && cov.qeres[0].ketivIndex === 2, "the qere's ketiv index is offset past the earlier verses' words");
+  const r = repointQereVerse(ezkUlt(), cov.words, cov.qeres);
+  assert(r.changes[0].occurrence?.after === "2" && r.changes[0].occurrences?.after === "2", "occurrence 2 of 2 across the bridge");
+}
+
+console.log("\nverifier — strong diffs are stored as strongChange");
+{
+  const a = JSON.parse(ezkUlt());
+  const b = JSON.parse(ezkUlt(ARIEL_QERE, "H0741"));
+  const v = verifyOnlyZalnSourceChanged(a, b, new Set(["strong"]));
+  assert(v.ok && v.changes[0].strong === ARIEL_STRONG && v.changes[0].strongChange.after === "H0741", "the record keeps strong as its label and the diff under strongChange");
 }
 
 console.log(`\n${passed} assertions passed`);

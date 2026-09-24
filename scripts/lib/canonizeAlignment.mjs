@@ -35,8 +35,14 @@ const MUTABLE_ZALN_ATTRS = new Set(["content", "lemma"]);
 // narrow the source words and can canonize onto the wrong word. So every
 // problem key is RECORDED in `unusable` (unparseable, or duplicated with
 // differing content) and the caller refuses any verse that touches one.
+//
+// `qeres` (issue #956) maps the same key to the verse's qere footnotes:
+// [{ qere: SourceWord, ketivIndex }], where ketivIndex is the position in
+// `words` of the ketiv \w the footnote follows, or -1 when the footnote
+// cannot be tied to exactly one ketiv word (see collectQereFootnotes).
 export function buildSourceIndex(uhbRows) {
   const words = new Map();
+  const qeres = new Map();
   const unusable = new Map();
   const seen = new Map(); // key -> content_json
   for (const r of uhbRows) {
@@ -45,6 +51,7 @@ export function buildSourceIndex(uhbRows) {
       if (seen.get(key) !== r.content_json) {
         unusable.set(key, "duplicate UHB rows with differing content");
         words.delete(key);
+        qeres.delete(key);
       }
       continue;
     }
@@ -52,12 +59,79 @@ export function buildSourceIndex(uhbRows) {
     try {
       const vo = JSON.parse(r.content_json).verseObjects;
       if (!Array.isArray(vo)) throw new Error("no verseObjects array");
-      words.set(key, collectSourceWords(vo));
+      const ws = collectSourceWords(vo);
+      words.set(key, ws);
+      qeres.set(key, collectQereFootnotes(vo, ws));
     } catch (e) {
       unusable.set(key, `UHB content_json unusable: ${e.message}`);
     }
   }
-  return { words, unusable };
+  return { words, qeres, unusable };
+}
+
+// ── qere footnotes (issue #956) ────────────────────────────────────────────
+
+// Since hbo_uhb aad8ce31 (2026-08-14) the UHB main text always carries the
+// ketiv; the qere sits in a footnote right after it:
+//   \w וּ⁠מֵ⁠הָ⁠אֲרִאֵ֣יל|…\w* \f + \ft Q \+w וּמֵהָאֲרִיאֵ֣ל|lemma="…" strong="…" x-morph="…"\+w*\f*
+// usfm-js keeps the footnote as { tag:"f", type:"footnote", content:"+ \ft Q \+w …\+w*" }.
+
+// `\+w text|attrs\+w*` words inside a footnote's content string.
+export function parseFootnoteWords(content) {
+  const out = [];
+  for (const m of String(content).matchAll(/\\\+w\s+([^|\\]+)\|([^\\]*)\\\+w\*/g)) {
+    const attr = (name) => new RegExp(`(?:^|\\s)${name}="([^"]*)"`).exec(m[2])?.[1] ?? "";
+    out.push({ text: m[1].trim(), strong: attr("strong"), lemma: attr("lemma"), morph: attr("x-morph") });
+  }
+  return out;
+}
+
+// Qere footnotes of one UHB verse, in the same walk order as
+// collectSourceWords, so ketivIndex indexes that function's output. Only a
+// footnote whose text starts with `Q` (after `+ \ft`) is a qere.
+//
+// The footnote does NOT always sit right after its own ketiv: 1CH 9:4 has one
+// footnote of five qere words after a multi-word ketiv phrase, and PSA 30:3's
+// footnote follows בֽוֹר but corrects מ⁠יורדי. So a qere is tied to the
+// preceding \w only when the footnote holds exactly one \+w AND that \w has
+// the qere's Strong's; otherwise ketivIndex is -1 and repointQereVerse
+// declines any milestone on it.
+export function collectQereFootnotes(verseObjects, sourceWords = []) {
+  const out = [];
+  let wordCount = 0;
+  const walk = (nodes) => {
+    for (const o of nodes) {
+      if (!o || typeof o !== "object") continue;
+      if (o.type === "word" && o.tag === "w" && typeof o.text === "string") {
+        wordCount++;
+      } else if (o.type === "footnote" && typeof o.content === "string" && /^\+?\s*\\ft\s+Q\s/.test(o.content)) {
+        const qs = parseFootnoteWords(o.content);
+        const prev = wordCount - 1;
+        const tied = qs.length === 1 && prev >= 0 && sourceWords[prev]?.strong === qs[0].strong;
+        for (const q of qs) out.push({ qere: q, ketivIndex: tied ? prev : -1 });
+      } else if (Array.isArray(o.children)) {
+        walk(o.children);
+      }
+    }
+  };
+  walk(verseObjects);
+  return out;
+}
+
+// Qere footnotes for a target verse, unioned across a verse bridge, with
+// ketivIndex offset into the matching sourceWordsForRange array.
+function qeresForRange(index, chapter, verse, verseEnd) {
+  const ch = Number(chapter);
+  const v = Number(verse);
+  const ve = verseEnd == null ? null : Number(verseEnd);
+  const end = ve != null && Number.isFinite(ve) && ve >= v ? ve : v;
+  const out = [];
+  let offset = 0;
+  for (let i = v; i <= end; i++) {
+    for (const q of index.qeres?.get(`${ch}:${i}`) ?? []) out.push({ qere: q.qere, ketivIndex: q.ketivIndex < 0 ? -1 : q.ketivIndex + offset });
+    offset += index.words.get(`${ch}:${i}`)?.length ?? 0;
+  }
+  return out;
 }
 
 // Which UHB verses a target verse needs, and whether each is usable. Returns
@@ -74,7 +148,7 @@ export function sourceCoverage(index, chapter, verse, verseEnd) {
     if (index.unusable.has(key)) problems.push(`UHB ${key}: ${index.unusable.get(key)}`);
     else if (!index.words.has(key)) problems.push(`UHB ${key} missing from the dump`);
   }
-  return { words: sourceWordsForRange(index.words, ch, v, verseEnd), problems };
+  return { words: sourceWordsForRange(index.words, ch, v, verseEnd), qeres: qeresForRange(index, ch, v, verseEnd), problems };
 }
 
 // ── dump hygiene ───────────────────────────────────────────────────────────
@@ -147,7 +221,9 @@ export function sourceWordsForRange(map, chapter, verse, verseEnd) {
 // `type:"milestone", tag:"zaln"` in BOTH trees. Everything else — node count,
 // key sets, order, `\w` text/occurrence, text nodes, other milestone attrs,
 // top-level keys — must be identical. Returns { ok, changes, why }.
-export function verifyOnlyZalnSourceChanged(before, after) {
+// `mutable` widens the allowed attribute set (the #956 qere repair also moves
+// morph, strong and occurrence counts).
+export function verifyOnlyZalnSourceChanged(before, after, mutable = MUTABLE_ZALN_ATTRS) {
   const changes = [];
   let why = null;
   const fail = (path, msg) => {
@@ -176,8 +252,10 @@ export function verifyOnlyZalnSourceChanged(before, after) {
     const zaln = isZaln(a) && isZaln(b);
     const change = {};
     for (const k of ka) {
-      if (zaln && MUTABLE_ZALN_ATTRS.has(k) && typeof a[k] === "string" && typeof b[k] === "string") {
-        if (a[k] !== b[k]) change[k] = { before: a[k], after: b[k] };
+      if (zaln && mutable.has(k) && typeof a[k] === "string" && typeof b[k] === "string") {
+        // `strong` is also the change record's own label field, so its diff is
+        // stored as strongChange.
+        if (a[k] !== b[k]) change[k === "strong" ? "strongChange" : k] = { before: a[k], after: b[k] };
         continue;
       }
       walk(a[k], b[k], `${path}.${k}`);
@@ -209,7 +287,7 @@ export function classifyChange(c) {
 // Hebrew skeleton for the "declined" report only: NFC, drop points/accents and
 // invisible joiners. Mirrors the canonizer's loosest tier; it never decides a
 // write, it only explains what was left alone.
-function skeleton(s) {
+export function skeleton(s) {
   let out = "";
   for (const ch of String(s).normalize("NFC")) {
     const c = ch.codePointAt(0);
@@ -286,6 +364,82 @@ export function repairVerse(contentJson, sourceWords) {
   if (!v.ok) return { status: "refused", why: `verifier: ${v.why}` };
   if (v.changes.length === 0) return { status: "clean", declined };
   const changes = v.changes.map((c) => ({ ...c, kind: classifyChange(c) }));
+  return { status: "repaired", newContentJson: JSON.stringify(after), changes, declined };
+}
+
+// ── qere → ketiv repoint (issue #956) ──────────────────────────────────────
+
+const QERE_MUTABLE_ZALN_ATTRS = new Set(["content", "lemma", "morph", "strong", "occurrence", "occurrences"]);
+
+// A milestone is in scope when its skeleton matches NO UHB \w in the verse
+// range but DOES match a qere footnote word there. It is re-pointed to the
+// ketiv \w that footnote follows: content, lemma, morph and strong adopt the
+// ketiv's values (lemma/morph only when the milestone already carries them),
+// and occurrence/occurrences are recounted for the ketiv text across the
+// range (bridges count across every verse, as the stored rows do).
+// Fails closed (reported in `declined`, left alone) when two different ketiv
+// words carry that qere, or when the milestone's Strong's matches neither the
+// qere nor the ketiv. A milestone matching neither a \w nor a qere is also
+// listed in `declined` so the report shows everything still unhighlightable.
+// Same return shape as repairVerse; every change has kind "qere_ketiv".
+export function repointQereVerse(contentJson, sourceWords, qeres) {
+  if (!sourceWords || sourceWords.length === 0) return { status: "no_source" };
+  let before;
+  let after;
+  try {
+    before = JSON.parse(contentJson);
+    after = JSON.parse(contentJson);
+  } catch (e) {
+    return { status: "refused", why: `content_json does not parse: ${e.message}` };
+  }
+  if (!after || !Array.isArray(after.verseObjects)) {
+    return { status: "refused", why: "content_json has no verseObjects array" };
+  }
+  const wordSkeletons = new Set(sourceWords.map((w) => skeleton(w.text)));
+  const nfcWords = new Set(sourceWords.map((w) => w.text.normalize("NFC")));
+  const declined = [];
+  const walk = (nodes) => {
+    for (const o of nodes) {
+      if (!o || typeof o !== "object") continue;
+      if (o.type === "milestone" && o.tag === "zaln" && typeof o.content === "string") {
+        const sk = skeleton(o.content);
+        const strong = typeof o.strong === "string" ? o.strong : "";
+        const hits = qeres.filter((q) => skeleton(q.qere.text) === sk);
+        const idxs = [...new Set(hits.map((h) => h.ketivIndex))];
+        const decline = (reason) =>
+          declined.push({ strong, content: o.content, candidates: idxs.filter((i) => i >= 0).map((i) => sourceWords[i].text), reason });
+        if (wordSkeletons.has(sk)) {
+          // EZK 46:9 shape: the qere shares its skeleton with another \w of the
+          // verse. Which one the milestone means is a judgment call; report it.
+          if (hits.length && !nfcWords.has(o.content.normalize("NFC"))) decline("skeleton matches both a UHB \\w and a qere; left for a human");
+        } else {
+          if (idxs.length === 0) decline("no UHB word or qere shares the skeleton");
+          else if (idxs.includes(-1)) decline("its qere footnote cannot be tied to one ketiv word");
+          else if (idxs.length > 1) decline("ambiguous: several ketiv words carry this qere");
+          else {
+            const ketiv = sourceWords[idxs[0]];
+            if (strong !== ketiv.strong && !hits.some((h) => h.qere.strong === strong)) {
+              decline("milestone Strong's matches neither the qere nor the ketiv");
+            } else {
+              o.content = ketiv.text;
+              if (typeof o.lemma === "string" && ketiv.lemma) o.lemma = ketiv.lemma;
+              if (typeof o.morph === "string" && ketiv.morph) o.morph = ketiv.morph;
+              if (ketiv.strong) o.strong = ketiv.strong;
+              const same = (w) => w.text === ketiv.text;
+              if (typeof o.occurrence === "string") o.occurrence = String(sourceWords.slice(0, idxs[0] + 1).filter(same).length);
+              if (typeof o.occurrences === "string") o.occurrences = String(sourceWords.filter(same).length);
+            }
+          }
+        }
+      }
+      if (Array.isArray(o.children)) walk(o.children);
+    }
+  };
+  walk(after.verseObjects);
+  const v = verifyOnlyZalnSourceChanged(before, after, QERE_MUTABLE_ZALN_ATTRS);
+  if (!v.ok) return { status: "refused", why: `verifier: ${v.why}` };
+  if (v.changes.length === 0) return { status: "clean", declined };
+  const changes = v.changes.map((c) => ({ ...c, kind: "qere_ketiv" }));
   return { status: "repaired", newContentJson: JSON.stringify(after), changes, declined };
 }
 
