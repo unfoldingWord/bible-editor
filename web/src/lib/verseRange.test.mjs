@@ -14,9 +14,11 @@ import {
   versesFromKey,
   noteOverlapsRange,
   sourceForTargetRow,
+  spanOccurrence,
 } from "./verseRange.ts";
 import usfm from "usfm-js";
 import { verseHasUnalignedWork } from "./alignment.ts";
+import { highlightsFor } from "./highlight.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -243,6 +245,32 @@ function mkVerse(verse, verseEnd, voCount = 1) {
   const single = mk(1, null, bridgeVO, "ULT");
   assert(sourceForTargetRow(uhb, single) === uhb[1], "singleton target gets its own source row");
   assert(sourceForTargetRow(uhb, null) === null, "no target row: no source");
+
+  // A note's occurrence counts within ITS OWN verse, but a bridged row's
+  // milestones number source words across the whole span (the aligner counts
+  // over concatSourceRange; Door43 bridges do the same, e.g. JER 9:25-26 UST
+  // עַל 1/2 + 2/2). A TN on 1:2 with occurrence 1 must light the English
+  // aligned to UHB 1:2's instance, not 1:1's.
+  console.log("\n[Case] note inside a bridge resolves its own verse's instance (#957)");
+  const src2 = vo(String.raw`\id ZEC
+\c 1
+\v 1 \w יְהוָה|lemma="יְהוָה" strong="H3068" x-morph="He,Np"\w*
+\v 2 \w יְהוָה|lemma="יְהוָה" strong="H3068" x-morph="He,Np"\w*
+`);
+  const tgt2 = vo(String.raw`\id ZEC
+\c 1
+\v 1-2 \zaln-s |x-strong="H3068" x-lemma="יְהוָה" x-morph="He,Np" x-occurrence="1" x-occurrences="2" x-content="יְהוָה"\*\w Yahweh|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* spoke; \zaln-s |x-strong="H3068" x-lemma="יְהוָה" x-morph="He,Np" x-occurrence="2" x-occurrences="2" x-content="יְהוָה"\*\w LORD|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`);
+  const uhb2 = { 1: mk(1, null, src2["1"], "UHB"), 2: mk(2, null, src2["2"], "UHB") };
+  const bridge2 = mk(1, 2, tgt2["1-2"] ?? tgt2["1"], "ULT");
+  const src12 = sourceForTargetRow(uhb2, bridge2)?.content;
+  const quote = "יְהוָה";
+  const hlV2 = highlightsFor("ULT", bridge2.content, quote, spanOccurrence(uhb2, bridge2, 2, quote, 1), src12);
+  assert(hlV2.has("LORD|1") && !hlV2.has("Yahweh|1"), `TN on 1:2 occ 1 lights LORD only (got ${[...hlV2]})`);
+  const hlV1 = highlightsFor("ULT", bridge2.content, quote, spanOccurrence(uhb2, bridge2, 1, quote, 1), src12);
+  assert(hlV1.has("Yahweh|1") && !hlV1.has("LORD|1"), `TN on 1:1 occ 1 lights Yahweh only (got ${[...hlV1]})`);
+  assert(spanOccurrence(uhb2, bridge2, 2, quote, -1) === -1, "occurrence -1 (all) is left alone");
+  assert(spanOccurrence(uhb2, uhb2[2], 2, quote, 1) === 1, "singleton target: occurrence unchanged");
 }
 
 if (failed) {
