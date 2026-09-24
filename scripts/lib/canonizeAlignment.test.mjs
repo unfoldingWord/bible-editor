@@ -305,11 +305,17 @@ console.log("\nqere repoint — fail closed");
   assert(wrongStrong.status === "clean" && /neither/.test(wrongStrong.declined[0]?.reason ?? ""), "a Strong's matching neither qere nor ketiv is declined, not written");
   const twoKetiv = uhbRow(43, 15, [
     srcW(ARIEL_KETIV, ARIEL_STRONG, ARIEL_LEMMA), qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m"), t(" "),
-    srcW(HARL, ARIEL_STRONG, ARIEL_LEMMA), qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m"),
+    srcW(ARIEL_KETIV, ARIEL_STRONG, ARIEL_LEMMA), qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m"),
   ]);
   const c2 = sourceCoverage(buildSourceIndex([twoKetiv]), 43, 15, null);
   const amb = repointQereVerse(ezkUlt(), c2.words, c2.qeres);
   assert(amb.status === "clean" && /ambiguous/.test(amb.declined[0]?.reason ?? ""), "two ketiv words carrying the same qere are declined");
+  const far = buildSourceIndex([uhbRow(43, 15, [srcW(HARL, ARIEL_STRONG, ARIEL_LEMMA), qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m")])]);
+  assert(far.qeres.get("43:15")[0].ketivIndex === -1, "same Strong's but skeletons more than 2 edits apart: untied");
+  const numeric = JSON.parse(ezkUlt());
+  numeric.verseObjects[1].occurrence = 1;
+  const rn = repointQereVerse(JSON.stringify(numeric), cov.words, cov.qeres);
+  assert(rn.status === "clean" && /not strings/.test(rn.declined[0]?.reason ?? ""), "numeric occurrence is declined, not left stale");
   const collide = uhbRow(46, 9, [
     srcW(ARIEL_KETIV, ARIEL_STRONG, ARIEL_LEMMA), qereNote(ARIEL_QERE, ARIEL_STRONG, ARIEL_LEMMA, "m"), t(" "),
     srcW(ARIEL_QERE + "֙", "H3318", "x"),

@@ -93,9 +93,10 @@ export function parseFootnoteWords(content) {
 // The footnote does NOT always sit right after its own ketiv: 1CH 9:4 has one
 // footnote of five qere words after a multi-word ketiv phrase, and PSA 30:3's
 // footnote follows בֽוֹר but corrects מ⁠יורדי. So a qere is tied to the
-// preceding \w only when the footnote holds exactly one \+w AND that \w has
-// the qere's Strong's; otherwise ketivIndex is -1 and repointQereVerse
-// declines any milestone on it.
+// preceding \w only when the footnote holds exactly one \+w, that \w has the
+// qere's Strong's, AND their consonant skeletons are within 2 edits (every
+// #956 pair is: ידו/ידיו is 1, והאראיל/והאריאל is 2). Otherwise ketivIndex is
+// -1 and repointQereVerse declines any milestone on it.
 export function collectQereFootnotes(verseObjects, sourceWords = []) {
   const out = [];
   let wordCount = 0;
@@ -107,7 +108,9 @@ export function collectQereFootnotes(verseObjects, sourceWords = []) {
       } else if (o.type === "footnote" && typeof o.content === "string" && /^\+?\s*\\ft\s+Q\s/.test(o.content)) {
         const qs = parseFootnoteWords(o.content);
         const prev = wordCount - 1;
-        const tied = qs.length === 1 && prev >= 0 && sourceWords[prev]?.strong === qs[0].strong;
+        const tied =
+          qs.length === 1 && prev >= 0 && sourceWords[prev]?.strong === qs[0].strong &&
+          editDistance(skeleton(sourceWords[prev].text), skeleton(qs[0].text)) <= 2;
         for (const q of qs) out.push({ qere: q, ketivIndex: tied ? prev : -1 });
       } else if (Array.isArray(o.children)) {
         walk(o.children);
@@ -116,6 +119,19 @@ export function collectQereFootnotes(verseObjects, sourceWords = []) {
   };
   walk(verseObjects);
   return out;
+}
+
+// Levenshtein distance, for the ketiv/qere tie check above.
+function editDistance(a, b) {
+  const x = [...a];
+  const y = [...b];
+  let prev = Array.from({ length: y.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= x.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= y.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x[i - 1] === y[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[y.length];
 }
 
 // Qere footnotes for a target verse, unioned across a verse bridge, with
@@ -379,8 +395,10 @@ const QERE_MUTABLE_ZALN_ATTRS = new Set(["content", "lemma", "morph", "strong", 
 // range (bridges count across every verse, as the stored rows do).
 // Fails closed (reported in `declined`, left alone) when two different ketiv
 // words carry that qere, or when the milestone's Strong's matches neither the
-// qere nor the ketiv. A milestone matching neither a \w nor a qere is also
-// listed in `declined` so the report shows everything still unhighlightable.
+// qere nor the ketiv. Also listed in `declined`: a milestone whose skeleton
+// matches neither a \w nor a qere, and one whose skeleton matches both a \w
+// and a qere. A skeleton match on a \w alone (a mark-order or accent
+// mismatch) is the #945 canonizer's job and is not reported here.
 // Same return shape as repairVerse; every change has kind "qere_ketiv".
 export function repointQereVerse(contentJson, sourceWords, qeres) {
   if (!sourceWords || sourceWords.length === 0) return { status: "no_source" };
@@ -420,12 +438,15 @@ export function repointQereVerse(contentJson, sourceWords, qeres) {
             const ketiv = sourceWords[idxs[0]];
             if (strong !== ketiv.strong && !hits.some((h) => h.qere.strong === strong)) {
               decline("milestone Strong's matches neither the qere nor the ketiv");
+            } else if ((o.occurrence != null && typeof o.occurrence !== "string") || (o.occurrences != null && typeof o.occurrences !== "string")) {
+              decline("occurrence/occurrences are not strings; cannot recount safely");
             } else {
               o.content = ketiv.text;
               if (typeof o.lemma === "string" && ketiv.lemma) o.lemma = ketiv.lemma;
               if (typeof o.morph === "string" && ketiv.morph) o.morph = ketiv.morph;
               if (ketiv.strong) o.strong = ketiv.strong;
-              const same = (w) => w.text === ketiv.text;
+              // NFC, as the highlighter compares (web/src/lib/hebrew.ts nfc()).
+              const same = (w) => w.text.normalize("NFC") === ketiv.text.normalize("NFC");
               if (typeof o.occurrence === "string") o.occurrence = String(sourceWords.slice(0, idxs[0] + 1).filter(same).length);
               if (typeof o.occurrences === "string") o.occurrences = String(sourceWords.filter(same).length);
             }
