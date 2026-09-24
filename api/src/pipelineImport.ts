@@ -187,6 +187,18 @@ export function tnPayload(
   };
 }
 
+// Dedup-key fold for a TN quote in applyJobOutput (#959). tnPayload canonizes
+// a proposal's Hebrew to UHB bytes (legacy mark order, the UHB's U+2060 word
+// joiners), while a live row from an earlier run may hold NFC with the joiners
+// dropped. Same text, so both sides fold before keying, or a re-run inserts a
+// second copy. Kept out of tnContentKey itself: the nightly reimport's dedup
+// (planTnContentDedup) keys master rows byte-exactly, because translationCore
+// counts byte-distinct surfaces as separate occurrences (quoteExact, lint.ts).
+// Exported for pipelineImport.test.mjs only.
+export function tnDedupQuote(quote: string | null): string | null {
+  return quote == null ? null : quote.replace(/[\u2060\u200D\uFEFF]/g, "").normalize("NFC");
+}
+
 export function tqPayload(book: string, refRaw: string, row: Record<string, string>) {
   const [ch, v] = refParts(refRaw);
   const occRaw = row["Occurrence"];
@@ -970,10 +982,12 @@ async function applyJobOutput(
     // keys never match, so content-dedup silently fails to recognize the
     // duplicate and a second copy gets inserted. `quote` is deliberately left
     // untouched here, matching tnPayload — it must stay byte-exact for
-    // occurrence matching. (Its Hebrew mark ORDER, which tnPayload now
-    // canonizes to UHB bytes, is folded to NFC inside tnContentKey instead.)
+    // occurrence matching. Its Hebrew encoding is folded for the key only
+    // (tnDedupQuote), since tnPayload now canonizes proposals to UHB bytes.
     for (const r of live.results ?? []) {
-      claimedTnKeys.add(tnContentKey({ ...r, note: r.note ? curlifyText(r.note) : r.note }));
+      claimedTnKeys.add(
+        tnContentKey({ ...r, quote: tnDedupQuote(r.quote), note: r.note ? curlifyText(r.note) : r.note }),
+      );
     }
   }
 
@@ -1045,7 +1059,7 @@ async function applyJobOutput(
       verse: p.verse,
       occurrence: (payload.occurrence as number | null | undefined) ?? null,
       support_reference: (payload.support_reference as string | null | undefined) ?? null,
-      quote: (payload.quote as string | null | undefined) ?? null,
+      quote: tnDedupQuote((payload.quote as string | null | undefined) ?? null),
       note: (payload.note as string | null | undefined) ?? null,
     });
 

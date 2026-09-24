@@ -27,9 +27,6 @@ export interface TnDedupRow {
 // occurrence 1 and 2 that must never be deduped. tags is intentionally out of the
 // key (it's metadata, not the note's identity). This is NOT a no-op signature:
 // it deliberately omits ref_raw + tags so a re-id'd copy still collides.
-// The quote is NFC-folded: AI staging canonizes Hebrew quotes to the UHB's legacy
-// mark order (#959) while older live rows hold NFC, and the two encodings are the
-// same text. The key is only ever compared for equality, never stored or written.
 export function tnContentKey(r: {
   chapter: number;
   verse: number;
@@ -43,7 +40,7 @@ export function tnContentKey(r: {
     r.verse,
     r.occurrence ?? null,
     r.support_reference ?? null,
-    r.quote != null ? r.quote.normalize("NFC") : null,
+    r.quote ?? null,
     r.note ?? null,
   ]);
 }

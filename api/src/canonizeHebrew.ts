@@ -26,6 +26,9 @@
 // claim it — this keeps two same-skeleton-but-differently-pointed words mapping
 // to distinct UHB words. On a hit we adopt the UHB's exact surface (and lemma,
 // for alignment); an unmatched token is LEFT AS-IS — the transform never guesses.
+// canonizeQuote also keeps a word that is already byte-identical to a UHB word,
+// and fails closed when a tier's unused candidates have more than one distinct
+// surface (see pickUnused).
 
 import type { SourceWord } from "./importParsers";
 
@@ -82,10 +85,16 @@ interface UhbEntry {
 
 const SEP = " "; // key separator that can't occur inside a Hebrew word
 
-function firstUnused(entries: UhbEntry[] | undefined): UhbEntry | null {
-  if (!entries) return null;
-  for (const e of entries) if (!e.found) return e;
-  return null;
+// The unused entries of one tier's bucket, resolved fail-closed: undefined = no
+// candidate (try the next tier); null = candidates with more than one distinct
+// surface (ambiguous: leave the word as-is and stop, as canonizeAlignmentSource's
+// pickCanonical does); otherwise the entry to adopt. Picking the first of two
+// look-alikes would move the quote onto another word, and translationCore
+// counts occurrences per byte-distinct surface (see quoteExact in lint.ts).
+function pickUnused(entries: UhbEntry[] | undefined): UhbEntry | null | undefined {
+  const free = entries?.filter((e) => !e.found) ?? [];
+  if (free.length === 0) return undefined;
+  return free.every((e) => e.form === free[0].form) ? free[0] : null;
 }
 
 function push(map: Map<string, UhbEntry[]>, key: string, entry: UhbEntry): void {
@@ -238,9 +247,14 @@ export function canonizeQuote(
   for (let i = 0; i < tokens.length; i += 2) {
     const word = tokens[i];
     if (!word) continue;
-    let e = firstUnused(lk.exact.get(canonicalHebrew(word)));
-    if (!e && !strict) e = firstUnused(lk.stripped.get(stripHebrewMarks(word)));
-    if (!e && !strict) e = firstUnused(lk.joiner.get(wordJoinerFold(word)));
+    // A word already byte-identical to a UHB word is already canonical: keep it.
+    const exact = lk.exact.get(canonicalHebrew(word));
+    let e: UhbEntry | null | undefined = exact?.find((x) => !x.found && x.form === word);
+    if (!e) {
+      e = pickUnused(exact);
+      if (e === undefined && !strict) e = pickUnused(lk.stripped.get(stripHebrewMarks(word)));
+      if (e === undefined && !strict) e = pickUnused(lk.joiner.get(wordJoinerFold(word)));
+    }
     if (e) {
       e.found = true;
       if (word !== e.form) {

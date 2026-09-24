@@ -26,6 +26,7 @@ import {
   maybeTouchClaim,
   maybeCheckCancelled,
   tnPayload,
+  tnDedupQuote,
   tqPayload,
   applyTnHintExpansionIfMatch,
   outputKindAllowedFor,
@@ -3030,7 +3031,18 @@ await withMockedClock(async () => {
   // The NFC live row and the canonized proposal must share one dedup key, or a
   // re-proposal of an existing note would insert a second copy.
   const key = (quote) => tnContentKey({ chapter: 29, verse: 4, occurrence: 1, support_reference: null, quote, note: "n" });
-  assert(key(`${KOH_NFC} ${AMAR}`) === key(built.payload.quote), "tnContentKey: NFC live quote and UHB-byte proposal collide");
+  assert(
+    key(tnDedupQuote(`${KOH_NFC} ${AMAR}`)) === key(tnDedupQuote(built.payload.quote)),
+    "AI dedup: NFC live quote and UHB-byte proposal collide",
+  );
+  // The UHB's U+2060 word joiner (which canonize adopts) folds away too.
+  assert(
+    tnDedupQuote("\u05dc\u05b0\u2060\u05db\u05b8\u05dc") === tnDedupQuote("\u05dc\u05b0\u05db\u05b8\u05dc"),
+    "AI dedup: a live quote missing the UHB word joiner collides with the canonized one",
+  );
+  assert(tnDedupQuote(null) === null, "AI dedup: null quote stays null");
+  // tnContentKey itself stays byte-exact, for the nightly reimport's dedup.
+  assert(key(`${KOH_NFC} ${AMAR}`) !== key(built.payload.quote), "tnContentKey alone still keys the two encodings apart");
 }
 
 // The same canonize proven through the REAL staging call site: stageJobOutput
