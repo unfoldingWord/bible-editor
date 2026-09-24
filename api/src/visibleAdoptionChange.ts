@@ -44,9 +44,13 @@ function validNodes(nodes: unknown[], depth: number = 0): boolean {
     // inspectable as the typed marker shapes above. Rejecting it reported
     // every axis changed on 49 of 49 flagged verses the night after Rich
     // restored `\ts\*` markers on Door43 (ZEC 1:17 ULT, 2026-09-24), when
-    // nothing a reader could see had changed. Kept exactly this narrow: only
-    // `tag` and `nextChar` may be present.
-    const bareMarker = typeof obj.tag === "string" && Object.keys(obj).every((k) => k === "tag" || k === "nextChar");
+    // nothing a reader could see had changed. Kept exactly this narrow: a
+    // self-closing marker (tag ends in `\*`), carrying only `tag` and
+    // `nextChar`. Any other type-less tag still fails closed.
+    const bareMarker =
+      typeof obj.tag === "string" &&
+      obj.tag.endsWith("\\*") &&
+      Object.keys(obj).every((k) => k === "tag" || k === "nextChar");
     if (!("text" in obj) && !("children" in obj) && !(markerOnlyType && typeof obj.tag === "string") && !bareMarker) return false;
     if ("type" in obj && typeof obj.type !== "string") return false;
     if ("tag" in obj && typeof obj.tag !== "string") return false;

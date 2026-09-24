@@ -127,6 +127,14 @@ export interface VerseMergeInput {
    * 2026-09-18 through 2026-09-24). OMITTED means unlocked.
    */
   masterAuthoritative?: boolean;
+  /**
+   * D1's current content was written by the nightly sync itself (the verse's
+   * newest content edit_log row has source `dcs_reimport`), i.e. it is a copy
+   * of an earlier master, so D1 has not moved since master last did. Read only
+   * by step 3b: a locked book's ancestor is frozen, so without this every later
+   * Door43 commit reads as "both changed" against the pre-lock app edit.
+   */
+  oursFromMaster?: boolean;
 }
 
 export interface VerseMergeResult {
@@ -458,13 +466,24 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   // touched keeps D1, because an unlock -> fix -> re-lock -> lock/push to a
   // review branch (bookImport.ts) leaves the fix in D1 before master has it,
   // and a Door43 commit elsewhere in the book must not revert it. Asked before
-  // the alignment guard, because keeping D1 here would only hand the pre-lock
-  // text back to master on the first export after unlock. A clean `adopt`
-  // still gets its audit row with the replaced version (applyVerseRows), so
-  // the old text stays recoverable; it just raises no alert. No ancestor
-  // (step 2) and unparseable master content both keep today's handling.
+  // the alignment guard and the AI-lineage check, because keeping D1 on a
+  // locked book only hands the pre-lock text back to master on the first
+  // export after unlock.
+  //   - D1 unmoved since the ancestor, or D1 is itself the sync's copy of an
+  //     earlier master: nobody's app work is replaced, so a clean `adopt`
+  //     (audit row, no alert).
+  //   - D1 holds an app edit master may not have: master still wins, but as
+  //     `adopt_conflict`, so applyVerseRows's visible-change refinement alerts
+  //     the editor on a real wording/punctuation/alignment loss and downgrades
+  //     a markers-only difference to adopt_no_visible_change (no alert).
+  //     Benjamin, 2026-09-24: a markers-only overwrite is worth seeing, not
+  //     alerting; a data-loss overwrite is worth alerting.
+  // No ancestor (step 2) and unparseable master content keep today's handling.
   if (input.masterAuthoritative === true && theirsKey !== null) {
-    return { action: "adopt", adopt: true, conflict: false, reason: "book_locked" };
+    if (keysEqual(oursKey, baseKey) || input.oursFromMaster === true) {
+      return { action: "adopt", adopt: true, conflict: false, reason: "book_locked" };
+    }
+    return { action: "adopt_conflict", adopt: true, conflict: true, reason: "both_changed" };
   }
 
   // 4. Alignment guard: refuse to adopt master's content if doing so would

@@ -200,6 +200,11 @@ function reason(ours, theirs) {
     { wordingChanged: true, punctuationChanged: true, alignmentChanged: true },
     "a tag-only node carrying any other key still fails closed",
   );
+  assert.deepEqual(
+    classifyVisibleAdoptionChange(ours, verse({ type: "text", text: "Again." }, { tag: "f", nextChar: " " })),
+    { wordingChanged: true, punctuationChanged: true, alignmentChanged: true },
+    "a type-less tag that is not self-closing still fails closed",
+  );
 }
 
 {

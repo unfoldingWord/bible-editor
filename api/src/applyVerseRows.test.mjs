@@ -2621,6 +2621,13 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
        VALUES ('verse', ?, ?, 1, 6, 7, 'update', ?, 1500)`,
     )
     .run(`${BOOK}/1/17/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("Again, call out")) }));
+  // Night 2: D1's newest version is the sync's own copy of master (v8).
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at, source)
+       VALUES ('verse', ?, ?, NULL, 7, 8, 'update', ?, 1550, 'dcs_reimport')`,
+    )
+    .run(`${BOOK}/1/17/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("Again, call out")) }));
   // An earlier night's flag a human already resolved.
   sqlite
     .prepare(
@@ -2726,6 +2733,36 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
   );
   const row = sqlite.prepare("SELECT resolved_at FROM verse_merge_conflicts WHERE book = ? AND chapter = 3 AND verse = 1").all(BOOK)[0];
   eq(row.resolved_at, 1600, "unlocked: a markers-only adoption does not reactivate a resolved flag");
+}
+
+{
+  // Locked, but D1's newest version is a human app edit master may never have
+  // received, and Door43 changed the wording: master still wins, but this is a
+  // data-loss-type overwrite, so the editor IS alerted.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 4, 1, NULL, ?, ?, ?, 3, 1)`,
+    )
+    .run(BOOK, VERSION, contentJson("the app edit"), "the app edit");
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('verse', ?, ?, 'baseline', ?, 500)`)
+    .run(`${BOOK}/4/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the published text")) }));
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 1, 2, 3, 'update', ?, 1500)`,
+    )
+    .run(`${BOOK}/4/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the app edit")) }));
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(4, 1, "a Door43 rewording")], null,
+    { confirmedAt: 1000, editId: 0, bookLocked: true }, false,
+  );
+  eq(counts.merge_adopted, 1, "locked + both moved → master adopted");
+  const alertable = sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult");
+  eq(alertable.map((r) => [r.action, r.overwritten_version]), [["adopt_conflict", 3]], "…and the editor is alerted, pointing at their version");
 }
 
 if (failed > 0) {
