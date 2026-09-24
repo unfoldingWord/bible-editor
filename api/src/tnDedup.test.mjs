@@ -47,6 +47,17 @@ assert(
   tnContentKey(row("aaaa", { occurrence: null })) === tnContentKey(row("bbbb", { occurrence: null })),
   "null occurrence is handled and still matches by content",
 );
+// #959: AI staging canonizes Hebrew quotes to the UHB's legacy mark order while
+// older live rows hold NFC. JER 29:4 כֹּ֥ה — UHB dagesh-before-holam vs NFC.
+assert(
+  tnContentKey(row("aaaa", { quote: "\u05DB\u05BC\u05B9\u05A5\u05D4" })) ===
+    tnContentKey(row("bbbb", { quote: "\u05DB\u05B9\u05BC\u05A5\u05D4" })),
+  "UHB-byte and NFC encodings of one Hebrew quote → same key",
+);
+assert(
+  tnContentKey(row("aaaa", { quote: "Thus says" })) !== tnContentKey(row("bbbb", { quote: "Thus said" })),
+  "the NFC fold does not blur genuinely different quotes",
+);
 
 // --- planTnContentDedup scenarios ---
 

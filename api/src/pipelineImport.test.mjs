@@ -31,6 +31,7 @@ import {
   outputKindAllowedFor,
 } from "./pipelineImport.ts";
 import { ROW_ID_RE, coerceRowId, deriveAltRowId } from "./rowId.ts";
+import { tnContentKey } from "./tnDedup.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -1345,6 +1346,9 @@ await (async () => {
     if (/UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(sql)) {
       return { changes: 1, rows: [], single: null };
     }
+    if (/SELECT chapter, verse, content_json FROM verses/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #959 staging UHB preload (TN quote canonize) — no source verses
+    }
     throw new Error(`fakePreDeleteCheckpointDb: unhandled SQL: ${sql}`);
   }
 
@@ -1489,6 +1493,9 @@ await withMockedClock(async () => {
     }
     if (/UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(sql)) {
       return { changes: 1, rows: [], single: null };
+    }
+    if (/SELECT chapter, verse, content_json FROM verses/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #959 staging UHB preload (TN quote canonize) — no source verses
     }
     throw new Error(`fakeStagingDb: unhandled SQL: ${sql}`);
   }
@@ -2984,6 +2991,102 @@ await withMockedClock(async () => {
     `tnPayload treats '/' as opener context, matching verse-text curling (got ${JSON.stringify(built.payload.note)})`,
   );
 }
+
+// ─── #959: AI TN quotes canonized to the UHB's exact bytes at staging ───────
+// JER 29:4 `כֹּ֥ה`: the UHB stores dagesh BEFORE holam (legacy Tanakh order);
+// the AI emits NFC (holam before dagesh). Visually identical, byte-distinct —
+// and bp-assistant's validator / Door43 checks compare bytes, so the NFC form
+// silently fails to match its source word.
+{
+  const KOH_UHB = "כֹּ֥ה";
+  const KOH_NFC = "כֹּ֥ה";
+  const AMAR = "אָמַ֛ר"; // same bytes in both forms
+  assert(KOH_UHB !== KOH_NFC && KOH_UHB.normalize("NFC") === KOH_NFC, "precondition: כֹּ֥ה UHB vs NFC bytes differ, fold under NFC");
+  const w = (text) => ({ text, strong: "H1", lemma: "", morph: "" });
+  const uhb = new Map([[29 * 100000 + 4, [w(KOH_UHB), w(AMAR)]]]);
+  const tnRow = (ref, quote) => ({
+    Reference: ref, ID: "qjok", Tags: "", SupportReference: "", Quote: quote, Occurrence: "1", Note: "n",
+  });
+
+  const built = tnPayload("JER", "29:4", tnRow("29:4", `${KOH_NFC} ${AMAR}`), uhb);
+  assert(built.payload.quote === `${KOH_UHB} ${AMAR}`, "tnPayload stores an NFC Hebrew quote in the UHB's exact bytes (separator kept)");
+  assert(built.payload.occurrence === 1, "canonizing leaves the staged occurrence untouched");
+
+  const eng = tnPayload("JER", "29:4", tnRow("29:4", "Thus says"), uhb);
+  assert(eng.payload.quote === "Thus says", "tnPayload leaves an English (Gateway-Language) quote unchanged");
+
+  const noSrc = tnPayload("JER", "29:5", tnRow("29:5", KOH_NFC), uhb);
+  assert(noSrc.payload.quote === KOH_NFC, "tnPayload leaves the quote unchanged when no UHB words are loaded for its verse");
+
+  const noMap = tnPayload("JER", "29:4", tnRow("29:4", KOH_NFC));
+  assert(noMap.payload.quote === KOH_NFC, "tnPayload without a UHB map (NT / no TN output) leaves the quote unchanged");
+
+  // Bridged ref: the leading verse's words are candidates, exact tier only.
+  const bridged = tnPayload("JER", "29:4-5", tnRow("29:4-5", KOH_NFC), uhb);
+  assert(bridged.payload.quote === KOH_UHB, "tnPayload canonizes a bridged-ref quote via the strict (exact) tier");
+  const bridgedLoose = tnPayload("JER", "29:4-5", tnRow("29:4-5", "כה"), uhb);
+  assert(bridgedLoose.payload.quote === "כה", "a bridged-ref quote is NOT matched on the looser consonant tier");
+
+  // The NFC live row and the canonized proposal must share one dedup key, or a
+  // re-proposal of an existing note would insert a second copy.
+  const key = (quote) => tnContentKey({ chapter: 29, verse: 4, occurrence: 1, support_reference: null, quote, note: "n" });
+  assert(key(`${KOH_NFC} ${AMAR}`) === key(built.payload.quote), "tnContentKey: NFC live quote and UHB-byte proposal collide");
+}
+
+// The same canonize proven through the REAL staging call site: stageJobOutput
+// preloads the UHB once (one SELECT FROM verses) and the pending_imports row it
+// INSERTs carries UHB bytes.
+await (async () => {
+  const KOH_UHB = "כֹּ֥ה";
+  const KOH_NFC = "כֹּ֥ה";
+  const uhbVerse = { verseObjects: [{ type: "word", tag: "w", text: KOH_UHB, strong: "H3541", lemma: "כֹּה", morph: "He,D" }] };
+  const tsv = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n" +
+    `29:4\tqjok\t\t\t${KOH_NFC}\t1\tA note.\n`;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(tsv, { status: 200 });
+  let sourceReads = 0;
+  const stagedPayloads = [];
+  function dispatch(sql, args) {
+    if (/RETURNING import_claimed_at/.test(sql)) return { changes: 1, rows: [{ import_claimed_at: 5000 }], single: null };
+    if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) return { changes: 0, rows: [], single: { staged_at: null } };
+    if (/SELECT state, error_kind FROM pipeline_jobs/.test(sql)) return { changes: 0, rows: [], single: { state: "running", error_kind: null } };
+    if (/SELECT user_id FROM pipeline_jobs/.test(sql)) return { changes: 0, rows: [], single: { user_id: 1 } };
+    if (/FROM verses/.test(sql) && /bible_version = \?4/.test(sql)) {
+      sourceReads += 1;
+      assert(args[3] === "UHB", "staging preloads the UHB (not UGNT) for an OT book");
+      return { changes: 0, rows: [{ chapter: 29, verse: 4, content_json: JSON.stringify(uhbVerse) }], single: null };
+    }
+    if (/INSERT INTO pending_imports/.test(sql)) {
+      stagedPayloads.push(JSON.parse(args[6]));
+      return { changes: 1, rows: [], single: null };
+    }
+    return { changes: 0, rows: [], single: null }; // everything else: no-op / empty
+  }
+  const stmt = (sql, args) => ({
+    sql, args,
+    async run() { const r = dispatch(sql, args); return { meta: { changes: r.changes }, results: r.rows }; },
+    async first() { return dispatch(sql, args).single; },
+    async all() { return { results: dispatch(sql, args).rows }; },
+  });
+  const env = {
+    DB: {
+      prepare(sql) { return { bind: (...args) => stmt(sql, args), ...stmt(sql, []) }; },
+      async batch(stmts) { return Promise.all(stmts.map((s) => s.run())); },
+    },
+  };
+  try {
+    await importJobOutput(
+      env,
+      { jobId: "job-959", pipelineType: "notes", book: "JER", startChapter: 29, endChapter: 29 },
+      [{ repo: "unfoldingWord/en_tn", rawUrl: "https://example.invalid/tn_JER.tsv" }],
+    );
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+  assert(sourceReads === 1, `staging preloads UHB words in ONE query per job (got ${sourceReads})`);
+  assert(stagedPayloads.length === 1, "staging inserted the one TN proposal");
+  assert(stagedPayloads[0].quote === KOH_UHB, "the staged pending_imports quote is stored in UHB bytes");
+})();
 
 // ─── TN dedup key drift (independent review finding) ────────────────────────
 // claimedTnKeys is seeded from LIVE tn_rows.note (RAW, as stored) while an

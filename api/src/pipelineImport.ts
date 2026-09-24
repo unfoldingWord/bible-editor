@@ -9,6 +9,7 @@
 import type { Env } from "./index";
 import {
   collectSourceWords,
+  coveredVersesFromRef,
   curlifyText,
   curlifyVerseObjects,
   extractPlainText,
@@ -23,7 +24,7 @@ import {
   type SourceWord,
   type VerseExtract,
 } from "./importParsers.ts";
-import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
+import { canonizeAlignmentSource, canonizeQuote } from "./canonizeHebrew.ts";
 import { hoistOpeningPunctuation } from "./openingPunct.ts";
 import { NT_BOOKS } from "./dcsSources.ts";
 import { newRowId, isValidRowId, coerceRowId, deriveAltRowId } from "./rowId.ts";
@@ -127,11 +128,29 @@ interface StagedRow {
 // NUM 26:53 prod forensics — straight quotes in AI-generated note prose).
 // Not intended as a public API beyond that — same rationale as
 // deleteUnkeptTns / maybeTouchClaim.
-export function tnPayload(book: string, refRaw: string, row: Record<string, string>) {
+export function tnPayload(
+  book: string,
+  refRaw: string,
+  row: Record<string, string>,
+  uhbWordsByVerse: Map<number, SourceWord[]> = new Map(),
+) {
   const [ch, v] = refParts(refRaw);
   const occRaw = row["Occurrence"];
   const parsedOcc = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
-  const quote = row["Quote"] || null;
+  // Rewrite the quote's Hebrew to the UHB's exact bytes (#959) — the AI emits
+  // NFC mark order, the UHB stores legacy Tanakh order, and a byte-exact
+  // consumer (bp-assistant's quote validator) drops a word whose bytes differ. Same placement rule as canonizeAlignmentSource: canonize where
+  // non-UHB Hebrew first enters D1. Every word of a bridged ref's verses is a
+  // candidate, but a range match is exact-tier only (see canonizeQuote). A
+  // Gateway-Language quote, an OT verse with no loaded UHB, or an NT book
+  // (map left empty by the caller) passes through unchanged.
+  const rawQuote = row["Quote"] || null;
+  const quoteWords = coveredVersesFromRef(refRaw, v).flatMap(
+    (cv) => uhbWordsByVerse.get(ch * 100000 + cv) ?? [],
+  );
+  const quote = rawQuote
+    ? canonizeQuote(rawQuote, quoteWords, { strict: /[-,]/.test(refRaw) })
+    : null;
   // Hold the AI to the same Occurrence invariant as the editor. Unlike
   // bookImport/bookReimport — which round-trip DCS master and must preserve its
   // blanks verbatim — this payload is freshly generated content, so a blank or
@@ -226,6 +245,7 @@ export function outputKindAllowedFor(pipelineType: string, kind: "verse" | "tn" 
 async function parseOutputEntry(
   ctx: ImportContext,
   entry: OutputEntry,
+  uhbWordsByVerse: Map<number, SourceWord[]>,
 ): Promise<{ staged: StagedRow[]; skipReason?: string }> {
   if (!entry.rawUrl) return { staged: [], skipReason: "missing rawUrl" };
   const cls = classify(entry);
@@ -272,7 +292,7 @@ async function parseOutputEntry(
       const [ch] = refParts(refRaw);
       if (ch < ctx.startChapter || ch > ctx.endChapter) continue;
       const built = cls.kind === "tn"
-        ? tnPayload(ctx.book, refRaw, row)
+        ? tnPayload(ctx.book, refRaw, row, uhbWordsByVerse)
         : tqPayload(ctx.book, refRaw, row);
       staged.push({
         kind: cls.kind,
@@ -705,10 +725,17 @@ async function stageJobOutput(
     .bind(job.jobId)
     .run();
 
+  // UHB words for TN quote canonizing (see tnPayload), loaded ONCE per job —
+  // one query, cap-safe — and only when an OT job actually carries TN output.
+  const uhbWordsByVerse =
+    !NT_BOOKS.has(job.book) && outputs.some((e) => e.rawUrl && classify(e).kind === "tn")
+      ? await loadUhbSourceWords(env, job)
+      : new Map<number, SourceWord[]>();
+
   const skipped: string[] = [];
   const allStaged: StagedRow[] = [];
   for (const entry of outputs) {
-    const { staged, skipReason } = await parseOutputEntry(job, entry);
+    const { staged, skipReason } = await parseOutputEntry(job, entry, uhbWordsByVerse);
     if (skipReason) skipped.push(skipReason);
     allStaged.push(...staged);
   }
@@ -943,7 +970,8 @@ async function applyJobOutput(
     // keys never match, so content-dedup silently fails to recognize the
     // duplicate and a second copy gets inserted. `quote` is deliberately left
     // untouched here, matching tnPayload — it must stay byte-exact for
-    // occurrence matching.
+    // occurrence matching. (Its Hebrew mark ORDER, which tnPayload now
+    // canonizes to UHB bytes, is folded to NFC inside tnContentKey instead.)
     for (const r of live.results ?? []) {
       claimedTnKeys.add(tnContentKey({ ...r, note: r.note ? curlifyText(r.note) : r.note }));
     }
