@@ -30,6 +30,8 @@ import {
   changedTsvChapters,
   softDeleteRemovedTsvRowsForTest as softDeleteRemovedTsvRows,
   tsvFetchLooksTruncatedForTest as tsvFetchLooksTruncated,
+  getMasterConfirmedAtForTest as getMasterConfirmedAt,
+  planAndStageBookResourcesForTest as planAndStageBookResources,
 } from "./bookReimport.ts";
 
 let failed = 0;
@@ -409,6 +411,198 @@ console.log("\n[issue #832 — control: a HUMAN-edited row is unaffected by the 
   // cutoff is ever consulted.
   const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, null);
   eq(res.deleted, 0, "nothing pruned — the human-edited row was never eligible regardless of the cutoff");
+}
+
+// ── Issue #857 — the prune must use the cutoff captured AT STAGING TIME, not
+// one re-read after the chunk-apply steps have run. runChunkedReimport's prune
+// loop runs after every chapter step of the same run; if another Workflow
+// instance exports this (book, kind)'s AI-only row and advances
+// master_confirmed_edit_id while those steps run, a FRESH read at prune time
+// sees the newer boundary even though the file THIS run staged predates it —
+// so the prune would wrongly conclude the row was already exported and then
+// removed on master, and delete it. The fix (bookReimport.ts's `StagedResource
+// .stagedCutoff`) carries the cutoff read during planAndStageBookResources's
+// staging loop — the same instant the file itself was staged — into the prune
+// step instead of letting it re-read getMasterConfirmedAt there.
+//
+// This directly exercises the mechanism the fix relies on: a cutoff captured
+// BEFORE a concurrent advance must let the row survive; the SAME row, judged
+// against a cutoff read AFTER that advance (today's pre-#857 behavior), must
+// not.
+console.log("\n[issue #857 — prune with the STAGING-TIME cutoff survives a concurrent export's advance]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  // X: an AI-only row, not yet part of any confirmed export.
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin, master_confirmed_edit_id, master_confirmed_at)
+       VALUES (?, 'tn', 'deadbeef', 1, 'reimport', 0, 1)`,
+    )
+    .run(BOOK);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+
+  // Staging time: this run reads the cutoff before X's create edit is confirmed.
+  const stagingCutoff = await getMasterConfirmedAt(env, BOOK, "tn");
+  eq(stagingCutoff.editId, 0, "precondition: the staging-time cutoff predates X's create edit");
+
+  // A DIFFERENT Workflow instance exports this same (book, tn) pair's AI-only
+  // row and advances the watermark while this run's chapter steps are still in
+  // flight — the exact #857 precondition (the #830 chapter locks are meant to
+  // prevent this overlap; this test is about not relying on that).
+  sqlite.prepare(`UPDATE book_resource_syncs SET master_confirmed_edit_id = 1 WHERE book = ? AND resource = 'tn'`).run(BOOK);
+  const reReadCutoff = await getMasterConfirmedAt(env, BOOK, "tn");
+  eq(reReadCutoff.editId, 1, "precondition: a fresh re-read now sees the concurrent export's advanced cutoff");
+
+  // The fix: prune with the cutoff captured at staging time.
+  const fixed = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, stagingCutoff);
+  eq(fixed.deleted, 0, "staging-time cutoff → X survives: this run's staged file predates the concurrent export");
+  const survivedRow = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
+  eq(survivedRow.deleted_at, null, "the AI-only row is untouched");
+}
+
+console.log("\n[issue #857 — control: a RE-READ cutoff (pre-fix behavior) wrongly deletes the same row]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin, master_confirmed_edit_id, master_confirmed_at)
+       VALUES (?, 'tn', 'deadbeef', 1, 'reimport', 0, 1)`,
+    )
+    .run(BOOK);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+
+  // Same concurrent-advance scenario, but this time the prune uses a FRESH
+  // read taken AFTER the advance — reproducing the bug #857 reports.
+  sqlite.prepare(`UPDATE book_resource_syncs SET master_confirmed_edit_id = 1 WHERE book = ? AND resource = 'tn'`).run(BOOK);
+  const reReadCutoff = await getMasterConfirmedAt(env, BOOK, "tn");
+
+  const buggy = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, reReadCutoff);
+  eq(buggy.deleted, 1, "re-read cutoff → X is wrongly pruned: this is the bug #857 fixes by using stagedCutoff instead");
+  const deletedRow = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
+  eq(deletedRow.deleted_at !== null, true, "the row is tombstoned under the re-read cutoff — the failure mode this issue is about");
+}
+
+// ── Issue #857 follow-up (Codex review finding F2 on PR #866) ──────────────
+// The fix above threads `StagedResource.stagedCutoff` from planAndStageBookResources
+// into the prune. A first version of that fix captured the cutoff BEFORE
+// loadMasterLineage ran — but loadMasterLineage can itself advance
+// master_confirmed_at/master_confirmed_edit_id from WITHIN that same staging
+// call (#658's own-publish-decline convergence). A pre-lineage capture would
+// therefore freeze the prune to a boundary already stale by the time staging
+// for this run finished, reintroducing the #485/#832 resurrection failure
+// mode from the other direction (a row this run's OWN lineage step just
+// confirmed exported would misread as "not yet exported" and wrongly
+// survive). The real fix reads the cutoff AFTER loadMasterLineage returns.
+//
+// This drives the REAL planAndStageBookResourcesForTest end to end (real
+// sqlite schema, a stubbed Door43 fetch) rather than re-testing
+// softDeleteRemovedTsvRows in isolation, so it exercises the exact ordering
+// bug: the DB wrapper below advances master_confirmed_edit_id as a side
+// effect of the SECOND read of book_resource_syncs's confirmed-boundary
+// query — standing in for ANY same-run advance between the two reads, #658's
+// included — and the plan's `stagedCutoff` must reflect that later value,
+// not the one read before it.
+function wrapDbAdvancingConfirmedOnSecondRead(sqlite, db, book, resource, advanceTo) {
+  let reads = 0;
+  return {
+    ...db,
+    prepare(sql) {
+      const stmt = db.prepare(sql);
+      if (!sql.includes("pushed_r2_key")) return stmt; // getMasterConfirmedAt's own SELECT only
+      return {
+        ...stmt,
+        bind(...args) {
+          const bound = stmt.bind(...args);
+          return {
+            ...bound,
+            first() {
+              if (args[0] === book && args[1] === resource) {
+                reads++;
+                if (reads === 2) {
+                  sqlite
+                    .prepare(
+                      `UPDATE book_resource_syncs SET master_confirmed_edit_id = ?, master_confirmed_at = ? WHERE book = ? AND resource = ?`,
+                    )
+                    .run(advanceTo.editId, advanceTo.confirmedAt, book, resource);
+                }
+              }
+              return bound.first();
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+console.log("\n[issue #857 follow-up (F2) — planAndStageBookResources' stagedCutoff reflects a same-run advance from AFTER loadMasterLineage, not before]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version)
+       VALUES (?, 1, 1, 'ULT', '{"a":1}', 'a', 1)`,
+    )
+    .run(BOOK);
+  // source_sha differs from the incoming masterSha below, so this resource is
+  // NOT SHA-skipped and goes through the full staging path. No pushed_blob_sha
+  // (never own-published), so own-publish recognition/decline never fires —
+  // this test is about the ordering of the two reads, not about #658's own
+  // trigger, so it stays out of the way. master_confirmed_at/_edit_id start
+  // NULL: no watermark yet, so loadMasterLineage returns immediately with no
+  // network calls (see its `confirmedAt == null` short-circuit).
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin) VALUES (?, 'tn', 'oldoldoldoldoldoldoldoldoldoldoldoldoldo', 1, 'reimport')`,
+    )
+    .run(BOOK);
+
+  const masterSha = "1111111111111111111111111111111111aaaa";
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "1:1", note: "fresh note" })].join("\n");
+  const bytes = new TextEncoder().encode(raw).byteLength;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    const resp = (status, body, headers = {}) => ({
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: (h) => headers[h.toLowerCase()] ?? null },
+      async text() { return body; },
+      async json() { return JSON.parse(body); },
+      async arrayBuffer() { return new TextEncoder().encode(body).buffer; },
+    });
+    if (u.includes("/commits?")) return resp(200, JSON.stringify([{ sha: masterSha }]));
+    if (u.includes("/contents/")) return resp(200, JSON.stringify({ size: bytes }));
+    if (u.includes("/raw/")) return resp(200, raw, { "content-length": String(bytes) });
+    return resp(404, "");
+  };
+
+  // The advance a concurrent same-run event (or a different Workflow
+  // instance) could make between the pre-lineage and post-lineage reads.
+  const ADVANCED = { confirmedAt: 2, editId: 5 };
+  env.DB = wrapDbAdvancingConfirmedOnSecondRead(sqlite, env.DB, BOOK, "tn", ADVANCED);
+  env.BLOBS = { async put() {}, async delete() {} };
+
+  let plan;
+  try {
+    plan = await planAndStageBookResources(env, BOOK, ["tn"], "inst-857f2");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  const entry = plan.entries.find((e) => e.resource === "tn");
+  eq(entry.changed, true, "precondition: the resource staged (SHA changed, not own-publish, not truncated)");
+  eq(
+    entry.stagedCutoff,
+    ADVANCED,
+    "stagedCutoff carries the SECOND (post-loadMasterLineage) read, not the first — the F2 fix",
+  );
 }
 
 if (failed > 0) {
