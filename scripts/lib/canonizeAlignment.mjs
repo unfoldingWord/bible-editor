@@ -27,21 +27,100 @@ const MUTABLE_ZALN_ATTRS = new Set(["content", "lemma"]);
 
 // ── source words ───────────────────────────────────────────────────────────
 
-// UHB rows → Map("ch:v" → SourceWord[]), built exactly like bookReimport.ts
-// step 6 (srcByKey) and pipelineImport.ts loadUhbSourceWords: parse
-// content_json, take verseObjects, collectSourceWords. An unparseable source
-// row is skipped (the canonizer then no-ops for that verse), as in production.
+// UHB rows → { words: Map("ch:v" → SourceWord[]), unusable: Map("ch:v" → why) }.
+// `words` is built exactly like bookReimport.ts step 6 (srcByKey) and
+// pipelineImport.ts loadUhbSourceWords: parse content_json, take verseObjects,
+// collectSourceWords. Production silently skips an unparseable source row; a
+// one-time repair must not, because a missing verse inside a bridge would
+// narrow the source words and can canonize onto the wrong word. So every
+// problem key is RECORDED in `unusable` (unparseable, or duplicated with
+// differing content) and the caller refuses any verse that touches one.
 export function buildSourceIndex(uhbRows) {
-  const map = new Map();
+  const words = new Map();
+  const unusable = new Map();
+  const seen = new Map(); // key -> content_json
   for (const r of uhbRows) {
+    const key = `${Number(r.chapter)}:${Number(r.verse)}`;
+    if (seen.has(key)) {
+      if (seen.get(key) !== r.content_json) {
+        unusable.set(key, "duplicate UHB rows with differing content");
+        words.delete(key);
+      }
+      continue;
+    }
+    seen.set(key, r.content_json);
     try {
-      const vo = JSON.parse(r.content_json).verseObjects ?? [];
-      map.set(`${Number(r.chapter)}:${Number(r.verse)}`, collectSourceWords(vo));
-    } catch {
-      /* unparseable source verse — leave targets in it uncanonized */
+      const vo = JSON.parse(r.content_json).verseObjects;
+      if (!Array.isArray(vo)) throw new Error("no verseObjects array");
+      words.set(key, collectSourceWords(vo));
+    } catch (e) {
+      unusable.set(key, `UHB content_json unusable: ${e.message}`);
     }
   }
-  return map;
+  return { words, unusable };
+}
+
+// Which UHB verses a target verse needs, and whether each is usable. Returns
+// { words, problems } — `problems` non-empty means the caller must refuse:
+// a verse in [verse, verse_end] is absent from the dump or unusable.
+export function sourceCoverage(index, chapter, verse, verseEnd) {
+  const ch = Number(chapter);
+  const v = Number(verse);
+  const ve = verseEnd == null ? null : Number(verseEnd);
+  const end = ve != null && Number.isFinite(ve) && ve >= v ? ve : v;
+  const problems = [];
+  for (let i = v; i <= end; i++) {
+    const key = `${ch}:${i}`;
+    if (index.unusable.has(key)) problems.push(`UHB ${key}: ${index.unusable.get(key)}`);
+    else if (!index.words.has(key)) problems.push(`UHB ${key} missing from the dump`);
+  }
+  return { words: sourceWordsForRange(index.words, ch, v, verseEnd), problems };
+}
+
+// ── dump hygiene ───────────────────────────────────────────────────────────
+
+// Keys every target row must CARRY (a null value is fine; an absent key means
+// the SELECT left the column out, and e.g. a missing verse_end would silently
+// disable bridge handling).
+const REQUIRED_KEYS = ["book", "chapter", "verse", "verse_end", "bible_version", "version", "content_json", "plain_text", "updated_by"];
+
+// Why a target row cannot be used, or null. A missing identity column would
+// otherwise produce `WHERE book = NULL`, which silently matches nothing.
+export function rowIdentityProblem(row) {
+  for (const k of REQUIRED_KEYS) if (!(k in row)) return `column '${k}' absent from the dump row`;
+  for (const col of ["book", "bible_version"]) {
+    if (typeof row[col] !== "string" || row[col].trim() === "") return `${col} missing (got ${JSON.stringify(row[col])})`;
+  }
+  for (const col of ["chapter", "verse", "version"]) {
+    if (row[col] == null || !Number.isInteger(Number(row[col]))) return `${col} missing or not an integer (got ${JSON.stringify(row[col])})`;
+  }
+  if (row.content_json == null) return "content_json is NULL";
+  return null;
+}
+
+// Collapse rows that appear more than once (the same file passed twice, a
+// re-dump beside an old dump). Identical duplicates collapse silently; rows
+// whose version or content differ are returned in `conflicts` and must be
+// refused — there is no way to know which is current.
+export function dedupeRows(rows) {
+  const byKey = new Map();
+  const conflicts = new Map(); // key -> why
+  for (const r of rows) {
+    const key = `${r.book}/${r.chapter}/${r.verse}/${r.bible_version}`;
+    const prev = byKey.get(key);
+    if (!prev) { byKey.set(key, r); continue; }
+    if (prev.version !== r.version || prev.content_json !== r.content_json || prev.verse_end !== r.verse_end) {
+      conflicts.set(key, `duplicate dump rows disagree (version ${prev.version} vs ${r.version})`);
+    }
+  }
+  return { rows: [...byKey.values()], conflicts };
+}
+
+// Make a data value safe inside a `--` SQL comment: escape CR/LF and every
+// other control character, so nothing from the dump can end the comment and
+// turn the rest of the line into a live statement.
+export function commentSafe(s) {
+  return String(s).replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`);
 }
 
 // Source words for a target verse, unioned across a verse bridge (verse_end).
@@ -212,13 +291,13 @@ export function repairVerse(contentJson, sourceWords) {
 
 // ── reporting helper ───────────────────────────────────────────────────────
 
-// Every non-ASCII code point as \uXXXX, so a word joiner vs an accent is
-// visible in a terminal or a report.
+// Every non-ASCII code point (and every ASCII control character) as \uXXXX, so
+// a word joiner vs an accent is visible, and the result is comment-safe.
 export function uEscape(s) {
   let out = "";
   for (const ch of String(s)) {
     const c = ch.codePointAt(0);
-    out += c < 0x80 ? ch : c > 0xffff ? `\\u{${c.toString(16).toUpperCase()}}` : `\\u${c.toString(16).toUpperCase().padStart(4, "0")}`;
+    out += c >= 0x20 && c < 0x7f ? ch : c > 0xffff ? `\\u{${c.toString(16).toUpperCase()}}` : `\\u${c.toString(16).toUpperCase().padStart(4, "0")}`;
   }
   return out;
 }

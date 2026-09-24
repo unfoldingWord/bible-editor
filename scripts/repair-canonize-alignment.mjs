@@ -50,7 +50,18 @@
 //   explicit `book_locks` row wins in BOTH directions; with no row, a book in
 //   PUBLISHED_BOOKS (api/src/publishedGuard.ts, parsed at run time) is locked.
 //   Locked-book changes are computed and REPORTED (with \u escapes) for a
-//   Door43 admin, never written to SQL unless --allow-locked is passed.
+//   Door43 admin, never written to SQL unless --allow-locked is passed. Each
+//   UPDATE also carries `AND NOT EXISTS (book_locks … locked = 1)`, so a lock
+//   placed between dump and apply still blocks the write.
+//
+// ── REFUSALS (never guessed around) ────────────────────────────────────────
+//   A verse is refused, reported, and left out of the SQL when: a required
+//   column is absent from its dump row (verse_end, plain_text, updated_by, …);
+//   duplicate dump rows for it disagree; any UHB verse in [verse, verse_end] is
+//   missing or unparseable; the verifier sees any change beyond zaln
+//   content/lemma; or a statement would exceed 90,000 bytes. A target book
+//   with no UHB rows at all stops the run (exit 1). Verse 0 is front matter
+//   and counts as "no source", not a refusal.
 //
 // ── USAGE ──────────────────────────────────────────────────────────────────
 //   1. Dump (SELECT ONLY — never --file against --remote), from api/, per book:
@@ -108,7 +119,15 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, readdirSy
 import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractJsonRows } from "./lib/numberSplit.mjs";
-import { buildSourceIndex, sourceWordsForRange, repairVerse, uEscape } from "./lib/canonizeAlignment.mjs";
+import {
+  buildSourceIndex,
+  sourceCoverage,
+  repairVerse,
+  rowIdentityProblem,
+  dedupeRows,
+  commentSafe,
+  uEscape,
+} from "./lib/canonizeAlignment.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -244,7 +263,7 @@ if (!dumpFiles.length) die("no .json dump files found");
 const DUMP_STALE_HOURS = 6;
 let oldestDumpHours = 0;
 const uhbRowsByBook = new Map();
-const targetRows = [];
+const rawTargets = [];
 for (const f of dumpFiles) {
   let rows;
   try {
@@ -254,19 +273,36 @@ for (const f of dumpFiles) {
   }
   oldestDumpHours = Math.max(oldestDumpHours, (Date.now() - statSync(f).mtimeMs) / 3_600_000);
   for (const r of rows) {
-    const bv = String(r.bible_version ?? "").toUpperCase();
-    const book = String(r.book ?? "").toUpperCase();
+    // Normalize identity at load so row_key, --exclude and the lock lookup all
+    // agree. D1 stores these uppercase; this only guards a hand-made dump.
+    if (typeof r.book === "string") r.book = r.book.trim().toUpperCase();
+    if (typeof r.bible_version === "string") r.bible_version = r.bible_version.trim().toUpperCase();
+    const bv = String(r.bible_version ?? "");
+    const book = String(r.book ?? "");
     if (bv === "UHB") {
       if (!uhbRowsByBook.has(book)) uhbRowsByBook.set(book, []);
       uhbRowsByBook.get(book).push(r);
     } else if (TARGET_VERSIONS.has(bv)) {
       if (bookFilter && !bookFilter.has(book)) continue;
       if (versionFilter && !versionFilter.has(bv)) continue;
-      targetRows.push(r);
+      rawTargets.push(r);
     }
   }
 }
-if (!targetRows.length) die("no ULT/UST rows to process (after --book/--bible-version filters)");
+if (!rawTargets.length) die("no ULT/UST rows to process (after --book/--bible-version filters)");
+const { rows: targetRows, conflicts: duplicateConflicts } = dedupeRows(rawTargets);
+
+// A target book with NO UHB rows at all means a dump file is missing, not that
+// the book has nothing to repair. Stop rather than report it as clean.
+const booksWithoutUhb = [...new Set(targetRows.map((r) => String(r.book)))].filter((b) => !uhbRowsByBook.has(b)).sort();
+if (booksWithoutUhb.length) {
+  console.error("═".repeat(96));
+  console.error(`NO UHB ROWS for ${booksWithoutUhb.length} target book(s): ${booksWithoutUhb.join(", ")}`);
+  console.error("Every verse in those books would be skipped unexamined. Dump their UHB verses, or narrow");
+  console.error("the run with --book. No SQL written.");
+  console.error("═".repeat(96));
+  process.exit(1);
+}
 
 const sourceIndexByBook = new Map();
 for (const [book, rows] of uhbRowsByBook) sourceIndexByBook.set(book, buildSourceIndex(rows));
@@ -275,61 +311,63 @@ if (existsSync(sqlPath) && !force) {
   die(`${sqlPath} already exists. Refusing to overwrite a file an operator may have verified. Pass --force.`);
 }
 
-// A dump missing a column would otherwise produce `WHERE book = NULL`, which
-// silently matches nothing.
-function rowIdentityProblem(row) {
-  for (const col of ["book", "bible_version"]) {
-    if (typeof row[col] !== "string" || row[col].trim() === "") return `${col} missing (got ${JSON.stringify(row[col])})`;
-  }
-  for (const col of ["chapter", "verse", "version"]) {
-    if (row[col] == null || !Number.isInteger(Number(row[col]))) return `${col} missing or not an integer (got ${JSON.stringify(row[col])})`;
-  }
-  return null;
-}
-
 // ── per-verse repair ───────────────────────────────────────────────────────
 
 const repaired = [];
 const lockedChanges = [];
 const refused = [];
 const excluded = [];
-const noSourceBooks = new Set();
 let clean = 0;
 let noSource = 0;
 let skippedInvisible = 0;
 const declined = []; // { ref, rowKey, book, bv, lock, items }
 
 for (const row of targetRows) {
-  const book = String(row.book).toUpperCase();
-  const bv = String(row.bible_version).toUpperCase();
+  const book = String(row.book);
+  const bv = String(row.bible_version);
   const ref = `${book} ${bv} ${row.chapter}:${row.verse}${row.verse_end != null && Number(row.verse_end) !== Number(row.verse) ? `-${row.verse_end}` : ""}`;
   const rowKey = `${row.book}/${row.chapter}/${row.verse}/${row.bible_version}`;
+  // --exclude first: an excluded verse is never parsed, so a malformed one
+  // cannot count as REFUSED or change the exit code.
+  if (excludeVerses.has(`${book}/${Number(row.chapter)}/${Number(row.verse)}/${bv}`)) {
+    excluded.push(rowKey);
+    continue;
+  }
+  if (duplicateConflicts.has(rowKey)) {
+    refused.push({ ref, rowKey, why: duplicateConflicts.get(rowKey) });
+    continue;
+  }
   const idProblem = rowIdentityProblem(row);
   if (idProblem) {
-    refused.push({ ref, rowKey, why: `row identity unusable — ${idProblem}` });
+    refused.push({ ref, rowKey, why: `row unusable — ${idProblem}` });
     continue;
   }
-  if (row.content_json == null) {
-    refused.push({ ref, rowKey, why: "content_json is NULL" });
-    continue;
-  }
+  // Verse 0 is front matter and normally has no UHB counterpart: expected, not
+  // a refusal. But Psalm superscriptions ARE verse 0 in the UHB and are aligned
+  // (128 PSA rows on 2026-09-24), so a verse 0 whose UHB row exists is
+  // processed like any other verse.
   const index = sourceIndexByBook.get(book);
-  if (!index) {
-    noSourceBooks.add(book);
+  const v0key = `${Number(row.chapter)}:0`;
+  if (Number(row.verse) === 0 && !index.words.has(v0key) && !index.unusable.has(v0key)) {
     noSource++;
     continue;
   }
-  const words = sourceWordsForRange(index, row.chapter, row.verse, row.verse_end);
-  const r = repairVerse(row.content_json, words);
-  if (r.declined?.length) declined.push({ ref, rowKey, book, bv, lock: lockReason(book), items: r.declined });
+  const cov = sourceCoverage(index, row.chapter, row.verse, row.verse_end);
+  if (cov.problems.length) {
+    refused.push({ ref, rowKey, why: `source words incomplete — ${cov.problems.join("; ")}` });
+    continue;
+  }
+  const r = repairVerse(row.content_json, cov.words);
+  const lock = lockReason(book);
+  if (r.declined?.length) declined.push({ ref, rowKey, book, bv, lock, items: r.declined });
   if (r.status === "clean") { clean++; continue; }
   if (r.status === "no_source") { noSource++; continue; }
   if (r.status === "refused") { refused.push({ ref, rowKey, why: r.why }); continue; }
-  if (visibleOnly && !r.changes.some((c) => c.kind === "visible")) { skippedInvisible++; continue; }
   const entry = { ref, rowKey, book, bv, row, newContentJson: r.newContentJson, changes: r.changes };
-  if (excludeVerses.has(rowKey)) { excluded.push(entry); continue; }
-  const lock = lockReason(book);
+  // Lock BEFORE the visible filter: a locked book's changes are always
+  // reported for the Door43 admin, whatever their kind.
   if (lock && !allowLocked) { lockedChanges.push({ ...entry, lock }); continue; }
+  if (visibleOnly && !r.changes.some((c) => c.kind === "visible")) { skippedInvisible++; continue; }
   repaired.push({ ...entry, lock });
 }
 
@@ -362,9 +400,14 @@ function statementsFor(r) {
     `UPDATE verses SET content_json = ${sqlStr(r.newContentJson)},` +
     ` version = version + 1, updated_at = ${nowTs}, updated_by = ${REPAIR_USER_ID},` +
     ` last_change_action = 'update', last_change_source = 'system', last_change_actor = ${sqlStr(REPAIR_ACTOR)}` +
-    ` WHERE ${match} AND version = ${v};`;
+    ` WHERE ${match} AND version = ${v}` +
+    // Apply-time lock guard: a lock placed between dump and apply blocks the
+    // write. (PUBLISHED_BOOKS is code, checked at generate time above.)
+    ` AND NOT EXISTS (SELECT 1 FROM book_locks WHERE book = ${sqlStr(row.book)} AND locked = 1);`;
   // Guarded audit row: only when the row is now at v+1 holding exactly our
   // content, and only once (re-running after a partial apply cannot double-log).
+  // It keys on the UPDATE having happened, so a lock-blocked or version-skipped
+  // UPDATE writes no audit row either.
   const log =
     `INSERT INTO edit_log (kind,row_key,book,user_id,prev_version,new_version,action,payload_json,source,created_at)` +
     ` SELECT 'verse',${sqlStr(r.rowKey)},${sqlStr(row.book)},${REPAIR_USER_ID},${v},${v + 1},${sqlStr(REPAIR_ACTION)},` +
@@ -376,6 +419,17 @@ function statementsFor(r) {
   return [update, log];
 }
 
+// D1 rejects a statement over ~100 KB. Refuse (never truncate) any verse whose
+// UPDATE or audit INSERT would pass this margin.
+const MAX_STATEMENT_BYTES = 90_000;
+for (let i = repaired.length - 1; i >= 0; i--) {
+  const sizes = statementsFor(repaired[i]).map((s) => Buffer.byteLength(s, "utf8"));
+  if (Math.max(...sizes) > MAX_STATEMENT_BYTES) {
+    const [r] = repaired.splice(i, 1);
+    refused.push({ ref: r.ref, rowKey: r.rowKey, why: `statement too large (${Math.max(...sizes)} bytes > ${MAX_STATEMENT_BYTES}); fix by hand` });
+  }
+}
+
 const wordCount = (list) => list.reduce((n, r) => n + r.changes.length, 0);
 const books = [...new Set(repaired.map((r) => r.row.book))].sort();
 const inList = (xs) => xs.map((b) => `'${b}'`).join(", ");
@@ -384,7 +438,7 @@ const fmtChange = (c) => {
   const parts = [];
   if (c.content) parts.push(`content ${uEscape(c.content.before)} → ${uEscape(c.content.after)}`);
   if (c.lemma) parts.push(`lemma ${uEscape(c.lemma.before)} → ${uEscape(c.lemma.after)}`);
-  return `[${c.kind}] ${c.strong || "?"}: ${parts.join("; ")}`;
+  return `[${c.kind}] ${uEscape(c.strong || "?")}: ${parts.join("; ")}`;
 };
 const kindCounts = (list) => {
   const k = { visible: 0, mark_order: 0, lemma_only: 0 };
@@ -441,13 +495,21 @@ const header = [
   "--   2. Re-dump the same books and re-run this script. Expect 0 verses in the SQL. The",
   `--      ${lockedChanges.length} locked-book change(s)${refused.length ? ` and ${refused.length} REFUSED verse(s)` : ""} reported by this run are NOT repaired`,
   "--      here and will be reported again — that is expected, not a failed apply.",
+  "--   3. Every UPDATE also requires NOT EXISTS a book_locks row with locked=1 for its book. If an",
+  "--      admin locked a book after the dump, its verses are silently skipped (no audit row",
+  "--      either), so check 1 comes up short by exactly those verses. Confirm with:",
+  ...(books.length ? [`--        SELECT book, locked FROM book_locks WHERE book IN (${inList(books)});`] : ["--        SELECT book, locked FROM book_locks;"]),
   "",
 ];
 
-const lines = [...header];
+// Every `--` line passes through commentSafe: refs, paths, book codes and
+// Strong's numbers come from data, and a raw CR/LF in one would end the
+// comment and turn the rest of that line into a live statement.
+const comment = (s) => commentSafe(s);
+const lines = header.map((l) => (l.startsWith("--") ? comment(l) : l));
 for (const r of repaired) {
-  lines.push(`-- ${r.ref}  v${r.row.version} → v${Number(r.row.version) + 1}${r.lock ? `  [LOCKED: ${r.lock}; --allow-locked]` : ""}`);
-  for (const c of r.changes) lines.push(`--   ${fmtChange(c)}`);
+  lines.push(comment(`-- ${r.ref}  v${r.row.version} → v${Number(r.row.version) + 1}${r.lock ? `  [LOCKED: ${r.lock}; --allow-locked]` : ""}`));
+  for (const c of r.changes) lines.push(comment(`--   ${fmtChange(c)}`));
   lines.push(...statementsFor(r));
 }
 mkdirSync(dirname(sqlPath), { recursive: true });
@@ -489,7 +551,7 @@ if (visibleOnly) console.log(`  skipped, no visible change: ${skippedInvisible} 
 console.log(`  DECLINED           : ${declinedCount} visible milestone(s) left alone, in ${declined.length} verse(s)`);
 console.log(`  --exclude'd        : ${excluded.length}`);
 console.log(`  already clean      : ${clean}`);
-console.log(`  no source words    : ${noSource}${noSourceBooks.size ? `  (no UHB dump for: ${[...noSourceBooks].sort().join(", ")})` : ""}`);
+console.log(`  verse 0 / no source: ${noSource}`);
 console.log(`  REFUSED            : ${refused.length}`);
 console.log("");
 
@@ -525,7 +587,7 @@ if (excluded.length) {
   console.log("");
   console.log("EXCLUDED BY --exclude");
   console.log("─".repeat(96));
-  for (const r of excluded) console.log(`  ${r.rowKey}`);
+  for (const k of excluded) console.log(`  ${k}`);
 }
 
 if (declined.length) {
@@ -587,7 +649,7 @@ if (jsonPath) {
         locked: lockedChanges.map(ser),
         refused,
         declined: declined.map((d) => ({ ...d, items: d.items.map((it) => ({ ...it, contentEscaped: uEscape(it.content) })) })),
-        excluded: excluded.map((r) => r.rowKey),
+        excluded,
       },
       null,
       2,
