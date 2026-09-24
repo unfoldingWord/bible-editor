@@ -127,14 +127,6 @@ export interface VerseMergeInput {
    * 2026-09-18 through 2026-09-24). OMITTED means unlocked.
    */
   masterAuthoritative?: boolean;
-  /**
-   * D1's current content was written by the nightly sync itself (the verse's
-   * newest content edit_log row has source `dcs_reimport`), i.e. it is a copy
-   * of an earlier master, so D1 has not moved since master last did. Read only
-   * by step 3b: a locked book's ancestor is frozen, so without this every later
-   * Door43 commit reads as "both changed" against the pre-lock app edit.
-   */
-  oursFromMaster?: boolean;
 }
 
 export interface VerseMergeResult {
@@ -469,9 +461,8 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   // the alignment guard and the AI-lineage check, because keeping D1 on a
   // locked book only hands the pre-lock text back to master on the first
   // export after unlock.
-  //   - D1 unmoved since the ancestor, or D1 is itself the sync's copy of an
-  //     earlier master: nobody's app work is replaced, so a clean `adopt`
-  //     (audit row, no alert).
+  //   - D1 unmoved since the ancestor and no human edit since the export:
+  //     nobody's app work is replaced, so a clean `adopt` (audit row, no alert).
   //   - D1 holds an app edit master may not have: master still wins, but as
   //     `adopt_conflict`, so applyVerseRows's visible-change refinement alerts
   //     the editor on a real wording/punctuation/alignment loss and downgrades
@@ -482,7 +473,11 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   // bridge master split (theirsForAlignment set: its whole-range alignment
   // check belongs to the structure path, issue #949) keep today's handling.
   if (input.masterAuthoritative === true && theirsKey !== null && input.theirsForAlignment === undefined) {
-    if (keysEqual(oursKey, baseKey) || input.oursFromMaster === true) {
+    // "D1 is the sync's own copy of master" is deliberately NOT a clean-adopt
+    // signal: the source-attr reconcile also writes `dcs_reimport` / sync_merge
+    // rows over a human's wording, so no stored field separates the two, and
+    // the refinement already keeps a markers-only difference silent.
+    if (keysEqual(oursKey, baseKey) && !humanEditedSinceExport) {
       return { action: "adopt", adopt: true, conflict: false, reason: "book_locked" };
     }
     return { action: "adopt_conflict", adopt: true, conflict: true, reason: "both_changed" };

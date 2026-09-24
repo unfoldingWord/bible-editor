@@ -6704,7 +6704,6 @@ async function applyVerseRows(
           // Issue #728: set only for the anchor of a bridge master has split.
           theirsForAlignment: structureAlignmentTheirs.get(structureKey(v.chapter, v.verse)),
           masterAuthoritative: bookLocked,
-          oursFromMaster: ex.latest_source === REIMPORT_SOURCE,
         });
         mergeAction = merge.action;
         // Issue #728: an anchor the content merge did NOT adopt — step 7s decides

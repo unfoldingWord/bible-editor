@@ -658,29 +658,28 @@ console.log("\n[locked book: Door43 master is authoritative]");
   const lockedIn = { base, ours, theirs, humanEditedSinceExport: true, masterAuthoritative: true };
 
   const first = computeVerseMerge(lockedIn);
-  eq(first.action, "adopt_conflict", "locked, D1 holds an app edit master may lack → master wins, flagged");
+  eq(first.action, "adopt_conflict", "locked, D1 holds an app edit master may lack → master wins, flagged for the visible-change refinement");
   eq(first.adopt, true, "…and it is adopted");
 
-  const later = computeVerseMerge({ ...lockedIn, oursFromMaster: true });
-  eq(later.action, "adopt", "locked, D1 is the sync's own copy of master → clean adopt");
-  eq(later.conflict, false, "…no human review asked");
-  eq(later.reason, "book_locked", "…reason names the lock");
-
+  const clean = computeVerseMerge({ ...lockedIn, ours: base, humanEditedSinceExport: false });
+  eq(clean.action, "adopt", "locked, D1 unmoved since the ancestor → clean adopt");
+  eq(clean.conflict, false, "…no human review asked");
+  eq(clean.reason, "book_locked", "…reason names the lock");
   eq(
     computeVerseMerge({ ...lockedIn, ours: base }).action,
-    "adopt",
-    "locked, D1 unmoved since the ancestor → clean adopt",
+    "adopt_conflict",
+    "locked, D1 back at the ancestor but a human edited since the export → flagged, like step 5",
   );
   eq(
-    computeVerseMerge({ ...lockedIn, oursFromMaster: true, masterMayHoldHumanEdit: false }).action,
-    "adopt",
+    computeVerseMerge({ ...lockedIn, masterMayHoldHumanEdit: false }).action,
+    "adopt_conflict",
     "locked: the AI-lineage keep does not apply — D1 would only be exported back over master on unlock",
   );
 
   const aligned = content([zaln("H1", [w("Again")]), { type: "text", text: " " }, zaln("H2", [w("call")])]);
   const flattened = text("Again call");
   eq(
-    computeVerseMerge({ base: text("x"), ours: aligned, theirs: flattened, humanEditedSinceExport: true, masterAuthoritative: true, oursFromMaster: true }).action,
+    computeVerseMerge({ base: aligned, ours: aligned, theirs: flattened, humanEditedSinceExport: false, masterAuthoritative: true }).action,
     "adopt",
     "locked: master wins even when it carries less alignment",
   );
@@ -701,7 +700,7 @@ console.log("\n[locked book: Door43 master is authoritative]");
     "locked: identical content still writes nothing",
   );
   eq(
-    computeVerseMerge({ ...lockedIn, oursFromMaster: true, theirsForAlignment: "{not json" }).action,
+    computeVerseMerge({ ...lockedIn, ours: base, humanEditedSinceExport: false, theirsForAlignment: "{not json" }).action,
     "keep_alignment_refused",
     "locked: a split-bridge anchor keeps the ordinary structure-aware path (#949)",
   );

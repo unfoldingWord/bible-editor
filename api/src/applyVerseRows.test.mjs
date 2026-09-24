@@ -2640,15 +2640,17 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
   eq(cutoff.bookLocked, true, "the lock is read into the ult cutoff");
   eq((await getMasterConfirmedAtForTest(env, BOOK, "tn")).bookLocked, undefined, "…and not for a TSV resource, whose merge does not honor it yet");
 
+  // Door43 restored a `\ts\*` marker; the words are unchanged.
+  const masterJson = JSON.stringify({ verseObjects: [{ type: "text", text: "Again, call out" }, { tag: "ts\\*", nextChar: "\n" }] });
   const counts = await applyVerseRowsForTest(
-    env, BOOK, VERSION, [verse(1, 17, "Again, call out, with Door43's fix")], null,
+    env, BOOK, VERSION, [{ chapter: 1, verse: 17, verseEnd: null, contentJson: masterJson, plainText: "Again, call out" }], null,
     { ...cutoff, confirmedAt: 1000, editId: 0 }, false,
   );
-  eq(counts.merge_adopted, 1, "master's text is adopted");
+  eq(counts.merge_adopted, 1, "master's markers are adopted");
   eq(
-    sqlite.prepare("SELECT plain_text FROM verses WHERE book = ? AND chapter = 1 AND verse = 17").all(BOOK)[0].plain_text,
-    "Again, call out, with Door43's fix",
-    "…and is what D1 now holds",
+    sqlite.prepare("SELECT content_json FROM verses WHERE book = ? AND chapter = 1 AND verse = 17").all(BOOK)[0].content_json,
+    masterJson,
+    "…and are what D1 now holds",
   );
   const row = sqlite
     .prepare("SELECT action, resolved_at, overwritten_version FROM verse_merge_conflicts WHERE book = ? AND chapter = 1 AND verse = 17")
@@ -2769,7 +2771,9 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
 
 {
   // The cutoff was read while locked, but the book was unlocked before this
-  // chunk read its rows: the re-read wins, so the ordinary merge runs.
+  // chunk read its rows: the re-read wins, so the ordinary merge runs. D1 is
+  // unmoved since the ancestor, so locked would say `book_locked` and
+  // unlocked says `master_only` — the reason tells the two apart.
   const { env, sqlite } = freshEnv();
   sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
   sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at, set_by) VALUES (?, 0, 100, 1)`).run(BOOK);
@@ -2778,22 +2782,16 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
       `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
        VALUES (?, 5, 1, NULL, ?, ?, ?, 3, 1)`,
     )
-    .run(BOOK, VERSION, contentJson("aligned app text"), "aligned app text");
+    .run(BOOK, VERSION, contentJson("old text"), "old text");
   sqlite
     .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('verse', ?, ?, 'baseline', ?, 500)`)
     .run(`${BOOK}/5/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("old text")) }));
-  sqlite
-    .prepare(
-      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at, source)
-       VALUES ('verse', ?, ?, NULL, 2, 3, 'update', ?, 1500, 'dcs_reimport')`,
-    )
-    .run(`${BOOK}/5/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("aligned app text")) }));
   await applyVerseRowsForTest(
     env, BOOK, VERSION, [verse(5, 1, "door43 text")], null,
     { confirmedAt: 1000, editId: 0, bookLocked: true }, false,
   );
   const mc = sqlite.prepare("SELECT reason FROM verse_merge_conflicts WHERE book = ? AND chapter = 5").all(BOOK)[0];
-  eq(mc?.reason === "book_locked", false, "a stale locked cutoff does not apply once the book is unlocked");
+  eq(mc?.reason, "master_only", "a stale locked cutoff does not apply once the book is unlocked");
 }
 
 if (failed > 0) {
