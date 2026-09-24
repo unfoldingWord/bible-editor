@@ -408,11 +408,17 @@ function statementsFor(r) {
     ` version = version + 1, updated_at = ${nowTs}, updated_by = ${REPAIR_USER_ID},` +
     ` last_change_action = 'update', last_change_source = 'system', last_change_actor = ${sqlStr(REPAIR_ACTOR)}` +
     ` WHERE ${match} AND version = ${v}` +
-    // Apply-time lock guard: an explicit locked=1 row placed between dump and
-    // apply blocks the write. (PUBLISHED_BOOKS is code, checked at generate
-    // time above.) Omitted under --allow-locked, which asks to write locked
-    // books on purpose.
-    (allowLocked ? ";" : ` AND NOT EXISTS (SELECT 1 FROM book_locks WHERE book = ${sqlStr(row.book)} AND locked = 1);`);
+    // Apply-time lock guard, mirroring effectiveBookLock at apply time. An
+    // unpublished book is writable unless a locked=1 row appears. A published
+    // book only got here through an explicit locked=0 unlock, so it stays
+    // writable only while that row still exists — deleting it reverts the book
+    // to the published default (locked). Omitted under --allow-locked, which
+    // asks to write locked books on purpose.
+    (allowLocked
+      ? ";"
+      : PUBLISHED_BOOKS.has(row.book)
+        ? ` AND EXISTS (SELECT 1 FROM book_locks WHERE book = ${sqlStr(row.book)} AND locked = 0);`
+        : ` AND NOT EXISTS (SELECT 1 FROM book_locks WHERE book = ${sqlStr(row.book)} AND locked = 1);`);
   // Guarded audit row: only when the row is now at v+1 holding exactly our
   // content, and only once (re-running after a partial apply cannot double-log).
   // It keys on the UPDATE having happened, so a lock-blocked or version-skipped
