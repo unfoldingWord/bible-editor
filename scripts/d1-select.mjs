@@ -58,7 +58,13 @@ if (out) {
     process.exit(2);
   }
   mkdirSync(outRoot, { recursive: true });
+  // scripts/out itself must be a real directory of this checkout, not a link
+  // to somewhere else (it is git-ignored, so git would not notice one).
   const realRoot = realpathSync(outRoot);
+  if (realRoot !== resolve(realpathSync(repoRoot), "scripts", "out")) {
+    console.error(`refused: ${outRoot} is not a plain directory of this checkout`);
+    process.exit(2);
+  }
   let anc = dirname(target);
   while (!existsSync(anc)) anc = dirname(anc);
   const realAnc = realpathSync(anc);

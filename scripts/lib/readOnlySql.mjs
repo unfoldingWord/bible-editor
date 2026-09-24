@@ -83,6 +83,9 @@ export function readOnlySqlProblem(sql) {
   const bad = body.match(FORBIDDEN_RE);
   if (bad) return `forbidden keyword ${bad[1].toUpperCase()}`;
   if (REPLACE_STMT_RE.test(body)) return "forbidden keyword REPLACE";
+  // Table-valued pragmas (pragma_optimize, …) are callable from a SELECT and
+  // some write (pragma_optimize runs ANALYZE). \bPRAGMA\b misses them.
+  if (/\bpragma_/i.test(body)) return "forbidden pragma_ function";
   const costly = body.match(EXPENSIVE_RE);
   if (costly) return `refused as potentially expensive: ${costly[1].toUpperCase()}`;
   return null;

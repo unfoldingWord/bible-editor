@@ -9,6 +9,10 @@
       "Bash(graft-dev:*)",
       "Bash(node dist/cli.js:*)",
       "Bash(node scripts/d1-select.mjs:*)"
+    ],
+    "deny": [
+      "Edit(**/scripts/d1-select.mjs)",
+      "Edit(**/scripts/lib/readOnlySql.mjs)"
     ]
   }
 }

@@ -44,6 +44,8 @@ const refused = [
   ["--file=evil.sql\nSELECT 1", "must not start with '-'"],
   ["WITH x AS (SELECT 1) REPLACE INTO t SELECT * FROM x", "forbidden keyword REPLACE"],
   ["WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c", "refused as potentially expensive: RECURSIVE"],
+  ["SELECT * FROM pragma_optimize", "forbidden pragma_ function"],
+  ["SELECT * FROM PRAGMA_table_info('verses')", "forbidden pragma_ function"],
   ["SELECT randomblob(1000000000)", "refused as potentially expensive: RANDOMBLOB"],
   ["  -- note\nSELECT 1", "must not start with '-'"],
 ];
