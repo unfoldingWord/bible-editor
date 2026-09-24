@@ -34,3 +34,23 @@ export function runSaveChain(steps: SaveStep[], finish: () => void): void {
   };
   run(0);
 }
+
+// The dual aligner's "save, mark done, next verse" button (#931): run the
+// same dirty-side save chain as the unsaved-changes gate's Save, and only once
+// every side has committed mark the verse done and advance. A cancelled
+// confirm stalls the chain, so nothing is marked and the aligner stays on this
+// verse. `alreadyDone` skips the mark only when nothing was saved: a verse
+// save reopens the Text lane server-side (api/src/verses.ts reopenLaneChecks),
+// so after any save the mark must be written again.
+export function runSaveDoneAndNext(opts: {
+  steps: SaveStep[];
+  alreadyDone: boolean;
+  markDone: () => void;
+  advance: () => void;
+}): void {
+  const saved = opts.steps.some((s) => s.dirty);
+  runSaveChain(opts.steps, () => {
+    if (saved || !opts.alreadyDone) opts.markDone();
+    opts.advance();
+  });
+}
