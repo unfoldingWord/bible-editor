@@ -1101,6 +1101,23 @@ export async function pollPipelineJob(
         return { kind: "ok", text, status: upstream.status, state: data.state ?? "running" };
       }
       appliedChapters = importResult.applied?.affectedChapters ?? [];
+      // Issue #875: a 'done' body whose output[] entries all named a repo
+      // classify() doesn't recognize staged/applied nothing, but importJobOutput
+      // returns normally (no throw, not aborted, claim not lost) — so without
+      // this check the guarded UPDATE below would write state='done' with
+      // nothing imported, and the follow-up chain would dispatch on top of a
+      // run that produced no rows. Route it through the SAME retry-then-fail
+      // path as a thrown import error: held at 'running' for one retry (in case
+      // this was a transient/partial upstream report), then forced 'failed' if
+      // it happens again — never a silent 'done'.
+      if (importResult.allOutputReposUnrecognized) {
+        importFailed = true;
+        importErrMessage = `no recognized output: every output[] entry with a rawUrl named an unrecognized repo (${importResult.skipped.join("; ")})`;
+        console.error(`[pollPipelineJob] job=${job.job_id} done body had no recognized output`, {
+          jobId: job.job_id,
+          skipped: importResult.skipped,
+        });
+      }
     } catch (err) {
       importFailed = true;
       importErrMessage = err instanceof Error ? err.message : String(err);
