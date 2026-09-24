@@ -15,7 +15,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { applyVerseRowsForTest, confirmedBasesForCutoffForTest, getMasterConfirmedAtForTest } from "./bookReimport.ts";
+import { applyVerseRowsForTest, confirmedBasesForCutoffForTest } from "./bookReimport.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 import { SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL, UPSERT_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictSql.ts";
 
@@ -76,6 +76,10 @@ function freshEnv() {
   for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
     sqlite.exec(readFileSync(join(dir, f), "utf8"));
   }
+  // PSA is a published book, which bookLock.ts treats as locked by default;
+  // an explicit unlock row keeps the ordinary merge for every case that does
+  // not set its own lock (the locked-book cases below replace this row).
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at, set_by) VALUES ('PSA', 0, 1, NULL)`).run();
   const db = makeDb(sqlite);
   return { sqlite, db, env: { DB: db } };
 }
@@ -2602,7 +2606,7 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
   // then read as both-changed and re-alerted that translator every night.
   const { env, sqlite } = freshEnv();
   sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
-  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
   sqlite
     .prepare(
       `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
@@ -2636,15 +2640,11 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
     )
     .run(BOOK);
 
-  const cutoff = await getMasterConfirmedAtForTest(env, BOOK, "ult");
-  eq(cutoff.bookLocked, true, "the lock is read into the ult cutoff");
-  eq((await getMasterConfirmedAtForTest(env, BOOK, "tn")).bookLocked, undefined, "…and not for a TSV resource, whose merge does not honor it yet");
-
   // Door43 restored a `\ts\*` marker; the words are unchanged.
   const masterJson = JSON.stringify({ verseObjects: [{ type: "text", text: "Again, call out" }, { tag: "ts\\*", nextChar: "\n" }] });
   const counts = await applyVerseRowsForTest(
     env, BOOK, VERSION, [{ chapter: 1, verse: 17, verseEnd: null, contentJson: masterJson, plainText: "Again, call out" }], null,
-    { ...cutoff, confirmedAt: 1000, editId: 0 }, false,
+    { confirmedAt: 1000, editId: 0 }, false,
   );
   eq(counts.merge_adopted, 1, "master's markers are adopted");
   eq(
@@ -2676,7 +2676,7 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
        VALUES (?, 2, 1, NULL, ?, ?, ?, 3, 1)`,
     )
     .run(BOOK, VERSION, contentJson("the fixed text"), "the fixed text");
-  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
   sqlite
     .prepare(
       `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
@@ -2691,7 +2691,7 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
     .run(`${BOOK}/2/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the fixed text")) }));
   const counts = await applyVerseRowsForTest(
     env, BOOK, VERSION, [verse(2, 1, "the published text")], null,
-    { confirmedAt: 1000, editId: 0, bookLocked: true }, false,
+    { confirmedAt: 1000, editId: 0 }, false,
   );
   eq(counts.merge_adopted, 0, "locked + master unchanged → nothing adopted");
   eq(
@@ -2750,7 +2750,7 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
        VALUES (?, 4, 1, NULL, ?, ?, ?, 3, 1)`,
     )
     .run(BOOK, VERSION, contentJson("the app edit"), "the app edit");
-  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
   sqlite
     .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('verse', ?, ?, 'baseline', ?, 500)`)
     .run(`${BOOK}/4/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the published text")) }));
@@ -2762,7 +2762,7 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
     .run(`${BOOK}/4/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the app edit")) }));
   const counts = await applyVerseRowsForTest(
     env, BOOK, VERSION, [verse(4, 1, "a Door43 rewording")], null,
-    { confirmedAt: 1000, editId: 0, bookLocked: true }, false,
+    { confirmedAt: 1000, editId: 0 }, false,
   );
   eq(counts.merge_adopted, 1, "locked + both moved → master adopted");
   const alertable = sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult");
@@ -2770,13 +2770,12 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
 }
 
 {
-  // The cutoff was read while locked, but the book was unlocked before this
-  // chunk read its rows: the re-read wins, so the ordinary merge runs. D1 is
-  // unmoved since the ancestor, so locked would say `book_locked` and
-  // unlocked says `master_only` — the reason tells the two apart.
+  // An explicit unlock row (locked=0) — e.g. unlocked minutes before this
+  // chunk — runs the ordinary merge. D1 is unmoved since the ancestor, so
+  // locked would say `book_locked` and unlocked says `master_only`.
   const { env, sqlite } = freshEnv();
   sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
-  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at, set_by) VALUES (?, 0, 100, 1)`).run(BOOK);
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 0, 100, 1)`).run(BOOK);
   sqlite
     .prepare(
       `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
@@ -2788,10 +2787,31 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
     .run(`${BOOK}/5/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("old text")) }));
   await applyVerseRowsForTest(
     env, BOOK, VERSION, [verse(5, 1, "door43 text")], null,
-    { confirmedAt: 1000, editId: 0, bookLocked: true }, false,
+    { confirmedAt: 1000, editId: 0 }, false,
   );
   const mc = sqlite.prepare("SELECT reason FROM verse_merge_conflicts WHERE book = ? AND chapter = 5").all(BOOK)[0];
-  eq(mc?.reason, "master_only", "a stale locked cutoff does not apply once the book is unlocked");
+  eq(mc?.reason, "master_only", "an unlocked book runs the ordinary merge");
+
+  // Same verse, now locked: the lock is read at apply time, so it applies.
+  sqlite.prepare(`UPDATE book_locks SET locked = 1 WHERE book = ?`).run(BOOK);
+  sqlite.prepare(`DELETE FROM verse_merge_conflicts`).run();
+  sqlite.prepare(`UPDATE verses SET content_json = ?, plain_text = 'old text' WHERE book = ? AND chapter = 5`).run(contentJson("old text"), BOOK);
+  await applyVerseRowsForTest(env, BOOK, VERSION, [verse(5, 1, "door43 text again")], null, { confirmedAt: 1000, editId: 0 }, false);
+  eq(
+    sqlite.prepare("SELECT reason FROM verse_merge_conflicts WHERE book = ? AND chapter = 5").all(BOOK)[0]?.reason,
+    "book_locked",
+    "a lock applied after the cutoff was read still applies",
+  );
+
+  // A failed lock read fails the apply rather than merging a locked book as unlocked.
+  sqlite.exec(`DROP TABLE book_locks`);
+  let threw = false;
+  try {
+    await applyVerseRowsForTest(env, BOOK, VERSION, [verse(5, 1, "door43 text third")], null, { confirmedAt: 1000, editId: 0 }, false);
+  } catch {
+    threw = true;
+  }
+  eq(threw, true, "a failed lock read throws (the Workflow step retries)");
 }
 
 if (failed > 0) {

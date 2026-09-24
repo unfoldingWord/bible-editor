@@ -4127,13 +4127,6 @@ interface MergeCutoff {
    * pass it to that helper. See masterLineage.ts.
    */
   lineage?: MasterLineageSummary | null;
-  /**
-   * The book is locked (bookLock.ts's effectiveBookLock), so Door43 master is
-   * authoritative for it: see VerseMergeInput.masterAuthoritative. Read only
-   * for ult/ust, the resources whose merge honors it today. ABSENT means
-   * unlocked, as does a failed lock read (the pre-existing behavior).
-   */
-  bookLocked?: boolean;
 }
 
 // Issue #788: stableKey intentionally treats whitespace-only content changes as
@@ -4230,38 +4223,11 @@ async function confirmedVerseBases(
   }
 }
 
-// A failed read answers "unlocked": the merge then runs exactly as it did
-// before locks were consulted, which is the fail direction that invents nothing.
-async function readBookLocked(env: Env, book: string): Promise<boolean> {
-  try {
-    return (await effectiveBookLock(env, book)) != null;
-  } catch (e) {
-    console.error("reimport: book lock read failed — merging as unlocked", {
-      book,
-      error: e instanceof Error ? e.message : String(e),
-    });
-    return false;
-  }
-}
-
-// Every path out of readMergeCutoff, the migration-lag fallbacks included,
-// carries the lock for ult/ust.
 async function getMasterConfirmedAt(
   env: Env,
   book: string,
   resource: string,
   includeConfirmedVerseBases: boolean = false,
-): Promise<MergeCutoff> {
-  const cutoff = await readMergeCutoff(env, book, resource, includeConfirmedVerseBases);
-  if (resource === "ult" || resource === "ust") cutoff.bookLocked = await readBookLocked(env, book);
-  return cutoff;
-}
-
-async function readMergeCutoff(
-  env: Env,
-  book: string,
-  resource: string,
-  includeConfirmedVerseBases: boolean,
 ): Promise<MergeCutoff> {
   try {
     const row = await env.DB.prepare(
@@ -6129,11 +6095,13 @@ async function applyVerseRows(
   const resource = bibleVersion.toLowerCase();
   const lastExportAt = cutoff?.confirmedAt ?? null;
   // Door43 master is authoritative for a locked book (verseMerge.ts step 3b).
-  // Re-read here, just before the row read below, when the cutoff says
-  // locked: the cutoff may be minutes old in the chunked nightly, and an
-  // unlock in between re-opens app edits this run must not treat as frozen.
-  // An edit after the row read is caught by the adoption's version CAS.
-  const bookLocked = cutoff?.bookLocked === true && (await readBookLocked(env, book));
+  // Read here, just before the row read below, not carried on the cutoff: the
+  // cutoff can be minutes old in the chunked nightly, and a lock or unlock in
+  // between must be honored. An app edit after the row read is caught by the
+  // adoption's version CAS. Not caught: a failed read fails this apply like
+  // the row read would, so the Workflow step retries instead of the run
+  // quietly merging a locked book as unlocked and stamping the watermark.
+  const bookLocked = lastExportAt != null && (await effectiveBookLock(env, book)) != null;
   // P1.3: precise id boundary when present; both sub-selects swap to it together.
   const masterEditId = cutoff?.editId ?? null;
 
