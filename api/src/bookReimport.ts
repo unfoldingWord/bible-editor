@@ -181,6 +181,7 @@ import {
   verseVersionFloorSql,
 } from "./verseBridge.ts";
 import { isAboveBoundary, planStructure, structureKey, type StructureAdoption, type StructuralEdit } from "./verseStructure.ts";
+import { effectiveBookLock } from "./bookLock.ts";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
 
@@ -6093,6 +6094,14 @@ async function applyVerseRows(
   // pre-fix "no watermark row" behavior, never treated as "nothing changed".
   const resource = bibleVersion.toLowerCase();
   const lastExportAt = cutoff?.confirmedAt ?? null;
+  // Door43 master is authoritative for a locked book (verseMerge.ts step 3b).
+  // Read here, just before the row read below, not carried on the cutoff: the
+  // cutoff can be minutes old in the chunked nightly, and a lock or unlock in
+  // between must be honored. An app edit after the row read is caught by the
+  // adoption's version CAS. Not caught: a failed read fails this apply like
+  // the row read would, so the Workflow step retries instead of the run
+  // quietly merging a locked book as unlocked and stamping the watermark.
+  const bookLocked = lastExportAt != null && (await effectiveBookLock(env, book)) != null;
   // P1.3: precise id boundary when present; both sub-selects swap to it together.
   const masterEditId = cutoff?.editId ?? null;
 
@@ -6662,6 +6671,7 @@ async function applyVerseRows(
           ),
           // Issue #728: set only for the anchor of a bridge master has split.
           theirsForAlignment: structureAlignmentTheirs.get(structureKey(v.chapter, v.verse)),
+          masterAuthoritative: bookLocked,
         });
         mergeAction = merge.action;
         // Issue #728: an anchor the content merge did NOT adopt — step 7s decides
@@ -7777,8 +7787,18 @@ async function applyVerseRows(
   // structure_absorbed_human_edit pointer is an adopt_conflict like any other:
   // left unconfirmed, a previously resolved row on that verse kept its stale
   // resolved_at and the banner (resolved_at IS NULL) never showed the pointer.
+  //
+  // Only THIS run's own adopt_conflict (after the 6a refinement) may reactivate
+  // a resolved row, because only it is a new overwrite a human must look at.
+  // The upsert keeps a stored adopt_conflict's action when tonight's outcome is
+  // a clean adopt or adopt_no_visible_change, so confirming those reactivated a
+  // row a human had already resolved, with its old recovery pointer, and
+  // re-raised the alert every night Door43 touched the verse again: a locked
+  // book's `book_locked` adoptions, and markers-only changes such as restored
+  // `\ts\*` (ZEC 1:17 ULT, 2026-09-24). A new row needs no confirm; it is
+  // inserted unresolved.
   const confirmRefs = mergeConflicts
-    .filter((mc) => mc.adopted && adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
+    .filter((mc) => mc.adopted && mc.action === "adopt_conflict" && adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
     .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
   if (confirmRefs.length > 0) {
     await confirmAdoptedConflicts(env, book, resource, confirmRefs);

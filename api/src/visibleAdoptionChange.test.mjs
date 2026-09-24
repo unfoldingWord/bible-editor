@@ -175,6 +175,39 @@ function reason(ours, theirs) {
 }
 
 {
+  // ZEC 1:17 ULT, 2026-09-24: Rich restored `\ts\*` on Door43, which usfm-js
+  // parses as a bare `{tag, nextChar}` with no `type`. The words, punctuation
+  // and alignment were untouched, yet the editor alert said all three changed.
+  const ours = verse(word("Again", { strong: "H5750", content: "עוֹד" }), { type: "text", text: ".”\n\n" });
+  const theirs = verse(
+    word("Again", { strong: "H5750", content: "עוֹד" }),
+    { type: "text", text: ".”\n\n" },
+    { tag: "ts\\*", nextChar: "\n" },
+    { tag: "p", nextChar: "\n", type: "paragraph" },
+  );
+  assert.deepEqual(
+    classifyVisibleAdoptionChange(ours, theirs),
+    { wordingChanged: false, punctuationChanged: false, alignmentChanged: false },
+    "a restored \\ts\\* marker is not a visible change",
+  );
+  assert.equal(reason(ours, theirs).action, ACTION_ADOPT_NO_VISIBLE_CHANGE, "…so it raises no editor alert");
+
+  const reworded = verse(word("Once more", { strong: "H5750", content: "עוֹד" }), { type: "text", text: ".”\n\n" }, { tag: "ts\\*", nextChar: "\n" });
+  assert.equal(classifyVisibleAdoptionChange(ours, reworded).wordingChanged, true, "a real wording change beside the marker is still reported");
+
+  assert.deepEqual(
+    classifyVisibleAdoptionChange(ours, verse({ tag: "ts\\*", value: "x" })),
+    { wordingChanged: true, punctuationChanged: true, alignmentChanged: true },
+    "a tag-only node carrying any other key still fails closed",
+  );
+  assert.deepEqual(
+    classifyVisibleAdoptionChange(ours, verse({ type: "text", text: "Again." }, { tag: "f", nextChar: " " })),
+    { wordingChanged: true, punctuationChanged: true, alignmentChanged: true },
+    "a type-less tag that is not self-closing still fails closed",
+  );
+}
+
+{
   const refined = refineAdoptConflictForVisibleChange("adopt", "master_changed", "{}", "{}");
   assert.equal(refined.action, "adopt", "non-conflict actions pass through untouched");
   assert.equal(refined.reason, "master_changed");

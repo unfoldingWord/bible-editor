@@ -76,6 +76,10 @@ function freshEnv() {
   for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
     sqlite.exec(readFileSync(join(dir, f), "utf8"));
   }
+  // PSA is a published book, which bookLock.ts treats as locked by default;
+  // an explicit unlock row keeps the ordinary merge for every case that does
+  // not set its own lock (the locked-book cases below replace this row).
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at, set_by) VALUES ('PSA', 0, 1, NULL)`).run();
   const db = makeDb(sqlite);
   return { sqlite, db, env: { DB: db } };
 }
@@ -2594,6 +2598,221 @@ console.log("\n[#641: no source-attr reconcile when master has not moved since o
   }
 }
 
+
+console.log("\n[locked book: Door43 master is authoritative, and a resolved flag stays resolved]");
+{
+  // ZEC 1:17 ULT, 2026-09-24. The book was locked, so the export skipped it and
+  // the ancestor froze before the translator's last app edit; each Door43 commit
+  // then read as both-changed and re-alerted that translator every night.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 1, 17, NULL, ?, ?, ?, 8, 1)`,
+    )
+    .run(BOOK, VERSION, contentJson("Again, call out"), "Again, call out");
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 'baseline', ?, 500)`,
+    )
+    .run(`${BOOK}/1/17/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("“Again, call out")) }));
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 1, 6, 7, 'update', ?, 1500)`,
+    )
+    .run(`${BOOK}/1/17/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("Again, call out")) }));
+  // Night 2: D1's newest version is the sync's own copy of master (v8).
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at, source)
+       VALUES ('verse', ?, ?, NULL, 7, 8, 'update', ?, 1550, 'dcs_reimport')`,
+    )
+    .run(`${BOOK}/1/17/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("Again, call out")) }));
+  // An earlier night's flag a human already resolved.
+  sqlite
+    .prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by)
+       VALUES (?, 'ult', 1, 17, 'adopt_conflict', 'both_changed_wording_punctuation_alignment', 7, 900, 1600, 1)`,
+    )
+    .run(BOOK);
+
+  // Door43 restored a `\ts\*` marker; the words are unchanged.
+  const masterJson = JSON.stringify({ verseObjects: [{ type: "text", text: "Again, call out" }, { tag: "ts\\*", nextChar: "\n" }] });
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [{ chapter: 1, verse: 17, verseEnd: null, contentJson: masterJson, plainText: "Again, call out" }], null,
+    { confirmedAt: 1000, editId: 0 }, false,
+  );
+  eq(counts.merge_adopted, 1, "master's markers are adopted");
+  eq(
+    sqlite.prepare("SELECT content_json FROM verses WHERE book = ? AND chapter = 1 AND verse = 17").all(BOOK)[0].content_json,
+    masterJson,
+    "…and are what D1 now holds",
+  );
+  const row = sqlite
+    .prepare("SELECT action, resolved_at, overwritten_version FROM verse_merge_conflicts WHERE book = ? AND chapter = 1 AND verse = 17")
+    .all(BOOK)[0];
+  eq(row.resolved_at, 1600, "the resolved flag is NOT reactivated by a locked-book adoption");
+  eq(row.overwritten_version, 7, "…and keeps its recovery pointer");
+  eq(
+    sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult").length,
+    0,
+    "nothing is left to alert on",
+  );
+}
+
+{
+  // Locked, but master never moved this verse since the ancestor: the app's
+  // unpushed fix (unlock -> fix -> re-lock -> lock/push to a review branch)
+  // must survive a Door43 commit elsewhere in the book.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 2, 1, NULL, ?, ?, ?, 3, 1)`,
+    )
+    .run(BOOK, VERSION, contentJson("the fixed text"), "the fixed text");
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 'baseline', ?, 500)`,
+    )
+    .run(`${BOOK}/2/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the published text")) }));
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 1, 2, 3, 'update', ?, 1500)`,
+    )
+    .run(`${BOOK}/2/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the fixed text")) }));
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(2, 1, "the published text")], null,
+    { confirmedAt: 1000, editId: 0 }, false,
+  );
+  eq(counts.merge_adopted, 0, "locked + master unchanged → nothing adopted");
+  eq(
+    sqlite.prepare("SELECT plain_text FROM verses WHERE book = ? AND chapter = 2 AND verse = 1").all(BOOK)[0].plain_text,
+    "the fixed text",
+    "…the app's fix is kept",
+  );
+}
+
+
+{
+  // Unlocked book, same shape: a resolved flag, then a markers-only Door43
+  // change (restored `\ts\*`). The outcome refines to adopt_no_visible_change,
+  // which must not reactivate the resolved row and its stale pointer.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 3, 1, NULL, ?, ?, ?, 8, 1)`,
+    )
+    .run(BOOK, VERSION, contentJson("Again, call out"), "Again, call out");
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('verse', ?, ?, 'baseline', ?, 500)`)
+    .run(`${BOOK}/3/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("“Again, call out")) }));
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 1, 7, 8, 'update', ?, 1500)`,
+    )
+    .run(`${BOOK}/3/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("Again, call out")) }));
+  sqlite
+    .prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by)
+       VALUES (?, 'ult', 3, 1, 'adopt_conflict', 'both_changed_wording_punctuation_alignment', 7, 900, 1600, 1)`,
+    )
+    .run(BOOK);
+  const masterJson = JSON.stringify({ verseObjects: [{ type: "text", text: "Again, call out" }, { tag: "ts\\*", nextChar: "\n" }] });
+  await applyVerseRowsForTest(
+    env, BOOK, VERSION, [{ chapter: 3, verse: 1, verseEnd: null, contentJson: masterJson, plainText: "Again, call out" }], null,
+    { confirmedAt: 1000, editId: 0 }, false,
+  );
+  const row = sqlite.prepare("SELECT resolved_at FROM verse_merge_conflicts WHERE book = ? AND chapter = 3 AND verse = 1").all(BOOK)[0];
+  eq(row.resolved_at, 1600, "unlocked: a markers-only adoption does not reactivate a resolved flag");
+}
+
+{
+  // Locked, but D1's newest version is a human app edit master may never have
+  // received, and Door43 changed the wording: master still wins, but this is a
+  // data-loss-type overwrite, so the editor IS alerted.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 4, 1, NULL, ?, ?, ?, 3, 1)`,
+    )
+    .run(BOOK, VERSION, contentJson("the app edit"), "the app edit");
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('verse', ?, ?, 'baseline', ?, 500)`)
+    .run(`${BOOK}/4/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the published text")) }));
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 1, 2, 3, 'update', ?, 1500)`,
+    )
+    .run(`${BOOK}/4/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the app edit")) }));
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(4, 1, "a Door43 rewording")], null,
+    { confirmedAt: 1000, editId: 0 }, false,
+  );
+  eq(counts.merge_adopted, 1, "locked + both moved → master adopted");
+  const alertable = sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult");
+  eq(alertable.map((r) => [r.action, r.overwritten_version]), [["adopt_conflict", 3]], "…and the editor is alerted, pointing at their version");
+}
+
+{
+  // An explicit unlock row (locked=0) — e.g. unlocked minutes before this
+  // chunk — runs the ordinary merge. D1 is unmoved since the ancestor, so
+  // locked would say `book_locked` and unlocked says `master_only`.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 0, 100, 1)`).run(BOOK);
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 5, 1, NULL, ?, ?, ?, 3, 1)`,
+    )
+    .run(BOOK, VERSION, contentJson("old text"), "old text");
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('verse', ?, ?, 'baseline', ?, 500)`)
+    .run(`${BOOK}/5/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("old text")) }));
+  await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(5, 1, "door43 text")], null,
+    { confirmedAt: 1000, editId: 0 }, false,
+  );
+  const mc = sqlite.prepare("SELECT reason FROM verse_merge_conflicts WHERE book = ? AND chapter = 5").all(BOOK)[0];
+  eq(mc?.reason, "master_only", "an unlocked book runs the ordinary merge");
+
+  // Same verse, now locked: the lock is read at apply time, so it applies.
+  sqlite.prepare(`UPDATE book_locks SET locked = 1 WHERE book = ?`).run(BOOK);
+  sqlite.prepare(`DELETE FROM verse_merge_conflicts`).run();
+  sqlite.prepare(`UPDATE verses SET content_json = ?, plain_text = 'old text' WHERE book = ? AND chapter = 5`).run(contentJson("old text"), BOOK);
+  await applyVerseRowsForTest(env, BOOK, VERSION, [verse(5, 1, "door43 text again")], null, { confirmedAt: 1000, editId: 0 }, false);
+  eq(
+    sqlite.prepare("SELECT reason FROM verse_merge_conflicts WHERE book = ? AND chapter = 5").all(BOOK)[0]?.reason,
+    "book_locked",
+    "a lock applied after the cutoff was read still applies",
+  );
+
+  // A failed lock read fails the apply rather than merging a locked book as unlocked.
+  sqlite.exec(`DROP TABLE book_locks`);
+  let threw = false;
+  try {
+    await applyVerseRowsForTest(env, BOOK, VERSION, [verse(5, 1, "door43 text third")], null, { confirmedAt: 1000, editId: 0 }, false);
+  } catch {
+    threw = true;
+  }
+  eq(threw, true, "a failed lock read throws (the Workflow step retries)");
+}
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);

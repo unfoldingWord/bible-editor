@@ -71,6 +71,19 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **A locked book freezes the merge ancestor, so Door43 is authoritative for it — and a markers-only overwrite
+  is logged, never alerted.** Measured 2026-09-24 (ZEC 1:17 ULT, Rich): the book was locked on 09-17, so the
+  export skipped it nightly, `master_confirmed_at` never advanced, and every Door43 commit read as "both changed"
+  against the last pre-lock app edit. The alert also said "wording, punctuation, and alignment changed" because
+  `visibleAdoptionChange.ts` failed closed on usfm-js's type-less `{tag:"ts\\*"}` node; the words were identical
+  and only `\p`/`\ts\*` markers had arrived. Of 228 open review rows prod-wide that day, 181 were false by the
+  same test and were resolved. Benjamin's rulings: a locked book accepts Door43 edits as authoritative ("the
+  lock is to prevent problems from the BE side"), but only on verses master actually moved since the ancestor
+  (`verseMerge.ts` step 3b), so an unlock → fix → re-lock → `lock/push` fix still in review is not reverted; and
+  a markers-only overwrite is a real overwrite worth seeing in history (#951) but not a data-loss alert. Only a
+  run's own `adopt_conflict` may reactivate a resolved flag. Open: structure paths (#949) and tn/tq/twl (#950)
+  do not honor the lock yet.
+
 - **D1 allows at most 5 terms in a compound SELECT (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`); node:sqlite allows
   500.** A 6-term `UNION ALL` fails on local workerd and remote D1 with `too many terms in compound SELECT`
   (measured 2026-09-23). SQL that passes a node:sqlite unit test can therefore be rejected on every prod run: the
