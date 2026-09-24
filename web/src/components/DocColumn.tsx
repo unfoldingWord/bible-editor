@@ -16,7 +16,7 @@ import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { FindMatch } from "./FindReplaceOverlay";
-import { formatVerseLabel, isFirstOfRange, isRangeRow, sourceForTargetRow } from "../lib/verseRange";
+import { formatVerseLabel, isFirstOfRange, isRangeRow, sourceForTargetRow, spanOccurrence } from "../lib/verseRange";
 import { VerseBridgeButtons } from "./VerseBridgeButtons";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -259,17 +259,21 @@ export function DocColumn({
           // mis-join a v12 ULT highlight.
           const rowSourceContent = sourceForTargetRow(sourceByVerseNum, dto)?.content;
           const sourceContent = rowSourceContent ?? activeSourceContent;
+          // Note occurrences count within the note's own verse; a bridged row
+          // numbers source words across its span, so re-count (#957).
+          const ro = reorderHighlight;
+          const aVerse = ro?.movedQuote ? ro.movedVerse : activeNoteCoveredVerses?.[0];
           const highlights = paintQuote
-            ? highlightsFor(bibleVersion, dto.content, aQuote, aOcc, sourceContent, partial)
+            ? highlightsFor(bibleVersion, dto.content, aQuote, spanOccurrence(sourceByVerseNum, dto, aVerse, aQuote, aOcc), sourceContent, partial)
             : null;
           // Reorder stoplight neighbour sets (active verse only, while live).
           const prevHighlights =
             isActive && reorderHighlight?.prevQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, sourceContent)
+              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, spanOccurrence(sourceByVerseNum, dto, reorderHighlight.prevVerse, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence), sourceContent)
               : null;
           const nextHighlights =
             isActive && reorderHighlight?.nextQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, sourceContent)
+              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, spanOccurrence(sourceByVerseNum, dto, reorderHighlight.nextVerse, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence), sourceContent)
               : null;
           // Lift any \s1/\s2/\s3 section headers in this verse's content
           // into block-level bands rendered AFTER the inline verse span

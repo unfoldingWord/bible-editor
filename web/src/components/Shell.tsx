@@ -1671,12 +1671,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // quote the highlight path resolves against the source and maps through the
     // alignment — so one lookup serves both. Ids are unique per book across
     // kinds, so checking tn first and falling through to twl can't collide.
-    const find = (id: string | null): { quote: string | null; occurrence: number | null } | null => {
+    const find = (id: string | null): { quote: string | null; occurrence: number | null; verse: number } | null => {
       if (!id) return null;
       const note = data.tn.find((r) => r.id === id);
-      if (note) return { quote: note.quote, occurrence: note.occurrence };
+      if (note) return { quote: note.quote, occurrence: note.occurrence, verse: note.verse };
       const word = data.twl.find((r) => r.id === id);
-      if (word) return { quote: word.orig_words, occurrence: word.occurrence };
+      if (word) return { quote: word.orig_words, occurrence: word.occurrence, verse: word.verse };
       return null;
     };
     const moved = find(reorderPreview.movedId);
@@ -1690,6 +1690,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       prevOccurrence: prev?.occurrence ?? null,
       nextQuote: next?.quote ?? null,
       nextOccurrence: next?.occurrence ?? null,
+      movedVerse: moved?.verse ?? null,
+      prevVerse: prev?.verse ?? null,
+      nextVerse: next?.verse ?? null,
     };
   }, [data, reorderPreview]);
 

@@ -13,6 +13,7 @@
 // reading `verses[bv][n]` directly.
 
 import type { VerseDto } from "../sync/api";
+import { countQuoteMatches } from "./highlight.ts";
 
 export type VerseSpan = readonly [start: number, end: number];
 
@@ -195,6 +196,28 @@ export function sourceForTargetRow(
   if (!target) return null;
   const [start, end] = verseSpan(target);
   return concatSourceRange(sourceByVerseStart, start, end);
+}
+
+// A note's occurrence, re-counted for a bridged target row's joined source.
+// TN/TWL occurrences count within the note's own verse, but a bridge's
+// `\zaln-s` x-occurrence numbers source words across the whole span (the
+// aligner counts over concatSourceRange, and Door43 bridges do the same), so a
+// note on verse N of a bridge starting at S skips the quote's matches in
+// S..N-1. Returns the occurrence unchanged for singletons, a note on the span's
+// first verse, or occurrence -1 ("all").
+export function spanOccurrence(
+  sourceByVerseStart: Record<number, VerseDto> | undefined,
+  target: VerseDto | null | undefined,
+  noteVerse: number | null | undefined,
+  quote: string | null | undefined,
+  occurrence: number | null | undefined,
+): number | null | undefined {
+  if (!target || !quote || occurrence == null || occurrence < 1 || noteVerse == null) return occurrence;
+  const [start, end] = verseSpan(target);
+  if (noteVerse <= start || noteVerse > end) return occurrence;
+  const before = concatSourceRange(sourceByVerseStart, start, noteVerse - 1);
+  const vo = (before?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  return Array.isArray(vo) ? occurrence + countQuoteMatches(vo, quote) : occurrence;
 }
 
 function buildSourceRange(

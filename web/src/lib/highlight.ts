@@ -527,6 +527,11 @@ export interface ReorderHighlight {
   prevOccurrence: number | null;
   nextQuote: string | null;
   nextOccurrence: number | null;
+  // Each row's own verse: its occurrence counts within that verse, so a bridged
+  // target row re-counts it over the joined source (spanOccurrence, #957).
+  movedVerse?: number | null;
+  prevVerse?: number | null;
+  nextVerse?: number | null;
 }
 
 // Per-token role sets handed to the renderers alongside the active highlight
@@ -793,6 +798,32 @@ export function extractTargetSelectionText(
   return words.join(" ");
 }
 
+// Every match of `quote` in a source verse, in document order, as indexes into
+// its bare-word tokens. One match per start position — the same list
+// matchSourceTokens picks its occurrence from.
+function sourceQuoteMatches(
+  verseObjects: unknown[],
+  quote: string,
+): { tokens: WordToken[]; matches: number[][] } {
+  const groups = quoteGroups(quote);
+  const tokens = collectBareWords(verseObjects);
+  const matches: number[][] = [];
+  if (groups.length === 0 || tokens.length === 0) return { tokens, matches };
+  const normGroups = groups.map((g) => g.map(matchNorm));
+  const normTokens = tokens.map((t) => matchNorm(t.text));
+  for (let start = 0; start < tokens.length; start++) {
+    const m = matchGroupsAt(start, normGroups, normTokens);
+    if (m) matches.push(m);
+  }
+  return { tokens, matches };
+}
+
+// How many times `quote` occurs in a source verse (or joined span). Used to
+// shift a note's per-verse occurrence onto a bridged row's whole-span source.
+export function countQuoteMatches(verseObjects: unknown[], quote: string): number {
+  return sourceQuoteMatches(verseObjects, quote).matches.length;
+}
+
 // Resolve a quote + occurrence against the source/original verse words, in
 // SOURCE document order (where the quote IS contiguous and ordered, and gap
 // markers mark the real discontinuities). Returns the matched bare-word tokens
@@ -804,21 +835,11 @@ export function matchSourceTokens(
   quote: string,
   occurrence: number,
 ): WordToken[] {
-  const groups = quoteGroups(quote);
-  const tokens = collectBareWords(verseObjects);
-  if (groups.length === 0 || tokens.length === 0) return [];
+  const { tokens, matches } = sourceQuoteMatches(verseObjects, quote);
+  if (matches.length === 0) return [];
   // `occurrence: -1` means "every occurrence of the quote" (TSV spec).
   const allOcc = (occurrence | 0) === -1;
   const wantOcc = Math.max(1, occurrence | 0);
-
-  const normGroups = groups.map((g) => g.map(matchNorm));
-  const normTokens = tokens.map((t) => matchNorm(t.text));
-
-  const matches: number[][] = [];
-  for (let start = 0; start < tokens.length; start++) {
-    const m = matchGroupsAt(start, normGroups, normTokens);
-    if (m) matches.push(m);
-  }
 
   if (allOcc) {
     // Union of every match, de-duped, in document order.

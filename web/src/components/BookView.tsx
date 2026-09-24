@@ -33,7 +33,7 @@ import type { FindMatch } from "./FindReplaceOverlay";
 import type { FindQuery } from "./ScriptureColumn";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
-import { formatVerseLabel, isRangeRow, sourceForTargetRow } from "../lib/verseRange";
+import { formatVerseLabel, isRangeRow, sourceForTargetRow, spanOccurrence } from "../lib/verseRange";
 import { directionForVersion } from "../lib/direction";
 import {
   classifySourceQuery,
@@ -748,6 +748,7 @@ const ChapterBlock = memo(function ChapterBlock({
               isActive || coverHighlight ? activeNoteOccurrence : null
             }
             activeNoteQuotePartialGroups={coverHighlight}
+            activeNoteVerse={isActive || coverHighlight ? activeNoteCoveredVerses?.[0] ?? null : null}
             reorderHighlight={isActive ? reorderHighlight : null}
             activeSourceContent={isActive ? activeSourceContent : undefined}
             rowRef={isActive ? activeRowRef : null}
@@ -788,6 +789,7 @@ const VerseRow = memo(function VerseRow({
   activeNoteQuote,
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
+  activeNoteVerse,
   reorderHighlight,
   activeSourceContent,
   rowRef,
@@ -821,6 +823,8 @@ const VerseRow = memo(function VerseRow({
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   activeNoteQuotePartialGroups?: boolean;
+  // The active note's own verse; its occurrence counts within that verse.
+  activeNoteVerse?: number | null;
   reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   rowRef: React.MutableRefObject<HTMLDivElement | null> | null;
@@ -856,6 +860,9 @@ const VerseRow = memo(function VerseRow({
   // Verse-level comment badge lives on a single column: ULT, or the leftmost
   // enabled version when ULT is hidden — so it doesn't repeat across columns.
   const commentColumn = enabledVersions.includes("ULT") ? "ULT" : enabledVersions[0];
+  // The source (UHB or UGNT) that actually has this verse — a bridged target
+  // row joins it across its span (#957).
+  const sourceByVerse = versesByVersion["UHB"]?.[verseNum] ? versesByVersion["UHB"] : versesByVersion["UGNT"];
   return (
     <Fragment>
       {enabledVersions.map((bv, colIdx) => {
@@ -900,16 +907,14 @@ const VerseRow = memo(function VerseRow({
               bibleVersion={bv}
               dto={dto}
               prevDto={prevDto}
-              sourceContent={
-                dto
-                  ? sourceForTargetRow(versesByVersion["UHB"] ?? versesByVersion["UGNT"], dto)?.content
-                  : versesByVersion["UHB"]?.[verseNum]?.content ?? versesByVersion["UGNT"]?.[verseNum]?.content
-              }
+              sourceContent={dto ? sourceForTargetRow(sourceByVerse, dto)?.content : sourceByVerse?.[verseNum]?.content}
+              sourceByVerse={sourceByVerse}
               isActive={isActive}
               bridgeActive={bridgeActive}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
               activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
+              activeNoteVerse={activeNoteVerse}
               reorderHighlight={reorderHighlight}
               activeSourceContent={activeSourceContent}
               search={search}
@@ -945,11 +950,13 @@ const VerseCell = memo(function VerseCell({
   dto,
   prevDto,
   sourceContent,
+  sourceByVerse,
   isActive,
   bridgeActive,
   activeNoteQuote,
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
+  activeNoteVerse,
   reorderHighlight,
   activeSourceContent,
   search,
@@ -982,6 +989,9 @@ const VerseCell = memo(function VerseCell({
   // The matching UHB/UGNT verse content_json so the align button flags a
   // broken link when a source word lacks a target. Absent on source columns.
   sourceContent?: unknown;
+  // The per-verse source map sourceContent came from; re-counts a note's
+  // occurrence over a bridged row's span (spanOccurrence, #957).
+  sourceByVerse?: Record<number, VerseDto>;
   isActive: boolean;
   // Range-aware active for the bridge buttons (see VerseRow) — the active verse
   // is inside this bridge's span, not necessarily its start row.
@@ -989,6 +999,8 @@ const VerseCell = memo(function VerseCell({
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   activeNoteQuotePartialGroups?: boolean;
+  // The active note's own verse; its occurrence counts within that verse.
+  activeNoteVerse?: number | null;
   reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   search: SearchState | null;
@@ -1153,13 +1165,16 @@ const VerseCell = memo(function VerseCell({
     if (!paint) return null;
     const partial = !reorderHighlight?.movedQuote && activeNoteQuotePartialGroups;
     const ol = sourceContent ?? activeSourceContent;
-    return highlightsFor(bibleVersion, dto.content, aQuote, aOcc, ol, partial);
+    const aVerse = reorderHighlight?.movedQuote ? reorderHighlight.movedVerse : activeNoteVerse;
+    return highlightsFor(bibleVersion, dto.content, aQuote, spanOccurrence(sourceByVerse, dto, aVerse, aQuote, aOcc), ol, partial);
   }, [
     findHTML,
     isActive,
     activeNoteQuote,
     activeNoteOccurrence,
     activeNoteQuotePartialGroups,
+    activeNoteVerse,
+    sourceByVerse,
     reorderHighlight,
     bibleVersion,
     dto?.content,
@@ -1171,12 +1186,14 @@ const VerseCell = memo(function VerseCell({
   // verse only and only while a drag / recent arrow-move is live.
   const prevHighlights = useMemo<Set<HighlightKey> | null>(() => {
     if (findHTML || !isActive || !reorderHighlight?.prevQuote || !dto?.content) return null;
-    return highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, activeSourceContent);
-  }, [findHTML, isActive, reorderHighlight, bibleVersion, dto?.content, activeSourceContent]);
+    const occ = spanOccurrence(sourceByVerse, dto, reorderHighlight.prevVerse, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence);
+    return highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, occ, sourceContent ?? activeSourceContent);
+  }, [findHTML, isActive, reorderHighlight, bibleVersion, dto, sourceByVerse, sourceContent, activeSourceContent]);
   const nextHighlights = useMemo<Set<HighlightKey> | null>(() => {
     if (findHTML || !isActive || !reorderHighlight?.nextQuote || !dto?.content) return null;
-    return highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, activeSourceContent);
-  }, [findHTML, isActive, reorderHighlight, bibleVersion, dto?.content, activeSourceContent]);
+    const occ = spanOccurrence(sourceByVerse, dto, reorderHighlight.nextVerse, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence);
+    return highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, occ, sourceContent ?? activeSourceContent);
+  }, [findHTML, isActive, reorderHighlight, bibleVersion, dto, sourceByVerse, sourceContent, activeSourceContent]);
   const roles = useMemo(() => {
     if (!prevHighlights?.size && !nextHighlights?.size) return undefined;
     return { prev: prevHighlights, next: nextHighlights };
