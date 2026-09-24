@@ -31,7 +31,7 @@ import {
 } from "./highlight.ts";
 import { shortSupport } from "./supportReference.ts";
 import { extractPlainText } from "./usfm.ts";
-import { buildVerseIndex } from "./verseRange.ts";
+import { buildVerseIndex, noteCoveredVerses } from "./verseRange.ts";
 
 const CONTEXT_WINDOW = 5;
 const HEBREW_GAP = /[&…]+|\.{3}/g;
@@ -187,9 +187,14 @@ export function buildTnQuickRequest(
   // The bp-assistant validator compares hebrewGuess to the UHB byte-for-byte
   // (no NFC), so an NFC-ordered word would be silently dropped. Rewrite each
   // word to the UHB's exact bytes (issue #959). Request-only: nothing stored
-  // changes. No UHB words (NT book) → canonizeQuote returns it unchanged.
+  // changes. No UHB words (NT book) → canonizeQuote returns it unchanged. The
+  // validator checks the leading verse only, so a bridged row matches that
+  // verse on the exact tier alone (strict): a consonant-only match could turn
+  // a later verse's word into a leading-verse look-alike.
   const uhbVo = verseObjectsOf(buildVerseIndex(data.verses.UHB)[row.verse]);
-  hebrewGuess = canonizeQuote(hebrewGuess, uhbVo ? sourceWordsOf(uhbVo) : []);
+  hebrewGuess = canonizeQuote(hebrewGuess, uhbVo ? sourceWordsOf(uhbVo) : [], {
+    strict: noteCoveredVerses(row).length > 1,
+  });
 
   const ultCtx = gatherContext(ultByVerse, row.verse);
   const ustCtx = gatherContext(ustByVerse, row.verse);

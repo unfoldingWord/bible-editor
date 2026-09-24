@@ -113,6 +113,17 @@ assert(ASHER !== ASHER.normalize("NFC"), "fixture: UHB asher differs from its NF
   assert(canonizeQuote(bare, [pair[0]]) === KOH, "case 3b: one candidate → adopted");
 }
 
+// (3c) A quote repeating a word the verse has once: the extra copy is already
+// byte-identical to UHB, so it is kept, not moved to a same-consonant look-alike.
+{
+  const kah = "\u05db\u05b8\u05d4"; // same consonants as koh, other pointing
+  const verse = [
+    { text: KOH, strong: "H3541", lemma: "", morph: "" },
+    { text: kah, strong: "H3541", lemma: "", morph: "" },
+  ];
+  assert(canonizeQuote(`${KOH} ${KOH}`, verse) === `${KOH} ${KOH}`, "case 3c: repeated byte-identical word kept");
+}
+
 // (4) buildTnQuickRequest sends hebrewGuess in UHB bytes on both paths.
 {
   const nfcKoh = KOH.normalize("NFC");
@@ -150,6 +161,13 @@ assert(ASHER !== ASHER.normalize("NFC"), "fixture: UHB asher differs from its NF
     eng.ok && eng.request.hebrewGuess === KOH,
     `case 4: English-mode hebrewGuess is UHB bytes (got ${eng.ok ? hex(eng.request.hebrewGuess) : eng.error.reason})`,
   );
+
+  // Bridged row: exact tier only, so a consonant-only token is not rewritten.
+  const bare = "\u05db\u05d4";
+  const bridged = buildTnQuickRequest({ ...row, ref_raw: "29:4-5", quote: bare }, data);
+  assert(bridged.ok && bridged.request.hebrewGuess === bare, "case 4: bridged row → strict, consonant-only token unchanged");
+  const single = buildTnQuickRequest({ ...row, ref_raw: "29:4", quote: bare }, data);
+  assert(single.ok && single.request.hebrewGuess === KOH, "case 4: single-verse row → consonant-only token adopts UHB koh");
 
   // No UHB verse (NT book): hebrewGuess passes through untouched.
   const noUhb = buildTnQuickRequest({ ...row, quote: `${nfcKoh} ${AMAR}` }, {

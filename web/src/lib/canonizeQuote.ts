@@ -1,4 +1,6 @@
-// Mirror of api/src/canonizeHebrew.ts canonizeQuote — keep behavior in sync.
+// Mirror of api/src/canonizeHebrew.ts canonizeQuote — keep behavior in sync,
+// including the fail-closed look-alike rules (byte-identical kept, ambiguous
+// tier left as-is) that both copies carry since #959.
 //
 // Rewrites each word of a TN quote to the UHB's exact bytes. The quick note
 // writer needs this at send time: the bp-assistant validator behind
@@ -12,11 +14,14 @@
 //   1. exact      — NFC + joiners removed (only combining-mark ORDER differs)
 //   2. stripped   — vowel points / cantillation removed (consonants + order)
 //   3. wordJoiner — stripped, then U+2060 removed (quotes routinely drop it)
-// A matched UHB word is CONSUMED (found flag) so a second token can't claim it.
-// A word already byte-identical to a UHB word is kept. A tier whose unused
-// candidates have more than one distinct surface is AMBIGUOUS: the word is
-// left as-is and looser tiers are not tried.
-// An unmatched token is LEFT AS-IS — the transform never guesses.
+// A word already byte-identical to a UHB word is kept. Otherwise a tier hit is
+// adopted only when every UHB word in that bucket has ONE surface; two distinct
+// surfaces are AMBIGUOUS and the word is left as-is (no looser tier is tried).
+// This is decided per word, independent of the quote's other words, so word
+// order cannot change the outcome. Picking one of two look-alikes would move a
+// quote onto another word, and translationCore counts occurrences per
+// byte-distinct surface (see quoteExact in lint.ts). An unmatched token is
+// LEFT AS-IS — the transform never guesses.
 
 // Mirror of api/src/importParsers.ts SourceWord.
 export interface SourceWord {
@@ -64,22 +69,17 @@ function wordJoinerFold(text: string): string {
   return stripHebrewMarks(text).replace(WORD_JOINER, "");
 }
 
-// One UHB word, ready to be adopted. `found` is consumed as tokens match it.
+// One UHB word, ready to be adopted.
 interface UhbEntry {
   form: string; // UHB surface `\w text` — the exact bytes we adopt
-  found: boolean;
 }
 
-// The unused entries of one tier's bucket, resolved fail-closed: undefined = no
-// candidate (try the next tier); null = candidates with more than one distinct
-// surface (ambiguous: leave the word as-is and stop, as canonizeAlignmentSource's
-// pickCanonical does); otherwise the entry to adopt. Picking the first of two
-// look-alikes would move the quote onto another word, and translationCore
-// counts occurrences per byte-distinct surface (see quoteExact in lint.ts).
-function pickUnused(entries: UhbEntry[] | undefined): UhbEntry | null | undefined {
-  const free = entries?.filter((e) => !e.found) ?? [];
-  if (free.length === 0) return undefined;
-  return free.every((e) => e.form === free[0].form) ? free[0] : null;
+// One tier's bucket, resolved fail-closed: undefined = no candidate (try the
+// next tier); null = more than one distinct surface (ambiguous: stop, as
+// canonizeAlignmentSource's pickCanonical does); otherwise the surface to adopt.
+function soleForm(entries: UhbEntry[] | undefined): string | null | undefined {
+  if (!entries || entries.length === 0) return undefined;
+  return entries.every((e) => e.form === entries[0].form) ? entries[0].form : null;
 }
 
 function push(map: Map<string, UhbEntry[]>, key: string, entry: UhbEntry): void {
@@ -98,7 +98,7 @@ interface TieredLookup {
 function buildShortLookup(words: SourceWord[]): TieredLookup {
   const lk: TieredLookup = { exact: new Map(), stripped: new Map(), joiner: new Map() };
   for (const w of words) {
-    const e: UhbEntry = { form: w.text, found: false };
+    const e: UhbEntry = { form: w.text };
     push(lk.exact, canonicalHebrew(w.text), e);
     push(lk.stripped, stripHebrewMarks(w.text), e);
     push(lk.joiner, wordJoinerFold(w.text), e);
@@ -127,18 +127,13 @@ export function canonizeQuote(
     if (!word) continue;
     // A word already byte-identical to a UHB word is already canonical: keep it.
     const exact = lk.exact.get(canonicalHebrew(word));
-    let e: UhbEntry | null | undefined = exact?.find((x) => !x.found && x.form === word);
-    if (!e) {
-      e = pickUnused(exact);
-      if (e === undefined && !strict) e = pickUnused(lk.stripped.get(stripHebrewMarks(word)));
-      if (e === undefined && !strict) e = pickUnused(lk.joiner.get(wordJoinerFold(word)));
-    }
-    if (e) {
-      e.found = true;
-      if (word !== e.form) {
-        tokens[i] = e.form;
-        changed = true;
-      }
+    if (exact?.some((x) => x.form === word)) continue;
+    let form = soleForm(exact);
+    if (form === undefined && !strict) form = soleForm(lk.stripped.get(stripHebrewMarks(word)));
+    if (form === undefined && !strict) form = soleForm(lk.joiner.get(wordJoinerFold(word)));
+    if (form) {
+      tokens[i] = form;
+      changed = true;
     }
   }
   return changed ? tokens.join("") : quote;
