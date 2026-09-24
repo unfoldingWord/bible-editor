@@ -17,9 +17,12 @@ import {
   ToggleButton,
   ToggleButtonGroup,
   Tooltip,
+  FormControlLabel,
+  Switch,
 } from "@mui/material";
 import { api, type VerseHistoryEntry } from "../sync/api";
 import { diffWords } from "../lib/wordDiff";
+import { renderVerseUsfm, stripAlignmentNoise } from "../lib/verseUsfmPreview";
 
 interface Props {
   open: boolean;
@@ -56,7 +59,7 @@ const sourceChip = (source: string | null): string | null => {
   return null;
 };
 
-type ViewMode = "snapshot" | "diff";
+type ViewMode = "snapshot" | "diff" | "usfm";
 
 export function VerseHistoryDialog({
   open,
@@ -74,6 +77,10 @@ export function VerseHistoryDialog({
   const [entries, setEntries] = useState<VerseHistoryEntry[]>([]);
   const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("snapshot");
+  // Shown only in USFM mode. Off by default: alignment attributes (Strong's,
+  // morph, occurrence counts) are the noise this view exists to see past —
+  // see stripAlignmentNoise. Flip on for alignment detail.
+  const [showAlignment, setShowAlignment] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -121,9 +128,38 @@ export function VerseHistoryDialog({
     [entries],
   );
 
+  // Rendered USFM per version, keyed by version — memoized once per history
+  // load rather than recomputed on every selection change. null entries
+  // (content not stored) fall back to a message in the USFM pane below.
+  const usfmByVersion = useMemo(() => {
+    const map = new Map<number, string | null>();
+    for (const e of entries) map.set(e.version, renderVerseUsfm(e.content, chapter, verseNum));
+    return map;
+  }, [entries, chapter, verseNum]);
+
+  // A version whose plain_text matches its immediate predecessor's but whose
+  // USFM render differs — a markers/alignment-only overwrite (#951's ZEC 1:17
+  // case). `ordered` is newest-first, so the predecessor of entry i is i+1.
+  const markersOnlyVersions = useMemo(() => {
+    const set = new Set<number>();
+    for (let i = 0; i < ordered.length - 1; i++) {
+      const e = ordered[i];
+      const prev = ordered[i + 1];
+      if (e.plain_text !== prev.plain_text) continue;
+      const eUsfm = usfmByVersion.get(e.version);
+      const prevUsfm = usfmByVersion.get(prev.version);
+      if (eUsfm !== null && prevUsfm !== null && eUsfm !== prevUsfm) set.add(e.version);
+    }
+    return set;
+  }, [ordered, usfmByVersion]);
+
   const isCurrent = !!selected?.current;
   const canDiff = !isCurrent && selected !== null && current !== null;
   const canRestore = restoreAllowed && !!selected && !isCurrent && selected.restorable;
+
+  const selectedUsfm = selected ? (usfmByVersion.get(selected.version) ?? null) : null;
+  const currentUsfm = current ? (usfmByVersion.get(current.version) ?? null) : null;
+  const canUsfmDiff = canDiff && selectedUsfm !== null && currentUsfm !== null;
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
@@ -199,6 +235,11 @@ export function VerseHistoryDialog({
                                 <Chip label="text only" size="small" variant="outlined" color="warning" sx={{ height: 18, fontSize: 10 }} />
                               </Tooltip>
                             )}
+                            {markersOnlyVersions.has(e.version) && (
+                              <Tooltip title="the visible text is unchanged from the previous version — only markers or alignment differ. Open the USFM view to see what changed">
+                                <Chip label="markers/alignment only" size="small" variant="outlined" color="info" sx={{ height: 18, fontSize: 10 }} />
+                              </Tooltip>
+                            )}
                           </Stack>
                         }
                         secondary={
@@ -224,9 +265,30 @@ export function VerseHistoryDialog({
                     <Typography variant="caption" color="text.secondary">
                       {viewMode === "diff" && canDiff
                         ? `diff: v${selected.version} → v${currentVersion}`
-                        : `preview of v${selected.version}`}
+                        : viewMode === "usfm" && canUsfmDiff
+                          ? `USFM diff: v${selected.version} → v${currentVersion}`
+                          : viewMode === "usfm"
+                            ? `USFM snapshot of v${selected.version}`
+                            : `preview of v${selected.version}`}
                     </Typography>
                     <Box sx={{ flex: 1 }} />
+                    {viewMode === "usfm" && (
+                      <FormControlLabel
+                        sx={{ mr: 0 }}
+                        control={
+                          <Switch
+                            size="small"
+                            checked={showAlignment}
+                            onChange={(_, checked) => setShowAlignment(checked)}
+                          />
+                        }
+                        label={
+                          <Typography variant="caption" color="text.secondary">
+                            show alignment attributes
+                          </Typography>
+                        }
+                      />
+                    )}
                     <ToggleButtonGroup
                       size="small"
                       exclusive
@@ -240,9 +302,28 @@ export function VerseHistoryDialog({
                       <ToggleButton value="diff" disabled={!canDiff}>
                         diff vs current
                       </ToggleButton>
+                      <ToggleButton value="usfm">USFM</ToggleButton>
                     </ToggleButtonGroup>
                   </Stack>
-                  {viewMode === "diff" && canDiff ? (
+                  {viewMode === "usfm" ? (
+                    selectedUsfm === null ? (
+                      <Alert severity="info" sx={{ py: 0 }}>
+                        alignment/markers weren't stored for this version — only plain text is
+                        available.
+                      </Alert>
+                    ) : canUsfmDiff ? (
+                      <TextDiff
+                        from={showAlignment ? selectedUsfm : stripAlignmentNoise(selectedUsfm)}
+                        to={showAlignment ? currentUsfm! : stripAlignmentNoise(currentUsfm!)}
+                        mono
+                      />
+                    ) : (
+                      <TextPreview
+                        value={showAlignment ? selectedUsfm : stripAlignmentNoise(selectedUsfm)}
+                        mono
+                      />
+                    )
+                  ) : viewMode === "diff" && canDiff ? (
                     <TextDiff from={selected.plain_text} to={current!.plain_text} />
                   ) : (
                     <TextPreview value={selected.plain_text} />
@@ -293,7 +374,10 @@ export function VerseHistoryDialog({
   );
 }
 
-function TextPreview({ value }: { value: string | null }) {
+const PROSE_FONT = '"Source Serif Pro","Cambria","Times New Roman",serif';
+const USFM_FONT = '"Source Code Pro","Consolas",monospace';
+
+function TextPreview({ value, mono }: { value: string | null; mono?: boolean }) {
   return (
     <Box
       sx={{
@@ -304,8 +388,8 @@ function TextPreview({ value }: { value: string | null }) {
         bgcolor: "grey.50",
         minHeight: 32,
         whiteSpace: "pre-wrap",
-        fontFamily: '"Source Serif Pro","Cambria","Times New Roman",serif',
-        fontSize: 15,
+        fontFamily: mono ? USFM_FONT : PROSE_FONT,
+        fontSize: mono ? 13 : 15,
         color: value ? "text.primary" : "text.disabled",
       }}
     >
@@ -314,7 +398,7 @@ function TextPreview({ value }: { value: string | null }) {
   );
 }
 
-function TextDiff({ from, to }: { from: string | null; to: string | null }) {
+function TextDiff({ from, to, mono }: { from: string | null; to: string | null; mono?: boolean }) {
   const fromStr = from ?? "";
   const toStr = to ?? "";
   const ops = useMemo(() => diffWords(fromStr, toStr), [fromStr, toStr]);
@@ -329,8 +413,8 @@ function TextDiff({ from, to }: { from: string | null; to: string | null }) {
         bgcolor: "grey.50",
         minHeight: 32,
         whiteSpace: "pre-wrap",
-        fontFamily: '"Source Serif Pro","Cambria","Times New Roman",serif',
-        fontSize: 15,
+        fontFamily: mono ? USFM_FONT : PROSE_FONT,
+        fontSize: mono ? 13 : 15,
       }}
     >
       {identical && fromStr === "" && toStr === "" ? (
