@@ -36,6 +36,14 @@ import { api, type BookTrashRow } from "../sync/api";
 // path that can take `total` from 0 back to something visible.
 const POLL_MS = 30_000;
 
+// A refocus/visibilitychange must wait at least this long after the last
+// load before it's allowed to trigger another one, so a rapid alt-tab
+// flurry collapses to one request. Module-level: only one book is open at a
+// time, so there is at most one mounted instance to share it with. The
+// steady POLL_MS interval below is unaffected.
+const REFOCUS_THROTTLE_MS = 60_000;
+let lastLoadAt = 0;
+
 interface Props {
   book: string;
   onNavigate: (book: string, chapter: number, verse?: number) => void;
@@ -63,6 +71,7 @@ export function BookTrashIndicator({ book, onNavigate, refreshSignal, onRestore 
   const [restoringId, setRestoringId] = useState<string | null>(null);
 
   const load = () => {
+    lastLoadAt = Date.now();
     api
       .getBookTrash(book)
       .then((r) => setRows(r.rows))
@@ -91,7 +100,9 @@ export function BookTrashIndicator({ book, onNavigate, refreshSignal, onRestore 
   // would just waste a request, since that path already refetches above.
   useEffect(() => {
     const onVis = () => {
-      if (document.visibilityState === "visible") load();
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - lastLoadAt < REFOCUS_THROTTLE_MS) return;
+      load();
     };
     document.addEventListener("visibilitychange", onVis);
     const timer = window.setInterval(() => {

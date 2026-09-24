@@ -14,6 +14,14 @@ import { dismissAlert, fetchAlerts, type SystemAlert } from "../sync/api";
 // in-chapter reply reaches the bell immediately.
 const POLL_MS = 30_000;
 
+// A refocus/visibilitychange must wait at least this long after the last
+// fetch before it's allowed to trigger another one. Module-level (not a
+// ref) so a rapid alt-tab flurry collapses to one request regardless of
+// remounts. The steady POLL_MS interval below is unaffected — this only
+// guards the extra, un-timed refetch that firing on every refocus adds.
+const REFOCUS_THROTTLE_MS = 60_000;
+let lastFetchAt = 0;
+
 // Alerts created more than this long before the first load are never "fresh",
 // even if the first load did not list them (a 401 on that fetch comes back as
 // an empty list, and a sign-out/sign-in as another user keeps this hook
@@ -53,6 +61,7 @@ export function useAlerts(authReady: boolean): {
   const seqRef = useRef(0);
 
   const refresh = useCallback(async () => {
+    lastFetchAt = Date.now();
     const seq = ++seqRef.current;
     try {
       const list = await fetchAlerts();
@@ -95,7 +104,9 @@ export function useAlerts(authReady: boolean): {
     }
     void refresh();
     const onVis = () => {
-      if (document.visibilityState === "visible") void refresh();
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - lastFetchAt < REFOCUS_THROTTLE_MS) return;
+      void refresh();
     };
     document.addEventListener("visibilitychange", onVis);
     const timer = window.setInterval(() => {

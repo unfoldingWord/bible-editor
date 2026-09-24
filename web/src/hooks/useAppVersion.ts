@@ -13,6 +13,14 @@ export interface VersionInfo {
 // workday gets nudged within a few minutes of a deploy.
 const POLL_MS = 5 * 60 * 1000;
 
+// A refocus/reconnect must wait at least this long after the last check
+// before it's allowed to trigger another fetch, so a rapid alt-tab flurry
+// collapses to one request. Module-level so it survives this hook's effect
+// re-running (it has no other reason to, but matches the other refocus
+// hooks for consistency).
+const REFOCUS_THROTTLE_MS = 60_000;
+let lastCheckAt = 0;
+
 function isVersionInfo(x: unknown): x is VersionInfo {
   return (
     typeof x === "object" &&
@@ -65,6 +73,7 @@ export function useAppVersion(): UseAppVersionReturn {
 
     const check = async () => {
       if (cancelled) return;
+      lastCheckAt = Date.now();
       const deployed = await fetchDeployedVersion();
       if (cancelled || !deployed) return;
       if (deployed.commit !== APP_VERSION.commit) setUpdateAvailable(true);
@@ -73,7 +82,9 @@ export function useAppVersion(): UseAppVersionReturn {
     void check();
     const interval = setInterval(() => void check(), POLL_MS);
     const onVisible = () => {
-      if (document.visibilityState === "visible") void check();
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - lastCheckAt < REFOCUS_THROTTLE_MS) return;
+      void check();
     };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("online", check);

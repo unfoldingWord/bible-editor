@@ -11,21 +11,46 @@ export interface UseBookLocksReturn {
   canManageLocks: boolean;
   lockedSet: Set<string>;
   refresh: () => void;
-  loading: boolean;
+}
+
+// How long a re-focus/visibility trigger must wait after the last load before
+// it's allowed to fire another one. Module-level (not a ref) so it survives
+// this hook remounting on book navigation (Shell is keyed by book). Distinct
+// from a "poll" — this hook has no interval; it only refetches on
+// authReady/focus, so the throttle exists purely to collapse a rapid
+// alt-tab flurry into one request instead of one per refocus.
+const FOCUS_RELOAD_THROTTLE_MS = 60_000;
+let lastLoadAt = 0;
+
+function sameBooks(a: BookListEntry[], b: BookListEntry[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      x.book !== y.book ||
+      x.locked !== y.locked ||
+      x.lockReason !== y.lockReason ||
+      x.lockSource !== y.lockSource ||
+      x.imported_at !== y.imported_at
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function useBookLocks(authReady: boolean): UseBookLocksReturn {
   const [books, setBooks] = useState<BookListEntry[]>([]);
   const [canManageLocks, setCanManageLocks] = useState(false);
-  const [loading, setLoading] = useState(true);
 
   const load = useCallback(() => {
-    setLoading(true);
+    lastLoadAt = Date.now();
     api
       .getBooks()
       .then((r) => {
-        setBooks(r.books);
-        setCanManageLocks(r.canManageLocks);
+        setBooks((prev) => (sameBooks(prev, r.books) ? prev : r.books));
+        setCanManageLocks((prev) => (prev === r.canManageLocks ? prev : r.canManageLocks));
       })
       .catch(() => {
         // Fail open on the client: an unknown list must not make the whole
@@ -33,10 +58,9 @@ export function useBookLocks(authReady: boolean): UseBookLocksReturn {
         // write to a locked book still 423s there), so a failed fetch here
         // only means the UI can't pre-emptively gray out an input — not
         // that anything actually becomes unsafe to write.
-        setBooks([]);
-        setCanManageLocks(false);
-      })
-      .finally(() => setLoading(false));
+        setBooks((prev) => (prev.length === 0 ? prev : []));
+        setCanManageLocks((prev) => (prev === false ? prev : false));
+      });
   }, []);
 
   // Gated on authReady, same reasoning as useAlerts: GET /api/books has no
@@ -68,7 +92,10 @@ export function useBookLocks(authReady: boolean): UseBookLocksReturn {
   // tab, where the server's 423 is the backstop.
   useEffect(() => {
     if (!authReady) return;
-    const onFocus = () => load();
+    const onFocus = () => {
+      if (Date.now() - lastLoadAt < FOCUS_RELOAD_THROTTLE_MS) return;
+      load();
+    };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   }, [authReady, load]);
@@ -77,5 +104,5 @@ export function useBookLocks(authReady: boolean): UseBookLocksReturn {
   // book is locked just because we don't know.
   const lockedSet = new Set(books.filter((b) => b.locked).map((b) => b.book));
 
-  return { books, canManageLocks, lockedSet, refresh: load, loading };
+  return { books, canManageLocks, lockedSet, refresh: load };
 }

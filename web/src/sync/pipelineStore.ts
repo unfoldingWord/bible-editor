@@ -32,6 +32,13 @@ export { getSessionKey, setPipelineUser } from "./pipelineSession";
 
 const POLL_INTERVAL_MS = 120_000; // contract §5
 
+// A tab-refocus reload must wait at least this long after the last
+// loadFromServer before it's allowed to trigger another one, so a rapid
+// alt-tab flurry collapses to one request. The steady POLL_INTERVAL_MS
+// ticker is unaffected.
+const REFOCUS_THROTTLE_MS = 60_000;
+let lastLoadFromServerAt = 0;
+
 // queued/dispatching are polled too — GET /api/pipelines/:id returns their
 // live queue position, so the chip's "#N in line" refreshes each tick.
 const POLLING_STATES: ReadonlySet<PipelineState> = new Set([
@@ -110,9 +117,21 @@ function snapshot(): PipelineJob[] {
   return Array.from(jobs.values()).sort((a, b) => b.updated_at - a.updated_at);
 }
 
+// Skips re-notifying subscribers when nothing a renderer would care about
+// changed. Compared on (job_id, state, updated_at) tuples — the fields that
+// drive every subscriber's render — not full row identity, so an unrelated
+// field refresh (e.g. last_polled_at) alone doesn't trigger a re-render.
+let lastNotifiedKey = "";
+function snapshotKey(list: PipelineJob[]): string {
+  return list.map((j) => `${j.job_id}:${j.state}:${j.updated_at}`).join("|");
+}
+
 function notify() {
   if (subscribers.size === 0) return;
   const list = snapshot();
+  const key = snapshotKey(list);
+  if (key === lastNotifiedKey) return;
+  lastNotifiedKey = key;
   for (const s of subscribers) s(list);
 }
 
@@ -217,7 +236,9 @@ function ensurePolling() {
   if (!visibilityBound) {
     visibilityBound = true;
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) void loadFromServer();
+      if (document.hidden) return;
+      if (Date.now() - lastLoadFromServerAt < REFOCUS_THROTTLE_MS) return;
+      void loadFromServer();
     });
   }
 }
@@ -229,6 +250,7 @@ function ensurePolling() {
 const STALE_NOTIFICATION_CUTOFF_SECONDS = 24 * 60 * 60;
 
 async function loadFromServer() {
+  lastLoadFromServerAt = Date.now();
   try {
     const res = await api.pipelineList();
     queueSummary = res.queue ?? null;
