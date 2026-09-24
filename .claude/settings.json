@@ -7,7 +7,8 @@
       "Bash(graft:*)",
       "Bash(npx graft:*)",
       "Bash(graft-dev:*)",
-      "Bash(node dist/cli.js:*)"
+      "Bash(node dist/cli.js:*)",
+      "Bash(node scripts/d1-select.mjs:*)"
     ]
   }
 }
