@@ -13,7 +13,10 @@ import {
   coveredVersesKey,
   versesFromKey,
   noteOverlapsRange,
+  sourceForTargetRow,
 } from "./verseRange.ts";
+import usfm from "usfm-js";
+import { verseHasUnalignedWork } from "./alignment.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -196,6 +199,50 @@ function mkVerse(verse, verseEnd, voCount = 1) {
   const single = { verse: 5, ref_raw: "1:5" };
   assert(noteOverlapsRange(single, 5, 5), "singleton shows on its verse");
   assert(!noteOverlapsRange(single, 6, 6), "singleton hidden elsewhere");
+}
+
+// ─── #957: reading-column source for a bridged target row ────────────────
+// A ULT/UST bridge (verse=1, verse_end=2) aligns against UHB 1 AND 2. The
+// unaligned indicator used to be handed only UHB 1, so a source word from the
+// LAST verse of the bridge that no target word aligned to went unflagged.
+{
+  console.log("\n[Case] sourceForTargetRow covers the whole bridge (#957)");
+  const vo = (raw) => {
+    const json = usfm.toJSON(raw);
+    const ch = Object.keys(json.chapters)[0];
+    return Object.fromEntries(
+      Object.entries(json.chapters[ch]).filter(([k]) => /^\d/.test(k)).map(([k, v]) => [k, v.verseObjects]),
+    );
+  };
+  const src = vo(String.raw`\id ZEC
+\c 1
+\v 1 \w דָּבָר|lemma="דָּבָר" strong="H1697" x-morph="He,Ncmsc"\w*
+\v 2 \w יְהוָה|lemma="יְהוָה" strong="H3068" x-morph="He,Np"\w*
+`);
+  // Target aligns the verse-1 word only; UHB 2's יְהוָה has no target word.
+  const tgt = vo(String.raw`\id ZEC
+\c 1
+\v 1-2 \zaln-s |x-strong="H1697" x-lemma="דָּבָר" x-morph="He,Ncmsc" x-occurrence="1" x-occurrences="1" x-content="דָּבָר"\*\w word|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`);
+  const mk = (verse, verseEnd, verseObjects, bv) => ({
+    book: "ZEC", chapter: 1, verse, verse_end: verseEnd, bible_version: bv,
+    plain_text: null, version: 1, updated_by: null, updated_at: 0, content: { verseObjects },
+  });
+  const uhb = { 1: mk(1, null, src["1"], "UHB"), 2: mk(2, null, src["2"], "UHB") };
+  const bridgeVO = tgt["1-2"] ?? tgt["1"];
+  const bridge = mk(1, 2, bridgeVO, "ULT");
+  assert(Array.isArray(bridgeVO), "bridged target parsed");
+  // Old call-site shape (first verse only) misses the unaligned verse-2 word.
+  assert(!verseHasUnalignedWork(bridgeVO, uhb[1].content.verseObjects),
+    "baseline: first-verse source alone reports the bridge as fully aligned");
+  const combined = sourceForTargetRow(uhb, bridge);
+  assert(combined?.verse === 1 && combined?.verse_end === 2, "combined source spans 1-2");
+  assert(verseHasUnalignedWork(bridgeVO, combined?.content?.verseObjects),
+    "bridge flags the unaligned UHB word from its LAST verse");
+  // Singletons are unchanged: the source is the very same row object.
+  const single = mk(1, null, bridgeVO, "ULT");
+  assert(sourceForTargetRow(uhb, single) === uhb[1], "singleton target gets its own source row");
+  assert(sourceForTargetRow(uhb, null) === null, "no target row: no source");
 }
 
 if (failed) {
