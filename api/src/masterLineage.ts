@@ -1410,6 +1410,28 @@ export function refEvidenceTouches(refs: string[], chapter: number, verse: numbe
 }
 
 /**
+ * Whether completeHumanRefEvidenceTouches can measure a touch against this
+ * lineage at all, separate from what it measures at a given chapter/verse.
+ * `false` here means "unmeasurable" — missing, incomplete, or malformed
+ * evidence — as opposed to "measured, no touch". A caller that logs the
+ * touch result for diagnosis (rather than using it to gate a decision) must
+ * check this first, or the two cases read as the same `false` (#874).
+ */
+export function humanRefEvidenceIsMeasurable(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+): lineage is MasterLineage | MasterLineageSummary {
+  if (
+    lineage == null ||
+    !("mayHoldHumanEdit" in lineage) ||
+    lineage.mayHoldHumanEdit !== true ||
+    lineage.incomplete !== false ||
+    lineage.hasHumanCommit !== true
+  ) return false;
+  const ev = refsFrom(lineage);
+  return ev !== null && ev.refs.length > 0;
+}
+
+/**
  * Positive-evidence counterpart to masterMayHoldHumanEditForVerse.
  *
  * This may authorize an exact master-byte adoption, so uncertainty must return
@@ -1422,13 +1444,7 @@ export function completeHumanRefEvidenceTouches(
   verse: number,
   verseEnd?: number | null,
 ): boolean {
-  if (
-    lineage == null ||
-    !("mayHoldHumanEdit" in lineage) ||
-    lineage.mayHoldHumanEdit !== true ||
-    lineage.incomplete !== false ||
-    lineage.hasHumanCommit !== true
-  ) return false;
+  if (!humanRefEvidenceIsMeasurable(lineage)) return false;
   if (!Number.isInteger(chapter) || !Number.isInteger(verse) || chapter < 0 || verse < 0) return false;
   const ev = refsFrom(lineage);
   if (ev === null || ev.refs.length === 0) return false;

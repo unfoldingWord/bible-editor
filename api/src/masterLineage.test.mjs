@@ -134,8 +134,10 @@ import { readFileSync } from "node:fs";
 import {
   classifyMasterCommit,
   compactLineage,
+  completeHumanRefEvidenceTouches,
   describeHumanCommits,
   humanCommitEvidenceClause,
+  humanRefEvidenceIsMeasurable,
   stripHumanCommitEvidence,
   LINEAGE_EVIDENCE_CAP,
   LINEAGE_EVIDENCE_LEAD,
@@ -1154,6 +1156,58 @@ console.log("\n[#557: every uncertainty resolves to the file-level answer]");
   const refs = Array.from({ length: LINEAGE_REF_CAP + 1 }, (_, i) => `1:${i + 1}`);
   eq(mergeRefEvidence([{ complete: true, refs, reason: "" }]).complete, false, "a ref set past the cap is incomplete");
   eq(mergeRefEvidence([{ complete: true, refs, reason: "" }]).reason, "ref_cap_exceeded", "...and says why");
+}
+
+// ── #874: humanRefEvidenceIsMeasurable must agree with
+// completeHumanRefEvidenceTouches about which `false` answers mean "could
+// not tell" versus "measured, no touch" ────────────────────────────────────
+{
+  const human = [classifyMasterCommit({ sha: "h2", message: "Fixes s6 markers", authorEmail: RICH })];
+  const goodRefs = { complete: true, refs: ["40:15", "41:*"], reason: "" };
+
+  const measured = compactLineage(summarizeLineage(human, { humanRefs: goodRefs }));
+  eq(humanRefEvidenceIsMeasurable(measured), true, "complete evidence with mapped refs is measurable");
+  eq(completeHumanRefEvidenceTouches(measured, 40, 15), true, "...and a matching ref touches");
+  eq(completeHumanRefEvidenceTouches(measured, 40, 16), false, "...while a non-matching verse measures a real 'no touch'");
+
+  eq(humanRefEvidenceIsMeasurable(null), false, "an absent lineage is unmeasurable");
+  eq(humanRefEvidenceIsMeasurable(undefined), false, "...same for undefined");
+  eq(humanRefEvidenceIsMeasurable({}), false, "a malformed lineage object is unmeasurable");
+  eq(completeHumanRefEvidenceTouches(null, 40, 15), false, "completeHumanRefEvidenceTouches's own answer for it is unchanged");
+
+  const noHumanCommit = compactLineage(summarizeLineage([], { humanRefs: goodRefs }));
+  eq(
+    humanRefEvidenceIsMeasurable(noHumanCommit),
+    false,
+    "a window with no human commit at all is unmeasurable, not 'measured, no touch'",
+  );
+
+  const incompleteWalk = compactLineage(
+    summarizeLineage(human, { humanRefs: goodRefs, incomplete: true, incompleteReason: "page_cap" }),
+  );
+  eq(humanRefEvidenceIsMeasurable(incompleteWalk), false, "an incomplete commit walk is unmeasurable even with complete refs");
+
+  const incompleteRefs = compactLineage(
+    summarizeLineage(human, { humanRefs: { complete: false, refs: ["40:15"], reason: "diff_fetch_failed" } }),
+  );
+  eq(humanRefEvidenceIsMeasurable(incompleteRefs), false, "incomplete per-verse ref evidence is unmeasurable");
+
+  const zeroRefs = compactLineage(summarizeLineage(human, { humanRefs: { complete: true, refs: [], reason: "" } }));
+  eq(
+    humanRefEvidenceIsMeasurable(zeroRefs),
+    false,
+    "a human window that mapped to zero refs is unmeasurable, matching completeHumanRefEvidenceTouches's own 'not believed' case",
+  );
+
+  const malformedRef = {
+    mayHoldHumanEdit: true,
+    hasHumanCommit: true,
+    incomplete: false,
+    refsComplete: true,
+    humanRefs: ["40:15", "nonsense"],
+  };
+  eq(humanRefEvidenceIsMeasurable(malformedRef), false, "one malformed ref entry discards the whole set, so it reads as unmeasurable");
+  eq(completeHumanRefEvidenceTouches(malformedRef, 40, 15), false, "...consistent with completeHumanRefEvidenceTouches's own answer");
 }
 
 // ── #607: the TSV half of #557's per-verse narrowing ────────────────────────
