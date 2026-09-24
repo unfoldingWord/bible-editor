@@ -22,10 +22,15 @@
 //   1. exact      — NFC + joiners removed (only combining-mark ORDER differs)
 //   2. stripped   — vowel points / cantillation removed (consonants + order)
 //   3. wordJoiner — stripped, then U+2060 removed (quotes routinely drop it)
-// A matched UHB word is CONSUMED (found flag) so a second resource token can't
-// claim it — this keeps two same-skeleton-but-differently-pointed words mapping
-// to distinct UHB words. On a hit we adopt the UHB's exact surface (and lemma,
-// for alignment); an unmatched token is LEFT AS-IS — the transform never guesses.
+// A word already byte-identical to a UHB word is kept. Otherwise a tier hit is
+// adopted only when every UHB word in that bucket has ONE surface (for
+// alignment, also one lemma, which is adopted too); two distinct
+// surfaces are AMBIGUOUS and the word is left as-is (no looser tier is tried).
+// This is decided per word, independent of the quote's other words, so word
+// order cannot change the outcome. Picking one of two look-alikes would move a
+// quote onto another word, and translationCore counts occurrences per
+// byte-distinct surface (see quoteExact in lint.ts). An unmatched token is
+// LEFT AS-IS — the transform never guesses.
 
 import type { SourceWord } from "./importParsers";
 
@@ -73,19 +78,20 @@ function wordJoinerFold(text: string): string {
 
 // ── Lookup tables ───────────────────────────────────────────────────────────
 
-// One UHB word, ready to be adopted. `found` is consumed as tokens match it.
+// One UHB word, ready to be adopted.
 interface UhbEntry {
   form: string; // UHB surface `\w text` — the exact bytes we adopt
   lemma: string; // UHB lemma — adopted for alignment milestones
-  found: boolean;
 }
 
 const SEP = " "; // key separator that can't occur inside a Hebrew word
 
-function firstUnused(entries: UhbEntry[] | undefined): UhbEntry | null {
-  if (!entries) return null;
-  for (const e of entries) if (!e.found) return e;
-  return null;
+// One tier's bucket, resolved fail-closed: undefined = no candidate (try the
+// next tier); null = more than one distinct surface (ambiguous: stop, as
+// canonizeAlignmentSource's pickCanonical does); otherwise the surface to adopt.
+function soleForm(entries: UhbEntry[] | undefined): string | null | undefined {
+  if (!entries || entries.length === 0) return undefined;
+  return entries.every((e) => e.form === entries[0].form) ? entries[0].form : null;
 }
 
 function push(map: Map<string, UhbEntry[]>, key: string, entry: UhbEntry): void {
@@ -117,7 +123,7 @@ function emptyLookup(): TieredLookup {
 function buildFullLookup(words: SourceWord[]): TieredLookup {
   const lk = emptyLookup();
   for (const w of words) {
-    const e: UhbEntry = { form: w.text, lemma: w.lemma, found: false };
+    const e: UhbEntry = { form: w.text, lemma: w.lemma };
     push(lk.exact, w.strong + SEP + canonicalHebrew(w.text), e);
     push(lk.stripped, w.strong + SEP + stripHebrewMarks(w.text), e);
     push(lk.joiner, w.strong + SEP + wordJoinerFold(w.text), e);
@@ -126,12 +132,11 @@ function buildFullLookup(words: SourceWord[]): TieredLookup {
 }
 
 // TSV quotes have no lemma/morph, so they key on the surface form alone
-// (mirrors the original's "short" lookups). Fresh entries → their own `found`
-// flags, independent of any alignment lookup.
+// (mirrors the original's "short" lookups).
 function buildShortLookup(words: SourceWord[]): TieredLookup {
   const lk = emptyLookup();
   for (const w of words) {
-    const e: UhbEntry = { form: w.text, lemma: w.lemma, found: false };
+    const e: UhbEntry = { form: w.text, lemma: w.lemma };
     push(lk.exact, canonicalHebrew(w.text), e);
     push(lk.stripped, stripHebrewMarks(w.text), e);
     push(lk.joiner, wordJoinerFold(w.text), e);
@@ -238,15 +243,15 @@ export function canonizeQuote(
   for (let i = 0; i < tokens.length; i += 2) {
     const word = tokens[i];
     if (!word) continue;
-    let e = firstUnused(lk.exact.get(canonicalHebrew(word)));
-    if (!e && !strict) e = firstUnused(lk.stripped.get(stripHebrewMarks(word)));
-    if (!e && !strict) e = firstUnused(lk.joiner.get(wordJoinerFold(word)));
-    if (e) {
-      e.found = true;
-      if (word !== e.form) {
-        tokens[i] = e.form;
-        changed = true;
-      }
+    // A word already byte-identical to a UHB word is already canonical: keep it.
+    const exact = lk.exact.get(canonicalHebrew(word));
+    if (exact?.some((x) => x.form === word)) continue;
+    let form = soleForm(exact);
+    if (form === undefined && !strict) form = soleForm(lk.stripped.get(stripHebrewMarks(word)));
+    if (form === undefined && !strict) form = soleForm(lk.joiner.get(wordJoinerFold(word)));
+    if (form) {
+      tokens[i] = form;
+      changed = true;
     }
   }
   return changed ? tokens.join("") : quote;
