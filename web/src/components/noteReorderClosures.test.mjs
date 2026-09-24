@@ -12,9 +12,10 @@
 
 import assert from "node:assert/strict";
 
-// ── ResourceColumn.renderNoteCard's neighbor derivation ─────────────────────
-// samePeers = peers.filter(p => p.verse === r.verse); idx = samePeers.indexOf(r);
-// prevNote = idx > 0 ? samePeers[idx - 1] : null; nextNote = idx < samePeers.length - 1 ? samePeers[idx + 1] : null;
+// ── ResourceColumn's neighbor derivation (buildNoteNeighbors) ───────────────
+// One pass per verse-group builds { prevId, nextId } for every row by index,
+// instead of a per-card peers.filter(p => p.verse === r.verse) + indexOf.
+// sortedPeers here is one such verse group, already sorted — same semantics.
 function neighborsFor(sortedPeers, id) {
   const idx = sortedPeers.findIndex((r) => r.id === id);
   const prevNote = idx > 0 ? sortedPeers[idx - 1] : null;
