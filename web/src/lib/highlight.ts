@@ -119,7 +119,7 @@ function nodeIsMilestone(n: unknown): n is Record<string, unknown> {
   return !!o && o["type"] === "milestone" && o["tag"] === "zaln";
 }
 
-function nodeIsWord(n: unknown): n is Record<string, unknown> {
+export function nodeIsWord(n: unknown): n is Record<string, unknown> {
   const o = n as Record<string, unknown> | null;
   return !!o && o["type"] === "word" && o["tag"] === "w";
 }
