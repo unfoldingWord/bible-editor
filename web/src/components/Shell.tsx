@@ -59,7 +59,7 @@ import {
   guardBlocksSave,
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
-import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, versesFromKey } from "../lib/verseRange";
+import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, versesFromKey } from "../lib/verseRange";
 import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
@@ -1189,12 +1189,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     });
     for (const verse of verses) {
       if (verse <= 0) continue;
-      const sourceVO = verseObjectsOf(sourceByVerse[verse]);
+      // Each row is judged against the source it covers — every UHB verse of
+      // a bridge, not just the first (#957).
       const ultVO = verseObjectsOf(ult[verse]);
       const ustVO = verseObjectsOf(ust[verse]);
       out.set(
         verse,
-        !!(ultVO && verseHasUnalignedWork(ultVO, sourceVO)) || !!(ustVO && verseHasUnalignedWork(ustVO, sourceVO)),
+        !!(ultVO && verseHasUnalignedWork(ultVO, verseObjectsOf(sourceForTargetRow(sourceByVerse, ult[verse]) ?? undefined))) ||
+          !!(ustVO && verseHasUnalignedWork(ustVO, verseObjectsOf(sourceForTargetRow(sourceByVerse, ust[verse]) ?? undefined))),
       );
     }
     return out;
@@ -1274,9 +1276,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     };
     for (const ref of alignAttention.refs) {
       if (ref.chapter !== data.chapter) continue;
-      const targetVO = getVO(targetsByResource[ref.resource]?.[ref.verse]);
+      const target = targetsByResource[ref.resource]?.[ref.verse];
+      const targetVO = getVO(target);
       if (!targetVO) continue;
-      const sourceVO = getVO(sourceByVerse[ref.verse]);
+      const sourceVO = getVO(sourceForTargetRow(sourceByVerse, target) ?? undefined);
       if (!verseHasUnalignedWork(targetVO, sourceVO)) {
         keys.add(`${ref.resource}:${ref.ref}`);
       }

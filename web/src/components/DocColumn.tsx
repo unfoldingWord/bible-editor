@@ -16,7 +16,7 @@ import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { FindMatch } from "./FindReplaceOverlay";
-import { formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
+import { formatVerseLabel, isFirstOfRange, isRangeRow, sourceForTargetRow } from "../lib/verseRange";
 import { VerseBridgeButtons } from "./VerseBridgeButtons";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -254,10 +254,11 @@ export function DocColumn({
             );
           const paintQuote = !!aQuote && (isActive || covered);
           const partial = !reorderHighlight?.movedQuote && covered;
-          // OL-anchor against THIS verse's source — activeSourceContent is only
-          // the navigated verse and would mis-join a v12 ULT highlight.
-          const sourceContent =
-            sourceByVerseNum?.[dto.verse]?.content ?? activeSourceContent;
+          // OL-anchor against THIS row's source (its whole span for a bridge,
+          // #957) — activeSourceContent is only the navigated verse and would
+          // mis-join a v12 ULT highlight.
+          const rowSourceContent = sourceForTargetRow(sourceByVerseNum, dto)?.content;
+          const sourceContent = rowSourceContent ?? activeSourceContent;
           const highlights = paintQuote
             ? highlightsFor(bibleVersion, dto.content, aQuote, aOcc, sourceContent, partial)
             : null;
@@ -301,7 +302,7 @@ export function DocColumn({
                 bibleVersion={bibleVersion}
                 text={dto.plain_text ?? ""}
                 content={dto.content}
-                sourceContent={sourceByVerseNum?.[dto.verse]?.content}
+                sourceContent={rowSourceContent}
                 precedingMarkers={drift}
                 highlights={highlights}
                 prevHighlights={prevHighlights}

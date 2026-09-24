@@ -28,7 +28,7 @@ import { SectionHeaderBand } from "./SectionHeaderBand";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
-import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
+import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow, sourceForTargetRow } from "../lib/verseRange";
 import { directionForBook, directionForVersion } from "../lib/direction";
 import {
   classifySourceQuery,
@@ -919,6 +919,10 @@ function StackedBody({
         const ustV = ust[v];
         const uhbV = uhb[v];
         if (isActive) {
+          // Each translation OL-anchors on the source its row covers: a bridged
+          // ULT/UST row joins every UHB verse of its span (#957).
+          const ultSrc = sourceForTargetRow(uhb, ultV)?.content;
+          const ustSrc = sourceForTargetRow(uhb, ustV)?.content;
           // OL-anchor the ULT/UST highlights on the active verse's source
           // (UHB/UGNT) verse so reordered translations still light up.
           // During a preview the yellow follows the MOVED note (so a hover over
@@ -927,16 +931,16 @@ function StackedBody({
           const aQuote = ro?.movedQuote ?? activeNoteQuote;
           const aOcc = ro?.movedQuote ? ro.movedOccurrence : activeNoteOccurrence;
           const partial = !ro?.movedQuote && activeNoteQuotePartialGroups;
-          const ultHL = highlightsFor("ULT", ultV?.content, aQuote, aOcc, uhbV?.content, partial);
-          const ustHL = highlightsFor("UST", ustV?.content, aQuote, aOcc, uhbV?.content, partial);
+          const ultHL = highlightsFor("ULT", ultV?.content, aQuote, aOcc, ultSrc, partial);
+          const ustHL = highlightsFor("UST", ustV?.content, aQuote, aOcc, ustSrc, partial);
           const uhbHL = highlightsFor(uhbLabel, uhbV?.content, aQuote, aOcc, undefined, partial);
           // Reorder stoplight: the moved note's candidate neighbours, resolved
           // per version (ULT/UST OL-anchored on UHB, like the active set).
           // Undefined unless a drag / hover / recent arrow-move is in flight.
-          const ultPrevHL = ro?.prevQuote ? highlightsFor("ULT", ultV?.content, ro.prevQuote, ro.prevOccurrence, uhbV?.content) : undefined;
-          const ultNextHL = ro?.nextQuote ? highlightsFor("ULT", ultV?.content, ro.nextQuote, ro.nextOccurrence, uhbV?.content) : undefined;
-          const ustPrevHL = ro?.prevQuote ? highlightsFor("UST", ustV?.content, ro.prevQuote, ro.prevOccurrence, uhbV?.content) : undefined;
-          const ustNextHL = ro?.nextQuote ? highlightsFor("UST", ustV?.content, ro.nextQuote, ro.nextOccurrence, uhbV?.content) : undefined;
+          const ultPrevHL = ro?.prevQuote ? highlightsFor("ULT", ultV?.content, ro.prevQuote, ro.prevOccurrence, ultSrc) : undefined;
+          const ultNextHL = ro?.nextQuote ? highlightsFor("ULT", ultV?.content, ro.nextQuote, ro.nextOccurrence, ultSrc) : undefined;
+          const ustPrevHL = ro?.prevQuote ? highlightsFor("UST", ustV?.content, ro.prevQuote, ro.prevOccurrence, ustSrc) : undefined;
+          const ustNextHL = ro?.nextQuote ? highlightsFor("UST", ustV?.content, ro.nextQuote, ro.nextOccurrence, ustSrc) : undefined;
           const uhbPrevHL = ro?.prevQuote ? highlightsFor(uhbLabel, uhbV?.content, ro.prevQuote, ro.prevOccurrence) : undefined;
           const uhbNextHL = ro?.nextQuote ? highlightsFor(uhbLabel, uhbV?.content, ro.nextQuote, ro.nextOccurrence) : undefined;
           // For multi-verse blocks, PATCH and find/replace target the canonical
@@ -1003,7 +1007,7 @@ function StackedBody({
                 verseNum={ultStart}
                 text={ultV?.plain_text ?? ""}
                 content={ultV?.content}
-                sourceContent={uhbV?.content}
+                sourceContent={ultSrc}
                 prevContent={ultPrev?.content}
                 highlights={ultHL}
                 prevHighlights={ultPrevHL}
@@ -1038,7 +1042,7 @@ function StackedBody({
                 verseNum={ustStart}
                 text={ustV?.plain_text ?? ""}
                 content={ustV?.content}
-                sourceContent={uhbV?.content}
+                sourceContent={ustSrc}
                 prevContent={ustPrev?.content}
                 highlights={ustHL}
                 prevHighlights={ustPrevHL}
@@ -1168,12 +1172,12 @@ const InactiveVerseRow = memo(
   }) {
     const ultV = ult[v];
     const ustV = ust[v];
-    const uhbV = uhb[v];
+    // Bridged rows anchor on their whole source span (#957).
     const ultHL = noteQuote
-      ? highlightsFor("ULT", ultV?.content, noteQuote, noteOccurrence, uhbV?.content, notePartial)
+      ? highlightsFor("ULT", ultV?.content, noteQuote, noteOccurrence, sourceForTargetRow(uhb, ultV)?.content, notePartial)
       : null;
     const ustHL = noteQuote
-      ? highlightsFor("UST", ustV?.content, noteQuote, noteOccurrence, uhbV?.content, notePartial)
+      ? highlightsFor("UST", ustV?.content, noteQuote, noteOccurrence, sourceForTargetRow(uhb, ustV)?.content, notePartial)
       : null;
     // Only render this version's cell when it's the start of its row's span —
     // keeps a UST 6-9 block from re-rendering on every verse 7,8,9 row

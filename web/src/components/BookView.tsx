@@ -33,7 +33,7 @@ import type { FindMatch } from "./FindReplaceOverlay";
 import type { FindQuery } from "./ScriptureColumn";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
-import { formatVerseLabel, isRangeRow } from "../lib/verseRange";
+import { formatVerseLabel, isRangeRow, sourceForTargetRow } from "../lib/verseRange";
 import { directionForVersion } from "../lib/direction";
 import {
   classifySourceQuery,
@@ -900,9 +900,10 @@ const VerseRow = memo(function VerseRow({
               bibleVersion={bv}
               dto={dto}
               prevDto={prevDto}
-                sourceContent={
-                versesByVersion["UHB"]?.[verseNum]?.content ??
-                versesByVersion["UGNT"]?.[verseNum]?.content
+              sourceContent={
+                dto
+                  ? sourceForTargetRow(versesByVersion["UHB"] ?? versesByVersion["UGNT"], dto)?.content
+                  : versesByVersion["UHB"]?.[verseNum]?.content ?? versesByVersion["UGNT"]?.[verseNum]?.content
               }
               isActive={isActive}
               bridgeActive={bridgeActive}

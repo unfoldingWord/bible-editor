@@ -183,6 +183,20 @@ export function concatSourceRange(
   return out;
 }
 
+// The source (UHB/UGNT) a target ULT/UST row aligns against: the row's own
+// verse for a singleton, every verse of [verse, verse_end] joined for a bridge.
+// Reading-column views (unaligned indicators, OL-anchored highlights) go
+// through this so they judge a bridge against the same source the aligner
+// uses (#957). A singleton returns the source row object itself.
+export function sourceForTargetRow(
+  sourceByVerseStart: Record<number, VerseDto> | undefined,
+  target: VerseDto | null | undefined,
+): VerseDto | null {
+  if (!target) return null;
+  const [start, end] = verseSpan(target);
+  return concatSourceRange(sourceByVerseStart, start, end);
+}
+
 function buildSourceRange(
   first: VerseDto,
   rows: Array<VerseDto | undefined>,
