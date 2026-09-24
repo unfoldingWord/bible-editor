@@ -1,4 +1,4 @@
-import { Fragment, type Ref, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, lazy, type Ref, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip, Link } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
@@ -9,7 +9,7 @@ import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { TwlSuggestions } from "./TwlSuggestions";
 import { QuestionsTable } from "./QuestionsTable";
-import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
+import type { AlignmentPanelHandle } from "./AlignmentPanel";
 import { noteOverlapsRange } from "../lib/verseRange";
 import { hasLeftNoteVerse, type ActiveLocation } from "../lib/noteGuard";
 import { canonicalTwlOrder, twlDisplayOrder } from "../lib/twlCanonicalOrder";
@@ -37,6 +37,13 @@ export interface ResourceCheckoff {
 // CSP frame-src (api/src/index.ts) — adding a different host requires updating
 // both.
 const SEARCH_IFRAME_URL = "https://swunrow.pythonanywhere.com/";
+
+// The alignment tab is off by default (panelMode starts "resources" in
+// Shell), so most sessions never need AlignmentPanel's DnD aligner code.
+// forwardRef components work through lazy() same as any other.
+const AlignmentPanel = lazy(() =>
+  import("./AlignmentPanel").then((m) => ({ default: m.AlignmentPanel })),
+);
 
 // Candidate slot for the reorder "stoplight" — the moved note plus the note
 // ids that would become its predecessor / successor at the current drag target
@@ -919,33 +926,35 @@ export function ResourceColumn({
       </Stack>
       {panelMode === "alignment" ? (
         alignmentProps ? (
-          <AlignmentPanel
-            // Remount on any target change (version OR verse). Without a key,
-            // React reuses the instance and the panel's `state` only resets via
-            // a passive useEffect that runs AFTER paint — leaving a window where
-            // `state` still holds the PREVIOUS version's alignment while `verse`
-            // / `onSave` are already bound to the new target. A save landing in
-            // that window writes the old content to the new row (e.g. UST
-            // alignment saved onto the ULT verse). Keying forces a fresh mount
-            // whose useState(computedInitial) seeds the correct state
-            // synchronously, closing the race.
-            key={`${alignmentProps.bibleVersion}:${alignmentProps.chapter}:${alignmentProps.verseNum}`}
-            ref={alignmentProps.panelRef}
-            book={alignmentProps.book}
-            chapter={alignmentProps.chapter}
-            verseNum={alignmentProps.verseNum}
-            bibleVersion={alignmentProps.bibleVersion}
-            verse={alignmentProps.verse}
-            sourceVerse={alignmentProps.sourceVerse}
-            sourceLabel={alignmentProps.sourceLabel}
-            twlForVerse={alignmentProps.twlForVerse}
-            onSave={alignmentProps.onSave}
-            onConfirmUnalign={alignmentProps.onConfirmUnalign}
-            onCancel={alignmentProps.onCancel}
-            onDirtyChange={alignmentProps.onDirtyChange}
-            onOpenDual={alignmentProps.onOpenDual}
-            onRestoreVersion={alignmentProps.onRestoreVersion}
-          />
+          <Suspense fallback={null}>
+            <AlignmentPanel
+              // Remount on any target change (version OR verse). Without a key,
+              // React reuses the instance and the panel's `state` only resets via
+              // a passive useEffect that runs AFTER paint — leaving a window where
+              // `state` still holds the PREVIOUS version's alignment while `verse`
+              // / `onSave` are already bound to the new target. A save landing in
+              // that window writes the old content to the new row (e.g. UST
+              // alignment saved onto the ULT verse). Keying forces a fresh mount
+              // whose useState(computedInitial) seeds the correct state
+              // synchronously, closing the race.
+              key={`${alignmentProps.bibleVersion}:${alignmentProps.chapter}:${alignmentProps.verseNum}`}
+              ref={alignmentProps.panelRef}
+              book={alignmentProps.book}
+              chapter={alignmentProps.chapter}
+              verseNum={alignmentProps.verseNum}
+              bibleVersion={alignmentProps.bibleVersion}
+              verse={alignmentProps.verse}
+              sourceVerse={alignmentProps.sourceVerse}
+              sourceLabel={alignmentProps.sourceLabel}
+              twlForVerse={alignmentProps.twlForVerse}
+              onSave={alignmentProps.onSave}
+              onConfirmUnalign={alignmentProps.onConfirmUnalign}
+              onCancel={alignmentProps.onCancel}
+              onDirtyChange={alignmentProps.onDirtyChange}
+              onOpenDual={alignmentProps.onOpenDual}
+              onRestoreVersion={alignmentProps.onRestoreVersion}
+            />
+          </Suspense>
         ) : (
           <Box sx={{ p: 3 }}>
             <Typography variant="body2" color="text.secondary">
