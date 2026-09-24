@@ -12,12 +12,20 @@
 // database. Matched as whole words outside string literals and comments, so a
 // column like `deleted_at` or a value like 'DELETE' does not trip it.
 const FORBIDDEN = [
-  "INSERT", "UPDATE", "DELETE", "REPLACE", "UPSERT", "MERGE",
+  "INSERT", "UPDATE", "DELETE", "UPSERT", "MERGE",
   "DROP", "ALTER", "CREATE", "TRUNCATE", "RENAME",
   "ATTACH", "DETACH", "VACUUM", "REINDEX", "ANALYZE", "PRAGMA",
   "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "TRANSACTION",
 ];
 const FORBIDDEN_RE = new RegExp(`\\b(${FORBIDDEN.join("|")})\\b`, "i");
+// REPLACE is a statement (REPLACE INTO …) and a scalar function replace(x, a, b).
+// The statement form is never followed by "(", so only that form is refused.
+const REPLACE_STMT_RE = /\bREPLACE\b(?!\s*\()/i;
+// Cheap ways to burn D1 CPU without writing: an unbounded recursive CTE or a
+// huge generated blob. A CPU-limit hit can reset the prod DB (STATE.md, 7429),
+// and this script runs without a human in the loop. A big cross join still
+// passes; keep queries narrow.
+const EXPENSIVE_RE = /\b(RECURSIVE|randomblob|zeroblob)\b/i;
 const LEADING_RE = /^(SELECT|WITH|EXPLAIN)\b/i;
 
 // Blank out string literals, quoted identifiers and comments, keeping length.
@@ -61,6 +69,8 @@ function stripLiterals(sql) {
 // null when `sql` is one read-only statement, else the reason it is refused.
 export function readOnlySqlProblem(sql) {
   if (typeof sql !== "string" || sql.trim() === "") return "empty SQL";
+  // Belt and braces for the wrangler argv: never let the SQL look like a flag.
+  if (sql.trimStart().startsWith("-")) return "must not start with '-'";
   const bare = stripLiterals(sql);
   if (bare === null) return "unterminated string literal or comment";
   const body = bare.trim().replace(/;\s*$/, "");
@@ -68,5 +78,8 @@ export function readOnlySqlProblem(sql) {
   if (!LEADING_RE.test(body)) return "must start with SELECT, WITH or EXPLAIN";
   const bad = body.match(FORBIDDEN_RE);
   if (bad) return `forbidden keyword ${bad[1].toUpperCase()}`;
+  if (REPLACE_STMT_RE.test(body)) return "forbidden keyword REPLACE";
+  const costly = body.match(EXPENSIVE_RE);
+  if (costly) return `refused as potentially expensive: ${costly[1].toUpperCase()}`;
   return null;
 }

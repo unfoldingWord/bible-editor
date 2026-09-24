@@ -20,6 +20,8 @@ const allowed = [
   "SELECT 1 -- DELETE FROM verses; trailing comment",
   "SELECT /* UPDATE x; */ 1",
   'SELECT "update" FROM t',                                    // quoted identifier
+  "SELECT replace(plain_text, ' ', '') FROM verses",          // scalar replace()
+  "SELECT REPLACE (plain_text, 'a', 'b') FROM verses",
 ];
 for (const sql of allowed) assert.equal(readOnlySqlProblem(sql), null, sql);
 
@@ -36,6 +38,11 @@ const refused = [
   ["SELECT 1 /* unterminated", "unterminated string literal or comment"],
   ["SELECT 'unterminated", "unterminated string literal or comment"],
   ["SELECT 'a'; DROP TABLE verses; --'", "more than one statement"],
+  ["--file=evil.sql\nSELECT 1", "must not start with '-'"],
+  ["WITH x AS (SELECT 1) REPLACE INTO t SELECT * FROM x", "forbidden keyword REPLACE"],
+  ["WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c", "refused as potentially expensive: RECURSIVE"],
+  ["SELECT randomblob(1000000000)", "refused as potentially expensive: RANDOMBLOB"],
+  ["  -- note\nSELECT 1", "must not start with '-'"],
 ];
 for (const [sql, why] of refused) assert.equal(readOnlySqlProblem(sql), why, sql);
 
