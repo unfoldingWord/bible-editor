@@ -65,6 +65,7 @@ import {
   masterMayHoldHumanEditForVerse,
   summarizeLineage,
   completeHumanRefEvidenceTouches,
+  humanRefEvidenceIsMeasurable,
   type ClassifiedCommit,
   type HumanRefEvidence,
   type MasterLineageSummary,
@@ -2478,12 +2479,16 @@ export async function applyTsvRows(
           // `possibleMasterActivityAtAncestorRef`: best-effort visibility only
           // (see the comment above classifyTsvRefMove's call) — VERSE-scoped
           // evidence, not proof this row's own history has an intermediate
-          // move. Never used to change the outcome.
+          // move. Never used to change the outcome. Tri-state: `null` means
+          // "unmeasurable" (no usable refBase, or the lineage evidence itself
+          // is missing/incomplete) rather than "measured, no touch" — the two
+          // used to both log as `false` (#874).
+          const refBaseUsable =
+            refBase != null && Number.isInteger(refBase.chapter) && Number.isInteger(refBase.verse);
           const possibleMasterActivityAtAncestorRef =
-            refBase != null &&
-            Number.isInteger(refBase.chapter) &&
-            Number.isInteger(refBase.verse) &&
-            completeHumanRefEvidenceTouches(cutoff?.lineage, refBase.chapter as number, refBase.verse as number);
+            refBaseUsable && humanRefEvidenceIsMeasurable(cutoff?.lineage)
+              ? completeHumanRefEvidenceTouches(cutoff?.lineage, refBase!.chapter as number, refBase!.verse as number)
+              : null;
           console.log("reimport: reference move attributed to the app; publishing it", {
             book,
             kind,
