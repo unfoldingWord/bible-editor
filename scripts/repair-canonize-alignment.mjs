@@ -60,8 +60,8 @@
 //   duplicate dump rows for it disagree; any UHB verse in [verse, verse_end] is
 //   missing or unparseable; the verifier sees any change beyond zaln
 //   content/lemma; or a statement would exceed 90,000 bytes. A target book
-//   with no UHB rows at all stops the run (exit 1). Verse 0 is front matter
-//   and counts as "no source", not a refusal.
+//   with no UHB rows at all stops the run (exit 1). An unaligned verse 0 with
+//   no UHB verse 0 is front matter ("no source"); an aligned one is refused.
 //
 // ── USAGE ──────────────────────────────────────────────────────────────────
 //   1. Dump (SELECT ONLY — never --file against --remote), from api/, per book:
@@ -86,7 +86,8 @@
 //        --book JER[,NUM]      only these books
 //        --bible-version ULT   only these target resources
 //        --exclude BOOK/CH/V/VER   drop one verse (repeatable)
-//        --allow-locked        include locked books in the SQL
+//        --allow-locked        include locked books in the SQL (and drop the
+//                              apply-time book_locks guard; unlock first anyway)
 //        --out <path>          SQL (default scripts/out/repair-canonize-alignment.sql)
 //        --json <path>         full per-verse report
 //        --force               overwrite an existing --out file
@@ -349,7 +350,13 @@ for (const row of targetRows) {
   const index = sourceIndexByBook.get(book);
   const v0key = `${Number(row.chapter)}:0`;
   if (Number(row.verse) === 0 && !index.words.has(v0key) && !index.unusable.has(v0key)) {
-    noSource++;
+    // No UHB verse 0 but the target is aligned: the dump is truncated, not
+    // front matter. Refuse rather than silently skip.
+    if (String(row.content_json).includes('"tag":"zaln"')) {
+      refused.push({ ref, rowKey, why: "aligned verse 0 but the UHB dump has no verse 0 for this chapter" });
+    } else {
+      noSource++;
+    }
     continue;
   }
   const cov = sourceCoverage(index, row.chapter, row.verse, row.verse_end);
@@ -401,9 +408,11 @@ function statementsFor(r) {
     ` version = version + 1, updated_at = ${nowTs}, updated_by = ${REPAIR_USER_ID},` +
     ` last_change_action = 'update', last_change_source = 'system', last_change_actor = ${sqlStr(REPAIR_ACTOR)}` +
     ` WHERE ${match} AND version = ${v}` +
-    // Apply-time lock guard: a lock placed between dump and apply blocks the
-    // write. (PUBLISHED_BOOKS is code, checked at generate time above.)
-    ` AND NOT EXISTS (SELECT 1 FROM book_locks WHERE book = ${sqlStr(row.book)} AND locked = 1);`;
+    // Apply-time lock guard: an explicit locked=1 row placed between dump and
+    // apply blocks the write. (PUBLISHED_BOOKS is code, checked at generate
+    // time above.) Omitted under --allow-locked, which asks to write locked
+    // books on purpose.
+    (allowLocked ? ";" : ` AND NOT EXISTS (SELECT 1 FROM book_locks WHERE book = ${sqlStr(row.book)} AND locked = 1);`);
   // Guarded audit row: only when the row is now at v+1 holding exactly our
   // content, and only once (re-running after a partial apply cannot double-log).
   // It keys on the UPDATE having happened, so a lock-blocked or version-skipped
@@ -504,8 +513,11 @@ const header = [
 
 // Every `--` line passes through commentSafe: refs, paths, book codes and
 // Strong's numbers come from data, and a raw CR/LF in one would end the
-// comment and turn the rest of that line into a live statement.
-const comment = (s) => commentSafe(s);
+// comment and turn the rest of that line into a live statement. A trailing
+// `;` is dropped too: scripts/split-sql.mjs counts any line ending in `;` as a
+// statement, so a comment ending in one shifts every segment boundary between
+// an UPDATE and its audit INSERT.
+const comment = (s) => commentSafe(s).replace(/;\s*$/, "");
 const lines = header.map((l) => (l.startsWith("--") ? comment(l) : l));
 for (const r of repaired) {
   lines.push(comment(`-- ${r.ref}  v${r.row.version} → v${Number(r.row.version) + 1}${r.lock ? `  [LOCKED: ${r.lock}; --allow-locked]` : ""}`));
