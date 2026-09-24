@@ -1460,8 +1460,11 @@ function ActiveLine({
 }) {
   const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   const [historyOpen, setHistoryOpen] = useState(false);
-  // The version chip + history are editable-ULT/UST only — read-only source
-  // lines and any line without a known version/restore handler get nothing.
+  // The version chip + history are ULT/UST only — source lines and any line
+  // without a known version/restore handler get nothing. A ULT/UST line that
+  // can't be edited right now (book locked, chapter mid-pipeline) still shows
+  // the chip: history is a read, and the server allows GETs on a locked book.
+  // The dialog opens view-only there (`canRestore` below).
   //
   // `version >= 1`, not `!= null`: a chapter-intro row that does not exist yet is
   // saved through a synthetic base carrying `version: 0` (see lib/verseIntro.ts),
@@ -1469,8 +1472,8 @@ function ActiveLine({
   // server's real row (version 1) comes back. Gating on `!= null` showed a `v0`
   // chip in that window, opening a history dialog for a row the server has never
   // held. Server versions start at 1, so this only ever excludes the placeholder.
-  const showHistory =
-    !!book && !!editable && !readOnly && !isSource && (version ?? 0) >= 1 && !!onRestoreVersion;
+  const showHistory = !!book && !isSource && (version ?? 0) >= 1 && !!onRestoreVersion;
+  const canRestore = !!editable && !readOnly;
   const draftKey = useMemo(
     () =>
       book && bibleVersion ? verseKey(book, chapter, verseNum, bibleVersion) : null,
@@ -1716,7 +1719,13 @@ function ActiveLine({
           {VERSION_LABEL[label] ?? label}
         </Typography>
         {showHistory && (
-          <Tooltip title="version history — view or restore an earlier save">
+          <Tooltip
+            title={
+              canRestore
+                ? "version history — view or restore an earlier save"
+                : "version history — view earlier saves (restore is off while locked)"
+            }
+          >
             <Chip
               icon={<HistoryIcon sx={{ fontSize: 14 }} />}
               label={`v${version}`}
@@ -1924,6 +1933,7 @@ function ActiveLine({
             verseNum={verseNum}
             bibleVersion={bibleVersion}
             currentVersion={version}
+            canRestore={canRestore}
             onClose={() => setHistoryOpen(false)}
             onUseVersion={(content, plainText) => onRestoreVersion?.(content, plainText)}
           />
