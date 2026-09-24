@@ -45,9 +45,15 @@ export async function getEntries(
   try {
     const idb = await db();
     const tx = idb.transaction(STORE, "readonly");
-    for (const k of strongs) {
-      const row = (await tx.store.get(k)) as LexiconRow | undefined;
-      if (row) out.set(k, row.entry);
+    // One transaction, all gets fired concurrently — sequential awaits here
+    // used to serialize hundreds of round trips before the network fetch for
+    // misses could even start (#898).
+    const rows = await Promise.all(
+      strongs.map((k) => tx.store.get(k) as Promise<LexiconRow | undefined>),
+    );
+    for (let i = 0; i < strongs.length; i++) {
+      const row = rows[i];
+      if (row) out.set(strongs[i]!, row.entry);
     }
     await tx.done;
   } catch {
@@ -61,9 +67,9 @@ export async function putEntries(map: Map<string, LexiconEntry | null>): Promise
   try {
     const idb = await db();
     const tx = idb.transaction(STORE, "readwrite");
-    for (const [strong, entry] of map) {
-      await tx.store.put({ strong, entry } satisfies LexiconRow);
-    }
+    await Promise.all(
+      Array.from(map, ([strong, entry]) => tx.store.put({ strong, entry } satisfies LexiconRow)),
+    );
     await tx.done;
   } catch {
     /* soft fail */

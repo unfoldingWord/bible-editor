@@ -1550,14 +1550,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // AND every loaded chapter in book mode, so the per-word tooltips in the
   // scripture column don't have to fetch on first hover. useLexicon
   // dedupes at module level, so passing this repeatedly is cheap.
+  // Per-chapter UHB Strong's lists, cached by the UHB verses object's own
+  // identity. `reduceVerses` only replaces the touched bible_version's slot
+  // (verseStructure.ts), so a ULT/UST save or `verse.updated` leaves
+  // `data.verses.UHB` — and every OTHER loaded chapter's UHB object in book
+  // mode — referentially unchanged. Without this cache every such save (and
+  // every unrelated book-mode chapter load, which replaces the whole
+  // `bookHook.chapters` Map) re-walked and re-`collectStrongs`'d every
+  // already-loaded chapter's UHB, even though UHB itself never changes (#898).
+  const uhbStrongsCacheRef = useRef(new WeakMap<Record<number, VerseDto>, string[]>());
   const uhbStrongs = useMemo(() => {
     const set = new Set<string>();
+    const cache = uhbStrongsCacheRef.current;
     const collect = (verses: Record<number, VerseDto> | undefined) => {
       if (!verses) return;
-      for (const v of Object.values(verses)) {
-        const objs = (v.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-        if (Array.isArray(objs)) for (const s of collectStrongs(objs)) set.add(s);
+      let strongs = cache.get(verses);
+      if (!strongs) {
+        strongs = [];
+        for (const v of Object.values(verses)) {
+          const objs = (v.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+          if (Array.isArray(objs)) strongs.push(...collectStrongs(objs));
+        }
+        cache.set(verses, strongs);
       }
+      for (const s of strongs) set.add(s);
     };
     collect(data?.verses?.UHB);
     if (bookHook) {
@@ -1569,7 +1585,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     return [...set];
     // `bookHook?.chapters` rather than `bookHook`: narrower, as in availableVersions above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data?.verses, bookHook?.chapters]);
+  }, [data?.verses?.UHB, bookHook?.chapters]);
   const lexiconMapRaw = useLexicon(uhbStrongs);
   // useLexicon hands back a fresh Map every render; stabilize its identity so
   // ScriptureColumn's and BookView's memos can compare it. Keyed on CONTENT —
