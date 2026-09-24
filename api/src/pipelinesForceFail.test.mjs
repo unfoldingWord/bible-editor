@@ -1253,14 +1253,18 @@ await withFetch(
   );
   assert(
     StatusResponseSchema.safeParse({
-      state: "done",
+      state: "running",
       output: [{ repo: "unfoldingWord/en_tn" }],
     }).success,
-    "an output[] entry with only some fields set still parses (lenient, matches pipelineImport.ts's OutputEntry)",
+    "an output[] entry with only some fields set still parses on a non-done state (lenient, matches pipelineImport.ts's OutputEntry)",
   );
   assert(
     !StatusResponseSchema.safeParse({ state: 1 }).success,
     "'state' as a number is rejected",
+  );
+  assert(
+    !StatusResponseSchema.safeParse({ state: "in_progress" }).success,
+    "an upstream state this codebase has never been taught (e.g. 'in_progress') is rejected, not stored verbatim",
   );
   assert(
     !StatusResponseSchema.safeParse({ state: "running", output: "not-an-array" }).success,
@@ -1273,6 +1277,26 @@ await withFetch(
   assert(
     !StatusResponseSchema.safeParse(null).success,
     "a non-object body (null) is rejected",
+  );
+  // Issue #859: a 'done' body finalizes the job and may dispatch a follow-up
+  // chain, so it must carry at least one entry the importer can actually use.
+  assert(
+    !StatusResponseSchema.safeParse({
+      state: "done",
+      output: [{ repo: "unfoldingWord/en_tn" }],
+    }).success,
+    "'done' with an output[] entry lacking rawUrl (nothing importable) is rejected",
+  );
+  assert(
+    StatusResponseSchema.safeParse({
+      state: "done",
+      output: [{ repo: "unfoldingWord/en_tn", rawUrl: "https://example/raw" }],
+    }).success,
+    "'done' with at least one importable output[] entry still parses",
+  );
+  assert(
+    StatusResponseSchema.safeParse({ state: "done" }).success,
+    "'done' with no output[] at all still parses (a run that produced nothing to import is not itself malformed)",
   );
 }
 
