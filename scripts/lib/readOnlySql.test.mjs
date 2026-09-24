@@ -15,10 +15,10 @@ const allowed = [
   "WITH x AS (SELECT book FROM verses) SELECT * FROM x",
   "EXPLAIN QUERY PLAN SELECT * FROM edit_log",
   "SELECT deleted_at, updated_at FROM tn_rows",               // keyword inside an identifier
-  "SELECT * FROM verses WHERE plain_text LIKE '%delete; drop%'", // keywords and ; inside a literal
+  "SELECT * FROM verses WHERE plain_text LIKE '%delete drop%'", // keywords inside a literal
   "SELECT 'it''s' AS s",                                       // doubled-quote escape
-  "SELECT 1 -- DELETE FROM verses; trailing comment",
-  "SELECT /* UPDATE x; */ 1",
+  "SELECT 1 -- DELETE FROM verses trailing comment",
+  "SELECT /* UPDATE x */ 1",
   'SELECT "update" FROM t',                                    // quoted identifier
   "SELECT replace(plain_text, ' ', '') FROM verses",          // scalar replace()
   "SELECT REPLACE (plain_text, 'a', 'b') FROM verses",
@@ -35,6 +35,9 @@ const refused = [
   ["WITH x AS (SELECT 1) DELETE FROM verses", "forbidden keyword DELETE"],
   ["WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x", "forbidden keyword INSERT"],
   ["EXPLAIN DELETE FROM verses", "forbidden keyword DELETE"],
+  ["SELECT [a; DELETE FROM verses; ] FROM t", "more than one statement"],
+  ["SELECT * FROM t WHERE x = 'a;b'", "more than one statement"],
+  ["SELECT 1 -- ; DELETE FROM verses", "more than one statement"],
   ["SELECT 1 /* unterminated", "unterminated string literal or comment"],
   ["SELECT 'unterminated", "unterminated string literal or comment"],
   ["SELECT 'a'; DROP TABLE verses; --'", "more than one statement"],

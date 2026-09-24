@@ -87,7 +87,7 @@ npx wrangler d1 execute bible_editor_dev --local --file=../scripts/out/import-ZE
 npm run tail                                                                 # wrangler tail (live API logs)
 ```
 
-Read-only prod queries (from repo root): `node scripts/d1-select.mjs [--out <file>] "<one SELECT>"`. It refuses anything but a single SELECT / WITH…SELECT / EXPLAIN and is allowlisted in `.claude/settings.json`, so agents use it instead of raw `wrangler d1 execute --remote --env production`.
+Read-only prod queries (from repo root): `node scripts/d1-select.mjs [--out scripts/out/<name>.json] "<one SELECT>"`. It refuses anything but a single SELECT / WITH…SELECT / EXPLAIN with no `;` except a trailing one, also refuses `RECURSIVE` / `randomblob` / `zeroblob` and bare keywords like `release` or `transaction` even as column names, and `--out` may only write `.json` under `scripts/out/`. It is allowlisted in `.claude/settings.json`, so agents use it instead of raw `wrangler d1 execute --remote --env production`.
 
 Web-only:
 

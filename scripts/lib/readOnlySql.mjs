@@ -71,6 +71,10 @@ export function readOnlySqlProblem(sql) {
   if (typeof sql !== "string" || sql.trim() === "") return "empty SQL";
   // Belt and braces for the wrangler argv: never let the SQL look like a flag.
   if (sql.trimStart().startsWith("-")) return "must not start with '-'";
+  // Any `;` but a trailing one is refused, even inside a literal or a [..] /
+  // `..` identifier: wrangler hands --remote SQL to D1's server, whose statement
+  // splitter is not documented, so do not rely on it agreeing with ours.
+  if (sql.trim().replace(/;\s*$/, "").includes(";")) return "more than one statement";
   const bare = stripLiterals(sql);
   if (bare === null) return "unterminated string literal or comment";
   const body = bare.trim().replace(/;\s*$/, "");

@@ -18,7 +18,7 @@
 // (STATE.md, code 7429).
 
 import { execFileSync } from "node:child_process";
-import { lstatSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readOnlySqlProblem } from "./lib/readOnlySql.mjs";
@@ -32,35 +32,42 @@ if (oi !== -1) {
   args.splice(oi, 2);
 }
 if (args.length !== 1 || !out && oi !== -1) {
-  console.error('usage: node scripts/d1-select.mjs [--out scripts/out/<name>.json] "<one SELECT statement>"');
+  console.error('usage: node scripts/d1-select.mjs [--out scripts/out/<name>.json (relative to the repo root)] "<one SELECT statement>"');
   process.exit(2);
-}
-// --out may only create/replace a .json file under this checkout's scripts/out/
-// (git-ignored). Anything wider turns an allowlisted prod READ into an
-// unprompted write of query-controlled bytes anywhere on disk (~/.bashrc, a git
-// hook). The parent directory is checked by realpath and the target must not
-// be a symlink, so neither `..` nor a planted link can leave scripts/out/.
-const outRoot = resolve(repoRoot, "scripts", "out");
-if (out) {
-  const target = resolve(out);
-  if (!target.startsWith(outRoot + sep) || !target.endsWith(".json")) {
-    console.error(`refused: --out must be a .json file under ${outRoot}`);
-    process.exit(2);
-  }
-  mkdirSync(dirname(target), { recursive: true });
-  let isLink = false;
-  try { isLink = lstatSync(target).isSymbolicLink(); } catch { /* does not exist yet */ }
-  if (isLink || !(realpathSync(dirname(target)) + sep).startsWith(realpathSync(outRoot) + sep)) {
-    console.error(`refused: --out resolves outside ${outRoot}`);
-    process.exit(2);
-  }
-  out = target;
 }
 const sql = args[0];
 const problem = readOnlySqlProblem(sql);
 if (problem) {
   console.error(`refused: ${problem}`);
   process.exit(2);
+}
+
+// --out may only create/replace a .json file under this checkout's scripts/out/
+// (git-ignored). Anything wider turns an allowlisted prod READ into an
+// unprompted write of query-controlled bytes anywhere on disk (~/.bashrc, a git
+// hook). A relative path is taken from the repo root. Before any directory is
+// created, the nearest existing ancestor must realpath inside scripts/out/, so
+// neither `..` nor a planted symlinked directory can leave it. The file is
+// written to a fresh temp name and renamed over the target, which replaces a
+// symlink or hardlink at that name instead of writing through it.
+const outRoot = resolve(repoRoot, "scripts", "out");
+if (out) {
+  const target = resolve(repoRoot, out);
+  if (!target.startsWith(outRoot + sep) || !target.endsWith(".json")) {
+    console.error(`refused: --out must be a .json file under ${outRoot}`);
+    process.exit(2);
+  }
+  mkdirSync(outRoot, { recursive: true });
+  const realRoot = realpathSync(outRoot);
+  let anc = dirname(target);
+  while (!existsSync(anc)) anc = dirname(anc);
+  const realAnc = realpathSync(anc);
+  if (realAnc !== realRoot && !realAnc.startsWith(realRoot + sep)) {
+    console.error(`refused: --out resolves outside ${outRoot}`);
+    process.exit(2);
+  }
+  mkdirSync(dirname(target), { recursive: true });
+  out = target;
 }
 
 const wrangler = resolve(repoRoot, "node_modules/wrangler/bin/wrangler.js");
@@ -77,7 +84,9 @@ try {
   process.exit(1);
 }
 if (out) {
-  writeFileSync(out, result);
+  const tmp = `${out}.${process.pid}.tmp`;
+  writeFileSync(tmp, result, { flag: "wx" });
+  renameSync(tmp, out);
   console.error(`wrote ${out} (${result.length} bytes)`);
 } else {
   process.stdout.write(result);
