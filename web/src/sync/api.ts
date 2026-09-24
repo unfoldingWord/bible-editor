@@ -2,6 +2,8 @@
 // dev proxy points /api/* at the local Worker; production serves the SPA
 // from the same origin as the Worker).
 
+import type { LexiconEntry } from "../hooks/useLexicon";
+
 export type RowKind = "tn" | "tq" | "twl";
 
 export interface TnRow {
@@ -649,6 +651,18 @@ export interface SystemAlert {
   message: string;
   linkUrl: string | null;
   createdAt: number;
+}
+
+// GET /api/lexicon?strongs=... — batched UHAL/UGL entries for the given
+// normalized Strong's numbers. Routed through `request` (not raw fetch) so a
+// hung lookup gets the shared timeout and a 401 gets a silent refresh+retry
+// like every other read, instead of leaving useLexicon's `inFlight` keys
+// stuck until reload (#898).
+export async function fetchLexiconEntries(strongs: string[]): Promise<LexiconEntry[]> {
+  const res = await request<{ entries?: LexiconEntry[] }>(
+    `/api/lexicon?strongs=${encodeURIComponent(strongs.join(","))}`,
+  );
+  return res.entries ?? [];
 }
 
 // GET /api/alerts/me — undismissed banner alerts targeted at this user.

@@ -6,8 +6,9 @@
 // F5 (or reload while offline) still renders tooltips and resource cards
 // without hitting the network.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
+import { fetchLexiconEntries } from "../sync/api";
 import { getEntries as getCachedEntries, putEntries as putCachedEntries } from "../sync/lexiconCache";
 
 export interface LexiconEntry {
@@ -58,10 +59,8 @@ async function ensure(rawStrongs: string[]) {
 
   for (const k of want) inFlight.add(k);
   try {
-    const url = `/api/lexicon?strongs=${encodeURIComponent(want.join(","))}`;
-    const res = await fetch(url);
-    const data = (await res.json()) as { entries?: LexiconEntry[] };
-    const byStrong = new Map((data.entries ?? []).map((e) => [e.strong, e]));
+    const entries = await fetchLexiconEntries(want);
+    const byStrong = new Map(entries.map((e) => [e.strong, e]));
     const fresh = new Map<string, LexiconEntry | null>();
     for (const k of want) {
       const entry = byStrong.get(k) ?? null;
@@ -83,7 +82,11 @@ async function ensure(rawStrongs: string[]) {
 // Subscribe to lexicon updates for the given raw Strong's. Returns a map
 // keyed by the *input* raw form so callers can look up by what they have.
 export function useLexicon(rawStrongs: string[]): Map<string, LexiconEntry | null> {
-  const [, force] = useState(0);
+  // `version` only bumps when a fetch/cache-read actually resolves (see
+  // `ensure`'s subscriber notification), not on every unrelated re-render —
+  // so the Map below is rebuilt at most once per lexicon update rather than
+  // once per Shell/AlignmentPanel render (#898).
+  const [version, force] = useState(0);
   const joined = rawStrongs.join(",");
   useEffect(() => {
     void ensure(rawStrongs);
@@ -95,18 +98,22 @@ export function useLexicon(rawStrongs: string[]): Map<string, LexiconEntry | nul
     // joined captures the set of strongs; rawStrongs identity is irrelevant.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [joined]);
-  const out = new Map<string, LexiconEntry | null>();
-  for (const raw of rawStrongs) {
-    const keys = normalizeStrong(raw);
-    let hit: LexiconEntry | null = null;
-    for (const k of keys) {
-      const v = cache.get(k);
-      if (v) {
-        hit = v;
-        break;
+  return useMemo(() => {
+    const out = new Map<string, LexiconEntry | null>();
+    for (const raw of rawStrongs) {
+      const keys = normalizeStrong(raw);
+      let hit: LexiconEntry | null = null;
+      for (const k of keys) {
+        const v = cache.get(k);
+        if (v) {
+          hit = v;
+          break;
+        }
       }
+      out.set(raw, hit);
     }
-    out.set(raw, hit);
-  }
-  return out;
+    return out;
+    // joined captures the set of strongs; rawStrongs identity is irrelevant.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [joined, version]);
 }
