@@ -2674,6 +2674,7 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
        VALUES (?, 2, 1, NULL, ?, ?, ?, 3, 1)`,
     )
     .run(BOOK, VERSION, contentJson("the fixed text"), "the fixed text");
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
   sqlite
     .prepare(
       `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
@@ -2747,6 +2748,7 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
        VALUES (?, 4, 1, NULL, ?, ?, ?, 3, 1)`,
     )
     .run(BOOK, VERSION, contentJson("the app edit"), "the app edit");
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 1)`).run(BOOK);
   sqlite
     .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('verse', ?, ?, 'baseline', ?, 500)`)
     .run(`${BOOK}/4/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the published text")) }));
@@ -2763,6 +2765,35 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
   eq(counts.merge_adopted, 1, "locked + both moved → master adopted");
   const alertable = sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult");
   eq(alertable.map((r) => [r.action, r.overwritten_version]), [["adopt_conflict", 3]], "…and the editor is alerted, pointing at their version");
+}
+
+{
+  // The cutoff was read while locked, but the book was unlocked before this
+  // chunk read its rows: the re-read wins, so the ordinary merge runs.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at, set_by) VALUES (?, 0, 100, 1)`).run(BOOK);
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 5, 1, NULL, ?, ?, ?, 3, 1)`,
+    )
+    .run(BOOK, VERSION, contentJson("aligned app text"), "aligned app text");
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('verse', ?, ?, 'baseline', ?, 500)`)
+    .run(`${BOOK}/5/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("old text")) }));
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at, source)
+       VALUES ('verse', ?, ?, NULL, 2, 3, 'update', ?, 1500, 'dcs_reimport')`,
+    )
+    .run(`${BOOK}/5/1/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("aligned app text")) }));
+  await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(5, 1, "door43 text")], null,
+    { confirmedAt: 1000, editId: 0, bookLocked: true }, false,
+  );
+  const mc = sqlite.prepare("SELECT reason FROM verse_merge_conflicts WHERE book = ? AND chapter = 5").all(BOOK)[0];
+  eq(mc?.reason === "book_locked", false, "a stale locked cutoff does not apply once the book is unlocked");
 }
 
 if (failed > 0) {

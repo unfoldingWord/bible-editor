@@ -4244,11 +4244,24 @@ async function readBookLocked(env: Env, book: string): Promise<boolean> {
   }
 }
 
+// Every path out of readMergeCutoff, the migration-lag fallbacks included,
+// carries the lock for ult/ust.
 async function getMasterConfirmedAt(
   env: Env,
   book: string,
   resource: string,
   includeConfirmedVerseBases: boolean = false,
+): Promise<MergeCutoff> {
+  const cutoff = await readMergeCutoff(env, book, resource, includeConfirmedVerseBases);
+  if (resource === "ult" || resource === "ust") cutoff.bookLocked = await readBookLocked(env, book);
+  return cutoff;
+}
+
+async function readMergeCutoff(
+  env: Env,
+  book: string,
+  resource: string,
+  includeConfirmedVerseBases: boolean,
 ): Promise<MergeCutoff> {
   try {
     const row = await env.DB.prepare(
@@ -4272,7 +4285,6 @@ async function getMasterConfirmedAt(
     if (includeConfirmedVerseBases && row && (resource === "ult" || resource === "ust")) {
       cutoff.confirmedVerseBases = await confirmedVerseBases(env, book, resource, row);
     }
-    if (resource === "ult" || resource === "ust") cutoff.bookLocked = await readBookLocked(env, book);
     return cutoff;
   } catch (e) {
     // 0064 may lag the Worker during a deploy. Preserve 0050's precise edit-id
@@ -6117,7 +6129,11 @@ async function applyVerseRows(
   const resource = bibleVersion.toLowerCase();
   const lastExportAt = cutoff?.confirmedAt ?? null;
   // Door43 master is authoritative for a locked book (verseMerge.ts step 3b).
-  const bookLocked = cutoff?.bookLocked === true;
+  // Re-read here, just before the row read below, when the cutoff says
+  // locked: the cutoff may be minutes old in the chunked nightly, and an
+  // unlock in between re-opens app edits this run must not treat as frozen.
+  // An edit after the row read is caught by the adoption's version CAS.
+  const bookLocked = cutoff?.bookLocked === true && (await readBookLocked(env, book));
   // P1.3: precise id boundary when present; both sub-selects swap to it together.
   const masterEditId = cutoff?.editId ?? null;
 

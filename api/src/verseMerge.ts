@@ -478,8 +478,10 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   //     a markers-only difference to adopt_no_visible_change (no alert).
   //     Benjamin, 2026-09-24: a markers-only overwrite is worth seeing, not
   //     alerting; a data-loss overwrite is worth alerting.
-  // No ancestor (step 2) and unparseable master content keep today's handling.
-  if (input.masterAuthoritative === true && theirsKey !== null) {
+  // No ancestor (step 2), unparseable master content, and the anchor of a
+  // bridge master split (theirsForAlignment set: its whole-range alignment
+  // check belongs to the structure path, issue #949) keep today's handling.
+  if (input.masterAuthoritative === true && theirsKey !== null && input.theirsForAlignment === undefined) {
     if (keysEqual(oursKey, baseKey) || input.oursFromMaster === true) {
       return { action: "adopt", adopt: true, conflict: false, reason: "book_locked" };
     }

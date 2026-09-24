@@ -701,6 +701,11 @@ console.log("\n[locked book: Door43 master is authoritative]");
     "locked: identical content still writes nothing",
   );
   eq(
+    computeVerseMerge({ ...lockedIn, oursFromMaster: true, theirsForAlignment: "{not json" }).action,
+    "keep_alignment_refused",
+    "locked: a split-bridge anchor keeps the ordinary structure-aware path (#949)",
+  );
+  eq(
     computeVerseMerge({ ...lockedIn, theirs: "{not json" }).action,
     "keep_alignment_refused",
     "locked: unparseable master is never adopted",
