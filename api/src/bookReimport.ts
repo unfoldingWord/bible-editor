@@ -181,6 +181,7 @@ import {
   verseVersionFloorSql,
 } from "./verseBridge.ts";
 import { isAboveBoundary, planStructure, structureKey, type StructureAdoption, type StructuralEdit } from "./verseStructure.ts";
+import { effectiveBookLock } from "./bookLock.ts";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
 
@@ -4126,6 +4127,13 @@ interface MergeCutoff {
    * pass it to that helper. See masterLineage.ts.
    */
   lineage?: MasterLineageSummary | null;
+  /**
+   * The book is locked (bookLock.ts's effectiveBookLock), so Door43 master is
+   * authoritative for it: see VerseMergeInput.masterAuthoritative. Read only
+   * for ult/ust, the resources whose merge honors it today. ABSENT means
+   * unlocked, as does a failed lock read (the pre-existing behavior).
+   */
+  bookLocked?: boolean;
 }
 
 // Issue #788: stableKey intentionally treats whitespace-only content changes as
@@ -4222,6 +4230,20 @@ async function confirmedVerseBases(
   }
 }
 
+// A failed read answers "unlocked": the merge then runs exactly as it did
+// before locks were consulted, which is the fail direction that invents nothing.
+async function readBookLocked(env: Env, book: string): Promise<boolean> {
+  try {
+    return (await effectiveBookLock(env, book)) != null;
+  } catch (e) {
+    console.error("reimport: book lock read failed — merging as unlocked", {
+      book,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return false;
+  }
+}
+
 async function getMasterConfirmedAt(
   env: Env,
   book: string,
@@ -4250,6 +4272,7 @@ async function getMasterConfirmedAt(
     if (includeConfirmedVerseBases && row && (resource === "ult" || resource === "ust")) {
       cutoff.confirmedVerseBases = await confirmedVerseBases(env, book, resource, row);
     }
+    if (resource === "ult" || resource === "ust") cutoff.bookLocked = await readBookLocked(env, book);
     return cutoff;
   } catch (e) {
     // 0064 may lag the Worker during a deploy. Preserve 0050's precise edit-id
@@ -6093,6 +6116,8 @@ async function applyVerseRows(
   // pre-fix "no watermark row" behavior, never treated as "nothing changed".
   const resource = bibleVersion.toLowerCase();
   const lastExportAt = cutoff?.confirmedAt ?? null;
+  // Door43 master is authoritative for a locked book (verseMerge.ts step 3b).
+  const bookLocked = cutoff?.bookLocked === true;
   // P1.3: precise id boundary when present; both sub-selects swap to it together.
   const masterEditId = cutoff?.editId ?? null;
 
@@ -6662,6 +6687,7 @@ async function applyVerseRows(
           ),
           // Issue #728: set only for the anchor of a bridge master has split.
           theirsForAlignment: structureAlignmentTheirs.get(structureKey(v.chapter, v.verse)),
+          masterAuthoritative: bookLocked,
         });
         mergeAction = merge.action;
         // Issue #728: an anchor the content merge did NOT adopt — step 7s decides
@@ -7777,8 +7803,18 @@ async function applyVerseRows(
   // structure_absorbed_human_edit pointer is an adopt_conflict like any other:
   // left unconfirmed, a previously resolved row on that verse kept its stale
   // resolved_at and the banner (resolved_at IS NULL) never showed the pointer.
+  //
+  // Only THIS run's own adopt_conflict (after the 6a refinement) may reactivate
+  // a resolved row, because only it is a new overwrite a human must look at.
+  // The upsert keeps a stored adopt_conflict's action when tonight's outcome is
+  // a clean adopt or adopt_no_visible_change, so confirming those reactivated a
+  // row a human had already resolved, with its old recovery pointer, and
+  // re-raised the alert every night Door43 touched the verse again: a locked
+  // book's `book_locked` adoptions, and markers-only changes such as restored
+  // `\ts\*` (ZEC 1:17 ULT, 2026-09-24). A new row needs no confirm; it is
+  // inserted unresolved.
   const confirmRefs = mergeConflicts
-    .filter((mc) => mc.adopted && adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
+    .filter((mc) => mc.adopted && mc.action === "adopt_conflict" && adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
     .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
   if (confirmRefs.length > 0) {
     await confirmAdoptedConflicts(env, book, resource, confirmRefs);

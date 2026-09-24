@@ -114,6 +114,19 @@ export interface VerseMergeInput {
    * unparseable `theirs` (fail closed, keep_alignment_refused).
    */
   theirsForAlignment?: string;
+  /**
+   * The book is locked (book_locks or the published default, bookLock.ts's
+   * effectiveBookLock). A lock freezes the app side: nobody can edit the book
+   * here and the export does not run, so Door43 master is the only place the
+   * book can move and it is authoritative for any verse master changed since
+   * the ancestor (Benjamin, 2026-09-24: "the lock is to prevent problems from
+   * the BE side"). Without this, the ancestor can
+   * never advance while locked, because only an export re-confirms master, and
+   * every Door43 commit then read as "both changed" against the last pre-lock
+   * app edit and re-alerted that editor nightly (ZEC 1:17 ULT, Rich,
+   * 2026-09-18 through 2026-09-24). OMITTED means unlocked.
+   */
+  masterAuthoritative?: boolean;
 }
 
 export interface VerseMergeResult {
@@ -438,6 +451,20 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   // 3. Master never moved since the ancestor — the difference is ours.
   if (keysEqual(baseKey, theirsKey)) {
     return { action: "keep_master_unchanged", adopt: false, conflict: false, reason: "master_unchanged" };
+  }
+
+  // 3b. Locked book, and master DID move this verse since the ancestor: master
+  // is authoritative. Asked after step 3 on purpose: a verse master never
+  // touched keeps D1, because an unlock -> fix -> re-lock -> lock/push to a
+  // review branch (bookImport.ts) leaves the fix in D1 before master has it,
+  // and a Door43 commit elsewhere in the book must not revert it. Asked before
+  // the alignment guard, because keeping D1 here would only hand the pre-lock
+  // text back to master on the first export after unlock. A clean `adopt`
+  // still gets its audit row with the replaced version (applyVerseRows), so
+  // the old text stays recoverable; it just raises no alert. No ancestor
+  // (step 2) and unparseable master content both keep today's handling.
+  if (input.masterAuthoritative === true && theirsKey !== null) {
+    return { action: "adopt", adopt: true, conflict: false, reason: "book_locked" };
   }
 
   // 4. Alignment guard: refuse to adopt master's content if doing so would

@@ -39,7 +39,15 @@ function validNodes(nodes: unknown[], depth: number = 0): boolean {
     // every real verse into a false all-axes warning. Conversely an arbitrary
     // `{type:"opaque", value:"changed"}` remains uninspectable and fails closed.
     const markerOnlyType = obj.type === "paragraph" || obj.type === "quote" || obj.type === "section" || obj.type === "milestone";
-    if (!("text" in obj) && !("children" in obj) && !(markerOnlyType && typeof obj.tag === "string")) return false;
+    // usfm-js parses a self-closing marker such as `\ts\*` as a bare
+    // `{tag, nextChar}` with no `type` at all. It carries no text, so it is as
+    // inspectable as the typed marker shapes above. Rejecting it reported
+    // every axis changed on 49 of 49 flagged verses the night after Rich
+    // restored `\ts\*` markers on Door43 (ZEC 1:17 ULT, 2026-09-24), when
+    // nothing a reader could see had changed. Kept exactly this narrow: only
+    // `tag` and `nextChar` may be present.
+    const bareMarker = typeof obj.tag === "string" && Object.keys(obj).every((k) => k === "tag" || k === "nextChar");
+    if (!("text" in obj) && !("children" in obj) && !(markerOnlyType && typeof obj.tag === "string") && !bareMarker) return false;
     if ("type" in obj && typeof obj.type !== "string") return false;
     if ("tag" in obj && typeof obj.tag !== "string") return false;
     if ("text" in obj && typeof obj.text !== "string") return false;
