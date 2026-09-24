@@ -24,8 +24,6 @@ import {
   Divider,
   Link,
 } from "@mui/material";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
 import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
@@ -85,6 +83,9 @@ import {
 
 const NoteHistoryDialog = lazy(() =>
   import("./NoteHistoryDialog").then((m) => ({ default: m.NoteHistoryDialog })),
+);
+const MarkdownView = lazy(() =>
+  import("./MarkdownView").then((m) => ({ default: m.MarkdownView })),
 );
 
 export type DropPosition = "before" | "after";
@@ -557,9 +558,9 @@ function NoteBodyMarkdownView({
       }}
     >
       {text.trim() ? (
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: LinkComponent }}>
-          {text}
-        </ReactMarkdown>
+        <Suspense fallback={null}>
+          <MarkdownView components={{ a: LinkComponent }}>{text}</MarkdownView>
+        </Suspense>
       ) : (
         " "
       )}

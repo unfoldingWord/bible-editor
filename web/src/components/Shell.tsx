@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Box,
   Typography,
@@ -79,11 +79,7 @@ import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import type { BookViewportRestore } from "./BookView";
 import { ResourceColumn, type AlignmentTabProps, type PanelMode, type ReorderPreview, type ResourceCheckoff, type ResourceLane } from "./ResourceColumn";
 import type { AlignmentPanelHandle } from "./AlignmentPanel";
-import {
-  SideBySideAligner,
-  type PanelSlot,
-  type ReadingLineHandle,
-} from "./SideBySideAligner";
+import type { PanelSlot, ReadingLineHandle } from "./SideBySideAligner";
 import { TopBar } from "./TopBar";
 import { ExportUsfmButton } from "./ExportUsfmButton";
 import { PrintPreviewButton } from "./PrintPreviewButton";
@@ -106,6 +102,14 @@ interface AlignerTarget {
   verse: number;
   bibleVersion: string;
 }
+
+// The dual-aligner popup (and the AlignmentPanel it hosts on each side) only
+// mounts once a translator opens it — lazy-loading keeps its ~35 KB, and the
+// AlignmentPanel chunk it would otherwise force into the eager graph, out of
+// the main bundle for every session that never touches it.
+const SideBySideAligner = lazy(() =>
+  import("./SideBySideAligner").then((m) => ({ default: m.SideBySideAligner })),
+);
 
 // Per-version slice of the alignment props: target verse, the source for the
 // verses that target covers (concatenated across a multi-verse range), and the
@@ -4238,37 +4242,39 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         </DialogActions>
       </Dialog>
       {dualAlignerProps && (
-        <SideBySideAligner
-          open
-          onClose={requestCloseDual}
-          book={dualAlignerProps.book}
-          chapter={dualAlignerProps.chapter}
-          verseNum={dualAlignerProps.verseNum}
-          vref={dualAlignerProps.vref}
-          sourceLabel={dualAlignerProps.sourceLabel}
-          sourceVerse={dualAlignerProps.sourceVerse}
-          twlForVerse={dualAlignerProps.twlForVerse}
-          lexiconMap={lexiconMap}
-          left={dualAlignerProps.left}
-          right={dualAlignerProps.right}
-          onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
-          onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
-          // Lane checks live on the loaded chapter's useChapter state; only
-          // wire when the dual popup is on that same chapter (verse arrows
-          // already no-op across chapters for the same reason).
-          textCheck={
-            dualAlignerProps.chapter === chapter ? textLaneCheck : undefined
-          }
-          onSaveReading={(bv, plain, base, afterCommit) =>
-            // base.verse, not verseNum — each side's row may start at a
-            // different verse (ULT v7 singleton vs UST 6-9 range row).
-            // afterCommit threads through so ReadingLineHandle.save (and thus
-            // the resolveDualAction save chain, #490) only proceeds once this
-            // actually lands — synchronously, or after the collateral-loss
-            // confirm's "Save anyway".
-            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit)
-          }
-        />
+        <Suspense fallback={null}>
+          <SideBySideAligner
+            open
+            onClose={requestCloseDual}
+            book={dualAlignerProps.book}
+            chapter={dualAlignerProps.chapter}
+            verseNum={dualAlignerProps.verseNum}
+            vref={dualAlignerProps.vref}
+            sourceLabel={dualAlignerProps.sourceLabel}
+            sourceVerse={dualAlignerProps.sourceVerse}
+            twlForVerse={dualAlignerProps.twlForVerse}
+            lexiconMap={lexiconMap}
+            left={dualAlignerProps.left}
+            right={dualAlignerProps.right}
+            onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
+            onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
+            // Lane checks live on the loaded chapter's useChapter state; only
+            // wire when the dual popup is on that same chapter (verse arrows
+            // already no-op across chapters for the same reason).
+            textCheck={
+              dualAlignerProps.chapter === chapter ? textLaneCheck : undefined
+            }
+            onSaveReading={(bv, plain, base, afterCommit) =>
+              // base.verse, not verseNum — each side's row may start at a
+              // different verse (ULT v7 singleton vs UST 6-9 range row).
+              // afterCommit threads through so ReadingLineHandle.save (and thus
+              // the resolveDualAction save chain, #490) only proceeds once this
+              // actually lands — synchronously, or after the collateral-loss
+              // confirm's "Save anyway".
+              saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit)
+            }
+          />
+        </Suspense>
       )}
       <Dialog open={!!pendingAlignmentLoss} onClose={() => setPendingAlignmentLoss(null)}>
         <DialogTitle>
