@@ -13,7 +13,8 @@
 export async function serveHashedAsset(req: Request, assets: Fetcher | undefined): Promise<Response> {
   if (assets) {
     const res = await assets.fetch(req);
-    if (!(res.headers.get("Content-Type") ?? "").startsWith("text/html")) return res;
+    if (!(res.headers.get("Content-Type") ?? "").toLowerCase().startsWith("text/html")) return res;
+    await res.body?.cancel();
   }
   return new Response("Not Found", {
     status: 404,

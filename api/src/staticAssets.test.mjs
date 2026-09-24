@@ -50,6 +50,15 @@ console.log("SPA fallback (text/html) under /assets/* becomes an uncacheable 404
   assert(assets.seen.length === 1, "delegated to ASSETS once");
 }
 
+console.log("the text/html match ignores media-type case");
+{
+  const assets = stubAssets(
+    new Response("<!doctype html>", { status: 200, headers: { "Content-Type": "Text/HTML", "Cache-Control": IMMUTABLE } }),
+  );
+  const res = await serveHashedAsset(new Request("https://x/assets/gone.js"), assets);
+  assert(res.status === 404, `status 404 (got ${res.status})`);
+}
+
 console.log("a real hashed asset passes through unchanged");
 {
   const original = new Response("export{}", {
