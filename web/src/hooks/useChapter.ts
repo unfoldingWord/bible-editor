@@ -24,6 +24,7 @@ import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapt
 import {
   applyStep,
   applyUpdated,
+  isStructureStep,
   mergeRefetched,
   reduceVerses,
   replaySteps,
@@ -92,7 +93,8 @@ export interface UseChapterReturn {
    * confirms; reused by the WS `verse.split` handler.
    */
   applyLocalVerseSplit: (start: VerseDto, newVerses: VerseDto[]) => void;
-  applyLocalVerseStatus: (verse: number, done: boolean) => void;
+  /** `updatedAt`: the server's timestamp, when the status came from the server (WS / outbox result). */
+  applyLocalVerseStatus: (verse: number, done: boolean, updatedAt?: number) => void;
   /** Optimistically add/remove my own stamp on a (verse, lane). */
   applyLocalLaneCheck: (verse: number, lane: CheckLane, userId: number, checked: boolean) => void;
   /** Authoritative: replace a (verse, lane)'s checker set (server result / WS). */
@@ -141,6 +143,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       setError(e instanceof ApiError ? `HTTP ${e.status}` : String(e));
       setStatus("error");
     },
+    // A row / status step recorded before a newer merging GET was sent is in
+    // that GET's snapshot already; only verse-structure steps carry over.
+    keepOnSupersede: isStructureStep,
   });
 
   const refetch = useCallback((opts?: RefetchOptions) => {
@@ -194,8 +199,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // Row replacements / deletes / inserts are recorded for replay while a
   // keepNewerLocal refetch is pending (#974): the merge takes row membership
   // from the fetch, so a row created or deleted in the GET's window would
-  // otherwise vanish or come back. Replay is guarded (lib/verseStructure.ts
-  // `applyStep`); the live update below is unchanged.
+  // otherwise vanish or come back. Replay applies a step over a fetched row
+  // only when strictly newer (lib/verseStructure.ts `applyStep`); the live
+  // update below is unchanged.
   const applyLocalRowReplacement = useCallback<UseChapterReturn["applyLocalRowReplacement"]>(
     (kind, row) => {
       sequencer.current?.record({ type: "rowReplace", kind, row });
@@ -224,7 +230,11 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
 
   const applyLocalRowInsert = useCallback<UseChapterReturn["applyLocalRowInsert"]>(
     (kind, row, position) => {
-      sequencer.current?.record({ type: "rowInsert", kind, row, afterId: position?.afterId });
+      // A late createRow response from the previous chapter must not be
+      // queued for replay into this one (applyStep also refuses it).
+      if (row.book === book && row.chapter === chapter) {
+        sequencer.current?.record({ type: "rowInsert", kind, row, afterId: position?.afterId });
+      }
       setData((prev) => {
         if (!prev) return prev;
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
@@ -246,7 +256,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
-    [],
+    [book, chapter],
   );
 
   // The verse map is reduced by lib/verseStructure.ts so the WS reorder rules
@@ -302,43 +312,100 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     [dispatchStep],
   );
 
-  // Verse statuses, lane checks and TWL locks are unversioned; their updates
-  // are steps too, so one arriving while a keepNewerLocal refetch is pending
-  // is replayed over the fetched lists instead of reverted by them (#974).
-  // Timestamps are fixed at call time so the replay writes the same value.
   const applyLocalVerseStatus = useCallback<UseChapterReturn["applyLocalVerseStatus"]>(
-    (verse, done) => {
-      dispatchStep({ type: "verseStatus", verse, done, updatedAt: Math.floor(Date.now() / 1000) });
+    (verse, done, updatedAt) => {
+      // Only a server-stamped status is recorded for replay: its updated_at is
+      // what proves it newer than a refetch's snapshot (#974).
+      if (updatedAt != null) sequencer.current?.record({ type: "verseStatus", verse, done, updatedAt });
+      setData((prev) => {
+        if (!prev) return prev;
+        const existing = prev.verseStatuses.find((s) => s.verse === verse);
+        const updated: VerseStatus = {
+          book: prev.book,
+          chapter: prev.chapter,
+          verse,
+          done: done ? 1 : 0,
+          updated_at: updatedAt ?? Math.floor(Date.now() / 1000),
+        };
+        const next = existing
+          ? prev.verseStatuses.map((s) => (s.verse === verse ? updated : s))
+          : [...prev.verseStatuses, updated];
+        return { ...prev, verseStatuses: next };
+      });
     },
-    [dispatchStep],
+    [],
   );
 
   const applyLocalLaneCheck = useCallback<UseChapterReturn["applyLocalLaneCheck"]>(
     (verse, lane, userId, checked) => {
-      dispatchStep({ type: "laneCheck", verse, lane, userId, checked, checkedAt: Math.floor(Date.now() / 1000) });
+      setData((prev) => {
+        if (!prev) return prev;
+        const exists = prev.verseLaneChecks.some(
+          (c) => c.verse === verse && c.lane === lane && c.checked_by === userId,
+        );
+        if (checked && exists) return prev;
+        if (!checked && !exists) return prev;
+        const next = checked
+          ? [
+              ...prev.verseLaneChecks,
+              {
+                book: prev.book,
+                chapter: prev.chapter,
+                verse,
+                lane,
+                checked_by: userId,
+                checked_at: Math.floor(Date.now() / 1000),
+              } as VerseLaneCheck,
+            ]
+          : prev.verseLaneChecks.filter(
+              (c) => !(c.verse === verse && c.lane === lane && c.checked_by === userId),
+            );
+        return { ...prev, verseLaneChecks: next };
+      });
     },
-    [dispatchStep],
+    [],
   );
 
   const applyLaneCheckers = useCallback<UseChapterReturn["applyLaneCheckers"]>(
     (verse, lane, checkers) => {
-      dispatchStep({ type: "laneCheckers", verse, lane, checkers, checkedAt: Math.floor(Date.now() / 1000) });
+      setData((prev) => {
+        if (!prev) return prev;
+        const rest = prev.verseLaneChecks.filter((c) => !(c.verse === verse && c.lane === lane));
+        const now = Math.floor(Date.now() / 1000);
+        const added: VerseLaneCheck[] = checkers.map((checked_by) => ({
+          book: prev.book,
+          chapter: prev.chapter,
+          verse,
+          lane,
+          checked_by,
+          checked_at: now,
+        }));
+        return { ...prev, verseLaneChecks: [...rest, ...added] };
+      });
     },
-    [dispatchStep],
+    [],
   );
 
   const replaceLaneChecksForLane = useCallback<UseChapterReturn["replaceLaneChecksForLane"]>(
     (lane, checks) => {
-      dispatchStep({ type: "laneChecksForLane", lane, checks });
+      setData((prev) => {
+        if (!prev) return prev;
+        const rest = prev.verseLaneChecks.filter((c) => c.lane !== lane);
+        return { ...prev, verseLaneChecks: [...rest, ...checks] };
+      });
     },
-    [dispatchStep],
+    [],
   );
 
   const applyLocalTwlOrderLock = useCallback<UseChapterReturn["applyLocalTwlOrderLock"]>(
     (verse, lock) => {
-      dispatchStep({ type: "twlOrderLock", verse, lock });
+      setData((prev) => {
+        if (!prev) return prev;
+        const rest = (prev.twlOrderLocks ?? []).filter((l) => l.verse !== verse);
+        return { ...prev, twlOrderLocks: lock ? [...rest, lock] : rest };
+      });
     },
-    [dispatchStep],
+    [],
   );
 
   // Adopt server-confirmed values when an outbox op succeeds.
@@ -365,7 +432,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       if (op.target.kind === "verse_status") {
         const s = result.updated as VerseStatus;
         if (s && s.book === book && s.chapter === chapter) {
-          applyLocalVerseStatus(s.verse, s.done === 1);
+          applyLocalVerseStatus(s.verse, s.done === 1, s.updated_at);
         }
         return;
       }

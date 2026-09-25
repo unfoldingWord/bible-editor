@@ -40,16 +40,7 @@
 // the server payload carries none, and after a refetch the verse map itself
 // is authoritative again.
 
-import type {
-  ChapterPayload,
-  CheckLane,
-  RowKind,
-  TwlOrderLock,
-  VerseDto,
-  VerseLaneCheck,
-  VerseStatus,
-} from "../sync/api";
-import { shouldApplyUpsert, type UpsertableRow } from "../components/rowUpsertGuard.ts";
+import type { ChapterPayload, RowKind, TnRow, TqRow, TwlRow, VerseDto, VerseStatus } from "../sync/api";
 
 export interface VerseLike {
   verse: number;
@@ -104,25 +95,30 @@ export function reduceVerses(
  * keeps the local row), so force steps are simply not recorded.
  *
  * The remaining arms are the chapter's non-verse state (#974). The merge
- * takes tn / tq / twl membership and the unversioned statuses / lane checks /
- * TWL locks from the fetch, so without replay a row created while the GET was
- * in flight vanished, one deleted in that window came back, and a done / lane
- * check / lock toggle was reverted on screen.
- *   - `rowInsert` / `rowReplace` / `rowDelete` are recorded by useChapter for
- *     replay only; the live update stays in its own row updaters. On replay a
- *     row the fetch already has is replaced only if `shouldApplyUpsert` agrees
- *     (the same guard as the WS `row.upserted` handler), so a stale event never
- *     regresses a newer fetched row while a same-version toggle / reorder still
- *     lands. `rowInsert` adds a row the fetch lacks; `rowReplace` never does (a
- *     row the server deleted must not be resurrected by an older event). Row
- *     ids are never reused, so `rowDelete` is final. An optimistic
- *     `applyLocalRowPatch` is not recorded (like a forced verse edit): its
- *     outbox result is, as a `rowReplace`.
- *   - `verseStatus` / `laneCheck` / `laneCheckers` / `laneChecksForLane` /
- *     `twlOrderLock` carry no version; they are the live updates themselves
- *     and replay in arrival order, so the last event per key wins exactly as it
- *     did on screen. Timestamps are taken when the step is created so a replay
- *     writes what the live update wrote.
+ * takes tn / tq / twl membership and verse statuses from the fetch, so without
+ * replay a row created while the GET was in flight vanished, one deleted in
+ * that window came back, and a done toggle was reverted on screen. They are
+ * recorded by useChapter for replay only (the live update stays in its own
+ * updaters), and the rule is: a replayed step never overrides the fetched
+ * snapshot unless it is provably newer than it.
+ *   - `rowInsert` / `rowReplace` over a row the fetch already has apply only
+ *     when STRICTLY newer by version. Same-version server changes (preserve /
+ *     hint / trash toggles, reorder-only sort_order) cannot be ordered against
+ *     the snapshot, so the fetch wins; a same-version toggle made during the
+ *     window can still be reverted on screen, as before #974. `rowInsert` adds
+ *     a row the fetch lacks; `rowReplace` never does (a row the server deleted
+ *     must not be resurrected by an older event). A row of another chapter (a
+ *     late createRow response after navigation) is never inserted. Row ids are
+ *     never reused, so `rowDelete` is final. An optimistic
+ *     `applyLocalRowPatch` is not recorded (like a forced verse edit).
+ *   - `verseStatus` carries the server's `updated_at` and applies only when
+ *     strictly newer than the fetched entry, or when the fetch has no entry
+ *     for a verse that still has a row (statuses are only ever deleted by a
+ *     bridge, which removes the row too). Only server-stamped statuses are
+ *     recorded; a status equal-to-the-second loses to the fetch.
+ *   - Lane checks and TWL order locks are NOT replayed: an unchecked lane or a
+ *     cleared lock leaves no timestamp, so a delayed event cannot be proven
+ *     newer than the snapshot. The fetch wins for them, as before #974.
  */
 export type StructureStep =
   | {
@@ -136,14 +132,17 @@ export type StructureStep =
     }
   | { type: "split"; bibleVersion: string; start: VerseDto; newVerses: VerseDto[] }
   | { type: "updated"; bibleVersion: string; verse: VerseDto }
-  | { type: "rowInsert"; kind: RowKind; row: UpsertableRow; afterId?: string }
-  | { type: "rowReplace"; kind: RowKind; row: UpsertableRow }
+  | { type: "rowInsert"; kind: RowKind; row: ChapterRow; afterId?: string }
+  | { type: "rowReplace"; kind: RowKind; row: ChapterRow }
   | { type: "rowDelete"; kind: RowKind; id: string }
-  | { type: "verseStatus"; verse: number; done: boolean; updatedAt: number }
-  | { type: "laneCheck"; verse: number; lane: CheckLane; userId: number; checked: boolean; checkedAt: number }
-  | { type: "laneCheckers"; verse: number; lane: CheckLane; checkers: number[]; checkedAt: number }
-  | { type: "laneChecksForLane"; lane: CheckLane; checks: VerseLaneCheck[] }
-  | { type: "twlOrderLock"; verse: number; lock: TwlOrderLock | null };
+  | { type: "verseStatus"; verse: number; done: boolean; updatedAt: number };
+
+type ChapterRow = TnRow | TqRow | TwlRow;
+
+/** Verse structure steps; the rest are chapter data steps (rows, statuses). */
+export function isStructureStep(step: StructureStep): boolean {
+  return step.type === "bridged" || step.type === "split" || step.type === "updated";
+}
 
 /**
  * Apply one `StructureStep` to a chapter payload. Returns `prev` itself when
@@ -187,10 +186,11 @@ export function applyStep(prev: ChapterData, step: StructureStep): ChapterData {
     }
     case "rowInsert":
     case "rowReplace": {
-      const list = prev[step.kind] as UpsertableRow[];
+      if (step.row.book !== prev.book || step.row.chapter !== prev.chapter) return prev;
+      const list = prev[step.kind] as ChapterRow[];
       const idx = list.findIndex((r) => r.id === step.row.id);
       if (idx >= 0) {
-        if (!shouldApplyUpsert(step.kind, step.row, list[idx])) return prev;
+        if (step.row.version <= list[idx].version) return prev;
         const next = list.slice();
         next[idx] = step.row;
         return { ...prev, [step.kind]: next };
@@ -201,11 +201,13 @@ export function applyStep(prev: ChapterData, step: StructureStep): ChapterData {
       return { ...prev, [step.kind]: next };
     }
     case "rowDelete": {
-      const list = prev[step.kind] as UpsertableRow[];
+      const list = prev[step.kind] as ChapterRow[];
       if (!list.some((r) => r.id === step.id)) return prev;
       return { ...prev, [step.kind]: list.filter((r) => r.id !== step.id) };
     }
     case "verseStatus": {
+      const existing = prev.verseStatuses.find((s) => s.verse === step.verse);
+      if (existing ? step.updatedAt <= existing.updated_at : !verseHasRow(prev, step.verse)) return prev;
       const updated: VerseStatus = {
         book: prev.book,
         chapter: prev.chapter,
@@ -213,52 +215,18 @@ export function applyStep(prev: ChapterData, step: StructureStep): ChapterData {
         done: step.done ? 1 : 0,
         updated_at: step.updatedAt,
       };
-      const found = prev.verseStatuses.some((s) => s.verse === step.verse);
-      const verseStatuses = found
-        ? prev.verseStatuses.map((s) => (s.verse === step.verse ? updated : s))
+      const verseStatuses = existing
+        ? prev.verseStatuses.map((s) => (s === existing ? updated : s))
         : [...prev.verseStatuses, updated];
       return { ...prev, verseStatuses };
     }
-    case "laneCheck": {
-      const mine = (c: VerseLaneCheck) => c.verse === step.verse && c.lane === step.lane && c.checked_by === step.userId;
-      const found = prev.verseLaneChecks.some(mine);
-      if (step.checked === found) return prev;
-      const verseLaneChecks = step.checked
-        ? [
-            ...prev.verseLaneChecks,
-            {
-              book: prev.book,
-              chapter: prev.chapter,
-              verse: step.verse,
-              lane: step.lane,
-              checked_by: step.userId,
-              checked_at: step.checkedAt,
-            },
-          ]
-        : prev.verseLaneChecks.filter((c) => !mine(c));
-      return { ...prev, verseLaneChecks };
-    }
-    case "laneCheckers": {
-      const rest = prev.verseLaneChecks.filter((c) => !(c.verse === step.verse && c.lane === step.lane));
-      const added: VerseLaneCheck[] = step.checkers.map((checked_by) => ({
-        book: prev.book,
-        chapter: prev.chapter,
-        verse: step.verse,
-        lane: step.lane,
-        checked_by,
-        checked_at: step.checkedAt,
-      }));
-      return { ...prev, verseLaneChecks: [...rest, ...added] };
-    }
-    case "laneChecksForLane": {
-      const rest = prev.verseLaneChecks.filter((c) => c.lane !== step.lane);
-      return { ...prev, verseLaneChecks: [...rest, ...step.checks] };
-    }
-    case "twlOrderLock": {
-      const rest = (prev.twlOrderLocks ?? []).filter((l) => l.verse !== step.verse);
-      return { ...prev, twlOrderLocks: step.lock ? [...rest, step.lock] : rest };
-    }
   }
+}
+
+// A verse number that is a row key in some bible_version (not absorbed into
+// another verse's bridge).
+function verseHasRow(data: ChapterData, verse: number): boolean {
+  return Object.values(data.verses).some((rows) => rows[verse] != null);
 }
 
 /**
@@ -301,7 +269,8 @@ export function replaySteps(state: ChapterData, steps: readonly StructureStep[])
  *   - Start from `fetched`: a verse the server no longer has is dropped (the
  *     whole point of the reconnect refetch — a missed verse.bridged must not
  *     leave a phantom) and statuses / lane checks / locks (unversioned) are
- *     the fetched ones (changes from the GET's window are replayed, #974).
+ *     the fetched ones (provably newer row / status changes from the GET's
+ *     window are replayed, #974; lane checks and locks are not).
  *   - A verse present in both keeps the LOCAL row when
  *     `local.version >= fetched.version`: equal means identical or an
  *     optimistic same-version edit whose PATCH is pending; higher means the

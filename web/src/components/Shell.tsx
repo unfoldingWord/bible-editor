@@ -500,7 +500,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       void refetch({ keepNewerLocal: true });
     },
     onVerseStatusUpdate: (status) => {
-      applyLocalVerseStatus(status.verse, status.done === 1);
+      applyLocalVerseStatus(status.verse, status.done === 1, status.updated_at);
     },
     onLaneCheckUpdate: (check) => {
       applyLaneCheckers(check.verse, check.lane, check.checkers);
