@@ -48,6 +48,7 @@ const SQLITE_FILES = new Set([
   "src/reviewFlagBroadcast.test.mjs",
   "src/syncWithholds.test.mjs",
   "src/chapters.test.mjs",
+  "src/exportMergeState.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([

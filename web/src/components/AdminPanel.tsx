@@ -39,6 +39,8 @@ import {
   type AdminBookSyncStatus,
   type AdminImportResponse,
   type AdminImportResult,
+  type AdminMergeFlag,
+  type AdminMergeFlagsResponse,
   type AdminPr,
   type AdminResourceSyncStatus,
   type AdminSyncActivityEntry,
@@ -126,7 +128,33 @@ function shortSha(sha: string | null): string {
 
 // ── Tab 1: Sync status ───────────────────────────────────────────────────
 
-function ResourceCell({ rs, resource }: { rs: AdminResourceSyncStatus | null; resource: Resource }) {
+// Issue #442 (option C): only problems get a chip — a merged or still-fresh
+// export shows nothing extra.
+function mergeFlagText(flag: AdminMergeFlag): { label: string; detail: string } {
+  if (flag.state === "waiting") {
+    return {
+      label: "waiting > 1 day",
+      detail: `Door43 has not merged PR #${flag.prNumber} since ${fmtTime(flag.exportedAt)}`,
+    };
+  }
+  return {
+    label: "rejected",
+    detail:
+      flag.reason === "validation_failed"
+        ? `Door43's validation failed on PR #${flag.prNumber}, so it will not merge`
+        : `PR #${flag.prNumber} was closed without merging to master`,
+  };
+}
+
+function ResourceCell({
+  rs,
+  resource,
+  flag,
+}: {
+  rs: AdminResourceSyncStatus | null;
+  resource: Resource;
+  flag?: AdminMergeFlag;
+}) {
   if (!rs) {
     return (
       <Typography variant="caption" color="text.disabled">
@@ -159,8 +187,14 @@ function ResourceCell({ rs, resource }: { rs: AdminResourceSyncStatus | null; re
     plainReason = "Door43's copy differs from what we last exported";
   }
 
+  const flagText = flag ? mergeFlagText(flag) : null;
   const tooltip = (
     <Stack spacing={0.5} sx={{ maxWidth: 320 }}>
+      {flagText && (
+        <Typography variant="caption" sx={{ fontWeight: 600 }}>
+          {flagText.detail}
+        </Typography>
+      )}
       {plainReason && (
         <Typography variant="caption" sx={{ fontWeight: 600 }}>
           {plainReason}
@@ -197,6 +231,18 @@ function ResourceCell({ rs, resource }: { rs: AdminResourceSyncStatus | null; re
             PR #{rs.prNumber}
           </Typography>
         )}
+        {flag && flagText && (
+          <Chip
+            component="a"
+            href={flag.url}
+            target="_blank"
+            rel="noopener"
+            clickable
+            label={`${flagText.label} · #${flag.prNumber}`}
+            size="small"
+            color={flag.state === "rejected" ? "error" : "warning"}
+          />
+        )}
       </Stack>
     </Tooltip>
   );
@@ -207,6 +253,10 @@ function SyncStatusTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
+  // Loaded separately from the grid: it reads Door43 live, so a slow or failed
+  // Door43 must not hold back the D1-only sync status.
+  const [merge, setMerge] = useState<AdminMergeFlagsResponse | null>(null);
+  const [mergeError, setMergeError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -216,7 +266,21 @@ function SyncStatusTab() {
       .then((res) => setBooks(res.books))
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
+    setMergeError(null);
+    api
+      .getAdminMergeFlags()
+      .then(setMerge)
+      .catch((e) => {
+        setMerge(null);
+        setMergeError(String(e));
+      });
   }, []);
+
+  const flagByKey = useMemo(() => {
+    const m = new Map<string, AdminMergeFlag>();
+    for (const f of merge?.flags ?? []) m.set(`${f.book}/${f.resource}`, f);
+    return m;
+  }, [merge]);
 
   useEffect(() => load(), [load]);
 
@@ -242,6 +306,13 @@ function SyncStatusTab() {
         </IconButton>
       </Stack>
       {error && <Alert severity="error">Failed to load sync status: {error}</Alert>}
+      {mergeError && <Alert severity="warning">Could not check Door43 merge state: {mergeError}</Alert>}
+      {merge && merge.unchecked.length > 0 && (
+        <Typography variant="caption" color="text.secondary">
+          Merge state not checked for {merge.unchecked.length} export(s):{" "}
+          {merge.unchecked.map((u) => `${u.book} ${RESOURCE_LABELS[u.resource]}`).join(", ")}
+        </Typography>
+      )}
       {loading ? (
         <Box sx={{ display: "flex", justifyContent: "center", p: 4 }}>
           <CircularProgress size={24} />
@@ -284,7 +355,7 @@ function SyncStatusTab() {
                   </TableCell>
                   {RESOURCES.map((r) => (
                     <TableCell key={r}>
-                      <ResourceCell rs={b.resources[r]} resource={r} />
+                      <ResourceCell rs={b.resources[r]} resource={r} flag={flagByKey.get(`${b.book}/${r}`)} />
                     </TableCell>
                   ))}
                 </TableRow>
