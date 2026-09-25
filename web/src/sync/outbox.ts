@@ -30,6 +30,8 @@ import {
 import {
   eligibleForVersionThread,
   isMaxAttemptsBlocked,
+  laneChecksToKeepBehind,
+  pickNextOp,
   shouldAnnounceResult,
   targetKey,
 } from "./outboxTargeting.ts";
@@ -515,6 +517,16 @@ export const outbox = {
       o.conflictCurrent = undefined;
       await tx.store.put(o);
     }
+    // #931: the re-armed verse op now sorts at the back. A lane check for the
+    // same verse that was queued behind it moves back too, so laneCheckHeld
+    // keeps it waiting until the verse save lands (otherwise the check goes
+    // first and the verse PATCH's lane reopen deletes it). `op` is the
+    // pre-resolve record, so its queuedAt/seq is the original position.
+    for (const lc of laneChecksToKeepBehind(op, all)) {
+      lc.queuedAt = resolvedAt;
+      lc.seq = nextSeq();
+      await tx.store.put(lc);
+    }
     await tx.done;
     void notify();
     void drain();
@@ -944,13 +956,10 @@ async function drainPass() {
     // treating that target as blocked for the rest of the pass even after
     // its live status no longer justifies it, stranding the revived op
     // until some unrelated trigger fires.
-    const blocked = new Set(pinnedBlocked);
-    for (const o of ops) {
-      if (o.status === "conflict" || isMaxAttemptsBlocked(o)) blocked.add(targetKey(o.target));
-    }
-    let next = ops.find(
-      (o) => o.status === "pending" && !blocked.has(targetKey(o.target)),
-    );
+    //
+    // The pick itself (blocked set + lane-check hold) is pickNextOp in
+    // outboxTargeting.ts so it can be unit-tested without IndexedDB.
+    let next = pickNextOp(ops, pinnedBlocked);
     if (!next) {
       // No pending work, but recoverInFlight skipped a young in-flight op
       // (its dispatching tab may have crashed/reloaded). Nothing else will

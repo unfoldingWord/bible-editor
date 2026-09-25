@@ -6,8 +6,11 @@ import { collapseWhitespaceForCompare } from "./verseMerge.ts";
 
 // "Edits reopen the checkoff": when a verse's underlying content advances, the
 // affected lane's sign-off (verse_lane_checks) should reopen so checkers re-see
-// it. This is a best-effort helper — fire it via waitUntil AFTER the write has
-// already succeeded, never on the request's critical path. It must NEVER throw
+// it. This is a best-effort helper — call it AFTER the write has already
+// succeeded. verses.ts awaits its DELETE before responding (#931: a Text
+// check sent right after the save must not be wiped by a late reopen) and
+// waits a bounded time for the broadcasts; rows.ts fires the whole call via
+// waitUntil. Either way it must NEVER throw
 // into the save response, so it swallows its own errors as a second layer of
 // defense behind the caller's try/catch. Only call it when the write actually
 // changed something.
@@ -107,6 +110,10 @@ export function lanesForAdoption(
 // batches more than one chapter into a single call.
 export const LANE_REOPEN_BROADCAST_CAP = 200;
 
+// How long reopenLaneChecks (with a waitUntil) waits for its broadcasts
+// before letting the save respond (#931). See the waitUntil parameter.
+export const LANE_REOPEN_BROADCAST_WAIT_MS = 1000;
+
 export async function reopenLaneChecks(
   env: Env,
   book: string,
@@ -120,6 +127,18 @@ export async function reopenLaneChecks(
   // master-adoption reopen) uses reopenLaneChecksBulk below instead, which
   // batches the DELETEs and applies LANE_REOPEN_BROADCAST_CAP itself.
   broadcast: boolean = true,
+  // When given, the broadcasts are awaited for at most
+  // LANE_REOPEN_BROADCAST_WAIT_MS; whatever has not finished by then is handed
+  // to it (ctx.waitUntil) and the returned promise settles. A caller that
+  // awaits this before responding (verses.ts, #931) passes it. In the normal
+  // case the empty-checker broadcast reaches the room before the response, so
+  // it cannot land AFTER the broadcast of a Text check the client sends right
+  // behind the save (that later event would otherwise be overwritten and every
+  // tab would show the verse unchecked while D1 has it checked). A slow or
+  // hung Durable Object (a DO fetch has no timeout) still holds the save for
+  // at most the cap. Omitted, the broadcasts are awaited in full as before
+  // (rows.ts already runs the whole call inside waitUntil).
+  waitUntil?: (p: Promise<unknown>) => void,
 ): Promise<void> {
   if (lanes.length === 0) return;
   try {
@@ -149,12 +168,31 @@ export async function reopenLaneChecks(
     ]);
     // Nothing was checked here → nothing reopened → no need to notify anyone.
     if (!res.meta.changes || !broadcast) return;
-    for (const lane of lanes) {
-      await broadcastChapter(env, book, chapter, {
-        type: "lane_check.updated",
-        check: { book, chapter, verse, lane, checkers: [] },
-      });
+    const broadcasts = (async () => {
+      for (const lane of lanes) {
+        await broadcastChapter(env, book, chapter, {
+          type: "lane_check.updated",
+          check: { book, chapter, verse, lane, checkers: [] },
+        });
+      }
+    })().catch(() => {
+      /* best-effort, same as below */
+    });
+    if (!waitUntil) {
+      await broadcasts;
+      return;
     }
+    // Hand the promise to waitUntil up front so the runtime keeps it alive
+    // whichever side of the race wins; the race only decides how long the
+    // save waits for it.
+    waitUntil(broadcasts);
+    let clearTimer = () => {};
+    const timeout = new Promise<void>((resolve) => {
+      const id = setTimeout(resolve, LANE_REOPEN_BROADCAST_WAIT_MS);
+      clearTimer = () => clearTimeout(id);
+    });
+    await Promise.race([broadcasts, timeout]);
+    clearTimer();
   } catch {
     // Best-effort: a failure here must never surface to the caller. The
     // checkoff simply stays as-is; a later edit reopens it.

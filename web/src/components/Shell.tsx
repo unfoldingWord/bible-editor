@@ -60,7 +60,7 @@ import {
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
 import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, versesFromKey } from "../lib/verseRange";
-import { runSaveChain } from "../lib/saveChain";
+import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import {
@@ -2553,6 +2553,29 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }),
     [requestDualAction],
   );
+  // Every dirty side's save, in order: both reading lines, then both alignment
+  // panels. Shared by the unsaved-changes gate's Save and the titlebar's
+  // "save, mark done, next verse" button (#931). Clean sides are skipped:
+  // save() serializes + enqueues a PATCH unconditionally.
+  const dualSaveSteps = useCallback((): SaveStep[] => {
+    const step = (
+      dirty: boolean,
+      ref: { current: { save: (afterCommit?: () => void) => unknown } | null },
+    ): SaveStep => ({
+      dirty,
+      save: (afterCommit) => {
+        const handle = ref.current;
+        if (handle) handle.save(afterCommit);
+        else afterCommit();
+      },
+    });
+    return [
+      step(dualLeftReadingDirty, dualLeftReadingRef),
+      step(dualRightReadingDirty, dualRightReadingRef),
+      step(dualLeftDirty, dualLeftRef),
+      step(dualRightDirty, dualRightRef),
+    ];
+  }, [dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty]);
   const resolveDualAction = useCallback(
     (choice: "save" | "discard") => {
       const action = pendingDualAction;
@@ -2581,46 +2604,43 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // chain stalls it — `finish` (and thus the close) never runs — which is
       // the fix for #490 (the dialog used to close, unmounting the reading
       // line, while its confirm was still pending).
-      runSaveChain(
-        [
-          {
-            dirty: dualLeftReadingDirty,
-            save: (afterCommit) => {
-              const ref = dualLeftReadingRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-          {
-            dirty: dualRightReadingDirty,
-            save: (afterCommit) => {
-              const ref = dualRightReadingRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-          {
-            dirty: dualLeftDirty,
-            save: (afterCommit) => {
-              const ref = dualLeftRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-          {
-            dirty: dualRightDirty,
-            save: (afterCommit) => {
-              const ref = dualRightRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-        ],
-        () => action?.run(),
-      );
+      runSaveChain(dualSaveSteps(), () => action?.run());
     },
-    [pendingDualAction, dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty],
+    [pendingDualAction, dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty, dualSaveSteps],
   );
+  // "Save both, mark verse done, next verse" (#931): the gate's Save chain
+  // without the prompt, then the Text-lane check (the same per-verse "done"
+  // the titlebar checkbox sets), then the next-verse move. Mark + advance run
+  // only once every dirty side has committed; a cancelled unalign confirm
+  // stalls the chain, so the verse stays unmarked and the aligner stays put.
+  // `verse` is the verse the click started on (captured in the button's
+  // render); the guard ignores a second click while this chain still runs,
+  // and cancelling the unalign confirm releases it (cancelAlignmentLoss).
+  const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
+  const dualSaveDoneAndNext = useCallback(
+    (verse: number, next: number) => {
+      if (meUserId == null || bookLocked) return;
+      saveDoneGuardRef.current.run({
+        steps: dualSaveSteps(),
+        markDone: () => {
+          applyLocalLaneCheck(verse, "text", meUserId, true);
+          void outbox.enqueueLaneCheck(book, chapter, verse, "text", true);
+        },
+        advance: () => {
+          setActiveVerse(next);
+          setDualTarget((t) => (t ? { ...t, verse: next } : t));
+        },
+      });
+    },
+    [dualSaveSteps, meUserId, bookLocked, applyLocalLaneCheck, book, chapter],
+  );
+  // Dismissing the unalign confirm without saving: any save chain waiting on it
+  // (the gate's Save, the save-done-next button) is stalled for good, so free
+  // the button's in-flight guard too.
+  const cancelAlignmentLoss = useCallback(() => {
+    setPendingAlignmentLoss(null);
+    saveDoneGuardRef.current.cancel();
+  }, []);
 
   const handleSetPanelMode = useCallback(
     (mode: PanelMode) => {
@@ -4256,6 +4276,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           right={dualAlignerProps.right}
           onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
           onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
+          onSaveDoneAndNext={
+            dualNav.next != null && textLaneCheck.canCheck
+              ? () => dualSaveDoneAndNext(dualAlignerProps.verseNum, dualNav.next!)
+              : undefined
+          }
           // Lane checks live on the loaded chapter's useChapter state; only
           // wire when the dual popup is on that same chapter (verse arrows
           // already no-op across chapters for the same reason).
@@ -4273,7 +4298,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }
         />
       )}
-      <Dialog open={!!pendingAlignmentLoss} onClose={() => setPendingAlignmentLoss(null)}>
+      <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>
         <DialogTitle>
           {pendingAlignmentLoss && pendingAlignmentLoss.lostWords.length === 1
             ? "A word will be unaligned"
@@ -4296,7 +4321,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setPendingAlignmentLoss(null)}>Cancel</Button>
+          <Button onClick={cancelAlignmentLoss}>Cancel</Button>
           <Button
             color="error"
             variant="contained"
