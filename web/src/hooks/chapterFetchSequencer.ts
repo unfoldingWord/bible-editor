@@ -23,8 +23,9 @@
 //    drops the replay queue and any deferred merge, so nothing from the old
 //    chapter can land afterwards.
 //
-// Replay queue: reducer steps (WS bridged / split / updated, outbox results)
-// that reach the tab while a merging refetch is pending (in flight or
+// Replay queue: reducer steps (WS bridged / split / updated, outbox results,
+// and since #974 tn/tq/twl row inserts / replacements / deletes plus verse
+// status, lane check and TWL lock updates) that reach the tab while a merging refetch is pending (in flight or
 // deferred); non-null exactly then. `mergeRefetched` can only judge verses
 // the GET's snapshot contains, so a split that recreated a verse AFTER the
 // snapshot but BEFORE the response landed would be silently discarded (the
@@ -32,8 +33,10 @@
 // it back. One queue, owned by the latest request: a merging
 // refetch that supersedes another inherits it (steps the first collected are
 // either newer than the second GET's rows and kept by the merge anyway, or
-// stale echoes that are no-ops on replay — every step is version-gated, see
-// lib/verseStructure.ts). A plain refetch or a reset drops it; the resolving
+// stale echoes that are no-ops on replay — every verse and row step is
+// version-gated, see lib/verseStructure.ts; the unversioned status / lane /
+// lock steps replay in arrival order, so the last one per key still wins).
+// A plain refetch or a reset drops it; the resolving
 // or failing latest request clears it.
 
 export type ChapterLoader<P> = (signal: AbortSignal, onAttempt: (attempts: number) => void) => Promise<P>;
