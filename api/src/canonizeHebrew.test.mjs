@@ -217,15 +217,27 @@ const W2_NFC = BET + QAMATS + DAGESH;
   assert(out === LEGACY + maqaf + LEGACY, "quote: maqaf separator preserved between canonized words");
 }
 
-// 11. Found-flag in quotes: repeated skeleton → distinct UHB words.
+// 11. Ambiguity in quotes fails closed (#959 review). A bare skeleton that
+//     matches two differently pointed UHB words is left as-is: picking the
+//     first would move a quote meant for the second onto another word. The
+//     decision is per word, so a neighbouring word cannot tip it.
 {
   const boA = "בֹא";
   const baA = "ב" + QAMATS + "א";
   const bare = "בא";
-  const q = bare + " " + bare;
   const uhb = [w(boA, "L", "M"), w(baA, "L", "M")];
-  const out = canonizeQuote(q, uhb);
-  assert(out === boA + " " + baA, "quote found-flag: two bare words map to two distinct UHB words");
+  assert(canonizeQuote(bare + " " + bare, uhb) === bare + " " + bare, "quote: ambiguous bare skeleton left as-is");
+  assert(canonizeQuote(boA + " " + bare, uhb) === boA + " " + bare, "quote: a byte-identical neighbour does not make bare resolvable");
+}
+
+// 11b. A word already byte-identical to a UHB word is kept, even when an
+//      earlier look-alike (same NFC, other bytes) would match the exact tier.
+//      translationCore counts each byte-distinct surface separately (lint.ts).
+{
+  const uhb = [w(LEGACY, LEGACY, "M"), w(NFC, NFC, "M")];
+  assert(canonizeQuote(NFC, uhb) === NFC, "quote: byte-identical 2nd look-alike kept, not moved to the 1st");
+  assert(canonizeQuote(LEGACY, uhb) === LEGACY, "quote: byte-identical 1st look-alike kept");
+  assert(canonizeQuote(NFC + " " + NFC, uhb) === NFC + " " + NFC, "quote: a repeated byte-identical look-alike is kept both times");
 }
 
 // 12. strict mode (verse ranges): only the exact tier fires; a bare word that

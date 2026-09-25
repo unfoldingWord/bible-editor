@@ -114,6 +114,21 @@
 //   3. Apply — a separate, human-approved step. The generated file's header
 //      carries the apply command and the post-apply checks.
 //
+// ── --qere-ketiv (GitHub issue #956) ───────────────────────────────────────
+//   A second, separate pass. Since hbo_uhb aad8ce31 (2026-08-14) the UHB main
+//   text always carries the KETIV (written) form and the QERE (read) form sits
+//   only in a footnote after it. Milestones still pointing at the qere match no
+//   UHB \w, so they never highlight, and the canonizer cannot fix them (the
+//   consonants differ). With --qere-ketiv, a milestone whose skeleton matches
+//   no UHB \w in [verse, verse_end] but matches a qere footnote word there is
+//   re-pointed to the ketiv \w that footnote follows: content, strong, and
+//   lemma/morph adopt the ketiv's values, and occurrence/occurrences are
+//   recounted for the ketiv across the range. The verifier then allows those
+//   six zaln attributes to change and nothing else. Incident '#956', default
+//   SQL scripts/out/repair-qere-ketiv-alignment.sql. DECLINED lists every
+//   milestone still matching no UHB \w (ambiguous qere, Strong's mismatch, or
+//   no qere either). Not combinable with --visible-only.
+//
 // Idempotent: re-running against a fresh dump of repaired rows emits no SQL.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, readdirSync } from "node:fs";
@@ -124,6 +139,7 @@ import {
   buildSourceIndex,
   sourceCoverage,
   repairVerse,
+  repointQereVerse,
   rowIdentityProblem,
   dedupeRows,
   commentSafe,
@@ -139,7 +155,9 @@ const REPAIR_USER_ID = 2;
 const REPAIR_ACTOR = "deferredreward";
 const REPAIR_ACTION = "update"; // must stay 'update' — see repair-number-split-verses.mjs
 const REPAIR_SOURCE = "data_repair";
-const INCIDENT = "#945";
+const QERE_MODE = process.argv.includes("--qere-ketiv");
+const ISSUE = QERE_MODE ? 956 : 945;
+const INCIDENT = `#${ISSUE}`;
 const INCIDENT_LIKE = `%"incident":"${INCIDENT}"%`;
 const TARGET_VERSIONS = new Set(["ULT", "UST"]);
 
@@ -149,7 +167,7 @@ const USAGE =
   "usage: node --experimental-strip-types --no-warnings scripts/repair-canonize-alignment.mjs\n" +
   "         --locks <book_locks.json> <dump.json|dir>...\n" +
   "         [--book JER[,NUM]] [--bible-version ULT[,UST]]\n" +
-  "         [--exclude BOOK/CH/V/VER] (repeatable)  [--allow-locked]  [--visible-only]\n" +
+  "         [--exclude BOOK/CH/V/VER] (repeatable)  [--allow-locked]  [--visible-only | --qere-ketiv]\n" +
   "         [--out <sql>] [--json <report>] [--force]\n" +
   "  exit 0 = every change verified · 2 = at least one verse REFUSED · 1 = bad input";
 const die = (msg) => {
@@ -159,7 +177,7 @@ const die = (msg) => {
 
 const argv = process.argv.slice(2);
 const VALUE_FLAGS = new Set(["--out", "--json", "--book", "--bible-version", "--exclude", "--locks"]);
-const BOOL_FLAGS = new Set(["--force", "--allow-locked", "--visible-only"]);
+const BOOL_FLAGS = new Set(["--force", "--allow-locked", "--visible-only", "--qere-ketiv"]);
 const REPEATABLE = new Set(["--exclude"]);
 const flags = new Map();
 const positionals = [];
@@ -200,8 +218,9 @@ const versionFilter = listArg("--bible-version");
 const allowLocked = flags.get("--allow-locked") === true;
 const force = flags.get("--force") === true;
 const visibleOnly = flags.get("--visible-only") === true;
+if (visibleOnly && QERE_MODE) die("--visible-only and --qere-ketiv cannot be combined (every qere repoint is visible)");
 const outDir = resolve(repoRoot, "scripts", "out");
-const sqlPath = argVal("--out") ? resolve(process.cwd(), argVal("--out")) : resolve(outDir, "repair-canonize-alignment.sql");
+const sqlPath = argVal("--out") ? resolve(process.cwd(), argVal("--out")) : resolve(outDir, QERE_MODE ? "repair-qere-ketiv-alignment.sql" : "repair-canonize-alignment.sql");
 const jsonPath = argVal("--json") ? resolve(process.cwd(), argVal("--json")) : null;
 const locksPath = resolve(process.cwd(), argVal("--locks"));
 
@@ -364,7 +383,7 @@ for (const row of targetRows) {
     refused.push({ ref, rowKey, why: `source words incomplete — ${cov.problems.join("; ")}` });
     continue;
   }
-  const r = repairVerse(row.content_json, cov.words);
+  const r = QERE_MODE ? repointQereVerse(row.content_json, cov.words, cov.qeres) : repairVerse(row.content_json, cov.words);
   const lock = lockReason(book);
   if (r.declined?.length) declined.push({ ref, rowKey, book, bv, lock, items: r.declined });
   if (r.status === "clean") { clean++; continue; }
@@ -396,12 +415,8 @@ function statementsFor(r) {
     content: r.newContentJson,
     plain_text: row.plain_text ?? null,
     incident: INCIDENT,
-    issue: 945,
-    changes: r.changes.map((c) => ({
-      strong: c.strong,
-      ...(c.content ? { content: c.content } : {}),
-      ...(c.lemma ? { lemma: c.lemma } : {}),
-    })),
+    issue: ISSUE,
+    changes: r.changes.map(({ path, kind, ...c }) => c),
   });
   const update =
     `UPDATE verses SET content_json = ${sqlStr(r.newContentJson)},` +
@@ -449,28 +464,33 @@ const wordCount = (list) => list.reduce((n, r) => n + r.changes.length, 0);
 const books = [...new Set(repaired.map((r) => r.row.book))].sort();
 const inList = (xs) => xs.map((b) => `'${b}'`).join(", ");
 const stmtCount = repaired.length * 2;
+const CHANGE_ATTRS = ["content", "lemma", "morph", "strongChange", "occurrence", "occurrences"];
 const fmtChange = (c) => {
   const parts = [];
-  if (c.content) parts.push(`content ${uEscape(c.content.before)} → ${uEscape(c.content.after)}`);
-  if (c.lemma) parts.push(`lemma ${uEscape(c.lemma.before)} → ${uEscape(c.lemma.after)}`);
+  for (const k of CHANGE_ATTRS) if (c[k]) parts.push(`${k === "strongChange" ? "strong" : k} ${uEscape(c[k].before)} → ${uEscape(c[k].after)}`);
   return `[${c.kind}] ${uEscape(c.strong || "?")}: ${parts.join("; ")}`;
 };
 const kindCounts = (list) => {
-  const k = { visible: 0, mark_order: 0, lemma_only: 0 };
+  const k = { visible: 0, mark_order: 0, lemma_only: 0, qere_ketiv: 0 };
   for (const r of list) for (const c of r.changes) k[c.kind]++;
   return k;
 };
-const fmtKinds = (k) => `visible ${k.visible} · mark_order ${k.mark_order} · lemma_only ${k.lemma_only}`;
+const fmtKinds = (k) =>
+  QERE_MODE ? `qere_ketiv ${k.qere_ketiv}` : `visible ${k.visible} · mark_order ${k.mark_order} · lemma_only ${k.lemma_only}`;
 
 const header = [
-  `-- Canonize ULT/UST \\zaln-s source Hebrew to the exact UHB bytes — GitHub issue #945.`,
+  QERE_MODE
+    ? `-- Re-point ULT/UST \\zaln-s from the qere to the UHB ketiv word — GitHub issue #956.`
+    : `-- Canonize ULT/UST \\zaln-s source Hebrew to the exact UHB bytes — GitHub issue #945.`,
   `-- Generated ${new Date().toISOString()} by scripts/repair-canonize-alignment.mjs`,
   `-- Source dumps: ${dumpFiles.length} file(s) under ${[...new Set(dumpFiles.map(dirname))].join(", ")}`,
   `-- ${repaired.length} verse(s); ${wordCount(repaired)} milestone(s) (${fmtKinds(kindCounts(repaired))}); ${stmtCount} statement(s).`,
-  `-- Mode: ${visibleOnly ? "--visible-only (verses with a broken highlight; each canonized whole)" : "full canonize (every verse the canonizer changes)"}.`,
+  `-- Mode: ${QERE_MODE ? "--qere-ketiv (qere milestones re-pointed to the ketiv \\w)" : visibleOnly ? "--visible-only (verses with a broken highlight; each canonized whole)" : "full canonize (every verse the canonizer changes)"}.`,
   "--",
   "-- Every verse below was verified BEFORE this file was written: the parsed tree before and",
-  "-- after is deep-equal except for `content` / `lemma` strings on zaln milestones. Node count,",
+  QERE_MODE
+    ? "-- after is deep-equal except for content/lemma/morph/strong/occurrence(s) on zaln milestones. Node count,"
+    : "-- after is deep-equal except for `content` / `lemma` strings on zaln milestones. Node count,",
   "-- order, every \\w, every text node and plain_text are identical.",
   "--",
   "-- Each UPDATE is version-CAS'd (AND version = <version read in the dump>): a row that moved",
@@ -539,7 +559,7 @@ const tally = (list) => {
   const m = new Map();
   for (const r of list) {
     const k = `${r.book} ${r.bv}`;
-    const cur = m.get(k) ?? { verses: 0, words: 0, visible: 0, mark_order: 0, lemma_only: 0 };
+    const cur = m.get(k) ?? { verses: 0, words: 0, visible: 0, mark_order: 0, lemma_only: 0, qere_ketiv: 0 };
     cur.verses++;
     cur.words += r.changes.length;
     for (const c of r.changes) cur[c.kind]++;
@@ -548,13 +568,17 @@ const tally = (list) => {
   return [...m].sort((a, b) => a[0].localeCompare(b[0]));
 };
 const pad = (s, n) => String(s).padEnd(n);
-const tallyHead = `  ${pad("book ver", 10)} ${pad("verses", 7)} ${pad("words", 6)} ${pad("visible", 8)} ${pad("mark_ord", 9)} lemma_only`;
+const tallyHead = QERE_MODE
+  ? `  ${pad("book ver", 10)} ${pad("verses", 7)} words`
+  : `  ${pad("book ver", 10)} ${pad("verses", 7)} ${pad("words", 6)} ${pad("visible", 8)} ${pad("mark_ord", 9)} lemma_only`;
 const tallyLine = ([k, c]) =>
-  `  ${pad(k, 10)} ${pad(c.verses, 7)} ${pad(c.words, 6)} ${pad(c.visible, 8)} ${pad(c.mark_order, 9)} ${c.lemma_only}`;
+  QERE_MODE
+    ? `  ${pad(k, 10)} ${pad(c.verses, 7)} ${c.words}`
+    : `  ${pad(k, 10)} ${pad(c.verses, 7)} ${pad(c.words, 6)} ${pad(c.visible, 8)} ${pad(c.mark_order, 9)} ${c.lemma_only}`;
 const declinedCount = declined.reduce((n, d) => n + d.items.length, 0);
 
 console.log("═".repeat(96));
-console.log("REPAIR CANONIZE ALIGNMENT SOURCE — issue #945   (DRY BUILD: nothing is written to any database)");
+console.log(`${QERE_MODE ? "REPOINT QERE → KETIV" : "REPAIR CANONIZE ALIGNMENT SOURCE"} — issue ${INCIDENT}   (DRY BUILD: nothing is written to any database)`);
 console.log("═".repeat(96));
 if (oldestDumpHours > DUMP_STALE_HOURS) {
   console.log(`  ** OLDEST DUMP IS ${oldestDumpHours.toFixed(1)}h OLD ** rows edited since will be SILENTLY SKIPPED. Re-dump before applying.`);
@@ -562,7 +586,7 @@ if (oldestDumpHours > DUMP_STALE_HOURS) {
 console.log(`  dump files         : ${dumpFiles.length}`);
 console.log(`  ULT/UST rows       : ${targetRows.length}`);
 console.log(`  UHB books loaded   : ${uhbRowsByBook.size}`);
-console.log(`  mode               : ${visibleOnly ? "--visible-only" : "full canonize"}`);
+console.log(`  mode               : ${QERE_MODE ? "--qere-ketiv" : visibleOnly ? "--visible-only" : "full canonize"}`);
 console.log(`  repaired (in SQL)  : ${repaired.length} verse(s), ${wordCount(repaired)} milestone(s)  [${fmtKinds(kindCounts(repaired))}]`);
 console.log(`  locked (reported)  : ${lockedChanges.length} verse(s), ${wordCount(lockedChanges)} milestone(s)  [${fmtKinds(kindCounts(lockedChanges))}]${allowLocked ? " (--allow-locked: in SQL)" : ""}`);
 if (visibleOnly) console.log(`  skipped, no visible change: ${skippedInvisible} verse(s)`);
@@ -594,7 +618,7 @@ if (lockedChanges.length) {
   console.log("");
   console.log("  VISIBLE changes only (broken highlights). mark_order / lemma_only changes are in the --json report.");
   for (const r of lockedChanges) {
-    const vis = r.changes.filter((c) => c.kind === "visible");
+    const vis = r.changes.filter((c) => c.kind === "visible" || c.kind === "qere_ketiv");
     if (!vis.length) continue;
     console.log(`  ${pad(r.ref, 22)} v${r.row.version}  (${r.lock})`);
     for (const c of vis) console.log(`        ${fmtChange(c)}`);
@@ -639,8 +663,9 @@ if (jsonPath) {
     version: r.row.version, updatedByBefore: r.row.updated_by ?? null, lock: r.lock ?? null,
     changes: r.changes.map((c) => ({
       path: c.path, strong: c.strong, kind: c.kind,
-      ...(c.content ? { content: { ...c.content, beforeEscaped: uEscape(c.content.before), afterEscaped: uEscape(c.content.after) } } : {}),
-      ...(c.lemma ? { lemma: { ...c.lemma, beforeEscaped: uEscape(c.lemma.before), afterEscaped: uEscape(c.lemma.after) } } : {}),
+      ...Object.fromEntries(
+        CHANGE_ATTRS.filter((k) => c[k]).map((k) => [k, { ...c[k], beforeEscaped: uEscape(c[k].before), afterEscaped: uEscape(c[k].after) }]),
+      ),
     })),
   });
   mkdirSync(dirname(jsonPath), { recursive: true });
