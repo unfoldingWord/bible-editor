@@ -230,6 +230,12 @@ interface Props {
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
   onNextVerse?: () => void;
+  // #943: an AI pipeline holds the verse resource on this chapter. The
+  // popup itself stays open (the reading line's own save still goes
+  // through and is correctly rejected server-side — see the matching
+  // comment on Shell's dualAlignerProps), but each AlignmentPanel disables
+  // its own Save so a drag can't produce a PATCH the server will reject.
+  locked?: boolean;
   // Text-lane checkoff for the current verse — same control as the rail /
   // column verse markers, so translators can stamp "done" without leaving
   // the dual aligner (check sits next to the verse chip + next-arrow).
@@ -333,6 +339,7 @@ export function SideBySideAligner({
   onPrevVerse,
   onNextVerse,
   textCheck,
+  locked = false,
 }: Props) {
   const [hover, setHover] = useState<HoverHighlight>(null);
   const [hoverLink, setHoverLink] = useState<boolean>(readHoverLink);
@@ -439,6 +446,7 @@ export function SideBySideAligner({
       renderUhbStrip={false}
       showSourceInfo={lexInfo}
       posOffset={slot.posOffset}
+      locked={locked}
     />
   );
 

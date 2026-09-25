@@ -198,6 +198,13 @@ interface Props {
   // shared strip and the opposite panel agree on which Hebrew token is meant
   // even when the two versions cover different verse ranges. 0 standalone.
   posOffset?: number;
+  // #943: an AI pipeline holds this chapter's verse resource. The panel
+  // stays mounted and draggable (drag state is local until Save), but Save
+  // and the history dialog's restore are disabled so nothing produces a
+  // PATCH the server will reject with 409 chapter_locked. See the matching
+  // comment on Shell's alignmentTabProps/dualAlignerProps for why entry
+  // itself isn't gated on this the way a book lock gates entry.
+  locked?: boolean;
 }
 
 const VerseHistoryDialog = lazy(() =>
@@ -229,6 +236,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       hideCancel = false,
       showSourceInfo = true,
       posOffset = 0,
+      locked = false,
     },
     ref,
   ) {
@@ -829,6 +837,18 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // Shell) pass the nav as `afterCommit` so it waits for the real commit instead
     // of firing while the confirm is still open.
     const handleSave = useCallback((afterCommit?: () => void): boolean => {
+      // #943: guard here, not just the ActionBar button — the dirty-navigation
+      // gate's "Save and go" choice calls this imperatively (Shell's
+      // resolvePendingNav → ref.save()), bypassing the disabled button. A
+      // locked save resolves as if it committed (so navigation isn't stuck
+      // behind it) but never calls onSave, so no PATCH is ever sent for a
+      // chapter an AI pipeline currently owns — mirrors the accepted
+      // "silently discard" behavior openAligner's comment documents for a
+      // locked BOOK.
+      if (locked) {
+        afterCommit?.();
+        return true;
+      }
       if (!state || !verse) {
         afterCommit?.();
         return true;
@@ -875,7 +895,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       }
       commit();
       return true;
-    }, [state, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
+    }, [state, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion, locked]);
 
     // Same two maps hebrewHighlight/onEnglishHover use, in the same roles:
     // posOwners (display-derived) says which CARD(s) own the position, and
@@ -1024,6 +1044,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
             </Box>
             <ActionBar
               dirty={dirty}
+              locked={locked}
               ghostCount={ghostByGroup.size}
               onAcceptAll={handleAcceptAllGhosts}
               onClear={handleClearAll}
@@ -1074,6 +1095,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
               verseNum={verseNum}
               bibleVersion={bibleVersion}
               currentVersion={verse.version}
+              canRestore={!locked}
               onClose={() => setHistoryOpen(false)}
               onUseVersion={(content, plainText) => onRestoreVersion?.(content, plainText)}
             />
@@ -1356,6 +1378,7 @@ function SectionHeader({ count }: { count: number }) {
 // ─── Action bar ────────────────────────────────────────────────────────
 function ActionBar({
   dirty,
+  locked = false,
   ghostCount,
   onAcceptAll,
   onClear,
@@ -1369,6 +1392,7 @@ function ActionBar({
   onOpenHistory,
 }: {
   dirty: boolean;
+  locked?: boolean;
   ghostCount: number;
   onAcceptAll: () => void;
   onClear: () => void;
@@ -1404,6 +1428,21 @@ function ActionBar({
       >
         editing {bibleVersion}
       </Typography>
+      {locked && (
+        <Tooltip title="An AI run is in progress on this chapter — alignment changes can't be saved right now">
+          <Typography
+            variant="caption"
+            sx={{
+              fontFamily: "monospace",
+              color: "warning.dark",
+              fontSize: 10,
+              ml: 1,
+            }}
+          >
+            🔒 chapter locked
+          </Typography>
+        </Tooltip>
+      )}
       {/* Spacer keeps the actions right-aligned when the bar fits on one line;
           when it doesn't (narrow laptop screens), the actions wrap to a second
           row instead of the rightmost Save button overflowing off-screen. */}
@@ -1447,6 +1486,7 @@ function ActionBar({
           size="small"
           variant="outlined"
           onClick={onAcceptAll}
+          disabled={locked}
           sx={{
             textTransform: "none",
             fontSize: 11,
@@ -1462,6 +1502,7 @@ function ActionBar({
       <Button
         size="small"
         onClick={onClear}
+        disabled={locked}
         sx={{
           color: "error.main",
           textTransform: "uppercase",
@@ -1475,7 +1516,7 @@ function ActionBar({
       <Button
         size="small"
         onClick={onReset}
-        disabled={!dirty}
+        disabled={!dirty || locked}
         sx={{
           color: "text.secondary",
           textTransform: "uppercase",
@@ -1501,21 +1542,25 @@ function ActionBar({
           Cancel
         </Button>
       )}
-      <Button
-        size="small"
-        variant="contained"
-        onClick={() => onSave()}
-        disabled={!dirty}
-        sx={{
-          textTransform: "uppercase",
-          fontSize: 11,
-          letterSpacing: "0.06em",
-          fontWeight: 700,
-          px: 2,
-        }}
-      >
-        Save {bibleVersion}
-      </Button>
+      <Tooltip title={locked ? "Chapter locked — an AI run is in progress" : ""}>
+        <span>
+          <Button
+            size="small"
+            variant="contained"
+            onClick={() => onSave()}
+            disabled={!dirty || locked}
+            sx={{
+              textTransform: "uppercase",
+              fontSize: 11,
+              letterSpacing: "0.06em",
+              fontWeight: 700,
+              px: 2,
+            }}
+          >
+            Save {bibleVersion}
+          </Button>
+        </span>
+      </Tooltip>
     </Stack>
   );
 }
