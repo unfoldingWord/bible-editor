@@ -135,6 +135,7 @@ const UNCHECKED_REASONS: Record<string, string> = {
   owner_mismatch: "export owner isn't unfoldingWord",
   master_unmeasured: "couldn't read master's history",
   lookup_failed: "Door43 request failed",
+  open_pr_list_failed: "couldn't read Door43's open PR list",
 };
 
 function capList(items: string[], max = 5): string {
@@ -272,19 +273,26 @@ function SyncStatusTab() {
   const [merge, setMerge] = useState<AdminMergeFlagsResponse | null>(null);
   const [mergeError, setMergeError] = useState<string | null>(null);
 
+  // Two quick refreshes can resolve out of order; only the latest load may
+  // set state, so a slow earlier response can't overwrite newer flags.
+  const loadSeq = useRef(0);
+
   const load = useCallback(() => {
+    const seq = ++loadSeq.current;
+    const latest = () => seq === loadSeq.current;
     setLoading(true);
     setError(null);
     api
       .getAdminSyncStatus()
-      .then((res) => setBooks(res.books))
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false));
+      .then((res) => latest() && setBooks(res.books))
+      .catch((e) => latest() && setError(String(e)))
+      .finally(() => latest() && setLoading(false));
     setMergeError(null);
     api
       .getAdminMergeFlags()
-      .then(setMerge)
+      .then((res) => latest() && setMerge(res))
       .catch((e) => {
+        if (!latest()) return;
         setMerge(null);
         setMergeError(String(e));
       });

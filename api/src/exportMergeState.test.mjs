@@ -322,11 +322,90 @@ function mockDoor43({ open = {}, pr = {}, status = {}, history = {}, failList = 
   const { sqlite, env } = freshEnv();
   snapshot(sqlite, "OBA", "tn", 500, NOW - 3 * DAY);
   snapshot(sqlite, "OBA", "tn", null, NOW - DAY, { error: "unchanged" });
-  const calls = mockDoor43({ pr: { 500: { state: "closed", merged: false } } });
+  const calls = mockDoor43({ open: { en_tn: [] }, pr: { 500: { state: "closed", merged: false } } });
   const res = await computeExportMergeFlags(env, NOW);
   eq(res.flags, [], "B1: PR closed by our own pipeline after an `unchanged` render → not rejected");
   eq(res.unchecked, [], "B1: …and not unchecked either");
-  eq(calls.length, 0, "B1: …and no Door43 read spent on it");
+  eq(
+    calls.filter((c) => !c.includes("/pulls?")).length,
+    0,
+    "C1: absent from the open-PR list → no single-PR GET, no walk, no status read",
+  );
+}
+
+{
+  // C1: the pipeline's closeDcsPr can fail silently (no throw on non-2xx), so
+  // an `unchanged` after the PR does not prove the PR closed. If it is still
+  // in the open list, it is judged as open.
+  const { sqlite, env } = freshEnv();
+  REPO_OF[501] = "en_tn";
+  snapshot(sqlite, "OBA", "tn", 501, NOW - 3 * DAY);
+  snapshot(sqlite, "OBA", "tn", null, NOW - DAY, { error: "unchanged" });
+  const calls = mockDoor43({ open: { en_tn: [openPr(501, "OBA-be-test")] }, status: { head501: "pending" } });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags.map((f) => [f.book, f.state, f.exportedAt]), [["OBA", "waiting", NOW - 3 * DAY]], "C1: still open after `unchanged` → waiting from its opened time");
+  eq(calls.some((c) => c.includes("/commits?")), false, "C1: …and no closed-PR walk");
+}
+
+{
+  // C1: same, with failed validation → rejected.
+  const { sqlite, env } = freshEnv();
+  REPO_OF[502] = "en_tn";
+  snapshot(sqlite, "OBA", "tn", 502, NOW - 2 * HOUR);
+  snapshot(sqlite, "OBA", "tn", null, NOW - HOUR, { error: "unchanged" });
+  mockDoor43({ open: { en_tn: [openPr(502, "OBA-be-test")] }, status: { head502: "failure" } });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags.map((f) => [f.state, f.reason]), [["rejected", "validation_failed"]], "C1: still open after `unchanged`, validation failed → rejected");
+}
+
+{
+  // C1: `unchanged` after the PR, but the open list itself failed → unchecked, not guessed either way.
+  const { sqlite, env } = freshEnv();
+  snapshot(sqlite, "OBA", "tn", 503, NOW - 3 * DAY);
+  snapshot(sqlite, "OBA", "tn", null, NOW - DAY, { error: "unchanged" });
+  mockDoor43({ failList: new Set(["en_tn"]) });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags, [], "C1: list failed → no flag");
+  eq(res.unchecked.map((u) => u.reason), ["open_pr_list_failed"], "C1: …unchecked, naming the failed list");
+}
+
+// C2: a hung Door43 call must not hang /merge-flags. `hangOn` never answers
+// unless the caller's AbortSignal fires. Each case is raced against a guard so
+// a missing timeout fails the test instead of stalling it.
+function withGuard(promise, ms = 3000) {
+  return Promise.race([promise, new Promise((r) => setTimeout(() => r("HUNG"), ms))]);
+}
+function hangFetch(inner, hangOn) {
+  const base = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    if (String(input).includes(hangOn)) {
+      return new Promise((_, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal.reason ?? new Error("aborted")));
+      });
+    }
+    return base(input, init);
+  };
+  return inner;
+}
+
+{
+  // C2: a hung open-PR list → its `unchanged`-after exports unchecked with a reason.
+  const { sqlite, env } = freshEnv();
+  snapshot(sqlite, "OBA", "tn", 504, NOW - 3 * DAY);
+  snapshot(sqlite, "OBA", "tn", null, NOW - DAY, { error: "unchanged" });
+  hangFetch(mockDoor43({}), "/en_tn/pulls?");
+  const res = await withGuard(computeExportMergeFlags(env, NOW, { timeoutMs: 200 }));
+  eq(res === "HUNG" ? "HUNG" : res.unchecked.map((u) => u.reason), ["open_pr_list_failed"], "C2: hung list times out → unchecked");
+}
+
+{
+  // C2: a hung status read → treated as unknown; the open PR is judged on age only.
+  const { sqlite, env } = freshEnv();
+  REPO_OF[505] = "en_ult";
+  snapshot(sqlite, "RUT", "ult", 505, NOW - 2 * DAY);
+  hangFetch(mockDoor43({ open: { en_ult: [openPr(505, "RUT-be-test")] } }), "/commits/head505/status");
+  const res = await withGuard(computeExportMergeFlags(env, NOW, { timeoutMs: 200 }));
+  eq(res === "HUNG" ? "HUNG" : res.flags.map((f) => f.state), ["waiting"], "C2: hung status times out → open over a day → waiting");
 }
 
 {

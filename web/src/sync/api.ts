@@ -2126,7 +2126,9 @@ export const api = {
     ),
 
   getAdminMergeFlags: (signal?: AbortSignal) =>
-    request<AdminMergeFlagsResponse>(`/api/admin/merge-flags`, { signal }),
+    // Live Door43 reads; the server's worst case is ~40 s (exportMergeState.ts
+    // BUDGET), above the 30 s default. Matches the other heavy admin calls.
+    request<AdminMergeFlagsResponse>(`/api/admin/merge-flags`, { signal, timeoutMs: 120_000 }),
 
   getAdminSyncActivity: (signal?: AbortSignal) =>
     request<AdminSyncActivityResponse>(`/api/admin/sync-activity`, { signal }),

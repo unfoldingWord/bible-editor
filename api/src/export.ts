@@ -2418,16 +2418,21 @@ export async function listOpenPrs(config: {
   token: string;
   owner: string;
   repo: string;
+  /** Optional deadline for the WHOLE paged list (one signal shared by every
+   *  page), so a hung Door43 cannot hold the caller. Omitted = no timeout,
+   *  which is every pre-existing caller's behavior. A timeout throws. */
+  timeoutMs?: number;
 }): Promise<DcsOpenPr[]> {
   const apiBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
   const limit = 50;
   const maxPages = 20;
   const sameRepo = `${config.owner}/${config.repo}`;
   const out: DcsOpenPr[] = [];
+  const signal = config.timeoutMs ? AbortSignal.timeout(config.timeoutMs) : undefined;
   for (let page = 1; page <= maxPages; page++) {
     const listRes = await fetch(
       `${apiBase}/pulls?state=open&limit=${limit}&page=${page}`,
-      { method: "GET", headers: dcsPrHeaders(config.token) },
+      { method: "GET", headers: dcsPrHeaders(config.token), ...(signal ? { signal } : {}) },
     );
     if (!listRes.ok) {
       throw new Error(`dcs_pull_list_failed: ${listRes.status} ${await listRes.text()}`);
@@ -2492,12 +2497,15 @@ export async function listOpenPrs(config: {
 export async function getCommitStatus(
   config: { baseUrl: string; token: string; owner: string; repo: string },
   sha: string,
+  opts: { timeoutMs?: number } = {},
 ): Promise<string | null> {
   const apiBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
   try {
+    // A timeout lands in the catch below: null, like any other failed read.
     const res = await fetch(`${apiBase}/commits/${encodeURIComponent(sha)}/status`, {
       method: "GET",
       headers: dcsPrHeaders(config.token),
+      ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
     });
     if (!res.ok) return null;
     const data = (await res.json()) as { state?: string };
