@@ -190,6 +190,9 @@ function assert(cond, msg) {
 
 {
   // Issue #633 / #788 admin guidance: same text-side vs alignment distinction.
+  // overwrittenVersion left unset here on purpose — buildMergeConflictGuidance
+  // must still treat these as overwrites (its pre-#981 behavior) when the
+  // field is simply absent, not just when it is explicitly a number.
   const w = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_wording" }]);
   assert(w.includes("The wording changed."), "admin wording-only names wording");
   assert(w.includes("replaced text is still"), "admin wording-only keeps text recovery");
@@ -214,6 +217,45 @@ function assert(cond, msg) {
   // it is not an adopt_conflict, so it must not count as an overwrite.
   const silent = buildMergeConflictGuidance([{ action: "adopt_no_visible_change", reason: "both_changed_no_visible" }]);
   assert(!silent.includes("took Door43's version"), "no-visible-change action is not an overwrite sentence");
+}
+
+{
+  // Issue #981: the #539 no-op guard (bookReimport.ts) keeps a conflicted
+  // byte no-op as `adopt_conflict` with `overwrittenVersion` cleared to null
+  // — D1 already matched Door43, so nothing was actually overwritten. The
+  // admin sentence must not call that an overwrite or point at a missing @v.
+  const pointerless = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null },
+  ]);
+  assert(!pointerless.includes("took Door43's version over the editor's"), "pointer-less adopt_conflict is not an overwrite");
+  assert(!pointerless.includes("@v"), "pointer-less adopt_conflict names no version to recover from");
+  assert(
+    pointerless.includes("1 was flagged for review but D1 already matched Door43, so nothing was overwritten."),
+    "pointer-less adopt_conflict gets its own explanatory clause",
+  );
+
+  // A row WITH a pointer still reads as an overwrite and still gives the @v
+  // recovery sentence, even mixed with a pointer-less row in the same run.
+  const mixed = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 4 },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null },
+  ]);
+  assert(mixed.includes("1 took Door43's version over the editor's"), "pointered row still counts as an overwrite");
+  assert(mixed.includes("at the version number given after @v in its ref above"), "pointered row keeps its @v recovery sentence");
+  assert(
+    mixed.includes("1 was flagged for review but D1 already matched Door43, so nothing was overwritten."),
+    "pointer-less row in the same run still gets its own clause",
+  );
+
+  // Plural agreement: two pointer-less rows read "were", not "was".
+  const twoPointerless = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null },
+  ]);
+  assert(
+    twoPointerless.includes("2 were flagged for review but D1 already matched Door43, so nothing was overwritten."),
+    "two pointer-less rows agree as 'were'",
+  );
 }
 
 {

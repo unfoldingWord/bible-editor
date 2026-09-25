@@ -359,11 +359,22 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
 }
 
 export function buildMergeConflictGuidance(
-  rows: Array<{ action: string; reason?: string }>,
+  rows: Array<{ action: string; reason?: string; overwrittenVersion?: number | null }>,
   opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
 ): string {
-  const overwrittenRows = rows.filter((r) => r.action === "adopt_conflict");
+  // #539's no-op guard (bookReimport.ts ~7318) keeps a CONFLICTED adopt whose
+  // bytes turned out to already match D1 as an `adopt_conflict` row with
+  // `overwrittenVersion` cleared to null, so the review banner still lists it
+  // — but nothing was actually overwritten, and a pointer-less row has no
+  // `@v` in its ref (buildGroupedRefsClause). Rows that don't set
+  // `overwrittenVersion` at all (pre-#981 call sites / existing tests) are
+  // treated as carrying a pointer, matching this function's behavior before
+  // this split existed.
+  const adoptConflictRows = rows.filter((r) => r.action === "adopt_conflict");
+  const overwrittenRows = adoptConflictRows.filter((r) => r.overwrittenVersion !== null);
+  const noOverwriteRows = adoptConflictRows.filter((r) => r.overwrittenVersion === null);
   const overwritten = overwrittenRows.length;
+  const noOverwrite = noOverwriteRows.length;
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
   const keptSourceAttr = rows.filter((r) => r.action === "source_attr_divergent").length;
   // Issue #728: the app's verse-bridge STRUCTURE was kept where Door43's
@@ -392,6 +403,10 @@ export function buildMergeConflictGuidance(
   return [
     overwritten > 0
       ? `${overwritten} took Door43's version over the editor's — ${overwriteAxes} ${overwriteRecovery}`
+      : "",
+    noOverwrite > 0
+      ? `${noOverwrite} ${noOverwrite === 1 ? "was" : "were"} flagged for review but D1 already matched Door43, ` +
+        `so nothing was overwritten.`
       : "",
     keptAlignment > 0
       ? `${keptAlignment} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +
