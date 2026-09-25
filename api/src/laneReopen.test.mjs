@@ -318,6 +318,60 @@ console.log("\n[#686 item 3, source check] chapters.ts's three edit_log INSERTs 
   eq(chaptersTs.includes(".bind(book, chapter, verse, done, now, userId)"), true, "[source] the insert binds userId as updated_by");
 }
 
+console.log("\n[#931] a verse save's lane reopen finishes BEFORE the save responds");
+{
+  // The dual aligner's "save, mark done, next verse" button sends the Text
+  // lane check right behind the verse PATCH. When the reopen ran in
+  // waitUntil (after the response), its DELETE could land after that check
+  // and wipe it. So the reopen must be awaited before responding — which is
+  // only safe because reopenLaneChecks swallows its own errors (runtime
+  // check below). verses.ts imports Hono, so the route itself cannot run
+  // here (STATE.md); the ordering is asserted on the source text, same
+  // limitation as the chapters.ts check above.
+  const throwingEnv = {
+    DB: {
+      prepare: () => ({ bind: () => ({}) }),
+      batch: async () => {
+        throw new Error("D1 down");
+      },
+    },
+  };
+  let threw = false;
+  try {
+    await reopenLaneChecks(throwingEnv, "ZEC", 1, 7, ["text"]);
+  } catch {
+    threw = true;
+  }
+  eq(threw, false, "a failing reopen resolves instead of throwing, so awaiting it cannot fail a save");
+
+  const { readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const versesTs = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "verses.ts"), "utf8");
+  const calls = versesTs.split("reopenLaneChecks(").length - 1;
+  const awaited = versesTs.split("await reopenLaneChecks(").length - 1;
+  eq(calls >= 3, true, "[source] verses.ts reopens lanes on PATCH, bridge and split");
+  eq(awaited, calls, "[source] every reopenLaneChecks call in verses.ts is awaited");
+  // No reopen inside a waitUntil: a waitUntil argument runs after the
+  // response, whether passed directly or wrapped in an async IIFE.
+  const waitUntilBodies = [];
+  for (const m of versesTs.matchAll(/waitUntil\(/g)) {
+    let depth = 0;
+    let i = m.index + "waitUntil".length;
+    const start = i;
+    for (; i < versesTs.length; i++) {
+      if (versesTs[i] === "(") depth++;
+      else if (versesTs[i] === ")" && --depth === 0) break;
+    }
+    waitUntilBodies.push(versesTs.slice(start, i + 1));
+  }
+  eq(
+    waitUntilBodies.some((b) => b.includes("reopenLaneChecks")),
+    false,
+    "[source] no reopenLaneChecks runs inside a waitUntil (after the response)",
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

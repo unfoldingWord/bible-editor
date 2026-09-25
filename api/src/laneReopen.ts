@@ -6,8 +6,10 @@ import { collapseWhitespaceForCompare } from "./verseMerge.ts";
 
 // "Edits reopen the checkoff": when a verse's underlying content advances, the
 // affected lane's sign-off (verse_lane_checks) should reopen so checkers re-see
-// it. This is a best-effort helper — fire it via waitUntil AFTER the write has
-// already succeeded, never on the request's critical path. It must NEVER throw
+// it. This is a best-effort helper — call it AFTER the write has already
+// succeeded. verses.ts awaits it before responding (#931: a Text check sent
+// right after the save must not be wiped by a late reopen); rows.ts fires it
+// via waitUntil. Either way it must NEVER throw
 // into the save response, so it swallows its own errors as a second layer of
 // defense behind the caller's try/catch. Only call it when the write actually
 // changed something.
