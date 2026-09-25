@@ -5,7 +5,7 @@ import {
   gotoVerse,
   mintToken,
   newUserContext,
-  noteTextarea,
+  openNoteEditor,
   waitForServerNote,
 } from "./helpers";
 
@@ -35,7 +35,7 @@ test("edits queued while offline survive and flush on reconnect", async ({ brows
   await context.setOffline(true);
 
   const offlineText = `OFFLINE alice ${Date.now()}`;
-  await noteTextarea(page, target!.id).fill(offlineText);
+  await (await openNoteEditor(page, target!.id)).fill(offlineText);
   // Click Save while offline — the PATCH can't reach the server, so it stays a
   // pending op in the outbox (asserted below). No autosave: Save is explicit.
   await saveNote(page, target!.id);
@@ -120,7 +120,7 @@ test("server flakiness triggers retry; eventual success drains the outbox", asyn
 
   await gotoVerse(page, "ZEC", 7, target!.verse);
   const flakyText = `FLAKY bob ${Date.now()}`;
-  await noteTextarea(page, target!.id).fill(flakyText);
+  await (await openNoteEditor(page, target!.id)).fill(flakyText);
   await saveNote(page, target!.id);
 
   const sideCtx = await apiRequest.newContext({ baseURL: BASE });

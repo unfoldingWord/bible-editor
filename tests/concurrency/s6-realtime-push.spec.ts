@@ -1,5 +1,5 @@
 import { expect, test, request as apiRequest } from "@playwright/test";
-import { authedRequest, fetchChapter, gotoVerse, mintToken, newUserContext, noteTextarea } from "./helpers";
+import { authedRequest, fetchChapter, gotoVerse, mintToken, newUserContext, noteReadView } from "./helpers";
 
 // Honor BE_BASE_URL so the suite runs on a relocated port (mirrors s8).
 const BASE = process.env.BE_BASE_URL ?? "http://localhost:5173";
@@ -30,7 +30,11 @@ test("alice's PATCH appears in bob's open view", async ({ browser }) => {
   const bob = await bobCtx.newPage();
   await gotoVerse(bob, "ZEC", 6, target.verse);
 
-  const bobNote = noteTextarea(bob, target.id);
+  // Bob never touches the card: it stays inactive, so its body is the
+  // click-to-edit read view (no textarea). The assertion below reads that
+  // untouched view, so no click or navigation of Bob's can have delivered
+  // the new text — only the WS push.
+  const bobNote = noteReadView(bob, target.id);
   await bobNote.waitFor({ timeout: 10_000 });
   // Give the WS subscription a beat to open before we mutate.
   await bob.waitForTimeout(500);
@@ -46,8 +50,8 @@ test("alice's PATCH appears in bob's open view", async ({ browser }) => {
   );
   expect(res.status(), `PATCH failed: ${await res.text()}`).toBe(200);
 
-  // Bob's textarea should re-sync via the WS push within a couple of seconds.
-  await expect(bobNote).toHaveValue(newText, { timeout: 5_000 });
+  // Bob's read view should re-sync via the WS push within a couple of seconds.
+  await expect(bobNote).toHaveText(newText, { timeout: 5_000 });
 
   await aliceCtx.dispose();
   await bobCtx.close();
@@ -65,7 +69,7 @@ test("alice's POST appears in bob's open view", async ({ browser }) => {
   const { context: bobCtx } = await newUserContext(browser, "bob");
   const bob = await bobCtx.newPage();
   await gotoVerse(bob, "ZEC", 6, anchor!.verse);
-  await noteTextarea(bob, anchor!.id).waitFor({ timeout: 10_000 });
+  await noteReadView(bob, anchor!.id).waitFor({ timeout: 10_000 });
   await bob.waitForTimeout(500);
 
   const aliceCtx = await apiRequest.newContext({ baseURL: BASE });

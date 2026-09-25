@@ -164,6 +164,29 @@ export function noteTextarea(page: Page, rowId: string) {
 }
 
 /**
+ * Locate the read-only Note body of an INACTIVE NoteCard. A card that isn't
+ * being edited renders the body as a plain-text "click to edit" view instead
+ * of the textarea (see `showReadView` in NoteCard.tsx), so `noteTextarea`
+ * matches nothing until the card is opened.
+ */
+export function noteReadView(page: Page, rowId: string) {
+  return page
+    .locator(`[data-note-id="${rowId}"]`)
+    .getByTitle("click to edit", { exact: true });
+}
+
+/**
+ * Open a NoteCard's editor the way a user does — one click on its read view —
+ * and return the now-mounted Note textarea, ready to `fill()`.
+ */
+export async function openNoteEditor(page: Page, rowId: string) {
+  await noteReadView(page, rowId).click();
+  const textarea = noteTextarea(page, rowId);
+  await textarea.waitFor();
+  return textarea;
+}
+
+/**
  * Drain the IndexedDB outbox. Polls /api/chapters until the row's note text
  * matches what we expect, OR a hard timeout. Server is the source of truth.
  */
