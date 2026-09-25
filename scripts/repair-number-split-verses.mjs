@@ -496,6 +496,16 @@ const versions = [...new Set(repaired.map((r) => r.row.bible_version))].sort();
 const inList = (xs) => xs.map((b) => `'${b}'`).join(", ");
 const stmtCount = repaired.length * 2;
 
+// The survivor query must match the scan's scope (everything --book/--bible-version
+// let through, i.e. what `rows` above was filtered to), NOT `books`/`versions`, which
+// are derived from `repaired` alone. expectedSurvivors — refused/plain_text_only/
+// locked/excluded — can and does land in books/versions that were scanned but never
+// repaired (see issue #985), so filtering the survivor SELECT down to `books` makes
+// it return 0 whenever every survivor sits outside those books, even on a fully
+// successful apply.
+const scanBooks = bookFilter ? [...bookFilter].sort() : [];
+const scanVersions = versionFilter ? [...versionFilter].sort() : [];
+
 const header = [
   `-- Repair the number-split defect ("1, 000" → "1,000") — GitHub issue #452.`,
   `-- Generated ${new Date().toISOString()} by scripts/repair-number-split-verses.mjs`,
@@ -565,8 +575,8 @@ const header = [
     : ["--   Expect 0 survivors (every matching row in scope is repaired by this file):"]),
   "--     SELECT book, bible_version, chapter, verse FROM verses",
   "--      WHERE plain_text GLOB '*[0-9], [0-9][0-9][0-9]*'",
-  ...(books.length ? [`--        AND book IN (${inList(books)})`] : []),
-  ...(versions.length ? [`--        AND bible_version IN (${inList(versions)})`] : []),
+  ...(scanBooks.length ? [`--        AND book IN (${inList(scanBooks)})`] : []),
+  ...(scanVersions.length ? [`--        AND bible_version IN (${inList(scanVersions)})`] : []),
   "--      ORDER BY book, bible_version, chapter, verse;",
   "--   If either number is wrong, re-dump and re-run this script; re-applying is safe.",
   ...(expectedSurvivors.length
