@@ -76,6 +76,10 @@ export interface AlignmentTabProps {
   onOpenDual?: () => void;
   // Restore a previously-saved verse version from the panel's history button.
   onRestoreVersion?: (content: unknown, plainText: string | null) => void;
+  // #943: true while an AI pipeline holds this verse's chapter lock. Passed
+  // through to AlignmentPanel, which disables Save and the history dialog's
+  // restore so a translator can't drag+save into a guaranteed 409.
+  locked?: boolean;
 }
 
 interface Props {
@@ -945,6 +949,7 @@ export function ResourceColumn({
             onDirtyChange={alignmentProps.onDirtyChange}
             onOpenDual={alignmentProps.onOpenDual}
             onRestoreVersion={alignmentProps.onRestoreVersion}
+            locked={alignmentProps.locked}
           />
         ) : (
           <Box sx={{ p: 3 }}>
