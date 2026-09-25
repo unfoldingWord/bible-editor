@@ -483,13 +483,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // merging refetch issued after it. Cost: if the mount GET already landed
     // when the socket opens, this is a second GET of the same chapter — the
     // price of correctness, deliberately not avoided with timestamps. If the
-    // mount GET is still in flight, `refetch` aborts and restarts it, so the
-    // chapter is still fetched once (see useChapter.refetch).
+    // mount GET is still in flight, `refetch` does not abort it: the mount GET
+    // lands and renders first, and the merging GET is issued right after it,
+    // so first paint never waits on the socket (#902; see
+    // hooks/chapterFetchSequencer.ts).
     //
     // Merging, not replacing: a reconnect fires on the same `online` moment
     // that drains the outbox, so the GET races the tab's own PATCHes. A verse
-    // held at an equal-or-newer version stays (the PATCH landed, or is pending
-    // with optimistic content); a stale GET body must not regress it into a
+    // or tn/tq/twl row held at an equal-or-newer version stays (the PATCH
+    // landed, or is pending with optimistic content); a stale GET body must
+    // not regress it into a
     // 409 against the user's own save. The other refetch callers (TWL order
     // unlock, pipeline Refresh, Door43 import) keep the plain replace — they
     // refetch because the server changed versions out from under the tab.

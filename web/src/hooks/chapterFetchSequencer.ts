@@ -129,7 +129,10 @@ export function createChapterFetchSequencer<P, S>(cb: ChapterFetchCallbacks<P, S
     cb.onLanded(payload, merge, pending ? [...queued] : queued);
     // Not awaited: this request's caller is done once its payload landed;
     // the deferring caller's promise settles when the merge does.
-    if (pending) void start(load, true).then(pending.resolve);
+    // `finally` so the deferring caller settles even if the merge throws
+    // (e.g. a callback error); the rejection is swallowed here, not left
+    // unhandled — the hook reports request failures via onError.
+    if (pending) void start(load, true).catch(() => {}).finally(pending.resolve);
   }
 
   return {

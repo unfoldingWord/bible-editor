@@ -189,7 +189,8 @@ export function replaySteps(state: ChapterData, steps: readonly StructureStep[])
  * RULES (per bible_version, per verse):
  *   - Start from `fetched`: a verse the server no longer has is dropped (the
  *     whole point of the reconnect refetch — a missed verse.bridged must not
- *     leave a phantom) and rows / statuses / locks are the fetched ones.
+ *     leave a phantom) and statuses / lane checks / locks (unversioned) are
+ *     the fetched ones.
  *   - A verse present in both keeps the LOCAL row when
  *     `local.version >= fetched.version`: equal means identical or an
  *     optimistic same-version edit whose PATCH is pending; higher means the
@@ -197,13 +198,19 @@ export function replaySteps(state: ChapterData, steps: readonly StructureStep[])
  *   - A fetched row at or below a tombstone this tab holds is the deleted row
  *     seen through a stale read (same clock argument as `applyUpdated`) and is
  *     dropped rather than resurrected.
+ *   - tn / tq / twl rows follow the same equal-or-newer rule by row id
+ *     (`mergeRowList`): with the first-open merge deferred behind the mount
+ *     GET (#902) the chapter is editable while the merging GET is in flight,
+ *     so a row PATCH's 200 can beat the GET's older body. Rows have no
+ *     tombstone, so a row this tab deleted after the GET's snapshot comes
+ *     back until the next refetch — a known limit.
  *   - Tombstones are cleared: the merged map is authoritative again, exactly
  *     as after a plain refetch.
  *   - The merge can only judge verses the snapshot contains. Events that
  *     arrived while the GET was in flight are re-applied over the result by
  *     `replaySteps` (see there for the mid-GET split this covers).
  *
- * Returns `fetched` itself when no local row is kept (a null `prev`, or one
+ * Returns `fetched` itself when no local verse or row is kept (a null `prev`, or one
  * for another chapter, is a plain replace) — the refetch caller always wants
  * the fresh non-verse data, so identity-with-`prev` is never the right no-op.
  */
@@ -233,7 +240,27 @@ export function mergeRefetched(prev: ChapterData | null, fetched: ChapterPayload
       verses[bibleVersion] = rows;
     }
   }
-  return verses ? { ...fetched, verses } : fetched;
+  const tn = mergeRowList(prev.tn, fetched.tn);
+  const tq = mergeRowList(prev.tq, fetched.tq);
+  const twl = mergeRowList(prev.twl, fetched.twl);
+  if (!verses && tn === fetched.tn && tq === fetched.tq && twl === fetched.twl) return fetched;
+  return { ...fetched, verses: verses ?? fetched.verses, tn, tq, twl };
+}
+
+// tn / tq / twl rows by the same clock as verses: a row present in both keeps
+// the local object when `local.version >= incoming.version` (the tab's own
+// PATCH already landed, or an optimistic edit is pending on that version).
+// Fetched order and membership win: a row the server no longer has is
+// dropped, and a local-only row is not kept. Returns `fetched` itself when
+// nothing local is kept.
+function mergeRowList<R extends { id: string; version: number }>(local: readonly R[], fetched: R[]): R[] {
+  const byId = new Map(local.map((r) => [r.id, r]));
+  let out: R[] | undefined;
+  fetched.forEach((incoming, i) => {
+    const mine = byId.get(incoming.id);
+    if (mine && mine !== incoming && mine.version >= incoming.version) (out ??= fetched.slice())[i] = mine;
+  });
+  return out ?? fetched;
 }
 
 /** bible_version → verse number → version the row had when it was deleted. */

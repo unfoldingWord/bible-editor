@@ -27,7 +27,10 @@ function harness() {
     onLanded: (payload, merge, queued) => events.push({ landed: payload, merge, queued: [...queued] }),
     onError: (e) => events.push({ error: String(e) }),
   });
-  function loader(label) {
+  // `ignoreAbort`: the request keeps going after abort and can still resolve
+  // late — the case the sequencer's stale-response guard exists for (a fetch
+  // whose body was already read, or a loader that does not honor the signal).
+  function loader(label, { ignoreAbort = false } = {}) {
     return (signal) => {
       const req = { label, signal, aborted: false };
       const p = new Promise((resolve, reject) => {
@@ -35,7 +38,7 @@ function harness() {
         req.reject = reject;
         signal.addEventListener("abort", () => {
           req.aborted = true;
-          reject(new Error("AbortError"));
+          if (!ignoreAbort) reject(new Error("AbortError"));
         });
       });
       requests.push(req);
@@ -95,7 +98,7 @@ function harness() {
 // ── Stale ordering: a response that lands after a newer request never commits
 {
   const h = harness();
-  const load = h.loader("ch1");
+  const load = h.loader("ch1", { ignoreAbort: true });
   const mount = h.seq.refetch(load, false);
   h.requests[0].resolve("snap1");
   await mount;
@@ -106,11 +109,11 @@ function harness() {
   assert.equal(h.requests[1].aborted, true, "the superseded merge is aborted");
   h.requests[2].resolve("snapB");
   await b;
-  await a;
   assert.deepEqual(h.landed().at(-1), { landed: "snapB", merge: true, queued: ["s1"] },
     "the latest merge inherits the superseded one's queue");
-  // Even if the aborted request's response somehow resolved late, it is ignored.
+  // The aborted request's response arrives late anyway: it must be ignored.
   h.requests[1].resolve("snapA-late");
+  await a;
   await tick();
   assert.equal(h.landed().filter((e) => e.landed === "snapA-late").length, 0, "a stale response never overwrites a newer one");
 }
@@ -136,9 +139,9 @@ function harness() {
 // ── Chapter change while GET #1 is in flight (and a merge is deferred) ────
 {
   const h = harness();
-  const load1 = h.loader("ch1");
+  const load1 = h.loader("ch1", { ignoreAbort: true });
   const load2 = h.loader("ch2");
-  h.seq.refetch(load1, false);
+  const mount1 = h.seq.refetch(load1, false);
   const open1 = h.seq.refetch(load1, true); // deferred
   h.seq.record("ch1-step");
   h.seq.reset(); // useChapter's effect cleanup for (book, chapter) change
@@ -147,6 +150,7 @@ function harness() {
   const mount2 = h.seq.refetch(load2, false);
   // The old response resolving late (after abort) must never commit.
   h.requests[0].resolve("ch1-snap");
+  await mount1;
   h.requests[1].resolve("ch2-snap");
   await mount2;
   await tick();
@@ -256,6 +260,27 @@ function harness() {
   seq.reset();
   attemptFns[0](2);
   assert.deepEqual(events, [1], "a reset request's retries are not reported");
+}
+
+// ── A deferred merge that throws still settles its caller (no hang, no
+//    unhandled rejection).
+{
+  const reqs = [];
+  const seq = createChapterFetchSequencer({
+    onStart: () => {},
+    onAttempt: () => {},
+    onLanded: (_p, merge) => { if (merge) throw new Error("commit failed"); },
+    onError: () => {},
+  });
+  const load = () => new Promise((resolve) => reqs.push(resolve));
+  const mount = seq.refetch(load, false);
+  const open = seq.refetch(load, true);
+  reqs[0]("snap1");
+  await mount;
+  await tick();
+  reqs[1]("snap2");
+  const settled = await Promise.race([open.then(() => "settled"), new Promise((r) => setTimeout(() => r("hung"), 50))]);
+  assert.equal(settled, "settled", "the deferring caller settles even when the merge throws");
 }
 
 console.log("chapterFetchSequencer: all cases passed");
