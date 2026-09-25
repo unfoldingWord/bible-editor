@@ -411,9 +411,9 @@ check(
     status,
     ...extra,
   });
-  const laneOp = (id, v, queuedAt, seq, status = "pending") => ({
+  const laneOp = (id, v, queuedAt, seq, status = "pending", lane = "text") => ({
     id,
-    target: { kind: "lane_check", book: "ZEC", chapter: 1, verse: v, lane: "text" },
+    target: { kind: "lane_check", book: "ZEC", chapter: 1, verse: v, lane },
     action: "patch",
     patch: { checked: true },
     expectedVersion: 0,
@@ -498,6 +498,42 @@ check(
     const other = verseOp("o", 8, "ULT", "pending", 102, 3);
     const ops = [verseOp("v", 7, "ULT", "conflict", 100, 1), laneOp("lc", 7, 101, 2), other];
     check(pickNextOp(ops, new Set()) === other, "a held lane check does not block other targets behind it");
+  }
+
+  // Only the lanes a verse save can reopen are held (mirrors the server's
+  // lanesToReopenOnVerseEdit): 'text' always, 'tw' for ULT, never tn/tq.
+  for (const lane of ["tn", "tq"]) {
+    for (const bv of ["ULT", "UST"]) {
+      const lc = laneOp("lc", 7, 101, 2, "pending", lane);
+      const ops = [verseOp("v", 7, bv, "conflict", 100, 1), lc];
+      check(
+        pickNextOp(ops, new Set()) === lc,
+        `FIX (#931 r3): a ${lane} check is not held by an earlier unsettled ${bv} verse op`,
+      );
+    }
+  }
+  {
+    const lc = laneOp("lc", 7, 101, 2, "pending", "tw");
+    check(
+      pickNextOp([verseOp("v", 7, "ULT", "pending", 100, 1, { lastError: "transient 503" }), lc], new Set([ultKey])) ===
+        undefined,
+      "FIX (#931 r3): a tw check is held by an earlier unsettled ULT verse op",
+    );
+    check(
+      pickNextOp([verseOp("v", 7, "UST", "conflict", 100, 1), lc], new Set()) === lc,
+      "FIX (#931 r3): a tw check is not held by an earlier unsettled UST verse op",
+    );
+  }
+  {
+    const conflicted = verseOp("v", 7, "UST", "conflict", 100, 1);
+    const text = laneOp("lct", 7, 101, 2, "pending", "text");
+    const tw = laneOp("lcw", 7, 102, 3, "pending", "tw");
+    const tn = laneOp("lcn", 7, 103, 4, "pending", "tn");
+    const moved = laneChecksToKeepBehind(conflicted, [conflicted, text, tw, tn]);
+    check(
+      moved.length === 1 && moved[0] === text,
+      "FIX (#931 r3): resolving a UST conflict moves only the text check behind it (not tw/tn)",
+    );
   }
 
   // resolveConflict re-queues the verse op at the back; the check that was

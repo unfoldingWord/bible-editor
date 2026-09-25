@@ -112,20 +112,34 @@ function verseOpUnsettled(o: PickOp): boolean {
   );
 }
 
-// #931: every verse PATCH reopens (deletes) the verse's lane checks server-side
-// (api/src/verses.ts → reopenLaneChecks). A lane check and a verse op have
-// different targetKeys, so per-target FIFO alone let a check queued right
-// behind a verse save dispatch first whenever that save was parked (retry,
-// 409, max-attempts) — and the late save then wiped the check. So a lane check
-// waits (stays pending) while any verse op for the same book+chapter+verse,
-// any bibleVersion, queued EARLIER than it is unsettled. Verse ops queued
-// after the check don't hold it: an edit made after checking still reopens.
+// Whether a verse save can reopen (delete) this lane's check server-side.
+// Mirrors api/src/laneReopen.ts lanesToReopenOnVerseEdit: every verse save
+// reopens 'text'; a ULT save also reopens 'tw' when a word changed (which the
+// client cannot tell in advance, so any ULT op counts). tn/tq are never
+// reopened by a verse save.
+function verseSaveCanReopen(verse: OpTarget, lc: OpTarget): boolean {
+  if (verse.kind !== "verse" || lc.kind !== "lane_check") return false;
+  if (lc.lane === "text") return true;
+  return lc.lane === "tw" && verse.bibleVersion === "ULT";
+}
+
+// #931: a verse PATCH reopens (deletes) some of the verse's lane checks
+// server-side (api/src/verses.ts → reopenLaneChecks). A lane check and a verse
+// op have different targetKeys, so per-target FIFO alone let a check queued
+// right behind a verse save dispatch first whenever that save was parked
+// (retry, 409, max-attempts) — and the late save then wiped the check. So a
+// lane check waits (stays pending) while a verse op for the same
+// book+chapter+verse that can reopen its lane (verseSaveCanReopen), queued
+// EARLIER than it, is unsettled. Verse ops queued after the check don't hold
+// it: an edit made after checking still reopens. A tn/tq check is never held,
+// so a stuck verse save cannot freeze an unrelated checkbox.
 export function laneCheckHeld(lc: PickOp, ops: PickOp[]): boolean {
   if (lc.target.kind !== "lane_check") return false;
   return ops.some(
     (o) =>
       o.target.kind === "verse" &&
       sameVerse(o.target, lc.target) &&
+      verseSaveCanReopen(o.target, lc.target) &&
       drainOrder(o, lc) < 0 &&
       verseOpUnsettled(o),
   );
@@ -160,7 +174,8 @@ function sameVerse(a: OpTarget, b: OpTarget): boolean {
 // behind it would then sort ahead of it and escape laneCheckHeld — and the
 // re-armed verse PATCH, landing second, would reopen (delete) the check
 // (#931). These are the pending lane checks resolveConflict must move to the
-// back too, so they keep their place behind the verse save.
+// back too, so they keep their place behind the verse save — only the lanes
+// that save can reopen, the same rule laneCheckHeld uses.
 export function laneChecksToKeepBehind<T extends PickOp>(conflicted: PickOp, all: T[]): T[] {
   if (conflicted.target.kind !== "verse") return [];
   return all
@@ -169,6 +184,7 @@ export function laneChecksToKeepBehind<T extends PickOp>(conflicted: PickOp, all
         o.target.kind === "lane_check" &&
         o.status === "pending" &&
         sameVerse(o.target, conflicted.target) &&
+        verseSaveCanReopen(conflicted.target, o.target) &&
         drainOrder(conflicted, o) < 0,
     )
     .sort(drainOrder);

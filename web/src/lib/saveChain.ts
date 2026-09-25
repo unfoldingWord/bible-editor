@@ -58,7 +58,8 @@ export function runSaveDoneAndNext(opts: {
 // In-flight guard for the button: a second click while a chain is still
 // running (waiting on a draft read or a confirm) is ignored, so it cannot
 // start a second save-and-mark (which, once the first had advanced, would mark
-// the NEXT verse). `cancel` releases the guard when the chain is known to have
+// the NEXT verse). The guard is released once advance has run, or when mark or
+// advance throws. `cancel` releases the guard when the chain is known to have
 // stalled for good — the user cancelled the unalign confirm — so the button
 // works again. The caller passes the verse to mark in its own closures, so the
 // mark always targets the verse the click started on.
@@ -74,11 +75,24 @@ export function createSaveDoneAndNextGuard() {
       try {
         runSaveDoneAndNext({
           steps: opts.steps,
+          // Released only AFTER advance, so a click landing between the mark
+          // and the move (or re-entering from either) cannot start a chain on
+          // the verse being left. A throw from either still releases it.
           markDone: () => {
-            running = false;
-            opts.markDone();
+            try {
+              opts.markDone();
+            } catch (e) {
+              running = false;
+              throw e;
+            }
           },
-          advance: opts.advance,
+          advance: () => {
+            try {
+              opts.advance();
+            } finally {
+              running = false;
+            }
+          },
         });
       } catch (e) {
         running = false;

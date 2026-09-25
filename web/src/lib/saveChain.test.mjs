@@ -165,18 +165,24 @@ function check(cond, msg) {
   const marked = [];
   let active = 7;
   let pendingCommit = null;
+  const heldDuring = [];
   const click = () => {
     const verse = active; // captured at click time, as Shell does
     return guard.run({
       steps: [{ dirty: true, save: (afterCommit) => { pendingCommit = afterCommit; } }],
-      markDone: () => marked.push(verse),
-      advance: () => { active = verse + 1; },
+      markDone: () => { heldDuring.push(["mark", guard.running]); marked.push(verse); },
+      advance: () => { heldDuring.push(["advance", guard.running]); active = verse + 1; },
     });
   };
   assert.equal(click(), true, "first click starts the chain");
   assert.equal(guard.running, true, "guard is held while the save is pending");
   assert.equal(click(), false, "a second click during the chain is ignored");
   pendingCommit();
+  assert.deepEqual(
+    heldDuring,
+    [["mark", true], ["advance", true]],
+    "the guard stays held through markDone AND advance (released only after advance)",
+  );
   assert.deepEqual(marked, [7], "only the starting verse is marked");
   assert.equal(active, 8, "advanced once");
   assert.equal(guard.running, false, "guard released when the chain finishes");
@@ -190,6 +196,28 @@ function check(cond, msg) {
   const g2 = createSaveDoneAndNextGuard();
   assert.throws(() => g2.run({ steps: [{ dirty: true, save: () => { throw new Error("boom"); } }], markDone() {}, advance() {} }));
   assert.equal(g2.running, false, "a throwing save releases the guard");
+  // A click from inside advance (e.g. a re-render firing the handler) is ignored.
+  const g3 = createSaveDoneAndNextGuard();
+  let reentered = null;
+  g3.run({
+    steps: [],
+    markDone() {},
+    advance() { reentered = g3.run({ steps: [], markDone() {}, advance() {} }); },
+  });
+  assert.equal(reentered, false, "a click during advance is ignored");
+  assert.equal(g3.running, false, "guard released after advance");
+  // A throwing advance or markDone (after an async commit) does not wedge it.
+  for (const which of ["markDone", "advance"]) {
+    const g4 = createSaveDoneAndNextGuard();
+    let commit = null;
+    g4.run({
+      steps: [{ dirty: true, save: (afterCommit) => { commit = afterCommit; } }],
+      markDone: () => { if (which === "markDone") throw new Error("boom"); },
+      advance: () => { if (which === "advance") throw new Error("boom"); },
+    });
+    assert.throws(() => commit());
+    assert.equal(g4.running, false, `a throwing ${which} releases the guard`);
+  }
 }
 
 if (failed) {
