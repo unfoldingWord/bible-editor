@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
 import UndoIcon from "@mui/icons-material/Undo";
@@ -33,6 +33,15 @@ interface SearchState {
 }
 
 const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
+// Shared empty instances so a verse with no drifted markers / no section
+// headers hands VerseSpan the SAME array reference every render, instead of a
+// fresh `[]` that would look like a change to its `html`/highlight memos.
+const EMPTY_MARKERS: unknown[] = [];
+const EMPTY_SECTIONS: SectionHeader[] = [];
+const EMPTY_DRIFT_SECTIONS: { drift: unknown[]; sections: SectionHeader[] } = {
+  drift: EMPTY_MARKERS,
+  sections: EMPTY_SECTIONS,
+};
 
 interface Props {
   book: string;
@@ -156,6 +165,45 @@ export function DocColumn({
   const activeRef = useRef<HTMLSpanElement | null>(null);
   const localSelectionRef = useRef<number | null>(null);
   const previousScrollNonce = useRef(scrollNonce);
+  // Latest `activeVerse` for the click handler below. Reading it via ref (set
+  // synchronously every render, ahead of the click) lets handleSelectVerse
+  // stay a single stable function shared by every verse instead of a fresh
+  // closure per verse per render — the closure only needed activeVerse to
+  // record whether the click actually changed the selection.
+  const activeVerseRef = useRef(activeVerse);
+  activeVerseRef.current = activeVerse;
+
+  const handleSelectVerse = useCallback(
+    (verseNum: number) => {
+      onSelectVerse(verseNum, () => {
+        if (verseNum !== activeVerseRef.current) localSelectionRef.current = verseNum;
+      });
+    },
+    [onSelectVerse],
+  );
+
+  // Per-verse drift (trailing markers composed from the previous verse) and
+  // section-header bands, precomputed once per versesByVerseNum change rather
+  // than recomputed — and freshly allocated — on every render regardless of
+  // which verse (if any) actually changed. Keyed by verse_start.
+  const driftAndSections = useMemo(() => {
+    const map = new Map<number, { drift: unknown[]; sections: SectionHeader[] }>();
+    for (const v of verseNumbers) {
+      const dto = versesByVerseNum[v];
+      if (!dto || !isFirstOfRange(dto, v)) continue;
+      const verseObjects = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+      const sections = Array.isArray(verseObjects) ? splitSectionHeaders(verseObjects).sections : EMPTY_SECTIONS;
+      const prevDto = findPreviousVerse(versesByVerseNum, dto.verse);
+      const rawDrift = prevDto
+        ? extractTrailingMarkers((prevDto.content as { verseObjects?: unknown[] } | null)?.verseObjects)
+        : null;
+      map.set(dto.verse, {
+        drift: rawDrift && rawDrift.length > 0 ? rawDrift : EMPTY_MARKERS,
+        sections: sections.length > 0 ? sections : EMPTY_SECTIONS,
+      });
+    }
+    return map;
+  }, [verseNumbers, versesByVerseNum]);
 
   useEffect(() => {
     const explicitScroll = previousScrollNonce.current !== scrollNonce;
@@ -245,8 +293,8 @@ export function DocColumn({
           const isActive = activeVerse >= dto.verse && activeVerse <= (dto.verse_end ?? dto.verse);
           // During a preview the yellow follows the moved/hovered note; else the
           // active note. Bridged TN quotes also paint on non-active covered verses.
-          const aQuote = reorderHighlight?.movedQuote ?? activeNoteQuote;
-          const aOcc = reorderHighlight?.movedQuote ? reorderHighlight.movedOccurrence : activeNoteOccurrence;
+          const aQuote = reorderHighlight?.movedQuote ?? activeNoteQuote ?? null;
+          const aOcc = (reorderHighlight?.movedQuote ? reorderHighlight.movedOccurrence : activeNoteOccurrence) ?? null;
           const covered =
             !!activeNoteQuotePartialGroups &&
             !!activeNoteCoveredVerses?.some(
@@ -258,38 +306,18 @@ export function DocColumn({
           // the navigated verse and would mis-join a v12 ULT highlight.
           const sourceContent =
             sourceByVerseNum?.[dto.verse]?.content ?? activeSourceContent;
-          const highlights = paintQuote
-            ? highlightsFor(bibleVersion, dto.content, aQuote, aOcc, sourceContent, partial)
-            : null;
-          // Reorder stoplight neighbour sets (active verse only, while live).
-          const prevHighlights =
-            isActive && reorderHighlight?.prevQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, sourceContent)
-              : null;
-          const nextHighlights =
-            isActive && reorderHighlight?.nextQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, sourceContent)
-              : null;
-          // Lift any \s1/\s2/\s3 section headers in this verse's content
-          // into block-level bands rendered AFTER the inline verse span
-          // (see below) — they sit in the verse's trailing objects and
-          // introduce the next verse. The remaining body still has them
-          // filtered by the renderer.
-          const verseObjects = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-          const sections: SectionHeader[] = Array.isArray(verseObjects)
-            ? splitSectionHeaders(verseObjects).sections
-            : [];
-          // Drift trailing \q1/\p etc. from the previous verse into the
-          // leading position of THIS verse — usfm-js attaches them to
-          // the prior verse (per `\q1 \v N+1`) but visually they introduce
-          // this verse. Composed into the rendered content here; storage
-          // stays untouched.
-          const prevDto = findPreviousVerse(versesByVerseNum, dto.verse);
-          const drift = prevDto
-            ? extractTrailingMarkers(
-                (prevDto.content as { verseObjects?: unknown[] } | null)?.verseObjects,
-              )
-            : [];
+          // Reorder stoplight neighbour quotes (active verse only, while live).
+          // Resolved to Sets inside VerseSpan (memoized there) rather than here,
+          // so an unrelated DocColumn render doesn't hand every verse a fresh Set.
+          const prevQuote = reorderHighlight?.prevQuote ?? null;
+          const prevOcc = reorderHighlight?.prevOccurrence ?? null;
+          const nextQuote = reorderHighlight?.nextQuote ?? null;
+          const nextOcc = reorderHighlight?.nextOccurrence ?? null;
+          // Lift any \s1/\s2/\s3 section headers in this verse's content into
+          // block-level bands rendered AFTER the inline verse span (see below),
+          // and the trailing \q1/\p etc. drifted down from the previous verse —
+          // both precomputed in driftAndSections above.
+          const { drift, sections } = driftAndSections.get(dto.verse) ?? EMPTY_DRIFT_SECTIONS;
           return (
             <Fragment key={dto.verse}>
               <VerseSpan
@@ -302,10 +330,16 @@ export function DocColumn({
                 text={dto.plain_text ?? ""}
                 content={dto.content}
                 sourceContent={sourceByVerseNum?.[dto.verse]?.content}
+                highlightSourceContent={sourceContent}
                 precedingMarkers={drift}
-                highlights={highlights}
-                prevHighlights={prevHighlights}
-                nextHighlights={nextHighlights}
+                paintQuote={paintQuote}
+                aQuote={aQuote}
+                aOcc={aOcc}
+                partial={partial}
+                prevQuote={prevQuote}
+                prevOcc={prevOcc}
+                nextQuote={nextQuote}
+                nextOcc={nextOcc}
                 isActive={isActive}
                 readOnly={!!readOnly}
                 rtl={!!rtl}
@@ -315,14 +349,11 @@ export function DocColumn({
                 findActiveMatch={findActiveMatch ?? null}
                 spanRef={isActive ? activeRef : null}
                 textCheck={textCheck}
-                onClick={() => {
-                  onSelectVerse(dto.verse, () => {
-                    if (dto.verse !== activeVerse) localSelectionRef.current = dto.verse;
-                  });
-                }}
-                onAlign={() => onOpenAligner(dto.verse)}
-                onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
-                onSave={(plain) => onSaveColumn([{ verseNum: dto.verse, plain, base: dto }])}
+                base={dto}
+                onSelectVerse={handleSelectVerse}
+                onAlign={onOpenAligner}
+                onEditVerse={onEditVerse}
+                onSaveColumn={onSaveColumn}
                 verseEnd={dto.verse_end}
                 // A following verse exists iff the expanded index has a row
                 // starting right after this one's span.
@@ -376,7 +407,7 @@ function findPreviousVerse(
   return null;
 }
 
-function VerseSpan({
+const VerseSpan = memo(function VerseSpan({
   book,
   chapter,
   verseNum,
@@ -386,10 +417,16 @@ function VerseSpan({
   text,
   content,
   sourceContent,
+  highlightSourceContent,
   precedingMarkers,
-  highlights,
-  prevHighlights,
-  nextHighlights,
+  paintQuote,
+  aQuote,
+  aOcc,
+  partial,
+  prevQuote,
+  prevOcc,
+  nextQuote,
+  nextOcc,
   isActive,
   readOnly,
   rtl,
@@ -399,10 +436,11 @@ function VerseSpan({
   findActiveMatch,
   spanRef,
   textCheck,
-  onClick,
+  base,
+  onSelectVerse,
   onAlign,
-  onEdit,
-  onSave,
+  onEditVerse,
+  onSaveColumn,
   verseEnd,
   hasNextVerse,
   onMergeBridge,
@@ -425,15 +463,29 @@ function VerseSpan({
   // The matching UHB/UGNT verse content_json (verse_start keyed) so the align
   // button flags a broken link when a source word lacks a target.
   sourceContent?: unknown;
+  // Same lookup, but falling back to activeSourceContent — used only to
+  // resolve note-quote highlight Sets below (DocColumn's old `sourceContent`
+  // local). Kept separate from `sourceContent` above: the align button must
+  // never see the fallback, or it would mis-join a v12 ULT highlight.
+  highlightSourceContent?: unknown;
   // Trailing markers drifted from the previous verse — composed at the
   // start of the rendered verseObjects so visual paragraph / poetry
   // breaks introduce this verse correctly.
   precedingMarkers?: unknown[];
-  highlights?: Set<string> | null;
-  // Reorder stoplight neighbour sets (green underline / red overline). Set only
-  // for the active verse while a drag / recent arrow-move is live.
-  prevHighlights?: Set<string> | null;
-  nextHighlights?: Set<string> | null;
+  // Whether the active/current note quote should paint on this verse at all
+  // (active verse, or a covered verse of a bridged ref). The Set itself is
+  // resolved below via useMemo so an unrelated DocColumn render doesn't hand
+  // every verse a freshly-allocated Set.
+  paintQuote: boolean;
+  aQuote: string | null;
+  aOcc: number | null;
+  partial: boolean;
+  // Reorder stoplight neighbour quotes (green underline / red overline).
+  // Resolved to Sets below, and only when this is the active verse.
+  prevQuote: string | null;
+  prevOcc: number | null;
+  nextQuote: string | null;
+  nextOcc: number | null;
   isActive: boolean;
   readOnly: boolean;
   rtl: boolean;
@@ -443,10 +495,16 @@ function VerseSpan({
   findActiveMatch: FindMatch | null;
   spanRef: React.MutableRefObject<HTMLSpanElement | null> | null;
   textCheck?: TextLaneCheck;
-  onClick: () => void;
-  onAlign: () => void;
-  onEdit: (plain: string) => void;
-  onSave: (plain: string) => void;
+  // This verse's DTO — carried through so edit/save can report it as the
+  // optimistic-concurrency base without DocColumn needing a per-verse closure.
+  base: VerseDto;
+  // Stable across DocColumn renders (verse number passed at call time), unlike
+  // the old per-verse inline closures — that's what lets `memo` below actually
+  // skip re-rendering verses whose own props didn't change.
+  onSelectVerse: (v: number) => void;
+  onAlign: (verseNum: number) => void;
+  onEditVerse: (verseNum: number, plain: string, base: VerseDto) => void;
+  onSaveColumn: (drafts: Array<{ verseNum: number; plain: string; base: VerseDto }>) => void;
   // Inclusive range end for this row (null for singletons) — the bridge buttons
   // need it to label "break bridge a-b" / decide merge vs extend.
   verseEnd?: number | null;
@@ -461,6 +519,31 @@ function VerseSpan({
   verseCommentCounts?: (verse: number) => CommentCounts;
   onOpenComments?: (anchorEl: HTMLElement, verse: number) => void;
 }) {
+  // Note-quote highlight Sets, memoized per verse instead of allocated fresh
+  // by DocColumn's map() on every render (#895). highlightsFor always returns
+  // a Set (never null) once a quote is present, so the gates below match the
+  // ternaries this replaces exactly.
+  const highlights = useMemo<Set<string> | null>(() => {
+    if (!paintQuote || !aQuote) return null;
+    return highlightsFor(bibleVersion, content, aQuote, aOcc, highlightSourceContent, partial);
+  }, [paintQuote, aQuote, aOcc, partial, bibleVersion, content, highlightSourceContent]);
+  const prevHighlights = useMemo<Set<string> | null>(() => {
+    if (!isActive || !prevQuote) return null;
+    return highlightsFor(bibleVersion, content, prevQuote, prevOcc, highlightSourceContent);
+  }, [isActive, prevQuote, prevOcc, bibleVersion, content, highlightSourceContent]);
+  const nextHighlights = useMemo<Set<string> | null>(() => {
+    if (!isActive || !nextQuote) return null;
+    return highlightsFor(bibleVersion, content, nextQuote, nextOcc, highlightSourceContent);
+  }, [isActive, nextQuote, nextOcc, bibleVersion, content, highlightSourceContent]);
+  const onClick = useCallback(() => onSelectVerse(verseNum), [onSelectVerse, verseNum]);
+  const onEdit = useCallback(
+    (plain: string) => onEditVerse(verseNum, plain, base),
+    [onEditVerse, verseNum, base],
+  );
+  const onSave = useCallback(
+    (plain: string) => onSaveColumn([{ verseNum, plain, base }]),
+    [onSaveColumn, verseNum, base],
+  );
   const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   const activeRange = useMemo<{ start: number; end: number } | null>(() => {
     if (!findActiveMatch) return null;
@@ -763,7 +846,7 @@ function VerseSpan({
           sx={{ p: 0.25, verticalAlign: "-3px" }}
           onClick={(e) => {
             e.stopPropagation();
-            onAlign();
+            onAlign(verseNum);
           }}
         />
       )}
@@ -965,7 +1048,7 @@ function VerseSpan({
     {" "}
     </>
   );
-}
+});
 
 function renderFindMatchesHTML(
   plainText: string,
