@@ -2400,6 +2400,7 @@ export interface DcsOpenPr {
   htmlUrl: string;
   mergeable: boolean | null;
   updatedAt: string | null;
+  createdAt: string | null;
 }
 
 // Pages GET /pulls?state=open for one repo, returning every open PR whose head
@@ -2440,6 +2441,7 @@ export async function listOpenPrs(config: {
       html_url?: string;
       mergeable?: boolean | null;
       updated_at?: string;
+      created_at?: string;
     }>;
     try {
       items = await listRes.json();
@@ -2474,6 +2476,7 @@ export async function listOpenPrs(config: {
           htmlUrl: pr.html_url ?? "",
           mergeable: pr.mergeable ?? null,
           updatedAt: pr.updated_at ?? null,
+          createdAt: pr.created_at ?? null,
         });
       }
     }

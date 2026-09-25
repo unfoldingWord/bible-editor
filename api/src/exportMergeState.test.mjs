@@ -146,9 +146,10 @@ const iso = (sec) => new Date(sec * 1000).toISOString();
 function giteaCommit(sha, at, message, email = "someone@example.org") {
   return { sha, commit: { message, author: { email, date: iso(at) }, committer: { date: iso(at) } } };
 }
-function openPr(number, branch) {
+function openPr(number, branch, createdAt = null) {
   return {
     number,
+    created_at: createdAt == null ? undefined : iso(createdAt),
     title: `bible-editor: ${branch}`,
     state: "open",
     head: { ref: branch, sha: `head${number}`, repo: { full_name: `unfoldingWord/${REPO_OF[number]}` } },
@@ -158,17 +159,23 @@ function openPr(number, branch) {
 }
 const REPO_OF = {};
 
-// Door43 mock. `open[repo]` = open PRs; `status[sha]` = combined state;
-// `history[path]` = newest-first commits on master for that file.
-function mockDoor43({ open = {}, status = {}, history = {}, failList = new Set() }) {
+// Door43 mock. `open[repo]` = open PRs (page 1 of the list); `pr[number]` =
+// the single-PR GET body; `status[sha]` = combined state; `history[path]` =
+// newest-first commits on master for that file; `throwOn` = a URL substring
+// whose fetch throws (transport failure).
+function mockDoor43({ open = {}, pr = {}, status = {}, history = {}, failList = new Set(), throwOn = null }) {
   const calls = [];
   globalThis.fetch = async (input) => {
     const url = new URL(String(input));
     calls.push(url.pathname + url.search);
+    if (throwOn && String(input).includes(throwOn)) throw new TypeError("network down");
     const json = (body, headers = {}) =>
       new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json", ...headers } });
     let m;
-    if ((m = url.pathname.match(/\/repos\/unfoldingWord\/([^/]+)\/pulls$/))) {
+    if ((m = url.pathname.match(/\/repos\/[^/]+\/[^/]+\/pulls\/(\d+)$/))) {
+      return pr[m[1]] ? json({ number: Number(m[1]), ...pr[m[1]] }) : new Response("nf", { status: 404 });
+    }
+    if ((m = url.pathname.match(/\/repos\/[^/]+\/([^/]+)\/pulls$/))) {
       if (failList.has(m[1])) return new Response("boom", { status: 500 });
       const page = Number(url.searchParams.get("page"));
       return json(page === 1 ? open[m[1]] ?? [] : []);
@@ -203,9 +210,10 @@ function mockDoor43({ open = {}, status = {}, history = {}, failList = new Set()
   snapshot(sqlite, "ZEC", "tn", 101, NOW - 2 * HOUR);
   REPO_OF[101] = "en_tn";
 
-  // open over a day → waiting. A later "unchanged" skip (no PR) must not hide it.
+  // open over a day → waiting. A later non-`unchanged` skip (no PR) must not
+  // hide it (an `unchanged` does — see the B1 case below).
   snapshot(sqlite, "JER", "ult", 200, NOW - 2 * DAY);
-  snapshot(sqlite, "JER", "ult", null, NOW - HOUR, { error: "unchanged" });
+  snapshot(sqlite, "JER", "ult", null, NOW - HOUR, { error: "book_locked:explicit" });
   REPO_OF[200] = "en_ult";
 
   // closed, never merged → rejected.
@@ -227,6 +235,7 @@ function mockDoor43({ open = {}, status = {}, history = {}, failList = new Set()
       en_ult: [openPr(200, "JER-be-test")],
       en_twl: [openPr(400, "ISA-be-test")],
     },
+    pr: { 300: { state: "closed", merged: false }, 102: { state: "closed", merged: false } },
     status: { head101: "success", head103: "success", head200: "pending", head400: "failure" },
     history: {
       "tq_DAN.tsv": [
@@ -285,23 +294,143 @@ function mockDoor43({ open = {}, status = {}, history = {}, failList = new Set()
   const { sqlite, env } = freshEnv();
   const books = ["GEN", "EXO", "LEV", "NUM", "DEU", "JOS", "JDG", "RUT", "1SA", "2SA", "1KI", "2KI", "1CH", "2CH", "EZR", "NEH", "EST", "JOB", "PSA", "PRO", "ECC", "SNG", "ISA", "JER", "LAM"];
   books.forEach((b, i) => snapshot(sqlite, b, "tn", 1000 + i, NOW - 2 * DAY + i));
-  const calls = mockDoor43({ open: {}, history: {} });
+  const pr = Object.fromEntries(books.map((_, i) => [1000 + i, { state: "closed", merged: false }]));
+  const calls = mockDoor43({ open: {}, pr, history: {} });
   const res = await computeExportMergeFlags(env, NOW);
-  const walks = calls.filter((c) => c.includes("/commits?")).length;
-  eq(walks <= MERGE_LIVE_LOOKUP_CAP * 2, true, `master walks bounded by the cap (${walks} ≤ ${MERGE_LIVE_LOOKUP_CAP * 2})`);
+  const perExport = calls.filter((c) => c.includes("/commits?") || /\/pulls\/\d+$/.test(c)).length;
+  eq(perExport <= MERGE_LIVE_LOOKUP_CAP * 3, true, `per-export reads bounded by the cap (${perExport} ≤ ${MERGE_LIVE_LOOKUP_CAP * 3})`);
   eq(res.unchecked.length, books.length - MERGE_LIVE_LOOKUP_CAP, "exports past the cap are reported unchecked");
   eq(res.unchecked[0]?.reason, "lookup_budget", "…with the budget as the stated reason");
 }
 
 {
-  // A failed open-PR list for one repo leaves that repo's exports unchecked, never flagged.
+  // A failed open-PR list AND a failed single-PR read leave the export unchecked, never flagged.
   const { sqlite, env } = freshEnv();
   snapshot(sqlite, "JER", "ult", 200, NOW - 2 * DAY);
   mockDoor43({ failList: new Set(["en_ult"]) });
   const res = await computeExportMergeFlags(env, NOW);
   eq(res.flags, [], "list failure → no flag invented");
-  eq(res.unchecked.map((u) => [u.book, u.resource, u.reason]), [["JER", "ult", "open_pr_list_failed"]], "…reported unchecked");
+  eq(res.unchecked.map((u) => [u.book, u.resource, u.reason]), [["JER", "ult", "pr_lookup_failed"]], "…reported unchecked");
   eq(res.errors.length, 1, "…and the repo error surfaced");
+}
+
+{
+  // B1: the pipeline itself closes a lingering PR when a later render matches
+  // master, and records an `unchanged` snapshot with no PR
+  // (exportWorkflow.ts's `!commit.branchTouched` path). That pair is fine: no
+  // flag and no Door43 read at all.
+  const { sqlite, env } = freshEnv();
+  snapshot(sqlite, "OBA", "tn", 500, NOW - 3 * DAY);
+  snapshot(sqlite, "OBA", "tn", null, NOW - DAY, { error: "unchanged" });
+  const calls = mockDoor43({ pr: { 500: { state: "closed", merged: false } } });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags, [], "B1: PR closed by our own pipeline after an `unchanged` render → not rejected");
+  eq(res.unchecked, [], "B1: …and not unchecked either");
+  eq(calls.length, 0, "B1: …and no Door43 read spent on it");
+}
+
+{
+  // B1 converse: an `unchanged` OLDER than the PR says nothing about the PR.
+  const { sqlite, env } = freshEnv();
+  snapshot(sqlite, "OBA", "tn", null, NOW - 4 * DAY, { error: "unchanged" });
+  snapshot(sqlite, "OBA", "tn", 500, NOW - 3 * DAY);
+  mockDoor43({ pr: { 500: { state: "closed", merged: false } }, history: { "tn_OBA.tsv": [] } });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags.map((f) => [f.book, f.state]), [["OBA", "rejected"]], "B1: an older `unchanged` does not excuse a newer PR");
+}
+
+{
+  // B2: every night re-pushes an open PR and records a fresh snapshot with
+  // the SAME pr_number, so the newest snapshot is always young. Waiting is
+  // measured from when the PR was opened.
+  const { sqlite, env } = freshEnv();
+  REPO_OF[600] = "en_ult";
+  for (let d = 5; d >= 1; d--) snapshot(sqlite, "RUT", "ult", 600, NOW - d * DAY);
+  snapshot(sqlite, "RUT", "ult", 600, NOW - HOUR);
+  mockDoor43({ open: { en_ult: [openPr(600, "RUT-be-test")] }, status: { head600: "pending" } });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(
+    res.flags.map((f) => [f.book, f.state, f.exportedAt]),
+    [["RUT", "waiting", NOW - 5 * DAY]],
+    "B2: PR open 5 days, newest snapshot 1 hour old → waiting, dated from the first export carrying it",
+  );
+}
+
+{
+  // B2: Door43's created_at wins when it is older than our first snapshot.
+  const { sqlite, env } = freshEnv();
+  REPO_OF[601] = "en_ult";
+  snapshot(sqlite, "RUT", "ult", 601, NOW - HOUR);
+  mockDoor43({ open: { en_ult: [openPr(601, "RUT-be-test", NOW - 3 * DAY)] }, status: { head601: "pending" } });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags.map((f) => [f.state, f.exportedAt]), [["waiting", NOW - 3 * DAY]], "B2: PR created_at 3 days ago → waiting");
+}
+
+{
+  // B3: overlapping exports can insert snapshots out of order. The newest PR
+  // (highest number — Gitea numbers PRs in creation order per repo) wins.
+  const { sqlite, env } = freshEnv();
+  REPO_OF[701] = "en_tn";
+  snapshot(sqlite, "JOL", "tn", 701, NOW - 2 * HOUR);
+  snapshot(sqlite, "JOL", "tn", 700, NOW - HOUR); // older run, recorded later
+  const calls = mockDoor43({ open: { en_tn: [openPr(701, "JOL-be-test")] }, status: { head701: "success" } });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags, [], "B3: newest PR #701 (open, fresh) wins over late-recorded #700");
+  eq(calls.some((c) => c.includes("/pulls/700")), false, "B3: …and #700 is never looked up");
+}
+
+{
+  // B4: the ledger and master walk read unfoldingWord's repos. With another
+  // export owner, a closed PR cannot be judged from them → unchecked.
+  const { sqlite, env } = freshEnv();
+  env.DCS_EXPORT_OWNER = "someFork";
+  snapshot(sqlite, "NAM", "tq", 800, NOW - 2 * DAY);
+  ledgerCommit(sqlite, "en_tq", "m800", NOW - 2 * DAY + 60, "bible-editor: NAM tq → master (#800)");
+  const calls = mockDoor43({ pr: { 800: { state: "closed", merged: false } } });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags, [], "B4: foreign export owner → no flag");
+  eq(res.unchecked.map((u) => u.reason), ["owner_mismatch"], "B4: …unchecked, naming the owner mismatch");
+  eq(calls.some((c) => c.includes("/commits?")), false, "B4: …and no walk of the wrong repo");
+}
+
+{
+  // B5: a PR missing from the open-PR list (the list is capped and can be
+  // truncated) is confirmed with its own GET before any closed-path verdict.
+  const { sqlite, env } = freshEnv();
+  snapshot(sqlite, "MAL", "ult", 900, NOW - 2 * DAY);
+  mockDoor43({
+    open: { en_ult: [] },
+    pr: { 900: { state: "open", merged: false, head: { sha: "head900" } } },
+    status: { head900: "pending" },
+  });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags.map((f) => [f.book, f.state]), [["MAL", "waiting"]], "B5: open per its own GET → waiting, not rejected");
+}
+
+{
+  // B6: a maintainer's merge-commit merge is classified human by the master
+  // walk, but Gitea reports it merged:true — trusted as merged.
+  const { sqlite, env } = freshEnv();
+  snapshot(sqlite, "HAG", "tn", 950, NOW - 2 * DAY);
+  const calls = mockDoor43({ pr: { 950: { state: "closed", merged: true } } });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags, [], "B6: closed with merged:true → merged, no flag");
+  eq(calls.some((c) => c.includes("/commits?")), false, "B6: …no master walk needed");
+}
+
+{
+  // B7: one export's transport failure must not fail the whole response.
+  const { sqlite, env } = freshEnv();
+  snapshot(sqlite, "JON", "tq", 555, NOW - 2 * DAY);
+  snapshot(sqlite, "DAN", "tq", 300, NOW - 2 * DAY);
+  mockDoor43({
+    pr: { 300: { state: "closed", merged: false } },
+    history: { "tq_DAN.tsv": [] },
+    throwOn: "/pulls/555",
+  });
+  const res = await computeExportMergeFlags(env, NOW);
+  eq(res.flags.map((f) => f.book), ["DAN"], "B7: the other export is still classified");
+  eq(res.unchecked.map((u) => [u.book, u.reason]), [["JON", "lookup_failed"]], "B7: the throwing one is unchecked");
 }
 
 if (failed) {

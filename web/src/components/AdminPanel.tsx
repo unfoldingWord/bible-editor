@@ -128,6 +128,20 @@ function shortSha(sha: string | null): string {
 
 // ── Tab 1: Sync status ───────────────────────────────────────────────────
 
+// Why an export's merge state could not be checked (api exportMergeState.ts).
+const UNCHECKED_REASONS: Record<string, string> = {
+  lookup_budget: "over the per-load check limit",
+  pr_lookup_failed: "couldn't read the PR",
+  owner_mismatch: "export owner isn't unfoldingWord",
+  master_unmeasured: "couldn't read master's history",
+  lookup_failed: "Door43 request failed",
+};
+
+function capList(items: string[], max = 5): string {
+  const shown = items.slice(0, max).join(", ");
+  return items.length > max ? `${shown} +${items.length - max} more` : shown;
+}
+
 // Issue #442 (option C): only problems get a chip — a merged or still-fresh
 // export shows nothing extra.
 function mergeFlagText(flag: AdminMergeFlag): { label: string; detail: string } {
@@ -310,7 +324,16 @@ function SyncStatusTab() {
       {merge && merge.unchecked.length > 0 && (
         <Typography variant="caption" color="text.secondary">
           Merge state not checked for {merge.unchecked.length} export(s):{" "}
-          {merge.unchecked.map((u) => `${u.book} ${RESOURCE_LABELS[u.resource]}`).join(", ")}
+          {capList(
+            merge.unchecked.map(
+              (u) => `${u.book} ${RESOURCE_LABELS[u.resource]} (${UNCHECKED_REASONS[u.reason] ?? u.reason})`,
+            ),
+          )}
+        </Typography>
+      )}
+      {merge && merge.errors.length > 0 && (
+        <Typography variant="caption" color="text.secondary">
+          Door43 errors: {capList(merge.errors.map((e) => `${e.repo}: ${e.message}`))}
         </Typography>
       )}
       {loading ? (
