@@ -340,6 +340,20 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
          AND verse_merge_conflicts.resolved_at IS NULL
        THEN verse_merge_conflicts.overwritten_version
        WHEN excluded.action IN ('keep_alignment_refused', 'source_attr_divergent', 'keep_local_structure') THEN NULL
+       -- Issue #978: the #539 no-op guard (bookReimport.ts) sends a conflicted
+       -- byte no-op as adopt_conflict with a NULL pointer — nothing was
+       -- overwritten. It is the only adopt_conflict writer that sends NULL.
+       -- When it promotes an audit-only adopt / adopt_no_visible_change row,
+       -- that row's old pointer must not ride along: the editor fan-out
+       -- (raiseVerseMergeConflictAlert) alerts on adopt_conflict + non-null
+       -- pointer, so the author of that old version would be told Door43
+       -- overwrote them. The pointer never alerted anyone while the row was
+       -- audit-only. A stored adopt_conflict keeps its pointer (the ELSE):
+       -- its human may still need it.
+       WHEN excluded.action = 'adopt_conflict'
+         AND excluded.overwritten_version IS NULL
+         AND verse_merge_conflicts.action <> 'adopt_conflict'
+       THEN NULL
        ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
      END,
      alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),
