@@ -20,6 +20,7 @@ import {
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
+import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
 import {
   applyStep,
   applyUpdated,
@@ -113,86 +114,52 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   const [data, setData] = useState<ChapterData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [retryAttempts, setRetryAttempts] = useState(0);
-  const mounted = useRef(true);
-  const fetchCtrl = useRef<AbortController | null>(null);
-  // Reducer steps (WS bridged / split / updated, outbox results) that reach
-  // the tab while a `keepNewerLocal` refetch is in flight. Non-null exactly
-  // while such a refetch is pending. `mergeRefetched` can only judge verses
-  // the GET's snapshot contains, so a split that recreated a verse AFTER the
-  // snapshot but BEFORE the response landed would be silently discarded (the
-  // response has no row for it); replaying the queue over the merged map puts
-  // it back. Replay is idempotent — every step is version-gated (see
-  // lib/verseStructure.ts `StructureStep`).
-  //
-  // One queue, owned by the LATEST request: a second open refetch while
-  // the first is in flight aborts the first (fetchCtrl) and inherits the
-  // queue — steps the first collected are either newer than the second GET's
-  // rows (and kept by the merge anyway) or stale echoes (no-ops on replay).
-  // A plain-replace refetch or a chapter change drops it; the resolving or
-  // failing latest request clears it.
-  const replayQueue = useRef<StructureStep[] | null>(null);
-
-  const refetch = useCallback(async (opts?: RefetchOptions) => {
-    // Abort any in-flight retry loop from a previous (book, chapter) before
-    // starting a new one — otherwise stale data could land after navigation.
-    //
-    // This is also what makes the WS first-open refetch (Shell's `onOpen`)
-    // safe when it overlaps the mount fetch below: the mount GET is aborted
-    // here and this later request — issued after the room subscription was
-    // established — replaces it, so the chapter is still fetched once and
-    // the snapshot that lands postdates the subscription. The aborted
-    // request's `catch` sees `fetchCtrl.current !== ctrl` and returns without
-    // touching status/error (fetchWithRetry rethrows on abort, no retry), and
-    // this request drives `status` loading → ready, so there is no stuck
-    // spinner and no AbortError flash. With `prev` still null (the mount
-    // effect cleared it), `mergeRefetched` is a plain replace.
-    fetchCtrl.current?.abort();
-    const ctrl = new AbortController();
-    fetchCtrl.current = ctrl;
-    // `=== true` so a caller that hands `refetch` straight to an event
-    // handler (receiving a truthy event object) still gets the replace.
-    const keepNewerLocal = opts?.keepNewerLocal === true;
-    replayQueue.current = keepNewerLocal ? (replayQueue.current ?? []) : null;
-
-    setStatus("loading");
-    setError(null);
-    setRetryAttempts(0);
-    try {
-      const payload = await fetchWithRetry(
-        (signal) => api.getChapter(book, chapter, signal),
-        {
-          signal: ctrl.signal,
-          onAttempt: (attempts) => {
-            if (mounted.current && fetchCtrl.current === ctrl) {
-              setStatus("retrying");
-              setRetryAttempts(attempts);
-            }
-          },
-        },
-      );
-      if (!mounted.current || fetchCtrl.current !== ctrl) return;
-      // Take the queue synchronously, before the updater runs: a step that
-      // arrives after this point is applied by its own setData, which React
-      // orders after this one, so it must not also be replayed here.
-      const queued = replayQueue.current ?? [];
-      replayQueue.current = null;
-      setData((prev) => (keepNewerLocal ? replaySteps(mergeRefetched(prev, payload), queued) : payload));
+  // Request ordering (abort-and-replace, the deferred first-open merge, the
+  // replay queue for steps that arrive while a merging refetch is pending)
+  // lives in chapterFetchSequencer.ts so every ordering case is unit-tested.
+  // The callbacks only touch state setters, which React keeps stable.
+  const sequencer = useRef<ChapterFetchSequencer<ChapterPayload, StructureStep> | null>(null);
+  sequencer.current ??= createChapterFetchSequencer<ChapterPayload, StructureStep>({
+    onStart: () => {
+      setStatus("loading");
+      setError(null);
+      setRetryAttempts(0);
+    },
+    onAttempt: (attempts) => {
+      setStatus("retrying");
+      setRetryAttempts(attempts);
+    },
+    onLanded: (payload, merge, queued) => {
+      // With `prev` null (the mount effect cleared it) `mergeRefetched` is a
+      // plain replace.
+      setData((prev) => replaySteps(merge ? mergeRefetched(prev, payload) : payload, queued));
       setStatus("ready");
       setRetryAttempts(0);
-    } catch (e) {
-      // A superseded request (a newer refetch owns fetchCtrl and the queue)
-      // must leave the queue to its successor; only the latest request's
-      // failure drops it.
-      if (!mounted.current || fetchCtrl.current !== ctrl) return;
-      replayQueue.current = null;
-      if (ctrl.signal.aborted) return;
+    },
+    onError: (e) => {
       setError(e instanceof ApiError ? `HTTP ${e.status}` : String(e));
       setStatus("error");
-    }
+    },
+  });
+
+  const refetch = useCallback((opts?: RefetchOptions) => {
+    // Any in-flight request is aborted and replaced (stale data must never
+    // land after a newer request or a navigation), with one exception: the
+    // WS first-open merging refetch (Shell's `onOpen`) arriving while the
+    // mount GET is still in flight does not abort it. The mount GET lands and
+    // renders, and the merging GET is issued right after it, so first paint
+    // no longer waits on the socket (#902) and the verse map is still
+    // reconciled by a merging refetch issued after the subscription.
+    //
+    // `=== true` so a caller that hands `refetch` straight to an event
+    // handler (receiving a truthy event object) still gets the replace.
+    return sequencer.current!.refetch(
+      (signal, onAttempt) => fetchWithRetry((s) => api.getChapter(book, chapter, s), { signal, onAttempt }),
+      opts?.keepNewerLocal === true,
+    );
   }, [book, chapter]);
 
   useEffect(() => {
-    mounted.current = true;
     // Clear the previous (book, chapter)'s payload before the new fetch
     // lands. `refetch` sets status to "loading" but never used to clear
     // `data`, so from the moment (book, chapter) changed until the new
@@ -206,10 +173,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     // in place without this blank. See #531.
     setData(null);
     void refetch();
-    return () => {
-      mounted.current = false;
-      fetchCtrl.current?.abort();
-    };
+    // Abort the in-flight GET and drop any deferred merge or queued steps,
+    // so nothing from this (book, chapter) lands after navigation/unmount.
+    return () => sequencer.current?.reset();
   }, [refetch]);
 
   const applyLocalRowPatch = useCallback<UseChapterReturn["applyLocalRowPatch"]>(
@@ -293,7 +259,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // (StrictMode) and run later than the call, and the refetch reads the queue
   // synchronously when its response lands.
   const dispatchStep = useCallback((step: StructureStep) => {
-    replayQueue.current?.push(step);
+    sequencer.current?.record(step);
     setData((prev) => (prev ? applyStep(prev, step) : prev));
   }, []);
 
