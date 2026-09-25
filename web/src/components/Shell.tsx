@@ -60,7 +60,7 @@ import {
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
 import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, versesFromKey } from "../lib/verseRange";
-import { runSaveChain, runSaveDoneAndNext, type SaveStep } from "../lib/saveChain";
+import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import {
@@ -2610,12 +2610,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // the titlebar checkbox sets), then the next-verse move. Mark + advance run
   // only once every dirty side has committed; a cancelled unalign confirm
   // stalls the chain, so the verse stays unmarked and the aligner stays put.
+  // `verse` is the verse the click started on (captured in the button's
+  // render); the guard ignores a second click while this chain still runs,
+  // and cancelling the unalign confirm releases it (cancelAlignmentLoss).
+  const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
   const dualSaveDoneAndNext = useCallback(
     (verse: number, next: number) => {
       if (meUserId == null || bookLocked) return;
-      runSaveDoneAndNext({
+      saveDoneGuardRef.current.run({
         steps: dualSaveSteps(),
-        alreadyDone: !!laneIndex.get(laneKey(verse, "text"))?.includes(meUserId),
         markDone: () => {
           applyLocalLaneCheck(verse, "text", meUserId, true);
           void outbox.enqueueLaneCheck(book, chapter, verse, "text", true);
@@ -2626,8 +2629,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         },
       });
     },
-    [dualSaveSteps, meUserId, bookLocked, laneIndex, applyLocalLaneCheck, book, chapter],
+    [dualSaveSteps, meUserId, bookLocked, applyLocalLaneCheck, book, chapter],
   );
+  // Dismissing the unalign confirm without saving: any save chain waiting on it
+  // (the gate's Save, the save-done-next button) is stalled for good, so free
+  // the button's in-flight guard too.
+  const cancelAlignmentLoss = useCallback(() => {
+    setPendingAlignmentLoss(null);
+    saveDoneGuardRef.current.cancel();
+  }, []);
 
   const handleSetPanelMode = useCallback(
     (mode: PanelMode) => {
@@ -4285,7 +4295,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }
         />
       )}
-      <Dialog open={!!pendingAlignmentLoss} onClose={() => setPendingAlignmentLoss(null)}>
+      <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>
         <DialogTitle>
           {pendingAlignmentLoss && pendingAlignmentLoss.lostWords.length === 1
             ? "A word will be unaligned"
@@ -4308,7 +4318,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setPendingAlignmentLoss(null)}>Cancel</Button>
+          <Button onClick={cancelAlignmentLoss}>Cancel</Button>
           <Button
             color="error"
             variant="contained"

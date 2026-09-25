@@ -39,18 +39,55 @@ export function runSaveChain(steps: SaveStep[], finish: () => void): void {
 // same dirty-side save chain as the unsaved-changes gate's Save, and only once
 // every side has committed mark the verse done and advance. A cancelled
 // confirm stalls the chain, so nothing is marked and the aligner stays on this
-// verse. `alreadyDone` skips the mark only when nothing was saved: a verse
-// save reopens the Text lane server-side (api/src/verses.ts reopenLaneChecks),
-// so after any save the mark must be written again.
+// verse. The mark is always written, even for a verse already shown done:
+// setting a check is idempotent, local state can be stale while a verse PATCH
+// is still queued (the server's reopen will clear the check), and the outbox
+// holds the check behind any earlier verse save for the same verse
+// (outboxTargeting.ts laneCheckHeld), so it always lands last.
 export function runSaveDoneAndNext(opts: {
   steps: SaveStep[];
-  alreadyDone: boolean;
   markDone: () => void;
   advance: () => void;
 }): void {
-  const saved = opts.steps.some((s) => s.dirty);
   runSaveChain(opts.steps, () => {
-    if (saved || !opts.alreadyDone) opts.markDone();
+    opts.markDone();
     opts.advance();
   });
+}
+
+// In-flight guard for the button: a second click while a chain is still
+// running (waiting on a draft read or a confirm) is ignored, so it cannot
+// start a second save-and-mark (which, once the first had advanced, would mark
+// the NEXT verse). `cancel` releases the guard when the chain is known to have
+// stalled for good — the user cancelled the unalign confirm — so the button
+// works again. The caller passes the verse to mark in its own closures, so the
+// mark always targets the verse the click started on.
+export function createSaveDoneAndNextGuard() {
+  let running = false;
+  return {
+    get running() {
+      return running;
+    },
+    run(opts: { steps: SaveStep[]; markDone: () => void; advance: () => void }): boolean {
+      if (running) return false;
+      running = true;
+      try {
+        runSaveDoneAndNext({
+          steps: opts.steps,
+          markDone: () => {
+            running = false;
+            opts.markDone();
+          },
+          advance: opts.advance,
+        });
+      } catch (e) {
+        running = false;
+        throw e;
+      }
+      return true;
+    },
+    cancel() {
+      running = false;
+    },
+  };
 }

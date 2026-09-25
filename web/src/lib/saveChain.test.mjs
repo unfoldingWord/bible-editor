@@ -6,7 +6,7 @@
 //   node --experimental-strip-types --no-warnings src/lib/saveChain.test.mjs
 
 import assert from "node:assert/strict";
-import { runSaveChain, runSaveDoneAndNext } from "./saveChain.ts";
+import { createSaveDoneAndNextGuard, runSaveChain, runSaveDoneAndNext } from "./saveChain.ts";
 
 let failed = 0;
 function check(cond, msg) {
@@ -132,7 +132,6 @@ function check(cond, msg) {
       { dirty: true, save: (afterCommit) => { order.push("ult"); pendingConfirm = afterCommit; } },
       { dirty: true, save: (afterCommit) => { order.push("ust"); afterCommit(); } },
     ],
-    alreadyDone: false,
     markDone: () => order.push("done"),
     advance: () => order.push("next"),
   });
@@ -140,38 +139,57 @@ function check(cond, msg) {
   pendingConfirm();
   assert.deepEqual(order, ["ult", "ust", "done", "next"], "both saves land, then mark done, then advance");
 }
-// Already done: leave it done (no re-write), still advance. Nothing dirty
-// still marks + advances.
+// The mark is always written, clean verse or not — no "already done" skip
+// (local state can be stale while a verse PATCH is queued; the outbox orders
+// the check after it).
 {
   const order = [];
   runSaveDoneAndNext({
     steps: [{ dirty: false, save: () => check(false, "clean step must not save") }],
-    alreadyDone: true,
     markDone: () => order.push("done"),
     advance: () => order.push("next"),
   });
-  assert.deepEqual(order, ["next"], "an already-done verse is not re-marked");
+  assert.deepEqual(order, ["done", "next"], "a clean verse is still marked done, then advanced");
   const order2 = [];
   runSaveDoneAndNext({
-    steps: [],
-    alreadyDone: false,
+    steps: [{ dirty: true, save: (afterCommit) => { order2.push("ult"); afterCommit(); } }],
     markDone: () => order2.push("done"),
     advance: () => order2.push("next"),
   });
-  assert.deepEqual(order2, ["done", "next"], "a clean verse is marked done and advanced");
+  assert.deepEqual(order2, ["ult", "done", "next"], "a saved verse is marked after its save");
 }
-// Already done but something was saved: the server's verse PATCH reopens the
-// Text lane (api/src/verses.ts reopenLaneChecks), so it must be re-marked or
-// the verse ends up un-done (measured on local ZEC 1:3).
+// In-flight guard: a second click while the chain is running is ignored, and
+// the mark targets the verse the FIRST click started on.
 {
-  const order = [];
-  runSaveDoneAndNext({
-    steps: [{ dirty: true, save: (afterCommit) => { order.push("ult"); afterCommit(); } }],
-    alreadyDone: true,
-    markDone: () => order.push("done"),
-    advance: () => order.push("next"),
-  });
-  assert.deepEqual(order, ["ult", "done", "next"], "a save reopens the lane, so an already-done verse is re-marked");
+  const guard = createSaveDoneAndNextGuard();
+  const marked = [];
+  let active = 7;
+  let pendingCommit = null;
+  const click = () => {
+    const verse = active; // captured at click time, as Shell does
+    return guard.run({
+      steps: [{ dirty: true, save: (afterCommit) => { pendingCommit = afterCommit; } }],
+      markDone: () => marked.push(verse),
+      advance: () => { active = verse + 1; },
+    });
+  };
+  assert.equal(click(), true, "first click starts the chain");
+  assert.equal(guard.running, true, "guard is held while the save is pending");
+  assert.equal(click(), false, "a second click during the chain is ignored");
+  pendingCommit();
+  assert.deepEqual(marked, [7], "only the starting verse is marked");
+  assert.equal(active, 8, "advanced once");
+  assert.equal(guard.running, false, "guard released when the chain finishes");
+  // Cancelled confirm: the chain stalls for good; cancel() frees the button.
+  pendingCommit = null;
+  assert.equal(click(), true, "a new click on verse 8 starts a chain");
+  guard.cancel();
+  assert.equal(guard.running, false, "cancel() releases a stalled chain");
+  assert.deepEqual(marked, [7], "the cancelled chain marked nothing");
+  // A throwing step does not wedge the guard.
+  const g2 = createSaveDoneAndNextGuard();
+  assert.throws(() => g2.run({ steps: [{ dirty: true, save: () => { throw new Error("boom"); } }], markDone() {}, advance() {} }));
+  assert.equal(g2.running, false, "a throwing save releases the guard");
 }
 
 if (failed) {

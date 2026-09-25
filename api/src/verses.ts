@@ -587,7 +587,11 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     // response could delete that check. Still best-effort — reopenLaneChecks
     // swallows its own errors, so a failed reopen cannot fail the save.
     const lanes = lanesToReopenOnVerseEdit(bibleVersion, delta.wordSequenceUnchanged);
-    await reopenLaneChecks(c.env, updated.book, updated.chapter, updated.verse, lanes);
+    // Only the DELETE is awaited; the lane broadcasts go to waitUntil so a
+    // slow Durable Object cannot hold the save response open.
+    await reopenLaneChecks(c.env, updated.book, updated.chapter, updated.verse, lanes, true, (p) =>
+      c.executionCtx.waitUntil(p),
+    );
     // Issue #626: this save just resolved the merge-conflict row for this
     // verse (RESOLVE_VERSE_MERGE_CONFLICT_SQL's own `changes() > 0` guard
     // above only fires when it did) — clear the book+resource sync-warning
@@ -811,7 +815,7 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/bridge", requireEditor, async 
   // Awaited before responding, same as the verse PATCH (#931): a Text check
   // sent right after this response must not be deleted by a reopen still in
   // flight. reopenLaneChecks swallows its own errors, so this cannot fail.
-  await reopenLaneChecks(c.env, book, chapter, verse, ["text"]);
+  await reopenLaneChecks(c.env, book, chapter, verse, ["text"], true, (p) => c.executionCtx.waitUntil(p));
   // `removed_version` mirrors the WS event so the originating tab tombstones
   // the absorbed verse exactly like every other tab.
   return c.json({ verse: bridgeDto, removed_verse: next.verse, removed_version: next.version, absorbed_verses: absorbed });
@@ -920,7 +924,7 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
     })(),
   );
   // Awaited before responding — see the bridge route (#931).
-  await reopenLaneChecks(c.env, book, chapter, verse, ["text"]);
+  await reopenLaneChecks(c.env, book, chapter, verse, ["text"], true, (p) => c.executionCtx.waitUntil(p));
   return c.json({ verse: startDto, new_verses: newDtos });
 });
 

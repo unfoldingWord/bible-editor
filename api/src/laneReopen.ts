@@ -7,9 +7,10 @@ import { collapseWhitespaceForCompare } from "./verseMerge.ts";
 // "Edits reopen the checkoff": when a verse's underlying content advances, the
 // affected lane's sign-off (verse_lane_checks) should reopen so checkers re-see
 // it. This is a best-effort helper — call it AFTER the write has already
-// succeeded. verses.ts awaits it before responding (#931: a Text check sent
-// right after the save must not be wiped by a late reopen); rows.ts fires it
-// via waitUntil. Either way it must NEVER throw
+// succeeded. verses.ts awaits its DELETE before responding (#931: a Text
+// check sent right after the save must not be wiped by a late reopen) and
+// hands the broadcasts to waitUntil; rows.ts fires the whole call via
+// waitUntil. Either way it must NEVER throw
 // into the save response, so it swallows its own errors as a second layer of
 // defense behind the caller's try/catch. Only call it when the write actually
 // changed something.
@@ -122,6 +123,13 @@ export async function reopenLaneChecks(
   // master-adoption reopen) uses reopenLaneChecksBulk below instead, which
   // batches the DELETEs and applies LANE_REOPEN_BROADCAST_CAP itself.
   broadcast: boolean = true,
+  // When given, the broadcasts are handed to it (ctx.waitUntil) instead of
+  // awaited, so the returned promise settles as soon as the DELETE has. A
+  // caller that awaits this before responding (verses.ts, #931) passes it:
+  // only the DELETE must beat the response — a Durable-Object fetch has no
+  // timeout and must not hold the save open. Omitted, the broadcasts are
+  // awaited as before (rows.ts already runs the whole call inside waitUntil).
+  waitUntil?: (p: Promise<unknown>) => void,
 ): Promise<void> {
   if (lanes.length === 0) return;
   try {
@@ -151,12 +159,18 @@ export async function reopenLaneChecks(
     ]);
     // Nothing was checked here → nothing reopened → no need to notify anyone.
     if (!res.meta.changes || !broadcast) return;
-    for (const lane of lanes) {
-      await broadcastChapter(env, book, chapter, {
-        type: "lane_check.updated",
-        check: { book, chapter, verse, lane, checkers: [] },
-      });
-    }
+    const broadcasts = (async () => {
+      for (const lane of lanes) {
+        await broadcastChapter(env, book, chapter, {
+          type: "lane_check.updated",
+          check: { book, chapter, verse, lane, checkers: [] },
+        });
+      }
+    })().catch(() => {
+      /* best-effort, same as below */
+    });
+    if (waitUntil) waitUntil(broadcasts);
+    else await broadcasts;
   } catch {
     // Best-effort: a failure here must never surface to the caller. The
     // checkoff simply stays as-is; a later edit reopens it.

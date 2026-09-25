@@ -509,7 +509,13 @@ export function SideBySideAligner({
             <Tooltip title="Save both, mark verse done, next verse">
               <span>
                 <IconButton
-                  onClick={onSaveDoneAndNext}
+                  // The 2nd click of a double-click (detail > 1) is dropped:
+                  // by then the first has usually advanced, so it would save
+                  // and mark the NEXT verse. Keyboard activation has detail 0.
+                  onClick={(e) => {
+                    if (e.detail > 1) return;
+                    onSaveDoneAndNext?.();
+                  }}
                   disabled={!onSaveDoneAndNext}
                   size="small"
                   aria-label="Save both, mark verse done, next verse"

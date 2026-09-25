@@ -318,16 +318,16 @@ console.log("\n[#686 item 3, source check] chapters.ts's three edit_log INSERTs 
   eq(chaptersTs.includes(".bind(book, chapter, verse, done, now, userId)"), true, "[source] the insert binds userId as updated_by");
 }
 
-console.log("\n[#931] a verse save's lane reopen finishes BEFORE the save responds");
+console.log("\n[#931] a verse save's lane reopen DELETE finishes BEFORE the save responds; broadcasts do not");
 {
   // The dual aligner's "save, mark done, next verse" button sends the Text
   // lane check right behind the verse PATCH. When the reopen ran in
   // waitUntil (after the response), its DELETE could land after that check
-  // and wipe it. So the reopen must be awaited before responding — which is
-  // only safe because reopenLaneChecks swallows its own errors (runtime
-  // check below). verses.ts imports Hono, so the route itself cannot run
-  // here (STATE.md); the ordering is asserted on the source text, same
-  // limitation as the chapters.ts check above.
+  // and wipe it. So verses.ts awaits the DELETE before responding — safe only
+  // because reopenLaneChecks swallows its own errors — and hands the
+  // Durable-Object broadcasts (no timeout) to waitUntil so they cannot hold
+  // the save open. verses.ts imports Hono, so the route itself cannot run
+  // here (STATE.md); its call shape is asserted on comment-stripped source.
   const throwingEnv = {
     DB: {
       prepare: () => ({ bind: () => ({}) }),
@@ -338,33 +338,106 @@ console.log("\n[#931] a verse save's lane reopen finishes BEFORE the save respon
   };
   let threw = false;
   try {
-    await reopenLaneChecks(throwingEnv, "ZEC", 1, 7, ["text"]);
+    await reopenLaneChecks(throwingEnv, "ZEC", 1, 7, ["text"], true, () => {});
   } catch {
     threw = true;
   }
   eq(threw, false, "a failing reopen resolves instead of throwing, so awaiting it cannot fail a save");
 
+  // A broadcast that never settles (a wedged Durable Object) must not hold the
+  // awaited part open when waitUntil is given.
+  const deleted = [];
+  const handed = [];
+  const hangingEnv = {
+    DB: {
+      prepare: (sql) => ({ bind: (...args) => ({ sql, args }) }),
+      batch: async (stmts) => {
+        deleted.push(stmts[0].args);
+        return [{ meta: { changes: 1 } }, { meta: { changes: 1 } }];
+      },
+    },
+    CHAPTER_ROOM: {
+      idFromName: (n) => n,
+      get: () => ({ fetch: () => new Promise(() => {}) }),
+    },
+  };
+  const outcome = await Promise.race([
+    reopenLaneChecks(hangingEnv, "ZEC", 1, 7, ["text", "tw"], true, (p) => handed.push(p)).then(() => "resolved"),
+    new Promise((r) => setTimeout(() => r("timed out"), 500)),
+  ]);
+  eq(outcome, "resolved", "with waitUntil, the call resolves after the DELETE even while the broadcast hangs forever");
+  eq(deleted.length, 1, "the DELETE batch ran before the call resolved");
+  eq(handed.length, 1, "the pending broadcasts were handed to waitUntil");
+
+  // Strip // and /* */ comments (string-aware) so a commented-out or
+  // prose mention of reopenLaneChecks cannot satisfy or trip the scan.
+  function stripComments(src) {
+    let out = "";
+    let i = 0;
+    let quote = null;
+    while (i < src.length) {
+      const ch = src[i];
+      const nx = src[i + 1];
+      if (quote) {
+        out += ch;
+        if (ch === "\\") {
+          out += nx ?? "";
+          i += 2;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        i++;
+        continue;
+      }
+      if (ch === "/" && nx === "/") {
+        while (i < src.length && src[i] !== "\n") i++;
+        continue;
+      }
+      if (ch === "/" && nx === "*") {
+        const end = src.indexOf("*/", i + 2);
+        i = end === -1 ? src.length : end + 2;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+      out += ch;
+      i++;
+    }
+    return out;
+  }
+  // The balanced-paren argument list starting at `open` (index of "(").
+  function argsAt(src, open) {
+    let depth = 0;
+    for (let i = open; i < src.length; i++) {
+      if (src[i] === "(") depth++;
+      else if (src[i] === ")" && --depth === 0) return src.slice(open, i + 1);
+    }
+    return src.slice(open);
+  }
+  eq(stripComments("a // reopenLaneChecks(x)\nb /* reopenLaneChecks( */ c \"//keep\""), "a \nb  c \"//keep\"", "stripComments drops comments but keeps strings");
+
   const { readFileSync } = await import("node:fs");
   const { join, dirname } = await import("node:path");
   const { fileURLToPath } = await import("node:url");
-  const versesTs = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "verses.ts"), "utf8");
-  const calls = versesTs.split("reopenLaneChecks(").length - 1;
-  const awaited = versesTs.split("await reopenLaneChecks(").length - 1;
-  eq(calls >= 3, true, "[source] verses.ts reopens lanes on PATCH, bridge and split");
-  eq(awaited, calls, "[source] every reopenLaneChecks call in verses.ts is awaited");
+  const versesTs = stripComments(
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), "verses.ts"), "utf8"),
+  );
+  const callSites = [...versesTs.matchAll(/reopenLaneChecks\(/g)].map((m) => m.index);
+  eq(callSites.length >= 3, true, "[source] verses.ts reopens lanes on PATCH, bridge and split");
+  eq(
+    callSites.every((idx) => /await\s+$/.test(versesTs.slice(Math.max(0, idx - 20), idx))),
+    true,
+    "[source] every reopenLaneChecks call in verses.ts is awaited",
+  );
+  eq(
+    callSites.every((idx) => argsAt(versesTs, idx + "reopenLaneChecks".length).includes("executionCtx.waitUntil")),
+    true,
+    "[source] every reopenLaneChecks call in verses.ts hands its broadcasts to executionCtx.waitUntil",
+  );
   // No reopen inside a waitUntil: a waitUntil argument runs after the
   // response, whether passed directly or wrapped in an async IIFE.
-  const waitUntilBodies = [];
-  for (const m of versesTs.matchAll(/waitUntil\(/g)) {
-    let depth = 0;
-    let i = m.index + "waitUntil".length;
-    const start = i;
-    for (; i < versesTs.length; i++) {
-      if (versesTs[i] === "(") depth++;
-      else if (versesTs[i] === ")" && --depth === 0) break;
-    }
-    waitUntilBodies.push(versesTs.slice(start, i + 1));
-  }
+  const waitUntilBodies = [...versesTs.matchAll(/waitUntil\(/g)].map((m) =>
+    argsAt(versesTs, m.index + "waitUntil".length),
+  );
   eq(
     waitUntilBodies.some((b) => b.includes("reopenLaneChecks")),
     false,
