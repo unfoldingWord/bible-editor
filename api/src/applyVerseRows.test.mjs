@@ -926,6 +926,184 @@ console.log("\n[a CONFLICTED no-op adopt writes nothing but KEEPS its review row
   );
 }
 
+// Issue #977: master differs from D1 ONLY in Hebrew combining-mark order.
+// D1 holds x-lemma in the UHB order canonize stores (dagesh U+05BC before the
+// vowel); Door43 master holds NFC (vowel first). Canonize turns master back
+// into D1's exact bytes, so this is the same byte no-op as S1 above — but it
+// is not S1's folded-back source fix: master carries no change at all beyond
+// mark order. 2026-09-25 prod (MIC UST 5:11 and 20 more): keeping the S1 row
+// promoted a stored adopt_no_visible_change to adopt_conflict, the upsert kept
+// its old overwritten_version, and editors got "Door43 overwrote your edits"
+// for text nobody changed. A mark-order-only no-op writes no row at all.
+console.log("\n[a mark-order-only no-op adopt drops its review row (issue #977)]");
+{
+  const { env, sqlite } = freshEnv();
+  const UHB_LEMMA = "בָּרָא"; // bet dagesh qamats resh qamats alef
+  const NFC_LEMMA = "בָּרָא"; // bet qamats dagesh …
+  eq(UHB_LEMMA === NFC_LEMMA, false, "fixture: the lemmas differ byte-for-byte");
+  eq(UHB_LEMMA.normalize("NFC"), NFC_LEMMA, "fixture: …and only in mark order");
+  const UHB_FORM = UHB_LEMMA;
+  const tree = (lemma) => ({
+    verseObjects: [
+      {
+        tag: "zaln",
+        type: "milestone",
+        strong: "H1254",
+        lemma,
+        content: UHB_FORM,
+        children: [{ tag: "w", type: "word", text: "created" }],
+      },
+    ],
+  });
+  const oursJson = JSON.stringify(tree(UHB_LEMMA));
+  const theirsJson = JSON.stringify(tree(NFC_LEMMA));
+  const baseJson = JSON.stringify(tree("ANCESTOR-LEMMA"));
+
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 909, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 8, 1, NULL, 'ULT', ?, 'created', 6, 9)`,
+    )
+    .run(BOOK, oursJson);
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version)
+       VALUES (?, 8, 1, NULL, 'UHB', ?, ?, 1)`,
+    )
+    .run(
+      BOOK,
+      JSON.stringify({
+        verseObjects: [
+          { tag: "w", type: "word", text: UHB_FORM, strong: "H1254", lemma: UHB_LEMMA, morph: "He,Vqp3ms" },
+        ],
+      }),
+      UHB_FORM,
+    );
+  const anc = sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 9, 3, 4, 'update', ?, 100)`,
+    )
+    .run(`${BOOK}/8/1/ULT`, BOOK, JSON.stringify({ plain_text: "created", content: baseJson }));
+  // An earlier night's real, landed, invisible adoption: audit-only, no alert.
+  sqlite
+    .prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, last_recorded_at)
+       VALUES (?, 'ult', 8, 1, 'adopt_no_visible_change', 'both_changed_no_visible', 3, 50, 50)`,
+    )
+    .run(BOOK);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    "ULT",
+    [{ chapter: 8, verse: 1, verseEnd: null, contentJson: theirsJson, plainText: "created" }],
+    null,
+    { confirmedAt: 200, editId: Number(anc.lastInsertRowid) },
+    false,
+  );
+
+  eq(counts.merge_noop_skipped, 1, "the adoption is a byte no-op after canonize");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 8 AND verse = 1 AND bible_version = 'ULT'")
+    .all(BOOK)[0];
+  eq(row.version, 6, "…the version does not move");
+  eq(row.content_json, oursJson, "…and D1 keeps its UHB-order bytes");
+  const mc = sqlite
+    .prepare("SELECT action, reason, overwritten_version, last_recorded_at FROM verse_merge_conflicts WHERE chapter = 8 AND verse = 1")
+    .all();
+  eq(mc.length, 1, "the earlier audit row is still the only row");
+  eq(mc[0].action, "adopt_no_visible_change", "…NOT promoted to adopt_conflict (that is what alerted the editor)");
+  eq(mc[0].last_recorded_at, 50, "…and not re-recorded at all tonight");
+}
+
+// N4 (issue #978): the S1 folded-back source fix — NOT NFC-equal, so the #977
+// mark-order drop does not apply — on a verse that already carries an earlier
+// night's audit-only row with a pointer. The review row must survive (an admin
+// needs to see the folded-back fix), and it must not inherit the old pointer:
+// nothing was overwritten tonight, and a non-null pointer on an adopt_conflict
+// is what sends "Door43 overwrote your edits" to an editor.
+console.log("\n[a folded-back no-op on a verse with a prior audit row keeps its row, pointer NULL (issue #978, N4)]");
+{
+  const { env, sqlite } = freshEnv();
+  const UHB_FORM = "בָּרָ֣א";
+  const UHB_LEMMA = "בָּרָא";
+  const tree = (lemma) => ({
+    verseObjects: [
+      {
+        tag: "zaln",
+        type: "milestone",
+        strong: "H1254",
+        lemma,
+        content: UHB_FORM,
+        children: [{ tag: "w", type: "word", text: "created" }],
+      },
+    ],
+  });
+  const oursJson = JSON.stringify(tree(UHB_LEMMA));
+  const theirsJson = JSON.stringify(tree("בּרא"));
+  eq(UHB_LEMMA.normalize("NFC") === "בּרא".normalize("NFC"), false, "fixture: master's lemma is NOT NFC-equal to D1's");
+  const baseJson = JSON.stringify(tree("ANCESTOR-LEMMA"));
+
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 909, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 8, 1, NULL, 'ULT', ?, 'created', 4, 9)`,
+    )
+    .run(BOOK, oursJson);
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version)
+       VALUES (?, 8, 1, NULL, 'UHB', ?, ?, 1)`,
+    )
+    .run(
+      BOOK,
+      JSON.stringify({
+        verseObjects: [
+          { tag: "w", type: "word", text: UHB_FORM, strong: "H1254", lemma: UHB_LEMMA, morph: "He,Vqp3ms" },
+        ],
+      }),
+      UHB_FORM,
+    );
+  const anc = sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 9, 3, 4, 'update', ?, 100)`,
+    )
+    .run(`${BOOK}/8/1/ULT`, BOOK, JSON.stringify({ plain_text: "created", content: baseJson }));
+  sqlite
+    .prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, last_recorded_at)
+       VALUES (?, 'ult', 8, 1, 'adopt_no_visible_change', 'both_changed_no_visible', 3, 50, 50)`,
+    )
+    .run(BOOK);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    "ULT",
+    [{ chapter: 8, verse: 1, verseEnd: null, contentJson: theirsJson, plainText: "created" }],
+    null,
+    { confirmedAt: 200, editId: Number(anc.lastInsertRowid) },
+    false,
+  );
+
+  eq(counts.merge_noop_skipped, 1, "the conflicted adoption is a byte no-op after canonize");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 8 AND verse = 1 AND bible_version = 'ULT'")
+    .all(BOOK)[0];
+  eq(row.version, 4, "…the version does not move");
+  const mc = sqlite
+    .prepare("SELECT action, overwritten_version, last_recorded_at FROM verse_merge_conflicts WHERE chapter = 8 AND verse = 1")
+    .all();
+  eq(mc.length, 1, "one row for the verse");
+  eq(mc[0].action, "adopt_conflict", "…promoted to adopt_conflict: the folded-back fix stays visible to admins");
+  eq(mc[0].last_recorded_at > 50, true, "…re-recorded tonight");
+  eq(mc[0].overwritten_version, null, "…with NO inherited pointer: nothing was overwritten, so no editor is alerted");
+}
+
 console.log("\n[#633: no-visible-change adoption is audit-only — not merge_conflicts, not the snackbar flag]");
 {
   // End-to-end: both sides moved (adopt_conflict), storage bytes differ so the

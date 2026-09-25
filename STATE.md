@@ -77,6 +77,13 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **Server-side, Hebrew mark order is data, so never blanket-NFC a D1-vs-master compare.** 2026-09-25: the sync
+  canonizes `x-lemma` to UHB mark order while Door43 master is NFC, so 21 locked-book verses nobody touched hit the
+  #539 no-op guard as `adopt_conflict`, kept the flag, and their editors got false "Door43 overwrote your edits"
+  alerts (issue #977). NFC in `verseMerge.ts`'s `stableKey` was tried and rejected in review: a Door43 fix that puts
+  source attrs INTO UHB bytes would then read as converged and be reverted on export. The fix lives in the no-op
+  guard instead: drop the row only when D1 already equals canonized master AND raw master is NFC-equal to D1.
+
 - **A locked book freezes the merge ancestor, so Door43 is authoritative for it — and a markers-only overwrite
   is logged, never alerted.** Measured 2026-09-24 (ZEC 1:17 ULT, Rich): the book was locked on 09-17, so the
   export skipped it nightly, `master_confirmed_at` never advanced, and every Door43 commit read as "both changed"

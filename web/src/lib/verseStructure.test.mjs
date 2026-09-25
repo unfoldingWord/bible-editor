@@ -391,6 +391,48 @@ for (const sc of scenarios) {
     assert(out.verses.ult[2].version === 6, "…while the newer local verse is still kept");
   }
 
+  // 7b. tn / tq / twl rows follow the verse clock (#902 review F1). With the
+  //     first-open merge deferred behind the mount GET, the chapter is
+  //     editable while the merging GET is in flight: a note PATCH's 200 (v4)
+  //     can land before that GET's older body (v3). Replacing the row list
+  //     wholesale reverted the note and the next edit sent If-Match 3 → 409.
+  //     Only a STRICTLY newer local row is kept: equal version takes the
+  //     fetched row, because trash/restore, preserve/hint, reorder-only
+  //     sort_order, review-flag clear and TWL order canonicalization change a
+  //     row without bumping its version.
+  {
+    const note = (id, version, text) => ({ id, version, text });
+    const local = payload([row(2, 5, "C")], {
+      tn: [note("a", 4, "saved"), note("b", 2, "b"), note("gone", 1, "x")],
+      tq: [note("q", 3, "pending edit")],
+      twl: [note("w", 1, "w")],
+    });
+    const fetched = payload([row(2, 5, "C")], {
+      tn: [note("b", 5, "b′"), note("a", 3, "old"), note("new", 1, "n")],
+      tq: [note("q", 3, "server")],
+      twl: [note("w", 2, "w′")],
+    });
+    const out = mergeRefetched(local, fetched);
+    assert(out.tn[1] === local.tn[0], "tn a@4 (own PATCH landed) survives a stale fetched a@3");
+    assert(out.tn[0].version === 5 && out.tn[2].id === "new", "strictly newer fetched rows and new server rows win");
+    assert(out.tn.map((r) => r.id).join(",") === "b,a,new", "fetched order/membership: a row the server dropped is gone");
+    assert(out.tq[0] === fetched.tq[0], "tq equal version takes the fetched row (as a plain replace did)");
+    assert(out.twl === fetched.twl, "twl with nothing kept is the fetched array itself");
+    assert(out.verseStatuses === fetched.verseStatuses, "statuses stay fetched (unversioned)");
+    const plain = mergeRefetched(payload([row(2, 5, "C")], { tn: [note("a", 1, "a")] }), payload([row(2, 6, "D")], { tn: [note("a", 2, "a′")] }));
+    assert(plain.tn[0].version === 2, "fetched newer row replaces local");
+    // Same-version server changes (no version bump) must reach the tab.
+    const r = (id, extra) => ({ id, version: 7, trashed_at: null, sort_order: 1, preserve: 0, ...extra });
+    const v25 = row(2, 5, "C"); // one shared verse object, so only rows differ
+    const sameLocal = payload([v25], { tn: [r("t"), r("s"), r("p")] });
+    const sameFetched = payload([v25], {
+      tn: [r("t", { trashed_at: "2026-09-25" }), r("s", { sort_order: 4 }), r("p", { preserve: 1 })],
+    });
+    const same = mergeRefetched(sameLocal, sameFetched);
+    assert(same.tn === sameFetched.tn, "equal version with differing trashed_at / sort_order / preserve takes the fetched rows");
+    assert(same === sameFetched, "…and the merge is then the fetched payload itself");
+  }
+
   // 8. Identity: when no local row is kept the fetched object is returned as
   //    is (fetched strictly newer on every overlapping verse, or no overlap);
   //    a null / different-chapter prev is a plain replace.
