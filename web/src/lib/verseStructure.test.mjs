@@ -662,5 +662,102 @@ for (const sc of scenarios) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// #974: tn / tq / twl row events, verse statuses, lane checks and TWL order
+// locks that reach the tab while a merging refetch is in flight are replayed
+// over the merged payload. `mergeRefetched` takes row membership and every
+// unversioned list from the fetch, so without replay a row created in the
+// window vanished, a row deleted in the window came back, and a done / lane
+// check / lock toggle was reverted on screen until the next refetch.
+{
+  const row = (verse, version, content) => ({ verse, version, content, verse_end: null, bible_version: "ult" });
+  const note = (id, version, extra = {}) => ({ id, version, book: "ZEC", chapter: 1, verse: 1, sort_order: 1, trashed_at: null, preserve: 0, hint: 0, ...extra });
+  const payload = (extra = {}) => ({
+    book: "ZEC",
+    chapter: 1,
+    verses: { ult: map(row(1, 3, "a")) },
+    tn: [],
+    tq: [],
+    twl: [],
+    verseStatuses: [],
+    verseLaneChecks: [],
+    twlOrderLocks: [],
+    ...extra,
+  });
+  // The GET snapshotted before either event: it has b (deleted in the window)
+  // and lacks n (created in the window). The tab already applied both live.
+  const prev = payload({ tn: [note("a", 1), note("n", 1)] });
+  const fetched = payload({ tn: [note("a", 1), note("b", 1)] });
+  const steps = [
+    { type: "rowInsert", kind: "tn", row: note("n", 1) },
+    { type: "rowDelete", kind: "tn", id: "b" },
+  ];
+  const mergedOnly = mergeRefetched(prev, fetched);
+  assert(!mergedOnly.tn.some((r) => r.id === "n") && mergedOnly.tn.some((r) => r.id === "b"), "witness: the merge alone drops n and resurrects b (the bug)");
+  const out = replaySteps(mergedOnly, steps);
+  assert(out.tn?.some((r) => r.id === "n"), "a row inserted while the merging GET was in flight survives it");
+  assert(out.tn && !out.tn.some((r) => r.id === "b"), "a row deleted while the merging GET was in flight stays gone");
+
+  // Insert position is honoured on replay, and an insert of a row the fetch
+  // already has is a guarded replace, not a duplicate.
+  {
+    const f = payload({ tn: [note("a", 1), note("c", 1)] });
+    const o = replaySteps(f, [{ type: "rowInsert", kind: "tn", row: note("n", 1), afterId: "a" }, { type: "rowInsert", kind: "tn", row: note("c", 1) }]);
+    assert(o.tn?.map((r) => r.id).join(",") === "a,n,c", "rowInsert replays after afterId and never duplicates a fetched row");
+  }
+  // #974 review A1: over a row the fetch already has, a replayed row step
+  // applies only when STRICTLY newer. A same-version event (preserve / hint /
+  // trashed_at / sort_order differ) cannot be proven newer than the snapshot:
+  // preserve=1 then preserve=0, the older upsert delivered late, must not
+  // overwrite the snapshot's preserve=0. A replacement never resurrects a row
+  // the fetch no longer has.
+  {
+    const f = payload({ tn: [note("a", 5), note("t", 2, { preserve: 0 }), note("u", 2)] });
+    const o = replaySteps(f, [
+      { type: "rowReplace", kind: "tn", row: note("a", 4) },
+      { type: "rowReplace", kind: "tn", row: note("t", 2, { preserve: 1 }) },
+      { type: "rowInsert", kind: "tn", row: note("t", 2, { sort_order: 9 }) },
+      { type: "rowReplace", kind: "tn", row: note("u", 3, { hint: 1 }) },
+      { type: "rowReplace", kind: "tn", row: note("gone", 9) },
+    ]);
+    assert(o.tn?.[0] === f.tn[0], "a stale replacement (a@4) never regresses the fetched a@5");
+    assert(o.tn?.[1] === f.tn[1], "A1: a same-version replay (preserve / sort_order) never overrides the fetched row");
+    assert(o.tn?.[2]?.version === 3 && o.tn?.[2]?.hint === 1, "a strictly newer replacement applies");
+    assert(o.tn?.length === 3, "a replacement for a row absent from the fetch is not inserted");
+  }
+  // #974 review A4: a row of another chapter (a createRow response landing
+  // after navigation) is never inserted by a step.
+  {
+    const f = payload({ tn: [note("a", 1)] });
+    const o = replaySteps(f, [{ type: "rowInsert", kind: "tn", row: note("late", 1, { book: "ZEC", chapter: 2 }) }]);
+    assert(o === f, "A4: a rowInsert for another chapter is a no-op");
+  }
+  // #974 review A2: verse statuses replay only when provably newer than the
+  // snapshot — a server updated_at strictly greater than the fetched entry's,
+  // or no fetched entry for a verse that still has a row. A delayed older
+  // event never reverts a newer snapshot. Lane checks and TWL locks carry no
+  // timestamp on removal, so newer cannot be proven: they are not steps.
+  {
+    const st = (verse, done, updated_at) => ({ book: "ZEC", chapter: 1, verse, done, updated_at });
+    const f = payload({
+      verses: { ult: map(row(1, 3, "a"), row(2, 3, "b"), row(3, 3, "c")) },
+      verseStatuses: [st(1, 0, 100), st(2, 0, 100)],
+    });
+    const o = replaySteps(f, [
+      { type: "verseStatus", verse: 1, done: true, updatedAt: 101 },
+      { type: "verseStatus", verse: 2, done: true, updatedAt: 99 },
+      { type: "verseStatus", verse: 3, done: true, updatedAt: 50 },
+      { type: "verseStatus", verse: 4, done: true, updatedAt: 200 },
+    ]);
+    const done = (v) => o.verseStatuses?.find((s) => s.verse === v)?.done;
+    assert(done(1) === 1, "A2: a status newer than the snapshot's is re-applied");
+    assert(done(2) === 0, "A2: a delayed older status never reverts the snapshot");
+    assert(done(3) === 1, "A2: a first-ever status for a live verse the snapshot lacks is re-applied");
+    assert(done(4) === undefined, "A2: a status for a verse with no row (absorbed by a bridge) is not re-added");
+    const eq = replaySteps(f, [{ type: "verseStatus", verse: 1, done: true, updatedAt: 100 }]);
+    assert(eq === f, "A2: an equal timestamp cannot be proven newer — the fetch wins");
+  }
+}
+
 console.log(`\nverseStructure: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

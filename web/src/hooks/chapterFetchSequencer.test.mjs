@@ -283,4 +283,61 @@ function harness() {
   assert.equal(settled, "settled", "the deferring caller settles even when the merge throws");
 }
 
+// ── (#974 review A3) a superseding merge drops inherited DATA steps ──────
+// A row / status step recorded before a newer merging GET started is already
+// in that GET's snapshot (the event arrived, so the write committed, before
+// the request was sent). Inheriting it could resurrect a row deleted while the
+// socket was down (its row.deleted broadcast lost). Structure steps are still
+// inherited, and data steps recorded after the new GET started still replay.
+{
+  const events = [];
+  const reqs = [];
+  const seq = createChapterFetchSequencer({
+    onStart: () => {},
+    onAttempt: () => {},
+    onLanded: (payload, merge, queued) => events.push({ landed: payload, merge, queued: [...queued] }),
+    onError: () => {},
+    keepOnSupersede: (step) => step.startsWith("structure"),
+  });
+  const load = () => new Promise((resolve) => reqs.push(resolve));
+  const mount = seq.refetch(load, false);
+  reqs[0]("snap0");
+  await mount;
+  const first = seq.refetch(load, true); // merging GET 1
+  seq.record("data:insert X");
+  seq.record("structure:split");
+  const second = seq.refetch(load, true); // reconnect: merging GET 2 supersedes
+  seq.record("data:after second started");
+  reqs[2]("snap2");
+  await second;
+  assert.deepEqual(events.at(-1), { landed: "snap2", merge: true, queued: ["structure:split", "data:after second started"] },
+    "a superseding merge keeps structure steps and later data steps, but drops data steps recorded before it started");
+  reqs[1]("snap1-late");
+  await first;
+  // Deferred first-open merge: data steps recorded during the mount GET were
+  // replayed over the mount payload; the merge GET issued after it already
+  // contains them, so they are dropped from its queue too.
+  const events2 = [];
+  const reqs2 = [];
+  const seq2 = createChapterFetchSequencer({
+    onStart: () => {},
+    onAttempt: () => {},
+    onLanded: (payload, merge, queued) => events2.push({ landed: payload, merge, queued: [...queued] }),
+    onError: () => {},
+    keepOnSupersede: (step) => step.startsWith("structure"),
+  });
+  const load2 = () => new Promise((resolve) => reqs2.push(resolve));
+  const mount2 = seq2.refetch(load2, false);
+  const open2 = seq2.refetch(load2, true);
+  seq2.record("data:during mount");
+  seq2.record("structure:during mount");
+  reqs2[0]("mount");
+  await mount2;
+  await tick();
+  assert.deepEqual(events2[0].queued, ["data:during mount", "structure:during mount"], "the mount payload replays every queued step");
+  reqs2[1]("merge");
+  await open2;
+  assert.deepEqual(events2[1].queued, ["structure:during mount"], "the deferred merge drops data steps its snapshot already contains");
+}
+
 console.log("chapterFetchSequencer: all cases passed");
