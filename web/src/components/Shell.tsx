@@ -490,9 +490,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     //
     // Merging, not replacing: a reconnect fires on the same `online` moment
     // that drains the outbox, so the GET races the tab's own PATCHes. A verse
-    // or tn/tq/twl row held at an equal-or-newer version stays (the PATCH
-    // landed, or is pending with optimistic content); a stale GET body must
-    // not regress it into a
+    // held at an equal-or-newer version, or a tn/tq/twl row held at a strictly
+    // newer one, stays (the PATCH landed, or is pending with optimistic
+    // content); a stale GET body must not regress it into a
     // 409 against the user's own save. The other refetch callers (TWL order
     // unlock, pipeline Refresh, Door43 import) keep the plain replace — they
     // refetch because the server changed versions out from under the tab.

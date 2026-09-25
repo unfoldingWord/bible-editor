@@ -36,7 +36,8 @@ type Status = "idle" | "loading" | "ready" | "error" | "retrying";
 export interface RefetchOptions {
   /**
    * Merge the fetched payload with the current one instead of replacing it:
-   * a verse or tn/tq/twl row the tab holds at an equal-or-newer version stays
+   * a verse the tab holds at an equal-or-newer version, or a tn/tq/twl row at a
+   * strictly newer one (rows change without a version bump), stays
    * (see lib/verseStructure.ts `mergeRefetched`). For the WS open refetch (Shell's
    * `onOpen`, every open incl. the first), whose reconnect case races the
    * outbox drain on the same `online` moment — a stale GET must not regress a
