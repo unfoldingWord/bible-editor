@@ -1415,6 +1415,27 @@ export interface AdminSyncStatusResponse {
   books: AdminBookSyncStatus[];
 }
 
+// GET /api/admin/merge-flags (issue #442) — only the exports whose Door43 PR
+// was rejected (closed unmerged, or validation failed) or has waited more than
+// a day. Merged and still-fresh exports are deliberately absent. `unchecked`
+// lists exports the server could not classify (budget, Door43 error), so the
+// panel can say so instead of implying they are fine.
+export interface AdminMergeFlag {
+  book: string;
+  resource: Resource;
+  prNumber: number;
+  exportedAt: number;
+  state: "waiting" | "rejected";
+  reason: "validation_failed" | "closed_unmerged" | null;
+  url: string;
+}
+
+export interface AdminMergeFlagsResponse {
+  flags: AdminMergeFlag[];
+  unchecked: Array<{ book: string; resource: Resource; prNumber: number; reason: string }>;
+  errors: Array<{ repo: string; message: string }>;
+}
+
 // GET /api/admin/sync-activity — durable, admin-only log of non-blocking
 // "record"-kind alerts (issue #535), e.g. "shipped to Door43 and overwrote
 // master's content as expected". These no longer appear in fetchAlerts()'s
@@ -2103,6 +2124,11 @@ export const api = {
       `/api/admin/sync-status${book ? `?book=${encodeURIComponent(book)}` : ""}`,
       { signal },
     ),
+
+  getAdminMergeFlags: (signal?: AbortSignal) =>
+    // Live Door43 reads; the server's worst case is ~40 s (exportMergeState.ts
+    // BUDGET), above the 30 s default. Matches the other heavy admin calls.
+    request<AdminMergeFlagsResponse>(`/api/admin/merge-flags`, { signal, timeoutMs: 120_000 }),
 
   getAdminSyncActivity: (signal?: AbortSignal) =>
     request<AdminSyncActivityResponse>(`/api/admin/sync-activity`, { signal }),

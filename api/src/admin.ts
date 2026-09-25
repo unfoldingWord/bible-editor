@@ -1,6 +1,7 @@
 // Admin panel backend — everything here is admin-gated (requireAdmin below).
 //   GET    /api/admin/sync-status        — D1-only view of pull/export state per book x resource.
 //   GET    /api/admin/prs                — live DCS read: open `-be-` export PRs across all 5 repos.
+//   GET    /api/admin/merge-flags        — exports Door43 rejected or left unmerged > 1 day (issue #442).
 //   GET    /api/admin/sync-activity      — durable log of "record"-kind system_alerts (issue #535):
 //                                           non-blocking, no-action-needed export/reimport records that
 //                                           used to show up as a personal alert on the admin's account.
@@ -29,6 +30,7 @@ import {
 import { BOOK_NUMBERS } from "./dcsSources";
 import { bookLockGuard } from "./bookLockGuard";
 import { lockedBooksIn } from "./bookLock";
+import { computeExportMergeFlags } from "./exportMergeState";
 
 export const admin = new Hono<{
   Bindings: Env;
@@ -245,6 +247,18 @@ admin.get("/prs", async (c) => {
   prs.sort((a, b) => (a.book === b.book ? a.resource.localeCompare(b.resource) : a.book.localeCompare(b.book)));
 
   return c.json({ prs, errors });
+});
+
+// ── GET /merge-flags ─────────────────────────────────────────────────────
+//
+// Issue #442, option C: only the problems — an export whose PR Door43 rejected
+// (closed unmerged, or validation failed) or that has waited more than a day.
+// Kept separate from /sync-status so that route stays D1-only and a slow or
+// failing Door43 never delays the grid. Subrequest budget and the merge
+// evidence are documented in exportMergeState.ts.
+admin.get("/merge-flags", async (c) => {
+  if (!c.env.DCS_SERVICE_TOKEN) return c.json({ error: "dcs_not_configured" }, 503);
+  return c.json(await computeExportMergeFlags(c.env, Math.floor(Date.now() / 1000)));
 });
 
 // ── GET /sync-activity ───────────────────────────────────────────────────
