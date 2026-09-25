@@ -662,5 +662,86 @@ for (const sc of scenarios) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// #974: tn / tq / twl row events, verse statuses, lane checks and TWL order
+// locks that reach the tab while a merging refetch is in flight are replayed
+// over the merged payload. `mergeRefetched` takes row membership and every
+// unversioned list from the fetch, so without replay a row created in the
+// window vanished, a row deleted in the window came back, and a done / lane
+// check / lock toggle was reverted on screen until the next refetch.
+{
+  const row = (verse, version, content) => ({ verse, version, content, verse_end: null, bible_version: "ult" });
+  const note = (id, version, extra = {}) => ({ id, version, verse: 1, sort_order: 1, trashed_at: null, preserve: 0, hint: 0, ...extra });
+  const payload = (extra = {}) => ({
+    book: "ZEC",
+    chapter: 1,
+    verses: { ult: map(row(1, 3, "a")) },
+    tn: [],
+    tq: [],
+    twl: [],
+    verseStatuses: [],
+    verseLaneChecks: [],
+    twlOrderLocks: [],
+    ...extra,
+  });
+  // The GET snapshotted before either event: it has b (deleted in the window)
+  // and lacks n (created in the window). The tab already applied both live.
+  const prev = payload({ tn: [note("a", 1), note("n", 1)] });
+  const fetched = payload({ tn: [note("a", 1), note("b", 1)] });
+  const steps = [
+    { type: "rowInsert", kind: "tn", row: note("n", 1) },
+    { type: "rowDelete", kind: "tn", id: "b" },
+  ];
+  const mergedOnly = mergeRefetched(prev, fetched);
+  assert(!mergedOnly.tn.some((r) => r.id === "n") && mergedOnly.tn.some((r) => r.id === "b"), "witness: the merge alone drops n and resurrects b (the bug)");
+  const out = replaySteps(mergedOnly, steps);
+  assert(out.tn?.some((r) => r.id === "n"), "a row inserted while the merging GET was in flight survives it");
+  assert(out.tn && !out.tn.some((r) => r.id === "b"), "a row deleted while the merging GET was in flight stays gone");
+
+  // Insert position is honoured on replay, and an insert of a row the fetch
+  // already has is a guarded replace, not a duplicate.
+  {
+    const f = payload({ tn: [note("a", 1), note("c", 1)] });
+    const o = replaySteps(f, [{ type: "rowInsert", kind: "tn", row: note("n", 1), afterId: "a" }, { type: "rowInsert", kind: "tn", row: note("c", 1) }]);
+    assert(o.tn?.map((r) => r.id).join(",") === "a,n,c", "rowInsert replays after afterId and never duplicates a fetched row");
+  }
+  // Replacement replays through shouldApplyUpsert: a stale event never
+  // regresses a newer fetched row, a same-version toggle does apply, and a
+  // replacement for a row the fetch no longer has does not resurrect it.
+  {
+    const f = payload({ tn: [note("a", 5), note("t", 2)] });
+    const o = replaySteps(f, [
+      { type: "rowReplace", kind: "tn", row: note("a", 4) },
+      { type: "rowReplace", kind: "tn", row: note("t", 2, { preserve: 1 }) },
+      { type: "rowReplace", kind: "tn", row: note("gone", 9) },
+    ]);
+    assert(o.tn?.[0] === f.tn[0], "a stale replacement (a@4) never regresses the fetched a@5");
+    assert(o.tn?.[1]?.preserve === 1, "a same-version preserve toggle from the window is re-applied");
+    assert(o.tn?.length === 2, "a replacement for a row absent from the fetch is not inserted");
+  }
+  // Unversioned lists replay in arrival order over the fetched ones.
+  {
+    const f = payload({
+      verseStatuses: [{ book: "ZEC", chapter: 1, verse: 1, done: 0, updated_at: 1 }],
+      verseLaneChecks: [{ book: "ZEC", chapter: 1, verse: 1, lane: "tn", checked_by: 7, checked_at: 1 }],
+    });
+    const lock = { verse: 2, locked_by: 7, locked_at: 5, dismissed_order: null };
+    const o = replaySteps(f, [
+      { type: "verseStatus", verse: 1, done: true, updatedAt: 9 },
+      { type: "verseStatus", verse: 2, done: true, updatedAt: 9 },
+      { type: "laneCheck", verse: 1, lane: "text", userId: 7, checked: true, checkedAt: 9 },
+      { type: "laneCheckers", verse: 1, lane: "tn", checkers: [8], checkedAt: 9 },
+      { type: "laneChecksForLane", lane: "tq", checks: [{ book: "ZEC", chapter: 1, verse: 3, lane: "tq", checked_by: 7, checked_at: 9 }] },
+      { type: "twlOrderLock", verse: 2, lock },
+    ]);
+    assert(o.verseStatuses?.find((s) => s.verse === 1)?.done === 1 && o.verseStatuses?.find((s) => s.verse === 2)?.done === 1, "verse done toggles from the window are re-applied");
+    const checks = (o.verseLaneChecks ?? []).map((c) => `${c.verse}/${c.lane}/${c.checked_by}`).sort().join(",");
+    assert(checks === "1/text/7,1/tn/8,3/tq/7", `lane checks from the window are re-applied (got ${checks})`);
+    assert(o.twlOrderLocks?.length === 1 && o.twlOrderLocks[0] === lock, "a TWL order lock set in the window is re-applied");
+    const cleared = replaySteps({ ...f, twlOrderLocks: [lock] }, [{ type: "twlOrderLock", verse: 2, lock: null }]);
+    assert(cleared.twlOrderLocks?.length === 0, "a TWL order lock cleared in the window stays cleared");
+  }
+}
+
 console.log(`\nverseStructure: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
