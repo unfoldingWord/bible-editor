@@ -7,6 +7,8 @@ import type { ReactElement, ReactNode } from "react";
 import { Box, CircularProgress, Tooltip, Typography } from "@mui/material";
 import { api } from "../sync/api";
 import type { ChapterPayload } from "../sync/api";
+import { onOutboxResult } from "../sync/outbox";
+import { savedChapter } from "../lib/savedChapter";
 import { pickLinkedNotes } from "../lib/noteLinks";
 import type { NoteLinkTarget } from "../lib/noteLinks";
 import { buildVerseIndex } from "../lib/verseRange";
@@ -34,6 +36,15 @@ export function OpenChapterProvider({ data, children }: { data: ChapterPayload |
 // instead of flashing the spinner for a microtask.
 const CACHE_TTL_MS = 60_000;
 const chapterCache = new Map<string, { at: number; promise: Promise<ChapterPayload>; value?: ChapterPayload }>();
+
+// This client's own confirmed saves make that chapter's cached copy stale at
+// once, even when the chapter isn't open (book-view find/replace writes into
+// any loaded chapter, #936). Dropping it on the 200, not at enqueue, means
+// the refetch sees the save. Other people's edits keep the TTL bound.
+onOutboxResult((op, result) => {
+  const hit = savedChapter(op, result);
+  if (hit) chapterCache.delete(cacheKey(hit.book, hit.chapter));
+});
 
 function cacheKey(book: string, chapter: number): string {
   return `${book.toUpperCase()}/${chapter}`;
