@@ -2328,6 +2328,71 @@ function ts(dateStr) {
   assert(editor?.resolved_at === null, "an incomplete run does not retire an omitted editor recipient");
 }
 
+// Issue #978: the #539 no-op guard keeps a CONFLICTED byte no-op as
+// adopt_conflict with overwritten_version NULL (nothing was replaced). When the
+// verse already holds an audit-only adopt / adopt_no_visible_change row with a
+// pointer, the upsert promotes the row to adopt_conflict; it must not carry the
+// old pointer along, or the editor fan-out (adopt_conflict + non-null pointer)
+// tells the author of that old version "Door43 overwrote your edits @v3" about
+// an overwrite that did not happen tonight. The admin banner still lists it.
+console.log("\n[a no-op adopt_conflict does not inherit an old audit row's pointer (issue #978)]");
+{
+  const d = verseDb();
+  d.exec(`ALTER TABLE system_alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    ALTER TABLE system_alerts ADD COLUMN condition_key TEXT;
+    ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
+    ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
+    CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+      user_id INTEGER, new_version INTEGER);`);
+  // v3 was authored by bethoakes — the version the old audit row points at.
+  d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
+  d.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, new_version) VALUES ('verse', 'MIC/5/11/UST', 'MIC', 7, 3)`,
+  ).run();
+  for (const stored of ["adopt_no_visible_change", "adopt"]) {
+    d.prepare(`DELETE FROM verse_merge_conflicts`).run();
+    d.prepare(`DELETE FROM system_alerts`).run();
+    upsertConflict(d, {
+      book: "MIC", resource: "ust", chapter: 5, verse: 11,
+      action: stored, reason: "both_changed_no_visible", overwrittenVersion: 3, now: 50,
+    });
+    // Tonight: the conflicted no-op, exactly as bookReimport's guard hands it over.
+    upsertConflict(d, {
+      book: "MIC", resource: "ust", chapter: 5, verse: 11,
+      action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, now: 100,
+    });
+    const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='MIC' AND chapter=5 AND verse=11`).get();
+    assert(row.action === "adopt_conflict", `${stored} -> no-op adopt_conflict: row is promoted (admin still sees it)`);
+    assert(row.overwritten_version === null,
+      `${stored} -> no-op adopt_conflict: the old pointer is NOT inherited (got ${row.overwritten_version})`);
+    const make = (sql, args = []) => ({
+      bind: (...next) => make(sql, next),
+      all: async () => ({ results: d.prepare(sql).all(...args) }),
+      run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+    });
+    await raiseVerseMergeConflictAlert({ DB: { prepare: (sql) => make(sql) } }, "MIC", "ust", { observedAt: 100 });
+    const alerts = d.prepare(`SELECT username FROM system_alerts WHERE source='verse_merge_conflict:MIC:ust'`).all();
+    assert(alerts.some((a) => a.username === "deferredreward"), `${stored}: the admin banner still lists the row`);
+    assert(!alerts.some((a) => a.username === "bethoakes"),
+      `${stored}: no editor-scoped alert claims an overwrite that did not happen`);
+  }
+
+  // Unchanged: a stored, still-UNRESOLVED real adopt_conflict keeps its
+  // recovery pointer when tonight's no-op re-detects it.
+  d.prepare(`DELETE FROM verse_merge_conflicts`).run();
+  upsertConflict(d, {
+    book: "MIC", resource: "ust", chapter: 5, verse: 11,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 3, now: 50,
+  });
+  upsertConflict(d, {
+    book: "MIC", resource: "ust", chapter: 5, verse: 11,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, now: 100,
+  });
+  const kept = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='MIC' AND chapter=5 AND verse=11`).get();
+  assert(kept.overwritten_version === 3, "a real prior adopt_conflict keeps the pointer its human still needs");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
