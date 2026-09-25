@@ -6277,6 +6277,10 @@ async function applyVerseRows(
     // reopen: the adoption write sets content_json, plain_text AND verse_end, so
     // all three have to be compared before it can be called a no-op (issue #539).
     beforeVerseEnd: number | null;
+    // Master's content as it arrived, before step 6 canonizes `v.contentJson`
+    // in place. The no-op guard needs it to tell a mark-order-only difference
+    // (issue #977) from a source fix that canonize folded back.
+    rawMasterContentJson: string;
   }> = [];
   // Issue #609 (review F6): the `chapter:verse` refs whose write this run
   // suppressed as a normalized no-op. The user-triggered path reports the COUNT in
@@ -6815,6 +6819,7 @@ async function applyVerseRows(
             beforeContentJson: ex.content_json,
             beforePlainText: ex.plain_text,
             beforeVerseEnd: ex.verse_end ?? null,
+            rawMasterContentJson: v.contentJson,
           });
           continue;
         }
@@ -7255,13 +7260,23 @@ async function applyVerseRows(
   //     bytes.
   if (masterAdoptions.length > 0) {
     const noopVerses = new Set<string>();
+    // Issue #977: no-op verses where master, as it arrived, differs from D1 only
+    // in Hebrew combining-mark order (master NFC, D1 the UHB order canonize
+    // stores). That is not the folded-back source fix described below: D1
+    // already holds exactly the bytes canonize makes of master, and master
+    // carries no other change, so there is nothing for a human to see.
+    const markOrderOnly = new Set<string>();
     for (const a of masterAdoptions) {
       if (
         a.v.contentJson === a.beforeContentJson &&
         (a.plainText ?? null) === (a.beforePlainText ?? null) &&
         (a.v.verseEnd ?? null) === (a.beforeVerseEnd ?? null)
       ) {
-        noopVerses.add(`${a.v.chapter}:${a.v.verse}`);
+        const key = `${a.v.chapter}:${a.v.verse}`;
+        noopVerses.add(key);
+        if (verseContentConverged(a.rawMasterContentJson.normalize("NFC"), a.beforeContentJson.normalize("NFC"))) {
+          markOrderOnly.add(key);
+        }
       }
     }
     if (noopVerses.size > 0) {
@@ -7297,7 +7312,7 @@ async function applyVerseRows(
       for (let i = mergeConflicts.length - 1; i >= 0; i--) {
         const mc = mergeConflicts[i];
         if (!mc.adopted || !noopVerses.has(`${mc.chapter}:${mc.verse}`)) continue;
-        if (mc.action === "adopt") {
+        if (mc.action === "adopt" || markOrderOnly.has(`${mc.chapter}:${mc.verse}`)) {
           mergeConflicts.splice(i, 1);
         } else {
           mc.adopted = false;
