@@ -198,10 +198,12 @@ export function replaySteps(state: ChapterData, steps: readonly StructureStep[])
  *   - A fetched row at or below a tombstone this tab holds is the deleted row
  *     seen through a stale read (same clock argument as `applyUpdated`) and is
  *     dropped rather than resurrected.
- *   - tn / tq / twl rows follow the same equal-or-newer rule by row id
+ *   - tn / tq / twl rows keep the local row only when it is STRICTLY newer
  *     (`mergeRowList`): with the first-open merge deferred behind the mount
  *     GET (#902) the chapter is editable while the merging GET is in flight,
- *     so a row PATCH's 200 can beat the GET's older body. Rows have no
+ *     so a row PATCH's 200 can beat the GET's older body. Equal version takes
+ *     the fetched row, unlike verses, because several server paths change a
+ *     row without bumping its version (see `mergeRowList`). Rows have no
  *     tombstone, so a row this tab deleted after the GET's snapshot comes
  *     back until the next refetch — a known limit.
  *   - Tombstones are cleared: the merged map is authoritative again, exactly
@@ -247,18 +249,24 @@ export function mergeRefetched(prev: ChapterData | null, fetched: ChapterPayload
   return { ...fetched, verses: verses ?? fetched.verses, tn, tq, twl };
 }
 
-// tn / tq / twl rows by the same clock as verses: a row present in both keeps
-// the local object when `local.version >= incoming.version` (the tab's own
-// PATCH already landed, or an optimistic edit is pending on that version).
-// Fetched order and membership win: a row the server no longer has is
-// dropped, and a local-only row is not kept. Returns `fetched` itself when
-// nothing local is kept.
+// tn / tq / twl rows: a row present in both keeps the local object only when
+// `local.version > incoming.version` — the tab's own PATCH landed (the outbox
+// 200 replaced the row with the server's newer copy) and the GET is stale.
+// Equal version takes the fetched row, as a plain replace always did: tn
+// trash/restore, preserve/hint toggles, the reorder-only sort_order path, the
+// review-flag clear (api/src/rows.ts) and nightly TWL order canonicalization
+// (api/src/twlSortOrderApply.ts) change a row without bumping its version, so
+// at equal version the fetched row may carry changes the tab lacks (the same
+// carve-out as components/rowUpsertGuard.ts, #671). This makes the merge
+// never worse than a plain replace. Fetched order and membership win: a row
+// the server no longer has is dropped, and a local-only row is not kept.
+// Returns `fetched` itself when nothing local is kept.
 function mergeRowList<R extends { id: string; version: number }>(local: readonly R[], fetched: R[]): R[] {
   const byId = new Map(local.map((r) => [r.id, r]));
   let out: R[] | undefined;
   fetched.forEach((incoming, i) => {
     const mine = byId.get(incoming.id);
-    if (mine && mine !== incoming && mine.version >= incoming.version) (out ??= fetched.slice())[i] = mine;
+    if (mine && mine !== incoming && mine.version > incoming.version) (out ??= fetched.slice())[i] = mine;
   });
   return out ?? fetched;
 }
