@@ -123,6 +123,43 @@ interface StagedRow {
   payload: Record<string, unknown>;
 }
 
+// Source words a TN quote at `refRaw` (chapter `chapter`, leading verse `verse`)
+// may match, unioned across every verse the ref covers — a bridged ref ("1:2-3")
+// makes every word of every verse it spans a candidate. Shared by tnPayload
+// (staging a proposal) and applyJobOutput's live-row dedup fold (#966) below, so
+// both sides of the dedup key canonize identically.
+function refQuoteWords(
+  refRaw: string,
+  chapter: number,
+  verse: number,
+  uhbWordsByVerse: Map<number, SourceWord[]>,
+): SourceWord[] {
+  return coveredVersesFromRef(refRaw, verse).flatMap(
+    (cv) => uhbWordsByVerse.get(chapter * 100000 + cv) ?? [],
+  );
+}
+
+// Rewrite a TN quote's Hebrew to the UHB's exact bytes (#959) — the AI emits NFC
+// mark order, the UHB stores legacy Tanakh order, and a byte-exact consumer
+// (bp-assistant's quote validator) drops a word whose bytes differ. Same
+// placement rule as canonizeAlignmentSource: canonize where non-UHB Hebrew first
+// enters D1. A range match is exact-tier only (see canonizeQuote). A
+// Gateway-Language quote, an OT verse with no loaded UHB, or an NT book (map left
+// empty by the caller) passes through unchanged. Exported for the live-row dedup
+// fold in applyJobOutput, which must canonize a stored quote the SAME way a fresh
+// proposal's quote was canonized at staging, or the two never key alike (#966).
+export function canonizeTnQuote(
+  refRaw: string,
+  chapter: number,
+  verse: number,
+  quote: string,
+  uhbWordsByVerse: Map<number, SourceWord[]>,
+): string {
+  return canonizeQuote(quote, refQuoteWords(refRaw, chapter, verse, uhbWordsByVerse), {
+    strict: /[-,]/.test(refRaw),
+  });
+}
+
 // tnPayload / tqPayload are exported for the direct regression tests in
 // pipelineImport.test.mjs, which assert on the quote-curling below (JER 32/33,
 // NUM 26:53 prod forensics — straight quotes in AI-generated note prose).
@@ -137,20 +174,8 @@ export function tnPayload(
   const [ch, v] = refParts(refRaw);
   const occRaw = row["Occurrence"];
   const parsedOcc = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
-  // Rewrite the quote's Hebrew to the UHB's exact bytes (#959) — the AI emits
-  // NFC mark order, the UHB stores legacy Tanakh order, and a byte-exact
-  // consumer (bp-assistant's quote validator) drops a word whose bytes differ. Same placement rule as canonizeAlignmentSource: canonize where
-  // non-UHB Hebrew first enters D1. Every word of a bridged ref's verses is a
-  // candidate, but a range match is exact-tier only (see canonizeQuote). A
-  // Gateway-Language quote, an OT verse with no loaded UHB, or an NT book
-  // (map left empty by the caller) passes through unchanged.
   const rawQuote = row["Quote"] || null;
-  const quoteWords = coveredVersesFromRef(refRaw, v).flatMap(
-    (cv) => uhbWordsByVerse.get(ch * 100000 + cv) ?? [],
-  );
-  const quote = rawQuote
-    ? canonizeQuote(rawQuote, quoteWords, { strict: /[-,]/.test(refRaw) })
-    : null;
+  const quote = rawQuote ? canonizeTnQuote(refRaw, ch, v, rawQuote, uhbWordsByVerse) : null;
   // Hold the AI to the same Occurrence invariant as the editor. Unlike
   // bookImport/bookReimport — which round-trip DCS master and must preserve its
   // blanks verbatim — this payload is freshly generated content, so a blank or
@@ -185,18 +210,6 @@ export function tnPayload(
       note: row["Note"] ? curlifyText(normalizeNoteWhitespace(row["Note"])) : null,
     },
   };
-}
-
-// Dedup-key fold for a TN quote in applyJobOutput (#959). tnPayload canonizes
-// a proposal's Hebrew to UHB bytes (legacy mark order, the UHB's U+2060 word
-// joiners), while a live row from an earlier run may hold NFC with the joiners
-// dropped. Same text, so both sides fold before keying, or a re-run inserts a
-// second copy. Kept out of tnContentKey itself: the nightly reimport's dedup
-// (planTnContentDedup) keys master rows byte-exactly, because translationCore
-// counts byte-distinct surfaces as separate occurrences (quoteExact, lint.ts).
-// Exported for pipelineImport.test.mjs only.
-export function tnDedupQuote(quote: string | null): string | null {
-  return quote == null ? null : quote.replace(/[\u2060\u200D\uFEFF]/g, "").normalize("NFC");
 }
 
 export function tqPayload(book: string, refRaw: string, row: Record<string, string>) {
@@ -904,6 +917,19 @@ async function applyJobOutput(
   const tqProposals = rows.filter((r) => r.kind === "tq");
   const verseProposals = rows.filter((r) => r.kind === "verse");
 
+  // UHB/UGNT source words for this job's chapter range, loaded ONCE (a single
+  // query — cap-safe) and reused below for both the TN live-row dedup fold
+  // (#966, needs canonizeTnQuote — OT only, same as tnPayload) and verse
+  // alignment canonize/heal (needs it whenever there are verse proposals, either
+  // testament). Loading it here instead of at each use site means a job with
+  // both TN and verse proposals for an OT book still issues one preload query,
+  // not two. Empty map — and both consumers no-op on it — when neither
+  // condition holds.
+  const uhbWordsByVerse =
+    (tnProposals.length > 0 && !NT_BOOKS.has(job.book)) || verseProposals.length > 0
+      ? await loadUhbSourceWords(env, job)
+      : new Map<number, SourceWord[]>();
+
   const result: ApplyResult = {
     tnDeleted: 0,
     tnCreated: 0,
@@ -960,7 +986,7 @@ async function applyJobOutput(
   const claimedTnKeys = new Set<string>();
   if (tnProposals.length > 0) {
     const live = await env.DB.prepare(
-      `SELECT chapter, verse, occurrence, support_reference, quote, note
+      `SELECT chapter, verse, ref_raw, occurrence, support_reference, quote, note
          FROM tn_rows
         WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND deleted_at IS NULL`,
     )
@@ -968,6 +994,7 @@ async function applyJobOutput(
       .all<{
         chapter: number;
         verse: number;
+        ref_raw: string | null;
         occurrence: number | null;
         support_reference: string | null;
         quote: string | null;
@@ -980,13 +1007,24 @@ async function applyJobOutput(
     // quotes, while a re-run's identical-content proposal is keyed from its
     // NOW-curled `payload.note` (see the contentKey build below) — the two
     // keys never match, so content-dedup silently fails to recognize the
-    // duplicate and a second copy gets inserted. `quote` is deliberately left
-    // untouched here, matching tnPayload — it must stay byte-exact for
-    // occurrence matching. Its Hebrew encoding is folded for the key only
-    // (tnDedupQuote), since tnPayload now canonizes proposals to UHB bytes.
+    // duplicate and a second copy gets inserted. `quote` runs through the SAME
+    // canonizeTnQuote a proposal gets from tnPayload (OT books only, matching
+    // tnPayload's own guard), not the old blunt NFC/joiner-strip fold (#966):
+    // that fold conflated byte-distinct twins translationCore counts as
+    // separate occurrences (e.g. a word written once with the UHB's U+2060
+    // word joiner and once without, both live in one verse). canonizeTnQuote
+    // only rewrites a quote when it resolves unambiguously to ONE UHB word, so
+    // an ambiguous twin is left exactly as stored on both sides and still keys
+    // apart; an unambiguous one canonizes to the same byte form a fresh
+    // proposal gets, so a genuine re-run still dedups.
+    const canonicalizeTn = !NT_BOOKS.has(job.book);
     for (const r of live.results ?? []) {
+      const quote =
+        canonicalizeTn && r.quote
+          ? canonizeTnQuote(r.ref_raw ?? String(r.verse), r.chapter, r.verse, r.quote, uhbWordsByVerse)
+          : r.quote;
       claimedTnKeys.add(
-        tnContentKey({ ...r, quote: tnDedupQuote(r.quote), note: r.note ? curlifyText(r.note) : r.note }),
+        tnContentKey({ ...r, quote, note: r.note ? curlifyText(r.note) : r.note }),
       );
     }
   }
@@ -1052,14 +1090,17 @@ async function applyJobOutput(
     // into tnBases), so we don't consume a counter slot for it.
     // Content key of this proposal — computed up front so a hint expansion can
     // claim it too (the expanded stub now carries this content live, so a later
-    // identical insert proposal in the same run must be suppressed).
+    // identical insert proposal in the same run must be suppressed). `quote` is
+    // used as staged: tnPayload already ran it through canonizeTnQuote, so it's
+    // already in the same byte form the live-row fold above produces (#966) —
+    // no second fold needed here.
     const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
     const contentKey = tnContentKey({
       chapter: p.chapter,
       verse: p.verse,
       occurrence: (payload.occurrence as number | null | undefined) ?? null,
       support_reference: (payload.support_reference as string | null | undefined) ?? null,
-      quote: tnDedupQuote((payload.quote as string | null | undefined) ?? null),
+      quote: (payload.quote as string | null | undefined) ?? null,
       note: (payload.note as string | null | undefined) ?? null,
     });
 
@@ -1134,14 +1175,9 @@ async function applyJobOutput(
     await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
-  // Preload the book's UHB/UGNT source words once (a single query — cap-safe)
-  // so each verse's alignment canonize + U+FFFD heal read from memory instead
-  // of issuing a per-verse D1 read (a whole-book generate would otherwise blow
-  // the ~1000-subrequest budget). Empty map when there are no verse proposals.
-  const uhbWordsByVerse =
-    verseProposals.length > 0
-      ? await loadUhbSourceWords(env, job)
-      : new Map<number, SourceWord[]>();
+  // uhbWordsByVerse (loaded once, above) covers verse alignment canonize +
+  // U+FFFD heal here too, reading from memory instead of a per-verse D1 read (a
+  // whole-book generate would otherwise blow the ~1000-subrequest budget).
 
   // #402: same group-boundary rule as the TQ loop above, keyed on verseKey
   // (chapter+verse), NOT bible_version. A `generate` run stages ULT and UST
