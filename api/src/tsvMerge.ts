@@ -440,11 +440,38 @@ export function computeTsvMerge(
   base: TsvMergeSide | null,
   ours: TsvMergeSide,
   theirs: TsvMergeSide,
-  opts: { masterMayHoldHumanEdit?: boolean; baseProvisional?: boolean } = {},
+  opts: { masterMayHoldHumanEdit?: boolean; baseProvisional?: boolean; bookLocked?: boolean } = {},
 ): TsvMergeResult {
   const fields = FIELDS_BY_KIND[kind];
   const masterWinsConflicts = opts.masterMayHoldHumanEdit !== false;
   const provisional = opts.baseProvisional === true;
+  // Issue #950. A locked book is read-only for app edits AND skips the export
+  // (bookLock.ts), the same fact verseMerge.ts's `masterAuthoritative` (its
+  // step 3b) already acts on for verse content: Door43 master is the only
+  // place the book can move while locked, so master is authoritative for any
+  // field it moved since the ancestor (Benjamin, 2026-09-24: "the lock is to
+  // prevent problems from the BE side"). Without this, master_confirmed_at
+  // never re-advances while locked — only an export re-confirms it — so every
+  // Door43 commit reads as BOTH sides having moved against the frozen
+  // pre-lock ancestor, and a genuinely AI-authored master excursion
+  // (masterMayHoldHumanEdit: false) would keep D1 and flag the row forever
+  // even though nobody on the app side could have made the conflicting edit.
+  // Unlike the verse merge, a locked adopt here carries no separate flag: the
+  // verse side still distinguishes a clean `adopt` from a flagged
+  // `adopt_conflict` because it protects against overwriting a real unsaved
+  // app edit (visible-change refinement); a locked book cannot hold one — see
+  // the field loop below.
+  //
+  // Scope decision (#950's "created/deleted/tombstoned row cases"): this
+  // option only affects the EDITED-row three-way merge below. A row master
+  // created or removed never reaches this function at all — bookReimport.ts
+  // classifies those by row EXISTENCE (present in master's file vs. D1) and
+  // always takes master's side unconditionally, locked or not, because
+  // there's no ancestor question to ask: an id absent from D1 is inserted
+  // from master's row verbatim, and an id D1 holds but master's file no
+  // longer does is tombstoned regardless. Both already match "Door43 is
+  // authoritative while locked" with no code change needed.
+  const bookLocked = opts.bookLocked === true;
 
   const writeFields: Partial<TsvMergeSide> = {};
   const conflictFields: TsvMergeField[] = [];
@@ -453,7 +480,7 @@ export function computeTsvMerge(
   let anyAttributable = false; // some differing field HAD a base to attribute against
 
   for (const f of fields) {
-    const fate = attributeField(f, base, ours, theirs);
+    let fate = attributeField(f, base, ours, theirs);
     if (fate === "converged") continue;
     anyDiff = true;
     if (fate === "no_base") {
@@ -462,11 +489,19 @@ export function computeTsvMerge(
     }
     // A provisional base may not convict (see the header): the two master-wins
     // fates degrade to "unattributable", which keeps D1 and reports the row as
-    // keep_no_base — main's behavior for this population, never worse.
+    // keep_no_base — main's behavior for this population, never worse. Checked
+    // BEFORE the lock override below so a locked book cannot bypass this
+    // fail-safe either — the boundary a provisional base cannot prove is the
+    // same one the lock claim would otherwise skip past.
     if (provisional && (fate === "adopt" || (fate === "conflict" && masterWinsConflicts))) {
       anyNoBase = true;
       continue;
     }
+    // A locked book never needs a human to adjudicate a both-moved field: the
+    // app side is read-only, so master is authoritative outright. Fold
+    // "conflict" into a plain "adopt" — no review flag, no AI-lineage
+    // question — rather than gating it behind masterWinsConflicts.
+    if (bookLocked && !provisional && fate === "conflict") fate = "adopt";
     anyAttributable = true;
     if (fate === "keep") continue; // master didn't move it — our edit stands
     if (fate === "conflict") {
