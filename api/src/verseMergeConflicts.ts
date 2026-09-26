@@ -898,6 +898,7 @@ export async function raiseVerseMergeConflictAlert(
       verse: r.verse,
       overwrittenVersion: r.overwrittenVersion,
       reason: r.reason,
+      detectedAt: r.detectedAt,
     }));
   // keep_no_base verses (issue #544): NOTHING was overwritten, but the same
   // human needs the same warning the admin gets — see groupNoBaseVersesByEditor's

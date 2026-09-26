@@ -225,6 +225,44 @@ function assert(cond, msg) {
   assert(editLogKey("ZEC", "ult", a) !== editLogKey("ZEC", "ust", b), "different resource -> different key");
 }
 
+{
+  // Issue #996: a re-raised alert whose ref list only SHRANK (some rows
+  // resolved, none touched tonight) must still read as old, not brand-new —
+  // the message names the oldest detectedAt among this user's refs.
+  const oldDate = Date.UTC(2026, 7, 19) / 1000; // 2026-08-19
+  const newDate = Date.UTC(2026, 8, 23) / 1000; // 2026-09-23
+  const overwritten = [
+    { chapter: 4, verse: 17, overwrittenVersion: 6, detectedAt: oldDate },
+  ];
+  const usernameByKey = new Map([[editLogKey("EZK", "ust", overwritten[0]), "bcameron93"]]);
+  const grouped = groupOverwrittenVersesByEditor("EZK", "ust", overwritten, usernameByKey);
+  const entry = grouped.get("bcameron93");
+  assert(entry.message.includes("(first flagged 2026-08-19)"), "single ref carries its own detectedAt as 'first flagged'");
+
+  // Two refs for the same editor: the message names the OLDER of the two,
+  // not the newer one and not the one listed first.
+  const twoRefs = [
+    { chapter: 4, verse: 17, overwrittenVersion: 6, detectedAt: newDate },
+    { chapter: 4, verse: 18, overwrittenVersion: 3, detectedAt: oldDate },
+  ];
+  const twoUsers = new Map([
+    [editLogKey("EZK", "ust", twoRefs[0]), "bcameron93"],
+    [editLogKey("EZK", "ust", twoRefs[1]), "bcameron93"],
+  ]);
+  const twoGrouped = groupOverwrittenVersesByEditor("EZK", "ust", twoRefs, twoUsers);
+  assert(
+    twoGrouped.get("bcameron93").message.includes("(first flagged 2026-08-19)"),
+    "two refs -> message names the OLDER detectedAt, not the newer one",
+  );
+
+  // No detectedAt supplied at all (a caller that hasn't been updated, or a
+  // row with no known date) -> no fabricated date, no dangling parenthetical.
+  const noDate = [{ chapter: 5, verse: 1, overwrittenVersion: 2 }];
+  const noDateUsers = new Map([[editLogKey("EZK", "ust", noDate[0]), "bcameron93"]]);
+  const noDateMsg = groupOverwrittenVersesByEditor("EZK", "ust", noDate, noDateUsers).get("bcameron93").message;
+  assert(!noDateMsg.includes("first flagged"), "missing detectedAt -> no 'first flagged' clause at all");
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Part 1b: groupNoBaseVersesByEditor (issue #544) — pure, no D1. The
 // keep_no_base analogue of groupOverwrittenVersesByEditor above: NOTHING was
