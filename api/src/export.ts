@@ -1294,6 +1294,40 @@ export function shouldComputeRevertEntries(
   return !masterIsOurLastPublish(masterBlobSha, pushedBlobSha);
 }
 
+// Did a foreign commit land on master in the window none of the checks above
+// can see (issue #871)? checkMasterFreshness resolves master's head file-
+// commit SHA (`pinnedMasterSha`) once, BEFORE the shrink/alignment guards take
+// their master snapshot and BEFORE commitToDcs's several DCS round trips run.
+// Every one of those — the guards' snapshot, `shouldComputeRevertEntries`'s
+// `masterBlobSha`, the eventual revert-report diff — is pinned to that same
+// moment. A maintainer hand-edit landing on master anywhere in that window is
+// invisible to all of them: the pinned snapshot already holds pre-edit
+// content, so a revert report built from it would diff against bytes that
+// predate the edit and either miss it entirely or blame unrelated rows.
+//
+// Re-resolving master's head SHA immediately after commitToDcs (exportOne's
+// job, not this function's) is the only way to notice the snapshot went
+// stale mid-run. This is the pure comparison that decides it: exportOne
+// should treat a report as unsafe to build only when the post-commit head is
+// a KNOWN, DIFFERENT sha from the one the gate pinned.
+//
+// Fails CLOSED like the freshness gate itself, but in the opposite direction
+// of "safe": an unresolvable post-commit head does not prove nothing landed,
+// but there is also nothing to compare it against, so this returns `false`
+// (not a foreign commit) rather than block a report on missing information —
+// the report then proceeds exactly as it did before this check existed. Only
+// an actual, different, non-null head SHA counts as a race.
+export function foreignCommitDuringExport(
+  pinnedMasterSha: string | null,
+  headAfterCommitSha: string | null,
+): boolean {
+  return (
+    pinnedMasterSha != null &&
+    headAfterCommitSha != null &&
+    headAfterCommitSha !== pinnedMasterSha
+  );
+}
+
 // Does the number of substantive reverts this export is about to make justify
 // escalating the alert's wording beyond routine? This NEVER blocks the export
 // — there is no `block` field, only `escalate` — because a revert report is
