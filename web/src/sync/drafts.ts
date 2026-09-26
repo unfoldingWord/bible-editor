@@ -17,7 +17,7 @@ import {
   type VerseOpExitInfo,
 } from "./draftSaveState";
 import { peekPinnedVerseBase, unpinVerseBase } from "./versePin";
-import { createDraftSnapshot } from "./draftSnapshot";
+import { createDraftSnapshot, dedupeByKeys } from "./draftSnapshot";
 export { pinVerseBase, peekPinnedVerseBase } from "./versePin";
 
 const DB_NAME = "bible-editor-drafts";
@@ -156,6 +156,12 @@ export function verseKey(
 export function rowKey(rowKind: RowKind, book: string, id: string): string {
   return `row:${rowKind}:${book}:${id}`;
 }
+
+// For subscribers that only need to know which drafts exist, not their live
+// content — see dedupeByKeys.
+export const subscribeDirtyDrafts = dedupeByKeys<DraftRecord>(
+  (fn) => snapshot.subscribe(fn),
+);
 
 export const drafts = {
   subscribe(fn: Subscriber): () => void {

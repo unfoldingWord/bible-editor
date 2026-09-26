@@ -17,7 +17,7 @@ import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import EditNoteIcon from "@mui/icons-material/EditNote";
 import { outbox, type OutboxOp, type OpTarget } from "../sync/outbox";
 import { explainRefusal, willRetryOnItsOwn } from "../sync/refusalReason";
-import { drafts, type DraftRecord, type DraftMeta } from "../sync/drafts";
+import { subscribeDirtyDrafts, type DraftRecord, type DraftMeta } from "../sync/drafts";
 
 // If the oldest pending/in-flight op has been queued longer than this, treat
 // it as effectively offline — navigator.onLine returns true on any LAN even
@@ -119,7 +119,7 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   // Distinct from outbox "saving N": those are in-flight to the server;
   // drafts haven't left the browser.
   const [draftList, setDraftList] = useState<DraftRecord[]>([]);
-  useEffect(() => drafts.subscribe(setDraftList), []);
+  useEffect(() => subscribeDirtyDrafts(setDraftList), []);
   const draftCount = draftList.length;
 
   // Track navigator.onLine so we can distinguish "actively saving" from
