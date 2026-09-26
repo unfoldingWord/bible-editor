@@ -71,6 +71,19 @@ console.log("\n[table row 2: exported bridge, master un-bridged → split adopti
     "a bridge narrowed to a bridge + a bridge is still a pure split");
 }
 
+console.log("\n[issue #949: a locked book is authoritative for structure too, like verseMerge.ts step 3b for content]");
+{
+  const below = new Map([[structureKey(5, 1), { id: 50, createdAt: 10 }]]);
+  eq(summary(planStructure([row(1, 2, 3)], [mv(1), mv(2)], CUT_AI, below, true)),
+    { ...EMPTY, skip: ["5:2"], adoptions: [["split", 1, null, [], [2]]] },
+    "locked: a provably non-human split still adopts — bookLocked skips the human question entirely");
+  eq(summary(planStructure([row(1, 2)], [mv(1, 2)], CUT_AI, new Map(), true)), EMPTY,
+    "locked: a component master never touched can't even reach the lock check (same signature skips above) — D1 is kept");
+  eq(summary(planStructure([row(1, 2, 3)], [mv(1), mv(2), mv(3)], CUT, new Map([[structureKey(5, 1), { id: 150, createdAt: 300 }]]), true)),
+    { ...EMPTY, skip: ["5:1", "5:2"], keptLocal: [[[1], [1, 2]]] },
+    "locked: a LOCAL (unpublished) D1 split still wins over master — bookLocked only overrides the human check at step 2, never step 1");
+}
+
 console.log("\n[table row 3: D1 split after the export, master still bridged → kept local]");
 {
   const edits = new Map([[structureKey(5, 1), { id: 150, createdAt: 300 }]]);

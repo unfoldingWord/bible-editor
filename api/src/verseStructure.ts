@@ -191,6 +191,17 @@ export function planStructure<R extends StructureD1Row, M extends StructureMaste
   masterVerses: M[],
   cutoff: StructureCutoff | null,
   structuralEdits: Map<string, StructuralEdit>,
+  // Issue #949: mirrors computeVerseMerge's `masterAuthoritative` (verseMerge.ts
+  // step 3b) for the structure dimension. Not carried on `cutoff` — like that
+  // flag, the caller reads the lock fresh, right before this call, not from a
+  // cutoff that can be minutes old in the chunked nightly. Only reachable at
+  // step 2 below, where the component's D1 side is already confirmed NOT
+  // local (its structure was itself exported and unchanged since) — so a
+  // differing signature at that point already proves master moved since the
+  // export; a component master never touched can't reach step 2 at all (the
+  // rangeSignature match above skips it), which is what protects an unlock →
+  // fix → re-lock → lock/push from ever being read as "master moved".
+  bookLocked = false,
 ): StructurePlan<R, M> {
   const plan: StructurePlan<R, M> = {
     skipMasterKeys: new Set<string>(),
@@ -287,10 +298,15 @@ export function planStructure<R extends StructureD1Row, M extends StructureMaste
 
       // 2. Exported, and master moved away from it. Only a human on Door43 may
       // re-structure what we published; a provably non-human divergence keeps
-      // D1 and is flagged for a human to look at.
+      // D1 and is flagged for a human to look at. Issue #949: a locked book
+      // skips that question — Door43 master is authoritative for the whole
+      // book while locked (verseMerge.ts step 3b), and by construction this
+      // component's master side already moved since the export (see the
+      // `bookLocked` parameter doc above), so there is nothing left to prove.
       const compStart = Math.min(...comp.map((r) => r.start));
       const compEnd = Math.max(...comp.map((r) => r.end));
-      const human = masterMayHoldHumanEditForVerse(c.lineage, chapter, compStart, compEnd > compStart ? compEnd : null);
+      const human = bookLocked ||
+        masterMayHoldHumanEditForVerse(c.lineage, chapter, compStart, compEnd > compStart ? compEnd : null);
       if (!human) {
         plan.conflicts.push({
           chapter, verse: first.verse, verseEnd: first.verse_end ?? null, reason: "master_moved_non_human",

@@ -6344,7 +6344,7 @@ async function applyVerseRows(
       });
     }
   }
-  const plan = planStructure(existingRs.results, verses, cutoff, structuralEdits);
+  const plan = planStructure(existingRs.results, verses, cutoff, structuralEdits, bookLocked);
   counts.structure_unclassified += plan.unclassified;
   counts.structure_kept_local += plan.keptLocal.length;
   counts.structure_refused += plan.conflicts.length;
