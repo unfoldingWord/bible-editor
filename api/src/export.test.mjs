@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, shouldRecordRevertReport, shouldComputeRevertEntries, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, shouldRecordRevertReport, shouldComputeRevertEntries, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -2517,6 +2517,42 @@ function utf8Base64(s) {
     usfmRevertReport(rendered, master, master).entries.length === 0,
     `base == last publish (master never moved at 13:5) -> nothing reported`,
   );
+}
+
+// --- RECORD_PUSHED_RENDER_SQL keeps prev_* on the real previous publish (#995), real schema ---
+{
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const db = new DatabaseSync(":memory:");
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) db.exec(readFileSync(join(dir, f), "utf8"));
+  db.prepare(
+    `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin, pushed_blob_sha, pushed_r2_key, pushed_read_at)
+     VALUES ('JER', 'ust', 'x', 0, 'export', 'A', 'exports/i1/JER/ust/f', 100)`,
+  ).run();
+  const record = (sha, readAt, key) => db.prepare(RECORD_PUSHED_RENDER_SQL).run("JER", "ust", sha, readAt, 0, 1, key);
+  const row = () => db.prepare(`SELECT * FROM book_resource_syncs WHERE book = 'JER' AND resource = 'ust'`).get();
+
+  record("B", 200, "exports/i2/JER/ust/f");
+  let r = row();
+  assert(r.pushed_blob_sha === "B" && r.prev_pushed_blob_sha === "A" && r.prev_pushed_r2_key === "exports/i1/JER/ust/f",
+    `a new instance's publish moves the outgoing render into prev_*`);
+  record("B2", 210, "exports/i2/JER/ust/f");
+  r = row();
+  assert(r.pushed_blob_sha === "B2" && r.prev_pushed_blob_sha === "A" && r.prev_pushed_r2_key === "exports/i1/JER/ust/f",
+    `a same-instance retry (same R2 key) leaves prev_* on the real previous publish`);
+  assert(priorPublishPointer(r, "exports/i2/JER/ust/f").blobSha === "A",
+    `…so a further retry of that step still diffs against last night's render`);
+  record("OLD", 150, "exports/i0/JER/ust/f");
+  r = row();
+  assert(r.pushed_blob_sha === "B2" && r.prev_pushed_blob_sha === "A",
+    `a stale render the pushed_read_at guard declines touches neither pushed_* nor prev_*`);
+  record("C", 300, "exports/i3/JER/ust/f");
+  r = row();
+  assert(r.pushed_blob_sha === "C" && r.prev_pushed_blob_sha === "B2" && r.prev_pushed_r2_key === "exports/i2/JER/ust/f",
+    `the next night's publish makes the retried render the previous publish`);
 }
 
 // --- shouldComputeRevertEntries: the composition, covered ---
