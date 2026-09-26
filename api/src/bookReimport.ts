@@ -1800,6 +1800,15 @@ export async function applyTsvRows(
   const now = Math.floor(Date.now() / 1000);
   const masterConfirmedAt = cutoff?.confirmedAt ?? null;
   const masterEditId = cutoff?.editId ?? null;
+  // Door43 master is authoritative for a locked book's tn/tq/twl merge too
+  // (issue #950 — verseMerge.ts step 3b's rule for verse content, mirrored
+  // here for TSV fields). Read here, just before the row read below, not
+  // carried on the cutoff — same reasoning as applyVerseRows's own copy of
+  // this line: the cutoff can be minutes old in the chunked nightly, and a
+  // lock or unlock in between must be honored. Gated on masterConfirmedAt so
+  // an (book, resource) never yet confirmed on master still falls back to the
+  // pre-existing ancestor-free handling exactly as before this fix.
+  const bookLocked = masterConfirmedAt != null && (await effectiveBookLock(env, book)) != null;
   // #686, hoisted ONCE per (book, kind) rather than evaluated per row. The
   // lineage is measured once per (book, resource) per run and rides in on the
   // cutoff, so every row in this call gets the identical string — and the
@@ -2263,6 +2272,9 @@ export async function applyTsvRows(
             masterMayHoldHumanEdit: masterMayHoldHuman,
             // #653: a create-as-ancestor base may exonerate, never convict.
             baseProvisional: bases.get(row.id)?.provisional === true,
+            // #950: master is authoritative for a both-moved field while the
+            // book is locked, same as verseMerge.ts's masterAuthoritative.
+            bookLocked,
           },
         );
         if (merge.action === "keep_no_base") {
