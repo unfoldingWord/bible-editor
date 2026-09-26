@@ -1,3 +1,23 @@
+// A keystroke replaces a draft's record (new payload/updatedAt/generation)
+// without ever adding or removing a key. A whole-list subscriber that shows
+// only *which* drafts exist (SyncStatusBar's count, UnsavedToasts' prompts) —
+// never their live text — gains nothing from re-rendering on every one of
+// those replacements. Wrap `subscribe` with this to skip callbacks whose key
+// set is unchanged from the last one delivered.
+export function dedupeByKeys<T extends { key: string }>(
+  subscribe: (fn: (all: T[]) => void) => () => void,
+): (fn: (all: T[]) => void) => () => void {
+  return (fn) => {
+    let lastKeys: string | undefined;
+    return subscribe((all) => {
+      const keys = all.map((r) => r.key).sort().join("\u0000");
+      if (keys === lastKeys) return;
+      lastKeys = keys;
+      fn(all);
+    });
+  };
+}
+
 // One hydration read shared by every editor. Subsequent commits refresh only
 // their key; an older in-flight read must never replace a newer notification.
 export function createDraftSnapshot<T extends { key: string; updatedAt: number }>(

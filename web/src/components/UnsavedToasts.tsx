@@ -10,7 +10,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Alert, IconButton, Stack, Button, Box, Typography } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
-import { drafts, type DraftRecord } from "../sync/drafts";
+import { subscribeDirtyDrafts, type DraftRecord } from "../sync/drafts";
 import { outbox, type OutboxOp } from "../sync/outbox";
 import { verseDraftHasActiveSave } from "../sync/draftSaveState";
 
@@ -40,7 +40,7 @@ export function UnsavedToasts({ book, onSaveVerseDraft, onJumpTo }: Props) {
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState(false);
 
-  useEffect(() => drafts.subscribe(setDraftList), []);
+  useEffect(() => subscribeDirtyDrafts(setDraftList), []);
   useEffect(() => outbox.subscribe(setOps), []);
 
   // Payload/generation changes on every keystroke, but observer targets do not.
