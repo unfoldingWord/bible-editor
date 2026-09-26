@@ -269,10 +269,23 @@ export const outbox = {
     id: string,
     expectedVersion: number,
     patch: Record<string, unknown>,
-    opts: { restoredFromVersion?: number; book: string; baseline?: Record<string, unknown> },
+    opts: {
+      restoredFromVersion?: number;
+      book: string;
+      baseline?: Record<string, unknown>;
+      // Fires synchronously, before this function's first await — so a
+      // caller that also applies `patch` optimistically can record a replay
+      // step (chapterFetchSequencer.ts) tied to this exact op's id with no
+      // gap a merging refetch could land in between (#989). Only `enqueueRow`
+      // needs this: `enqueueDeleteRow`'s optimistic apply already records its
+      // own step unconditionally (lib/verseStructure.ts `rowDelete`).
+      onEnqueued?: (op: OutboxOp) => void;
+    },
   ): Promise<OutboxOp> {
     if (isReadOnly()) {
-      return noopOp({ kind: "row", rowKind, id, book: opts.book }, "patch", patch);
+      const op = noopOp({ kind: "row", rowKind, id, book: opts.book }, "patch", patch);
+      opts.onEnqueued?.(op);
+      return op;
     }
     const op: OutboxOp = {
       id: uid(),
@@ -289,6 +302,7 @@ export const outbox = {
         : {}),
       ...(opts.baseline !== undefined ? { baseline: opts.baseline } : {}),
     };
+    opts.onEnqueued?.(op);
     await (await db()).put(STORE, op);
     void notify();
     void drain();

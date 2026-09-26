@@ -82,6 +82,14 @@ export interface ChapterFetchSequencer<P, S> {
   refetch(load: ChapterLoader<P>, merge: boolean): Promise<void>;
   /** Record a step for replay while a merging refetch is pending. */
   record(step: S): void;
+  /**
+   * Remove any currently-queued step matching `predicate` — e.g. a `rowPatch`
+   * step whose outbox op just settled and must stop replaying (see #989).
+   * Unlike `keepOnSupersede` (which only filters when a NEW merge starts),
+   * this acts on the live queue immediately, so it also takes effect while
+   * the current merge is still in flight, before it lands.
+   */
+  forget(predicate: (step: S) => boolean): void;
   /** Chapter change or unmount: abort and forget everything in flight. */
   reset(): void;
 }
@@ -164,6 +172,9 @@ export function createChapterFetchSequencer<P, S>(cb: ChapterFetchCallbacks<P, S
     },
     record(step: S): void {
       queue?.push(step);
+    },
+    forget(predicate: (step: S) => boolean): void {
+      if (queue) queue = queue.filter((s) => !predicate(s));
     },
     reset(): void {
       current?.ctrl.abort();

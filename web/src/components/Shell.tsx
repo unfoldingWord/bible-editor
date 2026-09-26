@@ -297,6 +297,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     retryAttempts,
     refetch,
     applyLocalRowPatch,
+    recordPendingRowPatch,
     applyLocalRowReplacement,
     applyLocalRowDelete,
     applyLocalRowInsert,
@@ -3057,7 +3058,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const baseline: Record<string, unknown> = {};
     for (const field of Object.keys(patch)) baseline[field] = rowRecord[field];
     applyLocalRowPatch(kind, row.id, localPatch);
-    void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, { ...opts, book: row.book, baseline });
+    // `onEnqueued` fires synchronously (before enqueueRow's first await), so
+    // the replay step lands with the exact op id and no gap a merging
+    // refetch could land in between (#989) — see recordPendingRowPatch.
+    void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, {
+      ...opts,
+      book: row.book,
+      baseline,
+      onEnqueued: (op) => recordPendingRowPatch(kind, row.id, localPatch, op.id),
+    });
   };
 
   // Draft-write path. Every keystroke in a verse-text cell calls this; it

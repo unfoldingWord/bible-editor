@@ -340,4 +340,35 @@ function harness() {
   assert.deepEqual(events2[1].queued, ["structure:during mount"], "the deferred merge drops data steps its snapshot already contains");
 }
 
+// ── (#989) forget() removes a step from the LIVE queue, independent of any
+//    new merge starting. A rowPatch step whose outbox op settles while a
+//    merge is already in flight must stop replaying for THAT merge's landing
+//    too — keepOnSupersede alone only re-filters when the NEXT merge starts.
+{
+  const h = harness();
+  const load = h.loader("ch1");
+  const mount = h.seq.refetch(load, false);
+  h.requests[0].resolve("snap1");
+  await mount;
+  const open = h.seq.refetch(load, true); // merging GET in flight
+  h.seq.record("keep-me");
+  h.seq.record("settle-me");
+  h.seq.forget((step) => step === "settle-me"); // the op settled mid-flight
+  h.requests[1].resolve("snap2");
+  await open;
+  assert.deepEqual(h.landed().at(-1), { landed: "snap2", merge: true, queued: ["keep-me"] },
+    "forget() drops the matching step before this in-flight merge lands, leaving the rest");
+}
+
+// ── forget() with nothing queued (no merge pending) is a safe no-op ───────
+{
+  const h = harness();
+  const load = h.loader("ch1");
+  h.seq.forget(() => true);
+  const mount = h.seq.refetch(load, false);
+  h.requests[0].resolve("snap1");
+  await mount;
+  assert.deepEqual(h.landed(), [{ landed: "snap1", merge: false, queued: [] }]);
+}
+
 console.log("chapterFetchSequencer: all cases passed");
