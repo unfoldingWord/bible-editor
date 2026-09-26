@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, shouldRecordRevertReport, shouldComputeRevertEntries, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -2496,6 +2496,37 @@ function utf8Base64(s) {
   assert(
     shouldComputeRevertEntries(true, "master", null, "sha-ours") === true,
     `master unhashable -> fail OPEN; an unknown master cannot prove it is safe to overwrite`,
+  );
+}
+
+// --- foreignCommitDuringExport (#871): the freshness-gate/commitToDcs race ---
+// checkMasterFreshness pins master's head SHA once, before the shrink/
+// alignment guards' snapshot and before commitToDcs's several DCS round
+// trips. A commit landing on master inside that window is invisible to every
+// check above — this is exportOne's re-check, run right after commitToDcs,
+// to notice the pinned snapshot went stale mid-run.
+{
+  assert(
+    foreignCommitDuringExport("sha-pinned", "sha-different") === true,
+    `head resolved again after commitToDcs differs from the gate's pinned sha -> a foreign commit landed mid-export`,
+  );
+  assert(
+    foreignCommitDuringExport("sha-pinned", "sha-pinned") === false,
+    `head unchanged since the gate ran -> today's behaviour exactly, no race`,
+  );
+  assert(
+    foreignCommitDuringExport(null, "sha-different") === false,
+    `no pinned sha to compare against (dry run, or the gate never resolved one) -> nothing to detect a race against`,
+  );
+  assert(
+    foreignCommitDuringExport("sha-pinned", null) === false,
+    `post-commit head unresolvable -> fails CLOSED on "is this a race", not open; an unreadable head does not ` +
+      `PROVE nothing landed, but there is nothing to compare, so the report proceeds exactly as it did before ` +
+      `this check existed rather than block on missing information`,
+  );
+  assert(
+    foreignCommitDuringExport(null, null) === false,
+    `neither side known -> no race detected`,
   );
 }
 

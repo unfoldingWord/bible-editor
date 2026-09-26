@@ -47,6 +47,7 @@ import {
   tsvRevertReport,
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
+  foreignCommitDuringExport,
   masterIsOurLastPublish,
   classifyRevertSeverity,
   mechanicalOverwriteAlert,
@@ -1472,6 +1473,23 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         resource === "ult" || resource === "ust"
           ? usfmMasterContentForRevertReport
           : tsvMasterContentForRevertReport;
+      // Foreign-commit race (#871): checkMasterFreshness pinned master's head
+      // SHA (`fresh.masterSha`) before the shrink/alignment guards took their
+      // master snapshot and before commitToDcs's several DCS round trips ran
+      // just above. A maintainer hand-edit landing on master anywhere in that
+      // window is invisible to every check so far — the snapshot the report
+      // would diff against already predates it. Re-resolve master's head SHA
+      // now, right after the commit, and only when a report is actually on
+      // the table (same gate as the hash below) so an ordinary unchanged
+      // night doesn't pay for an extra DCS round trip.
+      let foreignCommitSha: string | null = null;
+      if (shouldRecordRevertReport(dcsChanged, masterContentForRevertReport)) {
+        const postCommitHead = await fileHeadCommit(this.env, target.repo, filename);
+        if (foreignCommitDuringExport(fresh.masterSha, postCommitHead?.sha ?? null)) {
+          foreignCommitSha = postCommitHead!.sha;
+          await this.recordExportRevertRaceAlert(book, resource, fresh.masterSha, foreignCommitSha);
+        }
+      }
       // Hash only when a report is actually on the table. `dcsChanged` is false
       // on every unchanged night — the common steady state — and SHA-1 over a
       // multi-MB USFM or a 7776-row TSV is not free on a Worker this file
@@ -1540,6 +1558,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         }
       }
       if (
+        foreignCommitSha == null &&
         (resource === "ult" || resource === "ust") &&
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
@@ -1548,6 +1567,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           : [];
         await this.recordExportRevertReport(book, resource, "usfm", entries, mechanical, branch, instanceId, alertObservedAt);
       } else if (
+        foreignCommitSha == null &&
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
       ) {
@@ -2932,6 +2952,35 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         error: e instanceof Error ? e.message : String(e),
       });
     }
+  }
+
+  // #871: a foreign commit landed on master between checkMasterFreshness
+  // pinning its head SHA and commitToDcs finishing its several DCS round
+  // trips. Every snapshot this run captured — the shrink/alignment guards'
+  // master content, the blob sha shouldComputeRevertEntries compares — is
+  // pinned to the now-stale SHA, so a revert report built from it would diff
+  // against bytes that predate the foreign commit and either miss it or blame
+  // unrelated rows. Say so directly instead of publishing that wrong report.
+  // severity "warning", same as recordExportRevertReport: this never blocks
+  // the export (already shipped by the time this fires) or claims a cause
+  // beyond what was measured — only that master moved and by how much.
+  private async recordExportRevertRaceAlert(
+    book: string,
+    resource: Resource,
+    pinnedSha: string | null,
+    foreignSha: string,
+  ): Promise<void> {
+    const source = `export_revert_race:${book}:${resource}`;
+    const label = `${book} ${resource.toUpperCase()}`;
+    const pinned = (pinnedSha ?? "unknown").slice(0, 8);
+    const foreign = foreignSha.slice(0, 8);
+    const message =
+      `${label}: master moved from ${pinned} to ${foreign} while tonight's export was running, between the ` +
+      `freshness check and the DCS commit. The export-revert report for this run was skipped rather than built ` +
+      `against a snapshot that already predates that commit — diff ${pinned}..${foreign} on Door43 to see what ` +
+      `landed. This does not block the export, which already shipped; tomorrow night's freshness gate will ` +
+      `re-sync against ${foreign}.`;
+    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`, "warning");
   }
 
   // Build and record the export-revert report for one (book,resource), then
