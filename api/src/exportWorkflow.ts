@@ -48,6 +48,8 @@ import {
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
   masterIsOurLastPublish,
+  priorPublishPointer,
+  RECORD_PUSHED_RENDER_SQL,
   classifyRevertSeverity,
   mechanicalOverwriteAlert,
   isMasterConfirmed,
@@ -1409,16 +1411,25 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // See masterIsOurLastPublish.
       // pushed_r2_key (same row, same render) locates that render's bytes for
       // the per-row three-way diff (#870); it is only fetched if a report runs.
+      // On a step.do retry whose first attempt already recorded tonight's
+      // render, the previous publish lives in prev_* (#995).
       let priorPushedBlobSha: string | null = null;
       let priorPushedR2Key: string | null = null;
       try {
         const prior = await this.env.DB.prepare(
-          `SELECT pushed_blob_sha, pushed_r2_key FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+          `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key
+             FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
         )
           .bind(book, resource)
-          .first<{ pushed_blob_sha: string | null; pushed_r2_key: string | null }>();
-        priorPushedBlobSha = prior?.pushed_blob_sha ?? null;
-        priorPushedR2Key = prior?.pushed_r2_key ?? null;
+          .first<{
+            pushed_blob_sha: string | null;
+            pushed_r2_key: string | null;
+            prev_pushed_blob_sha: string | null;
+            prev_pushed_r2_key: string | null;
+          }>();
+        const pointer = priorPublishPointer(prior, r2Key);
+        priorPushedBlobSha = pointer.blobSha;
+        priorPushedR2Key = pointer.r2Key;
       } catch (e) {
         // Fail open — an unreadable base just means we report as before.
         console.error("export: prior pushed_blob_sha read failed; revert report keeps its unfiltered behaviour", {
@@ -2787,39 +2798,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         });
       }
       const result = await this.env.DB.prepare(
-        `UPDATE book_resource_syncs
-            SET pushed_blob_sha =
-                  CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?3 ELSE pushed_blob_sha END,
-                pushed_read_at = MAX(COALESCE(pushed_read_at, 0), ?4),
-                -- P1.3: store this render's edit_log id boundary next to its
-                -- blob/read-time, guarded IDENTICALLY to pushed_blob_sha so the
-                -- trio always describes ONE render. markOwnPublishConverged
-                -- promotes it into master_confirmed_edit_id when a later sync
-                -- recognizes this render on master (the steady-state path).
-                pushed_edit_id =
-                  CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?6 ELSE pushed_edit_id END,
-                pushed_r2_key =
-                  CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?7 ELSE pushed_r2_key END,
-                master_confirmed_at =
-                  CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END,
-                -- Shadow master_confirmed_at, but ONLY when this render is the
-                -- newest confirmed one (?4 >= the stored master_confirmed_at).
-                -- Without that gate the two columns are MAX'd independently, and a
-                -- delayed OLDER render arriving while master_confirmed_edit_id is
-                -- still NULL (warm-up) would advance the id to the old render's
-                -- boundary (MAX(0, old) = old) while the timestamp stays at the
-                -- newer render (MAX keeps it) — the two would then describe
-                -- DIFFERENT renders and reconstruction (which prefers the id) would
-                -- fold too old an ancestor, reintroducing the false-conflict this
-                -- migration removes. The non-null guard additionally stops an empty
-                -- edit_log (?6 NULL) from coercing this to a bogus 0. When the gate
-                -- passes, ?6 >= the stored id (readAt and MAX(id) move together per
-                -- build), so MAX here equals a direct assign but also can't regress.
-                master_confirmed_edit_id =
-                  CASE WHEN ?5 = 1 AND ?6 IS NOT NULL AND ?4 >= COALESCE(master_confirmed_at, 0)
-                       THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?6)
-                       ELSE master_confirmed_edit_id END
-          WHERE book = ?1 AND resource = ?2`,
+        RECORD_PUSHED_RENDER_SQL,
       )
         .bind(book, resource, blobSha, readAt, confirmMaster ? 1 : 0, editBoundary, r2Key)
         .run();

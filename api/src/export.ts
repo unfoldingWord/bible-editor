@@ -1249,6 +1249,88 @@ export function shouldRecordRevertReport(dcsChanged: boolean, masterContent: str
 // unhashable master keeps today's behaviour, because an unknown base cannot
 // prove master is safe to overwrite. That direction matters: a false alarm
 // costs attention, a missed revert costs someone's work.
+export interface PushedRenderPointer {
+  blobSha: string | null;
+  r2Key: string | null;
+}
+
+// Which render counts as "the one we published last time" for an export that
+// is about to write `thisRenderKey` (#995).
+//
+// A step.do retry re-runs the whole export step. If the first attempt already
+// reached recordPushedRender, pushed_* now describes THAT attempt's render,
+// which is tonight's own render, not the previous publish. Using it as the
+// revert base makes base == rendered at every verse, so the report lists every
+// verse our translators changed as an overwrite of master. The R2 key is
+// deterministic per instance+book+resource, so a stored key equal to the one
+// this attempt writes is exactly the same-instance case; recordPushedRender
+// kept the real previous pair in prev_* for it.
+export function priorPublishPointer(
+  row: {
+    pushed_blob_sha: string | null;
+    pushed_r2_key: string | null;
+    prev_pushed_blob_sha: string | null;
+    prev_pushed_r2_key: string | null;
+  } | null,
+  thisRenderKey: string,
+): PushedRenderPointer {
+  if (row == null) return { blobSha: null, r2Key: null };
+  if (row.pushed_r2_key != null && row.pushed_r2_key === thisRenderKey) {
+    return { blobSha: row.prev_pushed_blob_sha, r2Key: row.prev_pushed_r2_key };
+  }
+  return { blobSha: row.pushed_blob_sha, r2Key: row.pushed_r2_key };
+}
+
+// recordPushedRender's UPDATE (exportWorkflow.ts), kept here so a test can run
+// it against the real schema: the workflow module imports cloudflare:workers,
+// which plain node cannot load. Binds: ?1 book, ?2 resource, ?3 blob sha,
+// ?4 D1 read time, ?5 confirmMaster (1/0), ?6 edit_log boundary, ?7 R2 key.
+export const RECORD_PUSHED_RENDER_SQL = `UPDATE book_resource_syncs
+      SET -- #995: keep the outgoing render as the previous publish, but only
+          -- when the incoming render is from another export instance. A
+          -- same-instance step retry writes the same ?7 key again, and
+          -- must leave prev_* pointing at the real previous publish.
+          -- SET expressions read the pre-UPDATE row, so these see the
+          -- outgoing pushed_* values.
+          prev_pushed_blob_sha =
+            CASE WHEN (pushed_read_at IS NULL OR pushed_read_at <= ?4) AND pushed_r2_key IS NOT ?7
+                 THEN pushed_blob_sha ELSE prev_pushed_blob_sha END,
+          prev_pushed_r2_key =
+            CASE WHEN (pushed_read_at IS NULL OR pushed_read_at <= ?4) AND pushed_r2_key IS NOT ?7
+                 THEN pushed_r2_key ELSE prev_pushed_r2_key END,
+          pushed_blob_sha =
+            CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?3 ELSE pushed_blob_sha END,
+          pushed_read_at = MAX(COALESCE(pushed_read_at, 0), ?4),
+          -- P1.3: store this render's edit_log id boundary next to its
+          -- blob/read-time, guarded IDENTICALLY to pushed_blob_sha so the
+          -- trio always describes ONE render. markOwnPublishConverged
+          -- promotes it into master_confirmed_edit_id when a later sync
+          -- recognizes this render on master (the steady-state path).
+          pushed_edit_id =
+            CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?6 ELSE pushed_edit_id END,
+          pushed_r2_key =
+            CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?7 ELSE pushed_r2_key END,
+          master_confirmed_at =
+            CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END,
+          -- Shadow master_confirmed_at, but ONLY when this render is the
+          -- newest confirmed one (?4 >= the stored master_confirmed_at).
+          -- Without that gate the two columns are MAX'd independently, and a
+          -- delayed OLDER render arriving while master_confirmed_edit_id is
+          -- still NULL (warm-up) would advance the id to the old render's
+          -- boundary (MAX(0, old) = old) while the timestamp stays at the
+          -- newer render (MAX keeps it) — the two would then describe
+          -- DIFFERENT renders and reconstruction (which prefers the id) would
+          -- fold too old an ancestor, reintroducing the false-conflict this
+          -- migration removes. The non-null guard additionally stops an empty
+          -- edit_log (?6 NULL) from coercing this to a bogus 0. When the gate
+          -- passes, ?6 >= the stored id (readAt and MAX(id) move together per
+          -- build), so MAX here equals a direct assign but also can't regress.
+          master_confirmed_edit_id =
+            CASE WHEN ?5 = 1 AND ?6 IS NOT NULL AND ?4 >= COALESCE(master_confirmed_at, 0)
+                 THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?6)
+                 ELSE master_confirmed_edit_id END
+    WHERE book = ?1 AND resource = ?2`;
+
 export function masterIsOurLastPublish(
   masterBlobSha: string | null,
   pushedBlobSha: string | null,
