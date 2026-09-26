@@ -48,6 +48,7 @@ import {
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
   masterIsOurLastPublish,
+  priorPublishPointer,
   classifyRevertSeverity,
   mechanicalOverwriteAlert,
   isMasterConfirmed,
@@ -1409,16 +1410,25 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // See masterIsOurLastPublish.
       // pushed_r2_key (same row, same render) locates that render's bytes for
       // the per-row three-way diff (#870); it is only fetched if a report runs.
+      // On a step.do retry whose first attempt already recorded tonight's
+      // render, the previous publish lives in prev_* (#995).
       let priorPushedBlobSha: string | null = null;
       let priorPushedR2Key: string | null = null;
       try {
         const prior = await this.env.DB.prepare(
-          `SELECT pushed_blob_sha, pushed_r2_key FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+          `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key
+             FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
         )
           .bind(book, resource)
-          .first<{ pushed_blob_sha: string | null; pushed_r2_key: string | null }>();
-        priorPushedBlobSha = prior?.pushed_blob_sha ?? null;
-        priorPushedR2Key = prior?.pushed_r2_key ?? null;
+          .first<{
+            pushed_blob_sha: string | null;
+            pushed_r2_key: string | null;
+            prev_pushed_blob_sha: string | null;
+            prev_pushed_r2_key: string | null;
+          }>();
+        const pointer = priorPublishPointer(prior, r2Key);
+        priorPushedBlobSha = pointer.blobSha;
+        priorPushedR2Key = pointer.r2Key;
       } catch (e) {
         // Fail open — an unreadable base just means we report as before.
         console.error("export: prior pushed_blob_sha read failed; revert report keeps its unfiltered behaviour", {
@@ -2788,7 +2798,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
       const result = await this.env.DB.prepare(
         `UPDATE book_resource_syncs
-            SET pushed_blob_sha =
+            SET -- #995: keep the outgoing render as the previous publish, but only
+                -- when the incoming render is from another export instance. A
+                -- same-instance step retry writes the same ?7 key again, and
+                -- must leave prev_* pointing at the real previous publish.
+                -- SET expressions read the pre-UPDATE row, so these see the
+                -- outgoing pushed_* values.
+                prev_pushed_blob_sha =
+                  CASE WHEN (pushed_read_at IS NULL OR pushed_read_at <= ?4) AND pushed_r2_key IS NOT ?7
+                       THEN pushed_blob_sha ELSE prev_pushed_blob_sha END,
+                prev_pushed_r2_key =
+                  CASE WHEN (pushed_read_at IS NULL OR pushed_read_at <= ?4) AND pushed_r2_key IS NOT ?7
+                       THEN pushed_r2_key ELSE prev_pushed_r2_key END,
+                pushed_blob_sha =
                   CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?3 ELSE pushed_blob_sha END,
                 pushed_read_at = MAX(COALESCE(pushed_read_at, 0), ?4),
                 -- P1.3: store this render's edit_log id boundary next to its

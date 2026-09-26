@@ -1249,6 +1249,38 @@ export function shouldRecordRevertReport(dcsChanged: boolean, masterContent: str
 // unhashable master keeps today's behaviour, because an unknown base cannot
 // prove master is safe to overwrite. That direction matters: a false alarm
 // costs attention, a missed revert costs someone's work.
+export interface PushedRenderPointer {
+  blobSha: string | null;
+  r2Key: string | null;
+}
+
+// Which render counts as "the one we published last time" for an export that
+// is about to write `thisRenderKey` (#995).
+//
+// A step.do retry re-runs the whole export step. If the first attempt already
+// reached recordPushedRender, pushed_* now describes THAT attempt's render,
+// which is tonight's own render, not the previous publish. Using it as the
+// revert base makes base == rendered at every verse, so the report lists every
+// verse our translators changed as an overwrite of master. The R2 key is
+// deterministic per instance+book+resource, so a stored key equal to the one
+// this attempt writes is exactly the same-instance case; recordPushedRender
+// kept the real previous pair in prev_* for it.
+export function priorPublishPointer(
+  row: {
+    pushed_blob_sha: string | null;
+    pushed_r2_key: string | null;
+    prev_pushed_blob_sha: string | null;
+    prev_pushed_r2_key: string | null;
+  } | null,
+  thisRenderKey: string,
+): PushedRenderPointer {
+  if (row == null) return { blobSha: null, r2Key: null };
+  if (row.pushed_r2_key != null && row.pushed_r2_key === thisRenderKey) {
+    return { blobSha: row.prev_pushed_blob_sha, r2Key: row.prev_pushed_r2_key };
+  }
+  return { blobSha: row.pushed_blob_sha, r2Key: row.pushed_r2_key };
+}
+
 export function masterIsOurLastPublish(
   masterBlobSha: string | null,
   pushedBlobSha: string | null,

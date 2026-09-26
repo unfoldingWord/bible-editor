@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, shouldRecordRevertReport, shouldComputeRevertEntries, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, shouldRecordRevertReport, shouldComputeRevertEntries, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -2462,6 +2462,60 @@ function utf8Base64(s) {
   assert(
     masterIsOurLastPublish(null, null) === false,
     `neither side known -> fail OPEN`,
+  );
+}
+
+// --- priorPublishPointer: a step retry must not diff against its own render (#995) ---
+// Measured 2026-09-26, JER UST: the export step ran twice in one instance. The
+// retry read back the first attempt's render as "the one we published last
+// time", so base == rendered at every verse and the revert report listed all
+// 15 verses translators had edited that day as overwrites of master. With the
+// real previous publish as base, the same bytes produce 0 entries.
+{
+  const thisKey = "exports/export-2026-09-26T05-30-26-658Z-nightly-2026-09-26/JER/ust/24-JER.usfm";
+  const lastNightKey = "exports/export-2026-09-25T05-31-09-945Z-nightly-2026-09-25/JER/ust/24-JER.usfm";
+  const firstRun = priorPublishPointer(
+    { pushed_blob_sha: "a303", pushed_r2_key: lastNightKey, prev_pushed_blob_sha: "old", prev_pushed_r2_key: "old-key" },
+    thisKey,
+  );
+  assert(
+    firstRun.blobSha === "a303" && firstRun.r2Key === lastNightKey,
+    `first attempt: pushed_* is last night's publish, so it is the base`,
+  );
+  const retry = priorPublishPointer(
+    { pushed_blob_sha: "05f0", pushed_r2_key: thisKey, prev_pushed_blob_sha: "a303", prev_pushed_r2_key: lastNightKey },
+    thisKey,
+  );
+  assert(
+    retry.blobSha === "a303" && retry.r2Key === lastNightKey,
+    `retry: pushed_* holds this instance's own render, so the base is prev_* (last night's publish)`,
+  );
+  const retryNoPrev = priorPublishPointer(
+    { pushed_blob_sha: "05f0", pushed_r2_key: thisKey, prev_pushed_blob_sha: null, prev_pushed_r2_key: null },
+    thisKey,
+  );
+  assert(
+    retryNoPrev.blobSha === null && retryNoPrev.r2Key === null,
+    `retry before prev_* was ever filled -> no base, the report fails open rather than using its own render`,
+  );
+  const neverPublished = priorPublishPointer(
+    { pushed_blob_sha: null, pushed_r2_key: null, prev_pushed_blob_sha: null, prev_pushed_r2_key: null },
+    thisKey,
+  );
+  assert(neverPublished.blobSha === null && neverPublished.r2Key === null, `never published -> no base`);
+  assert(priorPublishPointer(null, thisKey).blobSha === null, `no book_resource_syncs row -> no base`);
+
+  // Why it matters, on the report itself: a base equal to the render reports
+  // every verse that differs from master; the real base reports none.
+  const master = "\\id JER\n\\c 13\n\\p\n\\v 5 So I went.\n\\v 6 Later.\n";
+  const rendered = "\\id JER\n\\c 13\n\\p\n\\v 5 So I went to the stream.\n\\v 6 Later.\n";
+  assert(
+    usfmRevertReport(rendered, master, rendered).entries.length === 1,
+    `base == rendered (the retry bug) -> the translator's own edit is reported as an overwrite`,
+  );
+  assert(
+    usfmRevertReport(rendered, master, master).entries.length === 0,
+    `base == last publish (master never moved at 13:5) -> nothing reported`,
   );
 }
 
