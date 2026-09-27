@@ -73,7 +73,7 @@ export function buildExportBranch(book: string, usernames: string[]): string {
 // WHY THIS EXISTS. Everything above is built so a branch carries `-be-` and is
 // therefore validated and AUTO-MERGED by DCS's own workflows. There is one case
 // where auto-merge is exactly wrong: a correction to a PUBLISHED book. Those
-// books are frozen because their content is in a cut release (v90), so a fix to
+// books are frozen because their content is in a cut release (v91), so a fix to
 // them has to land as a branch + PR that a uW maintainer reviews and merges
 // himself, then re-releases. `allowLocked` already lets such an export through
 // our own gate — but on a `-be-` branch, DCS's `merge-be-pr.yaml` would merge it

@@ -606,6 +606,12 @@ Highlights that bite repeatedly:
   script, systemd timer, secrets) is personal infrastructure and stays on that box, out of this repo. If you
   change how the test suites are invoked, how `STATE.md` is structured, or where the downstream fork lives,
   update that prompt too — nothing else will tell the routine.
+- **Door43's raw-file endpoint silently ignores a SHORT commit sha.** `GET /api/v1/repos/{o}/{r}/raw/{path}?ref=<10-char sha>`
+  returns the default branch's file with HTTP 200 instead of an error, so every "historical" version you fetch is
+  just master. Measured 2026-09-27 on `en_ult` `24-JER.usfm`: ten short-sha fetches all hashed to master's blob,
+  while the same commits by FULL sha gave ten different blobs. Always pass the full 40-char sha (the
+  `commits?path=` listing returns it), and confirm a fetch with `git hash-object` against the `contents?ref=`
+  `sha` field before reasoning from it.
 
 ## Stop conditions / goals
 
