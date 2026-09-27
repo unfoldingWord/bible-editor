@@ -237,10 +237,22 @@ export interface BookLintIssue {
 
 export interface BookLintReport {
   book: string;
+  /** Present only when this report was requested with `chapter` — see
+   *  getBookLint. Absent means this is the whole-book report. */
+  chapter?: number;
+  /** Present only alongside `chapter` — the id of every non-deleted tn/tq/twl
+   *  row IN that chapter, whether or not it currently has an issue. A caller
+   *  merging this into a cached full-book report uses it to find which
+   *  cached row-derived issues belong to this chapter (a row-derived issue's
+   *  `ref` is not reliably "<chapter>:<verse>", so it can't be used for
+   *  that), including a row that had an issue before and has none now. */
+  chapterRowIds?: { tn: string[]; tq: string[]; twl: string[] };
   total: number;
-  /** Issues needing a human decision (the "flag" bucket). */
+  /** Issues needing a human decision (the "flag" bucket). Scoped to `chapter`
+   *  when present — NOT the book total in that case. */
   flagCount: number;
-  /** Integrity issues (footnotes) — secondary, count only. */
+  /** Integrity issues (footnotes) — secondary, count only. Scoped to `chapter`
+   *  when present — NOT the book total in that case. */
   escalateCount: number;
   issues: BookLintIssue[];
 }
@@ -1679,9 +1691,15 @@ export const api = {
     ),
 
   // DCS-validation summary for a book (issues that need a human decision).
-  // Book-level, fetched once per book change by useBookLint.
-  getBookLint: (book: string, signal?: AbortSignal) =>
-    request<BookLintReport>(`/api/books/${encodeURIComponent(book)}/lint`, { signal }),
+  // Book-level, fetched once per book change by useBookLint. Pass `chapter` to
+  // get a smaller response scoped to one chapter (see the route's own comment
+  // for exactly which checks that does and doesn't narrow) — useBookLint uses
+  // this after a save to merge just the touched chapter into its cached report.
+  getBookLint: (book: string, signal?: AbortSignal, chapter?: number) =>
+    request<BookLintReport>(
+      `/api/books/${encodeURIComponent(book)}/lint${chapter !== undefined ? `?chapter=${chapter}` : ""}`,
+      { signal },
+    ),
 
   getCatalogs: () => request<Catalogs>(`/api/catalogs`),
 

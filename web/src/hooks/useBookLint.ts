@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type BookLintIssue, type BookLintReport } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { createLintRefreshQueue } from "./lintRefreshQueue";
+import { mergeChapterReport } from "./mergeChapterReport";
 
 export interface UseBookLintReturn {
   status: "idle" | "loading" | "ready" | "error";
@@ -21,6 +22,14 @@ export interface UseBookLintReturn {
   // bound an optimistic key's lifetime to this promise rather than to a
   // shared reset effect.
   refetch: () => Promise<void>;
+  // Pulls just one chapter's issues (GET .../lint?chapter=N) and merges them
+  // into the cached report in place — a save only ever changes one chapter,
+  // so this is far cheaper than refetch() for the common "I just saved"
+  // path (#888). Falls back to a full refetch() when there is no cached
+  // report yet to merge into (initial load in flight, book just changed, or
+  // the last load failed) — a merge onto nothing would understate the rest
+  // of the book's issues as "clean" when they were simply never fetched.
+  refetchChapter: (chapter: number) => void;
   // Date.now() when the last fetch landed; 0 before the first and after a
   // failed one, so a failure never suppresses the next retry. Lets the caller
   // skip a focus-driven refetch that would re-pull a report it just got (#887).
@@ -52,6 +61,54 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
     return queue.current!.refresh();
   }, []);
 
+  // Tracks the latest `book`/`enabled` for the async refetchChapter callback
+  // below, whose in-flight request must not apply its result after the book
+  // changed (or the hook was disabled) out from under it — the same race
+  // fetchWithRetry + ctrl.abort() guards against in the effect below, but
+  // refetchChapter fires ad hoc rather than from that effect.
+  const liveBook = useRef(book);
+  const liveEnabled = useRef(enabled);
+  liveBook.current = book;
+  liveEnabled.current = enabled;
+  // Aborted on unmount (below) so a chapter refetch in flight when the tab
+  // closes/navigates away doesn't resolve into a setState on a dead hook.
+  // Book-change races are instead caught by comparing liveBook after the
+  // await — an aborted fetchWithRetry throws too, so either guard suffices,
+  // but book changes are frequent enough (#887) that aborting on every one
+  // would also cancel a fetch that's about to legitimately land.
+  const chapterAborts = useRef<Set<AbortController>>(new Set());
+
+  const refetchChapter = useCallback((chapter: number): void => {
+    if (!liveEnabled.current) return;
+    if (reportJson.current === null) {
+      // No cached report to merge into — see the interface doc above.
+      void queue.current!.refresh();
+      return;
+    }
+    const requestBook = liveBook.current;
+    const ctrl = new AbortController();
+    chapterAborts.current.add(ctrl);
+    void (async () => {
+      let r: BookLintReport;
+      try {
+        r = await fetchWithRetry((signal) => api.getBookLint(requestBook, signal, chapter), { signal: ctrl.signal, maxAttempts: 3 });
+      } catch {
+        return;
+      } finally {
+        chapterAborts.current.delete(ctrl);
+      }
+      if (ctrl.signal.aborted || liveBook.current !== requestBook || !liveEnabled.current || reportJson.current === null) return;
+      settledAt.current = Date.now();
+      setReport((prev) => {
+        if (prev === null) return prev;
+        const merged = mergeChapterReport(prev, r);
+        reportJson.current = JSON.stringify(merged);
+        return merged;
+      });
+      setStatus("ready");
+    })();
+  }, []);
+
   // Dispose only on actual unmount — the queue itself outlives book changes.
   // React StrictMode replays effects (setup → cleanup → setup) in dev, so the
   // first cleanup disposes the retained queue while the ref survives; revive
@@ -67,6 +124,8 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
     return () => {
       queue.current!.dispose();
       disposed.current = true;
+      for (const ctrl of chapterAborts.current) ctrl.abort();
+      chapterAborts.current.clear();
     };
   }, []);
 
@@ -125,6 +184,7 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
     flagCount: report?.flagCount ?? flagIssues.length,
     escalateCount: report?.escalateCount ?? 0,
     refetch: load,
+    refetchChapter,
     lastSettledAt,
   };
 }
