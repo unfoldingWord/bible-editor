@@ -56,6 +56,12 @@ const READ_ONLY = new Set(["UHB", "UGNT"]);
 
 const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
 
+// Rough per-chapter height for the content-visibility placeholder below
+// (#909) — only affects how far the scrollbar jumps before the browser
+// remembers the real size after first paint, so exactness doesn't matter.
+const CHAPTER_HEADER_PX = 40;
+const VERSE_ROW_PX = 44;
+
 // Handed to every cell that never reads the lexicon (only the RTL source
 // column's HebrewLine does), so a lexicon batch landing — or a new chapter
 // loading — does not re-render every loaded cell (#890).
@@ -678,9 +684,27 @@ const ChapterBlock = memo(function ChapterBlock({
   }
 
   const data = state.data;
+  // content-visibility: auto lets the browser skip layout/paint for chapters
+  // scrolled out of view without unmounting them — the active verse's DOM
+  // node and any unsaved edit state survive untouched even while offscreen,
+  // and `[data-find-cell]` lookups keep finding it (#909 step 1). The nested
+  // grid mirrors the parent's column template so per-chapter containers keep
+  // lining up with the header row and each other (equal `1fr` tracks compute
+  // to the same width regardless of which grid they're measured in).
+  const gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+  const containIntrinsicPx = CHAPTER_HEADER_PX + verseNums.length * VERSE_ROW_PX;
 
   return (
-    <Fragment>
+    <Box
+      sx={{
+        gridColumn: `1 / span ${cols}`,
+        display: "grid",
+        gridTemplateColumns,
+        gap: 1,
+        contentVisibility: "auto",
+        containIntrinsicSize: `auto ${containIntrinsicPx}px`,
+      }}
+    >
       <Box
         sx={{
           gridColumn: `1 / span ${cols}`,
@@ -771,7 +795,7 @@ const ChapterBlock = memo(function ChapterBlock({
           />
         );
       })}
-    </Fragment>
+    </Box>
   );
 });
 
