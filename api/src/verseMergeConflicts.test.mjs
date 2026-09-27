@@ -285,6 +285,30 @@ function assert(cond, msg) {
   assert(grouped.size === 0, "no username found -> no alert entry");
 }
 
+{
+  // Issue #1006. A locked book never exports, so the translator's own
+  // keep_no_base alert must not claim tonight's export will overwrite their
+  // text, or tell them to re-save (re-saving a locked book ships nothing).
+  const noBase = [{ chapter: 1, verse: 6, version: 2 }];
+  const usernameByKey = new Map([
+    [editLogKey("ZEC", "ust", { chapter: 1, verse: 6, overwrittenVersion: 2 }), "deferredreward"],
+  ]);
+  const locked = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey, true);
+  const entry = locked.get("deferredreward");
+  assert(!!entry, "locked book still notifies the editor");
+  assert(!/tonight's export/i.test(entry.message), "locked book: no export claim");
+  assert(!/re-?save/i.test(entry.message), "locked book: no re-save remedy");
+  assert(entry.message.includes("this book is locked"), "locked book: names the actual reason");
+  assert(entry.message.includes("Nothing has been overwritten"), "locked book: still denies an overwrite");
+
+  // Unlocked (the default, and explicit false) keeps today's wording exactly.
+  const unlockedDefault = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey).get("deferredreward");
+  const unlockedExplicit = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey, false).get("deferredreward");
+  assert(unlockedDefault.message.includes("tonight's export"), "unlocked: keeps the export warning");
+  assert(unlockedDefault.message === unlockedExplicit.message, "omitting the flag matches passing it false explicitly");
+  assert(!unlockedDefault.message.includes("this book is locked"), "unlocked: never mentions a lock");
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Part 2: the ACTUAL production query (buildEditorLookupQuery, imported
 // above — not a hand-duplicated copy, so this can't silently drift from what
@@ -1912,6 +1936,34 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
 
   // Zero is not a story: no sentence at all.
   assert(buildMergeConflictGuidance([], { noBaseCount: 0 }) === "", "no no-ancestor sentence when the count is 0");
+}
+
+{
+  // Issue #1006. A locked book never exports (bookReimport.ts skips it
+  // outright), so the keep_no_base sentence must not warn that "tonight's
+  // export will still overwrite" — that cannot happen — and must not tell
+  // the reader to re-save, which ships nothing either.
+  const locked = buildMergeConflictGuidance([], {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseBookLocked: true,
+  });
+  assert(!/tonight's export/i.test(locked), "locked book: no export claim in the admin sentence");
+  assert(!/re-?save/i.test(locked), "locked book: no re-save remedy in the admin sentence");
+  assert(locked.includes("this book is locked"), "locked book: names the actual reason nothing ships");
+  assert(locked.includes("Nothing was overwritten"), "locked book: still denies an overwrite happened");
+  assert(locked.includes("1:6"), "locked book: still names the verse");
+
+  // Unlocked (the default, and explicit false) keeps today's wording exactly.
+  const unlockedDefault = buildMergeConflictGuidance([], { noBaseCount: 1, noBaseRefs: ["1:6"] });
+  const unlockedExplicit = buildMergeConflictGuidance([], {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseBookLocked: false,
+  });
+  assert(unlockedDefault.includes("tonight's export"), "unlocked: keeps the export warning");
+  assert(unlockedDefault === unlockedExplicit, "omitting the flag matches passing it false explicitly");
+  assert(!unlockedDefault.includes("this book is locked"), "unlocked: never mentions a lock");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

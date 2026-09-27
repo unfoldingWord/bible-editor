@@ -763,10 +763,14 @@ export async function raiseVerseMergeConflictAlert(
   // each carrying its current D1 version so groupNoBaseVersesByEditor can
   // attribute it to the human who last edited it and give THEM their own
   // notice too — until this fix that warning reached only ALERT_USERNAME.
+  // `noBaseBookLocked` (issue #1006): whether this book was locked (so
+  // nothing exports) for at least one of the keep_no_base verses behind
+  // noBaseCount — a locked book must not be told an export will overwrite it.
   opts: {
     recordingFailed?: boolean;
     noBaseCount?: number;
     noBaseRefs?: string[];
+    noBaseBookLocked?: boolean;
     noBaseEditorRefs?: NoBaseVerseRef[];
     observedAt?: number;
   } = {},
@@ -852,6 +856,7 @@ export async function raiseVerseMergeConflictAlert(
     recordingFailed: opts.recordingFailed,
     noBaseCount: opts.noBaseCount,
     noBaseRefs: opts.noBaseRefs,
+    noBaseBookLocked: opts.noBaseBookLocked,
   });
   // Issue #624: each ref grouped under its own reason, each group carrying
   // the oldest detected_at in that reason as a plain "first flagged" date —
@@ -914,7 +919,13 @@ export async function raiseVerseMergeConflictAlert(
   }));
   const usernameByKey = await lookupEditorUsernames(env, book, resource, [...overwrittenRefs, ...noBaseLookupRefs]);
   const perEditor = groupOverwrittenVersesByEditor(book, resource, overwrittenRefs, usernameByKey);
-  const perEditorNoBase = groupNoBaseVersesByEditor(book, resource, noBaseEditorRefs, usernameByKey);
+  const perEditorNoBase = groupNoBaseVersesByEditor(
+    book,
+    resource,
+    noBaseEditorRefs,
+    usernameByKey,
+    opts.noBaseBookLocked === true,
+  );
 
   // Combine per-editor content: an editor can appear in BOTH maps in the same
   // run (an overwritten verse elsewhere in the book, plus a keep_no_base verse
