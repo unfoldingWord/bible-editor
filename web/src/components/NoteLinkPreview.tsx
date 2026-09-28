@@ -76,6 +76,9 @@ function loadChapter(book: string, chapter: number): Promise<ChapterPayload> {
 
 const PREVIEW_WIDTH = 440;
 
+// How long a deferred mouse leave waits for the pointer to reach the preview.
+const CROSS_MS = 800;
+
 // Popper anchor for the preview: the hovered link's vertical extent, but its
 // note card's horizontal extent, so "left"/"right" placement puts the preview
 // beside the card instead of on top of it (#1026). contextElement lets Popper
@@ -260,11 +263,14 @@ export function NoteLinkPreview({
   const popperRef = useRef<PopperInstance>(null);
   const linkRef = useRef<Element | null>(null);
   const pointer = useRef<{ x: number; y: number } | null>(null);
-  const closing = useRef(false);
+  // Set while a mouse leave is deferred (see inCorridor); fires the close.
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Beside the card, the preview can sit a card's width from the link, too far
-  // to cross before MUI's leave delay closes it. So a mouse leave only closes
-  // it once the pointer is outside the box spanning the link and the preview.
+  // to cross before MUI's leave delay closes it. So after a mouse leave it
+  // stays open while the pointer is inside the box spanning the link and the
+  // preview and still heading for the preview: it closes on leaving that box,
+  // or after CROSS_MS without getting any closer (resting on the card).
   const inCorridor = () => {
     const p = pointer.current;
     const link = linkRef.current;
@@ -279,18 +285,52 @@ export function NoteLinkPreview({
       p.y <= Math.max(a.bottom, b.bottom) + 4
     );
   };
+  const distanceToPopper = () => {
+    const p = pointer.current;
+    const popper = popperRef.current?.state.elements.popper;
+    if (!p || !popper) return Infinity;
+    const b = popper.getBoundingClientRect();
+    return Math.hypot(Math.max(b.left - p.x, 0, p.x - b.right), Math.max(b.top - p.y, 0, p.y - b.bottom));
+  };
+  const lastDistance = useRef(Infinity);
+  const cancelDeferredClose = () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+    closeTimer.current = null;
+  };
+  const close = () => {
+    cancelDeferredClose();
+    setOpen(false);
+  };
+  const deferClose = () => {
+    cancelDeferredClose();
+    lastDistance.current = distanceToPopper();
+    closeTimer.current = setTimeout(() => {
+      closeTimer.current = null;
+      // Reached the preview or back on the link: MUI calls onClose again when
+      // the pointer leaves it.
+      const hovered = [popperRef.current?.state.elements.popper, linkRef.current].some((el) => el?.matches(":hover"));
+      if (!hovered) setOpen(false);
+    }, CROSS_MS);
+  };
   useEffect(() => {
     if (!open) return;
     const onMove = (e: PointerEvent) => {
       pointer.current = { x: e.clientX, y: e.clientY };
-      if (closing.current && !inCorridor()) {
-        closing.current = false;
-        setOpen(false);
-      }
+      if (!closeTimer.current) return;
+      if (!inCorridor()) return close();
+      const d = distanceToPopper();
+      if (d < lastDistance.current) deferClose();
     };
+    // The layout was measured for the old window size; re-hover to re-place.
+    const onResize = () => close();
     document.addEventListener("pointermove", onMove);
-    return () => document.removeEventListener("pointermove", onMove);
+    window.addEventListener("resize", onResize);
+    return () => {
+      document.removeEventListener("pointermove", onMove);
+      window.removeEventListener("resize", onResize);
+    };
   }, [open]);
+  useEffect(() => cancelDeferredClose, []);
 
   return (
     <Tooltip
@@ -305,14 +345,14 @@ export function NoteLinkPreview({
         const el = e.target;
         if (!(el instanceof Element)) return;
         linkRef.current = el;
-        closing.current = false;
+        cancelDeferredClose();
         setLayout(chooseLayout(el));
         setOpen(true);
       }}
       onClose={(e) => {
         // Escape, blur and touch close at once; only a mouse leave waits.
-        closing.current = e.type === "mouseleave" && inCorridor();
-        if (!closing.current) setOpen(false);
+        if (e.type === "mouseleave" && inCorridor()) deferClose();
+        else close();
       }}
       // MUI only mounts `title` while open, so the chapter fetch happens on
       // hover, never for links nobody points at.
