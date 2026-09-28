@@ -222,7 +222,7 @@ console.log("\n[(c) a coerced id colliding with an unrelated tombstone is untouc
 {
   const { sqlite, env } = freshEnv();
   seedTqTombstone(sqlite, { ref: "5:4", chapter: 5, verse: 4 });
-  // coerceRowId hashes a malformed master id into a 96-id space, so landing on
+  // coerceRowId hashes a malformed master id into a new one, so landing on
   // an unrelated tombstone at a different reference is an expected collision,
   // not evidence master reissued anything.
   const counts = await applyTsvRows(env, BOOK, "tq", [tqMasterRow({ ref: "23:7", idCoerced: true })], null);
