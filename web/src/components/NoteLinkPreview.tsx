@@ -329,11 +329,14 @@ export function NoteLinkPreview({
       const d = distanceToPopper();
       if (d < lastDistance.current) deferClose();
     };
-    // The layout was measured for the old window width; re-hover to re-place.
-    // Height alone changes as a mobile address bar slides; ignore that.
+    // The layout was measured for the old window; re-hover to re-place. A
+    // height-only change (a mobile address bar sliding) closes it only if the
+    // preview no longer fits.
     const width = window.innerWidth;
     const onResize = () => {
-      if (window.innerWidth !== width) close();
+      const popper = popperRef.current?.state.elements.popper.getBoundingClientRect();
+      const fits = popper != null && popper.top >= 0 && popper.bottom <= window.innerHeight;
+      if (window.innerWidth !== width || !fits) close();
     };
     document.addEventListener("pointermove", onMove);
     window.addEventListener("resize", onResize);
