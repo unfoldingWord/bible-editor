@@ -146,7 +146,7 @@ t("names the ref, row id and the validator's reason, and does not tell the trans
   const rejects = hardRejectRows("tn", tnTsv(["17:4", "ny7v", "", "", "", "", NY7V_NOTE]));
   const msg = buildHardRejectAlertMessage("JER", "tn", rejects);
   assert.match(msg, /JER TN/);
-  assert.match(msg, /17:4 \(ny7v\): Opening bracket/);
+  assert.match(msg, /17:4 \(ny7v\): Note: Opening bracket .* closing bracket\. Fix/);
   assert.doesNotMatch(msg, /Fix the Occurrence/);
 });
 t("caps the sample at 6 rows and counts the rest", () => {

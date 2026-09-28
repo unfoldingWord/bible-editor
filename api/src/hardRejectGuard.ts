@@ -43,6 +43,14 @@
 // as a backstop — a hit here means the render and this module have drifted apart,
 // which is worth a HOLD.
 //
+// tn Note brackets (validate_tn_files.py check 13, `validate_paired_square_brackets`)
+// are the other hard error, and unlike Occurrence a translator CAN fix them: the
+// Note is the field they type in. Issue #1015: JER 17:4 `ny7v` saved an
+// "Alternate translation: [...] or [..." with the second `[` never closed; the
+// export shipped it, Door43's validate-be failed on that one row, and every JER
+// TN edit sat off master for two nights with no banner naming the row. The rule
+// runs on the rendered Note cell, same as the validator.
+//
 // Pure and import-free so it is directly testable by the --experimental-strip-types
 // runner, same shape as shrinkGuard.ts / reimportSyncGate.ts.
 
@@ -77,6 +85,7 @@ export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow
   if (refIdx === -1 || idIdx === -1 || occIdx === -1) return [];
   const quoteIdx = kind === "tn" ? header.indexOf("Quote") : header.indexOf("OrigWords");
   if (quoteIdx === -1) return [];
+  const noteIdx = kind === "tn" ? header.indexOf("Note") : -1;
 
   const out: HardRejectRow[] = [];
   for (const line of lines.slice(1)) {
@@ -106,11 +115,73 @@ export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow
       if (quote !== "") {
         out.push({ ref, rowId, reason: "Occurrence is blank but Quote is not" });
       }
-      continue;
-    }
-    if (!TN_OCCURRENCE_RE.test(occ)) {
+    } else if (!TN_OCCURRENCE_RE.test(occ)) {
       out.push({ ref, rowId, reason: `Occurrence '${occ}' must be a non-negative integer or -1` });
+    }
+    if (noteIdx !== -1) {
+      for (const msg of bracketProblems(cells[noteIdx] ?? "")) {
+        out.push({ ref, rowId, reason: `Note: ${msg.replace(/\.$/, "")}` });
+      }
     }
   }
   return out;
+}
+
+// Port of validate_tn_files.py validate_paired_square_brackets. Returns the
+// human-readable problems with `[ ]` nesting in a note. Shared with lint.ts,
+// which shows the same problems in the in-app issues list before export.
+export function bracketProblems(note: string): string[] {
+  const out: string[] = [];
+  const stack: Array<{ len: number; pos: number }> = [];
+  let i = 0;
+  while (i < note.length) {
+    const ch = note[i];
+    if (ch !== "[" && ch !== "]") {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < note.length && note[j] === ch) j++;
+    const runLen = j - i;
+    const token = ch.repeat(runLen);
+    if (ch === "[") {
+      stack.push({ len: runLen, pos: i });
+    } else if (stack.length === 0) {
+      out.push(`Closing bracket '${token}' at character ${i + 1} has no matching opening bracket.`);
+    } else {
+      const open = stack.pop()!;
+      if (open.len !== runLen) {
+        out.push(
+          `Opening bracket '${"[".repeat(open.len)}' at character ${open.pos + 1} is closed by '${token}' at character ${i + 1}; bracket sizes must match.`,
+        );
+      }
+    }
+    i = j;
+  }
+  for (const open of stack) {
+    out.push(`Opening bracket '${"[".repeat(open.len)}' at character ${open.pos + 1} has no matching closing bracket.`);
+  }
+  return out;
+}
+
+// Banner text for a held export. States only what was measured: WE refused, the
+// DCS run has not happened, so it must not say DCS rejected anything.
+export function buildHardRejectAlertMessage(
+  book: string,
+  resource: string,
+  rejects: HardRejectRow[],
+): string {
+  const label = `${book} ${resource.toUpperCase()}`;
+  const shown = rejects
+    .slice(0, 6)
+    .map((r) => `${r.ref} (${r.rowId}): ${r.reason}`)
+    .join("; ");
+  const more = rejects.length > 6 ? `; +${rejects.length - 6} more` : "";
+  return (
+    `Benjamin — nightly export HELD ${label}: ${rejects.length} row(s) would fail DCS ` +
+    `validation as a hard error, so the -be- PR's check would go red and the merge bot would never merge it. ` +
+    `${shown}${more}. Fix those rows (or delete them) in the editor; the next export picks them up, and every other ` +
+    `edit in ${label} is waiting on it. Blank notes/questions/OrigWords/TWLink do NOT ` +
+    `cause this — those are validator warnings and ship normally.`
+  );
 }
