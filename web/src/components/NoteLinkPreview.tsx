@@ -2,8 +2,9 @@
 // shows the note the link points back to plus the target verse's ULT and UST,
 // so the translator can compare without navigating away. Clicking the link
 // still navigates (the caller owns that); this only wraps it in a tooltip.
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
+import type { Instance } from "@popperjs/core";
 import { Box, CircularProgress, Tooltip, Typography } from "@mui/material";
 import { api } from "../sync/api";
 import type { ChapterPayload } from "../sync/api";
@@ -71,6 +72,59 @@ function loadChapter(book: string, chapter: number): Promise<ChapterPayload> {
     },
   );
   return promise;
+}
+
+const PREVIEW_WIDTH = 440;
+
+// Popper anchor for the preview: the hovered link's vertical extent, but its
+// note card's horizontal extent, so "left"/"right" placement puts the preview
+// beside the card instead of on top of it (#1026). contextElement lets Popper
+// find the link's scroll parents and follow it when the column scrolls.
+function besideCard(el: Element) {
+  return {
+    contextElement: el,
+    getBoundingClientRect: () => {
+      const link = el.getBoundingClientRect();
+      const card = el.closest("[data-note-id]")?.getBoundingClientRect() ?? link;
+      return new DOMRect(card.left, link.top, card.width, link.height);
+    },
+  };
+}
+
+// Picked once per open instead of by Popper's flip: flipping resizes the popper
+// (MUI's tooltip margin follows the placement), and at widths where no side
+// fits that fed back into the next flip and looped until React gave up.
+// Beside the card when a side has room for the whole preview, else above or
+// below, whichever has more space; preventOverflow then keeps it on screen.
+function choosePlacement(el: Element): "left" | "right" | "top" | "bottom" {
+  const card = (el.closest("[data-note-id]") ?? el).getBoundingClientRect();
+  const need = Math.min(PREVIEW_WIDTH, window.innerWidth - 32) + 14 + 8; // + MUI's gap + edge padding
+  if (card.left >= need) return "left";
+  if (window.innerWidth - card.right >= need) return "right";
+  return card.top > window.innerHeight - card.bottom ? "top" : "bottom";
+}
+
+// Module-level so the Tooltip's memoized popperOptions stay stable.
+const POPPER_OPTIONS = {
+  modifiers: [
+    { name: "flip", enabled: false },
+    { name: "preventOverflow", options: { padding: 8, tether: false, altAxis: true } },
+  ],
+};
+
+// Popper positions once, often against the short "Loading…" state; when the
+// chapter arrives the preview grows and would run off the bottom of the screen
+// until the next hover. Re-run placement whenever the content changes size.
+function RepositionOnResize({ popper, children }: { popper: React.RefObject<Instance | null>; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => popper.current?.update());
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [popper]);
+  return <div ref={ref}>{children}</div>;
 }
 
 function tsvToDisplay(s: string | null): string {
@@ -180,16 +234,33 @@ export function NoteLinkPreview({
   supportRef: string | null;
   children: ReactElement;
 }) {
+  const [anchor, setAnchor] = useState<ReturnType<typeof besideCard> | null>(null);
+  // Replaces the Tooltip's own popperRef, which it only uses for followCursor.
+  const popperRef = useRef<Instance>(null);
+  const [placement, setPlacement] = useState<ReturnType<typeof choosePlacement>>("left");
   return (
     <Tooltip
       enterDelay={350}
       enterNextDelay={350}
-      leaveDelay={150}
-      placement="bottom-start"
+      // Longer than MUI's default: beside the card, the preview can sit a
+      // card's width away from the link, and the pointer has to cross that
+      // gap to reach it.
+      leaveDelay={300}
+      placement={placement}
+      onOpen={(e) => {
+        // MUI calls onOpen from the enterDelay timer, after React has cleared
+        // currentTarget; target (the link or something inside it) survives.
+        const el = e.target as Element | null;
+        if (!el) return;
+        setAnchor(besideCard(el));
+        setPlacement(choosePlacement(el));
+      }}
       // MUI only mounts `title` while open, so the chapter fetch happens on
       // hover, never for links nobody points at.
       title={
-        <PreviewBody target={target} supportRef={supportRef} />
+        <RepositionOnResize popper={popperRef}>
+          <PreviewBody target={target} supportRef={supportRef} />
+        </RepositionOnResize>
       }
       slotProps={{
         // React events bubble through the portal to the note card; stop them on
@@ -197,6 +268,11 @@ export function NoteLinkPreview({
         // (its padding, its scrollbar, the gap MUI leaves between link and
         // tooltip) can't flip the card into edit mode or navigate either.
         popper: {
+          // Only once opened: an explicit undefined would override the
+          // Tooltip's own anchor (the link) rather than fall back to it.
+          ...(anchor ? { anchorEl: anchor } : null),
+          popperOptions: POPPER_OPTIONS,
+          popperRef,
           onMouseDown: (e: React.MouseEvent) => e.stopPropagation(),
           onClick: (e: React.MouseEvent) => e.stopPropagation(),
         },
@@ -210,9 +286,11 @@ export function NoteLinkPreview({
             // Fixed width: Popper positions against the small loading state,
             // so a width that grows once the chapter arrives would overflow
             // the viewport edge instead of being shifted back inside it.
-            width: 440,
+            width: PREVIEW_WIDTH,
             maxWidth: "calc(100vw - 32px)",
-            maxHeight: 420,
+            // Never taller than the viewport, so preventOverflow can always
+            // fit all of it on screen.
+            maxHeight: "min(420px, calc(100vh - 16px))",
             overflowY: "auto",
             p: 1.5,
           },
