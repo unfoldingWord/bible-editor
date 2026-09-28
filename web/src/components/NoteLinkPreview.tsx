@@ -261,7 +261,9 @@ export function NoteLinkPreview({
   const [open, setOpen] = useState(false);
   // Replaces the Tooltip's own popperRef, which it only uses for followCursor.
   const popperRef = useRef<PopperInstance>(null);
-  const linkRef = useRef<Element | null>(null);
+  // The Tooltip forwards its ref to its child, so this is the link or button
+  // itself, not whichever inner node (an icon's <path>) the pointer was over.
+  const linkRef = useRef<HTMLElement>(null);
   const pointer = useRef<{ x: number; y: number } | null>(null);
   // Set while a mouse leave is deferred (see inCorridor); fires the close.
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -271,6 +273,12 @@ export function NoteLinkPreview({
   // stays open while the pointer is inside the box spanning the link and the
   // preview and still heading for the preview: it closes on leaving that box,
   // or after CROSS_MS without getting any closer (resting on the card).
+  const pointerIn = (el: Element | null | undefined) => {
+    const p = pointer.current;
+    if (!p || !el) return false;
+    const r = el.getBoundingClientRect();
+    return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom;
+  };
   const inCorridor = () => {
     const p = pointer.current;
     const link = linkRef.current;
@@ -307,9 +315,9 @@ export function NoteLinkPreview({
     closeTimer.current = setTimeout(() => {
       closeTimer.current = null;
       // Reached the preview or back on the link: MUI calls onClose again when
-      // the pointer leaves it.
-      const hovered = [popperRef.current?.state.elements.popper, linkRef.current].some((el) => el?.matches(":hover"));
-      if (!hovered) setOpen(false);
+      // the pointer leaves it. Fresh rects, so a preview that grew or moved
+      // under a still pointer counts too.
+      if (!pointerIn(popperRef.current?.state.elements.popper) && !pointerIn(linkRef.current)) setOpen(false);
     }, CROSS_MS);
   };
   useEffect(() => {
@@ -321,8 +329,12 @@ export function NoteLinkPreview({
       const d = distanceToPopper();
       if (d < lastDistance.current) deferClose();
     };
-    // The layout was measured for the old window size; re-hover to re-place.
-    const onResize = () => close();
+    // The layout was measured for the old window width; re-hover to re-place.
+    // Height alone changes as a mobile address bar slides; ignore that.
+    const width = window.innerWidth;
+    const onResize = () => {
+      if (window.innerWidth !== width) close();
+    };
     document.addEventListener("pointermove", onMove);
     window.addEventListener("resize", onResize);
     return () => {
@@ -334,17 +346,17 @@ export function NoteLinkPreview({
 
   return (
     <Tooltip
+      ref={linkRef}
       open={open}
       enterDelay={350}
       enterNextDelay={350}
       leaveDelay={150}
       placement={layout?.placement ?? "left"}
-      onOpen={(e) => {
+      onOpen={() => {
         // MUI calls onOpen from the enterDelay timer, after React has cleared
-        // currentTarget; target (the link or something inside it) survives.
-        const el = e.target;
-        if (!(el instanceof Element)) return;
-        linkRef.current = el;
+        // currentTarget, so read the child from the ref instead.
+        const el = linkRef.current;
+        if (!el) return;
         cancelDeferredClose();
         setLayout(chooseLayout(el));
         setOpen(true);
