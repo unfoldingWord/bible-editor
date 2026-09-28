@@ -77,6 +77,12 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **The three hot save routes check the book lock themselves, not via `bookLockGuard`.** Issue #905: row PATCH, row
+  create and verse PATCH read `book_locks` inside their batched pre-check `db.batch()` and return 423 before any
+  write; `bookLockGuard` skips exactly those routes via `isSelfLockCheckedRoute`. Changing either route's path shape,
+  or adding a new route that matches that regex, must keep the handler-side check — `saveRoundTrips.test.mjs` pins it.
+  Router-level test D1 shims must return `results` from `batch()` for SELECT / `RETURNING` statements, as real D1 does.
+
 - **Server-side, Hebrew mark order is data, so never blanket-NFC a D1-vs-master compare.** 2026-09-25: the sync
   canonizes `x-lemma` to UHB mark order while Door43 master is NFC, so 21 locked-book verses nobody touched hit the
   #539 no-op guard as `adopt_conflict`, kept the flag, and their editors got false "Door43 overwrote your edits"

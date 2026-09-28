@@ -57,8 +57,16 @@ function makeDb(sqlite) {
       return r.length ? r[0] : null;
     },
     run() {
+      // Like real D1, a row-returning statement (a SELECT batched as a
+      // pre-check, or an UPDATE/INSERT ... RETURNING) carries its rows on
+      // `results` — rows.ts's PATCH reads both off db.batch() (issue #905).
+      if (/^\s*(SELECT|WITH)\b|\bRETURNING\b/i.test(sql)) {
+        const results = sqlite.prepare(sql).all(...args);
+        const changes = /^\s*(SELECT|WITH)\b/i.test(sql) ? 0 : results.length;
+        return { results, success: true, meta: { changes } };
+      }
       const r = sqlite.prepare(sql).run(...args);
-      return { success: true, meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };
+      return { results: [], success: true, meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };
     },
   });
   return {
