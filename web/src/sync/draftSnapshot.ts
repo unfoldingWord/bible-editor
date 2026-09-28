@@ -7,12 +7,14 @@ export function createDraftSnapshot<T extends { key: string; updatedAt: number }
   const records = new Map<string, T>();
   const revisions = new Map<string, number>();
   const subscribers = new Set<(all: T[]) => void>();
-  // Keyed listeners get `remote = true` only when every refresh coalesced
-  // into this delivery came from another tab (#806). A mounted editor with no
-  // local typing ignores those, so it never latches another tab's
-  // half-typed text. The mount callback is always `remote = false`.
+  // Keyed listeners get `remote = true` when the refresh that wins delivery
+  // (the latest revision) came from another tab (#806). A mounted editor with
+  // no local typing ignores those, so it never latches another tab's
+  // half-typed text. No marker outlives its refresh, so a failed or
+  // superseded refresh cannot mislabel a later one; a superseded local
+  // refresh reaching a clean cell as remote is harmless (it typed nothing).
+  // The mount callback is always `remote = false`.
   const keyed = new Map<string, Set<(record: T | undefined, remote: boolean) => void>>();
-  const localSince = new Set<string>();
   const pending = new Map<string, Promise<void>>();
   const mutations = new Map<string, Set<Promise<void>>>();
   const failures = new Map<string, unknown>();
@@ -71,7 +73,6 @@ export function createDraftSnapshot<T extends { key: string; updatedAt: number }
       };
     },
     refresh(key: string, origin: "local" | "remote" = "local") {
-      if (origin === "local") localSince.add(key);
       const revision = (revisions.get(key) ?? 0) + 1;
       revisions.set(key, revision);
       let succeeded = false;
@@ -93,7 +94,7 @@ export function createDraftSnapshot<T extends { key: string; updatedAt: number }
         if (!succeeded) return;
         void settled(key).then(() => {
           if (revisions.get(key) !== revision) return;
-          const remote = !localSince.delete(key);
+          const remote = origin === "remote";
           for (const fn of keyed.get(key) ?? []) fn(records.get(key), remote);
         }).catch(() => {});
         void settled().then(() => {

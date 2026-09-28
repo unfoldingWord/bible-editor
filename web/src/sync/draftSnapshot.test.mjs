@@ -196,8 +196,8 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
 }
 // #806: another tab's typing must be distinguishable from this tab's own
 // commits, so a mounted, clean editor can ignore it instead of latching a
-// half-typed snapshot. The initial (mount) callback is never "remote"; a
-// refresh coalesced from any local commit is never "remote" either.
+// half-typed snapshot. The initial (mount) callback is never "remote"; the
+// latest refresh decides the flag for a coalesced delivery.
 {
   let persisted = record("a", "tab A typing");
   const cache = createDraftSnapshot(async () => [], async () => persisted);
@@ -212,14 +212,34 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
   await cache.refresh("a");
   await turn();
   assert.deepEqual(seen.at(-1), { text: "own typing", remote: false }, "own commit is local");
-  // A local refresh superseded by a later remote one still counts as local.
+  // A local refresh superseded by a later remote one: the latest decides.
   const local = cache.refresh("a");
   const remote = cache.refresh("a", "remote");
   await Promise.all([local, remote]);
   await turn();
-  assert.equal(seen.at(-1).remote, false, "coalesced local+remote delivery is local");
+  assert.equal(seen.at(-1).remote, true, "coalesced local-then-remote delivery is remote");
+  const remoteFirst = cache.refresh("a", "remote");
+  const localLast = cache.refresh("a");
+  await Promise.all([remoteFirst, localLast]);
+  await turn();
+  assert.equal(seen.at(-1).remote, false, "coalesced remote-then-local delivery is local");
+}
+
+// #806: a failed local refresh must not leave a marker that relabels the
+// next remote-only delivery as local.
+{
+  let fail = true;
+  const cache = createDraftSnapshot(async () => [], async () => {
+    if (fail) { fail = false; throw new Error("local read failed"); }
+    return record("a", "tab A typing");
+  });
+  const seen = [];
+  cache.subscribeKey("a", (r, remote) => seen.push({ text: r?.payload.plainText, remote }));
+  await turn();
+  await assert.rejects(cache.refresh("a"), /local read failed/);
+  await turn();
   await cache.refresh("a", "remote");
   await turn();
-  assert.equal(seen.at(-1).remote, true, "local marker is consumed by its delivery");
+  assert.deepEqual(seen.at(-1), { text: "tab A typing", remote: true }, "remote after a failed local stays remote");
 }
 console.log("draftSnapshot: hydration, typing, save/clear ordering, read failures and targeted notifications passed");
