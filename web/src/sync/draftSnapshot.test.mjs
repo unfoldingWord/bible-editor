@@ -194,4 +194,32 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
   );
   assert.deepEqual(seenA, [], "a must still stay silent after an unrelated key's successful refresh");
 }
+// #806: another tab's typing must be distinguishable from this tab's own
+// commits, so a mounted, clean editor can ignore it instead of latching a
+// half-typed snapshot. The initial (mount) callback is never "remote"; a
+// refresh coalesced from any local commit is never "remote" either.
+{
+  let persisted = record("a", "tab A typing");
+  const cache = createDraftSnapshot(async () => [], async () => persisted);
+  const seen = [];
+  cache.subscribeKey("a", (r, remote) => seen.push({ text: r?.payload.plainText, remote }));
+  await turn();
+  assert.deepEqual(seen, [{ text: undefined, remote: false }], "mount callback is local");
+  await cache.refresh("a", "remote");
+  await turn();
+  assert.deepEqual(seen.at(-1), { text: "tab A typing", remote: true }, "other-tab notification is flagged remote");
+  persisted = record("a", "own typing");
+  await cache.refresh("a");
+  await turn();
+  assert.deepEqual(seen.at(-1), { text: "own typing", remote: false }, "own commit is local");
+  // A local refresh superseded by a later remote one still counts as local.
+  const local = cache.refresh("a");
+  const remote = cache.refresh("a", "remote");
+  await Promise.all([local, remote]);
+  await turn();
+  assert.equal(seen.at(-1).remote, false, "coalesced local+remote delivery is local");
+  await cache.refresh("a", "remote");
+  await turn();
+  assert.equal(seen.at(-1).remote, true, "local marker is consumed by its delivery");
+}
 console.log("draftSnapshot: hydration, typing, save/clear ordering, read failures and targeted notifications passed");
