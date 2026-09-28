@@ -39,8 +39,11 @@ for (const bad of BAD) {
   assert(coerceRowId(c) === c, `coerce is idempotent for ${JSON.stringify(bad)} → ${c}`);
 }
 
-// Anchor one mapping so an accidental change to the hash is caught.
-assert(coerceRowId("1abc") === "w6w6", `coerce("1abc") is stable === w6w6 (got ${coerceRowId("1abc")})`);
+// Anchor one mapping so an accidental change to the hash is caught. The mapping
+// must stay stable night to night once master carries a malformed id. It was
+// changed once, for issue #428 ("w6w6" before), when a scan of every Door43
+// master TSV found 0 malformed ids, so no already-coerced row was remapped.
+assert(coerceRowId("1abc") === "wms6", `coerce("1abc") is stable === wms6 (got ${coerceRowId("1abc")})`);
 
 // Distinct bad ids generally map to distinct good ids (collision is possible but
 // must be rare — assert no collisions across this sample).
