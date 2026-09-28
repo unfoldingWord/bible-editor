@@ -1476,7 +1476,10 @@ async function runReimport(
     const current = resource === "ult" || resource === "ust"
       ? await getMasterConfirmedAt(env, book, resource, true)
       : cutoff;
-    return { ...current, lineage };
+    // #1005: our newer, not-yet-confirmed publish, when the lineage shows it
+    // landed. Reads nothing unless the lineage could let it matter.
+    const unconfirmedPublish = await loadUnconfirmedPublishVerses(env, book, resource, lineage);
+    return { ...current, lineage, unconfirmedPublish };
   };
 
   const masterConfirmedAtUlt = await withLineage(
@@ -4127,6 +4130,160 @@ interface MergeCutoff {
    * pass it to that helper. See masterLineage.ts.
    */
   lineage?: MasterLineageSummary | null;
+  /**
+   * Issue #1005: our LAST pushed render, when it is newer than the confirmed
+   * boundary above (the watermark lags it). Hash-verified against
+   * pushed_blob_sha and tied to the PR recorded for that exact render. Used
+   * ONLY to widen #788's "no app edit since export" condition — see
+   * d1MatchesShippedUnconfirmedPublish. Absent/null means not proven.
+   */
+  unconfirmedPublish?: UnconfirmedPublishVerses | null;
+}
+
+// Issue #1005. `confirmedAt` / `editId` are the confirmed boundary this render
+// was measured as NEWER than; a cutoff with a different boundary must ignore it.
+interface UnconfirmedPublishVerses {
+  confirmedAt: number | null;
+  editId: number | null;
+  prNumber: number;
+  verses: Map<string, { contentJson: string; verseEnd: number | null }>;
+}
+
+// Issue #1005: the "no app edit since export" condition of #788's cosmetic
+// adoption is bounded by master_confirmed_at, which can lag one publish behind:
+// our newest render merged, and a human commit landed on top of it before any
+// sync could positively confirm it. An app edit between the two publishes then
+// reads as "unpublished" although master already holds it. This answers the
+// condition's actual question — "does D1 hold anything master does not?" — from
+// that newer publish instead, and only when ALL of these hold:
+//   * the render is hash-verified and newer than this cutoff's boundary
+//     (loadUnconfirmedPublishVerses);
+//   * a COMPLETE lineage walk lists that render's own PR among its `ours`
+//     commits, i.e. it demonstrably landed on master inside the window;
+//   * D1's current verse equals that render's verse, byte-for-byte or through
+//     the real export renderer (same grouping).
+// Anything absent, stale or mismatched returns false: the existing
+// merge_cosmetic_ignored path is the fail-closed default. This never replaces
+// the watermark check; the caller consults it only when that check failed.
+function d1MatchesShippedUnconfirmedPublish(
+  book: string,
+  bibleVersion: string,
+  cutoff: MergeCutoff | null | undefined,
+  ex: { content_json: string; verse_end?: number | null },
+  v: VerseExtract,
+): boolean {
+  const pub = cutoff?.unconfirmedPublish;
+  if (cutoff == null || pub == null) return false;
+  if (pub.confirmedAt !== cutoff.confirmedAt || pub.editId !== cutoff.editId) return false;
+  const lineage = cutoff.lineage;
+  if (
+    lineage == null ||
+    lineage.incomplete !== false ||
+    !Array.isArray(lineage.oursPrNumbers) ||
+    !lineage.oursPrNumbers.includes(pub.prNumber)
+  ) return false;
+  const shipped = pub.verses.get(`${v.chapter}:${v.verse}`);
+  if (shipped == null || (shipped.verseEnd ?? null) !== (ex.verse_end ?? null)) return false;
+  if (shipped.contentJson === ex.content_json) return true;
+  const ours = exportRenderForVerse(book, bibleVersion, v, ex.content_json);
+  const published = exportRenderForVerse(book, bibleVersion, v, shipped.contentJson);
+  return ours !== null && published !== null && ours === published;
+}
+
+// Issue #1005: loads our last pushed render's verses when it is a publish the
+// merge boundary has not caught up to. Gated first on the lineage (no complete
+// human-ref evidence, or our PR not among `ours`, means the widening can never
+// fire, so nothing is read). The bytes must hash to pushed_blob_sha, exactly as
+// the export's revert-report base requires (readVerifiedPushedRenderText).
+async function loadUnconfirmedPublishVerses(
+  env: Env,
+  book: string,
+  resource: Resource,
+  lineage: MasterLineageSummary | null | undefined,
+): Promise<UnconfirmedPublishVerses | null> {
+  if (resource !== "ult" && resource !== "ust") return null;
+  if (
+    lineage == null ||
+    lineage.incomplete !== false ||
+    lineage.refsComplete !== true ||
+    !Array.isArray(lineage.oursPrNumbers) ||
+    lineage.oursPrNumbers.length === 0
+  ) return null;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT master_confirmed_at, master_confirmed_edit_id, pushed_blob_sha, pushed_read_at,
+              pushed_r2_key, pushed_pr_number, pushed_pr_read_at
+         FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource)
+      .first<{
+        master_confirmed_at: number | null;
+        master_confirmed_edit_id: number | null;
+        pushed_blob_sha: string | null;
+        pushed_read_at: number | null;
+        pushed_r2_key: string | null;
+        pushed_pr_number: number | null;
+        pushed_pr_read_at: number | null;
+      }>();
+    if (
+      row == null ||
+      row.master_confirmed_at == null ||
+      row.pushed_blob_sha == null ||
+      row.pushed_read_at == null ||
+      row.pushed_read_at <= row.master_confirmed_at ||
+      // The PR on the row counts only when it belongs to THIS render (same
+      // pairing rule as accountOwnPublishDecline).
+      row.pushed_pr_number == null ||
+      row.pushed_pr_read_at !== row.pushed_read_at ||
+      !lineage.oursPrNumbers.includes(row.pushed_pr_number)
+    ) return null;
+    const raw = await readVerifiedPushedRenderText(env, book, resource, row.pushed_r2_key, row.pushed_blob_sha);
+    if (raw == null) return null;
+    const verses = new Map<string, { contentJson: string; verseEnd: number | null }>();
+    for (const verse of extractVersesForRange(raw, 0, 999)) {
+      verses.set(`${verse.chapter}:${verse.verse}`, { contentJson: verse.contentJson, verseEnd: verse.verseEnd ?? null });
+    }
+    if (verses.size === 0) return null;
+    return {
+      confirmedAt: row.master_confirmed_at,
+      editId: row.master_confirmed_edit_id,
+      prNumber: row.pushed_pr_number,
+      verses,
+    };
+  } catch (e) {
+    console.error("reimport: unconfirmed-publish render unavailable — #1005 widening disabled for this run", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return null;
+  }
+}
+
+// Issue #1005 staging form: Maps do not survive JSON, so the nightly path stages
+// this as plain objects beside #790's confirmed bases and revives it per chunk.
+function serializeUnconfirmedPublish(p: UnconfirmedPublishVerses): unknown {
+  return { confirmedAt: p.confirmedAt, editId: p.editId, prNumber: p.prNumber, verses: Object.fromEntries(p.verses) };
+}
+
+function reviveUnconfirmedPublish(raw: unknown): UnconfirmedPublishVerses | null {
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const p = raw as { confirmedAt?: unknown; editId?: unknown; prNumber?: unknown; verses?: unknown };
+  if (typeof p.confirmedAt !== "number" && p.confirmedAt !== null) return null;
+  if (typeof p.editId !== "number" && p.editId !== null) return null;
+  if (typeof p.prNumber !== "number" || !Number.isSafeInteger(p.prNumber) || p.prNumber <= 0) return null;
+  if (p.verses == null || typeof p.verses !== "object" || Array.isArray(p.verses)) return null;
+  const verses = new Map<string, { contentJson: string; verseEnd: number | null }>();
+  for (const [key, value] of Object.entries(p.verses as Record<string, unknown>)) {
+    if (value == null || typeof value !== "object") continue;
+    const { contentJson, verseEnd } = value as { contentJson?: unknown; verseEnd?: unknown };
+    if (typeof contentJson !== "string") continue;
+    if (typeof verseEnd !== "number" && verseEnd !== null) continue;
+    verses.set(key, { contentJson, verseEnd });
+  }
+  return verses.size > 0
+    ? { confirmedAt: p.confirmedAt as number | null, editId: p.editId as number | null, prNumber: p.prNumber, verses }
+    : null;
 }
 
 // Issue #788: stableKey intentionally treats whitespace-only content changes as
@@ -4188,6 +4345,30 @@ export async function readPushedRenderText(
     raw = file ? await readPushedBlobText(env, file.repo, blobSha) : null;
   }
   return raw;
+}
+
+// readPushedRenderText, but only bytes that hash to `blobSha`. The R2 key is
+// per-instance and a step.do retry can rewrite it after recordPushedRender
+// stored the sha, so the key alone does not prove it holds the render the sha
+// describes; on a mismatch Door43 still serves the exact blob by sha. null
+// when neither source yields the measured bytes. Shared by the export's
+// revert-report base (#870) and the #1005 cosmetic-adoption widening.
+export async function readVerifiedPushedRenderText(
+  env: Env,
+  book: string,
+  resource: Resource,
+  r2Key: string | null,
+  blobSha: string | null,
+): Promise<string | null> {
+  if (blobSha == null) return null;
+  const raw = await readPushedRenderText(env, book, resource, r2Key, blobSha);
+  if (raw != null && (await gitBlobShaOrNull(raw)) === blobSha) return raw;
+  if (raw != null && r2Key != null) {
+    console.warn(`R2 last-publish render for ${book} ${resource} does not hash to pushed_blob_sha; trying Door43`);
+    const fromDcs = await readPushedRenderText(env, book, resource, null, blobSha);
+    if (fromDcs != null && (await gitBlobShaOrNull(fromDcs)) === blobSha) return fromDcs;
+  }
+  return null;
 }
 
 async function confirmedVerseBases(
@@ -6768,12 +6949,33 @@ async function applyVerseRows(
         // and the grouping is exactly unchanged. This preserves a maintainer's
         // intentional punctuation/spacing bytes without opening a generic
         // cosmetic-write lane that would churn checkoffs or race a translator.
-        const cosmeticHumanAdopt =
+        //
+        // Issue #1005: "no human app edit after the export boundary" is answered
+        // by the master_confirmed_at probe first, as before. Only when that probe
+        // found an edit AND everything else already holds is it asked again of
+        // our newer, not-yet-confirmed publish: if master demonstrably merged it
+        // and D1 still equals it at this verse, the edit the probe saw already
+        // shipped, and D1 holds nothing master lacks.
+        const cosmeticHumanCandidate =
           merge.action === "keep_converged" &&
           ex.content_json !== v.contentJson &&
           (ex.verse_end ?? null) === (v.verseEnd ?? null) &&
-          Number(ex.human_edit_after_export ?? 0) === 0 &&
           hasCompleteHumanRefEvidenceForVerse(cutoff?.lineage, v.chapter, v.verse, v.verseEnd);
+        const noEditSinceConfirmed = Number(ex.human_edit_after_export ?? 0) === 0;
+        const editAlreadyShipped =
+          cosmeticHumanCandidate &&
+          !noEditSinceConfirmed &&
+          d1MatchesShippedUnconfirmedPublish(book, bibleVersion, cutoff, ex, v);
+        if (editAlreadyShipped) {
+          console.log("reimport cosmetic_human: app edit after the lagging watermark was already shipped in our unconfirmed publish", {
+            book,
+            resource: bibleVersion,
+            ref: `${v.chapter}:${v.verse}`,
+            prNumber: cutoff?.unconfirmedPublish?.prNumber ?? null,
+            version: ex.version,
+          });
+        }
+        const cosmeticHumanAdopt = cosmeticHumanCandidate && (noEditSinceConfirmed || editAlreadyShipped);
         if (merge.action === "keep_converged" && ex.content_json !== v.contentJson && !cosmeticHumanAdopt) {
           counts.merge_cosmetic_ignored++;
         }
@@ -10034,14 +10236,20 @@ async function planAndStageBookResources(
       // exact confirmed render once now, then stage only its compact verse map
       // for all later chunk steps.
       const confirmed = await getMasterConfirmedAt(env, book, resource, true);
-      if (confirmed.confirmedVerseBases?.size) {
+      // #1005: our newer, not-yet-confirmed publish rides the same staged
+      // object (reviveUnconfirmedPublish on the chunk side). Mutually exclusive
+      // with the #790 bases in practice: those need the pushed render to BE
+      // the confirmed one, this needs it to be newer.
+      const unconfirmedPublish = await loadUnconfirmedPublishVerses(env, book, resource, lineage);
+      if (confirmed.confirmedVerseBases?.size || unconfirmedPublish) {
         confirmedBaseR2Key = `reimport-stage/${instanceId}/${book}/${resource}-confirmed-bases`;
         await env.BLOBS.put(
           confirmedBaseR2Key,
           JSON.stringify({
             confirmedAt: confirmed.confirmedAt,
             editId: confirmed.editId,
-            bases: Object.fromEntries(confirmed.confirmedVerseBases),
+            bases: Object.fromEntries(confirmed.confirmedVerseBases ?? new Map()),
+            ...(unconfirmedPublish ? { unconfirmedPublish: serializeUnconfirmedPublish(unconfirmedPublish) } : {}),
           }),
           { httpMetadata: { contentType: "application/json" } },
         );
@@ -10070,7 +10278,8 @@ function confirmedBasesForCutoff(
   stagedBase: { confirmedAt: number | null; editId: number | null; bases: Map<string, string> } | undefined,
   cutoff: { confirmedAt: number | null; editId: number | null },
 ): Map<string, string> | null {
-  return stagedBase && stagedBase.confirmedAt === cutoff.confirmedAt && stagedBase.editId === cutoff.editId
+  return stagedBase && stagedBase.bases.size > 0 &&
+      stagedBase.confirmedAt === cutoff.confirmedAt && stagedBase.editId === cutoff.editId
     ? stagedBase.bases
     : null;
 }
@@ -10105,13 +10314,17 @@ async function reimportStagedChunk(
     editId: number | null;
     bases: Map<string, string>;
   }>> = {};
+  // #1005: staged beside the #790 bases; gated per cutoff in withLineage below.
+  const unconfirmedPublishByResource: Partial<Record<"ult" | "ust", UnconfirmedPublishVerses>> = {};
   for (const resource of ["ult", "ust"] as const) {
     const key = staged.find((e) => e.resource === resource)?.confirmedBaseR2Key;
     if (!key) continue;
     const json = await readStaged(env, key);
     if (json == null) continue;
     try {
-      const parsed = JSON.parse(json) as { confirmedAt?: unknown; editId?: unknown; bases?: unknown };
+      const parsed = JSON.parse(json) as { confirmedAt?: unknown; editId?: unknown; bases?: unknown; unconfirmedPublish?: unknown };
+      const unconfirmed = reviveUnconfirmedPublish(parsed.unconfirmedPublish);
+      if (unconfirmed) unconfirmedPublishByResource[resource] = unconfirmed;
       if ((typeof parsed.confirmedAt !== "number" && parsed.confirmedAt !== null) ||
           (typeof parsed.editId !== "number" && parsed.editId !== null) ||
           parsed.bases == null || typeof parsed.bases !== "object" || Array.isArray(parsed.bases)) continue;
@@ -10187,6 +10400,10 @@ async function reimportStagedChunk(
           lineage: lineageOf(resource),
           confirmedVerseBases: resource === "ult" || resource === "ust"
             ? confirmedBasesForCutoff(confirmedBasesByResource[resource], cutoff)
+            : undefined,
+          // d1MatchesShippedUnconfirmedPublish re-checks the boundary match.
+          unconfirmedPublish: resource === "ult" || resource === "ust"
+            ? unconfirmedPublishByResource[resource] ?? null
             : undefined,
         };
 
