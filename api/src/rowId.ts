@@ -43,17 +43,19 @@ export function newRowId(): string {
 // the note on `mix`), so two malformed ids in one book could coerce to the same
 // id and the second row was silently skipped by ON CONFLICT DO NOTHING.
 //
-// Changing the mapping was safe because nothing was coerced when it changed.
-// The mapping only matters while Door43 master still carries the raw
-// malformed id (once master holds a valid id, coerceRowId is a no-op for it),
-// so the count that matters is master's. Measured 2026-09-28:
-// all 198 master TSVs the reimport reads (unfoldingWord/en_tn, en_tq, en_twl,
-// `{tn,tq,twl}_{BOOK}.tsv` for all 66 books, ID column) held 235,244 rows and
-// 0 ids failing ROW_ID_RE; prod D1 held 0 grammar-violating ids across
-// tn_rows/tq_rows/twl_rows (186,801 rows, live and tombstoned). So no
-// previously coerced id existed to keep stable, and no legacy lookup is needed.
-// If master ever carries a malformed id again, that id gets the new mapping on
-// its first reimport and keeps it every night after.
+// Changing the mapping was safe because no raw malformed id was left for it to
+// remap. The mapping only matters while an input still carries the raw
+// malformed id; once a coerced row is exported, master holds the valid id and
+// coerceRowId is a no-op for it. The two inputs are Door43 master (the
+// reimport) and stored AI proposals (pipelineImport's TQ seed id, which a
+// re-apply re-coerces). Measured 2026-09-28: all 198 master TSVs the reimport
+// reads (unfoldingWord/en_tn, en_tq, en_twl, `{tn,tq,twl}_{BOOK}.tsv` for all
+// 66 books, ID column) held 235,244 rows and 0 ids failing ROW_ID_RE; prod
+// pending_imports held 1,187 proposals (tn + tq) and 0 with a malformed
+// payload id. (A scan of D1's own ids cannot show past coercions, since a
+// coerced id is valid by construction.) So no legacy lookup is needed. A
+// malformed id that appears later gets the new mapping on first sight and
+// keeps it every night after.
 export function coerceRowId(id: string): string {
   if (isValidRowId(id)) return id;
   let h = 2166136261 >>> 0;
