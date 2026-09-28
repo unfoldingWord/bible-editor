@@ -1479,6 +1479,39 @@ console.log("\n[#1005: an app edit after a lagging watermark that our newer publ
   );
 }
 
+console.log("\n[#1005: the pushed render's verse is byte-different from D1 but renders identically (the usual production shape)]");
+{
+  // In production the shipped verse comes from extractVersesForRange over the
+  // whole pushed file, so its JSON is rarely byte-equal to D1's stored
+  // content_json. Same nodes, keys reordered: different bytes, same render.
+  const reorder = (node) =>
+    Array.isArray(node)
+      ? node.map(reorder)
+      : node && typeof node === "object"
+        ? Object.fromEntries(Object.entries(node).reverse().map(([k, v]) => [k, reorder(v)]))
+        : node;
+  const shippedReordered = JSON.stringify(reorder(JSON.parse(COSMETIC_OURS)));
+  if (shippedReordered === COSMETIC_OURS) throw new Error("fixture must differ in bytes");
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite);
+  seedEditAfterConfirmedBoundary(sqlite, 12, 3);
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 3, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    {
+      confirmedAt: 200,
+      editId: boundary,
+      lineage: lineageWithOurPublish(["12:3"]),
+      unconfirmedPublish: unconfirmedPublishOf(boundary, { "12:3": shippedReordered }),
+    },
+    false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 3`).get(BOOK);
+  eq([row.content_json, row.version], [COSMETIC_MASTER, 5], "render-equal to the pushed render is enough to adopt the human's master bytes");
+  eq([counts.merge_cosmetic_adopted, counts.merge_cosmetic_ignored], [1, 0], "counted as a cosmetic adoption through the render comparison");
+}
+
 console.log("\n[#1005: a genuinely unpublished app edit (or unproven publish) still blocks cosmetic_human]");
 for (const [label, lineage, unconfirmedPublish] of [
   // D1 moved past what we last pushed: the edit never reached master.
