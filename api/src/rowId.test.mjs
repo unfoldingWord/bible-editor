@@ -53,6 +53,42 @@ assert(coerceRowId("1abc") === "w6w6", `coerce("1abc") is stable === w6w6 (got $
   }
 }
 
+// --- coerceRowId: still a no-op for every well-formed id (sampled) ---
+{
+  let offender = "";
+  for (let i = 0; i < 20_000; i++) {
+    const id = newRowId();
+    if (coerceRowId(id) !== id) { offender = id; break; }
+  }
+  assert(!offender, `coerceRowId is a no-op across 20000 sampled valid ids${offender ? ` (offender: ${offender})` : ""}`);
+}
+
+// --- coerceRowId: output always satisfies ROW_ID_RE ---
+{
+  let offender = "";
+  for (let i = 0; i < 200_000 && !offender; i++) {
+    const bad = `${i}x`;
+    if (!ROW_ID_RE.test(coerceRowId(bad))) offender = bad;
+  }
+  assert(!offender, `coerceRowId output matches ROW_ID_RE across 200000 malformed inputs${offender ? ` (offender: ${offender})` : ""}`);
+}
+
+// --- coerceRowId: entropy regression guard (issue #428) ---
+// Same construction bug and same bar as the deriveAltRowId guard below: drawing
+// characters from the raw FNV state reached only 96 distinct outputs, so two
+// malformed ids in one book could coerce to the same id and the second row was
+// silently skipped (ON CONFLICT DO NOTHING). Every input here is malformed
+// (digit-first), so none short-circuits through the valid-id no-op.
+{
+  const seen = new Set();
+  for (let i = 0; i < 200_000; i++) seen.add(coerceRowId(`${i}bad`));
+  assert(
+    seen.size >= 150_000,
+    `coerceRowId spreads across at least 150000 distinct ids out of 200000 malformed draws (got ${seen.size}) — ` +
+      `the old construction reached only 96, so two malformed ids in one book could collide and one row was skipped`,
+  );
+}
+
 // --- newRowId always satisfies the grammar (sampled) ---
 {
   let allValid = true;
