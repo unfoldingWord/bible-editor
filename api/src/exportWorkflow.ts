@@ -103,6 +103,7 @@ import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
 import { hardRejectRows } from "./hardRejectGuard";
+import { reconcileTnExportInvalidAlert } from "./tnExportLint";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
@@ -1234,6 +1235,31 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           prNumber: null,
           prReason: null,
         };
+      }
+    }
+
+    // Non-blocking TN hard-error lint (issue #1015). Door43's validate_tn_files.py
+    // counts check 13 (unpaired `[`/`]` in a Note) as a hard error, so the -be-
+    // PR never merges and every later edit to this book's notes stays off
+    // master — measured on JER 17:4 `ny7v`. Door43 already blocks it, so this
+    // does NOT hold the export; it raises `export_tn_invalid:<BOOK>:tn` naming
+    // the rows, and clears it on the next export whose render is clean. After
+    // the hard-reject HOLD above so it only speaks for a render that ships.
+    // Best-effort: an alert failure must never fail the step.
+    if (dcsAllowed && resource === "tn") {
+      try {
+        await reconcileTnExportInvalidAlert(book, built.content, {
+          write: (source, message) => this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`),
+          clear: async (source) => {
+            await this.env.DB.prepare(
+              `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+            )
+              .bind(EXPORT_ALERT_USERNAME, source)
+              .run();
+          },
+        });
+      } catch (err) {
+        console.error(`export_tn_invalid alert failed for ${book}:`, err);
       }
     }
 

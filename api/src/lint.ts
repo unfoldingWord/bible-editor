@@ -102,7 +102,7 @@ const ALT_LABEL_RE = /Alternat(?:e|ive)( *)([Tt])ranslation/g;
 
 // Port of validate_tn_files.py validate_paired_square_brackets. Returns the
 // human-readable problems with `[ ]` nesting in a note.
-function bracketProblems(note: string): string[] {
+export function bracketProblems(note: string): string[] {
   const out: string[] = [];
   const stack: Array<{ len: number; pos: number }> = [];
   let i = 0;
