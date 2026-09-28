@@ -4,8 +4,8 @@
 // still navigates (the caller owns that); this only wraps it in a tooltip.
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
-import type { Instance } from "@popperjs/core";
 import { Box, CircularProgress, Tooltip, Typography } from "@mui/material";
+import type { PopperProps } from "@mui/material";
 import { api } from "../sync/api";
 import type { ChapterPayload } from "../sync/api";
 import { onOutboxResult } from "../sync/outbox";
@@ -91,17 +91,37 @@ function besideCard(el: Element) {
   };
 }
 
+// The Popper.js instance, via MUI's types (@popperjs/core isn't a declared dep).
+type PopperInstance = PopperProps["popperRef"] extends React.Ref<infer T> | undefined ? T : never;
+
+// MUI's tooltip margin (24px under touch, 14px otherwise) plus preventOverflow's
+// edge padding; the larger one, so a side judged to fit always does.
+const GAP = 24 + 8;
+
+type Layout = {
+  placement: "left" | "right" | "top-start" | "bottom-start";
+  anchor: Element | ReturnType<typeof besideCard>;
+  maxHeight: number;
+};
+
 // Picked once per open instead of by Popper's flip: flipping resizes the popper
 // (MUI's tooltip margin follows the placement), and at widths where no side
 // fits that fed back into the next flip and looped until React gave up.
-// Beside the card when a side has room for the whole preview, else above or
-// below, whichever has more space; preventOverflow then keeps it on screen.
-function choosePlacement(el: Element): "left" | "right" | "top" | "bottom" {
+// Beside the card when a side has room for the whole preview. Otherwise above
+// or below the link itself, whichever has more room, capped to that room so
+// preventOverflow doesn't push it back over the link and swallow its click.
+function chooseLayout(el: Element): Layout {
   const card = (el.closest("[data-note-id]") ?? el).getBoundingClientRect();
-  const need = Math.min(PREVIEW_WIDTH, window.innerWidth - 32) + 14 + 8; // + MUI's gap + edge padding
-  if (card.left >= need) return "left";
-  if (window.innerWidth - card.right >= need) return "right";
-  return card.top > window.innerHeight - card.bottom ? "top" : "bottom";
+  const link = el.getBoundingClientRect();
+  const fullHeight = Math.min(420, window.innerHeight - 16);
+  const need = Math.min(PREVIEW_WIDTH, window.innerWidth - 32) + GAP;
+  if (card.left >= need) return { placement: "left", anchor: besideCard(el), maxHeight: fullHeight };
+  if (window.innerWidth - card.right >= need) return { placement: "right", anchor: besideCard(el), maxHeight: fullHeight };
+  const above = link.top - GAP;
+  const below = window.innerHeight - link.bottom - GAP;
+  // Below a usable height, overlapping the link beats an unreadable sliver.
+  const maxHeight = Math.min(fullHeight, Math.max(above, below, 200));
+  return { placement: above > below ? "top-start" : "bottom-start", anchor: el, maxHeight };
 }
 
 // Module-level so the Tooltip's memoized popperOptions stay stable.
@@ -115,7 +135,7 @@ const POPPER_OPTIONS = {
 // Popper positions once, often against the short "Loading…" state; when the
 // chapter arrives the preview grows and would run off the bottom of the screen
 // until the next hover. Re-run placement whenever the content changes size.
-function RepositionOnResize({ popper, children }: { popper: React.RefObject<Instance | null>; children: ReactNode }) {
+function RepositionOnResize({ popper, children }: { popper: React.RefObject<PopperInstance | null>; children: ReactNode }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = ref.current;
@@ -234,26 +254,65 @@ export function NoteLinkPreview({
   supportRef: string | null;
   children: ReactElement;
 }) {
-  const [anchor, setAnchor] = useState<ReturnType<typeof besideCard> | null>(null);
+  const [layout, setLayout] = useState<Layout | null>(null);
+  const [open, setOpen] = useState(false);
   // Replaces the Tooltip's own popperRef, which it only uses for followCursor.
-  const popperRef = useRef<Instance>(null);
-  const [placement, setPlacement] = useState<ReturnType<typeof choosePlacement>>("left");
+  const popperRef = useRef<PopperInstance>(null);
+  const linkRef = useRef<Element | null>(null);
+  const pointer = useRef<{ x: number; y: number } | null>(null);
+  const closing = useRef(false);
+
+  // Beside the card, the preview can sit a card's width from the link, too far
+  // to cross before MUI's leave delay closes it. So a mouse leave only closes
+  // it once the pointer is outside the box spanning the link and the preview.
+  const inCorridor = () => {
+    const p = pointer.current;
+    const link = linkRef.current;
+    const popper = popperRef.current?.state.elements.popper;
+    if (!p || !link || !popper) return false;
+    const a = link.getBoundingClientRect();
+    const b = popper.getBoundingClientRect();
+    return (
+      p.x >= Math.min(a.left, b.left) - 4 &&
+      p.x <= Math.max(a.right, b.right) + 4 &&
+      p.y >= Math.min(a.top, b.top) - 4 &&
+      p.y <= Math.max(a.bottom, b.bottom) + 4
+    );
+  };
+  useEffect(() => {
+    if (!open) return;
+    const onMove = (e: PointerEvent) => {
+      pointer.current = { x: e.clientX, y: e.clientY };
+      if (closing.current && !inCorridor()) {
+        closing.current = false;
+        setOpen(false);
+      }
+    };
+    document.addEventListener("pointermove", onMove);
+    return () => document.removeEventListener("pointermove", onMove);
+  }, [open]);
+
   return (
     <Tooltip
+      open={open}
       enterDelay={350}
       enterNextDelay={350}
-      // Longer than MUI's default: beside the card, the preview can sit a
-      // card's width away from the link, and the pointer has to cross that
-      // gap to reach it.
-      leaveDelay={300}
-      placement={placement}
+      leaveDelay={150}
+      placement={layout?.placement ?? "left"}
       onOpen={(e) => {
         // MUI calls onOpen from the enterDelay timer, after React has cleared
         // currentTarget; target (the link or something inside it) survives.
-        const el = e.target as Element | null;
-        if (!el) return;
-        setAnchor(besideCard(el));
-        setPlacement(choosePlacement(el));
+        const el = e.target;
+        if (!(el instanceof Element)) return;
+        linkRef.current = el;
+        closing.current = false;
+        setLayout(chooseLayout(el));
+        setOpen(true);
+      }}
+      onClose={(e) => {
+        // Escape, blur and touch close at once; only a mouse leave waits.
+        closing.current = e.type === "mouseleave" && inCorridor();
+        if (!closing.current) setOpen(false);
       }}
       // MUI only mounts `title` while open, so the chapter fetch happens on
       // hover, never for links nobody points at.
@@ -270,7 +329,7 @@ export function NoteLinkPreview({
         popper: {
           // Only once opened: an explicit undefined would override the
           // Tooltip's own anchor (the link) rather than fall back to it.
-          ...(anchor ? { anchorEl: anchor } : null),
+          ...(layout ? { anchorEl: layout.anchor } : null),
           popperOptions: POPPER_OPTIONS,
           popperRef,
           onMouseDown: (e: React.MouseEvent) => e.stopPropagation(),
@@ -288,9 +347,9 @@ export function NoteLinkPreview({
             // the viewport edge instead of being shifted back inside it.
             width: PREVIEW_WIDTH,
             maxWidth: "calc(100vw - 32px)",
-            // Never taller than the viewport, so preventOverflow can always
-            // fit all of it on screen.
-            maxHeight: "min(420px, calc(100vh - 16px))",
+            // Never taller than the room chooseLayout found, so
+            // preventOverflow can always fit all of it on screen.
+            maxHeight: layout?.maxHeight ?? 420,
             overflowY: "auto",
             p: 1.5,
           },
