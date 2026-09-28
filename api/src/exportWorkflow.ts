@@ -1218,12 +1218,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     //
     // Unpaired `[ ]` in a tn Note (check 13) is the translator-fixable hard
     // error this gate holds for (issue #1015, JER 17:4 ny7v). The banner names
-    // the row, and a clean export clears it.
-    if (dcsAllowed && (resource === "tn" || resource === "twl")) {
+    // the row, and a clean render clears it — on a dry run too, since the
+    // clear only reads the bytes (the HOLD itself needs dcsAllowed).
+    if (resource === "tn" || resource === "twl") {
       const rejects = hardRejectRows(resource, built.content);
       if (rejects.length === 0) {
         // The rows were fixed (or deleted): clear the HELD banner so it does not
         // keep naming a row that is already fine. Best-effort, like writeAlert.
+        // Bound: an export that returns before this gate (stale_master,
+        // shrink_guard, no_rows) leaves the banner until a run reaches here.
         try {
           await this.env.DB.prepare(
             `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
@@ -1233,7 +1236,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         } catch (err) {
           console.error(`export_hard_reject banner clear failed for ${book} ${resource}:`, err);
         }
-      } else {
+      } else if (dcsAllowed) {
         await this.recordHardRejectAlert(book, resource, rejects);
         const reason = `hard_reject_guard:${rejects.length}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);

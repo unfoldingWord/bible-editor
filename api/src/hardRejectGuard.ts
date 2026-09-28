@@ -177,8 +177,11 @@ export function buildHardRejectAlertMessage(
     .map((r) => `${r.ref} (${r.rowId}): ${r.reason}`)
     .join("; ");
   const more = rejects.length > 6 ? `; +${rejects.length - 6} more` : "";
+  // One row can carry several problems (two unclosed brackets, or a bracket and
+  // an Occurrence), so count rows by ID rather than reporting the problem count.
+  const rowCount = new Set(rejects.map((r) => r.rowId)).size;
   return (
-    `Benjamin — nightly export HELD ${label}: ${rejects.length} row(s) would fail DCS ` +
+    `Benjamin — nightly export HELD ${label}: ${rowCount} row(s) would fail DCS ` +
     `validation as a hard error, so the -be- PR's check would go red and the merge bot would never merge it. ` +
     `${shown}${more}. Fix those rows (or delete them) in the editor; the next export picks them up, and every other ` +
     `edit in ${label} is waiting on it. Blank notes/questions/OrigWords/TWLink do NOT ` +

@@ -157,4 +157,10 @@ t("caps the sample at 6 rows and counts the rest", () => {
   assert.doesNotMatch(msg, /r006/);
 });
 
+t("two problems in one Note count as one row", () => {
+  const rejects = hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "stray] and [open"]));
+  assert.equal(rejects.length, 2);
+  assert.match(buildHardRejectAlertMessage("JER", "tn", rejects), /HELD JER TN: 1 row\(s\)/);
+});
+
 console.log(`\n${passed} hardRejectGuard tests passed`);
