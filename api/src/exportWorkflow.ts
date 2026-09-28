@@ -102,7 +102,7 @@ import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline
 import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
-import { hardRejectRows } from "./hardRejectGuard";
+import { buildHardRejectAlertMessage, hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
@@ -1215,9 +1215,28 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // paragraphs above: blank OrigWords/TWLink are severity="warning", they merge
     // fine, and lint.ts plus the save-path guards are where a blank row gets
     // caught. Prod carries 0 blank-OrigWords rows today.
-    if (dcsAllowed && (resource === "tn" || resource === "twl")) {
+    //
+    // Unpaired `[ ]` in a tn Note (check 13) is the translator-fixable hard
+    // error this gate holds for (issue #1015, JER 17:4 ny7v). The banner names
+    // the row, and a clean render clears it — on a dry run too, since the
+    // clear only reads the bytes (the HOLD itself needs dcsAllowed).
+    if (resource === "tn" || resource === "twl") {
       const rejects = hardRejectRows(resource, built.content);
-      if (rejects.length > 0) {
+      if (rejects.length === 0) {
+        // The rows were fixed (or deleted): clear the HELD banner so it does not
+        // keep naming a row that is already fine. Best-effort, like writeAlert.
+        // Bound: an export that returns before this gate (stale_master,
+        // shrink_guard, no_rows) leaves the banner until a run reaches here.
+        try {
+          await this.env.DB.prepare(
+            `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+          )
+            .bind(EXPORT_ALERT_USERNAME, `export_hard_reject:${book}:${resource}`)
+            .run();
+        } catch (err) {
+          console.error(`export_hard_reject banner clear failed for ${book} ${resource}:`, err);
+        }
+      } else if (dcsAllowed) {
         await this.recordHardRejectAlert(book, resource, rejects);
         const reason = `hard_reject_guard:${rejects.length}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
@@ -3172,17 +3191,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     rejects: Array<{ ref: string; rowId: string; reason: string }>,
   ): Promise<void> {
     const source = `export_hard_reject:${book}:${resource}`;
-    const shown = rejects
-      .slice(0, 6)
-      .map((r) => `${r.ref} (${r.rowId}): ${r.reason}`)
-      .join("; ");
-    const more = rejects.length > 6 ? `; +${rejects.length - 6} more` : "";
-    const message =
-      `Benjamin — nightly export HELD ${book} ${resource.toUpperCase()}: ${rejects.length} row(s) would fail DCS ` +
-      `validation as a hard error, so the -be- PR's check would go red and the merge bot would never merge it. ` +
-      `${shown}${more}. Fix the Occurrence on those rows (or delete them) in the editor and re-export; every other ` +
-      `edit in ${book} ${resource.toUpperCase()} is waiting on it. Blank notes/questions/OrigWords/TWLink do NOT ` +
-      `cause this — those are validator warnings and ship normally.`;
+    const message = buildHardRejectAlertMessage(book, resource, rejects);
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
