@@ -349,7 +349,7 @@ console.log("\n[a COERCED id must never count as blocked — review finding F4]"
 {
   const { sqlite, env } = freshEnv();
   seedTombstone(sqlite, { ref: "5:4", chapter: 5, verse: 4 });
-  // coerceRowId hashes a malformed master id into a 96-id space, so landing on
+  // coerceRowId hashes a malformed master id into a new one, so landing on
   // an unrelated tombstone at a different reference is an expected collision,
   // not evidence master reissued anything. Counting it would freeze the export.
   const counts = await applyTsvRows(env, BOOK, "tq", [masterRow({ ref: "23:7", idCoerced: true })], null);

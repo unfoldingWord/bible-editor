@@ -1050,7 +1050,18 @@ const VerseCell = memo(function VerseCell({
       setHasDraft(false);
       return;
     }
-    return drafts.subscribeKey(draftKey, (rec) => {
+    return drafts.subscribeKey(draftKey, (rec, remote) => {
+      // #806: another tab's typing on this verse must not reach a mounted
+      // cell that has no local edits — no hydrate, no dirty flag. The cell
+      // shows the draft only when it next mounts (reopen / reload). A
+      // notification that lands before the mount callback's first read
+      // settles is shown at mount, the same as a reload a moment later.
+      // setHasDraft(false) resyncs a cell whose own clear (undo) lost the
+      // race to that notification, so it does not stay marked dirty.
+      if (remote && !dirtyRef.current) {
+        setHasDraft(false);
+        return;
+      }
       setHasDraft(!!rec);
       // Snapshot BEFORE the mirror below overwrites it: true means the user has
       // already typed into this cell, so any draft record arriving now is the

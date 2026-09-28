@@ -1685,8 +1685,8 @@ interface ParsedTsvRow {
   id: string;
   // True when `id` is NOT master's literal ID — parseTsvRow rewrote a malformed
   // one through coerceRowId (rowId.ts). Issue #427: this must suppress the
-  // tombstone/conflict *blocked* counters. coerceRowId hashes into a 96-ID
-  // space, so two different malformed master IDs can legitimately land on the
+  // tombstone/conflict *blocked* counters. coerceRowId is a hash, so two
+  // different malformed master IDs can (rarely, since #428) land on the
   // same coerced value, and a coerced ID can land on an unrelated tombstone.
   // Neither is "master reissued this ID to a different row" — the coerced ID was
   // never the row's identity in the first place, so the reissue inference is
@@ -2001,7 +2001,7 @@ export async function applyTsvRows(
           });
         } else if (row.idCoerced) {
           // The (book, id) slot is taken, but this id is OURS — coerceRowId
-          // rewrote a malformed master id into a 96-id space, so a collision
+          // hashed a malformed master id into a new one, so a collision
           // here says nothing about master reissuing anything. Documented-benign
           // no-op (see ParsedTsvRow.idCoerced); count it as a duplicate, never as
           // a blocked drop, or a coercion collision would freeze the export.
@@ -2052,8 +2052,8 @@ export async function applyTsvRows(
         // different row, and master is authoritative for a row it still carries
         // — so RECLAIM the slot (batched below) instead of dropping it.
         // `!row.idCoerced` first: for a coerced id the "master reissued this id
-        // to a different row" inference is meaningless — the id is ours, hashed
-        // into a 96-id space, so landing on an unrelated tombstone at a
+        // to a different row" inference is meaningless — the id is ours, derived
+        // from a hash, so landing on an unrelated tombstone at a
         // different reference is an expected collision, not evidence master
         // moved anything. Reclaiming (or counting it blocked) would either
         // corrupt an unrelated row or freeze the export over a documented-benign
