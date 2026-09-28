@@ -24,6 +24,12 @@
 
 ## Escalated / blocked on a human (not a code change Claude can land alone)
 
+- **edit_log sweep index must reach prod before 2026-11-14 (issue #928)** — migration 0073 adds
+  `edit_log_kind_action_created`, and `EDIT_LOG_SWEEP_SQL` names it with `INDEXED BY`, so the sweep errors
+  ("no such index", caught and retried hourly) until the migration is applied. `npm run deploy` migrates first.
+  After deploy, re-run the issue's read-only `SELECT COUNT(*)` rehearsal at the 2026-12-01 cutoff and confirm
+  `sql_duration_ms` is well under 1 s.
+
 - **9 qere-pointing alignment milestones in locked books (issue #956)** — HAB 3:14 ULT+UST (×2 each), OBA 1:11
   ULT, PSA 39:0 + 77:0 ULT+UST. Each `\zaln-s x-content` holds the qere, which since hbo_uhb `aad8ce31` sits only
   in a UHB footnote, so the English word never highlights. `repair-canonize-alignment.mjs --qere-ketiv` computes
@@ -104,6 +110,13 @@ Highlights that bite repeatedly:
   instead, and prove new SQL with `wrangler d1 execute … --command "EXPLAIN …"`, which is read-only even on prod.
   Also: an ad-hoc diagnostic query that re-runs a heavy query as a subquery can hit D1's CPU limit and reset the
   prod DB (`code 7429`); keep prod diagnostics narrow.
+
+- **Adding an index is not enough when an older index already orders a GROUP BY.** For the edit_log sweep,
+  SQLite (node:sqlite and local workerd D1 alike, with or without `ANALYZE`) kept reading through
+  `edit_log_row (kind, row_key)` after a `(kind, action, created_at)` index was added, because the old index
+  hands `GROUP BY row_key` its order for free; the sweep stayed at 21 s on a 1.5M-row synthetic table until
+  `INDEXED BY` forced the new index (3.9 s, #928). Check `EXPLAIN QUERY PLAN` after adding an index, and pin
+  the plan in a test (`editLogSweepPlan.test.mjs`). `INDEXED BY` makes the migration a hard prerequisite of the code.
 
 - **A verse cell's "hydrate from a saved draft" branch must never run for a draft the user is creating right
   now.** All three verse views (`ScriptureColumn` `ActiveLine`, `BookView` `VerseCell`, `DocColumn`) subscribe to
