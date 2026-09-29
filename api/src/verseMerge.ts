@@ -114,6 +114,19 @@ export interface VerseMergeInput {
    * unparseable `theirs` (fail closed, keep_alignment_refused).
    */
   theirsForAlignment?: string;
+  /**
+   * The book is locked (book_locks or the published default, bookLock.ts's
+   * effectiveBookLock). A lock freezes the app side: nobody can edit the book
+   * here and the export does not run, so Door43 master is the only place the
+   * book can move and it is authoritative for any verse master changed since
+   * the ancestor (Benjamin, 2026-09-24: "the lock is to prevent problems from
+   * the BE side"). Without this, the ancestor can
+   * never advance while locked, because only an export re-confirms master, and
+   * every Door43 commit then read as "both changed" against the last pre-lock
+   * app edit and re-alerted that editor nightly (ZEC 1:17 ULT, Rich,
+   * 2026-09-18 through 2026-09-24). OMITTED means unlocked.
+   */
+  masterAuthoritative?: boolean;
 }
 
 export interface VerseMergeResult {
@@ -438,6 +451,36 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   // 3. Master never moved since the ancestor — the difference is ours.
   if (keysEqual(baseKey, theirsKey)) {
     return { action: "keep_master_unchanged", adopt: false, conflict: false, reason: "master_unchanged" };
+  }
+
+  // 3b. Locked book, and master DID move this verse since the ancestor: master
+  // is authoritative. Asked after step 3 on purpose: a verse master never
+  // touched keeps D1, because an unlock -> fix -> re-lock -> lock/push to a
+  // review branch (bookImport.ts) leaves the fix in D1 before master has it,
+  // and a Door43 commit elsewhere in the book must not revert it. Asked before
+  // the alignment guard and the AI-lineage check, because keeping D1 on a
+  // locked book only hands the pre-lock text back to master on the first
+  // export after unlock.
+  //   - D1 unmoved since the ancestor and no human edit since the export:
+  //     nobody's app work is replaced, so a clean `adopt` (audit row, no alert).
+  //   - D1 holds an app edit master may not have: master still wins, but as
+  //     `adopt_conflict`, so applyVerseRows's visible-change refinement alerts
+  //     the editor on a real wording/punctuation/alignment loss and downgrades
+  //     a markers-only difference to adopt_no_visible_change (no alert).
+  //     Benjamin, 2026-09-24: a markers-only overwrite is worth seeing, not
+  //     alerting; a data-loss overwrite is worth alerting.
+  // No ancestor (step 2), unparseable master content, and the anchor of a
+  // bridge master split (theirsForAlignment set: its whole-range alignment
+  // check belongs to the structure path, issue #949) keep today's handling.
+  if (input.masterAuthoritative === true && theirsKey !== null && input.theirsForAlignment === undefined) {
+    // "D1 is the sync's own copy of master" is deliberately NOT a clean-adopt
+    // signal: the source-attr reconcile also writes `dcs_reimport` / sync_merge
+    // rows over a human's wording, so no stored field separates the two, and
+    // the refinement already keeps a markers-only difference silent.
+    if (keysEqual(oursKey, baseKey) && !humanEditedSinceExport) {
+      return { action: "adopt", adopt: true, conflict: false, reason: "book_locked" };
+    }
+    return { action: "adopt_conflict", adopt: true, conflict: true, reason: "both_changed" };
   }
 
   // 4. Alignment guard: refuse to adopt master's content if doing so would
