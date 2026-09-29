@@ -2344,14 +2344,19 @@ function utf8Base64(s) {
   const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
   const tnRow = (ref, id, tags, quote, note) => `${ref}\t${id}\t${tags}\t\t${quote}\t1\t${note}`;
 
-  // Only Tags differs → "tags_only".
-  const masterTags = `${TN_HEADER}\n${tnRow("1:1", "ab01", "", "word", "a note")}\n`;
-  const renderedTags = `${TN_HEADER}\n${tnRow("1:1", "ab01", "keyword", "word", "a note")}\n`;
+  // #1029: tn/tq Tags are blanked on export by design, so a Tags-only
+  // difference is never reported. twl keeps Tags and still classifies.
+  const masterTags = `${TN_HEADER}\n${tnRow("1:1", "ab01", "ISSUE:MATCH_FAIL", "word", "a note")}\n`;
+  const renderedTags = `${TN_HEADER}\n${tnRow("1:1", "ab01", "", "word", "a note")}\n`;
   const rTags = tsvRevertReport(renderedTags, masterTags, "tn");
-  assert(
-    rTags.entries.length === 1 && rTags.entries[0].class === "tags_only",
-    `only the Tags column differing classifies as "tags_only"`,
+  assert(rTags.entries.length === 0, `tn: Tags-only difference is not reported`);
+  const TWL_HEADER = "Reference\tID\tTags\tOrigWords\tOccurrence\tTWLink";
+  const rTwlTags = tsvRevertReport(
+    `${TWL_HEADER}\n1:1\tab01\t\tw\t1\trc://*/tw/dict/bible/kt/god\n`,
+    `${TWL_HEADER}\n1:1\tab01\tkeep\tw\t1\trc://*/tw/dict/bible/kt/god\n`,
+    "twl",
   );
+  assert(rTwlTags.entries.length === 1 && rTwlTags.entries[0].class === "tags_only", `twl keeps tags_only`);
   assert(rTags.totalRows === 1, `totalRows counts master's rows`);
 
   // Only a double-space-vs-single-space difference in a text field → "whitespace_only".
@@ -2662,6 +2667,78 @@ function utf8Base64(s) {
     tMoved.entries.length === 1 && tMoved.entries[0].ref === "1:9",
     `tsv: master changing only Reference counts as moved -> reported; got ${JSON.stringify(tMoved.entries)}`,
   );
+}
+
+// --- #1029: false-alarm fixes ---
+{
+  const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
+  const row = (id, note) => `1:1\t${id}\t\t\tword\t1\t${note}`;
+  const tsv = (rows) => `${TN_HEADER}\n${rows.join("\n")}\n`;
+
+  // (a) master = render N-2, base = N-1 (unmerged), render = N.
+  const n2 = tsv([row("ab01", "v2")]);
+  const n = tsv([row("ab01", "v4")]);
+  const n2Sha = "sha-n2";
+  assert(
+    shouldComputeRevertEntries(true, n2, n2Sha, "sha-n1", ["sha-n2", "sha-n1"]) === false,
+    `(a) master holds an older unmerged-PR render of ours -> suppressed`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, n2, "sha-foreign", "sha-n1", ["sha-n2", "sha-n1"]) === true,
+    `(c) master bytes not in our render history -> still computed`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, n2, n2Sha, "sha-n1", null) === true,
+    `no history -> fails open`,
+  );
+  const foreign = tsv([row("ab01", "hand edit on master")]);
+  assert(
+    tsvRevertReport(n, foreign, "tn", tsv([row("ab01", "v3")])).entries.length === 1,
+    `(c) a real foreign edit still reports substantive`,
+  );
+
+  // (b) row created on master + D1 by ai_pipeline, then edited in the app.
+  const botMaster = tsv([row("ab01", "bot note")]);
+  const appEdited = tsv([row("ab01", "translator edit")]);
+  const payload = { ref_raw: "1:1", support_reference: "", quote: "word", occurrence: 1, note: "bot note" };
+  assert(
+    tsvRevertReport(appEdited, botMaster, "tn", null, new Map([["ab01", [payload]]])).entries.length === 0,
+    `(b) master cells equal an ai_pipeline payload -> 0 entries`,
+  );
+  assert(
+    tsvRevertReport(appEdited, botMaster, "tn", null, new Map([["ab01", [{ ...payload, note: "other" }]]])).entries.length === 1,
+    `(c) master differs from every bot payload (foreign edit) -> substantive`,
+  );
+  assert(
+    tsvRevertReport(appEdited, botMaster, "tn", null, new Map([["ab01", [{ note: "bot note" }]]])).entries.length === 1,
+    `partial payload never matches -> fails open`,
+  );
+}
+
+// --- RECORD_PUSHED_RENDER_SQL tracks renders since master was last confirmed (#1029) ---
+{
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const db = new DatabaseSync(":memory:");
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) db.exec(readFileSync(join(dir, f), "utf8"));
+  db.prepare(
+    `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin)
+     VALUES ('JER', 'tn', 'x', 0, 'export')`,
+  ).run();
+  const record = (sha, readAt, confirm) =>
+    db.prepare(RECORD_PUSHED_RENDER_SQL).run("JER", "tn", sha, readAt, confirm, 1, `k/${sha}`);
+  const list = () =>
+    JSON.parse(db.prepare(`SELECT unconfirmed_renders_json j FROM book_resource_syncs WHERE book='JER'`).get().j);
+  record("A", 100, 1);
+  assert(JSON.stringify(list()) === '["A"]', `confirmed render resets the list to itself`);
+  record("B", 200, 0);
+  record("C", 300, 0);
+  assert(list().sort().join() === "A,B,C", `unmerged renders accumulate; got ${list()}`);
+  record("D", 400, 1);
+  assert(JSON.stringify(list()) === '["D"]', `a confirmed render resets again`);
 }
 
 // --- isMasterConfirmed: the ONLY commitToDcs outcome that proves master

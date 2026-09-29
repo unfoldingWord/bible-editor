@@ -235,13 +235,16 @@ function tsvLine(cells: unknown[]): string {
 // Tags column filter for tn/tq — measured on DCS master 2026-08-10:
 // ISSUE:MATCH_FAIL (1,568), at-fit (214), both together (14), keep (1), and
 // one garbage "I" (1) — 1,797 rows across ISA, NUM, ECC, DAN, ZEC, HOS, MIC.
-// These are stale AI-pipeline diagnostics; no code writes them anymore (grep
-// across api/src, web/src, scripts, migrations turns up zero hits outside a
-// test fixture) and no editor surface displays them. The DCS maintainer
+// These are stale AI-pipeline diagnostics and no editor surface displays them.
+// (bp-assistant still writes e.g. ISSUE:MATCH_FAIL into D1 and master — seen
+// 2026-09-28 — so "nothing writes them" is not true, but the column is
+// pipeline-owned either way.) The DCS maintainer
 // hand-blanks this column before every release ("tags that mean nothing to
 // GL/OL translators") and our export puts them back the next night — he's
 // done the manual blank at least twice (2026-06-18, 2026-08-07). So tn/tq
 // always export an empty Tags column; the stored D1 value is untouched.
+// Because the blanking is deliberate, tsvRevertReport ignores the Tags column
+// for tn/tq: a Tags-only difference can never be a lost hand-edit (#1029).
 //
 // This is NOT the translator "keep this note through an AI run" flag — that's
 // the `preserve` column (see pipelineImport.ts ~line 1053), not `tags`.
@@ -1165,6 +1168,11 @@ export function tsvRevertReport(
   masterTsv: string,
   kind: "tn" | "tq" | "twl",
   baseTsv: string | null = null,
+  // #1029: rows (tn/tq) D1 itself took from master via ai_pipeline /
+  // dcs_reimport, as edit_log payload objects (D1 column names). A row whose
+  // master cells equal one of these was created on master by a bot and mirrored
+  // into D1, so a later app edit is ours, not a reverted foreign edit.
+  lineage: Map<string, Array<Record<string, unknown>>> | null = null,
 ): TsvRevertReport {
   const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
   const refIdx = headers.indexOf("Reference");
@@ -1179,9 +1187,13 @@ export function tsvRevertReport(
     if (!renderedCells) continue; // row absent from render — not our concern here
     const baseCells = base?.get(id);
     if (baseCells && baseCells.join("\t") === masterCells.join("\t")) continue; // master never moved here — the difference is ours
+    if (lineage && kind !== "twl" && masterMatchesLineage(masterCells, lineage.get(id), kind)) continue;
     const diffFields: string[] = [];
+    const tagsIdx = headers.indexOf("Tags");
     for (let i = 0; i < headers.length; i++) {
       if (i === refIdx || i === idIdx) continue;
+      // tn/tq Tags are blanked on every export by design (exportTags).
+      if (i === tagsIdx && kind !== "twl") continue;
       if ((masterCells[i] ?? "") !== (renderedCells[i] ?? "")) diffFields.push(headers[i]);
     }
     if (diffFields.length === 0) continue; // identical row, nothing overwritten
@@ -1204,6 +1216,31 @@ export function tsvRevertReport(
     entries.push({ ref, class: "substantive", fields: diffFields });
   }
   return { entries, totalRows: master.size };
+}
+
+const LINEAGE_FIELDS: Record<"tn" | "tq", Array<[string, string]>> = {
+  tn: [["SupportReference", "support_reference"], ["Quote", "quote"], ["Occurrence", "occurrence"], ["Note", "note"]],
+  tq: [["Quote", "quote"], ["Occurrence", "occurrence"], ["Question", "question"], ["Response", "response"]],
+};
+
+// True when master's row equals (on every content column) a full-row edit_log
+// payload from the machine lineage. Payloads missing a content field never
+// match (fail open).
+function masterMatchesLineage(
+  masterCells: string[],
+  payloads: Array<Record<string, unknown>> | undefined,
+  kind: "tn" | "tq",
+): boolean {
+  if (!payloads) return false;
+  const headers = kind === "tn" ? TN_HEADERS : TQ_HEADERS;
+  const fields = LINEAGE_FIELDS[kind];
+  return payloads.some((p) =>
+    fields.every(([header, key]) => {
+      if (!(key in p)) return false;
+      const v = key === "note" || key === "question" || key === "response" ? normalizeNoteText(p[key] as string) : p[key];
+      return tsvCell(v) === (masterCells[headers.indexOf(header)] ?? "");
+    }),
+  );
 }
 
 // Whether exportWorkflow.ts's exportOne should build and record an export-
@@ -1310,6 +1347,18 @@ export const RECORD_PUSHED_RENDER_SQL = `UPDATE book_resource_syncs
             CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?6 ELSE pushed_edit_id END,
           pushed_r2_key =
             CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?7 ELSE pushed_r2_key END,
+          -- #1029: every render pushed since master was last confirmed (this
+          -- render alone once confirmed), so a lagging master that still holds
+          -- an older unmerged-PR render is recognised as ours. Capped at 10.
+          unconfirmed_renders_json =
+            CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4
+                 THEN CASE WHEN ?5 = 1 THEN json_array(?3)
+                      ELSE (SELECT json_group_array(value) FROM
+                              (SELECT value FROM json_each(
+                                 json_insert(COALESCE(unconfirmed_renders_json, '[]'), '$[#]', ?3))
+                               ORDER BY key DESC LIMIT 10))
+                      END
+                 ELSE unconfirmed_renders_json END,
           master_confirmed_at =
             CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END,
           -- Shadow master_confirmed_at, but ONLY when this render is the
@@ -1359,7 +1408,9 @@ export function masterIsOurLastPublish(
 //    invisible to the unfiltered comparison this gate wraps, which diffs
 //    against that same pinned snapshot. Neither sees it.
 //  - `pushedBlobSha` advances every night whether or not the export PR merged,
-//    so master lagging behind an unmerged PR reads as "moved" and still reports.
+//    so master lagging behind an unmerged PR reads as "moved" — handled by
+//    `unconfirmedRenderShas` (#1029): every render pushed since master was last
+//    confirmed also counts as "our own bytes".
 //
 // And what suppression cannot hide: rows or verses present on master but absent
 // from our render are skipped by usfmRevertReport/tsvRevertReport outright
@@ -1371,8 +1422,13 @@ export function shouldComputeRevertEntries(
   masterContent: string | null,
   masterBlobSha: string | null,
   pushedBlobSha: string | null,
+  // #1029: blob shas of every render we pushed since master was last
+  // confirmed (book_resource_syncs.unconfirmed_renders_json). Master equal to
+  // any of them is still our own bytes, just lagging an unmerged export PR.
+  unconfirmedRenderShas: readonly string[] | null = null,
 ): boolean {
   if (!shouldRecordRevertReport(dcsChanged, masterContent)) return false;
+  if (masterBlobSha != null && unconfirmedRenderShas?.includes(masterBlobSha)) return false;
   return !masterIsOurLastPublish(masterBlobSha, pushedBlobSha);
 }
 
