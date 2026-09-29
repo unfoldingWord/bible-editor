@@ -133,8 +133,13 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // left. `landedGen` records which navigation the last landed payload was
   // fetched for, so after A → B → A the old A copy stays locked until A's new
   // GET lands (it can carry pre-save versions; see isChapterLocked).
+  // Advanced in the fetch effect, not during render, so only a committed
+  // navigation counts: a render React throws away must not bump a counter
+  // that no fetch will ever match. `navGen` mirrors it for rendering; until
+  // the effect runs, the render is locked anyway (the payload is another
+  // chapter's, or landedGen is the previous navigation's).
   const navRef = useRef<NavigationGen | null>(null);
-  navRef.current = trackNavigation(navRef.current, { book, chapter });
+  const [navGen, setNavGen] = useState(0);
   const [landedGen, setLandedGen] = useState(0);
   const [status, setStatus] = useState<Status>("idle");
   // ChapterData = the server payload + client-only verse tombstones. A fresh
@@ -212,6 +217,8 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     // #531 rule that no edit may be typed into, or queued against, a copy of
     // a chapter the route has moved away from. Local applies are no-ops while
     // stale (`mutate`), as they were while the payload used to be null.
+    navRef.current = trackNavigation(navRef.current, { book, chapter });
+    setNavGen(navRef.current.gen);
     void refetch();
     // Abort the in-flight GET and drop any deferred merge or queued steps,
     // so nothing from this (book, chapter) lands after navigation/unmount.
@@ -471,7 +478,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   return {
     status,
     data,
-    stale: isChapterLocked(data, { book, chapter }, landedGen, navRef.current.gen),
+    stale: isChapterLocked(data, { book, chapter }, landedGen, navGen),
     error,
     retryAttempts,
     refetch,
