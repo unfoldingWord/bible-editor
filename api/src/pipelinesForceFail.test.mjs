@@ -884,16 +884,19 @@ await withFetch(
 // to make the SAME "SELECT state, error_kind" query answer differently on
 // its two call sites — the outer pre-import re-read and the inner forced
 // pre-delete checkpoint both need to be reachable and to answer differently).
-// The output entry's repo is deliberately unrecognized (classify() ->
-// "unknown") so parseOutputEntry never calls fetchText — that would route
-// through this SAME mocked fetch and try to parse the upstream JSON body as a
-// TSV, which is unrelated to what this test is proving.
+// The output entry is a usable en_tn entry for this `notes` job (an entry
+// that is unrecognized or outside the job's declared writes now throws before
+// apply, #875). Its rawUrl fetch returns a header-only TSV, so staging runs
+// and stages zero rows without a real network fetch.
 const abortedMidApplyOutput = JSON.stringify({
   state: "done",
-  output: [{ type: "unknown", repo: "unfoldingWord/en_unrecognized", rawUrl: "https://example/raw" }],
+  output: [{ type: "tsv", repo: "unfoldingWord/en_tn", rawUrl: "https://raw.example/tn" }],
 });
 await withFetch(
-  async () => new Response(abortedMidApplyOutput, { status: 200 }),
+  async (url) =>
+    String(url).startsWith("https://raw.example/")
+      ? new Response("Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n", { status: 200 })
+      : new Response(abortedMidApplyOutput, { status: 200 }),
   async () => {
     console.log("\n[#402: pollPipelineJob's aborted branch skips finalize/broadcast/dispatch]");
     const queries = [];
@@ -938,7 +941,7 @@ await withFetch(
         return { changes: 0, rows: [], single: { user_id: 1 } };
       }
       if (/ORDER BY kind, chapter, verse, id/.test(sql)) {
-        return { changes: 0, rows: [], single: null }; // nothing staged (both outputs unrecognized)
+        return { changes: 0, rows: [], single: null }; // nothing staged (the TSV has no rows)
       }
       if (/UPDATE pipeline_jobs SET import_aborted_at/.test(sql)) {
         return { changes: 1, rows: [], single: null };
