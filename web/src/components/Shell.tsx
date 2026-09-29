@@ -388,6 +388,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const introRow = data.tn.find((r) => r.verse === 0);
     return { rowIds, introRowId: introRow ? introRow.id : null };
   }, [data]);
+  // Keyed on the chapter ON SCREEN, not the route (#892). While the previous
+  // chapter is the locked copy shown during a chapter change, the route's
+  // threads would paint onto its verse cells (and be indexed against its
+  // rows); the new chapter's comments load once its payload lands.
   const {
     index: commentsIndex,
     loading: commentsLoading,
@@ -399,7 +403,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     removeComment,
     applyWsComment,
     reload: reloadComments,
-  } = useComments(book, chapter, commentsEnabled, commentLiveRows);
+  } = useComments(data?.book ?? book, data?.chapter ?? chapter, commentsEnabled, commentLiveRows);
 
   // Live cross-tab updates. The server broadcasts row writes via the
   // ChapterRoom DO; we dedupe by version so the originating user's tab
@@ -4095,6 +4099,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveQuestionId(null);
           }}
           onNoteReorder={(draggedId, refId, position) => {
+            // #892: a reorder is new input; refuse it against a stale copy,
+            // as onWordReorder does (the inert container already blocks it).
+            if (chapterStaleRef.current) return;
             // Read the live (ref) row list, not the render-scoped `data`
             // closure: a rapid burst of arrow clicks fires several handlers
             // before React re-renders, and a stale closure would renumber from
