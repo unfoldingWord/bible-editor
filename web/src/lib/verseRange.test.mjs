@@ -271,6 +271,22 @@ function mkVerse(verse, verseEnd, voCount = 1) {
   assert(hlV1.has("Yahweh|1") && !hlV1.has("LORD|1"), `TN on 1:1 occ 1 lights Yahweh only (got ${[...hlV1]})`);
   assert(spanOccurrence(uhb2, bridge2, 2, quote, -1) === -1, "occurrence -1 (all) is left alone");
   assert(spanOccurrence(uhb2, uhb2[2], 2, quote, 1) === 1, "singleton target: occurrence unchanged");
+
+  // Not every bridge numbers across the span: a 2026-09-24 prod scan of the 83
+  // UST bridges found 143 repeated-word milestones numbered PER VERSE (1/1 in
+  // each verse, e.g. 1CH 4:17-18 אֶת) beside 71 numbered across it. Shifting a
+  // per-verse row's occurrence points at an x-occurrence that doesn't exist and
+  // lights nothing, so the shift must only apply when the row counts the word
+  // across the span; otherwise keep main's behavior (both copies light).
+  console.log("\n[Case] per-verse-numbered bridge keeps the unshifted occurrence (#957)");
+  const tgt3 = vo(String.raw`\id ZEC
+\c 1
+\v 1-2 \zaln-s |x-strong="H3068" x-lemma="יְהוָה" x-morph="He,Np" x-occurrence="1" x-occurrences="1" x-content="יְהוָה"\*\w Yahweh|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* spoke; \zaln-s |x-strong="H3068" x-lemma="יְהוָה" x-morph="He,Np" x-occurrence="1" x-occurrences="1" x-content="יְהוָה"\*\w LORD|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`);
+  const bridge3 = mk(1, 2, tgt3["1-2"] ?? tgt3["1"], "ULT");
+  assert(spanOccurrence(uhb2, bridge3, 2, quote, 1) === 1, "per-verse bridge: occurrence left unshifted");
+  const hlV2pv = highlightsFor("ULT", bridge3.content, quote, spanOccurrence(uhb2, bridge3, 2, quote, 1), src12);
+  assert(hlV2pv.has("LORD|1"), `per-verse bridge: TN on 1:2 still lights LORD (got ${[...hlV2pv]})`);
 }
 
 if (failed) {
