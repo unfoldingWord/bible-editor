@@ -234,29 +234,39 @@ test("an old chapter's refetch after navigating does not leave the view locked",
   });
   expect(lockRes.ok(), `lock twl order: ${lockRes.status()}`).toBe(true);
 
-  await page.goto(`/#/ZEC/10/${verse}`);
-  await page.getByRole("button", { name: /^Words/ }).first().click();
-  const useAutomatic = page.getByRole("button", { name: "use automatic" }).first();
-  await expect(useAutomatic).toBeVisible({ timeout: 15_000 });
+  try {
+    await page.goto(`/#/ZEC/10/${verse}`);
+    await page.getByRole("button", { name: /^Words/ }).first().click();
+    const useAutomatic = page.getByRole("button", { name: "use automatic" }).first();
+    await expect(useAutomatic).toBeVisible({ timeout: 15_000 });
 
-  // Hold the unlock's response and ZEC 11's GET, click, then navigate.
-  let releaseUnlock!: () => void;
-  const unlockGate = new Promise<void>((r) => (releaseUnlock = r));
-  await page.route(/\/twl-order-lock\?verse=/, async (route) => {
-    if (route.request().method() !== "DELETE") return route.continue();
-    await unlockGate;
-    await route.continue().catch(() => {});
-  });
-  const release11 = await holdChapter(page, 11);
-  await useAutomatic.click();
-  await setHash(page, "#/ZEC/11/1");
-  await expect(page.locator('[data-stale-chapter="10"]')).toBeVisible();
+    // Hold the unlock's response and ZEC 11's GET, click, then navigate.
+    let releaseUnlock!: () => void;
+    const unlockGate = new Promise<void>((r) => (releaseUnlock = r));
+    await page.route(/\/twl-order-lock\?verse=/, async (route) => {
+      if (route.request().method() !== "DELETE") return route.continue();
+      await unlockGate;
+      await route.continue().catch(() => {});
+    });
+    const release11 = await holdChapter(page, 11);
+    await useAutomatic.click();
+    await setHash(page, "#/ZEC/11/1");
+    await expect(page.locator('[data-stale-chapter="10"]')).toBeVisible();
 
-  // The unlock finishes after the navigation; its refetch now runs.
-  releaseUnlock();
-  await page.waitForTimeout(500);
-  release11();
-  await expect(page.locator("[data-stale-chapter]")).toHaveCount(0, { timeout: 15_000 });
-  await expect(page.locator(cellSel("rows", 11, 1))).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
-  await context.close();
+    // The unlock finishes after the navigation; its refetch now runs.
+    releaseUnlock();
+    await page.waitForTimeout(500);
+    release11();
+    await expect(page.locator("[data-stale-chapter]")).toHaveCount(0, { timeout: 15_000 });
+    await expect(page.locator(cellSel("rows", 11, 1))).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
+  } finally {
+    // Hand the verse back to automatic ordering even if the test failed before
+    // "use automatic" ran, so the shared fixture isn't left with a manual lock.
+    await context.request
+      .delete(`/api/chapters/ZEC/10/twl-order-lock?verse=${verse}`, {
+        headers: { Authorization: `Bearer ${auth.token}`, "x-csrf-token": csrf },
+      })
+      .catch(() => {});
+    await context.close();
+  }
 });

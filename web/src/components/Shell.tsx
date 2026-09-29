@@ -1354,18 +1354,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // REQUESTS the action (opens a confirm); nothing is written until confirmed.
   // Direction: check every applicable verse unless I've already checked them
   // all, in which case clear mine.
-  const [pendingBulk, setPendingBulk] = useState<{ lane: CheckLane; checked: boolean; verses: number[] } | null>(null);
+  // `chapter` is the chapter the verse list came from (the payload's): the
+  // confirm dialog is portaled outside the inert container and is closed on a
+  // chapter change, but confirmBulk also refuses a mismatch (#892).
+  const [pendingBulk, setPendingBulk] = useState<
+    { lane: CheckLane; checked: boolean; verses: number[]; chapter: number } | null
+  >(null);
   const bulkLaneToggle = useCallback(
     (lane: CheckLane) => {
-      if (meUserId == null) return;
+      if (meUserId == null || !data) return;
       const verses = tileSet
         .filter((t) => t.lanes.find((l) => l.lane === lane)?.applicable)
         .map((t) => t.verse);
       if (verses.length === 0) return;
       const allMine = verses.every((v) => laneIndex.get(laneKey(v, lane))?.includes(meUserId));
-      setPendingBulk({ lane, checked: !allMine, verses });
+      setPendingBulk({ lane, checked: !allMine, verses, chapter: data.chapter });
     },
-    [meUserId, tileSet, laneIndex],
+    [meUserId, tileSet, laneIndex, data],
   );
   // Run the confirmed bulk: optimistic apply + one direct PATCH (deliberate,
   // online action), reconciled from the server response.
@@ -1373,6 +1378,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const p = pendingBulk;
     setPendingBulk(null);
     if (!p || meUserId == null) return;
+    // Never apply one chapter's verse list to another chapter (#892).
+    if (p.chapter !== chapter) return;
     // Same reasoning as toggleLane: the bulk PATCH will 423 on a locked
     // book, so skip the optimistic apply rather than flip every checkbox
     // in the chapter and then silently revert them.
@@ -2366,6 +2373,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     if (toastChapterRef.current === chapter) return;
     toastChapterRef.current = chapter;
     setBoardOpen(false);
+    setPendingBulk(null);
     setPipelineToast((cur) => (cur?.action ? null : cur));
   }, [chapter]);
 
@@ -4353,8 +4361,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <DialogContent>
           <DialogContentText>
             {pendingBulk?.checked
-              ? `This marks ${pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} as checked by you for all ${pendingBulk?.verses.length ?? 0} applicable verses in ${book} ${chapter}.`
-              : `This removes your ${pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} checks from all ${pendingBulk?.verses.length ?? 0} applicable verses in ${book} ${chapter}.`}
+              ? `This marks ${pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} as checked by you for all ${pendingBulk?.verses.length ?? 0} applicable verses in ${book} ${pendingBulk?.chapter ?? chapter}.`
+              : `This removes your ${pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} checks from all ${pendingBulk?.verses.length ?? 0} applicable verses in ${book} ${pendingBulk?.chapter ?? chapter}.`}
           </DialogContentText>
         </DialogContent>
         <DialogActions>
@@ -4527,7 +4535,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // stale window (#892) `data` is still the previous chapter, and its
             // verse would be the wrong baseline and expected_version.
             const cached =
-              ch === data?.chapter
+              !chapterStale && ch === data?.chapter
                 ? data?.verses[bv]?.[v]
                 : bookHook?.chapters.get(ch)?.kind === "ready"
                   ? (bookHook.chapters.get(ch) as { kind: "ready"; data: { verses: Record<string, Record<number, VerseDto>> } }).data.verses[bv]?.[v]
