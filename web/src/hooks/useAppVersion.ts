@@ -73,9 +73,12 @@ export function useAppVersion(): UseAppVersionReturn {
 
     const check = async () => {
       if (cancelled) return;
-      lastCheckAt = Date.now();
       const deployed = await fetchDeployedVersion();
       if (cancelled || !deployed) return;
+      // Stamp only on success: stamping before the request would leave a
+      // failed fetch (offline, 404) blocking the next refocus retry for a
+      // full REFOCUS_THROTTLE_MS.
+      lastCheckAt = Date.now();
       if (deployed.commit !== APP_VERSION.commit) setUpdateAvailable(true);
     };
 

@@ -45,10 +45,13 @@ export function useBookLocks(authReady: boolean): UseBookLocksReturn {
   const [canManageLocks, setCanManageLocks] = useState(false);
 
   const load = useCallback(() => {
-    lastLoadAt = Date.now();
     api
       .getBooks()
       .then((r) => {
+        // Stamp only on success: stamping before the request would leave a
+        // failed fetch blocking the next refocus retry for a full
+        // FOCUS_RELOAD_THROTTLE_MS.
+        lastLoadAt = Date.now();
         setBooks((prev) => (sameBooks(prev, r.books) ? prev : r.books));
         setCanManageLocks((prev) => (prev === r.canManageLocks ? prev : r.canManageLocks));
       })
@@ -90,6 +93,14 @@ export function useBookLocks(authReady: boolean): UseBookLocksReturn {
   // Focus is the cheap 90% fix (lock, switch tab, come back). The remaining
   // gap is a lock landing while the translator is actively working in the same
   // tab, where the server's 423 is the backstop.
+  //
+  // The FOCUS_RELOAD_THROTTLE_MS below widens that gap slightly: unlike
+  // useAlerts/BookTrashIndicator this hook has no background poll to
+  // self-correct, so a lock set by someone else during a quick refocus
+  // flurry can stay unseen here for up to the throttle window. The 423
+  // backstop above still makes that a UI staleness issue, not a data-safety
+  // one, and is why we accept the same throttle window as the polled hooks
+  // rather than special-casing a shorter one here.
   useEffect(() => {
     if (!authReady) return;
     const onFocus = () => {

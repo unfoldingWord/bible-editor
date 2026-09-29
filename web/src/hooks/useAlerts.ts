@@ -61,10 +61,13 @@ export function useAlerts(authReady: boolean): {
   const seqRef = useRef(0);
 
   const refresh = useCallback(async () => {
-    lastFetchAt = Date.now();
     const seq = ++seqRef.current;
     try {
       const list = await fetchAlerts();
+      // Stamp only on success: stamping before the request would leave a
+      // failed fetch (offline, 5xx) blocking the next refocus retry for a
+      // full REFOCUS_THROTTLE_MS.
+      lastFetchAt = Date.now();
       if (seq !== seqRef.current) return;
       const known = knownIdsRef.current;
       if (known) {

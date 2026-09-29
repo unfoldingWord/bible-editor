@@ -71,10 +71,15 @@ export function BookTrashIndicator({ book, onNavigate, refreshSignal, onRestore 
   const [restoringId, setRestoringId] = useState<string | null>(null);
 
   const load = () => {
-    lastLoadAt = Date.now();
     api
       .getBookTrash(book)
-      .then((r) => setRows(r.rows))
+      .then((r) => {
+        // Stamp only on success: stamping before the request would leave a
+        // failed fetch (offline, 5xx) blocking the next refocus retry for a
+        // full REFOCUS_THROTTLE_MS.
+        lastLoadAt = Date.now();
+        setRows(r.rows);
+      })
       .catch(() => setRows([]));
   };
 

@@ -118,12 +118,23 @@ function snapshot(): PipelineJob[] {
 }
 
 // Skips re-notifying subscribers when nothing a renderer would care about
-// changed. Compared on (job_id, state, updated_at) tuples — the fields that
-// drive every subscriber's render — not full row identity, so an unrelated
-// field refresh (e.g. last_polled_at) alone doesn't trigger a re-render.
+// changed. Compared on the fields that drive a render — not full row
+// identity, so an unrelated field refresh (e.g. last_polled_at) alone
+// doesn't trigger a re-render. locks_resources/queue_position/queue_ahead
+// must be in the key: start() seeds a row with state "running" and no
+// locks_resources, then loadFromServer() re-fetches specifically to attach
+// it; the server's updated_at (unixepoch() at dispatch) is often the same
+// second as the seed's, so without these fields the key wouldn't change and
+// Shell would never see the lock the AI run is holding — an editable-looking
+// lane the server then 423s.
 let lastNotifiedKey = "";
 function snapshotKey(list: PipelineJob[]): string {
-  return list.map((j) => `${j.job_id}:${j.state}:${j.updated_at}`).join("|");
+  return list
+    .map(
+      (j) =>
+        `${j.job_id}:${j.state}:${j.updated_at}:${(j.locks_resources ?? []).join(",")}:${j.queue_position}:${j.queue_ahead}:${j.current_skill}:${j.current_status}`,
+    )
+    .join("|");
 }
 
 function notify() {
@@ -250,9 +261,12 @@ function ensurePolling() {
 const STALE_NOTIFICATION_CUTOFF_SECONDS = 24 * 60 * 60;
 
 async function loadFromServer() {
-  lastLoadFromServerAt = Date.now();
   try {
     const res = await api.pipelineList();
+    // Stamp only on success: stamping before the request would leave a
+    // failed fetch (offline, 5xx) blocking the next refocus retry for a
+    // full REFOCUS_THROTTLE_MS.
+    lastLoadFromServerAt = Date.now();
     queueSummary = res.queue ?? null;
     // Collect terminal jobs we haven't toasted yet *before* mutating the
     // jobs map. Anything in the response with state=done/failed and
