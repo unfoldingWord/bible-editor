@@ -10,6 +10,9 @@
 //   node --experimental-sqlite --experimental-strip-types --no-warnings src/chapters.test.mjs
 
 import { DatabaseSync } from "node:sqlite";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   TN_CHAPTER_SELECT_SQL,
   TQ_CHAPTER_SELECT_SQL,
@@ -28,40 +31,14 @@ function assert(cond, msg) {
 
 function db() {
   const d = new DatabaseSync(":memory:");
+  // Real schema: every migration, in order (same loader shape as
+  // tombstoneReclaim.test.mjs), so a column a later migration adds is present
+  // here and the column-coverage assertion below can see it (#927).
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    d.exec(readFileSync(join(dir, f), "utf8"));
+  }
   d.exec(`
-    CREATE TABLE tn_rows (
-      id TEXT, book TEXT, chapter INTEGER, verse INTEGER, ref_raw TEXT,
-      tags TEXT, support_reference TEXT, quote TEXT, occurrence INTEGER,
-      note TEXT, sort_order REAL, version INTEGER NOT NULL DEFAULT 1,
-      restored_from_version INTEGER, updated_by INTEGER, updated_at INTEGER,
-      deleted_at INTEGER, trashed_at INTEGER, preserve INTEGER NOT NULL DEFAULT 0,
-      hint INTEGER NOT NULL DEFAULT 0, review_kind TEXT, review_reason TEXT,
-      review_master_json TEXT, last_change_action TEXT, last_change_source TEXT,
-      last_change_actor TEXT,
-      PRIMARY KEY (book, id)
-    );
-    CREATE TABLE tq_rows (
-      id TEXT, book TEXT, chapter INTEGER, verse INTEGER, ref_raw TEXT,
-      tags TEXT, quote TEXT, occurrence INTEGER, question TEXT, response TEXT,
-      sort_order REAL, version INTEGER NOT NULL DEFAULT 1, restored_from_version INTEGER,
-      updated_by INTEGER, updated_at INTEGER, deleted_at INTEGER,
-      review_kind TEXT, review_reason TEXT, review_master_json TEXT,
-      last_change_action TEXT, last_change_source TEXT, last_change_actor TEXT,
-      PRIMARY KEY (book, id)
-    );
-    CREATE TABLE twl_rows (
-      id TEXT, book TEXT, chapter INTEGER, verse INTEGER, ref_raw TEXT,
-      tags TEXT, orig_words TEXT, occurrence INTEGER, tw_link TEXT,
-      sort_order REAL, version INTEGER NOT NULL DEFAULT 1, restored_from_version INTEGER,
-      updated_by INTEGER, updated_at INTEGER, deleted_at INTEGER,
-      review_kind TEXT, review_reason TEXT, review_master_json TEXT,
-      last_change_action TEXT, last_change_source TEXT, last_change_actor TEXT,
-      PRIMARY KEY (book, id)
-    );
-    CREATE TABLE edit_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT, source TEXT
-    );
-
     INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, version,
       trashed_at, preserve, hint, review_kind, review_reason, review_master_json,
       last_change_action, last_change_source, last_change_actor)
@@ -81,7 +58,7 @@ function db() {
     VALUES ('ef56', 'ZEC', 1, 3, '1:3', 'הוא', 'rc://*/tw/dict/bible/kt/god', 1, 1,
       'ref_moved', 'moved from 1:2', '{"ref_raw":"1:2"}', 'update', 'dcs_sync', 'Door43 sync');
 
-    INSERT INTO edit_log (kind, row_key, book, source) VALUES ('tn', 'ab12', 'ZEC', 'ai_pipeline');
+    INSERT INTO edit_log (kind, row_key, book, action, source) VALUES ('tn', 'ab12', 'ZEC', 'update', 'ai_pipeline');
   `);
   return d;
 }
@@ -136,6 +113,16 @@ assert(
   "twl row has exactly the expected column set",
 );
 assert(twlRow.review_kind === "ref_moved", "twl row keeps review_kind");
+
+// #927: every column the migrations give each table must reach the client via
+// the explicit SELECT list, except columns deliberately withheld. A migration
+// that adds a column now fails here until the SELECT (or this list) is updated.
+const WITHHELD = new Set(["review_master_json"]);
+for (const [table, row] of [["tn_rows", tnRow], ["tq_rows", tqRow], ["twl_rows", twlRow]]) {
+  const cols = d.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  const missing = cols.filter((c) => !WITHHELD.has(c) && !(c in row));
+  assert(missing.length === 0, `${table}: every schema column is selected (missing: ${missing.join(", ") || "none"})`);
+}
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
