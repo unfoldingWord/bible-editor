@@ -265,7 +265,12 @@ function mkVerse(verse, verseEnd, voCount = 1) {
   const bridge2 = mk(1, 2, tgt2["1-2"] ?? tgt2["1"], "ULT");
   const quote = "יְהוָה";
   const hlV2 = rowHighlightsFor("ULT", bridge2, quote, 1, uhb2, 2);
-  assert(hlV2.has("LORD|1") && !hlV2.has("Yahweh|1"), `TN on 1:2 occ 1 lights LORD only (got ${[...hlV2]})`);
+  // A later-verse note joins as main's rows view did: against its own
+  // verse's source alone. Known limit (#968): this row numbers יְהוָה across
+  // the span (1/2, 2/2), and the appears-once collapse over v2's source folds
+  // both milestones together, so v1's "Yahweh" lights beside "LORD".
+  const mainV2 = highlightsFor("ULT", bridge2.content, quote, 1, uhb2[2].content);
+  assert(hlV2.has("LORD|1") && [...hlV2].join() === [...mainV2].join(), `TN on 1:2 occ 1 lights LORD, same as main's rows view (got ${[...hlV2]})`);
   const hlV1 = rowHighlightsFor("ULT", bridge2, quote, 1, uhb2, 1);
   // A first-verse note joins exactly as on main (that verse's source alone),
   // where the appears-once collapse folds 1/2 and 2/2 together, so both copies
@@ -273,7 +278,8 @@ function mkVerse(verse, verseEnd, voCount = 1) {
   const mainV1 = highlightsFor("ULT", bridge2.content, quote, 1, uhb2[1].content);
   assert(hlV1.has("Yahweh|1") && [...hlV1].join() === [...mainV1].join(), `TN on 1:1 occ 1 lights Yahweh, same as main (got ${[...hlV1]})`);
   const hlAll = rowHighlightsFor("ULT", bridge2, quote, -1, uhb2, 2);
-  assert(hlAll.has("LORD|1") && !hlAll.has("Yahweh|1"), `occurrence -1 on 1:2 means every match in 1:2 only (got ${[...hlAll]})`);
+  const mainAll = highlightsFor("ULT", bridge2.content, quote, -1, uhb2[2].content);
+  assert(hlAll.has("LORD|1") && [...hlAll].join() === [...mainAll].join(), `occurrence -1 on 1:2 joins on 1:2's source, same as main (got ${[...hlAll]})`);
   const single2 = mk(2, null, bridge2.content.verseObjects, "ULT");
   assert([...rowHighlightsFor("ULT", single2, quote, 1, uhb2, 2)].join() === [...highlightsFor("ULT", single2.content, quote, 1, uhb2[2].content)].join(),
     "singleton target: same as the ordinary join on its own source verse");
@@ -325,6 +331,9 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     return mk(1, end, parsed[`1-${end}`] ?? parsed["1"], "ULT");
   };
   const show = (hl) => [...hl].join(",");
+  // Main's rows view: the note's own verse's source alone.
+  const mainRows = (row, quote, occ, byVerse, v, partial = false) =>
+    highlightsFor("ULT", row.content, quote, occ, byVerse[v].content, partial);
 
   console.log("\n[Case] per-verse bridge whose first quote word is unaligned (#957 review)");
   {
@@ -341,7 +350,8 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     const uhb = src([[B, C], [B, C]]);
     const row = bridge(2, [Z(B, 1, 2, "b1"), Z(C, 1, 1, "c1"), Z(B, 2, 2, "b2"), Z(C, 1, 1, "c2")].join(" "));
     const hl = rowHL(row, `${B} ${C}`, 1, uhb, 2);
-    assert(hl.has("b2|1") && hl.has("c2|1") && !hl.has("b1|1"), `TN on 1:2 lights b2 and c2, not b1 (got ${show(hl)})`);
+    // Known limit (#968): B is numbered across the span, so v1's b1 also lights.
+    assert(hl.has("b2|1") && hl.has("c2|1") && show(hl) === show(mainRows(row, `${B} ${C}`, 1, uhb, 2)), `TN on 1:2 lights b2 and c2, same as main's rows view (got ${show(hl)})`);
   }
 
   console.log("\n[Case] mixed numbering in one row: first word per verse, second across the span (#957 review)");
@@ -349,7 +359,8 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     const uhb = src([[B, C], [B, C]]);
     const row = bridge(2, [Z(B, 1, 1, "b1"), Z(C, 1, 2, "c1"), Z(B, 1, 1, "b2"), Z(C, 2, 2, "c2")].join(" "));
     const hl = rowHL(row, `${B} ${C}`, 1, uhb, 2);
-    assert(hl.has("c2|1") && !hl.has("c1|1"), `TN on 1:2 lights c2, not c1 (got ${show(hl)})`);
+    // Known limit (#968): C is numbered across the span, so v1's c1 also lights.
+    assert(hl.has("c2|1") && show(hl) === show(mainRows(row, `${B} ${C}`, 1, uhb, 2)), `TN on 1:2 lights c2, same as main's rows view (got ${show(hl)})`);
   }
 
   console.log("\n[Case] multi-verse note on a bridge: a later group never lands in an earlier verse (#957 review)");
@@ -360,7 +371,9 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     const uhb = src([[X], [P], [X]]);
     const row = bridge(3, [Z(X, 1, 2, "x1"), Z(P, 1, 1, "p2"), Z(X, 2, 2, "x3")].join(" "));
     const hl = rowHL(row, `${P} & ${X} & ${Q}`, 1, uhb, 2, true);
-    assert(hl.has("p2|1") && hl.has("x3|1") && !hl.has("x1|1"), `partial note lights p2 and x3, not x1 (got ${show(hl)})`);
+    // Joined on v2's source alone, the X group (in v3) is not seen, so x3 does
+    // not light (known limit, #968); what matters is that x1 never does.
+    assert(hl.has("p2|1") && !hl.has("x1|1") && show(hl) === show(mainRows(row, `${P} & ${X} & ${Q}`, 1, uhb, 2, true)), `partial note lights p2, never x1, same as main's rows view (got ${show(hl)})`);
   }
 
   console.log("\n[Case] note on a bridge's FIRST verse keeps main's single-verse join (#957 review 2)");
@@ -385,7 +398,9 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     const uhb = src([[B], [B]]);
     const row = bridge(2, [Z(B, 1, 2, "b1"), Z(B, 2, 2, "b2")].join(" "));
     const hl = rowHL(row, B, null, uhb, 2);
-    assert(hl.has("b2|1") && !hl.has("b1|1"), `TN on 1:2 with null occurrence lights b2, not b1 (got ${show(hl)})`);
+    // Same as occurrence 1 on main's rows view (known limit, #968: b1 also
+    // lights on this span-numbered row).
+    assert(hl.has("b2|1") && show(hl) === show(mainRows(row, B, 1, uhb, 2)), `TN on 1:2 with null occurrence lights b2, same as occurrence 1 on main's rows view (got ${show(hl)})`);
   }
 
   console.log("\n[Case] later-verse note whose milestone over-claims its occurrence falls back to its own verse (#957 review 4)");

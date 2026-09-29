@@ -13,7 +13,7 @@
 // reading `verses[bv][n]` directly.
 
 import type { VerseDto } from "../sync/api";
-import { findBridgeTargetHighlights, highlightsFor, type HighlightKey } from "./highlight.ts";
+import { highlightsFor, type HighlightKey } from "./highlight.ts";
 
 export type VerseSpan = readonly [start: number, end: number];
 
@@ -199,12 +199,17 @@ export function sourceForTargetRow(
 }
 
 // Note-quote highlights for a ULT/UST row, OL-anchored on the source the row
-// covers (its whole span for a bridge, #957). `noteVerse` is the note's own
-// verse, where its occurrence counts. A note on a bridge's first verse joins
-// against that verse's source alone, as on main. A note on a later verse goes
-// through findBridgeTargetHighlights, falling back to its own verse's source.
-// Singletons, and a note verse outside the span, use the ordinary join.
-// `fallbackSource` stands in when the map has no source row for the target.
+// covers. `noteVerse` is the note's own verse, where its occurrence counts.
+// For a bridged row, a note on any verse of the span joins exactly as main's
+// rows view did: against that verse's source alone, so the milestone repairs
+// in collectMilestoneRuns apply and an earlier verse's copy never lights
+// (#957). No source for that verse: nothing lights. Singletons, and a note
+// verse outside the span, use the ordinary join. `fallbackSource` stands in
+// when the map has no source row for the target.
+//
+// Known limit: a bridge numbered ACROSS the span (x-occurrence counting every
+// verse) can light the wrong copy, or none, for a note whose word also occurs
+// in an earlier bridge verse. A span-aware join is follow-up work (#968).
 export function rowHighlightsFor(
   bibleVersion: string,
   target: VerseDto | null | undefined,
@@ -215,34 +220,17 @@ export function rowHighlightsFor(
   partialGroups = false,
   fallbackSource?: unknown,
 ): Set<HighlightKey> {
-  const spanSource = sourceForTargetRow(sourceByVerseStart, target)?.content ?? fallbackSource;
   if (target && quote && noteVerse != null && sourceByVerseStart) {
     const [start, end] = verseSpan(target);
-    // A note on a bridge's first verse joins exactly as on main: against that
-    // verse's source alone, where its occurrence counts.
     if (end > start && noteVerse === start) {
       return highlightsFor(bibleVersion, target.content, quote, occurrence, sourceByVerseStart[start]?.content ?? fallbackSource, partialGroups);
     }
-    const targetVo = (target.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-    if (noteVerse > start && noteVerse <= end && Array.isArray(targetVo)) {
-      // A null occurrence means 1, as in highlightsFor.
-      const occ = occurrence ?? 1;
-      const sourceVerses: unknown[][] = [];
-      for (let v = start; v <= end; v++) {
-        const vo = (sourceByVerseStart[v]?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-        sourceVerses.push(Array.isArray(vo) ? vo : []);
-      }
-      const hl = findBridgeTargetHighlights(targetVo, quote, occ, sourceVerses, noteVerse - start, partialGroups);
-      if (hl && hl.size > 0) return hl;
-      // Unresolved from the note's verse on, or resolved but joined to no
-      // milestone (e.g. one over-claiming its occurrence, which main's
-      // appears-once repair heals): fall back to that verse's source
-      // alone (main's rows view), never the whole span, which would light an
-      // earlier verse's copy. No source for the verse: nothing lights.
+    if (noteVerse > start && noteVerse <= end) {
       const own = sourceByVerseStart[noteVerse]?.content;
-      return own ? highlightsFor(bibleVersion, target.content, quote, occ, own, partialGroups) : new Set();
+      return own ? highlightsFor(bibleVersion, target.content, quote, occurrence, own, partialGroups) : new Set();
     }
   }
+  const spanSource = sourceForTargetRow(sourceByVerseStart, target)?.content ?? fallbackSource;
   return highlightsFor(bibleVersion, target?.content, quote, occurrence, spanSource, partialGroups);
 }
 
