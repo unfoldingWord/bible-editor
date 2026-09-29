@@ -821,6 +821,52 @@ eq(
   "same case with no override → skip (conflict_skipped withholds, but is not a failure-class reason)",
 );
 
+// Issue #1033 (F1 from the #839 review): the stale-base gate (staleBaseGate.ts,
+// issue #639) stages a refused resource `changed: false, masterSha: null`, so
+// the reimport-sync step never reaches recordResourceSync for it — the
+// watermark is NOT stamped. The ledger must not call that success. It is a
+// deliberate hold that releases itself once master is repaired, the same class
+// as chapters_locked, so it is a skip, not a failure.
+eq(
+  classifyReimportOutcome({ ult: resourceCounts({ stale_base_held: 1 }), ust: resourceCounts() }),
+  "skip",
+  "a stale-base-held resource → skip (its watermark is never stamped)",
+);
+eq(
+  classifyReimportOutcome({ ult: resourceCounts({ stale_base_held: 1 }) }, undefined, "ult"),
+  "skip",
+  "idBlockedOverride does not open a stale-base hold (it only scopes conflict_skipped/tombstone_blocked)",
+);
+eq(
+  classifyReimportOutcome({ ult: resourceCounts({ stale_base_overridden: 1 }) }),
+  "success",
+  "a FORCE-RELEASED stale-base hold → success (the override adopted master and the watermark was stamped)",
+);
+eq(
+  classifyReimportOutcome({
+    ult: resourceCounts({ stale_base_held: 1 }),
+    ust: resourceCounts({ apply_incomplete: true }),
+  }),
+  "failure",
+  "a failure in one resource still outranks a stale-base hold in another",
+);
+
+// Issue #1033 (F2): a resource staged `changed: true` whose master commit SHA
+// could not be read (fileCommitSha returned null) passes every withhold gate
+// and then hits `if (!e.masterSha) continue;` — no stamp. Seeded onto
+// perResource as master_sha_unknown. It is an unmeasured DCS read, not a
+// deliberate hold, so it is a failure.
+eq(
+  classifyReimportOutcome({ ult: resourceCounts(), ust: resourceCounts({ master_sha_unknown: 1 }) }),
+  "failure",
+  "a changed resource with a null masterSha → failure (the watermark was not stamped)",
+);
+eq(
+  classifyReimportOutcome({ ult: resourceCounts({ chapters_locked: 1, master_sha_unknown: 1 }) }),
+  "failure",
+  "master_sha_unknown beside a skip condition in the same resource → failure (failure beats skip)",
+);
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
