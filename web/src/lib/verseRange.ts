@@ -200,12 +200,13 @@ export function sourceForTargetRow(
 
 // Note-quote highlights for a ULT/UST row, OL-anchored on the source the row
 // covers. `noteVerse` is the note's own verse, where its occurrence counts.
-// For a bridged row, a note on any verse of the span joins exactly as main's
-// rows view did: against that verse's source alone, so the milestone repairs
-// in collectMilestoneRuns apply and an earlier verse's copy never lights
-// (#957). No source for that verse: nothing lights. Singletons, and a note
-// verse outside the span, use the ordinary join. `fallbackSource` stands in
-// when the map has no source row for the target.
+// For a bridged row, a note on a later verse of the span joins exactly as
+// main's rows view did: against that verse's source alone, so the milestone
+// repairs in collectMilestoneRuns apply (#957); no source for that verse means
+// nothing lights. Every other note on a bridged row joins against the start
+// verse alone, as main did, so the whole-span source only ever feeds the
+// unaligned checks. Singletons use their own verse. `fallbackSource` stands in
+// when the map has no source row.
 //
 // Known limit: a bridge numbered ACROSS the span (x-occurrence counting every
 // verse) can light the wrong copy, or none, for a note whose word also occurs
@@ -220,15 +221,15 @@ export function rowHighlightsFor(
   partialGroups = false,
   fallbackSource?: unknown,
 ): Set<HighlightKey> {
-  if (target && quote && noteVerse != null && sourceByVerseStart) {
+  if (target && isRangeRow(target)) {
     const [start, end] = verseSpan(target);
-    if (end > start && noteVerse === start) {
-      return highlightsFor(bibleVersion, target.content, quote, occurrence, sourceByVerseStart[start]?.content ?? fallbackSource, partialGroups);
-    }
-    if (noteVerse > start && noteVerse <= end) {
-      const own = sourceByVerseStart[noteVerse]?.content;
+    if (noteVerse != null && noteVerse > start && noteVerse <= end) {
+      const own = sourceByVerseStart?.[noteVerse]?.content;
       return own ? highlightsFor(bibleVersion, target.content, quote, occurrence, own, partialGroups) : new Set();
     }
+    // Any other note (on the first verse, before the span, or with no verse)
+    // joins against the start verse alone, as on main.
+    return highlightsFor(bibleVersion, target.content, quote, occurrence, sourceByVerseStart?.[start]?.content ?? fallbackSource, partialGroups);
   }
   const spanSource = sourceForTargetRow(sourceByVerseStart, target)?.content ?? fallbackSource;
   return highlightsFor(bibleVersion, target?.content, quote, occurrence, spanSource, partialGroups);
