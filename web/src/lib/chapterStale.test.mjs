@@ -2,7 +2,7 @@
 // change (#892). Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/chapterStale.test.mjs
 
-import { isChapterLocked, isStaleChapter, trackNavigation, updateIfCurrent } from "./chapterStale.ts";
+import { currentRouteFetcher, isChapterLocked, isStaleChapter, trackNavigation, updateIfCurrent } from "./chapterStale.ts";
 
 let failed = 0;
 let passed = 0;
@@ -86,6 +86,25 @@ assert(isStaleChapter(payload("ZEC", 0), { book: "ZEC", chapter: 1 }) === true, 
   landedGen = nav.gen; // A's new GET landed
   assert(isChapterLocked(payload("ZEC", 3), A, landedGen, nav.gen) === false, "A is editable once its GET for this navigation lands");
   assert(isChapterLocked(null, A, 0, nav.gen) === false, "no payload is loading, not locked");
+}
+
+// ── A refetch closure made before a navigation targets the CURRENT route ────
+// A "Refresh" toast or a post-unlock refetch created on chapter 3 and run
+// after the tab moved to 4 must fetch 4. Fetching 3 would replace 4's GET in
+// the shared sequencer, land 3 under route 4, and leave the view locked.
+{
+  const routeRef = { current: { book: "ZEC", chapter: 3 } };
+  const calls = [];
+  const fetchFor = currentRouteFetcher(routeRef, (book, chapter, signal) => {
+    calls.push({ book, chapter, signal });
+    return Promise.resolve({ book, chapter });
+  });
+  routeRef.current = { book: "ZEC", chapter: 4 };
+  const sig = {};
+  const got = await fetchFor(sig);
+  assert(calls.length === 1 && calls[0].chapter === 4, "old closure fetches the current route's chapter");
+  assert(calls[0].signal === sig, "the abort signal is passed through");
+  assert(got.chapter === 4, "the payload is the current route's");
 }
 
 console.log(`chapterStale: ${passed} passed, ${failed} failed`);

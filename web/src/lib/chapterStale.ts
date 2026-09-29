@@ -40,6 +40,20 @@ export function updateIfCurrent<T extends ChapterKeyed>(
   return fn(prev);
 }
 
+/**
+ * A chapter fetcher that reads the route when it RUNS, not when it was made.
+ * `refetch` is handed to toasts ("Refresh") and async follow-ups that can fire
+ * after a navigation; fetching the chapter the closure was made on would
+ * replace the current route's GET in the shared sequencer and leave the view
+ * locked on a payload that never matches the route (#892).
+ */
+export function currentRouteFetcher<P>(
+  routeRef: { current: ChapterRoute },
+  get: (book: string, chapter: number, signal: AbortSignal) => Promise<P>,
+): (signal: AbortSignal) => Promise<P> {
+  return (signal) => get(routeRef.current.book, routeRef.current.chapter, signal);
+}
+
 /** The route key plus a counter bumped on every navigation to a new route. */
 export interface NavigationGen {
   key: string;
