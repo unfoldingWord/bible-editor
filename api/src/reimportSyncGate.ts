@@ -273,6 +273,117 @@ export function computeWithholdReason(
   return null;
 }
 
+// ── Per-book reimport ledger classification (issue #836) ────────────────────
+//
+// The export run's terminal ledger (#833) records one success/skip/failure
+// outcome per book. The FIRST version of this function (#836's initial fix)
+// re-derived it from the book's reimport totals SUMMED across all five
+// resources — which broke the "SUCCESS ⟺ watermark stamped" invariant two
+// ways a multi-model PR review caught before merge:
+//
+//   1. isSystemicMergeRefusal compares a THRESHOLD (SYSTEMIC_MERGE_REFUSAL_
+//      THRESHOLD, currently 5), not a "any nonzero" check like the other
+//      counters. Summing merge_refused across resources before comparing
+//      against that same threshold can trip it on a book where every
+//      INDIVIDUAL resource stayed under threshold and every watermark was
+//      actually stamped (ult: 3, ust: 2 → sums to 5, but the real gate
+//      (bookReimport.ts's reimport-sync step) checks each resource's own
+//      count and withheld nothing) — a false RED.
+//   2. `mergeRefusalOverrideAllowed`'s escape hatch (FIX H) is scoped to one
+//      resource and forces isSystemicMergeRefusal's gate open for it. A
+//      summed-totals re-derivation has no way to know which resource that
+//      was, so it reported failure at the exact moment a maintainer verified
+//      and overrode a real watermark stamp.
+//
+// The fix: classify from the SAME per-resource counts the reimport-sync step
+// actually gates on, checked EACH resource's own counts — never a book-level
+// sum.
+//
+// Scheduled codex-review-and-merge pass, same day: this function's SECOND
+// version (the one fixing the two findings above) called computeWithholdReason
+// per resource and used its single returned `reason` to pick skip vs failure.
+// That is unsound for a severity verdict, because computeWithholdReason
+// answers a DIFFERENT question — "which ONE condition fired first" (for
+// syncWithholds.ts's alert text, where naming one cause is exactly right) —
+// and its precedence checks every skip reason (chapters_locked, prune_locked,
+// conflict_skipped, tombstone_blocked) BEFORE any failure reason
+// (systemic_refusal, merge_record_failed, apply_incomplete; see its own doc
+// and code just above). A resource carrying BOTH — chapters_locked from one
+// chunk and apply_incomplete from a later CAS race, say — returned
+// `"chapters_locked"` and this function recorded `"skip"`, silently losing a
+// real apply failure. structure_overlap escaped this because
+// computeWithholdReason happens to check it before the two lock reasons; the
+// other three failure reasons did not.
+//
+// So classification does NOT go through computeWithholdReason (or any other
+// single-reason function) at all: it evaluates every failure-class condition
+// as one OR-set and every skip-class condition as a separate OR-set, exactly
+// mirroring computeWithholdReason's own field semantics (the same fail-safe
+// "undefined counter → treat as incomplete" rule, the same idBlockedOverride
+// scoping) but without its short-circuit-on-first-match control flow. A
+// resource's failure conditions are checked in full before its skip
+// conditions are even consulted, and — the point of the loop being
+// per-resource at all — a failure in any ONE resource wins over a book with
+// otherwise only skip conditions across the rest.
+export function classifyReimportOutcome(
+  perResource: Record<
+    string,
+    {
+      chapters_locked?: number;
+      prune_locked?: number;
+      conflict_skipped?: number;
+      tombstone_blocked?: number;
+      counts_incomplete?: boolean;
+      structure_overlap?: number;
+      merge_refused?: number;
+      merge_record_failed?: boolean;
+      apply_incomplete?: boolean;
+      errors?: string[];
+    }
+  >,
+  // The one resource (if any) this run's overrides apply to — mirrors
+  // mergeRefusalOverrideResource / idBlockedOverrideResource in
+  // runChunkedReimport's opts, both scoped to a single named resource.
+  mergeRefusalOverrideResource?: string,
+  idBlockedOverrideResource?: string,
+): "success" | "skip" | "failure" {
+  let sawSkip = false;
+  for (const [resource, t] of Object.entries(perResource)) {
+    const systemicRefusal = isSystemicMergeRefusal(
+      t.merge_refused ?? 0,
+      undefined,
+      resource === mergeRefusalOverrideResource,
+    );
+    const isFailure =
+      (t.errors?.length ?? 0) > 0 ||
+      t.apply_incomplete === true ||
+      t.merge_record_failed === true ||
+      (t.structure_overlap ?? 0) > 0 ||
+      systemicRefusal;
+    if (isFailure) return "failure";
+
+    // Same fail-safe presence rule as shouldRecordResourceSync /
+    // computeWithholdReason: an aggregate missing these counters entirely
+    // (a legacy/replayed Workflow chunk, per those functions' own docs)
+    // reads as incomplete, never as "absent means zero, so success".
+    const incomplete =
+      t.chapters_locked === undefined ||
+      t.prune_locked === undefined ||
+      t.conflict_skipped === undefined ||
+      t.tombstone_blocked === undefined ||
+      t.counts_incomplete === true;
+    const idBlockedOverride = resource === idBlockedOverrideResource;
+    const isSkip =
+      incomplete ||
+      (t.chapters_locked ?? 0) > 0 ||
+      (t.prune_locked ?? 0) > 0 ||
+      (!idBlockedOverride && (t.conflict_skipped ?? 0) > 0) ||
+      (!idBlockedOverride && (t.tombstone_blocked ?? 0) > 0);
+    if (isSkip) sawSkip = true;
+  }
+  return sawSkip ? "skip" : "success";
+}
+
 // ── Kept-over-Door43 scale alarm (#540 item 2's "keep_ai_master") ───────────
 //
 // The gate above FREEZES a resource's export once refusals look systemic. This
