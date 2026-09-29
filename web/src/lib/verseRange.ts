@@ -224,19 +224,21 @@ export function rowHighlightsFor(
       return highlightsFor(bibleVersion, target.content, quote, occurrence, sourceByVerseStart[start]?.content ?? fallbackSource, partialGroups);
     }
     const targetVo = (target.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-    if (occurrence != null && noteVerse > start && noteVerse <= end && Array.isArray(targetVo)) {
+    if (noteVerse > start && noteVerse <= end && Array.isArray(targetVo)) {
+      // A null occurrence means 1, as in highlightsFor.
+      const occ = occurrence ?? 1;
       const sourceVerses: unknown[][] = [];
       for (let v = start; v <= end; v++) {
         const vo = (sourceByVerseStart[v]?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
         sourceVerses.push(Array.isArray(vo) ? vo : []);
       }
-      const hl = findBridgeTargetHighlights(targetVo, quote, occurrence, sourceVerses, noteVerse - start, partialGroups);
+      const hl = findBridgeTargetHighlights(targetVo, quote, occ, sourceVerses, noteVerse - start, partialGroups);
       if (hl) return hl;
       // Unresolved from the note's verse on: fall back to that verse's source
       // alone (main's rows view), never the whole span, which would light an
       // earlier verse's copy. No source for the verse: nothing lights.
       const own = sourceByVerseStart[noteVerse]?.content;
-      return own ? highlightsFor(bibleVersion, target.content, quote, occurrence, own, partialGroups) : new Set();
+      return own ? highlightsFor(bibleVersion, target.content, quote, occ, own, partialGroups) : new Set();
     }
   }
   return highlightsFor(bibleVersion, target?.content, quote, occurrence, spanSource, partialGroups);
