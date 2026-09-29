@@ -511,6 +511,14 @@ export interface ReimportCounts {
   // still bounded so a pathological book can't blow up a Workflow step's
   // serialized return value. verses only.
   merge_no_base_editor_refs?: NoBaseVerseRef[];
+  // Issue #1006: whether this book was locked (bookLocked, computed once per
+  // applyVerseRows call from effectiveBookLock) for at least one verse behind
+  // this run's `merge_no_base` count. A locked book never exports, so the
+  // admin/editor `keep_no_base` messages must not warn that "tonight's export
+  // will still overwrite" a Door43-side change — nothing exports. Left false
+  // (never set) for the tsv side, which has no export-overwrite banner to
+  // begin with. verses only.
+  merge_no_base_book_locked?: boolean;
   // Reference-move attribution (issue #540 item 3), split by WHO moved so a run
   // summary can distinguish "we published a move" from "master moved under us".
   // Only ref_moved_theirs / _both / _unattributable / _ours_conflict withhold the
@@ -794,6 +802,7 @@ function zeroCounts(): ReimportCounts {
     merge_no_base_cleared: 0,
     merge_no_base_refs: [],
     merge_no_base_editor_refs: [],
+    merge_no_base_book_locked: false,
     ref_moved_ours: 0,
     ref_moved_ours_conflict: 0,
     ref_moved_theirs: 0,
@@ -1028,6 +1037,11 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_no_base += from.merge_no_base ?? 0;
   into.merge_no_base_mint_skipped += from.merge_no_base_mint_skipped ?? 0;
   into.merge_no_base_cleared += from.merge_no_base_cleared ?? 0;
+  // OR, not sum: this book was locked for the alert's purposes if ANY chunk
+  // saw it locked while recording a merge_no_base verse. A book/resource run
+  // spans multiple applyVerseRows calls (one per chapter/chunk); the lock can
+  // only meaningfully be one thing for the whole run's banner.
+  if (from.merge_no_base_book_locked) into.merge_no_base_book_locked = true;
   // Same shape as blocked_samples above: diagnostic, capped, gates nothing. A
   // chunk memoized before this field existed contributes no refs while still
   // contributing its count, which is why the banner reports the count as
@@ -1598,6 +1612,7 @@ async function runReimport(
       recordingFailed: perResource.ult.merge_record_failed === true,
       noBaseCount: perResource.ult.merge_no_base,
       noBaseRefs: perResource.ult.merge_no_base_refs,
+      noBaseBookLocked: perResource.ult.merge_no_base_book_locked === true,
       noBaseEditorRefs: perResource.ult.merge_no_base_editor_refs,
       observedAt: alertObservedAt,
     });
@@ -1607,6 +1622,7 @@ async function runReimport(
       recordingFailed: perResource.ust.merge_record_failed === true,
       noBaseCount: perResource.ust.merge_no_base,
       noBaseRefs: perResource.ust.merge_no_base_refs,
+      noBaseBookLocked: perResource.ust.merge_no_base_book_locked === true,
       noBaseEditorRefs: perResource.ust.merge_no_base_editor_refs,
       observedAt: alertObservedAt,
     });
@@ -6867,6 +6883,10 @@ async function applyVerseRows(
         }
         if (merge.action === "keep_no_base") {
           counts.merge_no_base++;
+          // Issue #1006: a locked book never exports, so the admin/editor
+          // messages built from this run's merge_no_base count must not warn
+          // that tonight's export will overwrite anything.
+          if (bookLocked) counts.merge_no_base_book_locked = true;
           // Name the verse, capped. keep_no_base writes no verse_merge_conflicts
           // row (that table only holds adjudicated outcomes), so without this the
           // banner's own admission — "a Door43-side change to them will still be
@@ -10700,6 +10720,7 @@ export async function runChunkedReimport(
         recordingFailed: perResource[e.resource].merge_record_failed === true,
         noBaseCount: perResource[e.resource].merge_no_base,
         noBaseRefs: perResource[e.resource].merge_no_base_refs,
+        noBaseBookLocked: perResource[e.resource].merge_no_base_book_locked === true,
         noBaseEditorRefs: perResource[e.resource].merge_no_base_editor_refs,
         observedAt: alertObservedAt,
       });

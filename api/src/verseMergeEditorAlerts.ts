@@ -360,7 +360,7 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
 
 export function buildMergeConflictGuidance(
   rows: Array<{ action: string; reason?: string }>,
-  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
+  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[]; noBaseBookLocked?: boolean } = {},
 ): string {
   const overwrittenRows = rows.filter((r) => r.action === "adopt_conflict");
   const overwritten = overwrittenRows.length;
@@ -422,7 +422,7 @@ export function buildMergeConflictGuidance(
       ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +
         "(see worker logs) — this table and count may be missing rows from tonight's sync."
       : "",
-    opts.noBaseCount ? buildNoBaseSentence(opts.noBaseCount, opts.noBaseRefs) : "",
+    opts.noBaseCount ? buildNoBaseSentence(opts.noBaseCount, opts.noBaseRefs, opts.noBaseBookLocked) : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -476,7 +476,7 @@ export function alertMessageCarriesNoBaseWarning(message: string): boolean {
   );
 }
 
-export function buildNoBaseSentence(count: number, refs?: string[]): string {
+export function buildNoBaseSentence(count: number, refs?: string[], bookLocked?: boolean): string {
   // Never list more refs than the count claims. Unreachable today (refs are
   // pushed on the same branch that increments the count, and nothing decrements
   // it), but the invariant is cheap to enforce and the helper is exported.
@@ -489,12 +489,21 @@ export function buildNoBaseSentence(count: number, refs?: string[]): string {
   // unlisted remainder to be a contiguous tail.
   const more = count > listed.length ? `; +${count - listed.length} more` : "";
   const where = listed.length > 0 ? ` Verses (sample): ${listed.join(", ")}${more}.` : "";
+  // Issue #1006: a locked book is never exported (bookReimport.ts's runReimport
+  // / runChunkedReimport skip it outright), so "tonight's export will still
+  // overwrite" is false for these — it asserts a cause that cannot happen and
+  // points the admin at a remedy (re-saving) that ships nothing either. Say
+  // what IS true instead: Door43 holds a different version, and only an admin
+  // unlocking + reconciling the book changes what ships.
+  const consequence = bookLocked
+    ? `Nothing was overwritten in these — but this book is locked, so nothing here exports; Door43 holds a ` +
+      `different version of ${listed.length === 1 && !more ? "it" : "them"} until an admin reconciles it.`
+    : `Nothing was overwritten in these — but a Door43-side change to them will still be overwritten by ` +
+      `tonight's export.`;
   return (
     `${count} verse(s) could not be adjudicated: ${NO_BASE_ADMIN_FINGERPRINT} for them from before this ` +
     `book+resource's master-confirmed watermark, so the sync could not tell which side changed, and so it ` +
-    `kept the app's version.${where} ` +
-    `Nothing was overwritten in these — but a Door43-side change to them will still be overwritten by ` +
-    `tonight's export.`
+    `kept the app's version.${where} ${consequence}`
   );
 }
 
@@ -536,6 +545,11 @@ export function groupNoBaseVersesByEditor(
   resource: string,
   noBase: NoBaseVerseRef[],
   usernameByKey: Map<string, string>,
+  // Issue #1006: same meaning as buildNoBaseSentence's `bookLocked` — this
+  // book is locked, so nothing here exports and "re-save first" ships
+  // nothing either. Defaults false so every existing call site (and the
+  // fixture tests below) keeps today's wording unless it opts in.
+  bookLocked: boolean = false,
 ): Map<string, { refs: string[]; message: string }> {
   const byUser = new Map<string, string[]>();
   for (const ref of noBase) {
@@ -549,12 +563,16 @@ export function groupNoBaseVersesByEditor(
   }
   const out = new Map<string, { refs: string[]; message: string }>();
   for (const [username, refs] of byUser) {
+    const consequence = bookLocked
+      ? `Nothing has been overwritten — but this book is locked, so nothing here is exported (re-saving ` +
+        `it here does not ship it either); Door43 holds a different version until an admin reconciles it.`
+      : `Nothing has been overwritten — but if ` +
+        `Door43 has changed ${refs.length === 1 ? "it" : "them"} since, tonight's export will still overwrite your ` +
+        `text there unless you open and re-save the verse${refs.length === 1 ? "" : "s"} here first.`;
     const message =
       `Door43's sync could not tell whether your edit or a Door43-side edit is newer, for ${refs.length} ` +
       `verse(s) you last edited in ${book} ${resource.toUpperCase()}: ${refs.join(", ")} — ${NO_BASE_EDITOR_FINGERPRINT}, ` +
-      `so it kept your version for now. Nothing has been overwritten — but if ` +
-      `Door43 has changed ${refs.length === 1 ? "it" : "them"} since, tonight's export will still overwrite your ` +
-      `text there unless you open and re-save the verse${refs.length === 1 ? "" : "s"} here first.`;
+      `so it kept your version for now. ${consequence}`;
     out.set(username, { refs, message });
   }
   return out;
