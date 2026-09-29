@@ -1030,6 +1030,160 @@ await withFetch(
   },
 );
 
+// ─── #875: a 'done' body with no USABLE output entry must not finalize done ──
+// "Usable" = has a rawUrl, names a repo classify() recognizes, AND is inside
+// the job's declared writes (outputKindAllowedFor). An entry failing either
+// check is skipped at import, so a done body made only of such entries used to
+// import nothing yet finalize as done and dispatch the follow-up chain. It
+// must instead take the same path as a thrown import error: held at 'running'
+// with error_kind='import_failed' (import claim released, staged_at left NULL
+// so the retry restages), then 'failed' on the second consecutive failure.
+// Drives the real pollPipelineJob -> importJobOutput -> stageJobOutput chain
+// against a stub D1 that records every statement.
+async function pollDoneBody(output, jobOverrides = {}) {
+  const body = JSON.stringify({ state: "done", output });
+  let guardedUpdateArgs = null;
+  let result;
+  const queries = [];
+  function dispatch(sql, args) {
+    if (/SELECT dcs_username FROM users/.test(sql)) {
+      return { changes: 0, rows: [], single: { dcs_username: "translator" } };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
+      return { changes: 1, rows: [{ import_claimed_at: 3000 }], single: { import_claimed_at: 3000 } };
+    }
+    if (/SELECT state, error_kind FROM pipeline_jobs WHERE job_id = \?1/.test(sql)) {
+      return { changes: 0, rows: [], single: { state: "running", error_kind: null } };
+    }
+    if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { staged_at: null } };
+    }
+    if (/SELECT user_id FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { user_id: 1 } };
+    }
+    if (/UPDATE pipeline_jobs SET\s+state = \?2,[\s\S]*last_polled_at = unixepoch\(\)/.test(sql)) {
+      guardedUpdateArgs = args;
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/^\s*(UPDATE|DELETE)/.test(sql)) return { changes: 1, rows: [], single: null };
+    return { changes: 0, rows: [], single: null };
+  }
+  const env = {
+    BT_API_TOKEN: "tok",
+    queries,
+    DB: {
+      prepare(sql) {
+        queries.push(sql);
+        return {
+          bind(...args) {
+            return {
+              sql,
+              args,
+              async run() {
+                const res = dispatch(sql, args);
+                return { meta: { changes: res.changes }, results: res.rows };
+              },
+              async first() {
+                return dispatch(sql, args).single;
+              },
+              async all() {
+                return { results: dispatch(sql, args).rows };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts) {
+        return stmts.map((s) => {
+          const res = dispatch(s.sql, s.args);
+          return { meta: { changes: res.changes }, results: res.rows };
+        });
+      },
+    },
+  };
+  // A rawUrl fetch returns a header-only TSV (a usable entry that stages zero
+  // rows); the upstream status fetch returns the done body.
+  await withFetch(
+    async (url) =>
+      String(url).startsWith("https://raw.example/")
+        ? new Response("Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n", { status: 200 })
+        : new Response(body, { status: 200 }),
+    async () => {
+      const originalError = console.error;
+      console.error = () => {};
+      try {
+        result = await pollPipelineJob(env, {
+          ...forceStoppedMidPollJob,
+          job_id: "job-875",
+          follow_up_job_id: null,
+          follow_up_options: '{"noIntro":true}',
+          error_kind: null,
+          ...jobOverrides,
+        });
+      } finally {
+        console.error = originalError;
+      }
+    },
+  );
+  return { result, queries, guardedUpdateArgs };
+}
+
+function assertHeldForRetry(run, label, reasonFragment) {
+  const a = run.guardedUpdateArgs;
+  assert(run.result?.kind === "ok", `${label}: poll completes without throwing`);
+  assert(a?.[1] === "running", `${label}: state held at 'running', not upstream 'done' (got ${JSON.stringify(a?.[1])})`);
+  assert(a?.[4] === "import_failed", `${label}: error_kind is 'import_failed' (got ${JSON.stringify(a?.[4])})`);
+  assert(
+    typeof a?.[5] === "string" && a[5].includes(reasonFragment),
+    `${label}: error_message names the skip reason (got ${JSON.stringify(a?.[5])})`,
+  );
+  assert(a?.[6] === null, `${label}: output_json NOT written, so the next poll re-imports`);
+  assert(
+    !run.queries.some((q) => /UPDATE pipeline_jobs SET staged_at = unixepoch\(\)/.test(q)),
+    `${label}: staged_at NOT marked, so the retry restages instead of hitting 'already staged'`,
+  );
+  assert(
+    run.queries.some((q) => /UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(q)),
+    `${label}: import claim released, so the retry can claim it`,
+  );
+  assert(!run.queries.some((q) => /INSERT INTO pipeline_jobs/.test(q)), `${label}: follow-up job NOT enqueued`);
+}
+
+console.log("\n[#875: done body whose only entry names an unrecognized repo]");
+assertHeldForRetry(
+  await pollDoneBody([{ type: "unknown", repo: "unfoldingWord/en_unrecognized", rawUrl: "https://raw.example/x" }]),
+  "unrecognized repo",
+  "unrecognized repo",
+);
+
+console.log("\n[#875: done body whose only entry is outside the job's declared writes (notes job, en_tq)]");
+assertHeldForRetry(
+  await pollDoneBody([{ type: "tsv", repo: "unfoldingWord/en_tq", rawUrl: "https://raw.example/tq" }]),
+  "outside declared writes",
+  "does not write tq",
+);
+
+console.log("\n[#875: second consecutive no-usable-output poll goes 'failed']");
+{
+  const run = await pollDoneBody(
+    [{ type: "unknown", repo: "unfoldingWord/en_unrecognized", rawUrl: "https://raw.example/x" }],
+    { error_kind: "import_failed" },
+  );
+  assert(run.guardedUpdateArgs?.[1] === "failed", `state is 'failed' on the retry (got ${JSON.stringify(run.guardedUpdateArgs?.[1])})`);
+  assert(run.guardedUpdateArgs?.[4] === "import_failed", "error_kind stays 'import_failed'");
+}
+
+console.log("\n[#875: a mixed batch with one usable entry still finalizes done]");
+{
+  const run = await pollDoneBody([
+    { type: "unknown", repo: "unfoldingWord/en_unrecognized", rawUrl: "https://raw.example/x" },
+    { type: "tsv", repo: "unfoldingWord/en_tn", rawUrl: "https://raw.example/tn" },
+  ]);
+  assert(run.guardedUpdateArgs?.[1] === "done", `state is 'done' (got ${JSON.stringify(run.guardedUpdateArgs?.[1])})`);
+  assert(run.guardedUpdateArgs?.[4] === null, `no error_kind (got ${JSON.stringify(run.guardedUpdateArgs?.[4])})`);
+  assert(typeof run.guardedUpdateArgs?.[6] === "string", "output_json written");
+}
+
 // ─── F6: the CAS UPDATE runs before the upstream stop call, and the final
 // error_message UPDATE runs after it ─────────────────────────────────────
 // Order matters: the old code called upstream /stop BEFORE the CAS, so a CAS
