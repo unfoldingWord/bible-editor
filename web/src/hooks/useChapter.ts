@@ -21,7 +21,7 @@ import {
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
 import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
-import { isChapterLocked, trackNavigation, updateIfCurrent, type ChapterRoute, type NavigationGen } from "../lib/chapterStale";
+import { currentRouteFetcher, isChapterLocked, trackNavigation, updateIfCurrent, type ChapterRoute, type NavigationGen } from "../lib/chapterStale";
 import {
   applyStep,
   applyUpdated,
@@ -192,11 +192,17 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     //
     // `=== true` so a caller that hands `refetch` straight to an event
     // handler (receiving a truthy event object) still gets the replace.
+    //
+    // The route is read when the fetch RUNS (currentRouteFetcher), so a
+    // `refetch` captured on an earlier chapter (a "Refresh" toast, the
+    // post-unlock refetch) fetches the current chapter instead of replacing
+    // its GET with the old one and leaving the view locked (#892).
+    const fetchRoute = currentRouteFetcher(routeRef, (b, c, s) => api.getChapter(b, c, s));
     return sequencer.current!.refetch(
-      (signal, onAttempt) => fetchWithRetry((s) => api.getChapter(book, chapter, s), { signal, onAttempt }),
+      (signal, onAttempt) => fetchWithRetry(fetchRoute, { signal, onAttempt }),
       opts?.keepNewerLocal === true,
     );
-  }, [book, chapter]);
+  }, []);
 
   useEffect(() => {
     // The previous (book, chapter)'s payload is NOT cleared here (#892): it
@@ -210,7 +216,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     // Abort the in-flight GET and drop any deferred merge or queued steps,
     // so nothing from this (book, chapter) lands after navigation/unmount.
     return () => sequencer.current?.reset();
-  }, [refetch]);
+  }, [book, chapter, refetch]);
 
   const applyLocalRowPatch = useCallback<UseChapterReturn["applyLocalRowPatch"]>(
     (kind, id, patch) => {

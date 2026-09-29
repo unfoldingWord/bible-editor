@@ -334,6 +334,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // would go out with a stale version and take a needless 409.
   const handleTwlOrderUnlock = useCallback(
     async (verse: number) => {
+      if (chapterStaleRef.current) return; // #892: route chapter, on-screen verse
       try {
         await api.unlockTwlOrder(book, chapter, verse);
         applyLocalTwlOrderLock(verse, null);
@@ -350,6 +351,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // quiet until automatic ordering proposes something genuinely different.
   const handleTwlOrderDismiss = useCallback(
     async (verse: number, dismissedOrder: string) => {
+      if (chapterStaleRef.current) return; // #892: route chapter, on-screen verse
       try {
         const lock = await api.dismissTwlOrderSuggestion(book, chapter, verse, dismissedOrder);
         applyLocalTwlOrderLock(verse, lock);
@@ -418,7 +420,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   useEffect(() => {
     if (!import.meta.env.DEV) return;
     registerVerseVersionReader((readBook, readChapter, readVerse, bibleVersion) => {
-      if (readBook !== book || readChapter !== chapter) return undefined;
+      if (readBook !== book || readChapter !== chapter || dataRef.current?.chapter !== chapter) return undefined;
       return dataRef.current?.verses[bibleVersion]?.[readVerse]?.version;
     });
   }, [book, chapter]);
@@ -2341,7 +2343,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // comment-deep-link consumer below runs after this effect, so it can still
     // open a popover on the chapter we're arriving at.
     closeComments();
+    // The quote builder is portaled outside the inert container (#892) and is
+    // about the chapter being left.
+    setQuoteBuildTarget(null);
+    setQuoteBuildSelectedKeys(new Set());
   }, [chapter, initialVerse, closeComments]);
+  // Chapter-only (not on a same-chapter verse link): the chapter board and an
+  // actionable pipeline toast ("new AI notes are ready, Refresh") are about the
+  // chapter being left, and both sit outside the inert container (#892).
+  const toastChapterRef = useRef(chapter);
+  useEffect(() => {
+    if (toastChapterRef.current === chapter) return;
+    toastChapterRef.current = chapter;
+    setBoardOpen(false);
+    setPipelineToast((cur) => (cur?.action ? null : cur));
+  }, [chapter]);
 
   // A front-matter / intro chapter (chapter 0) has only the intro tile (verse 0)
   // and no real verses. Navigation defaults activeVerse to 1, which doesn't
@@ -3262,7 +3278,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // open chapter, else the book-mode cache. Bridge create/break read both rows'
   // versions from here to CAS the structural change.
   const versesForChapterMap = (ch: number): Record<string, Record<number, VerseDto>> | undefined => {
-    if (ch === chapter) return dataRef.current?.verses;
+    // The payload's own chapter, not the route's: during the stale window
+    // (#892) the payload is still the previous chapter.
+    if (ch === dataRef.current?.chapter) return dataRef.current?.verses;
     const cs = bookHook?.chapters.get(ch);
     return cs?.kind === "ready" ? cs.data.verses : undefined;
   };
@@ -3548,7 +3566,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         exportMenu={
           <ExportUsfmButton
             book={book}
-            chapter={chapter}
+            chapter={viewChapter}
             enabledVersions={displayedVersions}
             chapterVersesFor={(version) =>
               data ? Object.values(data.verses[version] ?? {}) : []
@@ -3558,7 +3576,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         printPreview={
           <PrintPreviewButton
             book={book}
-            chapter={chapter}
+            chapter={viewChapter}
             enabledVersions={displayedVersions}
             chapterVersesFor={(version) =>
               data ? Object.values(data.verses[version] ?? {}) : []
@@ -3665,7 +3683,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         sx={{ flex: 1, display: "flex", overflow: "hidden" }}
         // Stale copy on screen (#892): inert blocks focus, typing, clicks and
         // drags into everything below. React 18 has no `inert` prop type and
-        // only renders the attribute from a string value.
+        // only renders the attribute from a string value. React 19 treats
+        // `inert` as a boolean: switch to `inert={true}` on upgrade (s16
+        // asserts the attribute is present).
         {...(chapterStale ? ({ inert: "", "aria-busy": "true", "data-stale-chapter": String(viewChapter) } as Record<string, string>) : {})}
       >
         {!railCollapsed && (
@@ -4069,6 +4089,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           verseOptions={verseNumbers}
           onNoteChangeVerse={(id, verse, verseEnd) => {
+            // #892: book/chapter come from the route, the verse from the copy
+            // on screen; refuse while that copy is another chapter's.
+            if (chapterStaleRef.current) return;
             // Retarget a note to another verse in this chapter, or extend it to
             // span a range (verseEnd > verse => ref_raw "chapter:start-end").
             // Read the live row (dataRef, not the render closure) so a rapid
@@ -4134,6 +4157,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveQuestionId(null);
           }}
           onWordChangeVerse={(id, verse) => {
+            // #892: book/chapter come from the route, the verse from the copy
+            // on screen; refuse while that copy is another chapter's.
+            if (chapterStaleRef.current) return;
             // Retarget a word link to another verse of the current bridge — the
             // Words "change reference" dropdown, mirroring onNoteChangeVerse. A
             // twl never spans, so ref_raw is always a single verse. Read the live
@@ -4163,6 +4189,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveQuestionId(null);
           }}
           onWordReorder={async (draggedId, refId, position) => {
+            // #892: book/chapter come from the route, the verse from the copy
+            // on screen; refuse while that copy is another chapter's.
+            if (chapterStaleRef.current) return;
             // See onNoteReorder: live ref list, not the stale render closure.
             const twl = dataRef.current?.twl ?? [];
             const dragged = twl.find((r) => r.id === draggedId);
@@ -4481,8 +4510,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             const payload = rec?.payload as { plainText?: string } | undefined;
             const plain = payload?.plainText;
             if (typeof plain !== "string") return;
+            // Compare with the payload's chapter, not the route's: during the
+            // stale window (#892) `data` is still the previous chapter, and its
+            // verse would be the wrong baseline and expected_version.
             const cached =
-              ch === chapter
+              ch === data?.chapter
                 ? data?.verses[bv]?.[v]
                 : bookHook?.chapters.get(ch)?.kind === "ready"
                   ? (bookHook.chapters.get(ch) as { kind: "ready"; data: { verses: Record<string, Record<number, VerseDto>> } }).data.verses[bv]?.[v]
