@@ -21,6 +21,7 @@ import {
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
 import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
+import { isStaleChapter, updateIfCurrent, type ChapterRoute } from "../lib/chapterStale";
 import {
   applyStep,
   applyUpdated,
@@ -51,7 +52,18 @@ export interface RefetchOptions {
 
 export interface UseChapterReturn {
   status: Status;
+  /**
+   * The payload on screen. After a chapter change this is still the PREVIOUS
+   * chapter's payload until the new one lands (#892): check `stale`.
+   */
   data: ChapterPayload | null;
+  /**
+   * True while `data` belongs to a different (book, chapter) than the one this
+   * hook was asked for. It is shown so the view doesn't blank, but it must be
+   * locked: nothing may be edited or queued against it (#531). Local applies
+   * are no-ops while stale.
+   */
+  stale: boolean;
   error: string | null;
   /** Incremented every failed attempt during the current retry loop. Useful for showing "reconnecting…". */
   retryAttempts: number;
@@ -111,10 +123,20 @@ export interface UseChapterReturn {
 }
 
 export function useChapter(book: string, chapter: number): UseChapterReturn {
+  // The route this render is for. Written before the state hooks so every
+  // local-apply updater (run while React processes the state queue) compares
+  // against the current route, not the one its callback was created under.
+  const routeRef = useRef<ChapterRoute>({ book, chapter });
+  routeRef.current = { book, chapter };
   const [status, setStatus] = useState<Status>("idle");
   // ChapterData = the server payload + client-only verse tombstones. A fresh
   // payload from refetch carries none, which is how tombstones get cleared.
   const [data, setData] = useState<ChapterData | null>(null);
+  // Every local apply goes through here: it lands only on the route's own
+  // payload, never on the previous chapter's copy still on screen (#892).
+  const mutate = useCallback((fn: (prev: ChapterData) => ChapterData) => {
+    setData((prev) => updateIfCurrent(prev, routeRef.current, fn));
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [retryAttempts, setRetryAttempts] = useState(0);
   // Request ordering (abort-and-replace, the deferred first-open merge, the
@@ -133,8 +155,8 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       setRetryAttempts(attempts);
     },
     onLanded: (payload, merge, queued) => {
-      // With `prev` null (the mount effect cleared it) `mergeRefetched` is a
-      // plain replace.
+      // With `prev` null, or the previous chapter's stale copy (#892),
+      // `mergeRefetched` is a plain replace.
       setData((prev) => replaySteps(merge ? mergeRefetched(prev, payload) : payload, queued));
       setStatus("ready");
       setRetryAttempts(0);
@@ -166,18 +188,13 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   }, [book, chapter]);
 
   useEffect(() => {
-    // Clear the previous (book, chapter)'s payload before the new fetch
-    // lands. `refetch` sets status to "loading" but never used to clear
-    // `data`, so from the moment (book, chapter) changed until the new
-    // payload arrived, Shell's `!data` gate fell through and rendered the
-    // PREVIOUS chapter's verses/notes/questions/words under the new
-    // book/chapter labels — and, because the editable UI only mounts in
-    // that data branch, let editing happen against stale content. This
-    // effect only re-runs when `refetch`'s own deps (book, chapter) change
-    // (it's identity-stable otherwise), so manual refetch() calls elsewhere
-    // (retry button, post-import refresh) are unaffected and keep refreshing
-    // in place without this blank. See #531.
-    setData(null);
+    // The previous (book, chapter)'s payload is NOT cleared here (#892): it
+    // stays on screen until the new one lands, so a chapter change doesn't
+    // blank and rebuild the view. It is reported as `stale` (derived below
+    // from data vs route) and Shell locks every edit path while it is: the
+    // #531 rule that no edit may be typed into, or queued against, a copy of
+    // a chapter the route has moved away from. Local applies are no-ops while
+    // stale (`mutate`), as they were while the payload used to be null.
     void refetch();
     // Abort the in-flight GET and drop any deferred merge or queued steps,
     // so nothing from this (book, chapter) lands after navigation/unmount.
@@ -186,14 +203,13 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
 
   const applyLocalRowPatch = useCallback<UseChapterReturn["applyLocalRowPatch"]>(
     (kind, id, patch) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
         const next = list.map((r) => (r.id === id ? { ...r, ...patch } : r));
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
-    [],
+    [mutate],
   );
 
   // Row replacements / deletes / inserts are recorded for replay while a
@@ -205,27 +221,25 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   const applyLocalRowReplacement = useCallback<UseChapterReturn["applyLocalRowReplacement"]>(
     (kind, row) => {
       sequencer.current?.record({ type: "rowReplace", kind, row });
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
         const next = list.map((r) => (r.id === row.id ? row : r));
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
-    [],
+    [mutate],
   );
 
   const applyLocalRowDelete = useCallback<UseChapterReturn["applyLocalRowDelete"]>(
     (kind, id) => {
       sequencer.current?.record({ type: "rowDelete", kind, id });
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
         const next = list.filter((r) => r.id !== id);
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
-    [],
+    [mutate],
   );
 
   const applyLocalRowInsert = useCallback<UseChapterReturn["applyLocalRowInsert"]>(
@@ -235,8 +249,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       if (row.book === book && row.chapter === chapter) {
         sequencer.current?.record({ type: "rowInsert", kind, row, afterId: position?.afterId });
       }
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
         // Skip if a row with this id is already present (e.g. createRow response
         // racing with an outbox replacement).
@@ -256,7 +269,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
-    [book, chapter],
+    [book, chapter, mutate],
   );
 
   // The verse map is reduced by lib/verseStructure.ts so the WS reorder rules
@@ -264,11 +277,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // place rather than being re-derived in each updater below.
   const applyLocalVerse = useCallback<UseChapterReturn["applyLocalVerse"]>(
     (verse) => {
-      setData((prev) =>
-        prev ? reduceVerses(prev, verse.bible_version, (s) => applyUpdated(s, verse, { force: true })) : prev,
-      );
+      mutate((prev) => reduceVerses(prev, verse.bible_version, (s) => applyUpdated(s, verse, { force: true })));
     },
-    [],
+    [mutate],
   );
 
   // Every strictly-gated step (never the forced optimistic edit above) goes
@@ -279,8 +290,8 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // synchronously when its response lands.
   const dispatchStep = useCallback((step: StructureStep) => {
     sequencer.current?.record(step);
-    setData((prev) => (prev ? applyStep(prev, step) : prev));
-  }, []);
+    mutate((prev) => applyStep(prev, step));
+  }, [mutate]);
 
   const applyRemoteVerse = useCallback<UseChapterReturn["applyRemoteVerse"]>(
     (verse) => {
@@ -317,8 +328,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       // Only a server-stamped status is recorded for replay: its updated_at is
       // what proves it newer than a refetch's snapshot (#974).
       if (updatedAt != null) sequencer.current?.record({ type: "verseStatus", verse, done, updatedAt });
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const existing = prev.verseStatuses.find((s) => s.verse === verse);
         const updated: VerseStatus = {
           book: prev.book,
@@ -333,13 +343,12 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         return { ...prev, verseStatuses: next };
       });
     },
-    [],
+    [mutate],
   );
 
   const applyLocalLaneCheck = useCallback<UseChapterReturn["applyLocalLaneCheck"]>(
     (verse, lane, userId, checked) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const exists = prev.verseLaneChecks.some(
           (c) => c.verse === verse && c.lane === lane && c.checked_by === userId,
         );
@@ -363,13 +372,12 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         return { ...prev, verseLaneChecks: next };
       });
     },
-    [],
+    [mutate],
   );
 
   const applyLaneCheckers = useCallback<UseChapterReturn["applyLaneCheckers"]>(
     (verse, lane, checkers) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const rest = prev.verseLaneChecks.filter((c) => !(c.verse === verse && c.lane === lane));
         const now = Math.floor(Date.now() / 1000);
         const added: VerseLaneCheck[] = checkers.map((checked_by) => ({
@@ -383,29 +391,27 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         return { ...prev, verseLaneChecks: [...rest, ...added] };
       });
     },
-    [],
+    [mutate],
   );
 
   const replaceLaneChecksForLane = useCallback<UseChapterReturn["replaceLaneChecksForLane"]>(
     (lane, checks) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const rest = prev.verseLaneChecks.filter((c) => c.lane !== lane);
         return { ...prev, verseLaneChecks: [...rest, ...checks] };
       });
     },
-    [],
+    [mutate],
   );
 
   const applyLocalTwlOrderLock = useCallback<UseChapterReturn["applyLocalTwlOrderLock"]>(
     (verse, lock) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const rest = (prev.twlOrderLocks ?? []).filter((l) => l.verse !== verse);
         return { ...prev, twlOrderLocks: lock ? [...rest, lock] : rest };
       });
     },
-    [],
+    [mutate],
   );
 
   // Adopt server-confirmed values when an outbox op succeeds.
@@ -448,6 +454,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   return {
     status,
     data,
+    stale: isStaleChapter(data, { book, chapter }),
     error,
     retryAttempts,
     refetch,
