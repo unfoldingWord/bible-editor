@@ -28,7 +28,7 @@ import { SectionHeaderBand } from "./SectionHeaderBand";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
-import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
+import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow, rowHighlightsFor, sourceForTargetRow } from "../lib/verseRange";
 import { directionForBook, directionForVersion } from "../lib/direction";
 import {
   classifySourceQuery,
@@ -70,6 +70,8 @@ interface Props {
   // spanning quote paints only 11+12, not every chapter verse that
   // happens to share a Hebrew word.
   activeNoteCoveredVerses?: readonly number[];
+  // The active note's own verse; its occurrence counts there (#957).
+  activeNoteVerse?: number | null;
   // Transient reorder "stoplight": while a note is dragged (or for ~3s after an
   // arrow move) the active verse also lights the moved note's candidate
   // predecessor (green underline) and successor (red overline) on channels
@@ -226,6 +228,7 @@ function ScriptureColumnInner({
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
   activeNoteCoveredVerses = EMPTY_COVERED,
+  activeNoteVerse,
   reorderHighlight,
   mode,
   enabledVersions,
@@ -647,6 +650,7 @@ function ScriptureColumnInner({
             activeNoteOccurrence={activeNoteOccurrence}
             activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
             activeNoteCoveredVerses={activeNoteCoveredVerses}
+            activeNoteVerse={activeNoteVerse}
             reorderHighlight={reorderHighlight ?? null}
             lexiconMap={lexiconMap}
             twl={twl}
@@ -681,6 +685,7 @@ function ScriptureColumnInner({
               activeNoteOccurrence={activeNoteOccurrence}
               activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
               activeNoteCoveredVerses={activeNoteCoveredVerses}
+              activeNoteVerse={activeNoteVerse}
               reorderHighlight={reorderHighlight ?? null}
               activeSourceContent={activeSourceContent}
               scrollNonce={scrollNonce}
@@ -725,6 +730,7 @@ function ScriptureColumnInner({
                 activeNoteOccurrence={activeNoteOccurrence}
                 activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
                 activeNoteCoveredVerses={activeNoteCoveredVerses}
+                activeNoteVerse={activeNoteVerse}
                 reorderHighlight={reorderHighlight ?? null}
                 activeSourceContent={activeSourceContent}
                 scrollNonce={scrollNonce}
@@ -786,6 +792,7 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     a.activeNoteOccurrence === b.activeNoteOccurrence &&
     a.activeNoteQuotePartialGroups === b.activeNoteQuotePartialGroups &&
     a.activeNoteCoveredVerses === b.activeNoteCoveredVerses &&
+    a.activeNoteVerse === b.activeNoteVerse &&
     a.reorderHighlight === b.reorderHighlight &&
     a.mode === b.mode &&
     a.enabledVersions === b.enabledVersions &&
@@ -840,6 +847,7 @@ function StackedBody({
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
   activeNoteCoveredVerses = EMPTY_COVERED,
+  activeNoteVerse,
   reorderHighlight,
   lexiconMap,
   twl,
@@ -868,6 +876,8 @@ function StackedBody({
   activeNoteOccurrence: number | null;
   activeNoteQuotePartialGroups?: boolean;
   activeNoteCoveredVerses?: readonly number[];
+  // The active note's own verse; its occurrence counts there (#957).
+  activeNoteVerse?: number | null;
   reorderHighlight: ReorderHighlight | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   twl: TwlRow[];
@@ -906,7 +916,9 @@ function StackedBody({
   // OL-anchor the ULT/UST highlights on the active verse's source (UHB/UGNT)
   // verse so reordered translations still light up. During a preview the
   // yellow follows the MOVED note (so a hover over a non-selected note's grip
-  // still lights it); otherwise the active note.
+  // still lights it); otherwise the active note. Bridged rows anchor on
+  // their whole source span via rowHighlightsFor, which is why `uhb` (the
+  // whole column, not just activeUhbV) is threaded through below (#957).
   const activeUltV = ult[activeVerse];
   const activeUstV = ust[activeVerse];
   const activeUhbV = uhb[activeVerse];
@@ -914,28 +926,32 @@ function StackedBody({
   const activeQuote = ro?.movedQuote ?? activeNoteQuote;
   const activeOcc = ro?.movedQuote ? ro.movedOccurrence : activeNoteOccurrence;
   const activePartial = !ro?.movedQuote && activeNoteQuotePartialGroups;
+  // A note's occurrence counts within its own verse, which a bridged row
+  // needs to find the right source instance (#957).
+  const activeNoteVerseForOcc = ro?.movedQuote ? ro.movedVerse : activeNoteVerse;
   // Hoisted out of the per-verse .map() below: up to 9 highlight Sets only
   // for the single active row, recomputed only when the active verse's own
-  // content or the highlight-driving quote/occurrence actually changes — not
-  // on every StackedBody render (e.g. an unrelated verse's save).
+  // content, the source column (bridged rows can span it), or the
+  // highlight-driving quote/occurrence actually changes — not on every
+  // StackedBody render (e.g. an unrelated verse's save).
   const activeHighlights = useMemo(() => {
-    const ultHL = highlightsFor("ULT", activeUltV?.content, activeQuote, activeOcc, activeUhbV?.content, activePartial);
-    const ustHL = highlightsFor("UST", activeUstV?.content, activeQuote, activeOcc, activeUhbV?.content, activePartial);
+    const ultHL = rowHighlightsFor("ULT", activeUltV, activeQuote, activeOcc, uhb, activeNoteVerseForOcc, activePartial);
+    const ustHL = rowHighlightsFor("UST", activeUstV, activeQuote, activeOcc, uhb, activeNoteVerseForOcc, activePartial);
     const uhbHL = highlightsFor(uhbLabel, activeUhbV?.content, activeQuote, activeOcc, undefined, activePartial);
     // Reorder stoplight: the moved note's candidate neighbours, resolved per
     // version (ULT/UST OL-anchored on UHB, like the active set). Undefined
     // unless a drag / hover / recent arrow-move is in flight.
     const ultPrevHL = ro?.prevQuote
-      ? highlightsFor("ULT", activeUltV?.content, ro.prevQuote, ro.prevOccurrence, activeUhbV?.content)
+      ? rowHighlightsFor("ULT", activeUltV, ro.prevQuote, ro.prevOccurrence, uhb, ro.prevVerse)
       : undefined;
     const ultNextHL = ro?.nextQuote
-      ? highlightsFor("ULT", activeUltV?.content, ro.nextQuote, ro.nextOccurrence, activeUhbV?.content)
+      ? rowHighlightsFor("ULT", activeUltV, ro.nextQuote, ro.nextOccurrence, uhb, ro.nextVerse)
       : undefined;
     const ustPrevHL = ro?.prevQuote
-      ? highlightsFor("UST", activeUstV?.content, ro.prevQuote, ro.prevOccurrence, activeUhbV?.content)
+      ? rowHighlightsFor("UST", activeUstV, ro.prevQuote, ro.prevOccurrence, uhb, ro.prevVerse)
       : undefined;
     const ustNextHL = ro?.nextQuote
-      ? highlightsFor("UST", activeUstV?.content, ro.nextQuote, ro.nextOccurrence, activeUhbV?.content)
+      ? rowHighlightsFor("UST", activeUstV, ro.nextQuote, ro.nextOccurrence, uhb, ro.nextVerse)
       : undefined;
     const uhbPrevHL = ro?.prevQuote
       ? highlightsFor(uhbLabel, activeUhbV?.content, ro.prevQuote, ro.prevOccurrence)
@@ -949,14 +965,18 @@ function StackedBody({
     activeUltV,
     activeUstV,
     activeUhbV,
+    uhb,
     activeQuote,
     activeOcc,
     activePartial,
+    activeNoteVerseForOcc,
     uhbLabel,
     ro?.prevQuote,
     ro?.prevOccurrence,
     ro?.nextQuote,
     ro?.nextOccurrence,
+    ro?.prevVerse,
+    ro?.nextVerse,
   ]);
   return (
     <Box
@@ -974,6 +994,10 @@ function StackedBody({
         const ustV = ust[v];
         const uhbV = uhb[v];
         if (isActive) {
+          // Each translation OL-anchors on the source its row covers: a bridged
+          // ULT/UST row joins every UHB verse of its span (#957).
+          const ultSrc = sourceForTargetRow(uhb, ultV)?.content;
+          const ustSrc = sourceForTargetRow(uhb, ustV)?.content;
           // Highlight Sets for the active row are memoized above (activeHighlights)
           // so an unrelated re-render doesn't recompute up to 9 Sets and bust
           // ActiveLine's downstream HTML memos.
@@ -1052,7 +1076,7 @@ function StackedBody({
                 verseNum={ultStart}
                 text={ultV?.plain_text ?? ""}
                 content={ultV?.content}
-                sourceContent={uhbV?.content}
+                sourceContent={ultSrc}
                 prevContent={ultPrev?.content}
                 highlights={ultHL}
                 prevHighlights={ultPrevHL}
@@ -1087,7 +1111,7 @@ function StackedBody({
                 verseNum={ustStart}
                 text={ustV?.plain_text ?? ""}
                 content={ustV?.content}
-                sourceContent={uhbV?.content}
+                sourceContent={ustSrc}
                 prevContent={ustPrev?.content}
                 highlights={ustHL}
                 prevHighlights={ustPrevHL}
@@ -1171,11 +1195,12 @@ function StackedBody({
             chapter={chapter}
             ultV={ultV}
             ustV={ustV}
-            uhbV={uhbV}
+            uhb={uhb}
             ultPrev={showUlt ? findPrevRowInColumn(ult, ultV.verse) : null}
             ustPrev={showUst ? findPrevRowInColumn(ust, ustV.verse) : null}
             noteQuote={coverHighlight ? activeNoteQuote : null}
             noteOccurrence={coverHighlight ? activeNoteOccurrence : null}
+            noteVerse={coverHighlight ? activeNoteVerse ?? null : null}
             notePartial={coverHighlight}
             search={search}
             findActiveMatch={findActiveMatch}
@@ -1193,9 +1218,9 @@ function StackedBody({
 // active verse — the common navigation — re-renders only the two rows whose
 // active state flips, not the whole chapter's verse list. Compared by the data
 // that affects its render; onSelectVerse is treated as stable (it only ever
-// calls onSelectVerse(v) for this row's own verse). ultV / ustV / uhbV are
-// this row's own resolved verse DTOs (not the whole column map), so they
-// change ref only when THIS verse's content actually changes — an edit to a
+// calls onSelectVerse(v) for this row's own verse). ultV / ustV are this
+// row's own resolved verse DTOs (not the whole column map), so they change
+// ref only when THIS verse's content actually changes — an edit to a
 // different verse in the same chapter leaves them untouched.
 const InactiveVerseRow = memo(
   function InactiveVerseRow({
@@ -1203,11 +1228,12 @@ const InactiveVerseRow = memo(
     chapter,
     ultV,
     ustV,
-    uhbV,
+    uhb,
     ultPrev,
     ustPrev,
     noteQuote,
     noteOccurrence,
+    noteVerse,
     notePartial,
     search,
     findActiveMatch,
@@ -1219,11 +1245,12 @@ const InactiveVerseRow = memo(
     chapter: number;
     ultV: VerseDto | undefined;
     ustV: VerseDto | undefined;
-    uhbV: VerseDto | undefined;
+    uhb: Record<number, VerseDto>;
     ultPrev: VerseDto | null;
     ustPrev: VerseDto | null;
     noteQuote: string | null;
     noteOccurrence: number | null;
+    noteVerse: number | null;
     notePartial: boolean;
     search: SearchState | null;
     findActiveMatch: FindMatch | null;
@@ -1231,11 +1258,21 @@ const InactiveVerseRow = memo(
     commentCounts?: CommentCounts;
     onOpenComments?: (anchorEl: HTMLElement, verse: number) => void;
   }) {
+    // Bridged rows anchor on their whole source span, matched from the
+    // note's own verse (rowHighlightsFor, #957). uhb is the one prop here
+    // that's still the whole column map rather than a resolved per-verse
+    // DTO — rowHighlightsFor needs it to look up an arbitrary verse inside
+    // the bridge's span, not just this row's own verse — so it's excluded
+    // from the memo comparator below rather than compared by reference:
+    // UHB/UGNT are read-only/upstream (never edited live), so treating it
+    // as unchanging there is safe, and comparing it would re-invalidate
+    // every inactive row on any edit — the exact problem this memo split
+    // (ultV/ustV instead of the whole ult/ust maps) fixes.
     const ultHL = noteQuote
-      ? highlightsFor("ULT", ultV?.content, noteQuote, noteOccurrence, uhbV?.content, notePartial)
+      ? rowHighlightsFor("ULT", ultV, noteQuote, noteOccurrence, uhb, noteVerse, notePartial)
       : null;
     const ustHL = noteQuote
-      ? highlightsFor("UST", ustV?.content, noteQuote, noteOccurrence, uhbV?.content, notePartial)
+      ? rowHighlightsFor("UST", ustV, noteQuote, noteOccurrence, uhb, noteVerse, notePartial)
       : null;
     // Only render this version's cell when it's the start of its row's span —
     // keeps a UST 6-9 block from re-rendering on every verse 7,8,9 row
@@ -1413,11 +1450,11 @@ const InactiveVerseRow = memo(
     a.chapter === b.chapter &&
     a.ultV === b.ultV &&
     a.ustV === b.ustV &&
-    a.uhbV === b.uhbV &&
     a.ultPrev === b.ultPrev &&
     a.ustPrev === b.ustPrev &&
     a.noteQuote === b.noteQuote &&
     a.noteOccurrence === b.noteOccurrence &&
+    a.noteVerse === b.noteVerse &&
     a.notePartial === b.notePartial &&
     a.search === b.search &&
     a.findActiveMatch === b.findActiveMatch &&
@@ -1522,8 +1559,11 @@ function ActiveLine({
 }) {
   const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   const [historyOpen, setHistoryOpen] = useState(false);
-  // The version chip + history are editable-ULT/UST only — read-only source
-  // lines and any line without a known version/restore handler get nothing.
+  // The version chip + history are ULT/UST only — source lines and any line
+  // without a known version/restore handler get nothing. A ULT/UST line that
+  // can't be edited right now (book locked, chapter mid-pipeline) still shows
+  // the chip: history is a read, and the server allows GETs on a locked book.
+  // The dialog opens view-only there (`canRestore` below).
   //
   // `version >= 1`, not `!= null`: a chapter-intro row that does not exist yet is
   // saved through a synthetic base carrying `version: 0` (see lib/verseIntro.ts),
@@ -1531,8 +1571,8 @@ function ActiveLine({
   // server's real row (version 1) comes back. Gating on `!= null` showed a `v0`
   // chip in that window, opening a history dialog for a row the server has never
   // held. Server versions start at 1, so this only ever excludes the placeholder.
-  const showHistory =
-    !!book && !!editable && !readOnly && !isSource && (version ?? 0) >= 1 && !!onRestoreVersion;
+  const showHistory = !!book && !isSource && (version ?? 0) >= 1 && !!onRestoreVersion;
+  const canRestore = !!editable && !readOnly;
   const draftKey = useMemo(
     () =>
       book && bibleVersion ? verseKey(book, chapter, verseNum, bibleVersion) : null,
@@ -1572,7 +1612,18 @@ function ActiveLine({
       setHasDraft(false);
       return;
     }
-    return drafts.subscribeKey(draftKey, (rec) => {
+    return drafts.subscribeKey(draftKey, (rec, remote) => {
+      // #806: another tab's typing on this verse must not reach a mounted
+      // cell that has no local edits — no hydrate, no dirty flag. The cell
+      // shows the draft only when it next mounts (reopen / reload). A
+      // notification that lands before the mount callback's first read
+      // settles is shown at mount, the same as a reload a moment later.
+      // setHasDraft(false) resyncs a cell whose own clear (undo) lost the
+      // race to that notification, so it does not stay marked dirty.
+      if (remote && !dirtyRef.current) {
+        setHasDraft(false);
+        return;
+      }
       setHasDraft(!!rec);
       // Snapshot BEFORE the mirror below overwrites it: true means the user has
       // already typed into this cell, so any draft record arriving now is the
@@ -1778,7 +1829,13 @@ function ActiveLine({
           {VERSION_LABEL[label] ?? label}
         </Typography>
         {showHistory && (
-          <Tooltip title="version history — view or restore an earlier save">
+          <Tooltip
+            title={
+              canRestore
+                ? "version history — view or restore an earlier save"
+                : "version history — view earlier saves (restore is off while locked)"
+            }
+          >
             <Chip
               icon={<HistoryIcon sx={{ fontSize: 14 }} />}
               label={`v${version}`}
@@ -1986,6 +2043,7 @@ function ActiveLine({
             verseNum={verseNum}
             bibleVersion={bibleVersion}
             currentVersion={version}
+            canRestore={canRestore}
             onClose={() => setHistoryOpen(false)}
             onUseVersion={(content, plainText) => onRestoreVersion?.(content, plainText)}
           />

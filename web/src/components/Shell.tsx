@@ -17,6 +17,7 @@ import {
 import GridViewIcon from "@mui/icons-material/GridView";
 import LockIcon from "@mui/icons-material/Lock";
 import { useChapter } from "../hooks/useChapter";
+import { OpenChapterProvider } from "./NoteLinkPreview";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
@@ -58,8 +59,8 @@ import {
   guardBlocksSave,
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
-import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, versesFromKey } from "../lib/verseRange";
-import { runSaveChain } from "../lib/saveChain";
+import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, versesFromKey } from "../lib/verseRange";
+import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import {
@@ -482,13 +483,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // merging refetch issued after it. Cost: if the mount GET already landed
     // when the socket opens, this is a second GET of the same chapter — the
     // price of correctness, deliberately not avoided with timestamps. If the
-    // mount GET is still in flight, `refetch` aborts and restarts it, so the
-    // chapter is still fetched once (see useChapter.refetch).
+    // mount GET is still in flight, `refetch` does not abort it: the mount GET
+    // lands and renders first, and the merging GET is issued right after it,
+    // so first paint never waits on the socket (#902; see
+    // hooks/chapterFetchSequencer.ts).
     //
     // Merging, not replacing: a reconnect fires on the same `online` moment
     // that drains the outbox, so the GET races the tab's own PATCHes. A verse
-    // held at an equal-or-newer version stays (the PATCH landed, or is pending
-    // with optimistic content); a stale GET body must not regress it into a
+    // held at an equal-or-newer version, or a tn/tq/twl row held at a strictly
+    // newer one, stays (the PATCH landed, or is pending with optimistic
+    // content); a stale GET body must not regress it into a
     // 409 against the user's own save. The other refetch callers (TWL order
     // unlock, pipeline Refresh, Door43 import) keep the plain replace — they
     // refetch because the server changed versions out from under the tab.
@@ -496,7 +500,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       void refetch({ keepNewerLocal: true });
     },
     onVerseStatusUpdate: (status) => {
-      applyLocalVerseStatus(status.verse, status.done === 1);
+      applyLocalVerseStatus(status.verse, status.done === 1, status.updated_at);
     },
     onLaneCheckUpdate: (check) => {
       applyLaneCheckers(check.verse, check.lane, check.checkers);
@@ -1185,12 +1189,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     });
     for (const verse of verses) {
       if (verse <= 0) continue;
-      const sourceVO = verseObjectsOf(sourceByVerse[verse]);
+      // Each row is judged against the source it covers — every UHB verse of
+      // a bridge, not just the first (#957).
       const ultVO = verseObjectsOf(ult[verse]);
       const ustVO = verseObjectsOf(ust[verse]);
       out.set(
         verse,
-        !!(ultVO && verseHasUnalignedWork(ultVO, sourceVO)) || !!(ustVO && verseHasUnalignedWork(ustVO, sourceVO)),
+        !!(ultVO && verseHasUnalignedWork(ultVO, verseObjectsOf(sourceForTargetRow(sourceByVerse, ult[verse]) ?? undefined))) ||
+          !!(ustVO && verseHasUnalignedWork(ustVO, verseObjectsOf(sourceForTargetRow(sourceByVerse, ust[verse]) ?? undefined))),
       );
     }
     return out;
@@ -1270,9 +1276,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     };
     for (const ref of alignAttention.refs) {
       if (ref.chapter !== data.chapter) continue;
-      const targetVO = getVO(targetsByResource[ref.resource]?.[ref.verse]);
+      const target = targetsByResource[ref.resource]?.[ref.verse];
+      const targetVO = getVO(target);
       if (!targetVO) continue;
-      const sourceVO = getVO(sourceByVerse[ref.verse]);
+      const sourceVO = getVO(sourceForTargetRow(sourceByVerse, target) ?? undefined);
       if (!verseHasUnalignedWork(targetVO, sourceVO)) {
         keys.add(`${ref.resource}:${ref.ref}`);
       }
@@ -1571,27 +1578,33 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   }, [data?.verses, bookHook?.chapters]);
   const lexiconMapRaw = useLexicon(uhbStrongs);
   // useLexicon hands back a fresh Map every render; stabilize its identity so
-  // ScriptureColumn's memo can compare it. The map's CONTENT only changes when
-  // a Strong's entry resolves, which bumps lexiconLoadedCount and rebases it.
-  const lexiconLoadedCount = useMemo(() => {
-    let c = 0;
-    for (const v of lexiconMapRaw.values()) if (v) c++;
-    return c;
+  // ScriptureColumn's and BookView's memos can compare it. Keyed on CONTENT —
+  // which entry each Strong's resolved to — not on uhbStrongs' identity, which
+  // is new on every save and every book-mode chapter load even when nothing
+  // changed, re-rendering every scripture cell that receives the map (#890).
+  // A count of resolved entries is not enough: 'H2148a' can first resolve to
+  // the cached base 'H2148' entry, then switch to its exact entry without the
+  // count moving.
+  const lexiconKey = useMemo(() => {
+    let key = "";
+    for (const [raw, v] of lexiconMapRaw) key += `${raw}=${v ? `${v.resource}:${v.strong}` : ""},`;
+    return key;
   }, [lexiconMapRaw]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const lexiconMap = useMemo(() => lexiconMapRaw, [uhbStrongs, lexiconLoadedCount]);
+  const lexiconMap = useMemo(() => lexiconMapRaw, [lexiconKey]);
 
   // When a tn note OR a twl word row is "active", treat its quote as the
   // highlight source. Notes and words are mutually exclusive; clicking one
   // clears the other. Words use `orig_words` (Hebrew source words) which the
   // same matcher handles directly for UHB and via \zaln-s for ULT/UST.
-  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses } =
+  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses, activeQuoteVerse } =
     useMemo(() => {
       const empty = {
         activeQuote: null as string | null,
         activeOccurrence: null as number | null,
         activeQuotePartialGroups: false,
         activeQuoteCoveredVerses: EMPTY_COVERED_VERSES,
+        activeQuoteVerse: null as number | null,
       };
       if (!data) return empty;
       if (activeNoteId) {
@@ -1603,6 +1616,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeOccurrence: r.occurrence ?? null,
           activeQuotePartialGroups: covered.length > 1,
           activeQuoteCoveredVerses: covered,
+          // The note's own verse: its occurrence counts there (#957).
+          activeQuoteVerse: r.verse,
         };
       }
       if (activeWordId) {
@@ -1612,6 +1627,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeOccurrence: r?.occurrence ?? null,
           activeQuotePartialGroups: false,
           activeQuoteCoveredVerses: r ? [r.verse] : EMPTY_COVERED_VERSES,
+          activeQuoteVerse: r?.verse ?? null,
         };
       }
       return empty;
@@ -1659,12 +1675,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // quote the highlight path resolves against the source and maps through the
     // alignment — so one lookup serves both. Ids are unique per book across
     // kinds, so checking tn first and falling through to twl can't collide.
-    const find = (id: string | null): { quote: string | null; occurrence: number | null } | null => {
+    const find = (id: string | null): { quote: string | null; occurrence: number | null; verse: number } | null => {
       if (!id) return null;
       const note = data.tn.find((r) => r.id === id);
-      if (note) return { quote: note.quote, occurrence: note.occurrence };
+      if (note) return { quote: note.quote, occurrence: note.occurrence, verse: note.verse };
       const word = data.twl.find((r) => r.id === id);
-      if (word) return { quote: word.orig_words, occurrence: word.occurrence };
+      if (word) return { quote: word.orig_words, occurrence: word.occurrence, verse: word.verse };
       return null;
     };
     const moved = find(reorderPreview.movedId);
@@ -1678,6 +1694,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       prevOccurrence: prev?.occurrence ?? null,
       nextQuote: next?.quote ?? null,
       nextOccurrence: next?.occurrence ?? null,
+      movedVerse: moved?.verse ?? null,
+      prevVerse: prev?.verse ?? null,
+      nextVerse: next?.verse ?? null,
     };
   }, [data, reorderPreview]);
 
@@ -2544,6 +2563,29 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }),
     [requestDualAction],
   );
+  // Every dirty side's save, in order: both reading lines, then both alignment
+  // panels. Shared by the unsaved-changes gate's Save and the titlebar's
+  // "save, mark done, next verse" button (#931). Clean sides are skipped:
+  // save() serializes + enqueues a PATCH unconditionally.
+  const dualSaveSteps = useCallback((): SaveStep[] => {
+    const step = (
+      dirty: boolean,
+      ref: { current: { save: (afterCommit?: () => void) => unknown } | null },
+    ): SaveStep => ({
+      dirty,
+      save: (afterCommit) => {
+        const handle = ref.current;
+        if (handle) handle.save(afterCommit);
+        else afterCommit();
+      },
+    });
+    return [
+      step(dualLeftReadingDirty, dualLeftReadingRef),
+      step(dualRightReadingDirty, dualRightReadingRef),
+      step(dualLeftDirty, dualLeftRef),
+      step(dualRightDirty, dualRightRef),
+    ];
+  }, [dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty]);
   const resolveDualAction = useCallback(
     (choice: "save" | "discard") => {
       const action = pendingDualAction;
@@ -2572,46 +2614,43 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // chain stalls it — `finish` (and thus the close) never runs — which is
       // the fix for #490 (the dialog used to close, unmounting the reading
       // line, while its confirm was still pending).
-      runSaveChain(
-        [
-          {
-            dirty: dualLeftReadingDirty,
-            save: (afterCommit) => {
-              const ref = dualLeftReadingRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-          {
-            dirty: dualRightReadingDirty,
-            save: (afterCommit) => {
-              const ref = dualRightReadingRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-          {
-            dirty: dualLeftDirty,
-            save: (afterCommit) => {
-              const ref = dualLeftRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-          {
-            dirty: dualRightDirty,
-            save: (afterCommit) => {
-              const ref = dualRightRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-        ],
-        () => action?.run(),
-      );
+      runSaveChain(dualSaveSteps(), () => action?.run());
     },
-    [pendingDualAction, dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty],
+    [pendingDualAction, dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty, dualSaveSteps],
   );
+  // "Save both, mark verse done, next verse" (#931): the gate's Save chain
+  // without the prompt, then the Text-lane check (the same per-verse "done"
+  // the titlebar checkbox sets), then the next-verse move. Mark + advance run
+  // only once every dirty side has committed; a cancelled unalign confirm
+  // stalls the chain, so the verse stays unmarked and the aligner stays put.
+  // `verse` is the verse the click started on (captured in the button's
+  // render); the guard ignores a second click while this chain still runs,
+  // and cancelling the unalign confirm releases it (cancelAlignmentLoss).
+  const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
+  const dualSaveDoneAndNext = useCallback(
+    (verse: number, next: number) => {
+      if (meUserId == null || bookLocked) return;
+      saveDoneGuardRef.current.run({
+        steps: dualSaveSteps(),
+        markDone: () => {
+          applyLocalLaneCheck(verse, "text", meUserId, true);
+          void outbox.enqueueLaneCheck(book, chapter, verse, "text", true);
+        },
+        advance: () => {
+          setActiveVerse(next);
+          setDualTarget((t) => (t ? { ...t, verse: next } : t));
+        },
+      });
+    },
+    [dualSaveSteps, meUserId, bookLocked, applyLocalLaneCheck, book, chapter],
+  );
+  // Dismissing the unalign confirm without saving: any save chain waiting on it
+  // (the gate's Save, the save-done-next button) is stalled for good, so free
+  // the button's in-flight guard too.
+  const cancelAlignmentLoss = useCallback(() => {
+    setPendingAlignmentLoss(null);
+    saveDoneGuardRef.current.cancel();
+  }, []);
 
   const handleSetPanelMode = useCallback(
     (mode: PanelMode) => {
@@ -3399,6 +3438,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   };
 
   return (
+    <OpenChapterProvider data={data}>
     <Box sx={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
       <TopBar
         book={book}
@@ -3633,6 +3673,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeNoteOccurrence={activeOccurrence}
           activeNoteQuotePartialGroups={activeQuotePartialGroups}
           activeNoteCoveredVerses={activeQuoteCoveredVerses}
+          activeNoteVerse={activeQuoteVerse}
           reorderHighlight={reorderHighlight}
           mode={mode}
           enabledVersions={displayedVersions}
@@ -4246,6 +4287,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           right={dualAlignerProps.right}
           onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
           onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
+          onSaveDoneAndNext={
+            dualNav.next != null && textLaneCheck.canCheck
+              ? () => dualSaveDoneAndNext(dualAlignerProps.verseNum, dualNav.next!)
+              : undefined
+          }
           // Lane checks live on the loaded chapter's useChapter state; only
           // wire when the dual popup is on that same chapter (verse arrows
           // already no-op across chapters for the same reason).
@@ -4263,7 +4309,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }
         />
       )}
-      <Dialog open={!!pendingAlignmentLoss} onClose={() => setPendingAlignmentLoss(null)}>
+      <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>
         <DialogTitle>
           {pendingAlignmentLoss && pendingAlignmentLoss.lostWords.length === 1
             ? "A word will be unaligned"
@@ -4286,7 +4332,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setPendingAlignmentLoss(null)}>Cancel</Button>
+          <Button onClick={cancelAlignmentLoss}>Cancel</Button>
           <Button
             color="error"
             variant="contained"
@@ -4444,6 +4490,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         />
       )}
     </Box>
+    </OpenChapterProvider>
   );
 }
 
