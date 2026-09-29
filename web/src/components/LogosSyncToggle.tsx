@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Box,
   Button,
@@ -47,6 +47,10 @@ function fireLogos(book: string, chapter: number, verse: number) {
   window.location.href = `logosref:Bible.${abbr}${chapter}.${verse}`;
 }
 
+// Coordinates of the last auto-follow fire, kept at module level so it survives
+// a remount of the toggle.
+let lastFiredKey = "";
+
 const STORAGE_KEY = "be:logosSyncEnabled";
 const WARNING_HIDDEN_KEY = "be:logosSyncWarningHidden";
 
@@ -70,9 +74,25 @@ export function LogosSyncToggle({ book, chapter, verse }: Props) {
   // Debounced auto-follow when enabled. Custom-scheme navigation hands off
   // to the OS — the page itself does not navigate. Note: Logos has no
   // no-focus mode, so each fire raises its window.
+  //
+  // The top bar moves this control into an overflow menu and back as the window
+  // resizes, which remounts it. A remount that starts enabled on coordinates
+  // already sent must not fire again (it would raise Logos with no verse
+  // change). mountSkip holds those coordinates until anything changes; it is a
+  // ref snapshot rather than a first-run flag so React StrictMode's second
+  // effect pass in dev skips too.
+  const mountSkip = useRef<string | null>(enabled && lastFiredKey ? lastFiredKey : null);
   useEffect(() => {
+    const key = `${book}:${chapter}:${verse}`;
+    if (mountSkip.current !== null) {
+      if (enabled && key === mountSkip.current) return;
+      mountSkip.current = null;
+    }
     if (!enabled) return;
-    const timer = window.setTimeout(() => fireLogos(book, chapter, verse), 400);
+    const timer = window.setTimeout(() => {
+      lastFiredKey = key;
+      fireLogos(book, chapter, verse);
+    }, 400);
     return () => window.clearTimeout(timer);
   }, [enabled, book, chapter, verse]);
 

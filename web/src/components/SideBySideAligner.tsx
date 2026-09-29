@@ -230,6 +230,9 @@ interface Props {
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
   onNextVerse?: () => void;
+  // Save both sides, mark the verse's Text lane done, then go to the next
+  // verse (#931). Undefined wherever it can't run (chapter end, locked book).
+  onSaveDoneAndNext?: () => void;
   // Text-lane checkoff for the current verse — same control as the rail /
   // column verse markers, so translators can stamp "done" without leaving
   // the dual aligner (check sits next to the verse chip + next-arrow).
@@ -332,6 +335,7 @@ export function SideBySideAligner({
   onSaveReading,
   onPrevVerse,
   onNextVerse,
+  onSaveDoneAndNext,
   textCheck,
 }: Props) {
   const [hover, setHover] = useState<HoverHighlight>(null);
@@ -496,6 +500,40 @@ export function SideBySideAligner({
                   sx={{ color: "inherit", "&.Mui-disabled": { color: "rgba(255,255,255,0.3)" } }}
                 >
                   <KeyboardArrowRightIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+            {/* Save both + mark done + next (#931). Outlined check+arrow pill,
+                spaced well clear of the plain next arrow so it isn't hit by
+                accident. */}
+            <Tooltip title="Save both, mark verse done, next verse">
+              <span>
+                <IconButton
+                  // The 2nd click of a double-click (detail > 1) is dropped:
+                  // by then the first has usually advanced, so it would save
+                  // and mark the NEXT verse. Keyboard activation has detail 0.
+                  onClick={(e) => {
+                    if (e.detail > 1) return;
+                    onSaveDoneAndNext?.();
+                  }}
+                  disabled={!onSaveDoneAndNext}
+                  size="small"
+                  aria-label="Save both, mark verse done, next verse"
+                  sx={{
+                    ml: 2.5,
+                    px: 0.75,
+                    borderRadius: 1,
+                    border: "1.5px solid rgba(255,255,255,0.55)",
+                    color: "inherit",
+                    "&:hover": { borderColor: "rgba(255,255,255,0.9)" },
+                    "&.Mui-disabled": {
+                      color: "rgba(255,255,255,0.3)",
+                      borderColor: "rgba(255,255,255,0.2)",
+                    },
+                  }}
+                >
+                  <CheckIcon sx={{ fontSize: 16 }} />
+                  <KeyboardArrowRightIcon sx={{ fontSize: 18, ml: -0.25 }} />
                 </IconButton>
               </span>
             </Tooltip>

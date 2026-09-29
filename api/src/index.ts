@@ -24,6 +24,7 @@ import { backfillDcsGaps } from "./dcsCommitBackfill";
 import { dcsCommits } from "./dcsCommits";
 import { books } from "./bookImport";
 import { bookLockGuard } from "./bookLockGuard";
+import { serveHashedAsset } from "./staticAssets";
 import { EDIT_LOG_SWEEP_SQL, EDIT_LOG_RETENTION_SECONDS, raiseEditLogSweepBoundaryAlerts } from "./editLogSweep";
 import { DCS_COMMITS_SWEEP_SQL, DCS_COMMITS_SWEEP_COVERAGE_SQL, DCS_COMMITS_RETENTION_SECONDS } from "./dcsCommitsSweep";
 import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
@@ -296,7 +297,13 @@ app.notFound((c) => {
 });
 
 export default {
-  fetch: app.fetch,
+  // /assets/* skips the Hono app (no auth/CSP middleware, same as when the
+  // assets layer served it directly) so a missing chunk 404s instead of
+  // getting the SPA fallback. See staticAssets.ts / issue #916.
+  fetch(req: Request, env: Env, ctx: ExecutionContext) {
+    if (new URL(req.url).pathname.startsWith("/assets/")) return serveHashedAsset(req, env.ASSETS);
+    return app.fetch(req, env, ctx);
+  },
   async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
     // Two crons share this handler — wrangler.toml has the full list. The
     // 05:30 one kicks the nightly DCS-export Workflow; the 5-min one polls
