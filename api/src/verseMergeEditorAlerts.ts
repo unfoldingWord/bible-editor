@@ -24,6 +24,17 @@ export interface OverwrittenVerseRef {
    * so the editor message does not call a comma correction a wording change.
    */
   reason?: string;
+  /**
+   * verse_merge_conflicts.detected_at for this row — the durable "first
+   * flagged" date (see verseMergeConflicts.ts's own doc comment on that
+   * column). Issue #996: when some of an editor's standing rows resolve and
+   * only the ref list shrinks, the next run's message named none of them as
+   * old, so a conflict flagged weeks ago re-raised reading like a brand-new
+   * overwrite. Naming the oldest detectedAt among this user's refs — the
+   * same "first flagged" framing buildGroupedRefsClause already gives the
+   * admin — makes a re-raised alert honest about age.
+   */
+  detectedAt?: number | null;
 }
 
 // edit_log has no (book, chapter, verse, resource) columns of its own — only
@@ -137,17 +148,21 @@ export function groupOverwrittenVersesByEditor(
   overwritten: OverwrittenVerseRef[],
   usernameByKey: Map<string, string>,
 ): Map<string, { refs: string[]; message: string }> {
-  const byUser = new Map<string, { refs: string[]; reasons: Array<string | undefined> }>();
+  const byUser = new Map<
+    string,
+    { refs: string[]; reasons: Array<string | undefined>; detectedAts: Array<number | null | undefined> }
+  >();
   for (const ref of overwritten) {
     const username = usernameByKey.get(editLogKey(book, resource, ref));
     if (!username) continue;
-    const entry = byUser.get(username) ?? { refs: [], reasons: [] };
+    const entry = byUser.get(username) ?? { refs: [], reasons: [], detectedAts: [] };
     entry.refs.push(`${ref.chapter}:${ref.verse}@v${ref.overwrittenVersion}`);
     entry.reasons.push(ref.reason);
+    entry.detectedAts.push(ref.detectedAt);
     byUser.set(username, entry);
   }
   const out = new Map<string, { refs: string[]; message: string }>();
-  for (const [username, { refs, reasons }] of byUser) {
+  for (const [username, { refs, reasons, detectedAts }] of byUser) {
     // "Door43's sync", not "Door43's nightly sync": this fan-out fires from
     // raiseVerseMergeConflictAlert, which runs on both the 05:30 UTC cron AND
     // the user-triggered POST /:book/reimport route — the admin message in
@@ -169,9 +184,19 @@ export function groupOverwrittenVersesByEditor(
           ? "previous punctuation"
           : "previous alignment";
     const recovery = `Your ${recoverable} is still recoverable from each verse's version history, at the version number given after @v.`;
+    // Issue #996: the oldest detectedAt among this user's refs — not each
+    // ref's own, and not just among refs newly added tonight — so a run that
+    // only shrinks an existing ref list (some rows resolved, none touched)
+    // still carries the true age of what's left, instead of reading as a
+    // fresh overwrite because the message carried no date at all.
+    const oldestDetectedAt = detectedAts.reduce<number | null>(
+      (oldest, d) => (d == null ? oldest : oldest == null || d < oldest ? d : oldest),
+      null,
+    );
+    const firstFlagged = oldestDetectedAt != null ? ` (first flagged ${plainDate(oldestDetectedAt)})` : "";
     const message =
       `Door43's sync overwrote your edit${refs.length === 1 ? "" : "s"} in ${book} ` +
-      `${resource.toUpperCase()} at ${refs.length} verse(s) with Door43's version: ${refs.join(", ")}. ` +
+      `${resource.toUpperCase()} at ${refs.length} verse(s) with Door43's version${firstFlagged}: ${refs.join(", ")}. ` +
       `${axes} ${recovery}`;
     out.set(username, { refs, message });
   }
