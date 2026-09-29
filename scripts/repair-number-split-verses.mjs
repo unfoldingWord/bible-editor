@@ -190,7 +190,7 @@
 //
 //   The asymmetry that makes this worth refusing rather than warning: the
 //   nightly EXPORT skips a locked book hard (exportWorkflow.ts:493-511,
-//   "book_locked:published:v90"), but the nightly DCS→D1 SYNC does NOT —
+//   "book_locked:published:v91"), but the nightly DCS→D1 SYNC does NOT —
 //   bookReimport.ts never consults the lock. So repairing a frozen book gets
 //   the worst of both: the fix never reaches Door43, and the row is still
 //   exposed to the sync. It would also leave D1 diverged from a published

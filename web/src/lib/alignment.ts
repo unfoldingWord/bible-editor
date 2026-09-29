@@ -767,14 +767,36 @@ export function parseAlignment(
   return finalize(withSourceCoverage(base, sourceVerseObjects));
 }
 
+// Result cache for verseHasUnalignedWork, keyed on the identity of the target
+// then the source verseObjects arrays. Every ULT/UST cell in book and columns
+// mode asks this on mount, and Shell asks it for the whole chapter on each
+// save; a verse's content arrays are replaced (not mutated) when it changes,
+// so the same pair of arrays always gives the same answer. (The one known
+// in-place write, usfm-js trimming whitespace during unaligned export, #932,
+// can't change it: whitespace holds no words.) WeakMaps let entries
+// die with the arrays, so there is no eviction to manage. NO_SOURCE stands in
+// for a null/absent source, which a WeakMap can't key on.
+const NO_SOURCE: object = {};
+const unalignedWorkCache = new WeakMap<object, WeakMap<object, boolean>>();
+
 export function verseHasUnalignedWork(
   targetVerseObjects: unknown[] | null | undefined,
   sourceVerseObjects: unknown[] | null | undefined,
 ): boolean {
   if (!Array.isArray(targetVerseObjects)) return false;
+  let bySource = unalignedWorkCache.get(targetVerseObjects);
+  if (!bySource) {
+    bySource = new WeakMap();
+    unalignedWorkCache.set(targetVerseObjects, bySource);
+  }
+  const sourceSlot = Array.isArray(sourceVerseObjects) ? sourceVerseObjects : NO_SOURCE;
+  const cached = bySource.get(sourceSlot);
+  if (cached !== undefined) return cached;
   const state = parseAlignment(targetVerseObjects, sourceVerseObjects ?? null);
-  if (state.unaligned.length > 0) return true;
-  return state.groups.some((g) => g.targets.length === 0);
+  const result =
+    state.unaligned.length > 0 || state.groups.some((g) => g.targets.length === 0);
+  bySource.set(sourceSlot, result);
+  return result;
 }
 
 // Count of unaligned TARGET words — the same metric the aligner's "N unaligned"

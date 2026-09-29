@@ -46,3 +46,6 @@ reports/
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# Per-worktree in-flight status and review scratch (CLAUDE.md "Project state").
+.claude/state/

@@ -21,6 +21,10 @@ export interface UseBookLintReturn {
   // bound an optimistic key's lifetime to this promise rather than to a
   // shared reset effect.
   refetch: () => Promise<void>;
+  // Date.now() when the last fetch landed; 0 before the first and after a
+  // failed one, so a failure never suppresses the next retry. Lets the caller
+  // skip a focus-driven refetch that would re-pull a report it just got (#887).
+  lastSettledAt: () => number;
 }
 
 export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
@@ -35,6 +39,11 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   const runner = useRef<() => Promise<void>>(() => Promise.resolve());
   const queue = useRef<ReturnType<typeof createLintRefreshQueue>>();
   const disposed = useRef(false);
+  // Serialized last-applied report, so an identical refetch skips setReport
+  // (and the Shell re-render it causes); null = no report yet.
+  const reportJson = useRef<string | null>(null);
+  const settledAt = useRef(0);
+  const lastSettledAt = useCallback(() => settledAt.current, []);
   if (queue.current === undefined) {
     queue.current = createLintRefreshQueue(() => runner.current());
   }
@@ -63,6 +72,7 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
 
   // Refetch on book change (and reset when disabled) — lint is per-book.
   useEffect(() => {
+    reportJson.current = null;
     if (!enabled) {
       setReport(null);
       setStatus("idle");
@@ -72,14 +82,24 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
     setReport(null);
     const ctrl = new AbortController();
     runner.current = async () => {
-      setStatus("loading");
+      // A refetch keeps showing the current report; only the first load of a
+      // book is "loading".
+      if (reportJson.current === null) setStatus("loading");
       try {
-        const r = await fetchWithRetry((signal) => api.getBookLint(book, signal), { signal: ctrl.signal });
+        // Bounded: a big book that times out must not retry forever (#887).
+        const r = await fetchWithRetry((signal) => api.getBookLint(book, signal), { signal: ctrl.signal, maxAttempts: 3 });
         if (ctrl.signal.aborted) return;
-        setReport(r);
+        settledAt.current = Date.now();
+        const json = JSON.stringify(r);
+        if (json !== reportJson.current) {
+          reportJson.current = json;
+          setReport(r);
+        }
         setStatus("ready");
       } catch {
-        if (!ctrl.signal.aborted) setStatus("error");
+        if (ctrl.signal.aborted) return;
+        settledAt.current = 0;
+        setStatus("error");
       }
     };
     void queue.current!.refresh();
@@ -105,5 +125,6 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
     flagCount: report?.flagCount ?? flagIssues.length,
     escalateCount: report?.escalateCount ?? 0,
     refetch: load,
+    lastSettledAt,
   };
 }

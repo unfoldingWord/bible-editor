@@ -60,16 +60,16 @@ function insertLock(sqlite, book, reason) {
 console.log("\n[POST /books/:book/lock/push's default (empty body → no branchName) on a locked book is refused without allowAutoMerge]");
 {
   const { sqlite, env } = freshEnv();
-  insertLock(sqlite, "ZEC", "cut release");
+  insertLock(sqlite, "ISA", "cut release");
 
-  const result = await requireAutoMergeConfirmation(env, "ZEC", {
+  const result = await requireAutoMergeConfirmation(env, "ISA", {
     allowLocked: true,
     branchName: undefined,
     allowAutoMerge: undefined, // an empty-body call, exactly as bookImport.ts used to reach EXPORT_WORKFLOW.create with
   });
 
   assert(
-    result !== null && result.book === "ZEC" && result.reason === "cut release",
+    result !== null && result.book === "ISA" && result.reason === "cut release",
     "an empty-body lock/push against a locked book is now refused by the centralized check (the #602 bypass)",
   );
 }
@@ -77,9 +77,9 @@ console.log("\n[POST /books/:book/lock/push's default (empty body → no branchN
 console.log("\n[the route's own 'publish now' acknowledgement (allowAutoMerge:true when branchName is absent) is honored]");
 {
   const { sqlite, env } = freshEnv();
-  insertLock(sqlite, "ZEC", "cut release");
+  insertLock(sqlite, "ISA", "cut release");
 
-  const result = await requireAutoMergeConfirmation(env, "ZEC", {
+  const result = await requireAutoMergeConfirmation(env, "ISA", {
     allowLocked: true,
     branchName: undefined,
     allowAutoMerge: true, // bookImport.ts's route now passes this explicitly for the publish-now path
@@ -91,9 +91,9 @@ console.log("\n[the route's own 'publish now' acknowledgement (allowAutoMerge:tr
 console.log("\n[a branchName is an equally valid acknowledgement — the review-branch path stays unblocked]");
 {
   const { sqlite, env } = freshEnv();
-  insertLock(sqlite, "ZEC", "cut release");
+  insertLock(sqlite, "ISA", "cut release");
 
-  const result = await requireAutoMergeConfirmation(env, "ZEC", {
+  const result = await requireAutoMergeConfirmation(env, "ISA", {
     allowLocked: true,
     branchName: "review/zec-fix",
     allowAutoMerge: undefined,
@@ -107,7 +107,7 @@ console.log("\n[an unlocked book never triggers the check, regardless of allowLo
   const { env } = freshEnv();
   // No book_locks row and GEN is in the PUBLISHED_BOOKS snapshot only if
   // it's actually published — use a book with no row and no default lock.
-  const result = await requireAutoMergeConfirmation(env, "ZEC", {
+  const result = await requireAutoMergeConfirmation(env, "ISA", {
     allowLocked: true,
     branchName: undefined,
     allowAutoMerge: undefined,
@@ -119,9 +119,9 @@ console.log("\n[an unlocked book never triggers the check, regardless of allowLo
 console.log("\n[allowLocked:false never triggers the check even against a locked book]");
 {
   const { sqlite, env } = freshEnv();
-  insertLock(sqlite, "ZEC", "cut release");
+  insertLock(sqlite, "ISA", "cut release");
 
-  const result = await requireAutoMergeConfirmation(env, "ZEC", {
+  const result = await requireAutoMergeConfirmation(env, "ISA", {
     allowLocked: false,
     branchName: undefined,
     allowAutoMerge: undefined,

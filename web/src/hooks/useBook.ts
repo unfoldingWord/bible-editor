@@ -8,7 +8,7 @@
 // for `If-Match` comes from this cache. Server responses are adopted via
 // onOutboxResult so the cache stays current alongside useChapter.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   ApiError,
@@ -99,6 +99,12 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
   // load (the effect above already clears the cache).
   useEffect(() => {
     return () => {
+      // Deliberately reads the LIVE ref at cleanup time: loadChapter (below)
+      // keeps adding controllers to this map for as long as the effect is
+      // mounted, so a snapshot taken at setup would miss every controller
+      // added after that — exactly the in-flight loads this cleanup exists to
+      // cancel on a book change.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
       for (const ctrl of chapterCtrls.current.values()) ctrl.abort();
       chapterCtrls.current.clear();
     };
@@ -263,15 +269,33 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
     });
   }, [book, enabled, applyRemoteVerse]);
 
-  return {
-    summary,
-    summaryStatus,
-    chapters,
-    loadChapter,
-    applyLocalVerse,
-    applyRemoteVerse,
-    applyLocalVerseBridge,
-    applyLocalVerseSplit,
-    applyLocalRowPatch,
-  };
+  // Memoized so the returned object keeps its identity until a field actually
+  // changes: Shell lists `bookHook` in memo deps (bookChapterList, the aligner
+  // props, getSearchNotes), and a fresh literal busted all of them on every
+  // App render (#889). The callbacks are all useCallback, so only the three
+  // state values move this.
+  return useMemo(
+    () => ({
+      summary,
+      summaryStatus,
+      chapters,
+      loadChapter,
+      applyLocalVerse,
+      applyRemoteVerse,
+      applyLocalVerseBridge,
+      applyLocalVerseSplit,
+      applyLocalRowPatch,
+    }),
+    [
+      summary,
+      summaryStatus,
+      chapters,
+      loadChapter,
+      applyLocalVerse,
+      applyRemoteVerse,
+      applyLocalVerseBridge,
+      applyLocalVerseSplit,
+      applyLocalRowPatch,
+    ],
+  );
 }
