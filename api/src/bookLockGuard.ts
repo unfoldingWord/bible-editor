@@ -30,6 +30,18 @@ import type { Env } from "./index";
 import { effectiveBookLock, bookLockedResponseBody, BOOK_LOCKED_STATUS } from "./bookLock";
 import { currentUserId } from "./auth";
 
+// PATCH /api/rows/:kind/:id, POST /api/rows/:kind, and
+// PATCH /api/verses/:book/:chapter/:verse/:bibleVersion — the routes whose
+// handlers run the book-lock check inside their batched pre-check read.
+export function isSelfLockCheckedRoute(method: string, path: string): boolean {
+  const m = method.toUpperCase();
+  if (m === "PATCH") {
+    return /^\/api\/rows\/[^/]+\/[^/]+$/.test(path) || /^\/api\/verses\/[^/]+\/[^/]+\/[^/]+\/[^/]+$/.test(path);
+  }
+  if (m === "POST") return /^\/api\/rows\/[^/]+$/.test(path);
+  return false;
+}
+
 export const bookLockGuard: MiddlewareHandler = async (c, next) => {
   const method = c.req.method.toUpperCase();
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
@@ -48,6 +60,17 @@ export const bookLockGuard: MiddlewareHandler = async (c, next) => {
   // `/twl-order-lock` ends in "-lock", not "/lock", so it was never exempt —
   // but that is luck, not design.)
   if (/^\/api\/books\/[^/]+\/lock(\/push)?$/.test(c.req.path)) {
+    return next();
+  }
+
+  // The three hot save routes enforce the lock THEMSELVES, reading book_locks
+  // in the same db.batch() as their other read-only pre-checks and returning
+  // 423 before any mutating statement (issue #905) — checking here too would
+  // spend the extra D1 round trip that change exists to remove. Matched
+  // exactly (method + full path shape), so every other write under
+  // /api/rows or /api/verses (DELETE, /preserve, /trash, /bridge, ...) stays
+  // gated here. See isSelfLockCheckedRoute's callers in rows.ts / verses.ts.
+  if (isSelfLockCheckedRoute(method, c.req.path)) {
     return next();
   }
 

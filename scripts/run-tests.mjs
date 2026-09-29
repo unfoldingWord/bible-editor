@@ -49,6 +49,7 @@ const SQLITE_FILES = new Set([
   "src/syncWithholds.test.mjs",
   "src/chapters.test.mjs",
   "src/exportMergeState.test.mjs",
+  "src/saveRoundTrips.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
@@ -71,6 +72,9 @@ const EXTRA_IMPORTS = new Map([
   // postExport.test.mjs imports postExport.ts (issue #841 schema tests),
   // which imports "./bookReimport" without an extension.
   ["src/postExport.test.mjs", "./src/tsResolveHook.mjs"],
+  // saveRoundTrips.test.mjs drives the real rows.ts / verses.ts routers
+  // (issue #905), which import their siblings extensionless.
+  ["src/saveRoundTrips.test.mjs", "./src/tsResolveHook.mjs"],
 ]);
 
 function findTestFiles(dir) {

@@ -17,12 +17,29 @@ export interface BookLock {
 
 // Resolves whether `book` is currently locked. Returns null when unlocked.
 export async function effectiveBookLock(env: Env, book: string): Promise<BookLock | null> {
+  const row = await bookLockStatement(env.DB, book).first<BookLockRow>();
+  return evaluateBookLock(book, row);
+}
+
+export interface BookLockRow {
+  locked: number;
+  reason: string | null;
+}
+
+// The read half of effectiveBookLock, as an unexecuted statement so a hot
+// write route (row/verse PATCH, row create — issue #905) can fold it into one
+// db.batch() with its other read-only pre-checks instead of paying a separate
+// D1 round trip. Pair with evaluateBookLock on the first result row.
+export function bookLockStatement(db: D1Database, book: string): D1PreparedStatement {
+  return db
+    .prepare(`SELECT locked, reason FROM book_locks WHERE book = ?1`)
+    .bind(book.toUpperCase());
+}
+
+// The decision half of effectiveBookLock: `row` is bookLockStatement's result
+// (null/undefined when there is no book_locks row).
+export function evaluateBookLock(book: string, row: BookLockRow | null | undefined): BookLock | null {
   const upper = book.toUpperCase();
-  const row = await env.DB.prepare(
-    `SELECT locked, reason FROM book_locks WHERE book = ?1`,
-  )
-    .bind(upper)
-    .first<{ locked: number; reason: string | null }>();
   if (row) {
     // An explicit locked=0 row is a deliberate unlock of an otherwise-published
     // book and wins over the published default.

@@ -3,7 +3,14 @@ import { z } from "zod";
 import type { Env } from "./index";
 import type { CheckLane, RowKind, TnRow, TqRow, TwlRow } from "./types";
 import { currentUserId, requireEditor } from "./auth";
-import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
+import {
+  activePipelineForChapter,
+  activePipelinesStatement,
+  lockedResponseBody,
+  pickActivePipeline,
+  type ActivePipelineRow,
+} from "./chapterLock";
+import { bookLockStatement, evaluateBookLock, bookLockedResponseBody, BOOK_LOCKED_STATUS, type BookLockRow } from "./bookLock";
 import { broadcastChapter } from "./wsEvents";
 import { newRowId } from "./rowId";
 import { blankStubClause } from "./blankStub";
@@ -81,23 +88,32 @@ async function selectRowWithLatestSource(
   id: string,
   book: string,
 ): Promise<Record<string, unknown> | null> {
+  return rowWithLatestSourceStatement(env.DB, kind, id, book).first();
+}
+
+// selectRowWithLatestSource's statement, unexecuted, so the PATCH handler can
+// batch it with its other read-only pre-checks (issue #905).
+function rowWithLatestSourceStatement(
+  db: D1Database,
+  kind: RowKind,
+  id: string,
+  book: string,
+): D1PreparedStatement {
   if (kind === "twl") {
-    return env.DB.prepare(`SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`)
-      .bind(id, book)
-      .first();
+    return db.prepare(`SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`).bind(id, book);
   }
-  return env.DB.prepare(
-    `SELECT t.*, (
-       SELECT source FROM edit_log
-        WHERE kind = ?3 AND row_key = t.id
-          AND (book = t.book OR book IS NULL)
-        ORDER BY id DESC LIMIT 1
-     ) AS latest_source
-        FROM ${KIND_TO_TABLE[kind]} t
-       WHERE t.id = ?1${bookClause(2)}`,
-  )
-    .bind(id, book, kind)
-    .first();
+  return db
+    .prepare(
+      `SELECT t.*, (
+         SELECT source FROM edit_log
+          WHERE kind = ?3 AND row_key = t.id
+            AND (book = t.book OR book IS NULL)
+          ORDER BY id DESC LIMIT 1
+       ) AS latest_source
+          FROM ${KIND_TO_TABLE[kind]} t
+         WHERE t.id = ?1${bookClause(2)}`,
+    )
+    .bind(id, book, kind);
 }
 
 // Reuse the Hono request lifecycle to pull "expected version" off the
@@ -235,9 +251,32 @@ rows.post("/:kind", requireEditor, async (c) => {
   // See rowsCreateGuard.ts for why both of these are needed and what each
   // one closes off (issue #491).
   data.book = normalizeBookCode(data.book as string);
-  const chapterExists = await c.env.DB.prepare(CHAPTER_EXISTS_SQL)
-    .bind(data.book, data.chapter)
-    .first<{ ok: number }>();
+
+  // Every read-only pre-check this handler needs, in ONE D1 round trip (issue
+  // #905): the book lock (bookLockGuard skips this route — see
+  // isSelfLockCheckedRoute — because it is enforced right here, before any
+  // write), the chapter-exists probe, the chapter's AI-pipeline jobs, and the
+  // end-of-verse sort_order when the client sent none. Each verdict is still
+  // evaluated below in its original order; only the round trips collapse.
+  const needsSortOrder = data.sort_order == null;
+  const preReads: D1PreparedStatement[] = [
+    bookLockStatement(c.env.DB, data.book as string),
+    c.env.DB.prepare(CHAPTER_EXISTS_SQL).bind(data.book, data.chapter),
+    activePipelinesStatement(c.env.DB, data.book as string, data.chapter as number),
+  ];
+  if (needsSortOrder) {
+    preReads.push(
+      c.env.DB.prepare(
+        `SELECT MAX(sort_order) AS m FROM ${KIND_TO_TABLE[kind]}
+          WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND deleted_at IS NULL`,
+      ).bind(data.book, data.chapter, data.verse),
+    );
+  }
+  const [bookLockRes, chapterExistsRes, pipelinesRes, maxSortRes] = await c.env.DB.batch(preReads);
+  const bookLock = evaluateBookLock(data.book as string, (bookLockRes.results?.[0] as BookLockRow | undefined) ?? null);
+  if (bookLock) return c.json(bookLockedResponseBody(bookLock), BOOK_LOCKED_STATUS);
+
+  const chapterExists = chapterExistsRes.results?.[0] as { ok: number } | undefined;
   if (!chapterExists) return c.json({ error: "not_found", reason: "unknown_chapter" }, 404);
 
   // A raw TAB in any text field is structural corruption (see rawTabGuard.ts)
@@ -271,9 +310,8 @@ rows.post("/:kind", requireEditor, async (c) => {
   // Block new rows while an AI pipeline that writes THIS kind is running for
   // this chapter — its auto-apply step will overwrite or rearrange that kind's
   // row set when it lands. A run on another resource is none of our business.
-  const lock = await activePipelineForChapter(
-    c.env,
-    parsed.data.book,
+  const lock = pickActivePipeline(
+    (pipelinesRes.results ?? []) as ActivePipelineRow[],
     parsed.data.chapter,
     kind,
   );
@@ -284,13 +322,8 @@ rows.post("/:kind", requireEditor, async (c) => {
   // of its verse keyed by id — scrambling file order in the nightly DCS diff
   // (pure-reorder churn). Honor a client-supplied value; otherwise place the
   // row at the end of its verse (max + 100), matching the import spacing.
-  if (data.sort_order == null) {
-    const maxRow = await c.env.DB.prepare(
-      `SELECT MAX(sort_order) AS m FROM ${KIND_TO_TABLE[kind]}
-        WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND deleted_at IS NULL`,
-    )
-      .bind(data.book, data.chapter, data.verse)
-      .first<{ m: number | null }>();
+  if (needsSortOrder) {
+    const maxRow = maxSortRes?.results?.[0] as { m: number | null } | undefined;
     data.sort_order = (maxRow?.m ?? 0) + 100;
   }
 
@@ -330,6 +363,9 @@ rows.post("/:kind", requireEditor, async (c) => {
   const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
   let id = "";
   let lastErr: unknown = null;
+  // The INSERT's RETURNING * row — the same columns the old post-insert
+  // `SELECT * ... WHERE id AND book` re-read returned, without the round trip.
+  let created: Record<string, unknown> | null = null;
   for (let i = 0; i < 8; i++) {
     id = newRowId();
     const values: unknown[] = [
@@ -339,10 +375,10 @@ rows.post("/:kind", requireEditor, async (c) => {
       ...provenanceValues({ action: "create", source: "user", actor }),
     ];
     try {
-      await c.env.DB.batch([
+      const [insertRes] = await c.env.DB.batch([
         c.env.DB
           .prepare(
-            `INSERT INTO ${KIND_TO_TABLE[kind]} (${cols.join(", ")}) VALUES (${placeholders})`,
+            `INSERT INTO ${KIND_TO_TABLE[kind]} (${cols.join(", ")}) VALUES (${placeholders}) RETURNING *`,
           )
           .bind(...values),
         c.env.DB
@@ -351,6 +387,7 @@ rows.post("/:kind", requireEditor, async (c) => {
           )
           .bind(kind, id, data.book, userId, JSON.stringify(data)),
       ]);
+      created = (insertRes.results?.[0] as Record<string, unknown> | undefined) ?? null;
       lastErr = null;
       break;
     } catch (e) {
@@ -365,11 +402,6 @@ rows.post("/:kind", requireEditor, async (c) => {
     return c.json({ error: "id_collision_exhausted" }, 503);
   }
 
-  const created = await c.env.DB.prepare(
-    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1 AND book = ?2`,
-  )
-    .bind(id, data.book)
-    .first();
   if (created) {
     const row = created as unknown as TnRow | TqRow | TwlRow;
     c.executionCtx.waitUntil(
@@ -571,6 +603,22 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
   if (!book) return c.json({ error: "book_required" }, 400);
 
+  // Every read-only pre-check, in ONE D1 round trip (issue #905): the book
+  // lock, the current row (with latest_source), and — for tq/twl, the kinds
+  // an AI run can lock — the book's non-terminal pipeline jobs (filtered to
+  // the row's chapter in JS once the row is known). bookLockGuard skips this
+  // route (isSelfLockCheckedRoute) because the lock is enforced right here,
+  // at the same point in the request the middleware used to answer 423 —
+  // before the If-Match / body checks and long before any write. Every other
+  // verdict below is still evaluated from these rows in its original order.
+  const [bookLockRes, currentRes, pipelinesRes] = await c.env.DB.batch([
+    bookLockStatement(c.env.DB, book),
+    rowWithLatestSourceStatement(c.env.DB, kind, id, book),
+    ...(kind !== "tn" ? [activePipelinesStatement(c.env.DB, book, null)] : []),
+  ]);
+  const bookLock = evaluateBookLock(book, (bookLockRes.results?.[0] as BookLockRow | undefined) ?? null);
+  if (bookLock) return c.json(bookLockedResponseBody(bookLock), BOOK_LOCKED_STATUS);
+
   const expected = parseIfMatch(c.req.header("if-match"));
   if (expected === null) {
     return c.json({ error: "if_match_required" }, 428);
@@ -630,7 +678,7 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   // Carries latest_source (see selectRowWithLatestSource) because a true
   // no-op PATCH returns this object as-is below — it must reflect the row's
   // real AI-provenance chip, not silently drop it.
-  const current = (await selectRowWithLatestSource(c.env, kind, id, book)) as
+  const current = ((currentRes.results?.[0] as Record<string, unknown> | undefined) ?? null) as
     | (Record<string, unknown> & {
         version: number;
         deleted_at: number | null;
@@ -759,7 +807,11 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   // PATCHes on already-kept rows are normal edits. tq has no such carve-out:
   // the questions run overwrites them. (twl is never locked at all.)
   if (kind !== "tn") {
-    const lock = await activePipelineForChapter(c.env, current.book, current.chapter, kind);
+    const lock = pickActivePipeline(
+      (pipelinesRes?.results ?? []) as ActivePipelineRow[],
+      current.chapter,
+      kind,
+    );
     if (lock) return c.json(lockedResponseBody(lock), 409);
   }
 
@@ -938,22 +990,33 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   // UPDATE. (An EXISTS probe on version = expected+1 is NOT equivalent: a
   // racing writer can move the row to expected+1, which would log the
   // rejected patch into history and corrupt version snapshots.)
+  //
+  // Both statements carry RETURNING so the response needs no post-write
+  // re-SELECT (issue #905). The UPDATE returns the row exactly as `SELECT *`
+  // would. latest_source (tn/tq) is the newest edit_log row's `source` for this
+  // row — and the newest one is, by construction, the audit row THIS batch just
+  // inserted (highest id; the batch is one transaction), so its RETURNING
+  // `source` is precisely what selectRowWithLatestSource's subquery would now
+  // compute. Neither RETURNING changes the CAS: the UPDATE is still gated on
+  // `version = expected`, and the INSERT on `changes() > 0`.
   const newVersion = expected + 1;
-  const [updateRes] = await c.env.DB.batch([
+  const [updateRes, logRes] = await c.env.DB.batch([
     c.env.DB
       .prepare(
         `UPDATE ${KIND_TO_TABLE[kind]}
            SET ${setClauses.join(", ")}
          WHERE id = ?${baseParams + 7}
            AND version = ?${baseParams + 8}
-           AND deleted_at IS NULL${bookClause(baseParams + 9)}`,
+           AND deleted_at IS NULL${bookClause(baseParams + 9)}
+         RETURNING *`,
       )
       .bind(...values),
     c.env.DB
       .prepare(
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, restored_from_version)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'update', ?7, ?8
-         WHERE changes() > 0`,
+         WHERE changes() > 0
+         RETURNING source`,
       )
       .bind(kind, id, book, userId, expected, newVersion, JSON.stringify(patch), restoredFromVersion),
   ]);
@@ -970,7 +1033,15 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     return c.json({ error: "version_mismatch", current: fresh }, 409);
   }
 
-  const updated = await selectRowWithLatestSource(c.env, kind, id, book);
+  const returnedRow = updateRes.results?.[0] as Record<string, unknown> | undefined;
+  const updated: Record<string, unknown> | null = !returnedRow
+    ? null
+    : kind === "twl"
+      ? returnedRow
+      : {
+          ...returnedRow,
+          latest_source: (logRes.results?.[0] as { source: string | null } | undefined)?.source ?? null,
+        };
   if (updated) {
     const row = updated as unknown as TnRow | TqRow | TwlRow;
     c.executionCtx.waitUntil(
