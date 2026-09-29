@@ -1,4 +1,4 @@
-import { useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Stack,
   Typography,
@@ -27,6 +27,7 @@ import MenuIcon from "@mui/icons-material/Menu";
 import Brightness4Icon from "@mui/icons-material/Brightness4";
 import Brightness7Icon from "@mui/icons-material/Brightness7";
 import CloudDownloadIcon from "@mui/icons-material/CloudDownload";
+import MoreVertIcon from "@mui/icons-material/MoreVert";
 import LogoutIcon from "@mui/icons-material/Logout";
 import AdminPanelSettingsIcon from "@mui/icons-material/AdminPanelSettings";
 import { api, getRole, type BookListEntry, type BookSummary } from "../sync/api";
@@ -122,6 +123,21 @@ function FontSizeControl() {
   );
 }
 
+// Items that move into the overflow menu when the bar runs out of width, in
+// the order they leave the bar (issue #1024): the first key collapses first.
+const COLLAPSE_ORDER = [
+  "totals",
+  "logos",
+  "version",
+  "admin",
+  "dark",
+  "logout",
+  "font",
+  "download",
+  "print",
+] as const;
+type CollapseKey = (typeof COLLAPSE_ORDER)[number];
+
 interface Props {
   book: string;
   chapter: number;
@@ -172,6 +188,17 @@ export function TopBar({
   const [importing, setImporting] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const { mode, toggle } = useContext(ThemeModeContext);
+  const barRef = useRef<HTMLDivElement>(null);
+  const moreRef = useRef<HTMLButtonElement>(null);
+  const [moreOpen, setMoreOpen] = useState(false);
+  // How many of the present COLLAPSE_ORDER items currently live in the menu.
+  const [collapsedCount, setCollapsedCount] = useState(0);
+  // Last measured width (incl. left margin) of each collapsible slot while it
+  // sat in the bar; 0 = rendered nothing (e.g. version unknown).
+  const slotWidths = useRef<Partial<Record<CollapseKey, number>>>({});
+  const moreWidth = useRef(0);
+  const lastSig = useRef("");
+  const [, setTick] = useState(0);
 
   useEffect(() => {
     api.getBooks().then((r) => setBooks(r.books)).catch(() => setBooks([]));
@@ -239,19 +266,179 @@ export function TopBar({
     }
   };
 
+  const isAdmin = getRole() === "admin";
+  const totals = summary?.chapters
+    ? `${summary.chapters.reduce((a, c) => a + c.tn, 0)} notes · ${summary.chapters.reduce((a, c) => a + c.twl, 0)} words · ${summary.chapters.reduce((a, c) => a + c.tq, 0)} questions`
+    : null;
+
+  const nodes: Partial<Record<CollapseKey, ReactNode>> = {
+    totals: totals ? (
+      <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
+        {totals}
+      </Typography>
+    ) : null,
+    logos: logosSyncToggle ?? null,
+    version: <VersionIndicator onRequestReload={onRequestReload} />,
+    admin:
+      isAdmin || bookLocksButton ? (
+        <>
+          {bookLocksButton}
+          {isAdmin && (
+            <Tooltip title="Admin">
+              <IconButton
+                size="small"
+                onClick={() => { setMoreOpen(false); window.location.hash = "#/admin"; }}
+                aria-label="Admin"
+              >
+                <AdminPanelSettingsIcon fontSize="small" />
+              </IconButton>
+            </Tooltip>
+          )}
+        </>
+      ) : null,
+    dark: (
+      <Tooltip title={mode === "dark" ? "switch to light mode" : "switch to dark mode"}>
+        <IconButton size="small" onClick={toggle} aria-label="toggle color mode">
+          {mode === "dark" ? <Brightness7Icon fontSize="small" /> : <Brightness4Icon fontSize="small" />}
+        </IconButton>
+      </Tooltip>
+    ),
+    logout: onLogout ? (
+      <Tooltip title="Sign out">
+        <IconButton
+          size="small"
+          onClick={() => { setMoreOpen(false); onLogout(); }}
+          aria-label="sign out"
+          sx={{ color: "text.disabled", "&:hover": { color: "text.secondary" } }}
+        >
+          <LogoutIcon fontSize="small" />
+        </IconButton>
+      </Tooltip>
+    ) : null,
+    font: <FontSizeControl />,
+    download: exportMenu,
+    print: printPreview,
+  };
+  const isPresent = (k: CollapseKey) => Boolean(nodes[k]) && slotWidths.current[k] !== 0;
+  const present = COLLAPSE_ORDER.filter(isPresent);
+  const collapsed = new Set<CollapseKey>(present.slice(0, collapsedCount));
+  // Every collapsible item sits in a slot wrapper so its width can be measured;
+  // an empty slot (component rendered null) hides itself.
+  const slotSx = {
+    display: "flex",
+    alignItems: "center",
+    gap: { xs: 0.75, md: 1.5 },
+    "&:empty": { display: "none" },
+  } as const;
+  const inBar = (k: CollapseKey) =>
+    collapsed.has(k) || !nodes[k] ? null : (
+      <Box data-slot={k} sx={slotSx}>
+        {k === "logout" && <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />}
+        {nodes[k]}
+        {k === "totals" && <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />}
+      </Box>
+    );
+  const allCollapsed = collapsedCount >= present.length;
+
+  // Keep the bar to one row. The bar is nowrap; each pass measures how much
+  // room is left (bar width minus the natural width of every child) and picks
+  // the smallest number of collapsed items that fits, using the last measured
+  // width of each item, so nothing depends on a stale threshold. Runs before
+  // paint, and again whenever any child or the bar changes size (see below).
+  useLayoutEffect(() => {
+    const el = barRef.current;
+    if (!el) return;
+    let emptyChanged = false;
+    for (const k of COLLAPSE_ORDER) {
+      const slot = el.querySelector(`:scope > [data-slot="${k}"]`) as HTMLElement | null;
+      if (!slot) continue;
+      const w = slot.offsetWidth > 0 ? slot.offsetWidth + (parseFloat(getComputedStyle(slot).marginLeft) || 0) : 0;
+      if ((w === 0) !== (slotWidths.current[k] === 0)) emptyChanged = true;
+      slotWidths.current[k] = w;
+    }
+    if (emptyChanged) {
+      setTick((t) => t + 1);
+      return;
+    }
+    const cs = getComputedStyle(el);
+    let natural = 0;
+    for (const child of Array.from(el.children) as HTMLElement[]) {
+      const c = getComputedStyle(child);
+      // A fixed child (an open Snackbar) takes no room in the row.
+      if (c.display === "none" || c.position === "fixed") continue;
+      // The spacer stretches to fill leftover room, so only its margin counts.
+      const own = child.hasAttribute("data-spacer") ? 0 : child.offsetWidth;
+      natural += own + (parseFloat(c.marginLeft) || 0);
+    }
+    const free = el.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0) - natural;
+    const items = COLLAPSE_ORDER.filter(isPresent);
+    const cur = Math.min(collapsedCount, items.length);
+    const more = moreWidth.current || 46;
+    const freeAt = (n: number) => {
+      let f = free + (cur > 0 ? more : 0) - (n > 0 ? more : 0);
+      items.forEach((k, i) => {
+        const w = slotWidths.current[k] ?? 0;
+        if (i >= cur && i < n) f += w;
+        if (i >= n && i < cur) f -= w;
+      });
+      return f;
+    };
+    let n = 0;
+    while (n < items.length && freeAt(n) < -0.5) n++;
+    if (moreOpen && n < cur) n = cur; // don't pull items out from under an open menu
+    if (n !== collapsedCount) setCollapsedCount(n);
+    const mb = moreRef.current;
+    if (mb) moreWidth.current = mb.offsetWidth + (parseFloat(getComputedStyle(mb).marginLeft) || 0);
+  });
+  // Re-render when the bar or any child changes size (e.g. the sync chip going
+  // from "saved" to "3 unsaved") or the window resizes; the layout effect above
+  // does the real work. The signature check stops re-observe loops.
+  useEffect(() => {
+    const el = barRef.current;
+    if (!el) return;
+    const sig = () =>
+      [el.clientWidth, ...Array.from(el.children).map((c) => (c as HTMLElement).offsetWidth)].join(",");
+    lastSig.current = sig();
+    const onChange = () => {
+      const next = sig();
+      if (next === lastSig.current) return;
+      lastSig.current = next;
+      setTick((t) => t + 1);
+    };
+    window.addEventListener("resize", onChange);
+    let ro: ResizeObserver | undefined;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(onChange);
+      ro.observe(el);
+      Array.from(el.children).forEach((c) => ro!.observe(c));
+    }
+    return () => {
+      window.removeEventListener("resize", onChange);
+      ro?.disconnect();
+    };
+  });
+  // The menu has nothing left to show once every item is back in the bar.
+  useEffect(() => {
+    if (collapsed.size === 0 && moreOpen) setMoreOpen(false);
+  }, [collapsed.size, moreOpen]);
+
   return (
     <Stack
       direction="row"
       alignItems="center"
       spacing={{ xs: 0.75, md: 1.5 }}
+      ref={barRef}
       sx={{
         px: { xs: 1, md: 2 },
         py: 1,
         borderBottom: "1px solid",
         borderColor: "divider",
         bgcolor: "background.paper",
-        flexWrap: "wrap",
+        // One row (issue #1024). Only if every collapsible item is already in
+        // the menu and it still overflows do we fall back to wrapping.
+        flexWrap: allCollapsed ? "wrap" : "nowrap",
         rowGap: 0.5,
+        "& > *": { flexShrink: 0 },
       }}
     >
       {onToggleRail && (
@@ -449,62 +636,61 @@ export function TopBar({
           />
         </Tooltip>
       </Box>
-      <Box sx={{ display: { xs: "none", md: "flex" }, alignItems: "center" }}>
-        {logosSyncToggle}
-      </Box>
-      <Box sx={{ flex: 1 }} />
-      {summary?.chapters && (
-        <Box sx={{ display: { xs: "none", lg: "flex" }, alignItems: "center", gap: 1.5 }}>
-          <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
-            {summary.chapters.reduce((a, c) => a + c.tn, 0)} notes · {summary.chapters.reduce((a, c) => a + c.twl, 0)} words · {summary.chapters.reduce((a, c) => a + c.tq, 0)} questions
-          </Typography>
-          <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
-        </Box>
-      )}
+      {inBar("logos")}
+      <Box data-spacer sx={{ flex: 1 }} />
+      {inBar("totals")}
       {syncWarnings}
       {lintIndicator}
       {alignIndicator}
       {notesIndicator}
       {trashIndicator}
       {notificationsMenu}
-      <VersionIndicator onRequestReload={onRequestReload} />
+      {inBar("version")}
       <SyncStatusBar onNavigate={onNavigate} />
-      {exportMenu}
-      {printPreview}
-      <FontSizeControl />
-      <Tooltip title={mode === "dark" ? "switch to light mode" : "switch to dark mode"}>
-        <IconButton size="small" onClick={toggle} aria-label="toggle color mode">
-          {mode === "dark" ? <Brightness7Icon fontSize="small" /> : <Brightness4Icon fontSize="small" />}
-        </IconButton>
-      </Tooltip>
+      {inBar("download")}
+      {inBar("print")}
+      {inBar("font")}
+      {inBar("dark")}
       <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       {pipelineMenu}
       {pipelineStatus}
-      {bookLocksButton}
-      {getRole() === "admin" && (
-        <Tooltip title="Admin">
-          <IconButton
-            size="small"
-            onClick={() => { window.location.hash = "#/admin"; }}
-            aria-label="Admin"
-          >
-            <AdminPanelSettingsIcon fontSize="small" />
-          </IconButton>
-        </Tooltip>
-      )}
-      {onLogout && (
+      {inBar("admin")}
+      {inBar("logout")}
+      {collapsed.size > 0 && (
         <>
-          <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
-          <Tooltip title="Sign out">
+          <Tooltip title="more">
             <IconButton
+              ref={moreRef}
               size="small"
-              onClick={onLogout}
-              aria-label="sign out"
-              sx={{ color: "text.disabled", "&:hover": { color: "text.secondary" } }}
+              onClick={() => setMoreOpen(true)}
+              aria-label="more options"
             >
-              <LogoutIcon fontSize="small" />
+              <MoreVertIcon fontSize="small" />
             </IconButton>
           </Tooltip>
+          <Popover
+            open={moreOpen}
+            // Collapsed items stay mounted while the menu is closed, so
+            // background work (Logos auto-follow, version polling) keeps running.
+            keepMounted
+            anchorEl={moreRef.current}
+            onClose={() => setMoreOpen(false)}
+            anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+            transformOrigin={{ vertical: "top", horizontal: "right" }}
+          >
+            <Stack spacing={1} sx={{ p: 1.5, maxWidth: 300 }} data-testid="topbar-overflow">
+              {COLLAPSE_ORDER.filter((k) => collapsed.has(k) && k !== "totals").length > 0 && (
+                <Stack direction="row" alignItems="center" flexWrap="wrap" gap={0.5}>
+                  {COLLAPSE_ORDER.filter((k) => collapsed.has(k) && k !== "totals").map((k) => (
+                    <Box key={k} sx={{ display: "flex", alignItems: "center" }}>
+                      {nodes[k]}
+                    </Box>
+                  ))}
+                </Stack>
+              )}
+              {collapsed.has("totals") && nodes.totals}
+            </Stack>
+          </Popover>
         </>
       )}
       <Snackbar

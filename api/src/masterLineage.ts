@@ -827,14 +827,40 @@ export interface MasterLineageSummary {
   humanRefs?: string[];
   /** Why the narrowing did not complete, for the log. Empty when it did. */
   refsReason?: string;
+  /**
+   * Issue #1005: the export PR numbers that `ours` commits in this window name
+   * in their subject (`… (#N)`), newest first, capped at LINEAGE_OURS_PR_CAP.
+   * This is how a consumer asks "did the publish recorded as
+   * book_resource_syncs.pushed_pr_number land on master inside this window"
+   * without carrying whole commits. ABSENT on every summary built before #1005
+   * shipped; a reader must treat absent (or a number not listed) as "not
+   * shown", never as proof either way.
+   */
+  oursPrNumbers?: number[];
 }
+
+// How many `ours` PR numbers a summary carries (#1005). Newest first, so the
+// render we pushed most recently is the one kept; a window with more of our own
+// publishes than this simply fails to show an older one, which reads as "not
+// shown" — the fail-closed answer.
+export const LINEAGE_OURS_PR_CAP = 20;
 
 export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
   const counts = { ours: 0, ai: 0, human: 0 };
   const humanShas: string[] = [];
   const humanCommits: LineageHumanCommit[] = [];
+  const oursPrNumbers: number[] = [];
   for (const c of lineage.commits) {
     counts[c.kind]++;
+    if (c.kind === "ours" && oursPrNumbers.length < LINEAGE_OURS_PR_CAP) {
+      // Same `(#N)` subject tag ownPublish.ts's findOurMergeForPr matches on.
+      for (const m of firstLine(c.message).matchAll(/\(#(\d+)\)/g)) {
+        const n = Number(m[1]);
+        if (Number.isSafeInteger(n) && n > 0 && !oursPrNumbers.includes(n) && oursPrNumbers.length < LINEAGE_OURS_PR_CAP) {
+          oursPrNumbers.push(n);
+        }
+      }
+    }
     if (c.kind === "human" && humanShas.length < LINEAGE_EVIDENCE_CAP) {
       humanShas.push(c.sha);
       // #684. Same commits, same cap, same order — carried alongside the bare
@@ -862,6 +888,7 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
     refsComplete: ev?.complete === true,
     humanRefs: ev?.complete === true ? ev.refs : [],
     refsReason: ev == null ? "not_measured" : ev.complete === true ? "" : ev.reason,
+    oursPrNumbers,
   };
 }
 

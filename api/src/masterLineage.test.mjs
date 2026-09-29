@@ -714,6 +714,21 @@ console.log("\n[the compact summary that crosses a Workflow step boundary]");
   eq(s.humanShas.length, LINEAGE_EVIDENCE_CAP, "the cited shas are capped");
 }
 
+{
+  // #1005: the export PRs our own commits name, so a consumer can ask whether
+  // the render recorded as pushed_pr_number landed inside this window. Only
+  // `ours` subjects count — a human commit's `(#458)` is not our publish.
+  const cs = [
+    classifyMasterCommit({ sha: "o2", message: "bible-editor: JER ult → master (#901)", authorEmail: BW }),
+    classifyMasterCommit({ sha: "h1", message: "Adds '0' to Occurrence column (#458)", authorEmail: RICH }),
+    classifyMasterCommit({ sha: "o1", message: "bible-editor: JER ult → master (#880)\n\nbody (#1)", authorEmail: BW }),
+    classifyMasterCommit({ sha: "o0", message: "bible-editor export: JER ult", authorEmail: BW }),
+  ];
+  const s = compactLineage(summarizeLineage(cs));
+  eq(JSON.stringify(s.oursPrNumbers), JSON.stringify([901, 880]), "ours PR numbers, newest first, subject only");
+  eq(JSON.stringify(JSON.parse(JSON.stringify(s)).oursPrNumbers), JSON.stringify([901, 880]), "…and they survive a Workflow step's JSON");
+}
+
 // ── #557: WHICH VERSE did the human touch? ──────────────────────────────────
 //
 // THE FIXTURES ARE REAL, and they have to be: this decides whether one

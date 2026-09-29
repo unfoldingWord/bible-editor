@@ -30,6 +30,11 @@ interface Props {
   // The live row.version — what the chip shows and what the timeline marks
   // "current".
   currentVersion: number;
+  // False puts the dialog in view-only mode: history still loads and previews,
+  // but the restore button is disabled. Set while the line can't be edited
+  // (book locked, or chapter mid-flight for an AI pipeline), where the server
+  // would reject the restore PATCH anyway. Mirrors RowHistoryDialog.
+  canRestore?: boolean;
   onClose: () => void;
   // Fires the chosen version's stored content + plain text back to the card,
   // which re-saves it through the normal verse pipe (alignment_edit intent) so
@@ -60,6 +65,7 @@ export function VerseHistoryDialog({
   verseNum,
   bibleVersion,
   currentVersion,
+  canRestore: restoreAllowed = true,
   onClose,
   onUseVersion,
 }: Props) {
@@ -117,7 +123,7 @@ export function VerseHistoryDialog({
 
   const isCurrent = !!selected?.current;
   const canDiff = !isCurrent && selected !== null && current !== null;
-  const canRestore = !!selected && !isCurrent && selected.restorable;
+  const canRestore = restoreAllowed && !!selected && !isCurrent && selected.restorable;
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
@@ -268,16 +274,18 @@ export function VerseHistoryDialog({
             variant="contained"
             disabled={!canRestore || loading}
             onClick={() => {
-              if (!selected || !selected.restorable) return;
+              if (!canRestore || !selected) return;
               onUseVersion(selected.content, selected.plain_text);
               onClose();
             }}
           >
-            {isCurrent
-              ? "Already current"
-              : selected
-                ? `Switch to v${selected.version}`
-                : "Switch"}
+            {!restoreAllowed
+              ? "Locked"
+              : isCurrent
+                ? "Already current"
+                : selected
+                  ? `Switch to v${selected.version}`
+                  : "Switch"}
           </Button>
         </Box>
       </DialogActions>
