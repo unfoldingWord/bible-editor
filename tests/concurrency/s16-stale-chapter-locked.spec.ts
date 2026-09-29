@@ -270,3 +270,49 @@ test("an old chapter's refetch after navigating does not leave the view locked",
     await context.close();
   }
 });
+
+// Comments load separately from the chapter. Keyed on the route, the next
+// chapter's threads arrived while the previous chapter was the locked copy on
+// screen and painted onto its verse cells (round-4 review of #892). They must
+// wait for their own chapter's payload.
+test("the stale copy keeps its own comment badges, not the next chapter's", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "stale892-comments");
+  const page = await context.newPage();
+  const headers = { Authorization: `Bearer ${auth.token}`, "x-csrf-token": auth.csrf, "Content-Type": "application/json" };
+  const created = await context.request.post("/api/comments", {
+    headers,
+    data: { book: "ZEC", chapter: 5, verse: 1, kind: "note", body: `STALE892-COMMENT-${Date.now()}` },
+  });
+  expect(created.ok(), `create comment: ${created.status()}`).toBe(true);
+  const commentId = ((await created.json()) as { id: number }).id;
+  // Badges that show a count (an empty badge's label is "Add an internal comment…").
+  const labels = (scope: string) =>
+    page.locator(`${scope} [data-comments-badge]:not([aria-label^="Add"])`).evaluateAll((els) =>
+      els.map((e) => e.getAttribute("aria-label")),
+    );
+
+  try {
+    // ZEC 4's own comments have loaded before the baseline is read.
+    const ch4Comments = page.waitForResponse(/\/api\/comments\/ZEC\/4(\?|$)/, { timeout: 15_000 });
+    await page.goto("/#/ZEC/4/1");
+    await expect(page.locator(cellSel("rows", 4, 1))).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
+    await ch4Comments;
+    await page.waitForTimeout(300);
+    const before = await labels("body");
+
+    const release = await holdChapter(page, 5);
+    await setHash(page, "#/ZEC/5/1");
+    await expect(page.locator('[data-stale-chapter="4"]')).toBeVisible();
+    // Long enough for ZEC 5's comments to arrive if anything requests them.
+    await page.waitForTimeout(1500);
+    expect(await labels("body"), "ZEC 5's thread must not badge ZEC 4's copy").toEqual(before);
+
+    release();
+    await expect(page.locator("[data-stale-chapter]")).toHaveCount(0, { timeout: 15_000 });
+    await expect(page.locator('[data-comments-badge][aria-label$="note"]').first()).toBeVisible({ timeout: 15_000 });
+  } finally {
+    await context.request.delete(`/api/comments/${commentId}`, { headers }).catch(() => {});
+    await context.close();
+  }
+});

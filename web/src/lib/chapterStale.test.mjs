@@ -107,5 +107,18 @@ assert(isStaleChapter(payload("ZEC", 0), { book: "ZEC", chapter: 1 }) === true, 
   assert(got.chapter === 4, "the payload is the current route's");
 }
 
+// ── comment events vs the chapter on screen ─────────────────────────────────
+// useComments is keyed on the chapter on screen, which lags the route (and the
+// route's ChapterRoom socket) during a chapter change. Its WS upsert drops a
+// comment for any other chapter with isStaleChapter, so ZEC 5's thread cannot
+// be filed into ZEC 4's list and badge ZEC 4's verse cells.
+{
+  const onScreen = { book: "ZEC", chapter: 4 };
+  const comment = (book, chapter) => ({ id: 1, book, chapter, verse: 3, rowKind: null, rowId: null, body: "x" });
+  assert(isStaleChapter(comment("ZEC", 5), onScreen) === true, "a comment from the route's new chapter is dropped");
+  assert(isStaleChapter(comment("HOS", 4), onScreen) === true, "a comment from another book's same chapter is dropped");
+  assert(isStaleChapter(comment("ZEC", 4), onScreen) === false, "a comment for the chapter on screen is kept");
+}
+
 console.log(`chapterStale: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
