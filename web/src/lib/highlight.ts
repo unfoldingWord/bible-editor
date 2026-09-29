@@ -824,6 +824,26 @@ export function countQuoteMatches(verseObjects: unknown[], quote: string): numbe
   return sourceQuoteMatches(verseObjects, quote).matches.length;
 }
 
+// Whether a bridged target row numbers the quote's first word across its whole
+// joined source (x-occurrences reaches the span total) rather than per verse.
+// Prod bridges hold both conventions, even within one row, so spanOccurrence
+// shifts only when this is true. No milestone for the word, or a word that
+// occurs once in the span, reads as true (the shift is then a no-op).
+export function targetCountsAcrossSpan(
+  targetVerseObjects: unknown[],
+  spanSourceVerseObjects: unknown[],
+  quote: string,
+): boolean {
+  const first = quoteGroups(quote)[0]?.[0];
+  if (!first) return true;
+  const word = matchNorm(first);
+  const total = collectBareWords(spanSourceVerseObjects).filter((t) => matchNorm(t.text) === word).length;
+  if (total < 2) return true;
+  const runs = collectRawRuns(targetVerseObjects).filter((r) => matchNorm(r.source) === word);
+  if (runs.length === 0) return true;
+  return Math.max(...runs.map((r) => r.occurrences)) >= total;
+}
+
 // Resolve a quote + occurrence against the source/original verse words, in
 // SOURCE document order (where the quote IS contiguous and ordered, and gap
 // markers mark the real discontinuities). Returns the matched bare-word tokens

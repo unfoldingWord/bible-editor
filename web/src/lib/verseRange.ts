@@ -13,7 +13,7 @@
 // reading `verses[bv][n]` directly.
 
 import type { VerseDto } from "../sync/api";
-import { countQuoteMatches } from "./highlight.ts";
+import { countQuoteMatches, targetCountsAcrossSpan } from "./highlight.ts";
 
 export type VerseSpan = readonly [start: number, end: number];
 
@@ -205,6 +205,10 @@ export function sourceForTargetRow(
 // note on verse N of a bridge starting at S skips the quote's matches in
 // S..N-1. Returns the occurrence unchanged for singletons, a note on the span's
 // first verse, or occurrence -1 ("all").
+// Not every bridge follows that rule: rows numbered per verse (143 of 214
+// repeated-word milestones in a 2026-09-24 prod scan) are left unshifted, which
+// keeps main's behavior (every same-numbered copy lights) instead of lighting
+// nothing.
 export function spanOccurrence(
   sourceByVerseStart: Record<number, VerseDto> | undefined,
   target: VerseDto | null | undefined,
@@ -215,6 +219,12 @@ export function spanOccurrence(
   if (!target || !quote || occurrence == null || occurrence < 1 || noteVerse == null) return occurrence;
   const [start, end] = verseSpan(target);
   if (noteVerse <= start || noteVerse > end) return occurrence;
+  const targetVo = (target.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  const spanVo = (concatSourceRange(sourceByVerseStart, start, end)?.content as { verseObjects?: unknown[] } | null)
+    ?.verseObjects;
+  if (Array.isArray(targetVo) && Array.isArray(spanVo) && !targetCountsAcrossSpan(targetVo, spanVo, quote)) {
+    return occurrence;
+  }
   const before = concatSourceRange(sourceByVerseStart, start, noteVerse - 1);
   const vo = (before?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   return Array.isArray(vo) ? occurrence + countQuoteMatches(vo, quote) : occurrence;

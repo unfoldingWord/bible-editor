@@ -1177,7 +1177,7 @@ const VerseCell = memo(function VerseCell({
     sourceByVerse,
     reorderHighlight,
     bibleVersion,
-    dto?.content,
+    dto,
     sourceContent,
     activeSourceContent,
   ]);
