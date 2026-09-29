@@ -200,9 +200,10 @@ export function sourceForTargetRow(
 
 // Note-quote highlights for a ULT/UST row, OL-anchored on the source the row
 // covers (its whole span for a bridge, #957). `noteVerse` is the note's own
-// verse, where its occurrence counts. A note on a later verse of a bridge goes
-// through findBridgeTargetHighlights; everything else, and a quote that does
-// not resolve from the note's verse on, uses the ordinary join.
+// verse, where its occurrence counts. A note on a bridge's first verse joins
+// against that verse's source alone, as on main. A note on a later verse goes
+// through findBridgeTargetHighlights, falling back to its own verse's source.
+// Singletons, and a note verse outside the span, use the ordinary join.
 // `fallbackSource` stands in when the map has no source row for the target.
 export function rowHighlightsFor(
   bibleVersion: string,
@@ -215,10 +216,15 @@ export function rowHighlightsFor(
   fallbackSource?: unknown,
 ): Set<HighlightKey> {
   const spanSource = sourceForTargetRow(sourceByVerseStart, target)?.content ?? fallbackSource;
-  if (target && quote && occurrence != null && noteVerse != null && sourceByVerseStart) {
+  if (target && quote && noteVerse != null && sourceByVerseStart) {
     const [start, end] = verseSpan(target);
+    // A note on a bridge's first verse joins exactly as on main: against that
+    // verse's source alone, where its occurrence counts.
+    if (end > start && noteVerse === start) {
+      return highlightsFor(bibleVersion, target.content, quote, occurrence, sourceByVerseStart[start]?.content ?? fallbackSource, partialGroups);
+    }
     const targetVo = (target.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-    if (noteVerse > start && noteVerse <= end && Array.isArray(targetVo)) {
+    if (occurrence != null && noteVerse > start && noteVerse <= end && Array.isArray(targetVo)) {
       const sourceVerses: unknown[][] = [];
       for (let v = start; v <= end; v++) {
         const vo = (sourceByVerseStart[v]?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
@@ -226,6 +232,11 @@ export function rowHighlightsFor(
       }
       const hl = findBridgeTargetHighlights(targetVo, quote, occurrence, sourceVerses, noteVerse - start, partialGroups);
       if (hl) return hl;
+      // Unresolved from the note's verse on: fall back to that verse's source
+      // alone (main's rows view), never the whole span, which would light an
+      // earlier verse's copy. No source for the verse: nothing lights.
+      const own = sourceByVerseStart[noteVerse]?.content;
+      return own ? highlightsFor(bibleVersion, target.content, quote, occurrence, own, partialGroups) : new Set();
     }
   }
   return highlightsFor(bibleVersion, target?.content, quote, occurrence, spanSource, partialGroups);

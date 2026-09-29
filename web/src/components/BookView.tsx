@@ -869,7 +869,7 @@ const VerseRow = memo(function VerseRow({
   const commentColumn = enabledVersions.includes("ULT") ? "ULT" : enabledVersions[0];
   // The source (UHB or UGNT) that actually has this verse — a bridged target
   // row joins it across its span (#957).
-  const sourceByVerse = versesByVersion["UHB"]?.[verseNum] ? versesByVersion["UHB"] : versesByVersion["UGNT"];
+  const sourceByVerse = versesByVersion["UHB"] ?? versesByVersion["UGNT"];
   return (
     <Fragment>
       {enabledVersions.map((bv, colIdx) => {

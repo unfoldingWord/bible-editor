@@ -267,7 +267,11 @@ function mkVerse(verse, verseEnd, voCount = 1) {
   const hlV2 = rowHighlightsFor("ULT", bridge2, quote, 1, uhb2, 2);
   assert(hlV2.has("LORD|1") && !hlV2.has("Yahweh|1"), `TN on 1:2 occ 1 lights LORD only (got ${[...hlV2]})`);
   const hlV1 = rowHighlightsFor("ULT", bridge2, quote, 1, uhb2, 1);
-  assert(hlV1.has("Yahweh|1") && !hlV1.has("LORD|1"), `TN on 1:1 occ 1 lights Yahweh only (got ${[...hlV1]})`);
+  // A first-verse note joins exactly as on main (that verse's source alone),
+  // where the appears-once collapse folds 1/2 and 2/2 together, so both copies
+  // light. Kept on purpose: it keeps main's milestone repairs (#957 review 2).
+  const mainV1 = highlightsFor("ULT", bridge2.content, quote, 1, uhb2[1].content);
+  assert(hlV1.has("Yahweh|1") && [...hlV1].join() === [...mainV1].join(), `TN on 1:1 occ 1 lights Yahweh, same as main (got ${[...hlV1]})`);
   const hlAll = rowHighlightsFor("ULT", bridge2, quote, -1, uhb2, 2);
   assert(hlAll.has("LORD|1") && !hlAll.has("Yahweh|1"), `occurrence -1 on 1:2 means every match in 1:2 only (got ${[...hlAll]})`);
   const single2 = mk(2, null, bridge2.content.verseObjects, "ULT");
