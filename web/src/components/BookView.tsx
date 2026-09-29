@@ -19,7 +19,7 @@ import { type ChapterCopyBlock } from "../lib/chapterCopy";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type LaneShade, type TextLaneCheck } from "../lib/laneChecks";
 import type { ChapterState } from "../hooks/useBook";
-import { highlightsFor, isPaintableHtml, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { isPaintableHtml, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx, bookTsDividerSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, extractTrailingDividers, stripTrailingDividers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -33,7 +33,7 @@ import type { FindMatch } from "./FindReplaceOverlay";
 import type { FindQuery } from "./ScriptureColumn";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
-import { formatVerseLabel, isRangeRow } from "../lib/verseRange";
+import { formatVerseLabel, isRangeRow, rowHighlightsFor, sourceForTargetRow } from "../lib/verseRange";
 import { directionForVersion } from "../lib/direction";
 import {
   classifySourceQuery,
@@ -100,6 +100,8 @@ interface Props {
   // Verses in the active TN ref (same chapter as activeChapter). With
   // partialGroups, only these rows paint the quote — not the whole book.
   activeNoteCoveredVerses?: readonly number[];
+  // The active note's own verse; its occurrence counts there (#957).
+  activeNoteVerse?: number | null;
   // Transient reorder stoplight for the active verse (drag held / ~3s after an
   // arrow move): the moved note's candidate prev (green) + next (red).
   reorderHighlight?: ReorderHighlight | null;
@@ -162,6 +164,7 @@ export function BookView({
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
   activeNoteCoveredVerses,
+  activeNoteVerse,
   reorderHighlight,
   activeSourceContent,
   scrollNonce,
@@ -489,6 +492,7 @@ export function BookView({
                 activeNoteOccurrence={isActiveChapter ? activeNoteOccurrence : null}
                 activeNoteQuotePartialGroups={isActiveChapter && activeNoteQuotePartialGroups}
                 activeNoteCoveredVerses={isActiveChapter ? activeNoteCoveredVerses : undefined}
+                activeNoteVerse={isActiveChapter ? activeNoteVerse : undefined}
                 reorderHighlight={isActiveChapter ? reorderHighlight ?? null : null}
                 activeSourceContent={isActiveChapter ? activeSourceContent : undefined}
                 activeRowRef={activeRowRef}
@@ -540,6 +544,7 @@ const ChapterBlock = memo(function ChapterBlock({
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
   activeNoteCoveredVerses,
+  activeNoteVerse,
   reorderHighlight,
   activeSourceContent,
   activeRowRef,
@@ -572,6 +577,8 @@ const ChapterBlock = memo(function ChapterBlock({
   activeNoteOccurrence: number | null;
   activeNoteQuotePartialGroups?: boolean;
   activeNoteCoveredVerses?: readonly number[];
+  // The active note's own verse; its occurrence counts there (#957).
+  activeNoteVerse?: number | null;
   reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   activeRowRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -748,6 +755,7 @@ const ChapterBlock = memo(function ChapterBlock({
               isActive || coverHighlight ? activeNoteOccurrence : null
             }
             activeNoteQuotePartialGroups={coverHighlight}
+            activeNoteVerse={isActive || coverHighlight ? activeNoteVerse ?? null : null}
             reorderHighlight={isActive ? reorderHighlight : null}
             activeSourceContent={isActive ? activeSourceContent : undefined}
             rowRef={isActive ? activeRowRef : null}
@@ -788,6 +796,7 @@ const VerseRow = memo(function VerseRow({
   activeNoteQuote,
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
+  activeNoteVerse,
   reorderHighlight,
   activeSourceContent,
   rowRef,
@@ -821,6 +830,8 @@ const VerseRow = memo(function VerseRow({
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   activeNoteQuotePartialGroups?: boolean;
+  // The active note's own verse; its occurrence counts within that verse.
+  activeNoteVerse?: number | null;
   reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   rowRef: React.MutableRefObject<HTMLDivElement | null> | null;
@@ -856,6 +867,9 @@ const VerseRow = memo(function VerseRow({
   // Verse-level comment badge lives on a single column: ULT, or the leftmost
   // enabled version when ULT is hidden — so it doesn't repeat across columns.
   const commentColumn = enabledVersions.includes("ULT") ? "ULT" : enabledVersions[0];
+  // The source (UHB or UGNT) that actually has this verse — a bridged target
+  // row joins it across its span (#957).
+  const sourceByVerse = versesByVersion["UHB"] ?? versesByVersion["UGNT"];
   return (
     <Fragment>
       {enabledVersions.map((bv, colIdx) => {
@@ -900,15 +914,14 @@ const VerseRow = memo(function VerseRow({
               bibleVersion={bv}
               dto={dto}
               prevDto={prevDto}
-                sourceContent={
-                versesByVersion["UHB"]?.[verseNum]?.content ??
-                versesByVersion["UGNT"]?.[verseNum]?.content
-              }
+              sourceContent={dto ? sourceForTargetRow(sourceByVerse, dto)?.content : sourceByVerse?.[verseNum]?.content}
+              sourceByVerse={sourceByVerse}
               isActive={isActive}
               bridgeActive={bridgeActive}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
               activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
+              activeNoteVerse={activeNoteVerse}
               reorderHighlight={reorderHighlight}
               activeSourceContent={activeSourceContent}
               search={search}
@@ -944,11 +957,13 @@ const VerseCell = memo(function VerseCell({
   dto,
   prevDto,
   sourceContent,
+  sourceByVerse,
   isActive,
   bridgeActive,
   activeNoteQuote,
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
+  activeNoteVerse,
   reorderHighlight,
   activeSourceContent,
   search,
@@ -981,6 +996,9 @@ const VerseCell = memo(function VerseCell({
   // The matching UHB/UGNT verse content_json so the align button flags a
   // broken link when a source word lacks a target. Absent on source columns.
   sourceContent?: unknown;
+  // The per-verse source map sourceContent came from; a bridged row's
+  // highlights match from the note's own verse (rowHighlightsFor, #957).
+  sourceByVerse?: Record<number, VerseDto>;
   isActive: boolean;
   // Range-aware active for the bridge buttons (see VerseRow) — the active verse
   // is inside this bridge's span, not necessarily its start row.
@@ -988,6 +1006,8 @@ const VerseCell = memo(function VerseCell({
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   activeNoteQuotePartialGroups?: boolean;
+  // The active note's own verse; its occurrence counts within that verse.
+  activeNoteVerse?: number | null;
   reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   search: SearchState | null;
@@ -1152,16 +1172,19 @@ const VerseCell = memo(function VerseCell({
     if (!paint) return null;
     const partial = !reorderHighlight?.movedQuote && activeNoteQuotePartialGroups;
     const ol = sourceContent ?? activeSourceContent;
-    return highlightsFor(bibleVersion, dto.content, aQuote, aOcc, ol, partial);
+    const aVerse = reorderHighlight?.movedQuote ? reorderHighlight.movedVerse : activeNoteVerse;
+    return rowHighlightsFor(bibleVersion, dto, aQuote, aOcc, sourceByVerse, aVerse, partial, ol);
   }, [
     findHTML,
     isActive,
     activeNoteQuote,
     activeNoteOccurrence,
     activeNoteQuotePartialGroups,
+    activeNoteVerse,
+    sourceByVerse,
     reorderHighlight,
     bibleVersion,
-    dto?.content,
+    dto,
     sourceContent,
     activeSourceContent,
   ]);
@@ -1170,12 +1193,12 @@ const VerseCell = memo(function VerseCell({
   // verse only and only while a drag / recent arrow-move is live.
   const prevHighlights = useMemo<Set<HighlightKey> | null>(() => {
     if (findHTML || !isActive || !reorderHighlight?.prevQuote || !dto?.content) return null;
-    return highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, activeSourceContent);
-  }, [findHTML, isActive, reorderHighlight, bibleVersion, dto?.content, activeSourceContent]);
+    return rowHighlightsFor(bibleVersion, dto, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, sourceByVerse, reorderHighlight.prevVerse, false, sourceContent ?? activeSourceContent);
+  }, [findHTML, isActive, reorderHighlight, bibleVersion, dto, sourceByVerse, sourceContent, activeSourceContent]);
   const nextHighlights = useMemo<Set<HighlightKey> | null>(() => {
     if (findHTML || !isActive || !reorderHighlight?.nextQuote || !dto?.content) return null;
-    return highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, activeSourceContent);
-  }, [findHTML, isActive, reorderHighlight, bibleVersion, dto?.content, activeSourceContent]);
+    return rowHighlightsFor(bibleVersion, dto, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, sourceByVerse, reorderHighlight.nextVerse, false, sourceContent ?? activeSourceContent);
+  }, [findHTML, isActive, reorderHighlight, bibleVersion, dto, sourceByVerse, sourceContent, activeSourceContent]);
   const roles = useMemo(() => {
     if (!prevHighlights?.size && !nextHighlights?.size) return undefined;
     return { prev: prevHighlights, next: nextHighlights };
