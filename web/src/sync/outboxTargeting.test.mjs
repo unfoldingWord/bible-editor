@@ -23,6 +23,8 @@ import { MAX_ATTEMPTS_SENTINEL } from "./refusalReason.ts";
 import {
   eligibleForVersionThread,
   isMaxAttemptsBlocked,
+  laneChecksToKeepBehind,
+  pickNextOp,
   shouldAnnounceResult,
   targetKey,
 } from "./outboxTargeting.ts";
@@ -386,5 +388,169 @@ check(
   shouldAnnounceResult("conflict", false) === true,
   "non-locked results (conflict/retry/fatal) are unaffected by a persist failure — only `locked` gets suppressed",
 );
+
+// --- #931: a lane check must not overtake an earlier verse save ---
+//
+// The dual aligner's "save both, mark done, next verse" queues the verse
+// PATCH(es) and then the Text-lane check for the same verse. They have
+// different targetKeys, so plain per-target FIFO let the check dispatch while
+// the verse PATCH was parked (retry backoff, conflict, max-attempts); the
+// verse PATCH then landed second and its server-side reopenLaneChecks deleted
+// the check. pickNextOp holds a lane check behind any EARLIER verse op for the
+// same book+chapter+verse (any bibleVersion) that is still unsettled.
+{
+  const verseOp = (id, v, bv, status, queuedAt, seq, extra = {}) => ({
+    id,
+    target: { kind: "verse", book: "ZEC", chapter: 1, verse: v, bibleVersion: bv },
+    action: "patch",
+    patch: {},
+    expectedVersion: 3,
+    queuedAt,
+    seq,
+    attempts: 1,
+    status,
+    ...extra,
+  });
+  const laneOp = (id, v, queuedAt, seq, status = "pending", lane = "text") => ({
+    id,
+    target: { kind: "lane_check", book: "ZEC", chapter: 1, verse: v, lane },
+    action: "patch",
+    patch: { checked: true },
+    expectedVersion: 0,
+    queuedAt,
+    seq,
+    attempts: 0,
+    status,
+  });
+  const ultKey = targetKey({ kind: "verse", book: "ZEC", chapter: 1, verse: 7, bibleVersion: "ULT" });
+
+  // Retrying: the ULT PATCH got a 503 this pass (pending + pinned-blocked).
+  {
+    const ops = [verseOp("v", 7, "ULT", "pending", 100, 1, { lastError: "transient 503" }), laneOp("lc", 7, 101, 2)];
+    check(
+      pickNextOp(ops, new Set([ultKey])) === undefined,
+      "FIX (#931): a lane check waits while an earlier verse PATCH for the same verse is in retry backoff",
+    );
+  }
+  // Conflict: the ULT PATCH 409'd and awaits the user's merge.
+  {
+    const ops = [verseOp("v", 7, "ULT", "conflict", 100, 1), laneOp("lc", 7, 101, 2)];
+    check(
+      pickNextOp(ops, new Set()) === undefined,
+      "FIX (#931): a lane check waits while an earlier verse PATCH for the same verse is conflicted",
+    );
+  }
+  // Max-attempts failure (auto-revives) holds it too; a UST op counts the same.
+  {
+    const ops = [
+      verseOp("v", 7, "UST", "failed", 100, 1, { lastError: MAX_ATTEMPTS_SENTINEL }),
+      laneOp("lc", 7, 101, 2),
+    ];
+    check(
+      pickNextOp(ops, new Set()) === undefined,
+      "FIX (#931): a lane check waits behind a max-attempts-failed verse PATCH of the other bibleVersion",
+    );
+  }
+  // In flight (another tab / not yet recovered): hold.
+  {
+    const ops = [verseOp("v", 7, "ULT", "in_flight", 100, 1), laneOp("lc", 7, 101, 2)];
+    check(
+      pickNextOp(ops, new Set()) === undefined,
+      "FIX (#931): a lane check waits while an earlier verse PATCH for the same verse is in flight",
+    );
+  }
+  // Done: the verse op is gone from the store, so the check dispatches.
+  {
+    const lc = laneOp("lc", 7, 101, 2);
+    check(pickNextOp([lc], new Set([ultKey])) === lc, "once the verse PATCH is done (deleted), the lane check dispatches");
+  }
+  // A fatal (never re-sent) verse failure does not freeze the check.
+  {
+    const lc = laneOp("lc", 7, 101, 2);
+    const ops = [verseOp("v", 7, "ULT", "failed", 100, 1, { lastError: "http 422" }), lc];
+    check(pickNextOp(ops, new Set()) === lc, "a fatally-refused verse op does not hold the lane check");
+  }
+  // No related verse op: unaffected.
+  {
+    const lc = laneOp("lc", 7, 101, 2);
+    check(pickNextOp([lc], new Set()) === lc, "a lane check with no verse op queued is unaffected");
+  }
+  // A different verse's parked PATCH does not hold it.
+  {
+    const lc = laneOp("lc", 7, 101, 2);
+    const ops = [verseOp("v", 6, "ULT", "conflict", 100, 1), lc];
+    check(pickNextOp(ops, new Set()) === lc, "a lane check for a different verse is unaffected");
+  }
+  // A verse op queued AFTER the check does not hold it (edits made after
+  // checking still reopen it, as before).
+  {
+    const lc = laneOp("lc", 7, 100, 1);
+    const ops = [lc, verseOp("v", 7, "ULT", "pending", 101, 2)];
+    check(pickNextOp(ops, new Set()) === lc, "a verse op queued after the lane check does not hold it (FIFO unchanged)");
+  }
+  // Same millisecond: seq decides.
+  {
+    const ops = [verseOp("v", 7, "ULT", "conflict", 100, 1), laneOp("lc", 7, 100, 2)];
+    check(pickNextOp(ops, new Set()) === undefined, "same-millisecond enqueue: the lower-seq verse op still holds the check");
+  }
+  // Holding the check does not stop other targets from draining.
+  {
+    const other = verseOp("o", 8, "ULT", "pending", 102, 3);
+    const ops = [verseOp("v", 7, "ULT", "conflict", 100, 1), laneOp("lc", 7, 101, 2), other];
+    check(pickNextOp(ops, new Set()) === other, "a held lane check does not block other targets behind it");
+  }
+
+  // Only the lanes a verse save can reopen are held (mirrors the server's
+  // lanesToReopenOnVerseEdit): 'text' always, 'tw' for ULT, never tn/tq.
+  for (const lane of ["tn", "tq"]) {
+    for (const bv of ["ULT", "UST"]) {
+      const lc = laneOp("lc", 7, 101, 2, "pending", lane);
+      const ops = [verseOp("v", 7, bv, "conflict", 100, 1), lc];
+      check(
+        pickNextOp(ops, new Set()) === lc,
+        `FIX (#931 r3): a ${lane} check is not held by an earlier unsettled ${bv} verse op`,
+      );
+    }
+  }
+  {
+    const lc = laneOp("lc", 7, 101, 2, "pending", "tw");
+    check(
+      pickNextOp([verseOp("v", 7, "ULT", "pending", 100, 1, { lastError: "transient 503" }), lc], new Set([ultKey])) ===
+        undefined,
+      "FIX (#931 r3): a tw check is held by an earlier unsettled ULT verse op",
+    );
+    check(
+      pickNextOp([verseOp("v", 7, "UST", "conflict", 100, 1), lc], new Set()) === lc,
+      "FIX (#931 r3): a tw check is not held by an earlier unsettled UST verse op",
+    );
+  }
+  {
+    const conflicted = verseOp("v", 7, "UST", "conflict", 100, 1);
+    const text = laneOp("lct", 7, 101, 2, "pending", "text");
+    const tw = laneOp("lcw", 7, 102, 3, "pending", "tw");
+    const tn = laneOp("lcn", 7, 103, 4, "pending", "tn");
+    const moved = laneChecksToKeepBehind(conflicted, [conflicted, text, tw, tn]);
+    check(
+      moved.length === 1 && moved[0] === text,
+      "FIX (#931 r3): resolving a UST conflict moves only the text check behind it (not tw/tn)",
+    );
+  }
+
+  // resolveConflict re-queues the verse op at the back; the check that was
+  // behind it must move back with it.
+  {
+    const conflicted = verseOp("v", 7, "ULT", "conflict", 100, 1);
+    const behind = laneOp("lc", 7, 101, 2);
+    const ahead = laneOp("lc0", 7, 99, 0);
+    const otherVerse = laneOp("lc8", 8, 102, 3);
+    const moved = laneChecksToKeepBehind(conflicted, [ahead, conflicted, behind, otherVerse]);
+    check(
+      moved.length === 1 && moved[0] === behind,
+      "FIX (#931): resolving a verse conflict moves only the same-verse lane checks queued behind it",
+    );
+    const rowConflict = { ...op1FailedA, status: "conflict" };
+    check(laneChecksToKeepBehind(rowConflict, [behind]).length === 0, "a row conflict moves no lane checks");
+  }
+}
 
 console.log(`\noutboxTargeting: ${passed} checks passed`);

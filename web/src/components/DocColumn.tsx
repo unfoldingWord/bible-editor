@@ -6,7 +6,7 @@ import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
-import { highlightsFor, isPaintableHtml, leadingBreakClass, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { isPaintableHtml, leadingBreakClass, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -16,7 +16,7 @@ import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { FindMatch } from "./FindReplaceOverlay";
-import { formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
+import { formatVerseLabel, isFirstOfRange, isRangeRow, rowHighlightsFor, sourceForTargetRow } from "../lib/verseRange";
 import { VerseBridgeButtons } from "./VerseBridgeButtons";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -67,6 +67,8 @@ interface Props {
   activeNoteQuotePartialGroups?: boolean;
   // Verses in the active TN ref; with partialGroups, only these paint.
   activeNoteCoveredVerses?: readonly number[];
+  // The active note's own verse; its occurrence counts there (#957).
+  activeNoteVerse?: number | null;
   // Transient reorder stoplight for the active verse (drag held / ~3s after an
   // arrow move): the moved note's candidate prev (green underline) + next (red
   // overline), on channels separate from the yellow active fill.
@@ -143,6 +145,7 @@ export function DocColumn({
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
   activeNoteCoveredVerses,
+  activeNoteVerse,
   reorderHighlight,
   activeSourceContent,
   scrollNonce,
@@ -302,17 +305,24 @@ export function DocColumn({
             );
           const paintQuote = !!aQuote && (isActive || covered);
           const partial = !reorderHighlight?.movedQuote && covered;
-          // OL-anchor against THIS verse's source — activeSourceContent is only
-          // the navigated verse and would mis-join a v12 ULT highlight.
-          const sourceContent =
-            sourceByVerseNum?.[dto.verse]?.content ?? activeSourceContent;
-          // Reorder stoplight neighbour quotes (active verse only, while live).
-          // Resolved to Sets inside VerseSpan (memoized there) rather than here,
-          // so an unrelated DocColumn render doesn't hand every verse a fresh Set.
+          // OL-anchor against THIS row's source (its whole span for a bridge,
+          // #957) — activeSourceContent is only the navigated verse and would
+          // mis-join a v12 ULT highlight. Resolved here (cheap: object lookups,
+          // no Set allocation) for the align button; the bridge-aware
+          // rowHighlightsFor calls themselves move into VerseSpan's useMemo
+          // below, keyed on primitives, so an unrelated DocColumn render
+          // doesn't hand every verse a freshly-allocated Set.
+          const rowSourceContent = sourceForTargetRow(sourceByVerseNum, dto)?.content;
+          // A note's occurrence counts within its own verse, which a bridged
+          // row needs to find the right source instance (#957).
+          const ro = reorderHighlight;
+          const aVerse = (ro?.movedQuote ? ro.movedVerse : activeNoteVerse) ?? null;
           const prevQuote = reorderHighlight?.prevQuote ?? null;
           const prevOcc = reorderHighlight?.prevOccurrence ?? null;
+          const prevVerse = reorderHighlight?.prevVerse ?? null;
           const nextQuote = reorderHighlight?.nextQuote ?? null;
           const nextOcc = reorderHighlight?.nextOccurrence ?? null;
+          const nextVerse = reorderHighlight?.nextVerse ?? null;
           // Lift any \s1/\s2/\s3 section headers in this verse's content into
           // block-level bands rendered AFTER the inline verse span (see below),
           // and the trailing \q1/\p etc. drifted down from the previous verse —
@@ -329,17 +339,21 @@ export function DocColumn({
                 bibleVersion={bibleVersion}
                 text={dto.plain_text ?? ""}
                 content={dto.content}
-                sourceContent={sourceByVerseNum?.[dto.verse]?.content}
-                highlightSourceContent={sourceContent}
+                sourceContent={rowSourceContent}
+                sourceByVerseNum={sourceByVerseNum}
+                activeSourceContent={activeSourceContent}
                 precedingMarkers={drift}
                 paintQuote={paintQuote}
                 aQuote={aQuote}
                 aOcc={aOcc}
+                aVerse={aVerse}
                 partial={partial}
                 prevQuote={prevQuote}
                 prevOcc={prevOcc}
+                prevVerse={prevVerse}
                 nextQuote={nextQuote}
                 nextOcc={nextOcc}
+                nextVerse={nextVerse}
                 isActive={isActive}
                 readOnly={!!readOnly}
                 rtl={!!rtl}
@@ -417,16 +431,20 @@ const VerseSpan = memo(function VerseSpan({
   text,
   content,
   sourceContent,
-  highlightSourceContent,
+  sourceByVerseNum,
+  activeSourceContent,
   precedingMarkers,
   paintQuote,
   aQuote,
   aOcc,
+  aVerse,
   partial,
   prevQuote,
   prevOcc,
+  prevVerse,
   nextQuote,
   nextOcc,
+  nextVerse,
   isActive,
   readOnly,
   rtl,
@@ -461,13 +479,16 @@ const VerseSpan = memo(function VerseSpan({
   text: string;
   content?: unknown;
   // The matching UHB/UGNT verse content_json (verse_start keyed) so the align
-  // button flags a broken link when a source word lacks a target.
+  // button flags a broken link when a source word lacks a target. Already
+  // resolved to this row's whole bridge span by DocColumn (sourceForTargetRow).
   sourceContent?: unknown;
-  // Same lookup, but falling back to activeSourceContent — used only to
-  // resolve note-quote highlight Sets below (DocColumn's old `sourceContent`
-  // local). Kept separate from `sourceContent` above: the align button must
-  // never see the fallback, or it would mis-join a v12 ULT highlight.
-  highlightSourceContent?: unknown;
+  // The full source-by-verse-start map (not just this row's span) plus the
+  // navigated-verse fallback — rowHighlightsFor needs both to resolve a
+  // bridged row's per-verse note occurrence (#957). Passed through as-is
+  // (object/primitive references DocColumn already holds) so this memo only
+  // reruns when they actually change, not on every DocColumn render.
+  sourceByVerseNum?: Record<number, VerseDto>;
+  activeSourceContent?: unknown;
   // Trailing markers drifted from the previous verse — composed at the
   // start of the rendered verseObjects so visual paragraph / poetry
   // breaks introduce this verse correctly.
@@ -479,13 +500,18 @@ const VerseSpan = memo(function VerseSpan({
   paintQuote: boolean;
   aQuote: string | null;
   aOcc: number | null;
+  // The note's own verse (where its occurrence counts) — a bridged row needs
+  // it to find the right source instance (#957).
+  aVerse: number | null;
   partial: boolean;
   // Reorder stoplight neighbour quotes (green underline / red overline).
   // Resolved to Sets below, and only when this is the active verse.
   prevQuote: string | null;
   prevOcc: number | null;
+  prevVerse: number | null;
   nextQuote: string | null;
   nextOcc: number | null;
+  nextVerse: number | null;
   isActive: boolean;
   readOnly: boolean;
   rtl: boolean;
@@ -520,21 +546,21 @@ const VerseSpan = memo(function VerseSpan({
   onOpenComments?: (anchorEl: HTMLElement, verse: number) => void;
 }) {
   // Note-quote highlight Sets, memoized per verse instead of allocated fresh
-  // by DocColumn's map() on every render (#895). highlightsFor always returns
-  // a Set (never null) once a quote is present, so the gates below match the
-  // ternaries this replaces exactly.
+  // by DocColumn's map() on every render (#895). rowHighlightsFor always
+  // returns a Set (never null) once a quote is present, so the gates below
+  // match the ternaries this replaces exactly.
   const highlights = useMemo<Set<string> | null>(() => {
     if (!paintQuote || !aQuote) return null;
-    return highlightsFor(bibleVersion, content, aQuote, aOcc, highlightSourceContent, partial);
-  }, [paintQuote, aQuote, aOcc, partial, bibleVersion, content, highlightSourceContent]);
+    return rowHighlightsFor(bibleVersion, base, aQuote, aOcc, sourceByVerseNum, aVerse, partial, activeSourceContent);
+  }, [paintQuote, aQuote, aOcc, aVerse, partial, bibleVersion, base, sourceByVerseNum, activeSourceContent]);
   const prevHighlights = useMemo<Set<string> | null>(() => {
     if (!isActive || !prevQuote) return null;
-    return highlightsFor(bibleVersion, content, prevQuote, prevOcc, highlightSourceContent);
-  }, [isActive, prevQuote, prevOcc, bibleVersion, content, highlightSourceContent]);
+    return rowHighlightsFor(bibleVersion, base, prevQuote, prevOcc, sourceByVerseNum, prevVerse, false, activeSourceContent);
+  }, [isActive, prevQuote, prevOcc, prevVerse, bibleVersion, base, sourceByVerseNum, activeSourceContent]);
   const nextHighlights = useMemo<Set<string> | null>(() => {
     if (!isActive || !nextQuote) return null;
-    return highlightsFor(bibleVersion, content, nextQuote, nextOcc, highlightSourceContent);
-  }, [isActive, nextQuote, nextOcc, bibleVersion, content, highlightSourceContent]);
+    return rowHighlightsFor(bibleVersion, base, nextQuote, nextOcc, sourceByVerseNum, nextVerse, false, activeSourceContent);
+  }, [isActive, nextQuote, nextOcc, nextVerse, bibleVersion, base, sourceByVerseNum, activeSourceContent]);
   const onClick = useCallback(() => onSelectVerse(verseNum), [onSelectVerse, verseNum]);
   const onEdit = useCallback(
     (plain: string) => onEditVerse(verseNum, plain, base),
@@ -577,7 +603,18 @@ const VerseSpan = memo(function VerseSpan({
       setHasDraft(false);
       return;
     }
-    return drafts.subscribeKey(draftKey, (rec) => {
+    return drafts.subscribeKey(draftKey, (rec, remote) => {
+      // #806: another tab's typing on this verse must not reach a mounted
+      // cell that has no local edits — no hydrate, no dirty flag. The cell
+      // shows the draft only when it next mounts (reopen / reload). A
+      // notification that lands before the mount callback's first read
+      // settles is shown at mount, the same as a reload a moment later.
+      // setHasDraft(false) resyncs a cell whose own clear (undo) lost the
+      // race to that notification, so it does not stay marked dirty.
+      if (remote && !dirtyRef.current) {
+        setHasDraft(false);
+        return;
+      }
       setHasDraft(!!rec);
       // Snapshot BEFORE the mirror below overwrites it: true means the user has
       // already typed into this cell, so any draft record arriving now is the
