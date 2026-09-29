@@ -388,6 +388,18 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     assert(hl.has("b2|1") && !hl.has("b1|1"), `TN on 1:2 with null occurrence lights b2, not b1 (got ${show(hl)})`);
   }
 
+  console.log("\n[Case] later-verse note whose milestone over-claims its occurrence falls back to its own verse (#957 review 4)");
+  {
+    // C appears once in the span (in v2), but its milestone claims 2 of 2.
+    // The bridge join finds no match; main's rows view (v2 source alone)
+    // heals it with the appears-once collapse, so the fallback must run.
+    const uhb = src([[B], [C]]);
+    const row = bridge(2, [Z(B, 1, 1, "b1"), Z(C, 2, 2, "c2")].join(" "));
+    const hl = rowHL(row, C, 1, uhb, 2);
+    const main = highlightsFor("ULT", row.content, C, 1, uhb[2].content);
+    assert(hl.has("c2|1") && show(hl) === show(main), `over-claiming milestone on 1:2 lights c2 like main (got ${show(hl)}, main ${show(main)})`);
+  }
+
   console.log("\n[Case] later-verse note whose quote does not resolve from its verse falls back to that verse alone (#957 review 2)");
   {
     // The source map lacks v2; the quote C exists only in v1.
