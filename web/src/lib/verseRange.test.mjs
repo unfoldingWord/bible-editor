@@ -358,6 +358,40 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     const hl = rowHL(row, `${P} & ${X} & ${Q}`, 1, uhb, 2, true);
     assert(hl.has("p2|1") && hl.has("x3|1") && !hl.has("x1|1"), `partial note lights p2 and x3, not x1 (got ${show(hl)})`);
   }
+
+  console.log("\n[Case] note on a bridge's FIRST verse keeps main's single-verse join (#957 review 2)");
+  {
+    // v1 holds B once, v2 once; the row numbers B across the span.
+    const uhb = src([[B], [B]]);
+    const row = bridge(2, [Z(B, 1, 2, "b1"), Z(B, 2, 2, "b2")].join(" "));
+    const hl = rowHL(row, B, 2, uhb, 1);
+    const main = highlightsFor("ULT", row.content, B, 2, uhb[1].content);
+    assert(!hl.has("b2|1") && show(hl) === show(main), `TN on 1:1 occ 2 (v1 has one copy) does not light v2's copy (got ${show(hl)}, main ${show(main)})`);
+  }
+  {
+    // v1 holds B twice, v2 once; occurrence -1 on 1:1 means v1's copies only.
+    const uhb = src([[B, B], [B]]);
+    const row = bridge(2, [Z(B, 1, 3, "b1a"), Z(B, 2, 3, "b1b"), Z(B, 3, 3, "b2")].join(" "));
+    const hl = rowHL(row, B, -1, uhb, 1);
+    assert(hl.has("b1a|1") && hl.has("b1b|1") && !hl.has("b2|1"), `TN on 1:1 occ -1 lights v1's English only (got ${show(hl)})`);
+  }
+
+  console.log("\n[Case] later-verse note whose quote does not resolve from its verse falls back to that verse alone (#957 review 2)");
+  {
+    // The source map lacks v2; the quote C exists only in v1.
+    const uhb = src([[C], [B]]);
+    delete uhb[2];
+    const row = bridge(2, [Z(C, 1, 1, "c1"), Z(B, 1, 1, "b2")].join(" "));
+    const hl = rowHL(row, C, 1, uhb, 2);
+    assert(hl.size === 0, `no source for 1:2: nothing lights (got ${show(hl)})`);
+  }
+  {
+    const uhb = src([[C, C], [B]]);
+    const row = bridge(2, [Z(C, 1, 2, "c1a"), Z(C, 2, 2, "c1b"), Z(B, 1, 1, "b2")].join(" "));
+    const hl = rowHL(row, C, 1, uhb, 2);
+    const main = highlightsFor("ULT", row.content, C, 1, uhb[2].content);
+    assert(show(hl) === show(main), `unresolved later-verse quote matches main's rows view on 1:2 (got ${show(hl)}, main ${show(main)})`);
+  }
 }
 
 if (failed) {
