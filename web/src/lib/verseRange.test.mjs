@@ -380,6 +380,14 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     assert(hl.has("b1a|1") && hl.has("b1b|1") && !hl.has("b2|1"), `TN on 1:1 occ -1 lights v1's English only (got ${show(hl)})`);
   }
 
+  console.log("\n[Case] later-verse note with a null occurrence still joins on its own verse (#957 review 3)");
+  {
+    const uhb = src([[B], [B]]);
+    const row = bridge(2, [Z(B, 1, 2, "b1"), Z(B, 2, 2, "b2")].join(" "));
+    const hl = rowHL(row, B, null, uhb, 2);
+    assert(hl.has("b2|1") && !hl.has("b1|1"), `TN on 1:2 with null occurrence lights b2, not b1 (got ${show(hl)})`);
+  }
+
   console.log("\n[Case] later-verse note whose quote does not resolve from its verse falls back to that verse alone (#957 review 2)");
   {
     // The source map lacks v2; the quote C exists only in v1.
