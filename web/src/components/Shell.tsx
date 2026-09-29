@@ -1312,15 +1312,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     return () => setReadOnlyReason("bookLocked", false);
   }, [bookLocked]);
   // After a chapter change the previous chapter's copy stays on screen until
-  // the new payload lands (#892). It is locked the whole time: `editLocked`
-  // goes everywhere `bookLocked` disables an edit affordance, the split
+  // the new payload lands (#892). The lock is on NEW input: `editLocked`
+  // goes everywhere `bookLocked` disables an edit affordance, and the split
   // container (rail, scripture and resource columns) is `inert` (no focus,
-  // typing, clicks or drags), and the write entry points below refuse while
-  // `chapterStaleRef` is set, so no edit is ever queued against the stale
-  // copy (#531). Not folded into
-  // setReadOnlyReason: that global also blocks the outbox for writes the
-  // stale window must not drop (a queued op draining, a note's blank-stub
-  // cleanup).
+  // typing, clicks or drags), so nothing new can be typed into the stale copy
+  // (#531). A write the user started before navigating (a save whose draft
+  // lookup resolves after the route moved, "Save anyway", an AI suggest
+  // landing) targets an explicit chapter-N row/verse id + version and still
+  // goes through; the outbox is the source of truth. What `chapterStaleRef`
+  // refuses is only a write whose target comes from the ROUTE chapter while
+  // the previous chapter's data is on screen (the row-create paths). Not
+  // folded into setReadOnlyReason: that global would drop the legitimate
+  // writes above.
   const editLocked = bookLocked || chapterStale;
   const chapterStaleRef = useRef(chapterStale);
   chapterStaleRef.current = chapterStale;
@@ -2718,7 +2721,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // eventual PATCH success can generation-gate its crash-draft cleanup.
     alignmentDraftGeneration?: string,
   ): boolean => {
-    if (chapterStaleRef.current) return false; // #892: never queue against the stale copy
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
     // predicate lives in guardBlocksSave — DO NOT inline a narrowing such as
@@ -3056,7 +3058,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     patch: Partial<T>,
     opts?: { restoredFromVersion?: number },
   ) => {
-    if (chapterStaleRef.current) return; // #892: never queue against the stale copy
     // Optimistic local apply mirrors what the server will do: any non-revert
     // patch clears the restored_from_version marker so the chip immediately
     // drops the v{N} override instead of waiting for the round-trip.
@@ -3088,7 +3089,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     plain: string,
     base: VerseDto,
   ) => {
-    if (chapterStaleRef.current) return; // #892: no draft for the stale copy
     const key = verseKey(book, chapterNum, verseNum, bibleVersion);
     // Pin the diff/save baseline to whatever `base` this edit session's FIRST
     // keystroke saw. A version bump that lands mid-edit (WS verse.updated,
@@ -3630,6 +3630,36 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             : ""}
         </Alert>
       ))}
+      {chapterStale && (
+        // The stale copy is locked until the new chapter lands (#892); say so,
+        // especially when the load is retrying (offline / slow network).
+        // Fixed-position so it neither shifts the layout nor sits inside the
+        // inert container.
+        <Box
+          data-testid="stale-chapter-status"
+          role="status"
+          sx={{
+            position: "fixed",
+            bottom: 16,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: (t) => t.zIndex.snackbar,
+            display: "flex",
+            alignItems: "center",
+            gap: 1,
+            px: 1.5,
+            py: 0.75,
+            borderRadius: 1,
+            bgcolor: "background.paper",
+            boxShadow: 3,
+          }}
+        >
+          <CircularProgress size={14} />
+          <Typography variant="body2">
+            {status === "retrying" ? `reconnecting… (attempt ${retryAttempts})` : `loading ${book} ${chapter}…`}
+          </Typography>
+        </Box>
+      )}
       <Box
         ref={splitContainerRef}
         sx={{ flex: 1, display: "flex", overflow: "hidden" }}
@@ -3977,6 +4007,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (row.verse !== activeVerse) setActiveVerse(row.verse);
           }}
           onNoteCreate={async () => {
+            // #892: book/chapter here come from the route, verse/sort from the
+            // stale copy on screen; refuse rather than misfile a new row.
+            if (chapterStaleRef.current) return;
             const list = sortedForVerse(data.tn, activeVerse);
             const sort_order = pickSortOrder(list, null, "after");
             const created = (await api.createRow<TnRow>("tn", {
@@ -3998,6 +4031,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveQuestionId(null);
           }}
           onNoteInsertAfter={async (refId) => {
+            // #892: book/chapter here come from the route, verse/sort from the
+            // stale copy on screen; refuse rather than misfile a new row.
+            if (chapterStaleRef.current) return;
             const ref = data.tn.find((r) => r.id === refId);
             if (!ref) return;
             const list = sortedForVerse(data.tn, ref.verse);
@@ -4073,6 +4109,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onTwlOrderUnlock={handleTwlOrderUnlock}
           onTwlOrderDismiss={handleTwlOrderDismiss}
           onWordCreate={async () => {
+            // #892: book/chapter here come from the route, verse/sort from the
+            // stale copy on screen; refuse rather than misfile a new row.
+            if (chapterStaleRef.current) return;
             const list = sortedForVerse(data.twl, activeVerse);
             const sort_order = pickSortOrder(list, null, "after");
             const created = (await api.createRow<TwlRow>("twl", {
@@ -4173,6 +4212,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             }
           }}
           onQuestionCreate={async () => {
+            // #892: book/chapter here come from the route, verse/sort from the
+            // stale copy on screen; refuse rather than misfile a new row.
+            if (chapterStaleRef.current) return;
             const created = (await api.createRow<TqRow>("tq", {
               book,
               chapter,

@@ -39,3 +39,38 @@ export function updateIfCurrent<T extends ChapterKeyed>(
   if (!prev || isStaleChapter(prev, route)) return prev;
   return fn(prev);
 }
+
+/** The route key plus a counter bumped on every navigation to a new route. */
+export interface NavigationGen {
+  key: string;
+  gen: number;
+}
+
+/**
+ * Advance the navigation generation when the route changes; return `prev`
+ * itself when it hasn't, so a re-render (or StrictMode's double render) never
+ * counts as a navigation. Returning to a chapter just left IS a new
+ * navigation (A → B → A bumps twice).
+ */
+export function trackNavigation(prev: NavigationGen | null, route: ChapterRoute): NavigationGen {
+  const key = `${route.book.toUpperCase()}:${route.chapter}`;
+  if (prev && prev.key === key) return prev;
+  return { key, gen: (prev?.gen ?? 0) + 1 };
+}
+
+/**
+ * Whether the payload on screen must be shown locked: when it belongs to
+ * another chapter than the route, and also when it matches the route but the
+ * fetch started for the current navigation hasn't landed yet (`landedGen`).
+ * After A → B → A, A's old copy can carry pre-save versions, because outbox
+ * results and WS updates for A were filtered while the route was B.
+ */
+export function isChapterLocked(
+  data: ChapterKeyed | null,
+  route: ChapterRoute,
+  landedGen: number,
+  currentGen: number,
+): boolean {
+  if (!data) return false;
+  return isStaleChapter(data, route) || landedGen !== currentGen;
+}

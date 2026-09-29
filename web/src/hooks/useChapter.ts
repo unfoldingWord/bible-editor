@@ -21,7 +21,7 @@ import {
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
 import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
-import { isStaleChapter, updateIfCurrent, type ChapterRoute } from "../lib/chapterStale";
+import { isChapterLocked, trackNavigation, updateIfCurrent, type ChapterRoute, type NavigationGen } from "../lib/chapterStale";
 import {
   applyStep,
   applyUpdated,
@@ -59,9 +59,10 @@ export interface UseChapterReturn {
   data: ChapterPayload | null;
   /**
    * True while `data` belongs to a different (book, chapter) than the one this
-   * hook was asked for. It is shown so the view doesn't blank, but it must be
-   * locked: nothing may be edited or queued against it (#531). Local applies
-   * are no-ops while stale.
+   * hook was asked for, or matches it but was not fetched for the current
+   * navigation (A → B → A before B lands). It is shown so the view doesn't
+   * blank, but it must be locked against new input (#531). Local applies are
+   * no-ops while it belongs to another chapter.
    */
   stale: boolean;
   error: string | null;
@@ -128,6 +129,13 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // against the current route, not the one its callback was created under.
   const routeRef = useRef<ChapterRoute>({ book, chapter });
   routeRef.current = { book, chapter };
+  // Bumped on every move to a new (book, chapter), including back to one just
+  // left. `landedGen` records which navigation the last landed payload was
+  // fetched for, so after A → B → A the old A copy stays locked until A's new
+  // GET lands (it can carry pre-save versions; see isChapterLocked).
+  const navRef = useRef<NavigationGen | null>(null);
+  navRef.current = trackNavigation(navRef.current, { book, chapter });
+  const [landedGen, setLandedGen] = useState(0);
   const [status, setStatus] = useState<Status>("idle");
   // ChapterData = the server payload + client-only verse tombstones. A fresh
   // payload from refetch carries none, which is how tombstones get cleared.
@@ -158,6 +166,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       // With `prev` null, or the previous chapter's stale copy (#892),
       // `mergeRefetched` is a plain replace.
       setData((prev) => replaySteps(merge ? mergeRefetched(prev, payload) : payload, queued));
+      // The sequencer aborts a request on navigation, so whatever lands was
+      // fetched for the current navigation.
+      setLandedGen(navRef.current?.gen ?? 0);
       setStatus("ready");
       setRetryAttempts(0);
     },
@@ -454,7 +465,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   return {
     status,
     data,
-    stale: isStaleChapter(data, { book, chapter }),
+    stale: isChapterLocked(data, { book, chapter }, landedGen, navRef.current.gen),
     error,
     retryAttempts,
     refetch,

@@ -2,7 +2,7 @@
 // change (#892). Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/chapterStale.test.mjs
 
-import { isStaleChapter, updateIfCurrent } from "./chapterStale.ts";
+import { isChapterLocked, isStaleChapter, trackNavigation, updateIfCurrent } from "./chapterStale.ts";
 
 let failed = 0;
 let passed = 0;
@@ -56,6 +56,36 @@ assert(isStaleChapter(payload("ZEC", 0), { book: "ZEC", chapter: 1 }) === true, 
     return p;
   });
   assert(out === null && called === 0, "null payload stays null and the mutation never runs");
+}
+
+// ── Navigation generations: A → B → A before B lands ───────────────────────
+// Coming back to A while B is still loading, the payload on screen (A's old
+// copy) matches the route again, but it may carry pre-save versions: outbox
+// results and WS updates for A were filtered while the route was B. It must
+// stay locked until the fetch started for THIS navigation lands.
+{
+  const A = { book: "ZEC", chapter: 3 };
+  const B = { book: "ZEC", chapter: 4 };
+  let nav = trackNavigation(null, A);
+  assert(nav.gen === 1, "first route is generation 1");
+  const again = trackNavigation(nav, { ...A });
+  assert(again === nav, "re-rendering the same route keeps the generation (same object)");
+  let landedGen = nav.gen; // A's mount GET landed
+  const aData = payload("ZEC", 3);
+  assert(isChapterLocked(aData, A, landedGen, nav.gen) === false, "A loaded for this navigation is editable");
+
+  nav = trackNavigation(nav, B);
+  assert(nav.gen === 2, "moving to B bumps the generation");
+  assert(isChapterLocked(aData, B, landedGen, nav.gen) === true, "A shown while B loads is locked");
+
+  nav = trackNavigation(nav, A);
+  assert(nav.gen === 3, "coming back to A bumps it again");
+  assert(isStaleChapter(aData, A) === false, "(chapter match alone would call A fresh)");
+  assert(isChapterLocked(aData, A, landedGen, nav.gen) === true, "old A copy stays locked until A's new GET lands");
+
+  landedGen = nav.gen; // A's new GET landed
+  assert(isChapterLocked(payload("ZEC", 3), A, landedGen, nav.gen) === false, "A is editable once its GET for this navigation lands");
+  assert(isChapterLocked(null, A, 0, nav.gen) === false, "no payload is loading, not locked");
 }
 
 console.log(`chapterStale: ${passed} passed, ${failed} failed`);
