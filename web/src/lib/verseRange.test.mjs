@@ -289,6 +289,76 @@ function mkVerse(verse, verseEnd, voCount = 1) {
   assert(hlV2pv.has("LORD|1"), `per-verse bridge: TN on 1:2 still lights LORD (got ${[...hlV2pv]})`);
 }
 
+// ─── #957 review: mixed numbering, unaligned first word, partial groups ──
+// `rowHL` is the call-site shape every reading view uses for a bridged
+// ULT/UST row: the row, the note's quote/occurrence/own verse, and the
+// per-verse source map.
+{
+  const vo = (raw) => {
+    const json = usfm.toJSON(raw);
+    const ch = Object.keys(json.chapters)[0];
+    return Object.fromEntries(
+      Object.entries(json.chapters[ch]).filter(([k]) => /^\d/.test(k)).map(([k, v]) => [k, v.verseObjects]),
+    );
+  };
+  const mk = (verse, verseEnd, verseObjects, bv) => ({
+    book: "ZEC", chapter: 1, verse, verse_end: verseEnd, bible_version: bv,
+    plain_text: null, version: 1, updated_by: null, updated_at: 0, content: { verseObjects },
+  });
+  const rowHL = (row, quote, occ, byVerse, noteVerse, partial = false) =>
+    highlightsFor("ULT", row.content, quote, spanOccurrence(byVerse, row, noteVerse, quote, occ), sourceForTargetRow(byVerse, row)?.content, partial);
+  const W = (s) => String.raw`\w ${s}|lemma="${s}" strong="H1" x-morph="He,X"\w*`;
+  const Z = (src, occ, occs, gloss) =>
+    String.raw`\zaln-s |x-strong="H1" x-lemma="${src}" x-morph="He,X" x-occurrence="${occ}" x-occurrences="${occs}" x-content="${src}"\*\w ${gloss}|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*`;
+  const A = "אֶת", B = "יְהוָה", C = "דָּבָר", P = "קָצַף", X = "עַל", Q = "שָׁלוֹם";
+  const src = (verses) => {
+    const parsed = vo(`\\id ZEC\n\\c 1\n${verses.map((ws, i) => `\\v ${i + 1} ${ws.map(W).join(" ")}`).join("\n")}\n`);
+    return Object.fromEntries(verses.map((_, i) => [i + 1, mk(i + 1, null, parsed[String(i + 1)], "UHB")]));
+  };
+  const bridge = (end, body) => {
+    const parsed = vo(`\\id ZEC\n\\c 1\n\\v 1-${end} ${body}\n`);
+    return mk(1, end, parsed[`1-${end}`] ?? parsed["1"], "ULT");
+  };
+  const show = (hl) => [...hl].join(",");
+
+  console.log("\n[Case] per-verse bridge whose first quote word is unaligned (#957 review)");
+  {
+    const uhb = src([[A, B], [A, B]]);
+    // A has no marker in the target; B is numbered per verse (1/1 in each).
+    const row = bridge(2, [String.raw`\w a1|x-occurrence="1" x-occurrences="2"\w*`, Z(B, 1, 1, "b1"),
+      String.raw`\w a2|x-occurrence="2" x-occurrences="2"\w*`, Z(B, 1, 1, "b2")].join(" "));
+    const hl = rowHL(row, `${A} ${B}`, 1, uhb, 2);
+    assert(hl.has("b2|1"), `TN on 1:2 still lights the English for B (got ${show(hl)})`);
+  }
+
+  console.log("\n[Case] mixed numbering in one row: first word across the span, second per verse (#957 review)");
+  {
+    const uhb = src([[B, C], [B, C]]);
+    const row = bridge(2, [Z(B, 1, 2, "b1"), Z(C, 1, 1, "c1"), Z(B, 2, 2, "b2"), Z(C, 1, 1, "c2")].join(" "));
+    const hl = rowHL(row, `${B} ${C}`, 1, uhb, 2);
+    assert(hl.has("b2|1") && hl.has("c2|1") && !hl.has("b1|1"), `TN on 1:2 lights b2 and c2, not b1 (got ${show(hl)})`);
+  }
+
+  console.log("\n[Case] mixed numbering in one row: first word per verse, second across the span (#957 review)");
+  {
+    const uhb = src([[B, C], [B, C]]);
+    const row = bridge(2, [Z(B, 1, 1, "b1"), Z(C, 1, 2, "c1"), Z(B, 1, 1, "b2"), Z(C, 2, 2, "c2")].join(" "));
+    const hl = rowHL(row, `${B} ${C}`, 1, uhb, 2);
+    assert(hl.has("c2|1") && !hl.has("c1|1"), `TN on 1:2 lights c2, not c1 (got ${show(hl)})`);
+  }
+
+  console.log("\n[Case] multi-verse note on a bridge: a later group never lands in an earlier verse (#957 review)");
+  {
+    // Bridge 1-3. The note is 1:2-4 ("P & X & Q"): P in v2, X in v3, Q in v4,
+    // which is outside this row, so the strict match fails and each group
+    // is matched on its own. X also occurs in v1.
+    const uhb = src([[X], [P], [X]]);
+    const row = bridge(3, [Z(X, 1, 2, "x1"), Z(P, 1, 1, "p2"), Z(X, 2, 2, "x3")].join(" "));
+    const hl = rowHL(row, `${P} & ${X} & ${Q}`, 1, uhb, 2, true);
+    assert(hl.has("p2|1") && hl.has("x3|1") && !hl.has("x1|1"), `partial note lights p2 and x3, not x1 (got ${show(hl)})`);
+  }
+}
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);
