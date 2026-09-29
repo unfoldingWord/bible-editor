@@ -192,6 +192,30 @@ const aligned = [
   assert(text.split("\n").filter((l) => l.trim()).length === 2, "one heading + one verse line (no \\ts split)");
 }
 
+// ── exportUsfm: unaligned export never mutates the input verseObjects ────────
+// Regression for #932: usfm.toUSFM edits plain (non-\w, non-\zaln) nodes in
+// place — trims trailing whitespace off a paragraph's `text`, and strips
+// `text`/`type` off a whitespace-only text node that follows a paragraph.
+// stripAlignmentNodes passes those nodes through by reference, so the unaligned
+// branch must clone first or the cached verse DTO gets rewritten.
+{
+  const verseObjects = [
+    { tag: "p", type: "paragraph", text: "Blessed is   \n" },
+    { type: "word", tag: "w", text: "the" },
+    { type: "text", text: " " },
+    { type: "word", tag: "w", text: "man" },
+    { tag: "p", type: "paragraph", nextChar: "\n" },
+    { type: "text", text: " " },
+    { type: "word", tag: "w", text: "who" },
+  ];
+  const before = JSON.parse(JSON.stringify(verseObjects));
+  buildUsfmFromVerses("PSA", "ULT", [mkVerse(1, verseObjects)], { aligned: false });
+  assert(
+    JSON.stringify(verseObjects) === JSON.stringify(before),
+    "unaligned export does not mutate the input verseObjects",
+  );
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
