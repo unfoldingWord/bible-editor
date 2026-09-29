@@ -216,10 +216,10 @@ export function sourceForTargetRow(
 //
 // Known limit: a bridge numbered ACROSS the span (x-occurrence counting every
 // verse) can light the wrong copy, or none, for a note whose word also occurs
-// in an earlier bridge verse. The single-note English lookups use
-// bridgeNoteAnchor below for this; the highlight join does not, because the
-// highlight path also serves partial-group (`&`) quotes and the milestone
-// repairs, which the #957 review found that shift does not yet handle (#968).
+// in an earlier bridge verse. The word-gloss preview and TN Quick handle this
+// with bridgeNoteAnchor below. The highlights do not: they also serve
+// partial-group (`&`) quotes, and the #957 review found edge cases in a
+// span-aware highlight join that are still open (#968 item 5).
 export function rowHighlightsFor(
   bibleVersion: string,
   target: VerseDto | null | undefined,
