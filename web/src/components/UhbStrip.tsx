@@ -202,7 +202,7 @@ function SourceVerseToken({
   twHint: string | null;
   hctx: HighlightCtx;
 }) {
-  const tone = hctx.hebrewHighlight(pos);
+  const tone = hctx.useHebrewHighlight(pos);
   const showInfo = hctx.showSourceInfo;
   // Double-click pins the lexical info into an interactive Popover so its text
   // (lemma, gloss, definition) can be selected and copied — the hover Tooltip
