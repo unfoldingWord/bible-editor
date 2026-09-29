@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { newUserContext } from "./helpers";
+import { fetchChapter, newUserContext } from "./helpers";
 
 // S16 — issue #892 (Benjamin's option B): on a chapter change the previous
 // chapter stays on screen, LOCKED, until the fresh chapter lands, in every
@@ -47,42 +47,56 @@ async function idbCounts(page: Page) {
   });
 }
 
+// Hold one chapter's GET until released.
+async function holdChapter(page: Page, chapter: number) {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  await page.route(new RegExp(`/api/chapters/ZEC/${chapter}(\\?|$)`), async (route) => {
+    await gate;
+    await route.continue().catch(() => {});
+  });
+  return release;
+}
+
+const setHash = (page: Page, hash: string) =>
+  page.evaluate((h) => {
+    window.location.hash = h;
+  }, hash);
+
 for (const mode of ["rows", "columns", "book"] as const) {
   test(`${mode}: the previous chapter stays visible and locked until the next one loads`, async ({ browser }) => {
     test.setTimeout(90_000);
-    const { context } = await newUserContext(browser, `stale892-${mode}`);
+    const { context, auth } = await newUserContext(browser, `stale892-${mode}`);
     const page = await context.newPage();
 
-    await page.goto("/#/ZEC/6/2");
+    // A verse of ZEC 6 that carries a note, so the note probe below always
+    // has a card to aim at (ZEC 7 has 14 verses, ZEC 6 notes start early).
+    const ch6 = await fetchChapter(context.request, auth.token, "ZEC", 6);
+    const verse = ch6.tn.find((r) => r.verse > 0 && r.verse <= 14)?.verse;
+    expect(verse, "ZEC 6 needs a note on a verse 1-14 for this test").toBeTruthy();
+
+    await page.goto(`/#/ZEC/6/${verse}`);
     if (mode !== "rows") {
       await page.locator("button").filter({ hasText: new RegExp(`^${mode}$`) }).click();
     }
-    const oldCell = page.locator(cellSel(mode, 6, 2));
+    const oldCell = page.locator(cellSel(mode, 6, verse!));
     await expect(oldCell).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
     const oldText = (await oldCell.textContent()) ?? "";
     expect(oldText.length).toBeGreaterThan(0);
     const before = await idbCounts(page);
 
-    // Hold ZEC 7's chapter GET until released.
-    let release!: () => void;
-    const gate = new Promise<void>((r) => (release = r));
-    await page.route(/\/api\/chapters\/ZEC\/7(\?|$)/, async (route) => {
-      await gate;
-      await route.continue();
-    });
-
-    await page.evaluate(() => {
-      window.location.hash = "#/ZEC/7/2";
-    });
+    const release = await holdChapter(page, 7);
+    await setHash(page, `#/ZEC/7/${verse}`);
 
     // Stale window: ZEC 6 is still on screen (no blank loading screen), the
-    // split container is inert, and no verse cell in it is editable.
+    // split container is inert, no verse cell in it is editable, and a small
+    // status line outside it says what is loading.
     const stale = page.locator('[data-stale-chapter="6"]');
     await expect(stale).toBeVisible();
     await expect(stale).toHaveAttribute("inert", "");
     await expect(oldCell).toBeVisible();
-    await expect(page.getByText(/^loading ZEC 7/)).toHaveCount(0);
     await expect(stale.locator('[contenteditable="true"]')).toHaveCount(0);
+    await expect(page.getByTestId("stale-chapter-status")).toContainText("loading ZEC 7");
 
     // Try to type into the old verse and into a note, the way a user would.
     // A real mouse click (not locator.click, which refuses an inert target).
@@ -91,27 +105,22 @@ for (const mode of ["rows", "columns", "book"] as const) {
     await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height / 2);
     await page.keyboard.type(" STALE892", { delay: 20 });
     const note = stale.locator("[data-note-id]").first();
-    if (await note.count()) {
-      const nb = await note.boundingBox();
-      if (nb) {
-        await page.mouse.click(nb.x + nb.width / 2, nb.y + Math.min(40, nb.height / 2));
-        await page.keyboard.type(" STALENOTE892", { delay: 20 });
-      }
-    }
+    await expect(note, "the stale view must show a note card to probe").toBeVisible();
+    const nb = await note.boundingBox();
+    expect(nb).not.toBeNull();
+    await page.mouse.click(nb!.x + nb!.width / 2, nb!.y + Math.min(40, nb!.height / 2));
+    await page.keyboard.type(" STALENOTE892", { delay: 20 });
     await page.waitForTimeout(500);
 
     expect(await oldCell.textContent(), "the stale verse text must not change").toBe(oldText);
-    // Nothing inside the stale view took focus or the typed note text.
     const probe = await page.evaluate(() => {
       const root = document.querySelector("[data-stale-chapter]");
       const areas = Array.from(root?.querySelectorAll("textarea, input") ?? []) as HTMLTextAreaElement[];
       return {
         focusInside: !!root && root.contains(document.activeElement),
         typedIntoField: areas.some((a) => a.value.includes("STALENOTE892")),
-        textareas: areas.filter((a) => a.tagName === "TEXTAREA" && !a.getAttribute("aria-hidden")).length,
       };
     });
-    console.log(`[s16 ${mode}] stale probe`, JSON.stringify(probe));
     expect(probe.focusInside, "focus must not enter the stale view").toBe(false);
     expect(probe.typedIntoField, "typed text must not reach a note field").toBe(false);
     const during = await idbCounts(page);
@@ -121,10 +130,10 @@ for (const mode of ["rows", "columns", "book"] as const) {
     // The fresh chapter lands: the lock lifts and ZEC 7 is editable.
     release();
     await expect(page.locator("[data-stale-chapter]")).toHaveCount(0, { timeout: 15_000 });
-    const newCell = page.locator(cellSel(mode, 7, 2));
+    await expect(page.getByTestId("stale-chapter-status")).toHaveCount(0);
+    const newCell = page.locator(cellSel(mode, 7, verse!));
     await expect(newCell).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
-    const newText = (await newCell.textContent()) ?? "";
-    expect(newText).not.toContain("STALE892");
+    expect((await newCell.textContent()) ?? "").not.toContain("STALE892");
     await newCell.click();
     await page.keyboard.press("ControlOrMeta+End");
     await page.keyboard.type(" FRESH892", { delay: 20 });
@@ -134,3 +143,71 @@ for (const mode of ["rows", "columns", "book"] as const) {
     await context.close();
   });
 }
+
+// A → B → A before B lands: A's old copy matches the route again, but it may
+// carry pre-save versions, so it stays locked until A's own new GET lands.
+test("A → B → A: the old copy of A stays locked until A's new load lands", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context } = await newUserContext(browser, "stale892-aba");
+  const page = await context.newPage();
+  await page.goto("/#/ZEC/8/1");
+  const cellA = page.locator(cellSel("rows", 8, 1));
+  await expect(cellA).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
+
+  const releaseB = await holdChapter(page, 9);
+  const releaseA = await holdChapter(page, 8);
+  await setHash(page, "#/ZEC/9/1");
+  await expect(page.locator('[data-stale-chapter="8"]')).toBeVisible();
+  await setHash(page, "#/ZEC/8/1");
+  await page.waitForTimeout(300);
+  // Route is A again and A's data is on screen, but A's new GET is held.
+  const stale = page.locator('[data-stale-chapter="8"]');
+  await expect(stale).toBeVisible();
+  await expect(stale).toHaveAttribute("inert", "");
+  await expect(stale.locator('[contenteditable="true"]')).toHaveCount(0);
+  await expect(page.getByTestId("stale-chapter-status")).toContainText("loading ZEC 8");
+
+  releaseA();
+  await expect(page.locator("[data-stale-chapter]")).toHaveCount(0, { timeout: 15_000 });
+  await expect(cellA).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
+  releaseB();
+  await context.close();
+});
+
+// A save the user started on chapter N before navigating must land on
+// chapter N, even when it completes while N is the stale copy on screen.
+test("a verse save started before navigating lands on the chapter it was typed in", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "stale892-inflight");
+  const page = await context.newPage();
+  await page.goto("/#/ZEC/12/1");
+  const cell = page.locator(cellSel("rows", 12, 1));
+  await expect(cell).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
+  const marker = ` INFLIGHT892-${Date.now()}`;
+  await cell.click();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.type(marker, { delay: 20 });
+  const save = page.locator('button:has([data-testid="SaveIcon"])').first();
+  await expect(save).toBeVisible();
+
+  // Hold ZEC 13 so the save's async draft lookup resolves while ZEC 12 is the
+  // stale copy on screen.
+  const release = await holdChapter(page, 13);
+  await save.click();
+  await setHash(page, "#/ZEC/13/1");
+  await expect(page.locator('[data-stale-chapter="12"]')).toBeVisible();
+
+  const verseText = async (chapter: number) => {
+    const res = await context.request.get(`/api/chapters/ZEC/${chapter}`, {
+      headers: { Authorization: `Bearer ${auth.token}` },
+    });
+    const body = (await res.json()) as { verses?: Record<string, Record<string, { plain_text?: string }>> };
+    return body.verses?.ULT?.["1"]?.plain_text ?? "";
+  };
+  await expect.poll(() => verseText(12), { timeout: 15_000 }).toContain(marker.trim());
+  expect(await verseText(13), "the save must not be filed against the new chapter").not.toContain(marker.trim());
+
+  release();
+  await expect(page.locator("[data-stale-chapter]")).toHaveCount(0, { timeout: 15_000 });
+  await context.close();
+});
