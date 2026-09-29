@@ -28,7 +28,7 @@ import { SectionHeaderBand } from "./SectionHeaderBand";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
-import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow, sourceForTargetRow, spanOccurrence } from "../lib/verseRange";
+import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow, rowHighlightsFor, sourceForTargetRow } from "../lib/verseRange";
 import { directionForBook, directionForVersion } from "../lib/direction";
 import {
   classifySourceQuery,
@@ -70,6 +70,8 @@ interface Props {
   // spanning quote paints only 11+12, not every chapter verse that
   // happens to share a Hebrew word.
   activeNoteCoveredVerses?: readonly number[];
+  // The active note's own verse; its occurrence counts there (#957).
+  activeNoteVerse?: number | null;
   // Transient reorder "stoplight": while a note is dragged (or for ~3s after an
   // arrow move) the active verse also lights the moved note's candidate
   // predecessor (green underline) and successor (red overline) on channels
@@ -226,6 +228,7 @@ function ScriptureColumnInner({
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
   activeNoteCoveredVerses = EMPTY_COVERED,
+  activeNoteVerse,
   reorderHighlight,
   mode,
   enabledVersions,
@@ -647,6 +650,7 @@ function ScriptureColumnInner({
             activeNoteOccurrence={activeNoteOccurrence}
             activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
             activeNoteCoveredVerses={activeNoteCoveredVerses}
+            activeNoteVerse={activeNoteVerse}
             reorderHighlight={reorderHighlight ?? null}
             lexiconMap={lexiconMap}
             twl={twl}
@@ -681,6 +685,7 @@ function ScriptureColumnInner({
               activeNoteOccurrence={activeNoteOccurrence}
               activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
               activeNoteCoveredVerses={activeNoteCoveredVerses}
+              activeNoteVerse={activeNoteVerse}
               reorderHighlight={reorderHighlight ?? null}
               activeSourceContent={activeSourceContent}
               scrollNonce={scrollNonce}
@@ -725,6 +730,7 @@ function ScriptureColumnInner({
                 activeNoteOccurrence={activeNoteOccurrence}
                 activeNoteQuotePartialGroups={activeNoteQuotePartialGroups}
                 activeNoteCoveredVerses={activeNoteCoveredVerses}
+                activeNoteVerse={activeNoteVerse}
                 reorderHighlight={reorderHighlight ?? null}
                 activeSourceContent={activeSourceContent}
                 scrollNonce={scrollNonce}
@@ -786,6 +792,7 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     a.activeNoteOccurrence === b.activeNoteOccurrence &&
     a.activeNoteQuotePartialGroups === b.activeNoteQuotePartialGroups &&
     a.activeNoteCoveredVerses === b.activeNoteCoveredVerses &&
+    a.activeNoteVerse === b.activeNoteVerse &&
     a.reorderHighlight === b.reorderHighlight &&
     a.mode === b.mode &&
     a.enabledVersions === b.enabledVersions &&
@@ -840,6 +847,7 @@ function StackedBody({
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
   activeNoteCoveredVerses = EMPTY_COVERED,
+  activeNoteVerse,
   reorderHighlight,
   lexiconMap,
   twl,
@@ -868,6 +876,8 @@ function StackedBody({
   activeNoteOccurrence: number | null;
   activeNoteQuotePartialGroups?: boolean;
   activeNoteCoveredVerses?: readonly number[];
+  // The active note's own verse; its occurrence counts there (#957).
+  activeNoteVerse?: number | null;
   reorderHighlight: ReorderHighlight | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   twl: TwlRow[];
@@ -931,19 +941,19 @@ function StackedBody({
           const aQuote = ro?.movedQuote ?? activeNoteQuote;
           const aOcc = ro?.movedQuote ? ro.movedOccurrence : activeNoteOccurrence;
           const partial = !ro?.movedQuote && activeNoteQuotePartialGroups;
-          // A note's occurrence counts within its own verse; a bridged row's
-          // milestones count across the span, so re-count per target (#957).
-          const aVerse = ro?.movedQuote ? ro.movedVerse : activeNoteCoveredVerses[0];
-          const ultHL = highlightsFor("ULT", ultV?.content, aQuote, spanOccurrence(uhb, ultV, aVerse, aQuote, aOcc), ultSrc, partial);
-          const ustHL = highlightsFor("UST", ustV?.content, aQuote, spanOccurrence(uhb, ustV, aVerse, aQuote, aOcc), ustSrc, partial);
+          // A note's occurrence counts within its own verse, which a bridged
+          // row needs to find the right source instance (#957).
+          const aVerse = ro?.movedQuote ? ro.movedVerse : activeNoteVerse;
+          const ultHL = rowHighlightsFor("ULT", ultV, aQuote, aOcc, uhb, aVerse, partial);
+          const ustHL = rowHighlightsFor("UST", ustV, aQuote, aOcc, uhb, aVerse, partial);
           const uhbHL = highlightsFor(uhbLabel, uhbV?.content, aQuote, aOcc, undefined, partial);
           // Reorder stoplight: the moved note's candidate neighbours, resolved
           // per version (ULT/UST OL-anchored on UHB, like the active set).
           // Undefined unless a drag / hover / recent arrow-move is in flight.
-          const ultPrevHL = ro?.prevQuote ? highlightsFor("ULT", ultV?.content, ro.prevQuote, spanOccurrence(uhb, ultV, ro.prevVerse, ro.prevQuote, ro.prevOccurrence), ultSrc) : undefined;
-          const ultNextHL = ro?.nextQuote ? highlightsFor("ULT", ultV?.content, ro.nextQuote, spanOccurrence(uhb, ultV, ro.nextVerse, ro.nextQuote, ro.nextOccurrence), ultSrc) : undefined;
-          const ustPrevHL = ro?.prevQuote ? highlightsFor("UST", ustV?.content, ro.prevQuote, spanOccurrence(uhb, ustV, ro.prevVerse, ro.prevQuote, ro.prevOccurrence), ustSrc) : undefined;
-          const ustNextHL = ro?.nextQuote ? highlightsFor("UST", ustV?.content, ro.nextQuote, spanOccurrence(uhb, ustV, ro.nextVerse, ro.nextQuote, ro.nextOccurrence), ustSrc) : undefined;
+          const ultPrevHL = ro?.prevQuote ? rowHighlightsFor("ULT", ultV, ro.prevQuote, ro.prevOccurrence, uhb, ro.prevVerse) : undefined;
+          const ultNextHL = ro?.nextQuote ? rowHighlightsFor("ULT", ultV, ro.nextQuote, ro.nextOccurrence, uhb, ro.nextVerse) : undefined;
+          const ustPrevHL = ro?.prevQuote ? rowHighlightsFor("UST", ustV, ro.prevQuote, ro.prevOccurrence, uhb, ro.prevVerse) : undefined;
+          const ustNextHL = ro?.nextQuote ? rowHighlightsFor("UST", ustV, ro.nextQuote, ro.nextOccurrence, uhb, ro.nextVerse) : undefined;
           const uhbPrevHL = ro?.prevQuote ? highlightsFor(uhbLabel, uhbV?.content, ro.prevQuote, ro.prevOccurrence) : undefined;
           const uhbNextHL = ro?.nextQuote ? highlightsFor(uhbLabel, uhbV?.content, ro.nextQuote, ro.nextOccurrence) : undefined;
           // For multi-verse blocks, PATCH and find/replace target the canonical
@@ -1124,7 +1134,7 @@ function StackedBody({
             uhb={uhb}
             noteQuote={coverHighlight ? activeNoteQuote : null}
             noteOccurrence={coverHighlight ? activeNoteOccurrence : null}
-            noteVerse={coverHighlight ? activeNoteCoveredVerses[0] : null}
+            noteVerse={coverHighlight ? activeNoteVerse ?? null : null}
             notePartial={coverHighlight}
             search={search}
             findActiveMatch={findActiveMatch}
@@ -1178,13 +1188,13 @@ const InactiveVerseRow = memo(
   }) {
     const ultV = ult[v];
     const ustV = ust[v];
-    // Bridged rows anchor on their whole source span, with the note's
-    // occurrence re-counted over it from the note's first verse (#957).
+    // Bridged rows anchor on their whole source span, matched from the
+    // note's own verse (rowHighlightsFor, #957).
     const ultHL = noteQuote
-      ? highlightsFor("ULT", ultV?.content, noteQuote, spanOccurrence(uhb, ultV, noteVerse, noteQuote, noteOccurrence), sourceForTargetRow(uhb, ultV)?.content, notePartial)
+      ? rowHighlightsFor("ULT", ultV, noteQuote, noteOccurrence, uhb, noteVerse, notePartial)
       : null;
     const ustHL = noteQuote
-      ? highlightsFor("UST", ustV?.content, noteQuote, spanOccurrence(uhb, ustV, noteVerse, noteQuote, noteOccurrence), sourceForTargetRow(uhb, ustV)?.content, notePartial)
+      ? rowHighlightsFor("UST", ustV, noteQuote, noteOccurrence, uhb, noteVerse, notePartial)
       : null;
     // Only render this version's cell when it's the start of its row's span —
     // keeps a UST 6-9 block from re-rendering on every verse 7,8,9 row

@@ -6,7 +6,7 @@ import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
-import { highlightsFor, isPaintableHtml, leadingBreakClass, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { isPaintableHtml, leadingBreakClass, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -16,7 +16,7 @@ import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { FindMatch } from "./FindReplaceOverlay";
-import { formatVerseLabel, isFirstOfRange, isRangeRow, sourceForTargetRow, spanOccurrence } from "../lib/verseRange";
+import { formatVerseLabel, isFirstOfRange, isRangeRow, rowHighlightsFor, sourceForTargetRow } from "../lib/verseRange";
 import { VerseBridgeButtons } from "./VerseBridgeButtons";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -58,6 +58,8 @@ interface Props {
   activeNoteQuotePartialGroups?: boolean;
   // Verses in the active TN ref; with partialGroups, only these paint.
   activeNoteCoveredVerses?: readonly number[];
+  // The active note's own verse; its occurrence counts there (#957).
+  activeNoteVerse?: number | null;
   // Transient reorder stoplight for the active verse (drag held / ~3s after an
   // arrow move): the moved note's candidate prev (green underline) + next (red
   // overline), on channels separate from the yellow active fill.
@@ -134,6 +136,7 @@ export function DocColumn({
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
   activeNoteCoveredVerses,
+  activeNoteVerse,
   reorderHighlight,
   activeSourceContent,
   scrollNonce,
@@ -258,22 +261,21 @@ export function DocColumn({
           // #957) — activeSourceContent is only the navigated verse and would
           // mis-join a v12 ULT highlight.
           const rowSourceContent = sourceForTargetRow(sourceByVerseNum, dto)?.content;
-          const sourceContent = rowSourceContent ?? activeSourceContent;
-          // Note occurrences count within the note's own verse; a bridged row
-          // numbers source words across its span, so re-count (#957).
+          // A note's occurrence counts within its own verse, which a bridged
+          // row needs to find the right source instance (#957).
           const ro = reorderHighlight;
-          const aVerse = ro?.movedQuote ? ro.movedVerse : activeNoteCoveredVerses?.[0];
+          const aVerse = ro?.movedQuote ? ro.movedVerse : activeNoteVerse;
           const highlights = paintQuote
-            ? highlightsFor(bibleVersion, dto.content, aQuote, spanOccurrence(sourceByVerseNum, dto, aVerse, aQuote, aOcc), sourceContent, partial)
+            ? rowHighlightsFor(bibleVersion, dto, aQuote, aOcc, sourceByVerseNum, aVerse, partial, activeSourceContent)
             : null;
           // Reorder stoplight neighbour sets (active verse only, while live).
           const prevHighlights =
             isActive && reorderHighlight?.prevQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, spanOccurrence(sourceByVerseNum, dto, reorderHighlight.prevVerse, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence), sourceContent)
+              ? rowHighlightsFor(bibleVersion, dto, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, sourceByVerseNum, reorderHighlight.prevVerse, false, activeSourceContent)
               : null;
           const nextHighlights =
             isActive && reorderHighlight?.nextQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, spanOccurrence(sourceByVerseNum, dto, reorderHighlight.nextVerse, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence), sourceContent)
+              ? rowHighlightsFor(bibleVersion, dto, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, sourceByVerseNum, reorderHighlight.nextVerse, false, activeSourceContent)
               : null;
           // Lift any \s1/\s2/\s3 section headers in this verse's content
           // into block-level bands rendered AFTER the inline verse span

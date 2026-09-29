@@ -14,7 +14,7 @@ import {
   versesFromKey,
   noteOverlapsRange,
   sourceForTargetRow,
-  spanOccurrence,
+  rowHighlightsFor,
 } from "./verseRange.ts";
 import usfm from "usfm-js";
 import { verseHasUnalignedWork } from "./alignment.ts";
@@ -263,14 +263,16 @@ function mkVerse(verse, verseEnd, voCount = 1) {
 `);
   const uhb2 = { 1: mk(1, null, src2["1"], "UHB"), 2: mk(2, null, src2["2"], "UHB") };
   const bridge2 = mk(1, 2, tgt2["1-2"] ?? tgt2["1"], "ULT");
-  const src12 = sourceForTargetRow(uhb2, bridge2)?.content;
   const quote = "יְהוָה";
-  const hlV2 = highlightsFor("ULT", bridge2.content, quote, spanOccurrence(uhb2, bridge2, 2, quote, 1), src12);
+  const hlV2 = rowHighlightsFor("ULT", bridge2, quote, 1, uhb2, 2);
   assert(hlV2.has("LORD|1") && !hlV2.has("Yahweh|1"), `TN on 1:2 occ 1 lights LORD only (got ${[...hlV2]})`);
-  const hlV1 = highlightsFor("ULT", bridge2.content, quote, spanOccurrence(uhb2, bridge2, 1, quote, 1), src12);
+  const hlV1 = rowHighlightsFor("ULT", bridge2, quote, 1, uhb2, 1);
   assert(hlV1.has("Yahweh|1") && !hlV1.has("LORD|1"), `TN on 1:1 occ 1 lights Yahweh only (got ${[...hlV1]})`);
-  assert(spanOccurrence(uhb2, bridge2, 2, quote, -1) === -1, "occurrence -1 (all) is left alone");
-  assert(spanOccurrence(uhb2, uhb2[2], 2, quote, 1) === 1, "singleton target: occurrence unchanged");
+  const hlAll = rowHighlightsFor("ULT", bridge2, quote, -1, uhb2, 2);
+  assert(hlAll.has("LORD|1") && !hlAll.has("Yahweh|1"), `occurrence -1 on 1:2 means every match in 1:2 only (got ${[...hlAll]})`);
+  const single2 = mk(2, null, bridge2.content.verseObjects, "ULT");
+  assert([...rowHighlightsFor("ULT", single2, quote, 1, uhb2, 2)].join() === [...highlightsFor("ULT", single2.content, quote, 1, uhb2[2].content)].join(),
+    "singleton target: same as the ordinary join on its own source verse");
 
   // Not every bridge numbers across the span: a 2026-09-24 prod scan of the 83
   // UST bridges found 143 repeated-word milestones numbered PER VERSE (1/1 in
@@ -284,8 +286,7 @@ function mkVerse(verse, verseEnd, voCount = 1) {
 \v 1-2 \zaln-s |x-strong="H3068" x-lemma="יְהוָה" x-morph="He,Np" x-occurrence="1" x-occurrences="1" x-content="יְהוָה"\*\w Yahweh|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* spoke; \zaln-s |x-strong="H3068" x-lemma="יְהוָה" x-morph="He,Np" x-occurrence="1" x-occurrences="1" x-content="יְהוָה"\*\w LORD|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
 `);
   const bridge3 = mk(1, 2, tgt3["1-2"] ?? tgt3["1"], "ULT");
-  assert(spanOccurrence(uhb2, bridge3, 2, quote, 1) === 1, "per-verse bridge: occurrence left unshifted");
-  const hlV2pv = highlightsFor("ULT", bridge3.content, quote, spanOccurrence(uhb2, bridge3, 2, quote, 1), src12);
+  const hlV2pv = rowHighlightsFor("ULT", bridge3, quote, 1, uhb2, 2);
   assert(hlV2pv.has("LORD|1"), `per-verse bridge: TN on 1:2 still lights LORD (got ${[...hlV2pv]})`);
 }
 
@@ -306,7 +307,7 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     plain_text: null, version: 1, updated_by: null, updated_at: 0, content: { verseObjects },
   });
   const rowHL = (row, quote, occ, byVerse, noteVerse, partial = false) =>
-    highlightsFor("ULT", row.content, quote, spanOccurrence(byVerse, row, noteVerse, quote, occ), sourceForTargetRow(byVerse, row)?.content, partial);
+    rowHighlightsFor("ULT", row, quote, occ, byVerse, noteVerse, partial);
   const W = (s) => String.raw`\w ${s}|lemma="${s}" strong="H1" x-morph="He,X"\w*`;
   const Z = (src, occ, occs, gloss) =>
     String.raw`\zaln-s |x-strong="H1" x-lemma="${src}" x-morph="He,X" x-occurrence="${occ}" x-occurrences="${occs}" x-content="${src}"\*\w ${gloss}|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*`;

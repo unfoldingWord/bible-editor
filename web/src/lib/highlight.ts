@@ -527,8 +527,8 @@ export interface ReorderHighlight {
   prevOccurrence: number | null;
   nextQuote: string | null;
   nextOccurrence: number | null;
-  // Each row's own verse: its occurrence counts within that verse, so a bridged
-  // target row re-counts it over the joined source (spanOccurrence, #957).
+  // Each row's own verse: its occurrence counts within that verse, which a
+  // bridged target row needs to find the right source instance (#957).
   movedVerse?: number | null;
   prevVerse?: number | null;
   nextVerse?: number | null;
@@ -798,52 +798,6 @@ export function extractTargetSelectionText(
   return words.join(" ");
 }
 
-// Every match of `quote` in a source verse, in document order, as indexes into
-// its bare-word tokens. One match per start position — the same list
-// matchSourceTokens picks its occurrence from.
-function sourceQuoteMatches(
-  verseObjects: unknown[],
-  quote: string,
-): { tokens: WordToken[]; matches: number[][] } {
-  const groups = quoteGroups(quote);
-  const tokens = collectBareWords(verseObjects);
-  const matches: number[][] = [];
-  if (groups.length === 0 || tokens.length === 0) return { tokens, matches };
-  const normGroups = groups.map((g) => g.map(matchNorm));
-  const normTokens = tokens.map((t) => matchNorm(t.text));
-  for (let start = 0; start < tokens.length; start++) {
-    const m = matchGroupsAt(start, normGroups, normTokens);
-    if (m) matches.push(m);
-  }
-  return { tokens, matches };
-}
-
-// How many times `quote` occurs in a source verse (or joined span). Used to
-// shift a note's per-verse occurrence onto a bridged row's whole-span source.
-export function countQuoteMatches(verseObjects: unknown[], quote: string): number {
-  return sourceQuoteMatches(verseObjects, quote).matches.length;
-}
-
-// Whether a bridged target row numbers the quote's first word across its whole
-// joined source (x-occurrences reaches the span total) rather than per verse.
-// Prod bridges hold both conventions, even within one row, so spanOccurrence
-// shifts only when this is true. No milestone for the word, or a word that
-// occurs once in the span, reads as true (the shift is then a no-op).
-export function targetCountsAcrossSpan(
-  targetVerseObjects: unknown[],
-  spanSourceVerseObjects: unknown[],
-  quote: string,
-): boolean {
-  const first = quoteGroups(quote)[0]?.[0];
-  if (!first) return true;
-  const word = matchNorm(first);
-  const total = collectBareWords(spanSourceVerseObjects).filter((t) => matchNorm(t.text) === word).length;
-  if (total < 2) return true;
-  const runs = collectRawRuns(targetVerseObjects).filter((r) => matchNorm(r.source) === word);
-  if (runs.length === 0) return true;
-  return Math.max(...runs.map((r) => r.occurrences)) >= total;
-}
-
 // Resolve a quote + occurrence against the source/original verse words, in
 // SOURCE document order (where the quote IS contiguous and ordered, and gap
 // markers mark the real discontinuities). Returns the matched bare-word tokens
@@ -855,11 +809,21 @@ export function matchSourceTokens(
   quote: string,
   occurrence: number,
 ): WordToken[] {
-  const { tokens, matches } = sourceQuoteMatches(verseObjects, quote);
-  if (matches.length === 0) return [];
+  const groups = quoteGroups(quote);
+  const tokens = collectBareWords(verseObjects);
+  if (groups.length === 0 || tokens.length === 0) return [];
   // `occurrence: -1` means "every occurrence of the quote" (TSV spec).
   const allOcc = (occurrence | 0) === -1;
   const wantOcc = Math.max(1, occurrence | 0);
+
+  const normGroups = groups.map((g) => g.map(matchNorm));
+  const normTokens = tokens.map((t) => matchNorm(t.text));
+
+  const matches: number[][] = [];
+  for (let start = 0; start < tokens.length; start++) {
+    const m = matchGroupsAt(start, normGroups, normTokens);
+    if (m) matches.push(m);
+  }
 
   if (allOcc) {
     // Union of every match, de-duped, in document order.
@@ -958,6 +922,73 @@ export function surfaceTotalsFromTokens(tokens: WordToken[]): Map<string, number
     totals.set(key, (totals.get(key) ?? 0) + 1);
   }
   return totals;
+}
+
+// ULT/UST highlights for a note on a LATER verse of a bridged target row
+// (#957). `sourceVerses` holds the source verseObjects of every verse in the
+// row's span, in order, and `noteIndex` is the note's own verse within it.
+//
+// Two facts make the ordinary join wrong here. A note's occurrence counts
+// within its own verse, so the quote is matched from the note's verse onward
+// (which also keeps a `&` group of a multi-verse note from landing in an
+// earlier bridge verse). And a bridge's `\zaln-s` x-occurrence is numbered
+// either across the whole span (the aligner's way) or per verse (as imported
+// from Door43), sometimes both within one row. So each matched source word
+// joins on the numbering the target actually uses for THAT word: across the
+// span when any of its milestones counts up to the span total, per verse
+// otherwise. Per-verse milestones cannot say which verse they belong to, so
+// every same-numbered copy lights, as it does for a single-verse source.
+//
+// Returns null when the quote does not resolve from the note's verse on, so
+// the caller can fall back to the ordinary join.
+export function findBridgeTargetHighlights(
+  targetVerseObjects: unknown[],
+  quote: string,
+  occurrence: number,
+  sourceVerses: unknown[][],
+  noteIndex: number,
+  partialGroups = false,
+): Set<HighlightKey> | null {
+  // occurrence -1 ("all") means every match in the note's own verse.
+  const tailVerses = (occurrence | 0) === -1 ? [sourceVerses[noteIndex]] : sourceVerses.slice(noteIndex);
+  const tail: unknown[] = [];
+  for (const vo of tailVerses) {
+    if (tail.length > 0) tail.push({ type: "text", text: " " });
+    tail.push(...vo);
+  }
+  const matched = partialGroups
+    ? matchSourceGroupsInVerse(tail, quote, occurrence)
+    : matchSourceTokens(tail, quote, occurrence);
+  if (matched.length === 0) return null;
+  const perVerse = sourceVerses.map((vo) => surfaceTotalsFromTokens(collectBareWords(vo)));
+  const countIn = (from: number, to: number, w: string) => {
+    let n = 0;
+    for (let i = from; i < to; i++) n += perVerse[i].get(w) ?? 0;
+    return n;
+  };
+  const runs = collectRawRuns(targetVerseObjects);
+  const out = new Set<HighlightKey>();
+  for (const t of matched) {
+    const w = matchNorm(t.text);
+    const tailOcc = t.surfaceOccurrence ?? t.occurrence;
+    const spanTotal = countIn(0, sourceVerses.length, w);
+    const spanOcc = countIn(0, noteIndex, w) + tailOcc;
+    // The verse this token sits in, and its occurrence within that verse.
+    let verseOcc = tailOcc;
+    for (let i = noteIndex; i < sourceVerses.length; i++) {
+      const c = perVerse[i].get(w) ?? 0;
+      if (verseOcc <= c) break;
+      verseOcc -= c;
+    }
+    for (const r of runs) {
+      if (!r.source || matchNorm(r.source) !== w) continue;
+      const acrossSpan = r.occurrences >= spanTotal;
+      if (r.occurrence === (acrossSpan ? spanOcc : verseOcc)) {
+        for (const tt of r.targets) out.add(k(tt.text, tt.occurrence));
+      }
+    }
+  }
+  return out;
 }
 
 // ---------- rendering ----------

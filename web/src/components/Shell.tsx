@@ -1597,13 +1597,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // highlight source. Notes and words are mutually exclusive; clicking one
   // clears the other. Words use `orig_words` (Hebrew source words) which the
   // same matcher handles directly for UHB and via \zaln-s for ULT/UST.
-  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses } =
+  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses, activeQuoteVerse } =
     useMemo(() => {
       const empty = {
         activeQuote: null as string | null,
         activeOccurrence: null as number | null,
         activeQuotePartialGroups: false,
         activeQuoteCoveredVerses: EMPTY_COVERED_VERSES,
+        activeQuoteVerse: null as number | null,
       };
       if (!data) return empty;
       if (activeNoteId) {
@@ -1615,6 +1616,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeOccurrence: r.occurrence ?? null,
           activeQuotePartialGroups: covered.length > 1,
           activeQuoteCoveredVerses: covered,
+          // The note's own verse: its occurrence counts there (#957).
+          activeQuoteVerse: r.verse,
         };
       }
       if (activeWordId) {
@@ -1624,6 +1627,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeOccurrence: r?.occurrence ?? null,
           activeQuotePartialGroups: false,
           activeQuoteCoveredVerses: r ? [r.verse] : EMPTY_COVERED_VERSES,
+          activeQuoteVerse: r?.verse ?? null,
         };
       }
       return empty;
@@ -3669,6 +3673,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeNoteOccurrence={activeOccurrence}
           activeNoteQuotePartialGroups={activeQuotePartialGroups}
           activeNoteCoveredVerses={activeQuoteCoveredVerses}
+          activeNoteVerse={activeQuoteVerse}
           reorderHighlight={reorderHighlight}
           mode={mode}
           enabledVersions={displayedVersions}

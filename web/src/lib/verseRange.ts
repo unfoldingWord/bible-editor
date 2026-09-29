@@ -13,7 +13,7 @@
 // reading `verses[bv][n]` directly.
 
 import type { VerseDto } from "../sync/api";
-import { countQuoteMatches, targetCountsAcrossSpan } from "./highlight.ts";
+import { findBridgeTargetHighlights, highlightsFor, type HighlightKey } from "./highlight.ts";
 
 export type VerseSpan = readonly [start: number, end: number];
 
@@ -198,36 +198,37 @@ export function sourceForTargetRow(
   return concatSourceRange(sourceByVerseStart, start, end);
 }
 
-// A note's occurrence, re-counted for a bridged target row's joined source.
-// TN/TWL occurrences count within the note's own verse, but a bridge's
-// `\zaln-s` x-occurrence numbers source words across the whole span (the
-// aligner counts over concatSourceRange, and Door43 bridges do the same), so a
-// note on verse N of a bridge starting at S skips the quote's matches in
-// S..N-1. Returns the occurrence unchanged for singletons, a note on the span's
-// first verse, or occurrence -1 ("all").
-// Not every bridge follows that rule: rows numbered per verse (143 of 214
-// repeated-word milestones in a 2026-09-24 prod scan) are left unshifted, which
-// keeps main's behavior (every same-numbered copy lights) instead of lighting
-// nothing.
-export function spanOccurrence(
-  sourceByVerseStart: Record<number, VerseDto> | undefined,
+// Note-quote highlights for a ULT/UST row, OL-anchored on the source the row
+// covers (its whole span for a bridge, #957). `noteVerse` is the note's own
+// verse, where its occurrence counts. A note on a later verse of a bridge goes
+// through findBridgeTargetHighlights; everything else, and a quote that does
+// not resolve from the note's verse on, uses the ordinary join.
+// `fallbackSource` stands in when the map has no source row for the target.
+export function rowHighlightsFor(
+  bibleVersion: string,
   target: VerseDto | null | undefined,
-  noteVerse: number | null | undefined,
   quote: string | null | undefined,
   occurrence: number | null | undefined,
-): number | null | undefined {
-  if (!target || !quote || occurrence == null || occurrence < 1 || noteVerse == null) return occurrence;
-  const [start, end] = verseSpan(target);
-  if (noteVerse <= start || noteVerse > end) return occurrence;
-  const targetVo = (target.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  const spanVo = (concatSourceRange(sourceByVerseStart, start, end)?.content as { verseObjects?: unknown[] } | null)
-    ?.verseObjects;
-  if (Array.isArray(targetVo) && Array.isArray(spanVo) && !targetCountsAcrossSpan(targetVo, spanVo, quote)) {
-    return occurrence;
+  sourceByVerseStart: Record<number, VerseDto> | undefined,
+  noteVerse: number | null | undefined,
+  partialGroups = false,
+  fallbackSource?: unknown,
+): Set<HighlightKey> {
+  const spanSource = sourceForTargetRow(sourceByVerseStart, target)?.content ?? fallbackSource;
+  if (target && quote && occurrence != null && noteVerse != null && sourceByVerseStart) {
+    const [start, end] = verseSpan(target);
+    const targetVo = (target.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (noteVerse > start && noteVerse <= end && Array.isArray(targetVo)) {
+      const sourceVerses: unknown[][] = [];
+      for (let v = start; v <= end; v++) {
+        const vo = (sourceByVerseStart[v]?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+        sourceVerses.push(Array.isArray(vo) ? vo : []);
+      }
+      const hl = findBridgeTargetHighlights(targetVo, quote, occurrence, sourceVerses, noteVerse - start, partialGroups);
+      if (hl) return hl;
+    }
   }
-  const before = concatSourceRange(sourceByVerseStart, start, noteVerse - 1);
-  const vo = (before?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  return Array.isArray(vo) ? occurrence + countQuoteMatches(vo, quote) : occurrence;
+  return highlightsFor(bibleVersion, target?.content, quote, occurrence, spanSource, partialGroups);
 }
 
 function buildSourceRange(
