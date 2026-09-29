@@ -592,6 +592,13 @@ export function ResourceColumn({
   const noteFocusRef = useRef<{ id: string; dir: "up" | "down" } | null>(null);
   const [recentNoteMove, setRecentNoteMove] = useState<{ id: string; dir: "up" | "down" } | null>(null);
   const noteFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Deliberately no dependency array: this must run after EVERY render to poll
+  // noteFocusRef, which an arrow-key handler sets synchronously outside any
+  // tracked dependency. The `pending`/early-return guard (immediately clearing
+  // the ref) makes each run a no-op unless that handler just fired, so this is
+  // not the unbounded setState loop the rule assumes — `[]` would only run it
+  // once at mount and never see a later arrow-key move.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useLayoutEffect(() => {
     const pending = noteFocusRef.current;
     if (!pending) return;
@@ -814,6 +821,17 @@ export function ResourceColumn({
       return;
     }
     clearCenter();
+    // `pinned` (the whole object) and `showResource` are deliberately excluded.
+    // This effect is keyed on scrollNonce as its one-shot navigation trigger —
+    // see STATE.md's lesson on exactly this class of bug: a scroll/nav effect
+    // must fire on an explicit token, never on a prop that churns identity on
+    // unrelated re-renders. `showResource` is a plain inline function
+    // (recreated every render, not a useCallback), and `pinned` is read here
+    // only through its three stable primitive fields (already listed below) —
+    // depending on the parent object too would re-fire this on every render
+    // that hands down a new `pinned` reference, jerking the scroll position
+    // outside of an actual navigation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     scrollNonce,
     jumpTab,

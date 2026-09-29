@@ -6,7 +6,7 @@
 //   node --experimental-strip-types --no-warnings src/lib/saveChain.test.mjs
 
 import assert from "node:assert/strict";
-import { runSaveChain } from "./saveChain.ts";
+import { createSaveDoneAndNextGuard, runSaveChain, runSaveDoneAndNext } from "./saveChain.ts";
 
 let failed = 0;
 function check(cond, msg) {
@@ -119,6 +119,105 @@ function check(cond, msg) {
     () => order.push("finish"),
   );
   assert.deepEqual(order, ["finish"], "a dirty step backed by a null ref still resolves via its fallback");
+}
+
+// #931 "save, mark done, next verse": mark-done and advance run only after
+// every dirty side has committed, in that order; a cancelled confirm leaves
+// the verse unmarked and the aligner where it is.
+{
+  const order = [];
+  let pendingConfirm = null;
+  runSaveDoneAndNext({
+    steps: [
+      { dirty: true, save: (afterCommit) => { order.push("ult"); pendingConfirm = afterCommit; } },
+      { dirty: true, save: (afterCommit) => { order.push("ust"); afterCommit(); } },
+    ],
+    markDone: () => order.push("done"),
+    advance: () => order.push("next"),
+  });
+  assert.deepEqual(order, ["ult"], "nothing is marked or advanced while a confirm is pending (Cancel = stays here)");
+  pendingConfirm();
+  assert.deepEqual(order, ["ult", "ust", "done", "next"], "both saves land, then mark done, then advance");
+}
+// The mark is always written, clean verse or not — no "already done" skip
+// (local state can be stale while a verse PATCH is queued; the outbox orders
+// the check after it).
+{
+  const order = [];
+  runSaveDoneAndNext({
+    steps: [{ dirty: false, save: () => check(false, "clean step must not save") }],
+    markDone: () => order.push("done"),
+    advance: () => order.push("next"),
+  });
+  assert.deepEqual(order, ["done", "next"], "a clean verse is still marked done, then advanced");
+  const order2 = [];
+  runSaveDoneAndNext({
+    steps: [{ dirty: true, save: (afterCommit) => { order2.push("ult"); afterCommit(); } }],
+    markDone: () => order2.push("done"),
+    advance: () => order2.push("next"),
+  });
+  assert.deepEqual(order2, ["ult", "done", "next"], "a saved verse is marked after its save");
+}
+// In-flight guard: a second click while the chain is running is ignored, and
+// the mark targets the verse the FIRST click started on.
+{
+  const guard = createSaveDoneAndNextGuard();
+  const marked = [];
+  let active = 7;
+  let pendingCommit = null;
+  const heldDuring = [];
+  const click = () => {
+    const verse = active; // captured at click time, as Shell does
+    return guard.run({
+      steps: [{ dirty: true, save: (afterCommit) => { pendingCommit = afterCommit; } }],
+      markDone: () => { heldDuring.push(["mark", guard.running]); marked.push(verse); },
+      advance: () => { heldDuring.push(["advance", guard.running]); active = verse + 1; },
+    });
+  };
+  assert.equal(click(), true, "first click starts the chain");
+  assert.equal(guard.running, true, "guard is held while the save is pending");
+  assert.equal(click(), false, "a second click during the chain is ignored");
+  pendingCommit();
+  assert.deepEqual(
+    heldDuring,
+    [["mark", true], ["advance", true]],
+    "the guard stays held through markDone AND advance (released only after advance)",
+  );
+  assert.deepEqual(marked, [7], "only the starting verse is marked");
+  assert.equal(active, 8, "advanced once");
+  assert.equal(guard.running, false, "guard released when the chain finishes");
+  // Cancelled confirm: the chain stalls for good; cancel() frees the button.
+  pendingCommit = null;
+  assert.equal(click(), true, "a new click on verse 8 starts a chain");
+  guard.cancel();
+  assert.equal(guard.running, false, "cancel() releases a stalled chain");
+  assert.deepEqual(marked, [7], "the cancelled chain marked nothing");
+  // A throwing step does not wedge the guard.
+  const g2 = createSaveDoneAndNextGuard();
+  assert.throws(() => g2.run({ steps: [{ dirty: true, save: () => { throw new Error("boom"); } }], markDone() {}, advance() {} }));
+  assert.equal(g2.running, false, "a throwing save releases the guard");
+  // A click from inside advance (e.g. a re-render firing the handler) is ignored.
+  const g3 = createSaveDoneAndNextGuard();
+  let reentered = null;
+  g3.run({
+    steps: [],
+    markDone() {},
+    advance() { reentered = g3.run({ steps: [], markDone() {}, advance() {} }); },
+  });
+  assert.equal(reentered, false, "a click during advance is ignored");
+  assert.equal(g3.running, false, "guard released after advance");
+  // A throwing advance or markDone (after an async commit) does not wedge it.
+  for (const which of ["markDone", "advance"]) {
+    const g4 = createSaveDoneAndNextGuard();
+    let commit = null;
+    g4.run({
+      steps: [{ dirty: true, save: (afterCommit) => { commit = afterCommit; } }],
+      markDone: () => { if (which === "markDone") throw new Error("boom"); },
+      advance: () => { if (which === "advance") throw new Error("boom"); },
+    });
+    assert.throws(() => commit());
+    assert.equal(g4.running, false, `a throwing ${which} releases the guard`);
+  }
 }
 
 if (failed) {

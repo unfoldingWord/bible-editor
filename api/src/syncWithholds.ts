@@ -65,10 +65,35 @@ export async function recordSyncWithhold(
  * shape — called only once recordResourceSync has actually stamped a fresh
  * watermark, never from the `!e.masterSha` short-circuit (nothing was measured
  * there, so any standing reason is not yet known to be stale).
+ *
+ * `runId`: this run's own exportWorkflow.ts `instanceId`, guarding the DELETE
+ * to `run_id <= ?3`. Without it, an unconditional delete-by-key is a race: two
+ * Workflow instances can overlap on the same (book, resource) despite the
+ * resource-scoped chapter locks (#830) that are meant to prevent it, and an
+ * OLDER instance calling this AFTER a NEWER one has already recorded its own
+ * fresh withhold would blow that row away — the newer run's own later read
+ * (readSyncWithhold) then sees no reason on record for a cause it measured
+ * moments ago. `instanceId` is a fixed-width ISO timestamp (plus a
+ * collision-proofing suffix — see exportWorkflow.ts), so lexicographic order
+ * matches start-time order: a STRICTLY newer row's run_id is never `<=` this
+ * one's, so it always survives.
+ *
+ * `<=` rather than `<` (issue #873, codex review of this fix): a Workflow
+ * replay reuses the same instanceId across attempts (deliberately — it's
+ * stable across replay), so an attempt that first recorded a withhold and
+ * then, on a later successful step, clears it needs to delete its OWN row
+ * (`run_id === runId`). Strict `<` would leave that row stranded — a stale
+ * reason surviving until some later run happens to touch the same
+ * (book, resource) — which is a self-inflicted version of the exact bug this
+ * guard exists to prevent. `<=` closes that without reopening the item-5 race:
+ * a row from a run that is actually newer still has `run_id > runId`, so it
+ * is never `<=` and is never touched.
  */
-export async function clearSyncWithhold(env: Env, book: string, resource: string): Promise<void> {
+export async function clearSyncWithhold(env: Env, book: string, resource: string, runId: string): Promise<void> {
   try {
-    await env.DB.prepare(`DELETE FROM sync_withholds WHERE book = ?1 AND resource = ?2`).bind(book, resource).run();
+    await env.DB.prepare(`DELETE FROM sync_withholds WHERE book = ?1 AND resource = ?2 AND run_id <= ?3`)
+      .bind(book, resource, runId)
+      .run();
   } catch (e) {
     console.error("sync withhold clear failed", { book, resource, error: e instanceof Error ? e.message : String(e) });
   }
@@ -127,28 +152,49 @@ const REASON_TEXT: Record<WithholdReason, (n: string) => string> = {
     `The pre-export sync withheld the watermark: removing rows master no longer carries hit ${n}chapter(s) ` +
     `still held by an active AI pipeline job. It will catch up once the job finishes and a later sync prunes ` +
     `them — no action needed unless the job is stuck.`,
+  // The counter this claim is measured from only proves the id was occupied
+  // at insert time (`ON CONFLICT(id, book) DO NOTHING` firing) — it does not,
+  // and cannot, know whether that occupying row is genuinely a different
+  // logical entity, so the wording states no more than that.
   conflict_skipped: (n) =>
     `The pre-export sync withheld the watermark: ${n}row(s) from master could not be inserted because their ` +
-    `id is already held by a different row in the app. This needs a human to resolve the id collision — see ` +
+    `id was already occupied in the app at insert time. This needs a human to resolve the id collision — see ` +
     `the reimport_id_blocked alert for this book and resource.`,
+  // Since issue #427 option 1 (#506), a reissued tombstone is reclaimed
+  // automatically in the SAME run it's first detected; this reason now fires
+  // only for the residual case — a reclaim attempt that lost its version-CAS
+  // race against a concurrent writer touching the same tombstoned row. The
+  // row is still a tombstone afterwards, so the next sync re-attempts the
+  // reclaim from scratch once the race that caused the loss has resolved —
+  // see raiseTombstoneBlockAlert's doc comment for the same "usually, not
+  // guaranteed" framing this mirrors.
   tombstone_blocked: (n) =>
-    `The pre-export sync withheld the watermark: ${n}row(s) from master are blocked by a deleted row holding ` +
-    `the same id at a different reference. This needs a human to resolve — see the reimport_id_blocked alert ` +
-    `for this book and resource.`,
+    `The pre-export sync withheld the watermark: ${n}row(s) from master lost a race reclaiming an id a ` +
+    `deleted row still holds at a different reference. This usually self-heals on the next sync once the ` +
+    `concurrent write it raced against has landed — but is not guaranteed to; see the reimport_id_blocked ` +
+    `alert for this book and resource if it persists across multiple nights.`,
   counts_incomplete: () =>
     `The pre-export sync withheld the watermark: this run's measurement of what it applied was incomplete ` +
     `(a resumed/replayed run, or an aggregation failure), so it could not certify the app as caught up. A ` +
     `later full sync will re-measure and, if actually current, clear this on its own.`,
+  // The counter records overlapping verse-range PAIRS (findOverlappingRanges'
+  // return, one entry per intersecting pair), not chapters — a single chapter
+  // can contribute more than one pair.
   structure_overlap: (n) =>
-    `The pre-export sync withheld the watermark: ${n}chapter(s) were left with overlapping verse ranges after ` +
-    `this run's merge, which the export cannot render. This needs a human to resolve the structural conflict.`,
+    `The pre-export sync withheld the watermark: this run's merge left ${n}overlapping verse-range pair(s), ` +
+    `which the export cannot render. This needs a human to resolve the structural conflict.`,
   systemic_refusal: () =>
     `The pre-export sync withheld the watermark: this run declined to adopt master's edits at scale, to avoid ` +
     `reverting translator work in the app. This needs a human to review the flagged verses (see the ` +
     `verse_merge_conflict alerts for this book and resource) and either resolve or override them.`,
+  // Only the pending master-adoption write batch is withheld when the
+  // merge-conflict recording write fails (applyVerseRows step 7's
+  // `recordFailed` guard) — every other write this run made (source-attr
+  // reconciliation, TSV inserts/updates, etc.) already landed.
   merge_record_failed: () =>
     `The pre-export sync withheld the watermark: this run's write of its merge-conflict results failed, so ` +
-    `nothing from this run was applied. A later sync will retry.`,
+    `any pending master-adoption edits were withheld (everything else this run applied still landed). A ` +
+    `later sync will retry the adoptions.`,
   apply_incomplete: () =>
     `The pre-export sync withheld the watermark: this run's write to the app failed partway through, so the ` +
     `app is not fully caught up with master. A later sync will retry.`,

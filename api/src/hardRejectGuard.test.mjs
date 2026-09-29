@@ -2,7 +2,7 @@
 // Run: node --experimental-strip-types --no-warnings src/hardRejectGuard.test.mjs
 
 import assert from "node:assert/strict";
-import { hardRejectRows } from "./hardRejectGuard.ts";
+import { buildHardRejectAlertMessage, hardRejectRows } from "./hardRejectGuard.ts";
 
 let passed = 0;
 function t(name, fn) {
@@ -110,6 +110,57 @@ t("a whitespace-only tn Quote does NOT license a blank Occurrence", () => {
 t("a whitespace-only twl OrigWords is still judged only on Occurrence", () => {
   // OrigWords blankness is only a validator WARNING, so it never drives a HOLD.
   assert.deepEqual(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "   ", "1", "rc://x"])), []);
+});
+
+console.log("[hardRejectRows — tn Note brackets (validate_tn_files.py check 13, a hard error)]");
+// Live prod shape (issue #1015): JER 17:4 ny7v, the second alternate translation
+// never closed. Door43's validate-be failed on exactly this row two nights running.
+const NY7V_NOTE =
+  "Yahweh is leaving out some of the words. Alternate translation: [And you shall loosen your hand] or [And you shall lose your own control of the inheritance that I gave to you";
+t("an unclosed [ in the Note is rejected, naming the row and the character position", () => {
+  const rows = hardRejectRows("tn", tnTsv(["17:4", "ny7v", "", "rc://*/ta/man/translate/figs-ellipsis", "וְ⁠שָׁמַטְתָּ֗ה", "1", NY7V_NOTE]));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].ref, "17:4");
+  assert.equal(rows[0].rowId, "ny7v");
+  assert.match(rows[0].reason, /Opening bracket '\[' at character \d+ has no matching closing bracket/);
+});
+t("a stray ] and a mismatched [[ ] are both rejected", () => {
+  assert.match(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "see this] here"]))[0].reason, /Closing bracket/);
+  assert.match(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "[[x] y"]))[0].reason, /bracket sizes must match/);
+});
+t("balanced brackets, including [[rc://...]] links, pass", () => {
+  assert.deepEqual(
+    hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "Alternate translation: [a] or [b] (See: [[rc://*/ta/man/translate/figs-ellipsis]])"])),
+    [],
+  );
+});
+t("brackets in the Quote are not judged (the validator checks the Note only)", () => {
+  assert.deepEqual(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "[x", "1", "fine"])), []);
+});
+t("twl has no Note column, so brackets never hold a twl book", () => {
+  assert.deepEqual(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "[x", "1", "rc://x"])), []);
+});
+
+console.log("[buildHardRejectAlertMessage]");
+t("names the ref, row id and the validator's reason, and does not tell the translator to fix an Occurrence", () => {
+  const rejects = hardRejectRows("tn", tnTsv(["17:4", "ny7v", "", "", "", "", NY7V_NOTE]));
+  const msg = buildHardRejectAlertMessage("JER", "tn", rejects);
+  assert.match(msg, /JER TN/);
+  assert.match(msg, /17:4 \(ny7v\): Note: Opening bracket .* closing bracket\. Fix/);
+  assert.doesNotMatch(msg, /Fix the Occurrence/);
+});
+t("caps the sample at 6 rows and counts the rest", () => {
+  const rejects = Array.from({ length: 8 }, (_, i) => ({ ref: `1:${i + 1}`, rowId: `r00${i}`, reason: "x" }));
+  const msg = buildHardRejectAlertMessage("JER", "tn", rejects);
+  assert.match(msg, /8 row\(s\)/);
+  assert.match(msg, /\+2 more/);
+  assert.doesNotMatch(msg, /r006/);
+});
+
+t("two problems in one Note count as one row", () => {
+  const rejects = hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "stray] and [open"]));
+  assert.equal(rejects.length, 2);
+  assert.match(buildHardRejectAlertMessage("JER", "tn", rejects), /HELD JER TN: 1 row\(s\)/);
 });
 
 console.log(`\n${passed} hardRejectGuard tests passed`);
