@@ -126,10 +126,10 @@ const snapshot = createDraftSnapshot<DraftRecord>(listAll, async (key) =>
 const draftChannel = typeof BroadcastChannel !== "undefined"
   ? new BroadcastChannel("be-draft-changes") : null;
 draftChannel?.addEventListener("message", (event: MessageEvent) => {
-  if (typeof event.data === "string") refreshSnapshot(event.data);
+  if (typeof event.data === "string") refreshSnapshot(event.data, "remote");
 });
-function refreshSnapshot(key: string) {
-  void snapshot.refresh(key).catch((error) => {
+function refreshSnapshot(key: string, origin: "local" | "remote" = "local") {
+  void snapshot.refresh(key, origin).catch((error) => {
     // A notification failure must never turn a persisted dirty draft into an
     // apparent absence. Keep the last known state; the next commit can retry.
     console.warn("Unable to refresh draft notification", error);
@@ -168,7 +168,11 @@ export const drafts = {
     return snapshot.subscribe(fn);
   },
 
-  subscribeKey(key: string, fn: (draft: DraftRecord | undefined) => void): () => void {
+  // `remote` is true when the change came only from another tab (#806).
+  subscribeKey(
+    key: string,
+    fn: (draft: DraftRecord | undefined, remote: boolean) => void,
+  ): () => void {
     return snapshot.subscribeKey(key, fn);
   },
 

@@ -59,7 +59,7 @@ import {
   guardBlocksSave,
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
-import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, versesFromKey } from "../lib/verseRange";
+import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, versesFromKey } from "../lib/verseRange";
 import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
@@ -1189,12 +1189,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     });
     for (const verse of verses) {
       if (verse <= 0) continue;
-      const sourceVO = verseObjectsOf(sourceByVerse[verse]);
+      // Each row is judged against the source it covers — every UHB verse of
+      // a bridge, not just the first (#957).
       const ultVO = verseObjectsOf(ult[verse]);
       const ustVO = verseObjectsOf(ust[verse]);
       out.set(
         verse,
-        !!(ultVO && verseHasUnalignedWork(ultVO, sourceVO)) || !!(ustVO && verseHasUnalignedWork(ustVO, sourceVO)),
+        !!(ultVO && verseHasUnalignedWork(ultVO, verseObjectsOf(sourceForTargetRow(sourceByVerse, ult[verse]) ?? undefined))) ||
+          !!(ustVO && verseHasUnalignedWork(ustVO, verseObjectsOf(sourceForTargetRow(sourceByVerse, ust[verse]) ?? undefined))),
       );
     }
     return out;
@@ -1274,9 +1276,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     };
     for (const ref of alignAttention.refs) {
       if (ref.chapter !== data.chapter) continue;
-      const targetVO = getVO(targetsByResource[ref.resource]?.[ref.verse]);
+      const target = targetsByResource[ref.resource]?.[ref.verse];
+      const targetVO = getVO(target);
       if (!targetVO) continue;
-      const sourceVO = getVO(sourceByVerse[ref.verse]);
+      const sourceVO = getVO(sourceForTargetRow(sourceByVerse, target) ?? undefined);
       if (!verseHasUnalignedWork(targetVO, sourceVO)) {
         keys.add(`${ref.resource}:${ref.ref}`);
       }
@@ -1594,13 +1597,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // highlight source. Notes and words are mutually exclusive; clicking one
   // clears the other. Words use `orig_words` (Hebrew source words) which the
   // same matcher handles directly for UHB and via \zaln-s for ULT/UST.
-  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses } =
+  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses, activeQuoteVerse } =
     useMemo(() => {
       const empty = {
         activeQuote: null as string | null,
         activeOccurrence: null as number | null,
         activeQuotePartialGroups: false,
         activeQuoteCoveredVerses: EMPTY_COVERED_VERSES,
+        activeQuoteVerse: null as number | null,
       };
       if (!data) return empty;
       if (activeNoteId) {
@@ -1612,6 +1616,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeOccurrence: r.occurrence ?? null,
           activeQuotePartialGroups: covered.length > 1,
           activeQuoteCoveredVerses: covered,
+          // The note's own verse: its occurrence counts there (#957).
+          activeQuoteVerse: r.verse,
         };
       }
       if (activeWordId) {
@@ -1621,6 +1627,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeOccurrence: r?.occurrence ?? null,
           activeQuotePartialGroups: false,
           activeQuoteCoveredVerses: r ? [r.verse] : EMPTY_COVERED_VERSES,
+          activeQuoteVerse: r?.verse ?? null,
         };
       }
       return empty;
@@ -1668,12 +1675,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // quote the highlight path resolves against the source and maps through the
     // alignment — so one lookup serves both. Ids are unique per book across
     // kinds, so checking tn first and falling through to twl can't collide.
-    const find = (id: string | null): { quote: string | null; occurrence: number | null } | null => {
+    const find = (id: string | null): { quote: string | null; occurrence: number | null; verse: number } | null => {
       if (!id) return null;
       const note = data.tn.find((r) => r.id === id);
-      if (note) return { quote: note.quote, occurrence: note.occurrence };
+      if (note) return { quote: note.quote, occurrence: note.occurrence, verse: note.verse };
       const word = data.twl.find((r) => r.id === id);
-      if (word) return { quote: word.orig_words, occurrence: word.occurrence };
+      if (word) return { quote: word.orig_words, occurrence: word.occurrence, verse: word.verse };
       return null;
     };
     const moved = find(reorderPreview.movedId);
@@ -1687,6 +1694,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       prevOccurrence: prev?.occurrence ?? null,
       nextQuote: next?.quote ?? null,
       nextOccurrence: next?.occurrence ?? null,
+      movedVerse: moved?.verse ?? null,
+      prevVerse: prev?.verse ?? null,
+      nextVerse: next?.verse ?? null,
     };
   }, [data, reorderPreview]);
 
@@ -3663,6 +3673,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeNoteOccurrence={activeOccurrence}
           activeNoteQuotePartialGroups={activeQuotePartialGroups}
           activeNoteCoveredVerses={activeQuoteCoveredVerses}
+          activeNoteVerse={activeQuoteVerse}
           reorderHighlight={reorderHighlight}
           mode={mode}
           enabledVersions={displayedVersions}
