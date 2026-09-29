@@ -527,6 +527,11 @@ export interface ReorderHighlight {
   prevOccurrence: number | null;
   nextQuote: string | null;
   nextOccurrence: number | null;
+  // Each row's own verse: its occurrence counts within that verse, which a
+  // bridged target row needs to find the right source instance (#957).
+  movedVerse?: number | null;
+  prevVerse?: number | null;
+  nextVerse?: number | null;
 }
 
 // Per-token role sets handed to the renderers alongside the active highlight

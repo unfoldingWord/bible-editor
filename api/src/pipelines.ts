@@ -133,7 +133,11 @@ interface StartResponse {
 
 // Strict on `state` (the one top-level field pollPipelineJob actually
 // branches on — shouldImport, effectiveState, the paused/interrupted checks
-// all read it directly) and on the shapes of `current`/`resume`/`output[]`.
+// all read it directly) — restricted to the enum of states this codebase
+// actually knows how to handle (issue #859: an unrecognized state like
+// "in_progress" must not parse and be stored verbatim, or the cron poll and
+// the active-slot check stop recognizing the job as occupying the bot slot).
+// Also strict on the shapes of `current`/`resume`/`output[]`.
 // Lenient (optional) on jobId/pipelineType/scope/updatedAt/createdAt: nothing
 // in this function reads them to make a decision — they're only spread
 // verbatim (`...data`) into a rewritten response body when the local apply
@@ -149,62 +153,95 @@ interface StartResponse {
 // refused, etc). A stricter output schema risks rejecting real bot payloads
 // the import layer already handles fine (see issue #841's "uncertainty to
 // resolve" — the bot's exact shape isn't contract-tested from here).
-export const StatusResponseSchema = z.object({
-  jobId: z.string().optional(),
-  pipelineType: z.string().optional(),
-  scope: z
-    .object({
-      book: z.string(),
-      startChapter: z.number(),
-      endChapter: z.number(),
-    })
-    .optional(),
-  state: z.string(),
-  current: z
-    .object({
-      chapter: z.number(),
-      skill: z.string(),
-      status: z.string(),
-      // OPTIONAL, verified against the real bot: serializeCheckpoint
-      // (bp-assistant/src/api/pipeline.js) only spreads startedAt when the
-      // checkpoint carries one, so a run that parked before its first timing
-      // stamp omits the key entirely.
-      startedAt: z.string().optional(),
-      errorKind: z.string().optional(),
-      error: z.string().optional(),
-    })
-    .optional(),
-  updatedAt: z.string().optional(),
-  createdAt: z.string().optional(),
-  interrupted: z.boolean().optional(),
-  // Both additive, and both may be absent — the bot ships them only from the
-  // resume-contract release onwards, so every read must tolerate undefined.
-  // resume: what a resume would pick back up (chapter + skill). pausedAt: when
-  // the bot parked the run, used to time-box auto-resume.
-  //
-  // `skill` is NULLABLE, verified against the real bot: it serializes
-  // `skill: cp.resume.skill ?? null`, so a checkpoint that knows the chapter to
-  // resume but not the step reports an explicit null.
-  resume: z
-    .object({ chapter: z.number(), skill: z.string().nullable() })
-    .nullable()
-    .optional(),
-  pausedAt: z.string().optional(),
-  output: z
-    .array(
-      z.object({
-        type: z.string().optional(),
-        repo: z.string().optional(),
-        branch: z.string().optional(),
-        path: z.string().optional(),
-        rawUrl: z.string().optional(),
-        prNumber: z.number().optional(),
-        mergedAt: z.string().optional(),
-        commitSha: z.string().optional(),
-      }),
-    )
-    .optional(),
-});
+// The upstream states pollPipelineJob's own branches (shouldImport,
+// upstreamInterrupted, attemptOutageResume, effectiveState) actually know how
+// to handle. An upstream state outside this set (a new bot-side state like
+// "in_progress" that this codebase has never been taught) must NOT parse —
+// it would be stored verbatim and then match none of those branches, so the
+// cron poll and the active-slot check stop recognizing the job as occupying
+// the bot slot while it is, in fact, still running upstream.
+const KNOWN_UPSTREAM_STATES = [
+  "running",
+  "paused_for_outage",
+  "paused_for_usage_limit",
+  "done",
+  "failed",
+  "cancelled",
+] as const;
+
+export const StatusResponseSchema = z
+  .object({
+    jobId: z.string().optional(),
+    pipelineType: z.string().optional(),
+    scope: z
+      .object({
+        book: z.string(),
+        startChapter: z.number(),
+        endChapter: z.number(),
+      })
+      .optional(),
+    state: z.enum(KNOWN_UPSTREAM_STATES),
+    current: z
+      .object({
+        chapter: z.number(),
+        skill: z.string(),
+        status: z.string(),
+        // OPTIONAL, verified against the real bot: serializeCheckpoint
+        // (bp-assistant/src/api/pipeline.js) only spreads startedAt when the
+        // checkpoint carries one, so a run that parked before its first timing
+        // stamp omits the key entirely.
+        startedAt: z.string().optional(),
+        errorKind: z.string().optional(),
+        error: z.string().optional(),
+      })
+      .optional(),
+    updatedAt: z.string().optional(),
+    createdAt: z.string().optional(),
+    interrupted: z.boolean().optional(),
+    // Both additive, and both may be absent — the bot ships them only from the
+    // resume-contract release onwards, so every read must tolerate undefined.
+    // resume: what a resume would pick back up (chapter + skill). pausedAt: when
+    // the bot parked the run, used to time-box auto-resume.
+    //
+    // `skill` is NULLABLE, verified against the real bot: it serializes
+    // `skill: cp.resume.skill ?? null`, so a checkpoint that knows the chapter to
+    // resume but not the step reports an explicit null.
+    resume: z
+      .object({ chapter: z.number(), skill: z.string().nullable() })
+      .nullable()
+      .optional(),
+    pausedAt: z.string().optional(),
+    output: z
+      .array(
+        z.object({
+          type: z.string().optional(),
+          repo: z.string().optional(),
+          branch: z.string().optional(),
+          path: z.string().optional(),
+          rawUrl: z.string().optional(),
+          prNumber: z.number().optional(),
+          mergedAt: z.string().optional(),
+          commitSha: z.string().optional(),
+        }),
+      )
+      .optional(),
+  })
+  // A 'done' response whose output[] is present but every entry lacks rawUrl
+  // still parsed before this refinement, so pollPipelineJob finalized the job
+  // as done — and any follow-up chain could dispatch — on top of a run that
+  // imported nothing (the importer silently skips a rawUrl-less entry). No
+  // output[] at all stays fine: a run can legitimately finish with nothing to
+  // import (e.g. a re-poll of an already-imported job). Reject only the
+  // "claimed output, none of it usable" shape as malformed — the same fate as
+  // an unparseable body — so the job holds at its prior state instead.
+  .refine(
+    (body) =>
+      body.state !== "done" ||
+      !Array.isArray(body.output) ||
+      body.output.length === 0 ||
+      body.output.some((entry) => typeof entry.rawUrl === "string" && entry.rawUrl.length > 0),
+    { message: "done_response_without_importable_output" },
+  );
 
 type StatusResponse = z.infer<typeof StatusResponseSchema>;
 

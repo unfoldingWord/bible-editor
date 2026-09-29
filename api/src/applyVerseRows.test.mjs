@@ -1419,6 +1419,126 @@ console.log("\n[#788: a cosmetic adoption that loses its version-CAS race does n
     "the speculative cosmetic audit is removed when the CAS did not overwrite anything");
 }
 
+// ── Issue #1005: the watermark lags one publish; the app edit already shipped ─
+//
+// JER ULT 29:23 / 49:21: master_confirmed_at still named the publish BEFORE our
+// newest one, because Richard Mahn's em-dash join landed on top of that newest
+// publish before any sync could positively confirm it. The app edits the
+// boundary probe saw were already in that newest publish (book_resource_syncs'
+// pushed_blob_sha / pushed_r2_key, whose PR the lineage lists among `ours`), so
+// D1 held nothing master lacked — yet the cosmetic adoption was refused and the
+// export put the newline back. The widening answers the probe from that publish,
+// and ONLY when D1 still equals it at the verse.
+const SHIPPED_PR = 4242;
+const lineageWithOurPublish = (refs, oursPrNumbers = [SHIPPED_PR]) => ({
+  ...cosmeticHumanLineage(refs),
+  counts: { ours: 2, ai: 0, human: 1 },
+  oursPrNumbers,
+});
+const unconfirmedPublishOf = (boundary, verses, prNumber = SHIPPED_PR) => ({
+  confirmedAt: 200,
+  editId: boundary,
+  prNumber,
+  verses: new Map(Object.entries(verses).map(([k, contentJson]) => [k, { contentJson, verseEnd: null }])),
+});
+
+function seedEditAfterConfirmedBoundary(sqlite, chapter, verse) {
+  // An app edit strictly after the confirmed id boundary (and after the
+  // confirmedAt timestamp) — the thing human_edit_after_export detects.
+  sqlite.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+     VALUES ('verse', ?, ?, 91, 4, 4, 'update', ?, 300)`,
+  ).run(`${BOOK}/${chapter}/${verse}/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(COSMETIC_OURS) }));
+}
+
+console.log("\n[#1005: an app edit after a lagging watermark that our newer publish already shipped does not block cosmetic_human]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite);
+  seedEditAfterConfirmedBoundary(sqlite, 12, 3);
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 3, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    {
+      confirmedAt: 200,
+      editId: boundary,
+      lineage: lineageWithOurPublish(["12:3"]),
+      // D1's current verse IS the last pushed render's verse.
+      unconfirmedPublish: unconfirmedPublishOf(boundary, { "12:3": COSMETIC_OURS }),
+    },
+    false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, plain_text, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 3`).get(BOOK);
+  eq([row.content_json, row.plain_text, row.version], [COSMETIC_MASTER, "—\n", 5], "the human's master bytes are adopted through the CAS lane");
+  eq([counts.merge_adopted, counts.merge_cosmetic_adopted, counts.merge_cosmetic_ignored], [1, 1, 0], "counted as a landed cosmetic adoption, not ignored drift");
+  eq(
+    sqlite.prepare(`SELECT action, reason, overwritten_version FROM verse_merge_conflicts WHERE book = ? AND resource = 'ult' AND chapter = 12 AND verse = 3`).get(BOOK),
+    { action: "adopt", reason: "cosmetic_human", overwritten_version: 4 },
+    "the audit says adopt / cosmetic_human",
+  );
+}
+
+console.log("\n[#1005: the pushed render's verse is byte-different from D1 but renders identically (the usual production shape)]");
+{
+  // In production the shipped verse comes from extractVersesForRange over the
+  // whole pushed file, so its JSON is rarely byte-equal to D1's stored
+  // content_json. Same nodes, keys reordered: different bytes, same render.
+  const reorder = (node) =>
+    Array.isArray(node)
+      ? node.map(reorder)
+      : node && typeof node === "object"
+        ? Object.fromEntries(Object.entries(node).reverse().map(([k, v]) => [k, reorder(v)]))
+        : node;
+  const shippedReordered = JSON.stringify(reorder(JSON.parse(COSMETIC_OURS)));
+  if (shippedReordered === COSMETIC_OURS) throw new Error("fixture must differ in bytes");
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite);
+  seedEditAfterConfirmedBoundary(sqlite, 12, 3);
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 3, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    {
+      confirmedAt: 200,
+      editId: boundary,
+      lineage: lineageWithOurPublish(["12:3"]),
+      unconfirmedPublish: unconfirmedPublishOf(boundary, { "12:3": shippedReordered }),
+    },
+    false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 3`).get(BOOK);
+  eq([row.content_json, row.version], [COSMETIC_MASTER, 5], "render-equal to the pushed render is enough to adopt the human's master bytes");
+  eq([counts.merge_cosmetic_adopted, counts.merge_cosmetic_ignored], [1, 0], "counted as a cosmetic adoption through the render comparison");
+}
+
+console.log("\n[#1005: a genuinely unpublished app edit (or unproven publish) still blocks cosmetic_human]");
+for (const [label, lineage, unconfirmedPublish] of [
+  // D1 moved past what we last pushed: the edit never reached master.
+  ["D1 differs from the last pushed render", lineageWithOurPublish(["12:3"]), (b) => unconfirmedPublishOf(b, { "12:3": contentJson("older published text") })],
+  ["last pushed render lacks the verse", lineageWithOurPublish(["12:3"]), (b) => unconfirmedPublishOf(b, { "12:4": COSMETIC_OURS })],
+  // The render matches, but nothing shows it landed on master.
+  ["publish's PR not among lineage ours", lineageWithOurPublish(["12:3"], [999]), (b) => unconfirmedPublishOf(b, { "12:3": COSMETIC_OURS })],
+  ["pre-#1005 lineage without oursPrNumbers", cosmeticHumanLineage(["12:3"]), (b) => unconfirmedPublishOf(b, { "12:3": COSMETIC_OURS })],
+  // Measured against a different confirmed boundary than this cutoff's.
+  ["publish staged for another boundary", lineageWithOurPublish(["12:3"]), (b) => ({ ...unconfirmedPublishOf(b, { "12:3": COSMETIC_OURS }), editId: b + 1000 })],
+  ["no unconfirmed publish", lineageWithOurPublish(["12:3"]), () => null],
+]) {
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite);
+  seedEditAfterConfirmedBoundary(sqlite, 12, 3);
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 3, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    { confirmedAt: 200, editId: boundary, lineage, unconfirmedPublish: unconfirmedPublish(boundary) },
+    false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 3`).get(BOOK);
+  eq([row.content_json, row.version], [COSMETIC_OURS, 4], `${label}: D1 is retained`);
+  eq([counts.merge_cosmetic_adopted, counts.merge_cosmetic_ignored], [0, 1], `${label}: unchanged merge_cosmetic_ignored behavior`);
+}
+
 // ── Issue #609: the PRISTINE / AI-only writers get the same lens ────────────
 //
 // The characterization test directly above pins the EDITED path: stableKey holds
