@@ -2,7 +2,7 @@
 // change (#892). Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/chapterStale.test.mjs
 
-import { currentRouteFetcher, isChapterLocked, isStaleChapter, trackNavigation, updateIfCurrent } from "./chapterStale.ts";
+import { currentRouteFetcher, isChapterLocked, isStaleChapter, trackLockedKey, trackNavigation, updateIfCurrent } from "./chapterStale.ts";
 
 let failed = 0;
 let passed = 0;
@@ -118,6 +118,29 @@ assert(isStaleChapter(payload("ZEC", 0), { book: "ZEC", chapter: 1 }) === true, 
   assert(isStaleChapter(comment("ZEC", 5), onScreen) === true, "a comment from the route's new chapter is dropped");
   assert(isStaleChapter(comment("HOS", 4), onScreen) === true, "a comment from another book's same chapter is dropped");
   assert(isStaleChapter(comment("ZEC", 4), onScreen) === false, "a comment for the chapter on screen is kept");
+}
+
+// ── trackLockedKey: reload comments after an A → B → A lock ─────────────────
+// Comments are keyed on the chapter on screen. A → B → A keeps A on screen the
+// whole time, so the key never changes and nothing would refetch A's comments,
+// although the tab's socket followed B meanwhile and missed A's events.
+{
+  let s = trackLockedKey(null, true, "ZEC/14"); // lock starts on A
+  assert(s.lockedKey === "ZEC/14" && s.reload === false, "the lock remembers the key it started on");
+  s = trackLockedKey(s.lockedKey, true, "ZEC/14"); // still locked (B window, back on A)
+  assert(s.lockedKey === "ZEC/14" && s.reload === false, "no reload while locked");
+  s = trackLockedKey(s.lockedKey, false, "ZEC/14"); // A's fresh payload lands
+  assert(s.lockedKey === null && s.reload === true, "A → B → A reloads A's comments when A lands");
+}
+{
+  // A → B: the key changes on landing, so the comments fetch runs by itself;
+  // a reload on top would fetch B twice.
+  let s = trackLockedKey(null, true, "ZEC/4");
+  s = trackLockedKey(s.lockedKey, false, "ZEC/5");
+  assert(s.lockedKey === null && s.reload === false, "A → B does not reload (the key change fetches)");
+  // No lock at all (first load, an in-place refetch): nothing to reload.
+  const t = trackLockedKey(null, false, "ZEC/5");
+  assert(t.lockedKey === null && t.reload === false, "unlocked renders never reload");
 }
 
 console.log(`chapterStale: ${passed} passed, ${failed} failed`);

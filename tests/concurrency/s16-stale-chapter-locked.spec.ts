@@ -316,3 +316,49 @@ test("the stale copy keeps its own comment badges, not the next chapter's", asyn
     await context.close();
   }
 });
+
+// A → B → A keeps A's payload on screen the whole time, so the comments key
+// never changes. A comment added to A while the tab's socket followed B must
+// still show once A's fresh payload lands (round-5 review of #892).
+test("A → B → A: a comment added to A during the B window shows after A lands", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "stale892-aba-comments");
+  const page = await context.newPage();
+  const headers = { Authorization: `Bearer ${auth.token}`, "x-csrf-token": auth.csrf, "Content-Type": "application/json" };
+  let commentId: number | null = null;
+  try {
+    const aComments = page.waitForResponse(/\/api\/comments\/ZEC\/14(\?|$)/, { timeout: 15_000 });
+    await page.goto("/#/ZEC/14/1");
+    await expect(page.locator(cellSel("rows", 14, 1))).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
+    await aComments;
+    await page.waitForTimeout(300);
+    // Counted badges on screen (an empty badge's label starts "Add …").
+    const labels = () =>
+      page.locator('[data-comments-badge]:not([aria-label^="Add"])').evaluateAll((els) =>
+        els.map((e) => e.getAttribute("aria-label")).join("|"),
+      );
+    const before = await labels();
+
+    const releaseB = await holdChapter(page, 1);
+    const releaseA = await holdChapter(page, 14);
+    await setHash(page, "#/ZEC/1/1");
+    await expect(page.locator('[data-stale-chapter="14"]')).toBeVisible();
+    // Someone adds a comment to A while this tab's socket is on B.
+    const created = await context.request.post("/api/comments", {
+      headers,
+      data: { book: "ZEC", chapter: 14, verse: 1, kind: "note", body: `STALE892-ABA-${Date.now()}` },
+    });
+    expect(created.ok(), `create comment: ${created.status()}`).toBe(true);
+    commentId = ((await created.json()) as { id: number }).id;
+    await setHash(page, "#/ZEC/14/1");
+    await expect(page.locator('[data-stale-chapter="14"]')).toBeVisible();
+
+    releaseA();
+    await expect(page.locator("[data-stale-chapter]")).toHaveCount(0, { timeout: 15_000 });
+    await expect.poll(labels, { timeout: 10_000, message: "A's new comment must show after A lands" }).not.toBe(before);
+    releaseB();
+  } finally {
+    if (commentId != null) await context.request.delete(`/api/comments/${commentId}`, { headers }).catch(() => {});
+    await context.close();
+  }
+});
