@@ -15,6 +15,7 @@ import {
   lanesForAdoption,
   reopenLaneChecks,
   reopenLaneChecksBulk,
+  LANE_REOPEN_BROADCAST_WAIT_MS,
 } from "./laneReopen.ts";
 
 let failed = 0;
@@ -253,6 +254,41 @@ console.log("\n[#686 item 3: reopenLaneChecks / reopenLaneChecksBulk leave an ed
   }
 }
 
+console.log("\n[#686 item 3 (remainder): verse_statuses.updated_by, migration 0070]");
+{
+  // Same SQL chapters.ts's status-toggle route runs (cross-checked against the
+  // real source below) against real SQLite, proving the upsert branch actually
+  // stamps updated_by on both a first toggle and a later re-toggle by a
+  // different user — not just that the source text mentions the column.
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(`
+    CREATE TABLE verse_statuses (
+      book TEXT NOT NULL, chapter INTEGER NOT NULL, verse INTEGER NOT NULL,
+      done INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_by INTEGER,
+      PRIMARY KEY (book, chapter, verse)
+    );
+  `);
+  const toggle = (book, chapter, verse, done, now, userId) =>
+    sqlite
+      .prepare(
+        `INSERT INTO verse_statuses (book, chapter, verse, done, updated_at, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(book, chapter, verse) DO UPDATE SET done = ?4, updated_at = ?5, updated_by = ?6`,
+      )
+      .run(book, chapter, verse, done, now, userId);
+
+  toggle("ZEC", 5, 3, 1, 100, 7);
+  let row = sqlite.prepare(`SELECT done, updated_by FROM verse_statuses WHERE book='ZEC' AND chapter=5 AND verse=3`).get();
+  eq(row.done, 1, "first toggle sets done");
+  eq(row.updated_by, 7, "first toggle stamps the toggling user");
+
+  toggle("ZEC", 5, 3, 0, 200, 9);
+  row = sqlite.prepare(`SELECT done, updated_by FROM verse_statuses WHERE book='ZEC' AND chapter=5 AND verse=3`).get();
+  eq(row.done, 0, "re-toggle by a different user updates done");
+  eq(row.updated_by, 9, "re-toggle overwrites updated_by with the new toggling user, not the original");
+}
+
 console.log("\n[#686 item 3, source check] chapters.ts's three edit_log INSERTs (verse_status, verse_lane x2) carry book");
 {
   // chapters.ts imports Hono (routes), so it cannot be driven directly under
@@ -271,6 +307,197 @@ console.log("\n[#686 item 3, source check] chapters.ts's three edit_log INSERTs 
   const occurrences = chaptersTs.split(withBook).length - 1;
   eq(occurrences, 3, "[source] all 3 edit_log INSERTs (verse_status, single lane, bulk lane) include the book column");
   eq(chaptersTs.includes(withoutBook), false, "[source] no edit_log INSERT in chapters.ts still omits book");
+
+  // #686 item 3 (remainder, migration 0070): the verse_statuses row itself
+  // had no actor column at all — PR #785 explicitly deferred this half.
+  // Same source-text limitation as above; assert the toggle route stamps
+  // updated_by on both the insert and the upsert branch.
+  const statusInsert = "INSERT INTO verse_statuses (book, chapter, verse, done, updated_at, updated_by)";
+  const statusUpsert = "ON CONFLICT(book, chapter, verse) DO UPDATE SET done = ?4, updated_at = ?5, updated_by = ?6";
+  eq(chaptersTs.includes(statusInsert), true, "[source] verse_statuses INSERT stamps updated_by");
+  eq(chaptersTs.includes(statusUpsert), true, "[source] verse_statuses upsert branch stamps updated_by");
+  eq(chaptersTs.includes(".bind(book, chapter, verse, done, now, userId)"), true, "[source] the insert binds userId as updated_by");
+}
+
+console.log("\n[#931] a verse save's lane reopen DELETE finishes BEFORE the save responds; broadcasts get a bounded wait");
+{
+  // The dual aligner's "save, mark done, next verse" button sends the Text
+  // lane check right behind the verse PATCH. When the reopen ran in
+  // waitUntil (after the response), its DELETE could land after that check
+  // and wipe it. So verses.ts awaits the DELETE before responding — safe only
+  // because reopenLaneChecks swallows its own errors — and waits at most
+  // LANE_REOPEN_BROADCAST_WAIT_MS for the Durable-Object broadcasts (no
+  // timeout of their own), handing any leftover to waitUntil. A fast
+  // broadcast lands before the response, so the empty-checker event cannot
+  // overtake the follow-up Text check's broadcast in the room. verses.ts imports Hono, so the route itself cannot run
+  // here (STATE.md); its call shape is asserted on comment-stripped source.
+  const throwingEnv = {
+    DB: {
+      prepare: () => ({ bind: () => ({}) }),
+      batch: async () => {
+        throw new Error("D1 down");
+      },
+    },
+  };
+  let threw = false;
+  try {
+    await reopenLaneChecks(throwingEnv, "ZEC", 1, 7, ["text"], true, () => {});
+  } catch {
+    threw = true;
+  }
+  eq(threw, false, "a failing reopen resolves instead of throwing, so awaiting it cannot fail a save");
+
+  // A broadcast that never settles (a wedged Durable Object) must not hold the
+  // awaited part open past the cap when waitUntil is given.
+  const deleted = [];
+  const handed = [];
+  const hangingEnv = {
+    DB: {
+      prepare: (sql) => ({ bind: (...args) => ({ sql, args }) }),
+      batch: async (stmts) => {
+        deleted.push(stmts[0].args);
+        return [{ meta: { changes: 1 } }, { meta: { changes: 1 } }];
+      },
+    },
+    CHAPTER_ROOM: {
+      idFromName: (n) => n,
+      get: () => ({ fetch: () => new Promise(() => {}) }),
+    },
+  };
+  eq(LANE_REOPEN_BROADCAST_WAIT_MS, 1000, "the bounded broadcast wait is about one second");
+  const hangStart = Date.now();
+  const outcome = await Promise.race([
+    reopenLaneChecks(hangingEnv, "ZEC", 1, 7, ["text", "tw"], true, (p) => handed.push(p)).then(() => "resolved"),
+    new Promise((r) => setTimeout(() => r("timed out"), LANE_REOPEN_BROADCAST_WAIT_MS + 500)),
+  ]);
+  const hangElapsed = Date.now() - hangStart;
+  eq(outcome, "resolved", "with waitUntil, the call resolves within the cap even while the broadcast hangs forever");
+  eq(
+    hangElapsed >= LANE_REOPEN_BROADCAST_WAIT_MS - 50,
+    true,
+    `a hung broadcast is waited for up to the cap before giving up (waited ${hangElapsed} ms)`,
+  );
+  eq(deleted.length, 1, "the DELETE batch ran before the call resolved");
+  eq(handed.length, 1, "the pending broadcasts were handed to waitUntil");
+
+  // A healthy room: both lanes' broadcasts finish BEFORE the call resolves,
+  // so the empty-checker event reaches the room ahead of the response.
+  const delivered = [];
+  const fastEnv = {
+    DB: hangingEnv.DB,
+    CHAPTER_ROOM: {
+      idFromName: (n) => n,
+      get: () => ({
+        fetch: async (req) => {
+          await new Promise((r) => setTimeout(r, 20));
+          delivered.push(JSON.parse(await req.text()).check.lane);
+        },
+      }),
+    },
+  };
+  const fastStart = Date.now();
+  await reopenLaneChecks(fastEnv, "ZEC", 1, 7, ["text", "tw"], true, () => {});
+  const fastElapsed = Date.now() - fastStart;
+  eq(delivered, ["text", "tw"], "with a fast room, every reopen broadcast is delivered before the call resolves");
+  eq(fastElapsed < LANE_REOPEN_BROADCAST_WAIT_MS / 2, true, `a fast broadcast does not wait for the cap (took ${fastElapsed} ms)`);
+
+  // Strip // and /* */ comments (string-aware) so a commented-out or
+  // prose mention of reopenLaneChecks cannot satisfy or trip the scan.
+  function stripComments(src) {
+    let out = "";
+    let i = 0;
+    let quote = null;
+    while (i < src.length) {
+      const ch = src[i];
+      const nx = src[i + 1];
+      if (quote) {
+        out += ch;
+        if (ch === "\\") {
+          out += nx ?? "";
+          i += 2;
+          continue;
+        }
+        if (ch === quote) quote = null;
+        i++;
+        continue;
+      }
+      if (ch === "/" && nx === "/") {
+        while (i < src.length && src[i] !== "\n") i++;
+        continue;
+      }
+      if (ch === "/" && nx === "*") {
+        const end = src.indexOf("*/", i + 2);
+        i = end === -1 ? src.length : end + 2;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+      out += ch;
+      i++;
+    }
+    return out;
+  }
+  // The balanced-paren argument list starting at `open` (index of "(").
+  function argsAt(src, open) {
+    let depth = 0;
+    for (let i = open; i < src.length; i++) {
+      if (src[i] === "(") depth++;
+      else if (src[i] === ")" && --depth === 0) return src.slice(open, i + 1);
+    }
+    return src.slice(open);
+  }
+  eq(stripComments("a // reopenLaneChecks(x)\nb /* reopenLaneChecks( */ c \"//keep\""), "a \nb  c \"//keep\"", "stripComments drops comments but keeps strings");
+
+  const { readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const versesTs = stripComments(
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), "verses.ts"), "utf8"),
+  );
+  const callSites = [...versesTs.matchAll(/reopenLaneChecks\(/g)].map((m) => m.index);
+  eq(callSites.length >= 3, true, "[source] verses.ts reopens lanes on PATCH, bridge and split");
+  eq(
+    callSites.every((idx) => /await\s+$/.test(versesTs.slice(Math.max(0, idx - 20), idx))),
+    true,
+    "[source] every reopenLaneChecks call in verses.ts is awaited",
+  );
+  eq(
+    callSites.every((idx) => argsAt(versesTs, idx + "reopenLaneChecks".length).includes("executionCtx.waitUntil")),
+    true,
+    "[source] every reopenLaneChecks call in verses.ts hands its broadcasts to executionCtx.waitUntil",
+  );
+  // The verse.updated / verse.bridged / verse.split broadcast is scheduled
+  // only AFTER the awaited reopen in its route, so another tab reacting to it
+  // cannot PUT a lane check that the reopen DELETE then wipes.
+  const routeStarts = [...versesTs.matchAll(/verses\.(?:get|patch|post|put|delete)\(/g)].map((m) => m.index);
+  for (const type of ["verse.updated", "verse.bridged", "verse.split"]) {
+    // Per route that reopens lanes, its LAST broadcast of this type (the
+    // save's own; PATCH also broadcasts verse.updated earlier from its
+    // verse-0 create branch, which returns before any reopen).
+    const lastPerRoute = new Map();
+    for (const m of versesTs.matchAll(new RegExp(`type: "${type.replace(".", "\\.")}"`, "g"))) {
+      const start = Math.max(-1, ...routeStarts.filter((r) => r < m.index));
+      lastPerRoute.set(start, m.index);
+    }
+    const checked = [...lastPerRoute].map(([start, at]) => {
+      const end = routeStarts.find((r) => r > start) ?? versesTs.length;
+      return { at, reopens: callSites.filter((c) => c > start && c < end) };
+    }).filter((o) => o.reopens.length > 0);
+    eq(
+      checked.length > 0 && checked.every((o) => o.reopens.some((c) => c < o.at)),
+      true,
+      `[source] the ${type} broadcast comes after its route's awaited reopenLaneChecks`,
+    );
+  }
+  // No reopen inside a waitUntil: a waitUntil argument runs after the
+  // response, whether passed directly or wrapped in an async IIFE.
+  const waitUntilBodies = [...versesTs.matchAll(/waitUntil\(/g)].map((m) =>
+    argsAt(versesTs, m.index + "waitUntil".length),
+  );
+  eq(
+    waitUntilBodies.some((b) => b.includes("reopenLaneChecks")),
+    false,
+    "[source] no reopenLaneChecks runs inside a waitUntil (after the response)",
+  );
 }
 
 if (failed > 0) {

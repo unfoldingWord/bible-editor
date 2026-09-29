@@ -201,6 +201,78 @@ export function isSystemicMergeRefusal(
   return refusedCount >= threshold;
 }
 
+// ── Withhold reason (issue #829) ─────────────────────────────────────────────
+//
+// shouldRecordResourceSync above answers "may the watermark be stamped" —
+// this answers "if not, WHICH measured condition said no". The reimport-sync
+// step (bookReimport.ts) persists the answer (syncWithholds.ts) so a later
+// export_stale banner (exportWorkflow.ts's recordStaleSkipAlert) can name the
+// real, measured cause instead of asserting one it never checked: before this,
+// EVERY withhold — a deliberate chapters_locked hold included — got the same
+// "the pre-export sync didn't catch up; re-run the sync" remedy, which for a
+// deliberate hold is not just unmeasured but actively wrong (re-running hits
+// the same hold and changes nothing).
+//
+// Mirrors shouldRecordResourceSync's own precedence exactly, condition for
+// condition, so the two can never disagree about WHETHER to withhold — only
+// this one also says which one fired first. `systemicRefusal` /
+// `mergeRecordFailed` / `applyIncomplete` are the three conditions the
+// reimport-sync step ORs in BESIDE shouldRecordResourceSync (see its call
+// site); they are not part of `counts` because they come from different
+// measurements (isSystemicMergeRefusal, applyVerseRows) this module does not
+// own, so they are checked last, after every condition shouldRecordResourceSync
+// itself would have refused on.
+export type WithholdReason =
+  | "chapters_locked"
+  | "prune_locked"
+  | "conflict_skipped"
+  | "tombstone_blocked"
+  | "counts_incomplete"
+  | "structure_overlap"
+  | "systemic_refusal"
+  | "merge_record_failed"
+  | "apply_incomplete";
+
+export function computeWithholdReason(
+  counts: {
+    chapters_locked?: number;
+    prune_locked?: number;
+    conflict_skipped?: number;
+    tombstone_blocked?: number;
+    counts_incomplete?: boolean;
+    structure_overlap?: number;
+  },
+  idBlockedOverride: boolean = false,
+  systemicRefusal: boolean = false,
+  mergeRecordFailed: boolean = false,
+  applyIncomplete: boolean = false,
+): { reason: WithholdReason; count: number } | null {
+  if (counts.chapters_locked === undefined || counts.prune_locked === undefined) {
+    return { reason: "counts_incomplete", count: 0 };
+  }
+  if (counts.conflict_skipped === undefined || counts.tombstone_blocked === undefined) {
+    return { reason: "counts_incomplete", count: 0 };
+  }
+  if (counts.counts_incomplete === true) return { reason: "counts_incomplete", count: 0 };
+  if ((counts.structure_overlap ?? 0) > 0) {
+    return { reason: "structure_overlap", count: counts.structure_overlap ?? 0 };
+  }
+  if (counts.chapters_locked > 0) return { reason: "chapters_locked", count: counts.chapters_locked };
+  if (counts.prune_locked > 0) return { reason: "prune_locked", count: counts.prune_locked };
+  if (!idBlockedOverride && counts.conflict_skipped > 0) {
+    return { reason: "conflict_skipped", count: counts.conflict_skipped };
+  }
+  if (!idBlockedOverride && counts.tombstone_blocked > 0) {
+    return { reason: "tombstone_blocked", count: counts.tombstone_blocked };
+  }
+  // Every condition shouldRecordResourceSync itself checks is clear — fall
+  // through to the three sibling gates the call site ORs in beside it.
+  if (systemicRefusal) return { reason: "systemic_refusal", count: 0 };
+  if (mergeRecordFailed) return { reason: "merge_record_failed", count: 0 };
+  if (applyIncomplete) return { reason: "apply_incomplete", count: 0 };
+  return null;
+}
+
 // ── Kept-over-Door43 scale alarm (#540 item 2's "keep_ai_master") ───────────
 //
 // The gate above FREEZES a resource's export once refusals look systemic. This

@@ -13,6 +13,7 @@
 // reading `verses[bv][n]` directly.
 
 import type { VerseDto } from "../sync/api";
+import { highlightsFor, type HighlightKey } from "./highlight.ts";
 
 export type VerseSpan = readonly [start: number, end: number];
 
@@ -101,6 +102,20 @@ export function noteCoveredVerses(row: { verse: number; ref_raw?: string | null 
   return [...covered].sort((x, y) => x - y);
 }
 
+// Every verse any of `rows` covers, as a sorted comma-joined key ("1,2,5").
+// A string, so a caller can memo on it: the rows array is new on every note
+// edit, but the key only changes when a verse gains or loses its last row.
+export function coveredVersesKey(rows: readonly { verse: number; ref_raw?: string | null }[]): string {
+  const s = new Set<number>();
+  for (const r of rows) for (const v of noteCoveredVerses(r)) s.add(v);
+  return [...s].sort((x, y) => x - y).join(",");
+}
+
+// Inverse of coveredVersesKey.
+export function versesFromKey(key: string): Set<number> {
+  return new Set(key ? key.split(",").map(Number) : []);
+}
+
 // True when a note/question row covers any verse in the inclusive display
 // window [rangeStart, rangeEnd]. Reduces to `verse in [start,end]` for singletons.
 export function noteOverlapsRange(
@@ -133,6 +148,17 @@ export function rangeSize(dto: VerseDto): number {
 // emits these naturally but we'd be combining post-parse, so we just splice
 // them together verbatim with a separator text node. The aligner doesn't
 // care about verse boundaries inside the combined source.
+//
+// Memoized per (map identity, start, end) so a Shell re-render that rebuilds
+// the aligner props hands AlignmentPanel the SAME sourceVerse object, and its
+// parseAlignment memo + rebase effect stay put (#889). A hit also requires
+// every per-verse row to be the identical object it was built from, so a map
+// updated in place (a row replaced under the same map) can't serve stale data.
+const concatCache = new WeakMap<
+  Record<number, VerseDto>,
+  Map<string, { rows: Array<VerseDto | undefined>; out: VerseDto | null }>
+>();
+
 export function concatSourceRange(
   sourceByVerseStart: Record<number, VerseDto> | undefined,
   start: number,
@@ -143,10 +169,80 @@ export function concatSourceRange(
   if (!first) return null;
   if (start === end) return first;
 
+  const rows: Array<VerseDto | undefined> = [];
+  for (let v = start; v <= end; v++) rows.push(sourceByVerseStart[v]);
+  const key = `${start}-${end}`;
+  let byRange = concatCache.get(sourceByVerseStart);
+  const hit = byRange?.get(key);
+  if (hit && hit.rows.every((r, i) => r === rows[i])) return hit.out;
+  const out = buildSourceRange(first, rows, end);
+  if (!byRange) {
+    byRange = new Map();
+    concatCache.set(sourceByVerseStart, byRange);
+  }
+  byRange.set(key, { rows, out });
+  return out;
+}
+
+// The source (UHB/UGNT) a target ULT/UST row aligns against: the row's own
+// verse for a singleton, every verse of [verse, verse_end] joined for a bridge.
+// Reading-column views (unaligned indicators, OL-anchored highlights) go
+// through this so they judge a bridge against the same source the aligner
+// uses (#957). A singleton returns the source row object itself.
+export function sourceForTargetRow(
+  sourceByVerseStart: Record<number, VerseDto> | undefined,
+  target: VerseDto | null | undefined,
+): VerseDto | null {
+  if (!target) return null;
+  const [start, end] = verseSpan(target);
+  return concatSourceRange(sourceByVerseStart, start, end);
+}
+
+// Note-quote highlights for a ULT/UST row, OL-anchored on the source the row
+// covers. `noteVerse` is the note's own verse, where its occurrence counts.
+// For a bridged row, a note on a later verse of the span joins exactly as
+// main's rows view did: against that verse's source alone, so the milestone
+// repairs in collectMilestoneRuns apply (#957); no source for that verse means
+// nothing lights. Every other note on a bridged row joins against the start
+// verse alone, as main did, so the whole-span source only ever feeds the
+// unaligned checks. Singletons use their own verse. `fallbackSource` stands in
+// when the map has no source row.
+//
+// Known limit: a bridge numbered ACROSS the span (x-occurrence counting every
+// verse) can light the wrong copy, or none, for a note whose word also occurs
+// in an earlier bridge verse. A span-aware join is follow-up work (#968).
+export function rowHighlightsFor(
+  bibleVersion: string,
+  target: VerseDto | null | undefined,
+  quote: string | null | undefined,
+  occurrence: number | null | undefined,
+  sourceByVerseStart: Record<number, VerseDto> | undefined,
+  noteVerse: number | null | undefined,
+  partialGroups = false,
+  fallbackSource?: unknown,
+): Set<HighlightKey> {
+  if (target && isRangeRow(target)) {
+    const [start, end] = verseSpan(target);
+    if (noteVerse != null && noteVerse > start && noteVerse <= end) {
+      const own = sourceByVerseStart?.[noteVerse]?.content;
+      return own ? highlightsFor(bibleVersion, target.content, quote, occurrence, own, partialGroups) : new Set();
+    }
+    // Any other note (on the first verse, before the span, or with no verse)
+    // joins against the start verse alone, as on main.
+    return highlightsFor(bibleVersion, target.content, quote, occurrence, sourceByVerseStart?.[start]?.content ?? fallbackSource, partialGroups);
+  }
+  const spanSource = sourceForTargetRow(sourceByVerseStart, target)?.content ?? fallbackSource;
+  return highlightsFor(bibleVersion, target?.content, quote, occurrence, spanSource, partialGroups);
+}
+
+function buildSourceRange(
+  first: VerseDto,
+  rows: Array<VerseDto | undefined>,
+  end: number,
+): VerseDto | null {
   const combined: unknown[] = [];
   let lastVerseSeen: VerseDto | null = null;
-  for (let v = start; v <= end; v++) {
-    const row = sourceByVerseStart[v];
+  for (const row of rows) {
     if (!row) continue;
     lastVerseSeen = row;
     const content = row.content as { verseObjects?: unknown[] } | null;

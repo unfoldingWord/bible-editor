@@ -738,13 +738,13 @@ console.log("\n9. admin route — override scoping and mode-independence");
   // The Workflow reads `resource` (singular) to confirm single-resource scoping,
   // so both fields have to travel together.
   eq(
-    reimportWorkflowParams("2CH", ["ult"], "ult"),
-    { book: "2CH", resources: ["ult"], reimportOnly: true, allowStaleBase: true, resource: "ult" },
+    reimportWorkflowParams("2CH", ["ult"], "ult", 42),
+    { book: "2CH", resources: ["ult"], reimportOnly: true, userId: 42, allowStaleBase: true, resource: "ult" },
     "whole-book dispatch carries allowStaleBase AND the resource the Workflow gates on",
   );
   eq(
-    reimportWorkflowParams("2CH", ["ult", "ust"], undefined),
-    { book: "2CH", resources: ["ult", "ust"], reimportOnly: true },
+    reimportWorkflowParams("2CH", ["ult", "ust"], undefined, 42),
+    { book: "2CH", resources: ["ult", "ust"], reimportOnly: true, userId: 42 },
     "…and an ordinary pull is unchanged — no resource narrowing, no flag",
   );
   // The Workflow's own gate must then accept exactly this shape.
@@ -752,6 +752,18 @@ console.log("\n9. admin route — override scoping and mode-independence");
     staleBaseOverrideAllowed({ allowStaleBase: true, book: "2CH", resource: "ult" }, 1, 1, "ult"),
     true,
     "…and staleBaseOverrideAllowed honours what the dispatch sends",
+  );
+
+  // Issue #686 item 7: the whole-book dispatch is the ONLY thing that can name
+  // an operator — every cron path (05:30 export, 08:00 REIMPORT_CRON) creates
+  // this same Workflow with no `userId` at all (index.ts's `scheduled()`), so
+  // the params this function builds must always carry whatever the route
+  // resolved, including the "nobody is signed in" case some route auth shapes
+  // allow through as null.
+  eq(
+    reimportWorkflowParams("2CH", ["ult"], undefined, null),
+    { book: "2CH", resources: ["ult"], reimportOnly: true, userId: null },
+    "…and a request with no resolvable user id is sent through as null, never silently dropped",
   );
 }
 

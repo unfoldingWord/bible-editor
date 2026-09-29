@@ -49,6 +49,7 @@ import FormatListBulletedIcon from "@mui/icons-material/FormatListBulleted";
 import FormatIndentIncreaseIcon from "@mui/icons-material/FormatIndentIncrease";
 import FormatIndentDecreaseIcon from "@mui/icons-material/FormatIndentDecrease";
 import AutoFixHighOutlinedIcon from "@mui/icons-material/AutoFixHighOutlined";
+import YoutubeSearchedForIcon from "@mui/icons-material/YoutubeSearchedFor";
 import type { TnRow } from "../sync/api";
 import { isReadOnly } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
@@ -67,6 +68,9 @@ import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { parseNoteSegments, resolveNoteLinkHref } from "../lib/noteLinks";
+import type { NoteLinkTarget } from "../lib/noteLinks";
+import { NoteLinkPreview } from "./NoteLinkPreview";
+import { directionForText } from "../lib/direction";
 import {
   continueListOnEnter,
   indentLines,
@@ -229,21 +233,6 @@ function tsvToDisplay(s: string | null): string {
   return (s ?? "").replace(/\\n/g, "\n");
 }
 
-// Detect the primary script of a string for directing RTL/LTR rendering and
-// showing the translate icon. Only Hebrew (U+0590–U+05FF) is RTL; Greek is
-// LTR and is grouped with Latin for detection purposes.
-const RTL_CHAR = /[֐-׿]/;
-const LTR_CHAR = /[a-zA-ZͰ-Ͽἀ-῿]/;
-
-type QuoteScript = "empty" | "rtl" | "ltr";
-
-function detectQuoteScript(text: string): QuoteScript {
-  if (!text.trim()) return "empty";
-  if (RTL_CHAR.test(text)) return "rtl";
-  if (LTR_CHAR.test(text)) return "ltr";
-  return "empty";
-}
-
 interface SessionSnapshot {
   quote: string;
   note: string;
@@ -279,12 +268,14 @@ function buildNoteFindRegex(q: {
 function NoteBodyReadView({
   text,
   book,
+  supportRef,
   query,
   activeOccurrence,
   onActivate,
 }: {
   text: string;
   book: string;
+  supportRef: string | null;
   query: { find: string; regex: boolean; caseSensitive: boolean } | null;
   activeOccurrence: number | null;
   onActivate: () => void;
@@ -344,39 +335,39 @@ function NoteBodyReadView({
     const overlaps = range != null && seg.start < range.end && range.start < seg.end;
     if (seg.type === "link") {
       return (
-        <Box
-          component="span"
-          key={i}
-          ref={overlaps ? assignMarkRef() : undefined}
-          title={`Go to ${seg.target.book} ${seg.target.chapter}:${seg.target.verse}`}
-          onMouseDown={(e: React.MouseEvent) => {
-            // The card's own activation (Paper's onMouseDown -> onFocus, see
-            // below) fires on mousedown, before click. On an inactive card
-            // that flips `active` true and swaps this read view for the
-            // editable textarea (see `showReadView`) — unmounting this very
-            // link before its click ever fires, so navigation silently never
-            // happens. Stop it here so the card stays put and the click below
-            // still lands on a mounted element.
-            e.stopPropagation();
-          }}
-          onClick={(e: React.MouseEvent) => {
-            // Don't also let this bubble into the outer Box's onActivate —
-            // clicking a link navigates away, it doesn't mean "start editing".
-            e.stopPropagation();
-            location.hash = `#/${seg.target.book}/${seg.target.chapter}/${seg.target.verse}`;
-          }}
-          sx={{
-            color: "primary.main",
-            textDecoration: "underline",
-            textDecorationStyle: "dotted",
-            textUnderlineOffset: "2px",
-            cursor: "pointer",
-            "&:hover": { textDecorationStyle: "solid" },
-            ...(overlaps ? markSx : null),
-          }}
-        >
-          {seg.text}
-        </Box>
+        <NoteLinkPreview key={i} target={seg.target} supportRef={supportRef}>
+          <Box
+            component="span"
+            ref={overlaps ? assignMarkRef() : undefined}
+            onMouseDown={(e: React.MouseEvent) => {
+              // The card's own activation (Paper's onMouseDown -> onFocus, see
+              // below) fires on mousedown, before click. On an inactive card
+              // that flips `active` true and swaps this read view for the
+              // editable textarea (see `showReadView`) — unmounting this very
+              // link before its click ever fires, so navigation silently never
+              // happens. Stop it here so the card stays put and the click below
+              // still lands on a mounted element.
+              e.stopPropagation();
+            }}
+            onClick={(e: React.MouseEvent) => {
+              // Don't also let this bubble into the outer Box's onActivate —
+              // clicking a link navigates away, it doesn't mean "start editing".
+              e.stopPropagation();
+              location.hash = `#/${seg.target.book}/${seg.target.chapter}/${seg.target.verse}`;
+            }}
+            sx={{
+              color: "primary.main",
+              textDecoration: "underline",
+              textDecorationStyle: "dotted",
+              textUnderlineOffset: "2px",
+              cursor: "pointer",
+              "&:hover": { textDecorationStyle: "solid" },
+              ...(overlaps ? markSx : null),
+            }}
+          >
+            {seg.text}
+          </Box>
+        </NoteLinkPreview>
       );
     }
     if (!overlaps) return <span key={i}>{seg.text}</span>;
@@ -458,10 +449,12 @@ function NoteBodyReadView({
 function NoteBodyMarkdownView({
   text,
   book,
+  supportRef,
   onActivate,
 }: {
   text: string;
   book: string;
+  supportRef: string | null;
   onActivate: () => void;
 }) {
   const LinkComponent = useMemo(() => {
@@ -470,25 +463,26 @@ function NoteBodyMarkdownView({
       const target = resolveNoteLinkHref(href, book);
       if (target) {
         return (
-          <Box
-            component="span"
-            title={`Go to ${target.book} ${target.chapter}:${target.verse}`}
-            onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
-            onClick={(e: React.MouseEvent) => {
-              e.stopPropagation();
-              location.hash = `#/${target.book}/${target.chapter}/${target.verse}`;
-            }}
-            sx={{
-              color: "primary.main",
-              textDecoration: "underline",
-              textDecorationStyle: "dotted",
-              textUnderlineOffset: "2px",
-              cursor: "pointer",
-              "&:hover": { textDecorationStyle: "solid" },
-            }}
-          >
-            {children}
-          </Box>
+          <NoteLinkPreview target={target} supportRef={supportRef}>
+            <Box
+              component="span"
+              onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
+              onClick={(e: React.MouseEvent) => {
+                e.stopPropagation();
+                location.hash = `#/${target.book}/${target.chapter}/${target.verse}`;
+              }}
+              sx={{
+                color: "primary.main",
+                textDecoration: "underline",
+                textDecorationStyle: "dotted",
+                textUnderlineOffset: "2px",
+                cursor: "pointer",
+                "&:hover": { textDecorationStyle: "solid" },
+              }}
+            >
+              {children}
+            </Box>
+          </NoteLinkPreview>
         );
       }
       // Anything else (rc:// / ta man links, a relative path that isn't one
@@ -510,7 +504,7 @@ function NoteBodyMarkdownView({
       return <>{children}</>;
     }
     return NoteMdLink;
-  }, [book]);
+  }, [book, supportRef]);
 
   return (
     <Box
@@ -712,6 +706,22 @@ function NoteCardInner({
     ta.setSelectionRange(sel.start, sel.end);
   }, [note]);
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
+  // "See how" link targets in the body, one per distinct verse. Clicking the
+  // card to read it switches the body to the editor, where the links (and
+  // their hover preview) are gone; the footer's look-back icon keeps the
+  // preview reachable while editing.
+  const seeHowTargets = useMemo(() => {
+    const seen = new Set<string>();
+    const out: NoteLinkTarget[] = [];
+    for (const seg of parseNoteSegments(note, row.book)) {
+      if (seg.type !== "link") continue;
+      const key = `${seg.target.book}/${seg.target.chapter}/${seg.target.verse}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(seg.target);
+    }
+    return out;
+  }, [note, row.book]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [aiConfirmOpen, setAiConfirmOpen] = useState(false);
   // Open when a save would blank out a previously-substantive note; see the
@@ -1150,6 +1160,12 @@ function NoteCardInner({
   useEffect(() => {
     return () => {
       if (!wasActiveRef.current) return;
+      // Deliberately reads the LIVE ref value at cleanup time, not a snapshot
+      // from setup — see the comment above: ResourceColumn updates
+      // activeLocRef during ITS render, before this cleanup can run, and that
+      // latest value (not the one captured when this effect was set up) is
+      // what "did the user actually leave this row's verse" has to check.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
       if (!hasLeftNoteTarget(rowAtUnmountRef.current, activeLocRef.current)) return;
       discardIfAbandonedStubRef.current();
     };
@@ -1204,7 +1220,7 @@ function NoteCardInner({
 
   const aiPrereqsMet = !!supportRef && quote.trim().length > 0;
 
-  const quoteScript = detectQuoteScript(quote);
+  const quoteScript = directionForText(quote);
   const showTranslateIcon = quoteScript === "ltr" && !readOnly && !!onTranslateQuote;
 
   const handleTranslateQuote = () => {
@@ -1965,12 +1981,14 @@ function NoteCardInner({
           <NoteBodyMarkdownView
             text={note}
             book={row.book}
+            supportRef={supportRef}
             onActivate={() => setEditingBody(true)}
           />
         ) : showReadView ? (
           <NoteBodyReadView
             text={note}
             book={row.book}
+            supportRef={supportRef}
             query={findQuery}
             activeOccurrence={activeMatchOccurrence}
             onActivate={() => setEditingBody(true)}
@@ -2181,6 +2199,29 @@ function NoteCardInner({
             />
           </span>
         </Tooltip>
+        {seeHowTargets.map((t) => (
+          <NoteLinkPreview key={`${t.book}/${t.chapter}/${t.verse}`} target={t} supportRef={supportRef}>
+            <IconButton
+              size="small"
+              aria-label={`Look back at ${t.book} ${t.chapter}:${t.verse}`}
+              // preventDefault too: a button takes focus on mousedown, and
+              // Paper's onFocus would activate this card (and its verse) on
+              // the way to navigating somewhere else. Same trap as the
+              // preview toggle above.
+              onMouseDown={(e: React.MouseEvent) => {
+                e.preventDefault();
+                e.stopPropagation();
+              }}
+              onClick={(e: React.MouseEvent) => {
+                e.stopPropagation();
+                location.hash = `#/${t.book}/${t.chapter}/${t.verse}`;
+              }}
+              sx={{ p: 0.25, color: "primary.main" }}
+            >
+              <YoutubeSearchedForIcon sx={{ fontSize: 18 }} />
+            </IconButton>
+          </NoteLinkPreview>
+        ))}
 
         <Box sx={{ flex: 1 }} />
 

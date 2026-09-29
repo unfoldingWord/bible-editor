@@ -67,7 +67,6 @@ import {
   completeHumanRefEvidenceTouches,
   type ClassifiedCommit,
   type HumanRefEvidence,
-  type MasterCommit,
   type MasterLineageSummary,
 } from "./masterLineage.ts";
 import { readLedgerMasterLineage } from "./masterLineageLedger.ts";
@@ -101,6 +100,7 @@ import {
   isReimportableRow,
   computeEditedFieldMerge,
   isReissuedTombstone,
+  AI_SOURCE,
 } from "./reimportClassify";
 import {
   classifyTsvRefMove,
@@ -113,7 +113,13 @@ import {
   type TsvRefSide,
   type TsvEditLogEntry,
 } from "./tsvMerge.ts";
-import { shouldRecordResourceSync, isSystemicMergeRefusal, isKeptOverDoor43AtScale } from "./reimportSyncGate";
+import {
+  shouldRecordResourceSync,
+  isSystemicMergeRefusal,
+  isKeptOverDoor43AtScale,
+  computeWithholdReason,
+} from "./reimportSyncGate";
+import { recordSyncWithhold, clearSyncWithhold } from "./syncWithholds";
 import { evaluateStaleBaseReplacement, type StaleBaseHold } from "./staleBaseGate";
 import { recordStaleBaseHold, raiseStaleBaseHoldAlert, clearStaleBaseHold } from "./staleBaseHolds";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
@@ -176,6 +182,7 @@ import {
   verseVersionFloorSql,
 } from "./verseBridge.ts";
 import { isAboveBoundary, planStructure, structureKey, type StructureAdoption, type StructuralEdit } from "./verseStructure.ts";
+import { effectiveBookLock } from "./bookLock.ts";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
 
@@ -842,8 +849,13 @@ export const softDeleteRemovedTsvRowsForTest = (
   // verified-complete widened-coverage case AND the unverified conservative
   // fallback case against the REAL function — see softDeleteRemovedTsvRows.
   verifiedComplete: boolean,
+  // Issue #832: the (book, kind) merge-ancestor cutoff, so the test can drive
+  // both the "already exported" and "not yet exported" AI-only-row cases
+  // against the REAL function. Required (no default) so a test can't
+  // silently fall back to "never confirmed" without saying so.
+  cutoff: MergeCutoff | null,
 ): Promise<{ deleted: number; skippedLocked: number }> =>
-  softDeleteRemovedTsvRows(env, book, kind, rawTsv, candidateChapters, verifiedComplete);
+  softDeleteRemovedTsvRows(env, book, kind, rawTsv, candidateChapters, verifiedComplete, cutoff);
 // tombstoneSweep.test.mjs (issue #427 option 3): same rationale as the alias
 // above — lets the test drive the REAL sweepObsoleteTombstones (hard-delete +
 // gated audit row) against the real SQL instead of proving only that SQLite
@@ -1465,7 +1477,10 @@ async function runReimport(
     const current = resource === "ult" || resource === "ust"
       ? await getMasterConfirmedAt(env, book, resource, true)
       : cutoff;
-    return { ...current, lineage };
+    // #1005: our newer, not-yet-confirmed publish, when the lineage shows it
+    // landed. Reads nothing unless the lineage could let it matter.
+    const unconfirmedPublish = await loadUnconfirmedPublishVerses(env, book, resource, lineage);
+    return { ...current, lineage, unconfirmedPublish };
   };
 
   const masterConfirmedAtUlt = await withLineage(
@@ -1612,11 +1627,27 @@ async function runReimport(
     tq: tqVerifiedComplete,
     twl: twlVerifiedComplete,
   };
+  // Issue #832: the same merge-ancestor cutoffs already hoisted above for
+  // applyTsvRows' three-way merge, reused here so the prune can tell whether
+  // an AI-only row's newest edit has actually reached a confirmed export yet.
+  const tsvCutoffByKind: Record<TsvKind, MergeCutoff | null> = {
+    tn: masterConfirmedAtTn,
+    tq: masterConfirmedAtTq,
+    twl: masterConfirmedAtTwl,
+  };
   for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
     const raw = tsvRawByKind[kind];
     if (!want.has(kind) || !raw) continue;
     try {
-      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chapters, tsvVerifiedByKind[kind]);
+      const res = await softDeleteRemovedTsvRows(
+        env,
+        book,
+        kind,
+        raw,
+        chapters,
+        tsvVerifiedByKind[kind],
+        tsvCutoffByKind[kind],
+      );
       perResource[kind].deleted += res.deleted;
       perResource[kind].skipped_locked += res.skippedLocked;
     } catch (e) {
@@ -1655,8 +1686,8 @@ interface ParsedTsvRow {
   id: string;
   // True when `id` is NOT master's literal ID — parseTsvRow rewrote a malformed
   // one through coerceRowId (rowId.ts). Issue #427: this must suppress the
-  // tombstone/conflict *blocked* counters. coerceRowId hashes into a 96-ID
-  // space, so two different malformed master IDs can legitimately land on the
+  // tombstone/conflict *blocked* counters. coerceRowId is a hash, so two
+  // different malformed master IDs can (rarely, since #428) land on the
   // same coerced value, and a coerced ID can land on an unrelated tombstone.
   // Neither is "master reissued this ID to a different row" — the coerced ID was
   // never the row's identity in the first place, so the reissue inference is
@@ -1971,7 +2002,7 @@ export async function applyTsvRows(
           });
         } else if (row.idCoerced) {
           // The (book, id) slot is taken, but this id is OURS — coerceRowId
-          // rewrote a malformed master id into a 96-id space, so a collision
+          // hashed a malformed master id into a new one, so a collision
           // here says nothing about master reissuing anything. Documented-benign
           // no-op (see ParsedTsvRow.idCoerced); count it as a duplicate, never as
           // a blocked drop, or a coercion collision would freeze the export.
@@ -2022,8 +2053,8 @@ export async function applyTsvRows(
         // different row, and master is authoritative for a row it still carries
         // — so RECLAIM the slot (batched below) instead of dropping it.
         // `!row.idCoerced` first: for a coerced id the "master reissued this id
-        // to a different row" inference is meaningless — the id is ours, hashed
-        // into a 96-id space, so landing on an unrelated tombstone at a
+        // to a different row" inference is meaningless — the id is ours, derived
+        // from a hash, so landing on an unrelated tombstone at a
         // different reference is an expected collision, not evidence master
         // moved anything. Reclaiming (or counting it blocked) would either
         // corrupt an unrelated row or freeze the export over a documented-benign
@@ -2385,6 +2416,28 @@ export async function applyTsvRows(
       // blocked from 2026-08-17). See classifyTsvRefMove.
       const refBase = bases.get(row.id)?.ref ?? null;
       const refMove = classifyTsvRefMove(cur, row, refBase, protectedRow);
+      // #547 item 1 (attempted, then reverted — PR #854 multi-model review,
+      // 2026-09-21): classifyTsvRefMove is a single-snapshot ancestor compare
+      // and cannot see master moving away from the ancestor and back to it
+      // within one watermark window (a maintainer's 1:2 -> 1:6 -> 1:2 leaves
+      // master's CURRENT ref_raw equal to the ancestor's, so this still reads
+      // as a pure `ours_moved` app-side move). An escalation keyed on
+      // completeHumanRefEvidenceTouches(cutoff?.lineage, refBase.chapter,
+      // refBase.verse) was tried here, but that evidence is VERSE-scoped, not
+      // ROW-scoped: refsTouchedInTsv (masterLineage.ts) maps a human commit's
+      // diff to every TSV line's Reference column with no id filter, so it
+      // fires just as reliably when a Door43 editor touches a DIFFERENT
+      // row/note that happens to share this row's ancestor verse — routine
+      // for tn/tq, which carry several rows per verse. That escalation would
+      // falsely hold THIS row's legitimate app-side move every night the
+      // unrelated neighbor stays in the lineage window — the same livelock
+      // shape as the AMO tq incident this classifier exists to prevent (#540
+      // item 3), just relocated. A correct fix needs per-row lineage evidence
+      // (the id each human commit's diff actually touched, not merely the
+      // ref), which the current evidence-gathering pipeline does not carry —
+      // a deliberate addition to shared, persisted lineage infrastructure,
+      // not a safe change to make here. Left as an open follow-up on #547
+      // item 1; do not reintroduce a ref-level-only escalation.
       // Do the two sides actually hold the same reference? Asked separately from
       // the attribution above, and with the protection argument forced off, so the
       // answer is a measurement even for a protected row (see the stale-flag clear
@@ -2427,6 +2480,15 @@ export async function applyTsvRows(
         // only from its damage. Capped: while one held row keeps the resource
         // stuck, every other moved row in the book would otherwise log nightly.
         if (counts.ref_moved_ours < REF_MOVE_LOG_CAP) {
+          // `possibleMasterActivityAtAncestorRef`: best-effort visibility only
+          // (see the comment above classifyTsvRefMove's call) — VERSE-scoped
+          // evidence, not proof this row's own history has an intermediate
+          // move. Never used to change the outcome.
+          const possibleMasterActivityAtAncestorRef =
+            refBase != null &&
+            Number.isInteger(refBase.chapter) &&
+            Number.isInteger(refBase.verse) &&
+            completeHumanRefEvidenceTouches(cutoff?.lineage, refBase.chapter as number, refBase.verse as number);
           console.log("reimport: reference move attributed to the app; publishing it", {
             book,
             kind,
@@ -2434,6 +2496,7 @@ export async function applyTsvRows(
             ours: `${cur.chapter}:${cur.verse} ${(cur.ref_raw as string | null) ?? ""}`,
             theirs: `${row.chapter}:${row.verse} ${row.refRaw ?? ""}`,
             base: refBase,
+            possibleMasterActivityAtAncestorRef,
           });
         }
         // Clear a flag a previous run raised by mis-attributing this same move —
@@ -4068,6 +4131,160 @@ interface MergeCutoff {
    * pass it to that helper. See masterLineage.ts.
    */
   lineage?: MasterLineageSummary | null;
+  /**
+   * Issue #1005: our LAST pushed render, when it is newer than the confirmed
+   * boundary above (the watermark lags it). Hash-verified against
+   * pushed_blob_sha and tied to the PR recorded for that exact render. Used
+   * ONLY to widen #788's "no app edit since export" condition — see
+   * d1MatchesShippedUnconfirmedPublish. Absent/null means not proven.
+   */
+  unconfirmedPublish?: UnconfirmedPublishVerses | null;
+}
+
+// Issue #1005. `confirmedAt` / `editId` are the confirmed boundary this render
+// was measured as NEWER than; a cutoff with a different boundary must ignore it.
+interface UnconfirmedPublishVerses {
+  confirmedAt: number | null;
+  editId: number | null;
+  prNumber: number;
+  verses: Map<string, { contentJson: string; verseEnd: number | null }>;
+}
+
+// Issue #1005: the "no app edit since export" condition of #788's cosmetic
+// adoption is bounded by master_confirmed_at, which can lag one publish behind:
+// our newest render merged, and a human commit landed on top of it before any
+// sync could positively confirm it. An app edit between the two publishes then
+// reads as "unpublished" although master already holds it. This answers the
+// condition's actual question — "does D1 hold anything master does not?" — from
+// that newer publish instead, and only when ALL of these hold:
+//   * the render is hash-verified and newer than this cutoff's boundary
+//     (loadUnconfirmedPublishVerses);
+//   * a COMPLETE lineage walk lists that render's own PR among its `ours`
+//     commits, i.e. it demonstrably landed on master inside the window;
+//   * D1's current verse equals that render's verse, byte-for-byte or through
+//     the real export renderer (same grouping).
+// Anything absent, stale or mismatched returns false: the existing
+// merge_cosmetic_ignored path is the fail-closed default. This never replaces
+// the watermark check; the caller consults it only when that check failed.
+function d1MatchesShippedUnconfirmedPublish(
+  book: string,
+  bibleVersion: string,
+  cutoff: MergeCutoff | null | undefined,
+  ex: { content_json: string; verse_end?: number | null },
+  v: VerseExtract,
+): boolean {
+  const pub = cutoff?.unconfirmedPublish;
+  if (cutoff == null || pub == null) return false;
+  if (pub.confirmedAt !== cutoff.confirmedAt || pub.editId !== cutoff.editId) return false;
+  const lineage = cutoff.lineage;
+  if (
+    lineage == null ||
+    lineage.incomplete !== false ||
+    !Array.isArray(lineage.oursPrNumbers) ||
+    !lineage.oursPrNumbers.includes(pub.prNumber)
+  ) return false;
+  const shipped = pub.verses.get(`${v.chapter}:${v.verse}`);
+  if (shipped == null || (shipped.verseEnd ?? null) !== (ex.verse_end ?? null)) return false;
+  if (shipped.contentJson === ex.content_json) return true;
+  const ours = exportRenderForVerse(book, bibleVersion, v, ex.content_json);
+  const published = exportRenderForVerse(book, bibleVersion, v, shipped.contentJson);
+  return ours !== null && published !== null && ours === published;
+}
+
+// Issue #1005: loads our last pushed render's verses when it is a publish the
+// merge boundary has not caught up to. Gated first on the lineage (no complete
+// human-ref evidence, or our PR not among `ours`, means the widening can never
+// fire, so nothing is read). The bytes must hash to pushed_blob_sha, exactly as
+// the export's revert-report base requires (readVerifiedPushedRenderText).
+async function loadUnconfirmedPublishVerses(
+  env: Env,
+  book: string,
+  resource: Resource,
+  lineage: MasterLineageSummary | null | undefined,
+): Promise<UnconfirmedPublishVerses | null> {
+  if (resource !== "ult" && resource !== "ust") return null;
+  if (
+    lineage == null ||
+    lineage.incomplete !== false ||
+    lineage.refsComplete !== true ||
+    !Array.isArray(lineage.oursPrNumbers) ||
+    lineage.oursPrNumbers.length === 0
+  ) return null;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT master_confirmed_at, master_confirmed_edit_id, pushed_blob_sha, pushed_read_at,
+              pushed_r2_key, pushed_pr_number, pushed_pr_read_at
+         FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource)
+      .first<{
+        master_confirmed_at: number | null;
+        master_confirmed_edit_id: number | null;
+        pushed_blob_sha: string | null;
+        pushed_read_at: number | null;
+        pushed_r2_key: string | null;
+        pushed_pr_number: number | null;
+        pushed_pr_read_at: number | null;
+      }>();
+    if (
+      row == null ||
+      row.master_confirmed_at == null ||
+      row.pushed_blob_sha == null ||
+      row.pushed_read_at == null ||
+      row.pushed_read_at <= row.master_confirmed_at ||
+      // The PR on the row counts only when it belongs to THIS render (same
+      // pairing rule as accountOwnPublishDecline).
+      row.pushed_pr_number == null ||
+      row.pushed_pr_read_at !== row.pushed_read_at ||
+      !lineage.oursPrNumbers.includes(row.pushed_pr_number)
+    ) return null;
+    const raw = await readVerifiedPushedRenderText(env, book, resource, row.pushed_r2_key, row.pushed_blob_sha);
+    if (raw == null) return null;
+    const verses = new Map<string, { contentJson: string; verseEnd: number | null }>();
+    for (const verse of extractVersesForRange(raw, 0, 999)) {
+      verses.set(`${verse.chapter}:${verse.verse}`, { contentJson: verse.contentJson, verseEnd: verse.verseEnd ?? null });
+    }
+    if (verses.size === 0) return null;
+    return {
+      confirmedAt: row.master_confirmed_at,
+      editId: row.master_confirmed_edit_id,
+      prNumber: row.pushed_pr_number,
+      verses,
+    };
+  } catch (e) {
+    console.error("reimport: unconfirmed-publish render unavailable — #1005 widening disabled for this run", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return null;
+  }
+}
+
+// Issue #1005 staging form: Maps do not survive JSON, so the nightly path stages
+// this as plain objects beside #790's confirmed bases and revives it per chunk.
+function serializeUnconfirmedPublish(p: UnconfirmedPublishVerses): unknown {
+  return { confirmedAt: p.confirmedAt, editId: p.editId, prNumber: p.prNumber, verses: Object.fromEntries(p.verses) };
+}
+
+function reviveUnconfirmedPublish(raw: unknown): UnconfirmedPublishVerses | null {
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const p = raw as { confirmedAt?: unknown; editId?: unknown; prNumber?: unknown; verses?: unknown };
+  if (typeof p.confirmedAt !== "number" && p.confirmedAt !== null) return null;
+  if (typeof p.editId !== "number" && p.editId !== null) return null;
+  if (typeof p.prNumber !== "number" || !Number.isSafeInteger(p.prNumber) || p.prNumber <= 0) return null;
+  if (p.verses == null || typeof p.verses !== "object" || Array.isArray(p.verses)) return null;
+  const verses = new Map<string, { contentJson: string; verseEnd: number | null }>();
+  for (const [key, value] of Object.entries(p.verses as Record<string, unknown>)) {
+    if (value == null || typeof value !== "object") continue;
+    const { contentJson, verseEnd } = value as { contentJson?: unknown; verseEnd?: unknown };
+    if (typeof contentJson !== "string") continue;
+    if (typeof verseEnd !== "number" && verseEnd !== null) continue;
+    verses.set(key, { contentJson, verseEnd });
+  }
+  return verses.size > 0
+    ? { confirmedAt: p.confirmedAt as number | null, editId: p.editId as number | null, prNumber: p.prNumber, verses }
+    : null;
 }
 
 // Issue #788: stableKey intentionally treats whitespace-only content changes as
@@ -4112,6 +4329,49 @@ async function readPushedBlobText(env: Env, repo: string, sha: string): Promise<
   }
 }
 
+// The exact bytes of the render book_resource_syncs says we last pushed: the
+// R2 copy (#790) first, Door43's blob by sha when that key is missing. Also
+// the base for the export-revert report's three-way diff (#870). null when
+// neither is readable; callers fail open on that.
+export async function readPushedRenderText(
+  env: Env,
+  book: string,
+  resource: Resource,
+  r2Key: string | null,
+  blobSha: string | null,
+): Promise<string | null> {
+  let raw = r2Key ? await readStaged(env, r2Key) : null;
+  if (raw == null && blobSha) {
+    const file = dcsResourceFile(book, resource);
+    raw = file ? await readPushedBlobText(env, file.repo, blobSha) : null;
+  }
+  return raw;
+}
+
+// readPushedRenderText, but only bytes that hash to `blobSha`. The R2 key is
+// per-instance and a step.do retry can rewrite it after recordPushedRender
+// stored the sha, so the key alone does not prove it holds the render the sha
+// describes; on a mismatch Door43 still serves the exact blob by sha. null
+// when neither source yields the measured bytes. Shared by the export's
+// revert-report base (#870) and the #1005 cosmetic-adoption widening.
+export async function readVerifiedPushedRenderText(
+  env: Env,
+  book: string,
+  resource: Resource,
+  r2Key: string | null,
+  blobSha: string | null,
+): Promise<string | null> {
+  if (blobSha == null) return null;
+  const raw = await readPushedRenderText(env, book, resource, r2Key, blobSha);
+  if (raw != null && (await gitBlobShaOrNull(raw)) === blobSha) return raw;
+  if (raw != null && r2Key != null) {
+    console.warn(`R2 last-publish render for ${book} ${resource} does not hash to pushed_blob_sha; trying Door43`);
+    const fromDcs = await readPushedRenderText(env, book, resource, null, blobSha);
+    if (fromDcs != null && (await gitBlobShaOrNull(fromDcs)) === blobSha) return fromDcs;
+  }
+  return null;
+}
+
 async function confirmedVerseBases(
   env: Env,
   book: string,
@@ -4132,11 +4392,7 @@ async function confirmedVerseBases(
     row.pushed_blob_sha == null
   ) return null;
 
-  let raw = row.pushed_r2_key ? await readStaged(env, row.pushed_r2_key) : null;
-  if (raw == null) {
-    const file = dcsResourceFile(book, resource);
-    raw = file ? await readPushedBlobText(env, file.repo, row.pushed_blob_sha) : null;
-  }
+  const raw = await readPushedRenderText(env, book, resource, row.pushed_r2_key, row.pushed_blob_sha);
   if (raw == null) return null;
   try {
     const bases = new Map<string, string>();
@@ -4319,7 +4575,17 @@ async function loadMasterLineage(
       const asOfSha = classified[0]?.sha ?? null;
       await persistMasterLineage(env, book, resource, summary, asOfSha, confirmedEditId, confirmedAt);
       if (resource === "tn" || resource === "tq" || resource === "twl") {
-        const cleared = await clearResolvedMergeNoBase(env, book, resource, confirmedAt, ledgerPage, file, asOfSha);
+        const cleared = await clearResolvedMergeNoBase(
+          env,
+          book,
+          resource,
+          confirmedAt,
+          ledgerPage,
+          file,
+          asOfSha,
+          null,
+          repoHead,
+        );
         if (stats) stats.noBaseCleared += cleared;
       }
       return summary;
@@ -4681,13 +4947,21 @@ const MINT_LOOKUP_BATCH = 90;
 // caller does one unconditional `walk = await this(...)`, exactly the shape
 // it already relied on before this existed. See its call site's comment for
 // what the ledger buys and what it still cannot prove.
+//
+// Returns the repo head the ledger read was validated against alongside the
+// page (#853/#867 reconciliation): a page this function builds from the
+// ledger is repo-scoped exactly like the reused `walked` parameter can be, so
+// the caller needs the same `ledgerRepoHead` signal to route it through the
+// #861 fixes (classification trust, walkTip/tipNow scope) instead of the
+// live/path-scoped handling. Null means "this call fell back to a live,
+// path-scoped fetch" — never a ledger-sourced page paired with a missing head.
 async function masterCommitsSinceViaLedgerOrLive(
   env: Env,
   file: { repo: string; path: string },
   windowStart: number,
   book: string,
   kind: TsvKind,
-): Promise<MasterCommitPage> {
+): Promise<{ page: MasterCommitPage; ledgerRepoHead: string | null }> {
   try {
     // Timeout required, not opt-in (review finding on #853): this sweep shares
     // its Workflow step's runtime budget across up to NO_BASE_SWEEP_MAX_PAIRS
@@ -4699,7 +4973,10 @@ async function masterCommitsSinceViaLedgerOrLive(
     const ledger = await readLedgerMasterLineage(env.DB, file.repo, file.path, windowStart, repoHead);
     if (ledger.usable && ledger.lineage) {
       console.log("reimport merge_no_base clear: walk source", { book, kind, source: "ledger" });
-      return { commits: ledger.lineage.commits, incomplete: false, incompleteReason: "" };
+      return {
+        page: { commits: ledger.lineage.commits, incomplete: false, incompleteReason: "" },
+        ledgerRepoHead: repoHead,
+      };
     }
     console.log("reimport merge_no_base clear: ledger unavailable for walk; using live walk", {
       book,
@@ -4715,34 +4992,8 @@ async function masterCommitsSinceViaLedgerOrLive(
       error: error instanceof Error ? error.message : String(error),
     });
   }
-  return listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: windowStart });
-}
-
-// A page from masterCommitsSinceViaLedgerOrLive can be EITHER source, and the
-// two disagree about merge-commit wrappers. A live listMasterCommitsSince page
-// is always raw MasterCommits that classifyMasterCommit has never seen — that
-// classifier has no merge-wrapper unwrapping (that logic lives only in
-// classifyForLedger, dcsCommitPoll.ts), which is fine for path-scoped history
-// because Gitea's path-scoped simplification mostly drops merge commits
-// already. A ledger-sourced page is REPO-scoped and DOES carry merge
-// wrappers (~26% of history per classifyForLedger's own doc), pre-classified
-// by classifyForLedger and stored as each row's `kind`/`reason`
-// (masterLineageLedger.ts's classifyStored). Blindly re-running
-// classifyMasterCommit on an already-classified commit throws that stored
-// verdict away and re-derives one with the wrong classifier — a bot-authored
-// `Merge pull request 'AI UST for EZK 39 …'`, stored `ai`, comes back `human`
-// (classifyMasterCommit has no OURS_PREFIX/AI_PIPELINE match for a "Merge
-// pull request …" subject), which blocks a #683 sweep clear the ledger path
-// was supposed to make cheaper, not more conservative than the live walk it
-// replaces. Fails safe (a wrongly-`human` commit only keeps a flag standing,
-// never clears one it shouldn't), but defeats the point of using the ledger
-// here. So: keep a commit's own kind/reason when its page already computed
-// one, and classify only the ones that did not (found 2026-09-21 review).
-function classifyOrKeep(c: MasterCommit): ClassifiedCommit {
-  const maybe = c as Partial<ClassifiedCommit>;
-  return typeof maybe.kind === "string" && typeof maybe.reason === "string"
-    ? (maybe as ClassifiedCommit)
-    : classifyMasterCommit(c);
+  const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: windowStart });
+  return { page, ledgerRepoHead: null };
 }
 
 async function clearResolvedMergeNoBase(
@@ -4764,6 +5015,17 @@ async function clearResolvedMergeNoBase(
   // from, and under what proof. See NoBaseFallbackWindow. Absent (the visited
   // path) leaves this function's behavior byte-for-byte what #665 shipped.
   fallback: NoBaseFallbackWindow | null = null,
+  // Issue #861: non-null ONLY when `walked` came from readLedgerMasterLineage
+  // (repo-scoped Gitea history, which — unlike the path-scoped history
+  // listMasterCommitsSince fetches — includes Gitea merge-wrapper commits).
+  // `walked.commits[0]?.sha` can then be a merge sha that path-scoped history
+  // never shows at all (see masterLineage.ts note 4), so comparing it against
+  // a path-scoped recheck spuriously reads as "master moved" every time. The
+  // caller already fetched this exact sha to validate the ledger read
+  // (readLedgerMasterLineage requires it to equal dcs_repo_polls.last_sha), so
+  // passing it through costs nothing extra and lets both halves of the
+  // walk/recheck comparison stay in the same (repo-scoped) history.
+  ledgerRepoHead: string | null = null,
 ): Promise<number> {
   try {
     const rs = await env.DB.prepare(
@@ -4839,8 +5101,12 @@ async function clearResolvedMergeNoBase(
     // learn master's current tip for this file, and that is the memo key for
     // both the read below and any write later. It is a single subrequest, taken
     // only when a pair actually has candidates, and it buys the right to skip
-    // the up-to-5-page walk entirely on a memo hit.
-    let tip = masterSha;
+    // the up-to-5-page walk entirely on a memo hit. Prefer `ledgerRepoHead`
+    // over `masterSha` when both are available: `masterSha` on the ledger path
+    // is the ledger's own repo-scoped file sha (issue #861 — same scope
+    // mismatch as `walkTip`/`tipNow` below), while `ledgerRepoHead` is the
+    // repo head the caller already validated the ledger read against.
+    let tip = ledgerRepoHead ?? masterSha;
     if (tip == null && candidates.length > 0) {
       const probe = await listMasterCommitsSince(env, file.repo, file.path, null, {
         sinceTime: Math.min(...candidates.map((c) => c.since)),
@@ -4891,6 +5157,16 @@ async function clearResolvedMergeNoBase(
     // `windowStart` — and a recheck bounded by `windowStart` would then see an
     // empty page and read "no commits" as "the tip moved".
     let walkSince = walkStart ?? windowStart;
+    // Whether `walk`, AS ACTUALLY USED BELOW, is the repo-scoped ledger page —
+    // not merely whether the caller passed one. The branch just below can
+    // replace `walk` with a fresh fetch even when `walked` was ledger-sourced
+    // (a flag whose own window starts earlier than the ledger read's
+    // confirmedAt bound); that fresh fetch can ITSELF be ledger-sourced too
+    // (masterCommitsSinceViaLedgerOrLive tries the ledger first), so this is
+    // reassigned from what that call actually returns, not forced to false —
+    // otherwise the #861 fixes below would silently stop applying to the one
+    // caller (the #683 sweep) that always takes this branch.
+    let ledgerSourcedWalk = ledgerRepoHead != null;
     if (walk == null || walkStart == null || walkStart > windowStart) {
       // Ledger-first, live-fallback (#691) — the exact pattern already proven
       // for the mint gate in loadMasterLineage, above. readLedgerMasterLineage
@@ -4904,8 +5180,11 @@ async function clearResolvedMergeNoBase(
       // NoBaseFallbackWindow's comment for the honest limit: neither this nor
       // the live walk can see a PLAIN late push (author and committer date
       // both unmoved).
-      walk = await masterCommitsSinceViaLedgerOrLive(env, file, windowStart, book, kind);
+      const fetched = await masterCommitsSinceViaLedgerOrLive(env, file, windowStart, book, kind);
+      walk = fetched.page;
       walkSince = windowStart;
+      ledgerSourcedWalk = fetched.ledgerRepoHead != null;
+      ledgerRepoHead = fetched.ledgerRepoHead;
     }
     // A blocked outcome is recorded on the rows themselves, keyed by master's
     // tip, so tonight's answer is not re-bought tomorrow for an unchanged file.
@@ -4952,7 +5231,24 @@ async function clearResolvedMergeNoBase(
       await memoBlocked(`incomplete:${walk.incompleteReason}`);
       return 0;
     }
-    const humans = walk.commits.map(classifyOrKeep).filter((c) => c.kind === "human");
+    // #861 (found while fixing the walkTip/tipNow scope mismatch below): a
+    // ledger-sourced walk's commits are ALREADY classified — correctly, via
+    // classifyForLedger, which unwraps a Gitea merge-wrapper subject
+    // ("Merge pull request 'bible-editor: …' from … into master") before
+    // testing it — and stored as such in dcs_commits.classification. Re-running
+    // plain classifyMasterCommit on it (as this line did) reclassifies from the
+    // WRAPPER subject alone, which OURS_PREFIX never matches, so the routine
+    // "our own nightly export merge" commit that is the whole reason #861 exists
+    // fails safe to `human` here and blocks the clear before it ever reaches the
+    // walkTip/tipNow comparison — the same fail-safe direction as everywhere
+    // else in this function, just one check too early. loadMasterLineage's own
+    // ledger branch (a few dozen lines above this function, same file) already
+    // gets this right — `classified.filter((c) => c.kind === "human")`, no
+    // reclassification — so a live/path-scoped walk (which per masterLineage.ts
+    // note 4 never contains a merge-wrapper commit at all) is the only case
+    // that needs classifyMasterCommit run fresh.
+    const humans = (ledgerSourcedWalk ? (walk.commits as ClassifiedCommit[]) : walk.commits.map(classifyMasterCommit))
+      .filter((c) => c.kind === "human");
     if (humans.length > 0) {
       console.log("reimport merge_no_base clear: skipped, a human commit is in the window", {
         book,
@@ -5045,22 +5341,50 @@ async function clearResolvedMergeNoBase(
     //     revisit's own gate already tries first; a PLAIN late push — author
     //     AND committer date both unmoved — is invisible to both, exactly as
     //     for every other walk here (issue #691).
-    const walkTip = walk.commits[0]?.sha ?? null;
-    const recheck = await listMasterCommitsSince(env, file.repo, file.path, null, {
-      sinceTime: walkSince,
-      // Only the newest commit is needed, so this never pays the 5-page budget.
-      pageLimit: 1,
-    });
-    if (recheck.commits.length === 0 && recheck.incomplete) {
-      console.log("reimport merge_no_base clear: skipped, master tip could not be re-read before the write", {
-        book,
-        kind,
-        flagged,
-        reason: recheck.incompleteReason,
+    //
+    // #861: when `walk` is the repo-scoped ledger page, `walk.commits[0]?.sha`
+    // can be a Gitea merge-wrapper commit — exactly the shape our own nightly
+    // export merges take (see masterLineage.ts note 4) — which path-scoped
+    // history (what listMasterCommitsSince fetches) never shows at all. That
+    // made this recheck compare two shas from different Gitea history scopes
+    // and spuriously read "master moved" on the common case of a window whose
+    // newest relevant activity is one of our own merges. So when the walk is
+    // ledger-sourced, keep BOTH sides of the comparison in that same
+    // repo-scoped history: walkTip is the repo head the caller already proved
+    // the ledger read against, and the recheck re-probes that same repo head
+    // live rather than asking path-scoped history for a sha it may not carry.
+    let walkTip: string | null;
+    let tipNow: string | null;
+    if (ledgerSourcedWalk) {
+      walkTip = ledgerRepoHead;
+      tipNow = await repoHeadCommitSha(env, file.repo);
+      if (tipNow == null) {
+        console.log("reimport merge_no_base clear: skipped, master tip could not be re-read before the write", {
+          book,
+          kind,
+          flagged,
+          reason: "repo_head_unavailable",
+        });
+        return 0;
+      }
+    } else {
+      walkTip = walk.commits[0]?.sha ?? null;
+      const recheck = await listMasterCommitsSince(env, file.repo, file.path, null, {
+        sinceTime: walkSince,
+        // Only the newest commit is needed, so this never pays the 5-page budget.
+        pageLimit: 1,
       });
-      return 0;
+      if (recheck.commits.length === 0 && recheck.incomplete) {
+        console.log("reimport merge_no_base clear: skipped, master tip could not be re-read before the write", {
+          book,
+          kind,
+          flagged,
+          reason: recheck.incompleteReason,
+        });
+        return 0;
+      }
+      tipNow = recheck.commits[0]?.sha ?? null;
     }
-    const tipNow = recheck.commits[0]?.sha ?? null;
     if (tipNow !== walkTip) {
       console.log("reimport merge_no_base clear: skipped, master moved between the walk and the write", {
         book,
@@ -5092,7 +5416,15 @@ async function clearResolvedMergeNoBase(
     // — the two ancestor folds take create/update/restore, the verse fold adds
     // baseline — so an audit row can never be mistaken for row content.
     const kindCounts = { ours: 0, ai: 0, human: 0 };
-    for (const c of walk.commits.map(classifyOrKeep)) kindCounts[c.kind]++;
+    // #861: same reclassification hazard as the `humans` filter above — a
+    // ledger-sourced walk's commits are ALREADY correctly classified (via
+    // classifyForLedger's merge-wrapper unwrap), so re-running plain
+    // classifyMasterCommit on them here would count our own nightly export
+    // merge as `human` and stamp this audit row's evidence with a human commit
+    // the decision above deliberately did not see. Trust the stored
+    // classification for a ledger-sourced walk, exactly as the filter does.
+    for (const c of ledgerSourcedWalk ? (walk.commits as ClassifiedCommit[]) : walk.commits.map(classifyMasterCommit))
+      kindCounts[c.kind]++;
     const evidence = {
       window_start: windowStart,
       walked_sha: tip,
@@ -5184,7 +5516,9 @@ export const clearResolvedMergeNoBaseForTest = (
   file: { repo: string; path: string },
   masterSha: string | null = null,
   fallback: NoBaseFallbackWindow | null = null,
-): Promise<number> => clearResolvedMergeNoBase(env, book, kind, walkStart, walked, file, masterSha, fallback);
+  ledgerRepoHead: string | null = null,
+): Promise<number> =>
+  clearResolvedMergeNoBase(env, book, kind, walkStart, walked, file, masterSha, fallback, ledgerRepoHead);
 
 // How many (book, kind) pairs one sweep will hand to the clear. THE BUDGET
 // GUARANTEE, and the reason the sweep can be unconditional. Measured cost of one
@@ -6043,6 +6377,14 @@ async function applyVerseRows(
   // pre-fix "no watermark row" behavior, never treated as "nothing changed".
   const resource = bibleVersion.toLowerCase();
   const lastExportAt = cutoff?.confirmedAt ?? null;
+  // Door43 master is authoritative for a locked book (verseMerge.ts step 3b).
+  // Read here, just before the row read below, not carried on the cutoff: the
+  // cutoff can be minutes old in the chunked nightly, and a lock or unlock in
+  // between must be honored. An app edit after the row read is caught by the
+  // adoption's version CAS. Not caught: a failed read fails this apply like
+  // the row read would, so the Workflow step retries instead of the run
+  // quietly merging a locked book as unlocked and stamping the watermark.
+  const bookLocked = lastExportAt != null && (await effectiveBookLock(env, book)) != null;
   // P1.3: precise id boundary when present; both sub-selects swap to it together.
   const masterEditId = cutoff?.editId ?? null;
 
@@ -6218,6 +6560,10 @@ async function applyVerseRows(
     // reopen: the adoption write sets content_json, plain_text AND verse_end, so
     // all three have to be compared before it can be called a no-op (issue #539).
     beforeVerseEnd: number | null;
+    // Master's content as it arrived, before step 6 canonizes `v.contentJson`
+    // in place. The no-op guard needs it to tell a mark-order-only difference
+    // (issue #977) from a source fix that canonize folded back.
+    rawMasterContentJson: string;
   }> = [];
   // Issue #609 (review F6): the `chapter:verse` refs whose write this run
   // suppressed as a normalized no-op. The user-triggered path reports the COUNT in
@@ -6612,6 +6958,7 @@ async function applyVerseRows(
           ),
           // Issue #728: set only for the anchor of a bridge master has split.
           theirsForAlignment: structureAlignmentTheirs.get(structureKey(v.chapter, v.verse)),
+          masterAuthoritative: bookLocked,
         });
         mergeAction = merge.action;
         // Issue #728: an anchor the content merge did NOT adopt — step 7s decides
@@ -6704,12 +7051,33 @@ async function applyVerseRows(
         // and the grouping is exactly unchanged. This preserves a maintainer's
         // intentional punctuation/spacing bytes without opening a generic
         // cosmetic-write lane that would churn checkoffs or race a translator.
-        const cosmeticHumanAdopt =
+        //
+        // Issue #1005: "no human app edit after the export boundary" is answered
+        // by the master_confirmed_at probe first, as before. Only when that probe
+        // found an edit AND everything else already holds is it asked again of
+        // our newer, not-yet-confirmed publish: if master demonstrably merged it
+        // and D1 still equals it at this verse, the edit the probe saw already
+        // shipped, and D1 holds nothing master lacks.
+        const cosmeticHumanCandidate =
           merge.action === "keep_converged" &&
           ex.content_json !== v.contentJson &&
           (ex.verse_end ?? null) === (v.verseEnd ?? null) &&
-          Number(ex.human_edit_after_export ?? 0) === 0 &&
           hasCompleteHumanRefEvidenceForVerse(cutoff?.lineage, v.chapter, v.verse, v.verseEnd);
+        const noEditSinceConfirmed = Number(ex.human_edit_after_export ?? 0) === 0;
+        const editAlreadyShipped =
+          cosmeticHumanCandidate &&
+          !noEditSinceConfirmed &&
+          d1MatchesShippedUnconfirmedPublish(book, bibleVersion, cutoff, ex, v);
+        if (editAlreadyShipped) {
+          console.log("reimport cosmetic_human: app edit after the lagging watermark was already shipped in our unconfirmed publish", {
+            book,
+            resource: bibleVersion,
+            ref: `${v.chapter}:${v.verse}`,
+            prNumber: cutoff?.unconfirmedPublish?.prNumber ?? null,
+            version: ex.version,
+          });
+        }
+        const cosmeticHumanAdopt = cosmeticHumanCandidate && (noEditSinceConfirmed || editAlreadyShipped);
         if (merge.action === "keep_converged" && ex.content_json !== v.contentJson && !cosmeticHumanAdopt) {
           counts.merge_cosmetic_ignored++;
         }
@@ -6755,6 +7123,7 @@ async function applyVerseRows(
             beforeContentJson: ex.content_json,
             beforePlainText: ex.plain_text,
             beforeVerseEnd: ex.verse_end ?? null,
+            rawMasterContentJson: v.contentJson,
           });
           continue;
         }
@@ -7195,13 +7564,23 @@ async function applyVerseRows(
   //     bytes.
   if (masterAdoptions.length > 0) {
     const noopVerses = new Set<string>();
+    // Issue #977: no-op verses where master, as it arrived, differs from D1 only
+    // in Hebrew combining-mark order (master NFC, D1 the UHB order canonize
+    // stores). That is not the folded-back source fix described below: D1
+    // already holds exactly the bytes canonize makes of master, and master
+    // carries no other change, so there is nothing for a human to see.
+    const markOrderOnly = new Set<string>();
     for (const a of masterAdoptions) {
       if (
         a.v.contentJson === a.beforeContentJson &&
         (a.plainText ?? null) === (a.beforePlainText ?? null) &&
         (a.v.verseEnd ?? null) === (a.beforeVerseEnd ?? null)
       ) {
-        noopVerses.add(`${a.v.chapter}:${a.v.verse}`);
+        const key = `${a.v.chapter}:${a.v.verse}`;
+        noopVerses.add(key);
+        if (verseContentConverged(a.rawMasterContentJson.normalize("NFC"), a.beforeContentJson.normalize("NFC"))) {
+          markOrderOnly.add(key);
+        }
       }
     }
     if (noopVerses.size > 0) {
@@ -7237,7 +7616,7 @@ async function applyVerseRows(
       for (let i = mergeConflicts.length - 1; i >= 0; i--) {
         const mc = mergeConflicts[i];
         if (!mc.adopted || !noopVerses.has(`${mc.chapter}:${mc.verse}`)) continue;
-        if (mc.action === "adopt") {
+        if (mc.action === "adopt" || markOrderOnly.has(`${mc.chapter}:${mc.verse}`)) {
           mergeConflicts.splice(i, 1);
         } else {
           mc.adopted = false;
@@ -7727,8 +8106,18 @@ async function applyVerseRows(
   // structure_absorbed_human_edit pointer is an adopt_conflict like any other:
   // left unconfirmed, a previously resolved row on that verse kept its stale
   // resolved_at and the banner (resolved_at IS NULL) never showed the pointer.
+  //
+  // Only THIS run's own adopt_conflict (after the 6a refinement) may reactivate
+  // a resolved row, because only it is a new overwrite a human must look at.
+  // The upsert keeps a stored adopt_conflict's action when tonight's outcome is
+  // a clean adopt or adopt_no_visible_change, so confirming those reactivated a
+  // row a human had already resolved, with its old recovery pointer, and
+  // re-raised the alert every night Door43 touched the verse again: a locked
+  // book's `book_locked` adoptions, and markers-only changes such as restored
+  // `\ts\*` (ZEC 1:17 ULT, 2026-09-24). A new row needs no confirm; it is
+  // inserted unresolved.
   const confirmRefs = mergeConflicts
-    .filter((mc) => mc.adopted && adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
+    .filter((mc) => mc.adopted && mc.action === "adopt_conflict" && adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
     .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
   if (confirmRefs.length > 0) {
     await confirmAdoptedConflicts(env, book, resource, confirmRefs);
@@ -9247,6 +9636,24 @@ export async function changedTsvChapters(
 // updated_by → NULL reclaims the tombstone to reimport-owned. The id
 // comparison is against the WHOLE file's id set so a row the update path just
 // moved to another chapter isn't mistaken for removed.
+// Issue #832: has an AI-only row's newest content edit actually reached a
+// CONFIRMED export yet? Mirrors the id/timestamp fallback applyVerseRows'
+// baseBoundary already uses for the verse three-way merge: the precise
+// edit_log id boundary (0050's master_confirmed_edit_id) when available,
+// else the coarser confirmedAt timestamp. `cutoff` null (this (book, resource)
+// has never been positively confirmed on master at all) and the row's latest
+// edit landing AFTER whichever boundary IS available both mean "D1 holds
+// content master has not had the chance to see yet" — must NOT be pruned.
+function aiRowContentIsExported(
+  cutoff: MergeCutoff | null,
+  latestEditId: number | null,
+  latestEditCreatedAt: number | null,
+): boolean {
+  if (cutoff == null || cutoff.confirmedAt == null) return false;
+  if (cutoff.editId != null) return latestEditId != null && latestEditId <= cutoff.editId;
+  return latestEditCreatedAt != null && latestEditCreatedAt < cutoff.confirmedAt;
+}
+
 async function softDeleteRemovedTsvRows(
   env: Env,
   book: string,
@@ -9259,6 +9666,12 @@ async function softDeleteRemovedTsvRows(
   // without it, tsvFetchLooksTruncated's loss-percentage heuristic alone is not
   // enough to trust "absent from the body" as "master emptied this chapter".
   verifiedComplete: boolean,
+  // Issue #832: this (book, kind)'s merge-ancestor cutoff (getMasterConfirmedAt),
+  // the same one applyTsvRows uses for the three-way edited-row merge. Used
+  // ONLY to gate pruning an AI-only row (see aiRowContentIsExported below) — a
+  // pristine row was never written by anything this run needs to protect, so
+  // it prunes exactly as before regardless of `cutoff`.
+  cutoff: MergeCutoff | null,
 ): Promise<{ deleted: number; skippedLocked: number }> {
   const incomingIds = new Set<string>();
   const coveredChapters = new Set<number>();
@@ -9357,15 +9770,32 @@ async function softDeleteRemovedTsvRows(
                  WHERE kind = ?3 AND row_key = ${kind}_rows.id
                    AND (book = ?1 OR book IS NULL)
                    AND action IN ('create', 'update')
-                 ORDER BY id DESC LIMIT 1) AS latest_source
+                 ORDER BY id DESC LIMIT 1) AS latest_source,
+              (SELECT id FROM edit_log
+                 WHERE kind = ?3 AND row_key = ${kind}_rows.id
+                   AND (book = ?1 OR book IS NULL)
+                   AND action IN ('create', 'update')
+                 ORDER BY id DESC LIMIT 1) AS latest_edit_id,
+              (SELECT created_at FROM edit_log
+                 WHERE kind = ?3 AND row_key = ${kind}_rows.id
+                   AND (book = ?1 OR book IS NULL)
+                   AND action IN ('create', 'update')
+                 ORDER BY id DESC LIMIT 1) AS latest_edit_created_at
          FROM ${kind}_rows WHERE book = ?1 AND chapter = ?2 AND ${selectProtections}`,
     )
       .bind(book, ch, kind)
-      .all<{ id: string; version: number; updated_by: number | null; latest_source: string | null }>();
-    const targets = (rs.results ?? []).filter(
-      (r) =>
-        !incomingIds.has(r.id) &&
-        isReimportableRow({
+      .all<{
+        id: string;
+        version: number;
+        updated_by: number | null;
+        latest_source: string | null;
+        latest_edit_id: number | null;
+        latest_edit_created_at: number | null;
+      }>();
+    const targets = (rs.results ?? []).filter((r) => {
+      if (incomingIds.has(r.id)) return false;
+      if (
+        !isReimportableRow({
           updated_by: r.updated_by,
           latestSource: r.latest_source ?? null,
           deleted_at: null,
@@ -9373,15 +9803,25 @@ async function softDeleteRemovedTsvRows(
           preserve: 0,
           hint: 0,
           kind,
-        }),
-    );
+        })
+      )
+        return false;
+      // Issue #832: an AI-only row (pristine rows have nothing pending) is
+      // prunable only once ITS own newest content edit has reached a
+      // confirmed export — otherwise this would delete content master has
+      // never had the chance to see.
+      if (r.latest_source === AI_SOURCE) {
+        return aiRowContentIsExported(cutoff, r.latest_edit_id, r.latest_edit_created_at);
+      }
+      return true;
+    });
     for (const t of targets) {
       // updated_by → NULL reclaims the tombstone to reimport-owned; version-CAS
       // (?4) + the re-asserted protections abort if a human touched the row
       // between the SELECT and here (bumps version → 0 rows changed).
-      // #686: sync_prune. This function has no lineage in scope (it is not
-      // handed a MergeCutoff — see the caller chain) and does not thread one
-      // through solely to name an author here, so DOOR43_ACTOR_UNMEASURED.
+      // #686: sync_prune. `cutoff` (issue #832) only gates AI-only eligibility
+      // above — it carries no per-row lineage/author signal, so there is still
+      // nothing here to name an author from, hence DOOR43_ACTOR_UNMEASURED.
       const upd = await env.DB.prepare(
         `UPDATE ${kind}_rows
             SET deleted_at = ?1, updated_by = NULL, version = version + 1, updated_at = ?1, ${provenanceSet(5)}
@@ -9898,14 +10338,20 @@ async function planAndStageBookResources(
       // exact confirmed render once now, then stage only its compact verse map
       // for all later chunk steps.
       const confirmed = await getMasterConfirmedAt(env, book, resource, true);
-      if (confirmed.confirmedVerseBases?.size) {
+      // #1005: our newer, not-yet-confirmed publish rides the same staged
+      // object (reviveUnconfirmedPublish on the chunk side). Mutually exclusive
+      // with the #790 bases in practice: those need the pushed render to BE
+      // the confirmed one, this needs it to be newer.
+      const unconfirmedPublish = await loadUnconfirmedPublishVerses(env, book, resource, lineage);
+      if (confirmed.confirmedVerseBases?.size || unconfirmedPublish) {
         confirmedBaseR2Key = `reimport-stage/${instanceId}/${book}/${resource}-confirmed-bases`;
         await env.BLOBS.put(
           confirmedBaseR2Key,
           JSON.stringify({
             confirmedAt: confirmed.confirmedAt,
             editId: confirmed.editId,
-            bases: Object.fromEntries(confirmed.confirmedVerseBases),
+            bases: Object.fromEntries(confirmed.confirmedVerseBases ?? new Map()),
+            ...(unconfirmedPublish ? { unconfirmedPublish: serializeUnconfirmedPublish(unconfirmedPublish) } : {}),
           }),
           { httpMetadata: { contentType: "application/json" } },
         );
@@ -9934,7 +10380,8 @@ function confirmedBasesForCutoff(
   stagedBase: { confirmedAt: number | null; editId: number | null; bases: Map<string, string> } | undefined,
   cutoff: { confirmedAt: number | null; editId: number | null },
 ): Map<string, string> | null {
-  return stagedBase && stagedBase.confirmedAt === cutoff.confirmedAt && stagedBase.editId === cutoff.editId
+  return stagedBase && stagedBase.bases.size > 0 &&
+      stagedBase.confirmedAt === cutoff.confirmedAt && stagedBase.editId === cutoff.editId
     ? stagedBase.bases
     : null;
 }
@@ -9969,13 +10416,17 @@ async function reimportStagedChunk(
     editId: number | null;
     bases: Map<string, string>;
   }>> = {};
+  // #1005: staged beside the #790 bases; gated per cutoff in withLineage below.
+  const unconfirmedPublishByResource: Partial<Record<"ult" | "ust", UnconfirmedPublishVerses>> = {};
   for (const resource of ["ult", "ust"] as const) {
     const key = staged.find((e) => e.resource === resource)?.confirmedBaseR2Key;
     if (!key) continue;
     const json = await readStaged(env, key);
     if (json == null) continue;
     try {
-      const parsed = JSON.parse(json) as { confirmedAt?: unknown; editId?: unknown; bases?: unknown };
+      const parsed = JSON.parse(json) as { confirmedAt?: unknown; editId?: unknown; bases?: unknown; unconfirmedPublish?: unknown };
+      const unconfirmed = reviveUnconfirmedPublish(parsed.unconfirmedPublish);
+      if (unconfirmed) unconfirmedPublishByResource[resource] = unconfirmed;
       if ((typeof parsed.confirmedAt !== "number" && parsed.confirmedAt !== null) ||
           (typeof parsed.editId !== "number" && parsed.editId !== null) ||
           parsed.bases == null || typeof parsed.bases !== "object" || Array.isArray(parsed.bases)) continue;
@@ -10051,6 +10502,10 @@ async function reimportStagedChunk(
           lineage: lineageOf(resource),
           confirmedVerseBases: resource === "ult" || resource === "ust"
             ? confirmedBasesForCutoff(confirmedBasesByResource[resource], cutoff)
+            : undefined,
+          // d1MatchesShippedUnconfirmedPublish re-checks the boundary match.
+          unconfirmedPublish: resource === "ult" || resource === "ust"
+            ? unconfirmedPublishByResource[resource] ?? null
             : undefined,
         };
 
@@ -10164,11 +10619,19 @@ export async function runChunkedReimport(
   // gate decides at STAGING time (it is what withholds the file from the chunk
   // steps in the first place), so a sync-step-only override would leave D1
   // un-updated while stamping the watermark — the worst of both.
+  // `userId` — issue #686 item 7: attributed to the operator who dispatched
+  // this run (admin.ts's `reimportWorkflowParams`, whole-book "Pull from
+  // Door43"), null/undefined on every cron path. Threaded only into the
+  // edit_log `user_id` column via reimportStagedChunk — it never reaches a
+  // row's own `updated_by`/pristine columns (sync writes clear or leave those
+  // alone regardless of who triggered the run), so this cannot affect
+  // isPristineTsv or any pristine-write predicate.
   opts: {
     chunk?: number;
     mergeRefusalOverrideResource?: Resource;
     idBlockedOverrideResource?: Resource;
     staleBaseOverrideResource?: Resource;
+    userId?: number | null;
   } = {},
 ): Promise<ReimportResult> {
   const chunkSize = opts.chunk ?? REIMPORT_CHAPTER_CHUNK;
@@ -10321,7 +10784,7 @@ export async function runChunkedReimport(
     const counts = await step.do(
       `reimport-${book}-ch${start}-${end}`,
       { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, null),
+      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, opts.userId ?? null),
     );
     mergePerResource(perResource, counts);
   }
@@ -10359,7 +10822,13 @@ export async function runChunkedReimport(
     const res = await step.do(`reimport-prune-${book}-${kind}`, async () => {
       const raw = await readStaged(env, r2Key);
       if (raw == null) return { deleted: 0, skippedLocked: 0 };
-      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs, verifiedComplete);
+      // Issue #832: this step runs after the chunk-apply steps above (which
+      // hoist their own cutoff inside reimportStagedChunk's separate call), so
+      // it re-reads the same (book, kind) merge-ancestor cutoff here rather
+      // than threading one through every chunk — one extra read per changed
+      // TSV kind, not per chapter.
+      const cutoff = await getMasterConfirmedAt(env, book, kind);
+      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs, verifiedComplete, cutoff);
       if (res.deleted > 0 || res.skippedLocked > 0) {
         console.log("reimport pruned rows removed on master", { book, resource: kind, ...res });
       }
@@ -10512,6 +10981,17 @@ export async function runChunkedReimport(
       const idBlockedOverride = opts.idBlockedOverrideResource === e.resource;
       const dropped =
         (perResource[e.resource].conflict_skipped ?? 0) + (perResource[e.resource].tombstone_blocked ?? 0);
+      // Issue #829: same four conditions as the `if` below, computed as WHICH
+      // one fired rather than just whether one did — see computeWithholdReason's
+      // doc for why this mirrors, rather than replaces, the gate immediately
+      // after it.
+      const withholdReason = computeWithholdReason(
+        perResource[e.resource],
+        idBlockedOverride,
+        systemicRefusals,
+        mergeRecordFailed,
+        applyIncomplete,
+      );
       if (
         !shouldRecordResourceSync(perResource[e.resource], idBlockedOverride) ||
         systemicRefusals ||
@@ -10531,11 +11011,29 @@ export async function runChunkedReimport(
         // has something to refuse against. No-op when a real (or previously
         // withheld) row already exists — see recordWithheldSyncIfAbsent.
         await recordWithheldSyncIfAbsent(env, book, e.resource);
+        // Issue #829: persist WHY, so recordStaleSkipAlert can name the real
+        // cause instead of guessing. withholdReason is always non-null here —
+        // it mirrors the `if` above exactly — but a defensive fallback keeps
+        // this write from ever asserting a cause it didn't measure.
+        await recordSyncWithhold(
+          env,
+          book,
+          e.resource,
+          withholdReason?.reason ?? "counts_incomplete",
+          withholdReason?.count ?? 0,
+          alertObservedAt,
+          instanceId,
+        );
         continue;
       }
       if (!e.masterSha) continue;
       await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");
       recorded++;
+      // This pair just reached a clean stamp, so it was NOT withheld above —
+      // release any reason left over from a past run (issue #829). `instanceId`
+      // guards the delete against an overlapping older run's clear stomping on
+      // a newer run's already-recorded reason — see clearSyncWithhold's doc.
+      await clearSyncWithhold(env, book, e.resource, instanceId);
       // Issue #473 option A: the override let a nonzero drop count through to
       // a recorded sync above — raise the distinct "force-released, Door43
       // will lose these rows" alert instead of clearing it. Ordered AFTER

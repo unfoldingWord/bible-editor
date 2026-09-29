@@ -29,6 +29,14 @@ import {
   normalizeWordPunctuation,
   splitGluedAlignmentWords,
 } from "../api/src/importParsers.ts";
+// Issue #686 item 5: a direct-SQL repair must not leave a row claiming its
+// PREVIOUS provenance (e.g. still reading as a Door43-pristine or in-app
+// human edit after a script rewrote its content_json). Same vocabulary
+// scan-tn-quotes.mjs / scan-source-occurrences.mjs use for this class of fix
+// (issue #768): action 'update', source 'system', actor named for the script.
+import { PROVENANCE_COLUMNS, provenanceValues } from "../api/src/rowProvenance.ts";
+
+const PROVENANCE = provenanceValues({ action: "update", source: "system", actor: "normalize-verse-punctuation" });
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -74,6 +82,9 @@ const q = (v) => {
   return `'${String(v).replace(/'/g, "''")}'`;
 };
 
+// Constant across every repaired row, so build the SET/VALUES fragments once.
+const PROVENANCE_SET_SQL = PROVENANCE_COLUMNS.map((col, i) => `${col} = ${q(PROVENANCE[i])}`).join(", ");
+
 const updates = [];
 let scanned = 0;
 let changed = 0;
@@ -98,8 +109,18 @@ for (const row of rows) {
   const newContent = { ...parsedContent, verseObjects: after };
   const newPlain = extractPlainText(newContent);
   updates.push(
-    `UPDATE verses SET content_json = ${q(JSON.stringify(newContent))}, plain_text = ${q(newPlain)} WHERE book = ${q(book)} AND chapter = ${q(chapter)} AND verse = ${q(verse)} AND bible_version = ${q(bible_version)};`,
+    `UPDATE verses SET content_json = ${q(JSON.stringify(newContent))}, plain_text = ${q(newPlain)}, ${PROVENANCE_SET_SQL} WHERE book = ${q(book)} AND chapter = ${q(chapter)} AND verse = ${q(verse)} AND bible_version = ${q(bible_version)};`,
   );
+  // Deliberately NO edit_log row (codex review on PR #784). Both history
+  // readers (verses.ts, rows.ts) filter `new_version IS NOT NULL`, and this
+  // script does not bump `version` (see the header comment on why: avoiding
+  // spurious 409s for concurrent translators). Unlike import-book.mjs's and
+  // reimport-ust-from-dcs.mjs's fresh inserts — which pair a real version-1
+  // edit_log row — an edit_log row for THIS repair would carry
+  // `new_version = NULL` (there is no new version; the row already exists)
+  // and would be silently invisible to the history dialog: dead data
+  // claiming to be an audit trail. The provenance stamp above is the real,
+  // durable trace of this repair.
 }
 
 const lines = [];

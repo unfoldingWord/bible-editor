@@ -16,6 +16,7 @@ import {
   describePublishedDrift,
   lockOverrideAllowed,
   autoMergeConfirmationRequired,
+  DcsReleaseListSchema,
 } from "./publishedGuard.ts";
 
 function assert(cond, msg) {
@@ -27,19 +28,20 @@ function assert(cond, msg) {
 }
 
 // --- PUBLISHED_BOOKS composition ---
-const UNPUBLISHED = ["NUM", "1CH", "2CH", "ECC", "ISA", "JER", "EZK", "DAN", "AMO", "ZEC"];
+const UNPUBLISHED = ["NUM", "1CH", "2CH", "ECC", "ISA", "JER", "EZK"];
 
-assert(PUBLISHED_BOOKS.size === 56, `PUBLISHED_BOOKS has 56 books (got ${PUBLISHED_BOOKS.size})`);
+assert(PUBLISHED_BOOKS.size === 59, `PUBLISHED_BOOKS has 59 books (got ${PUBLISHED_BOOKS.size})`);
 for (const book of UNPUBLISHED) {
   assert(!PUBLISHED_BOOKS.has(book), `${book} is absent from PUBLISHED_BOOKS (unpublished)`);
 }
-assert(PUBLISHED_BOOKS.size + UNPUBLISHED.length === 66, "56 published + 10 unpublished === 66");
+assert(PUBLISHED_BOOKS.size + UNPUBLISHED.length === 66, "59 published + 7 unpublished === 66");
 
 // --- isPublishedBook ---
 assert(isPublishedBook("gen"), "isPublishedBook is case-insensitive (lowercase)");
 assert(isPublishedBook("Gen"), "isPublishedBook is case-insensitive (mixed case)");
 assert(isPublishedBook("GEN"), "isPublishedBook true for GEN");
-assert(!isPublishedBook("ZEC"), "isPublishedBook false for unpublished ZEC");
+assert(!isPublishedBook("EZK"), "isPublishedBook false for unpublished EZK");
+assert(isPublishedBook("ZEC"), "isPublishedBook true for ZEC (added at v91)");
 assert(!isPublishedBook("XYZ"), "isPublishedBook false for unknown code");
 
 // --- pickLatestStableRelease ---
@@ -187,7 +189,7 @@ assert(
     drift.noLongerPublished.length === 1 && drift.noLongerPublished[0] === "EXO",
     "reports the no-longer-published book",
   );
-  assert(drift.message.includes("v90"), "message names the release tag");
+  assert(drift.message.includes("v91"), "message names the release tag");
   assert(drift.message.includes("ISA") && drift.message.includes("EXO"), "message names the differing books");
 }
 
@@ -257,6 +259,34 @@ assert(
   autoMergeConfirmationRequired({ allowLocked: true, branchName: "MIC-be-x" }, true) === false,
   "this predicate only checks presence, not content, of branchName — a -be- name is rejected earlier " +
     "by exportBranchOverrideValid in the route, before autoMergeConfirmationRequired ever runs",
+);
+
+// --- DcsReleaseListSchema (issue #841) ---
+// Every DcsRelease field is already read defensively by pickLatestStableRelease
+// et al. (missing/malformed fields sort as "not stable"/oldest), so what this
+// schema exists to catch is the one thing nothing downstream checks: that DCS
+// actually returned an array at all.
+assert(
+  DcsReleaseListSchema.safeParse([
+    { tag_name: "v90", draft: false, prerelease: false, target_commitish: "release_v90" },
+  ]).success,
+  "a normal releases array parses",
+);
+assert(
+  DcsReleaseListSchema.safeParse([]).success,
+  "an empty releases array parses",
+);
+assert(
+  DcsReleaseListSchema.safeParse([{}]).success,
+  "a release object with every field absent still parses — each field is optional, matching how pickLatestStableRelease already reads them",
+);
+assert(
+  !DcsReleaseListSchema.safeParse({ message: "Not Found" }).success,
+  "a non-array body (e.g. a DCS error object) is rejected up front, instead of reaching fetchDcsReleases' callers as DcsRelease[]",
+);
+assert(
+  !DcsReleaseListSchema.safeParse(null).success,
+  "a null body is rejected",
 );
 
 console.log("publishedGuard: all assertions passed");

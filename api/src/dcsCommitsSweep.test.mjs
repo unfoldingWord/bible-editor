@@ -12,7 +12,11 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DCS_COMMITS_SWEEP_SQL, DCS_COMMITS_RETENTION_SECONDS } from "./dcsCommitsSweep.ts";
+import {
+  DCS_COMMITS_SWEEP_SQL,
+  DCS_COMMITS_SWEEP_COVERAGE_SQL,
+  DCS_COMMITS_RETENTION_SECONDS,
+} from "./dcsCommitsSweep.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -48,6 +52,20 @@ function sweep(d, cutoff) {
   d.prepare(DCS_COMMITS_SWEEP_SQL).run(cutoff);
 }
 
+function pollRow(d, { repo, coverageSince = null }) {
+  d.prepare(
+    `INSERT INTO dcs_repo_polls (repo, coverage_since) VALUES (?, ?)`,
+  ).run(repo, coverageSince);
+}
+
+function coverageSince(d, repo) {
+  return d.prepare(`SELECT coverage_since FROM dcs_repo_polls WHERE repo = ?`).get(repo).coverage_since;
+}
+
+function raiseCoverage(d, cutoff) {
+  d.prepare(DCS_COMMITS_SWEEP_COVERAGE_SQL).run(cutoff);
+}
+
 console.log("\n[rows older than the cutoff are swept, newer rows survive]");
 {
   const d = freshDb();
@@ -73,6 +91,58 @@ console.log("\n[the exported retention constant matches the ~18-month figure the
 {
   const eighteenMonthsish = 548 * 86400;
   assert(DCS_COMMITS_RETENTION_SECONDS === eighteenMonthsish, "DCS_COMMITS_RETENTION_SECONDS is 548 days in seconds");
+}
+
+console.log("\n[a coverage floor older than the cutoff is raised to the cutoff, matching what the sweep deleted]");
+{
+  const d = freshDb();
+  pollRow(d, { repo: "en_tn", coverageSince: 1000 });
+  raiseCoverage(d, 5000);
+  assert(coverageSince(d, "en_tn") === 5000, "coverage_since moves up to the sweep's own cutoff");
+}
+
+console.log("\n[a coverage floor already at or after the cutoff is left untouched]");
+{
+  const d = freshDb();
+  pollRow(d, { repo: "en_tn", coverageSince: 5000 });
+  raiseCoverage(d, 5000);
+  assert(coverageSince(d, "en_tn") === 5000, "a floor already at the cutoff is not disturbed");
+
+  pollRow(d, { repo: "en_ust", coverageSince: 9000 });
+  raiseCoverage(d, 5000);
+  assert(coverageSince(d, "en_ust") === 9000, "a floor newer than the cutoff is never pushed backwards");
+}
+
+console.log("\n[a repo with no proven coverage floor gets none invented]");
+{
+  const d = freshDb();
+  pollRow(d, { repo: "en_tw", coverageSince: null });
+  raiseCoverage(d, 5000);
+  assert(coverageSince(d, "en_tw") === null, "NULL coverage_since stays NULL — the sweep never proves coverage on its own");
+}
+
+console.log("\n[a stalled-boundary repo whose old rows age out is no longer readable as complete]");
+{
+  // Regression for the bug this pairing fixes: without the coverage raise, a
+  // repo whose bootstrap floor predates the retention window would keep
+  // passing `confirmedAt >= coverage_since` even after the rows proving that
+  // window were deleted, so a stale export watermark's lineage read would
+  // silently report a truncated window as complete instead of falling back
+  // to the live walk.
+  const d = freshDb();
+  pollRow(d, { repo: "en_ult", coverageSince: 100 });
+  commitRow(d, { repo: "en_ult", sha: "old_human", committedAt: 200, seenAt: 200, classification: "human" });
+  commitRow(d, { repo: "en_ult", sha: "new_ai", committedAt: 9000, seenAt: 9000, classification: "ai" });
+  const cutoff = 5000;
+  sweep(d, cutoff);
+  raiseCoverage(d, cutoff);
+  assert(survivingShas(d).join(",") === "new_ai", "the old human commit is gone from dcs_commits");
+  assert(
+    coverageSince(d, "en_ult") === cutoff,
+    "coverage_since now sits at the sweep cutoff (5000), so readLedgerMasterLineage's " +
+      "`confirmedAt >= coverage_since` check correctly rejects a stalled confirmedAt=200 " +
+      "watermark instead of reading the now-empty [200, now) window as a complete, human-free history",
+  );
 }
 
 if (failed > 0) {

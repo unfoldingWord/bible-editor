@@ -389,6 +389,11 @@ export function FindReplaceOverlay({
   const noteMatches = useMemo<NoteMatch[]>(() => {
     if (!open || !scope.tn || !query) return [];
     return collectNoteMatches(searchNotes(), compiled.re, noteOverrides);
+    // `chapters` is intentionally listed though unused directly in this body —
+    // see the comment above bibleMatches: searchNotes() is a stable getter
+    // closing over a ref, so `chapters` is the recompute trigger that keeps
+    // note matches fresh after a note mutation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, scope.tn, query, compiled.re, searchNotes, chapters, noteOverrides]);
 
   // Merge + order both scopes by chapter then verse, bible before note within

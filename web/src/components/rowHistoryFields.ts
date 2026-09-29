@@ -11,8 +11,12 @@ export interface HistoryFieldSpec {
   // (see api/src/rows.ts) or the snapshot will always read empty.
   key: string;
   label: string;
-  // Hebrew/Greek quote lanes render right-to-left in a serif Hebrew stack.
-  rtl?: boolean;
+  // A TN/TWL quote can hold Hebrew, Greek, or a translator's English gloss,
+  // so its direction is derived from the shown value itself (via
+  // `directionForText` in lib/direction.ts, in RowHistoryDialog) rather than
+  // fixed per-field — a hardcoded `rtl: true` here used to disagree with
+  // NoteCard's own script-sniff of the exact same field (#843).
+  autoDirection?: boolean;
   // Skip the TSV `\n` → newline unescape on display. Set for fields that are
   // single-line identifiers (rc:// links), where a literal backslash-n is part
   // of the value rather than an escaped break.
@@ -26,7 +30,7 @@ export interface HistoryFieldSpec {
 // restore never resurrects a column the UI can't otherwise touch.
 export const TN_HISTORY_FIELDS: HistoryFieldSpec[] = [
   { key: "support_reference", label: "Support ref", raw: true },
-  { key: "quote", label: "Quote", rtl: true },
+  { key: "quote", label: "Quote", autoDirection: true },
   { key: "note", label: "Note", dividerBefore: true },
 ];
 

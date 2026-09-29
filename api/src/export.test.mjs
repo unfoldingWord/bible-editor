@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, shouldRecordRevertReport, shouldComputeRevertEntries, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -2431,6 +2431,236 @@ function utf8Base64(s) {
   assert(
     shouldRecordRevertReport(false, null) === false,
     `neither signal present -> do not record`,
+  );
+}
+
+// --- masterIsOurLastPublish: the base check the revert report was missing ---
+// shouldRecordRevertReport above answers "did we ship, and can we read master";
+// it never asked whether master's content was ANYONE ELSE'S. On a book nobody
+// else touches, master holds our own previous export, so every difference the
+// report found was just our translators' work since last night — the thing the
+// export exists to ship. Measured 2026-09-22: ECC UST raised
+// "systemic_23_substantive_reverts" while Door43's history showed every commit
+// to 21-ECC.usfm between our 09-20 and 09-22 exports was ours.
+{
+  assert(
+    masterIsOurLastPublish("abc123", "abc123") === true,
+    `master's bytes ARE the render we last published -> nobody else edited it, suppress the report`,
+  );
+  assert(
+    masterIsOurLastPublish("def456", "abc123") === false,
+    `master moved off our last publish (a bot or human edit landed) -> report, this export may overwrite it`,
+  );
+  assert(
+    masterIsOurLastPublish(null, "abc123") === false,
+    `master unhashable -> fail OPEN; an unknown master cannot prove it is safe to overwrite`,
+  );
+  assert(
+    masterIsOurLastPublish("abc123", null) === false,
+    `no recorded publish (first export, or migration 0048 unapplied) -> fail OPEN, keep the old behaviour`,
+  );
+  assert(
+    masterIsOurLastPublish(null, null) === false,
+    `neither side known -> fail OPEN`,
+  );
+}
+
+// --- priorPublishPointer: a step retry must not diff against its own render (#995) ---
+// Measured 2026-09-26, JER UST: the export step ran twice in one instance. The
+// retry read back the first attempt's render as "the one we published last
+// time", so base == rendered at every verse and the revert report listed all
+// 15 verses translators had edited that day as overwrites of master. With the
+// real previous publish as base, the same bytes produce 0 entries.
+{
+  const thisKey = "exports/export-2026-09-26T05-30-26-658Z-nightly-2026-09-26/JER/ust/24-JER.usfm";
+  const lastNightKey = "exports/export-2026-09-25T05-31-09-945Z-nightly-2026-09-25/JER/ust/24-JER.usfm";
+  const firstRun = priorPublishPointer(
+    { pushed_blob_sha: "a303", pushed_r2_key: lastNightKey, prev_pushed_blob_sha: "old", prev_pushed_r2_key: "old-key" },
+    thisKey,
+  );
+  assert(
+    firstRun.blobSha === "a303" && firstRun.r2Key === lastNightKey,
+    `first attempt: pushed_* is last night's publish, so it is the base`,
+  );
+  const retry = priorPublishPointer(
+    { pushed_blob_sha: "05f0", pushed_r2_key: thisKey, prev_pushed_blob_sha: "a303", prev_pushed_r2_key: lastNightKey },
+    thisKey,
+  );
+  assert(
+    retry.blobSha === "a303" && retry.r2Key === lastNightKey,
+    `retry: pushed_* holds this instance's own render, so the base is prev_* (last night's publish)`,
+  );
+  const retryNoPrev = priorPublishPointer(
+    { pushed_blob_sha: "05f0", pushed_r2_key: thisKey, prev_pushed_blob_sha: null, prev_pushed_r2_key: null },
+    thisKey,
+  );
+  assert(
+    retryNoPrev.blobSha === null && retryNoPrev.r2Key === null,
+    `retry before prev_* was ever filled -> no base, the report fails open rather than using its own render`,
+  );
+  const neverPublished = priorPublishPointer(
+    { pushed_blob_sha: null, pushed_r2_key: null, prev_pushed_blob_sha: null, prev_pushed_r2_key: null },
+    thisKey,
+  );
+  assert(neverPublished.blobSha === null && neverPublished.r2Key === null, `never published -> no base`);
+  assert(priorPublishPointer(null, thisKey).blobSha === null, `no book_resource_syncs row -> no base`);
+
+  // Why it matters, on the report itself: a base equal to the render reports
+  // every verse that differs from master; the real base reports none.
+  const master = "\\id JER\n\\c 13\n\\p\n\\v 5 So I went.\n\\v 6 Later.\n";
+  const rendered = "\\id JER\n\\c 13\n\\p\n\\v 5 So I went to the stream.\n\\v 6 Later.\n";
+  assert(
+    usfmRevertReport(rendered, master, rendered).entries.length === 1,
+    `base == rendered (the retry bug) -> the translator's own edit is reported as an overwrite`,
+  );
+  assert(
+    usfmRevertReport(rendered, master, master).entries.length === 0,
+    `base == last publish (master never moved at 13:5) -> nothing reported`,
+  );
+}
+
+// --- RECORD_PUSHED_RENDER_SQL keeps prev_* on the real previous publish (#995), real schema ---
+{
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const db = new DatabaseSync(":memory:");
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) db.exec(readFileSync(join(dir, f), "utf8"));
+  db.prepare(
+    `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin, pushed_blob_sha, pushed_r2_key, pushed_read_at)
+     VALUES ('JER', 'ust', 'x', 0, 'export', 'A', 'exports/i1/JER/ust/f', 100)`,
+  ).run();
+  const record = (sha, readAt, key) => db.prepare(RECORD_PUSHED_RENDER_SQL).run("JER", "ust", sha, readAt, 0, 1, key);
+  const row = () => db.prepare(`SELECT * FROM book_resource_syncs WHERE book = 'JER' AND resource = 'ust'`).get();
+
+  record("B", 200, "exports/i2/JER/ust/f");
+  let r = row();
+  assert(r.pushed_blob_sha === "B" && r.prev_pushed_blob_sha === "A" && r.prev_pushed_r2_key === "exports/i1/JER/ust/f",
+    `a new instance's publish moves the outgoing render into prev_*`);
+  record("B2", 210, "exports/i2/JER/ust/f");
+  r = row();
+  assert(r.pushed_blob_sha === "B2" && r.prev_pushed_blob_sha === "A" && r.prev_pushed_r2_key === "exports/i1/JER/ust/f",
+    `a same-instance retry (same R2 key) leaves prev_* on the real previous publish`);
+  assert(priorPublishPointer(r, "exports/i2/JER/ust/f").blobSha === "A",
+    `…so a further retry of that step still diffs against last night's render`);
+  record("OLD", 150, "exports/i0/JER/ust/f");
+  r = row();
+  assert(r.pushed_blob_sha === "B2" && r.prev_pushed_blob_sha === "A",
+    `a stale render the pushed_read_at guard declines touches neither pushed_* nor prev_*`);
+  record("C", 300, "exports/i3/JER/ust/f");
+  r = row();
+  assert(r.pushed_blob_sha === "C" && r.prev_pushed_blob_sha === "B2" && r.prev_pushed_r2_key === "exports/i2/JER/ust/f",
+    `the next night's publish makes the retried render the previous publish`);
+}
+
+// --- shouldComputeRevertEntries: the composition, covered ---
+// Both exportOne call sites consult this rather than composing the ship gate
+// and the base check inline. An inverted `!` on the base check would otherwise
+// suppress every report on every book with no unit test noticing.
+{
+  assert(
+    shouldComputeRevertEntries(true, "master", "sha-moved", "sha-ours") === true,
+    `shipped, master readable, and master moved off our last publish -> record`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, "master", "sha-ours", "sha-ours") === false,
+    `shipped and master readable, but master IS our last publish -> compute nothing; the only ` +
+      `differences are our own edits since the sync, which is what the export exists to ship. ` +
+      `exportOne still CALLS recordExportRevertReport with the empty list, so the clear/resolve ` +
+      `path keeps running`,
+  );
+  assert(
+    shouldComputeRevertEntries(false, "master", "sha-moved", "sha-ours") === false,
+    `nothing shipped -> the ship gate still decides first, base check cannot resurrect it`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, null, null, "sha-ours") === false,
+    `master unreadable -> the ship gate declines, same as before this check existed`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, "master", "sha-ours", null) === true,
+    `no recorded publish -> fail OPEN, record exactly as the unfiltered gate did`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, "master", null, "sha-ours") === true,
+    `master unhashable -> fail OPEN; an unknown master cannot prove it is safe to overwrite`,
+  );
+}
+
+// --- three-way revert report (#870): report only where master moved off base ---
+// #869 suppresses the whole report when master's bytes equal our last publish.
+// When master DID move (a bot merged one JER chapter), the report used to list
+// every row that differed, most of them just our own translators' work. With
+// the base render supplied, a row is reported only when master also differs
+// from base there.
+{
+  const verseUsfm = (verses) => `\\id JER\n\\c 1\n\\p\n` + verses.map(([v, t]) => `\\v ${v} ${t}\n`).join("");
+  const base = verseUsfm([[1, "base one"], [2, "base two"]]);
+  // v1: master moved (bot edit) and we differ -> report. v2: master == base,
+  // we changed it -> suppress.
+  const master = verseUsfm([[1, "bot one"], [2, "base two"]]);
+  const rendered = verseUsfm([[1, "ours one"], [2, "ours two"]]);
+  const r = usfmRevertReport(rendered, master, base);
+  assert(
+    r.entries.length === 1 && r.entries[0].ref === "1:1" && r.entries[0].class === "substantive",
+    `usfm: only the verse where master moved off base is reported, with today's class; got ${JSON.stringify(r.entries)}`,
+  );
+  // The case the report exists for: our render still carries the base text,
+  // master moved (a foreign edit), so this export reverts it -> reported.
+  const rRevert = usfmRevertReport(base, master, base);
+  assert(
+    rRevert.entries.length === 1 && rRevert.entries[0].ref === "1:1" && rRevert.entries[0].class === "substantive",
+    `usfm: render == base while master moved -> we are reverting a foreign edit, reported; got ${JSON.stringify(rRevert.entries)}`,
+  );
+  assert(
+    usfmRevertReport(rendered, master).entries.length === 2,
+    `usfm: no base -> every differing verse reported, exactly as before #870`,
+  );
+  assert(
+    usfmRevertReport(rendered, master, null).entries.length === 2,
+    `usfm: base unreadable (null) -> fail open, report every differing verse`,
+  );
+  // A verse new on master (absent from base) counts as moved.
+  const masterNew = verseUsfm([[1, "base one"], [2, "base two"], [3, "bot three"]]);
+  const renderedNew = verseUsfm([[1, "ours one"], [2, "base two"], [3, "ours three"]]);
+  const rNew = usfmRevertReport(renderedNew, masterNew, base);
+  assert(
+    rNew.entries.length === 1 && rNew.entries[0].ref === "1:3",
+    `usfm: a verse absent from base is master movement -> reported; got ${JSON.stringify(rNew.entries)}`,
+  );
+
+  const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
+  const tnRow = (ref, id, note) => `${ref}\t${id}\t\t\tword\t1\t${note}`;
+  const tsv = (rows) => `${TN_HEADER}\n${rows.join("\n")}\n`;
+  const tBase = tsv([tnRow("1:1", "ab01", "base"), tnRow("1:2", "ab02", "base")]);
+  const tMaster = tsv([tnRow("1:1", "ab01", "bot"), tnRow("1:2", "ab02", "base"), tnRow("1:3", "ab03", "bot new")]);
+  const tRendered = tsv([tnRow("1:1", "ab01", "ours"), tnRow("1:2", "ab02", "ours"), tnRow("1:3", "ab03", "ours new")]);
+  const t = tsvRevertReport(tRendered, tMaster, "tn", tBase);
+  assert(
+    t.entries.map((e) => e.ref).join(",") === "1:1,1:3" && t.entries.every((e) => e.class === "substantive"),
+    `tsv: rows where master moved (ab01) or is new (ab03) reported; ab02 (master == base) suppressed; got ${JSON.stringify(t.entries)}`,
+  );
+  const tRevert = tsvRevertReport(tBase, tMaster, "tn", tBase);
+  assert(
+    tRevert.entries.length === 1 && tRevert.entries[0].ref === "1:1",
+    `tsv: render == base while master moved -> reverting a foreign edit, reported; got ${JSON.stringify(tRevert.entries)}`,
+  );
+  assert(
+    tsvRevertReport(tRendered, tMaster, "tn", null).entries.length === 3,
+    `tsv: base unreadable (null) -> fail open, report every differing row`,
+  );
+  assert(
+    tsvRevertReport(tRendered, tMaster, "tn", "garbage without an ID header").entries.length === 3,
+    `tsv: unparseable base -> fail open, report every differing row`,
+  );
+  // A Reference-only move on master is still movement.
+  const tMasterMoved = tsv([tnRow("1:9", "ab01", "base"), tnRow("1:2", "ab02", "base")]);
+  const tMoved = tsvRevertReport(tRendered, tMasterMoved, "tn", tBase);
+  assert(
+    tMoved.entries.length === 1 && tMoved.entries[0].ref === "1:9",
+    `tsv: master changing only Reference counts as moved -> reported; got ${JSON.stringify(tMoved.entries)}`,
   );
 }
 

@@ -28,6 +28,7 @@ import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { resolveActorUsername } from "./rowProvenance.ts";
 import { withChapterZero, type ChapterSummaryRow } from "./chapterSummary";
+import { TN_CHAPTER_SELECT_SQL, TQ_CHAPTER_SELECT_SQL, TWL_CHAPTER_SELECT_SQL } from "./chapterSelectSql.ts";
 
 export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 type AppContext = Context<{ Bindings: Env; Variables: { userId?: number; username?: string } }>;
@@ -87,66 +88,45 @@ chapters.get("/:book/:chapter", async (c) => {
   // cross-book id collisions can't leak the wrong source chip. Pre-0017
   // audit rows have NULL book; the `OR book IS NULL` keeps them visible
   // until the next edit naturally backfills.
-  const [verses, tn, tq, twl, statuses, laneChecks, twlOrderLocks] = await Promise.all([
+  // One db.batch() round trip instead of 7 separate prepare().all() calls —
+  // one subrequest and one consistent read snapshot instead of 7 (#906).
+  // tn/tq/twl list columns explicitly (dropping review_master_json, which
+  // web/src never reads — grepped clean; PATCH/lint responses that DO use it
+  // are untouched, this is scoped to the chapter GET only).
+  const batchResults = await db.batch([
     db
       .prepare(
         "SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 ORDER BY verse, bible_version",
       )
-      .bind(book, chapter)
-      .all<VerseRow>(),
-    db
-      .prepare(
-        `SELECT t.*, (
-           SELECT source FROM edit_log
-            WHERE kind = 'tn' AND row_key = t.id
-              AND (book = t.book OR book IS NULL)
-            ORDER BY id DESC LIMIT 1
-         ) AS latest_source
-            FROM tn_rows t
-           WHERE t.book = ?1 AND t.chapter = ?2 AND t.deleted_at IS NULL
-           ORDER BY verse, sort_order ASC NULLS LAST, id`,
-      )
-      .bind(book, chapter)
-      .all<TnRow>(),
-    db
-      .prepare(
-        `SELECT t.*, (
-           SELECT source FROM edit_log
-            WHERE kind = 'tq' AND row_key = t.id
-              AND (book = t.book OR book IS NULL)
-            ORDER BY id DESC LIMIT 1
-         ) AS latest_source
-            FROM tq_rows t
-           WHERE t.book = ?1 AND t.chapter = ?2 AND t.deleted_at IS NULL
-           ORDER BY verse, sort_order ASC NULLS LAST, id`,
-      )
-      .bind(book, chapter)
-      .all<TqRow>(),
-    db
-      .prepare(
-        "SELECT * FROM twl_rows WHERE book = ?1 AND chapter = ?2 AND deleted_at IS NULL ORDER BY verse, sort_order ASC NULLS LAST, id",
-      )
-      .bind(book, chapter)
-      .all<TwlRow>(),
+      .bind(book, chapter),
+    db.prepare(TN_CHAPTER_SELECT_SQL).bind(book, chapter),
+    db.prepare(TQ_CHAPTER_SELECT_SQL).bind(book, chapter),
+    db.prepare(TWL_CHAPTER_SELECT_SQL).bind(book, chapter),
     db
       .prepare(
         "SELECT * FROM verse_statuses WHERE book = ?1 AND chapter = ?2",
       )
-      .bind(book, chapter)
-      .all<VerseStatus>(),
+      .bind(book, chapter),
     db
       .prepare(
         "SELECT * FROM verse_lane_checks WHERE book = ?1 AND chapter = ?2",
       )
-      .bind(book, chapter)
-      .all<VerseLaneCheck>(),
+      .bind(book, chapter),
     db
       .prepare(
         "SELECT verse, locked_by, locked_at, dismissed_order FROM twl_order_locks WHERE book = ?1 AND chapter = ?2",
       )
-      .bind(book, chapter)
-      .all<TwlOrderLock>(),
+      .bind(book, chapter),
   ]);
+  const [verses, tn, tq, twl, statuses, laneChecks, twlOrderLocks] = batchResults as [
+    D1Result<VerseRow>,
+    D1Result<TnRow>,
+    D1Result<TqRow>,
+    D1Result<TwlRow>,
+    D1Result<VerseStatus>,
+    D1Result<VerseLaneCheck>,
+    D1Result<TwlOrderLock>,
+  ];
 
   // Reshape verses → verses[bibleVersion][verseNum] = VerseDto for easy client lookup.
   const verseMap: Record<string, Record<number, VerseDto>> = {};
@@ -218,11 +198,14 @@ chapters.patch("/:book/:chapter/:verse/status", requireEditor, async (c) => {
   await c.env.DB.batch([
     c.env.DB
       .prepare(
-        `INSERT INTO verse_statuses (book, chapter, verse, done, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(book, chapter, verse) DO UPDATE SET done = ?4, updated_at = ?5`,
+        // #686 item 3: updated_by (migration 0070) is the verse_statuses actor
+        // column PR #785 deferred — the toggle has exactly one writer (a
+        // signed-in human via this route), so it's always 'user', never NULL.
+        `INSERT INTO verse_statuses (book, chapter, verse, done, updated_at, updated_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(book, chapter, verse) DO UPDATE SET done = ?4, updated_at = ?5, updated_by = ?6`,
       )
-      .bind(book, chapter, verse, done, now),
+      .bind(book, chapter, verse, done, now, userId),
     c.env.DB
       .prepare(
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)

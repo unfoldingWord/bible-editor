@@ -100,7 +100,17 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, prevHighlight
     }
   };
   walk(verseObjects);
-  return <>{items}</>;
+  // Every caller renders Hebrew (UHB) here — UGNT/Greek goes through the
+  // offset painter instead (see the callers' own "UHB renders via
+  // HebrewLine" comments) — so direction is intrinsic to the component, not
+  // inherited. All three current callers already wrap this in their own
+  // rtl + isolate span; that's a convention, not a guarantee, so isolation
+  // is set here too (#843) rather than relied on from outside.
+  return (
+    <Box component="span" dir="rtl" sx={{ unicodeBidi: "isolate" }}>
+      {items}
+    </Box>
+  );
 }
 
 // One \w source token: hover shows the lexical Tooltip; double-click pins the

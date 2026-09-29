@@ -23,7 +23,25 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { SignJWT, jwtVerify } from "jose";
+import { z } from "zod";
 import type { Env } from "./index";
+
+// DCS `/api/v1/user/orgs` and `/api/v1/users/:name/orgs` shape — only the one
+// field this codebase reads. `z.array(...)` rejects a non-array body up front
+// instead of relying on `.some()` throwing (which the caller's try/catch does
+// happen to convert to a fail-closed `false`, but only by accident of control
+// flow, not by an explicit check).
+export const DcsOrgMembershipsSchema = z.array(z.object({ username: z.string().optional() }));
+
+// DCS `/api/v1/user` — the signed-in user's identity. `id`/`login` are
+// declared required: this repo has no fallback identity to fall back to, so a
+// non-conforming body must fail the sign-in rather than propagate a `NaN` id
+// or an empty username into the users table.
+export const DcsUserSchema = z.object({
+  id: z.number(),
+  login: z.string(),
+  full_name: z.string().optional(),
+});
 
 const ACCESS_COOKIE = "be_access";
 const REFRESH_COOKIE = "be_refresh";
@@ -89,8 +107,9 @@ async function isViewerOrgMember(
         headers: { Authorization: `token ${accessToken}` },
       });
       if (!res.ok) return false;
-      const orgs = (await res.json()) as Array<{ username?: string }>;
-      return orgs.some((o) => (o.username ?? "").toLowerCase() === orgName);
+      const parsed = DcsOrgMembershipsSchema.safeParse(await res.json());
+      if (!parsed.success) return false;
+      return parsed.data.some((o) => (o.username ?? "").toLowerCase() === orgName);
     }
     // Unauthenticated path (refresh): only sees public memberships, but the
     // uW org membership is public so this is sufficient in practice. If the
@@ -102,8 +121,9 @@ async function isViewerOrgMember(
       { headers },
     );
     if (!res.ok) return false;
-    const orgs = (await res.json()) as Array<{ username?: string }>;
-    return orgs.some((o) => (o.username ?? "").toLowerCase() === orgName);
+    const parsed = DcsOrgMembershipsSchema.safeParse(await res.json());
+    if (!parsed.success) return false;
+    return parsed.data.some((o) => (o.username ?? "").toLowerCase() === orgName);
   } catch {
     return false;
   }
@@ -491,7 +511,9 @@ export async function callbackDcsAuth(c: AppContext): Promise<Response> {
     headers: { Authorization: `token ${accessToken}` },
   });
   if (!userRes.ok) return c.json({ error: "user_fetch_failed" }, 502);
-  const dcsUser = (await userRes.json()) as { id: number; login: string; full_name?: string };
+  const parsedDcsUser = DcsUserSchema.safeParse(await userRes.json());
+  if (!parsedDcsUser.success) return c.json({ error: "user_fetch_failed" }, 502);
+  const dcsUser = parsedDcsUser.data;
 
   // Allowlist gate. user_roles is the source of truth for edit access; an
   // account missing from it falls through to a DCS org-membership check so

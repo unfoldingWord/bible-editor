@@ -7,6 +7,7 @@
 
 import { normalizeStrong } from "../hooks/useLexicon";
 import { nfc } from "./hebrew";
+import { isOtBookCode } from "./direction";
 
 // ---------- query classification ----------
 
@@ -23,18 +24,15 @@ const HEBREW_MARK = /[֑-ׇֽֿׁׂׅׄ]/;
 const GREEK = /[Ͱ-Ͽἀ-῿]/;
 const STRONG_RE = /^\s*([HhGg])?0*(\d{1,5})([a-z])?\s*$/;
 
-// 39 OT book codes. Anything else (including front/back/uncoded) is
-// treated as NT for bare-Strong's prefix purposes.
-const OT_BOOKS = new Set([
-  "GEN", "EXO", "LEV", "NUM", "DEU", "JOS", "JDG", "RUT", "1SA", "2SA",
-  "1KI", "2KI", "1CH", "2CH", "EZR", "NEH", "EST", "JOB", "PSA", "PRO",
-  "ECC", "SNG", "ISA", "JER", "LAM", "EZK", "DAN", "HOS", "JOL", "AMO",
-  "OBA", "JON", "MIC", "NAM", "HAB", "ZEP", "HAG", "ZEC", "MAL",
-]);
-
+// Anything unrecognized (including front/back/uncoded) is treated as NT for
+// bare-Strong's prefix purposes — this default is specific to THIS contract
+// (a bare-digit query has to guess H vs G somehow, and ZEC is the seeded dev
+// fixture) and is intentionally not shared with direction.ts's
+// directionForBook, which defaults an unknown code the other way. The OT
+// book-code list itself is canonical in direction.ts.
 export function isHebrewBook(bookCode: string | null | undefined): boolean {
   if (!bookCode) return true; // default to OT if unknown — the dev default is ZEC anyway
-  return OT_BOOKS.has(bookCode.toUpperCase());
+  return isOtBookCode(bookCode);
 }
 
 // True for bare-digit / zero-padded queries — the only case where the user

@@ -17,24 +17,9 @@ import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
 import { TwArticleDialog } from "./TwArticleDialog";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
+import { directionForText } from "../lib/direction";
 
 export type WordDropPosition = "before" | "after";
-
-// Mirrors the NoteCard quote-script detector: Hebrew (U+0590–U+05FF) is
-// RTL, Greek + Latin are LTR. We only show the translate icon when the
-// user has typed English (LTR) into a field that normally holds the
-// source-language Hebrew/Greek.
-const RTL_CHAR = /[֐-׿]/;
-const LTR_CHAR = /[a-zA-ZͰ-Ͽἀ-῿]/;
-
-type QuoteScript = "empty" | "rtl" | "ltr";
-
-function detectQuoteScript(text: string): QuoteScript {
-  if (!text.trim()) return "empty";
-  if (RTL_CHAR.test(text)) return "rtl";
-  if (LTR_CHAR.test(text)) return "ltr";
-  return "empty";
-}
 
 // Container-query breakpoint: under this table width the quote + TW-article
 // columns plus three action buttons get too cramped, so the layout reflows to
@@ -168,6 +153,12 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
   const pendingFocusRef = useRef<{ id: string; dir: "up" | "down" } | null>(null);
   const [recentMove, setRecentMove] = useState<{ id: string; dir: "up" | "down" } | null>(null);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Deliberately no dependency array — mirrors ResourceColumn's note-focus
+  // effect: this polls pendingFocusRef, set synchronously by an arrow-key
+  // handler outside any tracked dependency, and the early-return guard makes
+  // every run a no-op unless that handler just fired. `[]` would only run
+  // this once at mount and miss every later arrow-key move.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useLayoutEffect(() => {
     const pending = pendingFocusRef.current;
     if (!pending) return;
@@ -518,6 +509,12 @@ const WordRow = memo(function WordRow({
   useEffect(() => setOccurrence(row.occurrence ?? 1), [row.id, row.version, row.occurrence]);
   useEffect(() => {
     savedRef.current = { quote: row.orig_words ?? "", twLink: row.tw_link, occurrence: row.occurrence ?? 1 };
+    // Deliberately keyed on [row.id, row.version] only — this snapshot is the
+    // "last saved" baseline the draft-dirty check compares against, and it
+    // must rebase only when the server hands back a new confirmed version,
+    // not on every field-level change (those three fields only ever change
+    // together with a version bump anyway, via the three effects above).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [row.id, row.version]);
 
   const draftKey = useMemo(() => rowKey("twl", row.book, row.id), [row.book, row.id]);
@@ -569,7 +566,7 @@ const WordRow = memo(function WordRow({
     return e.clientY < rect.top + rect.height / 2 ? "before" : "after";
   };
 
-  const quoteScript = detectQuoteScript(quote);
+  const quoteScript = directionForText(quote);
   const showTranslateIcon = quoteScript === "ltr" && !!onTranslateQuote;
 
   const handleTranslateQuote = () => {

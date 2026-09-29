@@ -85,6 +85,14 @@ function freshEnv() {
 
 const BOOK = "ZEC";
 
+// A MergeCutoff (getMasterConfirmedAt's return shape) whose editId is far
+// beyond any edit_log id these fixtures ever mint — i.e. "this (book, kind)
+// has already had a confirmed export that included every row's latest edit".
+// Used by the pre-existing cases below, which are testing the diff-gate/
+// completeness axes, not the #832 export-timing axis — passing this keeps
+// them exercising exactly what they did before #832 added the cutoff param.
+const ALREADY_EXPORTED = { confirmedAt: 1, editId: 999999999 };
+
 // A pristine tn row that master still carries unchanged — the "nothing to see
 // here" chapter, present in both maps at chapter 3.
 function seedPristineRow(sqlite, { id = "aaaa", chapter = 3, verse = 1, ref = "3:1", note = "pristine note" } = {}) {
@@ -244,7 +252,7 @@ console.log("\n[issue #485 P1 follow-up — AI-only row is the ONLY row in its c
   // verifiedComplete: true — this fetch is treated as carrying fetchDcsMasterText's
   // independent completeness proof (fetchTsvMasterVerified succeeded), so the
   // widened coveredChapters extension is trusted.
-  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true);
+  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, ALREADY_EXPORTED);
   eq(res.deleted, 1, "the prune actually deletes the AI-only row, not just flags its chapter");
 
   const row = sqlite.prepare(`SELECT deleted_at, updated_by FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
@@ -275,7 +283,7 @@ console.log("\n[control — a truncated/incomplete fetch must NOT be trusted as 
   // not-fetched (raw discarded) BEFORE it can reach the prune at all — so the
   // prune must never run here, and the AI-only row must survive untouched.
   if (!truncated) {
-    await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [3, 5], false);
+    await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [3, 5], false, ALREADY_EXPORTED);
   }
   const row = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
   eq(row.deleted_at, null, "the AI-only row survives — a truncated fetch never gets to drive the prune");
@@ -326,11 +334,81 @@ console.log("\n[second P1 follow-up — a partial fetch that PASSES the loss-per
   // (fetchDcsMasterText unavailable/null; only the heuristic above passed).
   // coveredChapters must fall back to body-present chapters only, so chapter 5
   // (absent from the body) is never touched by the prune.
-  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], false);
+  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], false, ALREADY_EXPORTED);
   eq(res.deleted, 0, "nothing is deleted — chapter 5 is not covered without a positive completeness proof");
 
   const row = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
   eq(row.deleted_at, null, "the AI-only row survives — the unverified fetch's absence is not trusted as an emptied chapter");
+}
+
+// ── Issue #832 — AI rows written to D1 but not yet exported are prunable ───
+// An AI pipeline writes rows straight into D1 (pipelineImport.ts), stamped
+// source=ai_pipeline. They reach master only via the nightly export. Before
+// this fix, softDeleteRemovedTsvRows treated "AI-only, absent from the
+// incoming file" as sufficient to prune — indistinguishable from "master
+// genuinely dropped this id" — even when the row's content had never yet
+// been exported at all (the export that would add it to master's file simply
+// hasn't run). These cases drive the REAL prune with a MergeCutoff
+// (getMasterConfirmedAt's own return shape) standing in for the (book,
+// kind)'s actual confirmed-export boundary.
+
+console.log("\n[issue #832 — AI-only row's edit is AFTER the confirmed export boundary: must survive the prune]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+  // Master's file never carried this id — the same shape as the row simply
+  // never having been exported yet.
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+
+  // editId: 0 — the last confirmed export happened BEFORE any edit_log row
+  // exists, so the AI row's own edit (id >= 1) is necessarily newer than it.
+  const NOT_YET_EXPORTED = { confirmedAt: 1, editId: 0 };
+  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, NOT_YET_EXPORTED);
+  eq(res.deleted, 0, "the AI-only row is NOT pruned — its content has never reached a confirmed export");
+
+  const row = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
+  eq(row.deleted_at, null, "the row survives untouched");
+}
+
+console.log("\n[issue #832 — control: the SAME AI-only row, but its edit already reached a confirmed export: pruned as before]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+
+  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, ALREADY_EXPORTED);
+  eq(res.deleted, 1, "the row IS pruned — its content was already exported before master dropped it");
+}
+
+console.log("\n[issue #832 — this (book, kind) has NEVER been confirmed exported at all: AI-only row must survive]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+
+  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, null);
+  eq(res.deleted, 0, "no confirmed export exists yet for this (book, tn) — the AI row is never pruned");
+}
+
+console.log("\n[issue #832 — control: a HUMAN-edited row is unaffected by the cutoff guard (isReimportableRow already blocks it)]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  seedHumanEditedRow(sqlite, { id: "cccc", chapter: 5, verse: 1, ref: "5:1" });
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+
+  // Even with NO confirmed export at all, a human-edited row is never a
+  // candidate for this guard — isReimportableRow excludes it before the
+  // cutoff is ever consulted.
+  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, null);
+  eq(res.deleted, 0, "nothing pruned — the human-edited row was never eligible regardless of the cutoff");
 }
 
 if (failed > 0) {

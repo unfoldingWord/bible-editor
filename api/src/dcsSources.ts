@@ -195,7 +195,7 @@ export async function fetchFirstLine(url: string): Promise<string | null> {
 // The reimport reads the canonical unfoldingWord source on master — the same
 // org dcsUrls() hardcodes. The SHA check below MUST agree with the raw fetch on
 // owner/repo/path/ref, so both derive from this one mapping.
-const DCS_OWNER = "unfoldingWord";
+export const DCS_OWNER = "unfoldingWord";
 
 export type ReimportResource = "ult" | "ust" | "tn" | "tq" | "twl";
 

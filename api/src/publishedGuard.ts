@@ -3,16 +3,17 @@
 // `node --experimental-strip-types` in the unit test runner, same as
 // shrinkGuard.ts.
 //
-// Measured evidence (2026-08-15, checked directly against DCS):
+// Measured evidence (2026-09-27, checked directly against DCS):
 //   - The latest release in all five resource repos (en_ult, en_ust, en_tn,
-//     en_tq, en_twl) is tag `v90`, target branch `release_v90`, published
-//     2026-08-14/15 (prerelease=false, draft=false).
-//   - Listing repo contents at `?ref=v90` returns exactly 56 books (v89 had
-//     54; HOS and MIC were added). `master` has 66 books.
-//   - The 10 books NOT yet published: NUM 1CH 2CH ECC ISA JER EZK DAN AMO ZEC.
+//     en_tq, en_twl) is tag `v91`, target branch `release_v91`, published
+//     2026-09-26 (prerelease=false, draft=false).
+//   - Listing repo contents at `?ref=v91` returns exactly 59 books in every
+//     one of the five repos (v90 had 56; AMO, DAN and ZEC were added).
+//     `master` has 66 books.
+//   - The 7 books NOT yet published: NUM 1CH 2CH ECC ISA JER EZK.
 //     These are exactly the books under active work in this app.
 //   - Releases happen ~3x/year (v84 shipped 2024-08, v89 shipped 2026-06,
-//     v90 shipped 2026-08).
+//     v90 shipped 2026-08, v91 shipped 2026-09).
 //
 // Why PUBLISHED_BOOKS is a hardcoded constant and not a live lookup: a failed
 // live lookup at request time cannot know WHICH books are published, so it
@@ -35,14 +36,15 @@
 // Runbook: when vNN ships, bump PUBLISHED_RELEASE_TAG and PUBLISHED_BOOKS in
 // this file, then run `npm --workspace api run test`.
 
+import { z } from "zod";
 import { RESOURCE_TARGETS, type Resource } from "./export.ts";
 
-export const PUBLISHED_RELEASE_TAG = "v90";
+export const PUBLISHED_RELEASE_TAG = "v91";
 
 export const PUBLISHED_BOOKS: ReadonlySet<string> = new Set([
   "GEN", "EXO", "LEV", "DEU", "JOS", "JDG", "RUT", "1SA", "2SA", "1KI", "2KI",
-  "EZR", "NEH", "EST", "JOB", "PSA", "PRO", "SNG", "LAM", "HOS", "JOL", "OBA",
-  "JON", "MIC", "NAM", "HAB", "ZEP", "HAG", "MAL",
+  "EZR", "NEH", "EST", "JOB", "PSA", "PRO", "SNG", "LAM", "DAN", "HOS", "JOL",
+  "AMO", "OBA", "JON", "MIC", "NAM", "HAB", "ZEP", "HAG", "ZEC", "MAL",
   "MAT", "MRK", "LUK", "JHN", "ACT", "ROM", "1CO", "2CO", "GAL", "EPH", "PHP",
   "COL", "1TH", "2TH", "1TI", "2TI", "TIT", "PHM", "HEB", "JAS", "1PE", "2PE",
   "1JN", "2JN", "3JN", "JUD", "REV",
@@ -60,6 +62,24 @@ export interface DcsRelease {
   published_at?: string | null;
   created_at?: string | null;
 }
+
+// Every field here is already read defensively (pickLatestStableRelease
+// treats a missing/malformed field as "not stable"/"oldest"), so this schema
+// exists to guard the one thing nothing downstream checks: that the DCS
+// releases endpoint actually returned an array. A non-array body (an error
+// object, an HTML error page parsed as JSON, etc.) previously reached callers
+// as `DcsRelease[]` via a bare cast and would throw the first time something
+// iterated it.
+export const DcsReleaseSchema = z.object({
+  tag_name: z.string().optional(),
+  draft: z.boolean().optional(),
+  prerelease: z.boolean().optional(),
+  target_commitish: z.string().optional(),
+  published_at: z.string().nullable().optional(),
+  created_at: z.string().nullable().optional(),
+});
+
+export const DcsReleaseListSchema = z.array(DcsReleaseSchema);
 
 // Picks the release that actually represents "what's published." NEVER sort
 // by tag name — string comparison puts "v9" after "v10" ("v9" > "v10"

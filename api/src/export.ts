@@ -73,7 +73,7 @@ export function buildExportBranch(book: string, usernames: string[]): string {
 // WHY THIS EXISTS. Everything above is built so a branch carries `-be-` and is
 // therefore validated and AUTO-MERGED by DCS's own workflows. There is one case
 // where auto-merge is exactly wrong: a correction to a PUBLISHED book. Those
-// books are frozen because their content is in a cut release (v90), so a fix to
+// books are frozen because their content is in a cut release (v91), so a fix to
 // them has to land as a branch + PR that a uW maintainer reviews and merges
 // himself, then re-releases. `allowLocked` already lets such an export through
 // our own gate — but on a `-be-` branch, DCS's `merge-be-pr.yaml` would merge it
@@ -1078,17 +1078,33 @@ export interface UsfmRevertReport {
 // reported — that is new/removed content, the shrink guard's territory, not a
 // "we overwrote something" finding. This NEVER decides whether to ship; it
 // runs only after the shrink/alignment guards have already allowed the commit.
-export function usfmRevertReport(renderedUsfm: string, masterUsfm: string): UsfmRevertReport {
+//
+// `baseUsfm` (#870) is the render we published LAST time (book_resource_syncs
+// .pushed_r2_key). When given, a differing verse is reported only if master
+// ALSO differs from base there: master == base means master never moved at
+// that verse since our last publish, so the difference is our own work since
+// then and overwriting it loses nothing. Without this, a book where a bot
+// merged one chapter reported every verse our translators had touched across
+// the whole book. Equality with base is exact (same parsed structure), not
+// canonicalized, so a cosmetic-only move on master still reports. Fails open:
+// a null or unparseable base reports every differing verse, as before.
+export function usfmRevertReport(
+  renderedUsfm: string,
+  masterUsfm: string,
+  baseUsfm: string | null = null,
+): UsfmRevertReport {
   const rendered = verseTextByRef(renderedUsfm);
   const master = verseTextByRef(masterUsfm);
   // Either side failing to parse leaves us with no reliable comparison — this
   // report is observational only, so decline to report rather than guess.
   if (rendered === null || master === null) return { entries: [], totalVerses: 0 };
+  const base = baseUsfm == null ? null : verseTextByRef(baseUsfm);
   const entries: UsfmRevertEntry[] = [];
   for (const [ref, masterText] of master) {
     const renderedText = rendered.get(ref);
     if (renderedText === undefined) continue; // verse absent from render — not our concern here
     if (renderedText === masterText) continue; // byte-identical, nothing overwritten
+    if (base !== null && base.get(ref) === masterText) continue; // master never moved here — the difference is ours
     const same = canonicalizeForRevertCompare(masterText) === canonicalizeForRevertCompare(renderedText);
     entries.push({ ref, class: same ? "formatting" : "substantive" });
   }
@@ -1138,10 +1154,17 @@ function parseTsvRowsById(raw: string): Map<string, string[]> | null {
 // field" for classification purposes — Reference just supplies the ref for
 // the report (master's own Reference value for that ID), and ID is the join
 // key, not content.
+//
+// `baseTsv` (#870): same three-way filter as usfmRevertReport's `baseUsfm` —
+// a differing row is reported only if master's row also differs from our last
+// publish's row (every cell, Reference included, compared exactly). A row
+// absent from base is new on master, so it counts as moved. Fails open on a
+// null or unparseable base.
 export function tsvRevertReport(
   renderedTsv: string,
   masterTsv: string,
   kind: "tn" | "tq" | "twl",
+  baseTsv: string | null = null,
 ): TsvRevertReport {
   const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
   const refIdx = headers.indexOf("Reference");
@@ -1149,10 +1172,13 @@ export function tsvRevertReport(
   const rendered = parseTsvRowsById(renderedTsv);
   const master = parseTsvRowsById(masterTsv);
   if (rendered === null || master === null) return { entries: [], totalRows: 0 };
+  const base = baseTsv == null ? null : parseTsvRowsById(baseTsv);
   const entries: TsvRevertEntry[] = [];
   for (const [id, masterCells] of master) {
     const renderedCells = rendered.get(id);
     if (!renderedCells) continue; // row absent from render — not our concern here
+    const baseCells = base?.get(id);
+    if (baseCells && baseCells.join("\t") === masterCells.join("\t")) continue; // master never moved here — the difference is ours
     const diffFields: string[] = [];
     for (let i = 0; i < headers.length; i++) {
       if (i === refIdx || i === idIdx) continue;
@@ -1200,6 +1226,154 @@ export function tsvRevertReport(
 // tsvRevertReport's own null-parse contract).
 export function shouldRecordRevertReport(dcsChanged: boolean, masterContent: string | null): boolean {
   return dcsChanged && masterContent != null;
+}
+
+// Did master stand, byte for byte, on the render WE last published — i.e. has
+// nobody else's edit landed on it since?
+//
+// This is the base check the revert report was missing. Without it the report
+// flags every difference between our new render and master, which on a book
+// nobody else touches is just *our own translators' work since last night* —
+// exactly what the export exists to ship. Measured 2026-09-22: ECC UST raised
+// "overwrote master's current content on 23 row(s) ... systemic_23_substantive
+// _reverts" while `git.door43.org` history showed the only commits to
+// `21-ECC.usfm` between our 09-20 and 09-22 exports were our own. Nothing was
+// at risk; the 23 rows were one translator's evening in ECC 7.
+//
+// The report's whole stated purpose is "in case a hand-edit there was lost".
+// If master holds precisely the bytes we last pushed, no hand-edit exists there
+// outside our own lineage, so there is nothing to lose and nothing to report.
+//
+// Fails OPEN — both shas must be present AND equal to suppress. A missing
+// `pushedBlobSha` (never published, or migration 0048 unapplied) or an
+// unhashable master keeps today's behaviour, because an unknown base cannot
+// prove master is safe to overwrite. That direction matters: a false alarm
+// costs attention, a missed revert costs someone's work.
+export interface PushedRenderPointer {
+  blobSha: string | null;
+  r2Key: string | null;
+}
+
+// Which render counts as "the one we published last time" for an export that
+// is about to write `thisRenderKey` (#995).
+//
+// A step.do retry re-runs the whole export step. If the first attempt already
+// reached recordPushedRender, pushed_* now describes THAT attempt's render,
+// which is tonight's own render, not the previous publish. Using it as the
+// revert base makes base == rendered at every verse, so the report lists every
+// verse our translators changed as an overwrite of master. The R2 key is
+// deterministic per instance+book+resource, so a stored key equal to the one
+// this attempt writes is exactly the same-instance case; recordPushedRender
+// kept the real previous pair in prev_* for it.
+export function priorPublishPointer(
+  row: {
+    pushed_blob_sha: string | null;
+    pushed_r2_key: string | null;
+    prev_pushed_blob_sha: string | null;
+    prev_pushed_r2_key: string | null;
+  } | null,
+  thisRenderKey: string,
+): PushedRenderPointer {
+  if (row == null) return { blobSha: null, r2Key: null };
+  if (row.pushed_r2_key != null && row.pushed_r2_key === thisRenderKey) {
+    return { blobSha: row.prev_pushed_blob_sha, r2Key: row.prev_pushed_r2_key };
+  }
+  return { blobSha: row.pushed_blob_sha, r2Key: row.pushed_r2_key };
+}
+
+// recordPushedRender's UPDATE (exportWorkflow.ts), kept here so a test can run
+// it against the real schema: the workflow module imports cloudflare:workers,
+// which plain node cannot load. Binds: ?1 book, ?2 resource, ?3 blob sha,
+// ?4 D1 read time, ?5 confirmMaster (1/0), ?6 edit_log boundary, ?7 R2 key.
+export const RECORD_PUSHED_RENDER_SQL = `UPDATE book_resource_syncs
+      SET -- #995: keep the outgoing render as the previous publish, but only
+          -- when the incoming render is from another export instance. A
+          -- same-instance step retry writes the same ?7 key again, and
+          -- must leave prev_* pointing at the real previous publish.
+          -- SET expressions read the pre-UPDATE row, so these see the
+          -- outgoing pushed_* values.
+          prev_pushed_blob_sha =
+            CASE WHEN (pushed_read_at IS NULL OR pushed_read_at <= ?4) AND pushed_r2_key IS NOT ?7
+                 THEN pushed_blob_sha ELSE prev_pushed_blob_sha END,
+          prev_pushed_r2_key =
+            CASE WHEN (pushed_read_at IS NULL OR pushed_read_at <= ?4) AND pushed_r2_key IS NOT ?7
+                 THEN pushed_r2_key ELSE prev_pushed_r2_key END,
+          pushed_blob_sha =
+            CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?3 ELSE pushed_blob_sha END,
+          pushed_read_at = MAX(COALESCE(pushed_read_at, 0), ?4),
+          -- P1.3: store this render's edit_log id boundary next to its
+          -- blob/read-time, guarded IDENTICALLY to pushed_blob_sha so the
+          -- trio always describes ONE render. markOwnPublishConverged
+          -- promotes it into master_confirmed_edit_id when a later sync
+          -- recognizes this render on master (the steady-state path).
+          pushed_edit_id =
+            CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?6 ELSE pushed_edit_id END,
+          pushed_r2_key =
+            CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?7 ELSE pushed_r2_key END,
+          master_confirmed_at =
+            CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END,
+          -- Shadow master_confirmed_at, but ONLY when this render is the
+          -- newest confirmed one (?4 >= the stored master_confirmed_at).
+          -- Without that gate the two columns are MAX'd independently, and a
+          -- delayed OLDER render arriving while master_confirmed_edit_id is
+          -- still NULL (warm-up) would advance the id to the old render's
+          -- boundary (MAX(0, old) = old) while the timestamp stays at the
+          -- newer render (MAX keeps it) — the two would then describe
+          -- DIFFERENT renders and reconstruction (which prefers the id) would
+          -- fold too old an ancestor, reintroducing the false-conflict this
+          -- migration removes. The non-null guard additionally stops an empty
+          -- edit_log (?6 NULL) from coercing this to a bogus 0. When the gate
+          -- passes, ?6 >= the stored id (readAt and MAX(id) move together per
+          -- build), so MAX here equals a direct assign but also can't regress.
+          master_confirmed_edit_id =
+            CASE WHEN ?5 = 1 AND ?6 IS NOT NULL AND ?4 >= COALESCE(master_confirmed_at, 0)
+                 THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?6)
+                 ELSE master_confirmed_edit_id END
+    WHERE book = ?1 AND resource = ?2`;
+
+export function masterIsOurLastPublish(
+  masterBlobSha: string | null,
+  pushedBlobSha: string | null,
+): boolean {
+  return masterBlobSha != null && pushedBlobSha != null && masterBlobSha === pushedBlobSha;
+}
+
+// Are there reverts worth COMPUTING for this publish? Both call sites in
+// exportOne consult this rather than composing the two predicates inline, so
+// the composition itself is covered by tests — an inverted `!` on the base
+// check would otherwise blank every report on every book and no unit test
+// would notice.
+//
+// Note what this does NOT gate: whether recordExportRevertReport is called at
+// all. It still is, with an empty entry list, because the zero-entry path is
+// the only thing that clears stale export_reverts rows and resolves a standing
+// export_revert_persistence alert. Skipping the call outright would leave both
+// stuck forever on any book that reaches the steady state this check detects.
+//
+// Two bounds worth stating, both of which merely cost suppression (the alert
+// fires as it does today) rather than hiding anything:
+//
+//  - `masterBlobSha` hashes the snapshot the shrink guards captured, pinned to
+//    the SHA the freshness gate resolved BEFORE commitToDcs ran. A commit
+//    landing on master inside that window is invisible here — but it is equally
+//    invisible to the unfiltered comparison this gate wraps, which diffs
+//    against that same pinned snapshot. Neither sees it.
+//  - `pushedBlobSha` advances every night whether or not the export PR merged,
+//    so master lagging behind an unmerged PR reads as "moved" and still reports.
+//
+// And what suppression cannot hide: rows or verses present on master but absent
+// from our render are skipped by usfmRevertReport/tsvRevertReport outright
+// ("not our concern here"), so a render that DELETES master content was never
+// this report's job — the shrink guards own that, and mechanicalOverwriteAlert
+// owns the zero-contributor render. Both are untouched by this check.
+export function shouldComputeRevertEntries(
+  dcsChanged: boolean,
+  masterContent: string | null,
+  masterBlobSha: string | null,
+  pushedBlobSha: string | null,
+): boolean {
+  if (!shouldRecordRevertReport(dcsChanged, masterContent)) return false;
+  return !masterIsOurLastPublish(masterBlobSha, pushedBlobSha);
 }
 
 // Does the number of substantive reverts this export is about to make justify
@@ -2308,6 +2482,7 @@ export interface DcsOpenPr {
   htmlUrl: string;
   mergeable: boolean | null;
   updatedAt: string | null;
+  createdAt: string | null;
 }
 
 // Pages GET /pulls?state=open for one repo, returning every open PR whose head
@@ -2325,16 +2500,21 @@ export async function listOpenPrs(config: {
   token: string;
   owner: string;
   repo: string;
+  /** Optional deadline for the WHOLE paged list (one signal shared by every
+   *  page), so a hung Door43 cannot hold the caller. Omitted = no timeout,
+   *  which is every pre-existing caller's behavior. A timeout throws. */
+  timeoutMs?: number;
 }): Promise<DcsOpenPr[]> {
   const apiBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
   const limit = 50;
   const maxPages = 20;
   const sameRepo = `${config.owner}/${config.repo}`;
   const out: DcsOpenPr[] = [];
+  const signal = config.timeoutMs ? AbortSignal.timeout(config.timeoutMs) : undefined;
   for (let page = 1; page <= maxPages; page++) {
     const listRes = await fetch(
       `${apiBase}/pulls?state=open&limit=${limit}&page=${page}`,
-      { method: "GET", headers: dcsPrHeaders(config.token) },
+      { method: "GET", headers: dcsPrHeaders(config.token), ...(signal ? { signal } : {}) },
     );
     if (!listRes.ok) {
       throw new Error(`dcs_pull_list_failed: ${listRes.status} ${await listRes.text()}`);
@@ -2348,6 +2528,7 @@ export async function listOpenPrs(config: {
       html_url?: string;
       mergeable?: boolean | null;
       updated_at?: string;
+      created_at?: string;
     }>;
     try {
       items = await listRes.json();
@@ -2382,6 +2563,7 @@ export async function listOpenPrs(config: {
           htmlUrl: pr.html_url ?? "",
           mergeable: pr.mergeable ?? null,
           updatedAt: pr.updated_at ?? null,
+          createdAt: pr.created_at ?? null,
         });
       }
     }
@@ -2397,12 +2579,15 @@ export async function listOpenPrs(config: {
 export async function getCommitStatus(
   config: { baseUrl: string; token: string; owner: string; repo: string },
   sha: string,
+  opts: { timeoutMs?: number } = {},
 ): Promise<string | null> {
   const apiBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
   try {
+    // A timeout lands in the catch below: null, like any other failed read.
     const res = await fetch(`${apiBase}/commits/${encodeURIComponent(sha)}/status`, {
       method: "GET",
       headers: dcsPrHeaders(config.token),
+      ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
     });
     if (!res.ok) return null;
     const data = (await res.json()) as { state?: string };
