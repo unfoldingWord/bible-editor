@@ -92,6 +92,18 @@ export function useLexicon(rawStrongs: string[]): Map<string, LexiconEntry | nul
     void ensure(rawStrongs);
     const fn = () => force((t) => t + 1);
     subscribers.add(fn);
+    // Close a race: `useEffect` runs after paint, so another component's
+    // `ensure()` for the same key(s) can resolve — updating `cache` and
+    // notifying subscribers — in the gap between this component's render
+    // (which saw pre-resolution nulls) and this subscription being added.
+    // `ensure` above would then see nothing left to do (already cached) and
+    // never notify again, leaving this component's memoized Map stuck on
+    // those nulls with no future update to unstick it. If any requested key
+    // is already resolved by the time we subscribe, force one recompute so
+    // this render picks up what it missed.
+    if (rawStrongs.some((raw) => normalizeStrong(raw).some((k) => cache.has(k)))) {
+      force((t) => t + 1);
+    }
     return () => {
       subscribers.delete(fn);
     };

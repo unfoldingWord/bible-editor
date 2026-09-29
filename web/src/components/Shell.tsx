@@ -1593,11 +1593,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data?.verses?.UHB, bookHook?.chapters]);
   const lexiconMapRaw = useLexicon(uhbStrongs);
-  // useLexicon hands back a fresh Map every render; stabilize its identity so
-  // ScriptureColumn's and BookView's memos can compare it. Keyed on CONTENT —
-  // which entry each Strong's resolved to — not on uhbStrongs' identity, which
-  // is new on every save and every book-mode chapter load even when nothing
-  // changed, re-rendering every scripture cell that receives the map (#890).
+  // useLexicon now memoizes its Map (#898), but it still gets a fresh
+  // identity whenever ANY lexicon fetch anywhere in the app resolves — its
+  // module-level `subscribers` notify every mounted useLexicon caller, not
+  // just the one whose keys just arrived — so stabilize its identity here
+  // too, so ScriptureColumn's and BookView's memos can compare it. Keyed on
+  // CONTENT — which entry each Strong's resolved to — not on uhbStrongs'
+  // identity, which is new on every save and every book-mode chapter load
+  // even when nothing changed, re-rendering every scripture cell that
+  // receives the map (#890).
   // A count of resolved entries is not enough: 'H2148a' can first resolve to
   // the cached base 'H2148' entry, then switch to its exact entry without the
   // count moving.
