@@ -17,6 +17,7 @@ import {
 import GridViewIcon from "@mui/icons-material/GridView";
 import LockIcon from "@mui/icons-material/Lock";
 import { useChapter } from "../hooks/useChapter";
+import { OpenChapterProvider } from "./NoteLinkPreview";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
@@ -58,8 +59,8 @@ import {
   guardBlocksSave,
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
-import { buildVerseIndex, concatSourceRange, formatVerseLabel, noteCoveredVerses } from "../lib/verseRange";
-import { runSaveChain } from "../lib/saveChain";
+import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, versesFromKey } from "../lib/verseRange";
+import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import {
@@ -171,6 +172,11 @@ function countSourceWords(row: VerseDto | undefined): number {
   };
   walk(verseObjects ?? []);
   return n;
+}
+
+function verseObjectsOf(dto: VerseDto | undefined): unknown[] | null {
+  const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  return Array.isArray(vo) ? vo : null;
 }
 
 const SCRIPTURE_MODE_KEY = "be:scriptureMode";
@@ -441,7 +447,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // lint-relevant state (e.g. a no-op review-flag clear, which doesn't
       // touch row content or version — see api/src/rows.ts). The lint chip is
       // drawn from a separate fetch (useBookLint), so nudge it via the same
-      // debounced refetch the outbox listener below uses.
+      // debounced refetch the outbox listener below uses. Every RowKind counts:
+      // tq and twl rows carry lint issues too (lintTqRows / lintTwlRows in
+      // api/src/lint.ts), so no kind filter here (#887).
       scheduleLintRefetch();
     },
     onDelete: (kind, id) => applyLocalRowDelete(kind, id),
@@ -475,13 +483,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // merging refetch issued after it. Cost: if the mount GET already landed
     // when the socket opens, this is a second GET of the same chapter — the
     // price of correctness, deliberately not avoided with timestamps. If the
-    // mount GET is still in flight, `refetch` aborts and restarts it, so the
-    // chapter is still fetched once (see useChapter.refetch).
+    // mount GET is still in flight, `refetch` does not abort it: the mount GET
+    // lands and renders first, and the merging GET is issued right after it,
+    // so first paint never waits on the socket (#902; see
+    // hooks/chapterFetchSequencer.ts).
     //
     // Merging, not replacing: a reconnect fires on the same `online` moment
     // that drains the outbox, so the GET races the tab's own PATCHes. A verse
-    // held at an equal-or-newer version stays (the PATCH landed, or is pending
-    // with optimistic content); a stale GET body must not regress it into a
+    // held at an equal-or-newer version, or a tn/tq/twl row held at a strictly
+    // newer one, stays (the PATCH landed, or is pending with optimistic
+    // content); a stale GET body must not regress it into a
     // 409 against the user's own save. The other refetch callers (TWL order
     // unlock, pipeline Refresh, Door43 import) keep the plain replace — they
     // refetch because the server changed versions out from under the tab.
@@ -489,7 +500,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       void refetch({ keepNewerLocal: true });
     },
     onVerseStatusUpdate: (status) => {
-      applyLocalVerseStatus(status.verse, status.done === 1);
+      applyLocalVerseStatus(status.verse, status.done === 1, status.updated_at);
     },
     onLaneCheckUpdate: (check) => {
       applyLaneCheckers(check.verse, check.lane, check.checkers);
@@ -693,18 +704,32 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // only edits the lint covers (TN flags + ULT/UST footnote integrity) —
   // debounced so a burst of saves coalesces into one request.
   const bookLintRefetch = bookLint.refetch;
+  const bookLintSettledAt = bookLint.lastSettledAt;
   const lintRefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Set when a lint-relevant change was skipped because the tab was hidden;
+  // the focus/visibility handler below then refetches regardless of age.
+  const lintStaleWhileHidden = useRef(false);
   // Debounced lint refetch — coalesces a burst of edits into one request.
   // Used by the outbox listener below AND by the trash/restore handlers, which
   // bypass the outbox (direct API calls) yet change the lint set: the lint
   // endpoint filters `trashed_at IS NULL`, so trashing a flagged note drops the
   // count and restoring one adds it back.
+  // A hidden tab can't see the chip, so defer to its return (#887).
   const scheduleLintRefetch = useCallback(() => {
+    if (document.hidden) {
+      lintStaleWhileHidden.current = true;
+      return;
+    }
     if (lintRefetchTimer.current) clearTimeout(lintRefetchTimer.current);
     lintRefetchTimer.current = setTimeout(() => {
       lintRefetchTimer.current = null;
+      // Hidden since the timer was armed: defer to the tab's return instead.
+      if (document.hidden) {
+        lintStaleWhileHidden.current = true;
+        return;
+      }
       bookLintRefetch();
-    }, 1000);
+    }, 3000);
   }, [bookLintRefetch]);
   useEffect(() => {
     const unsub = onOutboxResult((op, result) => {
@@ -728,10 +753,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // in another tab, on another device, or via an out-of-band fix) otherwise
   // shows a frozen count until a manual reload — the symptom that flagged-note
   // saves "weren't clearing." Reuses the debounced refetch, so a quick blur/
-  // focus flurry coalesces into one request.
+  // focus flurry coalesces into one request. Skipped when the last fetch
+  // landed under 60 s ago — translators alt-tab constantly and each refetch
+  // reads the whole book (#887) — unless a change was deferred while hidden,
+  // so a change from another tab or device can take up to 60 s to show here.
   useEffect(() => {
     const refresh = () => {
-      if (document.visibilityState === "visible") scheduleLintRefetch();
+      if (document.visibilityState !== "visible") return;
+      if (!lintStaleWhileHidden.current && Date.now() - bookLintSettledAt() < 60_000) return;
+      lintStaleWhileHidden.current = false;
+      scheduleLintRefetch();
     };
     window.addEventListener("focus", refresh);
     document.addEventListener("visibilitychange", refresh);
@@ -739,7 +770,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", refresh);
     };
-  }, [scheduleLintRefetch]);
+  }, [scheduleLintRefetch, bookLintSettledAt]);
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeWordId, setActiveWordId] = useState<string | null>(null);
@@ -1117,11 +1148,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [commentsEnabled, commentsIndex],
   );
 
-  // tileSet runs verseHasUnalignedWork (a full alignment parse) for EVERY
-  // verse, so it must not recompute when only a TN/TQ/TWL row changed. Keying
-  // it on the verse map + statuses + the intro flag means a note keystroke or
-  // save — which leaves data.verses untouched — skips the rescan entirely (and
-  // keeps verseNumbers referentially stable, so ScriptureColumn can memo-skip).
+  // The unaligned-work scan (a full alignment parse of ULT and UST for EVERY
+  // verse) lives in its own memo keyed only on the verse map, so it re-runs
+  // when verse content changes (a text save or alignment edit) and never on a
+  // TN/TQ/TWL row change. tileSet itself still rebuilds on lane / note-coverage
+  // changes, but only reads that result; verseNumbers is keyed on the joined
+  // verse list, so it stays referentially stable across those rebuilds and
+  // ScriptureColumn can memo-skip.
   const versesForTiles = data?.verses;
   const verseLaneChecksForTiles = data?.verseLaneChecks;
   const tnRowsForTiles = data?.tn;
@@ -1137,38 +1170,43 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // ("1:2-3") makes the Notes/Questions checkoff lane applicable on each verse
   // it renders under — matching noteOverlapsRange in ResourceColumn. Singletons
   // contribute one verse, the common case.
-  const versesWithTn = useMemo(() => {
-    const s = new Set<number>();
-    for (const r of tnRowsForTiles ?? []) for (const v of noteCoveredVerses(r)) s.add(v);
-    return s;
-  }, [tnRowsForTiles]);
-  const versesWithTq = useMemo(() => {
-    const s = new Set<number>();
-    for (const r of tqRowsForTiles ?? []) for (const v of noteCoveredVerses(r)) s.add(v);
-    return s;
-  }, [tqRowsForTiles]);
+  // The row arrays are new on every note edit; the covered-verse key only
+  // changes when a verse gains or loses its last note/question.
+  const tnVersesKey = useMemo(() => coveredVersesKey(tnRowsForTiles ?? []), [tnRowsForTiles]);
+  const tqVersesKey = useMemo(() => coveredVersesKey(tqRowsForTiles ?? []), [tqRowsForTiles]);
+  const versesWithTn = useMemo(() => versesFromKey(tnVersesKey), [tnVersesKey]);
+  const versesWithTq = useMemo(() => versesFromKey(tqVersesKey), [tqVersesKey]);
+  // verse -> "ULT or UST still has unaligned work". Keyed only on the verse map.
+  const unalignedByVerse = useMemo(() => {
+    const out = new Map<number, boolean>();
+    if (!versesForTiles) return out;
+    const sourceByVerse = versesForTiles.UHB ?? versesForTiles.UGNT ?? {};
+    const ult = versesForTiles.ULT ?? {};
+    const ust = versesForTiles.UST ?? {};
+    const verses = new Set<number>();
+    Object.values(versesForTiles).forEach((byVerse) => {
+      Object.keys(byVerse).forEach((v) => verses.add(parseInt(v, 10)));
+    });
+    for (const verse of verses) {
+      if (verse <= 0) continue;
+      // Each row is judged against the source it covers — every UHB verse of
+      // a bridge, not just the first (#957).
+      const ultVO = verseObjectsOf(ult[verse]);
+      const ustVO = verseObjectsOf(ust[verse]);
+      out.set(
+        verse,
+        !!(ultVO && verseHasUnalignedWork(ultVO, verseObjectsOf(sourceForTargetRow(sourceByVerse, ult[verse]) ?? undefined))) ||
+          !!(ustVO && verseHasUnalignedWork(ustVO, verseObjectsOf(sourceForTargetRow(sourceByVerse, ust[verse]) ?? undefined))),
+      );
+    }
+    return out;
+  }, [versesForTiles]);
   const tileSet = useMemo<VerseTile[]>(() => {
     if (!versesForTiles) return [];
     const versesWithSomething = new Set<number>();
     Object.values(versesForTiles).forEach((byVerse) => {
       Object.keys(byVerse).forEach((v) => versesWithSomething.add(parseInt(v, 10)));
     });
-    const sourceByVerse = versesForTiles.UHB ?? versesForTiles.UGNT ?? {};
-    const ult = versesForTiles.ULT ?? {};
-    const ust = versesForTiles.UST ?? {};
-    const getVO = (dto: VerseDto | undefined) => {
-      const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-      return Array.isArray(vo) ? vo : null;
-    };
-    const hasUnalignedFor = (verse: number) => {
-      if (verse === 0) return false;
-      const sourceVO = getVO(sourceByVerse[verse]);
-      const ultVO = getVO(ult[verse]);
-      if (ultVO && verseHasUnalignedWork(ultVO, sourceVO)) return true;
-      const ustVO = getVO(ust[verse]);
-      if (ustVO && verseHasUnalignedWork(ustVO, sourceVO)) return true;
-      return false;
-    };
     const introHasScripture = versesWithSomething.has(0);
     const buildLanes = (verse: number): VerseTileLane[] =>
       CHECK_LANES.map((lane) => {
@@ -1201,7 +1239,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const introMarkerMissing = (["ULT", "UST"] as const).some((bv) => {
       const byVerse = versesForTiles[bv];
       if (!byVerse) return false;
-      return chapterOpensWithoutMarker(getVO(byVerse[0]), getVO(byVerse[1]));
+      return chapterOpensWithoutMarker(verseObjectsOf(byVerse[0]), verseObjectsOf(byVerse[1]));
     });
     //
     // The book-intro chapter (chapter 0) always gets the slot: the summary now
@@ -1213,9 +1251,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       tiles.push({ verse: 0, has: false, lanes: buildLanes(0) });
     }
     const verseNums = [...versesWithSomething].filter((v) => v > 0).sort((a, b) => a - b);
-    for (const v of verseNums) tiles.push({ verse: v, has: hasUnalignedFor(v), lanes: buildLanes(v) });
+    for (const v of verseNums) tiles.push({ verse: v, has: unalignedByVerse.get(v) ?? false, lanes: buildLanes(v) });
     return tiles;
-  }, [chapter, versesForTiles, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl, introHasComment]);
+  }, [chapter, versesForTiles, unalignedByVerse, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl, introHasComment]);
 
   // Which alignment-attention refs (from the last nightly export) are already
   // fixed in the currently loaded chapter — re-parsed against live verse
@@ -1238,9 +1276,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     };
     for (const ref of alignAttention.refs) {
       if (ref.chapter !== data.chapter) continue;
-      const targetVO = getVO(targetsByResource[ref.resource]?.[ref.verse]);
+      const target = targetsByResource[ref.resource]?.[ref.verse];
+      const targetVO = getVO(target);
       if (!targetVO) continue;
-      const sourceVO = getVO(sourceByVerse[ref.verse]);
+      const sourceVO = getVO(sourceForTargetRow(sourceByVerse, target) ?? undefined);
       if (!verseHasUnalignedWork(targetVO, sourceVO)) {
         keys.add(`${ref.resource}:${ref.ref}`);
       }
@@ -1365,9 +1404,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Chapter board (verses × lanes overview) dialog.
   const [boardOpen, setBoardOpen] = useState(false);
 
+  const verseNumbersKey = tileSet.map((t) => t.verse).join(",");
   const verseNumbers = useMemo(
-    () => tileSet.map((t) => t.verse),
-    [tileSet],
+    () => (verseNumbersKey ? verseNumbersKey.split(",").map(Number) : []),
+    [verseNumbersKey],
   );
 
   const availableVersions = useMemo(() => {
@@ -1385,11 +1425,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }
     }
     return [...set];
-    // `bookHook` itself is deliberately excluded: useBook returns a fresh object
-    // every render, so depending on it would make this memo recompute (and hand
-    // ScriptureColumn a fresh array) on every render — exactly what the comment
-    // above says this memo exists to avoid. `bookHook?.chapters` is the stable,
-    // actually-changing signal (a new Map only when chapters are added/updated).
+    // `bookHook?.chapters` rather than `bookHook`: narrower — the hook object
+    // also changes on summary/summaryStatus, which don't affect this set.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [versesForTiles, mode, bookHook?.chapters]);
 
@@ -1478,10 +1515,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bookHook && mode === "book"
         ? (bookHook.summary?.chapters ?? []).map((c) => c.chapter)
         : undefined,
-    // `bookHook` already covers `bookHook.summary` (it's a plain object useBook
-    // returns fresh every render, so this memo already recomputes every render
-    // regardless — that's a pre-existing perf gap in useBook's return value, not
-    // something this dependency list can fix; see #842).
     [bookHook, mode],
   );
   // Restore a previously dragged ratio for the NEW mode/column-count (falling
@@ -1540,33 +1573,38 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }
     }
     return [...set];
-    // `bookHook` excluded for the same reason as availableVersions above: it's a
-    // fresh object every render, and `bookHook?.chapters` is the stable signal.
+    // `bookHook?.chapters` rather than `bookHook`: narrower, as in availableVersions above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data?.verses, bookHook?.chapters]);
   const lexiconMapRaw = useLexicon(uhbStrongs);
   // useLexicon hands back a fresh Map every render; stabilize its identity so
-  // ScriptureColumn's memo can compare it. The map's CONTENT only changes when
-  // a Strong's entry resolves, which bumps lexiconLoadedCount and rebases it.
-  const lexiconLoadedCount = useMemo(() => {
-    let c = 0;
-    for (const v of lexiconMapRaw.values()) if (v) c++;
-    return c;
+  // ScriptureColumn's and BookView's memos can compare it. Keyed on CONTENT —
+  // which entry each Strong's resolved to — not on uhbStrongs' identity, which
+  // is new on every save and every book-mode chapter load even when nothing
+  // changed, re-rendering every scripture cell that receives the map (#890).
+  // A count of resolved entries is not enough: 'H2148a' can first resolve to
+  // the cached base 'H2148' entry, then switch to its exact entry without the
+  // count moving.
+  const lexiconKey = useMemo(() => {
+    let key = "";
+    for (const [raw, v] of lexiconMapRaw) key += `${raw}=${v ? `${v.resource}:${v.strong}` : ""},`;
+    return key;
   }, [lexiconMapRaw]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const lexiconMap = useMemo(() => lexiconMapRaw, [uhbStrongs, lexiconLoadedCount]);
+  const lexiconMap = useMemo(() => lexiconMapRaw, [lexiconKey]);
 
   // When a tn note OR a twl word row is "active", treat its quote as the
   // highlight source. Notes and words are mutually exclusive; clicking one
   // clears the other. Words use `orig_words` (Hebrew source words) which the
   // same matcher handles directly for UHB and via \zaln-s for ULT/UST.
-  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses } =
+  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses, activeQuoteVerse } =
     useMemo(() => {
       const empty = {
         activeQuote: null as string | null,
         activeOccurrence: null as number | null,
         activeQuotePartialGroups: false,
         activeQuoteCoveredVerses: EMPTY_COVERED_VERSES,
+        activeQuoteVerse: null as number | null,
       };
       if (!data) return empty;
       if (activeNoteId) {
@@ -1578,6 +1616,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeOccurrence: r.occurrence ?? null,
           activeQuotePartialGroups: covered.length > 1,
           activeQuoteCoveredVerses: covered,
+          // The note's own verse: its occurrence counts there (#957).
+          activeQuoteVerse: r.verse,
         };
       }
       if (activeWordId) {
@@ -1587,6 +1627,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeOccurrence: r?.occurrence ?? null,
           activeQuotePartialGroups: false,
           activeQuoteCoveredVerses: r ? [r.verse] : EMPTY_COVERED_VERSES,
+          activeQuoteVerse: r?.verse ?? null,
         };
       }
       return empty;
@@ -1634,12 +1675,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // quote the highlight path resolves against the source and maps through the
     // alignment — so one lookup serves both. Ids are unique per book across
     // kinds, so checking tn first and falling through to twl can't collide.
-    const find = (id: string | null): { quote: string | null; occurrence: number | null } | null => {
+    const find = (id: string | null): { quote: string | null; occurrence: number | null; verse: number } | null => {
       if (!id) return null;
       const note = data.tn.find((r) => r.id === id);
-      if (note) return { quote: note.quote, occurrence: note.occurrence };
+      if (note) return { quote: note.quote, occurrence: note.occurrence, verse: note.verse };
       const word = data.twl.find((r) => r.id === id);
-      if (word) return { quote: word.orig_words, occurrence: word.occurrence };
+      if (word) return { quote: word.orig_words, occurrence: word.occurrence, verse: word.verse };
       return null;
     };
     const moved = find(reorderPreview.movedId);
@@ -1653,6 +1694,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       prevOccurrence: prev?.occurrence ?? null,
       nextQuote: next?.quote ?? null,
       nextOccurrence: next?.occurrence ?? null,
+      movedVerse: moved?.verse ?? null,
+      prevVerse: prev?.verse ?? null,
+      nextVerse: next?.verse ?? null,
     };
   }, [data, reorderPreview]);
 
@@ -2519,6 +2563,29 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }),
     [requestDualAction],
   );
+  // Every dirty side's save, in order: both reading lines, then both alignment
+  // panels. Shared by the unsaved-changes gate's Save and the titlebar's
+  // "save, mark done, next verse" button (#931). Clean sides are skipped:
+  // save() serializes + enqueues a PATCH unconditionally.
+  const dualSaveSteps = useCallback((): SaveStep[] => {
+    const step = (
+      dirty: boolean,
+      ref: { current: { save: (afterCommit?: () => void) => unknown } | null },
+    ): SaveStep => ({
+      dirty,
+      save: (afterCommit) => {
+        const handle = ref.current;
+        if (handle) handle.save(afterCommit);
+        else afterCommit();
+      },
+    });
+    return [
+      step(dualLeftReadingDirty, dualLeftReadingRef),
+      step(dualRightReadingDirty, dualRightReadingRef),
+      step(dualLeftDirty, dualLeftRef),
+      step(dualRightDirty, dualRightRef),
+    ];
+  }, [dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty]);
   const resolveDualAction = useCallback(
     (choice: "save" | "discard") => {
       const action = pendingDualAction;
@@ -2547,46 +2614,43 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // chain stalls it — `finish` (and thus the close) never runs — which is
       // the fix for #490 (the dialog used to close, unmounting the reading
       // line, while its confirm was still pending).
-      runSaveChain(
-        [
-          {
-            dirty: dualLeftReadingDirty,
-            save: (afterCommit) => {
-              const ref = dualLeftReadingRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-          {
-            dirty: dualRightReadingDirty,
-            save: (afterCommit) => {
-              const ref = dualRightReadingRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-          {
-            dirty: dualLeftDirty,
-            save: (afterCommit) => {
-              const ref = dualLeftRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-          {
-            dirty: dualRightDirty,
-            save: (afterCommit) => {
-              const ref = dualRightRef.current;
-              if (ref) ref.save(afterCommit);
-              else afterCommit();
-            },
-          },
-        ],
-        () => action?.run(),
-      );
+      runSaveChain(dualSaveSteps(), () => action?.run());
     },
-    [pendingDualAction, dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty],
+    [pendingDualAction, dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty, dualSaveSteps],
   );
+  // "Save both, mark verse done, next verse" (#931): the gate's Save chain
+  // without the prompt, then the Text-lane check (the same per-verse "done"
+  // the titlebar checkbox sets), then the next-verse move. Mark + advance run
+  // only once every dirty side has committed; a cancelled unalign confirm
+  // stalls the chain, so the verse stays unmarked and the aligner stays put.
+  // `verse` is the verse the click started on (captured in the button's
+  // render); the guard ignores a second click while this chain still runs,
+  // and cancelling the unalign confirm releases it (cancelAlignmentLoss).
+  const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
+  const dualSaveDoneAndNext = useCallback(
+    (verse: number, next: number) => {
+      if (meUserId == null || bookLocked) return;
+      saveDoneGuardRef.current.run({
+        steps: dualSaveSteps(),
+        markDone: () => {
+          applyLocalLaneCheck(verse, "text", meUserId, true);
+          void outbox.enqueueLaneCheck(book, chapter, verse, "text", true);
+        },
+        advance: () => {
+          setActiveVerse(next);
+          setDualTarget((t) => (t ? { ...t, verse: next } : t));
+        },
+      });
+    },
+    [dualSaveSteps, meUserId, bookLocked, applyLocalLaneCheck, book, chapter],
+  );
+  // Dismissing the unalign confirm without saving: any save chain waiting on it
+  // (the gate's Save, the save-done-next button) is stalled for good, so free
+  // the button's in-flight guard too.
+  const cancelAlignmentLoss = useCallback(() => {
+    setPendingAlignmentLoss(null);
+    saveDoneGuardRef.current.cancel();
+  }, []);
 
   const handleSetPanelMode = useCallback(
     (mode: PanelMode) => {
@@ -3374,6 +3438,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   };
 
   return (
+    <OpenChapterProvider data={data}>
     <Box sx={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
       <TopBar
         book={book}
@@ -3608,6 +3673,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeNoteOccurrence={activeOccurrence}
           activeNoteQuotePartialGroups={activeQuotePartialGroups}
           activeNoteCoveredVerses={activeQuoteCoveredVerses}
+          activeNoteVerse={activeQuoteVerse}
           reorderHighlight={reorderHighlight}
           mode={mode}
           enabledVersions={displayedVersions}
@@ -4221,6 +4287,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           right={dualAlignerProps.right}
           onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
           onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
+          onSaveDoneAndNext={
+            dualNav.next != null && textLaneCheck.canCheck
+              ? () => dualSaveDoneAndNext(dualAlignerProps.verseNum, dualNav.next!)
+              : undefined
+          }
           // Lane checks live on the loaded chapter's useChapter state; only
           // wire when the dual popup is on that same chapter (verse arrows
           // already no-op across chapters for the same reason).
@@ -4238,7 +4309,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }
         />
       )}
-      <Dialog open={!!pendingAlignmentLoss} onClose={() => setPendingAlignmentLoss(null)}>
+      <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>
         <DialogTitle>
           {pendingAlignmentLoss && pendingAlignmentLoss.lostWords.length === 1
             ? "A word will be unaligned"
@@ -4261,7 +4332,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setPendingAlignmentLoss(null)}>Cancel</Button>
+          <Button onClick={cancelAlignmentLoss}>Cancel</Button>
           <Button
             color="error"
             variant="contained"
@@ -4419,6 +4490,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         />
       )}
     </Box>
+    </OpenChapterProvider>
   );
 }
 

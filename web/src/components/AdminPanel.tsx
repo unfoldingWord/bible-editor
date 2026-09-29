@@ -39,6 +39,8 @@ import {
   type AdminBookSyncStatus,
   type AdminImportResponse,
   type AdminImportResult,
+  type AdminMergeFlag,
+  type AdminMergeFlagsResponse,
   type AdminPr,
   type AdminResourceSyncStatus,
   type AdminSyncActivityEntry,
@@ -126,7 +128,48 @@ function shortSha(sha: string | null): string {
 
 // ── Tab 1: Sync status ───────────────────────────────────────────────────
 
-function ResourceCell({ rs, resource }: { rs: AdminResourceSyncStatus | null; resource: Resource }) {
+// Why an export's merge state could not be checked (api exportMergeState.ts).
+const UNCHECKED_REASONS: Record<string, string> = {
+  lookup_budget: "over the per-load check limit",
+  pr_lookup_failed: "couldn't read the PR",
+  owner_mismatch: "export owner isn't unfoldingWord",
+  master_unmeasured: "couldn't read master's history",
+  lookup_failed: "Door43 request failed",
+  open_pr_list_failed: "couldn't read Door43's open PR list",
+};
+
+function capList(items: string[], max = 5): string {
+  const shown = items.slice(0, max).join(", ");
+  return items.length > max ? `${shown} +${items.length - max} more` : shown;
+}
+
+// Issue #442 (option C): only problems get a chip — a merged or still-fresh
+// export shows nothing extra.
+function mergeFlagText(flag: AdminMergeFlag): { label: string; detail: string } {
+  if (flag.state === "waiting") {
+    return {
+      label: "waiting > 1 day",
+      detail: `Door43 has not merged PR #${flag.prNumber} since ${fmtTime(flag.exportedAt)}`,
+    };
+  }
+  return {
+    label: "rejected",
+    detail:
+      flag.reason === "validation_failed"
+        ? `Door43's validation failed on PR #${flag.prNumber}, so it will not merge`
+        : `PR #${flag.prNumber} was closed without merging to master`,
+  };
+}
+
+function ResourceCell({
+  rs,
+  resource,
+  flag,
+}: {
+  rs: AdminResourceSyncStatus | null;
+  resource: Resource;
+  flag?: AdminMergeFlag;
+}) {
   if (!rs) {
     return (
       <Typography variant="caption" color="text.disabled">
@@ -159,8 +202,14 @@ function ResourceCell({ rs, resource }: { rs: AdminResourceSyncStatus | null; re
     plainReason = "Door43's copy differs from what we last exported";
   }
 
+  const flagText = flag ? mergeFlagText(flag) : null;
   const tooltip = (
     <Stack spacing={0.5} sx={{ maxWidth: 320 }}>
+      {flagText && (
+        <Typography variant="caption" sx={{ fontWeight: 600 }}>
+          {flagText.detail}
+        </Typography>
+      )}
       {plainReason && (
         <Typography variant="caption" sx={{ fontWeight: 600 }}>
           {plainReason}
@@ -197,6 +246,18 @@ function ResourceCell({ rs, resource }: { rs: AdminResourceSyncStatus | null; re
             PR #{rs.prNumber}
           </Typography>
         )}
+        {flag && flagText && (
+          <Chip
+            component="a"
+            href={flag.url}
+            target="_blank"
+            rel="noopener"
+            clickable
+            label={`${flagText.label} · #${flag.prNumber}`}
+            size="small"
+            color={flag.state === "rejected" ? "error" : "warning"}
+          />
+        )}
       </Stack>
     </Tooltip>
   );
@@ -207,16 +268,41 @@ function SyncStatusTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
+  // Loaded separately from the grid: it reads Door43 live, so a slow or failed
+  // Door43 must not hold back the D1-only sync status.
+  const [merge, setMerge] = useState<AdminMergeFlagsResponse | null>(null);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+
+  // Two quick refreshes can resolve out of order; only the latest load may
+  // set state, so a slow earlier response can't overwrite newer flags.
+  const loadSeq = useRef(0);
 
   const load = useCallback(() => {
+    const seq = ++loadSeq.current;
+    const latest = () => seq === loadSeq.current;
     setLoading(true);
     setError(null);
     api
       .getAdminSyncStatus()
-      .then((res) => setBooks(res.books))
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false));
+      .then((res) => latest() && setBooks(res.books))
+      .catch((e) => latest() && setError(String(e)))
+      .finally(() => latest() && setLoading(false));
+    setMergeError(null);
+    api
+      .getAdminMergeFlags()
+      .then((res) => latest() && setMerge(res))
+      .catch((e) => {
+        if (!latest()) return;
+        setMerge(null);
+        setMergeError(String(e));
+      });
   }, []);
+
+  const flagByKey = useMemo(() => {
+    const m = new Map<string, AdminMergeFlag>();
+    for (const f of merge?.flags ?? []) m.set(`${f.book}/${f.resource}`, f);
+    return m;
+  }, [merge]);
 
   useEffect(() => load(), [load]);
 
@@ -242,6 +328,22 @@ function SyncStatusTab() {
         </IconButton>
       </Stack>
       {error && <Alert severity="error">Failed to load sync status: {error}</Alert>}
+      {mergeError && <Alert severity="warning">Could not check Door43 merge state: {mergeError}</Alert>}
+      {merge && merge.unchecked.length > 0 && (
+        <Typography variant="caption" color="text.secondary">
+          Merge state not checked for {merge.unchecked.length} export(s):{" "}
+          {capList(
+            merge.unchecked.map(
+              (u) => `${u.book} ${RESOURCE_LABELS[u.resource]} (${UNCHECKED_REASONS[u.reason] ?? u.reason})`,
+            ),
+          )}
+        </Typography>
+      )}
+      {merge && merge.errors.length > 0 && (
+        <Typography variant="caption" color="text.secondary">
+          Door43 errors: {capList(merge.errors.map((e) => `${e.repo}: ${e.message}`))}
+        </Typography>
+      )}
       {loading ? (
         <Box sx={{ display: "flex", justifyContent: "center", p: 4 }}>
           <CircularProgress size={24} />
@@ -284,7 +386,7 @@ function SyncStatusTab() {
                   </TableCell>
                   {RESOURCES.map((r) => (
                     <TableCell key={r}>
-                      <ResourceCell rs={b.resources[r]} resource={r} />
+                      <ResourceCell rs={b.resources[r]} resource={r} flag={flagByKey.get(`${b.book}/${r}`)} />
                     </TableCell>
                   ))}
                 </TableRow>
