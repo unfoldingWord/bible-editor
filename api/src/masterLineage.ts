@@ -1410,23 +1410,29 @@ export function refEvidenceTouches(refs: string[], chapter: number, verse: numbe
 }
 
 /**
- * Whether completeHumanRefEvidenceTouches can measure a touch against this
- * lineage at all, separate from what it measures at a given chapter/verse.
- * `false` here means "unmeasurable" — missing, incomplete, or malformed
- * evidence — as opposed to "measured, no touch". A caller that logs the
- * touch result for diagnosis (rather than using it to gate a decision) must
- * check this first, or the two cases read as the same `false` (#874).
+ * Whether completeHumanRefEvidenceTouches's `false` for this lineage reflects
+ * an actual measurement, separate from what it measures at a given
+ * chapter/verse. Independent of completeHumanRefEvidenceTouches (deliberately
+ * not shared code — see the note on that function) so a change here can never
+ * alter its fail-closed answer.
+ *
+ * `false` (unmeasurable) covers: missing/malformed lineage, an INCOMPLETE
+ * commit walk (we have not seen the whole window), and — when a human commit
+ * WAS seen — per-verse ref evidence that never completed. In every one of
+ * those, "no touch measured" would be the un-protective lie.
+ *
+ * `true` (measurable) also covers a COMPLETE walk that found NO human commit
+ * at all: nothing touched the file, so completeHumanRefEvidenceTouches's
+ * `false` there is a genuine "measured, no touch", not a default. Conflating
+ * that case with "unmeasurable" was the #874 regression caught in review —
+ * this function must answer it `true` for the fix to hold.
  */
 export function humanRefEvidenceIsMeasurable(
   lineage: MasterLineage | MasterLineageSummary | null | undefined,
-): lineage is MasterLineage | MasterLineageSummary {
-  if (
-    lineage == null ||
-    !("mayHoldHumanEdit" in lineage) ||
-    lineage.mayHoldHumanEdit !== true ||
-    lineage.incomplete !== false ||
-    lineage.hasHumanCommit !== true
-  ) return false;
+): boolean {
+  if (lineage == null || !("mayHoldHumanEdit" in lineage)) return false;
+  if (lineage.incomplete !== false) return false;
+  if (lineage.hasHumanCommit !== true) return true;
   const ev = refsFrom(lineage);
   return ev !== null && ev.refs.length > 0;
 }
@@ -1437,6 +1443,10 @@ export function humanRefEvidenceIsMeasurable(
  * This may authorize an exact master-byte adoption, so uncertainty must return
  * false rather than the protective true used by the master-wins question. The
  * entire ref set is validated by refsFrom; one malformed entry invalidates it.
+ *
+ * Deliberately does NOT call humanRefEvidenceIsMeasurable: this function's
+ * fail-closed `false` must stay exactly what it has always been, so a future
+ * change to "is this measurable" can never quietly change what this measures.
  */
 export function completeHumanRefEvidenceTouches(
   lineage: MasterLineage | MasterLineageSummary | null | undefined,
@@ -1444,7 +1454,13 @@ export function completeHumanRefEvidenceTouches(
   verse: number,
   verseEnd?: number | null,
 ): boolean {
-  if (!humanRefEvidenceIsMeasurable(lineage)) return false;
+  if (
+    lineage == null ||
+    !("mayHoldHumanEdit" in lineage) ||
+    lineage.mayHoldHumanEdit !== true ||
+    lineage.incomplete !== false ||
+    lineage.hasHumanCommit !== true
+  ) return false;
   if (!Number.isInteger(chapter) || !Number.isInteger(verse) || chapter < 0 || verse < 0) return false;
   const ev = refsFrom(lineage);
   if (ev === null || ev.refs.length === 0) return false;

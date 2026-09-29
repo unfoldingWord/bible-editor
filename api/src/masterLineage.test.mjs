@@ -1175,17 +1175,35 @@ console.log("\n[#557: every uncertainty resolves to the file-level answer]");
   eq(humanRefEvidenceIsMeasurable({}), false, "a malformed lineage object is unmeasurable");
   eq(completeHumanRefEvidenceTouches(null, 40, 15), false, "completeHumanRefEvidenceTouches's own answer for it is unchanged");
 
-  const noHumanCommit = compactLineage(summarizeLineage([], { humanRefs: goodRefs }));
+  // A COMPLETE walk that found no human commit at all IS a real measurement —
+  // nothing touched anything — so this must read as measurable, not the same
+  // "unmeasurable" as an incomplete walk. (Caught in the 2026-09-29 backlog
+  // review sweep: the first cut of this predicate conflated the two by
+  // checking the derived `mayHoldHumanEdit` flag, which is also `false` here,
+  // instead of `incomplete`/`hasHumanCommit` directly.)
+  const noHumanCommit = compactLineage(summarizeLineage([], {}));
   eq(
     humanRefEvidenceIsMeasurable(noHumanCommit),
+    true,
+    "a COMPLETE window with no human commit at all is measurable — 'no touch' is the real answer, not a default",
+  );
+  eq(
+    completeHumanRefEvidenceTouches(noHumanCommit, 40, 15),
     false,
-    "a window with no human commit at all is unmeasurable, not 'measured, no touch'",
+    "...and completeHumanRefEvidenceTouches's own answer for it is that same real 'no touch'",
   );
 
   const incompleteWalk = compactLineage(
     summarizeLineage(human, { humanRefs: goodRefs, incomplete: true, incompleteReason: "page_cap" }),
   );
   eq(humanRefEvidenceIsMeasurable(incompleteWalk), false, "an incomplete commit walk is unmeasurable even with complete refs");
+
+  const incompleteNoHumanCommit = compactLineage(summarizeLineage([], { incomplete: true, incompleteReason: "page_cap" }));
+  eq(
+    humanRefEvidenceIsMeasurable(incompleteNoHumanCommit),
+    false,
+    "...and an INCOMPLETE walk that has not (yet) seen a human commit is still unmeasurable, unlike the complete case above",
+  );
 
   const incompleteRefs = compactLineage(
     summarizeLineage(human, { humanRefs: { complete: false, refs: ["40:15"], reason: "diff_fetch_failed" } }),
