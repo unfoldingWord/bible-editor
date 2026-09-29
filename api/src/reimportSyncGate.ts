@@ -345,8 +345,11 @@ export function computeWithholdReason(
 //
 // Not an exact mirror in one direction: `errors` (batch errors without
 // apply_incomplete) do NOT withhold the stamp, but classify as failure here —
-// a run that logged errors should not read green. So SUCCESS still implies
-// the watermark was stamped; a failure does not always mean it was withheld.
+// a run that logged errors should not read green; a failure does not always
+// mean the stamp was withheld. SUCCESS is meant to imply the watermark was
+// stamped, but three plan branches (own-publish with a null file SHA, a DCS
+// fetch error, a truncated TSV) still leave it unstamped and read success
+// here; #1035 tracks them.
 export function classifyReimportOutcome(
   perResource: Record<
     string,
