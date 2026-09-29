@@ -3663,7 +3663,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             </Tooltip>
             <TimelineRail
               book={book}
-              chapter={chapter}
+              chapter={viewChapter}
               tiles={tileSet}
               activeVerse={activeVerse}
               showChapter={mode === "book"}
@@ -4255,7 +4255,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         enabledLanes={enabledLanes}
         onToggleLaneVisible={toggleLaneVisible}
         book={book}
-        chapter={chapter}
+        chapter={viewChapter}
         tiles={tileSet}
         canCheck={meUserId != null}
         onToggle={toggleLane}
