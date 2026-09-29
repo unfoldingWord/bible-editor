@@ -46,6 +46,10 @@ import {
   usfmRevertReport,
   tsvRevertReport,
   shouldRecordRevertReport,
+  shouldComputeRevertEntries,
+  masterIsOurLastPublish,
+  priorPublishPointer,
+  RECORD_PUSHED_RENDER_SQL,
   classifyRevertSeverity,
   mechanicalOverwriteAlert,
   isMasterConfirmed,
@@ -89,15 +93,16 @@ import {
   storedResourceSha,
   retireMergeKeptFlags,
   sweepStaleMergeNoBase,
+  readVerifiedPushedRenderText,
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
 import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
 import { dcsResourceFile, fetchDcsMasterText, fileBlobShaAtCommit, fileHeadCommit, type ReimportResource } from "./dcsSources";
-import { gitBlobSha, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
+import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
 import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
-import { hardRejectRows } from "./hardRejectGuard";
+import { buildHardRejectAlertMessage, hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
@@ -253,7 +258,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     results: StepResult[];
   }> {
     const workflowRunId = event.instanceId;
-    const instanceId = `export-${new Date(event.timestamp).toISOString().replace(/[:.]/g, "-")}`;
+    // Issue #858 item 6: the timestamp alone is millisecond-resolution, so two
+    // Workflow instances triggered in the same millisecond (a manual re-run
+    // racing the cron, say) would mint the identical instanceId. That id is
+    // sync_withholds.run_id's generation token (readSyncWithhold/
+    // clearSyncWithhold) and clearSyncWithhold now also compares it
+    // lexicographically to order overlapping runs — a collision there is a
+    // false "same run" match. Appending the real Workflow instance id
+    // (globally unique, and — like the timestamp — stable across a replay of
+    // this same instance) makes the whole string collision-proof while
+    // keeping the human-readable timestamp prefix, and preserves
+    // chronological string ordering: two different timestamps still diverge
+    // before either suffix is reached.
+    const instanceId = `export-${new Date(event.timestamp).toISOString().replace(/[:.]/g, "-")}-${workflowRunId}`;
     const observedAt = event.timestamp.getTime();
     const params = event.payload ?? {};
     await step.do("ledger-run-started", async () =>
@@ -1198,9 +1215,28 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // paragraphs above: blank OrigWords/TWLink are severity="warning", they merge
     // fine, and lint.ts plus the save-path guards are where a blank row gets
     // caught. Prod carries 0 blank-OrigWords rows today.
-    if (dcsAllowed && (resource === "tn" || resource === "twl")) {
+    //
+    // Unpaired `[ ]` in a tn Note (check 13) is the translator-fixable hard
+    // error this gate holds for (issue #1015, JER 17:4 ny7v). The banner names
+    // the row, and a clean render clears it — on a dry run too, since the
+    // clear only reads the bytes (the HOLD itself needs dcsAllowed).
+    if (resource === "tn" || resource === "twl") {
       const rejects = hardRejectRows(resource, built.content);
-      if (rejects.length > 0) {
+      if (rejects.length === 0) {
+        // The rows were fixed (or deleted): clear the HELD banner so it does not
+        // keep naming a row that is already fine. Best-effort, like writeAlert.
+        // Bound: an export that returns before this gate (stale_master,
+        // shrink_guard, no_rows) leaves the banner until a run reaches here.
+        try {
+          await this.env.DB.prepare(
+            `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+          )
+            .bind(EXPORT_ALERT_USERNAME, `export_hard_reject:${book}:${resource}`)
+            .run();
+        } catch (err) {
+          console.error(`export_hard_reject banner clear failed for ${book} ${resource}:`, err);
+        }
+      } else if (dcsAllowed) {
         await this.recordHardRejectAlert(book, resource, rejects);
         const reason = `hard_reject_guard:${rejects.length}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
@@ -1386,6 +1422,42 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // `built.readAt` for both, not "now": FIX D — the time D1 was actually READ,
       // so an edit landing between the read and this commit is dated after the
       // watermark instead of being swallowed into the merge ancestor.
+      // The base for the export-revert report below: the blob sha of the render
+      // we published LAST time. Read HERE — after every early-bail gate, so a
+      // night that holds the export never pays for it, and immediately before
+      // recordPushedRender replaces the column with tonight's render. By the
+      // time the report runs, this row no longer holds the previous publish.
+      // See masterIsOurLastPublish.
+      // pushed_r2_key (same row, same render) locates that render's bytes for
+      // the per-row three-way diff (#870); it is only fetched if a report runs.
+      // On a step.do retry whose first attempt already recorded tonight's
+      // render, the previous publish lives in prev_* (#995).
+      let priorPushedBlobSha: string | null = null;
+      let priorPushedR2Key: string | null = null;
+      try {
+        const prior = await this.env.DB.prepare(
+          `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key
+             FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+        )
+          .bind(book, resource)
+          .first<{
+            pushed_blob_sha: string | null;
+            pushed_r2_key: string | null;
+            prev_pushed_blob_sha: string | null;
+            prev_pushed_r2_key: string | null;
+          }>();
+        const pointer = priorPublishPointer(prior, r2Key);
+        priorPushedBlobSha = pointer.blobSha;
+        priorPushedR2Key = pointer.r2Key;
+      } catch (e) {
+        // Fail open — an unreadable base just means we report as before.
+        console.error("export: prior pushed_blob_sha read failed; revert report keeps its unfiltered behaviour", {
+          book,
+          resource,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+
       await this.recordPushedRender(
         book,
         resource,
@@ -1419,22 +1491,98 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // recorded it. Still no second fetch: usfmMasterContentForRevertReport
       // / tsvMasterContentForRevertReport are the same raw content the
       // shrink/alignment guards captured earlier in this method.
+      //
+      // Base check (masterIsOurLastPublish): if master still holds exactly the
+      // bytes we published last time, nobody else's edit is sitting there, so
+      // this export overwrites only our own prior render — there is no hand-edit
+      // to have lost and nothing to report. Without it, every night's ordinary
+      // translator work on an otherwise-untouched book raised a "overwrote
+      // master's current content" alert.
+      const masterContentForRevertReport =
+        resource === "ult" || resource === "ust"
+          ? usfmMasterContentForRevertReport
+          : tsvMasterContentForRevertReport;
+      // Hash only when a report is actually on the table. `dcsChanged` is false
+      // on every unchanged night — the common steady state — and SHA-1 over a
+      // multi-MB USFM or a 7776-row TSV is not free on a Worker this file
+      // already treats as CPU- and subrequest-constrained.
+      const masterBlobSha =
+        dcsChanged && masterContentForRevertReport != null
+          ? await gitBlobShaOrNull(masterContentForRevertReport)
+          : null;
+      // Suppression records ZERO entries rather than skipping the reporter:
+      // recordExportRevertReport's empty-list path is the only thing that clears
+      // stale export_reverts rows and resolves a standing
+      // export_revert_persistence alert, so skipping the call outright would
+      // leave a banner stuck forever on exactly the books this check quiets.
+      const computeEntries = shouldComputeRevertEntries(
+        dcsChanged,
+        masterContentForRevertReport,
+        masterBlobSha,
+        priorPushedBlobSha,
+      );
+      // Log only a suppression that really happened: without the ship gate this
+      // would announce "suppressed" on nights where no report was ever going to
+      // run, which is exactly the unmeasured-cause claim this file forbids.
+      if (
+        shouldRecordRevertReport(dcsChanged, masterContentForRevertReport) &&
+        !computeEntries &&
+        masterIsOurLastPublish(masterBlobSha, priorPushedBlobSha)
+      ) {
+        console.log(
+          `export: revert entries suppressed for ${book} ${resource} — master still holds our last publish (${(priorPushedBlobSha ?? "").slice(0, 12)})`,
+        );
+      }
+      // Per-row base for the three-way diff (#870): master moved somewhere, so
+      // report only the rows where it moved, not every row our own translators
+      // changed since our last publish. Fetched only here, after the file-level
+      // check above declined to suppress — one R2 read, plus a Door43 blob
+      // fetch only when the R2 copy is missing — on a subrequest-constrained
+      // workflow. Fails open: no base means every differing row is reported.
+      //
+      // The bytes must hash to pushed_blob_sha before they may suppress
+      // anything. The R2 key is per-instance and a step.do retry can rewrite it
+      // after recordPushedRender stored the sha, so the key alone does not
+      // prove it holds the render the sha describes; a mismatched base could
+      // hide a foreign edit, which is the one failure this report cannot have.
+      let revertBase: string | null = null;
+      if (computeEntries && priorPushedBlobSha != null) {
+        try {
+          // R2 first, Door43's blob by sha when R2 is missing or holds a
+          // different render than the sha describes.
+          revertBase = await readVerifiedPushedRenderText(this.env, book, resource, priorPushedR2Key, priorPushedBlobSha);
+        } catch (e) {
+          console.error("export: last-publish base read failed; revert report lists every differing row", {
+            book,
+            resource,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+        if (revertBase == null) {
+          console.log(`export: no last-publish base for ${book} ${resource}; revert report lists every differing row`);
+        }
+      }
       if (
         (resource === "ult" || resource === "ust") &&
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
-        const report = usfmRevertReport(built.content, usfmMasterContentForRevertReport as string);
-        await this.recordExportRevertReport(book, resource, "usfm", report.entries, mechanical, branch, instanceId, alertObservedAt);
+        const entries = computeEntries
+          ? usfmRevertReport(built.content, usfmMasterContentForRevertReport as string, revertBase).entries
+          : [];
+        await this.recordExportRevertReport(book, resource, "usfm", entries, mechanical, branch, instanceId, alertObservedAt);
       } else if (
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
       ) {
-        const report = tsvRevertReport(
-          built.content,
-          tsvMasterContentForRevertReport as string,
-          resource as "tn" | "tq" | "twl",
-        );
-        await this.recordExportRevertReport(book, resource, "tsv", report.entries, mechanical, branch, instanceId, alertObservedAt);
+        const entries = computeEntries
+          ? tsvRevertReport(
+              built.content,
+              tsvMasterContentForRevertReport as string,
+              resource as "tn" | "tq" | "twl",
+              revertBase,
+            ).entries
+          : [];
+        await this.recordExportRevertReport(book, resource, "tsv", entries, mechanical, branch, instanceId, alertObservedAt);
       }
 
       if (!commit.branchTouched) {
@@ -2662,39 +2810,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         });
       }
       const result = await this.env.DB.prepare(
-        `UPDATE book_resource_syncs
-            SET pushed_blob_sha =
-                  CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?3 ELSE pushed_blob_sha END,
-                pushed_read_at = MAX(COALESCE(pushed_read_at, 0), ?4),
-                -- P1.3: store this render's edit_log id boundary next to its
-                -- blob/read-time, guarded IDENTICALLY to pushed_blob_sha so the
-                -- trio always describes ONE render. markOwnPublishConverged
-                -- promotes it into master_confirmed_edit_id when a later sync
-                -- recognizes this render on master (the steady-state path).
-                pushed_edit_id =
-                  CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?6 ELSE pushed_edit_id END,
-                pushed_r2_key =
-                  CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?7 ELSE pushed_r2_key END,
-                master_confirmed_at =
-                  CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END,
-                -- Shadow master_confirmed_at, but ONLY when this render is the
-                -- newest confirmed one (?4 >= the stored master_confirmed_at).
-                -- Without that gate the two columns are MAX'd independently, and a
-                -- delayed OLDER render arriving while master_confirmed_edit_id is
-                -- still NULL (warm-up) would advance the id to the old render's
-                -- boundary (MAX(0, old) = old) while the timestamp stays at the
-                -- newer render (MAX keeps it) — the two would then describe
-                -- DIFFERENT renders and reconstruction (which prefers the id) would
-                -- fold too old an ancestor, reintroducing the false-conflict this
-                -- migration removes. The non-null guard additionally stops an empty
-                -- edit_log (?6 NULL) from coercing this to a bogus 0. When the gate
-                -- passes, ?6 >= the stored id (readAt and MAX(id) move together per
-                -- build), so MAX here equals a direct assign but also can't regress.
-                master_confirmed_edit_id =
-                  CASE WHEN ?5 = 1 AND ?6 IS NOT NULL AND ?4 >= COALESCE(master_confirmed_at, 0)
-                       THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?6)
-                       ELSE master_confirmed_edit_id END
-          WHERE book = ?1 AND resource = ?2`,
+        RECORD_PUSHED_RENDER_SQL,
       )
         .bind(book, resource, blobSha, readAt, confirmMaster ? 1 : 0, editBoundary, r2Key)
         .run();
@@ -2715,12 +2831,18 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
   }
 
-  // Clear stale export_reverts rows for a book+resource that was actually
-  // compared against master this run and found to have zero reverts — the
-  // genuinely-clean case, distinct from "we never compared" (master
-  // unreadable), which must NOT clear yesterday's real findings. Callers are
-  // responsible for only invoking this when master was readable AND the
-  // report came back with 0 entries.
+  // Clear stale export_reverts rows for a book+resource with nothing to report
+  // this run — distinct from "we never compared" (master unreadable), which
+  // must NOT clear yesterday's real findings. Callers are responsible for only
+  // invoking this when master was readable AND there is nothing to report.
+  //
+  // Two ways to reach "nothing to report", both legitimate: the comparison ran
+  // and found zero reverts, or shouldComputeRevertEntries declined to compute
+  // because master still holds our own last publish, so any difference is our
+  // own work and there is nothing of anyone else's to record. Either way the
+  // clear states something measured — and the rows are replaced wholesale on
+  // every reporting night anyway (recordExportReverts opens with the same
+  // DELETE), so a suppressed night destroys nothing a normal night would keep.
   private async clearExportReverts(
     book: string,
     resource: Resource,
@@ -3062,17 +3184,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     rejects: Array<{ ref: string; rowId: string; reason: string }>,
   ): Promise<void> {
     const source = `export_hard_reject:${book}:${resource}`;
-    const shown = rejects
-      .slice(0, 6)
-      .map((r) => `${r.ref} (${r.rowId}): ${r.reason}`)
-      .join("; ");
-    const more = rejects.length > 6 ? `; +${rejects.length - 6} more` : "";
-    const message =
-      `Benjamin — nightly export HELD ${book} ${resource.toUpperCase()}: ${rejects.length} row(s) would fail DCS ` +
-      `validation as a hard error, so the -be- PR's check would go red and the merge bot would never merge it. ` +
-      `${shown}${more}. Fix the Occurrence on those rows (or delete them) in the editor and re-export; every other ` +
-      `edit in ${book} ${resource.toUpperCase()} is waiting on it. Blank notes/questions/OrigWords/TWLink do NOT ` +
-      `cause this — those are validator warnings and ship normally.`;
+    const message = buildHardRejectAlertMessage(book, resource, rejects);
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
