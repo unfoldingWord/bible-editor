@@ -415,6 +415,18 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     assert(hl.has("c2|1") && show(hl) === show(main), `over-claiming milestone on 1:2 lights c2 like main (got ${show(hl)}, main ${show(main)})`);
   }
 
+  console.log("\n[Case] a note whose verse is before the bridge joins on the bridge's start verse, as on main (#957 final)");
+  {
+    // A TN on 1:1-2 painted as covered over a ULT 1:2-4 row. B occurs once in
+    // v2 and again in v4; main joined against the start verse (v2) alone.
+    const uhb = src([[C], [B], [C], [B]]);
+    const parsed = vo(`\\id ZEC\n\\c 1\n\\v 2-4 ${[Z(B, 1, 2, "b2"), Z(B, 2, 2, "b4")].join(" ")}\n`);
+    const row = mk(2, 4, parsed["2-4"] ?? parsed["2"], "ULT");
+    const hl = rowHL(row, B, 1, uhb, 1, true);
+    const main = mainRows(row, B, 1, uhb, 2, true);
+    assert(show(hl) === show(main), `note on 1:1 over a 2-4 bridge equals main's start-verse join (got ${show(hl)}, main ${show(main)})`);
+  }
+
   console.log("\n[Case] later-verse note whose quote does not resolve from its verse falls back to that verse alone (#957 review 2)");
   {
     // The source map lacks v2; the quote C exists only in v1.
