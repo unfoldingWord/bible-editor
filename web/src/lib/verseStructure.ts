@@ -109,8 +109,14 @@ export function reduceVerses(
  *     a row the fetch lacks; `rowReplace` never does (a row the server deleted
  *     must not be resurrected by an older event). A row of another chapter (a
  *     late createRow response after navigation) is never inserted. Row ids are
- *     never reused, so `rowDelete` is final. An optimistic
- *     `applyLocalRowPatch` is not recorded (like a forced verse edit).
+ *     never reused, so `rowDelete` is final. A same-version optimistic patch
+ *     (preserve / hint / trashed_at / sort_order — a server write that never
+ *     bumps `version`, see rowUpsertGuard.ts) IS recorded, as `rowPatch`, but
+ *     only for the outbox-mediated path (Shell.tsx's `enqueueRow`): the
+ *     step's `opId` ties it to the outbox op that produced it, and the
+ *     caller (useChapter.ts) drops it from the sequencer's queue — via
+ *     `forget` — the moment that op settles. A row the fetch no longer has
+ *     is not patched (same guard as `rowReplace`).
  *   - `verseStatus` carries the server's `updated_at` and applies only when
  *     strictly newer than the fetched entry, or when the fetch has no entry
  *     for a verse that still has a row (statuses are only ever deleted by a
@@ -135,6 +141,7 @@ export type StructureStep =
   | { type: "rowInsert"; kind: RowKind; row: ChapterRow; afterId?: string }
   | { type: "rowReplace"; kind: RowKind; row: ChapterRow }
   | { type: "rowDelete"; kind: RowKind; id: string }
+  | { type: "rowPatch"; kind: RowKind; id: string; patch: Record<string, unknown>; opId: string }
   | { type: "verseStatus"; verse: number; done: boolean; updatedAt: number };
 
 type ChapterRow = TnRow | TqRow | TwlRow;
@@ -142,6 +149,34 @@ type ChapterRow = TnRow | TqRow | TwlRow;
 /** Verse structure steps; the rest are chapter data steps (rows, statuses). */
 export function isStructureStep(step: StructureStep): boolean {
   return step.type === "bridged" || step.type === "split" || step.type === "updated";
+}
+
+/**
+ * Steps chapterFetchSequencer.ts's `keepOnSupersede` should carry over when a
+ * merging refetch supersedes another one already in flight (or deferred).
+ * Structure steps always qualify — #729/#974's original rule. Two DATA steps
+ * qualify too, narrower than "every data step" (#974's original scope, which
+ * excluded every row/status step because one recorded before a superseding
+ * merge started is already reflected in its snapshot — replaying it stale
+ * could resurrect a row a newer snapshot correctly shows as gone):
+ *
+ *   - `rowDelete` is unconditionally safe to carry over. Row ids are never
+ *     reused, so a delete step can only ever remove a row — idempotently,
+ *     whether or not the snapshot already reflects it — never resurrect one.
+ *     Dropping it (pre-#989) let a row whose DELETE was still queued in the
+ *     outbox (offline, or mid-drain) reappear whenever a second merge
+ *     superseded the one that had inherited its delete step, until the next
+ *     refetch caught up — and an edit against it then PATCHed a deleted id.
+ *   - `rowPatch` is safe to carry over ONLY while its outbox op is still
+ *     unsettled. That is not enforced here: useChapter.ts removes a
+ *     `rowPatch` step from the sequencer's live queue (`forget`) the instant
+ *     its op settles (onOutboxResult / onOutboxDiscard), by any outcome. So
+ *     by the time this predicate ever sees a `rowPatch` step, it is already
+ *     known unsettled, and keeping every one this function is asked about is
+ *     exactly "keep it while unsettled."
+ */
+export function keepStepAcrossSupersede(step: StructureStep): boolean {
+  return isStructureStep(step) || step.type === "rowDelete" || step.type === "rowPatch";
 }
 
 /**
@@ -204,6 +239,18 @@ export function applyStep(prev: ChapterData, step: StructureStep): ChapterData {
       const list = prev[step.kind] as ChapterRow[];
       if (!list.some((r) => r.id === step.id)) return prev;
       return { ...prev, [step.kind]: list.filter((r) => r.id !== step.id) };
+    }
+    case "rowPatch": {
+      // No version to gate on — same-version fields by construction (#989).
+      // Safe only because the caller (keepStepAcrossSupersede + useChapter's
+      // `forget`) never lets an already-settled rowPatch reach here. A row
+      // the fetch no longer has is not patched, same as rowReplace.
+      const list = prev[step.kind] as ChapterRow[];
+      const idx = list.findIndex((r) => r.id === step.id);
+      if (idx < 0) return prev;
+      const next = list.slice();
+      next[idx] = { ...next[idx], ...step.patch };
+      return { ...prev, [step.kind]: next };
     }
     case "verseStatus": {
       const existing = prev.verseStatuses.find((s) => s.verse === step.verse);

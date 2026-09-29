@@ -19,12 +19,12 @@ import {
   type TwlOrderLock,
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
-import { onOutboxResult } from "../sync/outbox";
+import { onOutboxDiscard, onOutboxResult } from "../sync/outbox";
 import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
 import {
   applyStep,
   applyUpdated,
-  isStructureStep,
+  keepStepAcrossSupersede,
   mergeRefetched,
   reduceVerses,
   replaySteps,
@@ -57,6 +57,23 @@ export interface UseChapterReturn {
   retryAttempts: number;
   refetch: (opts?: RefetchOptions) => Promise<void>;
   applyLocalRowPatch: (kind: "tn" | "tq" | "twl", id: string, patch: Partial<TnRow & TqRow & TwlRow>) => void;
+  /**
+   * Record `patch` (already applied optimistically via `applyLocalRowPatch`)
+   * for replay while a merging refetch is pending, tied to the outbox op
+   * `opId` that carries it to the server. Only for a same-version patch
+   * (preserve / hint / trashed_at / sort_order): mergeRowList's "strictly
+   * newer wins" rule can't otherwise tell a still-in-flight local toggle from
+   * a same-version snapshot that already supersedes it (#989). The step is
+   * dropped from the queue — via `sequencer.forget` — the moment `opId`
+   * settles (see the onOutboxResult / onOutboxDiscard effect below), so it
+   * only ever replays while genuinely unsettled.
+   */
+  recordPendingRowPatch: (
+    kind: "tn" | "tq" | "twl",
+    id: string,
+    patch: Record<string, unknown>,
+    opId: string,
+  ) => void;
   applyLocalRowReplacement: (kind: "tn" | "tq" | "twl", row: TnRow | TqRow | TwlRow) => void;
   applyLocalRowDelete: (kind: "tn" | "tq" | "twl", id: string) => void;
   applyLocalRowInsert: (
@@ -144,8 +161,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       setStatus("error");
     },
     // A row / status step recorded before a newer merging GET was sent is in
-    // that GET's snapshot already; only verse-structure steps carry over.
-    keepOnSupersede: isStructureStep,
+    // that GET's snapshot already; verse-structure steps carry over, and so
+    // do rowDelete / rowPatch — see keepStepAcrossSupersede (#989).
+    keepOnSupersede: keepStepAcrossSupersede,
   });
 
   const refetch = useCallback((opts?: RefetchOptions) => {
@@ -192,6 +210,13 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         const next = list.map((r) => (r.id === id ? { ...r, ...patch } : r));
         return { ...prev, [kind]: next } as ChapterPayload;
       });
+    },
+    [],
+  );
+
+  const recordPendingRowPatch = useCallback<UseChapterReturn["recordPendingRowPatch"]>(
+    (kind, id, patch, opId) => {
+      sequencer.current?.record({ type: "rowPatch", kind, id, patch, opId });
     },
     [],
   );
@@ -411,6 +436,14 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // Adopt server-confirmed values when an outbox op succeeds.
   useEffect(() => {
     return onOutboxResult((op, result) => {
+      if (op.target.kind === "row" && (result.kind === "ok" || result.kind === "fatal" || result.kind === "locked")) {
+        // The patch either landed (the `ok` branch below adopts the server's
+        // row) or is never going to (fatal / locked) — either way this op is
+        // no longer "unsettled," so any `rowPatch` replay step recorded for
+        // it (#989) must stop replaying, on this outcome and every future
+        // merge alike.
+        sequencer.current?.forget((step) => step.type === "rowPatch" && step.opId === op.id);
+      }
       if (result.kind !== "ok") return;
       if (op.target.kind === "row") {
         const u = result.updated as TnRow | TqRow | TwlRow;
@@ -445,6 +478,17 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     });
   }, [book, chapter, applyLocalRowReplacement, applyRemoteVerse, applyLocalVerseStatus, applyLaneCheckers]);
 
+  // A discarded op (drop(), from the failed-ops drawer) never settles via
+  // onOutboxResult — it is a terminal exit no 200 will ever follow — so its
+  // rowPatch replay step (#989) must stop here instead.
+  useEffect(() => {
+    return onOutboxDiscard((op) => {
+      if (op.target.kind === "row") {
+        sequencer.current?.forget((step) => step.type === "rowPatch" && step.opId === op.id);
+      }
+    });
+  }, []);
+
   return {
     status,
     data,
@@ -452,6 +496,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     retryAttempts,
     refetch,
     applyLocalRowPatch,
+    recordPendingRowPatch,
     applyLocalRowReplacement,
     applyLocalRowDelete,
     applyLocalRowInsert,

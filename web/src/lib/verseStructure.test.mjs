@@ -3,7 +3,15 @@
 // any delivery order (#729). Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/verseStructure.test.mjs
 
-import { applyBridged, applySplit, applyStep, applyUpdated, mergeRefetched, replaySteps } from "./verseStructure.ts";
+import {
+  applyBridged,
+  applySplit,
+  applyStep,
+  applyUpdated,
+  keepStepAcrossSupersede,
+  mergeRefetched,
+  replaySteps,
+} from "./verseStructure.ts";
 
 let failed = 0;
 let passed = 0;
@@ -757,6 +765,60 @@ for (const sc of scenarios) {
     const eq = replaySteps(f, [{ type: "verseStatus", verse: 1, done: true, updatedAt: 100 }]);
     assert(eq === f, "A2: an equal timestamp cannot be proven newer — the fetch wins");
   }
+}
+
+// ---------------------------------------------------------------------------
+// #989: a superseding merge must inherit `rowDelete` and `rowPatch` steps
+// (chapterFetchSequencer.ts's `keepOnSupersede`), not just structure steps —
+// see keepStepAcrossSupersede's own comment for why each is safe.
+{
+  const note = (id, version, extra = {}) => ({ id, version, book: "ZEC", chapter: 1, verse: 1, sort_order: 1, trashed_at: null, preserve: 0, hint: 0, ...extra });
+  assert(keepStepAcrossSupersede({ type: "bridged", bibleVersion: "ult", bridge: v(1, 2, 2), removedVerse: 2, removedVersion: 1, absorbedVerses: [2] }), "structure step (bridged) carries over");
+  assert(keepStepAcrossSupersede({ type: "split", bibleVersion: "ult", start: v(1, 2), newVerses: [v(2, 2)] }), "structure step (split) carries over");
+  assert(keepStepAcrossSupersede({ type: "updated", bibleVersion: "ult", verse: v(1, 2) }), "structure step (updated) carries over");
+  assert(keepStepAcrossSupersede({ type: "rowDelete", kind: "tn", id: "b" }), "rowDelete always carries over — final and idempotent, never resurrects");
+  assert(keepStepAcrossSupersede({ type: "rowPatch", kind: "tn", id: "a", patch: { preserve: 1 }, opId: "op1" }), "rowPatch carries over — the caller (forget) is what stops it once its op settles");
+  assert(!keepStepAcrossSupersede({ type: "rowInsert", kind: "tn", row: note("n", 1) }), "rowInsert still does not carry over — a stale insert could resurrect what a newer snapshot correctly dropped");
+  assert(!keepStepAcrossSupersede({ type: "rowReplace", kind: "tn", row: note("a", 2) }), "rowReplace still does not carry over — same-version-or-older is already gated by applyStep, but staying conservative");
+  assert(!keepStepAcrossSupersede({ type: "verseStatus", verse: 1, done: true, updatedAt: 5 }), "verseStatus still does not carry over");
+}
+
+// #989: `rowPatch` applies a same-version field patch over a row the fetch
+// still has, and is a no-op for a row the fetch (and thus the merge) dropped.
+{
+  const note = (id, version, extra = {}) => ({ id, version, book: "ZEC", chapter: 1, verse: 1, sort_order: 1, trashed_at: null, preserve: 0, hint: 0, ...extra });
+  const payload = (extra = {}) => ({ book: "ZEC", chapter: 1, verses: {}, tn: [], tq: [], twl: [], verseStatuses: [], verseLaneChecks: [], twlOrderLocks: [], ...extra });
+  const f = payload({ tn: [note("a", 2, { preserve: 0 })] });
+  const out = applyStep(f, { type: "rowPatch", kind: "tn", id: "a", patch: { preserve: 1 }, opId: "op1" });
+  assert(out.tn?.[0]?.preserve === 1, "rowPatch applies its fields over the fetched row, same version");
+  assert(out.tn?.[0]?.version === 2, "rowPatch never touches version — it has none of its own");
+  const noRow = payload({ tn: [note("other", 1)] });
+  const gone = applyStep(noRow, { type: "rowPatch", kind: "tn", id: "a", patch: { preserve: 1 }, opId: "op1" });
+  assert(gone === noRow, "rowPatch is a no-op (identity) for a row the fetch/merge no longer has");
+}
+
+// #989 witness: the exact bug this closes. A tab optimistically deletes a
+// twl row (recording `rowDelete`) and, in the same window, patches a
+// DIFFERENT row's `preserve` bit (recording `rowPatch`) — both while a
+// merging refetch is already in flight. That GET's snapshot predates either
+// change (the DELETE is still queued in the outbox; the PATCH hasn't
+// settled), so on its own the merge resurrects the deleted row and reverts
+// the toggle. Replaying the two steps afterward (what `keepOnSupersede` +
+// `forget` deliver to useChapter, per #989) fixes both.
+{
+  const row = (id, version, extra = {}) => ({ id, version, book: "ZEC", chapter: 1, verse: 1, sort_order: 1, orig_words: "x", occurrence: 1, ...extra });
+  const payload = (extra = {}) => ({ book: "ZEC", chapter: 1, verses: {}, tn: [], tq: [], twl: [], verseStatuses: [], verseLaneChecks: [], twlOrderLocks: [], ...extra });
+  const prev = payload({ twl: [row("kept", 1, { preserve: 1 })] }); // "deleted" already spliced out locally
+  const fetched = payload({ twl: [row("deleted", 1), row("kept", 1, { preserve: 0 })] }); // stale GET: still has it, missed the toggle
+  const merged = mergeRefetched(prev, fetched);
+  assert(merged.twl.some((r) => r.id === "deleted"), "witness: the merge alone resurrects the tab's own pending delete");
+  assert(merged.twl.find((r) => r.id === "kept")?.preserve === 0, "witness: the merge alone reverts the tab's own unsettled same-version patch");
+  const fixed = replaySteps(merged, [
+    { type: "rowDelete", kind: "twl", id: "deleted" },
+    { type: "rowPatch", kind: "twl", id: "kept", patch: { preserve: 1 }, opId: "op1" },
+  ]);
+  assert(!fixed.twl.some((r) => r.id === "deleted"), "fix: replaying rowDelete removes the resurrected row");
+  assert(fixed.twl.find((r) => r.id === "kept")?.preserve === 1, "fix: replaying rowPatch restores the unsettled toggle");
 }
 
 console.log(`\nverseStructure: ${passed} passed, ${failed} failed`);
