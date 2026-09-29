@@ -233,8 +233,10 @@ export function rowHighlightsFor(
         sourceVerses.push(Array.isArray(vo) ? vo : []);
       }
       const hl = findBridgeTargetHighlights(targetVo, quote, occ, sourceVerses, noteVerse - start, partialGroups);
-      if (hl) return hl;
-      // Unresolved from the note's verse on: fall back to that verse's source
+      if (hl && hl.size > 0) return hl;
+      // Unresolved from the note's verse on, or resolved but joined to no
+      // milestone (e.g. one over-claiming its occurrence, which main's
+      // appears-once repair heals): fall back to that verse's source
       // alone (main's rows view), never the whole span, which would light an
       // earlier verse's copy. No source for the verse: nothing lights.
       const own = sourceByVerseStart[noteVerse]?.content;
