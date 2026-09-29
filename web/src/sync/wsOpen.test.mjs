@@ -76,4 +76,61 @@ function recorder() {
 assert.deepEqual(notifyOpen({}, false), { reconnect: false });
 assert.deepEqual(notifyOpen({}, true), { reconnect: true });
 
+// ── The open refetch wired to useChapter's request sequencer (#902) ───────
+// Shell wires `onOpen` to a merging refetch. Whichever lands first — the
+// mount GET or the socket's first open — the tab must render the mount GET
+// without waiting on the socket AND still get a merging GET issued after the
+// open. The full ordering matrix lives in hooks/chapterFetchSequencer.test.mjs.
+const { createChapterFetchSequencer } = await import("../hooks/chapterFetchSequencer.ts");
+
+function chapterRig() {
+  const requests = [];
+  const landed = [];
+  const seq = createChapterFetchSequencer({
+    onStart: () => {},
+    onAttempt: () => {},
+    onLanded: (payload, merge) => landed.push({ payload, merge }),
+    onError: () => {},
+  });
+  const load = (signal) => new Promise((resolve, reject) => {
+    const req = { resolve, aborted: false, startedAfterOpen: false };
+    signal.addEventListener("abort", () => { req.aborted = true; reject(new Error("abort")); });
+    requests.push(req);
+  });
+  const handlers = { onOpen: () => { void seq.refetch(load, true); } };
+  return { seq, load, requests, landed, handlers };
+}
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
+// GET #1 lands before the socket opens: rendered at once, merge issued on open.
+{
+  const c = chapterRig();
+  void c.seq.refetch(c.load, false);
+  c.requests[0].resolve("get1");
+  await flush();
+  assert.deepEqual(c.landed, [{ payload: "get1", merge: false }], "first paint does not wait for the socket");
+  notifyOpen(c.handlers, false);
+  assert.equal(c.requests.length, 2, "the first open issues the merging GET");
+  c.requests[1].resolve("get2");
+  await flush();
+  assert.deepEqual(c.landed.at(-1), { payload: "get2", merge: true });
+}
+
+// (regression) The socket opens first, while GET #1 is in flight: GET #1 is
+// not aborted, lands, and the merging GET #2 is issued after it (#902).
+{
+  const c = chapterRig();
+  void c.seq.refetch(c.load, false);
+  notifyOpen(c.handlers, false);
+  assert.equal(c.requests[0].aborted, false, "the first open must not abort the mount GET");
+  assert.equal(c.requests.length, 1, "no second GET until the mount GET lands");
+  c.requests[0].resolve("get1");
+  await flush();
+  assert.deepEqual(c.landed, [{ payload: "get1", merge: false }], "GET #1 renders");
+  assert.equal(c.requests.length, 2, "the merging GET #2 follows (still after the open)");
+  c.requests[1].resolve("get2");
+  await flush();
+  assert.deepEqual(c.landed.at(-1), { payload: "get2", merge: true }, "GET #2 merges over GET #1");
+}
+
 console.log("wsOpen.test.mjs: all assertions passed");

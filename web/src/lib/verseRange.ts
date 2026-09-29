@@ -13,6 +13,7 @@
 // reading `verses[bv][n]` directly.
 
 import type { VerseDto } from "../sync/api";
+import { highlightsFor, type HighlightKey } from "./highlight.ts";
 
 export type VerseSpan = readonly [start: number, end: number];
 
@@ -181,6 +182,57 @@ export function concatSourceRange(
   }
   byRange.set(key, { rows, out });
   return out;
+}
+
+// The source (UHB/UGNT) a target ULT/UST row aligns against: the row's own
+// verse for a singleton, every verse of [verse, verse_end] joined for a bridge.
+// Reading-column views (unaligned indicators, OL-anchored highlights) go
+// through this so they judge a bridge against the same source the aligner
+// uses (#957). A singleton returns the source row object itself.
+export function sourceForTargetRow(
+  sourceByVerseStart: Record<number, VerseDto> | undefined,
+  target: VerseDto | null | undefined,
+): VerseDto | null {
+  if (!target) return null;
+  const [start, end] = verseSpan(target);
+  return concatSourceRange(sourceByVerseStart, start, end);
+}
+
+// Note-quote highlights for a ULT/UST row, OL-anchored on the source the row
+// covers. `noteVerse` is the note's own verse, where its occurrence counts.
+// For a bridged row, a note on a later verse of the span joins exactly as
+// main's rows view did: against that verse's source alone, so the milestone
+// repairs in collectMilestoneRuns apply (#957); no source for that verse means
+// nothing lights. Every other note on a bridged row joins against the start
+// verse alone, as main did, so the whole-span source only ever feeds the
+// unaligned checks. Singletons use their own verse. `fallbackSource` stands in
+// when the map has no source row.
+//
+// Known limit: a bridge numbered ACROSS the span (x-occurrence counting every
+// verse) can light the wrong copy, or none, for a note whose word also occurs
+// in an earlier bridge verse. A span-aware join is follow-up work (#968).
+export function rowHighlightsFor(
+  bibleVersion: string,
+  target: VerseDto | null | undefined,
+  quote: string | null | undefined,
+  occurrence: number | null | undefined,
+  sourceByVerseStart: Record<number, VerseDto> | undefined,
+  noteVerse: number | null | undefined,
+  partialGroups = false,
+  fallbackSource?: unknown,
+): Set<HighlightKey> {
+  if (target && isRangeRow(target)) {
+    const [start, end] = verseSpan(target);
+    if (noteVerse != null && noteVerse > start && noteVerse <= end) {
+      const own = sourceByVerseStart?.[noteVerse]?.content;
+      return own ? highlightsFor(bibleVersion, target.content, quote, occurrence, own, partialGroups) : new Set();
+    }
+    // Any other note (on the first verse, before the span, or with no verse)
+    // joins against the start verse alone, as on main.
+    return highlightsFor(bibleVersion, target.content, quote, occurrence, sourceByVerseStart?.[start]?.content ?? fallbackSource, partialGroups);
+  }
+  const spanSource = sourceForTargetRow(sourceByVerseStart, target)?.content ?? fallbackSource;
+  return highlightsFor(bibleVersion, target?.content, quote, occurrence, spanSource, partialGroups);
 }
 
 function buildSourceRange(

@@ -24,6 +24,18 @@
 
 ## Escalated / blocked on a human (not a code change Claude can land alone)
 
+- **edit_log sweep index must reach prod before 2026-11-14 (issue #928)** — migration 0073 adds
+  `edit_log_kind_action_created`, and `EDIT_LOG_SWEEP_SQL` names it with `INDEXED BY`, so the sweep errors
+  ("no such index", caught and retried hourly) until the migration is applied. `npm run deploy` migrates first.
+  After deploy, re-run the issue's read-only `SELECT COUNT(*)` rehearsal at the 2026-12-01 cutoff and confirm
+  `sql_duration_ms` is well under 1 s.
+
+- **9 qere-pointing alignment milestones in locked books (issue #956)** — HAB 3:14 ULT+UST (×2 each), OBA 1:11
+  ULT, PSA 39:0 + 77:0 ULT+UST. Each `\zaln-s x-content` holds the qere, which since hbo_uhb `aad8ce31` sits only
+  in a UHB footnote, so the English word never highlights. `repair-canonize-alignment.mjs --qere-ketiv` computes
+  the ketiv replacement but reports rather than writes locked books. Fix on Door43 (admin), or unlock, re-dump,
+  and re-run. The unlocked EZK/1CH ten are covered by that script's SQL.
+
 - **Prod `DEU 27:22` TN content-dup** — 2 live PRISTINE notes, same content (occ 1, quote `שֹׁכֵב֙ עִם`,
   note "See how you translated 'lies with'…") under ids `y3oq` + `oi0y` (both valid ids — a pure
   doubling, not a digit-first id). The new reimport Guard 2 PREVENTS new doubles but does NOT remediate
@@ -71,6 +83,26 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **Server-side, Hebrew mark order is data, so never blanket-NFC a D1-vs-master compare.** 2026-09-25: the sync
+  canonizes `x-lemma` to UHB mark order while Door43 master is NFC, so 21 locked-book verses nobody touched hit the
+  #539 no-op guard as `adopt_conflict`, kept the flag, and their editors got false "Door43 overwrote your edits"
+  alerts (issue #977). NFC in `verseMerge.ts`'s `stableKey` was tried and rejected in review: a Door43 fix that puts
+  source attrs INTO UHB bytes would then read as converged and be reverted on export. The fix lives in the no-op
+  guard instead: drop the row only when D1 already equals canonized master AND raw master is NFC-equal to D1.
+
+- **A locked book freezes the merge ancestor, so Door43 is authoritative for it — and a markers-only overwrite
+  is logged, never alerted.** Measured 2026-09-24 (ZEC 1:17 ULT, Rich): the book was locked on 09-17, so the
+  export skipped it nightly, `master_confirmed_at` never advanced, and every Door43 commit read as "both changed"
+  against the last pre-lock app edit. The alert also said "wording, punctuation, and alignment changed" because
+  `visibleAdoptionChange.ts` failed closed on usfm-js's type-less `{tag:"ts\\*"}` node; the words were identical
+  and only `\p`/`\ts\*` markers had arrived. Of 228 open review rows prod-wide that day, 181 were false by the
+  same test and were resolved. Benjamin's rulings: a locked book accepts Door43 edits as authoritative ("the
+  lock is to prevent problems from the BE side"), but only on verses master actually moved since the ancestor
+  (`verseMerge.ts` step 3b), so an unlock → fix → re-lock → `lock/push` fix still in review is not reverted; and
+  a markers-only overwrite is a real overwrite worth seeing in history (#951) but not a data-loss alert. Only a
+  run's own `adopt_conflict` may reactivate a resolved flag. Open: structure paths (#949) and tn/tq/twl (#950)
+  do not honor the lock yet.
+
 - **D1 allows at most 5 terms in a compound SELECT (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`); node:sqlite allows
   500.** A 6-term `UNION ALL` fails on local workerd and remote D1 with `too many terms in compound SELECT`
   (measured 2026-09-23). SQL that passes a node:sqlite unit test can therefore be rejected on every prod run: the
@@ -78,6 +110,13 @@ Highlights that bite repeatedly:
   instead, and prove new SQL with `wrangler d1 execute … --command "EXPLAIN …"`, which is read-only even on prod.
   Also: an ad-hoc diagnostic query that re-runs a heavy query as a subquery can hit D1's CPU limit and reset the
   prod DB (`code 7429`); keep prod diagnostics narrow.
+
+- **Adding an index is not enough when an older index already orders a GROUP BY.** For the edit_log sweep,
+  SQLite (node:sqlite and local workerd D1 alike, with or without `ANALYZE`) kept reading through
+  `edit_log_row (kind, row_key)` after a `(kind, action, created_at)` index was added, because the old index
+  hands `GROUP BY row_key` its order for free; the sweep stayed at 21 s on a 1.5M-row synthetic table until
+  `INDEXED BY` forced the new index (3.9 s, #928). Check `EXPLAIN QUERY PLAN` after adding an index, and pin
+  the plan in a test (`editLogSweepPlan.test.mjs`). `INDEXED BY` makes the migration a hard prerequisite of the code.
 
 - **A verse cell's "hydrate from a saved draft" branch must never run for a draft the user is creating right
   now.** All three verse views (`ScriptureColumn` `ActiveLine`, `BookView` `VerseCell`, `DocColumn`) subscribe to
@@ -580,6 +619,12 @@ Highlights that bite repeatedly:
   script, systemd timer, secrets) is personal infrastructure and stays on that box, out of this repo. If you
   change how the test suites are invoked, how `STATE.md` is structured, or where the downstream fork lives,
   update that prompt too — nothing else will tell the routine.
+- **Door43's raw-file endpoint silently ignores a SHORT commit sha.** `GET /api/v1/repos/{o}/{r}/raw/{path}?ref=<10-char sha>`
+  returns the default branch's file with HTTP 200 instead of an error, so every "historical" version you fetch is
+  just master. Measured 2026-09-27 on `en_ult` `24-JER.usfm`: ten short-sha fetches all hashed to master's blob,
+  while the same commits by FULL sha gave ten different blobs. Always pass the full 40-char sha (the
+  `commits?path=` listing returns it), and confirm a fetch with `git hash-object` against the `contents?ref=`
+  `sha` field before reasoning from it.
 
 ## Stop conditions / goals
 
