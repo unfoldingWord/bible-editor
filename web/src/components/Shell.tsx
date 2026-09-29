@@ -2309,12 +2309,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // [chapter, initialVerse] — internal same-chapter verse selection sets
   // activeVerse directly without an URL push, so initialVerse doesn't change
   // and this won't clobber it. Skips the initial mount.
-  const chapterResetMounted = useRef(false);
+  //
+  // Detected by comparing against the previous (chapter, initialVerse) this
+  // effect actually saw, not a boolean latch (#842 step 4): a latch that's
+  // already flipped true survives a React StrictMode replay (setup → cleanup
+  // → setup) of this same first commit, so the replayed setup would see
+  // "not the initial mount" and fire the whole reset — 13 setState calls
+  // plus closeComments() — on mount, in dev only. Comparing keys instead
+  // means the replay's (chapter, initialVerse) still equals what was just
+  // recorded, so it reads as a no-op re-run of the same commit either way.
+  const chapterResetKey = useRef<{ chapter: number; initialVerse: number } | null>(null);
   useEffect(() => {
-    if (!chapterResetMounted.current) {
-      chapterResetMounted.current = true;
-      return;
-    }
+    const prev = chapterResetKey.current;
+    chapterResetKey.current = { chapter, initialVerse };
+    if (!prev || (prev.chapter === chapter && prev.initialVerse === initialVerse)) return;
     setActiveVerse(initialVerse);
     setActiveNoteId(null);
     setActiveWordId(null);
