@@ -262,6 +262,12 @@ export function App() {
   // Shell; used to clear the alert for a reply the user is already reading
   // (and to skip its toast), so the bell never nags about a thread in view.
   const viewedThreadIdsRef = useRef<Set<number>>(new Set());
+  // handleThreadsViewed below is a stable useCallback keyed only on
+  // [dismissViewedAlerts] — alerts is deliberately not a dep, since it changes
+  // on every alert refresh and would re-create the callback (and re-render
+  // every consumer) each time. Written during render so a later invocation
+  // (CommentsPopover reporting which threads are now open) dismisses against
+  // the alerts list this render actually received, not a stale closure.
   const alertsRef = useRef<SystemAlert[]>(alerts);
   alertsRef.current = alerts;
   // Each alert gets ONE automatic dismiss. Without this, a failing dismiss

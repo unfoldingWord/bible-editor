@@ -191,6 +191,12 @@ export function BookView({
   const previousScrollNonce = useRef(scrollNonce);
   const firstLayoutRef = useRef(true);
   const restoredTargetRef = useRef<string | null>(null);
+  // selectLocalVerse below is a stable useCallback([]) so memoized cells don't
+  // re-render every time activeChapter/activeVerse/onSelectVerse change
+  // identity (Shell hands us fresh values every render). Written during
+  // render, not in an effect: the callback fires later, from a cell's click
+  // handler, and must read whatever this render actually received rather
+  // than whatever was current when the callback itself was created.
   const selectionContextRef = useRef({ activeChapter, activeVerse, onSelectVerse });
   selectionContextRef.current = { activeChapter, activeVerse, onSelectVerse };
   const selectLocalVerse = useCallback((chapter: number, verse: number) => {
@@ -212,6 +218,13 @@ export function BookView({
   // see the scroll effect below.
   const [scrollPending, setScrollPending] = useState(false);
 
+  // The IntersectionObserver effect below is keyed only on [chapterObserver]
+  // (a stable identity) so the observer isn't torn down and rebuilt every
+  // time onLoadChapter changes identity — Shell hands us a fresh arrow every
+  // render. Read the latest callback through this ref instead, written
+  // during render so the observer's entry callback (which fires later,
+  // outside any render) always invokes whatever onLoadChapter this render
+  // actually received.
   const onLoadChapterRef = useRef(onLoadChapter);
   onLoadChapterRef.current = onLoadChapter;
   const observerRef = useRef<IntersectionObserver | null>(null);
