@@ -368,26 +368,59 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
 // Runs the flag/escalate lint (the DCS checks the export can't auto-fix) over the
 // book's live D1 rows and returns the issues, each with a ref + (for TN) a row id
 // so the UI can jump straight to it. Read-only; any authed user can view.
+//
+// Optional `?chapter=N` narrows the RESPONSE to one chapter's issues (issue #888):
+// a client can merge it into a cached full-book report after a save instead of
+// re-pulling the whole book. It also narrows the tn/tq/twl READS to that chapter,
+// since every tn/tq/twl check is genuinely per-row (refVerseList already refuses
+// a ref that spans chapters, so a row's own chapter is always the right scope).
+//
+// The ULT/UST/source verse reads and the checks built on them stay whole-book
+// regardless of `chapter`: lintPairedPunctuation and quoteIssues (inside
+// lintTranslationRows' `punctuation`/`usfm` fields) are DELIBERATELY book-wide —
+// their own comments record that per-chapter scoping was tried and reverted
+// because quoted speech legitimately spans a chapter break. Narrowing verses to
+// one chapter would either break that invariant or require duplicating it here;
+// instead every check still runs over the full book and only the OUTPUT is
+// filtered by chapter below, alongside the tn/tq/twl rows actually read.
+//
+// `flagCount`/`escalateCount` are always the counts for whatever this response
+// contains (the whole book with no `chapter`, one chapter with it) — a caller
+// merging a chapter-scoped response must recompute the merged totals itself
+// rather than trust these as book totals.
+//
+// Optional `?flagsOnly=1` drops `escalate` issues from the array (still counted
+// in `escalateCount`) for a caller that only renders the flag bucket.
 books.get("/:book/lint", requireAuth, async (c) => {
   const book = c.req.param("book").toUpperCase();
   if (!BOOK_NUMBERS[book]) return c.json({ error: "unknown_book", book }, 400);
 
+  const chapterParam = c.req.query("chapter");
+  let chapter: number | undefined;
+  if (chapterParam !== undefined) {
+    chapter = Number(chapterParam);
+    if (!Number.isInteger(chapter) || chapter < 0) {
+      return c.json({ error: "invalid_chapter", chapter: chapterParam }, 400);
+    }
+  }
+  const flagsOnly = c.req.query("flagsOnly") === "1" || c.req.query("flagsOnly") === "true";
+
   const srcVersion = NT_BOOKS.has(book) ? "UGNT" : "UHB";
+  const tnSql = `SELECT * FROM tn_rows WHERE book = ?1 AND deleted_at IS NULL AND trashed_at IS NULL${chapter !== undefined ? " AND chapter = ?2" : ""}
+       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`;
+  // tq/twl have no trashed_at column (only tn does), so filter deleted_at only.
+  const tqSql = `SELECT * FROM tq_rows WHERE book = ?1 AND deleted_at IS NULL${chapter !== undefined ? " AND chapter = ?2" : ""}
+       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`;
+  const twlSql = `SELECT * FROM twl_rows WHERE book = ?1 AND deleted_at IS NULL${chapter !== undefined ? " AND chapter = ?2" : ""}
+       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`;
+  const bind = (sql: string) => (chapter !== undefined ? c.env.DB.prepare(sql).bind(book, chapter) : c.env.DB.prepare(sql).bind(book));
+
   // One D1 round trip; all checks use the same transactional read snapshot.
   const results = await c.env.DB.batch([
-    c.env.DB.prepare(
-      `SELECT * FROM tn_rows WHERE book = ?1 AND deleted_at IS NULL AND trashed_at IS NULL
-       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
-    ).bind(book),
-    // tq/twl have no trashed_at column (only tn does), so filter deleted_at only.
-    c.env.DB.prepare(
-      `SELECT * FROM tq_rows WHERE book = ?1 AND deleted_at IS NULL
-       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
-    ).bind(book),
-    c.env.DB.prepare(
-      `SELECT * FROM twl_rows WHERE book = ?1 AND deleted_at IS NULL
-       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
-    ).bind(book),
+    bind(tnSql),
+    bind(tqSql),
+    bind(twlSql),
+    // ULT/UST/source stay whole-book — see the book-wide checks note above.
     c.env.DB.prepare(
       `SELECT * FROM verses WHERE book = ?1 AND bible_version = 'ULT' ORDER BY chapter, verse`,
     ).bind(book),
@@ -414,13 +447,26 @@ books.get("/:book/lint", requireAuth, async (c) => {
   const ultLint = lintTranslationRows(ult.results ?? [], srcWords);
   const ustLint = lintTranslationRows(ust.results ?? [], srcWords);
 
-  const issues = [
+  // tn/tq/twl issues: the rows themselves are already chapter-scoped above when
+  // `chapter` is set (the SQL WHERE clause), so no further filtering is needed —
+  // and none should be attempted here. Unlike the verse checks below, a tn row's
+  // `ref` is frequently NOT "<chapter>:<verse>": the "6. Reference" / "7.
+  // SupportReference" checks report the row's raw (possibly malformed) ref_raw
+  // verbatim, and legitimate values like "front:intro" have no numeric chapter
+  // prefix at all. Re-filtering by parsing `ref` would silently drop exactly
+  // the rows those checks exist to catch.
+  const rowIssues = [
     ...lintTnRows(tn.results ?? []).map((i) => ({ ...i, resource: "tn" })),
     ...lintTnQuotes(tn.results ?? [], srcWords).map((i) => ({ ...i, resource: "tn" })),
-    ...ultLint.alignment.map((i) => ({ ...i, resource: "ult" })),
-    ...ustLint.alignment.map((i) => ({ ...i, resource: "ust" })),
     ...lintTqRows(tq.results ?? []).map((i) => ({ ...i, resource: "tq" })),
     ...lintTwlRows(twl.results ?? []).map((i) => ({ ...i, resource: "twl" })),
+  ];
+  // Verse-derived issues: `ref` is always the literal "<chapter>:<verse>" here
+  // (every check below builds it from the row's own numeric chapter/verse), so
+  // filtering by its leading number is safe and exact.
+  let verseIssues = [
+    ...ultLint.alignment.map((i) => ({ ...i, resource: "ult" })),
+    ...ustLint.alignment.map((i) => ({ ...i, resource: "ust" })),
     ...ultLint.usfm.map((i) => ({ ...i, resource: "ult" })),
     ...ustLint.usfm.map((i) => ({ ...i, resource: "ust" })),
     ...ultLint.opening.map((i) => ({ ...i, resource: "ult" })),
@@ -432,9 +478,40 @@ books.get("/:book/lint", requireAuth, async (c) => {
     ...ultLint.punctuation.map((i) => ({ ...i, resource: "ult" })),
     ...ustLint.punctuation.map((i) => ({ ...i, resource: "ust" })),
   ];
+  // These checks (see the book-wide checks note above) still ran whole-book —
+  // filter their output down to the requested chapter.
+  if (chapter !== undefined) {
+    verseIssues = verseIssues.filter((i) => Number(i.ref.slice(0, i.ref.indexOf(":"))) === chapter);
+  }
+  let issues = [...rowIssues, ...verseIssues];
   const flagCount = issues.filter((i) => i.bucket === "flag").length;
   const escalateCount = issues.filter((i) => i.bucket === "escalate").length;
-  return c.json({ book, total: issues.length, flagCount, escalateCount, issues });
+  if (flagsOnly) issues = issues.filter((i) => i.bucket === "flag");
+  return c.json({
+    book,
+    ...(chapter !== undefined
+      ? {
+          chapter,
+          // The id of every non-deleted tn/tq/twl row IN this chapter (whether
+          // or not it currently has an issue) — this is how a caller merging
+          // this response into a cached full-book report knows which cached
+          // row-derived issues to drop, since a row-derived issue's own `ref`
+          // is not reliably "<chapter>:<verse>" (see the note above) and can't
+          // be used to detect chapter membership for a row that no longer has
+          // one. A row with no issue simply has no id in the corresponding
+          // `issues` entries below; its id still belongs here.
+          chapterRowIds: {
+            tn: (tn.results ?? []).map((r) => r.id),
+            tq: (tq.results ?? []).map((r) => r.id),
+            twl: (twl.results ?? []).map((r) => r.id),
+          },
+        }
+      : {}),
+    total: issues.length,
+    flagCount,
+    escalateCount,
+    issues,
+  });
 });
 
 books.post("/:book/import", requireEditor, async (c) => {
