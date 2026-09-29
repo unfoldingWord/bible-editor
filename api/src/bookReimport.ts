@@ -621,6 +621,14 @@ export interface ReimportCounts {
   // the quiet one. See stale_base_holds.reason = 'stale_tc_reexport_overridden'
   // for the durable half.
   stale_base_overridden: number;
+  // Issue #1033. 0 or 1 per resource per run: the resource was staged
+  // `changed: true` but its master commit SHA could not be read
+  // (fileCommitSha returned null), so the reimport-sync step applies the
+  // content yet skips recordResourceSync (`if (!e.masterSha) continue;`) — the
+  // watermark is NOT stamped. Seeded from the plan like stale_base_held. Read
+  // only by classifyReimportOutcome (reimportSyncGate.ts) so the run ledger
+  // does not record a success the watermark never certified; it gates nothing.
+  master_sha_unknown: number;
   // Issue #727. Pairs of verse rows, in chapters this run touched, whose
   // [verse, verse_end] ranges intersect (a `1-2` bridge beside a standalone `2`)
   // as found by applyVerseRows's post-apply structural audit. The export refuses
@@ -809,6 +817,7 @@ function zeroCounts(): ReimportCounts {
     merge_record_failed: false,
     stale_base_held: 0,
     stale_base_overridden: 0,
+    master_sha_unknown: 0,
     structure_overlap: 0,
     structure_kept_local: 0,
     structure_adopted: 0,
@@ -1070,6 +1079,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   // launder an absent measurement into a green light.
   into.stale_base_held += from.stale_base_held ?? 0;
   into.stale_base_overridden += from.stale_base_overridden ?? 0;
+  into.master_sha_unknown += from.master_sha_unknown ?? 0;
   // `?? 0` again for replayed pre-#727 chunk results. Safe here for the reason
   // shouldRecordResourceSync's doc gives: this is a positive end-of-chunk
   // measurement whose absence means "not measured on an older code path", and
@@ -10570,6 +10580,9 @@ export async function runChunkedReimport(
     if (e.noBaseCleared) perResource[e.resource].merge_no_base_cleared += e.noBaseCleared;
     if (e.staleBaseHold) perResource[e.resource].stale_base_held++;
     if (e.staleBaseOverridden) perResource[e.resource].stale_base_overridden++;
+    // Issue #1033: same plan-seeding rationale. The sync step's
+    // `if (!e.masterSha) continue;` leaves this resource unstamped.
+    if (e.changed && !e.masterSha) perResource[e.resource].master_sha_unknown++;
   }
 
   // Issue #639: the durable half of a stale-base refusal — a queryable row plus

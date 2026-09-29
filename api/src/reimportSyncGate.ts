@@ -325,6 +325,28 @@ export function computeWithholdReason(
 // conditions are even consulted, and — the point of the loop being
 // per-resource at all — a failure in any ONE resource wins over a book with
 // otherwise only skip conditions across the rest.
+//
+// Issue #1033: two ways a resource ends the run UNSTAMPED that neither
+// shouldRecordResourceSync nor computeWithholdReason sees, because both are
+// decided outside the reimport-sync step's gate (see bookReimport.ts's
+// runChunkedReimport):
+//   * `stale_base_held` — the stale-base gate (staleBaseGate.ts, #639) refused
+//     master's file at staging time and staged it `changed: false`, so the sync
+//     step never visits it. A deliberate hold that releases itself once master
+//     is repaired, the same class as chapters_locked → skip. A force-released
+//     hold is counted in `stale_base_overridden` instead and DOES stamp, so it
+//     is not read here.
+//   * `master_sha_unknown` — staged `changed: true` but master's commit SHA
+//     could not be read, so the sync step passes the gate and then skips
+//     recordResourceSync on `!e.masterSha`. An unmeasured DCS read, not a
+//     deliberate hold → failure.
+// Both read with `?? 0`: they are seeded from the plan onto a zeroCounts()
+// aggregate, never from a replayed chunk, so absence cannot launder a hold.
+//
+// Not an exact mirror in one direction: `errors` (batch errors without
+// apply_incomplete) do NOT withhold the stamp, but classify as failure here —
+// a run that logged errors should not read green. So SUCCESS still implies
+// the watermark was stamped; a failure does not always mean it was withheld.
 export function classifyReimportOutcome(
   perResource: Record<
     string,
@@ -339,6 +361,8 @@ export function classifyReimportOutcome(
       merge_record_failed?: boolean;
       apply_incomplete?: boolean;
       errors?: string[];
+      stale_base_held?: number;
+      master_sha_unknown?: number;
     }
   >,
   // The one resource (if any) this run's overrides apply to — mirrors
@@ -359,6 +383,7 @@ export function classifyReimportOutcome(
       t.apply_incomplete === true ||
       t.merge_record_failed === true ||
       (t.structure_overlap ?? 0) > 0 ||
+      (t.master_sha_unknown ?? 0) > 0 ||
       systemicRefusal;
     if (isFailure) return "failure";
 
@@ -378,7 +403,8 @@ export function classifyReimportOutcome(
       (t.chapters_locked ?? 0) > 0 ||
       (t.prune_locked ?? 0) > 0 ||
       (!idBlockedOverride && (t.conflict_skipped ?? 0) > 0) ||
-      (!idBlockedOverride && (t.tombstone_blocked ?? 0) > 0);
+      (!idBlockedOverride && (t.tombstone_blocked ?? 0) > 0) ||
+      (t.stale_base_held ?? 0) > 0;
     if (isSkip) sawSkip = true;
   }
   return sawSkip ? "skip" : "success";
