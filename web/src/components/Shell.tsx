@@ -31,6 +31,7 @@ import { outbox } from "../sync/outbox";
 import { api, ApiError, CHECK_LANES, setReadOnlyReason } from "../sync/api";
 import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
+import { trackLockedKey } from "../lib/chapterStale";
 import { countThreads, resolveCommentLocation, rowKey, type CommentThread, type LiveRows } from "../lib/commentsIndex";
 import { CommentsPopover } from "./CommentsPopover";
 import type { CommentTarget, NewCommentDraft, OpenCommentsFn } from "./commentsTarget";
@@ -404,6 +405,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyWsComment,
     reload: reloadComments,
   } = useComments(data?.book ?? book, data?.chapter ?? chapter, commentsEnabled, commentLiveRows);
+  // A → B → A keeps A on screen, so the key above never changes and A's
+  // comments would not refetch, although the socket followed B meanwhile and
+  // missed A's comment events. Reload them when such a lock lifts (#892).
+  const commentsLockedKeyRef = useRef<string | null>(null);
+  const commentsKey = data ? `${data.book}/${data.chapter}` : null;
+  useEffect(() => {
+    if (commentsKey == null) return;
+    const next = trackLockedKey(commentsLockedKeyRef.current, chapterStale, commentsKey);
+    commentsLockedKeyRef.current = next.lockedKey;
+    if (next.reload) reloadComments();
+  }, [chapterStale, commentsKey, reloadComments]);
 
   // Live cross-tab updates. The server broadcasts row writes via the
   // ChapterRoom DO; we dedupe by version so the originating user's tab

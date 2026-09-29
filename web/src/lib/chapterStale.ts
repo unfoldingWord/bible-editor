@@ -88,3 +88,21 @@ export function isChapterLocked(
   if (!data) return false;
   return isStaleChapter(data, route) || landedGen !== currentGen;
 }
+
+/**
+ * Whether to reload the comments when a chapter lock lifts. Comments are keyed
+ * on the chapter on screen, so a lock that ends on the key it started on
+ * (A → B → A: A stayed on screen throughout) changes nothing that would
+ * refetch them, although the tab's ChapterRoom socket followed B meanwhile and
+ * A's comment events never arrived. A lock that ends on another key (A → B)
+ * needs no reload: the key change fetches. Call on every render with the
+ * returned `lockedKey` carried over.
+ */
+export function trackLockedKey(
+  lockedKey: string | null,
+  stale: boolean,
+  key: string,
+): { lockedKey: string | null; reload: boolean } {
+  if (stale) return { lockedKey: lockedKey ?? key, reload: false };
+  return { lockedKey: null, reload: lockedKey === key };
+}
