@@ -29,6 +29,7 @@ import { parseVerseContentJson } from "./contentJson.ts";
 import { extractPlainText, isInFlowMarker, isTsMilestone } from "./importParsers.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
 import { hasOpeningPunctInsideMilestone } from "./openingPunct.ts";
+import { bracketProblems } from "./hardRejectGuard.ts";
 
 // Lint checks only read their trees. Keep at most one row's parsed tree while
 // running the per-verse checks together; retaining a whole large book's trees
@@ -99,42 +100,6 @@ function isBlankRequired(s: string | null | undefined): boolean {
 const REFERENCE_RE = /^(?:front:intro|(?!0:)\d+:intro|(?!0:)\d+:front|(?!0:)\d+:\d+(?:[,-][\d,:-]*\d+)*)$/;
 const SUPPORT_REFERENCE_RE = /^rc:\/\/[^/]+\/[^/]+\/[^/]+\/[^ \\]+$/;
 const ALT_LABEL_RE = /Alternat(?:e|ive)( *)([Tt])ranslation/g;
-
-// Port of validate_tn_files.py validate_paired_square_brackets. Returns the
-// human-readable problems with `[ ]` nesting in a note.
-function bracketProblems(note: string): string[] {
-  const out: string[] = [];
-  const stack: Array<{ len: number; pos: number }> = [];
-  let i = 0;
-  while (i < note.length) {
-    const ch = note[i];
-    if (ch !== "[" && ch !== "]") {
-      i++;
-      continue;
-    }
-    let j = i;
-    while (j < note.length && note[j] === ch) j++;
-    const runLen = j - i;
-    const token = ch.repeat(runLen);
-    if (ch === "[") {
-      stack.push({ len: runLen, pos: i });
-    } else if (stack.length === 0) {
-      out.push(`Closing bracket '${token}' at character ${i + 1} has no matching opening bracket.`);
-    } else {
-      const open = stack.pop()!;
-      if (open.len !== runLen) {
-        out.push(
-          `Opening bracket '${"[".repeat(open.len)}' at character ${open.pos + 1} is closed by '${token}' at character ${i + 1}; bracket sizes must match.`,
-        );
-      }
-    }
-    i = j;
-  }
-  for (const open of stack) {
-    out.push(`Opening bracket '${"[".repeat(open.len)}' at character ${open.pos + 1} has no matching closing bracket.`);
-  }
-  return out;
-}
 
 // Port of the JUDGEMENT-CALL subset of validate_alternate_translation_label:
 // a label whose preceding text has no sentence terminator (the auto-fix can't
