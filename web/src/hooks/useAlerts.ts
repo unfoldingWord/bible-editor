@@ -61,9 +61,12 @@ export function useAlerts(authReady: boolean): {
   const refresh = useCallback(async () => {
     const seq = ++seqRef.current;
     try {
-      const list = await fetchAlerts();
-      refocusThrottle.markSuccess();
+      const fetched = await fetchAlerts();
       if (seq !== seqRef.current) return;
+      // A 401 comes back as null and is treated as an empty list, as before,
+      // but it is not a real answer, so it does not hold off the next refocus.
+      if (fetched) refocusThrottle.markSuccess();
+      const list = fetched ?? [];
       const known = knownIdsRef.current;
       if (known) {
         const cutoff = firstLoadAtRef.current - FRESH_SKEW_S;

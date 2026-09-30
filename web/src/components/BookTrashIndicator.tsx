@@ -88,8 +88,9 @@ export function BookTrashIndicator({ book, onNavigate, refreshSignal, onRestore 
     api
       .getBookTrash(book)
       .then((r) => {
+        if (cancelled) return;
         refocusThrottle.markSuccess();
-        if (!cancelled) setRows(r.rows);
+        setRows(r.rows);
       })
       .catch(() => !cancelled && setRows([]));
     return () => {

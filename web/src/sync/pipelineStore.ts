@@ -246,7 +246,12 @@ const STALE_NOTIFICATION_CUTOFF_SECONDS = 24 * 60 * 60;
 async function loadFromServer() {
   try {
     const res = await api.pipelineList();
-    refocusThrottle.markSuccess();
+    // Stamp only when visible: pollTick() below skips a hidden tab, so a
+    // hidden load (the 120 s ticker keeps running) never fetched the upstream
+    // status of the user's own running jobs. Stamping it would make the
+    // refocus reload skip, and a finished run would keep its lagging D1 state
+    // (no toast, chapter still AI-locked) until the next tick.
+    if (typeof document === "undefined" || !document.hidden) refocusThrottle.markSuccess();
     queueSummary = res.queue ?? null;
     // Collect terminal jobs we haven't toasted yet *before* mutating the
     // jobs map. Anything in the response with state=done/failed and
@@ -316,7 +321,12 @@ async function loadFromServer() {
 export const pipelineStore = {
   subscribe(fn: JobsListener): () => void {
     subscribers.add(fn);
-    fn(snapshot());
+    const list = snapshot();
+    // The new subscriber now holds this content, so it is what was last
+    // notified. Without this, a zero-subscriber window leaves an older key
+    // behind and an exact revert to it would be skipped.
+    lastNotifiedKey = pipelineNotifyKey(list, queueSummary);
+    fn(list);
     if (!initStarted) {
       initStarted = true;
       void loadFromServer().then(() => ensurePolling());
