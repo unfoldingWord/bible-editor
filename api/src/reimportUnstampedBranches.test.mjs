@@ -181,7 +181,7 @@ try {
     const { env } = freshEnv();
     stubFetch({ commits: null, raw: null });
     const { entry, perResource } = await plan(env, "XYZ", ["ult"]);
-    eq(entry.masterSha, null, "no Door43 file for this book → null SHA");
+    eq(entry.masterSha, null, "book not in BOOK_NUMBERS (no resource file mapped) → null SHA");
     eq(
       [perResource.ult.fetch_failed, perResource.ult.tsv_truncated, perResource.ult.own_publish_unstamped],
       [0, 0, 0],
