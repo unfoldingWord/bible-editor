@@ -911,8 +911,73 @@ function StackedBody({
 }) {
   const ult = indexByVersion["ULT"] ?? EMPTY_COLUMN;
   const ust = indexByVersion["UST"] ?? EMPTY_COLUMN;
-  const uhb = indexByVersion["UHB"] ?? indexByVersion["UGNT"] ?? {};
+  const uhb = indexByVersion["UHB"] ?? indexByVersion["UGNT"] ?? EMPTY_COLUMN;
   const uhbLabel = isHebrew ? "UHB" : "UGNT";
+  // OL-anchor the ULT/UST highlights on the active verse's source (UHB/UGNT)
+  // verse so reordered translations still light up. During a preview the
+  // yellow follows the MOVED note (so a hover over a non-selected note's grip
+  // still lights it); otherwise the active note. Bridged rows anchor on
+  // their whole source span via rowHighlightsFor, which is why `uhb` (the
+  // whole column, not just activeUhbV) is threaded through below (#957).
+  const activeUltV = ult[activeVerse];
+  const activeUstV = ust[activeVerse];
+  const activeUhbV = uhb[activeVerse];
+  const ro = reorderHighlight;
+  const activeQuote = ro?.movedQuote ?? activeNoteQuote;
+  const activeOcc = ro?.movedQuote ? ro.movedOccurrence : activeNoteOccurrence;
+  const activePartial = !ro?.movedQuote && activeNoteQuotePartialGroups;
+  // A note's occurrence counts within its own verse, which a bridged row
+  // needs to find the right source instance (#957).
+  const activeNoteVerseForOcc = ro?.movedQuote ? ro.movedVerse : activeNoteVerse;
+  // Hoisted out of the per-verse .map() below: up to 9 highlight Sets only
+  // for the single active row, recomputed only when the active verse's own
+  // content, the source column (bridged rows can span it), or the
+  // highlight-driving quote/occurrence actually changes — not on every
+  // StackedBody render (e.g. an unrelated verse's save).
+  const activeHighlights = useMemo(() => {
+    const ultHL = rowHighlightsFor("ULT", activeUltV, activeQuote, activeOcc, uhb, activeNoteVerseForOcc, activePartial);
+    const ustHL = rowHighlightsFor("UST", activeUstV, activeQuote, activeOcc, uhb, activeNoteVerseForOcc, activePartial);
+    const uhbHL = highlightsFor(uhbLabel, activeUhbV?.content, activeQuote, activeOcc, undefined, activePartial);
+    // Reorder stoplight: the moved note's candidate neighbours, resolved per
+    // version (ULT/UST OL-anchored on UHB, like the active set). Undefined
+    // unless a drag / hover / recent arrow-move is in flight.
+    const ultPrevHL = ro?.prevQuote
+      ? rowHighlightsFor("ULT", activeUltV, ro.prevQuote, ro.prevOccurrence, uhb, ro.prevVerse)
+      : undefined;
+    const ultNextHL = ro?.nextQuote
+      ? rowHighlightsFor("ULT", activeUltV, ro.nextQuote, ro.nextOccurrence, uhb, ro.nextVerse)
+      : undefined;
+    const ustPrevHL = ro?.prevQuote
+      ? rowHighlightsFor("UST", activeUstV, ro.prevQuote, ro.prevOccurrence, uhb, ro.prevVerse)
+      : undefined;
+    const ustNextHL = ro?.nextQuote
+      ? rowHighlightsFor("UST", activeUstV, ro.nextQuote, ro.nextOccurrence, uhb, ro.nextVerse)
+      : undefined;
+    const uhbPrevHL = ro?.prevQuote
+      ? highlightsFor(uhbLabel, activeUhbV?.content, ro.prevQuote, ro.prevOccurrence)
+      : undefined;
+    const uhbNextHL = ro?.nextQuote
+      ? highlightsFor(uhbLabel, activeUhbV?.content, ro.nextQuote, ro.nextOccurrence)
+      : undefined;
+    return { ultHL, ustHL, uhbHL, ultPrevHL, ultNextHL, ustPrevHL, ustNextHL, uhbPrevHL, uhbNextHL };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeUltV,
+    activeUstV,
+    activeUhbV,
+    uhb,
+    activeQuote,
+    activeOcc,
+    activePartial,
+    activeNoteVerseForOcc,
+    uhbLabel,
+    ro?.prevQuote,
+    ro?.prevOccurrence,
+    ro?.nextQuote,
+    ro?.nextOccurrence,
+    ro?.prevVerse,
+    ro?.nextVerse,
+  ]);
   return (
     <Box
       sx={(theme) => ({
@@ -933,29 +998,20 @@ function StackedBody({
           // ULT/UST row joins every UHB verse of its span (#957).
           const ultSrc = sourceForTargetRow(uhb, ultV)?.content;
           const ustSrc = sourceForTargetRow(uhb, ustV)?.content;
-          // OL-anchor the ULT/UST highlights on the active verse's source
-          // (UHB/UGNT) verse so reordered translations still light up.
-          // During a preview the yellow follows the MOVED note (so a hover over
-          // a non-selected note's grip still lights it); otherwise the active note.
-          const ro = reorderHighlight;
-          const aQuote = ro?.movedQuote ?? activeNoteQuote;
-          const aOcc = ro?.movedQuote ? ro.movedOccurrence : activeNoteOccurrence;
-          const partial = !ro?.movedQuote && activeNoteQuotePartialGroups;
-          // A note's occurrence counts within its own verse, which a bridged
-          // row needs to find the right source instance (#957).
-          const aVerse = ro?.movedQuote ? ro.movedVerse : activeNoteVerse;
-          const ultHL = rowHighlightsFor("ULT", ultV, aQuote, aOcc, uhb, aVerse, partial);
-          const ustHL = rowHighlightsFor("UST", ustV, aQuote, aOcc, uhb, aVerse, partial);
-          const uhbHL = highlightsFor(uhbLabel, uhbV?.content, aQuote, aOcc, undefined, partial);
-          // Reorder stoplight: the moved note's candidate neighbours, resolved
-          // per version (ULT/UST OL-anchored on UHB, like the active set).
-          // Undefined unless a drag / hover / recent arrow-move is in flight.
-          const ultPrevHL = ro?.prevQuote ? rowHighlightsFor("ULT", ultV, ro.prevQuote, ro.prevOccurrence, uhb, ro.prevVerse) : undefined;
-          const ultNextHL = ro?.nextQuote ? rowHighlightsFor("ULT", ultV, ro.nextQuote, ro.nextOccurrence, uhb, ro.nextVerse) : undefined;
-          const ustPrevHL = ro?.prevQuote ? rowHighlightsFor("UST", ustV, ro.prevQuote, ro.prevOccurrence, uhb, ro.prevVerse) : undefined;
-          const ustNextHL = ro?.nextQuote ? rowHighlightsFor("UST", ustV, ro.nextQuote, ro.nextOccurrence, uhb, ro.nextVerse) : undefined;
-          const uhbPrevHL = ro?.prevQuote ? highlightsFor(uhbLabel, uhbV?.content, ro.prevQuote, ro.prevOccurrence) : undefined;
-          const uhbNextHL = ro?.nextQuote ? highlightsFor(uhbLabel, uhbV?.content, ro.nextQuote, ro.nextOccurrence) : undefined;
+          // Highlight Sets for the active row are memoized above (activeHighlights)
+          // so an unrelated re-render doesn't recompute up to 9 Sets and bust
+          // ActiveLine's downstream HTML memos.
+          const {
+            ultHL,
+            ustHL,
+            uhbHL,
+            ultPrevHL,
+            ultNextHL,
+            ustPrevHL,
+            ustNextHL,
+            uhbPrevHL,
+            uhbNextHL,
+          } = activeHighlights;
           // For multi-verse blocks, PATCH and find/replace target the canonical
           // row at verse_start (e.g. 6 for a 6-9 range), not the active integer.
           const ultStart = ultV?.verse ?? v;
@@ -1119,19 +1175,29 @@ function StackedBody({
         // Inactive rows are memoized (InactiveVerseRow) so selecting a verse
         // re-renders only the two rows whose active state actually flips — the
         // rest of the chapter's verse list is skipped. Bridged TN refs still
-        // paint quote highlights on covered non-active verses.
+        // paint quote highlights on covered non-active verses. Resolved
+        // per-verse DTOs (not the whole ult/ust/uhb column maps) are passed
+        // down: applyUpdated (verseStructure.ts) only replaces the touched
+        // verse's key, so an unrelated verse's DTO keeps its identity across
+        // an edit even though indexByVersion rebuilds the containing map —
+        // that keeps InactiveVerseRow's memo comparator meaningful instead of
+        // invalidating on every edit anywhere in the chapter.
         const coverHighlight =
           !!activeNoteQuotePartialGroups &&
           !!activeNoteCoveredVerses.includes(v) &&
           !!activeNoteQuote;
+        const showUlt = !!ultV && isFirstOfRange(ultV, v);
+        const showUst = !!ustV && isFirstOfRange(ustV, v);
         return (
           <InactiveVerseRow
             key={v}
             v={v}
             chapter={chapter}
-            ult={ult}
-            ust={ust}
+            ultV={ultV}
+            ustV={ustV}
             uhb={uhb}
+            ultPrev={showUlt ? findPrevRowInColumn(ult, ultV.verse) : null}
+            ustPrev={showUst ? findPrevRowInColumn(ust, ustV.verse) : null}
             noteQuote={coverHighlight ? activeNoteQuote : null}
             noteOccurrence={coverHighlight ? activeNoteOccurrence : null}
             noteVerse={coverHighlight ? activeNoteVerse ?? null : null}
@@ -1152,15 +1218,19 @@ function StackedBody({
 // active verse — the common navigation — re-renders only the two rows whose
 // active state flips, not the whole chapter's verse list. Compared by the data
 // that affects its render; onSelectVerse is treated as stable (it only ever
-// calls onSelectVerse(v) for this row's own verse). ult / ust are stable column
-// maps, so they change ref only on a real verse-content edit.
+// calls onSelectVerse(v) for this row's own verse). ultV / ustV are this
+// row's own resolved verse DTOs (not the whole column map), so they change
+// ref only when THIS verse's content actually changes — an edit to a
+// different verse in the same chapter leaves them untouched.
 const InactiveVerseRow = memo(
   function InactiveVerseRow({
     v,
     chapter,
-    ult,
-    ust,
+    ultV,
+    ustV,
     uhb,
+    ultPrev,
+    ustPrev,
     noteQuote,
     noteOccurrence,
     noteVerse,
@@ -1173,9 +1243,11 @@ const InactiveVerseRow = memo(
   }: {
     v: number;
     chapter: number;
-    ult: Record<number, VerseDto>;
-    ust: Record<number, VerseDto>;
+    ultV: VerseDto | undefined;
+    ustV: VerseDto | undefined;
     uhb: Record<number, VerseDto>;
+    ultPrev: VerseDto | null;
+    ustPrev: VerseDto | null;
     noteQuote: string | null;
     noteOccurrence: number | null;
     noteVerse: number | null;
@@ -1186,10 +1258,16 @@ const InactiveVerseRow = memo(
     commentCounts?: CommentCounts;
     onOpenComments?: (anchorEl: HTMLElement, verse: number) => void;
   }) {
-    const ultV = ult[v];
-    const ustV = ust[v];
     // Bridged rows anchor on their whole source span, matched from the
-    // note's own verse (rowHighlightsFor, #957).
+    // note's own verse (rowHighlightsFor, #957). uhb is the one prop here
+    // that's still the whole column map rather than a resolved per-verse
+    // DTO — rowHighlightsFor needs it to look up an arbitrary verse inside
+    // the bridge's span, not just this row's own verse — so it's excluded
+    // from the memo comparator below rather than compared by reference:
+    // UHB/UGNT are read-only/upstream (never edited live), so treating it
+    // as unchanging there is safe, and comparing it would re-invalidate
+    // every inactive row on any edit — the exact problem this memo split
+    // (ultV/ustV instead of the whole ult/ust maps) fixes.
     const ultHL = noteQuote
       ? rowHighlightsFor("ULT", ultV, noteQuote, noteOccurrence, uhb, noteVerse, notePartial)
       : null;
@@ -1297,16 +1375,15 @@ const InactiveVerseRow = memo(
             </Typography>
             <Box
               data-find-cell={`${chapter}-${ultV.verse}-ULT`}
-              sx={(theme) => ({
+              sx={{
                 gridColumn: 2,
                 gridRow: 2,
                 minWidth: 0,
-                ...markHighlightSx(theme.palette.mode),
-              })}
+              }}
             >
               <StackedRowBody
                 dto={ultV}
-                prevDto={findPrevRowInColumn(ult, ultV.verse)}
+                prevDto={ultPrev}
                 search={search}
                 highlights={ultHL}
                 activeRange={
@@ -1341,16 +1418,15 @@ const InactiveVerseRow = memo(
             </Typography>
             <Box
               data-find-cell={`${chapter}-${ustV.verse}-UST`}
-              sx={(theme) => ({
+              sx={{
                 gridColumn: 2,
                 gridRow: 3,
                 minWidth: 0,
-                ...markHighlightSx(theme.palette.mode),
-              })}
+              }}
             >
               <StackedRowBody
                 dto={ustV}
-                prevDto={findPrevRowInColumn(ust, ustV.verse)}
+                prevDto={ustPrev}
                 search={search}
                 highlights={ustHL}
                 activeRange={
@@ -1372,9 +1448,10 @@ const InactiveVerseRow = memo(
   (a, b) =>
     a.v === b.v &&
     a.chapter === b.chapter &&
-    a.ult === b.ult &&
-    a.ust === b.ust &&
-    a.uhb === b.uhb &&
+    a.ultV === b.ultV &&
+    a.ustV === b.ustV &&
+    a.ultPrev === b.ultPrev &&
+    a.ustPrev === b.ustPrev &&
     a.noteQuote === b.noteQuote &&
     a.noteOccurrence === b.noteOccurrence &&
     a.noteVerse === b.noteVerse &&
