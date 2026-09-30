@@ -343,13 +343,25 @@ export function computeWithholdReason(
 // Both read with `?? 0`: they are seeded from the plan onto a zeroCounts()
 // aggregate, never from a replayed chunk, so absence cannot launder a hold.
 //
+// Issue #1035: three more plan branches in planAndStageBookResources leave the
+// watermark unstamped, each on its own counter (a blanket "null masterSha
+// means failure" rule would misread the no-file entry and the stale-base hold,
+// which carry a null SHA too):
+//   * `own_publish_unstamped` — own-publish recognized, but source_sha did not
+//     move (masterSha null, so markOwnPublishConverged's COALESCE kept the old
+//     value; or its UPDATE did not land). computeWithholdReason is never
+//     consulted on this branch (markOwnPublishConverged documents why), so its
+//     precedence offers no hold to map to; the cause is the same unmeasured
+//     DCS read as master_sha_unknown (or a failed D1 write) → failure.
+//   * `fetch_failed` — master's file could not be fetched → failure.
+//   * `tsv_truncated` — the TSV fetch looked truncated → failure.
+// Same `?? 0` read and the same plan seeding as the #1033 pair.
+//
 // Not an exact mirror in one direction: `errors` (batch errors without
 // apply_incomplete) do NOT withhold the stamp, but classify as failure here —
 // a run that logged errors should not read green; a failure does not always
-// mean the stamp was withheld. SUCCESS is meant to imply the watermark was
-// stamped, but three plan branches (own-publish with a null file SHA, a DCS
-// fetch error, a truncated TSV) still leave it unstamped and read success
-// here; #1035 tracks them.
+// mean the stamp was withheld. The other direction does hold: SUCCESS ⟹ every
+// resource that had something to stamp was stamped.
 export function classifyReimportOutcome(
   perResource: Record<
     string,
@@ -366,6 +378,9 @@ export function classifyReimportOutcome(
       errors?: string[];
       stale_base_held?: number;
       master_sha_unknown?: number;
+      own_publish_unstamped?: number;
+      fetch_failed?: number;
+      tsv_truncated?: number;
     }
   >,
   // The one resource (if any) this run's overrides apply to — mirrors
@@ -387,6 +402,9 @@ export function classifyReimportOutcome(
       t.merge_record_failed === true ||
       (t.structure_overlap ?? 0) > 0 ||
       (t.master_sha_unknown ?? 0) > 0 ||
+      (t.own_publish_unstamped ?? 0) > 0 ||
+      (t.fetch_failed ?? 0) > 0 ||
+      (t.tsv_truncated ?? 0) > 0 ||
       systemicRefusal;
     if (isFailure) return "failure";
 
