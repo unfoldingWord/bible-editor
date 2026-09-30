@@ -75,6 +75,7 @@ import { resolveSpanToSource } from "../lib/twlResolve";
 import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
+import { createUhbStrongsCache } from "../lib/uhbStrongs";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import type { BookViewportRestore } from "./BookView";
@@ -1610,29 +1611,32 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // AND every loaded chapter in book mode, so the per-word tooltips in the
   // scripture column don't have to fetch on first hover. useLexicon
   // dedupes at module level, so passing this repeatedly is cheap.
+  // Each chapter's UHB is walked once, cached on its UHB object's identity
+  // (lib/uhbStrongs.ts), and the memo depends on `data?.verses?.UHB`, so a
+  // ULT/UST save or verse.updated does not re-walk UHB (#898).
+  const [uhbStrongsFor] = useState(() => createUhbStrongsCache<VerseDto>(collectStrongs));
   const uhbStrongs = useMemo(() => {
     const set = new Set<string>();
-    const collect = (verses: Record<number, VerseDto> | undefined) => {
-      if (!verses) return;
-      for (const v of Object.values(verses)) {
-        const objs = (v.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-        if (Array.isArray(objs)) for (const s of collectStrongs(objs)) set.add(s);
-      }
+    const add = (verses: Record<number, VerseDto> | undefined) => {
+      for (const s of uhbStrongsFor(verses)) set.add(s);
     };
-    collect(data?.verses?.UHB);
+    add(data?.verses?.UHB);
     if (bookHook) {
       for (const cs of bookHook.chapters.values()) {
         if (cs.kind !== "ready") continue;
-        collect(cs.data.verses?.UHB);
+        add(cs.data.verses?.UHB);
       }
     }
     return [...set];
     // `bookHook?.chapters` rather than `bookHook`: narrower, as in availableVersions above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data?.verses, bookHook?.chapters]);
+  }, [data?.verses?.UHB, bookHook?.chapters]);
   const lexiconMapRaw = useLexicon(uhbStrongs);
-  // useLexicon hands back a fresh Map every render; stabilize its identity so
-  // ScriptureColumn's and BookView's memos can compare it. Keyed on CONTENT —
+  // useLexicon keeps its Map until the store version moves (#898), but the
+  // version moves when ANY lexicon entry resolves anywhere in the app, and
+  // uhbStrongs gets a new identity on every book-mode chapter load. Stabilize
+  // the Map's identity so ScriptureColumn's and BookView's memos can compare
+  // it. Keyed on CONTENT —
   // which entry each Strong's resolved to — not on uhbStrongs' identity, which
   // is new on every save and every book-mode chapter load even when nothing
   // changed, re-rendering every scripture cell that receives the map (#890).
