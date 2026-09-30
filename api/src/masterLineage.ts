@@ -1437,6 +1437,41 @@ export function refEvidenceTouches(refs: string[], chapter: number, verse: numbe
 }
 
 /**
+ * The same question as completeHumanRefEvidenceTouches, for a log line (#874):
+ * `null` when the evidence cannot answer it, a boolean only when it can.
+ * completeHumanRefEvidenceTouches returns `false` for both "measured, no
+ * touch" and "could not tell", and a diagnostic log must not merge the two.
+ *
+ * Measurable means the compacted summary of a COMPLETE commit walk, plus a
+ * usable (non-negative integer) chapter and verse, and one of:
+ *   - no human commit in the window: nothing touched the file, so `false` is
+ *     a real measurement;
+ *   - human commits whose per-verse refs were mapped completely to a
+ *     non-empty, fully valid set.
+ * Anything else (no lineage, an incomplete walk, refs never mapped or partly
+ * mapped, a malformed entry, contradictory flags) is `null`.
+ *
+ * Log-only. It deliberately does not share code with
+ * completeHumanRefEvidenceTouches, whose fail-closed answer can authorize a
+ * master-byte adoption and must not move when this function changes.
+ */
+export function humanRefEvidenceAtRef(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+  chapter: unknown,
+  verse: unknown,
+): boolean | null {
+  if (lineage == null || !("mayHoldHumanEdit" in lineage)) return null;
+  if (typeof chapter !== "number" || !Number.isInteger(chapter) || chapter < 0) return null;
+  if (typeof verse !== "number" || !Number.isInteger(verse) || verse < 0) return null;
+  if (lineage.incomplete !== false) return null;
+  if (lineage.hasHumanCommit === false) return lineage.mayHoldHumanEdit === false ? false : null;
+  if (lineage.hasHumanCommit !== true || lineage.mayHoldHumanEdit !== true) return null;
+  const ev = refsFrom(lineage);
+  if (ev === null || ev.refs.length === 0) return null;
+  return refEvidenceTouches(ev.refs, chapter, verse);
+}
+
+/**
  * Positive-evidence counterpart to masterMayHoldHumanEditForVerse.
  *
  * This may authorize an exact master-byte adoption, so uncertainty must return
