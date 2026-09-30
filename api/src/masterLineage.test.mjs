@@ -134,8 +134,10 @@ import { readFileSync } from "node:fs";
 import {
   classifyMasterCommit,
   compactLineage,
+  completeHumanRefEvidenceTouches,
   describeHumanCommits,
   humanCommitEvidenceClause,
+  humanRefEvidenceAtRef,
   stripHumanCommitEvidence,
   LINEAGE_EVIDENCE_CAP,
   LINEAGE_EVIDENCE_LEAD,
@@ -1169,6 +1171,48 @@ console.log("\n[#557: every uncertainty resolves to the file-level answer]");
   const refs = Array.from({ length: LINEAGE_REF_CAP + 1 }, (_, i) => `1:${i + 1}`);
   eq(mergeRefEvidence([{ complete: true, refs, reason: "" }]).complete, false, "a ref set past the cap is incomplete");
   eq(mergeRefEvidence([{ complete: true, refs, reason: "" }]).reason, "ref_cap_exceeded", "...and says why");
+}
+
+// ── #874: the ours_moved log's tri-state ancestor-ref evidence ──────────────
+//
+// humanRefEvidenceAtRef answers null ("could not measure") for missing,
+// incomplete or malformed evidence, and a boolean only when the evidence was
+// complete. completeHumanRefEvidenceTouches answers false for both, and must
+// keep doing so: it can authorize a master-byte adoption, so its fail-closed
+// values are pinned case by case below alongside the new function's.
+console.log("\n[#874: measured 'no touch' vs unmeasurable]");
+{
+  const human = [classifyMasterCommit({ sha: "h2", message: "Fixes s6 markers", authorEmail: RICH })];
+  const goodRefs = { complete: true, refs: ["40:15", "41:*"], reason: "" };
+  const summary = (commits, opts) => compactLineage(summarizeLineage(commits, opts));
+  const cases = [
+    // [label, lineage, chapter, verse, expected completeHumanRefEvidenceTouches, expected humanRefEvidenceAtRef]
+    ["complete refs, matching verse", summary(human, { humanRefs: goodRefs }), 40, 15, true, true],
+    ["complete refs, whole-chapter ref", summary(human, { humanRefs: goodRefs }), 41, 3, true, true],
+    ["complete refs, other verse", summary(human, { humanRefs: goodRefs }), 40, 16, false, false],
+    ["COMPLETE walk with no human commit", summary([], {}), 40, 15, false, false],
+    ["absent lineage (null)", null, 40, 15, false, null],
+    ["absent lineage (undefined)", undefined, 40, 15, false, null],
+    ["malformed lineage object", {}, 40, 15, false, null],
+    ["uncompacted lineage (not the summary form)", summarizeLineage(human, { humanRefs: goodRefs }), 40, 15, false, null],
+    ["incomplete walk, complete refs", summary(human, { humanRefs: goodRefs, incomplete: true, incompleteReason: "page_cap" }), 40, 15, false, null],
+    ["incomplete walk, no human commit seen yet", summary([], { incomplete: true, incompleteReason: "page_cap" }), 40, 15, false, null],
+    ["incomplete per-verse refs", summary(human, { humanRefs: { complete: false, refs: ["40:15"], reason: "diff_fetch_failed" } }), 40, 15, false, null],
+    ["human refs never measured", summary(human, {}), 40, 15, false, null],
+    ["human window mapped to zero refs", summary(human, { humanRefs: { complete: true, refs: [], reason: "" } }), 40, 16, false, null],
+    ["one malformed ref entry", { mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, refsComplete: true, humanRefs: ["40:15", "nonsense"] }, 40, 15, false, null],
+    ["hasHumanCommit missing", { mayHoldHumanEdit: false, incomplete: false, refsComplete: true, humanRefs: [] }, 40, 15, false, null],
+    ["no human commit but mayHoldHumanEdit true (contradictory)", { mayHoldHumanEdit: true, hasHumanCommit: false, incomplete: false }, 40, 15, false, null],
+    ["negative chapter", summary(human, { humanRefs: goodRefs }), -40, 15, false, null],
+    ["negative verse", summary([], {}), 40, -1, false, null],
+    ["non-integer verse", summary(human, { humanRefs: goodRefs }), 40, 1.5, false, null],
+    ["chapter not a number", summary([], {}), "40", 15, false, null],
+    ["verse null", summary([], {}), 40, null, false, null],
+  ];
+  for (const [label, lin, c, v, touches, atRef] of cases) {
+    eq(completeHumanRefEvidenceTouches(lin, c, v), touches, `completeHumanRefEvidenceTouches unchanged: ${label}`);
+    eq(humanRefEvidenceAtRef(lin, c, v), atRef, `humanRefEvidenceAtRef: ${label}`);
+  }
 }
 
 // ── #607: the TSV half of #557's per-verse narrowing ────────────────────────

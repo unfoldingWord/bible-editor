@@ -65,6 +65,7 @@ import {
   masterMayHoldHumanEditForVerse,
   summarizeLineage,
   completeHumanRefEvidenceTouches,
+  humanRefEvidenceAtRef,
   type ClassifiedCommit,
   type HumanRefEvidence,
   type MasterLineageSummary,
@@ -622,6 +623,29 @@ export interface ReimportCounts {
   // the quiet one. See stale_base_holds.reason = 'stale_tc_reexport_overridden'
   // for the durable half.
   stale_base_overridden: number;
+  // Issue #1033. 0 or 1 per resource per run: the resource was staged
+  // `changed: true` but its master commit SHA could not be read
+  // (fileCommitSha returned null), so the reimport-sync step applies the
+  // content yet skips recordResourceSync (`if (!e.masterSha) continue;`) — the
+  // watermark is NOT stamped. Seeded from the plan like stale_base_held. Read
+  // only by classifyReimportOutcome (reimportSyncGate.ts) so the run ledger
+  // does not record a success the watermark never certified; it gates nothing.
+  master_sha_unknown: number;
+  // Issue #1035. Three more 0-or-1-per-resource plan outcomes that leave the
+  // watermark unstamped, each on its own counter because a blanket "null
+  // masterSha means failure" rule would misread the no-file entry and the
+  // stale-base hold, which also carry a null SHA. Same posture as
+  // master_sha_unknown: seeded from the plan, read only by
+  // classifyReimportOutcome, gates nothing (the export freshness gate already
+  // compares against source_sha).
+  //   own_publish_unstamped — own-publish recognized, but source_sha did not
+  //     move: masterSha was null (markOwnPublishConverged's COALESCE kept the
+  //     old value) or the stamp's UPDATE did not land.
+  //   fetch_failed — master's file could not be fetched (DCS 404 / error).
+  //   tsv_truncated — the TSV fetch looked truncated (tsvFetchLooksTruncated).
+  own_publish_unstamped: number;
+  fetch_failed: number;
+  tsv_truncated: number;
   // Issue #727. Pairs of verse rows, in chapters this run touched, whose
   // [verse, verse_end] ranges intersect (a `1-2` bridge beside a standalone `2`)
   // as found by applyVerseRows's post-apply structural audit. The export refuses
@@ -810,6 +834,10 @@ function zeroCounts(): ReimportCounts {
     merge_record_failed: false,
     stale_base_held: 0,
     stale_base_overridden: 0,
+    master_sha_unknown: 0,
+    own_publish_unstamped: 0,
+    fetch_failed: 0,
+    tsv_truncated: 0,
     structure_overlap: 0,
     structure_kept_local: 0,
     structure_adopted: 0,
@@ -1071,6 +1099,10 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   // launder an absent measurement into a green light.
   into.stale_base_held += from.stale_base_held ?? 0;
   into.stale_base_overridden += from.stale_base_overridden ?? 0;
+  into.master_sha_unknown += from.master_sha_unknown ?? 0;
+  into.own_publish_unstamped += from.own_publish_unstamped ?? 0;
+  into.fetch_failed += from.fetch_failed ?? 0;
+  into.tsv_truncated += from.tsv_truncated ?? 0;
   // `?? 0` again for replayed pre-#727 chunk results. Safe here for the reason
   // shouldRecordResourceSync's doc gives: this is a positive end-of-chunk
   // measurement whose absence means "not measured on an older code path", and
@@ -2483,12 +2515,15 @@ export async function applyTsvRows(
           // `possibleMasterActivityAtAncestorRef`: best-effort visibility only
           // (see the comment above classifyTsvRefMove's call) — VERSE-scoped
           // evidence, not proof this row's own history has an intermediate
-          // move. Never used to change the outcome.
-          const possibleMasterActivityAtAncestorRef =
-            refBase != null &&
-            Number.isInteger(refBase.chapter) &&
-            Number.isInteger(refBase.verse) &&
-            completeHumanRefEvidenceTouches(cutoff?.lineage, refBase.chapter as number, refBase.verse as number);
+          // move. Never used to change the outcome. Tri-state (#874): `null`
+          // means the evidence could not answer (no usable ancestor ref, or a
+          // missing/incomplete/malformed lineage), `false` means a complete
+          // lineage was checked and showed no human touch at that verse.
+          const possibleMasterActivityAtAncestorRef = humanRefEvidenceAtRef(
+            cutoff?.lineage,
+            refBase?.chapter,
+            refBase?.verse,
+          );
           console.log("reimport: reference move attributed to the app; publishing it", {
             book,
             kind,
@@ -8528,7 +8563,46 @@ interface StagedResource {
   // an override that consents to a risk must leave a record of having been
   // used, exactly like idBlockedOverride's raise-instead-of-clear.
   staleBaseOverridden?: StaleBaseHold | null;
+  // Issue #1035. Which unstamped branch produced this entry, so the run ledger
+  // can tell them apart from the no-file entry (also `changed: false`,
+  // `masterSha: null`, and not a failure). Absent on a plan replayed from a
+  // Workflow instance that started before this shipped, which reads as the old
+  // behavior (ledger success); nothing gates on these.
+  ownPublishUnstamped?: boolean;
+  fetchFailed?: boolean;
+  tsvTruncated?: boolean;
 }
+
+// The run-summary counters decided at staging time, seeded from the memoized
+// plan (see the call site in runChunkedReimport for why seeding happens out
+// here and not inside a step).
+function seedPerResourceFromPlan(entries: StagedResource[]): Record<Resource, ReimportCounts> {
+  const perResource = freshPerResource();
+  for (const e of entries) {
+    if (e.ownPublish) perResource[e.resource].own_publish_converged++;
+    // Issue #639. Seeded from the PLAN, not from a chunk: the refusal is
+    // file-level and was decided at staging time, and seeding it out here (not
+    // inside a `step.do`) keeps it correct across a Workflow replay, which
+    // re-serves the memoized plan but does NOT re-run any closure that mutated
+    // `perResource` from inside a step.
+    // #653: same seeding rationale as own_publish_converged above — the clear
+    // ran inside the plan step, so its count comes from the plan.
+    if (e.noBaseCleared) perResource[e.resource].merge_no_base_cleared += e.noBaseCleared;
+    if (e.staleBaseHold) perResource[e.resource].stale_base_held++;
+    if (e.staleBaseOverridden) perResource[e.resource].stale_base_overridden++;
+    // Issue #1033: same plan-seeding rationale. The sync step's
+    // `if (!e.masterSha) continue;` leaves this resource unstamped.
+    if (e.changed && !e.masterSha) perResource[e.resource].master_sha_unknown++;
+    // Issue #1035: same plan-seeding rationale; each flag marks a branch that
+    // left source_sha unstamped (see StagedResource).
+    if (e.ownPublishUnstamped) perResource[e.resource].own_publish_unstamped++;
+    if (e.fetchFailed) perResource[e.resource].fetch_failed++;
+    if (e.tsvTruncated) perResource[e.resource].tsv_truncated++;
+  }
+  return perResource;
+}
+
+export const seedPerResourceFromPlanForTest = seedPerResourceFromPlan;
 
 interface ReimportPlan {
   maxChapter: number;
@@ -10135,7 +10209,7 @@ async function planAndStageBookResources(
     }
     if (raw == null) {
       // DCS 404 / fetch error → nothing to import, no watermark.
-      entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false });
+      entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false, fetchFailed: true });
       continue;
     }
 
@@ -10220,6 +10294,8 @@ async function planAndStageBookResources(
         r2Key: sweepR2Key,
         ownPublish: stamped,
         verifiedComplete: sweepVerifiedComplete,
+        // #1035: source_sha moved only if the UPDATE landed AND carried a SHA.
+        ownPublishUnstamped: !stamped || !masterSha,
       });
       continue;
     }
@@ -10245,7 +10321,7 @@ async function planAndStageBookResources(
     // hiding the damage (the HAB tn incident). masterSha:null here is critical:
     // the reimport-sync step only stamps watermarks for entries with a masterSha.
     if (isTsv && (await tsvFetchLooksTruncated(env, book, resource, raw))) {
-      entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false });
+      entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false, tsvTruncated: true });
       continue;
     }
     // Stale-base gate (issue #639), verse resources only — the signal it reads
@@ -10659,20 +10735,7 @@ export async function runChunkedReimport(
   // below, because "every changed resource turned out to be our own publish" is
   // the single most common shape of this fix firing: `changed` is then empty and
   // an unadorned emptyResult would report the night as "nothing happened".
-  const perResource = freshPerResource();
-  for (const e of plan.entries) {
-    if (e.ownPublish) perResource[e.resource].own_publish_converged++;
-    // Issue #639. Seeded from the PLAN, not from a chunk: the refusal is
-    // file-level and was decided at staging time, and seeding it out here (not
-    // inside a `step.do`) keeps it correct across a Workflow replay, which
-    // re-serves the memoized plan but does NOT re-run any closure that mutated
-    // `perResource` from inside a step.
-    // #653: same seeding rationale as own_publish_converged above — the clear
-    // ran inside the plan step, so its count comes from the plan.
-    if (e.noBaseCleared) perResource[e.resource].merge_no_base_cleared += e.noBaseCleared;
-    if (e.staleBaseHold) perResource[e.resource].stale_base_held++;
-    if (e.staleBaseOverridden) perResource[e.resource].stale_base_overridden++;
-  }
+  const perResource = seedPerResourceFromPlan(plan.entries);
 
   // Issue #639: the durable half of a stale-base refusal — a queryable row plus
   // a banner. In its OWN step, ahead of every early return below, because a
