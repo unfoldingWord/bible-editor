@@ -665,14 +665,15 @@ export async function fetchLexiconEntries(strongs: string[]): Promise<LexiconEnt
 }
 
 // GET /api/alerts/me — undismissed banner alerts targeted at this user.
-// Empty array when there's nothing to show. Used by the App-level banner
-// stack rendered above the viewer alert.
-export async function fetchAlerts(): Promise<SystemAlert[]> {
+// Empty array when there's nothing to show; null on a 401 (not signed in
+// yet), so the caller can tell "no alerts" from "didn't get an answer". Used
+// by the App-level banner stack rendered above the viewer alert.
+export async function fetchAlerts(): Promise<SystemAlert[] | null> {
   try {
     const res = await request<{ alerts: SystemAlert[] }>(`/api/alerts/me`);
     return res.alerts;
   } catch (err) {
-    if (err instanceof ApiError && err.status === 401) return [];
+    if (err instanceof ApiError && err.status === 401) return null;
     throw err;
   }
 }
