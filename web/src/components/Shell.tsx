@@ -700,8 +700,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     async (draft: NewCommentDraft) => {
       // #892: the target came from the chapter on screen, book/chapter from
       // the route; refuse in the moment before the popover closes on a
-      // chapter change.
-      if (chapterStaleRef.current) return;
+      // chapter change. Throw, not return: the popover treats a resolved call
+      // as posted and clears the typed text.
+      if (chapterStaleRef.current) throw new Error("The chapter is still loading; try again in a moment.");
       if (!commentTarget) return;
       await addComment({
         book,
