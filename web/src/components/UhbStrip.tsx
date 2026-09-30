@@ -9,6 +9,7 @@ import { type HighlightCtx, hoverShadow } from "../lib/highlightTypes";
 import { nfc } from "../lib/hebrew";
 import { directionForVersion } from "../lib/direction";
 import { SourceTooltipBody } from "./SourceTooltipBody";
+import { LexTooltip } from "./LexTooltip";
 import { pinLex, usePinnedLexRefresh } from "./PinnedLexBox";
 
 // ─── UHB source strip ────────────────────────────────────────────────
@@ -41,6 +42,7 @@ export function UhbStrip({
   const sourceIsHebrew = directionForVersion(sourceLabel) === "rtl";
   return (
     <Box
+      data-lex-region
       sx={{
         px: 2,
         pt: 1,
@@ -210,7 +212,7 @@ function SourceVerseToken({
   usePinnedLexRefresh(source, lex);
   return (
     <>
-      <Tooltip
+      <LexTooltip
         title={showInfo ? <SourceTooltipBody source={source} lex={lex} twHint={twHint} pinHint /> : ""}
         enterDelay={0}
         enterNextDelay={0}
@@ -237,7 +239,7 @@ function SourceVerseToken({
         >
           {text}
         </Box>
-      </Tooltip>
+      </LexTooltip>
     </>
   );
 }

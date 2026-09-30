@@ -5,7 +5,7 @@
 // read-only, so we don't have to maintain a contentEditable cursor.
 
 import { memo, useMemo } from "react";
-import { Tooltip, Box } from "@mui/material";
+import { Box } from "@mui/material";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
 import type { HighlightKey } from "../lib/highlight";
@@ -13,6 +13,7 @@ import type { TwlRow } from "../sync/api";
 import { roleLineSx, wordHighlightStyles } from "../lib/highlightStyles";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 import { pinLex, usePinnedLexRefresh } from "./PinnedLexBox";
+import { LexTooltip } from "./LexTooltip";
 import { buildTwHintMap, twHintFromMap } from "./UhbStrip";
 
 interface Props {
@@ -111,7 +112,7 @@ export const HebrewLine = memo(function HebrewLine({ verseObjects, lexiconMap, h
   // rtl + isolate span; that's a convention, not a guarantee, so isolation
   // is set here too (#843) rather than relied on from outside.
   return (
-    <Box component="span" dir="rtl" sx={{ unicodeBidi: "isolate" }}>
+    <Box component="span" dir="rtl" data-lex-line sx={{ unicodeBidi: "isolate" }}>
       {items}
     </Box>
   );
@@ -145,7 +146,7 @@ function HebrewWord({
   usePinnedLexRefresh(src, lex);
   return (
     <>
-      <Tooltip
+      <LexTooltip
         title={
           <SourceTooltipBody source={src} lex={lex} twHint={twHint} pinHint />
         }
@@ -179,7 +180,7 @@ function HebrewWord({
         >
           {text}
         </Box>
-      </Tooltip>
+      </LexTooltip>
     </>
   );
 }
