@@ -1,4 +1,4 @@
-import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 import { csrfToken, newUserContext } from "./helpers";
 
 // S18 — issue #1046 (follow-up to #943): a book lock that lands while the
@@ -16,6 +16,9 @@ import { csrfToken, newUserContext } from "./helpers";
 //      the dialog open and the text in place (never "saved").
 //   3. No verse write reaches the network or the outbox, and the server
 //      text never picks up either edit.
+//   4. A save already under way when the lock lands (here: parked on the
+//      "Words will be unaligned" confirm) is refused at the point of commit
+//      too: "Save anyway" shows the toast and the line stays dirty.
 //
 // A chapter (pipeline) lock is s9 check (b)'s job: there the reading line
 // stays reachable and the server refuses the save with a toast. Locking a
@@ -70,6 +73,56 @@ async function outboxVerseOps(page: Page): Promise<number> {
   );
 }
 
+type Opened = {
+  page: Page;
+  dialog: Locator;
+  editable: Locator;
+  line: Locator;
+  lineBox: Locator;
+  verseWrites: string[];
+};
+
+// Open the dual aligner on BOOK CHAPTER:VERSE and tag the ULT reading line
+// (left = first) so it stays addressable once it is no longer
+// contenteditable. React leaves attributes it didn't set alone.
+async function openDual(page: Page): Promise<Opened> {
+  await page.goto(`/#/${BOOK}/${CHAPTER}/${VERSE}`);
+  await page.reload();
+  await page
+    .locator(`[data-find-cell="${CHAPTER}-${VERSE}-${BV}"]`)
+    .first()
+    .waitFor({ timeout: 15_000 });
+  await page.locator(`button[aria-label^="align ${BV}"]`).first().click();
+  const sideBySide = page.locator("button", { hasText: "Side-by-side" }).first();
+  await sideBySide.waitFor({ state: "visible" });
+  await sideBySide.click();
+  const dialog = page.getByRole("dialog").filter({ hasText: "reading text" });
+  const editable = dialog.locator('[contenteditable="true"]:visible');
+  await editable.first().waitFor({ state: "visible" });
+  await editable.first().evaluate((el) => el.setAttribute("data-s18-line", "ULT"));
+  const line = dialog.locator('[data-s18-line="ULT"]');
+  const verseWrites: string[] = [];
+  page.on("request", (req) => {
+    if (req.method() !== "GET" && req.url().includes("/api/verses/")) {
+      verseWrites.push(`${req.method()} ${req.url()}`);
+    }
+  });
+  return { page, dialog, editable, line, lineBox: line.locator(".."), verseWrites };
+}
+
+// Lock the book while the dialog is open. The tab learns about it on a
+// window refocus (useBookLocks), which is throttled to one successful fetch
+// per 15 s, so wait out the mount fetch's window first.
+async function lockAndLetItLand(o: Opened, request: APIRequestContext, csrf: string) {
+  await setLock(request, csrf, true);
+  await o.page.waitForTimeout(15_500);
+  await o.page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  // #943's aligner note is the sync point: the lock has reached the dialog.
+  // Page-wide, not dialog-scoped: while the unalign confirm is open the
+  // aligner dialog is aria-hidden, so a role query can't see into it.
+  await expect(o.page.getByText("🔒 book locked").first()).toBeVisible();
+}
+
 test("dual aligner reading line locks when a book lock lands, and a pre-lock edit is never shown as saved", async ({
   browser,
 }) => {
@@ -83,25 +136,8 @@ test("dual aligner reading line locks when a book lock lands, and a pre-lock edi
 
   try {
     await setLock(context.request, csrf, false);
-
-    await page.goto(`/#/${BOOK}/${CHAPTER}/${VERSE}`);
-    await page.reload();
-    await page
-      .locator(`[data-find-cell="${CHAPTER}-${VERSE}-${BV}"]`)
-      .first()
-      .waitFor({ timeout: 15_000 });
-    await page.locator(`button[aria-label^="align ${BV}"]`).first().click();
-    const sideBySide = page.locator("button", { hasText: "Side-by-side" }).first();
-    await sideBySide.waitFor({ state: "visible" });
-    await sideBySide.click();
-    const dialog = page.getByRole("dialog").filter({ hasText: "reading text" });
-    const editable = dialog.locator('[contenteditable="true"]:visible');
-    await editable.first().waitFor({ state: "visible" });
-    // Tag the ULT line (left = first) so it stays addressable once it is no
-    // longer contenteditable. React leaves attributes it didn't set alone.
-    await editable.first().evaluate((el) => el.setAttribute("data-s18-line", "ULT"));
-    const line = dialog.locator('[data-s18-line="ULT"]');
-    const lineBox = line.locator("..");
+    const o = await openDual(page);
+    const { dialog, editable, line, lineBox, verseWrites } = o;
 
     // An edit typed before the lock lands: dirty, not saved.
     await line.click();
@@ -109,21 +145,7 @@ test("dual aligner reading line locks when a book lock lands, and a pre-lock edi
     await page.keyboard.type(` ${preLock}`);
     await expect(lineBox.getByRole("button", { name: `Save ${BV}`, exact: true })).toBeEnabled();
 
-    const verseWrites: string[] = [];
-    page.on("request", (req) => {
-      if (req.method() !== "GET" && req.url().includes("/api/verses/")) {
-        verseWrites.push(`${req.method()} ${req.url()}`);
-      }
-    });
-
-    // Lock the book while the dialog is open. The tab learns about it on a
-    // window refocus (useBookLocks), which is throttled to one successful
-    // fetch per 15 s, so wait out the mount fetch's window first.
-    await setLock(context.request, csrf, true);
-    await page.waitForTimeout(15_500);
-    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-    // #943's aligner note is the sync point: the lock has reached the dialog.
-    await expect(dialog.getByText("🔒 book locked").first()).toBeVisible();
+    await lockAndLetItLand(o, context.request, csrf);
 
     // 1. The reading line is locked.
     await expect(editable).toHaveCount(0);
@@ -164,7 +186,58 @@ test("dual aligner reading line locks when a book lock lands, and a pre-lock edi
     await expect(gate).toHaveCount(0);
   } finally {
     await setLock(context.request, csrf, false);
+    await context.close();
   }
+});
 
-  await context.close();
+test("a reading-line save parked on the unalign confirm is refused if the book lock lands before Save anyway", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000); // includes the 15 s book-lock refocus throttle
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+
+  try {
+    await setLock(context.request, csrf, false);
+    const o = await openDual(page);
+    const { dialog, line, lineBox, verseWrites } = o;
+    const before = await serverPlain(context.request);
+
+    // Swapping two aligned words ("sent Sharezer" -> "Sharezer sent") trips
+    // the collateral-loss guard for ZEC 7:2 ULT, so the save parks on the
+    // "Words will be unaligned" confirm instead of enqueueing.
+    const original = (await line.textContent()) ?? "";
+    expect(original).toContain("sent Sharezer");
+    const swapped = original.replace("sent Sharezer", "Sharezer sent");
+    await line.evaluate((el, text) => {
+      el.textContent = text;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }, swapped);
+    await lineBox.getByRole("button", { name: `Save ${BV}`, exact: true }).click();
+    const confirm = page.getByRole("dialog").filter({ hasText: "will be unaligned" });
+    await expect(confirm.getByRole("button", { name: "Save anyway" })).toBeVisible();
+
+    // The lock lands while the confirm is open.
+    await lockAndLetItLand(o, context.request, csrf);
+
+    await confirm.getByRole("button", { name: "Save anyway" }).click();
+    await expect(page.getByText(/book is locked.*not saved/i)).toBeVisible();
+    await expect(confirm).toHaveCount(0);
+    await expect(dialog.getByText("🔒 book locked").first()).toBeVisible(); // aligner still open
+    await expect(line).toContainText("Sharezer sent");
+    const undo = lineBox.getByRole("button", { name: "Undo", exact: true });
+    await expect(undo).toBeEnabled(); // still dirty, not "saved"
+
+    await page.waitForTimeout(500);
+    expect(verseWrites).toEqual([]);
+    expect(await outboxVerseOps(page)).toBe(0);
+    expect(await serverPlain(context.request)).toBe(before);
+
+    await undo.click();
+    await expect(line).toContainText("sent Sharezer");
+  } finally {
+    await setLock(context.request, csrf, false);
+    await context.close();
+  }
 });

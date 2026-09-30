@@ -1354,6 +1354,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Cleared on unmount so leaving Shell (e.g. during sign-out) doesn't
   // strand the app read-only.
   const bookLocked = bookLocks.lockedSet.has(book);
+  // Live lock state for a save that commits after an await or a confirm
+  // (#1046): the render-time `bookLocked` a callback closed over can be stale
+  // by the time it enqueues.
+  const bookLockedRef = useRef(bookLocked);
+  bookLockedRef.current = bookLocked;
   useEffect(() => {
     setReadOnlyReason("bookLocked", bookLocked);
     return () => setReadOnlyReason("bookLocked", false);
@@ -2827,6 +2832,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // an alignment_edit save (AlignmentPanel), threaded through so the
     // eventual PATCH success can generation-gate its crash-draft cleanup.
     alignmentDraftGeneration?: string,
+    // Checked again right before the confirm's deferred enqueue: true means
+    // the save must not be queued (e.g. a book lock landed while the confirm
+    // was open, #1046). The caller shows its own message.
+    refuseCommit?: () => boolean,
   ): boolean => {
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
@@ -2854,6 +2863,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           ref: `${book} ${chapterNum}:${verseNum} ${bibleVersion}`,
           lostWords: lost,
           commit: () => {
+            if (refuseCommit?.()) return;
             void outbox.enqueueVerse(
               book,
               chapterNum,
@@ -3258,6 +3268,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     plain: string,
     base: VerseDto,
     afterCommit?: () => void,
+    // #1046: re-checked at the point of commit (after the draft lookup, and
+    // again on the collateral-loss confirm's "Save anyway"). True refuses the
+    // save: nothing is queued or applied and afterCommit does not run.
+    refuseCommit?: () => boolean,
   ) => {
     const key = verseKey(book, chapterNum, verseNum, bibleVersion);
     // Diff and save against the SAME baseline this edit session's first
@@ -3372,7 +3386,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         applyLocal();
         afterCommit?.();
       };
-      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, onConfirmedApply, draftGeneration)) {
+      if (refuseCommit?.()) return;
+      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, onConfirmedApply, draftGeneration, undefined, refuseCommit)) {
         return;
       }
       applyLocal();
@@ -4519,24 +4534,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onSaveReading={(bv, plain, base, afterCommit) => {
             // #1046: the reading line locks once a book lock lands, but an
             // edit typed before it can still reach here through the close /
-            // verse-nav gate's Save. The outbox would drop it silently
-            // (read-only mode), so refuse it out loud instead and skip
-            // afterCommit: the line stays dirty (Undo still works) and the
-            // gate's close/nav does not run.
-            if (bookLocked) {
+            // verse-nav gate's Save, and a save already under way can see the
+            // lock land during its draft lookup or its "Words will be
+            // unaligned" confirm. The outbox would drop it silently
+            // (read-only mode), so refuse it out loud instead, now and again
+            // at the point of commit, and skip afterCommit: the line stays
+            // dirty and the gate's close/nav does not run. The message names
+            // Discard, not Undo: Undo is hidden while that side also has
+            // unsaved alignment drags.
+            const refuseIfBookLocked = () => {
+              if (!bookLockedRef.current) return false;
               pushPipelineToast(
-                `This book is locked, so the ${bv} reading-text edit was not saved. Undo it to close the aligner.`,
+                `This book is locked, so the ${bv} reading-text edit was not saved. To drop it, close the aligner and choose Discard.`,
                 "error",
               );
-              return;
-            }
+              return true;
+            };
+            if (refuseIfBookLocked()) return;
             // base.verse, not verseNum — each side's row may start at a
             // different verse (ULT v7 singleton vs UST 6-9 range row).
             // afterCommit threads through so ReadingLineHandle.save (and thus
             // the resolveDualAction save chain, #490) only proceeds once this
             // actually lands — synchronously, or after the collateral-loss
             // confirm's "Save anyway".
-            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit);
+            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit, refuseIfBookLocked);
           }}
         />
       )}
