@@ -1028,6 +1028,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
                 onSourceDrop={handleSourceDrop}
                 onExtractSource={handleExtractSource}
                 onClearGroup={handleClearGroup}
+                locked={!!locked}
                 onMerge={handleMergeGroups}
                 draggingGroupId={draggingGroupId}
                 onGroupDragStart={setDraggingGroupId}
@@ -1581,6 +1582,7 @@ function AlignmentCards({
   onSourceDrop,
   onExtractSource,
   onClearGroup,
+  locked,
   onMerge,
   draggingGroupId,
   onGroupDragStart,
@@ -1602,6 +1604,9 @@ function AlignmentCards({
   onSourceDrop: (destGroupId: string, sourceId: string) => void;
   onExtractSource: (sourceId: string) => void;
   onClearGroup: (groupId: string) => void;
+  // #943: hide the per-card clear (x) and the suggestion chip while locked;
+  // their handlers refuse anyway, so a visible control would do nothing.
+  locked: boolean;
   onMerge: (dropTargetId: string, draggedId: string) => void;
   draggingGroupId: string | null;
   onGroupDragStart: (groupId: string) => void;
@@ -1691,7 +1696,7 @@ function AlignmentCards({
               );
             })}
           </Box>
-          {(g.targets.length > 0 || g.source.length > 1) && (
+          {!locked && (g.targets.length > 0 || g.source.length > 1) && (
             <Tooltip title="clear this group (send English back to the word bank, split compound source)">
               <IconButton
                 size="small"
@@ -1714,7 +1719,7 @@ function AlignmentCards({
           )}
           <Stack direction="row" spacing={0.5} flexWrap="wrap" rowGap={0.5} sx={{ direction: "ltr" }}>
             {g.targets.length === 0 ? (
-              ghost ? (
+              ghost && !locked ? (
                 <GhostChip
                   ghost={ghost}
                   onAccept={() => onAcceptGhost(ghost.groupId, ghost.wordIds)}

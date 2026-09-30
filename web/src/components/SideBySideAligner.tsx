@@ -627,6 +627,7 @@ export function SideBySideAligner({
             onSave={onSaveReading}
             onDirtyChange={left.onReadingDirtyChange}
             locked={leftDirty}
+            chapterLocked={!!locked}
             bodyHeight={readingHeight}
           />
           <ReadingLine
@@ -635,6 +636,7 @@ export function SideBySideAligner({
             onSave={onSaveReading}
             onDirtyChange={right.onReadingDirtyChange}
             locked={rightDirty}
+            chapterLocked={!!locked}
             bodyHeight={readingHeight}
           />
         </Box>
@@ -826,11 +828,15 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   // dirty-state note in SideBySideAligner). The translator saves/cancels the
   // alignment first, then the line unlocks.
   locked?: boolean;
+  // #943: the verse can't be written (see Props.locked). Only changes the
+  // hint: with unsaved drags the alignment Save is disabled, so point at
+  // Reset instead of "save alignment first".
+  chapterLocked?: boolean;
   // Drag-resizable cap for the editable text box; it scrolls past this height.
   // Shared by both reading lines so the two-column grid stays even.
   bodyHeight?: number;
 }>(function ReadingLine(
-  { slot, onSave, onDirtyChange, locked = false, bodyHeight = DEFAULT_READING_HEIGHT },
+  { slot, onSave, onDirtyChange, locked = false, chapterLocked = false, bodyHeight = DEFAULT_READING_HEIGHT },
   ref,
 ) {
   const { bibleVersion, verse } = slot;
@@ -928,7 +934,11 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
               letterSpacing: 0,
             }}
           >
-            {locked ? "🔒 save alignment first" : "✎ editable"}
+            {locked
+              ? chapterLocked
+                ? "🔒 locked: reset alignment first"
+                : "🔒 save alignment first"
+              : "✎ editable"}
           </Box>
         </Typography>
         <Box sx={{ flex: 1 }} />

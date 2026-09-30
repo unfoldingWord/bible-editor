@@ -125,6 +125,9 @@ test("aligner is read-only (no drag, save or history restore) while an AI run lo
     await expect(page.getByText("chapter locked")).toBeVisible();
     await expect(saveBtn).toBeDisabled();
     await expect(page.getByRole("button", { name: "Clear", exact: true })).toBeDisabled();
+    // The per-card clear (x) is hidden too: its handler refuses while locked.
+    const cardClear = page.getByRole("button", { name: /^clear this group/ });
+    await expect(cardClear).toHaveCount(0);
 
     const locked = await dragAlignedWordToStrip(page);
     expect(locked.after, "a drag must not change the alignment while locked").toBe(locked.before);
@@ -148,6 +151,7 @@ test("aligner is read-only (no drag, save or history restore) while an AI run lo
     d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
     await openAligner(page);
     await expect(page.getByText("chapter locked")).toHaveCount(0);
+    expect(await cardClear.count()).toBeGreaterThan(0);
     const unlocked = await dragAlignedWordToStrip(page);
     expect(unlocked.after, "positive control: the drag works when unlocked").not.toBe(unlocked.before);
     await expect(saveBtn).toBeEnabled();
