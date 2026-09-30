@@ -1092,6 +1092,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
               chapter={chapter}
               verseNum={verseNum}
               bibleVersion={bibleVersion}
+              verseEnd={verse.verse_end ?? null}
               currentVersion={verse.version}
               canRestore={!locked}
               onClose={() => setHistoryOpen(false)}

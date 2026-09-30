@@ -1092,6 +1092,7 @@ function StackedBody({
                   ultEditBase ? (plain) => onSaveVerse(ultStart, "ULT", plain, ultEditBase) : undefined
                 }
                 version={ultV?.version}
+                verseEnd={ultV?.verse_end ?? null}
                 onRestoreVersion={
                   ultV
                     ? (content, plainText) => onRestoreVerse(ultStart, "ULT", content, plainText, ultV)
@@ -1549,7 +1550,9 @@ function ActiveLine({
   // the editable UST line in the active card (bridges are UST-only). verseEnd
   // marks a `\v a-b` range so the split button knows when to show; hasNextVerse
   // gates the merge button off the chapter's last verse. Both callbacks absent
-  // for viewers / other versions ⇒ no bridge buttons.
+  // for viewers / other versions ⇒ no bridge buttons. verseEnd is also passed
+  // for ULT (buttons stay gated on the callbacks) so the history dialog's USFM
+  // view can label a range row `\v a-b`.
   verseEnd?: number | null;
   hasNextVerse?: boolean;
   onMergeBridge?: (verse: number) => void;
@@ -2042,6 +2045,7 @@ function ActiveLine({
             chapter={chapter}
             verseNum={verseNum}
             bibleVersion={bibleVersion}
+            verseEnd={verseEnd ?? null}
             currentVersion={version}
             canRestore={canRestore}
             onClose={() => setHistoryOpen(false)}
