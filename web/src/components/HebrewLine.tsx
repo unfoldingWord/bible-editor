@@ -4,7 +4,7 @@
 // column in stacked, columns, and book modes — these versions are
 // read-only, so we don't have to maintain a contentEditable cursor.
 
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { Tooltip, Box } from "@mui/material";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
@@ -44,14 +44,18 @@ interface Props {
   verseNum?: number;
 }
 
-export function HebrewLine({ verseObjects, lexiconMap, highlights, prevHighlights, nextHighlights, findHighlights, activeFindKey, fallbackText, twl, verseNum }: Props) {
+export const HebrewLine = memo(function HebrewLine({ verseObjects, lexiconMap, highlights, prevHighlights, nextHighlights, findHighlights, activeFindKey, fallbackText, twl, verseNum }: Props) {
+  // Precompute the per-verse orig-word → tw hint lookup once (see buildTwHintMap)
+  // so the token walk is an O(1) Map.get per \w instead of re-splitting every
+  // TWL row's orig_words per token. Memoized on [twl, verseNum] so it isn't
+  // rebuilt (re-splitting + nfc()-normalizing every TWL row) on every render.
+  const twHints = useMemo(
+    () => (twl && verseNum != null ? buildTwHintMap(twl, verseNum) : null),
+    [twl, verseNum],
+  );
   if (!Array.isArray(verseObjects)) {
     return <>{fallbackText ?? ""}</>;
   }
-  // Precompute the per-verse orig-word → tw hint lookup once (see buildTwHintMap)
-  // so the token walk is an O(1) Map.get per \w instead of re-splitting every
-  // TWL row's orig_words per token.
-  const twHints = twl && verseNum != null ? buildTwHintMap(twl, verseNum) : null;
   const items: React.ReactNode[] = [];
   const walk = (nodes: unknown[]) => {
     for (const n of nodes ?? []) {
@@ -111,7 +115,7 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, prevHighlight
       {items}
     </Box>
   );
-}
+});
 
 // One \w source token: hover shows the lexical Tooltip; double-click pins the
 // same lexical info into an interactive Popover so its text (lemma, gloss,
