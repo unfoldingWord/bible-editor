@@ -34,3 +34,74 @@ export function runSaveChain(steps: SaveStep[], finish: () => void): void {
   };
   run(0);
 }
+
+// The dual aligner's "save, mark done, next verse" button (#931): run the
+// same dirty-side save chain as the unsaved-changes gate's Save, and only once
+// every side has committed mark the verse done and advance. A cancelled
+// confirm stalls the chain, so nothing is marked and the aligner stays on this
+// verse. The mark is always written, even for a verse already shown done:
+// setting a check is idempotent, local state can be stale while a verse PATCH
+// is still queued (the server's reopen will clear the check), and the outbox
+// holds the check behind any earlier verse save for the same verse
+// (outboxTargeting.ts laneCheckHeld), so it always lands last.
+export function runSaveDoneAndNext(opts: {
+  steps: SaveStep[];
+  markDone: () => void;
+  advance: () => void;
+}): void {
+  runSaveChain(opts.steps, () => {
+    opts.markDone();
+    opts.advance();
+  });
+}
+
+// In-flight guard for the button: a second click while a chain is still
+// running (waiting on a draft read or a confirm) is ignored, so it cannot
+// start a second save-and-mark (which, once the first had advanced, would mark
+// the NEXT verse). The guard is released once advance has run, or when mark or
+// advance throws. `cancel` releases the guard when the chain is known to have
+// stalled for good — the user cancelled the unalign confirm — so the button
+// works again. The caller passes the verse to mark in its own closures, so the
+// mark always targets the verse the click started on.
+export function createSaveDoneAndNextGuard() {
+  let running = false;
+  return {
+    get running() {
+      return running;
+    },
+    run(opts: { steps: SaveStep[]; markDone: () => void; advance: () => void }): boolean {
+      if (running) return false;
+      running = true;
+      try {
+        runSaveDoneAndNext({
+          steps: opts.steps,
+          // Released only AFTER advance, so a click landing between the mark
+          // and the move (or re-entering from either) cannot start a chain on
+          // the verse being left. A throw from either still releases it.
+          markDone: () => {
+            try {
+              opts.markDone();
+            } catch (e) {
+              running = false;
+              throw e;
+            }
+          },
+          advance: () => {
+            try {
+              opts.advance();
+            } finally {
+              running = false;
+            }
+          },
+        });
+      } catch (e) {
+        running = false;
+        throw e;
+      }
+      return true;
+    },
+    cancel() {
+      running = false;
+    },
+  };
+}

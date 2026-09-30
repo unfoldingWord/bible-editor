@@ -20,9 +20,12 @@ import {
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
+import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
+import { currentRouteFetcher, isChapterLocked, trackNavigation, updateIfCurrent, type ChapterRoute, type NavigationGen } from "../lib/chapterStale";
 import {
   applyStep,
   applyUpdated,
+  isStructureStep,
   mergeRefetched,
   reduceVerses,
   replaySteps,
@@ -35,8 +38,9 @@ type Status = "idle" | "loading" | "ready" | "error" | "retrying";
 export interface RefetchOptions {
   /**
    * Merge the fetched payload with the current one instead of replacing it:
-   * a verse the tab holds at an equal-or-newer version stays (see
-   * lib/verseStructure.ts `mergeRefetched`). For the WS open refetch (Shell's
+   * a verse the tab holds at an equal-or-newer version, or a tn/tq/twl row at a
+   * strictly newer one (rows change without a version bump), stays
+   * (see lib/verseStructure.ts `mergeRefetched`). For the WS open refetch (Shell's
    * `onOpen`, every open incl. the first), whose reconnect case races the
    * outbox drain on the same `online` moment — a stale GET must not regress a
    * verse the tab's own PATCH just advanced. Every other
@@ -48,7 +52,19 @@ export interface RefetchOptions {
 
 export interface UseChapterReturn {
   status: Status;
+  /**
+   * The payload on screen. After a chapter change this is still the PREVIOUS
+   * chapter's payload until the new one lands (#892): check `stale`.
+   */
   data: ChapterPayload | null;
+  /**
+   * True while `data` belongs to a different (book, chapter) than the one this
+   * hook was asked for, or matches it but was not fetched for the current
+   * navigation (A → B → A before B lands). It is shown so the view doesn't
+   * blank, but it must be locked against new input (#531). Local applies are
+   * no-ops while it belongs to another chapter.
+   */
+  stale: boolean;
   error: string | null;
   /** Incremented every failed attempt during the current retry loop. Useful for showing "reconnecting…". */
   retryAttempts: number;
@@ -90,7 +106,8 @@ export interface UseChapterReturn {
    * confirms; reused by the WS `verse.split` handler.
    */
   applyLocalVerseSplit: (start: VerseDto, newVerses: VerseDto[]) => void;
-  applyLocalVerseStatus: (verse: number, done: boolean) => void;
+  /** `updatedAt`: the server's timestamp, when the status came from the server (WS / outbox result). */
+  applyLocalVerseStatus: (verse: number, done: boolean, updatedAt?: number) => void;
   /** Optimistically add/remove my own stamp on a (verse, lane). */
   applyLocalLaneCheck: (verse: number, lane: CheckLane, userId: number, checked: boolean) => void;
   /** Authoritative: replace a (verse, lane)'s checker set (server result / WS). */
@@ -107,151 +124,156 @@ export interface UseChapterReturn {
 }
 
 export function useChapter(book: string, chapter: number): UseChapterReturn {
+  // The route this render is for. Written before the state hooks so every
+  // local-apply updater (run while React processes the state queue) compares
+  // against the current route, not the one its callback was created under.
+  const routeRef = useRef<ChapterRoute>({ book, chapter });
+  routeRef.current = { book, chapter };
+  // Bumped on every move to a new (book, chapter), including back to one just
+  // left. `landedGen` records which navigation the last landed payload was
+  // fetched for, so after A → B → A the old A copy stays locked until A's new
+  // GET lands (it can carry pre-save versions; see isChapterLocked).
+  // Advanced in the fetch effect, not during render, so only a committed
+  // navigation counts: a render React throws away must not bump a counter
+  // that no fetch will ever match. `navGen` mirrors it for rendering; until
+  // the effect runs, the render is locked anyway (the payload is another
+  // chapter's, or landedGen is the previous navigation's).
+  const navRef = useRef<NavigationGen | null>(null);
+  const [navGen, setNavGen] = useState(0);
+  const [landedGen, setLandedGen] = useState(0);
   const [status, setStatus] = useState<Status>("idle");
   // ChapterData = the server payload + client-only verse tombstones. A fresh
   // payload from refetch carries none, which is how tombstones get cleared.
   const [data, setData] = useState<ChapterData | null>(null);
+  // Every local apply goes through here: it lands only on the route's own
+  // payload, never on the previous chapter's copy still on screen (#892).
+  const mutate = useCallback((fn: (prev: ChapterData) => ChapterData) => {
+    setData((prev) => updateIfCurrent(prev, routeRef.current, fn));
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [retryAttempts, setRetryAttempts] = useState(0);
-  const mounted = useRef(true);
-  const fetchCtrl = useRef<AbortController | null>(null);
-  // Reducer steps (WS bridged / split / updated, outbox results) that reach
-  // the tab while a `keepNewerLocal` refetch is in flight. Non-null exactly
-  // while such a refetch is pending. `mergeRefetched` can only judge verses
-  // the GET's snapshot contains, so a split that recreated a verse AFTER the
-  // snapshot but BEFORE the response landed would be silently discarded (the
-  // response has no row for it); replaying the queue over the merged map puts
-  // it back. Replay is idempotent — every step is version-gated (see
-  // lib/verseStructure.ts `StructureStep`).
-  //
-  // One queue, owned by the LATEST request: a second open refetch while
-  // the first is in flight aborts the first (fetchCtrl) and inherits the
-  // queue — steps the first collected are either newer than the second GET's
-  // rows (and kept by the merge anyway) or stale echoes (no-ops on replay).
-  // A plain-replace refetch or a chapter change drops it; the resolving or
-  // failing latest request clears it.
-  const replayQueue = useRef<StructureStep[] | null>(null);
-
-  const refetch = useCallback(async (opts?: RefetchOptions) => {
-    // Abort any in-flight retry loop from a previous (book, chapter) before
-    // starting a new one — otherwise stale data could land after navigation.
-    //
-    // This is also what makes the WS first-open refetch (Shell's `onOpen`)
-    // safe when it overlaps the mount fetch below: the mount GET is aborted
-    // here and this later request — issued after the room subscription was
-    // established — replaces it, so the chapter is still fetched once and
-    // the snapshot that lands postdates the subscription. The aborted
-    // request's `catch` sees `fetchCtrl.current !== ctrl` and returns without
-    // touching status/error (fetchWithRetry rethrows on abort, no retry), and
-    // this request drives `status` loading → ready, so there is no stuck
-    // spinner and no AbortError flash. With `prev` still null (the mount
-    // effect cleared it), `mergeRefetched` is a plain replace.
-    fetchCtrl.current?.abort();
-    const ctrl = new AbortController();
-    fetchCtrl.current = ctrl;
-    // `=== true` so a caller that hands `refetch` straight to an event
-    // handler (receiving a truthy event object) still gets the replace.
-    const keepNewerLocal = opts?.keepNewerLocal === true;
-    replayQueue.current = keepNewerLocal ? (replayQueue.current ?? []) : null;
-
-    setStatus("loading");
-    setError(null);
-    setRetryAttempts(0);
-    try {
-      const payload = await fetchWithRetry(
-        (signal) => api.getChapter(book, chapter, signal),
-        {
-          signal: ctrl.signal,
-          onAttempt: (attempts) => {
-            if (mounted.current && fetchCtrl.current === ctrl) {
-              setStatus("retrying");
-              setRetryAttempts(attempts);
-            }
-          },
-        },
-      );
-      if (!mounted.current || fetchCtrl.current !== ctrl) return;
-      // Take the queue synchronously, before the updater runs: a step that
-      // arrives after this point is applied by its own setData, which React
-      // orders after this one, so it must not also be replayed here.
-      const queued = replayQueue.current ?? [];
-      replayQueue.current = null;
-      setData((prev) => (keepNewerLocal ? replaySteps(mergeRefetched(prev, payload), queued) : payload));
+  // Request ordering (abort-and-replace, the deferred first-open merge, the
+  // replay queue for steps that arrive while a merging refetch is pending)
+  // lives in chapterFetchSequencer.ts so every ordering case is unit-tested.
+  // The callbacks only touch state setters, which React keeps stable.
+  const sequencer = useRef<ChapterFetchSequencer<ChapterPayload, StructureStep> | null>(null);
+  sequencer.current ??= createChapterFetchSequencer<ChapterPayload, StructureStep>({
+    onStart: () => {
+      setStatus("loading");
+      setError(null);
+      setRetryAttempts(0);
+    },
+    onAttempt: (attempts) => {
+      setStatus("retrying");
+      setRetryAttempts(attempts);
+    },
+    onLanded: (payload, merge, queued) => {
+      // With `prev` null, or the previous chapter's stale copy (#892),
+      // `mergeRefetched` is a plain replace.
+      setData((prev) => replaySteps(merge ? mergeRefetched(prev, payload) : payload, queued));
+      // The sequencer aborts a request on navigation, so whatever lands was
+      // fetched for the current navigation.
+      setLandedGen(navRef.current?.gen ?? 0);
       setStatus("ready");
       setRetryAttempts(0);
-    } catch (e) {
-      // A superseded request (a newer refetch owns fetchCtrl and the queue)
-      // must leave the queue to its successor; only the latest request's
-      // failure drops it.
-      if (!mounted.current || fetchCtrl.current !== ctrl) return;
-      replayQueue.current = null;
-      if (ctrl.signal.aborted) return;
+    },
+    onError: (e) => {
       setError(e instanceof ApiError ? `HTTP ${e.status}` : String(e));
       setStatus("error");
-    }
-  }, [book, chapter]);
+    },
+    // A row / status step recorded before a newer merging GET was sent is in
+    // that GET's snapshot already; only verse-structure steps carry over.
+    keepOnSupersede: isStructureStep,
+  });
+
+  const refetch = useCallback((opts?: RefetchOptions) => {
+    // Any in-flight request is aborted and replaced (stale data must never
+    // land after a newer request or a navigation), with one exception: the
+    // WS first-open merging refetch (Shell's `onOpen`) arriving while the
+    // mount GET is still in flight does not abort it. The mount GET lands and
+    // renders, and the merging GET is issued right after it, so first paint
+    // no longer waits on the socket (#902) and the verse map is still
+    // reconciled by a merging refetch issued after the subscription.
+    //
+    // `=== true` so a caller that hands `refetch` straight to an event
+    // handler (receiving a truthy event object) still gets the replace.
+    //
+    // The route is read when the fetch RUNS (currentRouteFetcher), so a
+    // `refetch` captured on an earlier chapter (a "Refresh" toast, the
+    // post-unlock refetch) fetches the current chapter instead of replacing
+    // its GET with the old one and leaving the view locked (#892).
+    const fetchRoute = currentRouteFetcher(routeRef, (b, c, s) => api.getChapter(b, c, s));
+    return sequencer.current!.refetch(
+      (signal, onAttempt) => fetchWithRetry(fetchRoute, { signal, onAttempt }),
+      opts?.keepNewerLocal === true,
+    );
+  }, []);
 
   useEffect(() => {
-    mounted.current = true;
-    // Clear the previous (book, chapter)'s payload before the new fetch
-    // lands. `refetch` sets status to "loading" but never used to clear
-    // `data`, so from the moment (book, chapter) changed until the new
-    // payload arrived, Shell's `!data` gate fell through and rendered the
-    // PREVIOUS chapter's verses/notes/questions/words under the new
-    // book/chapter labels — and, because the editable UI only mounts in
-    // that data branch, let editing happen against stale content. This
-    // effect only re-runs when `refetch`'s own deps (book, chapter) change
-    // (it's identity-stable otherwise), so manual refetch() calls elsewhere
-    // (retry button, post-import refresh) are unaffected and keep refreshing
-    // in place without this blank. See #531.
-    setData(null);
+    // The previous (book, chapter)'s payload is NOT cleared here (#892): it
+    // stays on screen until the new one lands, so a chapter change doesn't
+    // blank and rebuild the view. It is reported as `stale` (derived below
+    // from data vs route) and Shell locks every edit path while it is: the
+    // #531 rule that no edit may be typed into, or queued against, a copy of
+    // a chapter the route has moved away from. Local applies are no-ops while
+    // stale (`mutate`), as they were while the payload used to be null.
+    navRef.current = trackNavigation(navRef.current, { book, chapter });
+    setNavGen(navRef.current.gen);
     void refetch();
-    return () => {
-      mounted.current = false;
-      fetchCtrl.current?.abort();
-    };
-  }, [refetch]);
+    // Abort the in-flight GET and drop any deferred merge or queued steps,
+    // so nothing from this (book, chapter) lands after navigation/unmount.
+    return () => sequencer.current?.reset();
+  }, [book, chapter, refetch]);
 
   const applyLocalRowPatch = useCallback<UseChapterReturn["applyLocalRowPatch"]>(
     (kind, id, patch) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
         const next = list.map((r) => (r.id === id ? { ...r, ...patch } : r));
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
-    [],
+    [mutate],
   );
 
+  // Row replacements / deletes / inserts are recorded for replay while a
+  // keepNewerLocal refetch is pending (#974): the merge takes row membership
+  // from the fetch, so a row created or deleted in the GET's window would
+  // otherwise vanish or come back. Replay applies a step over a fetched row
+  // only when strictly newer (lib/verseStructure.ts `applyStep`); the live
+  // update below is unchanged.
   const applyLocalRowReplacement = useCallback<UseChapterReturn["applyLocalRowReplacement"]>(
     (kind, row) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      sequencer.current?.record({ type: "rowReplace", kind, row });
+      mutate((prev) => {
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
         const next = list.map((r) => (r.id === row.id ? row : r));
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
-    [],
+    [mutate],
   );
 
   const applyLocalRowDelete = useCallback<UseChapterReturn["applyLocalRowDelete"]>(
     (kind, id) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      sequencer.current?.record({ type: "rowDelete", kind, id });
+      mutate((prev) => {
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
         const next = list.filter((r) => r.id !== id);
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
-    [],
+    [mutate],
   );
 
   const applyLocalRowInsert = useCallback<UseChapterReturn["applyLocalRowInsert"]>(
     (kind, row, position) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      // A late createRow response from the previous chapter must not be
+      // queued for replay into this one (applyStep also refuses it).
+      if (row.book === book && row.chapter === chapter) {
+        sequencer.current?.record({ type: "rowInsert", kind, row, afterId: position?.afterId });
+      }
+      mutate((prev) => {
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
         // Skip if a row with this id is already present (e.g. createRow response
         // racing with an outbox replacement).
@@ -271,7 +293,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
-    [],
+    [book, chapter, mutate],
   );
 
   // The verse map is reduced by lib/verseStructure.ts so the WS reorder rules
@@ -279,11 +301,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // place rather than being re-derived in each updater below.
   const applyLocalVerse = useCallback<UseChapterReturn["applyLocalVerse"]>(
     (verse) => {
-      setData((prev) =>
-        prev ? reduceVerses(prev, verse.bible_version, (s) => applyUpdated(s, verse, { force: true })) : prev,
-      );
+      mutate((prev) => reduceVerses(prev, verse.bible_version, (s) => applyUpdated(s, verse, { force: true })));
     },
-    [],
+    [mutate],
   );
 
   // Every strictly-gated step (never the forced optimistic edit above) goes
@@ -293,9 +313,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // (StrictMode) and run later than the call, and the refetch reads the queue
   // synchronously when its response lands.
   const dispatchStep = useCallback((step: StructureStep) => {
-    replayQueue.current?.push(step);
-    setData((prev) => (prev ? applyStep(prev, step) : prev));
-  }, []);
+    sequencer.current?.record(step);
+    mutate((prev) => applyStep(prev, step));
+  }, [mutate]);
 
   const applyRemoteVerse = useCallback<UseChapterReturn["applyRemoteVerse"]>(
     (verse) => {
@@ -328,16 +348,18 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   );
 
   const applyLocalVerseStatus = useCallback<UseChapterReturn["applyLocalVerseStatus"]>(
-    (verse, done) => {
-      setData((prev) => {
-        if (!prev) return prev;
+    (verse, done, updatedAt) => {
+      // Only a server-stamped status is recorded for replay: its updated_at is
+      // what proves it newer than a refetch's snapshot (#974).
+      if (updatedAt != null) sequencer.current?.record({ type: "verseStatus", verse, done, updatedAt });
+      mutate((prev) => {
         const existing = prev.verseStatuses.find((s) => s.verse === verse);
         const updated: VerseStatus = {
           book: prev.book,
           chapter: prev.chapter,
           verse,
           done: done ? 1 : 0,
-          updated_at: Math.floor(Date.now() / 1000),
+          updated_at: updatedAt ?? Math.floor(Date.now() / 1000),
         };
         const next = existing
           ? prev.verseStatuses.map((s) => (s.verse === verse ? updated : s))
@@ -345,13 +367,12 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         return { ...prev, verseStatuses: next };
       });
     },
-    [],
+    [mutate],
   );
 
   const applyLocalLaneCheck = useCallback<UseChapterReturn["applyLocalLaneCheck"]>(
     (verse, lane, userId, checked) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const exists = prev.verseLaneChecks.some(
           (c) => c.verse === verse && c.lane === lane && c.checked_by === userId,
         );
@@ -375,13 +396,12 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         return { ...prev, verseLaneChecks: next };
       });
     },
-    [],
+    [mutate],
   );
 
   const applyLaneCheckers = useCallback<UseChapterReturn["applyLaneCheckers"]>(
     (verse, lane, checkers) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const rest = prev.verseLaneChecks.filter((c) => !(c.verse === verse && c.lane === lane));
         const now = Math.floor(Date.now() / 1000);
         const added: VerseLaneCheck[] = checkers.map((checked_by) => ({
@@ -395,29 +415,27 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         return { ...prev, verseLaneChecks: [...rest, ...added] };
       });
     },
-    [],
+    [mutate],
   );
 
   const replaceLaneChecksForLane = useCallback<UseChapterReturn["replaceLaneChecksForLane"]>(
     (lane, checks) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const rest = prev.verseLaneChecks.filter((c) => c.lane !== lane);
         return { ...prev, verseLaneChecks: [...rest, ...checks] };
       });
     },
-    [],
+    [mutate],
   );
 
   const applyLocalTwlOrderLock = useCallback<UseChapterReturn["applyLocalTwlOrderLock"]>(
     (verse, lock) => {
-      setData((prev) => {
-        if (!prev) return prev;
+      mutate((prev) => {
         const rest = (prev.twlOrderLocks ?? []).filter((l) => l.verse !== verse);
         return { ...prev, twlOrderLocks: lock ? [...rest, lock] : rest };
       });
     },
-    [],
+    [mutate],
   );
 
   // Adopt server-confirmed values when an outbox op succeeds.
@@ -444,7 +462,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       if (op.target.kind === "verse_status") {
         const s = result.updated as VerseStatus;
         if (s && s.book === book && s.chapter === chapter) {
-          applyLocalVerseStatus(s.verse, s.done === 1);
+          applyLocalVerseStatus(s.verse, s.done === 1, s.updated_at);
         }
         return;
       }
@@ -460,6 +478,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   return {
     status,
     data,
+    stale: isChapterLocked(data, { book, chapter }, landedGen, navGen),
     error,
     retryAttempts,
     refetch,

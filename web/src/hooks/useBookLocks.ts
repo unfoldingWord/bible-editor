@@ -5,26 +5,49 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, type BookListEntry } from "../sync/api";
+import { createRefocusThrottle } from "../sync/refocusThrottle";
 
 export interface UseBookLocksReturn {
   books: BookListEntry[];
   canManageLocks: boolean;
   lockedSet: Set<string>;
   refresh: () => void;
-  loading: boolean;
+}
+
+// A window refocus refetches only when no fetch has succeeded in this window
+// (#897). Deliberately shorter than the 60 s the polled hooks use: this hook
+// has no poll, so focus is its only way to learn about a lock someone else
+// set, and a 60 s window could hide that lock for a minute after a quick
+// alt-tab. 15 s still collapses a burst of alt-tabs; the server's 423 on a
+// write to a locked book stays the backstop either way.
+const refocusThrottle = createRefocusThrottle(15_000);
+
+function sameBooks(a: BookListEntry[], b: BookListEntry[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every(
+      (x, i) =>
+        x.book === b[i].book &&
+        x.imported_at === b[i].imported_at &&
+        x.locked === b[i].locked &&
+        x.lockReason === b[i].lockReason &&
+        x.lockSource === b[i].lockSource,
+    )
+  );
 }
 
 export function useBookLocks(authReady: boolean): UseBookLocksReturn {
   const [books, setBooks] = useState<BookListEntry[]>([]);
   const [canManageLocks, setCanManageLocks] = useState(false);
-  const [loading, setLoading] = useState(true);
 
+  // Keeps the previous array when the list is unchanged, so a refocus that
+  // learns nothing new does not re-render Shell (#897).
   const load = useCallback(() => {
-    setLoading(true);
     api
       .getBooks()
       .then((r) => {
-        setBooks(r.books);
+        refocusThrottle.markSuccess();
+        setBooks((prev) => (sameBooks(prev, r.books) ? prev : r.books));
         setCanManageLocks(r.canManageLocks);
       })
       .catch(() => {
@@ -33,10 +56,9 @@ export function useBookLocks(authReady: boolean): UseBookLocksReturn {
         // write to a locked book still 423s there), so a failed fetch here
         // only means the UI can't pre-emptively gray out an input — not
         // that anything actually becomes unsafe to write.
-        setBooks([]);
+        setBooks((prev) => (prev.length === 0 ? prev : []));
         setCanManageLocks(false);
-      })
-      .finally(() => setLoading(false));
+      });
   }, []);
 
   // Gated on authReady, same reasoning as useAlerts: GET /api/books has no
@@ -68,7 +90,9 @@ export function useBookLocks(authReady: boolean): UseBookLocksReturn {
   // tab, where the server's 423 is the backstop.
   useEffect(() => {
     if (!authReady) return;
-    const onFocus = () => load();
+    const onFocus = () => {
+      if (refocusThrottle.shouldRun()) load();
+    };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   }, [authReady, load]);
@@ -77,5 +101,5 @@ export function useBookLocks(authReady: boolean): UseBookLocksReturn {
   // book is locked just because we don't know.
   const lockedSet = new Set(books.filter((b) => b.locked).map((b) => b.book));
 
-  return { books, canManageLocks, lockedSet, refresh: load, loading };
+  return { books, canManageLocks, lockedSet, refresh: load };
 }

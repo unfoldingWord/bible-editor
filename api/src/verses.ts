@@ -573,26 +573,34 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   }
   if (updated) {
     const verseDto = { ...updated, content: updatedParsed };
+    // Edits reopen the checkoff. 'text' always reopens; 'tw' reopens only for a
+    // ULT edit that actually changed a word (not a comma / moved brace /
+    // whitespace) — see lanesToReopenOnVerseEdit. Awaited before responding
+    // (#931): the dual aligner's "save, mark done, next verse" sends the Text
+    // check right behind this PATCH, and a reopen still running after the
+    // response could delete that check. Still best-effort — reopenLaneChecks
+    // swallows its own errors, so a failed reopen cannot fail the save.
+    const lanes = lanesToReopenOnVerseEdit(bibleVersion, delta.wordSequenceUnchanged);
+    // The DELETE is awaited; the lane broadcasts get a bounded wait (see
+    // reopenLaneChecks) so a slow Durable Object cannot hold the save open.
+    await reopenLaneChecks(c.env, updated.book, updated.chapter, updated.verse, lanes, true, (p) =>
+      c.executionCtx.waitUntil(p),
+    );
+    // Broadcast only AFTER the reopen DELETE (#931): another tab reacting to
+    // verse.updated could PUT a lane check that a still-running DELETE would
+    // then wipe.
     c.executionCtx.waitUntil(
       broadcastChapter(c.env, updated.book, updated.chapter, {
         type: "verse.updated",
         verse: verseDto,
       }),
     );
-    // Edits reopen the checkoff. 'text' always reopens; 'tw' reopens only for a
-    // ULT edit that actually changed a word (not a comma / moved brace /
-    // whitespace) — see lanesToReopenOnVerseEdit. Best-effort and non-blocking
-    // (the write already landed above); see reopenLaneChecks.
-    const lanes = lanesToReopenOnVerseEdit(bibleVersion, delta.wordSequenceUnchanged);
-    c.executionCtx.waitUntil(
-      reopenLaneChecks(c.env, updated.book, updated.chapter, updated.verse, lanes),
-    );
     // Issue #626: this save just resolved the merge-conflict row for this
     // verse (RESOLVE_VERSE_MERGE_CONFLICT_SQL's own `changes() > 0` guard
     // above only fires when it did) — clear the book+resource sync-warning
     // banner if that was the last active conflict outstanding, so a human
     // working the list isn't sent back to a verse that needs nothing.
-    // Best-effort and non-blocking, same as the two waitUntil calls above:
+    // Best-effort and non-blocking, same as the broadcast waitUntil above:
     // the save already landed either way.
     if (resolveRes?.meta?.changes) {
       c.executionCtx.waitUntil(clearResolvedConflictBannerIfLast(c.env, updated.book, bibleVersion.toLowerCase()));
@@ -777,15 +785,22 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/bridge", requireEditor, async 
 
   const updated = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
   const bridgeDto = updated ? { ...updated, content: mergedContent } : null;
+  // Awaited before responding, same as the verse PATCH (#931): a Text check
+  // sent right after this response must not be deleted by a reopen still in
+  // flight. reopenLaneChecks swallows its own errors, so this cannot fail.
+  // It also runs BEFORE the verse.bridged broadcast below, so a tab reacting
+  // to that event cannot PUT a check the DELETE then wipes.
+  await reopenLaneChecks(c.env, book, chapter, verse, ["text"], true, (p) => c.executionCtx.waitUntil(p));
   c.executionCtx.waitUntil(
     (async () => {
       // Tell open tabs FIRST, then prune the orphaned per-verse status/checkoff
-      // for the absorbed verses and reopen the text lane on the bridge (its
-      // content changed). The broadcast used to wait behind those two awaits
-      // while PATCH broadcasts immediately, which widened the window for a
-      // racing verse.updated / verse.split to overtake this event in the room
-      // (#729). Receivers tolerate any order via the removedVersion tombstone;
-      // this just makes the reorder rare. Best-effort, off the response path.
+      // for the absorbed verses. The broadcast used to wait behind the prune
+      // too, which widened the window for a racing verse.updated / verse.split
+      // to overtake this event in the room (#729). Receivers tolerate any
+      // order via the removedVersion tombstone; this just makes the reorder
+      // rare. The text-lane reopen is awaited above, before this broadcast,
+      // the same way the PATCH and split routes now order it (#931).
+      // Best-effort, off the response path.
       if (bridgeDto) {
         await broadcastChapter(c.env, book, chapter, {
           type: "verse.bridged",
@@ -804,7 +819,6 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/bridge", requireEditor, async 
         // orphan cleanup is non-critical; a stale row keyed at an absent verse
         // is simply unused until (unless) the bridge is split again.
       }
-      await reopenLaneChecks(c.env, book, chapter, verse, ["text"]);
     })(),
   );
   // `removed_version` mirrors the WS event so the originating tab tombstones
@@ -901,10 +915,11 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
     updated_at: r.updated_at,
     content: seedContent,
   }));
+  // Awaited before responding and before the verse.split broadcast — see
+  // the bridge route (#931).
+  await reopenLaneChecks(c.env, book, chapter, verse, ["text"], true, (p) => c.executionCtx.waitUntil(p));
   c.executionCtx.waitUntil(
     (async () => {
-      // Broadcast before the lane reopen — see the bridge route for why the
-      // structural event goes out first (#729).
       if (startDto) {
         await broadcastChapter(c.env, book, chapter, {
           type: "verse.split",
@@ -912,7 +927,6 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
           newVerses: newDtos,
         });
       }
-      await reopenLaneChecks(c.env, book, chapter, verse, ["text"]);
     })(),
   );
   return c.json({ verse: startDto, new_verses: newDtos });
