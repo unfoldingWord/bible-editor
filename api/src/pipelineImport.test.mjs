@@ -3336,9 +3336,15 @@ function fake966Db(handlers) {
 // still holding the pre-fix NFC bytes canonizes to the same UHB bytes tnPayload
 // already gave the re-proposal, and the two collide as one note.
 await (async () => {
-  const KOH_UHB = "כֹּ֥ה";
-  const KOH_NFC = "כֹּ֥ה";
+  // Explicit \u escapes, not literal source text: the whole point of this case
+  // is that these two forms are BYTE-DISTINCT (legacy Tanakh mark order vs NFC
+  // order) while rendering identically — a literal-text copy/paste silently
+  // produced two IDENTICAL strings here once already (#966 review R3), which
+  // made this test pass even with the live-row canonize fix removed.
+  const KOH_UHB = "כֹּ֥ה"; // legacy: dagesh (05bc) before holam (05b9)
+  const KOH_NFC = "כֹּ֥ה"; // NFC: holam before dagesh
   const AMAR = "אָמַ֛ר";
+  assert(KOH_UHB !== KOH_NFC && KOH_UHB.normalize("NFC") === KOH_NFC, "precondition: כֹּ֥ה UHB vs NFC bytes differ, fold under NFC");
   const w = (text) => ({ text, strong: "H1", lemma: "", morph: "" });
   const uhbMap = new Map([[29 * 100000 + 4, [w(KOH_UHB), w(AMAR)]]]);
   const uhbVerseJson = JSON.stringify({
@@ -3459,6 +3465,122 @@ await (async () => {
   assert(result.applied?.tnCreated === 1, `#966: the proposal is inserted as a new row (got tnCreated=${result.applied?.tnCreated})`);
   assert(result.applied?.tnSkippedDup === 0, "#966: nothing here is a duplicate — both twins stand (tnSkippedDup stays 0)");
   assert(acceptCount === 1, "#966: the one proposal is accepted through the normal insert path, not the dup-skip path");
+})();
+
+// Case 3 (#966 review R2): an NT book must keep the OLD NFC/joiner-strip fold —
+// #966 only needed to stop that fold from running on OT (Hebrew) quotes; NT
+// (Greek) has no UHB-style byte-exact source to canonize against, and the
+// issue never scoped a change to NT text. A live Greek quote missing the fold
+// target's stray word joiner must still dedup against its re-proposal, exactly
+// as it did before #966.
+await (async () => {
+  const LOGOS_WITH_JOINER = "λόγος⁠"; // λόγος + U+2060
+  const LOGOS_PLAIN = "λόγος"; // λόγος
+  assert(LOGOS_WITH_JOINER !== LOGOS_PLAIN, "precondition: the NT quotes differ only by the stray word joiner");
+
+  const staged = tnPayload("MAT", "1:1", {
+    Reference: "1:1", ID: "qjok", Tags: "", SupportReference: "", Quote: LOGOS_PLAIN, Occurrence: "1", Note: "n",
+  });
+  assert(staged.payload.quote === LOGOS_PLAIN, "precondition: tnPayload never canonizes an NT quote (no UHB map passed)");
+
+  let sourceReads = 0;
+  let tnInsertCount = 0;
+  let acceptCount = 0;
+  const env = fake966Db([
+    (sql) =>
+      /ORDER BY kind, chapter, verse, id/.test(sql) && {
+        changes: 0,
+        rows: [{ id: 1, kind: "tn", book: "MAT", chapter: 1, verse: 1, bible_version: null, payload_json: JSON.stringify(staged.payload) }],
+        single: null,
+      },
+    (sql) =>
+      /SELECT chapter, verse, ref_raw, occurrence, support_reference, quote, note\s+FROM tn_rows/.test(sql) && {
+        // Live row holds the word-joiner variant — same other fields.
+        changes: 0,
+        rows: [{ chapter: 1, verse: 1, ref_raw: "1:1", occurrence: 1, support_reference: null, quote: LOGOS_WITH_JOINER, note: "n" }],
+        single: null,
+      },
+    (sql) => {
+      // An NT book must never issue the OT UHB preload query.
+      if (!(/FROM verses/.test(sql) && /bible_version = \?4/.test(sql))) return null;
+      sourceReads += 1;
+      return { changes: 0, rows: [], single: null };
+    },
+    (sql) => /INSERT INTO tn_rows/.test(sql) && (tnInsertCount += 1) && { changes: 1, rows: [], single: null },
+    (sql) => /INSERT INTO edit_log/.test(sql) && { changes: 1, rows: [], single: null },
+    (sql) => /SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql) && (acceptCount += 1) && { changes: 1, rows: [], single: null },
+  ]);
+
+  const result = await importJobOutput(
+    env,
+    { jobId: "job-966-nt-fold", pipelineType: "notes", book: "MAT", startChapter: 1, endChapter: 1 },
+    [],
+  );
+
+  assert(sourceReads === 0, `#966: an NT job never preloads UHB/UGNT words for TN dedup (got ${sourceReads} reads)`);
+  assert(tnInsertCount === 0, `#966: an NT live quote missing the stray word joiner still dedups against its re-proposal (got ${tnInsertCount} inserts)`);
+  assert(result.applied?.tnSkippedDup === 1, `#966: the NT proposal is recognized as a duplicate (got tnSkippedDup=${result.applied?.tnSkippedDup})`);
+  assert(acceptCount === 1, "#966: the duplicate NT proposal is still marked accepted");
+})();
+
+// Case 4 (#966 review R1): the PROPOSAL side must be (re-)canonicalized at
+// APPLY time against the apply's own uhbWordsByVerse, not trusted as already
+// canonical from staging — otherwise a proposal staged before this
+// canonicalization existed (or staged when its verse's UHB words weren't yet
+// loaded) keys apart from a live row canonized against the current, fuller map.
+await (async () => {
+  const KOH_UHB = "כֹּ֥ה"; // legacy: dagesh before holam
+  const KOH_NFC = "כֹּ֥ה"; // NFC: holam before dagesh
+  assert(KOH_UHB !== KOH_NFC, "precondition: the two byte forms differ");
+  const uhbVerseJson = JSON.stringify({
+    verseObjects: [{ type: "word", tag: "w", text: KOH_UHB, strong: "H1", lemma: "", morph: "" }],
+  });
+  // Hand-built payload — deliberately NOT run through tnPayload/canonizeTnQuote,
+  // simulating a proposal staged before #966 (or before #959) whose quote is
+  // still raw NFC bytes.
+  const rawStagedPayload = {
+    id: "qjok", book: "JER", chapter: 29, verse: 4, ref_raw: "29:4",
+    tags: null, support_reference: null, quote: KOH_NFC, occurrence: 1, note: "n",
+  };
+
+  let sourceReads = 0;
+  let tnInsertCount = 0;
+  let acceptCount = 0;
+  const env = fake966Db([
+    (sql) =>
+      /ORDER BY kind, chapter, verse, id/.test(sql) && {
+        changes: 0,
+        rows: [{ id: 1, kind: "tn", book: "JER", chapter: 29, verse: 4, bible_version: null, payload_json: JSON.stringify(rawStagedPayload) }],
+        single: null,
+      },
+    (sql) =>
+      /SELECT chapter, verse, ref_raw, occurrence, support_reference, quote, note\s+FROM tn_rows/.test(sql) && {
+        // Live row already holds the UHB's exact bytes (e.g. fixed by a prior,
+        // already-canonicalizing run).
+        changes: 0,
+        rows: [{ chapter: 29, verse: 4, ref_raw: "29:4", occurrence: 1, support_reference: null, quote: KOH_UHB, note: "n" }],
+        single: null,
+      },
+    (sql) => {
+      if (!(/FROM verses/.test(sql) && /bible_version = \?4/.test(sql))) return null;
+      sourceReads += 1;
+      return { changes: 0, rows: [{ chapter: 29, verse: 4, content_json: uhbVerseJson }], single: null };
+    },
+    (sql) => /INSERT INTO tn_rows/.test(sql) && (tnInsertCount += 1) && { changes: 1, rows: [], single: null },
+    (sql) => /INSERT INTO edit_log/.test(sql) && { changes: 1, rows: [], single: null },
+    (sql) => /SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql) && (acceptCount += 1) && { changes: 1, rows: [], single: null },
+  ]);
+
+  const result = await importJobOutput(
+    env,
+    { jobId: "job-966-stale-proposal", pipelineType: "notes", book: "JER", startChapter: 29, endChapter: 29 },
+    [],
+  );
+
+  assert(sourceReads === 1, `#966: exactly one UHB preload query per job (got ${sourceReads})`);
+  assert(tnInsertCount === 0, `#966: a pre-existing, not-yet-canonicalized staged proposal is still re-canonicalized at apply and dedups (got ${tnInsertCount} inserts)`);
+  assert(result.applied?.tnSkippedDup === 1, `#966: the stale-raw proposal is recognized as a duplicate at apply time (got tnSkippedDup=${result.applied?.tnSkippedDup})`);
+  assert(acceptCount === 1, "#966: the duplicate proposal is still marked accepted");
 })();
 
 // ─── #546: hint-expansion edit_log payload must match the UPDATE's columns ──

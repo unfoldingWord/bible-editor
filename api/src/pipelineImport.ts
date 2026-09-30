@@ -161,6 +161,40 @@ export function canonizeTnQuote(
   });
 }
 
+// Fold for an NT (Greek) TN quote before dedup-keying — plain NFC-normalize +
+// drop invisible joiners (word joiner / ZWJ / BOM). This is the SAME fold TN
+// dedup used for every book before #966; #966 only needed to stop it for OT
+// quotes, where it was too wide (it erases exactly the U+2060 byte that can
+// distinguish two real Hebrew occurrences of one word — see canonizeTnQuote
+// above). NT quotes have no UHB-style byte-exact source to canonize against
+// and #966 never scoped a change to NT text, so NT keeps this fold unchanged.
+function foldGreekTnQuote(quote: string): string {
+  return quote.replace(/[⁠‍﻿]/g, "").normalize("NFC");
+}
+
+// Canonicalize a TN quote for dedup-keying — the one function BOTH the
+// live-row fold and the staged-proposal key in applyJobOutput call, with the
+// SAME inputs (the apply's own uhbWordsByVerse, computed fresh every run), so
+// the two sides always transform identically (#966 review R1). Re-running
+// canonizeTnQuote on a proposal that tnPayload already canonized at staging is
+// a no-op (canonizeQuote is idempotent on an already-canonical quote) — this
+// also repairs a proposal staged before this canonicalization existed, or
+// staged when its verse's UHB words weren't yet loaded, which would otherwise
+// key apart from a live row canonized against the CURRENT (fuller) map.
+function dedupFoldTnQuote(
+  book: string,
+  refRaw: string | null,
+  chapter: number,
+  verse: number,
+  quote: string | null,
+  uhbWordsByVerse: Map<number, SourceWord[]>,
+): string | null {
+  if (quote == null) return null;
+  return NT_BOOKS.has(book)
+    ? foldGreekTnQuote(quote)
+    : canonizeTnQuote(refRaw ?? String(verse), chapter, verse, quote, uhbWordsByVerse);
+}
+
 // tnPayload / tqPayload are exported for the direct regression tests in
 // pipelineImport.test.mjs, which assert on the quote-curling below (JER 32/33,
 // NUM 26:53 prod forensics — straight quotes in AI-generated note prose).
@@ -1022,22 +1056,22 @@ async function applyJobOutput(
     // quotes, while a re-run's identical-content proposal is keyed from its
     // NOW-curled `payload.note` (see the contentKey build below) — the two
     // keys never match, so content-dedup silently fails to recognize the
-    // duplicate and a second copy gets inserted. `quote` runs through the SAME
-    // canonizeTnQuote a proposal gets from tnPayload (OT books only, matching
-    // tnPayload's own guard), not the old blunt NFC/joiner-strip fold (#966):
-    // that fold conflated byte-distinct twins translationCore counts as
-    // separate occurrences (e.g. a word written once with the UHB's U+2060
-    // word joiner and once without, both live in one verse). canonizeTnQuote
-    // only rewrites a quote when it resolves unambiguously to ONE UHB word, so
-    // an ambiguous twin is left exactly as stored on both sides and still keys
-    // apart; an unambiguous one canonizes to the same byte form a fresh
-    // proposal gets, so a genuine re-run still dedups.
-    const canonicalizeTn = !NT_BOOKS.has(job.book);
+    // duplicate and a second copy gets inserted. `quote` runs through
+    // dedupFoldTnQuote — an OT quote gets the SAME canonizeTnQuote a proposal
+    // gets below, not the old blunt NFC/joiner-strip fold (#966): that fold
+    // conflated byte-distinct twins translationCore counts as separate
+    // occurrences (e.g. a word written once with the UHB's U+2060 word joiner
+    // and once without, both live in one verse — DAN 2:10, 1CH 22:19).
+    // canonizeTnQuote only rewrites a quote when it resolves unambiguously to
+    // ONE UHB word, so an ambiguous twin is left exactly as stored on both
+    // sides and still keys apart (a re-run of a genuinely NEW proposal for the
+    // OTHER twin correctly inserts a second row; a re-run of the SAME twin
+    // still dedups only when the live row already holds that twin's exact
+    // bytes). An unambiguous quote canonizes to the same byte form on both
+    // sides, so a genuine re-run still dedups. NT keeps the old fold — see
+    // foldGreekTnQuote.
     for (const r of live.results ?? []) {
-      const quote =
-        canonicalizeTn && r.quote
-          ? canonizeTnQuote(r.ref_raw ?? String(r.verse), r.chapter, r.verse, r.quote, uhbWordsByVerse)
-          : r.quote;
+      const quote = dedupFoldTnQuote(job.book, r.ref_raw, r.chapter, r.verse, r.quote, uhbWordsByVerse);
       claimedTnKeys.add(
         tnContentKey({ ...r, quote, note: r.note ? curlifyText(r.note) : r.note }),
       );
@@ -1105,17 +1139,29 @@ async function applyJobOutput(
     // into tnBases), so we don't consume a counter slot for it.
     // Content key of this proposal — computed up front so a hint expansion can
     // claim it too (the expanded stub now carries this content live, so a later
-    // identical insert proposal in the same run must be suppressed). `quote` is
-    // used as staged: tnPayload already ran it through canonizeTnQuote, so it's
-    // already in the same byte form the live-row fold above produces (#966) —
-    // no second fold needed here.
+    // identical insert proposal in the same run must be suppressed). `quote`
+    // runs through the SAME dedupFoldTnQuote the live row got above, against
+    // THIS apply's uhbWordsByVerse, rather than trusting `payload.quote` was
+    // already canonicalized at staging (#966 review R1): a proposal staged
+    // before this canonicalization existed, or staged when its verse's UHB
+    // words weren't loaded yet, would otherwise key apart from a live twin
+    // canonized against the fuller, current map. Re-folding an
+    // already-canonical staged quote is a no-op (canonizeQuote/foldGreekTnQuote
+    // are both idempotent).
     const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
     const contentKey = tnContentKey({
       chapter: p.chapter,
       verse: p.verse,
       occurrence: (payload.occurrence as number | null | undefined) ?? null,
       support_reference: (payload.support_reference as string | null | undefined) ?? null,
-      quote: (payload.quote as string | null | undefined) ?? null,
+      quote: dedupFoldTnQuote(
+        job.book,
+        (payload.ref_raw as string | null | undefined) ?? null,
+        p.chapter,
+        p.verse,
+        (payload.quote as string | null | undefined) ?? null,
+        uhbWordsByVerse,
+      ),
       note: (payload.note as string | null | undefined) ?? null,
     });
 
