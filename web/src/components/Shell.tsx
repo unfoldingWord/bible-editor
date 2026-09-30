@@ -59,7 +59,7 @@ import {
   guardBlocksSave,
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
-import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, versesFromKey } from "../lib/verseRange";
+import { bridgeNoteAnchor, buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, versesFromKey } from "../lib/verseRange";
 import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
@@ -3925,21 +3925,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // English (ULT) words aligned to this row's saved orig_words.
             // OL-anchored via the UHB/UGNT verse, mirroring the highlighter.
             if (!row.orig_words) return "";
-            const ult = (
-              verseIndexByVersion["ULT"]?.[row.verse]?.content as
+            const ultRow = verseIndexByVersion["ULT"]?.[row.verse];
+            const ult = (ultRow?.content as { verseObjects?: unknown[] } | null | undefined)?.verseObjects;
+            if (!Array.isArray(ult)) return "";
+            // A ULT bridge numbered across its span joins on the whole
+            // bridge's source with a shifted occurrence (#968).
+            const sourceByVerse = verseIndexByVersion["UHB"] ?? verseIndexByVersion["UGNT"];
+            const anchor = bridgeNoteAnchor(sourceByVerse, ultRow, row.verse, row.orig_words, row.occurrence ?? 1);
+            const src = (
+              (anchor?.source ?? sourceByVerse?.[row.verse])?.content as
                 | { verseObjects?: unknown[] }
                 | null
                 | undefined
             )?.verseObjects;
-            if (!Array.isArray(ult)) return "";
-            const src = (
-              (verseIndexByVersion["UHB"]?.[row.verse] ?? verseIndexByVersion["UGNT"]?.[row.verse])
-                ?.content as { verseObjects?: unknown[] } | null | undefined
-            )?.verseObjects;
             return extractTargetSelectionText(
               ult,
               row.orig_words,
-              row.occurrence ?? 1,
+              anchor?.occurrence ?? row.occurrence ?? 1,
               Array.isArray(src) ? src : undefined,
               // Show the gap: one source word can align to non-contiguous ULT
               // words (ISA 60:6 "and … the praises of"), and hiding that reads

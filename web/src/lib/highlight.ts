@@ -924,6 +924,37 @@ export function surfaceTotalsFromTokens(tokens: WordToken[]): Map<string, number
   return totals;
 }
 
+// How many times `quote` resolves in a source verse, counted exactly as
+// matchSourceTokens numbers its occurrences. verseRange's bridgeNoteAnchor
+// uses it to turn a note's own-verse occurrence into a span occurrence.
+export function countQuoteMatches(verseObjects: unknown[], quote: string): number {
+  let n = 0;
+  while (n < 200 && matchSourceTokens(verseObjects, quote, n + 1).length > 0) n++;
+  return n;
+}
+
+// True when a target row numbers every word in `words` across the whole of
+// `sourceVerseObjects`: each alignment milestone for the word claims the
+// word's full count there (x-occurrences === that total), and at least one
+// milestone exists. A bridge numbered per verse (1/1 in each verse), or one
+// that mixes both styles, returns false, since its numbering cannot say which
+// copy belongs to which verse (#968).
+export function milestonesCountWhole(
+  targetVerseObjects: unknown[],
+  sourceVerseObjects: unknown[],
+  words: string[],
+): boolean {
+  const totals = surfaceTotalsFromTokens(collectBareWords(sourceVerseObjects));
+  const runs = collectRawRuns(targetVerseObjects);
+  for (const w of words) {
+    const norm = matchNorm(w);
+    const total = totals.get(norm) ?? 0;
+    const mine = runs.filter((r) => r.source && matchNorm(r.source) === norm);
+    if (mine.length === 0 || mine.some((r) => r.occurrences !== total)) return false;
+  }
+  return true;
+}
+
 // ---------- rendering ----------
 
 function escapeHtml(s: string): string {
