@@ -2,6 +2,8 @@
 // dev proxy points /api/* at the local Worker; production serves the SPA
 // from the same origin as the Worker).
 
+import type { LexiconEntry } from "../hooks/lexiconStore";
+
 export type RowKind = "tn" | "tq" | "twl";
 
 export interface TnRow {
@@ -649,6 +651,17 @@ export interface SystemAlert {
   message: string;
   linkUrl: string | null;
   createdAt: number;
+}
+
+// GET /api/lexicon?strongs=... — UHAL/UGL entries for the given normalized
+// Strong's numbers. Goes through `request` (not raw fetch) so a hung lookup
+// times out and a non-OK status throws instead of being read as "no entries"
+// and cached as nulls in IndexedDB (#898).
+export async function fetchLexiconEntries(strongs: string[]): Promise<LexiconEntry[]> {
+  const res = await request<{ entries?: LexiconEntry[] }>(
+    `/api/lexicon?strongs=${encodeURIComponent(strongs.join(","))}`,
+  );
+  return res.entries ?? [];
 }
 
 // GET /api/alerts/me — undismissed banner alerts targeted at this user.
