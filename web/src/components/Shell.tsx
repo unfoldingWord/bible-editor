@@ -389,6 +389,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const introRow = data.tn.find((r) => r.verse === 0);
     return { rowIds, introRowId: introRow ? introRow.id : null };
   }, [data]);
+  // A → B → A keeps A on screen, so the comments key never changes and A's
+  // comments would not refetch, although the socket followed B meanwhile and
+  // missed A's comment events. Bump the comments epoch when such a lock lifts
+  // (#892). Adjusted during render (React's derived-state pattern) so the
+  // first unlocked commit already treats the old set as unsettled: a comment
+  // deep link waits for the refetch instead of reporting the comment gone.
+  const [commentsLock, setCommentsLock] = useState<{ lockedKey: string | null; epoch: number }>({
+    lockedKey: null,
+    epoch: 0,
+  });
+  const commentsKey = data ? `${data.book}/${data.chapter}` : null;
+  if (commentsKey != null) {
+    const next = trackLockedKey(commentsLock.lockedKey, chapterStale, commentsKey);
+    if (next.lockedKey !== commentsLock.lockedKey) {
+      setCommentsLock({ lockedKey: next.lockedKey, epoch: commentsLock.epoch + (next.reload ? 1 : 0) });
+    }
+  }
+  const commentsEpoch = commentsLock.epoch;
   // Keyed on the chapter ON SCREEN, not the route (#892). While the previous
   // chapter is the locked copy shown during a chapter change, the route's
   // threads would paint onto its verse cells (and be indexed against its
@@ -404,18 +422,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     removeComment,
     applyWsComment,
     reload: reloadComments,
-  } = useComments(data?.book ?? book, data?.chapter ?? chapter, commentsEnabled, commentLiveRows);
-  // A → B → A keeps A on screen, so the key above never changes and A's
-  // comments would not refetch, although the socket followed B meanwhile and
-  // missed A's comment events. Reload them when such a lock lifts (#892).
-  const commentsLockedKeyRef = useRef<string | null>(null);
-  const commentsKey = data ? `${data.book}/${data.chapter}` : null;
-  useEffect(() => {
-    if (commentsKey == null) return;
-    const next = trackLockedKey(commentsLockedKeyRef.current, chapterStale, commentsKey);
-    commentsLockedKeyRef.current = next.lockedKey;
-    if (next.reload) reloadComments();
-  }, [chapterStale, commentsKey, reloadComments]);
+  } = useComments(data?.book ?? book, data?.chapter ?? chapter, commentsEnabled, commentLiveRows, commentsEpoch);
 
   // Live cross-tab updates. The server broadcasts row writes via the
   // ChapterRoom DO; we dedupe by version so the originating user's tab
@@ -691,6 +698,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // try/catch here, since a swallowed failure is indistinguishable from success.
   const handleCreateComment = useCallback(
     async (draft: NewCommentDraft) => {
+      // #892: the target came from the chapter on screen, book/chapter from
+      // the route; refuse in the moment before the popover closes on a
+      // chapter change.
+      if (chapterStaleRef.current) return;
       if (!commentTarget) return;
       await addComment({
         book,
@@ -1848,6 +1859,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   }, [quoteBuildTarget, data, verseIndexByVersion]);
 
   const commitQuoteBuild = useCallback(() => {
+    // #892: never write a quote built on a copy the route has moved away from.
+    if (chapterStaleRef.current) return;
     if (!quoteBuildTarget || !data) return;
     const row =
       quoteBuildTarget.kind === "tn"
@@ -2463,6 +2476,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   useEffect(() => {
     if (initialCommentId == null) return;
+    // #892: wait out a chapter lock. The comments on screen are the locked
+    // copy's; after A → B → A they can lack a comment made during the B window
+    // until the reload on lock lift, and a found one would resolve against the
+    // old copy's rows and open over a locked view.
+    if (chapterStale) return;
     const key = `${book}/${chapter}/${initialCommentId}`;
     if (consumedCommentKeyRef.current === key) return;
     const comment = commentsIndex.byId.get(initialCommentId);
@@ -2524,7 +2542,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // stayed set, this effect's deps never changed, and clicking the SAME alert
     // again was silently ignored (verified).
     onCommentConsumed?.();
-  }, [commentsIndex, commentLiveRows, commentsLoading, commentsLoadedKey, commentsError, book, chapter, initialCommentId, onCommentConsumed, pushPipelineToast]);
+  }, [commentsIndex, commentLiveRows, commentsLoading, commentsLoadedKey, commentsError, book, chapter, chapterStale, initialCommentId, onCommentConsumed, pushPipelineToast]);
 
   // Keep the alignment target's verse in step with the active verse while
   // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
