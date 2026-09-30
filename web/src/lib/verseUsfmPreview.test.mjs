@@ -78,6 +78,48 @@ function assert(cond, msg) {
   assert(stripAlignmentNoise(usfmText) === usfmText, "no-op when there is no alignment markup to strip");
 }
 
+// ── 7. renderVerseUsfm never mutates the input verseObjects. Regression for
+//       the same defect fixed for the export path in #932 (see
+//       web/src/lib/exportCopy.test.mjs): usfm.toUSFM edits plain (non-\w,
+//       non-\zaln) nodes in place — trims trailing whitespace off a
+//       paragraph's `text`, and strips `text`/`type` off a whitespace-only
+//       text node that follows a paragraph. Without cloning first, opening
+//       the verse-history dialog would silently rewrite the cached verse DTO
+//       the rest of the app holds live, and "Switch to vN" would then save
+//       the corrupted tree.
+{
+  const verseObjects = [
+    { tag: "p", type: "paragraph", text: "Blessed is   \n" },
+    { type: "word", tag: "w", text: "the" },
+    { type: "text", text: " " },
+    { type: "word", tag: "w", text: "man" },
+    { tag: "p", type: "paragraph", nextChar: "\n" },
+    { type: "text", text: " " },
+    { type: "word", tag: "w", text: "who" },
+  ];
+  const before = JSON.parse(JSON.stringify(verseObjects));
+  renderVerseUsfm({ verseObjects }, 1, 1);
+  assert(
+    JSON.stringify(verseObjects) === JSON.stringify(before),
+    "renderVerseUsfm does not mutate the input verseObjects",
+  );
+}
+
+// ── 8. renderVerseUsfm falls back to null instead of throwing on a
+//       malformed tree, so one bad history entry can't crash the dialog.
+{
+  const malformed = [{ tag: "zaln-s", type: "milestone" /* missing closing zaln-e */ }];
+  let threw = false;
+  let result;
+  try {
+    result = renderVerseUsfm({ verseObjects: malformed }, 1, 1);
+  } catch {
+    threw = true;
+  }
+  assert(!threw, "a malformed verseObjects tree does not throw out of renderVerseUsfm");
+  assert(result === null || typeof result === "string", "malformed input resolves to null or a string, never throws");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

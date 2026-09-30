@@ -10,7 +10,8 @@ import usfm from "usfm-js";
 // Render a single verse's content_json to a USFM string, scoped to just that
 // verse (no chapter/header wrapper). Returns null when `content` isn't a
 // usable verseObjects tree — older AI/reimport history entries only logged
-// `plain_text`, never `content` (see VerseHistoryEntry.restorable).
+// `plain_text`, never `content` (see VerseHistoryEntry.restorable) — or when
+// rendering throws on a malformed tree.
 export function renderVerseUsfm(
   content: unknown,
   chapter: number,
@@ -19,13 +20,28 @@ export function renderVerseUsfm(
   const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(verseObjects) || verseObjects.length === 0) return null;
   const verseKey = verseNum === 0 ? "front" : String(verseNum);
-  const rendered = usfm.toUSFM(
-    { chapters: { [String(chapter)]: { [verseKey]: { verseObjects } } } },
-    { forcedNewLines: true },
-  );
-  // toUSFM always prefixes the chapter marker for the chapter it was given —
-  // strip it, since the dialog already shows chapter:verse in its header.
-  return rendered.replace(/^\\c\s+\d+\n?/, "").trimEnd();
+  try {
+    // usfm-js's toUSFM edits the nodes it's given IN PLACE (trims paragraph
+    // text, deletes nextChar, strips text/type off a whitespace node after a
+    // paragraph — see node_modules/usfm-js/lib/js/jsonToUsfm.js and issue
+    // #932, which hit the same defect in exportUsfm.ts). `content` here is
+    // the entry's cached tree — for the CURRENT version that's the same
+    // object Shell/hooks hold live, and "Switch to vN" re-saves a selected
+    // version's own `content` verbatim (see onUseVersion below), so without
+    // cloning, merely opening this dialog would corrupt cached verse state
+    // and any subsequent restore. structuredClone isolates the render.
+    const rendered = usfm.toUSFM(
+      { chapters: { [String(chapter)]: { [verseKey]: { verseObjects: structuredClone(verseObjects) } } } },
+      { forcedNewLines: true },
+    );
+    // toUSFM always prefixes the chapter marker for the chapter it was given —
+    // strip it, since the dialog already shows chapter:verse in its header.
+    return rendered.replace(/^\\c\s+\d+\n?/, "").trimEnd();
+  } catch {
+    // A malformed tree (any one bad history entry) must not crash the whole
+    // dialog — fall back as if this version had no renderable USFM.
+    return null;
+  }
 }
 
 // Matches a `\zaln-s |attr="…" …\*` opening milestone, attributes included.

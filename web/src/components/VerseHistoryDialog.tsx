@@ -207,7 +207,20 @@ export function VerseHistoryDialog({
                     <ListItemButton
                       key={e.version}
                       selected={e.version === selectedVersion}
-                      onClick={() => setSelectedVersion(e.version)}
+                      onClick={() => {
+                        setSelectedVersion(e.version);
+                        // A "markers/alignment only" row's whole point is a
+                        // difference the plain-text/snapshot views can't show.
+                        // Jump straight to the view that can, with attributes
+                        // visible — otherwise the default hidden-attributes
+                        // USFM view can ALSO look unchanged (e.g. a re-pointed
+                        // \zaln is pure attributes), leaving the reader with no
+                        // view that shows what the chip promised.
+                        if (markersOnlyVersions.has(e.version)) {
+                          setViewMode("usfm");
+                          setShowAlignment(true);
+                        }
+                      }}
                     >
                       <ListItemText
                         primary={
