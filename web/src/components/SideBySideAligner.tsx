@@ -455,7 +455,9 @@ export function SideBySideAligner({
   );
 
   return (
-    <Dialog open={open} onClose={onClose} fullScreen>
+    // disableEnforceFocus: the pinned lexical box (PinnedLexBox) is portaled
+    // outside this Dialog; a focus trap would fight text selection in it (#1053).
+    <Dialog open={open} onClose={onClose} fullScreen disableEnforceFocus>
       <Box sx={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
         {/* titlebar */}
         <Box

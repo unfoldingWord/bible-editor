@@ -4,7 +4,7 @@
 // column in stacked, columns, and book modes — these versions are
 // read-only, so we don't have to maintain a contentEditable cursor.
 
-import { memo, useMemo, useState } from "react";
+import { memo, useMemo } from "react";
 import { Tooltip, Box } from "@mui/material";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
@@ -12,7 +12,7 @@ import type { HighlightKey } from "../lib/highlight";
 import type { TwlRow } from "../sync/api";
 import { roleLineSx, wordHighlightStyles } from "../lib/highlightStyles";
 import { SourceTooltipBody } from "./SourceTooltipBody";
-import { PinnedLexBox } from "./PinnedLexBox";
+import { pinLex, usePinnedLexRefresh } from "./PinnedLexBox";
 import { buildTwHintMap, twHintFromMap } from "./UhbStrip";
 
 interface Props {
@@ -118,10 +118,9 @@ export const HebrewLine = memo(function HebrewLine({ verseObjects, lexiconMap, h
 });
 
 // One \w source token: hover shows the lexical Tooltip; double-click pins the
-// same lexical info into an interactive Popover so its text (lemma, gloss,
+// same lexical info into the app's one pinned lexical box (PinnedLexBox) so its text (lemma, gloss,
 // definition) can be selected and copied — the hover Tooltip is
-// pointerEvents:none and can't be. Carried in its own component so the pin
-// state is hooks-legal (HebrewLine builds tokens in a loop).
+// pointerEvents:none and can't be.
 function HebrewWord({
   text,
   src,
@@ -143,12 +142,12 @@ function HebrewWord({
   isPrev: boolean;
   isNext: boolean;
 }) {
-  const [pinAnchor, setPinAnchor] = useState<HTMLElement | null>(null);
+  usePinnedLexRefresh(src, lex);
   return (
     <>
       <Tooltip
         title={
-          pinAnchor ? "" : <SourceTooltipBody source={src} lex={lex} twHint={twHint} pinHint />
+          <SourceTooltipBody source={src} lex={lex} twHint={twHint} pinHint />
         }
         enterDelay={0}
         enterNextDelay={0}
@@ -156,7 +155,7 @@ function HebrewWord({
       >
         <Box
           component="span"
-          onDoubleClick={(e) => setPinAnchor(e.currentTarget)}
+          onDoubleClick={() => pinLex(src, lex, twHint)}
           sx={(theme) => {
             const mode = theme.palette.mode;
             const hl = wordHighlightStyles(mode);
@@ -181,15 +180,6 @@ function HebrewWord({
           {text}
         </Box>
       </Tooltip>
-      {pinAnchor && (
-        <PinnedLexBox
-          anchorEl={pinAnchor}
-          source={src}
-          lex={lex}
-          twHint={twHint}
-          onClose={() => setPinAnchor(null)}
-        />
-      )}
     </>
   );
 }
