@@ -12,7 +12,7 @@ import type { HighlightKey } from "../lib/highlight";
 import type { TwlRow } from "../sync/api";
 import { roleLineSx, wordHighlightStyles } from "../lib/highlightStyles";
 import { SourceTooltipBody } from "./SourceTooltipBody";
-import { pinLex } from "./PinnedLexBox";
+import { pinLex, usePinnedLexRefresh } from "./PinnedLexBox";
 import { buildTwHintMap, twHintFromMap } from "./UhbStrip";
 
 interface Props {
@@ -142,6 +142,7 @@ function HebrewWord({
   isPrev: boolean;
   isNext: boolean;
 }) {
+  usePinnedLexRefresh(src, lex);
   return (
     <>
       <Tooltip

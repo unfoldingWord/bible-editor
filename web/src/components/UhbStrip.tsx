@@ -9,7 +9,7 @@ import { type HighlightCtx, hoverShadow } from "../lib/highlightTypes";
 import { nfc } from "../lib/hebrew";
 import { directionForVersion } from "../lib/direction";
 import { SourceTooltipBody } from "./SourceTooltipBody";
-import { pinLex } from "./PinnedLexBox";
+import { pinLex, usePinnedLexRefresh } from "./PinnedLexBox";
 
 // ─── UHB source strip ────────────────────────────────────────────────
 // The verse's Hebrew/Greek source text, rendered as hover-aware tokens. Lifted
@@ -207,6 +207,7 @@ function SourceVerseToken({
   // Double-click pins the lexical info into the app's one pinned lexical box so its text
   // (lemma, gloss, definition) can be selected and copied — the hover Tooltip
   // is pointerEvents:none and can't be.
+  usePinnedLexRefresh(source, lex);
   return (
     <>
       <Tooltip

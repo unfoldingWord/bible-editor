@@ -1,8 +1,9 @@
 // The pinned lexical box: double-clicking a Hebrew/Greek source word opens this
 // panel with the same lexical info as the hover Tooltip, but with
 // selectable/copyable text (the hover Tooltip is pointerEvents:none and can't
-// be). A copy button lifts the lexical form (lemma) to the clipboard; an X
-// (or Esc) closes it.
+// be). A copy button lifts the lexical form (lemma) to the clipboard; the X
+// closes it. No Esc shortcut: inside the aligner Dialog, Esc would also close
+// the aligner.
 //
 // It used to be a Popover anchored to the clicked word, which jumped whenever
 // the word moved or re-rendered and closed on any outside click (#1053). Now
@@ -37,6 +38,18 @@ export function pinLex(source: SourceWord, lex: LexiconEntry | null, twHint: str
   emit();
 }
 
+// A word pinned before its lexicon entry loaded is pinned with lex=null. Each
+// source word calls this on render; once the entry arrives it fills the pin
+// in. Entries are keyed by Strong's, so any word with the same Strong's can.
+export function usePinnedLexRefresh(source: SourceWord, lex: LexiconEntry | null) {
+  useEffect(() => {
+    if (lex && pinned && !pinned.lex && pinned.source.strong === source.strong) {
+      pinned = { ...pinned, lex };
+      emit();
+    }
+  }, [source.strong, lex]);
+}
+
 function unpinLex() {
   pinned = null;
   emit();
@@ -68,20 +81,20 @@ function clamp(p: Pos): Pos {
 export function PinnedLexHost() {
   const current = useSyncExternalStore(subscribe, () => pinned);
   // null = default spot (bottom-right corner, anchored by right/bottom).
-  const [pos, setPos] = useState<Pos | null>(loadPos);
+  const [pos, setPos] = useState<Pos | null>(() => {
+    const p = loadPos();
+    return p ? clamp(p) : null;
+  });
   const paperRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
 
+  useEffect(() => setCopied(false), [current?.source]);
+
   useEffect(() => {
     if (!current) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") unpinLex();
-    };
     const onResize = () => setPos((p) => (p ? clamp(p) : p));
-    window.addEventListener("keydown", onKey);
     window.addEventListener("resize", onResize);
     return () => {
-      window.removeEventListener("keydown", onKey);
       window.removeEventListener("resize", onResize);
     };
   }, [current]);
@@ -115,6 +128,7 @@ export function PinnedLexHost() {
     const up = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
       try {
         localStorage.setItem(POS_KEY, JSON.stringify(last));
       } catch {
@@ -123,6 +137,7 @@ export function PinnedLexHost() {
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
   };
 
   const iconSx = { color: "rgba(255,255,255,0.7)" };
@@ -135,7 +150,8 @@ export function PinnedLexHost() {
         elevation={8}
         sx={(theme) => ({
           position: "fixed",
-          zIndex: theme.zIndex.tooltip,
+          // Above Dialogs (the aligner), below Snackbars and hover tooltips.
+          zIndex: theme.zIndex.modal + 1,
           ...(pos ? { left: pos.x, top: pos.y } : { right: 16, bottom: 16 }),
           width: WIDTH,
           maxWidth: "calc(100vw - 16px)",
@@ -149,7 +165,7 @@ export function PinnedLexHost() {
       >
         <Box
           onPointerDown={startDrag}
-          sx={{ display: "flex", alignItems: "center", cursor: "move", mx: -0.5, userSelect: "none" }}
+          sx={{ display: "flex", alignItems: "center", cursor: "move", mx: -0.5, userSelect: "none", touchAction: "none" }}
         >
           <DragIndicatorIcon sx={{ fontSize: 16, ...iconSx }} />
           {lemma && (
