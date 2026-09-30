@@ -9,7 +9,7 @@ import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { TwlSuggestions } from "./TwlSuggestions";
 import { QuestionsTable } from "./QuestionsTable";
-import type { AlignmentPanelHandle } from "./AlignmentPanel";
+import type { AlignerLock, AlignmentPanelHandle } from "./AlignmentPanel";
 import { noteOverlapsRange } from "../lib/verseRange";
 import { hasLeftNoteVerse, type ActiveLocation } from "../lib/noteGuard";
 import { canonicalTwlOrder, twlDisplayOrder } from "../lib/twlCanonicalOrder";
@@ -83,6 +83,10 @@ export interface AlignmentTabProps {
   onOpenDual?: () => void;
   // Restore a previously-saved verse version from the panel's history button.
   onRestoreVersion?: (content: unknown, plainText: string | null) => void;
+  // #943: set while this verse can't be written (AI pipeline chapter lock,
+  // or a book lock that landed after the panel opened). Passed through to
+  // AlignmentPanel, which disables alignment changes, Save and history restore.
+  locked?: AlignerLock;
 }
 
 interface Props {
@@ -953,6 +957,7 @@ export function ResourceColumn({
               onDirtyChange={alignmentProps.onDirtyChange}
               onOpenDual={alignmentProps.onOpenDual}
               onRestoreVersion={alignmentProps.onRestoreVersion}
+              locked={alignmentProps.locked}
             />
           </Suspense>
         ) : (
