@@ -80,7 +80,7 @@ import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import type { BookViewportRestore } from "./BookView";
 import { ResourceColumn, type AlignmentTabProps, type PanelMode, type ReorderPreview, type ResourceCheckoff, type ResourceLane } from "./ResourceColumn";
-import type { AlignmentPanelHandle } from "./AlignmentPanel";
+import type { AlignerLock, AlignmentPanelHandle } from "./AlignmentPanel";
 import {
   SideBySideAligner,
   type PanelSlot,
@@ -1004,28 +1004,41 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // lanes the UI greys out can't drift from the ones the API rejects.
   const [activeJobs, setActiveJobs] = useState<PipelineJob[]>([]);
   useEffect(() => pipelineStore.subscribe(setActiveJobs), []);
-  const chapterLocks = useMemo(() => {
-    const running = activeJobs.filter(
-      (j) =>
-        j.book === book &&
-        j.start_chapter <= chapter &&
-        j.end_chapter >= chapter &&
-        (j.state === "running" ||
-          j.state === "paused_for_outage" ||
-          j.state === "paused_for_usage_limit" ||
-          j.state === "dispatching"),
-    );
-    const lockFor = (resource: "verse" | "tn" | "tq") => {
-      const found = running.find((j) => j.locks_resources?.includes(resource));
+  // Same derivation as chapterLocks below, but for an arbitrary chapter
+  // number rather than the one currently displayed — needed by the aligner
+  // props (alignerTarget/dualTarget can name a DIFFERENT chapter than
+  // `chapter` in book mode, where a translator can open the aligner on a
+  // chapter that isn't the one currently scrolled to).
+  const lockForChapter = useCallback(
+    (chapterNum: number, resource: "verse" | "tn" | "tq") => {
+      const found = activeJobs.find(
+        (j) =>
+          j.book === book &&
+          j.start_chapter <= chapterNum &&
+          j.end_chapter >= chapterNum &&
+          (j.state === "running" ||
+            j.state === "paused_for_outage" ||
+            j.state === "paused_for_usage_limit" ||
+            j.state === "dispatching") &&
+          j.locks_resources?.includes(resource),
+      );
       if (!found) return null;
       return {
         jobId: found.job_id,
         pipelineType: found.pipeline_type,
         startedAt: found.created_at,
       };
-    };
-    return { verse: lockFor("verse"), tn: lockFor("tn"), tq: lockFor("tq") };
-  }, [activeJobs, book, chapter]);
+    },
+    [activeJobs, book],
+  );
+  const chapterLocks = useMemo(
+    () => ({
+      verse: lockForChapter(chapter, "verse"),
+      tn: lockForChapter(chapter, "tn"),
+      tq: lockForChapter(chapter, "tq"),
+    }),
+    [lockForChapter, chapter],
+  );
   // One banner line per active run, so a run's type and start time are never
   // attributed to another run's locked lanes.
   const lockBanners = useMemo(() => {
@@ -1359,6 +1372,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // folded into setReadOnlyReason: that global would drop the legitimate
   // writes above.
   const editLocked = bookLocked || chapterStale;
+  // #943: the aligner's in-panel lock for a given chapter. Entry is already
+  // refused on editLocked (openAligner et al.); this covers a pipeline lock,
+  // which does not block entry, and a book lock that lands while an aligner
+  // is open. chapterStale is left out on purpose: the single aligner sits in
+  // the inert split container while stale, and an aligner save targets an
+  // explicit verse id + version, which #892 lets through.
+  const alignerLock = useCallback(
+    (chapterNum: number): AlignerLock =>
+      lockForChapter(chapterNum, "verse") ? "chapter" : bookLocked ? "book" : false,
+    [lockForChapter, bookLocked],
+  );
   const chapterStaleRef = useRef(chapterStale);
   chapterStaleRef.current = chapterStale;
 
@@ -2709,7 +2733,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
   const dualSaveDoneAndNext = useCallback(
     (verse: number, next: number) => {
-      if (meUserId == null || editLocked) return;
+      // #943: this only reaches the dual aligner while dualTarget.chapter ===
+      // chapter (see dualNav's gate above), so chapterLocks.verse (the
+      // CURRENT chapter's pipeline lock) is the right check here, same as
+      // editLocked. Without it, the chain's verse PATCHes would be rejected
+      // (409 chapter_locked) while this still marked the verse done and
+      // advanced. The button is also hidden while locked (onSaveDoneAndNext).
+      if (meUserId == null || editLocked || chapterLocks.verse) return;
       saveDoneGuardRef.current.run({
         steps: dualSaveSteps(),
         markDone: () => {
@@ -2722,7 +2752,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         },
       });
     },
-    [dualSaveSteps, meUserId, editLocked, applyLocalLaneCheck, book, chapter],
+    [dualSaveSteps, meUserId, editLocked, chapterLocks.verse, applyLocalLaneCheck, book, chapter],
   );
   // Dismissing the unalign confirm without saving: any save chain waiting on it
   // (the gate's Save, the save-done-next button) is stalled for good, so free
@@ -2942,11 +2972,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               targetVerse,
             )
         : undefined,
+      // #943: a pipeline lock does not block entry (the dual aligner's
+      // reading line must stay reachable through a chapter lock so its
+      // PATCH-then-reject-with-toast path keeps working, s9 check (b)), so
+      // the panel itself goes read-only: no alignment changes, Save or
+      // history restore. `alignerTarget.chapter` can differ from `chapter`
+      // in book mode.
+      locked: alignerLock(alignerTarget.chapter),
     };
     // `restoreVerse` excluded: it's recreated every render, so listing it here
     // would make this memoized props object churn every render too.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [alignerTarget, data, chapter, bookHook, book, openDualAligner, applyLocalVerse, enqueueVerseSafely]);
+  }, [
+    alignerTarget,
+    data,
+    chapter,
+    bookHook,
+    book,
+    openDualAligner,
+    applyLocalVerse,
+    enqueueVerseSafely,
+    alignerLock,
+  ]);
 
   // Props for the side-by-side popup: ULT + UST slices against one shared
   // source. Undefined (popup closed) unless a dualTarget is set and at least
@@ -3057,8 +3104,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       twlForVerse,
       left,
       right,
+      // #943: see the matching comment on alignmentTabProps.locked above —
+      // same reasoning, but the dual popup itself stays open through a
+      // chapter lock (its reading line's PATCH-then-reject path depends on
+      // that), so only the two AlignmentPanels' own save/restore disable.
+      locked: alignerLock(dualTarget.chapter),
     };
-  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely]);
+  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely, alignerLock]);
 
   // Prev/next verse for the dual aligner's titlebar arrows, within the current
   // chapter's verse list (excluding the intro tile). Null at the ends.
@@ -4446,10 +4498,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           lexiconMap={lexiconMap}
           left={dualAlignerProps.left}
           right={dualAlignerProps.right}
+          locked={dualAlignerProps.locked}
           onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
           onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
           onSaveDoneAndNext={
-            dualNav.next != null && textLaneCheck.canCheck
+            dualNav.next != null && textLaneCheck.canCheck && !dualAlignerProps.locked
               ? () => dualSaveDoneAndNext(dualAlignerProps.verseNum, dualNav.next!)
               : undefined
           }
