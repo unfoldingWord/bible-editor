@@ -15,6 +15,7 @@ import {
   noteOverlapsRange,
   sourceForTargetRow,
   rowHighlightsFor,
+  bridgeNoteAnchor,
 } from "./verseRange.ts";
 import usfm from "usfm-js";
 import { verseHasUnalignedWork } from "./alignment.ts";
@@ -443,6 +444,59 @@ function mkVerse(verse, verseEnd, voCount = 1) {
     const main = highlightsFor("ULT", row.content, C, 1, uhb[2].content);
     assert(show(hl) === show(main), `unresolved later-verse quote matches main's rows view on 1:2 (got ${show(hl)}, main ${show(main)})`);
   }
+}
+
+// ─── #968: bridgeNoteAnchor guards ──
+// The word-gloss preview and TN Quick shift a bridge note's occurrence only
+// when the row numbers the quote across the span and the counts add up.
+{
+  const vo = (raw) => {
+    const json = usfm.toJSON(raw);
+    const ch = Object.keys(json.chapters)[0];
+    return Object.fromEntries(
+      Object.entries(json.chapters[ch]).filter(([k]) => /^\d/.test(k)).map(([k, v]) => [k, v.verseObjects]),
+    );
+  };
+  const mk = (verse, verseEnd, verseObjects, bv) => ({
+    book: "ZEC", chapter: 1, verse, verse_end: verseEnd, bible_version: bv,
+    plain_text: null, version: 1, updated_by: null, updated_at: 0, content: { verseObjects },
+  });
+  const W = (s) => String.raw`\w ${s}|lemma="${s}" strong="H1" x-morph="He,X"\w*`;
+  const Z = (src, occ, occs, gloss) =>
+    String.raw`\zaln-s |x-strong="H1" x-lemma="${src}" x-morph="He,X" x-occurrence="${occ}" x-occurrences="${occs}" x-content="${src}"\*\w ${gloss}|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*`;
+  const A = "אֶת", B = "יְהוָה", C = "דָּבָר";
+  const src = (verses) => {
+    const parsed = vo(`\\id ZEC\n\\c 1\n${verses.map((ws, i) => `\\v ${i + 1} ${ws.map(W).join(" ")}`).join("\n")}\n`);
+    return Object.fromEntries(verses.map((_, i) => [i + 1, mk(i + 1, null, parsed[String(i + 1)], "UHB")]));
+  };
+  const bridge = (end, body) => {
+    const parsed = vo(`\\id ZEC\n\\c 1\n\\v 1-${end} ${body}\n`);
+    return mk(1, end, parsed[`1-${end}`] ?? parsed["1"], "ULT");
+  };
+
+  console.log("\n[Case] bridgeNoteAnchor (#968)");
+  const uhb = src([[A, B], [A, C]]);
+  const across = bridge(2, [Z(A, 1, 2, "a1"), Z(B, 1, 1, "b1"), Z(A, 2, 2, "a2"), Z(C, 1, 1, "c2")].join(" "));
+  const hit = bridgeNoteAnchor(uhb, across, 2, A, 1);
+  assert(hit?.occurrence === 2 && hit.source.verse_end === 2, `across-span row: note on 1:2 occ 1 becomes span occ 2 (got ${hit && hit.occurrence})`);
+  assert(bridgeNoteAnchor(uhb, across, 1, A, 1)?.occurrence === 1, "note on the first verse keeps occ 1 on the span source");
+  assert(bridgeNoteAnchor(uhb, across, 2, `${A} ${C}`, 1)?.occurrence === 1, "phrase: counts phrase matches, not single words");
+  assert(bridgeNoteAnchor(uhb, across, 2, A, -1) === null, "occurrence -1 keeps the own-verse lookup");
+  assert(bridgeNoteAnchor(uhb, across, 2, A, 2) === null, "occurrence past the note's own verse keeps the own-verse lookup");
+  assert(bridgeNoteAnchor(uhb, across, 2, null, 1) === null, "no quote: null");
+  assert(bridgeNoteAnchor(uhb, mk(2, null, across.content.verseObjects, "ULT"), 2, A, 1) === null, "singleton row: null");
+  assert(bridgeNoteAnchor({ 1: uhb[1] }, across, 2, A, 1) === null, "missing source verse inside the span: null");
+  const perVerse = bridge(2, [Z(A, 1, 1, "a1"), Z(B, 1, 1, "b1"), Z(A, 1, 1, "a2"), Z(C, 1, 1, "c2")].join(" "));
+  assert(bridgeNoteAnchor(uhb, perVerse, 2, A, 1) === null, "per-verse-numbered row: null");
+  const mixed = bridge(2, [Z(A, 1, 1, "a1"), Z(B, 1, 1, "b1"), Z(A, 2, 2, "a2"), Z(C, 1, 1, "c2")].join(" "));
+  assert(bridgeNoteAnchor(uhb, mixed, 2, A, 1) === null, "mixed-numbering row: null");
+  // "B A" occurs once inside verse 2 and once more across the 1|2 boundary
+  // (v1 ends in B, v2 starts with A), so the span count (2) is not the sum
+  // of the per-verse counts (0 + 1).
+  const uhbS = src([[A, B], [A, B, A]]);
+  const acrossS = bridge(2, [Z(A, 1, 3, "a1"), Z(B, 1, 2, "b1"), Z(A, 2, 3, "a2"), Z(B, 2, 2, "b2"), Z(A, 3, 3, "a3")].join(" "));
+  assert(bridgeNoteAnchor(uhbS, acrossS, 2, A, 2)?.occurrence === 3, "control: the straddle fixture shifts a plain word");
+  assert(bridgeNoteAnchor(uhbS, acrossS, 2, `${B} ${A}`, 1) === null, "quote straddling the verse boundary: null");
 }
 
 if (failed) {

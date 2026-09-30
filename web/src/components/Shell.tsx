@@ -31,6 +31,7 @@ import { outbox } from "../sync/outbox";
 import { api, ApiError, CHECK_LANES, setReadOnlyReason } from "../sync/api";
 import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
+import { trackLockedKey } from "../lib/chapterStale";
 import { countThreads, resolveCommentLocation, rowKey, type CommentThread, type LiveRows } from "../lib/commentsIndex";
 import { CommentsPopover } from "./CommentsPopover";
 import type { CommentTarget, NewCommentDraft, OpenCommentsFn } from "./commentsTarget";
@@ -59,7 +60,7 @@ import {
   guardBlocksSave,
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
-import { buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, versesFromKey } from "../lib/verseRange";
+import { bridgeNoteAnchor, buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, versesFromKey } from "../lib/verseRange";
 import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
@@ -74,11 +75,12 @@ import { resolveSpanToSource } from "../lib/twlResolve";
 import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
+import { createUhbStrongsCache } from "../lib/uhbStrongs";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import type { BookViewportRestore } from "./BookView";
 import { ResourceColumn, type AlignmentTabProps, type PanelMode, type ReorderPreview, type ResourceCheckoff, type ResourceLane } from "./ResourceColumn";
-import type { AlignmentPanelHandle } from "./AlignmentPanel";
+import type { AlignerLock, AlignmentPanelHandle } from "./AlignmentPanel";
 import {
   SideBySideAligner,
   type PanelSlot,
@@ -293,6 +295,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const {
     status,
     data,
+    stale: chapterStale,
     error,
     retryAttempts,
     refetch,
@@ -333,6 +336,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // would go out with a stale version and take a needless 409.
   const handleTwlOrderUnlock = useCallback(
     async (verse: number) => {
+      if (chapterStaleRef.current) return; // #892: route chapter, on-screen verse
       try {
         await api.unlockTwlOrder(book, chapter, verse);
         applyLocalTwlOrderLock(verse, null);
@@ -349,6 +353,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // quiet until automatic ordering proposes something genuinely different.
   const handleTwlOrderDismiss = useCallback(
     async (verse: number, dismissedOrder: string) => {
+      if (chapterStaleRef.current) return; // #892: route chapter, on-screen verse
       try {
         const lock = await api.dismissTwlOrderSuggestion(book, chapter, verse, dismissedOrder);
         applyLocalTwlOrderLock(verse, lock);
@@ -399,6 +404,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     return { rowIds, introRowId: introRow ? introRow.id : null };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [commentLiveRowsKey]);
+  // A → B → A keeps A on screen, so the comments key never changes and A's
+  // comments would not refetch, although the socket followed B meanwhile and
+  // missed A's comment events. Bump the comments epoch when such a lock lifts
+  // (#892). Adjusted during render (React's derived-state pattern) so the
+  // first unlocked commit already treats the old set as unsettled: a comment
+  // deep link waits for the refetch instead of reporting the comment gone.
+  const [commentsLock, setCommentsLock] = useState<{ lockedKey: string | null; epoch: number }>({
+    lockedKey: null,
+    epoch: 0,
+  });
+  const commentsKey = data ? `${data.book}/${data.chapter}` : null;
+  if (commentsKey != null) {
+    const next = trackLockedKey(commentsLock.lockedKey, chapterStale, commentsKey);
+    if (next.lockedKey !== commentsLock.lockedKey) {
+      setCommentsLock({ lockedKey: next.lockedKey, epoch: commentsLock.epoch + (next.reload ? 1 : 0) });
+    }
+  }
+  const commentsEpoch = commentsLock.epoch;
+  // Keyed on the chapter ON SCREEN, not the route (#892). While the previous
+  // chapter is the locked copy shown during a chapter change, the route's
+  // threads would paint onto its verse cells (and be indexed against its
+  // rows); the new chapter's comments load once its payload lands.
   const {
     index: commentsIndex,
     loading: commentsLoading,
@@ -410,7 +437,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     removeComment,
     applyWsComment,
     reload: reloadComments,
-  } = useComments(book, chapter, commentsEnabled, commentLiveRows);
+  } = useComments(data?.book ?? book, data?.chapter ?? chapter, commentsEnabled, commentLiveRows, commentsEpoch);
 
   // Live cross-tab updates. The server broadcasts row writes via the
   // ChapterRoom DO; we dedupe by version so the originating user's tab
@@ -431,7 +458,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   useEffect(() => {
     if (!import.meta.env.DEV) return;
     registerVerseVersionReader((readBook, readChapter, readVerse, bibleVersion) => {
-      if (readBook !== book || readChapter !== chapter) return undefined;
+      if (readBook !== book || readChapter !== chapter || dataRef.current?.chapter !== chapter) return undefined;
       return dataRef.current?.verses[bibleVersion]?.[readVerse]?.version;
     });
   }, [book, chapter]);
@@ -686,6 +713,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // try/catch here, since a swallowed failure is indistinguishable from success.
   const handleCreateComment = useCallback(
     async (draft: NewCommentDraft) => {
+      // #892: the target came from the chapter on screen, book/chapter from
+      // the route; refuse in the moment before the popover closes on a
+      // chapter change. Throw, not return: the popover treats a resolved call
+      // as posted and clears the typed text.
+      if (chapterStaleRef.current) throw new Error("The chapter is still loading; try again in a moment.");
       if (!commentTarget) return;
       await addComment({
         book,
@@ -986,28 +1018,41 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // lanes the UI greys out can't drift from the ones the API rejects.
   const [activeJobs, setActiveJobs] = useState<PipelineJob[]>([]);
   useEffect(() => pipelineStore.subscribe(setActiveJobs), []);
-  const chapterLocks = useMemo(() => {
-    const running = activeJobs.filter(
-      (j) =>
-        j.book === book &&
-        j.start_chapter <= chapter &&
-        j.end_chapter >= chapter &&
-        (j.state === "running" ||
-          j.state === "paused_for_outage" ||
-          j.state === "paused_for_usage_limit" ||
-          j.state === "dispatching"),
-    );
-    const lockFor = (resource: "verse" | "tn" | "tq") => {
-      const found = running.find((j) => j.locks_resources?.includes(resource));
+  // Same derivation as chapterLocks below, but for an arbitrary chapter
+  // number rather than the one currently displayed — needed by the aligner
+  // props (alignerTarget/dualTarget can name a DIFFERENT chapter than
+  // `chapter` in book mode, where a translator can open the aligner on a
+  // chapter that isn't the one currently scrolled to).
+  const lockForChapter = useCallback(
+    (chapterNum: number, resource: "verse" | "tn" | "tq") => {
+      const found = activeJobs.find(
+        (j) =>
+          j.book === book &&
+          j.start_chapter <= chapterNum &&
+          j.end_chapter >= chapterNum &&
+          (j.state === "running" ||
+            j.state === "paused_for_outage" ||
+            j.state === "paused_for_usage_limit" ||
+            j.state === "dispatching") &&
+          j.locks_resources?.includes(resource),
+      );
       if (!found) return null;
       return {
         jobId: found.job_id,
         pipelineType: found.pipeline_type,
         startedAt: found.created_at,
       };
-    };
-    return { verse: lockFor("verse"), tn: lockFor("tn"), tq: lockFor("tq") };
-  }, [activeJobs, book, chapter]);
+    },
+    [activeJobs, book],
+  );
+  const chapterLocks = useMemo(
+    () => ({
+      verse: lockForChapter(chapter, "verse"),
+      tn: lockForChapter(chapter, "tn"),
+      tq: lockForChapter(chapter, "tq"),
+    }),
+    [lockForChapter, chapter],
+  );
   // One banner line per active run, so a run's type and start time are never
   // attributed to another run's locked lanes.
   const lockBanners = useMemo(() => {
@@ -1327,6 +1372,33 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setReadOnlyReason("bookLocked", bookLocked);
     return () => setReadOnlyReason("bookLocked", false);
   }, [bookLocked]);
+  // After a chapter change the previous chapter's copy stays on screen until
+  // the new payload lands (#892). The lock is on NEW input: `editLocked`
+  // goes everywhere `bookLocked` disables an edit affordance, and the split
+  // container (rail, scripture and resource columns) is `inert` (no focus,
+  // typing, clicks or drags), so nothing new can be typed into the stale copy
+  // (#531). A write the user started before navigating (a save whose draft
+  // lookup resolves after the route moved, "Save anyway", an AI suggest
+  // landing) targets an explicit chapter-N row/verse id + version and still
+  // goes through; the outbox is the source of truth. What `chapterStaleRef`
+  // refuses is only a write whose target comes from the ROUTE chapter while
+  // the previous chapter's data is on screen (the row-create paths). Not
+  // folded into setReadOnlyReason: that global would drop the legitimate
+  // writes above.
+  const editLocked = bookLocked || chapterStale;
+  // #943: the aligner's in-panel lock for a given chapter. Entry is already
+  // refused on editLocked (openAligner et al.); this covers a pipeline lock,
+  // which does not block entry, and a book lock that lands while an aligner
+  // is open. chapterStale is left out on purpose: the single aligner sits in
+  // the inert split container while stale, and an aligner save targets an
+  // explicit verse id + version, which #892 lets through.
+  const alignerLock = useCallback(
+    (chapterNum: number): AlignerLock =>
+      lockForChapter(chapterNum, "verse") ? "chapter" : bookLocked ? "book" : false,
+    [lockForChapter, bookLocked],
+  );
+  const chapterStaleRef = useRef(chapterStale);
+  chapterStaleRef.current = chapterStale;
 
   // Toggle MY checkoff stamp on a (verse, lane): optimistic + outbox (offline-safe).
   const toggleLane = useCallback(
@@ -1336,31 +1408,36 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // blocks it at the outbox layer via setReadOnlyReason above), so
       // bail before the optimistic apply — otherwise the checkbox flips
       // and then silently reverts once the write is dropped.
-      if (bookLocked) return;
+      if (editLocked) return;
       const checkers = laneIndex.get(laneKey(verse, lane));
       const next = !(checkers?.includes(meUserId));
       applyLocalLaneCheck(verse, lane, meUserId, next);
       void outbox.enqueueLaneCheck(book, chapter, verse, lane, next);
     },
-    [book, chapter, meUserId, laneIndex, applyLocalLaneCheck, bookLocked],
+    [book, chapter, meUserId, laneIndex, applyLocalLaneCheck, editLocked],
   );
 
   // Bulk "all this chapter" for a lane. A fat-finger guard: clicking "all" only
   // REQUESTS the action (opens a confirm); nothing is written until confirmed.
   // Direction: check every applicable verse unless I've already checked them
   // all, in which case clear mine.
-  const [pendingBulk, setPendingBulk] = useState<{ lane: CheckLane; checked: boolean; verses: number[] } | null>(null);
+  // `chapter` is the chapter the verse list came from (the payload's): the
+  // confirm dialog is portaled outside the inert container and is closed on a
+  // chapter change, but confirmBulk also refuses a mismatch (#892).
+  const [pendingBulk, setPendingBulk] = useState<
+    { lane: CheckLane; checked: boolean; verses: number[]; chapter: number } | null
+  >(null);
   const bulkLaneToggle = useCallback(
     (lane: CheckLane) => {
-      if (meUserId == null) return;
+      if (meUserId == null || !data) return;
       const verses = tileSet
         .filter((t) => t.lanes.find((l) => l.lane === lane)?.applicable)
         .map((t) => t.verse);
       if (verses.length === 0) return;
       const allMine = verses.every((v) => laneIndex.get(laneKey(v, lane))?.includes(meUserId));
-      setPendingBulk({ lane, checked: !allMine, verses });
+      setPendingBulk({ lane, checked: !allMine, verses, chapter: data.chapter });
     },
-    [meUserId, tileSet, laneIndex],
+    [meUserId, tileSet, laneIndex, data],
   );
   // Run the confirmed bulk: optimistic apply + one direct PATCH (deliberate,
   // online action), reconciled from the server response.
@@ -1368,10 +1445,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const p = pendingBulk;
     setPendingBulk(null);
     if (!p || meUserId == null) return;
+    // Never apply one chapter's verse list to another chapter (#892).
+    if (p.chapter !== chapter) return;
     // Same reasoning as toggleLane: the bulk PATCH will 423 on a locked
     // book, so skip the optimistic apply rather than flip every checkbox
     // in the chapter and then silently revert them.
-    if (bookLocked) return;
+    if (editLocked) return;
     for (const v of p.verses) applyLocalLaneCheck(v, p.lane, meUserId, p.checked);
     void api
       .setLaneCheckBulk(book, chapter, p.lane, p.checked, p.verses)
@@ -1379,7 +1458,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       .catch(() => {
         /* leave optimistic state; a later load reconciles */
       });
-  }, [pendingBulk, book, chapter, meUserId, applyLocalLaneCheck, replaceLaneChecksForLane, bookLocked]);
+  }, [pendingBulk, book, chapter, meUserId, applyLocalLaneCheck, replaceLaneChecksForLane, editLocked]);
 
   // In-context checkoff for the resource panels, scoped to the active verse.
   const resourceCheckoff = useMemo<ResourceCheckoff>(() => {
@@ -1392,14 +1471,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // resource panel's `done` and `all` controls render off this flag alone,
       // so disabling only TimelineRail/ChapterBoard left a third live surface
       // whose clicks hit the handler's early return and silently did nothing.
-      canCheck: meUserId != null && !bookLocked,
+      canCheck: meUserId != null && !editLocked,
       applicable: applic,
       shade: (lane) => (applic(lane) ? shadeFromCheckers(checkersOf(lane), meUserId) : "open"),
       attribution: (lane) => laneAttribution(checkersOf(lane), meUserId),
       onToggle: (lane) => toggleLane(activeVerse, lane),
       onBulkToggle: (lane) => bulkLaneToggle(lane),
     };
-  }, [activeVerse, laneIndex, versesWithTn, versesWithTq, meUserId, bookLocked, toggleLane, bulkLaneToggle]);
+  }, [activeVerse, laneIndex, versesWithTn, versesWithTq, meUserId, editLocked, toggleLane, bulkLaneToggle]);
 
   // Text-lane checkoff for the column/book scripture views (per verse). Text is
   // always applicable. Memoized so BookView's memoized verse subtree is stable.
@@ -1407,12 +1486,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     () => ({
       // Same reasoning as resourceCheckoff above — a locked book must not
       // offer the Text-lane checkbox either.
-      canCheck: meUserId != null && !bookLocked,
+      canCheck: meUserId != null && !editLocked,
       shade: (verse) => shadeFromCheckers(laneIndex.get(laneKey(verse, "text")), meUserId),
       attribution: (verse) => laneAttribution(laneIndex.get(laneKey(verse, "text")), meUserId),
       onToggle: (verse) => toggleLane(verse, "text"),
     }),
-    [laneIndex, meUserId, bookLocked, toggleLane],
+    [laneIndex, meUserId, editLocked, toggleLane],
   );
 
   // Chapter board (verses × lanes overview) dialog.
@@ -1570,29 +1649,32 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // AND every loaded chapter in book mode, so the per-word tooltips in the
   // scripture column don't have to fetch on first hover. useLexicon
   // dedupes at module level, so passing this repeatedly is cheap.
+  // Each chapter's UHB is walked once, cached on its UHB object's identity
+  // (lib/uhbStrongs.ts), and the memo depends on `data?.verses?.UHB`, so a
+  // ULT/UST save or verse.updated does not re-walk UHB (#898).
+  const [uhbStrongsFor] = useState(() => createUhbStrongsCache<VerseDto>(collectStrongs));
   const uhbStrongs = useMemo(() => {
     const set = new Set<string>();
-    const collect = (verses: Record<number, VerseDto> | undefined) => {
-      if (!verses) return;
-      for (const v of Object.values(verses)) {
-        const objs = (v.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-        if (Array.isArray(objs)) for (const s of collectStrongs(objs)) set.add(s);
-      }
+    const add = (verses: Record<number, VerseDto> | undefined) => {
+      for (const s of uhbStrongsFor(verses)) set.add(s);
     };
-    collect(data?.verses?.UHB);
+    add(data?.verses?.UHB);
     if (bookHook) {
       for (const cs of bookHook.chapters.values()) {
         if (cs.kind !== "ready") continue;
-        collect(cs.data.verses?.UHB);
+        add(cs.data.verses?.UHB);
       }
     }
     return [...set];
     // `bookHook?.chapters` rather than `bookHook`: narrower, as in availableVersions above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data?.verses, bookHook?.chapters]);
+  }, [data?.verses?.UHB, bookHook?.chapters]);
   const lexiconMapRaw = useLexicon(uhbStrongs);
-  // useLexicon hands back a fresh Map every render; stabilize its identity so
-  // ScriptureColumn's and BookView's memos can compare it. Keyed on CONTENT —
+  // useLexicon keeps its Map until the store version moves (#898), but the
+  // version moves when ANY lexicon entry resolves anywhere in the app, and
+  // uhbStrongs gets a new identity on every book-mode chapter load. Stabilize
+  // the Map's identity so ScriptureColumn's and BookView's memos can compare
+  // it. Keyed on CONTENT —
   // which entry each Strong's resolved to — not on uhbStrongs' identity, which
   // is new on every save and every book-mode chapter load even when nothing
   // changed, re-rendering every scripture cell that receives the map (#890).
@@ -1852,6 +1934,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   }, [quoteBuildTarget, data, verseIndexByVersion]);
 
   const commitQuoteBuild = useCallback(() => {
+    // #892: never write a quote built on a copy the route has moved away from.
+    if (chapterStaleRef.current) return;
     if (!quoteBuildTarget || !data) return;
     const row =
       quoteBuildTarget.kind === "tn"
@@ -1908,7 +1992,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // goes through createRow("twl") so chapter locks / concurrency are respected.
   const handleAddTwlSuggestion = useCallback(
     async (s: TwlSuggestion, chosenArticleId: string, verse: number) => {
-      if (!data) return;
+      if (!data || chapterStaleRef.current) return;
       // `verse` is the verse the suggestion was scanned from — in a bridge that
       // may not be the active/leading verse, which is the whole point: the link
       // lands on the verse it belongs to, not wherever the cursor happens to be.
@@ -2345,11 +2429,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   // App keys Shell on book only, so a cross-chapter navigation (URL /
   // back-forward / TopBar / cross-chapter find) changes the chapter +
-  // initialVerse props WITHOUT remounting Shell itself. Note useChapter DOES
-  // null its payload on every (book, chapter) change (#531, to block editing
-  // stale content), so the `!data` gate below briefly unmounts ScriptureColumn
-  // and the Find overlay under it — Find survives that remount by reseeding
-  // from sessionStorage (see ../lib/findState), not by data being preserved.
+  // initialVerse props WITHOUT remounting Shell itself. useChapter keeps the
+  // previous chapter's payload on screen, locked, until the new one lands
+  // (#892), and the view is keyed on the payload's chapter, so ScriptureColumn
+  // and the Find overlay under it remount when it lands. Find survives that
+  // remount by reseeding from sessionStorage (see ../lib/findState).
   // This effect does what the old remount used to: reset the per-chapter
   // transient state. Keyed on
   // [chapter, initialVerse] — internal same-chapter verse selection sets
@@ -2380,7 +2464,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // comment-deep-link consumer below runs after this effect, so it can still
     // open a popover on the chapter we're arriving at.
     closeComments();
+    // The quote builder is portaled outside the inert container (#892) and is
+    // about the chapter being left.
+    setQuoteBuildTarget(null);
+    setQuoteBuildSelectedKeys(new Set());
   }, [chapter, initialVerse, closeComments]);
+  // Chapter-only (not on a same-chapter verse link): the chapter board and an
+  // actionable pipeline toast ("new AI notes are ready, Refresh") are about the
+  // chapter being left, and both sit outside the inert container (#892).
+  const toastChapterRef = useRef(chapter);
+  useEffect(() => {
+    if (toastChapterRef.current === chapter) return;
+    toastChapterRef.current = chapter;
+    setBoardOpen(false);
+    setPendingBulk(null);
+    setPipelineToast((cur) => (cur?.action ? null : cur));
+  }, [chapter]);
 
   // A front-matter / intro chapter (chapter 0) has only the intro tile (verse 0)
   // and no real verses. Navigation defaults activeVerse to 1, which doesn't
@@ -2452,6 +2551,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   useEffect(() => {
     if (initialCommentId == null) return;
+    // #892: wait out a chapter lock. The comments on screen are the locked
+    // copy's; after A → B → A they can lack a comment made during the B window
+    // until the reload on lock lift, and a found one would resolve against the
+    // old copy's rows and open over a locked view.
+    if (chapterStale) return;
     const key = `${book}/${chapter}/${initialCommentId}`;
     if (consumedCommentKeyRef.current === key) return;
     const comment = commentsIndex.byId.get(initialCommentId);
@@ -2513,7 +2617,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // stayed set, this effect's deps never changed, and clicking the SAME alert
     // again was silently ignored (verified).
     onCommentConsumed?.();
-  }, [commentsIndex, commentLiveRows, commentsLoading, commentsLoadedKey, commentsError, book, chapter, initialCommentId, onCommentConsumed, pushPipelineToast]);
+  }, [commentsIndex, commentLiveRows, commentsLoading, commentsLoadedKey, commentsError, book, chapter, chapterStale, initialCommentId, onCommentConsumed, pushPipelineToast]);
 
   // Keep the alignment target's verse in step with the active verse while
   // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
@@ -2534,7 +2638,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // draft is dropped while the outbox returns a synthetic no-op). Block
       // entry rather than trying to make the aligner itself partially
       // read-only.
-      if (bookLocked) return;
+      if (editLocked) return;
       runWithDirtyGate(() => {
         setAlignerTarget({ chapter: chapterNum, verse: v, bibleVersion: bv });
         setActiveVerse(v);
@@ -2544,7 +2648,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         setPanelMode("alignment");
       });
     },
-    [runWithDirtyGate, bookLocked],
+    [runWithDirtyGate, editLocked],
   );
 
   // Open the side-by-side ULT/UST aligner on a verse. Layered over the UI as a
@@ -2554,13 +2658,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     (chapterNum: number, v: number) => {
       // See the matching guard in openAligner above: a locked book must not
       // allow entry to any aligner, dual or single.
-      if (bookLocked) return;
+      if (editLocked) return;
       runWithDirtyGate(() => {
         setActiveVerse(v);
         setDualTarget({ chapter: chapterNum, verse: v });
       });
     },
-    [runWithDirtyGate, bookLocked],
+    [runWithDirtyGate, editLocked],
   );
   // Any action that leaves or re-targets the dual aligner gates on unsaved work
   // — alignment drags OR reading-text edits in either panel (save/discard
@@ -2675,7 +2779,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
   const dualSaveDoneAndNext = useCallback(
     (verse: number, next: number) => {
-      if (meUserId == null || bookLocked) return;
+      // #943: this only reaches the dual aligner while dualTarget.chapter ===
+      // chapter (see dualNav's gate above), so chapterLocks.verse (the
+      // CURRENT chapter's pipeline lock) is the right check here, same as
+      // editLocked. Without it, the chain's verse PATCHes would be rejected
+      // (409 chapter_locked) while this still marked the verse done and
+      // advanced. The button is also hidden while locked (onSaveDoneAndNext).
+      if (meUserId == null || editLocked || chapterLocks.verse) return;
       saveDoneGuardRef.current.run({
         steps: dualSaveSteps(),
         markDone: () => {
@@ -2688,7 +2798,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         },
       });
     },
-    [dualSaveSteps, meUserId, bookLocked, applyLocalLaneCheck, book, chapter],
+    [dualSaveSteps, meUserId, editLocked, chapterLocks.verse, applyLocalLaneCheck, book, chapter],
   );
   // Dismissing the unalign confirm without saving: any save chain waiting on it
   // (the gate's Save, the save-done-next button) is stalled for good, so free
@@ -2707,7 +2817,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // alignment and all clean switches still apply immediately.
       // See the matching guard in openAligner above: a locked book must not
       // allow entry to the aligner via the Alignment tab either.
-      if (mode === "alignment" && bookLocked) return;
+      if (mode === "alignment" && editLocked) return;
       runWithDirtyGate(() => {
         if (mode === "alignment" && !alignerTarget) {
           setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: "ULT" });
@@ -2715,7 +2825,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         setPanelMode(mode);
       });
     },
-    [runWithDirtyGate, alignerTarget, chapter, activeVerse, bookLocked],
+    [runWithDirtyGate, alignerTarget, chapter, activeVerse, editLocked],
   );
 
   const dismissPendingNav = useCallback(() => setPendingNav(null), []);
@@ -2908,11 +3018,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               targetVerse,
             )
         : undefined,
+      // #943: a pipeline lock does not block entry (the dual aligner's
+      // reading line must stay reachable through a chapter lock so its
+      // PATCH-then-reject-with-toast path keeps working, s9 check (b)), so
+      // the panel itself goes read-only: no alignment changes, Save or
+      // history restore. `alignerTarget.chapter` can differ from `chapter`
+      // in book mode.
+      locked: alignerLock(alignerTarget.chapter),
     };
     // `restoreVerse` excluded: it's recreated every render, so listing it here
     // would make this memoized props object churn every render too.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [alignerTarget, data, chapter, bookHook, book, openDualAligner, applyLocalVerse, enqueueVerseSafely]);
+  }, [
+    alignerTarget,
+    data,
+    chapter,
+    bookHook,
+    book,
+    openDualAligner,
+    applyLocalVerse,
+    enqueueVerseSafely,
+    alignerLock,
+  ]);
 
   // Props for the side-by-side popup: ULT + UST slices against one shared
   // source. Undefined (popup closed) unless a dualTarget is set and at least
@@ -3023,8 +3150,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       twlForVerse,
       left,
       right,
+      // #943: see the matching comment on alignmentTabProps.locked above —
+      // same reasoning, but the dual popup itself stays open through a
+      // chapter lock (its reading line's PATCH-then-reject path depends on
+      // that), so only the two AlignmentPanels' own save/restore disable.
+      locked: alignerLock(dualTarget.chapter),
     };
-  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely]);
+  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely, alignerLock]);
 
   // Prev/next verse for the dual aligner's titlebar arrows, within the current
   // chapter's verse list (excluding the intro tile). Null at the ends.
@@ -3054,7 +3186,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // out and an offline user sees their connection state. Navigation here is
   // deliberately ungated — the alignment panel and the dirty-confirm dialog
   // only mount in the data branch, so runWithDirtyGate would soft-lock.
-  if (!data) {
+  // A stale copy (#892) is only shown while its replacement is on the way;
+  // if that load failed, show the error instead of leaving it up.
+  if (!data || (chapterStale && status === "error")) {
     return (
       // height:100% (not 100vh) so an in-flow app banner above this Shell can
       // reserve space and push it down instead of being overlaid (issue #458).
@@ -3299,7 +3433,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // open chapter, else the book-mode cache. Bridge create/break read both rows'
   // versions from here to CAS the structural change.
   const versesForChapterMap = (ch: number): Record<string, Record<number, VerseDto>> | undefined => {
-    if (ch === chapter) return dataRef.current?.verses;
+    // The payload's own chapter, not the route's: during the stale window
+    // (#892) the payload is still the previous chapter.
+    if (ch === dataRef.current?.chapter) return dataRef.current?.verses;
     const cs = bookHook?.chapters.get(ch);
     return cs?.kind === "ready" ? cs.data.verses : undefined;
   };
@@ -3483,8 +3619,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     if (chapterNum === chapter) applyLocalVerse(newDto);
   };
 
+  // The chapter the rendered payload belongs to. Equal to `chapter` except in
+  // the stale window (#892), when the previous chapter is still on screen:
+  // anything that labels scripture content with a chapter uses this, so the
+  // old copy is never keyed as the new chapter.
+  const viewChapter = data.chapter;
+
   return (
-    <OpenChapterProvider data={data}>
+    // Keyed on the payload's chapter so the whole view remounts when the fresh
+    // payload lands, exactly as the old blank-then-load did, just later (#892).
+    <OpenChapterProvider key={`${data.book}:${viewChapter}`} data={data}>
     <Box sx={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
       <TopBar
         book={book}
@@ -3577,7 +3721,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         exportMenu={
           <ExportUsfmButton
             book={book}
-            chapter={chapter}
+            chapter={viewChapter}
             enabledVersions={displayedVersions}
             chapterVersesFor={(version) =>
               data ? Object.values(data.verses[version] ?? {}) : []
@@ -3587,7 +3731,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         printPreview={
           <PrintPreviewButton
             book={book}
-            chapter={chapter}
+            chapter={viewChapter}
             enabledVersions={displayedVersions}
             chapterVersesFor={(version) =>
               data ? Object.values(data.verses[version] ?? {}) : []
@@ -3659,7 +3803,46 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             : ""}
         </Alert>
       ))}
-      <Box ref={splitContainerRef} sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
+      {chapterStale && (
+        // The stale copy is locked until the new chapter lands (#892); say so,
+        // especially when the load is retrying (offline / slow network).
+        // Fixed-position so it neither shifts the layout nor sits inside the
+        // inert container.
+        <Box
+          data-testid="stale-chapter-status"
+          role="status"
+          sx={{
+            position: "fixed",
+            bottom: 16,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: (t) => t.zIndex.snackbar,
+            display: "flex",
+            alignItems: "center",
+            gap: 1,
+            px: 1.5,
+            py: 0.75,
+            borderRadius: 1,
+            bgcolor: "background.paper",
+            boxShadow: 3,
+          }}
+        >
+          <CircularProgress size={14} />
+          <Typography variant="body2">
+            {status === "retrying" ? `reconnecting… (attempt ${retryAttempts})` : `loading ${book} ${chapter}…`}
+          </Typography>
+        </Box>
+      )}
+      <Box
+        ref={splitContainerRef}
+        sx={{ flex: 1, display: "flex", overflow: "hidden" }}
+        // Stale copy on screen (#892): inert blocks focus, typing, clicks and
+        // drags into everything below. React 18 has no `inert` prop type and
+        // only renders the attribute from a string value. React 19 treats
+        // `inert` as a boolean: switch to `inert={true}` on upgrade (s16
+        // asserts the attribute is present).
+        {...(chapterStale ? ({ inert: "", "aria-busy": "true", "data-stale-chapter": String(viewChapter) } as Record<string, string>) : {})}
+      >
         {!railCollapsed && (
           <Box sx={{ width: railWidth, flexShrink: 0, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
             <Tooltip title="Chapter checkoff board" placement="right">
@@ -3685,7 +3868,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             </Tooltip>
             <TimelineRail
               book={book}
-              chapter={chapter}
+              chapter={viewChapter}
               tiles={tileSet}
               activeVerse={activeVerse}
               showChapter={mode === "book"}
@@ -3693,7 +3876,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               onSelect={requestSelectVerse}
               onToggleLane={toggleLane}
               onHideLane={toggleLaneVisible}
-              bookLocked={bookLocked}
+              bookLocked={editLocked}
             />
           </Box>
         )}
@@ -3708,7 +3891,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         >
         <ScriptureColumn
           book={book}
-          chapter={chapter}
+          chapter={viewChapter}
           textCheck={textLaneCheck}
           verseCommentCounts={verseCommentCounts}
           onOpenVerseComments={onOpenVerseComments}
@@ -3798,21 +3981,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             saveToStorage(ENABLED_VERSIONS_KEY, versions);
           }}
           onEditVerse={(verseNum, bibleVersion, plain, base) => {
-            stashVerseDraft(chapter, verseNum, bibleVersion, plain, base);
+            stashVerseDraft(viewChapter, verseNum, bibleVersion, plain, base);
           }}
           onSaveVerse={(verseNum, bibleVersion, plain, base) => {
-            saveVerseDraft(chapter, verseNum, bibleVersion, plain, base);
+            saveVerseDraft(viewChapter, verseNum, bibleVersion, plain, base);
           }}
           onRestoreVerse={(verseNum, bibleVersion, content, plainText, base) => {
-            restoreVerse(chapter, verseNum, bibleVersion, content, plainText, base);
+            restoreVerse(viewChapter, verseNum, bibleVersion, content, plainText, base);
           }}
           onEditSection={(verseNum, bibleVersion, change, base) => {
-            saveSectionEdit(chapter, verseNum, bibleVersion, change, base);
+            saveSectionEdit(viewChapter, verseNum, bibleVersion, change, base);
           }}
           onEditBookSection={(ch, verseNum, bibleVersion, change, base) => {
             saveSectionEdit(ch, verseNum, bibleVersion, change, base);
           }}
-          onOpenAligner={(v, bv) => openAligner(chapter, v, bv)}
+          onOpenAligner={(v, bv) => openAligner(viewChapter, v, bv)}
           onMergeVerseBridge={(ch, v, bv) => mergeVerseWithNext(ch, v, bv)}
           onSplitVerseBridge={(ch, v, bv) => splitVerseBridge(ch, v, bv)}
           scrollNonce={scrollNonce}
@@ -3824,7 +4007,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           lexiconMap={lexiconMap}
           twl={data.twl}
           locked={Boolean(chapterLocks.verse)}
-          bookLocked={bookLocked}
+          bookLocked={editLocked}
         />
         </Box>
         <Box
@@ -3971,21 +4154,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // English (ULT) words aligned to this row's saved orig_words.
             // OL-anchored via the UHB/UGNT verse, mirroring the highlighter.
             if (!row.orig_words) return "";
-            const ult = (
-              verseIndexByVersion["ULT"]?.[row.verse]?.content as
+            const ultRow = verseIndexByVersion["ULT"]?.[row.verse];
+            const ult = (ultRow?.content as { verseObjects?: unknown[] } | null | undefined)?.verseObjects;
+            if (!Array.isArray(ult)) return "";
+            // A ULT bridge numbered across its span joins on the whole
+            // bridge's source with a shifted occurrence (#968).
+            const sourceByVerse = verseIndexByVersion["UHB"] ?? verseIndexByVersion["UGNT"];
+            const anchor = bridgeNoteAnchor(sourceByVerse, ultRow, row.verse, row.orig_words, row.occurrence ?? 1);
+            const src = (
+              (anchor?.source ?? sourceByVerse?.[row.verse])?.content as
                 | { verseObjects?: unknown[] }
                 | null
                 | undefined
             )?.verseObjects;
-            if (!Array.isArray(ult)) return "";
-            const src = (
-              (verseIndexByVersion["UHB"]?.[row.verse] ?? verseIndexByVersion["UGNT"]?.[row.verse])
-                ?.content as { verseObjects?: unknown[] } | null | undefined
-            )?.verseObjects;
             return extractTargetSelectionText(
               ult,
               row.orig_words,
-              row.occurrence ?? 1,
+              anchor?.occurrence ?? row.occurrence ?? 1,
               Array.isArray(src) ? src : undefined,
               // Show the gap: one source word can align to non-contiguous ULT
               // words (ISA 60:6 "and … the praises of"), and hiding that reads
@@ -4000,6 +4185,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (row.verse !== activeVerse) setActiveVerse(row.verse);
           }}
           onNoteCreate={async () => {
+            // #892: book/chapter here come from the route, verse/sort from the
+            // stale copy on screen; refuse rather than misfile a new row.
+            if (chapterStaleRef.current) return;
             const list = sortedForVerse(data.tn, activeVerse);
             const sort_order = pickSortOrder(list, null, "after");
             const created = (await api.createRow<TnRow>("tn", {
@@ -4021,6 +4209,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveQuestionId(null);
           }}
           onNoteInsertAfter={async (refId) => {
+            // #892: book/chapter here come from the route, verse/sort from the
+            // stale copy on screen; refuse rather than misfile a new row.
+            if (chapterStaleRef.current) return;
             const ref = data.tn.find((r) => r.id === refId);
             if (!ref) return;
             const list = sortedForVerse(data.tn, ref.verse);
@@ -4041,6 +4232,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveQuestionId(null);
           }}
           onNoteReorder={(draggedId, refId, position) => {
+            // #892: a reorder is new input; refuse it against a stale copy,
+            // as onWordReorder does (the inert container already blocks it).
+            if (chapterStaleRef.current) return;
             // Read the live (ref) row list, not the render-scoped `data`
             // closure: a rapid burst of arrow clicks fires several handlers
             // before React re-renders, and a stale closure would renumber from
@@ -4056,6 +4250,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           verseOptions={verseNumbers}
           onNoteChangeVerse={(id, verse, verseEnd) => {
+            // #892: book/chapter come from the route, the verse from the copy
+            // on screen; refuse while that copy is another chapter's.
+            if (chapterStaleRef.current) return;
             // Retarget a note to another verse in this chapter, or extend it to
             // span a range (verseEnd > verse => ref_raw "chapter:start-end").
             // Read the live row (dataRef, not the render closure) so a rapid
@@ -4096,6 +4293,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onTwlOrderUnlock={handleTwlOrderUnlock}
           onTwlOrderDismiss={handleTwlOrderDismiss}
           onWordCreate={async () => {
+            // #892: book/chapter here come from the route, verse/sort from the
+            // stale copy on screen; refuse rather than misfile a new row.
+            if (chapterStaleRef.current) return;
             const list = sortedForVerse(data.twl, activeVerse);
             const sort_order = pickSortOrder(list, null, "after");
             const created = (await api.createRow<TwlRow>("twl", {
@@ -4118,6 +4318,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveQuestionId(null);
           }}
           onWordChangeVerse={(id, verse) => {
+            // #892: book/chapter come from the route, the verse from the copy
+            // on screen; refuse while that copy is another chapter's.
+            if (chapterStaleRef.current) return;
             // Retarget a word link to another verse of the current bridge — the
             // Words "change reference" dropdown, mirroring onNoteChangeVerse. A
             // twl never spans, so ref_raw is always a single verse. Read the live
@@ -4147,6 +4350,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveQuestionId(null);
           }}
           onWordReorder={async (draggedId, refId, position) => {
+            // #892: book/chapter come from the route, the verse from the copy
+            // on screen; refuse while that copy is another chapter's.
+            if (chapterStaleRef.current) return;
             // See onNoteReorder: live ref list, not the stale render closure.
             const twl = dataRef.current?.twl ?? [];
             const dragged = twl.find((r) => r.id === draggedId);
@@ -4196,6 +4402,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             }
           }}
           onQuestionCreate={async () => {
+            // #892: book/chapter here come from the route, verse/sort from the
+            // stale copy on screen; refuse rather than misfile a new row.
+            if (chapterStaleRef.current) return;
             const created = (await api.createRow<TqRow>("tq", {
               book,
               chapter,
@@ -4246,6 +4455,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           lockedTn={Boolean(chapterLocks.tn)}
           lockedTq={Boolean(chapterLocks.tq)}
+          // bookLocked, not editLocked: NoteCard reads readOnly at unmount to
+          // decide whether to discard an abandoned blank stub, and the stale
+          // window ends in exactly that unmount (#892). The inert split
+          // container blocks every input into this column while stale instead.
           bookLocked={bookLocked}
           onSetNotePreserve={handleSetNotePreserve}
           onSetNoteHint={handleSetNoteHint}
@@ -4274,12 +4487,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         enabledLanes={enabledLanes}
         onToggleLaneVisible={toggleLaneVisible}
         book={book}
-        chapter={chapter}
+        chapter={viewChapter}
         tiles={tileSet}
         canCheck={meUserId != null}
         onToggle={toggleLane}
         onBulkToggle={bulkLaneToggle}
-        bookLocked={bookLocked}
+        bookLocked={editLocked}
       />
       <Dialog open={!!pendingBulk} onClose={() => setPendingBulk(null)}>
         <DialogTitle>
@@ -4288,8 +4501,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <DialogContent>
           <DialogContentText>
             {pendingBulk?.checked
-              ? `This marks ${pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} as checked by you for all ${pendingBulk?.verses.length ?? 0} applicable verses in ${book} ${chapter}.`
-              : `This removes your ${pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} checks from all ${pendingBulk?.verses.length ?? 0} applicable verses in ${book} ${chapter}.`}
+              ? `This marks ${pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} as checked by you for all ${pendingBulk?.verses.length ?? 0} applicable verses in ${book} ${pendingBulk?.chapter ?? chapter}.`
+              : `This removes your ${pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} checks from all ${pendingBulk?.verses.length ?? 0} applicable verses in ${book} ${pendingBulk?.chapter ?? chapter}.`}
           </DialogContentText>
         </DialogContent>
         <DialogActions>
@@ -4331,10 +4544,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           lexiconMap={lexiconMap}
           left={dualAlignerProps.left}
           right={dualAlignerProps.right}
+          locked={dualAlignerProps.locked}
           onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
           onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
           onSaveDoneAndNext={
-            dualNav.next != null && textLaneCheck.canCheck
+            dualNav.next != null && textLaneCheck.canCheck && !dualAlignerProps.locked
               ? () => dualSaveDoneAndNext(dualAlignerProps.verseNum, dualNav.next!)
               : undefined
           }
@@ -4458,8 +4672,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             const payload = rec?.payload as { plainText?: string } | undefined;
             const plain = payload?.plainText;
             if (typeof plain !== "string") return;
+            // Compare with the payload's chapter, not the route's: during the
+            // stale window (#892) `data` is still the previous chapter, and its
+            // verse would be the wrong baseline and expected_version.
             const cached =
-              ch === chapter
+              !chapterStale && ch === data?.chapter
                 ? data?.verses[bv]?.[v]
                 : bookHook?.chapters.get(ch)?.kind === "ready"
                   ? (bookHook.chapters.get(ch) as { kind: "ready"; data: { verses: Record<string, Record<number, VerseDto>> } }).data.verses[bv]?.[v]

@@ -133,7 +133,9 @@ export function buildUsfmFromVerses(
       verseObjects = structuredClone(verseObjects);
       if (isTarget) recomputeTargetOccurrences(verseObjects);
     } else {
-      verseObjects = stripAlignmentNodes(verseObjects);
+      // Clone first: stripAlignmentNodes passes untransformed leaf nodes (e.g. \p)
+      // through by reference, and usfm.toUSFM edits those in place (#932).
+      verseObjects = stripAlignmentNodes(structuredClone(verseObjects));
     }
     const ch = String(v.chapter);
     if (!chapters[ch]) chapters[ch] = {};
