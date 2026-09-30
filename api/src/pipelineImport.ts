@@ -88,7 +88,8 @@ export interface ImportResult {
 
 // Classify a single output[] entry into the resource kind we know how to
 // parse. Returns null for entries we don't recognize — those get surfaced
-// in result.skipped and the job is otherwise marked imported.
+// in result.skipped and the job is otherwise marked imported (unless no entry
+// is usable at all, which fails the import: #875, see stageJobOutput).
 type Classification =
   | { kind: "verse"; bibleVersion: "ULT" | "UST"; format: "usfm" }
   | { kind: "tn"; format: "tsv" }
@@ -271,11 +272,11 @@ async function parseOutputEntry(
   ctx: ImportContext,
   entry: OutputEntry,
   uhbWordsByVerse: Map<number, SourceWord[]>,
-): Promise<{ staged: StagedRow[]; skipReason?: string }> {
+): Promise<{ staged: StagedRow[]; skipReason?: string; refused?: true }> {
   if (!entry.rawUrl) return { staged: [], skipReason: "missing rawUrl" };
   const cls = classify(entry);
   if (cls.kind === "unknown") {
-    return { staged: [], skipReason: `unrecognized repo: ${entry.repo ?? "(none)"}` };
+    return { staged: [], skipReason: `unrecognized repo: ${entry.repo ?? "(none)"}`, refused: true };
   }
   // PIPELINE_WRITES is what the chapter lock promises a run will overwrite —
   // the editor guards (rows.ts / verses.ts) and, since #828, the nightly
@@ -303,6 +304,7 @@ async function parseOutputEntry(
       skipReason:
         `refused ${entry.repo ?? "(none)"}: a ${ctx.pipelineType} run does not write ${cls.kind} ` +
         `(declared: ${[...allowed].join(", ")}) — nothing locks it, so it is not safe to apply`,
+      refused: true,
     };
   }
 
@@ -759,10 +761,23 @@ async function stageJobOutput(
 
   const skipped: string[] = [];
   const allStaged: StagedRow[] = [];
+  let usable = 0;
+  let refused = 0;
   for (const entry of outputs) {
-    const { staged, skipReason } = await parseOutputEntry(job, entry, uhbWordsByVerse);
+    const { staged, skipReason, refused: wasRefused } = await parseOutputEntry(job, entry, uhbWordsByVerse);
     if (skipReason) skipped.push(skipReason);
+    if (wasRefused) refused += 1;
+    else if (entry.rawUrl) usable += 1;
     allStaged.push(...staged);
+  }
+  // #875: every entry with a rawUrl was refused (unrecognized repo, or outside
+  // this job's declared writes), so this run imports nothing. Finalizing it as
+  // done would dispatch the follow-up chain on top of an empty run. Throw
+  // before staged_at is marked, so importJobOutput releases the claim and
+  // pollPipelineJob takes its import_failed retry-then-fail path; the retry
+  // restages from scratch rather than hitting "already staged".
+  if (refused > 0 && usable === 0) {
+    throw new Error(`no usable output: ${skipped.join("; ")}`);
   }
 
   // Batch insert in chunks. D1 batch() caps at 100 statements per call.
