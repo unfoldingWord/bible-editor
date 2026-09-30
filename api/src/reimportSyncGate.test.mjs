@@ -867,6 +867,27 @@ eq(
   "master_sha_unknown beside a skip condition in the same resource → failure (failure beats skip)",
 );
 
+// Issue #1035: three more plan branches that leave the watermark unstamped,
+// each on its own plan-seeded counter. All three are unmeasured or failed
+// reads/writes, not deliberate holds → failure, and failure beats skip.
+for (const field of ["own_publish_unstamped", "fetch_failed", "tsv_truncated"]) {
+  eq(
+    classifyReimportOutcome({ ult: resourceCounts(), tn: resourceCounts({ [field]: 1 }) }),
+    "failure",
+    `${field} → failure (the watermark was not stamped)`,
+  );
+  eq(
+    classifyReimportOutcome({ ult: resourceCounts({ stale_base_held: 1, [field]: 1 }) }),
+    "failure",
+    `${field} beside a skip condition in the same resource → failure (failure beats skip)`,
+  );
+  eq(
+    classifyReimportOutcome({ ult: resourceCounts({ [field]: 0 }) }),
+    "success",
+    `${field}: 0 → still success`,
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
