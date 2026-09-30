@@ -15,7 +15,7 @@ import CheckIcon from "@mui/icons-material/Check";
 import CloseIcon from "@mui/icons-material/Close";
 import KeyboardArrowLeftIcon from "@mui/icons-material/KeyboardArrowLeft";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
-import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
+import { AlignmentPanel, type AlignerLock, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { UhbStrip } from "./UhbStrip";
 import { type HoverHighlight, type HighlightCtx } from "../lib/highlightTypes";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
@@ -230,6 +230,15 @@ interface Props {
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
   onNextVerse?: () => void;
+  // #943: this verse can't be written (AI pipeline chapter lock, or a book
+  // lock that landed after the popup opened). The popup stays open (the
+  // reading line's own save still goes through and is rejected server-side
+  // with a toast; see s9 check (b)), but each AlignmentPanel disables its
+  // alignment changes, Save and history restore.
+  locked?: AlignerLock;
+  // Save both sides, mark the verse's Text lane done, then go to the next
+  // verse (#931). Undefined wherever it can't run (chapter end, locked book).
+  onSaveDoneAndNext?: () => void;
   // Text-lane checkoff for the current verse — same control as the rail /
   // column verse markers, so translators can stamp "done" without leaving
   // the dual aligner (check sits next to the verse chip + next-arrow).
@@ -332,7 +341,9 @@ export function SideBySideAligner({
   onSaveReading,
   onPrevVerse,
   onNextVerse,
+  onSaveDoneAndNext,
   textCheck,
+  locked = false,
 }: Props) {
   const [hover, setHover] = useState<HoverHighlight>(null);
   const [hoverLink, setHoverLink] = useState<boolean>(readHoverLink);
@@ -439,6 +450,7 @@ export function SideBySideAligner({
       renderUhbStrip={false}
       showSourceInfo={lexInfo}
       posOffset={slot.posOffset}
+      locked={locked}
     />
   );
 
@@ -496,6 +508,40 @@ export function SideBySideAligner({
                   sx={{ color: "inherit", "&.Mui-disabled": { color: "rgba(255,255,255,0.3)" } }}
                 >
                   <KeyboardArrowRightIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+            {/* Save both + mark done + next (#931). Outlined check+arrow pill,
+                spaced well clear of the plain next arrow so it isn't hit by
+                accident. */}
+            <Tooltip title="Save both, mark verse done, next verse">
+              <span>
+                <IconButton
+                  // The 2nd click of a double-click (detail > 1) is dropped:
+                  // by then the first has usually advanced, so it would save
+                  // and mark the NEXT verse. Keyboard activation has detail 0.
+                  onClick={(e) => {
+                    if (e.detail > 1) return;
+                    onSaveDoneAndNext?.();
+                  }}
+                  disabled={!onSaveDoneAndNext}
+                  size="small"
+                  aria-label="Save both, mark verse done, next verse"
+                  sx={{
+                    ml: 2.5,
+                    px: 0.75,
+                    borderRadius: 1,
+                    border: "1.5px solid rgba(255,255,255,0.55)",
+                    color: "inherit",
+                    "&:hover": { borderColor: "rgba(255,255,255,0.9)" },
+                    "&.Mui-disabled": {
+                      color: "rgba(255,255,255,0.3)",
+                      borderColor: "rgba(255,255,255,0.2)",
+                    },
+                  }}
+                >
+                  <CheckIcon sx={{ fontSize: 16 }} />
+                  <KeyboardArrowRightIcon sx={{ fontSize: 18, ml: -0.25 }} />
                 </IconButton>
               </span>
             </Tooltip>
@@ -581,6 +627,7 @@ export function SideBySideAligner({
             onSave={onSaveReading}
             onDirtyChange={left.onReadingDirtyChange}
             locked={leftDirty}
+            chapterLocked={!!locked}
             bodyHeight={readingHeight}
           />
           <ReadingLine
@@ -589,6 +636,7 @@ export function SideBySideAligner({
             onSave={onSaveReading}
             onDirtyChange={right.onReadingDirtyChange}
             locked={rightDirty}
+            chapterLocked={!!locked}
             bodyHeight={readingHeight}
           />
         </Box>
@@ -780,11 +828,15 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   // dirty-state note in SideBySideAligner). The translator saves/cancels the
   // alignment first, then the line unlocks.
   locked?: boolean;
+  // #943: the verse can't be written (see Props.locked). Only changes the
+  // hint: with unsaved drags the alignment Save is disabled, so point at
+  // Reset instead of "save alignment first".
+  chapterLocked?: boolean;
   // Drag-resizable cap for the editable text box; it scrolls past this height.
   // Shared by both reading lines so the two-column grid stays even.
   bodyHeight?: number;
 }>(function ReadingLine(
-  { slot, onSave, onDirtyChange, locked = false, bodyHeight = DEFAULT_READING_HEIGHT },
+  { slot, onSave, onDirtyChange, locked = false, chapterLocked = false, bodyHeight = DEFAULT_READING_HEIGHT },
   ref,
 ) {
   const { bibleVersion, verse } = slot;
@@ -882,7 +934,11 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
               letterSpacing: 0,
             }}
           >
-            {locked ? "🔒 save alignment first" : "✎ editable"}
+            {locked
+              ? chapterLocked
+                ? "🔒 locked: reset alignment first"
+                : "🔒 save alignment first"
+              : "✎ editable"}
           </Box>
         </Typography>
         <Box sx={{ flex: 1 }} />

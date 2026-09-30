@@ -48,7 +48,12 @@ function step(name, fn) {
   try {
     return fn();
   } catch (e) {
-    bundle.errors.push({ step: name, error: String(e?.stderr || e?.message || e).slice(0, 2000) });
+    // With --json, wrangler writes its failure (e.g. "not authenticated") to
+    // stdout, not stderr, so stdout goes first. e.message already repeats
+    // stderr, so only its first line ("Command failed: …") is kept.
+    const detail = [e?.stdout, e?.stderr].map((s) => String(s ?? "").trim()).filter(Boolean).join("\n");
+    const cmd = String(e?.message ?? "").split("\n")[0];
+    bundle.errors.push({ step: name, error: (detail ? `${detail}\n${cmd}` : String(e?.message || e)).slice(0, 2000) });
     return null;
   }
 }
@@ -182,7 +187,9 @@ const summary = [
     ? `**Collector: complete.**`
     : `**Collector: INCOMPLETE — do not read the counts below as clean.** ` +
       [
-        bundle.errors.length ? `${bundle.errors.length} step(s) failed (${bundle.errors.map((e) => e.step).join(", ")})` : "",
+        bundle.errors.length
+          ? `${bundle.errors.length} step(s) failed (${bundle.errors.map((e) => e.step).join(", ")}). First error: ${bundle.errors[0].error.split("\n").slice(0, 4).join(" ").slice(0, 300)}`
+          : "",
         byStatus != null && !runRecorded ? `no run_started/run_completed rows for nightly-${day} (did the sync run, or is the date wrong?)` : "",
       ].filter(Boolean).join("; "),
   ``,

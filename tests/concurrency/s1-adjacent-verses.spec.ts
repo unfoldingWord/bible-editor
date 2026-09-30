@@ -1,5 +1,5 @@
 import { expect, test, request as apiRequest } from "@playwright/test";
-import { fetchChapter, saveNote, gotoVerse, mintToken, newUserContext, noteTextarea, waitForServerNote } from "./helpers";
+import { fetchChapter, saveNote, gotoVerse, mintToken, newUserContext, openNoteEditor, waitForServerNote } from "./helpers";
 
 // Honor BE_BASE_URL so the suite runs on a relocated port (mirrors s8).
 const BASE = process.env.BE_BASE_URL ?? "http://localhost:5173";
@@ -40,8 +40,11 @@ test("two users editing adjacent verses both land — no clobber", async ({ brow
     gotoVerse(bob, "ZEC", 6, bobTarget!.verse),
   ]);
 
-  const aliceNote = noteTextarea(alice, aliceTarget!.id);
-  const bobNote = noteTextarea(bob, bobTarget!.id);
+  // Inactive cards show a click-to-edit read view; open each editor first.
+  const [aliceNote, bobNote] = await Promise.all([
+    openNoteEditor(alice, aliceTarget!.id),
+    openNoteEditor(bob, bobTarget!.id),
+  ]);
 
   const aliceText = `ALICE edit ${Date.now()}`;
   const bobText = `BOB edit ${Date.now()}`;

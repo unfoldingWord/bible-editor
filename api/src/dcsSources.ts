@@ -195,7 +195,7 @@ export async function fetchFirstLine(url: string): Promise<string | null> {
 // The reimport reads the canonical unfoldingWord source on master — the same
 // org dcsUrls() hardcodes. The SHA check below MUST agree with the raw fetch on
 // owner/repo/path/ref, so both derive from this one mapping.
-const DCS_OWNER = "unfoldingWord";
+export const DCS_OWNER = "unfoldingWord";
 
 export type ReimportResource = "ult" | "ust" | "tn" | "tq" | "twl";
 
@@ -309,7 +309,11 @@ export async function fileHeadCommit(
 // touched. The dcs_commits ledger is repo-scoped, so a file-head probe cannot
 // establish that its high-water mark is current when another file changed last.
 // Callers use null as an explicit fail-closed result.
-export async function repoHeadCommitSha(env: Env, repo: string): Promise<string | null> {
+export async function repoHeadCommitSha(
+  env: Env,
+  repo: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<string | null> {
   const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
   const url =
     `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
@@ -317,7 +321,10 @@ export async function repoHeadCommitSha(env: Env, repo: string): Promise<string 
   try {
     const headers: Record<string, string> = { Accept: "application/json" };
     if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
-    const r = await fetch(url, { headers });
+    const r = await fetch(url, {
+      headers,
+      ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+    });
     if (!r.ok) return null;
     const commits = (await r.json()) as Array<Record<string, unknown>>;
     return typeof commits[0]?.sha === "string" ? commits[0].sha : null;
