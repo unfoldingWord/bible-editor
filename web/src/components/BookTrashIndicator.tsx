@@ -22,6 +22,7 @@ import {
 } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import { api, type BookTrashRow } from "../sync/api";
+import { createRefocusThrottle } from "../sync/refocusThrottle";
 
 // Same interval useAlerts.ts polls system_alerts on, for the same reason: no
 // realtime path covers this. The chapter WebSocket only fans out events for
@@ -35,6 +36,12 @@ import { api, type BookTrashRow } from "../sync/api";
 // (hooks run every mount independent of the early return), so it's the one
 // path that can take `total` from 0 back to something visible.
 const POLL_MS = 30_000;
+
+// A visibility refocus refetches only when no fetch has succeeded in this
+// window, so a burst of alt-tabs gives one request (#897). Module-level: only
+// one book is open at a time, and every fetch below (mount, poll, refocus)
+// stamps it. The POLL_MS interval is not throttled.
+const refocusThrottle = createRefocusThrottle(60_000);
 
 interface Props {
   book: string;
@@ -65,7 +72,10 @@ export function BookTrashIndicator({ book, onNavigate, refreshSignal, onRestore 
   const load = () => {
     api
       .getBookTrash(book)
-      .then((r) => setRows(r.rows))
+      .then((r) => {
+        refocusThrottle.markSuccess();
+        setRows(r.rows);
+      })
       .catch(() => setRows([]));
   };
 
@@ -77,7 +87,10 @@ export function BookTrashIndicator({ book, onNavigate, refreshSignal, onRestore 
     let cancelled = false;
     api
       .getBookTrash(book)
-      .then((r) => !cancelled && setRows(r.rows))
+      .then((r) => {
+        refocusThrottle.markSuccess();
+        if (!cancelled) setRows(r.rows);
+      })
       .catch(() => !cancelled && setRows([]));
     return () => {
       cancelled = true;
@@ -91,7 +104,7 @@ export function BookTrashIndicator({ book, onNavigate, refreshSignal, onRestore 
   // would just waste a request, since that path already refetches above.
   useEffect(() => {
     const onVis = () => {
-      if (document.visibilityState === "visible") load();
+      if (document.visibilityState === "visible" && refocusThrottle.shouldRun()) load();
     };
     document.addEventListener("visibilitychange", onVis);
     const timer = window.setInterval(() => {

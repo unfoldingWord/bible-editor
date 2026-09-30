@@ -28,9 +28,16 @@ import {
   type PipelineType,
 } from "./api";
 import { currentPipelineUserId } from "./pipelineSession";
+import { pipelineNotifyKey } from "./pipelineNotifyKey";
+import { createRefocusThrottle } from "./refocusThrottle";
 export { getSessionKey, setPipelineUser } from "./pipelineSession";
 
 const POLL_INTERVAL_MS = 120_000; // contract §5
+
+// A tab refocus reloads only when no list load has succeeded in this window,
+// so a burst of alt-tabs gives one request (#897). The 120 s ticker is not
+// throttled.
+const refocusThrottle = createRefocusThrottle(60_000);
 
 // queued/dispatching are polled too — GET /api/pipelines/:id returns their
 // live queue position, so the chip's "#N in line" refreshes each tick.
@@ -110,9 +117,17 @@ function snapshot(): PipelineJob[] {
   return Array.from(jobs.values()).sort((a, b) => b.updated_at - a.updated_at);
 }
 
+// Skip notifying when nothing a subscriber reads has changed, so an idle poll
+// tick does not re-render Shell (#897). See pipelineNotifyKey for what the
+// key covers and why it must include every field.
+let lastNotifiedKey = "";
+
 function notify() {
   if (subscribers.size === 0) return;
   const list = snapshot();
+  const key = pipelineNotifyKey(list, queueSummary);
+  if (key === lastNotifiedKey) return;
+  lastNotifiedKey = key;
   for (const s of subscribers) s(list);
 }
 
@@ -217,7 +232,7 @@ function ensurePolling() {
   if (!visibilityBound) {
     visibilityBound = true;
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) void loadFromServer();
+      if (!document.hidden && refocusThrottle.shouldRun()) void loadFromServer();
     });
   }
 }
@@ -231,6 +246,7 @@ const STALE_NOTIFICATION_CUTOFF_SECONDS = 24 * 60 * 60;
 async function loadFromServer() {
   try {
     const res = await api.pipelineList();
+    refocusThrottle.markSuccess();
     queueSummary = res.queue ?? null;
     // Collect terminal jobs we haven't toasted yet *before* mutating the
     // jobs map. Anything in the response with state=done/failed and
