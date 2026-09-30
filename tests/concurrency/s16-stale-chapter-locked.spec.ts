@@ -362,3 +362,46 @@ test("A → B → A: a comment added to A during the B window shows after A land
     await context.close();
   }
 });
+
+// A comment link into A that arrives during A → B → A, for a comment created
+// while the tab was on B: A's old comment list doesn't have it yet, but the
+// link must wait for the lock to lift (and the comments reload), not be
+// consumed as "no longer available" (round-6 review of #892).
+test("A → B → A: a comment link into A waits for A to land instead of reporting it gone", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "stale892-aba-link");
+  const page = await context.newPage();
+  const headers = { Authorization: `Bearer ${auth.token}`, "x-csrf-token": auth.csrf, "Content-Type": "application/json" };
+  const body = `STALE892-LINK-${Date.now()}`;
+  let commentId: number | null = null;
+  try {
+    const aComments = page.waitForResponse(/\/api\/comments\/ZEC\/14(\?|$)/, { timeout: 15_000 });
+    await page.goto("/#/ZEC/14/1");
+    await expect(page.locator(cellSel("rows", 14, 1))).toHaveAttribute("contenteditable", "true", { timeout: 15_000 });
+    await aComments;
+
+    const releaseB = await holdChapter(page, 1);
+    const releaseA = await holdChapter(page, 14);
+    await setHash(page, "#/ZEC/1/1");
+    await expect(page.locator('[data-stale-chapter="14"]')).toBeVisible();
+    const created = await context.request.post("/api/comments", {
+      headers,
+      data: { book: "ZEC", chapter: 14, verse: 1, kind: "question", body },
+    });
+    expect(created.ok(), `create comment: ${created.status()}`).toBe(true);
+    commentId = ((await created.json()) as { id: number }).id;
+    await setHash(page, `#/ZEC/14/1?c=${commentId}`);
+    await expect(page.locator('[data-stale-chapter="14"]')).toBeVisible();
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("That comment is no longer available.")).toHaveCount(0);
+
+    releaseA();
+    await expect(page.locator("[data-stale-chapter]")).toHaveCount(0, { timeout: 15_000 });
+    await expect(page.getByText(body).first()).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("That comment is no longer available.")).toHaveCount(0);
+    releaseB();
+  } finally {
+    if (commentId != null) await context.request.delete(`/api/comments/${commentId}`, { headers }).catch(() => {});
+    await context.close();
+  }
+});
