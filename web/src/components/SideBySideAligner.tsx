@@ -628,6 +628,7 @@ export function SideBySideAligner({
             onDirtyChange={left.onReadingDirtyChange}
             locked={leftDirty}
             chapterLocked={!!locked}
+            bookLocked={locked === "book"}
             bodyHeight={readingHeight}
           />
           <ReadingLine
@@ -637,6 +638,7 @@ export function SideBySideAligner({
             onDirtyChange={right.onReadingDirtyChange}
             locked={rightDirty}
             chapterLocked={!!locked}
+            bookLocked={locked === "book"}
             bodyHeight={readingHeight}
           />
         </Box>
@@ -832,13 +834,28 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   // hint: with unsaved drags the alignment Save is disabled, so point at
   // Reset instead of "save alignment first".
   chapterLocked?: boolean;
+  // #1046: the book is locked. The outbox drops every write on a locked book
+  // without a trace, so the line stops taking input and loses its Save (Undo
+  // stays, so an edit typed before the lock landed can be discarded). A
+  // chapter lock alone leaves the line editable: the server refuses that save
+  // with a toast (s9 check (b)).
+  bookLocked?: boolean;
   // Drag-resizable cap for the editable text box; it scrolls past this height.
   // Shared by both reading lines so the two-column grid stays even.
   bodyHeight?: number;
 }>(function ReadingLine(
-  { slot, onSave, onDirtyChange, locked = false, chapterLocked = false, bodyHeight = DEFAULT_READING_HEIGHT },
+  {
+    slot,
+    onSave,
+    onDirtyChange,
+    locked = false,
+    chapterLocked = false,
+    bookLocked = false,
+    bodyHeight = DEFAULT_READING_HEIGHT,
+  },
   ref,
 ) {
+  const readOnly = locked || bookLocked;
   const { bibleVersion, verse } = slot;
   const editable = useMemo(() => (verse ? extractEditableText(verse.content) : ""), [verse]);
   const elRef = useRef<HTMLDivElement | null>(null);
@@ -929,12 +946,14 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
           <Box
             component="span"
             sx={{
-              color: locked ? "text.disabled" : "primary.main",
+              color: readOnly ? "text.disabled" : "primary.main",
               textTransform: "none",
               letterSpacing: 0,
             }}
           >
-            {locked
+            {bookLocked
+              ? "🔒 book locked"
+              : locked
               ? chapterLocked
                 ? "🔒 locked: reset alignment first"
                 : "🔒 save alignment first"
@@ -960,33 +979,37 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             >
               Undo
             </Button>
-            <Button
-              size="small"
-              variant="contained"
-              onClick={() => handleSave()}
-              disabled={!dirty}
-              sx={{
-                textTransform: "uppercase",
-                fontSize: 11,
-                letterSpacing: "0.06em",
-                fontWeight: 700,
-                px: 1.5,
-                py: 0.25,
-              }}
-            >
-              Save {bibleVersion}
-            </Button>
+            {!bookLocked && (
+              <Button
+                size="small"
+                variant="contained"
+                onClick={() => handleSave()}
+                disabled={!dirty}
+                sx={{
+                  textTransform: "uppercase",
+                  fontSize: 11,
+                  letterSpacing: "0.06em",
+                  fontWeight: 700,
+                  px: 1.5,
+                  py: 0.25,
+                }}
+              >
+                Save {bibleVersion}
+              </Button>
+            )}
           </>
         )}
       </Box>
       {verse ? (
         <Box
           ref={elRef}
-          contentEditable={!locked}
+          contentEditable={!readOnly}
           suppressContentEditableWarning
           spellCheck
           title={
-            locked
+            bookLocked
+              ? "This book is locked, so the reading text can't be edited right now"
+              : locked
               ? "save or cancel the pending alignment edits before editing the reading text"
               : undefined
           }
@@ -1002,17 +1025,17 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             fontFamily: '"Times New Roman", "Cardo", serif',
             fontSize: `calc(15px * var(--be-reading-scale, 1))`,
             lineHeight: 1.5,
-            color: locked ? "text.disabled" : "text.primary",
+            color: readOnly ? "text.disabled" : "text.primary",
             outline: "none",
             borderRadius: 1,
             px: 0.75,
             py: 0.25,
             border: "1px solid",
             borderColor: "divider",
-            cursor: locked ? "not-allowed" : "text",
-            opacity: locked ? 0.6 : 1,
+            cursor: readOnly ? "not-allowed" : "text",
+            opacity: readOnly ? 0.6 : 1,
             transition: "border-color 0.12s, opacity 0.12s",
-            ...(locked
+            ...(readOnly
               ? {}
               : {
                   "&:hover": { borderColor: "primary.main" },

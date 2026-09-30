@@ -1378,9 +1378,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // is open. chapterStale is left out on purpose: the single aligner sits in
   // the inert split container while stale, and an aligner save targets an
   // explicit verse id + version, which #892 lets through.
+  // "book" wins over "chapter" (#1046): under a book lock the outbox drops
+  // every write without a trace, so the dual aligner's reading line keys its
+  // own lock off "book"; a chapter lock alone is refused server-side with a
+  // toast and keeps the line reachable (s9 check (b)).
   const alignerLock = useCallback(
     (chapterNum: number): AlignerLock =>
-      lockForChapter(chapterNum, "verse") ? "chapter" : bookLocked ? "book" : false,
+      bookLocked ? "book" : lockForChapter(chapterNum, "verse") ? "chapter" : false,
     [lockForChapter, bookLocked],
   );
   const chapterStaleRef = useRef(chapterStale);
@@ -4512,15 +4516,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           textCheck={
             dualAlignerProps.chapter === chapter ? textLaneCheck : undefined
           }
-          onSaveReading={(bv, plain, base, afterCommit) =>
+          onSaveReading={(bv, plain, base, afterCommit) => {
+            // #1046: the reading line locks once a book lock lands, but an
+            // edit typed before it can still reach here through the close /
+            // verse-nav gate's Save. The outbox would drop it silently
+            // (read-only mode), so refuse it out loud instead and skip
+            // afterCommit: the line stays dirty (Undo still works) and the
+            // gate's close/nav does not run.
+            if (bookLocked) {
+              pushPipelineToast(
+                `This book is locked, so the ${bv} reading-text edit was not saved. Undo it to close the aligner.`,
+                "error",
+              );
+              return;
+            }
             // base.verse, not verseNum — each side's row may start at a
             // different verse (ULT v7 singleton vs UST 6-9 range row).
             // afterCommit threads through so ReadingLineHandle.save (and thus
             // the resolveDualAction save chain, #490) only proceeds once this
             // actually lands — synchronously, or after the collateral-loss
             // confirm's "Save anyway".
-            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit)
-          }
+            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit);
+          }}
         />
       )}
       <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>
