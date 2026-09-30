@@ -12,9 +12,10 @@
 export type Rect = { top: number; bottom: number; left: number; right: number };
 export type LexPlacement = "bottom" | "top" | "left" | "right";
 
-// Rough height of a typical hover box. A box taller than this still opens on
-// the chosen side; popper then keeps it on screen.
-export const LEX_BOX_HEIGHT = 200;
+// Height to reserve for the hover box: a gloss + grammar + definition box runs
+// ~170-270px. A taller box still opens on the chosen side (it may run off
+// that edge of the screen rather than back over the block).
+export const LEX_BOX_HEIGHT = 280;
 const LEX_BOX_WIDTH = 320;
 
 export function chooseLexPlacement(region: Rect, viewportW: number, viewportH: number): LexPlacement {

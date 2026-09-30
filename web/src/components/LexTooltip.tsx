@@ -3,7 +3,7 @@
 // under the word, so it doesn't cover the line being read (#1055). The
 // placement rule lives in lib/lexPlacement.ts.
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Tooltip, type TooltipProps } from "@mui/material";
 import { chooseLexPlacement, lexAnchorRect, type LexPlacement } from "../lib/lexPlacement";
 
@@ -25,6 +25,31 @@ export function LexTooltip({ onOpen, slotProps, ...rest }: TooltipProps) {
     }
     onOpen?.(e);
   };
+  // Stable across re-renders while open: a new anchorEl or popperOptions
+  // object makes the Popper rebuild, which shows as a flicker.
+  const placed = useMemo(() => {
+    if (!pos) return {};
+    let last: DOMRect | null = null;
+    return {
+      placement: pos.placement,
+      // Read live so a scroll while open keeps the box beside the block. A
+      // word that re-mounted while open measures as zeros; keep the last rect.
+      anchorEl: {
+        getBoundingClientRect: () => {
+          if (!pos.word.isConnected && last) return last;
+          const r = lexAnchorRect(
+            pos.placement,
+            regionOf(pos.word).getBoundingClientRect(),
+            pos.word.getBoundingClientRect(),
+          );
+          last = { ...r, x: r.left, y: r.top, width: r.right - r.left, height: r.bottom - r.top, toJSON: () => r } as DOMRect;
+          return last;
+        },
+      },
+      // Flipping would put the box back over the block.
+      popperOptions: { modifiers: [{ name: "flip", enabled: false }] },
+    };
+  }, [pos]);
   const popper = slotProps?.popper;
   return (
     <Tooltip
@@ -34,24 +59,7 @@ export function LexTooltip({ onOpen, slotProps, ...rest }: TooltipProps) {
         ...slotProps,
         popper: {
           ...(typeof popper === "object" ? popper : {}),
-          ...(pos
-            ? {
-                placement: pos.placement,
-                // Read live so a scroll while open keeps the box beside the block.
-                anchorEl: {
-                  getBoundingClientRect: () => {
-                    const r = lexAnchorRect(
-                      pos.placement,
-                      regionOf(pos.word).getBoundingClientRect(),
-                      pos.word.getBoundingClientRect(),
-                    );
-                    return { ...r, x: r.left, y: r.top, width: r.right - r.left, height: r.bottom - r.top, toJSON: () => r } as DOMRect;
-                  },
-                },
-                // Flipping would put the box back over the block.
-                popperOptions: { modifiers: [{ name: "flip", enabled: false }] },
-              }
-            : {}),
+          ...placed,
         },
       }}
     />

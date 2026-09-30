@@ -15,9 +15,9 @@ function assert(cond, msg) {
 const r = (top, bottom, left, right) => ({ top, bottom, left, right });
 
 // Rows mode: a two-line UHB block mid-screen → below the block.
-assert(chooseLexPlacement(r(600, 690, 180, 820), 1400, 900) === "bottom", "room below → bottom");
+assert(chooseLexPlacement(r(500, 590, 180, 820), 1400, 900) === "bottom", "room below → bottom");
 // Block near the bottom of the screen → above it.
-assert(chooseLexPlacement(r(760, 850, 180, 820), 1400, 900) === "top", "no room below → top");
+assert(chooseLexPlacement(r(700, 790, 180, 820), 1400, 900) === "top", "no room below → top");
 // Columns mode: the UHB column fills the height; more room on the left.
 assert(chooseLexPlacement(r(110, 890, 760, 1050), 1400, 900) === "left", "tall column → left side");
 assert(chooseLexPlacement(r(110, 890, 150, 440), 1400, 900) === "right", "tall column at left → right side");
