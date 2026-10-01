@@ -37,8 +37,12 @@ const API_DIR = path.join(REPO, "api");
 function d1(sqlRaw) {
   const sql = sqlRaw.replace(/\s+/g, " ").trim();
   const req = createRequire(path.join(API_DIR, "package.json"));
+  // wrangler 4.13x's `exports` map no longer resolves the `bin/wrangler.js`
+  // subpath directly (see tests/concurrency/s9-verse-pin-release.spec.ts) —
+  // resolve `wrangler/package.json` instead and derive the bin path from it.
+  const wranglerBin = path.join(path.dirname(req.resolve("wrangler/package.json")), "bin", "wrangler.js");
   const out = execFileSync(process.execPath,
-    [req.resolve("wrangler/bin/wrangler.js"), "d1", "execute", "bible_editor", "--remote", "--env", "production", "--json", "--command", sql],
+    [wranglerBin, "d1", "execute", "bible_editor", "--remote", "--env", "production", "--json", "--command", sql],
     { cwd: API_DIR, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   const parsed = JSON.parse(out.slice(out.indexOf("[")));
   // EVERY statement, not just the first: a multi-statement --command returns one
