@@ -306,11 +306,17 @@ test("typing in the reading line, then saving an alignment change in the panel, 
     await expect(o.dialog.getByText("🔒 save alignment first")).toBeVisible();
     const alignPatch = nextVersePatch(page, V62);
     await o.dialog.getByRole("button", { name: `Save ${BV}`, exact: true }).click();
-    await page
+    // The "will be unaligned" confirm shows on a fresh seed, but not once s17
+    // has already edited this verse in the same run, so answer it only if it
+    // comes up.
+    const saveAnyway = page
       .getByRole("dialog")
       .filter({ hasText: "will be unaligned" })
-      .getByRole("button", { name: "Save anyway" })
-      .click();
+      .getByRole("button", { name: "Save anyway" });
+    await Promise.race([
+      alignPatch,
+      saveAnyway.waitFor({ timeout: 10_000 }).then(() => saveAnyway.click()).catch(() => undefined),
+    ]);
     const aligned = await alignPatch;
     expect(aligned.status()).toBe(200);
     const alignedVersion = ((await aligned.json()) as { version: number }).version;
