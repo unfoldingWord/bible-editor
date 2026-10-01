@@ -149,6 +149,7 @@ async function typeAtEnd(page: Page, line: Locator, text: string) {
 function nextVersePatch(page: Page, r: Ref = V72) {
   return page.waitForResponse(
     (res) => res.request().method() === "PATCH" && res.url().includes(versePath(r)),
+    { timeout: 15_000 },
   );
 }
 
@@ -304,19 +305,21 @@ test("typing in the reading line, then saving an alignment change in the panel, 
     const chip = o.dialog.locator('[draggable="true"]').filter({ hasText: "horses" }).first();
     await chip.dragTo(o.dialog.getByText(`${BV} words`, { exact: true }).first());
     await expect(o.dialog.getByText("🔒 save alignment first")).toBeVisible();
-    const alignPatch = nextVersePatch(page, V62);
-    await o.dialog.getByRole("button", { name: `Save ${BV}`, exact: true }).click();
     // The "will be unaligned" confirm shows on a fresh seed, but not once s17
-    // has already edited this verse in the same run, so answer it only if it
-    // comes up.
-    const saveAnyway = page
-      .getByRole("dialog")
-      .filter({ hasText: "will be unaligned" })
-      .getByRole("button", { name: "Save anyway" });
-    await Promise.race([
-      alignPatch,
-      saveAnyway.waitFor({ timeout: 10_000 }).then(() => saveAnyway.click()).catch(() => undefined),
-    ]);
+    // has already edited this verse in the same run. The confirm gates the
+    // PATCH, so exactly one of the two comes first: answer the confirm only if
+    // it is up and nothing has been sent yet.
+    let alignSent = false;
+    const alignPatch = nextVersePatch(page, V62).then((r) => {
+      alignSent = true;
+      return r;
+    });
+    const unalignConfirm = page.getByRole("dialog").filter({ hasText: "will be unaligned" });
+    await o.dialog.getByRole("button", { name: `Save ${BV}`, exact: true }).click();
+    await expect
+      .poll(async () => alignSent || (await unalignConfirm.isVisible()), { timeout: 10_000 })
+      .toBe(true);
+    if (!alignSent) await unalignConfirm.getByRole("button", { name: "Save anyway" }).click();
     const aligned = await alignPatch;
     expect(aligned.status()).toBe(200);
     const alignedVersion = ((await aligned.json()) as { version: number }).version;
@@ -329,6 +332,8 @@ test("typing in the reading line, then saving an alignment change in the panel, 
     const textPatch = nextVersePatch(page, V62);
     await o.save.click();
     const res = await textPatch;
+    // The text save unaligns nothing, so it never asks.
+    await expect(unalignConfirm).toHaveCount(0);
     expect(res.request().headers()["if-match"]).toBe(String(alignedVersion));
     expect(res.status()).toBe(200);
     const after = await serverVerse(context.request, V62);
@@ -384,6 +389,45 @@ test("save, keep typing while that save is in flight, save again after it lands:
     const after = (await serverVerse(context.request)).plain_text;
     expect(after).toContain(`FIRST-${stamp}`);
     expect(after).toContain(`SECOND-${stamp}`);
+  } finally {
+    await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
+    await context.close();
+  }
+});
+
+// Review round 2: a Save that turns out to be a no-op (the text is back to the
+// base the edit was held against) queues nothing, so it must end the hold as a
+// clean line does and release the pin, even after another editor moved the
+// verse under the focused line.
+test("a no-op Save after another editor moved the verse queues nothing and leaks no pin", async ({ browser }) => {
+  test.setTimeout(60_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const original = await serverVerse(context.request);
+  const stamp = Date.now();
+  const typed = ` X${stamp}`;
+
+  try {
+    const o = await openDual(page);
+    const writes: string[] = [];
+    page.on("request", (req) => {
+      if (req.method() === "PATCH" && req.url().includes(versePath(V72))) writes.push(req.url());
+    });
+
+    await typeAtEnd(page, o.line, typed);
+    expect(await pinnedVersion(page)).toBe(original.version);
+    await bumpVerse(page, context.request, csrf, `[s19-noop-${stamp}]`);
+    // Erase the edit by hand: the box shows the held base's text again, which
+    // still differs from the moved verse, so the line stays dirty.
+    for (let i = 0; i < typed.length; i++) await page.keyboard.press("Backspace");
+    await expect(o.line).not.toContainText(`X${stamp}`);
+    await expect(o.save).toBeEnabled();
+
+    await o.save.click();
+    await expect(o.undo).toBeDisabled();
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+    expect(writes).toEqual([]);
   } finally {
     await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
     await context.close();

@@ -14,6 +14,7 @@ import {
   advanceHeldVerseBase,
   holdVerseBase,
   peekPinnedVerseBase,
+  pinEpoch,
   pinVerseBase,
   unpinVerseBase,
   unpinVerseBaseIfIdleWith,
@@ -215,6 +216,64 @@ check("only ops this tab queued count as own; each is claimed once", () => {
   assert.equal(takeOwnVerseOp(undefined), false);
   assert.equal(takeOwnVerseOp("op-a"), true);
   assert.equal(takeOwnVerseOp("op-a"), false, "forgotten after its exit");
+});
+
+// ---- review round 2 ----
+
+check("a late (async) exit release does not unpin a pin handed off to a newer queued save meanwhile", () => {
+  reset();
+  const hold = holdVerseBase(K, shown); // the line owns the pin
+  const epoch = pinEpoch(K); // an own op lands: its exit captures the epoch...
+  advanceHeldVerseBase(K, 3, { version: 4, content: "aligned" });
+  hold.handOff(); // ...the translator saves the line before the async release runs
+  unpinVerseBaseIfIdleWith(K, false, epoch); // the late release
+  assert.equal(peekPinnedVerseBase(K)?.version, 4, "the newer queued save's pin stays");
+  unpinVerseBaseIfIdleWith(K, false, pinEpoch(K)); // that save's own exit
+  assert.equal(peekPinnedVerseBase(K), undefined);
+});
+
+check("a late release with no hand-off in between still releases (or defers to a live hold)", () => {
+  reset();
+  holdVerseBase(K, shown).handOff();
+  const epoch = pinEpoch(K);
+  const again = holdVerseBase(K, moved); // joins: no new pin, same epoch
+  unpinVerseBaseIfIdleWith(K, false, epoch);
+  assert.equal(peekPinnedVerseBase(K)?.version, 3, "deferred to the live hold");
+  again.release();
+  assert.equal(peekPinnedVerseBase(K), undefined, "the hold releases it on clean");
+  pinVerseBase(K, shown);
+  const e2 = pinEpoch(K);
+  unpinVerseBaseIfIdleWith(K, false, e2);
+  assert.equal(peekPinnedVerseBase(K), undefined);
+});
+
+check("a late release does not unpin a pin created after it was captured", () => {
+  reset();
+  pinVerseBase(K, shown);
+  const epoch = pinEpoch(K);
+  unpinVerseBase(K);
+  pinVerseBase(K, moved); // a new session's pin
+  unpinVerseBaseIfIdleWith(K, false, epoch);
+  assert.equal(peekPinnedVerseBase(K)?.version, 4);
+  unpinVerseBase(K);
+});
+
+check("a no-op save ends its hold with release(): a deferred unpin is honoured, no pin leaks", () => {
+  reset();
+  holdVerseBase(K, shown).handOff(); // an earlier queued save's pin
+  const hold = holdVerseBase(K, moved); // the line is edited again
+  unpinVerseBaseIfIdleWith(K, false, pinEpoch(K)); // that save lands: deferred to the hold
+  hold.release(); // the next save was a no-op: nothing queued
+  assert.equal(peekPinnedVerseBase(K), undefined);
+});
+
+check("a hold reports the base its pin was advanced to, so the line can follow it", () => {
+  reset();
+  const hold = holdVerseBase(K, shown);
+  assert.equal(hold.advancedBase(), undefined, "not advanced yet");
+  advanceHeldVerseBase(K, 3, { version: 4, content: "aligned" });
+  assert.deepEqual(hold.advancedBase(), { version: 4, content: "aligned" });
+  hold.release();
 });
 
 console.log(`versePinHolds: ${passed} passed`);
