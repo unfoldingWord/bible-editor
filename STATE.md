@@ -630,9 +630,9 @@ Highlights that bite repeatedly:
   then walks lineage, then reads the prune cutoff. The walk's own #658 stamp is a legitimate advance and must be
   kept (#866 F2), while a concurrent export's confirm in the same window covers rows the file never saw and
   made the prune delete them (#1048). The two are told apart by provenance, not by value: the walk reports its
-  stamp through `LineageStats.lineageConfirmed`, and `pairStagedTsvCutoff` keeps the post-walk read only when it
-  equals the fetch-time read with that stamp applied; anything else falls back to the fetch-time read, which can
-  only keep more rows. Corollary for tests: a DB-side advance injected during staging now reads as an outside
+  stamp through `LineageStats.lineageConfirmed`, and `pairStagedTsvCutoff` pairs the file with the fetch-time read
+  plus that stamp, so an outside advance is dropped but the run's own stamp never is (dropping both would reopen
+  the F2 resurrection). Writers only move these columns forward, so the paired value can only keep more rows. Corollary for tests: a DB-side advance injected during staging now reads as an outside
   writer, so a test of the legitimate path has to drive the real #658 stamp.
 
 ## Stop conditions / goals

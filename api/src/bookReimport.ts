@@ -8587,8 +8587,8 @@ interface StagedResource {
   // AI-only row and advance the watermark while the chunk steps run, and a
   // newer boundary against this older file makes that row look exported and
   // then removed on master, so the prune would delete it. For TSV kinds the
-  // post-lineage read is kept only if this run's own lineage step explains it;
-  // otherwise the boundary read before the fetch is used (#1048,
+  // value is the boundary read before the fetch plus this run's own lineage
+  // stamp, so an outside advance in that window is dropped (#1048,
   // pairStagedTsvCutoff). Only the two
   // boundary fields, so the memoized plan stays plain JSON. Absent on a plan
   // replayed from an instance that started before this shipped; the prune
@@ -10127,13 +10127,15 @@ async function runTombstoneSweep(
 // confirming AI-only row X, pairs a file without X with a cutoff that covers X,
 // and the prune deletes X.
 //
-// So the post-lineage read is kept only when it equals the fetch-time cutoff
-// with this run's own #658 stamp (if any) applied, computed the way
-// markLineageConfirmedConverged's UPDATE computes it. Any other value means a
-// writer outside this run moved it, and the fetch-time cutoff is used instead.
-// That is the fail-safe direction: every writer of these columns only moves
-// them forward (MAX), so the older cutoff certifies fewer AI rows as exported
-// and the prune can only keep more of them, never delete more.
+// So the paired cutoff is the fetch-time cutoff with this run's own #658 stamp
+// (if any) applied, computed the way markLineageConfirmedConverged's UPDATE
+// computes it. On an ordinary run that equals the post-lineage read. Any other
+// post-lineage value means a writer outside this run also moved it; its
+// advance is dropped but the run's own stamp is kept, since dropping that too
+// would reopen the #866 F2 resurrection. That is the fail-safe direction:
+// every writer of these columns only moves them forward (MAX), so the paired
+// cutoff is never newer than the post-lineage read, certifies no more AI rows
+// as exported, and the prune can only keep more of them, never delete more.
 function pairStagedTsvCutoff(
   fetchCutoff: { confirmedAt: number | null; editId: number | null },
   postLineage: { confirmedAt: number | null; editId: number | null },
@@ -10150,16 +10152,16 @@ function pairStagedTsvCutoff(
         : fetchCutoff.editId,
     };
   }
-  if (postLineage.confirmedAt === expected.confirmedAt && postLineage.editId === expected.editId) {
-    return postLineage;
+  if (postLineage.confirmedAt !== expected.confirmedAt || postLineage.editId !== expected.editId) {
+    console.warn("reimport: prune cutoff moved between the master fetch and the post-lineage read by a writer outside this run; pruning against the fetch-time cutoff plus this run's own lineage stamp (#1048)", {
+      ...log,
+      fetchCutoff,
+      postLineage,
+      ownStamp,
+      paired: expected,
+    });
   }
-  console.warn("reimport: prune cutoff moved between the master fetch and the post-lineage read by a writer outside this run; pruning against the fetch-time cutoff (#1048)", {
-    ...log,
-    fetchCutoff,
-    postLineage,
-    ownStamp,
-  });
-  return fetchCutoff;
+  return expected;
 }
 
 // SHA-gate each requested resource and stage the changed ones to R2. Returns
