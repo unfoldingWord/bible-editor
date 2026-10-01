@@ -632,7 +632,10 @@ Highlights that bite repeatedly:
   made the prune delete them (#1048). The two are told apart by provenance, not by value: the walk reports its
   stamp through `LineageStats.lineageConfirmed`, and `pairStagedTsvCutoff` pairs the file with the fetch-time read
   plus that stamp, so an outside advance is dropped but the run's own stamp never is (dropping both would reopen
-  the F2 resurrection). Writers only move these columns forward, so the paired value can only keep more rows. Corollary for tests: a DB-side advance injected during staging now reads as an outside
+  the F2 resurrection). The invariant is that the paired value never certifies more than the fetch-time read plus
+  this run's own confirmed render. It is not "never newer than the post-walk read": an outside confirm with a
+  null edit id can push `master_confirmed_at` past the run's `pushed_read_at`, so the stamp's SQL edit-id gate
+  leaves the row's edit id at the fetch-time value while the paired edit id is the own stamp's. Corollary for tests: a DB-side advance injected during staging now reads as an outside
   writer, so a test of the legitimate path has to drive the real #658 stamp.
 
 ## Stop conditions / goals

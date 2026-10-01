@@ -8588,8 +8588,9 @@ interface StagedResource {
   // newer boundary against this older file makes that row look exported and
   // then removed on master, so the prune would delete it. For TSV kinds the
   // value is the boundary read before the fetch plus this run's own lineage
-  // stamp, so an outside advance in that window is dropped (#1048,
-  // pairStagedTsvCutoff). Only the two
+  // stamp, so an outside advance in that window is dropped and the value never
+  // certifies more than the fetch-time boundary plus this run's own confirmed
+  // render (#1048, pairStagedTsvCutoff). Only the two
   // boundary fields, so the memoized plan stays plain JSON. Absent on a plan
   // replayed from an instance that started before this shipped; the prune
   // then falls back to a fresh read.
@@ -10132,10 +10133,15 @@ async function runTombstoneSweep(
 // computes it. On an ordinary run that equals the post-lineage read. Any other
 // post-lineage value means a writer outside this run also moved it; its
 // advance is dropped but the run's own stamp is kept, since dropping that too
-// would reopen the #866 F2 resurrection. That is the fail-safe direction:
-// every writer of these columns only moves them forward (MAX), so the paired
-// cutoff is never newer than the post-lineage read, certifies no more AI rows
-// as exported, and the prune can only keep more of them, never delete more.
+// would reopen the #866 F2 resurrection. The invariant: the paired cutoff
+// never certifies more than the fetch-time cutoff plus this run's own
+// confirmed render, both of which the staged file reflects. It is usually no
+// newer than the post-lineage read either, but not always: an outside confirm
+// with a null edit id can move master_confirmed_at past this run's
+// pushed_read_at before the #658 stamp, so the stamp's SQL edit-id gate fails
+// and the row keeps the fetch-time edit id, while the paired edit id is the
+// own stamp's higher one. The extra rows that certifies are exactly those in
+// this run's own confirmed render, which the prune may judge.
 function pairStagedTsvCutoff(
   fetchCutoff: { confirmedAt: number | null; editId: number | null },
   postLineage: { confirmedAt: number | null; editId: number | null },
