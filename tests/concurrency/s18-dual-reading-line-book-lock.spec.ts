@@ -19,11 +19,13 @@ import { csrfToken, newUserContext } from "./helpers";
 //   4. A save already under way when the lock lands (here: parked on the
 //      "Words will be unaligned" confirm) is refused at the point of commit
 //      too: "Save anyway" shows the toast and the line stays dirty.
-//   5. (#1050) A refused or cancelled save leaves nothing behind. It used to
-//      keep the verse-base pin saveVerseDraft took, so once the verse moved
-//      on the server every later save of it in this tab sent the stale
-//      pinned version and hit a 409; and a refused "save, mark done, next"
-//      kept the button's in-flight guard set, so the button ignored clicks
+//   5. (#1050) A refused or cancelled save keeps the verse-base pin
+//      saveVerseDraft took only while its edit is still on screen: saving the
+//      kept edit after the verse moved must 409, never overwrite the change.
+//      Once the edit is dropped (Undo), the pin goes too; it used to leak, so
+//      every later save of the verse in this tab sent the stale version and
+//      hit a 409. And a refused "save, mark done, next" frees the button's
+//      in-flight guard; it used to stay set, so the button ignored clicks
 //      until the aligner remounted.
 //
 // A chapter (pipeline) lock is s9 check (b)'s job: there the reading line
@@ -328,7 +330,23 @@ test("a reading-line save parked on the unalign confirm is refused if the book l
   }
 });
 
-test("a refused or cancelled reading-line save releases the verse pin, so the next save after an unlock does not 409", async ({
+// The next PATCH of the verse this page sends.
+function nextVersePatch(page: Page) {
+  return page.waitForResponse(
+    (r) => r.request().method() === "PATCH" && r.url().includes(`/api/verses/${BOOK}/${CHAPTER}/${VERSE}/${BV}`),
+  );
+}
+
+// The ULT reading line's buttons, and the unalign confirm.
+function lineControls(o: Opened) {
+  return {
+    save: o.lineBox.getByRole("button", { name: `Save ${BV}`, exact: true }),
+    undo: o.lineBox.getByRole("button", { name: "Undo", exact: true }),
+    confirm: o.page.getByRole("dialog").filter({ hasText: "will be unaligned" }),
+  };
+}
+
+test("a refused reading-line save, then Undo: the next save after an unlock goes out against the moved verse (no 409)", async ({
   browser,
 }) => {
   test.setTimeout(120_000); // two 15 s book-lock refocus throttles
@@ -341,10 +359,8 @@ test("a refused or cancelled reading-line save releases the verse pin, so the ne
   try {
     await setLock(context.request, csrf, false);
     const o = await openDual(page);
-    const { dialog, line, lineBox } = o;
-    const save = lineBox.getByRole("button", { name: `Save ${BV}`, exact: true });
-    const undo = lineBox.getByRole("button", { name: "Undo", exact: true });
-    const confirm = page.getByRole("dialog").filter({ hasText: "will be unaligned" });
+    const { line } = o;
+    const { save, undo, confirm } = lineControls(o);
     expect(await pinnedVersion(page)).toBeUndefined();
 
     // A save parked on the unalign confirm, refused because the lock landed.
@@ -355,9 +371,12 @@ test("a refused or cancelled reading-line save releases the verse pin, so the ne
     await lockAndLetItLand(o, context.request, csrf);
     await confirm.getByRole("button", { name: "Save anyway" }).click();
     await expect(page.getByText(/book is locked.*not saved/i)).toBeVisible();
-    // Nothing was queued, so no outbox exit will ever release that pin.
-    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+    // The edit is still on screen, so its base stays pinned...
+    expect(await pinnedVersion(page)).toBe(original.version);
+    // ...until the edit is dropped. Nothing was queued, so no outbox exit
+    // would ever release it.
     await undo.click();
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
 
     // Unlock, and let the verse move on the server (another editor, or the
     // reimport the lock was for).
@@ -365,33 +384,128 @@ test("a refused or cancelled reading-line save releases the verse pin, so the ne
     await bumpVerse(page, context.request, csrf, `[s18-${stamp}]`);
     await expect(line).toContainText(`[s18-${stamp}]`);
 
-    // The next save goes out against the moved version: 200, not a 409 from
-    // a leaked pin of the version before the lock.
+    // A new edit saves against the moved version: 200, not a 409 from a
+    // leaked pin of the version before the lock.
     await appendToLine(line, `AFTER-${stamp}`);
-    const patched = page.waitForResponse(
-      (r) => r.request().method() === "PATCH" && r.url().includes(`/api/verses/${BOOK}/${CHAPTER}/${VERSE}/${BV}`),
-    );
+    const patched = nextVersePatch(page);
     await save.click();
     expect((await patched).status()).toBe(200);
     await expect(undo).toBeDisabled();
     await expect.poll(async () => (await serverVerse(context.request)).plain_text).toContain(`AFTER-${stamp}`);
-    // The landed save's outbox exit releases its own pin.
-    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
-
-    // The confirm's Cancel queues nothing either, so it must release the pin
-    // the save took as well.
-    await swapAlignedWords(line);
-    await save.click();
-    await expect(confirm.getByRole("button", { name: "Cancel" })).toBeVisible();
-    expect(await pinnedVersion(page)).toBeDefined();
-    await confirm.getByRole("button", { name: "Cancel" }).click();
-    await expect(confirm).toHaveCount(0);
-    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
-    await expect(undo).toBeEnabled(); // the edit is still there to keep or drop
-    await undo.click();
-    await expect(dialog.getByText("✎ editable").first()).toBeVisible();
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined(); // released by the landed save's exit
   } finally {
     await setLock(context.request, csrf, false);
+    await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
+    await context.close();
+  }
+});
+
+test("a refused reading-line save whose edit is kept: saving it after the verse moved is a 409, never an overwrite", async ({
+  browser,
+}) => {
+  test.setTimeout(120_000); // two 15 s book-lock refocus throttles
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const original = await serverVerse(context.request);
+  const tag = `[s18-${Date.now()}]`;
+
+  try {
+    await setLock(context.request, csrf, false);
+    const o = await openDual(page);
+    const { line } = o;
+    const { save, undo, confirm } = lineControls(o);
+
+    await swapAlignedWords(line);
+    await save.click();
+    await expect(confirm.getByRole("button", { name: "Save anyway" })).toBeVisible();
+    await lockAndLetItLand(o, context.request, csrf);
+    await confirm.getByRole("button", { name: "Save anyway" }).click();
+    await expect(page.getByText(/book is locked.*not saved/i)).toBeVisible();
+    await expect(undo).toBeEnabled(); // the edit is kept
+
+    // Unlocked, the translator goes back into the line (so it is not resynced
+    // under the caret) while the verse moves on the server.
+    await unlockAndLetItLand(o, context.request, csrf);
+    await line.click();
+    await bumpVerse(page, context.request, csrf, tag);
+    await expect(line).toContainText("Sharezer sent");
+    await expect(line).not.toContainText(tag);
+
+    // Saving the kept edit sends the version it was made against, so the
+    // server refuses it instead of losing the change.
+    await save.click();
+    await expect(confirm.getByRole("button", { name: "Save anyway" })).toBeVisible();
+    const patched = nextVersePatch(page);
+    await confirm.getByRole("button", { name: "Save anyway" }).click();
+    const res = await patched;
+    expect(res.request().headers()["if-match"]).toBe(String(original.version));
+    expect(res.status()).toBe(409);
+    await page.waitForTimeout(1_000);
+    const after = (await serverVerse(context.request)).plain_text;
+    expect(after).toContain(tag);
+    expect(after).not.toContain("Sharezer sent");
+  } finally {
+    await setLock(context.request, csrf, false);
+    await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
+    await context.close();
+  }
+});
+
+test("a cancelled unalign confirm keeps the pin while the edit is kept, and releases it on Undo", async ({ browser }) => {
+  test.setTimeout(60_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const original = await serverVerse(context.request);
+  const stamp = Date.now();
+
+  try {
+    await setLock(context.request, csrf, false);
+    const o = await openDual(page);
+    const { line } = o;
+    const { save, undo, confirm } = lineControls(o);
+
+    // Cancel, then Undo: the pin goes with the edit, so a new edit after the
+    // verse moved saves cleanly.
+    await swapAlignedWords(line);
+    await save.click();
+    await confirm.getByRole("button", { name: "Cancel" }).click();
+    await expect(confirm).toHaveCount(0);
+    expect(await pinnedVersion(page)).toBe(original.version);
+    await undo.click();
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+    await bumpVerse(page, context.request, csrf, `[s18a-${stamp}]`);
+    await expect(line).toContainText(`[s18a-${stamp}]`);
+    await appendToLine(line, `AFTER-${stamp}`);
+    let patched = nextVersePatch(page);
+    await save.click();
+    expect((await patched).status()).toBe(200);
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+
+    // Cancel and keep the edit: saving it after the verse moved is a 409.
+    const kept = await serverVerse(context.request);
+    await expect
+      .poll(() =>
+        page.evaluate((key) => (window as unknown as PinDebugWindow).__bePinDebug?.currentVersion(key), PIN_KEY),
+      )
+      .toBe(kept.version);
+    await swapAlignedWords(line);
+    await save.click();
+    await confirm.getByRole("button", { name: "Cancel" }).click();
+    await expect(confirm).toHaveCount(0);
+    expect(await pinnedVersion(page)).toBe(kept.version);
+    await line.click();
+    await bumpVerse(page, context.request, csrf, `[s18b-${stamp}]`);
+    await save.click();
+    patched = nextVersePatch(page);
+    await confirm.getByRole("button", { name: "Save anyway" }).click();
+    const res = await patched;
+    expect(res.request().headers()["if-match"]).toBe(String(kept.version));
+    expect(res.status()).toBe(409);
+    await page.waitForTimeout(1_000);
+    expect((await serverVerse(context.request)).plain_text).toContain(`[s18b-${stamp}]`);
+  } finally {
     await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
     await context.close();
   }
