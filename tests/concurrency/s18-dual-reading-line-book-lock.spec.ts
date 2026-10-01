@@ -19,6 +19,12 @@ import { csrfToken, newUserContext } from "./helpers";
 //   4. A save already under way when the lock lands (here: parked on the
 //      "Words will be unaligned" confirm) is refused at the point of commit
 //      too: "Save anyway" shows the toast and the line stays dirty.
+//   5. (#1050) A refused or cancelled save leaves nothing behind. It used to
+//      keep the verse-base pin saveVerseDraft took, so once the verse moved
+//      on the server every later save of it in this tab sent the stale
+//      pinned version and hit a 409; and a refused "save, mark done, next"
+//      kept the button's in-flight guard set, so the button ignored clicks
+//      until the aligner remounted.
 //
 // A chapter (pipeline) lock is s9 check (b)'s job: there the reading line
 // stays reachable and the server refuses the save with a toast. Locking a
@@ -121,6 +127,86 @@ async function lockAndLetItLand(o: Opened, request: APIRequestContext, csrf: str
   // Page-wide, not dialog-scoped: while the unalign confirm is open the
   // aligner dialog is aria-hidden, so a role query can't see into it.
   await expect(o.page.getByText("🔒 book locked").first()).toBeVisible();
+}
+
+// Unlock the book while the dialog is open and wait for the tab to learn it
+// (same 15 s refocus throttle as lockAndLetItLand).
+async function unlockAndLetItLand(o: Opened, request: APIRequestContext, csrf: string) {
+  await setLock(request, csrf, false);
+  await o.page.waitForTimeout(15_500);
+  await o.page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(o.dialog.getByText("✎ editable").first()).toBeVisible();
+}
+
+type VerseRow = { version: number; plain_text: string; content_json: string };
+
+async function serverVerse(request: APIRequestContext): Promise<VerseRow> {
+  const res = await request.get(`/api/verses/${BOOK}/${CHAPTER}/${VERSE}/${BV}`);
+  expect(res.ok()).toBe(true);
+  return (await res.json()) as VerseRow;
+}
+
+// Write the verse over the API, as another editor (or a reimport) would.
+// Returns the new version.
+async function putVerse(request: APIRequestContext, csrf: string, content: unknown, plain: string) {
+  const cur = await serverVerse(request);
+  const res = await request.patch(`/api/verses/${BOOK}/${CHAPTER}/${VERSE}/${BV}`, {
+    headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+    data: { content, plain_text: plain },
+  });
+  expect(res.status(), await res.text()).toBe(200);
+  return ((await res.json()) as { version: number }).version;
+}
+
+const PIN_KEY = `verse:${BOOK}:${CHAPTER}:${VERSE}:${BV}`;
+// drafts.ts's DEV-only test hook.
+type PinDebugWindow = {
+  __bePinDebug?: {
+    peek: (key: string) => { version: number } | undefined;
+    currentVersion: (key: string) => number | undefined;
+  };
+};
+
+// Move the verse on the server (append a plain text node, leaving every
+// alignment milestone alone), then wait until this tab's chapter cache holds
+// the new version, so the reading line's base is the moved verse.
+async function bumpVerse(page: Page, request: APIRequestContext, csrf: string, tag: string) {
+  const cur = await serverVerse(request);
+  const content = JSON.parse(cur.content_json) as { verseObjects: unknown[] };
+  content.verseObjects.push({ type: "text", text: ` ${tag}` });
+  const version = await putVerse(request, csrf, content, `${cur.plain_text} ${tag}`);
+  await expect
+    .poll(() =>
+      page.evaluate((key) => (window as unknown as PinDebugWindow).__bePinDebug?.currentVersion(key), PIN_KEY),
+    )
+    .toBe(version);
+}
+
+// The version of the verse-base pin this tab holds for the verse, if any
+// (DEV-only hook, drafts.ts).
+async function pinnedVersion(page: Page): Promise<number | undefined> {
+  return page.evaluate((key) => (window as unknown as PinDebugWindow).__bePinDebug?.peek(key)?.version, PIN_KEY);
+}
+
+// "sent Sharezer" -> "Sharezer sent": swapping two aligned words trips the
+// collateral-loss guard for ZEC 7:2 ULT, so the save parks on the "Words
+// will be unaligned" confirm instead of enqueueing.
+async function swapAlignedWords(line: Locator) {
+  const original = (await line.textContent()) ?? "";
+  expect(original).toContain("sent Sharezer");
+  await line.evaluate((el, text) => {
+    el.textContent = text;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }, original.replace("sent Sharezer", "Sharezer sent"));
+}
+
+// Append a word to the line as typed input. Unaligns nothing that was
+// aligned, so its save never asks for confirmation.
+async function appendToLine(line: Locator, word: string) {
+  await line.evaluate((el, w) => {
+    el.textContent = `${el.textContent ?? ""} ${w}`;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }, word);
 }
 
 test("dual aligner reading line locks when a book lock lands, and a pre-lock edit is never shown as saved", async ({
@@ -238,6 +324,132 @@ test("a reading-line save parked on the unalign confirm is refused if the book l
     await expect(line).toContainText("sent Sharezer");
   } finally {
     await setLock(context.request, csrf, false);
+    await context.close();
+  }
+});
+
+test("a refused or cancelled reading-line save releases the verse pin, so the next save after an unlock does not 409", async ({
+  browser,
+}) => {
+  test.setTimeout(120_000); // two 15 s book-lock refocus throttles
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const original = await serverVerse(context.request);
+  const stamp = Date.now();
+
+  try {
+    await setLock(context.request, csrf, false);
+    const o = await openDual(page);
+    const { dialog, line, lineBox } = o;
+    const save = lineBox.getByRole("button", { name: `Save ${BV}`, exact: true });
+    const undo = lineBox.getByRole("button", { name: "Undo", exact: true });
+    const confirm = page.getByRole("dialog").filter({ hasText: "will be unaligned" });
+    expect(await pinnedVersion(page)).toBeUndefined();
+
+    // A save parked on the unalign confirm, refused because the lock landed.
+    await swapAlignedWords(line);
+    await save.click();
+    await expect(confirm.getByRole("button", { name: "Save anyway" })).toBeVisible();
+    expect(await pinnedVersion(page)).toBe(original.version); // the save took a pin
+    await lockAndLetItLand(o, context.request, csrf);
+    await confirm.getByRole("button", { name: "Save anyway" }).click();
+    await expect(page.getByText(/book is locked.*not saved/i)).toBeVisible();
+    // Nothing was queued, so no outbox exit will ever release that pin.
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+    await undo.click();
+
+    // Unlock, and let the verse move on the server (another editor, or the
+    // reimport the lock was for).
+    await unlockAndLetItLand(o, context.request, csrf);
+    await bumpVerse(page, context.request, csrf, `[s18-${stamp}]`);
+    await expect(line).toContainText(`[s18-${stamp}]`);
+
+    // The next save goes out against the moved version: 200, not a 409 from
+    // a leaked pin of the version before the lock.
+    await appendToLine(line, `AFTER-${stamp}`);
+    const patched = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(`/api/verses/${BOOK}/${CHAPTER}/${VERSE}/${BV}`),
+    );
+    await save.click();
+    expect((await patched).status()).toBe(200);
+    await expect(undo).toBeDisabled();
+    await expect.poll(async () => (await serverVerse(context.request)).plain_text).toContain(`AFTER-${stamp}`);
+    // The landed save's outbox exit releases its own pin.
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+
+    // The confirm's Cancel queues nothing either, so it must release the pin
+    // the save took as well.
+    await swapAlignedWords(line);
+    await save.click();
+    await expect(confirm.getByRole("button", { name: "Cancel" })).toBeVisible();
+    expect(await pinnedVersion(page)).toBeDefined();
+    await confirm.getByRole("button", { name: "Cancel" }).click();
+    await expect(confirm).toHaveCount(0);
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+    await expect(undo).toBeEnabled(); // the edit is still there to keep or drop
+    await undo.click();
+    await expect(dialog.getByText("✎ editable").first()).toBeVisible();
+  } finally {
+    await setLock(context.request, csrf, false);
+    await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
+    await context.close();
+  }
+});
+
+test('a "save, mark done, next" refused by a book lock leaves the button working once the book is unlocked', async ({
+  browser,
+}) => {
+  test.setTimeout(120_000); // two 15 s book-lock refocus throttles
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const original = await serverVerse(context.request);
+  const stamp = Date.now();
+
+  try {
+    await setLock(context.request, csrf, false);
+    const o = await openDual(page);
+    const { dialog, line, lineBox } = o;
+    const undo = lineBox.getByRole("button", { name: "Undo", exact: true });
+    const confirm = page.getByRole("dialog").filter({ hasText: "will be unaligned" });
+    const doneNext = page.getByRole("button", { name: "Save both, mark verse done, next verse" });
+    const here = dialog.getByText(`${BOOK} ${CHAPTER}:${VERSE}`, { exact: true });
+
+    // The button's chain parks on the unalign confirm, the lock lands, and
+    // Save anyway is refused.
+    await expect(here).toBeVisible();
+    await swapAlignedWords(line);
+    await doneNext.click();
+    await expect(confirm.getByRole("button", { name: "Save anyway" })).toBeVisible();
+    await lockAndLetItLand(o, context.request, csrf);
+    await confirm.getByRole("button", { name: "Save anyway" }).click();
+    await expect(page.getByText(/book is locked.*not saved/i)).toBeVisible();
+    await expect(here).toBeVisible();
+    await undo.click();
+
+    // Unlocked again, the button saves, marks the verse done and moves on.
+    await unlockAndLetItLand(o, context.request, csrf);
+    await expect(doneNext).toBeEnabled();
+    await appendToLine(line, `DONE-${stamp}`);
+    const patched = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(`/api/verses/${BOOK}/${CHAPTER}/${VERSE}/${BV}`),
+    );
+    const marked = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(`/api/chapters/${BOOK}/${CHAPTER}/${VERSE}/lanes/text`),
+    );
+    await doneNext.click();
+    await expect(dialog.getByText(`${BOOK} ${CHAPTER}:${VERSE + 1}`, { exact: true })).toBeVisible();
+    expect((await patched).status()).toBe(200);
+    expect((await marked).ok()).toBe(true);
+  } finally {
+    await setLock(context.request, csrf, false);
+    // Put the verse and its Text-lane check back for the other specs.
+    await context.request.patch(`/api/chapters/${BOOK}/${CHAPTER}/${VERSE}/lanes/text`, {
+      headers: { "x-csrf-token": csrf },
+      data: { checked: false },
+    });
+    await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
     await context.close();
   }
 });
