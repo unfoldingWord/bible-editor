@@ -3697,4 +3697,202 @@ await (async () => {
   }
 }
 
+// ─── #966: byte-distinct Hebrew twins stay separate notes at AI apply ───────
+// translationCore counts each byte-distinct surface as its own occurrence
+// sequence (quoteExact, lint.ts): DAN 2:10 holds both `כָּ⁠ל` (U+2060) and bare
+// `כָּל`. The #962 fold (tnDedupQuote) merged them, so a proposal quoting one
+// twin was dropped as a duplicate of a live note quoting the other. Driven
+// through the REAL importJobOutput (staging + apply) against a migrated
+// node:sqlite database, so the SQL, the staging canonize and the apply dedup
+// all run for real. Every fixture is spelled in \u escapes and its byte
+// difference is asserted below, so no case can pass on identical bytes.
+await (async () => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+
+  const KOL_WJ = "כָּ⁠ל"; // כָּ⁠ל, UHB bytes with the word joiner
+  const KOL = "כָּל"; // כָּל, UHB bytes, bare
+  const KOL_NFC = "כָּל"; // כָּל in NFC order, no joiner: a legacy AI row
+  const KOH_UHB = "כֹּ֥ה"; // כֹּ֥ה, dagesh before holam (UHB)
+  const KOH_NFC = "כֹּ֥ה"; // כֹּ֥ה, holam before dagesh (NFC)
+  const LOGOS = "λόγος"; // λόγος, precomposed
+  const LOGOS_DECOMP = "λόγος"; // λόγος, combining acute
+  const hex = (s) => Buffer.from(s).toString("hex");
+  for (const [a, b] of [[KOL_WJ, KOL], [KOL, KOL_NFC], [KOH_UHB, KOH_NFC], [LOGOS, LOGOS_DECOMP]]) {
+    assert(a !== b, `#966 precondition: ${hex(a)} and ${hex(b)} differ in bytes`);
+    assert(tnDedupQuote(a) === tnDedupQuote(b), `#966 precondition: ${hex(a)} and ${hex(b)} fold together`);
+  }
+
+  const migrations = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  const migrationSql = readdirSync(migrations).filter((f) => f.endsWith(".sql")).sort()
+    .map((f) => readFileSync(join(migrations, f), "utf8"));
+
+  // One job against a fresh database. `source` maps verse -> UHB/UGNT word
+  // texts; `live` rows are preserved (deleteUnkeptTns keeps them, so only the
+  // content dedup stands between a re-proposal and a second copy); `tsv` rows
+  // go through staging; `prestaged` rows are written to pending_imports as-is
+  // (staged_at set), modelling a proposal staged before #959.
+  async function runJob({ book, chapter, source = {}, live = [], tsv = [], prestaged = [] }) {
+    const sqlite = new DatabaseSync(":memory:");
+    for (const sql of migrationSql) sqlite.exec(sql);
+    let sourceReads = 0;
+    const mk = (sql, args) => ({
+      sql, args,
+      bind: (...a) => mk(sql, a),
+      all() {
+        if (/FROM verses/.test(sql) && /bible_version = \?4/.test(sql)) sourceReads += 1;
+        return { results: sqlite.prepare(sql).all(...args), success: true };
+      },
+      first() { const r = sqlite.prepare(sql).all(...args); return r.length ? r[0] : null; },
+      run() { const r = sqlite.prepare(sql).run(...args); return { success: true, meta: { changes: Number(r.changes) } }; },
+    });
+    const env = { DB: { prepare: (sql) => mk(sql, []), async batch(stmts) { return stmts.map((s) => s.run()); } } };
+
+    const srcVersion = book === "TIT" ? "UGNT" : "UHB";
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator9')`).run();
+    sqlite.prepare(
+      `INSERT INTO pipeline_jobs (job_id, user_id, pipeline_type, book, start_chapter, end_chapter, session_key, state, staged_at)
+       VALUES ('job-966', 1, 'notes', ?, ?, ?, 'sess', 'running', ?)`,
+    ).run(book, chapter, chapter, prestaged.length ? 1000 : null);
+    for (const [v, texts] of Object.entries(source)) {
+      const verseObjects = texts.map((text) => ({ type: "word", tag: "w", text, strong: "H3605", lemma: "", morph: "" }));
+      sqlite.prepare(
+        `INSERT INTO verses (book, chapter, verse, bible_version, content_json) VALUES (?, ?, ?, ?, ?)`,
+      ).run(book, chapter, Number(v), srcVersion, JSON.stringify({ verseObjects }));
+    }
+    for (const r of live) {
+      sqlite.prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, quote, occurrence, note, sort_order, preserve, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 100, 1, 1)`,
+      ).run(r.id, book, chapter, r.verse, r.ref ?? `${chapter}:${r.verse}`, r.quote, r.occ ?? 1, r.note ?? "n");
+    }
+    for (const r of prestaged) {
+      const payload = { id: r.id, book, chapter, verse: r.verse, ref_raw: r.ref ?? `${chapter}:${r.verse}`, tags: null,
+        support_reference: null, quote: r.quote, occurrence: r.occ ?? 1, note: r.note ?? "n" };
+      sqlite.prepare(
+        `INSERT INTO pending_imports (job_id, kind, book, chapter, verse, payload_json) VALUES ('job-966', 'tn', ?, ?, ?, ?)`,
+      ).run(book, chapter, r.verse, JSON.stringify(payload));
+    }
+    const tsvText = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n" +
+      tsv.map((r) => `${r.ref ?? `${chapter}:${r.verse}`}\t${r.id}\t\t\t${r.quote}\t${r.occ ?? 1}\t${r.note ?? "n"}\n`).join("");
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(tsvText, { status: 200 });
+    let result;
+    try {
+      result = await importJobOutput(
+        env,
+        { jobId: "job-966", pipelineType: "notes", book, startChapter: chapter, endChapter: chapter },
+        tsv.length ? [{ repo: "unfoldingWord/en_tn", rawUrl: `https://example.invalid/tn_${book}.tsv` }] : [],
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    const rows = sqlite.prepare(
+      `SELECT id, quote FROM tn_rows WHERE book = ? AND deleted_at IS NULL ORDER BY id`,
+    ).all(book);
+    return { result, rows, sourceReads };
+  }
+
+  // 1. The issue's case: live `כָּ⁠ל`, proposal bare `כָּל`, every other field
+  // identical, both words in the verse's UHB. Two notes, not one.
+  {
+    const { result, rows, sourceReads } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL_WJ, KOL] },
+      live: [{ id: "aaaa", verse: 10, quote: KOL_WJ }],
+      tsv: [{ id: "bbbb", verse: 10, quote: KOL }],
+    });
+    assert(result.applied?.tnCreated === 1 && result.applied?.tnSkippedDup === 0,
+      `#966: a proposal quoting bare כָּל is NOT deduped against a live כָּ⁠ל note (created=${result.applied?.tnCreated}, skippedDup=${result.applied?.tnSkippedDup})`);
+    assert(rows.length === 2 && rows.some((r) => r.quote === KOL_WJ) && rows.some((r) => r.quote === KOL),
+      "#966: both twin notes exist after apply, each in its own bytes");
+    assert(sourceReads === 1, `#966: staging and apply share ONE UHB preload query per job (got ${sourceReads})`);
+  }
+  // 1b. Mark-order twins (1CH 22:19's shape), the other way round.
+  {
+    const { result, rows } = await runJob({
+      book: "JER", chapter: 29, source: { 4: [KOH_UHB, KOH_NFC] },
+      live: [{ id: "aaaa", verse: 4, quote: KOH_NFC }],
+      tsv: [{ id: "bbbb", verse: 4, quote: KOH_UHB }],
+    });
+    assert(result.applied?.tnCreated === 1 && rows.length === 2,
+      `#966: mark-order twins that are both UHB surfaces stay two notes (created=${result.applied?.tnCreated}, rows=${rows.length})`);
+  }
+
+  // 2. #959/#962 doubling guard: a live NFC row with the joiner dropped and its
+  // re-proposal (canonized to UHB bytes at staging) are ONE note.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOH_UHB, KOL_WJ] },
+      live: [{ id: "aaaa", verse: 10, quote: `${KOH_NFC} ${KOL_NFC}` }],
+      tsv: [{ id: "bbbb", verse: 10, quote: `${KOH_NFC} ${KOL_NFC}` }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && result.applied?.tnCreated === 0 && rows.length === 1,
+      `#966: a live NFC row still dedups its canonized re-proposal (created=${result.applied?.tnCreated}, skippedDup=${result.applied?.tnSkippedDup})`);
+  }
+
+  // 3. A proposal staged before #959 (raw NFC in pending_imports) against a live
+  // row in UHB bytes: still one note.
+  {
+    const { result, rows, sourceReads } = await runJob({
+      book: "JER", chapter: 29, source: { 4: [KOH_UHB] },
+      live: [{ id: "aaaa", verse: 4, quote: KOH_UHB }],
+      prestaged: [{ id: "bbbb", verse: 4, quote: KOH_NFC }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: an uncanonized pre-#959 proposal still dedups (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+    assert(sourceReads === 1, `#966: an already-staged job's apply loads the UHB once (got ${sourceReads})`);
+  }
+
+  // 4. A live row that cannot be canonized (no UHB loaded for its verse) holds
+  // NFC with the joiner dropped; the AI re-emits UHB bytes. Still one note.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 9: [KOL] },
+      live: [{ id: "aaaa", verse: 10, quote: KOL_NFC }],
+      tsv: [{ id: "bbbb", verse: 10, quote: KOL_WJ }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: no UHB words for the verse falls back to the fold (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+  }
+
+  // 5. A legacy NFC row in a twin verse is ambiguous (it could be either twin):
+  // a re-run must not add a second copy of it.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL_WJ, KOL] },
+      live: [{ id: "aaaa", verse: 10, quote: KOL_NFC }],
+      tsv: [{ id: "bbbb", verse: 10, quote: KOL_WJ }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: an ambiguous legacy NFC row in a twin verse still dedups a re-proposal (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+  }
+
+  // 6. A live row whose ref_raw is a range resolves its twin against the words
+  // of every verse it covers, the same candidates the proposal is checked on.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL], 11: [KOL_WJ] },
+      live: [{ id: "aaaa", verse: 10, ref: "2:10-11", quote: KOL_WJ }],
+      tsv: [{ id: "bbbb", verse: 10, quote: KOL }],
+    });
+    assert(result.applied?.tnCreated === 1 && rows.length === 2,
+      `#966: twins resolved across a live row's verse range stay two notes (created=${result.applied?.tnCreated}, rows=${rows.length})`);
+  }
+
+  // 7. NT keeps the #962 fold: composition and joiner differences still dedup,
+  // even with both forms present in the loaded UGNT.
+  {
+    const { result, rows, sourceReads } = await runJob({
+      book: "TIT", chapter: 1, source: { 3: [LOGOS, LOGOS_DECOMP] },
+      live: [{ id: "aaaa", verse: 3, quote: LOGOS_DECOMP }],
+      tsv: [{ id: "bbbb", verse: 3, quote: LOGOS }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: an NT re-proposal differing only in composition still dedups (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+    assert(sourceReads === 0, `#966: an NT notes-only job loads no source words (got ${sourceReads})`);
+  }
+})();
+
 console.log("pipelineImport (claim guard): all assertions passed");
