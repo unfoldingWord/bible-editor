@@ -26,6 +26,7 @@ import {
   classifyHiddenChange,
   renderVerseUsfm,
   stripAlignmentNoise,
+  type HiddenChange,
   type VerseUsfm,
 } from "../lib/verseUsfmPreview";
 
@@ -74,12 +75,18 @@ type ViewMode = "snapshot" | "diff" | "usfm";
 // diffs selected -> current, like the plain-text diff.
 type UsfmBase = "current" | "previous";
 
-const HIDDEN_CHANGE_LABEL = { markers: "markers only", alignment: "alignment only" } as const;
+const HIDDEN_CHANGE_LABEL = {
+  markers: "markers only",
+  alignment: "alignment only",
+  both: "markers + alignment",
+} as const;
 const HIDDEN_CHANGE_TIP = {
   markers:
     "the visible text is the same as the previous version; only USFM markers (\\p, \\q, \\ts, ...) changed. Select it to see the USFM diff against the previous version",
   alignment:
     "the visible text and markers are the same as the previous version; only word alignment changed. Select it to see the USFM diff with alignment attributes shown",
+  both:
+    "the visible text is the same as the previous version; both USFM markers (\\p, \\q, \\ts, ...) and word alignment changed. Select it to see the USFM diff with alignment attributes shown",
 } as const;
 
 export function VerseHistoryDialog({
@@ -171,7 +178,7 @@ export function VerseHistoryDialog({
 
   // Versions whose plain text equals the predecessor's but whose USFM differs.
   const hiddenChangeOf = useMemo(() => {
-    const map = new Map<number, "markers" | "alignment">();
+    const map = new Map<number, HiddenChange>();
     for (const e of ordered) {
       const prev = predecessorOf.get(e.version);
       if (!prev) continue;
@@ -187,15 +194,15 @@ export function VerseHistoryDialog({
   }, [ordered, predecessorOf, usfmByVersion]);
 
   // Select a version. A chip row's change is only visible in the USFM view
-  // against its predecessor, so open that directly, with attributes shown for
-  // an alignment change and hidden for a marker change.
+  // against its predecessor, so open that directly, with attributes shown
+  // whenever alignment changed and hidden for a marker-only change.
   const selectVersion = (version: number) => {
     setSelectedVersion(version);
     const kind = hiddenChangeOf.get(version);
     if (kind) {
       setViewMode("usfm");
       setUsfmBase("previous");
-      setShowAlignment(kind === "alignment");
+      setShowAlignment(kind !== "markers");
     }
   };
 
@@ -226,6 +233,10 @@ export function VerseHistoryDialog({
   const usfmOf = (e: VerseHistoryEntry): VerseUsfm => usfmByVersion.get(e.version) ?? { kind: "none" };
   const shown = (u: VerseUsfm) => (u.kind !== "usfm" ? null : showAlignment ? u.text : stripAlignmentNoise(u.text));
   const selectedUsfm = selected ? usfmOf(selected) : null;
+  // The USFM view diffs only when both ends rendered; otherwise it shows the
+  // selected version alone (or an alert), and the caption must say so.
+  const usfmDiffShown =
+    !!usfmPair && usfmOf(usfmPair[0]).kind === "usfm" && usfmOf(usfmPair[1]).kind === "usfm";
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
@@ -336,7 +347,7 @@ export function VerseHistoryDialog({
                   <Stack direction="row" alignItems="center" spacing={1}>
                     <Typography variant="caption" color="text.secondary">
                       {viewMode === "usfm"
-                        ? usfmPair
+                        ? usfmDiffShown && usfmPair
                           ? `USFM diff: v${usfmPair[0].version} → v${usfmPair[1].version}`
                           : `USFM of v${selected.version}`
                         : viewMode === "diff" && canDiff
@@ -406,7 +417,7 @@ export function VerseHistoryDialog({
                           ? "USFM unavailable: this version's stored tree could not be rendered."
                           : "Markers and alignment weren't stored for this version; only plain text is available."}
                       </Alert>
-                    ) : usfmPair && usfmOf(usfmPair[0]).kind === "usfm" && usfmOf(usfmPair[1]).kind === "usfm" ? (
+                    ) : usfmDiffShown && usfmPair ? (
                       <TextDiff from={shown(usfmOf(usfmPair[0]))} to={shown(usfmOf(usfmPair[1]))} mono />
                     ) : (
                       <>

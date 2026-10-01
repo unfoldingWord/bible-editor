@@ -155,7 +155,20 @@ const text = (r) => (r.kind === "usfm" ? r.text : null);
   const r = (p) => renderVerseUsfm(p.chapters["1"]["17"], 1, 17);
   assert(classifyHiddenChange("x", "x", r(bare), r(aligned)) === "alignment", "bare text -> first alignment is alignment only");
   assert(classifyHiddenChange("x", "x", r(aligned), r(bare)) === "alignment", "alignment removed entirely is alignment only");
-  assert(classifyHiddenChange("x", "x", r(bare), r(alignedP)) === "markers", "first alignment plus an added \\p is still markers");
+  assert(classifyHiddenChange("x", "x", r(bare), r(alignedP)) === "both", "first alignment plus an added \\p is both, not markers only");
+}
+
+// ── 11. Markers and alignment are judged separately (Cursor review, #951):
+//        "markers" only when the alignment is untouched, "both" when the same
+//        version also changed it, so the chip never says "markers only" over
+//        a diff full of new \w wrappers.
+{
+  const zaln = (strong) => `\\zaln-s |x-strong="${strong}"\\*\\w Cities|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\* \\w will|x-occurrence="1" x-occurrences="1"\\w* \\w overflow|x-occurrence="1" x-occurrences="1"\\w*.`;
+  const r = (src) => renderVerseUsfm(toJSON(`\\c 1\n\\v 17 ${src}`).chapters["1"]["17"], 1, 17);
+  assert(classifyHiddenChange("x", "x", r(zaln("H1")), r(zaln("H1") + "\n\\p")) === "markers", "aligned -> same alignment + \\p stays markers");
+  assert(classifyHiddenChange("x", "x", r(zaln("H1")), r(zaln("H2") + "\n\\p")) === "both", "re-pointed \\zaln + \\p is both");
+  assert(classifyHiddenChange("x", "x", r(zaln("H1")), r(zaln("H2"))) === "alignment", "re-pointed \\zaln alone stays alignment");
+  assert(classifyHiddenChange("x", "x", r("Cities will overflow."), r("Cities will overflow.\n\\p")) === "markers", "bare -> bare + \\p is markers");
 }
 
 if (failed > 0) {

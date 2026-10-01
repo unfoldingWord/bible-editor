@@ -65,20 +65,34 @@ function markerSkeleton(usfmText: string): string {
   return stripAlignmentNoise(usfmText).replace(BARE_WORD_RE, "$1").replace(/\s+/g, " ").trim();
 }
 
+// The alignment layer alone: every `\zaln-s …\*`, `\zaln-e\*` and `\w …\w*`
+// token in order, attributes included, with all other text and markers
+// dropped. Two versions with the same plain text have the same word text, so
+// this differs only when milestones, `\w` wrapping or attributes changed.
+const ALIGNMENT_TOKEN_RE = /\\zaln-s\s*\|[^\n]*?\\\*|\\zaln-e\\\*|\\w [^\\]*?\\w\*/g;
+function alignmentLayer(usfmText: string): string {
+  return (usfmText.match(ALIGNMENT_TOKEN_RE) ?? []).join("\n");
+}
+
+export type HiddenChange = "markers" | "alignment" | "both";
+
 // What a version changed that plain text can't show, relative to its
 // predecessor. "markers": a non-alignment marker differs (a `\p`, `\q1`,
-// `\ts\*`). "alignment": only `\zaln` milestones, `\w` wrappers / attributes,
-// or the whitespace between aligned words differ, so the reader must turn
-// attributes on to see it.
+// `\ts\*`) and the alignment layer does not. "alignment": only `\zaln`
+// milestones, `\w` wrappers / attributes, or the whitespace between aligned
+// words differ, so the reader must turn attributes on to see it. "both": the
+// same version changed markers and alignment.
 // null: plain text changed, is missing, or either side has no USFM.
 export function classifyHiddenChange(
   prevPlain: string | null,
   plain: string | null,
   prevUsfm: VerseUsfm,
   usfmNow: VerseUsfm,
-): "markers" | "alignment" | null {
+): HiddenChange | null {
   if (prevPlain == null || plain == null || prevPlain !== plain) return null;
   if (prevUsfm.kind !== "usfm" || usfmNow.kind !== "usfm") return null;
   if (prevUsfm.text === usfmNow.text) return null;
-  return markerSkeleton(prevUsfm.text) !== markerSkeleton(usfmNow.text) ? "markers" : "alignment";
+  const markers = markerSkeleton(prevUsfm.text) !== markerSkeleton(usfmNow.text);
+  if (!markers) return "alignment";
+  return alignmentLayer(prevUsfm.text) !== alignmentLayer(usfmNow.text) ? "both" : "markers";
 }
