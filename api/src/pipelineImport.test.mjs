@@ -1008,6 +1008,9 @@ function buildFakeAbortDb(flipAfterProposals, opts = {}) {
       releaseCalls.push({ sql, args });
       return { changes: 1, rows: [], single: null };
     }
+    if (/FROM verses/.test(sql) && /bible_version = \?4/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #966 apply UHB preload (TN dedup) — no source verses
+    }
     throw new Error(`fakeAbortDb: unhandled SQL: ${sql}`);
   }
 
@@ -3176,7 +3179,7 @@ await (async () => {
     if (/SELECT id, version FROM tn_rows\s+WHERE id = \?1/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no hint stub matches
     }
-    if (/SELECT chapter, verse, occurrence, support_reference, quote, note\s+FROM tn_rows/.test(sql)) {
+    if (/SELECT chapter, verse, ref_raw, occurrence, support_reference, quote, note\s+FROM tn_rows/.test(sql)) {
       // The LIVE, pre-fix row: same content, but STORED with straight quotes
       // (as a pre-fix AI run, or a translator who typed straight quotes,
       // would have left it) — preserved and un-swept, so it's still here.
@@ -3208,6 +3211,9 @@ await (async () => {
     if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) {
       skippedDupAcceptCount += 1;
       return { changes: 1, rows: [], single: null };
+    }
+    if (/FROM verses/.test(sql) && /bible_version = \?4/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #966 apply UHB preload (TN dedup) — no source verses
     }
     throw new Error(`fakeTnDedupDriftDb: unhandled SQL: ${sql}`);
   }

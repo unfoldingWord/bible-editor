@@ -200,6 +200,68 @@ export function tnDedupQuote(quote: string | null): string | null {
   return quote == null ? null : quote.replace(/[\u2060\u200D\uFEFF]/g, "").normalize("NFC");
 }
 
+// A note already claimed in applyJobOutput's content-dedup set, kept with its
+// raw quote and ref so a fold collision can be re-checked (isDistinctTwinTn).
+interface ClaimedTn {
+  quote: string | null;
+  refRaw: string | null;
+}
+
+const QUOTE_WORD_SEP = /[ \u05BE]/; // space or maqaf, as canonizeQuote splits
+
+// #966: the fold above is wider than translationCore's identity. tC counts
+// each byte-distinct surface as its own occurrence sequence, and some verses
+// hold two surfaces that fold together: DAN 2:10 has kol both with a U+2060
+// word joiner and bare, and 1CH 22:19 has two ha'elohim that differ only in
+// mark order (issue #966 lists them). Two fold-equal quotes are therefore
+// separate notes only when, at some word,
+// BOTH sides are byte-identical to a UHB word of the verses the notes cover
+// and those two UHB words differ. Any word that is not a UHB surface counts as
+// matching: a legacy NFC row, a proposal staged before #959, an un-canonizable
+// word, a verse with no UHB loaded, a Gateway-Language quote. That keeps the
+// #962 doubling guard for all of those (doubling is the worse failure), at the
+// accepted cost that a legacy NFC row in a twin verse, which cannot be told
+// apart from either twin, also blocks a re-proposal of either twin with
+// identical text. NT jobs pass an empty map, so they keep the fold unchanged.
+//
+// Why no canonizeQuote here, as staging does: within one fold bucket both
+// words share canonizeQuote's exact-tier key, so its exact tier resolves them
+// to the same UHB word unless that bucket is ambiguous, where it keeps only a
+// word that is already a UHB surface. That is this test. Its looser tiers key
+// on folds that keep U+2060, so they could resolve two fold-equal words to
+// different UHB words and split a real duplicate. Both sides are checked
+// against one candidate set (the union of the verses either ref covers), so a
+// live ref_raw that differs from the proposal's Reference cannot make them
+// resolve differently.
+function isDistinctTwinTn(
+  chapter: number,
+  verse: number,
+  a: ClaimedTn,
+  b: ClaimedTn,
+  sourceWordsByVerse: Map<number, SourceWord[]>,
+): boolean {
+  if (a.quote == null || b.quote == null || a.quote === b.quote || sourceWordsByVerse.size === 0) return false;
+  const surfaces = new Set<string>();
+  const verses = new Set([...coveredVersesFromRef(a.refRaw, verse), ...coveredVersesFromRef(b.refRaw, verse)]);
+  for (const v of verses) {
+    for (const w of sourceWordsByVerse.get(chapter * 100000 + v) ?? []) surfaces.add(w.text);
+  }
+  const aw = a.quote.split(QUOTE_WORD_SEP);
+  const bw = b.quote.split(QUOTE_WORD_SEP);
+  if (aw.length !== bw.length) return false;
+  return aw.some((w, i) => w !== bw[i] && surfaces.has(w) && surfaces.has(bw[i]));
+}
+
+// The book's UHB/UGNT words, loaded at most ONCE per importJobOutput call (one
+// query, cap-safe) and shared by staging's quote canonize and apply's TN dedup
+// and verse canonize, which used to load the same rows twice.
+type SourceWordsLoader = () => Promise<Map<number, SourceWord[]>>;
+
+function onceSourceWords(env: Env, job: ImportContext): SourceWordsLoader {
+  let loaded: Promise<Map<number, SourceWord[]>> | null = null;
+  return () => (loaded ??= loadUhbSourceWords(env, job));
+}
+
 export function tqPayload(book: string, refRaw: string, row: Record<string, string>) {
   const [ch, v] = refParts(refRaw);
   const occRaw = row["Occurrence"];
@@ -417,12 +479,13 @@ export async function importJobOutput(
     abortState: null,
     abortErrorKind: null,
   };
+  const sourceWords = onceSourceWords(env, job);
   try {
-    const stageResult = await stageJobOutput(env, job, outputs, heartbeat, cancel);
+    const stageResult = await stageJobOutput(env, job, outputs, heartbeat, cancel, sourceWords);
     // Staging itself can abort (see the CHUNK loop in stageJobOutput) — when it
     // does, skip apply entirely rather than running it against a possibly
     // incomplete pending_imports set.
-    const applyResult = cancel.aborted ? undefined : await applyJobOutput(env, job, heartbeat, cancel);
+    const applyResult = cancel.aborted ? undefined : await applyJobOutput(env, job, heartbeat, cancel, sourceWords);
 
     // Deliberate stop wins over an incidental lease loss below: it is the more
     // specific AND the more actionable outcome (keep-and-record + stamp the
@@ -709,6 +772,7 @@ async function stageJobOutput(
   outputs: OutputEntry[],
   heartbeat: ClaimHeartbeat,
   cancel: CancelWatch,
+  sourceWords: SourceWordsLoader,
 ): Promise<ImportResult> {
   // Idempotency guard: staged_at is written ONLY after the final chunk below
   // commits, so it — not the mere existence of a pending_imports row — is the
@@ -740,10 +804,11 @@ async function stageJobOutput(
     .run();
 
   // UHB words for TN quote canonizing (see tnPayload), loaded ONCE per job —
-  // one query, cap-safe — and only when an OT job actually carries TN output.
+  // one query, cap-safe, shared with apply — and only when an OT job actually
+  // carries TN output.
   const uhbWordsByVerse =
     !NT_BOOKS.has(job.book) && outputs.some((e) => e.rawUrl && classify(e).kind === "tn")
-      ? await loadUhbSourceWords(env, job)
+      ? await sourceWords()
       : new Map<number, SourceWord[]>();
 
   const skipped: string[] = [];
@@ -885,6 +950,7 @@ async function applyJobOutput(
   job: ImportContext,
   heartbeat: ClaimHeartbeat,
   cancel: CancelWatch,
+  sourceWords: SourceWordsLoader,
 ): Promise<ApplyResult> {
   // Look up the pipeline-starter's user id — every audit and updated_by
   // write is attributed to them, matching the contract that says the run
@@ -972,10 +1038,19 @@ async function applyJobOutput(
   // identical proposals in one file also collapse. This is the last line of
   // defense against the re-run doubling (ISA 36/41): even if the sweep misses a
   // row, its content key blocks the second copy.
-  const claimedTnKeys = new Set<string>();
+  //
+  // Keyed on the FOLDED quote (tnDedupQuote), each key holding the raw quotes
+  // claimed under it: a fold collision is a duplicate unless the two quotes are
+  // byte-distinct UHB twins (isDistinctTwinTn, #966). OT only — an NT job keeps
+  // an empty source map, so its dedup is the plain fold.
+  const claimedTn = new Map<string, ClaimedTn[]>();
+  const tnSourceWords =
+    tnProposals.length > 0 && !NT_BOOKS.has(job.book)
+      ? await sourceWords()
+      : new Map<number, SourceWord[]>();
   if (tnProposals.length > 0) {
     const live = await env.DB.prepare(
-      `SELECT chapter, verse, occurrence, support_reference, quote, note
+      `SELECT chapter, verse, ref_raw, occurrence, support_reference, quote, note
          FROM tn_rows
         WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND deleted_at IS NULL`,
     )
@@ -983,6 +1058,7 @@ async function applyJobOutput(
       .all<{
         chapter: number;
         verse: number;
+        ref_raw: string | null;
         occurrence: number | null;
         support_reference: string | null;
         quote: string | null;
@@ -1000,9 +1076,11 @@ async function applyJobOutput(
     // occurrence matching. Its Hebrew encoding is folded for the key only
     // (tnDedupQuote), since tnPayload now canonizes proposals to UHB bytes.
     for (const r of live.results ?? []) {
-      claimedTnKeys.add(
-        tnContentKey({ ...r, quote: tnDedupQuote(r.quote), note: r.note ? curlifyText(r.note) : r.note }),
-      );
+      const key = tnContentKey({ ...r, quote: tnDedupQuote(r.quote), note: r.note ? curlifyText(r.note) : r.note });
+      const claim: ClaimedTn = { quote: r.quote, refRaw: r.ref_raw };
+      const list = claimedTn.get(key);
+      if (list) list.push(claim);
+      else claimedTn.set(key, [claim]);
     }
   }
 
@@ -1077,10 +1155,19 @@ async function applyJobOutput(
       quote: tnDedupQuote((payload.quote as string | null | undefined) ?? null),
       note: (payload.note as string | null | undefined) ?? null,
     });
+    const claim: ClaimedTn = {
+      quote: (payload.quote as string | null | undefined) ?? null,
+      refRaw: (payload.ref_raw as string | null | undefined) ?? null,
+    };
+    const claimedUnderKey = claimedTn.get(contentKey);
+    const claimKey = () => {
+      if (claimedUnderKey) claimedUnderKey.push(claim);
+      else claimedTn.set(contentKey, [claim]);
+    };
 
     const expanded = await applyTnHintExpansionIfMatch(env, p, job, userId, actor);
     if (expanded) {
-      claimedTnKeys.add(contentKey);
+      claimKey();
       affected.add(p.chapter);
       result.tnHintExpanded += 1;
       continue;
@@ -1089,8 +1176,9 @@ async function applyJobOutput(
     // note, an expanded hint, or a prior-AI row the sweep somehow missed). Keyed
     // on content, not id, so the fresh id bp-assistant mints each run can't
     // sneak a duplicate past. A genuinely new/changed note has a different key
-    // and still inserts.
-    if (claimedTnKeys.has(contentKey)) {
+    // and still inserts. A fold collision with a byte-distinct UHB twin is not a
+    // duplicate (#966, isDistinctTwinTn).
+    if (claimedUnderKey?.some((c) => !isDistinctTwinTn(p.chapter, p.verse, c, claim, tnSourceWords))) {
       // Resolve the proposal so it doesn't linger as an unreviewed item in the
       // pending-imports review endpoint — the note it proposes already exists,
       // so accepting (without inserting) is the truthful resolution.
@@ -1102,7 +1190,7 @@ async function applyJobOutput(
       result.tnSkippedDup += 1;
       continue;
     }
-    claimedTnKeys.add(contentKey);
+    claimKey();
     const k = verseKey(p);
     const sortOrder = (tnCounters.get(k) ?? tnBases.get(k) ?? 0) + 100;
     tnCounters.set(k, sortOrder);
@@ -1130,7 +1218,7 @@ async function applyJobOutput(
   // question silently. Proposal order is stable (ORDER BY kind, chapter, verse,
   // id), so which proposal wins the shared id is deterministic across re-runs
   // and each keeps landing on the same row. TN has the same idea in
-  // claimedTnKeys, keyed on content rather than id.
+  // claimedTn, keyed on content rather than id.
   const claimedTqIds = new Set<string>();
   for (const p of tqProposals) {
     const k = verseKey(p);
@@ -1153,9 +1241,10 @@ async function applyJobOutput(
   // so each verse's alignment canonize + U+FFFD heal read from memory instead
   // of issuing a per-verse D1 read (a whole-book generate would otherwise blow
   // the ~1000-subrequest budget). Empty map when there are no verse proposals.
+  // The same load staging and the TN dedup above use, so it is never repeated.
   const uhbWordsByVerse =
     verseProposals.length > 0
-      ? await loadUhbSourceWords(env, job)
+      ? await sourceWords()
       : new Map<number, SourceWord[]>();
 
   // #402: same group-boundary rule as the TQ loop above, keyed on verseKey
@@ -1297,7 +1386,7 @@ export async function deleteUnkeptTns(
   // excluded verse's not-yet-deleted prior-run/pristine notes survive (mildly
   // stale) instead of being deleted — consistent with this module's existing
   // philosophy, and strictly better than deleting accepted notes. Content-
-  // dedup (`claimedTnKeys` in applyJobOutput) prevents the remainder inserts
+  // dedup (`claimedTn` in applyJobOutput) prevents the remainder inserts
   // from duplicating whatever survives.
   const resolved = await env.DB.prepare(
     `SELECT DISTINCT chapter, verse FROM pending_imports
