@@ -4,15 +4,16 @@
 // column in stacked, columns, and book modes — these versions are
 // read-only, so we don't have to maintain a contentEditable cursor.
 
-import { useState } from "react";
-import { Tooltip, Box } from "@mui/material";
+import { memo, useMemo } from "react";
+import { Box } from "@mui/material";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
 import type { HighlightKey } from "../lib/highlight";
 import type { TwlRow } from "../sync/api";
 import { roleLineSx, wordHighlightStyles } from "../lib/highlightStyles";
 import { SourceTooltipBody } from "./SourceTooltipBody";
-import { PinnedLexBox } from "./PinnedLexBox";
+import { pinLex, usePinnedLexRefresh } from "./PinnedLexBox";
+import { LexTooltip } from "./LexTooltip";
 import { buildTwHintMap, twHintFromMap } from "./UhbStrip";
 
 interface Props {
@@ -44,14 +45,18 @@ interface Props {
   verseNum?: number;
 }
 
-export function HebrewLine({ verseObjects, lexiconMap, highlights, prevHighlights, nextHighlights, findHighlights, activeFindKey, fallbackText, twl, verseNum }: Props) {
+export const HebrewLine = memo(function HebrewLine({ verseObjects, lexiconMap, highlights, prevHighlights, nextHighlights, findHighlights, activeFindKey, fallbackText, twl, verseNum }: Props) {
+  // Precompute the per-verse orig-word → tw hint lookup once (see buildTwHintMap)
+  // so the token walk is an O(1) Map.get per \w instead of re-splitting every
+  // TWL row's orig_words per token. Memoized on [twl, verseNum] so it isn't
+  // rebuilt (re-splitting + nfc()-normalizing every TWL row) on every render.
+  const twHints = useMemo(
+    () => (twl && verseNum != null ? buildTwHintMap(twl, verseNum) : null),
+    [twl, verseNum],
+  );
   if (!Array.isArray(verseObjects)) {
     return <>{fallbackText ?? ""}</>;
   }
-  // Precompute the per-verse orig-word → tw hint lookup once (see buildTwHintMap)
-  // so the token walk is an O(1) Map.get per \w instead of re-splitting every
-  // TWL row's orig_words per token.
-  const twHints = twl && verseNum != null ? buildTwHintMap(twl, verseNum) : null;
   const items: React.ReactNode[] = [];
   const walk = (nodes: unknown[]) => {
     for (const n of nodes ?? []) {
@@ -107,17 +112,16 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, prevHighlight
   // rtl + isolate span; that's a convention, not a guarantee, so isolation
   // is set here too (#843) rather than relied on from outside.
   return (
-    <Box component="span" dir="rtl" sx={{ unicodeBidi: "isolate" }}>
+    <Box component="span" dir="rtl" data-lex-line sx={{ unicodeBidi: "isolate" }}>
       {items}
     </Box>
   );
-}
+});
 
 // One \w source token: hover shows the lexical Tooltip; double-click pins the
-// same lexical info into an interactive Popover so its text (lemma, gloss,
+// same lexical info into the app's one pinned lexical box (PinnedLexBox) so its text (lemma, gloss,
 // definition) can be selected and copied — the hover Tooltip is
-// pointerEvents:none and can't be. Carried in its own component so the pin
-// state is hooks-legal (HebrewLine builds tokens in a loop).
+// pointerEvents:none and can't be.
 function HebrewWord({
   text,
   src,
@@ -139,12 +143,12 @@ function HebrewWord({
   isPrev: boolean;
   isNext: boolean;
 }) {
-  const [pinAnchor, setPinAnchor] = useState<HTMLElement | null>(null);
+  usePinnedLexRefresh(src, lex);
   return (
     <>
-      <Tooltip
+      <LexTooltip
         title={
-          pinAnchor ? "" : <SourceTooltipBody source={src} lex={lex} twHint={twHint} pinHint />
+          <SourceTooltipBody source={src} lex={lex} twHint={twHint} pinHint />
         }
         enterDelay={0}
         enterNextDelay={0}
@@ -152,7 +156,7 @@ function HebrewWord({
       >
         <Box
           component="span"
-          onDoubleClick={(e) => setPinAnchor(e.currentTarget)}
+          onDoubleClick={() => pinLex(src, lex, twHint)}
           sx={(theme) => {
             const mode = theme.palette.mode;
             const hl = wordHighlightStyles(mode);
@@ -176,16 +180,7 @@ function HebrewWord({
         >
           {text}
         </Box>
-      </Tooltip>
-      {pinAnchor && (
-        <PinnedLexBox
-          anchorEl={pinAnchor}
-          source={src}
-          lex={lex}
-          twHint={twHint}
-          onClose={() => setPinAnchor(null)}
-        />
-      )}
+      </LexTooltip>
     </>
   );
 }

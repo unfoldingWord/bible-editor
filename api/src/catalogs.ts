@@ -62,7 +62,28 @@ function buildDisambiguation(articles: TwArticleLite[]) {
 // the canonical en_tw catalog (tw_articles, migration 0032 + scripts/import-tw.mjs)
 // and fall back to / union with usage-derived links so nothing regresses before
 // the first import and any in-use-but-not-canonical link still autocompletes.
+//
+// The body is memoized at isolate scope for CATALOG_TTL_MS (#886): the usage
+// query scans every twl_rows row, and caches.default is a no-op on
+// *.workers.dev (see noteTemplates.ts). The only tw_articles writer is
+// scripts/import-tw.mjs via `wrangler d1 execute`, which runs outside the
+// Worker, so there is no in-isolate hook to invalidate on; the TTL bounds how
+// long twTitles can lag an import (the export reads tw_articles directly).
+const CATALOG_TTL_MS = 10 * 60 * 1000;
+let memo: { at: number; body: string } | null = null;
+
+function catalogResponse(body: string) {
+  return new Response(body, {
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "private, max-age=300",
+    },
+  });
+}
+
 catalogs.get("/", async (c) => {
+  if (memo && Date.now() - memo.at < CATALOG_TTL_MS) return catalogResponse(memo.body);
+
   // Canonical en_tw articles (empty until the first import). id + title also
   // feed the disambiguation groups below.
   const canonical = await c.env.DB.prepare(
@@ -111,11 +132,13 @@ catalogs.get("/", async (c) => {
     if (r.value && r.title) twTitles[r.value] = r.title;
   }
 
-  return c.json({
+  const body = JSON.stringify({
     supportReferences: TA_SUPPORT_REFERENCES,
     twLinks,
     twTitles,
     disambiguationGroups: disambiguation.groups,
     disambiguationIndex: disambiguation.index,
   });
+  memo = { at: Date.now(), body };
+  return catalogResponse(body);
 });

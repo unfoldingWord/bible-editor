@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { dismissAlert, fetchAlerts, type SystemAlert } from "../sync/api";
+import { createRefocusThrottle } from "../sync/refocusThrottle";
 
 // Alerts for the current user: comment mentions/replies (top-right bell) and
 // sync warnings (collapsed indicator). Fetches on mount (gated by auth-ready
@@ -13,6 +14,11 @@ import { dismissAlert, fetchAlerts, type SystemAlert } from "../sync/api";
 // stops being cheap. Callers can also `refresh()` on a comment event so an
 // in-chapter reply reaches the bell immediately.
 const POLL_MS = 30_000;
+
+// A tab refocus refetches only when no fetch has succeeded in this window, so
+// a burst of alt-tabs gives one request (#897). The POLL_MS interval is not
+// throttled.
+const refocusThrottle = createRefocusThrottle(60_000);
 
 // Alerts created more than this long before the first load are never "fresh",
 // even if the first load did not list them (a 401 on that fetch comes back as
@@ -55,8 +61,12 @@ export function useAlerts(authReady: boolean): {
   const refresh = useCallback(async () => {
     const seq = ++seqRef.current;
     try {
-      const list = await fetchAlerts();
+      const fetched = await fetchAlerts();
       if (seq !== seqRef.current) return;
+      // A 401 comes back as null and is treated as an empty list, as before,
+      // but it is not a real answer, so it does not hold off the next refocus.
+      if (fetched) refocusThrottle.markSuccess();
+      const list = fetched ?? [];
       const known = knownIdsRef.current;
       if (known) {
         const cutoff = firstLoadAtRef.current - FRESH_SKEW_S;
@@ -95,7 +105,7 @@ export function useAlerts(authReady: boolean): {
     }
     void refresh();
     const onVis = () => {
-      if (document.visibilityState === "visible") void refresh();
+      if (document.visibilityState === "visible" && refocusThrottle.shouldRun()) void refresh();
     };
     document.addEventListener("visibilitychange", onVis);
     const timer = window.setInterval(() => {

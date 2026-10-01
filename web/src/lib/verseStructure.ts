@@ -40,7 +40,7 @@
 // the server payload carries none, and after a refetch the verse map itself
 // is authoritative again.
 
-import type { ChapterPayload, VerseDto } from "../sync/api";
+import type { ChapterPayload, RowKind, TnRow, TqRow, TwlRow, VerseDto, VerseStatus } from "../sync/api";
 
 export interface VerseLike {
   verse: number;
@@ -93,6 +93,32 @@ export function reduceVerses(
  * would overwrite the newer row its own PATCH just produced. The tab's
  * optimistic content is protected by `mergeRefetched` instead (equal version
  * keeps the local row), so force steps are simply not recorded.
+ *
+ * The remaining arms are the chapter's non-verse state (#974). The merge
+ * takes tn / tq / twl membership and verse statuses from the fetch, so without
+ * replay a row created while the GET was in flight vanished, one deleted in
+ * that window came back, and a done toggle was reverted on screen. They are
+ * recorded by useChapter for replay only (the live update stays in its own
+ * updaters), and the rule is: a replayed step never overrides the fetched
+ * snapshot unless it is provably newer than it.
+ *   - `rowInsert` / `rowReplace` over a row the fetch already has apply only
+ *     when STRICTLY newer by version. Same-version server changes (preserve /
+ *     hint / trash toggles, reorder-only sort_order) cannot be ordered against
+ *     the snapshot, so the fetch wins; a same-version toggle made during the
+ *     window can still be reverted on screen, as before #974. `rowInsert` adds
+ *     a row the fetch lacks; `rowReplace` never does (a row the server deleted
+ *     must not be resurrected by an older event). A row of another chapter (a
+ *     late createRow response after navigation) is never inserted. Row ids are
+ *     never reused, so `rowDelete` is final. An optimistic
+ *     `applyLocalRowPatch` is not recorded (like a forced verse edit).
+ *   - `verseStatus` carries the server's `updated_at` and applies only when
+ *     strictly newer than the fetched entry, or when the fetch has no entry
+ *     for a verse that still has a row (statuses are only ever deleted by a
+ *     bridge, which removes the row too). Only server-stamped statuses are
+ *     recorded; a status equal-to-the-second loses to the fetch.
+ *   - Lane checks and TWL order locks are NOT replayed: an unchecked lane or a
+ *     cleared lock leaves no timestamp, so a delayed event cannot be proven
+ *     newer than the snapshot. The fetch wins for them, as before #974.
  */
 export type StructureStep =
   | {
@@ -105,7 +131,18 @@ export type StructureStep =
       absorbedVerses: number[];
     }
   | { type: "split"; bibleVersion: string; start: VerseDto; newVerses: VerseDto[] }
-  | { type: "updated"; bibleVersion: string; verse: VerseDto };
+  | { type: "updated"; bibleVersion: string; verse: VerseDto }
+  | { type: "rowInsert"; kind: RowKind; row: ChapterRow; afterId?: string }
+  | { type: "rowReplace"; kind: RowKind; row: ChapterRow }
+  | { type: "rowDelete"; kind: RowKind; id: string }
+  | { type: "verseStatus"; verse: number; done: boolean; updatedAt: number };
+
+type ChapterRow = TnRow | TqRow | TwlRow;
+
+/** Verse structure steps; the rest are chapter data steps (rows, statuses). */
+export function isStructureStep(step: StructureStep): boolean {
+  return step.type === "bridged" || step.type === "split" || step.type === "updated";
+}
 
 /**
  * Apply one `StructureStep` to a chapter payload. Returns `prev` itself when
@@ -147,7 +184,49 @@ export function applyStep(prev: ChapterData, step: StructureStep): ChapterData {
         verseLaneChecks: next.verseLaneChecks.filter((c) => !absorbed.has(c.verse)),
       };
     }
+    case "rowInsert":
+    case "rowReplace": {
+      if (step.row.book !== prev.book || step.row.chapter !== prev.chapter) return prev;
+      const list = prev[step.kind] as ChapterRow[];
+      const idx = list.findIndex((r) => r.id === step.row.id);
+      if (idx >= 0) {
+        if (step.row.version <= list[idx].version) return prev;
+        const next = list.slice();
+        next[idx] = step.row;
+        return { ...prev, [step.kind]: next };
+      }
+      if (step.type === "rowReplace") return prev;
+      const after = step.afterId ? list.findIndex((r) => r.id === step.afterId) : -1;
+      const next = after >= 0 ? [...list.slice(0, after + 1), step.row, ...list.slice(after + 1)] : [...list, step.row];
+      return { ...prev, [step.kind]: next };
+    }
+    case "rowDelete": {
+      const list = prev[step.kind] as ChapterRow[];
+      if (!list.some((r) => r.id === step.id)) return prev;
+      return { ...prev, [step.kind]: list.filter((r) => r.id !== step.id) };
+    }
+    case "verseStatus": {
+      const existing = prev.verseStatuses.find((s) => s.verse === step.verse);
+      if (existing ? step.updatedAt <= existing.updated_at : !verseHasRow(prev, step.verse)) return prev;
+      const updated: VerseStatus = {
+        book: prev.book,
+        chapter: prev.chapter,
+        verse: step.verse,
+        done: step.done ? 1 : 0,
+        updated_at: step.updatedAt,
+      };
+      const verseStatuses = existing
+        ? prev.verseStatuses.map((s) => (s === existing ? updated : s))
+        : [...prev.verseStatuses, updated];
+      return { ...prev, verseStatuses };
+    }
   }
+}
+
+// A verse number that is a row key in some bible_version (not absorbed into
+// another verse's bridge).
+function verseHasRow(data: ChapterData, verse: number): boolean {
+  return Object.values(data.verses).some((rows) => rows[verse] != null);
 }
 
 /**
@@ -189,7 +268,9 @@ export function replaySteps(state: ChapterData, steps: readonly StructureStep[])
  * RULES (per bible_version, per verse):
  *   - Start from `fetched`: a verse the server no longer has is dropped (the
  *     whole point of the reconnect refetch — a missed verse.bridged must not
- *     leave a phantom) and rows / statuses / locks are the fetched ones.
+ *     leave a phantom) and statuses / lane checks / locks (unversioned) are
+ *     the fetched ones (provably newer row / status changes from the GET's
+ *     window are replayed, #974; lane checks and locks are not).
  *   - A verse present in both keeps the LOCAL row when
  *     `local.version >= fetched.version`: equal means identical or an
  *     optimistic same-version edit whose PATCH is pending; higher means the
@@ -197,13 +278,21 @@ export function replaySteps(state: ChapterData, steps: readonly StructureStep[])
  *   - A fetched row at or below a tombstone this tab holds is the deleted row
  *     seen through a stale read (same clock argument as `applyUpdated`) and is
  *     dropped rather than resurrected.
+ *   - tn / tq / twl rows keep the local row only when it is STRICTLY newer
+ *     (`mergeRowList`): with the first-open merge deferred behind the mount
+ *     GET (#902) the chapter is editable while the merging GET is in flight,
+ *     so a row PATCH's 200 can beat the GET's older body. Equal version takes
+ *     the fetched row, unlike verses, because several server paths change a
+ *     row without bumping its version (see `mergeRowList`). Rows have no
+ *     tombstone: a row created or deleted after the GET's snapshot is put
+ *     right by the replayed `rowInsert` / `rowDelete` step (#974).
  *   - Tombstones are cleared: the merged map is authoritative again, exactly
  *     as after a plain refetch.
  *   - The merge can only judge verses the snapshot contains. Events that
  *     arrived while the GET was in flight are re-applied over the result by
  *     `replaySteps` (see there for the mid-GET split this covers).
  *
- * Returns `fetched` itself when no local row is kept (a null `prev`, or one
+ * Returns `fetched` itself when no local verse or row is kept (a null `prev`, or one
  * for another chapter, is a plain replace) — the refetch caller always wants
  * the fresh non-verse data, so identity-with-`prev` is never the right no-op.
  */
@@ -233,7 +322,34 @@ export function mergeRefetched(prev: ChapterData | null, fetched: ChapterPayload
       verses[bibleVersion] = rows;
     }
   }
-  return verses ? { ...fetched, verses } : fetched;
+  const tn = mergeRowList(prev.tn, fetched.tn);
+  const tq = mergeRowList(prev.tq, fetched.tq);
+  const twl = mergeRowList(prev.twl, fetched.twl);
+  if (!verses && tn === fetched.tn && tq === fetched.tq && twl === fetched.twl) return fetched;
+  return { ...fetched, verses: verses ?? fetched.verses, tn, tq, twl };
+}
+
+// tn / tq / twl rows: a row present in both keeps the local object only when
+// `local.version > incoming.version` — the tab's own PATCH landed (the outbox
+// 200 replaced the row with the server's newer copy) and the GET is stale.
+// Equal version takes the fetched row, as a plain replace always did: tn
+// trash/restore, preserve/hint toggles, the reorder-only sort_order path, the
+// review-flag clear (api/src/rows.ts) and nightly TWL order canonicalization
+// (api/src/twlSortOrderApply.ts) change a row without bumping its version, so
+// at equal version the fetched row may carry changes the tab lacks (the same
+// carve-out as components/rowUpsertGuard.ts, #671). This makes the merge
+// never worse than a plain replace. Fetched order and membership win: a row
+// the server no longer has is dropped, and a local-only row is not kept (row
+// events from the GET's window are replayed over this by `replaySteps`).
+// Returns `fetched` itself when nothing local is kept.
+function mergeRowList<R extends { id: string; version: number }>(local: readonly R[], fetched: R[]): R[] {
+  const byId = new Map(local.map((r) => [r.id, r]));
+  let out: R[] | undefined;
+  fetched.forEach((incoming, i) => {
+    const mine = byId.get(incoming.id);
+    if (mine && mine !== incoming && mine.version > incoming.version) (out ??= fetched.slice())[i] = mine;
+  });
+  return out ?? fetched;
 }
 
 /** bible_version → verse number → version the row had when it was deleted. */

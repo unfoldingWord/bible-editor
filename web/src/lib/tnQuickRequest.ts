@@ -23,13 +23,15 @@
 // chapter edges).
 
 import type { ChapterPayload, TnRow, TnQuickRequest, VerseDto } from "../sync/api";
+import { canonizeQuote, type SourceWord } from "./canonizeQuote.ts";
 import {
   extractTargetSelectionText,
   findSourceForTargetText,
-} from "./highlight";
-import { shortSupport } from "./supportReference";
-import { extractPlainText } from "./usfm";
-import { buildVerseIndex } from "./verseRange";
+  nodeIsWord,
+} from "./highlight.ts";
+import { shortSupport } from "./supportReference.ts";
+import { extractPlainText } from "./usfm.ts";
+import { bridgeNoteAnchor, buildVerseIndex, noteCoveredVerses } from "./verseRange.ts";
 
 const CONTEXT_WINDOW = 5;
 const HEBREW_GAP = /[&…]+|\.{3}/g;
@@ -57,6 +59,27 @@ function verseObjectsOf(v: VerseDto | undefined): unknown[] | null {
   if (!v) return null;
   const vo = (v.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   return Array.isArray(vo) ? vo : null;
+}
+
+// Every UHB `\w` in the verse (descending through milestones), as the
+// SourceWord shape canonizeQuote keys on.
+function sourceWordsOf(nodes: unknown[]): SourceWord[] {
+  const out: SourceWord[] = [];
+  for (const n of nodes) {
+    const o = n as Record<string, unknown> | null;
+    if (!o || typeof o !== "object") continue;
+    if (nodeIsWord(o)) {
+      out.push({
+        text: String(o["text"] ?? ""),
+        strong: String(o["strong"] ?? ""),
+        lemma: String(o["lemma"] ?? ""),
+        morph: String(o["morph"] ?? ""),
+      });
+    } else if (Array.isArray(o["children"])) {
+      out.push(...sourceWordsOf(o["children"] as unknown[]));
+    }
+  }
+  return out;
 }
 
 function gatherContext(
@@ -124,8 +147,17 @@ export function buildTnQuickRequest(
   // UHB/UGNT verse for OL-anchoring the selection lookups — without it,
   // extractTargetSelectionText permanently degrades to GL-only matching
   // even though the source is already in the payload.
-  const sourceVo =
-    verseObjectsOf(buildVerseIndex(data.verses.UHB ?? data.verses.UGNT)[row.verse]) ?? undefined;
+  const sourceByVerse = data.verses.UHB ?? data.verses.UGNT;
+  const sourceVo = verseObjectsOf(buildVerseIndex(sourceByVerse)[row.verse]) ?? undefined;
+  // A bridged ULT/UST row numbered across its span joins on the whole
+  // bridge's source with a shifted occurrence (#968); anything else keeps
+  // the note's own verse and occurrence.
+  const selectionFor = (target: VerseDto | undefined, vo: unknown[], quote: string, occurrence: number): string => {
+    const anchor = bridgeNoteAnchor(sourceByVerse, target, row.verse, quote, occurrence);
+    return anchor
+      ? extractTargetSelectionText(vo, quote, anchor.occurrence, verseObjectsOf(anchor.source) ?? undefined)
+      : extractTargetSelectionText(vo, quote, occurrence, sourceVo);
+  };
 
   let ultSelection: string;
   let ustSelection: string;
@@ -137,12 +169,8 @@ export function buildTnQuickRequest(
     // that drives highlighting.
     const occurrence = row.occurrence ?? 1;
     hebrewGuess = cleanHebrew(rawQuote);
-    ultSelection =
-      (ultVo && extractTargetSelectionText(ultVo, rawQuote, occurrence, sourceVo)) ||
-      ultText.slice(0, 500);
-    ustSelection =
-      (ustVo && extractTargetSelectionText(ustVo, rawQuote, occurrence, sourceVo)) ||
-      ustText.slice(0, 500);
+    ultSelection = (ultVo && selectionFor(ultVerse, ultVo, rawQuote, occurrence)) || ultText.slice(0, 500);
+    ustSelection = (ustVo && selectionFor(ustVerse, ustVo, rawQuote, occurrence)) || ustText.slice(0, 500);
   } else {
     // English path: user typed English from ULT. The English IS the
     // ULT selection; look it up against ULT alignment for the Hebrew
@@ -160,6 +188,18 @@ export function buildTnQuickRequest(
       (ustVo && extractTargetSelectionText(ustVo, derivedHebrew, 1, sourceVo)) ||
       ustText.slice(0, 500);
   }
+
+  // The bp-assistant validator compares hebrewGuess to the UHB byte-for-byte
+  // (no NFC), so an NFC-ordered word would be silently dropped. Rewrite each
+  // word to the UHB's exact bytes (issue #959). Request-only: nothing stored
+  // changes. No UHB words (NT book) → canonizeQuote returns it unchanged. The
+  // validator checks the leading verse only, so a bridged row matches that
+  // verse on the exact tier alone (strict): a consonant-only match could turn
+  // a later verse's word into a leading-verse look-alike.
+  const uhbVo = verseObjectsOf(buildVerseIndex(data.verses.UHB)[row.verse]);
+  hebrewGuess = canonizeQuote(hebrewGuess, uhbVo ? sourceWordsOf(uhbVo) : [], {
+    strict: noteCoveredVerses(row).length > 1,
+  });
 
   const ultCtx = gatherContext(ultByVerse, row.verse);
   const ustCtx = gatherContext(ustByVerse, row.verse);

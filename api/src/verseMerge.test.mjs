@@ -647,6 +647,70 @@ console.log("\n[verseContentConverged: unparseable input is never converged]");
   );
 }
 
+console.log("\n[locked book: Door43 master is authoritative]");
+{
+  // ZEC 1:17 ULT, 2026-09-18 through 09-24: ZEC locked, the export skipped,
+  // the ancestor stuck at the pre-lock v6, and every Door43 commit read as
+  // both-changed against Rich's last app edit.
+  const base = text("“Again, call out");
+  const ours = text("Again, call out");
+  const theirs = content([{ type: "text", text: "Again, call out" }, { tag: "ts\\*", nextChar: "\n" }]);
+  const lockedIn = { base, ours, theirs, humanEditedSinceExport: true, masterAuthoritative: true };
+
+  const first = computeVerseMerge(lockedIn);
+  eq(first.action, "adopt_conflict", "locked, D1 holds an app edit master may lack → master wins, flagged for the visible-change refinement");
+  eq(first.adopt, true, "…and it is adopted");
+
+  const clean = computeVerseMerge({ ...lockedIn, ours: base, humanEditedSinceExport: false });
+  eq(clean.action, "adopt", "locked, D1 unmoved since the ancestor → clean adopt");
+  eq(clean.conflict, false, "…no human review asked");
+  eq(clean.reason, "book_locked", "…reason names the lock");
+  eq(
+    computeVerseMerge({ ...lockedIn, ours: base }).action,
+    "adopt_conflict",
+    "locked, D1 back at the ancestor but a human edited since the export → flagged, like step 5",
+  );
+  eq(
+    computeVerseMerge({ ...lockedIn, masterMayHoldHumanEdit: false }).action,
+    "adopt_conflict",
+    "locked: the AI-lineage keep does not apply — D1 would only be exported back over master on unlock",
+  );
+
+  const aligned = content([zaln("H1", [w("Again")]), { type: "text", text: " " }, zaln("H2", [w("call")])]);
+  const flattened = text("Again call");
+  eq(
+    computeVerseMerge({ base: aligned, ours: aligned, theirs: flattened, humanEditedSinceExport: false, masterAuthoritative: true }).action,
+    "adopt",
+    "locked: master wins even when it carries less alignment",
+  );
+
+  eq(
+    computeVerseMerge({ ...lockedIn, theirs: base }).action,
+    "keep_master_unchanged",
+    "locked: a verse master never moved keeps D1 (an unlock-fix-relock fix not yet on master)",
+  );
+  eq(
+    computeVerseMerge({ ...lockedIn, base: null }).action,
+    "keep_no_base",
+    "locked: no ancestor → cannot prove master moved → keep D1",
+  );
+  eq(
+    computeVerseMerge({ ...lockedIn, theirs: ours }).action,
+    "keep_converged",
+    "locked: identical content still writes nothing",
+  );
+  eq(
+    computeVerseMerge({ ...lockedIn, ours: base, humanEditedSinceExport: false, theirsForAlignment: "{not json" }).action,
+    "keep_alignment_refused",
+    "locked: a split-bridge anchor keeps the ordinary structure-aware path (#949)",
+  );
+  eq(
+    computeVerseMerge({ ...lockedIn, theirs: "{not json" }).action,
+    "keep_alignment_refused",
+    "locked: unparseable master is never adopted",
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

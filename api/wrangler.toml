@@ -30,7 +30,10 @@ not_found_handling = "single-page-application"
 # swallowed by the SPA fallback and never hit the Worker — which breaks the
 # OAuth start redirect (Sign in with Door43 → 200 index.html instead of 302
 # to git.door43.org). Force the Worker to run first for /api/* paths.
-run_worker_first = ["/api/*"]
+# /assets/* also runs the Worker first so a missing hashed chunk gets a real,
+# uncacheable 404 instead of index.html under the immutable header (#916;
+# not_found_handling is global, so this can't be set per path).
+run_worker_first = ["/api/*", "/assets/*"]
 
 [[d1_databases]]
 binding = "DB"
@@ -108,7 +111,7 @@ account_id = "5a3ffd86280d3ed086be76d955829242"
 directory = "../web/dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-run_worker_first = ["/api/*"]
+run_worker_first = ["/api/*", "/assets/*"]
 
 [[env.production.d1_databases]]
 binding = "DB"
