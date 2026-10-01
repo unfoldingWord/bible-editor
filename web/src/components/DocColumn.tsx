@@ -355,6 +355,8 @@ export function DocColumn({
         />
       </Stack>
       <Box
+        // The hover lexical box opens beside the whole UHB column (#1055).
+        data-lex-region={rtl ? "" : undefined}
         sx={(theme) => ({
           flex: 1,
           overflowY: "auto",

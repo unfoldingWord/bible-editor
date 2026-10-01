@@ -68,6 +68,7 @@ import {
   type StreamWord,
 } from "../lib/alignmentSuggest";
 import { SourceTooltipBody } from "./SourceTooltipBody";
+import { LexTooltip } from "./LexTooltip";
 import { UhbStrip, buildTwHintMap, twHintFromMap } from "./UhbStrip";
 import { directionForVersion } from "../lib/direction";
 import {
@@ -1092,6 +1093,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
               chapter={chapter}
               verseNum={verseNum}
               bibleVersion={bibleVersion}
+              verseEnd={verse.verse_end ?? null}
               currentVersion={verse.version}
               canRestore={!locked}
               onClose={() => setHistoryOpen(false)}
@@ -1790,6 +1792,7 @@ function DropTargetCard({
   const showOver = over && !isMergeTarget && !isBeingDragged;
   return (
     <Paper
+      data-lex-region
       elevation={0}
       onDragOver={(e) => {
         e.preventDefault();
@@ -1931,7 +1934,7 @@ function SourceWordTypography({
   const tone = hctx.hebrewHighlight(pos, groupId);
   const showInfo = hctx.showSourceInfo;
   return (
-    <Tooltip
+    <LexTooltip
       enterDelay={0}
       enterNextDelay={0}
       title={
@@ -2055,7 +2058,7 @@ function SourceWordTypography({
           </Box>
         )}
       </Box>
-    </Tooltip>
+    </LexTooltip>
   );
 }
 
