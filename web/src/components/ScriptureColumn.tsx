@@ -1551,8 +1551,8 @@ function ActiveLine({
   // marks a `\v a-b` range so the split button knows when to show; hasNextVerse
   // gates the merge button off the chapter's last verse. Both callbacks absent
   // for viewers / other versions ⇒ no bridge buttons. verseEnd is also passed
-  // for ULT (buttons stay gated on the callbacks) so the history dialog's USFM
-  // view can label a range row `\v a-b`.
+  // for ULT (buttons stay gated on the callbacks) so the history dialog's
+  // header can label a range row `a-b`.
   verseEnd?: number | null;
   hasNextVerse?: boolean;
   onMergeBridge?: (verse: number) => void;

@@ -47,12 +47,13 @@ const text = (r) => (r.kind === "usfm" ? r.text : null);
   assert(out.includes("Introduction text"), "verse 0 (front matter) renders its own text");
 }
 
-// ── 4. A bridged row renders `\v N-M`, matching exportUsfm's "N-M" key.
+// ── 4. Every version renders `\v N`, never a bridge range. History entries
+//       don't record their own verse_end, and the live row's range applied to
+//       older versions showed a `\v 6-9` they never had (Codex review, #951).
 {
   const vo = { verseObjects: [{ type: "text", text: "Bridged text." }] };
-  assert(text(renderVerseUsfm(vo, 2, 6, 9)).startsWith("\\v 6-9"), "verse_end > verse renders \\v 6-9");
-  assert(text(renderVerseUsfm(vo, 2, 6, 6)).startsWith("\\v 6 "), "verse_end == verse renders \\v 6");
-  assert(text(renderVerseUsfm(vo, 2, 6, null)).startsWith("\\v 6 "), "null verse_end renders \\v 6");
+  assert(text(renderVerseUsfm(vo, 2, 6)).startsWith("\\v 6 "), "renders \\v 6");
+  assert(text(renderVerseUsfm(vo, 2, 6, 9)).startsWith("\\v 6 "), "a stray verse_end argument is ignored: still \\v 6, not \\v 6-9");
 }
 
 // ── 5. No stored tree -> kind "none" (plain_text-only history entry).
@@ -107,8 +108,8 @@ const text = (r) => (r.kind === "usfm" ? r.text : null);
   const r = renderVerseUsfm(content, 1, 1);
   assert(r.kind === "usfm", "the #932 fixture renders");
   assert(JSON.stringify(content) === JSON.stringify(before), "renderVerseUsfm does not mutate the input content");
-  renderVerseUsfm(content, 1, 1, 3);
-  assert(JSON.stringify(content) === JSON.stringify(before), "second (bridged) render does not mutate either");
+  renderVerseUsfm(content, 1, 1);
+  assert(JSON.stringify(content) === JSON.stringify(before), "a second render does not mutate either");
 }
 
 // ── 8. stripAlignmentNoise removes \zaln milestones and \w attributes, keeps
@@ -140,6 +141,21 @@ const text = (r) => (r.kind === "usfm" ? r.text : null);
   assert(classifyHiddenChange(null, null, ok(zalnA), ok(withP)) === null, "missing plain text -> no chip");
   assert(classifyHiddenChange("a", "a", { kind: "none" }, ok(withP)) === null, "predecessor without a tree -> no chip");
   assert(classifyHiddenChange("a", "a", ok(zalnA), { kind: "error" }) === null, "unrenderable version -> no chip");
+}
+
+// ── 10. First alignment of bare text is "alignment", not "markers" (Cursor
+//        review, #951). Aligning wraps each word in \w and, with
+//        forcedNewLines, puts the words on separate lines; stripping the
+//        attributes alone leaves those \w wrappers and newlines behind. Rendered
+//        through usfm-js so the whitespace is what the dialog really compares.
+{
+  const bare = toJSON(`\\c 1\n\\v 17 Cities will overflow.`);
+  const aligned = toJSON(`\\c 1\n\\v 17 \\zaln-s |x-strong="H1"\\*\\w Cities|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\* \\zaln-s |x-strong="H2"\\*\\w will|x-occurrence="1" x-occurrences="1"\\w* \\w overflow|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*.`);
+  const alignedP = toJSON(`\\c 1\n\\v 17 \\zaln-s |x-strong="H1"\\*\\w Cities|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\* \\w will|x-occurrence="1" x-occurrences="1"\\w* \\w overflow|x-occurrence="1" x-occurrences="1"\\w*.\n\\p`);
+  const r = (p) => renderVerseUsfm(p.chapters["1"]["17"], 1, 17);
+  assert(classifyHiddenChange("x", "x", r(bare), r(aligned)) === "alignment", "bare text -> first alignment is alignment only");
+  assert(classifyHiddenChange("x", "x", r(aligned), r(bare)) === "alignment", "alignment removed entirely is alignment only");
+  assert(classifyHiddenChange("x", "x", r(bare), r(alignedP)) === "markers", "first alignment plus an added \\p is still markers");
 }
 
 if (failed > 0) {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Dialog,
   DialogTitle,
@@ -34,9 +34,9 @@ interface Props {
   book: string;
   chapter: number;
   verseNum: number;
-  // Inclusive end of a bridged row (`\v 6-9`), so the USFM view renders the
-  // same `\v` label export does. Taken from the live row and applied to every
-  // version, since history entries don't carry their own verse_end.
+  // Inclusive end of the live row's bridge (`\v 6-9`), for the header label
+  // only. History entries don't record their own verse_end, so the USFM view
+  // renders every version as `\v N` rather than borrow the live row's range.
   verseEnd?: number | null;
   bibleVersion: string;
   // The live row.version — what the chip shows and what the timeline marks
@@ -103,6 +103,9 @@ export function VerseHistoryDialog({
   // Off by default: Strong's / morph / occurrence attributes would swamp the
   // marker changes this view exists to show.
   const [showAlignment, setShowAlignment] = useState(false);
+  // Set when a load picks the version to open on, so that pick takes the same
+  // chip path a click does (effect below, once the chips are computed).
+  const autoSelectedRef = useRef(false);
 
   useEffect(() => {
     if (!open) return;
@@ -123,6 +126,7 @@ export function VerseHistoryDialog({
           desc.find((v) => !v.current) ??
           desc[0];
         setSelectedVersion(target?.version ?? null);
+        autoSelectedRef.current = true;
         setLoading(false);
       })
       .catch((e) => {
@@ -154,9 +158,9 @@ export function VerseHistoryDialog({
   // entries' `content` (what "Switch to vN" re-saves) is never modified.
   const usfmByVersion = useMemo(() => {
     const map = new Map<number, VerseUsfm>();
-    for (const e of entries) map.set(e.version, renderVerseUsfm(e.content, chapter, verseNum, verseEnd));
+    for (const e of entries) map.set(e.version, renderVerseUsfm(e.content, chapter, verseNum));
     return map;
-  }, [entries, chapter, verseNum, verseEnd]);
+  }, [entries, chapter, verseNum]);
 
   // The next-older version of each version (`ordered` is newest first).
   const predecessorOf = useMemo(() => {
@@ -181,6 +185,27 @@ export function VerseHistoryDialog({
     }
     return map;
   }, [ordered, predecessorOf, usfmByVersion]);
+
+  // Select a version. A chip row's change is only visible in the USFM view
+  // against its predecessor, so open that directly, with attributes shown for
+  // an alignment change and hidden for a marker change.
+  const selectVersion = (version: number) => {
+    setSelectedVersion(version);
+    const kind = hiddenChangeOf.get(version);
+    if (kind) {
+      setViewMode("usfm");
+      setUsfmBase("previous");
+      setShowAlignment(kind === "alignment");
+    }
+  };
+
+  // The version a load opens on gets the same treatment as a click.
+  useEffect(() => {
+    if (!autoSelectedRef.current || selectedVersion == null) return;
+    autoSelectedRef.current = false;
+    selectVersion(selectedVersion);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once per load, after hiddenChangeOf reflects it
+  }, [hiddenChangeOf, selectedVersion]);
 
   const isCurrent = !!selected?.current;
   const canDiff = !isCurrent && selected !== null && current !== null;
@@ -210,7 +235,7 @@ export function VerseHistoryDialog({
             Verse history
           </Typography>
           <Chip
-            label={`${bibleVersion} ${chapter}:${verseNum}`}
+            label={`${bibleVersion} ${chapter}:${verseNum}${verseEnd != null && verseEnd > verseNum ? `-${verseEnd}` : ""}`}
             size="small"
             variant="outlined"
             sx={{ fontFamily: "monospace", height: 22 }}
@@ -248,17 +273,7 @@ export function VerseHistoryDialog({
                     <ListItemButton
                       key={e.version}
                       selected={e.version === selectedVersion}
-                      onClick={() => {
-                        setSelectedVersion(e.version);
-                        // A chip row's change is only visible in the USFM view
-                        // against its predecessor; open that directly.
-                        const kind = hiddenChangeOf.get(e.version);
-                        if (kind) {
-                          setViewMode("usfm");
-                          setUsfmBase("previous");
-                          if (kind === "alignment") setShowAlignment(true);
-                        }
-                      }}
+                      onClick={() => selectVersion(e.version)}
                     >
                       <ListItemText
                         primary={

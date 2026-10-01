@@ -14,22 +14,14 @@ export type VerseUsfm =
   | { kind: "none" }
   | { kind: "error" };
 
-// Render a single verse to USFM, starting at its `\v` marker. `verseEnd` >
-// `verseNum` renders a bridge (`\v 6-9`), matching exportUsfm's "N-M" key.
-export function renderVerseUsfm(
-  content: unknown,
-  chapter: number,
-  verseNum: number,
-  verseEnd?: number | null,
-): VerseUsfm {
+// Render a single verse to USFM, starting at its `\v N` marker. Always `\v N`,
+// even for a bridged row: history entries don't record their own verse_end,
+// and labelling every version with the live row's range showed older versions
+// a `\v 6-9` (or `\v 6`) they never had (#951 review).
+export function renderVerseUsfm(content: unknown, chapter: number, verseNum: number): VerseUsfm {
   const verseObjects = (content as { verseObjects?: unknown } | null)?.verseObjects;
   if (!Array.isArray(verseObjects) || verseObjects.length === 0) return { kind: "none" };
-  const verseKey =
-    verseNum === 0
-      ? "front"
-      : verseEnd != null && verseEnd > verseNum
-        ? `${verseNum}-${verseEnd}`
-        : String(verseNum);
+  const verseKey = verseNum === 0 ? "front" : String(verseNum);
   try {
     // Clone first: usfm.toUSFM edits the nodes it is given in place (trims a
     // paragraph's trailing whitespace, strips text/type off a whitespace node
@@ -62,10 +54,22 @@ export function stripAlignmentNoise(usfmText: string): string {
     .replace(WORD_ATTRS_RE, (_m, word: string) => `\\w ${word.trimEnd()}\\w*`);
 }
 
+// `\w text\w*` left by stripAlignmentNoise, unwrapped to its text.
+const BARE_WORD_RE = /\\w ([^\\]*?)\\w\*/g;
+
+// Text and non-alignment markers only, for classifying a change. Beyond
+// stripAlignmentNoise this unwraps `\w` and collapses whitespace: aligning bare
+// text wraps each word in `\w` and (with forcedNewLines) breaks the words onto
+// separate lines, which is alignment, not a marker change.
+function markerSkeleton(usfmText: string): string {
+  return stripAlignmentNoise(usfmText).replace(BARE_WORD_RE, "$1").replace(/\s+/g, " ").trim();
+}
+
 // What a version changed that plain text can't show, relative to its
-// predecessor. "markers": the USFM differs even with alignment attributes
-// hidden (a `\p`, `\q1`, `\ts\*`). "alignment": only the attributes /
-// milestones differ, so the reader must turn attributes on to see it.
+// predecessor. "markers": a non-alignment marker differs (a `\p`, `\q1`,
+// `\ts\*`). "alignment": only `\zaln` milestones, `\w` wrappers / attributes,
+// or the whitespace between aligned words differ, so the reader must turn
+// attributes on to see it.
 // null: plain text changed, is missing, or either side has no USFM.
 export function classifyHiddenChange(
   prevPlain: string | null,
@@ -76,5 +80,5 @@ export function classifyHiddenChange(
   if (prevPlain == null || plain == null || prevPlain !== plain) return null;
   if (prevUsfm.kind !== "usfm" || usfmNow.kind !== "usfm") return null;
   if (prevUsfm.text === usfmNow.text) return null;
-  return stripAlignmentNoise(prevUsfm.text) !== stripAlignmentNoise(usfmNow.text) ? "markers" : "alignment";
+  return markerSkeleton(prevUsfm.text) !== markerSkeleton(usfmNow.text) ? "markers" : "alignment";
 }
