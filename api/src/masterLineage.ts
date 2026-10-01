@@ -827,14 +827,40 @@ export interface MasterLineageSummary {
   humanRefs?: string[];
   /** Why the narrowing did not complete, for the log. Empty when it did. */
   refsReason?: string;
+  /**
+   * Issue #1005: the export PR numbers that `ours` commits in this window name
+   * in their subject (`… (#N)`), newest first, capped at LINEAGE_OURS_PR_CAP.
+   * This is how a consumer asks "did the publish recorded as
+   * book_resource_syncs.pushed_pr_number land on master inside this window"
+   * without carrying whole commits. ABSENT on every summary built before #1005
+   * shipped; a reader must treat absent (or a number not listed) as "not
+   * shown", never as proof either way.
+   */
+  oursPrNumbers?: number[];
 }
+
+// How many `ours` PR numbers a summary carries (#1005). Newest first, so the
+// render we pushed most recently is the one kept; a window with more of our own
+// publishes than this simply fails to show an older one, which reads as "not
+// shown" — the fail-closed answer.
+export const LINEAGE_OURS_PR_CAP = 20;
 
 export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
   const counts = { ours: 0, ai: 0, human: 0 };
   const humanShas: string[] = [];
   const humanCommits: LineageHumanCommit[] = [];
+  const oursPrNumbers: number[] = [];
   for (const c of lineage.commits) {
     counts[c.kind]++;
+    if (c.kind === "ours" && oursPrNumbers.length < LINEAGE_OURS_PR_CAP) {
+      // Same `(#N)` subject tag ownPublish.ts's findOurMergeForPr matches on.
+      for (const m of firstLine(c.message).matchAll(/\(#(\d+)\)/g)) {
+        const n = Number(m[1]);
+        if (Number.isSafeInteger(n) && n > 0 && !oursPrNumbers.includes(n) && oursPrNumbers.length < LINEAGE_OURS_PR_CAP) {
+          oursPrNumbers.push(n);
+        }
+      }
+    }
     if (c.kind === "human" && humanShas.length < LINEAGE_EVIDENCE_CAP) {
       humanShas.push(c.sha);
       // #684. Same commits, same cap, same order — carried alongside the bare
@@ -862,6 +888,7 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
     refsComplete: ev?.complete === true,
     humanRefs: ev?.complete === true ? ev.refs : [],
     refsReason: ev == null ? "not_measured" : ev.complete === true ? "" : ev.reason,
+    oursPrNumbers,
   };
 }
 
@@ -1407,6 +1434,41 @@ function refsFrom(lineage: MasterLineage | MasterLineageSummary): HumanRefEviden
 /** Does this evidence claim (chapter, verse)? "c:*" claims the whole chapter. */
 export function refEvidenceTouches(refs: string[], chapter: number, verse: number): boolean {
   return refs.includes(`${chapter}:*`) || refs.includes(`${chapter}:${verse}`);
+}
+
+/**
+ * The same question as completeHumanRefEvidenceTouches, for a log line (#874):
+ * `null` when the evidence cannot answer it, a boolean only when it can.
+ * completeHumanRefEvidenceTouches returns `false` for both "measured, no
+ * touch" and "could not tell", and a diagnostic log must not merge the two.
+ *
+ * Measurable means the compacted summary of a COMPLETE commit walk, plus a
+ * usable (non-negative integer) chapter and verse, and one of:
+ *   - no human commit in the window: nothing touched the file, so `false` is
+ *     a real measurement;
+ *   - human commits whose per-verse refs were mapped completely to a
+ *     non-empty, fully valid set.
+ * Anything else (no lineage, an incomplete walk, refs never mapped or partly
+ * mapped, a malformed entry, contradictory flags) is `null`.
+ *
+ * Log-only. It deliberately does not share code with
+ * completeHumanRefEvidenceTouches, whose fail-closed answer can authorize a
+ * master-byte adoption and must not move when this function changes.
+ */
+export function humanRefEvidenceAtRef(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+  chapter: unknown,
+  verse: unknown,
+): boolean | null {
+  if (lineage == null || !("mayHoldHumanEdit" in lineage)) return null;
+  if (typeof chapter !== "number" || !Number.isInteger(chapter) || chapter < 0) return null;
+  if (typeof verse !== "number" || !Number.isInteger(verse) || verse < 0) return null;
+  if (lineage.incomplete !== false) return null;
+  if (lineage.hasHumanCommit === false) return lineage.mayHoldHumanEdit === false ? false : null;
+  if (lineage.hasHumanCommit !== true || lineage.mayHoldHumanEdit !== true) return null;
+  const ev = refsFrom(lineage);
+  if (ev === null || ev.refs.length === 0) return null;
+  return refEvidenceTouches(ev.refs, chapter, verse);
 }
 
 /**

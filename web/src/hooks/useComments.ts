@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, type CommentDto, type NewCommentInput } from "../sync/api";
 import { indexComments, type CommentsIndex, type LiveRows } from "../lib/commentsIndex";
+import { isStaleChapter } from "../lib/chapterStale";
 
 // Stable empty array so the derived `comments` identity doesn't change on every
 // render while a chapter's fetch is still in flight (keeps useMemo honest).
@@ -17,6 +18,11 @@ export function useComments(
   // Omit to disable it (every row-anchored comment indexes under its own
   // rowId regardless of whether that row still exists).
   liveRows?: LiveRows,
+  // Bump to refetch AND to stop treating the current set as this chapter's
+  // settled set until the refetch lands (Shell: an A → B → A lock lifting,
+  // #892). Unlike reload(), it takes effect in the same render, so a caller
+  // reading `loadedKey` never mistakes the pre-reload set for a settled one.
+  epoch = 0,
 ): {
   comments: CommentDto[];
   index: CommentsIndex;
@@ -44,15 +50,19 @@ export function useComments(
   // Bumping this re-runs the fetch effect (manual reload()).
   const [reloadTick, setReloadTick] = useState(0);
 
-  const key = `${book}/${chapter}`;
+  const chapterKey = `${book}/${chapter}`;
+  const key = `${chapterKey}#${epoch}`;
   const comments = loaded.key === key ? loaded.comments : EMPTY;
 
   // Upsert by id, sorted by (createdAt, id) so indexComments' output is
   // stable. A dto with deletedAt set drops itself and any of its replies.
   // Ignores anything for a chapter we're no longer showing (a WS event can
-  // land just after navigating away).
+  // land just after navigating away). Also ignores a dto for another chapter:
+  // Shell keys this hook on the chapter on screen, which lags the route (and
+  // the route's ChapterRoom socket) while a chapter change loads (#892).
   const upsert = useCallback(
     (dto: CommentDto) => {
+      if (isStaleChapter(dto, { book, chapter })) return;
       setLoaded((prev) => {
         if (prev.key !== key) return prev;
         let next: CommentDto[];
@@ -69,7 +79,7 @@ export function useComments(
         return { key: prev.key, comments: next };
       });
     },
-    [key],
+    [book, chapter, key],
   );
 
   useEffect(() => {
@@ -158,7 +168,7 @@ export function useComments(
     // false from the previous chapter until this chapter's effect runs, while
     // `comments` is already empty — a window in which an absent comment looks
     // deleted rather than not-yet-loaded.
-    loadedKey: loaded.key,
+    loadedKey: loaded.key === key ? chapterKey : "",
     error,
     addComment,
     editComment,

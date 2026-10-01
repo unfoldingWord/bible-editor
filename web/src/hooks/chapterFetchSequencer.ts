@@ -23,9 +23,10 @@
 //    drops the replay queue and any deferred merge, so nothing from the old
 //    chapter can land afterwards.
 //
-// Replay queue: reducer steps (WS bridged / split / updated, outbox results)
-// that reach the tab while a merging refetch is pending (in flight or
-// deferred); non-null exactly then. `mergeRefetched` can only judge verses
+// Replay queue: reducer steps (WS bridged / split / updated, outbox results,
+// and since #974 tn/tq/twl row inserts / replacements / deletes and
+// server-stamped verse statuses) that reach the tab while a merging refetch
+// is pending (in flight or deferred); non-null exactly then. `mergeRefetched` can only judge verses
 // the GET's snapshot contains, so a split that recreated a verse AFTER the
 // snapshot but BEFORE the response landed would be silently discarded (the
 // response has no row for it); replaying the queue over the merged map puts
@@ -33,7 +34,12 @@
 // refetch that supersedes another inherits it (steps the first collected are
 // either newer than the second GET's rows and kept by the merge anyway, or
 // stale echoes that are no-ops on replay — every step is version-gated, see
-// lib/verseStructure.ts). A plain refetch or a reset drops it; the resolving
+// lib/verseStructure.ts). Chapter DATA steps (rows, statuses — #974) are NOT
+// inherited, by a superseding merge or by the deferred merge issued after the
+// mount GET (`keepOnSupersede`): an event that reached the tab before the new
+// GET was sent is already in its snapshot, and replaying it could resurrect a
+// row deleted while the socket was down (that row.deleted broadcast is lost).
+// A plain refetch or a reset drops it; the resolving
 // or failing latest request clears it.
 
 export type ChapterLoader<P> = (signal: AbortSignal, onAttempt: (attempts: number) => void) => Promise<P>;
@@ -51,6 +57,14 @@ export interface ChapterFetchCallbacks<P, S> {
   onLanded(payload: P, merge: boolean, queued: S[]): void;
   /** The latest request failed for good (never called for an abort). */
   onError(err: unknown): void;
+  /**
+   * Whether a step recorded before a new merging request started is still
+   * replayed over that request's payload (default: every step). A step that
+   * reached the tab before the request was sent is already in its snapshot,
+   * so only steps whose replay is safe and needed (verse structure) should be
+   * kept; see the replay-queue note above.
+   */
+  keepOnSupersede?(step: S): boolean;
 }
 
 interface InFlight<P> {
@@ -91,7 +105,7 @@ export function createChapterFetchSequencer<P, S>(cb: ChapterFetchCallbacks<P, S
     const ctrl = new AbortController();
     const self: InFlight<P> = { ctrl, merge, load };
     current = self;
-    queue = merge ? (queue ?? []) : null;
+    queue = merge ? (queue && cb.keepOnSupersede ? queue.filter(cb.keepOnSupersede) : (queue ?? [])) : null;
     // A plain request issued now postdates any open that deferred a merge,
     // so its snapshot already satisfies that merge.
     if (!merge) settleDeferred();
