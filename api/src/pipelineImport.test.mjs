@@ -27,6 +27,7 @@ import {
   maybeCheckCancelled,
   tnPayload,
   tnDedupQuote,
+  isDistinctTwinTn,
   tqPayload,
   applyTnHintExpansionIfMatch,
   outputKindAllowedFor,
@@ -3741,7 +3742,7 @@ await (async () => {
   // content dedup stands between a re-proposal and a second copy); `tsv` rows
   // go through staging; `prestaged` rows are written to pending_imports as-is
   // (staged_at set), modelling a proposal staged before #959.
-  async function runJob({ book, chapter, source = {}, live = [], tsv = [], prestaged = [] }) {
+  async function runJob({ book, chapter, source = {}, live = [], tsv = [], prestaged = [], failSourceRead = false }) {
     const sqlite = new DatabaseSync(":memory:");
     for (const sql of migrationSql) sqlite.exec(sql);
     let sourceReads = 0;
@@ -3749,7 +3750,10 @@ await (async () => {
       sql, args,
       bind: (...a) => mk(sql, a),
       all() {
-        if (/FROM verses/.test(sql) && /bible_version = \?4/.test(sql)) sourceReads += 1;
+        if (/FROM verses/.test(sql) && /bible_version = \?4/.test(sql)) {
+          sourceReads += 1;
+          if (failSourceRead) throw new Error("D1: source read failed");
+        }
         return { results: sqlite.prepare(sql).all(...args), success: true };
       },
       first() { const r = sqlite.prepare(sql).all(...args); return r.length ? r[0] : null; },
@@ -3772,8 +3776,8 @@ await (async () => {
     for (const r of live) {
       sqlite.prepare(
         `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, quote, occurrence, note, sort_order, preserve, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 100, 1, 1)`,
-      ).run(r.id, book, chapter, r.verse, r.ref ?? `${chapter}:${r.verse}`, r.quote, r.occ ?? 1, r.note ?? "n");
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 100, ?, 1)`,
+      ).run(r.id, book, chapter, r.verse, r.ref ?? `${chapter}:${r.verse}`, r.quote, r.occ ?? 1, r.note ?? "n", r.preserve ?? 1);
     }
     for (const r of prestaged) {
       const payload = { id: r.id, book, chapter, verse: r.verse, ref_raw: r.ref ?? `${chapter}:${r.verse}`, tags: null,
@@ -3787,19 +3791,23 @@ await (async () => {
     const origFetch = globalThis.fetch;
     globalThis.fetch = async () => new Response(tsvText, { status: 200 });
     let result;
+    let error = null;
     try {
       result = await importJobOutput(
         env,
         { jobId: "job-966", pipelineType: "notes", book, startChapter: chapter, endChapter: chapter },
         tsv.length ? [{ repo: "unfoldingWord/en_tn", rawUrl: `https://example.invalid/tn_${book}.tsv` }] : [],
       );
+    } catch (e) {
+      if (!failSourceRead) throw e;
+      error = e;
     } finally {
       globalThis.fetch = origFetch;
     }
     const rows = sqlite.prepare(
       `SELECT id, quote FROM tn_rows WHERE book = ? AND deleted_at IS NULL ORDER BY id`,
     ).all(book);
-    return { result, rows, sourceReads };
+    return { result, rows, sourceReads, error };
   }
 
   // 1. The issue's case: live `כָּ⁠ל`, proposal bare `כָּל`, every other field
@@ -3925,6 +3933,34 @@ await (async () => {
     assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
       `#966: an NT re-proposal differing only in composition still dedups (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
     assert(sourceReads === 0, `#966: an NT notes-only job loads no source words (got ${sourceReads})`);
+  }
+
+  // 7b. An already-staged job whose source-word read fails must stop BEFORE
+  // the delete phase: the unkept (pristine, updated_by NULL) note stays live
+  // rather than being swept with no replacement written.
+  {
+    const { result, rows, error } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL] }, failSourceRead: true,
+      live: [{ id: "aaaa", verse: 10, quote: KOL, note: "old", preserve: 0 }],
+      prestaged: [{ id: "bbbb", verse: 10, quote: KOL, note: "new" }],
+    });
+    assert(rows.length === 1 && rows[0].id === "aaaa",
+      `#966: a failed source-word read deletes nothing (rows=${JSON.stringify(rows.map((r) => r.id))}, tnDeleted=${result?.applied?.tnDeleted}, error=${error?.message ?? result?.error ?? "none"})`);
+  }
+
+  // 8. A null ref_raw (tn_rows.ref_raw is NOT NULL, so only a malformed
+  // payload) covers just the row's own verse: twins there still split, and a
+  // proposal with no trusted word still folds.
+  {
+    const w = (text) => ({ text, strong: "H3605", lemma: "", morph: "" });
+    const words = new Map([[2 * 100000 + 10, [w(KOL_WJ), w(KOL)]]]);
+    const live = { quote: KOL_WJ, refRaw: null, trusted: null };
+    assert(isDistinctTwinTn(2, 10, live, { quote: KOL, refRaw: null, trusted: [true] }, words),
+      "#966: null ref_raw on both sides still resolves the verse's twins");
+    assert(!isDistinctTwinTn(2, 10, live, { quote: KOL, refRaw: null, trusted: [] }, words),
+      "#966: an untrusted proposal word is not a twin, whatever its bytes");
+    assert(!isDistinctTwinTn(2, 11, live, { quote: KOL, refRaw: null, trusted: [true] }, words),
+      "#966: null ref_raw does not reach another verse's words");
   }
 })();
 

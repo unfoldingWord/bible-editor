@@ -172,6 +172,11 @@ export function tnPayload(
       tags: row["Tags"] || null,
       support_reference: row["SupportReference"] || null,
       quote,
+      // The AI's quote before canonizing, kept so apply's TN dedup can tell a
+      // word the AI wrote in UHB bytes from one a loose canonize tier rewrote
+      // into them (isDistinctTwinTn, #966). Staging-only: applyTnInsert drops
+      // it before the edit_log audit, which records the row's columns.
+      ai_quote: rawQuote,
       occurrence,
       // Collapse bp-assistant's double-space-after-punctuation artifact so the
       // stored note matches DCS master's normalized form (see
@@ -202,9 +207,12 @@ export function tnDedupQuote(quote: string | null): string | null {
 
 // A note already claimed in applyJobOutput's content-dedup set, kept with its
 // raw quote and ref so a fold collision can be re-checked (isDistinctTwinTn).
-interface ClaimedTn {
+// `trusted[i]` says whether word i's bytes may count as a UHB surface; null
+// means every word may (a live row: its stored bytes are what tC counts).
+export interface ClaimedTn {
   quote: string | null;
   refRaw: string | null;
+  trusted: boolean[] | null;
 }
 
 const QUOTE_WORD_SEP = /[ \u05BE]/; // space or maqaf, as canonizeQuote splits
@@ -219,10 +227,20 @@ const QUOTE_WORD_SEP = /[ \u05BE]/; // space or maqaf, as canonizeQuote splits
 // and those two UHB words differ. Any word that is not a UHB surface counts as
 // matching: a legacy NFC row, a proposal staged before #959, an un-canonizable
 // word, a verse with no UHB loaded, a Gateway-Language quote. That keeps the
-// #962 doubling guard for all of those (doubling is the worse failure), at the
-// accepted cost that a legacy NFC row in a twin verse, which cannot be told
-// apart from either twin, also blocks a re-proposal of either twin with
-// identical text. NT jobs pass an empty map, so they keep the fold unchanged.
+// #962 doubling guard for all of those (doubling is the worse failure). NT
+// jobs pass an empty map, so they keep the fold unchanged.
+//
+// A proposal word counts only when the AI itself wrote it in those UHB bytes
+// (its staged `ai_quote` word equals the stored word, see proposalTrust). A
+// word staging rewrote is not evidence: the stripped tier keys on a fold that
+// keeps U+2060, so an AI `kol` with the joiner dropped and a vowel slip lands
+// on the bare twin. A proposal staged without `ai_quote` trusts no word.
+//
+// Accepted costs, all toward dedup: a legacy NFC row in a twin verse, which
+// cannot be told apart from either twin, blocks a re-proposal of either twin
+// with identical text; and an AI proposal in NFC or with joiners dropped is
+// still deduped against a live twin note. Twins are kept apart only when the
+// proposal arrives in exact UHB bytes.
 //
 // Why no canonizeQuote here, as staging does: within one fold bucket both
 // words share canonizeQuote's exact-tier key, so its exact tier resolves them
@@ -232,8 +250,10 @@ const QUOTE_WORD_SEP = /[ \u05BE]/; // space or maqaf, as canonizeQuote splits
 // different UHB words and split a real duplicate. Both sides are checked
 // against one candidate set (the union of the verses either ref covers), so a
 // live ref_raw that differs from the proposal's Reference cannot make them
-// resolve differently.
-function isDistinctTwinTn(
+// resolve differently. A null ref_raw (tn_rows.ref_raw is NOT NULL, so only a
+// malformed payload) covers just the row's own verse. Exported for
+// pipelineImport.test.mjs only.
+export function isDistinctTwinTn(
   chapter: number,
   verse: number,
   a: ClaimedTn,
@@ -249,7 +269,20 @@ function isDistinctTwinTn(
   const aw = a.quote.split(QUOTE_WORD_SEP);
   const bw = b.quote.split(QUOTE_WORD_SEP);
   if (aw.length !== bw.length) return false;
-  return aw.some((w, i) => w !== bw[i] && surfaces.has(w) && surfaces.has(bw[i]));
+  const surface = (c: ClaimedTn, w: string, i: number) =>
+    (c.trusted === null || c.trusted[i] === true) && surfaces.has(w);
+  return aw.some((w, i) => w !== bw[i] && surface(a, w, i) && surface(b, bw[i], i));
+}
+
+// Per-word trust for a staged proposal: a word is trusted only when it is
+// byte-identical to the AI's own word at the same position. No `ai_quote`
+// (staged before it was recorded) or a different word count trusts nothing,
+// so the proposal falls back to the fold.
+function proposalTrust(quote: string | null, aiQuote: unknown): boolean[] {
+  if (quote == null || typeof aiQuote !== "string") return [];
+  const words = quote.split(QUOTE_WORD_SEP);
+  const aiWords = aiQuote.split(QUOTE_WORD_SEP);
+  return words.length === aiWords.length ? words.map((w, i) => w === aiWords[i]) : [];
 }
 
 // The book's UHB/UGNT words, loaded at most ONCE per importJobOutput call (one
@@ -1014,6 +1047,15 @@ async function applyJobOutput(
   // the rate limit and always actually read (see maybeCheckCancelled's
   // `opts.force`) — a fresh, sub-15s single-chapter stage would otherwise
   // consume the rate-limit window and leave this checkpoint unable to fire.
+  //
+  // The TN dedup's source words (isDistinctTwinTn, #966) load BEFORE this
+  // checkpoint and the deletes: a D1 error in that read must fail the apply
+  // while nothing is deleted yet, not between the deletes and their
+  // replacements. Reused from staging when it already loaded them; OT only.
+  const tnSourceWords =
+    tnProposals.length > 0 && !NT_BOOKS.has(job.book)
+      ? await sourceWords()
+      : new Map<number, SourceWord[]>();
   if (await maybeCheckCancelled(env, job.jobId, cancel, { force: true })) {
     result.affectedChapters = [...affected].sort((a, b) => a - b);
     return result;
@@ -1044,10 +1086,6 @@ async function applyJobOutput(
   // byte-distinct UHB twins (isDistinctTwinTn, #966). OT only — an NT job keeps
   // an empty source map, so its dedup is the plain fold.
   const claimedTn = new Map<string, ClaimedTn[]>();
-  const tnSourceWords =
-    tnProposals.length > 0 && !NT_BOOKS.has(job.book)
-      ? await sourceWords()
-      : new Map<number, SourceWord[]>();
   if (tnProposals.length > 0) {
     const live = await env.DB.prepare(
       `SELECT chapter, verse, ref_raw, occurrence, support_reference, quote, note
@@ -1077,7 +1115,7 @@ async function applyJobOutput(
     // (tnDedupQuote), since tnPayload now canonizes proposals to UHB bytes.
     for (const r of live.results ?? []) {
       const key = tnContentKey({ ...r, quote: tnDedupQuote(r.quote), note: r.note ? curlifyText(r.note) : r.note });
-      const claim: ClaimedTn = { quote: r.quote, refRaw: r.ref_raw };
+      const claim: ClaimedTn = { quote: r.quote, refRaw: r.ref_raw, trusted: null };
       const list = claimedTn.get(key);
       if (list) list.push(claim);
       else claimedTn.set(key, [claim]);
@@ -1155,9 +1193,11 @@ async function applyJobOutput(
       quote: tnDedupQuote((payload.quote as string | null | undefined) ?? null),
       note: (payload.note as string | null | undefined) ?? null,
     });
+    const proposedQuote = (payload.quote as string | null | undefined) ?? null;
     const claim: ClaimedTn = {
-      quote: (payload.quote as string | null | undefined) ?? null,
+      quote: proposedQuote,
       refRaw: (payload.ref_raw as string | null | undefined) ?? null,
+      trusted: proposalTrust(proposedQuote, payload.ai_quote),
     };
     const claimedUnderKey = claimedTn.get(contentKey);
     const claimKey = () => {
@@ -1724,7 +1764,7 @@ async function applyTnInsert(
                (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
              VALUES ('tn', ?1, ?2, ?3, NULL, 1, 'create', ?4, ?5)`,
           )
-          .bind(id, p.book, userId, JSON.stringify(payload), AI_SOURCE),
+          .bind(id, p.book, userId, JSON.stringify({ ...payload, ai_quote: undefined }), AI_SOURCE),
         env.DB
           .prepare(
             `UPDATE pending_imports
