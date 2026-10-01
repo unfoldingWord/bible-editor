@@ -15,7 +15,7 @@ import CheckIcon from "@mui/icons-material/Check";
 import CloseIcon from "@mui/icons-material/Close";
 import KeyboardArrowLeftIcon from "@mui/icons-material/KeyboardArrowLeft";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
-import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
+import { AlignmentPanel, type AlignerLock, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { UhbStrip } from "./UhbStrip";
 import { type HoverHighlight, type HighlightCtx } from "../lib/highlightTypes";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
@@ -230,6 +230,12 @@ interface Props {
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
   onNextVerse?: () => void;
+  // #943: this verse can't be written (AI pipeline chapter lock, or a book
+  // lock that landed after the popup opened). The popup stays open (the
+  // reading line's own save still goes through and is rejected server-side
+  // with a toast; see s9 check (b)), but each AlignmentPanel disables its
+  // alignment changes, Save and history restore.
+  locked?: AlignerLock;
   // Save both sides, mark the verse's Text lane done, then go to the next
   // verse (#931). Undefined wherever it can't run (chapter end, locked book).
   onSaveDoneAndNext?: () => void;
@@ -337,6 +343,7 @@ export function SideBySideAligner({
   onNextVerse,
   onSaveDoneAndNext,
   textCheck,
+  locked = false,
 }: Props) {
   const [hover, setHover] = useState<HoverHighlight>(null);
   const [hoverLink, setHoverLink] = useState<boolean>(readHoverLink);
@@ -443,11 +450,14 @@ export function SideBySideAligner({
       renderUhbStrip={false}
       showSourceInfo={lexInfo}
       posOffset={slot.posOffset}
+      locked={locked}
     />
   );
 
   return (
-    <Dialog open={open} onClose={onClose} fullScreen>
+    // disableEnforceFocus: the pinned lexical box (PinnedLexBox) is portaled
+    // outside this Dialog; a focus trap would fight text selection in it (#1053).
+    <Dialog open={open} onClose={onClose} fullScreen disableEnforceFocus>
       <Box sx={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
         {/* titlebar */}
         <Box
@@ -619,6 +629,8 @@ export function SideBySideAligner({
             onSave={onSaveReading}
             onDirtyChange={left.onReadingDirtyChange}
             locked={leftDirty}
+            chapterLocked={!!locked}
+            bookLocked={locked === "book"}
             bodyHeight={readingHeight}
           />
           <ReadingLine
@@ -627,6 +639,8 @@ export function SideBySideAligner({
             onSave={onSaveReading}
             onDirtyChange={right.onReadingDirtyChange}
             locked={rightDirty}
+            chapterLocked={!!locked}
+            bookLocked={locked === "book"}
             bodyHeight={readingHeight}
           />
         </Box>
@@ -818,13 +832,32 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   // dirty-state note in SideBySideAligner). The translator saves/cancels the
   // alignment first, then the line unlocks.
   locked?: boolean;
+  // #943: the verse can't be written (see Props.locked). Only changes the
+  // hint: with unsaved drags the alignment Save is disabled, so point at
+  // Reset instead of "save alignment first".
+  chapterLocked?: boolean;
+  // #1046: the book is locked. The outbox drops every write on a locked book
+  // without a trace, so the line stops taking input and loses its Save (Undo
+  // stays, so an edit typed before the lock landed can be discarded). A
+  // chapter lock alone leaves the line editable: the server refuses that save
+  // with a toast (s9 check (b)).
+  bookLocked?: boolean;
   // Drag-resizable cap for the editable text box; it scrolls past this height.
   // Shared by both reading lines so the two-column grid stays even.
   bodyHeight?: number;
 }>(function ReadingLine(
-  { slot, onSave, onDirtyChange, locked = false, bodyHeight = DEFAULT_READING_HEIGHT },
+  {
+    slot,
+    onSave,
+    onDirtyChange,
+    locked = false,
+    chapterLocked = false,
+    bookLocked = false,
+    bodyHeight = DEFAULT_READING_HEIGHT,
+  },
   ref,
 ) {
+  const readOnly = locked || bookLocked;
   const { bibleVersion, verse } = slot;
   const editable = useMemo(() => (verse ? extractEditableText(verse.content) : ""), [verse]);
   const elRef = useRef<HTMLDivElement | null>(null);
@@ -915,12 +948,18 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
           <Box
             component="span"
             sx={{
-              color: locked ? "text.disabled" : "primary.main",
+              color: readOnly ? "text.disabled" : "primary.main",
               textTransform: "none",
               letterSpacing: 0,
             }}
           >
-            {locked ? "🔒 save alignment first" : "✎ editable"}
+            {bookLocked
+              ? "🔒 book locked"
+              : locked
+              ? chapterLocked
+                ? "🔒 locked: reset alignment first"
+                : "🔒 save alignment first"
+              : "✎ editable"}
           </Box>
         </Typography>
         <Box sx={{ flex: 1 }} />
@@ -942,33 +981,37 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             >
               Undo
             </Button>
-            <Button
-              size="small"
-              variant="contained"
-              onClick={() => handleSave()}
-              disabled={!dirty}
-              sx={{
-                textTransform: "uppercase",
-                fontSize: 11,
-                letterSpacing: "0.06em",
-                fontWeight: 700,
-                px: 1.5,
-                py: 0.25,
-              }}
-            >
-              Save {bibleVersion}
-            </Button>
+            {!bookLocked && (
+              <Button
+                size="small"
+                variant="contained"
+                onClick={() => handleSave()}
+                disabled={!dirty}
+                sx={{
+                  textTransform: "uppercase",
+                  fontSize: 11,
+                  letterSpacing: "0.06em",
+                  fontWeight: 700,
+                  px: 1.5,
+                  py: 0.25,
+                }}
+              >
+                Save {bibleVersion}
+              </Button>
+            )}
           </>
         )}
       </Box>
       {verse ? (
         <Box
           ref={elRef}
-          contentEditable={!locked}
+          contentEditable={!readOnly}
           suppressContentEditableWarning
           spellCheck
           title={
-            locked
+            bookLocked
+              ? "This book is locked, so the reading text can't be edited right now"
+              : locked
               ? "save or cancel the pending alignment edits before editing the reading text"
               : undefined
           }
@@ -984,17 +1027,17 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             fontFamily: '"Times New Roman", "Cardo", serif',
             fontSize: `calc(15px * var(--be-reading-scale, 1))`,
             lineHeight: 1.5,
-            color: locked ? "text.disabled" : "text.primary",
+            color: readOnly ? "text.disabled" : "text.primary",
             outline: "none",
             borderRadius: 1,
             px: 0.75,
             py: 0.25,
             border: "1px solid",
             borderColor: "divider",
-            cursor: locked ? "not-allowed" : "text",
-            opacity: locked ? 0.6 : 1,
+            cursor: readOnly ? "not-allowed" : "text",
+            opacity: readOnly ? 0.6 : 1,
             transition: "border-color 0.12s, opacity 0.12s",
-            ...(locked
+            ...(readOnly
               ? {}
               : {
                   "&:hover": { borderColor: "primary.main" },
