@@ -511,6 +511,68 @@ test("a cancelled unalign confirm keeps the pin while the edit is kept, and rele
   }
 });
 
+test("a kept edit's pin is released however the edit goes away: typed back, resynced from the server, or discarded at the gate", async ({
+  browser,
+}) => {
+  test.setTimeout(60_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const original = await serverVerse(context.request);
+  const stamp = Date.now();
+
+  // Swap two aligned words, Save, and Cancel the unalign confirm: the edit
+  // stays on screen and its pin is kept.
+  const keepAnEdit = async (o: Opened) => {
+    const { save, confirm } = lineControls(o);
+    await swapAlignedWords(o.line);
+    await save.click();
+    await confirm.getByRole("button", { name: "Cancel" }).click();
+    await expect(confirm).toHaveCount(0);
+    await expect.poll(() => pinnedVersion(page)).toBeDefined();
+  };
+
+  try {
+    await setLock(context.request, csrf, false);
+    const o = await openDual(page);
+    const { line } = o;
+    const { save, undo } = lineControls(o);
+
+    // 1. Typed back by hand (no Undo): the line goes clean on input.
+    await keepAnEdit(o);
+    await line.evaluate((el) => {
+      el.textContent = (el.textContent ?? "").replace("Sharezer sent", "sent Sharezer");
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await expect(undo).toBeDisabled();
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+
+    // 2. Resynced from the server while the line is not focused: the edit is
+    //    replaced by the moved verse, so a new edit saves cleanly.
+    await keepAnEdit(o);
+    await bumpVerse(page, context.request, csrf, `[s18c-${stamp}]`);
+    await expect(line).toContainText(`[s18c-${stamp}]`);
+    await expect(undo).toBeDisabled();
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+    await appendToLine(line, `AFTER-${stamp}`);
+    const patched = nextVersePatch(page);
+    await save.click();
+    expect((await patched).status()).toBe(200);
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+
+    // 3. Discarded at the close gate.
+    await keepAnEdit(o);
+    await o.dialog.locator('button:has(svg[data-testid="CloseIcon"])').first().click();
+    const gate = page.getByRole("dialog").filter({ hasText: "Unsaved changes" });
+    await gate.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(line).toHaveCount(0);
+    await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+  } finally {
+    await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
+    await context.close();
+  }
+});
+
 test('a "save, mark done, next" refused by a book lock leaves the button working once the book is unlocked', async ({
   browser,
 }) => {
