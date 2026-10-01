@@ -68,6 +68,7 @@ import {
   type StreamWord,
 } from "../lib/alignmentSuggest";
 import { SourceTooltipBody } from "./SourceTooltipBody";
+import { LexTooltip } from "./LexTooltip";
 import { UhbStrip, buildTwHintMap, twHintFromMap } from "./UhbStrip";
 import { directionForVersion } from "../lib/direction";
 import {
@@ -1791,6 +1792,7 @@ function DropTargetCard({
   const showOver = over && !isMergeTarget && !isBeingDragged;
   return (
     <Paper
+      data-lex-region
       elevation={0}
       onDragOver={(e) => {
         e.preventDefault();
@@ -1932,7 +1934,7 @@ function SourceWordTypography({
   const tone = hctx.hebrewHighlight(pos, groupId);
   const showInfo = hctx.showSourceInfo;
   return (
-    <Tooltip
+    <LexTooltip
       enterDelay={0}
       enterNextDelay={0}
       title={
@@ -2056,7 +2058,7 @@ function SourceWordTypography({
           </Box>
         )}
       </Box>
-    </Tooltip>
+    </LexTooltip>
   );
 }
 

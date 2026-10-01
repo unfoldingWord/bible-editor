@@ -42,6 +42,7 @@ import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
 import { isHebrewBook } from "../lib/sourceSearch";
 import { SourceTooltipBody } from "./SourceTooltipBody";
+import { LexTooltip } from "./LexTooltip";
 
 type Row = "src" | "ult" | "ust";
 
@@ -411,7 +412,7 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <Box sx={{ px: 1.5, py: 1, borderBottom: "1px dashed", borderColor: "divider" }}>
+    <Box data-lex-region sx={{ px: 1.5, py: 1, borderBottom: "1px dashed", borderColor: "divider" }}>
       <Typography
         variant="caption"
         sx={{
@@ -490,14 +491,14 @@ function SourceChip({
   );
   if (!lexiconBody) return chip;
   return (
-    <Tooltip
+    <LexTooltip
       title={lexiconBody}
       enterDelay={0}
       enterNextDelay={0}
       slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
     >
       <Box sx={{ display: "inline-flex" }}>{chip}</Box>
-    </Tooltip>
+    </LexTooltip>
   );
 }
 
