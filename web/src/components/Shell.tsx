@@ -2740,6 +2740,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // render); the guard ignores a second click while this chain still runs,
   // and cancelling the unalign confirm releases it (cancelAlignmentLoss).
   const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
+  // #1050: verse keys whose pin belongs to a save that queued nothing
+  // (refused under a book lock, or its unalign confirm cancelled) while the
+  // dual aligner's reading line still shows the edit. The pin must outlive the
+  // refusal: it is the base that edit was made against, so saving it again
+  // after the verse moved must 409, not diff the old text against the new
+  // verse and overwrite the change. No outbox exit will ever release it, so
+  // the reading line reports when it drops the edit (Undo, the gate's Discard,
+  // a resync from the server, unmount) and this releases it then, the way the
+  // no-op save path does (#563): only with no draft holding it, IfIdle.
+  const unqueuedPinsRef = useRef(new Set<string>());
+  const releaseUnqueuedPin = useCallback((key: string) => {
+    if (!unqueuedPinsRef.current.delete(key)) return;
+    void drafts
+      .get(key)
+      .then((draft) => {
+        if (!draft) unpinVerseBaseIfIdle(key);
+      })
+      .catch(() => {
+        /* conservative: leave the pin with an unreadable draft store */
+      });
+  }, []);
   const dualSaveDoneAndNext = useCallback(
     (verse: number, next: number) => {
       // #943: this only reaches the dual aligner while dualTarget.chapter ===
@@ -2765,8 +2786,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   );
   // Dismissing the unalign confirm without saving: any save chain waiting on it
   // (the gate's Save, the save-done-next button) is stalled for good, so free
-  // the button's in-flight guard too, and let the save that opened it release
-  // what it holds (a text save's verse-base pin, #1050).
+  // the button's in-flight guard too, and tell the save that opened it that
+  // nothing was queued (a text save then keeps its pin for the edit, #1050).
   const cancelAlignmentLoss = useCallback(() => {
     const onCancel = pendingAlignmentLoss?.onCancel;
     setPendingAlignmentLoss(null);
@@ -2840,7 +2861,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // was open, #1046). The caller shows its own message.
     refuseCommit?: () => boolean,
     // Runs when the confirm ends without queueing anything: refused at commit
-    // (above) or cancelled. The caller releases what its save took (#1050).
+    // (above) or cancelled. The caller records that its save queued nothing
+    // (#1050).
     onAbandon?: () => void,
   ): boolean => {
     const delta = analyzeAlignmentDelta(base.content, content);
@@ -3284,6 +3306,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     refuseCommit?: () => boolean,
   ) => {
     const key = verseKey(book, chapterNum, verseNum, bibleVersion);
+    // A new attempt: whatever an earlier unqueued attempt recorded is decided
+    // again below (#1050).
+    unqueuedPinsRef.current.delete(key);
     // Diff and save against the SAME baseline this edit session's first
     // keystroke pinned — never the live `base` this call happened to receive.
     // `base` is recomputed from the chapter cache on every render, so a WS
@@ -3397,33 +3422,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // also run afterCommit, since that path never reaches the `applyLocal();
       // afterCommit?.();` below.
       const onConfirmedApply = () => {
+        unqueuedPinsRef.current.delete(key);
         notifyCommitted();
         applyLocal();
         afterCommit?.();
       };
       // A save that ends without queueing anything (refused, or its confirm
-      // cancelled) has no outbox exit, so nothing else would ever release the
-      // pin taken above, and every later save of this verse in this tab would
-      // send that stale version and 409 (#1050, same leak as #563). Release it
-      // the way the no-op path does: only when no draft holds it (#474 keeps
-      // a drafted session's pin), and IfIdle in case a keystroke re-pinned it.
-      const releaseUnqueuedPin = () => {
-        void drafts
-          .get(key)
-          .then((draft) => {
-            if (!draft) unpinVerseBaseIfIdle(key);
-          })
-          .catch(() => {
-            /* conservative: leave the pin with an unreadable draft store */
-          });
+      // cancelled) keeps the pin taken above: the edit is still on screen and
+      // was made against that base, so a later save of it must still 409 if
+      // the verse moved meanwhile. But there is no outbox exit to release it,
+      // so record it; releaseUnqueuedPin frees it when the edit is dropped
+      // (#1050).
+      const keepPinForUnqueuedEdit = () => {
+        unqueuedPinsRef.current.add(key);
       };
       if (refuseCommit?.()) {
-        releaseUnqueuedPin();
+        keepPinForUnqueuedEdit();
         return;
       }
-      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, onConfirmedApply, draftGeneration, undefined, refuseCommit, releaseUnqueuedPin)) {
+      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, onConfirmedApply, draftGeneration, undefined, refuseCommit, keepPinForUnqueuedEdit)) {
         return;
       }
+      unqueuedPinsRef.current.delete(key);
       notifyCommitted();
       applyLocal();
       afterCommit?.();
@@ -4599,6 +4619,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // confirm's "Save anyway".
             saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit, refuseIfBookLocked);
           }}
+          onDropReading={(bv, base) => releaseUnqueuedPin(verseKey(book, base.chapter, base.verse, bv))}
         />
       )}
       <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>

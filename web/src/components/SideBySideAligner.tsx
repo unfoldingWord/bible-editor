@@ -227,6 +227,10 @@ interface Props {
     base: VerseDto,
     afterCommit?: () => void,
   ) => void;
+  // A reading line dropped an unsaved edit without saving it: Undo, the
+  // gate's Discard, a resync from the server, or unmount. `base` is the verse
+  // the edit was made against (#1050).
+  onDropReading?: (bibleVersion: string, base: VerseDto) => void;
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
   onNextVerse?: () => void;
@@ -339,6 +343,7 @@ export function SideBySideAligner({
   left,
   right,
   onSaveReading,
+  onDropReading,
   onPrevVerse,
   onNextVerse,
   onSaveDoneAndNext,
@@ -627,6 +632,7 @@ export function SideBySideAligner({
             ref={left.readingRef}
             slot={left}
             onSave={onSaveReading}
+            onDrop={onDropReading}
             onDirtyChange={left.onReadingDirtyChange}
             locked={leftDirty}
             chapterLocked={!!locked}
@@ -637,6 +643,7 @@ export function SideBySideAligner({
             ref={right.readingRef}
             slot={right}
             onSave={onSaveReading}
+            onDrop={onDropReading}
             onDirtyChange={right.onReadingDirtyChange}
             locked={rightDirty}
             chapterLocked={!!locked}
@@ -826,6 +833,8 @@ function SharedUhbStrip({
 const ReadingLine = forwardRef<ReadingLineHandle, {
   slot: PanelSlot;
   onSave: (bibleVersion: string, plain: string, base: VerseDto, afterCommit?: () => void) => void;
+  // See Props.onDropReading.
+  onDrop?: (bibleVersion: string, base: VerseDto) => void;
   onDirtyChange: (dirty: boolean) => void;
   // Locked while this side's AlignmentPanel has unsaved drags: a text edit
   // here would swap the verse prop and silently wipe those drags (see the
@@ -849,6 +858,7 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   {
     slot,
     onSave,
+    onDrop,
     onDirtyChange,
     locked = false,
     chapterLocked = false,
@@ -868,10 +878,26 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   // buttons (and matches saveVerseDraft's no-op guard exactly). Mirrored up to
   // the parent so the close/nav gate can prompt before losing the edit.
   const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
   const markDirty = (next: boolean) => {
+    dirtyRef.current = next;
     setDirty(next);
     onDirtyChange(next);
   };
+  // The verse the box's text was last synced from, i.e. the base an edit in
+  // it was made against. Lags `verse` while a resync is skipped under the
+  // caret. Used to report a dropped edit (#1050): a save of it that queued
+  // nothing kept its pin, and only dropping the edit may release it.
+  const shownVerseRef = useRef(verse);
+  const onDropRef = useRef(onDrop);
+  onDropRef.current = onDrop;
+  const reportDrop = () => {
+    const shown = shownVerseRef.current;
+    if (dirtyRef.current && shown) onDropRef.current?.(bibleVersion, shown);
+  };
+  // Unmounting with an unsaved edit drops it too.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => reportDrop, []);
 
   useEffect(() => {
     const el = elRef.current;
@@ -887,8 +913,12 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
       // Skip the DOM write when the content already matches — after an edit that
       // round-trips identically, replacing the text node would needlessly
       // repaint (flash) the line and drop the caret.
-      if (dom !== editable) el.textContent = editable;
+      if (dom !== editable) {
+        reportDrop();
+        el.textContent = editable;
+      }
       lastSetRef.current = editable;
+      shownVerseRef.current = verse;
     }
     lastTextRef.current = editable;
     // Baseline moved (a Save landed, or a verse nav swapped the verse): the
@@ -920,9 +950,11 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   const handleUndo = () => {
     const el = elRef.current;
     if (!el) return;
+    reportDrop();
     el.textContent = editable;
     lastTextRef.current = editable;
     lastSetRef.current = editable;
+    shownVerseRef.current = verse;
     markDirty(false);
   };
 
