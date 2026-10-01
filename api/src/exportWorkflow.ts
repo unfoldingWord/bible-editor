@@ -1424,7 +1424,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // render, the previous publish lives in prev_* (#995).
       let priorPushedBlobSha: string | null = null;
       let priorPushedR2Key: string | null = null;
-      // #1029: renders pushed since master was last confirmed (see migration 0074).
+      // #1029: renders pushed since master was last confirmed (see migration 0075).
       let unconfirmedRenderShas: string[] | null = null;
       try {
         const prior = await this.env.DB.prepare(
