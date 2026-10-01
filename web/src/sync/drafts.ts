@@ -19,11 +19,13 @@ import {
 import {
   holdVerseBase,
   peekPinnedVerseBase,
-  unpinVerseBase,
+  unpinVerseBaseUnlessHeld,
   unpinVerseBaseIfIdleWith,
+  advanceHeldVerseBase,
   type PinnedVerseBase,
   type VerseBaseHold,
 } from "./versePin";
+import { takeOwnVerseOp } from "./ownVerseOps";
 import { createDraftSnapshot } from "./draftSnapshot";
 export { pinVerseBase, peekPinnedVerseBase, type VerseBaseHold } from "./versePin";
 
@@ -244,7 +246,7 @@ export const drafts = {
   async clear(key: string): Promise<void> {
     pendingKeys.delete(key);
     latestGenerationByKey.delete(key);
-    unpinVerseBase(key);
+    unpinVerseBaseUnlessHeld(key);
     const release = snapshot.beginMutation(key);
     try {
       await (await db()).delete(STORE, key);
@@ -270,7 +272,7 @@ export const drafts = {
     if (latestGenerationByKey.get(key) === generation) {
       latestGenerationByKey.delete(key);
       pendingKeys.delete(key);
-      unpinVerseBase(key);
+      unpinVerseBaseUnlessHeld(key);
     }
     notify(key);
     return true;
@@ -324,10 +326,22 @@ function releaseLocalBookkeeping(key: string, generation: string): void {
   if (latestGenerationByKey.get(key) !== generation) return;
   latestGenerationByKey.delete(key);
   pendingKeys.delete(key);
-  unpinVerseBase(key);
+  unpinVerseBaseUnlessHeld(key);
 }
 
 function applyVerseExit(key: string, info: VerseOpExitInfo): void {
+  // #1060: only the tab that QUEUED this op claims it (another tab's save, or
+  // another editor's, must keep a live hold's old base so its save 409s).
+  // Synchronous, before the async release below, so the line's next save
+  // already goes out against the landed row.
+  if (
+    takeOwnVerseOp(info.opId) &&
+    info.exit === "ok" &&
+    info.landed &&
+    info.expectedVersion !== undefined
+  ) {
+    advanceHeldVerseBase(key, info.expectedVersion, info.landed);
+  }
   void drafts.get(key).then((draft) => {
     const release = pinReleaseForVerseExit(draft, info);
     if (release.kind === "clear") {
@@ -366,7 +380,7 @@ verseExitChannel?.addEventListener("message", (e: MessageEvent) => {
   applyVerseExit(data.key, info);
 });
 
-function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
+function handleVerseExit(op: OutboxOp, exit: VerseOpExit, updated?: unknown): void {
   if (op.target.kind !== "verse") return;
   const key = verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion);
   let info: VerseOpExitInfo;
@@ -377,8 +391,19 @@ function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
     // so malformed content can't abort the drain pass's listener loop.
     info = verseOpExitInfo(op, exit);
   } catch {
+    takeOwnVerseOp(op.id);
     return; // same non-release the pre-#565 code gave this op
   }
+  // #1060: the landed row (the 200 body), for the queuing tab's hold.
+  const row = updated as { version?: unknown; content?: unknown } | null | undefined;
+  info = {
+    ...info,
+    opId: op.id,
+    expectedVersion: op.expectedVersion,
+    ...(exit === "ok" && typeof row?.version === "number" && row.content !== undefined
+      ? { landed: { version: row.version, content: row.content } }
+      : {}),
+  };
   applyVerseExit(key, info);
   // BroadcastChannel never delivers to its own poster — the applyVerseExit
   // above is this tab's copy. Announcement is best-effort: the local release
@@ -393,7 +418,8 @@ function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
 
 onOutboxResult((op, result) => {
   if (op.target.kind === "verse") {
-    if (result.kind === "ok" || result.kind === "locked") handleVerseExit(op, result.kind);
+    if (result.kind === "ok") handleVerseExit(op, "ok", result.updated);
+    else if (result.kind === "locked") handleVerseExit(op, "locked");
     return;
   }
   if (result.kind !== "ok") return;

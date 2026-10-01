@@ -943,8 +943,13 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   }, [editable]);
 
   // After the resync above (effects run in order), so a fresh sync is seen.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => syncShownVerse(), [verse]);
+  // A line mounted before its verse arrived starts from that first verse, so
+  // its first keystroke has a base to hold.
+  useEffect(() => {
+    if (!shownVerseRef.current && !holdRef.current) shownVerseRef.current = verse;
+    syncShownVerse();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [verse]);
 
   // `afterCommit` mirrors AlignmentPanelHandle's handleSave (#490): `onSave`
   // (ultimately Shell's saveVerseDraft → enqueueVerseSafely) can defer this

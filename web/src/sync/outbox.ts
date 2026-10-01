@@ -36,6 +36,7 @@ import {
   targetKey,
 } from "./outboxTargeting.ts";
 import { rebaseVersePatch } from "./verseRebase.ts";
+import { noteOwnVerseOp } from "./ownVerseOps.ts";
 
 const DB_NAME = "bible-editor-outbox";
 const DB_VERSION = 1;
@@ -350,6 +351,8 @@ export const outbox = {
       ...(opts.draftGeneration ? { draftGeneration: opts.draftGeneration } : {}),
       ...(opts.alignmentDraftGeneration ? { alignmentDraftGeneration: opts.alignmentDraftGeneration } : {}),
     };
+    // #1060: remember it was queued here, before any drain can see it land.
+    noteOwnVerseOp(op.id);
     await (await db()).put(STORE, op);
     void notify();
     void drain();

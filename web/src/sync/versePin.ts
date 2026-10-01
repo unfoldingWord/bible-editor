@@ -60,8 +60,13 @@ export function peekPinnedVerseBase(key: string): PinnedVerseBase | undefined {
 //   session now shares it.
 // - A hold that JOINED an existing pin (a queued save's, which that op's outbox
 //   exit releases, or a draft session's) leaves it alone on release(), unless
-//   the owner tried to release it while the hold was live (deferUnpinToHolds),
-//   which hands the release to the holds.
+//   the owner tried to release it while the hold was live
+//   (unpinVerseBaseIfIdleWith / unpinVerseBaseUnlessHeld), which hands the
+//   release to the holds.
+// - The held pin moves forward only when THIS tab's own save of the verse
+//   lands on exactly the held version (advanceHeldVerseBase): that change is
+//   the translator's own, and already on screen. Any other change keeps the
+//   old base, so the line's save 409s.
 // - handOff() ends a hold whose edit was just queued: the queued op's outbox
 //   exit (or a no-op save's own unpin) releases the pin, as for any save.
 // Both are synchronous: an async release lets a keystroke land in the gap and
@@ -120,4 +125,23 @@ export function unpinVerseBaseIfIdleWith(key: string, draftSessionLive: boolean)
     return;
   }
   unpinVerseBase(key);
+}
+
+// A draft session ended (drafts.clear, clearGeneration, a cross-tab
+// bookkeeping release). It no longer needs the pin, but a live hold that
+// joined it still does: the release then passes to the hold.
+export function unpinVerseBaseUnlessHeld(key: string): void {
+  unpinVerseBaseIfIdleWith(key, false);
+}
+
+// This tab's own save of `key`, made against version `fromVersion`, landed as
+// `landed`. While a hold is live and its pin is exactly that base, the pin
+// moves to the landed row: the server moved only by an edit the translator
+// made here, so the line's next save goes out against it instead of 409ing
+// over the translator's own work. The outbox threads queued siblings the same
+// way (threadVersionToSiblings).
+export function advanceHeldVerseBase(key: string, fromVersion: number, landed: PinnedVerseBase): void {
+  if (!holds.has(key)) return;
+  if (pinnedVerseBase.get(key)?.version !== fromVersion) return;
+  pinnedVerseBase.set(key, { version: landed.version, content: landed.content });
 }
