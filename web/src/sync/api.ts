@@ -2,6 +2,8 @@
 // dev proxy points /api/* at the local Worker; production serves the SPA
 // from the same origin as the Worker).
 
+import type { LexiconEntry } from "../hooks/lexiconStore";
+
 export type RowKind = "tn" | "tq" | "twl";
 
 export interface TnRow {
@@ -651,15 +653,27 @@ export interface SystemAlert {
   createdAt: number;
 }
 
+// GET /api/lexicon?strongs=... — UHAL/UGL entries for the given normalized
+// Strong's numbers. Goes through `request` (not raw fetch) so a hung lookup
+// times out and a non-OK status throws instead of being read as "no entries"
+// and cached as nulls in IndexedDB (#898).
+export async function fetchLexiconEntries(strongs: string[]): Promise<LexiconEntry[]> {
+  const res = await request<{ entries?: LexiconEntry[] }>(
+    `/api/lexicon?strongs=${encodeURIComponent(strongs.join(","))}`,
+  );
+  return res.entries ?? [];
+}
+
 // GET /api/alerts/me — undismissed banner alerts targeted at this user.
-// Empty array when there's nothing to show. Used by the App-level banner
-// stack rendered above the viewer alert.
-export async function fetchAlerts(): Promise<SystemAlert[]> {
+// Empty array when there's nothing to show; null on a 401 (not signed in
+// yet), so the caller can tell "no alerts" from "didn't get an answer". Used
+// by the App-level banner stack rendered above the viewer alert.
+export async function fetchAlerts(): Promise<SystemAlert[] | null> {
   try {
     const res = await request<{ alerts: SystemAlert[] }>(`/api/alerts/me`);
     return res.alerts;
   } catch (err) {
-    if (err instanceof ApiError && err.status === 401) return [];
+    if (err instanceof ApiError && err.status === 401) return null;
     throw err;
   }
 }
@@ -1415,6 +1429,27 @@ export interface AdminSyncStatusResponse {
   books: AdminBookSyncStatus[];
 }
 
+// GET /api/admin/merge-flags (issue #442) — only the exports whose Door43 PR
+// was rejected (closed unmerged, or validation failed) or has waited more than
+// a day. Merged and still-fresh exports are deliberately absent. `unchecked`
+// lists exports the server could not classify (budget, Door43 error), so the
+// panel can say so instead of implying they are fine.
+export interface AdminMergeFlag {
+  book: string;
+  resource: Resource;
+  prNumber: number;
+  exportedAt: number;
+  state: "waiting" | "rejected";
+  reason: "validation_failed" | "closed_unmerged" | null;
+  url: string;
+}
+
+export interface AdminMergeFlagsResponse {
+  flags: AdminMergeFlag[];
+  unchecked: Array<{ book: string; resource: Resource; prNumber: number; reason: string }>;
+  errors: Array<{ repo: string; message: string }>;
+}
+
 // GET /api/admin/sync-activity — durable, admin-only log of non-blocking
 // "record"-kind alerts (issue #535), e.g. "shipped to Door43 and overwrote
 // master's content as expected". These no longer appear in fetchAlerts()'s
@@ -2103,6 +2138,11 @@ export const api = {
       `/api/admin/sync-status${book ? `?book=${encodeURIComponent(book)}` : ""}`,
       { signal },
     ),
+
+  getAdminMergeFlags: (signal?: AbortSignal) =>
+    // Live Door43 reads; the server's worst case is ~40 s (exportMergeState.ts
+    // BUDGET), above the 30 s default. Matches the other heavy admin calls.
+    request<AdminMergeFlagsResponse>(`/api/admin/merge-flags`, { signal, timeoutMs: 120_000 }),
 
   getAdminSyncActivity: (signal?: AbortSignal) =>
     request<AdminSyncActivityResponse>(`/api/admin/sync-activity`, { signal }),

@@ -9,7 +9,7 @@ import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { TwlSuggestions } from "./TwlSuggestions";
 import { QuestionsTable } from "./QuestionsTable";
-import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
+import { AlignmentPanel, type AlignerLock, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { noteOverlapsRange } from "../lib/verseRange";
 import { hasLeftNoteVerse, type ActiveLocation } from "../lib/noteGuard";
 import { canonicalTwlOrder, twlDisplayOrder } from "../lib/twlCanonicalOrder";
@@ -76,6 +76,10 @@ export interface AlignmentTabProps {
   onOpenDual?: () => void;
   // Restore a previously-saved verse version from the panel's history button.
   onRestoreVersion?: (content: unknown, plainText: string | null) => void;
+  // #943: set while this verse can't be written (AI pipeline chapter lock,
+  // or a book lock that landed after the panel opened). Passed through to
+  // AlignmentPanel, which disables alignment changes, Save and history restore.
+  locked?: AlignerLock;
 }
 
 interface Props {
@@ -333,6 +337,24 @@ function groupByVerse<T extends { verse: number }>(rows: T[]): Array<[number, T[
   return [...map.entries()].sort(([a], [b]) => a - b);
 }
 
+// One pass over already-grouped, already-sorted verse buckets to a per-row
+// prev/next id lookup — the reorder neighbors a note card needs, without
+// re-filtering + indexOf'ing the peer array on every card render.
+function buildNoteNeighbors(
+  groups: Array<[number, TnRow[]]>,
+): Map<string, { prevId: string | null; nextId: string | null }> {
+  const out = new Map<string, { prevId: string | null; nextId: string | null }>();
+  for (const [, rows] of groups) {
+    for (let i = 0; i < rows.length; i++) {
+      out.set(rows[i].id, {
+        prevId: i > 0 ? rows[i - 1].id : null,
+        nextId: i < rows.length - 1 ? rows[i + 1].id : null,
+      });
+    }
+  }
+  return out;
+}
+
 export function ResourceColumn({
   book,
   chapter,
@@ -479,12 +501,16 @@ export function ResourceColumn({
   // Notes/questions filter on their ref_raw span (noteOverlapsRange), not just
   // the leading `verse`, so a bridged note ("1:2-3") shows on every verse it
   // covers — not only its leading verse. Singletons reduce to the old test.
-  const tnForVerse = useMemo(
+  const tnForVerseGroups = useMemo(
     () =>
-      groupByVerse(tn.filter((r) => noteOverlapsRange(r, rangeStart, rangeEnd))).flatMap(
-        ([, rows]) => sortBySortOrder(rows),
+      groupByVerse(tn.filter((r) => noteOverlapsRange(r, rangeStart, rangeEnd))).map(
+        ([v, rows]) => [v, sortBySortOrder(rows)] as [number, TnRow[]],
       ),
     [tn, rangeStart, rangeEnd],
+  );
+  const tnForVerse = useMemo(
+    () => tnForVerseGroups.flatMap(([, rows]) => rows),
+    [tnForVerseGroups],
   );
   const tqForVerse = useMemo(
     () =>
@@ -515,6 +541,14 @@ export function ResourceColumn({
         : null,
     [pinned.notes, tn],
   );
+  // Precomputed once per verse-group change rather than re-derived per card:
+  // renderNoteCard used to peers.filter(same verse) + indexOf on every card,
+  // O(n) work per card (O(n²) per group render). ids are enough — every
+  // consumer below only ever reads prevNote.id / nextNote.id.
+  const tnNeighbors = useMemo(
+    () => buildNoteNeighbors(pinned.notes && tnGroups ? tnGroups : tnForVerseGroups),
+    [pinned.notes, tnGroups, tnForVerseGroups],
+  );
   const tqGroups = useMemo(
     () =>
       pinned.questions
@@ -541,7 +575,10 @@ export function ResourceColumn({
   // the book-wide total in TopBar sums the server's book-summary query, which
   // excludes `trashed_at`. Counting raw array length here disagreed with that
   // total by exactly the trashed count for any chapter holding a trashed note.
-  const totalTn = (pinned.notes ? tn : tnForVerse).filter((r) => r.trashed_at == null).length;
+  const totalTn = useMemo(
+    () => (pinned.notes ? tn : tnForVerse).filter((r) => r.trashed_at == null).length,
+    [pinned.notes, tn, tnForVerse],
+  );
   const totalTwl = pinned.words ? twl.length : twlForVerse.length;
   const totalTq = pinned.questions ? tq.length : tqForVerse.length;
 
@@ -592,6 +629,13 @@ export function ResourceColumn({
   const noteFocusRef = useRef<{ id: string; dir: "up" | "down" } | null>(null);
   const [recentNoteMove, setRecentNoteMove] = useState<{ id: string; dir: "up" | "down" } | null>(null);
   const noteFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Deliberately no dependency array: this must run after EVERY render to poll
+  // noteFocusRef, which an arrow-key handler sets synchronously outside any
+  // tracked dependency. The `pending`/early-return guard (immediately clearing
+  // the ref) makes each run a no-op unless that handler just fired, so this is
+  // not the unbounded setState loop the rule assumes — `[]` would only run it
+  // once at mount and never see a later arrow-key move.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useLayoutEffect(() => {
     const pending = noteFocusRef.current;
     if (!pending) return;
@@ -814,6 +858,17 @@ export function ResourceColumn({
       return;
     }
     clearCenter();
+    // `pinned` (the whole object) and `showResource` are deliberately excluded.
+    // This effect is keyed on scrollNonce as its one-shot navigation trigger —
+    // see STATE.md's lesson on exactly this class of bug: a scroll/nav effect
+    // must fire on an explicit token, never on a prop that churns identity on
+    // unrelated re-renders. `showResource` is a plain inline function
+    // (recreated every render, not a useCallback), and `pinned` is read here
+    // only through its three stable primitive fields (already listed below) —
+    // depending on the parent object too would re-fire this on every render
+    // that hands down a new `pinned` reference, jerking the scroll position
+    // outside of an actual navigation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     scrollNonce,
     jumpTab,
@@ -927,6 +982,7 @@ export function ResourceColumn({
             onDirtyChange={alignmentProps.onDirtyChange}
             onOpenDual={alignmentProps.onOpenDual}
             onRestoreVersion={alignmentProps.onRestoreVersion}
+            locked={alignmentProps.locked}
           />
         ) : (
           <Box sx={{ p: 3 }}>
@@ -967,7 +1023,7 @@ export function ResourceColumn({
                 tnGroups.map(([verse, rows]) => (
                   <Fragment key={`tn-${verse}`}>
                     <VerseGroupHead verse={verse} active={verse === activeVerse} section="notes" />
-                    {rows.map((r) => renderNoteCard(r, rows))}
+                    {rows.map((r) => renderNoteCard(r))}
                   </Fragment>
                 ))
               )
@@ -976,7 +1032,7 @@ export function ResourceColumn({
                 no notes for this verse
               </Typography>
             ) : (
-              tnForVerse.map((r) => renderNoteCard(r, tnForVerse))
+              tnForVerse.map((r) => renderNoteCard(r))
             )}
           </>
         )}
@@ -1234,17 +1290,16 @@ export function ResourceColumn({
     );
   }
 
-  function renderNoteCard(r: TnRow, peers: TnRow[]) {
+  function renderNoteCard(r: TnRow) {
     const showBefore =
       dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "before";
     const showAfter =
       dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "after";
     // Only navigate within the same verse — displayVerseRange can span multiple
     // verses, but onNoteReorder in Shell operates per-verse via sortedForVerse.
-    const samePeers = peers.filter((p) => p.verse === r.verse);
-    const idx = samePeers.indexOf(r);
-    const prevNote = idx > 0 ? samePeers[idx - 1] : null;
-    const nextNote = idx < samePeers.length - 1 ? samePeers[idx + 1] : null;
+    // Precomputed in tnNeighbors (see comment there) rather than
+    // peers.filter(same verse) + indexOf per card.
+    const { prevId, nextId } = tnNeighbors.get(r.id) ?? { prevId: null, nextId: null };
     return (
       <Fragment key={r.id}>
         {showBefore && <DropIndicator />}
@@ -1285,23 +1340,23 @@ export function ResourceColumn({
               : undefined
           }
           onGripDragStart={() => setDragId(r.id)}
-          prevNoteId={prevNote?.id ?? null}
-          nextNoteId={nextNote?.id ?? null}
+          prevNoteId={prevId}
+          nextNoteId={nextId}
           onMoveUp={
-            prevNote
+            prevId
               ? () => {
                   noteFocusRef.current = { id: r.id, dir: "up" };
-                  onNoteReorder(r.id, prevNote.id, "before");
-                  onReorderPreview?.(computeNeighbors(r.id, prevNote.id, "before"), true);
+                  onNoteReorder(r.id, prevId, "before");
+                  onReorderPreview?.(computeNeighbors(r.id, prevId, "before"), true);
                 }
               : undefined
           }
           onMoveDown={
-            nextNote
+            nextId
               ? () => {
                   noteFocusRef.current = { id: r.id, dir: "down" };
-                  onNoteReorder(r.id, nextNote.id, "after");
-                  onReorderPreview?.(computeNeighbors(r.id, nextNote.id, "after"), true);
+                  onNoteReorder(r.id, nextId, "after");
+                  onReorderPreview?.(computeNeighbors(r.id, nextId, "after"), true);
                 }
               : undefined
           }
@@ -1310,9 +1365,7 @@ export function ResourceColumn({
             onReorderPreview
               ? (entering) =>
                   onReorderPreview(
-                    entering
-                      ? { verse: r.verse, movedId: r.id, prevId: prevNote?.id ?? null, nextId: nextNote?.id ?? null }
-                      : null,
+                    entering ? { verse: r.verse, movedId: r.id, prevId, nextId } : null,
                     false,
                   )
               : undefined

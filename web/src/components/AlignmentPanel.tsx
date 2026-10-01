@@ -68,6 +68,7 @@ import {
   type StreamWord,
 } from "../lib/alignmentSuggest";
 import { SourceTooltipBody } from "./SourceTooltipBody";
+import { LexTooltip } from "./LexTooltip";
 import { UhbStrip, buildTwHintMap, twHintFromMap } from "./UhbStrip";
 import { directionForVersion } from "../lib/direction";
 import {
@@ -198,7 +199,18 @@ interface Props {
   // shared strip and the opposite panel agree on which Hebrew token is meant
   // even when the two versions cover different verse ranges. 0 standalone.
   posOffset?: number;
+  // #943: why this verse can't be written right now. "chapter" = an AI
+  // pipeline holds the chapter's verse resource (a save would 409
+  // chapter_locked); "book" = the book is locked (entry is already blocked,
+  // this covers a lock that lands while the panel is open). The panel stays
+  // open for reading, but every alignment change (drag, merge, clear, accept
+  // suggestion), Save and the history dialog's restore are disabled. See
+  // Shell's alignmentTabProps for why entry isn't gated on a pipeline lock.
+  locked?: AlignerLock;
 }
+
+// #943: see Props.locked.
+export type AlignerLock = "chapter" | "book" | false;
 
 const VerseHistoryDialog = lazy(() =>
   import("./VerseHistoryDialog").then((m) => ({ default: m.VerseHistoryDialog })),
@@ -229,6 +241,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       hideCancel = false,
       showSourceInfo = true,
       posOffset = 0,
+      locked = false,
     },
     ref,
   ) {
@@ -439,6 +452,13 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       return () => {
         cancelled = true;
       };
+      // `initial` excluded deliberately: it's only ever set by this same effect
+      // (setInitial above), and it's read here only to detect an in-progress
+      // drag (stateRef.current === initial) at the moment this effect fires.
+      // Listing it would make the effect re-run immediately after its own
+      // setInitial call, on every rebase/reset — a self-triggered feedback loop
+      // in alignment-critical code.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [computedInitial, verse, book, chapter, verseNum, bibleVersion, sourceVerseObjects]);
 
     // Dismissals are per (verse, version) and only for this session — reset when
@@ -473,14 +493,16 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       return () => clearTimeout(t);
     }, [state, dirty, verse, book, chapter, verseNum, bibleVersion]);
 
+    // #943: every alignment mutation below returns early while locked, so a
+    // translator can't build up drags that can only be discarded.
     const handleTargetsDrop = (dest: string, wordIds: string[]) => {
-      if (!state || wordIds.length === 0) return;
+      if (locked || !state || wordIds.length === 0) return;
       setState(moveTargets(state, wordIds, dest));
       setSelectedUnaligned(new Set());
       setSelectionAnchor(null);
     };
     const handleSourceDrop = (destGroupId: string, sourceId: string) => {
-      if (!state) return;
+      if (locked || !state) return;
       // The drop target is a DISPLAY card, which may have collapsed several
       // state groups sharing a source position (occ 1/2 + 2/2 over-count → one
       // physical token, see displayGroups/mergeSamePositionGroups). Add the
@@ -509,7 +531,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       );
     };
     const handleExtractSource = (sourceId: string) => {
-      if (!state) return;
+      if (locked || !state) return;
       setState(extractSource(state, sourceId));
     };
     // Resolve a DISPLAY card id back to EVERY state group it collapsed — by
@@ -529,7 +551,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // a position-fused card standing for several state groups (see
     // mergeGroupsToGroups), so resolve both to all their underlying groups.
     const handleMergeGroups = (dropTargetId: string, draggedId: string) => {
-      if (!state || dropTargetId === draggedId) return;
+      if (locked || !state || dropTargetId === draggedId) return;
       const order = displayGroups.map((g) => g.id);
       const ti = order.indexOf(dropTargetId);
       const di = order.indexOf(draggedId);
@@ -551,12 +573,12 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       setSelectionAnchor(null);
     };
     const handleUndoMerge = () => {
-      if (!mergeUndo) return;
+      if (locked || !mergeUndo) return;
       setState(mergeUndo);
       setMergeUndo(null);
     };
     const handleClearGroup = (groupId: string) => {
-      if (!state) return;
+      if (locked || !state) return;
       const target = state.groups.find((g) => g.id === groupId);
       if (!target) return;
       // Clear EVERY underlying group the displayed card collapsed together, not
@@ -788,7 +810,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       });
     };
     const handleAcceptAllGhosts = () => {
-      if (!state || ghostByGroup.size === 0) return;
+      if (locked || !state || ghostByGroup.size === 0) return;
       let next = state;
       for (const gh of ghostByGroup.values()) {
         next = moveTargets(next, gh.wordIds, `g:${gh.groupId}`);
@@ -810,7 +832,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       lastDraftGenerationRef.current = undefined;
     }, [initial, book, chapter, verseNum, bibleVersion]);
     const handleClearAll = () => {
-      if (!state) return;
+      if (locked || !state) return;
       setState(clearAll(state));
       setSelectedUnaligned(new Set());
       setSelectionAnchor(null);
@@ -940,6 +962,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           overflow: "hidden",
           bgcolor: "background.paper",
         }}
+        // #943: no drag can start while locked (the handlers above also
+        // refuse; this keeps the drag ghost from appearing at all).
+        onDragStartCapture={locked ? (e) => e.preventDefault() : undefined}
       >
         {!state && (
           <Box sx={{ p: 3 }}>
@@ -1004,6 +1029,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
                 onSourceDrop={handleSourceDrop}
                 onExtractSource={handleExtractSource}
                 onClearGroup={handleClearGroup}
+                locked={!!locked}
                 onMerge={handleMergeGroups}
                 draggingGroupId={draggingGroupId}
                 onGroupDragStart={setDraggingGroupId}
@@ -1017,6 +1043,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
             </Box>
             <ActionBar
               dirty={dirty}
+              locked={locked}
               ghostCount={ghostByGroup.size}
               onAcceptAll={handleAcceptAllGhosts}
               onClear={handleClearAll}
@@ -1066,7 +1093,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
               chapter={chapter}
               verseNum={verseNum}
               bibleVersion={bibleVersion}
+              verseEnd={verse.verse_end ?? null}
               currentVersion={verse.version}
+              canRestore={!locked}
               onClose={() => setHistoryOpen(false)}
               onUseVersion={(content, plainText) => onRestoreVersion?.(content, plainText)}
             />
@@ -1349,6 +1378,7 @@ function SectionHeader({ count }: { count: number }) {
 // ─── Action bar ────────────────────────────────────────────────────────
 function ActionBar({
   dirty,
+  locked = false,
   ghostCount,
   onAcceptAll,
   onClear,
@@ -1362,6 +1392,7 @@ function ActionBar({
   onOpenHistory,
 }: {
   dirty: boolean;
+  locked?: AlignerLock;
   ghostCount: number;
   onAcceptAll: () => void;
   onClear: () => void;
@@ -1397,6 +1428,27 @@ function ActionBar({
       >
         editing {bibleVersion}
       </Typography>
+      {locked && (
+        <Tooltip
+          title={
+            locked === "book"
+              ? "This book is locked, so alignment changes can't be made right now"
+              : "An AI run is in progress on this chapter, so alignment changes can't be made right now"
+          }
+        >
+          <Typography
+            variant="caption"
+            sx={{
+              fontFamily: "monospace",
+              color: "warning.dark",
+              fontSize: 10,
+              ml: 1,
+            }}
+          >
+            🔒 {locked} locked
+          </Typography>
+        </Tooltip>
+      )}
       {/* Spacer keeps the actions right-aligned when the bar fits on one line;
           when it doesn't (narrow laptop screens), the actions wrap to a second
           row instead of the rightmost Save button overflowing off-screen. */}
@@ -1440,6 +1492,7 @@ function ActionBar({
           size="small"
           variant="outlined"
           onClick={onAcceptAll}
+          disabled={!!locked}
           sx={{
             textTransform: "none",
             fontSize: 11,
@@ -1455,6 +1508,7 @@ function ActionBar({
       <Button
         size="small"
         onClick={onClear}
+        disabled={!!locked}
         sx={{
           color: "error.main",
           textTransform: "uppercase",
@@ -1494,21 +1548,25 @@ function ActionBar({
           Cancel
         </Button>
       )}
-      <Button
-        size="small"
-        variant="contained"
-        onClick={() => onSave()}
-        disabled={!dirty}
-        sx={{
-          textTransform: "uppercase",
-          fontSize: 11,
-          letterSpacing: "0.06em",
-          fontWeight: 700,
-          px: 2,
-        }}
-      >
-        Save {bibleVersion}
-      </Button>
+      <Tooltip title={locked ? `${locked === "book" ? "Book" : "Chapter"} locked` : ""}>
+        <span>
+          <Button
+            size="small"
+            variant="contained"
+            onClick={() => onSave()}
+            disabled={!dirty || !!locked}
+            sx={{
+              textTransform: "uppercase",
+              fontSize: 11,
+              letterSpacing: "0.06em",
+              fontWeight: 700,
+              px: 2,
+            }}
+          >
+            Save {bibleVersion}
+          </Button>
+        </span>
+      </Tooltip>
     </Stack>
   );
 }
@@ -1526,6 +1584,7 @@ function AlignmentCards({
   onSourceDrop,
   onExtractSource,
   onClearGroup,
+  locked,
   onMerge,
   draggingGroupId,
   onGroupDragStart,
@@ -1547,6 +1606,9 @@ function AlignmentCards({
   onSourceDrop: (destGroupId: string, sourceId: string) => void;
   onExtractSource: (sourceId: string) => void;
   onClearGroup: (groupId: string) => void;
+  // #943: hide the per-card clear (x) and the suggestion chip while locked;
+  // their handlers refuse anyway, so a visible control would do nothing.
+  locked: boolean;
   onMerge: (dropTargetId: string, draggedId: string) => void;
   draggingGroupId: string | null;
   onGroupDragStart: (groupId: string) => void;
@@ -1636,7 +1698,7 @@ function AlignmentCards({
               );
             })}
           </Box>
-          {(g.targets.length > 0 || g.source.length > 1) && (
+          {!locked && (g.targets.length > 0 || g.source.length > 1) && (
             <Tooltip title="clear this group (send English back to the word bank, split compound source)">
               <IconButton
                 size="small"
@@ -1659,7 +1721,7 @@ function AlignmentCards({
           )}
           <Stack direction="row" spacing={0.5} flexWrap="wrap" rowGap={0.5} sx={{ direction: "ltr" }}>
             {g.targets.length === 0 ? (
-              ghost ? (
+              ghost && !locked ? (
                 <GhostChip
                   ghost={ghost}
                   onAccept={() => onAcceptGhost(ghost.groupId, ghost.wordIds)}
@@ -1730,6 +1792,7 @@ function DropTargetCard({
   const showOver = over && !isMergeTarget && !isBeingDragged;
   return (
     <Paper
+      data-lex-region
       elevation={0}
       onDragOver={(e) => {
         e.preventDefault();
@@ -1871,7 +1934,7 @@ function SourceWordTypography({
   const tone = hctx.hebrewHighlight(pos, groupId);
   const showInfo = hctx.showSourceInfo;
   return (
-    <Tooltip
+    <LexTooltip
       enterDelay={0}
       enterNextDelay={0}
       title={
@@ -1995,7 +2058,7 @@ function SourceWordTypography({
           </Box>
         )}
       </Box>
-    </Tooltip>
+    </LexTooltip>
   );
 }
 

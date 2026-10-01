@@ -11,6 +11,7 @@
 // in-app navigation instead.
 
 import { resolveBook } from "./bookNames.ts";
+import { noteCoveredVerses } from "./verseRange.ts";
 
 export interface NoteLinkTarget {
   // Uppercase 3-letter USFM book code.
@@ -91,4 +92,35 @@ export function parseNoteSegments(text: string, currentBook: string): NoteSegmen
     segments.push({ type: "text", text: text.slice(lastIndex), start: lastIndex, end: text.length });
   }
   return segments;
+}
+
+// Issue #934: hovering a "see how you translated this" link previews the note
+// it points back to. The link only carries a verse, not a row id, so pick the
+// target verse's live tn rows (bridges included — a "1:2-3" note covers 3) and,
+// when the linking note has a support reference, narrow to rows sharing it:
+// that is the note the "see how" is actually echoing. No match on the support
+// reference falls back to every note on the verse rather than showing nothing.
+export interface LinkableNoteRow {
+  verse: number;
+  ref_raw?: string | null;
+  support_reference: string | null;
+  sort_order: number | null;
+  trashed_at: number | null;
+  deleted_at: number | null;
+}
+
+export function pickLinkedNotes<T extends LinkableNoteRow>(
+  rows: readonly T[],
+  verse: number,
+  supportRef: string | null | undefined,
+): { notes: T[]; matchedSupport: boolean } {
+  const onVerse = rows
+    .filter((r) => r.deleted_at == null && r.trashed_at == null)
+    .filter((r) => noteCoveredVerses(r).includes(verse))
+    .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+  if (supportRef) {
+    const same = onVerse.filter((r) => r.support_reference === supportRef);
+    if (same.length > 0) return { notes: same, matchedSupport: true };
+  }
+  return { notes: onVerse, matchedSupport: false };
 }

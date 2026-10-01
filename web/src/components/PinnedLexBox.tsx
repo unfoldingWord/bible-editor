@@ -1,34 +1,108 @@
 // The pinned lexical box: double-clicking a Hebrew/Greek source word opens this
-// interactive Popover with the same lexical info as the hover Tooltip, but with
+// panel with the same lexical info as the hover Tooltip, but with
 // selectable/copyable text (the hover Tooltip is pointerEvents:none and can't
-// be). A copy button lifts the lexical form (lemma) to the clipboard; an X
-// closes it. Shared by the scripture-column source line (HebrewLine) and the
+// be). A copy button lifts the lexical form (lemma) to the clipboard; the X
+// closes it. No Esc shortcut: inside the aligner Dialog, Esc would also close
+// the aligner.
+//
+// It used to be a Popover anchored to the clicked word, which jumped whenever
+// the word moved or re-rendered and closed on any outside click (#1053). Now
+// there is ONE non-modal panel for the whole app, mounted by <PinnedLexHost/>,
+// at a fixed screen spot the user can drag; its position is remembered per
+// browser. Double-clicking another word just swaps its contents. Words call
+// pinLex() — used by the scripture-column source line (HebrewLine) and the
 // aligner's UHB strip (UhbStrip).
 
-import { useState } from "react";
-import { Popover, IconButton, Tooltip } from "@mui/material";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { Paper, Portal, IconButton, Tooltip, Box } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
 import CheckIcon from "@mui/icons-material/Check";
+import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import type { SourceWord } from "../lib/alignment";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 
-export function PinnedLexBox({
-  anchorEl,
-  source,
-  lex,
-  twHint,
-  onClose,
-}: {
-  anchorEl: HTMLElement;
-  source: SourceWord;
-  lex: LexiconEntry | null;
-  twHint: string | null;
-  onClose: () => void;
-}) {
-  const lemma = lex?.lemma || source.lemma || "";
+type Pinned = { source: SourceWord; lex: LexiconEntry | null; twHint: string | null };
+
+let pinned: Pinned | null = null;
+const listeners = new Set<() => void>();
+const emit = () => listeners.forEach((l) => l());
+const subscribe = (l: () => void) => {
+  listeners.add(l);
+  return () => listeners.delete(l);
+};
+
+export function pinLex(source: SourceWord, lex: LexiconEntry | null, twHint: string | null) {
+  pinned = { source, lex, twHint };
+  emit();
+}
+
+// A word pinned before its lexicon entry loaded is pinned with lex=null. Each
+// source word calls this on render; once the entry arrives it fills the pin
+// in. Entries are keyed by Strong's, so any word with the same Strong's can.
+export function usePinnedLexRefresh(source: SourceWord, lex: LexiconEntry | null) {
+  useEffect(() => {
+    if (lex && pinned && !pinned.lex && pinned.source.strong === source.strong) {
+      pinned = { ...pinned, lex };
+      emit();
+    }
+  }, [source.strong, lex]);
+}
+
+function unpinLex() {
+  pinned = null;
+  emit();
+}
+
+const POS_KEY = "bible-editor.lexbox.pos";
+const WIDTH = 360;
+
+type Pos = { x: number; y: number };
+
+function loadPos(): Pos | null {
+  try {
+    const p = JSON.parse(localStorage.getItem(POS_KEY) ?? "null");
+    if (p && typeof p.x === "number" && typeof p.y === "number") return p;
+  } catch {
+    // storage blocked or bad JSON — use the default spot
+  }
+  return null;
+}
+
+// Keep the panel's header on screen after a drag or a window resize.
+function clamp(p: Pos): Pos {
+  return {
+    x: Math.min(Math.max(0, p.x), Math.max(0, window.innerWidth - WIDTH)),
+    y: Math.min(Math.max(0, p.y), Math.max(0, window.innerHeight - 40)),
+  };
+}
+
+export function PinnedLexHost() {
+  const current = useSyncExternalStore(subscribe, () => pinned);
+  // null = default spot (bottom-right corner, anchored by right/bottom).
+  const [pos, setPos] = useState<Pos | null>(() => {
+    const p = loadPos();
+    return p ? clamp(p) : null;
+  });
+  const paperRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
+
+  useEffect(() => setCopied(false), [current?.source]);
+
+  useEffect(() => {
+    if (!current) return;
+    const onResize = () => setPos((p) => (p ? clamp(p) : p));
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+    };
+  }, [current]);
+
+  if (!current) return null;
+  const { source, lex, twHint } = current;
+  const lemma = lex?.lemma || source.lemma || "";
+
   const copy = async () => {
     if (!lemma) return;
     try {
@@ -39,52 +113,87 @@ export function PinnedLexBox({
       // clipboard blocked (insecure context / permissions) — no-op
     }
   };
+
+  const startDrag = (e: React.PointerEvent) => {
+    const rect = paperRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    e.preventDefault();
+    const dx = e.clientX - rect.left;
+    const dy = e.clientY - rect.top;
+    let last: Pos = { x: rect.left, y: rect.top };
+    const move = (ev: PointerEvent) => {
+      last = clamp({ x: ev.clientX - dx, y: ev.clientY - dy });
+      setPos(last);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      try {
+        localStorage.setItem(POS_KEY, JSON.stringify(last));
+      } catch {
+        // storage blocked — position just isn't remembered
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  };
+
+  const iconSx = { color: "rgba(255,255,255,0.7)" };
   return (
-    <Popover
-      open
-      anchorEl={anchorEl}
-      onClose={onClose}
-      anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
-      transformOrigin={{ vertical: "top", horizontal: "center" }}
-      slotProps={{
-        paper: {
-          sx: {
-            bgcolor: "rgba(33,33,33,0.97)",
-            color: "#fff",
-            maxWidth: 360,
-            p: 1,
-            pt: 3,
-            position: "relative",
-            overflow: "visible",
-          },
-        },
-      }}
-    >
-      {lemma && (
-        <Tooltip title={copied ? "copied" : "copy lexical form"}>
+    <Portal>
+      <Paper
+        ref={paperRef}
+        role="dialog"
+        aria-label="lexical information"
+        elevation={8}
+        sx={(theme) => ({
+          position: "fixed",
+          // Above Dialogs (the aligner), below Snackbars and hover tooltips.
+          zIndex: theme.zIndex.modal + 1,
+          ...(pos ? { left: pos.x, top: pos.y } : { right: 16, bottom: 16 }),
+          width: WIDTH,
+          maxWidth: "calc(100vw - 16px)",
+          maxHeight: "60vh",
+          overflow: "auto",
+          bgcolor: "rgba(33,33,33,0.97)",
+          color: "#fff",
+          p: 1,
+          pt: 0,
+        })}
+      >
+        <Box
+          onPointerDown={startDrag}
+          sx={{ display: "flex", alignItems: "center", cursor: "move", mx: -0.5, userSelect: "none", touchAction: "none" }}
+        >
+          <DragIndicatorIcon sx={{ fontSize: 16, ...iconSx }} />
+          {lemma && (
+            <Tooltip title={copied ? "copied" : "copy lexical form"}>
+              <IconButton
+                size="small"
+                aria-label="copy lexical form"
+                onClick={copy}
+                onPointerDown={(e) => e.stopPropagation()}
+                sx={iconSx}
+              >
+                {copied ? <CheckIcon sx={{ fontSize: 15 }} /> : <ContentCopyIcon sx={{ fontSize: 15 }} />}
+              </IconButton>
+            </Tooltip>
+          )}
+          <Box sx={{ flex: 1 }} />
           <IconButton
             size="small"
-            aria-label="copy lexical form"
-            onClick={copy}
-            sx={{ position: "absolute", top: 2, left: 2, color: "rgba(255,255,255,0.7)" }}
+            aria-label="close"
+            onClick={unpinLex}
+            onPointerDown={(e) => e.stopPropagation()}
+            sx={iconSx}
           >
-            {copied ? (
-              <CheckIcon sx={{ fontSize: 15 }} />
-            ) : (
-              <ContentCopyIcon sx={{ fontSize: 15 }} />
-            )}
+            <CloseIcon sx={{ fontSize: 16 }} />
           </IconButton>
-        </Tooltip>
-      )}
-      <IconButton
-        size="small"
-        aria-label="close"
-        onClick={onClose}
-        sx={{ position: "absolute", top: 2, right: 2, color: "rgba(255,255,255,0.7)" }}
-      >
-        <CloseIcon sx={{ fontSize: 16 }} />
-      </IconButton>
-      <SourceTooltipBody source={source} lex={lex} twHint={twHint} />
-    </Popover>
+        </Box>
+        <SourceTooltipBody source={source} lex={lex} twHint={twHint} />
+      </Paper>
+    </Portal>
   );
 }

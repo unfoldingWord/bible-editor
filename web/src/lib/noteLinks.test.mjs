@@ -8,7 +8,7 @@
 // book code) must fall through as plain text so NoteCard never renders a dead
 // link or drops real note content.
 
-import { parseNoteSegments, resolveNoteLinkHref } from "./noteLinks.ts";
+import { parseNoteSegments, pickLinkedNotes, resolveNoteLinkHref } from "./noteLinks.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -147,6 +147,28 @@ function linksOf(text, book) {
 }
 {
   assert(resolveNoteLinkHref("rc://*/ta/man/translate/figs-metaphor", "ZEC") === null, "an rc:// href is not a note link");
+}
+
+// ── pickLinkedNotes (issue #934: hover preview of the linked note) ──
+{
+  const row = (id, verse, support, extra = {}) => ({
+    id, verse, ref_raw: `1:${verse}`, support_reference: support, sort_order: 0,
+    trashed_at: null, deleted_at: null, ...extra,
+  });
+  const rows = [
+    row("a", 3, "rc://*/ta/man/translate/figs-metaphor", { sort_order: 2 }),
+    row("b", 3, "rc://*/ta/man/translate/figs-idiom", { sort_order: 1 }),
+    row("c", 4, "rc://*/ta/man/translate/figs-metaphor"),
+    row("d", 3, "rc://*/ta/man/translate/figs-metaphor", { trashed_at: 1 }),
+    row("e", 2, "rc://*/ta/man/translate/figs-metaphor", { ref_raw: "1:2-3" }),
+  ];
+  const hit = pickLinkedNotes(rows, 3, "rc://*/ta/man/translate/figs-metaphor");
+  assert(hit.matchedSupport, "same support reference is matched");
+  assert(hit.notes.map((r) => r.id).join(",") === "e,a", "matches same-support notes on the verse, bridges included, trashed excluded");
+  const miss = pickLinkedNotes(rows, 3, "rc://*/ta/man/translate/figs-simile");
+  assert(!miss.matchedSupport && miss.notes.map((r) => r.id).join(",") === "e,b,a", "no support match falls back to every live note on the verse, in sort order");
+  const none = pickLinkedNotes(rows, 9, null);
+  assert(none.notes.length === 0, "a verse with no notes yields none");
 }
 
 if (failed > 0) {

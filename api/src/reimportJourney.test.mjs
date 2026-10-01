@@ -349,7 +349,7 @@ console.log("\n[a COERCED id must never count as blocked — review finding F4]"
 {
   const { sqlite, env } = freshEnv();
   seedTombstone(sqlite, { ref: "5:4", chapter: 5, verse: 4 });
-  // coerceRowId hashes a malformed master id into a 96-id space, so landing on
+  // coerceRowId hashes a malformed master id into a new one, so landing on
   // an unrelated tombstone at a different reference is an expected collision,
   // not evidence master reissued anything. Counting it would freeze the export.
   const counts = await applyTsvRows(env, BOOK, "tq", [masterRow({ ref: "23:7", idCoerced: true })], null);
@@ -974,6 +974,40 @@ console.log("\n[reference-move attribution at the caller]");
     await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, { confirmedAt: 200, editId: boundary });
     const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01'`).all()[0];
     eq(row.review_kind, "merge_conflict", "a merge_conflict survives an agreed-reference run");
+  }
+
+  // 9. A #547 item 1 escalation keyed on ref-level lineage evidence was tried
+  //    and reverted (PR #854 multi-model review, 2026-09-21): a DIFFERENT
+  //    row sitting at the SAME ancestor verse being touched by a Door43
+  //    editor must NOT hold THIS row's legitimate app-side move. Shaped like
+  //    case 1 (D1 at 1:6, master reporting 1:2, same as the ancestor) with
+  //    lineage evidence naming "1:2" as human-touched — exactly what a
+  //    neighboring tn/tq note at that verse would produce, since
+  //    refsTouchedInTsv (masterLineage.ts) maps evidence to the Reference
+  //    column with no row-id filter. Must classify identically to case 1:
+  //    no hold, no flag, published.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite);
+    const lineage = {
+      mayHoldHumanEdit: true,
+      hasHumanCommit: true,
+      incomplete: false,
+      incompleteReason: "",
+      counts: { ours: 0, ai: 0, human: 1 },
+      humanShas: ["a".repeat(40)],
+      refsComplete: true,
+      humanRefs: ["1:2"],
+      refsReason: "",
+    };
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:2", 1, 2)], null, {
+      confirmedAt: 200, editId: boundary, lineage,
+    });
+    eq(counts.ref_moved_ours, 1, "still attributed to us — verse-level evidence must not stand in for row-level proof");
+    eq(counts.ref_moved_both, 0, "…never escalated to both_moved");
+    eq(counts.apply_incomplete, false, "…and the resource watermark is NOT withheld");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, null, "…and no flag is raised");
   }
 }
 
@@ -2869,6 +2903,262 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
     const rows = sqlite.prepare(`SELECT id, review_kind FROM tq_rows ORDER BY id`).all();
     eq(rows.map((r) => r.review_kind), ["merge_conflict", null], "…an unacknowledged merge_conflict stands");
   }
+
+  // 7. Issue #861: a ledger-sourced walk (repo-scoped Gitea history) whose
+  //    newest relevant commit is one of OUR OWN nightly export merges — the
+  //    common case, since we export nightly — must not spuriously abort.
+  //    `readLedgerMasterLineage` narrows repo-scoped history to one path, but
+  //    the commits it returns can still be Gitea MERGE-WRAPPER commits
+  //    (classifyForLedger's own doc comment: `Merge pull request 'bible-editor:
+  //    …' from … into master`), which Gitea's PATH-scoped history (what
+  //    listMasterCommitsSince fetches) never shows at all (masterLineage.ts
+  //    note 4). Two bugs compounded here, both fixed together: (1) the
+  //    human-commit check re-derived `kind` from the wrapper subject alone via
+  //    classifyMasterCommit, which OURS_PREFIX never matches, misreading our
+  //    own merge as human; (2) the pre-write tip recheck compared that same
+  //    merge sha against path-scoped history's answer for the same window,
+  //    which — once (1) is fixed — never carries the merge sha at all.
+  {
+    const MERGE_SHA = "22d652732b18";
+    // The exact production shape classifyForLedger documents: a Gitea merge
+    // commit wrapping our own export's PR title. Already correctly classified
+    // `ours` by the ledger at poll time (masterLineageLedger.ts's
+    // classifyStored reads dcs_commits.classification, never reclassifying) —
+    // this fixture models that stored, already-correct shape.
+    const LEDGER_MERGE_COMMIT = {
+      sha: MERGE_SHA,
+      message: "Merge pull request 'bible-editor: 1CH tq -> master (#7001)' from 1CH-tq-be into master",
+      authorEmail: "someone@example.com",
+      authorName: "Someone",
+      date: "2026-08-28T00:00:00Z",
+      kind: "ours",
+      reason: "merge_of_bible_editor_export",
+    };
+    const LEDGER_PAGE = { commits: [LEDGER_MERGE_COMMIT], incomplete: false, incompleteReason: "" };
+    // A Gitea double that answers the repo-head probe (no `&path=` — see
+    // repoHeadCommitSha) with a given sha, and every PATH-scoped call (every
+    // other request this function makes, which all carry `&path=`) with an
+    // EMPTY page — modeling Gitea's own path-history simplification dropping
+    // the merge commit from that scope entirely.
+    const gitea = (repoHeadSha) => async (url) => {
+      if (String(url).includes("&path=")) return giteaPage([])();
+      return giteaPage([{ ...LEDGER_MERGE_COMMIT, sha: repoHeadSha }])();
+    };
+
+    // 7a. Without passing ledgerRepoHead (the pre-#861 call shape), the same
+    //     ledger page spuriously blocks: classifyMasterCommit alone misreads
+    //     the wrapper subject as human.
+    {
+      const { sqlite, env } = freshEnv();
+      seedFlagged(sqlite);
+      const cleared = await withFetch(gitea(MERGE_SHA), () =>
+        clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, LEDGER_PAGE, FILE, MERGE_SHA),
+      );
+      eq(cleared, 0, "pre-#861 call shape: ledger page misread as a human commit, clear blocked");
+    }
+
+    // 7b. With ledgerRepoHead, both fixes apply: the merge is recognized as
+    //     `ours` (no reclassification) and the recheck re-probes the repo head
+    //     instead of path-scoped history — so the flag clears.
+    {
+      const { sqlite, env } = freshEnv();
+      seedFlagged(sqlite);
+      const cleared = await withFetch(gitea(MERGE_SHA), () =>
+        clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, LEDGER_PAGE, FILE, MERGE_SHA, null, MERGE_SHA),
+      );
+      eq(cleared, 2, "both flags retired: the ledger-sourced merge clears against a repo-head recheck");
+    }
+
+    // 7c. A GENUINE master move since the ledger read is still caught: the
+    //     repo-head probe now answers with a different sha.
+    {
+      const { sqlite, env } = freshEnv();
+      seedFlagged(sqlite);
+      const cleared = await withFetch(gitea("newsha000000"), () =>
+        clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, LEDGER_PAGE, FILE, MERGE_SHA, null, MERGE_SHA),
+      );
+      eq(cleared, 0, "a real repo-head move between the ledger read and the write still blocks the clear");
+    }
+  }
+}
+
+console.log("\n[issue #691: clearResolvedMergeNoBase consults the dcs_commits ledger before a live walk]");
+{
+  // Real schema, real tables: dcs_repo_polls / dcs_commits (migrations 0059 +
+  // 0065) exactly as readLedgerMasterLineage reads them, and the real
+  // clearResolvedMergeNoBase (via its *ForTest alias) — not a re-typed mock of
+  // either.
+  const NOW = Math.floor(Date.now() / 1000);
+  const FILE = { repo: "en_tq", path: "tq_1CH.tsv" };
+  const WINDOW_START = NOW - 5 * 86400;
+  const REPO_HEAD = "ledgertip1";
+
+  const seedLedgerPoll = (
+    sqlite,
+    { lastSha = REPO_HEAD, coverageSince = WINDOW_START - 86400, lastSuccessAt = NOW - 60 } = {},
+  ) => {
+    sqlite
+      .prepare(
+        `INSERT INTO dcs_repo_polls (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
+                                      last_status, gap_since_sha, gap_at, coverage_since)
+         VALUES (?, ?, ?, ?, ?, 'ok', NULL, NULL, ?)`,
+      )
+      .run(FILE.repo, lastSha, NOW, NOW, lastSuccessAt, coverageSince);
+  };
+
+  const seedLedgerCommit = (sqlite, { sha, committedAt, classification, message, authorEmail = "maintainer@example.com" }) => {
+    sqlite
+      .prepare(
+        `INSERT INTO dcs_commits (repo, sha, parent_sha, author_name, author_email, committed_at, message,
+                                   classification, classification_reason, files_json, seen_at)
+         VALUES (?, ?, NULL, 'Someone', ?, ?, ?, ?, 'unrecognized', ?, ?)`,
+      )
+      .run(FILE.repo, sha, authorEmail, committedAt, message, classification, JSON.stringify([FILE.path]), NOW - 30);
+  };
+
+  const seedFlaggedRow = (sqlite, id) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by,
+                              updated_at, review_kind, review_reason, review_master_json)
+         VALUES (?, ?, 3, 1, '3:1', 'app question', 'r', 4, 1, ?, 'merge_no_base', 'some earlier reason', ?)`,
+      )
+      .run(
+        id,
+        BOOK,
+        WINDOW_START + 100,
+        JSON.stringify({ question: "master q", _meta: { flag_at: WINDOW_START + 100, flag_since: WINDOW_START } }),
+      );
+  };
+
+  // A fetch stub that distinguishes repoHeadCommitSha's own probe (no `path=`
+  // in its URL — it asks for the repo's live tip, not one file's history) from
+  // an actual listMasterCommitsSince walk/probe/recheck (always `path=`).
+  // `onWalk` fires only for the latter, so a test can prove whether a live
+  // walk ever ran.
+  const ledgerAwareFetch = (repoHeadSha, walkCommits, onWalk) => async (url) => {
+    if (!String(url).includes("path=")) {
+      return { ok: true, headers: { get: () => null }, json: async () => [{ sha: repoHeadSha }] };
+    }
+    if (onWalk) onWalk();
+    return giteaPage(walkCommits)();
+  };
+
+  // (a) The ledger alone proves a human commit landed inside the window — a
+  //     commit an AUTHOR-DATE-bounded walk would miss (its author date, if it
+  //     had one modeled here, sits before WINDOW_START; what the ledger
+  //     actually keys on, committer date via `committed_at`, sits after it —
+  //     the shape a rebase or cherry-pick produces). The live-walk stub below
+  //     would answer "clean" if it were ever asked, so a false clear can only
+  //     mean the ledger path was skipped.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691a");
+    seedLedgerPoll(sqlite);
+    seedLedgerCommit(sqlite, {
+      sha: "latehuman",
+      committedAt: WINDOW_START + 3600,
+      classification: "human",
+      message: "Fixes a typo pushed late",
+    });
+    const realFetch = globalThis.fetch;
+    let liveWalkCalled = 0;
+    globalThis.fetch = ledgerAwareFetch(REPO_HEAD, OURS_AND_AI_PAGE.commits, () => liveWalkCalled++);
+    let cleared;
+    try {
+      // walkStart/walked both null (no run walk to reuse, the sweep's own
+      // shape) and an explicit masterSha so PASS B's tip probe is skipped —
+      // isolating the walk-fetch branch this change touches.
+      cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(cleared, 0, "a human commit the ledger alone proves in-window blocks the clear");
+    eq(liveWalkCalled, 0, "…found via the ledger, never falling back to a live Gitea walk");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id = 'lg691a'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "…the flag stands");
+  }
+
+  // (b) The ledger is load-bearing both ways: proving zero human commits (only
+  //     our own export in range) lets the clear proceed, entirely from the
+  //     ledger's data — the pre-write tip recheck is the only live fetch this
+  //     path still needs, and it must see the ledger's own newest commit held
+  //     steady.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691b");
+    seedLedgerPoll(sqlite);
+    seedLedgerCommit(sqlite, {
+      sha: "ourexport1",
+      committedAt: WINDOW_START + 3600,
+      classification: "ours",
+      message: "bible-editor: 1CH tq → master (#1)",
+      authorEmail: "someone@example.com",
+    });
+    const recheckCommit = [{
+      sha: "ourexport1",
+      message: "bible-editor: 1CH tq → master (#1)",
+      authorEmail: "someone@example.com",
+      authorName: "Someone",
+      date: new Date((WINDOW_START + 3600) * 1000).toISOString(),
+    }];
+    const cleared = await withFetch(ledgerAwareFetch(REPO_HEAD, recheckCommit), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip"),
+    );
+    eq(cleared, 1, "a ledger showing zero human commits still lets the clear proceed");
+  }
+
+  // (c) No ledger poll recorded for this repo at all: falls back to the live
+  //     walk exactly as #665 shipped it, unchanged by this addition.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691c");
+    const cleared = await withFetch(ledgerAwareFetch(REPO_HEAD, OURS_AND_AI_PAGE.commits), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip"),
+    );
+    eq(cleared, 1, "no ledger poll recorded: falls back to the live walk, unchanged");
+  }
+
+  // (d) 2026-09-21 review finding: a ledger row is already classified by
+  //     classifyForLedger (dcsCommitPoll.ts), which unwraps a Gitea merge-commit
+  //     wrapper before deciding — repo-scoped ledger history is full of these
+  //     (measured ~26%, classifyForLedger's own doc), and path-scoped Gitea
+  //     history (what the live walk sees) mostly hides them. Blindly re-running
+  //     the FULL-subject-only classifyMasterCommit on a ledger row throws that
+  //     unwrap away: classifyForLedger's own doc example —
+  //     `Merge pull request 'bible-editor: LAM ult → master' (#6555) from
+  //     LAM-be into master` — is stored `ours`, but classifyMasterCommit alone
+  //     (OURS_PREFIX is anchored at the subject's start, so a "Merge pull
+  //     request '…'" envelope never matches it) reclassifies it `human`. A
+  //     `human` verdict blocks the clear; `ours` does not — so this is a
+  //     differential test, not just a classification check. Before this fix
+  //     (trusting a ledger-sourced commit's own stored kind, later unified
+  //     with #867's `ledgerSourcedWalk` plumbing) this cleared 0 (blocked); it
+  //     must clear the flag.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691d");
+    seedLedgerPoll(sqlite);
+    seedLedgerCommit(sqlite, {
+      sha: "mergewrap1",
+      committedAt: WINDOW_START + 3600,
+      classification: "ours",
+      message: "Merge pull request 'bible-editor: LAM ult → master' (#6555) from LAM-be into master",
+      authorEmail: "someone@example.com",
+    });
+    const recheckCommit = [{
+      sha: "mergewrap1",
+      message: "Merge pull request 'bible-editor: LAM ult → master' (#6555) from LAM-be into master",
+      authorEmail: "someone@example.com",
+      authorName: "Someone",
+      date: new Date((WINDOW_START + 3600) * 1000).toISOString(),
+    }];
+    const cleared = await withFetch(ledgerAwareFetch(REPO_HEAD, recheckCommit), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip"),
+    );
+    eq(cleared, 1, "a merge-wrapper commit the ledger already classified `ours` is not re-derived as `human`");
+  }
 }
 
 console.log("\n[issue #672: a torn row (ref_raw ahead of its own stored chapter/verse) self-heals]");
@@ -3474,7 +3764,9 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
   //     subrequest limit, so one sweep hands at most NO_BASE_SWEEP_MAX_PAIRS
   //     (10) pairs to the clear however many books hold flags. Every book here
   //     is walkable, so the number of pairs that reached a walk is exactly the
-  //     number of first-page fetches.
+  //     number of first-page fetches: one tip probe, one repo-head probe for
+  //     the ledger attempt (#691 — it fails closed on "network down" and the
+  //     walk falls back to live, same as before), and one live walk attempt.
   {
     const { sqlite, env } = freshEnv();
     const books = ["1CH", "2CH", "AMO", "DAN", "ECC", "EZK", "HAB", "HOS", "ISA", "JER", "JOB", "JOL", "JON", "LAM", "MIC"];
@@ -3490,7 +3782,11 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
       const result = await sweepStaleMergeNoBase(env);
       eq(result.pairs, 15, "every flagged pair is found…");
       eq(result.swept, 10, "…but only the night's ration is handed to the clear");
-      eq(called, 20, "…so the Gitea budget is bounded too: one tip probe plus one walk per rationed pair");
+      eq(
+        called,
+        30,
+        "…so the Gitea budget is bounded too: one tip probe, one ledger repo-head probe, one walk per rationed pair",
+      );
     } finally {
       globalThis.fetch = realFetch;
     }
