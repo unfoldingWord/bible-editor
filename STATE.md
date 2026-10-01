@@ -90,6 +90,13 @@ Highlights that bite repeatedly:
   source attrs INTO UHB bytes would then read as converged and be reverted on export. The fix lives in the no-op
   guard instead: drop the row only when D1 already equals canonized master AND raw master is NFC-equal to D1.
 
+- **AI-apply TN dedup: fold to find candidates, split only on proven UHB twins; never key byte-exactly.** Issue
+  #966: the #962 fold (NFC + strip joiners) merged twins tC counts separately (DAN 2:10 kol with/without U+2060).
+  Keying byte-exactly after canonizing (PR #973's first shape) reopened AI TN doubling for every quote that could
+  not be canonized: pre-#959 proposals, verses with no UHB loaded, legacy NFC rows. `isDistinctTwinTn` in
+  `pipelineImport.ts` splits a fold collision only when both words are byte-identical, different UHB surfaces;
+  NT keeps the plain fold. The nightly reimport's `planTnContentDedup` stays byte-exact and was not touched.
+
 - **A locked book freezes the merge ancestor, so Door43 is authoritative for it — and a markers-only overwrite
   is logged, never alerted.** Measured 2026-09-24 (ZEC 1:17 ULT, Rich): the book was locked on 09-17, so the
   export skipped it nightly, `master_confirmed_at` never advanced, and every Door43 commit read as "both changed"
