@@ -890,9 +890,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Confirm gate for an aligner save that would leave a previously-aligned word
   // bare. alignment_edit is exempt from the collateral-loss save guard, so this
   // is the "out loud" surface for an accidental unlink (the JER 30:1 incident):
-  // commit runs only if the user proceeds.
+  // commit runs only if the user proceeds; onCancel runs if they dismiss it.
   const [pendingAlignmentLoss, setPendingAlignmentLoss] = useState<
-    { ref: string; lostWords: string[]; commit: () => void } | null
+    { ref: string; lostWords: string[]; commit: () => void; onCancel?: () => void } | null
   >(null);
   // Shared by the scripture + resource columns so a single "go to active"
   // click re-centers both. Bumped via requestScrollToActive (and elsewhere
@@ -2765,11 +2765,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   );
   // Dismissing the unalign confirm without saving: any save chain waiting on it
   // (the gate's Save, the save-done-next button) is stalled for good, so free
-  // the button's in-flight guard too.
+  // the button's in-flight guard too, and let the save that opened it release
+  // what it holds (a text save's verse-base pin, #1050).
   const cancelAlignmentLoss = useCallback(() => {
+    const onCancel = pendingAlignmentLoss?.onCancel;
     setPendingAlignmentLoss(null);
     saveDoneGuardRef.current.cancel();
-  }, []);
+    onCancel?.();
+  }, [pendingAlignmentLoss]);
 
   const handleSetPanelMode = useCallback(
     (mode: PanelMode) => {
@@ -2836,6 +2839,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // the save must not be queued (e.g. a book lock landed while the confirm
     // was open, #1046). The caller shows its own message.
     refuseCommit?: () => boolean,
+    // Runs when the confirm ends without queueing anything: refused at commit
+    // (above) or cancelled. The caller releases what its save took (#1050).
+    onAbandon?: () => void,
   ): boolean => {
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
@@ -2862,8 +2868,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         setPendingAlignmentLoss({
           ref: `${book} ${chapterNum}:${verseNum} ${bibleVersion}`,
           lostWords: lost,
+          onCancel: onAbandon,
           commit: () => {
-            if (refuseCommit?.()) return;
+            if (refuseCommit?.()) {
+              onAbandon?.();
+              return;
+            }
             void outbox.enqueueVerse(
               book,
               chapterNum,
@@ -3343,23 +3353,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       (result.content as { verseObjects?: unknown[] } | null)?.verseObjects,
     );
     const newlyUnaligned = afterUnaligned - beforeUnaligned;
-    if (newlyUnaligned > 0) {
-      pushPipelineToast(
-        `This edit left ${newlyUnaligned} word${newlyUnaligned > 1 ? "s" : ""} unaligned in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — re-align in the Alignment panel.`,
-        "info",
-      );
-    }
-    // The editor handed back text with none of its paragraph/poetry marks and
-    // no word changed, so the engine restored them rather than wipe the verse's
-    // lineation (#606). That is the right call for a dropped-chip capture, but
-    // it also overrides a translator who genuinely meant to remove every mark in
-    // the same save — so say so, and name the way to do it.
-    if (result.markerCaptureGuarded) {
-      pushPipelineToast(
-        `Paragraph and poetry marks were restored in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — the editor lost them during this edit. To remove them on purpose, delete the marks in a save of their own.`,
-        "info",
-      );
-    }
+    // Both notices describe a save that goes ahead, so they run only once it
+    // is queued — never ahead of a refusal or a cancelled confirm (#1050).
+    const notifyCommitted = () => {
+      if (newlyUnaligned > 0) {
+        pushPipelineToast(
+          `This edit left ${newlyUnaligned} word${newlyUnaligned > 1 ? "s" : ""} unaligned in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — re-align in the Alignment panel.`,
+          "info",
+        );
+      }
+      // The editor handed back text with none of its paragraph/poetry marks and
+      // no word changed, so the engine restored them rather than wipe the verse's
+      // lineation (#606). That is the right call for a dropped-chip capture, but
+      // it also overrides a translator who genuinely meant to remove every mark in
+      // the same save — so say so, and name the way to do it.
+      if (result.markerCaptureGuarded) {
+        pushPipelineToast(
+          `Paragraph and poetry marks were restored in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — the editor lost them during this edit. To remove them on purpose, delete the marks in a save of their own.`,
+          "info",
+        );
+      }
+    };
     const newPlainText = extractPlainText(result.content);
     const newDto = {
       ...effectiveBase,
@@ -3383,13 +3397,34 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // also run afterCommit, since that path never reaches the `applyLocal();
       // afterCommit?.();` below.
       const onConfirmedApply = () => {
+        notifyCommitted();
         applyLocal();
         afterCommit?.();
       };
-      if (refuseCommit?.()) return;
-      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, onConfirmedApply, draftGeneration, undefined, refuseCommit)) {
+      // A save that ends without queueing anything (refused, or its confirm
+      // cancelled) has no outbox exit, so nothing else would ever release the
+      // pin taken above, and every later save of this verse in this tab would
+      // send that stale version and 409 (#1050, same leak as #563). Release it
+      // the way the no-op path does: only when no draft holds it (#474 keeps
+      // a drafted session's pin), and IfIdle in case a keystroke re-pinned it.
+      const releaseUnqueuedPin = () => {
+        void drafts
+          .get(key)
+          .then((draft) => {
+            if (!draft) unpinVerseBaseIfIdle(key);
+          })
+          .catch(() => {
+            /* conservative: leave the pin with an unreadable draft store */
+          });
+      };
+      if (refuseCommit?.()) {
+        releaseUnqueuedPin();
         return;
       }
+      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, onConfirmedApply, draftGeneration, undefined, refuseCommit, releaseUnqueuedPin)) {
+        return;
+      }
+      notifyCommitted();
       applyLocal();
       afterCommit?.();
     };
@@ -4542,8 +4577,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // dirty and the gate's close/nav does not run. The message names
             // Discard, not Undo: Undo is hidden while that side also has
             // unsaved alignment drags.
+            //
+            // A refusal stalls any save chain this save is part of for good,
+            // so it also frees the "save, mark done, next" button's guard,
+            // the way cancelling the unalign confirm does (#1050).
             const refuseIfBookLocked = () => {
               if (!bookLockedRef.current) return false;
+              saveDoneGuardRef.current.cancel();
               pushPipelineToast(
                 `This book is locked, so the ${bv} reading-text edit was not saved. To drop it, close the aligner and choose Discard.`,
                 "error",
