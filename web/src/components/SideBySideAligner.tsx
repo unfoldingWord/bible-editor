@@ -226,10 +226,13 @@ interface Props {
     plain: string,
     base: VerseDto,
     afterCommit?: () => void,
+    // #1050: whether the line still shows this edit (asked when the save ends
+    // with nothing queued).
+    stillEditing?: () => boolean,
   ) => void;
-  // A reading line dropped an unsaved edit without saving it: Undo, the
-  // gate's Discard, a resync from the server, or unmount. `base` is the verse
-  // the edit was made against (#1050).
+  // A reading line stopped showing an unsaved edit: it went clean by any
+  // path, or unmounted. `base` is the verse the edit was made against. Shell
+  // releases the pin of a save of it that queued nothing (#1050).
   onDropReading?: (bibleVersion: string, base: VerseDto) => void;
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
@@ -832,7 +835,13 @@ function SharedUhbStrip({
 // + enqueue) or Undo (revert to the last-saved text) — nothing autosaves.
 const ReadingLine = forwardRef<ReadingLineHandle, {
   slot: PanelSlot;
-  onSave: (bibleVersion: string, plain: string, base: VerseDto, afterCommit?: () => void) => void;
+  onSave: (
+    bibleVersion: string,
+    plain: string,
+    base: VerseDto,
+    afterCommit?: () => void,
+    stillEditing?: () => boolean,
+  ) => void;
   // See Props.onDropReading.
   onDrop?: (bibleVersion: string, base: VerseDto) => void;
   onDirtyChange: (dirty: boolean) => void;
@@ -879,25 +888,34 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   // the parent so the close/nav gate can prompt before losing the edit.
   const [dirty, setDirty] = useState(false);
   const dirtyRef = useRef(false);
-  const markDirty = (next: boolean) => {
+  // The verse the box's text was last synced from, i.e. the base an edit in
+  // it was made against. Lags `verse` while a resync is skipped under the
+  // caret. Names the edit in onDrop reports (#1050).
+  const shownVerseRef = useRef(verse);
+  const onDropRef = useRef(onDrop);
+  onDropRef.current = onDrop;
+  // `from` is the base of the edit this call may end (the verse shown before
+  // a resync or Undo moved shownVerseRef on).
+  const markDirty = (next: boolean, from = shownVerseRef.current) => {
+    // Any dirty -> clean means the line no longer shows an unsaved edit: Undo,
+    // the gate's Discard, the text typed back by hand, a resync from the
+    // server, or a save that went out. A save of it that queued nothing kept
+    // its pin, and Shell releases that pin now (#1050); for any other edit
+    // the report is a no-op there.
+    if (dirtyRef.current && !next && from) onDropRef.current?.(bibleVersion, from);
     dirtyRef.current = next;
     setDirty(next);
     onDirtyChange(next);
   };
-  // The verse the box's text was last synced from, i.e. the base an edit in
-  // it was made against. Lags `verse` while a resync is skipped under the
-  // caret. Used to report a dropped edit (#1050): a save of it that queued
-  // nothing kept its pin, and only dropping the edit may release it.
-  const shownVerseRef = useRef(verse);
-  const onDropRef = useRef(onDrop);
-  onDropRef.current = onDrop;
-  const reportDrop = () => {
-    const shown = shownVerseRef.current;
-    if (dirtyRef.current && shown) onDropRef.current?.(bibleVersion, shown);
-  };
-  // Unmounting with an unsaved edit drops it too.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => reportDrop, []);
+  // Unmounting ends whatever the line showed, dirty or not (#1050).
+  useEffect(
+    () => () => {
+      const shown = shownVerseRef.current;
+      if (shown) onDropRef.current?.(bibleVersion, shown);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
 
   useEffect(() => {
     const el = elRef.current;
@@ -909,21 +927,19 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
     // signal (DocColumn's VerseSpan uses its draft for the same purpose).
     if (document.activeElement === el) return;
     const dom = el.textContent ?? "";
+    const shownBefore = shownVerseRef.current;
     if (lastSetRef.current === null || dom === lastTextRef.current) {
       // Skip the DOM write when the content already matches — after an edit that
       // round-trips identically, replacing the text node would needlessly
       // repaint (flash) the line and drop the caret.
-      if (dom !== editable) {
-        reportDrop();
-        el.textContent = editable;
-      }
+      if (dom !== editable) el.textContent = editable;
       lastSetRef.current = editable;
       shownVerseRef.current = verse;
     }
     lastTextRef.current = editable;
     // Baseline moved (a Save landed, or a verse nav swapped the verse): the
     // line now matches saved text, so it's no longer dirty.
-    markDirty(normalizeEditable(el.textContent ?? "") !== normalizeEditable(editable));
+    markDirty(normalizeEditable(el.textContent ?? "") !== normalizeEditable(editable), shownBefore);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editable]);
 
@@ -941,21 +957,27 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
       afterCommit?.();
       return;
     }
-    onSave(bibleVersion, el.textContent ?? "", verse, () => {
-      markDirty(false);
-      afterCommit?.();
-    });
+    onSave(
+      bibleVersion,
+      el.textContent ?? "",
+      verse,
+      () => {
+        markDirty(false);
+        afterCommit?.();
+      },
+      () => dirtyRef.current,
+    );
   };
 
   const handleUndo = () => {
     const el = elRef.current;
     if (!el) return;
-    reportDrop();
+    const shownBefore = shownVerseRef.current;
     el.textContent = editable;
     lastTextRef.current = editable;
     lastSetRef.current = editable;
     shownVerseRef.current = verse;
-    markDirty(false);
+    markDirty(false, shownBefore);
   };
 
   // The gate (close / verse-nav) drives these: save flushes the edit, discard

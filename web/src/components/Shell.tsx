@@ -62,6 +62,7 @@ import {
 } from "../lib/alignmentDelta";
 import { bridgeNoteAnchor, buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, versesFromKey } from "../lib/verseRange";
 import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
+import { createUnqueuedPinTracker } from "../sync/unqueuedPins";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import {
@@ -2740,27 +2741,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // render); the guard ignores a second click while this chain still runs,
   // and cancelling the unalign confirm releases it (cancelAlignmentLoss).
   const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
-  // #1050: verse keys whose pin belongs to a save that queued nothing
-  // (refused under a book lock, or its unalign confirm cancelled) while the
-  // dual aligner's reading line still shows the edit. The pin must outlive the
-  // refusal: it is the base that edit was made against, so saving it again
-  // after the verse moved must 409, not diff the old text against the new
-  // verse and overwrite the change. No outbox exit will ever release it, so
-  // the reading line reports when it drops the edit (Undo, the gate's Discard,
-  // a resync from the server, unmount) and this releases it then, the way the
-  // no-op save path does (#563): only with no draft holding it, IfIdle.
-  const unqueuedPinsRef = useRef(new Set<string>());
-  const releaseUnqueuedPin = useCallback((key: string) => {
-    if (!unqueuedPinsRef.current.delete(key)) return;
-    void drafts
-      .get(key)
-      .then((draft) => {
-        if (!draft) unpinVerseBaseIfIdle(key);
-      })
-      .catch(() => {
-        /* conservative: leave the pin with an unreadable draft store */
-      });
-  }, []);
+  // #1050: the pin of a save that queued nothing (refused under a book lock,
+  // or its unalign confirm cancelled) stays while the dual aligner's reading
+  // line still shows the edit, and is released the moment the line stops
+  // showing it (any dirty -> clean, or unmount). See unqueuedPins.ts.
+  const unqueuedPinsRef = useRef(createUnqueuedPinTracker(unpinVerseBaseIfIdle));
   const dualSaveDoneAndNext = useCallback(
     (verse: number, next: number) => {
       // #943: this only reaches the dual aligner while dualTarget.chapter ===
@@ -3304,11 +3289,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // again on the collateral-loss confirm's "Save anyway"). True refuses the
     // save: nothing is queued or applied and afterCommit does not run.
     refuseCommit?: () => boolean,
+    // #1050: whether the editor still shows this edit, asked when the save
+    // ends without queueing anything (see keepPinForUnqueuedEdit).
+    stillEditing?: () => boolean,
   ) => {
     const key = verseKey(book, chapterNum, verseNum, bibleVersion);
     // A new attempt: whatever an earlier unqueued attempt recorded is decided
     // again below (#1050).
-    unqueuedPinsRef.current.delete(key);
+    unqueuedPinsRef.current.started(key);
     // Diff and save against the SAME baseline this edit session's first
     // keystroke pinned — never the live `base` this call happened to receive.
     // `base` is recomputed from the chapter cache on every render, so a WS
@@ -3422,19 +3410,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // also run afterCommit, since that path never reaches the `applyLocal();
       // afterCommit?.();` below.
       const onConfirmedApply = () => {
-        unqueuedPinsRef.current.delete(key);
+        unqueuedPinsRef.current.queued(key);
         notifyCommitted();
         applyLocal();
         afterCommit?.();
       };
       // A save that ends without queueing anything (refused, or its confirm
-      // cancelled) keeps the pin taken above: the edit is still on screen and
-      // was made against that base, so a later save of it must still 409 if
-      // the verse moved meanwhile. But there is no outbox exit to release it,
-      // so record it; releaseUnqueuedPin frees it when the edit is dropped
-      // (#1050).
+      // cancelled) keeps the pin taken above while the edit is still on
+      // screen: it was made against that base, so a later save of it must
+      // still 409 if the verse moved meanwhile. No outbox exit will release
+      // it, so the tracker does, when the editor drops the edit (#1050).
       const keepPinForUnqueuedEdit = () => {
-        unqueuedPinsRef.current.add(key);
+        unqueuedPinsRef.current.abandoned(key, stillEditing);
       };
       if (refuseCommit?.()) {
         keepPinForUnqueuedEdit();
@@ -3443,7 +3430,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, onConfirmedApply, draftGeneration, undefined, refuseCommit, keepPinForUnqueuedEdit)) {
         return;
       }
-      unqueuedPinsRef.current.delete(key);
+      unqueuedPinsRef.current.queued(key);
       notifyCommitted();
       applyLocal();
       afterCommit?.();
@@ -4586,7 +4573,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           textCheck={
             dualAlignerProps.chapter === chapter ? textLaneCheck : undefined
           }
-          onSaveReading={(bv, plain, base, afterCommit) => {
+          onSaveReading={(bv, plain, base, afterCommit, stillEditing) => {
             // #1046: the reading line locks once a book lock lands, but an
             // edit typed before it can still reach here through the close /
             // verse-nav gate's Save, and a save already under way can see the
@@ -4617,9 +4604,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // the resolveDualAction save chain, #490) only proceeds once this
             // actually lands — synchronously, or after the collateral-loss
             // confirm's "Save anyway".
-            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit, refuseIfBookLocked);
+            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit, refuseIfBookLocked, stillEditing);
           }}
-          onDropReading={(bv, base) => releaseUnqueuedPin(verseKey(book, base.chapter, base.verse, bv))}
+          onDropReading={(bv, base) => unqueuedPinsRef.current.dropped(verseKey(book, base.chapter, base.verse, bv))}
         />
       )}
       <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>
