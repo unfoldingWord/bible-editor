@@ -9,13 +9,17 @@
 //   node --experimental-strip-types --no-warnings src/sync/versePinHolds.test.mjs
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
+  advanceHeldVerseBase,
   holdVerseBase,
   peekPinnedVerseBase,
   pinVerseBase,
   unpinVerseBase,
   unpinVerseBaseIfIdleWith,
+  unpinVerseBaseUnlessHeld,
 } from "./versePin.ts";
+import { noteOwnVerseOp, takeOwnVerseOp } from "./ownVerseOps.ts";
 
 let passed = 0;
 function check(name, fn) {
@@ -146,6 +150,71 @@ check("with no hold, the idle unpin behaves as before", () => {
   assert.equal(peekPinnedVerseBase(K)?.version, 3, "a draft session keeps it");
   unpinVerseBaseIfIdle(K, false);
   assert.equal(peekPinnedVerseBase(K), undefined);
+});
+
+// ---- review round 1 ----
+
+check("a draft session ending (clear / clearGeneration) keeps a pin a live hold joined, until the hold ends clean", () => {
+  reset();
+  pinVerseBase(K, shown); // the draft session's (or a queued draft-backed save's) pin
+  const hold = holdVerseBase(K, moved); // the reading line joins it
+  unpinVerseBaseUnlessHeld(K); // drafts.clear / clearGeneration / releaseLocalBookkeeping
+  assert.equal(peekPinnedVerseBase(K)?.version, 3, "the dirty line keeps its base");
+  hold.release();
+  assert.equal(peekPinnedVerseBase(K), undefined, "released when the line goes clean");
+});
+
+check("with no hold, a draft session ending unpins as before", () => {
+  reset();
+  pinVerseBase(K, shown);
+  unpinVerseBaseUnlessHeld(K);
+  assert.equal(peekPinnedVerseBase(K), undefined);
+});
+
+check("drafts.ts never unpins directly: every unpin path goes through a hold-aware release", () => {
+  const src = readFileSync(new URL("./drafts.ts", import.meta.url), "utf8");
+  assert.equal(/\bunpinVerseBase\s*\(/.test(src), false, "direct unpinVerseBase( call in drafts.ts");
+});
+
+check("this tab's own save landing moves a live hold's pin forward to the landed row", () => {
+  reset();
+  const hold = holdVerseBase(K, shown); // v3
+  advanceHeldVerseBase(K, 3, { version: 4, content: "aligned" });
+  assert.deepEqual(peekPinnedVerseBase(K), { version: 4, content: "aligned" });
+  // A second own save, threaded onto v4, lands as v5.
+  advanceHeldVerseBase(K, 4, { version: 5, content: "aligned+text" });
+  assert.equal(peekPinnedVerseBase(K)?.version, 5);
+  hold.release();
+  assert.equal(peekPinnedVerseBase(K), undefined);
+});
+
+check("an own save made against a different base does not move the pin (another change came between)", () => {
+  reset();
+  const hold = holdVerseBase(K, shown); // v3
+  advanceHeldVerseBase(K, 4, { version: 5, content: "x" }); // based on a v4 the line never showed
+  assert.equal(peekPinnedVerseBase(K)?.version, 3);
+  hold.release();
+});
+
+check("with no live hold, a landed save does not move a pin", () => {
+  reset();
+  pinVerseBase(K, shown);
+  advanceHeldVerseBase(K, 3, { version: 4, content: "x" });
+  assert.equal(peekPinnedVerseBase(K)?.version, 3);
+  // A hold on another key does not count.
+  const other = holdVerseBase(K2, moved);
+  advanceHeldVerseBase(K, 3, { version: 4, content: "x" });
+  assert.equal(peekPinnedVerseBase(K)?.version, 3);
+  other.release();
+  unpinVerseBase(K);
+});
+
+check("only ops this tab queued count as own; each is claimed once", () => {
+  noteOwnVerseOp("op-a");
+  assert.equal(takeOwnVerseOp("op-b"), false, "another tab's op");
+  assert.equal(takeOwnVerseOp(undefined), false);
+  assert.equal(takeOwnVerseOp("op-a"), true);
+  assert.equal(takeOwnVerseOp("op-a"), false, "forgotten after its exit");
 });
 
 console.log(`versePinHolds: ${passed} passed`);
