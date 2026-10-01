@@ -242,6 +242,10 @@ const TAB_FOR_ROW_KIND = {
 // a target has no threads yet.
 const EMPTY_COMMENT_THREADS: CommentThread[] = [];
 const EMPTY_COVERED_VERSES: number[] = [];
+// Shared identity for twlRowAlternatives' empty case (#896): `new Map()` on
+// every no-suggestions-loaded render broke WordsTable's `===` comparator on
+// every Shell render, not just when suggestions actually changed.
+const EMPTY_TWL_ROW_ALTERNATIVES: Map<string, string[]> = new Map();
 
 interface Props {
   book: string;
@@ -1820,15 +1824,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   }, [data, reorderPreview]);
   // ScriptureColumn compares reorderHighlight by identity (#896): `data` changing
   // elsewhere (any unrelated edit) rebuilt this object every time even when the
-  // moved/prev/next quotes were unchanged. Gate on the field values themselves.
+  // moved/prev/next quotes were unchanged. Gate on the field values themselves —
+  // including the verse fields (#957's bridged-verse disambiguation), since a
+  // reorder that swaps a same-quote/occurrence neighbour from one bridge verse
+  // to another must still produce a new object for rowHighlightsFor to pick up.
   const reorderHighlightKey = reorderHighlightRaw
     ? [
         reorderHighlightRaw.movedQuote,
         reorderHighlightRaw.movedOccurrence,
+        reorderHighlightRaw.movedVerse,
         reorderHighlightRaw.prevQuote,
         reorderHighlightRaw.prevOccurrence,
+        reorderHighlightRaw.prevVerse,
         reorderHighlightRaw.nextQuote,
         reorderHighlightRaw.nextOccurrence,
+        reorderHighlightRaw.nextVerse,
       ].join("|")
     : "";
   const reorderHighlight = useMemo<ReorderHighlight | null>(
@@ -2173,8 +2183,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // matcher's suggestions back onto the row by source-key surfaces it. Values are
   // short article ids (e.g. "other/lover").
   const twlRowAlternatives = useMemo<Map<string, string[]>>(() => {
+    if (!data || verseTwlSuggestions.length === 0) return EMPTY_TWL_ROW_ALTERNATIVES;
     const map = new Map<string, string[]>();
-    if (!data || verseTwlSuggestions.length === 0) return map;
     // Each group carries its own verse — resolve and match per verse so that in
     // a bridge every verse's committed rows get alternatives from their OWN
     // verse's matcher, not only the leading/active one. Row ids are unique
