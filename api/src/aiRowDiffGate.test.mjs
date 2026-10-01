@@ -33,7 +33,10 @@ import {
   getMasterConfirmedAtForTest as getMasterConfirmedAt,
   planAndStageBookResourcesForTest as planAndStageBookResources,
   runChunkedReimport,
+  reimportBookFromDcs,
 } from "./bookReimport.ts";
+import { extractVersesForRange } from "./importParsers.ts";
+import { createHash } from "node:crypto";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -960,6 +963,156 @@ console.log("\n[issue #1058 — end to end: our merge lands between the master f
   eq(entry.changed, true, "night 2 precondition: the resource staged");
   eq(confirmedRow(), { confirmedAt: READ_AT, editId: xEdit }, "night 2: #658 stamps render R once our merge is at or before masterSha");
   eq(entry.stagedCutoff, { confirmedAt: READ_AT, editId: xEdit }, "night 2: stagedCutoff carries the stamp (no starvation)");
+}
+
+// ── Issue #1063 — the same race on the admin "Pull from Door43" route, ULT.
+// reimportBookFromDcs fetched master's ULT unpinned, and the lineage walk later
+// in the same request (no pin) lands #658's stamp from master's CURRENT tip.
+// When the merge of our render R lands between the two, the walk stamps R
+// against a file that predates it; ULT/UST then re-read the boundary after the
+// walk, so the verse merge takes R as its ancestor. D1 still holds R's app edit
+// (== ancestor) and master's pre-R verse differs from it, so the merge reads
+// "only master moved" and adopts master over the translator's edit.
+//
+// The positive control: when master's file head is a bot push on top of our
+// merge, the merge is in the fetched file and the stamp still lands.
+const ULT_SHA_P = "d4".repeat(20); // master's ULT head when the file is fetched: predates R
+const ULT_SHA_M = "e5".repeat(20); // our export's merge of render R
+const ULT_SHA_B = "f6".repeat(20); // a later bot push on top of our merge
+const ULT_PATH = `38-${BOOK}.usfm`;
+const ultUsfm = (v1, v2) =>
+  `\\id ${BOOK} EN_ULT en_English_ltr unfoldingWord Literal Text\n\\h Zechariah\n\\c 3\n\\p\n\\v 1 ${v1}\n\\v 2 ${v2}\n`;
+const ULT_P = ultUsfm("Then he showed me Joshua.", "And Yahweh said.");
+const ULT_R = ultUsfm("Then he showed me Joshua the high priest.", "And Yahweh said.");
+const ULT_B = ultUsfm("Then he showed me Joshua the high priest.", "And Yahweh said to the accuser.");
+const gitBlobSha = (text) => {
+  const body = Buffer.from(text, "utf8");
+  return createHash("sha1").update(`blob ${body.length}\0`).update(body).digest("hex");
+};
+const ultVerse = (raw, n) => extractVersesForRange(raw, 3, 3).find((v) => v.verse === n).contentJson;
+
+function stubDoor43UltMergeLandsAfterFetch({ prNumber, pushedBlobSha, landAtFetch, initialHead }) {
+  const realFetch = globalThis.fetch;
+  const all = {
+    [ULT_SHA_B]: { sha: ULT_SHA_B, message: `ULT: ${BOOK} 3 [ju..7@api.bp-assistant]`, email: "bot@unfoldingword.org", name: "BW Bot", date: "2026-09-02T23:49:46Z", body: ULT_B },
+    [ULT_SHA_M]: { sha: ULT_SHA_M, message: `bible-editor: ${BOOK} ult → master (#${prNumber})`, email: "b@x", name: "Benjamin Wright", date: "2026-09-01T05:38:03Z", body: ULT_R },
+    [ULT_SHA_P]: { sha: ULT_SHA_P, message: `ULT: ${BOOK} 3 [ju..7@api.bp-assistant]`, email: "bot@unfoldingword.org", name: "BW Bot", date: "2026-08-31T23:49:46Z", body: ULT_P },
+  };
+  // Newest first, as Gitea lists them; the history grows at the head.
+  let history = initialHead === ULT_SHA_B ? [ULT_SHA_B, ULT_SHA_M, ULT_SHA_P] : [ULT_SHA_P];
+  const rawFetches = [];
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    const resp = (status, body, headers = {}) => ({
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: (h) => headers[h.toLowerCase()] ?? null },
+      async text() { return body; },
+      async json() { return JSON.parse(body); },
+      async arrayBuffer() { return new TextEncoder().encode(body).buffer; },
+    });
+    if (u.includes("/commits?")) {
+      return resp(
+        200,
+        JSON.stringify(history.map((sha) => all[sha]).map((c) => ({
+          sha: c.sha,
+          commit: { message: c.message, author: { email: c.email, name: c.name, date: c.date }, committer: { date: c.date } },
+        }))),
+        { "x-hasmore": "false" },
+      );
+    }
+    if (u.includes("/git/trees/")) {
+      const sha = Object.keys(all).find((k) => u.includes(k));
+      if (!sha) return resp(404, "");
+      const blob = sha === ULT_SHA_M ? pushedBlobSha : gitBlobSha(all[sha].body);
+      return resp(200, JSON.stringify({ truncated: false, tree: [{ path: ULT_PATH, type: "blob", sha: blob }] }));
+    }
+    if (u.includes("/raw/") && u.includes(ULT_PATH)) {
+      rawFetches.push(u);
+      const ref = /[?&]ref=([0-9a-f]{40})/.exec(u)?.[1];
+      if (ref && !all[ref]) return resp(404, "");
+      const body = all[ref ?? history[0]].body;
+      // The file has been served; our merge lands right now.
+      if (landAtFetch) history = [ULT_SHA_M, ...history];
+      return resp(200, body, { "content-length": String(Buffer.byteLength(body, "utf8")) });
+    }
+    return resp(404, "");
+  };
+  return { rawFetches, restore: () => { globalThis.fetch = realFetch; } };
+}
+
+async function runUltAdminPull({ landAtFetch, initialHead }) {
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO book_imports (book) VALUES (?)`).run(BOOK);
+  const T0 = Date.parse("2026-08-30T00:00:00Z") / 1000; // the import that baselined P
+  const C0 = Date.parse("2026-08-31T00:00:00Z") / 1000; // confirmed boundary: P is on master
+  const T1 = Date.parse("2026-09-01T05:00:00Z") / 1000; // the translator's app edit (in render R)
+  const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000; // render R read for push
+  const PR = 1063;
+  const pushed = gitBlobSha(ULT_R);
+  const key = (n) => `${BOOK}/3/${n}/ULT`;
+  const payload = (cj) => JSON.stringify({ content: JSON.parse(cj) });
+  // v1 carries the translator's app edit (= render R); v2 is pristine.
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 3, 1, 'ULT', ?, 'r', 2, 42), (?, 3, 2, 'ULT', ?, 'p', 1, NULL)`,
+    )
+    .run(BOOK, ultVerse(ULT_R, 1), BOOK, ultVerse(ULT_P, 2));
+  const logBase = sqlite.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, action, payload_json, source, created_at)
+     VALUES ('verse', ?, ?, 'create', ?, 'dcs_reimport', ?)`,
+  );
+  logBase.run(key(1), BOOK, payload(ultVerse(ULT_P, 1)), T0);
+  const baseEdit = Number(logBase.run(key(2), BOOK, payload(ultVerse(ULT_P, 2)), T0).lastInsertRowid);
+  const rEdit = Number(
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+         VALUES ('verse', ?, ?, 42, 1, 2, 'update', ?, ?)`,
+      )
+      .run(key(1), BOOK, payload(ultVerse(ULT_R, 1)), T1).lastInsertRowid,
+  );
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs
+         (book, resource, source_sha, synced_at, origin, master_confirmed_at, master_confirmed_edit_id,
+          pushed_blob_sha, pushed_read_at, pushed_edit_id, pushed_pr_number, pushed_pr_read_at)
+       VALUES (?, 'ult', ?, ?, 'reimport', ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(BOOK, ULT_SHA_P, C0, C0, baseEdit, pushed, READ_AT, rEdit, PR, READ_AT);
+  const stub = stubDoor43UltMergeLandsAfterFetch({ prNumber: PR, pushedBlobSha: pushed, landAtFetch, initialHead });
+  let result;
+  try {
+    result = await reimportBookFromDcs(env, BOOK, [3], ["ult"], 42, { source: "user" });
+  } finally {
+    stub.restore();
+  }
+  const confirmed = sqlite
+    .prepare(`SELECT master_confirmed_at AS confirmedAt, master_confirmed_edit_id AS editId FROM book_resource_syncs WHERE book = ? AND resource = 'ult'`)
+    .get(BOOK);
+  const v = (n) =>
+    sqlite.prepare(`SELECT content_json FROM verses WHERE book = ? AND chapter = 3 AND verse = ? AND bible_version = 'ULT'`).get(BOOK, n).content_json;
+  return { result, confirmed, v, C0, READ_AT, baseEdit, rEdit, rawFetches: stub.rawFetches };
+}
+
+console.log("\n[issue #1063 — admin Pull from Door43: our merge lands between the ULT fetch and the lineage walk]");
+{
+  const r = await runUltAdminPull({ landAtFetch: true, initialHead: ULT_SHA_P });
+  eq(r.result.perResource.ult.errors, [], "precondition: the pull ran without errors");
+  eq(r.rawFetches.length, 1, "precondition: master's ULT was fetched once");
+  eq(r.confirmed, { confirmedAt: r.C0, editId: r.baseEdit }, "no #658 stamp this run: the boundary is unchanged");
+  eq(r.v(1), ultVerse(ULT_R, 1), "the translator's R edit survives: master's pre-R verse is not adopted over it");
+  eq(r.result.perResource.ult.merge_adopted, 0, "…and the merge adopts nothing from the pre-R file");
+}
+
+console.log("\n[issue #1063 — admin Pull from Door43: file head is a bot push on top of our merge; the stamp lands]");
+{
+  const r = await runUltAdminPull({ landAtFetch: false, initialHead: ULT_SHA_B });
+  eq(r.result.perResource.ult.errors, [], "precondition: the pull ran without errors");
+  eq(r.confirmed, { confirmedAt: r.READ_AT, editId: r.rEdit }, "#658 stamps render R: our merge is in the fetched file");
+  eq(r.v(1), ultVerse(ULT_R, 1), "v1 (unchanged since R) keeps the app edit");
+  eq(r.v(2), ultVerse(ULT_B, 2), "v2 adopts the bot's later master edit");
 }
 
 if (failed > 0) {
