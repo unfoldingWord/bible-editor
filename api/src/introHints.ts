@@ -36,7 +36,17 @@ const HINT_MARKER = /^ai:\s*/i;
 // Hints beyond the budget are dropped, not truncated mid-sentence; earliest
 // (by chapter, then created_at — the row order buildIntroHints receives)
 // wins, so the drop is deterministic.
-const MAX_TOTAL_HINT_CHARS = 8000;
+//
+// Measured in UTF-8 BYTES, not JS string length: a follow-up review finding
+// on this same budget — a Hebrew/Greek excerpt quoted inside a hint (every
+// character 2+ bytes in UTF-8) would count as 1 toward a char-based budget
+// but 2+ toward the real request body bp-assistant actually receives, so a
+// char count alone could still let a Hebrew-heavy run through over the real
+// byte limit. TextEncoder is available in both this Worker's runtime and
+// plain Node (unlike Buffer, which is Node-only — this module stays
+// dependency-free, see the file header).
+const MAX_TOTAL_HINT_BYTES = 8000;
+const textEncoder = new TextEncoder();
 
 export interface IntroHintCommentRow {
   id: number;
@@ -65,13 +75,14 @@ export function isIntroHintComment(body: string): boolean {
 
 export function buildIntroHints(rows: IntroHintCommentRow[]): IntroHint[] {
   const hints: IntroHint[] = [];
-  let totalChars = 0;
+  let totalBytes = 0;
   for (const r of rows) {
     const note = stripIntroHintMarker(r.body);
     if (note === null) continue;
-    if (totalChars + note.length > MAX_TOTAL_HINT_CHARS) break;
+    const noteBytes = textEncoder.encode(note).length;
+    if (totalBytes + noteBytes > MAX_TOTAL_HINT_BYTES) break;
     hints.push({ chapter: r.chapter, note });
-    totalChars += note.length;
+    totalBytes += noteBytes;
   }
   return hints;
 }

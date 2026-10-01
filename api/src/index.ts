@@ -73,13 +73,17 @@ export interface Env {
   // when unset.
   PIPELINE_API_BASE?: string;
   // Gates whether options.introHints (issue #819, chapter-intro hint
-  // comments) is ever included in a notes-pipeline dispatch. Deliberately
-  // absent (falsy) everywhere until bp-assistant's side is confirmed to
-  // accept the key: a 2026-09-22 review of this PR found the two
-  // possibilities genuinely contested (one review pass said the bot ignores
-  // an unknown options key on /start; a later pass said its schema is
-  // strict and 400s the WHOLE job) — with the gate off, either claim being
-  // true is harmless, since nothing is ever sent. Flip to "true" (e.g. via
+  // comments) is ever included in a notes-pipeline dispatch. Checked with an
+  // EXACT `=== "true"` compare (see DEV_AUTH_ENABLED's use below for the same
+  // pattern) — a loose truthiness check would treat an operator's
+  // `INTRO_HINTS_ENABLED=false` (meant to turn the feature back OFF) as "on",
+  // since "false" is still a non-empty string. Absent/anything-but-"true"
+  // everywhere until bp-assistant's side is confirmed to accept the key: a
+  // 2026-09-22 review of this PR found the two possibilities genuinely
+  // contested (one review pass said the bot ignores an unknown options key
+  // on /start; a later pass said its schema is strict and 400s the WHOLE
+  // job) — with the gate off, either claim being true is harmless, since
+  // nothing is ever sent. Flip to exactly "true" (e.g. via
   // `wrangler secret put INTRO_HINTS_ENABLED` or a `[vars]` entry) only
   // once that's verified against the real bot, per
   // docs/bp-assistant-intro-hints-contract.md.

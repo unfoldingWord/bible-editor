@@ -1837,7 +1837,7 @@ pipelines.post("/start", requireEditor, async (c) => {
     // the guidance took effect. The cost is a marked hint gets re-sent on
     // every subsequent run for the chapter until then — harmless, since
     // it's an explicit opt-in, not a leak of arbitrary comments.
-    if (c.env.INTRO_HINTS_ENABLED) {
+    if (c.env.INTRO_HINTS_ENABLED === "true") {
       const introCommentRows = await c.env.DB.prepare(
         `SELECT id, chapter, body
            FROM comments

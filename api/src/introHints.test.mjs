@@ -80,6 +80,8 @@ function assert(cond, msg) {
 {
   console.log("\n[buildIntroHints: size bound]");
 
+  const encoder = new TextEncoder();
+
   // Review finding: an unbounded set of marked comments (each up to the
   // internal-comment body's 5000-char cap) risks exceeding bp-assistant's
   // request-body limit and 413ing the whole job. 7 comments at ~5000 chars
@@ -90,9 +92,9 @@ function assert(cond, msg) {
     body: `AI: ${"x".repeat(4995)}`, // ~5000 chars each, matching CreateBody's cap
   }));
   const bigHints = buildIntroHints(bigRows);
-  const totalChars = bigHints.reduce((sum, h) => sum + h.note.length, 0);
+  const totalBytes = bigHints.reduce((sum, h) => sum + encoder.encode(h.note).length, 0);
   assert(bigHints.length < bigRows.length, `7 maxed-out comments are not all forwarded (got ${bigHints.length})`);
-  assert(totalChars <= 8000, `combined forwarded note text stays under budget (got ${totalChars} chars)`);
+  assert(totalBytes <= 8000, `combined forwarded note text stays under budget (got ${totalBytes} bytes)`);
   assert(bigHints.length >= 1, "at least the earliest hint still gets through");
 
   // A normal, small batch is completely unaffected by the bound.
@@ -103,6 +105,27 @@ function assert(cond, msg) {
   assert(
     buildIntroHints(smallRows).length === 2,
     "an ordinary small batch is not truncated by the size bound",
+  );
+
+  // Follow-up review finding: the budget must count UTF-8 bytes, not JS
+  // string length — every Hebrew/Greek character is 2+ bytes in UTF-8 but
+  // only 1 toward .length, so a char-based budget would under-count a
+  // Hebrew-heavy run and still let it through over the bot's real byte
+  // limit. A Hebrew comment well under any plausible char-based budget but
+  // genuinely large in bytes:
+  const hebrewNote = "א".repeat(3000); // 1 char each, but 2 bytes each in UTF-8 → 6000 bytes
+  const hebrewRows = [
+    { id: 1, chapter: 3, body: `AI: ${hebrewNote}` },
+    { id: 2, chapter: 3, body: `AI: ${hebrewNote}` }, // pushes combined bytes over 8000
+  ];
+  const hebrewHints = buildIntroHints(hebrewRows);
+  assert(
+    hebrewHints.length === 1,
+    `a byte-based budget drops the second Hebrew-heavy hint that a char-based one would have let through (got ${hebrewHints.length})`,
+  );
+  assert(
+    encoder.encode(hebrewHints[0].note).length > hebrewHints[0].note.length,
+    "sanity: the Hebrew note's byte length actually exceeds its char length (confirms the test exercises the UTF-8 gap, not a no-op)",
   );
 }
 
@@ -152,8 +175,26 @@ function assert(cond, msg) {
   // schema is as strict as that review judged. Gate the whole block behind
   // an explicit flag defaulting off, so this PR can't cause that regression
   // before someone confirms it's safe.
-  const gateIndex = src.indexOf("if (c.env.INTRO_HINTS_ENABLED) {");
-  assert(gateIndex !== -1, "the intro-hints block is gated behind INTRO_HINTS_ENABLED");
+  //
+  // Second review finding (2026-10-01): the gate must use an EXACT "true"
+  // compare, not a bare truthiness check — `if (c.env.INTRO_HINTS_ENABLED)`
+  // treats the string "false" (or "0") as truthy, so an operator trying to
+  // switch the feature back OFF by setting INTRO_HINTS_ENABLED=false would
+  // actually turn it ON. An exact-string compare makes this unambiguous by
+  // construction: there is no runtime value for which `=== "true"` and the
+  // intended "is this literally enabled" question disagree, so a source-text
+  // match on the exact comparison is a complete proof here (unlike a SQL
+  // WHERE clause's three-valued NULL logic, which a text match can't fully
+  // verify — see pipelinesForceFail.test.mjs's note on that sharper limit).
+  const gateIndex = src.indexOf('if (c.env.INTRO_HINTS_ENABLED === "true") {');
+  assert(
+    gateIndex !== -1,
+    "the intro-hints block is gated behind an EXACT INTRO_HINTS_ENABLED === \"true\" compare, not a bare truthiness check",
+  );
+  assert(
+    !src.includes("if (c.env.INTRO_HINTS_ENABLED) {"),
+    "the old loose-truthiness gate is gone, not left alongside the fixed one",
+  );
   const selectIndex = src.indexOf("SELECT id, chapter, body");
   assert(
     gateIndex !== -1 && selectIndex !== -1 && gateIndex < selectIndex,
