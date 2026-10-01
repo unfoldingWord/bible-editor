@@ -4536,6 +4536,15 @@ export const getMasterConfirmedAtForTest = (
 // decision for a lineage to inform. Every other failure comes back as a summary
 // flagged `incomplete`, which masterMayHoldHumanEdit treats exactly like a found
 // human commit: a fetch that fell over must never read as "no human touched this".
+// Per-run side effects of one lineage walk, reported through an out-param (see
+// `stats` below). `lineageConfirmed` (#1048) is set only when #658's stamp
+// (markLineageConfirmedConverged) landed during this walk, carrying the render
+// boundary it stamped.
+type LineageStats = {
+  noBaseCleared: number;
+  lineageConfirmed?: { readAt: number; editId: number | null };
+};
+
 async function loadMasterLineage(
   env: Env,
   book: string,
@@ -4548,7 +4557,7 @@ async function loadMasterLineage(
   // every other outcome travels in, and this function's return value is a
   // lineage summary that is persisted and serialized into Workflow steps —
   // carrying a per-run side-effect count on it would leak into both.
-  stats?: { noBaseCleared: number },
+  stats?: LineageStats,
   // Non-null when own-publish recognition declined tonight with `content_differs`
   // for this pair: the sync state that comparison ran against. The walk fetched
   // here is the evidence that attributes the decline (accountOwnPublishDecline),
@@ -4564,7 +4573,7 @@ async function loadMasterLineage(
     // rewritten never GETS a watermark (recognition never fires), so gating the
     // detector on one would leave it blind for exactly the pairs it exists for
     // (cold review F3 / Codex P1 on this change).
-    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline, observedAt);
+    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline, observedAt, stats);
     return null;
   }
   // Prefer the repo-scoped ledger when it can prove a current, gap-free,
@@ -4583,7 +4592,7 @@ async function loadMasterLineage(
         incomplete: false,
         incompleteReason: "",
       };
-      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt);
+      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt, stats);
       const humans = classified.filter((c) => c.kind === "human");
       let humanRefs: HumanRefEvidence | null = null;
       if (humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
@@ -4641,7 +4650,7 @@ async function loadMasterLineage(
     });
   }
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
-  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline, observedAt);
+  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline, observedAt, stats);
   const commits = page.commits.map(classifyMasterCommit);
   // #557: narrow "a human touched this file" to "a human touched THIS verse",
   // but only where it is affordable and only where the file-level answer is
@@ -8571,6 +8580,21 @@ interface StagedResource {
   ownPublishUnstamped?: boolean;
   fetchFailed?: boolean;
   tsvTruncated?: boolean;
+  // Issue #857: this pair's merge-ancestor boundary (getMasterConfirmedAt),
+  // read while staging THIS file and after loadMasterLineage (which can
+  // itself advance it via #658). The prune step judges the staged file
+  // against this, not a fresh read: another Workflow instance can export an
+  // AI-only row and advance the watermark while the chunk steps run, and a
+  // newer boundary against this older file makes that row look exported and
+  // then removed on master, so the prune would delete it. For TSV kinds the
+  // value is the boundary read before the fetch plus this run's own lineage
+  // stamp, so an outside advance in that window is dropped and the value never
+  // certifies more than the fetch-time boundary plus this run's own confirmed
+  // render (#1048, pairStagedTsvCutoff). Only the two
+  // boundary fields, so the memoized plan stays plain JSON. Absent on a plan
+  // replayed from an instance that started before this shipped; the prune
+  // then falls back to a fresh read.
+  stagedCutoff?: { confirmedAt: number | null; editId: number | null };
 }
 
 // The run-summary counters decided at staging time, seeded from the memoized
@@ -8864,6 +8888,7 @@ async function accountOwnPublishDecline(
   walked: MasterCommitPage | null,
   sync: ResourceSyncState,
   observedAt = Date.now(),
+  stats?: LineageStats,
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   try {
@@ -8969,6 +8994,11 @@ async function accountOwnPublishDecline(
               pushedEditId,
             }, observedAt)
           : false;
+      // #1048: report the stamp to planAndStageBookResources, which has to tell
+      // this run's own advance apart from a concurrent export's.
+      if (lineageConfirmed && stats && pushedReadAt != null) {
+        stats.lineageConfirmed = { readAt: pushedReadAt, editId: pushedEditId };
+      }
       await env.DB.prepare(
         `UPDATE book_resource_syncs SET own_publish_declines = 0, own_publish_rewrite_sha = NULL
           WHERE book = ?1 AND resource = ?2 AND (own_publish_declines <> 0 OR own_publish_rewrite_sha IS NOT NULL)`,
@@ -10090,6 +10120,56 @@ async function runTombstoneSweep(
   }
 }
 
+// Issue #1048. The TSV prune judges the staged file against stagedCutoff, so
+// the two must describe the same instant. The file is fetched before
+// loadMasterLineage and the cutoff is read after it (it must be: #658 can
+// legitimately advance the boundary inside that walk, #866 F2). Anything else
+// that moves the boundary in that window, such as a concurrent export
+// confirming AI-only row X, pairs a file without X with a cutoff that covers X,
+// and the prune deletes X.
+//
+// So the paired cutoff is the fetch-time cutoff with this run's own #658 stamp
+// (if any) applied, computed the way markLineageConfirmedConverged's UPDATE
+// computes it. On an ordinary run that equals the post-lineage read. Any other
+// post-lineage value means a writer outside this run also moved it; its
+// advance is dropped but the run's own stamp is kept, since dropping that too
+// would reopen the #866 F2 resurrection. The invariant: the paired cutoff
+// never certifies more than the fetch-time cutoff plus this run's own
+// confirmed render, both of which the staged file reflects. It is usually no
+// newer than the post-lineage read either, but not always: an outside confirm
+// with a null edit id can move master_confirmed_at past this run's
+// pushed_read_at before the #658 stamp, so the stamp's SQL edit-id gate fails
+// and the row keeps the fetch-time edit id, while the paired edit id is the
+// own stamp's higher one. The extra rows that certifies are exactly those in
+// this run's own confirmed render, which the prune may judge.
+function pairStagedTsvCutoff(
+  fetchCutoff: { confirmedAt: number | null; editId: number | null },
+  postLineage: { confirmedAt: number | null; editId: number | null },
+  ownStamp: { readAt: number; editId: number | null } | null,
+  log: { book: string; resource: Resource; masterSha: string | null },
+): { confirmedAt: number | null; editId: number | null } {
+  let expected = fetchCutoff;
+  if (ownStamp) {
+    const prior = fetchCutoff.confirmedAt ?? 0;
+    expected = {
+      confirmedAt: Math.max(prior, ownStamp.readAt),
+      editId: ownStamp.editId != null && ownStamp.readAt >= prior
+        ? Math.max(fetchCutoff.editId ?? 0, ownStamp.editId)
+        : fetchCutoff.editId,
+    };
+  }
+  if (postLineage.confirmedAt !== expected.confirmedAt || postLineage.editId !== expected.editId) {
+    console.warn("reimport: prune cutoff moved between the master fetch and the post-lineage read by a writer outside this run; pruning against the fetch-time cutoff plus this run's own lineage stamp (#1048)", {
+      ...log,
+      fetchCutoff,
+      postLineage,
+      ownStamp,
+      paired: expected,
+    });
+  }
+  return expected;
+}
+
 // SHA-gate each requested resource and stage the changed ones to R2. Returns
 // the book's chapter extent + a manifest the chunk steps read from.
 async function planAndStageBookResources(
@@ -10122,6 +10202,11 @@ async function planAndStageBookResources(
     // previously computed just below, right where the actual fetch happens.
     const isTsv = resource === "tn" || resource === "tq" || resource === "twl";
 
+    // #1048: the prune cutoff as it stood BEFORE master's sha is resolved and
+    // its file fetched. Any render this boundary certifies was confirmed on
+    // master before that sha, so the file fetched below holds its rows (or a
+    // later real deletion of them). See pairStagedTsvCutoff.
+    const fetchCutoff = isTsv ? await getMasterConfirmedAt(env, book, resource) : null;
     const masterSha = await fileCommitSha(env, file.repo, file.path);
     const sync = await resourceSyncState(env, book, resource);
     const shaMatches = Boolean(masterSha && sync.sourceSha && masterSha === sync.sourceSha);
@@ -10394,7 +10479,7 @@ async function planAndStageBookResources(
     // step. The extra D1 read buys the correct boundary: the walk must start
     // where the merge's ancestor sits (`master_confirmed_at`), not at
     // `sync.sourceSha`, which this very function is about to move past it.
-    const noBaseStats = { noBaseCleared: 0 };
+    const noBaseStats: LineageStats = { noBaseCleared: 0 };
     const stageCutoff = await getMasterConfirmedAt(env, book, resource);
     const lineage = await loadMasterLineage(
       env,
@@ -10409,11 +10494,16 @@ async function planAndStageBookResources(
       alertObservedAt,
     );
     let confirmedBaseR2Key: string | null = null;
+    // #857: read after loadMasterLineage, not reused from `stageCutoff` —
+    // #658 can advance the boundary inside that call, and a pre-lineage value
+    // would make the prune keep a row this run just confirmed exported.
+    let stagedCutoff: { confirmedAt: number | null; editId: number | null };
     if (resource === "ult" || resource === "ust") {
       // loadMasterLineage may have advanced the boundary via #658. Parse the
       // exact confirmed render once now, then stage only its compact verse map
       // for all later chunk steps.
       const confirmed = await getMasterConfirmedAt(env, book, resource, true);
+      stagedCutoff = { confirmedAt: confirmed.confirmedAt, editId: confirmed.editId };
       // #1005: our newer, not-yet-confirmed publish rides the same staged
       // object (reviveUnconfirmedPublish on the chunk side). Mutually exclusive
       // with the #790 bases in practice: those need the pushed render to BE
@@ -10432,6 +10522,14 @@ async function planAndStageBookResources(
           { httpMetadata: { contentType: "application/json" } },
         );
       }
+    } else {
+      const confirmed = await getMasterConfirmedAt(env, book, resource);
+      stagedCutoff = pairStagedTsvCutoff(
+        fetchCutoff ?? { confirmedAt: null, editId: null },
+        { confirmedAt: confirmed.confirmedAt, editId: confirmed.editId },
+        noBaseStats.lineageConfirmed ?? null,
+        { book, resource, masterSha },
+      );
     }
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
@@ -10443,6 +10541,7 @@ async function planAndStageBookResources(
       verifiedComplete,
       lineage,
       confirmedBaseR2Key,
+      stagedCutoff,
       noBaseCleared: noBaseStats.noBaseCleared,
       // Null on every ordinary night. Non-null ONLY on a force-released
       // stale-base adoption — see the gate above and staleBaseOverridden below.
@@ -10882,15 +10981,16 @@ export async function runChunkedReimport(
     if (!chs || chs.length === 0) continue;
     const r2Key = e.r2Key;
     const verifiedComplete = e.verifiedComplete;
+    const stagedCutoff = e.stagedCutoff;
     const res = await step.do(`reimport-prune-${book}-${kind}`, async () => {
       const raw = await readStaged(env, r2Key);
       if (raw == null) return { deleted: 0, skippedLocked: 0 };
-      // Issue #832: this step runs after the chunk-apply steps above (which
-      // hoist their own cutoff inside reimportStagedChunk's separate call), so
-      // it re-reads the same (book, kind) merge-ancestor cutoff here rather
-      // than threading one through every chunk — one extra read per changed
-      // TSV kind, not per chapter.
-      const cutoff = await getMasterConfirmedAt(env, book, kind);
+      // Issue #832 / #857: judge the staged file against the boundary read
+      // when it was staged (see StagedResource.stagedCutoff), not a fresh
+      // read here — the chunk steps above give another Workflow instance time
+      // to advance it. The fresh read is only for a plan memoized before
+      // stagedCutoff existed.
+      const cutoff = stagedCutoff ?? (await getMasterConfirmedAt(env, book, kind));
       const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs, verifiedComplete, cutoff);
       if (res.deleted > 0 || res.skippedLocked > 0) {
         console.log("reimport pruned rows removed on master", { book, resource: kind, ...res });

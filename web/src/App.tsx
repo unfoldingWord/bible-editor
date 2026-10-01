@@ -1,4 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { PinnedLexHost } from "./components/PinnedLexBox";
 import { Alert, Box, Button, CircularProgress, Link, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
 import { NotificationsMenu } from "./components/NotificationsMenu";
@@ -510,6 +511,7 @@ export function App() {
           }
         />
       </Box>
+      <PinnedLexHost />
       <CommentAlertToasts alerts={freshCommentAlerts} onAck={ackFresh} onView={viewCommentAlert} />
       <Snackbar
         open={sessionExpired}
