@@ -16,9 +16,16 @@ import {
   type VerseOpExit,
   type VerseOpExitInfo,
 } from "./draftSaveState";
-import { peekPinnedVerseBase, unpinVerseBase } from "./versePin";
+import {
+  holdVerseBase,
+  peekPinnedVerseBase,
+  unpinVerseBase,
+  unpinVerseBaseIfIdleWith,
+  type PinnedVerseBase,
+  type VerseBaseHold,
+} from "./versePin";
 import { createDraftSnapshot } from "./draftSnapshot";
-export { pinVerseBase, peekPinnedVerseBase } from "./versePin";
+export { pinVerseBase, peekPinnedVerseBase, type VerseBaseHold } from "./versePin";
 
 const DB_NAME = "bible-editor-drafts";
 const DB_VERSION = 1;
@@ -99,9 +106,19 @@ const pendingKeys = new Set<string>();
 // so checking pendingKeys at the actual unpin moment closes the race the
 // snapshot leaves open. Mirrors the latestGenerationByKey guard inside
 // clearGeneration, which protects the clear path from the same class of race.
+//
+// A draftless editor's hold (#1060, versePin.ts) counts as a live session too:
+// the unpin is deferred to the hold, which releases the pin when its editor
+// goes clean.
 export function unpinVerseBaseIfIdle(key: string): void {
-  if (pendingKeys.has(key)) return;
-  unpinVerseBase(key);
+  unpinVerseBaseIfIdleWith(key, pendingKeys.has(key));
+}
+
+// Pin `key`'s base for a draftless editor (the dual aligner's reading line)
+// from its first dirty keystroke until it goes clean (#1060). A release never
+// pulls the pin from a draft session that shares it.
+export function holdVerseBaseForEditor(key: string, base: PinnedVerseBase): VerseBaseHold {
+  return holdVerseBase(key, base, (k) => !pendingKeys.has(k));
 }
 const latestGenerationByKey = new Map<string, string>();
 let generationSeq = 0;
