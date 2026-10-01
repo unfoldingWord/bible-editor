@@ -773,6 +773,63 @@ console.log("\n[issue #1048 — plan level: an advance from outside this run is 
   eq(entry.stagedCutoff, { confirmedAt: null, editId: null }, "stagedCutoff is the fetch-time boundary, not the outside advance");
 }
 
+// ── Issue #1048 review: BOTH happen in the window. This run's own #658 stamp
+// lands AND an outside writer (a newer concurrent export) moves the boundary.
+// The outside value must not be paired with the staged file (#1048), but
+// neither may the run's own stamp be dropped: falling back to the bare
+// fetch-time cutoff would read rows exported in the stamped render, and later
+// deleted on master, as never exported, so they survive the prune and the
+// next export re-adds them (the #485/#832 resurrection #866 F2 guards). The
+// paired value is the fetch-time cutoff with this run's stamp applied.
+console.log("\n[issue #1048 review — own #658 stamp plus an outside advance: stagedCutoff keeps the own stamp only]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPlanVerse(sqlite);
+  const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000;
+  const PUSHED_EDIT_ID = 77;
+  const PUSHED = "ba421e896eab0000000000000000000000000000";
+  const PR = 859;
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs
+         (book, resource, source_sha, synced_at, origin,
+          pushed_blob_sha, pushed_read_at, pushed_edit_id, pushed_pr_number, pushed_pr_read_at)
+       VALUES (?, 'tn', 'oldoldoldoldoldoldoldoldoldoldoldoldoldo', 1, 'reimport', ?, ?, ?, ?, ?)`,
+    )
+    .run(BOOK, PUSHED, READ_AT, PUSHED_EDIT_ID, PR, READ_AT);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "1:1", note: "fresh note" })].join("\n");
+  const restore = stubDoor43WithOwnMerge(raw, {
+    masterSha: "1111111111111111111111111111111111aaaa",
+    mergeSha: "22d652732b180000000000000000000000000000",
+    prNumber: PR,
+    pushedBlobSha: PUSHED,
+    mergeDate: "2026-09-01T05:38:03Z",
+    botDate: "2026-09-01T23:49:46Z",
+  });
+  // A newer render confirmed by a concurrent export, after the fetch and
+  // before the walk (the wrapper's second read is the pre-lineage one).
+  const OUTSIDE = { confirmedAt: READ_AT + 100, editId: 500 };
+  env.DB = wrapDbAdvancingConfirmedOnSecondRead(sqlite, env.DB, BOOK, "tn", OUTSIDE);
+  env.BLOBS = makeBlobs();
+  let plan;
+  try {
+    plan = await planAndStageBookResources(env, BOOK, ["tn"], "inst-1048-both");
+  } finally {
+    restore();
+  }
+  const entry = plan.entries.find((e) => e.resource === "tn");
+  const row = sqlite
+    .prepare(`SELECT master_confirmed_at AS confirmedAt, master_confirmed_edit_id AS editId FROM book_resource_syncs WHERE book = ? AND resource = 'tn'`)
+    .get(BOOK);
+  eq(entry.changed, true, "precondition: the resource staged");
+  eq(row, OUTSIDE, "precondition: the outside advance holds the row (#658's MAX kept the newer value)");
+  eq(
+    entry.stagedCutoff,
+    { confirmedAt: READ_AT, editId: PUSHED_EDIT_ID },
+    "stagedCutoff is the fetch-time cutoff plus this run's own stamp: not the outside value, not the bare fetch-time value",
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
