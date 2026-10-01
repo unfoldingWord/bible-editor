@@ -4564,6 +4564,10 @@ async function loadMasterLineage(
   // so it is judged here rather than paying a second Gitea fetch for it.
   ownDecline: ResourceSyncState | null = null,
   observedAt = Date.now(),
+  // #1058: the master commit the caller's file was fetched at, so #658's stamp
+  // is only accepted for a merge that file can contain. See
+  // accountOwnPublishDecline's `pinnedSha`.
+  pinnedSha?: string | null,
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
   if (!file) return null;
@@ -4573,7 +4577,7 @@ async function loadMasterLineage(
     // rewritten never GETS a watermark (recognition never fires), so gating the
     // detector on one would leave it blind for exactly the pairs it exists for
     // (cold review F3 / Codex P1 on this change).
-    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline, observedAt, stats);
+    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline, observedAt, stats, pinnedSha);
     return null;
   }
   // Prefer the repo-scoped ledger when it can prove a current, gap-free,
@@ -4592,7 +4596,7 @@ async function loadMasterLineage(
         incomplete: false,
         incompleteReason: "",
       };
-      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt, stats);
+      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt, stats, pinnedSha);
       const humans = classified.filter((c) => c.kind === "human");
       let humanRefs: HumanRefEvidence | null = null;
       if (humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
@@ -4650,7 +4654,7 @@ async function loadMasterLineage(
     });
   }
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
-  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline, observedAt, stats);
+  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline, observedAt, stats, pinnedSha);
   const commits = page.commits.map(classifyMasterCommit);
   // #557: narrow "a human touched this file" to "a human touched THIS verse",
   // but only where it is affordable and only where the file-level answer is
@@ -8889,6 +8893,12 @@ async function accountOwnPublishDecline(
   sync: ResourceSyncState,
   observedAt = Date.now(),
   stats?: LineageStats,
+  // #1058: the master commit the caller's file was fetched at. The walk reads
+  // master's CURRENT tip, so our merge can be in it yet newer than that file;
+  // #658's stamp is then withheld (see below). `undefined` means the caller did
+  // not pin its file and keeps the unpinned behavior; `null` means it pinned
+  // but the sha is unknown, which proves nothing.
+  pinnedSha?: string | null,
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   try {
@@ -8984,7 +8994,28 @@ async function accountOwnPublishDecline(
       // getMasterConfirmedAt is re-read for chunk apply, so tonight's merge can
       // recover the newly confirmed ancestor. Absent/incomplete/human evidence
       // deliberately declines to the existing conservative behavior.
+      //
+      // #1058: and only when our merge is at or before the commit the caller's
+      // file was fetched at. Otherwise the stamp certifies a render that file
+      // predates, and the TSV prune deletes that render's AI-only rows. The
+      // walk is newest first (git order on the live path, committed_at on the
+      // ledger), so "at or before" is "at or after the pinned sha's position";
+      // a pinned sha missing from the walk proves nothing. Withholding is the
+      // safe direction: next night's file head is at or after this merge.
+      const mergeIdx = commits.findIndex((c) => c.sha === judged.mergeSha);
+      const pinIdx = pinnedSha == null ? -1 : commits.findIndex((c) => c.sha === pinnedSha);
+      const mergeInPinnedFile = pinnedSha === undefined || (pinIdx >= 0 && mergeIdx >= pinIdx);
+      if (!mergeInPinnedFile) {
+        console.log("reimport #658 stamp withheld: our merge is not at or before the fetched file's commit (#1058)", {
+          book,
+          resource,
+          mergeSha: judged.mergeSha,
+          pinnedSha,
+          pinnedInWalk: pinIdx >= 0,
+        });
+      }
       const lineageConfirmed =
+        mergeInPinnedFile &&
         !page.incomplete &&
         commits.every((commit) => commit.kind !== "human") &&
         pushedReadAt != null
@@ -9082,7 +9113,8 @@ export const accountOwnPublishDeclineForTest = (
   walked: MasterCommitPage | null,
   sync: ResourceSyncState,
   observedAt = Date.now(),
-): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync, observedAt);
+  pinnedSha?: string | null,
+): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync, observedAt, undefined, pinnedSha);
 
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
@@ -10492,6 +10524,9 @@ async function planAndStageBookResources(
       // verdict that means "we measured a difference" (see accountOwnPublishDecline).
       own.reason === "content_differs" ? sync : null,
       alertObservedAt,
+      // #1058: the file above was fetched at masterSha; #658 may only stamp a
+      // merge at or before it.
+      masterSha,
     );
     let confirmedBaseR2Key: string | null = null;
     // #857: read after loadMasterLineage, not reused from `stageCutoff` —

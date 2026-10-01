@@ -643,7 +643,11 @@ Highlights that bite repeatedly:
   this run's own confirmed render. It is not "never newer than the post-walk read": an outside confirm with a
   null edit id can push `master_confirmed_at` past the run's `pushed_read_at`, so the stamp's SQL edit-id gate
   leaves the row's edit id at the fetch-time value while the paired edit id is the own stamp's. Corollary for tests: a DB-side advance injected during staging now reads as an outside
-  writer, so a test of the legitimate path has to drive the real #658 stamp.
+  writer, so a test of the legitimate path has to drive the real #658 stamp. The own stamp is only legitimate
+  for a merge the staged file can contain (#1058): the walk reads master's current tip, not `masterSha`, so
+  `accountOwnPublishDecline` withholds the stamp unless our merge sits at or after `masterSha`'s position in the
+  newest-first walk (a missing or unknown `masterSha` withholds too). Next night's file head is past the merge, so
+  the stamp lands then.
 
 ## Stop conditions / goals
 
