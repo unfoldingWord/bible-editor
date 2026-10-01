@@ -647,7 +647,10 @@ Highlights that bite repeatedly:
   for a merge the staged file can contain (#1058): the walk reads master's current tip, not `masterSha`, so
   `accountOwnPublishDecline` withholds the stamp unless our merge sits at or after `masterSha`'s position in the
   newest-first walk (a missing or unknown `masterSha` withholds too). Next night's file head is past the merge, so
-  the stamp lands then.
+  the stamp lands then. The admin "Pull from Door43" path (`runReimport`) pins ULT/UST the same way (#1063), because
+  it re-reads the verse cutoff after the walk. Its TSV fetch stays unpinned on purpose: a `ref`-pinned TSV fetch
+  comes back completeness-verified, which widens the prune's covered chapters, and that path's TSV cutoff is the
+  pre-walk read anyway.
 
 ## Stop conditions / goals
 

@@ -1269,9 +1269,22 @@ async function runReimport(
   // nulls a refused resource out, exactly as the TSV truncation gate does for
   // tn/tq/twl a few lines further down.
   let [ultRaw, ustRaw] = [null as string | null, null as string | null];
+  // #1063: resolve master's file-commit SHA BEFORE the verse fetch and fetch
+  // pinned to it (the nightly's pattern), so the lineage walk below can withhold
+  // #658's stamp for a merge that landed after this file was read (#1058). A
+  // null SHA falls back to the unpinned URL and withholds the stamp. TSV stays
+  // unpinned: a pinned TSV fetch is completeness-verified, which widens the prune.
+  const ultFile = dcsResourceFile(book, "ult");
+  const ustFile = dcsResourceFile(book, "ust");
+  const [ultSha, ustSha] = await Promise.all([
+    want.has("ult") && ultFile ? fileCommitSha(env, ultFile.repo, ultFile.path) : Promise.resolve(null),
+    want.has("ust") && ustFile ? fileCommitSha(env, ustFile.repo, ustFile.path) : Promise.resolve(null),
+  ]);
+  const verseUrl = (file: { repo: string; path: string } | null, sha: string | null, fallback: string) =>
+    file ? dcsRawUrl(env, file.repo, file.path, sha ?? undefined) : fallback;
   const [ultFetched, ustFetched, tnFetch, tqFetch, twlFetch] = await Promise.all([
-    want.has("ult") ? fetchText(urls.ult) : Promise.resolve(null),
-    want.has("ust") ? fetchText(urls.ust) : Promise.resolve(null),
+    want.has("ult") ? fetchText(verseUrl(ultFile, ultSha, urls.ult)) : Promise.resolve(null),
+    want.has("ust") ? fetchText(verseUrl(ustFile, ustSha, urls.ust)) : Promise.resolve(null),
     want.has("tn") && tnFile
       ? fetchTsvMasterVerified(env, tnFile.repo, tnFile.path)
       : Promise.resolve({ raw: null, verifiedComplete: false }),
@@ -1350,10 +1363,9 @@ async function runReimport(
     const file = dcsResourceFile(book, resource);
     if (!file) continue;
     const state = await resourceSyncState(env, book, resource);
-    // This route has no SHA gate of its own, so master's file-commit SHA is
-    // resolved here. One subrequest, on a human-triggered request, only for a
-    // verse resource that was actually fetched.
-    const masterSha = await fileCommitSha(env, file.repo, file.path);
+    // This route has no SHA gate of its own; the SHA resolved before the fetch
+    // (#1063) is the commit this file was read at.
+    const masterSha = resource === "ult" ? ultSha : ustSha;
     const { decision, hold } = await evaluateStaleBaseReplacement(env, {
       book,
       resource,
@@ -1500,6 +1512,10 @@ async function runReimport(
           stats,
           ownDeclines.get(resource) ?? null,
           alertObservedAt,
+          // #1063: the verse files were fetched pinned; #658 may only stamp a
+          // merge at or before that commit. TSV keeps the unpinned behavior:
+          // its cutoff below is the pre-walk read, so a stamp cannot reach it.
+          resource === "ult" ? ultSha : resource === "ust" ? ustSha : undefined,
         )
       : null;
     perResource[resource].merge_no_base_cleared += stats.noBaseCleared;
