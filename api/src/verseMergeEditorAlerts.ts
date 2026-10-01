@@ -359,17 +359,16 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
 }
 
 export function buildMergeConflictGuidance(
-  rows: Array<{ action: string; reason?: string; overwrittenVersion?: number | null }>,
+  rows: Array<{ action: string; reason?: string; overwrittenVersion: number | null }>,
   opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
 ): string {
-  // #539's no-op guard (bookReimport.ts ~7318) keeps a CONFLICTED adopt whose
-  // bytes turned out to already match D1 as an `adopt_conflict` row with
-  // `overwrittenVersion` cleared to null, so the review banner still lists it
-  // — but nothing was actually overwritten, and a pointer-less row has no
-  // `@v` in its ref (buildGroupedRefsClause). Rows that don't set
-  // `overwrittenVersion` at all (pre-#981 call sites / existing tests) are
-  // treated as carrying a pointer, matching this function's behavior before
-  // this split existed.
+  // #539's no-op guard (bookReimport.ts ~7609-7674) keeps a CONFLICTED adopt
+  // whose bytes turned out to already match D1 as an `adopt_conflict` row
+  // with `overwrittenVersion` cleared to null, so the review banner still
+  // lists it — but nothing was actually overwritten, and a pointer-less row
+  // has no `@v` in its ref (buildGroupedRefsClause). `overwrittenVersion` is
+  // required (not optional) precisely so every caller must say which case a
+  // row is, rather than one being silently assumed.
   const adoptConflictRows = rows.filter((r) => r.action === "adopt_conflict");
   const overwrittenRows = adoptConflictRows.filter((r) => r.overwrittenVersion !== null);
   const noOverwriteRows = adoptConflictRows.filter((r) => r.overwrittenVersion === null);
@@ -404,9 +403,19 @@ export function buildMergeConflictGuidance(
     overwritten > 0
       ? `${overwritten} took Door43's version over the editor's — ${overwriteAxes} ${overwriteRecovery}`
       : "",
+    // The #539 no-op guard only keeps a pointer-less row when master's
+    // ARRIVING bytes differed from D1 by more than Hebrew mark order (#977
+    // already drops the mark-order-only case before this point) — so the
+    // final bytes matching D1 is never "Door43 already matched D1"; it is
+    // canonizeAlignmentSource folding Door43's \zaln-s source-attribute fix
+    // onto D1's own (possibly stale) bytes. No app text was replaced, but
+    // Door43's fix was not carried into D1 either, so it reads the same as
+    // 'source_attr_divergent' below rather than as a clean no-op.
     noOverwrite > 0
-      ? `${noOverwrite} ${noOverwrite === 1 ? "was" : "were"} flagged for review but D1 already matched Door43, ` +
-        `so nothing was overwritten.`
+      ? `${noOverwrite} ${noOverwrite === 1 ? "was" : "were"} flagged for review, but no app text was replaced — ` +
+        `Door43 changed this verse's original-language source attributes (spelling/pointing/morphology on ` +
+        `\\zaln-s), and that fix was folded onto D1's own bytes rather than carried into D1, so tonight's export ` +
+        `may still write D1's stale source attributes back over Door43's fix unless someone checks it by hand.`
       : "",
     keptAlignment > 0
       ? `${keptAlignment} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +
