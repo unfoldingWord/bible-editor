@@ -3718,13 +3718,14 @@ await (async () => {
   const { join, dirname } = await import("node:path");
   const { fileURLToPath } = await import("node:url");
 
-  const KOL_WJ = "כָּ⁠ל"; // כָּ⁠ל, UHB bytes with the word joiner
-  const KOL = "כָּל"; // כָּל, UHB bytes, bare
-  const KOL_NFC = "כָּל"; // כָּל in NFC order, no joiner: a legacy AI row
-  const KOH_UHB = "כֹּ֥ה"; // כֹּ֥ה, dagesh before holam (UHB)
-  const KOH_NFC = "כֹּ֥ה"; // כֹּ֥ה, holam before dagesh (NFC)
-  const LOGOS = "λόγος"; // λόγος, precomposed
-  const LOGOS_DECOMP = "λόγος"; // λόγος, combining acute
+  const KOL_WJ = "\u05db\u05bc\u05b8\u2060\u05dc"; // kol, UHB bytes (dagesh, qamats) with the U+2060 word joiner
+  const KOL = "\u05db\u05bc\u05b8\u05dc"; // kol, UHB bytes, bare
+  const KOL_NFC = "\u05db\u05b8\u05bc\u05dc"; // kol in NFC order (qamats, dagesh), no joiner: a legacy AI row
+  const KOL_PATAH = "\u05db\u05bc\u05b7\u05dc"; // kol with the joiner dropped AND patah for qamats: an AI slip
+  const KOH_UHB = "\u05db\u05bc\u05b9\u05a5\u05d4"; // koh, dagesh before holam (UHB)
+  const KOH_NFC = "\u05db\u05b9\u05bc\u05a5\u05d4"; // koh, holam before dagesh (NFC)
+  const LOGOS = "\u03bb\u03cc\u03b3\u03bf\u03c2"; // logos, precomposed omicron-tonos
+  const LOGOS_DECOMP = "\u03bb\u03bf\u0301\u03b3\u03bf\u03c2"; // logos, omicron + combining acute
   const hex = (s) => Buffer.from(s).toString("hex");
   for (const [a, b] of [[KOL_WJ, KOL], [KOL, KOL_NFC], [KOH_UHB, KOH_NFC], [LOGOS, LOGOS_DECOMP]]) {
     assert(a !== b, `#966 precondition: ${hex(a)} and ${hex(b)} differ in bytes`);
@@ -3885,6 +3886,32 @@ await (async () => {
     });
     assert(result.applied?.tnCreated === 1 && rows.length === 2,
       `#966: twins resolved across a live row's verse range stay two notes (created=${result.applied?.tnCreated}, rows=${rows.length})`);
+  }
+
+  // 6b. A proposal that is a UHB surface only because staging's LOOSE tier
+  // rewrote it is not evidence of a twin. The AI re-proposes the live `כָּ⁠ל`
+  // note but drops the joiner and writes patah for qamats: the exact tier
+  // misses, the stripped tier (whose key keeps U+2060) resolves only to bare
+  // `כָּל`, and staging stores that. Still one note.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL_WJ, KOL] },
+      live: [{ id: "aaaa", verse: 10, quote: KOL_WJ }],
+      tsv: [{ id: "bbbb", verse: 10, quote: KOL_PATAH }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: a loose-tier rewrite to the other twin still dedups (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+  }
+  // 6c. A proposal staged before the AI's own quote was recorded (no ai_quote
+  // in the payload) cannot prove its bytes came from the AI: it dedups.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL_WJ, KOL] },
+      live: [{ id: "aaaa", verse: 10, quote: KOL_WJ }],
+      prestaged: [{ id: "bbbb", verse: 10, quote: KOL }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: an already-staged twin proposal with no recorded AI quote fails safe to dedup (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
   }
 
   // 7. NT keeps the #962 fold: composition and joiner differences still dedup,
