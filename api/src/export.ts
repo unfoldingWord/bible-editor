@@ -1232,8 +1232,10 @@ const LINEAGE_FIELDS: Record<"tn" | "tq", Array<[string, string]>> = {
 // do not supersede: a translator editing the bot's row is the case this serves.
 //
 // The bot write must also be NEWER than where master was last confirmed
-// (edit_log id > master_confirmed_edit_id, or created_at >= master_confirmed_at
-// when the id is NULL; neither known -> nothing counts). A bot write at or
+// (edit_log id > master_confirmed_edit_id, or created_at > master_confirmed_at
+// when the id is NULL — strict, because a write in the same second as the
+// render's D1 read may be inside that render; neither known -> nothing
+// counts). A bot write at or
 // before that point already reached master inside a confirmed render of ours,
 // so master holding it again now is a revert (bot X -> app Y exported and
 // confirmed -> app Z -> human restores X), not the bot push the app edit is
@@ -1253,7 +1255,7 @@ export function buildRevertLineage(
   const latest = new Map<string, (typeof rows)[number]>();
   for (const r of rows) if (r.source != null) latest.set(r.row_key, r);
   const afterConfirmed = (r: (typeof rows)[number]): boolean =>
-    confirmed.editId != null ? r.id > confirmed.editId : confirmed.at != null ? r.created_at >= confirmed.at : false;
+    confirmed.editId != null ? r.id > confirmed.editId : confirmed.at != null ? r.created_at > confirmed.at : false;
   const lineage = new Map<string, Array<Record<string, unknown>>>();
   for (const [rowKey, r] of latest) {
     if (r.source !== "ai_pipeline" || (r.action !== "create" && r.action !== "update") || r.payload_json == null) continue;
