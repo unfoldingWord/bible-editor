@@ -688,8 +688,8 @@ test("a range row opened on its inner verse: a refused save's drags come back un
     );
     await dual.locator('button:has(svg[data-testid="CloseIcon"])').first().click();
     await gate.getByRole("button", { name: "Save", exact: true }).click();
-    // The local cache still holds the refused content, so this save may not
-    // ask again (#1073).
+    // Whether this save asks again depends on what the cache holds by now
+    // (before #1073 it kept the refused content, so it did not ask).
     expect(await confirmUnalignIfAsked(page, patched)).toBe(200);
   } finally {
     clearLock();
@@ -716,6 +716,172 @@ test("a range row opened on its inner verse: a refused save's drags come back un
       });
       expect(put.status(), await put.text()).toBe(200);
     }
+  }
+
+  await context.close();
+});
+
+// #1073: a refused save left its optimistic content in the chapter cache, so
+// after the aligner's Reset (which goes back to the server's alignment) a
+// reopened aligner still showed the refused alignment as saved, and a refused
+// text edit stayed on screen as if it had landed. The cache must go back to
+// the server's row once the refusal arrives.
+test("a refused panel Save, then Reset: reopening the aligner shows the server's alignment, not the refused one", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "s17-refused-reset");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  await page.clock.install();
+
+  d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+  const snap = await snapshotVerse(context.request);
+  try {
+    await openAligner(page);
+    const saveBtn = page.getByRole("button", { name: `Save ${BV}`, exact: true });
+    const resetBtn = page.getByRole("button", { name: "Reset", exact: true });
+    const count = page
+      .getByText(`${BV} words`, { exact: true })
+      .locator("xpath=../..")
+      .getByText(/^\d+ unaligned$/);
+
+    const dragged = await dragAlignedWordToStrip(page);
+    expect(dragged.after).not.toBe(dragged.before);
+
+    lockChapter(auth.userId, "s17-refused-reset");
+    const refused = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(VERSE_PATH),
+    );
+    await saveBtn.click();
+    expect(await confirmUnalignIfAsked(page, refused)).toBe(409);
+    await expect(page.getByText("chapter locked")).toBeVisible({ timeout: 15_000 });
+
+    // Reset goes back to the server's alignment.
+    await resetBtn.click();
+    await expect(count).toHaveText(dragged.before);
+
+    // Close (clean, so no gate) and reopen: still the server's alignment.
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await expect(saveBtn).toHaveCount(0);
+    await page.locator(`button[aria-label^="align ${BV}"]`).first().click();
+    await saveBtn.waitFor({ state: "visible" });
+    await expect(count).toHaveText(dragged.before);
+    await expect(resetBtn).toBeDisabled();
+    expect(await crashDraftCount(page, DRAFT_KEY)).toBe(0);
+  } finally {
+    d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+    await restoreVerse(context.request, csrf, snap);
+  }
+
+  await context.close();
+});
+
+test("a refused gate Save: the crash draft still brings the drags back, and Reset then shows the server's alignment", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "s17-refused-gate-reset");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  await page.clock.install();
+
+  d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+  const snap = await snapshotVerse(context.request);
+  try {
+    await openAligner(page);
+    const saveBtn = page.getByRole("button", { name: `Save ${BV}`, exact: true });
+    const resetBtn = page.getByRole("button", { name: "Reset", exact: true });
+    const count = page
+      .getByText(`${BV} words`, { exact: true })
+      .locator("xpath=../..")
+      .getByText(/^\d+ unaligned$/);
+
+    const dragged = await dragAlignedWordToStrip(page);
+    expect(dragged.after).not.toBe(dragged.before);
+    await expect.poll(() => crashDraftCount(page, DRAFT_KEY), { timeout: 5_000 }).toBe(1);
+
+    lockChapter(auth.userId, "s17-refused-gate-reset");
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    const gate = page.getByRole("dialog").filter({ hasText: "Unsaved alignment changes" });
+    await expect(gate).toBeVisible();
+    const refused = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(VERSE_PATH),
+    );
+    await gate.getByRole("button", { name: "Save", exact: true }).click();
+    expect(await confirmUnalignIfAsked(page, refused)).toBe(409);
+    await expect(page.getByText(/Your changes are kept in the aligner/)).toBeVisible();
+
+    // Reopen: the crash draft is still offered (the drags, unsaved).
+    await page.locator(`button[aria-label^="align ${BV}"]`).first().click();
+    await saveBtn.waitFor({ state: "visible" });
+    await expect(count).toHaveText(dragged.after);
+    await expect(resetBtn).toBeEnabled();
+
+    // Reset discards them and lands on the server's alignment, which a
+    // second reopen also shows.
+    await resetBtn.click();
+    await expect(count).toHaveText(dragged.before);
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await expect(saveBtn).toHaveCount(0);
+    await page.locator(`button[aria-label^="align ${BV}"]`).first().click();
+    await saveBtn.waitFor({ state: "visible" });
+    await expect(count).toHaveText(dragged.before);
+    await expect(resetBtn).toBeDisabled();
+  } finally {
+    d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+    await restoreVerse(context.request, csrf, snap);
+  }
+
+  await context.close();
+});
+
+test("a refused text edit in the main column: the chapter cache goes back to the server's text", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "s17-refused-text");
+  const page = await context.newPage();
+  await page.clock.install();
+
+  d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+  // 6:3, not 6:2: the first test above leaves 6:2 with an unaligned text
+  // node, and this case needs a fully aligned verse to start from. The edit
+  // is refused, so nothing needs restoring.
+  const TEXT_VERSE = 3;
+  const textPath = `/api/verses/${BOOK}/${CHAPTER}/${TEXT_VERSE}/${BV}`;
+  try {
+    await page.goto(`/#/${BOOK}/${CHAPTER}/${TEXT_VERSE}`);
+    const cell = page.locator(`[contenteditable="true"][data-find-cell="${CHAPTER}-${TEXT_VERSE}-${BV}"]`);
+    await cell.waitFor({ timeout: 15_000 });
+    const original = (await cell.textContent()) ?? "";
+    expect(original.length).toBeGreaterThan(0);
+    const alignBtn = page.locator(`button[aria-label^="align ${BV}"]`).first();
+    await expect(alignBtn.locator('svg[data-testid="LinkOffIcon"]')).toHaveCount(0);
+
+    lockChapter(auth.userId, "s17-refused-text");
+    const marker = ` REFUSED1073-${Date.now()}`;
+    await cell.click();
+    await page.keyboard.press("ControlOrMeta+End");
+    await page.keyboard.type(marker, { delay: 20 });
+    await expect(cell).toHaveText(original + marker);
+    const refused = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(textPath),
+    );
+    await page.locator('button:has([data-testid="SaveIcon"])').first().click();
+    expect((await refused).status()).toBe(409);
+    await expect(page.getByText(/Edit dropped.*AI run.*mid-flight/i)).toBeVisible();
+
+    // The typing stays on screen as an unsaved draft (drafts.ts), but the
+    // chapter cache under it must hold the server's text again: the verse's
+    // align button, which reads the cache's content, goes back to aligned
+    // instead of showing the refused text's broken alignment.
+    const readOnlyCell = page.locator(`[data-find-cell="${CHAPTER}-${TEXT_VERSE}-${BV}"]`).first();
+    await expect(readOnlyCell).toHaveText(original + marker);
+    await expect(readOnlyCell).toHaveAttribute("data-dirty", "true");
+    await expect(alignBtn.locator('svg[data-testid="LinkOffIcon"]')).toHaveCount(0, { timeout: 10_000 });
+    const server = (await (await context.request.get(textPath)).json()) as { plain_text: string };
+    expect(server.plain_text).not.toContain(marker.trim());
+  } finally {
+    d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
   }
 
   await context.close();
