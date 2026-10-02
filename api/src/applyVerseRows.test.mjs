@@ -2341,6 +2341,36 @@ console.log("\n[#728 T2b: …but when the lineage PROVES no human moved master, 
   assertClean728(counts, "T2b");
 }
 
+console.log("\n[#949 follow-up (2026-10-02 backlog review): on a LOCKED book, T2b's AI-only lineage no longer blocks the split]");
+{
+  // The shape the review flagged: a locked book never advances the lineage
+  // walk, so a split anchor with an app edit since the export (the ordinary
+  // state of a locked book) used to reach #787's keep_ai_master check in
+  // computeVerseMerge before ever asking whether the book was locked — the
+  // whole component then fell back to structure_refused /
+  // anchor_keep_ai_master, silently keeping D1's bridge. Same fixture as T2b
+  // (AI-only lineage) plus T3's app edit, but LOCKED: the split must land.
+  const { env, sqlite } = freshEnv();
+  const boundary = seedExportedBridge(sqlite);
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 7)`).run(BOOK);
+  insertLog728(sqlite, { verse: 1, action: "update", prev: 3, next: 4, payload: { content: JSON.parse(contentJson("combined one two, app-edited")) }, createdAt: 400 });
+  sqlite.prepare(`UPDATE verses SET content_json = ?, plain_text = ?, version = 4 WHERE book = ? AND chapter = ? AND verse = 1 AND bible_version = ?`)
+    .run(contentJson("combined one two, app-edited"), "combined one two, app-edited", BOOK, CH, VERSION);
+  const master = [verse(CH, 1, "master verse one"), verse(CH, 2, "master verse two")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: AI_ONLY_LINEAGE_728 }, false,
+  );
+  const rows = rows728(sqlite);
+  eq(rows.map((r) => [r.verse, r.verse_end, r.text]), [[1, null, "master verse one"], [2, null, "master verse two"]],
+    "locked: master's split lands despite the AI-only lineage");
+  eq(counts.structure_adopted, 1, "counted structure_adopted");
+  eq(counts.structure_refused, 0, "NOT refused — this is the bug: it used to fall to anchor_keep_ai_master here");
+  const c = conflicts728(sqlite);
+  eq(c.map((x) => [x.verse, x.action, x.overwritten_version]), [[1, "adopt_conflict", 4]],
+    "the anchor's own app edit still gets a recovery pointer, same as T3 — the lock skips the AI-lineage gate, not the review flag");
+  assertClean728(counts, "T2c");
+}
+
 console.log("\n[#728 T3: an exported bridge a human ALSO edited in the app since, un-bridged on Door43: structure adopted, content flagged adopt_conflict]");
 {
   const { env, sqlite } = freshEnv();
