@@ -359,7 +359,7 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
 }
 
 export function buildMergeConflictGuidance(
-  rows: Array<{ action: string; reason?: string; overwrittenVersion: number | null }>,
+  rows: Array<{ action: string; reason?: string; overwrittenVersion: number | null; chapter?: number; verse?: number }>,
   opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
 ): string {
   // #539's no-op guard (bookReimport.ts ~7609-7674) keeps a CONFLICTED adopt
@@ -379,6 +379,21 @@ export function buildMergeConflictGuidance(
   const noOverwriteRows = adoptConflictRows.filter((r) => r.overwrittenVersion == null);
   const overwritten = overwrittenRows.length;
   const noOverwrite = noOverwriteRows.length;
+  // (2026-10-02 sweep, round 3): `buildGroupedRefsClause`'s shared ref list
+  // also renders 'keep_alignment_refused' / 'source_attr_divergent' /
+  // 'keep_local_structure' rows with no `@v` (they too store
+  // `overwritten_version` NULL — verseMergeConflictSql.ts's
+  // SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL), so "the ref above with no @v"
+  // does not uniquely pick out a pointer-less adopt_conflict row when the
+  // banner also lists one of those. Name this clause's OWN refs inline
+  // instead, independent of that shared list's cap, so a pointer-less ref
+  // that falls into the shared list's "+N more" is still identified here.
+  const noOverwriteRefStrs = noOverwriteRows
+    .filter((r): r is typeof r & { chapter: number; verse: number } => r.chapter != null && r.verse != null)
+    .map((r) => `${r.chapter}:${r.verse}`);
+  const noOverwriteListed = noOverwriteRefStrs.slice(0, MERGE_CONFLICT_REFS_DISPLAY);
+  const noOverwriteMore = noOverwrite > noOverwriteListed.length ? `, +${noOverwrite - noOverwriteListed.length} more` : "";
+  const noOverwriteRefsClause = noOverwriteListed.length > 0 ? ` (${noOverwriteListed.join(", ")}${noOverwriteMore})` : "";
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
   const keptSourceAttr = rows.filter((r) => r.action === "source_attr_divergent").length;
   // Issue #728: the app's verse-bridge STRUCTURE was kept where Door43's
@@ -421,11 +436,10 @@ export function buildMergeConflictGuidance(
     // copies differ on \zaln-s content/lemma and a human has to say which
     // side is right.
     noOverwrite > 0
-      ? `${noOverwrite} ${noOverwrite === 1 ? "was" : "were"} flagged for review but no app text was replaced — ` +
-        `for ${noOverwrite === 1 ? "the ref above with no @v" : "each ref above with no @v"}, Door43's copy ` +
-        `differs from the app's only in the original-language source attributes on \\zaln-s (x-content / ` +
-        `x-lemma); check which side is right before the next export, because the export will write the app's ` +
-        `attributes over Door43's.`
+      ? `${noOverwrite} ${noOverwrite === 1 ? "was" : "were"} flagged for review but no app text was replaced` +
+        `${noOverwriteRefsClause} — Door43's copy differs from the app's only in the original-language source ` +
+        `attributes on \\zaln-s (x-content / x-lemma); check which side is right before the next export, ` +
+        `because the export will write the app's attributes over Door43's.`
       : "",
     keptAlignment > 0
       ? `${keptAlignment} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +

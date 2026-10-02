@@ -237,12 +237,12 @@ function assert(cond, msg) {
   // no "Door43's fix" / D1's "stale" bytes framing, just that the two copies
   // differ on \zaln-s content/lemma and a human has to judge which is right.
   const pointerless = buildMergeConflictGuidance([
-    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
   ]);
   assert(!pointerless.includes("took Door43's version over the editor's"), "pointer-less adopt_conflict is not an overwrite");
   assert(
     !pointerless.includes("the version number given after @v"),
-    "pointer-less adopt_conflict does not claim a recovery version number exists (it may still SAY 'no @v', per the ref clarification below)",
+    "pointer-less adopt_conflict does not claim a recovery version number exists",
   );
   assert(!pointerless.includes("D1 already matched Door43"), "pointer-less adopt_conflict must not claim D1 already matched Door43");
   assert(!pointerless.includes("Door43's fix"), "pointer-less adopt_conflict must not assume Door43 holds the correct side");
@@ -250,41 +250,64 @@ function assert(cond, msg) {
   assert(!pointerless.includes("morphology"), "pointer-less adopt_conflict must not claim morph changed — canonizeAlignmentSource only rewrites content/lemma");
   assert(
     pointerless.includes(
-      "1 was flagged for review but no app text was replaced — for the ref above with no @v, Door43's copy " +
-        "differs from the app's only in the original-language source attributes on \\zaln-s (x-content / x-lemma)",
+      "1 was flagged for review but no app text was replaced (3:4) — Door43's copy differs from the app's " +
+        "only in the original-language source attributes on \\zaln-s (x-content / x-lemma)",
     ),
-    "pointer-less adopt_conflict states only what was measured, and points at the @v-less ref above",
+    "pointer-less adopt_conflict states only what was measured, naming its OWN ref (3:4) inline",
   );
   assert(pointerless.includes("check which side is right"), "pointer-less adopt_conflict leaves the judgment call to a human");
+
+  // Issue #981, round 3: "the ref above with no @v" does not uniquely pick
+  // out a pointer-less adopt_conflict row — keep_alignment_refused /
+  // source_attr_divergent / keep_local_structure rows are stored with
+  // overwritten_version NULL too (verseMergeConflictSql.ts's
+  // SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL), so buildGroupedRefsClause prints
+  // THEM without @v as well. A keep_alignment_refused ref sitting beside a
+  // pointer-less adopt_conflict ref must not be swept into "Door43's copy
+  // differs only in source attributes" — that's a live, unresolved Door43
+  // change, not a source-attribute no-op.
+  const ambiguous = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
+    { action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, chapter: 5, verse: 2 },
+  ]);
+  assert(
+    ambiguous.includes("no app text was replaced (3:4)"),
+    "the pointer-less clause names only its own ref (3:4), not the keep_alignment_refused ref beside it",
+  );
+  assert(
+    !ambiguous.includes("5:2) —") && !/\(3:4, 5:2\)/.test(ambiguous),
+    "5:2 (a live kept-alignment refusal) must never be folded into the source-attributes-only clause",
+  );
 
   // A row WITH a pointer still reads as an overwrite and still gives the @v
   // recovery sentence, even mixed with a pointer-less row in the same run.
   const mixed = buildMergeConflictGuidance([
-    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 4 },
-    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 4, chapter: 1, verse: 1 },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
   ]);
   assert(mixed.includes("1 took Door43's version over the editor's"), "pointered row still counts as an overwrite");
   assert(mixed.includes("at the version number given after @v in its ref above"), "pointered row keeps its @v recovery sentence");
   assert(
-    mixed.includes("1 was flagged for review but no app text was replaced"),
-    "pointer-less row in the same run still gets its own clause",
+    mixed.includes("1 was flagged for review but no app text was replaced (3:4)"),
+    "pointer-less row in the same run still gets its own clause, naming only its own ref",
   );
 
-  // Plural agreement: two pointer-less rows read "were" / "each ref", not
-  // "was" / "the ref".
+  // Plural agreement: two pointer-less rows read "were", list both refs, and
+  // cap/"+N more" like the shared ref clause does.
   const twoPointerless = buildMergeConflictGuidance([
-    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null },
-    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 6, verse: 1 },
   ]);
   assert(
-    twoPointerless.includes("2 were flagged for review but no app text was replaced — for each ref above with no @v"),
-    "two pointer-less rows agree as 'were' / 'each ref'",
+    twoPointerless.includes("2 were flagged for review but no app text was replaced (3:4, 6:1) —"),
+    "two pointer-less rows agree as 'were' and list both their own refs",
   );
 
   // overwrittenVersion omitted entirely (an untyped caller) reads the same as
   // an explicit null — loose equality, matching buildGroupedRefsClause's own
   // `!= null` convention, so an untyped row never silently becomes an
-  // overwrite it cannot point a @v at.
+  // overwrite it cannot point a @v at. No chapter/verse here either: the ref
+  // clause degrades to naming no refs rather than guessing.
   const omitted = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed" }]);
   assert(!omitted.includes("took Door43's version over the editor's"), "omitted overwrittenVersion is treated as pointer-less, not as an overwrite");
   assert(omitted.includes("1 was flagged for review but no app text was replaced"), "omitted overwrittenVersion gets the pointer-less clause");
