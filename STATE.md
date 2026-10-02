@@ -397,6 +397,17 @@ Highlights that bite repeatedly:
   blanket write-block in `request()` also kills writes the server deliberately still
   allows — it made comments vanish and made unlocking impossible from the UI. Split
   read-only into named reasons rather than one global boolean.
+  A third corollary (#1045): a lock that lands on work already typed or dragged must
+  also take Save off every unsaved-changes gate and auto-save path. Saving then
+  commits locally and the refused PATCH is dropped, so the work is lost.
+
+- **A Playwright test can land a pipeline (chapter) lock live without waiting minutes.**
+  The tab only re-reads pipeline jobs on a 120 s poll or a refocus throttled to 60 s
+  (`pipelineStore.ts`). Call `page.clock.install()` before the page loads, then
+  `page.clock.fastForward(61_000)` and dispatch `visibilitychange` (s17's
+  `refreshPipelineJobs`). A spec that saves to the seeded ZEC fixture must restore the
+  verse in `finally`. If it times out, the restore dies with the test and the seed
+  drifts, which breaks later runs. Re-run `import-ZEC.sql` to reset it.
 
 - **"Where is the user?" has no single source in this app — and both available sources
   are blind in a different direction.** `activeVerse` is Shell-LOCAL state
