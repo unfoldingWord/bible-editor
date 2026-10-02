@@ -16,7 +16,7 @@ name: Check for pending D1 migrations
 #
 # Deliberately separate from ci.yml: this must never gate a pull request (a
 # migration merged by someone else, or a slow operator, is not this PR's
-# fault), so it only runs on push to main, after the merge has already
+# fault), so it never runs on pull_request, only after the merge has already
 # happened.
 #
 # The push trigger is limited to pushes that touch api/migrations/. Running on
