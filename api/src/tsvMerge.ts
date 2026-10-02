@@ -627,6 +627,50 @@ export interface TsvEditLogEntry {
    * foldTsvRefBase — see the note there.
    */
   bookKnown?: boolean;
+  /**
+   * edit_log.source. Read only by advanceTsvBaseThroughSyncWrites (#1090);
+   * the boundary folds deliberately ignore who wrote an entry.
+   */
+  source?: string | null;
+}
+
+// edit_log.source of every write the Door43 -> D1 sync makes (bookReimport.ts's
+// REIMPORT_SOURCE, hardcoded in its logEdit / logEditStmt / gatedLogEditStmt).
+const SYNC_WRITE_SOURCE = "dcs_reimport";
+
+// Issue #1090. Advance a row's content ancestor past the export boundary
+// through the sync's OWN later writes, for a LOCKED book only (the caller
+// decides that). A locked book skips the export, so master_confirmed_at stops
+// moving and the bounded fold stays at the last pre-lock export. Without this,
+// a field the sync adopted from Door43 on night 1 (v0 -> v1) reads on night N
+// (Door43 now v2) as base v0, ours v1, theirs v2: "both changed", flagged as a
+// Door43 edit over an app-side change nobody made.
+//
+// Every TSV edit_log row the sync writes carries master's own value for each
+// content field in its payload (an adoption logs only the fields it wrote, all
+// master's raw values; a pristine/AI-only overwrite, restore or create logs
+// master's whole row). So right after such a write, D1 and Door43 held the
+// same value for that field: a true common ancestor, the same thing the export
+// boundary stands for. Overlaying those writes, oldest to newest, per field,
+// makes "D1 still holds what the sync wrote" read as "D1 did not move".
+// Anyone else's write (a human PATCH, source NULL; an AI apply, 'ai_pipeline')
+// is skipped, so a real app-side change after the sync's last write still
+// differs from the ancestor and still conflicts.
+//
+// `entries` are the row's edit_log rows ABOVE the boundary, oldest first. Same
+// skips as foldTsvBase: non-content actions, missing payloads, NULL-book rows.
+// Returns a new object; `base` is not mutated.
+export function advanceTsvBaseThroughSyncWrites(
+  kind: TsvMergeKind,
+  base: TsvMergeSide | null,
+  entries: TsvEditLogEntry[],
+): TsvMergeSide | null {
+  const syncWrites = entries.filter((e) => e.source === SYNC_WRITE_SOURCE);
+  if (syncWrites.length === 0) return base;
+  // foldTsvBase over [base as a seed entry, ...sync writes]: base's keys are
+  // already canonical field names, which readPayloadField reads as-is.
+  const seed: TsvEditLogEntry[] = base ? [{ action: "update", payload: { ...base }, bookKnown: true }] : [];
+  return foldTsvBase(kind, [...seed, ...syncWrites]);
 }
 
 // Fold a row's content-bearing edit_log history (already ordered oldest->newest

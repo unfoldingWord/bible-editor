@@ -11,6 +11,7 @@
 // ancestor. See tsvMerge.ts's header and the edited-row-skips-master-edit memory.
 
 import {
+  advanceTsvBaseThroughSyncWrites,
   classifyTsvRefMove,
   computeTsvMerge,
   detectTornTsvRef,
@@ -1038,6 +1039,57 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
     "none",
     "…same for an explicit null on both sides",
   );
+}
+
+// ── Issue #1090: on a locked book, the sync's own post-boundary writes advance
+// the ancestor; anyone else's do not ─────────────────────────────────────────
+{
+  const base = { quote: "q0", note: "v0", support_reference: "rc://s0" };
+  const sync = (payload) => ({ action: "update", payload, bookKnown: true, source: "dcs_reimport" });
+  const human = (payload) => ({ action: "update", payload, bookKnown: true, source: null });
+  const ai = (payload) => ({ action: "update", payload, bookKnown: true, source: "ai_pipeline" });
+
+  // The sync adopted Door43's v1: that value is now the shared ancestor.
+  const advanced = advanceTsvBaseThroughSyncWrites("tn", base, [sync({ note: "v1" })]);
+  deep(advanced, { quote: "q0", note: "v1", support_reference: "rc://s0" }, "#1090: a sync write advances its field only");
+  eq(base.note, "v0", "#1090: the input base is not mutated");
+  // Night 2 over that ancestor: D1 still holds v1, Door43 moved to v2 -> clean adopt.
+  const ours = { quote: "q0", note: "v1", support_reference: "rc://s0" };
+  const theirs = { quote: "q0", note: "v2", support_reference: "rc://s0" };
+  const m = computeTsvMerge("tn", advanced, ours, theirs, { bookLocked: true });
+  deep([m.action, m.conflict], ["adopt", false], "#1090: the second Door43 edit adopts with no flag");
+  eq(computeTsvMerge("tn", base, ours, theirs, { bookLocked: true }).action, "adopt_conflict",
+    "#1090 control: the frozen ancestor reads the same night as both-changed");
+
+  // A human or AI write after the sync's never advances the ancestor, so a real
+  // app-side change since the last shared value still conflicts.
+  for (const [label, entry] of [["human", human], ["AI", ai]]) {
+    const after = advanceTsvBaseThroughSyncWrites("tn", base, [sync({ note: "v1" }), entry({ note: "app" })]);
+    eq(after.note, "v1", `#1090: a ${label} write after the sync's leaves the ancestor at the sync's value`);
+    const mm = computeTsvMerge("tn", after, { ...ours, note: "app" }, theirs, { bookLocked: true });
+    deep([mm.action, mm.conflictFields], ["adopt_conflict", ["note"]], `#1090: a ${label} edit after the adoption still flags`);
+  }
+  // A sync write AFTER an app edit is the newest shared value (it was flagged when it landed).
+  eq(advanceTsvBaseThroughSyncWrites("tn", base, [human({ note: "app" }), sync({ note: "v1" })]).note, "v1",
+    "#1090: the newest sync write wins over an earlier app edit");
+  // Unprovable entries are ignored: a NULL-book row, a non-content action, no payload.
+  deep(
+    advanceTsvBaseThroughSyncWrites("tn", base, [
+      { ...sync({ note: "other book" }), bookKnown: false },
+      { action: "delete", payload: { note: "x" }, bookKnown: true, source: "dcs_reimport" },
+      { action: "update", payload: null, bookKnown: true, source: "dcs_reimport" },
+    ]),
+    base,
+    "#1090: NULL-book, non-content and payload-less entries never advance the ancestor",
+  );
+  // Payload spelling: a reimport logs ParsedTsvRow's snake/camel keys; non-merge keys are ignored.
+  deep(
+    advanceTsvBaseThroughSyncWrites("twl", { orig_words: "a", tw_link: "rc://x" }, [sync({ twLink: "rc://y", tags: "t", chapter: 2 })]),
+    { orig_words: "a", tw_link: "rc://y" },
+    "#1090: camelCase payload keys are read; tags and chapter are not merge fields",
+  );
+  // No ancestor at all and no sync writes: still none.
+  eq(advanceTsvBaseThroughSyncWrites("tn", null, [human({ note: "app" })]), null, "#1090: no base and no sync write stays null");
 }
 
 if (failed) {
