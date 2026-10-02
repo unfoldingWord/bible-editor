@@ -2828,6 +2828,12 @@ function utf8Base64(s) {
     JSON.stringify(list()) === JSON.stringify("GHIJKLMNOP".split("")),
     `cap keeps the 10 newest renders, oldest first; got ${JSON.stringify(list())}`,
   );
+  // C2: pushing the same bytes again does not add a duplicate entry.
+  record("P", 2000, 0);
+  assert(
+    JSON.stringify(list()) === JSON.stringify("GHIJKLMNOP".split("")),
+    `a repeated render sha is not appended twice; got ${JSON.stringify(list())}`,
+  );
 }
 
 // --- isMasterConfirmed: the ONLY commitToDcs outcome that proves master
