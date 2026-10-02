@@ -1639,9 +1639,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
       ) {
-        // #1029: rows D1 took from master via a bot push (ai_pipeline /
-        // dcs_reimport create/update payloads). Only read when a report is on
-        // the table, tn/tq only; fails open.
+        // #1029: rows D1 took from master via a bot push. dcs_reimport is read
+        // only so a later import supersedes an older ai_pipeline payload
+        // (buildRevertLineage). Only read when a report is on the table, tn/tq
+        // only; fails open.
         let lineage: Map<string, Array<Record<string, unknown>>> | null = null;
         if (computeEntries && (resource === "tn" || resource === "tq")) {
           try {

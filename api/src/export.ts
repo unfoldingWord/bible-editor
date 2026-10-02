@@ -1168,9 +1168,9 @@ export function tsvRevertReport(
   masterTsv: string,
   kind: "tn" | "tq" | "twl",
   baseTsv: string | null = null,
-  // #1029: rows (tn/tq) D1 itself took from master via ai_pipeline /
-  // dcs_reimport, as edit_log payload objects (D1 column names). A row whose
-  // master cells equal one of these was created on master by a bot and mirrored
+  // #1029: per row (tn/tq), the AI pipeline's payload when it is the row's
+  // latest machine write (see buildRevertLineage), in D1 column names. A row
+  // whose master cells equal it was written to master by the bot and mirrored
   // into D1, so a later app edit is ours, not a reverted foreign edit.
   lineage: Map<string, Array<Record<string, unknown>>> | null = null,
 ): TsvRevertReport {
@@ -1224,19 +1224,21 @@ const LINEAGE_FIELDS: Record<"tn" | "tq", Array<[string, string]>> = {
 };
 
 // Builds tsvRevertReport's `lineage` map from edit_log rows (ordered by id
-// ascending) for one (book, kind).
+// ascending) for one (book, kind). Per row, only the LATEST machine write
+// (ai_pipeline or dcs_reimport) counts, and only when the AI pipeline wrote
+// it: dcs_reimport also mirrors human Door43 edits, and a human can restore an
+// older bot value on Door43, so neither may hide a row from the report.
 export function buildRevertLineage(
   rows: ReadonlyArray<{ row_key: string; source: string | null; payload_json: string }>,
 ): Map<string, Array<Record<string, unknown>>> {
+  const latest = new Map<string, { source: string | null; payload_json: string }>();
+  for (const r of rows) latest.set(r.row_key, r);
   const lineage = new Map<string, Array<Record<string, unknown>>>();
-  for (const r of rows) {
+  for (const [rowKey, r] of latest) {
+    if (r.source !== "ai_pipeline") continue;
     try {
       const p = JSON.parse(r.payload_json);
-      if (p && typeof p === "object") {
-        const list = lineage.get(r.row_key) ?? [];
-        list.push(p as Record<string, unknown>);
-        lineage.set(r.row_key, list);
-      }
+      if (p && typeof p === "object") lineage.set(rowKey, [p as Record<string, unknown>]);
     } catch {
       /* skip unparseable payload */
     }
@@ -1258,7 +1260,10 @@ function masterMatchesLineage(
   return payloads.some((p) =>
     fields.every(([header, key]) => {
       if (!(key in p)) return false;
-      const v = key === "note" || key === "question" || key === "response" ? normalizeNoteText(p[key] as string) : p[key];
+      const isProse = key === "note" || key === "question" || key === "response";
+      // A non-string prose field never matches (fail open) instead of throwing.
+      if (isProse && p[key] != null && typeof p[key] !== "string") return false;
+      const v = isProse ? normalizeNoteText(p[key] as string | null) : p[key];
       return tsvCell(v) === (masterCells[headers.indexOf(header)] ?? "");
     }),
   );
