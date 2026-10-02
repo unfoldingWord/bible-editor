@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { rowDraftClearAfterOk, rowOpClearsDraft } from "./draftSaveState.ts";
+import { NO_ROW_DRAFT, rowDraftClearAfterOk, rowOpClearsDraft } from "./draftSaveState.ts";
 
 // #1092: a row op's 200 clears the row's draft only when that op saved the
 // draft's fields. A move (verse/ref_raw/sort_order) or a reorder carries none
@@ -91,6 +91,75 @@ assert.equal(
   rowDraftClearAfterOk(save, "g10", "g22", stored("g22")),
   false,
   "typing after the Save, re-set before the 200 handler: keep",
+);
+
+// The cases above are ops without a draftGeneration field: legacy ops already
+// queued in users' IndexedDB, which keep the read-at-200 fallback. New ops
+// always carry the field: the generation they saved, or NO_ROW_DRAFT.
+const genOp = (draftGeneration, patch = { note: "old typed" }, queuedAt = 100) => ({
+  ...op(patch),
+  draftGeneration,
+  queuedAt,
+});
+const rec = (generation, updatedAt, patch = { note: "old typed" }) => ({
+  ...draft(patch),
+  generation,
+  updatedAt,
+});
+
+// Review A1: the op drains in a tab that never set this draft (the user
+// reloaded after Save, or another tab holds the drain lock), so there is no
+// live generation. The stored record is the one the save captured: clear it.
+assert.equal(
+  rowDraftClearAfterOk(genOp("g1"), undefined, undefined, rec("g1", 50)),
+  true,
+  "fresh tab, stored draft is the saved generation: clear",
+);
+assert.equal(
+  rowDraftClearAfterOk(genOp("g1"), undefined, undefined, rec("g2", 150)),
+  false,
+  "fresh tab, stored draft is newer typing from the saving tab: keep",
+);
+assert.equal(rowDraftClearAfterOk(genOp("g1"), "g1", "g1", rec("g1", 50)), true, "same tab, no newer typing: clear");
+assert.equal(
+  rowDraftClearAfterOk(genOp("g1"), "g2", "g2", rec("g2", 150)),
+  false,
+  "same tab, newer typing already stored: keep",
+);
+assert.equal(
+  rowDraftClearAfterOk(genOp("g1"), "g1", "g2", rec("g1", 50)),
+  false,
+  "same tab, a newer set started but has not committed: keep",
+);
+assert.equal(
+  rowDraftClearAfterOk(genOp("g1", { verse: 5 }), "g1", "g1", rec("g1", 50)),
+  false,
+  "a move with a generation still never clears",
+);
+
+// Review A2: an op queued when no draft existed (the AI suggestion path, or a
+// save with no draft this session) carries NO_ROW_DRAFT. A draft written after
+// it was queued is typing it did not carry: keep. A draft older than the op
+// (a prior session's, never re-set here) is what the save stored: clear.
+assert.equal(
+  rowDraftClearAfterOk(genOp(NO_ROW_DRAFT), "g5", "g5", rec("g5", 150)),
+  false,
+  "no draft at enqueue, typing arrived in flight: keep",
+);
+assert.equal(
+  rowDraftClearAfterOk(genOp(NO_ROW_DRAFT), undefined, undefined, rec("old", 50)),
+  true,
+  "no draft at enqueue, prior-session draft older than the op: clear",
+);
+assert.equal(
+  rowDraftClearAfterOk(genOp(NO_ROW_DRAFT), undefined, "g6", rec("old", 50)),
+  false,
+  "no draft at enqueue, a newer set has started: keep",
+);
+assert.equal(
+  rowDraftClearAfterOk(genOp(NO_ROW_DRAFT), undefined, undefined, undefined),
+  false,
+  "no draft at enqueue, nothing stored: nothing to delete",
 );
 
 console.log("rowDraftClear: all assertions passed");

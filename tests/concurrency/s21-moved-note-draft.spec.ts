@@ -153,3 +153,39 @@ test("typing while a note's Save is in flight keeps that typing in the draft sto
   await expect(page.getByText(/^1 unsaved$/).first()).toBeVisible();
   await context.close();
 });
+
+test("a Save drained by a fresh tab still clears the saved draft", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "fresh1092");
+  const tabA = await context.newPage();
+  const chap = await fetchChapter(context.request, auth.token, "ZEC", 8);
+  const row = chap.tn.find((r) => r.verse === 6 && r.ref_raw === "8:6");
+  expect(row, "ZEC 8:6 needs a tn row").toBeTruthy();
+  const id = row!.id;
+  const key = `row:tn:ZEC:${id}`;
+
+  // Tab A's PATCH never reaches the server, so the Save stays queued.
+  await tabA.route((url) => url.pathname === `/api/rows/tn/${id}`, (route) =>
+    route.request().method() === "PATCH" ? route.abort() : route.continue());
+  await gotoVerse(tabA, "ZEC", 8, 6);
+  const textarea = await openNoteEditor(tabA, id);
+  const typed = " FRESH1092";
+  await textarea.click();
+  await tabA.keyboard.press("ControlOrMeta+End");
+  await tabA.keyboard.type(typed, { delay: 30 });
+  await expect.poll(async () => (await readRowDraft(tabA, key))?.note ?? "").toContain(typed.trim());
+  await saveNote(tabA, id);
+  await expect.poll(() => outboxCount(tabA)).toBe(1);
+  await tabA.close();
+
+  // Tab B never wrote this draft and does not show the note (another
+  // chapter); it drains the queued Save.
+  const tabB = await context.newPage();
+  await tabB.goto("/#/ZEC/1");
+  await waitForServerNote(context.request, auth.token, "ZEC", 8, id, (n) => (n ?? "").includes(typed.trim()), 20_000);
+  await expect.poll(() => outboxCount(tabB)).toBe(0);
+  await expect
+    .poll(() => readRowDraft(tabB, key), { message: "the saved draft must be cleared", timeout: 10_000 })
+    .toBeNull();
+  await context.close();
+});
