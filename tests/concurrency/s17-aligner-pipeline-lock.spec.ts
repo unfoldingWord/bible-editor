@@ -393,3 +393,330 @@ test("dual aligner: a pipeline lock landing on unsaved drags leaves Save off the
 
   await context.close();
 });
+
+// #1071: two paths #1045 left open. (a) The server holds a lock the tab has
+// not polled yet, so the gate still offers Save; its PATCH gets 409
+// chapter_locked and the outbox drops it. (b) A lock lands while the "Words
+// will be unaligned" confirm is open, and "Save anyway" still committed. In
+// both the panel had already reset its baseline and cleared its crash draft,
+// so the drags were gone. Now a refused save keeps them, and the confirm
+// re-checks the lock before it commits.
+
+test("a lock the tab has not seen yet: the gate's Save is refused with 409, the drags survive, and they save after the lock clears", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "s17-unseen-lock-gate");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  await page.clock.install();
+
+  d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+  const snap = await snapshotVerse(context.request);
+  try {
+    await openAligner(page);
+    const saveBtn = page.getByRole("button", { name: `Save ${BV}`, exact: true });
+    const count = page
+      .getByText(`${BV} words`, { exact: true })
+      .locator("xpath=../..")
+      .getByText(/^\d+ unaligned$/);
+
+    const dragged = await dragAlignedWordToStrip(page);
+    expect(dragged.after, "the drag must change the alignment while unlocked").not.toBe(dragged.before);
+    await expect.poll(() => crashDraftCount(page, DRAFT_KEY), { timeout: 5_000 }).toBe(1);
+
+    // The lock lands server-side only: no poll, no refocus.
+    lockChapter(auth.userId, "s17-unseen-lock-gate");
+    await expect(page.getByText("chapter locked")).toHaveCount(0);
+
+    // The gate still offers Save (the tab doesn't know), and the server refuses it.
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    const gate = page.getByRole("dialog").filter({ hasText: "Unsaved alignment changes" });
+    await expect(gate).toBeVisible();
+    const refused = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(VERSE_PATH),
+    );
+    await gate.getByRole("button", { name: "Save", exact: true }).click();
+    expect(await confirmUnalignIfAsked(page, refused)).toBe(409);
+
+    // The drags survive in the crash draft.
+    await expect.poll(() => crashDraftCount(page, DRAFT_KEY), { timeout: 5_000 }).toBe(1);
+
+    // The refusal re-read the lock: reopening the aligner shows it locked
+    // (no poll or refocus has run) with the drags restored.
+    await page.locator(`button[aria-label^="align ${BV}"]`).first().click();
+    await saveBtn.waitFor({ state: "visible" });
+    await expect(page.getByText("chapter locked")).toBeVisible({ timeout: 15_000 });
+    await expect(count).toHaveText(dragged.after);
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await expect(gate).toBeVisible();
+    await expect(gate.getByRole("button", { name: "Save", exact: true })).toHaveCount(0);
+    await gate.getByRole("button", { name: "Keep editing", exact: true }).click();
+
+    // The lock clears: the same drags save with a 200.
+    d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+    await refreshPipelineJobs(page);
+    await expect(page.getByText("chapter locked")).toHaveCount(0, { timeout: 15_000 });
+    await expect(count).toHaveText(dragged.after);
+    await expect(saveBtn).toBeEnabled();
+    const patched = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(VERSE_PATH),
+    );
+    await saveBtn.click();
+    expect(await confirmUnalignIfAsked(page, patched)).toBe(200);
+    await expect(saveBtn).toBeDisabled();
+  } finally {
+    d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+    await restoreVerse(context.request, csrf, snap);
+  }
+
+  await context.close();
+});
+
+test("a lock the tab has not seen yet: the panel's own Save is refused with 409 and the panel stays unsaved", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "s17-unseen-lock-panel");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  await page.clock.install();
+
+  d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+  const snap = await snapshotVerse(context.request);
+  try {
+    await openAligner(page);
+    const saveBtn = page.getByRole("button", { name: `Save ${BV}`, exact: true });
+    const resetBtn = page.getByRole("button", { name: "Reset", exact: true });
+    const count = page
+      .getByText(`${BV} words`, { exact: true })
+      .locator("xpath=../..")
+      .getByText(/^\d+ unaligned$/);
+
+    const dragged = await dragAlignedWordToStrip(page);
+    expect(dragged.after).not.toBe(dragged.before);
+
+    lockChapter(auth.userId, "s17-unseen-lock-panel");
+    const refused = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(VERSE_PATH),
+    );
+    await saveBtn.click();
+    expect(await confirmUnalignIfAsked(page, refused)).toBe(409);
+
+    // Still unsaved: the panel turns locked, keeps the drags, Reset stays
+    // available, and the crash draft holds them.
+    await expect(page.getByText("chapter locked")).toBeVisible({ timeout: 15_000 });
+    await expect(count).toHaveText(dragged.after);
+    await expect(resetBtn).toBeEnabled();
+    await expect.poll(() => crashDraftCount(page, DRAFT_KEY), { timeout: 5_000 }).toBe(1);
+
+    d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+    await refreshPipelineJobs(page);
+    await expect(page.getByText("chapter locked")).toHaveCount(0, { timeout: 15_000 });
+    await expect(saveBtn).toBeEnabled();
+    const patched = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(VERSE_PATH),
+    );
+    await saveBtn.click();
+    expect(await confirmUnalignIfAsked(page, patched)).toBe(200);
+    await expect(saveBtn).toBeDisabled();
+  } finally {
+    d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+    await restoreVerse(context.request, csrf, snap);
+  }
+
+  await context.close();
+});
+
+test("a lock landing while the unalign confirm is open: Save anyway refuses, the drags survive, and they save after the lock clears", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "s17-lock-in-confirm");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  await page.clock.install();
+
+  d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+  const snap = await snapshotVerse(context.request);
+  try {
+    const verseWrites: string[] = [];
+    page.on("request", (req) => {
+      if (req.method() !== "GET" && req.url().includes("/api/verses/")) {
+        verseWrites.push(`${req.method()} ${req.url()}`);
+      }
+    });
+
+    await openAligner(page);
+    const saveBtn = page.getByRole("button", { name: `Save ${BV}`, exact: true });
+    const count = page
+      .getByText(`${BV} words`, { exact: true })
+      .locator("xpath=../..")
+      .getByText(/^\d+ unaligned$/);
+
+    // Clear unaligns every word, so Save always opens the unalign confirm.
+    const before = (await count.textContent()) ?? "";
+    await page.getByRole("button", { name: "Clear", exact: true }).click();
+    await expect(count).not.toHaveText(before);
+    const after = (await count.textContent()) ?? "";
+    await expect.poll(() => crashDraftCount(page, DRAFT_KEY), { timeout: 5_000 }).toBe(1);
+
+    await saveBtn.click();
+    const confirm = page.getByRole("dialog").filter({ hasText: /will be unaligned/ });
+    await expect(confirm).toBeVisible();
+
+    // The lock lands while the confirm is open.
+    lockChapter(auth.userId, "s17-lock-in-confirm");
+    await refreshPipelineJobs(page);
+    await expect(page.getByText("chapter locked")).toBeVisible({ timeout: 15_000 });
+
+    await confirm.getByRole("button", { name: "Save anyway", exact: true }).click();
+    await expect(confirm).toHaveCount(0);
+    await expect(page.getByText(/so the alignment was not saved/)).toBeVisible();
+
+    // Nothing was sent, and the drags survive in the panel and the crash draft.
+    await page.waitForTimeout(500);
+    expect(verseWrites).toEqual([]);
+    await expect(count).toHaveText(after);
+    expect(await crashDraftCount(page, DRAFT_KEY)).toBe(1);
+    await expect(page.getByRole("button", { name: "Reset", exact: true })).toBeEnabled();
+
+    // The lock clears: the same drags save with a 200.
+    d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+    await refreshPipelineJobs(page);
+    await expect(page.getByText("chapter locked")).toHaveCount(0, { timeout: 15_000 });
+    await expect(count).toHaveText(after);
+    const patched = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(VERSE_PATH),
+    );
+    await saveBtn.click();
+    await confirm.getByRole("button", { name: "Save anyway", exact: true }).click();
+    expect((await patched).status()).toBe(200);
+    await expect(saveBtn).toBeDisabled();
+  } finally {
+    d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
+    await restoreVerse(context.request, csrf, snap);
+  }
+
+  await context.close();
+});
+
+// #1071 re-review: on a range row the PATCH is keyed by the row's
+// verse_start, but the aligner's crash draft by the verse it was opened on.
+// Bridge ZEC 7:6-7 UST, open the dual aligner on v7, and refuse its save
+// under a lock the tab has not seen: the draft must come back under v7's key.
+test("a range row opened on its inner verse: a refused save's drags come back under that verse's draft key", async ({
+  browser,
+}) => {
+  test.setTimeout(120_000);
+  const { context, auth } = await newUserContext(browser, "s17-range-lock");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  await page.clock.install();
+  const UST = "UST";
+  const V6 = `/api/verses/${BOOK}/7/6/${UST}`;
+  const V7 = `/api/verses/${BOOK}/7/7/${UST}`;
+  const RANGE_JOB = "s17-range-lock";
+  type Row = { version: number; plain_text: string; content_json: string; verse_end: number | null };
+  const get = async (path: string) => {
+    const res = await context.request.get(path);
+    expect(res.ok()).toBe(true);
+    return (await res.json()) as Row;
+  };
+  const clearLock = () => d1(`DELETE FROM pipeline_jobs WHERE job_id = '${RANGE_JOB}'`);
+  clearLock();
+  const orig6 = await get(V6);
+  const orig7 = await get(V7);
+  expect(orig6.verse_end).toBeNull();
+  let bridged = false;
+  try {
+    const res = await context.request.post(`${V6}/bridge`, {
+      headers: { "x-csrf-token": csrf },
+      data: { start_version: orig6.version, next_version: orig7.version },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    bridged = true;
+
+    await page.goto(`/#/${BOOK}/7/7`);
+    await page.reload();
+    await page.locator(`[data-find-cell="7-7-ULT"]`).first().waitFor({ timeout: 15_000 });
+    await page.locator(`button[aria-label^="align ULT"]`).first().click();
+    const sideBySide = page.locator("button", { hasText: "Side-by-side" }).first();
+    await sideBySide.click();
+    const dual = page.getByRole("dialog").filter({ hasText: "reading text" });
+    const wordsLabel = dual.getByText(`${UST} words`, { exact: true });
+    await wordsLabel.waitFor({ state: "visible" });
+    const count = wordsLabel.locator("xpath=../..").getByText(/^\d+ unaligned$/);
+    const before = (await count.textContent()) ?? "";
+    // Right panel (UST) Clear: unaligns everything, so Save asks first.
+    await dual.getByRole("button", { name: "Clear", exact: true }).nth(1).click();
+    await expect(count).not.toHaveText(before);
+    const after = (await count.textContent()) ?? "";
+    const innerKey = `${BOOK}:7:7:${UST}`;
+    await expect.poll(() => crashDraftCount(page, innerKey), { timeout: 5_000 }).toBe(1);
+
+    // Lock lands server-side only; the dual gate's Save is refused.
+    d1(
+      `INSERT INTO pipeline_jobs (job_id, user_id, pipeline_type, book, start_chapter, end_chapter, session_key, state) ` +
+        `VALUES ('${RANGE_JOB}', ${auth.userId}, 'generate', '${BOOK}', 7, 7, 's17-range-lock', 'running')`,
+    );
+    const refused = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(V6),
+    );
+    await dual.locator('button:has(svg[data-testid="CloseIcon"])').first().click();
+    const gate = page.getByRole("dialog").filter({ hasText: "Unsaved changes" });
+    await gate.getByRole("button", { name: "Save", exact: true }).click();
+    await page.getByRole("button", { name: "Save anyway", exact: true }).click();
+    expect((await refused).status()).toBe(409);
+
+    // The draft is back under the key the panel reads (v7), not the row's v6.
+    await expect.poll(() => crashDraftCount(page, innerKey), { timeout: 5_000 }).toBe(1);
+    expect(await crashDraftCount(page, `${BOOK}:7:6:${UST}`)).toBe(0);
+    await expect(page.getByText(/Your changes are kept in the aligner/)).toBeVisible();
+
+    // The lock clears; reopening shows the drags and they save with a 200.
+    clearLock();
+    await refreshPipelineJobs(page);
+    if (!(await sideBySide.isVisible())) {
+      await page.locator(`button[aria-label^="align ULT"]`).first().click();
+    }
+    await sideBySide.click();
+    await wordsLabel.waitFor({ state: "visible" });
+    await expect(count).toHaveText(after);
+    const patched = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(V6),
+    );
+    await dual.locator('button:has(svg[data-testid="CloseIcon"])').first().click();
+    await gate.getByRole("button", { name: "Save", exact: true }).click();
+    // The local cache still holds the refused content, so this save may not
+    // ask again (#1073).
+    expect(await confirmUnalignIfAsked(page, patched)).toBe(200);
+  } finally {
+    clearLock();
+    if (bridged) {
+      const cur = await get(V6);
+      const split = await context.request.post(`${V6}/split`, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+      });
+      expect(split.status(), await split.text()).toBe(200);
+    }
+    for (const [path, orig] of [
+      [V6, orig6],
+      [V7, orig7],
+    ] as const) {
+      const cur = await get(path);
+      if (cur.content_json === orig.content_json) continue;
+      const put = await context.request.patch(path, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+        data: {
+          content: JSON.parse(orig.content_json),
+          plain_text: orig.plain_text,
+          alignment_intent: "alignment_edit",
+        },
+      });
+      expect(put.status(), await put.text()).toBe(200);
+    }
+  }
+
+  await context.close();
+});
