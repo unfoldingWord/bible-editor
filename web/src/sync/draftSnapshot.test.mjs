@@ -194,10 +194,12 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
   );
   assert.deepEqual(seenA, [], "a must still stay silent after an unrelated key's successful refresh");
 }
-// dedupeByKeys: a whole-list "presence" subscriber (SyncStatusBar,
-// UnsavedToasts) must not be notified when a keystroke replaces a record's
-// payload/updatedAt without changing which keys exist, but must still see
-// an actual add/remove, and must not care about member order.
+// dedupeByKeys: SyncStatusBar's whole-list subscriber must not be notified
+// when a keystroke replaces a record's payload/updatedAt without changing
+// which keys exist, but must still see an actual add/remove, and a change in
+// list order (the list is sorted by updatedAt, so switching which draft you
+// type in moves it to the end, as it did before the dedup). UnsavedToasts
+// stays on the full subscription: it compares each draft's generation.
 {
   let fn;
   const fakeSubscribe = (f) => { fn = f; return () => { fn = undefined; }; };
@@ -210,27 +212,27 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
   assert.equal(calls.length, 1, "first notification always passes through");
 
   fn([record("a", "second keystroke", 2)]);
-  assert.equal(calls.length, 1, "same key set (even reordered by updatedAt) is suppressed");
+  assert.equal(calls.length, 1, "same key set in the same order is suppressed");
 
   fn([record("a", "third", 3), record("b", "new draft", 4)]);
   assert.equal(calls.length, 2, "a key being added must still notify");
 
   fn([record("b", "b typing", 5), record("a", "a typing", 6)]);
-  assert.equal(calls.length, 2, "same key set in a different order is still suppressed");
+  assert.equal(calls.length, 3, "same key set in a new order must notify, so the menu order follows typing");
 
   fn([record("b", "only b left", 5)]);
-  assert.equal(calls.length, 3, "a key being removed must still notify");
+  assert.equal(calls.length, 4, "a key being removed must still notify");
 
   // #901 review A1: a row draft's key (row:{kind}:{book}:{id}) has no
   // chapter/verse, so moving a note with an unsaved draft to another verse
   // rewrites meta under the SAME key. The jump menu must follow it.
   const atVerse3 = { key: "row:tn:ISA:ab12", updatedAt: 6, meta: { kind: "row", rowKind: "tn", id: "ab12", book: "ISA", chapter: 1, verse: 3 } };
   fn([atVerse3]);
-  assert.equal(calls.length, 4, "a new key always passes through");
+  assert.equal(calls.length, 5, "a new key always passes through");
   fn([{ ...atVerse3, updatedAt: 7 }]);
-  assert.equal(calls.length, 4, "same key and same meta is still suppressed");
+  assert.equal(calls.length, 5, "same key and same meta is still suppressed");
   fn([{ ...atVerse3, updatedAt: 8, meta: { ...atVerse3.meta, verse: 9 } }]);
-  assert.equal(calls.length, 5, "same key with meta.verse changed must notify");
+  assert.equal(calls.length, 6, "same key with meta.verse changed must notify");
   assert.equal(calls.at(-1)[0].meta.verse, 9, "subscriber sees the moved verse");
 
   unsubscribe();
