@@ -18,9 +18,20 @@ name: Check for pending D1 migrations
 # migration merged by someone else, or a slow operator, is not this PR's
 # fault), so it only runs on push to main, after the merge has already
 # happened.
+#
+# The push trigger is limited to pushes that touch api/migrations/. Running on
+# every push to main meant one unapplied migration (0074, Oct 2026) produced a
+# failed run and a failure email on every unrelated merge, ~25 in one day. The
+# alert now fires once when the migration lands, then once a day from the
+# schedule until prod catches up. Use "Run workflow" after applying to clear
+# the red status without waiting for the next day.
 on:
   push:
     branches: [main]
+    paths: ['api/migrations/**']
+  schedule:
+    - cron: "0 14 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: pending-migrations-${{ github.ref }}
