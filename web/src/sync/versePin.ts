@@ -21,6 +21,21 @@ export interface PinnedVerseBase {
 
 const pinnedVerseBase = new Map<string, PinnedVerseBase>();
 
+// #1060: which owner a pin currently answers to. Bumped when a pin is created
+// and when a hold hands its pin to a newly queued save. An async release (an
+// outbox exit's, after its draft lookup) captures the epoch when the exit
+// happens and passes it back; a mismatch means the pin it meant to release is
+// gone or now belongs to a later save, so it leaves it alone.
+const pinEpochs = new Map<string, number>();
+let epochSeq = 0;
+function bumpPinEpoch(key: string): void {
+  epochSeq += 1;
+  pinEpochs.set(key, epochSeq);
+}
+export function pinEpoch(key: string): number | undefined {
+  return pinEpochs.get(key);
+}
+
 // Returns the pinned baseline for `key`, pinning `base` now if this is the
 // first call for a new edit session (no existing pin). Callers pass the
 // live/current base every time; only the first call in a session "wins" —
@@ -30,6 +45,7 @@ export function pinVerseBase(key: string, base: PinnedVerseBase): PinnedVerseBas
   if (existing) return existing;
   const pinned: PinnedVerseBase = { version: base.version, content: base.content };
   pinnedVerseBase.set(key, pinned);
+  bumpPinEpoch(key);
   return pinned;
 }
 
@@ -68,7 +84,9 @@ export function peekPinnedVerseBase(key: string): PinnedVerseBase | undefined {
 //   the translator's own, and already on screen. Any other change keeps the
 //   old base, so the line's save 409s.
 // - handOff() ends a hold whose edit was just queued: the queued op's outbox
-//   exit (or a no-op save's own unpin) releases the pin, as for any save.
+//   exit releases the pin, as for any save. It bumps the pin epoch, so a late
+//   release meant for an EARLIER op cannot pull the pin from under this one.
+//   A save that queued nothing (a no-op) ends its hold with release() instead.
 // Both are synchronous: an async release lets a keystroke land in the gap and
 // lose its pin, or pulls a pin from under a save queued meanwhile.
 
@@ -78,6 +96,10 @@ export interface VerseBaseHold {
   release(): void;
   // The editor's edit was queued; the pin now belongs to that save. Idempotent.
   handOff(): void;
+  // The landed row this hold's pin was last moved to by advanceHeldVerseBase
+  // (undefined if never, or once the hold has ended), so the editor can take
+  // it as the base its text now shows.
+  advancedBase(): PinnedVerseBase | undefined;
 }
 
 interface HoldState {
@@ -85,6 +107,7 @@ interface HoldState {
   // The holds own the pin's release: one of them pinned it, or its owner
   // deferred an unpin to them.
   releaseOnLastLeave: boolean;
+  advanced?: PinnedVerseBase;
 }
 
 const holds = new Map<string, HoldState>();
@@ -108,17 +131,35 @@ export function holdVerseBase(
     if (!cur || !cur.holders.delete(token)) return;
     if (cur.holders.size > 0) return;
     holds.delete(key);
-    if (unpin && cur.releaseOnLastLeave && canUnpin(key)) unpinVerseBase(key);
+    if (!unpin) {
+      if (pinnedVerseBase.has(key)) bumpPinEpoch(key);
+      return;
+    }
+    if (cur.releaseOnLastLeave && canUnpin(key)) unpinVerseBase(key);
   };
-  return { release: () => leave(true), handOff: () => leave(false) };
+  return {
+    release: () => leave(true),
+    handOff: () => leave(false),
+    advancedBase: () => {
+      const cur = holds.get(key);
+      return cur && cur.holders.has(token) ? cur.advanced : undefined;
+    },
+  };
 }
 
 // An owner (a queued save's outbox exit, a no-op save) wants the pin released
 // "if idle". A live draft session (drafts.ts's pendingKeys, passed in) keeps
 // it. So does a live hold — its editor still shows an edit made against the
-// pin — and the hold then takes over the release.
-export function unpinVerseBaseIfIdleWith(key: string, draftSessionLive: boolean): void {
+// pin — and the hold then takes over the release. `epoch` (pinEpoch, captured
+// when an async caller's exit happened) makes the release a no-op once the pin
+// has been replaced or handed to a later save in the meantime.
+export function unpinVerseBaseIfIdleWith(
+  key: string,
+  draftSessionLive: boolean,
+  epoch?: number,
+): void {
   if (draftSessionLive) return;
+  if (epoch !== undefined && pinEpochs.get(key) !== epoch) return;
   const state = holds.get(key);
   if (state) {
     state.releaseOnLastLeave = true;
@@ -130,8 +171,8 @@ export function unpinVerseBaseIfIdleWith(key: string, draftSessionLive: boolean)
 // A draft session ended (drafts.clear, clearGeneration, a cross-tab
 // bookkeeping release). It no longer needs the pin, but a live hold that
 // joined it still does: the release then passes to the hold.
-export function unpinVerseBaseUnlessHeld(key: string): void {
-  unpinVerseBaseIfIdleWith(key, false);
+export function unpinVerseBaseUnlessHeld(key: string, epoch?: number): void {
+  unpinVerseBaseIfIdleWith(key, false, epoch);
 }
 
 // This tab's own save of `key`, made against version `fromVersion`, landed as
@@ -141,7 +182,10 @@ export function unpinVerseBaseUnlessHeld(key: string): void {
 // over the translator's own work. The outbox threads queued siblings the same
 // way (threadVersionToSiblings).
 export function advanceHeldVerseBase(key: string, fromVersion: number, landed: PinnedVerseBase): void {
-  if (!holds.has(key)) return;
+  const state = holds.get(key);
+  if (!state) return;
   if (pinnedVerseBase.get(key)?.version !== fromVersion) return;
-  pinnedVerseBase.set(key, { version: landed.version, content: landed.content });
+  const next = { version: landed.version, content: landed.content };
+  pinnedVerseBase.set(key, next);
+  state.advanced = next;
 }

@@ -226,7 +226,7 @@ interface Props {
     bibleVersion: string,
     plain: string,
     base: VerseDto,
-    afterCommit?: () => void,
+    afterCommit?: (outcome?: { queued: boolean }) => void,
   ) => void;
   // #1060: hold the verse-base pin for a reading line from its first dirty
   // keystroke. `base` is the verse the box was last synced from — the one the
@@ -834,7 +834,12 @@ function SharedUhbStrip({
 // + enqueue) or Undo (revert to the last-saved text) — nothing autosaves.
 const ReadingLine = forwardRef<ReadingLineHandle, {
   slot: PanelSlot;
-  onSave: (bibleVersion: string, plain: string, base: VerseDto, afterCommit?: () => void) => void;
+  onSave: (
+    bibleVersion: string,
+    plain: string,
+    base: VerseDto,
+    afterCommit?: (outcome?: { queued: boolean }) => void,
+  ) => void;
   // See Props.onHoldReadingBase.
   onHoldBase?: (bibleVersion: string, base: VerseDto) => VerseBaseHold;
   onDirtyChange: (dirty: boolean) => void;
@@ -895,11 +900,18 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
     } else if (!next && holdRef.current) {
       const hold = holdRef.current;
       holdRef.current = null;
+      // An own save that landed moved the hold's base forward: the box shows
+      // that row now, so a later edit starts from it, not the pre-save base.
+      const advanced = hold.advancedBase();
+      if (advanced && shownVerseRef.current) {
+        shownVerseRef.current = { ...shownVerseRef.current, version: advanced.version, content: advanced.content };
+      }
       if (endHold === "handOff") hold.handOff();
       else hold.release();
     }
     setDirty(next);
     onDirtyChange(next);
+    if (!next) syncShownVerse();
   };
   // A clean box showing exactly this verse's text was synced from it — this
   // also catches a version-only change (the line's own save landing, an
@@ -965,10 +977,10 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
       afterCommit?.();
       return;
     }
-    onSave(bibleVersion, el.textContent ?? "", verse, () => {
-      // The edit is queued (or was a no-op): its save owns the pin now, and
-      // that op's outbox exit, or the no-op save, releases it (#1060).
-      markDirty(false, "handOff");
+    onSave(bibleVersion, el.textContent ?? "", verse, (outcome) => {
+      // A queued edit's save owns the pin now and its outbox exit releases it;
+      // a no-op queued nothing, so the hold ends as a clean line's does (#1060).
+      markDirty(false, outcome?.queued === false ? "release" : "handOff");
       afterCommit?.();
     });
   };
@@ -980,7 +992,6 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
     lastTextRef.current = editable;
     lastSetRef.current = editable;
     markDirty(false);
-    syncShownVerse();
   };
 
   // The gate (close / verse-nav) drives these: save flushes the edit, discard
@@ -1077,7 +1088,6 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             lastTextRef.current = value;
             lastSetRef.current = value;
             markDirty(normalizeEditable(value) !== normalizeEditable(editable));
-            syncShownVerse();
           }}
           sx={{
             maxHeight: bodyHeight,
