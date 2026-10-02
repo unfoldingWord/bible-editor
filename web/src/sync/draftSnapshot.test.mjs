@@ -194,10 +194,12 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
   );
   assert.deepEqual(seenA, [], "a must still stay silent after an unrelated key's successful refresh");
 }
-// dedupeByKeys: a whole-list "presence" subscriber (SyncStatusBar,
-// UnsavedToasts) must not be notified when a keystroke replaces a record's
-// payload/updatedAt without changing which keys exist, but must still see
-// an actual add/remove, and must not care about member order.
+// dedupeByKeys: a whole-list "presence" subscriber (SyncStatusBar) must not
+// be notified when a keystroke replaces a record's payload/updatedAt
+// without changing its key or its meta, but must still see an actual
+// add/remove, a meta change under a STABLE key (#901's 2026-10-02 16:00
+// review — a moved tn/tq/twl row changes meta.chapter/verse under the same
+// row:{kind}:{book}:{id} key), and must not care about member order.
 {
   let fn;
   const fakeSubscribe = (f) => { fn = f; return () => { fn = undefined; }; };
@@ -220,6 +222,16 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
 
   fn([record("b", "only b left", 5)]);
   assert.equal(calls.length, 3, "a key being removed must still notify");
+
+  // The row-moved-to-another-verse shape: same key, same count, but the
+  // record's meta differs — must notify despite the key set being identical.
+  const atVerse3 = { key: "row:tn:ISA:ab12", updatedAt: 6, meta: { chapter: 1, verse: 3 } };
+  fn([atVerse3]);
+  assert.equal(calls.length, 4, "a new key with meta always passes through");
+  fn([{ ...atVerse3, updatedAt: 7 }]);
+  assert.equal(calls.length, 4, "identical key AND identical meta is still suppressed");
+  fn([{ ...atVerse3, updatedAt: 8, meta: { chapter: 1, verse: 9 } }]);
+  assert.equal(calls.length, 5, "same key, meta.verse changed -> must notify, not freeze the old verse");
 
   unsubscribe();
   assert.equal(fn, undefined, "unsubscribing tears down the underlying subscription");

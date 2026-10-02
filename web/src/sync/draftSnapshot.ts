@@ -1,29 +1,37 @@
 // A keystroke replaces a draft's record (new payload/updatedAt/generation)
 // without ever adding or removing a key. A whole-list subscriber that shows
-// only *which* drafts exist — never their live content, including the
-// generation a save is in flight for — gains nothing from re-rendering on
-// every one of those replacements. Wrap `subscribe` with this to skip
-// callbacks whose key set is unchanged from the last one delivered.
+// only *which* drafts exist and their (denormalized) `meta` — never the live
+// payload, or the generation a save is in flight for — gains nothing from
+// re-rendering on every one of those replacements. Wrap `subscribe` with this
+// to skip callbacks whose (key, meta) pairs are all unchanged from the last
+// one delivered.
 //
-// SyncStatusBar's count/jump-menu is exactly that: key + the (static) meta
-// text. UnsavedToasts is NOT a fit despite the similar "which drafts" framing
-// — it also matches a draft's CURRENT `generation` against in-flight outbox
-// ops (verseDraftHasActiveSave) to decide whether a save is already covering
-// this draft, and a generation changes on every keystroke. Deduping by key
-// alone would freeze it at whichever generation was current when the key set
-// last changed, so a later keystroke's generation could go uncompared against
-// its own save (toast wrongly hidden) or a stale generation could fail to
-// match the save it actually triggered (toast wrongly stuck showing
-// "unsaved"). See #901's review (2026-10-02) for both failure modes.
-export function dedupeByKeys<T extends { key: string }>(
+// `meta` is included, not just `key`: a row draft's key is `row:{kind}:{book}
+// :{id}` (drafts.ts's rowKey) with no chapter/verse, but `meta.chapter`/
+// `meta.verse` is denormalized there for display — and changes under that
+// SAME key when the row is moved to a different verse while an unsaved draft
+// is open (Shell.tsx's onNoteChangeVerse). Deduping on key alone would freeze
+// SyncStatusBar's "N unsaved" jump-menu at the row's OLD verse until some
+// unrelated key was added or removed. See #901's review (2026-10-02 16:00).
+//
+// UnsavedToasts is NOT a fit for this wrapper at all, key+meta or not — it
+// also matches a draft's CURRENT `generation` against in-flight outbox ops
+// (verseDraftHasActiveSave) to decide whether a save is already covering
+// this draft, and a generation changes on every keystroke without changing
+// key OR meta. See #901's review (2026-10-02 11:00) for both failure modes
+// that produces.
+export function dedupeByKeys<T extends { key: string; meta?: unknown }>(
   subscribe: (fn: (all: T[]) => void) => () => void,
 ): (fn: (all: T[]) => void) => () => void {
   return (fn) => {
-    let lastKeys: string | undefined;
+    let lastSignature: string | undefined;
     return subscribe((all) => {
-      const keys = all.map((r) => r.key).sort().join("\u0000");
-      if (keys === lastKeys) return;
-      lastKeys = keys;
+      const signature = all
+        .map((r) => `${r.key}\u0001${JSON.stringify(r.meta)}`)
+        .sort()
+        .join("\u0000");
+      if (signature === lastSignature) return;
+      lastSignature = signature;
       fn(all);
     });
   };
