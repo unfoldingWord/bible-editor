@@ -1432,18 +1432,19 @@ export const RECORD_PUSHED_RENDER_SQL = `UPDATE book_resource_syncs
           unconfirmed_renders_json =
             CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4
                  THEN CASE WHEN ?5 = 1 THEN json_array(?3)
-                      -- Same bytes pushed again: already listed, keep as is.
-                      WHEN EXISTS (SELECT 1 FROM json_each(COALESCE(unconfirmed_renders_json, '[]'))
-                                    WHERE value = ?3)
-                      THEN unconfirmed_renders_json
-                      -- Stored oldest-first: take the 10 newest by key, then
-                      -- re-sort ascending so the next push appends after them.
+                      -- Stored oldest-first. Drop any earlier copy of this sha
+                      -- (same bytes pushed again) and append it as newest, take
+                      -- the 10 newest by position, then re-sort ascending so the
+                      -- next push appends after them.
                       ELSE (SELECT json_group_array(value) FROM
                               (SELECT value FROM
-                                 (SELECT key, value FROM json_each(
-                                    json_insert(COALESCE(unconfirmed_renders_json, '[]'), '$[#]', ?3))
-                                  ORDER BY key DESC LIMIT 10)
-                               ORDER BY key ASC))
+                                 (SELECT k, value FROM
+                                    (SELECT key AS k, value
+                                       FROM json_each(COALESCE(unconfirmed_renders_json, '[]'))
+                                      WHERE value IS NOT ?3
+                                     UNION ALL SELECT 2147483647 AS k, ?3 AS value)
+                                  ORDER BY k DESC LIMIT 10)
+                               ORDER BY k ASC))
                       END
                  ELSE unconfirmed_renders_json END,
           master_confirmed_at =
