@@ -12,7 +12,8 @@ import {
 // verse with its reference chip. The move's PATCH carries only the verse
 // fields, so its 200 must not clear the note's draft: until Save, the typed
 // text has to stay in IndexedDB (crash-safe) and the status bar has to say
-// it is unsaved.
+// it is unsaved. A second case covers typing while a Save is in flight: that
+// newer typing must survive the Save's 200 too.
 
 async function readRowDraft(page: Page, key: string) {
   return page.evaluate(async (k) => {
@@ -35,6 +36,38 @@ async function readRowDraft(page: Page, key: string) {
   }, key);
 }
 
+async function outboxCount(page: Page) {
+  return page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((res, rej) => {
+      const req = indexedDB.open("bible-editor-outbox");
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    if (!db.objectStoreNames.contains("ops")) {
+      db.close();
+      return 0;
+    }
+    const n = await new Promise<number>((res, rej) => {
+      const req = db.transaction("ops").objectStore("ops").count();
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    db.close();
+    return n;
+  });
+}
+
+// Poll until `check` holds, then require it to keep holding for ~1s: on the
+// buggy path the draft exists for a few ms after the 200 before the clear
+// deletes it, so a single successful read would not prove it survived.
+async function expectStays(check: () => Promise<boolean>, message: string) {
+  await expect.poll(check, { message, timeout: 10_000 }).toBe(true);
+  for (let i = 0; i < 5; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+    expect(await check(), message).toBe(true);
+  }
+}
+
 test("moving a note with unsaved typing keeps its draft until Save", async ({ browser }) => {
   test.setTimeout(90_000);
   const { context, auth } = await newUserContext(browser, "move1092");
@@ -53,28 +86,70 @@ test("moving a note with unsaved typing keeps its draft until Save", async ({ br
   await page.keyboard.type(typed, { delay: 40 });
   await expect.poll(async () => (await readRowDraft(page, key))?.note ?? "").toContain(typed.trim());
 
-  // Move the note to v5 through the reference chip's menu.
+  // Move the note to v5 through the reference chip's menu, then wait for the
+  // move to land on the server and leave the outbox.
   await page.locator(`[data-note-id="${id}"] .MuiChip-root`).filter({ hasText: "8:3" }).click();
   await page.getByRole("menuitem", { name: "v5", exact: true }).click();
-  const moved = await waitForServerNote(context.request, auth.token, "ZEC", 8, id, () => true);
   await expect
     .poll(async () => (await fetchChapter(context.request, auth.token, "ZEC", 8)).tn.find((r) => r.id === id)?.verse)
     .toBe(5);
-  expect(moved).toBeTruthy();
-  // Let the move's 200 and any draft clear settle.
-  await page.waitForTimeout(1_500);
-
+  await expect.poll(() => outboxCount(page)).toBe(0);
   const server = (await fetchChapter(context.request, auth.token, "ZEC", 8)).tn.find((r) => r.id === id)!;
   expect(server.note ?? "", "the move must not carry the typing").not.toContain(typed.trim());
-  const draft = await readRowDraft(page, key);
-  expect(draft?.note ?? "", "the typed text must still be in the draft store").toContain(typed.trim());
-  expect(draft?.expectedVersion, "the draft must be based on the moved row's version").toBe(server.version);
-  expect(draft?.verse, "the draft must point at the new verse").toBe(5);
+
+  await expectStays(async () => {
+    const d = await readRowDraft(page, key);
+    return !!d && (d.note ?? "").includes(typed.trim()) && d.expectedVersion === server.version && d.verse === 5;
+  }, "the typed text must stay in the draft store, at the moved row's version and verse");
   await expect(page.getByText(/^1 unsaved$/).first()).toBeVisible();
 
   // Save stores the typing and clears the draft.
   await saveNote(page, id);
   await waitForServerNote(context.request, auth.token, "ZEC", 8, id, (n) => (n ?? "").includes(typed.trim()));
   await expect.poll(() => readRowDraft(page, key)).toBeNull();
+  await context.close();
+});
+
+test("typing while a note's Save is in flight keeps that typing in the draft store", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "inflight1092");
+  const page = await context.newPage();
+  const chap = await fetchChapter(context.request, auth.token, "ZEC", 8);
+  const row = chap.tn.find((r) => r.verse === 4 && r.ref_raw === "8:4");
+  expect(row, "ZEC 8:4 needs a tn row").toBeTruthy();
+  const id = row!.id;
+  const key = `row:tn:ZEC:${id}`;
+
+  // Hold this row's PATCH for 1.5s so the second burst of typing lands while
+  // the Save is in flight.
+  await page.route((url) => url.pathname === `/api/rows/tn/${id}`, async (route) => {
+    if (route.request().method() === "PATCH") await new Promise((r) => setTimeout(r, 1_500));
+    await route.continue();
+  });
+
+  await gotoVerse(page, "ZEC", 8, 4);
+  const textarea = await openNoteEditor(page, id);
+  const first = " FIRST1092";
+  const second = " SECOND1092";
+  await textarea.click();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.type(first, { delay: 30 });
+  await expect.poll(async () => (await readRowDraft(page, key))?.note ?? "").toContain(first.trim());
+  await saveNote(page, id);
+  await textarea.click();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.type(second, { delay: 30 });
+
+  const saved = await waitForServerNote(
+    context.request, auth.token, "ZEC", 8, id, (n) => (n ?? "").includes(first.trim()),
+  );
+  expect(saved.note ?? "", "the in-flight Save carried only the first typing").not.toContain(second.trim());
+  await expect.poll(() => outboxCount(page)).toBe(0);
+
+  await expectStays(async () => {
+    const d = await readRowDraft(page, key);
+    return !!d && (d.note ?? "").includes(second.trim());
+  }, "typing made during the Save must stay in the draft store after its 200");
+  await expect(page.getByText(/^1 unsaved$/).first()).toBeVisible();
   await context.close();
 });
