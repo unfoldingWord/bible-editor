@@ -37,6 +37,7 @@ import {
 } from "./outboxTargeting.ts";
 import { rebaseVersePatch } from "./verseRebase.ts";
 import { noteOwnVerseOp } from "./ownVerseOps.ts";
+import type { AlignmentDraftRow } from "./alignmentDraftSaveState.ts";
 
 const DB_NAME = "bible-editor-outbox";
 const DB_VERSION = 1;
@@ -162,6 +163,10 @@ export interface OutboxOp {
   // verse 6, draft key v7), so a refused save restores the draft the panel
   // actually reads. Absent on ops queued before this field existed.
   alignmentDraftKey?: string;
+  // The row the panel saved against (#1074): a refused save restores its
+  // crash draft with it, so the draft is never restored onto a different row
+  // (a bridge or split landing meanwhile). Absent on older ops.
+  alignmentDraftRow?: AlignmentDraftRow;
 }
 
 type Subscriber = (ops: OutboxOp[]) => void;
@@ -334,7 +339,12 @@ export const outbox = {
     bibleVersion: string,
     expectedVersion: number,
     patch: { content: unknown; plain_text?: string | null; alignment_intent?: AlignmentIntent },
-    opts: { draftGeneration?: string; alignmentDraftGeneration?: string; alignmentDraftKey?: string } = {},
+    opts: {
+      draftGeneration?: string;
+      alignmentDraftGeneration?: string;
+      alignmentDraftKey?: string;
+      alignmentDraftRow?: AlignmentDraftRow;
+    } = {},
   ): Promise<OutboxOp> {
     if (isReadOnly()) {
       return noopOp(
@@ -356,6 +366,7 @@ export const outbox = {
       ...(opts.draftGeneration ? { draftGeneration: opts.draftGeneration } : {}),
       ...(opts.alignmentDraftGeneration ? { alignmentDraftGeneration: opts.alignmentDraftGeneration } : {}),
       ...(opts.alignmentDraftKey ? { alignmentDraftKey: opts.alignmentDraftKey } : {}),
+      ...(opts.alignmentDraftRow ? { alignmentDraftRow: opts.alignmentDraftRow } : {}),
     };
     // #1060: remember it was queued here, before any drain can see it land.
     noteOwnVerseOp(op.id);
