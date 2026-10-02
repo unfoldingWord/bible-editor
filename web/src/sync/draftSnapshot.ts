@@ -4,7 +4,9 @@
 // including the generation a save is in flight for — gains nothing from
 // re-rendering on every one of those replacements. Wrap `subscribe` with this
 // to skip callbacks whose (key, meta) pairs are unchanged from the last one
-// delivered.
+// delivered. Order counts too: the list is sorted by updatedAt, so typing in
+// the newest draft keeps the order (suppressed) while switching to another
+// draft moves it to the end (delivered), as the menu showed before the dedup.
 //
 // `meta` counts, not just the key: a row draft's key (drafts.ts's rowKey) has
 // no chapter/verse, but its meta does, and moving the row to another verse
@@ -29,7 +31,6 @@ export function dedupeByKeys<T extends { key: string; meta?: unknown }>(
     return subscribe((all) => {
       const signature = all
         .map((r) => `${r.key}\u0001${JSON.stringify(r.meta)}`)
-        .sort()
         .join("\u0000");
       if (signature === lastSignature) return;
       lastSignature = signature;
