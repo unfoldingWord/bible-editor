@@ -136,12 +136,21 @@ export async function readLedgerMasterLineage(
   }
   if (confirmedAt < poll.coverage_since) return EMPTY("ledger_window_before_coverage_floor");
 
+  // Issue #691: `seen_at > ?2` admits a PLAIN late push — a commit authored
+  // and committed before the window but first seen by the poller after it
+  // opened. committed_at alone cannot catch it (neither Door43 date moves),
+  // and seen_at is our arrival stamp, the closest thing to push time Gitea
+  // gives us. Strictly greater, because the first clean poll stamps every
+  // bootstrap row with seen_at = coverage_since, and a window starting at
+  // that floor must not count the whole bootstrap batch as new. Errors in
+  // this clause lean safe: poll lag or a backfill's later seen_at can only
+  // admit an extra row (more "human found"), never hide one.
   const rows = await db
     .prepare(
       `SELECT repo, sha, parent_sha, author_name, author_email, committed_at, message,
               classification, classification_reason, files_json
          FROM dcs_commits
-        WHERE repo = ?1 AND (committed_at >= ?2 OR committed_at IS NULL)
+        WHERE repo = ?1 AND (committed_at >= ?2 OR committed_at IS NULL OR seen_at > ?2)
         ORDER BY committed_at DESC`,
     )
     .bind(repo, confirmedAt)
