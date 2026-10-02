@@ -443,6 +443,127 @@ test("a dirty reading line whose verse is bridged into another row by another ed
   }
 });
 
+// The reverse: a split by another editor maps a dirty line on a 6-7 row onto
+// the new verse-6 row. The line drops the edit and its pin rather than keep
+// text typed against the bridge.
+test("a dirty reading line on a bridged row that another editor splits drops the edit and its pin", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const UST = "UST";
+  const V6 = `/api/verses/${BOOK}/7/6/${UST}`;
+  const V7 = `/api/verses/${BOOK}/7/7/${UST}`;
+  const get = async (path: string) => {
+    const res = await context.request.get(path);
+    expect(res.ok()).toBe(true);
+    return (await res.json()) as VerseRow & { verse_end: number | null };
+  };
+  const orig6 = await get(V6);
+  const orig7 = await get(V7);
+  expect(orig6.verse_end).toBeNull();
+  const stamp = Date.now();
+  const key6 = `verse:${BOOK}:7:6:${UST}`;
+  const peek = (k: string) =>
+    page.evaluate((kk) => (window as unknown as PinDebugWindow).__bePinDebug?.peek(kk)?.version, k);
+  const current = (k: string) =>
+    page.evaluate((kk) => (window as unknown as PinDebugWindow).__bePinDebug?.currentVersion(kk), k);
+  let bridged = false;
+
+  try {
+    const res = await context.request.post(`${V6}/bridge`, {
+      headers: { "x-csrf-token": csrf },
+      data: { start_version: orig6.version, next_version: orig7.version },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    bridged = true;
+    const bridgedVersion = ((await res.json()) as { verse: { version: number } }).verse.version;
+
+    const o = await openDual(page, { chapter: 7, verse: 6 });
+    const lineBox = o.dialog
+      .locator("div:has(> [contenteditable])")
+      .filter({ hasText: `${UST} · reading text` });
+    const line = lineBox.locator("[contenteditable]");
+    const save = lineBox.getByRole("button", { name: `Save ${UST}`, exact: true });
+    await expect(line).toContainText("former prophets");
+
+    await typeAtEnd(page, line, ` EDIT-${stamp}`);
+    expect(await peek(key6)).toBe(bridgedVersion);
+    await o.dialog.getByText(`${UST} words`, { exact: true }).first().click();
+    await expect(line).not.toBeFocused();
+    await expect(save).toBeEnabled();
+
+    const split = await context.request.post(`${V6}/split`, {
+      headers: { "x-csrf-token": csrf, "If-Match": String(bridgedVersion) },
+    });
+    expect(split.status(), await split.text()).toBe(200);
+    bridged = false;
+    await expect.poll(() => current(key6)).not.toBe(bridgedVersion);
+
+    // The new verse-6 row: clean, no edit, no pin.
+    await expect(line).not.toContainText(`EDIT-${stamp}`);
+    await expect(save).toBeDisabled();
+    await expect.poll(() => peek(key6)).toBeUndefined();
+    const after6 = await get(V6);
+    expect(after6.verse_end).toBeNull();
+    expect(after6.plain_text).not.toContain(`EDIT-${stamp}`);
+  } finally {
+    if (bridged) {
+      const cur = await get(V6);
+      const split = await context.request.post(`${V6}/split`, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+      });
+      expect(split.status(), await split.text()).toBe(200);
+    }
+    for (const [path, orig] of [
+      [V6, orig6],
+      [V7, orig7],
+    ] as const) {
+      const cur = await get(path);
+      const put = await context.request.patch(path, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+        data: { content: JSON.parse(orig.content_json), plain_text: orig.plain_text },
+      });
+      expect(put.status(), await put.text()).toBe(200);
+    }
+    await context.close();
+  }
+});
+
+// Both lines are keyed by row, and ULT and UST rows usually share one verse
+// number: the keys must still differ per side, or React keeps a stale line
+// (and its hold) around after an in-dialog verse move.
+test("in-dialog next-verse navigation shows exactly two reading lines, with no duplicate-key warning", async ({
+  browser,
+}) => {
+  test.setTimeout(60_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const page = await context.newPage();
+  const dupKeys: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error" && msg.text().includes("same key")) dupKeys.push(msg.text());
+  });
+
+  try {
+    const o = await openDual(page);
+    const lines = o.dialog.getByText(/· reading text/);
+    await expect(lines).toHaveCount(2);
+    await o.dialog.locator('[aria-label="next verse"]').locator("xpath=descendant-or-self::button").first().click();
+    await expect(o.dialog.getByText(`${BOOK} 7:3`, { exact: true })).toBeVisible();
+    await expect(lines).toHaveCount(2);
+    await expect(o.dialog.locator("[contenteditable]")).toHaveCount(2);
+    await o.dialog.locator('[aria-label="next verse"]').locator("xpath=descendant-or-self::button").first().click();
+    await expect(o.dialog.getByText(`${BOOK} 7:4`, { exact: true })).toBeVisible();
+    await expect(lines).toHaveCount(2);
+    await expect(o.dialog.locator("[contenteditable]")).toHaveCount(2);
+    expect(dupKeys).toEqual([]);
+  } finally {
+    await context.close();
+  }
+});
+
 // Review round 1: this tab's own writes must not 409 the translator. The hold
 // detects OTHER editors' changes; a save of this tab's that lands while the
 // line is dirty moves the held base forward instead.
