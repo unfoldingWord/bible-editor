@@ -59,12 +59,18 @@ import {
   alignmentDrafts,
   alignmentDraftKey,
   mintAlignmentDraftGeneration,
+  newestCommittedAlignerSave,
   noteRefusalKeptInPanel,
+  onAlignerSaveRefused,
 } from "../sync/alignmentDrafts";
-import { onOutboxResult } from "../sync/outbox";
+import { onOutboxResult, outbox } from "../sync/outbox";
 import {
   alignmentDraftFitsRow,
+  alignmentDraftKeyForOp,
   alignmentDraftRow,
+  isAlignerPanelSaveOp,
+  refusedDraftMayRehydrate,
+  refusedOpOrder,
   refusedSaveStillCurrent,
 } from "../sync/alignmentDraftSaveState";
 import { isVersionOnlyRebase, lostAlignedWords, sameVerseContent } from "../lib/alignmentDelta";
@@ -283,8 +289,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // already dragged in that window — the hydration guards on this ref so a
     // restore never clobbers a fresh edit (see the reset/hydration effect).
     const stateRef = useRef(state);
+    const initialRef = useRef(initial);
     useEffect(() => {
       stateRef.current = state;
+      initialRef.current = initial;
     });
     // (target key, verse.content) the panel last synced `initial`/`state` to.
     // Lets the reset effect tell a version-only bump (our own save
@@ -342,6 +350,47 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           }
         }),
       [],
+    );
+    // #1077: a refused save's crash draft is written after the 409, which can
+    // land after this panel's one-time draft read (Saved at the gate and
+    // reopened before the refusal; or A saved, then B refused after A's row
+    // reset the panel and dropped its record of B). Re-read it then, only
+    // when refusedDraftMayRehydrate says nothing newer can be overwritten
+    // and the draft fits the row the panel shows.
+    const sourceVerseObjectsRef = useRef(sourceVerseObjects);
+    sourceVerseObjectsRef.current = sourceVerseObjects;
+    useEffect(
+      () =>
+        onAlignerSaveRefused((op, _kept, heldInDraft) => {
+          const draftKey = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
+          if (!heldInDraft || alignmentDraftKeyForOp(op) !== draftKey) return;
+          const refused = refusedOpOrder(op);
+          void Promise.all([alignmentDrafts.get(draftKey), outbox.list()]).then(([rec, ops]) => {
+            const base = verseRef.current;
+            if (!mountedRef.current || !rec || !base || !alignmentDraftFitsRow(rec, base, verseNum)) return;
+            const otherSaves = ops
+              .filter((o) => o.id !== op.id && isAlignerPanelSaveOp(o) && alignmentDraftKeyForOp(o) === draftKey)
+              .map(refusedOpOrder);
+            const committed = newestCommittedAlignerSave(draftKey);
+            if (committed) otherSaves.push(committed);
+            if (
+              !refusedDraftMayRehydrate({
+                panelClean: stateRef.current === initialRef.current,
+                panelHasPendingSave: pendingSaveRef.current !== null,
+                refused,
+                draftFrom: rec.refusedFrom,
+                otherSaves,
+              })
+            ) {
+              return;
+            }
+            const vo = (rec.content as { verseObjects?: unknown[] }).verseObjects;
+            if (!Array.isArray(vo)) return;
+            setState(parseAlignment(vo, sourceVerseObjectsRef.current));
+            setRestored(true);
+          });
+        }),
+      [book, chapter, verseNum, bibleVersion],
     );
     // False once the panel really unmounts (React StrictMode's dev replay sets
     // it back to true), so a crash-draft read resolving after unmount does

@@ -99,6 +99,13 @@ export function noteRefusalKeptInPanel(generation: string): void {
   keptInPanel.add(generation);
 }
 
+// #1077: the newest aligner save per draft key that this tab saw commit, so
+// an open panel never re-reads an older refused save's draft over it.
+const committedAlignerSaves = new Map<string, RefusedOpOrder>();
+export function newestCommittedAlignerSave(key: string): RefusedOpOrder | undefined {
+  return committedAlignerSaves.get(key);
+}
+
 let generationSeq = 0;
 // Exported so a caller can mint an op's provenance identity WITHOUT writing a
 // draft — see AlignmentPanel's commit(), which needs every alignment save to
@@ -236,6 +243,13 @@ onOutboxResult((op, result) => {
         .then(settle, () => settle(false));
     }
     return;
+  }
+  if (isAlignerPanelSaveOp(op)) {
+    const order = refusedOpOrder(op);
+    const prev = committedAlignerSaves.get(key);
+    if (!prev || order.queuedAt > prev.queuedAt || (order.queuedAt === prev.queuedAt && order.seq > prev.seq)) {
+      committedAlignerSaves.set(key, order);
+    }
   }
   if (op.alignmentDraftGeneration) {
     void alignmentDrafts.clearGeneration(key, op.alignmentDraftGeneration);
