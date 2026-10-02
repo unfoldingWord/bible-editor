@@ -93,7 +93,7 @@ import {
   storedResourceSha,
   retireMergeKeptFlags,
   sweepStaleMergeNoBase,
-  readPushedRenderText,
+  readVerifiedPushedRenderText,
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
 import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
@@ -102,11 +102,16 @@ import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline
 import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
-import { hardRejectRows } from "./hardRejectGuard";
+import { buildHardRejectAlertMessage, hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
-import { mergeRefusalOverrideAllowed, idBlockedOverrideAllowed, staleBaseOverrideAllowed } from "./reimportSyncGate";
+import {
+  mergeRefusalOverrideAllowed,
+  idBlockedOverrideAllowed,
+  staleBaseOverrideAllowed,
+  classifyReimportOutcome,
+} from "./reimportSyncGate";
 import { readSyncWithhold, staleSkipRemedy } from "./syncWithholds";
 import { lockedBooksIn } from "./bookLock";
 import {
@@ -501,32 +506,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             userId: params.userId ?? null,
           });
           // runChunkedReimport resolves normally in three distinct outcomes and
-          // the ledger must tell them apart (#833 review). The split mirrors
-          // shouldRecordResourceSync (reimportSyncGate.ts), the authority on
-          // whether the watermark was stamped, so SUCCESS ⟺ watermark stamped:
-          //   • FAILURE — a real error left D1 stale and the watermark withheld:
-          //     a write batch threw (apply_incomplete), a batch errored
-          //     (errors), the conflict record failed (merge_record_failed), or a
-          //     structural overlap fail-safe fired (structure_overlap). These
-          //     are the "something went wrong" withholds.
-          //   • SKIP — the sync was DEFERRED, not broken, and the watermark was
-          //     withheld for a benign, retriable reason: a pipeline lock
-          //     (chapters_locked / prune_locked), an id conflict blocking a row
-          //     (conflict_skipped / tombstone_blocked), or an unmeasurable chunk
-          //     (counts_incomplete). The next run retries and the export
-          //     freshness gate keeps stale D1 off master meanwhile — flagging
-          //     these as FAILURE would be false-RED noise. NOTE: skipped_locked
-          //     is deliberately excluded — it is a row-level counter that
-          //     shouldRecordResourceSync ignores, so it does NOT withhold the
-          //     watermark and must not force a skip.
-          //   • SUCCESS — a clean, fully-applied sync (watermark stamped).
-          const t = res.totals;
-          const status: "success" | "skip" | "failure" =
-            t.apply_incomplete || t.errors.length > 0 || t.merge_record_failed || t.structure_overlap > 0
-              ? "failure"
-              : t.chapters_locked || t.prune_locked || t.conflict_skipped || t.tombstone_blocked || t.counts_incomplete
-                ? "skip"
-                : "success";
+          // the ledger must tell them apart (#833 review) — see
+          // classifyReimportOutcome (reimportSyncGate.ts) for the split. Fed
+          // res.perResource, NEVER res.totals: a PR review on #836's first
+          // version caught that classifying from the book-level SUM breaks
+          // isSystemicMergeRefusal's per-resource threshold check (and hides
+          // which resource an override applies to) — see that function's doc.
+          const status = classifyReimportOutcome(
+            res.perResource,
+            mergeRefusalOverride ? params.resource : undefined,
+            idBlockedOverride ? params.resource : undefined,
+          );
           reimportOutcomes.push({ book, status });
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
@@ -1215,9 +1205,28 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // paragraphs above: blank OrigWords/TWLink are severity="warning", they merge
     // fine, and lint.ts plus the save-path guards are where a blank row gets
     // caught. Prod carries 0 blank-OrigWords rows today.
-    if (dcsAllowed && (resource === "tn" || resource === "twl")) {
+    //
+    // Unpaired `[ ]` in a tn Note (check 13) is the translator-fixable hard
+    // error this gate holds for (issue #1015, JER 17:4 ny7v). The banner names
+    // the row, and a clean render clears it — on a dry run too, since the
+    // clear only reads the bytes (the HOLD itself needs dcsAllowed).
+    if (resource === "tn" || resource === "twl") {
       const rejects = hardRejectRows(resource, built.content);
-      if (rejects.length > 0) {
+      if (rejects.length === 0) {
+        // The rows were fixed (or deleted): clear the HELD banner so it does not
+        // keep naming a row that is already fine. Best-effort, like writeAlert.
+        // Bound: an export that returns before this gate (stale_master,
+        // shrink_guard, no_rows) leaves the banner until a run reaches here.
+        try {
+          await this.env.DB.prepare(
+            `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+          )
+            .bind(EXPORT_ALERT_USERNAME, `export_hard_reject:${book}:${resource}`)
+            .run();
+        } catch (err) {
+          console.error(`export_hard_reject banner clear failed for ${book} ${resource}:`, err);
+        }
+      } else if (dcsAllowed) {
         await this.recordHardRejectAlert(book, resource, rejects);
         const reason = `hard_reject_guard:${rejects.length}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
@@ -1529,16 +1538,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       let revertBase: string | null = null;
       if (computeEntries && priorPushedBlobSha != null) {
         try {
-          const raw = await readPushedRenderText(this.env, book, resource, priorPushedR2Key, priorPushedBlobSha);
-          if (raw != null && (await gitBlobShaOrNull(raw)) === priorPushedBlobSha) {
-            revertBase = raw;
-          } else if (raw != null && priorPushedR2Key != null) {
-            // R2 held a different render than the sha describes; Door43 still
-            // serves the exact blob by sha, so fetch it there instead.
-            console.warn(`export: R2 last-publish base for ${book} ${resource} does not hash to pushed_blob_sha; trying Door43`);
-            const fromDcs = await readPushedRenderText(this.env, book, resource, null, priorPushedBlobSha);
-            if (fromDcs != null && (await gitBlobShaOrNull(fromDcs)) === priorPushedBlobSha) revertBase = fromDcs;
-          }
+          // R2 first, Door43's blob by sha when R2 is missing or holds a
+          // different render than the sha describes.
+          revertBase = await readVerifiedPushedRenderText(this.env, book, resource, priorPushedR2Key, priorPushedBlobSha);
         } catch (e) {
           console.error("export: last-publish base read failed; revert report lists every differing row", {
             book,
@@ -3172,17 +3174,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     rejects: Array<{ ref: string; rowId: string; reason: string }>,
   ): Promise<void> {
     const source = `export_hard_reject:${book}:${resource}`;
-    const shown = rejects
-      .slice(0, 6)
-      .map((r) => `${r.ref} (${r.rowId}): ${r.reason}`)
-      .join("; ");
-    const more = rejects.length > 6 ? `; +${rejects.length - 6} more` : "";
-    const message =
-      `Benjamin — nightly export HELD ${book} ${resource.toUpperCase()}: ${rejects.length} row(s) would fail DCS ` +
-      `validation as a hard error, so the -be- PR's check would go red and the merge bot would never merge it. ` +
-      `${shown}${more}. Fix the Occurrence on those rows (or delete them) in the editor and re-export; every other ` +
-      `edit in ${book} ${resource.toUpperCase()} is waiting on it. Blank notes/questions/OrigWords/TWLink do NOT ` +
-      `cause this — those are validator warnings and ship normally.`;
+    const message = buildHardRejectAlertMessage(book, resource, rejects);
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 

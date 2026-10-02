@@ -9,7 +9,7 @@
 
 import { openDB, type IDBPDatabase } from "idb";
 
-import type { LexiconEntry } from "../hooks/useLexicon";
+import type { LexiconEntry } from "../hooks/lexiconStore";
 
 const DB_NAME = "bible-editor-lexicon";
 const DB_VERSION = 1;
@@ -45,10 +45,16 @@ export async function getEntries(
   try {
     const idb = await db();
     const tx = idb.transaction(STORE, "readonly");
-    for (const k of strongs) {
-      const row = (await tx.store.get(k)) as LexiconRow | undefined;
-      if (row) out.set(k, row.entry);
-    }
+    // All gets in one transaction, issued together: awaiting each in turn
+    // made hundreds of sequential round trips before the network fetch for
+    // misses could start (#898).
+    const rows = (await Promise.all(strongs.map((k) => tx.store.get(k)))) as (
+      | LexiconRow
+      | undefined
+    )[];
+    rows.forEach((row, i) => {
+      if (row) out.set(strongs[i]!, row.entry);
+    });
     await tx.done;
   } catch {
     /* IDB blocked / private mode — degrade to no-cache */
@@ -61,9 +67,9 @@ export async function putEntries(map: Map<string, LexiconEntry | null>): Promise
   try {
     const idb = await db();
     const tx = idb.transaction(STORE, "readwrite");
-    for (const [strong, entry] of map) {
-      await tx.store.put({ strong, entry } satisfies LexiconRow);
-    }
+    await Promise.all(
+      Array.from(map, ([strong, entry]) => tx.store.put({ strong, entry } satisfies LexiconRow)),
+    );
     await tx.done;
   } catch {
     /* soft fail */

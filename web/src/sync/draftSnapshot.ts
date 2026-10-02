@@ -7,7 +7,14 @@ export function createDraftSnapshot<T extends { key: string; updatedAt: number }
   const records = new Map<string, T>();
   const revisions = new Map<string, number>();
   const subscribers = new Set<(all: T[]) => void>();
-  const keyed = new Map<string, Set<(record: T | undefined) => void>>();
+  // Keyed listeners get `remote = true` when the refresh that wins delivery
+  // (the latest revision) came from another tab (#806). A mounted editor with
+  // no local typing ignores those, so it never latches another tab's
+  // half-typed text. No marker outlives its refresh, so a failed or
+  // superseded refresh cannot mislabel a later one; a superseded local
+  // refresh reaching a clean cell as remote is harmless (it typed nothing).
+  // The mount callback is always `remote = false`.
+  const keyed = new Map<string, Set<(record: T | undefined, remote: boolean) => void>>();
   const pending = new Map<string, Promise<void>>();
   const mutations = new Map<string, Set<Promise<void>>>();
   const failures = new Map<string, unknown>();
@@ -55,17 +62,17 @@ export function createDraftSnapshot<T extends { key: string; updatedAt: number }
       void settled().then(() => { if (subscribers.has(fn)) fn(snapshot()); }).catch(() => {});
       return () => { subscribers.delete(fn); };
     },
-    subscribeKey(key: string, fn: (record: T | undefined) => void) {
+    subscribeKey(key: string, fn: (record: T | undefined, remote: boolean) => void) {
       let listeners = keyed.get(key);
       if (!listeners) keyed.set(key, listeners = new Set());
       listeners.add(fn);
-      void settled(key).then(() => { if (listeners.has(fn)) fn(records.get(key)); }).catch(() => {});
+      void settled(key).then(() => { if (listeners.has(fn)) fn(records.get(key), false); }).catch(() => {});
       return () => {
         listeners.delete(fn);
         if (!listeners.size) keyed.delete(key);
       };
     },
-    refresh(key: string) {
+    refresh(key: string, origin: "local" | "remote" = "local") {
       const revision = (revisions.get(key) ?? 0) + 1;
       revisions.set(key, revision);
       let succeeded = false;
@@ -87,7 +94,8 @@ export function createDraftSnapshot<T extends { key: string; updatedAt: number }
         if (!succeeded) return;
         void settled(key).then(() => {
           if (revisions.get(key) !== revision) return;
-          for (const fn of keyed.get(key) ?? []) fn(records.get(key));
+          const remote = origin === "remote";
+          for (const fn of keyed.get(key) ?? []) fn(records.get(key), remote);
         }).catch(() => {});
         void settled().then(() => {
           if (revisions.get(key) !== revision || !subscribers.size) return;
