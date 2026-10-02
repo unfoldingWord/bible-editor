@@ -690,6 +690,9 @@ test("a cancelled unalign confirm keeps the pin while the edit is kept (a later 
       expect((await patched).status()).toBe(200);
       await expect(undo).toBeDisabled();
       await expect.poll(() => pinnedVersion(page)).toBeUndefined();
+      // That save's own "left 1 word unaligned" notice must expire (8 s)
+      // before the next keepAnEdit watches for early notices.
+      await expect(page.getByText(/This edit left \d+ words? unaligned/)).toHaveCount(0, { timeout: 15_000 });
     };
 
     // 1. Undo.
