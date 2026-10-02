@@ -133,3 +133,36 @@ export function alignmentDraftFitsRow(
   if (!draft.row) return row.verse === verseNum && row.verseEnd === null;
   return draft.row.verse === row.verse && (draft.row.verseEnd ?? null) === row.verseEnd;
 }
+
+function opIsAfter(a: RefusedOpOrder, b: RefusedOpOrder): boolean {
+  return a.queuedAt > b.queuedAt || (a.queuedAt === b.queuedAt && a.seq > b.seq);
+}
+
+// #1077: an aligner panel already open on the verse read its crash draft once,
+// when it mounted or last fully reset. A refusal that lands later (Saved at
+// the gate and reopened before the 409; or A saved, then B refused, after A's
+// row reset the panel and dropped its record of B) writes the draft after
+// that read, so the open panel would not show the drags until reopened. May
+// it re-read the draft now? Only when nothing newer can be overwritten:
+// - the panel is clean (no drags of its own since its last reset or save);
+// - it has no pending save of its own (that save's result decides instead);
+// - the draft at the key is this refusal's (another refusal or a persist
+//   write may have replaced it);
+// - no other aligner save for the key, still queued or already committed,
+//   is newer than the refused one. Two saves queued for one verse with the
+//   older refused after the newer committed: the newer holds the drags the
+//   translator last saved, so the older one's content must not come back.
+// The caller still checks the draft fits the row the panel shows
+// (alignmentDraftFitsRow).
+export function refusedDraftMayRehydrate(args: {
+  panelClean: boolean;
+  panelHasPendingSave: boolean;
+  refused: RefusedOpOrder;
+  draftFrom: RefusedOpOrder | undefined;
+  otherSaves: ReadonlyArray<RefusedOpOrder>;
+}): boolean {
+  const { panelClean, panelHasPendingSave, refused, draftFrom, otherSaves } = args;
+  if (!panelClean || panelHasPendingSave || !draftFrom) return false;
+  if (draftFrom.queuedAt !== refused.queuedAt || draftFrom.seq !== refused.seq) return false;
+  return !otherSaves.some((o) => opIsAfter(o, refused));
+}
