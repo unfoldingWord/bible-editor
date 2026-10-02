@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import {
+  alignmentDraftFitsRow,
   alignmentDraftKey,
+  alignmentDraftRow,
+  alignmentPanelRowKey,
   alignmentDraftKeyForOp,
   isAlignerPanelSaveOp,
   isAlignmentSaveOp,
   refusalMayReplaceDraft,
+  refusedDraftMayRehydrate,
   refusedSaveStillCurrent,
 } from "./alignmentDraftSaveState.ts";
 
@@ -142,4 +146,102 @@ assert.equal(
 );
 assert.equal(alignmentDraftKey("ZEC", 7, 7, "UST"), "ZEC:7:7:UST", "the key format is unchanged");
 
-console.log("alignmentDraftSaveState: 19 passed");
+// #1074: a crash draft is restored only onto the row it was made on.
+{
+  const v7 = { version: 5, verse: 7, verse_end: null };
+  const draft7 = { expectedVersion: 5, row: alignmentDraftRow(v7) };
+  assert.equal(alignmentDraftFitsRow(draft7, v7, 7), true, "same version, same single-verse row: restore");
+  assert.equal(alignmentDraftFitsRow(draft7, { ...v7, version: 6 }, 7), false, "the base moved on: discard");
+  // The bridged 6-7 row is written at v6's version + 1, which can equal v7's.
+  const bridged = { version: 5, verse: 6, verse_end: 7 };
+  assert.equal(
+    alignmentDraftFitsRow(draft7, bridged, 7),
+    false,
+    "v7's draft is never restored onto a 6-7 row whose version happens to match",
+  );
+  const draftBridged = { expectedVersion: 5, row: alignmentDraftRow(bridged) };
+  assert.deepEqual(draftBridged.row, { verse: 6, verseEnd: 7 });
+  assert.equal(alignmentDraftFitsRow(draftBridged, bridged, 7), true, "a range row opened on its inner verse: restore");
+  assert.equal(
+    alignmentDraftFitsRow(draftBridged, { version: 5, verse: 7, verse_end: null }, 7),
+    false,
+    "a draft made on 6-7 is not restored onto v7 after a split",
+  );
+  assert.equal(
+    alignmentDraftFitsRow(draftBridged, { version: 5, verse: 6, verse_end: 8 }, 7),
+    false,
+    "nor onto a row that grew to 6-8",
+  );
+  assert.deepEqual(
+    alignmentDraftRow({ verse: 7, verse_end: 7 }),
+    { verse: 7, verseEnd: null },
+    "verse_end equal to verse is a single verse",
+  );
+  // A draft written before the row was recorded.
+  const legacy = { expectedVersion: 5 };
+  assert.equal(alignmentDraftFitsRow(legacy, v7, 7), true, "a legacy draft on its own single-verse row: restore");
+  assert.equal(alignmentDraftFitsRow(legacy, bridged, 7), false, "a legacy draft on a range row: discard");
+  assert.equal(alignmentDraftFitsRow(legacy, bridged, 6), false, "even opened on the range row's start verse");
+}
+
+// #1074: the panel's row key is the same however a single verse spells its end.
+assert.equal(alignmentPanelRowKey({ verse: 7, verse_end: null }), "7-7");
+assert.equal(alignmentPanelRowKey({ verse: 7 }), "7-7");
+assert.equal(alignmentPanelRowKey({ verse: 7, verse_end: 7 }), "7-7");
+assert.equal(alignmentPanelRowKey({ verse: 6, verse_end: 7 }), "6-7", "a bridge keys differently");
+assert.equal(alignmentPanelRowKey(null), "none");
+
+// #1077: may an already-open panel re-read the crash draft a refused save
+// just wrote? Its one-time hydration read ran before the refusal.
+{
+  const refused = { queuedAt: 10, seq: 3 };
+  const safe = {
+    panelClean: true,
+    panelHasPendingSave: false,
+    refused,
+    draftFrom: { queuedAt: 10, seq: 3 },
+    otherSaves: [],
+  };
+  assert.equal(
+    refusedDraftMayRehydrate(safe),
+    true,
+    "reopened before the 409: a clean panel with no save of its own re-reads the refusal's draft",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, otherSaves: [{ queuedAt: 8, seq: 1 }] }),
+    true,
+    "A ok then B refused: an earlier save that committed does not stop B's draft",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, otherSaves: [{ queuedAt: 12, seq: 4 }] }),
+    false,
+    "two queued saves, the older refused after the newer committed: the older save's draft is not restored",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, otherSaves: [{ queuedAt: 10, seq: 4 }] }),
+    false,
+    "same millisecond: a higher-seq save is newer",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, panelClean: false }),
+    false,
+    "a panel with unsaved drags keeps them",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, panelHasPendingSave: true }),
+    false,
+    "a panel with its own pending save decides from that save's result instead",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, draftFrom: undefined }),
+    false,
+    "a draft not written by a refusal is not this refusal's",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, draftFrom: { queuedAt: 12, seq: 4 } }),
+    false,
+    "a draft another refusal wrote is not this refusal's",
+  );
+}
+
+console.log("alignmentDraftSaveState: 43 passed");
