@@ -1,0 +1,49 @@
+import assert from "node:assert/strict";
+import { rowOpClearsDraft } from "./draftSaveState.ts";
+
+// #1092: a row op's 200 clears the row's draft only when that op saved the
+// draft's fields. A move (verse/ref_raw/sort_order) or a reorder carries none
+// of the typed fields, so the typed text must stay in the draft store.
+const draft = (patch) => ({
+  key: "row:tn:ZEC:m9ri",
+  payload: { patch, baseline: { quote: "", note: "old", support_reference: "" } },
+  expectedVersion: 1,
+  updatedAt: 1,
+  generation: "g1",
+  meta: { kind: "row", rowKind: "tn", id: "m9ri", book: "ZEC", chapter: 8, verse: 3 },
+});
+const op = (patch, action = "patch") => ({
+  id: "op1",
+  target: { kind: "row", rowKind: "tn", id: "m9ri", book: "ZEC" },
+  action,
+  patch,
+  expectedVersion: 1,
+  queuedAt: 1,
+  attempts: 0,
+  status: "in_flight",
+});
+
+assert.equal(
+  rowOpClearsDraft(op({ verse: 5, ref_raw: "8:5", sort_order: 9 }), draft({ note: "old typed" })),
+  false,
+  "a move does not clear unsaved note typing",
+);
+assert.equal(
+  rowOpClearsDraft(op({ sort_order: 4 }), draft({ quote: "q" })),
+  false,
+  "a reorder does not clear unsaved quote typing",
+);
+assert.equal(rowOpClearsDraft(op({ note: "old typed" }), draft({ note: "old typed" })), true, "a save clears its draft");
+assert.equal(
+  rowOpClearsDraft(op({ quote: "q" }), draft({ quote: "q", note: "n" })),
+  true,
+  "a save of any draft field clears (prior behavior)",
+);
+assert.equal(rowOpClearsDraft(op({}, "delete"), draft({ note: "x" })), true, "a delete still clears");
+assert.equal(
+  rowOpClearsDraft(op({ verse: 5 }), { ...draft({}), payload: { note: "legacy" } }),
+  true,
+  "a draft without a patch object keeps the old clear-on-200 behavior",
+);
+
+console.log("rowDraftClear: all assertions passed");
