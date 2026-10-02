@@ -3159,6 +3159,30 @@ console.log("\n[issue #691: clearResolvedMergeNoBase consults the dcs_commits le
     );
     eq(cleared, 1, "a merge-wrapper commit the ledger already classified `ours` is not re-derived as `human`");
   }
+
+  // (e) A PLAIN late push (#691's residual): a human commit whose author AND
+  //     committer dates sit a week before WINDOW_START, first seen by the
+  //     poller (seen_at = NOW - 30) after the window opened. Neither date
+  //     moved, so only the ledger's arrival stamp can place it in the window.
+  //     Before readLedgerMasterLineage admitted rows on seen_at, the ledger
+  //     answered "no human" and this cleared 1.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691e");
+    seedLedgerPoll(sqlite, { coverageSince: WINDOW_START - 30 * 86400 });
+    seedLedgerCommit(sqlite, {
+      sha: "plainlate1",
+      committedAt: WINDOW_START - 7 * 86400,
+      classification: "human",
+      message: "Hand fix committed locally, pushed a week later",
+    });
+    let liveWalkCalled = 0;
+    const cleared = await withFetch(ledgerAwareFetch(REPO_HEAD, [], () => liveWalkCalled++), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip"),
+    );
+    eq(cleared, 0, "a plain late push first seen inside the window blocks the clear");
+    eq(liveWalkCalled, 0, "...caught by the ledger's seen_at, with no live walk");
+  }
 }
 
 console.log("\n[issue #672: a torn row (ref_raw ahead of its own stored chapter/verse) self-heals]");
