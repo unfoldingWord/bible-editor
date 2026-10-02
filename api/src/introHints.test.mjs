@@ -194,7 +194,7 @@ function assert(cond, msg) {
   // pass the bot's ~32 KiB limit and 413 the whole notes job. When the
   // merged options would exceed MAX_OPTIONS_BYTES, the intro hints go and
   // the verse hints (the job's actual work) stay.
-  const bigVerseHints = Array.from({ length: 60 }, (_, i) => ({
+  const bigVerseHints = Array.from({ length: 50 }, (_, i) => ({
     rowId: `r${i}`,
     verse: i + 1,
     quote: "",
