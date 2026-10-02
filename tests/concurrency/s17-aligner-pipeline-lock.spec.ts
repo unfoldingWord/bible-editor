@@ -82,11 +82,11 @@ async function openAligner(page: Page) {
 // Drag the aligned "horses" chip off its alignment card onto the "ULT words"
 // strip, which unaligns it (the strip's own aligned chips are not draggable).
 // Returns the strip's "N unaligned" label before and after.
-async function dragAlignedWordToStrip(page: Page): Promise<{ before: string; after: string }> {
+async function dragAlignedWordToStrip(page: Page, word = "horses"): Promise<{ before: string; after: string }> {
   const strip = page.getByText(`${BV} words`, { exact: true }).locator("xpath=../..");
   const count = strip.getByText(/^\d+ unaligned$/);
   const before = (await count.textContent()) ?? "";
-  const chip = page.locator('[draggable="true"]').filter({ hasText: "horses" }).first();
+  const chip = page.locator('[draggable="true"]').filter({ hasText: word }).first();
   await chip.dragTo(page.getByText(`${BV} words`, { exact: true }));
   await page.waitForTimeout(200);
   const after = (await count.textContent()) ?? "";
@@ -899,6 +899,15 @@ test("a refused text edit in the main column: the chapter cache goes back to the
   await context.close();
 });
 
+// Click through the "word will be unaligned" confirm if it opens before
+// `done` settles (whether a drag trips it depends on the verse's other
+// aligned copies of the word).
+async function saveAnywayIfAsked(page: Page, done: Promise<unknown>): Promise<void> {
+  const anyway = page.getByRole("button", { name: "Save anyway", exact: true });
+  await Promise.race([done, anyway.click().catch(() => undefined)]);
+  await done;
+}
+
 // #1077: the refusal writes its crash draft after an open panel's one-time
 // hydration read. Hold the gate Save's PATCH until the aligner is reopened,
 // so the 409 lands under a panel that already read "no draft".
@@ -941,7 +950,7 @@ test("a refused gate Save whose 409 lands after the aligner reopened: the open p
     await expect(gate).toBeVisible();
     const sent = page.waitForRequest((r) => r.method() === "PATCH" && r.url().includes(VERSE_PATH));
     await gate.getByRole("button", { name: "Save", exact: true }).click();
-    await sent;
+    await saveAnywayIfAsked(page, sent);
     await expect(saveBtn).toHaveCount(0);
 
     // Reopen while the PATCH is still held: the panel reads no crash draft.
@@ -962,9 +971,9 @@ test("a refused gate Save whose 409 lands after the aligner reopened: the open p
     await resetBtn.click();
     await expect(count).toHaveText(dragged.before);
   } finally {
-    await page.unrouteAll({ behavior: "ignoreErrors" });
     d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
     await restoreVerse(context.request, csrf, snap);
+    await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => undefined);
   }
 
   await context.close();
@@ -1014,13 +1023,12 @@ test("A saved, then B refused under a lock that began between them: the open pan
     expect(draggedA.after).not.toBe(draggedA.before);
     const sentA = page.waitForRequest((r) => r.method() === "PATCH" && r.url().includes(VERSE_PATH));
     await saveBtn.click();
-    await sentA;
+    await saveAnywayIfAsked(page, sentA);
 
-    const draggedB = await dragAlignedWordToStrip(page);
+    const draggedB = await dragAlignedWordToStrip(page, "red");
     expect(draggedB.after, "the second drag must change the alignment").not.toBe(draggedB.before);
     await saveBtn.click();
-    // B unaligns the last aligned "horses": click through the confirm.
-    await page.getByRole("button", { name: "Save anyway", exact: true }).click();
+    await saveAnywayIfAsked(page, expect(saveBtn).toBeDisabled());
     await expect(saveBtn).toBeDisabled();
 
     const okA = page.waitForResponse(
@@ -1040,9 +1048,9 @@ test("A saved, then B refused under a lock that began between them: the open pan
     await resetBtn.click();
     await expect(count).toHaveText(draggedA.after);
   } finally {
-    await page.unrouteAll({ behavior: "ignoreErrors" });
     d1(`DELETE FROM pipeline_jobs WHERE job_id = '${JOB_ID}'`);
     await restoreVerse(context.request, csrf, snap);
+    await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => undefined);
   }
 
   await context.close();
