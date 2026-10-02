@@ -38,6 +38,15 @@ export type VerseRollback =
   // enough and cannot regress a newer row.
   | { kind: "remote"; row: VerseDto };
 
+// Whether the Shell that started a rollback may still write to the caches when
+// its GET lands. App keys Shell by book while useBook (hoisted in App) applies
+// by chapter number with no book check, so a Shell that unmounted on a book
+// switch, or one now showing another book, would write the old book's verse
+// into the new book's cache.
+export function rollbackMayApply(args: { mounted: boolean; liveBook: string; targetBook: string }): boolean {
+  return args.mounted && args.liveBook === args.targetBook;
+}
+
 export function planRefusedVerseRollback(args: {
   serverRow: VerseDto | undefined;
   // The cache's row when the refusal arrived, before the chapter GET.

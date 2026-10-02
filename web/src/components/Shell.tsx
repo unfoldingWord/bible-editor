@@ -99,7 +99,7 @@ import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult, type OutboxOp } from "../sync/outbox";
 import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
-import { planRefusedVerseRollback, siblingStillDraining } from "../sync/refusedVerseRollback";
+import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
 import {
   alignmentDraftKey,
   alignmentDraftKeyForOp,
@@ -1040,6 +1040,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // One chapter GET per refusal burst: a find/replace across a locked chapter
   // is refused verse by verse, and every refusal reads the same chapter.
   const rollbackFetchRef = useRef(new Map<string, Promise<ChapterPayload>>());
+  const liveBookRef = useRef(book);
+  liveBookRef.current = book;
+  // False once this Shell unmounts (React StrictMode's dev replay sets it
+  // back to true).
+  const rollbackMountedRef = useRef(false);
+  useEffect(() => {
+    rollbackMountedRef.current = true;
+    return () => {
+      rollbackMountedRef.current = false;
+    };
+  }, []);
   const rollBackRefusedVerse = useCallback(async (op: OutboxOp) => {
     const t = op.target;
     if (t.kind !== "verse") return;
@@ -1102,6 +1113,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         if (plan.kind === "force") force(plan.row);
         else if (plan.kind === "remote") remote(plan.row);
       };
+      // App keys Shell by book and hoists useBook, whose applies have no book
+      // check: once this Shell is gone (a book switch during the GET), its
+      // refs still hold the old book's snapshot, and an apply would write the
+      // old book's verse into the new book's cache. Apply nothing then.
+      if (
+        !rollbackMayApply({
+          mounted: rollbackMountedRef.current,
+          liveBook: liveBookRef.current,
+          targetBook: t.book,
+        })
+      ) {
+        return;
+      }
       apply(chapterBefore, chapterRow(), applyLocalVerseRef.current, applyRemoteVerseRef.current);
       const bh = bookHookRef.current;
       if (bh) apply(bookBefore, bookRow(), bh.applyLocalVerse, bh.applyRemoteVerse);

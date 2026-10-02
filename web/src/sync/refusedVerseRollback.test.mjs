@@ -3,7 +3,7 @@
 // cache that still holds the refused optimistic content.
 
 import assert from "node:assert/strict";
-import { planRefusedVerseRollback, siblingStillDraining } from "./refusedVerseRollback.ts";
+import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "./refusedVerseRollback.ts";
 
 let passed = 0;
 const check = (cond, msg) => {
@@ -103,5 +103,12 @@ check(
   check(!siblingStillDraining([op("a", "pending")], "a", K), "the refused op itself does not count");
   check(!siblingStillDraining([op("b", "pending", "verse:ZEC:6:3:ULT")], "a", K), "another verse's op does not count");
 }
+
+// Codex verify on 23e68cf: a book switch during the GET unmounts Shell (App
+// keys it by book); its stale refs must not write the old book's verse into
+// the new book's cache through the hoisted useBook.
+check(rollbackMayApply({ mounted: true, liveBook: "ZEC", targetBook: "ZEC" }), "a live Shell on the op's book applies");
+check(!rollbackMayApply({ mounted: false, liveBook: "ZEC", targetBook: "ZEC" }), "an unmounted Shell applies nothing");
+check(!rollbackMayApply({ mounted: true, liveBook: "MAL", targetBook: "ZEC" }), "a Shell now on another book applies nothing");
 
 console.log(`refusedVerseRollback: ${passed} passed`);
