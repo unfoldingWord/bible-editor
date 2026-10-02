@@ -1230,14 +1230,34 @@ const LINEAGE_FIELDS: Record<"tn" | "tq", Array<[string, string]>> = {
 // mirrors human Door43 edits, and a human can restore an older bot value on
 // Door43, so neither may hide a row from the report. App edits (source NULL)
 // do not supersede: a translator editing the bot's row is the case this serves.
+//
+// The bot write must also be NEWER than where master was last confirmed
+// (edit_log id > master_confirmed_edit_id, or created_at >= master_confirmed_at
+// when the id is NULL; neither known -> nothing counts). A bot write at or
+// before that point already reached master inside a confirmed render of ours,
+// so master holding it again now is a revert (bot X -> app Y exported and
+// confirmed -> app Z -> human restores X), not the bot push the app edit is
+// layered on. The #1029 case is unaffected: there the bot push lands after
+// our last confirmed publish.
 export function buildRevertLineage(
-  rows: ReadonlyArray<{ row_key: string; source: string | null; action: string; payload_json: string | null }>,
+  rows: ReadonlyArray<{
+    id: number;
+    row_key: string;
+    source: string | null;
+    action: string;
+    payload_json: string | null;
+    created_at: number;
+  }>,
+  confirmed: { editId: number | null; at: number | null },
 ): Map<string, Array<Record<string, unknown>>> {
   const latest = new Map<string, (typeof rows)[number]>();
   for (const r of rows) if (r.source != null) latest.set(r.row_key, r);
+  const afterConfirmed = (r: (typeof rows)[number]): boolean =>
+    confirmed.editId != null ? r.id > confirmed.editId : confirmed.at != null ? r.created_at >= confirmed.at : false;
   const lineage = new Map<string, Array<Record<string, unknown>>>();
   for (const [rowKey, r] of latest) {
     if (r.source !== "ai_pipeline" || (r.action !== "create" && r.action !== "update") || r.payload_json == null) continue;
+    if (!afterConfirmed(r)) continue;
     try {
       const p = JSON.parse(r.payload_json);
       if (p && typeof p === "object") lineage.set(rowKey, [p as Record<string, unknown>]);
@@ -1257,20 +1277,26 @@ export async function loadRevertLineage(
   book: string,
   confirmed: { editId: number | null; at: number | null },
 ): Promise<Map<string, Array<Record<string, unknown>>>> {
-  void confirmed;
   // Every machine write for the book, so a later one of any action supersedes
   // an older bot payload. Payloads are only needed for ai_pipeline rows.
   const { results } = await db
     .prepare(
-      `SELECT row_key, source, action,
+      `SELECT id, row_key, source, action, created_at,
               CASE WHEN source = 'ai_pipeline' THEN payload_json END AS payload_json
          FROM edit_log
         WHERE kind = ?1 AND book = ?2 AND source IS NOT NULL
         ORDER BY id`,
     )
     .bind(kind, book)
-    .all<{ row_key: string; source: string | null; action: string; payload_json: string | null }>();
-  return buildRevertLineage(results ?? []);
+    .all<{
+      id: number;
+      row_key: string;
+      source: string | null;
+      action: string;
+      payload_json: string | null;
+      created_at: number;
+    }>();
+  return buildRevertLineage(results ?? [], confirmed);
 }
 
 // True when master's row equals (on every content column) a full-row edit_log
