@@ -65,6 +65,7 @@ const EXTRA_IMPORTS = new Map([
   ["src/aiRowDiffGate.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/masterLineagePersist.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/staleBaseGate.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/unconfirmedRenders.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/reimportUnstampedBranches.test.mjs", "./src/tsResolveHook.mjs"],
   // verseMergeConflicts.test.mjs now imports retireVerseKeptAiMasterFlags
   // directly from verseMergeConflicts.ts (issue #760 fail-closed regression

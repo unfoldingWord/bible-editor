@@ -9559,6 +9559,12 @@ async function markOwnPublishConverged(
               -- misreport which run established the watermark the admin panel
               -- shows.
               origin = CASE WHEN ?4 IS NOT NULL THEN 'own_publish' ELSE origin END,
+              -- #1029: master is confirmed at this render, so older renders no
+              -- longer count as "master lagging". Only when ?3 is still the
+              -- current pushed render (a newer push since the read keeps the list).
+              unconfirmed_renders_json =
+                CASE WHEN pushed_read_at = ?3 AND pushed_blob_sha IS NOT NULL
+                     THEN json_array(pushed_blob_sha) ELSE unconfirmed_renders_json END,
               -- Free reset of the inertness detector: a match is exactly the
               -- evidence that recognition is working for this (book, resource).
               own_publish_declines = 0
@@ -9617,7 +9623,10 @@ async function markLineageConfirmedConverged(
                    THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?4)
                    ELSE master_confirmed_edit_id END,
             own_publish_declines = 0,
-            own_publish_rewrite_sha = NULL
+            own_publish_rewrite_sha = NULL,
+            -- #1029: confirmed at this render (the CAS below pins it), so older
+            -- renders no longer count as "master lagging".
+            unconfirmed_renders_json = json_array(?5)
       WHERE book = ?1 AND resource = ?2
         AND pushed_blob_sha = ?5
         AND pushed_read_at = ?3
@@ -9644,6 +9653,15 @@ export const markLineageConfirmedConvergedForTest = (
   resource: Resource,
   candidate: { pushedBlobSha: string; pushedReadAt: number; pushedEditId: number | null },
 ): Promise<boolean> => markLineageConfirmedConverged(env, book, resource, candidate);
+
+export const markOwnPublishConvergedForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+  readAt: number,
+  pushedEditId: number | null,
+  masterSha: string | null,
+): Promise<boolean> => markOwnPublishConverged(env, book, resource, readAt, pushedEditId, masterSha);
 
 export async function storedResourceSha(env: Env, book: string, resource: Resource): Promise<string | null> {
   const row = await env.DB.prepare(
