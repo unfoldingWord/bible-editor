@@ -98,7 +98,7 @@ import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
-import { isAlignmentSaveOp } from "../sync/alignmentDraftSaveState";
+import { isAlignerPanelSaveOp } from "../sync/alignmentDraftSaveState";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { UnsavedToasts } from "./UnsavedToasts";
 import { QuoteBuilderPopper } from "./QuoteBuilderPopper";
@@ -1013,15 +1013,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   //
   // #1071: the tab learns of locks from a 120 s poll, so a refusal is often
   // the first it hears of one. Re-read the jobs now so the lanes lock and the
-  // aligner's gates stop offering Save. An aligner save is not lost: the
-  // panel and its crash draft keep the drags (AlignmentPanel, alignmentDrafts).
+  // aligner's gates stop offering Save. A burst of refusals shares one
+  // reload. An aligner save is not lost: the panel and its crash draft keep
+  // the drags (AlignmentPanel, alignmentDrafts). A verse-history restore also
+  // sends alignment_edit but is not aligner work, so it keeps the old toast.
+  const lockReloadRef = useRef<Promise<void> | null>(null);
   useEffect(
     () =>
       onOutboxResult((op, result) => {
         if (result.kind === "locked") {
-          void pipelineStore.reload();
+          lockReloadRef.current ??= pipelineStore.reload().finally(() => {
+            lockReloadRef.current = null;
+          });
           pushPipelineToast(
-            isAlignmentSaveOp(op)
+            isAlignerPanelSaveOp(op)
               ? "Alignment not saved — the AI run for this chapter is mid-flight. Your changes are kept in the aligner; save them after it finishes."
               : "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",

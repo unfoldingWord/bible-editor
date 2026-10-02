@@ -17,7 +17,13 @@
 import { openDB, type IDBPDatabase } from "idb";
 import { isReadOnly } from "./api";
 import { onOutboxResult, type VerseTarget } from "./outbox";
-import { isAlignmentSaveOp } from "./alignmentDraftSaveState";
+import {
+  isAlignerPanelSaveOp,
+  isAlignmentSaveOp,
+  refusalMayReplaceDraft,
+  refusedOpOrder,
+  type RefusedOpOrder,
+} from "./alignmentDraftSaveState";
 
 const DB_NAME = "bible-editor-alignment-drafts";
 const DB_VERSION = 1;
@@ -44,6 +50,9 @@ export interface AlignmentDraftRecord {
   // instead of being wiped for the ~400ms until its own persist cycle re-runs
   // (#508). Absent on records persisted before this field existed.
   generation?: string;
+  // Set only on a draft restoreRefused wrote: the refused op it came from
+  // (#1071). The panel's own persist writes leave it off.
+  refusedFrom?: RefusedOpOrder;
 }
 
 let dbp: Promise<IDBPDatabase> | null = null;
@@ -128,20 +137,30 @@ export const alignmentDrafts = {
     return true;
   },
 
-  // #1071: put a refused save's content back as the crash draft, unless a
-  // draft is already there. A draft written after that Save came from more
-  // dragging on top of the saved state, so it already holds these drags.
-  async restoreRefused(key: string, content: unknown, expectedVersion: number): Promise<void> {
+  // #1071: put a refused save's content back as the crash draft, when
+  // refusalMayReplaceDraft allows it (no draft, or one an earlier refusal
+  // wrote). The commit's own clear of the pre-save draft cannot land after
+  // this: its readwrite transaction on this store was created before the op
+  // was even dispatched, and IndexedDB runs overlapping readwrite
+  // transactions in creation order.
+  async restoreRefused(
+    key: string,
+    content: unknown,
+    expectedVersion: number,
+    from: RefusedOpOrder,
+  ): Promise<void> {
     if (isReadOnly()) return;
     const idb = await db();
     const tx = idb.transaction(STORE, "readwrite");
-    if (!(await tx.store.get(key))) {
+    const existing = (await tx.store.get(key)) as AlignmentDraftRecord | undefined;
+    if (refusalMayReplaceDraft(existing, from)) {
       const rec: AlignmentDraftRecord = {
         key,
         content,
         expectedVersion,
         updatedAt: Date.now(),
         generation: mintAlignmentDraftGeneration(),
+        refusedFrom: from,
       };
       await tx.store.put(rec);
     }
@@ -170,14 +189,22 @@ export const alignmentDrafts = {
 // cleared its crash draft when it committed. Put the saved alignment back as
 // the draft so the drags come back when the verse's aligner reopens. Runs
 // here rather than in the panel because the gate's Save usually navigates
-// away, unmounting it, before the refusal arrives.
+// away, unmounting it, before the refusal arrives. Only the aligner's own
+// saves: a refused verse-history restore is not aligner work.
 onOutboxResult((op, result) => {
   if (result.kind !== "ok" && result.kind !== "locked") return;
   if (!isAlignmentSaveOp(op)) return;
   const target = op.target as VerseTarget;
   const key = alignmentDraftKey(target.book, target.chapter, target.verse, target.bibleVersion);
   if (result.kind === "locked") {
-    void alignmentDrafts.restoreRefused(key, op.patch.content, op.expectedVersion);
+    if (isAlignerPanelSaveOp(op)) {
+      void alignmentDrafts.restoreRefused(
+        key,
+        op.patch.content,
+        op.expectedVersion,
+        refusedOpOrder(op),
+      );
+    }
     return;
   }
   if (op.alignmentDraftGeneration) {

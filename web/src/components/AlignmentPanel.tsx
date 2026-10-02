@@ -57,6 +57,7 @@ import {
 import type { TwlRow, VerseDto } from "../sync/api";
 import { alignmentDrafts, alignmentDraftKey, mintAlignmentDraftGeneration } from "../sync/alignmentDrafts";
 import { onOutboxResult } from "../sync/outbox";
+import { refusedSaveStillCurrent } from "../sync/alignmentDraftSaveState";
 import { isVersionOnlyRebase, lostAlignedWords } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
@@ -300,16 +301,23 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // Save (#508). Reset to undefined whenever the panel resyncs to a
     // genuinely different target/content or the user explicitly discards.
     const lastDraftGenerationRef = useRef<string | undefined>(undefined);
-    // #1071: the panel's last committed save (its op's draft generation and
-    // the baseline from before it), until the outbox reports on it. A save
-    // refused as chapter_locked (a lock this tab had not polled yet) is
-    // dropped from the outbox, so put the old baseline back: the drags read
-    // as unsaved again, the gates guard them and the persist effect keeps
-    // them in the crash draft. The panel is keyed on its target, so a
-    // refusal arriving here is always for this verse.
-    const pendingSaveRef = useRef<{ generation: string; baseline: AlignmentState | null } | null>(
-      null,
-    );
+    // #1071: the panel's last committed save (its op's draft generation, the
+    // baseline from before it, and the verse it was built on), until the
+    // outbox reports on it. A save refused as chapter_locked (a lock this tab
+    // had not polled yet) is dropped from the outbox, so put the old baseline
+    // back: the drags read as unsaved again, the gates guard them and the
+    // persist effect keeps them in the crash draft. The op's generation is
+    // unique to this commit, and refusedSaveStillCurrent skips the restore
+    // when a foreign change has replaced the verse since.
+    const pendingSaveRef = useRef<{
+      generation: string;
+      baseline: AlignmentState | null;
+      version: number;
+      savedContent: unknown;
+      baseContent: unknown;
+    } | null>(null);
+    const verseRef = useRef(verse);
+    verseRef.current = verse;
     useEffect(
       () =>
         onOutboxResult((op, result) => {
@@ -318,11 +326,21 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           if (result.kind === "ok") pendingSaveRef.current = null;
           else if (result.kind === "locked") {
             pendingSaveRef.current = null;
-            setInitial(pending.baseline);
+            if (refusedSaveStillCurrent(pending, verseRef.current)) setInitial(pending.baseline);
           }
         }),
       [],
     );
+    // False once the panel really unmounts (React StrictMode's dev replay sets
+    // it back to true), so a crash-draft read resolving after unmount does
+    // nothing, the way the old effect-cleanup flag behaved.
+    const mountedRef = useRef(false);
+    useEffect(() => {
+      mountedRef.current = true;
+      return () => {
+        mountedRef.current = false;
+      };
+    }, []);
     const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
     const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
@@ -468,7 +486,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       const token = {};
       hydrationTokenRef.current = token;
       void alignmentDrafts.get(draftKey).then((rec) => {
-        if (hydrationTokenRef.current !== token || !rec) return;
+        if (!mountedRef.current || hydrationTokenRef.current !== token || !rec) return;
         if (rec.expectedVersion !== baseVersion) {
           void alignmentDrafts.clear(draftKey);
           return;
@@ -894,7 +912,13 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         // an up-to-date client — see lastDraftGenerationRef's doc comment and
         // alignmentDrafts.ts's onOutboxResult listener (#508).
         const draftGeneration = lastDraftGenerationRef.current ?? mintAlignmentDraftGeneration();
-        pendingSaveRef.current = { generation: draftGeneration, baseline: initial };
+        pendingSaveRef.current = {
+          generation: draftGeneration,
+          baseline: initial,
+          version: verse.version,
+          savedContent: newContent,
+          baseContent: verse.content,
+        };
         onSave(newContent, plain, verse.version, draftGeneration);
         // Optimistic: the freshly-saved state is now the baseline. When the
         // chapter cache eventually round-trips the new content, computedInitial
