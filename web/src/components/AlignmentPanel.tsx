@@ -56,6 +56,7 @@ import {
 } from "../lib/alignmentHover";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { alignmentDrafts, alignmentDraftKey, mintAlignmentDraftGeneration } from "../sync/alignmentDrafts";
+import { onOutboxResult } from "../sync/outbox";
 import { isVersionOnlyRebase, lostAlignedWords } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
@@ -296,6 +297,29 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // Save (#508). Reset to undefined whenever the panel resyncs to a
     // genuinely different target/content or the user explicitly discards.
     const lastDraftGenerationRef = useRef<string | undefined>(undefined);
+    // #1071: the panel's last committed save (its op's draft generation and
+    // the baseline from before it), until the outbox reports on it. A save
+    // refused as chapter_locked (a lock this tab had not polled yet) is
+    // dropped from the outbox, so put the old baseline back: the drags read
+    // as unsaved again, the gates guard them and the persist effect keeps
+    // them in the crash draft. The panel is keyed on its target, so a
+    // refusal arriving here is always for this verse.
+    const pendingSaveRef = useRef<{ generation: string; baseline: AlignmentState | null } | null>(
+      null,
+    );
+    useEffect(
+      () =>
+        onOutboxResult((op, result) => {
+          const pending = pendingSaveRef.current;
+          if (!pending || op.alignmentDraftGeneration !== pending.generation) return;
+          if (result.kind === "ok") pendingSaveRef.current = null;
+          else if (result.kind === "locked") {
+            pendingSaveRef.current = null;
+            setInitial(pending.baseline);
+          }
+        }),
+      [],
+    );
     const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
     const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
@@ -865,6 +889,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         // an up-to-date client — see lastDraftGenerationRef's doc comment and
         // alignmentDrafts.ts's onOutboxResult listener (#508).
         const draftGeneration = lastDraftGenerationRef.current ?? mintAlignmentDraftGeneration();
+        pendingSaveRef.current = { generation: draftGeneration, baseline: initial };
         onSave(newContent, plain, verse.version, draftGeneration);
         // Optimistic: the freshly-saved state is now the baseline. When the
         // chapter cache eventually round-trips the new content, computedInitial
@@ -890,7 +915,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       }
       commit();
       return true;
-    }, [state, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
+    }, [state, initial, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
 
     // Same two maps hebrewHighlight/onEnglishHover use, in the same roles:
     // posOwners (display-derived) says which CARD(s) own the position, and

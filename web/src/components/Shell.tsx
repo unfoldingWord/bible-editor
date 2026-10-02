@@ -98,6 +98,7 @@ import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
+import { isAlignmentSaveOp } from "../sync/alignmentDraftSaveState";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { UnsavedToasts } from "./UnsavedToasts";
 import { QuoteBuilderPopper } from "./QuoteBuilderPopper";
@@ -1009,12 +1010,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Surface a toast when the outbox drops an op because the chapter was
   // locked. The user's edit was rejected by the server (409 chapter_locked)
   // and discarded — retrying would race the auto-apply step.
+  //
+  // #1071: the tab learns of locks from a 120 s poll, so a refusal is often
+  // the first it hears of one. Re-read the jobs now so the lanes lock and the
+  // aligner's gates stop offering Save. An aligner save is not lost: the
+  // panel and its crash draft keep the drags (AlignmentPanel, alignmentDrafts).
   useEffect(
     () =>
-      onOutboxResult((_op, result) => {
+      onOutboxResult((op, result) => {
         if (result.kind === "locked") {
+          void pipelineStore.reload();
           pushPipelineToast(
-            "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+            isAlignmentSaveOp(op)
+              ? "Alignment not saved — the AI run for this chapter is mid-flight. Your changes are kept in the aligner; save them after it finishes."
+              : "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }
@@ -1417,6 +1426,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bookLocked ? "book" : lockForChapter(chapterNum, "verse") ? "chapter" : false,
     [lockForChapter, bookLocked],
   );
+  // Live lock state for the unalign confirm's deferred commit (#1071), same
+  // reason as bookLockedRef.
+  const alignerLockRef = useRef(alignerLock);
+  alignerLockRef.current = alignerLock;
   const chapterStaleRef = useRef(chapterStale);
   chapterStaleRef.current = chapterStale;
 
@@ -2986,6 +2999,34 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     return true;
   }, [book, pushPipelineToast]);
 
+  // The aligner's "Words will be unaligned" confirm. A lock can land while it
+  // is open (#1071), and committing then resets the panel's baseline and
+  // clears its crash draft for a save that is refused (chapter lock) or
+  // silently dropped (book lock). So "Save anyway" re-checks the live lock
+  // and refuses out loud: nothing is queued, the panel stays dirty with its
+  // crash draft, and a gate's pending nav (afterCommit) does not run.
+  // Mirrors the dual reading line's refuseCommit (#1046).
+  const confirmAlignerUnalign = useCallback(
+    (chapterNum: number, ref: string, lostWords: string[], commit: () => void) =>
+      setPendingAlignmentLoss({
+        ref,
+        lostWords,
+        commit: () => {
+          const lock = alignerLockRef.current(chapterNum);
+          if (lock) {
+            saveDoneGuardRef.current.cancel();
+            pushPipelineToast(
+              `${alignerLockReason(lock)}, so the alignment was not saved. Your changes are kept in the aligner; save them once the lock lifts.`,
+              "error",
+            );
+            return;
+          }
+          commit();
+        },
+      }),
+    [pushPipelineToast],
+  );
+
   // Compute the alignment panel's props from the current chapter cache.
   // Memoized so identity stays stable when the chapter hasn't changed under
   // it; the panel uses verse identity to re-init its internal state.
@@ -3050,11 +3091,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }
       },
       onConfirmUnalign: (lostWords, commit) =>
-        setPendingAlignmentLoss({
-          ref: `${book} ${alignerTarget.chapter}:${targetVerse?.verse ?? alignerTarget.verse} ${alignerTarget.bibleVersion}`,
+        confirmAlignerUnalign(
+          alignerTarget.chapter,
+          `${book} ${alignerTarget.chapter}:${targetVerse?.verse ?? alignerTarget.verse} ${alignerTarget.bibleVersion}`,
           lostWords,
           commit,
-        }),
+        ),
       onCancel: () => {
         setPanelMode("resources");
       },
@@ -3093,6 +3135,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalVerse,
     enqueueVerseSafely,
     alignerLock,
+    confirmAlignerUnalign,
   ]);
 
   // Props for the side-by-side popup: ULT + UST slices against one shared
@@ -3163,11 +3206,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       };
     const confirmUnalign = (bibleVersion: string, row: VerseDto | null) =>
       (lostWords: string[], commit: () => void) =>
-        setPendingAlignmentLoss({
-          ref: `${book} ${dualTarget.chapter}:${row?.verse ?? dualTarget.verse} ${bibleVersion}`,
+        confirmAlignerUnalign(
+          dualTarget.chapter,
+          `${book} ${dualTarget.chapter}:${row?.verse ?? dualTarget.verse} ${bibleVersion}`,
           lostWords,
           commit,
-        });
+        );
     const left: PanelSlot = {
       bibleVersion: "ULT",
       verse: ult.targetVerse,
@@ -3210,7 +3254,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // that), so only the two AlignmentPanels' own save/restore disable.
       locked: alignerLock(dualTarget.chapter),
     };
-  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely, alignerLock]);
+  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely, alignerLock, confirmAlignerUnalign]);
 
   // Prev/next verse for the dual aligner's titlebar arrows, within the current
   // chapter's verse list (excluding the intro tile). Null at the ends.

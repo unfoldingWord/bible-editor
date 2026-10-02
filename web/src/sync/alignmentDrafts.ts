@@ -128,6 +128,26 @@ export const alignmentDrafts = {
     return true;
   },
 
+  // #1071: put a refused save's content back as the crash draft, unless a
+  // draft is already there. A draft written after that Save came from more
+  // dragging on top of the saved state, so it already holds these drags.
+  async restoreRefused(key: string, content: unknown, expectedVersion: number): Promise<void> {
+    if (isReadOnly()) return;
+    const idb = await db();
+    const tx = idb.transaction(STORE, "readwrite");
+    if (!(await tx.store.get(key))) {
+      const rec: AlignmentDraftRecord = {
+        key,
+        content,
+        expectedVersion,
+        updatedAt: Date.now(),
+        generation: mintAlignmentDraftGeneration(),
+      };
+      await tx.store.put(rec);
+    }
+    await tx.done;
+  },
+
   // Mirrors drafts.ts's shape; `updatedAt` + `list` are the seam a future
   // "you have unsaved alignment from an earlier session" recovery surface would
   // hang on (the way UnsavedToasts/SyncStatusBar consume drafts.ts). No caller
@@ -144,11 +164,22 @@ export const alignmentDrafts = {
 // an unconditional clear only for a legacy op enqueued before generation
 // tracking existed) so a draft written by dragging that continued AFTER Save
 // — a newer generation this op never captured — survives (#508).
+//
+// A save the server refused as chapter_locked (an AI run the tab had not
+// polled yet, #1071) is deleted from the outbox, and the panel already
+// cleared its crash draft when it committed. Put the saved alignment back as
+// the draft so the drags come back when the verse's aligner reopens. Runs
+// here rather than in the panel because the gate's Save usually navigates
+// away, unmounting it, before the refusal arrives.
 onOutboxResult((op, result) => {
-  if (result.kind !== "ok") return;
+  if (result.kind !== "ok" && result.kind !== "locked") return;
   if (!isAlignmentSaveOp(op)) return;
   const target = op.target as VerseTarget;
   const key = alignmentDraftKey(target.book, target.chapter, target.verse, target.bibleVersion);
+  if (result.kind === "locked") {
+    void alignmentDrafts.restoreRefused(key, op.patch.content, op.expectedVersion);
+    return;
+  }
   if (op.alignmentDraftGeneration) {
     void alignmentDrafts.clearGeneration(key, op.alignmentDraftGeneration);
   } else {
