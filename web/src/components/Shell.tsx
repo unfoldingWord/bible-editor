@@ -98,7 +98,7 @@ import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
-import { alignmentDraftKey, isAlignerPanelSaveOp } from "../sync/alignmentDraftSaveState";
+import { alignmentDraftKey, alignmentDraftKeyForOp, isAlignerPanelSaveOp } from "../sync/alignmentDraftSaveState";
 import { onAlignerSaveRefused } from "../sync/alignmentDrafts";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { UnsavedToasts } from "./UnsavedToasts";
@@ -1041,10 +1041,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [pushPipelineToast],
   );
   // #1071: say "kept" only when a crash draft or an open panel actually holds
-  // the refused drags.
+  // the refused drags. Two queued saves of one verse refused together get
+  // one toast.
+  const lastRefusalToastRef = useRef<{ key: string; at: number } | null>(null);
   useEffect(
     () =>
-      onAlignerSaveRefused((_op, kept) => {
+      onAlignerSaveRefused((op, kept) => {
+        const key = alignmentDraftKeyForOp(op);
+        const last = lastRefusalToastRef.current;
+        if (last && last.key === key && Date.now() - last.at < 3000) return;
+        lastRefusalToastRef.current = { key, at: Date.now() };
         pushPipelineToast(
           kept
             ? "Alignment not saved — the AI run for this chapter is mid-flight. Your changes are kept in the aligner; save them after it finishes."

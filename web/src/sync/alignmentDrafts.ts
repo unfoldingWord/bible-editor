@@ -76,9 +76,9 @@ function db() {
 export { alignmentDraftKey };
 
 // #1071: a refused aligner save, once this module knows whether anything kept
-// its drags: the crash draft was written here, or an open panel put its
-// pre-save baseline back (noteRefusalKeptInPanel). Shell words its toast on
-// this, so it never says "kept" when nothing was.
+// its drags: a crash draft holds them (written here, or one already there),
+// or an open panel put its pre-save baseline back (noteRefusalKeptInPanel).
+// Shell words its toast on this, so it never says "kept" when nothing was.
 type RefusalListener = (op: OutboxOp, kept: boolean) => void;
 const refusalListeners = new Set<RefusalListener>();
 export function onAlignerSaveRefused(fn: RefusalListener): () => void {
@@ -90,16 +90,6 @@ const keptInPanel = new Set<string>();
 // lands before the draft write below resolves.
 export function noteRefusalKeptInPanel(generation: string): void {
   keptInPanel.add(generation);
-}
-
-// #1071: a refused save's draft was just written at `key`. An open, clean
-// panel on that key (the user reopened the aligner before the refusal
-// arrived, so its own read found nothing) re-reads it.
-type RestoredListener = (key: string) => void;
-const restoredListeners = new Set<RestoredListener>();
-export function onRefusedDraftRestored(fn: RestoredListener): () => void {
-  restoredListeners.add(fn);
-  return () => restoredListeners.delete(fn);
 }
 
 let generationSeq = 0;
@@ -188,8 +178,10 @@ export const alignmentDrafts = {
       await tx.store.put(rec);
     }
     await tx.done;
-    if (write) for (const l of restoredListeners) l(key);
-    return write;
+    // True whenever a draft at `key` now holds these drags: the one just
+    // written, or one refusalMayReplaceDraft kept because it already holds
+    // them (dragging after Save, or a later save's refusal).
+    return write || existing !== undefined;
   },
 
   // Mirrors drafts.ts's shape; `updatedAt` + `list` are the seam a future
@@ -225,8 +217,8 @@ onOutboxResult((op, result) => {
   if (result.kind === "locked") {
     if (isAlignerPanelSaveOp(op)) {
       const generation = op.alignmentDraftGeneration as string;
-      const settle = (written: boolean) => {
-        const kept = keptInPanel.delete(generation) || written;
+      const settle = (heldInDraft: boolean) => {
+        const kept = keptInPanel.delete(generation) || heldInDraft;
         for (const l of refusalListeners) l(op, kept);
       };
       alignmentDrafts
