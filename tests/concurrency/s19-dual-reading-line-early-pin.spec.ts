@@ -15,8 +15,11 @@ import { csrfToken, newUserContext } from "./helpers";
 //      last synced from. Saving after a mid-edit server change sends that old
 //      version and gets a 409; the server keeps the other change.
 //   2. The pin goes as soon as the line goes clean (Undo, typed back by hand,
-//      replaced by an unfocused resync): a new edit saved after the verse
-//      moved again lands with a 200, never a 409 from a leaked pin.
+//      the verse moving onto the line's own text): a new edit saved after the
+//      verse moved again lands with a 200, never a 409 from a leaked pin.
+//   3. #1067: a verse change never replaces unsaved text on screen, focused or
+//      not. A line that lost focus keeps its edit and its pin, so Save is a
+//      409 and a merge prompt, not an overwrite.
 //
 // Kept apart from s18 (book locks) so the two suites can change separately.
 
@@ -264,17 +267,299 @@ test("a reading-line pin is released however the line goes clean (Undo, typed ba
     await expect(o.undo).toBeDisabled();
     await saveAfterMove(o, 2);
 
-    // 3. Replaced by a resync from the server while the line is not focused.
+    // 3. The verse moves onto the line's own text while the line is not
+    //    focused: the resync finds nothing left unsaved. (A verse change never
+    //    replaces a dirty line's text (#1067), so this is the only way a
+    //    resync cleans one.)
     await typeAtEnd(page, o.line, ` RESYNC-${stamp}`);
     expect(await pinnedVersion(page)).toBeDefined();
     await o.title.click();
-    await bumpVerse(page, context.request, csrf, `[s19-3a-${stamp}]`);
-    await expect(o.line).toContainText(`[s19-3a-${stamp}]`);
-    await expect(o.line).not.toContainText(`RESYNC-${stamp}`);
+    await bumpVerse(page, context.request, csrf, `RESYNC-${stamp}`);
     await expect(o.undo).toBeDisabled();
     await saveAfterMove(o, 3);
   } finally {
     await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
+    await context.close();
+  }
+});
+
+// #1067: the unfocused resync used to replace a dirty line's text whenever
+// the verse changed, since its "still showing what we set?" check compared
+// against text onInput keeps equal to the box. The edit vanished, the line
+// went clean and its pin was released, with nothing to warn the translator.
+test("a reading line with unsaved text that lost focus keeps it when another editor changes the verse: Save is a 409 and a merge prompt", async ({
+  browser,
+}) => {
+  test.setTimeout(60_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const original = await serverVerse(context.request);
+  const stamp = Date.now();
+  const tag = `[s19-unfocused-${stamp}]`;
+
+  try {
+    const o = await openDual(page);
+    await typeAtEnd(page, o.line, ` EDIT-${stamp}`);
+    expect(await pinnedVersion(page)).toBe(original.version);
+
+    // Click into the alignment panel: the line loses focus, still dirty.
+    await o.dialog.getByText(`${BV} words`, { exact: true }).first().click();
+    await expect(o.line).not.toBeFocused();
+    await expect(o.save).toBeEnabled();
+
+    const bumped = await bumpVerse(page, context.request, csrf, tag);
+    expect(bumped).toBeGreaterThan(original.version);
+    // The moved verse has rendered (the main column behind the dialog shows
+    // it), so the line's resync has run by now.
+    await expect(page.locator(`[data-find-cell="${V72.chapter}-${V72.verse}-${BV}"]`).first()).toContainText(tag);
+
+    // The edit is still on screen, still unsaved, still pinned to its base.
+    await expect(o.line).toContainText(`EDIT-${stamp}`);
+    await expect(o.line).not.toContainText(tag);
+    await expect(o.save).toBeEnabled();
+    expect(await pinnedVersion(page)).toBe(original.version);
+
+    const patched = nextVersePatch(page);
+    await o.save.click();
+    const res = await patched;
+    expect(res.request().headers()["if-match"]).toBe(String(original.version));
+    expect(res.status()).toBe(409);
+    await expect.poll(() => verseOpStatuses(page)).toEqual(["conflict"]);
+    await expect(page.getByText("resolve 1 conflict")).toBeVisible();
+    const after = (await serverVerse(context.request)).plain_text;
+    expect(after).toContain(tag);
+    expect(after).not.toContain(`EDIT-${stamp}`);
+  } finally {
+    await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
+    await context.close();
+  }
+});
+
+// #1067 review: the line is not tied to one row. A bridge (or split) by
+// another editor maps the slot onto a different row; an edit kept across that
+// would be saved onto the new row with that row's fresh version (200), and the
+// v7-only text would replace the whole 6-7 row, deleting verse 6. A change of
+// row drops the line's edit and its pin instead.
+test("a dirty reading line whose verse is bridged into another row by another editor never saves its text onto the bridged row", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const UST = "UST";
+  const V6 = `/api/verses/${BOOK}/7/6/${UST}`;
+  const V7 = `/api/verses/${BOOK}/7/7/${UST}`;
+  const get = async (path: string) => {
+    const res = await context.request.get(path);
+    expect(res.ok()).toBe(true);
+    return (await res.json()) as VerseRow & { verse_end: number | null };
+  };
+  const orig6 = await get(V6);
+  const orig7 = await get(V7);
+  expect(orig6.verse_end).toBeNull();
+  const stamp = Date.now();
+  const key = (v: number) => `verse:${BOOK}:7:${v}:${UST}`;
+  const peek = (k: string) =>
+    page.evaluate((kk) => (window as unknown as PinDebugWindow).__bePinDebug?.peek(kk)?.version, k);
+  const current = (k: string) =>
+    page.evaluate((kk) => (window as unknown as PinDebugWindow).__bePinDebug?.currentVersion(kk), k);
+  let bridged = false;
+
+  try {
+    const o = await openDual(page, { chapter: 7, verse: 7 });
+    const lineBox = o.dialog
+      .locator("div:has(> [contenteditable])")
+      .filter({ hasText: `${UST} · reading text` });
+    const line = lineBox.locator("[contenteditable]");
+    const save = lineBox.getByRole("button", { name: `Save ${UST}`, exact: true });
+    await expect(line).toContainText("former prophets");
+
+    await typeAtEnd(page, line, ` EDIT-${stamp}`);
+    expect(await peek(key(7))).toBe(orig7.version);
+    // Off the line, still dirty.
+    await o.dialog.getByText(`${UST} words`, { exact: true }).first().click();
+    await expect(line).not.toBeFocused();
+    await expect(save).toBeEnabled();
+
+    // Another editor bridges 6+7 into one row.
+    const res = await context.request.post(`${V6}/bridge`, {
+      headers: { "x-csrf-token": csrf },
+      data: { start_version: orig6.version, next_version: orig7.version },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    bridged = true;
+    const bridgedVersion = ((await res.json()) as { verse: { version: number } }).verse.version;
+    await expect.poll(() => current(key(6))).toBe(bridgedVersion);
+
+    // Whatever the line shows now, a Save (if it offers one) must not put the
+    // v7-only text over the bridged row.
+    if (await save.isEnabled()) {
+      // Dropping verse 6's aligned words asks first; answer it if it comes.
+      const confirm = page.getByRole("dialog").filter({ hasText: "will be unaligned" });
+      let sent = false;
+      const patched = page
+        .waitForResponse((r) => r.request().method() === "PATCH" && r.url().includes(V6), { timeout: 15_000 })
+        .then((r) => {
+          sent = true;
+          return r;
+        });
+      await save.click();
+      await expect.poll(async () => sent || (await confirm.isVisible()), { timeout: 10_000 }).toBe(true);
+      if (!sent) await confirm.getByRole("button", { name: "Save anyway" }).click();
+      await patched;
+    }
+    const after6 = await get(V6);
+    expect(after6.verse_end).toBe(7);
+    expect(after6.plain_text).toContain("feasted");
+    expect(after6.plain_text).not.toContain(`EDIT-${stamp}`);
+
+    // The line shows the bridged row, clean, and the v7 pin is gone.
+    await expect(line).toContainText("feasted");
+    await expect(line).not.toContainText(`EDIT-${stamp}`);
+    await expect(save).toBeDisabled();
+    await expect.poll(() => peek(key(7))).toBeUndefined();
+  } finally {
+    if (bridged) {
+      const cur = await get(V6);
+      const split = await context.request.post(`${V6}/split`, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+      });
+      expect(split.status(), await split.text()).toBe(200);
+    }
+    for (const [path, orig] of [
+      [V6, orig6],
+      [V7, orig7],
+    ] as const) {
+      const cur = await get(path);
+      const put = await context.request.patch(path, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+        data: { content: JSON.parse(orig.content_json), plain_text: orig.plain_text },
+      });
+      expect(put.status(), await put.text()).toBe(200);
+    }
+    await context.close();
+  }
+});
+
+// The reverse: a split by another editor maps a dirty line on a 6-7 row onto
+// the new verse-6 row. The line drops the edit and its pin rather than keep
+// text typed against the bridge.
+test("a dirty reading line on a bridged row that another editor splits drops the edit and its pin", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const UST = "UST";
+  const V6 = `/api/verses/${BOOK}/7/6/${UST}`;
+  const V7 = `/api/verses/${BOOK}/7/7/${UST}`;
+  const get = async (path: string) => {
+    const res = await context.request.get(path);
+    expect(res.ok()).toBe(true);
+    return (await res.json()) as VerseRow & { verse_end: number | null };
+  };
+  const orig6 = await get(V6);
+  const orig7 = await get(V7);
+  expect(orig6.verse_end).toBeNull();
+  const stamp = Date.now();
+  const key6 = `verse:${BOOK}:7:6:${UST}`;
+  const peek = (k: string) =>
+    page.evaluate((kk) => (window as unknown as PinDebugWindow).__bePinDebug?.peek(kk)?.version, k);
+  const current = (k: string) =>
+    page.evaluate((kk) => (window as unknown as PinDebugWindow).__bePinDebug?.currentVersion(kk), k);
+  let bridged = false;
+
+  try {
+    const res = await context.request.post(`${V6}/bridge`, {
+      headers: { "x-csrf-token": csrf },
+      data: { start_version: orig6.version, next_version: orig7.version },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    bridged = true;
+    const bridgedVersion = ((await res.json()) as { verse: { version: number } }).verse.version;
+
+    const o = await openDual(page, { chapter: 7, verse: 6 });
+    const lineBox = o.dialog
+      .locator("div:has(> [contenteditable])")
+      .filter({ hasText: `${UST} · reading text` });
+    const line = lineBox.locator("[contenteditable]");
+    const save = lineBox.getByRole("button", { name: `Save ${UST}`, exact: true });
+    await expect(line).toContainText("former prophets");
+
+    await typeAtEnd(page, line, ` EDIT-${stamp}`);
+    expect(await peek(key6)).toBe(bridgedVersion);
+    await o.dialog.getByText(`${UST} words`, { exact: true }).first().click();
+    await expect(line).not.toBeFocused();
+    await expect(save).toBeEnabled();
+
+    const split = await context.request.post(`${V6}/split`, {
+      headers: { "x-csrf-token": csrf, "If-Match": String(bridgedVersion) },
+    });
+    expect(split.status(), await split.text()).toBe(200);
+    bridged = false;
+    await expect.poll(() => current(key6)).not.toBe(bridgedVersion);
+
+    // The new verse-6 row: clean, no edit, no pin.
+    await expect(line).not.toContainText(`EDIT-${stamp}`);
+    await expect(save).toBeDisabled();
+    await expect.poll(() => peek(key6)).toBeUndefined();
+    const after6 = await get(V6);
+    expect(after6.verse_end).toBeNull();
+    expect(after6.plain_text).not.toContain(`EDIT-${stamp}`);
+  } finally {
+    if (bridged) {
+      const cur = await get(V6);
+      const split = await context.request.post(`${V6}/split`, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+      });
+      expect(split.status(), await split.text()).toBe(200);
+    }
+    for (const [path, orig] of [
+      [V6, orig6],
+      [V7, orig7],
+    ] as const) {
+      const cur = await get(path);
+      const put = await context.request.patch(path, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+        data: { content: JSON.parse(orig.content_json), plain_text: orig.plain_text },
+      });
+      expect(put.status(), await put.text()).toBe(200);
+    }
+    await context.close();
+  }
+});
+
+// Both lines are keyed by row, and ULT and UST rows usually share one verse
+// number: the keys must still differ per side, or React keeps a stale line
+// (and its hold) around after an in-dialog verse move.
+test("in-dialog next-verse navigation shows exactly two reading lines, with no duplicate-key warning", async ({
+  browser,
+}) => {
+  test.setTimeout(60_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const page = await context.newPage();
+  const dupKeys: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error" && msg.text().includes("same key")) dupKeys.push(msg.text());
+  });
+
+  try {
+    const o = await openDual(page);
+    const lines = o.dialog.getByText(/· reading text/);
+    await expect(lines).toHaveCount(2);
+    await o.dialog.locator('[aria-label="next verse"]').locator("xpath=descendant-or-self::button").first().click();
+    await expect(o.dialog.getByText(`${BOOK} 7:3`, { exact: true })).toBeVisible();
+    await expect(lines).toHaveCount(2);
+    await expect(o.dialog.locator("[contenteditable]")).toHaveCount(2);
+    await o.dialog.locator('[aria-label="next verse"]').locator("xpath=descendant-or-self::button").first().click();
+    await expect(o.dialog.getByText(`${BOOK} 7:4`, { exact: true })).toBeVisible();
+    await expect(lines).toHaveCount(2);
+    await expect(o.dialog.locator("[contenteditable]")).toHaveCount(2);
+    expect(dupKeys).toEqual([]);
+  } finally {
     await context.close();
   }
 });
@@ -428,6 +713,8 @@ test("a no-op Save after another editor moved the verse queues nothing and leaks
     await expect(o.undo).toBeDisabled();
     await expect.poll(() => pinnedVersion(page)).toBeUndefined();
     expect(writes).toEqual([]);
+    // Clean now, so it shows the server's text, not the stale base (#1067 review).
+    await expect(o.line).toContainText(`[s19-noop-${stamp}]`);
   } finally {
     await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
     await context.close();

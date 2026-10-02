@@ -29,7 +29,11 @@ import {
   lockedBooksIn,
 } from "./bookLock.ts";
 import { broadcastChapter } from "./wsEvents.ts";
-import { buildIntroHints, type IntroHintCommentRow } from "./introHints.ts";
+import {
+  buildIntroHints,
+  mergeIntroHintsIntoOptions,
+  type IntroHintCommentRow,
+} from "./introHints.ts";
 
 export const pipelines = new Hono<{
   Bindings: Env;
@@ -1844,14 +1848,14 @@ pipelines.post("/start", requireEditor, async (c) => {
           WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
             AND verse = 0 AND row_kind IS NULL AND parent_id IS NULL
             AND kind = 'note' AND resolved_at IS NULL AND deleted_at IS NULL
-          ORDER BY chapter, created_at ASC`,
+          ORDER BY chapter, created_at ASC, id ASC`,
       )
         .bind(book, startChapter, endChapter)
         .all<IntroHintCommentRow>();
       const introHints = buildIntroHints(introCommentRows.results ?? []);
-      if (introHints.length > 0) {
-        mergedOptions = { ...(mergedOptions ?? {}), introHints };
-      }
+      // Size-guarded against the whole request, not just the intro notes —
+      // see mergeIntroHintsIntoOptions (issue #1072).
+      mergedOptions = mergeIntroHintsIntoOptions(mergedOptions, introHints).options;
     }
   }
 
