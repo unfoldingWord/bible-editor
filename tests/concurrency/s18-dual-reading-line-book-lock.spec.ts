@@ -22,8 +22,9 @@ import { csrfToken, newUserContext } from "./helpers";
 //   5. (#1050) A refused or cancelled save leaves the reading line's verse-base
 //      hold (#1060) in place while its edit is still on screen: saving the
 //      kept edit after the verse moved must 409, never overwrite the change.
-//      Once the edit goes away (Undo, typed back, an unfocused resync, gate
-//      Discard), the pin goes too, so a new edit saves with a 200. A refusal
+//      Once the edit goes away (Undo, typed back, gate Discard), the pin goes
+//      too, so a new edit saves with a 200. A server change never replaces
+//      the kept edit on screen, focused or not (#1067). A refusal
 //      also frees "save, mark done, next" (its in-flight guard used to stay
 //      set, so the button ignored clicks), and the "left N words unaligned"
 //      notice appears only for a save that is actually queued.
@@ -712,11 +713,21 @@ test("a cancelled unalign confirm keeps the pin while the edit is kept (a later 
     await expect(undo).toBeDisabled();
     await expect.poll(() => pinnedVersion(page)).toBeUndefined();
 
-    // 3. Replaced by a resync from the server while the line is not focused.
+    // 3. Not replaced by a server change while the line is not focused
+    //    (#1067): the edit and its pin stay on screen until Undo.
     await keepAnEdit();
+    const held = await pinnedVersion(page);
     await bumpVerse(page, context.request, csrf, `[s18c-${stamp}]`);
+    // The main column behind the dialog shows the move, so the line has seen it.
+    await expect(
+      page.locator(`[data-find-cell="${CHAPTER}-${VERSE}-${BV}"]`).first(),
+    ).toContainText(`[s18c-${stamp}]`);
+    await expect(line).toContainText("Sharezer sent");
+    await expect(line).not.toContainText(`[s18c-${stamp}]`);
+    await expect(undo).toBeEnabled();
+    expect(await pinnedVersion(page)).toBe(held);
+    await undo.click();
     await expect(line).toContainText(`[s18c-${stamp}]`);
-    await expect(undo).toBeDisabled();
     await expect.poll(() => pinnedVersion(page)).toBeUndefined();
     await newEditSaves(`C-${stamp}`);
 

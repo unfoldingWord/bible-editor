@@ -94,6 +94,8 @@ import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
+import { alignmentDraftKey, alignmentDraftKeyForOp, isAlignerPanelSaveOp } from "../sync/alignmentDraftSaveState";
+import { onAlignerSaveRefused } from "../sync/alignmentDrafts";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { UnsavedToasts } from "./UnsavedToasts";
 import { QuoteBuilderPopper } from "./QuoteBuilderPopper";
@@ -246,6 +248,10 @@ const TAB_FOR_ROW_KIND = {
 // a target has no threads yet.
 const EMPTY_COMMENT_THREADS: CommentThread[] = [];
 const EMPTY_COVERED_VERSES: number[] = [];
+// Shared identity for twlRowAlternatives' empty case (#896): `new Map()` on
+// every no-suggestions-loaded render broke WordsTable's `===` comparator on
+// every Shell render, not just when suggestions actually changed.
+const EMPTY_TWL_ROW_ALTERNATIVES: Map<string, string[]> = new Map();
 
 interface Props {
   book: string;
@@ -392,6 +398,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // row stay visible (floated to the verse) instead of vanishing, and lets a
   // chapter-intro comment always land on whichever tn row is the CURRENT
   // intro rather than the one it was created against.
+  // Keyed on a content signature (row ids + intro id), not `data` itself: `data`
+  // gets a new identity on every edit (verse text, drafts, lane checks, ...),
+  // which used to rebuild this Set/object — and everything indexComments derives
+  // from it — on every keystroke even though the row-id set rarely changes (#896).
+  const commentLiveRowsKey = data
+    ? [
+        ...data.tn.map((r) => rowKey("tn", r.id)),
+        ...data.tq.map((r) => rowKey("tq", r.id)),
+        ...data.twl.map((r) => rowKey("twl", r.id)),
+        "|",
+        data.tn.find((r) => r.verse === 0)?.id ?? "",
+      ].join(",")
+    : "";
   const commentLiveRows = useMemo<LiveRows | undefined>(() => {
     if (!data) return undefined;
     const rowIds = new Set<string>();
@@ -400,7 +419,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     for (const r of data.twl) rowIds.add(rowKey("twl", r.id));
     const introRow = data.tn.find((r) => r.verse === 0);
     return { rowIds, introRowId: introRow ? introRow.id : null };
-  }, [data]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [commentLiveRowsKey]);
   // A → B → A keeps A on screen, so the comments key never changes and A's
   // comments would not refetch, although the socket followed B meanwhile and
   // missed A's comment events. Bump the comments epoch when such a lock lifts
@@ -995,15 +1015,52 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Surface a toast when the outbox drops an op because the chapter was
   // locked. The user's edit was rejected by the server (409 chapter_locked)
   // and discarded — retrying would race the auto-apply step.
+  //
+  // #1071: the tab learns of locks from a 120 s poll, so a refusal is often
+  // the first it hears of one. Re-read the jobs now so the lanes lock and the
+  // aligner's gates stop offering Save. A burst of refusals shares one
+  // reload. An aligner save is not lost: the panel and its crash draft keep
+  // the drags (AlignmentPanel, alignmentDrafts). A verse-history restore also
+  // sends alignment_edit but is not aligner work, so it keeps the old toast.
+  const lockReloadRef = useRef<Promise<void> | null>(null);
   useEffect(
     () =>
-      onOutboxResult((_op, result) => {
+      onOutboxResult((op, result) => {
         if (result.kind === "locked") {
+          lockReloadRef.current ??= pipelineStore
+            .reload()
+            .catch(() => undefined)
+            .finally(() => {
+              lockReloadRef.current = null;
+            });
+          // An aligner save's toast waits for alignmentDrafts to say whether
+          // the drags were kept (onAlignerSaveRefused below).
+          if (isAlignerPanelSaveOp(op)) return;
           pushPipelineToast(
             "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }
+      }),
+    [pushPipelineToast],
+  );
+  // #1071: say "kept" only when a crash draft or an open panel actually holds
+  // the refused drags. Two queued saves of one verse refused together get
+  // one toast.
+  const lastRefusalToastRef = useRef<{ key: string; at: number } | null>(null);
+  useEffect(
+    () =>
+      onAlignerSaveRefused((op, kept) => {
+        const key = alignmentDraftKeyForOp(op);
+        const last = lastRefusalToastRef.current;
+        if (last && last.key === key && Date.now() - last.at < 3000) return;
+        lastRefusalToastRef.current = { key, at: Date.now() };
+        pushPipelineToast(
+          kept
+            ? "Alignment not saved — the AI run for this chapter is mid-flight. Your changes are kept in the aligner; save them after it finishes."
+            : "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+          "error",
+        );
       }),
     [pushPipelineToast],
   );
@@ -1403,6 +1460,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bookLocked ? "book" : lockForChapter(chapterNum, "verse") ? "chapter" : false,
     [lockForChapter, bookLocked],
   );
+  // Live lock state for the unalign confirm's deferred commit (#1071), same
+  // reason as bookLockedRef.
+  const alignerLockRef = useRef(alignerLock);
+  alignerLockRef.current = alignerLock;
   const chapterStaleRef = useRef(chapterStale);
   chapterStaleRef.current = chapterStale;
 
@@ -1699,41 +1760,55 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // highlight source. Notes and words are mutually exclusive; clicking one
   // clears the other. Words use `orig_words` (Hebrew source words) which the
   // same matcher handles directly for UHB and via \zaln-s for ULT/UST.
-  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses, activeQuoteVerse } =
-    useMemo(() => {
-      const empty = {
-        activeQuote: null as string | null,
-        activeOccurrence: null as number | null,
-        activeQuotePartialGroups: false,
-        activeQuoteCoveredVerses: EMPTY_COVERED_VERSES,
-        activeQuoteVerse: null as number | null,
+  const {
+    activeQuote,
+    activeOccurrence,
+    activeQuotePartialGroups,
+    activeQuoteCoveredVersesRaw,
+    activeQuoteVerse,
+  } = useMemo(() => {
+    const empty = {
+      activeQuote: null as string | null,
+      activeOccurrence: null as number | null,
+      activeQuotePartialGroups: false,
+      activeQuoteCoveredVersesRaw: EMPTY_COVERED_VERSES,
+      activeQuoteVerse: null as number | null,
+    };
+    if (!data) return empty;
+    if (activeNoteId) {
+      const r = data.tn.find((row) => row.id === activeNoteId);
+      if (!r) return empty;
+      const covered = noteCoveredVerses(r);
+      return {
+        activeQuote: r.quote ?? null,
+        activeOccurrence: r.occurrence ?? null,
+        activeQuotePartialGroups: covered.length > 1,
+        activeQuoteCoveredVersesRaw: covered,
+        // The note's own verse: its occurrence counts there (#957).
+        activeQuoteVerse: r.verse,
       };
-      if (!data) return empty;
-      if (activeNoteId) {
-        const r = data.tn.find((row) => row.id === activeNoteId);
-        if (!r) return empty;
-        const covered = noteCoveredVerses(r);
-        return {
-          activeQuote: r.quote ?? null,
-          activeOccurrence: r.occurrence ?? null,
-          activeQuotePartialGroups: covered.length > 1,
-          activeQuoteCoveredVerses: covered,
-          // The note's own verse: its occurrence counts there (#957).
-          activeQuoteVerse: r.verse,
-        };
-      }
-      if (activeWordId) {
-        const r = data.twl.find((row) => row.id === activeWordId);
-        return {
-          activeQuote: r?.orig_words ?? null,
-          activeOccurrence: r?.occurrence ?? null,
-          activeQuotePartialGroups: false,
-          activeQuoteCoveredVerses: r ? [r.verse] : EMPTY_COVERED_VERSES,
-          activeQuoteVerse: r?.verse ?? null,
-        };
-      }
-      return empty;
-    }, [activeNoteId, activeWordId, data]);
+    }
+    if (activeWordId) {
+      const r = data.twl.find((row) => row.id === activeWordId);
+      return {
+        activeQuote: r?.orig_words ?? null,
+        activeOccurrence: r?.occurrence ?? null,
+        activeQuotePartialGroups: false,
+        activeQuoteCoveredVersesRaw: r ? [r.verse] : EMPTY_COVERED_VERSES,
+        activeQuoteVerse: r?.verse ?? null,
+      };
+    }
+    return empty;
+  }, [activeNoteId, activeWordId, data]);
+  // ScriptureColumn compares activeNoteCoveredVerses by identity (#896): gate on
+  // the joined verse list so a data change that doesn't move the active note/word
+  // keeps the same array reference instead of forcing a full re-render.
+  const activeQuoteCoveredVersesKey = activeQuoteCoveredVersesRaw.join(",");
+  const activeQuoteCoveredVerses = useMemo(
+    () => (activeQuoteCoveredVersesKey ? activeQuoteCoveredVersesRaw : EMPTY_COVERED_VERSES),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeQuoteCoveredVersesKey],
+  );
 
   // Reorder "stoplight": while a note is dragged (or for ~3s after an arrow
   // move) ResourceColumn reports the moved note's candidate neighbours; we
@@ -1769,7 +1844,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
     [],
   );
-  const reorderHighlight = useMemo<ReorderHighlight | null>(() => {
+  const reorderHighlightRaw = useMemo<ReorderHighlight | null>(() => {
     if (!data || !reorderPreview) return null;
     // Notes AND word links: the ids in a preview come from whichever table the
     // user is reordering. A TWL row's source quote lives in `orig_words` rather
@@ -1801,6 +1876,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       nextVerse: next?.verse ?? null,
     };
   }, [data, reorderPreview]);
+  // ScriptureColumn compares reorderHighlight by identity (#896): `data` changing
+  // elsewhere (any unrelated edit) rebuilt this object every time even when the
+  // moved/prev/next quotes were unchanged. Gate on the field values themselves —
+  // including the verse fields (#957's bridged-verse disambiguation), since a
+  // reorder that swaps a same-quote/occurrence neighbour from one bridge verse
+  // to another must still produce a new object for rowHighlightsFor to pick up.
+  const reorderHighlightKey = reorderHighlightRaw
+    ? [
+        reorderHighlightRaw.movedQuote,
+        reorderHighlightRaw.movedOccurrence,
+        reorderHighlightRaw.movedVerse,
+        reorderHighlightRaw.prevQuote,
+        reorderHighlightRaw.prevOccurrence,
+        reorderHighlightRaw.prevVerse,
+        reorderHighlightRaw.nextQuote,
+        reorderHighlightRaw.nextOccurrence,
+        reorderHighlightRaw.nextVerse,
+      ].join("|")
+    : "";
+  const reorderHighlight = useMemo<ReorderHighlight | null>(
+    () => reorderHighlightRaw,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [reorderHighlightKey],
+  );
 
   // Quote-builder session: when active, clicking Hebrew words in the UHB
   // row of the active verse toggles them into selectedKeys; "Use selection"
@@ -2138,8 +2237,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // matcher's suggestions back onto the row by source-key surfaces it. Values are
   // short article ids (e.g. "other/lover").
   const twlRowAlternatives = useMemo<Map<string, string[]>>(() => {
+    if (!data || verseTwlSuggestions.length === 0) return EMPTY_TWL_ROW_ALTERNATIVES;
     const map = new Map<string, string[]>();
-    if (!data || verseTwlSuggestions.length === 0) return map;
     // Each group carries its own verse — resolve and match per verse so that in
     // a bridge every verse's committed rows get alternatives from their OWN
     // verse's matcher, not only the leading/active one. Row ids are unique
@@ -2870,6 +2969,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // the save must not be queued (e.g. a book lock landed while the confirm
     // was open, #1046). The caller shows its own message.
     refuseCommit?: () => boolean,
+    // See outbox.ts's OutboxOp.alignmentDraftKey (#1071): the aligner panel's
+    // crash-draft key, which on a range row is not the PATCH's verse_start.
+    draftKey?: string,
   ): boolean => {
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
@@ -2905,7 +3007,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               bibleVersion,
               expectedVersion,
               { content, plain_text: plainText, alignment_intent: "confirmed_text_edit" },
-              { draftGeneration, alignmentDraftGeneration },
+              { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey },
             );
             onConfirmedApply?.();
           },
@@ -2929,10 +3031,38 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bibleVersion,
       expectedVersion,
       { content, plain_text: plainText, alignment_intent: intent },
-      { draftGeneration, alignmentDraftGeneration },
+      { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey },
     );
     return true;
   }, [book, pushPipelineToast]);
+
+  // The aligner's "Words will be unaligned" confirm. A lock can land while it
+  // is open (#1071), and committing then resets the panel's baseline and
+  // clears its crash draft for a save that is refused (chapter lock) or
+  // silently dropped (book lock). So "Save anyway" re-checks the live lock
+  // and refuses out loud: nothing is queued, the panel stays dirty with its
+  // crash draft, and a gate's pending nav (afterCommit) does not run.
+  // Mirrors the dual reading line's refuseCommit (#1046).
+  const confirmAlignerUnalign = useCallback(
+    (chapterNum: number, ref: string, lostWords: string[], commit: () => void) =>
+      setPendingAlignmentLoss({
+        ref,
+        lostWords,
+        commit: () => {
+          const lock = alignerLockRef.current(chapterNum);
+          if (lock) {
+            saveDoneGuardRef.current.cancel();
+            pushPipelineToast(
+              `${alignerLockReason(lock)}, so the alignment was not saved. Your changes are kept in the aligner; save them once the lock lifts.`,
+              "error",
+            );
+            return;
+          }
+          commit();
+        },
+      }),
+    [pushPipelineToast],
+  );
 
   // Compute the alignment panel's props from the current chapter cache.
   // Memoized so identity stays stable when the chapter hasn't changed under
@@ -2984,6 +3114,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             undefined,
             undefined,
             draftGeneration,
+            undefined,
+            alignmentDraftKey(book, alignerTarget.chapter, alignerTarget.verse, alignerTarget.bibleVersion),
           );
         }
         // Optimistically fold the new alignment into the local chapter cache so
@@ -2998,11 +3130,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }
       },
       onConfirmUnalign: (lostWords, commit) =>
-        setPendingAlignmentLoss({
-          ref: `${book} ${alignerTarget.chapter}:${targetVerse?.verse ?? alignerTarget.verse} ${alignerTarget.bibleVersion}`,
+        confirmAlignerUnalign(
+          alignerTarget.chapter,
+          `${book} ${alignerTarget.chapter}:${targetVerse?.verse ?? alignerTarget.verse} ${alignerTarget.bibleVersion}`,
           lostWords,
           commit,
-        }),
+        ),
       onCancel: () => {
         setPanelMode("resources");
       },
@@ -3041,6 +3174,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalVerse,
     enqueueVerseSafely,
     alignerLock,
+    confirmAlignerUnalign,
   ]);
 
   // Props for the side-by-side popup: ULT + UST slices against one shared
@@ -3102,6 +3236,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           undefined,
           undefined,
           draftGeneration,
+          undefined,
+          alignmentDraftKey(book, dualTarget.chapter, dualTarget.verse, bibleVersion),
         );
         // Optimistic local update so content-derived UI (the broken-alignment
         // link) refreshes immediately — same as the single-panel aligner.
@@ -3111,11 +3247,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       };
     const confirmUnalign = (bibleVersion: string, row: VerseDto | null) =>
       (lostWords: string[], commit: () => void) =>
-        setPendingAlignmentLoss({
-          ref: `${book} ${dualTarget.chapter}:${row?.verse ?? dualTarget.verse} ${bibleVersion}`,
+        confirmAlignerUnalign(
+          dualTarget.chapter,
+          `${book} ${dualTarget.chapter}:${row?.verse ?? dualTarget.verse} ${bibleVersion}`,
           lostWords,
           commit,
-        });
+        );
     const left: PanelSlot = {
       bibleVersion: "ULT",
       verse: ult.targetVerse,
@@ -3158,7 +3295,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // that), so only the two AlignmentPanels' own save/restore disable.
       locked: alignerLock(dualTarget.chapter),
     };
-  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely, alignerLock]);
+  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely, alignerLock, confirmAlignerUnalign]);
 
   // Prev/next verse for the dual aligner's titlebar arrows, within the current
   // chapter's verse list (excluding the intro tile). Null at the ends.
