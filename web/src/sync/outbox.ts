@@ -157,6 +157,11 @@ export interface OutboxOp {
   // generation sequences, and only ever apply to one of text_edit/find_replace/
   // section_edit (draftGeneration) or alignment_edit (this one) saves.
   alignmentDraftGeneration?: string;
+  // The aligner panel's crash-draft key for this save (#1071). Differs from
+  // the target on a range row opened inside the row (UST 6-9 on v7: target
+  // verse 6, draft key v7), so a refused save restores the draft the panel
+  // actually reads. Absent on ops queued before this field existed.
+  alignmentDraftKey?: string;
 }
 
 type Subscriber = (ops: OutboxOp[]) => void;
@@ -329,7 +334,7 @@ export const outbox = {
     bibleVersion: string,
     expectedVersion: number,
     patch: { content: unknown; plain_text?: string | null; alignment_intent?: AlignmentIntent },
-    opts: { draftGeneration?: string; alignmentDraftGeneration?: string } = {},
+    opts: { draftGeneration?: string; alignmentDraftGeneration?: string; alignmentDraftKey?: string } = {},
   ): Promise<OutboxOp> {
     if (isReadOnly()) {
       return noopOp(
@@ -350,6 +355,7 @@ export const outbox = {
       status: "pending",
       ...(opts.draftGeneration ? { draftGeneration: opts.draftGeneration } : {}),
       ...(opts.alignmentDraftGeneration ? { alignmentDraftGeneration: opts.alignmentDraftGeneration } : {}),
+      ...(opts.alignmentDraftKey ? { alignmentDraftKey: opts.alignmentDraftKey } : {}),
     };
     // #1060: remember it was queued here, before any drain can see it land.
     noteOwnVerseOp(op.id);

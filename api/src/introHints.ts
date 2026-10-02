@@ -33,9 +33,11 @@ const HINT_MARKER = /^ai:\s*/i;
 // per-run cap on how many intro-hint comments can exist, so bound the total
 // forwarded here instead — well under that limit, with room left for the
 // rest of the request body (book/chapters/the existing options.hints[]).
-// Hints beyond the budget are dropped, not truncated mid-sentence; earliest
-// (by chapter, then created_at — the row order buildIntroHints receives)
-// wins, so the drop is deterministic.
+// A hint that would push past the budget is skipped (and logged), not
+// truncated mid-sentence; later hints that still fit are kept — issue #1072:
+// stopping at the first oversized hint silently dropped every later
+// chapter's hints. Earliest (by chapter, then created_at, then id — the row
+// order buildIntroHints receives) wins, so the drop is deterministic.
 //
 // Measured in UTF-8 BYTES, not JS string length: a follow-up review finding
 // on this same budget — a Hebrew/Greek excerpt quoted inside a hint (every
@@ -80,9 +82,40 @@ export function buildIntroHints(rows: IntroHintCommentRow[]): IntroHint[] {
     const note = stripIntroHintMarker(r.body);
     if (note === null) continue;
     const noteBytes = textEncoder.encode(note).length;
-    if (totalBytes + noteBytes > MAX_TOTAL_HINT_BYTES) break;
+    if (totalBytes + noteBytes > MAX_TOTAL_HINT_BYTES) {
+      console.warn(
+        `[introHints] skipped comment ${r.id} (chapter ${r.chapter}, ${noteBytes} bytes): over the ${MAX_TOTAL_HINT_BYTES}-byte intro-hint budget`,
+      );
+      continue;
+    }
     hints.push({ chapter: r.chapter, note });
     totalBytes += noteBytes;
   }
   return hints;
+}
+
+// Issue #1072: the per-hint budget above counts only intro note bytes, not
+// the rest of the request — the existing verse options.hints can already be
+// ~25 KiB, and bp-assistant rejects a body over ~32 KiB (413s the whole
+// notes job). So measure the serialized merged options and, if adding the
+// intro hints would cross the limit, leave them off: the verse hints are
+// the job's actual work, intro hints are optional guidance. 2 KiB below
+// 32 KiB is reserved for dispatchNext's wrapper (pipelineType, book,
+// chapters, username, sessionKey) around `options`.
+export const MAX_OPTIONS_BYTES = 32 * 1024 - 2048;
+
+export function mergeIntroHintsIntoOptions(
+  options: Record<string, unknown> | undefined,
+  introHints: IntroHint[],
+): { options: Record<string, unknown> | undefined; dropped: boolean } {
+  if (introHints.length === 0) return { options, dropped: false };
+  const merged = { ...(options ?? {}), introHints };
+  const bytes = textEncoder.encode(JSON.stringify(merged)).length;
+  if (bytes > MAX_OPTIONS_BYTES) {
+    console.warn(
+      `[introHints] dropped ${introHints.length} intro hint(s): merged options would be ${bytes} bytes, over the ${MAX_OPTIONS_BYTES}-byte request budget`,
+    );
+    return { options, dropped: true };
+  }
+  return { options: merged, dropped: false };
 }

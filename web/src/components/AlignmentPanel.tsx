@@ -55,8 +55,15 @@ import {
   type HoverCtx,
 } from "../lib/alignmentHover";
 import type { TwlRow, VerseDto } from "../sync/api";
-import { alignmentDrafts, alignmentDraftKey, mintAlignmentDraftGeneration } from "../sync/alignmentDrafts";
-import { isVersionOnlyRebase, lostAlignedWords } from "../lib/alignmentDelta";
+import {
+  alignmentDrafts,
+  alignmentDraftKey,
+  mintAlignmentDraftGeneration,
+  noteRefusalKeptInPanel,
+} from "../sync/alignmentDrafts";
+import { onOutboxResult } from "../sync/outbox";
+import { refusedSaveStillCurrent } from "../sync/alignmentDraftSaveState";
+import { isVersionOnlyRebase, lostAlignedWords, sameVerseContent } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
 import {
@@ -287,6 +294,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     const lastSyncRef = useRef<{ key: string; content: unknown; sourceContent: unknown } | null>(
       null,
     );
+    // The crash-draft read the last full reset started; see guard (3) in the
+    // reset effect below.
+    const hydrationTokenRef = useRef<object | null>(null);
     // The generation (see alignmentDrafts.ts) of the most recently PERSISTED
     // crash-draft for the CURRENT dirty session, or undefined if nothing has
     // been persisted yet (e.g. Save fires before the 400ms debounce below
@@ -296,6 +306,49 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // Save (#508). Reset to undefined whenever the panel resyncs to a
     // genuinely different target/content or the user explicitly discards.
     const lastDraftGenerationRef = useRef<string | undefined>(undefined);
+    // #1071: the panel's last committed save (its op's draft generation, the
+    // baseline from before it, and the verse it was built on), until the
+    // outbox reports on it. A save refused as chapter_locked (a lock this tab
+    // had not polled yet) is dropped from the outbox, so put the old baseline
+    // back: the drags read as unsaved again, the gates guard them and the
+    // persist effect keeps them in the crash draft. The op's generation is
+    // unique to this commit, and refusedSaveStillCurrent skips the restore
+    // when a foreign change has replaced the verse since.
+    const pendingSaveRef = useRef<{
+      generation: string;
+      baseline: AlignmentState | null;
+      version: number;
+      savedContent: unknown;
+      baseContent: unknown;
+    } | null>(null);
+    const verseRef = useRef(verse);
+    verseRef.current = verse;
+    useEffect(
+      () =>
+        onOutboxResult((op, result) => {
+          const pending = pendingSaveRef.current;
+          if (!pending || op.alignmentDraftGeneration !== pending.generation) return;
+          if (result.kind === "ok") pendingSaveRef.current = null;
+          else if (result.kind === "locked") {
+            pendingSaveRef.current = null;
+            if (refusedSaveStillCurrent(pending, verseRef.current)) {
+              setInitial(pending.baseline);
+              noteRefusalKeptInPanel(pending.generation);
+            }
+          }
+        }),
+      [],
+    );
+    // False once the panel really unmounts (React StrictMode's dev replay sets
+    // it back to true), so a crash-draft read resolving after unmount does
+    // nothing, the way the old effect-cleanup flag behaved.
+    const mountedRef = useRef(false);
+    useEffect(() => {
+      mountedRef.current = true;
+      return () => {
+        mountedRef.current = false;
+      };
+    }, []);
     const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
     const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
@@ -414,6 +467,19 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       lastDraftGenerationRef.current = undefined;
       lastSyncRef.current =
         verse != null ? { key: targetKey, content: verse.content, sourceContent: currentSourceContent } : null;
+      hydrationTokenRef.current = null;
+      // #1071: a full reset to anything but the pending save's own optimistic
+      // content (a foreign change, or a refetch back to the server's copy)
+      // means the panel no longer shows that save, so a later refusal must
+      // not put its old baseline back (a phantom-dirty panel's persist write
+      // would then overwrite the refusal's crash draft). That draft carries
+      // the drags and is restored when the verse's aligner next opens.
+      if (
+        pendingSaveRef.current &&
+        !sameVerseContent(verse?.content, pendingSaveRef.current.savedContent)
+      ) {
+        pendingSaveRef.current = null;
+      }
 
       if (!computedInitial || !verse) return;
       // Attempt to restore a crash-saved alignment draft (Fix C — a browser
@@ -428,15 +494,19 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       // content change per the isRebase gate above, so that's the correct
       // call here); (2) the user must not have started editing in the
       // async-read window (stateRef still === computedInitial) so a restore
-      // never overwrites a fresh drag; (3) the `cancelled` flag drops a
-      // resolution whose verse changed again. `initial` stays computedInitial
-      // so the restored state reads as dirty (state !== initial) and can be
-      // saved or reset.
+      // never overwrites a fresh drag; (3) the token drops a resolution whose
+      // verse changed again. `initial` stays computedInitial so the restored
+      // state reads as dirty (state !== initial) and can be saved or reset.
+      // (3) is a token that only the next FULL reset replaces, not an effect
+      // cleanup (#1071): React StrictMode replays this effect on mount, and
+      // the replay takes the rebase path above, so a cleanup flag cancelled
+      // every mount's read and a crash draft was never restored in dev.
       const draftKey = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
       const baseVersion = verse.version;
-      let cancelled = false;
+      const token = {};
+      hydrationTokenRef.current = token;
       void alignmentDrafts.get(draftKey).then((rec) => {
-        if (cancelled || !rec) return;
+        if (!mountedRef.current || hydrationTokenRef.current !== token || !rec) return;
         if (rec.expectedVersion !== baseVersion) {
           void alignmentDrafts.clear(draftKey);
           return;
@@ -449,9 +519,6 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         setState(parseAlignment(vo, sourceVerseObjects));
         setRestored(true);
       });
-      return () => {
-        cancelled = true;
-      };
       // `initial` excluded deliberately: it's only ever set by this same effect
       // (setInitial above), and it's read here only to detect an in-progress
       // drag (stateRef.current === initial) at the moment this effect fires.
@@ -865,6 +932,15 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         // an up-to-date client — see lastDraftGenerationRef's doc comment and
         // alignmentDrafts.ts's onOutboxResult listener (#508).
         const draftGeneration = lastDraftGenerationRef.current ?? mintAlignmentDraftGeneration();
+        pendingSaveRef.current = {
+          generation: draftGeneration,
+          // A save still waiting on the outbox keeps the older baseline: if
+          // both are refused, the panel goes back to what the server holds.
+          baseline: pendingSaveRef.current ? pendingSaveRef.current.baseline : initial,
+          version: verse.version,
+          savedContent: newContent,
+          baseContent: verse.content,
+        };
         onSave(newContent, plain, verse.version, draftGeneration);
         // Optimistic: the freshly-saved state is now the baseline. When the
         // chapter cache eventually round-trips the new content, computedInitial
@@ -890,7 +966,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       }
       commit();
       return true;
-    }, [state, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
+    }, [state, initial, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
 
     // Same two maps hebrewHighlight/onEnglishHover use, in the same roles:
     // posOwners (display-derived) says which CARD(s) own the position, and
