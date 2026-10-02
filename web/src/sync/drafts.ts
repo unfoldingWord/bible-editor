@@ -182,7 +182,8 @@ export function rowKey(rowKind: RowKind, book: string, id: string): string {
 }
 
 // For subscribers that only need to know which drafts exist, not their live
-// content — see dedupeByKeys.
+// content — SyncStatusBar, not UnsavedToasts (it also needs each draft's
+// current generation; see dedupeByKeys's comment).
 export const subscribeDirtyDrafts = dedupeByKeys<DraftRecord>(
   (fn) => snapshot.subscribe(fn),
 );
