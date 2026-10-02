@@ -2872,11 +2872,22 @@ function utf8Base64(s) {
     JSON.stringify(list()) === JSON.stringify("GHIJKLMNOP".split("")),
     `cap keeps the 10 newest renders, oldest first; got ${JSON.stringify(list())}`,
   );
-  // C2: pushing the same bytes again does not add a duplicate entry.
+  // C2: pushing the same bytes again does not add a duplicate entry, and moves
+  // that sha to the newest position so the cap cannot evict it next.
   record("P", 2000, 0);
   assert(
     JSON.stringify(list()) === JSON.stringify("GHIJKLMNOP".split("")),
     `a repeated render sha is not appended twice; got ${JSON.stringify(list())}`,
+  );
+  record("G", 2100, 0);
+  assert(
+    JSON.stringify(list()) === JSON.stringify("HIJKLMNOPG".split("")),
+    `a repeated older sha moves to the newest position; got ${JSON.stringify(list())}`,
+  );
+  record("Q", 2200, 0);
+  assert(
+    JSON.stringify(list()) === JSON.stringify("IJKLMNOPGQ".split("")),
+    `the cap then evicts the oldest other render, not the repeated one; got ${JSON.stringify(list())}`,
   );
 }
 
