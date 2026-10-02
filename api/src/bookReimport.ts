@@ -7711,11 +7711,22 @@ async function applyVerseRows(
         (row) => row.chapter === a.v.chapter && row.verse === a.v.verse && row.adopted,
       );
       if (!mc || mc.action !== "adopt_conflict") continue;
+      // Issue #1081: for a split anchor, `beforeContentJson` is D1's WHOLE
+      // bridged row, while `a.v.contentJson` is only master's anchor piece.
+      // Compare the bridge with everything this adoption stores over its range:
+      // the post-canonize anchor plus the recreated rows step 7s inserts, joined
+      // the way joinVerseContentJson joins them (a space between pieces, which
+      // both visible axes ignore). A null join (an off-shape piece) is passed as
+      // null, which the classifier reads as every axis changed: fail-closed.
+      const split = anchorByKey.get(structureKey(a.v.chapter, a.v.verse));
+      const after = split?.kind === "split"
+        ? joinVerseContentJson([a.v.contentJson, ...split.recreated.map((m) => m.contentJson)])
+        : a.v.contentJson;
       const refined = refineAdoptConflictForVisibleChange(
         "adopt_conflict",
         a.merge.reason,
         a.beforeContentJson,
-        a.v.contentJson,
+        after,
       );
       mc.action = refined.action;
       mc.reason = refined.reason;

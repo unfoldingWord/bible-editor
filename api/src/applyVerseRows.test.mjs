@@ -2368,7 +2368,55 @@ console.log("\n[#949 follow-up (2026-10-02 backlog review): on a LOCKED book, T2
   const c = conflicts728(sqlite);
   eq(c.map((x) => [x.verse, x.action, x.overwritten_version]), [[1, "adopt_conflict", 4]],
     "the anchor's own app edit still gets a recovery pointer, same as T3 — the lock skips the AI-lineage gate, not the review flag");
+  eq(c[0].reason.startsWith("both_changed_wording"), true,
+    `#1081: the split really changed the words, so the reason names wording (got ${c[0].reason})`);
   assertClean728(counts, "T2c");
+}
+
+// #1081: step 6a's visible-change refine compared D1's WHOLE bridged row with
+// only master's anchor piece, so a split whose words were identical still read
+// as "wording changed" and alerted the editor. These two cases share T2c's
+// locked fixture; the D1 app edit already holds the words master splits.
+async function runLockedSplit1081(masterVerseTwoText) {
+  const { env, sqlite } = freshEnv();
+  const boundary = seedExportedBridge(sqlite);
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 7)`).run(BOOK);
+  insertLog728(sqlite, { verse: 1, action: "update", prev: 3, next: 4, payload: { content: JSON.parse(contentJson("alpha beta")) }, createdAt: 400 });
+  sqlite.prepare(`UPDATE verses SET content_json = ?, plain_text = ?, version = 4 WHERE book = ? AND chapter = ? AND verse = 1 AND bible_version = ?`)
+    .run(contentJson("alpha beta"), "alpha beta", BOOK, CH, VERSION);
+  // Master splits the bridge and adds only a paragraph marker.
+  const verseTwo = {
+    chapter: CH, verse: 2, verseEnd: null, plainText: masterVerseTwoText,
+    contentJson: JSON.stringify({ verseObjects: [{ type: "text", text: masterVerseTwoText }, { type: "paragraph", tag: "p", nextChar: "\n" }] }),
+  };
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(CH, 1, "alpha"), verseTwo], null,
+    { confirmedAt: 200, editId: boundary, lineage: AI_ONLY_LINEAGE_728 }, false,
+  );
+  return { sqlite, counts };
+}
+
+console.log("\n[#1081 T2d: locked book, master splits an exported bridge with the SAME words (markers only): logged, not alerted]");
+{
+  const { sqlite, counts } = await runLockedSplit1081("beta");
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end]), [[1, null], [2, null]], "the split lands");
+  eq(counts.structure_adopted, 1, "counted structure_adopted");
+  eq(conflicts728(sqlite).map((x) => [x.verse, x.action, x.reason, x.overwritten_version]),
+    [[1, "adopt_no_visible_change", "both_changed_no_visible", 4]],
+    "the anchor's audit row says no visible change, and still points at the overwritten version");
+  eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult"), [], "no editor-facing alert");
+  assertClean728(counts, "T2d");
+}
+
+console.log("\n[#1081 T2e: same locked split, but a later piece's wording differs: still alerts as wording-changed]");
+{
+  const { sqlite, counts } = await runLockedSplit1081("gamma");
+  const c = conflicts728(sqlite);
+  eq(c.map((x) => [x.verse, x.action]), [[1, "adopt_conflict"]], "the anchor stays adopt_conflict");
+  eq(c[0].reason.startsWith("both_changed_wording"), true, `the reason names wording (got ${c[0].reason})`);
+  eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult").map((r) => [r.verse, r.action]), [[1, "adopt_conflict"]],
+    "the editor is alerted");
+  assertClean728(counts, "T2e");
 }
 
 console.log("\n[#728 T3: an exported bridge a human ALSO edited in the app since, un-bridged on Door43: structure adopted, content flagged adopt_conflict]");
