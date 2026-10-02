@@ -16,8 +16,17 @@
 
 import { openDB, type IDBPDatabase } from "idb";
 import { isReadOnly } from "./api";
-import { onOutboxResult, type VerseTarget } from "./outbox";
-import { isAlignmentSaveOp } from "./alignmentDraftSaveState";
+import { onOutboxResult, type OutboxOp } from "./outbox";
+import {
+  alignmentDraftKey,
+  alignmentDraftKeyForOp,
+  isAlignerPanelSaveOp,
+  isAlignmentSaveOp,
+  refusalMayReplaceDraft,
+  refusedOpOrder,
+  type AlignmentDraftRow,
+  type RefusedOpOrder,
+} from "./alignmentDraftSaveState";
 
 const DB_NAME = "bible-editor-alignment-drafts";
 const DB_VERSION = 1;
@@ -44,6 +53,12 @@ export interface AlignmentDraftRecord {
   // instead of being wiped for the ~400ms until its own persist cycle re-runs
   // (#508). Absent on records persisted before this field existed.
   generation?: string;
+  // Set only on a draft restoreRefused wrote: the refused op it came from
+  // (#1071). The panel's own persist writes leave it off.
+  refusedFrom?: RefusedOpOrder;
+  // The row the draft was made on (#1074). Hydration restores it only onto
+  // that same row; see alignmentDraftFitsRow. Absent on older records.
+  row?: AlignmentDraftRow;
 }
 
 let dbp: Promise<IDBPDatabase> | null = null;
@@ -60,15 +75,35 @@ function db() {
   return dbp;
 }
 
-// Same key shape the outbox uses for a verse target, so the onOutboxResult
-// listener below can clear the matching draft off a landed save.
-export function alignmentDraftKey(
-  book: string,
-  chapter: number,
-  verse: number,
-  bibleVersion: string,
-): string {
-  return `${book}:${chapter}:${verse}:${bibleVersion}`;
+// The panel's draft key. Defined in alignmentDraftSaveState.ts (no IndexedDB
+// there, so it is unit-testable) and re-exported for existing callers.
+export { alignmentDraftKey };
+
+// #1071: a refused aligner save, once this module knows whether anything kept
+// its drags: a crash draft holds them (written here, or one already there),
+// or an open panel put its pre-save baseline back (noteRefusalKeptInPanel).
+// Shell words its toast on this, so it never says "kept" when nothing was.
+// `heldInDraft`: a crash draft at the key holds the drags. False with `kept`
+// true means only the open panel's memory holds them (#1073: Shell must not
+// then reset that panel by rolling the cache back).
+type RefusalListener = (op: OutboxOp, kept: boolean, heldInDraft: boolean) => void;
+const refusalListeners = new Set<RefusalListener>();
+export function onAlignerSaveRefused(fn: RefusalListener): () => void {
+  refusalListeners.add(fn);
+  return () => refusalListeners.delete(fn);
+}
+const keptInPanel = new Set<string>();
+// Called by AlignmentPanel from inside the same outbox-result dispatch, so it
+// lands before the draft write below resolves.
+export function noteRefusalKeptInPanel(generation: string): void {
+  keptInPanel.add(generation);
+}
+
+// #1077: the newest aligner save per draft key that this tab saw commit, so
+// an open panel never re-reads an older refused save's draft over it.
+const committedAlignerSaves = new Map<string, RefusedOpOrder>();
+export function newestCommittedAlignerSave(key: string): RefusedOpOrder | undefined {
+  return committedAlignerSaves.get(key);
 }
 
 let generationSeq = 0;
@@ -89,7 +124,7 @@ export const alignmentDrafts = {
   // Returns the generation minted for this write (even in read-only mode,
   // where nothing is actually persisted) so callers that want generation-safe
   // cleanup later (AlignmentPanel's save path) always have a value to carry.
-  async set(key: string, content: unknown, expectedVersion: number): Promise<string> {
+  async set(key: string, content: unknown, expectedVersion: number, row: AlignmentDraftRow): Promise<string> {
     const generation = mintAlignmentDraftGeneration();
     if (isReadOnly()) return generation;
     const rec: AlignmentDraftRecord = {
@@ -98,6 +133,7 @@ export const alignmentDrafts = {
       expectedVersion,
       updatedAt: Date.now(),
       generation,
+      row,
     };
     await (await db()).put(STORE, rec);
     return generation;
@@ -128,6 +164,43 @@ export const alignmentDrafts = {
     return true;
   },
 
+  // #1071: put a refused save's content back as the crash draft, when
+  // refusalMayReplaceDraft allows it (no draft, or one an earlier refusal
+  // wrote). The commit's own clear of the pre-save draft cannot land after
+  // this: its readwrite transaction on this store was created before the op
+  // was even dispatched, and IndexedDB runs overlapping readwrite
+  // transactions in creation order.
+  async restoreRefused(
+    key: string,
+    content: unknown,
+    expectedVersion: number,
+    from: RefusedOpOrder,
+    row: AlignmentDraftRow | undefined,
+  ): Promise<boolean> {
+    if (isReadOnly()) return false;
+    const idb = await db();
+    const tx = idb.transaction(STORE, "readwrite");
+    const existing = (await tx.store.get(key)) as AlignmentDraftRecord | undefined;
+    const write = refusalMayReplaceDraft(existing, from);
+    if (write) {
+      const rec: AlignmentDraftRecord = {
+        key,
+        content,
+        expectedVersion,
+        updatedAt: Date.now(),
+        generation: mintAlignmentDraftGeneration(),
+        refusedFrom: from,
+        ...(row ? { row } : {}),
+      };
+      await tx.store.put(rec);
+    }
+    await tx.done;
+    // True whenever a draft at `key` now holds these drags: the one just
+    // written, or one refusalMayReplaceDraft kept because it already holds
+    // them (dragging after Save, or a later save's refusal).
+    return write || existing !== undefined;
+  },
+
   // Mirrors drafts.ts's shape; `updatedAt` + `list` are the seam a future
   // "you have unsaved alignment from an earlier session" recovery surface would
   // hang on (the way UnsavedToasts/SyncStatusBar consume drafts.ts). No caller
@@ -144,11 +217,40 @@ export const alignmentDrafts = {
 // an unconditional clear only for a legacy op enqueued before generation
 // tracking existed) so a draft written by dragging that continued AFTER Save
 // — a newer generation this op never captured — survives (#508).
+//
+// A save the server refused as chapter_locked (an AI run the tab had not
+// polled yet, #1071) is deleted from the outbox, and the panel already
+// cleared its crash draft when it committed. Put the saved alignment back as
+// the draft so the drags come back when the verse's aligner reopens. Runs
+// here rather than in the panel because the gate's Save usually navigates
+// away, unmounting it, before the refusal arrives. Only the aligner's own
+// saves: a refused verse-history restore is not aligner work.
 onOutboxResult((op, result) => {
-  if (result.kind !== "ok") return;
+  if (result.kind !== "ok" && result.kind !== "locked") return;
   if (!isAlignmentSaveOp(op)) return;
-  const target = op.target as VerseTarget;
-  const key = alignmentDraftKey(target.book, target.chapter, target.verse, target.bibleVersion);
+  // The panel's own key, not the row's verse_start (a range row opened on an
+  // inner verse, #1071).
+  const key = alignmentDraftKeyForOp(op);
+  if (result.kind === "locked") {
+    if (isAlignerPanelSaveOp(op)) {
+      const generation = op.alignmentDraftGeneration as string;
+      const settle = (heldInDraft: boolean) => {
+        const kept = keptInPanel.delete(generation) || heldInDraft;
+        for (const l of refusalListeners) l(op, kept, heldInDraft);
+      };
+      alignmentDrafts
+        .restoreRefused(key, op.patch.content, op.expectedVersion, refusedOpOrder(op), op.alignmentDraftRow)
+        .then(settle, () => settle(false));
+    }
+    return;
+  }
+  if (isAlignerPanelSaveOp(op)) {
+    const order = refusedOpOrder(op);
+    const prev = committedAlignerSaves.get(key);
+    if (!prev || order.queuedAt > prev.queuedAt || (order.queuedAt === prev.queuedAt && order.seq > prev.seq)) {
+      committedAlignerSaves.set(key, order);
+    }
+  }
   if (op.alignmentDraftGeneration) {
     void alignmentDrafts.clearGeneration(key, op.alignmentDraftGeneration);
   } else {
