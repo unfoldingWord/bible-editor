@@ -702,13 +702,54 @@ console.log("\n[locked book: Door43 master is authoritative]");
   eq(
     computeVerseMerge({ ...lockedIn, ours: base, humanEditedSinceExport: false, theirsForAlignment: "{not json" }).action,
     "keep_alignment_refused",
-    "locked: a split-bridge anchor keeps the ordinary structure-aware path (#949)",
+    "locked: a split-bridge anchor with unparseable whole-range master content is refused",
   );
   eq(
     computeVerseMerge({ ...lockedIn, theirs: "{not json" }).action,
     "keep_alignment_refused",
     "locked: unparseable master is never adopted",
   );
+
+  // Issue #949 follow-up (2026-10-02 backlog review): the split-anchor branch
+  // used to skip step 3b entirely and fall through to #787's keep_ai_master
+  // check, which fires whenever ours != base and the lineage is AI-only —
+  // exactly the common shape on a locked book (an app edit sits on the anchor
+  // since the export, and nothing on a locked book advances the lineage
+  // walk). That silently kept D1's bridge and reverted master's split on the
+  // next export, even though #949 already made planStructure plan the split.
+  const splitAnchor = {
+    base: text("Original"),
+    ours: text("Edited by a human after the export"),
+    theirs: text("Master's post-split anchor piece"),
+    theirsForAlignment: text("Master's whole pre-split range"),
+    humanEditedSinceExport: true,
+    masterAuthoritative: true,
+    masterMayHoldHumanEdit: false,
+  };
+  eq(
+    computeVerseMerge(splitAnchor).action,
+    "adopt_conflict",
+    "locked split anchor: master still wins despite an AI-only lineage — #787's keep_ai_master must not apply here",
+  );
+  eq(computeVerseMerge(splitAnchor).adopt, true, "…and it is adopted, not just flagged");
+
+  // The alignment guard this branch keeps (unlike the plain single-verse case
+  // above, which skips alignment by design): a locked book's split still fails
+  // closed on a genuine word loss measured against master's WHOLE pre-split
+  // range, not just the anchor's own piece.
+  const anchorAligned = content([zaln("H1", [w("Again")]), { type: "text", text: " " }, zaln("H2", [w("call")])]);
+  const wholeRangeFlattened = text("Again call");
+  const shrinkingSplit = {
+    base: anchorAligned,
+    ours: anchorAligned,
+    theirs: text("Again call"),
+    theirsForAlignment: wholeRangeFlattened,
+    humanEditedSinceExport: false,
+    masterAuthoritative: true,
+  };
+  const shrunk = computeVerseMerge(shrinkingSplit);
+  eq(shrunk.action, "keep_alignment_refused", "locked split anchor: a real alignment loss over the whole range is still refused");
+  eq(shrunk.reason, "alignment_shrink", "…reason names the shrink");
 }
 
 if (failed > 0) {

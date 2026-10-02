@@ -77,8 +77,16 @@ console.log("\n[issue #949: a locked book is authoritative for structure too, li
   eq(summary(planStructure([row(1, 2, 3)], [mv(1), mv(2)], CUT_AI, below, true)),
     { ...EMPTY, skip: ["5:2"], adoptions: [["split", 1, null, [], [2]]] },
     "locked: a provably non-human split still adopts — bookLocked skips the human question entirely");
+  // NOT a test of "bookLocked skips the lock check when master never moved":
+  // that case cannot be constructed at the planStructure level at all. By the
+  // time a component reaches step 2, its D1 side is already confirmed
+  // non-local (step 1) and its signature differs from master's CURRENT
+  // signature (the match above would have skipped it otherwise) — so master
+  // necessarily moved since the export, locked or not. This only confirms the
+  // ordinary same-signature skip fires before any lock reasoning, same as the
+  // unlocked case already covers at the top of this file.
   eq(summary(planStructure([row(1, 2)], [mv(1, 2)], CUT_AI, new Map(), true)), EMPTY,
-    "locked: a component master never touched can't even reach the lock check (same signature skips above) — D1 is kept");
+    "locked: an agreeing component is a no-op regardless of the lock (never reaches step 1 or 2)");
   eq(summary(planStructure([row(1, 2, 3)], [mv(1), mv(2), mv(3)], CUT, new Map([[structureKey(5, 1), { id: 150, createdAt: 300 }]]), true)),
     { ...EMPTY, skip: ["5:1", "5:2"], keptLocal: [[[1], [1, 2]]] },
     "locked: a LOCAL (unpublished) D1 split still wins over master — bookLocked only overrides the human check at step 2, never step 1");
