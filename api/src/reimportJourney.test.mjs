@@ -1133,7 +1133,7 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
     eq(counts.merge_conflicts, 1, "…one merge_conflicts row (the adopting write)");
     eq(counts.merge_master_wins, 1, "…surfaced as a master-wins flag for review (#706)");
-    eq(row.review_reason.includes("was merged over your app-side change"), true, "…with the pre-existing wording");
+    eq(row.review_reason.includes("was merged over a different change saved in the app"), true, "…with the merge_conflict wording (#1090)");
     // #684: HAS_HUMAN is the pre-#684 shape (shas, no identity), so the message
     // is byte-identical to what it was before this shipped.
     eq(row.review_reason.includes("Door43 edits to this file:"), false, "…and, with no identity measured, names nobody");
@@ -1158,7 +1158,7 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
     eq(row.review_kind, "merge_conflict", "…flagged the same way");
     eq(
-      row.review_reason.startsWith("A Door43 edit to this row's response was merged over your app-side change."),
+      row.review_reason.startsWith("A Door43 edit to this row's response was merged over a different change saved in the app."),
       true,
       "…the outcome still leads (the chip clamps to two lines)",
     );
