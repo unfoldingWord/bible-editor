@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PinnedLexHost } from "./components/PinnedLexBox";
 import { Alert, Box, Button, CircularProgress, Link, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
@@ -22,7 +22,10 @@ import {
 } from "./sync/api";
 import { setPipelineUser } from "./sync/pipelineStore";
 import { parseHashString, stripCommentParam, type Location } from "./lib/parseHash";
-import { AdminPanel } from "./components/AdminPanel";
+
+const AdminPanel = lazy(() =>
+  import("./components/AdminPanel").then((m) => ({ default: m.AdminPanel })),
+);
 
 // OBA (Obadiah) is the shortest book in the canon — one chapter, 21 verses.
 // Loads faster than ZEC on a cold cache and keeps the default landing page
@@ -463,7 +466,17 @@ export function App() {
         </Stack>
       );
     }
-    return <AdminPanel onClose={backToApp} />;
+    return (
+      <Suspense
+        fallback={
+          <Stack alignItems="center" justifyContent="center" sx={{ height: "100vh" }} spacing={2}>
+            <CircularProgress />
+          </Stack>
+        }
+      >
+        <AdminPanel onClose={backToApp} />
+      </Suspense>
+    );
   }
 
   return (

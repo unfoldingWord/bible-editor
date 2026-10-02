@@ -19,8 +19,8 @@ import {
 } from "@mui/material";
 import DownloadIcon from "@mui/icons-material/Download";
 import type { VerseDto } from "../sync/api";
-import { buildUsfmFromVerses } from "../lib/exportUsfm";
 import { fetchBookVerses } from "../lib/bookVerses";
+import { isChunkLoadError } from "./AppErrorBoundary";
 
 interface Props {
   book: string;
@@ -69,7 +69,10 @@ export function ExportUsfmButton({ book, chapter, enabledVersions, chapterVerses
     close();
     setBusy(true);
     try {
-      const verses = await versesFor(scope, version);
+      const [verses, { buildUsfmFromVerses }] = await Promise.all([
+        versesFor(scope, version),
+        import("../lib/exportUsfm"),
+      ]);
       if (verses.length === 0) {
         setError(`No ${version} text to export for ${scope === "chapter" ? `${book} ${chapter}` : book}.`);
         return;
@@ -82,6 +85,12 @@ export function ExportUsfmButton({ book, chapter, enabledVersions, chapterVerses
           : `${book}-${version}${suffix}.usfm`;
       download(name, usfm);
     } catch (e) {
+      // The USFM builder is a lazy chunk; a tab left open across a deploy
+      // asks for a chunk name that no longer exists.
+      if (isChunkLoadError(e)) {
+        setError("USFM export failed: the app was updated since this tab opened. Reload the page, then export again.");
+        return;
+      }
       setError(`USFM export failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBusy(false);
