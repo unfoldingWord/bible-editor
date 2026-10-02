@@ -1440,7 +1440,14 @@ export const RECORD_PUSHED_RENDER_SQL = `UPDATE book_resource_syncs
                               (SELECT value FROM
                                  (SELECT k, value FROM
                                     (SELECT key AS k, value
-                                       FROM json_each(COALESCE(unconfirmed_renders_json, '[]'))
+                                       -- A NULL list (first push since 0075) is
+                                       -- seeded with the prior pushed renders.
+                                       FROM json_each(COALESCE(unconfirmed_renders_json,
+                                              CASE WHEN prev_pushed_blob_sha IS NOT NULL
+                                                        AND prev_pushed_blob_sha IS NOT pushed_blob_sha
+                                                   THEN json_array(prev_pushed_blob_sha, pushed_blob_sha)
+                                                   WHEN pushed_blob_sha IS NOT NULL THEN json_array(pushed_blob_sha)
+                                                   ELSE '[]' END))
                                       WHERE value IS NOT ?3
                                      UNION ALL SELECT 2147483647 AS k, ?3 AS value)
                                   ORDER BY k DESC LIMIT 10)
@@ -1502,6 +1509,10 @@ export function masterIsOurLastPublish(
 //
 // #1029: the unconfirmed-render list as read from book_resource_syncs before
 // tonight's push. Unparseable or non-array JSON reads as no list (fails open).
+// A NULL list (a pair whose first push since migration 0075 has not happened
+// yet) is seeded from the last two pushed renders, so a book already lagging
+// at deploy time is covered; the suppression is still gated on master's head
+// being our export merge.
 export function readUnconfirmedRenders(
   prior: {
     unconfirmed_renders_json: string | null;
@@ -1509,7 +1520,11 @@ export function readUnconfirmedRenders(
     pushed_blob_sha: string | null;
   } | null,
 ): string[] | null {
-  if (!prior?.unconfirmed_renders_json) return null;
+  if (!prior) return null;
+  if (prior.unconfirmed_renders_json == null) {
+    const seed = [prior.prev_pushed_blob_sha, prior.pushed_blob_sha].filter((x): x is string => typeof x === "string");
+    return seed.length ? [...new Set(seed)] : null;
+  }
   try {
     const parsed: unknown = JSON.parse(prior.unconfirmed_renders_json);
     return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : null;
