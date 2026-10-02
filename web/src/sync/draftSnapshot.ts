@@ -1,3 +1,34 @@
+// A keystroke replaces a draft's record (new payload/updatedAt/generation)
+// without ever adding or removing a key. A whole-list subscriber that shows
+// only *which* drafts exist — never their live content, including the
+// generation a save is in flight for — gains nothing from re-rendering on
+// every one of those replacements. Wrap `subscribe` with this to skip
+// callbacks whose key set is unchanged from the last one delivered.
+//
+// SyncStatusBar's count/jump-menu is exactly that: key + the (static) meta
+// text. UnsavedToasts is NOT a fit despite the similar "which drafts" framing
+// — it also matches a draft's CURRENT `generation` against in-flight outbox
+// ops (verseDraftHasActiveSave) to decide whether a save is already covering
+// this draft, and a generation changes on every keystroke. Deduping by key
+// alone would freeze it at whichever generation was current when the key set
+// last changed, so a later keystroke's generation could go uncompared against
+// its own save (toast wrongly hidden) or a stale generation could fail to
+// match the save it actually triggered (toast wrongly stuck showing
+// "unsaved"). See #901's review (2026-10-02) for both failure modes.
+export function dedupeByKeys<T extends { key: string }>(
+  subscribe: (fn: (all: T[]) => void) => () => void,
+): (fn: (all: T[]) => void) => () => void {
+  return (fn) => {
+    let lastKeys: string | undefined;
+    return subscribe((all) => {
+      const keys = all.map((r) => r.key).sort().join("\u0000");
+      if (keys === lastKeys) return;
+      lastKeys = keys;
+      fn(all);
+    });
+  };
+}
+
 // One hydration read shared by every editor. Subsequent commits refresh only
 // their key; an older in-flight read must never replace a newer notification.
 export function createDraftSnapshot<T extends { key: string; updatedAt: number }>(

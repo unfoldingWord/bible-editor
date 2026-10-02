@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createDraftSnapshot } from "./draftSnapshot.ts";
+import { createDraftSnapshot, dedupeByKeys } from "./draftSnapshot.ts";
 
 const deferred = () => {
   let resolve;
@@ -194,6 +194,37 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
   );
   assert.deepEqual(seenA, [], "a must still stay silent after an unrelated key's successful refresh");
 }
+// dedupeByKeys: a whole-list "presence" subscriber (SyncStatusBar,
+// UnsavedToasts) must not be notified when a keystroke replaces a record's
+// payload/updatedAt without changing which keys exist, but must still see
+// an actual add/remove, and must not care about member order.
+{
+  let fn;
+  const fakeSubscribe = (f) => { fn = f; return () => { fn = undefined; }; };
+  const wrapped = dedupeByKeys(fakeSubscribe);
+  const calls = [];
+  const unsubscribe = wrapped((all) => calls.push(all));
+  assert.equal(calls.length, 0, "wrapping does not itself call the underlying subscribe");
+
+  fn([record("a", "first", 1)]);
+  assert.equal(calls.length, 1, "first notification always passes through");
+
+  fn([record("a", "second keystroke", 2)]);
+  assert.equal(calls.length, 1, "same key set (even reordered by updatedAt) is suppressed");
+
+  fn([record("a", "third", 3), record("b", "new draft", 4)]);
+  assert.equal(calls.length, 2, "a key being added must still notify");
+
+  fn([record("b", "b typing", 5), record("a", "a typing", 6)]);
+  assert.equal(calls.length, 2, "same key set in a different order is still suppressed");
+
+  fn([record("b", "only b left", 5)]);
+  assert.equal(calls.length, 3, "a key being removed must still notify");
+
+  unsubscribe();
+  assert.equal(fn, undefined, "unsubscribing tears down the underlying subscription");
+}
+
 // #806: another tab's typing must be distinguishable from this tab's own
 // commits, so a mounted, clean editor can ignore it instead of latching a
 // half-typed snapshot. The initial (mount) callback is never "remote"; the
@@ -242,4 +273,4 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
   await turn();
   assert.deepEqual(seen.at(-1), { text: "tab A typing", remote: true }, "remote after a failed local stays remote");
 }
-console.log("draftSnapshot: hydration, typing, save/clear ordering, read failures and targeted notifications passed");
+console.log("draftSnapshot: hydration, typing, save/clear ordering, read failures, targeted notifications, key-set dedup and remote-tab flagging passed");
