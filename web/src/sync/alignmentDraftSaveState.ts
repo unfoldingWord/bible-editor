@@ -93,3 +93,34 @@ export function refusedSaveStillCurrent(
     sameVerseContent(verse.content, pending.baseContent)
   );
 }
+
+// #1074: the row a crash draft was made on — its start verse and bridge end
+// (null for a single verse). A bridge or split by another editor moves the
+// panel's verse onto a different row while its draft key stays the same.
+export interface AlignmentDraftRow {
+  verse: number;
+  verseEnd: number | null;
+}
+
+export function alignmentDraftRow(row: { verse: number; verse_end?: number | null }): AlignmentDraftRow {
+  const end = row.verse_end ?? null;
+  return { verse: row.verse, verseEnd: end === row.verse ? null : end };
+}
+
+// #1074: may the panel open on verse `verseNum` restore this crash draft onto
+// the row it now resolves to? Only onto the version the draft branched from
+// AND the same row. The version alone is not enough: a bridged row's version
+// (its start verse's + 1) can equal the version of the verse whose draft it
+// would replace, and restoring v7's draft onto a 6-7 row would let Save
+// delete verse 6. A draft written before the row was recorded is trusted only
+// on the single-verse row of its own verse.
+export function alignmentDraftFitsRow(
+  draft: { expectedVersion: number; row?: AlignmentDraftRow },
+  current: { version: number; verse: number; verse_end?: number | null },
+  verseNum: number,
+): boolean {
+  if (draft.expectedVersion !== current.version) return false;
+  const row = alignmentDraftRow(current);
+  if (!draft.row) return row.verse === verseNum && row.verseEnd === null;
+  return draft.row.verse === row.verse && (draft.row.verseEnd ?? null) === row.verseEnd;
+}

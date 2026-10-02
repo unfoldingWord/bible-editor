@@ -431,8 +431,12 @@ export function SideBySideAligner({
       // (useState(computedInitial)) instead of carrying the previous verse's
       // alignment across a dualNavTo until the passive reset effect runs — the
       // same stale-state race the single-panel aligner had. bibleVersion is
-      // fixed per side (ULT left / UST right), so verseNum alone keys it.
-      key={`${slot.bibleVersion}:${verseNum}`}
+      // fixed per side (ULT left / UST right). Also keyed by the ROW (start
+      // verse + bridge end), as the reading line is (#1067): a bridge or split
+      // by another editor moves the slot onto a different row, and the panel
+      // must start fresh on it rather than carry drags made on the old one
+      // (#1074).
+      key={`${slot.bibleVersion}:${chapter}:${verseNum}:${slot.verse?.verse}-${slot.verse?.verse_end}`}
       ref={slot.panelRef}
       book={book}
       chapter={chapter}
