@@ -4,6 +4,7 @@ import {
   Typography,
   CircularProgress,
   Alert,
+  Backdrop,
   Dialog,
   DialogActions,
   DialogContent,
@@ -4830,7 +4831,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         </DialogActions>
       </Dialog>
       {dualAlignerProps && (
-        <Suspense fallback={null}>
+        <Suspense
+          // #939 review (A1): before lazy-loading, SideBySideAligner's Dialog
+          // mounted synchronously and blocked the single AlignmentPanel behind
+          // it immediately. A null fallback instead leaves that panel visible
+          // and interactive while the chunk downloads — drags made in that
+          // window, followed by a same-verse save in the dual aligner once it
+          // mounts, hit AlignmentPanel's sync-effect full reset (AlignmentPanel
+          // .tsx) and are silently dropped. A blocking Backdrop closes the
+          // window the same way the eager Dialog used to: nothing in the
+          // single panel is reachable until the real dual-aligner Dialog
+          // replaces it.
+          fallback={
+            <Backdrop open sx={{ color: "#fff", zIndex: (theme) => theme.zIndex.modal + 1 }}>
+              <CircularProgress color="inherit" />
+            </Backdrop>
+          }
+        >
           <SideBySideAligner
             open
             onClose={requestCloseDual}
