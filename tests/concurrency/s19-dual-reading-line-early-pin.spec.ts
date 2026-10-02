@@ -338,6 +338,76 @@ test("a reading line with unsaved text that lost focus keeps it when another edi
   }
 });
 
+// #1075: a kept edit that is saved and 409s hands its text to the queued op,
+// and the line goes clean still showing it. When that op is discarded the
+// text never reached the server, so the line has to show the server's text
+// again. It used to keep the discarded text as if saved (Save and Undo off),
+// and its next edit pinned the old version and 409'd again.
+test("after a 409'd reading-line save is discarded, the line shows the server's text and a new edit saves with a 200", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const original = await serverVerse(context.request);
+  const stamp = Date.now();
+  const tag = `[s19-discard-${stamp}]`;
+  const route = `**${versePath(V72)}`;
+
+  try {
+    const o = await openDual(page);
+    await typeAtEnd(page, o.line, ` EDIT-${stamp}`);
+    await o.dialog.getByText(`${BV} words`, { exact: true }).first().click();
+    await expect(o.line).not.toBeFocused();
+    const bumped = await bumpVerse(page, context.request, csrf, tag);
+    await expect(o.line).toContainText(`EDIT-${stamp}`);
+
+    // The real 409, minus the server's current row: "resolve" can then only
+    // offer to discard the edit (the unresolvable-conflict dialog), which is
+    // the discard this case is about.
+    await page.route(route, async (r) => {
+      if (r.request().method() !== "PATCH") return r.fallback();
+      const res = await r.fetch();
+      const body = (await res.json()) as Record<string, unknown>;
+      delete body.current;
+      await r.fulfill({ response: res, json: body });
+    });
+    const patched = nextVersePatch(page);
+    await o.save.click();
+    expect((await patched).status()).toBe(409);
+    await page.unroute(route);
+    await expect.poll(() => verseOpStatuses(page)).toEqual(["conflict"]);
+
+    await page.getByText("resolve 1 conflict").click();
+    const discard = page.getByRole("dialog").filter({ hasText: "unresolvable conflict" });
+    await discard.getByRole("button", { name: "discard", exact: true }).click();
+    await expect.poll(() => verseOpStatuses(page)).toEqual([]);
+
+    // The line shows the server's text, clean.
+    await expect(o.line).toContainText(tag);
+    await expect(o.line).not.toContainText(`EDIT-${stamp}`);
+    await expect(o.save).toBeDisabled();
+    await expect(o.undo).toBeDisabled();
+
+    // A new edit goes out against the server's version and lands.
+    await typeAtEnd(page, o.line, ` AGAIN-${stamp}`);
+    const again = nextVersePatch(page);
+    await o.save.click();
+    const res = await again;
+    expect(res.request().headers()["if-match"]).toBe(String(bumped));
+    expect(res.status()).toBe(200);
+    const after = (await serverVerse(context.request)).plain_text;
+    expect(after).toContain(tag);
+    expect(after).toContain(`AGAIN-${stamp}`);
+    expect(after).not.toContain(`EDIT-${stamp}`);
+  } finally {
+    await page.unroute(route).catch(() => {});
+    await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
+    await context.close();
+  }
+});
+
 // #1067 review: the line is not tied to one row. A bridge (or split) by
 // another editor maps the slot onto a different row; an edit kept across that
 // would be saved onto the new row with that row's fresh version (200), and the
@@ -395,23 +465,11 @@ test("a dirty reading line whose verse is bridged into another row by another ed
     const bridgedVersion = ((await res.json()) as { verse: { version: number } }).verse.version;
     await expect.poll(() => current(key(6))).toBe(bridgedVersion);
 
-    // Whatever the line shows now, a Save (if it offers one) must not put the
-    // v7-only text over the bridged row.
-    if (await save.isEnabled()) {
-      // Dropping verse 6's aligned words asks first; answer it if it comes.
-      const confirm = page.getByRole("dialog").filter({ hasText: "will be unaligned" });
-      let sent = false;
-      const patched = page
-        .waitForResponse((r) => r.request().method() === "PATCH" && r.url().includes(V6), { timeout: 15_000 })
-        .then((r) => {
-          sent = true;
-          return r;
-        });
-      await save.click();
-      await expect.poll(async () => sent || (await confirm.isVisible()), { timeout: 10_000 }).toBe(true);
-      if (!sent) await confirm.getByRole("button", { name: "Save anyway" }).click();
-      await patched;
-    }
+    // #1075: the line moved onto the bridged row and dropped the edit, and
+    // says so, naming the verse the edit was typed on. Nothing is left to save.
+    await expect(page.getByText(/ZEC 7:7 UST.*unsaved reading text.*dropped/)).toBeVisible();
+    await expect(line).toContainText("feasted");
+    await expect(save).toBeDisabled();
     const after6 = await get(V6);
     expect(after6.verse_end).toBe(7);
     expect(after6.plain_text).toContain("feasted");
@@ -504,7 +562,9 @@ test("a dirty reading line on a bridged row that another editor splits drops the
     bridged = false;
     await expect.poll(() => current(key6)).not.toBe(bridgedVersion);
 
-    // The new verse-6 row: clean, no edit, no pin.
+    // The new verse-6 row: clean, no edit, no pin, and a notice naming the
+    // bridged row the edit was typed on (#1075).
+    await expect(page.getByText(/ZEC 7:6-7 UST.*unsaved reading text.*dropped/)).toBeVisible();
     await expect(line).not.toContainText(`EDIT-${stamp}`);
     await expect(save).toBeDisabled();
     await expect.poll(() => peek(key6)).toBeUndefined();
@@ -634,6 +694,8 @@ async function panelDragsUnderBridge(browser: Browser, collide: boolean) {
 
     // The panel shows the bridged row with nothing to save: the v7 draft is
     // dropped rather than restored onto 6-7, and no UST Save is offered.
+    // The drop is announced, naming the verse the drags were made on (#1075).
+    await expect(page.getByText(/ZEC 7:7 UST.*unsaved alignment changes.*dropped/)).toBeVisible();
     await expect(ustLine).toContainText("feasted");
     await expect(o.dialog.getByText(`${UST} words`, { exact: true }).first()).toBeVisible();
     await expect.poll(() => alignmentDraft(page, draftKey)).toBeUndefined();
