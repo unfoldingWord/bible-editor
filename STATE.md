@@ -662,6 +662,12 @@ Highlights that bite repeatedly:
   it re-reads the verse cutoff after the walk. Its TSV fetch stays unpinned on purpose: a `ref`-pinned TSV fetch
   comes back completeness-verified, which widens the prune's covered chapters, and that path's TSV cutoff is the
   pre-walk read anyway.
+- **The dual aligner's reading line decides whether to resync from its dirty state, not from focus.** Until #1067
+  the unfocused resync compared the box against text `onInput` keeps equal to the box, so any verse change replaced
+  a dirty line that had merely lost focus (clicked into the alignment panel), marked it clean and released its pin.
+  Two specs (s18 "cancelled unalign confirm" step 3, s19 pin-release step 3) asserted that overwrite as a way an
+  edit "goes away". A dirty line now keeps its text and its pin on any server change, so Save is a 409 and a merge
+  prompt; the only resync that cleans a dirty line is a verse that moved onto the line's own text.
 
 ## Stop conditions / goals
 
