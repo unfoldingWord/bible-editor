@@ -469,10 +469,39 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   //     a markers-only difference to adopt_no_visible_change (no alert).
   //     Benjamin, 2026-09-24: a markers-only overwrite is worth seeing, not
   //     alerting; a data-loss overwrite is worth alerting.
-  // No ancestor (step 2), unparseable master content, and the anchor of a
-  // bridge master split (theirsForAlignment set: its whole-range alignment
-  // check belongs to the structure path, issue #949) keep today's handling.
-  if (input.masterAuthoritative === true && theirsKey !== null && input.theirsForAlignment === undefined) {
+  // No ancestor (step 2) and unparseable master content keep today's handling.
+  // The anchor of a bridge master split (theirsForAlignment set) is also
+  // master-authoritative, but unlike the plain single-verse case below it does
+  // NOT skip the alignment guard: `theirs` here is only the anchor's post-split
+  // piece, while `theirsForAlignment` is master's whole pre-split range, and a
+  // real word loss across that wider range is exactly what issue #949's
+  // follow-up review found this branch skipping entirely (a locked book's
+  // split anchor landed via #787's keep_ai_master / a plain alignment refusal
+  // before ever reaching here, silently keeping D1's bridge and reverting
+  // master's split on the next export). Fail closed on that loss, same as step
+  // 4; otherwise fall through to the same adopt / adopt_conflict split below.
+  if (input.masterAuthoritative === true && theirsKey !== null) {
+    if (input.theirsForAlignment !== undefined) {
+      const alignmentTheirsKey = stableKey(input.theirsForAlignment);
+      if (oursKey === null || alignmentTheirsKey === null) {
+        return { action: "keep_alignment_refused", adopt: false, conflict: true, reason: "unparseable" };
+      }
+      const delta = analyzeAlignmentDelta(JSON.parse(ours), JSON.parse(input.theirsForAlignment));
+      const lostWords = delta.unexpectedLosses.filter((loss) => loss.reason === "lost").map((loss) => loss.text);
+      if (delta.afterAligned < delta.beforeAligned || lostWords.length > 0) {
+        return {
+          action: "keep_alignment_refused",
+          adopt: false,
+          conflict: true,
+          reason: "alignment_shrink",
+          alignment: {
+            beforeAligned: delta.beforeAligned,
+            afterAligned: delta.afterAligned,
+            lostWords: lostWords.slice(0, 10),
+          },
+        };
+      }
+    }
     // "D1 is the sync's own copy of master" is deliberately NOT a clean-adopt
     // signal: the source-attr reconcile also writes `dcs_reimport` / sync_merge
     // rows over a human's wording, so no stored field separates the two, and

@@ -93,3 +93,76 @@ export function refusedSaveStillCurrent(
     sameVerseContent(verse.content, pending.baseContent)
   );
 }
+
+// #1074: the row a crash draft was made on — its start verse and bridge end
+// (null for a single verse). A bridge or split by another editor moves the
+// panel's verse onto a different row while its draft key stays the same.
+export interface AlignmentDraftRow {
+  verse: number;
+  verseEnd: number | null;
+}
+
+export function alignmentDraftRow(row: { verse: number; verse_end?: number | null }): AlignmentDraftRow {
+  const end = row.verse_end ?? null;
+  return { verse: row.verse, verseEnd: end === row.verse ? null : end };
+}
+
+// #1074: the row part of an aligner panel's React key, so a bridge or split
+// under the panel remounts it. A single verse keys the same whether its
+// verse_end is null, missing or equal to its start.
+export function alignmentPanelRowKey(row: { verse: number; verse_end?: number | null } | null | undefined): string {
+  if (!row) return "none";
+  const r = alignmentDraftRow(row);
+  return `${r.verse}-${r.verseEnd ?? r.verse}`;
+}
+
+// #1074: may the panel open on verse `verseNum` restore this crash draft onto
+// the row it now resolves to? Only onto the version the draft branched from
+// AND the same row. The version alone is not enough: a bridged row's version
+// (its start verse's + 1) can equal the version of the verse whose draft it
+// would replace, and restoring v7's draft onto a 6-7 row would let Save
+// delete verse 6. A draft written before the row was recorded is trusted only
+// on the single-verse row of its own verse.
+export function alignmentDraftFitsRow(
+  draft: { expectedVersion: number; row?: AlignmentDraftRow },
+  current: { version: number; verse: number; verse_end?: number | null },
+  verseNum: number,
+): boolean {
+  if (draft.expectedVersion !== current.version) return false;
+  const row = alignmentDraftRow(current);
+  if (!draft.row) return row.verse === verseNum && row.verseEnd === null;
+  return draft.row.verse === row.verse && (draft.row.verseEnd ?? null) === row.verseEnd;
+}
+
+function opIsAfter(a: RefusedOpOrder, b: RefusedOpOrder): boolean {
+  return a.queuedAt > b.queuedAt || (a.queuedAt === b.queuedAt && a.seq > b.seq);
+}
+
+// #1077: an aligner panel already open on the verse read its crash draft once,
+// when it mounted or last fully reset. A refusal that lands later (Saved at
+// the gate and reopened before the 409; or A saved, then B refused, after A's
+// row reset the panel and dropped its record of B) writes the draft after
+// that read, so the open panel would not show the drags until reopened. May
+// it re-read the draft now? Only when nothing newer can be overwritten:
+// - the panel is clean (no drags of its own since its last reset or save);
+// - it has no pending save of its own (that save's result decides instead);
+// - the draft at the key is this refusal's (another refusal or a persist
+//   write may have replaced it);
+// - no other aligner save for the key, still queued or already committed,
+//   is newer than the refused one. Two saves queued for one verse with the
+//   older refused after the newer committed: the newer holds the drags the
+//   translator last saved, so the older one's content must not come back.
+// The caller still checks the draft fits the row the panel shows
+// (alignmentDraftFitsRow).
+export function refusedDraftMayRehydrate(args: {
+  panelClean: boolean;
+  panelHasPendingSave: boolean;
+  refused: RefusedOpOrder;
+  draftFrom: RefusedOpOrder | undefined;
+  otherSaves: ReadonlyArray<RefusedOpOrder>;
+}): boolean {
+  const { panelClean, panelHasPendingSave, refused, draftFrom, otherSaves } = args;
+  if (!panelClean || panelHasPendingSave || !draftFrom) return false;
+  if (draftFrom.queuedAt !== refused.queuedAt || draftFrom.seq !== refused.seq) return false;
+  return !otherSaves.some((o) => opIsAfter(o, refused));
+}

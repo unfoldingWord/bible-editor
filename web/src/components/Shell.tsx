@@ -97,8 +97,15 @@ import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
-import { onOutboxResult } from "../sync/outbox";
-import { alignmentDraftKey, alignmentDraftKeyForOp, isAlignerPanelSaveOp } from "../sync/alignmentDraftSaveState";
+import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
+import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
+import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
+import {
+  alignmentDraftKey,
+  alignmentDraftKeyForOp,
+  alignmentDraftRow,
+  isAlignerPanelSaveOp,
+} from "../sync/alignmentDraftSaveState";
 import { onAlignerSaveRefused } from "../sync/alignmentDrafts";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { UnsavedToasts } from "./UnsavedToasts";
@@ -1019,6 +1026,113 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // the drags (AlignmentPanel, alignmentDrafts). A verse-history restore also
   // sends alignment_edit but is not aligner work, so it keeps the old toast.
   const lockReloadRef = useRef<Promise<void> | null>(null);
+  // #1073: the refused save's content was folded into the chapter and book
+  // caches optimistically, and the drop leaves it there, reading as saved
+  // (the aligner's Reset goes back to it, a reopened verse shows it). Re-read
+  // the chapter and put the server's row back. Read through refs: the GET
+  // resolves after renders this closure did not see.
+  const bookHookRef = useRef(bookHook);
+  bookHookRef.current = bookHook;
+  const applyLocalVerseRef = useRef(applyLocalVerse);
+  applyLocalVerseRef.current = applyLocalVerse;
+  const applyRemoteVerseRef = useRef(applyRemoteVerse);
+  applyRemoteVerseRef.current = applyRemoteVerse;
+  // One chapter GET per refusal burst: a find/replace across a locked chapter
+  // is refused verse by verse, and every refusal reads the same chapter.
+  const rollbackFetchRef = useRef(new Map<string, Promise<ChapterPayload>>());
+  const liveBookRef = useRef(book);
+  liveBookRef.current = book;
+  // False once this Shell unmounts (React StrictMode's dev replay sets it
+  // back to true).
+  const rollbackMountedRef = useRef(false);
+  useEffect(() => {
+    rollbackMountedRef.current = true;
+    return () => {
+      rollbackMountedRef.current = false;
+    };
+  }, []);
+  const rollBackRefusedVerse = useCallback(async (op: OutboxOp) => {
+    const t = op.target;
+    if (t.kind !== "verse") return;
+    try {
+      const key = outboxTargetKey(t);
+      const queuedForTarget = async () =>
+        siblingStillDraining(
+          (await outbox.list()).map((o) => ({ id: o.id, status: o.status, targetKey: outboxTargetKey(o.target) })),
+          op.id,
+          key,
+        );
+      if (await queuedForTarget()) return;
+      // The rows the refusal left in each cache. A row that is not still these
+      // when the GET lands (the verse was saved or edited again meanwhile) is
+      // left alone, so the server's older row never overwrites newer work.
+      const chapterRow = () => {
+        const cur = dataRef.current;
+        return cur && cur.book === t.book && cur.chapter === t.chapter
+          ? cur.verses[t.bibleVersion]?.[t.verse]
+          : undefined;
+      };
+      const bookRow = () => {
+        const ch = t.book === book ? bookHookRef.current?.chapters.get(t.chapter) : undefined;
+        return ch?.kind === "ready" ? ch.data.verses[t.bibleVersion]?.[t.verse] : undefined;
+      };
+      const chapterBefore = chapterRow();
+      const bookBefore = bookRow();
+      const fetchKey = `${t.book}:${t.chapter}`;
+      const fetchChapter = () => {
+        let fetching = rollbackFetchRef.current.get(fetchKey);
+        if (!fetching) {
+          fetching = api.getChapter(t.book, t.chapter);
+          rollbackFetchRef.current.set(fetchKey, fetching);
+          const forget = () => {
+            rollbackFetchRef.current.delete(fetchKey);
+          };
+          fetching.then(forget, forget);
+        }
+        return fetching;
+      };
+      // One retry after a short wait for a transient failure; the guards
+      // below run on whichever response lands. A second failure gives up
+      // (the outer catch) and the next chapter refetch catches up.
+      let server: ChapterPayload;
+      try {
+        server = await fetchChapter();
+      } catch {
+        await new Promise((r) => setTimeout(r, 2000));
+        server = await fetchChapter();
+      }
+      const stillQueuedForTarget = await queuedForTarget();
+      const serverRow = server.verses[t.bibleVersion]?.[t.verse];
+      const apply = (
+        cachedBefore: VerseDto | undefined,
+        cachedRow: VerseDto | undefined,
+        force: (v: VerseDto) => void,
+        remote: (v: VerseDto) => void,
+      ) => {
+        const plan = planRefusedVerseRollback({ serverRow, cachedBefore, cachedRow, stillQueuedForTarget });
+        if (plan.kind === "force") force(plan.row);
+        else if (plan.kind === "remote") remote(plan.row);
+      };
+      // App keys Shell by book and hoists useBook, whose applies have no book
+      // check: once this Shell is gone (a book switch during the GET), its
+      // refs still hold the old book's snapshot, and an apply would write the
+      // old book's verse into the new book's cache. Apply nothing then.
+      if (
+        !rollbackMayApply({
+          mounted: rollbackMountedRef.current,
+          liveBook: liveBookRef.current,
+          targetBook: t.book,
+        })
+      ) {
+        return;
+      }
+      apply(chapterBefore, chapterRow(), applyLocalVerseRef.current, applyRemoteVerseRef.current);
+      const bh = bookHookRef.current;
+      if (bh) apply(bookBefore, bookRow(), bh.applyLocalVerse, bh.applyRemoteVerse);
+    } catch {
+      // Best-effort: the next chapter refetch catches up.
+    }
+  }, [book]);
   useEffect(
     () =>
       onOutboxResult((op, result) => {
@@ -1030,15 +1144,29 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               lockReloadRef.current = null;
             });
           // An aligner save's toast waits for alignmentDrafts to say whether
-          // the drags were kept (onAlignerSaveRefused below).
+          // the drags were kept (onAlignerSaveRefused below), and so does its
+          // cache rollback: a mounted panel's reset to the server's row then
+          // finds the crash draft already written and restores the drags.
           if (isAlignerPanelSaveOp(op)) return;
+          void rollBackRefusedVerse(op);
           pushPipelineToast(
             "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }
       }),
-    [pushPipelineToast],
+    [pushPipelineToast, rollBackRefusedVerse],
+  );
+  // #1075: a discarded verse op (an unresolvable 409, a refused save, discard
+  // all) leaves its optimistic content in the caches just as a lock refusal
+  // does, so a reopened aligner or reading line would show the discarded
+  // text as saved and its next edit would pin the old version. Same rollback.
+  useEffect(
+    () =>
+      onOutboxDiscard((op) => {
+        if (op.target.kind === "verse") void rollBackRefusedVerse(op);
+      }),
+    [rollBackRefusedVerse],
   );
   // #1071: say "kept" only when a crash draft or an open panel actually holds
   // the refused drags. Two queued saves of one verse refused together get
@@ -1046,7 +1174,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const lastRefusalToastRef = useRef<{ key: string; at: number } | null>(null);
   useEffect(
     () =>
-      onAlignerSaveRefused((op, kept) => {
+      onAlignerSaveRefused((op, kept, heldInDraft) => {
+        // Kept only in the open panel's memory (no crash draft: read-only,
+        // or the draft write failed): rolling the cache back would reset
+        // that panel and lose the drags, so leave the cache until they save.
+        if (heldInDraft || !kept) void rollBackRefusedVerse(op);
         const key = alignmentDraftKeyForOp(op);
         const last = lastRefusalToastRef.current;
         if (last && last.key === key && Date.now() - last.at < 3000) return;
@@ -1058,7 +1190,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           "error",
         );
       }),
-    [pushPipelineToast],
+    [pushPipelineToast, rollBackRefusedVerse],
   );
 
   // Derive the chapter lock from active pipeline jobs. A run only locks the
@@ -2969,6 +3101,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // crash-draft key, which on a range row is not the PATCH's verse_start.
     draftKey?: string,
   ): boolean => {
+    // The row this save targets, kept with a refused save's crash draft (#1074).
+    const draftRow = draftKey ? alignmentDraftRow(base) : undefined;
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
     // predicate lives in guardBlocksSave — DO NOT inline a narrowing such as
@@ -3003,7 +3137,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               bibleVersion,
               expectedVersion,
               { content, plain_text: plainText, alignment_intent: "confirmed_text_edit" },
-              { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey },
+              { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow },
             );
             onConfirmedApply?.();
           },
@@ -3027,7 +3161,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bibleVersion,
       expectedVersion,
       { content, plain_text: plainText, alignment_intent: intent },
-      { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey },
+      { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow },
     );
     return true;
   }, [book, pushPipelineToast]);
@@ -4761,6 +4895,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onHoldReadingBase={(bv, base) =>
             holdVerseBaseForEditor(verseKey(book, dualAlignerProps.chapter, base.verse, bv), base)
           }
+          // #1075: a bridge or split under unsaved work dropped it; say so.
+          onUnsavedDropped={(message) => pushPipelineToast(message, "error")}
         />
       )}
       <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>
