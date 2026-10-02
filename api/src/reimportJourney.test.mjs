@@ -4559,6 +4559,134 @@ console.log("\n[#728 journey: an exported bridge a human un-bridged on Door43 is
   eq(rows().map((r) => r.version), [3, 2], "…and no version moved");
 }
 
+// ── Issue #1090: a locked book's frozen ancestor must not turn the sync's own
+// earlier adoption into a false "both changed" flag ─────────────────────────
+// A locked book skips the export, so master_confirmed_at never advances and the
+// ancestor reconstructTsvBases folds stays at the last pre-lock export. Night 1
+// Door43 moves a field v0 -> v1 and the sync adopts it cleanly; night 2 Door43
+// moves it to v2. D1's v1 came only from the sync itself, which wrote Door43's
+// own value, so D1 did not move: night 2 must be a clean adopt with no flag. A
+// real app or AI edit after the sync's adoption must still flag.
+console.log("\n[#1090: locked book, Door43 edits a field on two nights]");
+{
+  const HAS_HUMAN = {
+    mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+  };
+  const seed = (sqlite, { locked }) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    // Translator-owned row (updated_by set), so it reaches the three-way merge.
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, sort_order, updated_by, version)
+         VALUES ('lk01', ?, 1, 2, '1:2', null, 'the question', 'v0', 10, 7, 3)`,
+      )
+      .run(BOOK);
+    // The ancestor: what the last export (before the lock) published.
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tq', 'lk01', ?, 'create', ?, 100)`,
+      )
+      .run(BOOK, JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2", question: "the question", response: "v0" }));
+    if (locked) sqlite.prepare(`INSERT INTO book_locks (book, locked, reason) VALUES (?, 1, 'test lock')`).run(BOOK);
+    return Number(e.lastInsertRowid);
+  };
+  const master = (response) => ({
+    id: "lk01", idCoerced: false, refRaw: "1:2", chapter: 1, verse: 2,
+    occurrence: null, tags: null, quote: null, question: "the question", response,
+  });
+  const readRow = (sqlite) =>
+    sqlite.prepare(`SELECT response, review_kind, review_reason, version FROM tq_rows WHERE id='lk01'`).all()[0];
+  // A later D1 edit to the response by someone other than the sync. `source`
+  // null is a human PATCH (rows.ts), 'ai_pipeline' an AI auto-apply.
+  const appEdit = (sqlite, value, source) => {
+    const v = readRow(sqlite).version;
+    sqlite.prepare(`UPDATE tq_rows SET response = ?, version = ? WHERE id = 'lk01'`).run(value, v + 1);
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+         VALUES ('tq', 'lk01', ?, 7, ?, ?, 'update', ?, ?, 300)`,
+      )
+      .run(BOOK, v, v + 1, JSON.stringify({ response: value }), source);
+  };
+  const night = (env, boundary, response) =>
+    applyTsvRows(env, BOOK, "tq", [master(response)], null, { confirmedAt: 200, editId: boundary, lineage: HAS_HUMAN });
+
+  // A. Locked, no app edit between the two nights: both nights adopt cleanly.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, { locked: true });
+    const n1 = await night(env, boundary, "v1");
+    eq([readRow(sqlite).response, n1.merge_adopted, n1.merge_conflicts], ["v1", 1, 0], "locked night 1: Door43's v1 adopted cleanly");
+    const syncLog = sqlite
+      .prepare(`SELECT action, source FROM edit_log WHERE row_key = 'lk01' ORDER BY id DESC LIMIT 1`)
+      .all()[0];
+    eq([syncLog.action, syncLog.source], ["update", "dcs_reimport"], "…and the adoption is logged as the sync's own write");
+    const n2 = await night(env, boundary, "v2");
+    const row = readRow(sqlite);
+    eq(row.response, "v2", "locked night 2: Door43's v2 lands");
+    eq([n2.merge_adopted, n2.merge_conflicts, n2.merge_master_wins], [1, 0, 0], "…as a clean adopt, not a both-changed conflict");
+    eq(row.review_kind, null, "…and the row is NOT flagged: nobody in the app changed it");
+  }
+
+  // B. Locked, a translator edits the response between the nights: still flagged.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, { locked: true });
+    await night(env, boundary, "v1");
+    appEdit(sqlite, "the translator's edit", null);
+    const n2 = await night(env, boundary, "v2");
+    const row = readRow(sqlite);
+    eq(row.response, "v2", "locked + app edit: Door43 still wins");
+    eq([n2.merge_conflicts, n2.merge_master_wins], [1, 1], "…counted as a both-changed master win");
+    eq(row.review_kind, "merge_conflict", "…and the row IS flagged");
+    eq(
+      row.review_reason.startsWith("A Door43 edit to this row's response was merged over a different change saved in the app."),
+      true,
+      "…with wording that claims only what was measured",
+    );
+    // C'. The night after, Door43 moves it again with no further app edit: the
+    // sync's night-2 write is the newest shared value, so this is clean.
+    const n3 = await night(env, boundary, "v3");
+    eq([readRow(sqlite).response, n3.merge_conflicts], ["v3", 0], "…and the next Door43 edit after that adopts without a new conflict");
+  }
+
+  // C. Locked, an AI auto-apply writes the response between the nights, and a
+  //    translator then edits the question. (With the AI write as the row's
+  //    LATEST edit the row is AI-only and the pre-existing update_ai path
+  //    overwrites it from master without reaching this merge at all; the
+  //    translator's later edit is what routes it here.) The AI's response is
+  //    not the sync's write, so it is still a both-changed field: flagged.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, { locked: true });
+    await night(env, boundary, "v1");
+    appEdit(sqlite, "the AI's rewrite", "ai_pipeline");
+    sqlite.prepare(`UPDATE tq_rows SET question = 'the translator''s question' WHERE id = 'lk01'`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, action, payload_json, source, created_at)
+         VALUES ('tq', 'lk01', ?, 7, 'update', ?, NULL, 310)`,
+      )
+      .run(BOOK, JSON.stringify({ question: "the translator's question" }));
+    const n2 = await night(env, boundary, "v2");
+    const row = readRow(sqlite);
+    eq([row.response, n2.merge_conflicts, row.review_kind], ["v2", 1, "merge_conflict"], "locked + AI edit: Door43 wins, flagged");
+  }
+
+  // D. Unlocked control: the same two nights keep the pre-#1090 outcome (the
+  //    export, not the sync, advances an unlocked book's ancestor).
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, { locked: false });
+    await night(env, boundary, "v1");
+    const n2 = await night(env, boundary, "v2");
+    const row = readRow(sqlite);
+    eq([row.response, n2.merge_conflicts, row.review_kind], ["v2", 1, "merge_conflict"], "unlocked: behavior unchanged");
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
