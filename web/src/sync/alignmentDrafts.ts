@@ -24,6 +24,7 @@ import {
   isAlignmentSaveOp,
   refusalMayReplaceDraft,
   refusedOpOrder,
+  type AlignmentDraftRow,
   type RefusedOpOrder,
 } from "./alignmentDraftSaveState";
 
@@ -55,6 +56,9 @@ export interface AlignmentDraftRecord {
   // Set only on a draft restoreRefused wrote: the refused op it came from
   // (#1071). The panel's own persist writes leave it off.
   refusedFrom?: RefusedOpOrder;
+  // The row the draft was made on (#1074). Hydration restores it only onto
+  // that same row; see alignmentDraftFitsRow. Absent on older records.
+  row?: AlignmentDraftRow;
 }
 
 let dbp: Promise<IDBPDatabase> | null = null;
@@ -110,7 +114,7 @@ export const alignmentDrafts = {
   // Returns the generation minted for this write (even in read-only mode,
   // where nothing is actually persisted) so callers that want generation-safe
   // cleanup later (AlignmentPanel's save path) always have a value to carry.
-  async set(key: string, content: unknown, expectedVersion: number): Promise<string> {
+  async set(key: string, content: unknown, expectedVersion: number, row: AlignmentDraftRow): Promise<string> {
     const generation = mintAlignmentDraftGeneration();
     if (isReadOnly()) return generation;
     const rec: AlignmentDraftRecord = {
@@ -119,6 +123,7 @@ export const alignmentDrafts = {
       expectedVersion,
       updatedAt: Date.now(),
       generation,
+      row,
     };
     await (await db()).put(STORE, rec);
     return generation;
@@ -160,6 +165,7 @@ export const alignmentDrafts = {
     content: unknown,
     expectedVersion: number,
     from: RefusedOpOrder,
+    row: AlignmentDraftRow | undefined,
   ): Promise<boolean> {
     if (isReadOnly()) return false;
     const idb = await db();
@@ -174,6 +180,7 @@ export const alignmentDrafts = {
         updatedAt: Date.now(),
         generation: mintAlignmentDraftGeneration(),
         refusedFrom: from,
+        ...(row ? { row } : {}),
       };
       await tx.store.put(rec);
     }
@@ -222,7 +229,7 @@ onOutboxResult((op, result) => {
         for (const l of refusalListeners) l(op, kept);
       };
       alignmentDrafts
-        .restoreRefused(key, op.patch.content, op.expectedVersion, refusedOpOrder(op))
+        .restoreRefused(key, op.patch.content, op.expectedVersion, refusedOpOrder(op), op.alignmentDraftRow)
         .then(settle, () => settle(false));
     }
     return;

@@ -62,7 +62,11 @@ import {
   noteRefusalKeptInPanel,
 } from "../sync/alignmentDrafts";
 import { onOutboxResult } from "../sync/outbox";
-import { refusedSaveStillCurrent } from "../sync/alignmentDraftSaveState";
+import {
+  alignmentDraftFitsRow,
+  alignmentDraftRow,
+  refusedSaveStillCurrent,
+} from "../sync/alignmentDraftSaveState";
 import { isVersionOnlyRebase, lostAlignedWords, sameVerseContent } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
@@ -502,12 +506,15 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       // the replay takes the rebase path above, so a cleanup flag cancelled
       // every mount's read and a crash draft was never restored in dev.
       const draftKey = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
-      const baseVersion = verse.version;
+      const baseRow = verse;
       const token = {};
       hydrationTokenRef.current = token;
       void alignmentDrafts.get(draftKey).then((rec) => {
         if (!mountedRef.current || hydrationTokenRef.current !== token || !rec) return;
-        if (rec.expectedVersion !== baseVersion) {
+        // Same version AND same row (#1074): after a bridge or split the
+        // draft key is unchanged but the verse now resolves to another row,
+        // whose version can equal the draft's.
+        if (!alignmentDraftFitsRow(rec, baseRow, verseNum)) {
           void alignmentDrafts.clear(draftKey);
           return;
         }
@@ -551,9 +558,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       if (!dirty || !state || !verse) return;
       const key = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
       const baseVersion = verse.version;
+      const baseRow = alignmentDraftRow(verse);
       const t = setTimeout(() => {
         const content = { verseObjects: serializeAlignment(state) };
-        void alignmentDrafts.set(key, content, baseVersion).then((generation) => {
+        void alignmentDrafts.set(key, content, baseVersion, baseRow).then((generation) => {
           lastDraftGenerationRef.current = generation;
         });
       }, 400);

@@ -1,4 +1,4 @@
-import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Browser, type Locator, type Page } from "@playwright/test";
 import { csrfToken, newUserContext } from "./helpers";
 
 // S19 — issue #1060: the dual aligner's reading line writes no keystroke
@@ -20,6 +20,8 @@ import { csrfToken, newUserContext } from "./helpers";
 //   3. #1067: a verse change never replaces unsaved text on screen, focused or
 //      not. A line that lost focus keeps its edit and its pin, so Save is a
 //      409 and a merge prompt, not an overwrite.
+//   4. #1074: unsaved drags in the alignment panel are never saved onto a row
+//      another editor bridged under it.
 //
 // Kept apart from s18 (book locks) so the two suites can change separately.
 
@@ -530,6 +532,176 @@ test("a dirty reading line on a bridged row that another editor splits drops the
     }
     await context.close();
   }
+});
+
+// #1074: unsaved drags in the alignment panel must never be saved onto a row
+// another editor bridged under it. The panel's crash draft for ZEC 7:7 holds
+// v7-only content; restored onto the 6-7 row, its Save would write v7's
+// alignment over the whole bridged row and delete verse 6. `collide` arranges
+// the case a version check alone cannot catch: the draft's base version
+// (v7's) equals the bridged row's version (v6's + 1).
+
+// The panel's crash draft (alignmentDrafts.ts), read straight from IndexedDB.
+async function alignmentDraft(page: Page, key: string): Promise<{ expectedVersion: number } | undefined> {
+  return page.evaluate(async (k) => {
+    const db = await new Promise<IDBDatabase>((res, rej) => {
+      const req = indexedDB.open("bible-editor-alignment-drafts", 1);
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    const rec = await new Promise<{ expectedVersion: number } | undefined>((res, rej) => {
+      const req = db.transaction("drafts", "readonly").objectStore("drafts").get(k);
+      req.onsuccess = () => res(req.result as { expectedVersion: number } | undefined);
+      req.onerror = () => rej(req.error);
+    });
+    db.close();
+    return rec;
+  }, key);
+}
+
+async function panelDragsUnderBridge(browser: Browser, collide: boolean) {
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const UST = "UST";
+  const V6 = `/api/verses/${BOOK}/7/6/${UST}`;
+  const V7 = `/api/verses/${BOOK}/7/7/${UST}`;
+  const get = async (path: string) => {
+    const res = await context.request.get(path);
+    expect(res.ok()).toBe(true);
+    return (await res.json()) as VerseRow & { verse_end: number | null };
+  };
+  // Re-save a row unchanged, which only moves its version on.
+  const bump = async (path: string) => {
+    const cur = await get(path);
+    const res = await context.request.patch(path, {
+      headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+      data: { content: JSON.parse(cur.content_json), plain_text: cur.plain_text },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+  };
+  const orig6 = await get(V6);
+  const orig7 = await get(V7);
+  expect(orig6.verse_end).toBeNull();
+  // "telling" is in UST 7:7 only (not ULT 7:7), so the chip is the UST panel's.
+  expect(wordIsAligned(JSON.parse(orig7.content_json), "telling")).toBe(true);
+  expect(wordIsAligned(JSON.parse(orig6.content_json), "temple")).toBe(true);
+  const draftKey = `${BOOK}:7:7:${UST}`;
+  const key6 = `verse:${BOOK}:7:6:${UST}`;
+  const current = (k: string) =>
+    page.evaluate((kk) => (window as unknown as PinDebugWindow).__bePinDebug?.currentVersion(kk), k);
+  let bridged = false;
+
+  try {
+    if (collide) {
+      // A bridge writes the 6-7 row at v6's version + 1 (verses.ts).
+      // Each re-save moves one row on by one; the gap grows with run history
+      // (a split resets v6 low while v7 keeps climbing), so close all of it.
+      const gap = (await get(V7)).version - ((await get(V6)).version + 1);
+      for (let i = 0; i < Math.abs(gap); i++) await bump(gap > 0 ? V6 : V7);
+    }
+    const base6 = await get(V6);
+    const base7 = await get(V7);
+    if (collide) expect(base7.version).toBe(base6.version + 1);
+
+    const o = await openDual(page, { chapter: 7, verse: 7 });
+    const ustLine = o.dialog
+      .locator("div:has(> [contenteditable])")
+      .filter({ hasText: `${UST} · reading text` })
+      .locator("[contenteditable]");
+    await expect(ustLine).toContainText("former prophets");
+
+    // Unalign "telling" in the UST panel, unsaved, and wait for its crash draft.
+    const chip = o.dialog.locator('[draggable="true"]').filter({ hasText: "telling" }).first();
+    await chip.dragTo(o.dialog.getByText(`${UST} words`, { exact: true }).first());
+    const lock = o.dialog.getByText("🔒 save alignment first");
+    await expect(lock).toBeVisible();
+    const ustSave = o.dialog.getByRole("button", { name: `Save ${UST}`, exact: true });
+    await expect(ustSave.first()).toBeEnabled();
+    await expect.poll(async () => (await alignmentDraft(page, draftKey))?.expectedVersion).toBe(base7.version);
+
+    // Another editor bridges 6+7 into one row.
+    const res = await context.request.post(`${V6}/bridge`, {
+      headers: { "x-csrf-token": csrf },
+      data: { start_version: base6.version, next_version: base7.version },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    bridged = true;
+    const bridgedVersion = ((await res.json()) as { verse: { version: number } }).verse.version;
+    if (collide) expect(bridgedVersion).toBe(base7.version);
+    const bridgedRow = await get(V6);
+    await expect.poll(() => current(key6)).toBe(bridgedVersion);
+
+    // The panel shows the bridged row with nothing to save: the v7 draft is
+    // dropped rather than restored onto 6-7, and no UST Save is offered.
+    await expect(ustLine).toContainText("feasted");
+    await expect(o.dialog.getByText(`${UST} words`, { exact: true }).first()).toBeVisible();
+    await expect.poll(() => alignmentDraft(page, draftKey)).toBeUndefined();
+    await expect(lock).toBeHidden();
+    const enabledSaves = async () => {
+      let n = 0;
+      for (const b of await ustSave.all()) if (await b.isEnabled()) n++;
+      return n;
+    };
+    await expect.poll(enabledSaves).toBe(0);
+
+    const after6 = await get(V6);
+    expect(after6.verse_end).toBe(7);
+    expect(after6.version).toBe(bridgedVersion);
+    expect(after6.content_json).toBe(bridgedRow.content_json);
+    const content6 = JSON.parse(after6.content_json);
+    expect(wordIsAligned(content6, "temple")).toBe(true);
+    expect(wordIsAligned(content6, "telling")).toBe(true);
+  } finally {
+    // Every cleanup step runs even if an earlier one fails; the first failure
+    // is thrown at the end, after the fixture is restored and the context closed.
+    const errors: unknown[] = [];
+    const step = async (fn: () => Promise<void>) => {
+      try {
+        await fn();
+      } catch (e) {
+        errors.push(e);
+      }
+    };
+    if (bridged) {
+      await step(async () => {
+        const cur = await get(V6);
+        const split = await context.request.post(`${V6}/split`, {
+          headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+        });
+        expect(split.status(), await split.text()).toBe(200);
+      });
+    }
+    for (const [path, orig] of [
+      [V6, orig6],
+      [V7, orig7],
+    ] as const) {
+      await step(async () => {
+        const cur = await get(path);
+        const put = await context.request.patch(path, {
+          headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+          data: { content: JSON.parse(orig.content_json), plain_text: orig.plain_text },
+        });
+        expect(put.status(), await put.text()).toBe(200);
+      });
+    }
+    await step(() => context.close());
+    if (errors.length > 0) throw errors[0];
+  }
+}
+
+test("unsaved alignment drags in the panel are never saved onto a row another editor bridged under it", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  await panelDragsUnderBridge(browser, false);
+});
+
+test("a panel crash draft whose base version equals the bridged row's version is not restored onto that row", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  await panelDragsUnderBridge(browser, true);
 });
 
 // Both lines are keyed by row, and ULT and UST rows usually share one verse

@@ -98,7 +98,12 @@ import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
-import { alignmentDraftKey, alignmentDraftKeyForOp, isAlignerPanelSaveOp } from "../sync/alignmentDraftSaveState";
+import {
+  alignmentDraftKey,
+  alignmentDraftKeyForOp,
+  alignmentDraftRow,
+  isAlignerPanelSaveOp,
+} from "../sync/alignmentDraftSaveState";
 import { onAlignerSaveRefused } from "../sync/alignmentDrafts";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { UnsavedToasts } from "./UnsavedToasts";
@@ -2969,6 +2974,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // crash-draft key, which on a range row is not the PATCH's verse_start.
     draftKey?: string,
   ): boolean => {
+    // The row this save targets, kept with a refused save's crash draft (#1074).
+    const draftRow = draftKey ? alignmentDraftRow(base) : undefined;
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
     // predicate lives in guardBlocksSave — DO NOT inline a narrowing such as
@@ -3003,7 +3010,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               bibleVersion,
               expectedVersion,
               { content, plain_text: plainText, alignment_intent: "confirmed_text_edit" },
-              { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey },
+              { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow },
             );
             onConfirmedApply?.();
           },
@@ -3027,7 +3034,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bibleVersion,
       expectedVersion,
       { content, plain_text: plainText, alignment_intent: intent },
-      { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey },
+      { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow },
     );
     return true;
   }, [book, pushPipelineToast]);

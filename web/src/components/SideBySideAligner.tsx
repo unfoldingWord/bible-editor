@@ -21,6 +21,7 @@ import { type HoverHighlight, type HighlightCtx } from "../lib/highlightTypes";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { TwlRow, VerseDto } from "../sync/api";
 import type { VerseBaseHold } from "../sync/versePin";
+import { alignmentPanelRowKey } from "../sync/alignmentDraftSaveState";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { extractEditableText, normalizeEditable } from "../lib/usfm";
 
@@ -431,8 +432,12 @@ export function SideBySideAligner({
       // (useState(computedInitial)) instead of carrying the previous verse's
       // alignment across a dualNavTo until the passive reset effect runs — the
       // same stale-state race the single-panel aligner had. bibleVersion is
-      // fixed per side (ULT left / UST right), so verseNum alone keys it.
-      key={`${slot.bibleVersion}:${verseNum}`}
+      // fixed per side (ULT left / UST right). Also keyed by the ROW (start
+      // verse + bridge end), as the reading line is (#1067): a bridge or split
+      // by another editor moves the slot onto a different row, and the panel
+      // must start fresh on it rather than carry drags made on the old one
+      // (#1074).
+      key={`${slot.bibleVersion}:${chapter}:${verseNum}:${alignmentPanelRowKey(slot.verse)}`}
       ref={slot.panelRef}
       book={book}
       chapter={chapter}
