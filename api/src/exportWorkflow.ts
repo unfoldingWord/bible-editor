@@ -1536,12 +1536,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // makes this rare, and the alert is observational, not blocking — a
       // human reading it can tell the difference from the named SHA.
       //
-      // Skipped entirely when `branch === "master"` — the lock-push override
-      // that commits straight to master with no PR/merge step
-      // (lockPushExportParams). There, commitToDcs's own PUT IS what moves
-      // master's head; the post-commit head differing from the pre-commit
-      // pin is the expected, intended outcome of every single use of that
-      // override, not evidence of a foreign edit.
+      // Skipped entirely when `branch === "master"` — an operator
+      // `branchName: "master"` override (exports.ts's /run or /lock/push;
+      // exportBranchOverrideValid accepts the name, lockPushExportParams only
+      // passes it through) that commits straight to master with no PR/merge
+      // step. There, commitToDcs's own PUT IS what moves master's head, so a
+      // plain SHA compare would raise a false alert on every such run.
+      // Known coverage gap: that PUT still lands over master's current file,
+      // so a foreign commit inside the window gets no banner on this path.
       if (branch !== "master" && shouldRecordRevertReport(dcsChanged, masterContentForRevertReport)) {
         const postCommitHead = await fileHeadCommit(this.env, target.repo, filename);
         const postCommitSha = postCommitHead?.sha ?? null;
