@@ -1535,12 +1535,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // makes this rare, and the alert is observational, not blocking — a
       // human reading it can tell the difference from the named SHA.
       //
-      // Skipped entirely when `branch === "master"` — the lock-push override
-      // that commits straight to master with no PR/merge step
-      // (lockPushExportParams). There, commitToDcs's own PUT IS what moves
-      // master's head; the post-commit head differing from the pre-commit
-      // pin is the expected, intended outcome of every single use of that
-      // override, not evidence of a foreign edit.
+      // Skipped entirely when `branch === "master"` — an admin branch
+      // override (exportBranchOverrideValid accepts the literal name
+      // "master", though no normal caller is expected to use it that way)
+      // that would commit straight to master with no PR/merge step. There,
+      // commitToDcs's own PUT IS what moves master's head; the post-commit
+      // head differing from the pre-commit pin would be the expected,
+      // intended outcome of every single use of that override, not evidence
+      // of a foreign edit. A direct-to-master override is otherwise simply
+      // UNCOVERED by this check — not a false alarm, but not detected
+      // either; see the comment on recordExportRevertRaceAlert for why that
+      // gap is accepted rather than closed here.
       if (branch !== "master" && shouldRecordRevertReport(dcsChanged, masterContentForRevertReport)) {
         const postCommitHead = await fileHeadCommit(this.env, target.repo, filename);
         const postCommitSha = postCommitHead?.sha ?? null;
@@ -3004,6 +3009,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // that lies about a destructive action is worse than none." Leaving it
   // standing costs one extra dismiss-click; auto-clearing it risks losing
   // the only trace of a silently overwritten hand-edit.
+  //
+  // The `source` carries the SHA pair, not just (book, resource): writeAlert
+  // itself DELETEs any undismissed alert for the same source before
+  // inserting the new one (its own anti-pileup logic, see its comment) — so
+  // a fixed per-pair source would let race 2 (a DIFFERENT, later SHA pair)
+  // silently erase race 1's still-undismissed banner, defeating the whole
+  // "never auto-cleared" guarantee above by a path that isn't this
+  // function's own clearing logic at all. A recurrence of the EXACT SAME
+  // pair (the sync genuinely hasn't caught up yet) still collapses onto one
+  // row, which is correct — it's the same unresolved condition, not a new one.
   private async recordExportRevertRaceAlert(
     book: string,
     resource: Resource,
@@ -3011,10 +3026,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     pinnedSha: string | null,
     foreignSha: string,
   ): Promise<void> {
-    const source = `export_revert_race:${book}:${resource}`;
     const label = `${book} ${resource.toUpperCase()}`;
     const pinned = (pinnedSha ?? "unknown").slice(0, 8);
     const foreign = foreignSha.slice(0, 8);
+    const source = `export_revert_race:${book}:${resource}:${pinned}..${foreign}`;
     // Not "this self-heals tomorrow": branch `branch`'s PUT carries this
     // run's full render, built from content that predates `foreignSha`. If
     // that foreign commit touched this same file, this run's own PR is at
