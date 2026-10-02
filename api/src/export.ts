@@ -1500,6 +1500,24 @@ export function masterIsOurLastPublish(
 //    `unconfirmedRenderShas` (#1029): every render pushed since master was last
 //    confirmed also counts as "our own bytes".
 //
+// #1029: the unconfirmed-render list as read from book_resource_syncs before
+// tonight's push. Unparseable or non-array JSON reads as no list (fails open).
+export function readUnconfirmedRenders(
+  prior: {
+    unconfirmed_renders_json: string | null;
+    prev_pushed_blob_sha: string | null;
+    pushed_blob_sha: string | null;
+  } | null,
+): string[] | null {
+  if (!prior?.unconfirmed_renders_json) return null;
+  try {
+    const parsed: unknown = JSON.parse(prior.unconfirmed_renders_json);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : null;
+  } catch {
+    return null;
+  }
+}
+
 // And what suppression cannot hide: rows or verses present on master but absent
 // from our render are skipped by usfmRevertReport/tsvRevertReport outright
 // ("not our concern here"), so a render that DELETES master content was never

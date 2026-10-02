@@ -48,6 +48,7 @@ import {
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
   loadRevertLineage,
+  readUnconfirmedRenders,
   foreignCommitDuringExport,
   exportRevertRaceAlertSource,
   masterIsOurLastPublish,
@@ -1452,10 +1453,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           editId: prior?.master_confirmed_edit_id ?? null,
           at: prior?.master_confirmed_at ?? null,
         };
-        if (prior?.unconfirmed_renders_json) {
-          const parsed: unknown = JSON.parse(prior.unconfirmed_renders_json);
-          if (Array.isArray(parsed)) unconfirmedRenderShas = parsed.filter((x): x is string => typeof x === "string");
-        }
+        unconfirmedRenderShas = readUnconfirmedRenders(prior);
         const pointer = priorPublishPointer(prior, r2Key);
         priorPushedBlobSha = pointer.blobSha;
         priorPushedR2Key = pointer.r2Key;

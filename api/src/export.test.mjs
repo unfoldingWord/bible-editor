@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, loadRevertLineage, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, exportRevertRaceAlertSource, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, loadRevertLineage, readUnconfirmedRenders, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, exportRevertRaceAlertSource, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -2733,9 +2733,44 @@ function utf8Base64(s) {
   const n = tsv([row("ab01", "v4")]);
   const n2Sha = "sha-n2";
   assert(
-    shouldComputeRevertEntries(true, n2, n2Sha, "sha-n1", ["sha-n2", "sha-n1"]) === false,
-    `(a) master holds an older unmerged-PR render of ours -> suppressed`,
+    shouldComputeRevertEntries(true, n2, n2Sha, "sha-n1", ["sha-n2", "sha-n1"], true) === false,
+    `(a) master holds an older unmerged-PR render of ours, head commit is ours -> suppressed`,
   );
+  // Third review C1: render K-1 confirmed, K pushed, PR K merges, a human
+  // reverts it on Door43. Master's bytes equal K-1 (listed), but the commit
+  // that last touched the file is the human's revert, not our export merge.
+  assert(
+    shouldComputeRevertEntries(true, n2, n2Sha, "sha-n1", ["sha-n2", "sha-n1"], false) === true,
+    `C1: master back on an older render of ours via a non-export commit -> still computed`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, n2, n2Sha, "sha-n1", ["sha-n2", "sha-n1"]) === true,
+    `C1: head commit unknown -> fails open (computed)`,
+  );
+  {
+    const { classifyMasterCommit } = await import("./masterLineage.ts");
+    const ours = { sha: "a", message: "bible-editor: JER tn nightly export (#7790)", authorEmail: "person@example.org" };
+    const revert = {
+      sha: "b",
+      message: 'Revert "bible-editor: JER tn nightly export (#7790)"\n\nThis reverts commit a.',
+      authorEmail: "person@example.org",
+    };
+    assert(classifyMasterCommit(ours).kind === "ours", `our export squash commit classifies ours`);
+    assert(classifyMasterCommit(revert).kind !== "ours", `a Door43 revert of our export does not classify ours`);
+  }
+  // Third review: books already lagging when migration 0075 lands have a NULL
+  // list; the prior pushed renders stand in for it.
+  assert(
+    JSON.stringify(readUnconfirmedRenders({ unconfirmed_renders_json: null, prev_pushed_blob_sha: "p0", pushed_blob_sha: "p1" })) ===
+      '["p0","p1"]',
+    `NULL list -> seeded from prev_pushed_blob_sha and pushed_blob_sha`,
+  );
+  assert(
+    JSON.stringify(readUnconfirmedRenders({ unconfirmed_renders_json: '["x"]', prev_pushed_blob_sha: "p0", pushed_blob_sha: "p1" })) ===
+      '["x"]',
+    `a stored list wins over the seed`,
+  );
+  assert(readUnconfirmedRenders(null) === null, `no row -> null`);
   assert(
     shouldComputeRevertEntries(true, n2, "sha-foreign", "sha-n1", ["sha-n2", "sha-n1"]) === true,
     `(c) master bytes not in our render history -> still computed`,
@@ -2828,6 +2863,10 @@ function utf8Base64(s) {
     `AO2: no edit-id boundary, bot write before master_confirmed_at -> reported`);
   assert((await entries([[20, "ai_pipeline", "create", "X", 1100]], { editId: null, at: 1000 })) === 0,
     `no edit-id boundary, bot write after master_confirmed_at -> 0 entries`);
+  // Same second as the confirmed render's D1 read: it may be inside that render,
+  // so it must not count (counting it could hide a later human restore).
+  assert((await entries([[20, "ai_pipeline", "create", "X", 1000]], { editId: null, at: 1000 })) === 1,
+    `no edit-id boundary, bot write in the same second as master_confirmed_at -> reported`);
   assert((await entries([[20, "ai_pipeline", "create", "X"]], { editId: null, at: null })) === 1,
     `no confirmed point at all -> lineage unused, reported (fails open)`);
   // C1: a non-string content field must not throw (the report runs after the DCS commit).
@@ -2857,6 +2896,15 @@ function utf8Base64(s) {
     db.prepare(RECORD_PUSHED_RENDER_SQL).run("JER", "tn", sha, readAt, confirm, 1, `k/${sha}`);
   const list = () =>
     JSON.parse(db.prepare(`SELECT unconfirmed_renders_json j FROM book_resource_syncs WHERE book='JER'`).get().j);
+  db.prepare(
+    `UPDATE book_resource_syncs SET prev_pushed_blob_sha = 'S0', pushed_blob_sha = 'S1', pushed_read_at = 50
+      WHERE book = 'JER'`,
+  ).run();
+  record("S2", 60, 0);
+  assert(
+    JSON.stringify(list()) === '["S0","S1","S2"]',
+    `first unconfirmed push on a NULL list seeds it with prev/pushed renders; got ${JSON.stringify(list())}`,
+  );
   record("A", 100, 1);
   assert(JSON.stringify(list()) === '["A"]', `confirmed render resets the list to itself`);
   record("B", 200, 0);
