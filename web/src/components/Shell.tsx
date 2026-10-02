@@ -49,7 +49,7 @@ import {
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
 import { shouldApplyUpsert } from "./rowUpsertGuard";
-import { drafts, verseKey, pinVerseBase, unpinVerseBaseIfIdle, registerVerseVersionReader } from "../sync/drafts";
+import { drafts, verseKey, pinVerseBase, pinEpoch, unpinVerseBaseIfIdle, holdVerseBaseForEditor, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -3267,7 +3267,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     bibleVersion: string,
     plain: string,
     base: VerseDto,
-    afterCommit?: () => void,
+    // `queued: false` marks the no-op path below: nothing was queued, so a
+    // reading line ends its pin hold as a clean line does (#1060).
+    afterCommit?: (outcome?: { queued: boolean }) => void,
     // #1046: re-checked at the point of commit (after the draft lookup, and
     // again on the collateral-loss confirm's "Save anyway"). True refuses the
     // save: nothing is queued or applied and afterCommit does not run.
@@ -3302,6 +3304,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // leaves an orphaned draft (dirty border + SyncStatusBar entry + "unsaved
     // edits" toast whose Save button re-hits this guard and never resolves).
     if (oldEditable === normalizeEditable(plain)) {
+      // The pin as of this no-op: a pin taken or handed on after it (a new
+      // keystroke, a save queued meanwhile) is not this release's to drop.
+      const epoch = pinEpoch(key);
       void drafts
         .get(key)
         .then((draft) => {
@@ -3313,12 +3318,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           // pin then poisons every later save of this verse (#563). IfIdle:
           // a keystroke landing while this get() was in flight re-pins the
           // session synchronously, and that pin must survive.
-          else if (!draft) unpinVerseBaseIfIdle(key);
+          else if (!draft) unpinVerseBaseIfIdle(key, epoch);
         })
         .catch(() => {
           /* conservative: leave an unreadable draft in place */
         });
-      afterCommit?.();
+      afterCommit?.({ queued: false });
       return;
     }
     // `plain` is raw DOM textContent, so the dropped-marker-chip guard applies
@@ -4559,6 +4564,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // confirm's "Save anyway".
             saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit, refuseIfBookLocked);
           }}
+          // #1060: the reading line writes no draft, so it holds the verse
+          // base itself from its first dirty keystroke; saveVerseDraft's
+          // pinVerseBase above then finds that pin instead of pinning the
+          // version on screen at Save time. Same key as the save.
+          onHoldReadingBase={(bv, base) =>
+            holdVerseBaseForEditor(verseKey(book, dualAlignerProps.chapter, base.verse, bv), base)
+          }
         />
       )}
       <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>

@@ -20,6 +20,7 @@ import { UhbStrip } from "./UhbStrip";
 import { type HoverHighlight, type HighlightCtx } from "../lib/highlightTypes";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { TwlRow, VerseDto } from "../sync/api";
+import type { VerseBaseHold } from "../sync/versePin";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { extractEditableText, normalizeEditable } from "../lib/usfm";
 
@@ -225,8 +226,13 @@ interface Props {
     bibleVersion: string,
     plain: string,
     base: VerseDto,
-    afterCommit?: () => void,
+    afterCommit?: (outcome?: { queued: boolean }) => void,
   ) => void;
+  // #1060: hold the verse-base pin for a reading line from its first dirty
+  // keystroke. `base` is the verse the box was last synced from — the one the
+  // edit is made against. The line releases the hold when it goes clean with
+  // nothing queued, and hands it off when its save is queued.
+  onHoldReadingBase?: (bibleVersion: string, base: VerseDto) => VerseBaseHold;
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
   onNextVerse?: () => void;
@@ -339,6 +345,7 @@ export function SideBySideAligner({
   left,
   right,
   onSaveReading,
+  onHoldReadingBase,
   onPrevVerse,
   onNextVerse,
   onSaveDoneAndNext,
@@ -627,6 +634,7 @@ export function SideBySideAligner({
             ref={left.readingRef}
             slot={left}
             onSave={onSaveReading}
+            onHoldBase={onHoldReadingBase}
             onDirtyChange={left.onReadingDirtyChange}
             locked={leftDirty}
             chapterLocked={!!locked}
@@ -637,6 +645,7 @@ export function SideBySideAligner({
             ref={right.readingRef}
             slot={right}
             onSave={onSaveReading}
+            onHoldBase={onHoldReadingBase}
             onDirtyChange={right.onReadingDirtyChange}
             locked={rightDirty}
             chapterLocked={!!locked}
@@ -825,7 +834,14 @@ function SharedUhbStrip({
 // + enqueue) or Undo (revert to the last-saved text) — nothing autosaves.
 const ReadingLine = forwardRef<ReadingLineHandle, {
   slot: PanelSlot;
-  onSave: (bibleVersion: string, plain: string, base: VerseDto, afterCommit?: () => void) => void;
+  onSave: (
+    bibleVersion: string,
+    plain: string,
+    base: VerseDto,
+    afterCommit?: (outcome?: { queued: boolean }) => void,
+  ) => void;
+  // See Props.onHoldReadingBase.
+  onHoldBase?: (bibleVersion: string, base: VerseDto) => VerseBaseHold;
   onDirtyChange: (dirty: boolean) => void;
   // Locked while this side's AlignmentPanel has unsaved drags: a text edit
   // here would swap the verse prop and silently wipe those drags (see the
@@ -849,6 +865,7 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   {
     slot,
     onSave,
+    onHoldBase,
     onDirtyChange,
     locked = false,
     chapterLocked = false,
@@ -868,10 +885,50 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   // buttons (and matches saveVerseDraft's no-op guard exactly). Mirrored up to
   // the parent so the close/nav gate can prompt before losing the edit.
   const [dirty, setDirty] = useState(false);
-  const markDirty = (next: boolean) => {
+  // #1060: the verse the box's text was last synced from, i.e. the base an
+  // edit typed now is made against. It lags `verse` while the resync below is
+  // skipped under the caret: a server change that lands while the translator
+  // types in the focused box must not become the edit's base.
+  const shownVerseRef = useRef(verse);
+  // The verse-base pin held for the current edit (see VerseBaseHold): taken on
+  // the first dirty keystroke, ended on the way back to clean — released when
+  // nothing was queued, handed to the queued save otherwise.
+  const holdRef = useRef<VerseBaseHold | null>(null);
+  const markDirty = (next: boolean, endHold: "release" | "handOff" = "release") => {
+    if (next && !holdRef.current && shownVerseRef.current && onHoldBase) {
+      holdRef.current = onHoldBase(bibleVersion, shownVerseRef.current);
+    } else if (!next && holdRef.current) {
+      const hold = holdRef.current;
+      holdRef.current = null;
+      // An own save that landed moved the hold's base forward: the box shows
+      // that row now, so a later edit starts from it, not the pre-save base.
+      const advanced = hold.advancedBase();
+      if (advanced && shownVerseRef.current) {
+        shownVerseRef.current = { ...shownVerseRef.current, version: advanced.version, content: advanced.content };
+      }
+      if (endHold === "handOff") hold.handOff();
+      else hold.release();
+    }
     setDirty(next);
     onDirtyChange(next);
+    if (!next) syncShownVerse();
   };
+  // A clean box showing exactly this verse's text was synced from it — this
+  // also catches a version-only change (the line's own save landing, an
+  // alignment-only change) that the `editable`-keyed resync never sees.
+  const syncShownVerse = () => {
+    const el = elRef.current;
+    if (holdRef.current || !el) return;
+    if (normalizeEditable(el.textContent ?? "") === normalizeEditable(editable)) shownVerseRef.current = verse;
+  };
+  // Unmounting drops whatever the line showed (#1060).
+  useEffect(
+    () => () => {
+      holdRef.current?.release();
+      holdRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     const el = elRef.current;
@@ -897,6 +954,15 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editable]);
 
+  // After the resync above (effects run in order), so a fresh sync is seen.
+  // A line mounted before its verse arrived starts from that first verse, so
+  // its first keystroke has a base to hold.
+  useEffect(() => {
+    if (!shownVerseRef.current && !holdRef.current) shownVerseRef.current = verse;
+    syncShownVerse();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [verse]);
+
   // `afterCommit` mirrors AlignmentPanelHandle's handleSave (#490): `onSave`
   // (ultimately Shell's saveVerseDraft → enqueueVerseSafely) can defer this
   // save behind the collateral-loss confirm rather than enqueueing
@@ -911,8 +977,10 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
       afterCommit?.();
       return;
     }
-    onSave(bibleVersion, el.textContent ?? "", verse, () => {
-      markDirty(false);
+    onSave(bibleVersion, el.textContent ?? "", verse, (outcome) => {
+      // A queued edit's save owns the pin now and its outbox exit releases it;
+      // a no-op queued nothing, so the hold ends as a clean line's does (#1060).
+      markDirty(false, outcome?.queued === false ? "release" : "handOff");
       afterCommit?.();
     });
   };

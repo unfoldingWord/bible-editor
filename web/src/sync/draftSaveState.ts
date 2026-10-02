@@ -95,6 +95,12 @@ export interface VerseOpExitInfo {
   // extractEditableText(op.patch.content), precomputed by the announcing tab
   // so a receiving tab can run the legacy provenance check without the op.
   editableText?: string;
+  // #1060: which op this was, the version it was saved against, and (on "ok")
+  // the row the server stored, so the tab that QUEUED it can move a live
+  // reading-line hold forward even when another tab drained it.
+  opId?: string;
+  expectedVersion?: number;
+  landed?: { version: number; content: unknown };
 }
 
 export function verseOpExitInfo(op: OutboxOp, exit: VerseOpExit): VerseOpExitInfo {
