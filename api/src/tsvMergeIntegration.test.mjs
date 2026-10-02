@@ -133,10 +133,14 @@ eq(merge.conflict, false, "merge has no conflict");
 eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; our quote is preserved");
 
 // ── issue #950: a locked book, over this SAME real reconstructed ancestor,
-// adopts a genuinely BOTH-changed field with no review flag. Unlike `ours`/
-// `theirs` above (which only disagree field-by-field, never on the same
-// field), both sides here move `note` away from the ancestor — the case that
-// would otherwise need a human commit behind master's side to win.
+// still adopts a genuinely BOTH-changed field — but FLAGGED (PR #1000 review
+// finding A1: the first version of this fix adopted silently, which can
+// overwrite a real unexported D1 edit; see tsvMerge.test.mjs for the full
+// rationale). Unlike `ours`/`theirs` above (which only disagree field-by-
+// field, never on the same field), both sides here move `note` away from
+// the ancestor — the case that needs a human commit behind master's side to
+// win UNLESS the book is locked, in which case master wins regardless but
+// the collision is still surfaced.
 {
   const oursLocked = { quote: "q0", note: "our further edit", occurrence: 1, support_reference: "rc://s0" };
   const theirsLocked = { quote: "q0", note: "master's out-of-band note", occurrence: 1, support_reference: "rc://s0" };
@@ -144,11 +148,13 @@ eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; ou
     masterMayHoldHumanEdit: false,
     bookLocked: true,
   });
-  eq(lockedMerge.action, "adopt", "locked: a real both-changed field adopts master, no flag");
-  eq(lockedMerge.conflict, false, "locked: no conflict flag even though the lineage says no human moved master");
+  eq(lockedMerge.action, "adopt_conflict", "locked: a real both-changed field adopts master, but still flagged");
+  eq(lockedMerge.conflict, true, "locked: the collision is flagged even though the lineage says no human moved master");
   eq(lockedMerge.writeFields, { note: "master's out-of-band note" }, "locked: writes master's note");
+  eq(lockedMerge.conflictFields, ["note"], "locked: the contested field is named");
 
-  // Control: same inputs, unlocked — the pre-existing D1-wins-and-flag outcome.
+  // Control: same inputs, unlocked — the pre-existing D1-wins-and-flag
+  // outcome. Proves the lock changed only WHO wins, not whether it's flagged.
   const unlockedMerge = computeTsvMerge("tn", base, oursLocked, theirsLocked, { masterMayHoldHumanEdit: false });
   eq(unlockedMerge.action, "keep_ai_master", "control: unlocked keeps D1's note and flags it");
 }

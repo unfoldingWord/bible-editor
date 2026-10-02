@@ -445,22 +445,36 @@ export function computeTsvMerge(
   const fields = FIELDS_BY_KIND[kind];
   const masterWinsConflicts = opts.masterMayHoldHumanEdit !== false;
   const provisional = opts.baseProvisional === true;
-  // Issue #950. A locked book is read-only for app edits AND skips the export
-  // (bookLock.ts), the same fact verseMerge.ts's `masterAuthoritative` (its
-  // step 3b) already acts on for verse content: Door43 master is the only
-  // place the book can move while locked, so master is authoritative for any
-  // field it moved since the ancestor (Benjamin, 2026-09-24: "the lock is to
-  // prevent problems from the BE side"). Without this, master_confirmed_at
+  // Issue #950. A locked book is read-only for FUTURE app edits AND skips the
+  // export (bookLock.ts), the same fact verseMerge.ts's `masterAuthoritative`
+  // (its step 3b) already acts on for verse content: Door43 master is the
+  // only place the book can move while locked, so master is authoritative for
+  // any field it moved since the ancestor (Benjamin, 2026-09-24: "the lock is
+  // to prevent problems from the BE side"). Without this, master_confirmed_at
   // never re-advances while locked — only an export re-confirms it — so every
   // Door43 commit reads as BOTH sides having moved against the frozen
   // pre-lock ancestor, and a genuinely AI-authored master excursion
   // (masterMayHoldHumanEdit: false) would keep D1 and flag the row forever
-  // even though nobody on the app side could have made the conflicting edit.
-  // Unlike the verse merge, a locked adopt here carries no separate flag: the
-  // verse side still distinguishes a clean `adopt` from a flagged
-  // `adopt_conflict` because it protects against overwriting a real unsaved
-  // app edit (visible-change refinement); a locked book cannot hold one — see
-  // the field loop below.
+  // even though nobody on the app side could have made the conflicting edit
+  // SINCE THE LOCK LANDED.
+  //
+  // What locked does NOT prove: that D1's current value for a "conflict"
+  // field (attributeField already ruled out "keep" and "adopt", so ours !=
+  // base here) is itself stale/unwanted. The lock freezes what happens next;
+  // it does not retroactively undo a write already in D1. Three real paths
+  // land one there anyway: a note saved after the last export but before the
+  // lock landed; an AI pipeline auto-apply write, which is deliberately NOT
+  // gated by effectiveBookLock (pipelines.ts — it finishes a run already in
+  // flight when the lock landed rather than abort mid-apply); and an
+  // unlock -> fix -> relock cycle. So `bookLocked` only skips the AI-lineage
+  // question (masterWinsConflicts) a "conflict" field would otherwise need to
+  // answer — it still flags the collision exactly like the unlocked
+  // `adopt_conflict` path, mirroring verseMerge.ts step 3b's FLAGGED branch
+  // (its clean branch only fires when D1 never moved from the ancestor at
+  // all, which here is the separate, already-clean "adopt" fate below). A
+  // flagged master-win is a safe default either way: D1's pre-lock content is
+  // still recoverable from row version history, same as any other
+  // adopt_conflict. See the field loop below.
   //
   // Scope decision (#950's "created/deleted/tombstoned row cases"): this
   // option only affects the EDITED-row three-way merge below. A row master
@@ -480,38 +494,36 @@ export function computeTsvMerge(
   let anyAttributable = false; // some differing field HAD a base to attribute against
 
   for (const f of fields) {
-    let fate = attributeField(f, base, ours, theirs);
+    const fate = attributeField(f, base, ours, theirs);
     if (fate === "converged") continue;
     anyDiff = true;
     if (fate === "no_base") {
       anyNoBase = true;
       continue; // keep ours for this field; can't attribute it
     }
-    // A provisional base may not convict (see the header): the two master-wins
-    // fates degrade to "unattributable", which keeps D1 and reports the row as
-    // keep_no_base — main's behavior for this population, never worse. Checked
-    // BEFORE the lock override below so a locked book cannot bypass this
-    // fail-safe either — the boundary a provisional base cannot prove is the
-    // same one the lock claim would otherwise skip past.
-    if (provisional && (fate === "adopt" || (fate === "conflict" && masterWinsConflicts))) {
+    // A provisional base may not convict (see the header): any fate that
+    // would write master's value over an unproven base degrades to
+    // "unattributable". `bookLocked` joins `masterWinsConflicts` here (#950)
+    // because it can ALSO force a "conflict" field to write master's value
+    // below — the provisional floor must suppress that master-win exactly
+    // like the ordinary one, lock or not.
+    if (provisional && (fate === "adopt" || (fate === "conflict" && (masterWinsConflicts || bookLocked)))) {
       anyNoBase = true;
       continue;
     }
-    // A locked book never needs a human to adjudicate a both-moved field: the
-    // app side is read-only, so master is authoritative outright. Fold
-    // "conflict" into a plain "adopt" — no review flag, no AI-lineage
-    // question — rather than gating it behind masterWinsConflicts.
-    if (bookLocked && !provisional && fate === "conflict") fate = "adopt";
     anyAttributable = true;
     if (fate === "keep") continue; // master didn't move it — our edit stands
     if (fate === "conflict") {
       conflictFields.push(f);
-      // Both sides moved this field, and the lineage says nothing human moved
-      // master's side — so master's value is our own pipeline's output and must
-      // not overwrite the app edit that came after it (#540 item 2, the AMO 4:2
-      // shape). Keep D1's value: write nothing for this field, and let the row
-      // carry a review flag so a human still sees the collision.
-      if (!masterWinsConflicts) continue;
+      // Both sides moved this field. Normally D1 wins unless a human could
+      // have written master's side (masterWinsConflicts) — master's value
+      // would otherwise be our own pipeline's output overwriting the app
+      // edit that came after it (#540 item 2, the AMO 4:2 shape). Issue #950:
+      // a locked book skips that AI-lineage question entirely — master wins
+      // regardless — but the field is STILL flagged via conflictFields.push
+      // above; only the write-skip below is bypassed. See the bookLocked
+      // doc comment above for why D1's side can still hold real work.
+      if (!masterWinsConflicts && !bookLocked) continue;
     }
     // adopt, OR a conflict master is allowed to win: write master's RAW value.
     (writeFields as Record<string, unknown>)[f] = theirs[f] ?? null;
@@ -539,7 +551,11 @@ export function computeTsvMerge(
   // otherwise swallow it as a plain keep_master_unchanged and lose the flag — a
   // collision a human should see, whichever side won it. `adopt` stays honest:
   // a row can hold both a kept conflict and a field master moved on its own.
-  if (!masterWinsConflicts && conflictFields.length > 0) {
+  // `!bookLocked` guards this: when locked, the loop above never skipped the
+  // write for a conflict field (see "if (!masterWinsConflicts && !bookLocked)
+  // continue"), so writeFields already holds master's value for it — this
+  // branch, which reports a D1-WINS outcome, must not fire over that write.
+  if (!masterWinsConflicts && !bookLocked && conflictFields.length > 0) {
     return {
       action: "keep_ai_master",
       adopt: Object.keys(writeFields).length > 0,

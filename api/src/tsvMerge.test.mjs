@@ -809,78 +809,86 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
 }
 
 // ── issue #950: a locked book is authoritative for the tn/tq/twl merge too,
-// like verseMerge.ts step 3b for verse content ─────────────────────────────
+// like verseMerge.ts step 3b for verse content — but FLAGGED, mirroring step
+// 3b's flagged `adopt_conflict` branch, never its clean one. Review finding
+// A1 on PR #1000 caught the first version of this fix silently overwriting a
+// genuine unexported D1 edit (clean `adopt`, no flag) on the premise that "a
+// locked book cannot hold one" — false: a note can be saved after the last
+// export but before the lock lands, an AI pipeline auto-apply write is
+// deliberately not gated by effectiveBookLock (pipelines.ts), and an
+// unlock->fix->relock cycle lands D1 content the lock never saw exported. ──
 {
   const base = { quote: "q0", note: "n0" };
   const ours = { quote: "q0", note: "our note" };
   const theirs = { quote: "q0", note: "master's note" };
 
-  // A locked book with both sides moved adopts master with NO review flag —
-  // unlike the unlocked case, where the AI-lineage question would otherwise
-  // keep D1 and flag it.
+  // A1's exact scenario: D1 holds an edit saved after the export (ours !=
+  // base) and the book is now locked; Door43 also moved the field out of
+  // band, with no human commit provably behind it. Locked still lets master
+  // win — but FLAGGED, exactly like the unlocked `adopt_conflict` path, so
+  // D1's pre-lock edit is never silently lost.
   const locked = computeTsvMerge("tn", base, ours, theirs, {
     masterMayHoldHumanEdit: false,
     bookLocked: true,
   });
-  eq(locked.action, "adopt", "locked: both-moved field adopts master outright");
-  eq(locked.conflict, false, "locked: no review flag");
+  eq(locked.action, "adopt_conflict", "locked: a both-moved field still adopts master, but flagged — never a silent adopt");
+  eq(locked.conflict, true, "locked: the collision is still flagged for a human");
   eq(locked.adopt, true, "locked: adopt is true");
   deep(locked.writeFields, { note: "master's note" }, "locked: writes master's raw value");
-  deep(locked.conflictFields, [], "locked: nothing is reported as contested");
+  deep(locked.conflictFields, ["note"], "locked: the field is named as contested");
 
-  // Control: the identical inputs, unlocked, keep D1 and flag it — proving
-  // `bookLocked` is what changed the outcome above, not the lineage flag.
+  // Control: the identical inputs, unlocked. Same action as before this fix
+  // — proving the lock changed WHO wins (master instead of D1), never
+  // whether the collision gets flagged.
   const unlocked = computeTsvMerge("tn", base, ours, theirs, { masterMayHoldHumanEdit: false });
   eq(unlocked.action, "keep_ai_master", "control: unlocked + no human commit keeps D1, flagged");
   eq(unlocked.conflict, true, "control: unlocked is still a conflict");
+  deep(unlocked.writeFields, {}, "control: unlocked writes nothing — D1 wins this one");
 
   // A locked book where master never moved a field still keeps D1 — asked
   // BEFORE the lock override, matching verseMerge.ts step 3b's own ordering
   // ("a verse master never touched keeps D1"). `theirs` here equals `base`:
-  // master's side never moved, only ours did.
+  // master's side never moved, only ours did. Unaffected by this fix: this
+  // is the "keep" fate, which the lock has never touched.
   const untouched = computeTsvMerge("tn", base, { quote: "q0", note: "our own edit" }, base, {
     bookLocked: true,
   });
   eq(untouched.action, "keep_master_unchanged", "locked: master never moved -> keeps D1, not adopted");
   deep(untouched.writeFields, {}, "locked: nothing written when master didn't move");
 
-  // Master-only movement was already a clean adopt; locked changes nothing.
+  // Master-only movement (the "adopt" fate — ours === base) was already a
+  // clean, unflagged adopt; this fix only changed the "conflict" fate, so
+  // locked changes nothing here.
   const masterOnly = computeTsvMerge("tn", base, base, theirs, { bookLocked: true });
-  eq(masterOnly.action, "adopt", "locked: an uncontested master edit is still a plain adopt");
-  eq(masterOnly.conflict, false, "locked: still no flag");
+  eq(masterOnly.action, "adopt", "locked: an uncontested master edit is still a plain, unflagged adopt");
+  eq(masterOnly.conflict, false, "locked: still no flag — nothing was contested");
 
   // No ancestor recoverable still keeps D1 — a lock cannot manufacture an
   // attribution any more than the provisional-base floor can.
   const noBase = computeTsvMerge("tn", null, ours, theirs, { bookLocked: true });
   eq(noBase.action, "keep_no_base", "locked: no ancestor -> keep_no_base, not adopt");
 
-  // A provisional (create-as-ancestor) base still must not convict, even
-  // while locked — the boundary it cannot prove is the same one either way.
-  // (masterMayHoldHumanEdit omitted so masterWinsConflicts defaults true,
-  // exactly the sub-case the provisional-degrade check above already
-  // intercepts BEFORE the lock override ever runs — see the ordering
-  // comment in computeTsvMerge.)
-  const provisionalLocked = computeTsvMerge("tn", base, ours, theirs, {
-    bookLocked: true,
-    baseProvisional: true,
-  });
-  eq(provisionalLocked.action, "keep_no_base", "locked + provisional: still degrades to keep_no_base, never adopts");
-  deep(provisionalLocked.writeFields, {}, "locked + provisional: writes nothing");
-
-  // The other provisional sub-case: masterMayHoldHumanEdit explicitly false
-  // means masterWinsConflicts is false, so the provisional-degrade check
-  // above (which only fires for a conflict masterWinsConflicts WOULD have
-  // let master win) does not intercept it — the lock override is reached,
-  // but its own `!provisional` guard still refuses to let master win here.
-  // D1 keeps its value exactly as the unlocked #653 "kept" case above does;
-  // this is a D1-wins outcome, so there is nothing a lock needed to fix.
-  const provisionalLockedAiMaster = computeTsvMerge("tn", base, ours, theirs, {
-    masterMayHoldHumanEdit: false,
-    bookLocked: true,
-    baseProvisional: true,
-  });
-  eq(provisionalLockedAiMaster.action, "keep_ai_master", "locked + provisional + no human commit: still D1-wins, unaffected by the lock");
-  deep(provisionalLockedAiMaster.writeFields, {}, "…writing nothing");
+  // A provisional (create-as-ancestor) base still must not let master win a
+  // conflict field, whether that master-win would come from the ordinary
+  // masterWinsConflicts gate OR from the lock override — `bookLocked` joins
+  // `masterWinsConflicts` in the provisional-degrade condition precisely so
+  // both sub-cases degrade the same way. Unlike before this fix, there is no
+  // longer a second sub-case that slips past the degrade: forcing master to
+  // win on a "conflict" field now ALWAYS goes through the single write-skip
+  // bypass the provisional check already guards.
+  for (const masterMayHoldHumanEdit of [undefined, true, false]) {
+    const provisionalLocked = computeTsvMerge("tn", base, ours, theirs, {
+      masterMayHoldHumanEdit,
+      bookLocked: true,
+      baseProvisional: true,
+    });
+    eq(
+      provisionalLocked.action,
+      "keep_no_base",
+      `locked + provisional (masterMayHoldHumanEdit=${masterMayHoldHumanEdit}): still degrades to keep_no_base, never adopts`,
+    );
+    deep(provisionalLocked.writeFields, {}, "…writing nothing");
+  }
 }
 
 // ── detectTornTsvRef (issue #672) ────────────────────────────────────────────
