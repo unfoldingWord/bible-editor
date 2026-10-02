@@ -97,7 +97,9 @@ import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
-import { onOutboxResult } from "../sync/outbox";
+import { onOutboxResult, type OutboxOp } from "../sync/outbox";
+import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
+import { planRefusedVerseRollback } from "../sync/refusedVerseRollback";
 import {
   alignmentDraftKey,
   alignmentDraftKeyForOp,
@@ -1024,6 +1026,48 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // the drags (AlignmentPanel, alignmentDrafts). A verse-history restore also
   // sends alignment_edit but is not aligner work, so it keeps the old toast.
   const lockReloadRef = useRef<Promise<void> | null>(null);
+  // #1073: the refused save's content was folded into the chapter and book
+  // caches optimistically, and the drop leaves it there, reading as saved
+  // (the aligner's Reset goes back to it, a reopened verse shows it). Re-read
+  // the chapter and put the server's row back. Read through refs: the GET
+  // resolves after renders this closure did not see.
+  const bookHookRef = useRef(bookHook);
+  bookHookRef.current = bookHook;
+  const applyLocalVerseRef = useRef(applyLocalVerse);
+  applyLocalVerseRef.current = applyLocalVerse;
+  const applyRemoteVerseRef = useRef(applyRemoteVerse);
+  applyRemoteVerseRef.current = applyRemoteVerse;
+  const rollBackRefusedVerse = useCallback(async (op: OutboxOp) => {
+    const t = op.target;
+    if (t.kind !== "verse") return;
+    let server: ChapterPayload;
+    let stillQueuedForTarget: boolean;
+    try {
+      const key = outboxTargetKey(t);
+      stillQueuedForTarget = (await outbox.list()).some(
+        (o) => o.id !== op.id && outboxTargetKey(o.target) === key,
+      );
+      if (stillQueuedForTarget) return;
+      server = await api.getChapter(t.book, t.chapter);
+    } catch {
+      return; // the next refetch catches up
+    }
+    const serverRow = server.verses[t.bibleVersion]?.[t.verse];
+    const apply = (cachedRow: VerseDto | undefined, force: (v: VerseDto) => void, remote: (v: VerseDto) => void) => {
+      const plan = planRefusedVerseRollback({ serverRow, cachedRow, stillQueuedForTarget });
+      if (plan.kind === "force") force(plan.row);
+      else if (plan.kind === "remote") remote(plan.row);
+    };
+    const cur = dataRef.current;
+    if (cur && cur.book === t.book && cur.chapter === t.chapter) {
+      apply(cur.verses[t.bibleVersion]?.[t.verse], applyLocalVerseRef.current, applyRemoteVerseRef.current);
+    }
+    const bh = bookHookRef.current;
+    const bookChapter = bh?.chapters.get(t.chapter);
+    if (bh && t.book === book && bookChapter?.kind === "ready") {
+      apply(bookChapter.data.verses[t.bibleVersion]?.[t.verse], bh.applyLocalVerse, bh.applyRemoteVerse);
+    }
+  }, [book]);
   useEffect(
     () =>
       onOutboxResult((op, result) => {
@@ -1035,15 +1079,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               lockReloadRef.current = null;
             });
           // An aligner save's toast waits for alignmentDrafts to say whether
-          // the drags were kept (onAlignerSaveRefused below).
+          // the drags were kept (onAlignerSaveRefused below), and so does its
+          // cache rollback: a mounted panel's reset to the server's row then
+          // finds the crash draft already written and restores the drags.
           if (isAlignerPanelSaveOp(op)) return;
+          void rollBackRefusedVerse(op);
           pushPipelineToast(
             "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }
       }),
-    [pushPipelineToast],
+    [pushPipelineToast, rollBackRefusedVerse],
   );
   // #1071: say "kept" only when a crash draft or an open panel actually holds
   // the refused drags. Two queued saves of one verse refused together get
@@ -1052,6 +1099,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   useEffect(
     () =>
       onAlignerSaveRefused((op, kept) => {
+        void rollBackRefusedVerse(op);
         const key = alignmentDraftKeyForOp(op);
         const last = lastRefusalToastRef.current;
         if (last && last.key === key && Date.now() - last.at < 3000) return;
@@ -1063,7 +1111,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           "error",
         );
       }),
-    [pushPipelineToast],
+    [pushPipelineToast, rollBackRefusedVerse],
   );
 
   // Derive the chapter lock from active pipeline jobs. A run only locks the
