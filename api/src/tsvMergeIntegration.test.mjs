@@ -132,6 +132,27 @@ eq(merge.action, "adopt", "merge adopts (master moved note only)");
 eq(merge.conflict, false, "merge has no conflict");
 eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; our quote is preserved");
 
+// ── issue #950: a locked book, over this SAME real reconstructed ancestor,
+// adopts a genuinely BOTH-changed field with no review flag. Unlike `ours`/
+// `theirs` above (which only disagree field-by-field, never on the same
+// field), both sides here move `note` away from the ancestor — the case that
+// would otherwise need a human commit behind master's side to win.
+{
+  const oursLocked = { quote: "q0", note: "our further edit", occurrence: 1, support_reference: "rc://s0" };
+  const theirsLocked = { quote: "q0", note: "master's out-of-band note", occurrence: 1, support_reference: "rc://s0" };
+  const lockedMerge = computeTsvMerge("tn", base, oursLocked, theirsLocked, {
+    masterMayHoldHumanEdit: false,
+    bookLocked: true,
+  });
+  eq(lockedMerge.action, "adopt", "locked: a real both-changed field adopts master, no flag");
+  eq(lockedMerge.conflict, false, "locked: no conflict flag even though the lineage says no human moved master");
+  eq(lockedMerge.writeFields, { note: "master's out-of-band note" }, "locked: writes master's note");
+
+  // Control: same inputs, unlocked — the pre-existing D1-wins-and-flag outcome.
+  const unlockedMerge = computeTsvMerge("tn", base, oursLocked, theirsLocked, { masterMayHoldHumanEdit: false });
+  eq(unlockedMerge.action, "keep_ai_master", "control: unlocked keeps D1's note and flags it");
+}
+
 // Boundary case (Codex P1.3, fixed). An edit committed in the SAME second as the
 // export's D1 read (created_at === CUTOFF) but that was reflected in the render —
 // i.e. its edit_log id is at/below the captured boundary — must fold INTO the
