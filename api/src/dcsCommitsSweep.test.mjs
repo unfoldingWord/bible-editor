@@ -87,6 +87,17 @@ console.log("\n[a NULL committed_at (unparseable Door43 date) ages out on seen_a
   );
 }
 
+console.log("\n[issue #691: a late push (old committed_at, recent seen_at) survives the sweep]");
+{
+  const d = freshDb();
+  // Backdated far past the cutoff, but first seen after it: the ledger read
+  // admits it on seen_at, so deleting it would hide the late push again.
+  commitRow(d, { repo: "en_tn", sha: "late_push", committedAt: 1000, seenAt: 9000 });
+  commitRow(d, { repo: "en_tn", sha: "old_both", committedAt: 1000, seenAt: 1000 });
+  sweep(d, 5000);
+  assert(survivingShas(d).join(",") === "late_push", "only rows old on BOTH clocks are swept");
+}
+
 console.log("\n[the exported retention constant matches the ~18-month figure the issue asked for]");
 {
   const eighteenMonthsish = 548 * 86400;

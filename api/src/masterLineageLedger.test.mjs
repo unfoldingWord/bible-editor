@@ -2,6 +2,7 @@
 // node --experimental-strip-types --no-warnings src/masterLineageLedger.test.mjs
 
 import { readLedgerMasterLineage } from "./masterLineageLedger.ts";
+import { backfillDcsRepoGap } from "./dcsCommitBackfill.ts";
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
@@ -204,6 +205,91 @@ for (const [name, setup] of [
     atFloor.usable && !(atFloor.lineage?.commits ?? []).some((c) => c.sha === "bootstrap-old"),
     "bootstrap rows seen AT the window start are not treated as late arrivals",
   );
+}
+
+// Issue #691 review A1: the gap BACKFILL must not make historic commits look
+// like late arrivals. Timeline: a capped bootstrap poll at T1 opens a gap
+// (gap_at = T1); a later clean poll at T2 sets coverage_since = T2 while the
+// gap is still open; the backfill at T3 inserts the repo's older history. A
+// window with confirmedAt in [T2, T3) must not read that history as in-window,
+// while a commit the forward poll genuinely first saw after the window still is.
+{
+  const sqlite = new DatabaseSync(":memory:");
+  const dir = new URL("../migrations/", import.meta.url);
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    sqlite.exec(readFileSync(new URL(f, dir), "utf8"));
+  }
+  const mk = (sql, args) => ({
+    bind: (...a) => mk(sql, a),
+    async first() {
+      const r = sqlite.prepare(sql).all(...args);
+      return r.length ? r[0] : null;
+    },
+    async all() {
+      return { results: sqlite.prepare(sql).all(...args) };
+    },
+    async run() {
+      const r = sqlite.prepare(sql).run(...args);
+      return { success: true, meta: { changes: Number(r.changes) } };
+    },
+  });
+  const env = {
+    DB: {
+      prepare: (sql) => mk(sql, []),
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    },
+  };
+  const T1 = 2_000_000;
+  const T2 = T1 + 3600;
+  const T3 = T2 + 6 * 3600;
+  sqlite
+    .prepare(
+      `INSERT INTO dcs_repo_polls (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
+                                    last_status, gap_since_sha, gap_at, gap_frontier_json, coverage_since)
+       VALUES ('en_ust', 'tip', ?, ?, ?, 'ok', 'boot-oldest', ?, ?, ?)`,
+    )
+    .run(T2, T2, T2, T1, JSON.stringify(["hist1"]), T2);
+  // The repo's older history, reached by the backfill walk from the frontier.
+  const oldDate = new Date((T1 - 400 * 86400) * 1000).toISOString();
+  const histCommit = (sha, parent) => ({
+    sha,
+    commit: { message: `hand fix ${sha}`, author: { email: "h@x", name: "Editor", date: oldDate }, committer: { date: oldDate } },
+    author: null,
+    parents: parent ? [{ sha: parent }] : [],
+    files: [{ filename: "24-JER.usfm", status: "modified" }],
+  });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: (k) => (k.toLowerCase() === "x-hasmore" ? "false" : k.toLowerCase() === "x-pagecount" ? "1" : null) },
+    json: async () => [histCommit("hist1", "hist2"), histCommit("hist2", null)],
+  });
+  let res;
+  try {
+    res = await backfillDcsRepoGap(env, "en_ust", T3);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  ok(res.resolved === true && res.inserted === 2, "the backfill walks the history and closes the gap");
+  // A genuine late push the forward poll first saw after the window opened.
+  sqlite
+    .prepare(
+      `INSERT INTO dcs_commits (repo, sha, parent_sha, author_name, author_email, committed_at, message,
+                                 classification, classification_reason, files_json, seen_at)
+       VALUES ('en_ust', 'late-push', NULL, 'Editor', 'h@x', ?, 'hand fix', 'human', 'unrecognized', ?, ?)`,
+    )
+    .run(T1 - 7 * 86400, files, T3 + 300);
+
+  const result = await readLedgerMasterLineage(env.DB, "en_ust", "24-JER.usfm", T2 + 600, "tip");
+  const shas = (result.lineage?.commits ?? []).map((c) => c.sha);
+  ok(result.usable, "the ledger is usable once the gap is closed");
+  ok(!shas.includes("hist1") && !shas.includes("hist2"), "backfilled history is not read as arriving inside a window that opened before the backfill ran");
+  ok(shas.includes("late-push"), "...while a genuine late push in the same window still is");
 }
 
 if (failed) process.exit(1);
