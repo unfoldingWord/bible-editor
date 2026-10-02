@@ -1353,10 +1353,14 @@ export const RECORD_PUSHED_RENDER_SQL = `UPDATE book_resource_syncs
           unconfirmed_renders_json =
             CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4
                  THEN CASE WHEN ?5 = 1 THEN json_array(?3)
+                      -- Stored oldest-first: take the 10 newest by key, then
+                      -- re-sort ascending so the next push appends after them.
                       ELSE (SELECT json_group_array(value) FROM
-                              (SELECT value FROM json_each(
-                                 json_insert(COALESCE(unconfirmed_renders_json, '[]'), '$[#]', ?3))
-                               ORDER BY key DESC LIMIT 10))
+                              (SELECT value FROM
+                                 (SELECT key, value FROM json_each(
+                                    json_insert(COALESCE(unconfirmed_renders_json, '[]'), '$[#]', ?3))
+                                  ORDER BY key DESC LIMIT 10)
+                               ORDER BY key ASC))
                       END
                  ELSE unconfirmed_renders_json END,
           master_confirmed_at =
