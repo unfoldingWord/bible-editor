@@ -221,6 +221,18 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
   fn([record("b", "only b left", 5)]);
   assert.equal(calls.length, 3, "a key being removed must still notify");
 
+  // #901 review A1: a row draft's key (row:{kind}:{book}:{id}) has no
+  // chapter/verse, so moving a note with an unsaved draft to another verse
+  // rewrites meta under the SAME key. The jump menu must follow it.
+  const atVerse3 = { key: "row:tn:ISA:ab12", updatedAt: 6, meta: { kind: "row", rowKind: "tn", id: "ab12", book: "ISA", chapter: 1, verse: 3 } };
+  fn([atVerse3]);
+  assert.equal(calls.length, 4, "a new key always passes through");
+  fn([{ ...atVerse3, updatedAt: 7 }]);
+  assert.equal(calls.length, 4, "same key and same meta is still suppressed");
+  fn([{ ...atVerse3, updatedAt: 8, meta: { ...atVerse3.meta, verse: 9 } }]);
+  assert.equal(calls.length, 5, "same key with meta.verse changed must notify");
+  assert.equal(calls.at(-1)[0].meta.verse, 9, "subscriber sees the moved verse");
+
   unsubscribe();
   assert.equal(fn, undefined, "unsubscribing tears down the underlying subscription");
 }
