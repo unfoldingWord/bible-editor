@@ -170,3 +170,22 @@ export function generationForSavedPlain(
   const generation = draft.generation ?? `legacy:${draft.updatedAt}`;
   return payload.plainText === plain ? generation : undefined;
 }
+
+// Whether a landed (200) row op should clear that row's draft (#1092). A row
+// draft holds the typed fields as `payload.patch`; the op clears it only when
+// it saved at least one of them. A move ("change reference": verse, ref_raw,
+// sort_order) or a reorder (sort_order) carries none of the typed fields, so
+// clearing on its 200 left the typing only in React state and the status bar
+// saying "saved". Deletes, and drafts without a patch object, keep the
+// earlier clear-on-200 behavior.
+export function rowOpClearsDraft(
+  op: Pick<OutboxOp, "action" | "patch">,
+  draft: Pick<DraftRecord, "payload">,
+): boolean {
+  if (op.action !== "patch") return true;
+  const patch = (draft.payload as { patch?: unknown }).patch;
+  if (!patch || typeof patch !== "object") return true;
+  const fields = Object.keys(patch);
+  if (fields.length === 0) return true;
+  return fields.some((field) => Object.prototype.hasOwnProperty.call(op.patch, field));
+}

@@ -12,6 +12,7 @@ import { isReadOnly, type RowKind } from "./api";
 import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "./outbox";
 import {
   pinReleaseForVerseExit,
+  rowOpClearsDraft,
   verseOpExitInfo,
   type VerseOpExit,
   type VerseOpExitInfo,
@@ -442,7 +443,13 @@ onOutboxResult((op, result) => {
   }
   if (result.kind !== "ok") return;
   if (op.target.kind === "row") {
-    void drafts.clear(rowKey(op.target.rowKind, op.target.book, op.target.id));
+    // #1092: only an op that saved the draft's fields clears it — a move or
+    // reorder must leave unsaved typing in the store (see rowOpClearsDraft).
+    const key = rowKey(op.target.rowKind, op.target.book, op.target.id);
+    void drafts.get(key).then((rec) => {
+      if (rec && !rowOpClearsDraft(op, rec)) return;
+      return drafts.clear(key);
+    });
   }
 });
 
