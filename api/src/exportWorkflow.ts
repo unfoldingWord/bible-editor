@@ -1597,6 +1597,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         console.log(
           `export: revert entries suppressed for ${book} ${resource} — master still holds our last publish (${(priorPushedBlobSha ?? "").slice(0, 12)})`,
         );
+      } else if (
+        shouldRecordRevertReport(dcsChanged, masterContentForRevertReport) &&
+        !computeEntries
+      ) {
+        // #1029: suppressed because master holds an older render of ours that
+        // an unmerged export PR has not replaced yet.
+        console.log(
+          `export: revert entries suppressed for ${book} ${resource} — master holds an older unmerged render of ours (${(masterBlobSha ?? "").slice(0, 12)})`,
+        );
       }
       // Per-row base for the three-way diff (#870): master moved somewhere, so
       // report only the rows where it moved, not every row our own translators
