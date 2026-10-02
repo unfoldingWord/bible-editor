@@ -2490,6 +2490,54 @@ console.log("\n[#728 T4b: an absorbed row a human edited since the render is del
   assertClean728(counts, "T4b");
 }
 
+// #1086, the mirror of #1081: for a BRIDGE anchor step 6a compared only D1's
+// anchor verse with master's whole bridge, so a bridge whose words were
+// identical still read as "wording changed" and alerted the editor. Locked
+// book, app edit on the anchor (so the merge adopts with a conflict); D1's two
+// verses already hold the words master bridges.
+async function runLockedBridge1086(masterBridgeText) {
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, text: "alpha", version: 2, updatedBy: 7 });
+  insertVerse728(sqlite, { verse: 2, text: "beta" });
+  insertLog728(sqlite, { verse: 1, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("one")) }, source: "dcs_reimport", userId: null, createdAt: 10 });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("beta")) }, source: "dcs_reimport", userId: null, createdAt: 10 });
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 7)`).run(BOOK);
+  insertLog728(sqlite, { verse: 1, action: "update", prev: 1, next: 2, payload: { content: JSON.parse(contentJson("alpha")) }, createdAt: 400 });
+  // Master bridges 1-2 and adds only a paragraph marker.
+  const bridge = {
+    chapter: CH, verse: 1, verseEnd: 2, plainText: masterBridgeText,
+    contentJson: JSON.stringify({ verseObjects: [{ type: "text", text: masterBridgeText }, { type: "paragraph", tag: "p", nextChar: "\n" }] }),
+  };
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [bridge], null, { confirmedAt: 200, editId: boundary, lineage: AI_ONLY_LINEAGE_728 }, false,
+  );
+  return { sqlite, counts };
+}
+
+console.log("\n[#1086 T4c: locked book, master bridges two D1 verses with the SAME words (markers only): logged, not alerted]");
+{
+  const { sqlite, counts } = await runLockedBridge1086("alpha beta");
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end]), [[1, 2]], "the bridge lands");
+  eq(counts.structure_adopted, 1, "counted structure_adopted");
+  eq(conflicts728(sqlite).map((x) => [x.verse, x.action, x.reason, x.overwritten_version]),
+    [[1, "adopt_no_visible_change", "both_changed_no_visible", 2]],
+    "the anchor's audit row says no visible change, and still points at the overwritten version");
+  eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult"), [], "no editor-facing alert");
+  assertClean728(counts, "T4c");
+}
+
+console.log("\n[#1086 T4d: same locked bridge, but the absorbed verse's wording differs: still alerts as wording-changed]");
+{
+  const { sqlite, counts } = await runLockedBridge1086("alpha gamma");
+  const c = conflicts728(sqlite);
+  eq(c.map((x) => [x.verse, x.action]), [[1, "adopt_conflict"]], "the anchor stays adopt_conflict");
+  eq(c[0].reason.startsWith("both_changed_wording"), true, `the reason names wording (got ${c[0].reason})`);
+  eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult").map((r) => [r.verse, r.action]), [[1, "adopt_conflict"]],
+    "the editor is alerted");
+  assertClean728(counts, "T4d");
+}
+
 console.log("\n[#728 T5: D1 SPLIT a bridge after the export ('split' row above the boundary) while master still carries it: D1 keeps its plain rows]");
 {
   const { env, sqlite } = freshEnv();
