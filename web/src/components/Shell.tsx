@@ -242,6 +242,10 @@ const TAB_FOR_ROW_KIND = {
 // a target has no threads yet.
 const EMPTY_COMMENT_THREADS: CommentThread[] = [];
 const EMPTY_COVERED_VERSES: number[] = [];
+// Shared identity for twlRowAlternatives' empty case (#896): `new Map()` on
+// every no-suggestions-loaded render broke WordsTable's `===` comparator on
+// every Shell render, not just when suggestions actually changed.
+const EMPTY_TWL_ROW_ALTERNATIVES: Map<string, string[]> = new Map();
 
 interface Props {
   book: string;
@@ -388,6 +392,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // row stay visible (floated to the verse) instead of vanishing, and lets a
   // chapter-intro comment always land on whichever tn row is the CURRENT
   // intro rather than the one it was created against.
+  // Keyed on a content signature (row ids + intro id), not `data` itself: `data`
+  // gets a new identity on every edit (verse text, drafts, lane checks, ...),
+  // which used to rebuild this Set/object — and everything indexComments derives
+  // from it — on every keystroke even though the row-id set rarely changes (#896).
+  const commentLiveRowsKey = data
+    ? [
+        ...data.tn.map((r) => rowKey("tn", r.id)),
+        ...data.tq.map((r) => rowKey("tq", r.id)),
+        ...data.twl.map((r) => rowKey("twl", r.id)),
+        "|",
+        data.tn.find((r) => r.verse === 0)?.id ?? "",
+      ].join(",")
+    : "";
   const commentLiveRows = useMemo<LiveRows | undefined>(() => {
     if (!data) return undefined;
     const rowIds = new Set<string>();
@@ -396,7 +413,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     for (const r of data.twl) rowIds.add(rowKey("twl", r.id));
     const introRow = data.tn.find((r) => r.verse === 0);
     return { rowIds, introRowId: introRow ? introRow.id : null };
-  }, [data]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [commentLiveRowsKey]);
   // A → B → A keeps A on screen, so the comments key never changes and A's
   // comments would not refetch, although the socket followed B meanwhile and
   // missed A's comment events. Bump the comments epoch when such a lock lifts
@@ -1695,41 +1713,55 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // highlight source. Notes and words are mutually exclusive; clicking one
   // clears the other. Words use `orig_words` (Hebrew source words) which the
   // same matcher handles directly for UHB and via \zaln-s for ULT/UST.
-  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses, activeQuoteVerse } =
-    useMemo(() => {
-      const empty = {
-        activeQuote: null as string | null,
-        activeOccurrence: null as number | null,
-        activeQuotePartialGroups: false,
-        activeQuoteCoveredVerses: EMPTY_COVERED_VERSES,
-        activeQuoteVerse: null as number | null,
+  const {
+    activeQuote,
+    activeOccurrence,
+    activeQuotePartialGroups,
+    activeQuoteCoveredVersesRaw,
+    activeQuoteVerse,
+  } = useMemo(() => {
+    const empty = {
+      activeQuote: null as string | null,
+      activeOccurrence: null as number | null,
+      activeQuotePartialGroups: false,
+      activeQuoteCoveredVersesRaw: EMPTY_COVERED_VERSES,
+      activeQuoteVerse: null as number | null,
+    };
+    if (!data) return empty;
+    if (activeNoteId) {
+      const r = data.tn.find((row) => row.id === activeNoteId);
+      if (!r) return empty;
+      const covered = noteCoveredVerses(r);
+      return {
+        activeQuote: r.quote ?? null,
+        activeOccurrence: r.occurrence ?? null,
+        activeQuotePartialGroups: covered.length > 1,
+        activeQuoteCoveredVersesRaw: covered,
+        // The note's own verse: its occurrence counts there (#957).
+        activeQuoteVerse: r.verse,
       };
-      if (!data) return empty;
-      if (activeNoteId) {
-        const r = data.tn.find((row) => row.id === activeNoteId);
-        if (!r) return empty;
-        const covered = noteCoveredVerses(r);
-        return {
-          activeQuote: r.quote ?? null,
-          activeOccurrence: r.occurrence ?? null,
-          activeQuotePartialGroups: covered.length > 1,
-          activeQuoteCoveredVerses: covered,
-          // The note's own verse: its occurrence counts there (#957).
-          activeQuoteVerse: r.verse,
-        };
-      }
-      if (activeWordId) {
-        const r = data.twl.find((row) => row.id === activeWordId);
-        return {
-          activeQuote: r?.orig_words ?? null,
-          activeOccurrence: r?.occurrence ?? null,
-          activeQuotePartialGroups: false,
-          activeQuoteCoveredVerses: r ? [r.verse] : EMPTY_COVERED_VERSES,
-          activeQuoteVerse: r?.verse ?? null,
-        };
-      }
-      return empty;
-    }, [activeNoteId, activeWordId, data]);
+    }
+    if (activeWordId) {
+      const r = data.twl.find((row) => row.id === activeWordId);
+      return {
+        activeQuote: r?.orig_words ?? null,
+        activeOccurrence: r?.occurrence ?? null,
+        activeQuotePartialGroups: false,
+        activeQuoteCoveredVersesRaw: r ? [r.verse] : EMPTY_COVERED_VERSES,
+        activeQuoteVerse: r?.verse ?? null,
+      };
+    }
+    return empty;
+  }, [activeNoteId, activeWordId, data]);
+  // ScriptureColumn compares activeNoteCoveredVerses by identity (#896): gate on
+  // the joined verse list so a data change that doesn't move the active note/word
+  // keeps the same array reference instead of forcing a full re-render.
+  const activeQuoteCoveredVersesKey = activeQuoteCoveredVersesRaw.join(",");
+  const activeQuoteCoveredVerses = useMemo(
+    () => (activeQuoteCoveredVersesKey ? activeQuoteCoveredVersesRaw : EMPTY_COVERED_VERSES),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeQuoteCoveredVersesKey],
+  );
 
   // Reorder "stoplight": while a note is dragged (or for ~3s after an arrow
   // move) ResourceColumn reports the moved note's candidate neighbours; we
@@ -1765,7 +1797,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
     [],
   );
-  const reorderHighlight = useMemo<ReorderHighlight | null>(() => {
+  const reorderHighlightRaw = useMemo<ReorderHighlight | null>(() => {
     if (!data || !reorderPreview) return null;
     // Notes AND word links: the ids in a preview come from whichever table the
     // user is reordering. A TWL row's source quote lives in `orig_words` rather
@@ -1797,6 +1829,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       nextVerse: next?.verse ?? null,
     };
   }, [data, reorderPreview]);
+  // ScriptureColumn compares reorderHighlight by identity (#896): `data` changing
+  // elsewhere (any unrelated edit) rebuilt this object every time even when the
+  // moved/prev/next quotes were unchanged. Gate on the field values themselves —
+  // including the verse fields (#957's bridged-verse disambiguation), since a
+  // reorder that swaps a same-quote/occurrence neighbour from one bridge verse
+  // to another must still produce a new object for rowHighlightsFor to pick up.
+  const reorderHighlightKey = reorderHighlightRaw
+    ? [
+        reorderHighlightRaw.movedQuote,
+        reorderHighlightRaw.movedOccurrence,
+        reorderHighlightRaw.movedVerse,
+        reorderHighlightRaw.prevQuote,
+        reorderHighlightRaw.prevOccurrence,
+        reorderHighlightRaw.prevVerse,
+        reorderHighlightRaw.nextQuote,
+        reorderHighlightRaw.nextOccurrence,
+        reorderHighlightRaw.nextVerse,
+      ].join("|")
+    : "";
+  const reorderHighlight = useMemo<ReorderHighlight | null>(
+    () => reorderHighlightRaw,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [reorderHighlightKey],
+  );
 
   // Quote-builder session: when active, clicking Hebrew words in the UHB
   // row of the active verse toggles them into selectedKeys; "Use selection"
@@ -2134,8 +2190,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // matcher's suggestions back onto the row by source-key surfaces it. Values are
   // short article ids (e.g. "other/lover").
   const twlRowAlternatives = useMemo<Map<string, string[]>>(() => {
+    if (!data || verseTwlSuggestions.length === 0) return EMPTY_TWL_ROW_ALTERNATIVES;
     const map = new Map<string, string[]>();
-    if (!data || verseTwlSuggestions.length === 0) return map;
     // Each group carries its own verse — resolve and match per verse so that in
     // a bridge every verse's committed rows get alternatives from their OWN
     // verse's matcher, not only the leading/active one. Row ids are unique
