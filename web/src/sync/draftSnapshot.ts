@@ -1,12 +1,18 @@
 // A keystroke replaces a draft's record (new payload/updatedAt/generation)
 // without ever adding or removing a key. A whole-list subscriber that shows
-// only *which* drafts exist — never their live content, including the
-// generation a save is in flight for — gains nothing from re-rendering on
-// every one of those replacements. Wrap `subscribe` with this to skip
-// callbacks whose key set is unchanged from the last one delivered.
+// only *which* drafts exist and their `meta` — never their live content,
+// including the generation a save is in flight for — gains nothing from
+// re-rendering on every one of those replacements. Wrap `subscribe` with this
+// to skip callbacks whose (key, meta) pairs are unchanged from the last one
+// delivered.
 //
-// SyncStatusBar's count/jump-menu is exactly that: key + the (static) meta
-// text. UnsavedToasts is NOT a fit despite the similar "which drafts" framing
+// `meta` counts, not just the key: a row draft's key (drafts.ts's rowKey) has
+// no chapter/verse, but its meta does, and moving the row to another verse
+// with an unsaved draft open rewrites meta under the SAME key. Comparing keys
+// alone froze SyncStatusBar's jump menu at the old verse (#901 review A1).
+//
+// SyncStatusBar's count/jump-menu is exactly that: key + meta text.
+// UnsavedToasts is NOT a fit despite the similar "which drafts" framing
 // — it also matches a draft's CURRENT `generation` against in-flight outbox
 // ops (verseDraftHasActiveSave) to decide whether a save is already covering
 // this draft, and a generation changes on every keystroke. Deduping by key
@@ -15,15 +21,18 @@
 // its own save (toast wrongly hidden) or a stale generation could fail to
 // match the save it actually triggered (toast wrongly stuck showing
 // "unsaved"). See #901's review (2026-10-02) for both failure modes.
-export function dedupeByKeys<T extends { key: string }>(
+export function dedupeByKeys<T extends { key: string; meta?: unknown }>(
   subscribe: (fn: (all: T[]) => void) => () => void,
 ): (fn: (all: T[]) => void) => () => void {
   return (fn) => {
-    let lastKeys: string | undefined;
+    let lastSignature: string | undefined;
     return subscribe((all) => {
-      const keys = all.map((r) => r.key).sort().join("\u0000");
-      if (keys === lastKeys) return;
-      lastKeys = keys;
+      const signature = all
+        .map((r) => `${r.key}\u0001${JSON.stringify(r.meta)}`)
+        .sort()
+        .join("\u0000");
+      if (signature === lastSignature) return;
+      lastSignature = signature;
       fn(all);
     });
   };
