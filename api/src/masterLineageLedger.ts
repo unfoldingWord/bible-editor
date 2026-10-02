@@ -142,9 +142,11 @@ export async function readLedgerMasterLineage(
   // and seen_at is our arrival stamp, the closest thing to push time Gitea
   // gives us. Strictly greater, because the first clean poll stamps every
   // bootstrap row with seen_at = coverage_since, and a window starting at
-  // that floor must not count the whole bootstrap batch as new. Errors in
-  // this clause lean safe: poll lag or a backfill's later seen_at can only
-  // admit an extra row (more "human found"), never hide one.
+  // that floor must not count the whole bootstrap batch as new. A backfilled
+  // row carries its gap's opening-poll time, not the backfill's own time
+  // (dcsCommitBackfill.ts), so backfilled history is not misread as late.
+  // Poll lag can still admit a row that landed just before the window,
+  // which only leans toward "human found".
   const rows = await db
     .prepare(
       `SELECT repo, sha, parent_sha, author_name, author_email, committed_at, message,

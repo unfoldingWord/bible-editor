@@ -102,6 +102,7 @@ export const DCS_BACKFILL_PAGE_LIMIT = 2;
 interface GapState {
   gap_since_sha: string | null;
   gap_frontier_json: string | null;
+  gap_at?: number | null;
 }
 
 export interface BackfillResult {
@@ -145,7 +146,7 @@ const UPDATE_FRONTIER_SQL = `UPDATE dcs_repo_polls
  * backfillDcsGaps below.
  */
 export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: number): Promise<BackfillResult> {
-  const state = await env.DB.prepare(`SELECT gap_since_sha, gap_frontier_json FROM dcs_repo_polls WHERE repo = ?1`)
+  const state = await env.DB.prepare(`SELECT gap_since_sha, gap_frontier_json, gap_at FROM dcs_repo_polls WHERE repo = ?1`)
     .bind(repo)
     .first<GapState>();
 
@@ -179,6 +180,17 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
 
   const { rows } = ledgerRowsFromCommits(repo, page.commits);
   const ordered = [...rows].reverse(); // oldest-first, same discipline as pollDcsRepo
+  // seen_at for a backfilled row is the time of the capped poll that opened
+  // the gap (gap_at), not now. Every commit behind that poll's tip was
+  // already on master when it ran, so gap_at is a true upper bound on its
+  // arrival, the same meaning a forward poll's stamp has. Stamping `now`
+  // instead made readLedgerMasterLineage's `seen_at > confirmedAt` clause
+  // (#691) read a bootstrap's whole backfilled history as late pushes for
+  // any window opened between the floor and the backfill. Limit: gap_at is
+  // the OLDEST open gap's time, so a commit from a second, newer gap gets an
+  // earlier stamp than its arrival and can be missed as a late push. That is
+  // the same miss every read had before #691, not a new one.
+  const seenAt = state.gap_at ?? nowSeconds;
   const insertStatements = ordered.map((r) =>
     env.DB.prepare(INSERT_COMMIT_SQL).bind(
       r.repo,
@@ -191,7 +203,7 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
       r.classification,
       r.reason,
       r.filesJson,
-      nowSeconds,
+      seenAt,
     ),
   );
   for (let i = 0; i < insertStatements.length; i += DCS_POLL_WRITE_BATCH) {
