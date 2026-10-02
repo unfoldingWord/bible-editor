@@ -20,8 +20,7 @@ import { AlignmentPanel, type AlignerLock, type AlignmentPanelHandle } from "./A
 import { UhbStrip } from "./UhbStrip";
 import { type HoverHighlight, type HighlightCtx } from "../lib/highlightTypes";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
-import { api, type TwlRow, type VerseDto } from "../sync/api";
-import { onOutboxDiscard } from "../sync/outbox";
+import type { TwlRow, VerseDto } from "../sync/api";
 import type { VerseBaseHold } from "../sync/versePin";
 import { alignmentPanelRowKey } from "../sync/alignmentDraftSaveState";
 import type { LexiconEntry } from "../hooks/useLexicon";
@@ -940,17 +939,8 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   ref,
 ) {
   const readOnly = locked || bookLocked;
-  const { bibleVersion } = slot;
-  // #1075: a saved edit is shown from the chapter cache's optimistic copy. If
-  // its queued op is then discarded (an unresolvable 409, a refused save),
-  // nothing puts the server's row back in that cache, so `slot.verse` keeps
-  // the discarded text at the old version. The line re-reads the row and
-  // shows it until the cache next changes (`over` is the cached verse it
-  // stands in for).
-  const [serverRow, setServerRow] = useState<{ over: VerseDto | null; row: VerseDto } | null>(null);
-  const verse = serverRow && serverRow.over === slot.verse ? serverRow.row : slot.verse;
-  const slotVerseRef = useRef(slot.verse);
-  slotVerseRef.current = slot.verse;
+  const { bibleVersion, verse } = slot;
+  // Mirrors `dirty` for the blur handler, which may run before a re-render.
   const dirtyRef = useRef(false);
   const editable = useMemo(() => (verse ? extractEditableText(verse.content) : ""), [verse]);
   const elRef = useRef<HTMLDivElement | null>(null);
@@ -997,34 +987,6 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
     if (holdRef.current || !el) return;
     if (normalizeEditable(el.textContent ?? "") === normalizeEditable(editable)) shownVerseRef.current = verse;
   };
-  // #1075: a discarded op for this row never reached the server, so a clean
-  // line (one whose text was handed to that op) re-reads the server's row;
-  // the resync below then shows it, and the next edit's hold pins its
-  // version. A dirty line is a newer edit and keeps its text.
-  const rowBook = verse?.book;
-  const rowChapter = verse?.chapter;
-  const rowStart = verse?.verse;
-  useEffect(() => {
-    if (rowBook === undefined || rowChapter === undefined || rowStart === undefined) return;
-    let live = true;
-    const unsubscribe = onOutboxDiscard((op) => {
-      const t = op.target;
-      if (t.kind !== "verse" || t.book !== rowBook || t.chapter !== rowChapter || t.verse !== rowStart || t.bibleVersion !== bibleVersion) return;
-      api
-        .getVerse(rowBook, rowChapter, rowStart, bibleVersion)
-        .then((row) => {
-          if (live && !dirtyRef.current) setServerRow({ over: slotVerseRef.current, row });
-        })
-        .catch(() => {
-          /* the cache's copy stays on screen, as before */
-        });
-    });
-    return () => {
-      live = false;
-      unsubscribe();
-    };
-  }, [rowBook, rowChapter, rowStart, bibleVersion]);
-
   // Unmounting drops whatever the line showed (#1060).
   useEffect(
     () => () => {
@@ -1194,6 +1156,19 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
               ? "save or cancel the pending alignment edits before editing the reading text"
               : undefined
           }
+          // The resync skipped under the caret runs once the caret leaves, for
+          // a line with nothing unsaved (#1075 review): otherwise the box
+          // keeps text the server no longer has (a discarded save, another
+          // editor's change) while reading as clean, and its next edit pins
+          // the old version. A dirty line keeps its edit (#1067).
+          onBlur={(e) => {
+            const el = e.currentTarget as HTMLDivElement;
+            if (dirtyRef.current) return;
+            if (normalizeEditable(el.textContent ?? "") === normalizeEditable(editable)) return;
+            el.textContent = editable;
+            lastSetRef.current = editable;
+            markDirty(false);
+          }}
           onInput={(e) => {
             const value = (e.currentTarget as HTMLDivElement).textContent ?? "";
             lastSetRef.current = value;

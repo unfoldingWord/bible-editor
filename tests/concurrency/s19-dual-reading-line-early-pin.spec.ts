@@ -389,6 +389,23 @@ test("after a 409'd reading-line save is discarded, the line shows the server's 
     await expect(o.line).not.toContainText(`EDIT-${stamp}`);
     await expect(o.save).toBeDisabled();
     await expect(o.undo).toBeDisabled();
+    // The cache itself was rolled back, not just the line: the main column
+    // shows the server's text, and so does a reopened aligner.
+    const cell = page.locator(`[data-find-cell="${V72.chapter}-${V72.verse}-${BV}"]`).first();
+    await expect(cell).toContainText(tag);
+    await expect(cell).not.toContainText(`EDIT-${stamp}`);
+    await o.dialog.getByRole("button", { name: "close", exact: true }).click();
+    await expect(o.dialog).toHaveCount(0);
+    await page.locator(`button[aria-label^="align ${BV}"]`).first().click();
+    await page.locator("button", { hasText: "Side-by-side" }).first().click();
+    await o.dialog.locator('[contenteditable="true"]:visible').first().waitFor({ state: "visible" });
+    await o.dialog
+      .locator('[contenteditable="true"]:visible')
+      .first()
+      .evaluate((el) => el.setAttribute("data-s19-line", "ULT"));
+    await expect(o.line).toContainText(tag);
+    await expect(o.line).not.toContainText(`EDIT-${stamp}`);
+    await expect(o.save).toBeDisabled();
 
     // A new edit goes out against the server's version and lands.
     await typeAtEnd(page, o.line, ` AGAIN-${stamp}`);

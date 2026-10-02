@@ -97,7 +97,7 @@ import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
-import { onOutboxResult, type OutboxOp } from "../sync/outbox";
+import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
 import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
 import {
@@ -1156,6 +1156,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }
       }),
     [pushPipelineToast, rollBackRefusedVerse],
+  );
+  // #1075: a discarded verse op (an unresolvable 409, a refused save, discard
+  // all) leaves its optimistic content in the caches just as a lock refusal
+  // does, so a reopened aligner or reading line would show the discarded
+  // text as saved and its next edit would pin the old version. Same rollback.
+  useEffect(
+    () =>
+      onOutboxDiscard((op) => {
+        if (op.target.kind === "verse") void rollBackRefusedVerse(op);
+      }),
+    [rollBackRefusedVerse],
   );
   // #1071: say "kept" only when a crash draft or an open panel actually holds
   // the refused drags. Two queued saves of one verse refused together get
