@@ -50,7 +50,7 @@ import {
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
 import { shouldApplyUpsert } from "./rowUpsertGuard";
-import { drafts, verseKey, pinVerseBase, pinEpoch, unpinVerseBaseIfIdle, holdVerseBaseForEditor, registerVerseVersionReader } from "../sync/drafts";
+import { drafts, verseKey, rowKey as draftRowKey, pinVerseBase, pinEpoch, unpinVerseBaseIfIdle, holdVerseBaseForEditor, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -3521,7 +3521,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const baseline: Record<string, unknown> = {};
     for (const field of Object.keys(patch)) baseline[field] = rowRecord[field];
     applyLocalRowPatch(kind, row.id, localPatch);
-    void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, { ...opts, book: row.book, baseline });
+    // #1092: tie the op to the draft generation it saves, so its 200 cannot
+    // clear typing that arrives while it is in flight.
+    const draftGeneration = drafts.latestGeneration(draftRowKey(kind, row.book, row.id));
+    void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, {
+      ...opts,
+      book: row.book,
+      baseline,
+      draftGeneration,
+    });
   };
 
   // Draft-write path. Every keystroke in a verse-text cell calls this; it

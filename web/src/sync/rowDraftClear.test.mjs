@@ -84,5 +84,13 @@ assert.equal(
   false,
   "typing started after the 200 on a prior-session draft: keep",
 );
+// The sequence measured live: the Save captured g10, the user typed on (g21),
+// and NoteCard re-set the still-dirty draft (g22) when the 200 bumped the
+// version, before the 200 handler ran.
+assert.equal(
+  rowDraftClearAfterOk(save, "g10", "g22", stored("g22")),
+  false,
+  "typing after the Save, re-set before the 200 handler: keep",
+);
 
 console.log("rowDraftClear: all assertions passed");

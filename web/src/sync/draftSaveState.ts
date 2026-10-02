@@ -189,3 +189,24 @@ export function rowOpClearsDraft(
   if (fields.length === 0) return true;
   return fields.some((field) => Object.prototype.hasOwnProperty.call(op.patch, field));
 }
+
+// Whether the 200 handler for a row op may delete the row draft it just read
+// (#1092 review). `captured` is the draft generation the op saved, captured
+// at enqueue (or, for a legacy or draftless op, the latest generation when the
+// 200 was handled); `latestNow` is the key's latest generation at the moment
+// of the read. Typing after the save (a keystroke while it is in flight, or
+// NoteCard re-setting a still-dirty draft when the row version bumps) shows up
+// as a different generation, and that newer draft must never be deleted.
+// `captured` undefined means no draft was set this session (a prior session's
+// record), which the save may still clear.
+export function rowDraftClearAfterOk(
+  op: Pick<OutboxOp, "action" | "patch">,
+  captured: string | undefined,
+  latestNow: string | undefined,
+  rec: Pick<DraftRecord, "payload" | "generation"> | undefined,
+): boolean {
+  if (!rec) return false;
+  if (latestNow !== captured) return false;
+  if (captured !== undefined && rec.generation !== captured) return false;
+  return rowOpClearsDraft(op, rec);
+}

@@ -12,7 +12,7 @@ import { isReadOnly, type RowKind } from "./api";
 import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "./outbox";
 import {
   pinReleaseForVerseExit,
-  rowOpClearsDraft,
+  rowDraftClearAfterOk,
   verseOpExitInfo,
   type VerseOpExit,
   type VerseOpExitInfo,
@@ -292,6 +292,12 @@ export const drafts = {
     return true;
   },
 
+  // The generation of the latest set() for `key` this session, if any. A row
+  // save captures it at enqueue so its 200 clears only that draft (#1092).
+  latestGeneration(key: string): string | undefined {
+    return latestGenerationByKey.get(key);
+  },
+
   async list(): Promise<DraftRecord[]> {
     return listAll();
   },
@@ -435,6 +441,24 @@ function handleVerseExit(op: OutboxOp, exit: VerseOpExit, updated?: unknown): vo
   }
 }
 
+// The row half of the outbox-ok listener (#1092). One readwrite transaction
+// reads the draft and deletes it only when rowDraftClearAfterOk allows, so a
+// set() that started after the 200 (a newer generation) is never deleted. The
+// in-memory dirty marks are dropped only while no newer set() has started.
+async function clearRowDraftAfterOk(key: string, op: OutboxOp, captured: string | undefined): Promise<void> {
+  const idb = await db();
+  const tx = idb.transaction(STORE, "readwrite");
+  const rec = (await tx.store.get(key)) as DraftRecord | undefined;
+  const remove = rowDraftClearAfterOk(op, captured, latestGenerationByKey.get(key), rec);
+  if (remove) await tx.store.delete(key);
+  await tx.done;
+  if ((remove || !rec) && latestGenerationByKey.get(key) === captured) {
+    latestGenerationByKey.delete(key);
+    pendingKeys.delete(key);
+  }
+  if (remove) notify(key);
+}
+
 onOutboxResult((op, result) => {
   if (op.target.kind === "verse") {
     if (result.kind === "ok") handleVerseExit(op, "ok", result.updated);
@@ -445,10 +469,16 @@ onOutboxResult((op, result) => {
   if (op.target.kind === "row") {
     // #1092: only an op that saved the draft's fields clears it — a move or
     // reorder must leave unsaved typing in the store (see rowOpClearsDraft).
+    // The op carries the draft generation it saved (captured at enqueue).
+    // NoteCard re-sets a still-dirty draft when the row version bumps, and
+    // that runs BEFORE this listener, so a generation read here could already
+    // be the newer typing. Legacy ops and draftless saves (no draft at
+    // enqueue) fall back to the generation read now.
     const key = rowKey(op.target.rowKind, op.target.book, op.target.id);
-    void drafts.get(key).then((rec) => {
-      if (rec && !rowOpClearsDraft(op, rec)) return;
-      return drafts.clear(key);
+    const captured = op.draftGeneration ?? latestGenerationByKey.get(key);
+    void clearRowDraftAfterOk(key, op, captured).catch((error) => {
+      // Fail safe: a failed read or delete leaves the draft in place.
+      console.warn("Unable to clear a saved row draft", error);
     });
   }
 });
