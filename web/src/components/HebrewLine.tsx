@@ -1,19 +1,25 @@
 // Renders a Hebrew (UHB) or Greek (UGNT) verse one \w token at a time so
-// each carries a lexicon Tooltip on hover, while still respecting the
-// note-quote highlight set from highlight.ts. Used by the main scripture
-// column in stacked, columns, and book modes — these versions are
-// read-only, so we don't have to maintain a contentEditable cursor.
+// each shows the lexical hover box, while still respecting the note-quote
+// highlight set from highlight.ts. Used by the main scripture column in
+// stacked, columns, and book modes — these versions are read-only, so we
+// don't have to maintain a contentEditable cursor.
+//
+// Words are plain <span className> elements; the line carries the one
+// stylesheet for their highlight classes and the one hover box, which reads
+// the hovered word back from its data-w index (#899). A per-word MUI Tooltip
+// and sx callback cost a Popper fiber and an emotion serialization per word —
+// thousands for a long chapter in columns or book mode.
 
-import { memo, useMemo } from "react";
-import { Box } from "@mui/material";
+import { memo, useMemo, useState } from "react";
+import { Box, Tooltip } from "@mui/material";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
 import type { HighlightKey } from "../lib/highlight";
 import type { TwlRow } from "../sync/api";
-import { roleLineSx, wordHighlightStyles } from "../lib/highlightStyles";
+import { hebrewLineSx, hebrewWordClass, sourceWordOf, wordOccurrence } from "../lib/hebrewLine";
 import { SourceTooltipBody } from "./SourceTooltipBody";
-import { pinLex, usePinnedLexRefresh } from "./PinnedLexBox";
-import { LexTooltip } from "./LexTooltip";
+import { pinLex, usePinnedLexRefreshFrom } from "./PinnedLexBox";
+import { lexPopperPlacement } from "./LexTooltip";
 import { buildTwHintMap, twHintFromMap } from "./UhbStrip";
 
 interface Props {
@@ -45,66 +51,84 @@ interface Props {
   verseNum?: number;
 }
 
+// Built once per mode: the line's sx is the same object every render.
+const LINE_SX = {
+  light: { unicodeBidi: "isolate", ...hebrewLineSx("light") },
+  dark: { unicodeBidi: "isolate", ...hebrewLineSx("dark") },
+} as const;
+
+type Hover = {
+  word: HTMLElement;
+  source: SourceWord;
+  placed: ReturnType<typeof lexPopperPlacement>;
+  open: boolean;
+};
+
 export const HebrewLine = memo(function HebrewLine({ verseObjects, lexiconMap, highlights, prevHighlights, nextHighlights, findHighlights, activeFindKey, fallbackText, twl, verseNum }: Props) {
   // Precompute the per-verse orig-word → tw hint lookup once (see buildTwHintMap)
-  // so the token walk is an O(1) Map.get per \w instead of re-splitting every
-  // TWL row's orig_words per token. Memoized on [twl, verseNum] so it isn't
-  // rebuilt (re-splitting + nfc()-normalizing every TWL row) on every render.
+  // so a hover is an O(1) Map.get instead of re-splitting every TWL row's
+  // orig_words. Memoized on [twl, verseNum] so it isn't rebuilt (re-splitting
+  // + nfc()-normalizing every TWL row) on every render.
   const twHints = useMemo(
     () => (twl && verseNum != null ? buildTwHintMap(twl, verseNum) : null),
     [twl, verseNum],
   );
+  // The word spans depend only on the verse and its highlight sets, so a
+  // lexicon batch landing or a hover doesn't rebuild them. `words[i]` is the
+  // \w node behind the span with data-w={i}.
+  const { items, words } = useMemo(() => {
+    const items: React.ReactNode[] = [];
+    const words: Record<string, unknown>[] = [];
+    if (!Array.isArray(verseObjects)) return { items, words };
+    const walk = (nodes: unknown[]) => {
+      for (const n of nodes ?? []) {
+        const o = n as Record<string, unknown> | null;
+        if (!o) continue;
+        if (o["type"] === "text") {
+          items.push(<span key={`t${items.length}`}>{String(o["text"] ?? "")}</span>);
+        } else if (o["type"] === "word" && o["tag"] === "w") {
+          const text = String(o["text"] ?? "");
+          const key: HighlightKey = `${text}|${wordOccurrence(o)}`;
+          const className = hebrewWordClass({
+            find: !!findHighlights && findHighlights.has(key),
+            activeFind: !!activeFindKey && activeFindKey === key,
+            note: !!highlights && highlights.has(key),
+            prev: !!prevHighlights && prevHighlights.has(key),
+            next: !!nextHighlights && nextHighlights.has(key),
+          });
+          items.push(
+            <span key={`w${items.length}`} className={className} data-w={words.length}>
+              {text}
+            </span>,
+          );
+          words.push(o);
+        } else if (o["type"] === "milestone") {
+          walk((o["children"] as unknown[] | undefined) ?? []);
+        }
+      }
+    };
+    walk(verseObjects);
+    return { items, words };
+  }, [verseObjects, highlights, prevHighlights, nextHighlights, findHighlights, activeFindKey]);
+  // A word pinned before its lexicon entry loaded fills in when it arrives.
+  usePinnedLexRefreshFrom(lexiconMap);
+  // The hover box is mounted only while a word is hovered (and fading out).
+  const [hover, setHover] = useState<Hover | null>(null);
+
   if (!Array.isArray(verseObjects)) {
     return <>{fallbackText ?? ""}</>;
   }
-  const items: React.ReactNode[] = [];
-  const walk = (nodes: unknown[]) => {
-    for (const n of nodes ?? []) {
-      const o = n as Record<string, unknown> | null;
-      if (!o) continue;
-      if (o["type"] === "text") {
-        items.push(
-          <span key={`t${items.length}`}>{String(o["text"] ?? "")}</span>,
-        );
-      } else if (o["type"] === "word" && o["tag"] === "w") {
-        const text = String(o["text"] ?? "");
-        const strong = String(o["strong"] ?? "");
-        const occ = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
-        const key: HighlightKey = `${text}|${occ}`;
-        const isFindHit = !!findHighlights && findHighlights.has(key);
-        const isActiveFind = !!activeFindKey && activeFindKey === key;
-        const isHighlighted = !!highlights && highlights.has(key);
-        const isPrev = !!prevHighlights && prevHighlights.has(key);
-        const isNext = !!nextHighlights && nextHighlights.has(key);
-        const src: SourceWord = {
-          id: "",
-          strong,
-          lemma: String(o["lemma"] ?? ""),
-          morph: String(o["morph"] ?? ""),
-          occurrence: String(occ),
-          occurrences: String(o["occurrences"] ?? "1"),
-          content: text,
-        };
-        items.push(
-          <HebrewWord
-            key={`w${items.length}`}
-            text={text}
-            src={src}
-            lex={lexiconMap.get(strong) ?? null}
-            twHint={twHints ? twHintFromMap(twHints, text) : null}
-            isFindHit={isFindHit}
-            isActiveFind={isActiveFind}
-            isHighlighted={isHighlighted}
-            isPrev={isPrev}
-            isNext={isNext}
-          />,
-        );
-      } else if (o["type"] === "milestone") {
-        walk((o["children"] as unknown[] | undefined) ?? []);
-      }
-    }
+
+  const wordAt = (e: React.SyntheticEvent): { el: HTMLElement; source: SourceWord } | null => {
+    const el = e.target instanceof Element ? e.target.closest<HTMLElement>("[data-w]") : null;
+    if (!el || !e.currentTarget.contains(el)) return null;
+    const node = words[Number(el.dataset.w)];
+    return node ? { el, source: sourceWordOf(node) } : null;
   };
-  walk(verseObjects);
+  const close = () => setHover((h) => (h && h.open ? { ...h, open: false } : h));
+  const lexOf = (s: SourceWord) => lexiconMap.get(s.strong) ?? null;
+  const twHintOf = (s: SourceWord) => (twHints ? twHintFromMap(twHints, s.content ?? "") : null);
+
   // Every caller renders Hebrew (UHB) here — UGNT/Greek goes through the
   // offset painter instead (see the callers' own "UHB renders via
   // HebrewLine" comments) — so direction is intrinsic to the component, not
@@ -112,78 +136,53 @@ export const HebrewLine = memo(function HebrewLine({ verseObjects, lexiconMap, h
   // rtl + isolate span; that's a convention, not a guarantee, so isolation
   // is set here too (#843) rather than relied on from outside.
   return (
-    <Box component="span" dir="rtl" data-lex-line sx={{ unicodeBidi: "isolate" }}>
+    <Box
+      component="span"
+      dir="rtl"
+      data-lex-line
+      sx={(theme) => LINE_SX[theme.palette.mode]}
+      onMouseOver={(e) => {
+        const w = wordAt(e);
+        if (!w) return close();
+        if (hover?.open && hover.word === w.el) return;
+        setHover({ word: w.el, source: w.source, placed: lexPopperPlacement(w.el), open: true });
+      }}
+      onMouseLeave={close}
+      // Double-click pins the same lexical info into the app's one pinned
+      // lexical box (PinnedLexBox), whose text can be selected and copied —
+      // the hover box is pointerEvents:none and can't be.
+      onDoubleClick={(e) => {
+        const w = wordAt(e);
+        if (w) pinLex(w.source, lexOf(w.source), twHintOf(w.source));
+      }}
+    >
       {items}
+      {hover && (
+        <Tooltip
+          open={hover.open}
+          onClose={close}
+          disableHoverListener
+          disableFocusListener
+          disableTouchListener
+          title={
+            <SourceTooltipBody source={hover.source} lex={lexOf(hover.source)} twHint={twHintOf(hover.source)} pinHint />
+          }
+          slotProps={{
+            popper: { sx: { pointerEvents: "none" }, ...hover.placed },
+            // Unmount once faded out, so lines hovered earlier hold no Tooltip.
+            // (This replaces the Popper's own onExited, which only matters
+            // to a Popper that stays mounted.)
+            transition: { onExited: () => setHover((h) => (h && !h.open ? null : h)) },
+          }}
+        >
+          {/* The box is placed against the hovered word (placed.anchorEl);
+              MUI just needs an element child. */}
+          <span />
+        </Tooltip>
+      )}
     </Box>
   );
 });
-
-// One \w source token: hover shows the lexical Tooltip; double-click pins the
-// same lexical info into the app's one pinned lexical box (PinnedLexBox) so its text (lemma, gloss,
-// definition) can be selected and copied — the hover Tooltip is
-// pointerEvents:none and can't be.
-function HebrewWord({
-  text,
-  src,
-  lex,
-  twHint,
-  isFindHit,
-  isActiveFind,
-  isHighlighted,
-  isPrev,
-  isNext,
-}: {
-  text: string;
-  src: SourceWord;
-  lex: LexiconEntry | null;
-  twHint: string | null;
-  isFindHit: boolean;
-  isActiveFind: boolean;
-  isHighlighted: boolean;
-  isPrev: boolean;
-  isNext: boolean;
-}) {
-  usePinnedLexRefresh(src, lex);
-  return (
-    <>
-      <LexTooltip
-        title={
-          <SourceTooltipBody source={src} lex={lex} twHint={twHint} pinHint />
-        }
-        enterDelay={0}
-        enterNextDelay={0}
-        slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
-      >
-        <Box
-          component="span"
-          onDoubleClick={() => pinLex(src, lex, twHint)}
-          sx={(theme) => {
-            const mode = theme.palette.mode;
-            const hl = wordHighlightStyles(mode);
-            // Find hits own the token (orange) and suppress both the yellow
-            // note fill and the reorder stoplight lines, matching the <mark>
-            // render path's find precedence.
-            const roleSx =
-              !isFindHit && !isActiveFind ? roleLineSx(mode, isPrev, isNext) : undefined;
-            return {
-              cursor: "help",
-              ...(isActiveFind
-                ? hl.findActive
-                : isFindHit
-                  ? hl.find
-                  : isHighlighted
-                    ? hl.hl
-                    : {}),
-              ...(roleSx ?? {}),
-            };
-          }}
-        >
-          {text}
-        </Box>
-      </LexTooltip>
-    </>
-  );
-}
 
 // Collect every \w token's raw Strong's from a verseObjects tree. Used by
 // callers that want to pre-load lexicon entries for a chapter at a time.
