@@ -688,8 +688,9 @@ test("a range row opened on its inner verse: a refused save's drags come back un
     );
     await dual.locator('button:has(svg[data-testid="CloseIcon"])').first().click();
     await gate.getByRole("button", { name: "Save", exact: true }).click();
-    await page.getByRole("button", { name: "Save anyway", exact: true }).click();
-    expect((await patched).status()).toBe(200);
+    // The local cache still holds the refused content, so this save may not
+    // ask again (#1073).
+    expect(await confirmUnalignIfAsked(page, patched)).toBe(200);
   } finally {
     clearLock();
     if (bridged) {
