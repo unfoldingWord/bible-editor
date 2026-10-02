@@ -64,7 +64,9 @@ test("single aligner panel is blocked while the dual-aligner chunk loads", async
       { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 },
     );
     expect(hitsPanel, "single aligner panel is still clickable while the dual chunk loads").toBe(false);
-    await expect(page.getByRole("progressbar").first()).toBeVisible();
+    // CSS, not getByRole: MUI's Backdrop is aria-hidden, which hides the
+    // spinner from role queries.
+    await expect(page.locator('[role="progressbar"]').first()).toBeVisible();
 
     // Once the chunk arrives the dual aligner replaces the loading state.
     await expect(dialog).toBeVisible({ timeout: CHUNK_DELAY_MS + 10_000 });
