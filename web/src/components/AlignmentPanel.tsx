@@ -388,6 +388,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
             if (!Array.isArray(vo)) return;
             setState(parseAlignment(vo, sourceVerseObjectsRef.current));
             setRestored(true);
+          }).catch(() => {
+            // Best effort, like the mount-time read: the draft is still there on reopen.
           });
         }),
       [book, chapter, verseNum, bibleVersion],

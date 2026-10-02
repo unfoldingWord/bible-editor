@@ -191,8 +191,6 @@ assert.equal(alignmentPanelRowKey({ verse: 7, verse_end: 7 }), "7-7");
 assert.equal(alignmentPanelRowKey({ verse: 6, verse_end: 7 }), "6-7", "a bridge keys differently");
 assert.equal(alignmentPanelRowKey(null), "none");
 
-console.log("alignmentDraftSaveState: 35 passed");
-
 // #1077: may an already-open panel re-read the crash draft a refused save
 // just wrote? Its one-time hydration read ran before the refusal.
 {
@@ -245,3 +243,5 @@ console.log("alignmentDraftSaveState: 35 passed");
     "a draft another refusal wrote is not this refusal's",
   );
 }
+
+console.log("alignmentDraftSaveState: 43 passed");

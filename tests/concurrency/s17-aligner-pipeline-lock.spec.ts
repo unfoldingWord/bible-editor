@@ -902,9 +902,18 @@ test("a refused text edit in the main column: the chapter cache goes back to the
 // Click through the "word will be unaligned" confirm if it opens before
 // `done` settles (whether a drag trips it depends on the verse's other
 // aligned copies of the word).
+// The wait is bounded and the click happens only once the button is visible,
+// so no click is left pending to hit a later save's confirm.
 async function saveAnywayIfAsked(page: Page, done: Promise<unknown>): Promise<void> {
   const anyway = page.getByRole("button", { name: "Save anyway", exact: true });
-  await Promise.race([done, anyway.click().catch(() => undefined)]);
+  const asked = await Promise.race([
+    done.then(() => false),
+    anyway.waitFor({ state: "visible", timeout: 5_000 }).then(
+      () => true,
+      () => false,
+    ),
+  ]);
+  if (asked) await anyway.click();
   await done;
 }
 
@@ -961,9 +970,16 @@ test("a refused gate Save whose 409 lands after the aligner reopened: the open p
     const refused = page.waitForResponse(
       (r) => r.request().method() === "PATCH" && r.url().includes(VERSE_PATH),
     );
+    // The rollback's chapter re-read, sent after the 409. Reset before it
+    // lands would go back to the optimistic row, not the server's.
+    const reread = page.waitForResponse(
+      (r) => r.request().method() === "GET" && r.url().endsWith(`/api/chapters/${BOOK}/${CHAPTER}`),
+    );
     release();
     expect((await refused).status()).toBe(409);
     await expect(page.getByText(/Your changes are kept in the aligner/)).toBeVisible();
+    expect((await reread).ok()).toBe(true);
+    await page.waitForTimeout(300); // let the applied row render
 
     // The open panel shows the drags as unsaved, over the server's alignment.
     await expect(resetBtn).toBeEnabled({ timeout: 15_000 });
