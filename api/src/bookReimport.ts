@@ -9645,6 +9645,15 @@ export const markLineageConfirmedConvergedForTest = (
   candidate: { pushedBlobSha: string; pushedReadAt: number; pushedEditId: number | null },
 ): Promise<boolean> => markLineageConfirmedConverged(env, book, resource, candidate);
 
+export const markOwnPublishConvergedForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+  readAt: number,
+  pushedEditId: number | null,
+  masterSha: string | null,
+): Promise<boolean> => markOwnPublishConverged(env, book, resource, readAt, pushedEditId, masterSha);
+
 export async function storedResourceSha(env: Env, book: string, resource: Resource): Promise<string | null> {
   const row = await env.DB.prepare(
     `SELECT source_sha FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
