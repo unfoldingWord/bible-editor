@@ -15,8 +15,11 @@ import { csrfToken, newUserContext } from "./helpers";
 //      last synced from. Saving after a mid-edit server change sends that old
 //      version and gets a 409; the server keeps the other change.
 //   2. The pin goes as soon as the line goes clean (Undo, typed back by hand,
-//      replaced by an unfocused resync): a new edit saved after the verse
-//      moved again lands with a 200, never a 409 from a leaked pin.
+//      the verse moving onto the line's own text): a new edit saved after the
+//      verse moved again lands with a 200, never a 409 from a leaked pin.
+//   3. #1067: a verse change never replaces unsaved text on screen, focused or
+//      not. A line that lost focus keeps its edit and its pin, so Save is a
+//      409 and a merge prompt, not an overwrite.
 //
 // Kept apart from s18 (book locks) so the two suites can change separately.
 
@@ -264,15 +267,69 @@ test("a reading-line pin is released however the line goes clean (Undo, typed ba
     await expect(o.undo).toBeDisabled();
     await saveAfterMove(o, 2);
 
-    // 3. Replaced by a resync from the server while the line is not focused.
+    // 3. The verse moves onto the line's own text while the line is not
+    //    focused: the resync finds nothing left unsaved. (A verse change never
+    //    replaces a dirty line's text (#1067), so this is the only way a
+    //    resync cleans one.)
     await typeAtEnd(page, o.line, ` RESYNC-${stamp}`);
     expect(await pinnedVersion(page)).toBeDefined();
     await o.title.click();
-    await bumpVerse(page, context.request, csrf, `[s19-3a-${stamp}]`);
-    await expect(o.line).toContainText(`[s19-3a-${stamp}]`);
-    await expect(o.line).not.toContainText(`RESYNC-${stamp}`);
+    await bumpVerse(page, context.request, csrf, `RESYNC-${stamp}`);
     await expect(o.undo).toBeDisabled();
     await saveAfterMove(o, 3);
+  } finally {
+    await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
+    await context.close();
+  }
+});
+
+// #1067: the unfocused resync used to replace a dirty line's text whenever
+// the verse changed, since its "still showing what we set?" check compared
+// against text onInput keeps equal to the box. The edit vanished, the line
+// went clean and its pin was released, with nothing to warn the translator.
+test("a reading line with unsaved text that lost focus keeps it when another editor changes the verse: Save is a 409 and a merge prompt", async ({
+  browser,
+}) => {
+  test.setTimeout(60_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const original = await serverVerse(context.request);
+  const stamp = Date.now();
+  const tag = `[s19-unfocused-${stamp}]`;
+
+  try {
+    const o = await openDual(page);
+    await typeAtEnd(page, o.line, ` EDIT-${stamp}`);
+    expect(await pinnedVersion(page)).toBe(original.version);
+
+    // Click into the alignment panel: the line loses focus, still dirty.
+    await o.dialog.getByText(`${BV} words`, { exact: true }).first().click();
+    await expect(o.line).not.toBeFocused();
+    await expect(o.save).toBeEnabled();
+
+    const bumped = await bumpVerse(page, context.request, csrf, tag);
+    expect(bumped).toBeGreaterThan(original.version);
+    // The moved verse has rendered (the main column behind the dialog shows
+    // it), so the line's resync has run by now.
+    await expect(page.locator(`[data-find-cell="${V72.chapter}-${V72.verse}-${BV}"]`).first()).toContainText(tag);
+
+    // The edit is still on screen, still unsaved, still pinned to its base.
+    await expect(o.line).toContainText(`EDIT-${stamp}`);
+    await expect(o.line).not.toContainText(tag);
+    await expect(o.save).toBeEnabled();
+    expect(await pinnedVersion(page)).toBe(original.version);
+
+    const patched = nextVersePatch(page);
+    await o.save.click();
+    const res = await patched;
+    expect(res.request().headers()["if-match"]).toBe(String(original.version));
+    expect(res.status()).toBe(409);
+    await expect.poll(() => verseOpStatuses(page)).toEqual(["conflict"]);
+    await expect(page.getByText("resolve 1 conflict")).toBeVisible();
+    const after = (await serverVerse(context.request)).plain_text;
+    expect(after).toContain(tag);
+    expect(after).not.toContain(`EDIT-${stamp}`);
   } finally {
     await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
     await context.close();
