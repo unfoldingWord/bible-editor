@@ -31,7 +31,7 @@ import {
 } from "./highlight.ts";
 import { shortSupport } from "./supportReference.ts";
 import { extractPlainText } from "./usfm.ts";
-import { buildVerseIndex, noteCoveredVerses } from "./verseRange.ts";
+import { bridgeNoteAnchor, buildVerseIndex, noteCoveredVerses } from "./verseRange.ts";
 
 const CONTEXT_WINDOW = 5;
 const HEBREW_GAP = /[&…]+|\.{3}/g;
@@ -147,8 +147,17 @@ export function buildTnQuickRequest(
   // UHB/UGNT verse for OL-anchoring the selection lookups — without it,
   // extractTargetSelectionText permanently degrades to GL-only matching
   // even though the source is already in the payload.
-  const sourceVo =
-    verseObjectsOf(buildVerseIndex(data.verses.UHB ?? data.verses.UGNT)[row.verse]) ?? undefined;
+  const sourceByVerse = data.verses.UHB ?? data.verses.UGNT;
+  const sourceVo = verseObjectsOf(buildVerseIndex(sourceByVerse)[row.verse]) ?? undefined;
+  // A bridged ULT/UST row numbered across its span joins on the whole
+  // bridge's source with a shifted occurrence (#968); anything else keeps
+  // the note's own verse and occurrence.
+  const selectionFor = (target: VerseDto | undefined, vo: unknown[], quote: string, occurrence: number): string => {
+    const anchor = bridgeNoteAnchor(sourceByVerse, target, row.verse, quote, occurrence);
+    return anchor
+      ? extractTargetSelectionText(vo, quote, anchor.occurrence, verseObjectsOf(anchor.source) ?? undefined)
+      : extractTargetSelectionText(vo, quote, occurrence, sourceVo);
+  };
 
   let ultSelection: string;
   let ustSelection: string;
@@ -160,12 +169,8 @@ export function buildTnQuickRequest(
     // that drives highlighting.
     const occurrence = row.occurrence ?? 1;
     hebrewGuess = cleanHebrew(rawQuote);
-    ultSelection =
-      (ultVo && extractTargetSelectionText(ultVo, rawQuote, occurrence, sourceVo)) ||
-      ultText.slice(0, 500);
-    ustSelection =
-      (ustVo && extractTargetSelectionText(ustVo, rawQuote, occurrence, sourceVo)) ||
-      ustText.slice(0, 500);
+    ultSelection = (ultVo && selectionFor(ultVerse, ultVo, rawQuote, occurrence)) || ultText.slice(0, 500);
+    ustSelection = (ustVo && selectionFor(ustVerse, ustVo, rawQuote, occurrence)) || ustText.slice(0, 500);
   } else {
     // English path: user typed English from ULT. The English IS the
     // ULT selection; look it up against ULT alignment for the Hebrew

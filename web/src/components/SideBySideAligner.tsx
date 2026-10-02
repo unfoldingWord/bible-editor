@@ -15,11 +15,12 @@ import CheckIcon from "@mui/icons-material/Check";
 import CloseIcon from "@mui/icons-material/Close";
 import KeyboardArrowLeftIcon from "@mui/icons-material/KeyboardArrowLeft";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
-import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
+import { AlignmentPanel, type AlignerLock, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { UhbStrip } from "./UhbStrip";
 import { type HoverHighlight, type HighlightCtx } from "../lib/highlightTypes";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { TwlRow, VerseDto } from "../sync/api";
+import type { VerseBaseHold } from "../sync/versePin";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { extractEditableText, normalizeEditable } from "../lib/usfm";
 
@@ -225,11 +226,22 @@ interface Props {
     bibleVersion: string,
     plain: string,
     base: VerseDto,
-    afterCommit?: () => void,
+    afterCommit?: (outcome?: { queued: boolean }) => void,
   ) => void;
+  // #1060: hold the verse-base pin for a reading line from its first dirty
+  // keystroke. `base` is the verse the box was last synced from — the one the
+  // edit is made against. The line releases the hold when it goes clean with
+  // nothing queued, and hands it off when its save is queued.
+  onHoldReadingBase?: (bibleVersion: string, base: VerseDto) => VerseBaseHold;
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
   onNextVerse?: () => void;
+  // #943: this verse can't be written (AI pipeline chapter lock, or a book
+  // lock that landed after the popup opened). The popup stays open (the
+  // reading line's own save still goes through and is rejected server-side
+  // with a toast; see s9 check (b)), but each AlignmentPanel disables its
+  // alignment changes, Save and history restore.
+  locked?: AlignerLock;
   // Save both sides, mark the verse's Text lane done, then go to the next
   // verse (#931). Undefined wherever it can't run (chapter end, locked book).
   onSaveDoneAndNext?: () => void;
@@ -333,10 +345,12 @@ export function SideBySideAligner({
   left,
   right,
   onSaveReading,
+  onHoldReadingBase,
   onPrevVerse,
   onNextVerse,
   onSaveDoneAndNext,
   textCheck,
+  locked = false,
 }: Props) {
   const [hover, setHover] = useState<HoverHighlight>(null);
   const [hoverLink, setHoverLink] = useState<boolean>(readHoverLink);
@@ -443,11 +457,14 @@ export function SideBySideAligner({
       renderUhbStrip={false}
       showSourceInfo={lexInfo}
       posOffset={slot.posOffset}
+      locked={locked}
     />
   );
 
   return (
-    <Dialog open={open} onClose={onClose} fullScreen>
+    // disableEnforceFocus: the pinned lexical box (PinnedLexBox) is portaled
+    // outside this Dialog; a focus trap would fight text selection in it (#1053).
+    <Dialog open={open} onClose={onClose} fullScreen disableEnforceFocus>
       <Box sx={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
         {/* titlebar */}
         <Box
@@ -617,16 +634,22 @@ export function SideBySideAligner({
             ref={left.readingRef}
             slot={left}
             onSave={onSaveReading}
+            onHoldBase={onHoldReadingBase}
             onDirtyChange={left.onReadingDirtyChange}
             locked={leftDirty}
+            chapterLocked={!!locked}
+            bookLocked={locked === "book"}
             bodyHeight={readingHeight}
           />
           <ReadingLine
             ref={right.readingRef}
             slot={right}
             onSave={onSaveReading}
+            onHoldBase={onHoldReadingBase}
             onDirtyChange={right.onReadingDirtyChange}
             locked={rightDirty}
+            chapterLocked={!!locked}
+            bookLocked={locked === "book"}
             bodyHeight={readingHeight}
           />
         </Box>
@@ -811,20 +834,47 @@ function SharedUhbStrip({
 // + enqueue) or Undo (revert to the last-saved text) — nothing autosaves.
 const ReadingLine = forwardRef<ReadingLineHandle, {
   slot: PanelSlot;
-  onSave: (bibleVersion: string, plain: string, base: VerseDto, afterCommit?: () => void) => void;
+  onSave: (
+    bibleVersion: string,
+    plain: string,
+    base: VerseDto,
+    afterCommit?: (outcome?: { queued: boolean }) => void,
+  ) => void;
+  // See Props.onHoldReadingBase.
+  onHoldBase?: (bibleVersion: string, base: VerseDto) => VerseBaseHold;
   onDirtyChange: (dirty: boolean) => void;
   // Locked while this side's AlignmentPanel has unsaved drags: a text edit
   // here would swap the verse prop and silently wipe those drags (see the
   // dirty-state note in SideBySideAligner). The translator saves/cancels the
   // alignment first, then the line unlocks.
   locked?: boolean;
+  // #943: the verse can't be written (see Props.locked). Only changes the
+  // hint: with unsaved drags the alignment Save is disabled, so point at
+  // Reset instead of "save alignment first".
+  chapterLocked?: boolean;
+  // #1046: the book is locked. The outbox drops every write on a locked book
+  // without a trace, so the line stops taking input and loses its Save (Undo
+  // stays, so an edit typed before the lock landed can be discarded). A
+  // chapter lock alone leaves the line editable: the server refuses that save
+  // with a toast (s9 check (b)).
+  bookLocked?: boolean;
   // Drag-resizable cap for the editable text box; it scrolls past this height.
   // Shared by both reading lines so the two-column grid stays even.
   bodyHeight?: number;
 }>(function ReadingLine(
-  { slot, onSave, onDirtyChange, locked = false, bodyHeight = DEFAULT_READING_HEIGHT },
+  {
+    slot,
+    onSave,
+    onHoldBase,
+    onDirtyChange,
+    locked = false,
+    chapterLocked = false,
+    bookLocked = false,
+    bodyHeight = DEFAULT_READING_HEIGHT,
+  },
   ref,
 ) {
+  const readOnly = locked || bookLocked;
   const { bibleVersion, verse } = slot;
   const editable = useMemo(() => (verse ? extractEditableText(verse.content) : ""), [verse]);
   const elRef = useRef<HTMLDivElement | null>(null);
@@ -835,10 +885,50 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   // buttons (and matches saveVerseDraft's no-op guard exactly). Mirrored up to
   // the parent so the close/nav gate can prompt before losing the edit.
   const [dirty, setDirty] = useState(false);
-  const markDirty = (next: boolean) => {
+  // #1060: the verse the box's text was last synced from, i.e. the base an
+  // edit typed now is made against. It lags `verse` while the resync below is
+  // skipped under the caret: a server change that lands while the translator
+  // types in the focused box must not become the edit's base.
+  const shownVerseRef = useRef(verse);
+  // The verse-base pin held for the current edit (see VerseBaseHold): taken on
+  // the first dirty keystroke, ended on the way back to clean — released when
+  // nothing was queued, handed to the queued save otherwise.
+  const holdRef = useRef<VerseBaseHold | null>(null);
+  const markDirty = (next: boolean, endHold: "release" | "handOff" = "release") => {
+    if (next && !holdRef.current && shownVerseRef.current && onHoldBase) {
+      holdRef.current = onHoldBase(bibleVersion, shownVerseRef.current);
+    } else if (!next && holdRef.current) {
+      const hold = holdRef.current;
+      holdRef.current = null;
+      // An own save that landed moved the hold's base forward: the box shows
+      // that row now, so a later edit starts from it, not the pre-save base.
+      const advanced = hold.advancedBase();
+      if (advanced && shownVerseRef.current) {
+        shownVerseRef.current = { ...shownVerseRef.current, version: advanced.version, content: advanced.content };
+      }
+      if (endHold === "handOff") hold.handOff();
+      else hold.release();
+    }
     setDirty(next);
     onDirtyChange(next);
+    if (!next) syncShownVerse();
   };
+  // A clean box showing exactly this verse's text was synced from it — this
+  // also catches a version-only change (the line's own save landing, an
+  // alignment-only change) that the `editable`-keyed resync never sees.
+  const syncShownVerse = () => {
+    const el = elRef.current;
+    if (holdRef.current || !el) return;
+    if (normalizeEditable(el.textContent ?? "") === normalizeEditable(editable)) shownVerseRef.current = verse;
+  };
+  // Unmounting drops whatever the line showed (#1060).
+  useEffect(
+    () => () => {
+      holdRef.current?.release();
+      holdRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     const el = elRef.current;
@@ -864,6 +954,15 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editable]);
 
+  // After the resync above (effects run in order), so a fresh sync is seen.
+  // A line mounted before its verse arrived starts from that first verse, so
+  // its first keystroke has a base to hold.
+  useEffect(() => {
+    if (!shownVerseRef.current && !holdRef.current) shownVerseRef.current = verse;
+    syncShownVerse();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [verse]);
+
   // `afterCommit` mirrors AlignmentPanelHandle's handleSave (#490): `onSave`
   // (ultimately Shell's saveVerseDraft → enqueueVerseSafely) can defer this
   // save behind the collateral-loss confirm rather than enqueueing
@@ -878,8 +977,10 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
       afterCommit?.();
       return;
     }
-    onSave(bibleVersion, el.textContent ?? "", verse, () => {
-      markDirty(false);
+    onSave(bibleVersion, el.textContent ?? "", verse, (outcome) => {
+      // A queued edit's save owns the pin now and its outbox exit releases it;
+      // a no-op queued nothing, so the hold ends as a clean line's does (#1060).
+      markDirty(false, outcome?.queued === false ? "release" : "handOff");
       afterCommit?.();
     });
   };
@@ -915,12 +1016,18 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
           <Box
             component="span"
             sx={{
-              color: locked ? "text.disabled" : "primary.main",
+              color: readOnly ? "text.disabled" : "primary.main",
               textTransform: "none",
               letterSpacing: 0,
             }}
           >
-            {locked ? "🔒 save alignment first" : "✎ editable"}
+            {bookLocked
+              ? "🔒 book locked"
+              : locked
+              ? chapterLocked
+                ? "🔒 locked: reset alignment first"
+                : "🔒 save alignment first"
+              : "✎ editable"}
           </Box>
         </Typography>
         <Box sx={{ flex: 1 }} />
@@ -942,33 +1049,37 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             >
               Undo
             </Button>
-            <Button
-              size="small"
-              variant="contained"
-              onClick={() => handleSave()}
-              disabled={!dirty}
-              sx={{
-                textTransform: "uppercase",
-                fontSize: 11,
-                letterSpacing: "0.06em",
-                fontWeight: 700,
-                px: 1.5,
-                py: 0.25,
-              }}
-            >
-              Save {bibleVersion}
-            </Button>
+            {!bookLocked && (
+              <Button
+                size="small"
+                variant="contained"
+                onClick={() => handleSave()}
+                disabled={!dirty}
+                sx={{
+                  textTransform: "uppercase",
+                  fontSize: 11,
+                  letterSpacing: "0.06em",
+                  fontWeight: 700,
+                  px: 1.5,
+                  py: 0.25,
+                }}
+              >
+                Save {bibleVersion}
+              </Button>
+            )}
           </>
         )}
       </Box>
       {verse ? (
         <Box
           ref={elRef}
-          contentEditable={!locked}
+          contentEditable={!readOnly}
           suppressContentEditableWarning
           spellCheck
           title={
-            locked
+            bookLocked
+              ? "This book is locked, so the reading text can't be edited right now"
+              : locked
               ? "save or cancel the pending alignment edits before editing the reading text"
               : undefined
           }
@@ -984,17 +1095,17 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             fontFamily: '"Times New Roman", "Cardo", serif',
             fontSize: `calc(15px * var(--be-reading-scale, 1))`,
             lineHeight: 1.5,
-            color: locked ? "text.disabled" : "text.primary",
+            color: readOnly ? "text.disabled" : "text.primary",
             outline: "none",
             borderRadius: 1,
             px: 0.75,
             py: 0.25,
             border: "1px solid",
             borderColor: "divider",
-            cursor: locked ? "not-allowed" : "text",
-            opacity: locked ? 0.6 : 1,
+            cursor: readOnly ? "not-allowed" : "text",
+            opacity: readOnly ? 0.6 : 1,
             transition: "border-color 0.12s, opacity 0.12s",
-            ...(locked
+            ...(readOnly
               ? {}
               : {
                   "&:hover": { borderColor: "primary.main" },

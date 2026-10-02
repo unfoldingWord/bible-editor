@@ -13,7 +13,13 @@
 // reading `verses[bv][n]` directly.
 
 import type { VerseDto } from "../sync/api";
-import { highlightsFor, type HighlightKey } from "./highlight.ts";
+import {
+  countQuoteMatches,
+  highlightsFor,
+  matchSourceTokens,
+  milestonesCountWhole,
+  type HighlightKey,
+} from "./highlight.ts";
 
 export type VerseSpan = readonly [start: number, end: number];
 
@@ -210,7 +216,10 @@ export function sourceForTargetRow(
 //
 // Known limit: a bridge numbered ACROSS the span (x-occurrence counting every
 // verse) can light the wrong copy, or none, for a note whose word also occurs
-// in an earlier bridge verse. A span-aware join is follow-up work (#968).
+// in an earlier bridge verse. The word-gloss preview and TN Quick handle this
+// with bridgeNoteAnchor below. The highlights do not: they also serve
+// partial-group (`&`) quotes, and the #957 review found edge cases in a
+// span-aware highlight join that are still open (#968 item 5).
 export function rowHighlightsFor(
   bibleVersion: string,
   target: VerseDto | null | undefined,
@@ -233,6 +242,63 @@ export function rowHighlightsFor(
   }
   const spanSource = sourceForTargetRow(sourceByVerseStart, target)?.content ?? fallbackSource;
   return highlightsFor(bibleVersion, target?.content, quote, occurrence, spanSource, partialGroups);
+}
+
+// The source and occurrence a single-note English lookup (the word-gloss
+// preview and the TN Quick selection) joins a bridged ULT/UST row on (#968).
+// A note's occurrence counts within its own verse; a bridge numbered ACROSS
+// its span stamps the later verse's copy of a repeated word 2/2. When every
+// guard below holds, the lookup joins on the whole bridge's source with the
+// occurrence shifted past the earlier verses' matches, so it gets the English
+// for the note's own copy. Returns null otherwise, and the caller keeps its
+// own-verse lookup (what rowHighlightsFor does for a later-verse note).
+//
+// Guards (each one fell out of the #957 review of the wider version):
+// - the row is a bridge and the note's verse is inside it; occurrence >= 1
+//   (-1, "every occurrence", keeps the own-verse lookup);
+// - every source verse of the span is loaded, so the counts line up;
+// - the occurrence exists in the note's own verse, and no quote match
+//   straddles a verse boundary inside the span (the counts must add up);
+// - every milestone for each resolved word claims the span-wide count, so a
+//   per-verse-numbered or mixed row is left alone.
+//
+// Known limits, not handled here (documented on #968): the reading-column
+// highlights (rowHighlightsFor) still join a later-verse note on its own
+// verse, and partial-group (`&`) quotes are not offset.
+export function bridgeNoteAnchor(
+  sourceByVerseStart: Record<number, VerseDto> | undefined,
+  target: VerseDto | null | undefined,
+  noteVerse: number | null | undefined,
+  quote: string | null | undefined,
+  occurrence: number | null | undefined,
+): { source: VerseDto; occurrence: number } | null {
+  if (!sourceByVerseStart || !target || !isRangeRow(target) || !quote || noteVerse == null) return null;
+  const occ = occurrence ?? 1;
+  if (!Number.isInteger(occ) || occ < 1) return null;
+  const [start, end] = verseSpan(target);
+  if (noteVerse < start || noteVerse > end) return null;
+  for (let v = start; v <= end; v++) if (!verseObjectsOf(sourceByVerseStart[v])) return null;
+  const targetVo = verseObjectsOf(target);
+  const span = concatSourceRange(sourceByVerseStart, start, end);
+  const spanVo = verseObjectsOf(span);
+  if (!targetVo || !span || !spanVo) return null;
+  const count = (a: number, b: number): number => {
+    if (a > b) return 0;
+    const vo = verseObjectsOf(concatSourceRange(sourceByVerseStart, a, b));
+    return vo ? countQuoteMatches(vo, quote) : 0;
+  };
+  const before = count(start, noteVerse - 1);
+  const own = count(noteVerse, noteVerse);
+  const after = count(noteVerse + 1, end);
+  if (occ > own || countQuoteMatches(spanVo, quote) !== before + own + after) return null;
+  const tokens = matchSourceTokens(spanVo, quote, before + occ);
+  if (tokens.length === 0 || !milestonesCountWhole(targetVo, spanVo, tokens.map((t) => t.text))) return null;
+  return { source: span, occurrence: before + occ };
+}
+
+function verseObjectsOf(dto: VerseDto | null | undefined): unknown[] | null {
+  const vo = (dto?.content as { verseObjects?: unknown[] } | null | undefined)?.verseObjects;
+  return Array.isArray(vo) ? vo : null;
 }
 
 function buildSourceRange(
