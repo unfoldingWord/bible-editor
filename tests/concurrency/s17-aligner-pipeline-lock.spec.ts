@@ -688,9 +688,11 @@ test("a range row opened on its inner verse: a refused save's drags come back un
     );
     await dual.locator('button:has(svg[data-testid="CloseIcon"])').first().click();
     await gate.getByRole("button", { name: "Save", exact: true }).click();
-    // Whether this save asks again depends on what the cache holds by now
-    // (before #1073 it kept the refused content, so it did not ask).
-    expect(await confirmUnalignIfAsked(page, patched)).toBe(200);
+    // The refusal rolled the cache back to the server's (aligned) row, so
+    // saving the restored Clear unaligns words against it and asks again
+    // (#1073; before, the cache kept the refused content and it did not ask).
+    await page.getByRole("button", { name: "Save anyway", exact: true }).click();
+    expect((await patched).status()).toBe(200);
   } finally {
     clearLock();
     if (bridged) {
@@ -756,6 +758,10 @@ test("a refused panel Save, then Reset: reopening the aligner shows the server's
     await saveBtn.click();
     expect(await confirmUnalignIfAsked(page, refused)).toBe(409);
     await expect(page.getByText("chapter locked")).toBeVisible({ timeout: 15_000 });
+    // The rollback has landed: the open panel reset to the server's row and
+    // restored the drags from the crash draft.
+    await expect(page.getByText("restored unsaved alignment")).toBeVisible({ timeout: 15_000 });
+    await expect(count).toHaveText(dragged.after);
 
     // Reset goes back to the server's alignment.
     await resetBtn.click();
@@ -808,9 +814,15 @@ test("a refused gate Save: the crash draft still brings the drags back, and Rese
     const refused = page.waitForResponse(
       (r) => r.request().method() === "PATCH" && r.url().includes(VERSE_PATH),
     );
+    // The rollback's chapter re-read, sent after the 409.
+    const reread = page.waitForResponse(
+      (r) => r.request().method() === "GET" && r.url().endsWith(`/api/chapters/${BOOK}/${CHAPTER}`),
+    );
     await gate.getByRole("button", { name: "Save", exact: true }).click();
     expect(await confirmUnalignIfAsked(page, refused)).toBe(409);
     await expect(page.getByText(/Your changes are kept in the aligner/)).toBeVisible();
+    expect((await reread).ok()).toBe(true);
+    await page.waitForTimeout(300); // let the applied row render
 
     // Reopen: the crash draft is still offered (the drags, unsaved).
     await page.locator(`button[aria-label^="align ${BV}"]`).first().click();

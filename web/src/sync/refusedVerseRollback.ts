@@ -12,8 +12,9 @@ import type { VerseDto } from "./api";
 
 export type VerseRollback =
   // Nothing to put back: another save of the verse is still queued (its own
-  // result settles the cache), the server no longer has the row, or the cache
-  // holds a row newer than the one just fetched.
+  // result settles the cache), the cache's row changed during the GET, the
+  // server no longer has the row, or the cache holds a row newer than the one
+  // just fetched.
   | { kind: "skip" }
   // The server's row is at the version the cache holds (the refused save never
   // bumped it), so only a forced apply replaces the refused content.
@@ -24,13 +25,24 @@ export type VerseRollback =
 
 export function planRefusedVerseRollback(args: {
   serverRow: VerseDto | undefined;
-  // The cache's row for the verse now, or undefined if this cache has no copy.
+  // The cache's row when the refusal arrived, before the chapter GET.
+  cachedBefore: VerseDto | undefined;
+  // The cache's row now (after the GET), or undefined if this cache has no copy.
   cachedRow: VerseDto | undefined;
   // Whether the outbox still holds another op for the same verse target.
   stillQueuedForTarget: boolean;
 }): VerseRollback {
-  const { serverRow, cachedRow, stillQueuedForTarget } = args;
+  const { serverRow, cachedBefore, cachedRow, stillQueuedForTarget } = args;
   if (stillQueuedForTarget || !serverRow || !cachedRow) return { kind: "skip" };
+  // The verse changed while the GET was in flight (saved or edited again):
+  // that change is newer than the refusal, so leave it.
+  if (
+    !cachedBefore ||
+    cachedRow.version !== cachedBefore.version ||
+    cachedRow.content !== cachedBefore.content
+  ) {
+    return { kind: "skip" };
+  }
   if (serverRow.version > cachedRow.version) return { kind: "remote", row: serverRow };
   if (serverRow.version === cachedRow.version) return { kind: "force", row: serverRow };
   return { kind: "skip" };

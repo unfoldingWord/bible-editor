@@ -1037,35 +1037,60 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   applyLocalVerseRef.current = applyLocalVerse;
   const applyRemoteVerseRef = useRef(applyRemoteVerse);
   applyRemoteVerseRef.current = applyRemoteVerse;
+  // One chapter GET per refusal burst: a find/replace across a locked chapter
+  // is refused verse by verse, and every refusal reads the same chapter.
+  const rollbackFetchRef = useRef(new Map<string, Promise<ChapterPayload>>());
   const rollBackRefusedVerse = useCallback(async (op: OutboxOp) => {
     const t = op.target;
     if (t.kind !== "verse") return;
-    let server: ChapterPayload;
-    let stillQueuedForTarget: boolean;
     try {
       const key = outboxTargetKey(t);
-      stillQueuedForTarget = (await outbox.list()).some(
-        (o) => o.id !== op.id && outboxTargetKey(o.target) === key,
-      );
-      if (stillQueuedForTarget) return;
-      server = await api.getChapter(t.book, t.chapter);
+      const queuedForTarget = async () =>
+        (await outbox.list()).some((o) => o.id !== op.id && outboxTargetKey(o.target) === key);
+      if (await queuedForTarget()) return;
+      // The rows the refusal left in each cache. A row that is not still these
+      // when the GET lands (the verse was saved or edited again meanwhile) is
+      // left alone, so the server's older row never overwrites newer work.
+      const chapterRow = () => {
+        const cur = dataRef.current;
+        return cur && cur.book === t.book && cur.chapter === t.chapter
+          ? cur.verses[t.bibleVersion]?.[t.verse]
+          : undefined;
+      };
+      const bookRow = () => {
+        const ch = t.book === book ? bookHookRef.current?.chapters.get(t.chapter) : undefined;
+        return ch?.kind === "ready" ? ch.data.verses[t.bibleVersion]?.[t.verse] : undefined;
+      };
+      const chapterBefore = chapterRow();
+      const bookBefore = bookRow();
+      const fetchKey = `${t.book}:${t.chapter}`;
+      let fetching = rollbackFetchRef.current.get(fetchKey);
+      if (!fetching) {
+        fetching = api.getChapter(t.book, t.chapter);
+        rollbackFetchRef.current.set(fetchKey, fetching);
+        const forget = () => {
+          rollbackFetchRef.current.delete(fetchKey);
+        };
+        fetching.then(forget, forget);
+      }
+      const server = await fetching;
+      const stillQueuedForTarget = await queuedForTarget();
+      const serverRow = server.verses[t.bibleVersion]?.[t.verse];
+      const apply = (
+        cachedBefore: VerseDto | undefined,
+        cachedRow: VerseDto | undefined,
+        force: (v: VerseDto) => void,
+        remote: (v: VerseDto) => void,
+      ) => {
+        const plan = planRefusedVerseRollback({ serverRow, cachedBefore, cachedRow, stillQueuedForTarget });
+        if (plan.kind === "force") force(plan.row);
+        else if (plan.kind === "remote") remote(plan.row);
+      };
+      apply(chapterBefore, chapterRow(), applyLocalVerseRef.current, applyRemoteVerseRef.current);
+      const bh = bookHookRef.current;
+      if (bh) apply(bookBefore, bookRow(), bh.applyLocalVerse, bh.applyRemoteVerse);
     } catch {
-      return; // the next refetch catches up
-    }
-    const serverRow = server.verses[t.bibleVersion]?.[t.verse];
-    const apply = (cachedRow: VerseDto | undefined, force: (v: VerseDto) => void, remote: (v: VerseDto) => void) => {
-      const plan = planRefusedVerseRollback({ serverRow, cachedRow, stillQueuedForTarget });
-      if (plan.kind === "force") force(plan.row);
-      else if (plan.kind === "remote") remote(plan.row);
-    };
-    const cur = dataRef.current;
-    if (cur && cur.book === t.book && cur.chapter === t.chapter) {
-      apply(cur.verses[t.bibleVersion]?.[t.verse], applyLocalVerseRef.current, applyRemoteVerseRef.current);
-    }
-    const bh = bookHookRef.current;
-    const bookChapter = bh?.chapters.get(t.chapter);
-    if (bh && t.book === book && bookChapter?.kind === "ready") {
-      apply(bookChapter.data.verses[t.bibleVersion]?.[t.verse], bh.applyLocalVerse, bh.applyRemoteVerse);
+      // Best-effort: the next chapter refetch catches up.
     }
   }, [book]);
   useEffect(
@@ -1098,8 +1123,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const lastRefusalToastRef = useRef<{ key: string; at: number } | null>(null);
   useEffect(
     () =>
-      onAlignerSaveRefused((op, kept) => {
-        void rollBackRefusedVerse(op);
+      onAlignerSaveRefused((op, kept, heldInDraft) => {
+        // Kept only in the open panel's memory (no crash draft: read-only,
+        // or the draft write failed): rolling the cache back would reset
+        // that panel and lose the drags, so leave the cache until they save.
+        if (heldInDraft || !kept) void rollBackRefusedVerse(op);
         const key = alignmentDraftKeyForOp(op);
         const last = lastRefusalToastRef.current;
         if (last && last.key === key && Date.now() - last.at < 3000) return;
