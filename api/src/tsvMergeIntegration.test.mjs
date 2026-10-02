@@ -133,7 +133,7 @@ eq(merge.conflict, false, "merge has no conflict");
 eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; our quote is preserved");
 
 // ── issue #950: a locked book, over this SAME real reconstructed ancestor,
-// adopts a genuinely BOTH-changed field with no review flag. Unlike `ours`/
+// adopts a genuinely BOTH-changed field and flags it (adopt_conflict). Unlike `ours`/
 // `theirs` above (which only disagree field-by-field, never on the same
 // field), both sides here move `note` away from the ancestor — the case that
 // would otherwise need a human commit behind master's side to win.
@@ -144,8 +144,8 @@ eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; ou
     masterMayHoldHumanEdit: false,
     bookLocked: true,
   });
-  eq(lockedMerge.action, "adopt", "locked: a real both-changed field adopts master, no flag");
-  eq(lockedMerge.conflict, false, "locked: no conflict flag even though the lineage says no human moved master");
+  eq(lockedMerge.action, "adopt_conflict", "locked: a real both-changed field adopts master, flagged");
+  eq(lockedMerge.conflict, true, "locked: flagged even though the lineage says no human moved master");
   eq(lockedMerge.writeFields, { note: "master's out-of-band note" }, "locked: writes master's note");
 
   // Control: same inputs, unlocked — the pre-existing D1-wins-and-flag outcome.

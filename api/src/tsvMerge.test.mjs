@@ -815,18 +815,39 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   const ours = { quote: "q0", note: "our note" };
   const theirs = { quote: "q0", note: "master's note" };
 
-  // A locked book with both sides moved adopts master with NO review flag —
-  // unlike the unlocked case, where the AI-lineage question would otherwise
-  // keep D1 and flag it.
+  // A locked book with both sides moved adopts master — no AI-lineage
+  // question — but still FLAGS the row (adopt_conflict), mirroring
+  // verseMerge.ts step 3b: D1 moving off the ancestor means app work master
+  // is overwriting, and a lock does not prove that work was ever exported.
   const locked = computeTsvMerge("tn", base, ours, theirs, {
     masterMayHoldHumanEdit: false,
     bookLocked: true,
   });
-  eq(locked.action, "adopt", "locked: both-moved field adopts master outright");
-  eq(locked.conflict, false, "locked: no review flag");
+  eq(locked.action, "adopt_conflict", "locked: both-moved field adopts master, flagged");
+  eq(locked.conflict, true, "locked: review flag kept so the overwrite is visible");
   eq(locked.adopt, true, "locked: adopt is true");
   deep(locked.writeFields, { note: "master's note" }, "locked: writes master's raw value");
-  deep(locked.conflictFields, [], "locked: nothing is reported as contested");
+  deep(locked.conflictFields, ["note"], "locked: the overwritten field is reported as contested");
+
+  // Review A1 on PR #1000: a note edited in the app AFTER the last export,
+  // then the book locked before the next export (a locked book skips export).
+  // `base` is the exported ancestor, `ours` the unexported app edit, `theirs`
+  // a Door43 edit of the same field. Master wins (the lock's rule), but the
+  // row must carry a flag — a clean adopt here would silently drop the edit.
+  {
+    const exported = { quote: "q0", note: "exported note" };
+    const editedAfterExport = { quote: "q0", note: "unexported app edit" };
+    const door43 = { quote: "q0", note: "door43 edit" };
+    for (const lineage of [false, true, undefined]) {
+      const r = computeTsvMerge("tn", exported, editedAfterExport, door43, {
+        masterMayHoldHumanEdit: lineage,
+        bookLocked: true,
+      });
+      eq(r.action, "adopt_conflict", `edited-then-locked (lineage ${lineage}): adopt_conflict, not a silent adopt`);
+      eq(r.conflict, true, `edited-then-locked (lineage ${lineage}): flagged`);
+      deep(r.conflictFields, ["note"], `edited-then-locked (lineage ${lineage}): note is contested`);
+    }
+  }
 
   // Control: the identical inputs, unlocked, keep D1 and flag it — proving
   // `bookLocked` is what changed the outcome above, not the lineage flag.
