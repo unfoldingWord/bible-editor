@@ -49,7 +49,7 @@ import {
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
 import { shouldApplyUpsert } from "./rowUpsertGuard";
-import { drafts, verseKey, pinVerseBase, unpinVerseBaseIfIdle, registerVerseVersionReader } from "../sync/drafts";
+import { drafts, verseKey, pinVerseBase, pinEpoch, unpinVerseBaseIfIdle, holdVerseBaseForEditor, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -281,6 +281,13 @@ interface Props {
   // by App and rendered in the TopBar next to the other indicators — replaces
   // the old full-width banner so these warnings never block navigation (#458).
   syncWarnings?: ReactNode;
+}
+
+// #1045: why a locked aligner's unsaved-changes gate offers no Save.
+function alignerLockReason(lock: "chapter" | "book"): string {
+  return lock === "book"
+    ? "This book is locked"
+    : "An AI run is updating this chapter";
 }
 
 export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, onCommentActivity, onCommentThreadsViewed, authReady = false, notificationsMenu, syncWarnings }: Props) {
@@ -2639,6 +2646,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // in-memory alignment + reading dirtiness here plus unsaved drafts internally.
   useUnsavedGuard(alignmentDirty || dualDirty);
 
+  // #1045: a lock that lands while an aligner holds unsaved drags. Saving them
+  // then commits locally (baseline reset, crash draft cleared) and queues a
+  // PATCH the server refuses with 409 chapter_locked, which the outbox drops,
+  // so the drags are lost. While locked, the gates below leave out Save and
+  // the update reload skips its auto-save; the drags stay in the panel and its
+  // crash draft and can be saved once the lock lifts. handleSave itself is
+  // left alone on purpose (#943): refusing there would drop them silently.
+  const singleAlignerLocked =
+    panelMode === "alignment" && alignerTarget ? alignerLock(alignerTarget.chapter) : false;
+  // Only the alignment panels' drags: a dirty reading line keeps the dual
+  // gate's Save, which refuses out loud under a book lock (#1046, s18) and is
+  // rejected with a toast under a chapter lock (s9 check (b)).
+  const dualAlignmentLocked =
+    (dualLeftDirty || dualRightDirty) && dualTarget ? alignerLock(dualTarget.chapter) : false;
+
   // Save-aware reload for the "App update available" chip. A bare reload would
   // drop unsaved in-memory alignment drags (they only reach the durable outbox
   // on save). If the single alignment panel is dirty, save first, then wait for
@@ -2646,17 +2668,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // IndexedDB serializes AFTER the save's write, so its resolution means the op
   // is durably queued (it survives the reload and drains after) — before
   // tearing the page down. Text/note/row drafts already persist across reload;
-  // the beforeunload guard covers the other unload paths.
+  // the beforeunload guard covers the other unload paths. A locked aligner
+  // (#1045) reloads without saving: the beforeunload guard still asks, and the
+  // crash draft brings the drags back when the verse's aligner reopens.
   const reloadForUpdate = useCallback(() => {
     const reload = () => window.location.reload();
-    if (panelMode === "alignment" && alignmentDirty && alignmentPanelRef.current) {
+    if (
+      panelMode === "alignment" &&
+      alignmentDirty &&
+      !singleAlignerLocked &&
+      alignmentPanelRef.current
+    ) {
       alignmentPanelRef.current.save(() => {
         void outbox.list().then(reload);
       });
     } else {
       reload();
     }
-  }, [panelMode, alignmentDirty]);
+  }, [panelMode, alignmentDirty, singleAlignerLocked]);
   const requestDualAction = useCallback(
     (run: () => void) => {
       if (dualDirty) setPendingDualAction({ run });
@@ -2738,7 +2767,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // stalls the chain, so the verse stays unmarked and the aligner stays put.
   // `verse` is the verse the click started on (captured in the button's
   // render); the guard ignores a second click while this chain still runs,
-  // and cancelling the unalign confirm releases it (cancelAlignmentLoss).
+  // and cancelling the unalign confirm releases it (cancelAlignmentLoss), as
+  // does a reading-line save refused under a book lock (onSaveReading, #1050).
   const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
   const dualSaveDoneAndNext = useCallback(
     (verse: number, next: number) => {
@@ -3267,7 +3297,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     bibleVersion: string,
     plain: string,
     base: VerseDto,
-    afterCommit?: () => void,
+    // `queued: false` marks the no-op path below: nothing was queued, so a
+    // reading line ends its pin hold as a clean line does (#1060).
+    afterCommit?: (outcome?: { queued: boolean }) => void,
     // #1046: re-checked at the point of commit (after the draft lookup, and
     // again on the collateral-loss confirm's "Save anyway"). True refuses the
     // save: nothing is queued or applied and afterCommit does not run.
@@ -3302,6 +3334,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // leaves an orphaned draft (dirty border + SyncStatusBar entry + "unsaved
     // edits" toast whose Save button re-hits this guard and never resolves).
     if (oldEditable === normalizeEditable(plain)) {
+      // The pin as of this no-op: a pin taken or handed on after it (a new
+      // keystroke, a save queued meanwhile) is not this release's to drop.
+      const epoch = pinEpoch(key);
       void drafts
         .get(key)
         .then((draft) => {
@@ -3313,12 +3348,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           // pin then poisons every later save of this verse (#563). IfIdle:
           // a keystroke landing while this get() was in flight re-pins the
           // session synchronously, and that pin must survive.
-          else if (!draft) unpinVerseBaseIfIdle(key);
+          else if (!draft) unpinVerseBaseIfIdle(key, epoch);
         })
         .catch(() => {
           /* conservative: leave an unreadable draft in place */
         });
-      afterCommit?.();
+      afterCommit?.({ queued: false });
       return;
     }
     // `plain` is raw DOM textContent, so the dropped-marker-chip guard applies
@@ -3343,23 +3378,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       (result.content as { verseObjects?: unknown[] } | null)?.verseObjects,
     );
     const newlyUnaligned = afterUnaligned - beforeUnaligned;
-    if (newlyUnaligned > 0) {
-      pushPipelineToast(
-        `This edit left ${newlyUnaligned} word${newlyUnaligned > 1 ? "s" : ""} unaligned in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — re-align in the Alignment panel.`,
-        "info",
-      );
-    }
-    // The editor handed back text with none of its paragraph/poetry marks and
-    // no word changed, so the engine restored them rather than wipe the verse's
-    // lineation (#606). That is the right call for a dropped-chip capture, but
-    // it also overrides a translator who genuinely meant to remove every mark in
-    // the same save — so say so, and name the way to do it.
-    if (result.markerCaptureGuarded) {
-      pushPipelineToast(
-        `Paragraph and poetry marks were restored in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — the editor lost them during this edit. To remove them on purpose, delete the marks in a save of their own.`,
-        "info",
-      );
-    }
+    // Both notices describe a save that goes ahead, so they run only once it
+    // is queued: never ahead of a refusal or a cancelled confirm (#1050).
+    const notifyQueued = () => {
+      if (newlyUnaligned > 0) {
+        pushPipelineToast(
+          `This edit left ${newlyUnaligned} word${newlyUnaligned > 1 ? "s" : ""} unaligned in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — re-align in the Alignment panel.`,
+          "info",
+        );
+      }
+      // The editor handed back text with none of its paragraph/poetry marks and
+      // no word changed, so the engine restored them rather than wipe the verse's
+      // lineation (#606). That is the right call for a dropped-chip capture, but
+      // it also overrides a translator who genuinely meant to remove every mark in
+      // the same save — so say so, and name the way to do it.
+      if (result.markerCaptureGuarded) {
+        pushPipelineToast(
+          `Paragraph and poetry marks were restored in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — the editor lost them during this edit. To remove them on purpose, delete the marks in a save of their own.`,
+          "info",
+        );
+      }
+    };
     const newPlainText = extractPlainText(result.content);
     const newDto = {
       ...effectiveBase,
@@ -3383,6 +3422,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // also run afterCommit, since that path never reaches the `applyLocal();
       // afterCommit?.();` below.
       const onConfirmedApply = () => {
+        notifyQueued();
         applyLocal();
         afterCommit?.();
       };
@@ -3390,6 +3430,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, onConfirmedApply, draftGeneration, undefined, refuseCommit)) {
         return;
       }
+      notifyQueued();
       applyLocal();
       afterCommit?.();
     };
@@ -4489,18 +4530,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <DialogTitle>Unsaved alignment changes</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            You have unsaved changes in the alignment editor. Save them before switching
-            verses, discard them, or cancel to stay here.
+            {singleAlignerLocked
+              ? `${alignerLockReason(singleAlignerLocked)}, so your alignment changes can't be saved right now. They are kept here: stay on this verse and save them once the lock lifts.`
+              : "You have unsaved changes in the alignment editor. Save them before switching verses, discard them, or cancel to stay here."}
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={dismissPendingNav}>Cancel</Button>
-          <Button color="error" onClick={() => resolvePendingNav("discard")}>
-            Discard
-          </Button>
-          <Button variant="contained" onClick={() => resolvePendingNav("save")}>
-            Save
-          </Button>
+          {/* #1045: no Save or Discard while locked; see singleAlignerLocked. */}
+          {singleAlignerLocked ? (
+            <Button variant="contained" onClick={dismissPendingNav}>
+              Keep editing
+            </Button>
+          ) : (
+            <>
+              <Button onClick={dismissPendingNav}>Cancel</Button>
+              <Button color="error" onClick={() => resolvePendingNav("discard")}>
+                Discard
+              </Button>
+              <Button variant="contained" onClick={() => resolvePendingNav("save")}>
+                Save
+              </Button>
+            </>
+          )}
         </DialogActions>
       </Dialog>
       {dualAlignerProps && (
@@ -4542,8 +4593,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // dirty and the gate's close/nav does not run. The message names
             // Discard, not Undo: Undo is hidden while that side also has
             // unsaved alignment drags.
+            //
+            // A refusal stalls any save chain this save is part of for good,
+            // so it also frees the "save, mark done, next" button's in-flight
+            // guard, as cancelling the unalign confirm does (#1050). The pin
+            // needs nothing here: the line's hold (#1060) keeps it while the
+            // edit stays on screen and releases it when the line goes clean.
             const refuseIfBookLocked = () => {
               if (!bookLockedRef.current) return false;
+              saveDoneGuardRef.current.cancel();
               pushPipelineToast(
                 `This book is locked, so the ${bv} reading-text edit was not saved. To drop it, close the aligner and choose Discard.`,
                 "error",
@@ -4559,6 +4617,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // confirm's "Save anyway".
             saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit, refuseIfBookLocked);
           }}
+          // #1060: the reading line writes no draft, so it holds the verse
+          // base itself from its first dirty keystroke; saveVerseDraft's
+          // pinVerseBase above then finds that pin instead of pinning the
+          // version on screen at Save time. Same key as the save.
+          onHoldReadingBase={(bv, base) =>
+            holdVerseBaseForEditor(verseKey(book, dualAlignerProps.chapter, base.verse, bv), base)
+          }
         />
       )}
       <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>
@@ -4605,18 +4670,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <DialogTitle>Unsaved changes</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            You have unsaved changes in the side-by-side aligner (alignment edits or reading text).
-            Save them, discard them, or cancel to keep editing.
+            {dualAlignmentLocked
+              ? `${alignerLockReason(dualAlignmentLocked)}, so your alignment changes can't be saved right now. They are kept here: stay on this verse and save them once the lock lifts.`
+              : "You have unsaved changes in the side-by-side aligner (alignment edits or reading text). Save them, discard them, or cancel to keep editing."}
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setPendingDualAction(null)}>Cancel</Button>
-          <Button color="error" onClick={() => resolveDualAction("discard")}>
-            Discard
-          </Button>
-          <Button variant="contained" onClick={() => resolveDualAction("save")}>
-            Save
-          </Button>
+          {/* #1045: no Save or Discard while locked; see dualAlignmentLocked. */}
+          {dualAlignmentLocked ? (
+            <Button variant="contained" onClick={() => setPendingDualAction(null)}>
+              Keep editing
+            </Button>
+          ) : (
+            <>
+              <Button onClick={() => setPendingDualAction(null)}>Cancel</Button>
+              <Button color="error" onClick={() => resolveDualAction("discard")}>
+                Discard
+              </Button>
+              <Button variant="contained" onClick={() => resolveDualAction("save")}>
+                Save
+              </Button>
+            </>
+          )}
         </DialogActions>
       </Dialog>
       <Snackbar

@@ -4213,6 +4213,33 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
     eq(s.confirmedEditId, 11, `${label} lineage does not advance master_confirmed_edit_id`);
   }
 
+  // (a3) #1058: the stamp is only accepted for a merge at or before the commit
+  //      the caller's file was fetched at. The prod shape (file head = the bot
+  //      push on top of our merge, or our merge itself) still stamps, so the
+  //      gate does not starve the nightly; a file fetched before our merge
+  //      landed, or an unknown fetch sha, withholds it. The verdict itself
+  //      (counter reset, banner down) is unaffected either way.
+  for (const [label, pinned, walkedCommits, stamps] of [
+    ["file head is the bot push after our merge", BOT_PUSH.sha, [BOT_PUSH, OUR_MERGE], true],
+    ["file head is our merge", OUR_MERGE.sha, [OUR_MERGE], true],
+    ["our merge landed after the file was fetched", "a1".repeat(6), [OUR_MERGE, { ...BOT_PUSH, sha: "a1".repeat(6), date: "2026-09-01T05:00:00Z" }], false],
+    ["fetched sha is not in the walk", "ffffffffffff", [BOT_PUSH, OUR_MERGE], false],
+    ["fetched sha unknown", null, [BOT_PUSH, OUR_MERGE], false],
+  ]) {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    const g = gitea(walkedCommits, PUSHED);
+    const walked = { commits: walkedCommits, incomplete: false, incompleteReason: "" };
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, walked, sync, Date.now(), pinned));
+    const s = readState(sqlite);
+    eq(s.declines, 0, `#1058 ${label}: the preserved verdict still resets the counter`);
+    eq(
+      { confirmedAt: s.confirmedAt, confirmedEditId: s.confirmedEditId },
+      stamps ? { confirmedAt: READ_AT, confirmedEditId: PUSHED_EDIT_ID } : { confirmedAt: 1000, confirmedEditId: 11 },
+      `#1058 ${label}: ${stamps ? "#658 stamps the pushed render" : "#658 stamp withheld"}`,
+    );
+  }
+
   // (b) The same night with the lineage walk handed in: no second commit fetch.
   {
     const { sqlite, env } = freshEnv();
