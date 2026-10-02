@@ -107,8 +107,8 @@ Highlights that bite repeatedly:
   lock is to prevent problems from the BE side"), but only on verses master actually moved since the ancestor
   (`verseMerge.ts` step 3b), so an unlock → fix → re-lock → `lock/push` fix still in review is not reverted; and
   a markers-only overwrite is a real overwrite worth seeing in history (#951) but not a data-loss alert. Only a
-  run's own `adopt_conflict` may reactivate a resolved flag. Open: structure paths (#949) and tn/tq/twl (#950)
-  do not honor the lock yet.
+  run's own `adopt_conflict` may reactivate a resolved flag. Structure paths honor the lock since #999
+  (#949); tn/tq/twl (#950) do not yet.
 
 - **D1 allows at most 5 terms in a compound SELECT (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`); node:sqlite allows
   500.** A 6-term `UNION ALL` fails on local workerd and remote D1 with `too many terms in compound SELECT`

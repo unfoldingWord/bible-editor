@@ -50,7 +50,7 @@ the full background.
 ## What bible-editor sends
 
 `POST /api/pipeline/start` body's existing optional `options` object gains
-`introHints`, sent only when `INTRO_HINTS_ENABLED` is set (see Status
+`introHints`, sent only when `INTRO_HINTS_ENABLED` is exactly `"true"` (see Status
 above — unset everywhere today), for `pipelineType: "notes"` runs, and only
 when at least one hint exists in the requested chapter range:
 
@@ -81,11 +81,19 @@ Field semantics:
   Free-form editor guidance — no schema beyond that. May be anything from a
   one-line reminder to several sentences.
 
-The whole array is also capped at 8000 combined `note` characters per
-request (`MAX_TOTAL_HINT_CHARS`, `api/src/introHints.ts`) — a defensive
-bound against an unbounded number of marked comments pushing the request
-past bp-assistant's body-size limit. Hints beyond the budget are dropped
-outright (not truncated mid-sentence), earliest first.
+The whole array is also capped at 8000 combined `note` bytes, measured in
+UTF-8 (`MAX_TOTAL_HINT_BYTES`, `api/src/introHints.ts`; a Hebrew or Greek
+character counts 2+ bytes) — a defensive bound against an unbounded number
+of marked comments pushing the request past bp-assistant's body-size limit.
+Hints are taken in order (chapter, then comment creation time, then comment
+id); one that would push the total past the budget is skipped outright (not
+truncated mid-sentence) and logged, and later hints that still fit are kept.
+
+A second guard covers the whole request: if the serialized `options`
+(existing verse `options.hints` plus `introHints`) would exceed
+`MAX_OPTIONS_BYTES` (30 KiB — bp-assistant's ~32 KiB body limit less 2 KiB
+for the rest of the body), `introHints` is left off entirely and the drop is
+logged. The verse hints are always kept.
 
 `introHints` may be empty or absent on any run (omitted, not an empty array,
 when there is nothing to send). When absent, behave exactly as today.
@@ -119,10 +127,11 @@ For your awareness (already implemented):
   unrelated remark) is never swept into generation guidance. The marker is
   stripped before the note text is forwarded.
 - **Outbound** (`api/src/pipelines.ts`): at `/api/pipelines/start` time, when
-  `INTRO_HINTS_ENABLED` is set and `pipelineType: "notes"`, the proxy selects
+  `INTRO_HINTS_ENABLED` is exactly `"true"` and `pipelineType: "notes"`, the proxy selects
   all unresolved, non-reply, verse-0, row-less, `kind = "note"` comments in
   the requested chapter range, keeps only the `AI:`-marked ones (bounded to
-  8000 combined characters), and folds them into `options.introHints` (see
+  8000 combined UTF-8 bytes, and dropped entirely if the whole `options`
+  object would pass 30 KiB), and folds them into `options.introHints` (see
   `api/src/introHints.ts`). A chained `notes` step from a "Generate
   everything" run does not go through this code path at all and never gets
   `introHints` — see Status above.
@@ -154,7 +163,7 @@ bp-assistant smoke test (once the intro skill consumes `introHints`):
    chapter's intro reflects its own note only; a chapter with no hints
    generates its normal, unguided intro.
 
-bible-editor smoke test (requires `INTRO_HINTS_ENABLED` set — e.g.
+bible-editor smoke test (requires `INTRO_HINTS_ENABLED` set to `"true"` — e.g.
 `wrangler dev --var INTRO_HINTS_ENABLED:true` locally; not testable as-is
 against `main`'s deployed default, which leaves it unset):
 

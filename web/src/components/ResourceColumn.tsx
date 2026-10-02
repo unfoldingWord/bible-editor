@@ -4,6 +4,7 @@ import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
 import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, TwlOrderLock, CommentRowKind } from "../sync/api";
+import { alignmentPanelRowKey } from "../sync/alignmentDraftSaveState";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
@@ -973,8 +974,10 @@ export function ResourceColumn({
               // that window writes the old content to the new row (e.g. UST
               // alignment saved onto the ULT verse). Keying forces a fresh mount
               // whose useState(computedInitial) seeds the correct state
-              // synchronously, closing the race.
-              key={`${alignmentProps.bibleVersion}:${alignmentProps.chapter}:${alignmentProps.verseNum}`}
+              // synchronously, closing the race. Also keyed by the row (start
+              // verse + bridge end), so a bridge or split by another editor
+              // remounts it fresh on the new row (#1074).
+              key={`${alignmentProps.bibleVersion}:${alignmentProps.chapter}:${alignmentProps.verseNum}:${alignmentPanelRowKey(alignmentProps.verse)}`}
               ref={alignmentProps.panelRef}
               book={alignmentProps.book}
               chapter={alignmentProps.chapter}

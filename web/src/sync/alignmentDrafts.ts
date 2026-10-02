@@ -24,6 +24,7 @@ import {
   isAlignmentSaveOp,
   refusalMayReplaceDraft,
   refusedOpOrder,
+  type AlignmentDraftRow,
   type RefusedOpOrder,
 } from "./alignmentDraftSaveState";
 
@@ -55,6 +56,9 @@ export interface AlignmentDraftRecord {
   // Set only on a draft restoreRefused wrote: the refused op it came from
   // (#1071). The panel's own persist writes leave it off.
   refusedFrom?: RefusedOpOrder;
+  // The row the draft was made on (#1074). Hydration restores it only onto
+  // that same row; see alignmentDraftFitsRow. Absent on older records.
+  row?: AlignmentDraftRow;
 }
 
 let dbp: Promise<IDBPDatabase> | null = null;
@@ -79,7 +83,10 @@ export { alignmentDraftKey };
 // its drags: a crash draft holds them (written here, or one already there),
 // or an open panel put its pre-save baseline back (noteRefusalKeptInPanel).
 // Shell words its toast on this, so it never says "kept" when nothing was.
-type RefusalListener = (op: OutboxOp, kept: boolean) => void;
+// `heldInDraft`: a crash draft at the key holds the drags. False with `kept`
+// true means only the open panel's memory holds them (#1073: Shell must not
+// then reset that panel by rolling the cache back).
+type RefusalListener = (op: OutboxOp, kept: boolean, heldInDraft: boolean) => void;
 const refusalListeners = new Set<RefusalListener>();
 export function onAlignerSaveRefused(fn: RefusalListener): () => void {
   refusalListeners.add(fn);
@@ -90,6 +97,13 @@ const keptInPanel = new Set<string>();
 // lands before the draft write below resolves.
 export function noteRefusalKeptInPanel(generation: string): void {
   keptInPanel.add(generation);
+}
+
+// #1077: the newest aligner save per draft key that this tab saw commit, so
+// an open panel never re-reads an older refused save's draft over it.
+const committedAlignerSaves = new Map<string, RefusedOpOrder>();
+export function newestCommittedAlignerSave(key: string): RefusedOpOrder | undefined {
+  return committedAlignerSaves.get(key);
 }
 
 let generationSeq = 0;
@@ -110,7 +124,7 @@ export const alignmentDrafts = {
   // Returns the generation minted for this write (even in read-only mode,
   // where nothing is actually persisted) so callers that want generation-safe
   // cleanup later (AlignmentPanel's save path) always have a value to carry.
-  async set(key: string, content: unknown, expectedVersion: number): Promise<string> {
+  async set(key: string, content: unknown, expectedVersion: number, row: AlignmentDraftRow): Promise<string> {
     const generation = mintAlignmentDraftGeneration();
     if (isReadOnly()) return generation;
     const rec: AlignmentDraftRecord = {
@@ -119,6 +133,7 @@ export const alignmentDrafts = {
       expectedVersion,
       updatedAt: Date.now(),
       generation,
+      row,
     };
     await (await db()).put(STORE, rec);
     return generation;
@@ -160,6 +175,7 @@ export const alignmentDrafts = {
     content: unknown,
     expectedVersion: number,
     from: RefusedOpOrder,
+    row: AlignmentDraftRow | undefined,
   ): Promise<boolean> {
     if (isReadOnly()) return false;
     const idb = await db();
@@ -174,6 +190,7 @@ export const alignmentDrafts = {
         updatedAt: Date.now(),
         generation: mintAlignmentDraftGeneration(),
         refusedFrom: from,
+        ...(row ? { row } : {}),
       };
       await tx.store.put(rec);
     }
@@ -219,13 +236,20 @@ onOutboxResult((op, result) => {
       const generation = op.alignmentDraftGeneration as string;
       const settle = (heldInDraft: boolean) => {
         const kept = keptInPanel.delete(generation) || heldInDraft;
-        for (const l of refusalListeners) l(op, kept);
+        for (const l of refusalListeners) l(op, kept, heldInDraft);
       };
       alignmentDrafts
-        .restoreRefused(key, op.patch.content, op.expectedVersion, refusedOpOrder(op))
+        .restoreRefused(key, op.patch.content, op.expectedVersion, refusedOpOrder(op), op.alignmentDraftRow)
         .then(settle, () => settle(false));
     }
     return;
+  }
+  if (isAlignerPanelSaveOp(op)) {
+    const order = refusedOpOrder(op);
+    const prev = committedAlignerSaves.get(key);
+    if (!prev || order.queuedAt > prev.queuedAt || (order.queuedAt === prev.queuedAt && order.seq > prev.seq)) {
+      committedAlignerSaves.set(key, order);
+    }
   }
   if (op.alignmentDraftGeneration) {
     void alignmentDrafts.clearGeneration(key, op.alignmentDraftGeneration);
