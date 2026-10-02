@@ -47,7 +47,7 @@ import {
   tsvRevertReport,
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
-  buildRevertLineage,
+  loadRevertLineage,
   foreignCommitDuringExport,
   exportRevertRaceAlertSource,
   masterIsOurLastPublish,
@@ -1429,10 +1429,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       let priorPushedR2Key: string | null = null;
       // #1029: renders pushed since master was last confirmed (see migration 0075).
       let unconfirmedRenderShas: string[] | null = null;
+      // #1029: where master was last confirmed, read before tonight's push;
+      // bounds which bot writes the revert lineage may count.
+      let priorConfirmed: { editId: number | null; at: number | null } = { editId: null, at: null };
       try {
         const prior = await this.env.DB.prepare(
           `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key,
-                  unconfirmed_renders_json
+                  unconfirmed_renders_json, master_confirmed_edit_id, master_confirmed_at
              FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
         )
           .bind(book, resource)
@@ -1442,7 +1445,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             prev_pushed_blob_sha: string | null;
             prev_pushed_r2_key: string | null;
             unconfirmed_renders_json: string | null;
+            master_confirmed_edit_id: number | null;
+            master_confirmed_at: number | null;
           }>();
+        priorConfirmed = {
+          editId: prior?.master_confirmed_edit_id ?? null,
+          at: prior?.master_confirmed_at ?? null,
+        };
         if (prior?.unconfirmed_renders_json) {
           const parsed: unknown = JSON.parse(prior.unconfirmed_renders_json);
           if (Array.isArray(parsed)) unconfirmedRenderShas = parsed.filter((x): x is string => typeof x === "string");
@@ -1655,15 +1664,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         let lineage: Map<string, Array<Record<string, unknown>>> | null = null;
         if (computeEntries && (resource === "tn" || resource === "tq")) {
           try {
-            const { results } = await this.env.DB.prepare(
-              `SELECT row_key, source, payload_json FROM edit_log
-                WHERE kind = ?1 AND book = ?2 AND source IN ('ai_pipeline', 'dcs_reimport')
-                  AND action IN ('create', 'update') AND payload_json IS NOT NULL
-                ORDER BY id`,
-            )
-              .bind(resource, book)
-              .all<{ row_key: string; source: string | null; payload_json: string }>();
-            lineage = buildRevertLineage(results ?? []);
+            lineage = await loadRevertLineage(this.env.DB, resource, book, priorConfirmed);
           } catch (e) {
             console.error("export: revert lineage read failed; report keeps its unfiltered behaviour", {
               book,

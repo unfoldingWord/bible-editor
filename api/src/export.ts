@@ -1246,6 +1246,28 @@ export function buildRevertLineage(
   return lineage;
 }
 
+// Reads the tn/tq revert lineage for one (book, kind) from edit_log.
+// `confirmed` is the pair's master_confirmed_edit_id / master_confirmed_at as
+// read before tonight's push.
+export async function loadRevertLineage(
+  db: D1Database,
+  kind: "tn" | "tq",
+  book: string,
+  confirmed: { editId: number | null; at: number | null },
+): Promise<Map<string, Array<Record<string, unknown>>>> {
+  void confirmed;
+  const { results } = await db
+    .prepare(
+      `SELECT row_key, source, payload_json FROM edit_log
+        WHERE kind = ?1 AND book = ?2 AND source IN ('ai_pipeline', 'dcs_reimport')
+          AND action IN ('create', 'update') AND payload_json IS NOT NULL
+        ORDER BY id`,
+    )
+    .bind(kind, book)
+    .all<{ row_key: string; source: string | null; payload_json: string }>();
+  return buildRevertLineage(results ?? []);
+}
+
 // True when master's row equals (on every content column) a full-row edit_log
 // payload from the machine lineage. Payloads missing a content field never
 // match (fail open).

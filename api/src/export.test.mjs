@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, buildRevertLineage, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, exportRevertRaceAlertSource, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, loadRevertLineage, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, exportRevertRaceAlertSource, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -2767,29 +2767,73 @@ function utf8Base64(s) {
     `partial payload never matches -> fails open`,
   );
 
-  // Review A2: only the row's LATEST machine write counts, and only when the
-  // AI pipeline wrote it. dcs_reimport mirrors human Door43 edits too, and an
-  // older bot value can be restored on Door43 by a human.
-  const ev = (source, note) => ({ row_key: "ab01", source, payload_json: JSON.stringify({ ...payload, note }) });
-  const reported = (rows) => tsvRevertReport(appEdited, botMaster, "tn", null, buildRevertLineage(rows)).entries.length;
-  assert(reported([ev("ai_pipeline", "bot note")]) === 0, `A2: latest machine write is the bot's -> 0 entries`);
+}
+
+// --- #1029 review: loadRevertLineage on the real schema (A2, AO1, AO2, C1) ---
+{
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const migDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  const migs = readdirSync(migDir).filter((f) => f.endsWith(".sql")).sort().map((f) => readFileSync(join(migDir, f), "utf8"));
+  // Minimal D1 shim over node:sqlite.
+  const shim = (sqlite) => {
+    const mk = (sql, args) => ({
+      bind: (...a) => mk(sql, a),
+      all: async () => ({ results: sqlite.prepare(sql).all(...args), success: true }),
+    });
+    return { prepare: (sql) => mk(sql, []) };
+  };
+  const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
+  const tsv = (note) => `${TN_HEADER}\n1:1\tab01\t\t\tword\t1\t${note}\n`;
+  const base = { ref_raw: "1:1", support_reference: "", quote: "word", occurrence: 1 };
+  // events: [id, source, action, note, created_at?]. Master holds `master`; tonight's render holds `rendered`.
+  const entries = async (events, confirmed, rendered = "Z", master = "X") => {
+    const sqlite = new DatabaseSync(":memory:");
+    for (const m of migs) sqlite.exec(m);
+    for (const [id, source, action, note, at] of events) {
+      sqlite
+        .prepare(
+          `INSERT INTO edit_log (id, kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+           VALUES (?, 'tn', 'ab01', 'EZK', NULL, NULL, 1, ?, ?, ?, ?)`,
+        )
+        .run(id, action, note == null ? null : JSON.stringify({ ...base, note }), source, at ?? id);
+    }
+    const lineage = await loadRevertLineage(shim(sqlite), "tn", "EZK", confirmed);
+    return tsvRevertReport(tsv(rendered), tsv(master), "tn", null, lineage).entries.length;
+  };
+  const before = { editId: 10, at: 10 }; // master last confirmed before the bot write
+
+  // The issue's case (b): bot writes X to master and D1, translator edits in the app.
+  assert((await entries([[20, "ai_pipeline", "create", "X"], [30, null, "update", "Z"]], before)) === 0,
+    `(b) bot write after the confirmed point, then an app edit -> 0 entries`);
+  // A2
+  assert((await entries([[20, "dcs_reimport", "update", "X"]], before)) === 1,
+    `A2: master equals an imported (possibly human) Door43 value -> still reported`);
+  assert((await entries([[20, "ai_pipeline", "create", "X"], [25, "ai_pipeline", "update", "X2"]], before)) === 1,
+    `A2: human restores an OLDER bot value on Door43 -> still reported`);
+  assert((await entries([[20, "ai_pipeline", "create", "X"], [25, "dcs_reimport", "update", "H"]], before)) === 1,
+    `A2: bot value superseded by an imported Door43 edit, then restored -> still reported`);
+  // AO1: a reimport 'restore' also supersedes the bot write.
+  assert((await entries([[20, "ai_pipeline", "create", "X"], [25, "dcs_reimport", "restore", "R"]], before)) === 1,
+    `AO1: bot value superseded by a reimport restore, then restored on Door43 -> still reported`);
+  // AO2: X (bot) -> Y (app, exported, merged, confirmed at 35) -> Z (app); a human restores X on Door43.
   assert(
-    reported([ev("dcs_reimport", "bot note")]) === 1,
-    `A2: master equals an imported (possibly human) Door43 value -> still reported`,
+    (await entries([[20, "ai_pipeline", "create", "X"], [30, null, "update", "Y"], [40, null, "update", "Z"]], { editId: 35, at: 35 })) === 1,
+    `AO2: bot write older than the confirmed point -> a human restore of it is still reported`,
   );
-  assert(
-    reported([ev("ai_pipeline", "bot note"), ev("ai_pipeline", "bot v2")]) === 1,
-    `A2: human restores an OLDER bot value on Door43 -> still reported`,
-  );
-  assert(
-    reported([ev("ai_pipeline", "bot note"), ev("dcs_reimport", "human door43 edit")]) === 1,
-    `A2: bot value superseded by an imported Door43 edit, then restored -> still reported`,
-  );
+  // Timestamp fallback when master_confirmed_edit_id is NULL (warm-up).
+  assert((await entries([[20, "ai_pipeline", "create", "X", 900]], { editId: null, at: 1000 })) === 1,
+    `AO2: no edit-id boundary, bot write before master_confirmed_at -> reported`);
+  assert((await entries([[20, "ai_pipeline", "create", "X", 1100]], { editId: null, at: 1000 })) === 0,
+    `no edit-id boundary, bot write after master_confirmed_at -> 0 entries`);
+  assert((await entries([[20, "ai_pipeline", "create", "X"]], { editId: null, at: null })) === 1,
+    `no confirmed point at all -> lineage unused, reported (fails open)`);
   // C1: a non-string content field must not throw (the report runs after the DCS commit).
-  const odd = [{ row_key: "ab01", source: "ai_pipeline", payload_json: JSON.stringify({ ...payload, note: 7 }) }];
   let threw = false;
   try {
-    reported(odd);
+    await entries([[20, "ai_pipeline", "create", 7]], before);
   } catch {
     threw = true;
   }
