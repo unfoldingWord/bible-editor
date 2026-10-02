@@ -90,6 +90,13 @@ Highlights that bite repeatedly:
   source attrs INTO UHB bytes would then read as converged and be reverted on export. The fix lives in the no-op
   guard instead: drop the row only when D1 already equals canonized master AND raw master is NFC-equal to D1.
 
+- **AI-apply TN dedup: fold to find candidates, split only on proven UHB twins; never key byte-exactly.** Issue
+  #966: the #962 fold (NFC + strip joiners) merged twins tC counts separately (DAN 2:10 kol with/without U+2060).
+  Keying byte-exactly after canonizing (PR #973's first shape) reopened AI TN doubling for every quote that could
+  not be canonized: pre-#959 proposals, verses with no UHB loaded, legacy NFC rows. `isDistinctTwinTn` in
+  `pipelineImport.ts` splits a fold collision only when both words are byte-identical, different UHB surfaces;
+  NT keeps the plain fold. The nightly reimport's `planTnContentDedup` stays byte-exact and was not touched.
+
 - **A locked book freezes the merge ancestor, so Door43 is authoritative for it — and a markers-only overwrite
   is logged, never alerted.** Measured 2026-09-24 (ZEC 1:17 ULT, Rich): the book was locked on 09-17, so the
   export skipped it nightly, `master_confirmed_at` never advanced, and every Door43 commit read as "both changed"
@@ -390,6 +397,17 @@ Highlights that bite repeatedly:
   blanket write-block in `request()` also kills writes the server deliberately still
   allows — it made comments vanish and made unlocking impossible from the UI. Split
   read-only into named reasons rather than one global boolean.
+  A third corollary (#1045): a lock that lands on work already typed or dragged must
+  also take Save off every unsaved-changes gate and auto-save path. Saving then
+  commits locally and the refused PATCH is dropped, so the work is lost.
+
+- **A Playwright test can land a pipeline (chapter) lock live without waiting minutes.**
+  The tab only re-reads pipeline jobs on a 120 s poll or a refocus throttled to 60 s
+  (`pipelineStore.ts`). Call `page.clock.install()` before the page loads, then
+  `page.clock.fastForward(61_000)` and dispatch `visibilitychange` (s17's
+  `refreshPipelineJobs`). A spec that saves to the seeded ZEC fixture must restore the
+  verse in `finally`. If it times out, the restore dies with the test and the seed
+  drifts, which breaks later runs. Re-run `import-ZEC.sql` to reset it.
 
 - **"Where is the user?" has no single source in this app — and both available sources
   are blind in a different direction.** `activeVerse` is Shell-LOCAL state
@@ -636,7 +654,14 @@ Highlights that bite repeatedly:
   this run's own confirmed render. It is not "never newer than the post-walk read": an outside confirm with a
   null edit id can push `master_confirmed_at` past the run's `pushed_read_at`, so the stamp's SQL edit-id gate
   leaves the row's edit id at the fetch-time value while the paired edit id is the own stamp's. Corollary for tests: a DB-side advance injected during staging now reads as an outside
-  writer, so a test of the legitimate path has to drive the real #658 stamp.
+  writer, so a test of the legitimate path has to drive the real #658 stamp. The own stamp is only legitimate
+  for a merge the staged file can contain (#1058): the walk reads master's current tip, not `masterSha`, so
+  `accountOwnPublishDecline` withholds the stamp unless our merge sits at or after `masterSha`'s position in the
+  newest-first walk (a missing or unknown `masterSha` withholds too). Next night's file head is past the merge, so
+  the stamp lands then. The admin "Pull from Door43" path (`runReimport`) pins ULT/UST the same way (#1063), because
+  it re-reads the verse cutoff after the walk. Its TSV fetch stays unpinned on purpose: a `ref`-pinned TSV fetch
+  comes back completeness-verified, which widens the prune's covered chapters, and that path's TSV cutoff is the
+  pre-walk read anyway.
 
 ## Stop conditions / goals
 
