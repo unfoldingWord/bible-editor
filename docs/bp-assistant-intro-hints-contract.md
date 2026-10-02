@@ -119,7 +119,8 @@ For your awareness (already implemented):
 
 - **Storage**: an editor leaves a hint via the *existing* internal-comments
   UI (`CommentsPopover`), anchored to the chapter's verse-0 "intro" row with
-  no `rowKind`/`rowId` (a verse-level comment, `kind: "note"`) — the same
+  no `rowKind`/`rowId` (a verse-level comment of either kind, Note or Question;
+  issue #1079) — the same
   affordance already used for "add a comment on this verse," not a new UI
   surface. The comment body must start with an `AI:` marker (case-
   insensitive, e.g. `AI: mention the covenant theme`) to opt in — an
@@ -128,7 +129,7 @@ For your awareness (already implemented):
   stripped before the note text is forwarded.
 - **Outbound** (`api/src/pipelines.ts`): at `/api/pipelines/start` time, when
   `INTRO_HINTS_ENABLED` is exactly `"true"` and `pipelineType: "notes"`, the proxy selects
-  all unresolved, non-reply, verse-0, row-less, `kind = "note"` comments in
+  all unresolved, non-reply, verse-0, row-less comments (Note or Question) in
   the requested chapter range, keeps only the `AI:`-marked ones (bounded to
   8000 combined UTF-8 bytes, and dropped entirely if the whole `options`
   object would pass 30 KiB), and folds them into `options.introHints` (see
@@ -167,7 +168,7 @@ bible-editor smoke test (requires `INTRO_HINTS_ENABLED` set to `"true"` — e.g.
 `wrangler dev --var INTRO_HINTS_ENABLED:true` locally; not testable as-is
 against `main`'s deployed default, which leaves it unset):
 
-1. Add an internal comment (kind: note) on a chapter's intro (verse 0)
+1. Add an internal comment (Note or Question) on a chapter's intro (verse 0)
    starting with `AI:`, plus a second, unmarked comment in the same spot
    (ordinary discussion).
 2. Trigger the notes pipeline for that chapter.

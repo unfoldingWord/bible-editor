@@ -1812,6 +1812,9 @@ pipelines.post("/start", requireEditor, async (c) => {
     // leading "AI:" marker (see introHints.ts — an ordinary unmarked
     // discussion note on the intro must not silently become generation
     // guidance). Forwarded as options.introHints alongside options.hints.
+    // Both comment kinds count (issue #1079): the composer defaults to
+    // "Question", and an editor who starts a comment with AI: means it for
+    // the AI whichever kind they left selected.
     //
     // Gated on INTRO_HINTS_ENABLED (see index.ts's Env): a 2026-09-22 review
     // found the bp-assistant-side contract genuinely unverified from here —
@@ -1847,7 +1850,7 @@ pipelines.post("/start", requireEditor, async (c) => {
            FROM comments
           WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
             AND verse = 0 AND row_kind IS NULL AND parent_id IS NULL
-            AND kind = 'note' AND resolved_at IS NULL AND deleted_at IS NULL
+            AND kind IN ('note', 'question') AND resolved_at IS NULL AND deleted_at IS NULL
           ORDER BY chapter, created_at ASC, id ASC`,
       )
         .bind(book, startChapter, endChapter)
