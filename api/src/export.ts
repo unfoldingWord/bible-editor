@@ -1225,17 +1225,19 @@ const LINEAGE_FIELDS: Record<"tn" | "tq", Array<[string, string]>> = {
 
 // Builds tsvRevertReport's `lineage` map from edit_log rows (ordered by id
 // ascending) for one (book, kind). Per row, only the LATEST machine write
-// (ai_pipeline or dcs_reimport) counts, and only when the AI pipeline wrote
-// it: dcs_reimport also mirrors human Door43 edits, and a human can restore an
-// older bot value on Door43, so neither may hide a row from the report.
+// (any non-NULL source, any action: create, update, restore, delete, ...)
+// counts, and only when it is an ai_pipeline create/update: dcs_reimport also
+// mirrors human Door43 edits, and a human can restore an older bot value on
+// Door43, so neither may hide a row from the report. App edits (source NULL)
+// do not supersede: a translator editing the bot's row is the case this serves.
 export function buildRevertLineage(
-  rows: ReadonlyArray<{ row_key: string; source: string | null; payload_json: string }>,
+  rows: ReadonlyArray<{ row_key: string; source: string | null; action: string; payload_json: string | null }>,
 ): Map<string, Array<Record<string, unknown>>> {
-  const latest = new Map<string, { source: string | null; payload_json: string }>();
-  for (const r of rows) latest.set(r.row_key, r);
+  const latest = new Map<string, (typeof rows)[number]>();
+  for (const r of rows) if (r.source != null) latest.set(r.row_key, r);
   const lineage = new Map<string, Array<Record<string, unknown>>>();
   for (const [rowKey, r] of latest) {
-    if (r.source !== "ai_pipeline") continue;
+    if (r.source !== "ai_pipeline" || (r.action !== "create" && r.action !== "update") || r.payload_json == null) continue;
     try {
       const p = JSON.parse(r.payload_json);
       if (p && typeof p === "object") lineage.set(rowKey, [p as Record<string, unknown>]);
@@ -1256,15 +1258,18 @@ export async function loadRevertLineage(
   confirmed: { editId: number | null; at: number | null },
 ): Promise<Map<string, Array<Record<string, unknown>>>> {
   void confirmed;
+  // Every machine write for the book, so a later one of any action supersedes
+  // an older bot payload. Payloads are only needed for ai_pipeline rows.
   const { results } = await db
     .prepare(
-      `SELECT row_key, source, payload_json FROM edit_log
-        WHERE kind = ?1 AND book = ?2 AND source IN ('ai_pipeline', 'dcs_reimport')
-          AND action IN ('create', 'update') AND payload_json IS NOT NULL
+      `SELECT row_key, source, action,
+              CASE WHEN source = 'ai_pipeline' THEN payload_json END AS payload_json
+         FROM edit_log
+        WHERE kind = ?1 AND book = ?2 AND source IS NOT NULL
         ORDER BY id`,
     )
     .bind(kind, book)
-    .all<{ row_key: string; source: string | null; payload_json: string }>();
+    .all<{ row_key: string; source: string | null; action: string; payload_json: string | null }>();
   return buildRevertLineage(results ?? []);
 }
 
