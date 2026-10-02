@@ -4873,12 +4873,16 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // from a store PROVEN gap-free by sha-continuity polling, without a live
 // Gitea round trip and its failure modes (timeouts, page caps). A PLAIN late
 // push, where the commit is locally authored AND committed days before it
-// reaches Door43 so neither timestamp ever moves, is caught only by the
-// ledger: readLedgerMasterLineage also admits a row whose `seen_at` (the
-// poller's arrival stamp) is after the window start (#691). The live-walk
-// fallback still cannot see it, because Gitea exposes no push time; that
-// residual applies only when the ledger is unusable (stale tip, gap, no
-// coverage floor), and those cases already fall back to live by design.
+// reaches Door43 so neither timestamp ever moves, can be seen only through
+// the ledger: readLedgerMasterLineage also admits a row whose `seen_at` is
+// after the window start (#691). seen_at is the poll that recorded the row
+// (or, for a backfilled row, the poll that opened its gap), so it is an
+// upper bound on arrival: a poll's lag can add a row that landed just before
+// the window, and a commit from a second gap opened while an older one was
+// still being backfilled gets the older gap's stamp and can be missed. The
+// live-walk fallback (ledger unusable: stale tip, open gap, no coverage
+// floor) cannot see a plain late push at all, because Gitea exposes no push
+// time.
 interface NoBaseFallbackWindow {
   /** Where the walk must start: see the tier notes above. */
   windowStart: number;
@@ -5229,13 +5233,13 @@ async function clearResolvedMergeNoBase(
       // fails closed on anything but a current, gap-free ledger whose coverage
       // reaches back to windowStart, so trying it here is always safe: worst
       // case it refuses and the live walk below runs exactly as it always has.
-      // What it buys when it IS usable: the same committer-date answer the
-      // live walk would give, but from a store already proven gap-free by
-      // sha-continuity polling — so this survives a live Gitea hiccup (a
-      // timeout or page cap) that would otherwise force a refusal. See
-      // NoBaseFallbackWindow's comment for the honest limit: neither this nor
-      // the live walk can see a PLAIN late push (author and committer date
-      // both unmoved).
+      // What it buys when it IS usable: the committer-date answer the live
+      // walk would give, plus commits first seen (seen_at) after windowStart,
+      // from a store already proven gap-free by sha-continuity polling — so
+      // this survives a live Gitea hiccup (a timeout or page cap) that would
+      // otherwise force a refusal. See NoBaseFallbackWindow's comment for the
+      // limit: the ledger can catch a PLAIN late push (author and committer
+      // date both unmoved); the live-walk fallback cannot.
       const fetched = await masterCommitsSinceViaLedgerOrLive(env, file, windowStart, book, kind);
       walk = fetched.page;
       walkSince = windowStart;

@@ -41,9 +41,16 @@
 
 export const DCS_COMMITS_RETENTION_SECONDS = 548 * 86400; // ~18 months
 
+//
+// AND seen_at (#691): readLedgerMasterLineage also admits a row on seen_at,
+// so a late push backdated past the cutoff but first seen after it must
+// survive until its seen_at ages out too. A row is deleted only when it is
+// old on BOTH clocks. Backfilled rows carry seen_at = the gap's opening
+// poll (dcsCommitBackfill.ts), so a bootstrap's backfilled history is kept
+// at most one retention period after that poll, not forever.
 export const DCS_COMMITS_SWEEP_SQL = `
   DELETE FROM dcs_commits
-   WHERE COALESCE(committed_at, seen_at) < ?1`;
+   WHERE COALESCE(committed_at, seen_at) < ?1 AND seen_at < ?1`;
 
 // Companion to DCS_COMMITS_SWEEP_SQL, run with the SAME ?1 cutoff (ideally in
 // the same batch, so the floor raise and the deletion it accounts for commit
