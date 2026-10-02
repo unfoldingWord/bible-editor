@@ -20,6 +20,8 @@ import { csrfToken, newUserContext } from "./helpers";
 //   3. #1067: a verse change never replaces unsaved text on screen, focused or
 //      not. A line that lost focus keeps its edit and its pin, so Save is a
 //      409 and a merge prompt, not an overwrite.
+//   4. #1074: unsaved drags in the alignment panel are never saved onto a row
+//      another editor bridged under it.
 //
 // Kept apart from s18 (book locks) so the two suites can change separately.
 
@@ -509,6 +511,118 @@ test("a dirty reading line on a bridged row that another editor splits drops the
     const after6 = await get(V6);
     expect(after6.verse_end).toBeNull();
     expect(after6.plain_text).not.toContain(`EDIT-${stamp}`);
+  } finally {
+    if (bridged) {
+      const cur = await get(V6);
+      const split = await context.request.post(`${V6}/split`, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+      });
+      expect(split.status(), await split.text()).toBe(200);
+    }
+    for (const [path, orig] of [
+      [V6, orig6],
+      [V7, orig7],
+    ] as const) {
+      const cur = await get(path);
+      const put = await context.request.patch(path, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+        data: { content: JSON.parse(orig.content_json), plain_text: orig.plain_text },
+      });
+      expect(put.status(), await put.text()).toBe(200);
+    }
+    await context.close();
+  }
+});
+
+// #1074: the alignment PANEL is keyed by verse number only, not by row. A
+// bridge by another editor under a panel holding unsaved drags maps the slot
+// onto the 6-7 row; if the panel kept its v7 state, Save would write v7's
+// alignment over the whole bridged row and delete verse 6. Whatever the panel
+// does with the drag, the bridged row must keep verse 6's text and alignment.
+test("unsaved alignment drags in the panel are never saved onto a row another editor bridged under it", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const UST = "UST";
+  const V6 = `/api/verses/${BOOK}/7/6/${UST}`;
+  const V7 = `/api/verses/${BOOK}/7/7/${UST}`;
+  const get = async (path: string) => {
+    const res = await context.request.get(path);
+    expect(res.ok()).toBe(true);
+    return (await res.json()) as VerseRow & { verse_end: number | null };
+  };
+  const orig6 = await get(V6);
+  const orig7 = await get(V7);
+  expect(orig6.verse_end).toBeNull();
+  // "telling" is in UST 7:7 only (not ULT 7:7), so the chip is the UST panel's.
+  expect(wordIsAligned(JSON.parse(orig7.content_json), "telling")).toBe(true);
+  expect(wordIsAligned(JSON.parse(orig6.content_json), "temple")).toBe(true);
+  const key6 = `verse:${BOOK}:7:6:${UST}`;
+  const current = (k: string) =>
+    page.evaluate((kk) => (window as unknown as PinDebugWindow).__bePinDebug?.currentVersion(kk), k);
+  let bridged = false;
+
+  try {
+    const o = await openDual(page, { chapter: 7, verse: 7 });
+    const ustLineBox = o.dialog
+      .locator("div:has(> [contenteditable])")
+      .filter({ hasText: `${UST} · reading text` });
+    await expect(ustLineBox.locator("[contenteditable]")).toContainText("former prophets");
+
+    // Unalign "telling" in the UST panel (unsaved).
+    const chip = o.dialog.locator('[draggable="true"]').filter({ hasText: "telling" }).first();
+    await chip.dragTo(o.dialog.getByText(`${UST} words`, { exact: true }).first());
+    await expect(o.dialog.getByText("🔒 save alignment first")).toBeVisible();
+    const panelSave = o.dialog.getByRole("button", { name: `Save ${UST}`, exact: true });
+    await expect(panelSave.first()).toBeEnabled();
+
+    // Another editor bridges 6+7 into one row.
+    const res = await context.request.post(`${V6}/bridge`, {
+      headers: { "x-csrf-token": csrf },
+      data: { start_version: orig6.version, next_version: orig7.version },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    bridged = true;
+    const bridgedVersion = ((await res.json()) as { verse: { version: number } }).verse.version;
+    const bridgedRow = await get(V6);
+    await expect.poll(() => current(key6)).toBe(bridgedVersion);
+
+    // Save whatever the dialog still offers for UST. Today the panel's full
+    // reset on the row's content change drops the drag, so nothing is
+    // enabled; a panel that kept its v7 state would PATCH the 6-7 row with
+    // its fresh version (200) and delete verse 6, which the checks below catch.
+    const enabled: Locator[] = [];
+    for (const b of await panelSave.all()) if (await b.isEnabled()) enabled.push(b);
+    if (enabled.length > 0) {
+      const confirm = page.getByRole("dialog").filter({ hasText: "will be unaligned" });
+      let sent = false;
+      const patched = page
+        .waitForResponse((r) => r.request().method() === "PATCH" && r.url().includes(`/api/verses/${BOOK}/7/`), {
+          timeout: 15_000,
+        })
+        .then((r) => {
+          sent = true;
+          return r;
+        });
+      await enabled[0].click();
+      await expect.poll(async () => sent || (await confirm.isVisible()), { timeout: 10_000 }).toBe(true);
+      if (!sent) await confirm.getByRole("button", { name: "Save anyway" }).click();
+      await patched;
+    }
+    // Let any queued op drain before reading the server.
+    await page.waitForTimeout(2_000);
+
+    const after6 = await get(V6);
+    expect(after6.verse_end).toBe(7);
+    expect(after6.plain_text).toContain("feasted");
+    expect(after6.plain_text).toContain("telling");
+    const content6 = JSON.parse(after6.content_json);
+    expect(wordIsAligned(content6, "temple")).toBe(true);
+    expect(wordIsAligned(content6, "telling")).toBe(true);
+    expect(after6.content_json).toBe(bridgedRow.content_json);
   } finally {
     if (bridged) {
       const cur = await get(V6);
