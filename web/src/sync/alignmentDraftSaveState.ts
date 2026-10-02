@@ -107,6 +107,15 @@ export function alignmentDraftRow(row: { verse: number; verse_end?: number | nul
   return { verse: row.verse, verseEnd: end === row.verse ? null : end };
 }
 
+// #1074: the row part of an aligner panel's React key, so a bridge or split
+// under the panel remounts it. A single verse keys the same whether its
+// verse_end is null, missing or equal to its start.
+export function alignmentPanelRowKey(row: { verse: number; verse_end?: number | null } | null | undefined): string {
+  if (!row) return "none";
+  const r = alignmentDraftRow(row);
+  return `${r.verse}-${r.verseEnd ?? r.verse}`;
+}
+
 // #1074: may the panel open on verse `verseNum` restore this crash draft onto
 // the row it now resolves to? Only onto the version the draft branched from
 // AND the same row. The version alone is not enough: a bridged row's version

@@ -3,6 +3,7 @@ import {
   alignmentDraftFitsRow,
   alignmentDraftKey,
   alignmentDraftRow,
+  alignmentPanelRowKey,
   alignmentDraftKeyForOp,
   isAlignerPanelSaveOp,
   isAlignmentSaveOp,
@@ -182,4 +183,11 @@ assert.equal(alignmentDraftKey("ZEC", 7, 7, "UST"), "ZEC:7:7:UST", "the key form
   assert.equal(alignmentDraftFitsRow(legacy, bridged, 6), false, "even opened on the range row's start verse");
 }
 
-console.log("alignmentDraftSaveState: 30 passed");
+// #1074: the panel's row key is the same however a single verse spells its end.
+assert.equal(alignmentPanelRowKey({ verse: 7, verse_end: null }), "7-7");
+assert.equal(alignmentPanelRowKey({ verse: 7 }), "7-7");
+assert.equal(alignmentPanelRowKey({ verse: 7, verse_end: 7 }), "7-7");
+assert.equal(alignmentPanelRowKey({ verse: 6, verse_end: 7 }), "6-7", "a bridge keys differently");
+assert.equal(alignmentPanelRowKey(null), "none");
+
+console.log("alignmentDraftSaveState: 35 passed");

@@ -595,12 +595,10 @@ async function panelDragsUnderBridge(browser: Browser, collide: boolean) {
   try {
     if (collide) {
       // A bridge writes the 6-7 row at v6's version + 1 (verses.ts).
-      for (let i = 0; i < 20; i++) {
-        const v6 = (await get(V6)).version;
-        const v7 = (await get(V7)).version;
-        if (v7 === v6 + 1) break;
-        await bump(v7 < v6 + 1 ? V7 : V6);
-      }
+      // Each re-save moves one row on by one; the gap grows with run history
+      // (a split resets v6 low while v7 keeps climbing), so close all of it.
+      const gap = (await get(V7)).version - ((await get(V6)).version + 1);
+      for (let i = 0; i < Math.abs(gap); i++) await bump(gap > 0 ? V6 : V7);
     }
     const base6 = await get(V6);
     const base7 = await get(V7);
@@ -655,25 +653,40 @@ async function panelDragsUnderBridge(browser: Browser, collide: boolean) {
     expect(wordIsAligned(content6, "temple")).toBe(true);
     expect(wordIsAligned(content6, "telling")).toBe(true);
   } finally {
+    // Every cleanup step runs even if an earlier one fails; the first failure
+    // is thrown at the end, after the fixture is restored and the context closed.
+    const errors: unknown[] = [];
+    const step = async (fn: () => Promise<void>) => {
+      try {
+        await fn();
+      } catch (e) {
+        errors.push(e);
+      }
+    };
     if (bridged) {
-      const cur = await get(V6);
-      const split = await context.request.post(`${V6}/split`, {
-        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+      await step(async () => {
+        const cur = await get(V6);
+        const split = await context.request.post(`${V6}/split`, {
+          headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+        });
+        expect(split.status(), await split.text()).toBe(200);
       });
-      expect(split.status(), await split.text()).toBe(200);
     }
     for (const [path, orig] of [
       [V6, orig6],
       [V7, orig7],
     ] as const) {
-      const cur = await get(path);
-      const put = await context.request.patch(path, {
-        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
-        data: { content: JSON.parse(orig.content_json), plain_text: orig.plain_text },
+      await step(async () => {
+        const cur = await get(path);
+        const put = await context.request.patch(path, {
+          headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+          data: { content: JSON.parse(orig.content_json), plain_text: orig.plain_text },
+        });
+        expect(put.status(), await put.text()).toBe(200);
       });
-      expect(put.status(), await put.text()).toBe(200);
     }
-    await context.close();
+    await step(() => context.close());
+    if (errors.length > 0) throw errors[0];
   }
 }
 

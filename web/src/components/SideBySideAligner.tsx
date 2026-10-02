@@ -21,6 +21,7 @@ import { type HoverHighlight, type HighlightCtx } from "../lib/highlightTypes";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { TwlRow, VerseDto } from "../sync/api";
 import type { VerseBaseHold } from "../sync/versePin";
+import { alignmentPanelRowKey } from "../sync/alignmentDraftSaveState";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { extractEditableText, normalizeEditable } from "../lib/usfm";
 
@@ -436,7 +437,7 @@ export function SideBySideAligner({
       // by another editor moves the slot onto a different row, and the panel
       // must start fresh on it rather than carry drags made on the old one
       // (#1074).
-      key={`${slot.bibleVersion}:${chapter}:${verseNum}:${slot.verse?.verse}-${slot.verse?.verse_end}`}
+      key={`${slot.bibleVersion}:${chapter}:${verseNum}:${alignmentPanelRowKey(slot.verse)}`}
       ref={slot.panelRef}
       book={book}
       chapter={chapter}
