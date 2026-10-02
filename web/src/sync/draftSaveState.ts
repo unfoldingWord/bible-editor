@@ -190,23 +190,41 @@ export function rowOpClearsDraft(
   return fields.some((field) => Object.prototype.hasOwnProperty.call(op.patch, field));
 }
 
+// A row op's draftGeneration when no draft existed for the row at enqueue
+// (#1092 review). Distinct from an absent field, which marks a legacy op
+// queued before row ops carried a generation.
+export const NO_ROW_DRAFT = "no-draft";
+
 // Whether the 200 handler for a row op may delete the row draft it just read
-// (#1092 review). `captured` is the draft generation the op saved, captured
-// at enqueue (or, for a legacy or draftless op, the latest generation when the
-// 200 was handled); `latestNow` is the key's latest generation at the moment
-// of the read. Typing after the save (a keystroke while it is in flight, or
-// NoteCard re-setting a still-dirty draft when the row version bumps) shows up
-// as a different generation, and that newer draft must never be deleted.
-// `captured` undefined means no draft was set this session (a prior session's
-// record), which the save may still clear.
+// (#1092 review). `latestAt200` is the key's latest in-memory draft generation
+// when the 200 was handled, `latestNow` the same at the moment of the read;
+// both are undefined in a tab that never wrote this draft (a reload after
+// Save, or another tab holding the drain lock). Typing after the save (a
+// keystroke while it is in flight, or NoteCard re-setting a still-dirty draft
+// when the row version bumps, which runs before the 200 handler) shows up as
+// a different generation or a later updatedAt, and must never be deleted.
+//   - op.draftGeneration = a generation: clear only that stored generation,
+//     and only while no newer set() has started in this tab.
+//   - op.draftGeneration = NO_ROW_DRAFT: clear only a draft written before the
+//     op was queued (a prior session's draft the save stored).
+//   - no field (legacy op): fall back to the generation read at the 200.
 export function rowDraftClearAfterOk(
-  op: Pick<OutboxOp, "action" | "patch">,
-  captured: string | undefined,
+  op: Pick<OutboxOp, "action" | "patch" | "draftGeneration" | "queuedAt">,
+  latestAt200: string | undefined,
   latestNow: string | undefined,
-  rec: Pick<DraftRecord, "payload" | "generation"> | undefined,
+  rec: Pick<DraftRecord, "payload" | "generation" | "updatedAt"> | undefined,
 ): boolean {
   if (!rec) return false;
-  if (latestNow !== captured) return false;
-  if (captured !== undefined && rec.generation !== captured) return false;
-  return rowOpClearsDraft(op, rec);
+  if (!rowOpClearsDraft(op, rec)) return false;
+  const saved = op.draftGeneration;
+  if (saved === NO_ROW_DRAFT) {
+    return latestNow === undefined && rec.updatedAt < op.queuedAt;
+  }
+  if (saved !== undefined) {
+    if (rec.generation !== saved) return false;
+    return latestNow === undefined || latestNow === saved;
+  }
+  if (latestNow !== latestAt200) return false;
+  if (latestAt200 !== undefined && rec.generation !== latestAt200) return false;
+  return true;
 }

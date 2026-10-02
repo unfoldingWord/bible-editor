@@ -3523,7 +3523,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalRowPatch(kind, row.id, localPatch);
     // #1092: tie the op to the draft generation it saves, so its 200 cannot
     // clear typing that arrives while it is in flight.
-    const draftGeneration = drafts.latestGeneration(draftRowKey(kind, row.book, row.id));
+    const draftGeneration = drafts.rowSaveGeneration(draftRowKey(kind, row.book, row.id));
     void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, {
       ...opts,
       book: row.book,
@@ -4421,7 +4421,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
                   nfc(res.quote) !== nfc(r.quote ?? "") || res.note !== (r.note ?? "");
                 if (!changed) return;
                 applyLocalRowPatch("tn", r.id, patch);
-                void outbox.enqueueRow("tn", r.id, r.version, patch, { book: r.book });
+                // #1092: record the draft this save carries (usually none),
+                // so its 200 keeps typing that arrives while it is in flight.
+                void outbox.enqueueRow("tn", r.id, r.version, patch, {
+                  book: r.book,
+                  draftGeneration: drafts.rowSaveGeneration(draftRowKey("tn", r.book, r.id)),
+                });
               },
             });
           }}
