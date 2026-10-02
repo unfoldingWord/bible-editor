@@ -30,7 +30,13 @@ import {
   changedTsvChapters,
   softDeleteRemovedTsvRowsForTest as softDeleteRemovedTsvRows,
   tsvFetchLooksTruncatedForTest as tsvFetchLooksTruncated,
+  getMasterConfirmedAtForTest as getMasterConfirmedAt,
+  planAndStageBookResourcesForTest as planAndStageBookResources,
+  runChunkedReimport,
+  reimportBookFromDcs,
 } from "./bookReimport.ts";
+import { extractVersesForRange } from "./importParsers.ts";
+import { createHash } from "node:crypto";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -409,6 +415,704 @@ console.log("\n[issue #832 — control: a HUMAN-edited row is unaffected by the 
   // cutoff is ever consulted.
   const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, null);
   eq(res.deleted, 0, "nothing pruned — the human-edited row was never eligible regardless of the cutoff");
+}
+
+// ── Issue #857 — the prune must use the cutoff captured AT STAGING TIME, not
+// one re-read after the chunk-apply steps have run. runChunkedReimport stages
+// master's file once, then runs every chapter step, then the prune. If another
+// Workflow instance exports this (book, kind)'s AI-only row X and advances
+// master_confirmed_edit_id while those steps run, a fresh read at prune time
+// sees a boundary newer than the staged file: X looks "already exported, then
+// removed on master" and is soft-deleted. The fix carries the cutoff read
+// during planAndStageBookResources (StagedResource.stagedCutoff) into the
+// prune step.
+console.log("\n[issue #857 — prune with the STAGING-TIME cutoff: X survives a concurrent export's advance]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin, master_confirmed_edit_id, master_confirmed_at)
+       VALUES (?, 'tn', 'deadbeef', 1, 'reimport', 0, 1)`,
+    )
+    .run(BOOK);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+
+  const stagingCutoff = await getMasterConfirmedAt(env, BOOK, "tn");
+  eq(stagingCutoff.editId, 0, "precondition: the staging-time cutoff predates X's create edit");
+  sqlite.prepare(`UPDATE book_resource_syncs SET master_confirmed_edit_id = 1 WHERE book = ? AND resource = 'tn'`).run(BOOK);
+  const reReadCutoff = await getMasterConfirmedAt(env, BOOK, "tn");
+  eq(reReadCutoff.editId, 1, "precondition: a fresh re-read now sees the concurrent export's advanced cutoff");
+
+  const fixed = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, stagingCutoff);
+  eq(fixed.deleted, 0, "staging-time cutoff: X survives");
+  const row = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
+  eq(row.deleted_at, null, "the AI-only row is untouched");
+}
+
+console.log("\n[issue #857 — control: a RE-READ cutoff (pre-fix behavior) deletes the same row]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin, master_confirmed_edit_id, master_confirmed_at)
+       VALUES (?, 'tn', 'deadbeef', 1, 'reimport', 0, 1)`,
+    )
+    .run(BOOK);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+  sqlite.prepare(`UPDATE book_resource_syncs SET master_confirmed_edit_id = 1 WHERE book = ? AND resource = 'tn'`).run(BOOK);
+  const reReadCutoff = await getMasterConfirmedAt(env, BOOK, "tn");
+
+  const buggy = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true, reReadCutoff);
+  eq(buggy.deleted, 1, "re-read cutoff: X is pruned (the #857 failure mode)");
+}
+
+// Shared by the two end-to-end #857 cases below: a stubbed Door43 that serves
+// one TN file, and a Map-backed R2.
+function stubDoor43(raw, masterSha, onRaw = null) {
+  const bytes = new TextEncoder().encode(raw).byteLength;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    const resp = (status, body, headers = {}) => ({
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: (h) => headers[h.toLowerCase()] ?? null },
+      async text() { return body; },
+      async json() { return JSON.parse(body); },
+      async arrayBuffer() { return new TextEncoder().encode(body).buffer; },
+    });
+    if (u.includes("/commits?")) return resp(200, JSON.stringify([{ sha: masterSha }]));
+    if (u.includes("/contents/")) return resp(200, JSON.stringify({ size: bytes }));
+    if (u.includes("/raw/")) {
+      // #1048: lets a test land a concurrent export's confirm the instant the
+      // master file has been fetched, inside the fetch -> post-lineage window.
+      if (onRaw) onRaw();
+      return resp(200, raw, { "content-length": String(bytes) });
+    }
+    return resp(404, "");
+  };
+  return () => { globalThis.fetch = realFetch; };
+}
+function makeBlobs() {
+  const store = new Map();
+  return {
+    async get(key) {
+      const v = store.get(key);
+      return v === undefined ? null : { text: async () => v };
+    },
+    async put(key, value) { store.set(key, value); },
+    async delete(key) { store.delete(key); },
+  };
+}
+
+// ── Issue #857 end to end: drive the REAL runChunkedReimport. The fake step
+// runner stands in for a concurrent Workflow instance: right before the
+// `reimport-prune-*` step runs, it confirms an export that includes X's
+// create edit. The staged file (fetched before that) does not carry X, so a
+// prune judging against the re-read boundary deletes X; the staging-time
+// boundary (no confirmed export yet) must keep it.
+async function runReimportWithConcurrentAdvance(advanceBeforePrune, { advanceAtFetch = false } = {}) {
+  const { sqlite, env } = freshEnv();
+  env.BLOBS = makeBlobs();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+  // planAndStageBookResources plans nothing for a book with no verses.
+  for (const ch of [3, 5]) {
+    sqlite
+      .prepare(
+        `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version)
+         VALUES (?, ?, 1, 'ULT', '{"a":1}', 'a', 1)`,
+      )
+      .run(BOOK, ch);
+  }
+  const xEdit = sqlite.prepare(`SELECT MAX(id) AS id FROM edit_log WHERE row_key = 'bbbb'`).get().id;
+  // NULL watermark at staging: nothing confirmed exported yet, so X is absent
+  // from master only because it was never exported. The prune must keep it.
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin) VALUES (?, 'tn', 'oldoldoldoldoldoldoldoldoldoldoldoldoldo', 1, 'reimport')`,
+    )
+    .run(BOOK);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+  // 40 hex chars: a pinned SHA, so the fetch counts as verifiedComplete and
+  // the prune may act on chapter 5's absence.
+  const advance = () =>
+    sqlite
+      .prepare(
+        `UPDATE book_resource_syncs SET master_confirmed_edit_id = ?, master_confirmed_at = 2 WHERE book = ? AND resource = 'tn'`,
+      )
+      .run(xEdit, BOOK);
+  const restore = stubDoor43(raw, "2".repeat(36) + "bbbb", advanceAtFetch ? advance : null);
+  let pruneRan = false;
+  const step = {
+    async do(name, optsOrFn, maybeFn) {
+      const run = typeof optsOrFn === "function" ? optsOrFn : maybeFn;
+      if (name.startsWith("reimport-prune-")) pruneRan = true;
+      if (name.startsWith("reimport-prune-") && advanceBeforePrune) advance();
+      // Workflows memoize step results as serialized values; round-trip them
+      // so a non-serializable field in the plan would show up here.
+      const out = await run();
+      return out === undefined ? out : JSON.parse(JSON.stringify(out));
+    },
+  };
+  try {
+    await runChunkedReimport(env, step, BOOK, "inst-857-e2e", ["tn"]);
+  } finally {
+    restore();
+  }
+  const row = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).get(BOOK);
+  const sync = sqlite
+    .prepare(`SELECT master_confirmed_edit_id AS editId FROM book_resource_syncs WHERE book = ? AND resource = 'tn'`)
+    .get(BOOK);
+  return { pruneRan, xDeletedAt: row.deleted_at, confirmedEditId: sync.editId, xEdit };
+}
+
+console.log("\n[issue #857 — end to end, control: no concurrent advance, X (never exported) survives the prune]");
+{
+  const r = await runReimportWithConcurrentAdvance(false);
+  eq(r.pruneRan, true, "precondition: the prune step ran");
+  eq(r.xDeletedAt, null, "X survives");
+}
+
+console.log("\n[issue #857 — end to end: runChunkedReimport's prune ignores a watermark advanced after staging]");
+{
+  const r = await runReimportWithConcurrentAdvance(true);
+  eq(r.pruneRan, true, "precondition: the prune step ran, after the concurrent advance");
+  eq(r.xDeletedAt, null, "X survives: the prune judged the staged file against the staging-time cutoff");
+}
+
+// ── Issue #1048 — the residual of #857: the staged file and the staged cutoff
+// were not captured from the same instant. planAndStageBookResources fetches
+// master's file, THEN runs loadMasterLineage (a Door43 commit walk), and only
+// then reads stagedCutoff. A concurrent export that confirms AI-only row X
+// inside that window pairs a file without X with a cutoff that covers X, and
+// the prune soft-deletes X. Here the confirm lands the instant the raw file is
+// served: after the fetch, before the post-lineage read.
+console.log("\n[issue #1048 — end to end: a confirm landing between the master fetch and the post-lineage cutoff read does not prune X]");
+{
+  const r = await runReimportWithConcurrentAdvance(false, { advanceAtFetch: true });
+  eq(r.pruneRan, true, "precondition: the prune step ran");
+  eq(r.confirmedEditId, r.xEdit, "precondition: the concurrent confirm covers X's create edit");
+  eq(r.xDeletedAt, null, "X survives: the prune judged the staged file against the cutoff it was fetched under");
+}
+
+// ── Issue #857 follow-up (Codex finding F2 on PR #866): the staged cutoff must
+// be read AFTER loadMasterLineage, which can itself advance the boundary
+// within the same staging call (#658's own-publish-decline convergence). A
+// pre-lineage capture would freeze the prune to an already-stale boundary and
+// keep a row this run's own lineage step just confirmed exported (the
+// #485/#832 resurrection failure mode, from the other direction). This case
+// drives the REAL #658 path: master's bytes differ from our pushed render
+// (own-publish declines with content_differs), and a complete, human-free walk
+// shows our export's merge landed exactly the pushed blob with only a bot push
+// after it, so accountOwnPublishDecline stamps the pushed render as confirmed.
+// The plan's stagedCutoff must carry that stamp. Since #1048 a same-run advance
+// is kept only when this run's lineage step made it, so the case has to be the
+// real stamp, not a generic DB-side advance (that is the #1048 race, below).
+function stubDoor43WithOwnMerge(raw, { masterSha, mergeSha, prNumber, pushedBlobSha, mergeDate, botDate }) {
+  const bytes = new TextEncoder().encode(raw).byteLength;
+  const realFetch = globalThis.fetch;
+  const commits = [
+    { sha: masterSha, message: "TN: ZEC 1 [ju..7@api.bp-assistant]", email: "bot@bp-assistant", name: "BW Bot", date: botDate },
+    { sha: mergeSha, message: `bible-editor: ${BOOK} tn → master (#${prNumber})`, email: "b@x", name: "Benjamin Wright", date: mergeDate },
+  ];
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    const resp = (status, body, headers = {}) => ({
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: (h) => headers[h.toLowerCase()] ?? null },
+      async text() { return body; },
+      async json() { return JSON.parse(body); },
+      async arrayBuffer() { return new TextEncoder().encode(body).buffer; },
+    });
+    if (u.includes("/commits?")) {
+      return resp(
+        200,
+        JSON.stringify(commits.map((c) => ({
+          sha: c.sha,
+          commit: { message: c.message, author: { email: c.email, name: c.name, date: c.date }, committer: { date: c.date } },
+        }))),
+        { "x-hasmore": "false" },
+      );
+    }
+    if (u.includes("/git/trees/")) {
+      return resp(200, JSON.stringify({ sha: mergeSha, truncated: false, tree: [{ path: `tn_${BOOK}.tsv`, type: "blob", sha: pushedBlobSha }] }));
+    }
+    if (u.includes("/contents/")) return resp(200, JSON.stringify({ size: bytes }));
+    if (u.includes("/raw/")) return resp(200, raw, { "content-length": String(bytes) });
+    return resp(404, "");
+  };
+  return () => { globalThis.fetch = realFetch; };
+}
+
+function seedPlanVerse(sqlite) {
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version)
+       VALUES (?, 1, 1, 'ULT', '{"a":1}', 'a', 1)`,
+    )
+    .run(BOOK);
+}
+
+console.log("\n[issue #857 follow-up (F2) — stagedCutoff carries this run's own #658 lineage stamp]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPlanVerse(sqlite);
+  const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000;
+  const PUSHED_EDIT_ID = 77;
+  const PUSHED = "ba421e896eab0000000000000000000000000000";
+  const PR = 859;
+  // source_sha differs from the incoming master SHA, so tn goes through full
+  // staging. A NULL watermark takes loadMasterLineage's `confirmedAt == null`
+  // branch, which still accounts tonight's own-publish decline on its own walk
+  // from pushed_read_at — the walk that lands #658's stamp.
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs
+         (book, resource, source_sha, synced_at, origin,
+          pushed_blob_sha, pushed_read_at, pushed_edit_id, pushed_pr_number, pushed_pr_read_at)
+       VALUES (?, 'tn', 'oldoldoldoldoldoldoldoldoldoldoldoldoldo', 1, 'reimport', ?, ?, ?, ?, ?)`,
+    )
+    .run(BOOK, PUSHED, READ_AT, PUSHED_EDIT_ID, PR, READ_AT);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "1:1", note: "fresh note" })].join("\n");
+  const restore = stubDoor43WithOwnMerge(raw, {
+    masterSha: "1111111111111111111111111111111111aaaa",
+    mergeSha: "22d652732b180000000000000000000000000000",
+    prNumber: PR,
+    pushedBlobSha: PUSHED,
+    mergeDate: "2026-09-01T05:38:03Z",
+    botDate: "2026-09-01T23:49:46Z",
+  });
+  env.BLOBS = makeBlobs();
+  let plan;
+  try {
+    plan = await planAndStageBookResources(env, BOOK, ["tn"], "inst-857f2");
+  } finally {
+    restore();
+  }
+  const entry = plan.entries.find((e) => e.resource === "tn");
+  const ADVANCED = { confirmedAt: READ_AT, editId: PUSHED_EDIT_ID };
+  const row = sqlite
+    .prepare(`SELECT master_confirmed_at AS confirmedAt, master_confirmed_edit_id AS editId FROM book_resource_syncs WHERE book = ? AND resource = 'tn'`)
+    .get(BOOK);
+  eq(entry.changed, true, "precondition: the resource staged");
+  eq(row, ADVANCED, "precondition: #658 stamped the pushed render during loadMasterLineage");
+  eq(entry.stagedCutoff, ADVANCED, "stagedCutoff carries the post-loadMasterLineage read");
+}
+
+// ── Issue #1048, plan level: an advance this run did NOT make is not carried.
+// The DB wrapper advances master_confirmed_edit_id on the SECOND read of
+// getMasterConfirmedAt's query. The first is the fetch-time read (before
+// master's sha is resolved); the second comes after the file fetch, so the
+// advance lands inside the fetch -> post-lineage window, as a concurrent
+// export's confirm would. The staged file was fetched under the older
+// boundary, so the plan must pair it with that one.
+function wrapDbAdvancingConfirmedOnSecondRead(sqlite, db, book, resource, advanceTo) {
+  let reads = 0;
+  return {
+    ...db,
+    prepare(sql) {
+      const stmt = db.prepare(sql);
+      if (!sql.includes("pushed_r2_key")) return stmt; // getMasterConfirmedAt's own SELECT only
+      return {
+        ...stmt,
+        bind(...args) {
+          const bound = stmt.bind(...args);
+          return {
+            ...bound,
+            first() {
+              if (args[0] === book && args[1] === resource) {
+                reads++;
+                if (reads === 2) {
+                  sqlite
+                    .prepare(
+                      `UPDATE book_resource_syncs SET master_confirmed_edit_id = ?, master_confirmed_at = ? WHERE book = ? AND resource = ?`,
+                    )
+                    .run(advanceTo.editId, advanceTo.confirmedAt, book, resource);
+                }
+              }
+              return bound.first();
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+console.log("\n[issue #1048 — plan level: an advance from outside this run is not paired with the staged file]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPlanVerse(sqlite);
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin) VALUES (?, 'tn', 'oldoldoldoldoldoldoldoldoldoldoldoldoldo', 1, 'reimport')`,
+    )
+    .run(BOOK);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "1:1", note: "fresh note" })].join("\n");
+  const restore = stubDoor43(raw, "1111111111111111111111111111111111aaaa");
+  const ADVANCED = { confirmedAt: 2, editId: 5 };
+  env.DB = wrapDbAdvancingConfirmedOnSecondRead(sqlite, env.DB, BOOK, "tn", ADVANCED);
+  env.BLOBS = makeBlobs();
+  let plan;
+  try {
+    plan = await planAndStageBookResources(env, BOOK, ["tn"], "inst-1048");
+  } finally {
+    restore();
+  }
+  const entry = plan.entries.find((e) => e.resource === "tn");
+  const row = sqlite
+    .prepare(`SELECT master_confirmed_at AS confirmedAt, master_confirmed_edit_id AS editId FROM book_resource_syncs WHERE book = ? AND resource = 'tn'`)
+    .get(BOOK);
+  eq(entry.changed, true, "precondition: the resource staged");
+  eq(row, ADVANCED, "precondition: the outside advance landed before the post-lineage read");
+  eq(entry.stagedCutoff, { confirmedAt: null, editId: null }, "stagedCutoff is the fetch-time boundary, not the outside advance");
+}
+
+// ── Issue #1048 review: BOTH happen in the window. This run's own #658 stamp
+// lands AND an outside writer (a newer concurrent export) moves the boundary.
+// The outside value must not be paired with the staged file (#1048), but
+// neither may the run's own stamp be dropped: falling back to the bare
+// fetch-time cutoff would read rows exported in the stamped render, and later
+// deleted on master, as never exported, so they survive the prune and the
+// next export re-adds them (the #485/#832 resurrection #866 F2 guards). The
+// paired value is the fetch-time cutoff with this run's stamp applied.
+console.log("\n[issue #1048 review — own #658 stamp plus an outside advance: stagedCutoff keeps the own stamp only]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPlanVerse(sqlite);
+  const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000;
+  const PUSHED_EDIT_ID = 77;
+  const PUSHED = "ba421e896eab0000000000000000000000000000";
+  const PR = 859;
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs
+         (book, resource, source_sha, synced_at, origin,
+          pushed_blob_sha, pushed_read_at, pushed_edit_id, pushed_pr_number, pushed_pr_read_at)
+       VALUES (?, 'tn', 'oldoldoldoldoldoldoldoldoldoldoldoldoldo', 1, 'reimport', ?, ?, ?, ?, ?)`,
+    )
+    .run(BOOK, PUSHED, READ_AT, PUSHED_EDIT_ID, PR, READ_AT);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "1:1", note: "fresh note" })].join("\n");
+  const restore = stubDoor43WithOwnMerge(raw, {
+    masterSha: "1111111111111111111111111111111111aaaa",
+    mergeSha: "22d652732b180000000000000000000000000000",
+    prNumber: PR,
+    pushedBlobSha: PUSHED,
+    mergeDate: "2026-09-01T05:38:03Z",
+    botDate: "2026-09-01T23:49:46Z",
+  });
+  // A newer render confirmed by a concurrent export, after the fetch and
+  // before the walk (the wrapper's second read is the pre-lineage one).
+  const OUTSIDE = { confirmedAt: READ_AT + 100, editId: 500 };
+  env.DB = wrapDbAdvancingConfirmedOnSecondRead(sqlite, env.DB, BOOK, "tn", OUTSIDE);
+  env.BLOBS = makeBlobs();
+  let plan;
+  try {
+    plan = await planAndStageBookResources(env, BOOK, ["tn"], "inst-1048-both");
+  } finally {
+    restore();
+  }
+  const entry = plan.entries.find((e) => e.resource === "tn");
+  const row = sqlite
+    .prepare(`SELECT master_confirmed_at AS confirmedAt, master_confirmed_edit_id AS editId FROM book_resource_syncs WHERE book = ? AND resource = 'tn'`)
+    .get(BOOK);
+  eq(entry.changed, true, "precondition: the resource staged");
+  eq(row, OUTSIDE, "precondition: the outside advance holds the row (#658's MAX kept the newer value)");
+  eq(
+    entry.stagedCutoff,
+    { confirmedAt: READ_AT, editId: PUSHED_EDIT_ID },
+    "stagedCutoff is the fetch-time cutoff plus this run's own stamp: not the outside value, not the bare fetch-time value",
+  );
+}
+
+// ── Issue #1058 — the #658 stamp must describe the file that was fetched.
+// master's TSV is fetched pinned to masterSha, but the lineage walk that
+// produces this run's own #658 stamp reads master's CURRENT tip. Here the merge
+// of our render R (which carries AI-only row X) lands on master after
+// masterSha is resolved and the file fetched, and before the walk. The file
+// predates R, so own-publish declines with content_differs; the walk then finds
+// our merge preserved R's exact blob with nothing human around it, and stamps
+// R as confirmed. Pairing that stamp with the pre-R file makes X look
+// "exported, then removed on master", and the prune soft-deletes it. The stamp
+// must only be accepted when our merge is at or before masterSha.
+//
+// Night 2 is the starvation check: once master's file head is at or after our
+// merge (here a later bot push on top of it), the same render IS stamped.
+const SHA_P = "a1".repeat(20); // master's file head at night 1's fetch: predates R
+const SHA_M = "b2".repeat(20); // our export's merge of render R
+const SHA_B = "c3".repeat(20); // a later bot push, night 2's file head
+function stubDoor43MergeLandsAfterFetch(raw, { prNumber, pushedBlobSha, landAtFetch, initialHead }) {
+  const bytes = new TextEncoder().encode(raw).byteLength;
+  const realFetch = globalThis.fetch;
+  const all = {
+    [SHA_B]: { sha: SHA_B, message: "TN: ZEC 5 [ju..7@api.bp-assistant]", email: "bot@bp-assistant", name: "BW Bot", date: "2026-09-02T23:49:46Z" },
+    [SHA_M]: { sha: SHA_M, message: `bible-editor: ${BOOK} tn → master (#${prNumber})`, email: "b@x", name: "Benjamin Wright", date: "2026-09-01T05:38:03Z" },
+    [SHA_P]: { sha: SHA_P, message: "TN: ZEC 3 [ju..7@api.bp-assistant]", email: "bot@bp-assistant", name: "BW Bot", date: "2026-08-31T23:49:46Z" },
+  };
+  // Newest first, as Gitea lists them; the history grows at the head.
+  let history = initialHead === SHA_B ? [SHA_B, SHA_M, SHA_P] : [SHA_P];
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    const resp = (status, body, headers = {}) => ({
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: (h) => headers[h.toLowerCase()] ?? null },
+      async text() { return body; },
+      async json() { return JSON.parse(body); },
+      async arrayBuffer() { return new TextEncoder().encode(body).buffer; },
+    });
+    if (u.includes("/commits?")) {
+      return resp(
+        200,
+        JSON.stringify(history.map((sha) => all[sha]).map((c) => ({
+          sha: c.sha,
+          commit: { message: c.message, author: { email: c.email, name: c.name, date: c.date }, committer: { date: c.date } },
+        }))),
+        { "x-hasmore": "false" },
+      );
+    }
+    if (u.includes("/git/trees/")) {
+      return resp(200, JSON.stringify({ truncated: false, tree: [{ path: `tn_${BOOK}.tsv`, type: "blob", sha: pushedBlobSha }] }));
+    }
+    if (u.includes("/contents/")) return resp(200, JSON.stringify({ size: bytes }));
+    if (u.includes("/raw/")) {
+      // The file at masterSha has been served; our merge lands right now.
+      if (landAtFetch) history = [SHA_M, ...history];
+      return resp(200, raw, { "content-length": String(bytes) });
+    }
+    return resp(404, "");
+  };
+  return () => { globalThis.fetch = realFetch; };
+}
+
+console.log("\n[issue #1058 — end to end: our merge lands between the master fetch and the lineage walk; X survives the prune]");
+{
+  const { sqlite, env } = freshEnv();
+  env.BLOBS = makeBlobs();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+  for (const ch of [3, 5]) {
+    sqlite
+      .prepare(
+        `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version)
+         VALUES (?, ?, 1, 'ULT', '{"a":1}', 'a', 1)`,
+      )
+      .run(BOOK, ch);
+  }
+  const xEdit = sqlite.prepare(`SELECT MAX(id) AS id FROM edit_log WHERE row_key = 'bbbb'`).get().id;
+  const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000;
+  const PUSHED = "ba421e896eab0000000000000000000000000000";
+  const PR = 859;
+  // Render R (pushed, carrying X's create edit) is on the row; the confirmed
+  // boundary predates X. A non-null watermark sends the walk down the live
+  // path (no ledger poll row), the one issue #1058 names.
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs
+         (book, resource, source_sha, synced_at, origin, master_confirmed_at, master_confirmed_edit_id,
+          pushed_blob_sha, pushed_read_at, pushed_edit_id, pushed_pr_number, pushed_pr_read_at)
+       VALUES (?, 'tn', 'oldoldoldoldoldoldoldoldoldoldoldoldoldo', 1, 'reimport', 1, 0, ?, ?, ?, ?, ?)`,
+    )
+    .run(BOOK, PUSHED, READ_AT, xEdit, PR, READ_AT);
+  const confirmedRow = () =>
+    sqlite
+      .prepare(`SELECT master_confirmed_at AS confirmedAt, master_confirmed_edit_id AS editId FROM book_resource_syncs WHERE book = ? AND resource = 'tn'`)
+      .get(BOOK);
+  // The file at masterSha predates R: it never carried X.
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+  let restore = stubDoor43MergeLandsAfterFetch(raw, { prNumber: PR, pushedBlobSha: PUSHED, landAtFetch: true, initialHead: SHA_P });
+  let pruneRan = false;
+  const step = {
+    async do(name, optsOrFn, maybeFn) {
+      const run = typeof optsOrFn === "function" ? optsOrFn : maybeFn;
+      if (name.startsWith("reimport-prune-")) pruneRan = true;
+      const out = await run();
+      return out === undefined ? out : JSON.parse(JSON.stringify(out));
+    },
+  };
+  try {
+    await runChunkedReimport(env, step, BOOK, "inst-1058-e2e", ["tn"]);
+  } finally {
+    restore();
+  }
+  const x = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).get(BOOK);
+  eq(pruneRan, true, "precondition: the prune step ran");
+  eq(x.deleted_at, null, "X survives: a stamp for a merge newer than the fetched file is not applied");
+  eq(confirmedRow(), { confirmedAt: 1, editId: 0 }, "no #658 stamp this run: the boundary is unchanged");
+
+  // Night 2: master's file head is a bot push on top of our merge, so the merge
+  // is at or before masterSha and the very same render is stamped.
+  sqlite.prepare(`UPDATE book_resource_syncs SET source_sha = 'oldoldoldoldoldoldoldoldoldoldoldoldoldo' WHERE book = ? AND resource = 'tn'`).run(BOOK);
+  const raw2 = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" }), tnTsvRow({ id: "bbbb", ref: "5:1", note: "ai note" })].join("\n");
+  restore = stubDoor43MergeLandsAfterFetch(raw2, { prNumber: PR, pushedBlobSha: PUSHED, landAtFetch: false, initialHead: SHA_B });
+  let plan;
+  try {
+    plan = await planAndStageBookResources(env, BOOK, ["tn"], "inst-1058-night2");
+  } finally {
+    restore();
+  }
+  const entry = plan.entries.find((e) => e.resource === "tn");
+  eq(entry.changed, true, "night 2 precondition: the resource staged");
+  eq(confirmedRow(), { confirmedAt: READ_AT, editId: xEdit }, "night 2: #658 stamps render R once our merge is at or before masterSha");
+  eq(entry.stagedCutoff, { confirmedAt: READ_AT, editId: xEdit }, "night 2: stagedCutoff carries the stamp (no starvation)");
+}
+
+// ── Issue #1063 — the same race on the admin "Pull from Door43" route, ULT.
+// reimportBookFromDcs fetched master's ULT unpinned, and the lineage walk later
+// in the same request (no pin) lands #658's stamp from master's CURRENT tip.
+// When the merge of our render R lands between the two, the walk stamps R
+// against a file that predates it; ULT/UST then re-read the boundary after the
+// walk, so the verse merge takes R as its ancestor. D1 still holds R's app edit
+// (== ancestor) and master's pre-R verse differs from it, so the merge reads
+// "only master moved" and adopts master over the translator's edit.
+//
+// The positive control: when master's file head is a bot push on top of our
+// merge, the merge is in the fetched file and the stamp still lands.
+const ULT_SHA_P = "d4".repeat(20); // master's ULT head when the file is fetched: predates R
+const ULT_SHA_M = "e5".repeat(20); // our export's merge of render R
+const ULT_SHA_B = "f6".repeat(20); // a later bot push on top of our merge
+const ULT_PATH = `38-${BOOK}.usfm`;
+const ultUsfm = (v1, v2) =>
+  `\\id ${BOOK} EN_ULT en_English_ltr unfoldingWord Literal Text\n\\h Zechariah\n\\c 3\n\\p\n\\v 1 ${v1}\n\\v 2 ${v2}\n`;
+const ULT_P = ultUsfm("Then he showed me Joshua.", "And Yahweh said.");
+const ULT_R = ultUsfm("Then he showed me Joshua the high priest.", "And Yahweh said.");
+const ULT_B = ultUsfm("Then he showed me Joshua the high priest.", "And Yahweh said to the accuser.");
+const gitBlobSha = (text) => {
+  const body = Buffer.from(text, "utf8");
+  return createHash("sha1").update(`blob ${body.length}\0`).update(body).digest("hex");
+};
+const ultVerse = (raw, n) => extractVersesForRange(raw, 3, 3).find((v) => v.verse === n).contentJson;
+
+function stubDoor43UltMergeLandsAfterFetch({ prNumber, pushedBlobSha, landAtFetch, initialHead }) {
+  const realFetch = globalThis.fetch;
+  const all = {
+    [ULT_SHA_B]: { sha: ULT_SHA_B, message: `ULT: ${BOOK} 3 [ju..7@api.bp-assistant]`, email: "bot@unfoldingword.org", name: "BW Bot", date: "2026-09-02T23:49:46Z", body: ULT_B },
+    [ULT_SHA_M]: { sha: ULT_SHA_M, message: `bible-editor: ${BOOK} ult → master (#${prNumber})`, email: "b@x", name: "Benjamin Wright", date: "2026-09-01T05:38:03Z", body: ULT_R },
+    [ULT_SHA_P]: { sha: ULT_SHA_P, message: `ULT: ${BOOK} 3 [ju..7@api.bp-assistant]`, email: "bot@unfoldingword.org", name: "BW Bot", date: "2026-08-31T23:49:46Z", body: ULT_P },
+  };
+  // Newest first, as Gitea lists them; the history grows at the head.
+  let history = initialHead === ULT_SHA_B ? [ULT_SHA_B, ULT_SHA_M, ULT_SHA_P] : [ULT_SHA_P];
+  const rawFetches = [];
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    const resp = (status, body, headers = {}) => ({
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: (h) => headers[h.toLowerCase()] ?? null },
+      async text() { return body; },
+      async json() { return JSON.parse(body); },
+      async arrayBuffer() { return new TextEncoder().encode(body).buffer; },
+    });
+    if (u.includes("/commits?")) {
+      return resp(
+        200,
+        JSON.stringify(history.map((sha) => all[sha]).map((c) => ({
+          sha: c.sha,
+          commit: { message: c.message, author: { email: c.email, name: c.name, date: c.date }, committer: { date: c.date } },
+        }))),
+        { "x-hasmore": "false" },
+      );
+    }
+    if (u.includes("/git/trees/")) {
+      const sha = Object.keys(all).find((k) => u.includes(k));
+      if (!sha) return resp(404, "");
+      const blob = sha === ULT_SHA_M ? pushedBlobSha : gitBlobSha(all[sha].body);
+      return resp(200, JSON.stringify({ truncated: false, tree: [{ path: ULT_PATH, type: "blob", sha: blob }] }));
+    }
+    if (u.includes("/raw/") && u.includes(ULT_PATH)) {
+      rawFetches.push(u);
+      const ref = /[?&]ref=([0-9a-f]{40})/.exec(u)?.[1];
+      if (ref && !all[ref]) return resp(404, "");
+      const body = all[ref ?? history[0]].body;
+      // The file has been served; our merge lands right now.
+      if (landAtFetch) history = [ULT_SHA_M, ...history];
+      return resp(200, body, { "content-length": String(Buffer.byteLength(body, "utf8")) });
+    }
+    return resp(404, "");
+  };
+  return { rawFetches, restore: () => { globalThis.fetch = realFetch; } };
+}
+
+async function runUltAdminPull({ landAtFetch, initialHead }) {
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO book_imports (book) VALUES (?)`).run(BOOK);
+  const T0 = Date.parse("2026-08-30T00:00:00Z") / 1000; // the import that baselined P
+  const C0 = Date.parse("2026-08-31T00:00:00Z") / 1000; // confirmed boundary: P is on master
+  const T1 = Date.parse("2026-09-01T05:00:00Z") / 1000; // the translator's app edit (in render R)
+  const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000; // render R read for push
+  const PR = 1063;
+  const pushed = gitBlobSha(ULT_R);
+  const key = (n) => `${BOOK}/3/${n}/ULT`;
+  const payload = (cj) => JSON.stringify({ content: JSON.parse(cj) });
+  // v1 carries the translator's app edit (= render R); v2 is pristine.
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 3, 1, 'ULT', ?, 'r', 2, 42), (?, 3, 2, 'ULT', ?, 'p', 1, NULL)`,
+    )
+    .run(BOOK, ultVerse(ULT_R, 1), BOOK, ultVerse(ULT_P, 2));
+  const logBase = sqlite.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, action, payload_json, source, created_at)
+     VALUES ('verse', ?, ?, 'create', ?, 'dcs_reimport', ?)`,
+  );
+  logBase.run(key(1), BOOK, payload(ultVerse(ULT_P, 1)), T0);
+  const baseEdit = Number(logBase.run(key(2), BOOK, payload(ultVerse(ULT_P, 2)), T0).lastInsertRowid);
+  const rEdit = Number(
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+         VALUES ('verse', ?, ?, 42, 1, 2, 'update', ?, ?)`,
+      )
+      .run(key(1), BOOK, payload(ultVerse(ULT_R, 1)), T1).lastInsertRowid,
+  );
+  sqlite
+    .prepare(
+      `INSERT INTO book_resource_syncs
+         (book, resource, source_sha, synced_at, origin, master_confirmed_at, master_confirmed_edit_id,
+          pushed_blob_sha, pushed_read_at, pushed_edit_id, pushed_pr_number, pushed_pr_read_at)
+       VALUES (?, 'ult', ?, ?, 'reimport', ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(BOOK, ULT_SHA_P, C0, C0, baseEdit, pushed, READ_AT, rEdit, PR, READ_AT);
+  const stub = stubDoor43UltMergeLandsAfterFetch({ prNumber: PR, pushedBlobSha: pushed, landAtFetch, initialHead });
+  let result;
+  try {
+    result = await reimportBookFromDcs(env, BOOK, [3], ["ult"], 42, { source: "user" });
+  } finally {
+    stub.restore();
+  }
+  const confirmed = sqlite
+    .prepare(`SELECT master_confirmed_at AS confirmedAt, master_confirmed_edit_id AS editId FROM book_resource_syncs WHERE book = ? AND resource = 'ult'`)
+    .get(BOOK);
+  const v = (n) =>
+    sqlite.prepare(`SELECT content_json FROM verses WHERE book = ? AND chapter = 3 AND verse = ? AND bible_version = 'ULT'`).get(BOOK, n).content_json;
+  return { result, confirmed, v, C0, READ_AT, baseEdit, rEdit, rawFetches: stub.rawFetches };
+}
+
+console.log("\n[issue #1063 — admin Pull from Door43: our merge lands between the ULT fetch and the lineage walk]");
+{
+  const r = await runUltAdminPull({ landAtFetch: true, initialHead: ULT_SHA_P });
+  eq(r.result.perResource.ult.errors, [], "precondition: the pull ran without errors");
+  eq(r.rawFetches.length, 1, "precondition: master's ULT was fetched once");
+  eq(r.confirmed, { confirmedAt: r.C0, editId: r.baseEdit }, "no #658 stamp this run: the boundary is unchanged");
+  eq(r.v(1), ultVerse(ULT_R, 1), "the translator's R edit survives: master's pre-R verse is not adopted over it");
+  eq(r.result.perResource.ult.merge_adopted, 0, "…and the merge adopts nothing from the pre-R file");
+}
+
+console.log("\n[issue #1063 — admin Pull from Door43: file head is a bot push on top of our merge; the stamp lands]");
+{
+  const r = await runUltAdminPull({ landAtFetch: false, initialHead: ULT_SHA_B });
+  eq(r.result.perResource.ult.errors, [], "precondition: the pull ran without errors");
+  eq(r.confirmed, { confirmedAt: r.READ_AT, editId: r.rEdit }, "#658 stamps render R: our merge is in the fetched file");
+  eq(r.v(1), ultVerse(ULT_R, 1), "v1 (unchanged since R) keeps the app edit");
+  eq(r.v(2), ultVerse(ULT_B, 2), "v2 adopts the bot's later master edit");
 }
 
 if (failed > 0) {

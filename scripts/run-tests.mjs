@@ -49,6 +49,7 @@ const SQLITE_FILES = new Set([
   "src/syncWithholds.test.mjs",
   "src/chapters.test.mjs",
   "src/exportMergeState.test.mjs",
+  "src/reimportUnstampedBranches.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
@@ -64,6 +65,7 @@ const EXTRA_IMPORTS = new Map([
   ["src/aiRowDiffGate.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/masterLineagePersist.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/staleBaseGate.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/reimportUnstampedBranches.test.mjs", "./src/tsResolveHook.mjs"],
   // verseMergeConflicts.test.mjs now imports retireVerseKeptAiMasterFlags
   // directly from verseMergeConflicts.ts (issue #760 fail-closed regression
   // test), which in turn imports "./auth" and "./index" without extensions.

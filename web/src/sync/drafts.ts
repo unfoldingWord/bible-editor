@@ -16,9 +16,19 @@ import {
   type VerseOpExit,
   type VerseOpExitInfo,
 } from "./draftSaveState";
-import { peekPinnedVerseBase, unpinVerseBase } from "./versePin";
+import {
+  holdVerseBase,
+  peekPinnedVerseBase,
+  pinEpoch,
+  unpinVerseBaseUnlessHeld,
+  unpinVerseBaseIfIdleWith,
+  advanceHeldVerseBase,
+  type PinnedVerseBase,
+  type VerseBaseHold,
+} from "./versePin";
+import { takeOwnVerseOp } from "./ownVerseOps";
 import { createDraftSnapshot, dedupeByKeys } from "./draftSnapshot";
-export { pinVerseBase, peekPinnedVerseBase } from "./versePin";
+export { pinVerseBase, peekPinnedVerseBase, pinEpoch, type VerseBaseHold } from "./versePin";
 
 const DB_NAME = "bible-editor-drafts";
 const DB_VERSION = 1;
@@ -99,9 +109,23 @@ const pendingKeys = new Set<string>();
 // so checking pendingKeys at the actual unpin moment closes the race the
 // snapshot leaves open. Mirrors the latestGenerationByKey guard inside
 // clearGeneration, which protects the clear path from the same class of race.
-export function unpinVerseBaseIfIdle(key: string): void {
-  if (pendingKeys.has(key)) return;
-  unpinVerseBase(key);
+//
+// A draftless editor's hold (#1060, versePin.ts) counts as a live session too:
+// the unpin is deferred to the hold, which releases the pin when its editor
+// goes clean.
+//
+// `epoch` (pinEpoch, read when the caller's exit happened, before its await)
+// keeps a late release off a pin that was replaced, or handed to a later
+// queued save, in the meantime (#1060).
+export function unpinVerseBaseIfIdle(key: string, epoch?: number): void {
+  unpinVerseBaseIfIdleWith(key, pendingKeys.has(key), epoch);
+}
+
+// Pin `key`'s base for a draftless editor (the dual aligner's reading line)
+// from its first dirty keystroke until it goes clean (#1060). A release never
+// pulls the pin from a draft session that shares it.
+export function holdVerseBaseForEditor(key: string, base: PinnedVerseBase): VerseBaseHold {
+  return holdVerseBase(key, base, (k) => !pendingKeys.has(k));
 }
 const latestGenerationByKey = new Map<string, string>();
 let generationSeq = 0;
@@ -233,7 +257,7 @@ export const drafts = {
   async clear(key: string): Promise<void> {
     pendingKeys.delete(key);
     latestGenerationByKey.delete(key);
-    unpinVerseBase(key);
+    unpinVerseBaseUnlessHeld(key);
     const release = snapshot.beginMutation(key);
     try {
       await (await db()).delete(STORE, key);
@@ -245,7 +269,8 @@ export const drafts = {
   // The read + conditional delete share one transaction so another committed
   // write cannot slip between them. latestGenerationByKey also covers a newer
   // set() that has started synchronously but has not committed to IndexedDB yet.
-  async clearGeneration(key: string, generation: string): Promise<boolean> {
+  // `epoch`: see unpinVerseBaseIfIdle.
+  async clearGeneration(key: string, generation: string, epoch?: number): Promise<boolean> {
     const idb = await db();
     const tx = idb.transaction(STORE, "readwrite");
     const rec = (await tx.store.get(key)) as DraftRecord | undefined;
@@ -259,7 +284,7 @@ export const drafts = {
     if (latestGenerationByKey.get(key) === generation) {
       latestGenerationByKey.delete(key);
       pendingKeys.delete(key);
-      unpinVerseBase(key);
+      unpinVerseBaseUnlessHeld(key, epoch);
     }
     notify(key);
     return true;
@@ -309,23 +334,39 @@ export function draftDirtyBorderSx() {
 // one confirmed cleared: any newer local keystroke replaces
 // latestGenerationByKey synchronously, so a match proves no live edit session
 // depends on the pin (#474 guard preserved).
-function releaseLocalBookkeeping(key: string, generation: string): void {
+function releaseLocalBookkeeping(key: string, generation: string, epoch?: number): void {
   if (latestGenerationByKey.get(key) !== generation) return;
   latestGenerationByKey.delete(key);
   pendingKeys.delete(key);
-  unpinVerseBase(key);
+  unpinVerseBaseUnlessHeld(key, epoch);
 }
 
 function applyVerseExit(key: string, info: VerseOpExitInfo): void {
+  // #1060: only the tab that QUEUED this op claims it (another tab's save, or
+  // another editor's, must keep a live hold's old base so its save 409s).
+  // Synchronous, before the async release below, so the line's next save
+  // already goes out against the landed row.
+  // A landed row that can't be used leaves the claim alone; any terminal exit
+  // otherwise ends it.
+  const canAdvance = info.exit === "ok" && info.landed !== undefined && info.expectedVersion !== undefined;
+  if (canAdvance && takeOwnVerseOp(info.opId)) {
+    advanceHeldVerseBase(key, info.expectedVersion!, info.landed!);
+  } else if (info.exit !== "ok") {
+    takeOwnVerseOp(info.opId);
+  }
+  // The pin as of this exit. Everything below runs after an await; if a save
+  // queued meanwhile has taken the pin over (handOff), or it was replaced, the
+  // late release leaves it to that save's own exit.
+  const epoch = pinEpoch(key);
   void drafts.get(key).then((draft) => {
     const release = pinReleaseForVerseExit(draft, info);
     if (release.kind === "clear") {
-      void drafts.clearGeneration(key, release.generation).then((cleared) => {
+      void drafts.clearGeneration(key, release.generation, epoch).then((cleared) => {
         // The draining tab can win the race and delete the record between our
         // get() above and this clear — clearGeneration then returns false
         // without touching this tab's bookkeeping, leaving the pin and the
         // beforeunload dirty flag leaked for a save that has in fact landed.
-        if (!cleared) releaseLocalBookkeeping(key, release.generation);
+        if (!cleared) releaseLocalBookkeeping(key, release.generation, epoch);
       });
     } else if (release.kind === "unpin") {
       // The shared draft record can already be gone — cleared by the draining
@@ -335,9 +376,9 @@ function applyVerseExit(key: string, info: VerseOpExitInfo): void {
       // mismatch (or a draftless/legacy op with no generation) falls through
       // to the idle-guarded unpin and a live edit session keeps its pin.
       if (info.exit === "ok" && info.draftGeneration !== undefined) {
-        releaseLocalBookkeeping(key, info.draftGeneration);
+        releaseLocalBookkeeping(key, info.draftGeneration, epoch);
       }
-      unpinVerseBaseIfIdle(key);
+      unpinVerseBaseIfIdle(key, epoch);
     }
   });
 }
@@ -355,7 +396,7 @@ verseExitChannel?.addEventListener("message", (e: MessageEvent) => {
   applyVerseExit(data.key, info);
 });
 
-function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
+function handleVerseExit(op: OutboxOp, exit: VerseOpExit, updated?: unknown): void {
   if (op.target.kind !== "verse") return;
   const key = verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion);
   let info: VerseOpExitInfo;
@@ -366,8 +407,20 @@ function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
     // so malformed content can't abort the drain pass's listener loop.
     info = verseOpExitInfo(op, exit);
   } catch {
-    return; // same non-release the pre-#565 code gave this op
+    // Unparseable queued content: still run the exit's release, just without
+    // the legacy text-provenance hint (a draft then stays, conservatively).
+    info = { exit };
   }
+  // #1060: the landed row (the 200 body), for the queuing tab's hold.
+  const row = updated as { version?: unknown; content?: unknown } | null | undefined;
+  info = {
+    ...info,
+    opId: op.id,
+    expectedVersion: op.expectedVersion,
+    ...(exit === "ok" && typeof row?.version === "number" && row.content !== undefined
+      ? { landed: { version: row.version, content: row.content } }
+      : {}),
+  };
   applyVerseExit(key, info);
   // BroadcastChannel never delivers to its own poster — the applyVerseExit
   // above is this tab's copy. Announcement is best-effort: the local release
@@ -382,7 +435,8 @@ function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
 
 onOutboxResult((op, result) => {
   if (op.target.kind === "verse") {
-    if (result.kind === "ok" || result.kind === "locked") handleVerseExit(op, result.kind);
+    if (result.kind === "ok") handleVerseExit(op, "ok", result.updated);
+    else if (result.kind === "locked") handleVerseExit(op, "locked");
     return;
   }
   if (result.kind !== "ok") return;

@@ -266,6 +266,18 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
     [],
   );
 
+  // The store only notifies when a job changes (#897), so in an idle tab
+  // nothing re-renders this component. While a done job is listed, tick every
+  // 5 minutes so it drops off at its 24-hour cutoff and the "updated Xm ago"
+  // labels move.
+  const hasDone = jobs.some((j) => j.state === "done");
+  const [clockMs, setClockMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!hasDone) return;
+    const t = window.setInterval(() => setClockMs(Date.now()), 5 * 60_000);
+    return () => window.clearInterval(t);
+  }, [hasDone]);
+
   const { active, queued, doneRecent, failed } = useMemo(() => {
     const nowSec = Math.floor(Date.now() / 1000);
     return {
@@ -282,7 +294,8 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
       doneRecent: jobs.filter((j) => j.state === "done" && nowSec - j.updated_at < 24 * 3600),
       failed: jobs.filter((j) => j.state === "failed"),
     };
-  }, [jobs]);
+    // clockMs is not read above; it is a dependency so the tick recomputes.
+  }, [jobs, clockMs]);
 
   const hasAnything = active.length + queued.length + doneRecent.length + failed.length > 0;
 

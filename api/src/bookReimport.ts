@@ -65,11 +65,13 @@ import {
   masterMayHoldHumanEditForVerse,
   summarizeLineage,
   completeHumanRefEvidenceTouches,
+  humanRefEvidenceAtRef,
   type ClassifiedCommit,
   type HumanRefEvidence,
   type MasterLineageSummary,
 } from "./masterLineage.ts";
 import { readLedgerMasterLineage } from "./masterLineageLedger.ts";
+import { DCS_POLL_FETCH_TIMEOUT_MS } from "./dcsCommitPoll.ts";
 import {
   findOurMergeForPr,
   gitBlobShaOrNull,
@@ -621,6 +623,29 @@ export interface ReimportCounts {
   // the quiet one. See stale_base_holds.reason = 'stale_tc_reexport_overridden'
   // for the durable half.
   stale_base_overridden: number;
+  // Issue #1033. 0 or 1 per resource per run: the resource was staged
+  // `changed: true` but its master commit SHA could not be read
+  // (fileCommitSha returned null), so the reimport-sync step applies the
+  // content yet skips recordResourceSync (`if (!e.masterSha) continue;`) — the
+  // watermark is NOT stamped. Seeded from the plan like stale_base_held. Read
+  // only by classifyReimportOutcome (reimportSyncGate.ts) so the run ledger
+  // does not record a success the watermark never certified; it gates nothing.
+  master_sha_unknown: number;
+  // Issue #1035. Three more 0-or-1-per-resource plan outcomes that leave the
+  // watermark unstamped, each on its own counter because a blanket "null
+  // masterSha means failure" rule would misread the no-file entry and the
+  // stale-base hold, which also carry a null SHA. Same posture as
+  // master_sha_unknown: seeded from the plan, read only by
+  // classifyReimportOutcome, gates nothing (the export freshness gate already
+  // compares against source_sha).
+  //   own_publish_unstamped — own-publish recognized, but source_sha did not
+  //     move: masterSha was null (markOwnPublishConverged's COALESCE kept the
+  //     old value) or the stamp's UPDATE did not land.
+  //   fetch_failed — master's file could not be fetched (DCS 404 / error).
+  //   tsv_truncated — the TSV fetch looked truncated (tsvFetchLooksTruncated).
+  own_publish_unstamped: number;
+  fetch_failed: number;
+  tsv_truncated: number;
   // Issue #727. Pairs of verse rows, in chapters this run touched, whose
   // [verse, verse_end] ranges intersect (a `1-2` bridge beside a standalone `2`)
   // as found by applyVerseRows's post-apply structural audit. The export refuses
@@ -809,6 +834,10 @@ function zeroCounts(): ReimportCounts {
     merge_record_failed: false,
     stale_base_held: 0,
     stale_base_overridden: 0,
+    master_sha_unknown: 0,
+    own_publish_unstamped: 0,
+    fetch_failed: 0,
+    tsv_truncated: 0,
     structure_overlap: 0,
     structure_kept_local: 0,
     structure_adopted: 0,
@@ -1070,6 +1099,10 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   // launder an absent measurement into a green light.
   into.stale_base_held += from.stale_base_held ?? 0;
   into.stale_base_overridden += from.stale_base_overridden ?? 0;
+  into.master_sha_unknown += from.master_sha_unknown ?? 0;
+  into.own_publish_unstamped += from.own_publish_unstamped ?? 0;
+  into.fetch_failed += from.fetch_failed ?? 0;
+  into.tsv_truncated += from.tsv_truncated ?? 0;
   // `?? 0` again for replayed pre-#727 chunk results. Safe here for the reason
   // shouldRecordResourceSync's doc gives: this is a positive end-of-chunk
   // measurement whose absence means "not measured on an older code path", and
@@ -1236,9 +1269,22 @@ async function runReimport(
   // nulls a refused resource out, exactly as the TSV truncation gate does for
   // tn/tq/twl a few lines further down.
   let [ultRaw, ustRaw] = [null as string | null, null as string | null];
+  // #1063: resolve master's file-commit SHA BEFORE the verse fetch and fetch
+  // pinned to it (the nightly's pattern), so the lineage walk below can withhold
+  // #658's stamp for a merge that landed after this file was read (#1058). A
+  // null SHA falls back to the unpinned URL and withholds the stamp. TSV stays
+  // unpinned: a pinned TSV fetch is completeness-verified, which widens the prune.
+  const ultFile = dcsResourceFile(book, "ult");
+  const ustFile = dcsResourceFile(book, "ust");
+  const [ultSha, ustSha] = await Promise.all([
+    want.has("ult") && ultFile ? fileCommitSha(env, ultFile.repo, ultFile.path) : Promise.resolve(null),
+    want.has("ust") && ustFile ? fileCommitSha(env, ustFile.repo, ustFile.path) : Promise.resolve(null),
+  ]);
+  const verseUrl = (file: { repo: string; path: string } | null, sha: string | null, fallback: string) =>
+    file ? dcsRawUrl(env, file.repo, file.path, sha ?? undefined) : fallback;
   const [ultFetched, ustFetched, tnFetch, tqFetch, twlFetch] = await Promise.all([
-    want.has("ult") ? fetchText(urls.ult) : Promise.resolve(null),
-    want.has("ust") ? fetchText(urls.ust) : Promise.resolve(null),
+    want.has("ult") ? fetchText(verseUrl(ultFile, ultSha, urls.ult)) : Promise.resolve(null),
+    want.has("ust") ? fetchText(verseUrl(ustFile, ustSha, urls.ust)) : Promise.resolve(null),
     want.has("tn") && tnFile
       ? fetchTsvMasterVerified(env, tnFile.repo, tnFile.path)
       : Promise.resolve({ raw: null, verifiedComplete: false }),
@@ -1317,10 +1363,9 @@ async function runReimport(
     const file = dcsResourceFile(book, resource);
     if (!file) continue;
     const state = await resourceSyncState(env, book, resource);
-    // This route has no SHA gate of its own, so master's file-commit SHA is
-    // resolved here. One subrequest, on a human-triggered request, only for a
-    // verse resource that was actually fetched.
-    const masterSha = await fileCommitSha(env, file.repo, file.path);
+    // This route has no SHA gate of its own; the SHA resolved before the fetch
+    // (#1063) is the commit this file was read at.
+    const masterSha = resource === "ult" ? ultSha : ustSha;
     const { decision, hold } = await evaluateStaleBaseReplacement(env, {
       book,
       resource,
@@ -1467,6 +1512,10 @@ async function runReimport(
           stats,
           ownDeclines.get(resource) ?? null,
           alertObservedAt,
+          // #1063: the verse files were fetched pinned; #658 may only stamp a
+          // merge at or before that commit. TSV keeps the unpinned behavior:
+          // its cutoff below is the pre-walk read, so a stamp cannot reach it.
+          resource === "ult" ? ultSha : resource === "ust" ? ustSha : undefined,
         )
       : null;
     perResource[resource].merge_no_base_cleared += stats.noBaseCleared;
@@ -2482,12 +2531,15 @@ export async function applyTsvRows(
           // `possibleMasterActivityAtAncestorRef`: best-effort visibility only
           // (see the comment above classifyTsvRefMove's call) — VERSE-scoped
           // evidence, not proof this row's own history has an intermediate
-          // move. Never used to change the outcome.
-          const possibleMasterActivityAtAncestorRef =
-            refBase != null &&
-            Number.isInteger(refBase.chapter) &&
-            Number.isInteger(refBase.verse) &&
-            completeHumanRefEvidenceTouches(cutoff?.lineage, refBase.chapter as number, refBase.verse as number);
+          // move. Never used to change the outcome. Tri-state (#874): `null`
+          // means the evidence could not answer (no usable ancestor ref, or a
+          // missing/incomplete/malformed lineage), `false` means a complete
+          // lineage was checked and showed no human touch at that verse.
+          const possibleMasterActivityAtAncestorRef = humanRefEvidenceAtRef(
+            cutoff?.lineage,
+            refBase?.chapter,
+            refBase?.verse,
+          );
           console.log("reimport: reference move attributed to the app; publishing it", {
             book,
             kind,
@@ -4500,6 +4552,15 @@ export const getMasterConfirmedAtForTest = (
 // decision for a lineage to inform. Every other failure comes back as a summary
 // flagged `incomplete`, which masterMayHoldHumanEdit treats exactly like a found
 // human commit: a fetch that fell over must never read as "no human touched this".
+// Per-run side effects of one lineage walk, reported through an out-param (see
+// `stats` below). `lineageConfirmed` (#1048) is set only when #658's stamp
+// (markLineageConfirmedConverged) landed during this walk, carrying the render
+// boundary it stamped.
+type LineageStats = {
+  noBaseCleared: number;
+  lineageConfirmed?: { readAt: number; editId: number | null };
+};
+
 async function loadMasterLineage(
   env: Env,
   book: string,
@@ -4512,13 +4573,17 @@ async function loadMasterLineage(
   // every other outcome travels in, and this function's return value is a
   // lineage summary that is persisted and serialized into Workflow steps —
   // carrying a per-run side-effect count on it would leak into both.
-  stats?: { noBaseCleared: number },
+  stats?: LineageStats,
   // Non-null when own-publish recognition declined tonight with `content_differs`
   // for this pair: the sync state that comparison ran against. The walk fetched
   // here is the evidence that attributes the decline (accountOwnPublishDecline),
   // so it is judged here rather than paying a second Gitea fetch for it.
   ownDecline: ResourceSyncState | null = null,
   observedAt = Date.now(),
+  // #1058: the master commit the caller's file was fetched at, so #658's stamp
+  // is only accepted for a merge that file can contain. See
+  // accountOwnPublishDecline's `pinnedSha`.
+  pinnedSha?: string | null,
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
   if (!file) return null;
@@ -4528,7 +4593,7 @@ async function loadMasterLineage(
     // rewritten never GETS a watermark (recognition never fires), so gating the
     // detector on one would leave it blind for exactly the pairs it exists for
     // (cold review F3 / Codex P1 on this change).
-    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline, observedAt);
+    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline, observedAt, stats, pinnedSha);
     return null;
   }
   // Prefer the repo-scoped ledger when it can prove a current, gap-free,
@@ -4547,7 +4612,7 @@ async function loadMasterLineage(
         incomplete: false,
         incompleteReason: "",
       };
-      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt);
+      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt, stats, pinnedSha);
       const humans = classified.filter((c) => c.kind === "human");
       let humanRefs: HumanRefEvidence | null = null;
       if (humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
@@ -4605,7 +4670,7 @@ async function loadMasterLineage(
     });
   }
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
-  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline, observedAt);
+  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline, observedAt, stats, pinnedSha);
   const commits = page.commits.map(classifyMasterCommit);
   // #557: narrow "a human touched this file" to "a human touched THIS verse",
   // but only where it is affordable and only where the file-level answer is
@@ -4797,11 +4862,31 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // one — so the slack is free in the only direction that matters. A day also
 // absorbs modest author-date backdating.
 //
-// A SHARED LIMIT, NOT THIS TIER'S: every walk in this system bounds by
-// `author.date` (listMasterCommitsSince's sinceTime compares it), so a commit
-// PUSHED later carrying an author date older than the window start is invisible
-// to the mint gate, to #665's clear, and to tier 1 alike — this derivation is no
-// more exposed to it than the code it extends. Tracked as issue #691.
+// A SHARED LIMIT, NOT THIS TIER'S — NARROWED BY #691, NOT CLOSED. Every
+// date-bounded walk here (listMasterCommitsSince's sinceTime) compares
+// COMMITTER date, not author date (see that function's own comment), which
+// already closes the rebase/cherry-pick class of backdating: those move the
+// committer date to landing time even though the author date stays old. The
+// walk below (whichever tier supplied `windowStart`) now also tries the
+// dcs_commits ledger first — the same pattern loadMasterLineage (above)
+// already uses for the mint gate — which buys the same committer-date answer
+// from a store PROVEN gap-free by sha-continuity polling, without a live
+// Gitea round trip and its failure modes (timeouts, page caps). What neither
+// the live walk NOR the ledger can catch, even so: a PLAIN late push, where
+// the commit is locally authored AND committed days before it reaches
+// Door43, so neither timestamp ever moves. The dcs_commits row for such a
+// commit DOES exist once the poller's sha-continuity walk discovers it
+// (`seen_at` records exactly when) — but readLedgerMasterLineage's own read
+// filters on `committed_at`, the same field the live walk keys on, not on
+// `seen_at`. VERIFIED directly: a ledger with full, gap-free coverage
+// starting well before `windowStart` still returns zero commits for a row
+// whose `committed_at` itself predates `windowStart`. Closing that fully
+// would mean widening readLedgerMasterLineage's own comparison to admit a row
+// on `seen_at` too — a change to that shared, separately-audited module,
+// which this fix does not make (see the PR that introduced this comment for
+// why). So the honest residual is: a plain late push is invisible to every
+// walk here, live or ledger-backed, regardless of how current the ledger's
+// coverage is. Tracked as issue #691.
 interface NoBaseFallbackWindow {
   /** Where the walk must start: see the tier notes above. */
   windowStart: number;
@@ -4919,6 +5004,62 @@ const MINT_LOOKUP_BATCH = 90;
 // the flag's own `_meta`, so re-running against an unchanged master costs zero
 // fetches. Never throws: a failure here must not take down a reimport, and the
 // flags simply stand for another night.
+//
+// Ledger-first, live-fallback (#691), the one Gitea-facing helper this walk
+// needs. Split out of clearResolvedMergeNoBase itself so the ledger attempt's
+// own try/catch cannot weaken the caller's null-narrowing of `walk` — the
+// caller does one unconditional `walk = await this(...)`, exactly the shape
+// it already relied on before this existed. See its call site's comment for
+// what the ledger buys and what it still cannot prove.
+//
+// Returns the repo head the ledger read was validated against alongside the
+// page (#853/#867 reconciliation): a page this function builds from the
+// ledger is repo-scoped exactly like the reused `walked` parameter can be, so
+// the caller needs the same `ledgerRepoHead` signal to route it through the
+// #861 fixes (classification trust, walkTip/tipNow scope) instead of the
+// live/path-scoped handling. Null means "this call fell back to a live,
+// path-scoped fetch" — never a ledger-sourced page paired with a missing head.
+async function masterCommitsSinceViaLedgerOrLive(
+  env: Env,
+  file: { repo: string; path: string },
+  windowStart: number,
+  book: string,
+  kind: TsvKind,
+): Promise<{ page: MasterCommitPage; ledgerRepoHead: string | null }> {
+  try {
+    // Timeout required, not opt-in (review finding on #853): this sweep shares
+    // its Workflow step's runtime budget across up to NO_BASE_SWEEP_MAX_PAIRS
+    // pairs, so an unbounded probe here — Door43 accepting the connection and
+    // then stalling, never erroring — would stall the whole step short of its
+    // promised live fallback rather than just costing one more fetch. Same
+    // ceiling as the ledger poller's own fetches (DCS_POLL_FETCH_TIMEOUT_MS).
+    const repoHead = await repoHeadCommitSha(env, file.repo, { timeoutMs: DCS_POLL_FETCH_TIMEOUT_MS });
+    const ledger = await readLedgerMasterLineage(env.DB, file.repo, file.path, windowStart, repoHead);
+    if (ledger.usable && ledger.lineage) {
+      console.log("reimport merge_no_base clear: walk source", { book, kind, source: "ledger" });
+      return {
+        page: { commits: ledger.lineage.commits, incomplete: false, incompleteReason: "" },
+        ledgerRepoHead: repoHead,
+      };
+    }
+    console.log("reimport merge_no_base clear: ledger unavailable for walk; using live walk", {
+      book,
+      kind,
+      reason: ledger.reason,
+    });
+  } catch (error) {
+    // Same fail-closed-for-ledger-use posture as loadMasterLineage: a ledger
+    // read failure must never disable the established live attribution path.
+    console.warn("reimport merge_no_base clear: ledger read failed; using live walk", {
+      book,
+      kind,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: windowStart });
+  return { page, ledgerRepoHead: null };
+}
+
 async function clearResolvedMergeNoBase(
   env: Env,
   book: string,
@@ -5082,15 +5223,32 @@ async function clearResolvedMergeNoBase(
     let walkSince = walkStart ?? windowStart;
     // Whether `walk`, AS ACTUALLY USED BELOW, is the repo-scoped ledger page —
     // not merely whether the caller passed one. The branch just below can
-    // replace `walk` with a fresh path-scoped live fetch even when `walked` was
-    // ledger-sourced (a flag whose own window starts earlier than the ledger
-    // read's confirmedAt bound), and in that case the walk actually being used
-    // is path-scoped again, so the #861 fix below must not fire for it.
+    // replace `walk` with a fresh fetch even when `walked` was ledger-sourced
+    // (a flag whose own window starts earlier than the ledger read's
+    // confirmedAt bound); that fresh fetch can ITSELF be ledger-sourced too
+    // (masterCommitsSinceViaLedgerOrLive tries the ledger first), so this is
+    // reassigned from what that call actually returns, not forced to false —
+    // otherwise the #861 fixes below would silently stop applying to the one
+    // caller (the #683 sweep) that always takes this branch.
     let ledgerSourcedWalk = ledgerRepoHead != null;
     if (walk == null || walkStart == null || walkStart > windowStart) {
-      walk = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: windowStart });
+      // Ledger-first, live-fallback (#691) — the exact pattern already proven
+      // for the mint gate in loadMasterLineage, above. readLedgerMasterLineage
+      // fails closed on anything but a current, gap-free ledger whose coverage
+      // reaches back to windowStart, so trying it here is always safe: worst
+      // case it refuses and the live walk below runs exactly as it always has.
+      // What it buys when it IS usable: the same committer-date answer the
+      // live walk would give, but from a store already proven gap-free by
+      // sha-continuity polling — so this survives a live Gitea hiccup (a
+      // timeout or page cap) that would otherwise force a refusal. See
+      // NoBaseFallbackWindow's comment for the honest limit: neither this nor
+      // the live walk can see a PLAIN late push (author and committer date
+      // both unmoved).
+      const fetched = await masterCommitsSinceViaLedgerOrLive(env, file, windowStart, book, kind);
+      walk = fetched.page;
       walkSince = windowStart;
-      ledgerSourcedWalk = false;
+      ledgerSourcedWalk = fetched.ledgerRepoHead != null;
+      ledgerRepoHead = fetched.ledgerRepoHead;
     }
     // A blocked outcome is recorded on the rows themselves, keyed by master's
     // tip, so tonight's answer is not re-bought tomorrow for an unchanged file.
@@ -5241,10 +5399,12 @@ async function clearResolvedMergeNoBase(
     //     `keep_no_base` (:1999). What (b) really guarantees is that the human's
     //     commit becomes VISIBLE to the next run's gate — restoring the
     //     protection the flag stood for — not that the identical flag reappears.
-    //   · The revisit's walk inherits the author-date bound described in
-    //     NoBaseFallbackWindow: a commit authored before the watermark but
-    //     pushed after it is invisible to that walk exactly as it is to every
-    //     other walk here (issue #691).
+    //   · The revisit's walk inherits the narrowed residual described in
+    //     NoBaseFallbackWindow's #691 note: committer-date backdating (a
+    //     rebase or cherry-pick) is caught, live or via the ledger the
+    //     revisit's own gate already tries first; a PLAIN late push — author
+    //     AND committer date both unmoved — is invisible to both, exactly as
+    //     for every other walk here (issue #691).
     //
     // #861: when `walk` is the repo-scoped ledger page, `walk.commits[0]?.sha`
     // can be a Gitea merge-wrapper commit — exactly the shape our own nightly
@@ -5429,17 +5589,23 @@ export const clearResolvedMergeNoBaseForTest = (
 // swept pair, worst case:
 //
 //   D1:    1 lineage read (book_resource_syncs) + 1 flagged-row read + 1
-//          mint-time read (only for flags with no window of their own) + one
+//          mint-time read (only for flags with no window of their own) + up to
+//          2 ledger reads (readLedgerMasterLineage's dcs_repo_polls +
+//          dcs_commits queries, #691, paid whenever the ledger-first attempt
+//          runs — the same condition as the repo-head probe below) + one
 //          write batch per WRITE_BATCH slice of rows it clears or memoizes.
-//   Gitea: 0 on a pair with nothing walkable; otherwise THREE components —
+//   Gitea: 0 on a pair with nothing walkable; otherwise FOUR components —
 //          1 tip probe (the memo key, always paid once a pair has candidates)
-//          + up to listMasterCommitsSince's 5-page walk (skipped entirely on a
-//          memo hit) + 1 pre-write tip recheck (only for a pair that survives
-//          every gate and reaches the write). So 7 at worst per pair, 1 on a
-//          memo hit.
+//          + 1 repo-head probe for the ledger-first attempt (#691; the ledger
+//          read itself is a D1 read, counted above, but proving it usable
+//          needs the live repo head) + up to listMasterCommitsSince's 5-page
+//          walk when the ledger is not usable (skipped entirely on a memo
+//          hit, or when the ledger supplies the walk) + 1 pre-write tip
+//          recheck (only for a pair that survives every gate and reaches the
+//          write). So 8 at worst per pair, 1 on a memo hit.
 //
-// So a full sweep is bounded at roughly 30 D1 reads, a handful of write batches,
-// and up to 70 Gitea fetches (10 pairs x 7) however many books hold flags. Plus the three
+// So a full sweep is bounded at roughly 50 D1 reads, a handful of write batches,
+// and up to 80 Gitea fetches (10 pairs x 8) however many books hold flags. Plus the three
 // DISTINCT-book queries that find the pairs in the first place. The nightly has
 // already died once on Cloudflare's ~1000-subrequest cap, and this runs in its
 // own Workflow step (exportWorkflow.ts) so none of it is spent from a book's
@@ -8426,7 +8592,61 @@ interface StagedResource {
   // an override that consents to a risk must leave a record of having been
   // used, exactly like idBlockedOverride's raise-instead-of-clear.
   staleBaseOverridden?: StaleBaseHold | null;
+  // Issue #1035. Which unstamped branch produced this entry, so the run ledger
+  // can tell them apart from the no-file entry (also `changed: false`,
+  // `masterSha: null`, and not a failure). Absent on a plan replayed from a
+  // Workflow instance that started before this shipped, which reads as the old
+  // behavior (ledger success); nothing gates on these.
+  ownPublishUnstamped?: boolean;
+  fetchFailed?: boolean;
+  tsvTruncated?: boolean;
+  // Issue #857: this pair's merge-ancestor boundary (getMasterConfirmedAt),
+  // read while staging THIS file and after loadMasterLineage (which can
+  // itself advance it via #658). The prune step judges the staged file
+  // against this, not a fresh read: another Workflow instance can export an
+  // AI-only row and advance the watermark while the chunk steps run, and a
+  // newer boundary against this older file makes that row look exported and
+  // then removed on master, so the prune would delete it. For TSV kinds the
+  // value is the boundary read before the fetch plus this run's own lineage
+  // stamp, so an outside advance in that window is dropped and the value never
+  // certifies more than the fetch-time boundary plus this run's own confirmed
+  // render (#1048, pairStagedTsvCutoff). Only the two
+  // boundary fields, so the memoized plan stays plain JSON. Absent on a plan
+  // replayed from an instance that started before this shipped; the prune
+  // then falls back to a fresh read.
+  stagedCutoff?: { confirmedAt: number | null; editId: number | null };
 }
+
+// The run-summary counters decided at staging time, seeded from the memoized
+// plan (see the call site in runChunkedReimport for why seeding happens out
+// here and not inside a step).
+function seedPerResourceFromPlan(entries: StagedResource[]): Record<Resource, ReimportCounts> {
+  const perResource = freshPerResource();
+  for (const e of entries) {
+    if (e.ownPublish) perResource[e.resource].own_publish_converged++;
+    // Issue #639. Seeded from the PLAN, not from a chunk: the refusal is
+    // file-level and was decided at staging time, and seeding it out here (not
+    // inside a `step.do`) keeps it correct across a Workflow replay, which
+    // re-serves the memoized plan but does NOT re-run any closure that mutated
+    // `perResource` from inside a step.
+    // #653: same seeding rationale as own_publish_converged above — the clear
+    // ran inside the plan step, so its count comes from the plan.
+    if (e.noBaseCleared) perResource[e.resource].merge_no_base_cleared += e.noBaseCleared;
+    if (e.staleBaseHold) perResource[e.resource].stale_base_held++;
+    if (e.staleBaseOverridden) perResource[e.resource].stale_base_overridden++;
+    // Issue #1033: same plan-seeding rationale. The sync step's
+    // `if (!e.masterSha) continue;` leaves this resource unstamped.
+    if (e.changed && !e.masterSha) perResource[e.resource].master_sha_unknown++;
+    // Issue #1035: same plan-seeding rationale; each flag marks a branch that
+    // left source_sha unstamped (see StagedResource).
+    if (e.ownPublishUnstamped) perResource[e.resource].own_publish_unstamped++;
+    if (e.fetchFailed) perResource[e.resource].fetch_failed++;
+    if (e.tsvTruncated) perResource[e.resource].tsv_truncated++;
+  }
+  return perResource;
+}
+
+export const seedPerResourceFromPlanForTest = seedPerResourceFromPlan;
 
 interface ReimportPlan {
   maxChapter: number;
@@ -8688,6 +8908,13 @@ async function accountOwnPublishDecline(
   walked: MasterCommitPage | null,
   sync: ResourceSyncState,
   observedAt = Date.now(),
+  stats?: LineageStats,
+  // #1058: the master commit the caller's file was fetched at. The walk reads
+  // master's CURRENT tip, so our merge can be in it yet newer than that file;
+  // #658's stamp is then withheld (see below). `undefined` means the caller did
+  // not pin its file and keeps the unpinned behavior; `null` means it pinned
+  // but the sha is unknown, which proves nothing.
+  pinnedSha?: string | null,
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   try {
@@ -8783,7 +9010,28 @@ async function accountOwnPublishDecline(
       // getMasterConfirmedAt is re-read for chunk apply, so tonight's merge can
       // recover the newly confirmed ancestor. Absent/incomplete/human evidence
       // deliberately declines to the existing conservative behavior.
+      //
+      // #1058: and only when our merge is at or before the commit the caller's
+      // file was fetched at. Otherwise the stamp certifies a render that file
+      // predates, and the TSV prune deletes that render's AI-only rows. The
+      // walk is newest first (git order on the live path, committed_at on the
+      // ledger), so "at or before" is "at or after the pinned sha's position";
+      // a pinned sha missing from the walk proves nothing. Withholding is the
+      // safe direction: next night's file head is at or after this merge.
+      const mergeIdx = commits.findIndex((c) => c.sha === judged.mergeSha);
+      const pinIdx = pinnedSha == null ? -1 : commits.findIndex((c) => c.sha === pinnedSha);
+      const mergeInPinnedFile = pinnedSha === undefined || (pinIdx >= 0 && mergeIdx >= pinIdx);
+      if (!mergeInPinnedFile) {
+        console.log("reimport #658 stamp withheld: our merge is not at or before the fetched file's commit (#1058)", {
+          book,
+          resource,
+          mergeSha: judged.mergeSha,
+          pinnedSha,
+          pinnedInWalk: pinIdx >= 0,
+        });
+      }
       const lineageConfirmed =
+        mergeInPinnedFile &&
         !page.incomplete &&
         commits.every((commit) => commit.kind !== "human") &&
         pushedReadAt != null
@@ -8793,6 +9041,11 @@ async function accountOwnPublishDecline(
               pushedEditId,
             }, observedAt)
           : false;
+      // #1048: report the stamp to planAndStageBookResources, which has to tell
+      // this run's own advance apart from a concurrent export's.
+      if (lineageConfirmed && stats && pushedReadAt != null) {
+        stats.lineageConfirmed = { readAt: pushedReadAt, editId: pushedEditId };
+      }
       await env.DB.prepare(
         `UPDATE book_resource_syncs SET own_publish_declines = 0, own_publish_rewrite_sha = NULL
           WHERE book = ?1 AND resource = ?2 AND (own_publish_declines <> 0 OR own_publish_rewrite_sha IS NOT NULL)`,
@@ -8876,7 +9129,8 @@ export const accountOwnPublishDeclineForTest = (
   walked: MasterCommitPage | null,
   sync: ResourceSyncState,
   observedAt = Date.now(),
-): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync, observedAt);
+  pinnedSha?: string | null,
+): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync, observedAt, undefined, pinnedSha);
 
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
@@ -9914,6 +10168,56 @@ async function runTombstoneSweep(
   }
 }
 
+// Issue #1048. The TSV prune judges the staged file against stagedCutoff, so
+// the two must describe the same instant. The file is fetched before
+// loadMasterLineage and the cutoff is read after it (it must be: #658 can
+// legitimately advance the boundary inside that walk, #866 F2). Anything else
+// that moves the boundary in that window, such as a concurrent export
+// confirming AI-only row X, pairs a file without X with a cutoff that covers X,
+// and the prune deletes X.
+//
+// So the paired cutoff is the fetch-time cutoff with this run's own #658 stamp
+// (if any) applied, computed the way markLineageConfirmedConverged's UPDATE
+// computes it. On an ordinary run that equals the post-lineage read. Any other
+// post-lineage value means a writer outside this run also moved it; its
+// advance is dropped but the run's own stamp is kept, since dropping that too
+// would reopen the #866 F2 resurrection. The invariant: the paired cutoff
+// never certifies more than the fetch-time cutoff plus this run's own
+// confirmed render, both of which the staged file reflects. It is usually no
+// newer than the post-lineage read either, but not always: an outside confirm
+// with a null edit id can move master_confirmed_at past this run's
+// pushed_read_at before the #658 stamp, so the stamp's SQL edit-id gate fails
+// and the row keeps the fetch-time edit id, while the paired edit id is the
+// own stamp's higher one. The extra rows that certifies are exactly those in
+// this run's own confirmed render, which the prune may judge.
+function pairStagedTsvCutoff(
+  fetchCutoff: { confirmedAt: number | null; editId: number | null },
+  postLineage: { confirmedAt: number | null; editId: number | null },
+  ownStamp: { readAt: number; editId: number | null } | null,
+  log: { book: string; resource: Resource; masterSha: string | null },
+): { confirmedAt: number | null; editId: number | null } {
+  let expected = fetchCutoff;
+  if (ownStamp) {
+    const prior = fetchCutoff.confirmedAt ?? 0;
+    expected = {
+      confirmedAt: Math.max(prior, ownStamp.readAt),
+      editId: ownStamp.editId != null && ownStamp.readAt >= prior
+        ? Math.max(fetchCutoff.editId ?? 0, ownStamp.editId)
+        : fetchCutoff.editId,
+    };
+  }
+  if (postLineage.confirmedAt !== expected.confirmedAt || postLineage.editId !== expected.editId) {
+    console.warn("reimport: prune cutoff moved between the master fetch and the post-lineage read by a writer outside this run; pruning against the fetch-time cutoff plus this run's own lineage stamp (#1048)", {
+      ...log,
+      fetchCutoff,
+      postLineage,
+      ownStamp,
+      paired: expected,
+    });
+  }
+  return expected;
+}
+
 // SHA-gate each requested resource and stage the changed ones to R2. Returns
 // the book's chapter extent + a manifest the chunk steps read from.
 async function planAndStageBookResources(
@@ -9946,6 +10250,11 @@ async function planAndStageBookResources(
     // previously computed just below, right where the actual fetch happens.
     const isTsv = resource === "tn" || resource === "tq" || resource === "twl";
 
+    // #1048: the prune cutoff as it stood BEFORE master's sha is resolved and
+    // its file fetched. Any render this boundary certifies was confirmed on
+    // master before that sha, so the file fetched below holds its rows (or a
+    // later real deletion of them). See pairStagedTsvCutoff.
+    const fetchCutoff = isTsv ? await getMasterConfirmedAt(env, book, resource) : null;
     const masterSha = await fileCommitSha(env, file.repo, file.path);
     const sync = await resourceSyncState(env, book, resource);
     const shaMatches = Boolean(masterSha && sync.sourceSha && masterSha === sync.sourceSha);
@@ -10033,7 +10342,7 @@ async function planAndStageBookResources(
     }
     if (raw == null) {
       // DCS 404 / fetch error → nothing to import, no watermark.
-      entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false });
+      entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false, fetchFailed: true });
       continue;
     }
 
@@ -10118,6 +10427,8 @@ async function planAndStageBookResources(
         r2Key: sweepR2Key,
         ownPublish: stamped,
         verifiedComplete: sweepVerifiedComplete,
+        // #1035: source_sha moved only if the UPDATE landed AND carried a SHA.
+        ownPublishUnstamped: !stamped || !masterSha,
       });
       continue;
     }
@@ -10143,7 +10454,7 @@ async function planAndStageBookResources(
     // hiding the damage (the HAB tn incident). masterSha:null here is critical:
     // the reimport-sync step only stamps watermarks for entries with a masterSha.
     if (isTsv && (await tsvFetchLooksTruncated(env, book, resource, raw))) {
-      entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false });
+      entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false, tsvTruncated: true });
       continue;
     }
     // Stale-base gate (issue #639), verse resources only — the signal it reads
@@ -10216,7 +10527,7 @@ async function planAndStageBookResources(
     // step. The extra D1 read buys the correct boundary: the walk must start
     // where the merge's ancestor sits (`master_confirmed_at`), not at
     // `sync.sourceSha`, which this very function is about to move past it.
-    const noBaseStats = { noBaseCleared: 0 };
+    const noBaseStats: LineageStats = { noBaseCleared: 0 };
     const stageCutoff = await getMasterConfirmedAt(env, book, resource);
     const lineage = await loadMasterLineage(
       env,
@@ -10229,13 +10540,21 @@ async function planAndStageBookResources(
       // verdict that means "we measured a difference" (see accountOwnPublishDecline).
       own.reason === "content_differs" ? sync : null,
       alertObservedAt,
+      // #1058: the file above was fetched at masterSha; #658 may only stamp a
+      // merge at or before it.
+      masterSha,
     );
     let confirmedBaseR2Key: string | null = null;
+    // #857: read after loadMasterLineage, not reused from `stageCutoff` —
+    // #658 can advance the boundary inside that call, and a pre-lineage value
+    // would make the prune keep a row this run just confirmed exported.
+    let stagedCutoff: { confirmedAt: number | null; editId: number | null };
     if (resource === "ult" || resource === "ust") {
       // loadMasterLineage may have advanced the boundary via #658. Parse the
       // exact confirmed render once now, then stage only its compact verse map
       // for all later chunk steps.
       const confirmed = await getMasterConfirmedAt(env, book, resource, true);
+      stagedCutoff = { confirmedAt: confirmed.confirmedAt, editId: confirmed.editId };
       // #1005: our newer, not-yet-confirmed publish rides the same staged
       // object (reviveUnconfirmedPublish on the chunk side). Mutually exclusive
       // with the #790 bases in practice: those need the pushed render to BE
@@ -10254,6 +10573,14 @@ async function planAndStageBookResources(
           { httpMetadata: { contentType: "application/json" } },
         );
       }
+    } else {
+      const confirmed = await getMasterConfirmedAt(env, book, resource);
+      stagedCutoff = pairStagedTsvCutoff(
+        fetchCutoff ?? { confirmedAt: null, editId: null },
+        { confirmedAt: confirmed.confirmedAt, editId: confirmed.editId },
+        noBaseStats.lineageConfirmed ?? null,
+        { book, resource, masterSha },
+      );
     }
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
@@ -10265,6 +10592,7 @@ async function planAndStageBookResources(
       verifiedComplete,
       lineage,
       confirmedBaseR2Key,
+      stagedCutoff,
       noBaseCleared: noBaseStats.noBaseCleared,
       // Null on every ordinary night. Non-null ONLY on a force-released
       // stale-base adoption — see the gate above and staleBaseOverridden below.
@@ -10557,20 +10885,7 @@ export async function runChunkedReimport(
   // below, because "every changed resource turned out to be our own publish" is
   // the single most common shape of this fix firing: `changed` is then empty and
   // an unadorned emptyResult would report the night as "nothing happened".
-  const perResource = freshPerResource();
-  for (const e of plan.entries) {
-    if (e.ownPublish) perResource[e.resource].own_publish_converged++;
-    // Issue #639. Seeded from the PLAN, not from a chunk: the refusal is
-    // file-level and was decided at staging time, and seeding it out here (not
-    // inside a `step.do`) keeps it correct across a Workflow replay, which
-    // re-serves the memoized plan but does NOT re-run any closure that mutated
-    // `perResource` from inside a step.
-    // #653: same seeding rationale as own_publish_converged above — the clear
-    // ran inside the plan step, so its count comes from the plan.
-    if (e.noBaseCleared) perResource[e.resource].merge_no_base_cleared += e.noBaseCleared;
-    if (e.staleBaseHold) perResource[e.resource].stale_base_held++;
-    if (e.staleBaseOverridden) perResource[e.resource].stale_base_overridden++;
-  }
+  const perResource = seedPerResourceFromPlan(plan.entries);
 
   // Issue #639: the durable half of a stale-base refusal — a queryable row plus
   // a banner. In its OWN step, ahead of every early return below, because a
@@ -10717,15 +11032,16 @@ export async function runChunkedReimport(
     if (!chs || chs.length === 0) continue;
     const r2Key = e.r2Key;
     const verifiedComplete = e.verifiedComplete;
+    const stagedCutoff = e.stagedCutoff;
     const res = await step.do(`reimport-prune-${book}-${kind}`, async () => {
       const raw = await readStaged(env, r2Key);
       if (raw == null) return { deleted: 0, skippedLocked: 0 };
-      // Issue #832: this step runs after the chunk-apply steps above (which
-      // hoist their own cutoff inside reimportStagedChunk's separate call), so
-      // it re-reads the same (book, kind) merge-ancestor cutoff here rather
-      // than threading one through every chunk — one extra read per changed
-      // TSV kind, not per chapter.
-      const cutoff = await getMasterConfirmedAt(env, book, kind);
+      // Issue #832 / #857: judge the staged file against the boundary read
+      // when it was staged (see StagedResource.stagedCutoff), not a fresh
+      // read here — the chunk steps above give another Workflow instance time
+      // to advance it. The fresh read is only for a plan memoized before
+      // stagedCutoff existed.
+      const cutoff = stagedCutoff ?? (await getMasterConfirmedAt(env, book, kind));
       const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs, verifiedComplete, cutoff);
       if (res.deleted > 0 || res.skippedLocked > 0) {
         console.log("reimport pruned rows removed on master", { book, resource: kind, ...res });
