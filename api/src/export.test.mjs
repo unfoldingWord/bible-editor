@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, exportRevertRaceAlertSource, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -2617,6 +2617,28 @@ function utf8Base64(s) {
   assert(
     foreignCommitDuringExport(null, null) === false,
     `neither side known -> no race detected`,
+  );
+}
+
+// exportRevertRaceAlertSource (#871 review A1): writeAlert deletes any
+// undismissed alert with the same source before inserting, and the race banner
+// is never auto-cleared. So the source must be unique per race: race 1
+// (P1 -> F1) left undismissed must survive race 2 (P2 -> F2) on a later night.
+{
+  const race1 = exportRevertRaceAlertSource("JER", "ult", "p1sha", "f1sha");
+  const race2 = exportRevertRaceAlertSource("JER", "ult", "p2sha", "f2sha");
+  assert(race1 !== race2, `two different races on one pair must not share an alert source (got ${race1})`);
+  assert(
+    race1 === exportRevertRaceAlertSource("JER", "ult", "p1sha", "f1sha"),
+    `the same race re-detected keeps its source, so a re-run replaces it and a dismissal sticks`,
+  );
+  assert(
+    race1.startsWith("export_revert_race:JER:ult:"),
+    `source keeps the export_revert_race:<book>:<resource> prefix (got ${race1})`,
+  );
+  assert(
+    exportRevertRaceAlertSource("JER", "ult", "p1sha", "f2sha") !== race1,
+    `same pin, different foreign head is a different race`,
   );
 }
 
