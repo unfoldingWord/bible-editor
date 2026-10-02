@@ -1019,7 +1019,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // silent revert. A fresh book with no watermark has nothing to clobber.
     // Only meaningful when we'd actually commit (dcsAllowed); a dry run renders
     // to R2 only and can't clobber anything.
-    const fresh = dcsAllowed ? await this.checkMasterFreshness(book, resource) : { ok: true as const, detail: "dry", masterSha: null, watermark: null };
+    const fresh = dcsAllowed ? await this.checkMasterFreshness(book, resource) : { ok: true as const, detail: "dry", masterSha: null, watermark: null, headIsOurExport: false };
     if (!fresh.ok) {
       await this.recordStaleSkipAlert(book, resource, fresh.masterSha, fresh.watermark, instanceId);
       const reason = `stale_master:${fresh.detail}`;
@@ -1592,6 +1592,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         masterBlobSha,
         priorPushedBlobSha,
         unconfirmedRenderShas,
+        fresh.headIsOurExport,
       );
       // Log only a suppression that really happened: without the ship gate this
       // would announce "suppressed" on nights where no report was ever going to
@@ -2253,16 +2254,27 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   private async checkMasterFreshness(
     book: string,
     resource: Resource,
-  ): Promise<{ ok: boolean; detail: string; masterSha: string | null; watermark: string | null }> {
+  ): Promise<{
+    ok: boolean;
+    detail: string;
+    masterSha: string | null;
+    watermark: string | null;
+    // #1029: the file's head commit on master is one of our export merges
+    // (classifyMasterCommit, no extra fetch). Gates the lagging-master
+    // suppression in shouldComputeRevertEntries.
+    headIsOurExport: boolean;
+  }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
     // Unknown book/resource → no file to compare; don't block (shouldn't happen
     // for the five real resources).
-    if (!file) return { ok: true, detail: "no_file", masterSha: null, watermark: null };
+    if (!file) return { ok: true, detail: "no_file", masterSha: null, watermark: null, headIsOurExport: false };
     const watermark = await storedResourceSha(this.env, book, resource);
-    if (!watermark) return { ok: true, detail: "no_watermark", masterSha: null, watermark: null };
+    if (!watermark) return { ok: true, detail: "no_watermark", masterSha: null, watermark: null, headIsOurExport: false };
     const head = await fileHeadCommit(this.env, file.repo, file.path);
-    if (!head) return { ok: false, detail: "master_sha_unknown", masterSha: null, watermark };
-    if (head.sha === watermark) return { ok: true, detail: "current", masterSha: head.sha, watermark };
+    if (!head) return { ok: false, detail: "master_sha_unknown", masterSha: null, watermark, headIsOurExport: false };
+    const headIsOurExport =
+      classifyMasterCommit({ sha: head.sha, message: head.message, authorEmail: head.authorEmail }).kind === "ours";
+    if (head.sha === watermark) return { ok: true, detail: "current", masterSha: head.sha, watermark, headIsOurExport };
 
     // Master moved past the watermark. Normally that means a foreign commit
     // landed and the export must not clobber it (stale_master:master_ahead,
@@ -2303,10 +2315,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         pushedBlobSha: pushedPr.pushed_blob_sha,
         newest: classifiedHead,
       });
-      if (judged.verdict === "preserved") return { ok: true, detail: "own_publish", masterSha: head.sha, watermark };
+      if (judged.verdict === "preserved") return { ok: true, detail: "own_publish", masterSha: head.sha, watermark, headIsOurExport };
     }
 
-    return { ok: false, detail: "master_ahead", masterSha: head.sha, watermark };
+    return { ok: false, detail: "master_ahead", masterSha: head.sha, watermark, headIsOurExport };
   }
 
   // Banner alert when the freshness gate skips an export to avoid clobbering

@@ -1532,9 +1532,15 @@ export function shouldComputeRevertEntries(
   // confirmed (book_resource_syncs.unconfirmed_renders_json). Master equal to
   // any of them is still our own bytes, just lagging an unmerged export PR.
   unconfirmedRenderShas: readonly string[] | null = null,
+  // #1029: whether the commit that last touched this file on master (the one
+  // the freshness gate resolved) is one of our export merges. Bytes alone
+  // cannot tell "lagging behind our unmerged PR" from "a human reverted our
+  // newer merge back to older bytes of ours"; only a lagging master still has
+  // our export merge as the file's head. Unknown -> false (report).
+  masterHeadIsOurExport = false,
 ): boolean {
   if (!shouldRecordRevertReport(dcsChanged, masterContent)) return false;
-  if (masterBlobSha != null && unconfirmedRenderShas?.includes(masterBlobSha)) return false;
+  if (masterHeadIsOurExport && masterBlobSha != null && unconfirmedRenderShas?.includes(masterBlobSha)) return false;
   return !masterIsOurLastPublish(masterBlobSha, pushedBlobSha);
 }
 
