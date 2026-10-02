@@ -1426,9 +1426,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // render, the previous publish lives in prev_* (#995).
       let priorPushedBlobSha: string | null = null;
       let priorPushedR2Key: string | null = null;
+      // #1029: renders pushed since master was last confirmed (see migration 0075).
+      let unconfirmedRenderShas: string[] | null = null;
       try {
         const prior = await this.env.DB.prepare(
-          `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key
+          `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key,
+                  unconfirmed_renders_json
              FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
         )
           .bind(book, resource)
@@ -1437,7 +1440,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             pushed_r2_key: string | null;
             prev_pushed_blob_sha: string | null;
             prev_pushed_r2_key: string | null;
+            unconfirmed_renders_json: string | null;
           }>();
+        if (prior?.unconfirmed_renders_json) {
+          const parsed: unknown = JSON.parse(prior.unconfirmed_renders_json);
+          if (Array.isArray(parsed)) unconfirmedRenderShas = parsed.filter((x): x is string => typeof x === "string");
+        }
         const pointer = priorPublishPointer(prior, r2Key);
         priorPushedBlobSha = pointer.blobSha;
         priorPushedR2Key = pointer.r2Key;
@@ -1575,6 +1583,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         masterContentForRevertReport,
         masterBlobSha,
         priorPushedBlobSha,
+        unconfirmedRenderShas,
       );
       // Log only a suppression that really happened: without the ship gate this
       // would announce "suppressed" on nights where no report was ever going to
@@ -1629,12 +1638,47 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
       ) {
+        // #1029: rows D1 took from master via a bot push (ai_pipeline /
+        // dcs_reimport create/update payloads). Only read when a report is on
+        // the table, tn/tq only; fails open.
+        let lineage: Map<string, Array<Record<string, unknown>>> | null = null;
+        if (computeEntries && (resource === "tn" || resource === "tq")) {
+          try {
+            const { results } = await this.env.DB.prepare(
+              `SELECT row_key, payload_json FROM edit_log
+                WHERE kind = ?1 AND book = ?2 AND source IN ('ai_pipeline', 'dcs_reimport')
+                  AND action IN ('create', 'update') AND payload_json IS NOT NULL`,
+            )
+              .bind(resource, book)
+              .all<{ row_key: string; payload_json: string }>();
+            lineage = new Map();
+            for (const r of results ?? []) {
+              try {
+                const p = JSON.parse(r.payload_json);
+                if (p && typeof p === "object") {
+                  const list = lineage.get(r.row_key) ?? [];
+                  list.push(p as Record<string, unknown>);
+                  lineage.set(r.row_key, list);
+                }
+              } catch {
+                /* skip unparseable payload */
+              }
+            }
+          } catch (e) {
+            console.error("export: revert lineage read failed; report keeps its unfiltered behaviour", {
+              book,
+              resource,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
         const entries = computeEntries
           ? tsvRevertReport(
               built.content,
               tsvMasterContentForRevertReport as string,
               resource as "tn" | "tq" | "twl",
               revertBase,
+              lineage,
             ).entries
           : [];
         await this.recordExportRevertReport(book, resource, "tsv", entries, mechanical, branch, instanceId, alertObservedAt);
