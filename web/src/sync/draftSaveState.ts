@@ -170,3 +170,61 @@ export function generationForSavedPlain(
   const generation = draft.generation ?? `legacy:${draft.updatedAt}`;
   return payload.plainText === plain ? generation : undefined;
 }
+
+// Whether a landed (200) row op should clear that row's draft (#1092). A row
+// draft holds the typed fields as `payload.patch`; the op clears it only when
+// it saved at least one of them. A move ("change reference": verse, ref_raw,
+// sort_order) or a reorder (sort_order) carries none of the typed fields, so
+// clearing on its 200 left the typing only in React state and the status bar
+// saying "saved". Deletes, and drafts without a patch object, keep the
+// earlier clear-on-200 behavior.
+export function rowOpClearsDraft(
+  op: Pick<OutboxOp, "action" | "patch">,
+  draft: Pick<DraftRecord, "payload">,
+): boolean {
+  if (op.action !== "patch") return true;
+  const patch = (draft.payload as { patch?: unknown }).patch;
+  if (!patch || typeof patch !== "object") return true;
+  const fields = Object.keys(patch);
+  if (fields.length === 0) return true;
+  return fields.some((field) => Object.prototype.hasOwnProperty.call(op.patch, field));
+}
+
+// A row op's draftGeneration when no draft existed for the row at enqueue
+// (#1092 review). Distinct from an absent field, which marks a legacy op
+// queued before row ops carried a generation.
+export const NO_ROW_DRAFT = "no-draft";
+
+// Whether the 200 handler for a row op may delete the row draft it just read
+// (#1092 review). `latestAt200` is the key's latest in-memory draft generation
+// when the 200 was handled, `latestNow` the same at the moment of the read;
+// both are undefined in a tab that never wrote this draft (a reload after
+// Save, or another tab holding the drain lock). Typing after the save (a
+// keystroke while it is in flight, or NoteCard re-setting a still-dirty draft
+// when the row version bumps, which runs before the 200 handler) shows up as
+// a different generation or a later updatedAt, and must never be deleted.
+//   - op.draftGeneration = a generation: clear only that stored generation,
+//     and only while no newer set() has started in this tab.
+//   - op.draftGeneration = NO_ROW_DRAFT: clear only a draft written before the
+//     op was queued (a prior session's draft the save stored).
+//   - no field (legacy op): fall back to the generation read at the 200.
+export function rowDraftClearAfterOk(
+  op: Pick<OutboxOp, "action" | "patch" | "draftGeneration" | "queuedAt">,
+  latestAt200: string | undefined,
+  latestNow: string | undefined,
+  rec: Pick<DraftRecord, "payload" | "generation" | "updatedAt"> | undefined,
+): boolean {
+  if (!rec) return false;
+  if (!rowOpClearsDraft(op, rec)) return false;
+  const saved = op.draftGeneration;
+  if (saved === NO_ROW_DRAFT) {
+    return latestNow === undefined && rec.updatedAt < op.queuedAt;
+  }
+  if (saved !== undefined) {
+    if (rec.generation !== saved) return false;
+    return latestNow === undefined || latestNow === saved;
+  }
+  if (latestNow !== latestAt200) return false;
+  if (latestAt200 !== undefined && rec.generation !== latestAt200) return false;
+  return true;
+}
