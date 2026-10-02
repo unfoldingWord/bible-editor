@@ -1410,6 +1410,22 @@ export function foreignCommitDuringExport(
   );
 }
 
+// The system_alerts source for one #871 race banner. Unique per race, not per
+// (book, resource): writeAlert deletes every undismissed alert with the same
+// source before it inserts, and this banner is never auto-cleared, so a fixed
+// per-pair source would let a second race on a later night erase the first,
+// still-undismissed banner (the only record of the pinned..foreign range a
+// human has to check). The same race re-detected keeps its source, so a re-run
+// replaces it in place and a dismissal of that exact race still sticks.
+export function exportRevertRaceAlertSource(
+  book: string,
+  resource: string,
+  pinnedSha: string | null,
+  foreignSha: string,
+): string {
+  return `export_revert_race:${book}:${resource}:${pinnedSha ?? "unknown"}:${foreignSha}`;
+}
+
 // Does the number of substantive reverts this export is about to make justify
 // escalating the alert's wording beyond routine? This NEVER blocks the export
 // — there is no `block` field, only `escalate` — because a revert report is

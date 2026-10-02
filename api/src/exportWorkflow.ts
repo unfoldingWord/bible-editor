@@ -48,6 +48,7 @@ import {
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
   foreignCommitDuringExport,
+  exportRevertRaceAlertSource,
   masterIsOurLastPublish,
   priorPublishPointer,
   RECORD_PUSHED_RENDER_SQL,
@@ -3011,7 +3012,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     pinnedSha: string | null,
     foreignSha: string,
   ): Promise<void> {
-    const source = `export_revert_race:${book}:${resource}`;
+    const source = exportRevertRaceAlertSource(book, resource, pinnedSha, foreignSha);
     const label = `${book} ${resource.toUpperCase()}`;
     const pinned = (pinnedSha ?? "unknown").slice(0, 8);
     const foreign = foreignSha.slice(0, 8);
