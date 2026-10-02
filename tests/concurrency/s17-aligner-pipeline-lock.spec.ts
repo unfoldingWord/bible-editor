@@ -600,3 +600,122 @@ test("a lock landing while the unalign confirm is open: Save anyway refuses, the
 
   await context.close();
 });
+
+// #1071 re-review: on a range row the PATCH is keyed by the row's
+// verse_start, but the aligner's crash draft by the verse it was opened on.
+// Bridge ZEC 7:6-7 UST, open the dual aligner on v7, and refuse its save
+// under a lock the tab has not seen: the draft must come back under v7's key.
+test("a range row opened on its inner verse: a refused save's drags come back under that verse's draft key", async ({
+  browser,
+}) => {
+  test.setTimeout(120_000);
+  const { context, auth } = await newUserContext(browser, "s17-range-lock");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  await page.clock.install();
+  const UST = "UST";
+  const V6 = `/api/verses/${BOOK}/7/6/${UST}`;
+  const V7 = `/api/verses/${BOOK}/7/7/${UST}`;
+  const RANGE_JOB = "s17-range-lock";
+  type Row = { version: number; plain_text: string; content_json: string; verse_end: number | null };
+  const get = async (path: string) => {
+    const res = await context.request.get(path);
+    expect(res.ok()).toBe(true);
+    return (await res.json()) as Row;
+  };
+  const clearLock = () => d1(`DELETE FROM pipeline_jobs WHERE job_id = '${RANGE_JOB}'`);
+  clearLock();
+  const orig6 = await get(V6);
+  const orig7 = await get(V7);
+  expect(orig6.verse_end).toBeNull();
+  let bridged = false;
+  try {
+    const res = await context.request.post(`${V6}/bridge`, {
+      headers: { "x-csrf-token": csrf },
+      data: { start_version: orig6.version, next_version: orig7.version },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    bridged = true;
+
+    await page.goto(`/#/${BOOK}/7/7`);
+    await page.reload();
+    await page.locator(`[data-find-cell="7-7-ULT"]`).first().waitFor({ timeout: 15_000 });
+    await page.locator(`button[aria-label^="align ULT"]`).first().click();
+    const sideBySide = page.locator("button", { hasText: "Side-by-side" }).first();
+    await sideBySide.click();
+    const dual = page.getByRole("dialog").filter({ hasText: "reading text" });
+    const wordsLabel = dual.getByText(`${UST} words`, { exact: true });
+    await wordsLabel.waitFor({ state: "visible" });
+    const count = wordsLabel.locator("xpath=../..").getByText(/^\d+ unaligned$/);
+    const before = (await count.textContent()) ?? "";
+    // Right panel (UST) Clear: unaligns everything, so Save asks first.
+    await dual.getByRole("button", { name: "Clear", exact: true }).nth(1).click();
+    await expect(count).not.toHaveText(before);
+    const after = (await count.textContent()) ?? "";
+    const innerKey = `${BOOK}:7:7:${UST}`;
+    await expect.poll(() => crashDraftCount(page, innerKey), { timeout: 5_000 }).toBe(1);
+
+    // Lock lands server-side only; the dual gate's Save is refused.
+    d1(
+      `INSERT INTO pipeline_jobs (job_id, user_id, pipeline_type, book, start_chapter, end_chapter, session_key, state) ` +
+        `VALUES ('${RANGE_JOB}', ${auth.userId}, 'generate', '${BOOK}', 7, 7, 's17-range-lock', 'running')`,
+    );
+    const refused = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(V6),
+    );
+    await dual.locator('button:has(svg[data-testid="CloseIcon"])').first().click();
+    const gate = page.getByRole("dialog").filter({ hasText: "Unsaved changes" });
+    await gate.getByRole("button", { name: "Save", exact: true }).click();
+    await page.getByRole("button", { name: "Save anyway", exact: true }).click();
+    expect((await refused).status()).toBe(409);
+
+    // The draft is back under the key the panel reads (v7), not the row's v6.
+    await expect.poll(() => crashDraftCount(page, innerKey), { timeout: 5_000 }).toBe(1);
+    expect(await crashDraftCount(page, `${BOOK}:7:6:${UST}`)).toBe(0);
+    await expect(page.getByText(/Your changes are kept in the aligner/)).toBeVisible();
+
+    // The lock clears; reopening shows the drags and they save with a 200.
+    clearLock();
+    await refreshPipelineJobs(page);
+    if (!(await sideBySide.isVisible())) {
+      await page.locator(`button[aria-label^="align ULT"]`).first().click();
+    }
+    await sideBySide.click();
+    await wordsLabel.waitFor({ state: "visible" });
+    await expect(count).toHaveText(after);
+    const patched = page.waitForResponse(
+      (r) => r.request().method() === "PATCH" && r.url().includes(V6),
+    );
+    await dual.locator('button:has(svg[data-testid="CloseIcon"])').first().click();
+    await gate.getByRole("button", { name: "Save", exact: true }).click();
+    await page.getByRole("button", { name: "Save anyway", exact: true }).click();
+    expect((await patched).status()).toBe(200);
+  } finally {
+    clearLock();
+    if (bridged) {
+      const cur = await get(V6);
+      const split = await context.request.post(`${V6}/split`, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+      });
+      expect(split.status(), await split.text()).toBe(200);
+    }
+    for (const [path, orig] of [
+      [V6, orig6],
+      [V7, orig7],
+    ] as const) {
+      const cur = await get(path);
+      if (cur.content_json === orig.content_json) continue;
+      const put = await context.request.patch(path, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+        data: {
+          content: JSON.parse(orig.content_json),
+          plain_text: orig.plain_text,
+          alignment_intent: "alignment_edit",
+        },
+      });
+      expect(put.status(), await put.text()).toBe(200);
+    }
+  }
+
+  await context.close();
+});
