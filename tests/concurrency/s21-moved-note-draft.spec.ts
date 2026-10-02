@@ -36,6 +36,29 @@ async function readRowDraft(page: Page, key: string) {
   }, key);
 }
 
+// Status + attempts of every queued op, for waiting until a failed attempt
+// has been recorded (the op is back to pending, not mid-request).
+async function outboxOps(page: Page) {
+  return page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((res, rej) => {
+      const req = indexedDB.open("bible-editor-outbox");
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    if (!db.objectStoreNames.contains("ops")) {
+      db.close();
+      return [];
+    }
+    const all = await new Promise<{ status: string; attempts: number }[]>((res, rej) => {
+      const req = db.transaction("ops").objectStore("ops").getAll();
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    db.close();
+    return all.map((o) => `${o.status}:${o.attempts}`);
+  });
+}
+
 async function outboxCount(page: Page) {
   return page.evaluate(async () => {
     const db = await new Promise<IDBDatabase>((res, rej) => {
@@ -175,7 +198,12 @@ test("a Save drained by a fresh tab still clears the saved draft", async ({ brow
   await tabA.keyboard.type(typed, { delay: 30 });
   await expect.poll(async () => (await readRowDraft(tabA, key))?.note ?? "").toContain(typed.trim());
   await saveNote(tabA, id);
-  await expect.poll(() => outboxCount(tabA)).toBe(1);
+  // Close tab A only once its failed attempt is recorded: closing it while
+  // the PATCH is in flight leaves an in_flight op that another tab will not
+  // re-arm until it is stale.
+  await expect
+    .poll(async () => (await outboxOps(tabA)).some((o) => o.startsWith("pending:") && !o.endsWith(":0")))
+    .toBe(true);
   await tabA.close();
 
   // Tab B never wrote this draft and does not show the note (another
