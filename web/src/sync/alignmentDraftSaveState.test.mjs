@@ -8,6 +8,7 @@ import {
   isAlignerPanelSaveOp,
   isAlignmentSaveOp,
   refusalMayReplaceDraft,
+  refusedDraftMayRehydrate,
   refusedSaveStillCurrent,
 } from "./alignmentDraftSaveState.ts";
 
@@ -191,3 +192,56 @@ assert.equal(alignmentPanelRowKey({ verse: 6, verse_end: 7 }), "6-7", "a bridge 
 assert.equal(alignmentPanelRowKey(null), "none");
 
 console.log("alignmentDraftSaveState: 35 passed");
+
+// #1077: may an already-open panel re-read the crash draft a refused save
+// just wrote? Its one-time hydration read ran before the refusal.
+{
+  const refused = { queuedAt: 10, seq: 3 };
+  const safe = {
+    panelClean: true,
+    panelHasPendingSave: false,
+    refused,
+    draftFrom: { queuedAt: 10, seq: 3 },
+    otherSaves: [],
+  };
+  assert.equal(
+    refusedDraftMayRehydrate(safe),
+    true,
+    "reopened before the 409: a clean panel with no save of its own re-reads the refusal's draft",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, otherSaves: [{ queuedAt: 8, seq: 1 }] }),
+    true,
+    "A ok then B refused: an earlier save that committed does not stop B's draft",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, otherSaves: [{ queuedAt: 12, seq: 4 }] }),
+    false,
+    "two queued saves, the older refused after the newer committed: the older save's draft is not restored",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, otherSaves: [{ queuedAt: 10, seq: 4 }] }),
+    false,
+    "same millisecond: a higher-seq save is newer",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, panelClean: false }),
+    false,
+    "a panel with unsaved drags keeps them",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, panelHasPendingSave: true }),
+    false,
+    "a panel with its own pending save decides from that save's result instead",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, draftFrom: undefined }),
+    false,
+    "a draft not written by a refusal is not this refusal's",
+  );
+  assert.equal(
+    refusedDraftMayRehydrate({ ...safe, draftFrom: { queuedAt: 12, seq: 4 } }),
+    false,
+    "a draft another refusal wrote is not this refusal's",
+  );
+}
