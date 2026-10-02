@@ -4884,6 +4884,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onHoldReadingBase={(bv, base) =>
             holdVerseBaseForEditor(verseKey(book, dualAlignerProps.chapter, base.verse, bv), base)
           }
+          // #1075: a bridge or split under unsaved work dropped it; say so.
+          onUnsavedDropped={(message) => pushPipelineToast(message, "error")}
         />
       )}
       <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>

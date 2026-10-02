@@ -1957,6 +1957,13 @@ export const api = {
       `/api/verses/${encodeURIComponent(book)}/${chapter}/${verse}/${encodeURIComponent(bibleVersion)}/history`,
     ),
 
+  // One verse row as the server holds it now (#1075: the dual reading line
+  // re-reads it after its queued save was discarded).
+  getVerse: (book: string, chapter: number, verse: number, bibleVersion: string) =>
+    request<VerseDto>(
+      `/api/verses/${encodeURIComponent(book)}/${chapter}/${verse}/${encodeURIComponent(bibleVersion)}`,
+    ),
+
   patchVerse: <T = unknown>(
     book: string,
     chapter: number,
