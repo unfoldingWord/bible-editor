@@ -283,6 +283,13 @@ interface Props {
   syncWarnings?: ReactNode;
 }
 
+// #1045: why a locked aligner's unsaved-changes gate offers no Save.
+function alignerLockReason(lock: "chapter" | "book"): string {
+  return lock === "book"
+    ? "This book is locked"
+    : "An AI run is updating this chapter";
+}
+
 export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, onCommentActivity, onCommentThreadsViewed, authReady = false, notificationsMenu, syncWarnings }: Props) {
   const bookViewportRestoreRef = useRef<BookViewportRestore | null>(null);
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
@@ -2639,6 +2646,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // in-memory alignment + reading dirtiness here plus unsaved drafts internally.
   useUnsavedGuard(alignmentDirty || dualDirty);
 
+  // #1045: a lock that lands while an aligner holds unsaved drags. Saving them
+  // then commits locally (baseline reset, crash draft cleared) and queues a
+  // PATCH the server refuses with 409 chapter_locked, which the outbox drops,
+  // so the drags are lost. While locked, the gates below leave out Save and
+  // the update reload skips its auto-save; the drags stay in the panel and its
+  // crash draft and can be saved once the lock lifts. handleSave itself is
+  // left alone on purpose (#943): refusing there would drop them silently.
+  const singleAlignerLocked =
+    panelMode === "alignment" && alignerTarget ? alignerLock(alignerTarget.chapter) : false;
+  // Only the alignment panels' drags: a dirty reading line keeps the dual
+  // gate's Save, which refuses out loud under a book lock (#1046, s18) and is
+  // rejected with a toast under a chapter lock (s9 check (b)).
+  const dualAlignmentLocked =
+    (dualLeftDirty || dualRightDirty) && dualTarget ? alignerLock(dualTarget.chapter) : false;
+
   // Save-aware reload for the "App update available" chip. A bare reload would
   // drop unsaved in-memory alignment drags (they only reach the durable outbox
   // on save). If the single alignment panel is dirty, save first, then wait for
@@ -2646,17 +2668,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // IndexedDB serializes AFTER the save's write, so its resolution means the op
   // is durably queued (it survives the reload and drains after) — before
   // tearing the page down. Text/note/row drafts already persist across reload;
-  // the beforeunload guard covers the other unload paths.
+  // the beforeunload guard covers the other unload paths. A locked aligner
+  // (#1045) reloads without saving: the beforeunload guard still asks, and the
+  // crash draft brings the drags back when the verse's aligner reopens.
   const reloadForUpdate = useCallback(() => {
     const reload = () => window.location.reload();
-    if (panelMode === "alignment" && alignmentDirty && alignmentPanelRef.current) {
+    if (
+      panelMode === "alignment" &&
+      alignmentDirty &&
+      !singleAlignerLocked &&
+      alignmentPanelRef.current
+    ) {
       alignmentPanelRef.current.save(() => {
         void outbox.list().then(reload);
       });
     } else {
       reload();
     }
-  }, [panelMode, alignmentDirty]);
+  }, [panelMode, alignmentDirty, singleAlignerLocked]);
   const requestDualAction = useCallback(
     (run: () => void) => {
       if (dualDirty) setPendingDualAction({ run });
@@ -4501,18 +4530,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <DialogTitle>Unsaved alignment changes</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            You have unsaved changes in the alignment editor. Save them before switching
-            verses, discard them, or cancel to stay here.
+            {singleAlignerLocked
+              ? `${alignerLockReason(singleAlignerLocked)}, so your alignment changes can't be saved right now. They are kept here: stay on this verse and save them once the lock lifts.`
+              : "You have unsaved changes in the alignment editor. Save them before switching verses, discard them, or cancel to stay here."}
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={dismissPendingNav}>Cancel</Button>
-          <Button color="error" onClick={() => resolvePendingNav("discard")}>
-            Discard
-          </Button>
-          <Button variant="contained" onClick={() => resolvePendingNav("save")}>
-            Save
-          </Button>
+          {/* #1045: no Save or Discard while locked; see singleAlignerLocked. */}
+          {singleAlignerLocked ? (
+            <Button variant="contained" onClick={dismissPendingNav}>
+              Keep editing
+            </Button>
+          ) : (
+            <>
+              <Button onClick={dismissPendingNav}>Cancel</Button>
+              <Button color="error" onClick={() => resolvePendingNav("discard")}>
+                Discard
+              </Button>
+              <Button variant="contained" onClick={() => resolvePendingNav("save")}>
+                Save
+              </Button>
+            </>
+          )}
         </DialogActions>
       </Dialog>
       {dualAlignerProps && (
@@ -4631,18 +4670,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <DialogTitle>Unsaved changes</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            You have unsaved changes in the side-by-side aligner (alignment edits or reading text).
-            Save them, discard them, or cancel to keep editing.
+            {dualAlignmentLocked
+              ? `${alignerLockReason(dualAlignmentLocked)}, so your alignment changes can't be saved right now. They are kept here: stay on this verse and save them once the lock lifts.`
+              : "You have unsaved changes in the side-by-side aligner (alignment edits or reading text). Save them, discard them, or cancel to keep editing."}
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setPendingDualAction(null)}>Cancel</Button>
-          <Button color="error" onClick={() => resolveDualAction("discard")}>
-            Discard
-          </Button>
-          <Button variant="contained" onClick={() => resolveDualAction("save")}>
-            Save
-          </Button>
+          {/* #1045: no Save or Discard while locked; see dualAlignmentLocked. */}
+          {dualAlignmentLocked ? (
+            <Button variant="contained" onClick={() => setPendingDualAction(null)}>
+              Keep editing
+            </Button>
+          ) : (
+            <>
+              <Button onClick={() => setPendingDualAction(null)}>Cancel</Button>
+              <Button color="error" onClick={() => resolveDualAction("discard")}>
+                Discard
+              </Button>
+              <Button variant="contained" onClick={() => resolveDualAction("save")}>
+                Save
+              </Button>
+            </>
+          )}
         </DialogActions>
       </Dialog>
       <Snackbar
