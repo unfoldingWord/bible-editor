@@ -2792,6 +2792,14 @@ function utf8Base64(s) {
   assert(list().sort().join() === "A,B,C", `unmerged renders accumulate; got ${list()}`);
   record("D", 400, 1);
   assert(JSON.stringify(list()) === '["D"]', `a confirmed render resets again`);
+  // The cap keeps the 10 NEWEST renders: a lagging master holds a recent one,
+  // so dropping recent shas while keeping old ones brings the false alarm back.
+  const more = "EFGHIJKLMNOP".split("");
+  more.forEach((s, i) => record(s, 500 + i * 100, 0));
+  assert(
+    JSON.stringify(list()) === JSON.stringify("GHIJKLMNOP".split("")),
+    `cap keeps the 10 newest renders, oldest first; got ${JSON.stringify(list())}`,
+  );
 }
 
 // --- isMasterConfirmed: the ONLY commitToDcs outcome that proves master
