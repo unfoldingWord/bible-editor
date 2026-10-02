@@ -634,9 +634,12 @@ export function SideBySideAligner({
               the verse number: a bridge or split by another editor moves the
               slot onto a different row, and an edit kept across that would
               save its text over the new row (#1067 review). The remount drops
-              the edit and releases its hold, as an unfocused resync used to. */}
+              the edit and releases its hold, as an unfocused resync used to.
+              Prefixed by version: the two lines are siblings and their rows
+              usually share a verse number, and duplicate keys leave a stale
+              line (and its hold) behind on a verse move. */}
           <ReadingLine
-            key={`${left.verse?.verse}-${left.verse?.verse_end}`}
+            key={`${left.bibleVersion}:${left.verse?.verse}-${left.verse?.verse_end}`}
             ref={left.readingRef}
             slot={left}
             onSave={onSaveReading}
@@ -648,7 +651,7 @@ export function SideBySideAligner({
             bodyHeight={readingHeight}
           />
           <ReadingLine
-            key={`${right.verse?.verse}-${right.verse?.verse_end}`}
+            key={`${right.bibleVersion}:${right.verse?.verse}-${right.verse?.verse_end}`}
             ref={right.readingRef}
             slot={right}
             onSave={onSaveReading}
