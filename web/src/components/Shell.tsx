@@ -98,7 +98,8 @@ import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
-import { isAlignerPanelSaveOp } from "../sync/alignmentDraftSaveState";
+import { alignmentDraftKey, isAlignerPanelSaveOp } from "../sync/alignmentDraftSaveState";
+import { onAlignerSaveRefused } from "../sync/alignmentDrafts";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { UnsavedToasts } from "./UnsavedToasts";
 import { QuoteBuilderPopper } from "./QuoteBuilderPopper";
@@ -1022,16 +1023,34 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     () =>
       onOutboxResult((op, result) => {
         if (result.kind === "locked") {
-          lockReloadRef.current ??= pipelineStore.reload().finally(() => {
-            lockReloadRef.current = null;
-          });
+          lockReloadRef.current ??= pipelineStore
+            .reload()
+            .catch(() => undefined)
+            .finally(() => {
+              lockReloadRef.current = null;
+            });
+          // An aligner save's toast waits for alignmentDrafts to say whether
+          // the drags were kept (onAlignerSaveRefused below).
+          if (isAlignerPanelSaveOp(op)) return;
           pushPipelineToast(
-            isAlignerPanelSaveOp(op)
-              ? "Alignment not saved — the AI run for this chapter is mid-flight. Your changes are kept in the aligner; save them after it finishes."
-              : "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+            "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }
+      }),
+    [pushPipelineToast],
+  );
+  // #1071: say "kept" only when a crash draft or an open panel actually holds
+  // the refused drags.
+  useEffect(
+    () =>
+      onAlignerSaveRefused((_op, kept) => {
+        pushPipelineToast(
+          kept
+            ? "Alignment not saved — the AI run for this chapter is mid-flight. Your changes are kept in the aligner; save them after it finishes."
+            : "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+          "error",
+        );
       }),
     [pushPipelineToast],
   );
@@ -2940,6 +2959,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // the save must not be queued (e.g. a book lock landed while the confirm
     // was open, #1046). The caller shows its own message.
     refuseCommit?: () => boolean,
+    // See outbox.ts's OutboxOp.alignmentDraftKey (#1071): the aligner panel's
+    // crash-draft key, which on a range row is not the PATCH's verse_start.
+    draftKey?: string,
   ): boolean => {
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
@@ -2975,7 +2997,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               bibleVersion,
               expectedVersion,
               { content, plain_text: plainText, alignment_intent: "confirmed_text_edit" },
-              { draftGeneration, alignmentDraftGeneration },
+              { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey },
             );
             onConfirmedApply?.();
           },
@@ -2999,7 +3021,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bibleVersion,
       expectedVersion,
       { content, plain_text: plainText, alignment_intent: intent },
-      { draftGeneration, alignmentDraftGeneration },
+      { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey },
     );
     return true;
   }, [book, pushPipelineToast]);
@@ -3082,6 +3104,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             undefined,
             undefined,
             draftGeneration,
+            undefined,
+            alignmentDraftKey(book, alignerTarget.chapter, alignerTarget.verse, alignerTarget.bibleVersion),
           );
         }
         // Optimistically fold the new alignment into the local chapter cache so
@@ -3202,6 +3226,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           undefined,
           undefined,
           draftGeneration,
+          undefined,
+          alignmentDraftKey(book, dualTarget.chapter, dualTarget.verse, bibleVersion),
         );
         // Optimistic local update so content-derived UI (the broken-alignment
         // link) refreshes immediately — same as the single-panel aligner.

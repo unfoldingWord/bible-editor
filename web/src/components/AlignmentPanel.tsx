@@ -55,10 +55,16 @@ import {
   type HoverCtx,
 } from "../lib/alignmentHover";
 import type { TwlRow, VerseDto } from "../sync/api";
-import { alignmentDrafts, alignmentDraftKey, mintAlignmentDraftGeneration } from "../sync/alignmentDrafts";
+import {
+  alignmentDrafts,
+  alignmentDraftKey,
+  mintAlignmentDraftGeneration,
+  noteRefusalKeptInPanel,
+  onRefusedDraftRestored,
+} from "../sync/alignmentDrafts";
 import { onOutboxResult } from "../sync/outbox";
 import { refusedSaveStillCurrent } from "../sync/alignmentDraftSaveState";
-import { isVersionOnlyRebase, lostAlignedWords } from "../lib/alignmentDelta";
+import { isVersionOnlyRebase, lostAlignedWords, sameVerseContent } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
 import {
@@ -326,7 +332,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           if (result.kind === "ok") pendingSaveRef.current = null;
           else if (result.kind === "locked") {
             pendingSaveRef.current = null;
-            if (refusedSaveStillCurrent(pending, verseRef.current)) setInitial(pending.baseline);
+            if (refusedSaveStillCurrent(pending, verseRef.current)) {
+              setInitial(pending.baseline);
+              noteRefusalKeptInPanel(pending.generation);
+            }
           }
         }),
       [],
@@ -341,6 +350,31 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         mountedRef.current = false;
       };
     }, []);
+    // #1071: a refused save's crash draft can land after this panel's own
+    // mount read found nothing (the aligner was reopened before the 409
+    // arrived). Re-read it then, while the panel is still clean, with the same
+    // version guard the mount read uses.
+    const initialRef = useRef(initial);
+    initialRef.current = initial;
+    const sourceVerseObjectsRef = useRef(sourceVerseObjects);
+    sourceVerseObjectsRef.current = sourceVerseObjects;
+    useEffect(() => {
+      const draftKey = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
+      return onRefusedDraftRestored((key) => {
+        if (key !== draftKey) return;
+        void alignmentDrafts.get(draftKey).then((rec) => {
+          const v = verseRef.current;
+          if (!mountedRef.current || !rec || !v || rec.expectedVersion !== v.version) return;
+          // Dirty: the user is editing (or a refusal already restored its
+          // baseline here); never restore over that.
+          if (stateRef.current !== initialRef.current) return;
+          const vo = (rec.content as { verseObjects?: unknown[] }).verseObjects;
+          if (!Array.isArray(vo)) return;
+          setState(parseAlignment(vo, sourceVerseObjectsRef.current));
+          setRestored(true);
+        });
+      });
+    }, [book, chapter, verseNum, bibleVersion]);
     const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
     const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
@@ -460,6 +494,17 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       lastSyncRef.current =
         verse != null ? { key: targetKey, content: verse.content, sourceContent: currentSourceContent } : null;
       hydrationTokenRef.current = null;
+      // #1071: a full reset to anything but the pending save's own optimistic
+      // content (a foreign change, or a refetch back to the server's copy)
+      // means the panel no longer shows that save, so a later refusal must
+      // not put its old baseline back. The refusal's crash draft, re-read via
+      // onRefusedDraftRestored, carries the drags instead.
+      if (
+        pendingSaveRef.current &&
+        !sameVerseContent(verse?.content, pendingSaveRef.current.savedContent)
+      ) {
+        pendingSaveRef.current = null;
+      }
 
       if (!computedInitial || !verse) return;
       // Attempt to restore a crash-saved alignment draft (Fix C — a browser
@@ -914,7 +959,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         const draftGeneration = lastDraftGenerationRef.current ?? mintAlignmentDraftGeneration();
         pendingSaveRef.current = {
           generation: draftGeneration,
-          baseline: initial,
+          // A save still waiting on the outbox keeps the older baseline: if
+          // both are refused, the panel goes back to what the server holds.
+          baseline: pendingSaveRef.current ? pendingSaveRef.current.baseline : initial,
           version: verse.version,
           savedContent: newContent,
           baseContent: verse.content,

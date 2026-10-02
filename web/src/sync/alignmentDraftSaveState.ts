@@ -15,6 +15,30 @@ export function isAlignmentSaveOp(op: Pick<OutboxOp, "target" | "patch">): boole
   return op.target.kind === "verse" && op.patch.alignment_intent === "alignment_edit";
 }
 
+// The crash-draft key the aligner panel uses (alignmentDrafts.ts re-exports
+// it): the verse the panel was opened on, which on a range row can sit inside
+// the row rather than at its verse_start.
+export function alignmentDraftKey(
+  book: string,
+  chapter: number,
+  verse: number,
+  bibleVersion: string,
+): string {
+  return `${book}:${chapter}:${verse}:${bibleVersion}`;
+}
+
+// #1071: the crash-draft key for an aligner save op. The op's target is keyed
+// by the row's verse_start (the PATCH needs it), so the panel's own key rides
+// along on the op; an op queued before that field existed falls back to its
+// target, which is right for every single-verse row.
+export function alignmentDraftKeyForOp(
+  op: Pick<OutboxOp, "target" | "alignmentDraftKey">,
+): string {
+  if (op.alignmentDraftKey) return op.alignmentDraftKey;
+  const t = op.target as { book: string; chapter: number; verse: number; bibleVersion: string };
+  return alignmentDraftKey(t.book, t.chapter, t.verse, t.bibleVersion);
+}
+
 // #1071: an alignment save the aligner panel itself queued. Its commit always
 // mints an alignmentDraftGeneration; the verse-history restore also sends
 // alignment_intent "alignment_edit" but carries none, and a refused restore

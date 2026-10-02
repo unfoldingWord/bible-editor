@@ -16,8 +16,10 @@
 
 import { openDB, type IDBPDatabase } from "idb";
 import { isReadOnly } from "./api";
-import { onOutboxResult, type VerseTarget } from "./outbox";
+import { onOutboxResult, type OutboxOp } from "./outbox";
 import {
+  alignmentDraftKey,
+  alignmentDraftKeyForOp,
   isAlignerPanelSaveOp,
   isAlignmentSaveOp,
   refusalMayReplaceDraft,
@@ -69,15 +71,35 @@ function db() {
   return dbp;
 }
 
-// Same key shape the outbox uses for a verse target, so the onOutboxResult
-// listener below can clear the matching draft off a landed save.
-export function alignmentDraftKey(
-  book: string,
-  chapter: number,
-  verse: number,
-  bibleVersion: string,
-): string {
-  return `${book}:${chapter}:${verse}:${bibleVersion}`;
+// The panel's draft key. Defined in alignmentDraftSaveState.ts (no IndexedDB
+// there, so it is unit-testable) and re-exported for existing callers.
+export { alignmentDraftKey };
+
+// #1071: a refused aligner save, once this module knows whether anything kept
+// its drags: the crash draft was written here, or an open panel put its
+// pre-save baseline back (noteRefusalKeptInPanel). Shell words its toast on
+// this, so it never says "kept" when nothing was.
+type RefusalListener = (op: OutboxOp, kept: boolean) => void;
+const refusalListeners = new Set<RefusalListener>();
+export function onAlignerSaveRefused(fn: RefusalListener): () => void {
+  refusalListeners.add(fn);
+  return () => refusalListeners.delete(fn);
+}
+const keptInPanel = new Set<string>();
+// Called by AlignmentPanel from inside the same outbox-result dispatch, so it
+// lands before the draft write below resolves.
+export function noteRefusalKeptInPanel(generation: string): void {
+  keptInPanel.add(generation);
+}
+
+// #1071: a refused save's draft was just written at `key`. An open, clean
+// panel on that key (the user reopened the aligner before the refusal
+// arrived, so its own read found nothing) re-reads it.
+type RestoredListener = (key: string) => void;
+const restoredListeners = new Set<RestoredListener>();
+export function onRefusedDraftRestored(fn: RestoredListener): () => void {
+  restoredListeners.add(fn);
+  return () => restoredListeners.delete(fn);
 }
 
 let generationSeq = 0;
@@ -148,12 +170,13 @@ export const alignmentDrafts = {
     content: unknown,
     expectedVersion: number,
     from: RefusedOpOrder,
-  ): Promise<void> {
-    if (isReadOnly()) return;
+  ): Promise<boolean> {
+    if (isReadOnly()) return false;
     const idb = await db();
     const tx = idb.transaction(STORE, "readwrite");
     const existing = (await tx.store.get(key)) as AlignmentDraftRecord | undefined;
-    if (refusalMayReplaceDraft(existing, from)) {
+    const write = refusalMayReplaceDraft(existing, from);
+    if (write) {
       const rec: AlignmentDraftRecord = {
         key,
         content,
@@ -165,6 +188,8 @@ export const alignmentDrafts = {
       await tx.store.put(rec);
     }
     await tx.done;
+    if (write) for (const l of restoredListeners) l(key);
+    return write;
   },
 
   // Mirrors drafts.ts's shape; `updatedAt` + `list` are the seam a future
@@ -194,16 +219,19 @@ export const alignmentDrafts = {
 onOutboxResult((op, result) => {
   if (result.kind !== "ok" && result.kind !== "locked") return;
   if (!isAlignmentSaveOp(op)) return;
-  const target = op.target as VerseTarget;
-  const key = alignmentDraftKey(target.book, target.chapter, target.verse, target.bibleVersion);
+  // The panel's own key, not the row's verse_start (a range row opened on an
+  // inner verse, #1071).
+  const key = alignmentDraftKeyForOp(op);
   if (result.kind === "locked") {
     if (isAlignerPanelSaveOp(op)) {
-      void alignmentDrafts.restoreRefused(
-        key,
-        op.patch.content,
-        op.expectedVersion,
-        refusedOpOrder(op),
-      );
+      const generation = op.alignmentDraftGeneration as string;
+      const settle = (written: boolean) => {
+        const kept = keptInPanel.delete(generation) || written;
+        for (const l of refusalListeners) l(op, kept);
+      };
+      alignmentDrafts
+        .restoreRefused(key, op.patch.content, op.expectedVersion, refusedOpOrder(op))
+        .then(settle, () => settle(false));
     }
     return;
   }

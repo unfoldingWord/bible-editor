@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import {
+  alignmentDraftKey,
+  alignmentDraftKeyForOp,
   isAlignerPanelSaveOp,
   isAlignmentSaveOp,
   refusalMayReplaceDraft,
@@ -120,4 +122,24 @@ assert.equal(
 );
 assert.equal(refusedSaveStillCurrent(pending, null), false, "no verse: do not restore");
 
-console.log("alignmentDraftSaveState: 16 passed");
+// #1071 re-review: the PATCH is keyed by the row's verse_start, the panel's
+// crash draft by the verse it was opened on. On a range row (UST 6-9, opened
+// on v7) those differ, so a refused save must use the key the op carries.
+assert.equal(
+  alignmentDraftKeyForOp(
+    op({
+      target: { kind: "verse", book: "ZEC", chapter: 7, verse: 6, bibleVersion: "UST" },
+      alignmentDraftKey: "ZEC:7:7:UST",
+    }),
+  ),
+  "ZEC:7:7:UST",
+  "a range-row save uses the panel's own draft key, not the row's verse_start",
+);
+assert.equal(
+  alignmentDraftKeyForOp(op()),
+  "ZEC:6:1:ULT",
+  "an op without one (queued before this field) falls back to its target",
+);
+assert.equal(alignmentDraftKey("ZEC", 7, 7, "UST"), "ZEC:7:7:UST", "the key format is unchanged");
+
+console.log("alignmentDraftSaveState: 19 passed");
