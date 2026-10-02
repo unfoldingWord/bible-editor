@@ -2,7 +2,8 @@
 // node --experimental-strip-types --no-warnings src/masterLineageLedger.test.mjs
 
 import { readLedgerMasterLineage } from "./masterLineageLedger.ts";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 
 let failed = 0;
 function ok(value, message) {
@@ -133,6 +134,75 @@ for (const [name, setup] of [
   ok(
     !result.usable && result.reason === "ledger_floor_moved",
     "a coverage floor raised between the poll read and the commit read is caught, not silently trusted",
+  );
+}
+
+// Issue #691: a PLAIN late push. A human commit authored AND committed before
+// the window opened, but pushed (first seen by the poller) after it, carries
+// an old committed_at, so a read bounded only by committed_at misses it. The
+// ledger's seen_at is arrival time, the closest thing to push time we have,
+// so the read must also admit a row first seen after the window opened.
+// Real schema (every migration), real SQL: the mock db above ignores WHERE.
+{
+  const sqlite = new DatabaseSync(":memory:");
+  const dir = new URL("../migrations/", import.meta.url);
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    sqlite.exec(readFileSync(new URL(f, dir), "utf8"));
+  }
+  const realDb = {
+    prepare(sql) {
+      return {
+        bind(...args) {
+          return {
+            async first() {
+              const r = sqlite.prepare(sql).all(...args);
+              return r.length ? r[0] : null;
+            },
+            async all() {
+              return { results: sqlite.prepare(sql).all(...args) };
+            },
+          };
+        },
+      };
+    },
+  };
+  const COVERAGE = 1_000_000; // first clean poll; its bootstrap rows carry seen_at = COVERAGE
+  const WINDOW = COVERAGE + 10 * 86400;
+  sqlite
+    .prepare(
+      `INSERT INTO dcs_repo_polls (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
+                                    last_status, gap_since_sha, gap_at, coverage_since)
+       VALUES ('en_ust', 'tip', ?, ?, ?, 'ok', NULL, NULL, ?)`,
+    )
+    .run(WINDOW + 7200, WINDOW + 7200, WINDOW + 7200, COVERAGE);
+  const insert = (sha, committedAt, seenAt, classification = "human") =>
+    sqlite
+      .prepare(
+        `INSERT INTO dcs_commits (repo, sha, parent_sha, author_name, author_email, committed_at, message,
+                                   classification, classification_reason, files_json, seen_at)
+         VALUES ('en_ust', ?, NULL, 'Editor', 'editor@example.org', ?, 'hand fix', ?, 'unrecognized', ?, ?)`,
+      )
+      .run(sha, committedAt, classification, files, seenAt);
+  // Bootstrap-era history: committed and first seen long before the window.
+  insert("bootstrap-old", COVERAGE - 86400, COVERAGE);
+  // Arrived before the window opened (old dates, seen before WINDOW).
+  insert("seen-before", WINDOW - 5 * 86400, WINDOW - 100);
+  // The plain late push: both dates a week before WINDOW, first seen after it.
+  insert("late-push", WINDOW - 7 * 86400, WINDOW + 3600);
+
+  const result = await readLedgerMasterLineage(realDb, "en_ust", "24-JER.usfm", WINDOW, "tip");
+  ok(result.usable, "a current, gap-free real-schema ledger is usable");
+  const shas = (result.lineage?.commits ?? []).map((c) => c.sha);
+  ok(shas.includes("late-push"), "a commit first seen after the window opened is admitted despite old dates (#691)");
+  ok(result.lineage?.hasHumanCommit === true, "...and flips the gate's verdict to human-found for that window");
+  ok(!shas.includes("seen-before") && !shas.includes("bootstrap-old"), "commits already seen before the window stay out");
+
+  // A window starting exactly at the coverage floor must not pull in the
+  // whole bootstrap batch, whose seen_at equals that floor.
+  const atFloor = await readLedgerMasterLineage(realDb, "en_ust", "24-JER.usfm", COVERAGE, "tip");
+  ok(
+    atFloor.usable && !(atFloor.lineage?.commits ?? []).some((c) => c.sha === "bootstrap-old"),
+    "bootstrap rows seen AT the window start are not treated as late arrivals",
   );
 }
 
