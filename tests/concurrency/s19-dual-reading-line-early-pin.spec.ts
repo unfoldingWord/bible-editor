@@ -336,6 +336,113 @@ test("a reading line with unsaved text that lost focus keeps it when another edi
   }
 });
 
+// #1067 review: the line is not tied to one row. A bridge (or split) by
+// another editor maps the slot onto a different row; an edit kept across that
+// would be saved onto the new row with that row's fresh version (200), and the
+// v7-only text would replace the whole 6-7 row, deleting verse 6. A change of
+// row drops the line's edit and its pin instead.
+test("a dirty reading line whose verse is bridged into another row by another editor never saves its text onto the bridged row", async ({
+  browser,
+}) => {
+  test.setTimeout(90_000);
+  const { context } = await newUserContext(browser, "deferredreward");
+  const csrf = await csrfToken(context.request);
+  const page = await context.newPage();
+  const UST = "UST";
+  const V6 = `/api/verses/${BOOK}/7/6/${UST}`;
+  const V7 = `/api/verses/${BOOK}/7/7/${UST}`;
+  const get = async (path: string) => {
+    const res = await context.request.get(path);
+    expect(res.ok()).toBe(true);
+    return (await res.json()) as VerseRow & { verse_end: number | null };
+  };
+  const orig6 = await get(V6);
+  const orig7 = await get(V7);
+  expect(orig6.verse_end).toBeNull();
+  const stamp = Date.now();
+  const key = (v: number) => `verse:${BOOK}:7:${v}:${UST}`;
+  const peek = (k: string) =>
+    page.evaluate((kk) => (window as unknown as PinDebugWindow).__bePinDebug?.peek(kk)?.version, k);
+  const current = (k: string) =>
+    page.evaluate((kk) => (window as unknown as PinDebugWindow).__bePinDebug?.currentVersion(kk), k);
+  let bridged = false;
+
+  try {
+    const o = await openDual(page, { chapter: 7, verse: 7 });
+    const lineBox = o.dialog
+      .locator("div:has(> [contenteditable])")
+      .filter({ hasText: `${UST} · reading text` });
+    const line = lineBox.locator("[contenteditable]");
+    const save = lineBox.getByRole("button", { name: `Save ${UST}`, exact: true });
+    await expect(line).toContainText("former prophets");
+
+    await typeAtEnd(page, line, ` EDIT-${stamp}`);
+    expect(await peek(key(7))).toBe(orig7.version);
+    // Off the line, still dirty.
+    await o.dialog.getByText(`${UST} words`, { exact: true }).first().click();
+    await expect(line).not.toBeFocused();
+    await expect(save).toBeEnabled();
+
+    // Another editor bridges 6+7 into one row.
+    const res = await context.request.post(`${V6}/bridge`, {
+      headers: { "x-csrf-token": csrf },
+      data: { start_version: orig6.version, next_version: orig7.version },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    bridged = true;
+    const bridgedVersion = ((await res.json()) as { verse: { version: number } }).verse.version;
+    await expect.poll(() => current(key(6))).toBe(bridgedVersion);
+
+    // Whatever the line shows now, a Save (if it offers one) must not put the
+    // v7-only text over the bridged row.
+    if (await save.isEnabled()) {
+      // Dropping verse 6's aligned words asks first; answer it if it comes.
+      const confirm = page.getByRole("dialog").filter({ hasText: "will be unaligned" });
+      let sent = false;
+      const patched = page
+        .waitForResponse((r) => r.request().method() === "PATCH" && r.url().includes(V6), { timeout: 15_000 })
+        .then((r) => {
+          sent = true;
+          return r;
+        });
+      await save.click();
+      await expect.poll(async () => sent || (await confirm.isVisible()), { timeout: 10_000 }).toBe(true);
+      if (!sent) await confirm.getByRole("button", { name: "Save anyway" }).click();
+      await patched;
+    }
+    const after6 = await get(V6);
+    expect(after6.verse_end).toBe(7);
+    expect(after6.plain_text).toContain("feasted");
+    expect(after6.plain_text).not.toContain(`EDIT-${stamp}`);
+
+    // The line shows the bridged row, clean, and the v7 pin is gone.
+    await expect(line).toContainText("feasted");
+    await expect(line).not.toContainText(`EDIT-${stamp}`);
+    await expect(save).toBeDisabled();
+    await expect.poll(() => peek(key(7))).toBeUndefined();
+  } finally {
+    if (bridged) {
+      const cur = await get(V6);
+      const split = await context.request.post(`${V6}/split`, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+      });
+      expect(split.status(), await split.text()).toBe(200);
+    }
+    for (const [path, orig] of [
+      [V6, orig6],
+      [V7, orig7],
+    ] as const) {
+      const cur = await get(path);
+      const put = await context.request.patch(path, {
+        headers: { "x-csrf-token": csrf, "If-Match": String(cur.version) },
+        data: { content: JSON.parse(orig.content_json), plain_text: orig.plain_text },
+      });
+      expect(put.status(), await put.text()).toBe(200);
+    }
+    await context.close();
+  }
+});
+
 // Review round 1: this tab's own writes must not 409 the translator. The hold
 // detects OTHER editors' changes; a save of this tab's that lands while the
 // line is dirty moves the held base forward instead.
@@ -485,6 +592,8 @@ test("a no-op Save after another editor moved the verse queues nothing and leaks
     await expect(o.undo).toBeDisabled();
     await expect.poll(() => pinnedVersion(page)).toBeUndefined();
     expect(writes).toEqual([]);
+    // Clean now, so it shows the server's text, not the stale base (#1067 review).
+    await expect(o.line).toContainText(`[s19-noop-${stamp}]`);
   } finally {
     await putVerse(context.request, csrf, JSON.parse(original.content_json), original.plain_text);
     await context.close();
