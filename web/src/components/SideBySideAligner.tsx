@@ -6,6 +6,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -24,6 +25,8 @@ import type { VerseBaseHold } from "../sync/versePin";
 import { alignmentPanelRowKey } from "../sync/alignmentDraftSaveState";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { extractEditableText, normalizeEditable } from "../lib/usfm";
+import { formatVerseLabel } from "../lib/verseRange";
+import { droppedEditNotice, type DualSideRow } from "../lib/dualRowChange";
 
 // Separate key from the single-panel aligner's `be:alignmentHoverLink`
 // (which defaults OFF). The side-by-side popup's whole point is the
@@ -250,6 +253,10 @@ interface Props {
   // column verse markers, so translators can stamp "done" without leaving
   // the dual aligner (check sits next to the verse chip + next-arrow).
   textCheck?: TextLaneCheck;
+  // #1075: a bridge or split by another editor moved a side onto a different
+  // row while it held unsaved reading text or alignment drags, and the
+  // remount dropped them. Shell shows `message` as a toast.
+  onUnsavedDropped?: (message: string) => void;
 }
 
 // Text-lane checkoff for the dual-aligner titlebar — same 18×18 cell as the
@@ -352,6 +359,7 @@ export function SideBySideAligner({
   onSaveDoneAndNext,
   textCheck,
   locked = false,
+  onUnsavedDropped,
 }: Props) {
   const [hover, setHover] = useState<HoverHighlight>(null);
   const [hoverLink, setHoverLink] = useState<boolean>(readHoverLink);
@@ -367,6 +375,39 @@ export function SideBySideAligner({
   // by a same-side text edit. (Still forwards the upstream onDirtyChange.)
   const [leftDirty, setLeftDirty] = useState(false);
   const [rightDirty, setRightDirty] = useState(false);
+  // #1075: what each side holds unsaved, as last reported by its line and
+  // panel, and the row each side stood on at the last commit. A bridge or
+  // split moves a side onto another row and remounts both (see their keys),
+  // dropping that work; the layout effect below runs before the remounted
+  // children's passive effects report "clean", so these still hold what the
+  // old row had.
+  const unsavedRef = useRef({
+    left: { reading: false, panel: false },
+    right: { reading: false, panel: false },
+  });
+  const sideRowRef = useRef<{ left?: DualSideRow; right?: DualSideRow }>({});
+  const leftRowKey = alignmentPanelRowKey(left.verse);
+  const rightRowKey = alignmentPanelRowKey(right.verse);
+  useLayoutEffect(() => {
+    const notices: string[] = [];
+    for (const [side, slot, rowKey] of [
+      ["left", left, leftRowKey],
+      ["right", right, rightRowKey],
+    ] as const) {
+      const cur: DualSideRow = {
+        chapter,
+        verseNum,
+        rowKey,
+        label: slot.verse ? formatVerseLabel(slot.verse) : null,
+      };
+      const notice = droppedEditNotice(book, slot.bibleVersion, sideRowRef.current[side], cur, unsavedRef.current[side]);
+      if (notice) notices.push(notice);
+      sideRowRef.current[side] = cur;
+    }
+    // One toast slot: a bridge that hit both sides says both.
+    if (notices.length > 0) onUnsavedDropped?.(notices.join(" "));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [book, chapter, verseNum, leftRowKey, rightRowKey]);
   // Drag-resizable height for the reading (English) band, persisted per browser.
   // See StripResizeHandle / clampStripHeight above.
   const [readingHeight, setReadingHeight] = useState(() =>
@@ -426,7 +467,12 @@ export function SideBySideAligner({
     [left.panelRef, right.panelRef],
   );
 
-  const renderPanel = (slot: PanelSlot, setLocalDirty: (dirty: boolean) => void) => (
+  const readingDirtyChange = (side: "left" | "right", slot: PanelSlot) => (dirty: boolean) => {
+    unsavedRef.current[side].reading = dirty;
+    slot.onReadingDirtyChange(dirty);
+  };
+
+  const renderPanel = (side: "left" | "right", slot: PanelSlot, setLocalDirty: (dirty: boolean) => void) => (
     <AlignmentPanel
       // Remount on verse change so the panel's internal state is seeded fresh
       // (useState(computedInitial)) instead of carrying the previous verse's
@@ -452,6 +498,7 @@ export function SideBySideAligner({
       onCancel={onClose}
       hideCancel
       onDirtyChange={(dirty) => {
+        unsavedRef.current[side].panel = dirty;
         setLocalDirty(dirty);
         slot.onDirtyChange(dirty);
       }}
@@ -642,26 +689,28 @@ export function SideBySideAligner({
               the edit and releases its hold, as an unfocused resync used to.
               Prefixed by version: the two lines are siblings and their rows
               usually share a verse number, and duplicate keys leave a stale
-              line (and its hold) behind on a verse move. */}
+              line (and its hold) behind on a verse move. The row key is the
+              panel's, so the line and the panel remount together and the
+              drop notice above sees one change (#1075). */}
           <ReadingLine
-            key={`${left.bibleVersion}:${left.verse?.verse}-${left.verse?.verse_end}`}
+            key={`${left.bibleVersion}:${leftRowKey}`}
             ref={left.readingRef}
             slot={left}
             onSave={onSaveReading}
             onHoldBase={onHoldReadingBase}
-            onDirtyChange={left.onReadingDirtyChange}
+            onDirtyChange={readingDirtyChange("left", left)}
             locked={leftDirty}
             chapterLocked={!!locked}
             bookLocked={locked === "book"}
             bodyHeight={readingHeight}
           />
           <ReadingLine
-            key={`${right.bibleVersion}:${right.verse?.verse}-${right.verse?.verse_end}`}
+            key={`${right.bibleVersion}:${rightRowKey}`}
             ref={right.readingRef}
             slot={right}
             onSave={onSaveReading}
             onHoldBase={onHoldReadingBase}
-            onDirtyChange={right.onReadingDirtyChange}
+            onDirtyChange={readingDirtyChange("right", right)}
             locked={rightDirty}
             chapterLocked={!!locked}
             bookLocked={locked === "book"}
@@ -705,7 +754,7 @@ export function SideBySideAligner({
               overflow: "hidden",
             }}
           >
-            {renderPanel(left, setLeftDirty)}
+            {renderPanel("left", left, setLeftDirty)}
           </Box>
           <Box
             sx={{
@@ -716,7 +765,7 @@ export function SideBySideAligner({
               overflow: "hidden",
             }}
           >
-            {renderPanel(right, setRightDirty)}
+            {renderPanel("right", right, setRightDirty)}
           </Box>
         </Box>
       </Box>
@@ -891,6 +940,8 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
 ) {
   const readOnly = locked || bookLocked;
   const { bibleVersion, verse } = slot;
+  // Mirrors `dirty` for the blur handler, which may run before a re-render.
+  const dirtyRef = useRef(false);
   const editable = useMemo(() => (verse ? extractEditableText(verse.content) : ""), [verse]);
   const elRef = useRef<HTMLDivElement | null>(null);
   const lastSetRef = useRef<string | null>(null);
@@ -923,6 +974,7 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
       if (endHold === "handOff") hold.handOff();
       else hold.release();
     }
+    dirtyRef.current = next;
     setDirty(next);
     onDirtyChange(next);
     if (!next) syncShownVerse();
@@ -1104,6 +1156,19 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
               ? "save or cancel the pending alignment edits before editing the reading text"
               : undefined
           }
+          // The resync skipped under the caret runs once the caret leaves, for
+          // a line with nothing unsaved (#1075 review): otherwise the box
+          // keeps text the server no longer has (a discarded save, another
+          // editor's change) while reading as clean, and its next edit pins
+          // the old version. A dirty line keeps its edit (#1067).
+          onBlur={(e) => {
+            const el = e.currentTarget as HTMLDivElement;
+            if (dirtyRef.current) return;
+            if (normalizeEditable(el.textContent ?? "") === normalizeEditable(editable)) return;
+            el.textContent = editable;
+            lastSetRef.current = editable;
+            markDirty(false);
+          }}
           onInput={(e) => {
             const value = (e.currentTarget as HTMLDivElement).textContent ?? "";
             lastSetRef.current = value;
