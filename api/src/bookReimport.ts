@@ -7730,14 +7730,21 @@ async function applyVerseRows(
       // the way joinVerseContentJson joins them (a space between pieces, which
       // both visible axes ignore). A null join (an off-shape piece) is passed as
       // null, which the classifier reads as every axis changed: fail-closed.
-      const split = anchorByKey.get(structureKey(a.v.chapter, a.v.verse));
-      const after = split?.kind === "split"
-        ? joinVerseContentJson([a.v.contentJson, ...split.recreated.map((m) => m.contentJson)])
+      // Issue #1086, the mirror: for a bridge anchor, `beforeContentJson` is
+      // only D1's anchor verse while `a.v.contentJson` is master's whole bridge,
+      // so the before side is the anchor joined with the rows the bridge absorbs
+      // (read by the same `existing` SELECT), with the same null fail-closed.
+      const ad = anchorByKey.get(structureKey(a.v.chapter, a.v.verse));
+      const before = ad?.kind === "bridge"
+        ? joinVerseContentJson([a.beforeContentJson, ...ad.absorbed.map((r) => r.content_json)])
+        : a.beforeContentJson;
+      const after = ad?.kind === "split"
+        ? joinVerseContentJson([a.v.contentJson, ...ad.recreated.map((m) => m.contentJson)])
         : a.v.contentJson;
       const refined = refineAdoptConflictForVisibleChange(
         "adopt_conflict",
         a.merge.reason,
-        a.beforeContentJson,
+        before,
         after,
       );
       mc.action = refined.action;
