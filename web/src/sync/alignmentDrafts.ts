@@ -83,7 +83,10 @@ export { alignmentDraftKey };
 // its drags: a crash draft holds them (written here, or one already there),
 // or an open panel put its pre-save baseline back (noteRefusalKeptInPanel).
 // Shell words its toast on this, so it never says "kept" when nothing was.
-type RefusalListener = (op: OutboxOp, kept: boolean) => void;
+// `heldInDraft`: a crash draft at the key holds the drags. False with `kept`
+// true means only the open panel's memory holds them (#1073: Shell must not
+// then reset that panel by rolling the cache back).
+type RefusalListener = (op: OutboxOp, kept: boolean, heldInDraft: boolean) => void;
 const refusalListeners = new Set<RefusalListener>();
 export function onAlignerSaveRefused(fn: RefusalListener): () => void {
   refusalListeners.add(fn);
@@ -226,7 +229,7 @@ onOutboxResult((op, result) => {
       const generation = op.alignmentDraftGeneration as string;
       const settle = (heldInDraft: boolean) => {
         const kept = keptInPanel.delete(generation) || heldInDraft;
-        for (const l of refusalListeners) l(op, kept);
+        for (const l of refusalListeners) l(op, kept, heldInDraft);
       };
       alignmentDrafts
         .restoreRefused(key, op.patch.content, op.expectedVersion, refusedOpOrder(op), op.alignmentDraftRow)
