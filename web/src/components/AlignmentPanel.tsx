@@ -288,6 +288,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     const lastSyncRef = useRef<{ key: string; content: unknown; sourceContent: unknown } | null>(
       null,
     );
+    // The crash-draft read the last full reset started; see guard (3) in the
+    // reset effect below.
+    const hydrationTokenRef = useRef<object | null>(null);
     // The generation (see alignmentDrafts.ts) of the most recently PERSISTED
     // crash-draft for the CURRENT dirty session, or undefined if nothing has
     // been persisted yet (e.g. Save fires before the 400ms debounce below
@@ -438,6 +441,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       lastDraftGenerationRef.current = undefined;
       lastSyncRef.current =
         verse != null ? { key: targetKey, content: verse.content, sourceContent: currentSourceContent } : null;
+      hydrationTokenRef.current = null;
 
       if (!computedInitial || !verse) return;
       // Attempt to restore a crash-saved alignment draft (Fix C — a browser
@@ -452,15 +456,19 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       // content change per the isRebase gate above, so that's the correct
       // call here); (2) the user must not have started editing in the
       // async-read window (stateRef still === computedInitial) so a restore
-      // never overwrites a fresh drag; (3) the `cancelled` flag drops a
-      // resolution whose verse changed again. `initial` stays computedInitial
-      // so the restored state reads as dirty (state !== initial) and can be
-      // saved or reset.
+      // never overwrites a fresh drag; (3) the token drops a resolution whose
+      // verse changed again. `initial` stays computedInitial so the restored
+      // state reads as dirty (state !== initial) and can be saved or reset.
+      // (3) is a token that only the next FULL reset replaces, not an effect
+      // cleanup (#1071): React StrictMode replays this effect on mount, and
+      // the replay takes the rebase path above, so a cleanup flag cancelled
+      // every mount's read and a crash draft was never restored in dev.
       const draftKey = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
       const baseVersion = verse.version;
-      let cancelled = false;
+      const token = {};
+      hydrationTokenRef.current = token;
       void alignmentDrafts.get(draftKey).then((rec) => {
-        if (cancelled || !rec) return;
+        if (hydrationTokenRef.current !== token || !rec) return;
         if (rec.expectedVersion !== baseVersion) {
           void alignmentDrafts.clear(draftKey);
           return;
@@ -473,9 +481,6 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         setState(parseAlignment(vo, sourceVerseObjects));
         setRestored(true);
       });
-      return () => {
-        cancelled = true;
-      };
       // `initial` excluded deliberately: it's only ever set by this same effect
       // (setInitial above), and it's read here only to detect an in-progress
       // drag (stateRef.current === initial) at the moment this effect fires.
