@@ -369,9 +369,14 @@ export function buildMergeConflictGuidance(
   // has no `@v` in its ref (buildGroupedRefsClause). `overwrittenVersion` is
   // required (not optional) precisely so every caller must say which case a
   // row is, rather than one being silently assumed.
+  // Loose `!= null` / `== null` (not `!==` / `===`) matches buildGroupedRefsClause's
+  // own `!= null` check and the editor fan-out's `.filter` above — an untyped
+  // .mjs caller that omits the field entirely gets the same "no @v" treatment
+  // a row explicitly carrying `null` gets, rather than silently reading as an
+  // overwrite it cannot point a `@v` at.
   const adoptConflictRows = rows.filter((r) => r.action === "adopt_conflict");
-  const overwrittenRows = adoptConflictRows.filter((r) => r.overwrittenVersion !== null);
-  const noOverwriteRows = adoptConflictRows.filter((r) => r.overwrittenVersion === null);
+  const overwrittenRows = adoptConflictRows.filter((r) => r.overwrittenVersion != null);
+  const noOverwriteRows = adoptConflictRows.filter((r) => r.overwrittenVersion == null);
   const overwritten = overwrittenRows.length;
   const noOverwrite = noOverwriteRows.length;
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
@@ -407,15 +412,20 @@ export function buildMergeConflictGuidance(
     // ARRIVING bytes differed from D1 by more than Hebrew mark order (#977
     // already drops the mark-order-only case before this point) — so the
     // final bytes matching D1 is never "Door43 already matched D1"; it is
-    // canonizeAlignmentSource folding Door43's \zaln-s source-attribute fix
-    // onto D1's own (possibly stale) bytes. No app text was replaced, but
-    // Door43's fix was not carried into D1 either, so it reads the same as
-    // 'source_attr_divergent' below rather than as a clean no-op.
+    // canonizeAlignmentSource (canonizeHebrew.ts) mapping master's \zaln-s
+    // content/lemma onto D1's bytes. That mapping also matches through looser
+    // tiers (stripped marks, word-joiner fold), so master's incoming copy
+    // could be the WORSE one (under-pointed, cantillation-stripped, an older
+    // UHB alignment) — unlike 'source_attr_divergent' below, this is never
+    // framed as "Door43's fix" or D1's bytes as "stale"; only that the two
+    // copies differ on \zaln-s content/lemma and a human has to say which
+    // side is right.
     noOverwrite > 0
-      ? `${noOverwrite} ${noOverwrite === 1 ? "was" : "were"} flagged for review, but no app text was replaced — ` +
-        `Door43 changed this verse's original-language source attributes (spelling/pointing/morphology on ` +
-        `\\zaln-s), and that fix was folded onto D1's own bytes rather than carried into D1, so tonight's export ` +
-        `may still write D1's stale source attributes back over Door43's fix unless someone checks it by hand.`
+      ? `${noOverwrite} ${noOverwrite === 1 ? "was" : "were"} flagged for review but no app text was replaced — ` +
+        `for ${noOverwrite === 1 ? "the ref above with no @v" : "each ref above with no @v"}, Door43's copy ` +
+        `differs from the app's only in the original-language source attributes on \\zaln-s (x-content / ` +
+        `x-lemma); check which side is right before the next export, because the export will write the app's ` +
+        `attributes over Door43's.`
       : "",
     keptAlignment > 0
       ? `${keptAlignment} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +
