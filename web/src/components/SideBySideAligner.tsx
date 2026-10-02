@@ -630,7 +630,16 @@ export function SideBySideAligner({
             flexShrink: 0,
           }}
         >
+          {/* Keyed by the ROW the line edits (start verse + bridge end), not
+              the verse number: a bridge or split by another editor moves the
+              slot onto a different row, and an edit kept across that would
+              save its text over the new row (#1067 review). The remount drops
+              the edit and releases its hold, as an unfocused resync used to.
+              Prefixed by version: the two lines are siblings and their rows
+              usually share a verse number, and duplicate keys leave a stale
+              line (and its hold) behind on a verse move. */}
           <ReadingLine
+            key={`${left.bibleVersion}:${left.verse?.verse}-${left.verse?.verse_end}`}
             ref={left.readingRef}
             slot={left}
             onSave={onSaveReading}
@@ -642,6 +651,7 @@ export function SideBySideAligner({
             bodyHeight={readingHeight}
           />
           <ReadingLine
+            key={`${right.bibleVersion}:${right.verse?.verse}-${right.verse?.verse_end}`}
             ref={right.readingRef}
             slot={right}
             onSave={onSaveReading}
@@ -878,7 +888,6 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   const { bibleVersion, verse } = slot;
   const editable = useMemo(() => (verse ? extractEditableText(verse.content) : ""), [verse]);
   const elRef = useRef<HTMLDivElement | null>(null);
-  const lastTextRef = useRef("");
   const lastSetRef = useRef<string | null>(null);
   // Enables Save/Undo only when the DOM text actually differs from the saved
   // baseline — normalized so editor-emitted trailing whitespace doesn't arm the
@@ -933,23 +942,24 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
   useEffect(() => {
     const el = elRef.current;
     if (!el) return;
-    // Never resync under the user's caret: onInput updates lastTextRef, so the
-    // tracker can't distinguish "user typed" from "still showing what we set" —
-    // a refetch echo (e.g. the other panel's save landing) would overwrite
-    // mid-edit text and drop the caret to the start. Focus is the mid-edit
-    // signal (DocColumn's VerseSpan uses its draft for the same purpose).
+    // Never resync under the user's caret: a refetch echo (e.g. the other
+    // panel's save landing) would drop the caret to the start.
     if (document.activeElement === el) return;
-    const dom = el.textContent ?? "";
-    if (lastSetRef.current === null || dom === lastTextRef.current) {
+    // Nor over unsaved text, focused or not (#1067): a line that merely lost
+    // focus (the translator clicked into the alignment panel) keeps its edit.
+    // Its hold still pins the version the edit was made against, so a newer
+    // server version makes Save a 409 and a merge prompt instead.
+    if (lastSetRef.current === null || !dirty) {
+      const dom = el.textContent ?? "";
       // Skip the DOM write when the content already matches — after an edit that
       // round-trips identically, replacing the text node would needlessly
       // repaint (flash) the line and drop the caret.
       if (dom !== editable) el.textContent = editable;
       lastSetRef.current = editable;
     }
-    lastTextRef.current = editable;
-    // Baseline moved (a Save landed, or a verse nav swapped the verse): the
-    // line now matches saved text, so it's no longer dirty.
+    // Baseline moved (a Save landed, or a verse nav swapped the verse): a
+    // resynced line matches saved text, so it's no longer dirty. A kept edit
+    // stays dirty unless the verse moved onto that same text.
     markDirty(normalizeEditable(el.textContent ?? "") !== normalizeEditable(editable));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editable]);
@@ -978,6 +988,13 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
       return;
     }
     onSave(bibleVersion, el.textContent ?? "", verse, (outcome) => {
+      // A no-op is text back at the held base while the verse moved on (a
+      // dirty line is never resynced, #1067): show the server's text, or the
+      // now-clean line would sit on the stale base until the next change.
+      if (outcome?.queued === false) {
+        el.textContent = editable;
+        lastSetRef.current = editable;
+      }
       // A queued edit's save owns the pin now and its outbox exit releases it;
       // a no-op queued nothing, so the hold ends as a clean line's does (#1060).
       markDirty(false, outcome?.queued === false ? "release" : "handOff");
@@ -989,7 +1006,6 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
     const el = elRef.current;
     if (!el) return;
     el.textContent = editable;
-    lastTextRef.current = editable;
     lastSetRef.current = editable;
     markDirty(false);
   };
@@ -1085,7 +1101,6 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
           }
           onInput={(e) => {
             const value = (e.currentTarget as HTMLDivElement).textContent ?? "";
-            lastTextRef.current = value;
             lastSetRef.current = value;
             markDirty(normalizeEditable(value) !== normalizeEditable(editable));
           }}
