@@ -99,7 +99,7 @@ import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult, type OutboxOp } from "../sync/outbox";
 import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
-import { planRefusedVerseRollback } from "../sync/refusedVerseRollback";
+import { planRefusedVerseRollback, siblingStillDraining } from "../sync/refusedVerseRollback";
 import {
   alignmentDraftKey,
   alignmentDraftKeyForOp,
@@ -1046,7 +1046,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     try {
       const key = outboxTargetKey(t);
       const queuedForTarget = async () =>
-        (await outbox.list()).some((o) => o.id !== op.id && outboxTargetKey(o.target) === key);
+        siblingStillDraining(
+          (await outbox.list()).map((o) => ({ id: o.id, status: o.status, targetKey: outboxTargetKey(o.target) })),
+          op.id,
+          key,
+        );
       if (await queuedForTarget()) return;
       // The rows the refusal left in each cache. A row that is not still these
       // when the GET lands (the verse was saved or edited again meanwhile) is
@@ -1064,16 +1068,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       const chapterBefore = chapterRow();
       const bookBefore = bookRow();
       const fetchKey = `${t.book}:${t.chapter}`;
-      let fetching = rollbackFetchRef.current.get(fetchKey);
-      if (!fetching) {
-        fetching = api.getChapter(t.book, t.chapter);
-        rollbackFetchRef.current.set(fetchKey, fetching);
-        const forget = () => {
-          rollbackFetchRef.current.delete(fetchKey);
-        };
-        fetching.then(forget, forget);
+      const fetchChapter = () => {
+        let fetching = rollbackFetchRef.current.get(fetchKey);
+        if (!fetching) {
+          fetching = api.getChapter(t.book, t.chapter);
+          rollbackFetchRef.current.set(fetchKey, fetching);
+          const forget = () => {
+            rollbackFetchRef.current.delete(fetchKey);
+          };
+          fetching.then(forget, forget);
+        }
+        return fetching;
+      };
+      // One retry after a short wait for a transient failure; the guards
+      // below run on whichever response lands. A second failure gives up
+      // (the outer catch) and the next chapter refetch catches up.
+      let server: ChapterPayload;
+      try {
+        server = await fetchChapter();
+      } catch {
+        await new Promise((r) => setTimeout(r, 2000));
+        server = await fetchChapter();
       }
-      const server = await fetching;
       const stillQueuedForTarget = await queuedForTarget();
       const serverRow = server.verses[t.bibleVersion]?.[t.verse];
       const apply = (

@@ -9,6 +9,21 @@
 // refusedVerseRollback.test.mjs.
 
 import type { VerseDto } from "./api";
+import type { OpStatus } from "./outbox";
+
+// Whether another save of the same verse will still drain on its own and so
+// settle the cache itself: pending (including retrying in backoff) or in
+// flight. A conflict waiting on the user, or a failed op, is terminal until a
+// person acts, so it must not hold the rollback off forever.
+export function siblingStillDraining(
+  ops: ReadonlyArray<{ id: string; status: OpStatus; targetKey: string }>,
+  refusedId: string,
+  key: string,
+): boolean {
+  return ops.some(
+    (o) => o.id !== refusedId && o.targetKey === key && (o.status === "pending" || o.status === "in_flight"),
+  );
+}
 
 export type VerseRollback =
   // Nothing to put back: another save of the verse is still queued (its own
