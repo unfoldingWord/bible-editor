@@ -1520,34 +1520,39 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // the failure mode this file's `export_revert_persistence` plumbing
       // exists to avoid.
       //
-      // Known residual gap: this closes the window between the freshness
-      // gate and commitToDcs, not the one between THIS check and the report
-      // being recorded a few lines below — a commit landing in that second,
-      // much narrower window is still invisible. Accepted for now; closing
-      // it would mean re-resolving the head yet again right before the
-      // report, for a gap on the order of a few D1 reads wide.
+      // Known residual gap: this narrows the window to between the
+      // freshness gate and THIS check, not between this check and whenever
+      // Door43's merge bot actually merges the resulting PR — a commit
+      // landing in that later window, which can run to several minutes, is
+      // still invisible to it.
       //
       // Known false-positive risk: a plain SHA mismatch has no own-publish
       // classification (unlike checkMasterFreshness's pre-commit gate, which
       // runs classifyMasterCommit/judgeOwnPublishDecline for exactly this
       // reason). An overlapping run's own merge for this SAME (book,
-      // resource), or a lock-push override that targets master directly,
-      // would also read as "foreign" here. Accepted: those are rare (one
-      // scheduled export per book+resource per night) and the alert is
-      // observational, not blocking — a human reading it can tell the
-      // difference from the named SHA.
-      if (shouldRecordRevertReport(dcsChanged, masterContentForRevertReport)) {
+      // resource) landing inside the window would also read as "foreign"
+      // here. Accepted: one scheduled export per book+resource per night
+      // makes this rare, and the alert is observational, not blocking — a
+      // human reading it can tell the difference from the named SHA.
+      //
+      // Skipped entirely when `branch === "master"` — the lock-push override
+      // that commits straight to master with no PR/merge step
+      // (lockPushExportParams). There, commitToDcs's own PUT IS what moves
+      // master's head; the post-commit head differing from the pre-commit
+      // pin is the expected, intended outcome of every single use of that
+      // override, not evidence of a foreign edit.
+      if (branch !== "master" && shouldRecordRevertReport(dcsChanged, masterContentForRevertReport)) {
         const postCommitHead = await fileHeadCommit(this.env, target.repo, filename);
-        if (foreignCommitDuringExport(fresh.masterSha, postCommitHead?.sha ?? null)) {
-          await this.recordExportRevertRaceAlert(book, resource, branch, fresh.masterSha, postCommitHead!.sha);
-        } else {
-          // No race this run — clear any banner an earlier night's race left
-          // standing. A "review" alert is never auto-resolved by writeAlert
-          // unless the SAME source fires again; without this, a one-time
-          // race would leave a permanent banner even after the situation is
-          // long past relevant.
-          await this.clearExportRevertRaceAlert(book, resource);
+        const postCommitSha = postCommitHead?.sha ?? null;
+        if (foreignCommitDuringExport(fresh.masterSha, postCommitSha)) {
+          await this.recordExportRevertRaceAlert(book, resource, branch, fresh.masterSha, postCommitSha!);
         }
+        // An unresolvable comparison (either side null — no watermark, or a
+        // transient fetch failure on THIS call) must never read as "clean":
+        // it raises nothing here, but it also must never be allowed to
+        // clear a standing banner from an earlier night's real race. See
+        // recordExportRevertRaceAlert's own comment for why that banner is
+        // never auto-cleared at all, by any outcome of this comparison.
       }
       // Hash only when a report is actually on the table. `dcsChanged` is false
       // on every unchanged night — the common steady state — and SHA-1 over a
@@ -2976,12 +2981,29 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // pinning its head SHA and commitToDcs finishing its several DCS round
   // trips. Every snapshot this run captured — the shrink/alignment guards'
   // master content, the blob sha shouldComputeRevertEntries compares — is
-  // pinned to the now-stale SHA, so a revert report built from it would diff
-  // against bytes that predate the foreign commit and either miss it or blame
-  // unrelated rows. Say so directly instead of publishing that wrong report.
+  // pinned to the now-stale SHA, so the revert report built below from it
+  // diffs against bytes that predate the foreign commit and can miss it or
+  // blame unrelated rows. This says so directly, as an ADDITIONAL signal
+  // alongside that report, not instead of it (see the long comment at the
+  // call site for why suppressing the report would be its own bug).
   // severity "warning", same as recordExportRevertReport: this never blocks
   // the export (already shipped by the time this fires) or claims a cause
   // beyond what was measured — only that master moved and by how much.
+  //
+  // Deliberately never auto-cleared. A "review" alert here is exactly the
+  // sibling skip/guard alerts' convention (recordStaleSkipAlert,
+  // recordHardRejectAlert, recordAlignmentShrinkSkipAlert, …): it names an
+  // action a human needs to take and stays until a human dismisses it. An
+  // earlier revision auto-deleted this banner on the next run that didn't
+  // re-detect a race — which is unsafe twice over: (a) "didn't re-detect"
+  // includes "couldn't compare" (no watermark, a transient Door43 read
+  // failure), which must never read as "confirmed resolved"; and (b) even a
+  // genuinely confirmed-clean comparison deleting the ONE record of a race
+  // that needed a human's attention, with nothing else tracking it, is the
+  // same failure shape this file elsewhere calls out: "a durable record
+  // that lies about a destructive action is worse than none." Leaving it
+  // standing costs one extra dismiss-click; auto-clearing it risks losing
+  // the only trace of a silently overwritten hand-edit.
   private async recordExportRevertRaceAlert(
     book: string,
     resource: Resource,
@@ -2993,51 +3015,28 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const label = `${book} ${resource.toUpperCase()}`;
     const pinned = (pinnedSha ?? "unknown").slice(0, 8);
     const foreign = foreignSha.slice(0, 8);
-    // Not "this self-heals tomorrow": commitToDcs (just above, in exportOne)
-    // already re-based branch `branch` onto whatever master held at that
-    // moment — possibly already including `foreignSha` — and PUT this run's
-    // full render over the file. If `foreignSha`'s commit touched this same
-    // file, this run's own PR overwrites it once Door43's merge bot merges
-    // `branch` (typically within minutes, possibly already by the time this
-    // alert is read), and tomorrow's freshness gate reads that merge as our
-    // own publish and never flags it again — so a human has to look at this
-    // one, now, not wait for it to resurface. The report below is still
-    // built and still correct for what it measures (the diff against the
-    // PINNED snapshot); it simply cannot see `foreignSha`.
+    // Not "this self-heals tomorrow": branch `branch`'s PUT carries this
+    // run's full render, built from content that predates `foreignSha`. If
+    // that foreign commit touched this same file, this run's own PR is at
+    // risk of overwriting it once Door43's merge bot merges `branch` —
+    // whether the branch was rebased onto master before or after
+    // `foreignSha` landed, this render still doesn't contain it either way.
+    // Once that merge happens, tomorrow's freshness gate reads it as our
+    // own publish and never flags it again — so a human has to look at
+    // this one, now, not wait for it to resurface. The export-revert report
+    // for this run is still built and still correct for what it measures
+    // (the diff against the PINNED snapshot); it simply cannot see
+    // `foreignSha`.
     const message =
       `${label}: master moved from ${pinned} to ${foreign} while tonight's export was running, between the ` +
       `freshness check and the DCS commit — a hand-edit may have landed there. This does NOT self-heal: branch ` +
-      `\`${branch}\` was already re-based onto that moved master and this run's full render was PUT over the ` +
-      `file, so if ${foreign}'s commit touched ${book} ${resource.toUpperCase()}, this run's own PR will ` +
-      `overwrite it once Door43's merge bot merges \`${branch}\` (minutes away, maybe already done), and ` +
-      `tomorrow's freshness gate will read that merge as our own publish and never flag it. Diff ` +
-      `${pinned}..${foreign} on Door43 now; if it touched this file, recover it from git history after the ` +
-      `merge. (The export-revert report for this run still ran against the ${pinned} snapshot — valid for what ` +
-      `it covers, it just cannot see ${foreign}.)`;
+      `\`${branch}\`'s PUT carries this run's full render, built without ${foreign}'s content, so if ${foreign}'s ` +
+      `commit touched ${book} ${resource.toUpperCase()}, this run's own PR risks overwriting it once Door43's ` +
+      `merge bot merges \`${branch}\` (minutes away, maybe already done) — after which tomorrow's freshness gate ` +
+      `reads that merge as our own publish and never flags it. Diff ${pinned}..${foreign} on Door43 now; if it ` +
+      `touched this file, recover it from git history after the merge. (The export-revert report for this run ` +
+      `still ran against the ${pinned} snapshot — valid for what it covers, it just cannot see ${foreign}.)`;
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`, "warning");
-  }
-
-  // Clear a standing #871 race banner once a later run for this (book,
-  // resource) passes back through the gate above without detecting one.
-  // writeAlert only replaces a source's banner when that SAME source fires
-  // again; a race is a one-off event tied to a specific night, so without
-  // this explicit clear a single bad night's banner would sit undismissed
-  // forever even once the situation is long past relevant. Same best-effort,
-  // never-throws shape as clearAlignmentAttention.
-  private async clearExportRevertRaceAlert(book: string, resource: Resource): Promise<void> {
-    try {
-      await this.env.DB.prepare(
-        `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
-      )
-        .bind(EXPORT_ALERT_USERNAME, `export_revert_race:${book}:${resource}`)
-        .run();
-    } catch (e) {
-      console.error("export revert-race alert clear failed", {
-        book,
-        resource,
-        error: e instanceof Error ? e.message : String(e),
-      });
-    }
   }
 
   // Build and record the export-revert report for one (book,resource), then
