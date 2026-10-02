@@ -20,6 +20,7 @@ import {
 import DownloadIcon from "@mui/icons-material/Download";
 import type { VerseDto } from "../sync/api";
 import { fetchBookVerses } from "../lib/bookVerses";
+import { isChunkLoadError } from "./AppErrorBoundary";
 
 interface Props {
   book: string;
@@ -84,6 +85,12 @@ export function ExportUsfmButton({ book, chapter, enabledVersions, chapterVerses
           : `${book}-${version}${suffix}.usfm`;
       download(name, usfm);
     } catch (e) {
+      // The USFM builder is a lazy chunk; a tab left open across a deploy
+      // asks for a chunk name that no longer exists.
+      if (isChunkLoadError(e)) {
+        setError("USFM export failed: the app was updated since this tab opened. Reload the page, then export again.");
+        return;
+      }
       setError(`USFM export failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBusy(false);
