@@ -19,7 +19,6 @@ import {
 } from "@mui/material";
 import DownloadIcon from "@mui/icons-material/Download";
 import type { VerseDto } from "../sync/api";
-import { buildUsfmFromVerses } from "../lib/exportUsfm";
 import { fetchBookVerses } from "../lib/bookVerses";
 
 interface Props {
@@ -69,7 +68,10 @@ export function ExportUsfmButton({ book, chapter, enabledVersions, chapterVerses
     close();
     setBusy(true);
     try {
-      const verses = await versesFor(scope, version);
+      const [verses, { buildUsfmFromVerses }] = await Promise.all([
+        versesFor(scope, version),
+        import("../lib/exportUsfm"),
+      ]);
       if (verses.length === 0) {
         setError(`No ${version} text to export for ${scope === "chapter" ? `${book} ${chapter}` : book}.`);
         return;

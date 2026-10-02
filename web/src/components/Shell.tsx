@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Box,
   Typography,
@@ -81,11 +81,7 @@ import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import type { BookViewportRestore } from "./BookView";
 import { ResourceColumn, type AlignmentTabProps, type PanelMode, type ReorderPreview, type ResourceCheckoff, type ResourceLane } from "./ResourceColumn";
 import type { AlignerLock, AlignmentPanelHandle } from "./AlignmentPanel";
-import {
-  SideBySideAligner,
-  type PanelSlot,
-  type ReadingLineHandle,
-} from "./SideBySideAligner";
+import type { PanelSlot, ReadingLineHandle } from "./SideBySideAligner";
 import { TopBar } from "./TopBar";
 import { ExportUsfmButton } from "./ExportUsfmButton";
 import { PrintPreviewButton } from "./PrintPreviewButton";
@@ -117,6 +113,14 @@ interface AlignerTarget {
   verse: number;
   bibleVersion: string;
 }
+
+// The dual-aligner popup (and the AlignmentPanel it hosts on each side) only
+// mounts once a translator opens it — lazy-loading keeps its ~35 KB, and the
+// AlignmentPanel chunk it would otherwise force into the eager graph, out of
+// the main bundle for every session that never touches it.
+const SideBySideAligner = lazy(() =>
+  import("./SideBySideAligner").then((m) => ({ default: m.SideBySideAligner })),
+);
 
 // Per-version slice of the alignment props: target verse, the source for the
 // verses that target covers (concatenated across a multi-verse range), and the
@@ -4826,78 +4830,80 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         </DialogActions>
       </Dialog>
       {dualAlignerProps && (
-        <SideBySideAligner
-          open
-          onClose={requestCloseDual}
-          book={dualAlignerProps.book}
-          chapter={dualAlignerProps.chapter}
-          verseNum={dualAlignerProps.verseNum}
-          vref={dualAlignerProps.vref}
-          sourceLabel={dualAlignerProps.sourceLabel}
-          sourceVerse={dualAlignerProps.sourceVerse}
-          twlForVerse={dualAlignerProps.twlForVerse}
-          lexiconMap={lexiconMap}
-          left={dualAlignerProps.left}
-          right={dualAlignerProps.right}
-          locked={dualAlignerProps.locked}
-          onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
-          onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
-          onSaveDoneAndNext={
-            dualNav.next != null && textLaneCheck.canCheck && !dualAlignerProps.locked
-              ? () => dualSaveDoneAndNext(dualAlignerProps.verseNum, dualNav.next!)
-              : undefined
-          }
-          // Lane checks live on the loaded chapter's useChapter state; only
-          // wire when the dual popup is on that same chapter (verse arrows
-          // already no-op across chapters for the same reason).
-          textCheck={
-            dualAlignerProps.chapter === chapter ? textLaneCheck : undefined
-          }
-          onSaveReading={(bv, plain, base, afterCommit) => {
-            // #1046: the reading line locks once a book lock lands, but an
-            // edit typed before it can still reach here through the close /
-            // verse-nav gate's Save, and a save already under way can see the
-            // lock land during its draft lookup or its "Words will be
-            // unaligned" confirm. The outbox would drop it silently
-            // (read-only mode), so refuse it out loud instead, now and again
-            // at the point of commit, and skip afterCommit: the line stays
-            // dirty and the gate's close/nav does not run. The message names
-            // Discard, not Undo: Undo is hidden while that side also has
-            // unsaved alignment drags.
-            //
-            // A refusal stalls any save chain this save is part of for good,
-            // so it also frees the "save, mark done, next" button's in-flight
-            // guard, as cancelling the unalign confirm does (#1050). The pin
-            // needs nothing here: the line's hold (#1060) keeps it while the
-            // edit stays on screen and releases it when the line goes clean.
-            const refuseIfBookLocked = () => {
-              if (!bookLockedRef.current) return false;
-              saveDoneGuardRef.current.cancel();
-              pushPipelineToast(
-                `This book is locked, so the ${bv} reading-text edit was not saved. To drop it, close the aligner and choose Discard.`,
-                "error",
-              );
-              return true;
-            };
-            if (refuseIfBookLocked()) return;
-            // base.verse, not verseNum — each side's row may start at a
-            // different verse (ULT v7 singleton vs UST 6-9 range row).
-            // afterCommit threads through so ReadingLineHandle.save (and thus
-            // the resolveDualAction save chain, #490) only proceeds once this
-            // actually lands — synchronously, or after the collateral-loss
-            // confirm's "Save anyway".
-            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit, refuseIfBookLocked);
-          }}
-          // #1060: the reading line writes no draft, so it holds the verse
-          // base itself from its first dirty keystroke; saveVerseDraft's
-          // pinVerseBase above then finds that pin instead of pinning the
-          // version on screen at Save time. Same key as the save.
-          onHoldReadingBase={(bv, base) =>
-            holdVerseBaseForEditor(verseKey(book, dualAlignerProps.chapter, base.verse, bv), base)
-          }
-          // #1075: a bridge or split under unsaved work dropped it; say so.
-          onUnsavedDropped={(message) => pushPipelineToast(message, "error")}
-        />
+        <Suspense fallback={null}>
+          <SideBySideAligner
+            open
+            onClose={requestCloseDual}
+            book={dualAlignerProps.book}
+            chapter={dualAlignerProps.chapter}
+            verseNum={dualAlignerProps.verseNum}
+            vref={dualAlignerProps.vref}
+            sourceLabel={dualAlignerProps.sourceLabel}
+            sourceVerse={dualAlignerProps.sourceVerse}
+            twlForVerse={dualAlignerProps.twlForVerse}
+            lexiconMap={lexiconMap}
+            left={dualAlignerProps.left}
+            right={dualAlignerProps.right}
+            locked={dualAlignerProps.locked}
+            onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
+            onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
+            onSaveDoneAndNext={
+              dualNav.next != null && textLaneCheck.canCheck && !dualAlignerProps.locked
+                ? () => dualSaveDoneAndNext(dualAlignerProps.verseNum, dualNav.next!)
+                : undefined
+            }
+            // Lane checks live on the loaded chapter's useChapter state; only
+            // wire when the dual popup is on that same chapter (verse arrows
+            // already no-op across chapters for the same reason).
+            textCheck={
+              dualAlignerProps.chapter === chapter ? textLaneCheck : undefined
+            }
+            onSaveReading={(bv, plain, base, afterCommit) => {
+              // #1046: the reading line locks once a book lock lands, but an
+              // edit typed before it can still reach here through the close /
+              // verse-nav gate's Save, and a save already under way can see the
+              // lock land during its draft lookup or its "Words will be
+              // unaligned" confirm. The outbox would drop it silently
+              // (read-only mode), so refuse it out loud instead, now and again
+              // at the point of commit, and skip afterCommit: the line stays
+              // dirty and the gate's close/nav does not run. The message names
+              // Discard, not Undo: Undo is hidden while that side also has
+              // unsaved alignment drags.
+              //
+              // A refusal stalls any save chain this save is part of for good,
+              // so it also frees the "save, mark done, next" button's in-flight
+              // guard, as cancelling the unalign confirm does (#1050). The pin
+              // needs nothing here: the line's hold (#1060) keeps it while the
+              // edit stays on screen and releases it when the line goes clean.
+              const refuseIfBookLocked = () => {
+                if (!bookLockedRef.current) return false;
+                saveDoneGuardRef.current.cancel();
+                pushPipelineToast(
+                  `This book is locked, so the ${bv} reading-text edit was not saved. To drop it, close the aligner and choose Discard.`,
+                  "error",
+                );
+                return true;
+              };
+              if (refuseIfBookLocked()) return;
+              // base.verse, not verseNum — each side's row may start at a
+              // different verse (ULT v7 singleton vs UST 6-9 range row).
+              // afterCommit threads through so ReadingLineHandle.save (and thus
+              // the resolveDualAction save chain, #490) only proceeds once this
+              // actually lands — synchronously, or after the collateral-loss
+              // confirm's "Save anyway".
+              saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit, refuseIfBookLocked);
+            }}
+            // #1060: the reading line writes no draft, so it holds the verse
+            // base itself from its first dirty keystroke; saveVerseDraft's
+            // pinVerseBase above then finds that pin instead of pinning the
+            // version on screen at Save time. Same key as the save.
+            onHoldReadingBase={(bv, base) =>
+              holdVerseBaseForEditor(verseKey(book, dualAlignerProps.chapter, base.verse, bv), base)
+            }
+            // #1075: a bridge or split under unsaved work dropped it; say so.
+            onUnsavedDropped={(message) => pushPipelineToast(message, "error")}
+          />
+        </Suspense>
       )}
       <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>
         <DialogTitle>
