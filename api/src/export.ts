@@ -1223,6 +1223,27 @@ const LINEAGE_FIELDS: Record<"tn" | "tq", Array<[string, string]>> = {
   tq: [["Quote", "quote"], ["Occurrence", "occurrence"], ["Question", "question"], ["Response", "response"]],
 };
 
+// Builds tsvRevertReport's `lineage` map from edit_log rows (ordered by id
+// ascending) for one (book, kind).
+export function buildRevertLineage(
+  rows: ReadonlyArray<{ row_key: string; source: string | null; payload_json: string }>,
+): Map<string, Array<Record<string, unknown>>> {
+  const lineage = new Map<string, Array<Record<string, unknown>>>();
+  for (const r of rows) {
+    try {
+      const p = JSON.parse(r.payload_json);
+      if (p && typeof p === "object") {
+        const list = lineage.get(r.row_key) ?? [];
+        list.push(p as Record<string, unknown>);
+        lineage.set(r.row_key, list);
+      }
+    } catch {
+      /* skip unparseable payload */
+    }
+  }
+  return lineage;
+}
+
 // True when master's row equals (on every content column) a full-row edit_log
 // payload from the machine lineage. Payloads missing a content field never
 // match (fail open).

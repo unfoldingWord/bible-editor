@@ -47,6 +47,7 @@ import {
   tsvRevertReport,
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
+  buildRevertLineage,
   foreignCommitDuringExport,
   exportRevertRaceAlertSource,
   masterIsOurLastPublish,
@@ -1645,25 +1646,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         if (computeEntries && (resource === "tn" || resource === "tq")) {
           try {
             const { results } = await this.env.DB.prepare(
-              `SELECT row_key, payload_json FROM edit_log
+              `SELECT row_key, source, payload_json FROM edit_log
                 WHERE kind = ?1 AND book = ?2 AND source IN ('ai_pipeline', 'dcs_reimport')
-                  AND action IN ('create', 'update') AND payload_json IS NOT NULL`,
+                  AND action IN ('create', 'update') AND payload_json IS NOT NULL
+                ORDER BY id`,
             )
               .bind(resource, book)
-              .all<{ row_key: string; payload_json: string }>();
-            lineage = new Map();
-            for (const r of results ?? []) {
-              try {
-                const p = JSON.parse(r.payload_json);
-                if (p && typeof p === "object") {
-                  const list = lineage.get(r.row_key) ?? [];
-                  list.push(p as Record<string, unknown>);
-                  lineage.set(r.row_key, list);
-                }
-              } catch {
-                /* skip unparseable payload */
-              }
-            }
+              .all<{ row_key: string; source: string | null; payload_json: string }>();
+            lineage = buildRevertLineage(results ?? []);
           } catch (e) {
             console.error("export: revert lineage read failed; report keeps its unfiltered behaviour", {
               book,

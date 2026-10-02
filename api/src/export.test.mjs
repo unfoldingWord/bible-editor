@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, exportRevertRaceAlertSource, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, buildRevertLineage, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, exportRevertRaceAlertSource, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -2766,6 +2766,34 @@ function utf8Base64(s) {
     tsvRevertReport(appEdited, botMaster, "tn", null, new Map([["ab01", [{ note: "bot note" }]]])).entries.length === 1,
     `partial payload never matches -> fails open`,
   );
+
+  // Review A2: only the row's LATEST machine write counts, and only when the
+  // AI pipeline wrote it. dcs_reimport mirrors human Door43 edits too, and an
+  // older bot value can be restored on Door43 by a human.
+  const ev = (source, note) => ({ row_key: "ab01", source, payload_json: JSON.stringify({ ...payload, note }) });
+  const reported = (rows) => tsvRevertReport(appEdited, botMaster, "tn", null, buildRevertLineage(rows)).entries.length;
+  assert(reported([ev("ai_pipeline", "bot note")]) === 0, `A2: latest machine write is the bot's -> 0 entries`);
+  assert(
+    reported([ev("dcs_reimport", "bot note")]) === 1,
+    `A2: master equals an imported (possibly human) Door43 value -> still reported`,
+  );
+  assert(
+    reported([ev("ai_pipeline", "bot note"), ev("ai_pipeline", "bot v2")]) === 1,
+    `A2: human restores an OLDER bot value on Door43 -> still reported`,
+  );
+  assert(
+    reported([ev("ai_pipeline", "bot note"), ev("dcs_reimport", "human door43 edit")]) === 1,
+    `A2: bot value superseded by an imported Door43 edit, then restored -> still reported`,
+  );
+  // C1: a non-string content field must not throw (the report runs after the DCS commit).
+  const odd = [{ row_key: "ab01", source: "ai_pipeline", payload_json: JSON.stringify({ ...payload, note: 7 }) }];
+  let threw = false;
+  try {
+    reported(odd);
+  } catch {
+    threw = true;
+  }
+  assert(!threw, `C1: a non-string note in a payload does not throw`);
 }
 
 // --- RECORD_PUSHED_RENDER_SQL tracks renders since master was last confirmed (#1029) ---
