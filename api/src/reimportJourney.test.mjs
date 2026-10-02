@@ -4687,6 +4687,92 @@ console.log("\n[#1090: locked book, Door43 edits a field on two nights]");
   }
 }
 
+// ── #1090 review C1: a row already flagged with the PRE-#1090 wording that
+// conflicts again on a later sync. The flag rides the adoption write, so the
+// row takes exactly ONE version bump whether or not the reason is rewritten;
+// the rewrite replaces the old wording, which claimed an app-side change.
+console.log("\n[#1090 C1: re-flag of a row carrying the old merge_conflict wording]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+  const OLD = "A Door43 edit to this row's response was merged over your app-side change. Please double-check it.";
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, sort_order, updated_by, version,
+                            review_kind, review_reason)
+       VALUES ('c1r1', ?, 1, 2, '1:2', null, 'the question', 'the app value', 10, 7, 5, 'merge_conflict', ?)`,
+    )
+    .run(BOOK, OLD);
+  const e = sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+       VALUES ('tq', 'c1r1', ?, 'create', ?, 100)`,
+    )
+    .run(BOOK, JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2", question: "the question", response: "v0" }));
+  const counts = await applyTsvRows(
+    env, BOOK, "tq",
+    [{ id: "c1r1", idCoerced: false, refRaw: "1:2", chapter: 1, verse: 2, occurrence: null, tags: null, quote: null,
+       question: "the question", response: "Door43's v2" }],
+    null,
+    { confirmedAt: 200, editId: Number(e.lastInsertRowid), lineage: {
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+    } },
+  );
+  const row = sqlite.prepare(`SELECT response, review_kind, review_reason, version FROM tq_rows WHERE id='c1r1'`).all()[0];
+  eq([row.response, counts.merge_conflicts, row.review_kind], ["Door43's v2", 1, "merge_conflict"], "C1: still a master-wins conflict");
+  eq(row.version, 6, "C1: one version bump, from the adoption write the flag rides on");
+  eq(row.review_reason.startsWith("A Door43 edit to this row's response was merged over a different change saved in the app."), true,
+    "C1: the old wording is replaced in that same write");
+}
+
+// ── #1090 review C2: a locked book's NON-provisional row with no ancestor at
+// or below the boundary (no create in edit_log: aged out, or predates it).
+// Before #1090 it stayed keep_no_base with a merge_no_base flag. Now the
+// sync's own later write is its ancestor for the fields that write named,
+// so Door43's next edit to such a field adopts cleanly. Unlocked: unchanged.
+console.log("\n[#1090 C2: locked book, no ancestor below the boundary]");
+for (const locked of [true, false]) {
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, sort_order, updated_by, version)
+       VALUES ('c2r1', ?, 1, 2, '1:2', null, 'the question', 'v1', 10, 7, 4)`,
+    )
+    .run(BOOK);
+  // Boundary marker on another row; c2r1 has nothing at or below it.
+  const b = sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('tq', 'other', ?, 'create', '{}', 100)`)
+    .run(BOOK);
+  // The sync's earlier adoption of Door43's v1, above the boundary.
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, source, created_at)
+       VALUES ('tq', 'c2r1', ?, 'update', ?, 'dcs_reimport', 250)`,
+    )
+    .run(BOOK, JSON.stringify({ response: "v1" }));
+  if (locked) sqlite.prepare(`INSERT INTO book_locks (book, locked, reason) VALUES (?, 1, 'test lock')`).run(BOOK);
+  const counts = await applyTsvRows(
+    env, BOOK, "tq",
+    [{ id: "c2r1", idCoerced: false, refRaw: "1:2", chapter: 1, verse: 2, occurrence: null, tags: null, quote: null,
+       question: "the question", response: "v2" }],
+    null,
+    { confirmedAt: 200, editId: Number(b.lastInsertRowid), lineage: {
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+    } },
+  );
+  const row = sqlite.prepare(`SELECT response, review_kind FROM tq_rows WHERE id='c2r1'`).all()[0];
+  if (locked) {
+    eq([row.response, counts.merge_adopted, counts.merge_no_base, counts.merge_conflicts, row.review_kind],
+      ["v2", 1, 0, 0, null], "C2 locked: the sync's write is the ancestor; Door43's v2 adopts cleanly, no flag");
+  } else {
+    eq([row.response, counts.merge_no_base, row.review_kind],
+      ["v1", 1, "merge_no_base"], "C2 unlocked: unchanged, keep_no_base with a merge_no_base flag");
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
