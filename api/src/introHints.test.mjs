@@ -16,7 +16,12 @@
 //      a bug a text match wouldn't see).
 
 import { readFileSync } from "node:fs";
-import { buildIntroHints, isIntroHintComment } from "./introHints.ts";
+import {
+  buildIntroHints,
+  isIntroHintComment,
+  mergeIntroHintsIntoOptions,
+  MAX_OPTIONS_BYTES,
+} from "./introHints.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -127,6 +132,95 @@ function assert(cond, msg) {
     encoder.encode(hebrewHints[0].note).length > hebrewHints[0].note.length,
     "sanity: the Hebrew note's byte length actually exceeds its char length (confirms the test exercises the UTF-8 gap, not a no-op)",
   );
+
+  // Issue #1072 (1): the loop used to `break` on the first hint that did
+  // not fit, so one long early note (a 5000-char comment with Hebrew is
+  // easily > 8000 bytes on its own) silently dropped every later chapter's
+  // hints. A hint that doesn't fit is skipped; the ones after it still go.
+  const skipRows = [
+    { id: 1, chapter: 1, body: `AI: ${"a".repeat(100)}` },
+    { id: 2, chapter: 2, body: `AI: ${"b".repeat(9000)}` }, // alone exceeds the 8000-byte budget
+    { id: 3, chapter: 3, body: `AI: ${"c".repeat(100)}` },
+  ];
+  const origWarn = console.warn;
+  const warned = [];
+  console.warn = (...args) => warned.push(args.join(" "));
+  let skipHints;
+  try {
+    skipHints = buildIntroHints(skipRows);
+  } finally {
+    console.warn = origWarn;
+  }
+  assert(
+    skipHints.length === 2 && skipHints[0].chapter === 1 && skipHints[1].chapter === 3,
+    `[100-byte, 9000-byte, 100-byte] forwards the first and third (got chapters ${skipHints.map((h) => h.chapter).join(",")})`,
+  );
+  assert(
+    warned.length === 1 && /comment 2/.test(warned[0]),
+    `the skipped hint is logged, naming its comment id (got ${JSON.stringify(warned)})`,
+  );
+}
+
+// ─── whole-request size guard ───────────────────────────────────────────────
+{
+  console.log("\n[mergeIntroHintsIntoOptions: whole-request size guard]");
+
+  const intro = [{ chapter: 3, note: "mention the covenant theme" }];
+
+  const small = mergeIntroHintsIntoOptions({ hints: [{ rowId: "a" }] }, intro);
+  assert(
+    small.dropped === false && JSON.stringify(small.options.introHints) === JSON.stringify(intro),
+    "a small request carries introHints",
+  );
+  assert(
+    Array.isArray(small.options.hints) && small.options.hints.length === 1,
+    "existing verse options.hints are kept alongside introHints",
+  );
+
+  const none = mergeIntroHintsIntoOptions(undefined, intro);
+  assert(
+    none.dropped === false && none.options.introHints.length === 1,
+    "undefined options plus intro hints yields an options object carrying them",
+  );
+
+  const empty = mergeIntroHintsIntoOptions({ fresh: true }, []);
+  assert(
+    empty.dropped === false && !("introHints" in empty.options),
+    "no intro hints → introHints key omitted, not an empty array",
+  );
+
+  // Issue #1072 (2): the 8000-byte intro budget ignored the rest of the
+  // request. Verse hints alone can already be ~25 KiB; together they could
+  // pass the bot's ~32 KiB limit and 413 the whole notes job. When the
+  // merged options would exceed MAX_OPTIONS_BYTES, the intro hints go and
+  // the verse hints (the job's actual work) stay.
+  const bigVerseHints = Array.from({ length: 50 }, (_, i) => ({
+    rowId: `r${i}`,
+    verse: i + 1,
+    quote: "",
+    supportReference: null,
+    seed: "s".repeat(500),
+  }));
+  const base = { hints: bigVerseHints };
+  const baseBytes = new TextEncoder().encode(JSON.stringify(base)).length;
+  assert(
+    baseBytes < MAX_OPTIONS_BYTES && baseBytes + 8000 > MAX_OPTIONS_BYTES,
+    `sanity: verse hints alone fit but leave less than an intro budget of room (${baseBytes} of ${MAX_OPTIONS_BYTES})`,
+  );
+  const bigIntro = [{ chapter: 3, note: "n".repeat(7000) }];
+  const origWarn = console.warn;
+  const warned = [];
+  console.warn = (...args) => warned.push(args.join(" "));
+  let full;
+  try {
+    full = mergeIntroHintsIntoOptions(base, bigIntro);
+  } finally {
+    console.warn = origWarn;
+  }
+  assert(full.dropped === true, "the merged request would exceed the limit, so intro hints are dropped");
+  assert(!("introHints" in full.options), "a request whose verse hints already fill the limit carries no introHints");
+  assert(full.options.hints === bigVerseHints, "the verse hints are left untouched");
+  assert(warned.length === 1, `the drop is logged once (got ${warned.length})`);
 }
 
 // ─── pipelines.ts wiring (source-text) ──────────────────────────────────────
@@ -135,9 +229,12 @@ function assert(cond, msg) {
   const src = readFileSync(new URL("./pipelines.ts", import.meta.url), "utf8");
 
   const selectMatch = src.match(
-    /SELECT id, chapter, body\s+FROM comments\s+WHERE book = \?1 AND chapter BETWEEN \?2 AND \?3\s+AND ([^`]+?)\s+ORDER BY chapter, created_at ASC/,
+    /SELECT id, chapter, body\s+FROM comments\s+WHERE book = \?1 AND chapter BETWEEN \?2 AND \?3\s+AND ([^`]+?)\s+ORDER BY chapter, created_at ASC, id ASC/,
   );
-  assert(selectMatch !== null, "the intro-comments SELECT exists with the expected shape");
+  assert(
+    selectMatch !== null,
+    "the intro-comments SELECT exists and orders by chapter, created_at, then id — created_at has one-second resolution, so id breaks ties deterministically (issue #1072)",
+  );
   const guards = selectMatch ? selectMatch[1] : "";
 
   assert(/verse = 0/.test(guards), "scoped to verse 0 (the chapter intro), not arbitrary verse comments");
@@ -154,8 +251,8 @@ function assert(cond, msg) {
   assert(/deleted_at IS NULL/.test(guards), "excludes soft-deleted comments");
 
   assert(
-    /mergedOptions = \{ \.\.\.\(mergedOptions \?\? \{\}\), introHints \};/.test(src),
-    "introHints is folded onto mergedOptions (not clobbering a prior options.hints assignment)",
+    /mergeIntroHintsIntoOptions\(mergedOptions, introHints\)/.test(src),
+    "introHints is folded onto mergedOptions through the size-guarded helper (not clobbering a prior options.hints assignment, not bypassing the whole-request limit)",
   );
   assert(
     !/resolveIntroHintComments/.test(src),
