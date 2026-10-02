@@ -4862,7 +4862,7 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // one — so the slack is free in the only direction that matters. A day also
 // absorbs modest author-date backdating.
 //
-// A SHARED LIMIT, NOT THIS TIER'S — NARROWED BY #691, NOT CLOSED. Every
+// A SHARED LIMIT, NOT THIS TIER'S — CLOSED FOR THE LEDGER, NOT THE LIVE WALK. Every
 // date-bounded walk here (listMasterCommitsSince's sinceTime) compares
 // COMMITTER date, not author date (see that function's own comment), which
 // already closes the rebase/cherry-pick class of backdating: those move the
@@ -4871,22 +4871,14 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // dcs_commits ledger first — the same pattern loadMasterLineage (above)
 // already uses for the mint gate — which buys the same committer-date answer
 // from a store PROVEN gap-free by sha-continuity polling, without a live
-// Gitea round trip and its failure modes (timeouts, page caps). What neither
-// the live walk NOR the ledger can catch, even so: a PLAIN late push, where
-// the commit is locally authored AND committed days before it reaches
-// Door43, so neither timestamp ever moves. The dcs_commits row for such a
-// commit DOES exist once the poller's sha-continuity walk discovers it
-// (`seen_at` records exactly when) — but readLedgerMasterLineage's own read
-// filters on `committed_at`, the same field the live walk keys on, not on
-// `seen_at`. VERIFIED directly: a ledger with full, gap-free coverage
-// starting well before `windowStart` still returns zero commits for a row
-// whose `committed_at` itself predates `windowStart`. Closing that fully
-// would mean widening readLedgerMasterLineage's own comparison to admit a row
-// on `seen_at` too — a change to that shared, separately-audited module,
-// which this fix does not make (see the PR that introduced this comment for
-// why). So the honest residual is: a plain late push is invisible to every
-// walk here, live or ledger-backed, regardless of how current the ledger's
-// coverage is. Tracked as issue #691.
+// Gitea round trip and its failure modes (timeouts, page caps). A PLAIN late
+// push, where the commit is locally authored AND committed days before it
+// reaches Door43 so neither timestamp ever moves, is caught only by the
+// ledger: readLedgerMasterLineage also admits a row whose `seen_at` (the
+// poller's arrival stamp) is after the window start (#691). The live-walk
+// fallback still cannot see it, because Gitea exposes no push time; that
+// residual applies only when the ledger is unusable (stale tip, gap, no
+// coverage floor), and those cases already fall back to live by design.
 interface NoBaseFallbackWindow {
   /** Where the walk must start: see the tier notes above. */
   windowStart: number;
@@ -5403,8 +5395,8 @@ async function clearResolvedMergeNoBase(
     //     NoBaseFallbackWindow's #691 note: committer-date backdating (a
     //     rebase or cherry-pick) is caught, live or via the ledger the
     //     revisit's own gate already tries first; a PLAIN late push — author
-    //     AND committer date both unmoved — is invisible to both, exactly as
-    //     for every other walk here (issue #691).
+    //     AND committer date both unmoved — is caught by the ledger's seen_at
+    //     but still invisible to the live fallback (issue #691).
     //
     // #861: when `walk` is the repo-scoped ledger page, `walk.commits[0]?.sha`
     // can be a Gitea merge-wrapper commit — exactly the shape our own nightly
