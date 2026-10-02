@@ -630,7 +630,13 @@ export function SideBySideAligner({
             flexShrink: 0,
           }}
         >
+          {/* Keyed by the ROW the line edits (start verse + bridge end), not
+              the verse number: a bridge or split by another editor moves the
+              slot onto a different row, and an edit kept across that would
+              save its text over the new row (#1067 review). The remount drops
+              the edit and releases its hold, as an unfocused resync used to. */}
           <ReadingLine
+            key={`${left.verse?.verse}-${left.verse?.verse_end}`}
             ref={left.readingRef}
             slot={left}
             onSave={onSaveReading}
@@ -642,6 +648,7 @@ export function SideBySideAligner({
             bodyHeight={readingHeight}
           />
           <ReadingLine
+            key={`${right.verse?.verse}-${right.verse?.verse_end}`}
             ref={right.readingRef}
             slot={right}
             onSave={onSaveReading}
@@ -978,6 +985,13 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
       return;
     }
     onSave(bibleVersion, el.textContent ?? "", verse, (outcome) => {
+      // A no-op is text back at the held base while the verse moved on (a
+      // dirty line is never resynced, #1067): show the server's text, or the
+      // now-clean line would sit on the stale base until the next change.
+      if (outcome?.queued === false) {
+        el.textContent = editable;
+        lastSetRef.current = editable;
+      }
       // A queued edit's save owns the pin now and its outbox exit releases it;
       // a no-op queued nothing, so the hold ends as a clean line's does (#1060).
       markDirty(false, outcome?.queued === false ? "release" : "handOff");
