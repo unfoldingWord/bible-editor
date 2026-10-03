@@ -217,3 +217,52 @@ test("a Save drained by a fresh tab still clears the saved draft", async ({ brow
     .toBeNull();
   await context.close();
 });
+
+test("a Save drained by a tab holding an older draft generation of its own still clears the draft (#1100)", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "older1100");
+  const chap = await fetchChapter(context.request, auth.token, "ZEC", 8);
+  const row = chap.tn.find((r) => r.verse === 7 && r.ref_raw === "8:7");
+  expect(row, "ZEC 8:7 needs a tn row").toBeTruthy();
+  const id = row!.id;
+  const key = `row:tn:ZEC:${id}`;
+
+  // Tab B types in the note without saving, then leaves the chapter. Its
+  // in-memory latest generation for this note stays the older one.
+  const tabB = await context.newPage();  await gotoVerse(tabB, "ZEC", 8, 7);
+  const textareaB = await openNoteEditor(tabB, id);
+  const older = " OLDB1100";
+  await textareaB.click();
+  await tabB.keyboard.press("ControlOrMeta+End");
+  await tabB.keyboard.type(older, { delay: 30 });
+  await expect.poll(async () => (await readRowDraft(tabB, key))?.note ?? "").toContain(older.trim());
+  await tabB.evaluate(() => { location.hash = "#/ZEC/1"; });
+  await expect.poll(async () => (await readRowDraft(tabB, key))?.note ?? "").toContain(older.trim());
+
+  // Tab A writes a newer draft of the same note and saves it, but its PATCH
+  // never reaches the server, so the Save stays queued for tab B to drain.
+  const tabA = await context.newPage();
+  await tabA.route((url) => url.pathname === `/api/rows/tn/${id}`, (route) =>
+    route.request().method() === "PATCH" ? route.abort() : route.continue());
+  await gotoVerse(tabA, "ZEC", 8, 7);
+  const textareaA = await openNoteEditor(tabA, id);
+  const newer = " NEWA1100";
+  await textareaA.click();
+  await tabA.keyboard.press("ControlOrMeta+End");
+  await tabA.keyboard.type(newer, { delay: 30 });
+  await expect.poll(async () => (await readRowDraft(tabA, key))?.note ?? "").toContain(newer.trim());
+  await saveNote(tabA, id);
+  await expect
+    .poll(async () => (await outboxOps(tabA)).some((o) => o.startsWith("pending:") && !o.endsWith(":0")))
+    .toBe(true);
+  await tabA.close();
+
+  // Wake tab B's drain; it lands tab A's Save.
+  await tabB.evaluate(() => window.dispatchEvent(new Event("online")));
+  await waitForServerNote(context.request, auth.token, "ZEC", 8, id, (n) => (n ?? "").includes(newer.trim()), 20_000);
+  await expect.poll(() => outboxCount(tabB)).toBe(0);
+  await expect
+    .poll(() => readRowDraft(tabB, key), { message: "the saved draft must be cleared", timeout: 10_000 })
+    .toBeNull();
+  await context.close();
+});
