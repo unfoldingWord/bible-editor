@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { NO_ROW_DRAFT, rowDraftClearAfterOk, rowOpClearsDraft } from "./draftSaveState.ts";
+import { NO_ROW_DRAFT, rowDraftClearAfterOk, rowDraftMarksReleasable, rowOpClearsDraft } from "./draftSaveState.ts";
 
 // #1092: a row op's 200 clears the row's draft only when that op saved the
 // draft's fields. A move (verse/ref_raw/sort_order) or a reorder carries none
@@ -193,6 +193,29 @@ assert.equal(
   rowDraftClearAfterOk(genOp("200:1:a"), "100:4:b", "100:4:b", rec("300:2:a", 300)),
   false,
   "older own generation, but the store holds newer unsaved typing: keep",
+);
+
+// #1100 review F1: once the record is deleted, the draining tab's in-memory
+// marks (the unload guard's pendingKeys and the generation a later save
+// carries) go too, as long as no set() started after the decision. That
+// includes the superseded case, where the tab's own mark is its older
+// generation, not the deleted record's.
+assert.equal(rowDraftMarksReleasable(undefined, undefined, "200:1:a"), true, "no own mark: release");
+assert.equal(rowDraftMarksReleasable("200:1:a", "200:1:a", "200:1:a"), true, "own mark is the deleted record: release");
+assert.equal(
+  rowDraftMarksReleasable("100:4:b", "100:4:b", "200:1:a"),
+  true,
+  "own older mark, superseded and unchanged since the decision: release",
+);
+assert.equal(
+  rowDraftMarksReleasable("300:5:b", "100:4:b", "200:1:a"),
+  false,
+  "a set() started after the decision: keep the marks",
+);
+assert.equal(
+  rowDraftMarksReleasable("300:5:b", undefined, "200:1:a"),
+  false,
+  "a first set() started after a no-mark decision: keep the marks",
 );
 
 // #1100 case 2: a 409 resolve or a fatal-failure retry moves the op's queuedAt

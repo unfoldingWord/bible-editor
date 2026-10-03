@@ -257,12 +257,26 @@ test("a Save drained by a tab holding an older draft generation of its own still
     .toBe(true);
   await tabA.close();
 
-  // Wake tab B's drain; it lands tab A's Save.
+  // Wake tab B's drain; it lands tab A's Save. Tab B is the only tab that can:
+  // tab A aborted every PATCH for this row and is closed, so the server note
+  // carrying the newer typing proves tab B ran the 200 handler.
   await tabB.evaluate(() => window.dispatchEvent(new Event("online")));
   await waitForServerNote(context.request, auth.token, "ZEC", 8, id, (n) => (n ?? "").includes(newer.trim()), 20_000);
   await expect.poll(() => outboxCount(tabB)).toBe(0);
   await expect
     .poll(() => readRowDraft(tabB, key), { message: "the saved draft must be cleared", timeout: 10_000 })
     .toBeNull();
+  // Review F1: tab B's own older marks go with the record, so its leave-page
+  // guard no longer fires (a synthetic beforeunload is not prevented).
+  await expect
+    .poll(
+      () => tabB.evaluate(() => {
+        const e = new Event("beforeunload", { cancelable: true });
+        window.dispatchEvent(e);
+        return e.defaultPrevented;
+      }),
+      { message: "tab B must not warn about unsaved changes", timeout: 10_000 },
+    )
+    .toBe(false);
   await context.close();
 });
