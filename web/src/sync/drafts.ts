@@ -33,6 +33,7 @@ import {
 import { takeOwnVerseOp } from "./ownVerseOps";
 import { createDraftSnapshot, dedupeByKeys } from "./draftSnapshot";
 import { createDraftWriteCoalescer } from "./draftWriteCoalescer";
+import { createDraftDbConnection } from "./draftDb";
 export { pinVerseBase, peekPinnedVerseBase, pinEpoch, type VerseBaseHold } from "./versePin";
 
 const DB_NAME = "bible-editor-drafts";
@@ -82,24 +83,22 @@ export type DraftMeta =
 
 type Subscriber = (drafts: DraftRecord[]) => void;
 
-let dbp: Promise<IDBPDatabase> | null = null;
-// The opened handle, kept so a flush inside pagehide/beforeunload can issue its
-// put synchronously, with no await before it (#901 review A1).
-let dbHandle: IDBPDatabase | null = null;
-function db() {
-  if (!dbp) {
-    dbp = openDB(DB_NAME, DB_VERSION, {
-      upgrade(d) {
-        if (!d.objectStoreNames.contains(STORE)) {
-          d.createObjectStore(STORE, { keyPath: "key" });
-        }
-      },
-    }).then((d) => {
-      dbHandle = d;
-      return d;
-    });
-  }
-  return dbp;
+// Cached, but reopened if the browser closes the connection (#1102). With the
+// handle open, run() issues its op synchronously, so a flush inside
+// pagehide/beforeunload has its put queued in time (#901 review A1).
+const conn = createDraftDbConnection<IDBPDatabase>(({ terminated, blocking }) =>
+  openDB(DB_NAME, DB_VERSION, {
+    upgrade(d) {
+      if (!d.objectStoreNames.contains(STORE)) {
+        d.createObjectStore(STORE, { keyPath: "key" });
+      }
+    },
+    terminated,
+    blocking,
+  }));
+const withDb = conn.run;
+function db(): Promise<IDBPDatabase> {
+  return withDb((d) => d);
 }
 
 // Synchronous mirror of "a draft was written this session and not yet cleared".
@@ -151,13 +150,13 @@ export function hasUnsavedDrafts(): boolean {
 }
 
 async function listAll(): Promise<DraftRecord[]> {
-  const all = (await (await db()).getAll(STORE)) as DraftRecord[];
+  const all = (await withDb((d) => d.getAll(STORE))) as DraftRecord[];
   all.sort((a, b) => a.updatedAt - b.updatedAt);
   return all;
 }
 
-const snapshot = createDraftSnapshot<DraftRecord>(listAll, async (key) =>
-  (await db()).get(STORE, key));
+const snapshot = createDraftSnapshot<DraftRecord>(listAll, (key) =>
+  withDb((d) => d.get(STORE, key)));
 const draftChannel = typeof BroadcastChannel !== "undefined"
   ? new BroadcastChannel("be-draft-changes") : null;
 draftChannel?.addEventListener("message", (event: MessageEvent) => {
@@ -198,8 +197,9 @@ function persistDraft(key: string, rec: DraftRecord): Promise<void> {
   // Once the database is open the put is ISSUED here, synchronously (idb
   // creates the transaction and request before its first await), so a flush
   // from pagehide/beforeunload has its request queued before the handler
-  // returns (#901 review A1). Only a write before the first open awaits it.
-  const put = dbHandle ? dbHandle.put(STORE, rec) : db().then((d) => d.put(STORE, rec));
+  // returns (#901 review A1). Only a write before the first open, or the
+  // retry after a closed connection (#1102), awaits the open.
+  const put = withDb((d) => d.put(STORE, rec));
   return put.then(() => { notify(key); }).finally(release);
 }
 const writes = createDraftWriteCoalescer<DraftRecord>(persistDraft, DRAFT_WRITE_INTERVAL_MS);
@@ -285,8 +285,7 @@ export const drafts = {
 
   async get(key: string): Promise<DraftRecord | undefined> {
     await writes.flush(key);
-    const idb = await db();
-    const rec = (await idb.get(STORE, key)) as DraftRecord | undefined;
+    const rec = (await withDb((d) => d.get(STORE, key))) as DraftRecord | undefined;
     if (rec) return rec;
     // One-time tolerance for the pre-book row key format ("row:{kind}:{id}").
     // On a miss, check whether a legacy record exists whose meta says it
@@ -297,15 +296,15 @@ export const drafts = {
     if (!m) return undefined;
     const [, rowKind, book, id] = m;
     const legacyKey = `row:${rowKind}:${id}`;
-    const legacy = (await idb.get(STORE, legacyKey)) as DraftRecord | undefined;
+    const legacy = (await withDb((d) => d.get(STORE, legacyKey))) as DraftRecord | undefined;
     if (!legacy || legacy.meta.kind !== "row" || legacy.meta.book !== book) {
       return undefined;
     }
     const migrated: DraftRecord = { ...legacy, key };
     pendingKeys.delete(legacyKey);
     pendingKeys.add(key);
-    await idb.put(STORE, migrated);
-    await idb.delete(STORE, legacyKey);
+    await withDb((d) => d.put(STORE, migrated));
+    await withDb((d) => d.delete(STORE, legacyKey));
     notify(legacyKey);
     notify(key);
     return migrated;
@@ -319,7 +318,7 @@ export const drafts = {
     unpinVerseBaseUnlessHeld(key);
     const release = snapshot.beginMutation(key);
     try {
-      await (await db()).delete(STORE, key);
+      await withDb((d) => d.delete(STORE, key));
       notify(key);
     } finally { release(); }
   },
@@ -332,16 +331,20 @@ export const drafts = {
   async clearGeneration(key: string, generation: string, epoch?: number): Promise<boolean> {
     // Compare against the latest typing, not the last coalesced write.
     await writes.flush(key);
-    const idb = await db();
-    const tx = idb.transaction(STORE, "readwrite");
-    const rec = (await tx.store.get(key)) as DraftRecord | undefined;
-    const currentGeneration = rec?.generation ?? (rec ? `legacy:${rec.updatedAt}` : undefined);
-    if (!rec || currentGeneration !== generation) {
+    // The read + delete is safe to rerun whole after a closed connection.
+    const removed = await withDb(async (idb) => {
+      const tx = idb.transaction(STORE, "readwrite");
+      const rec = (await tx.store.get(key)) as DraftRecord | undefined;
+      const currentGeneration = rec?.generation ?? (rec ? `legacy:${rec.updatedAt}` : undefined);
+      if (!rec || currentGeneration !== generation) {
+        await tx.done;
+        return false;
+      }
+      await tx.store.delete(key);
       await tx.done;
-      return false;
-    }
-    await tx.store.delete(key);
-    await tx.done;
+      return true;
+    });
+    if (!removed) return false;
     if (latestGenerationByKey.get(key) === generation) {
       latestGenerationByKey.delete(key);
       pendingKeys.delete(key);
