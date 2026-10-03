@@ -83,6 +83,9 @@ export type DraftMeta =
 type Subscriber = (drafts: DraftRecord[]) => void;
 
 let dbp: Promise<IDBPDatabase> | null = null;
+// The opened handle, kept so a flush inside pagehide/beforeunload can issue its
+// put synchronously, with no await before it (#901 review A1).
+let dbHandle: IDBPDatabase | null = null;
 function db() {
   if (!dbp) {
     dbp = openDB(DB_NAME, DB_VERSION, {
@@ -91,6 +94,9 @@ function db() {
           d.createObjectStore(STORE, { keyPath: "key" });
         }
       },
+    }).then((d) => {
+      dbHandle = d;
+      return d;
     });
   }
   return dbp;
@@ -175,10 +181,11 @@ function notify(key: string) {
 // 2 s keeps 20 keystrokes at an ordinary 5 per second to 3 writes (one at the
 // first key, then one per interval), not only a fast burst; Benjamin allowed
 // up to 5 s. The cost is crash-only: a frozen browser or power cut can lose up
-// to the last 2 s of typing. A tab switch, hide or close flushes at once
-// (listeners below), and so does every path that reads the record or records
-// its generation for a save (get, rowSaveGeneration, clearGeneration, the
-// row-ok clear, list, subscribeKey mount/unmount). The in-memory marks
+// to the last 2 s of typing. A tab switch, hide, leave prompt or close flushes
+// at once (listeners below), and so does every path that reads the record or
+// records its generation for a save (get, rowSaveGeneration, clearGeneration,
+// the row-ok clear, list, subscribeKey mount/unmount). A flush also closes the
+// window, so the first keystroke after a save writes at once. The in-memory marks
 // (pendingKeys, latestGenerationByKey) still change synchronously on every
 // keystroke, so the unload guard and a save's generation are always current.
 const DRAFT_WRITE_INTERVAL_MS = 2000;
@@ -188,16 +195,19 @@ function persistDraft(key: string, rec: DraftRecord): Promise<void> {
   // beginMutation runs synchronously (before the first await), so a
   // subscribeKey that mounts while the write is in flight waits for it.
   const release = snapshot.beginMutation(key);
-  return (async () => {
-    try {
-      await (await db()).put(STORE, rec);
-      notify(key);
-    } finally { release(); }
-  })();
+  // Once the database is open the put is ISSUED here, synchronously (idb
+  // creates the transaction and request before its first await), so a flush
+  // from pagehide/beforeunload has its request queued before the handler
+  // returns (#901 review A1). Only a write before the first open awaits it.
+  const put = dbHandle ? dbHandle.put(STORE, rec) : db().then((d) => d.put(STORE, rec));
+  return put.then(() => { notify(key); }).finally(release);
 }
 const writes = createDraftWriteCoalescer<DraftRecord>(persistDraft, DRAFT_WRITE_INTERVAL_MS);
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {
+  // beforeunload too: while the leave-page prompt shows, the newest typing is
+  // already on disk rather than only in memory.
+  window.addEventListener("beforeunload", () => { void writes.flushAll(); });
   window.addEventListener("pagehide", () => { void writes.flushAll(); });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") void writes.flushAll();

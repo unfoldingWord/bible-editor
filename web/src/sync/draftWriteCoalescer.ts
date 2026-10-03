@@ -21,8 +21,9 @@ export interface CoalescerClock {
 export interface DraftWriteCoalescer<T> {
   // Queue `value` as `key`'s latest. Writes at once when no window is open.
   write(key: string, value: T): void;
-  // Write `key`'s queued value now; resolves once every write started for
-  // `key` so far has settled.
+  // Write `key`'s queued value now (persist is called synchronously) and
+  // close its window; resolves once every write started for `key` so far has
+  // settled.
   flush(key: string): Promise<void>;
   flushAll(): Promise<void>;
   // Drop `key`'s queued value and close its window (the draft was cleared).
@@ -85,10 +86,13 @@ export function createDraftWriteCoalescer<T>(
 
   const flush = (key: string): Promise<void> => {
     const w = windows.get(key);
-    if (w?.queued) {
-      const { value } = w.queued;
-      w.queued = undefined;
-      start(key, value);
+    if (w) {
+      // Close the window (#901 review C2): after a flush (a save, a hide, a
+      // read) the next keystroke writes at once, so the chip, the toast's
+      // save-covers-this-draft check and other tabs see it without the lag.
+      clock.clearTimeout(w.timer);
+      windows.delete(key);
+      if (w.queued) start(key, w.queued.value);
     }
     const active = inFlight.get(key);
     return active ? Promise.all([...active]).then(() => undefined) : Promise.resolve();

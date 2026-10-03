@@ -113,6 +113,34 @@ function harness(interval = 2000) {
   assert.deepEqual(puts, [["a", 1], ["b", 1], ["a", 2], ["b", 2]]);
 }
 
+// #901 review A1: flushAll must call persist synchronously (inside the
+// pagehide/beforeunload handler), not after an await.
+{
+  const { puts, coalescer } = harness();
+  coalescer.write("a", 1);
+  coalescer.write("a", 2);
+  coalescer.write("b", 1);
+  coalescer.write("b", 2);
+  void coalescer.flushAll();
+  assert.deepEqual(puts, [["a", 1], ["b", 1], ["a", 2], ["b", 2]]);
+}
+
+// #901 review C2: a flush (before a save, or before a save's clear) closes the
+// window, so the next keystroke writes at once instead of up to 2 s later.
+{
+  const { puts, coalescer } = harness();
+  coalescer.write("k", 1);
+  coalescer.write("k", 2);
+  void coalescer.flush("k");
+  assert.equal(puts.length, 2);
+  coalescer.write("k", 3);
+  assert.deepEqual(puts.at(-1), ["k", 3], "first keystroke after a flush writes immediately");
+  // A flush with nothing queued also closes an open window.
+  void coalescer.flush("k");
+  coalescer.write("k", 4);
+  assert.deepEqual(puts.at(-1), ["k", 4]);
+}
+
 // cancel drops the queued value (the draft was cleared): it must never land
 // after the clear and resurrect the draft.
 {
