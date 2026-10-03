@@ -280,3 +280,59 @@ test("a Save drained by a tab holding an older draft generation of its own still
     .toBe(false);
   await context.close();
 });
+
+// #1100 review C1: the same drain, but tab B still has the note open with its
+// own unsaved typing. The superseded clear deletes A's saved record and drops
+// B's older marks; B's open card must then re-back-up its typing (NoteCard's
+// draft effect re-runs set() when the row version moves) so the record and
+// the leave-page guard come back.
+test("a tab draining another tab's Save keeps its own open unsaved typing backed up (#1100)", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "open1100");
+  const chap = await fetchChapter(context.request, auth.token, "ZEC", 8);
+  const row = chap.tn.find((r) => r.verse === 2 && r.ref_raw === "8:2");
+  expect(row, "ZEC 8:2 needs a tn row").toBeTruthy();
+  const id = row!.id;
+  const key = `row:tn:ZEC:${id}`;
+
+  const tabB = await context.newPage();  await gotoVerse(tabB, "ZEC", 8, 2);
+  const textareaB = await openNoteEditor(tabB, id);
+  const older = " OPENB1100";
+  await textareaB.click();
+  await tabB.keyboard.press("ControlOrMeta+End");
+  await tabB.keyboard.type(older, { delay: 30 });
+  await expect.poll(async () => (await readRowDraft(tabB, key))?.note ?? "").toContain(older.trim());
+
+  const tabA = await context.newPage();
+  await tabA.route((url) => url.pathname === `/api/rows/tn/${id}`, (route) =>
+    route.request().method() === "PATCH" ? route.abort() : route.continue());
+  await gotoVerse(tabA, "ZEC", 8, 2);
+  const textareaA = await openNoteEditor(tabA, id);
+  const newer = " OPENA1100";
+  await textareaA.click();
+  await tabA.keyboard.press("ControlOrMeta+End");
+  await tabA.keyboard.type(newer, { delay: 30 });
+  await expect.poll(async () => (await readRowDraft(tabA, key))?.note ?? "").toContain(newer.trim());
+  await saveNote(tabA, id);
+  await expect
+    .poll(async () => (await outboxOps(tabA)).some((o) => o.startsWith("pending:") && !o.endsWith(":0")))
+    .toBe(true);
+  await tabA.close();
+
+  await tabB.evaluate(() => window.dispatchEvent(new Event("online")));
+  await waitForServerNote(context.request, auth.token, "ZEC", 8, id, (n) => (n ?? "").includes(newer.trim()), 20_000);
+  await expect.poll(() => outboxCount(tabB)).toBe(0);
+  await expectStays(async () => {
+    const d = await readRowDraft(tabB, key);
+    return !!d && (d.note ?? "").includes(older.trim()) && !(d.note ?? "").includes(newer.trim());
+  }, "tab B's open unsaved typing must stay backed up in the draft store");
+  expect(
+    await tabB.evaluate(() => {
+      const e = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(e);
+      return e.defaultPrevented;
+    }),
+    "tab B must still warn about its unsaved typing",
+  ).toBe(true);
+  await context.close();
+});

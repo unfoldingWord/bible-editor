@@ -524,6 +524,11 @@ async function clearRowDraftAfterOk(key: string, op: OutboxOp, latestAt200: stri
     return { remove, rec, checked };
   });
   if (!remove) return;
+  // Releasing a superseded tab's older marks (#1100) cannot strand typing
+  // still open in that tab: its mounted NoteCard re-runs set() when the 200
+  // moves row.version and its text differs from the saved row. Measured in
+  // s21 "keeps its own open unsaved typing backed up": that set() ran before
+  // this handler, so the read saw the newer generation and kept the record.
   if (rowDraftMarksReleasable(latestGenerationByKey.get(key), checked, rec?.generation)) {
     latestGenerationByKey.delete(key);
     pendingKeys.delete(key);

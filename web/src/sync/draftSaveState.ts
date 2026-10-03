@@ -235,14 +235,6 @@ export function rowDraftClearAfterOk(
   return true;
 }
 
-// Whether this tab's latest set() for a key (`own`) began strictly before the
-// stored record was written (#1100). The store then already replaced that
-// typing with the record, so the record decides the clear. The caller flushes
-// this tab's queued write before reading the store, so own typing newer than
-// the record either is the record or started after the flush and carries a
-// later time. A generation is "<Date.now()>:<seq>:<random>" (drafts.ts
-// nextGeneration); one without a readable time, or a set() in the same
-// millisecond as the record, keeps the draft.
 // After the 200 handler deleted a row draft: whether this tab's in-memory
 // marks for the key (pendingKeys, latestGenerationByKey) go too (#1100 review
 // F1). `latest` is the key's mark now, `checked` the one rowDraftClearAfterOk
@@ -259,6 +251,14 @@ export function rowDraftMarksReleasable(
   return latest === undefined || latest === recGeneration || latest === checked;
 }
 
+// Whether this tab's latest set() for a key (`own`) began strictly before the
+// stored record was written (#1100). The store then already replaced that
+// typing with the record, so the record decides the clear. The caller flushes
+// this tab's queued write before reading the store, so own typing newer than
+// the record either is the record or started after the flush and carries a
+// later time. A generation is "<Date.now()>:<seq>:<random>" (drafts.ts
+// nextGeneration); one without a readable time, or a set() in the same
+// millisecond as the record, keeps the draft.
 function ownGenerationSuperseded(own: string, rec: Pick<DraftRecord, "updatedAt">): boolean {
   const startedAt = Number(own.split(":", 1)[0]);
   return Number.isFinite(startedAt) && startedAt < rec.updatedAt;
