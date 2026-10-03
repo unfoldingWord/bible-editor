@@ -217,3 +217,122 @@ test("a Save drained by a fresh tab still clears the saved draft", async ({ brow
     .toBeNull();
   await context.close();
 });
+
+test("a Save drained by a tab holding an older draft generation of its own still clears the draft (#1100)", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "older1100");
+  const chap = await fetchChapter(context.request, auth.token, "ZEC", 8);
+  const row = chap.tn.find((r) => r.verse === 7 && r.ref_raw === "8:7");
+  expect(row, "ZEC 8:7 needs a tn row").toBeTruthy();
+  const id = row!.id;
+  const key = `row:tn:ZEC:${id}`;
+
+  // Tab B types in the note without saving, then leaves the chapter. Its
+  // in-memory latest generation for this note stays the older one.
+  const tabB = await context.newPage();  await gotoVerse(tabB, "ZEC", 8, 7);
+  const textareaB = await openNoteEditor(tabB, id);
+  const older = " OLDB1100";
+  await textareaB.click();
+  await tabB.keyboard.press("ControlOrMeta+End");
+  await tabB.keyboard.type(older, { delay: 30 });
+  await expect.poll(async () => (await readRowDraft(tabB, key))?.note ?? "").toContain(older.trim());
+  await tabB.evaluate(() => { location.hash = "#/ZEC/1"; });
+  await expect.poll(async () => (await readRowDraft(tabB, key))?.note ?? "").toContain(older.trim());
+
+  // Tab A writes a newer draft of the same note and saves it, but its PATCH
+  // never reaches the server, so the Save stays queued for tab B to drain.
+  const tabA = await context.newPage();
+  await tabA.route((url) => url.pathname === `/api/rows/tn/${id}`, (route) =>
+    route.request().method() === "PATCH" ? route.abort() : route.continue());
+  await gotoVerse(tabA, "ZEC", 8, 7);
+  const textareaA = await openNoteEditor(tabA, id);
+  const newer = " NEWA1100";
+  await textareaA.click();
+  await tabA.keyboard.press("ControlOrMeta+End");
+  await tabA.keyboard.type(newer, { delay: 30 });
+  await expect.poll(async () => (await readRowDraft(tabA, key))?.note ?? "").toContain(newer.trim());
+  await saveNote(tabA, id);
+  await expect
+    .poll(async () => (await outboxOps(tabA)).some((o) => o.startsWith("pending:") && !o.endsWith(":0")))
+    .toBe(true);
+  await tabA.close();
+
+  // Wake tab B's drain; it lands tab A's Save. Tab B is the only tab that can:
+  // tab A aborted every PATCH for this row and is closed, so the server note
+  // carrying the newer typing proves tab B ran the 200 handler.
+  await tabB.evaluate(() => window.dispatchEvent(new Event("online")));
+  await waitForServerNote(context.request, auth.token, "ZEC", 8, id, (n) => (n ?? "").includes(newer.trim()), 20_000);
+  await expect.poll(() => outboxCount(tabB)).toBe(0);
+  await expect
+    .poll(() => readRowDraft(tabB, key), { message: "the saved draft must be cleared", timeout: 10_000 })
+    .toBeNull();
+  // Review F1: tab B's own older marks go with the record, so its leave-page
+  // guard no longer fires (a synthetic beforeunload is not prevented).
+  await expect
+    .poll(
+      () => tabB.evaluate(() => {
+        const e = new Event("beforeunload", { cancelable: true });
+        window.dispatchEvent(e);
+        return e.defaultPrevented;
+      }),
+      { message: "tab B must not warn about unsaved changes", timeout: 10_000 },
+    )
+    .toBe(false);
+  await context.close();
+});
+
+// #1100 review C1: the same drain, but tab B still has the note open with its
+// own unsaved typing. The superseded clear deletes A's saved record and drops
+// B's older marks; B's open card must then re-back-up its typing (NoteCard's
+// draft effect re-runs set() when the row version moves) so the record and
+// the leave-page guard come back.
+test("a tab draining another tab's Save keeps its own open unsaved typing backed up (#1100)", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const { context, auth } = await newUserContext(browser, "open1100");
+  const chap = await fetchChapter(context.request, auth.token, "ZEC", 8);
+  const row = chap.tn.find((r) => r.verse === 2 && r.ref_raw === "8:2");
+  expect(row, "ZEC 8:2 needs a tn row").toBeTruthy();
+  const id = row!.id;
+  const key = `row:tn:ZEC:${id}`;
+
+  const tabB = await context.newPage();  await gotoVerse(tabB, "ZEC", 8, 2);
+  const textareaB = await openNoteEditor(tabB, id);
+  const older = " OPENB1100";
+  await textareaB.click();
+  await tabB.keyboard.press("ControlOrMeta+End");
+  await tabB.keyboard.type(older, { delay: 30 });
+  await expect.poll(async () => (await readRowDraft(tabB, key))?.note ?? "").toContain(older.trim());
+
+  const tabA = await context.newPage();
+  await tabA.route((url) => url.pathname === `/api/rows/tn/${id}`, (route) =>
+    route.request().method() === "PATCH" ? route.abort() : route.continue());
+  await gotoVerse(tabA, "ZEC", 8, 2);
+  const textareaA = await openNoteEditor(tabA, id);
+  const newer = " OPENA1100";
+  await textareaA.click();
+  await tabA.keyboard.press("ControlOrMeta+End");
+  await tabA.keyboard.type(newer, { delay: 30 });
+  await expect.poll(async () => (await readRowDraft(tabA, key))?.note ?? "").toContain(newer.trim());
+  await saveNote(tabA, id);
+  await expect
+    .poll(async () => (await outboxOps(tabA)).some((o) => o.startsWith("pending:") && !o.endsWith(":0")))
+    .toBe(true);
+  await tabA.close();
+
+  await tabB.evaluate(() => window.dispatchEvent(new Event("online")));
+  await waitForServerNote(context.request, auth.token, "ZEC", 8, id, (n) => (n ?? "").includes(newer.trim()), 20_000);
+  await expect.poll(() => outboxCount(tabB)).toBe(0);
+  await expectStays(async () => {
+    const d = await readRowDraft(tabB, key);
+    return !!d && (d.note ?? "").includes(older.trim()) && !(d.note ?? "").includes(newer.trim());
+  }, "tab B's open unsaved typing must stay backed up in the draft store");
+  expect(
+    await tabB.evaluate(() => {
+      const e = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(e);
+      return e.defaultPrevented;
+    }),
+    "tab B must still warn about its unsaved typing",
+  ).toBe(true);
+  await context.close();
+});

@@ -16,6 +16,7 @@ import {
   pinReleaseForVerseExit,
   NO_ROW_DRAFT,
   rowDraftClearAfterOk,
+  rowDraftMarksReleasable,
   verseOpExitInfo,
   type VerseOpExit,
   type VerseOpExitInfo,
@@ -513,17 +514,22 @@ async function clearRowDraftAfterOk(key: string, op: OutboxOp, latestAt200: stri
   await writes.flush(key);
   // Inside withDb so a closed connection reopens and reruns the whole
   // read + delete (#1102); the in-memory marks below run once, after it.
-  const { remove, rec } = await withDb(async (idb) => {
+  const { remove, rec, checked } = await withDb(async (idb) => {
     const tx = idb.transaction(STORE, "readwrite");
     const rec = (await tx.store.get(key)) as DraftRecord | undefined;
-    const remove = rowDraftClearAfterOk(op, latestAt200, latestGenerationByKey.get(key), rec);
+    const checked = latestGenerationByKey.get(key);
+    const remove = rowDraftClearAfterOk(op, latestAt200, checked, rec);
     if (remove) await tx.store.delete(key);
     await tx.done;
-    return { remove, rec };
+    return { remove, rec, checked };
   });
   if (!remove) return;
-  const latest = latestGenerationByKey.get(key);
-  if (latest === undefined || latest === rec?.generation) {
+  // Releasing a superseded tab's older marks (#1100) cannot strand typing
+  // still open in that tab: its mounted NoteCard re-runs set() when the 200
+  // moves row.version and its text differs from the saved row. Measured in
+  // s21 "keeps its own open unsaved typing backed up": that set() ran before
+  // this handler, so the read saw the newer generation and kept the record.
+  if (rowDraftMarksReleasable(latestGenerationByKey.get(key), checked, rec?.generation)) {
     latestGenerationByKey.delete(key);
     pendingKeys.delete(key);
   }
