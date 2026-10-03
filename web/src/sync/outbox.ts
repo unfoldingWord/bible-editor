@@ -111,6 +111,11 @@ export interface OutboxOp {
   patch: Record<string, unknown>;
   expectedVersion: number;
   queuedAt: number;
+  // The original enqueue time, set once and never moved (#1100). queuedAt is
+  // the FIFO position, which a 409 resolve or a retry resets to "now"; the
+  // row-draft clear for a NO_ROW_DRAFT op compares against this instead.
+  // Set on row patches only; absent on older records (fall back to queuedAt).
+  firstQueuedAt?: number;
   // Monotonic per-session counter breaking queuedAt ties (ms granularity) so
   // two enqueues in the same millisecond keep their true order — the IDB
   // index otherwise falls back to primary-key (uuid) order. Absent on
@@ -290,13 +295,15 @@ export const outbox = {
     if (isReadOnly()) {
       return noopOp({ kind: "row", rowKind, id, book: opts.book }, "patch", patch);
     }
+    const queuedAt = Date.now();
     const op: OutboxOp = {
       id: uid(),
       target: { kind: "row", rowKind, id, book: opts.book },
       action: "patch",
       patch,
       expectedVersion,
-      queuedAt: Date.now(),
+      queuedAt,
+      firstQueuedAt: queuedAt,
       seq: nextSeq(),
       attempts: 0,
       status: "pending",
