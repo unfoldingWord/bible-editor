@@ -162,4 +162,61 @@ assert.equal(
   "no draft at enqueue, nothing stored: nothing to delete",
 );
 
+// #1100 case 1: only the tab holding the drain lock runs the 200 handler, and
+// its in-memory generation is its own. Tab B drains tab A's save of A's newer
+// draft while B still holds an older generation of its own for that note. The
+// store holds A's saved generation, written after B's last set() began, so
+// B's typing is already superseded there: clear. A B generation that started
+// at or after the stored write is live typing: keep. Generations are
+// "<Date.now()>:<seq>:<random>" (drafts.ts nextGeneration).
+assert.equal(
+  rowDraftClearAfterOk(genOp("200:1:a"), "100:4:b", "100:4:b", rec("200:1:a", 200)),
+  true,
+  "other tab drains the saved draft while holding an older own generation: clear",
+);
+assert.equal(
+  rowDraftClearAfterOk(genOp("200:1:a"), "100:4:b", "300:5:b", rec("200:1:a", 200)),
+  false,
+  "other tab started newer typing after the stored write: keep",
+);
+assert.equal(
+  rowDraftClearAfterOk(genOp("200:1:a"), "200:5:b", "200:5:b", rec("200:1:a", 200)),
+  false,
+  "other tab's set() in the same millisecond as the stored write: keep",
+);
+assert.equal(
+  rowDraftClearAfterOk(genOp("200:1:a"), "g0", "g0", rec("200:1:a", 200)),
+  false,
+  "an own generation without a readable start time: keep",
+);
+assert.equal(
+  rowDraftClearAfterOk(genOp("200:1:a"), "100:4:b", "100:4:b", rec("300:2:a", 300)),
+  false,
+  "older own generation, but the store holds newer unsaved typing: keep",
+);
+
+// #1100 case 2: a 409 resolve or a fatal-failure retry moves the op's queuedAt
+// to "now". A NO_ROW_DRAFT op must still compare against its ORIGINAL enqueue
+// time (firstQueuedAt), or it deletes another tab's typing written between
+// that enqueue and the requeue. Legacy ops without the field keep queuedAt.
+const requeued = (firstQueuedAt) => ({
+  ...genOp(NO_ROW_DRAFT, { note: "old typed" }, 500),
+  ...(firstQueuedAt === undefined ? {} : { firstQueuedAt }),
+});
+assert.equal(
+  rowDraftClearAfterOk(requeued(100), undefined, undefined, rec("200:1:a", 300)),
+  false,
+  "requeued draftless op, typing written after the original enqueue: keep",
+);
+assert.equal(
+  rowDraftClearAfterOk(requeued(100), undefined, undefined, rec("old", 50)),
+  true,
+  "requeued draftless op, draft older than the original enqueue: clear",
+);
+assert.equal(
+  rowDraftClearAfterOk(requeued(undefined), undefined, undefined, rec("old", 300)),
+  true,
+  "legacy op without firstQueuedAt keeps comparing against queuedAt",
+);
+
 console.log("rowDraftClear: all assertions passed");
