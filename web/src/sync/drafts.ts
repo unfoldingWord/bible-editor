@@ -97,9 +97,6 @@ const conn = createDraftDbConnection<IDBPDatabase>(({ terminated, blocking }) =>
     blocking,
   }));
 const withDb = conn.run;
-function db(): Promise<IDBPDatabase> {
-  return withDb((d) => d);
-}
 
 // Synchronous mirror of "a draft was written this session and not yet cleared".
 // The subscription-driven signal (useUnsavedGuard's hasDrafts) only updates
@@ -514,12 +511,16 @@ function handleVerseExit(op: OutboxOp, exit: VerseOpExit, updated?: unknown): vo
 // in-memory dirty marks are dropped only while no newer set() has started.
 async function clearRowDraftAfterOk(key: string, op: OutboxOp, latestAt200: string | undefined): Promise<void> {
   await writes.flush(key);
-  const idb = await db();
-  const tx = idb.transaction(STORE, "readwrite");
-  const rec = (await tx.store.get(key)) as DraftRecord | undefined;
-  const remove = rowDraftClearAfterOk(op, latestAt200, latestGenerationByKey.get(key), rec);
-  if (remove) await tx.store.delete(key);
-  await tx.done;
+  // Inside withDb so a closed connection reopens and reruns the whole
+  // read + delete (#1102); the in-memory marks below run once, after it.
+  const { remove, rec } = await withDb(async (idb) => {
+    const tx = idb.transaction(STORE, "readwrite");
+    const rec = (await tx.store.get(key)) as DraftRecord | undefined;
+    const remove = rowDraftClearAfterOk(op, latestAt200, latestGenerationByKey.get(key), rec);
+    if (remove) await tx.store.delete(key);
+    await tx.done;
+    return { remove, rec };
+  });
   if (!remove) return;
   const latest = latestGenerationByKey.get(key);
   if (latest === undefined || latest === rec?.generation) {

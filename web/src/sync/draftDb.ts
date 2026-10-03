@@ -33,6 +33,10 @@ export function createDraftDbConnection<D extends Closable>(
 
   function connect(): Promise<D> {
     if (dbp) return dbp;
+    // Known limit: after `blocking` because another tab opened a NEWER
+    // version, this tab's reopen (at its old version) fails with VersionError.
+    // That is not retried and not cached, so each backup retries the open and
+    // fails with only a console.warn until this tab reloads.
     let opened: D | null = null;
     // Each callback drops only its own connection, never a newer one.
     const drop = () => {
