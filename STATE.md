@@ -108,7 +108,17 @@ Highlights that bite repeatedly:
   (`verseMerge.ts` step 3b), so an unlock → fix → re-lock → `lock/push` fix still in review is not reverted; and
   a markers-only overwrite is a real overwrite worth seeing in history (#951) but not a data-loss alert. Only a
   run's own `adopt_conflict` may reactivate a resolved flag. Structure paths honor the lock since #999
-  (#949); tn/tq/twl (#950) do not yet.
+  (#949); tn/tq/twl follow it since #950 (PR #1091).
+
+- **On a locked book the TSV ancestor advances through the sync's own writes; the verse ancestor cannot (#1090).**
+  Every tn/tq/twl edit_log row with `source = 'dcs_reimport'` carries master's own value for each content field it
+  names (adoptions log only `merge.writeFields`, overwrites/creates log master's row), so right after it D1 and
+  Door43 agreed on that field: a valid ancestor. `reconstructTsvBases(..., bookLocked)` overlays those writes past
+  the frozen boundary, so a second Door43 edit to an already-adopted note adopts cleanly instead of flagging
+  "merged over your app-side change". The same trick is unsafe for verses: the source-attr reconcile writes
+  `dcs_reimport` rows over a translator's wording (`verseMerge.ts` step 3b comment), so verse step 3b keeps the
+  false flag by design. A row whose LATEST edit is an AI apply never reaches the TSV merge at all (it is AI-only,
+  overwritten via `update_ai`).
 
 - **D1 allows at most 5 terms in a compound SELECT (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`); node:sqlite allows
   500.** A 6-term `UNION ALL` fails on local workerd and remote D1 with `too many terms in compound SELECT`

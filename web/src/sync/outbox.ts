@@ -150,7 +150,7 @@ export interface OutboxOp {
   // row patches; absent for verse/status/lane ops and pre-baseline records.
   baseline?: Record<string, unknown>;
   // Exact local text-draft generation captured by this save. Used only for
-  // generation-safe cleanup after a successful verse PATCH (drafts.ts).
+  // generation-safe cleanup after a successful verse or row PATCH (drafts.ts).
   draftGeneration?: string;
   // Exact local ALIGNMENT-draft generation captured by this save (a separate
   // IndexedDB store — see alignmentDrafts.ts). Deliberately a distinct field
@@ -280,7 +280,12 @@ export const outbox = {
     id: string,
     expectedVersion: number,
     patch: Record<string, unknown>,
-    opts: { restoredFromVersion?: number; book: string; baseline?: Record<string, unknown> },
+    opts: {
+      restoredFromVersion?: number;
+      book: string;
+      baseline?: Record<string, unknown>;
+      draftGeneration?: string;
+    },
   ): Promise<OutboxOp> {
     if (isReadOnly()) {
       return noopOp({ kind: "row", rowKind, id, book: opts.book }, "patch", patch);
@@ -299,6 +304,7 @@ export const outbox = {
         ? { restoredFromVersion: opts.restoredFromVersion }
         : {}),
       ...(opts.baseline !== undefined ? { baseline: opts.baseline } : {}),
+      ...(opts.draftGeneration ? { draftGeneration: opts.draftGeneration } : {}),
     };
     await (await db()).put(STORE, op);
     void notify();
