@@ -243,6 +243,22 @@ export function rowDraftClearAfterOk(
 // later time. A generation is "<Date.now()>:<seq>:<random>" (drafts.ts
 // nextGeneration); one without a readable time, or a set() in the same
 // millisecond as the record, keeps the draft.
+// After the 200 handler deleted a row draft: whether this tab's in-memory
+// marks for the key (pendingKeys, latestGenerationByKey) go too (#1100 review
+// F1). `latest` is the key's mark now, `checked` the one rowDraftClearAfterOk
+// decided on. A set() after the decision replaces the mark with a new
+// generation, so a mark still equal to `checked` (including this tab's own
+// older generation, superseded in the store) or to the deleted record is not
+// live typing; leaving it set kept the leave-page guard on and let a later
+// save carry the stale generation.
+export function rowDraftMarksReleasable(
+  latest: string | undefined,
+  checked: string | undefined,
+  recGeneration: string | undefined,
+): boolean {
+  return latest === undefined || latest === recGeneration || latest === checked;
+}
+
 function ownGenerationSuperseded(own: string, rec: Pick<DraftRecord, "updatedAt">): boolean {
   const startedAt = Number(own.split(":", 1)[0]);
   return Number.isFinite(startedAt) && startedAt < rec.updatedAt;
