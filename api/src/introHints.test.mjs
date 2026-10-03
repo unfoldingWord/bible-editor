@@ -246,7 +246,10 @@ function assert(cond, msg) {
     /parent_id IS NULL/.test(guards),
     "top-level threads only — a reply must not be double-counted as its own hint",
   );
-  assert(/kind = 'note'/.test(guards), "scoped to notes, not open questions");
+  assert(
+    /kind IN \('note', 'question'\)/.test(guards),
+    "reads both comment kinds — the composer defaults to Question, and an editor who starts a comment with AI: means it for the AI either way (issue #1079)",
+  );
   assert(/resolved_at IS NULL/.test(guards), "excludes already-resolved comments");
   assert(/deleted_at IS NULL/.test(guards), "excludes soft-deleted comments");
 
