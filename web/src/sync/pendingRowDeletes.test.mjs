@@ -350,8 +350,8 @@ function tab(h, own = null) {
     onResult: (fn) => (results.add(fn), () => results.delete(fn)),
     onDiscard: (fn) => (discards.add(fn), () => discards.delete(fn)),
     channel: h ? h.channel() : null,
-    isOwn: own?.isOwn ?? ((t) => marks.has(key(t))),
-    clearOwn: own?.clearOwn ?? ((t) => marks.delete(key(t))),
+    isOwn: own?.isOwn ?? ((op) => marks.has(key(op.target))),
+    clearOwn: own?.clearOwn ?? ((op) => marks.delete(key(op.target))),
   }) ?? { on: () => () => {} };
   const seen = [];
   outcomes.on((o) => seen.push(o));
@@ -438,20 +438,70 @@ const sig = (o) => `${o.kind}:${o.op.target.id}:${o.remote ? "remote" : "local"}
   // ...and this tab's own delete refused in tab B during A's plain refetch
   // shows its row (A's rollback restores it; hiding it here would undo that).
   const h = hub();
-  const a = tab(h, { isOwn: mod.isOwnRowDelete, clearOwn: mod.clearOwnRowDelete });
+  const a = tab(h, { isOwn: mod.isOwnRowDeleteOp, clearOwn: mod.forgetOwnRowDeleteOp });
   const b = tab(h);
   mark("q1");
+  mod.recordOwnRowDeleteOp?.(del("tq", "q1"));
   let ops = [del("tq", "q1")];
   let resolveGet;
   const load = wrap(() => new Promise((res) => (resolveGet = res)), async () => ops, mod.rowDeleteHooks?.(a.outcomes) ?? {});
   const p = load(new AbortController().signal, () => {});
   await new Promise((res) => setTimeout(res, 0));
   ops = [];
-  b.result(del("tq", "q1", "in_flight"), "locked");
+  b.result({ ...del("tq", "q1"), status: "in_flight" }, "locked");
   await settle();
   resolveGet(payload());
   check(ids((await p).tq).join() === "q1,q2", "#1119: this tab's delete refused in another tab during the plain refetch shows its row");
   check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "q1" }) === false, "#1119: and its own mark is cleared");
+}
+
+// Review A1: only a DELETE op in the after-read counts as "seen". A queued
+// PATCH of the row (edited offline, then deleted while the after-read ran)
+// must not make the unseen-mark path skip the row.
+{
+  const r = run({ ops: [], ...tracked() });
+  await r.ready();
+  mark("q1");
+  r.ops = [{ ...del("tq", "q1"), id: "patch-q1", action: "patch" }]; // the read sees the PATCH, not the new DELETE
+  check(ids((await r.finish()).tq).join() === "q2", "#1119 A1: a queued PATCH of the row does not count as its DELETE being seen");
+  unmark("q1");
+}
+
+// Review A2: own-ness and clearing are per op, not per row.
+{
+  // (a) Tabs A and C both delete q1. C's DELETE is refused: in A it is not
+  // own (A's rollback must not run for it) and A's mark stays while A's own
+  // DELETE is pending.
+  const h = hub();
+  const a = tab(h, { isOwn: mod.isOwnRowDeleteOp, clearOwn: mod.forgetOwnRowDeleteOp });
+  const c = tab(h);
+  mark("q1");
+  mod.recordOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "opA" });
+  c.result({ ...del("tq", "q1", "in_flight"), id: "opC" }, "locked");
+  await settle();
+  check(a.seen.map(sig).join() === "abandoned:q1:remote:other", "#1119 A2: another tab's refused DELETE of a row this tab also deleted is not own");
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "q1" }) === true, "#1119 A2: and it leaves this tab's mark while its own DELETE is pending");
+  // A's own op refused: own, and now the mark goes.
+  c.result({ ...del("tq", "q1", "in_flight"), id: "opA" }, "locked");
+  await settle();
+  check(sig(a.seen.at(-1)) === "abandoned:q1:remote:own", "#1119 A2: this tab's own op refused elsewhere is own");
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "q1" }) === false, "#1119 A2: and clears the mark");
+}
+{
+  // (b) A delayed refusal of an older DELETE does not clear the mark of the
+  // row's newer DELETE (deleted again after it came back).
+  const h = hub();
+  const a = tab(h, { isOwn: mod.isOwnRowDeleteOp, clearOwn: mod.forgetOwnRowDeleteOp });
+  const b = tab(h);
+  mark("q1");
+  mod.recordOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "old" });
+  mark("q1");
+  mod.recordOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "new" });
+  b.result({ ...del("tq", "q1", "in_flight"), id: "old" }, "locked");
+  await settle();
+  check(sig(a.seen.at(-1)) === "abandoned:q1:remote:own", "#1119 A2: the older own op's refusal is own");
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "q1" }) === true, "#1119 A2: but keeps the mark of the newer DELETE");
+  unmark("q1");
 }
 
 console.log(`pendingRowDeletes: ${passed} passed`);
