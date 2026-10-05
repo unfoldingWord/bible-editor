@@ -6,7 +6,12 @@
 // listeners, so a tab relays what it drains even before anything subscribes.
 
 import { onOutboxDiscard, onOutboxResult } from "./outbox";
-import { createRowDeleteOutcomes, forgetOwnRowDeleteOp, isOwnRowDeleteOp } from "./pendingRowDeletes";
+import {
+  createRowDeleteOutcomes,
+  forgetOwnRowDeleteOp,
+  isOwnRowDeleteOp,
+  settleOwnRowDeleteOp,
+} from "./pendingRowDeletes";
 
 const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("be-row-delete-outcomes") : null;
 
@@ -16,4 +21,12 @@ export const rowDeleteOutcomes = createRowDeleteOutcomes({
   channel,
   isOwn: isOwnRowDeleteOp,
   clearOwn: forgetOwnRowDeleteOp,
+  settleOwn: settleOwnRowDeleteOp,
+});
+
+// Dev only (#1126 item 4): a hot reload of this module would otherwise leave
+// the old instance relaying into the new one (a double rollback).
+import.meta.hot?.dispose(() => {
+  rowDeleteOutcomes.close();
+  channel?.close();
 });

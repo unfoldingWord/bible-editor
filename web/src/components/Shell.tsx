@@ -99,7 +99,7 @@ import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
 import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
 import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
-import { markOwnRowDelete, recordOwnRowDeleteOp } from "../sync/pendingRowDeletes";
+import { dropOwnRowDeleteClick, markOwnRowDelete, recordOwnRowDeleteClickOp } from "../sync/pendingRowDeletes";
 import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
 import {
   alignmentDraftKey,
@@ -1225,16 +1225,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // Best-effort: the next chapter refetch catches up.
     }
   }, [fetchRollbackChapter]);
+  // A chapter_locked refusal means this tab's view of the pipeline is stale:
+  // refresh it (one reload at a time).
+  const reloadLocks = useCallback(() => {
+    lockReloadRef.current ??= pipelineStore
+      .reload()
+      .catch(() => undefined)
+      .finally(() => {
+        lockReloadRef.current = null;
+      });
+  }, []);
   useEffect(
     () =>
       onOutboxResult((op, result) => {
         if (result.kind === "locked") {
-          lockReloadRef.current ??= pipelineStore
-            .reload()
-            .catch(() => undefined)
-            .finally(() => {
-              lockReloadRef.current = null;
-            });
+          reloadLocks();
           // An aligner save's toast waits for alignmentDrafts to say whether
           // the drags were kept (onAlignerSaveRefused below), and so does its
           // cache rollback: a mounted panel's reset to the server's row then
@@ -1248,7 +1253,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           );
         }
       }),
-    [pushPipelineToast, rollBackRefusedVerse, rollBackRefusedRowDelete],
+    [pushPipelineToast, reloadLocks, rollBackRefusedVerse, rollBackRefusedRowDelete],
   );
   // #1075: a discarded verse op (an unresolvable 409, a refused save, discard
   // all) leaves its optimistic content in the caches just as a lock refusal
@@ -1266,13 +1271,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // #1119: this tab's row DELETE refused or discarded in another tab (the
   // drain is shared across tabs, its announcements are not) gets the same
   // rollback here, since this tab hid the row. Local outcomes are handled by
-  // the two listeners above.
+  // the two listeners above. A refusal also gets the draining tab's toast and
+  // lock reload, so the row coming back here is explained (#1126 item 1).
   useEffect(
     () =>
       rowDeleteOutcomes.on((o) => {
-        if (o.remote && o.own && o.kind === "abandoned") void rollBackRefusedRowDelete(o.op);
+        if (!(o.remote && o.own && o.kind === "abandoned")) return;
+        void rollBackRefusedRowDelete(o.op);
+        if (o.reason === "locked") {
+          reloadLocks();
+          pushPipelineToast(
+            "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+            "error",
+          );
+        }
       }),
-    [rollBackRefusedRowDelete],
+    [pushPipelineToast, reloadLocks, rollBackRefusedRowDelete],
   );
   // #1071: say "kept" only when a crash draft or an open panel actually holds
   // the refused drags. Two queued saves of one verse refused together get
@@ -4852,9 +4866,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (!row) return;
             applyLocalRowDelete("twl", id);
             if (activeWordId === id) setActiveWordId(null);
-            markOwnRowDelete("twl", row.book, id); // a refetch keeps it hidden (#1107)
+            const click = markOwnRowDelete("twl", row.book, id); // a refetch keeps it hidden (#1107)
             lintDeletedRowChapter.current.set(`twl:${row.book}:${id}`, row.chapter); // #1135
-            void outbox.enqueueDeleteRow("twl", id, row.version, row.book).then(recordOwnRowDeleteOp);
+            // No op queued: drop the click's mark so a load doesn't hide the row (#1126 item 9).
+            void outbox
+              .enqueueDeleteRow("twl", id, row.version, row.book)
+              .then(
+                (op) => recordOwnRowDeleteClickOp(op, click),
+                (e) => {
+                  console.error("Shell: could not queue the word-link delete", e);
+                  dropOwnRowDeleteClick({ rowKind: "twl", book: row.book, id }, click);
+                },
+              );
           }}
           onQuestionSave={(id, patch, opts) => {
             const row = data.tq.find((r) => r.id === id);
@@ -4865,9 +4888,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (!row) return;
             applyLocalRowDelete("tq", id);
             if (activeQuestionId === id) setActiveQuestionId(null);
-            markOwnRowDelete("tq", row.book, id); // a refetch keeps it hidden (#1107)
+            const click = markOwnRowDelete("tq", row.book, id); // a refetch keeps it hidden (#1107)
             lintDeletedRowChapter.current.set(`tq:${row.book}:${id}`, row.chapter); // #1135
-            void outbox.enqueueDeleteRow("tq", id, row.version, row.book).then(recordOwnRowDeleteOp);
+            // No op queued: drop the click's mark so a load doesn't hide the row (#1126 item 9).
+            void outbox
+              .enqueueDeleteRow("tq", id, row.version, row.book)
+              .then(
+                (op) => recordOwnRowDeleteClickOp(op, click),
+                (e) => {
+                  console.error("Shell: could not queue the question delete", e);
+                  dropOwnRowDeleteClick({ rowKind: "tq", book: row.book, id }, click);
+                },
+              );
           }}
           lockedTn={Boolean(chapterLocks.tn)}
           lockedTq={Boolean(chapterLocks.tq)}
