@@ -72,7 +72,7 @@ const ids = (rows) => rows.map((r) => r.id);
 {
   const load = wrap(async () => payload(), async () => [del("tq", "q2")]);
   const out = await load(new AbortController().signal, () => {});
-  check(ids(out.tq).join() === "q1", "the wrapped loader reads the outbox after the GET and hides the row");
+  check(ids(out.tq).join() === "q1", "the wrapped loader hides the row whose DELETE is draining");
 }
 {
   const p = payload();
@@ -110,21 +110,74 @@ const ids = (rows) => rows.map((r) => r.id);
     },
   );
   await load(new AbortController().signal, () => {});
-  check(order.join() === "get,outbox", "the outbox is read after the GET resolves, not before");
+  check(order.join() === "outbox,get,outbox", "the outbox is read before the GET starts and again after it resolves");
 }
 {
-  let listed = false;
+  let listed = 0;
   const load = wrap(
     async () => {
       throw new Error("HTTP 500");
     },
     async () => {
-      listed = true;
+      listed++;
       return [];
     },
   );
   await assert.rejects(load(new AbortController().signal, () => {}), /HTTP 500/);
-  check(!listed, "a failed GET still fails, without reading the outbox");
+  check(listed === 1, "a failed GET still fails, without the after-read");
+}
+
+// The race the after-read alone missed: the DELETE is draining when the GET
+// starts, its small 200 lands and removes the op while the chapter body is
+// still downloading, and the snapshot predates the commit.
+{
+  let ops = [del("tq", "q1", "in_flight")];
+  let resolveGet;
+  const load = wrap(() => new Promise((r) => (resolveGet = r)), async () => ops, () => () => {});
+  const p = load(new AbortController().signal, () => {});
+  await new Promise((r) => setTimeout(r, 0)); // the before-read has run
+  ops = []; // DELETE 200: op removed
+  resolveGet(payload()); // snapshot taken before the commit still holds q1
+  const out = await p;
+  check(ids(out.tq).join() === "q2", "#1107: a DELETE committed while the GET downloads stays hidden (op gone by the after-read)");
+}
+// The same window, but the DELETE is refused (chapter_locked) or discarded:
+// Shell's #1108 rollback restores the row from its own GET, which may land
+// first, so the before-set must not hide it.
+{
+  let ops = [del("tq", "q1")];
+  const listeners = new Set();
+  const onAbandoned = (fn) => {
+    listeners.add(fn);
+    return () => listeners.delete(fn);
+  };
+  let resolveGet;
+  const load = wrap(() => new Promise((r) => (resolveGet = r)), async () => ops, onAbandoned);
+  const p = load(new AbortController().signal, () => {});
+  await new Promise((r) => setTimeout(r, 0));
+  const refused = ops[0];
+  ops = [];
+  for (const l of listeners) l(refused); // the refusal / discard announcement
+  resolveGet(payload());
+  const out = await p;
+  check(ids(out.tq).join() === "q1,q2", "#1108: a DELETE refused or discarded during the GET is not hidden by the before-read");
+  check(listeners.size === 0, "the abandon subscription is released when the load settles");
+}
+{
+  // A failing subscription is fail-safe too.
+  const p = payload();
+  const warn = console.warn;
+  console.warn = () => {};
+  let out;
+  try {
+    const load = wrap(async () => p, async () => [del("tq", "q1")], () => {
+      throw new Error("listener registry broken");
+    });
+    out = await load(new AbortController().signal, () => {});
+  } finally {
+    console.warn = warn;
+  }
+  check(out === p, "a subscription failure lands the snapshot unchanged");
 }
 
 console.log(`pendingRowDeletes: ${passed} passed`);

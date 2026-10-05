@@ -466,11 +466,13 @@ function harness() {
   state = vs.applyStep(state, del);
   const reconnect = seq.refetch(load, true); // WS onOpen after reconnect
   ops = [{ ...ops[0], status: "in_flight" }]; // the drain picks the DELETE up
+  await tick(); // the loader reads the outbox before sending the GET
   reqs[0](chapter([q("X"), q("Y")])); // snapshot taken before the DELETE committed
   await reconnect;
   assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#1107: the offline-deleted row stays hidden after the reconnect merge");
   // A plain refetch (a chapter re-opened, a Refresh) racing the drain too.
   const plain = seq.refetch(load, false);
+  await tick();
   reqs[1](chapter([q("X"), q("Y")]));
   await plain;
   assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#1107: a plain refetch landing before the DELETE commits does not show the row either");
@@ -478,6 +480,7 @@ function harness() {
   // has X. The next GET must show it, never hide a row with no DELETE left.
   ops = [];
   const after = seq.refetch(load, true);
+  await tick();
   reqs[2](chapter([q("X"), q("Y")]));
   await after;
   assert.deepEqual(state.tq.map((r) => r.id), ["X", "Y"], "#1107: with its DELETE gone from the outbox the server's row shows again");
