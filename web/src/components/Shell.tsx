@@ -99,6 +99,7 @@ import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
 import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
 import { markOwnRowDelete } from "../sync/pendingRowDeletes";
+import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
 import {
   alignmentDraftKey,
   alignmentDraftKeyForOp,
@@ -1150,7 +1151,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // are left alone: see refusedRowRollback.ts.
   const restoreRowRef = useRef(restoreRow);
   restoreRowRef.current = restoreRow;
-  const rollBackRefusedRowDelete = useCallback(async (op: OutboxOp) => {
+  const rollBackRefusedRowDelete = useCallback(async (op: Pick<OutboxOp, "id" | "target" | "action">) => {
     const t = op.target;
     if (t.kind !== "row" || op.action !== "delete") return;
     try {
@@ -1231,6 +1232,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         else void rollBackRefusedRowDelete(op);
       }),
     [rollBackRefusedVerse, rollBackRefusedRowDelete],
+  );
+  // #1119: this tab's row DELETE refused or discarded in another tab (the
+  // drain is shared across tabs, its announcements are not) gets the same
+  // rollback here, since this tab hid the row. Local outcomes are handled by
+  // the two listeners above.
+  useEffect(
+    () =>
+      rowDeleteOutcomes.on((o) => {
+        if (o.remote && o.own && o.kind === "abandoned") void rollBackRefusedRowDelete(o.op);
+      }),
+    [rollBackRefusedRowDelete],
   );
   // #1071: say "kept" only when a crash draft or an open panel actually holds
   // the refused drags. Two queued saves of one verse refused together get
