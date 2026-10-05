@@ -41,7 +41,9 @@
 // row deleted while the socket was down (that row.deleted broadcast is lost).
 // Row deletes are the exception (#989, lib/verseStructure.ts
 // `keepStepAcrossSupersede`): the tab's own delete is applied before its
-// DELETE commits, so the new snapshot can still hold the row.
+// DELETE commits, so the new snapshot can still hold the row. A delete made
+// with no merge pending has no step at all; useChapter's loader hides it
+// from the payload while its DELETE drains (#1107, sync/pendingRowDeletes.ts).
 // A plain refetch or a reset drops it; the resolving
 // or failing latest request clears it.
 

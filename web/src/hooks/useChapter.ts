@@ -19,7 +19,8 @@ import {
   type TwlOrderLock,
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
-import { onOutboxResult } from "../sync/outbox";
+import { onOutboxDiscard, onOutboxResult, outbox } from "../sync/outbox";
+import { hidingPendingRowDeletes, isOwnRowDelete } from "../sync/pendingRowDeletes";
 import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
 import { currentRouteFetcher, isChapterLocked, trackNavigation, updateIfCurrent, type ChapterRoute, type NavigationGen } from "../lib/chapterStale";
 import {
@@ -213,9 +214,34 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     // `refetch` captured on an earlier chapter (a "Refresh" toast, the
     // post-unlock refetch) fetches the current chapter instead of replacing
     // its GET with the old one and leaving the view locked (#892).
+    //
+    // A row whose own tq/twl DELETE (this tab's) is draining in the outbox,
+    // or committed while the GET ran, is left out of whatever lands (#1107):
+    // the GET can be answered before the DELETE commits (offline, then the
+    // reconnect GET races the drain). A DELETE refused as chapter_locked or
+    // discarded meanwhile is not hidden: Shell's #1108 rollback restores that
+    // row (the same two triggers).
     const fetchRoute = currentRouteFetcher(routeRef, (b, c, s) => api.getChapter(b, c, s));
     return sequencer.current!.refetch(
-      (signal, onAttempt) => fetchWithRetry(fetchRoute, { signal, onAttempt }),
+      hidingPendingRowDeletes(
+        (signal, onAttempt) => fetchWithRetry(fetchRoute, { signal, onAttempt }),
+        () => outbox.list(),
+        {
+          watch: (on) => {
+            const offResult = onOutboxResult((op, result) => {
+              if (op.target.kind !== "row" || op.action !== "delete") return;
+              if (result.kind === "ok") on.committed(op);
+              else if (result.kind === "locked") on.abandoned(op);
+            });
+            const offDiscard = onOutboxDiscard((op) => on.abandoned(op));
+            return () => {
+              offResult();
+              offDiscard();
+            };
+          },
+          isOwn: isOwnRowDelete,
+        },
+      ),
       opts?.keepNewerLocal === true,
     );
   }, []);
