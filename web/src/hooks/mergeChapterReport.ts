@@ -12,8 +12,10 @@
 // comes whole from one side.
 //
 // Returns null when the inputs can't be merged faithfully (no whole-book base,
-// a different book, or a report from a server without these fields); the
-// caller then fetches the whole book instead.
+// a different book, a report from a server without these fields, or two
+// reports of different lint-schema versions, as when a deploy lands between
+// the base fetch and this one, #1135); the caller then fetches the whole book
+// instead.
 //
 // Pure, with type-only imports, so a node test can load it directly.
 
@@ -23,6 +25,7 @@ export function mergeChapterReport(base: BookLintReport, chunk: BookLintReport):
   const n = chunk.chapter;
   if (typeof n !== "number" || base.chapter !== null || base.book !== chunk.book) return null;
   if (!base.escalateByChapter || !chunk.escalateByChapter) return null;
+  if (base.lintVersion === undefined || base.lintVersion !== chunk.lintVersion) return null;
 
   const order = (i: BookLintIssue): number => i.chapter ?? -1;
   const issues = [
@@ -41,6 +44,7 @@ export function mergeChapterReport(base: BookLintReport, chunk: BookLintReport):
 
   return {
     book: base.book,
+    lintVersion: base.lintVersion,
     chapter: null,
     total: issues.length + escalateCount,
     flagCount: issues.length,

@@ -46,8 +46,18 @@ export interface BookLintReportIssue extends LintIssue {
   section: number;
 }
 
+/** The report's schema version (#1135). Bump it whenever a change would make a
+ *  report from the old code merge wrongly with one from the new: a check moved
+ *  into or out of BOOK_WIDE_CHECKS, the section list reordered, or the chapter
+ *  tagging changed. The client merges a chapter report into its cached
+ *  whole-book report only when both carry the same version, so a deploy that
+ *  lands between the two fetches costs one whole-book fetch, not a wrong chip. */
+export const LINT_REPORT_VERSION = 1;
+
 export interface BookLintReport {
   book: string;
+  /** LINT_REPORT_VERSION of the server that built the report. */
+  lintVersion: number;
   /** null = whole book; N = chapter N's local issues plus all book-wide ones. */
   chapter: number | null;
   /** flagCount + escalateCount, for this response's scope. */
@@ -172,6 +182,7 @@ export async function buildBookLintReport(
   });
   return {
     book,
+    lintVersion: LINT_REPORT_VERSION,
     chapter,
     total: issues.length + escalateCount,
     flagCount: issues.length,

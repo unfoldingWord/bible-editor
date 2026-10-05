@@ -22,7 +22,7 @@ import { OpenChapterProvider } from "./NoteLinkPreview";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
-import { WHOLE_BOOK_LINT_MAX_AGE_MS } from "../hooks/lintRefreshScope";
+import { lintChapterForSavedOp, WHOLE_BOOK_LINT_MAX_AGE_MS } from "../hooks/lintRefreshScope";
 import { useBookLocks } from "../hooks/useBookLocks";
 import { useAlignmentAttention } from "../hooks/useAlignmentAttention";
 import { useLexicon } from "../hooks/useLexicon";
@@ -523,7 +523,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // api/src/lint.ts), so no kind filter here (#887).
       scheduleLintRefetch(row.chapter);
     },
-    onDelete: (kind, id) => applyLocalRowDelete(kind, id),
+    // A delete broadcast changes the lint set the same way, and this room's
+    // rows are all in `chapter` (#1135).
+    onDelete: (kind, id) => {
+      applyLocalRowDelete(kind, id);
+      scheduleLintRefetch(chapter);
+    },
     // Version-gated inside the hook (strictly newer than local AND above the
     // verse's tombstone) so a verse.updated that reordered behind the bridge
     // that deleted its row cannot resurrect it (#729).
@@ -776,10 +781,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // The lint report is otherwise fetched once per book, so a translator who
   // fixes a flagged note (e.g. unbalanced brackets around an Alternate
   // translation) would keep seeing the stale count until a reload. Refetch when
-  // a TN-row or verse write for THIS book lands successfully — those are the
-  // only edits the lint covers (TN flags + ULT/UST footnote integrity) —
-  // debounced so a burst of saves coalesces into one request.
+  // a row (tn, tq or twl) or verse write for THIS book lands successfully —
+  // all of them carry lint issues (#887, #1135) — debounced so a burst of
+  // saves coalesces into one request.
   const bookLintRefetch = bookLint.refetch;
+  // The chapter of each tq/twl row this tab deleted, keyed
+  // `${rowKind}:${book}:${id}`, until its DELETE's result arrives: the DELETE
+  // answers `{ ok: true }` with no row, and the chapter keeps the refresh to
+  // one chapter instead of the whole book (#1135).
+  const lintDeletedRowChapter = useRef(new Map<string, number>());
   const bookLintSettledAt = bookLint.lastSettledAt;
   const lintRefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Set when a lint-relevant change was skipped because the tab was hidden;
@@ -823,15 +833,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const unsub = onOutboxResult((op, result) => {
       if (result.kind !== "ok") return;
       const t = op.target;
-      if (t.kind === "verse" && t.book === book) {
-        scheduleLintRefetch(t.chapter);
-      } else if (t.kind === "row" && t.rowKind === "tn" && t.book === book) {
-        // A row target carries no chapter; the saved row the server returned
-        // does (a PATCH never moves a row to another chapter). A delete may
-        // return no row, which falls back to the whole book.
-        const ch = (result.updated as { chapter?: unknown } | null)?.chapter;
-        scheduleLintRefetch(typeof ch === "number" ? ch : undefined);
+      // Every row kind, not just tn (#1135). A DELETE returns no row, so its
+      // chapter comes from the row as the user deleted it (recorded below).
+      let deletedChapter: number | undefined;
+      if (t.kind === "row" && op.action === "delete") {
+        const key = `${t.rowKind}:${t.book}:${t.id}`;
+        deletedChapter = lintDeletedRowChapter.current.get(key);
+        lintDeletedRowChapter.current.delete(key);
       }
+      const ch = lintChapterForSavedOp(t, result.updated, book, deletedChapter);
+      if (ch !== null) scheduleLintRefetch(ch);
     });
     return () => {
       unsub();
@@ -4842,6 +4853,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             applyLocalRowDelete("twl", id);
             if (activeWordId === id) setActiveWordId(null);
             markOwnRowDelete("twl", row.book, id); // a refetch keeps it hidden (#1107)
+            lintDeletedRowChapter.current.set(`twl:${row.book}:${id}`, row.chapter); // #1135
             void outbox.enqueueDeleteRow("twl", id, row.version, row.book).then(recordOwnRowDeleteOp);
           }}
           onQuestionSave={(id, patch, opts) => {
@@ -4854,6 +4866,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             applyLocalRowDelete("tq", id);
             if (activeQuestionId === id) setActiveQuestionId(null);
             markOwnRowDelete("tq", row.book, id); // a refetch keeps it hidden (#1107)
+            lintDeletedRowChapter.current.set(`tq:${row.book}:${id}`, row.chapter); // #1135
             void outbox.enqueueDeleteRow("tq", id, row.version, row.book).then(recordOwnRowDeleteOp);
           }}
           lockedTn={Boolean(chapterLocks.tn)}
