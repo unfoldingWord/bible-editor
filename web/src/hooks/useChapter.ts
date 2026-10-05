@@ -19,8 +19,9 @@ import {
   type TwlOrderLock,
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
-import { onOutboxDiscard, onOutboxResult, outbox } from "../sync/outbox";
-import { hidingPendingRowDeletes, isOwnRowDelete } from "../sync/pendingRowDeletes";
+import { onOutboxResult, outbox } from "../sync/outbox";
+import { hidingPendingRowDeletes, rowDeleteHooks } from "../sync/pendingRowDeletes";
+import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
 import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
 import { currentRouteFetcher, isChapterLocked, trackNavigation, updateIfCurrent, type ChapterRoute, type NavigationGen } from "../lib/chapterStale";
 import {
@@ -220,27 +221,14 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     // the GET can be answered before the DELETE commits (offline, then the
     // reconnect GET races the drain). A DELETE refused as chapter_locked or
     // discarded meanwhile is not hidden: Shell's #1108 rollback restores that
-    // row (the same two triggers).
+    // row (the same two triggers). Outcomes drained in another tab count too
+    // (rowDeleteOutcomes, #1119).
     const fetchRoute = currentRouteFetcher(routeRef, (b, c, s) => api.getChapter(b, c, s));
     return sequencer.current!.refetch(
       hidingPendingRowDeletes(
         (signal, onAttempt) => fetchWithRetry(fetchRoute, { signal, onAttempt }),
         () => outbox.list(),
-        {
-          watch: (on) => {
-            const offResult = onOutboxResult((op, result) => {
-              if (op.target.kind !== "row" || op.action !== "delete") return;
-              if (result.kind === "ok") on.committed(op);
-              else if (result.kind === "locked") on.abandoned(op);
-            });
-            const offDiscard = onOutboxDiscard((op) => on.abandoned(op));
-            return () => {
-              offResult();
-              offDiscard();
-            };
-          },
-          isOwn: isOwnRowDelete,
-        },
+        rowDeleteHooks(rowDeleteOutcomes),
       ),
       opts?.keepNewerLocal === true,
     );

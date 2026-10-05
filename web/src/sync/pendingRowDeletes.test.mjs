@@ -108,6 +108,7 @@ const ids = (rows) => rows.map((r) => r.id);
       order.push("outbox");
       return [];
     },
+    { watch: () => () => {} },
   );
   await load(new AbortController().signal, () => {});
   check(order.join() === "outbox,get,outbox", "the outbox is read before the GET starts and again after it resolves");
@@ -122,6 +123,7 @@ const ids = (rows) => rows.map((r) => r.id);
       listed++;
       return [];
     },
+    { watch: () => () => {} },
   );
   await assert.rejects(load(new AbortController().signal, () => {}), /HTTP 500/);
   check(listed === 1, "a failed GET still fails, without the after-read");
@@ -165,7 +167,7 @@ const ids = (rows) => rows.map((r) => r.id);
 }
 // A controllable run: `step(snapshot)` lets the before-read happen, then the
 // test changes `ops` / fires outcomes, then the GET resolves.
-function run({ ops: initial, isOwn, failBefore = false, failWatch = false }) {
+function run({ ops: initial, isOwn, track, failBefore = false, failWatch = false }) {
   const state = { ops: initial, on: null };
   let reads = 0;
   let resolveGet;
@@ -184,6 +186,7 @@ function run({ ops: initial, isOwn, failBefore = false, failWatch = false }) {
         return () => (state.on = null);
       },
       ...(isOwn ? { isOwn } : {}),
+      ...(track ? { trackOwnDeletes: track } : {}),
     },
   );
   console.warn = () => {};
@@ -257,6 +260,248 @@ for (const status of ["conflict", "failed"]) {
   mod.markOwnRowDelete?.("tq", "ZEC", "zz");
   check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "zz" }) === true, "markOwnRowDelete makes it own");
   check(mod.isOwnRowDelete?.({ rowKind: "twl", book: "ZEC", id: "zz" }) === false, "own is per row kind");
+}
+
+// ---------- #1119 ----------
+
+// 5. Without `watch` nothing tells a committed op from a refused one, so a
+// vanished op must not be trusted as committed.
+{
+  let ops = [del("tq", "q1")];
+  let resolveGet;
+  const load = wrap(() => new Promise((r) => (resolveGet = r)), async () => ops);
+  const p = load(new AbortController().signal, () => {});
+  await new Promise((r) => setTimeout(r, 0));
+  ops = [];
+  resolveGet(payload());
+  check(ids((await p).tq).join() === "q1,q2", "#1119: with no watch a vanished op is not trusted as committed");
+}
+
+// 2. A delete clicked while the after-read is pending: Shell marks the row at
+// the click, but the read's transaction started before the op was written.
+const mark = (id) => mod.markOwnRowDelete?.("tq", "ZEC", id);
+const unmark = (id) => mod.clearOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id });
+const tracked = () => ({ isOwn: mod.isOwnRowDelete, track: mod.trackOwnRowDeletes });
+{
+  const r = run({ ops: [], ...tracked() });
+  await r.ready();
+  mark("q1"); // the after-read below misses its op
+  check(ids((await r.finish()).tq).join() === "q2", "#1119: a row marked deleted during the load, unseen by the after-read, stays hidden");
+  unmark("q1");
+}
+{
+  // ...but an op the after-read does see is judged by its status.
+  const r = run({ ops: [], ...tracked() });
+  await r.ready();
+  mark("q1");
+  r.ops = [del("tq", "q1", "conflict")];
+  check(ids((await r.finish()).tq).join() === "q1,q2", "#1119: a row marked during the load whose DELETE is now a conflict shows");
+  unmark("q1");
+}
+{
+  // ...and a mark cleared (refused / discarded) during the load hides nothing.
+  const r = run({ ops: [], ...tracked() });
+  await r.ready();
+  mark("q1");
+  unmark("q1");
+  check(ids((await r.finish()).tq).join() === "q1,q2", "#1119: a mark cleared during the load hides nothing");
+}
+{
+  // A mark from before the load whose op is in neither read hides nothing.
+  mark("q1");
+  const r = run({ ops: [], ...tracked() });
+  await r.ready();
+  check(ids((await r.finish()).tq).join() === "q1,q2", "#1119: a mark from before the load with no op hides nothing");
+  unmark("q1");
+}
+
+// 1, 3, 4. The cross-tab outcome channel and the adapter useChapter uses.
+// A fake BroadcastChannel hub: a message reaches every other tab's channel,
+// asynchronously and as a structured clone, never the sender's.
+function hub() {
+  const chans = new Set();
+  const posted = [];
+  return {
+    posted,
+    channel() {
+      const ch = {
+        listeners: new Set(),
+        postMessage(m) {
+          posted.push(m);
+          const data = structuredClone(m);
+          for (const o of chans) if (o !== ch) for (const l of o.listeners) setTimeout(() => l({ data }), 0);
+        },
+        addEventListener(type, fn) {
+          if (type === "message") ch.listeners.add(fn);
+        },
+      };
+      chans.add(ch);
+      return ch;
+    },
+  };
+}
+const key = (t) => `${t.rowKind}:${t.book}:${t.id}`;
+// One tab: its local outbox announcements, its own marks, its outcome feed.
+function tab(h, own = null) {
+  const results = new Set();
+  const discards = new Set();
+  const marks = new Set();
+  const outcomes = mod.createRowDeleteOutcomes?.({
+    onResult: (fn) => (results.add(fn), () => results.delete(fn)),
+    onDiscard: (fn) => (discards.add(fn), () => discards.delete(fn)),
+    channel: h ? h.channel() : null,
+    isOwn: own?.isOwn ?? ((op) => marks.has(key(op.target))),
+    clearOwn: own?.clearOwn ?? ((op) => marks.delete(key(op.target))),
+  }) ?? { on: () => () => {} };
+  const seen = [];
+  outcomes.on((o) => seen.push(o));
+  return {
+    outcomes,
+    marks,
+    seen,
+    result: (op, kind) => { for (const l of [...results]) l(op, { kind }); },
+    discard: (op) => { for (const l of [...discards]) l(op); },
+  };
+}
+const settle = () => new Promise((r) => setTimeout(r, 5));
+const sig = (o) => `${o.kind}:${o.op.target.id}:${o.remote ? "remote" : "local"}:${o.own ? "own" : "other"}`;
+{
+  // 4. The adapter's mapping in the tab that drained: ok → committed,
+  // locked / discard → abandoned, everything else (and non-row-deletes) nothing.
+  const a = tab(null);
+  a.result(del("tq", "q1", "in_flight"), "ok");
+  a.result(del("tq", "q2", "in_flight"), "locked");
+  a.discard(del("twl", "w1", "failed"));
+  for (const kind of ["conflict", "retry", "fatal"]) a.result(del("twl", "w2", "pending"), kind);
+  a.result({ ...del("tq", "q1"), action: "patch" }, "ok");
+  a.discard({ ...del("tq", "q1"), action: "patch" });
+  a.result({ id: "v", target: { kind: "verse", book: "ZEC", chapter: 1, verse: 1, bibleVersion: "ult" }, action: "patch", status: "in_flight" }, "ok");
+  check(
+    a.seen.map(sig).join() === "committed:q1:local:other,abandoned:q2:local:other,abandoned:w1:local:other",
+    "#1119: row-delete outcomes map ok→committed, locked/discard→abandoned, and ignore the rest",
+  );
+}
+{
+  // 1. Tab B drains tab A's delete: A hears it (remote), own by A's mark.
+  const h = hub();
+  const a = tab(h);
+  const b = tab(h);
+  a.marks.add("tq:ZEC:q1");
+  b.result(del("tq", "q1", "in_flight"), "ok");
+  await settle();
+  check(a.seen.map(sig).join() === "committed:q1:remote:own", "#1119: a commit drained in another tab reaches this tab, as its own delete");
+  check(b.seen.map(sig).join() === "committed:q1:local:other", "the draining tab hears it locally");
+  check(h.posted.length === 1, "a remote outcome is not re-broadcast");
+  check(a.marks.has("tq:ZEC:q1"), "a committed delete keeps its mark");
+}
+{
+  // 3. A refusal or discard in another tab clears this tab's mark after its
+  // listeners saw it as own; a later delete of the row elsewhere is not own.
+  const h = hub();
+  const a = tab(h);
+  const b = tab(h);
+  a.marks.add("tq:ZEC:q1");
+  a.marks.add("twl:ZEC:w1");
+  b.result(del("tq", "q1", "in_flight"), "locked");
+  b.discard(del("twl", "w1", "conflict"));
+  await settle();
+  check(a.seen.map(sig).join() === "abandoned:q1:remote:own,abandoned:w1:remote:own", "#1119: a refusal / discard in another tab reaches this tab as its own abandoned delete");
+  check(a.marks.size === 0, "#1119: an abandoned delete clears this tab's own mark");
+  a.result(del("tq", "q1", "in_flight"), "locked");
+  check(sig(a.seen.at(-1)) === "abandoned:q1:local:other", "a later delete of the row from elsewhere is then not treated as own");
+}
+{
+  const h = hub();
+  const a = tab(h);
+  const raw = h.channel();
+  for (const m of [null, "x", { kind: "committed" }, { kind: "boom", op: del("tq", "q1") }, { kind: "committed", op: { ...del("tq", "q1"), action: "patch" } }]) raw.postMessage(m);
+  await settle();
+  check(a.seen.length === 0, "#1119: a malformed cross-tab message is ignored");
+}
+{
+  // The hooks useChapter passes (rowDeleteHooks): tab B commits another tab's
+  // delete during A's plain refetch. Before #1119 the stale snapshot put the
+  // row back until the next reload.
+  const h = hub();
+  const a = tab(h);
+  const b = tab(h);
+  let resolveGet;
+  const load = wrap(() => new Promise((res) => (resolveGet = res)), async () => [], mod.rowDeleteHooks?.(a.outcomes) ?? {});
+  const p = load(new AbortController().signal, () => {});
+  await new Promise((res) => setTimeout(res, 0));
+  b.result(del("tq", "q2", "in_flight"), "ok");
+  await settle();
+  resolveGet(payload());
+  check(ids((await p).tq).join() === "q1", "#1119: a delete committed in another tab during the plain refetch stays hidden");
+}
+{
+  // ...and this tab's own delete refused in tab B during A's plain refetch
+  // shows its row (A's rollback restores it; hiding it here would undo that).
+  const h = hub();
+  const a = tab(h, { isOwn: mod.isOwnRowDeleteOp, clearOwn: mod.forgetOwnRowDeleteOp });
+  const b = tab(h);
+  mark("q1");
+  mod.recordOwnRowDeleteOp?.(del("tq", "q1"));
+  let ops = [del("tq", "q1")];
+  let resolveGet;
+  const load = wrap(() => new Promise((res) => (resolveGet = res)), async () => ops, mod.rowDeleteHooks?.(a.outcomes) ?? {});
+  const p = load(new AbortController().signal, () => {});
+  await new Promise((res) => setTimeout(res, 0));
+  ops = [];
+  b.result({ ...del("tq", "q1"), status: "in_flight" }, "locked");
+  await settle();
+  resolveGet(payload());
+  check(ids((await p).tq).join() === "q1,q2", "#1119: this tab's delete refused in another tab during the plain refetch shows its row");
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "q1" }) === false, "#1119: and its own mark is cleared");
+}
+
+// Review A1: only a DELETE op in the after-read counts as "seen". A queued
+// PATCH of the row (edited offline, then deleted while the after-read ran)
+// must not make the unseen-mark path skip the row.
+{
+  const r = run({ ops: [], ...tracked() });
+  await r.ready();
+  mark("q1");
+  r.ops = [{ ...del("tq", "q1"), id: "patch-q1", action: "patch" }]; // the read sees the PATCH, not the new DELETE
+  check(ids((await r.finish()).tq).join() === "q2", "#1119 A1: a queued PATCH of the row does not count as its DELETE being seen");
+  unmark("q1");
+}
+
+// Review A2: own-ness and clearing are per op, not per row.
+{
+  // (a) Tabs A and C both delete q1. C's DELETE is refused: in A it is not
+  // own (A's rollback must not run for it) and A's mark stays while A's own
+  // DELETE is pending.
+  const h = hub();
+  const a = tab(h, { isOwn: mod.isOwnRowDeleteOp, clearOwn: mod.forgetOwnRowDeleteOp });
+  const c = tab(h);
+  mark("q1");
+  mod.recordOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "opA" });
+  c.result({ ...del("tq", "q1", "in_flight"), id: "opC" }, "locked");
+  await settle();
+  check(a.seen.map(sig).join() === "abandoned:q1:remote:other", "#1119 A2: another tab's refused DELETE of a row this tab also deleted is not own");
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "q1" }) === true, "#1119 A2: and it leaves this tab's mark while its own DELETE is pending");
+  // A's own op refused: own, and now the mark goes.
+  c.result({ ...del("tq", "q1", "in_flight"), id: "opA" }, "locked");
+  await settle();
+  check(sig(a.seen.at(-1)) === "abandoned:q1:remote:own", "#1119 A2: this tab's own op refused elsewhere is own");
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "q1" }) === false, "#1119 A2: and clears the mark");
+}
+{
+  // (b) A delayed refusal of an older DELETE does not clear the mark of the
+  // row's newer DELETE (deleted again after it came back).
+  const h = hub();
+  const a = tab(h, { isOwn: mod.isOwnRowDeleteOp, clearOwn: mod.forgetOwnRowDeleteOp });
+  const b = tab(h);
+  mark("q1");
+  mod.recordOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "old" });
+  mark("q1");
+  mod.recordOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "new" });
+  b.result({ ...del("tq", "q1", "in_flight"), id: "old" }, "locked");
+  await settle();
+  check(sig(a.seen.at(-1)) === "abandoned:q1:remote:own", "#1119 A2: the older own op's refusal is own");
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "q1" }) === true, "#1119 A2: but keeps the mark of the newer DELETE");
+  unmark("q1");
 }
 
 console.log(`pendingRowDeletes: ${passed} passed`);
