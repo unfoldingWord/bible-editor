@@ -58,6 +58,7 @@ const SQLITE_FILES = new Set([
 const EXTRA_IMPORTS = new Map([
   ["src/rowRestoreNoop.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/bookTrashSummary.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/selfLockCheckedRoutes.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/dismissReview.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/reviewFlagBroadcast.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/reimportJourney.test.mjs", "./src/tsResolveHook.mjs"],
