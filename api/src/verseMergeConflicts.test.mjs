@@ -452,6 +452,39 @@ function assert(cond, msg) {
   );
 }
 
+{
+  // Issue #1110: on a locked book with keep_no_base AND kept rows
+  // (keep_alignment_refused, source_attr_divergent), #1006's "the export skips
+  // it" sentence sat beside older sentences that still said tonight's export
+  // will write. A locked book is not exported, so none may say so.
+  const rows = [
+    { action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, chapter: 1, verse: 8 },
+    { action: "source_attr_divergent", reason: "source_attr_ambiguous", overwrittenVersion: null, chapter: 1, verse: 9 },
+  ];
+  const opts = { noBaseCount: 1, noBaseRefs: ["1:6"] };
+  const locked = buildMergeConflictGuidance(rows, { ...opts, noBaseBookLocked: true, bookLocked: true });
+  assert(!/tonight's export/i.test(locked), `locked book (kept rows + no-base): no sentence claims tonight's export writes (got: ${locked})`);
+  assert(locked.includes("1 kept the editor's version because adopting Door43's would have cost alignment"),
+    "locked book: the alignment-refused verse is still reported");
+  assert(locked.includes("1 kept D1 because Door43's original-language source fix"),
+    "locked book: the source-attr verse is still reported");
+  assert((locked.match(/this book is locked/g) ?? []).length === 3, "locked book: each kept sentence names the lock");
+
+  // Unlocked: byte-identical to the wording before this change.
+  const unlockedText =
+    "1 kept the editor's version because adopting Door43's would have cost alignment — Door43's change has NOT " +
+    "been taken, so tonight's export will still write over it until someone resolves it. 1 kept D1 because " +
+    "Door43's original-language source fix (the spelling/pointing/morphology on \\zaln-s) could not be placed " +
+    "unambiguously — the same source word repeats in the verse — so Door43's change has NOT been taken, and " +
+    "tonight's export will write over it until someone resolves it by hand. " +
+    buildNoBaseSentence(1, ["1:6"]);
+  assert(buildMergeConflictGuidance(rows, opts) === unlockedText, "unlocked (flags omitted): kept wording unchanged");
+  assert(
+    buildMergeConflictGuidance(rows, { ...opts, noBaseBookLocked: false, bookLocked: false }) === unlockedText,
+    "unlocked (flags false): kept wording unchanged",
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Part 2: the ACTUAL production query (buildEditorLookupQuery, imported
 // above — not a hand-duplicated copy, so this can't silently drift from what
