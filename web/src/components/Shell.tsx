@@ -99,7 +99,7 @@ import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
 import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
 import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
-import { dropOwnRowDeleteClick, markOwnRowDelete, recordOwnRowDeleteOp } from "../sync/pendingRowDeletes";
+import { dropOwnRowDeleteClick, markOwnRowDelete, recordOwnRowDeleteClickOp } from "../sync/pendingRowDeletes";
 import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
 import {
   alignmentDraftKey,
@@ -4871,7 +4871,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // No op queued: drop the click's mark so a load doesn't hide the row (#1126 item 9).
             void outbox
               .enqueueDeleteRow("twl", id, row.version, row.book)
-              .then(recordOwnRowDeleteOp, () => dropOwnRowDeleteClick({ rowKind: "twl", book: row.book, id }, click));
+              .then(
+                (op) => recordOwnRowDeleteClickOp(op, click),
+                (e) => {
+                  console.error("Shell: could not queue the word-link delete", e);
+                  dropOwnRowDeleteClick({ rowKind: "twl", book: row.book, id }, click);
+                },
+              );
           }}
           onQuestionSave={(id, patch, opts) => {
             const row = data.tq.find((r) => r.id === id);
@@ -4887,7 +4893,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // No op queued: drop the click's mark so a load doesn't hide the row (#1126 item 9).
             void outbox
               .enqueueDeleteRow("tq", id, row.version, row.book)
-              .then(recordOwnRowDeleteOp, () => dropOwnRowDeleteClick({ rowKind: "tq", book: row.book, id }, click));
+              .then(
+                (op) => recordOwnRowDeleteClickOp(op, click),
+                (e) => {
+                  console.error("Shell: could not queue the question delete", e);
+                  dropOwnRowDeleteClick({ rowKind: "tq", book: row.book, id }, click);
+                },
+              );
           }}
           lockedTn={Boolean(chapterLocks.tn)}
           lockedTq={Boolean(chapterLocks.tq)}

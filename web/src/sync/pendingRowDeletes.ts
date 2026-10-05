@@ -134,6 +134,20 @@ export function forgetOwnRowDeleteOp(op: Pick<OpLike, "id" | "target">): void {
   if (!m?.ops.delete(op.id)) return;
   m.all.delete(op.id);
   if (m.ops.size === 0) ownRowDeletes.delete(key);
+  else if (m.latest === op.id) {
+    // The click's op is gone and its row is back: the click is dead, though
+    // an older op keeps the mark (#1126 review A5).
+    m.seq = 0;
+    m.latest = undefined;
+  }
+}
+// What the click's enqueue resolved with. A viewer's delete resolves with
+// the outbox's read-only no-op, which is never queued: drop the click as for
+// a failed enqueue (#1126 review A3).
+export function recordOwnRowDeleteClickOp(op: Pick<OpLike, "id" | "target">, click: number): void {
+  if (op.target.kind !== "row") return;
+  if (op.id === "readonly-noop") dropOwnRowDeleteClick(op.target, click);
+  else recordOwnRowDeleteOp(op);
 }
 // This tab's op committed: it no longer holds the mark (#1126 item 5).
 export function settleOwnRowDeleteOp(op: Pick<OpLike, "id" | "target">): void {
@@ -395,14 +409,20 @@ export function hidingPendingRowDeletes<P extends Pick<ChapterPayload, "book" | 
               !abandoned.has(op.id) &&
               !committed.some((c) => c.id === op.id),
           );
-        if (watching && unheard()) {
+        if (watching && unheard() && !signal.aborted) {
           await new Promise<void>((res) => {
-            const timer = setTimeout(res, OTHER_TAB_OUTCOME_GRACE_MS);
-            wake = () => {
-              if (unheard()) return;
+            const done = () => {
               clearTimeout(timer);
+              signal.removeEventListener("abort", done);
+              wake = () => {};
               res();
             };
+            const timer = setTimeout(done, OTHER_TAB_OUTCOME_GRACE_MS);
+            signal.addEventListener("abort", done);
+            wake = () => {
+              if (!unheard()) done();
+            };
+            wake(); // an outcome may have arrived since the check above
           });
         }
         const gone = before.filter((op) => !afterIds.has(op.id) && !abandoned.has(op.id));
@@ -423,7 +443,11 @@ export function hidingPendingRowDeletes<P extends Pick<ChapterPayload, "book" | 
             );
           })
           .map(({ target: t }) => ({ id: `mark:${ownKey(t)}`, target: { kind: "row", ...t }, action: "delete", status: "in_flight" }));
-        return hidePendingRowDeletes(payload, [...after.filter(own), ...gone.filter(own), ...committed, ...unseen]);
+        // An own DELETE abandoned during the load hides nothing even if the
+        // after-read still listed it: its #1108 rollback may already have
+        // restored the row (#1126 review A1).
+        const draining = after.filter((op) => own(op) && !abandoned.has(op.id));
+        return hidePendingRowDeletes(payload, [...draining, ...gone.filter(own), ...committed, ...unseen]);
       } catch (e) {
         warn(e);
         return payload;

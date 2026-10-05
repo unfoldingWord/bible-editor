@@ -646,7 +646,7 @@ const sig = (o) => `${o.kind}:${o.op.target.id}:${o.remote ? "remote" : "local"}
 {
   const r = run({ ops: [del("tq", "q1")] });
   await r.ready();
-  r.on.abandoned(del("tq", "q1", "in_flight"));
+  r.on.abandoned({ ...del("tq", "q1"), status: "in_flight" }); // same op id as the after-read's
   check(ids((await r.finish()).tq).join() === "q1,q2", "#1126 A1: an own DELETE abandoned during the load hides nothing, whatever the after-read says");
 }
 
