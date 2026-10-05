@@ -340,4 +340,43 @@ function harness() {
   assert.deepEqual(events2[1].queued, ["structure:during mount"], "the deferred merge drops data steps its snapshot already contains");
 }
 
+// ── (#989 case 1) a tab's own pending delete survives a superseding merge ─
+// The predicate useChapter really passes (verseStructure's
+// keepStepAcrossSupersede), driven end to end: merging GET 1 is in flight,
+// the tab deletes tq row X (optimistic apply + rowDelete step; the DELETE
+// waits in the outbox), a reconnect starts merging GET 2, and GET 2's
+// snapshot still holds X because the DELETE has not committed. Before the
+// fix the inherited rowDelete was dropped and X came back on screen.
+{
+  const vs = await import("../lib/verseStructure.ts");
+  // Falls back to the pre-#989 predicate, so this case fails on the row
+  // itself (not on a missing export) against the old code.
+  const keep = vs.keepStepAcrossSupersede ?? vs.isStructureStep;
+  const chapter = (tq) => ({ book: "ZEC", chapter: 1, verses: {}, tn: [], tq, twl: [], verseStatuses: [], verseLaneChecks: [], twlOrderLocks: [] });
+  const q = (id) => ({ id, version: 2, book: "ZEC", chapter: 1, verse: 1, sort_order: 1, updated_at: 100 });
+  let state = chapter([q("X"), q("Y")]);
+  const reqs = [];
+  const seq = createChapterFetchSequencer({
+    onStart: () => {},
+    onAttempt: () => {},
+    onLanded: (payload, merge, queued) => {
+      state = vs.replaySteps(merge ? vs.mergeRefetched(state, payload) : payload, queued);
+    },
+    onError: () => {},
+    keepOnSupersede: keep,
+  });
+  const load = () => new Promise((resolve) => reqs.push(resolve));
+  const first = seq.refetch(load, true); // merging GET 1 (a WS open)
+  const del = { type: "rowDelete", kind: "tq", id: "X" };
+  seq.record(del); // Shell onQuestionDelete → applyLocalRowDelete
+  state = vs.applyStep(state, del);
+  const second = seq.refetch(load, true); // reconnect: merging GET 2 supersedes
+  reqs[1](chapter([q("X"), q("Y")])); // the DELETE is still queued: X is in GET 2's snapshot
+  await second;
+  assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#989: the own deleted row stays gone after the superseding merge lands");
+  reqs[0](chapter([q("X"), q("Y")]));
+  await first;
+  assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#989: the superseded GET 1 landing late changes nothing");
+}
+
 console.log("chapterFetchSequencer: all cases passed");
