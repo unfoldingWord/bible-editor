@@ -1656,7 +1656,7 @@ async function runReimport(
       recordingFailed: perResource.ult.merge_record_failed === true,
       noBaseCount: perResource.ult.merge_no_base,
       noBaseRefs: perResource.ult.merge_no_base_refs,
-      noBaseBookLocked: perResource.ult.merge_no_base_book_locked === true,
+      noBaseBookLocked: await noBaseBookLockedForAlert(env, book, "ult", perResource.ult.merge_no_base_book_locked),
       noBaseEditorRefs: perResource.ult.merge_no_base_editor_refs,
       observedAt: alertObservedAt,
     });
@@ -1666,7 +1666,7 @@ async function runReimport(
       recordingFailed: perResource.ust.merge_record_failed === true,
       noBaseCount: perResource.ust.merge_no_base,
       noBaseRefs: perResource.ust.merge_no_base_refs,
-      noBaseBookLocked: perResource.ust.merge_no_base_book_locked === true,
+      noBaseBookLocked: await noBaseBookLockedForAlert(env, book, "ust", perResource.ust.merge_no_base_book_locked),
       noBaseEditorRefs: perResource.ust.merge_no_base_editor_refs,
       observedAt: alertObservedAt,
     });
@@ -10936,6 +10936,34 @@ async function reimportStagedChunk(
   return perResource;
 }
 
+// Issue #1006: whether a resource's no-base alert should use the locked-book
+// wording ("the export skips it; ask an admin") instead of "tonight's export
+// will overwrite". True only when the run saw the book locked on a
+// keep_no_base verse, the book is STILL locked as the alert is raised (an
+// unlock part-way through the run means the export will not skip it), and this
+// run is not an admin lock/push for this resource (that run's export pushes D1
+// over Door43). A failed lock read falls back to the overwrite warning, the
+// wording that asks someone to act, and never fails the alert.
+export async function noBaseBookLockedForAlert(
+  env: Env,
+  book: string,
+  resource: Resource,
+  sawLockedNoBase: boolean | undefined,
+  lockOverrideResource?: Resource,
+): Promise<boolean> {
+  if (sawLockedNoBase !== true || lockOverrideResource === resource) return false;
+  try {
+    return (await effectiveBookLock(env, book)) != null;
+  } catch (e) {
+    console.error("reimport no-base alert: lock re-read failed; using the unlocked wording", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return false;
+  }
+}
+
 // Orchestrate a chunked, SHA-gated, diff-aware reimport of one book as a series
 // of Workflow steps. Lock-free (see section header). Returns aggregate counts.
 export async function runChunkedReimport(
@@ -10970,11 +10998,17 @@ export async function runChunkedReimport(
   // row's own `updated_by`/pristine columns (sync writes clear or leave those
   // alone regardless of who triggered the run), so this cannot affect
   // isPristineTsv or any pristine-write predicate.
+  // `lockOverrideResource` — issue #1006 review: set by exportWorkflow.ts only
+  // when this run's export will push this ONE resource of a locked book
+  // (an admin lock/push, allowLocked). It changes only the no-base alert
+  // wording: that export does write D1 over Door43, so the alert must not say
+  // the export skips the book.
   opts: {
     chunk?: number;
     mergeRefusalOverrideResource?: Resource;
     idBlockedOverrideResource?: Resource;
     staleBaseOverrideResource?: Resource;
+    lockOverrideResource?: Resource;
     userId?: number | null;
   } = {},
 ): Promise<ReimportResult> {
@@ -11133,7 +11167,13 @@ export async function runChunkedReimport(
         recordingFailed: perResource[e.resource].merge_record_failed === true,
         noBaseCount: perResource[e.resource].merge_no_base,
         noBaseRefs: perResource[e.resource].merge_no_base_refs,
-        noBaseBookLocked: perResource[e.resource].merge_no_base_book_locked === true,
+        noBaseBookLocked: await noBaseBookLockedForAlert(
+          env,
+          book,
+          e.resource,
+          perResource[e.resource].merge_no_base_book_locked,
+          opts.lockOverrideResource,
+        ),
         noBaseEditorRefs: perResource[e.resource].merge_no_base_editor_refs,
         observedAt: alertObservedAt,
       });

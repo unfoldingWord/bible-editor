@@ -15,8 +15,14 @@ export function verseMergeEditorConditionKey(
   resource: string,
   username: string,
   refs: string[],
+  // Issue #1006: set only when this editor's alert carries the locked-book
+  // no-base wording. Omitted (not false) otherwise, so every unlocked key stays
+  // byte-identical to the keys stored before #1006.
+  noBaseBookLocked = false,
 ): string {
-  return reviewConditionKey("verse_merge_conflict_editor", { book, resource, username }, { refs: [...refs].sort() });
+  const state: Record<string, unknown> = { refs: [...refs].sort() };
+  if (noBaseBookLocked) state.noBaseBookLocked = true;
+  return reviewConditionKey("verse_merge_conflict_editor", { book, resource, username }, state);
 }
 
 function stableJson(value: unknown): string {
