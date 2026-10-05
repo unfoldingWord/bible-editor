@@ -7,7 +7,8 @@ import { newUserContext } from "./helpers";
 // GET's snapshot is taken first, then held) while tab B settles a delete, and
 // checks that A ends with the server's state once the stale snapshot lands:
 //   - A's own tq DELETE drained by B and refused (chapter_locked): the row is
-//     back in A (before #1119 A kept hiding it, and its #1108 restore never ran);
+//     back in A (before #1119 A kept hiding it, and its #1108 restore never ran),
+//     and A shows the "Edit dropped" toast (#1126; before, only B did);
 //   - A's own tq DELETE drained by B and committed: the row stays gone;
 //   - B's own tq DELETE committed during A's refetch: the row stays gone in A
 //     (before #1119 the stale snapshot put it back until the next reload).
@@ -31,6 +32,26 @@ const outboxCount = (p: Page) =>
         };
       }),
   );
+
+// Record the row-DELETE outcomes other tabs relay to this page (#1126: poll
+// for the hand-off instead of sleeping). A second channel of the same name in
+// the page hears what the app's channel hears.
+type OutcomeLog = { __outcomes1126?: { ch: BroadcastChannel; seen: string[] } };
+const recordOutcomes = (p: Page) =>
+  p.evaluate(() => {
+    const w = window as unknown as OutcomeLog;
+    w.__outcomes1126?.ch.close();
+    const ch = new BroadcastChannel("be-row-delete-outcomes");
+    const seen: string[] = [];
+    ch.onmessage = (e) => seen.push(`${e.data?.kind}:${e.data?.op?.target?.id}`);
+    w.__outcomes1126 = { ch, seen };
+  });
+const heardOutcome = (p: Page, kind: string, id: string) =>
+  expect
+    .poll(() => p.evaluate((s) => (window as unknown as OutcomeLog).__outcomes1126?.seen.includes(s) ?? false, `${kind}:${id}`), {
+      timeout: 10_000,
+    })
+    .toBe(true);
 
 const idText = (p: Page, id: string) => p.getByText(id, { exact: true });
 const deleteButton = (p: Page, id: string) =>
@@ -70,6 +91,8 @@ test("a tq delete settled by another tab during this tab's plain refetch ends wi
     const later = new Promise<void>((r) => (releaseLater = r));
     let fetched!: () => void;
     const sent = new Promise<void>((r) => (fetched = r));
+    let delivered!: () => void;
+    const landed = new Promise<void>((r) => (delivered = r));
     let n = 0;
     const handler = async (route: Route) => {
       const first = n++ === 0;
@@ -77,16 +100,20 @@ test("a tq delete settled by another tab during this tab's plain refetch ends wi
       if (first) fetched();
       await (first ? gate : later);
       await route.fulfill({ response }).catch(() => {});
+      if (first) delivered();
     };
     await tabA.route("**/api/chapters/ZEC/1", handler);
+    // Leave for chapter 2 and wait for its load, so coming back is a fresh
+    // plain refetch of chapter 1 (#1126: no fixed sleep).
+    const leftFor2 = tabA.waitForResponse((r) => r.url().endsWith("/api/chapters/ZEC/2"));
     await tabA.evaluate(() => (location.hash = "#/ZEC/2/1"));
-    await tabA.waitForTimeout(1_500);
+    await leftFor2;
     await tabA.evaluate((v) => (location.hash = `#/ZEC/1/${v}`), row.verse);
     await sent;
     return {
       land: async () => {
         release();
-        await tabA.waitForTimeout(500);
+        await landed;
         // The chapter change switched the resource panel back to Notes.
         await tabA.getByRole("button", { name: /^Questions/ }).click();
       },
@@ -122,6 +149,7 @@ test("a tq delete settled by another tab during this tab's plain refetch ends wi
     await expect.poll(() => outboxCount(tabA)).toBe(1);
 
     const refetchA = await holdPlainRefetch(row);
+    await recordOutcomes(tabA);
 
     let deleteSeen = false;
     const drainB = async (route: Route) => {
@@ -151,7 +179,13 @@ test("a tq delete settled by another tab during this tab's plain refetch ends wi
       )
       .toBe(true);
     await expect.poll(() => outboxCount(tabB), { timeout: 10_000 }).toBe(0);
-    await tabA.waitForTimeout(500); // B's announcement reaches A
+    await heardOutcome(tabA, outcome === "refused" ? "abandoned" : "committed", row.id); // B's announcement reached A
+    if (outcome === "refused") {
+      // #1126 item 1: the tab that made the delete says why the row comes back.
+      await expect
+        .soft(tabA.getByText(/Edit dropped.*AI run.*mid-flight/i).first(), "A shows the Edit dropped toast")
+        .toBeVisible({ timeout: 10_000 });
+    }
     await refetchA.land();
     await tabA.unroute("**/api/rows/tq/**", abortA);
     await tabB.unroute("**/api/rows/tq/**", drainB);
@@ -163,6 +197,7 @@ test("a tq delete settled by another tab during this tab's plain refetch ends wi
     } else {
       expect(onServer).toBe(false);
       await expect.soft(idText(tabA, row.id)).toHaveCount(0);
+      // A negative check: watch for the row coming back over a short window.
       await tabA.waitForTimeout(2_000);
       await expect.soft(idText(tabA, row.id), "A still hides the committed row").toHaveCount(0);
     }
@@ -173,12 +208,14 @@ test("a tq delete settled by another tab during this tab's plain refetch ends wi
   await show(tabA, otherTabRow);
   await show(tabB, otherTabRow);
   const refetchA = await holdPlainRefetch(otherTabRow);
+  await recordOutcomes(tabA);
   await deleteButton(tabB, otherTabRow.id).click();
   await expect.poll(() => outboxCount(tabB), { timeout: 10_000 }).toBe(0);
   expect((await serverTq()).some((r) => r.id === otherTabRow.id)).toBe(false);
-  await tabA.waitForTimeout(500);
+  await heardOutcome(tabA, "committed", otherTabRow.id);
   await refetchA.land();
   await expect.soft(idText(tabA, otherTabRow.id)).toHaveCount(0);
+  // A negative check: watch for the row coming back over a short window.
   await tabA.waitForTimeout(2_000);
   await expect.soft(idText(tabA, otherTabRow.id), "A does not resurrect another tab's committed delete").toHaveCount(0);
   await refetchA.finish();
