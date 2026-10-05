@@ -23,6 +23,30 @@ export interface PendingLintScope {
  * `lastWholeAt` is 0 before the first whole-book fetch lands and after a
  * failed fetch.
  */
+/**
+ * Which chapter a successful outbox op should re-lint (#1135): a number for
+ * that chapter, undefined for the whole book, null for no refresh (another
+ * book, or an op the lint does not cover such as a done tick or a lane check).
+ *
+ * Every row kind counts: tq and twl rows carry lint issues too (#887). A row
+ * target carries no chapter, but the saved row the server returns does (a
+ * PATCH never moves a row to another chapter). A DELETE answers `{ ok: true }`,
+ * so the caller passes `knownChapter`, the deleted row's chapter as it was
+ * when the user deleted it; without one the whole book is re-linted.
+ */
+export function lintChapterForSavedOp(
+  target: { kind: string; book: string; chapter?: number },
+  updated: unknown,
+  book: string,
+  knownChapter?: number,
+): number | undefined | null {
+  if (target.book !== book) return null;
+  if (target.kind === "verse") return target.chapter;
+  if (target.kind !== "row") return null;
+  const ch = (updated as { chapter?: unknown } | null | undefined)?.chapter;
+  return typeof ch === "number" ? ch : knownChapter;
+}
+
 export function lintRefreshScope(
   pending: PendingLintScope,
   hasBase: boolean,

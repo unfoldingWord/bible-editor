@@ -247,6 +247,9 @@ export interface BookLintIssue {
 // holds only the "flag" bucket; escalate issues arrive as counts.
 export interface BookLintReport {
   book: string;
+  /** The server's lint-schema version (#1135); absent from servers before it.
+   *  A chapter report merges only into a base of the same version. */
+  lintVersion?: number;
   /** null = whole book; N = chapter N's issues plus every book-wide one. */
   chapter: number | null;
   total: number;
