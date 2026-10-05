@@ -9,7 +9,7 @@
 // column alignment, which is what makes find/replace and side-by-side
 // comparison readable when the scroll spans an entire book.
 
-import { Component, Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, Fragment, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip, CircularProgress } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
 import UndoIcon from "@mui/icons-material/Undo";
@@ -17,6 +17,7 @@ import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { type ChapterCopyBlock } from "../lib/chapterCopy";
 import { chapterHeightKey } from "../lib/chapterHeightKey";
+import { FontScaleContext } from "../theme";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type LaneShade, type TextLaneCheck } from "../lib/laneChecks";
 import type { ChapterState } from "../hooks/useBook";
@@ -425,32 +426,43 @@ export function BookView({
     return () => ro.disconnect();
   }, [book, activeChapter, activeReady]);
 
-  // A window resize or zoom re-wraps the text, but a skipped chapter keeps
-  // the height it had when last laid out and changes size when next drawn,
-  // which in a browser without scroll anchoring (Safari) moves the view.
-  // Once the scroll box's width has held still for 300 ms, bump widthEpoch:
-  // every loaded chapter is laid out once more (ChapterBlock's layoutKey)
-  // while ColumnToggleAnchor holds the top row in place (#1131).
-  const [widthEpoch, setWidthEpoch] = useState(0);
+  // A window resize, zoom or reading-text-size change re-wraps the text, but
+  // a skipped chapter keeps the height it had when last laid out and changes
+  // size when next drawn, which in a browser without scroll anchoring
+  // (Safari) moves the view. Once the scroll box's width and the reading
+  // scale have held still for 300 ms, bump wrapEpoch: every loaded chapter is
+  // laid out once more (ChapterBlock's layoutKey) while ColumnToggleAnchor
+  // holds the top row in place (#1131). The scroll box reserves its scrollbar
+  // gutter, so a scrollbar appearing after that re-layout does not change
+  // the width and schedule another one.
+  const { scale: readingScale } = useContext(FontScaleContext);
+  const [wrapEpoch, setWrapEpoch] = useState(0);
+  const wrapTimerRef = useRef(0);
+  const scheduleRewrap = useCallback(() => {
+    window.clearTimeout(wrapTimerRef.current);
+    wrapTimerRef.current = window.setTimeout(() => setWrapEpoch((n) => n + 1), 300);
+  }, []);
+  useEffect(() => () => window.clearTimeout(wrapTimerRef.current), []);
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
     let width: number | null = null;
-    let timer = 0;
     const ro = new ResizeObserver((entries) => {
       const w = entries[entries.length - 1].contentRect.width;
       if (width === null) width = w;
       if (w === width) return;
       width = w;
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => setWidthEpoch((n) => n + 1), 300);
+      scheduleRewrap();
     });
     ro.observe(el);
-    return () => {
-      ro.disconnect();
-      window.clearTimeout(timer);
-    };
-  }, []);
+    return () => ro.disconnect();
+  }, [scheduleRewrap]);
+  const scaleRef = useRef(readingScale);
+  useEffect(() => {
+    if (scaleRef.current === readingScale) return;
+    scaleRef.current = readingScale;
+    scheduleRewrap();
+  }, [readingScale, scheduleRewrap]);
 
   // Chapters always laid out in full, never skipped by content-visibility:
   // the active chapter with the two above it and the one below (the chapters
@@ -546,12 +558,14 @@ export function BookView({
           );
         })}
       </Box>
-      <ColumnToggleAnchor layoutKey={`${enabledVersionsKey}|${widthEpoch}`} containerRef={containerRef} />
+      <ColumnToggleAnchor layoutKey={`${enabledVersionsKey}|${wrapEpoch}`} containerRef={containerRef} />
       <Box
         ref={containerRef}
         sx={(theme) => ({
           flex: 1,
           overflowY: "auto",
+          // See wrapEpoch: a scrollbar coming or going must not change the width.
+          scrollbarGutter: "stable",
           ...markHighlightSx(theme.palette.mode),
           ...bookTsDividerSx(),
           ...draftDirtyBorderSx(),
@@ -585,7 +599,7 @@ export function BookView({
                 state={chapters.get(ch) ?? UNLOADED_STATE}
                 enabledVersions={stableEnabledVersions}
                 cols={cols}
-                widthEpoch={widthEpoch}
+                wrapEpoch={wrapEpoch}
                 pinned={isPinned(ch)}
                 isActiveChapter={isActiveChapter}
                 activeVerse={isActiveChapter ? activeVerse : -1}
@@ -623,7 +637,8 @@ export function BookView({
 }
 
 // Keeps the verse row at the top of the view in place across a version-column
-// toggle (#1120) or a settled width change (BookView's widthEpoch, #1131);
+// toggle (#1120) or a settled width or text-size change (BookView's wrapEpoch,
+// #1131);
 // `layoutKey` changes with either. Both re-lay out every loaded chapter
 // (ChapterBlock's layoutKey), so all the chapters above the view change
 // height at once; browsers with scroll anchoring absorb that, Safari does
@@ -706,7 +721,7 @@ const ChapterBlock = memo(function ChapterBlock({
   state,
   enabledVersions,
   cols,
-  widthEpoch,
+  wrapEpoch,
   pinned,
   isActiveChapter,
   activeVerse,
@@ -740,8 +755,9 @@ const ChapterBlock = memo(function ChapterBlock({
   state: ChapterState;
   enabledVersions: string[];
   cols: number;
-  // Bumped when the scroll box's width settles after a change (see BookView).
-  widthEpoch: number;
+  // Bumped once the scroll box's width or the reading scale settles after a
+  // change (see BookView).
+  wrapEpoch: number;
   // Never skipped by content-visibility (see BookView's isPinned).
   pinned: boolean;
   isActiveChapter: boolean;
@@ -819,8 +835,9 @@ const ChapterBlock = memo(function ChapterBlock({
   // changed size when next laid out, which moves the view in a browser
   // without scroll anchoring. A data change that cannot change the height (an
   // outbox result that only bumps a verse's version) keeps the key, so an
-  // off-screen chapter is not laid out for it (#1131). A settled width change
-  // (widthEpoch) re-wraps the text, so it lays the chapter out again too.
+  // off-screen chapter is not laid out for it (#1131). A settled width or
+  // text-size change (wrapEpoch) re-wraps the text, so it lays the chapter
+  // out again too.
   // One object per change, so a column toggled off and back on within the
   // two frames is measured again. Verse text fills in during the cells'
   // passive effects, which run before this one; the size is recorded after
@@ -829,9 +846,9 @@ const ChapterBlock = memo(function ChapterBlock({
     () => (readyData ? chapterHeightKey(readyData.verses, enabledVersions, verseNums) : ""),
     [readyData, enabledVersions, verseNums],
   );
-  const layoutKey = useMemo(() => ({ key: heightKey, widthEpoch }), [heightKey, widthEpoch]);
+  const layoutKey = useMemo(() => ({ key: heightKey, wrapEpoch }), [heightKey, wrapEpoch]);
   const isReady = readyData !== null;
-  const [measuredKey, setMeasuredKey] = useState<{ key: string; widthEpoch: number } | null>(null);
+  const [measuredKey, setMeasuredKey] = useState<{ key: string; wrapEpoch: number } | null>(null);
   useEffect(() => {
     if (!isReady) return;
     let second = 0;
