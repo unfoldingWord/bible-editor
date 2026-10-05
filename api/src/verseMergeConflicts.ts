@@ -75,6 +75,7 @@
 import { Hono } from "hono";
 import type { Env } from "./index";
 import { requireAuth } from "./auth";
+import { effectiveBookLock } from "./bookLock.ts";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
@@ -866,7 +867,15 @@ export async function raiseVerseMergeConflictAlert(
   // failed read falls back to the unlocked wording, the one that asks someone
   // to act, and never fails the alert.
   const hasNoBase = (opts.noBaseCount ?? 0) > 0;
-  const hasKept = rows.some((r) => r.action === "keep_alignment_refused" || r.action === "source_attr_divergent");
+  // Every row whose sentence says an export will write over Door43: the kept
+  // rows, and an adopt_conflict with no overwritten version (#981).
+  const hasKept = rows.some(
+    (r) =>
+      r.action === "keep_alignment_refused" ||
+      r.action === "source_attr_divergent" ||
+      r.action === "keep_local_structure" ||
+      (r.action === "adopt_conflict" && r.overwrittenVersion == null),
+  );
   let bookLocked = false;
   if (hasNoBase || hasKept) {
     try {
@@ -1073,11 +1082,14 @@ export async function raiseVerseMergeConflictAlert(
 // that started before the lock change and raises after it carries a later
 // observation, and must still win (reconcileReviewAlert drops any observation
 // older than one already stored).
-export async function refreshVerseMergeAlertsAfterLockChange(
-  env: Env,
-  book: string,
-  bookLocked: boolean,
-): Promise<void> {
+//
+// It takes no lock value from its caller on purpose (#1110 review): a lock and
+// an unlock in quick succession run two of these after their responses, and
+// they can finish out of order. Each reads the effective lock itself, as late
+// as the raise allows, so a late one words the alert for the lock as it is
+// then, not as its request saw it.
+export async function refreshVerseMergeAlertsAfterLockChange(env: Env, book: string): Promise<void> {
+  const bookLocked = async () => (await effectiveBookLock(env, book)) != null;
   for (const resource of ["ult", "ust"]) {
     const source = `verse_merge_conflict:${book}:${resource}`;
     try {

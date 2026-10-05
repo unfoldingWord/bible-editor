@@ -10338,6 +10338,9 @@ async function planAndStageBookResources(
   // written anyway rather than skipped because an operator approved.
   staleBaseOverrideResource?: Resource,
   alertObservedAt = Date.now(),
+  // Issue #1110 review: runChunkedReimport's `lockOverrideResource`, for the
+  // own-publish convergence re-raise below (see bookLockedForAlert).
+  lockOverrideResource?: Resource,
 ): Promise<ReimportPlan> {
   const maxRow = await env.DB
     .prepare(`SELECT MAX(chapter) AS m FROM verses WHERE book = ?1`)
@@ -10499,6 +10502,10 @@ async function planAndStageBookResources(
           noBaseCount: 0,
           noBaseRefs: [],
           noBaseEditorRefs: [],
+          // Issue #1110 review: the rows left standing can still carry
+          // lock-dependent sentences, and on a book whose resources are all
+          // unchanged this is the run's last raise.
+          bookLocked: () => bookLockedForAlert(env, book, resource, lockOverrideResource),
           observedAt: alertObservedAt,
         });
       }
@@ -11016,7 +11023,16 @@ export async function runChunkedReimport(
   const plan = await step.do(
     `reimport-fetch-${book}`,
     { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-    async () => planAndStageBookResources(env, book, resources, instanceId, opts.staleBaseOverrideResource, alertObservedAt),
+    async () =>
+      planAndStageBookResources(
+        env,
+        book,
+        resources,
+        instanceId,
+        opts.staleBaseOverrideResource,
+        alertObservedAt,
+        opts.lockOverrideResource,
+      ),
   );
 
   // Own-publish recognition already ran inside planAndStageBookResources (it
