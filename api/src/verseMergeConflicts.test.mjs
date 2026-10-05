@@ -56,9 +56,19 @@
 // SQL, and tests the pure grouping logic directly (no D1 needed) — same
 // split as chapterLock.test.mjs.
 
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import { reviewConditionKey, verseMergeEditorConditionKey } from "./reviewAlerts.ts";
-import { raiseVerseMergeConflictAlert, retireVerseKeptAiMasterFlags, resolveConvergedVerseMergeConflicts } from "./verseMergeConflicts.ts";
+import {
+  confirmAdoptedConflicts,
+  deleteLostAdoptionConflicts,
+  raiseVerseMergeConflictAlert,
+  recordVerseMergeConflicts,
+  resolveConvergedVerseMergeConflicts,
+  retireVerseKeptAiMasterFlags,
+} from "./verseMergeConflicts.ts";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
@@ -2654,6 +2664,193 @@ console.log("\n[locked -> dismissed -> unlocked: the overwrite warning comes bac
     assert(rows.length === 1, `${u}: after the unlock, a fresh undismissed alert is raised`);
     assert(/tonight's export/i.test(rows[0]?.message ?? ""), `${u}: …carrying the unlocked overwrite warning`);
     assert(rows[0]?.condition_key === expectedKeys[u], `${u}: the unlocked condition key is unchanged from before #1006`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Issue #996: the editor's "Door43's sync overwrote your edits" alert carries
+// each ref's first-flagged date, so an alert re-raised because its ref list
+// only SHRANK (some rows resolved, nothing new tonight) reads as old, and a
+// genuinely new overwrite sharing the alert with old ones is dated tonight
+// instead of hiding under the oldest date.
+// ─────────────────────────────────────────────────────────────────────────
+console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)]");
+{
+  const AUG19 = Date.UTC(2026, 7, 19, 5, 30) / 1000;
+  const OCT05 = Date.UTC(2026, 9, 5, 5, 30) / 1000;
+  const users = (refs) => new Map(refs.map((r) => [editLogKey("EZK", "ust", r), "bcameron93"]));
+
+  // Every ref from the same day: one date, after the list (the shrink case).
+  const sameDay = [
+    { chapter: 4, verse: 17, overwrittenVersion: 6, detectedAt: AUG19 },
+    { chapter: 4, verse: 18, overwrittenVersion: 3, detectedAt: AUG19 + 40 },
+  ];
+  const one = groupOverwrittenVersesByEditor("EZK", "ust", sameDay, users(sameDay)).get("bcameron93").message;
+  assert(
+    one.includes("with Door43's version: 4:17@v6, 4:18@v3 (first flagged 2026-08-19)."),
+    `same-day refs share one first-flagged date (got: ${one})`,
+  );
+
+  // Old and new refs in one alert: each group carries its own date, oldest
+  // first, so tonight's overwrite is not dated by the August rows.
+  const mixed = [
+    { chapter: 3, verse: 2, overwrittenVersion: 9, detectedAt: OCT05 },
+    { chapter: 4, verse: 17, overwrittenVersion: 6, detectedAt: AUG19 },
+  ];
+  const two = groupOverwrittenVersesByEditor("EZK", "ust", mixed, users(mixed)).get("bcameron93");
+  assert(
+    two.message.includes(
+      "with Door43's version: 4:17@v6 (first flagged 2026-08-19); 3:2@v9 (first flagged 2026-10-05).",
+    ),
+    `old and new refs are dated separately, oldest first (got: ${two.message})`,
+  );
+  assert(two.refs.join(",") === "3:2@v9,4:17@v6", "the refs that feed the condition key keep their order and shape");
+
+  // No detectedAt (a caller without dates): the message is exactly the old one.
+  const undated = [{ chapter: 5, verse: 1, overwrittenVersion: 2 }];
+  const plain = groupOverwrittenVersesByEditor("EZK", "ust", undated, users(undated)).get("bcameron93").message;
+  assert(
+    plain.startsWith("Door43's sync overwrote your edit in EZK UST at 1 verse(s) with Door43's version: 5:1@v2. "),
+    `no detectedAt -> no invented date (got: ${plain})`,
+  );
+}
+
+// The same, end to end on a database built from the real migrations: the real
+// writers (recordVerseMergeConflicts, confirmAdoptedConflicts) and the real
+// alert path (raiseVerseMergeConflictAlert).
+{
+  const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  const migrationSql = readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort()
+    .map((f) => readFileSync(join(migrationsDir, f), "utf8"));
+  const JUN10 = Date.UTC(2026, 5, 10, 5, 30) / 1000;
+  const AUG19 = Date.UTC(2026, 7, 19, 5, 30) / 1000;
+  const OCT05 = Date.UTC(2026, 9, 5, 5, 30) / 1000;
+  const SOURCE = "verse_merge_conflict:EZK:ust";
+
+  function migratedEnv() {
+    const sqlite = new DatabaseSync(":memory:");
+    for (const sql of migrationSql) sqlite.exec(sql);
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'bcameron93')`).run();
+    const stmt = (sql, args = []) => ({
+      _sql: sql,
+      _args: args,
+      bind: (...next) => stmt(sql, next),
+      all: async () => ({ results: sqlite.prepare(sql).all(...args) }),
+      first: async () => sqlite.prepare(sql).get(...args) ?? null,
+      run: async () => ({ meta: { changes: Number(sqlite.prepare(sql).run(...args).changes) } }),
+    });
+    const env = {
+      DB: {
+        prepare: (sql) => stmt(sql),
+        batch: async (stmts) => {
+          sqlite.exec("BEGIN");
+          try {
+            const out = stmts.map((s) => ({ meta: { changes: Number(sqlite.prepare(s._sql).run(...s._args).changes) } }));
+            sqlite.exec("COMMIT");
+            return out;
+          } catch (e) {
+            sqlite.exec("ROLLBACK");
+            throw e;
+          }
+        },
+      },
+    };
+    return { sqlite, env };
+  }
+  // bcameron93 wrote `version` of the verse, so an overwrite pointing at it is theirs.
+  const authored = (sqlite, chapter, verse, version) =>
+    sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', ?, 'EZK', 7, ?, 'update')`,
+    ).run(`EZK/${chapter}/${verse}/UST`, version);
+  const overwrite = (chapter, verse, overwrittenVersion) => ({
+    chapter, verse, action: "adopt_conflict", reason: "both_changed_wording",
+    overwrittenVersion, alignment: null, observedVersion: null,
+  });
+  const humanResolve = (sqlite, chapter, verse, at) =>
+    sqlite.prepare(
+      `UPDATE verse_merge_conflicts SET resolved_at = ?, resolved_by = 7
+        WHERE book = 'EZK' AND resource = 'ust' AND chapter = ? AND verse = ?`,
+    ).run(at, chapter, verse);
+  const row = (sqlite, chapter, verse) =>
+    sqlite.prepare(`SELECT * FROM verse_merge_conflicts WHERE book = 'EZK' AND resource = 'ust' AND chapter = ? AND verse = ?`)
+      .get(chapter, verse);
+  const editorAlerts = (sqlite) =>
+    sqlite.prepare(`SELECT * FROM system_alerts WHERE username = 'bcameron93' AND source = ? ORDER BY id`).all(SOURCE);
+
+  // (a) The issue's own case: the standing list only shrinks. Two refs first
+  // flagged 2026-08-19; one is resolved; tonight's re-raise names the other
+  // with its August date.
+  {
+    const { sqlite, env } = migratedEnv();
+    authored(sqlite, 4, 17, 6);
+    authored(sqlite, 4, 18, 3);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 17, 6), overwrite(4, 18, 3)], AUG19);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: AUG19 * 1000 });
+    humanResolve(sqlite, 4, 18, AUG19 + 86400);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const live = editorAlerts(sqlite).filter((a) => a.resolved_at == null);
+    assert(live.length === 1, "shrink: one standing editor alert");
+    assert(
+      live[0]?.message.includes("at 1 verse(s) with Door43's version: 4:17@v6 (first flagged 2026-08-19)."),
+      `shrink: the re-raised alert carries the remaining ref's August date (got: ${live[0]?.message})`,
+    );
+    assert(
+      live[0]?.condition_key === verseMergeEditorConditionKey("EZK", "ust", "bcameron93", ["4:17@v6"]),
+      "shrink: the condition key keeps its pre-#996 shape (dates are message-only)",
+    );
+
+    // Stickiness: dismiss it; the next run with the same rows leaves it down,
+    // even though the message wording changed with this fix.
+    sqlite.prepare(`UPDATE system_alerts SET dismissed_at = ? WHERE id = ?`).run(OCT05 + 60, live[0].id);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: (OCT05 + 120) * 1000 });
+    const shown = editorAlerts(sqlite).filter((a) => a.resolved_at == null && a.dismissed_at == null);
+    assert(shown.length === 0, "shrink: a dismissed alert stays dismissed on the next run");
+  }
+
+  // (b) The PR #1001 review case: a verse overwritten in June, resolved by a
+  // person, then overwritten again tonight. The reactivated row is dated
+  // tonight, not June, so the editor is not told this is an old, known loss.
+  {
+    const { sqlite, env } = migratedEnv();
+    authored(sqlite, 4, 20, 4);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 20, 4)], JUN10);
+    humanResolve(sqlite, 4, 20, JUN10 + 86400);
+    // Tonight: the speculative upsert, the CAS lands, the confirm reactivates.
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 20, 11)], OCT05);
+    assert(row(sqlite, 4, 20).detected_at === JUN10, "reactivation: the speculative upsert alone leaves detected_at alone");
+    await confirmAdoptedConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 20 }], OCT05);
+    const r = row(sqlite, 4, 20);
+    assert(r.resolved_at === null && r.resolved_by === null, "reactivation: the row is active again");
+    assert(r.detected_at === OCT05, `reactivation: detected_at is tonight, not June (got ${r.detected_at})`);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const msg = editorAlerts(sqlite).find((a) => a.resolved_at == null)?.message ?? "";
+    assert(msg.includes("(first flagged 2026-10-05)"), `reactivation: the editor alert is dated tonight (got: ${msg})`);
+    assert(!msg.includes("2026-06-10"), "reactivation: the June date does not appear");
+  }
+
+  // (c) A still-UNRESOLVED row whose overwrite is confirmed again keeps its
+  // original detected_at: the reset is only for a row coming back from resolved.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 21, 5)], AUG19);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 21, 8)], OCT05);
+    await confirmAdoptedConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 21 }], OCT05);
+    const r = row(sqlite, 4, 21);
+    assert(r.detected_at === AUG19, `unresolved re-confirm: detected_at keeps its first date (got ${r.detected_at})`);
+    assert(r.last_recorded_at === OCT05, "unresolved re-confirm: last_recorded_at still records tonight");
+  }
+
+  // (d) A resolved row whose adoption LOSES its CAS race (no confirm) keeps
+  // its resolution and its date: nothing was overwritten tonight.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 22, 5)], JUN10);
+    humanResolve(sqlite, 4, 22, JUN10 + 86400);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 22, 9)], OCT05);
+    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 22 }], OCT05);
+    const r = row(sqlite, 4, 22);
+    assert(r.resolved_at === JUN10 + 86400, "lost CAS: the resolution stands");
+    assert(r.detected_at === JUN10, "lost CAS: detected_at is untouched");
   }
 }
 
