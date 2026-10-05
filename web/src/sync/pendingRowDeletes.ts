@@ -44,19 +44,20 @@ export function hidePendingRowDeletes<P extends Pick<ChapterPayload, "book" | "t
 // Wrap a chapter loader so its payload is filtered by the outbox as read
 // AFTER the GET resolved: a DELETE that committed before the snapshot is not
 // in it anyway, and one that commits after the read reaches the tab as its
-// own `row.deleted`. An outbox read failure lands the snapshot unchanged.
+// own `row.deleted`. Any failure here (the outbox read, or a malformed
+// persisted op tripping the filter) lands the snapshot unchanged: an outbox
+// problem must never turn a good GET into the chapter's error screen.
 export function hidingPendingRowDeletes<P extends Pick<ChapterPayload, "book" | "tn" | "tq" | "twl">>(
   load: ChapterLoader<P>,
   listOps: () => Promise<readonly OpLike[]>,
 ): ChapterLoader<P> {
   return async (signal, onAttempt) => {
     const payload = await load(signal, onAttempt);
-    let ops: readonly OpLike[];
     try {
-      ops = await listOps();
-    } catch {
+      return hidePendingRowDeletes(payload, await listOps());
+    } catch (e) {
+      console.warn("pendingRowDeletes: could not apply pending row deletes; showing the snapshot unchanged", e);
       return payload;
     }
-    return hidePendingRowDeletes(payload, ops);
   };
 }

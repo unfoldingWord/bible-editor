@@ -82,6 +82,22 @@ const ids = (rows) => rows.map((r) => r.id);
   check((await load(new AbortController().signal, () => {})) === p, "an outbox read failure lands the snapshot unchanged");
 }
 {
+  // A malformed persisted op (a row DELETE with no rowKind) must not make the
+  // chapter GET reject: the snapshot lands unchanged.
+  const p = payload();
+  const bad = { id: "bad", target: { kind: "row", id: "q1", book: "ZEC" }, action: "delete", status: "pending" };
+  const load = wrap(async () => p, async () => [bad]);
+  const warn = console.warn;
+  console.warn = () => {};
+  let out;
+  try {
+    out = await load(new AbortController().signal, () => {});
+  } finally {
+    console.warn = warn;
+  }
+  check(out === p, "a malformed outbox op lands the snapshot unchanged instead of failing the GET");
+}
+{
   const order = [];
   const load = wrap(
     async () => {
