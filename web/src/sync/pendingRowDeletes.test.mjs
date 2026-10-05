@@ -640,6 +640,71 @@ const sig = (o) => `${o.kind}:${o.op.target.id}:${o.remote ? "remote" : "local"}
   check(ids((await out).tq).join() === "q1,q2", "#1126 item 2: another tab's late refusal shows its row");
 }
 
+// Review A1: an own DELETE abandoned during the load (its rollback may
+// already have restored the row) hides nothing, though the after-read still
+// listed it as pending.
+{
+  const r = run({ ops: [del("tq", "q1")] });
+  await r.ready();
+  r.on.abandoned(del("tq", "q1", "in_flight"));
+  check(ids((await r.finish()).tq).join() === "q1,q2", "#1126 A1: an own DELETE abandoned during the load hides nothing, whatever the after-read says");
+}
+
+// Review A2: an aborted load does not sit out the grace.
+{
+  const ctl = new AbortController();
+  let ops = [del("tq", "q2")];
+  let resolveGet;
+  let watched;
+  const load = wrap(() => new Promise((res) => (resolveGet = res)), async () => ops, {
+    watch: (on) => ((watched = on), () => (watched = null)),
+    isOwn: () => false,
+  });
+  const p = load(ctl.signal, () => {});
+  await new Promise((res) => setTimeout(res, 0));
+  ops = [];
+  resolveGet(payload());
+  await new Promise((res) => setTimeout(res, 10));
+  const t0 = Date.now();
+  ctl.abort();
+  await p.catch(() => {});
+  check(Date.now() - t0 < 100, "#1126 A2: an abort ends the grace wait at once");
+  check(watched === null, "#1126 A2: and the load unsubscribes");
+}
+
+// Review A3: a viewer's delete is a read-only no-op, never queued: the click
+// is dropped as if the enqueue had failed.
+{
+  const r = run({ ops: [], ...tracked() });
+  await r.ready();
+  const click = mod.markOwnRowDelete?.("tq", "ZEC", "q1");
+  mod.recordOwnRowDeleteClickOp?.({ ...del("tq", "q1"), id: "readonly-noop" }, click);
+  check(ids((await r.finish()).tq).join() === "q1,q2", "#1126 A3: a read-only no-op delete hides nothing in a load spanning it");
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "q1" }) === false, "#1126 A3: and leaves no mark");
+  unmark("q1");
+}
+{
+  // ...while a real op is recorded as before.
+  const click = mod.markOwnRowDelete?.("tq", "ZEC", "q1");
+  mod.recordOwnRowDeleteClickOp?.({ ...del("tq", "q1"), id: "opA3" }, click);
+  check(mod.isOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "opA3" }) === true, "#1126 A3: a queued op is recorded");
+  unmark("q1");
+}
+
+// Review A5: once the click's op is forgotten (refused / discarded), the
+// click is dead even while an older own op keeps the mark.
+{
+  mark("q1");
+  mod.recordOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "opA5-old" });
+  const track = mod.trackOwnRowDeletes?.() ?? (() => []);
+  mark("q1");
+  mod.recordOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "opA5-new" });
+  mod.forgetOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "opA5-new" });
+  check(track().length === 0, "#1126 A5: a click whose op was forgotten is no longer reported as clicked");
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "q1" }) === true, "#1126 A5: the older op keeps the mark");
+  unmark("q1");
+}
+
 // Item 5: a committed own op no longer keeps the mark alive once a later
 // DELETE of the (re-created) row is refused.
 {
