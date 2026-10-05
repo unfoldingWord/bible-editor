@@ -600,8 +600,9 @@ export function BookView({
 // jumped by the whole change above it (12,900 px on ZEC). A class component
 // because getSnapshotBeforeUpdate is the one place React runs code before a
 // commit changes the DOM, which is when the old position must be read.
-// Corrected once in the commit and once more on the next frame, after the
-// new column's cells have filled in their text.
+// Corrected in the commit and again on each of the next two frames (the new
+// column's cells fill in their text after the commit, and ChapterBlock keeps
+// chapters laid out for two frames), unless something else scrolled.
 interface ToggleAnchorSnapshot {
   selector: string;
   offset: number;
@@ -633,15 +634,21 @@ class ColumnToggleAnchor extends Component<{
   }
   componentDidUpdate(_prev: unknown, _state: unknown, snapshot: ToggleAnchorSnapshot | null) {
     if (!snapshot) return;
-    const restore = () => {
+    // scrollTop as this anchor last left it. A later correction runs only if
+    // it still holds: anything else that scrolled in between (the reader, a
+    // go-to-verse or Find jump, scroll-to-active once a chapter loads) wins.
+    let written: number | null = null;
+    const restore = (framesLeft: number) => {
       const container = this.props.containerRef.current;
       const el = container?.querySelector<HTMLElement>(snapshot.selector);
       if (!container || !el) return;
+      if (written !== null && container.scrollTop !== written) return;
       container.scrollTop += el.getBoundingClientRect().top - container.getBoundingClientRect().top - snapshot.offset;
+      written = container.scrollTop;
+      if (framesLeft > 0) this.frame = requestAnimationFrame(() => restore(framesLeft - 1));
     };
-    restore();
     cancelAnimationFrame(this.frame);
-    this.frame = requestAnimationFrame(restore);
+    restore(2);
   }
   componentWillUnmount() {
     cancelAnimationFrame(this.frame);
