@@ -16,7 +16,7 @@
 // Cross-chapter persistence is intentionally a v3 — for now the
 // expectation is "click sparkles, stay in this chapter until it lands."
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api, type TnRow, type TnQuickRequest, type TnQuickResponse } from "../sync/api";
 
 const PULSE_MS = 4000;
@@ -109,10 +109,18 @@ export function useAiDrafts(): UseAiDraftsAPI {
   const [completedAt, setCompletedAt] = useState<Map<string, number>>(() => new Map());
   const [notifications, setNotifications] = useState<AiDraftNotification[]>([]);
 
-  // Refs so async callbacks read current values without re-binding the
-  // setters every keystroke.
+  // Lets start and abortAll read the in-flight map while keeping a stable
+  // identity. abortAll must not change when `pending` does: the unmount
+  // effect below lists it in its deps, so a new abortAll would run that
+  // effect's cleanup and abort every in-flight request each time one starts
+  // or finishes. Written in a layout effect, not during render, so a
+  // render React throws away (StrictMode's dev replay) never leaves it holding
+  // an uncommitted map. Its readers run after a commit: start from a click
+  // handler in Shell, abortAll from this hook's unmount cleanup (passive).
   const pendingRef = useRef(pending);
-  pendingRef.current = pending;
+  useLayoutEffect(() => {
+    pendingRef.current = pending;
+  });
 
   const isPending = useCallback((rowId: string) => pending.has(rowId), [pending]);
   const recentlyCompletedAt = useCallback(

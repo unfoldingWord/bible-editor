@@ -390,17 +390,24 @@ function ScriptureColumnInner({
   // Stacked/columns scroll-to-match: BookView handles book mode internally.
   // Runs exactly once per navigation request (keyed on `findNav`, whose seq
   // changes every time) — `activeVerse`, `chapter` and `onSelectVerse` are
-  // read through refs on purpose: Shell hands us a fresh `onSelectVerse`
-  // arrow on every render, so keeping it (or activeVerse) in the deps made
-  // this re-fire on the very re-render a manual verse click causes and pull
-  // the user straight back to the match. In stacked mode an explicit
+  // read through refs on purpose: a manual verse click changes activeVerse,
+  // so keeping it in the deps made this re-fire on the very re-render that
+  // click causes and pull the user straight back to the match. (Shell's
+  // onSelectVerse is now the stable requestSelectVerse; it used to be a
+  // fresh arrow every render, with the same effect.) In stacked mode an explicit
   // prev/next promotes the match verse to "active" so its full editable
   // card expands; the active-verse
   // effect below then scrolls the expanded card into view. The auto-jump
   // while typing only scrolls the (still inactive, but visible and
   // highlighted) row into view.
+  // Written in a layout effect, not during render, so a render React throws
+  // away (StrictMode's dev replay) never leaves it holding uncommitted values.
+  // Its readers are the find effect below (passive, so it runs after every
+  // layout effect of the commit) and selectLocalVerse (click handlers).
   const findNavCtxRef = useRef({ activeVerse, chapter, onSelectVerse });
-  findNavCtxRef.current = { activeVerse, chapter, onSelectVerse };
+  useLayoutEffect(() => {
+    findNavCtxRef.current = { activeVerse, chapter, onSelectVerse };
+  });
   const localSelectionRef = useRef<number | null>(null);
   const localRowAnchorRef = useRef<{ top: number; scroller: HTMLElement } | null>(null);
   const selectLocalVerse = useCallback((verse: number, onAccepted?: () => void) => {

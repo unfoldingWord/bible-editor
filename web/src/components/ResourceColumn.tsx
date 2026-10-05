@@ -437,11 +437,19 @@ export function ResourceColumn({
 }: Props) {
   // Where the user's focus currently is, mirrored into a ref for NoteCard's
   // abandoned-blank-stub discard (see hasLeftNoteVerse in noteGuard.ts).
-  // Written during render, not in an effect: in per-verse mode the card for
-  // the OLD verse unmounts in the same commit that changes activeVerse, so
-  // its own props are stale by the time its unmount cleanup runs — reading a
-  // parent ref that was already updated during the parent's render is the
-  // only way that cleanup can see the NEW location.
+  // In per-verse mode the card for the OLD verse unmounts in the same commit
+  // that changes activeVerse, so its own props are stale by the time its
+  // unmount cleanup runs; this parent ref is how that cleanup sees the NEW
+  // location. Its readers are NoteCard's discard effect and unmount cleanup,
+  // both passive. A useEffect write here would be too late: React runs the
+  // removed card's passive cleanup before this component's passive effects.
+  // A useLayoutEffect write would land in time and would also keep a render
+  // React throws away from leaking in, but it is left as a render-time write
+  // on purpose (#1011): this feeds the blank-stub discard, which deletes a
+  // note when it misjudges, and the move buys nothing on this tree. No
+  // startTransition / useDeferredValue is in use, so the render React throws
+  // away here is StrictMode's dev replay, which re-renders with the same
+  // props. Revisit if concurrent rendering arrives (e.g. a React 19 upgrade).
   const activeLocRef = useRef<ActiveLocation>({ book, chapter, verse: activeVerse });
   activeLocRef.current = { book, chapter, verse: activeVerse };
 

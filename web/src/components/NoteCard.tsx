@@ -750,6 +750,12 @@ function NoteCardInner({
   // lockstep and hasRowDiff would never go true. Pinning the baseline to
   // version means it only rebases on a real server confirmation (PATCH 200,
   // restore, AI completion, or WS row.upserted), all of which bump version.
+  // The rebase below must happen during render: the diff further down
+  // (rowDiff) reads savedRef in this same render. An effect would rebase only
+  // after this render had already diffed against the old baseline, and a ref
+  // write does not itself re-render, so the stale diff could stay on screen
+  // until something else re-rendered the card. It is
+  // keyed on row.version, so StrictMode's replay writes the same value twice.
   const savedRef = useRef({
     quote: row.quote,
     note: row.note,
@@ -798,7 +804,9 @@ function NoteCardInner({
   // the timer always flushes the final text, even if an undo / template /
   // translate set the quote through another path before it fires. The note
   // BODY drives nothing outside this card, so it never propagates (it persists
-  // via the draft store and saves through flushPending).
+  // via the draft store and saves through flushPending). Also read by the
+  // blank-stub discard; written during render for the reason given at the
+  // unmount refs below.
   const quoteRef = useRef(quote);
   quoteRef.current = quote;
   const quotePropagateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1068,7 +1076,7 @@ function NoteCardInner({
   // their local state + their own IndexedDB draft, so the row really is blank
   // in D1 and BLANK_STUB_CLAUSE cannot save it — a second viewer would bin the
   // note mid-sentence. Only discard a card this user activated and then left.
-  // Written during render, like savedRef above.
+  // Written during render, for the reason given at the unmount refs below.
   const wasActiveRef = useRef(false);
   if (active) wasActiveRef.current = true;
   const discardedRef = useRef(false);
@@ -1076,8 +1084,19 @@ function NoteCardInner({
   // Mirrored refs for the unmount cleanup below, which fires after the
   // component is gone and can't read live state/props from closure — only
   // whatever was captured at effect-creation time (mount, since its deps are
-  // []). Written during render, same pattern as savedRef above, so the
-  // cleanup always sees the last values this instance actually held.
+  // []).
+  //
+  // These, discardIfAbandonedStubRef, wasActiveRef and quoteRef are written
+  // during render, and left that way on purpose (#1011). Every reader runs
+  // after a commit: the discard is called only from passive effects (the
+  // MOUNTED-path effect and the unmount cleanup below), and quoteRef's other
+  // reader is a timer. So a useLayoutEffect write would deliver the same
+  // values, and would also keep a render React throws away from leaking in.
+  // They were not moved because this path deletes a note when it misjudges
+  // (see wasActiveRef) and the move buys nothing on this tree: no
+  // startTransition / useDeferredValue is in use, so the render React throws
+  // away here is StrictMode's dev replay, which re-renders with the same
+  // props. Revisit if concurrent rendering arrives (e.g. a React 19 upgrade).
   const noteAtUnmountRef = useRef(note);
   noteAtUnmountRef.current = note;
   const supportRefAtUnmountRef = useRef(supportRef);
@@ -1092,7 +1111,8 @@ function NoteCardInner({
   // Runs every guard, then discards. Kept in a ref (rather than a plain
   // function) and updated every render so the unmount effect's cleanup —
   // frozen at mount — always invokes the LATEST closure, not a stale one
-  // that captured mount-time handleDelete/onDelete.
+  // that captured mount-time handleDelete/onDelete. Written during render;
+  // see the unmount refs above.
   const discardIfAbandonedStubRef = useRef<() => void>(() => {});
   discardIfAbandonedStubRef.current = () => {
     if (discardedRef.current) return;
