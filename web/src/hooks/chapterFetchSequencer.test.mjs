@@ -433,4 +433,54 @@ function harness() {
   assert.deepEqual(events.at(-1).queued, ["keep"], "forget drops only the matching step");
 }
 
+// ── (#1107) a delete made with NO merge pending survives the next merge ──
+// The case #989 did not cover: the tab deletes tq row X while offline (no
+// merging GET pending, so record() keeps no rowDelete step). On reconnect the
+// merging GET races the outbox drain and its snapshot still holds X. The
+// loader useChapter really passes (pendingRowDeletes.ts) re-reads the outbox
+// after the GET and hides rows whose own DELETE is still draining.
+{
+  const vs = await import("../lib/verseStructure.ts");
+  // Missing-module fallback: against the pre-#1107 code the case fails on the
+  // row itself, not on the import.
+  const prd = await import("../sync/pendingRowDeletes.ts").catch(() => ({}));
+  const wrap = prd.hidingPendingRowDeletes ?? ((load) => load);
+  const chapter = (tq) => ({ book: "ZEC", chapter: 1, verses: {}, tn: [], tq, twl: [], verseStatuses: [], verseLaneChecks: [], twlOrderLocks: [] });
+  const q = (id) => ({ id, version: 2, book: "ZEC", chapter: 1, verse: 1, sort_order: 1, updated_at: 100 });
+  let state = chapter([q("X"), q("Y")]);
+  const reqs = [];
+  const seq = createChapterFetchSequencer({
+    onStart: () => {},
+    onAttempt: () => {},
+    onLanded: (payload, merge, queued) => {
+      state = vs.replaySteps(merge ? vs.mergeRefetched(state, payload) : payload, queued);
+    },
+    onError: () => {},
+    keepOnSupersede: vs.keepStepAcrossSupersede,
+  });
+  // The tab's outbox: X's DELETE is queued (offline).
+  let ops = [{ id: "op1", target: { kind: "row", rowKind: "tq", id: "X", book: "ZEC" }, action: "delete", status: "pending" }];
+  const load = wrap(() => new Promise((resolve) => reqs.push(resolve)), async () => ops);
+  const del = { type: "rowDelete", kind: "tq", id: "X" };
+  seq.record(del); // no merge pending: nothing is recorded
+  state = vs.applyStep(state, del);
+  const reconnect = seq.refetch(load, true); // WS onOpen after reconnect
+  ops = [{ ...ops[0], status: "in_flight" }]; // the drain picks the DELETE up
+  reqs[0](chapter([q("X"), q("Y")])); // snapshot taken before the DELETE committed
+  await reconnect;
+  assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#1107: the offline-deleted row stays hidden after the reconnect merge");
+  // A plain refetch (a chapter re-opened, a Refresh) racing the drain too.
+  const plain = seq.refetch(load, false);
+  reqs[1](chapter([q("X"), q("Y")]));
+  await plain;
+  assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#1107: a plain refetch landing before the DELETE commits does not show the row either");
+  // The DELETE is refused or discarded: the op is gone and the server still
+  // has X. The next GET must show it, never hide a row with no DELETE left.
+  ops = [];
+  const after = seq.refetch(load, true);
+  reqs[2](chapter([q("X"), q("Y")]));
+  await after;
+  assert.deepEqual(state.tq.map((r) => r.id), ["X", "Y"], "#1107: with its DELETE gone from the outbox the server's row shows again");
+}
+
 console.log("chapterFetchSequencer: all cases passed");
