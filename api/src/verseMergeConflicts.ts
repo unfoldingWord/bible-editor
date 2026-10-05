@@ -1210,17 +1210,16 @@ async function rewordVerseMergeAlertForLock(
   // The raise puts a lock flag in the key whenever it used the locked wording
   // for a sentence, so the stored key says which wording stands.
   const wordedLocked = state.noBaseBookLocked === true || state.keptBookLocked === true;
-  if (!dependsOnLock && !wordedLocked) return false;
-  // #1110 round 2, #1118 item 2: nothing live depends on the lock, but the
-  // standing alert still carries the locked wording (its only lock-dependent
-  // row was resolved since). Re-raising rebuilds it from the shrunken live
-  // rows and mints a new key. For a DISMISSED alert that brings back what
-  // people dismissed, for a wording difference about a row that is already
-  // resolved, so leave it. An undismissed one is re-raised below, so it stops
-  // naming a lock that is gone (#1118 review).
-  if (!dependsOnLock && standing.dismissed_at != null) return false;
   const wantLocked = dependsOnLock && (await lockedNow());
-  if (wantLocked === wordedLocked) return false;
+  // #1110 round 2, #1118 item 2: a re-raise rebuilds the alert from the live
+  // rows, so once rows were resolved since the last reimport it mints a new
+  // key. For a DISMISSED alert that brings back what people dismissed, so it
+  // is re-raised only when something live still depends on the lock and the
+  // wording it stands under is wrong for the lock now. An undismissed alert
+  // is always rebuilt from the live rows, as before #1118: it then stops
+  // listing rows a save resolved, and stops naming a lock that is gone. An
+  // identical rebuild leaves the stored key as it was, which ends the refresh.
+  if (standing.dismissed_at != null && (!dependsOnLock || wantLocked === wordedLocked)) return false;
   const ordered = [...noBase].sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
   await raiseVerseMergeConflictAlert(env, book, resource, {
     recordingFailed: false,
