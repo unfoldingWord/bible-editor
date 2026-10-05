@@ -1419,6 +1419,126 @@ console.log("\n[#788: a cosmetic adoption that loses its version-CAS race does n
     "the speculative cosmetic audit is removed when the CAS did not overwrite anything");
 }
 
+// ── Issue #1005: the watermark lags one publish; the app edit already shipped ─
+//
+// JER ULT 29:23 / 49:21: master_confirmed_at still named the publish BEFORE our
+// newest one, because Richard Mahn's em-dash join landed on top of that newest
+// publish before any sync could positively confirm it. The app edits the
+// boundary probe saw were already in that newest publish (book_resource_syncs'
+// pushed_blob_sha / pushed_r2_key, whose PR the lineage lists among `ours`), so
+// D1 held nothing master lacked — yet the cosmetic adoption was refused and the
+// export put the newline back. The widening answers the probe from that publish,
+// and ONLY when D1 still equals it at the verse.
+const SHIPPED_PR = 4242;
+const lineageWithOurPublish = (refs, oursPrNumbers = [SHIPPED_PR]) => ({
+  ...cosmeticHumanLineage(refs),
+  counts: { ours: 2, ai: 0, human: 1 },
+  oursPrNumbers,
+});
+const unconfirmedPublishOf = (boundary, verses, prNumber = SHIPPED_PR) => ({
+  confirmedAt: 200,
+  editId: boundary,
+  prNumber,
+  verses: new Map(Object.entries(verses).map(([k, contentJson]) => [k, { contentJson, verseEnd: null }])),
+});
+
+function seedEditAfterConfirmedBoundary(sqlite, chapter, verse) {
+  // An app edit strictly after the confirmed id boundary (and after the
+  // confirmedAt timestamp) — the thing human_edit_after_export detects.
+  sqlite.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+     VALUES ('verse', ?, ?, 91, 4, 4, 'update', ?, 300)`,
+  ).run(`${BOOK}/${chapter}/${verse}/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(COSMETIC_OURS) }));
+}
+
+console.log("\n[#1005: an app edit after a lagging watermark that our newer publish already shipped does not block cosmetic_human]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite);
+  seedEditAfterConfirmedBoundary(sqlite, 12, 3);
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 3, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    {
+      confirmedAt: 200,
+      editId: boundary,
+      lineage: lineageWithOurPublish(["12:3"]),
+      // D1's current verse IS the last pushed render's verse.
+      unconfirmedPublish: unconfirmedPublishOf(boundary, { "12:3": COSMETIC_OURS }),
+    },
+    false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, plain_text, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 3`).get(BOOK);
+  eq([row.content_json, row.plain_text, row.version], [COSMETIC_MASTER, "—\n", 5], "the human's master bytes are adopted through the CAS lane");
+  eq([counts.merge_adopted, counts.merge_cosmetic_adopted, counts.merge_cosmetic_ignored], [1, 1, 0], "counted as a landed cosmetic adoption, not ignored drift");
+  eq(
+    sqlite.prepare(`SELECT action, reason, overwritten_version FROM verse_merge_conflicts WHERE book = ? AND resource = 'ult' AND chapter = 12 AND verse = 3`).get(BOOK),
+    { action: "adopt", reason: "cosmetic_human", overwritten_version: 4 },
+    "the audit says adopt / cosmetic_human",
+  );
+}
+
+console.log("\n[#1005: the pushed render's verse is byte-different from D1 but renders identically (the usual production shape)]");
+{
+  // In production the shipped verse comes from extractVersesForRange over the
+  // whole pushed file, so its JSON is rarely byte-equal to D1's stored
+  // content_json. Same nodes, keys reordered: different bytes, same render.
+  const reorder = (node) =>
+    Array.isArray(node)
+      ? node.map(reorder)
+      : node && typeof node === "object"
+        ? Object.fromEntries(Object.entries(node).reverse().map(([k, v]) => [k, reorder(v)]))
+        : node;
+  const shippedReordered = JSON.stringify(reorder(JSON.parse(COSMETIC_OURS)));
+  if (shippedReordered === COSMETIC_OURS) throw new Error("fixture must differ in bytes");
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite);
+  seedEditAfterConfirmedBoundary(sqlite, 12, 3);
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 3, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    {
+      confirmedAt: 200,
+      editId: boundary,
+      lineage: lineageWithOurPublish(["12:3"]),
+      unconfirmedPublish: unconfirmedPublishOf(boundary, { "12:3": shippedReordered }),
+    },
+    false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 3`).get(BOOK);
+  eq([row.content_json, row.version], [COSMETIC_MASTER, 5], "render-equal to the pushed render is enough to adopt the human's master bytes");
+  eq([counts.merge_cosmetic_adopted, counts.merge_cosmetic_ignored], [1, 0], "counted as a cosmetic adoption through the render comparison");
+}
+
+console.log("\n[#1005: a genuinely unpublished app edit (or unproven publish) still blocks cosmetic_human]");
+for (const [label, lineage, unconfirmedPublish] of [
+  // D1 moved past what we last pushed: the edit never reached master.
+  ["D1 differs from the last pushed render", lineageWithOurPublish(["12:3"]), (b) => unconfirmedPublishOf(b, { "12:3": contentJson("older published text") })],
+  ["last pushed render lacks the verse", lineageWithOurPublish(["12:3"]), (b) => unconfirmedPublishOf(b, { "12:4": COSMETIC_OURS })],
+  // The render matches, but nothing shows it landed on master.
+  ["publish's PR not among lineage ours", lineageWithOurPublish(["12:3"], [999]), (b) => unconfirmedPublishOf(b, { "12:3": COSMETIC_OURS })],
+  ["pre-#1005 lineage without oursPrNumbers", cosmeticHumanLineage(["12:3"]), (b) => unconfirmedPublishOf(b, { "12:3": COSMETIC_OURS })],
+  // Measured against a different confirmed boundary than this cutoff's.
+  ["publish staged for another boundary", lineageWithOurPublish(["12:3"]), (b) => ({ ...unconfirmedPublishOf(b, { "12:3": COSMETIC_OURS }), editId: b + 1000 })],
+  ["no unconfirmed publish", lineageWithOurPublish(["12:3"]), () => null],
+]) {
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite);
+  seedEditAfterConfirmedBoundary(sqlite, 12, 3);
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 12, verse: 3, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    { confirmedAt: 200, editId: boundary, lineage, unconfirmedPublish: unconfirmedPublish(boundary) },
+    false,
+  );
+  const row = sqlite.prepare(`SELECT content_json, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 3`).get(BOOK);
+  eq([row.content_json, row.version], [COSMETIC_OURS, 4], `${label}: D1 is retained`);
+  eq([counts.merge_cosmetic_adopted, counts.merge_cosmetic_ignored], [0, 1], `${label}: unchanged merge_cosmetic_ignored behavior`);
+}
+
 // ── Issue #609: the PRISTINE / AI-only writers get the same lens ────────────
 //
 // The characterization test directly above pins the EDITED path: stableKey holds
@@ -2221,6 +2341,84 @@ console.log("\n[#728 T2b: …but when the lineage PROVES no human moved master, 
   assertClean728(counts, "T2b");
 }
 
+console.log("\n[#949 follow-up (2026-10-02 backlog review): on a LOCKED book, T2b's AI-only lineage no longer blocks the split]");
+{
+  // The shape the review flagged: a locked book never advances the lineage
+  // walk, so a split anchor with an app edit since the export (the ordinary
+  // state of a locked book) used to reach #787's keep_ai_master check in
+  // computeVerseMerge before ever asking whether the book was locked — the
+  // whole component then fell back to structure_refused /
+  // anchor_keep_ai_master, silently keeping D1's bridge. Same fixture as T2b
+  // (AI-only lineage) plus T3's app edit, but LOCKED: the split must land.
+  const { env, sqlite } = freshEnv();
+  const boundary = seedExportedBridge(sqlite);
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 7)`).run(BOOK);
+  insertLog728(sqlite, { verse: 1, action: "update", prev: 3, next: 4, payload: { content: JSON.parse(contentJson("combined one two, app-edited")) }, createdAt: 400 });
+  sqlite.prepare(`UPDATE verses SET content_json = ?, plain_text = ?, version = 4 WHERE book = ? AND chapter = ? AND verse = 1 AND bible_version = ?`)
+    .run(contentJson("combined one two, app-edited"), "combined one two, app-edited", BOOK, CH, VERSION);
+  const master = [verse(CH, 1, "master verse one"), verse(CH, 2, "master verse two")];
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, master, null, { confirmedAt: 200, editId: boundary, lineage: AI_ONLY_LINEAGE_728 }, false,
+  );
+  const rows = rows728(sqlite);
+  eq(rows.map((r) => [r.verse, r.verse_end, r.text]), [[1, null, "master verse one"], [2, null, "master verse two"]],
+    "locked: master's split lands despite the AI-only lineage");
+  eq(counts.structure_adopted, 1, "counted structure_adopted");
+  eq(counts.structure_refused, 0, "NOT refused — this is the bug: it used to fall to anchor_keep_ai_master here");
+  const c = conflicts728(sqlite);
+  eq(c.map((x) => [x.verse, x.action, x.overwritten_version]), [[1, "adopt_conflict", 4]],
+    "the anchor's own app edit still gets a recovery pointer, same as T3 — the lock skips the AI-lineage gate, not the review flag");
+  eq(c[0].reason.startsWith("both_changed_wording"), true,
+    `#1081: the split really changed the words, so the reason names wording (got ${c[0].reason})`);
+  assertClean728(counts, "T2c");
+}
+
+// #1081: step 6a's visible-change refine compared D1's WHOLE bridged row with
+// only master's anchor piece, so a split whose words were identical still read
+// as "wording changed" and alerted the editor. These two cases share T2c's
+// locked fixture; the D1 app edit already holds the words master splits.
+async function runLockedSplit1081(masterVerseTwoText) {
+  const { env, sqlite } = freshEnv();
+  const boundary = seedExportedBridge(sqlite);
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 7)`).run(BOOK);
+  insertLog728(sqlite, { verse: 1, action: "update", prev: 3, next: 4, payload: { content: JSON.parse(contentJson("alpha beta")) }, createdAt: 400 });
+  sqlite.prepare(`UPDATE verses SET content_json = ?, plain_text = ?, version = 4 WHERE book = ? AND chapter = ? AND verse = 1 AND bible_version = ?`)
+    .run(contentJson("alpha beta"), "alpha beta", BOOK, CH, VERSION);
+  // Master splits the bridge and adds only a paragraph marker.
+  const verseTwo = {
+    chapter: CH, verse: 2, verseEnd: null, plainText: masterVerseTwoText,
+    contentJson: JSON.stringify({ verseObjects: [{ type: "text", text: masterVerseTwoText }, { type: "paragraph", tag: "p", nextChar: "\n" }] }),
+  };
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(CH, 1, "alpha"), verseTwo], null,
+    { confirmedAt: 200, editId: boundary, lineage: AI_ONLY_LINEAGE_728 }, false,
+  );
+  return { sqlite, counts };
+}
+
+console.log("\n[#1081 T2d: locked book, master splits an exported bridge with the SAME words (markers only): logged, not alerted]");
+{
+  const { sqlite, counts } = await runLockedSplit1081("beta");
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end]), [[1, null], [2, null]], "the split lands");
+  eq(counts.structure_adopted, 1, "counted structure_adopted");
+  eq(conflicts728(sqlite).map((x) => [x.verse, x.action, x.reason, x.overwritten_version]),
+    [[1, "adopt_no_visible_change", "both_changed_no_visible", 4]],
+    "the anchor's audit row says no visible change, and still points at the overwritten version");
+  eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult"), [], "no editor-facing alert");
+  assertClean728(counts, "T2d");
+}
+
+console.log("\n[#1081 T2e: same locked split, but a later piece's wording differs: still alerts as wording-changed]");
+{
+  const { sqlite, counts } = await runLockedSplit1081("gamma");
+  const c = conflicts728(sqlite);
+  eq(c.map((x) => [x.verse, x.action]), [[1, "adopt_conflict"]], "the anchor stays adopt_conflict");
+  eq(c[0].reason.startsWith("both_changed_wording"), true, `the reason names wording (got ${c[0].reason})`);
+  eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult").map((r) => [r.verse, r.action]), [[1, "adopt_conflict"]],
+    "the editor is alerted");
+  assertClean728(counts, "T2e");
+}
+
 console.log("\n[#728 T3: an exported bridge a human ALSO edited in the app since, un-bridged on Door43: structure adopted, content flagged adopt_conflict]");
 {
   const { env, sqlite } = freshEnv();
@@ -2290,6 +2488,54 @@ console.log("\n[#728 T4b: an absorbed row a human edited since the render is del
   eq(counts.structure_adopted, 1, "counted structure_adopted");
   eq(counts.merge_conflicts, 1, "…and one live merge conflict for the reviewer");
   assertClean728(counts, "T4b");
+}
+
+// #1086, the mirror of #1081: for a BRIDGE anchor step 6a compared only D1's
+// anchor verse with master's whole bridge, so a bridge whose words were
+// identical still read as "wording changed" and alerted the editor. Locked
+// book, app edit on the anchor (so the merge adopts with a conflict); D1's two
+// verses already hold the words master bridges.
+async function runLockedBridge1086(masterBridgeText) {
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7, 'translator')`).run();
+  insertVerse728(sqlite, { verse: 1, text: "alpha", version: 2, updatedBy: 7 });
+  insertVerse728(sqlite, { verse: 2, text: "beta" });
+  insertLog728(sqlite, { verse: 1, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("one")) }, source: "dcs_reimport", userId: null, createdAt: 10 });
+  const boundary = insertLog728(sqlite, { verse: 2, action: "create", prev: null, next: 1, payload: { content: JSON.parse(contentJson("beta")) }, source: "dcs_reimport", userId: null, createdAt: 10 });
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, 7)`).run(BOOK);
+  insertLog728(sqlite, { verse: 1, action: "update", prev: 1, next: 2, payload: { content: JSON.parse(contentJson("alpha")) }, createdAt: 400 });
+  // Master bridges 1-2 and adds only a paragraph marker.
+  const bridge = {
+    chapter: CH, verse: 1, verseEnd: 2, plainText: masterBridgeText,
+    contentJson: JSON.stringify({ verseObjects: [{ type: "text", text: masterBridgeText }, { type: "paragraph", tag: "p", nextChar: "\n" }] }),
+  };
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [bridge], null, { confirmedAt: 200, editId: boundary, lineage: AI_ONLY_LINEAGE_728 }, false,
+  );
+  return { sqlite, counts };
+}
+
+console.log("\n[#1086 T4c: locked book, master bridges two D1 verses with the SAME words (markers only): logged, not alerted]");
+{
+  const { sqlite, counts } = await runLockedBridge1086("alpha beta");
+  eq(rows728(sqlite).map((r) => [r.verse, r.verse_end]), [[1, 2]], "the bridge lands");
+  eq(counts.structure_adopted, 1, "counted structure_adopted");
+  eq(conflicts728(sqlite).map((x) => [x.verse, x.action, x.reason, x.overwritten_version]),
+    [[1, "adopt_no_visible_change", "both_changed_no_visible", 2]],
+    "the anchor's audit row says no visible change, and still points at the overwritten version");
+  eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult"), [], "no editor-facing alert");
+  assertClean728(counts, "T4c");
+}
+
+console.log("\n[#1086 T4d: same locked bridge, but the absorbed verse's wording differs: still alerts as wording-changed]");
+{
+  const { sqlite, counts } = await runLockedBridge1086("alpha gamma");
+  const c = conflicts728(sqlite);
+  eq(c.map((x) => [x.verse, x.action]), [[1, "adopt_conflict"]], "the anchor stays adopt_conflict");
+  eq(c[0].reason.startsWith("both_changed_wording"), true, `the reason names wording (got ${c[0].reason})`);
+  eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult").map((r) => [r.verse, r.action]), [[1, "adopt_conflict"]],
+    "the editor is alerted");
+  assertClean728(counts, "T4d");
 }
 
 console.log("\n[#728 T5: D1 SPLIT a bridge after the export ('split' row above the boundary) while master still carries it: D1 keeps its plain rows]");

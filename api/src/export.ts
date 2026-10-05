@@ -235,13 +235,16 @@ function tsvLine(cells: unknown[]): string {
 // Tags column filter for tn/tq — measured on DCS master 2026-08-10:
 // ISSUE:MATCH_FAIL (1,568), at-fit (214), both together (14), keep (1), and
 // one garbage "I" (1) — 1,797 rows across ISA, NUM, ECC, DAN, ZEC, HOS, MIC.
-// These are stale AI-pipeline diagnostics; no code writes them anymore (grep
-// across api/src, web/src, scripts, migrations turns up zero hits outside a
-// test fixture) and no editor surface displays them. The DCS maintainer
+// These are stale AI-pipeline diagnostics and no editor surface displays them.
+// (bp-assistant still writes e.g. ISSUE:MATCH_FAIL into D1 and master — seen
+// 2026-09-28 — so "nothing writes them" is not true, but the column is
+// pipeline-owned either way.) The DCS maintainer
 // hand-blanks this column before every release ("tags that mean nothing to
 // GL/OL translators") and our export puts them back the next night — he's
 // done the manual blank at least twice (2026-06-18, 2026-08-07). So tn/tq
 // always export an empty Tags column; the stored D1 value is untouched.
+// Because the blanking is deliberate, tsvRevertReport ignores the Tags column
+// for tn/tq: a Tags-only difference can never be a lost hand-edit (#1029).
 //
 // This is NOT the translator "keep this note through an AI run" flag — that's
 // the `preserve` column (see pipelineImport.ts ~line 1053), not `tags`.
@@ -1165,6 +1168,11 @@ export function tsvRevertReport(
   masterTsv: string,
   kind: "tn" | "tq" | "twl",
   baseTsv: string | null = null,
+  // #1029: per row (tn/tq), the AI pipeline's payload when it is the row's
+  // latest machine write (see buildRevertLineage), in D1 column names. A row
+  // whose master cells equal it was written to master by the bot and mirrored
+  // into D1, so a later app edit is ours, not a reverted foreign edit.
+  lineage: Map<string, Array<Record<string, unknown>>> | null = null,
 ): TsvRevertReport {
   const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
   const refIdx = headers.indexOf("Reference");
@@ -1179,9 +1187,13 @@ export function tsvRevertReport(
     if (!renderedCells) continue; // row absent from render — not our concern here
     const baseCells = base?.get(id);
     if (baseCells && baseCells.join("\t") === masterCells.join("\t")) continue; // master never moved here — the difference is ours
+    if (lineage && kind !== "twl" && masterMatchesLineage(masterCells, lineage.get(id), kind)) continue;
     const diffFields: string[] = [];
+    const tagsIdx = headers.indexOf("Tags");
     for (let i = 0; i < headers.length; i++) {
       if (i === refIdx || i === idIdx) continue;
+      // tn/tq Tags are blanked on every export by design (exportTags).
+      if (i === tagsIdx && kind !== "twl") continue;
       if ((masterCells[i] ?? "") !== (renderedCells[i] ?? "")) diffFields.push(headers[i]);
     }
     if (diffFields.length === 0) continue; // identical row, nothing overwritten
@@ -1204,6 +1216,112 @@ export function tsvRevertReport(
     entries.push({ ref, class: "substantive", fields: diffFields });
   }
   return { entries, totalRows: master.size };
+}
+
+const LINEAGE_FIELDS: Record<"tn" | "tq", Array<[string, string]>> = {
+  tn: [["SupportReference", "support_reference"], ["Quote", "quote"], ["Occurrence", "occurrence"], ["Note", "note"]],
+  tq: [["Quote", "quote"], ["Occurrence", "occurrence"], ["Question", "question"], ["Response", "response"]],
+};
+
+// Builds tsvRevertReport's `lineage` map from edit_log rows (ordered by id
+// ascending) for one (book, kind). Per row, only the LATEST machine write
+// (any non-NULL source, any action: create, update, restore, delete, ...)
+// counts, and only when it is an ai_pipeline create/update: dcs_reimport also
+// mirrors human Door43 edits, and a human can restore an older bot value on
+// Door43, so neither may hide a row from the report. App edits (source NULL)
+// do not supersede: a translator editing the bot's row is the case this serves.
+//
+// The bot write must also be NEWER than where master was last confirmed
+// (edit_log id > master_confirmed_edit_id, or created_at > master_confirmed_at
+// when the id is NULL — strict, because a write in the same second as the
+// render's D1 read may be inside that render; neither known -> nothing
+// counts). A bot write at or
+// before that point already reached master inside a confirmed render of ours,
+// so master holding it again now is a revert (bot X -> app Y exported and
+// confirmed -> app Z -> human restores X), not the bot push the app edit is
+// layered on. The #1029 case is unaffected: there the bot push lands after
+// our last confirmed publish.
+export function buildRevertLineage(
+  rows: ReadonlyArray<{
+    id: number;
+    row_key: string;
+    source: string | null;
+    action: string;
+    payload_json: string | null;
+    created_at: number;
+  }>,
+  confirmed: { editId: number | null; at: number | null },
+): Map<string, Array<Record<string, unknown>>> {
+  const latest = new Map<string, (typeof rows)[number]>();
+  for (const r of rows) if (r.source != null) latest.set(r.row_key, r);
+  const afterConfirmed = (r: (typeof rows)[number]): boolean =>
+    confirmed.editId != null ? r.id > confirmed.editId : confirmed.at != null ? r.created_at > confirmed.at : false;
+  const lineage = new Map<string, Array<Record<string, unknown>>>();
+  for (const [rowKey, r] of latest) {
+    if (r.source !== "ai_pipeline" || (r.action !== "create" && r.action !== "update") || r.payload_json == null) continue;
+    if (!afterConfirmed(r)) continue;
+    try {
+      const p = JSON.parse(r.payload_json);
+      if (p && typeof p === "object") lineage.set(rowKey, [p as Record<string, unknown>]);
+    } catch {
+      /* skip unparseable payload */
+    }
+  }
+  return lineage;
+}
+
+// Reads the tn/tq revert lineage for one (book, kind) from edit_log.
+// `confirmed` is the pair's master_confirmed_edit_id / master_confirmed_at as
+// read before tonight's push.
+export async function loadRevertLineage(
+  db: D1Database,
+  kind: "tn" | "tq",
+  book: string,
+  confirmed: { editId: number | null; at: number | null },
+): Promise<Map<string, Array<Record<string, unknown>>>> {
+  // Every machine write for the book, so a later one of any action supersedes
+  // an older bot payload. Payloads are only needed for ai_pipeline rows.
+  const { results } = await db
+    .prepare(
+      `SELECT id, row_key, source, action, created_at,
+              CASE WHEN source = 'ai_pipeline' THEN payload_json END AS payload_json
+         FROM edit_log
+        WHERE kind = ?1 AND book = ?2 AND source IS NOT NULL
+        ORDER BY id`,
+    )
+    .bind(kind, book)
+    .all<{
+      id: number;
+      row_key: string;
+      source: string | null;
+      action: string;
+      payload_json: string | null;
+      created_at: number;
+    }>();
+  return buildRevertLineage(results ?? [], confirmed);
+}
+
+// True when master's row equals (on every content column) a full-row edit_log
+// payload from the machine lineage. Payloads missing a content field never
+// match (fail open).
+function masterMatchesLineage(
+  masterCells: string[],
+  payloads: Array<Record<string, unknown>> | undefined,
+  kind: "tn" | "tq",
+): boolean {
+  if (!payloads) return false;
+  const headers = kind === "tn" ? TN_HEADERS : TQ_HEADERS;
+  const fields = LINEAGE_FIELDS[kind];
+  return payloads.some((p) =>
+    fields.every(([header, key]) => {
+      if (!(key in p)) return false;
+      const isProse = key === "note" || key === "question" || key === "response";
+      // A non-string prose field never matches (fail open) instead of throwing.
+      if (isProse && p[key] != null && typeof p[key] !== "string") return false;
+      const v = isProse ? normalizeNoteText(p[key] as string | null) : p[key];
+      return tsvCell(v) === (masterCells[headers.indexOf(header)] ?? "");
+    }),
+  );
 }
 
 // Whether exportWorkflow.ts's exportOne should build and record an export-
@@ -1310,6 +1428,34 @@ export const RECORD_PUSHED_RENDER_SQL = `UPDATE book_resource_syncs
             CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?6 ELSE pushed_edit_id END,
           pushed_r2_key =
             CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?7 ELSE pushed_r2_key END,
+          -- #1029: every render pushed since master was last confirmed (this
+          -- render alone once confirmed), so a lagging master that still holds
+          -- an older unmerged-PR render is recognised as ours. Capped at 10.
+          unconfirmed_renders_json =
+            CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4
+                 THEN CASE WHEN ?5 = 1 THEN json_array(?3)
+                      -- Stored oldest-first. Drop any earlier copy of this sha
+                      -- (same bytes pushed again) and append it as newest, take
+                      -- the 10 newest by position, then re-sort ascending so the
+                      -- next push appends after them.
+                      ELSE (SELECT json_group_array(value) FROM
+                              (SELECT value FROM
+                                 (SELECT k, value FROM
+                                    (SELECT key AS k, value
+                                       -- A NULL list (first push since 0075) is
+                                       -- seeded with the prior pushed renders.
+                                       FROM json_each(COALESCE(unconfirmed_renders_json,
+                                              CASE WHEN prev_pushed_blob_sha IS NOT NULL
+                                                        AND prev_pushed_blob_sha IS NOT pushed_blob_sha
+                                                   THEN json_array(prev_pushed_blob_sha, pushed_blob_sha)
+                                                   WHEN pushed_blob_sha IS NOT NULL THEN json_array(pushed_blob_sha)
+                                                   ELSE '[]' END))
+                                      WHERE value IS NOT ?3
+                                     UNION ALL SELECT 2147483647 AS k, ?3 AS value)
+                                  ORDER BY k DESC LIMIT 10)
+                               ORDER BY k ASC))
+                      END
+                 ELSE unconfirmed_renders_json END,
           master_confirmed_at =
             CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END,
           -- Shadow master_confirmed_at, but ONLY when this render is the
@@ -1359,8 +1505,36 @@ export function masterIsOurLastPublish(
 //    invisible to the unfiltered comparison this gate wraps, which diffs
 //    against that same pinned snapshot. Neither sees it.
 //  - `pushedBlobSha` advances every night whether or not the export PR merged,
-//    so master lagging behind an unmerged PR reads as "moved" and still reports.
+//    so master lagging behind an unmerged PR reads as "moved" — handled by
+//    `unconfirmedRenderShas` (#1029): every render pushed since master was last
+//    confirmed also counts as "our own bytes".
 //
+// #1029: the unconfirmed-render list as read from book_resource_syncs before
+// tonight's push. Unparseable or non-array JSON reads as no list (fails open).
+// A NULL list (a pair whose first push since migration 0075 has not happened
+// yet) is seeded from the last two pushed renders, so a book already lagging
+// at deploy time is covered; the suppression is still gated on master's head
+// being our export merge.
+export function readUnconfirmedRenders(
+  prior: {
+    unconfirmed_renders_json: string | null;
+    prev_pushed_blob_sha: string | null;
+    pushed_blob_sha: string | null;
+  } | null,
+): string[] | null {
+  if (!prior) return null;
+  if (prior.unconfirmed_renders_json == null) {
+    const seed = [prior.prev_pushed_blob_sha, prior.pushed_blob_sha].filter((x): x is string => typeof x === "string");
+    return seed.length ? [...new Set(seed)] : null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(prior.unconfirmed_renders_json);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : null;
+  } catch {
+    return null;
+  }
+}
+
 // And what suppression cannot hide: rows or verses present on master but absent
 // from our render are skipped by usfmRevertReport/tsvRevertReport outright
 // ("not our concern here"), so a render that DELETES master content was never
@@ -1371,9 +1545,70 @@ export function shouldComputeRevertEntries(
   masterContent: string | null,
   masterBlobSha: string | null,
   pushedBlobSha: string | null,
+  // #1029: blob shas of every render we pushed since master was last
+  // confirmed (book_resource_syncs.unconfirmed_renders_json). Master equal to
+  // any of them is still our own bytes, just lagging an unmerged export PR.
+  unconfirmedRenderShas: readonly string[] | null = null,
+  // #1029: whether the commit that last touched this file on master (the one
+  // the freshness gate resolved) is one of our export merges. Bytes alone
+  // cannot tell "lagging behind our unmerged PR" from "a human reverted our
+  // newer merge back to older bytes of ours"; only a lagging master still has
+  // our export merge as the file's head. Unknown -> false (report).
+  masterHeadIsOurExport = false,
 ): boolean {
   if (!shouldRecordRevertReport(dcsChanged, masterContent)) return false;
+  if (masterHeadIsOurExport && masterBlobSha != null && unconfirmedRenderShas?.includes(masterBlobSha)) return false;
   return !masterIsOurLastPublish(masterBlobSha, pushedBlobSha);
+}
+
+// Did a foreign commit land on master in the window none of the checks above
+// can see (issue #871)? checkMasterFreshness resolves master's head file-
+// commit SHA (`pinnedMasterSha`) once, BEFORE the shrink/alignment guards take
+// their master snapshot and BEFORE commitToDcs's several DCS round trips run.
+// Every one of those — the guards' snapshot, `shouldComputeRevertEntries`'s
+// `masterBlobSha`, the eventual revert-report diff — is pinned to that same
+// moment. A maintainer hand-edit landing on master anywhere in that window is
+// invisible to all of them: the pinned snapshot already holds pre-edit
+// content, so a revert report built from it would diff against bytes that
+// predate the edit and either miss it entirely or blame unrelated rows.
+//
+// Re-resolving master's head SHA immediately after commitToDcs (exportOne's
+// job, not this function's) is the only way to notice the snapshot went
+// stale mid-run. This is the pure comparison that decides it: exportOne
+// should treat a report as unsafe to build only when the post-commit head is
+// a KNOWN, DIFFERENT sha from the one the gate pinned.
+//
+// Fails CLOSED like the freshness gate itself, but in the opposite direction
+// of "safe": an unresolvable post-commit head does not prove nothing landed,
+// but there is also nothing to compare it against, so this returns `false`
+// (not a foreign commit) rather than block a report on missing information —
+// the report then proceeds exactly as it did before this check existed. Only
+// an actual, different, non-null head SHA counts as a race.
+export function foreignCommitDuringExport(
+  pinnedMasterSha: string | null,
+  headAfterCommitSha: string | null,
+): boolean {
+  return (
+    pinnedMasterSha != null &&
+    headAfterCommitSha != null &&
+    headAfterCommitSha !== pinnedMasterSha
+  );
+}
+
+// The system_alerts source for one #871 race banner. Unique per race, not per
+// (book, resource): writeAlert deletes every undismissed alert with the same
+// source before it inserts, and this banner is never auto-cleared, so a fixed
+// per-pair source would let a second race on a later night erase the first,
+// still-undismissed banner (the only record of the pinned..foreign range a
+// human has to check). The same race re-detected keeps its source, so a re-run
+// replaces it in place and a dismissal of that exact race still sticks.
+export function exportRevertRaceAlertSource(
+  book: string,
+  resource: string,
+  pinnedSha: string | null,
+  foreignSha: string,
+): string {
+  return `export_revert_race:${book}:${resource}:${pinnedSha ?? "unknown"}:${foreignSha}`;
 }
 
 // Does the number of substantive reverts this export is about to make justify

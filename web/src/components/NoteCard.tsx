@@ -24,8 +24,6 @@ import {
   Divider,
   Link,
 } from "@mui/material";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
 import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
@@ -85,6 +83,9 @@ import {
 
 const NoteHistoryDialog = lazy(() =>
   import("./NoteHistoryDialog").then((m) => ({ default: m.NoteHistoryDialog })),
+);
+const MarkdownView = lazy(() =>
+  import("./MarkdownView").then((m) => ({ default: m.MarkdownView })),
 );
 
 export type DropPosition = "before" | "after";
@@ -557,9 +558,9 @@ function NoteBodyMarkdownView({
       }}
     >
       {text.trim() ? (
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: LinkComponent }}>
-          {text}
-        </ReactMarkdown>
+        <Suspense fallback={null}>
+          <MarkdownView components={{ a: LinkComponent }}>{text}</MarkdownView>
+        </Suspense>
       ) : (
         " "
       )}
@@ -2446,6 +2447,12 @@ function areNotePropsEqual(a: Props, b: Props): boolean {
     a.bookLocked === b.bookLocked &&
     a.quoteBuildMode === b.quoteBuildMode &&
     a.quoteBuildSelectionCount === b.quoteBuildSelectionCount &&
+    // Load-bearing: the quote-build "apply now" effect (below) is keyed on
+    // this prop. Without it here, a memo-skipped card whose bump arrived in
+    // the same render as an otherwise-unchanged prop set would never re-run
+    // the effect and pick up the newly-applied quote (STATE.md: any prop an
+    // effect needs goes in the comparator).
+    (a.quoteBuildAppliedAt ?? null) === (b.quoteBuildAppliedAt ?? null) &&
     (a.flashArrow ?? null) === (b.flashArrow ?? null) &&
     // Compared BY VALUE: ResourceColumn derives these from the comments index
     // per render, so a fresh object arrives every time and a reference check

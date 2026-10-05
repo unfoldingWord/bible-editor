@@ -24,6 +24,12 @@
 
 ## Escalated / blocked on a human (not a code change Claude can land alone)
 
+- **edit_log sweep index must reach prod before 2026-11-14 (issue #928)** — migration 0073 adds
+  `edit_log_kind_action_created`, and `EDIT_LOG_SWEEP_SQL` names it with `INDEXED BY`, so the sweep errors
+  ("no such index", caught and retried hourly) until the migration is applied. `npm run deploy` migrates first.
+  After deploy, re-run the issue's read-only `SELECT COUNT(*)` rehearsal at the 2026-12-01 cutoff and confirm
+  `sql_duration_ms` is well under 1 s.
+
 - **9 qere-pointing alignment milestones in locked books (issue #956)** — HAB 3:14 ULT+UST (×2 each), OBA 1:11
   ULT, PSA 39:0 + 77:0 ULT+UST. Each `\zaln-s x-content` holds the qere, which since hbo_uhb `aad8ce31` sits only
   in a UHB footnote, so the English word never highlights. `repair-canonize-alignment.mjs --qere-ketiv` computes
@@ -84,6 +90,13 @@ Highlights that bite repeatedly:
   source attrs INTO UHB bytes would then read as converged and be reverted on export. The fix lives in the no-op
   guard instead: drop the row only when D1 already equals canonized master AND raw master is NFC-equal to D1.
 
+- **AI-apply TN dedup: fold to find candidates, split only on proven UHB twins; never key byte-exactly.** Issue
+  #966: the #962 fold (NFC + strip joiners) merged twins tC counts separately (DAN 2:10 kol with/without U+2060).
+  Keying byte-exactly after canonizing (PR #973's first shape) reopened AI TN doubling for every quote that could
+  not be canonized: pre-#959 proposals, verses with no UHB loaded, legacy NFC rows. `isDistinctTwinTn` in
+  `pipelineImport.ts` splits a fold collision only when both words are byte-identical, different UHB surfaces;
+  NT keeps the plain fold. The nightly reimport's `planTnContentDedup` stays byte-exact and was not touched.
+
 - **A locked book freezes the merge ancestor, so Door43 is authoritative for it — and a markers-only overwrite
   is logged, never alerted.** Measured 2026-09-24 (ZEC 1:17 ULT, Rich): the book was locked on 09-17, so the
   export skipped it nightly, `master_confirmed_at` never advanced, and every Door43 commit read as "both changed"
@@ -94,8 +107,18 @@ Highlights that bite repeatedly:
   lock is to prevent problems from the BE side"), but only on verses master actually moved since the ancestor
   (`verseMerge.ts` step 3b), so an unlock → fix → re-lock → `lock/push` fix still in review is not reverted; and
   a markers-only overwrite is a real overwrite worth seeing in history (#951) but not a data-loss alert. Only a
-  run's own `adopt_conflict` may reactivate a resolved flag. Open: structure paths (#949) and tn/tq/twl (#950)
-  do not honor the lock yet.
+  run's own `adopt_conflict` may reactivate a resolved flag. Structure paths honor the lock since #999
+  (#949); tn/tq/twl follow it since #950 (PR #1091).
+
+- **On a locked book the TSV ancestor advances through the sync's own writes; the verse ancestor cannot (#1090).**
+  Every tn/tq/twl edit_log row with `source = 'dcs_reimport'` carries master's own value for each content field it
+  names (adoptions log only `merge.writeFields`, overwrites/creates log master's row), so right after it D1 and
+  Door43 agreed on that field: a valid ancestor. `reconstructTsvBases(..., bookLocked)` overlays those writes past
+  the frozen boundary, so a second Door43 edit to an already-adopted note adopts cleanly instead of flagging
+  "merged over your app-side change". The same trick is unsafe for verses: the source-attr reconcile writes
+  `dcs_reimport` rows over a translator's wording (`verseMerge.ts` step 3b comment), so verse step 3b keeps the
+  false flag by design. A row whose LATEST edit is an AI apply never reaches the TSV merge at all (it is AI-only,
+  overwritten via `update_ai`).
 
 - **D1 allows at most 5 terms in a compound SELECT (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`); node:sqlite allows
   500.** A 6-term `UNION ALL` fails on local workerd and remote D1 with `too many terms in compound SELECT`
@@ -104,6 +127,13 @@ Highlights that bite repeatedly:
   instead, and prove new SQL with `wrangler d1 execute … --command "EXPLAIN …"`, which is read-only even on prod.
   Also: an ad-hoc diagnostic query that re-runs a heavy query as a subquery can hit D1's CPU limit and reset the
   prod DB (`code 7429`); keep prod diagnostics narrow.
+
+- **Adding an index is not enough when an older index already orders a GROUP BY.** For the edit_log sweep,
+  SQLite (node:sqlite and local workerd D1 alike, with or without `ANALYZE`) kept reading through
+  `edit_log_row (kind, row_key)` after a `(kind, action, created_at)` index was added, because the old index
+  hands `GROUP BY row_key` its order for free; the sweep stayed at 21 s on a 1.5M-row synthetic table until
+  `INDEXED BY` forced the new index (3.9 s, #928). Check `EXPLAIN QUERY PLAN` after adding an index, and pin
+  the plan in a test (`editLogSweepPlan.test.mjs`). `INDEXED BY` makes the migration a hard prerequisite of the code.
 
 - **A verse cell's "hydrate from a saved draft" branch must never run for a draft the user is creating right
   now.** All three verse views (`ScriptureColumn` `ActiveLine`, `BookView` `VerseCell`, `DocColumn`) subscribe to
@@ -377,6 +407,17 @@ Highlights that bite repeatedly:
   blanket write-block in `request()` also kills writes the server deliberately still
   allows — it made comments vanish and made unlocking impossible from the UI. Split
   read-only into named reasons rather than one global boolean.
+  A third corollary (#1045): a lock that lands on work already typed or dragged must
+  also take Save off every unsaved-changes gate and auto-save path. Saving then
+  commits locally and the refused PATCH is dropped, so the work is lost.
+
+- **A Playwright test can land a pipeline (chapter) lock live without waiting minutes.**
+  The tab only re-reads pipeline jobs on a 120 s poll or a refocus throttled to 60 s
+  (`pipelineStore.ts`). Call `page.clock.install()` before the page loads, then
+  `page.clock.fastForward(61_000)` and dispatch `visibilitychange` (s17's
+  `refreshPipelineJobs`). A spec that saves to the seeded ZEC fixture must restore the
+  verse in `finally`. If it times out, the restore dies with the test and the seed
+  drifts, which breaks later runs. Re-run `import-ZEC.sql` to reset it.
 
 - **"Where is the user?" has no single source in this app — and both available sources
   are blind in a different direction.** `activeVerse` is Shell-LOCAL state
@@ -612,6 +653,34 @@ Highlights that bite repeatedly:
   while the same commits by FULL sha gave ten different blobs. Always pass the full 40-char sha (the
   `commits?path=` listing returns it), and confirm a fetch with `git hash-object` against the `contents?ref=`
   `sha` field before reasoning from it.
+- **A staged file and the cutoff it is judged against must come from the same instant, and "the cutoff moved
+  during staging" has two causes that need opposite answers.** `planAndStageBookResources` fetches master's TSV,
+  then walks lineage, then reads the prune cutoff. The walk's own #658 stamp is a legitimate advance and must be
+  kept (#866 F2), while a concurrent export's confirm in the same window covers rows the file never saw and
+  made the prune delete them (#1048). The two are told apart by provenance, not by value: the walk reports its
+  stamp through `LineageStats.lineageConfirmed`, and `pairStagedTsvCutoff` pairs the file with the fetch-time read
+  plus that stamp, so an outside advance is dropped but the run's own stamp never is (dropping both would reopen
+  the F2 resurrection). The invariant is that the paired value never certifies more than the fetch-time read plus
+  this run's own confirmed render. It is not "never newer than the post-walk read": an outside confirm with a
+  null edit id can push `master_confirmed_at` past the run's `pushed_read_at`, so the stamp's SQL edit-id gate
+  leaves the row's edit id at the fetch-time value while the paired edit id is the own stamp's. Corollary for tests: a DB-side advance injected during staging now reads as an outside
+  writer, so a test of the legitimate path has to drive the real #658 stamp. The own stamp is only legitimate
+  for a merge the staged file can contain (#1058): the walk reads master's current tip, not `masterSha`, so
+  `accountOwnPublishDecline` withholds the stamp unless our merge sits at or after `masterSha`'s position in the
+  newest-first walk (a missing or unknown `masterSha` withholds too). Next night's file head is past the merge, so
+  the stamp lands then. The admin "Pull from Door43" path (`runReimport`) pins ULT/UST the same way (#1063), because
+  it re-reads the verse cutoff after the walk. Its TSV fetch stays unpinned on purpose: a `ref`-pinned TSV fetch
+  comes back completeness-verified, which widens the prune's covered chapters, and that path's TSV cutoff is the
+  pre-walk read anyway.
+- **The dual aligner's reading line decides whether to resync from its dirty state, not from focus.** Until #1067
+  the unfocused resync compared the box against text `onInput` keeps equal to the box, so any verse change replaced
+  a dirty line that had merely lost focus (clicked into the alignment panel), marked it clean and released its pin.
+  Two specs (s18 "cancelled unalign confirm" step 3, s19 pin-release step 3) asserted that overwrite as a way an
+  edit "goes away". A dirty line now keeps its text and its pin on any server change, so Save is a 409 and a merge
+  prompt; the only resync that cleans a dirty line is a verse that moved onto the line's own text. Keeping the edit
+  is only safe while the slot points at the same ROW: a bridge or split by another editor remaps it, and the save
+  then keys on the new row and lands with a 200 (measured: v7-only text replaced the whole 6-7 row). So the line is
+  keyed by row start + `verse_end` and remounts, dropping the edit, when the row changes.
 
 ## Stop conditions / goals
 
