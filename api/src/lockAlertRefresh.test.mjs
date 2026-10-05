@@ -473,6 +473,61 @@ console.log("\n[a pass whose raise writes nothing stops the refresh instead of r
   assert(conflictReads <= 4, `the refresh stopped after the pass that wrote nothing (conflict-table reads: ${conflictReads})`);
 }
 
+console.log("\n[an UNDISMISSED unlocked alert whose kept row resolved is rebuilt from live rows on a lock toggle (#1118 re-review)]");
+{
+  // Raised unlocked with an overwrite (pointer) and a kept row; a save resolves
+  // the kept row; the overwrite keeps the banner up. Nobody dismissed it. On
+  // main a lock refresh rebuilt it from live rows (dropping the resolved row);
+  // the refresh must still do that for an undismissed alert.
+  const { sqlite, env, lockRoute, live } = freshApp();
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', ?, ?, 7, 4, 'update')`)
+    .run(`${BOOK}/2/1/UST`, BOOK);
+  await recordVerseMergeConflicts(env, BOOK, "ust", "UST", [
+    { chapter: 2, verse: 1, action: "adopt_conflict", reason: "both_changed_wording", overwrittenVersion: 4, alignment: null, observedVersion: null },
+    { chapter: 1, verse: 8, action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, alignment: null, observedVersion: null },
+  ], 1000);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", { observedAt: 1000 });
+  assert(live(ADMIN)[0]?.condition_key.includes("alignment_shrink"), "setup: the admin key lists the kept row");
+  sqlite
+    .prepare(`UPDATE verse_merge_conflicts SET resolved_at = 6000, resolved_by = 7 WHERE book = ? AND chapter = 1 AND verse = 8`)
+    .run(BOOK);
+  await lockRoute("PUT");
+  const admin = live(ADMIN);
+  assert(admin.length === 1, `after the lock, one undismissed admin alert stands (got ${admin.length})`);
+  assert(!admin[0]?.condition_key.includes("alignment_shrink"), `after the lock, the resolved kept row is gone from the key (got ${admin[0]?.condition_key})`);
+  assert(!/alignment_shrink|1:8/.test(admin[0]?.message ?? ""), `after the lock, the message no longer names the resolved kept row (got ${admin[0]?.message})`);
+}
+
+console.log("\n[an UNDISMISSED locked no-base alert whose kept row resolved is rebuilt on a second lock (#1118 re-review)]");
+{
+  // Raised locked with a no-ancestor verse and a kept row; the kept row is
+  // resolved; the lock is set again. The lock flags already match, but the
+  // undismissed alert still lists the resolved row, so it is rebuilt.
+  const { sqlite, env, lockRoute, live } = freshApp();
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES (?, 1, 900)`).run(BOOK);
+  await recordVerseMergeConflicts(env, BOOK, "ust", "UST", [
+    { chapter: 1, verse: 8, action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, alignment: null, observedVersion: null },
+  ], 1000);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    bookLocked: true,
+    observedAt: 1000,
+  });
+  assert(live(ADMIN)[0]?.condition_key.includes("alignment_shrink"), "setup: the locked admin key lists the kept row");
+  sqlite
+    .prepare(`UPDATE verse_merge_conflicts SET resolved_at = 6000, resolved_by = 7 WHERE book = ? AND chapter = 1 AND verse = 8`)
+    .run(BOOK);
+  await lockRoute("PUT");
+  const admin = live(ADMIN);
+  assert(admin.length === 1, `after the second lock, one undismissed admin alert stands (got ${admin.length})`);
+  assert(!admin[0]?.condition_key.includes("alignment_shrink"), `after the second lock, the resolved kept row is gone from the key (got ${admin[0]?.condition_key})`);
+  assert(admin[0]?.condition_key.includes(`"noBaseBookLocked":true`), "…and the no-base verse keeps the locked wording");
+  assert(!/tonight's export/.test(admin[0]?.message ?? ""), "…with no claim that tonight's export writes");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
