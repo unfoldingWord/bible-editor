@@ -21,7 +21,11 @@ import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
 
 import { books } from "./bookImport.ts";
-import { raiseVerseMergeConflictAlert, recordVerseMergeConflicts } from "./verseMergeConflicts.ts";
+import {
+  raiseVerseMergeConflictAlert,
+  recordVerseMergeConflicts,
+  refreshVerseMergeAlertsAfterLockChange,
+} from "./verseMergeConflicts.ts";
 import { reviewConditionKey, verseMergeEditorConditionKey } from "./reviewAlerts.ts";
 
 let failed = 0;
@@ -207,6 +211,34 @@ console.log("\n[a dismissed alert whose condition did not change stays dismissed
   await lockRoute("PUT");
   await lockRoute("DELETE");
   assert(live(ADMIN).length === 0 && live(EDITOR).length === 0, "the dismissed overwrite alerts stay dismissed");
+}
+
+console.log("\n[a late refresh carrying a stale lock state still words the alert for the CURRENT lock (issue #1110 review A1)]");
+{
+  // Lock and unlock in quick succession: the two waitUntil refreshes can finish
+  // out of order. The refresh must read the lock when it raises, not trust the
+  // value its request saw.
+  const { sqlite, env, live } = freshApp();
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    observedAt: 1000,
+  });
+  // The book is now locked; a refresh from an earlier unlock request finishes late.
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES (?, 1, 2000)`).run(BOOK);
+  await refreshVerseMergeAlertsAfterLockChange(env, BOOK, false);
+  for (const u of [ADMIN, EDITOR]) {
+    const m = live(u)[0]?.message ?? "";
+    assert(!/tonight's export/.test(m) && /locked/.test(m), `${u}: the stale "unlocked" refresh still produces the locked wording (got: ${m})`);
+  }
+  // And the reverse: unlocked now, a late refresh from a lock request.
+  sqlite.prepare(`UPDATE book_locks SET locked = 0 WHERE book = ?`).run(BOOK);
+  await refreshVerseMergeAlertsAfterLockChange(env, BOOK, true);
+  for (const u of [ADMIN, EDITOR]) {
+    const m = live(u)[0]?.message ?? "";
+    assert(/tonight's export/.test(m), `${u}: the stale "locked" refresh still produces the overwrite wording (got: ${m})`);
+  }
 }
 
 console.log("\n[a reimport that started before the lock change still lands after it (issue #1110)]");

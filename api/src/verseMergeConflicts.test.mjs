@@ -485,6 +485,37 @@ function assert(cond, msg) {
   );
 }
 
+{
+  // Issue #1110 review (A3): the pointer-less adopt_conflict and the two
+  // keep_local_structure sentences also promised the next export would write
+  // over Door43. A locked book is skipped by the export, so none may say so.
+  const rows = [
+    { action: "adopt_conflict", reason: "source_attr_only", overwrittenVersion: null, chapter: 2, verse: 1 },
+    { action: "keep_local_structure", reason: "no_human_commit", overwrittenVersion: null, chapter: 2, verse: 2 },
+    { action: "keep_local_structure", reason: "master_moved_under_local_bridge", overwrittenVersion: null, chapter: 2, verse: 3 },
+  ];
+  const locked = buildMergeConflictGuidance(rows, { bookLocked: true });
+  assert(!/next export|tonight's export|will write|written over|writes the app's/i.test(locked),
+    `locked book (pointer-less + structure rows): no sentence claims an export will write (got: ${locked})`);
+  assert((locked.match(/this book is locked/g) ?? []).length === 3, "locked book: each of the three sentences names the lock");
+  assert(locked.includes("1 was flagged for review but no app text was replaced (2:1)"), "locked book: the pointer-less verse is still named");
+  assert(locked.includes("1 kept the app's verse grouping"), "locked book: the kept grouping is still reported");
+  assert(locked.includes("1 verse(s) changed on Door43 that a bridge made in the app"), "locked book: the absorbed verse is still reported");
+
+  const unlockedText =
+    "1 was flagged for review but no app text was replaced (2:1) — Door43's copy differs from the app's only in the " +
+    "original-language source attributes on \\zaln-s (x-content / x-lemma); check which side is right before the " +
+    "next export, because the export will write the app's attributes over Door43's. 1 kept the app's verse " +
+    "grouping (a \\v a-b bridge, or its split) where Door43 now groups the verses differently: either no commit " +
+    "from a Door43 editor's own account was found behind Door43's change, or the two groupings could not be " +
+    "reconciled automatically. Door43's grouping has NOT been taken, so the next export that runs for this " +
+    "resource writes the app's grouping over it. 1 verse(s) changed on Door43 that a bridge made in the app (not " +
+    "yet exported) has since absorbed — the next export publishes the bridge, and Door43's change to that verse's " +
+    "own text will be written over unless it is carried into the bridged verse first.";
+  assert(buildMergeConflictGuidance(rows) === unlockedText, "unlocked (flag omitted): wording unchanged");
+  assert(buildMergeConflictGuidance(rows, { bookLocked: false }) === unlockedText, "unlocked (flag false): wording unchanged");
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Part 2: the ACTUAL production query (buildEditorLookupQuery, imported
 // above — not a hand-duplicated copy, so this can't silently drift from what

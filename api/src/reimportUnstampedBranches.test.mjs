@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import { planAndStageBookResourcesForTest, seedPerResourceFromPlanForTest } from "./bookReimport.ts";
 import { classifyReimportOutcome } from "./reimportSyncGate.ts";
 import { gitBlobSha } from "./ownPublish.ts";
+import { recordVerseMergeConflicts } from "./verseMergeConflicts.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -174,6 +175,39 @@ try {
     eq(entry.changed, false, "1 incoming row vs 40 live → treated as truncated, not staged");
     eq(perResource.tq.tsv_truncated, 1, "…seeded as tsv_truncated");
     eq(classifyReimportOutcome(perResource), "failure", "…and the ledger records failure");
+  }
+
+  console.log("\n#1110 review (A2): the own-publish convergence re-raise keeps a locked book's lock wording");
+  {
+    // SHA-matched resource with a kept-row backlog, master holding our own
+    // render: the plan retires the backlog and re-raises the banner from what
+    // is left (a pointer-less adopt_conflict). The book is locked, so that
+    // re-raise must not say the export will write, and its key carries the lock.
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES ('2CH', 1, 100)`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin, pushed_blob_sha, pushed_read_at)
+         VALUES ('2CH','ult',?,1,'reimport',?,1000)`,
+      )
+      .run(MASTER_SHA, await gitBlobSha(ultBody));
+    await recordVerseMergeConflicts(env, "2CH", "ult", "ULT", [
+      { chapter: 1, verse: 1, action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, alignment: null, observedVersion: null },
+      { chapter: 1, verse: 2, action: "adopt_conflict", reason: "source_attr_only", overwrittenVersion: null, alignment: null, observedVersion: null },
+    ], 500);
+    stubFetch({ commits: MASTER_SHA, raw: ultBody });
+    const { entry } = await plan(env, "2CH", ["ult"]);
+    eq(entry.ownPublish, true, "own-publish recognized (the convergence re-raise path ran)");
+    const alert = sqlite
+      .prepare(
+        `SELECT message, condition_key FROM system_alerts
+          WHERE source = 'verse_merge_conflict:2CH:ult' AND username = 'deferredreward' AND resolved_at IS NULL`,
+      )
+      .get();
+    eq(Boolean(alert), true, "the re-raised admin alert stands (the pointer-less row is still active)");
+    eq(/next export|tonight's export|will write/i.test(alert?.message ?? ""), false,
+      "locked book: the re-raised alert makes no claim that an export will write");
+    eq((alert?.condition_key ?? "").includes(`"keptBookLocked":true`), true, "locked book: the re-raised key carries the lock");
   }
 
   console.log("\n4. controls that carry a null SHA but are NOT failures");
