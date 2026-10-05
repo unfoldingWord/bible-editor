@@ -16,6 +16,7 @@ import UndoIcon from "@mui/icons-material/Undo";
 import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { type ChapterCopyBlock } from "../lib/chapterCopy";
+import { chapterHeightKey } from "../lib/chapterHeightKey";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type LaneShade, type TextLaneCheck } from "../lib/laneChecks";
 import type { ChapterState } from "../hooks/useBook";
@@ -776,28 +777,39 @@ const ChapterBlock = memo(function ChapterBlock({
   // CHAPTER_HEAD_PX for why it must not change afterwards).
   const placeholderRowPx = useRef<number | null>(null);
   if (readyData && placeholderRowPx.current === null) placeholderRowPx.current = rowPxFor(book);
-  // Laid out in full whenever the chapter's content or columns change (both
-  // give verseNums a new identity), until the browser has recorded its real
-  // height as `auto`'s remembered size; only then may it be skipped (#1120).
-  // Otherwise a chapter the pre-loader fetched but never showed sat at the
-  // estimate, and one skipped across a column toggle kept its pre-toggle
-  // height; either changed size when next laid out, which moves the view in
-  // a browser without scroll anchoring. Verse text fills in during the
-  // cells' passive effects, which run before this one; the size is recorded
-  // after the next frame's layout, so wait two frames.
-  const [measuredRows, setMeasuredRows] = useState<number[] | null>(null);
+  // Laid out in full when the chapter loads and whenever something that can
+  // change its height changes (its columns, rows or text; see
+  // chapterHeightKey), until the browser has recorded its real height as
+  // `auto`'s remembered size; only then may it be skipped (#1120). Otherwise
+  // a chapter the pre-loader fetched but never showed sat at the estimate,
+  // and one skipped across a column toggle kept its pre-toggle height; either
+  // changed size when next laid out, which moves the view in a browser
+  // without scroll anchoring. A data change that cannot change the height (an
+  // outbox result that only bumps a verse's version) keeps the key, so an
+  // off-screen chapter is not laid out for it (#1131). One object per key
+  // change, so a column toggled off and back on within the two frames is
+  // measured again. Verse text fills in during the cells' passive effects,
+  // which run before this one; the size is recorded after the next frame's
+  // layout, so wait two frames.
+  const heightKey = useMemo(
+    () => (readyData ? chapterHeightKey(readyData.verses, enabledVersions, verseNums) : ""),
+    [readyData, enabledVersions, verseNums],
+  );
+  const layoutKey = useMemo(() => ({ key: heightKey }), [heightKey]);
+  const isReady = readyData !== null;
+  const [measuredKey, setMeasuredKey] = useState<{ key: string } | null>(null);
   useEffect(() => {
-    if (!readyData) return;
+    if (!isReady) return;
     let second = 0;
     const first = requestAnimationFrame(() => {
-      second = requestAnimationFrame(() => setMeasuredRows(verseNums));
+      second = requestAnimationFrame(() => setMeasuredKey(layoutKey));
     });
     return () => {
       cancelAnimationFrame(first);
       cancelAnimationFrame(second);
     };
-  }, [readyData, verseNums]);
-  const measured = measuredRows === verseNums;
+  }, [isReady, layoutKey]);
+  const measured = measuredKey === layoutKey;
   // One CommentCounts object per comments change, not per render: Shell's
   // verseCommentCounts builds a fresh object on every call, which would
   // re-render the active row on any render of this block.
