@@ -962,7 +962,9 @@ export const planAndStageBookResourcesForTest = (
   resources: Resource[],
   instanceId: string,
   staleBaseOverrideResource?: Resource,
-): Promise<ReimportPlan> => planAndStageBookResources(env, book, resources, instanceId, staleBaseOverrideResource);
+  lockOverrideResource?: Resource,
+): Promise<ReimportPlan> =>
+  planAndStageBookResources(env, book, resources, instanceId, staleBaseOverrideResource, undefined, lockOverrideResource);
 
 export const persistMasterLineageForTest = (
   env: Env,

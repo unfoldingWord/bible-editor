@@ -867,15 +867,7 @@ export async function raiseVerseMergeConflictAlert(
   // failed read falls back to the unlocked wording, the one that asks someone
   // to act, and never fails the alert.
   const hasNoBase = (opts.noBaseCount ?? 0) > 0;
-  // Every row whose sentence says an export will write over Door43: the kept
-  // rows, and an adopt_conflict with no overwritten version (#981).
-  const hasKept = rows.some(
-    (r) =>
-      r.action === "keep_alignment_refused" ||
-      r.action === "source_attr_divergent" ||
-      r.action === "keep_local_structure" ||
-      (r.action === "adopt_conflict" && r.overwrittenVersion == null),
-  );
+  const hasKept = rows.some(rowWordingDependsOnLock);
   let bookLocked = false;
   if (hasNoBase || hasKept) {
     try {
@@ -1059,6 +1051,19 @@ export async function raiseVerseMergeConflictAlert(
   }
 }
 
+// Issue #1110: a row whose alert sentence says an export will write over Door43
+// and so changes on a locked book: the kept rows, and an adopt_conflict with no
+// overwritten version (#981). An overwrite with a pointer reads the same either
+// way.
+function rowWordingDependsOnLock(r: { action: string; overwrittenVersion: number | null }): boolean {
+  return (
+    r.action === "keep_alignment_refused" ||
+    r.action === "source_attr_divergent" ||
+    r.action === "keep_local_structure" ||
+    (r.action === "adopt_conflict" && r.overwrittenVersion == null)
+  );
+}
+
 // Issue #1110: re-derive a book's standing verse-merge alerts when an admin
 // locks or unlocks it (bookImport.ts's PUT/DELETE /:book/lock). The lock used
 // to be read only when a reimport raised the alert, and a reimport returns
@@ -1102,20 +1107,30 @@ export async function refreshVerseMergeAlertsAfterLockChange(env: Env, book: str
         .first<{ condition_key: string | null; condition_observed_at: number | null }>();
       if (!standing) continue;
       const state = reviewConditionState(standing.condition_key, "verse_merge_conflict", { book, resource }) as
-        | { noBase?: unknown; noBaseCount?: unknown; recordingFailed?: unknown }
+        | { noBase?: unknown; noBaseCount?: unknown; recordingFailed?: unknown; rows?: unknown }
         | undefined;
       const noBase = Array.isArray(state?.noBase) ? (state.noBase as NoBaseVerseRef[]) : null;
+      const storedRows = Array.isArray(state?.rows)
+        ? (state.rows as Array<{ action: string; overwrittenVersion: number | null }>)
+        : null;
       if (
         standing.condition_observed_at == null ||
         !state ||
         state.recordingFailed !== false ||
         typeof state.noBaseCount !== "number" ||
         !noBase ||
+        !storedRows ||
         !noBase.every((r) => Number.isInteger(r?.chapter) && Number.isInteger(r?.verse) && Number.isInteger(r?.version))
       ) {
         console.warn("verseMergeConflicts: lock change left an alert it cannot re-derive", { book, resource });
         continue;
       }
+      // #1110 round 2: touch only an alert whose wording the lock changes. The
+      // raise below rebuilds from the LIVE rows, so for any other alert it would
+      // only re-measure rows resolved since the last reimport, mint a new key,
+      // and resurrect an alert people dismissed. Rows are added only by a
+      // reimport, which raises, so the stored rows cover every live one.
+      if (state.noBaseCount === 0 && !storedRows.some(rowWordingDependsOnLock)) continue;
       const ordered = [...noBase].sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
       await raiseVerseMergeConflictAlert(env, book, resource, {
         recordingFailed: false,
