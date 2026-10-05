@@ -30,9 +30,12 @@ export interface UseBookLintReturn {
   // when several chapters (or a whole-book refetch) are pending together, or
   // when the last request failed.
   refetchChapter: (chapter: number) => Promise<void>;
-  // Date.now() when the last fetch landed; 0 before the first and after a
-  // failed one, so a failure never suppresses the next retry. Lets the caller
-  // skip a focus-driven refetch that would re-pull a report it just got (#887).
+  // Date.now() when the last WHOLE-BOOK fetch landed; 0 before the first and
+  // after a failed one, so a failure never suppresses the next retry. Lets the
+  // caller skip a focus-driven refetch that would re-pull a report it just got
+  // (#887). A chapter merge does not count: it only refreshes the saved
+  // chapter, so other chapters' changes (other users, AI apply, nightly sync)
+  // still need the focus refresh to come due (#888).
   lastSettledAt: () => number;
 }
 
@@ -112,6 +115,7 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
           fetchWithRetry((signal) => api.getBookLint(book, signal, ch), { signal: ctrl.signal, maxAttempts: 3 });
         let r = await fetchLint(chapter);
         if (ctrl.signal.aborted) return;
+        let wholeBook = chapter === undefined;
         if (chapter !== undefined && base) {
           const merged = mergeChapterReport(base, r);
           if (merged) {
@@ -119,10 +123,11 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
           } else {
             r = await fetchLint();
             if (ctrl.signal.aborted) return;
+            wholeBook = true;
           }
         }
         reportRef.current = r;
-        settledAt.current = Date.now();
+        if (wholeBook) settledAt.current = Date.now();
         const json = JSON.stringify(r);
         if (json !== reportJson.current) {
           reportJson.current = json;
