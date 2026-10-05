@@ -4,11 +4,15 @@
 // problems a translator must resolve) and "escalate" (integrity, footnotes);
 // we expose the flag list + both counts. Book-level, so it fetches once per
 // book change — not per chapter — and offers a refetch for on-demand refresh.
+// After a save, refetchChapter re-lints just that chapter and merges it into
+// the cached report (#888, mergeChapterReport.ts), which on a big book is a
+// fraction of the whole-book request.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type BookLintIssue, type BookLintReport } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { createLintRefreshQueue } from "./lintRefreshQueue";
+import { mergeChapterReport } from "./mergeChapterReport";
 
 export interface UseBookLintReturn {
   status: "idle" | "loading" | "ready" | "error";
@@ -21,6 +25,11 @@ export interface UseBookLintReturn {
   // bound an optimistic key's lifetime to this promise rather than to a
   // shared reset effect.
   refetch: () => Promise<void>;
+  // Same contract as refetch, but asks only for one chapter's lint and merges
+  // it in. Falls back to the whole book when there is no report to merge into,
+  // when several chapters (or a whole-book refetch) are pending together, or
+  // when the last request failed.
+  refetchChapter: (chapter: number) => Promise<void>;
   // Date.now() when the last fetch landed; 0 before the first and after a
   // failed one, so a failure never suppresses the next retry. Lets the caller
   // skip a focus-driven refetch that would re-pull a report it just got (#887).
@@ -45,8 +54,18 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   const reportJson = useRef<string | null>(null);
   const settledAt = useRef(0);
   const lastSettledAt = useCallback(() => settledAt.current, []);
+  // The report a chapter response merges into (state can lag a render).
+  const reportRef = useRef<BookLintReport | null>(null);
+  // What the next run must refresh. A run takes and clears it, so requests
+  // that pile up during a run are served together by the follow-up run.
+  const pending = useRef({ whole: false, chapters: new Set<number>() });
 
   const load = useCallback((): Promise<void> => {
+    pending.current.whole = true;
+    return queue.current ? queue.current.refresh() : Promise.resolve();
+  }, []);
+  const loadChapter = useCallback((chapter: number): Promise<void> => {
+    pending.current.chapters.add(chapter);
     return queue.current ? queue.current.refresh() : Promise.resolve();
   }, []);
 
@@ -67,6 +86,8 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   // Refetch on book change (and reset when disabled) — lint is per-book.
   useEffect(() => {
     reportJson.current = null;
+    reportRef.current = null;
+    pending.current = { whole: false, chapters: new Set() };
     if (!enabled) {
       setReport(null);
       setStatus("idle");
@@ -79,10 +100,28 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
       // A refetch keeps showing the current report; only the first load of a
       // book is "loading".
       if (reportJson.current === null) setStatus("loading");
+      const scope = pending.current;
+      pending.current = { whole: false, chapters: new Set() };
+      const base = reportRef.current;
+      // One chapter only when that is all that changed and there is a report
+      // to merge it into; anything else re-lints the whole book.
+      const chapter = !scope.whole && scope.chapters.size === 1 && base ? [...scope.chapters][0] : undefined;
       try {
         // Bounded: a big book that times out must not retry forever (#887).
-        const r = await fetchWithRetry((signal) => api.getBookLint(book, signal), { signal: ctrl.signal, maxAttempts: 3 });
+        const fetchLint = (ch?: number) =>
+          fetchWithRetry((signal) => api.getBookLint(book, signal, ch), { signal: ctrl.signal, maxAttempts: 3 });
+        let r = await fetchLint(chapter);
         if (ctrl.signal.aborted) return;
+        if (chapter !== undefined && base) {
+          const merged = mergeChapterReport(base, r);
+          if (merged) {
+            r = merged;
+          } else {
+            r = await fetchLint();
+            if (ctrl.signal.aborted) return;
+          }
+        }
+        reportRef.current = r;
         settledAt.current = Date.now();
         const json = JSON.stringify(r);
         if (json !== reportJson.current) {
@@ -94,6 +133,9 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
         if (ctrl.signal.aborted) return;
         settledAt.current = 0;
         setStatus("error");
+        // The cached report missed this refresh, so it can no longer be patched
+        // one chapter at a time: the next refresh re-lints the whole book.
+        pending.current.whole = true;
       }
     };
     void queue.current?.refresh();
@@ -119,6 +161,7 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
     flagCount: report?.flagCount ?? flagIssues.length,
     escalateCount: report?.escalateCount ?? 0,
     refetch: load,
+    refetchChapter: loadChapter,
     lastSettledAt,
   };
 }
