@@ -617,6 +617,29 @@ const sig = (o) => `${o.kind}:${o.op.target.id}:${o.remote ? "remote" : "local"}
   unmark("q1");
 }
 
+// Items 2 / 8: another tab's DELETE left the outbox during the load, and its
+// commit message arrives only after the after-read. The load waits briefly
+// for that outcome instead of landing the stale row.
+{
+  const notMine = () => false;
+  const r = run({ ops: [del("tq", "q2")], isOwn: notMine });
+  await r.ready();
+  r.ops = [];
+  const out = r.finish();
+  setTimeout(() => r.on?.committed(del("tq", "q2", "in_flight")), 20);
+  check(ids((await out).tq).join() === "q1", "#1126 item 2: another tab's commit heard just after the after-read still hides its row");
+}
+{
+  // ...and a late refusal of it shows the row.
+  const notMine = () => false;
+  const r = run({ ops: [del("tq", "q2")], isOwn: notMine });
+  await r.ready();
+  r.ops = [];
+  const out = r.finish();
+  setTimeout(() => r.on?.abandoned(del("tq", "q2", "in_flight")), 20);
+  check(ids((await out).tq).join() === "q1,q2", "#1126 item 2: another tab's late refusal shows its row");
+}
+
 // Item 5: a committed own op no longer keeps the mark alive once a later
 // DELETE of the (re-created) row is refused.
 {
