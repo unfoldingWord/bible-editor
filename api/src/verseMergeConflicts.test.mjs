@@ -2882,7 +2882,7 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     // Tonight: the speculative upsert, the CAS lands, the confirm reactivates.
     await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 20, 11)], OCT05);
     assert(row(sqlite, 4, 20).detected_at === JUN10, "reactivation: the speculative upsert alone leaves detected_at alone");
-    await confirmAdoptedConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 20 }], OCT05);
+    await confirmAdoptedConflicts(env, "EZK", "ust", [overwrite(4, 20, 11)], OCT05);
     const r = row(sqlite, 4, 20);
     assert(r.resolved_at === null && r.resolved_by === null, "reactivation: the row is active again");
     assert(r.detected_at === OCT05, `reactivation: detected_at is tonight, not June (got ${r.detected_at})`);
@@ -2898,10 +2898,46 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     const { sqlite, env } = migratedEnv();
     await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 21, 5)], AUG19);
     await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 21, 8)], OCT05);
-    await confirmAdoptedConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 21 }], OCT05);
+    await confirmAdoptedConflicts(env, "EZK", "ust", [overwrite(4, 21, 8)], OCT05);
     const r = row(sqlite, 4, 21);
     assert(r.detected_at === AUG19, `unresolved re-confirm: detected_at keeps its first date (got ${r.detected_at})`);
     assert(r.last_recorded_at === OCT05, "unresolved re-confirm: last_recorded_at still records tonight");
+    // Issue #1112's other half: a row still waiting for a human keeps its FIRST
+    // recovery pointer. Its v5 text is what that human has not yet looked at.
+    assert(r.overwritten_version === 5, `unresolved re-confirm: the first pointer (v5) is kept (got v${r.overwritten_version})`);
+  }
+
+  // (e) Issue #1112: a verse overwritten in June (v4, bcameron93's text),
+  // resolved by a person, then overwritten again tonight (v11, jdoe's text).
+  // The reactivated row, and the editor alert raised from it, point at v11 and
+  // go to jdoe. June's pointer and June's lost-word snapshot describe a loss
+  // someone already dealt with.
+  {
+    const { sqlite, env } = migratedEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (8, 8008, 'jdoe')`).run();
+    authored(sqlite, 4, 20, 4);
+    sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', 'EZK/4/20/UST', 'EZK', 8, 11, 'update')`,
+    ).run();
+    const june = { ...overwrite(4, 20, 4), alignment: { beforeAligned: 6, afterAligned: 4, lostWords: ["june"] } };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [june], JUN10);
+    humanResolve(sqlite, 4, 20, JUN10 + 86400);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 20, 11)], OCT05);
+    await confirmAdoptedConflicts(env, "EZK", "ust", [overwrite(4, 20, 11)], OCT05);
+    const r = row(sqlite, 4, 20);
+    assert(r.resolved_at === null, "re-overwrite: the row is active again");
+    assert(r.overwritten_version === 11, `re-overwrite: the pointer is tonight's v11, not June's v4 (got v${r.overwritten_version})`);
+    assert(r.alignment === null, `re-overwrite: June's lost-word snapshot is not carried over (got ${r.alignment})`);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const live = (user) =>
+      sqlite.prepare(`SELECT * FROM system_alerts WHERE username = ? AND source = ? AND resolved_at IS NULL ORDER BY id`)
+        .all(user, SOURCE);
+    const jdoe = live("jdoe");
+    assert(
+      jdoe.length === 1 && jdoe[0].message.includes("4:20@v11 (first flagged 2026-10-05)"),
+      `re-overwrite: v11's author is alerted at v11 (got: ${jdoe.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+    assert(live("bcameron93").length === 0, "re-overwrite: v4's author is not told Door43 overwrote them tonight");
   }
 
   // (d) A resolved row whose adoption LOSES its CAS race (no confirm) keeps
