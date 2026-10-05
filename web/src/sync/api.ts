@@ -235,15 +235,27 @@ export interface BookLintIssue {
   ours?: Record<string, unknown>;
   reviewKind?: string;
   reviewReason?: string | null;
+  /** Chapter of the row the issue came from, or null for a book-wide check
+   *  (curly quotes, paired punctuation) that any chapter's edit can change.
+   *  Drives the chapter merge (#888, mergeChapterReport.ts). */
+  chapter: number | null;
+  /** Check-group index; the server emits issues in (section, chapter) order. */
+  section: number;
 }
 
+// Mirror of api/src/bookLintReport.ts's BookLintReport. Since #888 `issues`
+// holds only the "flag" bucket; escalate issues arrive as counts.
 export interface BookLintReport {
   book: string;
+  /** null = whole book; N = chapter N's issues plus every book-wide one. */
+  chapter: number | null;
   total: number;
   /** Issues needing a human decision (the "flag" bucket). */
   flagCount: number;
   /** Integrity issues (footnotes) — secondary, count only. */
   escalateCount: number;
+  /** Escalate counts by chapter, so a chapter response can replace one. */
+  escalateByChapter: Record<number, number>;
   issues: BookLintIssue[];
 }
 
@@ -1693,9 +1705,13 @@ export const api = {
     ),
 
   // DCS-validation summary for a book (issues that need a human decision).
-  // Book-level, fetched once per book change by useBookLint.
-  getBookLint: (book: string, signal?: AbortSignal) =>
-    request<BookLintReport>(`/api/books/${encodeURIComponent(book)}/lint`, { signal }),
+  // Whole book on book load / focus refresh; one chapter after a save, which
+  // useBookLint merges into the cached report (#888).
+  getBookLint: (book: string, signal?: AbortSignal, chapter?: number) =>
+    request<BookLintReport>(
+      `/api/books/${encodeURIComponent(book)}/lint${chapter === undefined ? "" : `?chapter=${chapter}`}`,
+      { signal },
+    ),
 
   getCatalogs: () => request<Catalogs>(`/api/catalogs`),
 

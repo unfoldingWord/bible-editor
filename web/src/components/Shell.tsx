@@ -22,6 +22,7 @@ import { OpenChapterProvider } from "./NoteLinkPreview";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
+import { WHOLE_BOOK_LINT_MAX_AGE_MS } from "../hooks/lintRefreshScope";
 import { useBookLocks } from "../hooks/useBookLocks";
 import { useAlignmentAttention } from "../hooks/useAlignmentAttention";
 import { useLexicon } from "../hooks/useLexicon";
@@ -520,7 +521,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // debounced refetch the outbox listener below uses. Every RowKind counts:
       // tq and twl rows carry lint issues too (lintTqRows / lintTwlRows in
       // api/src/lint.ts), so no kind filter here (#887).
-      scheduleLintRefetch();
+      scheduleLintRefetch(row.chapter);
     },
     onDelete: (kind, id) => applyLocalRowDelete(kind, id),
     // Version-gated inside the hook (strictly newer than local AND above the
@@ -790,30 +791,47 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // endpoint filters `trashed_at IS NULL`, so trashing a flagged note drops the
   // count and restoring one adds it back.
   // A hidden tab can't see the chip, so defer to its return (#887).
-  const scheduleLintRefetch = useCallback(() => {
+  // `chapter` is the chapter the change landed in: when every change in the
+  // debounce window names the same one, only that chapter is re-linted and
+  // merged (#888). No chapter (focus refresh, a change whose chapter isn't
+  // known) re-lints the whole book.
+  const bookLintRefetchChapter = bookLint.refetchChapter;
+  const lintPendingScope = useRef<Set<number> | "book">(new Set());
+  const scheduleLintRefetch = useCallback((chapter?: number) => {
     if (document.hidden) {
       lintStaleWhileHidden.current = true;
       return;
     }
+    const scope = lintPendingScope.current;
+    if (chapter === undefined) lintPendingScope.current = "book";
+    else if (scope !== "book") scope.add(chapter);
     if (lintRefetchTimer.current) clearTimeout(lintRefetchTimer.current);
     lintRefetchTimer.current = setTimeout(() => {
       lintRefetchTimer.current = null;
+      const pending = lintPendingScope.current;
+      lintPendingScope.current = new Set();
       // Hidden since the timer was armed: defer to the tab's return instead.
       if (document.hidden) {
         lintStaleWhileHidden.current = true;
         return;
       }
-      bookLintRefetch();
+      if (pending !== "book" && pending.size === 1) bookLintRefetchChapter([...pending][0]);
+      else bookLintRefetch();
     }, 3000);
-  }, [bookLintRefetch]);
+  }, [bookLintRefetch, bookLintRefetchChapter]);
   useEffect(() => {
     const unsub = onOutboxResult((op, result) => {
       if (result.kind !== "ok") return;
       const t = op.target;
-      const touchesLint =
-        (t.kind === "row" && t.rowKind === "tn" && t.book === book) ||
-        (t.kind === "verse" && t.book === book);
-      if (touchesLint) scheduleLintRefetch();
+      if (t.kind === "verse" && t.book === book) {
+        scheduleLintRefetch(t.chapter);
+      } else if (t.kind === "row" && t.rowKind === "tn" && t.book === book) {
+        // A row target carries no chapter; the saved row the server returned
+        // does (a PATCH never moves a row to another chapter). A delete may
+        // return no row, which falls back to the whole book.
+        const ch = (result.updated as { chapter?: unknown } | null)?.chapter;
+        scheduleLintRefetch(typeof ch === "number" ? ch : undefined);
+      }
     });
     return () => {
       unsub();
@@ -821,6 +839,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         clearTimeout(lintRefetchTimer.current);
         lintRefetchTimer.current = null;
       }
+      lintPendingScope.current = new Set();
     };
   }, [book, scheduleLintRefetch]);
   // Self-heal a stale "issues to clean up" chip: when the tab regains focus or
@@ -835,7 +854,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   useEffect(() => {
     const refresh = () => {
       if (document.visibilityState !== "visible") return;
-      if (!lintStaleWhileHidden.current && Date.now() - bookLintSettledAt() < 60_000) return;
+      if (!lintStaleWhileHidden.current && Date.now() - bookLintSettledAt() < WHOLE_BOOK_LINT_MAX_AGE_MS) return;
       lintStaleWhileHidden.current = false;
       scheduleLintRefetch();
     };
@@ -1386,7 +1405,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         applyLocalRowReplacement("tn", updated);
         // Trash bypasses the outbox, so refresh the lint chip directly — a
         // trashed note leaves the lint set (trashed_at IS NULL filter).
-        scheduleLintRefetch();
+        scheduleLintRefetch(updated.chapter);
         // The book-level trash indicator (#755) has no other way to learn a
         // row changed state — it lists the whole book, not just this chapter.
         setTrashRefreshSignal((n) => n + 1);
@@ -1417,7 +1436,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         applyLocalRowReplacement("tn", updated);
         // Restore re-adds the note to the lint set — refresh the chip (the
         // outbox listener won't fire for this direct API call).
-        scheduleLintRefetch();
+        scheduleLintRefetch(updated.chapter);
         setTrashRefreshSignal((n) => n + 1);
       } catch (e) {
         applyLocalRowPatch("tn", id, { trashed_at: Math.floor(Date.now() / 1000) });

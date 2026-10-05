@@ -23,6 +23,7 @@ import { readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 const SQLITE_FILES = new Set([
+  "src/bookLintReport.test.mjs",
   "src/tsvMergeIntegration.test.mjs",
   "src/tombstoneCollision.test.mjs",
   "src/reimportJourney.test.mjs",
