@@ -85,6 +85,12 @@ export interface ChapterFetchSequencer<P, S> {
   refetch(load: ChapterLoader<P>, merge: boolean): Promise<void>;
   /** Record a step for replay while a merging refetch is pending. */
   record(step: S): void;
+  /**
+   * Drop queued steps that match `pred` (no-op with no merge pending). A
+   * refused or discarded row DELETE restores its row, and its own `rowDelete`
+   * step must not hide it again when a pending merge lands (#1108).
+   */
+  forget(pred: (step: S) => boolean): void;
   /** Chapter change or unmount: abort and forget everything in flight. */
   reset(): void;
 }
@@ -167,6 +173,9 @@ export function createChapterFetchSequencer<P, S>(cb: ChapterFetchCallbacks<P, S
     },
     record(step: S): void {
       queue?.push(step);
+    },
+    forget(pred: (step: S) => boolean): void {
+      if (queue) queue = queue.filter((s) => !pred(s));
     },
     reset(): void {
       current?.ctrl.abort();
