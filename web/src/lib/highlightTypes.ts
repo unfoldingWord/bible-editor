@@ -44,13 +44,25 @@ export interface HighlightCtx {
   // the position resolved from the group's source word.
   onHebrewEnter: (pos: number, groupIdOverride?: string) => void;
   onLeave: () => void;
-  englishHighlight: (
+  // Subscribing hover-tone HOOKS, not precomputed values (see hoverStore.ts):
+  // each chip/card/token calls one of these directly, during its OWN render,
+  // to read its resolved tone off a live external store via
+  // useSyncExternalStore. That is why the `use` prefix isn't cosmetic — this
+  // field IS a hook and must be called unconditionally from a component's
+  // render, same as any hook, even though it arrives via a prop rather than a
+  // module-level import: React tracks hook identity by call order on the
+  // CURRENTLY RENDERING component, not by where the function was lexically
+  // defined, so invoking it inside a chip's render body attaches the
+  // subscription to that chip. The payoff (#900): a hover event re-renders
+  // only the specific words whose tone actually changed, not this context's
+  // owner and everything under it.
+  useEnglishHighlight: (
     wordId: string,
     text: string,
     occurrence: string,
     groupIdOverride?: string,
   ) => HighlightTone;
-  hebrewHighlight: (
+  useHebrewHighlight: (
     pos: number,
     groupIdOverride?: string,
   ) => HighlightTone;

@@ -18,7 +18,8 @@ import KeyboardArrowLeftIcon from "@mui/icons-material/KeyboardArrowLeft";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
 import { AlignmentPanel, type AlignerLock, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { UhbStrip } from "./UhbStrip";
-import { type HoverHighlight, type HighlightCtx } from "../lib/highlightTypes";
+import { type HighlightCtx } from "../lib/highlightTypes";
+import { createHoverStore, useHoverTone, type HoverStore } from "../lib/hoverStore";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { TwlRow, VerseDto } from "../sync/api";
 import type { VerseBaseHold } from "../sync/versePin";
@@ -361,7 +362,14 @@ export function SideBySideAligner({
   locked = false,
   onUnsavedDropped,
 }: Props) {
-  const [hover, setHover] = useState<HoverHighlight>(null);
+  // Lifted hover lives in an external store, not React state (#900): a plain
+  // `useState` here forced this dialog — and both AlignmentPanels and
+  // SharedUhbStrip under it — to re-render on every mouseenter/mouseleave.
+  // Created once and never replaced (this dialog isn't remounted across a
+  // verse nav — see the reset effect below).
+  const hoverStoreRef = useRef<HoverStore | null>(null);
+  if (!hoverStoreRef.current) hoverStoreRef.current = createHoverStore(null);
+  const hoverStore = hoverStoreRef.current;
   const [hoverLink, setHoverLink] = useState<boolean>(readHoverLink);
   // Hebrew lexicon tooltip on hover — default on; turn off to see only what's
   // aligned (the highlight bridge) without the popup covering the panels.
@@ -437,13 +445,13 @@ export function SideBySideAligner({
   // Hover positions are verse-specific — a stale ring would attach to whatever
   // token happens to hold the same position after a verse nav.
   useEffect(() => {
-    setHover(null);
-  }, [verseNum, chapter]);
+    hoverStore.setHover(null);
+  }, [hoverStore, verseNum, chapter]);
   const toggleHoverLink = () =>
     setHoverLink((cur) => {
       const next = !cur;
       writeHoverLink(next);
-      if (!next) setHover(null);
+      if (!next) hoverStore.setHover(null);
       return next;
     });
 
@@ -502,8 +510,7 @@ export function SideBySideAligner({
         setLocalDirty(dirty);
         slot.onDirtyChange(dirty);
       }}
-      hover={hover}
-      onHoverChange={setHover}
+      hoverStore={hoverStore}
       hoverLink={hoverLink}
       onToggleHoverLink={toggleHoverLink}
       renderUhbStrip={false}
@@ -733,8 +740,7 @@ export function SideBySideAligner({
             lexiconMap={lexiconMap}
             twlForVerse={twlForVerse}
             verseNum={verseNum}
-            hover={hover}
-            onHover={setHover}
+            hoverStore={hoverStore}
             hoverLink={hoverLink}
             showSourceInfo={lexInfo}
             groupPositionsFor={groupPositionsFor}
@@ -780,8 +786,7 @@ function SharedUhbStrip({
   lexiconMap,
   twlForVerse,
   verseNum,
-  hover,
-  onHover,
+  hoverStore,
   hoverLink,
   showSourceInfo,
   groupPositionsFor,
@@ -791,8 +796,7 @@ function SharedUhbStrip({
   lexiconMap: Map<string, LexiconEntry | null>;
   twlForVerse: TwlRow[];
   verseNum: number;
-  hover: HoverHighlight;
-  onHover: (h: HoverHighlight) => void;
+  hoverStore: HoverStore;
   hoverLink: boolean;
   showSourceInfo: boolean;
   // Union positions of the hovered token's group(s), across BOTH panels. The
@@ -808,13 +812,13 @@ function SharedUhbStrip({
   // Hebrew hovered → its group's Hebrew siblings, unioned across both panels).
   //
   // Resolution here is POSITION-ONLY. That is deliberate, and adding a
-  // `hover.groupId === myGroupId` term like AlignmentPanel's hebrewHighlight has
-  // would accomplish nothing — it would be inert, not merely redundant:
+  // `hover.groupId === myGroupId` term like AlignmentPanel's useHebrewHighlight
+  // has would accomplish nothing — it would be inert, not merely redundant:
   //   - That term serves the panel's CARD call site, which passes an explicit
-  //     groupId override (SourceWordTypography → hebrewHighlight(pos, groupId),
+  //     groupId override (SourceWordTypography → useHebrewHighlight(pos, groupId),
   //     with pos = -1 when the source word didn't resolve) and can therefore
   //     still name its group. UhbStrip never passes an override — it calls
-  //     hebrewHighlight(pos) — so the panel's own strip resolves by position
+  //     useHebrewHighlight(pos) — so the panel's own strip resolves by position
   //     too.
   //   - This strip holds no group ids of its own and seeds the lifted hover with
   //     `groupId: null`, so a strip-side comparison could only ever match
@@ -862,22 +866,33 @@ function SharedUhbStrip({
         if (!hoverLink) return;
         // Carry the group's union positions (both panels) so the strip can light
         // the hovered token's Hebrew siblings — still positions, not group ids.
-        onHover({ kind: "hebrew", pos, groupId: null, positions: groupPositionsFor(pos) });
+        hoverStore.setHover({ kind: "hebrew", pos, groupId: null, positions: groupPositionsFor(pos) });
       },
-      onLeave: () => onHover(null),
-      englishHighlight: () => null,
-      hebrewHighlight: (pos: number) => {
-        if (!hoverLink || !hover) return null;
-        if (hover.kind === "hebrew" && hover.pos === pos) return "exact";
-        // `positions` is absent on a hover seeded by a panel (card/chip), where
-        // each panel resolves its own grouping; then only the exact token lights
-        // here, as before.
-        if (hover.kind === "hebrew") return hover.positions?.includes(pos) ? "linked" : null;
-        if (hover.kind === "english" && hover.positions.includes(pos)) return "linked";
-        return null;
-      },
+      onLeave: () => hoverStore.setHover(null),
+      // No English chips on this strip, so this hook always returns null — it
+      // still has to exist (and be a no-arg-independent, unconditionally
+      // callable function) to satisfy HighlightCtx's shape.
+      useEnglishHighlight: () => null,
+      // A hook (see the HighlightCtx field docs in highlightTypes.ts and
+      // useHoverTone in hoverStore.ts), not a precomputed value keyed off
+      // `hover` state — that used to force this WHOLE strip's hctx to rebuild,
+      // and its parent dialog to re-render, on every mouseenter/mouseleave
+      // (#900). `resolve` keeps this strip's bespoke position-only comparison
+      // (see the long comment above) rather than routing through
+      // resolveHebrewHighlight, which does not apply here — see that comment.
+      useHebrewHighlight: (pos: number) =>
+        useHoverTone(hoverStore, (hover) => {
+          if (!hoverLink || !hover) return null;
+          if (hover.kind === "hebrew" && hover.pos === pos) return "exact";
+          // `positions` is absent on a hover seeded by a panel (card/chip),
+          // where each panel resolves its own grouping; then only the exact
+          // token lights here, as before.
+          if (hover.kind === "hebrew") return hover.positions?.includes(pos) ? "linked" : null;
+          if (hover.kind === "english" && hover.positions.includes(pos)) return "linked";
+          return null;
+        }),
     }),
-    [hoverLink, showSourceInfo, themeMode, hover, onHover, groupPositionsFor],
+    [hoverLink, showSourceInfo, themeMode, hoverStore, groupPositionsFor],
   );
   return (
     <UhbStrip
