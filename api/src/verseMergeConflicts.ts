@@ -241,13 +241,14 @@ export async function recordVerseMergeConflicts(
 // this two-phase split exists to prevent.
 //
 // `now` is this run's timestamp (the same one recordVerseMergeConflicts got):
-// a row reactivated from resolved takes it as its new detected_at (issue #996,
-// see CONFIRM_ADOPTED_CONFLICT_SQL).
+// a row reactivated from resolved takes it as its new detected_at (issue #996),
+// and each ref's overwrittenVersion / alignment as its new recovery pointer and
+// snapshot (issue #1112). See CONFIRM_ADOPTED_CONFLICT_SQL.
 export async function confirmAdoptedConflicts(
   env: Env,
   book: string,
   resource: string,
-  refs: Array<{ chapter: number; verse: number }>,
+  refs: Array<Pick<VerseMergeConflictRow, "chapter" | "verse" | "overwrittenVersion" | "alignment">>,
   now: number,
 ): Promise<void> {
   if (refs.length === 0) return;
@@ -255,7 +256,17 @@ export async function confirmAdoptedConflicts(
     for (let i = 0; i < refs.length; i += WRITE_BATCH) {
       const slice = refs.slice(i, i + WRITE_BATCH);
       await env.DB.batch(
-        slice.map((r) => env.DB.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse, now)),
+        slice.map((r) =>
+          env.DB.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).bind(
+            book,
+            resource,
+            r.chapter,
+            r.verse,
+            now,
+            r.overwrittenVersion,
+            r.alignment ? JSON.stringify(r.alignment) : null,
+          ),
+        ),
       );
     }
   } catch (e) {

@@ -2843,10 +2843,10 @@ console.log("\n[#728 review F3: an absorbed row's structure_absorbed_human_edit 
     .all(BOOK, CH)[0];
   eq([row.action, row.reason], ["adopt_conflict", "structure_absorbed_human_edit"], "the pointer row carries tonight's reason");
   eq([row.resolved_at, row.resolved_by], [null, null], "…and is CONFIRMED (resolved_at/resolved_by cleared) because the DELETE landed");
-  // The upsert keeps the EARLIEST pointer across a resolve → new-conflict cycle
-  // (verseMergeConflictSql.ts's documented "known narrower follow-on"); what this
-  // case guards is visibility, not which of the two versions the pointer names.
-  eq(row.overwritten_version, 1, "the recovery pointer is present (earliest-pointer rule, documented)");
+  // Issue #1112: the confirm that reactivates a RESOLVED row takes tonight's
+  // pointer (v2, the app-edited text the absorb deleted), not the resolved
+  // night's v1.
+  eq(row.overwritten_version, 2, "the recovery pointer names tonight's overwritten version (v2), not the resolved v1");
   eq(sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult").map((r) => [r.verse, r.action]), [[2, "adopt_conflict"]],
     "…so the banner's active-conflict filter (the real constant) shows it");
   eq(counts.structure_adopted, 1, "counted structure_adopted");
