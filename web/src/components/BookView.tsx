@@ -60,12 +60,17 @@ const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total:
 // (content-visibility, #909): CHAPTER_HEAD_PX plus one row height per verse.
 // Once a chapter has rendered, `auto` makes the browser reuse its real size.
 // rowPxEstimate is the active chapter's measured average row height (see
-// BookView). Each chapter copies it once, when it first loads, and keeps that
-// number: a placeholder that changed size later would move everything below
-// it, and in a browser without scroll anchoring (Safari) the view with it.
-// 150px is the fallback before the first measurement (ZEC, 1400px wide).
+// BookView), kept per book. Each chapter copies the row height once, when it
+// first loads, and keeps it: a placeholder that changed size later would move
+// everything below it, and in a browser without scroll anchoring (Safari) the
+// view with it. The placeholder still scales with the chapter's current row
+// count, which changes only when a version column is toggled.
+// DEFAULT_ROW_PX is the fallback before a book's first measurement (ZEC,
+// 1400px wide).
 const CHAPTER_HEAD_PX = 60;
-let rowPxEstimate = 150;
+const DEFAULT_ROW_PX = 150;
+let rowPxEstimate = { book: "", px: DEFAULT_ROW_PX };
+const rowPxFor = (book: string) => (rowPxEstimate.book === book ? rowPxEstimate.px : DEFAULT_ROW_PX);
 
 // Handed to every cell that never reads the lexicon (only the RTL source
 // column's HebrewLine does), so a lexicon batch landing — or a new chapter
@@ -400,19 +405,21 @@ export function BookView({
   // Keep rowPxEstimate (see CHAPTER_HEAD_PX) at the active chapter's real
   // average row height, so a chapter loaded later takes about the space it
   // will need. Re-measures when the chapter resizes: a column toggled, the
-  // window resized, a verse edited.
+  // window resized, a verse edited. The row count is read on every resize,
+  // since a toggled column can change it.
   const activeReady = chapters.get(activeChapter)?.kind === "ready";
   useEffect(() => {
     const block = containerRef.current?.querySelector<HTMLElement>(`[data-chapter-block="${activeChapter}"]`);
-    const rows = Number(block?.dataset.rows);
-    if (!block || !(rows > 0)) return;
+    if (!block) return;
     const ro = new ResizeObserver(() => {
+      const rows = Number(block.dataset.rows);
+      if (!(rows > 0)) return;
       const rowPx = Math.round((block.offsetHeight - CHAPTER_HEAD_PX) / rows);
-      if (rowPx > 0) rowPxEstimate = rowPx;
+      if (rowPx > 0) rowPxEstimate = { book, px: rowPx };
     });
     ro.observe(block);
     return () => ro.disconnect();
-  }, [activeChapter, activeReady]);
+  }, [book, activeChapter, activeReady]);
 
   // Chapters always laid out in full, never skipped by content-visibility:
   // the active chapter with the two above it and the one below (the chapters
@@ -538,7 +545,9 @@ export function BookView({
             const isActiveChapter = ch === activeChapter;
             return (
               <ChapterBlock
-                key={ch}
+                // Keyed by book too, so a new book's chapters start with a
+                // fresh placeholder rather than the last book's row height.
+                key={`${book}-${ch}`}
                 book={book}
                 chapter={ch}
                 state={chapters.get(ch) ?? UNLOADED_STATE}
@@ -694,10 +703,10 @@ const ChapterBlock = memo(function ChapterBlock({
     }
     return [...set].sort((a, b) => a - b);
   }, [readyData, enabledVersions]);
-  // This chapter's placeholder row height, fixed when it first loads (see
+  // This chapter's placeholder row height, copied when it first loads (see
   // CHAPTER_HEAD_PX for why it must not change afterwards).
   const placeholderRowPx = useRef<number | null>(null);
-  if (readyData && placeholderRowPx.current === null) placeholderRowPx.current = rowPxEstimate;
+  if (readyData && placeholderRowPx.current === null) placeholderRowPx.current = rowPxFor(book);
   // One CommentCounts object per comments change, not per render: Shell's
   // verseCommentCounts builds a fresh object on every call, which would
   // re-render the active row on any render of this block.
@@ -770,7 +779,7 @@ const ChapterBlock = memo(function ChapterBlock({
         // Set on pinned chapters too: the browser records the real height of
         // a laid-out chapter as `auto`'s remembered size, so one that unpins
         // off screen keeps its height instead of dropping to the estimate.
-        containIntrinsicHeight: `auto ${CHAPTER_HEAD_PX + verseNums.length * (placeholderRowPx.current ?? rowPxEstimate)}px`,
+        containIntrinsicHeight: `auto ${CHAPTER_HEAD_PX + verseNums.length * (placeholderRowPx.current ?? rowPxFor(book))}px`,
       }}
     >
       <Box
