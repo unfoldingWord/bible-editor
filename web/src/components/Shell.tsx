@@ -97,6 +97,7 @@ import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
 import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
+import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
 import {
   alignmentDraftKey,
   alignmentDraftKeyForOp,
@@ -328,6 +329,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalRowReplacement,
     applyLocalRowDelete,
     applyLocalRowInsert,
+    restoreRow,
     applyLocalVerse,
     applyRemoteVerse,
     applyLocalVerseBridge,
@@ -1056,6 +1058,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       rollbackMountedRef.current = false;
     };
   }, []);
+  // One retry after a short wait for a transient failure; the caller's guards
+  // run on whichever response lands. A second failure throws (the caller's
+  // catch gives up) and the next chapter refetch catches up.
+  const fetchRollbackChapter = useCallback(async (b: string, c: number): Promise<ChapterPayload> => {
+    const fetchKey = `${b}:${c}`;
+    const fetchChapter = () => {
+      let fetching = rollbackFetchRef.current.get(fetchKey);
+      if (!fetching) {
+        fetching = api.getChapter(b, c);
+        rollbackFetchRef.current.set(fetchKey, fetching);
+        const forget = () => {
+          rollbackFetchRef.current.delete(fetchKey);
+        };
+        fetching.then(forget, forget);
+      }
+      return fetching;
+    };
+    try {
+      return await fetchChapter();
+    } catch {
+      await new Promise((r) => setTimeout(r, 2000));
+      return await fetchChapter();
+    }
+  }, []);
   const rollBackRefusedVerse = useCallback(async (op: OutboxOp) => {
     const t = op.target;
     if (t.kind !== "verse") return;
@@ -1083,29 +1109,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       };
       const chapterBefore = chapterRow();
       const bookBefore = bookRow();
-      const fetchKey = `${t.book}:${t.chapter}`;
-      const fetchChapter = () => {
-        let fetching = rollbackFetchRef.current.get(fetchKey);
-        if (!fetching) {
-          fetching = api.getChapter(t.book, t.chapter);
-          rollbackFetchRef.current.set(fetchKey, fetching);
-          const forget = () => {
-            rollbackFetchRef.current.delete(fetchKey);
-          };
-          fetching.then(forget, forget);
-        }
-        return fetching;
-      };
-      // One retry after a short wait for a transient failure; the guards
-      // below run on whichever response lands. A second failure gives up
-      // (the outer catch) and the next chapter refetch catches up.
-      let server: ChapterPayload;
-      try {
-        server = await fetchChapter();
-      } catch {
-        await new Promise((r) => setTimeout(r, 2000));
-        server = await fetchChapter();
-      }
+      const server = await fetchRollbackChapter(t.book, t.chapter);
       const stillQueuedForTarget = await queuedForTarget();
       const serverRow = server.verses[t.bibleVersion]?.[t.verse];
       const apply = (
@@ -1137,7 +1141,58 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     } catch {
       // Best-effort: the next chapter refetch catches up.
     }
-  }, [book]);
+  }, [book, fetchRollbackChapter]);
+  // #1108: a tq/twl DELETE hides its row before it is sent. A refusal (lock)
+  // or a discard means no 200 will follow, so the row stayed hidden although
+  // the server still has it. Re-read the chapter on screen and put the
+  // server's row back (planRefusedRowDeleteRollback decides). Refused PATCHes
+  // are left alone: see refusedRowRollback.ts.
+  const restoreRowRef = useRef(restoreRow);
+  restoreRowRef.current = restoreRow;
+  const rollBackRefusedRowDelete = useCallback(async (op: OutboxOp) => {
+    const t = op.target;
+    if (t.kind !== "row" || op.action !== "delete") return;
+    try {
+      const key = outboxTargetKey(t);
+      // Another DELETE of the row (another tab's) settles the cache itself.
+      const deleteQueued = async () =>
+        siblingStillDraining(
+          (await outbox.list())
+            .filter((o) => o.action === "delete")
+            .map((o) => ({ id: o.id, status: o.status, targetKey: outboxTargetKey(o.target) })),
+          op.id,
+          key,
+        );
+      if (await deleteQueued()) return;
+      // The op carries no chapter; the row was hidden from the chapter on
+      // screen. A chapter opened since loads fresh and has it anyway.
+      const cur = dataRef.current;
+      if (!cur || cur.book !== t.book) return;
+      const chapterNo = cur.chapter;
+      const server = await fetchRollbackChapter(t.book, chapterNo);
+      const stillQueuedForTarget = await deleteQueued();
+      if (
+        !rollbackMayApply({
+          mounted: rollbackMountedRef.current,
+          liveBook: liveBookRef.current,
+          targetBook: t.book,
+        })
+      ) {
+        return;
+      }
+      const now = dataRef.current;
+      if (!now || now.book !== t.book || now.chapter !== chapterNo) return;
+      const plan = planRefusedRowDeleteRollback<TnRow | TqRow | TwlRow>({
+        id: t.id,
+        serverRows: server[t.rowKind],
+        cachedRows: now[t.rowKind],
+        stillQueuedForTarget,
+      });
+      if (plan.kind === "restore") restoreRowRef.current(t.rowKind, plan.row, { afterId: plan.afterId });
+    } catch {
+      // Best-effort: the next chapter refetch catches up.
+    }
+  }, [fetchRollbackChapter]);
   useEffect(
     () =>
       onOutboxResult((op, result) => {
@@ -1154,24 +1209,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           // finds the crash draft already written and restores the drags.
           if (isAlignerPanelSaveOp(op)) return;
           void rollBackRefusedVerse(op);
+          void rollBackRefusedRowDelete(op);
           pushPipelineToast(
             "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }
       }),
-    [pushPipelineToast, rollBackRefusedVerse],
+    [pushPipelineToast, rollBackRefusedVerse, rollBackRefusedRowDelete],
   );
   // #1075: a discarded verse op (an unresolvable 409, a refused save, discard
   // all) leaves its optimistic content in the caches just as a lock refusal
   // does, so a reopened aligner or reading line would show the discarded
   // text as saved and its next edit would pin the old version. Same rollback.
+  // A discarded row DELETE puts its hidden row back (#1108).
   useEffect(
     () =>
       onOutboxDiscard((op) => {
         if (op.target.kind === "verse") void rollBackRefusedVerse(op);
+        else void rollBackRefusedRowDelete(op);
       }),
-    [rollBackRefusedVerse],
+    [rollBackRefusedVerse, rollBackRefusedRowDelete],
   );
   // #1071: say "kept" only when a crash draft or an open panel actually holds
   // the refused drags. Two queued saves of one verse refused together get

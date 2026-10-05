@@ -379,4 +379,58 @@ function harness() {
   assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#989: the superseded GET 1 landing late changes nothing");
 }
 
+// ── (#1108) a refused row delete comes back and stays back ────────────────
+// The flip side of #989: the tab deletes tq row X while a merging GET is in
+// flight, and the server refuses the DELETE (409 chapter_locked, or the user
+// discards the op). Shell restores X (forget the rowDelete step, re-insert
+// the server's row, as useChapter.restoreRow does). A superseding merge and
+// the late first GET must not hide it again with the inherited delete step.
+{
+  const vs = await import("../lib/verseStructure.ts");
+  const chapter = (tq) => ({ book: "ZEC", chapter: 1, verses: {}, tn: [], tq, twl: [], verseStatuses: [], verseLaneChecks: [], twlOrderLocks: [] });
+  const q = (id) => ({ id, version: 2, book: "ZEC", chapter: 1, verse: 1, sort_order: 1, updated_at: 100 });
+  let state = chapter([q("X"), q("Y")]);
+  const reqs = [];
+  const seq = createChapterFetchSequencer({
+    onStart: () => {},
+    onAttempt: () => {},
+    onLanded: (payload, merge, queued) => {
+      state = vs.replaySteps(merge ? vs.mergeRefetched(state, payload) : payload, queued);
+    },
+    onError: () => {},
+    keepOnSupersede: vs.keepStepAcrossSupersede,
+  });
+  const load = () => new Promise((resolve) => reqs.push(resolve));
+  const first = seq.refetch(load, true); // merging GET 1 (a WS open)
+  const del = { type: "rowDelete", kind: "tq", id: "X" };
+  seq.record(del);
+  state = vs.applyStep(state, del);
+  // The DELETE is refused: restore X.
+  assert.equal(typeof seq.forget, "function", "#1108: the sequencer can forget a queued step");
+  seq.forget((s) => s.type === "rowDelete" && s.kind === "tq" && s.id === "X");
+  const ins = { type: "rowInsert", kind: "tq", row: q("X") };
+  seq.record(ins);
+  state = vs.applyStep(state, ins);
+  const second = seq.refetch(load, true); // reconnect: merging GET 2 supersedes
+  reqs[1](chapter([q("X"), q("Y")]));
+  await second;
+  assert.deepEqual(state.tq.map((r) => r.id).sort(), ["X", "Y"], "#1108: the restored row survives the superseding merge");
+  reqs[0](chapter([q("X"), q("Y")]));
+  await first;
+  assert.deepEqual(state.tq.map((r) => r.id).sort(), ["X", "Y"], "#1108: the superseded GET landing late changes nothing");
+}
+
+// forget() with nothing pending is a no-op, and only drops the matching steps.
+{
+  const { seq, loader, requests, events } = harness();
+  seq.forget(() => true); // no merge pending: no queue, nothing to throw on
+  const p = seq.refetch(loader("merge"), true);
+  seq.record("keep");
+  seq.record("drop");
+  seq.forget((s) => s === "drop");
+  requests[0].resolve("snap");
+  await p;
+  assert.deepEqual(events.at(-1).queued, ["keep"], "forget drops only the matching step");
+}
+
 console.log("chapterFetchSequencer: all cases passed");

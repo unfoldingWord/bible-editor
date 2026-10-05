@@ -78,6 +78,16 @@ export interface UseChapterReturn {
     position?: { afterId?: string },
   ) => void;
   /**
+   * Put back a row whose own DELETE the server refused or the user discarded
+   * (#1108): forget its queued `rowDelete` replay step so a pending merging
+   * refetch cannot hide it again, then re-insert the server's row.
+   */
+  restoreRow: (
+    kind: "tn" | "tq" | "twl",
+    row: TnRow | TqRow | TwlRow,
+    position?: { afterId?: string },
+  ) => void;
+  /**
    * This tab's own edit (optimistic, or the outbox's confirmed result for it):
    * applied regardless of version, EXCEPT that it can never resurrect a verse
    * another tab has already bridged away (tombstone — lib/verseStructure.ts).
@@ -297,6 +307,14 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     [book, chapter, mutate],
   );
 
+  const restoreRow = useCallback<UseChapterReturn["restoreRow"]>(
+    (kind, row, position) => {
+      sequencer.current?.forget((s) => s.type === "rowDelete" && s.kind === kind && s.id === row.id);
+      applyLocalRowInsert(kind, row, position);
+    },
+    [applyLocalRowInsert],
+  );
+
   // The verse map is reduced by lib/verseStructure.ts so the WS reorder rules
   // (version clock + per-verse tombstones) live in one pure, permutation-tested
   // place rather than being re-derived in each updater below.
@@ -487,6 +505,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     applyLocalRowReplacement,
     applyLocalRowDelete,
     applyLocalRowInsert,
+    restoreRow,
     applyLocalVerse,
     applyRemoteVerse,
     applyLocalVerseBridge,
