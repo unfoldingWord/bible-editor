@@ -2620,7 +2620,7 @@ for (const bookLocked of [true, false]) {
     noBaseCount: 1,
     noBaseRefs: ["1:6"],
     noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
-    noBaseBookLocked: bookLocked,
+    bookLocked,
     observedAt: 100,
   });
   const msg = (u) =>
@@ -2662,12 +2662,12 @@ console.log("\n[locked -> dismissed -> unlocked: the overwrite warning comes bac
     all: async () => ({ results: d.prepare(sql).all(...args) }),
     run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
   });
-  const raise = (noBaseBookLocked, observedAt) =>
+  const raise = (bookLocked, observedAt) =>
     raiseVerseMergeConflictAlert({ DB: { prepare: (sql) => make(sql) } }, "ZEC", "ust", {
       noBaseCount: 1,
       noBaseRefs: ["1:6"],
       noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
-      noBaseBookLocked,
+      bookLocked,
       observedAt,
     });
   const live = (u) =>

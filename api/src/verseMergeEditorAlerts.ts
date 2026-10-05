@@ -396,7 +396,17 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
 
 export function buildMergeConflictGuidance(
   rows: Array<{ action: string; reason?: string; overwrittenVersion: number | null; chapter?: number; verse?: number }>,
-  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[]; noBaseBookLocked?: boolean } = {},
+  // `bookLocked` (issue #1110): the book is locked, so the export skips it.
+  // It changes only the two kept-row sentences that would otherwise say
+  // tonight's export will write; `noBaseBookLocked` does the same for the
+  // no-base sentence (issue #1006).
+  opts: {
+    recordingFailed?: boolean;
+    noBaseCount?: number;
+    noBaseRefs?: string[];
+    noBaseBookLocked?: boolean;
+    bookLocked?: boolean;
+  } = {},
 ): string {
   // #539's no-op guard (bookReimport.ts ~7609-7674) keeps a CONFLICTED adopt
   // whose bytes turned out to already match D1 as an `adopt_conflict` row
@@ -477,14 +487,22 @@ export function buildMergeConflictGuidance(
         `attributes on \\zaln-s (x-content / x-lemma); check which side is right before the next export, ` +
         `because the export will write the app's attributes over Door43's.`
       : "",
+    // Issue #1110: the export skips a locked book, so on one these two must
+    // not say tonight's export will write. The unlocked wording is unchanged.
     keptAlignment > 0
       ? `${keptAlignment} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +
-        `change has NOT been taken, so tonight's export will still write over it until someone resolves it.`
+        (opts.bookLocked
+          ? `change has NOT been taken, and this book is locked, so the export skips it: Door43 keeps its own ` +
+            `version until an admin resolves it.`
+          : `change has NOT been taken, so tonight's export will still write over it until someone resolves it.`)
       : "",
     keptSourceAttr > 0
       ? `${keptSourceAttr} kept D1 because Door43's original-language source fix (the spelling/pointing/morphology ` +
         `on \\zaln-s) could not be placed unambiguously — the same source word repeats in the verse — so Door43's ` +
-        `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`
+        (opts.bookLocked
+          ? `change has NOT been taken, and this book is locked, so the export skips it: Door43 keeps its fix ` +
+            `until an admin resolves it by hand.`
+          : `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`)
       : "",
     // A 'keep_ai_master' sentence sat here until issue #749. It is gone with the
     // action itself: nothing of Door43's was taken, the next export publishes

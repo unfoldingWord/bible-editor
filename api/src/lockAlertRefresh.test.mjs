@@ -209,6 +209,69 @@ console.log("\n[a dismissed alert whose condition did not change stays dismissed
   assert(live(ADMIN).length === 0 && live(EDITOR).length === 0, "the dismissed overwrite alerts stay dismissed");
 }
 
+console.log("\n[a reimport that started before the lock change still lands after it (issue #1110)]");
+{
+  // The refresh re-words the stored measurement at that measurement's own
+  // observation time. A reimport observed later (it started before the lock
+  // change, raises after it) must not be dropped as "older than the stored one".
+  const { env, lockRoute, live } = freshApp();
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    observedAt: 1000,
+  });
+  await lockRoute("PUT");
+  await recordVerseMergeConflicts(env, BOOK, "ust", "UST", [
+    {
+      chapter: 3, verse: 4, action: "keep_alignment_refused", reason: "alignment_shrink",
+      overwrittenVersion: null, alignment: null, observedVersion: null,
+    },
+  ], 1500);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    bookLocked: true,
+    observedAt: 1500,
+  });
+  assert(live(ADMIN)[0]?.message.includes("alignment_shrink: 3:4"), `the later reimport's new verse reaches the alert (got: ${live(ADMIN)[0]?.message})`);
+}
+
+console.log("\n[the lock is read only when the alert has a lock-dependent sentence (issue #1110)]");
+{
+  const { sqlite, env, live } = freshApp();
+  let reads = 0;
+  const reader = async () => {
+    reads++;
+    return true;
+  };
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', ?, ?, 7, 4, 'update')`)
+    .run(`${BOOK}/2/1/UST`, BOOK);
+  await recordVerseMergeConflicts(env, BOOK, "ust", "UST", [
+    {
+      chapter: 2, verse: 1, action: "adopt_conflict", reason: "both_changed_wording",
+      overwrittenVersion: 4, alignment: null, observedVersion: null,
+    },
+  ], 1000);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", { bookLocked: reader, observedAt: 1000 });
+  assert(reads === 0, "an overwrite-only alert spends no D1 read on the lock");
+
+  await recordVerseMergeConflicts(env, BOOK, "ust", "UST", [
+    {
+      chapter: 1, verse: 8, action: "keep_alignment_refused", reason: "alignment_shrink",
+      overwrittenVersion: null, alignment: null, observedVersion: null,
+    },
+  ], 1000);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", { bookLocked: reader, observedAt: 2000 });
+  assert(reads === 1, "a kept row makes the alert read the lock once");
+  const admin = live(ADMIN)[0];
+  assert(!/tonight's export/.test(admin?.message ?? ""), "locked, kept row only: no claim that tonight's export writes");
+  assert(admin?.condition_key.includes(`"keptBookLocked":true`), "locked, kept row only: the key carries the lock");
+  assert(!admin?.condition_key.includes("noBaseBookLocked"), "no no-base verse: the no-base lock flag stays out of the key");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
