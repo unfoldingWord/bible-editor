@@ -758,6 +758,46 @@ console.log("\n[a dismissed editor alert with the other lock wording is correcte
   );
 }
 
+console.log("\n[a failed lock read does not bring back dismissed locked alerts (#1129 review B1)]");
+{
+  // The book is locked; the admin's and editor's no-base alerts carry the
+  // locked wording and were dismissed. A refresh whose lock read throws falls
+  // back to the unlocked wording, but must not resurface a dismissed alert on
+  // a lock it could not read.
+  const { sqlite, env } = freshApp();
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES (?, 1, 900)`).run(BOOK);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    bookLocked: true,
+    observedAt: 1000,
+  });
+  sqlite.prepare(`UPDATE system_alerts SET dismissed_at = 5000 WHERE source = ? AND resolved_at IS NULL`).run(SOURCE);
+  const snapshot = () =>
+    sqlite.prepare(`SELECT id, username, condition_key, dismissed_at, resolved_at FROM system_alerts WHERE source = ? ORDER BY id`).all(SOURCE);
+  const before = JSON.stringify(snapshot());
+  assert(JSON.parse(before).length === 2, "setup: an admin and an editor alert stand, both dismissed");
+  const failingLockEnv = {
+    ...env,
+    DB: {
+      ...env.DB,
+      prepare: (sql) => {
+        if (/FROM book_locks/.test(sql)) throw new Error("simulated book_locks read failure");
+        return env.DB.prepare(sql);
+      },
+    },
+  };
+  const realError = console.error;
+  console.error = () => {};
+  try {
+    await refreshVerseMergeAlertsAfterLockChange(failingLockEnv, BOOK);
+  } finally {
+    console.error = realError;
+  }
+  assert(JSON.stringify(snapshot()) === before, `nothing resurfaces and no row is minted (got ${JSON.stringify(snapshot())})`);
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
