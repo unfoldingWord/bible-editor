@@ -843,11 +843,12 @@ export async function raiseVerseMergeConflictAlert(
   const reasonCounts = new Map<string, number>();
   for (const r of rows) reasonCounts.set(r.reason, (reasonCounts.get(r.reason) ?? 0) + 1);
   const reasonBreakdown = [...reasonCounts.entries()].map(([reason, n]) => `${n} ${reason}`).join(", ") || "none";
-  // Per-outcome guidance, classified by ACTION (never by the nullable
-  // overwritten_version pointer) — see buildMergeConflictGuidance. Pulled into
-  // that pure helper so the three-way overwritten / kept-alignment /
-  // kept-source-attr split is unit-testable without an Env, and so a refusal or
-  // a source-attr divergence can never be miscounted as an overwrite.
+  // Per-outcome guidance, classified by ACTION — refined, for 'adopt_conflict'
+  // only, by whether overwritten_version is null (issue #981: the #539 no-op
+  // guard keeps a pointer-less adopt_conflict row around, and that is not an
+  // overwrite) — see buildMergeConflictGuidance. Pulled into that pure helper
+  // so the split is unit-testable without an Env, and so a refusal or a
+  // source-attr divergence can never be miscounted as an overwrite.
   const guidance = buildMergeConflictGuidance(rows, {
     recordingFailed: opts.recordingFailed,
     noBaseCount: opts.noBaseCount,

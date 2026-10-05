@@ -384,11 +384,41 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
 }
 
 export function buildMergeConflictGuidance(
-  rows: Array<{ action: string; reason?: string }>,
+  rows: Array<{ action: string; reason?: string; overwrittenVersion: number | null; chapter?: number; verse?: number }>,
   opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
 ): string {
-  const overwrittenRows = rows.filter((r) => r.action === "adopt_conflict");
+  // #539's no-op guard (bookReimport.ts ~7609-7674) keeps a CONFLICTED adopt
+  // whose bytes turned out to already match D1 as an `adopt_conflict` row
+  // with `overwrittenVersion` cleared to null, so the review banner still
+  // lists it — but nothing was actually overwritten, and a pointer-less row
+  // has no `@v` in its ref (buildGroupedRefsClause). `overwrittenVersion` is
+  // required (not optional) precisely so every caller must say which case a
+  // row is, rather than one being silently assumed.
+  // Loose `!= null` / `== null` (not `!==` / `===`) matches buildGroupedRefsClause's
+  // own `!= null` check and the editor fan-out's `.filter` above — an untyped
+  // .mjs caller that omits the field entirely gets the same "no @v" treatment
+  // a row explicitly carrying `null` gets, rather than silently reading as an
+  // overwrite it cannot point a `@v` at.
+  const adoptConflictRows = rows.filter((r) => r.action === "adopt_conflict");
+  const overwrittenRows = adoptConflictRows.filter((r) => r.overwrittenVersion != null);
+  const noOverwriteRows = adoptConflictRows.filter((r) => r.overwrittenVersion == null);
   const overwritten = overwrittenRows.length;
+  const noOverwrite = noOverwriteRows.length;
+  // (2026-10-02 sweep, round 3): `buildGroupedRefsClause`'s shared ref list
+  // also renders 'keep_alignment_refused' / 'source_attr_divergent' /
+  // 'keep_local_structure' rows with no `@v` (they too store
+  // `overwritten_version` NULL — verseMergeConflictSql.ts's
+  // SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL), so "the ref above with no @v"
+  // does not uniquely pick out a pointer-less adopt_conflict row when the
+  // banner also lists one of those. Name this clause's OWN refs inline
+  // instead, independent of that shared list's cap, so a pointer-less ref
+  // that falls into the shared list's "+N more" is still identified here.
+  const noOverwriteRefStrs = noOverwriteRows
+    .filter((r): r is typeof r & { chapter: number; verse: number } => r.chapter != null && r.verse != null)
+    .map((r) => `${r.chapter}:${r.verse}`);
+  const noOverwriteListed = noOverwriteRefStrs.slice(0, MERGE_CONFLICT_REFS_DISPLAY);
+  const noOverwriteMore = noOverwrite > noOverwriteListed.length ? `, +${noOverwrite - noOverwriteListed.length} more` : "";
+  const noOverwriteRefsClause = noOverwriteListed.length > 0 ? ` (${noOverwriteListed.join(", ")}${noOverwriteMore})` : "";
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
   const keptSourceAttr = rows.filter((r) => r.action === "source_attr_divergent").length;
   // Issue #728: the app's verse-bridge STRUCTURE was kept where Door43's
@@ -417,6 +447,24 @@ export function buildMergeConflictGuidance(
   return [
     overwritten > 0
       ? `${overwritten} took Door43's version over the editor's — ${overwriteAxes} ${overwriteRecovery}`
+      : "",
+    // The #539 no-op guard only keeps a pointer-less row when master's
+    // ARRIVING bytes differed from D1 by more than Hebrew mark order (#977
+    // already drops the mark-order-only case before this point) — so the
+    // final bytes matching D1 is never "Door43 already matched D1"; it is
+    // canonizeAlignmentSource (canonizeHebrew.ts) mapping master's \zaln-s
+    // content/lemma onto D1's bytes. That mapping also matches through looser
+    // tiers (stripped marks, word-joiner fold), so master's incoming copy
+    // could be the WORSE one (under-pointed, cantillation-stripped, an older
+    // UHB alignment) — unlike 'source_attr_divergent' below, this is never
+    // framed as "Door43's fix" or D1's bytes as "stale"; only that the two
+    // copies differ on \zaln-s content/lemma and a human has to say which
+    // side is right.
+    noOverwrite > 0
+      ? `${noOverwrite} ${noOverwrite === 1 ? "was" : "were"} flagged for review but no app text was replaced` +
+        `${noOverwriteRefsClause} — Door43's copy differs from the app's only in the original-language source ` +
+        `attributes on \\zaln-s (x-content / x-lemma); check which side is right before the next export, ` +
+        `because the export will write the app's attributes over Door43's.`
       : "",
     keptAlignment > 0
       ? `${keptAlignment} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +

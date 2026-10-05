@@ -4,7 +4,9 @@
 // Save — drafts are deliberately separate from the write-ahead queue so the
 // only thing that produces a PATCH is an explicit user action.
 //
-// Persistence is IndexedDB so a tab close or crash doesn't lose typing.
+// Persistence is IndexedDB so a tab close or crash doesn't lose typing. The
+// writes are coalesced (see DRAFT_WRITE_INTERVAL_MS), so a crash can lose the
+// last couple of seconds; a normal close or hide flushes first.
 // This is not autosave; nothing leaves the browser until the user saves.
 
 import { openDB, type IDBPDatabase } from "idb";
@@ -12,13 +14,28 @@ import { isReadOnly, type RowKind } from "./api";
 import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "./outbox";
 import {
   pinReleaseForVerseExit,
+  NO_ROW_DRAFT,
+  rowDraftClearAfterOk,
+  rowDraftMarksReleasable,
   verseOpExitInfo,
   type VerseOpExit,
   type VerseOpExitInfo,
 } from "./draftSaveState";
-import { peekPinnedVerseBase, unpinVerseBase } from "./versePin";
-import { createDraftSnapshot } from "./draftSnapshot";
-export { pinVerseBase, peekPinnedVerseBase } from "./versePin";
+import {
+  holdVerseBase,
+  peekPinnedVerseBase,
+  pinEpoch,
+  unpinVerseBaseUnlessHeld,
+  unpinVerseBaseIfIdleWith,
+  advanceHeldVerseBase,
+  type PinnedVerseBase,
+  type VerseBaseHold,
+} from "./versePin";
+import { takeOwnVerseOp } from "./ownVerseOps";
+import { createDraftSnapshot, dedupeByKeys } from "./draftSnapshot";
+import { createDraftWriteCoalescer } from "./draftWriteCoalescer";
+import { createDraftDbConnection } from "./draftDb";
+export { pinVerseBase, peekPinnedVerseBase, pinEpoch, type VerseBaseHold } from "./versePin";
 
 const DB_NAME = "bible-editor-drafts";
 const DB_VERSION = 1;
@@ -67,19 +84,20 @@ export type DraftMeta =
 
 type Subscriber = (drafts: DraftRecord[]) => void;
 
-let dbp: Promise<IDBPDatabase> | null = null;
-function db() {
-  if (!dbp) {
-    dbp = openDB(DB_NAME, DB_VERSION, {
-      upgrade(d) {
-        if (!d.objectStoreNames.contains(STORE)) {
-          d.createObjectStore(STORE, { keyPath: "key" });
-        }
-      },
-    });
-  }
-  return dbp;
-}
+// Cached, but reopened if the browser closes the connection (#1102). With the
+// handle open, run() issues its op synchronously, so a flush inside
+// pagehide/beforeunload has its put queued in time (#901 review A1).
+const conn = createDraftDbConnection<IDBPDatabase>(({ terminated, blocking }) =>
+  openDB(DB_NAME, DB_VERSION, {
+    upgrade(d) {
+      if (!d.objectStoreNames.contains(STORE)) {
+        d.createObjectStore(STORE, { keyPath: "key" });
+      }
+    },
+    terminated,
+    blocking,
+  }));
+const withDb = conn.run;
 
 // Synchronous mirror of "a draft was written this session and not yet cleared".
 // The subscription-driven signal (useUnsavedGuard's hasDrafts) only updates
@@ -99,9 +117,23 @@ const pendingKeys = new Set<string>();
 // so checking pendingKeys at the actual unpin moment closes the race the
 // snapshot leaves open. Mirrors the latestGenerationByKey guard inside
 // clearGeneration, which protects the clear path from the same class of race.
-export function unpinVerseBaseIfIdle(key: string): void {
-  if (pendingKeys.has(key)) return;
-  unpinVerseBase(key);
+//
+// A draftless editor's hold (#1060, versePin.ts) counts as a live session too:
+// the unpin is deferred to the hold, which releases the pin when its editor
+// goes clean.
+//
+// `epoch` (pinEpoch, read when the caller's exit happened, before its await)
+// keeps a late release off a pin that was replaced, or handed to a later
+// queued save, in the meantime (#1060).
+export function unpinVerseBaseIfIdle(key: string, epoch?: number): void {
+  unpinVerseBaseIfIdleWith(key, pendingKeys.has(key), epoch);
+}
+
+// Pin `key`'s base for a draftless editor (the dual aligner's reading line)
+// from its first dirty keystroke until it goes clean (#1060). A release never
+// pulls the pin from a draft session that shares it.
+export function holdVerseBaseForEditor(key: string, base: PinnedVerseBase): VerseBaseHold {
+  return holdVerseBase(key, base, (k) => !pendingKeys.has(k));
 }
 const latestGenerationByKey = new Map<string, string>();
 let generationSeq = 0;
@@ -116,20 +148,20 @@ export function hasUnsavedDrafts(): boolean {
 }
 
 async function listAll(): Promise<DraftRecord[]> {
-  const all = (await (await db()).getAll(STORE)) as DraftRecord[];
+  const all = (await withDb((d) => d.getAll(STORE))) as DraftRecord[];
   all.sort((a, b) => a.updatedAt - b.updatedAt);
   return all;
 }
 
-const snapshot = createDraftSnapshot<DraftRecord>(listAll, async (key) =>
-  (await db()).get(STORE, key));
+const snapshot = createDraftSnapshot<DraftRecord>(listAll, (key) =>
+  withDb((d) => d.get(STORE, key)));
 const draftChannel = typeof BroadcastChannel !== "undefined"
   ? new BroadcastChannel("be-draft-changes") : null;
 draftChannel?.addEventListener("message", (event: MessageEvent) => {
-  if (typeof event.data === "string") refreshSnapshot(event.data);
+  if (typeof event.data === "string") refreshSnapshot(event.data, "remote");
 });
-function refreshSnapshot(key: string) {
-  void snapshot.refresh(key).catch((error) => {
+function refreshSnapshot(key: string, origin: "local" | "remote" = "local") {
+  void snapshot.refresh(key, origin).catch((error) => {
     // A notification failure must never turn a persisted dirty draft into an
     // apparent absence. Keep the last known state; the next commit can retry.
     console.warn("Unable to refresh draft notification", error);
@@ -138,6 +170,46 @@ function refreshSnapshot(key: string) {
 function notify(key: string) {
   refreshSnapshot(key);
   try { draftChannel?.postMessage(key); } catch { /* best-effort */ }
+}
+
+// #901 step 2 (Benjamin's option B): the backup is written at most once per
+// DRAFT_WRITE_INTERVAL_MS per draft while typing continues, instead of on
+// every keystroke. The first keystroke of a burst still writes at once.
+// 2 s keeps 20 keystrokes at an ordinary 5 per second to 3 writes (one at the
+// first key, then one per interval), not only a fast burst; Benjamin allowed
+// up to 5 s. The cost is crash-only: a frozen browser or power cut can lose up
+// to the last 2 s of typing. A tab switch, hide, leave prompt or close flushes
+// at once (listeners below), and so does every path that reads the record or
+// records its generation for a save (get, rowSaveGeneration, clearGeneration,
+// the row-ok clear, list, subscribeKey mount/unmount). A flush also closes the
+// window, so the first keystroke after a save writes at once. The in-memory marks
+// (pendingKeys, latestGenerationByKey) still change synchronously on every
+// keystroke, so the unload guard and a save's generation are always current.
+const DRAFT_WRITE_INTERVAL_MS = 2000;
+
+// The cross-tab notify rides along with each write, so it is coalesced too.
+function persistDraft(key: string, rec: DraftRecord): Promise<void> {
+  // beginMutation runs synchronously (before the first await), so a
+  // subscribeKey that mounts while the write is in flight waits for it.
+  const release = snapshot.beginMutation(key);
+  // Once the database is open the put is ISSUED here, synchronously (idb
+  // creates the transaction and request before its first await), so a flush
+  // from pagehide/beforeunload has its request queued before the handler
+  // returns (#901 review A1). Only a write before the first open, or the
+  // retry after a closed connection (#1102), awaits the open.
+  const put = withDb((d) => d.put(STORE, rec));
+  return put.then(() => { notify(key); }).finally(release);
+}
+const writes = createDraftWriteCoalescer<DraftRecord>(persistDraft, DRAFT_WRITE_INTERVAL_MS);
+
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  // beforeunload too: while the leave-page prompt shows, the newest typing is
+  // already on disk rather than only in memory.
+  window.addEventListener("beforeunload", () => { void writes.flushAll(); });
+  window.addEventListener("pagehide", () => { void writes.flushAll(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") void writes.flushAll();
+  });
 }
 
 export function verseKey(
@@ -157,13 +229,31 @@ export function rowKey(rowKind: RowKind, book: string, id: string): string {
   return `row:${rowKind}:${book}:${id}`;
 }
 
+// For subscribers that only need to know which drafts exist, not their live
+// content — SyncStatusBar, not UnsavedToasts (it also needs each draft's
+// current generation; see dedupeByKeys's comment).
+export const subscribeDirtyDrafts = dedupeByKeys<DraftRecord>(
+  (fn) => snapshot.subscribe(fn),
+);
+
 export const drafts = {
   subscribe(fn: Subscriber): () => void {
     return snapshot.subscribe(fn);
   },
 
-  subscribeKey(key: string, fn: (draft: DraftRecord | undefined) => void): () => void {
-    return snapshot.subscribeKey(key, fn);
+  // `remote` is true when the change came only from another tab (#806).
+  subscribeKey(
+    key: string,
+    fn: (draft: DraftRecord | undefined, remote: boolean) => void,
+  ): () => void {
+    // Flush on mount and unmount (#901): a remounting editor hydrates from the
+    // latest typing, not from the last coalesced write.
+    void writes.flush(key);
+    const unsubscribe = snapshot.subscribeKey(key, fn);
+    return () => {
+      unsubscribe();
+      void writes.flush(key);
+    };
   },
 
   async set(
@@ -186,16 +276,14 @@ export const drafts = {
       generation,
       meta,
     };
-    const release = snapshot.beginMutation(key);
-    try {
-      await (await db()).put(STORE, rec);
-      notify(key);
-    } finally { release(); }
+    // Coalesced (#901): written now for the first keystroke of a burst, else
+    // as the trailing write of the current interval.
+    writes.write(key, rec);
   },
 
   async get(key: string): Promise<DraftRecord | undefined> {
-    const idb = await db();
-    const rec = (await idb.get(STORE, key)) as DraftRecord | undefined;
+    await writes.flush(key);
+    const rec = (await withDb((d) => d.get(STORE, key))) as DraftRecord | undefined;
     if (rec) return rec;
     // One-time tolerance for the pre-book row key format ("row:{kind}:{id}").
     // On a miss, check whether a legacy record exists whose meta says it
@@ -206,27 +294,29 @@ export const drafts = {
     if (!m) return undefined;
     const [, rowKind, book, id] = m;
     const legacyKey = `row:${rowKind}:${id}`;
-    const legacy = (await idb.get(STORE, legacyKey)) as DraftRecord | undefined;
+    const legacy = (await withDb((d) => d.get(STORE, legacyKey))) as DraftRecord | undefined;
     if (!legacy || legacy.meta.kind !== "row" || legacy.meta.book !== book) {
       return undefined;
     }
     const migrated: DraftRecord = { ...legacy, key };
     pendingKeys.delete(legacyKey);
     pendingKeys.add(key);
-    await idb.put(STORE, migrated);
-    await idb.delete(STORE, legacyKey);
+    await withDb((d) => d.put(STORE, migrated));
+    await withDb((d) => d.delete(STORE, legacyKey));
     notify(legacyKey);
     notify(key);
     return migrated;
   },
 
   async clear(key: string): Promise<void> {
+    // A queued backup must never land after the clear and resurrect it.
+    writes.cancel(key);
     pendingKeys.delete(key);
     latestGenerationByKey.delete(key);
-    unpinVerseBase(key);
+    unpinVerseBaseUnlessHeld(key);
     const release = snapshot.beginMutation(key);
     try {
-      await (await db()).delete(STORE, key);
+      await withDb((d) => d.delete(STORE, key));
       notify(key);
     } finally { release(); }
   },
@@ -235,27 +325,45 @@ export const drafts = {
   // The read + conditional delete share one transaction so another committed
   // write cannot slip between them. latestGenerationByKey also covers a newer
   // set() that has started synchronously but has not committed to IndexedDB yet.
-  async clearGeneration(key: string, generation: string): Promise<boolean> {
-    const idb = await db();
-    const tx = idb.transaction(STORE, "readwrite");
-    const rec = (await tx.store.get(key)) as DraftRecord | undefined;
-    const currentGeneration = rec?.generation ?? (rec ? `legacy:${rec.updatedAt}` : undefined);
-    if (!rec || currentGeneration !== generation) {
+  // `epoch`: see unpinVerseBaseIfIdle.
+  async clearGeneration(key: string, generation: string, epoch?: number): Promise<boolean> {
+    // Compare against the latest typing, not the last coalesced write.
+    await writes.flush(key);
+    // The read + delete is safe to rerun whole after a closed connection.
+    const removed = await withDb(async (idb) => {
+      const tx = idb.transaction(STORE, "readwrite");
+      const rec = (await tx.store.get(key)) as DraftRecord | undefined;
+      const currentGeneration = rec?.generation ?? (rec ? `legacy:${rec.updatedAt}` : undefined);
+      if (!rec || currentGeneration !== generation) {
+        await tx.done;
+        return false;
+      }
+      await tx.store.delete(key);
       await tx.done;
-      return false;
-    }
-    await tx.store.delete(key);
-    await tx.done;
+      return true;
+    });
+    if (!removed) return false;
     if (latestGenerationByKey.get(key) === generation) {
       latestGenerationByKey.delete(key);
       pendingKeys.delete(key);
-      unpinVerseBase(key);
+      unpinVerseBaseUnlessHeld(key, epoch);
     }
     notify(key);
     return true;
   },
 
+  // What a row save records as the draft it carries (#1092): the generation
+  // of the latest set() for `key` this session, or NO_ROW_DRAFT when there is
+  // none, so its 200 clears only that draft (see rowDraftClearAfterOk).
+  // Also starts the queued write now (#901), so the stored record carries this
+  // generation by the time the save's 200 compares against it.
+  rowSaveGeneration(key: string): string {
+    void writes.flush(key);
+    return latestGenerationByKey.get(key) ?? NO_ROW_DRAFT;
+  },
+
   async list(): Promise<DraftRecord[]> {
+    await writes.flushAll();
     return listAll();
   },
 };
@@ -299,23 +407,39 @@ export function draftDirtyBorderSx() {
 // one confirmed cleared: any newer local keystroke replaces
 // latestGenerationByKey synchronously, so a match proves no live edit session
 // depends on the pin (#474 guard preserved).
-function releaseLocalBookkeeping(key: string, generation: string): void {
+function releaseLocalBookkeeping(key: string, generation: string, epoch?: number): void {
   if (latestGenerationByKey.get(key) !== generation) return;
   latestGenerationByKey.delete(key);
   pendingKeys.delete(key);
-  unpinVerseBase(key);
+  unpinVerseBaseUnlessHeld(key, epoch);
 }
 
 function applyVerseExit(key: string, info: VerseOpExitInfo): void {
+  // #1060: only the tab that QUEUED this op claims it (another tab's save, or
+  // another editor's, must keep a live hold's old base so its save 409s).
+  // Synchronous, before the async release below, so the line's next save
+  // already goes out against the landed row.
+  // A landed row that can't be used leaves the claim alone; any terminal exit
+  // otherwise ends it.
+  const canAdvance = info.exit === "ok" && info.landed !== undefined && info.expectedVersion !== undefined;
+  if (canAdvance && takeOwnVerseOp(info.opId)) {
+    advanceHeldVerseBase(key, info.expectedVersion!, info.landed!);
+  } else if (info.exit !== "ok") {
+    takeOwnVerseOp(info.opId);
+  }
+  // The pin as of this exit. Everything below runs after an await; if a save
+  // queued meanwhile has taken the pin over (handOff), or it was replaced, the
+  // late release leaves it to that save's own exit.
+  const epoch = pinEpoch(key);
   void drafts.get(key).then((draft) => {
     const release = pinReleaseForVerseExit(draft, info);
     if (release.kind === "clear") {
-      void drafts.clearGeneration(key, release.generation).then((cleared) => {
+      void drafts.clearGeneration(key, release.generation, epoch).then((cleared) => {
         // The draining tab can win the race and delete the record between our
         // get() above and this clear — clearGeneration then returns false
         // without touching this tab's bookkeeping, leaving the pin and the
         // beforeunload dirty flag leaked for a save that has in fact landed.
-        if (!cleared) releaseLocalBookkeeping(key, release.generation);
+        if (!cleared) releaseLocalBookkeeping(key, release.generation, epoch);
       });
     } else if (release.kind === "unpin") {
       // The shared draft record can already be gone — cleared by the draining
@@ -325,9 +449,9 @@ function applyVerseExit(key: string, info: VerseOpExitInfo): void {
       // mismatch (or a draftless/legacy op with no generation) falls through
       // to the idle-guarded unpin and a live edit session keeps its pin.
       if (info.exit === "ok" && info.draftGeneration !== undefined) {
-        releaseLocalBookkeeping(key, info.draftGeneration);
+        releaseLocalBookkeeping(key, info.draftGeneration, epoch);
       }
-      unpinVerseBaseIfIdle(key);
+      unpinVerseBaseIfIdle(key, epoch);
     }
   });
 }
@@ -345,7 +469,7 @@ verseExitChannel?.addEventListener("message", (e: MessageEvent) => {
   applyVerseExit(data.key, info);
 });
 
-function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
+function handleVerseExit(op: OutboxOp, exit: VerseOpExit, updated?: unknown): void {
   if (op.target.kind !== "verse") return;
   const key = verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion);
   let info: VerseOpExitInfo;
@@ -356,8 +480,20 @@ function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
     // so malformed content can't abort the drain pass's listener loop.
     info = verseOpExitInfo(op, exit);
   } catch {
-    return; // same non-release the pre-#565 code gave this op
+    // Unparseable queued content: still run the exit's release, just without
+    // the legacy text-provenance hint (a draft then stays, conservatively).
+    info = { exit };
   }
+  // #1060: the landed row (the 200 body), for the queuing tab's hold.
+  const row = updated as { version?: unknown; content?: unknown } | null | undefined;
+  info = {
+    ...info,
+    opId: op.id,
+    expectedVersion: op.expectedVersion,
+    ...(exit === "ok" && typeof row?.version === "number" && row.content !== undefined
+      ? { landed: { version: row.version, content: row.content } }
+      : {}),
+  };
   applyVerseExit(key, info);
   // BroadcastChannel never delivers to its own poster — the applyVerseExit
   // above is this tab's copy. Announcement is best-effort: the local release
@@ -370,14 +506,56 @@ function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
   }
 }
 
+// The row half of the outbox-ok listener (#1092). One readwrite transaction
+// reads the draft and deletes it only when rowDraftClearAfterOk allows, so a
+// set() that started after the 200 (a newer generation) is never deleted. The
+// in-memory dirty marks are dropped only while no newer set() has started.
+async function clearRowDraftAfterOk(key: string, op: OutboxOp, latestAt200: string | undefined): Promise<void> {
+  await writes.flush(key);
+  // Inside withDb so a closed connection reopens and reruns the whole
+  // read + delete (#1102); the in-memory marks below run once, after it.
+  const { remove, rec, checked } = await withDb(async (idb) => {
+    const tx = idb.transaction(STORE, "readwrite");
+    const rec = (await tx.store.get(key)) as DraftRecord | undefined;
+    const checked = latestGenerationByKey.get(key);
+    const remove = rowDraftClearAfterOk(op, latestAt200, checked, rec);
+    if (remove) await tx.store.delete(key);
+    await tx.done;
+    return { remove, rec, checked };
+  });
+  if (!remove) return;
+  // Releasing a superseded tab's older marks (#1100) cannot strand typing
+  // still open in that tab: its mounted NoteCard re-runs set() when the 200
+  // moves row.version and its text differs from the saved row. Measured in
+  // s21 "keeps its own open unsaved typing backed up": that set() ran before
+  // this handler, so the read saw the newer generation and kept the record.
+  if (rowDraftMarksReleasable(latestGenerationByKey.get(key), checked, rec?.generation)) {
+    latestGenerationByKey.delete(key);
+    pendingKeys.delete(key);
+  }
+  notify(key);
+}
+
 onOutboxResult((op, result) => {
   if (op.target.kind === "verse") {
-    if (result.kind === "ok" || result.kind === "locked") handleVerseExit(op, result.kind);
+    if (result.kind === "ok") handleVerseExit(op, "ok", result.updated);
+    else if (result.kind === "locked") handleVerseExit(op, "locked");
     return;
   }
   if (result.kind !== "ok") return;
   if (op.target.kind === "row") {
-    void drafts.clear(rowKey(op.target.rowKind, op.target.book, op.target.id));
+    // #1092: only an op that saved the draft's fields clears it — a move or
+    // reorder must leave unsaved typing in the store (see rowOpClearsDraft).
+    // The op carries the draft generation it saved, or NO_ROW_DRAFT, captured
+    // at enqueue. NoteCard re-sets a still-dirty draft when the row version
+    // bumps, and that runs BEFORE this listener, so a generation read here
+    // could already be the newer typing; only legacy ops (no field) fall back
+    // to it.
+    const key = rowKey(op.target.rowKind, op.target.book, op.target.id);
+    void clearRowDraftAfterOk(key, op, latestGenerationByKey.get(key)).catch((error) => {
+      // Fail safe: a failed read or delete leaves the draft in place.
+      console.warn("Unable to clear a saved row draft", error);
+    });
   }
 });
 
