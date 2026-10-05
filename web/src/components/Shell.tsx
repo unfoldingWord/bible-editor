@@ -98,7 +98,7 @@ import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
 import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
 import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
-import { markOwnRowDelete } from "../sync/pendingRowDeletes";
+import { markOwnRowDelete, recordOwnRowDeleteOp } from "../sync/pendingRowDeletes";
 import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
 import {
   alignmentDraftKey,
@@ -4823,7 +4823,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             applyLocalRowDelete("twl", id);
             if (activeWordId === id) setActiveWordId(null);
             markOwnRowDelete("twl", row.book, id); // a refetch keeps it hidden (#1107)
-            void outbox.enqueueDeleteRow("twl", id, row.version, row.book);
+            void outbox.enqueueDeleteRow("twl", id, row.version, row.book).then(recordOwnRowDeleteOp);
           }}
           onQuestionSave={(id, patch, opts) => {
             const row = data.tq.find((r) => r.id === id);
@@ -4835,7 +4835,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             applyLocalRowDelete("tq", id);
             if (activeQuestionId === id) setActiveQuestionId(null);
             markOwnRowDelete("tq", row.book, id); // a refetch keeps it hidden (#1107)
-            void outbox.enqueueDeleteRow("tq", id, row.version, row.book);
+            void outbox.enqueueDeleteRow("tq", id, row.version, row.book).then(recordOwnRowDeleteOp);
           }}
           lockedTn={Boolean(chapterLocks.tn)}
           lockedTq={Boolean(chapterLocks.tq)}

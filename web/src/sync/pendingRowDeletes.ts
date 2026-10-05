@@ -51,23 +51,44 @@ export function hidePendingRowDeletes<P extends Pick<ChapterPayload, "book" | "t
 }
 
 // This tab's own row deletes, by target. Shell marks one when the user deletes
-// a row, before the DELETE is queued. A mark is cleared when its DELETE is
-// refused or discarded, in any tab (#1119): the row is back, and a later
-// delete of it from another tab is not this tab's. A committed delete keeps
-// its mark (the row is gone for good, and a load still running may need it).
+// a row, before the DELETE is queued, then records the queued op's id
+// (recordOwnRowDeleteOp). An outcome is this tab's only when its op id is one
+// this tab queued; another tab's DELETE of the same row is not (#1119 review).
+// A mark is cleared when the last of this tab's DELETEs of the row is refused
+// or discarded, in any tab: the row is back, and a later delete of it from
+// another tab is not this tab's. Another tab's refusal, or an older op's late
+// one, leaves it. A committed delete keeps its mark (the row is gone for good,
+// and a load still running may need it).
 type MarkTarget = Pick<RowTarget, "rowKind" | "book" | "id">;
-const ownRowDeletes = new Map<string, { seq: number; target: MarkTarget }>();
+const ownRowDeletes = new Map<string, { seq: number; target: MarkTarget; ops: Set<string> }>();
 let markSeq = 0;
 const ownKey = (t: MarkTarget) => `${t.rowKind}:${t.book}:${t.id}`;
 export function markOwnRowDelete(rowKind: RowTarget["rowKind"], book: string, id: string): void {
   const target = { rowKind, book, id };
-  ownRowDeletes.set(ownKey(target), { seq: ++markSeq, target });
+  const ops = ownRowDeletes.get(ownKey(target))?.ops ?? new Set<string>();
+  ownRowDeletes.set(ownKey(target), { seq: ++markSeq, target, ops });
+}
+export function recordOwnRowDeleteOp(op: Pick<OpLike, "id" | "target">): void {
+  if (op.target.kind !== "row") return;
+  ownRowDeletes.get(ownKey(op.target))?.ops.add(op.id);
 }
 export function clearOwnRowDelete(t: MarkTarget): void {
   ownRowDeletes.delete(ownKey(t));
 }
 export function isOwnRowDelete(t: MarkTarget): boolean {
   return ownRowDeletes.has(ownKey(t));
+}
+export function isOwnRowDeleteOp(op: Pick<OpLike, "id" | "target">): boolean {
+  return op.target.kind === "row" && Boolean(ownRowDeletes.get(ownKey(op.target))?.ops.has(op.id));
+}
+// This tab's op left the outbox without a 200: drop it, and the mark with the
+// row's last one.
+export function forgetOwnRowDeleteOp(op: Pick<OpLike, "id" | "target">): void {
+  if (op.target.kind !== "row") return;
+  const key = ownKey(op.target);
+  const m = ownRowDeletes.get(key);
+  if (!m?.ops.delete(op.id)) return;
+  if (m.ops.size === 0) ownRowDeletes.delete(key);
 }
 // The rows marked from now on and still marked when the returned function is
 // called: deletes clicked while a load runs.
@@ -114,7 +135,7 @@ export interface RowDeleteOutcome {
   op: OpLike;
   /** Observed by another tab and relayed here. */
   remote: boolean;
-  /** This tab marked the row deleted (judged before an abandon clears it). */
+  /** This tab queued this op (judged before an abandon clears its mark). */
   own: boolean;
 }
 export interface RowDeleteOutcomes {
@@ -135,13 +156,12 @@ export function createRowDeleteOutcomes(deps: {
   onResult(fn: (op: OpLike, result: { kind: string }) => void): unknown;
   onDiscard(fn: (op: OpLike) => void): unknown;
   channel: OutcomeChannel | null;
-  isOwn(t: MarkTarget): boolean;
-  clearOwn(t: MarkTarget): void;
+  isOwn(op: OpLike): boolean;
+  clearOwn(op: OpLike): void;
 }): RowDeleteOutcomes {
   const listeners = new Set<(o: RowDeleteOutcome) => void>();
   const dispatch = (kind: RowDeleteOutcomeKind, op: OpLike, remote: boolean) => {
-    const t = op.target as RowTarget;
-    const outcome = { kind, op, remote, own: deps.isOwn(t) };
+    const outcome = { kind, op, remote, own: deps.isOwn(op) };
     for (const l of [...listeners]) {
       try {
         l(outcome);
@@ -149,7 +169,7 @@ export function createRowDeleteOutcomes(deps: {
         console.warn("pendingRowDeletes: a row-delete outcome listener failed", e);
       }
     }
-    if (kind === "abandoned") deps.clearOwn(t);
+    if (kind === "abandoned") deps.clearOwn(op);
   };
   const local = (kind: RowDeleteOutcomeKind, op: OpLike) => {
     if (!isRowDelete(op)) return;
@@ -269,7 +289,9 @@ export function hidingPendingRowDeletes<P extends Pick<ChapterPayload, "book" | 
         // Clicked during the load and not in the after-read (its read began
         // before the op was written, or the op already left): hidden unless
         // abandoned, which clears the mark. One the read saw is judged above.
-        const seen = new Set(after.flatMap((op) => (op.target.kind === "row" ? [ownKey(op.target)] : [])));
+        // Only a DELETE counts: a queued PATCH of the row says nothing about
+        // whether its DELETE was seen.
+        const seen = new Set(after.flatMap((op) => (op.target.kind === "row" && op.action === "delete" ? [ownKey(op.target)] : [])));
         const unseen: OpLike[] = clicked()
           .filter((t) => !seen.has(ownKey(t)))
           .map((t) => ({ id: `mark:${ownKey(t)}`, target: { kind: "row", ...t }, action: "delete", status: "in_flight" }));

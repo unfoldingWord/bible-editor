@@ -6,7 +6,7 @@
 // listeners, so a tab relays what it drains even before anything subscribes.
 
 import { onOutboxDiscard, onOutboxResult } from "./outbox";
-import { clearOwnRowDelete, createRowDeleteOutcomes, isOwnRowDelete } from "./pendingRowDeletes";
+import { createRowDeleteOutcomes, forgetOwnRowDeleteOp, isOwnRowDeleteOp } from "./pendingRowDeletes";
 
 const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("be-row-delete-outcomes") : null;
 
@@ -14,6 +14,6 @@ export const rowDeleteOutcomes = createRowDeleteOutcomes({
   onResult: onOutboxResult,
   onDiscard: onOutboxDiscard,
   channel,
-  isOwn: isOwnRowDelete,
-  clearOwn: clearOwnRowDelete,
+  isOwn: isOwnRowDeleteOp,
+  clearOwn: forgetOwnRowDeleteOp,
 });
