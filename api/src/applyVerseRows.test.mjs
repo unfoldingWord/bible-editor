@@ -552,6 +552,31 @@ console.log("\n[keep_no_base collects an editor ref carrying the verse's CURRENT
     .all(BOOK, 7, 3)[0];
   eq(JSON.parse(row.content_json).verseObjects[0].text, "app's own text", "D1's content is untouched");
   eq(row.version, 5, "D1's version is untouched — nothing was written");
+  eq(counts.merge_no_base_book_locked, false, "unlocked book: the no-base alert is not told the book is locked");
+}
+
+console.log("\n[locked book: keep_no_base records the lock for the alert wording (issue #1006)]");
+{
+  // Same no-ancestor verse as above, on a LOCKED book. The export skips a
+  // locked book, so the alert built from these counts must not warn that
+  // tonight's export will overwrite anything; the counts carry that fact.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, NULL)`).run(BOOK);
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 900, 'translator9')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, 5, 9)`,
+    )
+    .run(BOOK, 7, 3, VERSION, contentJson("app's own text"), "app's own text");
+
+  const cutoff = { confirmedAt: Math.floor(Date.now() / 1000), editId: null };
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(7, 3, "master's differing text")], null, cutoff, false,
+  );
+
+  eq(counts.merge_no_base, 1, "locked book: still keep_no_base (no ancestor, ours != theirs)");
+  eq(counts.merge_no_base_book_locked, true, "locked book: the counts record the lock for the alert wording");
 }
 
 console.log("\n[#790: first edit after watermark recovers the exact confirmed-render ancestor]");

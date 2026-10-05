@@ -382,6 +382,65 @@ function assert(cond, msg) {
   assert(grouped.size === 0, "no username found -> no alert entry");
 }
 
+{
+  // Issue #1006 (ZEC UST 1:6, system_alerts 1305). A locked book is skipped by
+  // the export (exportWorkflow.ts, `book_locked:*`), so the translator's
+  // keep_no_base alert must not claim tonight's export will overwrite their
+  // text, and must not name re-saving as the remedy: a locked book's verses
+  // cannot be saved here, and nothing from it is exported anyway.
+  const noBase = [{ chapter: 1, verse: 6, version: 2 }];
+  const usernameByKey = new Map([
+    [editLogKey("ZEC", "ust", { chapter: 1, verse: 6, overwrittenVersion: 2 }), "deferredreward"],
+  ]);
+  const locked = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey, true).get("deferredreward");
+  assert(!!locked, "locked book: the editor is still told about the verse");
+  assert(!/tonight's export/i.test(locked.message), "locked book: no claim that tonight's export overwrites anything");
+  assert(!/re-?sav/i.test(locked.message), "locked book: re-saving is not named as the remedy");
+  assert(/locked/i.test(locked.message), "locked book: says the book is locked");
+  assert(/admin/i.test(locked.message), "locked book: names asking an admin as the remedy");
+  assert(locked.message.includes("Nothing has been overwritten"), "locked book: still denies an overwrite");
+  assert(alertMessageCarriesNoBaseWarning(locked.message), "locked book: keeps the no-base fingerprint");
+  assert(locked.message.includes("ZEC UST: 1:6"), "locked book: still names the verse");
+
+  // Unlocked wording is unchanged, byte for byte, whether the flag is omitted
+  // or passed false.
+  const unlockedText =
+    "Door43's sync could not tell whether your edit or a Door43-side edit is newer, for 1 verse(s) you last " +
+    "edited in ZEC UST: 1:6 — no earlier version was recoverable to compare against, so it kept your version " +
+    "for now. Nothing has been overwritten — but if Door43 has changed it since, tonight's export will still " +
+    "overwrite your text there unless you open and re-save the verse here first.";
+  const omitted = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey).get("deferredreward");
+  const explicit = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey, false).get("deferredreward");
+  assert(omitted.message === unlockedText, "unlocked (flag omitted): wording unchanged");
+  assert(explicit.message === unlockedText, "unlocked (flag false): wording unchanged");
+}
+
+{
+  // Issue #1006, admin side: buildNoBaseSentence / buildMergeConflictGuidance
+  // carry the same false "tonight's export" claim for a locked book.
+  const locked = buildMergeConflictGuidance([], { noBaseCount: 1, noBaseRefs: ["1:6"], noBaseBookLocked: true });
+  assert(!/tonight's export/i.test(locked), "locked book (admin): no claim that tonight's export overwrites anything");
+  assert(!/re-?sav/i.test(locked), "locked book (admin): re-saving is not named as the remedy");
+  assert(/locked/i.test(locked), "locked book (admin): says the book is locked");
+  assert(/admin/i.test(locked), "locked book (admin): says an admin reconciles it");
+  assert(locked.includes("Nothing was overwritten"), "locked book (admin): still denies an overwrite");
+  assert(locked.includes("Verses (sample): 1:6."), "locked book (admin): still names the verse");
+  assert(locked.includes(NO_BASE_ADMIN_FINGERPRINT), "locked book (admin): keeps the no-base fingerprint");
+  assert(buildNoBaseSentence(1, ["1:6"], true) === locked, "the guidance passes the lock through to buildNoBaseSentence");
+
+  const unlockedText =
+    "1 verse(s) could not be adjudicated: no ancestor was recoverable for them from before this book+resource's " +
+    "master-confirmed watermark, so the sync could not tell which side changed, and so it kept the app's " +
+    "version. Verses (sample): 1:6. Nothing was overwritten in these — but a Door43-side change to them will " +
+    "still be overwritten by tonight's export.";
+  assert(buildNoBaseSentence(1, ["1:6"]) === unlockedText, "unlocked (flag omitted): admin wording unchanged");
+  assert(buildNoBaseSentence(1, ["1:6"], false) === unlockedText, "unlocked (flag false): admin wording unchanged");
+  assert(
+    buildMergeConflictGuidance([], { noBaseCount: 1, noBaseRefs: ["1:6"], noBaseBookLocked: false }) === unlockedText,
+    "unlocked guidance: wording unchanged",
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Part 2: the ACTUAL production query (buildEditorLookupQuery, imported
 // above — not a hand-duplicated copy, so this can't silently drift from what
@@ -2490,6 +2549,46 @@ console.log("\n[a no-op adopt_conflict does not inherit an old audit row's point
   });
   const kept = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='MIC' AND chapter=5 AND verse=11`).get();
   assert(kept.overwritten_version === 3, "a real prior adopt_conflict keeps the pointer its human still needs");
+}
+
+// Issue #1006: the lock flag reaches BOTH stored messages through the real
+// raise path (admin banner + the translator's own keep_no_base alert).
+console.log("\n[locked book: keep_no_base alerts make no export claim (issue #1006)]");
+for (const bookLocked of [true, false]) {
+  const d = verseDb();
+  d.exec(`ALTER TABLE system_alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    ALTER TABLE system_alerts ADD COLUMN condition_key TEXT;
+    ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
+    ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
+    CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+      user_id INTEGER, new_version INTEGER);`);
+  d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
+  d.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, new_version) VALUES ('verse', 'ZEC/1/6/UST', 'ZEC', 7, 2)`,
+  ).run();
+  const make = (sql, args = []) => ({
+    bind: (...next) => make(sql, next),
+    all: async () => ({ results: d.prepare(sql).all(...args) }),
+    run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+  });
+  await raiseVerseMergeConflictAlert({ DB: { prepare: (sql) => make(sql) } }, "ZEC", "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    noBaseBookLocked: bookLocked,
+    observedAt: 100,
+  });
+  const msg = (u) =>
+    d.prepare(`SELECT message FROM system_alerts WHERE username=? AND source='verse_merge_conflict:ZEC:ust'`).get(u)
+      ?.message ?? "";
+  const label = bookLocked ? "locked" : "unlocked";
+  for (const [who, m] of [["admin", msg("deferredreward")], ["editor", msg("bethoakes")]]) {
+    assert(alertMessageCarriesNoBaseWarning(m), `${label} ${who}: alert raised with the no-base warning`);
+    assert(/tonight's export/i.test(m) === !bookLocked,
+      `${label} ${who}: the "tonight's export" warning appears only for an unlocked book`);
+    assert(/this book is locked/i.test(m) === bookLocked, `${label} ${who}: the lock is named only when locked`);
+  }
 }
 
 if (failed) {
