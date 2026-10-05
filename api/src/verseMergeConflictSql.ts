@@ -340,11 +340,16 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- never alerted anyone) promoted to adopt_conflict tonight takes tonight's
      -- pointer, snapshot and detected_at: the overwrite an editor must now look
      -- at is tonight's, and the alert goes to the author of the version the
-     -- pointer names. Taking them here, speculatively, is safe for an
+     -- pointer names. Taking them here, speculatively, is normally safe for an
      -- unresolved row: if tonight's CAS loses, DELETE_LOST_ADOPTION_CONFLICT_SQL
      -- deletes every unresolved adoption row this run touched, so tonight's
-     -- pointer cannot outlive a lost race. And it survives a crash between the
-     -- CAS and the confirm, which is why 6b writes before the CAS at all.
+     -- pointer does not outlive a lost race. And it survives a crash between
+     -- the CAS and the confirm, which is why 6b writes before the CAS at all.
+     -- Two exceptions, tracked in issue #1132: if the isolate dies before the
+     -- adoption write and the retry takes a non-adopting outcome, or the
+     -- best-effort delete throws, the promoted row keeps tonight's pointer for
+     -- an overwrite that never landed. Before #1124 it kept the old pointer in
+     -- the same situation; either way the alert is false.
      detected_at = CASE
        WHEN excluded.action = 'adopt_conflict'
          AND verse_merge_conflicts.action IN ('adopt', 'adopt_no_visible_change')
@@ -385,9 +390,15 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- the pointer above names. The stored row keeps its own snapshot exactly
      -- when it keeps its own (non-null) pointer, so a still-unresolved
      -- adopt_conflict keeps its first lost words beside its first pointer, and
-     -- a resolved row keeps June's beside June's (CONFIRM_ADOPTED_CONFLICT_SQL
-     -- swaps both on a landed overwrite; a lost race leaves both). When the
-     -- pointer is tonight's (or tonight's NULL), so is the snapshot, even NULL.
+     -- a resolved row with a pointer keeps June's beside June's
+     -- (CONFIRM_ADOPTED_CONFLICT_SQL swaps both on a landed overwrite; a lost
+     -- race leaves both). When the pointer is tonight's (or tonight's NULL), so
+     -- is the snapshot, even NULL. That includes a RESOLVED row whose stored
+     -- pointer is NULL (a resolved #978 no-op row, or one that came from a
+     -- keep-D1 flag): the COALESCE above gives it tonight's pointer, and the
+     -- lost-race delete skips it because it is resolved, so after a lost race
+     -- it claims an overwrite that never landed. It stays resolved, so no
+     -- alert is raised; the pointer half predates #1124. Tracked in #1132.
      -- The keep-D1 flags carry no pointer and keep the old COALESCE.
      alignment = CASE
        WHEN excluded.action NOT IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')

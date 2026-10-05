@@ -3041,9 +3041,12 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     assert(liveFor(sqlite, "jdoe").length === 0 && liveFor(sqlite, "bcameron93").length === 0, "lost promotion: no editor is alerted");
   }
 
-  // (i) A RESOLVED row whose re-overwrite loses its CAS keeps its June pointer
-  // AND its June snapshot: the speculative upsert does not swap either, so a
-  // lost race leaves the row exactly as the person who resolved it saw it.
+  // (i) A RESOLVED row WITH a stored pointer whose re-overwrite loses its CAS
+  // keeps its June pointer AND its June snapshot: the speculative upsert does
+  // not swap either, so a lost race leaves the row exactly as the person who
+  // resolved it saw it. (A resolved row whose stored pointer is NULL does take
+  // tonight's pointer and snapshot speculatively and keeps them after a lost
+  // race; that gap predates #1124 and is tracked in #1132.)
   {
     const { sqlite, env } = migratedEnv();
     await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 26, 4), alignment: snap("june") }], JUN10);
