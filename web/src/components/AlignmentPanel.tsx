@@ -49,11 +49,15 @@ import {
   groupsForCard as groupsForCardId,
   makeEnglishHover,
   makeHebrewHover,
-  resolveEnglishHighlight,
-  resolveHebrewHighlight,
   resolveSourcePos,
   type HoverCtx,
 } from "../lib/alignmentHover";
+import {
+  createHoverStore,
+  useEnglishHighlightTone,
+  useHebrewHighlightTone,
+  type HoverStore,
+} from "../lib/hoverStore";
 import type { TwlRow, VerseDto } from "../sync/api";
 import {
   alignmentDrafts,
@@ -88,11 +92,7 @@ import { SourceTooltipBody } from "./SourceTooltipBody";
 import { LexTooltip } from "./LexTooltip";
 import { UhbStrip, buildTwHintMap, twHintFromMap } from "./UhbStrip";
 import { directionForVersion } from "../lib/direction";
-import {
-  type HoverHighlight,
-  type HighlightCtx,
-  hoverShadow,
-} from "../lib/highlightTypes";
+import { type HighlightCtx, hoverShadow } from "../lib/highlightTypes";
 
 const WORD_IDS_MIME = "text/word-ids";
 const SOURCE_ID_MIME = "text/source-id";
@@ -188,13 +188,16 @@ interface Props {
   // doesn't wire the confirm).
   onConfirmUnalign?: (lostWords: string[], commit: () => void) => void;
   // Side-by-side mode (all optional; absent = standalone single-panel behavior).
-  // When `hover`/`onHoverChange` are provided the hover state is controlled by a
-  // shared parent so two panels cross-highlight the same Hebrew. Likewise
-  // `hoverLink`/`onToggleHoverLink` let the parent keep both toolbars in sync.
-  // `renderUhbStrip={false}` suppresses the per-panel source strip (the parent
-  // renders one shared strip). `onOpenDual` adds a "Side-by-side" action.
-  hover?: HoverHighlight;
-  onHoverChange?: (h: HoverHighlight) => void;
+  // When `hoverStore` is provided, hover state is a store SHARED with a parent
+  // (and typically a sibling panel) so two panels cross-highlight the same
+  // Hebrew — see hoverStore.ts for why this is a subscribe/getSnapshot store
+  // rather than a lifted `hover`/`onHoverChange` value+setter pair (#900: the
+  // latter forces the parent that owns the state to re-render on every
+  // mouseenter/mouseleave). Likewise `hoverLink`/`onToggleHoverLink` let the
+  // parent keep both toolbars in sync. `renderUhbStrip={false}` suppresses the
+  // per-panel source strip (the parent renders one shared strip). `onOpenDual`
+  // adds a "Side-by-side" action.
+  hoverStore?: HoverStore;
   hoverLink?: boolean;
   onToggleHoverLink?: () => void;
   renderUhbStrip?: boolean;
@@ -248,8 +251,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       onCancel,
       onDirtyChange,
       onConfirmUnalign,
-      hover: hoverProp,
-      onHoverChange,
+      hoverStore: hoverStoreProp,
       hoverLink: hoverLinkProp,
       onToggleHoverLink,
       renderUhbStrip = true,
@@ -409,13 +411,18 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
     const [hideUhbStrip, setHideUhbStrip] = useState<boolean>(() => readFlag(LS_HIDE_UHB));
     const [colorize, setColorize] = useState<boolean>(() => readFlag(LS_COLORIZE));
-    // hover + hoverLink are controlled when the side-by-side parent passes them
-    // in; otherwise they're local (standalone single-panel behavior unchanged).
+    // hoverLink is controlled when the side-by-side parent passes it in;
+    // otherwise it's local (standalone single-panel behavior unchanged).
     const [localHoverLink, setLocalHoverLink] = useState<boolean>(() => readFlag(LS_HOVERLINK));
     const hoverLink = hoverLinkProp !== undefined ? hoverLinkProp : localHoverLink;
-    const [localHover, setLocalHover] = useState<HoverHighlight>(null);
-    const hover = hoverProp !== undefined ? hoverProp : localHover;
-    const setHover: (h: HoverHighlight) => void = onHoverChange ?? setLocalHover;
+    // Hover itself is never React state (#900) — it lives in an external store,
+    // local to this panel unless a side-by-side parent shares one so both
+    // panels cross-highlight the same Hebrew. The ref keeps a standalone
+    // panel's store identity stable across this component's own re-renders
+    // (created once, on first render, never replaced).
+    const localHoverStoreRef = useRef<HoverStore | null>(null);
+    if (!localHoverStoreRef.current) localHoverStoreRef.current = createHoverStore(null);
+    const hoverStore = hoverStoreProp ?? localHoverStoreRef.current;
     // Session-scoped ghost rejections (keyed by dismissedGhostKey). Suppresses a
     // suggestion the user dismissed via the chip's × so it can't immediately
     // regenerate on the next render — the "predicted alignment" circle fix.
@@ -452,7 +459,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       setLocalHoverLink((cur) => {
         const next = !cur;
         writeFlag(LS_HOVERLINK, next);
-        if (!next) setHover(null);
+        if (!next) hoverStore.setHover(null);
         return next;
       });
     };
@@ -811,35 +818,26 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
 
     // Hover handlers. They no-op when hoverLink is off so the chips can fire
     // them unconditionally; the payloads themselves are built in alignmentHover.
+    // Writing to hoverStore (not React state) is what keeps a hover event from
+    // re-rendering this whole panel (#900) — see hoverStore.ts.
     const onEnglishHover = useCallback(
       (wordId: string, text: string, occurrence: string, groupIdOverride?: string) => {
         if (!hoverLink) return;
-        setHover(makeEnglishHover(hoverCtx, wordId, text, occurrence, groupIdOverride));
+        hoverStore.setHover(makeEnglishHover(hoverCtx, wordId, text, occurrence, groupIdOverride));
       },
-      [hoverLink, hoverCtx, setHover],
+      [hoverLink, hoverCtx, hoverStore],
     );
     const onHebrewHover = useCallback(
       (pos: number, groupIdOverride?: string) => {
         if (!hoverLink) return;
         if (pos < 0 && !groupIdOverride) return;
-        setHover(makeHebrewHover(hoverCtx, pos, groupIdOverride));
+        hoverStore.setHover(makeHebrewHover(hoverCtx, pos, groupIdOverride));
       },
-      [hoverLink, hoverCtx, setHover],
+      [hoverLink, hoverCtx, hoverStore],
     );
     const onHoverLeave = useCallback(() => {
-      setHover(null);
-    }, [setHover]);
-
-    const englishHighlight = useCallback(
-      (wordId: string, text: string, occurrence: string, groupIdOverride?: string) =>
-        resolveEnglishHighlight(hoverCtx, hover, wordId, text, occurrence, groupIdOverride),
-      [hoverCtx, hover],
-    );
-    const hebrewHighlight = useCallback(
-      (pos: number, groupIdOverride?: string) =>
-        resolveHebrewHighlight(hoverCtx, hover, pos, groupIdOverride),
-      [hoverCtx, hover],
-    );
+      hoverStore.setHover(null);
+    }, [hoverStore]);
 
     const hctx: HighlightCtx = useMemo(
       () => ({
@@ -851,8 +849,16 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         onEnglishEnter: onEnglishHover,
         onHebrewEnter: onHebrewHover,
         onLeave: onHoverLeave,
-        englishHighlight,
-        hebrewHighlight,
+        // Hooks, not precomputed tones — each chip/card subscribes to its own
+        // slice of the live hover store (see the field docs in
+        // highlightTypes.ts and hoverStore.ts). Deliberately NOT `hover` (nor
+        // anything derived from it) in this useMemo's deps: that's the value
+        // that used to force this whole memo — and everything downstream of
+        // it — to rebuild on every mouseenter/mouseleave.
+        useEnglishHighlight: (wordId, text, occurrence, groupIdOverride) =>
+          useEnglishHighlightTone(hoverCtx, hoverStore, wordId, text, occurrence, groupIdOverride),
+        useHebrewHighlight: (pos, groupIdOverride) =>
+          useHebrewHighlightTone(hoverCtx, hoverStore, pos, groupIdOverride),
       }),
       [
         colorize,
@@ -863,8 +869,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         onEnglishHover,
         onHebrewHover,
         onHoverLeave,
-        englishHighlight,
-        hebrewHighlight,
+        hoverCtx,
+        hoverStore,
       ],
     );
 
@@ -2066,7 +2072,7 @@ function SourceWordTypography({
   reused: boolean;
 }) {
   const [hover, setHover] = useState(false);
-  const tone = hctx.hebrewHighlight(pos, groupId);
+  const tone = hctx.useHebrewHighlight(pos, groupId);
   const showInfo = hctx.showSourceInfo;
   return (
     <LexTooltip
@@ -2211,7 +2217,7 @@ function AlignedChip({
   occurrences: string;
   hctx: HighlightCtx;
 }) {
-  const tone = hctx.englishHighlight(wordId, text, occurrence);
+  const tone = hctx.useEnglishHighlight(wordId, text, occurrence);
   const hueDeg = hctx.colorize ? hctx.matchHues.get(`${text}|${occurrence}`) : undefined;
   const accent = hueDeg != null ? chipAccentColor(hueDeg, hctx.themeMode) : undefined;
   const supColor = hueDeg != null ? chipSupColor(hueDeg, hctx.themeMode) : "text.disabled";
@@ -2258,7 +2264,7 @@ function SelectableChip({
   idsForDrag: () => string[];
   hctx: HighlightCtx;
 }) {
-  const tone = hctx.englishHighlight(wordId, text, occurrence);
+  const tone = hctx.useEnglishHighlight(wordId, text, occurrence);
   const hueDeg =
     !selected && hctx.colorize
       ? hctx.matchHues.get(`${text}|${occurrence}`)
@@ -2319,7 +2325,7 @@ function SimpleDraggableChip({
   onUnalign?: () => void;
   hctx: HighlightCtx;
 }) {
-  const tone = hctx.englishHighlight(wordId, text, occurrence, groupId);
+  const tone = hctx.useEnglishHighlight(wordId, text, occurrence, groupId);
   const hueDeg = hctx.colorize ? hctx.matchHues.get(`${text}|${occurrence}`) : undefined;
   const accent = hueDeg != null ? chipAccentColor(hueDeg, hctx.themeMode) : undefined;
   const supColor = hueDeg != null ? chipSupColor(hueDeg, hctx.themeMode) : "primary.dark";
