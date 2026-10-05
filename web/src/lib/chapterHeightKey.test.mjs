@@ -73,6 +73,31 @@ const base = chapterHeightKey(chapter(ult, ust), ["ULT", "UST"], [1, 2]);
   const gone = { 1: ult[1] };
   assert(chapterHeightKey(chapter(gone, ust), ["ULT", "UST"], [1, 2]) !== base, "a missing cell changes the key");
 }
+// Review of #1131 (A1): changes that keep every length and count but can
+// still rewrap or re-indent a row.
+{
+  const withMarker = (tag) => ({ ...ult, 2: dto(2, "Yahweh was very angry", { content: { verseObjects: [{ type: tag === "b" ? "paragraph" : "quote", tag }, ...words("Yahweh was very angry")] } }) });
+  const q1 = chapterHeightKey(chapter(withMarker("q1"), ust), ["ULT", "UST"], [1, 2]);
+  assert(q1 !== chapterHeightKey(chapter(withMarker("q2"), ust), ["ULT", "UST"], [1, 2]), "\\q1 -> \\q2 changes the key");
+  assert(
+    chapterHeightKey(chapter(withMarker("p"), ust), ["ULT", "UST"], [1, 2]) !== chapterHeightKey(chapter(withMarker("b"), ust), ["ULT", "UST"], [1, 2]),
+    "\\p -> \\b changes the key",
+  );
+  // Same length, different words (a rewording can rewrap the line).
+  const reworded = { ...ult, 2: dto(2, "Yahweh was much angry") };
+  const sameLen = { ...ult, 2: dto(2, "Yahweh was VERY angry") };
+  assert(chapterHeightKey(chapter(sameLen, ust), ["ULT", "UST"], [1, 2]) !== base, "same-length different text changes the key");
+  assert(chapterHeightKey(chapter(reworded, ust), ["ULT", "UST"], [1, 2]) !== base, "reworded text changes the key");
+  // Same heading length, different heading words.
+  const head = (text) => ({ ...ult, 1: dto(1, "In the eighth month", { content: { verseObjects: [{ type: "section", tag: "s1", content: text }, ...words("In the eighth month")] } }) });
+  assert(
+    chapterHeightKey(chapter(head("A call to return"), ust), ["ULT", "UST"], [1, 2]) !== chapterHeightKey(chapter(head("A cell to return"), ust), ["ULT", "UST"], [1, 2]),
+    "same-length heading rewording changes the key",
+  );
+  // The outbox reply: a fresh object, a newer version, the same content.
+  const echoed = { ...withMarker("q1"), 2: { ...withMarker("q1")[2], version: 7, updated_at: 123, content: JSON.parse(JSON.stringify(withMarker("q1")[2].content)) } };
+  assert(chapterHeightKey(chapter(echoed, ust), ["ULT", "UST"], [1, 2]) === q1, "version-only reply with re-parsed content keeps the key");
+}
 assert(chapterHeightKey(chapter(ult, ust), ["ULT", "UST"], [1]) !== base, "a removed row changes the key");
 assert(chapterHeightKey(chapter(ult, ust), ["ULT", "UST", "UHB"], [1, 2]) !== base, "a toggled column changes the key");
 assert(chapterHeightKey(chapter(ult, ust), ["UST", "ULT"], [1, 2]) !== base, "column order is part of the key");
