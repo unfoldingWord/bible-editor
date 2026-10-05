@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Browser, type BrowserContext, type Page } from "@playwright/test";
 import { newUserContext } from "./helpers";
 
 // S23 — issue #1120: book mode lets the browser skip layout for chapters far
@@ -107,53 +107,91 @@ async function openBookMode(page: Page, chapter: number) {
   await settle(page);
 }
 
+// A context showing ULT + UST with scroll anchoring off, as in Safari:
+// nothing absorbs a height change above the view, so the top-row checks see
+// every jump.
+async function noAnchoringContext(browser: Browser, username: string): Promise<BrowserContext> {
+  const { context } = await newUserContext(browser, username);
+  await context.addInitScript(() => {
+    try {
+      if (!sessionStorage.getItem("s23")) {
+        sessionStorage.setItem("s23", "1");
+        localStorage.setItem("be:enabledVersions", JSON.stringify(["ULT", "UST"]));
+      }
+    } catch {
+      /* private mode */
+    }
+    document.addEventListener("DOMContentLoaded", () => {
+      const s = document.createElement("style");
+      s.textContent = "*{overflow-anchor:none !important}";
+      document.head.appendChild(s);
+    });
+  });
+  return context;
+}
+
+// Scroll the whole book so every chapter loads and is laid out once, then
+// assert it all loaded (otherwise the checks would skip chapters).
+async function loadWholeBook(page: Page) {
+  const sc = await scroller(page);
+  for (let i = 0; i < 200; i++) {
+    const done = await sc.evaluate((el) => {
+      el.scrollTop += 700;
+      return (
+        el.scrollTop + el.clientHeight >= el.scrollHeight - 2 &&
+        !document.body.innerText.includes("(scroll to load)") &&
+        !document.body.innerText.includes("loading…")
+      );
+    });
+    await page.waitForTimeout(120);
+    if (done) break;
+  }
+  await settle(page);
+  await expect(page.getByText("(scroll to load)")).toHaveCount(0);
+  await expect(page.getByText(/loading…/)).toHaveCount(0);
+  const caption = (await page.getByText(/ch · loaded/).first().textContent()) ?? "";
+  const [, total, loaded] = caption.match(/(\d+) ch · loaded (\d+)/) ?? [];
+  expect(Number(loaded)).toBeGreaterThan(0);
+  expect(loaded).toBe(total);
+}
+
 test.describe("S23 — book-mode placeholder heights (#1120)", () => {
   test.setTimeout(180_000);
 
-  test("after a column toggle, every loaded chapter keeps its real height", async ({ browser }) => {
-    const { context } = await newUserContext(browser, "s23-toggle");
-    await context.addInitScript(() => {
-      try {
-        if (!sessionStorage.getItem("s23")) {
-          sessionStorage.setItem("s23", "1");
-          localStorage.setItem("be:enabledVersions", JSON.stringify(["ULT", "UST"]));
-        }
-      } catch {
-        /* private mode */
-      }
-      // No scroll anchoring, as in Safari: nothing absorbs a height change
-      // above the view, so the top-row checks below see every jump.
-      document.addEventListener("DOMContentLoaded", () => {
-        const s = document.createElement("style");
-        s.textContent = "*{overflow-anchor:none !important}";
-        document.head.appendChild(s);
-      });
-    });
+  // #1131: a skipped chapter kept its pre-resize height, so it changed size
+  // when next drawn. BookView lays every loaded chapter out again once the
+  // width settles, holding the top row in place.
+  test("after a window resize, every loaded chapter keeps its real height", async ({ browser }) => {
+    const context = await noAnchoringContext(browser, "s23-resize");
     const page = await context.newPage();
     await page.setViewportSize({ width: 1400, height: 900 });
     await openBookMode(page, 1);
-    // Scroll the whole book so every chapter loads and is laid out once.
-    const sc = await scroller(page);
-    for (let i = 0; i < 200; i++) {
-      const done = await sc.evaluate((el) => {
-        el.scrollTop += 700;
-        return (
-          el.scrollTop + el.clientHeight >= el.scrollHeight - 2 &&
-          !document.body.innerText.includes("(scroll to load)") &&
-          !document.body.innerText.includes("loading…")
-        );
-      });
-      await page.waitForTimeout(120);
-      if (done) break;
-    }
+    await loadWholeBook(page);
+    await page.evaluate(() => {
+      location.hash = "#/ZEC/14/5";
+    });
     await settle(page);
-    // The whole book must be loaded, or the checks below skip chapters.
-    await expect(page.getByText("(scroll to load)")).toHaveCount(0);
-    await expect(page.getByText(/loading…/)).toHaveCount(0);
-    const caption = (await page.getByText(/ch · loaded/).first().textContent()) ?? "";
-    const [, total, loaded] = caption.match(/(\d+) ch · loaded (\d+)/) ?? [];
-    expect(Number(loaded)).toBeGreaterThan(0);
-    expect(loaded).toBe(total);
+    expect(await wrongPlaceholders(page)).toEqual([]);
+
+    await page.setViewportSize({ width: 1100, height: 900 });
+    // The resize itself re-wraps the chapters on screen, which moves the view
+    // with anchoring off whatever BookView does. Read the top row after that,
+    // two frames in, before the re-measure (which waits for the width to hold
+    // still for 300 ms): the re-measure must not move it.
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    const top = await topRow(page);
+    await settle(page);
+    expect(await wrongPlaceholders(page)).toEqual([]);
+    expect(Math.abs(await topRowMovedPx(page, top))).toBeLessThan(50);
+    await context.close();
+  });
+
+  test("after a column toggle, every loaded chapter keeps its real height", async ({ browser }) => {
+    const context = await noAnchoringContext(browser, "s23-toggle");
+    const page = await context.newPage();
+    await page.setViewportSize({ width: 1400, height: 900 });
+    await openBookMode(page, 1);
+    await loadWholeBook(page);
     await page.evaluate(() => {
       location.hash = "#/ZEC/14/5";
     });
