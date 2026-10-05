@@ -606,6 +606,22 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
   if (!book) return c.json({ error: "book_required" }, 400);
 
+  // Wait for the whole request body (and the actor lookup) BEFORE the
+  // pre-check reads, so they are taken as late as they were before #905. A
+  // Worker starts the handler before a streamed body has fully arrived: reading
+  // the pipeline lock first would let an AI run that starts during a slow
+  // upload miss the lock and then overwrite this save, and reading the row
+  // first would widen the window before the no-op decision. Hono caches the
+  // text, so the c.req.json() below parses it without a second read; a failed
+  // read surfaces there as the usual 400, still after the 423.
+  await c.req.text().catch(() => undefined);
+
+  // Hoisted above every branch below (no-op review-clear, reorder fast path,
+  // full content write) — all three are `source: 'user'` provenance stamps and
+  // the actor lookup is one shared await, not one per branch.
+  const userId = currentUserId(c);
+  const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
+
   // Every read-only pre-check in ONE D1 round trip (issue #905): the book lock,
   // the current row, and (tq/twl only) the book's active AI-pipeline jobs. The
   // row's chapter is not known until this batch returns, so the pipeline read
@@ -669,12 +685,6 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   if (fields.length === 0) {
     return c.json({ error: "empty_patch" }, 400);
   }
-
-  // Hoisted above every branch below (no-op review-clear, reorder fast path,
-  // full content write) — all three are `source: 'user'` provenance stamps and
-  // the actor lookup is one shared await, not one per branch.
-  const userId = currentUserId(c);
-  const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
 
   // The current row, read once in the pre-check batch above — used for the
   // lock-scope lookup and the no-op short-circuit. Carries latest_source (see

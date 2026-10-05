@@ -146,7 +146,29 @@ function freshApp({ role = "editor" } = {}) {
     } catch {}
     return { status: res.status, json, roundTrips: stats.roundTrips, sql: [...stats.sql] };
   };
-  return { sqlite, req };
+  // Like req, but the body arrives as a stream whose bytes are delivered only
+  // after `whileUploading` runs, the way a slow upload reaches a Worker that
+  // has already started the handler.
+  const reqSlowBody = async (method, path, body, ifMatch, whileUploading) => {
+    stats.sql = [];
+    const bytes = new TextEncoder().encode(JSON.stringify(body));
+    const stream = new ReadableStream({
+      async pull(controller) {
+        await new Promise((r) => setTimeout(r, 5));
+        whileUploading();
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+    const headers = { "content-type": "application/json", "if-match": String(ifMatch) };
+    const res = await app.request(path, { method, headers, body: stream, duplex: "half" }, env, ctx);
+    let json = null;
+    try {
+      json = await res.json();
+    } catch {}
+    return { status: res.status, json, sql: [...stats.sql] };
+  };
+  return { sqlite, req, reqSlowBody };
 }
 
 // Seed: a chapter's verses (ULT 1:1, 1:2) so creates pass the chapter probe,
@@ -389,6 +411,42 @@ console.log("\n[tq PATCH: pipeline lock from the batched read, chapter-scoped]")
   eq(locked.json.jobId, "j-here", "names the covering job");
   eq(plainRow(sqlite, "tq", "tq01").version, 3, "no write while locked");
   eq(mutating(locked.sql), false, "pipeline-lock refusal issued no write");
+}
+
+console.log("\n[pre-checks are read after the request body arrives]");
+{
+  // An AI run that starts while a save's body is still uploading must still
+  // lock that save out: the pipeline read has to happen after the body is in.
+  const { sqlite, reqSlowBody } = freshApp();
+  seed(sqlite);
+  const startRun = (type, id) => () =>
+    sqlite
+      .prepare(
+        `INSERT INTO pipeline_jobs (job_id, user_id, pipeline_type, book, start_chapter, end_chapter, session_key, state)
+         VALUES (?, 9, ?, ?, 1, 1, 'k', 'running')`,
+      )
+      .run(id, type, BOOK);
+  const tqRes = await reqSlowBody("PATCH", `/api/rows/tq/tq01?book=${BOOK}`, { question: "Slow upload?" }, 2, startRun("tqs", "j-tq-slow"));
+  eq([tqRes.status, tqRes.json?.error, tqRes.json?.jobId], [409, "chapter_locked", "j-tq-slow"], "tq PATCH: a run started during the upload locks the save");
+  eq(mutating(tqRes.sql), false, "tq PATCH: no write");
+  eq(plainRow(sqlite, "tq", "tq01").question, "Who?", "tq row untouched");
+
+  const content = { verseObjects: [{ type: "text", text: "Slow upload." }] };
+  const vRes = await reqSlowBody("PATCH", `/api/verses/${BOOK}/1/1/ULT`, { content, plain_text: "Slow upload." }, 3, startRun("generate", "j-gen-slow"));
+  eq([vRes.status, vRes.json?.error, vRes.json?.jobId], [409, "chapter_locked", "j-gen-slow"], "verse PATCH: a run started during the upload locks the save");
+  eq(mutating(vRes.sql), false, "verse PATCH: no write");
+  eq(verseRow(sqlite, 1).version, 3, "verse untouched");
+
+  // And the row snapshot is taken after the body too: a trash toggle (no
+  // version bump) landing mid-upload is seen, so an identical-content save is
+  // not answered as a no-op on a row that is now trashed.
+  const { sqlite: s2, reqSlowBody: slow2 } = freshApp();
+  seed(s2);
+  const res = await slow2("PATCH", `/api/rows/tn/tn01?book=${BOOK}`, { note: "AI wrote this." }, 4, () =>
+    s2.prepare(`UPDATE tn_rows SET trashed_at = 1 WHERE id = 'tn01'`).run(),
+  );
+  eq(res.status, 200, "identical-content save after a mid-upload trash is accepted");
+  eq([res.json.version, res.json.trashed_at], [5, null], "it takes the full-write path and revives the row, as for any trashed row");
 }
 
 console.log("\n[twl PATCH: RETURNING * shape, no latest_source key]");

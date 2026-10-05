@@ -255,6 +255,16 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     return c.json({ error: "invalid_params" }, 400);
   }
 
+  // Wait for the whole request body BEFORE the pre-check reads, so they are
+  // taken as late as they were before #905. A Worker starts the handler before
+  // a streamed body has fully arrived, and a large aligned verse on a slow
+  // connection can take a while: reading the pipeline lock first would let a
+  // scripture run that starts during the upload miss the lock and then
+  // overwrite this save. Hono caches the text, so the c.req.json() below
+  // parses it without a second read; a failed read surfaces there as the usual
+  // 400, still after the 423.
+  await c.req.text().catch(() => undefined);
+
   // Every read-only pre-check in ONE D1 round trip (issue #905): the book lock,
   // the chapter's AI-pipeline jobs, and the existing verse row. bookLockGuard
   // defers this route to here (isSelfLockCheckedRoute), so the 423 is answered
