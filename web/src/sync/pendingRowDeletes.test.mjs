@@ -334,6 +334,9 @@ function hub() {
         addEventListener(type, fn) {
           if (type === "message") ch.listeners.add(fn);
         },
+        removeEventListener(type, fn) {
+          if (type === "message") ch.listeners.delete(fn);
+        },
       };
       chans.add(ch);
       return ch;
@@ -520,6 +523,19 @@ const sig = (o) => `${o.kind}:${o.op.target.id}:${o.remote ? "remote" : "local"}
   const why = (o) => `${o.kind}:${o.op.target.id}:${o.reason ?? "-"}`;
   check(b.seen.map(why).join() === "abandoned:q1:locked,abandoned:w1:discarded,committed:q2:-", "#1126 item 1: an abandoned outcome carries its reason in the draining tab");
   check(a.seen.map(why).join() === "abandoned:q1:locked,abandoned:w1:discarded,committed:q2:-", "#1126 item 1: and the reason crosses to the other tabs");
+}
+
+// Item 4: close() (a dev hot reload's dispose) stops relaying and hearing.
+{
+  const h = hub();
+  const a = tab(h);
+  const b = tab(h);
+  b.outcomes.close?.();
+  b.result(del("tq", "q1", "in_flight"), "ok");
+  b.discard(del("tq", "q2", "conflict"));
+  a.result(del("twl", "w1", "in_flight"), "ok");
+  await settle();
+  check(b.seen.length === 0 && a.seen.length === 1 && h.posted.length === 1, "#1126 item 4: a closed outcome feed neither relays nor hears");
 }
 
 // Item 9: the DELETE's enqueue failed, so no op will ever settle the click's
