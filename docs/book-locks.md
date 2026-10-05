@@ -64,14 +64,16 @@ the constant. **The detector never influences the gate.** A new release becomes 
 reviewed human event, which is right: the night a new release lands, a dozen more
 books go quiet, and a cron should not decide that by itself.
 
-### Evidence behind the current constant (measured 2026-08-10)
+### Evidence behind the current constant (measured 2026-09-27)
 
-- Latest release in `en_ult`, `en_ust`, `en_tn`, `en_tq`, `en_twl` is **v89**,
-  target branch `release_v89`, published 2026-06-23.
-- Listing each repo at `?ref=v89` returns **54 books, and the set is identical
+- Latest release in `en_ult`, `en_ust`, `en_tn`, `en_tq`, `en_twl` is **v91**,
+  target branch `release_v91`, published 2026-09-26.
+- Listing each repo at `?ref=v91` returns **59 books, and the set is identical
   across all five repos**. `master` has 66.
-- The 12 unpublished books: `NUM 1CH 2CH ECC ISA JER EZK DAN HOS AMO MIC ZEC`.
-- Release cadence is roughly 3 per year (v84 2024-08 → v89 2026-06).
+- The 7 unpublished books: `NUM 1CH 2CH ECC ISA JER EZK`. (v90 added HOS and
+  MIC; v91 added AMO, DAN and ZEC.)
+- Release cadence is roughly 3 per year (v84 2024-08 → v89 2026-06 → v90
+  2026-08 → v91 2026-09).
 
 Two traps the code guards against, both found while measuring:
 
@@ -102,6 +104,9 @@ must never be mistaken for evidence.
    `api/src/publishedGuard.ts`.
 3. Run `npm --workspace api run test` — the suite asserts the list's size and the
    unpublished complement, so a partial edit fails loudly.
+   Unit-test fixtures that need an unpublished book must use one still
+   unpublished. The Playwright suite's ZEC fixture is published since v91, so
+   `tests/concurrency/global-setup.ts` seeds an explicit `locked = 0` row for it.
 4. Decide about any `-be-` PRs already open on the newly published books. **The
    export being blocked does not stop Door43's merge bot** from landing a PR that
    is already open, so check and close them by hand if needed:
