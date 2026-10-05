@@ -104,8 +104,9 @@ export function reduceVerses(
  *   - `rowInsert` / `rowReplace` over a row the fetch already has apply only
  *     when STRICTLY newer by version. Same-version server changes (preserve /
  *     hint / trash toggles, reorder-only sort_order) cannot be ordered against
- *     the snapshot, so the fetch wins; a same-version toggle made during the
- *     window can still be reverted on screen, as before #974. `rowInsert` adds
+ *     the snapshot by version, so the fetch wins here; the tab's own copy of
+ *     such a change is kept by `mergeRowList`'s updated_at rule instead
+ *     (#989). `rowInsert` adds
  *     a row the fetch lacks; `rowReplace` never does (a row the server deleted
  *     must not be resurrected by an older event). A row of another chapter (a
  *     late createRow response after navigation) is never inserted. Row ids are
@@ -142,6 +143,24 @@ type ChapterRow = TnRow | TqRow | TwlRow;
 /** Verse structure steps; the rest are chapter data steps (rows, statuses). */
 export function isStructureStep(step: StructureStep): boolean {
   return step.type === "bridged" || step.type === "split" || step.type === "updated";
+}
+
+/**
+ * The steps a merging refetch inherits when it supersedes another one
+ * (chapterFetchSequencer's `keepOnSupersede`). Structure steps, as since
+ * #729, plus `rowDelete` (#989). Other data steps recorded before the new GET
+ * was sent are dropped: their write already committed, so the new snapshot
+ * holds it, and replaying an insert or a status could resurrect a row deleted
+ * while the socket was down (#974 A3). A delete is different on both counts.
+ * The tab's own delete is applied before its outbox DELETE commits, so a
+ * superseding GET sent while that DELETE is still queued (offline, or mid
+ * drain) still has the row, and without the step the row came back on screen
+ * and the next edit PATCHed a deleted id. And a replayed delete can only
+ * remove a row, never resurrect one, so keeping a delete that the snapshot
+ * already reflects is a no-op.
+ */
+export function keepStepAcrossSupersede(step: StructureStep): boolean {
+  return isStructureStep(step) || step.type === "rowDelete";
 }
 
 /**
@@ -283,7 +302,8 @@ export function replaySteps(state: ChapterData, steps: readonly StructureStep[])
  *     GET (#902) the chapter is editable while the merging GET is in flight,
  *     so a row PATCH's 200 can beat the GET's older body. Equal version takes
  *     the fetched row, unlike verses, because several server paths change a
- *     row without bumping its version (see `mergeRowList`). Rows have no
+ *     row without bumping its version, unless the local row's server
+ *     `updated_at` is strictly newer (see `mergeRowList`, #989). Rows have no
  *     tombstone: a row created or deleted after the GET's snapshot is put
  *     right by the replayed `rowInsert` / `rowDelete` step (#974).
  *   - Tombstones are cleared: the merged map is authoritative again, exactly
@@ -341,13 +361,31 @@ export function mergeRefetched(prev: ChapterData | null, fetched: ChapterPayload
 // never worse than a plain replace. Fetched order and membership win: a row
 // the server no longer has is dropped, and a local-only row is not kept (row
 // events from the GET's window are replayed over this by `replaySteps`).
+//
+// One exception at equal version (#989): every one of those version-neutral
+// writes still stamps the row's server `updated_at`, and the tab only ever
+// holds a server-issued `updated_at` (optimistic patches never set it). A
+// local row whose `updated_at` is STRICTLY newer than the fetched one at the
+// same version is therefore a server write this tab saw after the GET's
+// snapshot, such as its own preserve / hint / trash toggle or drag-reorder
+// confirmed while the GET was in flight, and it is kept. Without this the
+// older snapshot reverted the toggle on screen until the next refetch. An
+// equal or older stamp cannot be proven newer (a late, older echo, or two
+// writes in one second), so the fetch wins, the same rule as verse statuses.
 // Returns `fetched` itself when nothing local is kept.
-function mergeRowList<R extends { id: string; version: number }>(local: readonly R[], fetched: R[]): R[] {
+function mergeRowList<R extends { id: string; version: number; updated_at?: number }>(local: readonly R[], fetched: R[]): R[] {
   const byId = new Map(local.map((r) => [r.id, r]));
   let out: R[] | undefined;
   fetched.forEach((incoming, i) => {
     const mine = byId.get(incoming.id);
-    if (mine && mine !== incoming && mine.version > incoming.version) (out ??= fetched.slice())[i] = mine;
+    if (!mine || mine === incoming) return;
+    const newer =
+      mine.version > incoming.version ||
+      (mine.version === incoming.version &&
+        typeof mine.updated_at === "number" &&
+        typeof incoming.updated_at === "number" &&
+        mine.updated_at > incoming.updated_at);
+    if (newer) (out ??= fetched.slice())[i] = mine;
   });
   return out ?? fetched;
 }

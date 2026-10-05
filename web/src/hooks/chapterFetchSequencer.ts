@@ -39,6 +39,9 @@
 // mount GET (`keepOnSupersede`): an event that reached the tab before the new
 // GET was sent is already in its snapshot, and replaying it could resurrect a
 // row deleted while the socket was down (that row.deleted broadcast is lost).
+// Row deletes are the exception (#989, lib/verseStructure.ts
+// `keepStepAcrossSupersede`): the tab's own delete is applied before its
+// DELETE commits, so the new snapshot can still hold the row.
 // A plain refetch or a reset drops it; the resolving
 // or failing latest request clears it.
 

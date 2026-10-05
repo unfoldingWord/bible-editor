@@ -25,7 +25,7 @@ import { currentRouteFetcher, isChapterLocked, trackNavigation, updateIfCurrent,
 import {
   applyStep,
   applyUpdated,
-  isStructureStep,
+  keepStepAcrossSupersede,
   mergeRefetched,
   reduceVerses,
   replaySteps,
@@ -182,8 +182,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       setStatus("error");
     },
     // A row / status step recorded before a newer merging GET was sent is in
-    // that GET's snapshot already; only verse-structure steps carry over.
-    keepOnSupersede: isStructureStep,
+    // that GET's snapshot already; verse-structure steps carry over, and so do
+    // row deletes, whose own DELETE may still be queued (#989).
+    keepOnSupersede: keepStepAcrossSupersede,
   });
 
   const refetch = useCallback((opts?: RefetchOptions) => {
