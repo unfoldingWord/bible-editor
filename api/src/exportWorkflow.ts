@@ -507,6 +507,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
+            // Issue #1006 review: this run's export will push the locked book
+            // (exportOne's allowLocked branch) only when the override holds and
+            // the run really exports, so only then is the no-base alert told
+            // the export does not skip it.
+            lockOverrideResource:
+              lockOverride && dcsAllowed && !params.reimportOnly ? (params.resource as Resource) : undefined,
             userId: params.userId ?? null,
           });
           // runChunkedReimport resolves normally in three distinct outcomes and

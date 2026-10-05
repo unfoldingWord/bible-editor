@@ -763,10 +763,14 @@ export async function raiseVerseMergeConflictAlert(
   // each carrying its current D1 version so groupNoBaseVersesByEditor can
   // attribute it to the human who last edited it and give THEM their own
   // notice too — until this fix that warning reached only ALERT_USERNAME.
+  // `noBaseBookLocked` (issue #1006): the book was locked when those verses
+  // were kept, so the export skips it and the no-base wording must not warn
+  // that tonight's export will overwrite anything.
   opts: {
     recordingFailed?: boolean;
     noBaseCount?: number;
     noBaseRefs?: string[];
+    noBaseBookLocked?: boolean;
     noBaseEditorRefs?: NoBaseVerseRef[];
     observedAt?: number;
   } = {},
@@ -849,10 +853,13 @@ export async function raiseVerseMergeConflictAlert(
   // overwrite) — see buildMergeConflictGuidance. Pulled into that pure helper
   // so the split is unit-testable without an Env, and so a refusal or a
   // source-attr divergence can never be miscounted as an overwrite.
+  // Issue #1006: whether the no-base sentences use the locked-book wording.
+  const noBaseLockedWording = opts.noBaseBookLocked === true && (opts.noBaseCount ?? 0) > 0;
   const guidance = buildMergeConflictGuidance(rows, {
     recordingFailed: opts.recordingFailed,
     noBaseCount: opts.noBaseCount,
     noBaseRefs: opts.noBaseRefs,
+    noBaseBookLocked: noBaseLockedWording,
   });
   // Issue #624: each ref grouped under its own reason, each group carrying
   // the oldest detected_at in that reason as a plain "first flagged" date —
@@ -915,7 +922,13 @@ export async function raiseVerseMergeConflictAlert(
   }));
   const usernameByKey = await lookupEditorUsernames(env, book, resource, [...overwrittenRefs, ...noBaseLookupRefs]);
   const perEditor = groupOverwrittenVersesByEditor(book, resource, overwrittenRefs, usernameByKey);
-  const perEditorNoBase = groupNoBaseVersesByEditor(book, resource, noBaseEditorRefs, usernameByKey);
+  const perEditorNoBase = groupNoBaseVersesByEditor(
+    book,
+    resource,
+    noBaseEditorRefs,
+    usernameByKey,
+    noBaseLockedWording,
+  );
 
   // Combine per-editor content: an editor can appear in BOTH maps in the same
   // run (an overwritten verse elsewhere in the book, plus a keep_no_base verse
@@ -953,6 +966,11 @@ export async function raiseVerseMergeConflictAlert(
         .sort((a, b) => `${a.chapter}:${a.verse}`.localeCompare(`${b.chapter}:${b.verse}`)),
       noBaseCount: opts.noBaseCount ?? 0,
       recordingFailed: Boolean(opts.recordingFailed),
+      // Issue #1006: the locked wording ("ask an admin") and the unlocked one
+      // ("tonight's export will overwrite") are different conditions, so a
+      // dismissed locked alert cannot hide the warning after an unlock. Added
+      // only when locked, so unlocked keys match the ones already stored.
+      ...(noBaseLockedWording ? { noBaseBookLocked: true } : {}),
     },
   );
   const conditionForUser = (username: string): string => {
@@ -960,7 +978,13 @@ export async function raiseVerseMergeConflictAlert(
     const refs = [perEditor.get(username)?.refs ?? [], perEditorNoBase.get(username)?.refs ?? []]
       .flat()
       .sort();
-    return verseMergeEditorConditionKey(book, resource, username, refs);
+    return verseMergeEditorConditionKey(
+      book,
+      resource,
+      username,
+      refs,
+      noBaseLockedWording && perEditorNoBase.has(username),
+    );
   };
 
   try {
