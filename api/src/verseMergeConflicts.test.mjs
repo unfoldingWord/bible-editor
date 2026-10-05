@@ -3252,6 +3252,16 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     );
     assert(liveFor(sqlite, "bcameron93").length === 0, "overlapping runs: v4's author is not told to recover June's loss");
   }
+
+  // (r) A ref listed twice in one call (two upserts, two generation bumps) is
+  // left out of the capture, so its cleanup takes the delete instead of a
+  // restore whose guard could never match.
+  {
+    const { env } = migratedEnv();
+    const prior = new Map();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 36, 5), overwrite(4, 36, 6), overwrite(4, 37, 5)], OCT05, prior);
+    assert(!prior.has("4:36") && prior.has("4:37"), "repeated ref: not captured; a single ref still is");
+  }
 }
 
 if (failed) {

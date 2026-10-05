@@ -236,6 +236,22 @@ export async function recordVerseMergeConflicts(
   prior?: PriorVerseMergeConflicts,
 ): Promise<boolean> {
   if (rows.length === 0) return true;
+  // A ref listed twice gets two upserts (two generation bumps), so the
+  // restore's `prior + 1` guard could never match it. bookReimport.ts keeps
+  // content and structure flags on disjoint verses, so this should not occur;
+  // if it does, the ref is left out of `prior` and the cleanup uses the delete.
+  const seen = new Set<string>();
+  const repeated = new Set<string>();
+  for (const r of rows) {
+    const k = conflictRefKey(r.chapter, r.verse);
+    if (seen.has(k)) repeated.add(k);
+    seen.add(k);
+  }
+  if (prior && repeated.size > 0) {
+    console.warn("verseMergeConflicts: ref recorded twice in one call; its lost-race cleanup will delete, not restore", {
+      book, resource, refs: [...repeated],
+    });
+  }
   try {
     for (let i = 0; i < rows.length; i += WRITE_BATCH) {
       const slice = rows.slice(i, i + WRITE_BATCH);
@@ -266,7 +282,7 @@ export async function recordVerseMergeConflicts(
         const found = new Map(captured.map((p) => [conflictRefKey(p.chapter, p.verse), p]));
         for (const r of slice) {
           const k = conflictRefKey(r.chapter, r.verse);
-          if (!prior.has(k)) prior.set(k, found.get(k) ?? null);
+          if (!prior.has(k) && !repeated.has(k)) prior.set(k, found.get(k) ?? null);
         }
       }
     }

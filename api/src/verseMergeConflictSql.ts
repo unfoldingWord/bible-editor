@@ -513,6 +513,17 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
 // alerted anyone. This statement cannot make that distinction itself: by the
 // time it runs, the upsert has already rewritten the row's action.
 //
+// Issue #1132 review: the confirm also bumps recorded_generation. A landed
+// overwrite is a write the lost-race restore (RESTORE_LOST_ADOPTION_CONFLICT_SQL)
+// must never undo, and that restore runs only while the generation is still
+// the one its own upsert left. Without the bump, two overlapping runs on one
+// verse (the nightly Workflow takes no book import lock) could interleave so
+// that run B's restore, from a capture of run A's speculative state, rewound
+// the row A had just confirmed at tonight's pointer back to the resolved
+// June pointer, now unresolved. The only other reader of the token,
+// RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL, matches kept-D1 actions this
+// statement never touches.
+//
 // Binds, in order: (book, resource, chapter, verse, now, overwrittenVersion,
 // alignmentJson).
 // ---------------------------------------------------------------------------
@@ -520,7 +531,8 @@ export const CONFIRM_ADOPTED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
     SET detected_at = CASE WHEN resolved_at IS NULL THEN detected_at ELSE ?5 END,
         overwritten_version = CASE WHEN resolved_at IS NULL THEN overwritten_version ELSE ?6 END,
         alignment = CASE WHEN resolved_at IS NULL THEN alignment ELSE ?7 END,
-        resolved_at = NULL, resolved_by = NULL
+        resolved_at = NULL, resolved_by = NULL,
+        recorded_generation = recorded_generation + 1
   WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
     AND action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')`;
 
