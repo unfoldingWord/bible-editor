@@ -448,7 +448,11 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
 // recover v4 and never alerted the author of tonight's overwritten v11. June's
 // lost-word snapshot likewise describes a loss someone already dealt with, so
 // ?7 replaces it even when tonight's is NULL. A row still unresolved keeps its
-// first pointer and snapshot, as it keeps its detected_at.
+// first pointer, as it keeps its detected_at. Its snapshot is NOT kept: it is
+// whatever the speculative upsert last wrote (that statement's
+// COALESCE(excluded.alignment, ...) takes tonight's whenever it is non-null),
+// so on an unresolved row the pointer and the snapshot can describe different
+// overwrites. That gap predates #1112 and is tracked in issue #1124.
 //
 // Binds, in order: (book, resource, chapter, verse, now, overwrittenVersion,
 // alignmentJson).
