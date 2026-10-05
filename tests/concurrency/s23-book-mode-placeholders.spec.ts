@@ -1,7 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import { newUserContext } from "./helpers";
 
-// S22 — issue #1120: book mode lets the browser skip layout for chapters far
+// S23 — issue #1120: book mode lets the browser skip layout for chapters far
 // off screen (`content-visibility: auto`, #909 step 1). A skipped chapter is
 // sized by a placeholder: the browser's remembered size of its last layout,
 // or an estimate if it was never laid out. When the placeholder is wrong, the
@@ -15,7 +15,11 @@ import { newUserContext } from "./helpers";
 //      they loaded before the active chapter was measured.
 //
 // What this guards: every loaded chapter's shown height equals the height it
-// has when laid out in full, after a column toggle and after a far jump.
+// has when laid out in full, after a column toggle and after a far jump; and,
+// with scroll anchoring turned off as in Safari, the verse row at the top of
+// the view stays put across a toggle (a toggle re-lays out every chapter
+// above it at once, which without BookView's ColumnToggleAnchor moved the
+// view by thousands of pixels).
 
 const BOOK = "ZEC";
 
@@ -35,6 +39,36 @@ async function wrongPlaceholders(page: Page): Promise<{ chapter: number; errPx: 
       .map((b, i) => ({ chapter: Number(b.dataset.chapterBlock), errPx: Math.round(shown[i] - real[i]) }))
       .filter((e) => Math.abs(e.errPx) > 1);
   });
+}
+
+// The verse row at the top of the scroll box: its chapter-verse and offset.
+async function topRow(page: Page): Promise<{ id: string; offset: number }> {
+  const row = await page.evaluate(() => {
+    let el = document.querySelector("[data-chapter-block]")?.parentElement ?? null;
+    while (el && getComputedStyle(el).overflowY !== "auto") el = el.parentElement;
+    if (!el) return null;
+    const top = el.getBoundingClientRect().top;
+    for (const c of el.querySelectorAll<HTMLElement>("[data-find-cell]")) {
+      const r = c.getBoundingClientRect();
+      if (r.height === 0 || r.bottom <= top) continue;
+      const [ch, v] = (c.dataset.findCell ?? "").split("-");
+      return { id: `${ch}-${v}`, offset: r.top - top };
+    }
+    return null;
+  });
+  expect(row).not.toBeNull();
+  return row!;
+}
+
+// How far that row has moved since `before` was read.
+async function topRowMovedPx(page: Page, before: { id: string; offset: number }): Promise<number> {
+  return page.evaluate(({ id, offset }) => {
+    let el = document.querySelector("[data-chapter-block]")?.parentElement ?? null;
+    while (el && getComputedStyle(el).overflowY !== "auto") el = el.parentElement;
+    const c = el?.querySelector(`[data-find-cell^="${id}-"]`);
+    if (!el || !c) return Number.POSITIVE_INFINITY;
+    return Math.round(c.getBoundingClientRect().top - el.getBoundingClientRect().top - offset);
+  }, before);
 }
 
 async function scroller(page: Page) {
@@ -73,20 +107,27 @@ async function openBookMode(page: Page, chapter: number) {
   await settle(page);
 }
 
-test.describe("S22 — book-mode placeholder heights (#1120)", () => {
+test.describe("S23 — book-mode placeholder heights (#1120)", () => {
   test.setTimeout(180_000);
 
   test("after a column toggle, every loaded chapter keeps its real height", async ({ browser }) => {
-    const { context } = await newUserContext(browser, "s22-toggle");
+    const { context } = await newUserContext(browser, "s23-toggle");
     await context.addInitScript(() => {
       try {
-        if (!sessionStorage.getItem("s22")) {
-          sessionStorage.setItem("s22", "1");
+        if (!sessionStorage.getItem("s23")) {
+          sessionStorage.setItem("s23", "1");
           localStorage.setItem("be:enabledVersions", JSON.stringify(["ULT", "UST"]));
         }
       } catch {
         /* private mode */
       }
+      // No scroll anchoring, as in Safari: nothing absorbs a height change
+      // above the view, so the top-row checks below see every jump.
+      document.addEventListener("DOMContentLoaded", () => {
+        const s = document.createElement("style");
+        s.textContent = "*{overflow-anchor:none !important}";
+        document.head.appendChild(s);
+      });
     });
     const page = await context.newPage();
     await page.setViewportSize({ width: 1400, height: 900 });
@@ -106,6 +147,13 @@ test.describe("S22 — book-mode placeholder heights (#1120)", () => {
       if (done) break;
     }
     await settle(page);
+    // The whole book must be loaded, or the checks below skip chapters.
+    await expect(page.getByText("(scroll to load)")).toHaveCount(0);
+    await expect(page.getByText(/loading…/)).toHaveCount(0);
+    const caption = (await page.getByText(/ch · loaded/).first().textContent()) ?? "";
+    const [, total, loaded] = caption.match(/(\d+) ch · loaded (\d+)/) ?? [];
+    expect(Number(loaded)).toBeGreaterThan(0);
+    expect(loaded).toBe(total);
     await page.evaluate(() => {
       location.hash = "#/ZEC/14/5";
     });
@@ -113,18 +161,22 @@ test.describe("S22 — book-mode placeholder heights (#1120)", () => {
     expect(await wrongPlaceholders(page)).toEqual([]);
 
     const versions = page.getByRole("group", { name: "visible versions" });
+    const topOn = await topRow(page);
     await versions.getByRole("button", { name: "UHB", exact: true }).click();
     await settle(page);
+    expect(Math.abs(await topRowMovedPx(page, topOn))).toBeLessThan(50);
     expect(await wrongPlaceholders(page)).toEqual([]);
 
+    const topOff = await topRow(page);
     await versions.getByRole("button", { name: "UHB", exact: true }).click();
     await settle(page);
+    expect(Math.abs(await topRowMovedPx(page, topOff))).toBeLessThan(50);
     expect(await wrongPlaceholders(page)).toEqual([]);
     await context.close();
   });
 
   test("chapters loaded but never shown are sized at their real height", async ({ browser }) => {
-    const { context } = await newUserContext(browser, "s22-firstwave");
+    const { context } = await newUserContext(browser, "s23-firstwave");
     const page = await context.newPage();
     await page.setViewportSize({ width: 1400, height: 900 });
     await openBookMode(page, 1);
