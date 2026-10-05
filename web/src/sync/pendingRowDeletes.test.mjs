@@ -133,7 +133,7 @@ const ids = (rows) => rows.map((r) => r.id);
 {
   let ops = [del("tq", "q1", "in_flight")];
   let resolveGet;
-  const load = wrap(() => new Promise((r) => (resolveGet = r)), async () => ops, () => () => {});
+  const load = wrap(() => new Promise((r) => (resolveGet = r)), async () => ops, { watch: () => () => {} });
   const p = load(new AbortController().signal, () => {});
   await new Promise((r) => setTimeout(r, 0)); // the before-read has run
   ops = []; // DELETE 200: op removed
@@ -147,12 +147,12 @@ const ids = (rows) => rows.map((r) => r.id);
 {
   let ops = [del("tq", "q1")];
   const listeners = new Set();
-  const onAbandoned = (fn) => {
-    listeners.add(fn);
-    return () => listeners.delete(fn);
+  const watch = (on) => {
+    listeners.add(on.abandoned);
+    return () => listeners.delete(on.abandoned);
   };
   let resolveGet;
-  const load = wrap(() => new Promise((r) => (resolveGet = r)), async () => ops, onAbandoned);
+  const load = wrap(() => new Promise((r) => (resolveGet = r)), async () => ops, { watch });
   const p = load(new AbortController().signal, () => {});
   await new Promise((r) => setTimeout(r, 0));
   const refused = ops[0];
@@ -163,21 +163,100 @@ const ids = (rows) => rows.map((r) => r.id);
   check(ids(out.tq).join() === "q1,q2", "#1108: a DELETE refused or discarded during the GET is not hidden by the before-read");
   check(listeners.size === 0, "the abandon subscription is released when the load settles");
 }
-{
-  // A failing subscription is fail-safe too.
-  const p = payload();
-  const warn = console.warn;
+// A controllable run: `step(snapshot)` lets the before-read happen, then the
+// test changes `ops` / fires outcomes, then the GET resolves.
+function run({ ops: initial, isOwn, failBefore = false, failWatch = false }) {
+  const state = { ops: initial, on: null };
+  let reads = 0;
+  let resolveGet;
+  const quiet = console.warn;
+  const load = wrap(
+    () => new Promise((r) => (resolveGet = r)),
+    async () => {
+      reads++;
+      if (failBefore && reads === 1) throw new Error("IndexedDB hiccup");
+      return state.ops;
+    },
+    {
+      watch: (on) => {
+        if (failWatch) throw new Error("listener registry broken");
+        state.on = on;
+        return () => (state.on = null);
+      },
+      ...(isOwn ? { isOwn } : {}),
+    },
+  );
   console.warn = () => {};
-  let out;
-  try {
-    const load = wrap(async () => p, async () => [del("tq", "q1")], () => {
-      throw new Error("listener registry broken");
-    });
-    out = await load(new AbortController().signal, () => {});
-  } finally {
-    console.warn = warn;
-  }
-  check(out === p, "a subscription failure lands the snapshot unchanged");
+  const p = load(new AbortController().signal, () => {});
+  state.finish = async (snapshot = payload()) => {
+    resolveGet(snapshot);
+    try {
+      return await p;
+    } finally {
+      console.warn = quiet;
+    }
+  };
+  state.ready = () => new Promise((r) => setTimeout(r, 0));
+  return state;
+}
+{
+  // A failing subscription skips the before-set (an abandoned op could not be
+  // told apart) but the after-read still hides a draining delete.
+  const r = run({ ops: [del("tq", "q1")], failWatch: true });
+  await r.ready();
+  const out = await r.finish();
+  check(ids(out.tq).join() === "q2", "a subscription failure still applies the after-read");
+}
+{
+  // ...and a before-set op gone by the after-read is not hidden then.
+  const r = run({ ops: [del("tq", "q1")], failWatch: true });
+  await r.ready();
+  r.ops = [];
+  const out = await r.finish();
+  check(ids(out.tq).join() === "q1,q2", "with no subscription a vanished op is not trusted as committed");
+}
+{
+  // Cursor minor: a failed before-read still runs the after-read filter.
+  const r = run({ ops: [del("tq", "q1")], failBefore: true });
+  await r.ready();
+  const out = await r.finish();
+  check(ids(out.tq).join() === "q2", "a failed before-read still applies the after-read");
+}
+// B1: an op draining at the before-read that turns into a conflict or a
+// refusal waiting on the user during the GET is judged by its later status:
+// the row shows while the sync UI asks the user about it.
+for (const status of ["conflict", "failed"]) {
+  const r = run({ ops: [del("tq", "q1")] });
+  await r.ready();
+  r.ops = [{ ...r.ops[0], status }];
+  const out = await r.finish();
+  check(ids(out.tq).join() === "q1,q2", `a DELETE that became ${status} during the GET shows its row`);
+}
+// B2: deleted after the before-read and committed before the after-read:
+// neither read sees it, its 200 does.
+{
+  const r = run({ ops: [] });
+  await r.ready();
+  r.on.committed(del("tq", "q1", "in_flight"));
+  const out = await r.finish();
+  check(ids(out.tq).join() === "q2", "a DELETE that committed during the GET, unseen by both reads, stays hidden");
+}
+// B3: only this tab's own deletes are hidden; another tab's refusal would
+// never be announced here.
+{
+  const mine = (t) => t.id === "q1";
+  const r = run({ ops: [del("tq", "q1"), del("tq", "q2"), del("twl", "w1")], isOwn: mine });
+  await r.ready();
+  r.ops = [del("tq", "q1"), del("twl", "w1")]; // the other tab's q2 op left
+  const out = await r.finish();
+  check(ids(out.tq).join() === "q2" && ids(out.twl).join() === "w1,w2", "another tab's DELETE (draining or gone) hides nothing here");
+}
+{
+  // The registry Shell marks: a row is own only after markOwnRowDelete.
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "zz" }) === false, "an unmarked delete is not own");
+  mod.markOwnRowDelete?.("tq", "ZEC", "zz");
+  check(mod.isOwnRowDelete?.({ rowKind: "tq", book: "ZEC", id: "zz" }) === true, "markOwnRowDelete makes it own");
+  check(mod.isOwnRowDelete?.({ rowKind: "twl", book: "ZEC", id: "zz" }) === false, "own is per row kind");
 }
 
 console.log(`pendingRowDeletes: ${passed} passed`);

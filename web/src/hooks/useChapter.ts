@@ -20,7 +20,7 @@ import {
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxDiscard, onOutboxResult, outbox } from "../sync/outbox";
-import { hidingPendingRowDeletes } from "../sync/pendingRowDeletes";
+import { hidingPendingRowDeletes, isOwnRowDelete } from "../sync/pendingRowDeletes";
 import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
 import { currentRouteFetcher, isChapterLocked, trackNavigation, updateIfCurrent, type ChapterRoute, type NavigationGen } from "../lib/chapterStale";
 import {
@@ -215,25 +215,31 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     // post-unlock refetch) fetches the current chapter instead of replacing
     // its GET with the old one and leaving the view locked (#892).
     //
-    // A row whose own tq/twl DELETE is draining in the outbox is left out of
-    // whatever lands (#1107): the GET can be answered before the DELETE
-    // commits (offline, then the reconnect GET races the drain). A DELETE
-    // refused as chapter_locked or discarded meanwhile is not hidden: Shell's
-    // #1108 rollback restores that row (the same two triggers).
+    // A row whose own tq/twl DELETE (this tab's) is draining in the outbox,
+    // or committed while the GET ran, is left out of whatever lands (#1107):
+    // the GET can be answered before the DELETE commits (offline, then the
+    // reconnect GET races the drain). A DELETE refused as chapter_locked or
+    // discarded meanwhile is not hidden: Shell's #1108 rollback restores that
+    // row (the same two triggers).
     const fetchRoute = currentRouteFetcher(routeRef, (b, c, s) => api.getChapter(b, c, s));
     return sequencer.current!.refetch(
       hidingPendingRowDeletes(
         (signal, onAttempt) => fetchWithRetry(fetchRoute, { signal, onAttempt }),
         () => outbox.list(),
-        (fn) => {
-          const offResult = onOutboxResult((op, result) => {
-            if (result.kind === "locked") fn(op);
-          });
-          const offDiscard = onOutboxDiscard(fn);
-          return () => {
-            offResult();
-            offDiscard();
-          };
+        {
+          watch: (on) => {
+            const offResult = onOutboxResult((op, result) => {
+              if (op.target.kind !== "row" || op.action !== "delete") return;
+              if (result.kind === "ok") on.committed(op);
+              else if (result.kind === "locked") on.abandoned(op);
+            });
+            const offDiscard = onOutboxDiscard((op) => on.abandoned(op));
+            return () => {
+              offResult();
+              offDiscard();
+            };
+          },
+          isOwn: isOwnRowDelete,
         },
       ),
       opts?.keepNewerLocal === true,

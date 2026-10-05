@@ -98,6 +98,7 @@ import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
 import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
 import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
+import { markOwnRowDelete } from "../sync/pendingRowDeletes";
 import {
   alignmentDraftKey,
   alignmentDraftKeyForOp,
@@ -4809,6 +4810,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (!row) return;
             applyLocalRowDelete("twl", id);
             if (activeWordId === id) setActiveWordId(null);
+            markOwnRowDelete("twl", row.book, id); // a refetch keeps it hidden (#1107)
             void outbox.enqueueDeleteRow("twl", id, row.version, row.book);
           }}
           onQuestionSave={(id, patch, opts) => {
@@ -4820,6 +4822,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (!row) return;
             applyLocalRowDelete("tq", id);
             if (activeQuestionId === id) setActiveQuestionId(null);
+            markOwnRowDelete("tq", row.book, id); // a refetch keeps it hidden (#1107)
             void outbox.enqueueDeleteRow("tq", id, row.version, row.book);
           }}
           lockedTn={Boolean(chapterLocks.tn)}
