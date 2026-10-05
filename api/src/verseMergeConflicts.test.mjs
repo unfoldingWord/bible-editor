@@ -3219,6 +3219,39 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
     assert(liveFor(sqlite, "jdoe").length === 0, "retry after a dead attempt: v7's author is not alerted");
   }
+
+  // (q) Two overlapping runs on one verse (the nightly Workflow takes no book
+  // import lock). June's resolved adopt_conflict points at v4. Run A upserts;
+  // run B upserts and captures A's speculative state as its "prior"; A's CAS
+  // lands and its confirm reactivates the row at v11; B's CAS loses. B's
+  // cleanup must not rewind A's landed alert to June's v4.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authored(sqlite, 4, 35, 4);
+    authoredBy(sqlite, 8, 4, 35, 11);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 35, 4), alignment: snap("june") }], JUN10);
+    humanResolve(sqlite, 4, 35, JUN10 + 86400);
+    const tonightA = { ...overwrite(4, 35, 11), alignment: snap("october") };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [tonightA], OCT05, new Map()); // run A
+    const priorB = new Map();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [tonightA], OCT05 + 20, priorB); // run B
+    await confirmAdoptedConflicts(env, "EZK", "ust", [tonightA], OCT05); // A's CAS landed
+    await lostRace(env, 4, 35, OCT05 + 20, priorB, OCT05 + 20); // B's CAS lost
+    const r = row(sqlite, 4, 35);
+    assert(r?.resolved_at === null, "overlapping runs: A's landed overwrite stays active");
+    assert(
+      r?.overwritten_version === 11 && lostWords(r) === "october" && r?.detected_at === OCT05,
+      `overlapping runs: the row keeps A's v11, its snapshot and date (got v${r?.overwritten_version}, ${r && lostWords(r)}, ${r?.detected_at})`,
+    );
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const toJdoe = liveFor(sqlite, "jdoe");
+    assert(
+      toJdoe.length === 1 && toJdoe[0].message.includes("4:35@v11"),
+      `overlapping runs: v11's author is alerted (got: ${toJdoe.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+    assert(liveFor(sqlite, "bcameron93").length === 0, "overlapping runs: v4's author is not told to recover June's loss");
+  }
 }
 
 if (failed) {
