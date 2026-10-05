@@ -349,7 +349,7 @@ console.log("\n[a COERCED id must never count as blocked — review finding F4]"
 {
   const { sqlite, env } = freshEnv();
   seedTombstone(sqlite, { ref: "5:4", chapter: 5, verse: 4 });
-  // coerceRowId hashes a malformed master id into a 96-id space, so landing on
+  // coerceRowId hashes a malformed master id into a new one, so landing on
   // an unrelated tombstone at a different reference is an expected collision,
   // not evidence master reissued anything. Counting it would freeze the export.
   const counts = await applyTsvRows(env, BOOK, "tq", [masterRow({ ref: "23:7", idCoerced: true })], null);
@@ -1133,7 +1133,7 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
     eq(counts.merge_conflicts, 1, "…one merge_conflicts row (the adopting write)");
     eq(counts.merge_master_wins, 1, "…surfaced as a master-wins flag for review (#706)");
-    eq(row.review_reason.includes("was merged over your app-side change"), true, "…with the pre-existing wording");
+    eq(row.review_reason.includes("was merged over a different change saved in the app"), true, "…with the merge_conflict wording (#1090)");
     // #684: HAS_HUMAN is the pre-#684 shape (shas, no identity), so the message
     // is byte-identical to what it was before this shipped.
     eq(row.review_reason.includes("Door43 edits to this file:"), false, "…and, with no identity measured, names nobody");
@@ -1158,7 +1158,7 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
     eq(row.review_kind, "merge_conflict", "…flagged the same way");
     eq(
-      row.review_reason.startsWith("A Door43 edit to this row's response was merged over your app-side change."),
+      row.review_reason.startsWith("A Door43 edit to this row's response was merged over a different change saved in the app."),
       true,
       "…the outcome still leads (the chip clamps to two lines)",
     );
@@ -2982,6 +2982,185 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
   }
 }
 
+console.log("\n[issue #691: clearResolvedMergeNoBase consults the dcs_commits ledger before a live walk]");
+{
+  // Real schema, real tables: dcs_repo_polls / dcs_commits (migrations 0059 +
+  // 0065) exactly as readLedgerMasterLineage reads them, and the real
+  // clearResolvedMergeNoBase (via its *ForTest alias) — not a re-typed mock of
+  // either.
+  const NOW = Math.floor(Date.now() / 1000);
+  const FILE = { repo: "en_tq", path: "tq_1CH.tsv" };
+  const WINDOW_START = NOW - 5 * 86400;
+  const REPO_HEAD = "ledgertip1";
+
+  const seedLedgerPoll = (
+    sqlite,
+    { lastSha = REPO_HEAD, coverageSince = WINDOW_START - 86400, lastSuccessAt = NOW - 60 } = {},
+  ) => {
+    sqlite
+      .prepare(
+        `INSERT INTO dcs_repo_polls (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
+                                      last_status, gap_since_sha, gap_at, coverage_since)
+         VALUES (?, ?, ?, ?, ?, 'ok', NULL, NULL, ?)`,
+      )
+      .run(FILE.repo, lastSha, NOW, NOW, lastSuccessAt, coverageSince);
+  };
+
+  const seedLedgerCommit = (sqlite, { sha, committedAt, classification, message, authorEmail = "maintainer@example.com" }) => {
+    sqlite
+      .prepare(
+        `INSERT INTO dcs_commits (repo, sha, parent_sha, author_name, author_email, committed_at, message,
+                                   classification, classification_reason, files_json, seen_at)
+         VALUES (?, ?, NULL, 'Someone', ?, ?, ?, ?, 'unrecognized', ?, ?)`,
+      )
+      .run(FILE.repo, sha, authorEmail, committedAt, message, classification, JSON.stringify([FILE.path]), NOW - 30);
+  };
+
+  const seedFlaggedRow = (sqlite, id) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by,
+                              updated_at, review_kind, review_reason, review_master_json)
+         VALUES (?, ?, 3, 1, '3:1', 'app question', 'r', 4, 1, ?, 'merge_no_base', 'some earlier reason', ?)`,
+      )
+      .run(
+        id,
+        BOOK,
+        WINDOW_START + 100,
+        JSON.stringify({ question: "master q", _meta: { flag_at: WINDOW_START + 100, flag_since: WINDOW_START } }),
+      );
+  };
+
+  // A fetch stub that distinguishes repoHeadCommitSha's own probe (no `path=`
+  // in its URL — it asks for the repo's live tip, not one file's history) from
+  // an actual listMasterCommitsSince walk/probe/recheck (always `path=`).
+  // `onWalk` fires only for the latter, so a test can prove whether a live
+  // walk ever ran.
+  const ledgerAwareFetch = (repoHeadSha, walkCommits, onWalk) => async (url) => {
+    if (!String(url).includes("path=")) {
+      return { ok: true, headers: { get: () => null }, json: async () => [{ sha: repoHeadSha }] };
+    }
+    if (onWalk) onWalk();
+    return giteaPage(walkCommits)();
+  };
+
+  // (a) The ledger alone proves a human commit landed inside the window — a
+  //     commit an AUTHOR-DATE-bounded walk would miss (its author date, if it
+  //     had one modeled here, sits before WINDOW_START; what the ledger
+  //     actually keys on, committer date via `committed_at`, sits after it —
+  //     the shape a rebase or cherry-pick produces). The live-walk stub below
+  //     would answer "clean" if it were ever asked, so a false clear can only
+  //     mean the ledger path was skipped.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691a");
+    seedLedgerPoll(sqlite);
+    seedLedgerCommit(sqlite, {
+      sha: "latehuman",
+      committedAt: WINDOW_START + 3600,
+      classification: "human",
+      message: "Fixes a typo pushed late",
+    });
+    const realFetch = globalThis.fetch;
+    let liveWalkCalled = 0;
+    globalThis.fetch = ledgerAwareFetch(REPO_HEAD, OURS_AND_AI_PAGE.commits, () => liveWalkCalled++);
+    let cleared;
+    try {
+      // walkStart/walked both null (no run walk to reuse, the sweep's own
+      // shape) and an explicit masterSha so PASS B's tip probe is skipped —
+      // isolating the walk-fetch branch this change touches.
+      cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(cleared, 0, "a human commit the ledger alone proves in-window blocks the clear");
+    eq(liveWalkCalled, 0, "…found via the ledger, never falling back to a live Gitea walk");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id = 'lg691a'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "…the flag stands");
+  }
+
+  // (b) The ledger is load-bearing both ways: proving zero human commits (only
+  //     our own export in range) lets the clear proceed, entirely from the
+  //     ledger's data — the pre-write tip recheck is the only live fetch this
+  //     path still needs, and it must see the ledger's own newest commit held
+  //     steady.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691b");
+    seedLedgerPoll(sqlite);
+    seedLedgerCommit(sqlite, {
+      sha: "ourexport1",
+      committedAt: WINDOW_START + 3600,
+      classification: "ours",
+      message: "bible-editor: 1CH tq → master (#1)",
+      authorEmail: "someone@example.com",
+    });
+    const recheckCommit = [{
+      sha: "ourexport1",
+      message: "bible-editor: 1CH tq → master (#1)",
+      authorEmail: "someone@example.com",
+      authorName: "Someone",
+      date: new Date((WINDOW_START + 3600) * 1000).toISOString(),
+    }];
+    const cleared = await withFetch(ledgerAwareFetch(REPO_HEAD, recheckCommit), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip"),
+    );
+    eq(cleared, 1, "a ledger showing zero human commits still lets the clear proceed");
+  }
+
+  // (c) No ledger poll recorded for this repo at all: falls back to the live
+  //     walk exactly as #665 shipped it, unchanged by this addition.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691c");
+    const cleared = await withFetch(ledgerAwareFetch(REPO_HEAD, OURS_AND_AI_PAGE.commits), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip"),
+    );
+    eq(cleared, 1, "no ledger poll recorded: falls back to the live walk, unchanged");
+  }
+
+  // (d) 2026-09-21 review finding: a ledger row is already classified by
+  //     classifyForLedger (dcsCommitPoll.ts), which unwraps a Gitea merge-commit
+  //     wrapper before deciding — repo-scoped ledger history is full of these
+  //     (measured ~26%, classifyForLedger's own doc), and path-scoped Gitea
+  //     history (what the live walk sees) mostly hides them. Blindly re-running
+  //     the FULL-subject-only classifyMasterCommit on a ledger row throws that
+  //     unwrap away: classifyForLedger's own doc example —
+  //     `Merge pull request 'bible-editor: LAM ult → master' (#6555) from
+  //     LAM-be into master` — is stored `ours`, but classifyMasterCommit alone
+  //     (OURS_PREFIX is anchored at the subject's start, so a "Merge pull
+  //     request '…'" envelope never matches it) reclassifies it `human`. A
+  //     `human` verdict blocks the clear; `ours` does not — so this is a
+  //     differential test, not just a classification check. Before this fix
+  //     (trusting a ledger-sourced commit's own stored kind, later unified
+  //     with #867's `ledgerSourcedWalk` plumbing) this cleared 0 (blocked); it
+  //     must clear the flag.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlaggedRow(sqlite, "lg691d");
+    seedLedgerPoll(sqlite);
+    seedLedgerCommit(sqlite, {
+      sha: "mergewrap1",
+      committedAt: WINDOW_START + 3600,
+      classification: "ours",
+      message: "Merge pull request 'bible-editor: LAM ult → master' (#6555) from LAM-be into master",
+      authorEmail: "someone@example.com",
+    });
+    const recheckCommit = [{
+      sha: "mergewrap1",
+      message: "Merge pull request 'bible-editor: LAM ult → master' (#6555) from LAM-be into master",
+      authorEmail: "someone@example.com",
+      authorName: "Someone",
+      date: new Date((WINDOW_START + 3600) * 1000).toISOString(),
+    }];
+    const cleared = await withFetch(ledgerAwareFetch(REPO_HEAD, recheckCommit), () =>
+      clearResolvedMergeNoBaseForTest(env, BOOK, "tq", null, null, FILE, "someTip"),
+    );
+    eq(cleared, 1, "a merge-wrapper commit the ledger already classified `ours` is not re-derived as `human`");
+  }
+}
+
 console.log("\n[issue #672: a torn row (ref_raw ahead of its own stored chapter/verse) self-heals]");
 {
   // The shape rows.ts's cross-chapter REF retype produces: ref_raw already
@@ -3585,7 +3764,9 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
   //     subrequest limit, so one sweep hands at most NO_BASE_SWEEP_MAX_PAIRS
   //     (10) pairs to the clear however many books hold flags. Every book here
   //     is walkable, so the number of pairs that reached a walk is exactly the
-  //     number of first-page fetches.
+  //     number of first-page fetches: one tip probe, one repo-head probe for
+  //     the ledger attempt (#691 — it fails closed on "network down" and the
+  //     walk falls back to live, same as before), and one live walk attempt.
   {
     const { sqlite, env } = freshEnv();
     const books = ["1CH", "2CH", "AMO", "DAN", "ECC", "EZK", "HAB", "HOS", "ISA", "JER", "JOB", "JOL", "JON", "LAM", "MIC"];
@@ -3601,7 +3782,11 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
       const result = await sweepStaleMergeNoBase(env);
       eq(result.pairs, 15, "every flagged pair is found…");
       eq(result.swept, 10, "…but only the night's ration is handed to the clear");
-      eq(called, 20, "…so the Gitea budget is bounded too: one tip probe plus one walk per rationed pair");
+      eq(
+        called,
+        30,
+        "…so the Gitea budget is bounded too: one tip probe, one ledger repo-head probe, one walk per rationed pair",
+      );
     } finally {
       globalThis.fetch = realFetch;
     }
@@ -4028,6 +4213,33 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
     eq(s.confirmedEditId, 11, `${label} lineage does not advance master_confirmed_edit_id`);
   }
 
+  // (a3) #1058: the stamp is only accepted for a merge at or before the commit
+  //      the caller's file was fetched at. The prod shape (file head = the bot
+  //      push on top of our merge, or our merge itself) still stamps, so the
+  //      gate does not starve the nightly; a file fetched before our merge
+  //      landed, or an unknown fetch sha, withholds it. The verdict itself
+  //      (counter reset, banner down) is unaffected either way.
+  for (const [label, pinned, walkedCommits, stamps] of [
+    ["file head is the bot push after our merge", BOT_PUSH.sha, [BOT_PUSH, OUR_MERGE], true],
+    ["file head is our merge", OUR_MERGE.sha, [OUR_MERGE], true],
+    ["our merge landed after the file was fetched", "a1".repeat(6), [OUR_MERGE, { ...BOT_PUSH, sha: "a1".repeat(6), date: "2026-09-01T05:00:00Z" }], false],
+    ["fetched sha is not in the walk", "ffffffffffff", [BOT_PUSH, OUR_MERGE], false],
+    ["fetched sha unknown", null, [BOT_PUSH, OUR_MERGE], false],
+  ]) {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    const g = gitea(walkedCommits, PUSHED);
+    const walked = { commits: walkedCommits, incomplete: false, incompleteReason: "" };
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, walked, sync, Date.now(), pinned));
+    const s = readState(sqlite);
+    eq(s.declines, 0, `#1058 ${label}: the preserved verdict still resets the counter`);
+    eq(
+      { confirmedAt: s.confirmedAt, confirmedEditId: s.confirmedEditId },
+      stamps ? { confirmedAt: READ_AT, confirmedEditId: PUSHED_EDIT_ID } : { confirmedAt: 1000, confirmedEditId: 11 },
+      `#1058 ${label}: ${stamps ? "#658 stamps the pushed render" : "#658 stamp withheld"}`,
+    );
+  }
+
   // (b) The same night with the lineage walk handed in: no second commit fetch.
   {
     const { sqlite, env } = freshEnv();
@@ -4345,6 +4557,220 @@ console.log("\n[#728 journey: an exported bridge a human un-bridged on Door43 is
     "idempotent: one no-op, one converged edited row, no structural decision",
   );
   eq(rows().map((r) => r.version), [3, 2], "…and no version moved");
+}
+
+// ── Issue #1090: a locked book's frozen ancestor must not turn the sync's own
+// earlier adoption into a false "both changed" flag ─────────────────────────
+// A locked book skips the export, so master_confirmed_at never advances and the
+// ancestor reconstructTsvBases folds stays at the last pre-lock export. Night 1
+// Door43 moves a field v0 -> v1 and the sync adopts it cleanly; night 2 Door43
+// moves it to v2. D1's v1 came only from the sync itself, which wrote Door43's
+// own value, so D1 did not move: night 2 must be a clean adopt with no flag. A
+// real app or AI edit after the sync's adoption must still flag.
+console.log("\n[#1090: locked book, Door43 edits a field on two nights]");
+{
+  const HAS_HUMAN = {
+    mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+  };
+  const seed = (sqlite, { locked }) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    // Translator-owned row (updated_by set), so it reaches the three-way merge.
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, sort_order, updated_by, version)
+         VALUES ('lk01', ?, 1, 2, '1:2', null, 'the question', 'v0', 10, 7, 3)`,
+      )
+      .run(BOOK);
+    // The ancestor: what the last export (before the lock) published.
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tq', 'lk01', ?, 'create', ?, 100)`,
+      )
+      .run(BOOK, JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2", question: "the question", response: "v0" }));
+    if (locked) sqlite.prepare(`INSERT INTO book_locks (book, locked, reason) VALUES (?, 1, 'test lock')`).run(BOOK);
+    return Number(e.lastInsertRowid);
+  };
+  const master = (response) => ({
+    id: "lk01", idCoerced: false, refRaw: "1:2", chapter: 1, verse: 2,
+    occurrence: null, tags: null, quote: null, question: "the question", response,
+  });
+  const readRow = (sqlite) =>
+    sqlite.prepare(`SELECT response, review_kind, review_reason, version FROM tq_rows WHERE id='lk01'`).all()[0];
+  // A later D1 edit to the response by someone other than the sync. `source`
+  // null is a human PATCH (rows.ts), 'ai_pipeline' an AI auto-apply.
+  const appEdit = (sqlite, value, source) => {
+    const v = readRow(sqlite).version;
+    sqlite.prepare(`UPDATE tq_rows SET response = ?, version = ? WHERE id = 'lk01'`).run(value, v + 1);
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+         VALUES ('tq', 'lk01', ?, 7, ?, ?, 'update', ?, ?, 300)`,
+      )
+      .run(BOOK, v, v + 1, JSON.stringify({ response: value }), source);
+  };
+  const night = (env, boundary, response) =>
+    applyTsvRows(env, BOOK, "tq", [master(response)], null, { confirmedAt: 200, editId: boundary, lineage: HAS_HUMAN });
+
+  // A. Locked, no app edit between the two nights: both nights adopt cleanly.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, { locked: true });
+    const n1 = await night(env, boundary, "v1");
+    eq([readRow(sqlite).response, n1.merge_adopted, n1.merge_conflicts], ["v1", 1, 0], "locked night 1: Door43's v1 adopted cleanly");
+    const syncLog = sqlite
+      .prepare(`SELECT action, source FROM edit_log WHERE row_key = 'lk01' ORDER BY id DESC LIMIT 1`)
+      .all()[0];
+    eq([syncLog.action, syncLog.source], ["update", "dcs_reimport"], "…and the adoption is logged as the sync's own write");
+    const n2 = await night(env, boundary, "v2");
+    const row = readRow(sqlite);
+    eq(row.response, "v2", "locked night 2: Door43's v2 lands");
+    eq([n2.merge_adopted, n2.merge_conflicts, n2.merge_master_wins], [1, 0, 0], "…as a clean adopt, not a both-changed conflict");
+    eq(row.review_kind, null, "…and the row is NOT flagged: nobody in the app changed it");
+  }
+
+  // B. Locked, a translator edits the response between the nights: still flagged.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, { locked: true });
+    await night(env, boundary, "v1");
+    appEdit(sqlite, "the translator's edit", null);
+    const n2 = await night(env, boundary, "v2");
+    const row = readRow(sqlite);
+    eq(row.response, "v2", "locked + app edit: Door43 still wins");
+    eq([n2.merge_conflicts, n2.merge_master_wins], [1, 1], "…counted as a both-changed master win");
+    eq(row.review_kind, "merge_conflict", "…and the row IS flagged");
+    eq(
+      row.review_reason.startsWith("A Door43 edit to this row's response was merged over a different change saved in the app."),
+      true,
+      "…with wording that claims only what was measured",
+    );
+    // C'. The night after, Door43 moves it again with no further app edit: the
+    // sync's night-2 write is the newest shared value, so this is clean.
+    const n3 = await night(env, boundary, "v3");
+    eq([readRow(sqlite).response, n3.merge_conflicts], ["v3", 0], "…and the next Door43 edit after that adopts without a new conflict");
+  }
+
+  // C. Locked, an AI auto-apply writes the response between the nights, and a
+  //    translator then edits the question. (With the AI write as the row's
+  //    LATEST edit the row is AI-only and the pre-existing update_ai path
+  //    overwrites it from master without reaching this merge at all; the
+  //    translator's later edit is what routes it here.) The AI's response is
+  //    not the sync's write, so it is still a both-changed field: flagged.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, { locked: true });
+    await night(env, boundary, "v1");
+    appEdit(sqlite, "the AI's rewrite", "ai_pipeline");
+    sqlite.prepare(`UPDATE tq_rows SET question = 'the translator''s question' WHERE id = 'lk01'`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, action, payload_json, source, created_at)
+         VALUES ('tq', 'lk01', ?, 7, 'update', ?, NULL, 310)`,
+      )
+      .run(BOOK, JSON.stringify({ question: "the translator's question" }));
+    const n2 = await night(env, boundary, "v2");
+    const row = readRow(sqlite);
+    eq([row.response, n2.merge_conflicts, row.review_kind], ["v2", 1, "merge_conflict"], "locked + AI edit: Door43 wins, flagged");
+  }
+
+  // D. Unlocked control: the same two nights keep the pre-#1090 outcome (the
+  //    export, not the sync, advances an unlocked book's ancestor).
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, { locked: false });
+    await night(env, boundary, "v1");
+    const n2 = await night(env, boundary, "v2");
+    const row = readRow(sqlite);
+    eq([row.response, n2.merge_conflicts, row.review_kind], ["v2", 1, "merge_conflict"], "unlocked: behavior unchanged");
+  }
+}
+
+// ── #1090 review C1: a row already flagged with the PRE-#1090 wording that
+// conflicts again on a later sync. The flag rides the adoption write, so the
+// row takes exactly ONE version bump whether or not the reason is rewritten;
+// the rewrite replaces the old wording, which claimed an app-side change.
+console.log("\n[#1090 C1: re-flag of a row carrying the old merge_conflict wording]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+  const OLD = "A Door43 edit to this row's response was merged over your app-side change. Please double-check it.";
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, sort_order, updated_by, version,
+                            review_kind, review_reason)
+       VALUES ('c1r1', ?, 1, 2, '1:2', null, 'the question', 'the app value', 10, 7, 5, 'merge_conflict', ?)`,
+    )
+    .run(BOOK, OLD);
+  const e = sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+       VALUES ('tq', 'c1r1', ?, 'create', ?, 100)`,
+    )
+    .run(BOOK, JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2", question: "the question", response: "v0" }));
+  const counts = await applyTsvRows(
+    env, BOOK, "tq",
+    [{ id: "c1r1", idCoerced: false, refRaw: "1:2", chapter: 1, verse: 2, occurrence: null, tags: null, quote: null,
+       question: "the question", response: "Door43's v2" }],
+    null,
+    { confirmedAt: 200, editId: Number(e.lastInsertRowid), lineage: {
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+    } },
+  );
+  const row = sqlite.prepare(`SELECT response, review_kind, review_reason, version FROM tq_rows WHERE id='c1r1'`).all()[0];
+  eq([row.response, counts.merge_conflicts, row.review_kind], ["Door43's v2", 1, "merge_conflict"], "C1: still a master-wins conflict");
+  eq(row.version, 6, "C1: one version bump, from the adoption write the flag rides on");
+  eq(row.review_reason.startsWith("A Door43 edit to this row's response was merged over a different change saved in the app."), true,
+    "C1: the old wording is replaced in that same write");
+}
+
+// ── #1090 review C2: a locked book's NON-provisional row with no ancestor at
+// or below the boundary (no create in edit_log: aged out, or predates it).
+// Before #1090 it stayed keep_no_base with a merge_no_base flag. Now the
+// sync's own later write is its ancestor for the fields that write named,
+// so Door43's next edit to such a field adopts cleanly. Unlocked: unchanged.
+console.log("\n[#1090 C2: locked book, no ancestor below the boundary]");
+for (const locked of [true, false]) {
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, sort_order, updated_by, version)
+       VALUES ('c2r1', ?, 1, 2, '1:2', null, 'the question', 'v1', 10, 7, 4)`,
+    )
+    .run(BOOK);
+  // Boundary marker on another row; c2r1 has nothing at or below it.
+  const b = sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at) VALUES ('tq', 'other', ?, 'create', '{}', 100)`)
+    .run(BOOK);
+  // The sync's earlier adoption of Door43's v1, above the boundary.
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, source, created_at)
+       VALUES ('tq', 'c2r1', ?, 'update', ?, 'dcs_reimport', 250)`,
+    )
+    .run(BOOK, JSON.stringify({ response: "v1" }));
+  if (locked) sqlite.prepare(`INSERT INTO book_locks (book, locked, reason) VALUES (?, 1, 'test lock')`).run(BOOK);
+  const counts = await applyTsvRows(
+    env, BOOK, "tq",
+    [{ id: "c2r1", idCoerced: false, refRaw: "1:2", chapter: 1, verse: 2, occurrence: null, tags: null, quote: null,
+       question: "the question", response: "v2" }],
+    null,
+    { confirmedAt: 200, editId: Number(b.lastInsertRowid), lineage: {
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+    } },
+  );
+  const row = sqlite.prepare(`SELECT response, review_kind FROM tq_rows WHERE id='c2r1'`).all()[0];
+  if (locked) {
+    eq([row.response, counts.merge_adopted, counts.merge_no_base, counts.merge_conflicts, row.review_kind],
+      ["v2", 1, 0, 0, null], "C2 locked: the sync's write is the ancestor; Door43's v2 adopts cleanly, no flag");
+  } else {
+    eq([row.response, counts.merge_no_base, row.review_kind],
+      ["v1", 1, "merge_no_base"], "C2 unlocked: unchanged, keep_no_base with a merge_no_base flag");
+  }
 }
 
 if (failed > 0) {

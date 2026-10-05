@@ -55,8 +55,25 @@ import {
   type HoverCtx,
 } from "../lib/alignmentHover";
 import type { TwlRow, VerseDto } from "../sync/api";
-import { alignmentDrafts, alignmentDraftKey, mintAlignmentDraftGeneration } from "../sync/alignmentDrafts";
-import { isVersionOnlyRebase, lostAlignedWords } from "../lib/alignmentDelta";
+import {
+  alignmentDrafts,
+  alignmentDraftKey,
+  mintAlignmentDraftGeneration,
+  newestCommittedAlignerSave,
+  noteRefusalKeptInPanel,
+  onAlignerSaveRefused,
+} from "../sync/alignmentDrafts";
+import { onOutboxResult, outbox } from "../sync/outbox";
+import {
+  alignmentDraftFitsRow,
+  alignmentDraftKeyForOp,
+  alignmentDraftRow,
+  isAlignerPanelSaveOp,
+  refusedDraftMayRehydrate,
+  refusedOpOrder,
+  refusedSaveStillCurrent,
+} from "../sync/alignmentDraftSaveState";
+import { isVersionOnlyRebase, lostAlignedWords, sameVerseContent } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
 import {
@@ -68,6 +85,7 @@ import {
   type StreamWord,
 } from "../lib/alignmentSuggest";
 import { SourceTooltipBody } from "./SourceTooltipBody";
+import { LexTooltip } from "./LexTooltip";
 import { UhbStrip, buildTwHintMap, twHintFromMap } from "./UhbStrip";
 import { directionForVersion } from "../lib/direction";
 import {
@@ -198,7 +216,18 @@ interface Props {
   // shared strip and the opposite panel agree on which Hebrew token is meant
   // even when the two versions cover different verse ranges. 0 standalone.
   posOffset?: number;
+  // #943: why this verse can't be written right now. "chapter" = an AI
+  // pipeline holds the chapter's verse resource (a save would 409
+  // chapter_locked); "book" = the book is locked (entry is already blocked,
+  // this covers a lock that lands while the panel is open). The panel stays
+  // open for reading, but every alignment change (drag, merge, clear, accept
+  // suggestion), Save and the history dialog's restore are disabled. See
+  // Shell's alignmentTabProps for why entry isn't gated on a pipeline lock.
+  locked?: AlignerLock;
 }
+
+// #943: see Props.locked.
+export type AlignerLock = "chapter" | "book" | false;
 
 const VerseHistoryDialog = lazy(() =>
   import("./VerseHistoryDialog").then((m) => ({ default: m.VerseHistoryDialog })),
@@ -229,6 +258,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       hideCancel = false,
       showSourceInfo = true,
       posOffset = 0,
+      locked = false,
     },
     ref,
   ) {
@@ -259,8 +289,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // already dragged in that window — the hydration guards on this ref so a
     // restore never clobbers a fresh edit (see the reset/hydration effect).
     const stateRef = useRef(state);
+    const initialRef = useRef(initial);
     useEffect(() => {
       stateRef.current = state;
+      initialRef.current = initial;
     });
     // (target key, verse.content) the panel last synced `initial`/`state` to.
     // Lets the reset effect tell a version-only bump (our own save
@@ -274,6 +306,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     const lastSyncRef = useRef<{ key: string; content: unknown; sourceContent: unknown } | null>(
       null,
     );
+    // The crash-draft read the last full reset started; see guard (3) in the
+    // reset effect below.
+    const hydrationTokenRef = useRef<object | null>(null);
     // The generation (see alignmentDrafts.ts) of the most recently PERSISTED
     // crash-draft for the CURRENT dirty session, or undefined if nothing has
     // been persisted yet (e.g. Save fires before the 400ms debounce below
@@ -283,6 +318,92 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // Save (#508). Reset to undefined whenever the panel resyncs to a
     // genuinely different target/content or the user explicitly discards.
     const lastDraftGenerationRef = useRef<string | undefined>(undefined);
+    // #1071: the panel's last committed save (its op's draft generation, the
+    // baseline from before it, and the verse it was built on), until the
+    // outbox reports on it. A save refused as chapter_locked (a lock this tab
+    // had not polled yet) is dropped from the outbox, so put the old baseline
+    // back: the drags read as unsaved again, the gates guard them and the
+    // persist effect keeps them in the crash draft. The op's generation is
+    // unique to this commit, and refusedSaveStillCurrent skips the restore
+    // when a foreign change has replaced the verse since.
+    const pendingSaveRef = useRef<{
+      generation: string;
+      baseline: AlignmentState | null;
+      version: number;
+      savedContent: unknown;
+      baseContent: unknown;
+    } | null>(null);
+    const verseRef = useRef(verse);
+    verseRef.current = verse;
+    useEffect(
+      () =>
+        onOutboxResult((op, result) => {
+          const pending = pendingSaveRef.current;
+          if (!pending || op.alignmentDraftGeneration !== pending.generation) return;
+          if (result.kind === "ok") pendingSaveRef.current = null;
+          else if (result.kind === "locked") {
+            pendingSaveRef.current = null;
+            if (refusedSaveStillCurrent(pending, verseRef.current)) {
+              setInitial(pending.baseline);
+              noteRefusalKeptInPanel(pending.generation);
+            }
+          }
+        }),
+      [],
+    );
+    // #1077: a refused save's crash draft is written after the 409, which can
+    // land after this panel's one-time draft read (Saved at the gate and
+    // reopened before the refusal; or A saved, then B refused after A's row
+    // reset the panel and dropped its record of B). Re-read it then, only
+    // when refusedDraftMayRehydrate says nothing newer can be overwritten
+    // and the draft fits the row the panel shows.
+    const sourceVerseObjectsRef = useRef(sourceVerseObjects);
+    sourceVerseObjectsRef.current = sourceVerseObjects;
+    useEffect(
+      () =>
+        onAlignerSaveRefused((op, _kept, heldInDraft) => {
+          const draftKey = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
+          if (!heldInDraft || alignmentDraftKeyForOp(op) !== draftKey) return;
+          const refused = refusedOpOrder(op);
+          void Promise.all([alignmentDrafts.get(draftKey), outbox.list()]).then(([rec, ops]) => {
+            const base = verseRef.current;
+            if (!mountedRef.current || !rec || !base || !alignmentDraftFitsRow(rec, base, verseNum)) return;
+            const otherSaves = ops
+              .filter((o) => o.id !== op.id && isAlignerPanelSaveOp(o) && alignmentDraftKeyForOp(o) === draftKey)
+              .map(refusedOpOrder);
+            const committed = newestCommittedAlignerSave(draftKey);
+            if (committed) otherSaves.push(committed);
+            if (
+              !refusedDraftMayRehydrate({
+                panelClean: stateRef.current === initialRef.current,
+                panelHasPendingSave: pendingSaveRef.current !== null,
+                refused,
+                draftFrom: rec.refusedFrom,
+                otherSaves,
+              })
+            ) {
+              return;
+            }
+            const vo = (rec.content as { verseObjects?: unknown[] }).verseObjects;
+            if (!Array.isArray(vo)) return;
+            setState(parseAlignment(vo, sourceVerseObjectsRef.current));
+            setRestored(true);
+          }).catch(() => {
+            // Best effort, like the mount-time read: the draft is still there on reopen.
+          });
+        }),
+      [book, chapter, verseNum, bibleVersion],
+    );
+    // False once the panel really unmounts (React StrictMode's dev replay sets
+    // it back to true), so a crash-draft read resolving after unmount does
+    // nothing, the way the old effect-cleanup flag behaved.
+    const mountedRef = useRef(false);
+    useEffect(() => {
+      mountedRef.current = true;
+      return () => {
+        mountedRef.current = false;
+      };
+    }, []);
     const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
     const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
@@ -401,6 +522,19 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       lastDraftGenerationRef.current = undefined;
       lastSyncRef.current =
         verse != null ? { key: targetKey, content: verse.content, sourceContent: currentSourceContent } : null;
+      hydrationTokenRef.current = null;
+      // #1071: a full reset to anything but the pending save's own optimistic
+      // content (a foreign change, or a refetch back to the server's copy)
+      // means the panel no longer shows that save, so a later refusal must
+      // not put its old baseline back (a phantom-dirty panel's persist write
+      // would then overwrite the refusal's crash draft). That draft carries
+      // the drags and is restored when the verse's aligner next opens.
+      if (
+        pendingSaveRef.current &&
+        !sameVerseContent(verse?.content, pendingSaveRef.current.savedContent)
+      ) {
+        pendingSaveRef.current = null;
+      }
 
       if (!computedInitial || !verse) return;
       // Attempt to restore a crash-saved alignment draft (Fix C — a browser
@@ -415,16 +549,23 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       // content change per the isRebase gate above, so that's the correct
       // call here); (2) the user must not have started editing in the
       // async-read window (stateRef still === computedInitial) so a restore
-      // never overwrites a fresh drag; (3) the `cancelled` flag drops a
-      // resolution whose verse changed again. `initial` stays computedInitial
-      // so the restored state reads as dirty (state !== initial) and can be
-      // saved or reset.
+      // never overwrites a fresh drag; (3) the token drops a resolution whose
+      // verse changed again. `initial` stays computedInitial so the restored
+      // state reads as dirty (state !== initial) and can be saved or reset.
+      // (3) is a token that only the next FULL reset replaces, not an effect
+      // cleanup (#1071): React StrictMode replays this effect on mount, and
+      // the replay takes the rebase path above, so a cleanup flag cancelled
+      // every mount's read and a crash draft was never restored in dev.
       const draftKey = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
-      const baseVersion = verse.version;
-      let cancelled = false;
+      const baseRow = verse;
+      const token = {};
+      hydrationTokenRef.current = token;
       void alignmentDrafts.get(draftKey).then((rec) => {
-        if (cancelled || !rec) return;
-        if (rec.expectedVersion !== baseVersion) {
+        if (!mountedRef.current || hydrationTokenRef.current !== token || !rec) return;
+        // Same version AND same row (#1074): after a bridge or split the
+        // draft key is unchanged but the verse now resolves to another row,
+        // whose version can equal the draft's.
+        if (!alignmentDraftFitsRow(rec, baseRow, verseNum)) {
           void alignmentDrafts.clear(draftKey);
           return;
         }
@@ -436,9 +577,6 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         setState(parseAlignment(vo, sourceVerseObjects));
         setRestored(true);
       });
-      return () => {
-        cancelled = true;
-      };
       // `initial` excluded deliberately: it's only ever set by this same effect
       // (setInitial above), and it's read here only to detect an in-progress
       // drag (stateRef.current === initial) at the moment this effect fires.
@@ -471,23 +609,26 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       if (!dirty || !state || !verse) return;
       const key = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
       const baseVersion = verse.version;
+      const baseRow = alignmentDraftRow(verse);
       const t = setTimeout(() => {
         const content = { verseObjects: serializeAlignment(state) };
-        void alignmentDrafts.set(key, content, baseVersion).then((generation) => {
+        void alignmentDrafts.set(key, content, baseVersion, baseRow).then((generation) => {
           lastDraftGenerationRef.current = generation;
         });
       }, 400);
       return () => clearTimeout(t);
     }, [state, dirty, verse, book, chapter, verseNum, bibleVersion]);
 
+    // #943: every alignment mutation below returns early while locked, so a
+    // translator can't build up drags that can only be discarded.
     const handleTargetsDrop = (dest: string, wordIds: string[]) => {
-      if (!state || wordIds.length === 0) return;
+      if (locked || !state || wordIds.length === 0) return;
       setState(moveTargets(state, wordIds, dest));
       setSelectedUnaligned(new Set());
       setSelectionAnchor(null);
     };
     const handleSourceDrop = (destGroupId: string, sourceId: string) => {
-      if (!state) return;
+      if (locked || !state) return;
       // The drop target is a DISPLAY card, which may have collapsed several
       // state groups sharing a source position (occ 1/2 + 2/2 over-count → one
       // physical token, see displayGroups/mergeSamePositionGroups). Add the
@@ -516,7 +657,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       );
     };
     const handleExtractSource = (sourceId: string) => {
-      if (!state) return;
+      if (locked || !state) return;
       setState(extractSource(state, sourceId));
     };
     // Resolve a DISPLAY card id back to EVERY state group it collapsed — by
@@ -536,7 +677,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // a position-fused card standing for several state groups (see
     // mergeGroupsToGroups), so resolve both to all their underlying groups.
     const handleMergeGroups = (dropTargetId: string, draggedId: string) => {
-      if (!state || dropTargetId === draggedId) return;
+      if (locked || !state || dropTargetId === draggedId) return;
       const order = displayGroups.map((g) => g.id);
       const ti = order.indexOf(dropTargetId);
       const di = order.indexOf(draggedId);
@@ -558,12 +699,12 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       setSelectionAnchor(null);
     };
     const handleUndoMerge = () => {
-      if (!mergeUndo) return;
+      if (locked || !mergeUndo) return;
       setState(mergeUndo);
       setMergeUndo(null);
     };
     const handleClearGroup = (groupId: string) => {
-      if (!state) return;
+      if (locked || !state) return;
       const target = state.groups.find((g) => g.id === groupId);
       if (!target) return;
       // Clear EVERY underlying group the displayed card collapsed together, not
@@ -795,7 +936,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       });
     };
     const handleAcceptAllGhosts = () => {
-      if (!state || ghostByGroup.size === 0) return;
+      if (locked || !state || ghostByGroup.size === 0) return;
       let next = state;
       for (const gh of ghostByGroup.values()) {
         next = moveTargets(next, gh.wordIds, `g:${gh.groupId}`);
@@ -817,7 +958,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       lastDraftGenerationRef.current = undefined;
     }, [initial, book, chapter, verseNum, bibleVersion]);
     const handleClearAll = () => {
-      if (!state) return;
+      if (locked || !state) return;
       setState(clearAll(state));
       setSelectedUnaligned(new Set());
       setSelectionAnchor(null);
@@ -850,6 +991,15 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         // an up-to-date client — see lastDraftGenerationRef's doc comment and
         // alignmentDrafts.ts's onOutboxResult listener (#508).
         const draftGeneration = lastDraftGenerationRef.current ?? mintAlignmentDraftGeneration();
+        pendingSaveRef.current = {
+          generation: draftGeneration,
+          // A save still waiting on the outbox keeps the older baseline: if
+          // both are refused, the panel goes back to what the server holds.
+          baseline: pendingSaveRef.current ? pendingSaveRef.current.baseline : initial,
+          version: verse.version,
+          savedContent: newContent,
+          baseContent: verse.content,
+        };
         onSave(newContent, plain, verse.version, draftGeneration);
         // Optimistic: the freshly-saved state is now the baseline. When the
         // chapter cache eventually round-trips the new content, computedInitial
@@ -875,7 +1025,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       }
       commit();
       return true;
-    }, [state, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
+    }, [state, initial, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
 
     // Same two maps hebrewHighlight/onEnglishHover use, in the same roles:
     // posOwners (display-derived) says which CARD(s) own the position, and
@@ -947,6 +1097,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           overflow: "hidden",
           bgcolor: "background.paper",
         }}
+        // #943: no drag can start while locked (the handlers above also
+        // refuse; this keeps the drag ghost from appearing at all).
+        onDragStartCapture={locked ? (e) => e.preventDefault() : undefined}
       >
         {!state && (
           <Box sx={{ p: 3 }}>
@@ -1011,6 +1164,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
                 onSourceDrop={handleSourceDrop}
                 onExtractSource={handleExtractSource}
                 onClearGroup={handleClearGroup}
+                locked={!!locked}
                 onMerge={handleMergeGroups}
                 draggingGroupId={draggingGroupId}
                 onGroupDragStart={setDraggingGroupId}
@@ -1024,6 +1178,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
             </Box>
             <ActionBar
               dirty={dirty}
+              locked={locked}
               ghostCount={ghostByGroup.size}
               onAcceptAll={handleAcceptAllGhosts}
               onClear={handleClearAll}
@@ -1073,7 +1228,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
               chapter={chapter}
               verseNum={verseNum}
               bibleVersion={bibleVersion}
+              verseEnd={verse.verse_end ?? null}
               currentVersion={verse.version}
+              canRestore={!locked}
               onClose={() => setHistoryOpen(false)}
               onUseVersion={(content, plainText) => onRestoreVersion?.(content, plainText)}
             />
@@ -1356,6 +1513,7 @@ function SectionHeader({ count }: { count: number }) {
 // ─── Action bar ────────────────────────────────────────────────────────
 function ActionBar({
   dirty,
+  locked = false,
   ghostCount,
   onAcceptAll,
   onClear,
@@ -1369,6 +1527,7 @@ function ActionBar({
   onOpenHistory,
 }: {
   dirty: boolean;
+  locked?: AlignerLock;
   ghostCount: number;
   onAcceptAll: () => void;
   onClear: () => void;
@@ -1404,6 +1563,27 @@ function ActionBar({
       >
         editing {bibleVersion}
       </Typography>
+      {locked && (
+        <Tooltip
+          title={
+            locked === "book"
+              ? "This book is locked, so alignment changes can't be made right now"
+              : "An AI run is in progress on this chapter, so alignment changes can't be made right now"
+          }
+        >
+          <Typography
+            variant="caption"
+            sx={{
+              fontFamily: "monospace",
+              color: "warning.dark",
+              fontSize: 10,
+              ml: 1,
+            }}
+          >
+            🔒 {locked} locked
+          </Typography>
+        </Tooltip>
+      )}
       {/* Spacer keeps the actions right-aligned when the bar fits on one line;
           when it doesn't (narrow laptop screens), the actions wrap to a second
           row instead of the rightmost Save button overflowing off-screen. */}
@@ -1447,6 +1627,7 @@ function ActionBar({
           size="small"
           variant="outlined"
           onClick={onAcceptAll}
+          disabled={!!locked}
           sx={{
             textTransform: "none",
             fontSize: 11,
@@ -1462,6 +1643,7 @@ function ActionBar({
       <Button
         size="small"
         onClick={onClear}
+        disabled={!!locked}
         sx={{
           color: "error.main",
           textTransform: "uppercase",
@@ -1501,21 +1683,25 @@ function ActionBar({
           Cancel
         </Button>
       )}
-      <Button
-        size="small"
-        variant="contained"
-        onClick={() => onSave()}
-        disabled={!dirty}
-        sx={{
-          textTransform: "uppercase",
-          fontSize: 11,
-          letterSpacing: "0.06em",
-          fontWeight: 700,
-          px: 2,
-        }}
-      >
-        Save {bibleVersion}
-      </Button>
+      <Tooltip title={locked ? `${locked === "book" ? "Book" : "Chapter"} locked` : ""}>
+        <span>
+          <Button
+            size="small"
+            variant="contained"
+            onClick={() => onSave()}
+            disabled={!dirty || !!locked}
+            sx={{
+              textTransform: "uppercase",
+              fontSize: 11,
+              letterSpacing: "0.06em",
+              fontWeight: 700,
+              px: 2,
+            }}
+          >
+            Save {bibleVersion}
+          </Button>
+        </span>
+      </Tooltip>
     </Stack>
   );
 }
@@ -1533,6 +1719,7 @@ function AlignmentCards({
   onSourceDrop,
   onExtractSource,
   onClearGroup,
+  locked,
   onMerge,
   draggingGroupId,
   onGroupDragStart,
@@ -1554,6 +1741,9 @@ function AlignmentCards({
   onSourceDrop: (destGroupId: string, sourceId: string) => void;
   onExtractSource: (sourceId: string) => void;
   onClearGroup: (groupId: string) => void;
+  // #943: hide the per-card clear (x) and the suggestion chip while locked;
+  // their handlers refuse anyway, so a visible control would do nothing.
+  locked: boolean;
   onMerge: (dropTargetId: string, draggedId: string) => void;
   draggingGroupId: string | null;
   onGroupDragStart: (groupId: string) => void;
@@ -1643,7 +1833,7 @@ function AlignmentCards({
               );
             })}
           </Box>
-          {(g.targets.length > 0 || g.source.length > 1) && (
+          {!locked && (g.targets.length > 0 || g.source.length > 1) && (
             <Tooltip title="clear this group (send English back to the word bank, split compound source)">
               <IconButton
                 size="small"
@@ -1666,7 +1856,7 @@ function AlignmentCards({
           )}
           <Stack direction="row" spacing={0.5} flexWrap="wrap" rowGap={0.5} sx={{ direction: "ltr" }}>
             {g.targets.length === 0 ? (
-              ghost ? (
+              ghost && !locked ? (
                 <GhostChip
                   ghost={ghost}
                   onAccept={() => onAcceptGhost(ghost.groupId, ghost.wordIds)}
@@ -1737,6 +1927,7 @@ function DropTargetCard({
   const showOver = over && !isMergeTarget && !isBeingDragged;
   return (
     <Paper
+      data-lex-region
       elevation={0}
       onDragOver={(e) => {
         e.preventDefault();
@@ -1878,7 +2069,7 @@ function SourceWordTypography({
   const tone = hctx.hebrewHighlight(pos, groupId);
   const showInfo = hctx.showSourceInfo;
   return (
-    <Tooltip
+    <LexTooltip
       enterDelay={0}
       enterNextDelay={0}
       title={
@@ -2002,7 +2193,7 @@ function SourceWordTypography({
           </Box>
         )}
       </Box>
-    </Tooltip>
+    </LexTooltip>
   );
 }
 
