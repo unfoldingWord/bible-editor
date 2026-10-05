@@ -15,7 +15,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { applyVerseRowsForTest, confirmedBasesForCutoffForTest } from "./bookReimport.ts";
+import { applyVerseRowsForTest, confirmedBasesForCutoffForTest, noBaseBookLockedForAlert } from "./bookReimport.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 import { SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL, UPSERT_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictSql.ts";
 
@@ -577,6 +577,31 @@ console.log("\n[locked book: keep_no_base records the lock for the alert wording
 
   eq(counts.merge_no_base, 1, "locked book: still keep_no_base (no ancestor, ours != theirs)");
   eq(counts.merge_no_base_book_locked, true, "locked book: the counts record the lock for the alert wording");
+}
+
+console.log("\n[no-base alert lock wording: decided at raise time, false for a lock/push run (issue #1006 review)]");
+{
+  // A1: an admin lock/push (allowLocked, one book + one resource) runs the
+  // pre-export reimport on the locked book and then DOES push D1 over Door43,
+  // so that run's alert must keep the unlocked "tonight's export will
+  // overwrite" wording. Also: an unlock part-way through the run means the
+  // export will not skip the book, so the lock is re-read when the alert is
+  // raised.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, NULL)`).run(BOOK);
+  eq(await noBaseBookLockedForAlert(env, BOOK, "ult", true), true, "locked now, locked during the run: locked wording");
+  eq(await noBaseBookLockedForAlert(env, BOOK, "ult", false), false, "no locked keep_no_base verse in the run: unlocked wording");
+  eq(await noBaseBookLockedForAlert(env, BOOK, "ult", undefined), false, "a chunk memoized before the field existed: unlocked wording");
+  eq(await noBaseBookLockedForAlert(env, BOOK, "ult", true, "ult"), false,
+    "lock/push run for this resource: the export WILL push, so unlocked (overwrite) wording");
+  eq(await noBaseBookLockedForAlert(env, BOOK, "ust", true, "ult"), true,
+    "a lock/push override for another resource does not apply to this one");
+  sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 0, 200, NULL)`).run(BOOK);
+  eq(await noBaseBookLockedForAlert(env, BOOK, "ult", true), false,
+    "unlocked part-way through the run: the export will not skip it, so unlocked wording");
+  const failing = { DB: { prepare() { throw new Error("simulated D1 outage"); } } };
+  eq(await noBaseBookLockedForAlert(failing, BOOK, "ult", true), false,
+    "a failed lock read falls back to the unlocked (warning) wording rather than failing the alert");
 }
 
 console.log("\n[#790: first edit after watermark recovers the exact confirmed-render ancestor]");

@@ -57,6 +57,7 @@
 // split as chapterLock.test.mjs.
 
 import { DatabaseSync } from "node:sqlite";
+import { reviewConditionKey, verseMergeEditorConditionKey } from "./reviewAlerts.ts";
 import { raiseVerseMergeConflictAlert, retireVerseKeptAiMasterFlags, resolveConvergedVerseMergeConflicts } from "./verseMergeConflicts.ts";
 import {
   alertMessageCarriesNoBaseWarning,
@@ -2588,6 +2589,71 @@ for (const bookLocked of [true, false]) {
     assert(/tonight's export/i.test(m) === !bookLocked,
       `${label} ${who}: the "tonight's export" warning appears only for an unlocked book`);
     assert(/this book is locked/i.test(m) === bookLocked, `${label} ${who}: the lock is named only when locked`);
+  }
+}
+
+// Issue #1006 review (A2): the lock state is part of the alert condition. A
+// dismissed locked-book alert (nothing to act on) must not keep the unlocked
+// "tonight's export will overwrite" warning hidden after the book is unlocked.
+// Unlocked condition keys stay byte-identical to the pre-#1006 keys, so this
+// deploy does not resurrect alerts people already dismissed.
+console.log("\n[locked -> dismissed -> unlocked: the overwrite warning comes back (issue #1006 review)]");
+{
+  const d = verseDb();
+  d.exec(`ALTER TABLE system_alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    ALTER TABLE system_alerts ADD COLUMN condition_key TEXT;
+    ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
+    ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
+    CREATE UNIQUE INDEX system_alerts_one_standing_review_test
+      ON system_alerts(username, source)
+      WHERE kind='review' AND condition_key IS NOT NULL AND dismissed_at IS NULL AND resolved_at IS NULL;
+    CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+      user_id INTEGER, new_version INTEGER);`);
+  d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
+  d.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, new_version) VALUES ('verse', 'ZEC/1/6/UST', 'ZEC', 7, 2)`,
+  ).run();
+  const make = (sql, args = []) => ({
+    bind: (...next) => make(sql, next),
+    all: async () => ({ results: d.prepare(sql).all(...args) }),
+    run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+  });
+  const raise = (noBaseBookLocked, observedAt) =>
+    raiseVerseMergeConflictAlert({ DB: { prepare: (sql) => make(sql) } }, "ZEC", "ust", {
+      noBaseCount: 1,
+      noBaseRefs: ["1:6"],
+      noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+      noBaseBookLocked,
+      observedAt,
+    });
+  const live = (u) =>
+    d.prepare(
+      `SELECT message, condition_key FROM system_alerts
+        WHERE username=? AND source='verse_merge_conflict:ZEC:ust' AND dismissed_at IS NULL AND resolved_at IS NULL`,
+    ).all(u);
+
+  await raise(true, 100);
+  d.prepare(`UPDATE system_alerts SET dismissed_at = 150 WHERE source='verse_merge_conflict:ZEC:ust'`).run();
+  await raise(true, 200);
+  for (const u of ["deferredreward", "bethoakes"]) {
+    assert(live(u).length === 0, `${u}: a dismissed locked alert stays dismissed while the book stays locked`);
+  }
+
+  await raise(false, 300);
+  const expectedKeys = {
+    deferredreward: reviewConditionKey(
+      "verse_merge_conflict",
+      { book: "ZEC", resource: "ust" },
+      { rows: [], noBase: [{ chapter: 1, verse: 6, version: 2 }], noBaseCount: 1, recordingFailed: false },
+    ),
+    bethoakes: verseMergeEditorConditionKey("ZEC", "ust", "bethoakes", ["1:6"]),
+  };
+  for (const u of ["deferredreward", "bethoakes"]) {
+    const rows = live(u);
+    assert(rows.length === 1, `${u}: after the unlock, a fresh undismissed alert is raised`);
+    assert(/tonight's export/i.test(rows[0]?.message ?? ""), `${u}: …carrying the unlocked overwrite warning`);
+    assert(rows[0]?.condition_key === expectedKeys[u], `${u}: the unlocked condition key is unchanged from before #1006`);
   }
 }
 
