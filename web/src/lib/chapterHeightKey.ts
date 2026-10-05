@@ -7,14 +7,26 @@
 // browser without scroll anchoring (Safari) a chapter above the view that is
 // laid out moves the view at that moment.
 //
-// Per verse row and shown column: the bridge end (a bridge spans rows), the
-// plain-text length, the top-level node count (paragraph and poetry markers,
-// words) and the section-heading text. A same-length edit that rewraps a line
-// is not caught; the chapter then keeps its old height until it is next on
-// screen, as before #1120.
+// Per verse row and shown column: the bridge end (a bridge spans rows) and a
+// 32-bit FNV-1a hash of the plain text, the tag (or type) of every top-level
+// node (paragraph and poetry markers such as \q1 vs \q2, \p vs \b) and the
+// section-heading text. Content, not lengths, so a same-length rewording
+// that rewraps still changes it; a version or timestamp alone does not.
 
 import type { VerseDto } from "../sync/api.ts";
 import { splitSectionHeaders } from "./usfm.ts";
+
+const FNV_OFFSET = 0x811c9dc5;
+const FNV_PRIME = 0x01000193;
+
+function fnv(h: number, s: string): number {
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, FNV_PRIME);
+  }
+  // Separator, so "ab"+"c" and "a"+"bc" differ.
+  return Math.imul(h ^ 0x1f, FNV_PRIME);
+}
 
 export function chapterHeightKey(
   verses: Record<string, Record<number, VerseDto> | undefined>,
@@ -30,14 +42,16 @@ export function chapterHeightKey(
         key += ":-";
         continue;
       }
+      let h = fnv(FNV_OFFSET, dto.plain_text ?? "");
       const verseObjects = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-      let nodes = 0;
-      let headings = "";
       if (Array.isArray(verseObjects)) {
-        nodes = verseObjects.length;
-        for (const s of splitSectionHeaders(verseObjects).sections) headings += `${s.tag}.${s.text.length};`;
+        for (const node of verseObjects) {
+          const o = node as { tag?: unknown; type?: unknown } | null;
+          h = fnv(h, String(o?.tag ?? o?.type ?? ""));
+        }
+        for (const s of splitSectionHeaders(verseObjects).sections) h = fnv(h, s.text);
       }
-      key += `:${dto.verse_end ?? ""}.${dto.plain_text?.length ?? 0}.${nodes}.${headings}`;
+      key += `:${dto.verse_end ?? ""}.${(h >>> 0).toString(36)}`;
     }
   }
   return key;
