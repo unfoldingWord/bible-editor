@@ -191,8 +191,9 @@ export function BookView({
   const previousScrollNonce = useRef(scrollNonce);
   const firstLayoutRef = useRef(true);
   const restoredTargetRef = useRef<string | null>(null);
-  // Lets selectLocalVerse keep one identity for the memoized cells. Shell
-  // passes onSelectVerse as an inline arrow, so it is new every render;
+  // Lets selectLocalVerse keep one identity for the memoized cells. This
+  // component's onSelectVerse is Shell's onSelectBookVerse, an inline arrow
+  // that ScriptureColumn forwards, so it is new every render;
   // activeChapter / activeVerse change only on navigation. Written in a layout
   // effect, not during render, so a render React throws away (StrictMode's dev
   // replay) never leaves it holding uncommitted values. Its reader runs from a

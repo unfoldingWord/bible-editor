@@ -115,8 +115,9 @@ export function useAiDrafts(): UseAiDraftsAPI {
   // effect's cleanup and abort every in-flight request each time one starts
   // or finishes. Written in a layout effect, not during render, so a
   // render React throws away (StrictMode's dev replay) never leaves it holding
-  // an uncommitted map. Its readers run after a commit: start from a click
-  // handler in Shell, abortAll from this hook's unmount cleanup (passive).
+  // an uncommitted map. Its readers run after a commit: start from NoteCard's
+  // AI button and AI confirm-dialog click handlers (through Shell's
+  // onNoteStartAi), abortAll from this hook's unmount cleanup (passive).
   const pendingRef = useRef(pending);
   useLayoutEffect(() => {
     pendingRef.current = pending;

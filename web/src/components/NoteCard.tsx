@@ -1094,9 +1094,14 @@ function NoteCardInner({
   // values, and would also keep a render React throws away from leaking in.
   // They were not moved because this path deletes a note when it misjudges
   // (see wasActiveRef) and the move buys nothing on this tree: no
-  // startTransition / useDeferredValue is in use, so the render React throws
-  // away here is StrictMode's dev replay, which re-renders with the same
-  // props. Revisit if concurrent rendering arrives (e.g. a React 19 upgrade).
+  // startTransition / useDeferredValue is in use, so a render of this card
+  // that React throws away is StrictMode's dev replay or React's one retry
+  // after a render error, and both re-render with the same props. A lazy()
+  // child that suspends throws away only the render inside its own Suspense
+  // boundary, and this card sits above both boundaries in its subtree (they
+  // wrap only NoteBodyMarkdownView's MarkdownView and NoteHistoryDialog), not
+  // inside one. Revisit if concurrent rendering
+  // arrives (e.g. a React 19 upgrade).
   const noteAtUnmountRef = useRef(note);
   noteAtUnmountRef.current = note;
   const supportRefAtUnmountRef = useRef(supportRef);

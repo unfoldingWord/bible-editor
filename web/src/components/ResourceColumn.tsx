@@ -447,9 +447,13 @@ export function ResourceColumn({
   // React throws away from leaking in, but it is left as a render-time write
   // on purpose (#1011): this feeds the blank-stub discard, which deletes a
   // note when it misjudges, and the move buys nothing on this tree. No
-  // startTransition / useDeferredValue is in use, so the render React throws
-  // away here is StrictMode's dev replay, which re-renders with the same
-  // props. Revisit if concurrent rendering arrives (e.g. a React 19 upgrade).
+  // startTransition / useDeferredValue is in use, so a render of this
+  // component that React throws away is StrictMode's dev replay or React's
+  // one retry after a render error, and both re-render with the same props.
+  // A lazy() child that suspends throws away only the render inside its own
+  // Suspense boundary, and this component sits above every boundary (its own
+  // wraps only AlignmentPanel). Revisit if concurrent rendering arrives
+  // (e.g. a React 19 upgrade).
   const activeLocRef = useRef<ActiveLocation>({ book, chapter, verse: activeVerse });
   activeLocRef.current = { book, chapter, verse: activeVerse };
 

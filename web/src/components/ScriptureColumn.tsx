@@ -392,9 +392,11 @@ function ScriptureColumnInner({
   // changes every time) — `activeVerse`, `chapter` and `onSelectVerse` are
   // read through refs on purpose: a manual verse click changes activeVerse,
   // so keeping it in the deps made this re-fire on the very re-render that
-  // click causes and pull the user straight back to the match. (Shell's
-  // onSelectVerse is now the stable requestSelectVerse; it used to be a
-  // fresh arrow every render, with the same effect.) In stacked mode an explicit
+  // click causes and pull the user straight back to the match. (This
+  // component's onSelectVerse prop is now Shell's stable requestSelectVerse;
+  // it used to be a fresh arrow every render, with the same effect. Book
+  // mode's onSelectBookVerse, forwarded to BookView, is still an inline
+  // arrow.) In stacked mode an explicit
   // prev/next promotes the match verse to "active" so its full editable
   // card expands; the active-verse
   // effect below then scrolls the expanded card into view. The auto-jump
