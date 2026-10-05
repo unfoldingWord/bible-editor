@@ -150,6 +150,7 @@ import {
   raiseVerseMergeConflictAlert,
   resolveConvergedVerseMergeConflicts,
   activeKeptVerseMergeConflictRefs,
+  type PriorVerseMergeConflicts,
 } from "./verseMergeConflicts.ts";
 import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
@@ -939,8 +940,9 @@ export const applyVerseRowsForTest = (
   userId: number | null,
   cutoff: MergeCutoff | null,
   broadcastLaneReopens?: boolean,
+  runStartedAt?: number,
 ): Promise<ReimportCounts> =>
-  applyVerseRows(env, book, bibleVersion, verses, userId, cutoff, broadcastLaneReopens);
+  applyVerseRows(env, book, bibleVersion, verses, userId, cutoff, broadcastLaneReopens, runStartedAt);
 export const clearTombstoneBlockAlertForTest = (
   env: Env,
   book: string,
@@ -6485,6 +6487,12 @@ async function applyVerseRows(
   // relying on a per-call cap. Defaults true so any caller that forgets to
   // pass it keeps the pre-existing (safer, notifying) behavior.
   broadcastLaneReopens: boolean = true,
+  // Issue #1132: when this logical run began (seconds), stable across Workflow
+  // step retries — the nightly path passes its durable alertObservedAt. Step
+  // 7b uses it to tell a row an earlier, dead attempt of this run already
+  // touched from a genuine prior night's row. Omitted (a caller with no
+  // retries), it defaults to this call's own `now`.
+  runStartedAt?: number,
 ): Promise<ReimportCounts> {
   const counts = zeroCounts();
   if (verses.length === 0) return counts;
@@ -7825,6 +7833,9 @@ async function applyVerseRows(
   // recordVerseMergeConflicts's INSERT is idempotent (ON CONFLICT DO UPDATE),
   // so writing here and again if this call retries is safe.
   let recordFailed = false;
+  // Issue #1132: each touched row's state from just before this upsert, so 7b
+  // can put a pre-existing row back on a lost race instead of deleting it.
+  const priorConflicts: PriorVerseMergeConflicts = new Map();
   if (mergeConflicts.length > 0) {
     const allConflictRows = mergeConflicts.map((mc) => ({
       chapter: mc.chapter,
@@ -7835,7 +7846,7 @@ async function applyVerseRows(
       alignment: mc.alignment,
       observedVersion: mc.observedVersion,
     }));
-    const recorded = await recordVerseMergeConflicts(env, book, resource, bibleVersion, allConflictRows, now);
+    const recorded = await recordVerseMergeConflicts(env, book, resource, bibleVersion, allConflictRows, now, priorConflicts);
     if (!recorded) recordFailed = true;
   }
 
@@ -8293,9 +8304,12 @@ async function applyVerseRows(
 
   // 7b. FIX 3 (cleanup half): the CAS batch above may have lost the race on
   // some adoptions (a human wrote the verse first). Their conflict row was
-  // written speculatively in step 6b before we knew that — delete it now so
+  // written speculatively in step 6b before we knew that — undo it now so
   // it never misdirects a reviewer to a version that still holds their
-  // current text. Refused verses (never attempted a write) are untouched —
+  // current text. Issue #1132: "undo" means delete a row 6b created, and put
+  // a row that existed before 6b back as 6b found it (priorConflicts), so an
+  // earlier night's unreviewed alert is not lost to tonight's race. Refused
+  // verses (never attempted a write) are untouched —
   // `mc.adopted` is false for `keep_alignment_refused`, and
   // deleteLostAdoptionConflicts is additionally scoped to
   // `action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')` as a second, independent guard.
@@ -8325,8 +8339,9 @@ async function applyVerseRows(
     // Same `now` passed to step 6b's recordVerseMergeConflicts call above —
     // required for deleteLostAdoptionConflicts's last_recorded_at-based scoping to
     // correctly identify only THIS run's own speculative rows (see that
-    // function's doc comment).
-    await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs, now);
+    // function's doc comment). runStartedAt marks a capture written by an
+    // earlier, dead attempt of this run, which falls back to the delete.
+    await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs, now, priorConflicts, runStartedAt ?? now);
   }
 
   // 8. Tally this run's landed merge conflicts. FIX 2: excludes a clean
@@ -10740,6 +10755,8 @@ async function reimportStagedChunk(
   staged: StagedResource[],
   changedTsv: Partial<Record<TsvKind, number[]>>,
   userId: number | null,
+  // Issue #1132: the run's start (seconds), stable across this step's retries.
+  runStartedAt?: number,
 ): Promise<Record<Resource, ReimportCounts>> {
   const perResource = freshPerResource();
 
@@ -10918,7 +10935,7 @@ async function reimportStagedChunk(
       addCounts(
         perResource.ult,
         await applyVerseRows(
-          env, book, "ULT", versesByChapter.ult.get(chapter) ?? [], userId, masterConfirmedAtUlt, false,
+          env, book, "ULT", versesByChapter.ult.get(chapter) ?? [], userId, masterConfirmedAtUlt, false, runStartedAt,
         ),
       );
     }
@@ -10926,7 +10943,7 @@ async function reimportStagedChunk(
       addCounts(
         perResource.ust,
         await applyVerseRows(
-          env, book, "UST", versesByChapter.ust.get(chapter) ?? [], userId, masterConfirmedAtUst, false,
+          env, book, "UST", versesByChapter.ust.get(chapter) ?? [], userId, masterConfirmedAtUst, false, runStartedAt,
         ),
       );
     }
@@ -11156,7 +11173,9 @@ export async function runChunkedReimport(
     const counts = await step.do(
       `reimport-${book}-ch${start}-${end}`,
       { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, opts.userId ?? null),
+      async () => reimportStagedChunk(
+        env, book, start, end, changed, changedTsv, opts.userId ?? null, Math.floor(alertObservedAt / 1000),
+      ),
     );
     mergePerResource(perResource, counts);
   }

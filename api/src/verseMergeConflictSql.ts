@@ -340,16 +340,15 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- never alerted anyone) promoted to adopt_conflict tonight takes tonight's
      -- pointer, snapshot and detected_at: the overwrite an editor must now look
      -- at is tonight's, and the alert goes to the author of the version the
-     -- pointer names. Taking them here, speculatively, is normally safe for an
-     -- unresolved row: if tonight's CAS loses, DELETE_LOST_ADOPTION_CONFLICT_SQL
-     -- deletes every unresolved adoption row this run touched, so tonight's
-     -- pointer does not outlive a lost race. And it survives a crash between
-     -- the CAS and the confirm, which is why 6b writes before the CAS at all.
-     -- Two exceptions, tracked in issue #1132: if the isolate dies before the
-     -- adoption write and the retry takes a non-adopting outcome, or the
-     -- best-effort delete throws, the promoted row keeps tonight's pointer for
-     -- an overwrite that never landed. Before #1124 it kept the old pointer in
-     -- the same situation; either way the alert is false.
+     -- pointer names. Taking them here, speculatively, is normally safe: if
+     -- tonight's CAS loses, the lost-race cleanup puts the row back as it was
+     -- before this upsert (RESTORE_LOST_ADOPTION_CONFLICT_SQL, issue #1132) or
+     -- deletes it if this run created it, so tonight's pointer does not
+     -- outlive a lost race. And it survives a crash between the CAS and the
+     -- confirm, which is why 6b writes before the CAS at all. Two exceptions
+     -- remain: if the isolate dies before the adoption write and the retry
+     -- takes a non-adopting outcome, or the best-effort cleanup throws, the
+     -- promoted row keeps tonight's pointer for an overwrite that never landed.
      detected_at = CASE
        WHEN excluded.action = 'adopt_conflict'
          AND verse_merge_conflicts.action IN ('adopt', 'adopt_no_visible_change')
@@ -395,10 +394,9 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- race leaves both). When the pointer is tonight's (or tonight's NULL), so
      -- is the snapshot, even NULL. That includes a RESOLVED row whose stored
      -- pointer is NULL (a resolved #978 no-op row, or one that came from a
-     -- keep-D1 flag): the COALESCE above gives it tonight's pointer, and the
-     -- lost-race delete skips it because it is resolved, so after a lost race
-     -- it claims an overwrite that never landed. It stays resolved, so no
-     -- alert is raised; the pointer half predates #1124. Tracked in #1132.
+     -- keep-D1 flag): the COALESCE above gives it tonight's pointer and
+     -- snapshot, and a lost race puts its NULL pointer and old snapshot back
+     -- (RESTORE_LOST_ADOPTION_CONFLICT_SQL, issue #1132).
      -- The keep-D1 flags carry no pointer and keep the old COALESCE.
      alignment = CASE
        WHEN excluded.action NOT IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')
@@ -541,14 +539,16 @@ export const CONFIRM_ADOPTED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 // exactly the old (correct, harmless) behavior — nothing valid existed
 // before it. A row that predates tonight and is CURRENTLY RESOLVED
 // (resolved_at non-null, from a real prior resolution) is excluded by
-// `resolved_at IS NULL` regardless of last_recorded_at — under two-phase
-// reactivation its resolved_at was never touched by tonight's speculative
-// upsert in the first place (see above), so this condition alone is what
-// protects it; last_recorded_at no longer needs to distinguish "old" from
-// "new" for that case. A row that predates tonight and is CURRENTLY ACTIVE
-// (never resolved) still gets deleted on a lost CAS — matching this
-// cleanup's ORIGINAL, pre-review behavior for that case (it was never
-// specially protected, and the two-phase design doesn't change that).
+// `resolved_at IS NULL` regardless of last_recorded_at.
+//
+// Issue #1132: a row that predates tonight is no longer sent here when its
+// prior state was captured; RESTORE_LOST_ADOPTION_CONFLICT_SQL puts it back
+// instead. Deleting it threw away an earlier night's still-pending alert (an
+// unreviewed adopt_conflict) whenever a person saved the verse during
+// tonight's sync. This DELETE now runs only for a row this run created, or
+// when no usable capture exists (the capture batch failed, or the captured
+// state was itself written earlier in this run by an attempt that died; see
+// deleteLostAdoptionConflicts), which is the pre-#1132 behavior.
 //
 // Binds, in order: (book, resource, chapter, verse, lastRecordedAt).
 // ---------------------------------------------------------------------------
@@ -557,6 +557,63 @@ export const DELETE_LOST_ADOPTION_CONFLICT_SQL = `DELETE FROM verse_merge_confli
       AND action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')
       AND resolved_at IS NULL
       AND last_recorded_at = ?5`;
+
+// ---------------------------------------------------------------------------
+// Issue #1132: the prior state of the rows a speculative upsert batch is about
+// to touch. verseMergeConflicts.ts's recordVerseMergeConflicts puts this
+// SELECT first in the SAME batch() as the upserts, so the capture and the
+// writes are one D1 transaction: no other write can land between the read and
+// the upsert. It returns exactly the columns UPSERT_VERSE_MERGE_CONFLICT_SQL
+// can change for an adoption action (resolved_at/resolved_by are not among
+// them; the upsert's reactivation carve-out covers only the kept-D1 actions)
+// plus recorded_generation, which the restore below uses as its guard.
+//
+// ?3 is a JSON array of "chapter:verse" strings (json_each keeps the bind
+// count at three whatever the slice size; D1 caps binds per statement).
+//
+// Binds, in order: (book, resource, refsJson).
+// ---------------------------------------------------------------------------
+export const SELECT_PRIOR_VERSE_MERGE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment,
+       detected_at, last_recorded_at, recorded_generation
+  FROM verse_merge_conflicts
+ WHERE book = ?1 AND resource = ?2
+   AND (chapter || ':' || verse) IN (SELECT value FROM json_each(?3))`;
+
+// ---------------------------------------------------------------------------
+// Issue #1132: the lost-race cleanup for a row that EXISTED before tonight's
+// speculative upsert. Puts back every column the upsert can change for an
+// adoption (action, reason, pointer, snapshot, detected_at, last_recorded_at),
+// from the state SELECT_PRIOR_VERSE_MERGE_CONFLICTS_SQL captured in the
+// upsert's own batch. Nothing was overwritten, so the row must say exactly
+// what it said before: an earlier night's unreviewed adopt_conflict keeps its
+// pointer, snapshot and alert; an audit-only row promoted tonight (#1124) is
+// audit-only again; a RESOLVED row whose NULL pointer the upsert's COALESCE
+// filled with tonight's pointer gets its NULL back.
+//
+// resolved_at/resolved_by are left as they are now. The upsert never changes
+// them for an adoption, so any change since the capture is a person's save
+// resolving the row (often the very save that beat the CAS), and that stands.
+//
+// The guard applies the restore only while the row is still exactly as THIS
+// upsert left it: `last_recorded_at = ?5` (this run's timestamp) and
+// `recorded_generation = ?6 + 1` (the captured generation plus this upsert's
+// increment). A later upsert from another run moves either, and its state is
+// left alone. recorded_generation is incremented again rather than put back,
+// so it stays monotonic and a stale RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL
+// token cannot match across the restore.
+//
+// Binds, in order: (book, resource, chapter, verse, lastRecordedAt,
+// priorGeneration, action, reason, overwrittenVersion, alignmentJson,
+// detectedAt, priorLastRecordedAt).
+// ---------------------------------------------------------------------------
+export const RESTORE_LOST_ADOPTION_CONFLICT_SQL = `UPDATE verse_merge_conflicts
+    SET action = ?7, reason = ?8, overwritten_version = ?9, alignment = ?10,
+        detected_at = ?11, last_recorded_at = ?12,
+        recorded_generation = recorded_generation + 1
+  WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
+    AND action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')
+    AND last_recorded_at = ?5
+    AND recorded_generation = ?6 + 1`;
 
 // ---------------------------------------------------------------------------
 // verseMergeConflicts.ts's retireVerseKeptAiMasterFlags — issue #749, the verse

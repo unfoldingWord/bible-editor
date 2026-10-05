@@ -1141,7 +1141,10 @@ function confirmAdopted(d, { book, resource, chapter, verse, now, overwrittenVer
   // specially protected (only a RESOLVED row's resolved_at IS NULL exclusion
   // protects it) — it is still deleted, matching this cleanup's original,
   // pre-review behavior for the never-resolved case. (The resolved case is
-  // covered exhaustively in Part 4 above.)
+  // covered exhaustively in Part 4 above.) Since issue #1132 the production
+  // cleanup does not send such a row to this DELETE when its prior state was
+  // captured: it restores it (cases (j)-(p) below). This pins the DELETE
+  // statement itself, which still runs for rows with no usable capture.
   const d = verseDb();
   upsertConflict(d, {
     book: "MIC", resource: "ult", chapter: 1, verse: 1,
@@ -3027,8 +3030,8 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
 
   // (h) The same promotion, but tonight's CAS LOSES (a human saved first):
   // nothing was overwritten, so nothing may point at v7 or alert anyone. The
-  // unresolved row this run touched is removed by the lost-CAS cleanup, as
-  // every unresolved adoption row is (DELETE_LOST_ADOPTION_CONFLICT_SQL).
+  // lost-CAS cleanup puts the audit row back as it was (issue #1132; case (m)
+  // checks every column).
   {
     const { sqlite, env } = migratedEnv();
     jdoe(sqlite);
@@ -3036,8 +3039,9 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     authoredBy(sqlite, 8, 4, 25, 7);
     const audit = { ...overwrite(4, 25, 3), action: "adopt_no_visible_change", reason: "both_changed_markers_only" };
     await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [audit], AUG19);
-    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 25, 7), alignment: snap("october") }], OCT05);
-    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 25 }], OCT05);
+    const prior = new Map();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 25, 7), alignment: snap("october") }], OCT05, prior);
+    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 25 }], OCT05, prior);
     const claims = sqlite.prepare(
       `SELECT COUNT(*) c FROM verse_merge_conflicts WHERE book = 'EZK' AND chapter = 4 AND verse = 25 AND overwritten_version = 7`,
     ).get().c;
@@ -3050,15 +3054,16 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
   // keeps its June pointer AND its June snapshot: the speculative upsert does
   // not swap either, so a lost race leaves the row exactly as the person who
   // resolved it saw it. (A resolved row whose stored pointer is NULL does take
-  // tonight's pointer and snapshot speculatively and keeps them after a lost
-  // race; that gap predates #1124 and is tracked in #1132.)
+  // tonight's pointer and snapshot speculatively; the lost-race cleanup puts
+  // them back, case (l).)
   {
     const { sqlite, env } = migratedEnv();
     await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 26, 4), alignment: snap("june") }], JUN10);
     humanResolve(sqlite, 4, 26, JUN10 + 86400);
     const before = row(sqlite, 4, 26);
-    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 26, 11), alignment: snap("october") }], OCT05);
-    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 26 }], OCT05);
+    const prior = new Map();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 26, 11), alignment: snap("october") }], OCT05, prior);
+    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 26 }], OCT05, prior);
     const r = row(sqlite, 4, 26);
     assert(r.resolved_at === before.resolved_at && r.detected_at === before.detected_at, "resolved lost CAS: resolution and date stand");
     assert(r.overwritten_version === 4, `resolved lost CAS: the pointer stays v4 (got v${r.overwritten_version})`);
