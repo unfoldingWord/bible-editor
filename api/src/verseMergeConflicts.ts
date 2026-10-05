@@ -163,8 +163,9 @@ const WRITE_BATCH = 90;
 // REPLACE: a REPLACE deletes-then-reinserts, which mints a new `id` and resets
 // `detected_at` on every re-detection of the SAME still-unresolved conflict —
 // making "how long has this been sitting unresolved" unrecoverable. The
-// DO UPDATE preserves the original `detected_at` (it's simply not in the SET
-// list). It does NOT blindly refresh the other columns to this run's values —
+// DO UPDATE preserves the original `detected_at` (its SET keeps the stored
+// value, except for an unresolved audit-only row promoted to adopt_conflict,
+// issue #1124). It does NOT blindly refresh the other columns to this run's values —
 // see the CASE expressions below, which refuse to downgrade a row still
 // awaiting human judgement and keep `overwritten_version` consistent with the
 // surviving action.

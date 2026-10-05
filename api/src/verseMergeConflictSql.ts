@@ -256,7 +256,10 @@ export const RESOLVE_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `UPDATE system_alerts
 // while still unresolved") untouched by any of this — conflating the two
 // would have silently reset the age of a conflict that has been sitting
 // unresolved for weeks every time this upsert re-ran, which is a real
-// feature this table exists to support, not a bug to route around.
+// feature this table exists to support, not a bug to route around. The one
+// exception (issue #1124) is an unresolved audit-only row promoted to
+// adopt_conflict: nobody was ever alerted about it, so its streak as a
+// conflict starts tonight (see the detected_at CASE below).
 //
 // Binds, in order: (book, resource, chapter, verse, action, reason,
 // overwrittenVersion, alignmentJson, now, bibleVersion, observedVersion).
@@ -330,6 +333,25 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- this upsert is speculative and its CAS may still lose. If the overwrite
      -- lands, CONFIRM_ADOPTED_CONFLICT_SQL below swaps in tonight's pointer as
      -- it reactivates the row (issue #1112).
+     --
+     -- Issue #1124: the alignment snapshot below follows the same rule, so the
+     -- pointer and the lost words always describe the same overwrite. And an
+     -- UNRESOLVED audit-only row ('adopt' / 'adopt_no_visible_change', which
+     -- never alerted anyone) promoted to adopt_conflict tonight takes tonight's
+     -- pointer, snapshot and detected_at: the overwrite an editor must now look
+     -- at is tonight's, and the alert goes to the author of the version the
+     -- pointer names. Taking them here, speculatively, is safe for an
+     -- unresolved row: if tonight's CAS loses, DELETE_LOST_ADOPTION_CONFLICT_SQL
+     -- deletes every unresolved adoption row this run touched, so tonight's
+     -- pointer cannot outlive a lost race. And it survives a crash between the
+     -- CAS and the confirm, which is why 6b writes before the CAS at all.
+     detected_at = CASE
+       WHEN excluded.action = 'adopt_conflict'
+         AND verse_merge_conflicts.action IN ('adopt', 'adopt_no_visible_change')
+         AND verse_merge_conflicts.resolved_at IS NULL
+       THEN excluded.detected_at
+       ELSE verse_merge_conflicts.detected_at
+     END,
      overwritten_version = CASE
        -- Same unresolved-adopt_conflict carve-out as action above: the row
        -- stays an adopt_conflict, so its recovery pointer stays with it.
@@ -352,9 +374,34 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
          AND excluded.overwritten_version IS NULL
          AND verse_merge_conflicts.action <> 'adopt_conflict'
        THEN NULL
+       -- Issue #1124: an unresolved audit-only row promoted tonight (see above).
+       WHEN excluded.action = 'adopt_conflict'
+         AND verse_merge_conflicts.action IN ('adopt', 'adopt_no_visible_change')
+         AND verse_merge_conflicts.resolved_at IS NULL
+       THEN excluded.overwritten_version
        ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
      END,
-     alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),
+     -- Issue #1124: for an adoption, the snapshot comes from whichever overwrite
+     -- the pointer above names. The stored row keeps its own snapshot exactly
+     -- when it keeps its own (non-null) pointer, so a still-unresolved
+     -- adopt_conflict keeps its first lost words beside its first pointer, and
+     -- a resolved row keeps June's beside June's (CONFIRM_ADOPTED_CONFLICT_SQL
+     -- swaps both on a landed overwrite; a lost race leaves both). When the
+     -- pointer is tonight's (or tonight's NULL), so is the snapshot, even NULL.
+     -- The keep-D1 flags carry no pointer and keep the old COALESCE.
+     alignment = CASE
+       WHEN excluded.action NOT IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')
+       THEN COALESCE(excluded.alignment, verse_merge_conflicts.alignment)
+       WHEN verse_merge_conflicts.overwritten_version IS NOT NULL
+         AND NOT (excluded.action = 'adopt_conflict'
+           AND excluded.overwritten_version IS NULL
+           AND verse_merge_conflicts.action <> 'adopt_conflict')
+         AND NOT (excluded.action = 'adopt_conflict'
+           AND verse_merge_conflicts.action IN ('adopt', 'adopt_no_visible_change')
+           AND verse_merge_conflicts.resolved_at IS NULL)
+       THEN verse_merge_conflicts.alignment
+       ELSE excluded.alignment
+     END,
      last_recorded_at = excluded.last_recorded_at,
      recorded_generation = verse_merge_conflicts.recorded_generation + 1,
      -- REACTIVATION carve-out, 'source_attr_divergent', 'keep_alignment_refused',
@@ -447,12 +494,15 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
 // author of the version the pointer names, so keeping it told v4's author to
 // recover v4 and never alerted the author of tonight's overwritten v11. June's
 // lost-word snapshot likewise describes a loss someone already dealt with, so
-// ?7 replaces it even when tonight's is NULL. A row still unresolved keeps its
-// first pointer, as it keeps its detected_at. Its snapshot is NOT kept: it is
-// whatever the speculative upsert last wrote (that statement's
-// COALESCE(excluded.alignment, ...) takes tonight's whenever it is non-null),
-// so on an unresolved row the pointer and the snapshot can describe different
-// overwrites. That gap predates #1112 and is tracked in issue #1124.
+// ?7 replaces it even when tonight's is NULL. A row still unresolved is left
+// alone here: the speculative upsert already settled which overwrite it
+// describes, with pointer and snapshot together (issue #1124). A standing
+// adopt_conflict keeps its first pointer, first snapshot and detected_at,
+// because that first loss is what its editor has not looked at yet. An
+// audit-only row ('adopt' / 'adopt_no_visible_change') promoted tonight
+// already holds tonight's pointer, snapshot and detected_at, since it never
+// alerted anyone. This statement cannot make that distinction itself: by the
+// time it runs, the upsert has already rewritten the row's action.
 //
 // Binds, in order: (book, resource, chapter, verse, now, overwrittenVersion,
 // alignmentJson).
