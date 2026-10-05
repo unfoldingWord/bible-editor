@@ -1106,23 +1106,14 @@ function rowWordingDependsOnLock(r: { action: string; overwrittenVersion: number
 // stored wording disagrees with the lock it just read, so a refresh stops only
 // once the wording matches the lock as read after its own last write. A stale
 // write from an older refresh is followed by that refresh's next pass, which
-// corrects it. The pass cap only bounds a lock that keeps flipping.
-//
-// `lockOverrideResource` (#1118 item 1): runChunkedReimport passes it for an
-// admin lock/push of a verse resource whose Door43 file is SHA-unchanged, where
-// no raise runs. That export writes D1 over Door43, so the pushed resource is
-// worded as unlocked: the same rule as bookReimport.ts's bookLockedForAlert.
+// corrects it. A pass whose raise changed nothing (a failed write, or an
+// observation reconcileReviewAlert dropped) also stops the refresh. The pass
+// cap only bounds a lock that keeps flipping.
 const LOCK_REFRESH_MAX_PASSES = 4;
 
-export async function refreshVerseMergeAlertsAfterLockChange(
-  env: Env,
-  book: string,
-  opts: { resources?: string[]; lockOverrideResource?: string } = {},
-): Promise<void> {
+export async function refreshVerseMergeAlertsAfterLockChange(env: Env, book: string): Promise<void> {
   for (const resource of ["ult", "ust"]) {
-    if (opts.resources && !opts.resources.includes(resource)) continue;
     const lockedNow = async (): Promise<boolean> => {
-      if (opts.lockOverrideResource === resource) return false;
       try {
         return (await effectiveBookLock(env, book)) != null;
       } catch (e) {
@@ -1157,8 +1148,12 @@ export async function refreshVerseMergeAlertsAfterLockChange(
 }
 
 // One pass of refreshVerseMergeAlertsAfterLockChange: true when it re-raised
-// the alert (the caller then checks again), false when there was nothing to
-// re-word.
+// the alert AND the stored admin alert changed (the caller then checks again),
+// false when there was nothing to re-word or the raise wrote nothing.
+const STANDING_VERSE_MERGE_ADMIN_ALERT_SQL = `SELECT id, condition_key, condition_observed_at, dismissed_at FROM system_alerts
+      WHERE username = ?1 AND source = ?2 AND resolved_at IS NULL
+      ORDER BY id DESC LIMIT 1`;
+
 async function rewordVerseMergeAlertForLock(
   env: Env,
   book: string,
@@ -1166,13 +1161,15 @@ async function rewordVerseMergeAlertForLock(
   lockedNow: () => Promise<boolean>,
 ): Promise<boolean> {
   const source = `verse_merge_conflict:${book}:${resource}`;
-  const standing = await env.DB.prepare(
-    `SELECT condition_key, condition_observed_at FROM system_alerts
-      WHERE username = ?1 AND source = ?2 AND resolved_at IS NULL
-      ORDER BY id DESC LIMIT 1`,
-  )
+  type Standing = {
+    id: number;
+    condition_key: string | null;
+    condition_observed_at: number | null;
+    dismissed_at: number | null;
+  };
+  const standing = await env.DB.prepare(STANDING_VERSE_MERGE_ADMIN_ALERT_SQL)
     .bind(ALERT_USERNAME, source)
-    .first<{ condition_key: string | null; condition_observed_at: number | null }>();
+    .first<Standing>();
   if (!standing) return false;
   const state = reviewConditionState(standing.condition_key, "verse_merge_conflict", { book, resource }) as
     | {
@@ -1197,36 +1194,50 @@ async function rewordVerseMergeAlertForLock(
     console.warn("verseMergeConflicts: lock change left an alert it cannot re-derive", { book, resource });
     return false;
   }
-  // #1110 round 2, #1118 item 2: touch only an alert whose wording the lock
-  // changes, judged from the LIVE rows, which are what the raise below rebuilds
-  // from. When no live row has lock-dependent wording (the only one was
-  // resolved by a save during the day), a raise would only re-measure rows
-  // resolved since the last reimport, mint a new key, and bring back an alert
-  // people dismissed. The stored rows are not a safe stand-in either way: a
-  // chunked reimport can record rows and then fail before its raise step.
+  // Whether the alert would carry a lock-dependent sentence if raised now,
+  // judged from the LIVE rows, which are what the raise below rebuilds from
+  // (#1118 item 2). The stored rows are not a safe stand-in: a save can
+  // resolve a row during the day, and a chunked reimport can record rows and
+  // then fail before its raise step.
   const live = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL)
     .bind(book, resource)
     .all<{ action: string; overwritten_version: number | null }>();
-  const liveDependsOnLock = (live.results ?? []).some((r) =>
-    rowWordingDependsOnLock({ action: r.action, overwrittenVersion: r.overwritten_version }),
-  );
-  if (state.noBaseCount === 0 && !liveDependsOnLock) return false;
+  const dependsOnLock =
+    state.noBaseCount > 0 ||
+    (live.results ?? []).some((r) =>
+      rowWordingDependsOnLock({ action: r.action, overwrittenVersion: r.overwritten_version }),
+    );
   // The raise puts a lock flag in the key whenever it used the locked wording
-  // for a sentence, so the stored key says which wording stands. Already right
-  // for the lock as it is now: nothing to write.
+  // for a sentence, so the stored key says which wording stands.
   const wordedLocked = state.noBaseBookLocked === true || state.keptBookLocked === true;
-  const locked = await lockedNow();
-  if (locked === wordedLocked) return false;
+  if (!dependsOnLock && !wordedLocked) return false;
+  // #1110 round 2, #1118 item 2: nothing live depends on the lock, but the
+  // standing alert still carries the locked wording (its only lock-dependent
+  // row was resolved since). Re-raising rebuilds it from the shrunken live
+  // rows and mints a new key. For a DISMISSED alert that brings back what
+  // people dismissed, for a wording difference about a row that is already
+  // resolved, so leave it. An undismissed one is re-raised below, so it stops
+  // naming a lock that is gone (#1118 review).
+  if (!dependsOnLock && standing.dismissed_at != null) return false;
+  const wantLocked = dependsOnLock && (await lockedNow());
+  if (wantLocked === wordedLocked) return false;
   const ordered = [...noBase].sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
   await raiseVerseMergeConflictAlert(env, book, resource, {
     recordingFailed: false,
     noBaseCount: state.noBaseCount,
     noBaseRefs: ordered.map((r) => `${r.chapter}:${r.verse}`),
     noBaseEditorRefs: ordered.map((r) => ({ chapter: r.chapter, verse: r.verse, version: r.version })),
-    bookLocked: locked,
+    bookLocked: wantLocked,
     observedAt: standing.condition_observed_at,
   });
-  return true;
+  // The raise is best-effort and can write nothing (a failed write, or an
+  // observation reconcileReviewAlert drops as older). Report a change only if
+  // the stored admin alert actually moved, so the caller does not repeat a
+  // pass that cannot land.
+  const after = await env.DB.prepare(STANDING_VERSE_MERGE_ADMIN_ALERT_SQL)
+    .bind(ALERT_USERNAME, source)
+    .first<Standing>();
+  return after?.id !== standing.id || after?.condition_key !== standing.condition_key;
 }
 
 interface VerseMergeConflictRecord {

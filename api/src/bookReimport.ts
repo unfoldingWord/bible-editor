@@ -150,7 +150,6 @@ import {
   raiseVerseMergeConflictAlert,
   resolveConvergedVerseMergeConflicts,
   activeKeptVerseMergeConflictRefs,
-  refreshVerseMergeAlertsAfterLockChange,
 } from "./verseMergeConflicts.ts";
 import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
@@ -11105,23 +11104,6 @@ export async function runChunkedReimport(
     const totals = zeroCounts();
     for (const r of ALL_RESOURCES) addCounts(totals, perResource[r]);
     return { book, perResource, totals };
-  }
-
-  // Issue #1118: an admin lock/push (or an allowLocked /exports/run) of a verse
-  // resource whose Door43 file did not change reaches no raise below, so its
-  // standing alert keeps the "locked, the export skips it" wording that the
-  // lock gave it, while this run's export writes D1 over Door43. Re-word that
-  // one resource's standing alert for the push. A changed resource is raised
-  // with the override by the mergealert step below, so it is left to that.
-  const pushedVerse = opts.lockOverrideResource;
-  if ((pushedVerse === "ult" || pushedVerse === "ust") && !changed.some((e) => e.resource === pushedVerse)) {
-    await step.do(`reimport-lockpush-alert-${book}`, async () => {
-      await refreshVerseMergeAlertsAfterLockChange(env, book, {
-        resources: [pushedVerse],
-        lockOverrideResource: pushedVerse,
-      });
-      return { refreshed: pushedVerse };
-    });
   }
 
   if (changed.length === 0) {
