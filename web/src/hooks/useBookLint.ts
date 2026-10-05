@@ -30,43 +30,37 @@ export interface UseBookLintReturn {
 export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   const [report, setReport] = useState<BookLintReport | null>(null);
   const [status, setStatus] = useState<UseBookLintReturn["status"]>("idle");
-  // Created once for the hook's lifetime so `load()` never observes a null
-  // queue — neither on first render (before the mount effect runs) nor
-  // between a book change's effect cleanup and its replacement effect. The
-  // effect below swaps `runner.current` instead of recreating the queue, so
+  // The effect below owns the queue's whole lifecycle (create in setup,
+  // dispose in cleanup) so setup and cleanup stay symmetric under a React
+  // StrictMode replay (setup → cleanup → setup) — see that effect's comment.
+  // `load()`/the book-change effect below tolerate a momentarily-null queue
+  // (there is none between a real unmount and the hook itself going away).
+  // The effect below swaps `runner.current` instead of recreating the queue, so
   // an in-flight refresh() from before a book change still resolves against
   // whichever run() the queue picks up next (the queue's own coalescing).
   const runner = useRef<() => Promise<void>>(() => Promise.resolve());
-  const queue = useRef<ReturnType<typeof createLintRefreshQueue>>();
-  const disposed = useRef(false);
+  const queue = useRef<ReturnType<typeof createLintRefreshQueue> | null>(null);
   // Serialized last-applied report, so an identical refetch skips setReport
   // (and the Shell re-render it causes); null = no report yet.
   const reportJson = useRef<string | null>(null);
   const settledAt = useRef(0);
   const lastSettledAt = useCallback(() => settledAt.current, []);
-  if (queue.current === undefined) {
-    queue.current = createLintRefreshQueue(() => runner.current());
-  }
 
   const load = useCallback((): Promise<void> => {
-    return queue.current!.refresh();
+    return queue.current ? queue.current.refresh() : Promise.resolve();
   }, []);
 
-  // Dispose only on actual unmount — the queue itself outlives book changes.
-  // React StrictMode replays effects (setup → cleanup → setup) in dev, so the
-  // first cleanup disposes the retained queue while the ref survives; revive
-  // it on the replayed setup or every later refresh() (lint load, dismiss,
-  // edit) would silently no-op against a permanently-disposed queue. This
-  // effect is declared before the book-change effect, so its replayed setup
-  // recreates the queue before that effect's refresh() runs against it.
+  // Created in setup, disposed in cleanup — a one-way `disposed` latch used
+  // to survive a React StrictMode replay by reviving a queue created once in
+  // the render body, which made correctness depend on this effect being
+  // declared before the book-change effect below (#842 step 4). Owning the
+  // whole lifecycle here removes both: cleanup always undoes exactly what
+  // setup just did, in dev and in production alike, in any declaration order.
   useEffect(() => {
-    if (disposed.current) {
-      queue.current = createLintRefreshQueue(() => runner.current());
-      disposed.current = false;
-    }
+    queue.current = createLintRefreshQueue(() => runner.current());
     return () => {
-      queue.current!.dispose();
-      disposed.current = true;
+      queue.current?.dispose();
+      queue.current = null;
     };
   }, []);
 
@@ -102,7 +96,7 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
         setStatus("error");
       }
     };
-    void queue.current!.refresh();
+    void queue.current?.refresh();
     return () => {
       ctrl.abort();
     };

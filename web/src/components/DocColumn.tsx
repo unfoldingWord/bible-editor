@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
 import UndoIcon from "@mui/icons-material/Undo";
@@ -6,7 +6,7 @@ import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
-import { highlightsFor, isPaintableHtml, leadingBreakClass, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { isPaintableHtml, leadingBreakClass, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -16,7 +16,7 @@ import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { FindMatch } from "./FindReplaceOverlay";
-import { formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
+import { formatVerseLabel, isFirstOfRange, isRangeRow, rowHighlightsFor, sourceForTargetRow } from "../lib/verseRange";
 import { VerseBridgeButtons } from "./VerseBridgeButtons";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -33,6 +33,16 @@ interface SearchState {
 }
 
 const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
+// Shared "nothing here" values so a verse with no drift / no section headers
+// hands VerseSpan the same reference every render (#895).
+const EMPTY_MARKERS: unknown[] = [];
+const EMPTY_SECTIONS: SectionHeader[] = [];
+
+interface RowHighlights {
+  highlights: Set<string> | null;
+  prevHighlights: Set<string> | null;
+  nextHighlights: Set<string> | null;
+}
 
 interface Props {
   book: string;
@@ -58,6 +68,8 @@ interface Props {
   activeNoteQuotePartialGroups?: boolean;
   // Verses in the active TN ref; with partialGroups, only these paint.
   activeNoteCoveredVerses?: readonly number[];
+  // The active note's own verse; its occurrence counts there (#957).
+  activeNoteVerse?: number | null;
   // Transient reorder stoplight for the active verse (drag held / ~3s after an
   // arrow move): the moved note's candidate prev (green underline) + next (red
   // overline), on channels separate from the yellow active fill.
@@ -134,6 +146,7 @@ export function DocColumn({
   activeNoteOccurrence,
   activeNoteQuotePartialGroups = false,
   activeNoteCoveredVerses,
+  activeNoteVerse,
   reorderHighlight,
   activeSourceContent,
   scrollNonce,
@@ -165,6 +178,131 @@ export function DocColumn({
     if (localSelection && !explicitScroll) return;
     activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [activeVerse, scrollNonce]);
+
+  // #895: VerseSpan is memoized, so everything it receives must keep its
+  // identity across a verse click unless that verse's own render changes.
+  //
+  // Per-row layout (sections + drift) depends only on the verse data, so it is
+  // computed once per versesByVerseNum instead of once per verse per render.
+  // Keyed by verse_start; ranges appear once (the index repeats their DTO).
+  const rowLayout = useMemo(() => {
+    const map = new Map<number, { sections: SectionHeader[]; drift: unknown[] }>();
+    for (const dto of Object.values(versesByVerseNum)) {
+      if (!dto || map.has(dto.verse)) continue;
+      // Lift any \s1/\s2/\s3 section headers in this verse's content
+      // into block-level bands rendered AFTER the inline verse span
+      // (see below) — they sit in the verse's trailing objects and
+      // introduce the next verse. The remaining body still has them
+      // filtered by the renderer.
+      const verseObjects = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+      const sections = Array.isArray(verseObjects) ? splitSectionHeaders(verseObjects).sections : [];
+      // Drift trailing \q1/\p etc. from the previous verse into the
+      // leading position of THIS verse — usfm-js attaches them to
+      // the prior verse (per `\q1 \v N+1`) but visually they introduce
+      // this verse. Composed into the rendered content here; storage
+      // stays untouched.
+      const prevDto = findPreviousVerse(versesByVerseNum, dto.verse);
+      const drift = prevDto
+        ? extractTrailingMarkers((prevDto.content as { verseObjects?: unknown[] } | null)?.verseObjects)
+        : [];
+      map.set(dto.verse, {
+        sections: sections.length > 0 ? sections : EMPTY_SECTIONS,
+        drift: drift.length > 0 ? drift : EMPTY_MARKERS,
+      });
+    }
+    return map;
+  }, [versesByVerseNum]);
+
+  // Note-quote and reorder-stoplight highlight sets, built only for the rows
+  // that paint (the active row, plus a bridged note's covered rows). Every
+  // other row gets no entry → null props that never change identity. Deps are
+  // exactly the highlight inputs, so Find typing or unrelated parent renders
+  // do not rebuild them.
+  const rowHighlights = useMemo(() => {
+    const map = new Map<number, RowHighlights>();
+    // During a preview the yellow follows the moved/hovered note; else the
+    // active note. Bridged TN quotes also paint on non-active covered verses.
+    const ro = reorderHighlight;
+    const aQuote = ro?.movedQuote ?? activeNoteQuote;
+    const aOcc = ro?.movedQuote ? ro.movedOccurrence : activeNoteOccurrence;
+    // A note's occurrence counts within its own verse, which a bridged
+    // row needs to find the right source instance (#957).
+    const aVerse = ro?.movedQuote ? ro.movedVerse : activeNoteVerse;
+    const seen = new Set<number>();
+    for (const dto of Object.values(versesByVerseNum)) {
+      if (!dto || seen.has(dto.verse)) continue;
+      seen.add(dto.verse);
+      const end = dto.verse_end ?? dto.verse;
+      // "Active" if the user's navigated verse is inside this DTO's range.
+      const isActive = activeVerse >= dto.verse && activeVerse <= end;
+      const covered =
+        !!activeNoteQuotePartialGroups &&
+        !!activeNoteCoveredVerses?.some((cv) => cv >= dto.verse && cv <= end);
+      const paintQuote = !!aQuote && (isActive || covered);
+      const partial = !ro?.movedQuote && covered;
+      // OL-anchor against THIS row's source (its whole span for a bridge,
+      // #957) — activeSourceContent is only the navigated verse and would
+      // mis-join a v12 ULT highlight.
+      const highlights = paintQuote
+        ? rowHighlightsFor(bibleVersion, dto, aQuote, aOcc, sourceByVerseNum, aVerse, partial, activeSourceContent)
+        : null;
+      // Reorder stoplight neighbour sets (active verse only, while live).
+      const prevHighlights =
+        isActive && ro?.prevQuote
+          ? rowHighlightsFor(bibleVersion, dto, ro.prevQuote, ro.prevOccurrence, sourceByVerseNum, ro.prevVerse, false, activeSourceContent)
+          : null;
+      const nextHighlights =
+        isActive && ro?.nextQuote
+          ? rowHighlightsFor(bibleVersion, dto, ro.nextQuote, ro.nextOccurrence, sourceByVerseNum, ro.nextVerse, false, activeSourceContent)
+          : null;
+      if (highlights || prevHighlights || nextHighlights) {
+        map.set(dto.verse, { highlights, prevHighlights, nextHighlights });
+      }
+    }
+    return map;
+  }, [
+    versesByVerseNum,
+    sourceByVerseNum,
+    bibleVersion,
+    activeVerse,
+    activeNoteQuote,
+    activeNoteOccurrence,
+    activeNoteQuotePartialGroups,
+    activeNoteCoveredVerses,
+    activeNoteVerse,
+    reorderHighlight,
+    activeSourceContent,
+  ]);
+
+  // ScriptureColumn builds its per-column callbacks inline, so their identity
+  // changes on every render. VerseSpan gets stable wrappers that read the
+  // latest callbacks from a ref at call time (the verse number is passed in by
+  // VerseSpan), so a new parent closure alone never re-renders a verse.
+  const latest = useRef({ onSelectVerse, onEditVerse, onSaveColumn, onOpenAligner, onMergeBridge, onSplitBridge, onOpenVerseComments, activeVerse });
+  latest.current = { onSelectVerse, onEditVerse, onSaveColumn, onOpenAligner, onMergeBridge, onSplitBridge, onOpenVerseComments, activeVerse };
+  const handleSelect = useCallback((verse: number) => {
+    // Compare against the active verse as of the click, like the old inline
+    // closure did — onAccepted may run after a confirm dialog and a re-render.
+    const activeAtClick = latest.current.activeVerse;
+    latest.current.onSelectVerse(verse, () => {
+      if (verse !== activeAtClick) localSelectionRef.current = verse;
+    });
+  }, []);
+  const handleAlign = useCallback((verse: number) => latest.current.onOpenAligner(verse), []);
+  const handleEdit = useCallback(
+    (verse: number, plain: string, base: VerseDto) => latest.current.onEditVerse(verse, plain, base),
+    [],
+  );
+  const handleSave = useCallback(
+    (verse: number, plain: string, base: VerseDto) => latest.current.onSaveColumn([{ verseNum: verse, plain, base }]),
+    [],
+  );
+  const handleMerge = useCallback((verse: number) => latest.current.onMergeBridge?.(verse), []);
+  const handleSplit = useCallback((verse: number) => latest.current.onSplitBridge?.(verse), []);
+  const handleOpenComments = useCallback(
+    (el: HTMLElement, verse: number) => latest.current.onOpenVerseComments?.(el, verse),
+    [],
+  );
 
   return (
     <Box
@@ -217,6 +355,8 @@ export function DocColumn({
         />
       </Stack>
       <Box
+        // The hover lexical box opens beside the whole UHB column (#1055).
+        data-lex-region={rtl ? "" : undefined}
         sx={(theme) => ({
           flex: 1,
           overflowY: "auto",
@@ -243,53 +383,12 @@ export function DocColumn({
           // "Active" if the user's navigated verse is inside this DTO's
           // range. For singletons this reduces to v === activeVerse.
           const isActive = activeVerse >= dto.verse && activeVerse <= (dto.verse_end ?? dto.verse);
-          // During a preview the yellow follows the moved/hovered note; else the
-          // active note. Bridged TN quotes also paint on non-active covered verses.
-          const aQuote = reorderHighlight?.movedQuote ?? activeNoteQuote;
-          const aOcc = reorderHighlight?.movedQuote ? reorderHighlight.movedOccurrence : activeNoteOccurrence;
-          const covered =
-            !!activeNoteQuotePartialGroups &&
-            !!activeNoteCoveredVerses?.some(
-              (cv) => cv >= dto.verse && cv <= (dto.verse_end ?? dto.verse),
-            );
-          const paintQuote = !!aQuote && (isActive || covered);
-          const partial = !reorderHighlight?.movedQuote && covered;
-          // OL-anchor against THIS verse's source — activeSourceContent is only
-          // the navigated verse and would mis-join a v12 ULT highlight.
-          const sourceContent =
-            sourceByVerseNum?.[dto.verse]?.content ?? activeSourceContent;
-          const highlights = paintQuote
-            ? highlightsFor(bibleVersion, dto.content, aQuote, aOcc, sourceContent, partial)
-            : null;
-          // Reorder stoplight neighbour sets (active verse only, while live).
-          const prevHighlights =
-            isActive && reorderHighlight?.prevQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, sourceContent)
-              : null;
-          const nextHighlights =
-            isActive && reorderHighlight?.nextQuote
-              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, sourceContent)
-              : null;
-          // Lift any \s1/\s2/\s3 section headers in this verse's content
-          // into block-level bands rendered AFTER the inline verse span
-          // (see below) — they sit in the verse's trailing objects and
-          // introduce the next verse. The remaining body still has them
-          // filtered by the renderer.
-          const verseObjects = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-          const sections: SectionHeader[] = Array.isArray(verseObjects)
-            ? splitSectionHeaders(verseObjects).sections
-            : [];
-          // Drift trailing \q1/\p etc. from the previous verse into the
-          // leading position of THIS verse — usfm-js attaches them to
-          // the prior verse (per `\q1 \v N+1`) but visually they introduce
-          // this verse. Composed into the rendered content here; storage
-          // stays untouched.
-          const prevDto = findPreviousVerse(versesByVerseNum, dto.verse);
-          const drift = prevDto
-            ? extractTrailingMarkers(
-                (prevDto.content as { verseObjects?: unknown[] } | null)?.verseObjects,
-              )
-            : [];
+          // Memoized per row above (#895) so unchanged rows get the same refs.
+          const rowSourceContent = sourceForTargetRow(sourceByVerseNum, dto)?.content;
+          const hl = rowHighlights.get(dto.verse);
+          const layout = rowLayout.get(dto.verse);
+          const sections = layout?.sections ?? EMPTY_SECTIONS;
+          const drift = layout?.drift ?? EMPTY_MARKERS;
           return (
             <Fragment key={dto.verse}>
               <VerseSpan
@@ -301,11 +400,11 @@ export function DocColumn({
                 bibleVersion={bibleVersion}
                 text={dto.plain_text ?? ""}
                 content={dto.content}
-                sourceContent={sourceByVerseNum?.[dto.verse]?.content}
+                sourceContent={rowSourceContent}
                 precedingMarkers={drift}
-                highlights={highlights}
-                prevHighlights={prevHighlights}
-                nextHighlights={nextHighlights}
+                highlights={hl?.highlights ?? null}
+                prevHighlights={hl?.prevHighlights ?? null}
+                nextHighlights={hl?.nextHighlights ?? null}
                 isActive={isActive}
                 readOnly={!!readOnly}
                 rtl={!!rtl}
@@ -315,22 +414,19 @@ export function DocColumn({
                 findActiveMatch={findActiveMatch ?? null}
                 spanRef={isActive ? activeRef : null}
                 textCheck={textCheck}
-                onClick={() => {
-                  onSelectVerse(dto.verse, () => {
-                    if (dto.verse !== activeVerse) localSelectionRef.current = dto.verse;
-                  });
-                }}
-                onAlign={() => onOpenAligner(dto.verse)}
-                onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
-                onSave={(plain) => onSaveColumn([{ verseNum: dto.verse, plain, base: dto }])}
+                base={dto}
+                onSelect={handleSelect}
+                onAlign={handleAlign}
+                onEdit={handleEdit}
+                onSave={handleSave}
                 verseEnd={dto.verse_end}
                 // A following verse exists iff the expanded index has a row
                 // starting right after this one's span.
                 hasNextVerse={!!versesByVerseNum[(dto.verse_end ?? dto.verse) + 1]}
-                onMergeBridge={onMergeBridge}
-                onSplitBridge={onSplitBridge}
+                onMergeBridge={onMergeBridge ? handleMerge : undefined}
+                onSplitBridge={onSplitBridge ? handleSplit : undefined}
                 verseCommentCounts={verseCommentCounts}
-                onOpenComments={onOpenVerseComments}
+                onOpenComments={onOpenVerseComments ? handleOpenComments : undefined}
               />
               {/* `\s*` headings live in this verse's trailing verseObjects
                   but introduce the NEXT verse — render the band AFTER the
@@ -376,7 +472,8 @@ function findPreviousVerse(
   return null;
 }
 
-function VerseSpan({
+// memo: see #895 — a verse click must only re-render the rows whose props change.
+const VerseSpan = memo(function VerseSpan({
   book,
   chapter,
   verseNum,
@@ -399,7 +496,8 @@ function VerseSpan({
   findActiveMatch,
   spanRef,
   textCheck,
-  onClick,
+  base,
+  onSelect,
   onAlign,
   onEdit,
   onSave,
@@ -443,10 +541,13 @@ function VerseSpan({
   findActiveMatch: FindMatch | null;
   spanRef: React.MutableRefObject<HTMLSpanElement | null> | null;
   textCheck?: TextLaneCheck;
-  onClick: () => void;
-  onAlign: () => void;
-  onEdit: (plain: string) => void;
-  onSave: (plain: string) => void;
+  // The row's DTO, handed back to onEdit / onSave as the edit base.
+  base: VerseDto;
+  // Stable column-level callbacks; the verse number is supplied at call time.
+  onSelect: (verseNum: number) => void;
+  onAlign: (verseNum: number) => void;
+  onEdit: (verseNum: number, plain: string, base: VerseDto) => void;
+  onSave: (verseNum: number, plain: string, base: VerseDto) => void;
   // Inclusive range end for this row (null for singletons) — the bridge buttons
   // need it to label "break bridge a-b" / decide merge vs extend.
   verseEnd?: number | null;
@@ -676,8 +777,13 @@ function VerseSpan({
   // Latest `isActive` for the native `beforeinput` guard below. The listener is
   // attached per element, not per render, so reading `isActive` straight out of
   // the closure that defined it would pin whatever value that render saw.
+  // Written in a layout effect, not during render, so a render React throws
+  // away (StrictMode's dev replay) never leaves it holding an uncommitted
+  // value; the listener only fires on user input, after the commit.
   const isActiveRef = useRef(isActive);
-  isActiveRef.current = isActive;
+  useLayoutEffect(() => {
+    isActiveRef.current = isActive;
+  });
 
   // Refuse input on a verse that is not (yet) the active one. The span stays
   // contentEditable regardless of `isActive` (see the comment on it below), so
@@ -720,7 +826,7 @@ function VerseSpan({
     <>
     <span
       data-find-cell={`${chapter}-${verseNum}-${bibleVersion}`}
-      onClick={onClick}
+      onClick={() => onSelect(verseNum)}
       style={{
         display: "inline",
         borderRadius: 4,
@@ -774,7 +880,7 @@ function VerseSpan({
           sx={{ p: 0.25, verticalAlign: "-3px" }}
           onClick={(e) => {
             e.stopPropagation();
-            onAlign();
+            onAlign(verseNum);
           }}
         />
       )}
@@ -865,7 +971,7 @@ function VerseSpan({
               // stale, marker-free save even though the DOM itself carries
               // the correct \q/\p chips (#642 defect 1). Mirrors
               // ScriptureColumn's elRef.current?.textContent save read.
-              onSave(elRef.current?.textContent ?? lastTextRef.current);
+              onSave(verseNum, elRef.current?.textContent ?? lastTextRef.current, base);
             }}
             size="small"
             sx={{ visibility: hasDraft ? "visible" : "hidden", color: "primary.main", p: 0.25, ml: 0.75, verticalAlign: "-3px" }}
@@ -958,7 +1064,7 @@ function VerseSpan({
           // which then corrupts the stored draft and the verse. textContent is
           // synchronous and reliable in both browsers (matches the rows editor).
           const value = el.textContent ?? "";
-          onEdit(value);
+          onEdit(verseNum, value, base);
           lastTextRef.current = value;
           lastSetRef.current = value;
           // Mark dirty synchronously, ahead of the async draft write, so a
@@ -976,7 +1082,7 @@ function VerseSpan({
     {" "}
     </>
   );
-}
+});
 
 function renderFindMatchesHTML(
   plainText: string,

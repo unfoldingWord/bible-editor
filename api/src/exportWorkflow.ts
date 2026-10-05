@@ -47,6 +47,10 @@ import {
   tsvRevertReport,
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
+  loadRevertLineage,
+  readUnconfirmedRenders,
+  foreignCommitDuringExport,
+  exportRevertRaceAlertSource,
   masterIsOurLastPublish,
   priorPublishPointer,
   RECORD_PUSHED_RENDER_SQL,
@@ -93,7 +97,7 @@ import {
   storedResourceSha,
   retireMergeKeptFlags,
   sweepStaleMergeNoBase,
-  readPushedRenderText,
+  readVerifiedPushedRenderText,
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
 import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
@@ -102,11 +106,16 @@ import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline
 import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
-import { hardRejectRows } from "./hardRejectGuard";
+import { buildHardRejectAlertMessage, hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
-import { mergeRefusalOverrideAllowed, idBlockedOverrideAllowed, staleBaseOverrideAllowed } from "./reimportSyncGate";
+import {
+  mergeRefusalOverrideAllowed,
+  idBlockedOverrideAllowed,
+  staleBaseOverrideAllowed,
+  classifyReimportOutcome,
+} from "./reimportSyncGate";
 import { readSyncWithhold, staleSkipRemedy } from "./syncWithholds";
 import { lockedBooksIn } from "./bookLock";
 import {
@@ -498,35 +507,26 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
             staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
+            // Issue #1006 review: this run's export will push the locked book
+            // (exportOne's allowLocked branch) only when the override holds and
+            // the run really exports, so only then is the no-base alert told
+            // the export does not skip it.
+            lockOverrideResource:
+              lockOverride && dcsAllowed && !params.reimportOnly ? (params.resource as Resource) : undefined,
             userId: params.userId ?? null,
           });
           // runChunkedReimport resolves normally in three distinct outcomes and
-          // the ledger must tell them apart (#833 review). The split mirrors
-          // shouldRecordResourceSync (reimportSyncGate.ts), the authority on
-          // whether the watermark was stamped, so SUCCESS ⟺ watermark stamped:
-          //   • FAILURE — a real error left D1 stale and the watermark withheld:
-          //     a write batch threw (apply_incomplete), a batch errored
-          //     (errors), the conflict record failed (merge_record_failed), or a
-          //     structural overlap fail-safe fired (structure_overlap). These
-          //     are the "something went wrong" withholds.
-          //   • SKIP — the sync was DEFERRED, not broken, and the watermark was
-          //     withheld for a benign, retriable reason: a pipeline lock
-          //     (chapters_locked / prune_locked), an id conflict blocking a row
-          //     (conflict_skipped / tombstone_blocked), or an unmeasurable chunk
-          //     (counts_incomplete). The next run retries and the export
-          //     freshness gate keeps stale D1 off master meanwhile — flagging
-          //     these as FAILURE would be false-RED noise. NOTE: skipped_locked
-          //     is deliberately excluded — it is a row-level counter that
-          //     shouldRecordResourceSync ignores, so it does NOT withhold the
-          //     watermark and must not force a skip.
-          //   • SUCCESS — a clean, fully-applied sync (watermark stamped).
-          const t = res.totals;
-          const status: "success" | "skip" | "failure" =
-            t.apply_incomplete || t.errors.length > 0 || t.merge_record_failed || t.structure_overlap > 0
-              ? "failure"
-              : t.chapters_locked || t.prune_locked || t.conflict_skipped || t.tombstone_blocked || t.counts_incomplete
-                ? "skip"
-                : "success";
+          // the ledger must tell them apart (#833 review) — see
+          // classifyReimportOutcome (reimportSyncGate.ts) for the split. Fed
+          // res.perResource, NEVER res.totals: a PR review on #836's first
+          // version caught that classifying from the book-level SUM breaks
+          // isSystemicMergeRefusal's per-resource threshold check (and hides
+          // which resource an override applies to) — see that function's doc.
+          const status = classifyReimportOutcome(
+            res.perResource,
+            mergeRefusalOverride ? params.resource : undefined,
+            idBlockedOverride ? params.resource : undefined,
+          );
           reimportOutcomes.push({ book, status });
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
@@ -1025,7 +1025,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // silent revert. A fresh book with no watermark has nothing to clobber.
     // Only meaningful when we'd actually commit (dcsAllowed); a dry run renders
     // to R2 only and can't clobber anything.
-    const fresh = dcsAllowed ? await this.checkMasterFreshness(book, resource) : { ok: true as const, detail: "dry", masterSha: null, watermark: null };
+    const fresh = dcsAllowed ? await this.checkMasterFreshness(book, resource) : { ok: true as const, detail: "dry", masterSha: null, watermark: null, headIsOurExport: false };
     if (!fresh.ok) {
       await this.recordStaleSkipAlert(book, resource, fresh.masterSha, fresh.watermark, instanceId);
       const reason = `stale_master:${fresh.detail}`;
@@ -1215,9 +1215,28 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // paragraphs above: blank OrigWords/TWLink are severity="warning", they merge
     // fine, and lint.ts plus the save-path guards are where a blank row gets
     // caught. Prod carries 0 blank-OrigWords rows today.
-    if (dcsAllowed && (resource === "tn" || resource === "twl")) {
+    //
+    // Unpaired `[ ]` in a tn Note (check 13) is the translator-fixable hard
+    // error this gate holds for (issue #1015, JER 17:4 ny7v). The banner names
+    // the row, and a clean render clears it — on a dry run too, since the
+    // clear only reads the bytes (the HOLD itself needs dcsAllowed).
+    if (resource === "tn" || resource === "twl") {
       const rejects = hardRejectRows(resource, built.content);
-      if (rejects.length > 0) {
+      if (rejects.length === 0) {
+        // The rows were fixed (or deleted): clear the HELD banner so it does not
+        // keep naming a row that is already fine. Best-effort, like writeAlert.
+        // Bound: an export that returns before this gate (stale_master,
+        // shrink_guard, no_rows) leaves the banner until a run reaches here.
+        try {
+          await this.env.DB.prepare(
+            `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+          )
+            .bind(EXPORT_ALERT_USERNAME, `export_hard_reject:${book}:${resource}`)
+            .run();
+        } catch (err) {
+          console.error(`export_hard_reject banner clear failed for ${book} ${resource}:`, err);
+        }
+      } else if (dcsAllowed) {
         await this.recordHardRejectAlert(book, resource, rejects);
         const reason = `hard_reject_guard:${rejects.length}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
@@ -1415,9 +1434,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // render, the previous publish lives in prev_* (#995).
       let priorPushedBlobSha: string | null = null;
       let priorPushedR2Key: string | null = null;
+      // #1029: renders pushed since master was last confirmed (see migration 0075).
+      let unconfirmedRenderShas: string[] | null = null;
+      // #1029: where master was last confirmed, read before tonight's push;
+      // bounds which bot writes the revert lineage may count.
+      let priorConfirmed: { editId: number | null; at: number | null } = { editId: null, at: null };
       try {
         const prior = await this.env.DB.prepare(
-          `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key
+          `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key,
+                  unconfirmed_renders_json, master_confirmed_edit_id, master_confirmed_at
              FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
         )
           .bind(book, resource)
@@ -1426,7 +1451,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             pushed_r2_key: string | null;
             prev_pushed_blob_sha: string | null;
             prev_pushed_r2_key: string | null;
+            unconfirmed_renders_json: string | null;
+            master_confirmed_edit_id: number | null;
+            master_confirmed_at: number | null;
           }>();
+        priorConfirmed = {
+          editId: prior?.master_confirmed_edit_id ?? null,
+          at: prior?.master_confirmed_at ?? null,
+        };
+        unconfirmedRenderShas = readUnconfirmedRenders(prior);
         const pointer = priorPublishPointer(prior, r2Key);
         priorPushedBlobSha = pointer.blobSha;
         priorPushedR2Key = pointer.r2Key;
@@ -1483,6 +1516,69 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         resource === "ult" || resource === "ust"
           ? usfmMasterContentForRevertReport
           : tsvMasterContentForRevertReport;
+      // Foreign-commit race (#871): checkMasterFreshness pinned master's head
+      // SHA (`fresh.masterSha`) before the shrink/alignment guards took their
+      // master snapshot and before commitToDcs's several DCS round trips ran
+      // just above. A maintainer hand-edit landing on master anywhere in that
+      // window is invisible to every check so far — the snapshot below is
+      // already stale with respect to it. Re-resolve master's head SHA now,
+      // right after the commit, and only when a report is actually on the
+      // table (same gate as the hash below) so an ordinary unchanged night
+      // doesn't pay for an extra DCS round trip.
+      //
+      // This additionally ALERTS on a race; it must not SUPPRESS the report
+      // below. The report still diffs against the pinned M0 snapshot, and
+      // that diff is correct for what it claims: "did this render change
+      // anything master held at M0 that wasn't just our own prior publish".
+      // A foreign commit landing afterward doesn't make those findings
+      // wrong, it just means there is a SEPARATE, unreported risk — commitToDcs
+      // (just above) already re-based the `-be-` branch onto the live master
+      // (which may by now include the foreign commit) and PUT our full
+      // render over this file, so once Door43's merge bot merges this run's
+      // PR, the foreign edit is likely gone from this file, silently, and
+      // tomorrow's freshness gate will read that merge as our own publish
+      // and never flag it. Skipping the report would also skip its
+      // zero-entry clear path (see the comment below) and leave a prior
+      // generation's rows and persistence alert looking current — exactly
+      // the failure mode this file's `export_revert_persistence` plumbing
+      // exists to avoid.
+      //
+      // Known residual gap: this narrows the window to between the
+      // freshness gate and THIS check, not between this check and whenever
+      // Door43's merge bot actually merges the resulting PR — a commit
+      // landing in that later window, which can run to several minutes, is
+      // still invisible to it.
+      //
+      // Known false-positive risk: a plain SHA mismatch has no own-publish
+      // classification (unlike checkMasterFreshness's pre-commit gate, which
+      // runs classifyMasterCommit/judgeOwnPublishDecline for exactly this
+      // reason). An overlapping run's own merge for this SAME (book,
+      // resource) landing inside the window would also read as "foreign"
+      // here. Accepted: one scheduled export per book+resource per night
+      // makes this rare, and the alert is observational, not blocking — a
+      // human reading it can tell the difference from the named SHA.
+      //
+      // Skipped entirely when `branch === "master"` — an operator
+      // `branchName: "master"` override (exports.ts's /run or /lock/push;
+      // exportBranchOverrideValid accepts the name, lockPushExportParams only
+      // passes it through) that commits straight to master with no PR/merge
+      // step. There, commitToDcs's own PUT IS what moves master's head, so a
+      // plain SHA compare would raise a false alert on every such run.
+      // Known coverage gap: that PUT still lands over master's current file,
+      // so a foreign commit inside the window gets no banner on this path.
+      if (branch !== "master" && shouldRecordRevertReport(dcsChanged, masterContentForRevertReport)) {
+        const postCommitHead = await fileHeadCommit(this.env, target.repo, filename);
+        const postCommitSha = postCommitHead?.sha ?? null;
+        if (foreignCommitDuringExport(fresh.masterSha, postCommitSha)) {
+          await this.recordExportRevertRaceAlert(book, resource, branch, fresh.masterSha, postCommitSha!);
+        }
+        // An unresolvable comparison (either side null — no watermark, or a
+        // transient fetch failure on THIS call) must never read as "clean":
+        // it raises nothing here, but it also must never be allowed to
+        // clear a standing banner from an earlier night's real race. See
+        // recordExportRevertRaceAlert's own comment for why that banner is
+        // never auto-cleared at all, by any outcome of this comparison.
+      }
       // Hash only when a report is actually on the table. `dcsChanged` is false
       // on every unchanged night — the common steady state — and SHA-1 over a
       // multi-MB USFM or a 7776-row TSV is not free on a Worker this file
@@ -1501,6 +1597,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         masterContentForRevertReport,
         masterBlobSha,
         priorPushedBlobSha,
+        unconfirmedRenderShas,
+        fresh.headIsOurExport,
       );
       // Log only a suppression that really happened: without the ship gate this
       // would announce "suppressed" on nights where no report was ever going to
@@ -1512,6 +1610,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       ) {
         console.log(
           `export: revert entries suppressed for ${book} ${resource} — master still holds our last publish (${(priorPushedBlobSha ?? "").slice(0, 12)})`,
+        );
+      } else if (
+        shouldRecordRevertReport(dcsChanged, masterContentForRevertReport) &&
+        !computeEntries
+      ) {
+        // #1029: suppressed because master holds an older render of ours that
+        // an unmerged export PR has not replaced yet.
+        console.log(
+          `export: revert entries suppressed for ${book} ${resource} — master holds an older unmerged render of ours (${(masterBlobSha ?? "").slice(0, 12)})`,
         );
       }
       // Per-row base for the three-way diff (#870): master moved somewhere, so
@@ -1529,16 +1636,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       let revertBase: string | null = null;
       if (computeEntries && priorPushedBlobSha != null) {
         try {
-          const raw = await readPushedRenderText(this.env, book, resource, priorPushedR2Key, priorPushedBlobSha);
-          if (raw != null && (await gitBlobShaOrNull(raw)) === priorPushedBlobSha) {
-            revertBase = raw;
-          } else if (raw != null && priorPushedR2Key != null) {
-            // R2 held a different render than the sha describes; Door43 still
-            // serves the exact blob by sha, so fetch it there instead.
-            console.warn(`export: R2 last-publish base for ${book} ${resource} does not hash to pushed_blob_sha; trying Door43`);
-            const fromDcs = await readPushedRenderText(this.env, book, resource, null, priorPushedBlobSha);
-            if (fromDcs != null && (await gitBlobShaOrNull(fromDcs)) === priorPushedBlobSha) revertBase = fromDcs;
-          }
+          // R2 first, Door43's blob by sha when R2 is missing or holds a
+          // different render than the sha describes.
+          revertBase = await readVerifiedPushedRenderText(this.env, book, resource, priorPushedR2Key, priorPushedBlobSha);
         } catch (e) {
           console.error("export: last-publish base read failed; revert report lists every differing row", {
             book,
@@ -1562,12 +1662,29 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
       ) {
+        // #1029: rows D1 took from master via a bot push. dcs_reimport is read
+        // only so a later import supersedes an older ai_pipeline payload
+        // (buildRevertLineage). Only read when a report is on the table, tn/tq
+        // only; fails open.
+        let lineage: Map<string, Array<Record<string, unknown>>> | null = null;
+        if (computeEntries && (resource === "tn" || resource === "tq")) {
+          try {
+            lineage = await loadRevertLineage(this.env.DB, resource, book, priorConfirmed);
+          } catch (e) {
+            console.error("export: revert lineage read failed; report keeps its unfiltered behaviour", {
+              book,
+              resource,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
         const entries = computeEntries
           ? tsvRevertReport(
               built.content,
               tsvMasterContentForRevertReport as string,
               resource as "tn" | "tq" | "twl",
               revertBase,
+              lineage,
             ).entries
           : [];
         await this.recordExportRevertReport(book, resource, "tsv", entries, mechanical, branch, instanceId, alertObservedAt);
@@ -2143,16 +2260,27 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   private async checkMasterFreshness(
     book: string,
     resource: Resource,
-  ): Promise<{ ok: boolean; detail: string; masterSha: string | null; watermark: string | null }> {
+  ): Promise<{
+    ok: boolean;
+    detail: string;
+    masterSha: string | null;
+    watermark: string | null;
+    // #1029: the file's head commit on master is one of our export merges
+    // (classifyMasterCommit, no extra fetch). Gates the lagging-master
+    // suppression in shouldComputeRevertEntries.
+    headIsOurExport: boolean;
+  }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
     // Unknown book/resource → no file to compare; don't block (shouldn't happen
     // for the five real resources).
-    if (!file) return { ok: true, detail: "no_file", masterSha: null, watermark: null };
+    if (!file) return { ok: true, detail: "no_file", masterSha: null, watermark: null, headIsOurExport: false };
     const watermark = await storedResourceSha(this.env, book, resource);
-    if (!watermark) return { ok: true, detail: "no_watermark", masterSha: null, watermark: null };
+    if (!watermark) return { ok: true, detail: "no_watermark", masterSha: null, watermark: null, headIsOurExport: false };
     const head = await fileHeadCommit(this.env, file.repo, file.path);
-    if (!head) return { ok: false, detail: "master_sha_unknown", masterSha: null, watermark };
-    if (head.sha === watermark) return { ok: true, detail: "current", masterSha: head.sha, watermark };
+    if (!head) return { ok: false, detail: "master_sha_unknown", masterSha: null, watermark, headIsOurExport: false };
+    const headIsOurExport =
+      classifyMasterCommit({ sha: head.sha, message: head.message, authorEmail: head.authorEmail }).kind === "ours";
+    if (head.sha === watermark) return { ok: true, detail: "current", masterSha: head.sha, watermark, headIsOurExport };
 
     // Master moved past the watermark. Normally that means a foreign commit
     // landed and the export must not clobber it (stale_master:master_ahead,
@@ -2193,10 +2321,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         pushedBlobSha: pushedPr.pushed_blob_sha,
         newest: classifiedHead,
       });
-      if (judged.verdict === "preserved") return { ok: true, detail: "own_publish", masterSha: head.sha, watermark };
+      if (judged.verdict === "preserved") return { ok: true, detail: "own_publish", masterSha: head.sha, watermark, headIsOurExport };
     }
 
-    return { ok: false, detail: "master_ahead", masterSha: head.sha, watermark };
+    return { ok: false, detail: "master_ahead", masterSha: head.sha, watermark, headIsOurExport };
   }
 
   // Banner alert when the freshness gate skips an export to avoid clobbering
@@ -2913,6 +3041,68 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
   }
 
+  // #871: a foreign commit landed on master between checkMasterFreshness
+  // pinning its head SHA and commitToDcs finishing its several DCS round
+  // trips. Every snapshot this run captured — the shrink/alignment guards'
+  // master content, the blob sha shouldComputeRevertEntries compares — is
+  // pinned to the now-stale SHA, so the revert report built below from it
+  // diffs against bytes that predate the foreign commit and can miss it or
+  // blame unrelated rows. This says so directly, as an ADDITIONAL signal
+  // alongside that report, not instead of it (see the long comment at the
+  // call site for why suppressing the report would be its own bug).
+  // severity "warning", same as recordExportRevertReport: this never blocks
+  // the export (already shipped by the time this fires) or claims a cause
+  // beyond what was measured — only that master moved and by how much.
+  //
+  // Deliberately never auto-cleared. A "review" alert here is exactly the
+  // sibling skip/guard alerts' convention (recordStaleSkipAlert,
+  // recordHardRejectAlert, recordAlignmentShrinkSkipAlert, …): it names an
+  // action a human needs to take and stays until a human dismisses it. An
+  // earlier revision auto-deleted this banner on the next run that didn't
+  // re-detect a race — which is unsafe twice over: (a) "didn't re-detect"
+  // includes "couldn't compare" (no watermark, a transient Door43 read
+  // failure), which must never read as "confirmed resolved"; and (b) even a
+  // genuinely confirmed-clean comparison deleting the ONE record of a race
+  // that needed a human's attention, with nothing else tracking it, is the
+  // same failure shape this file elsewhere calls out: "a durable record
+  // that lies about a destructive action is worse than none." Leaving it
+  // standing costs one extra dismiss-click; auto-clearing it risks losing
+  // the only trace of a silently overwritten hand-edit.
+  private async recordExportRevertRaceAlert(
+    book: string,
+    resource: Resource,
+    branch: string,
+    pinnedSha: string | null,
+    foreignSha: string,
+  ): Promise<void> {
+    const source = exportRevertRaceAlertSource(book, resource, pinnedSha, foreignSha);
+    const label = `${book} ${resource.toUpperCase()}`;
+    const pinned = (pinnedSha ?? "unknown").slice(0, 8);
+    const foreign = foreignSha.slice(0, 8);
+    // Not "this self-heals tomorrow": branch `branch`'s PUT carries this
+    // run's full render, built from content that predates `foreignSha`. If
+    // that foreign commit touched this same file, this run's own PR is at
+    // risk of overwriting it once Door43's merge bot merges `branch` —
+    // whether the branch was rebased onto master before or after
+    // `foreignSha` landed, this render still doesn't contain it either way.
+    // Once that merge happens, tomorrow's freshness gate reads it as our
+    // own publish and never flags it again — so a human has to look at
+    // this one, now, not wait for it to resurface. The export-revert report
+    // for this run is still built and still correct for what it measures
+    // (the diff against the PINNED snapshot); it simply cannot see
+    // `foreignSha`.
+    const message =
+      `${label}: master moved from ${pinned} to ${foreign} while tonight's export was running, between the ` +
+      `freshness check and the DCS commit — a hand-edit may have landed there. This does NOT self-heal: branch ` +
+      `\`${branch}\`'s PUT carries this run's full render, built without ${foreign}'s content, so if ${foreign}'s ` +
+      `commit touched ${book} ${resource.toUpperCase()}, this run's own PR risks overwriting it once Door43's ` +
+      `merge bot merges \`${branch}\` (minutes away, maybe already done) — after which tomorrow's freshness gate ` +
+      `reads that merge as our own publish and never flags it. Diff ${pinned}..${foreign} on Door43 now; if it ` +
+      `touched this file, recover it from git history after the merge. (The export-revert report for this run ` +
+      `still ran against the ${pinned} snapshot — valid for what it covers, it just cannot see ${foreign}.)`;
+    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`, "warning");
+  }
+
   // Build and record the export-revert report for one (book,resource), then
   // write a non-blocking, observational alert naming only what was measured
   // (class breakdown + refs) — never a cause, per this file's established
@@ -3172,17 +3362,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     rejects: Array<{ ref: string; rowId: string; reason: string }>,
   ): Promise<void> {
     const source = `export_hard_reject:${book}:${resource}`;
-    const shown = rejects
-      .slice(0, 6)
-      .map((r) => `${r.ref} (${r.rowId}): ${r.reason}`)
-      .join("; ");
-    const more = rejects.length > 6 ? `; +${rejects.length - 6} more` : "";
-    const message =
-      `Benjamin — nightly export HELD ${book} ${resource.toUpperCase()}: ${rejects.length} row(s) would fail DCS ` +
-      `validation as a hard error, so the -be- PR's check would go red and the merge bot would never merge it. ` +
-      `${shown}${more}. Fix the Occurrence on those rows (or delete them) in the editor and re-export; every other ` +
-      `edit in ${book} ${resource.toUpperCase()} is waiting on it. Blank notes/questions/OrigWords/TWLink do NOT ` +
-      `cause this — those are validator warnings and ship normally.`;
+    const message = buildHardRejectAlertMessage(book, resource, rejects);
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 

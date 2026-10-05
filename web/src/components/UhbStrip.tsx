@@ -1,4 +1,4 @@
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useMemo } from "react";
 import { Box, Typography, Stack, IconButton, Tooltip } from "@mui/material";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
@@ -9,7 +9,8 @@ import { type HighlightCtx, hoverShadow } from "../lib/highlightTypes";
 import { nfc } from "../lib/hebrew";
 import { directionForVersion } from "../lib/direction";
 import { SourceTooltipBody } from "./SourceTooltipBody";
-import { PinnedLexBox } from "./PinnedLexBox";
+import { LexTooltip } from "./LexTooltip";
+import { pinLex, usePinnedLexRefresh } from "./PinnedLexBox";
 
 // ─── UHB source strip ────────────────────────────────────────────────
 // The verse's Hebrew/Greek source text, rendered as hover-aware tokens. Lifted
@@ -41,6 +42,7 @@ export function UhbStrip({
   const sourceIsHebrew = directionForVersion(sourceLabel) === "rtl";
   return (
     <Box
+      data-lex-region
       sx={{
         px: 2,
         pt: 1,
@@ -202,16 +204,16 @@ function SourceVerseToken({
   twHint: string | null;
   hctx: HighlightCtx;
 }) {
-  const tone = hctx.hebrewHighlight(pos);
+  const tone = hctx.useHebrewHighlight(pos);
   const showInfo = hctx.showSourceInfo;
-  // Double-click pins the lexical info into an interactive Popover so its text
+  // Double-click pins the lexical info into the app's one pinned lexical box so its text
   // (lemma, gloss, definition) can be selected and copied — the hover Tooltip
-  // is pointerEvents:none and can't be. anchorEl is the word's own element.
-  const [pinAnchor, setPinAnchor] = useState<HTMLElement | null>(null);
+  // is pointerEvents:none and can't be.
+  usePinnedLexRefresh(source, lex);
   return (
     <>
-      <Tooltip
-        title={showInfo && !pinAnchor ? <SourceTooltipBody source={source} lex={lex} twHint={twHint} pinHint /> : ""}
+      <LexTooltip
+        title={showInfo ? <SourceTooltipBody source={source} lex={lex} twHint={twHint} pinHint /> : ""}
         enterDelay={0}
         enterNextDelay={0}
         disableHoverListener={!showInfo}
@@ -223,8 +225,8 @@ function SourceVerseToken({
           component="span"
           onMouseEnter={() => hctx.onHebrewEnter(pos)}
           onMouseLeave={hctx.onLeave}
-          onDoubleClick={(e) => {
-            if (showInfo) setPinAnchor(e.currentTarget);
+          onDoubleClick={() => {
+            if (showInfo) pinLex(source, lex, twHint);
           }}
           sx={{
             cursor: "help",
@@ -237,16 +239,7 @@ function SourceVerseToken({
         >
           {text}
         </Box>
-      </Tooltip>
-      {pinAnchor && (
-        <PinnedLexBox
-          anchorEl={pinAnchor}
-          source={source}
-          lex={lex}
-          twHint={twHint}
-          onClose={() => setPinAnchor(null)}
-        />
-      )}
+      </LexTooltip>
     </>
   );
 }

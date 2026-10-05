@@ -6,6 +6,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -15,13 +16,18 @@ import CheckIcon from "@mui/icons-material/Check";
 import CloseIcon from "@mui/icons-material/Close";
 import KeyboardArrowLeftIcon from "@mui/icons-material/KeyboardArrowLeft";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
-import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
+import { AlignmentPanel, type AlignerLock, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { UhbStrip } from "./UhbStrip";
-import { type HoverHighlight, type HighlightCtx } from "../lib/highlightTypes";
+import { type HighlightCtx } from "../lib/highlightTypes";
+import { createHoverStore, useHoverTone, type HoverStore } from "../lib/hoverStore";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { TwlRow, VerseDto } from "../sync/api";
+import type { VerseBaseHold } from "../sync/versePin";
+import { alignmentPanelRowKey } from "../sync/alignmentDraftSaveState";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { extractEditableText, normalizeEditable } from "../lib/usfm";
+import { formatVerseLabel } from "../lib/verseRange";
+import { droppedEditNotice, type DualSideRow } from "../lib/dualRowChange";
 
 // Separate key from the single-panel aligner's `be:alignmentHoverLink`
 // (which defaults OFF). The side-by-side popup's whole point is the
@@ -225,11 +231,22 @@ interface Props {
     bibleVersion: string,
     plain: string,
     base: VerseDto,
-    afterCommit?: () => void,
+    afterCommit?: (outcome?: { queued: boolean }) => void,
   ) => void;
+  // #1060: hold the verse-base pin for a reading line from its first dirty
+  // keystroke. `base` is the verse the box was last synced from — the one the
+  // edit is made against. The line releases the hold when it goes clean with
+  // nothing queued, and hands it off when its save is queued.
+  onHoldReadingBase?: (bibleVersion: string, base: VerseDto) => VerseBaseHold;
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
   onNextVerse?: () => void;
+  // #943: this verse can't be written (AI pipeline chapter lock, or a book
+  // lock that landed after the popup opened). The popup stays open (the
+  // reading line's own save still goes through and is rejected server-side
+  // with a toast; see s9 check (b)), but each AlignmentPanel disables its
+  // alignment changes, Save and history restore.
+  locked?: AlignerLock;
   // Save both sides, mark the verse's Text lane done, then go to the next
   // verse (#931). Undefined wherever it can't run (chapter end, locked book).
   onSaveDoneAndNext?: () => void;
@@ -237,6 +254,10 @@ interface Props {
   // column verse markers, so translators can stamp "done" without leaving
   // the dual aligner (check sits next to the verse chip + next-arrow).
   textCheck?: TextLaneCheck;
+  // #1075: a bridge or split by another editor moved a side onto a different
+  // row while it held unsaved reading text or alignment drags, and the
+  // remount dropped them. Shell shows `message` as a toast.
+  onUnsavedDropped?: (message: string) => void;
 }
 
 // Text-lane checkoff for the dual-aligner titlebar — same 18×18 cell as the
@@ -333,12 +354,22 @@ export function SideBySideAligner({
   left,
   right,
   onSaveReading,
+  onHoldReadingBase,
   onPrevVerse,
   onNextVerse,
   onSaveDoneAndNext,
   textCheck,
+  locked = false,
+  onUnsavedDropped,
 }: Props) {
-  const [hover, setHover] = useState<HoverHighlight>(null);
+  // Lifted hover lives in an external store, not React state (#900): a plain
+  // `useState` here forced this dialog — and both AlignmentPanels and
+  // SharedUhbStrip under it — to re-render on every mouseenter/mouseleave.
+  // Created once and never replaced (this dialog isn't remounted across a
+  // verse nav — see the reset effect below).
+  const hoverStoreRef = useRef<HoverStore | null>(null);
+  if (!hoverStoreRef.current) hoverStoreRef.current = createHoverStore(null);
+  const hoverStore = hoverStoreRef.current;
   const [hoverLink, setHoverLink] = useState<boolean>(readHoverLink);
   // Hebrew lexicon tooltip on hover — default on; turn off to see only what's
   // aligned (the highlight bridge) without the popup covering the panels.
@@ -352,6 +383,39 @@ export function SideBySideAligner({
   // by a same-side text edit. (Still forwards the upstream onDirtyChange.)
   const [leftDirty, setLeftDirty] = useState(false);
   const [rightDirty, setRightDirty] = useState(false);
+  // #1075: what each side holds unsaved, as last reported by its line and
+  // panel, and the row each side stood on at the last commit. A bridge or
+  // split moves a side onto another row and remounts both (see their keys),
+  // dropping that work; the layout effect below runs before the remounted
+  // children's passive effects report "clean", so these still hold what the
+  // old row had.
+  const unsavedRef = useRef({
+    left: { reading: false, panel: false },
+    right: { reading: false, panel: false },
+  });
+  const sideRowRef = useRef<{ left?: DualSideRow; right?: DualSideRow }>({});
+  const leftRowKey = alignmentPanelRowKey(left.verse);
+  const rightRowKey = alignmentPanelRowKey(right.verse);
+  useLayoutEffect(() => {
+    const notices: string[] = [];
+    for (const [side, slot, rowKey] of [
+      ["left", left, leftRowKey],
+      ["right", right, rightRowKey],
+    ] as const) {
+      const cur: DualSideRow = {
+        chapter,
+        verseNum,
+        rowKey,
+        label: slot.verse ? formatVerseLabel(slot.verse) : null,
+      };
+      const notice = droppedEditNotice(book, slot.bibleVersion, sideRowRef.current[side], cur, unsavedRef.current[side]);
+      if (notice) notices.push(notice);
+      sideRowRef.current[side] = cur;
+    }
+    // One toast slot: a bridge that hit both sides says both.
+    if (notices.length > 0) onUnsavedDropped?.(notices.join(" "));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [book, chapter, verseNum, leftRowKey, rightRowKey]);
   // Drag-resizable height for the reading (English) band, persisted per browser.
   // See StripResizeHandle / clampStripHeight above.
   const [readingHeight, setReadingHeight] = useState(() =>
@@ -381,13 +445,13 @@ export function SideBySideAligner({
   // Hover positions are verse-specific — a stale ring would attach to whatever
   // token happens to hold the same position after a verse nav.
   useEffect(() => {
-    setHover(null);
-  }, [verseNum, chapter]);
+    hoverStore.setHover(null);
+  }, [hoverStore, verseNum, chapter]);
   const toggleHoverLink = () =>
     setHoverLink((cur) => {
       const next = !cur;
       writeHoverLink(next);
-      if (!next) setHover(null);
+      if (!next) hoverStore.setHover(null);
       return next;
     });
 
@@ -411,14 +475,23 @@ export function SideBySideAligner({
     [left.panelRef, right.panelRef],
   );
 
-  const renderPanel = (slot: PanelSlot, setLocalDirty: (dirty: boolean) => void) => (
+  const readingDirtyChange = (side: "left" | "right", slot: PanelSlot) => (dirty: boolean) => {
+    unsavedRef.current[side].reading = dirty;
+    slot.onReadingDirtyChange(dirty);
+  };
+
+  const renderPanel = (side: "left" | "right", slot: PanelSlot, setLocalDirty: (dirty: boolean) => void) => (
     <AlignmentPanel
       // Remount on verse change so the panel's internal state is seeded fresh
       // (useState(computedInitial)) instead of carrying the previous verse's
       // alignment across a dualNavTo until the passive reset effect runs — the
       // same stale-state race the single-panel aligner had. bibleVersion is
-      // fixed per side (ULT left / UST right), so verseNum alone keys it.
-      key={`${slot.bibleVersion}:${verseNum}`}
+      // fixed per side (ULT left / UST right). Also keyed by the ROW (start
+      // verse + bridge end), as the reading line is (#1067): a bridge or split
+      // by another editor moves the slot onto a different row, and the panel
+      // must start fresh on it rather than carry drags made on the old one
+      // (#1074).
+      key={`${slot.bibleVersion}:${chapter}:${verseNum}:${alignmentPanelRowKey(slot.verse)}`}
       ref={slot.panelRef}
       book={book}
       chapter={chapter}
@@ -433,21 +506,24 @@ export function SideBySideAligner({
       onCancel={onClose}
       hideCancel
       onDirtyChange={(dirty) => {
+        unsavedRef.current[side].panel = dirty;
         setLocalDirty(dirty);
         slot.onDirtyChange(dirty);
       }}
-      hover={hover}
-      onHoverChange={setHover}
+      hoverStore={hoverStore}
       hoverLink={hoverLink}
       onToggleHoverLink={toggleHoverLink}
       renderUhbStrip={false}
       showSourceInfo={lexInfo}
       posOffset={slot.posOffset}
+      locked={locked}
     />
   );
 
   return (
-    <Dialog open={open} onClose={onClose} fullScreen>
+    // disableEnforceFocus: the pinned lexical box (PinnedLexBox) is portaled
+    // outside this Dialog; a focus trap would fight text selection in it (#1053).
+    <Dialog open={open} onClose={onClose} fullScreen disableEnforceFocus>
       <Box sx={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
         {/* titlebar */}
         <Box
@@ -613,20 +689,38 @@ export function SideBySideAligner({
             flexShrink: 0,
           }}
         >
+          {/* Keyed by the ROW the line edits (start verse + bridge end), not
+              the verse number: a bridge or split by another editor moves the
+              slot onto a different row, and an edit kept across that would
+              save its text over the new row (#1067 review). The remount drops
+              the edit and releases its hold, as an unfocused resync used to.
+              Prefixed by version: the two lines are siblings and their rows
+              usually share a verse number, and duplicate keys leave a stale
+              line (and its hold) behind on a verse move. The row key is the
+              panel's, so the line and the panel remount together and the
+              drop notice above sees one change (#1075). */}
           <ReadingLine
+            key={`${left.bibleVersion}:${leftRowKey}`}
             ref={left.readingRef}
             slot={left}
             onSave={onSaveReading}
-            onDirtyChange={left.onReadingDirtyChange}
+            onHoldBase={onHoldReadingBase}
+            onDirtyChange={readingDirtyChange("left", left)}
             locked={leftDirty}
+            chapterLocked={!!locked}
+            bookLocked={locked === "book"}
             bodyHeight={readingHeight}
           />
           <ReadingLine
+            key={`${right.bibleVersion}:${rightRowKey}`}
             ref={right.readingRef}
             slot={right}
             onSave={onSaveReading}
-            onDirtyChange={right.onReadingDirtyChange}
+            onHoldBase={onHoldReadingBase}
+            onDirtyChange={readingDirtyChange("right", right)}
             locked={rightDirty}
+            chapterLocked={!!locked}
+            bookLocked={locked === "book"}
             bodyHeight={readingHeight}
           />
         </Box>
@@ -646,8 +740,7 @@ export function SideBySideAligner({
             lexiconMap={lexiconMap}
             twlForVerse={twlForVerse}
             verseNum={verseNum}
-            hover={hover}
-            onHover={setHover}
+            hoverStore={hoverStore}
             hoverLink={hoverLink}
             showSourceInfo={lexInfo}
             groupPositionsFor={groupPositionsFor}
@@ -667,7 +760,7 @@ export function SideBySideAligner({
               overflow: "hidden",
             }}
           >
-            {renderPanel(left, setLeftDirty)}
+            {renderPanel("left", left, setLeftDirty)}
           </Box>
           <Box
             sx={{
@@ -678,7 +771,7 @@ export function SideBySideAligner({
               overflow: "hidden",
             }}
           >
-            {renderPanel(right, setRightDirty)}
+            {renderPanel("right", right, setRightDirty)}
           </Box>
         </Box>
       </Box>
@@ -693,8 +786,7 @@ function SharedUhbStrip({
   lexiconMap,
   twlForVerse,
   verseNum,
-  hover,
-  onHover,
+  hoverStore,
   hoverLink,
   showSourceInfo,
   groupPositionsFor,
@@ -704,8 +796,7 @@ function SharedUhbStrip({
   lexiconMap: Map<string, LexiconEntry | null>;
   twlForVerse: TwlRow[];
   verseNum: number;
-  hover: HoverHighlight;
-  onHover: (h: HoverHighlight) => void;
+  hoverStore: HoverStore;
   hoverLink: boolean;
   showSourceInfo: boolean;
   // Union positions of the hovered token's group(s), across BOTH panels. The
@@ -721,13 +812,13 @@ function SharedUhbStrip({
   // Hebrew hovered → its group's Hebrew siblings, unioned across both panels).
   //
   // Resolution here is POSITION-ONLY. That is deliberate, and adding a
-  // `hover.groupId === myGroupId` term like AlignmentPanel's hebrewHighlight has
-  // would accomplish nothing — it would be inert, not merely redundant:
+  // `hover.groupId === myGroupId` term like AlignmentPanel's useHebrewHighlight
+  // has would accomplish nothing — it would be inert, not merely redundant:
   //   - That term serves the panel's CARD call site, which passes an explicit
-  //     groupId override (SourceWordTypography → hebrewHighlight(pos, groupId),
+  //     groupId override (SourceWordTypography → useHebrewHighlight(pos, groupId),
   //     with pos = -1 when the source word didn't resolve) and can therefore
   //     still name its group. UhbStrip never passes an override — it calls
-  //     hebrewHighlight(pos) — so the panel's own strip resolves by position
+  //     useHebrewHighlight(pos) — so the panel's own strip resolves by position
   //     too.
   //   - This strip holds no group ids of its own and seeds the lifted hover with
   //     `groupId: null`, so a strip-side comparison could only ever match
@@ -775,22 +866,33 @@ function SharedUhbStrip({
         if (!hoverLink) return;
         // Carry the group's union positions (both panels) so the strip can light
         // the hovered token's Hebrew siblings — still positions, not group ids.
-        onHover({ kind: "hebrew", pos, groupId: null, positions: groupPositionsFor(pos) });
+        hoverStore.setHover({ kind: "hebrew", pos, groupId: null, positions: groupPositionsFor(pos) });
       },
-      onLeave: () => onHover(null),
-      englishHighlight: () => null,
-      hebrewHighlight: (pos: number) => {
-        if (!hoverLink || !hover) return null;
-        if (hover.kind === "hebrew" && hover.pos === pos) return "exact";
-        // `positions` is absent on a hover seeded by a panel (card/chip), where
-        // each panel resolves its own grouping; then only the exact token lights
-        // here, as before.
-        if (hover.kind === "hebrew") return hover.positions?.includes(pos) ? "linked" : null;
-        if (hover.kind === "english" && hover.positions.includes(pos)) return "linked";
-        return null;
-      },
+      onLeave: () => hoverStore.setHover(null),
+      // No English chips on this strip, so this hook always returns null — it
+      // still has to exist (and be a no-arg-independent, unconditionally
+      // callable function) to satisfy HighlightCtx's shape.
+      useEnglishHighlight: () => null,
+      // A hook (see the HighlightCtx field docs in highlightTypes.ts and
+      // useHoverTone in hoverStore.ts), not a precomputed value keyed off
+      // `hover` state — that used to force this WHOLE strip's hctx to rebuild,
+      // and its parent dialog to re-render, on every mouseenter/mouseleave
+      // (#900). `resolve` keeps this strip's bespoke position-only comparison
+      // (see the long comment above) rather than routing through
+      // resolveHebrewHighlight, which does not apply here — see that comment.
+      useHebrewHighlight: (pos: number) =>
+        useHoverTone(hoverStore, (hover) => {
+          if (!hoverLink || !hover) return null;
+          if (hover.kind === "hebrew" && hover.pos === pos) return "exact";
+          // `positions` is absent on a hover seeded by a panel (card/chip),
+          // where each panel resolves its own grouping; then only the exact
+          // token lights here, as before.
+          if (hover.kind === "hebrew") return hover.positions?.includes(pos) ? "linked" : null;
+          if (hover.kind === "english" && hover.positions.includes(pos)) return "linked";
+          return null;
+        }),
     }),
-    [hoverLink, showSourceInfo, themeMode, hover, onHover, groupPositionsFor],
+    [hoverLink, showSourceInfo, themeMode, hoverStore, groupPositionsFor],
   );
   return (
     <UhbStrip
@@ -811,58 +913,137 @@ function SharedUhbStrip({
 // + enqueue) or Undo (revert to the last-saved text) — nothing autosaves.
 const ReadingLine = forwardRef<ReadingLineHandle, {
   slot: PanelSlot;
-  onSave: (bibleVersion: string, plain: string, base: VerseDto, afterCommit?: () => void) => void;
+  onSave: (
+    bibleVersion: string,
+    plain: string,
+    base: VerseDto,
+    afterCommit?: (outcome?: { queued: boolean }) => void,
+  ) => void;
+  // See Props.onHoldReadingBase.
+  onHoldBase?: (bibleVersion: string, base: VerseDto) => VerseBaseHold;
   onDirtyChange: (dirty: boolean) => void;
   // Locked while this side's AlignmentPanel has unsaved drags: a text edit
   // here would swap the verse prop and silently wipe those drags (see the
   // dirty-state note in SideBySideAligner). The translator saves/cancels the
   // alignment first, then the line unlocks.
   locked?: boolean;
+  // #943: the verse can't be written (see Props.locked). Only changes the
+  // hint: with unsaved drags the alignment Save is disabled, so point at
+  // Reset instead of "save alignment first".
+  chapterLocked?: boolean;
+  // #1046: the book is locked. The outbox drops every write on a locked book
+  // without a trace, so the line stops taking input and loses its Save (Undo
+  // stays, so an edit typed before the lock landed can be discarded). A
+  // chapter lock alone leaves the line editable: the server refuses that save
+  // with a toast (s9 check (b)).
+  bookLocked?: boolean;
   // Drag-resizable cap for the editable text box; it scrolls past this height.
   // Shared by both reading lines so the two-column grid stays even.
   bodyHeight?: number;
 }>(function ReadingLine(
-  { slot, onSave, onDirtyChange, locked = false, bodyHeight = DEFAULT_READING_HEIGHT },
+  {
+    slot,
+    onSave,
+    onHoldBase,
+    onDirtyChange,
+    locked = false,
+    chapterLocked = false,
+    bookLocked = false,
+    bodyHeight = DEFAULT_READING_HEIGHT,
+  },
   ref,
 ) {
+  const readOnly = locked || bookLocked;
   const { bibleVersion, verse } = slot;
+  // Mirrors `dirty` for the blur handler, which may run before a re-render.
+  const dirtyRef = useRef(false);
   const editable = useMemo(() => (verse ? extractEditableText(verse.content) : ""), [verse]);
   const elRef = useRef<HTMLDivElement | null>(null);
-  const lastTextRef = useRef("");
   const lastSetRef = useRef<string | null>(null);
   // Enables Save/Undo only when the DOM text actually differs from the saved
   // baseline — normalized so editor-emitted trailing whitespace doesn't arm the
   // buttons (and matches saveVerseDraft's no-op guard exactly). Mirrored up to
   // the parent so the close/nav gate can prompt before losing the edit.
   const [dirty, setDirty] = useState(false);
-  const markDirty = (next: boolean) => {
+  // #1060: the verse the box's text was last synced from, i.e. the base an
+  // edit typed now is made against. It lags `verse` while the resync below is
+  // skipped under the caret: a server change that lands while the translator
+  // types in the focused box must not become the edit's base.
+  const shownVerseRef = useRef(verse);
+  // The verse-base pin held for the current edit (see VerseBaseHold): taken on
+  // the first dirty keystroke, ended on the way back to clean — released when
+  // nothing was queued, handed to the queued save otherwise.
+  const holdRef = useRef<VerseBaseHold | null>(null);
+  const markDirty = (next: boolean, endHold: "release" | "handOff" = "release") => {
+    if (next && !holdRef.current && shownVerseRef.current && onHoldBase) {
+      holdRef.current = onHoldBase(bibleVersion, shownVerseRef.current);
+    } else if (!next && holdRef.current) {
+      const hold = holdRef.current;
+      holdRef.current = null;
+      // An own save that landed moved the hold's base forward: the box shows
+      // that row now, so a later edit starts from it, not the pre-save base.
+      const advanced = hold.advancedBase();
+      if (advanced && shownVerseRef.current) {
+        shownVerseRef.current = { ...shownVerseRef.current, version: advanced.version, content: advanced.content };
+      }
+      if (endHold === "handOff") hold.handOff();
+      else hold.release();
+    }
+    dirtyRef.current = next;
     setDirty(next);
     onDirtyChange(next);
+    if (!next) syncShownVerse();
   };
+  // A clean box showing exactly this verse's text was synced from it — this
+  // also catches a version-only change (the line's own save landing, an
+  // alignment-only change) that the `editable`-keyed resync never sees.
+  const syncShownVerse = () => {
+    const el = elRef.current;
+    if (holdRef.current || !el) return;
+    if (normalizeEditable(el.textContent ?? "") === normalizeEditable(editable)) shownVerseRef.current = verse;
+  };
+  // Unmounting drops whatever the line showed (#1060).
+  useEffect(
+    () => () => {
+      holdRef.current?.release();
+      holdRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     const el = elRef.current;
     if (!el) return;
-    // Never resync under the user's caret: onInput updates lastTextRef, so the
-    // tracker can't distinguish "user typed" from "still showing what we set" —
-    // a refetch echo (e.g. the other panel's save landing) would overwrite
-    // mid-edit text and drop the caret to the start. Focus is the mid-edit
-    // signal (DocColumn's VerseSpan uses its draft for the same purpose).
+    // Never resync under the user's caret: a refetch echo (e.g. the other
+    // panel's save landing) would drop the caret to the start.
     if (document.activeElement === el) return;
-    const dom = el.textContent ?? "";
-    if (lastSetRef.current === null || dom === lastTextRef.current) {
+    // Nor over unsaved text, focused or not (#1067): a line that merely lost
+    // focus (the translator clicked into the alignment panel) keeps its edit.
+    // Its hold still pins the version the edit was made against, so a newer
+    // server version makes Save a 409 and a merge prompt instead.
+    if (lastSetRef.current === null || !dirty) {
+      const dom = el.textContent ?? "";
       // Skip the DOM write when the content already matches — after an edit that
       // round-trips identically, replacing the text node would needlessly
       // repaint (flash) the line and drop the caret.
       if (dom !== editable) el.textContent = editable;
       lastSetRef.current = editable;
     }
-    lastTextRef.current = editable;
-    // Baseline moved (a Save landed, or a verse nav swapped the verse): the
-    // line now matches saved text, so it's no longer dirty.
+    // Baseline moved (a Save landed, or a verse nav swapped the verse): a
+    // resynced line matches saved text, so it's no longer dirty. A kept edit
+    // stays dirty unless the verse moved onto that same text.
     markDirty(normalizeEditable(el.textContent ?? "") !== normalizeEditable(editable));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editable]);
+
+  // After the resync above (effects run in order), so a fresh sync is seen.
+  // A line mounted before its verse arrived starts from that first verse, so
+  // its first keystroke has a base to hold.
+  useEffect(() => {
+    if (!shownVerseRef.current && !holdRef.current) shownVerseRef.current = verse;
+    syncShownVerse();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [verse]);
 
   // `afterCommit` mirrors AlignmentPanelHandle's handleSave (#490): `onSave`
   // (ultimately Shell's saveVerseDraft → enqueueVerseSafely) can defer this
@@ -878,8 +1059,17 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
       afterCommit?.();
       return;
     }
-    onSave(bibleVersion, el.textContent ?? "", verse, () => {
-      markDirty(false);
+    onSave(bibleVersion, el.textContent ?? "", verse, (outcome) => {
+      // A no-op is text back at the held base while the verse moved on (a
+      // dirty line is never resynced, #1067): show the server's text, or the
+      // now-clean line would sit on the stale base until the next change.
+      if (outcome?.queued === false) {
+        el.textContent = editable;
+        lastSetRef.current = editable;
+      }
+      // A queued edit's save owns the pin now and its outbox exit releases it;
+      // a no-op queued nothing, so the hold ends as a clean line's does (#1060).
+      markDirty(false, outcome?.queued === false ? "release" : "handOff");
       afterCommit?.();
     });
   };
@@ -888,7 +1078,6 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
     const el = elRef.current;
     if (!el) return;
     el.textContent = editable;
-    lastTextRef.current = editable;
     lastSetRef.current = editable;
     markDirty(false);
   };
@@ -915,12 +1104,18 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
           <Box
             component="span"
             sx={{
-              color: locked ? "text.disabled" : "primary.main",
+              color: readOnly ? "text.disabled" : "primary.main",
               textTransform: "none",
               letterSpacing: 0,
             }}
           >
-            {locked ? "🔒 save alignment first" : "✎ editable"}
+            {bookLocked
+              ? "🔒 book locked"
+              : locked
+              ? chapterLocked
+                ? "🔒 locked: reset alignment first"
+                : "🔒 save alignment first"
+              : "✎ editable"}
           </Box>
         </Typography>
         <Box sx={{ flex: 1 }} />
@@ -942,39 +1137,55 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             >
               Undo
             </Button>
-            <Button
-              size="small"
-              variant="contained"
-              onClick={() => handleSave()}
-              disabled={!dirty}
-              sx={{
-                textTransform: "uppercase",
-                fontSize: 11,
-                letterSpacing: "0.06em",
-                fontWeight: 700,
-                px: 1.5,
-                py: 0.25,
-              }}
-            >
-              Save {bibleVersion}
-            </Button>
+            {!bookLocked && (
+              <Button
+                size="small"
+                variant="contained"
+                onClick={() => handleSave()}
+                disabled={!dirty}
+                sx={{
+                  textTransform: "uppercase",
+                  fontSize: 11,
+                  letterSpacing: "0.06em",
+                  fontWeight: 700,
+                  px: 1.5,
+                  py: 0.25,
+                }}
+              >
+                Save {bibleVersion}
+              </Button>
+            )}
           </>
         )}
       </Box>
       {verse ? (
         <Box
           ref={elRef}
-          contentEditable={!locked}
+          contentEditable={!readOnly}
           suppressContentEditableWarning
           spellCheck
           title={
-            locked
+            bookLocked
+              ? "This book is locked, so the reading text can't be edited right now"
+              : locked
               ? "save or cancel the pending alignment edits before editing the reading text"
               : undefined
           }
+          // The resync skipped under the caret runs once the caret leaves, for
+          // a line with nothing unsaved (#1075 review): otherwise the box
+          // keeps text the server no longer has (a discarded save, another
+          // editor's change) while reading as clean, and its next edit pins
+          // the old version. A dirty line keeps its edit (#1067).
+          onBlur={(e) => {
+            const el = e.currentTarget as HTMLDivElement;
+            if (dirtyRef.current) return;
+            if (normalizeEditable(el.textContent ?? "") === normalizeEditable(editable)) return;
+            el.textContent = editable;
+            lastSetRef.current = editable;
+            markDirty(false);
+          }}
           onInput={(e) => {
             const value = (e.currentTarget as HTMLDivElement).textContent ?? "";
-            lastTextRef.current = value;
             lastSetRef.current = value;
             markDirty(normalizeEditable(value) !== normalizeEditable(editable));
           }}
@@ -984,17 +1195,17 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             fontFamily: '"Times New Roman", "Cardo", serif',
             fontSize: `calc(15px * var(--be-reading-scale, 1))`,
             lineHeight: 1.5,
-            color: locked ? "text.disabled" : "text.primary",
+            color: readOnly ? "text.disabled" : "text.primary",
             outline: "none",
             borderRadius: 1,
             px: 0.75,
             py: 0.25,
             border: "1px solid",
             borderColor: "divider",
-            cursor: locked ? "not-allowed" : "text",
-            opacity: locked ? 0.6 : 1,
+            cursor: readOnly ? "not-allowed" : "text",
+            opacity: readOnly ? 0.6 : 1,
             transition: "border-color 0.12s, opacity 0.12s",
-            ...(locked
+            ...(readOnly
               ? {}
               : {
                   "&:hover": { borderColor: "primary.main" },

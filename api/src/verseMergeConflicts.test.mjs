@@ -56,8 +56,19 @@
 // SQL, and tests the pure grouping logic directly (no D1 needed) — same
 // split as chapterLock.test.mjs.
 
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { raiseVerseMergeConflictAlert, retireVerseKeptAiMasterFlags, resolveConvergedVerseMergeConflicts } from "./verseMergeConflicts.ts";
+import { fileURLToPath } from "node:url";
+import { reviewConditionKey, verseMergeEditorConditionKey } from "./reviewAlerts.ts";
+import {
+  confirmAdoptedConflicts,
+  deleteLostAdoptionConflicts,
+  raiseVerseMergeConflictAlert,
+  recordVerseMergeConflicts,
+  resolveConvergedVerseMergeConflicts,
+  retireVerseKeptAiMasterFlags,
+} from "./verseMergeConflicts.ts";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
@@ -190,30 +201,127 @@ function assert(cond, msg) {
 
 {
   // Issue #633 / #788 admin guidance: same text-side vs alignment distinction.
-  const w = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_wording" }]);
+  // overwrittenVersion is a real pointer in each case: all of these are
+  // overwrites that actually replaced text (see the #981 block below for the
+  // pointer-less case).
+  const w = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_wording", overwrittenVersion: 1 }]);
   assert(w.includes("The wording changed."), "admin wording-only names wording");
   assert(w.includes("replaced text is still"), "admin wording-only keeps text recovery");
 
-  const p = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_punctuation" }]);
+  const p = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_punctuation", overwrittenVersion: 1 }]);
   assert(p.includes("The punctuation changed (the wording did not)."), "admin punctuation-only names punctuation");
   assert(p.includes("previous punctuation is still"), "admin punctuation-only keeps punctuation recovery");
 
-  const a = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_alignment" }]);
+  const a = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_alignment", overwrittenVersion: 1 }]);
   assert(a.includes("The alignment changed (the wording and punctuation did not)."), "admin alignment-only names alignment");
   assert(a.includes("previous alignment is still"), "admin alignment-only recovers alignment");
   assert(!a.includes("replaced text"), "admin alignment-only must not claim replaced text");
 
-  const legacy = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed" }]);
+  const legacy = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 1 }]);
   assert(legacy.includes("The wording and alignment changed."), "legacy both_changed keeps its original two-axis meaning");
   assert(!legacy.includes("punctuation"), "legacy both_changed does not invent a punctuation claim");
 
-  const prototypeKey = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "__proto__" }]);
+  const prototypeKey = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "__proto__", overwrittenVersion: 1 }]);
   assert(prototypeKey.includes("The wording and alignment changed."), "prototype-key reason takes the fail-safe warning");
 
   // adopt_no_visible_change is not alertable — if it somehow reached guidance
   // it is not an adopt_conflict, so it must not count as an overwrite.
-  const silent = buildMergeConflictGuidance([{ action: "adopt_no_visible_change", reason: "both_changed_no_visible" }]);
+  const silent = buildMergeConflictGuidance([{ action: "adopt_no_visible_change", reason: "both_changed_no_visible", overwrittenVersion: null }]);
   assert(!silent.includes("took Door43's version"), "no-visible-change action is not an overwrite sentence");
+}
+
+{
+  // Issue #981: the #539 no-op guard (bookReimport.ts ~7609-7674) keeps a
+  // conflicted byte no-op as `adopt_conflict` with `overwrittenVersion`
+  // cleared to null, so the review banner still lists it. Per that guard's
+  // own comment, a surviving pointer-less row is never "D1 already matched
+  // Door43" — #977 already drops the case where master's arriving bytes
+  // differ from D1 only in Hebrew mark order, so a row that gets here had
+  // master's bytes differ from D1 by more; the final match happens because
+  // canonizeAlignmentSource (canonizeHebrew.ts) maps master's \zaln-s
+  // content/lemma onto D1's bytes. That mapping falls through looser tiers
+  // too (stripped marks, word-joiner fold), so master's incoming copy could
+  // be the WORSE one (under-pointed, cantillation-stripped, an older UHB
+  // alignment) — the admin sentence must not call this an overwrite, must
+  // not point at a missing @v, must not claim D1 already matched Door43, and
+  // (2026-10-02 sweep, round 2) must NOT assert which side is right either:
+  // no "Door43's fix" / D1's "stale" bytes framing, just that the two copies
+  // differ on \zaln-s content/lemma and a human has to judge which is right.
+  const pointerless = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
+  ]);
+  assert(!pointerless.includes("took Door43's version over the editor's"), "pointer-less adopt_conflict is not an overwrite");
+  assert(
+    !pointerless.includes("the version number given after @v"),
+    "pointer-less adopt_conflict does not claim a recovery version number exists",
+  );
+  assert(!pointerless.includes("D1 already matched Door43"), "pointer-less adopt_conflict must not claim D1 already matched Door43");
+  assert(!pointerless.includes("Door43's fix"), "pointer-less adopt_conflict must not assume Door43 holds the correct side");
+  assert(!pointerless.includes("stale"), "pointer-less adopt_conflict must not assume D1 holds the stale side");
+  assert(!pointerless.includes("morphology"), "pointer-less adopt_conflict must not claim morph changed — canonizeAlignmentSource only rewrites content/lemma");
+  assert(
+    pointerless.includes(
+      "1 was flagged for review but no app text was replaced (3:4) — Door43's copy differs from the app's " +
+        "only in the original-language source attributes on \\zaln-s (x-content / x-lemma)",
+    ),
+    "pointer-less adopt_conflict states only what was measured, naming its OWN ref (3:4) inline",
+  );
+  assert(pointerless.includes("check which side is right"), "pointer-less adopt_conflict leaves the judgment call to a human");
+
+  // Issue #981, round 3: "the ref above with no @v" does not uniquely pick
+  // out a pointer-less adopt_conflict row — keep_alignment_refused /
+  // source_attr_divergent / keep_local_structure rows are stored with
+  // overwritten_version NULL too (verseMergeConflictSql.ts's
+  // SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL), so buildGroupedRefsClause prints
+  // THEM without @v as well. A keep_alignment_refused ref sitting beside a
+  // pointer-less adopt_conflict ref must not be swept into "Door43's copy
+  // differs only in source attributes" — that's a live, unresolved Door43
+  // change, not a source-attribute no-op.
+  const ambiguous = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
+    { action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, chapter: 5, verse: 2 },
+  ]);
+  assert(
+    ambiguous.includes("no app text was replaced (3:4)"),
+    "the pointer-less clause names only its own ref (3:4), not the keep_alignment_refused ref beside it",
+  );
+  assert(
+    !ambiguous.includes("5:2) —") && !/\(3:4, 5:2\)/.test(ambiguous),
+    "5:2 (a live kept-alignment refusal) must never be folded into the source-attributes-only clause",
+  );
+
+  // A row WITH a pointer still reads as an overwrite and still gives the @v
+  // recovery sentence, even mixed with a pointer-less row in the same run.
+  const mixed = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 4, chapter: 1, verse: 1 },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
+  ]);
+  assert(mixed.includes("1 took Door43's version over the editor's"), "pointered row still counts as an overwrite");
+  assert(mixed.includes("at the version number given after @v in its ref above"), "pointered row keeps its @v recovery sentence");
+  assert(
+    mixed.includes("1 was flagged for review but no app text was replaced (3:4)"),
+    "pointer-less row in the same run still gets its own clause, naming only its own ref",
+  );
+
+  // Plural agreement: two pointer-less rows read "were", list both refs, and
+  // cap/"+N more" like the shared ref clause does.
+  const twoPointerless = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 6, verse: 1 },
+  ]);
+  assert(
+    twoPointerless.includes("2 were flagged for review but no app text was replaced (3:4, 6:1) —"),
+    "two pointer-less rows agree as 'were' and list both their own refs",
+  );
+
+  // overwrittenVersion omitted entirely (an untyped caller) reads the same as
+  // an explicit null — loose equality, matching buildGroupedRefsClause's own
+  // `!= null` convention, so an untyped row never silently becomes an
+  // overwrite it cannot point a @v at. No chapter/verse here either: the ref
+  // clause degrades to naming no refs rather than guessing.
+  const omitted = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed" }]);
+  assert(!omitted.includes("took Door43's version over the editor's"), "omitted overwrittenVersion is treated as pointer-less, not as an overwrite");
+  assert(omitted.includes("1 was flagged for review but no app text was replaced"), "omitted overwrittenVersion gets the pointer-less clause");
 }
 
 {
@@ -283,6 +391,129 @@ function assert(cond, msg) {
   const noBase = [{ chapter: 4, verse: 4, version: 1 }];
   const grouped = groupNoBaseVersesByEditor("MIC", "ult", noBase, new Map());
   assert(grouped.size === 0, "no username found -> no alert entry");
+}
+
+{
+  // Issue #1006 (ZEC UST 1:6, system_alerts 1305). A locked book is skipped by
+  // the export (exportWorkflow.ts, `book_locked:*`), so the translator's
+  // keep_no_base alert must not claim tonight's export will overwrite their
+  // text, and must not name re-saving as the remedy: a locked book's verses
+  // cannot be saved here, and nothing from it is exported anyway.
+  const noBase = [{ chapter: 1, verse: 6, version: 2 }];
+  const usernameByKey = new Map([
+    [editLogKey("ZEC", "ust", { chapter: 1, verse: 6, overwrittenVersion: 2 }), "deferredreward"],
+  ]);
+  const locked = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey, true).get("deferredreward");
+  assert(!!locked, "locked book: the editor is still told about the verse");
+  assert(!/tonight's export/i.test(locked.message), "locked book: no claim that tonight's export overwrites anything");
+  assert(!/re-?sav/i.test(locked.message), "locked book: re-saving is not named as the remedy");
+  assert(/locked/i.test(locked.message), "locked book: says the book is locked");
+  assert(/admin/i.test(locked.message), "locked book: names asking an admin as the remedy");
+  assert(locked.message.includes("Nothing has been overwritten"), "locked book: still denies an overwrite");
+  assert(alertMessageCarriesNoBaseWarning(locked.message), "locked book: keeps the no-base fingerprint");
+  assert(locked.message.includes("ZEC UST: 1:6"), "locked book: still names the verse");
+
+  // Unlocked wording is unchanged, byte for byte, whether the flag is omitted
+  // or passed false.
+  const unlockedText =
+    "Door43's sync could not tell whether your edit or a Door43-side edit is newer, for 1 verse(s) you last " +
+    "edited in ZEC UST: 1:6 — no earlier version was recoverable to compare against, so it kept your version " +
+    "for now. Nothing has been overwritten — but if Door43 has changed it since, tonight's export will still " +
+    "overwrite your text there unless you open and re-save the verse here first.";
+  const omitted = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey).get("deferredreward");
+  const explicit = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey, false).get("deferredreward");
+  assert(omitted.message === unlockedText, "unlocked (flag omitted): wording unchanged");
+  assert(explicit.message === unlockedText, "unlocked (flag false): wording unchanged");
+}
+
+{
+  // Issue #1006, admin side: buildNoBaseSentence / buildMergeConflictGuidance
+  // carry the same false "tonight's export" claim for a locked book.
+  const locked = buildMergeConflictGuidance([], { noBaseCount: 1, noBaseRefs: ["1:6"], noBaseBookLocked: true });
+  assert(!/tonight's export/i.test(locked), "locked book (admin): no claim that tonight's export overwrites anything");
+  assert(!/re-?sav/i.test(locked), "locked book (admin): re-saving is not named as the remedy");
+  assert(/locked/i.test(locked), "locked book (admin): says the book is locked");
+  assert(/admin/i.test(locked), "locked book (admin): says an admin reconciles it");
+  assert(locked.includes("Nothing was overwritten"), "locked book (admin): still denies an overwrite");
+  assert(locked.includes("Verses (sample): 1:6."), "locked book (admin): still names the verse");
+  assert(locked.includes(NO_BASE_ADMIN_FINGERPRINT), "locked book (admin): keeps the no-base fingerprint");
+  assert(buildNoBaseSentence(1, ["1:6"], true) === locked, "the guidance passes the lock through to buildNoBaseSentence");
+
+  const unlockedText =
+    "1 verse(s) could not be adjudicated: no ancestor was recoverable for them from before this book+resource's " +
+    "master-confirmed watermark, so the sync could not tell which side changed, and so it kept the app's " +
+    "version. Verses (sample): 1:6. Nothing was overwritten in these — but a Door43-side change to them will " +
+    "still be overwritten by tonight's export.";
+  assert(buildNoBaseSentence(1, ["1:6"]) === unlockedText, "unlocked (flag omitted): admin wording unchanged");
+  assert(buildNoBaseSentence(1, ["1:6"], false) === unlockedText, "unlocked (flag false): admin wording unchanged");
+  assert(
+    buildMergeConflictGuidance([], { noBaseCount: 1, noBaseRefs: ["1:6"], noBaseBookLocked: false }) === unlockedText,
+    "unlocked guidance: wording unchanged",
+  );
+}
+
+{
+  // Issue #1110: on a locked book with keep_no_base AND kept rows
+  // (keep_alignment_refused, source_attr_divergent), #1006's "the export skips
+  // it" sentence sat beside older sentences that still said tonight's export
+  // will write. A locked book is not exported, so none may say so.
+  const rows = [
+    { action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, chapter: 1, verse: 8 },
+    { action: "source_attr_divergent", reason: "source_attr_ambiguous", overwrittenVersion: null, chapter: 1, verse: 9 },
+  ];
+  const opts = { noBaseCount: 1, noBaseRefs: ["1:6"] };
+  const locked = buildMergeConflictGuidance(rows, { ...opts, noBaseBookLocked: true, bookLocked: true });
+  assert(!/tonight's export/i.test(locked), `locked book (kept rows + no-base): no sentence claims tonight's export writes (got: ${locked})`);
+  assert(locked.includes("1 kept the editor's version because adopting Door43's would have cost alignment"),
+    "locked book: the alignment-refused verse is still reported");
+  assert(locked.includes("1 kept D1 because Door43's original-language source fix"),
+    "locked book: the source-attr verse is still reported");
+  assert((locked.match(/this book is locked/g) ?? []).length === 3, "locked book: each kept sentence names the lock");
+
+  // Unlocked: byte-identical to the wording before this change.
+  const unlockedText =
+    "1 kept the editor's version because adopting Door43's would have cost alignment — Door43's change has NOT " +
+    "been taken, so tonight's export will still write over it until someone resolves it. 1 kept D1 because " +
+    "Door43's original-language source fix (the spelling/pointing/morphology on \\zaln-s) could not be placed " +
+    "unambiguously — the same source word repeats in the verse — so Door43's change has NOT been taken, and " +
+    "tonight's export will write over it until someone resolves it by hand. " +
+    buildNoBaseSentence(1, ["1:6"]);
+  assert(buildMergeConflictGuidance(rows, opts) === unlockedText, "unlocked (flags omitted): kept wording unchanged");
+  assert(
+    buildMergeConflictGuidance(rows, { ...opts, noBaseBookLocked: false, bookLocked: false }) === unlockedText,
+    "unlocked (flags false): kept wording unchanged",
+  );
+}
+
+{
+  // Issue #1110 review (A3): the pointer-less adopt_conflict and the two
+  // keep_local_structure sentences also promised the next export would write
+  // over Door43. A locked book is skipped by the export, so none may say so.
+  const rows = [
+    { action: "adopt_conflict", reason: "source_attr_only", overwrittenVersion: null, chapter: 2, verse: 1 },
+    { action: "keep_local_structure", reason: "no_human_commit", overwrittenVersion: null, chapter: 2, verse: 2 },
+    { action: "keep_local_structure", reason: "master_moved_under_local_bridge", overwrittenVersion: null, chapter: 2, verse: 3 },
+  ];
+  const locked = buildMergeConflictGuidance(rows, { bookLocked: true });
+  assert(!/next export|tonight's export|will write|written over|writes the app's/i.test(locked),
+    `locked book (pointer-less + structure rows): no sentence claims an export will write (got: ${locked})`);
+  assert((locked.match(/this book is locked/g) ?? []).length === 3, "locked book: each of the three sentences names the lock");
+  assert(locked.includes("1 was flagged for review but no app text was replaced (2:1)"), "locked book: the pointer-less verse is still named");
+  assert(locked.includes("1 kept the app's verse grouping"), "locked book: the kept grouping is still reported");
+  assert(locked.includes("1 verse(s) changed on Door43 that a bridge made in the app"), "locked book: the absorbed verse is still reported");
+
+  const unlockedText =
+    "1 was flagged for review but no app text was replaced (2:1) — Door43's copy differs from the app's only in the " +
+    "original-language source attributes on \\zaln-s (x-content / x-lemma); check which side is right before the " +
+    "next export, because the export will write the app's attributes over Door43's. 1 kept the app's verse " +
+    "grouping (a \\v a-b bridge, or its split) where Door43 now groups the verses differently: either no commit " +
+    "from a Door43 editor's own account was found behind Door43's change, or the two groupings could not be " +
+    "reconciled automatically. Door43's grouping has NOT been taken, so the next export that runs for this " +
+    "resource writes the app's grouping over it. 1 verse(s) changed on Door43 that a bridge made in the app (not " +
+    "yet exported) has since absorbed — the next export publishes the bridge, and Door43's change to that verse's " +
+    "own text will be written over unless it is carried into the bridged verse first.";
+  assert(buildMergeConflictGuidance(rows) === unlockedText, "unlocked (flag omitted): wording unchanged");
+  assert(buildMergeConflictGuidance(rows, { bookLocked: false }) === unlockedText, "unlocked (flag false): wording unchanged");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -767,8 +998,8 @@ function upsertConflict(
     .run(book, resource, chapter, verse, action, reason, overwrittenVersion, null, now, bibleVersion, observedVersion);
 }
 
-function confirmAdopted(d, { book, resource, chapter, verse }) {
-  return d.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).run(book, resource, chapter, verse);
+function confirmAdopted(d, { book, resource, chapter, verse, now }) {
+  return d.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).run(book, resource, chapter, verse, now);
 }
 
 {
@@ -844,7 +1075,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
 
   // Tonight's CAS attempt LANDS — confirmAdoptedConflicts is called for
   // exactly this ref (bookReimport.ts's landedAdoptions).
-  confirmAdopted(d, { book: "ZEC", resource: "ult", chapter: 6, verse: 2 });
+  confirmAdopted(d, { book: "ZEC", resource: "ult", chapter: 6, verse: 2, now: tonight });
 
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=6 AND verse=2`).get();
   assert(row.resolved_at === null, "CONFIRMED landed adoption -> resolved_at cleared, genuinely active");
@@ -1827,11 +2058,13 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   assert(!g.includes("took Door43's version"), "…and never reports it as an overwrite");
 
   // A mixed set is counted per-action, not lumped: one adopt_conflict is an
-  // overwrite, one source_attr_divergent is a kept-D1 divergence.
+  // overwrite, one source_attr_divergent is a kept-D1 divergence. A real
+  // pointer (overwrittenVersion set) so this exercises the overwrite branch,
+  // not the #981 pointer-less one tested above.
   const mixed = buildMergeConflictGuidance([
-    { action: "adopt_conflict" },
-    { action: "source_attr_divergent" },
-    { action: "keep_alignment_refused" },
+    { action: "adopt_conflict", overwrittenVersion: 1 },
+    { action: "source_attr_divergent", overwrittenVersion: null },
+    { action: "keep_alignment_refused", overwrittenVersion: null },
   ]);
   assert(mixed.includes("1 took Door43's version"), "adopt_conflict counted as an overwrite");
   assert(mixed.includes("1 kept the editor's version because adopting Door43's would have cost alignment"),
@@ -1847,7 +2080,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   const ai = buildMergeConflictGuidance([{ action: "keep_ai_master" }]);
   assert(ai === "", "a keep_ai_master row produces no guidance sentence at all (#749)");
 
-  const withAi = buildMergeConflictGuidance([{ action: "adopt_conflict" }, { action: "keep_ai_master" }]);
+  const withAi = buildMergeConflictGuidance([{ action: "adopt_conflict", overwrittenVersion: 1 }, { action: "keep_ai_master" }]);
   assert(withAi.includes("1 took Door43's version"),
     "…and its presence does not disturb the adopt_conflict count beside it");
   assert(!withAi.includes("kept the editor's version even though Door43 changed too"),
@@ -2391,6 +2624,298 @@ console.log("\n[a no-op adopt_conflict does not inherit an old audit row's point
   });
   const kept = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='MIC' AND chapter=5 AND verse=11`).get();
   assert(kept.overwritten_version === 3, "a real prior adopt_conflict keeps the pointer its human still needs");
+}
+
+// Issue #1006: the lock flag reaches BOTH stored messages through the real
+// raise path (admin banner + the translator's own keep_no_base alert).
+console.log("\n[locked book: keep_no_base alerts make no export claim (issue #1006)]");
+for (const bookLocked of [true, false]) {
+  const d = verseDb();
+  d.exec(`ALTER TABLE system_alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    ALTER TABLE system_alerts ADD COLUMN condition_key TEXT;
+    ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
+    ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
+    CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+      user_id INTEGER, new_version INTEGER);`);
+  d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
+  d.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, new_version) VALUES ('verse', 'ZEC/1/6/UST', 'ZEC', 7, 2)`,
+  ).run();
+  const make = (sql, args = []) => ({
+    bind: (...next) => make(sql, next),
+    all: async () => ({ results: d.prepare(sql).all(...args) }),
+    run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+  });
+  await raiseVerseMergeConflictAlert({ DB: { prepare: (sql) => make(sql) } }, "ZEC", "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    bookLocked,
+    observedAt: 100,
+  });
+  const msg = (u) =>
+    d.prepare(`SELECT message FROM system_alerts WHERE username=? AND source='verse_merge_conflict:ZEC:ust'`).get(u)
+      ?.message ?? "";
+  const label = bookLocked ? "locked" : "unlocked";
+  for (const [who, m] of [["admin", msg("deferredreward")], ["editor", msg("bethoakes")]]) {
+    assert(alertMessageCarriesNoBaseWarning(m), `${label} ${who}: alert raised with the no-base warning`);
+    assert(/tonight's export/i.test(m) === !bookLocked,
+      `${label} ${who}: the "tonight's export" warning appears only for an unlocked book`);
+    assert(/this book is locked/i.test(m) === bookLocked, `${label} ${who}: the lock is named only when locked`);
+  }
+}
+
+// Issue #1006 review (A2): the lock state is part of the alert condition. A
+// dismissed locked-book alert (nothing to act on) must not keep the unlocked
+// "tonight's export will overwrite" warning hidden after the book is unlocked.
+// Unlocked condition keys stay byte-identical to the pre-#1006 keys, so this
+// deploy does not resurrect alerts people already dismissed.
+console.log("\n[locked -> dismissed -> unlocked: the overwrite warning comes back (issue #1006 review)]");
+{
+  const d = verseDb();
+  d.exec(`ALTER TABLE system_alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    ALTER TABLE system_alerts ADD COLUMN condition_key TEXT;
+    ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
+    ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
+    CREATE UNIQUE INDEX system_alerts_one_standing_review_test
+      ON system_alerts(username, source)
+      WHERE kind='review' AND condition_key IS NOT NULL AND dismissed_at IS NULL AND resolved_at IS NULL;
+    CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+      user_id INTEGER, new_version INTEGER);`);
+  d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
+  d.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, new_version) VALUES ('verse', 'ZEC/1/6/UST', 'ZEC', 7, 2)`,
+  ).run();
+  const make = (sql, args = []) => ({
+    bind: (...next) => make(sql, next),
+    all: async () => ({ results: d.prepare(sql).all(...args) }),
+    run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+  });
+  const raise = (bookLocked, observedAt) =>
+    raiseVerseMergeConflictAlert({ DB: { prepare: (sql) => make(sql) } }, "ZEC", "ust", {
+      noBaseCount: 1,
+      noBaseRefs: ["1:6"],
+      noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+      bookLocked,
+      observedAt,
+    });
+  const live = (u) =>
+    d.prepare(
+      `SELECT message, condition_key FROM system_alerts
+        WHERE username=? AND source='verse_merge_conflict:ZEC:ust' AND dismissed_at IS NULL AND resolved_at IS NULL`,
+    ).all(u);
+
+  await raise(true, 100);
+  d.prepare(`UPDATE system_alerts SET dismissed_at = 150 WHERE source='verse_merge_conflict:ZEC:ust'`).run();
+  await raise(true, 200);
+  for (const u of ["deferredreward", "bethoakes"]) {
+    assert(live(u).length === 0, `${u}: a dismissed locked alert stays dismissed while the book stays locked`);
+  }
+
+  await raise(false, 300);
+  const expectedKeys = {
+    deferredreward: reviewConditionKey(
+      "verse_merge_conflict",
+      { book: "ZEC", resource: "ust" },
+      { rows: [], noBase: [{ chapter: 1, verse: 6, version: 2 }], noBaseCount: 1, recordingFailed: false },
+    ),
+    bethoakes: verseMergeEditorConditionKey("ZEC", "ust", "bethoakes", ["1:6"]),
+  };
+  for (const u of ["deferredreward", "bethoakes"]) {
+    const rows = live(u);
+    assert(rows.length === 1, `${u}: after the unlock, a fresh undismissed alert is raised`);
+    assert(/tonight's export/i.test(rows[0]?.message ?? ""), `${u}: …carrying the unlocked overwrite warning`);
+    assert(rows[0]?.condition_key === expectedKeys[u], `${u}: the unlocked condition key is unchanged from before #1006`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Issue #996: the editor's "Door43's sync overwrote your edits" alert carries
+// each ref's first-flagged date, so an alert re-raised because its ref list
+// only SHRANK (some rows resolved, nothing new tonight) reads as old, and a
+// genuinely new overwrite sharing the alert with old ones is dated tonight
+// instead of hiding under the oldest date.
+// ─────────────────────────────────────────────────────────────────────────
+console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)]");
+{
+  const AUG19 = Date.UTC(2026, 7, 19, 5, 30) / 1000;
+  const OCT05 = Date.UTC(2026, 9, 5, 5, 30) / 1000;
+  const users = (refs) => new Map(refs.map((r) => [editLogKey("EZK", "ust", r), "bcameron93"]));
+
+  // Every ref from the same day: one date, after the list (the shrink case).
+  const sameDay = [
+    { chapter: 4, verse: 17, overwrittenVersion: 6, detectedAt: AUG19 },
+    { chapter: 4, verse: 18, overwrittenVersion: 3, detectedAt: AUG19 + 40 },
+  ];
+  const one = groupOverwrittenVersesByEditor("EZK", "ust", sameDay, users(sameDay)).get("bcameron93").message;
+  assert(
+    one.includes("with Door43's version: 4:17@v6, 4:18@v3 (first flagged 2026-08-19)."),
+    `same-day refs share one first-flagged date (got: ${one})`,
+  );
+
+  // Old and new refs in one alert: each group carries its own date, oldest
+  // first, so tonight's overwrite is not dated by the August rows.
+  const mixed = [
+    { chapter: 3, verse: 2, overwrittenVersion: 9, detectedAt: OCT05 },
+    { chapter: 4, verse: 17, overwrittenVersion: 6, detectedAt: AUG19 },
+  ];
+  const two = groupOverwrittenVersesByEditor("EZK", "ust", mixed, users(mixed)).get("bcameron93");
+  assert(
+    two.message.includes(
+      "with Door43's version: 4:17@v6 (first flagged 2026-08-19); 3:2@v9 (first flagged 2026-10-05).",
+    ),
+    `old and new refs are dated separately, oldest first (got: ${two.message})`,
+  );
+  assert(two.refs.join(",") === "3:2@v9,4:17@v6", "the refs that feed the condition key keep their order and shape");
+
+  // No detectedAt (a caller without dates): the message is exactly the old one.
+  const undated = [{ chapter: 5, verse: 1, overwrittenVersion: 2 }];
+  const plain = groupOverwrittenVersesByEditor("EZK", "ust", undated, users(undated)).get("bcameron93").message;
+  assert(
+    plain.startsWith("Door43's sync overwrote your edit in EZK UST at 1 verse(s) with Door43's version: 5:1@v2. "),
+    `no detectedAt -> no invented date (got: ${plain})`,
+  );
+}
+
+// The same, end to end on a database built from the real migrations: the real
+// writers (recordVerseMergeConflicts, confirmAdoptedConflicts) and the real
+// alert path (raiseVerseMergeConflictAlert).
+{
+  const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  const migrationSql = readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort()
+    .map((f) => readFileSync(join(migrationsDir, f), "utf8"));
+  const JUN10 = Date.UTC(2026, 5, 10, 5, 30) / 1000;
+  const AUG19 = Date.UTC(2026, 7, 19, 5, 30) / 1000;
+  const OCT05 = Date.UTC(2026, 9, 5, 5, 30) / 1000;
+  const SOURCE = "verse_merge_conflict:EZK:ust";
+
+  function migratedEnv() {
+    const sqlite = new DatabaseSync(":memory:");
+    for (const sql of migrationSql) sqlite.exec(sql);
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'bcameron93')`).run();
+    const stmt = (sql, args = []) => ({
+      _sql: sql,
+      _args: args,
+      bind: (...next) => stmt(sql, next),
+      all: async () => ({ results: sqlite.prepare(sql).all(...args) }),
+      first: async () => sqlite.prepare(sql).get(...args) ?? null,
+      run: async () => ({ meta: { changes: Number(sqlite.prepare(sql).run(...args).changes) } }),
+    });
+    const env = {
+      DB: {
+        prepare: (sql) => stmt(sql),
+        batch: async (stmts) => {
+          sqlite.exec("BEGIN");
+          try {
+            const out = stmts.map((s) => ({ meta: { changes: Number(sqlite.prepare(s._sql).run(...s._args).changes) } }));
+            sqlite.exec("COMMIT");
+            return out;
+          } catch (e) {
+            sqlite.exec("ROLLBACK");
+            throw e;
+          }
+        },
+      },
+    };
+    return { sqlite, env };
+  }
+  // bcameron93 wrote `version` of the verse, so an overwrite pointing at it is theirs.
+  const authored = (sqlite, chapter, verse, version) =>
+    sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', ?, 'EZK', 7, ?, 'update')`,
+    ).run(`EZK/${chapter}/${verse}/UST`, version);
+  const overwrite = (chapter, verse, overwrittenVersion) => ({
+    chapter, verse, action: "adopt_conflict", reason: "both_changed_wording",
+    overwrittenVersion, alignment: null, observedVersion: null,
+  });
+  const humanResolve = (sqlite, chapter, verse, at) =>
+    sqlite.prepare(
+      `UPDATE verse_merge_conflicts SET resolved_at = ?, resolved_by = 7
+        WHERE book = 'EZK' AND resource = 'ust' AND chapter = ? AND verse = ?`,
+    ).run(at, chapter, verse);
+  const row = (sqlite, chapter, verse) =>
+    sqlite.prepare(`SELECT * FROM verse_merge_conflicts WHERE book = 'EZK' AND resource = 'ust' AND chapter = ? AND verse = ?`)
+      .get(chapter, verse);
+  const editorAlerts = (sqlite) =>
+    sqlite.prepare(`SELECT * FROM system_alerts WHERE username = 'bcameron93' AND source = ? ORDER BY id`).all(SOURCE);
+
+  // (a) The issue's own case: the standing list only shrinks. Two refs first
+  // flagged 2026-08-19; one is resolved; tonight's re-raise names the other
+  // with its August date.
+  {
+    const { sqlite, env } = migratedEnv();
+    authored(sqlite, 4, 17, 6);
+    authored(sqlite, 4, 18, 3);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 17, 6), overwrite(4, 18, 3)], AUG19);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: AUG19 * 1000 });
+    humanResolve(sqlite, 4, 18, AUG19 + 86400);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const live = editorAlerts(sqlite).filter((a) => a.resolved_at == null);
+    assert(live.length === 1, "shrink: one standing editor alert");
+    assert(
+      live[0]?.message.includes("at 1 verse(s) with Door43's version: 4:17@v6 (first flagged 2026-08-19)."),
+      `shrink: the re-raised alert carries the remaining ref's August date (got: ${live[0]?.message})`,
+    );
+    assert(
+      live[0]?.condition_key === verseMergeEditorConditionKey("EZK", "ust", "bcameron93", ["4:17@v6"]),
+      "shrink: the condition key keeps its pre-#996 shape (dates are message-only)",
+    );
+
+    // Stickiness: dismiss it; the next run with the same rows leaves it down,
+    // even though the message wording changed with this fix.
+    sqlite.prepare(`UPDATE system_alerts SET dismissed_at = ? WHERE id = ?`).run(OCT05 + 60, live[0].id);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: (OCT05 + 120) * 1000 });
+    const shown = editorAlerts(sqlite).filter((a) => a.resolved_at == null && a.dismissed_at == null);
+    assert(shown.length === 0, "shrink: a dismissed alert stays dismissed on the next run");
+  }
+
+  // (b) The PR #1001 review case: a verse overwritten in June, resolved by a
+  // person, then overwritten again tonight. The reactivated row is dated
+  // tonight, not June, so the editor is not told this is an old, known loss.
+  {
+    const { sqlite, env } = migratedEnv();
+    authored(sqlite, 4, 20, 4);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 20, 4)], JUN10);
+    humanResolve(sqlite, 4, 20, JUN10 + 86400);
+    // Tonight: the speculative upsert, the CAS lands, the confirm reactivates.
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 20, 11)], OCT05);
+    assert(row(sqlite, 4, 20).detected_at === JUN10, "reactivation: the speculative upsert alone leaves detected_at alone");
+    await confirmAdoptedConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 20 }], OCT05);
+    const r = row(sqlite, 4, 20);
+    assert(r.resolved_at === null && r.resolved_by === null, "reactivation: the row is active again");
+    assert(r.detected_at === OCT05, `reactivation: detected_at is tonight, not June (got ${r.detected_at})`);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const msg = editorAlerts(sqlite).find((a) => a.resolved_at == null)?.message ?? "";
+    assert(msg.includes("(first flagged 2026-10-05)"), `reactivation: the editor alert is dated tonight (got: ${msg})`);
+    assert(!msg.includes("2026-06-10"), "reactivation: the June date does not appear");
+  }
+
+  // (c) A still-UNRESOLVED row whose overwrite is confirmed again keeps its
+  // original detected_at: the reset is only for a row coming back from resolved.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 21, 5)], AUG19);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 21, 8)], OCT05);
+    await confirmAdoptedConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 21 }], OCT05);
+    const r = row(sqlite, 4, 21);
+    assert(r.detected_at === AUG19, `unresolved re-confirm: detected_at keeps its first date (got ${r.detected_at})`);
+    assert(r.last_recorded_at === OCT05, "unresolved re-confirm: last_recorded_at still records tonight");
+  }
+
+  // (d) A resolved row whose adoption LOSES its CAS race (no confirm) keeps
+  // its resolution and its date: nothing was overwritten tonight.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 22, 5)], JUN10);
+    humanResolve(sqlite, 4, 22, JUN10 + 86400);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 22, 9)], OCT05);
+    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 22 }], OCT05);
+    const r = row(sqlite, 4, 22);
+    assert(r.resolved_at === JUN10 + 86400, "lost CAS: the resolution stands");
+    assert(r.detected_at === JUN10, "lost CAS: detected_at is untouched");
+  }
 }
 
 if (failed) {

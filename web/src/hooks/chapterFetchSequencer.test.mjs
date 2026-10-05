@@ -340,4 +340,150 @@ function harness() {
   assert.deepEqual(events2[1].queued, ["structure:during mount"], "the deferred merge drops data steps its snapshot already contains");
 }
 
+// ── (#989 case 1) a tab's own pending delete survives a superseding merge ─
+// The predicate useChapter really passes (verseStructure's
+// keepStepAcrossSupersede), driven end to end: merging GET 1 is in flight,
+// the tab deletes tq row X (optimistic apply + rowDelete step; the DELETE
+// waits in the outbox), a reconnect starts merging GET 2, and GET 2's
+// snapshot still holds X because the DELETE has not committed. Before the
+// fix the inherited rowDelete was dropped and X came back on screen.
+{
+  const vs = await import("../lib/verseStructure.ts");
+  // Falls back to the pre-#989 predicate, so this case fails on the row
+  // itself (not on a missing export) against the old code.
+  const keep = vs.keepStepAcrossSupersede ?? vs.isStructureStep;
+  const chapter = (tq) => ({ book: "ZEC", chapter: 1, verses: {}, tn: [], tq, twl: [], verseStatuses: [], verseLaneChecks: [], twlOrderLocks: [] });
+  const q = (id) => ({ id, version: 2, book: "ZEC", chapter: 1, verse: 1, sort_order: 1, updated_at: 100 });
+  let state = chapter([q("X"), q("Y")]);
+  const reqs = [];
+  const seq = createChapterFetchSequencer({
+    onStart: () => {},
+    onAttempt: () => {},
+    onLanded: (payload, merge, queued) => {
+      state = vs.replaySteps(merge ? vs.mergeRefetched(state, payload) : payload, queued);
+    },
+    onError: () => {},
+    keepOnSupersede: keep,
+  });
+  const load = () => new Promise((resolve) => reqs.push(resolve));
+  const first = seq.refetch(load, true); // merging GET 1 (a WS open)
+  const del = { type: "rowDelete", kind: "tq", id: "X" };
+  seq.record(del); // Shell onQuestionDelete → applyLocalRowDelete
+  state = vs.applyStep(state, del);
+  const second = seq.refetch(load, true); // reconnect: merging GET 2 supersedes
+  reqs[1](chapter([q("X"), q("Y")])); // the DELETE is still queued: X is in GET 2's snapshot
+  await second;
+  assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#989: the own deleted row stays gone after the superseding merge lands");
+  reqs[0](chapter([q("X"), q("Y")]));
+  await first;
+  assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#989: the superseded GET 1 landing late changes nothing");
+}
+
+// ── (#1108) a refused row delete comes back and stays back ────────────────
+// The flip side of #989: the tab deletes tq row X while a merging GET is in
+// flight, and the server refuses the DELETE (409 chapter_locked, or the user
+// discards the op). Shell restores X (forget the rowDelete step, re-insert
+// the server's row, as useChapter.restoreRow does). A superseding merge and
+// the late first GET must not hide it again with the inherited delete step.
+{
+  const vs = await import("../lib/verseStructure.ts");
+  const chapter = (tq) => ({ book: "ZEC", chapter: 1, verses: {}, tn: [], tq, twl: [], verseStatuses: [], verseLaneChecks: [], twlOrderLocks: [] });
+  const q = (id) => ({ id, version: 2, book: "ZEC", chapter: 1, verse: 1, sort_order: 1, updated_at: 100 });
+  let state = chapter([q("X"), q("Y")]);
+  const reqs = [];
+  const seq = createChapterFetchSequencer({
+    onStart: () => {},
+    onAttempt: () => {},
+    onLanded: (payload, merge, queued) => {
+      state = vs.replaySteps(merge ? vs.mergeRefetched(state, payload) : payload, queued);
+    },
+    onError: () => {},
+    keepOnSupersede: vs.keepStepAcrossSupersede,
+  });
+  const load = () => new Promise((resolve) => reqs.push(resolve));
+  const first = seq.refetch(load, true); // merging GET 1 (a WS open)
+  const del = { type: "rowDelete", kind: "tq", id: "X" };
+  seq.record(del);
+  state = vs.applyStep(state, del);
+  // The DELETE is refused: restore X.
+  assert.equal(typeof seq.forget, "function", "#1108: the sequencer can forget a queued step");
+  seq.forget((s) => s.type === "rowDelete" && s.kind === "tq" && s.id === "X");
+  const ins = { type: "rowInsert", kind: "tq", row: q("X") };
+  seq.record(ins);
+  state = vs.applyStep(state, ins);
+  const second = seq.refetch(load, true); // reconnect: merging GET 2 supersedes
+  reqs[1](chapter([q("X"), q("Y")]));
+  await second;
+  assert.deepEqual(state.tq.map((r) => r.id).sort(), ["X", "Y"], "#1108: the restored row survives the superseding merge");
+  reqs[0](chapter([q("X"), q("Y")]));
+  await first;
+  assert.deepEqual(state.tq.map((r) => r.id).sort(), ["X", "Y"], "#1108: the superseded GET landing late changes nothing");
+}
+
+// forget() with nothing pending is a no-op, and only drops the matching steps.
+{
+  const { seq, loader, requests, events } = harness();
+  seq.forget(() => true); // no merge pending: no queue, nothing to throw on
+  const p = seq.refetch(loader("merge"), true);
+  seq.record("keep");
+  seq.record("drop");
+  seq.forget((s) => s === "drop");
+  requests[0].resolve("snap");
+  await p;
+  assert.deepEqual(events.at(-1).queued, ["keep"], "forget drops only the matching step");
+}
+
+// ── (#1107) a delete made with NO merge pending survives the next merge ──
+// The case #989 did not cover: the tab deletes tq row X while offline (no
+// merging GET pending, so record() keeps no rowDelete step). On reconnect the
+// merging GET races the outbox drain and its snapshot still holds X. The
+// loader useChapter really passes (pendingRowDeletes.ts) re-reads the outbox
+// after the GET and hides rows whose own DELETE is still draining.
+{
+  const vs = await import("../lib/verseStructure.ts");
+  // Missing-module fallback: against the pre-#1107 code the case fails on the
+  // row itself, not on the import.
+  const prd = await import("../sync/pendingRowDeletes.ts").catch(() => ({}));
+  const wrap = prd.hidingPendingRowDeletes ?? ((load) => load);
+  const chapter = (tq) => ({ book: "ZEC", chapter: 1, verses: {}, tn: [], tq, twl: [], verseStatuses: [], verseLaneChecks: [], twlOrderLocks: [] });
+  const q = (id) => ({ id, version: 2, book: "ZEC", chapter: 1, verse: 1, sort_order: 1, updated_at: 100 });
+  let state = chapter([q("X"), q("Y")]);
+  const reqs = [];
+  const seq = createChapterFetchSequencer({
+    onStart: () => {},
+    onAttempt: () => {},
+    onLanded: (payload, merge, queued) => {
+      state = vs.replaySteps(merge ? vs.mergeRefetched(state, payload) : payload, queued);
+    },
+    onError: () => {},
+    keepOnSupersede: vs.keepStepAcrossSupersede,
+  });
+  // The tab's outbox: X's DELETE is queued (offline).
+  let ops = [{ id: "op1", target: { kind: "row", rowKind: "tq", id: "X", book: "ZEC" }, action: "delete", status: "pending" }];
+  const load = wrap(() => new Promise((resolve) => reqs.push(resolve)), async () => ops);
+  const del = { type: "rowDelete", kind: "tq", id: "X" };
+  seq.record(del); // no merge pending: nothing is recorded
+  state = vs.applyStep(state, del);
+  const reconnect = seq.refetch(load, true); // WS onOpen after reconnect
+  ops = [{ ...ops[0], status: "in_flight" }]; // the drain picks the DELETE up
+  await tick(); // the loader reads the outbox before sending the GET
+  reqs[0](chapter([q("X"), q("Y")])); // snapshot taken before the DELETE committed
+  await reconnect;
+  assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#1107: the offline-deleted row stays hidden after the reconnect merge");
+  // A plain refetch (a chapter re-opened, a Refresh) racing the drain too.
+  const plain = seq.refetch(load, false);
+  await tick();
+  reqs[1](chapter([q("X"), q("Y")]));
+  await plain;
+  assert.deepEqual(state.tq.map((r) => r.id), ["Y"], "#1107: a plain refetch landing before the DELETE commits does not show the row either");
+  // The DELETE is refused or discarded: the op is gone and the server still
+  // has X. The next GET must show it, never hide a row with no DELETE left.
+  ops = [];
+  const after = seq.refetch(load, true);
+  await tick();
+  reqs[2](chapter([q("X"), q("Y")]));
+  await after;
+  assert.deepEqual(state.tq.map((r) => r.id), ["X", "Y"], "#1107: with its DELETE gone from the outbox the server's row shows again");
+}
+
 console.log("chapterFetchSequencer: all cases passed");

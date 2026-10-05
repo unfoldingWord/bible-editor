@@ -1,15 +1,16 @@
-import { Fragment, type Ref, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, lazy, type Ref, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip, Link } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
 import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, TwlOrderLock, CommentRowKind } from "../sync/api";
+import { alignmentPanelRowKey } from "../sync/alignmentDraftSaveState";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { TwlSuggestions } from "./TwlSuggestions";
 import { QuestionsTable } from "./QuestionsTable";
-import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
+import type { AlignerLock, AlignmentPanelHandle } from "./AlignmentPanel";
 import { noteOverlapsRange } from "../lib/verseRange";
 import { hasLeftNoteVerse, type ActiveLocation } from "../lib/noteGuard";
 import { canonicalTwlOrder, twlDisplayOrder } from "../lib/twlCanonicalOrder";
@@ -37,6 +38,13 @@ export interface ResourceCheckoff {
 // CSP frame-src (api/src/index.ts) — adding a different host requires updating
 // both.
 const SEARCH_IFRAME_URL = "https://swunrow.pythonanywhere.com/";
+
+// The alignment tab is off by default (panelMode starts "resources" in
+// Shell), so most sessions never need AlignmentPanel's DnD aligner code.
+// forwardRef components work through lazy() same as any other.
+const AlignmentPanel = lazy(() =>
+  import("./AlignmentPanel").then((m) => ({ default: m.AlignmentPanel })),
+);
 
 // Candidate slot for the reorder "stoplight" — the moved note plus the note
 // ids that would become its predecessor / successor at the current drag target
@@ -76,6 +84,10 @@ export interface AlignmentTabProps {
   onOpenDual?: () => void;
   // Restore a previously-saved verse version from the panel's history button.
   onRestoreVersion?: (content: unknown, plainText: string | null) => void;
+  // #943: set while this verse can't be written (AI pipeline chapter lock,
+  // or a book lock that landed after the panel opened). Passed through to
+  // AlignmentPanel, which disables alignment changes, Save and history restore.
+  locked?: AlignerLock;
 }
 
 interface Props {
@@ -333,6 +345,24 @@ function groupByVerse<T extends { verse: number }>(rows: T[]): Array<[number, T[
   return [...map.entries()].sort(([a], [b]) => a - b);
 }
 
+// One pass over already-grouped, already-sorted verse buckets to a per-row
+// prev/next id lookup — the reorder neighbors a note card needs, without
+// re-filtering + indexOf'ing the peer array on every card render.
+function buildNoteNeighbors(
+  groups: Array<[number, TnRow[]]>,
+): Map<string, { prevId: string | null; nextId: string | null }> {
+  const out = new Map<string, { prevId: string | null; nextId: string | null }>();
+  for (const [, rows] of groups) {
+    for (let i = 0; i < rows.length; i++) {
+      out.set(rows[i].id, {
+        prevId: i > 0 ? rows[i - 1].id : null,
+        nextId: i < rows.length - 1 ? rows[i + 1].id : null,
+      });
+    }
+  }
+  return out;
+}
+
 export function ResourceColumn({
   book,
   chapter,
@@ -407,11 +437,23 @@ export function ResourceColumn({
 }: Props) {
   // Where the user's focus currently is, mirrored into a ref for NoteCard's
   // abandoned-blank-stub discard (see hasLeftNoteVerse in noteGuard.ts).
-  // Written during render, not in an effect: in per-verse mode the card for
-  // the OLD verse unmounts in the same commit that changes activeVerse, so
-  // its own props are stale by the time its unmount cleanup runs — reading a
-  // parent ref that was already updated during the parent's render is the
-  // only way that cleanup can see the NEW location.
+  // In per-verse mode the card for the OLD verse unmounts in the same commit
+  // that changes activeVerse, so its own props are stale by the time its
+  // unmount cleanup runs; this parent ref is how that cleanup sees the NEW
+  // location. Its readers are NoteCard's discard effect and unmount cleanup,
+  // both passive. A useEffect write here would be too late: React runs the
+  // removed card's passive cleanup before this component's passive effects.
+  // A useLayoutEffect write would land in time and would also keep a render
+  // React throws away from leaking in, but it is left as a render-time write
+  // on purpose (#1011): this feeds the blank-stub discard, which deletes a
+  // note when it misjudges, and the move buys nothing on this tree. No
+  // startTransition / useDeferredValue is in use, so a render of this
+  // component that React throws away is StrictMode's dev replay or React's
+  // one retry after a render error, and both re-render with the same props.
+  // A lazy() child that suspends throws away only the render inside its own
+  // Suspense boundary, and this component sits above every boundary (its own
+  // wraps only AlignmentPanel). Revisit if concurrent rendering arrives
+  // (e.g. a React 19 upgrade).
   const activeLocRef = useRef<ActiveLocation>({ book, chapter, verse: activeVerse });
   activeLocRef.current = { book, chapter, verse: activeVerse };
 
@@ -479,12 +521,16 @@ export function ResourceColumn({
   // Notes/questions filter on their ref_raw span (noteOverlapsRange), not just
   // the leading `verse`, so a bridged note ("1:2-3") shows on every verse it
   // covers — not only its leading verse. Singletons reduce to the old test.
-  const tnForVerse = useMemo(
+  const tnForVerseGroups = useMemo(
     () =>
-      groupByVerse(tn.filter((r) => noteOverlapsRange(r, rangeStart, rangeEnd))).flatMap(
-        ([, rows]) => sortBySortOrder(rows),
+      groupByVerse(tn.filter((r) => noteOverlapsRange(r, rangeStart, rangeEnd))).map(
+        ([v, rows]) => [v, sortBySortOrder(rows)] as [number, TnRow[]],
       ),
     [tn, rangeStart, rangeEnd],
+  );
+  const tnForVerse = useMemo(
+    () => tnForVerseGroups.flatMap(([, rows]) => rows),
+    [tnForVerseGroups],
   );
   const tqForVerse = useMemo(
     () =>
@@ -515,6 +561,14 @@ export function ResourceColumn({
         : null,
     [pinned.notes, tn],
   );
+  // Precomputed once per verse-group change rather than re-derived per card:
+  // renderNoteCard used to peers.filter(same verse) + indexOf on every card,
+  // O(n) work per card (O(n²) per group render). ids are enough — every
+  // consumer below only ever reads prevNote.id / nextNote.id.
+  const tnNeighbors = useMemo(
+    () => buildNoteNeighbors(pinned.notes && tnGroups ? tnGroups : tnForVerseGroups),
+    [pinned.notes, tnGroups, tnForVerseGroups],
+  );
   const tqGroups = useMemo(
     () =>
       pinned.questions
@@ -541,7 +595,10 @@ export function ResourceColumn({
   // the book-wide total in TopBar sums the server's book-summary query, which
   // excludes `trashed_at`. Counting raw array length here disagreed with that
   // total by exactly the trashed count for any chapter holding a trashed note.
-  const totalTn = (pinned.notes ? tn : tnForVerse).filter((r) => r.trashed_at == null).length;
+  const totalTn = useMemo(
+    () => (pinned.notes ? tn : tnForVerse).filter((r) => r.trashed_at == null).length,
+    [pinned.notes, tn, tnForVerse],
+  );
   const totalTwl = pinned.words ? twl.length : twlForVerse.length;
   const totalTq = pinned.questions ? tq.length : tqForVerse.length;
 
@@ -919,33 +976,38 @@ export function ResourceColumn({
       </Stack>
       {panelMode === "alignment" ? (
         alignmentProps ? (
-          <AlignmentPanel
-            // Remount on any target change (version OR verse). Without a key,
-            // React reuses the instance and the panel's `state` only resets via
-            // a passive useEffect that runs AFTER paint — leaving a window where
-            // `state` still holds the PREVIOUS version's alignment while `verse`
-            // / `onSave` are already bound to the new target. A save landing in
-            // that window writes the old content to the new row (e.g. UST
-            // alignment saved onto the ULT verse). Keying forces a fresh mount
-            // whose useState(computedInitial) seeds the correct state
-            // synchronously, closing the race.
-            key={`${alignmentProps.bibleVersion}:${alignmentProps.chapter}:${alignmentProps.verseNum}`}
-            ref={alignmentProps.panelRef}
-            book={alignmentProps.book}
-            chapter={alignmentProps.chapter}
-            verseNum={alignmentProps.verseNum}
-            bibleVersion={alignmentProps.bibleVersion}
-            verse={alignmentProps.verse}
-            sourceVerse={alignmentProps.sourceVerse}
-            sourceLabel={alignmentProps.sourceLabel}
-            twlForVerse={alignmentProps.twlForVerse}
-            onSave={alignmentProps.onSave}
-            onConfirmUnalign={alignmentProps.onConfirmUnalign}
-            onCancel={alignmentProps.onCancel}
-            onDirtyChange={alignmentProps.onDirtyChange}
-            onOpenDual={alignmentProps.onOpenDual}
-            onRestoreVersion={alignmentProps.onRestoreVersion}
-          />
+          <Suspense fallback={null}>
+            <AlignmentPanel
+              // Remount on any target change (version OR verse). Without a key,
+              // React reuses the instance and the panel's `state` only resets via
+              // a passive useEffect that runs AFTER paint — leaving a window where
+              // `state` still holds the PREVIOUS version's alignment while `verse`
+              // / `onSave` are already bound to the new target. A save landing in
+              // that window writes the old content to the new row (e.g. UST
+              // alignment saved onto the ULT verse). Keying forces a fresh mount
+              // whose useState(computedInitial) seeds the correct state
+              // synchronously, closing the race. Also keyed by the row (start
+              // verse + bridge end), so a bridge or split by another editor
+              // remounts it fresh on the new row (#1074).
+              key={`${alignmentProps.bibleVersion}:${alignmentProps.chapter}:${alignmentProps.verseNum}:${alignmentPanelRowKey(alignmentProps.verse)}`}
+              ref={alignmentProps.panelRef}
+              book={alignmentProps.book}
+              chapter={alignmentProps.chapter}
+              verseNum={alignmentProps.verseNum}
+              bibleVersion={alignmentProps.bibleVersion}
+              verse={alignmentProps.verse}
+              sourceVerse={alignmentProps.sourceVerse}
+              sourceLabel={alignmentProps.sourceLabel}
+              twlForVerse={alignmentProps.twlForVerse}
+              onSave={alignmentProps.onSave}
+              onConfirmUnalign={alignmentProps.onConfirmUnalign}
+              onCancel={alignmentProps.onCancel}
+              onDirtyChange={alignmentProps.onDirtyChange}
+              onOpenDual={alignmentProps.onOpenDual}
+              onRestoreVersion={alignmentProps.onRestoreVersion}
+              locked={alignmentProps.locked}
+            />
+          </Suspense>
         ) : (
           <Box sx={{ p: 3 }}>
             <Typography variant="body2" color="text.secondary">
@@ -985,7 +1047,7 @@ export function ResourceColumn({
                 tnGroups.map(([verse, rows]) => (
                   <Fragment key={`tn-${verse}`}>
                     <VerseGroupHead verse={verse} active={verse === activeVerse} section="notes" />
-                    {rows.map((r) => renderNoteCard(r, rows))}
+                    {rows.map((r) => renderNoteCard(r))}
                   </Fragment>
                 ))
               )
@@ -994,7 +1056,7 @@ export function ResourceColumn({
                 no notes for this verse
               </Typography>
             ) : (
-              tnForVerse.map((r) => renderNoteCard(r, tnForVerse))
+              tnForVerse.map((r) => renderNoteCard(r))
             )}
           </>
         )}
@@ -1252,17 +1314,16 @@ export function ResourceColumn({
     );
   }
 
-  function renderNoteCard(r: TnRow, peers: TnRow[]) {
+  function renderNoteCard(r: TnRow) {
     const showBefore =
       dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "before";
     const showAfter =
       dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "after";
     // Only navigate within the same verse — displayVerseRange can span multiple
     // verses, but onNoteReorder in Shell operates per-verse via sortedForVerse.
-    const samePeers = peers.filter((p) => p.verse === r.verse);
-    const idx = samePeers.indexOf(r);
-    const prevNote = idx > 0 ? samePeers[idx - 1] : null;
-    const nextNote = idx < samePeers.length - 1 ? samePeers[idx + 1] : null;
+    // Precomputed in tnNeighbors (see comment there) rather than
+    // peers.filter(same verse) + indexOf per card.
+    const { prevId, nextId } = tnNeighbors.get(r.id) ?? { prevId: null, nextId: null };
     return (
       <Fragment key={r.id}>
         {showBefore && <DropIndicator />}
@@ -1303,23 +1364,23 @@ export function ResourceColumn({
               : undefined
           }
           onGripDragStart={() => setDragId(r.id)}
-          prevNoteId={prevNote?.id ?? null}
-          nextNoteId={nextNote?.id ?? null}
+          prevNoteId={prevId}
+          nextNoteId={nextId}
           onMoveUp={
-            prevNote
+            prevId
               ? () => {
                   noteFocusRef.current = { id: r.id, dir: "up" };
-                  onNoteReorder(r.id, prevNote.id, "before");
-                  onReorderPreview?.(computeNeighbors(r.id, prevNote.id, "before"), true);
+                  onNoteReorder(r.id, prevId, "before");
+                  onReorderPreview?.(computeNeighbors(r.id, prevId, "before"), true);
                 }
               : undefined
           }
           onMoveDown={
-            nextNote
+            nextId
               ? () => {
                   noteFocusRef.current = { id: r.id, dir: "down" };
-                  onNoteReorder(r.id, nextNote.id, "after");
-                  onReorderPreview?.(computeNeighbors(r.id, nextNote.id, "after"), true);
+                  onNoteReorder(r.id, nextId, "after");
+                  onReorderPreview?.(computeNeighbors(r.id, nextId, "after"), true);
                 }
               : undefined
           }
@@ -1328,9 +1389,7 @@ export function ResourceColumn({
             onReorderPreview
               ? (entering) =>
                   onReorderPreview(
-                    entering
-                      ? { verse: r.verse, movedId: r.id, prevId: prevNote?.id ?? null, nextId: nextNote?.id ?? null }
-                      : null,
+                    entering ? { verse: r.verse, movedId: r.id, prevId, nextId } : null,
                     false,
                   )
               : undefined

@@ -32,6 +32,7 @@ import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import type { ChapterState } from "../hooks/useBook";
 import type { TnRow, VerseDto } from "../sync/api";
+import type { ChapterData } from "../lib/verseStructure";
 import { smartReplaceVerse } from "../lib/replace";
 import { loadFindDraft, saveFindDraft } from "../lib/findState";
 import {
@@ -317,12 +318,23 @@ export function FindReplaceOverlay({
   // Push query down to the caller so verse cells can paint match marks.
   // Query changes clear the old active mark without navigating. Note active
   // marks can themselves scroll their card, so they are also explicit-only.
-  const queryEffectRanRef = useRef(false);
+  //
+  // "First run" is detected by comparing this effect's own dependency values
+  // against what they were the last time it fired, not a boolean latch
+  // (#842 step 4): a latch that's already flipped true survives a React
+  // StrictMode replay (setup → cleanup → setup) of the same first commit, so
+  // the replayed setup reads as "not the first run" and clears
+  // onScrollToMatch/onActiveNoteMatchChange on mount, in dev only. Comparing
+  // the actual deps instead means a replay of the same commit — same deps as
+  // last recorded — still reads as the first run either way.
+  const queryEffectDepsRef = useRef<unknown[] | null>(null);
   useEffect(() => {
+    const deps = [open, query, regex, caseSensitive, strongs, scope.bible, scope.tn];
+    const prevDeps = queryEffectDepsRef.current;
     // Re-anchor before the Bible-scope return so TN-only search behaves the
     // same. Restoring a persisted query also stays still.
-    const firstRun = !queryEffectRanRef.current;
-    queryEffectRanRef.current = true;
+    const firstRun = !prevDeps || deps.every((d, i) => d === prevDeps[i]);
+    queryEffectDepsRef.current = deps;
     if (open && query && (scope.bible || scope.tn)) {
       wantsScrollRef.current = { activate: enterPendingRef.current, nearest: true };
       candidateUnvisitedRef.current = true;
@@ -1225,6 +1237,17 @@ function buildSearchRegex(
   }
 }
 
+// Per-chapter match cache, keyed on the chapter's own ChapterState object.
+// useBook/useChapter only replace a chapter's entry (with a fresh object)
+// when THAT chapter's content actually changes (see the comment above
+// noteMatches) — every other loaded chapter keeps its prior reference. In
+// book mode, "load full book" arrives as one `chapters` Map identity change
+// per newly-loaded chapter, which used to make collectMatches rescan every
+// chapter already loaded, not just the new one; caching by chapter state
+// reference makes each chapter re-scan only when its own data changes (or
+// the query/scope changes, via cacheKey).
+const chapterMatchCache = new WeakMap<ChapterState, { key: string; matches: FindMatch[] }>();
+
 function collectMatches(
   chapters: Map<number, ChapterState>,
   enabledVersions: string[],
@@ -1239,52 +1262,80 @@ function collectMatches(
   const versionsToScan = sourceMode
     ? Array.from(new Set([...enabledVersions, "UHB", "UGNT"]))
     : enabledVersions;
+  // Everything collectChapterMatches' output depends on besides the
+  // chapter's own content — a query/version/scope change must still rescan
+  // every chapter even though none of their ChapterState objects changed.
+  const cacheKey = JSON.stringify([
+    re ? [re.source, re.flags] : null,
+    sourceQuery,
+    versionsToScan.slice().sort(),
+  ]);
   const chList = [...chapters.keys()].sort((a, b) => a - b);
   for (const ch of chList) {
     const state = chapters.get(ch);
     if (!state || state.kind !== "ready") continue;
-    for (const bv of versionsToScan) {
-      const byVerse = state.data.verses[bv];
-      if (!byVerse) continue;
-      const isSource = bv === "UHB" || bv === "UGNT";
-      // Source-language query: only run on UHB/UGNT, skip ULT/UST entirely.
-      // English query: run regex on every version's plain_text as before.
-      if (sourceMode && !isSource) continue;
-      const verseNums = Object.keys(byVerse).map(Number).sort((a, b) => a - b);
-      for (const v of verseNums) {
-        const dto = byVerse[v];
-        if (sourceMode && isSource) {
-          const vo = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-          if (!Array.isArray(vo)) continue;
-          for (const m of matchSourceVerse(vo, sourceQuery as Exclude<SourceQueryKind, { kind: "english" }>)) {
-            out.push({
-              chapter: ch,
-              verse: v,
-              bibleVersion: bv,
-              startIndex: m.start,
-              endIndex: m.end,
-              matchText: m.text,
-            });
-          }
-          continue;
-        }
-        if (!re) continue;
-        const text = dto.plain_text ?? "";
-        if (!text) continue;
-        // Use a fresh regex per verse so lastIndex doesn't bleed.
-        const localRe = new RegExp(re.source, re.flags);
-        let m: RegExpExecArray | null;
-        while ((m = localRe.exec(text)) !== null) {
+    const cached = chapterMatchCache.get(state);
+    if (cached && cached.key === cacheKey) {
+      out.push(...cached.matches);
+      continue;
+    }
+    const chapterMatches = collectChapterMatches(ch, state.data.verses, versionsToScan, sourceMode, re, sourceQuery);
+    chapterMatchCache.set(state, { key: cacheKey, matches: chapterMatches });
+    out.push(...chapterMatches);
+  }
+  return out;
+}
+
+function collectChapterMatches(
+  ch: number,
+  verses: ChapterData["verses"],
+  versionsToScan: string[],
+  sourceMode: boolean,
+  re: RegExp | null,
+  sourceQuery: SourceQueryKind,
+): FindMatch[] {
+  const out: FindMatch[] = [];
+  for (const bv of versionsToScan) {
+    const byVerse = verses[bv];
+    if (!byVerse) continue;
+    const isSource = bv === "UHB" || bv === "UGNT";
+    // Source-language query: only run on UHB/UGNT, skip ULT/UST entirely.
+    // English query: run regex on every version's plain_text as before.
+    if (sourceMode && !isSource) continue;
+    const verseNums = Object.keys(byVerse).map(Number).sort((a, b) => a - b);
+    for (const v of verseNums) {
+      const dto = byVerse[v];
+      if (sourceMode && isSource) {
+        const vo = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+        if (!Array.isArray(vo)) continue;
+        for (const m of matchSourceVerse(vo, sourceQuery as Exclude<SourceQueryKind, { kind: "english" }>)) {
           out.push({
             chapter: ch,
             verse: v,
             bibleVersion: bv,
-            startIndex: m.index,
-            endIndex: m.index + m[0].length,
-            matchText: m[0],
+            startIndex: m.start,
+            endIndex: m.end,
+            matchText: m.text,
           });
-          if (m[0].length === 0) localRe.lastIndex++;
         }
+        continue;
+      }
+      if (!re) continue;
+      const text = dto.plain_text ?? "";
+      if (!text) continue;
+      // Use a fresh regex per verse so lastIndex doesn't bleed.
+      const localRe = new RegExp(re.source, re.flags);
+      let m: RegExpExecArray | null;
+      while ((m = localRe.exec(text)) !== null) {
+        out.push({
+          chapter: ch,
+          verse: v,
+          bibleVersion: bv,
+          startIndex: m.index,
+          endIndex: m.index + m[0].length,
+          matchText: m[0],
+        });
+        if (m[0].length === 0) localRe.lastIndex++;
       }
     }
   }

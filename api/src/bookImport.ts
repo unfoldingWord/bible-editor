@@ -27,6 +27,7 @@ import { effectiveBookLock, canManageLocks, requireAutoMergeConfirmation, type B
 import { isPublishedBook } from "./publishedGuard";
 import { exportBranchOverrideValid, lockPushExportParams } from "./export";
 import { LockPushBody } from "./exportRequestBodies";
+import { refreshVerseMergeAlertsAfterLockChange } from "./verseMergeConflicts";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { PROVENANCE_COLUMNS, provenanceValues, resolveActorUsername } from "./rowProvenance.ts";
 
@@ -149,6 +150,13 @@ books.put("/:book/lock", requireEditor, async (c) => {
   }
 
   const lock = await effectiveBookLock(c.env, book);
+  // Issue #1110: the export skips a locked book, so the book's standing
+  // verse-merge alerts are re-worded for the new lock state now, not at the
+  // next reimport (which never raises them when Door43's file is unchanged).
+  // The refresh reads the lock itself when it raises (two quick changes can
+  // finish out of order). After the response, so the lock change stays fast;
+  // best-effort.
+  c.executionCtx.waitUntil(refreshVerseMergeAlertsAfterLockChange(c.env, book));
   return c.json(lockStateResponse(book, lock));
 });
 
@@ -189,6 +197,8 @@ books.delete("/:book/lock", requireEditor, async (c) => {
   }
 
   const lock = await effectiveBookLock(c.env, book);
+  // Issue #1110: see the PUT handler above.
+  c.executionCtx.waitUntil(refreshVerseMergeAlertsAfterLockChange(c.env, book));
   return c.json(lockStateResponse(book, lock));
 });
 

@@ -75,6 +75,7 @@
 import { Hono } from "hono";
 import type { Env } from "./index";
 import { requireAuth } from "./auth";
+import { effectiveBookLock } from "./bookLock.ts";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
@@ -104,6 +105,7 @@ import {
   reconcileReviewAlert,
   resolveReviewAlert,
   reviewConditionKey,
+  reviewConditionState,
   verseMergeEditorConditionKey,
 } from "./reviewAlerts.ts";
 
@@ -237,18 +239,23 @@ export async function recordVerseMergeConflicts(
 // just leaves a row that stays resolved/dormant one run longer than it
 // should — never a false-positive reactivation, which is the failure mode
 // this two-phase split exists to prevent.
+//
+// `now` is this run's timestamp (the same one recordVerseMergeConflicts got):
+// a row reactivated from resolved takes it as its new detected_at (issue #996,
+// see CONFIRM_ADOPTED_CONFLICT_SQL).
 export async function confirmAdoptedConflicts(
   env: Env,
   book: string,
   resource: string,
   refs: Array<{ chapter: number; verse: number }>,
+  now: number,
 ): Promise<void> {
   if (refs.length === 0) return;
   try {
     for (let i = 0; i < refs.length; i += WRITE_BATCH) {
       const slice = refs.slice(i, i + WRITE_BATCH);
       await env.DB.batch(
-        slice.map((r) => env.DB.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse)),
+        slice.map((r) => env.DB.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse, now)),
       );
     }
   } catch (e) {
@@ -763,10 +770,16 @@ export async function raiseVerseMergeConflictAlert(
   // each carrying its current D1 version so groupNoBaseVersesByEditor can
   // attribute it to the human who last edited it and give THEM their own
   // notice too — until this fix that warning reached only ALERT_USERNAME.
+  // `bookLocked` (issues #1006, #1110): the export skips this book+resource as
+  // the alert is raised, so neither the no-base sentence nor the kept-row
+  // sentences may warn that tonight's export will write. Either the known
+  // value or a reader; the reader runs only when the alert has a sentence
+  // that depends on the lock, so a run with none spends no D1 read on it.
   opts: {
     recordingFailed?: boolean;
     noBaseCount?: number;
     noBaseRefs?: string[];
+    bookLocked?: boolean | (() => Promise<boolean>);
     noBaseEditorRefs?: NoBaseVerseRef[];
     observedAt?: number;
   } = {},
@@ -843,15 +856,38 @@ export async function raiseVerseMergeConflictAlert(
   const reasonCounts = new Map<string, number>();
   for (const r of rows) reasonCounts.set(r.reason, (reasonCounts.get(r.reason) ?? 0) + 1);
   const reasonBreakdown = [...reasonCounts.entries()].map(([reason, n]) => `${n} ${reason}`).join(", ") || "none";
-  // Per-outcome guidance, classified by ACTION (never by the nullable
-  // overwritten_version pointer) — see buildMergeConflictGuidance. Pulled into
-  // that pure helper so the three-way overwritten / kept-alignment /
-  // kept-source-attr split is unit-testable without an Env, and so a refusal or
-  // a source-attr divergence can never be miscounted as an overwrite.
+  // Per-outcome guidance, classified by ACTION — refined, for 'adopt_conflict'
+  // only, by whether overwritten_version is null (issue #981: the #539 no-op
+  // guard keeps a pointer-less adopt_conflict row around, and that is not an
+  // overwrite) — see buildMergeConflictGuidance. Pulled into that pure helper
+  // so the split is unit-testable without an Env, and so a refusal or a
+  // source-attr divergence can never be miscounted as an overwrite.
+  // Issues #1006 / #1110: whether the no-base and kept-row sentences use the
+  // locked-book wording. The lock is read only when one of them is present. A
+  // failed read falls back to the unlocked wording, the one that asks someone
+  // to act, and never fails the alert.
+  const hasNoBase = (opts.noBaseCount ?? 0) > 0;
+  const hasKept = rows.some(rowWordingDependsOnLock);
+  let bookLocked = false;
+  if (hasNoBase || hasKept) {
+    try {
+      bookLocked = typeof opts.bookLocked === "function" ? await opts.bookLocked() : opts.bookLocked === true;
+    } catch (e) {
+      console.error("verseMergeConflicts: lock read failed; using the unlocked wording", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  const noBaseLockedWording = bookLocked && hasNoBase;
+  const keptLockedWording = bookLocked && hasKept;
   const guidance = buildMergeConflictGuidance(rows, {
     recordingFailed: opts.recordingFailed,
     noBaseCount: opts.noBaseCount,
     noBaseRefs: opts.noBaseRefs,
+    noBaseBookLocked: noBaseLockedWording,
+    bookLocked: keptLockedWording,
   });
   // Issue #624: each ref grouped under its own reason, each group carrying
   // the oldest detected_at in that reason as a plain "first flagged" date —
@@ -898,6 +934,8 @@ export async function raiseVerseMergeConflictAlert(
       verse: r.verse,
       overwrittenVersion: r.overwrittenVersion,
       reason: r.reason,
+      // Issue #996: dates each ref in the editor's message ("first flagged").
+      detectedAt: r.detectedAt,
     }));
   // keep_no_base verses (issue #544): NOTHING was overwritten, but the same
   // human needs the same warning the admin gets — see groupNoBaseVersesByEditor's
@@ -914,7 +952,13 @@ export async function raiseVerseMergeConflictAlert(
   }));
   const usernameByKey = await lookupEditorUsernames(env, book, resource, [...overwrittenRefs, ...noBaseLookupRefs]);
   const perEditor = groupOverwrittenVersesByEditor(book, resource, overwrittenRefs, usernameByKey);
-  const perEditorNoBase = groupNoBaseVersesByEditor(book, resource, noBaseEditorRefs, usernameByKey);
+  const perEditorNoBase = groupNoBaseVersesByEditor(
+    book,
+    resource,
+    noBaseEditorRefs,
+    usernameByKey,
+    noBaseLockedWording,
+  );
 
   // Combine per-editor content: an editor can appear in BOTH maps in the same
   // run (an overwritten verse elsewhere in the book, plus a keep_no_base verse
@@ -952,6 +996,13 @@ export async function raiseVerseMergeConflictAlert(
         .sort((a, b) => `${a.chapter}:${a.verse}`.localeCompare(`${b.chapter}:${b.verse}`)),
       noBaseCount: opts.noBaseCount ?? 0,
       recordingFailed: Boolean(opts.recordingFailed),
+      // Issue #1006: the locked wording ("ask an admin") and the unlocked one
+      // ("tonight's export will overwrite") are different conditions, so a
+      // dismissed locked alert cannot hide the warning after an unlock. Added
+      // only when locked, so unlocked keys match the ones already stored.
+      ...(noBaseLockedWording ? { noBaseBookLocked: true } : {}),
+      // Issue #1110: the same for the kept-row sentences.
+      ...(keptLockedWording ? { keptBookLocked: true } : {}),
     },
   );
   const conditionForUser = (username: string): string => {
@@ -959,7 +1010,13 @@ export async function raiseVerseMergeConflictAlert(
     const refs = [perEditor.get(username)?.refs ?? [], perEditorNoBase.get(username)?.refs ?? []]
       .flat()
       .sort();
-    return verseMergeEditorConditionKey(book, resource, username, refs);
+    return verseMergeEditorConditionKey(
+      book,
+      resource,
+      username,
+      refs,
+      noBaseLockedWording && perEditorNoBase.has(username),
+    );
   };
 
   try {
@@ -991,6 +1048,105 @@ export async function raiseVerseMergeConflictAlert(
       resource,
       error: e instanceof Error ? e.message : String(e),
     });
+  }
+}
+
+// Issue #1110: a row whose alert sentence says an export will write over Door43
+// and so changes on a locked book: the kept rows, and an adopt_conflict with no
+// overwritten version (#981). An overwrite with a pointer reads the same either
+// way.
+function rowWordingDependsOnLock(r: { action: string; overwrittenVersion: number | null }): boolean {
+  return (
+    r.action === "keep_alignment_refused" ||
+    r.action === "source_attr_divergent" ||
+    r.action === "keep_local_structure" ||
+    (r.action === "adopt_conflict" && r.overwrittenVersion == null)
+  );
+}
+
+// Issue #1110: re-derive a book's standing verse-merge alerts when an admin
+// locks or unlocks it (bookImport.ts's PUT/DELETE /:book/lock). The lock used
+// to be read only when a reimport raised the alert, and a reimport returns
+// before the alert path when Door43's file is unchanged, so after an unlock a
+// locked alert ("the export skips it") kept standing, and a dismissed one
+// stayed dismissed, while the first export after the unlock wrote over
+// Door43's version of those verses.
+//
+// The adjudicated verses come from verse_merge_conflicts as usual. keep_no_base
+// verses write no row: between reimports the only record of them is the
+// standing admin alert's condition key (raiseVerseMergeConflictAlert stores the
+// uncapped verse list, with versions, and the count there), so that is what
+// this re-raises them from. Only a (book, resource) with a standing admin alert
+// is touched; nothing standing means nothing to re-word. A legacy alert with no
+// parseable key, or one from a run whose recording failed (its table rows may
+// be incomplete), is left for the next reimport rather than re-derived from
+// partial facts. Best-effort: callers run this after the lock has landed.
+//
+// It re-words the stored measurement rather than taking a new one, so it
+// re-raises at that measurement's own observation time, not now: a reimport
+// that started before the lock change and raises after it carries a later
+// observation, and must still win (reconcileReviewAlert drops any observation
+// older than one already stored).
+//
+// It takes no lock value from its caller on purpose (#1110 review): a lock and
+// an unlock in quick succession run two of these after their responses, and
+// they can finish out of order. Each reads the effective lock itself, as late
+// as the raise allows, so a late one words the alert for the lock as it is
+// then, not as its request saw it.
+export async function refreshVerseMergeAlertsAfterLockChange(env: Env, book: string): Promise<void> {
+  const bookLocked = async () => (await effectiveBookLock(env, book)) != null;
+  for (const resource of ["ult", "ust"]) {
+    const source = `verse_merge_conflict:${book}:${resource}`;
+    try {
+      const standing = await env.DB.prepare(
+        `SELECT condition_key, condition_observed_at FROM system_alerts
+          WHERE username = ?1 AND source = ?2 AND resolved_at IS NULL
+          ORDER BY id DESC LIMIT 1`,
+      )
+        .bind(ALERT_USERNAME, source)
+        .first<{ condition_key: string | null; condition_observed_at: number | null }>();
+      if (!standing) continue;
+      const state = reviewConditionState(standing.condition_key, "verse_merge_conflict", { book, resource }) as
+        | { noBase?: unknown; noBaseCount?: unknown; recordingFailed?: unknown; rows?: unknown }
+        | undefined;
+      const noBase = Array.isArray(state?.noBase) ? (state.noBase as NoBaseVerseRef[]) : null;
+      const storedRows = Array.isArray(state?.rows)
+        ? (state.rows as Array<{ action: string; overwrittenVersion: number | null }>)
+        : null;
+      if (
+        standing.condition_observed_at == null ||
+        !state ||
+        state.recordingFailed !== false ||
+        typeof state.noBaseCount !== "number" ||
+        !noBase ||
+        !storedRows ||
+        !noBase.every((r) => Number.isInteger(r?.chapter) && Number.isInteger(r?.verse) && Number.isInteger(r?.version))
+      ) {
+        console.warn("verseMergeConflicts: lock change left an alert it cannot re-derive", { book, resource });
+        continue;
+      }
+      // #1110 round 2: touch only an alert whose wording the lock changes. The
+      // raise below rebuilds from the LIVE rows, so for any other alert it would
+      // only re-measure rows resolved since the last reimport, mint a new key,
+      // and resurrect an alert people dismissed. Rows are added only by a
+      // reimport, which raises, so the stored rows cover every live one.
+      if (state.noBaseCount === 0 && !storedRows.some(rowWordingDependsOnLock)) continue;
+      const ordered = [...noBase].sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
+      await raiseVerseMergeConflictAlert(env, book, resource, {
+        recordingFailed: false,
+        noBaseCount: state.noBaseCount,
+        noBaseRefs: ordered.map((r) => `${r.chapter}:${r.verse}`),
+        noBaseEditorRefs: ordered.map((r) => ({ chapter: r.chapter, verse: r.verse, version: r.version })),
+        bookLocked,
+        observedAt: standing.condition_observed_at,
+      });
+    } catch (e) {
+      console.error("verseMergeConflicts: lock-change alert refresh failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 }
 
