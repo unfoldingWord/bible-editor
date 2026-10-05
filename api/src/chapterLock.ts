@@ -96,24 +96,66 @@ export async function activePipelineForChapter(
   chapter: number,
   resource?: LockedResource,
 ): Promise<ActiveLock | null> {
+  const rs = await activePipelinesStatement(env.DB, book, chapter).all<ActivePipelineRow>();
+  return pickActivePipeline(rs.results ?? [], chapter, resource);
+}
+
+export interface ActivePipelineRow {
+  job_id: string;
+  pipeline_type: string;
+  user_id: number;
+  created_at: number;
+  follow_up_chain: string | null;
+  start_chapter: number;
+  end_chapter: number;
+}
+
+// The read half of activePipelineForChapter as an unexecuted statement, so a
+// hot save route can put it in one db.batch() with its other read-only
+// pre-checks (issue #905). `chapter: null` reads the book's non-terminal jobs
+// for every chapter: the row PATCH learns its chapter only from the row read
+// in that same batch, so pickActivePipeline applies the chapter range in JS
+// instead. The bot has one slot, so that is still a handful of rows.
+export function activePipelinesStatement(
+  db: D1Database,
+  book: string,
+  chapter: number | null,
+): D1PreparedStatement {
+  if (chapter == null) {
+    const statePlaceholders = NON_TERMINAL.map((_, i) => `?${i + 2}`).join(", ");
+    return db
+      .prepare(
+        `SELECT job_id, pipeline_type, user_id, created_at, follow_up_chain, start_chapter, end_chapter
+           FROM pipeline_jobs
+          WHERE book = ?1
+            AND state IN (${statePlaceholders})
+          ORDER BY created_at ASC`,
+      )
+      .bind(book.toUpperCase(), ...NON_TERMINAL);
+  }
   const statePlaceholders = NON_TERMINAL.map((_, i) => `?${i + 3}`).join(", ");
-  const rs = await env.DB.prepare(
-    `SELECT job_id, pipeline_type, user_id, created_at, follow_up_chain
-       FROM pipeline_jobs
-      WHERE book = ?1
-        AND start_chapter <= ?2 AND end_chapter >= ?2
-        AND state IN (${statePlaceholders})
-      ORDER BY created_at ASC`,
-  )
-    .bind(book.toUpperCase(), chapter, ...NON_TERMINAL)
-    .all<{
-      job_id: string;
-      pipeline_type: string;
-      user_id: number;
-      created_at: number;
-      follow_up_chain: string | null;
-    }>();
-  for (const row of rs.results ?? []) {
+  return db
+    .prepare(
+      `SELECT job_id, pipeline_type, user_id, created_at, follow_up_chain, start_chapter, end_chapter
+         FROM pipeline_jobs
+        WHERE book = ?1
+          AND start_chapter <= ?2 AND end_chapter >= ?2
+          AND state IN (${statePlaceholders})
+        ORDER BY created_at ASC`,
+    )
+    .bind(book.toUpperCase(), chapter, ...NON_TERMINAL);
+}
+
+// The decision half of activePipelineForChapter over activePipelinesStatement's
+// rows (already in created_at order): the first job covering `chapter` that
+// will write `resource`, or null.
+export function pickActivePipeline(
+  rows: readonly ActivePipelineRow[],
+  chapter: number,
+  resource?: LockedResource,
+): ActiveLock | null {
+  for (const row of rows) {
+    if (!(row.start_chapter <= chapter && row.end_chapter >= chapter)) continue;
     if (resource && !resourcesLockedByJob(row.pipeline_type, row.follow_up_chain).has(resource)) {
       continue;
     }
