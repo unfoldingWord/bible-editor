@@ -433,10 +433,21 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
 // write is known to have landed means a lost CAS never reactivates anything:
 // nothing was cleared speculatively, so there is nothing to undo.
 //
-// Binds, in order: (book, resource, chapter, verse).
+// Issue #996: a row coming back from RESOLVED also gets detected_at = ?5
+// (this run's `now`). The old streak ended when a person resolved it; tonight's
+// landed overwrite is a new one, and the editor alert dates refs by
+// detected_at ("first flagged"). Keeping June's date would present a fresh
+// loss as an old, known one. A row that was still unresolved keeps its date,
+// so detected_at still means "first detected, preserved across every
+// re-detection while still unresolved". SQLite evaluates every SET expression
+// against the row as it was before the UPDATE, so the CASE sees the old
+// resolved_at even though the same statement clears it.
+//
+// Binds, in order: (book, resource, chapter, verse, now).
 // ---------------------------------------------------------------------------
 export const CONFIRM_ADOPTED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
-    SET resolved_at = NULL, resolved_by = NULL
+    SET detected_at = CASE WHEN resolved_at IS NULL THEN detected_at ELSE ?5 END,
+        resolved_at = NULL, resolved_by = NULL
   WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
     AND action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')`;
 

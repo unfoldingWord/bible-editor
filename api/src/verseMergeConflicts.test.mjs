@@ -934,8 +934,8 @@ function upsertConflict(
     .run(book, resource, chapter, verse, action, reason, overwrittenVersion, null, now, bibleVersion, observedVersion);
 }
 
-function confirmAdopted(d, { book, resource, chapter, verse }) {
-  return d.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).run(book, resource, chapter, verse);
+function confirmAdopted(d, { book, resource, chapter, verse, now }) {
+  return d.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).run(book, resource, chapter, verse, now);
 }
 
 {
@@ -1011,7 +1011,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
 
   // Tonight's CAS attempt LANDS — confirmAdoptedConflicts is called for
   // exactly this ref (bookReimport.ts's landedAdoptions).
-  confirmAdopted(d, { book: "ZEC", resource: "ult", chapter: 6, verse: 2 });
+  confirmAdopted(d, { book: "ZEC", resource: "ult", chapter: 6, verse: 2, now: tonight });
 
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=6 AND verse=2`).get();
   assert(row.resolved_at === null, "CONFIRMED landed adoption -> resolved_at cleared, genuinely active");

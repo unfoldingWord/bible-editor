@@ -24,6 +24,13 @@ export interface OverwrittenVerseRef {
    * so the editor message does not call a comma correction a wording change.
    */
   reason?: string;
+  /**
+   * verse_merge_conflicts.detected_at for this overwrite (issue #996): when it
+   * was first flagged. The editor message dates its refs by it, so an alert
+   * re-raised only because some refs resolved does not read as a new
+   * overwrite. Absent (no-base refs, pure callers) means no date is shown.
+   */
+  detectedAt?: number | null;
 }
 
 // edit_log has no (book, chapter, verse, resource) columns of its own — only
@@ -125,6 +132,31 @@ export function describeOverwriteAxes(reasons: Array<string | undefined>): strin
   return "Door43's version was taken.";
 }
 
+// Issue #996: the editor's ref list, each ref dated by the day it was first
+// flagged. Editor alerts reconcile by condition key, built from the ref list,
+// so when some refs resolve the shrunken list is a new key and the alert comes
+// back. Without a date it read as a fresh overwrite. Refs are grouped by UTC
+// day, oldest first ("4:17@v6, 4:18@v3 (first flagged 2026-08-19); 3:2@v9
+// (first flagged 2026-10-05)"), so a new overwrite that shares the alert with
+// old ones keeps tonight's date instead of hiding under the oldest one. Dates
+// are message-only: the condition key still comes from `refs` alone, so this
+// changes no key and resurrects no dismissed alert. Refs without a date are
+// listed last, undated, so a caller that passes none gets the old text.
+function datedRefList(refs: string[], detectedAts: Array<number | null | undefined>): string {
+  const byDay = new Map<string, string[]>();
+  refs.forEach((ref, i) => {
+    const at = detectedAts[i];
+    const day = at == null ? "" : plainDate(at);
+    const group = byDay.get(day);
+    if (group) group.push(ref);
+    else byDay.set(day, [ref]);
+  });
+  return [...byDay.entries()]
+    .sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b)))
+    .map(([day, group]) => `${group.join(", ")}${day ? ` (first flagged ${day})` : ""}`)
+    .join("; ");
+}
+
 // Given the verses that were overwritten this run and the (key -> username)
 // lookup already fetched from D1, produce one message per affected editor. A
 // verse whose edit_log row has no user_id (an AI-pipeline edit with no human
@@ -137,17 +169,21 @@ export function groupOverwrittenVersesByEditor(
   overwritten: OverwrittenVerseRef[],
   usernameByKey: Map<string, string>,
 ): Map<string, { refs: string[]; message: string }> {
-  const byUser = new Map<string, { refs: string[]; reasons: Array<string | undefined> }>();
+  const byUser = new Map<
+    string,
+    { refs: string[]; reasons: Array<string | undefined>; detectedAts: Array<number | null | undefined> }
+  >();
   for (const ref of overwritten) {
     const username = usernameByKey.get(editLogKey(book, resource, ref));
     if (!username) continue;
-    const entry = byUser.get(username) ?? { refs: [], reasons: [] };
+    const entry = byUser.get(username) ?? { refs: [], reasons: [], detectedAts: [] };
     entry.refs.push(`${ref.chapter}:${ref.verse}@v${ref.overwrittenVersion}`);
     entry.reasons.push(ref.reason);
+    entry.detectedAts.push(ref.detectedAt);
     byUser.set(username, entry);
   }
   const out = new Map<string, { refs: string[]; message: string }>();
-  for (const [username, { refs, reasons }] of byUser) {
+  for (const [username, { refs, reasons, detectedAts }] of byUser) {
     // "Door43's sync", not "Door43's nightly sync": this fan-out fires from
     // raiseVerseMergeConflictAlert, which runs on both the 05:30 UTC cron AND
     // the user-triggered POST /:book/reimport route — the admin message in
@@ -171,7 +207,7 @@ export function groupOverwrittenVersesByEditor(
     const recovery = `Your ${recoverable} is still recoverable from each verse's version history, at the version number given after @v.`;
     const message =
       `Door43's sync overwrote your edit${refs.length === 1 ? "" : "s"} in ${book} ` +
-      `${resource.toUpperCase()} at ${refs.length} verse(s) with Door43's version: ${refs.join(", ")}. ` +
+      `${resource.toUpperCase()} at ${refs.length} verse(s) with Door43's version: ${datedRefList(refs, detectedAts)}. ` +
       `${axes} ${recovery}`;
     out.set(username, { refs, message });
   }
