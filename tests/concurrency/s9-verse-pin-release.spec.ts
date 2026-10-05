@@ -183,6 +183,13 @@ test.describe("S9 — cross-tab verse pin release (#565 / #569 / #571)", () => {
   test("tab A's draftless save, drained by tab B, releases tab A's pin — a follow-up save lands clean", async ({
     browser,
   }) => {
+    // Measured 26.5-29.5s on agentbox (headless chromium, vite + wrangler
+    // dev) against Playwright's default 30s test timeout — see issue #1019.
+    // The two bounded `.poll()` waits (WS fanout catch-up, then the
+    // follow-up save's own drain) can each take up to 15s back-to-back on a
+    // slow run; give the test real headroom instead of shortening either
+    // wait, which would reintroduce the #605 flake those polls exist to fix.
+    test.setTimeout(60_000);
     const CHAPTER = 1;
     const VERSE = 1;
     const BV = "ULT";
