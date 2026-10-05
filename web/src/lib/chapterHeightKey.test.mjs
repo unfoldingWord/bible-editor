@@ -98,6 +98,25 @@ const base = chapterHeightKey(chapter(ult, ust), ["ULT", "UST"], [1, 2]);
   const echoed = { ...withMarker("q1"), 2: { ...withMarker("q1")[2], version: 7, updated_at: 123, content: JSON.parse(JSON.stringify(withMarker("q1")[2].content)) } };
   assert(chapterHeightKey(chapter(echoed, ust), ["ULT", "UST"], [1, 2]) === q1, "version-only reply with re-parsed content keeps the key");
 }
+// Re-check of #1131: a \qa acrostic label sits on the node's `content` after
+// liftMarkerText; plain_text and splitSectionHeaders leave it out, but
+// BookView draws it as a be-qa heading block.
+{
+  const qa = (label, extra = {}) => ({
+    ...ult,
+    1: dto(1, "In the eighth month", { content: { verseObjects: [{ type: "quote", tag: "qa", content: label }, ...words("In the eighth month")] }, ...extra }),
+  });
+  const aleph = chapterHeightKey(chapter(qa("ALEPH"), ust), ["ULT", "UST"], [1, 2]);
+  assert(aleph !== chapterHeightKey(chapter(qa("ALEPH (the first letter)"), ust), ["ULT", "UST"], [1, 2]), "a \\qa label change changes the key");
+  assert(aleph !== chapterHeightKey(chapter(qa("BETHH"), ust), ["ULT", "UST"], [1, 2]), "a same-length \\qa label change changes the key");
+  assert(aleph === chapterHeightKey(chapter(qa("ALEPH", { version: 9, updated_at: 5 }), ust), ["ULT", "UST"], [1, 2]), "a version-only \\qa reply keeps the key");
+  // A raw (unlifted) label on `text` counts too.
+  const raw = (label) => ({ ...ult, 1: dto(1, "In the eighth month", { content: { verseObjects: [{ type: "quote", tag: "qa", text: label }, ...words("In the eighth month")] } }) });
+  assert(
+    chapterHeightKey(chapter(raw("ALEPH"), ust), ["ULT", "UST"], [1, 2]) !== chapterHeightKey(chapter(raw("ALEPH ALEPH"), ust), ["ULT", "UST"], [1, 2]),
+    "a raw \\qa text label change changes the key",
+  );
+}
 assert(chapterHeightKey(chapter(ult, ust), ["ULT", "UST"], [1]) !== base, "a removed row changes the key");
 assert(chapterHeightKey(chapter(ult, ust), ["ULT", "UST", "UHB"], [1, 2]) !== base, "a toggled column changes the key");
 assert(chapterHeightKey(chapter(ult, ust), ["UST", "ULT"], [1, 2]) !== base, "column order is part of the key");

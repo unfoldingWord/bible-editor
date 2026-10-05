@@ -8,9 +8,9 @@
 // laid out moves the view at that moment.
 //
 // Per verse row and shown column: the bridge end (a bridge spans rows) and a
-// 32-bit FNV-1a hash of the plain text, the tag (or type) of every top-level
-// node (paragraph and poetry markers such as \q1 vs \q2, \p vs \b) and the
-// section-heading text. Content, not lengths, so a same-length rewording
+// 32-bit FNV-1a hash of the plain text, the tag (or type) and string `text` /
+// `content` of every top-level node (paragraph and poetry markers such as \q1
+// vs \q2, \p vs \b; a \qa acrostic label) and the section-heading text. Content, not lengths, so a same-length rewording
 // that rewraps still changes it; a version or timestamp alone does not.
 
 import type { VerseDto } from "../sync/api.ts";
@@ -46,8 +46,16 @@ export function chapterHeightKey(
       const verseObjects = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
       if (Array.isArray(verseObjects)) {
         for (const node of verseObjects) {
-          const o = node as { tag?: unknown; type?: unknown } | null;
+          const o = node as { tag?: unknown; type?: unknown; text?: unknown; content?: unknown } | null;
           h = fnv(h, String(o?.tag ?? o?.type ?? ""));
+          // Labels the renderer draws but plain_text leaves out live here: a
+          // `\qa` acrostic label (lifted to `content`), a `\d` title's text.
+          // Words and alignment milestones are skipped: their text is already
+          // in plain_text, and a milestone's `content` is the source word, not
+          // drawn in this column (hashing them doubled the cost on PSA).
+          if (o?.type === "word" || o?.type === "milestone") continue;
+          h = fnv(h, typeof o?.text === "string" ? o.text : "");
+          h = fnv(h, typeof o?.content === "string" ? o.content : "");
         }
         for (const s of splitSectionHeaders(verseObjects).sections) h = fnv(h, s.text);
       }
