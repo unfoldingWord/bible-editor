@@ -186,6 +186,35 @@ test.describe("S23 — book-mode placeholder heights (#1120)", () => {
     await context.close();
   });
 
+  // #1131 review: the reading text size control rewraps every verse without
+  // changing the scroll box's width, so it needs the same re-measure.
+  test("after a reading text size change, every loaded chapter keeps its real height", async ({ browser }) => {
+    const context = await noAnchoringContext(browser, "s23-textsize");
+    const page = await context.newPage();
+    await page.setViewportSize({ width: 1400, height: 900 });
+    await openBookMode(page, 1);
+    await loadWholeBook(page);
+    await page.evaluate(() => {
+      location.hash = "#/ZEC/14/5";
+    });
+    await settle(page);
+    expect(await wrongPlaceholders(page)).toEqual([]);
+
+    await page.getByRole("button", { name: "adjust reading text size" }).click();
+    const larger = page.getByRole("button", { name: "increase reading text size" });
+    await larger.click();
+    await larger.click();
+    await page.keyboard.press("Escape");
+    // As for a resize: the on-screen rows rewrap at once; read the top row
+    // after that and require the re-measure not to move it.
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    const top = await topRow(page);
+    await settle(page);
+    expect(await wrongPlaceholders(page)).toEqual([]);
+    expect(Math.abs(await topRowMovedPx(page, top))).toBeLessThan(50);
+    await context.close();
+  });
+
   test("after a column toggle, every loaded chapter keeps its real height", async ({ browser }) => {
     const context = await noAnchoringContext(browser, "s23-toggle");
     const page = await context.newPage();
