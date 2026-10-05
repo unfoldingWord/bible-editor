@@ -2808,7 +2808,12 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
         batch: async (stmts) => {
           sqlite.exec("BEGIN");
           try {
-            const out = stmts.map((s) => ({ meta: { changes: Number(sqlite.prepare(s._sql).run(...s._args).changes) } }));
+            // Like D1, a SELECT inside a batch returns its rows (issue #1132's
+            // prior-row capture rides in the upsert's own batch).
+            const out = stmts.map((s) =>
+              /^\s*SELECT/i.test(s._sql)
+                ? { results: sqlite.prepare(s._sql).all(...s._args), meta: { changes: 0 } }
+                : { meta: { changes: Number(sqlite.prepare(s._sql).run(...s._args).changes) } });
             sqlite.exec("COMMIT");
             return out;
           } catch (e) {
@@ -3058,6 +3063,156 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     assert(r.resolved_at === before.resolved_at && r.detected_at === before.detected_at, "resolved lost CAS: resolution and date stand");
     assert(r.overwritten_version === 4, `resolved lost CAS: the pointer stays v4 (got v${r.overwritten_version})`);
     assert(lostWords(r) === "june", `resolved lost CAS: the snapshot stays June's, matching the pointer (got ${lostWords(r)})`);
+  }
+
+  // Issue #1132: a lost race puts back the row tonight's speculative upsert
+  // changed, instead of deleting it. recordVerseMergeConflicts captures each
+  // touched row's prior state (into `prior`) in the same batch as its upsert;
+  // the lost-race cleanup restores a row that existed and deletes only a row
+  // this run created.
+  const lostRace = (env, chapter, verse, now, prior, runStartedAt) =>
+    deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter, verse }], now, prior, runStartedAt);
+  const speculative = (r) => ({
+    action: r.action, reason: r.reason, overwritten_version: r.overwritten_version, alignment: r.alignment,
+    detected_at: r.detected_at, last_recorded_at: r.last_recorded_at, resolved_at: r.resolved_at, resolved_by: r.resolved_by,
+  });
+
+  // (j) The issue's own case: Monday's unresolved adopt_conflict at v5, which
+  // its editor has not reviewed yet. Tuesday's overwrite of the same verse
+  // loses its race (a person saved first). Monday's row, its v5 pointer, its
+  // snapshot and its dates survive, and its editor alert still raises.
+  {
+    const { sqlite, env } = migratedEnv();
+    authored(sqlite, 4, 27, 5);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 27, 5), alignment: snap("monday") }], AUG19);
+    const monday = speculative(row(sqlite, 4, 27));
+    const prior = new Map();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 27, 8), alignment: snap("tuesday") }], OCT05, prior);
+    await lostRace(env, 4, 27, OCT05, prior);
+    const r = row(sqlite, 4, 27);
+    assert(!!r, "lost race on a pending alert row: Monday's row is not deleted");
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(monday),
+      `lost race on a pending alert row: the row is exactly Monday's (got ${JSON.stringify(r && speculative(r))})`,
+    );
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const live = liveFor(sqlite, "bcameron93");
+    assert(
+      live.length === 1 && live[0].message.includes("4:27@v5 (first flagged 2026-08-19)"),
+      `lost race on a pending alert row: Monday's editor alert still raises (got: ${live.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+  }
+
+  // (k) A row this run CREATED speculatively is still deleted on a lost race:
+  // nothing existed before it.
+  {
+    const { sqlite, env } = migratedEnv();
+    const prior = new Map();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 28, 6)], OCT05, prior);
+    await lostRace(env, 4, 28, OCT05, prior);
+    assert(!row(sqlite, 4, 28), "lost race on a brand-new row: the row is deleted");
+  }
+
+  // (l) A RESOLVED row with a NULL stored pointer (a kept-D1 flag someone
+  // resolved, or a resolved #978 no-op adopt_conflict) takes tonight's pointer
+  // and snapshot through the upsert's COALESCE. After a lost race it is back
+  // exactly as it was: it does not claim an overwrite that never landed.
+  {
+    const { sqlite, env } = migratedEnv();
+    const kept = { ...overwrite(4, 29, null), action: "keep_alignment_refused", reason: "alignment_shrink" };
+    const noop = { ...overwrite(4, 30, null), reason: "no_op_conflicted" };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [kept, noop], AUG19);
+    humanResolve(sqlite, 4, 29, AUG19 + 86400);
+    humanResolve(sqlite, 4, 30, AUG19 + 86400);
+    const before29 = speculative(row(sqlite, 4, 29));
+    const before30 = speculative(row(sqlite, 4, 30));
+    const prior = new Map();
+    await recordVerseMergeConflicts(
+      env, "EZK", "ust", "UST",
+      [{ ...overwrite(4, 29, 9), alignment: snap("october") }, { ...overwrite(4, 30, 9), alignment: snap("october") }],
+      OCT05, prior,
+    );
+    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 29 }, { chapter: 4, verse: 30 }], OCT05, prior);
+    const after29 = speculative(row(sqlite, 4, 29));
+    const after30 = speculative(row(sqlite, 4, 30));
+    assert(JSON.stringify(after29) === JSON.stringify(before29), `resolved NULL-pointer kept row: unchanged by a lost race (got ${JSON.stringify(after29)})`);
+    assert(JSON.stringify(after30) === JSON.stringify(before30), `resolved NULL-pointer no-op row: unchanged by a lost race (got ${JSON.stringify(after30)})`);
+  }
+
+  // (m) An unresolved audit-only row promoted tonight (#1124) whose CAS loses
+  // goes back to being the audit row it was: v3, its own date, no alert.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authored(sqlite, 4, 31, 3);
+    authoredBy(sqlite, 8, 4, 31, 7);
+    const audit = { ...overwrite(4, 31, 3), action: "adopt_no_visible_change", reason: "both_changed_markers_only" };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [audit], AUG19);
+    const before = speculative(row(sqlite, 4, 31));
+    const prior = new Map();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 31, 7), alignment: snap("october") }], OCT05, prior);
+    await lostRace(env, 4, 31, OCT05, prior);
+    const after = row(sqlite, 4, 31);
+    assert(
+      after != null && JSON.stringify(speculative(after)) === JSON.stringify(before),
+      `lost promotion: the audit row is restored (got ${JSON.stringify(after && speculative(after))})`,
+    );
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    assert(liveFor(sqlite, "jdoe").length === 0 && liveFor(sqlite, "bcameron93").length === 0, "lost promotion: no editor is alerted");
+  }
+
+  // (n) The person whose save beat the CAS also resolved Monday's row (their
+  // save resolves it) between the upsert and the cleanup. Their resolution
+  // stands; the rest of the row is Monday's.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 32, 5), alignment: snap("monday") }], AUG19);
+    const prior = new Map();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 32, 8), alignment: snap("tuesday") }], OCT05, prior);
+    humanResolve(sqlite, 4, 32, OCT05 + 30);
+    await lostRace(env, 4, 32, OCT05, prior);
+    const r = row(sqlite, 4, 32);
+    assert(r?.resolved_at === OCT05 + 30 && r?.resolved_by === 7, "resolved mid-race: the person's resolution stands");
+    assert(
+      r?.overwritten_version === 5 && lostWords(r) === "monday" && r?.last_recorded_at === AUG19,
+      `resolved mid-race: Monday's pointer, snapshot and last_recorded_at are back (got v${r?.overwritten_version}, ${r && lostWords(r)}, ${r?.last_recorded_at})`,
+    );
+  }
+
+  // (o) Another write touched the row after tonight's upsert (a later run
+  // recorded it again): the cleanup leaves that newer state alone.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 33, 5), alignment: snap("monday") }], AUG19);
+    const prior = new Map();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 33, 8)], OCT05, prior);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 33, 9)], OCT05 + 60);
+    await lostRace(env, 4, 33, OCT05, prior);
+    const r = row(sqlite, 4, 33);
+    assert(r?.last_recorded_at === OCT05 + 60, "later write: the cleanup does not undo a write it did not make");
+  }
+
+  // (p) A Workflow retry: an earlier attempt of THIS run (it died before its
+  // CAS) already touched the row, so the retry's capture holds that attempt's
+  // speculative state, not the real prior one. Restoring it would keep a
+  // promotion that never landed, so the cleanup falls back to the old delete.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 34, 7);
+    const audit = { ...overwrite(4, 34, 3), action: "adopt_no_visible_change", reason: "both_changed_markers_only" };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [audit], AUG19);
+    const runStartedAt = OCT05;
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 34, 7)], OCT05); // attempt 1 dies here
+    const prior = new Map();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 34, 7)], OCT05 + 60, prior); // the retry
+    await lostRace(env, 4, 34, OCT05 + 60, prior, runStartedAt);
+    const claims = sqlite.prepare(
+      `SELECT COUNT(*) c FROM verse_merge_conflicts WHERE book = 'EZK' AND chapter = 4 AND verse = 34 AND overwritten_version = 7`,
+    ).get().c;
+    assert(claims === 0, "retry after a dead attempt: no row claims the v7 overwrite that never landed");
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    assert(liveFor(sqlite, "jdoe").length === 0, "retry after a dead attempt: v7's author is not alerted");
   }
 }
 
