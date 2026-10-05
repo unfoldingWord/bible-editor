@@ -977,10 +977,12 @@ export async function raiseVerseMergeConflictAlert(
   const hasNoBase = (opts.noBaseCount ?? 0) > 0;
   const hasKept = rows.some(rowWordingDependsOnLock);
   let bookLocked = false;
+  let lockReadFailed = false;
   if (hasNoBase || hasKept) {
     try {
       bookLocked = typeof opts.bookLocked === "function" ? await opts.bookLocked() : opts.bookLocked === true;
     } catch (e) {
+      lockReadFailed = true;
       console.error("verseMergeConflicts: lock read failed; using the unlocked wording", {
         book,
         resource,
@@ -1157,7 +1159,14 @@ export async function raiseVerseMergeConflictAlert(
         const row = latest.get(username);
         if (row?.dismissed_at == null) continue;
         const want = lockWordingFor(username);
-        if (!want.depends || want.locked === storedLockWording(book, resource, username, row.condition_key)) {
+        // #1129 review B1: a failed lock read falls back to the unlocked
+        // wording, which is a guess. Do not bring back a dismissed alert on a
+        // lock this raise could not read; undismissed ones keep the fallback.
+        if (
+          !want.depends ||
+          lockReadFailed ||
+          want.locked === storedLockWording(book, resource, username, row.condition_key)
+        ) {
           keepDismissed.add(username);
         }
       }
@@ -1274,13 +1283,10 @@ export async function refreshVerseMergeAlertsAfterLockChange(env: Env, book: str
         return locked;
       } catch (e) {
         lockReads.push("failed");
-        // The raise's own fallback: the wording that asks someone to act.
-        console.error("verseMergeConflicts: lock read failed; using the unlocked wording", {
-          book,
-          resource,
-          error: e instanceof Error ? e.message : String(e),
-        });
-        return false;
+        // Rethrown so the raise knows the read failed (#1129 review B1): it
+        // logs, falls back to the unlocked wording for undismissed alerts, and
+        // leaves dismissed ones alone.
+        throw e;
       }
     };
     try {
