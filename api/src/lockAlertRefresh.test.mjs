@@ -616,6 +616,57 @@ console.log("\n[key churn from concurrent saves with a stable lock does not blam
   }
   assert(warnings.some((w) => /kept changing/.test(w)), `setup: the churn drove the refresh to its pass cap (got: ${JSON.stringify(warnings)})`);
   assert(!warnings.some((w) => /lock kept changing/.test(w)), `the cap warning does not blame a lock that never changed (got: ${JSON.stringify(warnings)})`);
+  // #1129 review A2: nothing in this alert depends on the lock, so no pass read
+  // it; the warning must not claim the reads agreed.
+  assert(
+    warnings.some((w) => /lock was not read/.test(w)) && !warnings.some((w) => /read the same each time/.test(w)),
+    `the cap warning says the lock was never read (got: ${JSON.stringify(warnings)})`,
+  );
+}
+
+console.log("\n[a failing lock read during key churn is reported as such, not as a stable lock (#1129 review A2)]");
+{
+  // A no-base alert (its wording depends on the lock), key churn from
+  // concurrent overwrites, and every lock read failing. The fallback wording
+  // is the unlocked one, but the warning must say the lock could not be read.
+  const { sqlite, env } = freshApp();
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    observedAt: 1000,
+  });
+  const churnEnv = afterConflictReads(env, (n) => {
+    sqlite
+      .prepare(
+        `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+         VALUES (?, 'ust', 3, ?, 'adopt_conflict', 'both_changed_wording', 9, 1000)`,
+      )
+      .run(BOOK, n);
+  });
+  const failingLockEnv = {
+    ...churnEnv,
+    DB: {
+      ...churnEnv.DB,
+      prepare: (sql) => {
+        if (/FROM book_locks/.test(sql)) throw new Error("simulated book_locks read failure");
+        return churnEnv.DB.prepare(sql);
+      },
+    },
+  };
+  const warnings = [];
+  const realWarn = console.warn;
+  const realError = console.error;
+  console.warn = (...args) => warnings.push(args.map(String).join(" "));
+  console.error = () => {};
+  try {
+    await refreshVerseMergeAlertsAfterLockChange(failingLockEnv, BOOK);
+  } finally {
+    console.warn = realWarn;
+    console.error = realError;
+  }
+  assert(warnings.some((w) => /lock could not be read/.test(w)), `the cap warning says the lock read failed (got: ${JSON.stringify(warnings)})`);
+  assert(!warnings.some((w) => /read the same each time/.test(w)), `…and does not claim a stable lock (got: ${JSON.stringify(warnings)})`);
 }
 
 console.log("\n[a dismissed editor alert survives a lock toggle when only its own refs changed (#1129 item 4)]");
@@ -671,6 +722,40 @@ console.log("\n[an undismissed editor alert is re-worded even when the admin's d
   const m = live(EDITOR)[0]?.message ?? "";
   assert(!/tonight's export/.test(m) && /locked/.test(m), `the editor's alert now carries the locked wording (got: ${m})`);
   assert(live(ADMIN).length === 0, "the admin's dismissed alert stays dismissed");
+}
+
+console.log("\n[a dismissed editor alert with the other lock wording is corrected even when the admin's dismissed alert matches (#1129 review A1)]");
+{
+  // Raised unlocked with a no-ancestor verse. The editor's write of the locked
+  // wording landed once (an earlier refresh) but the admin's did not: the
+  // editor's key carries the lock flag on an unlocked book. Both are
+  // dismissed. A lock refresh on the still-unlocked book must re-word the
+  // editor's alert so it warns about tonight's export again (#1006), and leave
+  // the admin's matching dismissed alert alone.
+  const { sqlite, env, live } = freshApp();
+  const noBase = {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+  };
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", { ...noBase, observedAt: 1000 });
+  const editorRow = live(EDITOR)[0];
+  sqlite
+    .prepare(`UPDATE system_alerts SET condition_key = ?, message = 'locked wording (book locked; an admin pushes it)' WHERE id = ?`)
+    .run(verseMergeEditorConditionKey(BOOK, "ust", EDITOR, ["1:6"], true), editorRow.id);
+  sqlite.prepare(`UPDATE system_alerts SET dismissed_at = 5000 WHERE source = ? AND resolved_at IS NULL`).run(SOURCE);
+  const adminBefore = JSON.stringify(
+    sqlite.prepare(`SELECT id, condition_key, dismissed_at, resolved_at FROM system_alerts WHERE source = ? AND username = ?`).all(SOURCE, ADMIN),
+  );
+  await refreshVerseMergeAlertsAfterLockChange(env, BOOK);
+  const m = live(EDITOR)[0]?.message ?? "";
+  assert(/tonight's export/.test(m), `the editor's alert is re-worded for the unlocked book and stands again (got: ${m})`);
+  assert(
+    JSON.stringify(
+      sqlite.prepare(`SELECT id, condition_key, dismissed_at, resolved_at FROM system_alerts WHERE source = ? AND username = ?`).all(SOURCE, ADMIN),
+    ) === adminBefore,
+    "the admin's matching dismissed alert is untouched",
+  );
 }
 
 if (failed) {
