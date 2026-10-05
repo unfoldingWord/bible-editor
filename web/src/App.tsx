@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { PinnedLexHost } from "./components/PinnedLexBox";
 import { Alert, Box, Button, CircularProgress, Link, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
@@ -266,8 +266,19 @@ export function App() {
   // Shell; used to clear the alert for a reply the user is already reading
   // (and to skip its toast), so the bell never nags about a thread in view.
   const viewedThreadIdsRef = useRef<Set<number>>(new Set());
+  // Latest alerts for handleThreadsViewed, which reads them through this ref
+  // so its identity stays stable: Shell's effect that reports the viewed
+  // threads lists onCommentThreadsViewed in its deps, so a callback keyed on
+  // `alerts` would re-run that effect on every alert refresh. Written in a
+  // layout effect, not during render, so a render React throws away
+  // (StrictMode's dev replay) never leaves it holding uncommitted alerts. Its
+  // only reader is that Shell effect, a passive effect, and every layout
+  // effect in a commit finishes before any passive one starts, so the reader
+  // still sees this commit's alerts.
   const alertsRef = useRef<SystemAlert[]>(alerts);
-  alertsRef.current = alerts;
+  useLayoutEffect(() => {
+    alertsRef.current = alerts;
+  });
   // Each alert gets ONE automatic dismiss. Without this, a failing dismiss
   // POST would refetch, find the alert still there, and dismiss again — a
   // request loop for as long as the thread stayed open.

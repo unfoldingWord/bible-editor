@@ -191,8 +191,17 @@ export function BookView({
   const previousScrollNonce = useRef(scrollNonce);
   const firstLayoutRef = useRef(true);
   const restoredTargetRef = useRef<string | null>(null);
+  // Lets selectLocalVerse keep one identity for the memoized cells. This
+  // component's onSelectVerse is Shell's onSelectBookVerse, an inline arrow
+  // that ScriptureColumn forwards, so it is new every render;
+  // activeChapter / activeVerse change only on navigation. Written in a layout
+  // effect, not during render, so a render React throws away (StrictMode's dev
+  // replay) never leaves it holding uncommitted values. Its reader runs from a
+  // cell's click handler, which always comes after the commit's layout effects.
   const selectionContextRef = useRef({ activeChapter, activeVerse, onSelectVerse });
-  selectionContextRef.current = { activeChapter, activeVerse, onSelectVerse };
+  useLayoutEffect(() => {
+    selectionContextRef.current = { activeChapter, activeVerse, onSelectVerse };
+  });
   const selectLocalVerse = useCallback((chapter: number, verse: number) => {
     const current = selectionContextRef.current;
     const container = containerRef.current;
@@ -212,8 +221,18 @@ export function BookView({
   // see the scroll effect below.
   const [scrollPending, setScrollPending] = useState(false);
 
+  // The observer below is created once (its effect is keyed on the stable
+  // chapterObserver), so its callback reads onLoadChapter through this ref.
+  // onLoadChapter is useBook's loadChapter, which changes only with the book
+  // or `enabled`; the ref keeps the observer from calling a stale one after
+  // that. Written in a layout effect, not during render, so a render React
+  // throws away (StrictMode's dev replay) never leaves it holding an
+  // uncommitted value. Its reader is the IntersectionObserver callback, which
+  // the browser runs asynchronously, after any commit.
   const onLoadChapterRef = useRef(onLoadChapter);
-  onLoadChapterRef.current = onLoadChapter;
+  useLayoutEffect(() => {
+    onLoadChapterRef.current = onLoadChapter;
+  });
   const observerRef = useRef<IntersectionObserver | null>(null);
   const sentinelTargetsRef = useRef(new Map<Element, number>());
   const chapterObserver = useMemo<ChapterObserver>(() => ({
@@ -1343,8 +1362,13 @@ const VerseCell = memo(function VerseCell({
   // Latest `isActive` for the native `beforeinput` guard below. The listener is
   // attached per element, not per render, so reading `isActive` straight out of
   // the closure that defined it would pin whatever value that render saw.
+  // Written in a layout effect, not during render, so a render React throws
+  // away (StrictMode's dev replay) never leaves it holding an uncommitted
+  // value; the listener only fires on user input, after the commit.
   const isActiveRef = useRef(isActive);
-  isActiveRef.current = isActive;
+  useLayoutEffect(() => {
+    isActiveRef.current = isActive;
+  });
 
   // Refuse input on a verse that is not (yet) the active one. The span stays
   // contentEditable regardless of `isActive` (see the comment on it below), so
