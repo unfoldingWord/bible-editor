@@ -324,14 +324,12 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
        THEN verse_merge_conflicts.reason
        ELSE excluded.reason
      END,
-     -- KNOWN NARROWER FOLLOW-ON (flagged, deliberately not fixed here): this
-     -- keeps the EARLIEST overwritten_version pointer, including across a
-     -- resolve -> new-conflict cycle on the SAME verse. So a row resolved on
-     -- night 1 (pointer -> v2) that gets a genuinely NEW, distinct overwrite
-     -- confirmed on night 30 can still show the OLD v2 pointer rather than
-     -- night 30's real overwrite, if v2 was never cleared. Only relevant
-     -- across a resolve -> new-conflict cycle on the SAME verse — worth a
-     -- follow-up if that combination turns out to matter in practice.
+     -- This keeps the EARLIEST overwritten_version pointer while the row is
+     -- still waiting for a human: their first lost text is what they have not
+     -- looked at yet. A RESOLVED row also keeps its old pointer here, because
+     -- this upsert is speculative and its CAS may still lose. If the overwrite
+     -- lands, CONFIRM_ADOPTED_CONFLICT_SQL below swaps in tonight's pointer as
+     -- it reactivates the row (issue #1112).
      overwritten_version = CASE
        -- Same unresolved-adopt_conflict carve-out as action above: the row
        -- stays an adopt_conflict, so its recovery pointer stays with it.
@@ -443,10 +441,22 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
 // against the row as it was before the UPDATE, so the CASE sees the old
 // resolved_at even though the same statement clears it.
 //
-// Binds, in order: (book, resource, chapter, verse, now).
+// Issue #1112: the same reactivation also takes tonight's overwritten_version
+// (?6) and alignment snapshot (?7). The speculative upsert's COALESCE kept the
+// resolved row's old pointer (June's v4), and the editor alert goes to the
+// author of the version the pointer names, so keeping it told v4's author to
+// recover v4 and never alerted the author of tonight's overwritten v11. June's
+// lost-word snapshot likewise describes a loss someone already dealt with, so
+// ?7 replaces it even when tonight's is NULL. A row still unresolved keeps its
+// first pointer and snapshot, as it keeps its detected_at.
+//
+// Binds, in order: (book, resource, chapter, verse, now, overwrittenVersion,
+// alignmentJson).
 // ---------------------------------------------------------------------------
 export const CONFIRM_ADOPTED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
     SET detected_at = CASE WHEN resolved_at IS NULL THEN detected_at ELSE ?5 END,
+        overwritten_version = CASE WHEN resolved_at IS NULL THEN overwritten_version ELSE ?6 END,
+        alignment = CASE WHEN resolved_at IS NULL THEN alignment ELSE ?7 END,
         resolved_at = NULL, resolved_by = NULL
   WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
     AND action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')`;

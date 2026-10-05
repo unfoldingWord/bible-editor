@@ -8273,7 +8273,7 @@ async function applyVerseRows(
   // inserted unresolved.
   const confirmRefs = mergeConflicts
     .filter((mc) => mc.adopted && mc.action === "adopt_conflict" && adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
-    .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
+    .map((mc) => ({ chapter: mc.chapter, verse: mc.verse, overwrittenVersion: mc.overwrittenVersion, alignment: mc.alignment }));
   if (confirmRefs.length > 0) {
     await confirmAdoptedConflicts(env, book, resource, confirmRefs, now);
   }
@@ -8323,7 +8323,7 @@ async function applyVerseRows(
     .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
   if (lostAdoptionRefs.length > 0) {
     // Same `now` passed to step 6b's recordVerseMergeConflicts call above —
-    // required for deleteLostAdoptionConflicts's detected_at-based scoping to
+    // required for deleteLostAdoptionConflicts's last_recorded_at-based scoping to
     // correctly identify only THIS run's own speculative rows (see that
     // function's doc comment).
     await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs, now);

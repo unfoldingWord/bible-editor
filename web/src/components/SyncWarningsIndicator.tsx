@@ -115,8 +115,9 @@ export function SyncWarningsIndicator({ alerts, onDismiss }: Props) {
                 "flagged" would assert a freshness this column cannot support —
                 worse than no date, because it is confidently wrong.
                 The durable per-verse first-seen date is
-                verse_merge_conflicts.detected_at, deliberately never reset, which
-                no endpoint selects for display yet — issue #624.
+                verse_merge_conflicts.detected_at (kept across re-detections while
+                unresolved, reset only when a resolved row is reactivated by a new
+                overwrite, #996), which no endpoint selects for display yet — issue #624.
                 Tooltip + <time dateTime>, not a bare `title`: `title` on static
                 text is unreachable by keyboard and touch and is announced
                 inconsistently by screen readers, and the absolute stamp is

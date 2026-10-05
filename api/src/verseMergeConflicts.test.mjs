@@ -998,8 +998,8 @@ function upsertConflict(
     .run(book, resource, chapter, verse, action, reason, overwrittenVersion, null, now, bibleVersion, observedVersion);
 }
 
-function confirmAdopted(d, { book, resource, chapter, verse, now }) {
-  return d.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).run(book, resource, chapter, verse, now);
+function confirmAdopted(d, { book, resource, chapter, verse, now, overwrittenVersion = null, alignment = null }) {
+  return d.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).run(book, resource, chapter, verse, now, overwrittenVersion, alignment);
 }
 
 {
@@ -1075,7 +1075,7 @@ function confirmAdopted(d, { book, resource, chapter, verse, now }) {
 
   // Tonight's CAS attempt LANDS — confirmAdoptedConflicts is called for
   // exactly this ref (bookReimport.ts's landedAdoptions).
-  confirmAdopted(d, { book: "ZEC", resource: "ult", chapter: 6, verse: 2, now: tonight });
+  confirmAdopted(d, { book: "ZEC", resource: "ult", chapter: 6, verse: 2, now: tonight, overwrittenVersion: 9 });
 
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=6 AND verse=2`).get();
   assert(row.resolved_at === null, "CONFIRMED landed adoption -> resolved_at cleared, genuinely active");
@@ -1085,11 +1085,10 @@ function confirmAdopted(d, { book, resource, chapter, verse, now }) {
     .get().c;
   assert(activeCount === 1, "now visible to the same query the banner and GET route use");
 
-  // Documented, deliberately NOT fixed here (unchanged from the six-angle
-  // review): the pre-existing "keep the EARLIEST pointer" COALESCE means
-  // overwritten_version still shows the OLD (v2) pointer, not tonight's real
-  // v9 overwrite. Pinned so a future change to the CASE logic is deliberate.
-  assert(row.overwritten_version === 2, "documented limitation: overwritten_version still shows the OLD pointer (v2), not v9");
+  // Issue #1112 (this used to pin the old pointer as a known limitation): the
+  // confirm that reactivates a RESOLVED row takes tonight's real overwrite
+  // (v9), not the resolved v2 pointer.
+  assert(row.overwritten_version === 9, `reactivated row points at tonight's overwrite (v9), not the resolved v2 (got v${row.overwritten_version})`);
 }
 
 {
@@ -2877,6 +2876,9 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
   {
     const { sqlite, env } = migratedEnv();
     authored(sqlite, 4, 20, 4);
+    // bcameron93 also wrote v11, tonight's overwritten version, so the alert is
+    // theirs (since #1112 the reactivated row points at v11, not June's v4).
+    authored(sqlite, 4, 20, 11);
     await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 20, 4)], JUN10);
     humanResolve(sqlite, 4, 20, JUN10 + 86400);
     // Tonight: the speculative upsert, the CAS lands, the confirm reactivates.
