@@ -19,7 +19,8 @@ import {
   type TwlOrderLock,
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
-import { onOutboxResult } from "../sync/outbox";
+import { onOutboxResult, outbox } from "../sync/outbox";
+import { hidingPendingRowDeletes } from "../sync/pendingRowDeletes";
 import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
 import { currentRouteFetcher, isChapterLocked, trackNavigation, updateIfCurrent, type ChapterRoute, type NavigationGen } from "../lib/chapterStale";
 import {
@@ -213,9 +214,16 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     // `refetch` captured on an earlier chapter (a "Refresh" toast, the
     // post-unlock refetch) fetches the current chapter instead of replacing
     // its GET with the old one and leaving the view locked (#892).
+    //
+    // A row whose own tq/twl DELETE is still draining in the outbox is left
+    // out of whatever lands (#1107): the GET can be answered before the
+    // DELETE commits (offline, then the reconnect GET races the drain).
     const fetchRoute = currentRouteFetcher(routeRef, (b, c, s) => api.getChapter(b, c, s));
     return sequencer.current!.refetch(
-      (signal, onAttempt) => fetchWithRetry(fetchRoute, { signal, onAttempt }),
+      hidingPendingRowDeletes(
+        (signal, onAttempt) => fetchWithRetry(fetchRoute, { signal, onAttempt }),
+        () => outbox.list(),
+      ),
       opts?.keepNewerLocal === true,
     );
   }, []);
