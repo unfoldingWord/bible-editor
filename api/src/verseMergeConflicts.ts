@@ -1136,14 +1136,6 @@ export async function raiseVerseMergeConflictAlert(
     username === ALERT_USERNAME
       ? { depends: hasNoBase || hasKept, locked: noBaseLockedWording || keptLockedWording }
       : { depends: perEditorNoBase.has(username), locked: noBaseLockedWording && perEditorNoBase.has(username) };
-  const storedLockedWording = (username: string, key: string | null): boolean => {
-    const state = (
-      username === ALERT_USERNAME
-        ? reviewConditionState(key, "verse_merge_conflict", { book, resource })
-        : reviewConditionState(key, "verse_merge_conflict_editor", { book, resource, username })
-    ) as { noBaseBookLocked?: unknown; keptBookLocked?: unknown } | undefined;
-    return state?.noBaseBookLocked === true || state?.keptBookLocked === true;
-  };
 
   try {
     // #1129: a lock refresh rebuilds from the live rows, which a save can have
@@ -1165,7 +1157,9 @@ export async function raiseVerseMergeConflictAlert(
         const row = latest.get(username);
         if (row?.dismissed_at == null) continue;
         const want = lockWordingFor(username);
-        if (!want.depends || want.locked === storedLockedWording(username, row.condition_key)) keepDismissed.add(username);
+        if (!want.depends || want.locked === storedLockWording(book, resource, username, row.condition_key)) {
+          keepDismissed.add(username);
+        }
       }
     }
     for (const [username, msg] of desired) {
@@ -1213,6 +1207,23 @@ function rowWordingDependsOnLock(r: { action: string; overwrittenVersion: number
   );
 }
 
+// #1129: whether a stored verse-merge alert key says its alert uses the locked
+// wording. The raise adds a lock flag to the key whenever it does. An editor's
+// key carries only noBaseBookLocked (verseMergeEditorConditionKey); kept rows
+// never reach an editor's alert, so a keptBookLocked there is ignored.
+function storedLockWording(book: string, resource: string, username: string, key: string | null): boolean {
+  if (username === ALERT_USERNAME) {
+    const state = reviewConditionState(key, "verse_merge_conflict", { book, resource }) as
+      | { noBaseBookLocked?: unknown; keptBookLocked?: unknown }
+      | undefined;
+    return state?.noBaseBookLocked === true || state?.keptBookLocked === true;
+  }
+  const state = reviewConditionState(key, "verse_merge_conflict_editor", { book, resource, username }) as
+    | { noBaseBookLocked?: unknown }
+    | undefined;
+  return state?.noBaseBookLocked === true;
+}
+
 // Issue #1110: re-derive a book's standing verse-merge alerts when an admin
 // locks or unlocks it (bookImport.ts's PUT/DELETE /:book/lock). The lock used
 // to be read only when a reimport raised the alert, and a reimport returns
@@ -1252,13 +1263,17 @@ const LOCK_REFRESH_MAX_PASSES = 4;
 
 export async function refreshVerseMergeAlertsAfterLockChange(env: Env, book: string): Promise<void> {
   for (const resource of ["ult", "ust"]) {
-    const lockReads: boolean[] = [];
+    // Every lock read this refresh made, a failed one as "failed", so the cap
+    // warning can say whether the lock changed, could not be read, or was
+    // never read (#1129 review A2).
+    const lockReads: Array<boolean | "failed"> = [];
     const lockedNow = async (): Promise<boolean> => {
       try {
         const locked = (await effectiveBookLock(env, book)) != null;
         lockReads.push(locked);
         return locked;
       } catch (e) {
+        lockReads.push("failed");
         // The raise's own fallback: the wording that asks someone to act.
         console.error("verseMergeConflicts: lock read failed; using the unlocked wording", {
           book,
@@ -1273,16 +1288,15 @@ export async function refreshVerseMergeAlertsAfterLockChange(env: Env, book: str
       for (let pass = 0; pass < LOCK_REFRESH_MAX_PASSES && !settled; pass++) {
         settled = !(await rewordVerseMergeAlertForLock(env, book, resource, lockedNow));
       }
-      if (!settled && new Set(lockReads).size > 1) {
-        console.warn("verseMergeConflicts: the lock kept changing during the alert refresh; left for the next change", {
-          book,
-          resource,
-        });
-      } else if (!settled) {
-        console.warn(
-          "verseMergeConflicts: the alert's rows kept changing during the alert refresh (saves or a reimport; the lock read the same each time); left for the next sync",
-          { book, resource },
-        );
+      if (!settled) {
+        const why = lockReads.includes("failed")
+          ? "the lock could not be read during the alert refresh, so the wording may not match it"
+          : new Set(lockReads).size > 1
+            ? "the lock kept changing during the alert refresh"
+            : lockReads.length === 0
+              ? "the alert's rows kept changing during the alert refresh (saves or a reimport; the lock was not read, since nothing in the alert depends on it)"
+              : "the alert's rows kept changing during the alert refresh (saves or a reimport; the lock read the same each time)";
+        console.warn(`verseMergeConflicts: ${why}; left for the next change`, { book, resource });
       }
     } catch (e) {
       console.error("verseMergeConflicts: lock-change alert refresh failed", {
@@ -1344,11 +1358,6 @@ async function rewordVerseMergeAlertForLock(
     console.warn("verseMergeConflicts: lock change left an alert it cannot re-derive", { book, resource });
     return false;
   }
-  // One lock read per pass, shared with the raise (#1129): the raise reads it
-  // only if its own rows carry a lock-dependent sentence, so a row a reimport
-  // recorded after the read below still gets the wording for the lock.
-  let lockRead: Promise<boolean> | undefined;
-  const locked = (): Promise<boolean> => (lockRead ??= lockedNow());
   // Whether the alert would carry a lock-dependent sentence if raised now,
   // judged from the LIVE rows (#1118 item 2). The stored rows are not a safe
   // stand-in: a save can resolve a row during the day, and a chunked reimport
@@ -1363,9 +1372,6 @@ async function rewordVerseMergeAlertForLock(
     (live.results ?? []).some((r) =>
       rowWordingDependsOnLock({ action: r.action, overwrittenVersion: r.overwritten_version }),
     );
-  // The raise puts a lock flag in the key whenever it used the locked wording
-  // for a sentence, so the stored key says which wording stands.
-  const wordedLocked = state.noBaseBookLocked === true || state.keptBookLocked === true;
   // #1110 round 2, #1118 item 2: a re-raise rebuilds the alert from the live
   // rows, so once rows were resolved since the last reimport it mints a new
   // key. For a DISMISSED alert that brings back what people dismissed, so it
@@ -1374,23 +1380,22 @@ async function rewordVerseMergeAlertForLock(
   // is always rebuilt from the live rows, as before #1118: it then stops
   // listing rows a save resolved, and stops naming a lock that is gone. An
   // identical rebuild leaves the stored key as it was, which ends the refresh.
-  // #1129 item 4: the admin's row alone does not decide this. An undismissed
-  // editor alert is rebuilt too, and the raise keeps each dismissed alert
-  // whose own lock wording would not change.
-  if (
-    standing.dismissed_at != null &&
-    before.every((r) => r.dismissed_at != null) &&
-    (!dependsOnLock || (await locked()) === wordedLocked)
-  ) {
-    return false;
-  }
+  // #1129: the raise makes that call per recipient (lockRefresh). This only
+  // skips the raise when every standing alert is dismissed and nothing depends
+  // on the lock: an editor's wording depends on it only through no-base
+  // verses, which make the admin's depend on it too, so the raise would keep
+  // them all. Whether a dismissed editor's wording matches the lock needs the
+  // editor lookup, so that is left to the raise (#1129 review A1).
+  if (before.every((r) => r.dismissed_at != null) && !dependsOnLock) return false;
   const ordered = [...noBase].sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
   await raiseVerseMergeConflictAlert(env, book, resource, {
     recordingFailed: false,
     noBaseCount: state.noBaseCount,
     noBaseRefs: ordered.map((r) => `${r.chapter}:${r.verse}`),
     noBaseEditorRefs: ordered.map((r) => ({ chapter: r.chapter, verse: r.verse, version: r.version })),
-    bookLocked: locked,
+    // #1129: the raise reads the lock itself, once, and only if the rows it
+    // read carry a lock-dependent sentence, so the wording matches those rows.
+    bookLocked: lockedNow,
     observedAt: standing.condition_observed_at,
     lockRefresh: true,
   });
