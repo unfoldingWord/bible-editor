@@ -514,11 +514,6 @@ export interface ReimportCounts {
   // still bounded so a pathological book can't blow up a Workflow step's
   // serialized return value. verses only.
   merge_no_base_editor_refs?: NoBaseVerseRef[];
-  // Issue #1006: the book was locked (applyVerseRows' bookLocked) when at least
-  // one merge_no_base verse was kept. The export skips a locked book, so the
-  // no-base alert wording must not warn that tonight's export will overwrite
-  // anything. verses only.
-  merge_no_base_book_locked?: boolean;
   // Reference-move attribution (issue #540 item 3), split by WHO moved so a run
   // summary can distinguish "we published a move" from "master moved under us".
   // Only ref_moved_theirs / _both / _unattributable / _ours_conflict withhold the
@@ -825,7 +820,6 @@ function zeroCounts(): ReimportCounts {
     merge_no_base_cleared: 0,
     merge_no_base_refs: [],
     merge_no_base_editor_refs: [],
-    merge_no_base_book_locked: false,
     ref_moved_ours: 0,
     ref_moved_ours_conflict: 0,
     ref_moved_theirs: 0,
@@ -968,7 +962,9 @@ export const planAndStageBookResourcesForTest = (
   resources: Resource[],
   instanceId: string,
   staleBaseOverrideResource?: Resource,
-): Promise<ReimportPlan> => planAndStageBookResources(env, book, resources, instanceId, staleBaseOverrideResource);
+  lockOverrideResource?: Resource,
+): Promise<ReimportPlan> =>
+  planAndStageBookResources(env, book, resources, instanceId, staleBaseOverrideResource, undefined, lockOverrideResource);
 
 export const persistMasterLineageForTest = (
   env: Env,
@@ -1064,8 +1060,6 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_no_base += from.merge_no_base ?? 0;
   into.merge_no_base_mint_skipped += from.merge_no_base_mint_skipped ?? 0;
   into.merge_no_base_cleared += from.merge_no_base_cleared ?? 0;
-  // OR across chunks: the lock is one fact per book for this run's alert.
-  if (from.merge_no_base_book_locked) into.merge_no_base_book_locked = true;
   // Same shape as blocked_samples above: diagnostic, capped, gates nothing. A
   // chunk memoized before this field existed contributes no refs while still
   // contributing its count, which is why the banner reports the count as
@@ -1656,7 +1650,7 @@ async function runReimport(
       recordingFailed: perResource.ult.merge_record_failed === true,
       noBaseCount: perResource.ult.merge_no_base,
       noBaseRefs: perResource.ult.merge_no_base_refs,
-      noBaseBookLocked: await noBaseBookLockedForAlert(env, book, "ult", perResource.ult.merge_no_base_book_locked),
+      bookLocked: () => bookLockedForAlert(env, book, "ult"),
       noBaseEditorRefs: perResource.ult.merge_no_base_editor_refs,
       observedAt: alertObservedAt,
     });
@@ -1666,7 +1660,7 @@ async function runReimport(
       recordingFailed: perResource.ust.merge_record_failed === true,
       noBaseCount: perResource.ust.merge_no_base,
       noBaseRefs: perResource.ust.merge_no_base_refs,
-      noBaseBookLocked: await noBaseBookLockedForAlert(env, book, "ust", perResource.ust.merge_no_base_book_locked),
+      bookLocked: () => bookLockedForAlert(env, book, "ust"),
       noBaseEditorRefs: perResource.ust.merge_no_base_editor_refs,
       observedAt: alertObservedAt,
     });
@@ -7112,9 +7106,6 @@ async function applyVerseRows(
         }
         if (merge.action === "keep_no_base") {
           counts.merge_no_base++;
-          // Issue #1006: the export skips a locked book, so the alert built from
-          // this count must not say tonight's export will overwrite anything.
-          if (bookLocked) counts.merge_no_base_book_locked = true;
           // Name the verse, capped. keep_no_base writes no verse_merge_conflicts
           // row (that table only holds adjudicated outcomes), so without this the
           // banner's own admission — "a Door43-side change to them will still be
@@ -10349,6 +10340,9 @@ async function planAndStageBookResources(
   // written anyway rather than skipped because an operator approved.
   staleBaseOverrideResource?: Resource,
   alertObservedAt = Date.now(),
+  // Issue #1110 review: runChunkedReimport's `lockOverrideResource`, for the
+  // own-publish convergence re-raise below (see bookLockedForAlert).
+  lockOverrideResource?: Resource,
 ): Promise<ReimportPlan> {
   const maxRow = await env.DB
     .prepare(`SELECT MAX(chapter) AS m FROM verses WHERE book = ?1`)
@@ -10510,6 +10504,10 @@ async function planAndStageBookResources(
           noBaseCount: 0,
           noBaseRefs: [],
           noBaseEditorRefs: [],
+          // Issue #1110 review: the rows left standing can still carry
+          // lock-dependent sentences, and on a book whose resources are all
+          // unchanged this is the run's last raise.
+          bookLocked: () => bookLockedForAlert(env, book, resource, lockOverrideResource),
           observedAt: alertObservedAt,
         });
       }
@@ -10936,26 +10934,26 @@ async function reimportStagedChunk(
   return perResource;
 }
 
-// Issue #1006: whether a resource's no-base alert should use the locked-book
-// wording ("the export skips it; ask an admin") instead of "tonight's export
-// will overwrite". True only when the run saw the book locked on a
-// keep_no_base verse, the book is STILL locked as the alert is raised (an
-// unlock part-way through the run means the export will not skip it), and this
-// run is not an admin lock/push for this resource (that run's export pushes D1
-// over Door43). A failed lock read falls back to the overwrite warning, the
-// wording that asks someone to act, and never fails the alert.
-export async function noBaseBookLockedForAlert(
+// Issues #1006 / #1110: whether a resource's verse-merge alert should use the
+// locked-book wording ("the export skips it") instead of "tonight's export
+// will write", for its no-base and kept-row sentences. True only when the book
+// is locked as the alert is raised (an unlock part-way through the run means
+// the export will not skip it), and this run is not an admin lock/push for
+// this resource (that run's export pushes D1 over Door43). A failed lock read
+// falls back to the overwrite warning, the wording that asks someone to act,
+// and never fails the alert. Passed to the alert as a reader, so it costs a D1
+// read only when the alert has a sentence that depends on the lock.
+export async function bookLockedForAlert(
   env: Env,
   book: string,
   resource: Resource,
-  sawLockedNoBase: boolean | undefined,
   lockOverrideResource?: Resource,
 ): Promise<boolean> {
-  if (sawLockedNoBase !== true || lockOverrideResource === resource) return false;
+  if (lockOverrideResource === resource) return false;
   try {
     return (await effectiveBookLock(env, book)) != null;
   } catch (e) {
-    console.error("reimport no-base alert: lock re-read failed; using the unlocked wording", {
+    console.error("reimport merge alert: lock re-read failed; using the unlocked wording", {
       book,
       resource,
       error: e instanceof Error ? e.message : String(e),
@@ -11000,8 +10998,8 @@ export async function runChunkedReimport(
   // isPristineTsv or any pristine-write predicate.
   // `lockOverrideResource` — issue #1006 review: set by exportWorkflow.ts only
   // when this run's export will push this ONE resource of a locked book
-  // (an admin lock/push, allowLocked). It changes only the no-base alert
-  // wording: that export does write D1 over Door43, so the alert must not say
+  // (an admin lock/push, allowLocked). It changes only the verse-merge alert's
+  // lock wording: that export does write D1 over Door43, so the alert must not say
   // the export skips the book.
   opts: {
     chunk?: number;
@@ -11027,7 +11025,16 @@ export async function runChunkedReimport(
   const plan = await step.do(
     `reimport-fetch-${book}`,
     { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-    async () => planAndStageBookResources(env, book, resources, instanceId, opts.staleBaseOverrideResource, alertObservedAt),
+    async () =>
+      planAndStageBookResources(
+        env,
+        book,
+        resources,
+        instanceId,
+        opts.staleBaseOverrideResource,
+        alertObservedAt,
+        opts.lockOverrideResource,
+      ),
   );
 
   // Own-publish recognition already ran inside planAndStageBookResources (it
@@ -11167,13 +11174,7 @@ export async function runChunkedReimport(
         recordingFailed: perResource[e.resource].merge_record_failed === true,
         noBaseCount: perResource[e.resource].merge_no_base,
         noBaseRefs: perResource[e.resource].merge_no_base_refs,
-        noBaseBookLocked: await noBaseBookLockedForAlert(
-          env,
-          book,
-          e.resource,
-          perResource[e.resource].merge_no_base_book_locked,
-          opts.lockOverrideResource,
-        ),
+        bookLocked: () => bookLockedForAlert(env, book, e.resource, opts.lockOverrideResource),
         noBaseEditorRefs: perResource[e.resource].merge_no_base_editor_refs,
         observedAt: alertObservedAt,
       });

@@ -396,7 +396,18 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
 
 export function buildMergeConflictGuidance(
   rows: Array<{ action: string; reason?: string; overwrittenVersion: number | null; chapter?: number; verse?: number }>,
-  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[]; noBaseBookLocked?: boolean } = {},
+  // `bookLocked` (issue #1110): the book is locked, so the export skips it.
+  // It changes only the sentences that would otherwise say an export will
+  // write over Door43 (pointer-less adopt_conflict, keep_alignment_refused,
+  // source_attr_divergent, keep_local_structure); `noBaseBookLocked` does the
+  // same for the no-base sentence (issue #1006).
+  opts: {
+    recordingFailed?: boolean;
+    noBaseCount?: number;
+    noBaseRefs?: string[];
+    noBaseBookLocked?: boolean;
+    bookLocked?: boolean;
+  } = {},
 ): string {
   // #539's no-op guard (bookReimport.ts ~7609-7674) keeps a CONFLICTED adopt
   // whose bytes turned out to already match D1 as an `adopt_conflict` row
@@ -474,17 +485,29 @@ export function buildMergeConflictGuidance(
     noOverwrite > 0
       ? `${noOverwrite} ${noOverwrite === 1 ? "was" : "were"} flagged for review but no app text was replaced` +
         `${noOverwriteRefsClause} — Door43's copy differs from the app's only in the original-language source ` +
-        `attributes on \\zaln-s (x-content / x-lemma); check which side is right before the next export, ` +
-        `because the export will write the app's attributes over Door43's.`
+        `attributes on \\zaln-s (x-content / x-lemma); ` +
+        (opts.bookLocked
+          ? `check which side is right; this book is locked, so the export skips it: Door43 keeps its ` +
+            `attributes until an admin resolves it.`
+          : `check which side is right before the next export, because the export will write the app's ` +
+            `attributes over Door43's.`)
       : "",
+    // Issue #1110: the export skips a locked book, so on one these two must
+    // not say tonight's export will write. The unlocked wording is unchanged.
     keptAlignment > 0
       ? `${keptAlignment} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +
-        `change has NOT been taken, so tonight's export will still write over it until someone resolves it.`
+        (opts.bookLocked
+          ? `change has NOT been taken, and this book is locked, so the export skips it: Door43 keeps its own ` +
+            `version until an admin resolves it.`
+          : `change has NOT been taken, so tonight's export will still write over it until someone resolves it.`)
       : "",
     keptSourceAttr > 0
       ? `${keptSourceAttr} kept D1 because Door43's original-language source fix (the spelling/pointing/morphology ` +
         `on \\zaln-s) could not be placed unambiguously — the same source word repeats in the verse — so Door43's ` +
-        `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`
+        (opts.bookLocked
+          ? `change has NOT been taken, and this book is locked, so the export skips it: Door43 keeps its fix ` +
+            `until an admin resolves it by hand.`
+          : `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`)
       : "",
     // A 'keep_ai_master' sentence sat here until issue #749. It is gone with the
     // action itself: nothing of Door43's was taken, the next export publishes
@@ -495,12 +518,18 @@ export function buildMergeConflictGuidance(
       ? `${keptStructureOther} kept the app's verse grouping (a \\v a-b bridge, or its split) where Door43 now groups ` +
         `the verses differently: either no commit from a Door43 editor's own account was found behind Door43's ` +
         `change, or the two groupings could not be reconciled automatically. Door43's grouping has NOT been ` +
-        `taken, so the next export that runs for this resource writes the app's grouping over it.`
+        (opts.bookLocked
+          ? `taken, and this book is locked, so the export skips it: Door43 keeps its grouping until an admin ` +
+            `resolves it.`
+          : `taken, so the next export that runs for this resource writes the app's grouping over it.`)
       : "",
     keptStructureUnderLocal > 0
       ? `${keptStructureUnderLocal} verse(s) changed on Door43 that a bridge made in the app (not yet exported) ` +
-        `has since absorbed — the next export publishes the bridge, and Door43's change to that verse's own text ` +
-        `will be written over unless it is carried into the bridged verse first.`
+        (opts.bookLocked
+          ? `has since absorbed; this book is locked, so the export skips it: Door43 keeps its own text for ` +
+            `that verse until an admin resolves it.`
+          : `has since absorbed — the next export publishes the bridge, and Door43's change to that verse's own ` +
+            `text will be written over unless it is carried into the bridged verse first.`)
       : "",
     opts.recordingFailed
       ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +

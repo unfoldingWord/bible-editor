@@ -15,7 +15,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { applyVerseRowsForTest, confirmedBasesForCutoffForTest, noBaseBookLockedForAlert } from "./bookReimport.ts";
+import { applyVerseRowsForTest, confirmedBasesForCutoffForTest, bookLockedForAlert } from "./bookReimport.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 import { SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL, UPSERT_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictSql.ts";
 
@@ -552,14 +552,12 @@ console.log("\n[keep_no_base collects an editor ref carrying the verse's CURRENT
     .all(BOOK, 7, 3)[0];
   eq(JSON.parse(row.content_json).verseObjects[0].text, "app's own text", "D1's content is untouched");
   eq(row.version, 5, "D1's version is untouched — nothing was written");
-  eq(counts.merge_no_base_book_locked, false, "unlocked book: the no-base alert is not told the book is locked");
 }
 
-console.log("\n[locked book: keep_no_base records the lock for the alert wording (issue #1006)]");
+console.log("\n[locked book: keep_no_base is still counted (issue #1006)]");
 {
-  // Same no-ancestor verse as above, on a LOCKED book. The export skips a
-  // locked book, so the alert built from these counts must not warn that
-  // tonight's export will overwrite anything; the counts carry that fact.
+  // Same no-ancestor verse as above, on a LOCKED book. The alert's locked
+  // wording is decided when it is raised (bookLockedForAlert, below).
   const { env, sqlite } = freshEnv();
   sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, NULL)`).run(BOOK);
   sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 900, 'translator9')`).run();
@@ -576,10 +574,9 @@ console.log("\n[locked book: keep_no_base records the lock for the alert wording
   );
 
   eq(counts.merge_no_base, 1, "locked book: still keep_no_base (no ancestor, ours != theirs)");
-  eq(counts.merge_no_base_book_locked, true, "locked book: the counts record the lock for the alert wording");
 }
 
-console.log("\n[no-base alert lock wording: decided at raise time, false for a lock/push run (issue #1006 review)]");
+console.log("\n[merge alert lock wording: decided at raise time, false for a lock/push run (issues #1006, #1110)]");
 {
   // A1: an admin lock/push (allowLocked, one book + one resource) runs the
   // pre-export reimport on the locked book and then DOES push D1 over Door43,
@@ -589,18 +586,16 @@ console.log("\n[no-base alert lock wording: decided at raise time, false for a l
   // raised.
   const { env, sqlite } = freshEnv();
   sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 1, 100, NULL)`).run(BOOK);
-  eq(await noBaseBookLockedForAlert(env, BOOK, "ult", true), true, "locked now, locked during the run: locked wording");
-  eq(await noBaseBookLockedForAlert(env, BOOK, "ult", false), false, "no locked keep_no_base verse in the run: unlocked wording");
-  eq(await noBaseBookLockedForAlert(env, BOOK, "ult", undefined), false, "a chunk memoized before the field existed: unlocked wording");
-  eq(await noBaseBookLockedForAlert(env, BOOK, "ult", true, "ult"), false,
+  eq(await bookLockedForAlert(env, BOOK, "ult"), true, "locked as the alert is raised: locked wording");
+  eq(await bookLockedForAlert(env, BOOK, "ult", "ult"), false,
     "lock/push run for this resource: the export WILL push, so unlocked (overwrite) wording");
-  eq(await noBaseBookLockedForAlert(env, BOOK, "ust", true, "ult"), true,
+  eq(await bookLockedForAlert(env, BOOK, "ust", "ult"), true,
     "a lock/push override for another resource does not apply to this one");
   sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, 0, 200, NULL)`).run(BOOK);
-  eq(await noBaseBookLockedForAlert(env, BOOK, "ult", true), false,
+  eq(await bookLockedForAlert(env, BOOK, "ult"), false,
     "unlocked part-way through the run: the export will not skip it, so unlocked wording");
   const failing = { DB: { prepare() { throw new Error("simulated D1 outage"); } } };
-  eq(await noBaseBookLockedForAlert(failing, BOOK, "ult", true), false,
+  eq(await bookLockedForAlert(failing, BOOK, "ult"), false,
     "a failed lock read falls back to the unlocked (warning) wording rather than failing the alert");
 }
 
