@@ -256,13 +256,13 @@ rows.post("/:kind", requireEditor, async (c) => {
   // Every read-only pre-check in ONE D1 round trip (issue #905): the book lock,
   // the chapter probe, the chapter's AI-pipeline jobs and, when the client sent
   // no sort_order, the verse's current max. Each verdict is still evaluated
-  // below in its original order. The lock is read for the same book
-  // bookLockGuard would have read (`?book=` first, else the body's), because
-  // the guard defers this route to here (isSelfLockCheckedRoute).
-  const lockBook = c.req.query("book") || (data.book as string);
+  // below in its original order. bookLockGuard defers this route to here
+  // (isSelfLockCheckedRoute). The lock is read for the book the row is written
+  // to: the guard read `?book=` ahead of the body's book, so a request whose
+  // query named another book could insert into a locked one.
   const needsSortOrder = data.sort_order == null;
   const [lockRes, chapterRes, pipelinesRes, maxSortRes] = await c.env.DB.batch([
-    bookLockStatement(c.env.DB, lockBook),
+    bookLockStatement(c.env.DB, data.book as string),
     c.env.DB.prepare(CHAPTER_EXISTS_SQL).bind(data.book, data.chapter),
     activePipelinesStatement(c.env.DB, data.book as string, data.chapter as number),
     ...(needsSortOrder
@@ -276,7 +276,7 @@ rows.post("/:kind", requireEditor, async (c) => {
         ]
       : []),
   ]);
-  const bookLock = evaluateBookLock(lockBook, lockRes.results?.[0] as BookLockRow | undefined);
+  const bookLock = evaluateBookLock(data.book as string, lockRes.results?.[0] as BookLockRow | undefined);
   if (bookLock) return c.json(bookLockedResponseBody(bookLock), BOOK_LOCKED_STATUS);
 
   if (!chapterRes.results?.length) return c.json({ error: "not_found", reason: "unknown_chapter" }, 404);

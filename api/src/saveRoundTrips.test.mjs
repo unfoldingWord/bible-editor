@@ -451,6 +451,9 @@ console.log("\n[book lock: 423 before any write, on every hot route; guard still
   const cr = await req("POST", `/api/rows/tn`, { book: BOOK, chapter: 1, verse: 1, ref_raw: "1:1", note: "x" });
   eq([cr.status, cr.json], [423, body423], "row create -> 423");
   eq(mutating(cr.sql), false, "row create issued no mutating statement");
+  const crQuery = await req("POST", `/api/rows/tn?book=XYZ`, { book: BOOK, chapter: 1, verse: 1, ref_raw: "1:1", note: "x" });
+  eq(crQuery.status, 423, "row create checks the lock of the book it writes, not a ?book= naming another book");
+  eq(mutating(crQuery.sql), false, "that create issued no mutating statement");
 
   const vbody = { content: { verseObjects: [{ type: "text", text: "x" }] }, plain_text: "x" };
   const vp = await req("PATCH", `/api/verses/${BOOK}/1/1/ULT`, vbody, 3);
