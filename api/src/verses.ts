@@ -3,7 +3,14 @@ import { z } from "zod";
 import type { Env } from "./index";
 import type { VerseDto, VerseRow } from "./types";
 import { currentUserId, requireEditor } from "./auth";
-import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
+import {
+  activePipelineForChapter,
+  activePipelinesStatement,
+  lockedResponseBody,
+  pickActivePipeline,
+  type ActivePipelineRow,
+} from "./chapterLock";
+import { bookLockStatement, evaluateBookLock, bookLockedResponseBody, BOOK_LOCKED_STATUS, type BookLockRow } from "./bookLock";
 import { broadcastChapter } from "./wsEvents";
 import { recomputeTargetOccurrences } from "./importParsers";
 import {
@@ -247,6 +254,23 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   if (!Number.isFinite(chapter) || !Number.isFinite(verse)) {
     return c.json({ error: "invalid_params" }, 400);
   }
+
+  // Every read-only pre-check in ONE D1 round trip (issue #905): the book lock,
+  // the chapter's AI-pipeline jobs, and the existing verse row. bookLockGuard
+  // defers this route to here (isSelfLockCheckedRoute), so the 423 is answered
+  // first, ahead of the If-Match and body checks exactly as the guard did, and
+  // before any write. The pipeline and existing-row verdicts are still
+  // evaluated below at their original points.
+  const [lockRes, pipelinesRes, existingRes] = await c.env.DB.batch([
+    bookLockStatement(c.env.DB, book),
+    activePipelinesStatement(c.env.DB, book, chapter),
+    c.env.DB
+      .prepare(`SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`)
+      .bind(book, chapter, verse, bibleVersion),
+  ]);
+  const bookLock = evaluateBookLock(book, lockRes.results?.[0] as BookLockRow | undefined);
+  if (bookLock) return c.json(bookLockedResponseBody(bookLock), BOOK_LOCKED_STATUS);
+
   const expected = parseIfMatch(c.req.header("if-match"));
   if (expected === null) {
     return c.json({ error: "if_match_required" }, 428);
@@ -281,7 +305,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   // Its auto-apply step overwrites verse content on completion; concurrent
   // edits would race with it and silently lose to the AI result. Notes and
   // questions runs never write verses, so they don't lock this.
-  const lock = await activePipelineForChapter(c.env, book, chapter, "verse");
+  const lock = pickActivePipeline((pipelinesRes.results ?? []) as ActivePipelineRow[], chapter, "verse");
   if (lock) return c.json(lockedResponseBody(lock), 409);
 
   // Self-heal the occurrence numbering before it lands in D1 (and therefore in
@@ -289,11 +313,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   // were rejected above. Mutates parsed.data.content.verseObjects in place.
   normalizeOccurrences(parsed.data.content);
 
-  const existing = await c.env.DB.prepare(
-    `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
-  )
-    .bind(book, chapter, verse, bibleVersion)
-    .first<VerseRow>();
+  const existing = (existingRes.results?.[0] as VerseRow | undefined) ?? null;
 
   // Create the chapter-intro row on first write (#379). A chapter's opening
   // paragraph marker lives BEFORE `\v 1`, so it is stored on the chapter-front
@@ -459,9 +479,15 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   // plain_text uses COALESCE so an omitted field keeps the stored value
   // instead of nulling the column (null here means "absent" — current
   // callers always send it).
+  //
+  // The UPDATE carries RETURNING * (issue #905), which hands back the row
+  // exactly as the old post-write `SELECT * FROM verses` re-read did, without
+  // that round trip. It changes nothing about the CAS: the WHERE is still
+  // VERSE_PATCH_UPDATE_SQL's `version = expected`, and the two statements after
+  // it still chain off its changes(). Success is read off the returned row.
   const [updateRes, , resolveRes] = await c.env.DB.batch([
     c.env.DB
-      .prepare(VERSE_PATCH_UPDATE_SQL)
+      .prepare(`${VERSE_PATCH_UPDATE_SQL}\n RETURNING *`)
       .bind(
         JSON.stringify(parsed.data.content),
         parsed.data.plain_text ?? null,
@@ -533,7 +559,8 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
       .bind(now, userId, book, bibleVersion.toLowerCase(), chapter, verse),
   ]);
 
-  if (!updateRes.meta.changes) {
+  const updated = (updateRes.results?.[0] as VerseRow | undefined) ?? null;
+  if (!updated) {
     const fresh = await c.env.DB.prepare(
       `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
     )
@@ -556,11 +583,6 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     );
   }
 
-  const updated = await c.env.DB.prepare(
-    `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
-  )
-    .bind(book, chapter, verse, bibleVersion)
-    .first<VerseRow>();
   let updatedParsed: unknown = null;
   try {
     if (updated) updatedParsed = parseVerseContentJson(updated);
