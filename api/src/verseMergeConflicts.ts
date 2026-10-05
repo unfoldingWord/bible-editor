@@ -140,7 +140,11 @@ export interface VerseMergeConflictRow {
    * `verse_merge_conflicts.detected_at` — the durable "first flagged" date
    * (issue #624), preserved across re-detections of the SAME still-unresolved
    * conflict by the upsert's ON CONFLICT DO UPDATE (see that statement's doc
-   * comment). Optional: only populated on the ALERT READ path
+   * comment). It is reset to the run's timestamp in exactly two cases: a
+   * resolved row reactivated by a landed overwrite (CONFIRM_ADOPTED_CONFLICT_SQL,
+   * issue #996), and an unresolved audit-only row ('adopt' /
+   * 'adopt_no_visible_change') promoted to adopt_conflict (the upsert, issue
+   * #1124). Both start a new streak nobody has been alerted about. Optional: only populated on the ALERT READ path
    * (raiseVerseMergeConflictAlert), where it comes back from D1. It is not
    * read off THIS field on the write path: recordVerseMergeConflicts binds the
    * run's own timestamp into detected_at itself (`?9` in
@@ -163,8 +167,9 @@ const WRITE_BATCH = 90;
 // REPLACE: a REPLACE deletes-then-reinserts, which mints a new `id` and resets
 // `detected_at` on every re-detection of the SAME still-unresolved conflict —
 // making "how long has this been sitting unresolved" unrecoverable. The
-// DO UPDATE preserves the original `detected_at` (it's simply not in the SET
-// list). It does NOT blindly refresh the other columns to this run's values —
+// DO UPDATE preserves the original `detected_at` (its SET keeps the stored
+// value, except for an unresolved audit-only row promoted to adopt_conflict,
+// issue #1124). It does NOT blindly refresh the other columns to this run's values —
 // see the CASE expressions below, which refuse to downgrade a row still
 // awaiting human judgement and keep `overwritten_version` consistent with the
 // surviving action.
@@ -1294,7 +1299,9 @@ verseMergeConflicts.get("/:book", async (c) => {
       overwrittenVersion: r.overwritten_version,
       alignment,
       // Issue #624: the durable "first flagged" date (never reset by
-      // re-detection of the same still-unresolved conflict — see
+      // re-detection of the same still-unresolved conflict; reset only when a
+      // resolved row is reactivated (#996) or an unresolved audit-only row is
+      // promoted to adopt_conflict (#1124) — see
       // VerseMergeConflictRow.detectedAt's doc comment), so the in-app
       // merge-review banner can show it per verse without a prod D1 query.
       detectedAt: r.detected_at,
