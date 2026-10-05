@@ -24,7 +24,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildBookLintReport, parseLintChapter } from "./bookLintReport.ts";
+import { buildBookLintReport, LINT_REPORT_VERSION, parseLintChapter } from "./bookLintReport.ts";
+import { BOOK_WIDE_CHECKS } from "./lint.ts";
 import { mergeChapterReport } from "../../web/src/hooks/mergeChapterReport.ts";
 
 const BOOK = "ZEC";
@@ -101,8 +102,22 @@ sqlite.prepare(`INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question
 sqlite.prepare(`INSERT INTO twl_rows (id, book, chapter, verse, ref_raw, orig_words, tw_link, version) VALUES ('tw01', ?, 2, 2, '2:2', '', 'rc://*/tw/dict/bible/kt/god', 1)`).run(BOOK);
 sqlite.prepare(`INSERT INTO twl_rows (id, book, chapter, verse, ref_raw, orig_words, tw_link, review_kind, review_reason, version) VALUES ('tw02', ?, 3, 1, '3:1', 'דָּג', 'rc://*/tw/dict/bible/kt/god', 'merge_conflict', 'why', 1)`).run(BOOK);
 
-const full = () => buildBookLintReport(db, BOOK, "UHB", null);
-const chunk = (n) => buildBookLintReport(db, BOOK, "UHB", n);
+// #1135: the merge treats chapter === null as "book-wide, replace them all".
+// A chapter-local issue tagged null (e.g. a future verse check whose ref does
+// not start with a number) would be dropped from the cache on every merge, or
+// duplicated. So every report this file builds is checked: an issue whose check
+// is not in BOOK_WIDE_CHECKS carries a numeric chapter, and every report carries
+// the lint-schema version the merge compares.
+function assertChapterTags(report) {
+  assert.equal(report.lintVersion, LINT_REPORT_VERSION, "report is stamped with the lint-schema version");
+  for (const i of report.issues) {
+    if (BOOK_WIDE_CHECKS.has(i.check)) assert.equal(i.chapter, null, `book-wide ${i.check} @ ${i.ref} is tagged null`);
+    else assert.ok(Number.isInteger(i.chapter), `chapter-local ${i.check} @ ${i.ref} has a numeric chapter, got ${i.chapter}`);
+  }
+  return report;
+}
+const full = async () => assertChapterTags(await buildBookLintReport(db, BOOK, "UHB", null));
+const chunk = async (n) => assertChapterTags(await buildBookLintReport(db, BOOK, "UHB", n));
 const checksAt = (report, ref) => report.issues.filter((i) => i.ref === ref).map((i) => i.check).sort();
 
 // ── Shape of a full report ──────────────────────────────────────────────────
@@ -201,6 +216,16 @@ assert.equal(mergeChapterReport(f1, f1), null, "chunk must be a chapter report")
 assert.equal(mergeChapterReport(f1, { ...(await chunk(1)), book: "MAL" }), null, "books must match");
 const { escalateByChapter: _drop, ...legacy } = f1;
 assert.equal(mergeChapterReport(legacy, await chunk(1)), null, "a pre-#888 report has no escalateByChapter");
+// #1135: a base and a chapter report from different lint-schema versions (a
+// deploy landed between the two fetches) may section or tag issues
+// differently, so the merge refuses and the caller re-lints the whole book.
+assert.ok(mergeChapterReport(f1, await chunk(1)), "same version merges");
+assert.equal(mergeChapterReport(f1, { ...(await chunk(1)), lintVersion: LINT_REPORT_VERSION + 1 }), null, "newer chapter report");
+assert.equal(mergeChapterReport({ ...f1, lintVersion: LINT_REPORT_VERSION + 1 }, await chunk(1)), null, "newer base report");
+const { lintVersion: _v, ...unversioned } = f1;
+assert.equal(mergeChapterReport(unversioned, await chunk(1)), null, "a base from before the version stamp");
+const { lintVersion: _cv, ...unversionedChunk } = await chunk(1);
+assert.equal(mergeChapterReport(f1, unversionedChunk), null, "a chapter report without the version stamp");
 
 // ── parseLintChapter ────────────────────────────────────────────────────────
 assert.equal(parseLintChapter(undefined), null);
