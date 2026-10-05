@@ -237,18 +237,23 @@ export async function recordVerseMergeConflicts(
 // just leaves a row that stays resolved/dormant one run longer than it
 // should — never a false-positive reactivation, which is the failure mode
 // this two-phase split exists to prevent.
+//
+// `now` is this run's timestamp (the same one recordVerseMergeConflicts got):
+// a row reactivated from resolved takes it as its new detected_at (issue #996,
+// see CONFIRM_ADOPTED_CONFLICT_SQL).
 export async function confirmAdoptedConflicts(
   env: Env,
   book: string,
   resource: string,
   refs: Array<{ chapter: number; verse: number }>,
+  now: number,
 ): Promise<void> {
   if (refs.length === 0) return;
   try {
     for (let i = 0; i < refs.length; i += WRITE_BATCH) {
       const slice = refs.slice(i, i + WRITE_BATCH);
       await env.DB.batch(
-        slice.map((r) => env.DB.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse)),
+        slice.map((r) => env.DB.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse, now)),
       );
     }
   } catch (e) {
@@ -906,6 +911,8 @@ export async function raiseVerseMergeConflictAlert(
       verse: r.verse,
       overwrittenVersion: r.overwrittenVersion,
       reason: r.reason,
+      // Issue #996: dates each ref in the editor's message ("first flagged").
+      detectedAt: r.detectedAt,
     }));
   // keep_no_base verses (issue #544): NOTHING was overwritten, but the same
   // human needs the same warning the admin gets — see groupNoBaseVersesByEditor's

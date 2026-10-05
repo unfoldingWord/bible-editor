@@ -8284,7 +8284,7 @@ async function applyVerseRows(
     .filter((mc) => mc.adopted && mc.action === "adopt_conflict" && adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
     .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
   if (confirmRefs.length > 0) {
-    await confirmAdoptedConflicts(env, book, resource, confirmRefs);
+    await confirmAdoptedConflicts(env, book, resource, confirmRefs, now);
   }
 
   const reopenEntries: Array<{ chapter: number; verse: number; lanes: CheckLane[] }> = [];
