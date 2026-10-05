@@ -13,6 +13,7 @@ import { api, type BookLintIssue, type BookLintReport } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { createLintRefreshQueue } from "./lintRefreshQueue";
 import { mergeChapterReport } from "./mergeChapterReport";
+import { lintRefreshScope, type PendingLintScope } from "./lintRefreshScope";
 
 export interface UseBookLintReturn {
   status: "idle" | "loading" | "ready" | "error";
@@ -27,8 +28,10 @@ export interface UseBookLintReturn {
   refetch: () => Promise<void>;
   // Same contract as refetch, but asks only for one chapter's lint and merges
   // it in. Falls back to the whole book when there is no report to merge into,
-  // when several chapters (or a whole-book refetch) are pending together, or
-  // when the last request failed.
+  // when several chapters (or a whole-book refetch) are pending together, when
+  // the last request failed, or when the last whole-book lint is a minute old
+  // (WHOLE_BOOK_LINT_MAX_AGE_MS), so a tab that stays focused still picks up
+  // other chapters' changes.
   refetchChapter: (chapter: number) => Promise<void>;
   // Date.now() when the last WHOLE-BOOK fetch landed; 0 before the first and
   // after a failed one, so a failure never suppresses the next retry. Lets the
@@ -61,7 +64,7 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   const reportRef = useRef<BookLintReport | null>(null);
   // What the next run must refresh. A run takes and clears it, so requests
   // that pile up during a run are served together by the follow-up run.
-  const pending = useRef({ whole: false, chapters: new Set<number>() });
+  const pending = useRef<PendingLintScope>({ whole: false, chapters: new Set<number>() });
 
   const load = useCallback((): Promise<void> => {
     pending.current.whole = true;
@@ -106,9 +109,10 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
       const scope = pending.current;
       pending.current = { whole: false, chapters: new Set() };
       const base = reportRef.current;
-      // One chapter only when that is all that changed and there is a report
-      // to merge it into; anything else re-lints the whole book.
-      const chapter = !scope.whole && scope.chapters.size === 1 && base ? [...scope.chapters][0] : undefined;
+      // One chapter only when that is all that changed, there is a report to
+      // merge it into, and the last whole-book lint is recent; anything else
+      // re-lints the whole book (see lintRefreshScope).
+      const chapter = lintRefreshScope(scope, base !== null, settledAt.current, Date.now());
       try {
         // Bounded: a big book that times out must not retry forever (#887).
         const fetchLint = (ch?: number) =>

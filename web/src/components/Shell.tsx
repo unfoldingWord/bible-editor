@@ -22,6 +22,7 @@ import { OpenChapterProvider } from "./NoteLinkPreview";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
+import { WHOLE_BOOK_LINT_MAX_AGE_MS } from "../hooks/lintRefreshScope";
 import { useBookLocks } from "../hooks/useBookLocks";
 import { useAlignmentAttention } from "../hooks/useAlignmentAttention";
 import { useLexicon } from "../hooks/useLexicon";
@@ -853,7 +854,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   useEffect(() => {
     const refresh = () => {
       if (document.visibilityState !== "visible") return;
-      if (!lintStaleWhileHidden.current && Date.now() - bookLintSettledAt() < 60_000) return;
+      if (!lintStaleWhileHidden.current && Date.now() - bookLintSettledAt() < WHOLE_BOOK_LINT_MAX_AGE_MS) return;
       lintStaleWhileHidden.current = false;
       scheduleLintRefetch();
     };
