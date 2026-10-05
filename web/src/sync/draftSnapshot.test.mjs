@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createDraftSnapshot } from "./draftSnapshot.ts";
+import { createDraftSnapshot, dedupeByKeys } from "./draftSnapshot.ts";
 
 const deferred = () => {
   let resolve;
@@ -194,4 +194,97 @@ const record = (key, text, updatedAt = 1) => ({ key, updatedAt, payload: { plain
   );
   assert.deepEqual(seenA, [], "a must still stay silent after an unrelated key's successful refresh");
 }
-console.log("draftSnapshot: hydration, typing, save/clear ordering, read failures and targeted notifications passed");
+// dedupeByKeys: SyncStatusBar's whole-list subscriber must not be notified
+// when a keystroke replaces a record's payload/updatedAt without changing
+// which keys exist, but must still see an actual add/remove, and a change in
+// list order (the list is sorted by updatedAt, so switching which draft you
+// type in moves it to the end, as it did before the dedup). UnsavedToasts
+// stays on the full subscription: it compares each draft's generation.
+{
+  let fn;
+  const fakeSubscribe = (f) => { fn = f; return () => { fn = undefined; }; };
+  const wrapped = dedupeByKeys(fakeSubscribe);
+  const calls = [];
+  const unsubscribe = wrapped((all) => calls.push(all));
+  assert.equal(calls.length, 0, "wrapping does not itself call the underlying subscribe");
+
+  fn([record("a", "first", 1)]);
+  assert.equal(calls.length, 1, "first notification always passes through");
+
+  fn([record("a", "second keystroke", 2)]);
+  assert.equal(calls.length, 1, "same key set in the same order is suppressed");
+
+  fn([record("a", "third", 3), record("b", "new draft", 4)]);
+  assert.equal(calls.length, 2, "a key being added must still notify");
+
+  fn([record("b", "b typing", 5), record("a", "a typing", 6)]);
+  assert.equal(calls.length, 3, "same key set in a new order must notify, so the menu order follows typing");
+
+  fn([record("b", "only b left", 5)]);
+  assert.equal(calls.length, 4, "a key being removed must still notify");
+
+  // #901 review A1: a row draft's key (row:{kind}:{book}:{id}) has no
+  // chapter/verse, so moving a note with an unsaved draft to another verse
+  // rewrites meta under the SAME key. The jump menu must follow it.
+  const atVerse3 = { key: "row:tn:ISA:ab12", updatedAt: 6, meta: { kind: "row", rowKind: "tn", id: "ab12", book: "ISA", chapter: 1, verse: 3 } };
+  fn([atVerse3]);
+  assert.equal(calls.length, 5, "a new key always passes through");
+  fn([{ ...atVerse3, updatedAt: 7 }]);
+  assert.equal(calls.length, 5, "same key and same meta is still suppressed");
+  fn([{ ...atVerse3, updatedAt: 8, meta: { ...atVerse3.meta, verse: 9 } }]);
+  assert.equal(calls.length, 6, "same key with meta.verse changed must notify");
+  assert.equal(calls.at(-1)[0].meta.verse, 9, "subscriber sees the moved verse");
+
+  unsubscribe();
+  assert.equal(fn, undefined, "unsubscribing tears down the underlying subscription");
+}
+
+// #806: another tab's typing must be distinguishable from this tab's own
+// commits, so a mounted, clean editor can ignore it instead of latching a
+// half-typed snapshot. The initial (mount) callback is never "remote"; the
+// latest refresh decides the flag for a coalesced delivery.
+{
+  let persisted = record("a", "tab A typing");
+  const cache = createDraftSnapshot(async () => [], async () => persisted);
+  const seen = [];
+  cache.subscribeKey("a", (r, remote) => seen.push({ text: r?.payload.plainText, remote }));
+  await turn();
+  assert.deepEqual(seen, [{ text: undefined, remote: false }], "mount callback is local");
+  await cache.refresh("a", "remote");
+  await turn();
+  assert.deepEqual(seen.at(-1), { text: "tab A typing", remote: true }, "other-tab notification is flagged remote");
+  persisted = record("a", "own typing");
+  await cache.refresh("a");
+  await turn();
+  assert.deepEqual(seen.at(-1), { text: "own typing", remote: false }, "own commit is local");
+  // A local refresh superseded by a later remote one: the latest decides.
+  const local = cache.refresh("a");
+  const remote = cache.refresh("a", "remote");
+  await Promise.all([local, remote]);
+  await turn();
+  assert.equal(seen.at(-1).remote, true, "coalesced local-then-remote delivery is remote");
+  const remoteFirst = cache.refresh("a", "remote");
+  const localLast = cache.refresh("a");
+  await Promise.all([remoteFirst, localLast]);
+  await turn();
+  assert.equal(seen.at(-1).remote, false, "coalesced remote-then-local delivery is local");
+}
+
+// #806: a failed local refresh must not leave a marker that relabels the
+// next remote-only delivery as local.
+{
+  let fail = true;
+  const cache = createDraftSnapshot(async () => [], async () => {
+    if (fail) { fail = false; throw new Error("local read failed"); }
+    return record("a", "tab A typing");
+  });
+  const seen = [];
+  cache.subscribeKey("a", (r, remote) => seen.push({ text: r?.payload.plainText, remote }));
+  await turn();
+  await assert.rejects(cache.refresh("a"), /local read failed/);
+  await turn();
+  await cache.refresh("a", "remote");
+  await turn();
+  assert.deepEqual(seen.at(-1), { text: "tab A typing", remote: true }, "remote after a failed local stays remote");
+}
+console.log("draftSnapshot: hydration, typing, save/clear ordering, read failures, targeted notifications, key-set dedup and remote-tab flagging passed");

@@ -57,5 +57,29 @@ export default async function globalSetup() {
     );
   }
 
+  // ZEC is published (v91), so with no book_locks row the published default
+  // freezes it and every edit in this suite would get 423 book_locked. Seed an
+  // explicit unlock — the same row DELETE /api/books/:book/lock writes.
+  console.log("[setup] unlocking ZEC in local D1…");
+  const unlock = spawnSync(
+    "npx",
+    [
+      "wrangler",
+      "d1",
+      "execute",
+      "bible_editor_dev",
+      "--local",
+      `--command="INSERT INTO book_locks (book, locked, reason) VALUES ('ZEC', 0, NULL) ON CONFLICT (book) DO UPDATE SET locked = 0, reason = NULL"`,
+    ],
+    {
+      cwd: resolve(repoRoot, "api"),
+      stdio: "inherit",
+      shell: true,
+    },
+  );
+  if (unlock.status !== 0) {
+    throw new Error(`unlocking ZEC failed (status ${unlock.status})`);
+  }
+
   console.log("[setup] complete");
 }

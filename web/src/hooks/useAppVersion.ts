@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { createRefocusThrottle } from "../sync/refocusThrottle";
 
 // The version baked into the bundle running right now (see vite.config.ts).
 export const APP_VERSION = __APP_VERSION__;
@@ -12,6 +13,11 @@ export interface VersionInfo {
 // negligible traffic; short enough that someone who leaves a tab open for a
 // workday gets nudged within a few minutes of a deploy.
 const POLL_MS = 5 * 60 * 1000;
+
+// A tab refocus checks only when no check has succeeded in this window, so a
+// burst of alt-tabs gives one request (#897). The interval and the "online"
+// reconnect check are not throttled.
+const refocusThrottle = createRefocusThrottle(60_000);
 
 function isVersionInfo(x: unknown): x is VersionInfo {
   return (
@@ -67,13 +73,14 @@ export function useAppVersion(): UseAppVersionReturn {
       if (cancelled) return;
       const deployed = await fetchDeployedVersion();
       if (cancelled || !deployed) return;
+      refocusThrottle.markSuccess();
       if (deployed.commit !== APP_VERSION.commit) setUpdateAvailable(true);
     };
 
     void check();
     const interval = setInterval(() => void check(), POLL_MS);
     const onVisible = () => {
-      if (document.visibilityState === "visible") void check();
+      if (document.visibilityState === "visible" && refocusThrottle.shouldRun()) void check();
     };
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("online", check);
