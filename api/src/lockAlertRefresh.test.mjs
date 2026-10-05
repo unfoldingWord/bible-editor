@@ -213,6 +213,35 @@ console.log("\n[a dismissed alert whose condition did not change stays dismissed
   assert(live(ADMIN).length === 0 && live(EDITOR).length === 0, "the dismissed overwrite alerts stay dismissed");
 }
 
+console.log("\n[a lock change leaves an alert with no lock-dependent wording untouched, even after rows resolved (issue #1110 round 2)]");
+{
+  // Two overwrites with pointers (nothing lock-dependent), dismissed; one is
+  // resolved by a save during the day with no re-raise. A lock toggle must not
+  // rebuild the alert from the shrunken live rows: that mints a new key and
+  // resurrects what people dismissed.
+  const { sqlite, env, lockRoute } = freshApp();
+  for (const [verse, version] of [[1, 4], [2, 5]]) {
+    sqlite
+      .prepare(`INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', ?, ?, 7, ?, 'update')`)
+      .run(`${BOOK}/2/${verse}/UST`, BOOK, version);
+  }
+  await recordVerseMergeConflicts(env, BOOK, "ust", "UST", [
+    { chapter: 2, verse: 1, action: "adopt_conflict", reason: "both_changed_wording", overwrittenVersion: 4, alignment: null, observedVersion: null },
+    { chapter: 2, verse: 2, action: "adopt_conflict", reason: "both_changed_wording", overwrittenVersion: 5, alignment: null, observedVersion: null },
+  ], 1000);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", { observedAt: 1000 });
+  sqlite.prepare(`UPDATE system_alerts SET dismissed_at = 5000 WHERE source = ? AND resolved_at IS NULL`).run(SOURCE);
+  const snapshot = () =>
+    sqlite.prepare(`SELECT id, username, condition_key, dismissed_at, resolved_at FROM system_alerts WHERE source = ? ORDER BY id`).all(SOURCE);
+  const before = JSON.stringify(snapshot());
+  sqlite
+    .prepare(`UPDATE verse_merge_conflicts SET resolved_at = 6000, resolved_by = 7 WHERE book = ? AND chapter = 2 AND verse = 2`)
+    .run(BOOK);
+  await lockRoute("PUT");
+  await lockRoute("DELETE");
+  assert(JSON.stringify(snapshot()) === before, "the dismissed alerts and their keys are untouched; no new row is minted");
+}
+
 console.log("\n[a late refresh carrying a stale lock state still words the alert for the CURRENT lock (issue #1110 review A1)]");
 {
   // Lock and unlock in quick succession: the two waitUntil refreshes can finish

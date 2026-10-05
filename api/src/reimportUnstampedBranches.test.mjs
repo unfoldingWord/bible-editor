@@ -110,8 +110,8 @@ const ultBody = "\\id 2CH EN_ULT\n\\c 1\n\\v 1 text\n";
 const tqHeader = "Reference\tID\tTags\tQuote\tOccurrence\tQuestion\tResponse";
 const tqLine = (i) => `1:${i}\tq${String(i).padStart(3, "0")}\t\t\t\tQuestion ${i}?\tAnswer ${i}.`;
 
-async function plan(env, book, resources) {
-  const p = await planAndStageBookResourcesForTest(env, book, resources, "inst-1035");
+async function plan(env, book, resources, lockOverrideResource) {
+  const p = await planAndStageBookResourcesForTest(env, book, resources, "inst-1035", undefined, lockOverrideResource);
   return { entry: p.entries[0], perResource: seedPerResourceFromPlanForTest(p.entries) };
 }
 
@@ -178,11 +178,15 @@ try {
   }
 
   console.log("\n#1110 review (A2): the own-publish convergence re-raise keeps a locked book's lock wording");
-  {
-    // SHA-matched resource with a kept-row backlog, master holding our own
-    // render: the plan retires the backlog and re-raises the banner from what
-    // is left (a pointer-less adopt_conflict). The book is locked, so that
-    // re-raise must not say the export will write, and its key carries the lock.
+  // SHA-matched resource with a kept-row backlog, master holding our own
+  // render: the plan retires the backlog and re-raises the banner from what is
+  // left (a pointer-less adopt_conflict). The book is locked, so that re-raise
+  // must not say the export will write, and its key carries the lock — unless
+  // this is an admin lock/push run for this resource, whose export DOES push
+  // D1 over Door43 (round 2: lockOverrideResource reaches the plan).
+  for (const lockOverride of [undefined, "ult"]) {
+    const pushing = lockOverride === "ult";
+    const label = pushing ? "lock/push run" : "locked book";
     const { sqlite, env } = freshEnv();
     sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES ('2CH', 1, 100)`).run();
     sqlite
@@ -196,18 +200,21 @@ try {
       { chapter: 1, verse: 2, action: "adopt_conflict", reason: "source_attr_only", overwrittenVersion: null, alignment: null, observedVersion: null },
     ], 500);
     stubFetch({ commits: MASTER_SHA, raw: ultBody });
-    const { entry } = await plan(env, "2CH", ["ult"]);
-    eq(entry.ownPublish, true, "own-publish recognized (the convergence re-raise path ran)");
+    const { entry } = await plan(env, "2CH", ["ult"], lockOverride);
+    eq(entry.ownPublish, true, `${label}: own-publish recognized (the convergence re-raise path ran)`);
     const alert = sqlite
       .prepare(
         `SELECT message, condition_key FROM system_alerts
           WHERE source = 'verse_merge_conflict:2CH:ult' AND username = 'deferredreward' AND resolved_at IS NULL`,
       )
       .get();
-    eq(Boolean(alert), true, "the re-raised admin alert stands (the pointer-less row is still active)");
-    eq(/next export|tonight's export|will write/i.test(alert?.message ?? ""), false,
-      "locked book: the re-raised alert makes no claim that an export will write");
-    eq((alert?.condition_key ?? "").includes(`"keptBookLocked":true`), true, "locked book: the re-raised key carries the lock");
+    eq(Boolean(alert), true, `${label}: the re-raised admin alert stands (the pointer-less row is still active)`);
+    eq(/next export|tonight's export|will write/i.test(alert?.message ?? ""), pushing,
+      pushing
+        ? "lock/push run: the export will push, so the alert keeps the overwrite warning"
+        : "locked book: the re-raised alert makes no claim that an export will write");
+    eq((alert?.condition_key ?? "").includes(`"keptBookLocked":true`), !pushing,
+      pushing ? "lock/push run: the key carries no lock" : "locked book: the re-raised key carries the lock");
   }
 
   console.log("\n4. controls that carry a null SHA but are NOT failures");
