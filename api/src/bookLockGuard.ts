@@ -30,6 +30,22 @@ import type { Env } from "./index";
 import { effectiveBookLock, bookLockedResponseBody, BOOK_LOCKED_STATUS } from "./bookLock";
 import { currentUserId } from "./auth";
 
+// PATCH /api/rows/:kind/:id, POST /api/rows/:kind and
+// PATCH /api/verses/:book/:chapter/:verse/:bibleVersion: the hot save routes,
+// whose handlers read book_locks in the same db.batch() as their other
+// read-only pre-checks and answer 423 themselves, before any write (issue
+// #905). Matched exactly (method + full path shape), so every other write
+// under /api/rows or /api/verses (DELETE, /preserve, /trash, /bridge, ...)
+// stays gated here.
+export function isSelfLockCheckedRoute(method: string, path: string): boolean {
+  const m = method.toUpperCase();
+  if (m === "PATCH") {
+    return /^\/api\/rows\/[^/]+\/[^/]+$/.test(path) || /^\/api\/verses\/[^/]+\/[^/]+\/[^/]+\/[^/]+$/.test(path);
+  }
+  if (m === "POST") return /^\/api\/rows\/[^/]+$/.test(path);
+  return false;
+}
+
 export const bookLockGuard: MiddlewareHandler = async (c, next) => {
   const method = c.req.method.toUpperCase();
   if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
@@ -80,6 +96,17 @@ export const bookLockGuard: MiddlewareHandler = async (c, next) => {
   // requireEditor produce the correct 401/403 for an anonymous caller — this
   // guard only needs to run at all once we know a caller is authenticated.
   if (!currentUserId(c)) return next();
+
+  // The hot save routes check the lock inside their own batched pre-check
+  // read (see isSelfLockCheckedRoute), so checking here as well would spend
+  // the D1 round trip #905 removed. Deferred only for an editor: requireEditor
+  // runs between this guard and the handler, so a signed-in non-editor never
+  // reaches the handler's check, and must keep getting the 423 it always got
+  // here rather than a 403.
+  const role = c.get("role");
+  if ((role === "editor" || role === "admin") && isSelfLockCheckedRoute(method, c.req.path)) {
+    return next();
+  }
 
   const lock = await effectiveBookLock(c.env as Env, book.toUpperCase());
   if (lock) {
