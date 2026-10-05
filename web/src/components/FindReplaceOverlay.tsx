@@ -318,12 +318,23 @@ export function FindReplaceOverlay({
   // Push query down to the caller so verse cells can paint match marks.
   // Query changes clear the old active mark without navigating. Note active
   // marks can themselves scroll their card, so they are also explicit-only.
-  const queryEffectRanRef = useRef(false);
+  //
+  // "First run" is detected by comparing this effect's own dependency values
+  // against what they were the last time it fired, not a boolean latch
+  // (#842 step 4): a latch that's already flipped true survives a React
+  // StrictMode replay (setup → cleanup → setup) of the same first commit, so
+  // the replayed setup reads as "not the first run" and clears
+  // onScrollToMatch/onActiveNoteMatchChange on mount, in dev only. Comparing
+  // the actual deps instead means a replay of the same commit — same deps as
+  // last recorded — still reads as the first run either way.
+  const queryEffectDepsRef = useRef<unknown[] | null>(null);
   useEffect(() => {
+    const deps = [open, query, regex, caseSensitive, strongs, scope.bible, scope.tn];
+    const prevDeps = queryEffectDepsRef.current;
     // Re-anchor before the Bible-scope return so TN-only search behaves the
     // same. Restoring a persisted query also stays still.
-    const firstRun = !queryEffectRanRef.current;
-    queryEffectRanRef.current = true;
+    const firstRun = !prevDeps || deps.every((d, i) => d === prevDeps[i]);
+    queryEffectDepsRef.current = deps;
     if (open && query && (scope.bible || scope.tn)) {
       wantsScrollRef.current = { activate: enterPendingRef.current, nearest: true };
       candidateUnvisitedRef.current = true;
