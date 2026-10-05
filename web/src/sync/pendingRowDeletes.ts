@@ -313,7 +313,8 @@ export function rowDeleteHooks(outcomes: RowDeleteOutcomes): RowDeleteHooks {
 //   be undone. A committed delete stays hidden, which is right.
 // - Committed: a DELETE queued after the before-read that also commits before
 //   the after-read is seen by neither read; its 200 (`watch` committed) hides
-//   it.
+//   it. Another tab's DELETE gone between the reads with no outcome heard yet
+//   gets a short grace for that outcome (#1126 item 2).
 // - Except abandoned ones: a DELETE refused as chapter_locked or discarded
 //   during the window is dropped from the before-set. Shell's #1108 rollback
 //   re-reads the chapter with its own GET and restores the row; if that GET
@@ -328,6 +329,8 @@ export function rowDeleteHooks(outcomes: RowDeleteOutcomes): RowDeleteHooks {
 // failed after-read or filter (a malformed persisted op) lands the snapshot
 // unchanged. An outbox problem must never turn a good GET into the chapter's
 // error screen.
+// How long a load waits for another tab's outcome that trails the after-read.
+const OTHER_TAB_OUTCOME_GRACE_MS = 250;
 export function hidingPendingRowDeletes<P extends Pick<ChapterPayload, "book" | "tn" | "tq" | "twl">>(
   load: ChapterLoader<P>,
   listOps: () => Promise<readonly OpLike[]>,
@@ -346,11 +349,18 @@ export function hidingPendingRowDeletes<P extends Pick<ChapterPayload, "book" | 
     } catch (e) {
       warn(e);
     }
+    let wake = () => {};
     try {
       if (hooks.watch) {
         stop = hooks.watch({
-          abandoned: (op) => abandoned.add(op.id),
-          committed: (op) => committed.push({ ...op, status: "in_flight" }),
+          abandoned: (op) => {
+            abandoned.add(op.id);
+            wake();
+          },
+          committed: (op) => {
+            committed.push({ ...op, status: "in_flight" });
+            wake();
+          },
         });
         watching = true;
       }
@@ -371,6 +381,30 @@ export function hidingPendingRowDeletes<P extends Pick<ChapterPayload, "book" | 
         const after = await listOps();
         const own = (op: OpLike) => op.target.kind === "row" && (hooks.isOwn?.(op.target) ?? true);
         const afterIds = new Set(after.map((op) => op.id));
+        // Another tab's DELETE that left the outbox between the reads is
+        // hidden only once its outcome is heard, and the draining tab posts it
+        // just after removing the op, so it can trail the after-read by a few
+        // milliseconds. Wait briefly for it rather than land the stale row
+        // (#1126 item 2); a refusal heard here shows the row, a commit hides it.
+        const unheard = () =>
+          before.some(
+            (op) =>
+              isRowDelete(op) &&
+              !afterIds.has(op.id) &&
+              !own(op) &&
+              !abandoned.has(op.id) &&
+              !committed.some((c) => c.id === op.id),
+          );
+        if (watching && unheard()) {
+          await new Promise<void>((res) => {
+            const timer = setTimeout(res, OTHER_TAB_OUTCOME_GRACE_MS);
+            wake = () => {
+              if (unheard()) return;
+              clearTimeout(timer);
+              res();
+            };
+          });
+        }
         const gone = before.filter((op) => !afterIds.has(op.id) && !abandoned.has(op.id));
         // Clicked during the load and not in the after-read (its read began
         // before the op was written, or the op already left): hidden unless
