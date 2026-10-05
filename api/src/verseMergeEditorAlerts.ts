@@ -360,7 +360,7 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
 
 export function buildMergeConflictGuidance(
   rows: Array<{ action: string; reason?: string; overwrittenVersion: number | null; chapter?: number; verse?: number }>,
-  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
+  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[]; noBaseBookLocked?: boolean } = {},
 ): string {
   // #539's no-op guard (bookReimport.ts ~7609-7674) keeps a CONFLICTED adopt
   // whose bytes turned out to already match D1 as an `adopt_conflict` row
@@ -470,7 +470,7 @@ export function buildMergeConflictGuidance(
       ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +
         "(see worker logs) — this table and count may be missing rows from tonight's sync."
       : "",
-    opts.noBaseCount ? buildNoBaseSentence(opts.noBaseCount, opts.noBaseRefs) : "",
+    opts.noBaseCount ? buildNoBaseSentence(opts.noBaseCount, opts.noBaseRefs, opts.noBaseBookLocked) : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -524,7 +524,7 @@ export function alertMessageCarriesNoBaseWarning(message: string): boolean {
   );
 }
 
-export function buildNoBaseSentence(count: number, refs?: string[]): string {
+export function buildNoBaseSentence(count: number, refs?: string[], bookLocked = false): string {
   // Never list more refs than the count claims. Unreachable today (refs are
   // pushed on the same branch that increments the count, and nothing decrements
   // it), but the invariant is cheap to enforce and the helper is exported.
@@ -537,12 +537,19 @@ export function buildNoBaseSentence(count: number, refs?: string[]): string {
   // unlisted remainder to be a contiguous tail.
   const more = count > listed.length ? `; +${count - listed.length} more` : "";
   const where = listed.length > 0 ? ` Verses (sample): ${listed.join(", ")}${more}.` : "";
+  // Issue #1006: the export skips a locked book (exportWorkflow.ts,
+  // `book_locked:*`), so "tonight's export will overwrite" cannot happen there.
+  // keep_no_base fires only when D1 and master differ (verseMerge.ts returns
+  // keep_converged first), so "a different version" is what was measured.
+  const consequence = bookLocked
+    ? `Nothing was overwritten in these, and this book is locked, so the export skips it: Door43 keeps its ` +
+      `own, different version, and the app's version stays only here until an admin reconciles the two.`
+    : `Nothing was overwritten in these — but a Door43-side change to them will still be overwritten by ` +
+      `tonight's export.`;
   return (
     `${count} verse(s) could not be adjudicated: ${NO_BASE_ADMIN_FINGERPRINT} for them from before this ` +
     `book+resource's master-confirmed watermark, so the sync could not tell which side changed, and so it ` +
-    `kept the app's version.${where} ` +
-    `Nothing was overwritten in these — but a Door43-side change to them will still be overwritten by ` +
-    `tonight's export.`
+    `kept the app's version.${where} ${consequence}`
   );
 }
 
@@ -584,6 +591,10 @@ export function groupNoBaseVersesByEditor(
   resource: string,
   noBase: NoBaseVerseRef[],
   usernameByKey: Map<string, string>,
+  // Issue #1006: same meaning as buildNoBaseSentence's `bookLocked`. A locked
+  // book is not exported and its verses cannot be saved here, so neither the
+  // export warning nor "re-save here first" applies; the remedy is an admin.
+  bookLocked = false,
 ): Map<string, { refs: string[]; message: string }> {
   const byUser = new Map<string, string[]>();
   for (const ref of noBase) {
@@ -597,12 +608,17 @@ export function groupNoBaseVersesByEditor(
   }
   const out = new Map<string, { refs: string[]; message: string }>();
   for (const [username, refs] of byUser) {
+    const consequence = bookLocked
+      ? `Nothing has been overwritten, and because this book is locked, the export skips it, so Door43 keeps ` +
+        `its own, different version of ${refs.length === 1 ? "this verse" : "these verses"} for now. Ask an ` +
+        `admin to reconcile the two versions.`
+      : `Nothing has been overwritten — but if ` +
+        `Door43 has changed ${refs.length === 1 ? "it" : "them"} since, tonight's export will still overwrite your ` +
+        `text there unless you open and re-save the verse${refs.length === 1 ? "" : "s"} here first.`;
     const message =
       `Door43's sync could not tell whether your edit or a Door43-side edit is newer, for ${refs.length} ` +
       `verse(s) you last edited in ${book} ${resource.toUpperCase()}: ${refs.join(", ")} — ${NO_BASE_EDITOR_FINGERPRINT}, ` +
-      `so it kept your version for now. Nothing has been overwritten — but if ` +
-      `Door43 has changed ${refs.length === 1 ? "it" : "them"} since, tonight's export will still overwrite your ` +
-      `text there unless you open and re-save the verse${refs.length === 1 ? "" : "s"} here first.`;
+      `so it kept your version for now. ${consequence}`;
     out.set(username, { refs, message });
   }
   return out;
