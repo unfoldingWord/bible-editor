@@ -62,7 +62,8 @@ function makeDb(sqlite) {
       batchCalls.count++;
       batchCalls.sizes.push(stmts.length);
       const out = [];
-      for (const s of stmts) out.push(s.run());
+      // Like D1, a SELECT inside a batch returns its rows (issue #1132).
+      for (const s of stmts) out.push(/^\s*SELECT/i.test(s.sql) ? { ...s.all(), meta: { changes: 0 } } : s.run());
       return out;
     },
     _batchCalls: batchCalls,
@@ -1462,6 +1463,36 @@ console.log("\n[#788: a cosmetic adoption that loses its version-CAS race does n
   eq([counts.merge_adopted, counts.merge_cosmetic_adopted, counts.apply_incomplete], [0, 0, true], "a lost cosmetic adoption is not counted and withholds the watermark for retry");
   eq(sqlite.prepare(`SELECT COUNT(*) AS n FROM verse_merge_conflicts WHERE book = ? AND chapter = 15 AND verse = 1`).get(BOOK).n, 0,
     "the speculative cosmetic audit is removed when the CAS did not overwrite anything");
+}
+
+console.log("\n[#1132: a lost CAS race leaves an earlier night's still-pending overwrite alert row as it was]");
+{
+  const { env, sqlite } = freshEnv();
+  const boundary = seedCosmeticVerse(sqlite, { chapter: 16, verse: 1 });
+  // Monday: Door43 overwrote translator91's v2 here; the editor has not looked yet.
+  sqlite.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, alignment, detected_at, last_recorded_at)
+     VALUES (?, 'ult', 16, 1, 'adopt_conflict', 'both_changed_wording', 2, '{"beforeAligned":3,"afterAligned":1,"lostWords":["monday"]}', 100, 100)`,
+  ).run(BOOK);
+  const monday = sqlite.prepare(`SELECT * FROM verse_merge_conflicts WHERE book = ? AND chapter = 16 AND verse = 1`).get(BOOK);
+  let raced = false;
+  env.DB._beforeBatch.push((stmts) => {
+    if (raced || !stmts.some((s) => /UPDATE verses\s+SET content_json/.test(s.sql))) return;
+    raced = true;
+    sqlite.prepare(`UPDATE verses SET version = version + 1, content_json = ?, plain_text = ? WHERE book = ? AND chapter = 16 AND verse = 1`)
+      .run(contentJson("translator concurrent edit"), "translator concurrent edit", BOOK);
+  });
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION,
+    [{ chapter: 16, verse: 1, verseEnd: null, contentJson: COSMETIC_MASTER, plainText: "—\n" }],
+    null,
+    { confirmedAt: 200, editId: boundary, lineage: cosmeticHumanLineage(["16:1"]) }, false,
+  );
+  eq(raced, true, "the adoption's CAS lost its race");
+  eq(counts.merge_cosmetic_adopted, 0, "nothing was adopted");
+  const after = sqlite.prepare(`SELECT * FROM verse_merge_conflicts WHERE book = ? AND chapter = 16 AND verse = 1`).get(BOOK);
+  const fields = (r) => r && [r.action, r.reason, r.overwritten_version, r.alignment, r.detected_at, r.last_recorded_at, r.resolved_at];
+  eq(fields(after), fields(monday), "Monday's pending adopt_conflict row survives exactly as it was");
 }
 
 // ── Issue #1005: the watermark lags one publish; the app edit already shipped ─
