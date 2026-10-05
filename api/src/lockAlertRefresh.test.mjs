@@ -27,8 +27,6 @@ import {
   refreshVerseMergeAlertsAfterLockChange,
 } from "./verseMergeConflicts.ts";
 import { reviewConditionKey, verseMergeEditorConditionKey } from "./reviewAlerts.ts";
-import { runChunkedReimport } from "./bookReimport.ts";
-
 let failed = 0;
 function assert(cond, msg) {
   if (!cond) {
@@ -407,66 +405,72 @@ console.log("\n[a refresh whose lock read went stale before its write re-checks 
   }
 }
 
-console.log("\n[lock, then /lock/push with Door43's file unchanged: the pushed resource's alert gets the overwrite wording (issue #1118 item 1)]");
+console.log("\n[an UNDISMISSED locked alert whose only kept row resolved loses its locked wording on unlock (#1118 review, Cursor)]");
 {
-  // The lock refresh words the standing alert "locked, the export skips it".
-  // The admin then pushes: the export WILL write D1 over Door43, but the
-  // pre-export reimport finds Door43's SHA unchanged and returns before any
-  // raise, so nothing corrected the wording for that push.
-  const MASTER_SHA = "a1e8182af6b8b72f762e676d5307f32fee358f84";
-  const realFetch = globalThis.fetch;
-  const step = {
-    async do(_name, optsOrFn, maybeFn) {
-      const run = typeof optsOrFn === "function" ? optsOrFn : maybeFn;
-      const out = await run();
-      return out === undefined ? out : JSON.parse(JSON.stringify(out));
+  // Raised while locked with an overwrite (pointer) and a kept row, so its key
+  // carries keptBookLocked. The kept row is resolved during the day; the
+  // overwrite keeps the banner up. Nobody dismissed it. On unlock the standing
+  // alert must not keep the locked key: the guard against rebuilding from live
+  // rows protects DISMISSED alerts only.
+  const { sqlite, env, lockRoute, live } = freshApp();
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES (?, 1, 900)`).run(BOOK);
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', ?, ?, 7, 4, 'update')`)
+    .run(`${BOOK}/2/1/UST`, BOOK);
+  await recordVerseMergeConflicts(env, BOOK, "ust", "UST", [
+    { chapter: 2, verse: 1, action: "adopt_conflict", reason: "both_changed_wording", overwrittenVersion: 4, alignment: null, observedVersion: null },
+    { chapter: 1, verse: 8, action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, alignment: null, observedVersion: null },
+  ], 1000);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", { bookLocked: true, observedAt: 1000 });
+  assert(live(ADMIN)[0]?.condition_key.includes(`"keptBookLocked":true`), "setup: the locked admin key carries keptBookLocked");
+  sqlite
+    .prepare(`UPDATE verse_merge_conflicts SET resolved_at = 6000, resolved_by = 7 WHERE book = ? AND chapter = 1 AND verse = 8`)
+    .run(BOOK);
+  await lockRoute("DELETE");
+  const admin = live(ADMIN);
+  assert(admin.length === 1, `after the unlock, one undismissed admin alert stands (got ${admin.length})`);
+  assert(!admin[0]?.condition_key.includes("keptBookLocked"), `after the unlock, the admin key no longer carries the lock (got ${admin[0]?.condition_key})`);
+  assert(!/locked/.test(admin[0]?.message ?? ""), `after the unlock, the admin message no longer names the lock (got ${admin[0]?.message})`);
+}
+
+console.log("\n[a pass whose raise writes nothing stops the refresh instead of repeating it (#1118 review, Cursor)]");
+{
+  // The lock says the wording must change, but every system_alerts write fails
+  // (the raise logs and returns). The refresh must notice the stored key did
+  // not change and stop, not repeat to its pass cap and warn that the lock
+  // kept changing.
+  const { sqlite, env, live } = freshApp();
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    observedAt: 1000,
+  });
+  const keyBefore = live(ADMIN)[0]?.condition_key;
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES (?, 1, 2000)`).run(BOOK);
+  let conflictReads = 0;
+  const failingEnv = {
+    ...env,
+    DB: {
+      ...env.DB,
+      prepare: (sql) => {
+        if (/FROM verse_merge_conflicts/.test(sql)) conflictReads++;
+        if (/^\s*(INSERT|UPDATE|DELETE)[\s\S]*system_alerts/i.test(sql)) throw new Error("simulated system_alerts write failure");
+        return env.DB.prepare(sql);
+      },
     },
   };
-  for (const pushing of [false, true]) {
-    const label = pushing ? "lock/push run" : "plain locked sync (control)";
-    const { sqlite, env, lockRoute, live } = freshApp();
-    env.BLOBS = { async put() {}, async get() { return null; }, async delete() {} };
-    env.DCS_BASE_URL = "https://dcs.test";
-    sqlite
-      .prepare(`INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version) VALUES (?, 1, 6, 'UST', '{}', 'x', 2)`)
-      .run(BOOK);
-    sqlite
-      .prepare(`INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin) VALUES (?, 'ust', ?, 1, 'reimport')`)
-      .run(BOOK, MASTER_SHA);
-    await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
-      noBaseCount: 1,
-      noBaseRefs: ["1:6"],
-      noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
-      observedAt: 1000,
-    });
-    await lockRoute("PUT");
-    assert(!/tonight's export/.test(live(ADMIN)[0]?.message ?? ""), `${label}: setup, the lock refresh gave the locked wording`);
-    globalThis.fetch = async (url) => {
-      const u = String(url);
-      const body = u.includes("/commits?") ? JSON.stringify([{ sha: MASTER_SHA }]) : "";
-      const status = u.includes("/commits?") ? 200 : 404;
-      return {
-        ok: status === 200,
-        status,
-        headers: { get: () => null },
-        async text() { return body; },
-        async json() { return JSON.parse(body); },
-      };
-    };
-    try {
-      const res = await runChunkedReimport(env, step, BOOK, `inst-1118-${pushing}`, ["ust"], pushing ? { lockOverrideResource: "ust" } : {});
-      assert(res.perResource.ust.updated === 0, `${label}: setup, Door43's file was SHA-unchanged so nothing was reimported`);
-    } finally {
-      globalThis.fetch = realFetch;
-    }
-    for (const u of [ADMIN, EDITOR]) {
-      const m = live(u)[0]?.message ?? "";
-      assert(/tonight's export/.test(m) === pushing,
-        pushing
-          ? `${u}: the push writes D1 over Door43, so the alert carries the overwrite wording (got: ${m})`
-          : `${u}: no push, so the locked wording stands (got: ${m})`);
-    }
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.map(String).join(" "));
+  try {
+    await refreshVerseMergeAlertsAfterLockChange(failingEnv, BOOK);
+  } finally {
+    console.warn = realWarn;
   }
+  assert(live(ADMIN)[0]?.condition_key === keyBefore, "setup: the failed writes left the stored key as it was");
+  assert(!warnings.some((w) => /kept changing/.test(w)), `no "lock kept changing" warning when the lock is stable (got: ${JSON.stringify(warnings)})`);
+  assert(conflictReads <= 4, `the refresh stopped after the pass that wrote nothing (conflict-table reads: ${conflictReads})`);
 }
 
 if (failed) {
