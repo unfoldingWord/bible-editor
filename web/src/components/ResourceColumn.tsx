@@ -1,8 +1,7 @@
 import { Fragment, lazy, type Ref, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip, Link } from "@mui/material";
+import { Box, Stack, Typography, Chip, Button, Tooltip, Link } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
-import PushPinIcon from "@mui/icons-material/PushPin";
-import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
+import DoneAllIcon from "@mui/icons-material/DoneAll";
 import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, TwlOrderLock, CommentRowKind } from "../sync/api";
 import { alignmentPanelRowKey } from "../sync/alignmentDraftSaveState";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -1528,12 +1527,29 @@ function SectionHead({
   const laneApplicable = checkoff && lane ? checkoff.applicable(lane) : false;
   const shade = checkoff && lane && laneApplicable ? checkoff.shade(lane) : "open";
   const fill = shade !== "open" ? LANE_FILL[shade as Exclude<LaneShade, "open">] : null;
+  const pill = {
+    display: "flex",
+    alignItems: "center",
+    gap: 0.5,
+    cursor: "pointer",
+    px: 0.75,
+    height: 20,
+    borderRadius: 1,
+    fontSize: 11,
+    whiteSpace: "nowrap",
+    userSelect: "none",
+  } as const;
+  const lowerTitle = title.toLowerCase();
+  // One flex-wrap row: title, count, scope toggle, spacer, approvals, new. On a
+  // narrow panel the right-hand group wraps below instead of being clipped.
   return (
     <Stack
       direction="row"
-      spacing={1}
       alignItems="center"
       sx={{
+        flexWrap: "wrap",
+        columnGap: 1,
+        rowGap: 0.25,
         pb: 0.25,
         mb: 0.25,
         borderBottom: "1px solid",
@@ -1556,13 +1572,45 @@ function SectionHead({
         variant="outlined"
         sx={{ height: 18, fontFamily: "monospace", fontSize: 10 }}
       />
-      <Tooltip
-        title={pinned ? `unpin — show ${title.toLowerCase()} for the active verse only` : `pin — show ${title.toLowerCase()} for every verse in this chapter`}
+      {/* What is shown: a two-option segmented control, so both choices are
+          visible and the active one is filled (not a label that names the
+          current state and reads like a button for the other). */}
+      <Box
+        role="group"
+        aria-label={`${title}: which verses to show`}
+        sx={{ display: "flex", border: "1px solid", borderColor: "divider", borderRadius: 1, overflow: "hidden" }}
       >
-        <IconButton size="small" onClick={onTogglePin} sx={{ p: 0.25, color: pinned ? "primary.main" : "text.disabled" }}>
-          {pinned ? <PushPinIcon fontSize="inherit" sx={{ fontSize: 16 }} /> : <PushPinOutlinedIcon fontSize="inherit" sx={{ fontSize: 16 }} />}
-        </IconButton>
-      </Tooltip>
+        {[
+          { on: !pinned, label: "verse", tip: `Show ${lowerTitle} for the active verse only` },
+          { on: pinned, label: "chapter", tip: `Show ${lowerTitle} for every verse in this chapter` },
+        ].map((o) => (
+          <Tooltip key={o.label} title={o.tip}>
+            <Box
+              role="button"
+              aria-pressed={o.on}
+              tabIndex={0}
+              onClick={() => {
+                if (!o.on) onTogglePin();
+              }}
+              onKeyDown={(e) => {
+                if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
+                  e.preventDefault();
+                  if (!o.on) onTogglePin();
+                }
+              }}
+              sx={{
+                ...pill,
+                borderRadius: 0,
+                bgcolor: o.on ? "primary.main" : "transparent",
+                color: o.on ? "primary.contrastText" : "text.secondary",
+              }}
+            >
+              {o.label}
+            </Box>
+          </Tooltip>
+        ))}
+      </Box>
+      <Box sx={{ flex: 1 }} />
       {checkoff && lane && laneApplicable && checkoff.canCheck && !pinned && (
         <Tooltip
           title={`${title} for this verse — ${checkoff.attribution(lane)} · click to ${shade === "me" || shade === "both" ? "uncheck" : "check"}`}
@@ -1570,50 +1618,59 @@ function SectionHead({
           <Box
             role="checkbox"
             aria-checked={shade !== "open"}
+            aria-label={`${title} checked for this verse`}
+            tabIndex={0}
             onClick={() => checkoff.onToggle(lane)}
+            onKeyDown={(e) => {
+              if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
+                e.preventDefault();
+                checkoff.onToggle(lane);
+              }
+            }}
             sx={{
-              display: "flex",
-              alignItems: "center",
-              gap: 0.5,
-              cursor: "pointer",
-              px: 0.75,
-              height: 20,
-              borderRadius: 1,
-              fontSize: 11,
-              userSelect: "none",
+              ...pill,
               bgcolor: fill ? fill.bg : "transparent",
               color: fill ? fill.fg : "text.secondary",
               border: fill ? "none" : "1px solid",
               borderColor: fill ? "transparent" : "divider",
             }}
           >
-            <CheckIcon sx={{ fontSize: 13 }} /> done
+            <CheckIcon sx={{ fontSize: 13 }} /> vrs
           </Box>
         </Tooltip>
       )}
       {checkoff && lane && laneApplicable && checkoff.canCheck && (
-        <Tooltip title={`check ${title.toLowerCase()} for every applicable verse in this chapter`}>
-          <Typography
-            variant="caption"
+        <Tooltip title={`Check ${lowerTitle} for every applicable verse in this chapter (asks for confirmation)`}>
+          <Box
+            role="button"
+            aria-label={`Check ${lowerTitle} for the whole chapter`}
+            tabIndex={0}
             onClick={() => checkoff.onBulkToggle(lane)}
-            sx={{ color: "primary.main", cursor: "pointer", whiteSpace: "nowrap", ml: 0.25 }}
+            onKeyDown={(e) => {
+              if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
+                e.preventDefault();
+                checkoff.onBulkToggle(lane);
+              }
+            }}
+            sx={{ ...pill, color: "primary.main", border: "1px dashed", borderColor: "primary.main" }}
           >
-            all
-          </Typography>
+            <DoneAllIcon sx={{ fontSize: 13 }} /> ch
+          </Box>
         </Tooltip>
       )}
-      <Box sx={{ flex: 1 }} />
       {hideAdd ? null : (
-        <Button
-          size="small"
-          startIcon={<AddIcon fontSize="small" />}
-          color="success"
-          variant="outlined"
-          sx={{ minWidth: 0, fontSize: 11 }}
-          onClick={onAdd}
-        >
-          new
-        </Button>
+        <Tooltip title={`New ${lowerTitle.replace(/s$/, "")}`}>
+          <Button
+            size="small"
+            aria-label={`New ${lowerTitle.replace(/s$/, "")}`}
+            color="success"
+            variant="outlined"
+            sx={{ minWidth: 0, px: 0.5, height: 20 }}
+            onClick={onAdd}
+          >
+            <AddIcon fontSize="small" />
+          </Button>
+        </Tooltip>
       )}
     </Stack>
   );
