@@ -101,6 +101,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveTnQuote, sourceWordsByRef, wordsForRow } from "../api/src/lint.ts";
 import { PUBLISHED_BOOKS } from "../api/src/publishedGuard.ts";
+import { quoteRepairAuditSql } from "./lib/quoteRepairAudit.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -322,9 +323,10 @@ for (const f of repairable) {
     // advanced to that number, filing someone else's edit as a quote repair.
     // changes() reflects the immediately preceding UPDATE on this connection,
     // which is the same guard the app's write path uses.
-    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)`,
-    `  SELECT 'tn', id, book, ${actor}, version - 1, version, 'update', json_object('quote', quote)`,
-    `    FROM tn_rows WHERE book = '${sqlEscape(f.row.book)}' AND id = '${sqlEscape(f.row.id)}' AND changes() > 0;`,
+    //
+    // source is 'quote_repair' (see scripts/lib/quoteRepairAudit.mjs) so the
+    // keep rule never counts this row as a person's edit.
+    ...quoteRepairAuditSql(actor, sqlEscape(f.row.book), sqlEscape(f.row.id)),
     "",
   );
 }

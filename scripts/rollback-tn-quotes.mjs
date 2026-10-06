@@ -40,6 +40,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { quoteRepairAuditSql } from "./lib/quoteRepairAudit.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sidecarPath = process.argv[2] ?? "scripts/out/repair-tn-quotes.json";
@@ -90,9 +91,7 @@ for (const e of entries) {
     `UPDATE tn_rows SET quote = '${esc(e.oldQuote)}', version = version + 1, updated_at = unixepoch(), updated_by = ${actor}, last_change_action = 'update', last_change_source = 'system', last_change_actor = 'rollback-tn-quotes'`,
     `  WHERE book = '${esc(e.book)}' AND id = '${esc(e.id)}' AND version = ${e.oldVersion + 1} AND quote = '${esc(e.newQuote)}'`,
     `    AND deleted_at IS NULL AND trashed_at IS NULL;`,
-    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)`,
-    `  SELECT 'tn', id, book, ${actor}, version - 1, version, 'update', json_object('quote', quote)`,
-    `    FROM tn_rows WHERE book = '${esc(e.book)}' AND id = '${esc(e.id)}' AND changes() > 0;`,
+    ...quoteRepairAuditSql(actor, esc(e.book), esc(e.id)),
   );
 }
 const outDir = resolve(repoRoot, "scripts/out");
