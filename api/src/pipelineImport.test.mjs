@@ -629,6 +629,10 @@ await (async () => {
   });
   const cases = [
     { id: "pri1", row: mkRow("pri1", { updated_by: null }), log: [], deleted: true, why: "pristine row" },
+    {
+      id: "nolg", row: mkRow("nolg"), log: [],
+      deleted: false, why: "updated_by set but no edit_log history (pruned) stays",
+    },
     { id: "aiof", row: mkRow("aiof"), log: [aiCreate("aiof")], deleted: true, why: "AI-only row" },
     {
       id: "edit", row: mkRow("edit", { note: "A translator rewrote this." }),
