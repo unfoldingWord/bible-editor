@@ -87,8 +87,8 @@ DCS_EXPORT_OWNER = "unfoldingWord"
 TN_QUICK_URL = "https://uw-bt-bot.fly.dev/api/tn-quick"
 PIPELINE_API_BASE = "https://uw-bt-bot.fly.dev"
 # Send options.kept (the notes an AI notes run must leave in place, #1152) on a
-# notes dispatch. Off until the live test on EZK 40 passes; flip to "true" in a
-# PR. Exact "true" compare in code. See docs/bp-assistant-kept-notes-contract.md.
+# notes dispatch. On in production since the offline EZK 40 check (#1152); the
+# switch is "false" + redeploy. Exact "true" compare. See docs/bp-assistant-kept-notes-contract.md.
 KEPT_NOTES_ENABLED = "false"
 
 # ── PRODUCTION ENV ──────────────────────────────────────────────────────────
@@ -161,6 +161,6 @@ DCS_EXPORT_OWNER = "unfoldingWord"
 TN_QUICK_URL = "https://uw-bt-bot.fly.dev/api/tn-quick"
 PIPELINE_API_BASE = "https://uw-bt-bot.fly.dev"
 # Send options.kept (the notes an AI notes run must leave in place, #1152) on a
-# notes dispatch. Off until the live test on EZK 40 passes; flip to "true" in a
-# PR. Exact "true" compare in code. See docs/bp-assistant-kept-notes-contract.md.
+# notes dispatch. On in production since the offline EZK 40 check (#1152); the
+# switch is "false" + redeploy. Exact "true" compare. See docs/bp-assistant-kept-notes-contract.md.
 KEPT_NOTES_ENABLED = "true"
