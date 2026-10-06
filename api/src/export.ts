@@ -248,7 +248,9 @@ function tsvLine(cells: unknown[]): string {
 //
 // This is NOT the translator "keep this note through an AI run" flag — that's
 // the `preserve` column (see pipelineImport.ts ~line 1053), not `tags`.
-// Blanking `tags` on export cannot affect preserve-gated behavior.
+// Because Tags is blanked, master never tells the bot which notes are kept (the
+// bot only honors a KEEP value there): the editor sends them as options.kept on
+// a notes run instead (keptNotes.ts, issue #1152).
 //
 // twl keeps its `tags` as-is: Shell.tsx can set a real tag on TWL creation,
 // so that column is human-ownable and not part of this stale-diagnostic mess.

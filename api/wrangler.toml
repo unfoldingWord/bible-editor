@@ -86,6 +86,10 @@ DEV_AUTH_ENABLED = "true"
 DCS_EXPORT_OWNER = "unfoldingWord"
 TN_QUICK_URL = "https://uw-bt-bot.fly.dev/api/tn-quick"
 PIPELINE_API_BASE = "https://uw-bt-bot.fly.dev"
+# Send options.kept (the notes an AI notes run must leave in place, #1152) on a
+# notes dispatch. Off until the live test on EZK 40 passes; flip to "true" in a
+# PR. Exact "true" compare in code. See docs/bp-assistant-kept-notes-contract.md.
+KEPT_NOTES_ENABLED = "false"
 
 # ── PRODUCTION ENV ──────────────────────────────────────────────────────────
 # Activated by `wrangler deploy --env production` (which is what `npm run
@@ -156,3 +160,7 @@ DEV_AUTH_ENABLED = "false"
 DCS_EXPORT_OWNER = "unfoldingWord"
 TN_QUICK_URL = "https://uw-bt-bot.fly.dev/api/tn-quick"
 PIPELINE_API_BASE = "https://uw-bt-bot.fly.dev"
+# Send options.kept (the notes an AI notes run must leave in place, #1152) on a
+# notes dispatch. Off until the live test on EZK 40 passes; flip to "true" in a
+# PR. Exact "true" compare in code. See docs/bp-assistant-kept-notes-contract.md.
+KEPT_NOTES_ENABLED = "false"

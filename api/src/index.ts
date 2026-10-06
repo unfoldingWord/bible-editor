@@ -88,6 +88,12 @@ export interface Env {
   // once that's verified against the real bot, per
   // docs/bp-assistant-intro-hints-contract.md.
   INTRO_HINTS_ENABLED?: string;
+  // Gates whether options.kept (issue #1152, the notes an AI run must leave in
+  // place) is sent on a notes dispatch. Exact `=== "true"` compare, same
+  // reasoning as INTRO_HINTS_ENABLED. bp-assistant accepts the key since
+  // release 507; the flag stays off until the live test on EZK 40 passes.
+  // See docs/bp-assistant-kept-notes-contract.md.
+  KEPT_NOTES_ENABLED?: string;
 }
 
 // Cron patterns must match the [env.production.triggers] crons list in
