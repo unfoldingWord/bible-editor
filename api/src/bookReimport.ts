@@ -15,8 +15,10 @@
 //      reimport — it's promoted to a deleted_at tombstone by the nightly job.)
 //   2. AI-only — the AI pipeline wrote the row (so updated_by is the pipeline
 //      starter's id) but no human has edited it since: the latest content-bearing
-//      edit_log entry is source='ai_pipeline'. This is the same signal the AI
-//      pipeline sweep uses in pipelineImport.ts deleteUnkeptTns. An AI-only row is
+//      edit_log entry is source='ai_pipeline'. This coarse signal is what the AI
+//      pipeline sweep (pipelineImport.ts deleteUnkeptTns) used before #1152 PR B;
+//      the sweep now uses classifyKept (keptNotes.ts) and this reimport rule
+//      stays deliberately more conservative (it keeps more). An AI-only row is
 //      re-seeded from master exactly like a pristine one AND reclaimed to
 //      master-owned (updated_by → NULL), counted as `reimported_ai` (NOT the
 //      misleading `skipped_edited`). Its write is guarded by version-CAS + the
@@ -1890,7 +1892,7 @@ export async function applyTsvRows(
     const inClause = slice.map((_, j) => `?${j + 3}`).join(", ");
     // latest_source: source of the latest content-bearing edit_log entry, so we
     // can tell an AI-only row (updated_by set, latest source = ai_pipeline) apart
-    // from a human edit. Mirrors the deleteUnkeptTns correlated subquery.
+    // from a human edit. Same subquery deleteUnkeptTns used before it moved to classifyKept.
     const rs = await env.DB.prepare(
       // review_reason is selected alongside review_kind because two flag writers
       // below compare against it to avoid re-writing an identical message every

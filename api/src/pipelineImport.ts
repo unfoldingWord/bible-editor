@@ -29,6 +29,7 @@ import { hoistOpeningPunctuation } from "./openingPunct.ts";
 import { NT_BOOKS } from "./dcsSources.ts";
 import { newRowId, isValidRowId, coerceRowId, deriveAltRowId } from "./rowId.ts";
 import { tnContentKey } from "./tnDedup.ts";
+import { classifyKept, loadEditLogs, type KeptRow } from "./keptNotes.ts";
 import { requiredOccurrence } from "./occurrenceRule.ts";
 import { resourcesWrittenBy } from "./chapterLock.ts";
 import {
@@ -1357,17 +1358,19 @@ export async function deleteUnkeptTns(
   // starter on every note it creates, so a re-run's notes are NOT pristine and
   // a plain `updated_by IS NULL` sweep would skip them — leaving them in place
   // while the re-run inserts a full fresh set, DOUBLING every note (ISA 36/41,
-  // 2026-06). Class (b) is identified by the most-recent CONTENT-bearing
-  // edit_log entry (action IN create/update) still being source 'ai_pipeline'.
-  // The action filter matters: /preserve/hint/trash toggles write NULL-source
-  // audit rows (rows.ts), so an AI note that was preserved-then-unpreserved
-  // would otherwise look human-owned (its LATEST audit row is 'unpreserve',
-  // source NULL) and dodge the sweep forever. A real human content edit writes
-  // action 'update' source NULL, and a hint expansion writes 'hint_expansion'
-  // — both correctly take the latest content action off 'ai_pipeline', so an
-  // edited / hint-owned note is protected. The reimport never rewrites an AI
-  // row (its UPDATE/prune are updated_by-IS-NULL gated), so the content source
-  // stays 'ai_pipeline' reliably.
+  // 2026-06). Class (b) is every row with updated_by set that classifyKept
+  // (keptNotes.ts) does not keep. That is the SAME rule that built the
+  // `options.kept` list sent to the bot (#1152), so "what the bot was told to
+  // leave" and "what this sweep refuses to delete" cannot disagree. The old
+  // rule here (latest create/update source != 'ai_pipeline' means human-owned)
+  // kept ~100 rows the bot was never told to keep: reorder-only and
+  // whitespace-only saves, edits reverted to the AI text, quote-repair
+  // scripts, Door43 tag-only syncs. The bot deleted those from master, the AI
+  // rewrote them, and the sweep left the D1 copy standing, so every re-run
+  // grew a duplicate. classifyKept replays each row's full create/update/
+  // restore history, which is why the SELECT below reads rows and a second
+  // query (loadEditLogs) reads their history, instead of one correlated
+  // subquery on the latest source.
   //
   // trashed_at IS NULL: a trashed AI note is left alone — the content-dedup
   // claim set below (seeded from deleted_at IS NULL rows, which includes
@@ -1437,40 +1440,44 @@ export async function deleteUnkeptTns(
   const pairs = tnSweepScope(tnProposals, resolved.results ?? []);
   if (pairs.length === 0) return 0;
 
-  // D1 caps bound parameters at 100 per statement. This query already binds 4
-  // fixed params (book, startChapter, endChapter, AI_SOURCE) before the pair
-  // params, so the chunk size must leave room: 4 + 2*CHUNK_PAIRS <= 100.
-  // 40 pairs -> 84 total, comfortable headroom below the cap.
+  // D1 caps bound parameters at 100 per statement. This query already binds 3
+  // fixed params (book, startChapter, endChapter) before the pair params, so
+  // the chunk size must leave room: 3 + 2*CHUNK_PAIRS <= 100. 40 pairs -> 83
+  // total, comfortable headroom below the cap.
   const CHUNK_PAIRS = 40;
-  const list: { id: string; version: number }[] = [];
+  const candidates: (KeptRow & { version: number; updated_by: number | null })[] = [];
   for (let i = 0; i < pairs.length; i += CHUNK_PAIRS) {
     const slice = pairs.slice(i, i + CHUNK_PAIRS);
     const pairClauses = slice
-      .map((_, idx) => `(t.chapter = ?${5 + idx * 2} AND t.verse = ?${6 + idx * 2})`)
+      .map((_, idx) => `(chapter = ?${4 + idx * 2} AND verse = ?${5 + idx * 2})`)
       .join(" OR ");
     const pairParams = slice.flatMap((pair) => [pair.chapter, pair.verse]);
     const rs = await env.DB.prepare(
-      `SELECT id, version FROM tn_rows t
+      `SELECT id, version, book, chapter, verse, ref_raw, quote, note,
+              support_reference, preserve, updated_by
+         FROM tn_rows
         WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
           AND deleted_at IS NULL AND trashed_at IS NULL
           AND preserve = 0 AND hint = 0
-          AND (${pairClauses})
-          AND (
-            updated_by IS NULL
-            OR (
-              SELECT source FROM edit_log
-                WHERE kind = 'tn' AND row_key = t.id
-                  AND (book = t.book OR book IS NULL)
-                  AND action IN ('create', 'update')
-                ORDER BY id DESC LIMIT 1
-            ) = ?4
-          )`,
+          AND (${pairClauses})`,
     )
-      .bind(job.book, job.startChapter, job.endChapter, AI_SOURCE, ...pairParams)
-      .all<{ id: string; version: number }>();
-    list.push(...(rs.results ?? []));
+      .bind(job.book, job.startChapter, job.endChapter, ...pairParams)
+      .all<KeptRow & { version: number; updated_by: number | null }>();
+    candidates.push(...(rs.results ?? []));
     await maybeTouchClaim(env, job.jobId, heartbeat);
   }
+  // Read the history AFTER the rows: an edit landing in between bumps the
+  // row's version, so the version-CAS in the delete below aborts that row.
+  const logs = await loadEditLogs(
+    env,
+    job.book,
+    candidates.filter((r) => r.updated_by != null).map((r) => r.id),
+  );
+  await maybeTouchClaim(env, job.jobId, heartbeat);
+  // A pristine row (updated_by NULL) is never kept, same as loadKeptTns.
+  const list = candidates
+    .filter((r) => r.updated_by == null || !classifyKept(r, logs.get(r.id) ?? []).kept)
+    .map((r) => ({ id: r.id, version: r.version }));
   if (list.length === 0) return 0;
 
   const now = Math.floor(Date.now() / 1000);
