@@ -20,6 +20,7 @@ import { z } from "zod";
 import type { Env } from "./index";
 import { currentUserId, requireEditor } from "./auth.ts";
 import { importJobOutput } from "./pipelineImport.ts";
+import { buildKeptOption } from "./keptNotes.ts";
 import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim.ts";
 import { resourcesLockedByJob } from "./chapterLock.ts";
 import {
@@ -323,6 +324,8 @@ interface PolledJob {
 // 400 the resume the same way a stray `fresh` would. Drop it here rather than
 // gate it at the call site — resumeOptionsFromJson is the one place that must
 // agree with the bot's resume schema, and the /start path is unaffected.
+// `kept` (issue #1152) is never stored in options_json, but is stripped here
+// for the same reason: the bot reuses the list from its checkpoint.
 export function resumeOptionsFromJson(
   optionsJson: string | null,
   jobId: string,
@@ -344,6 +347,7 @@ export function resumeOptionsFromJson(
     return undefined;
   }
   const { fresh: _fresh, introHints: _introHints, ...rest } = parsed as Record<string, unknown>;
+  delete rest.kept;
   return rest;
 }
 
@@ -547,6 +551,41 @@ export async function dispatchNext(env: Env): Promise<void> {
       options = JSON.parse(job.options_json);
     } catch {
       /* corrupt snapshot — dispatch without options rather than wedge */
+    }
+  }
+
+  // options.kept (issue #1152): the notes the AI run must leave in place. Built
+  // HERE, at dispatch time, and never stored in options_json, so a run that sat
+  // in the queue still gets the current list and a resume (which replays
+  // options_json) never carries it — the bot reuses the list from its own
+  // checkpoint. Notes runs only; the "Generate everything" chain's notes step
+  // is enqueued as an ordinary queued job and so passes through here too.
+  //
+  // If the list cannot be built the job FAILS rather than dispatching without
+  // it: a notes run with no kept list is exactly the run that deletes the
+  // translators' notes from master.
+  if (job.pipeline_type === "notes" && env.KEPT_NOTES_ENABLED === "true") {
+    const base =
+      options && typeof options === "object" && !Array.isArray(options)
+        ? { ...(options as Record<string, unknown>) }
+        : {};
+    delete base.kept;
+    try {
+      const hints = Array.isArray(base.hints) ? (base.hints as ({ rowId?: unknown } | null)[]) : [];
+      const hintIds = new Set(hints.map((h) => String(h?.rowId)));
+      const kept = await buildKeptOption(
+        env,
+        job.book,
+        job.start_chapter,
+        job.end_chapter,
+        hintIds,
+      );
+      options = kept.length > 0 ? { ...base, kept } : options ? base : options;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[dispatchNext] job=${job.job_id} kept list failed:`, e);
+      await fail("sdk_error", `kept_notes_unavailable: ${msg}`);
+      return;
     }
   }
 
