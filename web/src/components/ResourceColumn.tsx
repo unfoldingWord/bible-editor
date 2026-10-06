@@ -1581,8 +1581,8 @@ function SectionHead({
         sx={{ display: "flex", border: "1px solid", borderColor: "divider", borderRadius: 1, overflow: "hidden" }}
       >
         {[
-          { on: !pinned, label: "this verse", tip: `Show ${lowerTitle} for the active verse only` },
-          { on: pinned, label: "whole chapter", tip: `Show ${lowerTitle} for every verse in this chapter` },
+          { on: !pinned, label: "verse", tip: `Show ${lowerTitle} for the active verse only` },
+          { on: pinned, label: "chapter", tip: `Show ${lowerTitle} for every verse in this chapter` },
         ].map((o) => (
           <Tooltip key={o.label} title={o.tip}>
             <Box
@@ -1659,16 +1659,18 @@ function SectionHead({
         </Tooltip>
       )}
       {hideAdd ? null : (
-        <Button
-          size="small"
-          startIcon={<AddIcon fontSize="small" />}
-          color="success"
-          variant="outlined"
-          sx={{ minWidth: 0, fontSize: 11 }}
-          onClick={onAdd}
-        >
-          new
-        </Button>
+        <Tooltip title={`New ${lowerTitle.replace(/s$/, "")}`}>
+          <Button
+            size="small"
+            aria-label={`New ${lowerTitle.replace(/s$/, "")}`}
+            color="success"
+            variant="outlined"
+            sx={{ minWidth: 0, px: 0.5, height: 20 }}
+            onClick={onAdd}
+          >
+            <AddIcon fontSize="small" />
+          </Button>
+        </Tooltip>
       )}
     </Stack>
   );
