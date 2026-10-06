@@ -1216,9 +1216,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // fine, and lint.ts plus the save-path guards are where a blank row gets
     // caught. Prod carries 0 blank-OrigWords rows today.
     //
-    // Unpaired `[ ]` in a tn Note (check 13) is the translator-fixable hard
-    // error this gate holds for (issue #1015, JER 17:4 ny7v). The banner names
-    // the row, and a clean render clears it — on a dry run too, since the
+    // Unpaired `[ ]` in a tn Note (check 13) no longer holds either: en_tn
+    // d6fc28c11c (2026-09-28) made it a severity="warning", so it merges, and
+    // lint.ts flags it in-app (issue #1149, which reversed #1015's hold). A
+    // clean render clears any stale HELD banner — on a dry run too, since the
     // clear only reads the bytes (the HOLD itself needs dcsAllowed).
     if (resource === "tn" || resource === "twl") {
       const rejects = hardRejectRows(resource, built.content);
