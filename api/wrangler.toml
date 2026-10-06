@@ -163,4 +163,4 @@ PIPELINE_API_BASE = "https://uw-bt-bot.fly.dev"
 # Send options.kept (the notes an AI notes run must leave in place, #1152) on a
 # notes dispatch. Off until the live test on EZK 40 passes; flip to "true" in a
 # PR. Exact "true" compare in code. See docs/bp-assistant-kept-notes-contract.md.
-KEPT_NOTES_ENABLED = "false"
+KEPT_NOTES_ENABLED = "true"
