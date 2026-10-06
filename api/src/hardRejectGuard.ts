@@ -172,8 +172,8 @@ export function buildHardRejectAlertMessage(
     .map((r) => `${r.ref} (${r.rowId}): ${r.reason}`)
     .join("; ");
   const more = rejects.length > 6 ? `; +${rejects.length - 6} more` : "";
-  // One row can carry several problems (two unclosed brackets, or a bracket and
-  // an Occurrence), so count rows by ID rather than reporting the problem count.
+  // hardRejectRows reports at most one problem per row today, but count rows by
+  // ID rather than entries so the banner stays right if a rule is ever added.
   const rowCount = new Set(rejects.map((r) => r.rowId)).size;
   return (
     `Benjamin — nightly export HELD ${label}: ${rowCount} row(s) would fail DCS ` +
