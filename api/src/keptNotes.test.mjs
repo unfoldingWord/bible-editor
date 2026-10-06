@@ -68,7 +68,7 @@ assert(!verdict(row({ note: "from master" }), [aiCreate(), ev("update", "dcs_rei
 
 // migration / hint
 assert(verdict(row(), [ev("create", "parallel_migration", 2, { ...AI_TEXT })]).reason === "migration", "parallel_migration → kept (D4)");
-assert(!verdict(row(), [ev("create", "parallel_migration", 2, { ...AI_TEXT }), ev("update", "ai_pipeline", 7, { note: "x" })]).kept, "migration note the AI later rewrote → not kept");
+assert(!verdict(row({ note: "x" }), [ev("create", "parallel_migration", 2, { ...AI_TEXT }), ev("update", "ai_pipeline", 7, { note: "x" })]).kept, "migration note the AI later rewrote → not kept");
 assert(verdict(row(), [ev("create", null, 5, { quote: "", note: "stub", support_reference: "" }), ev("update", "hint_expansion", 5, { note: "expanded" })]).reason === "hint", "hint_expansion → kept (D5)");
 
 // repair batch
@@ -82,7 +82,12 @@ assert(verdict(row(), [ev("update", null, 5, { note: "x" })]).reason === "fallba
 assert(!verdict(row(), [ev("update", "ai_pipeline", 7, { note: "x" })]).kept, "no create, AI wrote last → not kept");
 assert(verdict(row(), []).reason === "fallback", "no log at all but updated_by set → fallback keeps");
 
+// pruned update: AI create survives, a person's later update aged out of the log
+assert(verdict(row({ note: "person wrote this" }), [aiCreate()]).reason === "unexplained", "live content the log cannot explain → kept");
+
 // toKeptOption
+assert(toKeptOption(row({ ref_raw: "40:12-14" })).ref === "40:12-14", "forward same-chapter range sent as is");
+assert(toKeptOption(row({ ref_raw: "40:2,4", chapter: 40, verse: 2 })).ref === "40:2", "comma-list ref sent as its leading verse");
 assert(toKeptOption(row({ quote: "q".repeat(501) })).quote === "", "quote over 500 chars → sent empty");
 assert(toKeptOption(row({ support_reference: "s".repeat(150) })).supportReference.length === 100, "support reference cut to 100");
 assert(toKeptOption(row({ note: "n".repeat(900) })).note === undefined, "note is never sent");

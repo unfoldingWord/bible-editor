@@ -570,9 +570,9 @@ export async function dispatchNext(env: Env): Promise<void> {
         ? { ...(options as Record<string, unknown>) }
         : {};
     delete base.kept;
-    const hints = Array.isArray(base.hints) ? (base.hints as { rowId?: unknown }[]) : [];
-    const hintIds = new Set(hints.map((h) => String(h.rowId)));
     try {
+      const hints = Array.isArray(base.hints) ? (base.hints as ({ rowId?: unknown } | null)[]) : [];
+      const hintIds = new Set(hints.map((h) => String(h?.rowId)));
       const kept = await buildKeptOption(
         env,
         job.book,
@@ -580,7 +580,7 @@ export async function dispatchNext(env: Env): Promise<void> {
         job.end_chapter,
         hintIds,
       );
-      if (kept.length > 0) options = { ...base, kept };
+      options = kept.length > 0 ? { ...base, kept } : options ? base : options;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[dispatchNext] job=${job.job_id} kept list failed:`, e);

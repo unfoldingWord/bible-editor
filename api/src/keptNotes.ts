@@ -63,6 +63,7 @@ export type KeptReason =
   | "migration"
   | "hint"
   | "edited"
+  | "unexplained"
   | "fallback"
   | null;
 
@@ -191,8 +192,14 @@ export function classifyKept(
     firstHuman = human.findIndex((h) => h);
     baseline = firstHuman <= 0 ? EMPTY : states[firstHuman - 1];
   }
+  // Live content the log cannot explain: an update aged out of edit_log (the
+  // 180-day sweep) after a person made it. Someone changed the note, so keep.
+  const live = contentOf(row);
+  if (!sameContent(live, states[states.length - 1])) {
+    return { kept: true, reason: "unexplained" };
+  }
   if (firstHuman < 0) return { kept: false, reason: null };
-  return sameContent(contentOf(row), baseline)
+  return sameContent(live, baseline)
     ? { kept: false, reason: null }
     : { kept: true, reason: "edited" };
 }
@@ -227,7 +234,12 @@ function refRunsBackwards(ref: string): boolean {
 // sent: the bot does not use it. An over-long quote is sent empty: an empty
 // quote still protects by id and by support reference.
 export function toKeptOption(row: KeptRow): KeptOption | null {
-  const ref = row.ref_raw;
+  let ref = row.ref_raw;
+  // A comma list ("40:2,4", "1:1,3-5") has no form in the bot's schema; send
+  // the leading verse so the row is still kept by id.
+  if (ref && ref.includes(",") && /^\d+:\d+[\d,\-]*$/.test(ref) && row.chapter > 0 && row.verse > 0) {
+    ref = `${row.chapter}:${row.verse}`;
+  }
   if (!ROW_ID_RE.test(row.id)) return null;
   if (!ref || ref.length > MAX_REF || !REF_RE.test(ref) || refRunsBackwards(ref)) return null;
   const quote = row.quote ?? "";
