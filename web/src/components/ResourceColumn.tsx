@@ -1618,6 +1618,7 @@ function SectionHead({
           <Box
             role="checkbox"
             aria-checked={shade !== "open"}
+            aria-label={`${title} checked for this verse`}
             tabIndex={0}
             onClick={() => checkoff.onToggle(lane)}
             onKeyDown={(e) => {
@@ -1634,7 +1635,7 @@ function SectionHead({
               borderColor: fill ? "transparent" : "divider",
             }}
           >
-            <CheckIcon sx={{ fontSize: 13 }} /> verse checked
+            <CheckIcon sx={{ fontSize: 13 }} /> vrs
           </Box>
         </Tooltip>
       )}
@@ -1642,6 +1643,7 @@ function SectionHead({
         <Tooltip title={`Check ${lowerTitle} for every applicable verse in this chapter (asks for confirmation)`}>
           <Box
             role="button"
+            aria-label={`Check ${lowerTitle} for the whole chapter`}
             tabIndex={0}
             onClick={() => checkoff.onBulkToggle(lane)}
             onKeyDown={(e) => {
@@ -1652,7 +1654,7 @@ function SectionHead({
             }}
             sx={{ ...pill, color: "primary.main", border: "1px dashed", borderColor: "primary.main" }}
           >
-            <DoneAllIcon sx={{ fontSize: 13 }} /> check chapter…
+            <DoneAllIcon sx={{ fontSize: 13 }} /> ch
           </Box>
         </Tooltip>
       )}
