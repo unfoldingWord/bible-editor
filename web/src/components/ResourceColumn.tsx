@@ -1576,7 +1576,7 @@ function SectionHead({
           visible and the active one is filled (not a label that names the
           current state and reads like a button for the other). */}
       <Box
-        role="radiogroup"
+        role="group"
         aria-label={`${title}: which verses to show`}
         sx={{ display: "flex", border: "1px solid", borderColor: "divider", borderRadius: 1, overflow: "hidden" }}
       >
@@ -1586,16 +1586,16 @@ function SectionHead({
         ].map((o) => (
           <Tooltip key={o.label} title={o.tip}>
             <Box
-              role="radio"
-              aria-checked={o.on}
+              role="button"
+              aria-pressed={o.on}
               tabIndex={0}
               onClick={() => {
                 if (!o.on) onTogglePin();
               }}
               onKeyDown={(e) => {
-                if ((e.key === "Enter" || e.key === " ") && !o.on) {
+                if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
                   e.preventDefault();
-                  onTogglePin();
+                  if (!o.on) onTogglePin();
                 }
               }}
               sx={{
@@ -1621,7 +1621,7 @@ function SectionHead({
             tabIndex={0}
             onClick={() => checkoff.onToggle(lane)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
+              if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
                 e.preventDefault();
                 checkoff.onToggle(lane);
               }
@@ -1645,7 +1645,7 @@ function SectionHead({
             tabIndex={0}
             onClick={() => checkoff.onBulkToggle(lane)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
+              if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
                 e.preventDefault();
                 checkoff.onBulkToggle(lane);
               }
