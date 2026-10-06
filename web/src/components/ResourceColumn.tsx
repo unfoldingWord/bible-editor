@@ -1572,6 +1572,22 @@ function SectionHead({
         variant="outlined"
         sx={{ height: 18, fontFamily: "monospace", fontSize: 10 }}
       />
+      {/* New sits beside the title, away from the check buttons on the right, so a
+          click aimed at "+" can't land on "✓✓ ch" (which checks the whole chapter). */}
+      {hideAdd ? null : (
+        <Tooltip title={`New ${lowerTitle.replace(/s$/, "")}`}>
+          <Button
+            size="small"
+            aria-label={`New ${lowerTitle.replace(/s$/, "")}`}
+            color="success"
+            variant="outlined"
+            sx={{ minWidth: 0, px: 0.5, height: 20 }}
+            onClick={onAdd}
+          >
+            <AddIcon fontSize="small" />
+          </Button>
+        </Tooltip>
+      )}
       {/* What is shown: a two-option segmented control, so both choices are
           visible and the active one is filled (not a label that names the
           current state and reads like a button for the other). */}
@@ -1656,20 +1672,6 @@ function SectionHead({
           >
             <DoneAllIcon sx={{ fontSize: 13 }} /> ch
           </Box>
-        </Tooltip>
-      )}
-      {hideAdd ? null : (
-        <Tooltip title={`New ${lowerTitle.replace(/s$/, "")}`}>
-          <Button
-            size="small"
-            aria-label={`New ${lowerTitle.replace(/s$/, "")}`}
-            color="success"
-            variant="outlined"
-            sx={{ minWidth: 0, px: 0.5, height: 20 }}
-            onClick={onAdd}
-          >
-            <AddIcon fontSize="small" />
-          </Button>
         </Tooltip>
       )}
     </Stack>
