@@ -261,6 +261,37 @@ export interface KeptLoad {
   candidates: number;
 }
 
+// The create/update/restore history of each id, in log order. Shared with the
+// import sweep (deleteUnkeptTns) so it replays the same history the kept list
+// was built from.
+export async function loadEditLogs(
+  env: Env,
+  book: string,
+  ids: string[],
+): Promise<Map<string, KeptLogEntry[]>> {
+  const logs = new Map<string, KeptLogEntry[]>();
+  for (let i = 0; i < ids.length; i += ID_CHUNK) {
+    const slice = ids.slice(i, i + ID_CHUNK);
+    const placeholders = slice.map((_, idx) => `?${idx + 2}`).join(", ");
+    const el = await env.DB.prepare(
+      `SELECT row_key, action, source, user_id, created_at, payload_json
+         FROM edit_log
+        WHERE kind = 'tn' AND (book = ?1 OR book IS NULL)
+          AND action IN ('create', 'update', 'restore')
+          AND row_key IN (${placeholders})
+        ORDER BY id`,
+    )
+      .bind(book, ...slice)
+      .all<KeptLogEntry & { row_key: string }>();
+    for (const e of el.results ?? []) {
+      const list = logs.get(e.row_key);
+      if (list) list.push(e);
+      else logs.set(e.row_key, [e]);
+    }
+  }
+  return logs;
+}
+
 // The kept notes among the live, non-hint, non-trashed rows of the chapter
 // range. Pristine rows (updated_by NULL) are never candidates, except that a
 // preserve row always is.
@@ -282,27 +313,11 @@ export async function loadKeptTns(
     .all<KeptRow>();
   const candidates = rs.results ?? [];
 
-  const logs = new Map<string, KeptLogEntry[]>();
-  const needLog = candidates.filter((r) => r.preserve !== 1).map((r) => r.id);
-  for (let i = 0; i < needLog.length; i += ID_CHUNK) {
-    const slice = needLog.slice(i, i + ID_CHUNK);
-    const placeholders = slice.map((_, idx) => `?${idx + 2}`).join(", ");
-    const el = await env.DB.prepare(
-      `SELECT row_key, action, source, user_id, created_at, payload_json
-         FROM edit_log
-        WHERE kind = 'tn' AND (book = ?1 OR book IS NULL)
-          AND action IN ('create', 'update', 'restore')
-          AND row_key IN (${placeholders})
-        ORDER BY id`,
-    )
-      .bind(book, ...slice)
-      .all<KeptLogEntry & { row_key: string }>();
-    for (const e of el.results ?? []) {
-      const list = logs.get(e.row_key);
-      if (list) list.push(e);
-      else logs.set(e.row_key, [e]);
-    }
-  }
+  const logs = await loadEditLogs(
+    env,
+    book,
+    candidates.filter((r) => r.preserve !== 1).map((r) => r.id),
+  );
 
   const rows: KeptLoad["rows"] = [];
   for (const row of candidates) {

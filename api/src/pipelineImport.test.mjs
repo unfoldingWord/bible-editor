@@ -436,13 +436,13 @@ function tnProposal(chapter, verse) {
 }
 
 function selectCalls(calls) {
-  return calls.filter((c) => /SELECT id, version FROM tn_rows/.test(c.sql));
+  return calls.filter((c) => /SELECT id, version, book, chapter/.test(c.sql));
 }
 
 function pairsFromArgs(args) {
-  // args = [book, startChapter, endChapter, AI_SOURCE, ch1, v1, ch2, v2, ...]
+  // args = [book, startChapter, endChapter, ch1, v1, ch2, v2, ...]
   const pairs = [];
-  for (let i = 4; i < args.length; i += 2) {
+  for (let i = 3; i < args.length; i += 2) {
     pairs.push({ chapter: args[i], verse: args[i + 1] });
   }
   return pairs;
@@ -510,14 +510,20 @@ await (async () => {
     "preserve = 0",
     "hint = 0",
     "chapter BETWEEN",
-    "updated_by IS NULL",
   ]) {
     assert(sql.includes(guard), `guard-preservation: generated SQL retains "${guard}"`);
   }
+  // The keep decision moved out of SQL into classifyKept (#1152 PR B): the
+  // SELECT must return every candidate (no updated_by / latest-source filter,
+  // or a row classifyKept would delete is never seen) and must hand back the
+  // columns classifyKept reads.
   assert(
-    /FROM edit_log/.test(sql) && /action IN \('create', 'update'\)/.test(sql),
-    "guard-preservation: generated SQL retains the edit_log latest-content-source subquery",
+    !/updated_by IS NULL/.test(sql) && !/FROM edit_log/.test(sql),
+    "keep rule: the SELECT no longer filters on updated_by or the latest edit_log source",
   );
+  for (const col of ["updated_by", "quote", "note", "support_reference", "preserve", "ref_raw"]) {
+    assert(sql.includes(col), `keep rule: the SELECT returns ${col} for classifyKept`);
+  }
 })();
 
 // --- Test 2b: Codex finding — a verse with an accepted proposal must be
@@ -599,7 +605,122 @@ await (async () => {
     inputKeys.every((k) => seenSet.has(k)),
     "binding integrity: union of bound pairs across all statements equals the input pairs exactly",
   );
-});
+})();
+
+// --- #1152 PR B: the sweep deletes exactly what classifyKept does not keep ---
+// Drives the REAL deleteUnkeptTns with candidate rows + edit_log history and
+// asserts which ids reach the delete batch. Each case is a row class where the
+// old sweep rule (latest create/update source != 'ai_pipeline' => human-owned)
+// and classifyKept disagreed on prod (measured 2026-10-06 on EZK/ISA/DAN/ZEC:
+// 66 rows with latest source NULL, 35 with dcs_reimport, all kept by the old
+// sweep and NOT in the kept list sent to the bot).
+await (async () => {
+  const { classifyKept } = await import("./keptNotes.ts");
+  const AI = { quote: "q", note: "AI wrote this note.", support_reference: "rc://*/ta/man/translate/figs-metaphor" };
+  let ts = 5_000;
+  const ev = (action, source, user_id, payload) => ({
+    action, source, user_id, created_at: (ts += 10), payload_json: JSON.stringify(payload),
+  });
+  const aiCreate = (id) => ({ row_key: id, ...ev("create", "ai_pipeline", 7, AI) });
+  const withKey = (id, e) => ({ row_key: id, ...e });
+  const mkRow = (id, over = {}) => ({
+    id, version: 3, book: "DAN", chapter: 11, verse: 32, ref_raw: "11:32",
+    preserve: 0, updated_by: 7, ...AI, ...over,
+  });
+  const cases = [
+    { id: "pri1", row: mkRow("pri1", { updated_by: null }), log: [], deleted: true, why: "pristine row" },
+    {
+      id: "nolg", row: mkRow("nolg"), log: [],
+      deleted: false, why: "updated_by set but no edit_log history (pruned) stays",
+    },
+    { id: "aiof", row: mkRow("aiof"), log: [aiCreate("aiof")], deleted: true, why: "AI-only row" },
+    {
+      id: "edit", row: mkRow("edit", { note: "A translator rewrote this." }),
+      log: [aiCreate("edit"), withKey("edit", ev("update", null, 9, { note: "A translator rewrote this." }))],
+      deleted: false, why: "real human edit stays",
+    },
+    {
+      id: "wsps", row: mkRow("wsps", { note: "AI wrote this note. " }),
+      log: [aiCreate("wsps"), withKey("wsps", ev("update", null, 9, { note: "AI wrote this note. " }))],
+      deleted: true, why: "whitespace-only human save (old rule kept it)",
+    },
+    {
+      id: "reor", row: mkRow("reor"),
+      log: [aiCreate("reor"), withKey("reor", ev("update", null, 9, { sort_order: 200 }))],
+      deleted: true, why: "reorder-only save (old rule kept it)",
+    },
+    {
+      id: "rvrt", row: mkRow("rvrt"),
+      log: [
+        aiCreate("rvrt"),
+        withKey("rvrt", ev("update", null, 9, { note: "Changed." })),
+        withKey("rvrt", ev("update", null, 9, { note: AI.note })),
+      ],
+      deleted: true, why: "edited then reverted to the AI text (old rule kept it)",
+    },
+    {
+      id: "rpar", row: mkRow("rpar", { quote: "q2" }),
+      log: [aiCreate("rpar"), withKey("rpar", ev("update", "quote_repair", 2, { quote: "q2" }))],
+      deleted: true, why: "quote-repair script rewrite (old rule kept it)",
+    },
+    {
+      id: "dcsr", row: mkRow("dcsr"),
+      log: [aiCreate("dcsr"), withKey("dcsr", ev("update", "dcs_reimport", null, { tags: null }))],
+      deleted: true, why: "Door43 sync that only cleared tags (old rule kept it)",
+    },
+    {
+      id: "migr", row: mkRow("migr"),
+      log: [withKey("migr", ev("create", "parallel_migration", 2, AI))],
+      deleted: false, why: "migrated note stays (D4)",
+    },
+  ];
+
+  const deletedIds = [];
+  const logRows = cases.flatMap((c) => c.log);
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              sql, args,
+              async all() {
+                if (/FROM pending_imports/.test(sql)) return { results: [] };
+                if (/SELECT id, version, book, chapter/.test(sql)) return { results: cases.map((c) => c.row) };
+                if (/FROM edit_log/.test(sql)) {
+                  const wanted = new Set(args.slice(1));
+                  return { results: logRows.filter((e) => wanted.has(e.row_key)) };
+                }
+                return { results: [] };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts) {
+        return stmts.map((st) => {
+          if (/^\s*UPDATE tn_rows/.test(st.sql)) {
+            deletedIds.push(st.args[2]);
+            return { meta: { changes: 1 } };
+          }
+          return { meta: { changes: 0 } };
+        });
+      },
+    },
+  };
+
+  const n = await deleteUnkeptTns(env, job11, 1, "AI pipeline", [tnProposal(11, 32)], newHeartbeat());
+  assert(n === deletedIds.length, `kept-rule sweep: returned count (${n}) matches deletes issued (${deletedIds.length})`);
+  for (const c of cases) {
+    assert(deletedIds.includes(c.id) === c.deleted, `kept-rule sweep: ${c.why} -> ${c.deleted ? "deleted" : "kept"}`);
+    if (c.row.updated_by != null) {
+      assert(
+        classifyKept(c.row, c.log).kept === !c.deleted,
+        `kept-rule sweep: ${c.id} verdict equals classifyKept (the list the bot was sent)`,
+      );
+    }
+  }
+})();
 
 // --- error-path release is CAS'd too: a pass that already lost the lease must
 //     NOT null out the new owner's claim when it later throws ---
@@ -973,7 +1094,7 @@ function buildFakeAbortDb(flipAfterProposals, opts = {}) {
     if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no accepted TN proposals yet
     }
-    if (/SELECT id, version FROM tn_rows t/.test(sql)) {
+    if (/SELECT id, version, book, chapter/.test(sql)) {
       return { changes: 0, rows: seedTnDeleteRows, single: null };
     }
     if (/UPDATE tn_rows\s+SET deleted_at/.test(sql)) {
@@ -1319,7 +1440,7 @@ await (async () => {
         single: null,
       };
     }
-    if (/SELECT id, version FROM tn_rows t/.test(sql)) {
+    if (/SELECT id, version, book, chapter/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no unkept TNs in scope
     }
     if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
@@ -3174,7 +3295,7 @@ await (async () => {
     if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no accepted TN proposals yet
     }
-    if (/SELECT id, version FROM tn_rows t\b/.test(sql)) {
+    if (/SELECT id, version, book, chapter/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // nothing UNKEPT — the live row is preserved
     }
     if (/SELECT id, version FROM tn_rows\s+WHERE id = \?1/.test(sql)) {
