@@ -41,6 +41,24 @@ const isTnMove = (op: Pick<OutboxOp, "target" | "action" | "patch">) =>
   op.action === "patch" &&
   typeof op.patch?.verse === "number";
 
+// Queue one of this tab's moves under `opId`, marked as this tab's BEFORE the
+// put starts: once the op is in IndexedDB another tab's drain can send it and
+// relay its refusal before the put resolves here (#1174 review), so marking
+// from the resolved op would miss that relay. A synchronous throw from
+// `enqueue` becomes a rejection, like the put's own failure.
+export function enqueueOwnTnMove<T>(
+  relay: Pick<RefusedTnMoveRelay, "markOwn">,
+  opId: string,
+  enqueue: (opId: string) => Promise<T>,
+): Promise<T> {
+  relay.markOwn(opId);
+  try {
+    return enqueue(opId);
+  } catch (e) {
+    return Promise.reject(e);
+  }
+}
+
 export function createRefusedTnMoveRelay(deps: {
   onResult(fn: (op: RefusedTnMove, result: { kind: string }) => void): unknown;
   channel: RelayChannel | null;

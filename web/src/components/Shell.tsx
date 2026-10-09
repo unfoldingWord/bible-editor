@@ -103,6 +103,7 @@ import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
 import { dropOwnRowDeleteClick, markOwnRowDelete, recordOwnRowDeleteClickOp } from "../sync/pendingRowDeletes";
 import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
 import { tnMoveRelay } from "../sync/tnMoveRelay";
+import { enqueueOwnTnMove } from "../sync/refusedTnMoves";
 import {
   alignmentDraftKey,
   alignmentDraftKeyForOp,
@@ -3712,7 +3713,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     kind: "tn" | "tq" | "twl",
     row: T,
     patch: Partial<T>,
-    opts?: { restoredFromVersion?: number },
+    opts?: { restoredFromVersion?: number; opId?: string },
   ) => {
     // Optimistic local apply mirrors what the server will do: any non-revert
     // patch clears the restored_from_version marker so the chip immediately
@@ -4806,11 +4807,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             }
             const sort_order = pickSortOrder(sortedForVerse(tn, effectiveVerse), null, "after");
             // #1174: remember the op as this tab's, so a refusal drained by
-            // another tab is rolled back here too.
-            void enqueueRow("tn", row, { verse: effectiveVerse, ref_raw, sort_order }).then(
-              (op) => tnMoveRelay.markOwn(op.id),
-              (e) => console.error("Shell: could not queue the note move", e),
-            );
+            // another tab is rolled back here too. Marked before it is queued:
+            // another tab can drain and relay it before the put resolves here.
+            enqueueOwnTnMove(tnMoveRelay, crypto.randomUUID(), (opId) =>
+              enqueueRow("tn", row, { verse: effectiveVerse, ref_raw, sort_order }, { opId }),
+            ).catch((e) => console.error("Shell: could not queue the note move", e));
             // Follow the note to its new verse: the resource column only renders
             // notes in displayVerseRange, so without this the moved card vanishes
             // from view. Navigating there confirms the move landed. Must match

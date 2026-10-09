@@ -140,6 +140,35 @@ const move = (id, verse = 12, opId = `op-${id}`) => ({
   check(a.heard.length === 0, "a committed move's mark is cleared");
 }
 {
+  // #1174 review: B drains A's op and relays the refusal before A's enqueue
+  // resolves. Marked before the put starts, A still hears it.
+  const h = hub();
+  const a = tab(h);
+  const b = tab(h);
+  let resolvePut;
+  let queuedId;
+  const queued = (mod.enqueueOwnTnMove ?? ((_r, id, enq) => enq(id)))(a.relay, "op-early", (id) => {
+    queuedId = id;
+    return new Promise((r) => (resolvePut = () => r({ id })));
+  });
+  b.result(move("n1", 12, queuedId), "locked");
+  await settle();
+  check(queuedId === "op-early", "the move is queued under the id it was marked by");
+  check(a.heard.length === 1, "a refusal relayed before the queuing tab's enqueue resolves is still heard");
+  resolvePut();
+  check((await queued).id === "op-early", "enqueueOwnTnMove resolves with the queued op");
+}
+{
+  // A synchronous throw from the enqueue surfaces as a rejection.
+  const r = await (mod.enqueueOwnTnMove ?? (() => Promise.resolve()))({ markOwn() {} }, "x", () => {
+    throw new Error("boom");
+  }).then(
+    () => "resolved",
+    (e) => e.message,
+  );
+  check(r === "boom", "a throwing enqueue rejects instead of throwing");
+}
+{
   // An outcome is heard once: a second relay of the same op id is ignored.
   const h = hub();
   const a = tab(h);

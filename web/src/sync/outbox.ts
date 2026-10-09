@@ -290,6 +290,8 @@ export const outbox = {
       book: string;
       baseline?: Record<string, unknown>;
       draftGeneration?: string;
+      /** The op's id, when the caller must know it before the op can drain (#1174). */
+      opId?: string;
     },
   ): Promise<OutboxOp> {
     if (isReadOnly()) {
@@ -297,7 +299,7 @@ export const outbox = {
     }
     const queuedAt = Date.now();
     const op: OutboxOp = {
-      id: uid(),
+      id: opts.opId ?? uid(),
       target: { kind: "row", rowKind, id, book: opts.book },
       action: "patch",
       patch,
