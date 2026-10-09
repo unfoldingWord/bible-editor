@@ -214,9 +214,10 @@ export function tnLockVerseRange(
 
 // Is a tn row being MOVED to anchor verse `verse` moving into a verse-range
 // run's locked span (issue #1165)? Note edits stay exempt from the lock (a
-// content edit makes the note kept), but a reference-only move is not a content
-// change, so classifyKept (keptNotes.ts) does not keep the note: one moved into
-// the range mid-run would be swept by the range import. Whole-chapter runs are
+// content edit makes the note kept). A move now makes the note kept too
+// (classifyKept, keptNotes.ts, #1180), but the run's kept list was sent to the
+// bot at dispatch, before the move: a note moved into the range mid-run is not
+// on it, so the bot can write a duplicate beside it. Whole-chapter runs are
 // left as they were (the note was already inside their sweep scope wherever it
 // sat in the chapter), so only a range lock answers here.
 export function rangeLockCoveringVerse(

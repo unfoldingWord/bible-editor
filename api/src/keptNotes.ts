@@ -9,7 +9,8 @@
 //
 // A note is "kept" when it is worth defending against an AI re-run:
 //   - the translator marked it preserve;
-//   - a person really edited it (content differs from what the AI last wrote);
+//   - a person really edited it (content, verse/reference or occurrence
+//     differs from what the AI last wrote);
 //   - it came from the 2 Kings -> Isaiah migration (decision D4);
 //   - the AI expanded it from a translator's hint (decision D5).
 // Pristine rows (updated_by NULL) are never kept.
@@ -37,6 +38,19 @@ const FIELDS = ["quote", "note", "support_reference"] as const;
 type Field = (typeof FIELDS)[number];
 type Content = Record<Field, string>;
 const EMPTY: Content = { quote: "", note: "", support_reference: "" };
+
+// Where the note sits (#1180): a person's verse move (PATCH verse + ref_raw)
+// or occurrence fix is an edit too. Compared only on the replayed edit_log,
+// never on the live row: the Door43 reimport rewrites ref_raw/verse/occurrence
+// without always logging them (its creates log `refRaw`, some of its updates
+// log no payload), so live position can drift with no person involved.
+// undefined = no logged write has set the field yet; an unknown value on
+// either side is never a difference.
+const POSITION = ["verse", "ref_raw", "occurrence"] as const;
+type PositionField = (typeof POSITION)[number];
+type Position = Record<PositionField, string | undefined>;
+type State = Content & Position;
+const EMPTY_STATE: State = { ...EMPTY, verse: undefined, ref_raw: undefined, occurrence: undefined };
 
 export interface KeptRow {
   id: string;
@@ -105,13 +119,28 @@ function parsePayload(json: string | null): Record<string, unknown> {
   }
 }
 
-function applyPayload(state: Content, payload: Record<string, unknown>): Content {
+function samePosition(a: Position, b: Position): boolean {
+  return POSITION.every((f) => a[f] === undefined || b[f] === undefined || a[f] === b[f]);
+}
+
+function applyPayload(state: State, payload: Record<string, unknown>): State {
   const next = { ...state };
   for (const f of FIELDS) {
     if (f in payload) {
       const v = payload[f];
       next[f] = normalizeForCompare(typeof v === "string" ? v : null);
     }
+  }
+  for (const f of POSITION) {
+    if (f in payload) {
+      const v = payload[f];
+      next[f] = v == null ? "" : String(v).trim();
+    }
+  }
+  // The reimport logs chapter/verse but not the ref_raw it also wrote, so
+  // after such a write the replayed ref_raw is no longer known.
+  if (("chapter" in payload || "verse" in payload) && !("ref_raw" in payload)) {
+    next.ref_raw = undefined;
   }
   return next;
 }
@@ -124,13 +153,14 @@ function isRepair(e: KeptLogEntry): boolean {
 // A person's content change: source NULL with a user, not a known repair, and
 // either a create with an empty note (a person started the note) or an
 // update/restore whose payload changes quote, note or support_reference after
-// normalizing. AI Suggest output a person saves arrives as an ordinary save
+// normalizing, or moves the note (verse, ref_raw) or changes its occurrence
+// (#1180). AI Suggest output a person saves arrives as an ordinary save
 // and counts (D3). Reorders (payload only sort_order), whitespace-only saves
 // and tag-only saves change nothing after normalizing, so they do not count.
-function isHumanEvent(e: KeptLogEntry, before: Content, after: Content): boolean {
+function isHumanEvent(e: KeptLogEntry, before: State, after: State): boolean {
   if (e.source != null || e.user_id == null || isRepair(e)) return false;
   if (e.action === "create") return after.note === "";
-  return !sameContent(before, after);
+  return !sameContent(before, after) || !samePosition(before, after);
 }
 
 export function classifyKept(
@@ -172,10 +202,10 @@ export function classifyKept(
       : { kept: true, reason: "fallback" };
   }
 
-  // states[i] is the normalized content right after entries[i].
-  const states: Content[] = [];
+  // states[i] is the normalized content and position right after entries[i].
+  const states: State[] = [];
   const human: boolean[] = [];
-  let state = EMPTY;
+  let state = EMPTY_STATE;
   for (const e of entries) {
     const next = applyPayload(state, parsePayload(e.payload_json));
     human.push(isHumanEvent(e, state, next));
@@ -183,23 +213,25 @@ export function classifyKept(
     state = next;
   }
 
-  let baseline: Content;
+  let baseline: State;
   let firstHuman = -1;
   if (lastAi >= 0) {
     baseline = states[lastAi];
     firstHuman = human.findIndex((h, i) => h && i > lastAi);
   } else {
     firstHuman = human.findIndex((h) => h);
-    baseline = firstHuman <= 0 ? EMPTY : states[firstHuman - 1];
+    baseline = firstHuman <= 0 ? EMPTY_STATE : states[firstHuman - 1];
   }
   // Live content the log cannot explain: an update aged out of edit_log (the
   // 180-day sweep) after a person made it. Someone changed the note, so keep.
+  // Content only: live position can drift unlogged (see POSITION).
   const live = contentOf(row);
-  if (!sameContent(live, states[states.length - 1])) {
+  const last = states[states.length - 1];
+  if (!sameContent(live, last)) {
     return { kept: true, reason: "unexplained" };
   }
   if (firstHuman < 0) return { kept: false, reason: null };
-  return sameContent(live, baseline)
+  return sameContent(live, baseline) && samePosition(last, baseline)
     ? { kept: false, reason: null }
     : { kept: true, reason: "edited" };
 }
