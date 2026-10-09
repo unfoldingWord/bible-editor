@@ -1175,6 +1175,12 @@ export interface PipelineStartRequest {
   book: string;
   startChapter: number;
   endChapter?: number;
+  /**
+   * Verse-range notes run (issue #1160): both set, one chapter only
+   * (startChapter === endChapter), notes only. The server rejects anything else.
+   */
+  verseStart?: number;
+  verseEnd?: number;
   sessionKey: string;
   options?: PipelineRequestOptions;
   /**

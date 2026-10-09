@@ -105,12 +105,20 @@ const ChainStep = z
   })
   .strict();
 
-const StartBody = z
+// Exported for pipelineVerseRange.test.mjs.
+export const StartBody = z
   .object({
     pipelineType: z.enum(PIPELINE_TYPES),
     book: z.string().min(1).max(8),
     startChapter: z.number().int().positive(),
     endChapter: z.number().int().positive().optional(),
+    // Verse-range notes run (issue #1160): rerun part of ONE chapter. Top-level
+    // like the bot's /start (bp-assistant src/api/pipeline.js — its options
+    // schema is strict and rejects them). Persisted in options_json as
+    // `verseRange` (see storedVerseRange) and lifted back out at
+    // dispatch, so the import knows not to touch verses outside the range.
+    verseStart: z.number().int().min(1).max(200).optional(),
+    verseEnd: z.number().int().min(1).max(200).optional(),
     sessionKey: z.string().min(1).max(120).regex(/^[A-Za-z0-9_\-/]+$/),
     options: PipelineOptions.optional(),
     // Optional second pipeline to fire on the parent's done-transition. Used
@@ -128,7 +136,81 @@ const StartBody = z
   })
   .refine((b) => !(b.followUpOptions && b.followUpChain), {
     message: "follow_up_options_and_chain_mutually_exclusive",
+  })
+  .refine((b) => (b.verseStart === undefined) === (b.verseEnd === undefined), {
+    message: "verse_start_and_end_go_together",
+  })
+  .refine(
+    (b) =>
+      b.verseStart === undefined ||
+      (b.pipelineType === "notes" &&
+        (b.endChapter ?? b.startChapter) === b.startChapter &&
+        b.verseEnd !== undefined &&
+        b.verseEnd >= b.verseStart &&
+        !b.followUpOptions &&
+        !b.followUpChain),
+    { message: "verse_range_is_one_chapter_notes_only" },
+  );
+
+// A verse-range job's range, as stored in pipeline_jobs.options_json (issue
+// #1160). Every reader of a job's range goes through here: dispatch (top-level
+// verseStart/verseEnd for the bot), the /start duplicate check, and the import
+// (ImportContext.verseRange — without it the #1151 chapter-wide sweep would
+// retire AI notes outside the range).
+//
+// Fails CLOSED: `range: null` (a whole-chapter run) only when options_json is
+// absent or is an object with no verseRange key. Unparseable JSON, a non-object,
+// or a verseRange that is not 1 <= start <= end <= 200 is an error, because
+// reading any of those as "whole chapter" is the direction that deletes notes.
+export type StoredVerseRange =
+  | { ok: true; range: { start: number; end: number } | null }
+  | { ok: false; error: string };
+
+export function storedVerseRange(optionsJson: string | null): StoredVerseRange {
+  if (!optionsJson) return { ok: true, range: null };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(optionsJson);
+  } catch {
+    return { ok: false, error: "verse_range_invalid: options_json is not valid JSON" };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, error: "verse_range_invalid: options_json is not an object" };
+  }
+  if (!("verseRange" in parsed)) return { ok: true, range: null };
+  const vr = (parsed as { verseRange: unknown }).verseRange as { start?: unknown; end?: unknown } | null;
+  const start = vr && typeof vr === "object" && !Array.isArray(vr) ? vr.start : undefined;
+  const end = vr && typeof vr === "object" && !Array.isArray(vr) ? vr.end : undefined;
+  if (
+    !Number.isInteger(start) ||
+    !Number.isInteger(end) ||
+    (start as number) < 1 ||
+    (end as number) < (start as number) ||
+    (end as number) > 200
+  ) {
+    return { ok: false, error: `verse_range_invalid: ${JSON.stringify(vr)}` };
+  }
+  return { ok: true, range: { start: start as number, end: end as number } };
+}
+
+// /start duplicate check (issue #1160): a queued/running job is "the same run"
+// only when its verse range matches the request exactly (both whole-chapter,
+// or the same start and end). A different range on the same chapter is a
+// different run and queues behind it: the bot has one slot, so runs on one
+// chapter already go one after another, the same as a chapter run queued
+// behind a multi-chapter run that covers it. A stored range that fails
+// validation never matches.
+export function findSameScopeJob<T extends { options_json: string | null }>(
+  rows: T[],
+  verseRange: { start: number; end: number } | null,
+): T | undefined {
+  return rows.find((r) => {
+    const s = storedVerseRange(r.options_json);
+    if (!s.ok) return false;
+    if (s.range === null || verseRange === null) return s.range === verseRange;
+    return s.range.start === verseRange.start && s.range.end === verseRange.end;
   });
+}
 
 interface StartResponse {
   jobId: string;
@@ -348,6 +430,10 @@ export function resumeOptionsFromJson(
   }
   const { fresh: _fresh, introHints: _introHints, ...rest } = parsed as Record<string, unknown>;
   delete rest.kept;
+  // `verseRange` (issue #1160) is ours, not a bot option: the bot keeps the
+  // range in its own jobId/checkpoint scope, and its strict options schema
+  // would 400 the resume.
+  delete rest.verseRange;
   return rest;
 }
 
@@ -553,6 +639,25 @@ export async function dispatchNext(env: Env): Promise<void> {
       /* corrupt snapshot — dispatch without options rather than wedge */
     }
   }
+  // Verse-range notes run (issue #1160): the range is stored in options_json
+  // but the bot takes it as top-level verseStart/verseEnd, and its options
+  // schema is strict, so lift it out here. A notes job whose stored range
+  // cannot be read FAILS instead of dispatching: sent without a range it would
+  // run (and import) as a whole chapter. Other pipelines never carry a range.
+  let verseRange: { start: number; end: number } | null = null;
+  if (job.pipeline_type === "notes") {
+    const stored = storedVerseRange(job.options_json);
+    if (!stored.ok) {
+      console.error(`[dispatchNext] job=${job.job_id} ${stored.error}`);
+      await fail("sdk_error", stored.error);
+      return;
+    }
+    verseRange = stored.range;
+  }
+  if (options && typeof options === "object" && "verseRange" in options) {
+    const { verseRange: _vr, ...rest } = options as Record<string, unknown>;
+    options = Object.keys(rest).length > 0 ? rest : undefined;
+  }
 
   // options.kept (issue #1152): the notes the AI run must leave in place. Built
   // HERE, at dispatch time, and never stored in options_json, so a run that sat
@@ -594,6 +699,7 @@ export async function dispatchNext(env: Env): Promise<void> {
     book: job.book,
     startChapter: job.start_chapter,
     endChapter: job.end_chapter,
+    ...(verseRange ? { verseStart: verseRange.start, verseEnd: verseRange.end } : {}),
     username,
     sessionKey: job.session_key,
     ...(options ? { options } : {}),
@@ -1151,6 +1257,17 @@ export async function pollPipelineJob(
       // its inserts inside importJobOutput has previously corrupted data
       // (see the DAN 11 incident) — so an in-flight import is exempt by
       // design, not by oversight.
+      //
+      // #1160: a verse-range run must never retire notes outside its range —
+      // without verseRange the #1151 chapter-wide sweep would. A notes job
+      // whose stored range cannot be read is an import FAILURE (the catch
+      // below), never a whole-chapter import.
+      let verseRange: { start: number; end: number } | null = null;
+      if (job.pipeline_type === "notes") {
+        const stored = storedVerseRange(job.options_json);
+        if (!stored.ok) throw new Error(stored.error);
+        verseRange = stored.range;
+      }
       const importResult = await importJobOutput(
         env,
         {
@@ -1159,6 +1276,7 @@ export async function pollPipelineJob(
           book: job.book,
           startChapter: job.start_chapter,
           endChapter: job.end_chapter,
+          verseRange,
         },
         data.output,
       );
@@ -1758,21 +1876,36 @@ pipelines.post("/start", requireEditor, async (c) => {
   // relying on the bot's same-scope 409, which can't see our queue). Same
   // user + same scope/type → focus the existing job. Different user → the
   // enriched 409 the menu renders as an "Already running / queued" dialog.
-  const dup = await c.env.DB.prepare(
+  //
+  // Verse-range run (issue #1160; the schema has already checked it is one
+  // chapter, notes only). "Same scope" includes the verse range: a notes run
+  // for 36:1-5 or for all of 36 is NOT the same run as a queued 36:10-15, so
+  // it queues behind it (see findSameScopeJob) instead of being told it is
+  // already running and focusing the wrong job.
+  const verseRange =
+    parsed.data.verseStart !== undefined && parsed.data.verseEnd !== undefined
+      ? { start: parsed.data.verseStart, end: parsed.data.verseEnd }
+      : null;
+  const dupRows = await c.env.DB.prepare(
     `SELECT j.job_id, j.user_id, j.pipeline_type, j.book, j.start_chapter,
             j.end_chapter, j.state, j.current_skill, j.current_status,
-            j.created_at, j.updated_at, u.dcs_username AS started_by_username
+            j.created_at, j.updated_at, u.dcs_username AS started_by_username,
+            j.options_json
        FROM pipeline_jobs j
        LEFT JOIN users u ON u.id = j.user_id
       WHERE j.book = ?1 AND j.start_chapter = ?2 AND j.end_chapter = ?3
         AND j.pipeline_type = ?4
         AND j.state IN ('queued', 'dispatching', 'running',
                         'paused_for_outage', 'paused_for_usage_limit')
-      ORDER BY j.created_at ASC
-      LIMIT 1`,
+      ORDER BY j.created_at ASC`,
   )
     .bind(book, startChapter, endChapter, parsed.data.pipelineType)
-    .first<PublicJobSummary & { user_id: number }>();
+    .all<PublicJobSummary & { user_id: number; options_json: string | null }>();
+  const dupCandidates = dupRows.results ?? [];
+  const dup =
+    parsed.data.pipelineType === "notes"
+      ? findSameScopeJob(dupCandidates, verseRange)
+      : dupCandidates[0];
   if (dup) {
     if (dup.user_id === userId) {
       const resp: StartResponse = {
@@ -1814,15 +1947,18 @@ pipelines.post("/start", requireEditor, async (c) => {
   // Wider type for mergedOptions: hints is a server-added field, not part of
   // the client-validated PipelineOptions schema (clients never send it).
   let mergedOptions: Record<string, unknown> | undefined = parsed.data.options;
+  // Verse-range run: hints outside the range are left for a later run. The
+  // bot writes only inside the range, and the import drops anything else.
   if (parsed.data.pipelineType === "notes") {
     const hintRows = await c.env.DB.prepare(
       `SELECT id, verse, quote, support_reference, note
          FROM tn_rows
         WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
+          AND verse BETWEEN ?4 AND ?5
           AND hint = 1 AND deleted_at IS NULL
         ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
     )
-      .bind(book, startChapter, endChapter)
+      .bind(book, startChapter, endChapter, verseRange?.start ?? 0, verseRange?.end ?? 1_000_000)
       .all<{
         id: string;
         verse: number;
@@ -1903,6 +2039,7 @@ pipelines.post("/start", requireEditor, async (c) => {
 
   // Enqueue. The job goes to the bot only when dispatchNext claims the slot.
   const jobId = crypto.randomUUID();
+  if (verseRange) mergedOptions = { ...(mergedOptions ?? {}), verseRange };
   const optionsJson = mergedOptions ? JSON.stringify(mergedOptions) : null;
   const followUpJson = parsed.data.followUpOptions
     ? JSON.stringify(parsed.data.followUpOptions)

@@ -65,12 +65,15 @@ export interface ImportContext {
   book: string;
   startChapter: number;
   endChapter: number;
-  // Set only for a notes run limited to part of one chapter. No caller sets
-  // it yet: the editor can only start whole-chapter runs, and neither
-  // pipeline_jobs nor the bot's status scope carries a verse range. #1160
-  // (verse-range reruns) fills it in. When absent, a notes job is treated as
-  // a whole-chapter run and its TN sweep covers every verse of the chapters
-  // it proposed for (#1151); when present, the sweep stays per-verse.
+  // Set only for a notes run limited to part of one chapter (#1160). The
+  // range is stored in pipeline_jobs.options_json and pollPipelineJob reads it
+  // back with storedVerseRange. When absent, a notes job is treated
+  // as a whole-chapter run and its TN sweep covers every verse of the chapters
+  // it proposed for (#1151). When present, staging drops every TSV row
+  // outside the range (the bot's output file holds the whole book, and the
+  // verses outside the range are master's copy, not this run's work) and the
+  // sweep stays per-verse, which matches the bot's own verse-range push
+  // (door43-push replaceChapter:false replaces only verses it has notes for).
   verseRange?: { start: number; end: number } | null;
 }
 
@@ -406,8 +409,19 @@ async function parseOutputEntry(
     for (const row of rows) {
       const refRaw = row["Reference"];
       if (!refRaw) continue;
-      const [ch] = refParts(refRaw);
+      const [ch, vs] = refParts(refRaw);
       if (ch < ctx.startChapter || ch > ctx.endChapter) continue;
+      // #1160: a verse-range run touches only its own verses, keyed on the
+      // ANCHOR (leading) verse — the same (chapter, verse) the sweep and apply
+      // use. A bridge anchored inside that runs past the end (36:14-16 in a
+      // 10-15 run) is this run's note and lands. A bridge anchored before the
+      // start (36:9-11) is master's copy: the bot never anchors a note outside
+      // its window (bp-assistant notes-pipeline.js "Partial-chapter runs ...
+      // must never anchor ... outside their own verse window"), and importing
+      // it would meet only content dedup at a verse the sweep never touches —
+      // a stale duplicate of today's edit, or a resurrection of today's
+      // delete. The intro (verse 0) is outside every range.
+      if (ctx.verseRange && (vs < ctx.verseRange.start || vs > ctx.verseRange.end)) continue;
       const built = cls.kind === "tn"
         ? tnPayload(ctx.book, refRaw, row, uhbWordsByVerse)
         : tqPayload(ctx.book, refRaw, row);
@@ -1469,7 +1483,12 @@ export async function deleteUnkeptTns(
       ...(liveVerses.results ?? []).filter((p) => chapters.has(p.chapter)),
     ];
   }
-  const pairs = tnSweepScope(scopeInput, resolved.results ?? []);
+  // #1160: a verse-range run never sweeps a verse outside its range. Staging
+  // already drops proposals anchored outside it; this is the backstop.
+  const range = job.verseRange;
+  const pairs = tnSweepScope(scopeInput, resolved.results ?? []).filter(
+    (p) => !range || (p.verse >= range.start && p.verse <= range.end),
+  );
   if (pairs.length === 0) return 0;
 
   // D1 caps bound parameters at 100 per statement. This query already binds 3

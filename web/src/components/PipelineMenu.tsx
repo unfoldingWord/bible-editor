@@ -36,7 +36,7 @@ import type {
 } from "../sync/api";
 import { getSessionKey, pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { currentPipelineUserId } from "../sync/pipelineSession";
-import { parseChapterRange } from "../lib/refParser";
+import { parsePipelineRange } from "../lib/refParser";
 
 interface Props {
   book: string;
@@ -198,7 +198,15 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
   }, [confirm, book, chapter]);
 
   const genNothingSelected = !genOpts.ult && !genOpts.ust;
-  const refParsed = useMemo(() => parseChapterRange(refInput, book), [refInput, book]);
+  // Verse ranges ("36:10-15") are for the notes pipeline only (issue #1160):
+  // the bot can rerun part of a chapter's notes, not part of a ULT/UST or tq run.
+  // A run with a follow-up chain can't take one (the server refuses it), so the
+  // field shows the same inline error and Start stays disabled.
+  const allowVerses = confirm?.type === "notes" && !confirm.followUpChain;
+  const refParsed = useMemo(
+    () => parsePipelineRange(refInput, book, allowVerses),
+    [refInput, book, allowVerses],
+  );
 
   // "In progress" for the chapter = queued/dispatching/running/paused. A
   // failed or cancelled job covering the chapter must NOT disable the menu —
@@ -227,7 +235,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
     if (!refParsed.ok) return;
     const isMacro = Boolean(confirm.followUpChain);
     if (confirm.type === "generate" && !isMacro && genNothingSelected) return;
-    const { book: rangeBook, startChapter, endChapter } = refParsed.range;
+    const { book: rangeBook, startChapter, endChapter, verseStart, verseEnd } = refParsed.range;
     const chapters: number[] = [];
     for (let c = startChapter; c <= endChapter; c++) chapters.push(c);
     setSubmitting(true);
@@ -245,6 +253,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
           book: rangeBook,
           startChapter: ch,
           endChapter: ch,
+          ...(verseStart !== undefined && verseEnd !== undefined ? { verseStart, verseEnd } : {}),
           sessionKey: getSessionKey(),
           ...(wire.options ? { options: wire.options } : {}),
           ...(wire.followUpOptions ? { followUpOptions: wire.followUpOptions } : {}),
@@ -254,9 +263,11 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
         if (res.status !== "already_running") startedCount++;
       }
       const rangeLabel =
-        chapters.length === 1
-          ? `${rangeBook} ${startChapter}`
-          : `${rangeBook} ${startChapter}-${endChapter}`;
+        verseStart !== undefined
+          ? `${rangeBook} ${startChapter}:${verseStart}${verseEnd !== verseStart ? `-${verseEnd}` : ""}`
+          : chapters.length === 1
+            ? `${rangeBook} ${startChapter}`
+            : `${rangeBook} ${startChapter}-${endChapter}`;
       if (startedCount > 0) {
         // Single-chapter run that didn't win the bot slot — it's waiting in
         // line. Surface the position instead of "Started".
@@ -373,18 +384,20 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
           <Box sx={{ mt: 2, display: "flex", alignItems: "flex-start", gap: 1.5 }}>
             <Typography sx={{ pt: 1, fontWeight: 500 }}>{book}</Typography>
             <TextField
-              label="Chapter or range"
+              label={allowVerses ? "Chapter, range, or verses" : "Chapter or range"}
               value={refInput}
-              onChange={(e) => setRefInput(e.target.value.replace(/[^\d-]/g, ""))}
+              onChange={(e) => setRefInput(e.target.value.replace(/[^\d:-]/g, ""))}
               disabled={submitting}
               fullWidth
               size="small"
               autoFocus
               error={!refParsed.ok}
-              inputProps={{ inputMode: "numeric", pattern: "[0-9-]*" }}
+              inputProps={{ inputMode: allowVerses ? "text" : "numeric", pattern: "[0-9:-]*" }}
               helperText={
                 refParsed.ok
-                  ? refParsed.range.startChapter === refParsed.range.endChapter
+                  ? refParsed.range.verseStart !== undefined
+                    ? `Runs once for ${refParsed.range.book} ${refParsed.range.startChapter}:${refParsed.range.verseStart}${refParsed.range.verseEnd !== refParsed.range.verseStart ? `-${refParsed.range.verseEnd}` : ""}. Notes outside these verses are left alone.`
+                    : refParsed.range.startChapter === refParsed.range.endChapter
                     ? `Runs once for ${refParsed.range.book} ${refParsed.range.startChapter}.`
                     : `Runs ${refParsed.range.endChapter - refParsed.range.startChapter + 1} times across ${refParsed.range.book} ${refParsed.range.startChapter}-${refParsed.range.endChapter}.`
                   : refParsed.error
