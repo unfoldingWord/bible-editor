@@ -20,7 +20,7 @@ import {
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult, outbox } from "../sync/outbox";
-import { hidingPendingRowDeletes, rowDeleteHooks } from "../sync/pendingRowDeletes";
+import { applyCommittedRowDeletes, hidingPendingRowDeletes, rowDeleteHooks } from "../sync/pendingRowDeletes";
 import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
 import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
 import { currentRouteFetcher, isChapterLocked, trackNavigation, updateIfCurrent, type ChapterRoute, type NavigationGen } from "../lib/chapterStale";
@@ -287,11 +287,19 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       sequencer.current?.record({ type: "rowDelete", kind, id });
       mutate((prev) => {
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
+        if (!list.some((r) => r.id === id)) return prev; // nothing to remove: no re-render
         const next = list.filter((r) => r.id !== id);
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
     [mutate],
+  );
+  // A committed row DELETE heard from any tab removes its row, after a load
+  // landed too: another tab's DELETE queued and committed between a load's
+  // two outbox reads can land its stale row (#1147 item 1).
+  useEffect(
+    () => applyCommittedRowDeletes(rowDeleteOutcomes, () => routeRef.current.book, applyLocalRowDelete),
+    [applyLocalRowDelete],
   );
 
   const applyLocalRowInsert = useCallback<UseChapterReturn["applyLocalRowInsert"]>(

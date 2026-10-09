@@ -90,18 +90,21 @@ export function markOwnRowDelete(rowKind: RowTarget["rowKind"], book: string, id
 }
 // The click's op is queued. The mark is created again if it went in the
 // meantime (an older op of the row discarded while this put ran, #1126 item 6).
-export function recordOwnRowDeleteOp(op: Pick<OpLike, "id" | "target">): void {
+// `click` (markOwnRowDelete's token): an older click's put that resolves
+// after a newer click of the row is recorded as own but does not become the
+// newer click's op (#1147 item 3).
+export function recordOwnRowDeleteOp(op: Pick<OpLike, "id" | "target">, click?: number): void {
   if (op.target.kind !== "row") return;
   const { rowKind, book, id } = op.target;
   const key = ownKey(op.target);
   let m = ownRowDeletes.get(key);
   if (!m) {
-    m = { seq: ++markSeq, target: { rowKind, book, id }, ops: new Set(), all: new Set() };
+    m = { seq: ++markSeq, target: { rowKind, book, id }, ops: new Set(), all: new Set(), latest: op.id };
     ownRowDeletes.set(key, m);
   }
   m.ops.add(op.id);
   m.all.add(op.id);
-  m.latest = op.id;
+  if (click === undefined || m.seq === click) m.latest = op.id;
 }
 // The click's enqueue failed (#1126 item 9): no op will ever settle its mark,
 // so undo the click. A mark still holding an older op of the row stays for
@@ -147,7 +150,7 @@ export function forgetOwnRowDeleteOp(op: Pick<OpLike, "id" | "target">): void {
 export function recordOwnRowDeleteClickOp(op: Pick<OpLike, "id" | "target">, click: number): void {
   if (op.target.kind !== "row") return;
   if (op.id === "readonly-noop") dropOwnRowDeleteClick(op.target, click);
-  else recordOwnRowDeleteOp(op);
+  else recordOwnRowDeleteOp(op, click);
 }
 // This tab's op committed: it no longer holds the mark (#1126 item 5).
 export function settleOwnRowDeleteOp(op: Pick<OpLike, "id" | "target">): void {
@@ -313,6 +316,25 @@ export function rowDeleteHooks(outcomes: RowDeleteOutcomes): RowDeleteHooks {
   };
 }
 
+// Every committed row DELETE heard for the open book, this tab's or another
+// tab's, removes its row from the open chapter (#1147 item 1). Another tab's
+// DELETE queued and committed entirely between a load's two outbox reads is
+// in neither read, so the load cannot know to wait for its outcome; when that
+// outcome trails the after-read, the stale row lands. Heard here after the
+// load, it is removed then. A committed DELETE is final, so removing the row
+// again (the `row.deleted` broadcast already did, or it was never there) is
+// harmless. Returns the unsubscribe.
+export function applyCommittedRowDeletes(
+  outcomes: RowDeleteOutcomes,
+  book: () => string,
+  remove: (rowKind: RowTarget["rowKind"], id: string) => void,
+): () => void {
+  return outcomes.on((o) => {
+    const t = o.op.target;
+    if (o.kind === "committed" && t.kind === "row" && t.book === book()) remove(t.rowKind, t.id);
+  });
+}
+
 // Wrap a chapter loader so its payload is filtered by this tab's row DELETEs
 // that were draining when the GET started, are still draining when it
 // resolved, or committed while it ran.
@@ -395,17 +417,19 @@ export function hidingPendingRowDeletes<P extends Pick<ChapterPayload, "book" | 
         const after = await listOps();
         const own = (op: OpLike) => op.target.kind === "row" && (hooks.isOwn?.(op.target) ?? true);
         const afterIds = new Set(after.map((op) => op.id));
-        // Another tab's DELETE that left the outbox between the reads is
-        // hidden only once its outcome is heard, and the draining tab posts it
-        // just after removing the op, so it can trail the after-read by a few
-        // milliseconds. Wait briefly for it rather than land the stale row
-        // (#1126 item 2); a refusal heard here shows the row, a commit hides it.
+        // A DELETE that left the outbox between the reads with no outcome
+        // heard yet: the draining tab posts the outcome just after removing
+        // the op, so it can trail the after-read by a few milliseconds. Wait
+        // briefly for it (#1126 item 2); a refusal heard here shows the row, a
+        // commit hides it. Another tab's op is hidden only once its commit is
+        // heard. This tab's own op counts too (#1147 item 2): drained and
+        // refused in another tab, it would otherwise be hidden here after its
+        // #1108 rollback restored the row.
         const unheard = () =>
           before.some(
             (op) =>
               isRowDelete(op) &&
               !afterIds.has(op.id) &&
-              !own(op) &&
               !abandoned.has(op.id) &&
               !committed.some((c) => c.id === op.id),
           );
