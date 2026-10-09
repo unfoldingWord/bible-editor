@@ -293,6 +293,14 @@ export function BookView({
   // handlers, so route each through a ref to its latest value and hand the
   // cells one stable function apiece (#890). Presence still passes through:
   // an omitted optional callback stays undefined below.
+  //
+  // Written during render (#1117). Since every reader is an input or click
+  // handler, a write in a no-deps useLayoutEffect would hand them the same
+  // value; it was left here because these are the keystroke save callbacks
+  // and the move buys nothing on this tree: no startTransition /
+  // useDeferredValue is in use, so a render React throws away (StrictMode's
+  // dev replay, the one retry after a render error) has the same props.
+  // Revisit if concurrent rendering arrives (e.g. a React 19 upgrade).
   const latestCallbacksRef = useRef({
     onEditVerse, onSaveColumn, onOpenAligner, onEditSection, onMergeBridge, onSplitBridge, onOpenVerseComments, textCheck,
   });

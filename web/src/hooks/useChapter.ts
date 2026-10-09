@@ -139,6 +139,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // The route this render is for. Written before the state hooks so every
   // local-apply updater (run while React processes the state queue) compares
   // against the current route, not the one its callback was created under.
+  // Must stay a render-time write (#1117): an updater queued before a route
+  // change runs while React renders this hook for the new route, which is
+  // before any effect, so a layout-effect write would land too late.
   const routeRef = useRef<ChapterRoute>({ book, chapter });
   routeRef.current = { book, chapter };
   // Bumped on every move to a new (book, chapter), including back to one just
