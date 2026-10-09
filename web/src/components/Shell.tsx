@@ -30,7 +30,7 @@ import { useAiDrafts } from "../hooks/useAiDrafts";
 import { useTwlFilters } from "../hooks/useTwlFilters";
 import { useUnsavedGuard } from "../hooks/useUnsavedGuard";
 import { outbox } from "../sync/outbox";
-import { api, ApiError, CHECK_LANES, setReadOnlyReason } from "../sync/api";
+import { api, ApiError, CHECK_LANES, isReadOnly, setReadOnlyReason } from "../sync/api";
 import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
 import { trackLockedKey } from "../lib/chapterStale";
@@ -4892,7 +4892,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onWordDelete={(id) => {
             const row = data.twl.find((r) => r.id === id);
-            if (!row) return;
+            // Read-only (viewer, locked book): the outbox would not queue the
+            // DELETE, so hiding the row would only fake it (#1147 item 4).
+            if (!row || isReadOnly()) return;
             applyLocalRowDelete("twl", id);
             if (activeWordId === id) setActiveWordId(null);
             const click = markOwnRowDelete("twl", row.book, id); // a refetch keeps it hidden (#1107)
@@ -4914,7 +4916,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onQuestionDelete={(id) => {
             const row = data.tq.find((r) => r.id === id);
-            if (!row) return;
+            if (!row || isReadOnly()) return; // as for a word link (#1147 item 4)
             applyLocalRowDelete("tq", id);
             if (activeQuestionId === id) setActiveQuestionId(null);
             const click = markOwnRowDelete("tq", row.book, id); // a refetch keeps it hidden (#1107)
