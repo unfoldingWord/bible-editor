@@ -114,6 +114,32 @@ const move = (id, verse = 12, opId = `op-${id}`) => ({
   check(a.heard.length === 0, "only a chapter_locked refusal of a tn verse move is relayed");
 }
 {
+  // #1174 review K1: A's own drain gets a non-final result (retry, conflict,
+  // fatal) that leaves the op queued; B later drains it and is refused. A
+  // must still hear B's relay.
+  for (const kind of ["retry", "conflict", "fatal"]) {
+    const h = hub();
+    const a = tab(h);
+    const b = tab(h);
+    a.relay.markOwn("op-n1");
+    a.result(move("n1"), kind);
+    b.result(move("n1"), "locked");
+    await settle();
+    check(a.heard.length === 1, `a ${kind} in the queuing tab keeps the mark, so a later refusal in another tab is heard`);
+  }
+}
+{
+  // A final result in the queuing tab (ok) does clear the mark.
+  const h = hub();
+  const a = tab(h);
+  const b = tab(h);
+  a.relay.markOwn("op-n1");
+  a.result(move("n1"), "ok");
+  b.result(move("n1"), "locked");
+  await settle();
+  check(a.heard.length === 0, "a committed move's mark is cleared");
+}
+{
   // An outcome is heard once: a second relay of the same op id is ignored.
   const h = hub();
   const a = tab(h);

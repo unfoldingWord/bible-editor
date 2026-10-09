@@ -4809,7 +4809,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // another tab is rolled back here too.
             void enqueueRow("tn", row, { verse: effectiveVerse, ref_raw, sort_order }).then(
               (op) => tnMoveRelay.markOwn(op.id),
-              () => undefined,
+              (e) => console.error("Shell: could not queue the note move", e),
             );
             // Follow the note to its new verse: the resource column only renders
             // notes in displayVerseRange, so without this the moved card vanishes

@@ -49,6 +49,10 @@ export function createRefusedTnMoveRelay(deps: {
   const listeners = new Set<(op: RefusedTnMove) => void>();
   const unsub = deps.onResult((op, result) => {
     if (!isTnMove(op)) return;
+    // Only ok and locked take the op out of the outbox. A retry, conflict or
+    // fatal result leaves it queued (pending, conflict, failed), so any tab
+    // may still drain it and relay a refusal: keep the mark for that.
+    if (result.kind !== "ok" && result.kind !== "locked") return;
     // Settled here: a later relay of it from elsewhere is not news.
     own.delete(op.id);
     if (result.kind !== "locked") return;
