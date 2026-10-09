@@ -114,6 +114,11 @@ interface Props {
   // active match (by note id + occurrence index) is emphasized + scrolled to.
   findNoteQuery?: { find: string; regex: boolean; caseSensitive: boolean } | null;
   activeNoteMatch?: { noteId: string; occurrence: number } | null;
+  // Find-in-questions highlight (TQ scope): only the row holding the active
+  // match receives the query, so typing in the find box doesn't re-render
+  // every question row.
+  findQuestionQuery?: { find: string; regex: boolean; caseSensitive: boolean } | null;
+  activeQuestionMatch?: { rowId: string; field: "question" | "response"; occurrence: number } | null;
   // Bumped by Shell's "go to active" button so the resource column can
   // recentre on the active note / word / verse group alongside the
   // scripture column.
@@ -382,6 +387,8 @@ export function ResourceColumn({
   activeQuestionId = null,
   findNoteQuery,
   activeNoteMatch,
+  findQuestionQuery,
+  activeQuestionMatch,
   scrollNonce,
   jumpTab = null,
   onNoteChange,
@@ -1176,12 +1183,12 @@ export function ResourceColumn({
                 tqGroups.map(([verse, rows]) => (
                   <Fragment key={`tq-${verse}`}>
                     <VerseGroupHead verse={verse} active={verse === activeVerse} section="questions" />
-                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} />
+                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} findQuery={findQuestionQuery} activeMatch={activeQuestionMatch} />
                   </Fragment>
                 ))
               )
             ) : (
-              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} />
+              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} findQuery={findQuestionQuery} activeMatch={activeQuestionMatch} />
             )}
           </>
         )}
