@@ -411,16 +411,17 @@ async function parseOutputEntry(
       if (!refRaw) continue;
       const [ch, vs] = refParts(refRaw);
       if (ch < ctx.startChapter || ch > ctx.endChapter) continue;
-      // #1160: a verse-range run touches only its own verses. A row is kept
-      // when any verse it covers is in the range, so a bridge such as 36:9-11
-      // in a 10-15 run still lands (it is staged at its leading verse, 9; the
-      // sweep is limited to in-range verses separately, in deleteUnkeptTns).
-      // The intro (verse 0) is outside every range.
-      if (ctx.verseRange) {
-        const { start, end } = ctx.verseRange;
-        const covered = vs > 0 ? coveredVersesFromRef(refRaw, vs) : [];
-        if (!covered.some((v) => v >= start && v <= end)) continue;
-      }
+      // #1160: a verse-range run touches only its own verses, keyed on the
+      // ANCHOR (leading) verse — the same (chapter, verse) the sweep and apply
+      // use. A bridge anchored inside that runs past the end (36:14-16 in a
+      // 10-15 run) is this run's note and lands. A bridge anchored before the
+      // start (36:9-11) is master's copy: the bot never anchors a note outside
+      // its window (bp-assistant notes-pipeline.js "Partial-chapter runs ...
+      // must never anchor ... outside their own verse window"), and importing
+      // it would meet only content dedup at a verse the sweep never touches —
+      // a stale duplicate of today's edit, or a resurrection of today's
+      // delete. The intro (verse 0) is outside every range.
+      if (ctx.verseRange && (vs < ctx.verseRange.start || vs > ctx.verseRange.end)) continue;
       const built = cls.kind === "tn"
         ? tnPayload(ctx.book, refRaw, row, uhbWordsByVerse)
         : tqPayload(ctx.book, refRaw, row);
@@ -1482,11 +1483,8 @@ export async function deleteUnkeptTns(
       ...(liveVerses.results ?? []).filter((p) => chapters.has(p.chapter)),
     ];
   }
-  // #1160: a verse-range run never sweeps a verse outside its range, even when
-  // it proposed a bridged note anchored there (36:9-11 in a 10-15 run is
-  // staged at verse 9). Content dedup still stops an exact re-insert of an
-  // existing verse-9 note; a reworded bridge can sit beside the old one, which
-  // is the safe side.
+  // #1160: a verse-range run never sweeps a verse outside its range. Staging
+  // already drops proposals anchored outside it; this is the backstop.
   const range = job.verseRange;
   const pairs = tnSweepScope(scopeInput, resolved.results ?? []).filter(
     (p) => !range || (p.verse >= range.start && p.verse <= range.end),
