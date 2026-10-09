@@ -4954,7 +4954,7 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // one — so the slack is free in the only direction that matters. A day also
 // absorbs modest author-date backdating.
 //
-// A SHARED LIMIT, NOT THIS TIER'S — NARROWED BY #691, NOT CLOSED. Every
+// A SHARED LIMIT, NOT THIS TIER'S — CLOSED FOR THE LEDGER, NOT THE LIVE WALK. Every
 // date-bounded walk here (listMasterCommitsSince's sinceTime) compares
 // COMMITTER date, not author date (see that function's own comment), which
 // already closes the rebase/cherry-pick class of backdating: those move the
@@ -4963,22 +4963,18 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // dcs_commits ledger first — the same pattern loadMasterLineage (above)
 // already uses for the mint gate — which buys the same committer-date answer
 // from a store PROVEN gap-free by sha-continuity polling, without a live
-// Gitea round trip and its failure modes (timeouts, page caps). What neither
-// the live walk NOR the ledger can catch, even so: a PLAIN late push, where
-// the commit is locally authored AND committed days before it reaches
-// Door43, so neither timestamp ever moves. The dcs_commits row for such a
-// commit DOES exist once the poller's sha-continuity walk discovers it
-// (`seen_at` records exactly when) — but readLedgerMasterLineage's own read
-// filters on `committed_at`, the same field the live walk keys on, not on
-// `seen_at`. VERIFIED directly: a ledger with full, gap-free coverage
-// starting well before `windowStart` still returns zero commits for a row
-// whose `committed_at` itself predates `windowStart`. Closing that fully
-// would mean widening readLedgerMasterLineage's own comparison to admit a row
-// on `seen_at` too — a change to that shared, separately-audited module,
-// which this fix does not make (see the PR that introduced this comment for
-// why). So the honest residual is: a plain late push is invisible to every
-// walk here, live or ledger-backed, regardless of how current the ledger's
-// coverage is. Tracked as issue #691.
+// Gitea round trip and its failure modes (timeouts, page caps). A PLAIN late
+// push, where the commit is locally authored AND committed days before it
+// reaches Door43 so neither timestamp ever moves, can be seen only through
+// the ledger: readLedgerMasterLineage also admits a row whose `seen_at` is
+// after the window start (#691). seen_at is the poll that recorded the row
+// (or, for a backfilled row, the poll that opened its gap), so it is an
+// upper bound on arrival: a poll's lag can add a row that landed just before
+// the window, and a commit from a second gap opened while an older one was
+// still being backfilled gets the older gap's stamp and can be missed. The
+// live-walk fallback (ledger unusable: stale tip, open gap, no coverage
+// floor) cannot see a plain late push at all, because Gitea exposes no push
+// time.
 interface NoBaseFallbackWindow {
   /** Where the walk must start: see the tier notes above. */
   windowStart: number;
@@ -5329,13 +5325,13 @@ async function clearResolvedMergeNoBase(
       // fails closed on anything but a current, gap-free ledger whose coverage
       // reaches back to windowStart, so trying it here is always safe: worst
       // case it refuses and the live walk below runs exactly as it always has.
-      // What it buys when it IS usable: the same committer-date answer the
-      // live walk would give, but from a store already proven gap-free by
-      // sha-continuity polling — so this survives a live Gitea hiccup (a
-      // timeout or page cap) that would otherwise force a refusal. See
-      // NoBaseFallbackWindow's comment for the honest limit: neither this nor
-      // the live walk can see a PLAIN late push (author and committer date
-      // both unmoved).
+      // What it buys when it IS usable: the committer-date answer the live
+      // walk would give, plus commits first seen (seen_at) after windowStart,
+      // from a store already proven gap-free by sha-continuity polling — so
+      // this survives a live Gitea hiccup (a timeout or page cap) that would
+      // otherwise force a refusal. See NoBaseFallbackWindow's comment for the
+      // limit: the ledger can catch a PLAIN late push (author and committer
+      // date both unmoved); the live-walk fallback cannot.
       const fetched = await masterCommitsSinceViaLedgerOrLive(env, file, windowStart, book, kind);
       walk = fetched.page;
       walkSince = windowStart;
@@ -5495,8 +5491,8 @@ async function clearResolvedMergeNoBase(
     //     NoBaseFallbackWindow's #691 note: committer-date backdating (a
     //     rebase or cherry-pick) is caught, live or via the ledger the
     //     revisit's own gate already tries first; a PLAIN late push — author
-    //     AND committer date both unmoved — is invisible to both, exactly as
-    //     for every other walk here (issue #691).
+    //     AND committer date both unmoved — is caught by the ledger's seen_at
+    //     but still invisible to the live fallback (issue #691).
     //
     // #861: when `walk` is the repo-scoped ledger page, `walk.commits[0]?.sha`
     // can be a Gitea merge-wrapper commit — exactly the shape our own nightly
