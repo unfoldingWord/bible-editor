@@ -193,6 +193,16 @@ export function storedVerseRange(optionsJson: string | null): StoredVerseRange {
   return { ok: true, range: { start: start as number, end: end as number } };
 }
 
+// The range as the web sees it on a job row (issue #1166): null = whole
+// chapter, "invalid" = a stored range that fails validation. The UI labels an
+// invalid one as unknown; it must never show it as the whole chapter.
+export type PublicVerseRange = { start: number; end: number } | "invalid" | null;
+
+export function publicVerseRange(optionsJson: string | null): PublicVerseRange {
+  const s = storedVerseRange(optionsJson);
+  return s.ok ? s.range : "invalid";
+}
+
 // /start duplicate check (issue #1160): a queued/running job is "the same run"
 // only when its verse range matches the request exactly (both whole-chapter,
 // or the same start and end). A different range on the same chapter is a
@@ -456,6 +466,7 @@ interface PublicJobSummary {
   created_at: number;
   updated_at: number;
   started_by_username: string | null;
+  verse_range: PublicVerseRange;
 }
 
 // ── Queue helpers ──────────────────────────────────────────────────────────
@@ -474,15 +485,18 @@ async function queueSnapshot(env: Env): Promise<{
   const activeRs = await env.DB.prepare(
     `SELECT j.job_id, j.pipeline_type, j.book, j.start_chapter, j.end_chapter,
             j.state, j.current_skill, j.current_status, j.created_at, j.updated_at,
-            u.dcs_username AS started_by_username
+            u.dcs_username AS started_by_username, j.options_json
        FROM pipeline_jobs j
        LEFT JOIN users u ON u.id = j.user_id
       WHERE j.state IN (${ACTIVE_PLACEHOLDERS})
       ORDER BY j.created_at ASC`,
   )
     .bind(...ACTIVE_STATES)
-    .all<PublicJobSummary>();
-  const active = activeRs.results ?? [];
+    .all<Omit<PublicJobSummary, "verse_range"> & { options_json: string | null }>();
+  const active: PublicJobSummary[] = (activeRs.results ?? []).map(({ options_json, ...r }) => ({
+    ...r,
+    verse_range: publicVerseRange(options_json),
+  }));
   const activeCount = active.length;
 
   const queuedRs = await env.DB.prepare(
@@ -1900,7 +1914,7 @@ pipelines.post("/start", requireEditor, async (c) => {
       ORDER BY j.created_at ASC`,
   )
     .bind(book, startChapter, endChapter, parsed.data.pipelineType)
-    .all<PublicJobSummary & { user_id: number; options_json: string | null }>();
+    .all<Omit<PublicJobSummary, "verse_range"> & { user_id: number; options_json: string | null }>();
   const dupCandidates = dupRows.results ?? [];
   const dup =
     parsed.data.pipelineType === "notes"
@@ -1931,6 +1945,7 @@ pipelines.post("/start", requireEditor, async (c) => {
           created_at: dup.created_at,
           updated_at: dup.updated_at,
           started_by_username: dup.started_by_username,
+          verse_range: publicVerseRange(dup.options_json),
         },
       },
       409,
@@ -2395,7 +2410,7 @@ pipelines.get("/", requireEditor, async (c) => {
             start_chapter, end_chapter, session_key, state, priority,
             current_skill, current_status, error_kind, error_message,
             output_json, follow_up_job_id, follow_up_chain, created_at, updated_at,
-            last_polled_at, notified_user_at`;
+            last_polled_at, notified_user_at, options_json`;
 
   if (stateList === null) {
     // Default: the live queue is visible to everyone (active + waiting jobs,
@@ -2464,10 +2479,13 @@ pipelines.get("/", requireEditor, async (c) => {
     // plus any pending chain steps) so the editor can lock exactly those lanes
     // without re-implementing the map. follow_up_chain itself stays server-side
     // — it carries upstream options the UI has no business seeing.
-    const { follow_up_chain, ...rest } = sanitized;
+    const { follow_up_chain, options_json, ...rest } = sanitized;
     const withLocks = {
       ...rest,
       locks_resources: Array.from(resourcesLockedByJob(row.pipeline_type, follow_up_chain)),
+      // The verse range (issue #1166), read through storedVerseRange so an
+      // unreadable stored range shows as "invalid", never as whole chapter.
+      verse_range: publicVerseRange(options_json),
     };
     if (withLocks.state === "queued") {
       const pos = snap.positions.get(withLocks.job_id);
@@ -2506,6 +2524,8 @@ interface PipelineRowSelect {
   updated_at: number;
   last_polled_at: number | null;
   notified_user_at: number | null;
+  // Never returned to the client either: it gets verse_range (issue #1166).
+  options_json: string | null;
   // Present only on the default (shared-queue) list where we JOIN users, so the
   // UI can attribute another user's run. Absent on the explicit-state branch.
   started_by_username?: string | null;

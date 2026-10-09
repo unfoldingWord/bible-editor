@@ -3,6 +3,7 @@
 // from the same origin as the Worker).
 
 import type { LexiconEntry } from "../hooks/lexiconStore";
+import type { JobVerseRange } from "../lib/pipelineScope";
 
 export type RowKind = "tn" | "tq" | "twl";
 
@@ -306,6 +307,8 @@ export interface PipelineConflictExisting {
   created_at: number;
   updated_at: number;
   started_by_username: string | null;
+  /** See PipelineJobRow.verse_range (issue #1166). */
+  verse_range?: JobVerseRange;
 }
 export interface PipelineConflictBody {
   error: "conflict";
@@ -1312,6 +1315,12 @@ export interface PipelineJobRow {
    * pipelineStore.start() before the first list refresh.
    */
   locks_resources?: ("verse" | "tn" | "tq" | "twl")[];
+  /**
+   * Verse range of a notes run (issue #1166): null = whole chapter, "invalid"
+   * = a stored range the server could not read (shown as unknown, never as
+   * whole chapter). Absent on optimistic rows from an older server.
+   */
+  verse_range?: JobVerseRange;
   created_at: number;
   updated_at: number;
   last_polled_at: number | null;

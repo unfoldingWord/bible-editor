@@ -412,6 +412,10 @@ export const pipelineStore = {
       last_polled_at: null,
       notified_user_at: null,
       started_by_username: null,
+      verse_range:
+        req.verseStart !== undefined && req.verseEnd !== undefined
+          ? { start: req.verseStart, end: req.verseEnd }
+          : null,
     };
     jobs.set(res.jobId, jobs.get(res.jobId) ?? seeded);
     notify();

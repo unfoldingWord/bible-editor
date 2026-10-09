@@ -21,7 +21,10 @@ import {
   resumeOptionsFromJson,
   storedVerseRange,
   findSameScopeJob,
+  publicVerseRange,
+  pipelines,
 } from "./pipelines.ts";
+import { Hono } from "hono";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -287,6 +290,81 @@ console.log("\n[control: the same output on a whole-chapter job]");
 {
   const { t, ids } = await poll(null);
   assert(!t.live(ids.v3Ai) && !t.live(ids.v5Ai), "whole-chapter job DOES retire verses 3 and 5 — so the range test above is discriminating");
+}
+
+// Issue #1166: the job rows the web reads carry the stored range, read through
+// storedVerseRange (an invalid stored range is "invalid", never whole chapter),
+// and never the raw options_json.
+console.log("\n[publicVerseRange]");
+{
+  const r = publicVerseRange(JSON.stringify({ verseRange: { start: 3, end: 5 } }));
+  assert(r && r !== "invalid" && r.start === 3 && r.end === 5, "stored range → {start, end}");
+  assert(publicVerseRange(null) === null, "no options → null (whole chapter)");
+  assert(publicVerseRange(JSON.stringify({ noIntro: true })) === null, "options without a range → null");
+  assert(publicVerseRange("{bad") === "invalid", "unparseable → invalid, NOT whole chapter");
+  assert(publicVerseRange(JSON.stringify({ verseRange: { start: 9, end: 2 } })) === "invalid", "out-of-order → invalid");
+}
+
+console.log("\n[GET /api/pipelines and the /start 409 carry verse_range]");
+{
+  const sqlite = new DatabaseSync(":memory:");
+  for (const m of migrations) sqlite.exec(m);
+  const stmt = (sql, args = []) => ({
+    bind: (...a) => stmt(sql, a),
+    async all() { return { results: sqlite.prepare(sql).all(...args) }; },
+    async first() { return sqlite.prepare(sql).all(...args)[0] ?? null; },
+    async run() { return { meta: { changes: Number(sqlite.prepare(sql).run(...args).changes) } }; },
+  });
+  const DB = {
+    prepare: (sql) => stmt(sql),
+    async batch(stmts) { const out = []; for (const s of stmts) out.push(await s.run()); return out; },
+  };
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 700, 'translator7'), (8, 800, 'other8')`).run();
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, reason) VALUES ('ZEC', 0, 'test')`).run();
+  const ins = sqlite.prepare(
+    `INSERT INTO pipeline_jobs (job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
+       end_chapter, session_key, state, options_json, created_at, updated_at)
+     VALUES (?, ?, ?, 'notes', 'ZEC', 1, 1, 's', ?, ?, ?, ?)`,
+  );
+  ins.run("j-range", "bot-1", 7, "running", JSON.stringify({ verseRange: { start: 3, end: 5 } }), 100, 100);
+  ins.run("j-whole", null, 7, "queued", JSON.stringify({ noIntro: true }), 101, 101);
+  ins.run("j-bad", null, 8, "queued", "{bad", 102, 102);
+  const app = new Hono();
+  app.use("*", async (c, next) => { c.set("userId", 7); c.set("role", "editor"); await next(); });
+  app.route("/api/pipelines", pipelines);
+  const env = { DB, BT_API_TOKEN: "dummy" };
+  const ctx = { waitUntil(p) { p?.catch?.(() => {}); }, passThroughOnException() {} };
+
+  const list = await (await app.request("/api/pipelines", {}, env, ctx)).json();
+  const byId = new Map(list.jobs.map((j) => [j.job_id, j]));
+  const vr = byId.get("j-range")?.verse_range;
+  assert(vr && vr.start === 3 && vr.end === 5, `range job → verse_range {3,5} (got ${JSON.stringify(vr)})`);
+  assert(byId.get("j-whole")?.verse_range === null, "whole-chapter job → verse_range null");
+  assert(byId.get("j-bad")?.verse_range === "invalid", "unreadable stored range → \"invalid\", not whole chapter");
+  assert(list.jobs.every((j) => !("options_json" in j)), "raw options_json is not returned");
+  const active = list.queue.activeJob;
+  assert(active?.job_id === "j-range" && active.verse_range?.start === 3, "queue.activeJob carries verse_range");
+  assert(!("options_json" in (active ?? {})), "queue.activeJob does not leak options_json");
+
+  const filtered = await (await app.request("/api/pipelines?state=running", {}, env, ctx)).json();
+  assert(filtered.jobs[0]?.verse_range?.end === 5, "explicit ?state= list also carries verse_range");
+
+  // Another user's same-scope run → 409 whose `existing` names the range.
+  sqlite.prepare(`UPDATE pipeline_jobs SET user_id = 8 WHERE job_id = 'j-range'`).run();
+  const res = await app.request(
+    "/api/pipelines/start",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pipelineType: "notes", book: "ZEC", startChapter: 1, verseStart: 3, verseEnd: 5, sessionKey: "s" }),
+    },
+    env,
+    ctx,
+  );
+  const body = await res.json();
+  assert(res.status === 409 && body.existing?.job_id === "j-range", `same scope by another user → 409 (got ${res.status})`);
+  assert(body.existing?.verse_range?.start === 3 && body.existing.verse_range.end === 5, "409 existing carries verse_range");
+  assert(!("options_json" in (body.existing ?? {})), "409 existing does not leak options_json");
 }
 
 if (failed) { console.error(`${failed} failed`); process.exit(1); }

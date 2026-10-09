@@ -35,6 +35,7 @@ import BlockIcon from "@mui/icons-material/Block";
 import type { PipelineJobRow, PipelineState } from "../sync/api";
 import { pipelineStore } from "../sync/pipelineStore";
 import { currentPipelineUserId } from "../sync/pipelineSession";
+import { jobScopeLabel } from "../lib/pipelineScope";
 
 // A job requested by another user. The shared queue shows everyone's active /
 // queued runs, but only the owner can cancel one, and its requester is
@@ -509,7 +510,7 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
               Only one runs at a time. Running now:{" "}
               {queueSummary.activeJob.started_by_username ?? "someone"} ·{" "}
               {TYPE_LABEL[queueSummary.activeJob.pipeline_type]}{" "}
-              {queueSummary.activeJob.book} {queueSummary.activeJob.start_chapter}
+              {jobScopeLabel(queueSummary.activeJob)}
               {` (${relativeTime(queueSummary.activeJob.updated_at)})`}
             </Typography>
           )}
@@ -537,8 +538,7 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                   </Box>
                   <Box sx={{ flex: 1, minWidth: 0 }}>
                     <Typography variant="body2" sx={{ fontWeight: 500 }}>
-                      {TYPE_LABEL[job.pipeline_type]} — {job.book} {job.start_chapter}
-                      {job.end_chapter !== job.start_chapter ? `–${job.end_chapter}` : ""}
+                      {TYPE_LABEL[job.pipeline_type]} — {jobScopeLabel(job)}
                     </Typography>
                     <Typography variant="caption" color="text.secondary" display="block">
                       {stateLabel(job.state)}
