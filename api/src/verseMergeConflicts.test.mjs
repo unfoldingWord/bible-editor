@@ -3262,6 +3262,217 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 36, 5), overwrite(4, 36, 6), overwrite(4, 37, 5)], OCT05, prior);
     assert(!prior.has("4:36") && prior.has("4:37"), "repeated ref: not captured; a single ref still is");
   }
+
+  // Issue #1137: the crash/retry and overlapping-run cases. A "run" is one
+  // logical reimport (a nightly Workflow run, retried attempt by attempt, or
+  // one UI pull); an attempt is one execution of it. The adapter below is the
+  // only part of this section that knows the writers' signatures:
+  //   begin()     — an attempt starts (the nightly chunk step's entry)
+  //   record(rs)  — the speculative upsert (step 6b)
+  //   land(rs)    — the CAS lands: its reimport edit_log row, then the confirm
+  //   lost(refs)  — the CAS lost: the lost-race cleanup (step 7b)
+  const reimportLanded = (sqlite, r) =>
+    sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+       VALUES ('verse', ?, 'EZK', NULL, ?, ?, 'update', 'dcs_reimport')`,
+    ).run(`EZK/${r.chapter}/${r.verse}/UST`, r.observedVersion, r.observedVersion + 1);
+  const run1137 = (sqlite, env, { startedAt, nightly }) => ({
+    attempt(now) {
+      const prior = new Map();
+      return {
+        begin: async () => {},
+        record: (rows) => recordVerseMergeConflicts(env, "EZK", "ust", "UST", rows, now, prior),
+        land: async (rows) => {
+          for (const r of rows) reimportLanded(sqlite, r);
+          await confirmAdoptedConflicts(env, "EZK", "ust", rows.filter((r) => r.action === "adopt_conflict"), now);
+        },
+        lost: (refs) => deleteLostAdoptionConflicts(env, "EZK", "ust", refs, now, prior, nightly ? startedAt : now),
+      };
+    },
+  });
+  const ow = (chapter, verse, version, extra = {}) => ({ ...overwrite(chapter, verse, version), observedVersion: version, ...extra });
+  const claimsOverwriteOf = (sqlite, chapter, verse, version) =>
+    sqlite.prepare(
+      `SELECT COUNT(*) c FROM verse_merge_conflicts WHERE book = 'EZK' AND chapter = ? AND verse = ? AND overwritten_version = ?`,
+    ).get(chapter, verse, version).c;
+  const auditRow = (chapter, verse) => ({ ...ow(chapter, verse, 3), action: "adopt_no_visible_change", reason: "both_changed_markers_only" });
+
+  // (s) Item 2: Monday's unreviewed adopt_conflict (v5). Tonight's attempt 1
+  // upserts and dies before its CAS; the retry upserts again and loses its
+  // race. Monday's row comes back whole and its editor is still alerted.
+  {
+    const { sqlite, env } = migratedEnv();
+    authored(sqlite, 4, 40, 5);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [ow(4, 40, 5, { alignment: snap("monday") })], AUG19);
+    const monday = speculative(row(sqlite, 4, 40));
+    const R = run1137(sqlite, env, { startedAt: OCT05, nightly: true });
+    const tonight = ow(4, 40, 8, { alignment: snap("tuesday") });
+    const a1 = R.attempt(OCT05);
+    await a1.begin();
+    await a1.record([tonight]); // dies here
+    const a2 = R.attempt(OCT05 + 60);
+    await a2.begin();
+    await a2.record([tonight]);
+    await a2.lost([{ chapter: 4, verse: 40 }]);
+    const r = row(sqlite, 4, 40);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(monday),
+      `#1137 dead attempt + lost retry: Monday's row is back exactly (got ${JSON.stringify(r && speculative(r))})`,
+    );
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const live = liveFor(sqlite, "bcameron93");
+    assert(
+      live.length === 1 && live[0].message.includes("4:40@v5"),
+      `#1137 dead attempt + lost retry: Monday's alert still raises (got: ${live.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+  }
+
+  // (t) Item 1: attempt 1 promotes an audit row to an adopt_conflict at v7 and
+  // dies before its CAS; a person saves the verse; the retry measures
+  // something that is not an adoption and writes no row for it. Nothing may
+  // still claim the v7 overwrite.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 41, 7);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 41)], AUG19);
+    const before = speculative(row(sqlite, 4, 41));
+    const R = run1137(sqlite, env, { startedAt: OCT05, nightly: true });
+    const a1 = R.attempt(OCT05);
+    await a1.begin();
+    await a1.record([ow(4, 41, 7)]); // dies here
+    const a2 = R.attempt(OCT05 + 60);
+    await a2.begin(); // and records nothing for 4:41
+    assert(claimsOverwriteOf(sqlite, 4, 41, 7) === 0, "#1137 dead attempt + non-adopting retry: no row claims the unlanded v7 overwrite");
+    const r = row(sqlite, 4, 41);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(before),
+      `#1137 dead attempt + non-adopting retry: the audit row is back (got ${JSON.stringify(r && speculative(r))})`,
+    );
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    assert(liveFor(sqlite, "jdoe").length === 0, "#1137 dead attempt + non-adopting retry: v7's author is not alerted");
+  }
+
+  // (t2) The guard on (t): attempt 1's CAS LANDED (its reimport edit_log row
+  // exists) and it died before anything after the CAS ran. The overwrite is
+  // real, so the retry must keep the row's claim.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 47)], AUG19);
+    const R = run1137(sqlite, env, { startedAt: OCT05, nightly: true });
+    const a1 = R.attempt(OCT05);
+    await a1.begin();
+    await a1.record([ow(4, 47, 7)]);
+    reimportLanded(sqlite, ow(4, 47, 7)); // the CAS landed; the attempt died right after
+    const a2 = R.attempt(OCT05 + 60);
+    await a2.begin(); // D1 now equals master: the retry records nothing for 4:47
+    assert(claimsOverwriteOf(sqlite, 4, 47, 7) === 1, "#1137 dead attempt whose CAS landed: the retry keeps the v7 claim");
+  }
+
+  // (u) Item 6: nightly run B starts; a UI pull A upserts a brand-new row,
+  // then B upserts the same verse; A's CAS lands and confirms; B's loses. A's
+  // landed alert survives B's cleanup.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 42, 11);
+    const tonight = ow(4, 42, 11, { alignment: snap("october") });
+    const B = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05 + 40);
+    const A = run1137(sqlite, env, { startedAt: OCT05 + 30, nightly: false }).attempt(OCT05 + 30);
+    await B.begin();
+    await A.begin();
+    await A.record([tonight]);
+    await B.record([tonight]);
+    await A.land([tonight]);
+    await B.lost([{ chapter: 4, verse: 42 }]);
+    assert(claimsOverwriteOf(sqlite, 4, 42, 11) === 1, "#1137 overlap (UI lands, nightly loses): the landed v11 row survives");
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const toJdoe = liveFor(sqlite, "jdoe");
+    assert(
+      toJdoe.length === 1 && toJdoe[0].message.includes("4:42@v11"),
+      `#1137 overlap (UI lands, nightly loses): v11's author is alerted (got: ${toJdoe.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+  }
+
+  // (v) Item 4, first half: a UI pull A upserts, lands and confirms a new row
+  // AFTER nightly run B started; B then upserts the same verse and loses. A's
+  // row is genuine, not a dead attempt of B's, and survives.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 45, 11);
+    const tonight = ow(4, 45, 11);
+    const B = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05 + 20);
+    const A = run1137(sqlite, env, { startedAt: OCT05 + 10, nightly: false }).attempt(OCT05 + 10);
+    await B.begin();
+    await A.begin();
+    await A.record([tonight]);
+    await A.land([tonight]);
+    await B.record([tonight]);
+    await B.lost([{ chapter: 4, verse: 45 }]);
+    assert(claimsOverwriteOf(sqlite, 4, 45, 11) === 1, "#1137 overlap (genuine row from another run): A's landed v11 row survives B's lost race");
+  }
+
+  // (w) Item 4, second half: nightly X and UI pull Y both upsert a promotion
+  // of the same audit row and both lose. Neither overwrite landed, so the row
+  // ends as the audit row, whichever cleanup runs last.
+  {
+    for (const order of ["XY", "YX"]) {
+      const { sqlite, env } = migratedEnv();
+      jdoe(sqlite);
+      authoredBy(sqlite, 8, 4, 43, 7);
+      await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 43)], AUG19);
+      const before = speculative(row(sqlite, 4, 43));
+      const X = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+      const Y = run1137(sqlite, env, { startedAt: OCT05 + 30, nightly: false }).attempt(OCT05 + 30);
+      await X.begin();
+      await X.record([ow(4, 43, 7)]);
+      await Y.begin();
+      await Y.record([ow(4, 43, 7)]);
+      for (const who of order) await (who === "X" ? X : Y).lost([{ chapter: 4, verse: 43 }]);
+      assert(claimsOverwriteOf(sqlite, 4, 43, 7) === 0, `#1137 overlap, both lose (${order}): no row claims the v7 overwrite`);
+      const r = row(sqlite, 4, 43);
+      assert(
+        r != null && JSON.stringify(speculative(r)) === JSON.stringify(before),
+        `#1137 overlap, both lose (${order}): the audit row is back (got ${JSON.stringify(r && speculative(r))})`,
+      );
+    }
+  }
+
+  // (x) Item 3: a UI pull D upserts a promotion and dies before its CAS; a
+  // later UI pull P upserts the same verse and loses. P must not put back D's
+  // unlanded speculative row as if it were the real prior state.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 44, 7);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 44)], AUG19);
+    const D = run1137(sqlite, env, { startedAt: OCT05, nightly: false }).attempt(OCT05);
+    await D.begin();
+    await D.record([ow(4, 44, 7)]); // dies here
+    const P = run1137(sqlite, env, { startedAt: OCT05 + 3600, nightly: false }).attempt(OCT05 + 3600);
+    await P.begin();
+    await P.record([ow(4, 44, 7)]);
+    await P.lost([{ chapter: 4, verse: 44 }]);
+    assert(claimsOverwriteOf(sqlite, 4, 44, 7) === 0, "#1137 dead UI pull + later lost pull: no row claims the unlanded v7 overwrite");
+  }
+
+  // (y) Items 5 and 7: a ref listed twice in one record call, then a lost
+  // race. Monday's pending alert row survives instead of being deleted.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [ow(4, 46, 5, { alignment: snap("monday") })], AUG19);
+    const monday = speculative(row(sqlite, 4, 46));
+    const a = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+    await a.begin();
+    await a.record([ow(4, 46, 8), ow(4, 46, 9)]);
+    await a.lost([{ chapter: 4, verse: 46 }]);
+    const r = row(sqlite, 4, 46);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(monday),
+      `#1137 repeated ref + lost race: Monday's row is back (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
 }
 
 if (failed) {
