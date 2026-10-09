@@ -378,16 +378,17 @@ function settleSpeculationStmts(env: Env, scope: unknown[]): D1PreparedStatement
 }
 
 // Issue #1137: the statement bookReimport.ts puts in a master-adoption CAS
-// batch directly after one ref's write and its changes()-gated edit_log row,
-// so that ref's row drops its speculative capture in the same transaction, and
-// only if that write landed (SETTLE_LANDED_CONFLICT_SQL).
+// batch directly after a write and its changes()-gated edit_log row, so the
+// `refs` that write covers drop their speculative capture in the same
+// transaction, and only if that write landed (SETTLE_LANDED_CONFLICT_SQL).
 export function settleLandedConflictStmt(
   env: Env,
   book: string,
   resource: string,
-  ref: { chapter: number; verse: number },
+  refs: Array<{ chapter: number; verse: number }>,
 ): D1PreparedStatement {
-  return env.DB.prepare(SETTLE_LANDED_CONFLICT_SQL).bind(book, resource, ref.chapter, ref.verse);
+  return env.DB.prepare(SETTLE_LANDED_CONFLICT_SQL)
+    .bind(book, resource, JSON.stringify(refs.map((r) => conflictRefKey(r.chapter, r.verse))));
 }
 
 // A dead run's unsettled capture older than this (seconds) is rolled back by

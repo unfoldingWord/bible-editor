@@ -3254,7 +3254,7 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
          VALUES ('verse', 'EZK/4/35/UST', 'EZK', NULL, 11, 12, 'update', 'dcs_reimport')`,
       ),
-      settleLandedConflictStmt(env, "EZK", "ust", tonightA),
+      settleLandedConflictStmt(env, "EZK", "ust", [tonightA]),
     ]);
     await confirmAdoptedConflicts(env, "EZK", "ust", [tonightA], OCT05);
     await lostRace(env, 4, 35, OCT05 + 20, "run-B"); // B's CAS lost
@@ -3304,7 +3304,7 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     ).run(`EZK/${r.chapter}/${r.verse}/UST`, r.observedVersion, r.observedVersion + 1);
   // The settle that closes a CAS batch, for one ref, placed right after that
   // ref's write and edit_log row as bookReimport.ts places it.
-  const settleOne = (env, r) => settleLandedConflictStmt(env, "EZK", "ust", r);
+  const settleOne = (env, r) => settleLandedConflictStmt(env, "EZK", "ust", [r]);
   // A dead run's capture older than this is rolled back by any later run.
   const STALE_SECONDS = 3600;
   let runSeq = 0;
@@ -3621,6 +3621,32 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     assert(
       r != null && JSON.stringify(speculative(r)) === JSON.stringify(before),
       `#1137 A3: the audit row is back (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review F2: the keep_local_structure carve-out. Run A speculates a
+  // promotion of an audit row to adopt_conflict; a keep_local_structure flag
+  // then lands on the same verse (step 7s's late flags, no run id). The row
+  // still shows A's adopt_conflict (the upsert keeps an unresolved
+  // adopt_conflict over keep_local_structure), so A's capture must survive the
+  // flag, and A's lost CAS must put the audit row back.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 53)], AUG19);
+    const before = speculative(row(sqlite, 4, 53));
+    const A = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+    await A.begin();
+    await A.record([ow(4, 53, 7)]);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{
+      ...ow(4, 53, null), action: "keep_local_structure", reason: "anchor_keep_alignment_refused", observedVersion: 7,
+    }], OCT05);
+    const mid = row(sqlite, 4, 53);
+    assert(mid?.action === "adopt_conflict" && mid?.prior_run != null, "#1137 F2: the carve-out keeps A's adopt_conflict and A's capture");
+    await A.casLost([ow(4, 53, 7)]);
+    const r = row(sqlite, 4, 53);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(before) && r.prior_run === null,
+      `#1137 F2: A's lost CAS puts the audit row back (got ${JSON.stringify(r && speculative(r))})`,
     );
   }
 

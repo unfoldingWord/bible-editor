@@ -6485,6 +6485,46 @@ function buildStructureAdoptionStmts(
   return stmts;
 }
 
+// Issue #1137: one structure component's statements as the CAS batch sends
+// them: buildStructureAdoptionStmts's anchor write and its edit_log row, then
+// ONE settleLandedConflictStmt for the anchor and every absorbed row, then the
+// rest (per absorbed row: delete, log; per recreated row: insert, log).
+// Results: anchor at +0, absorbed row j at +3 + 2j, recreated row j at
+// +3 + 2(absorbed + j). The settle is gated on the anchor's log row, and that
+// is exact for the absorbed rows too: within the batch's one transaction the
+// anchor lands only if every absorbed row is still at its read version
+// (buildStructureAdoptionStmts's bridge guards), and each delete then needs
+// only that and the anchor at its new version, covering it. One statement,
+// not one per row (#1137 review C1), so a component costs one more than
+// before: 3 + 2 × (absorbed + recreated), at most 83 for
+// MAX_STRUCTURE_COMPONENT_ROWS (40), under D1's 100 per batch. The statement
+// after the settle (an absorbed delete or a recreated insert) does not read
+// changes().
+function structureComponentSize(aw: StructureAnchorWrite): number {
+  return 3 + 2 * (aw.adoption.absorbed.length + aw.adoption.recreated.length);
+}
+
+function structureComponentStmts(
+  env: Env,
+  book: string,
+  bibleVersion: string,
+  resource: string,
+  userId: number | null,
+  now: number,
+  door43: string,
+  aw: StructureAnchorWrite,
+): D1PreparedStatement[] {
+  const built = buildStructureAdoptionStmts(env, book, bibleVersion, userId, now, door43, aw);
+  const ad = aw.adoption;
+  const settle = settleLandedConflictStmt(env, book, resource, [
+    { chapter: ad.chapter, verse: ad.anchor.verse },
+    ...ad.absorbed.map((row) => ({ chapter: ad.chapter, verse: row.verse })),
+  ]);
+  return [built[0], built[1], settle, ...built.slice(2)];
+}
+
+export const structureComponentForTest = { size: structureComponentSize, stmts: structureComponentStmts };
+
 async function applyVerseRows(
   env: Env,
   book: string,
@@ -7971,7 +8011,7 @@ async function applyVerseRows(
               book, userId, a.oldVersion, a.oldVersion + 1, "update",
               { plain_text: a.plainText, content: a.v.contentJson },
             ),
-            settleLandedConflictStmt(env, book, resource, a.v),
+            settleLandedConflictStmt(env, book, resource, [a.v]),
           ]),
         ]);
         slice.forEach((a, j) => {
@@ -8138,8 +8178,7 @@ async function applyVerseRows(
     let group: StructureAnchorWrite[] = [];
     let groupSize = 0;
     for (const aw of staged) {
-      // Issue #1137: + 1 settle after the anchor and after each absorbed row.
-      const size = 3 + 3 * aw.adoption.absorbed.length + 2 * aw.adoption.recreated.length;
+      const size = structureComponentSize(aw);
       if (group.length > 0 && groupSize + size > WRITE_BATCH) {
         groups.push(group);
         group = [];
@@ -8155,19 +8194,7 @@ async function applyVerseRows(
       const offsets: number[] = [];
       for (const aw of g) {
         offsets.push(stmts.length);
-        // Issue #1137: a settleLandedConflictStmt right after the anchor's
-        // edit_log row and after each absorbed row's, so each of those verses'
-        // conflict rows settles exactly when its own write landed (see step
-        // 7's content batch). Layout per component: anchor write, log,
-        // settle; per absorbed row: delete, log, settle; per recreated row:
-        // insert, log. No statement after a settle reads changes().
-        const built = buildStructureAdoptionStmts(env, book, bibleVersion, userId, now, door43, aw);
-        const ad = aw.adoption;
-        stmts.push(built[0], built[1], settleLandedConflictStmt(env, book, resource, { chapter: ad.chapter, verse: ad.anchor.verse }));
-        ad.absorbed.forEach((row, j) => {
-          stmts.push(built[2 + 2 * j], built[3 + 2 * j], settleLandedConflictStmt(env, book, resource, { chapter: ad.chapter, verse: row.verse }));
-        });
-        stmts.push(...built.slice(2 + 2 * ad.absorbed.length));
+        stmts.push(...structureComponentStmts(env, book, bibleVersion, resource, userId, now, door43, aw));
       }
       try {
         const results = await env.DB.batch(stmts);
@@ -8200,14 +8227,14 @@ async function applyVerseRows(
           let landed = 0;
           ad.absorbed.forEach((row, j) => {
             subs++;
-            if ((results[off + 3 + 3 * j]?.meta.changes ?? 0) > 0) {
+            if ((results[off + 3 + 2 * j]?.meta.changes ?? 0) > 0) {
               landed++;
               adoptionsApplied.add(structureKey(ad.chapter, row.verse));
             }
           });
           ad.recreated.forEach((_m, j) => {
             subs++;
-            if ((results[off + 3 + 3 * ad.absorbed.length + 2 * j]?.meta.changes ?? 0) > 0) landed++;
+            if ((results[off + 3 + 2 * (ad.absorbed.length + j)]?.meta.changes ?? 0) > 0) landed++;
           });
           if (landed === subs) {
             counts.structure_adopted++;

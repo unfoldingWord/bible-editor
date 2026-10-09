@@ -15,7 +15,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { applyVerseRowsForTest, confirmedBasesForCutoffForTest, bookLockedForAlert } from "./bookReimport.ts";
+import { applyVerseRowsForTest, confirmedBasesForCutoffForTest, bookLockedForAlert, structureComponentForTest } from "./bookReimport.ts";
+import { MAX_STRUCTURE_COMPONENT_ROWS } from "./verseStructure.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 import { SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL, UPSERT_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictSql.ts";
 
@@ -1488,6 +1489,13 @@ console.log("\n[#1132: a lost CAS race leaves an earlier night's still-pending o
     raced = true;
     sqlite.prepare(`UPDATE verses SET version = version + 1, content_json = ?, plain_text = ? WHERE book = ? AND chapter = 16 AND verse = 1`)
       .run(contentJson("translator concurrent edit"), "translator concurrent edit", BOOK);
+    // Issue #1137 review A2: a non-adoption reimport write logged at the same
+    // version (a source-attribute reconcile) must not read as this adoption
+    // landing. The CAS batch's own gated log row is what settles a capture.
+    const v = sqlite.prepare(`SELECT version FROM verses WHERE book = ? AND chapter = 16 AND verse = 1 AND bible_version = ?`).get(BOOK, VERSION).version;
+    sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, prev_version, new_version, action, source) VALUES ('verse', ?, ?, ?, ?, 'update', 'dcs_reimport')`,
+    ).run(`${BOOK}/16/1/${VERSION}`, BOOK, v - 1, v);
   });
   const counts = await applyVerseRowsForTest(
     env, BOOK, VERSION,
@@ -1500,6 +1508,43 @@ console.log("\n[#1132: a lost CAS race leaves an earlier night's still-pending o
   const after = sqlite.prepare(`SELECT * FROM verse_merge_conflicts WHERE book = ? AND chapter = 16 AND verse = 1`).get(BOOK);
   const fields = (r) => r && [r.action, r.reason, r.overwritten_version, r.alignment, r.detected_at, r.last_recorded_at, r.resolved_at];
   eq(fields(after), fields(monday), "Monday's pending adopt_conflict row survives exactly as it was");
+  eq([after?.prior_run, after?.prior_json], [null, null], "…restored through the real CAS batch and step 7b, its capture cleared (#1137)");
+}
+
+// Issue #1137 review C1: a structure component's CAS batch stays under D1's
+// 100-statement batch cap at the widest component the planner allows. The
+// per-row settles of an earlier draft made 3 + 3 x 40 = 123 statements, which
+// D1 rejects, so a bridge that worked on main would never land.
+console.log("\n[#1137 C1: the widest structure component's batch fits D1's caps]");
+{
+  const fakeEnv = {
+    DB: {
+      prepare: (sql) => {
+        const st = { sql, args: [], bind: (...a) => { st.args = a; return st; } };
+        return st;
+      },
+    },
+  };
+  const n = MAX_STRUCTURE_COMPONENT_ROWS;
+  const absorbed = Array.from({ length: n }, (_, i) => ({
+    chapter: 3, verse: i + 2, verse_end: null, version: 1, content_json: "{}", plain_text: "x",
+  }));
+  const aw = {
+    adoption: { kind: "bridge", chapter: 3, anchor: { chapter: 3, verse: 1, verse_end: null, version: 4 },
+      anchorMaster: { chapter: 3, verse: 1, verseEnd: n + 1 }, absorbed, recreated: [] },
+    v: { chapter: 3, verse: 1, verseEnd: n + 1, contentJson: "{}", plainText: "x" },
+    oldVersion: 4, mode: "merge", contentJson: "{}", plainText: "x",
+  };
+  const stmts = structureComponentForTest.stmts(fakeEnv, BOOK, "ULT", "ult", null, 1000, "door43-user", aw);
+  eq(stmts.length, structureComponentForTest.size(aw), "the size the grouping uses matches the statements built");
+  eq(stmts.length, 3 + 2 * n, `${n} absorbed rows: anchor pair, one settle, ${n} delete/log pairs`);
+  eq(2 + 2 * n <= 100 && stmts.length <= 100, true, `main's ${2 + 2 * n} statements and this branch's ${stmts.length} both fit D1's 100`);
+  eq(/^UPDATE verse_merge_conflicts/.test(stmts[2].sql) && /changes\(\) > 0/.test(stmts[2].sql), true,
+    "the settle sits right after the anchor's gated edit_log row");
+  eq(JSON.parse(stmts[2].args[2]).length, n + 1, "the settle covers the anchor and every absorbed row");
+  const anchorParams = Math.max(...[...stmts[0].sql.matchAll(/\?(\d+)/g)].map((m) => Number(m[1])));
+  eq(anchorParams <= 100 && stmts[0].args.length === anchorParams, true,
+    `the anchor UPDATE binds ${anchorParams} parameters, within D1's 100 (unchanged by #1137)`);
 }
 
 // ── Issue #1005: the watermark lags one publish; the app edit already shipped ─

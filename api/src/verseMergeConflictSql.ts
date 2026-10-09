@@ -654,11 +654,14 @@ export const SETTLE_SPECULATIVE_CONFLICTS_SQL = `UPDATE verse_merge_conflicts
   WHERE ${SPECULATION_SCOPE}`;
 
 // ---------------------------------------------------------------------------
-// Issue #1137: settle the row of an overwrite that just landed. bookReimport.ts
-// puts one of these in each master-adoption CAS batch (content and
-// structure) directly after each write's changes()-gated edit_log row, so
-// `changes() > 0` here means exactly "that ref's own write landed" (the gated
-// log row was inserted). It runs in the same D1 transaction as the write: a
+// Issue #1137: settle the rows of an overwrite that just landed. bookReimport.ts
+// puts one of these in each master-adoption CAS batch directly after a write's
+// changes()-gated edit_log row, so `changes() > 0` here means exactly "that
+// write landed" (the gated log row was inserted). A content adoption settles
+// its one verse; a structure component settles its anchor and every absorbed
+// row together after the anchor's log row, because in one transaction the
+// absorbed deletes land exactly when the anchor does (bookReimport.ts's
+// structureComponentStmts). It runs in the same D1 transaction as the write: a
 // landed overwrite and the end of its row's speculation commit together, and
 // an attempt that dies right after its CAS leaves nothing for a retry to
 // misread as unlanded. A reimport write that is not this adoption (a
@@ -667,11 +670,13 @@ export const SETTLE_SPECULATIVE_CONFLICTS_SQL = `UPDATE verse_merge_conflicts
 // dropped, not just this run's: once an overwrite of the verse has landed, the
 // row describes a real overwrite whoever's speculation is on it.
 //
-// Binds, in order: (book, resource, chapter, verse).
+// Binds, in order: (book, resource, refsJson), refsJson a JSON array of
+// "chapter:verse" strings.
 // ---------------------------------------------------------------------------
 export const SETTLE_LANDED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
     SET prior_json = NULL, prior_run = NULL
-  WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
+  WHERE book = ?1 AND resource = ?2
+    AND (chapter || ':' || verse) IN (SELECT value FROM json_each(?3))
     AND prior_run IS NOT NULL
     AND changes() > 0`;
 
