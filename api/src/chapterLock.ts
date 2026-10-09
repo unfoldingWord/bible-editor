@@ -5,6 +5,7 @@
 // (tn PATCH, /preserve, /hint, legacy /keep alias).
 
 import type { Env } from "./index";
+import { storedVerseRange } from "./storedVerseRange.ts";
 
 export interface ActiveLock {
   jobId: string;
@@ -95,9 +96,10 @@ export async function activePipelineForChapter(
   book: string,
   chapter: number,
   resource?: LockedResource,
+  verse?: number,
 ): Promise<ActiveLock | null> {
   const rs = await activePipelinesStatement(env.DB, book, chapter).all<ActivePipelineRow>();
-  return pickActivePipeline(rs.results ?? [], chapter, resource);
+  return pickActivePipeline(rs.results ?? [], chapter, resource, verse);
 }
 
 export interface ActivePipelineRow {
@@ -108,6 +110,7 @@ export interface ActivePipelineRow {
   follow_up_chain: string | null;
   start_chapter: number;
   end_chapter: number;
+  options_json: string | null;
 }
 
 // The read half of activePipelineForChapter as an unexecuted statement, so a
@@ -125,7 +128,7 @@ export function activePipelinesStatement(
     const statePlaceholders = NON_TERMINAL.map((_, i) => `?${i + 2}`).join(", ");
     return db
       .prepare(
-        `SELECT job_id, pipeline_type, user_id, created_at, follow_up_chain, start_chapter, end_chapter
+        `SELECT job_id, pipeline_type, user_id, created_at, follow_up_chain, start_chapter, end_chapter, options_json
            FROM pipeline_jobs
           WHERE book = ?1
             AND state IN (${statePlaceholders})
@@ -136,7 +139,7 @@ export function activePipelinesStatement(
   const statePlaceholders = NON_TERMINAL.map((_, i) => `?${i + 3}`).join(", ");
   return db
     .prepare(
-      `SELECT job_id, pipeline_type, user_id, created_at, follow_up_chain, start_chapter, end_chapter
+      `SELECT job_id, pipeline_type, user_id, created_at, follow_up_chain, start_chapter, end_chapter, options_json
          FROM pipeline_jobs
         WHERE book = ?1
           AND start_chapter <= ?2 AND end_chapter >= ?2
@@ -149,22 +152,83 @@ export function activePipelinesStatement(
 // The decision half of activePipelineForChapter over activePipelinesStatement's
 // rows (already in created_at order): the first job covering `chapter` that
 // will write `resource`, or null.
+//
+// `verse` (issue #1165) is the ANCHOR verse of the tn row being written. A
+// verse-range notes run locks only notes anchored inside its range (see
+// tnLockVerseRange), so a job whose range does not contain `verse` is skipped
+// and the next covering job is still checked. Omitting `verse` keeps the
+// whole-chapter answer. It narrows the "tn" resource only.
 export function pickActivePipeline(
   rows: readonly ActivePipelineRow[],
   chapter: number,
   resource?: LockedResource,
+  verse?: number,
 ): ActiveLock | null {
   for (const row of rows) {
     if (!(row.start_chapter <= chapter && row.end_chapter >= chapter)) continue;
     if (resource && !resourcesLockedByJob(row.pipeline_type, row.follow_up_chain).has(resource)) {
       continue;
     }
-    return {
-      jobId: row.job_id,
-      pipelineType: row.pipeline_type,
-      userId: row.user_id,
-      startedAt: row.created_at,
-    };
+    if (resource === "tn" && verse !== undefined) {
+      const span = tnLockVerseRange(row);
+      if (span && (verse < span.start || verse > span.end)) continue;
+    }
+    return activeLockOf(row);
+  }
+  return null;
+}
+
+function activeLockOf(row: ActivePipelineRow): ActiveLock {
+  return {
+    jobId: row.job_id,
+    pipelineType: row.pipeline_type,
+    userId: row.user_id,
+    startedAt: row.created_at,
+  };
+}
+
+// The anchor verses a job's notes lock covers (issue #1165), or null when it
+// locks the whole chapter. Only a one-chapter `notes` job with no follow-up
+// chain and a VALID stored verse range narrows: that is the shape #1160 accepts
+// at /start, and the range import stages, applies and sweeps only notes whose
+// anchor verse is inside the range (pipelineImport.ts), so a note anchored
+// outside it is never read or written by the run. Anything else, including a
+// stored range storedVerseRange rejects, answers null: fail closed, because a
+// wrong range here is the direction that lets an edit race the import.
+//
+// Keyed on the anchor verse like the import, so a bridge anchored before the
+// range (36:9-11 in a 10-15 run) is outside it: staging skips notes anchored
+// there and the sweep never reaches that verse.
+//
+// The client reads this from GET /api/pipelines `locks_tn_verse_range`
+// (computed with this function), so the lanes it greys out match these.
+export function tnLockVerseRange(
+  row: Pick<ActivePipelineRow, "pipeline_type" | "follow_up_chain" | "start_chapter" | "end_chapter" | "options_json">,
+): { start: number; end: number } | null {
+  if (row.pipeline_type !== "notes" || row.follow_up_chain || row.start_chapter !== row.end_chapter) {
+    return null;
+  }
+  const stored = storedVerseRange(row.options_json);
+  return stored.ok ? stored.range : null;
+}
+
+// Is a tn row being MOVED to anchor verse `verse` moving into a verse-range
+// run's locked span (issue #1165)? Note edits stay exempt from the lock (a
+// content edit makes the note kept), but a reference-only move is not a content
+// change, so classifyKept (keptNotes.ts) does not keep the note: one moved into
+// the range mid-run would be swept by the range import. Whole-chapter runs are
+// left as they were (the note was already inside their sweep scope wherever it
+// sat in the chapter), so only a range lock answers here.
+export function rangeLockCoveringVerse(
+  rows: readonly ActivePipelineRow[],
+  chapter: number,
+  verse: number,
+): ActiveLock | null {
+  for (const row of rows) {
+    if (!(row.start_chapter <= chapter && row.end_chapter >= chapter)) continue;
+    if (!resourcesLockedByJob(row.pipeline_type, row.follow_up_chain).has("tn")) continue;
+    const span = tnLockVerseRange(row);
+    if (span && verse >= span.start && verse <= span.end) return activeLockOf(row);
   }
   return null;
 }
