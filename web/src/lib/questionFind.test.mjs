@@ -74,9 +74,10 @@ const re = /the/gi;
 {
   const r = replaceAllLiteral("a the b the", /the/i, "$1&");
   check(r.text === "a $1& b $1&" && r.count === 2, "literal, all occurrences");
-  check(applyQuestionMatch("a the b", { start: 2, end: 5 }, "$&") === "a $& b", "single literal");
-  check(applyQuestionMatch("a the b", { start: 2, end: 99 }, "x") === null, "drift rejected");
-  check(applyQuestionMatch("a the b", { start: 2, end: 5 }, "the") === null, "no-op rejected");
+  check(applyQuestionMatch("a the b", { start: 2, end: 5, matchText: "the" }, "$&") === "a $& b", "single literal");
+  check(applyQuestionMatch("a the b", { start: 2, end: 99, matchText: "the" }, "x") === null, "drift rejected");
+  check(applyQuestionMatch("a xyz b", { start: 2, end: 5, matchText: "the" }, "x") === null, "stale offsets rejected");
+  check(applyQuestionMatch("a the b", { start: 2, end: 5, matchText: "the" }, "the") === null, "no-op rejected");
 }
 
 // Empty guard.

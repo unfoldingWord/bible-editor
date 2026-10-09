@@ -965,7 +965,15 @@ export function FindReplaceOverlay({
           rows += 1;
         }
       }
-      if (matches === 0) return;
+      if (matches === 0) {
+        // Every hit sits in a pipeline-locked chapter: say so instead of
+        // silently doing nothing.
+        const lockedRows = searchQuestions().filter(
+          (r) => r.deleted_at == null && isQuestionLocked(r.chapter),
+        ).length;
+        if (lockedRows > 0) setReplaceSummary(emptyQuestionSummary({ lockedSkipped: lockedRows }));
+        return;
+      }
       setConfirmAll({ scope: "tq", count: matches, rows });
     }
   };

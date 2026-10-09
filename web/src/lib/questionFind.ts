@@ -95,10 +95,13 @@ export function collectQuestionMatches(
 // the match no longer lines up with the text (drift) or nothing would change.
 export function applyQuestionMatch(
   text: string,
-  m: { start: number; end: number },
+  m: { start: number; end: number; matchText: string },
   replacement: string,
 ): string | null {
   if (!text || m.start < 0 || m.end > text.length || m.start >= m.end) return null;
+  // The match list can lag a saved edit; never splice at offsets that no
+  // longer hold the matched text.
+  if (text.slice(m.start, m.end) !== m.matchText) return null;
   const next = text.slice(0, m.start) + replacement + text.slice(m.end);
   return next === text ? null : next;
 }

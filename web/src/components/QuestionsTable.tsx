@@ -183,8 +183,14 @@ const Row = memo(function Row({
     }
   }, [editingField]);
   const findRe = useMemo(() => (findQuery ? buildFindRegex(findQuery) : null), [findQuery]);
+  // Not while the field holds unsaved text: the match index was computed on
+  // the saved text, so the mark could land on the wrong occurrence.
+  const fieldDirty = (f: QuestionField) =>
+    (f === "question" ? question : response) !== (row[f] ?? "");
   const readField: QuestionField | null =
-    activeMatch && findRe && editingField !== activeMatch.field ? activeMatch.field : null;
+    activeMatch && findRe && editingField !== activeMatch.field && !fieldDirty(activeMatch.field)
+      ? activeMatch.field
+      : null;
 
   // Set by a history restore that fires while the REF lane has unsaved typing.
   // The restore bumps row.version, which would otherwise make the resync below
@@ -511,6 +517,8 @@ function QuestionFindReadView({
         onActivate();
       }}
       title="click to edit"
+      tabIndex={0}
+      onFocus={onActivate}
       sx={{
         gridArea,
         cursor: "text",
