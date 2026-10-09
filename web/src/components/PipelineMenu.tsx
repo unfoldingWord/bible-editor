@@ -195,7 +195,12 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
   // a change made in a different tab is reflected.
   useEffect(() => {
     if (confirm?.type === "generate") setGenOpts(loadGenOpts());
-    if (confirm) setRefInput(String(chapter));
+    // While the user's own notes run covers this chapter, the field opens empty
+    // (issue #1166): pre-filling the chapter would make one click queue a
+    // whole-chapter rerun behind a range run. They must type a scope.
+    if (confirm) {
+      setRefInput(confirm.type === "notes" && runningType("notes") ? "" : String(chapter));
+    }
   }, [confirm, book, chapter]);
 
   const genNothingSelected = !genOpts.ult && !genOpts.ust;
@@ -233,6 +238,10 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
   // notes item stays open while a notes run is going, and only the dialog
   // blocks, when what the user typed is the same scope as their own active
   // run (issue #1166; same rule as findSameScopeJob in api/src/pipelines.ts).
+  const ownNotesRun = confirm?.type === "notes" ? runningType("notes") : undefined;
+  // The field opened empty because of ownNotesRun (see the open effect) and
+  // nothing is typed yet: Start stays disabled, the hint asks for a scope.
+  const awaitingNotesScope = Boolean(ownNotesRun) && refInput.trim() === "";
   const sameScopeNotesRun: PipelineJob | undefined =
     confirm?.type === "notes" && refParsed.ok && refParsed.range.startChapter === refParsed.range.endChapter
       ? activeJobs.find(
@@ -375,7 +384,13 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
                   running
                     ? blocks
                       ? `Already running (${running.state})`
-                      : `Running for ${jobScopeLabel(running)} (${running.state}). Other verses can queue.`
+                      : `Running for ${jobScopeLabel(running)} (${running.state}). ${
+                          running.verse_range == null
+                            ? "A verse range can queue behind it."
+                            : running.verse_range === "invalid"
+                              ? "A different scope can queue behind it."
+                              : "Other verses can queue behind it."
+                        }`
                     : `${opt.description} ${opt.approxDuration}`
                 }
               />
@@ -422,10 +437,12 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
               fullWidth
               size="small"
               autoFocus
-              error={!refParsed.ok || Boolean(sameScopeNotesRun)}
+              error={(!refParsed.ok && !awaitingNotesScope) || Boolean(sameScopeNotesRun)}
               inputProps={{ inputMode: allowVerses ? "text" : "numeric", pattern: "[0-9:-]*" }}
               helperText={
-                sameScopeNotesRun
+                awaitingNotesScope && ownNotesRun
+                  ? `Your notes run for ${jobScopeLabel(ownNotesRun)} is ${ownNotesRun.state}. Type the verses for another run (e.g. ${chapter}:6-8), or ${chapter} for the whole chapter.`
+                  : sameScopeNotesRun
                   ? `Already running for ${jobScopeLabel(sameScopeNotesRun)} (${sameScopeNotesRun.state}). Pick other verses to queue another run.`
                   : refParsed.ok
                   ? refParsed.range.verseStart !== undefined
