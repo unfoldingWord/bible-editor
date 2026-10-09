@@ -2814,6 +2814,26 @@ function countAllMilestones(nodes) {
   assert(alignedWords(r2.content).map((x) => x.text).join("|") === "helo|world", "deleting one letter inside a word still yields one word");
 }
 
+// Case 79c: the widening follows a connector that binds two word characters, so
+// a fused token is never cut mid-way (reviewers' hyphen / possessive cases), and
+// a gap deletion with no connector or a lone space works the same way.
+{
+  console.log("\n[Case 79c] Gap deletions next to hyphenated / possessive tokens fuse into one \\w");
+  const cases = [
+    ["foo-bar baz", "foo-barbaz", [zaln("H1", [w("foo-bar")]), t(" "), zaln("H2", [w("baz")])], "foo-barbaz"],
+    ["so Isaiah's book", "so Isaiah'sbook", [zaln("H0", [w("so")]), t(" "), zaln("H1", [w("Isaiah's")]), t(" "), zaln("H2", [w("book")])], "so|Isaiah'sbook"],
+    ["so foo bar", "so foobar", [zaln("H0", [w("so")]), t(" "), zaln("H1", [w("foo")]), t(" "), zaln("H2", [w("bar")])], "so|foobar"],
+  ];
+  for (const [oldText, newText, vo, expected] of cases) {
+    const verse = { verseObjects: vo };
+    assert(extractEditableText(verse) === oldText, `fixture baseline is ${JSON.stringify(oldText)}`);
+    const r = smartEditVerse(verse, oldText, newText);
+    assert(extractEditableText(r.content) === newText, `${JSON.stringify(oldText)} -> ${JSON.stringify(newText)}: text round-trips`);
+    const got = alignedWords(r.content).map((x) => x.text).join("|");
+    assert(got === expected, `${JSON.stringify(newText)} is words ${expected} (got ${got})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

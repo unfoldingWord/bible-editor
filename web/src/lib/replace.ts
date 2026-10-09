@@ -1447,8 +1447,10 @@ function snapDiffToWordBoundaries(
     // mid-word, localizedRewriteVerse keeps a fragment of each word — \w "A" +
     // \w "las", two chips that read as one word (JER 34:5). Snap out to the whole
     // words so it becomes an ordinary word replacement and the fused text
-    // tokenizes as one word. A deletion inside ONE word has no gap in its range
-    // and stays as it was.
+    // tokenizes as one word. A deletion of word characters only, inside ONE
+    // word, has no gap in its range and stays as it was; deleting a lone
+    // connector or space between word characters (don't -> dont, foo bar ->
+    // foobar) does widen, since the result is a single token either way.
     const deleted = oldText.slice(start0, end0);
     if (
       !isCore(oldText[start0 - 1]) ||
@@ -1457,10 +1459,21 @@ function snapDiffToWordBoundaries(
     ) {
       return diff;
     }
+    // Walk out over the whole token: word characters, plus a connector with a
+    // word character on BOTH sides (foo-bar, Isaiah's, 300,000). Stopping at
+    // the connector would cut the token mid-way and re-create the split.
     let s = start0;
     let e = end0;
-    while (s > 0 && isCore(oldText[s - 1])) s--;
-    while (e < oldText.length && isCore(oldText[e])) e++;
+    while (s > 0) {
+      if (isCore(oldText[s - 1])) s--;
+      else if (isConnector(oldText[s - 1]) && isCore(oldText[s - 2]) && isCore(oldText[s])) s--;
+      else break;
+    }
+    while (e < oldText.length) {
+      if (isCore(oldText[e])) e++;
+      else if (isConnector(oldText[e]) && isCore(oldText[e - 1]) && isCore(oldText[e + 1])) e++;
+      else break;
+    }
     // Same shared-edge argument as below: the widened range only adds characters
     // common to both texts, so the matching newText window shifts by the delta.
     const newEnd0 = newText.length - (oldText.length - e);
