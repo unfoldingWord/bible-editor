@@ -2400,6 +2400,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         sort_order,
       });
       applyLocalRowInsert("twl", created);
+      scheduleLintRefetch(created.chapter);
       setActiveWordId(created.id);
       setActiveNoteId(null);
       setActiveQuestionId(null);
@@ -2417,7 +2418,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         );
       }
     },
-    [data, verseIndexByVersion, book, chapter, twTitles, lockedTwlVerses, applyLocalRowInsert],
+    [data, verseIndexByVersion, book, chapter, twTitles, lockedTwlVerses, applyLocalRowInsert, scheduleLintRefetch],
   );
 
   // Whether a per-verse suggestion is already covered on the active verse. Done
@@ -4630,6 +4631,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               sort_order,
             }));
             applyLocalRowInsert("tn", created);
+            // A new row can add lint flags (a blank note is one). The room's
+            // row.upserted echo also re-lints, but only while the socket is up;
+            // the HTTP response is the source of truth (#1143).
+            scheduleLintRefetch(created.chapter);
             setActiveNoteId(created.id);
             setActiveWordId(null);
             setActiveQuestionId(null);
@@ -4653,6 +4658,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               sort_order,
             }));
             applyLocalRowInsert("tn", created, { afterId: refId });
+            scheduleLintRefetch(created.chapter);
             setActiveNoteId(created.id);
             setActiveWordId(null);
             setActiveQuestionId(null);
@@ -4739,6 +4745,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               sort_order,
             }));
             applyLocalRowInsert("twl", created);
+            scheduleLintRefetch(created.chapter);
             setActiveWordId(created.id);
             setActiveNoteId(null);
             setActiveQuestionId(null);
@@ -4845,6 +4852,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               response: "",
             }));
             applyLocalRowInsert("tq", created);
+            scheduleLintRefetch(created.chapter);
             setActiveQuestionId(created.id);
             setActiveNoteId(null);
             setActiveWordId(null);
