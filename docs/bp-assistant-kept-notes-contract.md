@@ -16,7 +16,7 @@ notes). The editor now sends the list itself.
 
 ## What the editor sends
 
-`POST /api/pipeline/start`, notes runs only, in `options.kept`:
+`POST /api/pipeline/start`, notes runs only, in `options.kept`. When the flag is on the list is always sent, as `[]` when the run has no kept notes: the bot reads an absent `kept` as "not supplied" and restores nothing, so only `[]` tells it a previously kept note is gone:
 
 ```json
 { "rowId": "cyfz", "ref": "40:12", "supportReference": "rc://*/ta/man/translate/figs-metaphor", "quote": "…" }
