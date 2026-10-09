@@ -102,6 +102,8 @@ import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from
 import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
 import { dropOwnRowDeleteClick, markOwnRowDelete, recordOwnRowDeleteClickOp } from "../sync/pendingRowDeletes";
 import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
+import { tnMoveRelay } from "../sync/tnMoveRelay";
+import { enqueueOwnTnMove } from "../sync/refusedTnMoves";
 import {
   alignmentDraftKey,
   alignmentDraftKeyForOp,
@@ -1334,6 +1336,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }
       }),
     [pushPipelineToast, reloadLocks, rollBackRefusedRowDelete],
+  );
+  // #1174: this tab's note move refused in another tab (which drained it and
+  // rolled back its own view) gets the same rollback, toast and lock reload
+  // here. A move refused in this tab is handled by the result listener above.
+  useEffect(
+    () =>
+      tnMoveRelay.on((op) => {
+        void rollBackRefusedTnMove(op);
+        reloadLocks();
+        pushPipelineToast(
+          "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+          "error",
+        );
+      }),
+    [pushPipelineToast, reloadLocks, rollBackRefusedTnMove],
   );
   // #1071: say "kept" only when a crash draft or an open panel actually holds
   // the refused drags. Two queued saves of one verse refused together get
@@ -3696,7 +3713,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     kind: "tn" | "tq" | "twl",
     row: T,
     patch: Partial<T>,
-    opts?: { restoredFromVersion?: number },
+    opts?: { restoredFromVersion?: number; opId?: string },
   ) => {
     // Optimistic local apply mirrors what the server will do: any non-revert
     // patch clears the restored_from_version marker so the chip immediately
@@ -3719,7 +3736,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // #1092: tie the op to the draft generation it saves, so its 200 cannot
     // clear typing that arrives while it is in flight.
     const draftGeneration = drafts.rowSaveGeneration(draftRowKey(kind, row.book, row.id));
-    void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, {
+    return outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, {
       ...opts,
       book: row.book,
       baseline,
@@ -4789,7 +4806,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               return;
             }
             const sort_order = pickSortOrder(sortedForVerse(tn, effectiveVerse), null, "after");
-            enqueueRow("tn", row, { verse: effectiveVerse, ref_raw, sort_order });
+            // #1174: remember the op as this tab's, so a refusal drained by
+            // another tab is rolled back here too. Marked before it is queued:
+            // another tab can drain and relay it before the put resolves here.
+            enqueueOwnTnMove(tnMoveRelay, crypto.randomUUID(), (opId) =>
+              enqueueRow("tn", row, { verse: effectiveVerse, ref_raw, sort_order }, { opId }),
+            ).catch((e) => console.error("Shell: could not queue the note move", e));
             // Follow the note to its new verse: the resource column only renders
             // notes in displayVerseRange, so without this the moved card vanishes
             // from view. Navigating there confirms the move landed. Must match
