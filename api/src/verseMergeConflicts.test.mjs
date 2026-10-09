@@ -3650,6 +3650,48 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     );
   }
 
+  // Review E1 (open, see the follow-up issue): two overlapping runs speculate
+  // on one verse with different outcomes. A (a clean `adopt`) and B (an
+  // `adopt_conflict` from a different master revision) both upsert; only one
+  // CAS can land, since both expect the version they read. The second upsert
+  // is computed over the first one's speculative row, and the row cannot be
+  // recomputed from the pre-chain capture inside the CAS batch, so when A
+  // lands the row can still show B's adopt_conflict (an alert A's own merge
+  // judged unnecessary). What does hold, and is pinned here: whichever run
+  // lands, the row is settled, still claims the v7 overwrite that really
+  // happened (no alert or recovery pointer is lost), and when the
+  // adopt_conflict run lands its author is alerted.
+  for (const [order, lands] of [["AB", "A"], ["AB", "B"], ["BA", "A"], ["BA", "B"]]) {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 54, 7);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 54)], AUG19);
+    const A = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+    const B = run1137(sqlite, env, { startedAt: OCT05 + 30, nightly: false }).attempt(OCT05 + 30);
+    const cleanA = ow(4, 54, 7, { action: "adopt", reason: "master_only" });
+    const conflictB = ow(4, 54, 7, { alignment: snap("b") });
+    await A.begin();
+    await B.begin();
+    for (const who of order) await (who === "A" ? A.record([cleanA]) : B.record([conflictB]));
+    if (lands === "A") {
+      await A.land([cleanA]);
+      await B.casLost([conflictB]);
+    } else {
+      await B.land([conflictB]);
+      await A.casLost([cleanA]);
+    }
+    const r = row(sqlite, 4, 54);
+    assert(r?.prior_run === null, `#1137 E1 (${order}, ${lands} lands): the row is settled`);
+    assert(claimsOverwriteOf(sqlite, 4, 54, 7) === 1, `#1137 E1 (${order}, ${lands} lands): the row still points at the landed v7 overwrite`);
+    if (lands === "B") {
+      await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+      assert(
+        r?.action === "adopt_conflict" && lostWords(r) === "b" && liveFor(sqlite, "jdoe").length === 1,
+        `#1137 E1 (${order}, B lands): B's adopt_conflict stands and v7's author is alerted`,
+      );
+    }
+  }
+
   // Review A3's guard: a capture younger than the threshold may belong to a
   // run still in flight, so another run's start leaves it alone.
   {
