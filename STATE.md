@@ -685,11 +685,12 @@ Highlights that bite repeatedly:
   pre-upsert `verse_merge_conflicts` row in memory, which a crashed Workflow attempt, a retry, or an overlapping
   run cannot see, so each of those either deleted an earlier night's pending alert or kept a pointer to an
   overwrite that never landed (#1137). Since migration 0076 the speculative upsert stores `prior_json` /
-  `prior_run` / `prior_version` on the row, and whether the overwrite landed is read from the reimport's own
-  `edit_log` row (source `dcs_reimport`, `prev_version` ≥ the observed version), which commits in the same batch
-  as the CAS write. Rules that follow: the capture is taken only when the row is settled, so a retry or a second
-  run inherits the first capture; a landed write settles the capture inside its own CAS batch; a nightly chunk
-  step rolls back its run's unsettled rows before writing; only the owning run may restore or delete.
+  `prior_run` on the row. Whether the overwrite landed is decided inside the CAS batch itself: a settle statement
+  directly after each write's changes()-gated edit_log row. Do not infer "landed" from edit_log by version: a
+  source-attribute reconcile or AI reseed logs `dcs_reimport` at the same version (#1137 review A2). Rules that
+  follow: a landed write and a non-adoption flag settle the row (prior_run NULL); an unsettled row is always an
+  unlanded speculation, so a later run inherits its capture; step 7b and a run's start undo only their own run's
+  rows plus any run's capture older than an hour (`STALE_SPECULATION_SECONDS`), never a younger foreign one.
 
 ## Stop conditions / goals
 

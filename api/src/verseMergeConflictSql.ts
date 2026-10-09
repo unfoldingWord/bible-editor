@@ -213,26 +213,6 @@ export const RESOLVE_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `UPDATE system_alerts
 const ADOPTION_ACTIONS = `('adopt', 'adopt_conflict', 'adopt_no_visible_change')`;
 
 // ---------------------------------------------------------------------------
-// Issue #1137: has any reimport overwrite of this row's verse landed since the
-// row's unsettled speculation began (migration 0076's prior_version)? Every
-// reimport verse write (content adoption, structure anchor, absorbed-row
-// delete) commits its edit_log row in the SAME D1 batch as the write, gated on
-// the write's changes(), with source 'dcs_reimport' (bookReimport.ts's
-// REIMPORT_SOURCE) and prev_version = the version it replaced. Versions only
-// grow, so a row at or after prior_version is a reimport write made after the
-// speculation was observed: the overwrite the row describes (or one like it
-// from an overlapping run) is real, and the row must not be put back.
-// prior_version NULL counts as not landed. Correlated on the outer
-// verse_merge_conflicts row; served by edit_log_row (kind, row_key).
-// ---------------------------------------------------------------------------
-const SPECULATION_LANDED = `EXISTS (SELECT 1 FROM edit_log
-     WHERE edit_log.kind = 'verse'
-       AND edit_log.row_key = verse_merge_conflicts.book || '/' || verse_merge_conflicts.chapter || '/' ||
-                              verse_merge_conflicts.verse || '/' || upper(verse_merge_conflicts.resource)
-       AND edit_log.source = 'dcs_reimport'
-       AND edit_log.prev_version >= verse_merge_conflicts.prior_version)`;
-
-// ---------------------------------------------------------------------------
 // TWO-PHASE REACTIVATION (2026-08-15 Codex second-opinion review fix,
 // superseding the first six-angle review's "reset resolved_at
 // unconditionally" approach, which had a real bug — see below).
@@ -304,10 +284,9 @@ const SPECULATION_LANDED = `EXISTS (SELECT 1 FROM edit_log
 // ---------------------------------------------------------------------------
 export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflicts
      (book, resource, chapter, verse, action, reason, overwritten_version, alignment, detected_at, last_recorded_at,
-      prior_run, prior_version)
+      prior_run)
    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9,
-      CASE WHEN ?5 IN ${ADOPTION_ACTIONS} THEN ?12 END,
-      CASE WHEN ?5 IN ${ADOPTION_ACTIONS} AND ?12 IS NOT NULL THEN ?11 END)
+      CASE WHEN ?5 IN ${ADOPTION_ACTIONS} THEN ?12 END)
    ON CONFLICT (book, resource, chapter, verse) DO UPDATE SET
      -- A row needing human judgement must never be DOWNGRADED by a later
      -- routine adoption — see recordVerseMergeConflicts's own doc comment for
@@ -507,21 +486,31 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- Issue #1137: the durable pre-run capture (migration 0076). An adoption
      -- write is speculative until its CAS settles, so it records what the row
      -- said before it (prior_json, NULL when there was no row) and which run
-     -- owns the speculation (prior_run = ?12). When the row already carries
-     -- an unsettled speculation (prior_run set, and no reimport overwrite of
-     -- the verse has landed since it began), that speculation never landed
-     -- either, so the row's real prior state is still the one captured before
-     -- it: keep that capture, and the verse version it began at. That covers a
-     -- retry of the same run, a ref recorded twice in one call, a dead earlier
-     -- run, and a run still in flight. Otherwise (a settled row, or a stale
-     -- capture whose overwrite did land) capture the row as it is now. A
-     -- non-adoption action (a kept-D1 or structure flag) is final, not
-     -- speculative, and leaves the capture alone; an adoption from a caller
-     -- with no run id (?12 NULL) clears it.
+     -- owns the speculation (prior_run = ?12). A landed overwrite settles its
+     -- row (prior_run NULL) in the CAS's own transaction
+     -- (SETTLE_LANDED_CONFLICT_SQL), so a row that still carries prior_run
+     -- holds a speculation that has not landed, whoever owns it (a retry of
+     -- the same run, a ref recorded twice in one call, a dead earlier run, a
+     -- run still in flight). Its real prior state is still the one captured
+     -- before that speculation: keep the capture and take ownership. A
+     -- settled row is captured as it is now.
+     --
+     -- A non-adoption action (a kept-D1 or structure flag) is a final,
+     -- measured write, not a speculation, so it settles the row (review A1):
+     -- otherwise a lost race of the run that owns the capture, or a later run
+     -- inheriting it, would rewind this flag to the state from before that
+     -- speculation. The one exception is the sticky carve-out at the top of
+     -- this statement (keep_local_structure over an unresolved adopt_conflict
+     -- keeps the adopt_conflict and its pointer): the row still shows the
+     -- speculative overwrite, so the capture stays to undo it. An adoption
+     -- from a caller with no run id (?12 NULL) settles the row too.
      prior_json = CASE
-       WHEN excluded.action NOT IN ${ADOPTION_ACTIONS} THEN verse_merge_conflicts.prior_json
+       WHEN excluded.action = 'keep_local_structure'
+         AND verse_merge_conflicts.action = 'adopt_conflict'
+         AND verse_merge_conflicts.resolved_at IS NULL
+       THEN verse_merge_conflicts.prior_json
        WHEN excluded.prior_run IS NULL THEN NULL
-       WHEN verse_merge_conflicts.prior_run IS NOT NULL AND NOT ${SPECULATION_LANDED} THEN verse_merge_conflicts.prior_json
+       WHEN verse_merge_conflicts.prior_run IS NOT NULL THEN verse_merge_conflicts.prior_json
        ELSE json_object(
          'action', verse_merge_conflicts.action,
          'reason', verse_merge_conflicts.reason,
@@ -530,14 +519,11 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
          'detected_at', verse_merge_conflicts.detected_at,
          'last_recorded_at', verse_merge_conflicts.last_recorded_at)
      END,
-     prior_version = CASE
-       WHEN excluded.action NOT IN ${ADOPTION_ACTIONS} THEN verse_merge_conflicts.prior_version
-       WHEN excluded.prior_run IS NULL THEN NULL
-       WHEN verse_merge_conflicts.prior_run IS NOT NULL AND NOT ${SPECULATION_LANDED} THEN verse_merge_conflicts.prior_version
-       ELSE excluded.prior_version
-     END,
      prior_run = CASE
-       WHEN excluded.action NOT IN ${ADOPTION_ACTIONS} THEN verse_merge_conflicts.prior_run
+       WHEN excluded.action = 'keep_local_structure'
+         AND verse_merge_conflicts.action = 'adopt_conflict'
+         AND verse_merge_conflicts.resolved_at IS NULL
+       THEN verse_merge_conflicts.prior_run
        ELSE excluded.prior_run
      END`;
 
@@ -584,8 +570,8 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
 //
 // Issue #1132 review: the confirm also bumps recorded_generation, keeping the
 // token monotonic. Since issue #1137 the lost-race restore no longer reads it
-// (RESTORE_SPECULATIVE_CONFLICTS_SQL is guarded by prior_run and by whether an
-// overwrite landed, which SETTLE_LANDED_CONFLICTS_SQL records with the CAS).
+// (RESTORE_SPECULATIVE_CONFLICTS_SQL is guarded by prior_run, which
+// SETTLE_LANDED_CONFLICT_SQL clears with a landed CAS).
 // The only other reader, RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL, matches
 // kept-D1 actions this statement never touches.
 //
@@ -608,16 +594,25 @@ export const CONFIRM_ADOPTED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 // in one batch, over one scope:
 //
 //   ?1 book, ?2 resource, ?3..?4 chapter range, ?5 a JSON array of
-//   "chapter:verse" refs or NULL for every verse in the range, ?6 the run id.
+//   "chapter:verse" refs or NULL for every verse in the range, ?6 the run id,
+//   ?7 a stale cutoff (seconds) or NULL.
 //
-// Only rows whose unsettled speculation THIS run owns (prior_run = ?6) are
-// touched, so a row another run wrote or already settled is never undone.
-// Callers: deleteLostAdoptionConflicts (step 7b, the refs whose CAS lost) and
-// rollBackDeadAttemptConflicts (a nightly chunk step's entry, every verse in
-// its chapters, i.e. whatever a dead earlier attempt of this run left).
+// Only unsettled rows are touched (prior_run set): a landed overwrite was
+// settled in its CAS batch, and a non-adoption flag settles its row, so every
+// row in scope holds a speculation that never landed. Of those, only rows THIS
+// run owns (prior_run = ?6), or, with ?7, rows whose speculation was written
+// before ?7 (last_recorded_at < ?7) by a run that must be dead by now: a
+// speculation and its CAS happen within one applyVerseRows call, seconds
+// apart, so a capture an hour old (the callers' cutoff) belongs to no live
+// run, and undoing it cannot race that run's CAS (review A3). Callers:
+// deleteLostAdoptionConflicts (step 7b, the refs whose CAS lost; no cutoff)
+// and rollBackDeadAttemptConflicts (a nightly chunk step's or a UI pull's
+// entry, every verse in its chapters: a dead earlier attempt of this run, or
+// any dead run's stale capture).
 //
-// 1. RESTORE: a row that existed before the speculation and whose overwrite
-//    did not land goes back to exactly what it said before: an earlier
+// 1. RESTORE: a row that existed before the speculation and still shows it
+//    (an adoption action; review A1) goes back to exactly what it said
+//    before: an earlier
 //    night's unreviewed adopt_conflict keeps its pointer, snapshot and alert;
 //    an audit-only row promoted tonight (#1124) is audit-only again; a
 //    RESOLVED row whose NULL pointer the upsert's COALESCE filled gets its
@@ -625,16 +620,15 @@ export const CONFIRM_ADOPTED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 //    never changes them for an adoption, so a change since is a person's
 //    save resolving the row, and that stands. recorded_generation is bumped
 //    so a stale RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL token cannot match.
-// 2. DELETE: a row the speculation created (prior_json NULL) whose overwrite
-//    did not land: nothing existed before it. A row someone resolved in the
-//    meantime is left (pre-#1132 behavior) and settled by 3.
-// 3. SETTLE: whatever this run still owns in scope (an overwrite that did
-//    land, or a resolved row 2 left) keeps its current state and drops the
-//    capture.
+// 2. DELETE: a row the speculation created (prior_json NULL): nothing existed
+//    before it. A row someone resolved in the meantime is left (pre-#1132
+//    behavior) and settled by 3.
+// 3. SETTLE: whatever is still in scope (a resolved row 2 left) keeps its
+//    current state and drops the capture.
 // ---------------------------------------------------------------------------
 const SPECULATION_SCOPE = `book = ?1 AND resource = ?2 AND chapter BETWEEN ?3 AND ?4
       AND (?5 IS NULL OR (chapter || ':' || verse) IN (SELECT value FROM json_each(?5)))
-      AND prior_run = ?6`;
+      AND (prior_run = ?6 OR (prior_run IS NOT NULL AND last_recorded_at < ?7))`;
 
 export const RESTORE_SPECULATIVE_CONFLICTS_SQL = `UPDATE verse_merge_conflicts
     SET action = json_extract(prior_json, '$.action'),
@@ -644,40 +638,42 @@ export const RESTORE_SPECULATIVE_CONFLICTS_SQL = `UPDATE verse_merge_conflicts
         detected_at = json_extract(prior_json, '$.detected_at'),
         last_recorded_at = json_extract(prior_json, '$.last_recorded_at'),
         recorded_generation = recorded_generation + 1,
-        prior_json = NULL, prior_run = NULL, prior_version = NULL
+        prior_json = NULL, prior_run = NULL
   WHERE ${SPECULATION_SCOPE}
     AND prior_json IS NOT NULL
-    AND NOT ${SPECULATION_LANDED}`;
+    AND action IN ${ADOPTION_ACTIONS}`;
 
 export const DELETE_SPECULATIVE_CONFLICTS_SQL = `DELETE FROM verse_merge_conflicts
   WHERE ${SPECULATION_SCOPE}
     AND prior_json IS NULL
     AND action IN ${ADOPTION_ACTIONS}
-    AND resolved_at IS NULL
-    AND NOT ${SPECULATION_LANDED}`;
+    AND resolved_at IS NULL`;
 
 export const SETTLE_SPECULATIVE_CONFLICTS_SQL = `UPDATE verse_merge_conflicts
-    SET prior_json = NULL, prior_run = NULL, prior_version = NULL
+    SET prior_json = NULL, prior_run = NULL
   WHERE ${SPECULATION_SCOPE}`;
 
 // ---------------------------------------------------------------------------
-// Issue #1137: settle the rows whose overwrite just landed. bookReimport.ts
-// appends this to each master-adoption CAS batch (content and structure),
-// AFTER the batch's writes and their edit_log rows, so it runs in the same D1
-// transaction: a landed overwrite and the end of its row's speculation commit
-// together, and an attempt that dies right after its CAS leaves nothing for a
-// retry to misread as unlanded. Any run's capture is dropped, not just this
-// run's: once an overwrite of the verse has landed, the row describes a real
-// overwrite whoever's speculation is on it.
+// Issue #1137: settle the row of an overwrite that just landed. bookReimport.ts
+// puts one of these in each master-adoption CAS batch (content and
+// structure) directly after each write's changes()-gated edit_log row, so
+// `changes() > 0` here means exactly "that ref's own write landed" (the gated
+// log row was inserted). It runs in the same D1 transaction as the write: a
+// landed overwrite and the end of its row's speculation commit together, and
+// an attempt that dies right after its CAS leaves nothing for a retry to
+// misread as unlanded. A reimport write that is not this adoption (a
+// source-attribute reconcile, an AI reseed) never settles it (review A2: an
+// edit_log lookup by version could not tell them apart). Any run's capture is
+// dropped, not just this run's: once an overwrite of the verse has landed, the
+// row describes a real overwrite whoever's speculation is on it.
 //
-// Binds, in order: (book, resource, refsJson).
+// Binds, in order: (book, resource, chapter, verse).
 // ---------------------------------------------------------------------------
-export const SETTLE_LANDED_CONFLICTS_SQL = `UPDATE verse_merge_conflicts
-    SET prior_json = NULL, prior_run = NULL, prior_version = NULL
-  WHERE book = ?1 AND resource = ?2
-    AND (chapter || ':' || verse) IN (SELECT value FROM json_each(?3))
+export const SETTLE_LANDED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
+    SET prior_json = NULL, prior_run = NULL
+  WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
     AND prior_run IS NOT NULL
-    AND ${SPECULATION_LANDED}`;
+    AND changes() > 0`;
 
 // ---------------------------------------------------------------------------
 // verseMergeConflicts.ts's retireVerseKeptAiMasterFlags — issue #749, the verse

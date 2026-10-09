@@ -99,7 +99,7 @@ import {
   RETIRE_KEPT_AI_MASTER_CONFLICTS_FOR_PAIR_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL,
-  SETTLE_LANDED_CONFLICTS_SQL,
+  SETTLE_LANDED_CONFLICT_SQL,
   SETTLE_SPECULATIVE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
 } from "./verseMergeConflictSql.ts";
@@ -309,10 +309,10 @@ export async function confirmAdoptedConflicts(
 // before this run's speculation is put back from the capture the upsert
 // stored on it, and a row the speculation created is deleted
 // (RESTORE_/DELETE_/SETTLE_SPECULATIVE_CONFLICTS_SQL, one batch). Only rows
-// whose speculation `runId` still owns are touched, and none whose verse has
-// since taken a reimport overwrite, so a retry restores the state from before
-// its dead first attempt, and an overlapping run's landed alert is never
-// rewound or deleted.
+// whose unsettled speculation `runId` still owns are touched (a landed
+// overwrite settled its row in its CAS batch; a non-adoption flag settles its
+// row), so a retry restores the state from before its dead first attempt, and
+// an overlapping run's landed alert or final flag is never rewound or deleted.
 export async function deleteLostAdoptionConflicts(
   env: Env,
   book: string,
@@ -324,7 +324,7 @@ export async function deleteLostAdoptionConflicts(
   const chapters = refs.map((r) => r.chapter);
   const scope = [
     book, resource, Math.min(...chapters), Math.max(...chapters),
-    JSON.stringify(refs.map((r) => conflictRefKey(r.chapter, r.verse))), runId,
+    JSON.stringify(refs.map((r) => conflictRefKey(r.chapter, r.verse))), runId, null,
   ];
   try {
     await env.DB.batch(settleSpeculationStmts(env, scope));
@@ -337,13 +337,15 @@ export async function deleteLostAdoptionConflicts(
   }
 }
 
-// Issue #1137: a nightly chunk step calls this as it starts, before any of its
-// own writes. A row in these chapters whose speculation `runId` still owns can
-// only have been left by an earlier attempt of the same run that died between
-// its speculative upsert and the end of its cleanup. Whatever that attempt's
-// CAS did is settled here exactly as step 7b would have: an overwrite that
-// never landed is put back (or its row deleted), one that landed stands. The
-// retry then measures from honest state, so a retry that no longer adopts the
+// Issue #1137: a nightly chunk step and a UI pull call this as they start,
+// before any of their own writes. An unsettled row in these chapters is a
+// speculation that never landed (a landed one settles in its CAS batch). Two
+// kinds are put back here (or their row deleted), as step 7b would have:
+// those `runId` owns, left by an earlier attempt of the same run that died
+// between its upsert and its cleanup; and those any run wrote before
+// `staleBefore` (seconds), which no live run can still own (review A3: a UI
+// pull that died with a 502 is never retried and has no other cleanup). The
+// run then measures from honest state, so a run that no longer adopts the
 // verse leaves no pointer to an overwrite that never happened. One batch for
 // all `resources`. Best-effort, like the rest of this file.
 export async function rollBackDeadAttemptConflicts(
@@ -353,11 +355,13 @@ export async function rollBackDeadAttemptConflicts(
   chapterFrom: number,
   chapterTo: number,
   runId: string,
+  staleBefore: number,
 ): Promise<void> {
   if (resources.length === 0) return;
   try {
     await env.DB.batch(
-      resources.flatMap((resource) => settleSpeculationStmts(env, [book, resource, chapterFrom, chapterTo, null, runId])),
+      resources.flatMap((resource) =>
+        settleSpeculationStmts(env, [book, resource, chapterFrom, chapterTo, null, runId, staleBefore])),
     );
   } catch (e) {
     console.error("verseMergeConflicts: roll-back of a dead attempt's conflict rows failed", {
@@ -373,20 +377,24 @@ function settleSpeculationStmts(env: Env, scope: unknown[]): D1PreparedStatement
     .map((sql) => env.DB.prepare(sql).bind(...scope));
 }
 
-// Issue #1137: the statement bookReimport.ts appends to a master-adoption CAS
-// batch, after its writes and their edit_log rows, so the refs whose overwrite
-// landed drop their speculative capture in the same transaction as the write
-// (SETTLE_LANDED_CONFLICTS_SQL). Null when there is nothing to settle.
-export function settleLandedConflictsStmt(
+// Issue #1137: the statement bookReimport.ts puts in a master-adoption CAS
+// batch directly after one ref's write and its changes()-gated edit_log row,
+// so that ref's row drops its speculative capture in the same transaction, and
+// only if that write landed (SETTLE_LANDED_CONFLICT_SQL).
+export function settleLandedConflictStmt(
   env: Env,
   book: string,
   resource: string,
-  refs: Array<{ chapter: number; verse: number }>,
-): D1PreparedStatement | null {
-  if (refs.length === 0) return null;
-  return env.DB.prepare(SETTLE_LANDED_CONFLICTS_SQL)
-    .bind(book, resource, JSON.stringify(refs.map((r) => conflictRefKey(r.chapter, r.verse))));
+  ref: { chapter: number; verse: number },
+): D1PreparedStatement {
+  return env.DB.prepare(SETTLE_LANDED_CONFLICT_SQL).bind(book, resource, ref.chapter, ref.verse);
 }
+
+// A dead run's unsettled capture older than this (seconds) is rolled back by
+// any later run's start (rollBackDeadAttemptConflicts). A speculation and its
+// CAS are seconds apart inside one applyVerseRows call; an hour is far past
+// any Worker request or Workflow step that could still be holding one.
+export const STALE_SPECULATION_SECONDS = 3600;
 
 // Issue #789. Called from bookReimport.ts's applyVerseRows once per call,
 // with the (chapter, verse) refs THIS run measured as `keep_converged` /

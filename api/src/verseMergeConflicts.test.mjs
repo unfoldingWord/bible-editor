@@ -69,7 +69,7 @@ import {
   resolveConvergedVerseMergeConflicts,
   retireVerseKeptAiMasterFlags,
   rollBackDeadAttemptConflicts,
-  settleLandedConflictsStmt,
+  settleLandedConflictStmt,
 } from "./verseMergeConflicts.ts";
 import {
   alertMessageCarriesNoBaseWarning,
@@ -635,12 +635,7 @@ function verseDb() {
     verse INTEGER, action TEXT, reason TEXT, overwritten_version INTEGER, alignment TEXT,
     detected_at INTEGER, resolved_at INTEGER, resolved_by INTEGER, last_recorded_at INTEGER,
     recorded_generation INTEGER NOT NULL DEFAULT 0,
-    prior_json TEXT, prior_run TEXT, prior_version INTEGER
-  )`);
-  // Read by the #1137 landed-overwrite check in the upsert and the cleanup.
-  d.exec(`CREATE TABLE edit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
-    user_id INTEGER, prev_version INTEGER, new_version INTEGER, action TEXT, source TEXT
+    prior_json TEXT, prior_run TEXT
   )`);
   // Required for UPSERT_VERSE_MERGE_CONFLICT_SQL's `ON CONFLICT (book,
   // resource, chapter, verse)` clause to have anything to conflict against —
@@ -2596,7 +2591,7 @@ console.log("\n[a no-op adopt_conflict does not inherit an old audit row's point
     ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
     ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
     CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
-    CREATE TABLE IF NOT EXISTS edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
       user_id INTEGER, new_version INTEGER);`);
   // v3 was authored by bethoakes — the version the old audit row points at.
   d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
@@ -2656,7 +2651,7 @@ for (const bookLocked of [true, false]) {
     ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
     ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
     CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
-    CREATE TABLE IF NOT EXISTS edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
       user_id INTEGER, new_version INTEGER);`);
   d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
   d.prepare(
@@ -2702,7 +2697,7 @@ console.log("\n[locked -> dismissed -> unlocked: the overwrite warning comes bac
       ON system_alerts(username, source)
       WHERE kind='review' AND condition_key IS NOT NULL AND dismissed_at IS NULL AND resolved_at IS NULL;
     CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
-    CREATE TABLE IF NOT EXISTS edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
       user_id INTEGER, new_version INTEGER);`);
   d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
   d.prepare(
@@ -3259,7 +3254,7 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
          VALUES ('verse', 'EZK/4/35/UST', 'EZK', NULL, 11, 12, 'update', 'dcs_reimport')`,
       ),
-      settleLandedConflictsStmt(env, "EZK", "ust", [tonightA]),
+      settleLandedConflictStmt(env, "EZK", "ust", tonightA),
     ]);
     await confirmAdoptedConflicts(env, "EZK", "ust", [tonightA], OCT05);
     await lostRace(env, 4, 35, OCT05 + 20, "run-B"); // B's CAS lost
@@ -3309,7 +3304,7 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     ).run(`EZK/${r.chapter}/${r.verse}/UST`, r.observedVersion, r.observedVersion + 1);
   // The settle that closes a CAS batch, for one ref, placed right after that
   // ref's write and edit_log row as bookReimport.ts places it.
-  const settleOne = (env, r) => settleLandedConflictsStmt(env, "EZK", "ust", [r]);
+  const settleOne = (env, r) => settleLandedConflictStmt(env, "EZK", "ust", r);
   // A dead run's capture older than this is rolled back by any later run.
   const STALE_SECONDS = 3600;
   let runSeq = 0;

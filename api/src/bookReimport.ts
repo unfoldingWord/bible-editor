@@ -153,7 +153,8 @@ import {
   resolveConvergedVerseMergeConflicts,
   activeKeptVerseMergeConflictRefs,
   rollBackDeadAttemptConflicts,
-  settleLandedConflictsStmt,
+  settleLandedConflictStmt,
+  STALE_SPECULATION_SECONDS,
 } from "./verseMergeConflicts.ts";
 import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
@@ -1581,6 +1582,19 @@ async function runReimport(
   // rows independently and a chapter can be locked for one kind and open for
   // another.
   const nonLockedChapters: Record<TsvKind, Set<number>> = { tn: new Set(), tq: new Set(), twl: new Set() };
+  // Issue #1137 (review A3): this path is never retried, so a pull that died
+  // between a verse's speculative conflict upsert and its CAS (a 502) leaves
+  // that unlanded claim for no one to clean up. Before writing, roll back any
+  // run's unsettled capture in these chapters older than
+  // STALE_SPECULATION_SECONDS (no live run can own one that old). The run id
+  // is fresh, so it matches no row: only stale captures qualify. One batch.
+  const pullVerseResources = (["ult", "ust"] as const).filter((r) => want.has(r) && (r === "ult" ? ultRaw : ustRaw));
+  if (pullVerseResources.length > 0 && chapters.length > 0) {
+    await rollBackDeadAttemptConflicts(
+      env, book, [...pullVerseResources], Math.min(...chapters), Math.max(...chapters), crypto.randomUUID(),
+      Math.floor(Date.now() / 1000) - STALE_SPECULATION_SECONDS,
+    );
+  }
   for (const chapter of chapters) {
     const lockedRes = await lockedResourcesForChapter(env, book, chapter);
     for (const r of resources) {
@@ -7924,15 +7938,15 @@ async function applyVerseRows(
     // separate log batch can commit the new verse bytes and then lose history
     // permanently. Pairing also guarantees a lost CAS mints no phantom log.
     //
-    // Issue #1137: one more statement closes each batch, after every pair:
-    // settleLandedConflictsStmt drops the speculative capture of each verse
-    // whose overwrite just landed, in the same transaction as the write, so an
-    // attempt that dies right after this batch leaves no unsettled row for
-    // the retry to roll back as if the overwrite had never happened.
-    const ADOPTION_PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+    // Issue #1137: each pair is followed by settleLandedConflictStmt, gated on
+    // the pair's edit_log row (changes() > 0), so it drops the speculative
+    // capture of that verse's conflict row only when this write landed, in
+    // the same transaction as the write. An attempt that dies right after
+    // this batch leaves no unsettled row for a retry to roll back as if the
+    // overwrite had never happened; a lost CAS leaves the capture for 7b.
+    const ADOPTION_PAIR_BATCH = Math.floor(WRITE_BATCH / 3);
     for (let i = 0; i < contentOnlyAdoptions.length; i += ADOPTION_PAIR_BATCH) {
       const slice = contentOnlyAdoptions.slice(i, i + ADOPTION_PAIR_BATCH);
-      const settle = settleLandedConflictsStmt(env, book, resource, slice.map((a) => a.v));
       try {
         const results = await env.DB.batch([
           // #686: master-adoption of an out-of-band Door43 correction over a
@@ -7957,11 +7971,11 @@ async function applyVerseRows(
               book, userId, a.oldVersion, a.oldVersion + 1, "update",
               { plain_text: a.plainText, content: a.v.contentJson },
             ),
+            settleLandedConflictStmt(env, book, resource, a.v),
           ]),
-          ...(settle ? [settle] : []),
         ]);
         slice.forEach((a, j) => {
-          if ((results[j * 2]?.meta.changes ?? 0) > 0) {
+          if ((results[j * 3]?.meta.changes ?? 0) > 0) {
             counts.merge_adopted++;
             if (a.cosmeticHuman) counts.merge_cosmetic_adopted++;
             adoptionsApplied.add(`${a.v.chapter}:${a.v.verse}`);
@@ -8124,7 +8138,8 @@ async function applyVerseRows(
     let group: StructureAnchorWrite[] = [];
     let groupSize = 0;
     for (const aw of staged) {
-      const size = 2 + 2 * (aw.adoption.absorbed.length + aw.adoption.recreated.length);
+      // Issue #1137: + 1 settle after the anchor and after each absorbed row.
+      const size = 3 + 3 * aw.adoption.absorbed.length + 2 * aw.adoption.recreated.length;
       if (group.length > 0 && groupSize + size > WRITE_BATCH) {
         groups.push(group);
         group = [];
@@ -8140,20 +8155,20 @@ async function applyVerseRows(
       const offsets: number[] = [];
       for (const aw of g) {
         offsets.push(stmts.length);
-        stmts.push(...buildStructureAdoptionStmts(env, book, bibleVersion, userId, now, door43, aw));
+        // Issue #1137: a settleLandedConflictStmt right after the anchor's
+        // edit_log row and after each absorbed row's, so each of those verses'
+        // conflict rows settles exactly when its own write landed (see step
+        // 7's content batch). Layout per component: anchor write, log,
+        // settle; per absorbed row: delete, log, settle; per recreated row:
+        // insert, log. No statement after a settle reads changes().
+        const built = buildStructureAdoptionStmts(env, book, bibleVersion, userId, now, door43, aw);
+        const ad = aw.adoption;
+        stmts.push(built[0], built[1], settleLandedConflictStmt(env, book, resource, { chapter: ad.chapter, verse: ad.anchor.verse }));
+        ad.absorbed.forEach((row, j) => {
+          stmts.push(built[2 + 2 * j], built[3 + 2 * j], settleLandedConflictStmt(env, book, resource, { chapter: ad.chapter, verse: row.verse }));
+        });
+        stmts.push(...built.slice(2 + 2 * ad.absorbed.length));
       }
-      // Issue #1137: last, after every component's statements (the offsets
-      // above stay valid): the anchors and absorbed rows whose overwrite
-      // landed settle their speculative conflict rows in this transaction.
-      // See the same statement on step 7's content batch.
-      const settle = settleLandedConflictsStmt(
-        env, book, resource,
-        g.flatMap((aw) => [
-          { chapter: aw.adoption.chapter, verse: aw.adoption.anchor.verse },
-          ...aw.adoption.absorbed.map((row) => ({ chapter: aw.adoption.chapter, verse: row.verse })),
-        ]),
-      );
-      if (settle) stmts.push(settle);
       try {
         const results = await env.DB.batch(stmts);
         g.forEach((aw, gi) => {
@@ -8185,14 +8200,14 @@ async function applyVerseRows(
           let landed = 0;
           ad.absorbed.forEach((row, j) => {
             subs++;
-            if ((results[off + 2 + 2 * j]?.meta.changes ?? 0) > 0) {
+            if ((results[off + 3 + 3 * j]?.meta.changes ?? 0) > 0) {
               landed++;
               adoptionsApplied.add(structureKey(ad.chapter, row.verse));
             }
           });
           ad.recreated.forEach((_m, j) => {
             subs++;
-            if ((results[off + 2 + 2 * (ad.absorbed.length + j)]?.meta.changes ?? 0) > 0) landed++;
+            if ((results[off + 3 + 3 * ad.absorbed.length + 2 * j]?.meta.changes ?? 0) > 0) landed++;
           });
           if (landed === subs) {
             counts.structure_adopted++;
@@ -10784,13 +10799,17 @@ async function reimportStagedChunk(
   const perResource = freshPerResource();
 
   // Issue #1137: before this attempt writes anything, settle whatever an
-  // earlier, dead attempt of this same step left speculative in these
-  // chapters (rollBackDeadAttemptConflicts): an overwrite that never landed is
-  // put back, so a retry that no longer adopts a verse leaves no pointer to
-  // it. One D1 batch per attempt, only when this chunk applies verse rows.
+  // earlier, dead attempt of this same step (or any dead run, after
+  // STALE_SPECULATION_SECONDS) left speculative in these chapters
+  // (rollBackDeadAttemptConflicts): an overwrite that never landed is put
+  // back, so a retry that no longer adopts a verse leaves no pointer to it.
+  // One D1 batch per attempt, only when this chunk applies verse rows.
   const verseResources = staged.filter((e) => e.changed && (e.resource === "ult" || e.resource === "ust")).map((e) => e.resource);
   if (runId && verseResources.length > 0) {
-    await rollBackDeadAttemptConflicts(env, book, verseResources, startChapter, endChapter, runId);
+    await rollBackDeadAttemptConflicts(
+      env, book, verseResources, startChapter, endChapter, runId,
+      Math.floor(Date.now() / 1000) - STALE_SPECULATION_SECONDS,
+    );
   }
 
   // Read + parse each staged file ONCE for the whole chunk (not per chapter).
