@@ -2760,6 +2760,60 @@ function countAllMilestones(nodes) {
   assert(!/‘ [a-zA-Z]/.test(r.plainText), `plainText no longer has a space between the opener and the following word (got ${JSON.stringify(r.plainText)})`);
 }
 
+// ─── Case 79: deleting the gap between two words fuses them into ONE word ───────
+// JER 34:5 ULT: "And alas" -> "Alas" diffs as a pure deletion of "nd a" (the
+// shared "A" is the common prefix, "las" the common suffix), so BOTH edges cut
+// mid-word. canonicalizePureDeletion has no word-clean slide for it and
+// snapDiffToWordBoundaries used to return early for deletions, so the localized
+// rewrite left a fragment of each word: \w "A" + \w "las" (two chips, two words
+// to align) that READ as "Alas". Snap out to whole words, exactly as the
+// insertion counterpart (ZEC 5:3) already does.
+{
+  console.log("\n[Case 79] Deleting the gap between two words fuses them into one \\w");
+  const verse = {
+    verseObjects: [
+      t("“"),
+      zaln("H1", [w("And"), t(" "), w("alas")]),
+      t(", "),
+      zaln("H2", [w("master")]),
+      t("!”"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  assert(old === "“And alas, master!”", `fixture's editable text is the expected baseline (got ${JSON.stringify(old)})`);
+  const after = "“Alas, master!”";
+  const r = smartEditVerse(verse, old, after);
+  assert(extractEditableText(r.content) === after, `editable text === newPlain (got ${JSON.stringify(extractEditableText(r.content))})`);
+  const words = alignedWords(r.content).map((x) => x.text);
+  assert(words.join("|") === "Alas|master", `"Alas" is ONE word node, not "A"+"las" (got ${JSON.stringify(words)})`);
+  const master = alignedWords(r.content).find((x) => x.text === "master");
+  assert(master && master.strongs.includes("H2"), "untouched 'master' keeps its alignment");
+}
+
+// A fused deletion inside ONE word's neighbourhood must not disturb words that
+// were not touched, and a plain mid-word deletion is unaffected.
+{
+  console.log("\n[Case 79b] Fusing deletion leaves other aligned words alone; same-word deletion unchanged");
+  const verse = {
+    verseObjects: [
+      zaln("H0", [w("so")]),
+      t(" "),
+      zaln("H1", [w("And"), t(" "), w("alas")]),
+      t(" "),
+      zaln("H2", [w("master")]),
+    ],
+  };
+  const old = extractEditableText(verse);
+  const r = smartEditVerse(verse, old, "so Alas master");
+  const aw = alignedWords(r.content);
+  assert(aw.map((x) => x.text).join("|") === "so|Alas|master", `words are so|Alas|master (got ${JSON.stringify(aw.map((x) => x.text))})`);
+  assert(aw.find((x) => x.text === "so").strongs.includes("H0"), "'so' keeps its alignment");
+  assert(aw.find((x) => x.text === "master").strongs.includes("H2"), "'master' keeps its alignment");
+  const verse2 = { verseObjects: [zaln("H1", [w("hello"), t(" "), w("world")])] };
+  const r2 = smartEditVerse(verse2, "hello world", "helo world");
+  assert(alignedWords(r2.content).map((x) => x.text).join("|") === "helo|world", "deleting one letter inside a word still yields one word");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
