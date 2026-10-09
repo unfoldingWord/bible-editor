@@ -1094,6 +1094,9 @@ function buildFakeAbortDb(flipAfterProposals, opts = {}) {
     if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no accepted TN proposals yet
     }
+    if (/SELECT DISTINCT chapter, verse FROM tn_rows/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #1151 whole-chapter scope: no extra verses
+    }
     if (/SELECT id, version, book, chapter/.test(sql)) {
       return { changes: 0, rows: seedTnDeleteRows, single: null };
     }
@@ -1442,6 +1445,9 @@ await (async () => {
     }
     if (/SELECT id, version, book, chapter/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no unkept TNs in scope
+    }
+    if (/SELECT DISTINCT chapter, verse FROM tn_rows/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #1151 whole-chapter scope: no extra verses
     }
     if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no accepted TN proposals yet
@@ -3292,6 +3298,9 @@ await (async () => {
         single: null,
       };
     }
+    if (/SELECT DISTINCT chapter, verse FROM tn_rows/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #1151 whole-chapter scope: no extra verses
+    }
     if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no accepted TN proposals yet
     }
@@ -4126,10 +4135,11 @@ await (async () => {
     };
     let seq = 0;
     // kind: "ai" (AI-created, untouched), "human" (AI-created then a real
-    // translator rewrite), "pristine" (bootstrap import, updated_by NULL).
+    // translator rewrite), "added" (a translator's "Add note": empty create,
+    // then a save), "pristine" (bootstrap import, updated_by NULL).
     const addTn = (book, chapter, verse, { kind = "ai", preserve = 0, hint = 0, trashed = false } = {}) => {
       const id = `t${String(++seq).padStart(3, "0")}`;
-      const note = kind === "human" ? "A translator rewrote this." : AI_NOTE.note;
+      const note = kind === "human" || kind === "added" ? "A translator rewrote this." : AI_NOTE.note;
       sqlite.prepare(
         `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, quote, note, support_reference,
            preserve, hint, trashed_at, updated_by, version)
@@ -4141,8 +4151,12 @@ await (async () => {
           `INSERT INTO edit_log (kind, row_key, book, user_id, action, source, payload_json, created_at)
            VALUES ('tn', ?, ?, ?, ?, ?, ?, ?)`,
         );
-        log.run(id, book, 7, "create", "ai_pipeline", JSON.stringify(AI_NOTE), 1000 + seq);
-        if (kind === "human") {
+        if (kind === "added") {
+          log.run(id, book, 9, "create", null, JSON.stringify({ ...AI_NOTE, note: "" }), 1000 + seq);
+        } else {
+          log.run(id, book, 7, "create", "ai_pipeline", JSON.stringify(AI_NOTE), 1000 + seq);
+        }
+        if (kind === "human" || kind === "added") {
           log.run(id, book, 9, "update", null, JSON.stringify({ note }), 2000 + seq);
         }
       }
@@ -4170,6 +4184,7 @@ await (async () => {
     const v3Hint = t.addTn("EZK", 40, 3, { hint: 1 });
     const v3Trashed = t.addTn("EZK", 40, 3, { trashed: true });
     const v3Human = t.addTn("EZK", 40, 3, { kind: "human" });
+    const v3Added = t.addTn("EZK", 40, 3, { kind: "added" });
     const introAi = t.addTn("EZK", 40, 0);
     const otherBook = t.addTn("JER", 40, 3);
     await deleteUnkeptTns(t.env, ezk40, 1, "AI pipeline", [prop("EZK", 40, 1), prop("EZK", 40, 2)], newHeartbeat());
@@ -4180,6 +4195,7 @@ await (async () => {
     assert(t.live(v3Hint), "#1151 chapter run: hint stub in verse 3 stays");
     assert(t.live(v3Trashed), "#1151 chapter run: trashed note in verse 3 stays trashed, not deleted");
     assert(t.live(v3Human), "#1151 chapter run: human-edited note in verse 3 stays");
+    assert(t.live(v3Added), "#1151 chapter run: a translator's own added note in verse 3 stays");
     assert(t.live(introAi), "#1151 chapter run: chapter intro (verse 0) is not swept when the run proposed no intro");
     assert(t.live(otherBook), "#1151 chapter run: another book's note in the same chapter/verse stays");
   }
