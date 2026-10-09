@@ -663,7 +663,11 @@ export async function dispatchNext(env: Env): Promise<void> {
         job.end_chapter,
         hintIds,
       );
-      options = kept.length > 0 ? { ...base, kept } : options ? base : options;
+      // Always send the list when the flag is on, even when it is empty: the
+      // bot reads an ABSENT kept as "the caller did not supply it" and then
+      // restores nothing, so an empty array is the only way to say "this chapter
+      // has no kept notes (any more)" (bp-assistant #448).
+      options = { ...base, kept };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[dispatchNext] job=${job.job_id} kept list failed:`, e);

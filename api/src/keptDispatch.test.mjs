@@ -65,7 +65,7 @@ console.log("\n[notes, flag on]");
 {
   const hints = [{ rowId: "cyfz", verse: 3, quote: "", supportReference: null, seed: "s" }];
   const { body } = await run({ pipelineType: "notes", flag: "true", optionsJson: JSON.stringify({ hints }) });
-  assert(body.options.kept === undefined && body.options.hints.length === 1, "a rowId that is also a hint is not sent as kept");
+  assert(Array.isArray(body.options.kept) && body.options.kept.length === 0 && body.options.hints.length === 1, "a rowId that is also a hint is not sent as kept; the empty list is still sent");
 }
 console.log("\n[notes, flag off or not exactly true]");
 for (const flag of [undefined, "false", "TRUE", "1", ""]) {
