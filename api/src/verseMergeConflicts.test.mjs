@@ -3307,6 +3307,11 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
       `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
        VALUES ('verse', ?, 'EZK', NULL, ?, ?, 'update', 'dcs_reimport')`,
     ).run(`EZK/${r.chapter}/${r.verse}/UST`, r.observedVersion, r.observedVersion + 1);
+  // The settle that closes a CAS batch, for one ref, placed right after that
+  // ref's write and edit_log row as bookReimport.ts places it.
+  const settleOne = (env, r) => settleLandedConflictsStmt(env, "EZK", "ust", [r]);
+  // A dead run's capture older than this is rolled back by any later run.
+  const STALE_SECONDS = 3600;
   let runSeq = 0;
   const run1137 = (sqlite, env, { startedAt, nightly }) => {
     // A nightly run's id is stable across its attempts; a UI pull is never
@@ -3315,20 +3320,32 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     return {
       attempt(now) {
         return {
-          // A nightly chunk step's entry (reimportStagedChunk).
-          begin: () => (nightly ? rollBackDeadAttemptConflicts(env, "EZK", ["ust"], 4, 4, runId) : Promise.resolve()),
+          // A nightly chunk step's entry (reimportStagedChunk) or a UI pull's
+          // (runReimport): roll back this run's own dead attempts, and any
+          // run's capture older than STALE_SECONDS.
+          begin: () => rollBackDeadAttemptConflicts(env, "EZK", ["ust"], 4, 4, runId, now - STALE_SECONDS),
           record: (rows) => recordVerseMergeConflicts(env, "EZK", "ust", "UST", rows, now, runId),
-          land: async (rows) => {
-            // The CAS batch: each write's reimport edit_log row, then the settle.
-            await env.DB.batch([
-              ...rows.map((r) =>
-                env.DB.prepare(
-                  `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
-                   VALUES ('verse', ?, 'EZK', NULL, ?, ?, 'update', 'dcs_reimport')`,
-                ).bind(`EZK/${r.chapter}/${r.verse}/UST`, r.observedVersion, r.observedVersion + 1)),
-              settleLandedConflictsStmt(env, "EZK", "ust", rows),
-            ]);
+          // The CAS batch, landing: each write's reimport edit_log row, then its settle.
+          cas: (rows) =>
+            env.DB.batch(rows.flatMap((r) => [
+              env.DB.prepare(
+                `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+                 VALUES ('verse', ?, 'EZK', NULL, ?, ?, 'update', 'dcs_reimport')`,
+              ).bind(`EZK/${r.chapter}/${r.verse}/UST`, r.observedVersion, r.observedVersion + 1),
+              settleOne(env, r),
+            ])),
+          land: async function (rows) {
+            await this.cas(rows);
             await confirmAdoptedConflicts(env, "EZK", "ust", rows.filter((r) => r.action === "adopt_conflict"), now);
+          },
+          // The CAS batch, losing (the version moved): the write and its gated
+          // edit_log row change nothing, then the settle; then step 7b.
+          casLost: async (rows) => {
+            await env.DB.batch(rows.flatMap((r) => [
+              env.DB.prepare(`UPDATE verses SET version = version WHERE 0`),
+              settleOne(env, r),
+            ]));
+            await deleteLostAdoptionConflicts(env, "EZK", "ust", rows.map((r) => ({ chapter: r.chapter, verse: r.verse })), runId);
           },
           lost: (refs) => deleteLostAdoptionConflicts(env, "EZK", "ust", refs, runId),
         };
@@ -3398,9 +3415,9 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     assert(liveFor(sqlite, "jdoe").length === 0, "#1137 dead attempt + non-adopting retry: v7's author is not alerted");
   }
 
-  // (t2) The guard on (t): attempt 1's CAS LANDED (its reimport edit_log row
-  // exists) and it died before anything after the CAS ran. The overwrite is
-  // real, so the retry must keep the row's claim.
+  // (t2) The guard on (t): attempt 1's CAS LANDED (its CAS batch committed)
+  // and it died before anything after the CAS ran. The overwrite is real, so
+  // the retry must keep the row's claim.
   {
     const { sqlite, env } = migratedEnv();
     await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 47)], AUG19);
@@ -3408,7 +3425,7 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
     const a1 = R.attempt(OCT05);
     await a1.begin();
     await a1.record([ow(4, 47, 7)]);
-    reimportLanded(sqlite, ow(4, 47, 7)); // the CAS landed; the attempt died right after
+    await a1.cas([ow(4, 47, 7)]); // the CAS landed; the attempt died right after
     const a2 = R.attempt(OCT05 + 60);
     await a2.begin(); // D1 now equals master: the retry records nothing for 4:47
     assert(claimsOverwriteOf(sqlite, 4, 47, 7) === 1, "#1137 dead attempt whose CAS landed: the retry keeps the v7 claim");
@@ -3517,6 +3534,112 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
       r != null && JSON.stringify(speculative(r)) === JSON.stringify(monday),
       `#1137 repeated ref + lost race: Monday's row is back (got ${JSON.stringify(r && speculative(r))})`,
     );
+  }
+
+  // Review A1, first case: run A speculates an adoption on an audit row; an
+  // overlapping run B records a final, non-adoption flag on the same verse
+  // (keep_alignment_refused: D1 kept, nothing overwritten); A's CAS loses. B's
+  // flag stands: A's restore must not rewind it to the audit row.
+  const keptFlag = (chapter, verse, version) => ({
+    ...ow(chapter, verse, null), action: "keep_alignment_refused", reason: "alignment_shrink", observedVersion: version,
+  });
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 48)], AUG19);
+    const A = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+    const B = run1137(sqlite, env, { startedAt: OCT05 + 30, nightly: false }).attempt(OCT05 + 30);
+    await A.begin();
+    await A.record([ow(4, 48, 7)]);
+    await B.begin();
+    await B.record([keptFlag(4, 48, 7)]);
+    await A.casLost([ow(4, 48, 7)]);
+    const r = row(sqlite, 4, 48);
+    assert(
+      r?.action === "keep_alignment_refused" && r?.last_recorded_at === OCT05 + 30,
+      `#1137 A1: another run's final keep flag survives a lost race's restore (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review A1, second case: a UI pull D speculates an adoption and dies; a
+  // later run B records a final keep flag on the verse; a later nightly run N
+  // speculates an adoption and loses. N must put back B's flag, not the state
+  // from before D's dead speculation.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 49)], AUG19);
+    const D = run1137(sqlite, env, { startedAt: OCT05, nightly: false }).attempt(OCT05);
+    await D.begin();
+    await D.record([ow(4, 49, 7)]); // dies here
+    const B = run1137(sqlite, env, { startedAt: OCT05 + 60, nightly: false }).attempt(OCT05 + 60);
+    await B.begin();
+    await B.record([keptFlag(4, 49, 7)]);
+    const N = run1137(sqlite, env, { startedAt: OCT05 + 120, nightly: true }).attempt(OCT05 + 120);
+    await N.begin();
+    await N.record([ow(4, 49, 7)]);
+    await N.casLost([ow(4, 49, 7)]);
+    const r = row(sqlite, 4, 49);
+    assert(
+      r?.action === "keep_alignment_refused" && r?.last_recorded_at === OCT05 + 60,
+      `#1137 A1: a later lost race puts back the keep flag, not the state before a dead pull (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review A2: a non-adoption reimport write (a source-attribute reconcile, an
+  // AI reseed) logs dcs_reimport at the verse's observed version, and then the
+  // adoption's CAS loses (the version moved under it). That write is not the
+  // adoption landing: no row may claim the v7 overwrite.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 50, 7);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 50)], AUG19);
+    const before = speculative(row(sqlite, 4, 50));
+    const A = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+    await A.begin();
+    await A.record([ow(4, 50, 7)]);
+    reimportLanded(sqlite, ow(4, 50, 7)); // the reconcile write: dcs_reimport, v7 -> v8
+    await A.casLost([ow(4, 50, 7)]);
+    assert(claimsOverwriteOf(sqlite, 4, 50, 7) === 0, "#1137 A2: a same-version non-adoption reimport write is not read as the adoption landing");
+    const r = row(sqlite, 4, 50);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(before),
+      `#1137 A2: the audit row is back (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review A3: a UI pull D speculates and dies before its CAS (a 502); two
+  // hours later another pull P runs the chapter and no longer adopts the
+  // verse. P's start rolls back D's stale, unlanded capture.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 51, 7);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 51)], AUG19);
+    const before = speculative(row(sqlite, 4, 51));
+    const D = run1137(sqlite, env, { startedAt: OCT05, nightly: false }).attempt(OCT05);
+    await D.begin();
+    await D.record([ow(4, 51, 7)]); // dies here
+    const P = run1137(sqlite, env, { startedAt: OCT05 + 7200, nightly: false }).attempt(OCT05 + 7200);
+    await P.begin(); // and records nothing for 4:51
+    assert(claimsOverwriteOf(sqlite, 4, 51, 7) === 0, "#1137 A3: a later pull rolls back a dead pull's stale unlanded claim");
+    const r = row(sqlite, 4, 51);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(before),
+      `#1137 A3: the audit row is back (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review A3's guard: a capture younger than the threshold may belong to a
+  // run still in flight, so another run's start leaves it alone.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 52)], AUG19);
+    const X = run1137(sqlite, env, { startedAt: OCT05, nightly: false }).attempt(OCT05);
+    await X.begin();
+    await X.record([ow(4, 52, 7)]); // still in flight
+    const P = run1137(sqlite, env, { startedAt: OCT05 + 60, nightly: false }).attempt(OCT05 + 60);
+    await P.begin();
+    assert(row(sqlite, 4, 52)?.prior_run != null, "#1137 A3: a young capture from another run is not rolled back");
   }
 }
 
