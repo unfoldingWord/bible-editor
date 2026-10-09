@@ -65,6 +65,13 @@ export interface ImportContext {
   book: string;
   startChapter: number;
   endChapter: number;
+  // Set only for a notes run limited to part of one chapter. No caller sets
+  // it yet: the editor can only start whole-chapter runs, and neither
+  // pipeline_jobs nor the bot's status scope carries a verse range. #1160
+  // (verse-range reruns) fills it in. When absent, a notes job is treated as
+  // a whole-chapter run and its TN sweep covers every verse of the chapters
+  // it proposed for (#1151); when present, the sweep stays per-verse.
+  verseRange?: { start: number; end: number } | null;
 }
 
 export interface ImportResult {
@@ -1437,7 +1444,32 @@ export async function deleteUnkeptTns(
   )
     .bind(job.jobId)
     .all<{ chapter: number; verse: number }>();
-  const pairs = tnSweepScope(tnProposals, resolved.results ?? []);
+  // #1151: a whole-chapter notes run replaces the whole chapter in en_tn
+  // (bp-assistant#436), so a verse the run left empty must lose its old AI
+  // notes too. Add every verse that has a live note in a chapter this pass
+  // proposed for; tnSweepScope still drops the resolved verses, so the
+  // resumed-pass protection above holds unchanged (an empty verse has nothing
+  // to re-insert, so re-sweeping it on a resumed pass is harmless). Left out
+  // on purpose: verse 0 (the chapter intro — a noIntro run writes none, so an
+  // unproposed intro stays), chapters with no proposal in this pass (a chapter
+  // with no output reads as a failed chapter, not a wipe), and verse-range
+  // runs (they keep the per-verse scope).
+  let scopeInput: Array<{ chapter: number; verse: number }> = tnProposals;
+  if (job.pipelineType === "notes" && !job.verseRange) {
+    const chapters = new Set(tnProposals.map((p) => p.chapter));
+    const liveVerses = await env.DB.prepare(
+      `SELECT DISTINCT chapter, verse FROM tn_rows
+        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND verse > 0
+          AND deleted_at IS NULL`,
+    )
+      .bind(job.book, job.startChapter, job.endChapter)
+      .all<{ chapter: number; verse: number }>();
+    scopeInput = [
+      ...tnProposals,
+      ...(liveVerses.results ?? []).filter((p) => chapters.has(p.chapter)),
+    ];
+  }
+  const pairs = tnSweepScope(scopeInput, resolved.results ?? []);
   if (pairs.length === 0) return 0;
 
   // D1 caps bound parameters at 100 per statement. This query already binds 3
