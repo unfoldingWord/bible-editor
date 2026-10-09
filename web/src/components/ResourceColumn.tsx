@@ -182,6 +182,9 @@ interface Props {
   // propagates read-only to that tab's children.
   lockedTn?: boolean;
   lockedTq?: boolean;
+  // #1165: which notes `lockedTn` covers, by anchor verse. A verse-range notes
+  // run locks only its range; absent means every note in the chapter.
+  tnVerseLocked?: (verse: number) => boolean;
   // The whole BOOK is locked (server-enforced, hard freeze, no carve-outs —
   // unlike lockedTn/lockedTq above, which are per-resource chapter-pipeline
   // locks with a preserve/hint carve-out on NoteCard). ORed into every
@@ -403,6 +406,7 @@ export function ResourceColumn({
   onQuestionCreate,
   onQuestionFocus,
   lockedTn = false,
+  tnVerseLocked,
   lockedTq = false,
   bookLocked = false,
   onSetNotePreserve,
@@ -1033,7 +1037,7 @@ export function ResourceColumn({
               onTogglePin={() => togglePinned("notes")}
               onAdd={onNoteCreate}
               sticky
-              hideAdd={lockedTn || bookLocked}
+              hideAdd={(lockedTn && (tnVerseLocked?.(activeVerse) ?? true)) || bookLocked}
               lane="tn"
               checkoff={checkoff}
             />
@@ -1421,7 +1425,7 @@ export function ResourceColumn({
           isAiPending={isNoteAiPending?.(r.id) ?? false}
           aiRecentlyCompletedAt={noteAiRecentlyCompletedAt?.(r.id) ?? null}
           onVisibilityChange={onNoteVisibilityChange}
-          locked={lockedTn}
+          locked={lockedTn && (tnVerseLocked?.(r.verse) ?? true)}
           bookLocked={bookLocked}
           onSetPreserve={
             onSetNotePreserve ? (value) => onSetNotePreserve(r.id, value) : undefined

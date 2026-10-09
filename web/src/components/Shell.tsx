@@ -78,6 +78,7 @@ import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
 import { createUhbStrongsCache } from "../lib/uhbStrongs";
+import { isTnVerseLocked, tnLockingJobs } from "../lib/tnRangeLock";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import type { BookViewportRestore } from "./BookView";
@@ -1362,17 +1363,26 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }),
     [lockForChapter, chapter],
   );
+  // #1165: a verse-range notes run locks only the notes anchored in its range,
+  // so `chapterLocks.tn` says a run holds notes and this says which ones.
+  const tnLockJobs = useMemo(() => tnLockingJobs(activeJobs, book, chapter), [activeJobs, book, chapter]);
+  const tnVerseLocked = useCallback((verse: number) => isTnVerseLocked(tnLockJobs, verse), [tnLockJobs]);
   // One banner line per active run, so a run's type and start time are never
   // attributed to another run's locked lanes.
   const lockBanners = useMemo(() => {
     const byJob = new Map<string, { pipelineType: string; startedAt: number; resources: string[] }>();
-    for (const [resource, label] of [
+    for (const [resource, baseLabel] of [
       ["verse", "scripture"],
       ["tn", "notes"],
       ["tq", "questions"],
     ] as const) {
       const lock = chapterLocks[resource];
       if (!lock) continue;
+      const range =
+        resource === "tn" ? tnLockJobs.find((j) => j.job_id === lock.jobId)?.locks_tn_verse_range : null;
+      const label = range
+        ? `notes in verses ${range.start}${range.end !== range.start ? `–${range.end}` : ""}`
+        : baseLabel;
       const entry = byJob.get(lock.jobId);
       if (entry) entry.resources.push(label);
       else
@@ -1383,7 +1393,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         });
     }
     return Array.from(byJob, ([jobId, v]) => ({ jobId, ...v }));
-  }, [chapterLocks]);
+  }, [chapterLocks, tnLockJobs]);
 
   const handleSetNotePreserve = useCallback(
     async (id: string, value: boolean) => {
@@ -4241,7 +4251,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           {formatRelative(b.startedAt)}. Editing is locked for{" "}
           {b.resources.join(", ")} in this chapter; everything else stays
           editable.
-          {b.resources.includes("notes")
+          {b.resources.some((r) => r.startsWith("notes"))
             ? " You can still mark notes to keep before the new set lands."
             : ""}
         </Alert>
@@ -4933,6 +4943,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               );
           }}
           lockedTn={Boolean(chapterLocks.tn)}
+          tnVerseLocked={tnVerseLocked}
           lockedTq={Boolean(chapterLocks.tq)}
           // bookLocked, not editLocked: NoteCard reads readOnly at unmount to
           // decide whether to discard an abandoned blank stub, and the stale
