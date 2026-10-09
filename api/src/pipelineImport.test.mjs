@@ -4085,4 +4085,161 @@ await (async () => {
   }
 })();
 
+// ── #1151: a whole-chapter notes run retires old AI notes in verses it left empty ──
+// The bot's whole-chapter notes run replaces the whole chapter in en_tn
+// (unfoldingWord/bp-assistant#436). The sweep used to cover only the verses
+// that had a proposal, so an old AI note in a verse the new run left empty
+// stayed live in D1 and the next export wrote it back (EZK 40, 2026-10-06:
+// 35 rows in verses 11, 25-36, 41, 47). These cases drive the REAL
+// deleteUnkeptTns against the real migrated schema in node:sqlite, so the
+// guards are what SQLite actually does, not what a fake DB returns.
+await (async () => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const migDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  const migrations = readdirSync(migDir).filter((f) => f.endsWith(".sql")).sort()
+    .map((f) => readFileSync(join(migDir, f), "utf8"));
+
+  const AI_NOTE = { quote: "q", note: "AI wrote this note.", support_reference: "rc://*/ta/man/translate/figs-metaphor" };
+  function freshSweepEnv() {
+    const sqlite = new DatabaseSync(":memory:");
+    for (const m of migrations) sqlite.exec(m);
+    // pending_imports.job_id references pipeline_jobs (which references
+    // users); the sweep never reads either, so skip seeding them.
+    sqlite.exec("PRAGMA foreign_keys = OFF");
+    const stmt =(sql, args = []) => ({
+      sql, args,
+      bind: (...a) => stmt(sql, a),
+      async all() { return { results: sqlite.prepare(sql).all(...args) }; },
+      async first() { return sqlite.prepare(sql).all(...args)[0] ?? null; },
+      async run() { return { meta: { changes: Number(sqlite.prepare(sql).run(...args).changes) } }; },
+    });
+    const DB = {
+      prepare: (sql) => stmt(sql),
+      async batch(stmts) {
+        const out = [];
+        for (const st of stmts) out.push(await st.run());
+        return out;
+      },
+    };
+    let seq = 0;
+    // kind: "ai" (AI-created, untouched), "human" (AI-created then a real
+    // translator rewrite), "pristine" (bootstrap import, updated_by NULL).
+    const addTn = (book, chapter, verse, { kind = "ai", preserve = 0, hint = 0, trashed = false } = {}) => {
+      const id = `t${String(++seq).padStart(3, "0")}`;
+      const note = kind === "human" ? "A translator rewrote this." : AI_NOTE.note;
+      sqlite.prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, quote, note, support_reference,
+           preserve, hint, trashed_at, updated_by, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 3)`,
+      ).run(id, book, chapter, verse, `${chapter}:${verse}`, AI_NOTE.quote, note, AI_NOTE.support_reference,
+        preserve, hint, trashed ? 1 : null, kind === "pristine" ? null : 7);
+      if (kind !== "pristine") {
+        const log = sqlite.prepare(
+          `INSERT INTO edit_log (kind, row_key, book, user_id, action, source, payload_json, created_at)
+           VALUES ('tn', ?, ?, ?, ?, ?, ?, ?)`,
+        );
+        log.run(id, book, 7, "create", "ai_pipeline", JSON.stringify(AI_NOTE), 1000 + seq);
+        if (kind === "human") {
+          log.run(id, book, 9, "update", null, JSON.stringify({ note }), 2000 + seq);
+        }
+      }
+      return id;
+    };
+    const accept = (jobId, book, chapter, verse) =>
+      sqlite.prepare(
+        `INSERT INTO pending_imports (job_id, kind, book, chapter, verse, payload_json, accepted_at)
+         VALUES (?, 'tn', ?, ?, ?, '{}', 1)`,
+      ).run(jobId, book, chapter, verse);
+    const live = (id) =>
+      sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE id = ?`).get(id).deleted_at == null;
+    return { env: { DB }, addTn, accept, live };
+  }
+  const prop = (book, chapter, verse) => ({ ...tnProposal(chapter, verse), book });
+  const ezk40 = { jobId: "job-ezk40", pipelineType: "notes", book: "EZK", startChapter: 40, endChapter: 40 };
+
+  // 1. Whole-chapter job: proposals in v1-2 only. Verse 3 got no new notes.
+  {
+    const t = freshSweepEnv();
+    const v1Ai = t.addTn("EZK", 40, 1);
+    const v3Ai = t.addTn("EZK", 40, 3);
+    const v3Pristine = t.addTn("EZK", 40, 3, { kind: "pristine" });
+    const v3Preserve = t.addTn("EZK", 40, 3, { preserve: 1 });
+    const v3Hint = t.addTn("EZK", 40, 3, { hint: 1 });
+    const v3Trashed = t.addTn("EZK", 40, 3, { trashed: true });
+    const v3Human = t.addTn("EZK", 40, 3, { kind: "human" });
+    const introAi = t.addTn("EZK", 40, 0);
+    const otherBook = t.addTn("JER", 40, 3);
+    await deleteUnkeptTns(t.env, ezk40, 1, "AI pipeline", [prop("EZK", 40, 1), prop("EZK", 40, 2)], newHeartbeat());
+    assert(!t.live(v1Ai), "#1151 chapter run: AI note in a proposed verse is swept (unchanged)");
+    assert(!t.live(v3Ai), "#1151 chapter run: old AI note in verse 3 (no new notes there) is swept");
+    assert(!t.live(v3Pristine), "#1151 chapter run: pristine note in verse 3 is swept");
+    assert(t.live(v3Preserve), "#1151 chapter run: preserve note in verse 3 stays");
+    assert(t.live(v3Hint), "#1151 chapter run: hint stub in verse 3 stays");
+    assert(t.live(v3Trashed), "#1151 chapter run: trashed note in verse 3 stays trashed, not deleted");
+    assert(t.live(v3Human), "#1151 chapter run: human-edited note in verse 3 stays");
+    assert(t.live(introAi), "#1151 chapter run: chapter intro (verse 0) is not swept when the run proposed no intro");
+    assert(t.live(otherBook), "#1151 chapter run: another book's note in the same chapter/verse stays");
+  }
+
+  // 2. The same job with a verse range keeps today's per-verse scope.
+  {
+    const t = freshSweepEnv();
+    const v1Ai = t.addTn("EZK", 40, 1);
+    const v3Ai = t.addTn("EZK", 40, 3);
+    const rangeJob = { ...ezk40, verseRange: { start: 1, end: 2 } };
+    await deleteUnkeptTns(t.env, rangeJob, 1, "AI pipeline", [prop("EZK", 40, 1), prop("EZK", 40, 2)], newHeartbeat());
+    assert(!t.live(v1Ai), "#1151 verse-range run: AI note inside the range is swept");
+    assert(t.live(v3Ai), "#1151 verse-range run: AI note outside the range (verse 3) stays");
+  }
+
+  // 3. Resumed pass: an earlier pass of THIS job already filled verse 5 (it
+  //    has an accepted proposal). The chapter-wide sweep must leave verse 5
+  //    alone and still sweep the unresolved and the empty verses.
+  {
+    const t = freshSweepEnv();
+    const v5FirstPass = t.addTn("EZK", 40, 5);
+    t.accept(ezk40.jobId, "EZK", 40, 5);
+    const v6Old = t.addTn("EZK", 40, 6);
+    const v9Old = t.addTn("EZK", 40, 9);
+    await deleteUnkeptTns(t.env, ezk40, 1, "AI pipeline", [prop("EZK", 40, 6)], newHeartbeat());
+    assert(t.live(v5FirstPass), "#1151 resumed pass: a verse an earlier pass already filled is not re-swept");
+    assert(!t.live(v6Old), "#1151 resumed pass: the unresolved verse is swept");
+    assert(!t.live(v9Old), "#1151 resumed pass: an empty verse is swept");
+  }
+
+  // 4. DAN 11 shape on the chapter-wide path: the first pass resolved verses
+  //    1-31; the resumed pass holds 32-45. Its notes in 1-31 must survive.
+  {
+    const t = freshSweepEnv();
+    const dan = { ...job11, jobId: "job-dan11-wide" };
+    const early = [];
+    for (let v = 1; v <= 31; v++) {
+      early.push(t.addTn("DAN", 11, v));
+      t.accept(dan.jobId, "DAN", 11, v);
+    }
+    const v40Old = t.addTn("DAN", 11, 40);
+    const proposals = [];
+    for (let v = 32; v <= 45; v++) proposals.push(prop("DAN", 11, v));
+    await deleteUnkeptTns(t.env, dan, 1, "AI pipeline", proposals, newHeartbeat());
+    assert(early.every((id) => t.live(id)), "#1151 DAN 11 chapter-wide: all 31 first-pass notes survive the resumed pass");
+    assert(!t.live(v40Old), "#1151 DAN 11 chapter-wide: an old note in a still-unresolved verse is swept");
+  }
+
+  // 5. A multi-chapter job widens only the chapters this pass has proposals
+  //    for: a chapter with no output at all is more likely a failed chapter
+  //    than a deliberate wipe, so its notes stay.
+  {
+    const t = freshSweepEnv();
+    const twoCh = { ...ezk40, jobId: "job-ezk40-41", endChapter: 41 };
+    const ch40v3 = t.addTn("EZK", 40, 3);
+    const ch41v3 = t.addTn("EZK", 41, 3);
+    await deleteUnkeptTns(t.env, twoCh, 1, "AI pipeline", [prop("EZK", 40, 1)], newHeartbeat());
+    assert(!t.live(ch40v3), "#1151 multi-chapter: an empty verse in a chapter with proposals is swept");
+    assert(t.live(ch41v3), "#1151 multi-chapter: a chapter with no proposals in this pass is left alone");
+  }
+})();
+
 console.log("pipelineImport (claim guard): all assertions passed");
