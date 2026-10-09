@@ -2727,6 +2727,33 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     return dataRef.current?.tn ?? [];
   }, [mode, bookHook]);
 
+  // Translation-question twins of the find-in-notes state/getter above (the
+  // overlay's TQ scope). Same stable-getter contract as getSearchNotes.
+  const [findQuestionQuery, setFindQuestionQuery] = useState<
+    { find: string; regex: boolean; caseSensitive: boolean } | null
+  >(null);
+  const [activeQuestionMatch, setActiveQuestionMatch] = useState<
+    { rowId: string; field: "question" | "response"; occurrence: number } | null
+  >(null);
+
+  const getSearchQuestions = useCallback((): TqRow[] => {
+    if (mode === "book" && bookHook) {
+      const out: TqRow[] = [];
+      for (const cs of bookHook.chapters.values()) {
+        if (cs.kind === "ready") out.push(...cs.data.tq);
+      }
+      return out;
+    }
+    return dataRef.current?.tq ?? [];
+  }, [mode, bookHook]);
+
+  // A running pipeline holding tq makes the server 409 a tq PATCH, so the
+  // overlay skips those chapters' rows rather than enqueueing doomed writes.
+  const isQuestionLocked = useCallback(
+    (ch: number) => lockForChapter(ch, "tq") != null,
+    [lockForChapter],
+  );
+
   // Navigate to + activate a TN match from the find overlay. Cross-chapter
   // (book mode) routes through the URL so the chapter payload reloads; the
   // common same-chapter case just focuses the verse + note, and the bumped
@@ -2776,6 +2803,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       });
     },
     [runWithDirtyGate, chapter, book, onNavigate, requestJumpTab],
+  );
+
+  // Find's TQ hits always land on the Questions tab (unlike TN, which only
+  // switches tab when TQ is also on) — a stable wrapper for the overlay.
+  const focusQuestionMatchSwitching = useCallback(
+    (ch: number, v: number, questionId: string) => focusQuestionMatch(ch, v, questionId, true),
+    [focusQuestionMatch],
   );
 
   const focusWordMatch = useCallback(
@@ -4514,6 +4548,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onScrollToNoteMatch={focusNoteMatch}
           onNoteQueryChange={setFindNoteQuery}
           onActiveNoteMatchChange={setActiveNoteMatch}
+          searchQuestions={getSearchQuestions}
+          onScrollToQuestionMatch={focusQuestionMatchSwitching}
+          onQuestionQueryChange={setFindQuestionQuery}
+          onActiveQuestionMatchChange={setActiveQuestionMatch}
+          isQuestionLocked={isQuestionLocked}
+          onReplaceQuestion={(row, patch) => {
+            // Find/replace on a translation question rewrites question /
+            // response only. Same path as onReplaceNote: enqueueRow carries the
+            // live row version as If-Match; the book cache is patched too so a
+            // cross-chapter row updates in book view. Not onQuestionSave —
+            // that one is active-chapter only.
+            enqueueRow("tq", row, patch);
+            bookHook?.applyLocalRowPatch("tq", row.chapter, row.id, {
+              ...patch,
+              restored_from_version: null,
+            });
+          }}
           lexiconMap={lexiconMap}
           twl={data.twl}
           locked={Boolean(chapterLocks.verse)}
@@ -4567,6 +4618,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeQuestionId={activeQuestionId}
           findNoteQuery={findNoteQuery}
           activeNoteMatch={activeNoteMatch}
+          findQuestionQuery={findQuestionQuery}
+          activeQuestionMatch={activeQuestionMatch}
           scrollNonce={scrollNonce}
           jumpTab={jumpTab}
           onNoteChange={(id, patch) => {
