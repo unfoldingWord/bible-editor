@@ -123,7 +123,10 @@ function samePosition(a: Position, b: Position): boolean {
   return POSITION.every((f) => a[f] === undefined || b[f] === undefined || a[f] === b[f]);
 }
 
-function applyPayload(state: State, payload: Record<string, unknown>): State {
+function applyPayload(state: State, raw: Record<string, unknown>): State {
+  // The Door43 reimport logs its parsed row, whose reference is `refRaw`.
+  const payload =
+    "refRaw" in raw && !("ref_raw" in raw) ? { ...raw, ref_raw: raw.refRaw } : raw;
   const next = { ...state };
   for (const f of FIELDS) {
     if (f in payload) {

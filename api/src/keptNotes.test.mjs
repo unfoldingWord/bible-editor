@@ -104,10 +104,12 @@ assert(verdict(row({ note: "person wrote this" }), [aiCreate()]).reason === "une
   assert(!verdict(row(), [aiFull(), ev("update", null, 5, { occurrence: 2 }), ev("update", null, 5, { occurrence: 1 })]).kept, "occurrence changed then changed back → not kept");
   // a person's move later overwritten by the Door43 reimport is not the person's position any more
   assert(!verdict(row(), [aiFull(), move(7), ev("update", "dcs_reimport", null, { chapter: 40, verse: 5, occurrence: 1 })]).kept, "person's move undone by reimport → not kept");
-  // a field the baseline never recorded cannot count as a difference: the
-  // reimport create logs no ref_raw, so a save that only re-sends it is no edit
+  // the reimport create logs its reference as refRaw; a save that only
+  // re-sends that same reference is no edit
   const reimportCreate = ev("create", "dcs_reimport", null, { ...AI_TEXT, refRaw: "40:5", chapter: 40, verse: 5, occurrence: 1 });
   assert(!verdict(row(), [reimportCreate, ev("update", null, 5, { ref_raw: "40:5", verse: 5, sort_order: 500 })]).kept, "save re-sending a position the baseline never logged → not kept");
+  // ...but its refRaw is the baseline, so a person widening the reference is an edit
+  assert(verdict(row(), [reimportCreate, ev("update", null, 5, { ref_raw: "40:5-6", verse: 5, sort_order: 500 })]).kept, "person widens the reference of a reimported note → kept");
   assert(!verdict(row(), [aiFull(), ev("update", null, 5, { ref_raw: "40:5", verse: 5, sort_order: 900 })]).kept, "reorder that re-sends the same position → not kept");
   // occurrence null vs number: an AI create with occurrence 0, a person sets 1
   assert(verdict(row(), [ev("create", "ai_pipeline", 7, { ...AI_TEXT, chapter: 40, verse: 5, ref_raw: "40:5", occurrence: 0 }), ev("update", null, 5, { occurrence: 1 })]).reason === "edited", "occurrence 0 → 1 by a person → kept");
