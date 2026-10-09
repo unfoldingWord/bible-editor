@@ -37,7 +37,7 @@ import type {
 import { getSessionKey, pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { currentPipelineUserId } from "../sync/pipelineSession";
 import { parsePipelineRange } from "../lib/refParser";
-import { jobScopeLabel, sameNotesScope } from "../lib/pipelineScope";
+import { defaultNotesInput, jobScopeLabel, notesStartBlock } from "../lib/pipelineScope";
 
 interface Props {
   book: string;
@@ -187,20 +187,19 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
   const [genOpts, setGenOpts] = useState<GenUiState>(() => loadGenOpts());
   const [conflict, setConflict] = useState<PipelineConflictExisting | null>(null);
   const [refInput, setRefInput] = useState("");
+  // True once the user has typed in the field; until then the field follows
+  // defaultNotesInput as the job store changes (issue #1166).
+  const [refTouched, setRefTouched] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
 
   useEffect(() => pipelineStore.subscribe(setActiveJobs), []);
 
   // Re-load from localStorage whenever the dialog opens for a generate run, so
   // a change made in a different tab is reflected.
+  // A fresh dialog starts untyped, so the prefill effect below owns the field.
   useEffect(() => {
     if (confirm?.type === "generate") setGenOpts(loadGenOpts());
-    // While the user's own notes run covers this chapter, the field opens empty
-    // (issue #1166): pre-filling the chapter would make one click queue a
-    // whole-chapter rerun behind a range run. They must type a scope.
-    if (confirm) {
-      setRefInput(confirm.type === "notes" && runningType("notes") ? "" : String(chapter));
-    }
+    if (confirm) setRefTouched(false);
   }, [confirm, book, chapter]);
 
   const genNothingSelected = !genOpts.ult && !genOpts.ust;
@@ -237,31 +236,42 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
   // different verse range (or the whole chapter) behind a running one. So the
   // notes item stays open while a notes run is going, and only the dialog
   // blocks, when what the user typed is the same scope as their own active
-  // run (issue #1166; same rule as findSameScopeJob in api/src/pipelines.ts).
+  // run (issue #1166; same rule as findSameScopeJob in api/src/pipelines.ts),
+  // or a multi-chapter span that includes it (see notesStartBlock).
   const ownNotesRun = confirm?.type === "notes" ? runningType("notes") : undefined;
-  // The field opened empty because of ownNotesRun (see the open effect) and
-  // nothing is typed yet: Start stays disabled, the hint asks for a scope.
-  const awaitingNotesScope = Boolean(ownNotesRun) && refInput.trim() === "";
-  const sameScopeNotesRun: PipelineJob | undefined =
-    confirm?.type === "notes" && refParsed.ok && refParsed.range.startChapter === refParsed.range.endChapter
-      ? activeJobs.find(
-          (j) =>
-            j.pipeline_type === "notes" &&
-            j.state !== "done" &&
-            j.state !== "failed" &&
-            j.state !== "cancelled" &&
-            (me == null || j.user_id === me) &&
-            sameNotesScope(j, {
-              book: refParsed.range.book,
-              startChapter: refParsed.range.startChapter,
-              endChapter: refParsed.range.endChapter,
-              verseRange:
-                refParsed.range.verseStart !== undefined && refParsed.range.verseEnd !== undefined
-                  ? { start: refParsed.range.verseStart, end: refParsed.range.verseEnd }
-                  : null,
-            }),
+  const hasOwnNotesRun = Boolean(ownNotesRun);
+  // Until the user types, the field follows the store: empty while their own
+  // notes run covers the chapter, the chapter otherwise. Re-applied when the
+  // store catches up after the dialog opened, or when that run finishes; never
+  // over typed input.
+  useEffect(() => {
+    if (confirm && !refTouched) setRefInput(defaultNotesInput(chapter, hasOwnNotesRun));
+  }, [confirm, chapter, hasOwnNotesRun, refTouched]);
+  // The field is empty because of ownNotesRun and nothing is typed yet: Start
+  // stays disabled, the hint asks for a scope.
+  const awaitingNotesScope = hasOwnNotesRun && refInput.trim() === "";
+  const notesBlock =
+    confirm?.type === "notes" && refParsed.ok
+      ? notesStartBlock(
+          activeJobs.filter(
+            (j) =>
+              j.pipeline_type === "notes" &&
+              j.state !== "done" &&
+              j.state !== "failed" &&
+              j.state !== "cancelled" &&
+              (me == null || j.user_id === me),
+          ),
+          {
+            book: refParsed.range.book,
+            startChapter: refParsed.range.startChapter,
+            endChapter: refParsed.range.endChapter,
+            verseRange:
+              refParsed.range.verseStart !== undefined && refParsed.range.verseEnd !== undefined
+                ? { start: refParsed.range.verseStart, end: refParsed.range.verseEnd }
+                : null,
+          },
         )
-      : undefined;
+      : null;
 
   const close = () => setAnchorEl(null);
 
@@ -367,7 +377,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
         {OPTIONS.map((opt) => {
           const running = runningType(opt.type);
           // Notes: a run on this chapter doesn't close the item; the dialog
-          // blocks only the same scope (see sameScopeNotesRun).
+          // blocks only the same scope (see notesBlock).
           const blocks = Boolean(running) && opt.type !== "notes";
           return (
             <MenuItem
@@ -432,18 +442,23 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
             <TextField
               label={allowVerses ? "Chapter, range, or verses" : "Chapter or range"}
               value={refInput}
-              onChange={(e) => setRefInput(e.target.value.replace(/[^\d:-]/g, ""))}
+              onChange={(e) => {
+                setRefTouched(true);
+                setRefInput(e.target.value.replace(/[^\d:-]/g, ""));
+              }}
               disabled={submitting}
               fullWidth
               size="small"
               autoFocus
-              error={(!refParsed.ok && !awaitingNotesScope) || Boolean(sameScopeNotesRun)}
+              error={(!refParsed.ok && !awaitingNotesScope) || Boolean(notesBlock)}
               inputProps={{ inputMode: allowVerses ? "text" : "numeric", pattern: "[0-9:-]*" }}
               helperText={
                 awaitingNotesScope && ownNotesRun
                   ? `Your notes run for ${jobScopeLabel(ownNotesRun)} is ${ownNotesRun.state}. Type the verses for another run (e.g. ${chapter}:6-8), or ${chapter} for the whole chapter.`
-                  : sameScopeNotesRun
-                  ? `Already running for ${jobScopeLabel(sameScopeNotesRun)} (${sameScopeNotesRun.state}). Pick other verses to queue another run.`
+                  : notesBlock?.kind === "same"
+                  ? `Already running for ${jobScopeLabel(notesBlock.job)} (${notesBlock.job.state}). Pick other verses to queue another run.`
+                  : notesBlock?.kind === "span"
+                  ? `Your notes run for ${jobScopeLabel(notesBlock.job)} is ${notesBlock.job.state}, and this span would queue a whole-chapter rerun behind it. Start the other chapters on their own.`
                   : refParsed.ok
                   ? refParsed.range.verseStart !== undefined
                     ? `Runs once for ${refParsed.range.book} ${refParsed.range.startChapter}:${refParsed.range.verseStart}${refParsed.range.verseEnd !== refParsed.range.verseStart ? `-${refParsed.range.verseEnd}` : ""}. Notes outside these verses are left alone.`
@@ -526,7 +541,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
             disabled={
               submitting ||
               !refParsed.ok ||
-              Boolean(sameScopeNotesRun) ||
+              Boolean(notesBlock) ||
               (confirm?.type === "generate" &&
                 !confirm.followUpChain &&
                 genNothingSelected)

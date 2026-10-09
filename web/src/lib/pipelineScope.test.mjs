@@ -1,7 +1,7 @@
 // Issue #1166: a job's scope label and the notes same-scope check. Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/pipelineScope.test.mjs
 
-import { jobScopeLabel, sameNotesScope } from "./pipelineScope.ts";
+import { defaultNotesInput, jobScopeLabel, notesStartBlock, sameNotesScope } from "./pipelineScope.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -45,6 +45,23 @@ assert(!sameNotesScope(job("invalid"), req(null)), "invalid never matches whole 
 assert(!sameNotesScope(job("invalid"), req({ start: 3, end: 5 })), "invalid never matches a range");
 assert(!sameNotesScope(job(null, 1, 3), req(null)), "multi-chapter run vs one chapter → different (server matches exact chapters)");
 assert(!sameNotesScope({ ...job(null), book: "MAL" }, req(null)), "other book → different");
+
+console.log("\n[notesStartBlock]");
+{
+  const running = [job({ start: 3, end: 5 })];
+  assert(notesStartBlock(running, req({ start: 3, end: 5 }))?.kind === "same", "same range → same");
+  assert(notesStartBlock(running, req({ start: 6, end: 8 })) === null, "1:6-8 beside 1:3-5 → not blocked");
+  assert(notesStartBlock(running, req(null)) === null, "whole chapter typed by hand → not blocked (server queues it)");
+  assert(notesStartBlock(running, req(null, 1, 2))?.kind === "span", "span 1-2 covering the running chapter → span");
+  assert(notesStartBlock(running, req(null, 2, 3)) === null, "span 2-3 not covering chapter 1 → not blocked");
+  assert(notesStartBlock([job(null, 2)], req(null, 1, 3))?.kind === "span", "span 1-3 with a run on chapter 2 → span");
+  assert(notesStartBlock([{ ...job(null, 1), book: "MAL" }], req(null, 1, 2)) === null, "other book → not blocked");
+  assert(notesStartBlock([], req(null, 1, 2)) === null, "no own runs → not blocked");
+}
+
+console.log("\n[defaultNotesInput]");
+assert(defaultNotesInput(1, true) === "", "own notes run active → empty");
+assert(defaultNotesInput(1, false) === "1", "no own run → chapter");
 
 if (failed) {
   console.error(`${failed} failed`);

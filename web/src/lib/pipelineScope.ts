@@ -54,3 +54,47 @@ export function sameNotesScope(
   if (vr === null || request.verseRange === null) return vr === request.verseRange;
   return vr.start === request.verseRange.start && vr.end === request.verseRange.end;
 }
+
+export interface NotesRequest {
+  book: string;
+  startChapter: number;
+  endChapter: number;
+  verseRange: { start: number; end: number } | null;
+}
+
+/**
+ * Why the notes dialog must not start what the user typed, given the user's
+ * OWN active notes runs (caller filters by owner and state):
+ *  - "same": one chapter, and the same scope as an active run (the server
+ *    would only point at that run).
+ *  - "span": a multi-chapter span that includes a chapter with an active run.
+ *    The span fans out into whole-chapter runs, so it would queue a
+ *    whole-chapter rerun behind that run without the user asking for one.
+ * null = nothing blocks.
+ */
+export function notesStartBlock<J extends ScopedJob>(
+  ownActiveNotesJobs: J[],
+  request: NotesRequest,
+): { kind: "same" | "span"; job: J } | null {
+  if (request.startChapter === request.endChapter) {
+    const job = ownActiveNotesJobs.find((j) => sameNotesScope(j, request));
+    return job ? { kind: "same", job } : null;
+  }
+  const job = ownActiveNotesJobs.find(
+    (j) =>
+      j.book === request.book &&
+      j.start_chapter <= request.endChapter &&
+      j.end_chapter >= request.startChapter,
+  );
+  return job ? { kind: "span", job } : null;
+}
+
+/**
+ * What the notes dialog's field holds until the user types: empty while their
+ * own notes run covers the chapter (so one click can't queue a whole-chapter
+ * rerun behind it), otherwise the chapter. Re-applied whenever that changes,
+ * as long as the user hasn't typed.
+ */
+export function defaultNotesInput(chapter: number, ownNotesRunActive: boolean): string {
+  return ownNotesRunActive ? "" : String(chapter);
+}
