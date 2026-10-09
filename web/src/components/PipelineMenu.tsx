@@ -394,7 +394,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
               helperText={
                 refParsed.ok
                   ? refParsed.range.verseStart !== undefined
-                    ? `Runs once for ${refParsed.range.book} ${refParsed.range.startChapter}:${refParsed.range.verseStart}-${refParsed.range.verseEnd}. Notes outside these verses are left alone.`
+                    ? `Runs once for ${refParsed.range.book} ${refParsed.range.startChapter}:${refParsed.range.verseStart}${refParsed.range.verseEnd !== refParsed.range.verseStart ? `-${refParsed.range.verseEnd}` : ""}. Notes outside these verses are left alone.`
                     : refParsed.range.startChapter === refParsed.range.endChapter
                     ? `Runs once for ${refParsed.range.book} ${refParsed.range.startChapter}.`
                     : `Runs ${refParsed.range.endChapter - refParsed.range.startChapter + 1} times across ${refParsed.range.book} ${refParsed.range.startChapter}-${refParsed.range.endChapter}.`
