@@ -83,6 +83,13 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **Live-testing cross-tab outbox races and the viewer role locally.** 2026-10-09 (#1147): the chapter room's
+  `row.deleted` usually heals a stale load (its step is replayed over a deferred merge), hiding the race. Silence
+  one tab's room with Playwright `page.routeWebSocket(/\/api\/ws\/chapter\//, () => {})` and buffer its
+  `be-row-delete-outcomes` BroadcastChannel in an init script to hold an outcome past a load. `/api/auth/dev` can
+  never mint a viewer (`user_roles` CHECK allows only admin/editor), so fake one by rewriting `role` in the
+  `/api/auth/me` response; the client sets `isReadOnly()` from it.
+
 - **Server-side, Hebrew mark order is data, so never blanket-NFC a D1-vs-master compare.** 2026-09-25: the sync
   canonizes `x-lemma` to UHB mark order while Door43 master is NFC, so 21 locked-book verses nobody touched hit the
   #539 no-op guard as `adopt_conflict`, kept the flag, and their editors got false "Door43 overwrote your edits"
