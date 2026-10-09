@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -335,8 +336,13 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       savedContent: unknown;
       baseContent: unknown;
     } | null>(null);
+    // Read only by the outbox-result and refusal listeners (the second after
+    // an awaited draft and outbox read), which fire after a request settles,
+    // never during a render, so it is written after commit (#1117).
     const verseRef = useRef(verse);
-    verseRef.current = verse;
+    useLayoutEffect(() => {
+      verseRef.current = verse;
+    });
     useEffect(
       () =>
         onOutboxResult((op, result) => {
@@ -359,8 +365,12 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // reset the panel and dropped its record of B). Re-read it then, only
     // when refusedDraftMayRehydrate says nothing newer can be overwritten
     // and the draft fits the row the panel shows.
+    // Read only inside the listener's awaited .then, so written after commit
+    // like verseRef (#1117).
     const sourceVerseObjectsRef = useRef(sourceVerseObjects);
-    sourceVerseObjectsRef.current = sourceVerseObjects;
+    useLayoutEffect(() => {
+      sourceVerseObjectsRef.current = sourceVerseObjects;
+    });
     useEffect(
       () =>
         onAlignerSaveRefused((op, _kept, heldInDraft) => {

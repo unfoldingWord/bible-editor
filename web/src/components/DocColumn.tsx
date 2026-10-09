@@ -278,6 +278,10 @@ export function DocColumn({
   // changes on every render. VerseSpan gets stable wrappers that read the
   // latest callbacks from a ref at call time (the verse number is passed in by
   // VerseSpan), so a new parent closure alone never re-renders a verse.
+  // Written during render for the same reason as BookView's
+  // latestCallbacksRef (#1117): the readers are click and input handlers, so
+  // a layout-effect write would also work, but these are the keystroke save
+  // callbacks and the move buys nothing without concurrent rendering.
   const latest = useRef({ onSelectVerse, onEditVerse, onSaveColumn, onOpenAligner, onMergeBridge, onSplitBridge, onOpenVerseComments, activeVerse });
   latest.current = { onSelectVerse, onEditVerse, onSaveColumn, onOpenAligner, onMergeBridge, onSplitBridge, onOpenVerseComments, activeVerse };
   const handleSelect = useCallback((verse: number) => {

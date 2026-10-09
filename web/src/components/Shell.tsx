@@ -1069,18 +1069,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // caches optimistically, and the drop leaves it there, reading as saved
   // (the aligner's Reset goes back to it, a reopened verse shows it). Re-read
   // the chapter and put the server's row back. Read through refs: the GET
-  // resolves after renders this closure did not see.
+  // resolves after renders this closure did not see. Every reader (here and
+  // in rollBackRefusedRowDelete below) runs only after an awaited outbox
+  // read or GET, so a write after commit gives them the same value (#1117).
   const bookHookRef = useRef(bookHook);
-  bookHookRef.current = bookHook;
   const applyLocalVerseRef = useRef(applyLocalVerse);
-  applyLocalVerseRef.current = applyLocalVerse;
   const applyRemoteVerseRef = useRef(applyRemoteVerse);
-  applyRemoteVerseRef.current = applyRemoteVerse;
   // One chapter GET per refusal burst: a find/replace across a locked chapter
   // is refused verse by verse, and every refusal reads the same chapter.
   const rollbackFetchRef = useRef(new Map<string, Promise<ChapterPayload>>());
   const liveBookRef = useRef(book);
-  liveBookRef.current = book;
+  useLayoutEffect(() => {
+    bookHookRef.current = bookHook;
+    applyLocalVerseRef.current = applyLocalVerse;
+    applyRemoteVerseRef.current = applyRemoteVerse;
+    liveBookRef.current = book;
+  });
   // False once this Shell unmounts (React StrictMode's dev replay sets it
   // back to true).
   const rollbackMountedRef = useRef(false);
@@ -1179,8 +1183,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // the server still has it. Re-read the chapter on screen and put the
   // server's row back (planRefusedRowDeleteRollback decides). Refused PATCHes
   // are left alone: see refusedRowRollback.ts.
+  // Read only after the awaited GET, so it is written after commit (#1117).
   const restoreRowRef = useRef(restoreRow);
-  restoreRowRef.current = restoreRow;
+  useLayoutEffect(() => {
+    restoreRowRef.current = restoreRow;
+  });
   const rollBackRefusedRowDelete = useCallback(async (op: Pick<OutboxOp, "id" | "target" | "action">) => {
     const t = op.target;
     if (t.kind !== "row" || op.action !== "delete") return;
@@ -1673,6 +1680,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Live lock state for a save that commits after an await or a confirm
   // (#1046): the render-time `bookLocked` a callback closed over can be stale
   // by the time it enqueues.
+  //
+  // This ref, alignerLockRef and chapterStaleRef below are written during
+  // render on purpose (#1117), unlike the rollback refs above: they are the
+  // gates a write checks just before it is sent, and a render-time write is
+  // the earliest point the new value is visible. A child's unmount cleanup
+  // or layout effect in the same commit runs before any layout effect of
+  // Shell's, so a write fired from one would still see the previous lock or
+  // stale flag. A render React throws away cannot leak a wrong value here:
+  // no startTransition / useDeferredValue is in use, so the only discarded
+  // renders are StrictMode's dev replay and React's one retry after a render
+  // error, and both compute the same value. Revisit if concurrent rendering
+  // arrives (e.g. a React 19 upgrade).
   const bookLockedRef = useRef(bookLocked);
   bookLockedRef.current = bookLocked;
   useEffect(() => {
@@ -1709,9 +1728,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [lockForChapter, bookLocked],
   );
   // Live lock state for the unalign confirm's deferred commit (#1071), same
-  // reason as bookLockedRef.
+  // reason as bookLockedRef; written during render for the reason given there.
   const alignerLockRef = useRef(alignerLock);
   alignerLockRef.current = alignerLock;
+  // Read by every route-chapter write (#892) right before it is sent; written
+  // during render for the reason given at bookLockedRef.
   const chapterStaleRef = useRef(chapterStale);
   chapterStaleRef.current = chapterStale;
 
