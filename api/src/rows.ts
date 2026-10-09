@@ -8,6 +8,7 @@ import {
   activePipelinesStatement,
   lockedResponseBody,
   pickActivePipeline,
+  rangeLockCoveringVerse,
   type ActivePipelineRow,
 } from "./chapterLock";
 import { bookLockStatement, evaluateBookLock, bookLockedResponseBody, BOOK_LOCKED_STATUS, type BookLockRow } from "./bookLock";
@@ -312,10 +313,12 @@ rows.post("/:kind", requireEditor, async (c) => {
   // Block new rows while an AI pipeline that writes THIS kind is running for
   // this chapter — its auto-apply step will overwrite or rearrange that kind's
   // row set when it lands. A run on another resource is none of our business.
+  // A verse-range notes run locks only notes anchored inside its range (#1165).
   const lock = pickActivePipeline(
     (pipelinesRes.results ?? []) as ActivePipelineRow[],
     data.chapter as number,
     kind,
+    data.verse as number,
   );
   if (lock) return c.json(lockedResponseBody(lock), 409);
 
@@ -829,6 +832,17 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     if (lock) return c.json(lockedResponseBody(lock), 409);
   }
 
+  // #1165: the tn carve-out above covers edits, not moves INTO a verse-range
+  // run's span. A reference-only move does not make the note kept, so the
+  // range import would sweep it (see rangeLockCoveringVerse). Read only when
+  // the PATCH actually changes the verse, so ordinary saves keep their two
+  // round trips.
+  if (kind === "tn" && typeof p.verse === "number" && p.verse !== current.verse) {
+    const rs = await activePipelinesStatement(c.env.DB, book, current.chapter).all<ActivePipelineRow>();
+    const lock = rangeLockCoveringVerse(rs.results ?? [], current.chapter, p.verse);
+    if (lock) return c.json(lockedResponseBody(lock), 409);
+  }
+
   // No-op short-circuit: if the precondition still holds and every patched
   // field already matches the stored value, return the row unchanged.
   // Identical re-saves are common — picker re-commit, AI completion echoing
@@ -1309,7 +1323,8 @@ rows.delete("/:kind/:id", requireEditor, async (c) => {
     .bind(id, book)
     .first<{ book: string; chapter: number; verse: number; ref_raw: string | null }>();
   if (scope) {
-    const lock = await activePipelineForChapter(c.env, scope.book, scope.chapter, kind);
+    // A verse-range notes run locks only notes anchored inside its range (#1165).
+    const lock = await activePipelineForChapter(c.env, scope.book, scope.chapter, kind, scope.verse);
     if (lock) return c.json(lockedResponseBody(lock), 409);
   }
 

@@ -16,6 +16,7 @@ import { canonicalTwlOrder, twlDisplayOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import CheckIcon from "@mui/icons-material/Check";
 import { LANE_FILL, type LaneShade } from "../lib/laneChecks";
+import { movableNoteVerses } from "../lib/tnRangeLock";
 
 export type PanelMode = "resources" | "alignment" | "search";
 
@@ -182,6 +183,12 @@ interface Props {
   // propagates read-only to that tab's children.
   lockedTn?: boolean;
   lockedTq?: boolean;
+  // #1165: which notes `lockedTn` covers, by anchor verse. A verse-range notes
+  // run locks only its range; absent means every note in the chapter.
+  tnVerseLocked?: (verse: number) => boolean;
+  // Verses a note may not be moved to (a verse-range run's range; the server
+  // refuses the move). Left out of the note "change reference" picker.
+  tnMoveBlocked?: (verse: number) => boolean;
   // The whole BOOK is locked (server-enforced, hard freeze, no carve-outs —
   // unlike lockedTn/lockedTq above, which are per-resource chapter-pipeline
   // locks with a preserve/hint carve-out on NoteCard). ORed into every
@@ -403,6 +410,8 @@ export function ResourceColumn({
   onQuestionCreate,
   onQuestionFocus,
   lockedTn = false,
+  tnVerseLocked,
+  tnMoveBlocked,
   lockedTq = false,
   bookLocked = false,
   onSetNotePreserve,
@@ -434,6 +443,12 @@ export function ResourceColumn({
   commentCountsForRow,
   onOpenRowComments,
 }: Props) {
+  // #1165: the note move picker leaves out verses a range run has locked.
+  // Same array when nothing is blocked, so cards don't re-render for nothing.
+  const noteVerseOptions = useMemo(
+    () => (tnMoveBlocked ? movableNoteVerses(verseOptions, tnMoveBlocked) : verseOptions),
+    [verseOptions, tnMoveBlocked],
+  );
   // Where the user's focus currently is, mirrored into a ref for NoteCard's
   // abandoned-blank-stub discard (see hasLeftNoteVerse in noteGuard.ts).
   // In per-verse mode the card for the OLD verse unmounts in the same commit
@@ -1033,7 +1048,7 @@ export function ResourceColumn({
               onTogglePin={() => togglePinned("notes")}
               onAdd={onNoteCreate}
               sticky
-              hideAdd={lockedTn || bookLocked}
+              hideAdd={(lockedTn && (tnVerseLocked?.(activeVerse) ?? true)) || bookLocked}
               lane="tn"
               checkoff={checkoff}
             />
@@ -1350,7 +1365,7 @@ export function ResourceColumn({
           onDelete={(opts) => onNoteDelete(r.id, opts)}
           onRestore={() => onNoteRestore(r.id)}
           onInsertAfter={() => onNoteInsertAfter(r.id)}
-          verseOptions={verseOptions}
+          verseOptions={noteVerseOptions}
           onChangeVerse={(v, vEnd) => onNoteChangeVerse(r.id, v, vEnd)}
           onFocus={() => onNoteFocus(r)}
           // r.verse is the row's START verse (a bridged row spans r.verse →
@@ -1421,7 +1436,7 @@ export function ResourceColumn({
           isAiPending={isNoteAiPending?.(r.id) ?? false}
           aiRecentlyCompletedAt={noteAiRecentlyCompletedAt?.(r.id) ?? null}
           onVisibilityChange={onNoteVisibilityChange}
-          locked={lockedTn}
+          locked={lockedTn && (tnVerseLocked?.(r.verse) ?? true)}
           bookLocked={bookLocked}
           onSetPreserve={
             onSetNotePreserve ? (value) => onSetNotePreserve(r.id, value) : undefined

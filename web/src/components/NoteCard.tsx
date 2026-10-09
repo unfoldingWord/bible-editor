@@ -2469,6 +2469,9 @@ function areNotePropsEqual(a: Props, b: Props): boolean {
     a.isAiPending === b.isAiPending &&
     a.aiRecentlyCompletedAt === b.aiRecentlyCompletedAt &&
     a.locked === b.locked &&
+    // The move picker's verses shrink while a verse-range run holds some of
+    // them (#1165); ResourceColumn memoizes the list, so a reference check.
+    a.verseOptions === b.verseOptions &&
     a.bookLocked === b.bookLocked &&
     a.quoteBuildMode === b.quoteBuildMode &&
     a.quoteBuildSelectionCount === b.quoteBuildSelectionCount &&

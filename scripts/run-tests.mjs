@@ -54,6 +54,7 @@ const SQLITE_FILES = new Set([
   "src/lockAlertRefresh.test.mjs",
   "src/saveRoundTrips.test.mjs",
   "src/pipelineVerseRange.test.mjs",
+  "src/tnRangeLock.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
@@ -76,6 +77,7 @@ const EXTRA_IMPORTS = new Map([
   // saveRoundTrips.test.mjs drives the real rows.ts / verses.ts routers
   // (issue #905), which import their siblings extensionless.
   ["src/saveRoundTrips.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/tnRangeLock.test.mjs", "./src/tsResolveHook.mjs"],
   // verseMergeConflicts.test.mjs now imports retireVerseKeptAiMasterFlags
   // directly from verseMergeConflicts.ts (issue #760 fail-closed regression
   // test), which in turn imports "./auth" and "./index" without extensions.

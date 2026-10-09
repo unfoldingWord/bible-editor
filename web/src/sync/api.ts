@@ -1321,6 +1321,12 @@ export interface PipelineJobRow {
    * whole chapter). Absent on optimistic rows from an older server.
    */
   verse_range?: JobVerseRange;
+  /**
+   * #1165: the anchor verses a verse-range notes run locks; null means its tn
+   * lock covers the whole chapter. Server-derived (chapterLock.ts
+   * tnLockVerseRange). Absent locks the whole chapter (web/src/lib/tnRangeLock.ts).
+   */
+  locks_tn_verse_range?: { start: number; end: number } | null;
   created_at: number;
   updated_at: number;
   last_polled_at: number | null;

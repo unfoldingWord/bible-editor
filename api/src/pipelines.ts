@@ -22,7 +22,8 @@ import { currentUserId, requireEditor } from "./auth.ts";
 import { importJobOutput } from "./pipelineImport.ts";
 import { buildKeptOption } from "./keptNotes.ts";
 import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim.ts";
-import { resourcesLockedByJob } from "./chapterLock.ts";
+import { resourcesLockedByJob, tnLockVerseRange } from "./chapterLock.ts";
+import { storedVerseRange, type StoredVerseRange } from "./storedVerseRange.ts";
 import {
   effectiveBookLock,
   bookLockedResponseBody,
@@ -152,46 +153,9 @@ export const StartBody = z
     { message: "verse_range_is_one_chapter_notes_only" },
   );
 
-// A verse-range job's range, as stored in pipeline_jobs.options_json (issue
-// #1160). Every reader of a job's range goes through here: dispatch (top-level
-// verseStart/verseEnd for the bot), the /start duplicate check, and the import
-// (ImportContext.verseRange — without it the #1151 chapter-wide sweep would
-// retire AI notes outside the range).
-//
-// Fails CLOSED: `range: null` (a whole-chapter run) only when options_json is
-// absent or is an object with no verseRange key. Unparseable JSON, a non-object,
-// or a verseRange that is not 1 <= start <= end <= 200 is an error, because
-// reading any of those as "whole chapter" is the direction that deletes notes.
-export type StoredVerseRange =
-  | { ok: true; range: { start: number; end: number } | null }
-  | { ok: false; error: string };
-
-export function storedVerseRange(optionsJson: string | null): StoredVerseRange {
-  if (!optionsJson) return { ok: true, range: null };
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(optionsJson);
-  } catch {
-    return { ok: false, error: "verse_range_invalid: options_json is not valid JSON" };
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { ok: false, error: "verse_range_invalid: options_json is not an object" };
-  }
-  if (!("verseRange" in parsed)) return { ok: true, range: null };
-  const vr = (parsed as { verseRange: unknown }).verseRange as { start?: unknown; end?: unknown } | null;
-  const start = vr && typeof vr === "object" && !Array.isArray(vr) ? vr.start : undefined;
-  const end = vr && typeof vr === "object" && !Array.isArray(vr) ? vr.end : undefined;
-  if (
-    !Number.isInteger(start) ||
-    !Number.isInteger(end) ||
-    (start as number) < 1 ||
-    (end as number) < (start as number) ||
-    (end as number) > 200
-  ) {
-    return { ok: false, error: `verse_range_invalid: ${JSON.stringify(vr)}` };
-  }
-  return { ok: true, range: { start: start as number, end: end as number } };
-}
+// storedVerseRange lives in storedVerseRange.ts so chapterLock.ts can read a
+// job's range without importing this module; re-exported for existing callers.
+export { storedVerseRange, type StoredVerseRange };
 
 // The range as the web sees it on a job row (issue #1166): null = whole
 // chapter, "invalid" = a stored range that fails validation. The UI labels an
@@ -2486,6 +2450,11 @@ pipelines.get("/", requireEditor, async (c) => {
       // The verse range (issue #1166), read through storedVerseRange so an
       // unreadable stored range shows as "invalid", never as whole chapter.
       verse_range: publicVerseRange(options_json),
+      // The anchor verses this run's notes lock covers (null = the whole
+      // chapter), from the same function the row routes enforce (#1165). Not
+      // verse_range: an invalid range, a chain or a non-notes run locks the
+      // whole chapter whatever its range says.
+      locks_tn_verse_range: tnLockVerseRange({ ...row, follow_up_chain, options_json }),
     };
     if (withLocks.state === "queued") {
       const pos = snap.positions.get(withLocks.job_id);
@@ -2524,7 +2493,8 @@ interface PipelineRowSelect {
   updated_at: number;
   last_polled_at: number | null;
   notified_user_at: number | null;
-  // Never returned to the client either: it gets verse_range (issue #1166).
+  // Never returned to the client either: it gets verse_range (issue #1166)
+  // and locks_tn_verse_range (#1165).
   options_json: string | null;
   // Present only on the default (shared-queue) list where we JOIN users, so the
   // UI can attribute another user's run. Absent on the explicit-state branch.

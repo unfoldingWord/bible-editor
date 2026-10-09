@@ -78,6 +78,7 @@ import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
 import { createUhbStrongsCache } from "../lib/uhbStrongs";
+import { isTnMoveBlocked, isTnVerseLocked, planRefusedTnMoveRollback, tnLockLabel, tnLockingJobs } from "../lib/tnRangeLock";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import type { BookViewportRestore } from "./BookView";
@@ -1232,6 +1233,44 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // Best-effort: the next chapter refetch catches up.
     }
   }, [fetchRollbackChapter]);
+  // #1165: a note MOVE the server refused (into a verse-range run's verses) was
+  // already applied to the cache, so the card would sit at the refused verse
+  // until a refetch. Put back the server's position only (verse, ref, sort
+  // order); the note's text and draft are untouched, which is why the general
+  // refused-PATCH rule in refusedRowRollback.ts does not apply here.
+  const rollBackRefusedTnMove = useCallback(
+    async (op: Pick<OutboxOp, "target" | "action" | "patch">) => {
+      const t = op.target;
+      if (t.kind !== "row" || t.rowKind !== "tn" || op.action !== "patch") return;
+      if (typeof op.patch?.verse !== "number") return;
+      try {
+        const cur = dataRef.current;
+        if (!cur || cur.book !== t.book) return;
+        const chapterNo = cur.chapter;
+        const server = await fetchRollbackChapter(t.book, chapterNo);
+        if (
+          !rollbackMayApply({
+            mounted: rollbackMountedRef.current,
+            liveBook: liveBookRef.current,
+            targetBook: t.book,
+          })
+        ) {
+          return;
+        }
+        const now = dataRef.current;
+        if (!now || now.book !== t.book || now.chapter !== chapterNo) return;
+        const plan = planRefusedTnMoveRollback({
+          patch: op.patch,
+          serverRow: server.tn.find((r) => r.id === t.id),
+          cachedRow: now.tn.find((r) => r.id === t.id),
+        });
+        if (plan) applyLocalRowPatch("tn", t.id, plan);
+      } catch {
+        // Best-effort: the next chapter refetch catches up.
+      }
+    },
+    [fetchRollbackChapter, applyLocalRowPatch],
+  );
   // A chapter_locked refusal means this tab's view of the pipeline is stale:
   // refresh it (one reload at a time).
   const reloadLocks = useCallback(() => {
@@ -1254,13 +1293,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           if (isAlignerPanelSaveOp(op)) return;
           void rollBackRefusedVerse(op);
           void rollBackRefusedRowDelete(op);
+          void rollBackRefusedTnMove(op);
           pushPipelineToast(
             "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }
       }),
-    [pushPipelineToast, reloadLocks, rollBackRefusedVerse, rollBackRefusedRowDelete],
+    [pushPipelineToast, reloadLocks, rollBackRefusedVerse, rollBackRefusedRowDelete, rollBackRefusedTnMove],
   );
   // #1075: a discarded verse op (an unresolvable 409, a refused save, discard
   // all) leaves its optimistic content in the caches just as a lock refusal
@@ -1362,17 +1402,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }),
     [lockForChapter, chapter],
   );
+  // #1165: a verse-range notes run locks only the notes anchored in its range,
+  // so `chapterLocks.tn` says a run holds notes and this says which ones.
+  const tnLockJobs = useMemo(() => tnLockingJobs(activeJobs, book, chapter), [activeJobs, book, chapter]);
+  const tnVerseLocked = useCallback((verse: number) => isTnVerseLocked(tnLockJobs, verse), [tnLockJobs]);
+  // The server refuses moving a note into a range run's verses (#1165), so the
+  // picker leaves them out and onNoteChangeVerse refuses them too.
+  const tnMoveBlocked = useCallback((verse: number) => isTnMoveBlocked(tnLockJobs, verse), [tnLockJobs]);
   // One banner line per active run, so a run's type and start time are never
   // attributed to another run's locked lanes.
   const lockBanners = useMemo(() => {
     const byJob = new Map<string, { pipelineType: string; startedAt: number; resources: string[] }>();
-    for (const [resource, label] of [
+    for (const [resource, baseLabel] of [
       ["verse", "scripture"],
       ["tn", "notes"],
       ["tq", "questions"],
     ] as const) {
       const lock = chapterLocks[resource];
       if (!lock) continue;
+      // The notes label names every locking run's verses (the union
+      // isTnVerseLocked enforces), not only this banner's job.
+      const label = resource === "tn" ? tnLockLabel(tnLockJobs) : baseLabel;
       const entry = byJob.get(lock.jobId);
       if (entry) entry.resources.push(label);
       else
@@ -1383,7 +1433,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         });
     }
     return Array.from(byJob, ([jobId, v]) => ({ jobId, ...v }));
-  }, [chapterLocks]);
+  }, [chapterLocks, tnLockJobs]);
 
   const handleSetNotePreserve = useCallback(
     async (id: string, value: boolean) => {
@@ -4241,7 +4291,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           {formatRelative(b.startedAt)}. Editing is locked for{" "}
           {b.resources.join(", ")} in this chapter; everything else stays
           editable.
-          {b.resources.includes("notes")
+          {b.resources.some((r) => r.startsWith("notes"))
             ? " You can still mark notes to keep before the new set lands."
             : ""}
         </Alert>
@@ -4728,6 +4778,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
                     : `${chapter}:${verse}`;
             const effectiveVerse = chapter === 0 ? 0 : verse;
             if (row.verse === effectiveVerse && row.ref_raw === ref_raw) return;
+            // #1165: the server refuses a move into a verse-range run's verses
+            // (the run would sweep the moved note). The picker leaves them out;
+            // this catches a picker opened before the run's lock arrived.
+            if (effectiveVerse !== row.verse && tnMoveBlocked(effectiveVerse)) {
+              pushPipelineToast(
+                `Can't move the note to v${effectiveVerse} while the AI notes run for those verses is in progress.`,
+                "error",
+              );
+              return;
+            }
             const sort_order = pickSortOrder(sortedForVerse(tn, effectiveVerse), null, "after");
             enqueueRow("tn", row, { verse: effectiveVerse, ref_raw, sort_order });
             // Follow the note to its new verse: the resource column only renders
@@ -4933,6 +4993,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               );
           }}
           lockedTn={Boolean(chapterLocks.tn)}
+          tnVerseLocked={tnVerseLocked}
+          tnMoveBlocked={tnMoveBlocked}
           lockedTq={Boolean(chapterLocks.tq)}
           // bookLocked, not editLocked: NoteCard reads readOnly at unmount to
           // decide whether to discard an abandoned blank stub, and the stale
