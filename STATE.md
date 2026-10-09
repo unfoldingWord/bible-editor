@@ -681,6 +681,15 @@ Highlights that bite repeatedly:
   is only safe while the slot points at the same ROW: a bridge or split by another editor remaps it, and the save
   then keys on the new row and lands with a 200 (measured: v7-only text replaced the whole 6-7 row). So the line is
   keyed by row start + `verse_end` and remounts, dropping the edit, when the row changes.
+- **A speculative write that must be undone needs its "before" state on the row, not in memory.** #1132 kept the
+  pre-upsert `verse_merge_conflicts` row in memory, which a crashed Workflow attempt, a retry, or an overlapping
+  run cannot see, so each of those either deleted an earlier night's pending alert or kept a pointer to an
+  overwrite that never landed (#1137). Since migration 0076 the speculative upsert stores `prior_json` /
+  `prior_run` / `prior_version` on the row, and whether the overwrite landed is read from the reimport's own
+  `edit_log` row (source `dcs_reimport`, `prev_version` ≥ the observed version), which commits in the same batch
+  as the CAS write. Rules that follow: the capture is taken only when the row is settled, so a retry or a second
+  run inherits the first capture; a landed write settles the capture inside its own CAS batch; a nightly chunk
+  step rolls back its run's unsettled rows before writing; only the owning run may restore or delete.
 
 ## Stop conditions / goals
 

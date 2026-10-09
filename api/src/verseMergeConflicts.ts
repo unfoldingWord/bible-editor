@@ -89,17 +89,18 @@ import {
 } from "./verseMergeEditorAlerts.ts";
 import {
   CONFIRM_ADOPTED_CONFLICT_SQL,
-  DELETE_LOST_ADOPTION_CONFLICT_SQL,
+  DELETE_SPECULATIVE_CONFLICTS_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   RESOLVE_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
   RESOLVE_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL,
-  RESTORE_LOST_ADOPTION_CONFLICT_SQL,
+  RESTORE_SPECULATIVE_CONFLICTS_SQL,
   RETIRE_KEPT_AI_MASTER_CONFLICTS_FOR_PAIR_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
-  SELECT_PRIOR_VERSE_MERGE_CONFLICTS_SQL,
   SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL,
+  SETTLE_LANDED_CONFLICTS_SQL,
+  SETTLE_SPECULATIVE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
 } from "./verseMergeConflictSql.ts";
 import {
@@ -160,26 +161,6 @@ export interface VerseMergeConflictRow {
 
 const WRITE_BATCH = 90;
 
-/**
- * Issue #1132: a verse_merge_conflicts row as it stood just before a
- * speculative upsert touched it (SELECT_PRIOR_VERSE_MERGE_CONFLICTS_SQL).
- * `alignment` is the stored JSON text, put back byte for byte.
- */
-export interface PriorVerseMergeConflict {
-  chapter: number;
-  verse: number;
-  action: string;
-  reason: string;
-  overwritten_version: number | null;
-  alignment: string | null;
-  detected_at: number;
-  last_recorded_at: number | null;
-  recorded_generation: number;
-}
-
-/** "chapter:verse" → the prior row, or null when the upsert created it. */
-export type PriorVerseMergeConflicts = Map<string, PriorVerseMergeConflict | null>;
-
 const conflictRefKey = (chapter: number, verse: number): string => `${chapter}:${verse}`;
 
 // Best-effort, batched per-verse upsert. Returns early (true — nothing failed,
@@ -213,19 +194,15 @@ const conflictRefKey = (chapter: number, verse: number): string => `${chapter}:$
 //
 // `now` is the caller's own Date.now()-derived timestamp (bookReimport.ts
 // already computes one per applyVerseRows call) — bound as detected_at's
-// value on INSERT and as last_recorded_at's value on every write, so
-// deleteLostAdoptionConflicts (called later in the same run) can match rows
-// touched by THIS run's speculative write by exact equality on
-// last_recorded_at.
+// value on INSERT and as last_recorded_at's value on every write.
 //
-// Issue #1132: pass `prior` to capture each touched row's state from just
-// before its upsert, for deleteLostAdoptionConflicts to put back on a lost
-// race. The capture is a SELECT at the head of each slice's batch(), so it is
-// atomic with the upserts and costs no extra subrequest (91 statements per
-// batch, under D1's 100). A ref maps to its prior row, or to null when the
-// upsert created it. A ref already in the map keeps its first capture. A ref
-// is left out when its slice failed or the batch returned no rows for the
-// SELECT, and the cleanup then falls back to the plain delete.
+// Issue #1137: `runId` names the logical run making these writes, stable
+// across its retries (the nightly path passes one per Workflow run and book;
+// a UI pull gets its own). Each adoption row's upsert records, durably on the
+// row, what it said before this run's speculation and which run owns it
+// (UPSERT_VERSE_MERGE_CONFLICT_SQL's prior_* columns), for the lost-race
+// cleanup and a retry's roll-back to put back. A ref recorded twice keeps its
+// first capture.
 export async function recordVerseMergeConflicts(
   env: Env,
   book: string,
@@ -233,35 +210,14 @@ export async function recordVerseMergeConflicts(
   bibleVersion: string,
   rows: VerseMergeConflictRow[],
   now: number,
-  prior?: PriorVerseMergeConflicts,
+  runId: string | null = null,
 ): Promise<boolean> {
   if (rows.length === 0) return true;
-  // A ref listed twice gets two upserts (two generation bumps), so the
-  // restore's `prior + 1` guard could never match it. bookReimport.ts keeps
-  // content and structure flags on disjoint verses, so this should not occur;
-  // if it does, the ref is left out of `prior` and the cleanup uses the delete.
-  const seen = new Set<string>();
-  const repeated = new Set<string>();
-  for (const r of rows) {
-    const k = conflictRefKey(r.chapter, r.verse);
-    if (seen.has(k)) repeated.add(k);
-    seen.add(k);
-  }
-  if (prior && repeated.size > 0) {
-    console.warn("verseMergeConflicts: ref recorded twice in one call; its lost-race cleanup will delete, not restore", {
-      book, resource, refs: [...repeated],
-    });
-  }
   try {
     for (let i = 0; i < rows.length; i += WRITE_BATCH) {
       const slice = rows.slice(i, i + WRITE_BATCH);
-      const capture = prior
-        ? [env.DB.prepare(SELECT_PRIOR_VERSE_MERGE_CONFLICTS_SQL)
-            .bind(book, resource, JSON.stringify(slice.map((r) => conflictRefKey(r.chapter, r.verse))))]
-        : [];
-      const results = await env.DB.batch([
-        ...capture,
-        ...slice.map((r) =>
+      await env.DB.batch(
+        slice.map((r) =>
           env.DB.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).bind(
             book,
             resource,
@@ -274,17 +230,10 @@ export async function recordVerseMergeConflicts(
             now,
             bibleVersion,
             r.observedVersion,
+            runId,
           ),
         ),
-      ]);
-      const captured = prior ? (results[0] as D1Result<PriorVerseMergeConflict> | undefined)?.results : undefined;
-      if (prior && Array.isArray(captured)) {
-        const found = new Map(captured.map((p) => [conflictRefKey(p.chapter, p.verse), p]));
-        for (const r of slice) {
-          const k = conflictRefKey(r.chapter, r.verse);
-          if (!prior.has(k) && !repeated.has(k)) prior.set(k, found.get(k) ?? null);
-        }
-      }
+      );
     }
     return true;
   } catch (e) {
@@ -346,66 +295,39 @@ export async function confirmAdoptedConflicts(
   }
 }
 
-// Delete conflict rows for adoptions whose version-CAS write did NOT land
-// (see bookReimport.ts's applyVerseRows step 6b/7b): the row was written
-// speculatively BEFORE the CAS batch so a mid-batch failure can't erase
-// evidence of an overwrite that DID happen, but once the write is confirmed
-// lost (a human wrote the verse first), nothing was overwritten and the row
-// would misdirect a reviewer to a version that still holds their current
-// text. Best-effort: a delete failure just leaves a spurious flag (the
+// Undo the speculative conflict rows for adoptions whose version-CAS write did
+// NOT land (see bookReimport.ts's applyVerseRows step 6b/7b): the row was
+// written speculatively BEFORE the CAS batch so a mid-batch failure can't
+// erase evidence of an overwrite that DID happen, but once the write is
+// confirmed lost (a human wrote the verse first), nothing was overwritten and
+// the row would misdirect a reviewer to a version that still holds their
+// current text. Best-effort: a failure just leaves a spurious flag (the
 // documented failure-mode inversion this whole ordering exists to produce),
 // never a silently lost one.
 //
-// `now` MUST be the exact same timestamp passed to this run's
-// recordVerseMergeConflicts call (bookReimport.ts already computes one `now`
-// per applyVerseRows invocation and reuses it for both) — see
-// DELETE_LOST_ADOPTION_CONFLICT_SQL's doc comment for why this scoping
-// (on last_recorded_at, not detected_at) exists: it protects a row's prior
-// resolution (from an earlier night) from being wholesale deleted just
-// because THIS run's separate speculative write happened to lose its CAS
-// race, while still deleting a row that is provably this run's own
-// speculative write and nothing else.
-//
-// Issue #1132: with `prior` (the map recordVerseMergeConflicts filled in the
-// same run), a row that existed before tonight's upsert is RESTORED to that
-// state (RESTORE_LOST_ADOPTION_CONFLICT_SQL) instead of deleted, so an earlier
-// night's unreviewed alert survives a lost race and a resolved row does not
-// keep tonight's pointer. Only a row this run created (prior null) is deleted.
-//
-// `runStartedAt` (seconds) is when this logical run began, stable across
-// Workflow step retries. A captured row whose last_recorded_at is at or after
-// it was written earlier in THIS run, by an attempt that died after its upsert
-// and before its CAS, so the capture holds that attempt's speculative state,
-// not the real prior one. Restoring it would keep tonight's unlanded pointer,
-// so such a row (and a ref with no capture at all) gets the plain delete, the
-// pre-#1132 behavior. Defaults to `now`: a caller with no retries has no
-// earlier attempt to account for.
+// Issue #1137 (superseding #1132's in-memory capture): a row that existed
+// before this run's speculation is put back from the capture the upsert
+// stored on it, and a row the speculation created is deleted
+// (RESTORE_/DELETE_/SETTLE_SPECULATIVE_CONFLICTS_SQL, one batch). Only rows
+// whose speculation `runId` still owns are touched, and none whose verse has
+// since taken a reimport overwrite, so a retry restores the state from before
+// its dead first attempt, and an overlapping run's landed alert is never
+// rewound or deleted.
 export async function deleteLostAdoptionConflicts(
   env: Env,
   book: string,
   resource: string,
   refs: Array<{ chapter: number; verse: number }>,
-  now: number,
-  prior?: PriorVerseMergeConflicts,
-  runStartedAt: number = now,
+  runId: string,
 ): Promise<void> {
   if (refs.length === 0) return;
+  const chapters = refs.map((r) => r.chapter);
+  const scope = [
+    book, resource, Math.min(...chapters), Math.max(...chapters),
+    JSON.stringify(refs.map((r) => conflictRefKey(r.chapter, r.verse))), runId,
+  ];
   try {
-    for (let i = 0; i < refs.length; i += WRITE_BATCH) {
-      const slice = refs.slice(i, i + WRITE_BATCH);
-      await env.DB.batch(
-        slice.map((r) => {
-          const p = prior?.get(conflictRefKey(r.chapter, r.verse));
-          if (p && (p.last_recorded_at == null || p.last_recorded_at < runStartedAt)) {
-            return env.DB.prepare(RESTORE_LOST_ADOPTION_CONFLICT_SQL).bind(
-              book, resource, r.chapter, r.verse, now, p.recorded_generation,
-              p.action, p.reason, p.overwritten_version, p.alignment, p.detected_at, p.last_recorded_at,
-            );
-          }
-          return env.DB.prepare(DELETE_LOST_ADOPTION_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse, now);
-        }),
-      );
-    }
+    await env.DB.batch(settleSpeculationStmts(env, scope));
   } catch (e) {
     console.error("verseMergeConflicts: delete-lost-adoption failed", {
       book,
@@ -413,6 +335,57 @@ export async function deleteLostAdoptionConflicts(
       error: e instanceof Error ? e.message : String(e),
     });
   }
+}
+
+// Issue #1137: a nightly chunk step calls this as it starts, before any of its
+// own writes. A row in these chapters whose speculation `runId` still owns can
+// only have been left by an earlier attempt of the same run that died between
+// its speculative upsert and the end of its cleanup. Whatever that attempt's
+// CAS did is settled here exactly as step 7b would have: an overwrite that
+// never landed is put back (or its row deleted), one that landed stands. The
+// retry then measures from honest state, so a retry that no longer adopts the
+// verse leaves no pointer to an overwrite that never happened. One batch for
+// all `resources`. Best-effort, like the rest of this file.
+export async function rollBackDeadAttemptConflicts(
+  env: Env,
+  book: string,
+  resources: string[],
+  chapterFrom: number,
+  chapterTo: number,
+  runId: string,
+): Promise<void> {
+  if (resources.length === 0) return;
+  try {
+    await env.DB.batch(
+      resources.flatMap((resource) => settleSpeculationStmts(env, [book, resource, chapterFrom, chapterTo, null, runId])),
+    );
+  } catch (e) {
+    console.error("verseMergeConflicts: roll-back of a dead attempt's conflict rows failed", {
+      book,
+      resources,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+function settleSpeculationStmts(env: Env, scope: unknown[]): D1PreparedStatement[] {
+  return [RESTORE_SPECULATIVE_CONFLICTS_SQL, DELETE_SPECULATIVE_CONFLICTS_SQL, SETTLE_SPECULATIVE_CONFLICTS_SQL]
+    .map((sql) => env.DB.prepare(sql).bind(...scope));
+}
+
+// Issue #1137: the statement bookReimport.ts appends to a master-adoption CAS
+// batch, after its writes and their edit_log rows, so the refs whose overwrite
+// landed drop their speculative capture in the same transaction as the write
+// (SETTLE_LANDED_CONFLICTS_SQL). Null when there is nothing to settle.
+export function settleLandedConflictsStmt(
+  env: Env,
+  book: string,
+  resource: string,
+  refs: Array<{ chapter: number; verse: number }>,
+): D1PreparedStatement | null {
+  if (refs.length === 0) return null;
+  return env.DB.prepare(SETTLE_LANDED_CONFLICTS_SQL)
+    .bind(book, resource, JSON.stringify(refs.map((r) => conflictRefKey(r.chapter, r.verse))));
 }
 
 // Issue #789. Called from bookReimport.ts's applyVerseRows once per call,

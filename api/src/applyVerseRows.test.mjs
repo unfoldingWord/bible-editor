@@ -457,6 +457,13 @@ console.log("\n[#537: a content-bearing 'baseline' edit_log row recovers an ance
     "a clean adoption, not 'adopt_conflict' — the baseline row's own id must not be misread as a human edit landing after the export (D1 never actually moved)",
   );
   eq(conflict.reason, "master_only", "…for the right reason: only master moved since the (recovered) ancestor");
+  // Issue #1137: the CAS batch settles a landed overwrite's speculative capture
+  // in the same transaction, so no retry could roll this row back.
+  eq(
+    sqlite.prepare("SELECT prior_run, prior_json FROM verse_merge_conflicts WHERE book = ? AND chapter = 7 AND verse = 3").all(BOOK)[0],
+    { prior_run: null, prior_json: null },
+    "…and the landed overwrite's speculative capture is settled with the write",
+  );
 }
 
 console.log("\n[#537 fallout: a GENUINE human edit after export still blocks clean-adopt, alongside a recovered baseline ancestor]");
