@@ -451,7 +451,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
               size="small"
               autoFocus
               error={(!refParsed.ok && !awaitingNotesScope) || Boolean(notesBlock)}
-              inputProps={{ inputMode: allowVerses ? "text" : "numeric", pattern: "[0-9:-]*" }}
+              inputProps={{ inputMode: allowVerses ? "text" : "numeric", pattern: "[0-9:\\-]*" }}
               helperText={
                 awaitingNotesScope && ownNotesRun
                   ? `Your notes run for ${jobScopeLabel(ownNotesRun)} is ${ownNotesRun.state}. Type the verses for another run (e.g. ${chapter}:6-8), or ${chapter} for the whole chapter.`
