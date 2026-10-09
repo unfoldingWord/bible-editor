@@ -104,6 +104,9 @@ assert(verdict(row({ note: "person wrote this" }), [aiCreate()]).reason === "une
   assert(!verdict(row(), [aiFull(), ev("update", null, 5, { occurrence: 2 }), ev("update", null, 5, { occurrence: 1 })]).kept, "occurrence changed then changed back → not kept");
   // a person's move later overwritten by the Door43 reimport is not the person's position any more
   assert(!verdict(row(), [aiFull(), move(7), ev("update", "dcs_reimport", null, { chapter: 40, verse: 5, occurrence: 1 })]).kept, "person's move undone by reimport → not kept");
+  // the torn-row heal logs only chapter/verse matching the row's own ref_raw;
+  // a person's widened reference survives it
+  assert(verdict(row({ ref_raw: "40:5-6" }), [aiFull(), ev("update", null, 5, { ref_raw: "40:5-6", verse: 5 }), ev("update", "dcs_reimport", null, { chapter: 40, verse: 5 })]).kept, "widened reference survives a torn-row heal → kept");
   // the reimport create logs its reference as refRaw; a save that only
   // re-sends that same reference is no edit
   const reimportCreate = ev("create", "dcs_reimport", null, { ...AI_TEXT, refRaw: "40:5", chapter: 40, verse: 5, occurrence: 1 });

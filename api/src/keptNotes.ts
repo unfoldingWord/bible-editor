@@ -141,9 +141,16 @@ function applyPayload(state: State, raw: Record<string, unknown>): State {
     }
   }
   // The reimport logs chapter/verse but not the ref_raw it also wrote, so
-  // after such a write the replayed ref_raw is no longer known.
+  // after such a write the replayed ref_raw is no longer known, unless it
+  // still starts at the logged chapter:verse (the torn-row heal, #672, sets
+  // chapter/verse from the row's own ref_raw and leaves ref_raw alone).
   if (("chapter" in payload || "verse" in payload) && !("ref_raw" in payload)) {
-    next.ref_raw = undefined;
+    const m = next.ref_raw?.match(/^(\d+):(\d+)/);
+    const fits =
+      m != null &&
+      (!("chapter" in payload) || String(payload.chapter).trim() === String(Number(m[1]))) &&
+      next.verse === String(Number(m[2]));
+    if (!fits) next.ref_raw = undefined;
   }
   return next;
 }
