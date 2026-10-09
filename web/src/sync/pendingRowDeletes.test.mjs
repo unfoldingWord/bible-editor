@@ -725,4 +725,76 @@ const sig = (o) => `${o.kind}:${o.op.target.id}:${o.remote ? "remote" : "local"}
   unmark("q1");
 }
 
+// #1147 item 1: another tab's DELETE queued and committed entirely between
+// this tab's two outbox reads is in neither read, so the load cannot know to
+// wait for its outcome. A commit heard at any time, after the load landed
+// too, removes the row from the open chapter.
+{
+  const h = hub();
+  const a = tab(h);
+  const b = tab(h);
+  const applied = [];
+  const stop = mod.applyCommittedRowDeletes?.(a.outcomes, () => "ZEC", (k, id) => applied.push(`${k}:${id}`)) ?? (() => {});
+  b.result(del("tq", "q2", "in_flight"), "ok"); // another tab's commit, relayed
+  b.result(del("tq", "q1", "in_flight"), "locked"); // a refusal removes nothing
+  b.result(del("twl", "w9", "in_flight", "HAG"), "ok"); // another book
+  await settle();
+  check(applied.join() === "tq:q2", "#1147 item 1: another tab's commit heard after the load removes the row; a refusal or another book's does not");
+  a.result(del("twl", "w1", "in_flight"), "ok"); // this tab's own commit
+  check(applied.join() === "tq:q2,twl:w1", "#1147 item 1: a local commit removes it too");
+  stop();
+  b.result(del("tq", "q1", "in_flight"), "ok");
+  await settle();
+  check(applied.length === 2, "#1147 item 1: and the subscription is released");
+}
+
+// #1147 item 2: this tab's own DELETE drained and refused in another tab
+// left the outbox before the after-read, but its abandon message trails it.
+// The load waits the same grace as for another tab's op, so the refusal
+// (whose #1108 rollback restores the row) is not undone by this load.
+{
+  const r = run({ ops: [del("tq", "q1")] });
+  await r.ready();
+  r.ops = [];
+  const out = r.finish();
+  setTimeout(() => r.on?.abandoned(del("tq", "q1")), 20); // same op id as the before-read
+  check(ids((await out).tq).join() === "q1,q2", "#1147 item 2: an own DELETE refused just after the after-read shows its row");
+}
+{
+  // ...and a late commit of it still hides the row.
+  const r = run({ ops: [del("tq", "q1")] });
+  await r.ready();
+  r.ops = [];
+  const out = r.finish();
+  setTimeout(() => r.on?.committed(del("tq", "q1")), 20);
+  check(ids((await out).tq).join() === "q2", "#1147 item 2: an own DELETE committed just after the after-read stays hidden");
+}
+
+// #1147 item 3: an older click's put resolving after a newer click's must
+// not become the click's op.
+{
+  const c1 = mod.markOwnRowDelete?.("tq", "ZEC", "q1");
+  const track = mod.trackOwnRowDeletes?.() ?? (() => []);
+  const c2 = mod.markOwnRowDelete?.("tq", "ZEC", "q1");
+  mod.recordOwnRowDeleteClickOp?.({ ...del("tq", "q1"), id: "op3new" }, c2);
+  mod.recordOwnRowDeleteClickOp?.({ ...del("tq", "q1"), id: "op3old" }, c1); // late put
+  const [c] = track();
+  check(c?.opId === "op3new", "#1147 item 3: a late older put does not replace the newer click's op");
+  check(c?.earlier.has("op3old") === true, "#1147 item 3: the older op counts as one of the row's earlier ops");
+  check(mod.isOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "op3old" }) === true, "#1147 item 3: and is still own");
+  unmark("q1");
+}
+{
+  // ...while a click whose mark was emptied during its put (#1126 item 6)
+  // still records its op as the click's.
+  const c1 = mod.markOwnRowDelete?.("tq", "ZEC", "q1");
+  mod.recordOwnRowDeleteClickOp?.({ ...del("tq", "q1"), id: "op3a" }, c1);
+  const track = mod.trackOwnRowDeletes?.() ?? (() => []);
+  const c2 = mod.markOwnRowDelete?.("tq", "ZEC", "q1");
+  mod.forgetOwnRowDeleteOp?.({ ...del("tq", "q1"), id: "op3a" }); // the mark goes
+  mod.recordOwnRowDeleteClickOp?.({ ...del("tq", "q1"), id: "op3b" }, c2);
+  check(track()[0]?.opId === "op3b", "#1147 item 3: a recreated mark takes the click's op");
+  unmark("q1");
+}
+
 console.log(`pendingRowDeletes: ${passed} passed`);
