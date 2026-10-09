@@ -53,6 +53,7 @@ const SQLITE_FILES = new Set([
   "src/reimportUnstampedBranches.test.mjs",
   "src/lockAlertRefresh.test.mjs",
   "src/saveRoundTrips.test.mjs",
+  "src/pipelineVerseRange.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([

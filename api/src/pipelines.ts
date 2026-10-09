@@ -105,12 +105,20 @@ const ChainStep = z
   })
   .strict();
 
-const StartBody = z
+// Exported for pipelineVerseRange.test.mjs.
+export const StartBody = z
   .object({
     pipelineType: z.enum(PIPELINE_TYPES),
     book: z.string().min(1).max(8),
     startChapter: z.number().int().positive(),
     endChapter: z.number().int().positive().optional(),
+    // Verse-range notes run (issue #1160): rerun part of ONE chapter. Top-level
+    // like the bot's /start (bp-assistant src/api/pipeline.js — its options
+    // schema is strict and rejects them). Persisted in options_json as
+    // `verseRange` (see verseRangeFromOptionsJson) and lifted back out at
+    // dispatch, so the import knows not to touch verses outside the range.
+    verseStart: z.number().int().min(1).max(200).optional(),
+    verseEnd: z.number().int().min(1).max(200).optional(),
     sessionKey: z.string().min(1).max(120).regex(/^[A-Za-z0-9_\-/]+$/),
     options: PipelineOptions.optional(),
     // Optional second pipeline to fire on the parent's done-transition. Used
@@ -128,7 +136,44 @@ const StartBody = z
   })
   .refine((b) => !(b.followUpOptions && b.followUpChain), {
     message: "follow_up_options_and_chain_mutually_exclusive",
-  });
+  })
+  .refine((b) => (b.verseStart === undefined) === (b.verseEnd === undefined), {
+    message: "verse_start_and_end_go_together",
+  })
+  .refine(
+    (b) =>
+      b.verseStart === undefined ||
+      (b.pipelineType === "notes" &&
+        (b.endChapter ?? b.startChapter) === b.startChapter &&
+        b.verseEnd !== undefined &&
+        b.verseEnd >= b.verseStart &&
+        !b.followUpOptions &&
+        !b.followUpChain),
+    { message: "verse_range_is_one_chapter_notes_only" },
+  );
+
+// A verse-range job's range, as stored in pipeline_jobs.options_json (issue
+// #1160). null = a whole-chapter run, including when options_json is absent or
+// not an object. Every reader of a job's range goes through here: dispatch
+// (top-level verseStart/verseEnd for the bot), resume (stripped), and the
+// import (ImportContext.verseRange — without it the #1151 chapter-wide sweep
+// would retire AI notes outside the range).
+export function verseRangeFromOptionsJson(
+  optionsJson: string | null,
+): { start: number; end: number } | null {
+  if (!optionsJson) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(optionsJson);
+  } catch {
+    return null;
+  }
+  const vr = (parsed as { verseRange?: { start?: unknown; end?: unknown } } | null)?.verseRange;
+  if (!vr || typeof vr !== "object") return null;
+  const { start, end } = vr;
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return null;
+  return { start: start as number, end: end as number };
+}
 
 interface StartResponse {
   jobId: string;
@@ -348,6 +393,10 @@ export function resumeOptionsFromJson(
   }
   const { fresh: _fresh, introHints: _introHints, ...rest } = parsed as Record<string, unknown>;
   delete rest.kept;
+  // `verseRange` (issue #1160) is ours, not a bot option: the bot keeps the
+  // range in its own jobId/checkpoint scope, and its strict options schema
+  // would 400 the resume.
+  delete rest.verseRange;
   return rest;
 }
 
@@ -553,6 +602,14 @@ export async function dispatchNext(env: Env): Promise<void> {
       /* corrupt snapshot — dispatch without options rather than wedge */
     }
   }
+  // Verse-range notes run (issue #1160): the range is stored in options_json
+  // but the bot takes it as top-level verseStart/verseEnd, and its options
+  // schema is strict, so lift it out here.
+  const verseRange = verseRangeFromOptionsJson(job.options_json);
+  if (options && typeof options === "object" && "verseRange" in options) {
+    const { verseRange: _vr, ...rest } = options as Record<string, unknown>;
+    options = Object.keys(rest).length > 0 ? rest : undefined;
+  }
 
   // options.kept (issue #1152): the notes the AI run must leave in place. Built
   // HERE, at dispatch time, and never stored in options_json, so a run that sat
@@ -594,6 +651,7 @@ export async function dispatchNext(env: Env): Promise<void> {
     book: job.book,
     startChapter: job.start_chapter,
     endChapter: job.end_chapter,
+    ...(verseRange ? { verseStart: verseRange.start, verseEnd: verseRange.end } : {}),
     username,
     sessionKey: job.session_key,
     ...(options ? { options } : {}),
@@ -1159,6 +1217,9 @@ export async function pollPipelineJob(
           book: job.book,
           startChapter: job.start_chapter,
           endChapter: job.end_chapter,
+          // #1160: a verse-range run must never retire notes outside its
+          // range — without this the #1151 chapter-wide sweep would.
+          verseRange: verseRangeFromOptionsJson(job.options_json),
         },
         data.output,
       );
@@ -1814,15 +1875,23 @@ pipelines.post("/start", requireEditor, async (c) => {
   // Wider type for mergedOptions: hints is a server-added field, not part of
   // the client-validated PipelineOptions schema (clients never send it).
   let mergedOptions: Record<string, unknown> | undefined = parsed.data.options;
+  // Verse-range run (issue #1160; the schema has already checked it is one
+  // chapter, notes only). Hints outside the range are left for a later run:
+  // the bot writes only inside the range, and the import drops anything else.
+  const verseRange =
+    parsed.data.verseStart !== undefined && parsed.data.verseEnd !== undefined
+      ? { start: parsed.data.verseStart, end: parsed.data.verseEnd }
+      : null;
   if (parsed.data.pipelineType === "notes") {
     const hintRows = await c.env.DB.prepare(
       `SELECT id, verse, quote, support_reference, note
          FROM tn_rows
         WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
+          AND verse BETWEEN ?4 AND ?5
           AND hint = 1 AND deleted_at IS NULL
         ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
     )
-      .bind(book, startChapter, endChapter)
+      .bind(book, startChapter, endChapter, verseRange?.start ?? 0, verseRange?.end ?? 1_000_000)
       .all<{
         id: string;
         verse: number;
@@ -1903,6 +1972,7 @@ pipelines.post("/start", requireEditor, async (c) => {
 
   // Enqueue. The job goes to the bot only when dispatchNext claims the slot.
   const jobId = crypto.randomUUID();
+  if (verseRange) mergedOptions = { ...(mergedOptions ?? {}), verseRange };
   const optionsJson = mergedOptions ? JSON.stringify(mergedOptions) : null;
   const followUpJson = parsed.data.followUpOptions
     ? JSON.stringify(parsed.data.followUpOptions)
