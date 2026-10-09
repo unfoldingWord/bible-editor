@@ -85,6 +85,44 @@ assert(verdict(row(), []).reason === "fallback", "no log at all but updated_by s
 // pruned update: AI create survives, a person's later update aged out of the log
 assert(verdict(row({ note: "person wrote this" }), [aiCreate()]).reason === "unexplained", "live content the log cannot explain → kept");
 
+// position and occurrence count as edits (#1180). Real AI creates carry the
+// full position: chapter, verse, ref_raw and occurrence.
+{
+  const aiFull = () => ev("create", "ai_pipeline", 7, { ...AI_TEXT, book: "EZK", chapter: 40, verse: 5, ref_raw: "40:5", occurrence: 1 });
+  const move = (v) => ev("update", null, 5, { ref_raw: `40:${v}`, verse: v, sort_order: 500 });
+  // (a) a person moves an AI note to another verse
+  assert(verdict(row({ verse: 7, ref_raw: "40:7" }), [aiFull(), move(7)]).reason === "edited", "person moves an AI note to another verse → kept (#1180 a)");
+  // a person widens the reference to a range on the same leading verse
+  assert(verdict(row({ ref_raw: "40:5-6" }), [aiFull(), ev("update", null, 5, { ref_raw: "40:5-6", verse: 5, sort_order: 500 })]).reason === "edited", "person widens the ref to a range → kept");
+  // (b) a person changes only the occurrence
+  assert(verdict(row(), [aiFull(), ev("update", null, 5, { occurrence: 2 })]).reason === "edited", "person changes only occurrence → kept (#1180 b)");
+  // (c) the AI's own position writes are the baseline, not an edit
+  assert(!verdict(row({ verse: 7, ref_raw: "40:7" }), [ev("create", "ai_pipeline", 7, { ...AI_TEXT, chapter: 40, verse: 7, ref_raw: "40:7", occurrence: 2 })]).kept, "AI create that sets verse/occurrence itself → not kept (#1180 c)");
+  assert(!verdict(row({ verse: 7, ref_raw: "40:7" }), [aiFull(), move(6), ev("update", "ai_pipeline", 7, { ref_raw: "40:7", verse: 7, occurrence: 1 })]).kept, "AI rewrite of position after a person's move → not kept (#1180 c)");
+  // (d) moved, then moved back to where the AI put it
+  assert(!verdict(row(), [aiFull(), move(7), move(5)]).kept, "moved then moved back to the AI position → not kept (#1180 d)");
+  assert(!verdict(row(), [aiFull(), ev("update", null, 5, { occurrence: 2 }), ev("update", null, 5, { occurrence: 1 })]).kept, "occurrence changed then changed back → not kept");
+  // a person's move later overwritten by the Door43 reimport is not the person's position any more
+  assert(!verdict(row(), [aiFull(), move(7), ev("update", "dcs_reimport", null, { chapter: 40, verse: 5, occurrence: 1 })]).kept, "person's move undone by reimport → not kept");
+  // the torn-row heal logs only chapter/verse matching the row's own ref_raw;
+  // a person's widened reference survives it
+  assert(verdict(row({ ref_raw: "40:5-6" }), [aiFull(), ev("update", null, 5, { ref_raw: "40:5-6", verse: 5 }), ev("update", "dcs_reimport", null, { chapter: 40, verse: 5 })]).kept, "widened reference survives a torn-row heal → kept");
+  // the reimport create logs its reference as refRaw; a save that only
+  // re-sends that same reference is no edit
+  const reimportCreate = ev("create", "dcs_reimport", null, { ...AI_TEXT, refRaw: "40:5", chapter: 40, verse: 5, occurrence: 1 });
+  assert(!verdict(row(), [reimportCreate, ev("update", null, 5, { ref_raw: "40:5", verse: 5, sort_order: 500 })]).kept, "save re-sending a position the baseline never logged → not kept");
+  // ...but its refRaw is the baseline, so a person widening the reference is an edit
+  assert(verdict(row(), [reimportCreate, ev("update", null, 5, { ref_raw: "40:5-6", verse: 5, sort_order: 500 })]).kept, "person widens the reference of a reimported note → kept");
+  assert(!verdict(row(), [aiFull(), ev("update", null, 5, { ref_raw: "40:5", verse: 5, sort_order: 900 })]).kept, "reorder that re-sends the same position → not kept");
+  // occurrence null vs number: an AI create with occurrence 0, a person sets 1
+  assert(verdict(row(), [ev("create", "ai_pipeline", 7, { ...AI_TEXT, chapter: 40, verse: 5, ref_raw: "40:5", occurrence: 0 }), ev("update", null, 5, { occurrence: 1 })]).reason === "edited", "occurrence 0 → 1 by a person → kept");
+  // live position drift with no logged human change is not an edit: the
+  // reimport writes ref_raw/verse without always logging them
+  assert(!verdict(row({ verse: 9, ref_raw: "40:9" }), [aiFull()]).kept, "unlogged position drift alone → not kept");
+  // a repair batch that moves a note is still not a person
+  assert(!verdict(row({ verse: 7, ref_raw: "40:7" }), [aiFull(), { ...ev("update", "quote_repair", 2, { ref_raw: "40:7", verse: 7 }) }]).kept, "repair-source move → not kept");
+}
+
 // toKeptOption
 assert(toKeptOption(row({ ref_raw: "40:12-14" })).ref === "40:12-14", "forward same-chapter range sent as is");
 assert(toKeptOption(row({ ref_raw: "40:2,4", chapter: 40, verse: 2 })).ref === "40:2", "comma-list ref sent as its leading verse");

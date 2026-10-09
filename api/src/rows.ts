@@ -833,8 +833,9 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   }
 
   // #1165: the tn carve-out above covers edits, not moves INTO a verse-range
-  // run's span. A reference-only move does not make the note kept, so the
-  // range import would sweep it (see rangeLockCoveringVerse). Read only when
+  // run's span. The move makes the note kept (#1180), but not on the kept list
+  // the bot already got, so it could write a duplicate (see
+  // rangeLockCoveringVerse). Read only when
   // the PATCH actually changes the verse, so ordinary saves keep their two
   // round trips.
   if (kind === "tn" && typeof p.verse === "number" && p.verse !== current.verse) {
