@@ -19,7 +19,8 @@ import {
   dispatchNext,
   pollPipelineJob,
   resumeOptionsFromJson,
-  verseRangeFromOptionsJson,
+  storedVerseRange,
+  findSameScopeJob,
 } from "./pipelines.ts";
 
 let failed = 0;
@@ -44,11 +45,38 @@ console.log("\n[StartBody]");
   assert(!ok({ ...base, verseStart: 10, verseEnd: 15, followUpChain: [{ pipelineType: "tqs" }] }), "verse range with a follow-up chain → rejected");
 }
 
-console.log("\n[verseRangeFromOptionsJson]");
-assert(JSON.stringify(verseRangeFromOptionsJson(JSON.stringify({ verseRange: { start: 10, end: 15 } }))) === '{"start":10,"end":15}', "reads the stored range");
-assert(verseRangeFromOptionsJson(null) === null, "no options → whole chapter");
-assert(verseRangeFromOptionsJson(JSON.stringify({ noIntro: true })) === null, "options without a range → whole chapter");
-assert(verseRangeFromOptionsJson("{not json") === null, "unparseable → null");
+console.log("\n[storedVerseRange — fails closed]");
+{
+  const s = (v) => storedVerseRange(v === undefined ? null : typeof v === "string" ? v : JSON.stringify(v));
+  const r = s({ verseRange: { start: 10, end: 15 } });
+  assert(r.ok && r.range.start === 10 && r.range.end === 15, "reads the stored range");
+  assert(s(undefined).ok && s(undefined).range === null, "no options → whole chapter");
+  assert(s({ noIntro: true }).ok && s({ noIntro: true }).range === null, "options without a range → whole chapter");
+  assert(!s("{not json").ok, "unparseable options_json → error, NOT whole chapter");
+  assert(!s({ verseRange: { start: 15, end: 10 } }).ok, "out-of-order range → error");
+  assert(!s({ verseRange: { start: 0, end: 5 } }).ok, "start below 1 → error");
+  assert(!s({ verseRange: { start: 10, end: 201 } }).ok, "end above 200 → error");
+  assert(!s({ verseRange: { start: "10", end: 15 } }).ok, "non-integer → error");
+  assert(!s({ verseRange: null }).ok, "verseRange key present but null → error");
+  assert(!s({ verseRange: [10, 15] }).ok, "verseRange key present but wrong shape → error");
+  assert(!s("[1,2]").ok, "options_json not an object → error");
+}
+
+console.log("\n[duplicate check is range-aware]");
+{
+  const row = (job_id, options_json) => ({ job_id, options_json });
+  const rows = [
+    row("whole", null),
+    row("r10", JSON.stringify({ verseRange: { start: 10, end: 15 } })),
+    row("bad", JSON.stringify({ verseRange: { start: 9, end: 1 } })),
+  ];
+  assert(findSameScopeJob(rows, { start: 10, end: 15 })?.job_id === "r10", "same range → that job");
+  assert(findSameScopeJob(rows, null)?.job_id === "whole", "whole chapter → the whole-chapter job");
+  assert(findSameScopeJob(rows, { start: 1, end: 5 }) === undefined, "different range → no duplicate (queues)");
+  assert(findSameScopeJob([rows[1]], null) === undefined, "whole chapter while only 10-15 is queued → no duplicate (queues)");
+  assert(findSameScopeJob([rows[0]], { start: 10, end: 15 }) === undefined, "range while only the whole chapter is queued → no duplicate (queues)");
+  assert(findSameScopeJob([rows[2]], { start: 9, end: 1 }) === undefined, "a stored invalid range never matches");
+}
 
 console.log("\n[resume]");
 {
@@ -59,6 +87,7 @@ console.log("\n[resume]");
 // ── dispatchNext: fake D1, same shape as keptDispatch.test.mjs ──
 const KEPT_IN_RANGE = { id: "kin1", book: "JER", chapter: 36, verse: 12, ref_raw: "36:12", quote: "q", note: "n", support_reference: "rc://*/ta/man/translate/figs-metaphor", preserve: 1 };
 const KEPT_OUTSIDE = { ...KEPT_IN_RANGE, id: "kout", verse: 3, ref_raw: "36:3" };
+const failCalls = [];
 function fakeDispatchEnv({ optionsJson, flag = "true" }) {
   const job = { job_id: "job-r", user_id: 1, pipeline_type: "notes", book: "JER", start_chapter: 36, end_chapter: 36, session_key: "s", options_json: optionsJson };
   return {
@@ -66,6 +95,9 @@ function fakeDispatchEnv({ optionsJson, flag = "true" }) {
     KEPT_NOTES_ENABLED: flag,
     DB: {
       prepare(sql) {
+        if (/SET state = 'failed', error_kind = \?2, error_message = \?3/.test(sql)) {
+          return { bind: (...a) => ({ run: async () => { failCalls.push({ kind: a[1], message: a[2] }); return { meta: { changes: 1 } }; } }) };
+        }
         if (/SELECT dcs_username FROM users/.test(sql)) return { bind: () => ({ first: async () => ({ dcs_username: "translator" }) }) };
         if (/SELECT DISTINCT book FROM pipeline_jobs WHERE state = 'queued'/.test(sql)) return { all: async () => ({ results: [] }) };
         if (/SET state = 'dispatching', updated_at = unixepoch\(\)/.test(sql)) return { bind: () => ({ run: async () => ({ meta: { changes: 1 } }) }) };
@@ -100,6 +132,15 @@ console.log("\n[dispatchNext]");
 {
   const body = await dispatch({ optionsJson: JSON.stringify({ verseRange: { start: 10, end: 15 } }), flag: "false" });
   assert(body.verseStart === 10 && body.verseEnd === 15 && body.options === undefined, "range-only options_json → no options key at all");
+}
+for (const [label, optionsJson] of [
+  ["out-of-order stored range", JSON.stringify({ verseRange: { start: 15, end: 10 } })],
+  ["unparseable options_json", "{not json"],
+]) {
+  failCalls.length = 0;
+  const body = await dispatch({ optionsJson });
+  assert(body === null, `${label} → nothing sent to the bot (not dispatched as a whole chapter)`);
+  assert(failCalls.length === 1 && /verse_range_invalid/.test(failCalls[0].message), `${label} → job failed with verse_range_invalid`);
 }
 {
   const body = await dispatch({ optionsJson: JSON.stringify({ noIntro: true }), flag: "false" });
@@ -167,14 +208,16 @@ const TSV =
   "n012\t36:12\t\t\t\t\tNew AI note for verse 12.\n" +
   "m020\t36:20\t\t\t\t\tMaster's copy of a verse-20 note.\n";
 
-async function poll(optionsJson) {
+async function poll(optionsJson, tsv = TSV) {
   const t = freshDb(optionsJson);
   const ids = {
     v3Ai: t.addTn(3),
     v5Ai: t.addTn(5),
+    v9Ai: t.addTn(9),
     v12Ai: t.addTn(12),
     v12Preserve: t.addTn(12, { preserve: 1 }),
     v14Ai: t.addTn(14),
+    v16Ai: t.addTn(16),
     v20Ai: t.addTn(20),
   };
   const job = {
@@ -192,7 +235,7 @@ async function poll(optionsJson) {
         output: [{ type: "tsv", repo: "unfoldingWord/en_tn", rawUrl: "https://raw.example/en_tn_JER.tsv" }],
       }), { status: 200 });
     }
-    if (String(url).includes("raw.example")) return new Response(TSV, { status: 200 });
+    if (String(url).includes("raw.example")) return new Response(tsv, { status: 200 });
     throw new Error(`unexpected fetch ${url}`);
   };
   let result;
@@ -213,6 +256,31 @@ console.log("\n[pollPipelineJob → import, verse-range job 10-15]");
   assert(t.live(ids.v12Preserve), "verse 12 — preserved note stays");
   assert(t.liveAt(12).some((r) => r.id === "n012"), "verse 12 — the new AI note landed");
   assert(t.live(ids.v14Ai), "verse 14 (inside, no new note) — kept: the bot's range push replaces only verses it wrote");
+}
+
+console.log("\n[bridged notes crossing the range edges, job 10-15]");
+{
+  const BRIDGES =
+    "ID\tReference\tTags\tSupportReference\tQuote\tOccurrence\tNote\n" +
+    "b009\t36:9-11\t\t\t\t\tBridge across the start of the range.\n" +
+    "b014\t36:14-16\t\t\t\t\tBridge across the end of the range.\n" +
+    "m017\t36:17-18\t\t\t\t\tMaster's bridge wholly after the range.\n";
+  const { t, ids, result } = await poll(JSON.stringify({ verseRange: { start: 10, end: 15 } }), BRIDGES);
+  assert(result.kind === "ok" && result.state === "done", `poll finished done (got ${result.kind}/${result.state})`);
+  assert(t.liveAt(9).some((r) => r.id === "b009"), "36:9-11 covers verses 10-11 → imported (anchored at verse 9)");
+  assert(t.live(ids.v9Ai), "…but verse 9's own old AI note is NOT swept (verse 9 is outside the range)");
+  assert(t.liveAt(14).some((r) => r.id === "b014"), "36:14-16 starts inside → imported");
+  assert(!t.live(ids.v14Ai), "…and verse 14's old AI note is retired (inside the range)");
+  assert(t.live(ids.v16Ai), "verse 16's old AI note is NOT swept (outside the range)");
+  assert(!t.liveAt(17).some((r) => r.id === "m017"), "a bridge wholly outside the range is not imported");
+}
+
+console.log("\n[a stored range that fails validation never imports as a whole chapter]");
+{
+  const { t, ids, result } = await poll(JSON.stringify({ verseRange: { start: 15, end: 10 } }));
+  assert(result.state !== "done", `job does not finish as done (got ${result.state})`);
+  assert(t.live(ids.v3Ai) && t.live(ids.v5Ai) && t.live(ids.v12Ai) && t.live(ids.v20Ai), "nothing swept anywhere in the chapter");
+  assert(!t.liveAt(12).some((r) => r.id === "n012"), "nothing imported");
 }
 
 console.log("\n[control: the same output on a whole-chapter job]");

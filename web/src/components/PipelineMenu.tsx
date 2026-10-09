@@ -200,7 +200,9 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
   const genNothingSelected = !genOpts.ult && !genOpts.ust;
   // Verse ranges ("36:10-15") are for the notes pipeline only (issue #1160):
   // the bot can rerun part of a chapter's notes, not part of a ULT/UST or tq run.
-  const allowVerses = confirm?.type === "notes";
+  // A run with a follow-up chain can't take one (the server refuses it), so the
+  // field shows the same inline error and Start stays disabled.
+  const allowVerses = confirm?.type === "notes" && !confirm.followUpChain;
   const refParsed = useMemo(
     () => parsePipelineRange(refInput, book, allowVerses),
     [refInput, book, allowVerses],

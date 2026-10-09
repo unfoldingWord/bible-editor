@@ -67,7 +67,7 @@ export interface ImportContext {
   endChapter: number;
   // Set only for a notes run limited to part of one chapter (#1160). The
   // range is stored in pipeline_jobs.options_json and pollPipelineJob reads it
-  // back with verseRangeFromOptionsJson. When absent, a notes job is treated
+  // back with storedVerseRange. When absent, a notes job is treated
   // as a whole-chapter run and its TN sweep covers every verse of the chapters
   // it proposed for (#1151). When present, staging drops every TSV row
   // outside the range (the bot's output file holds the whole book, and the
@@ -411,10 +411,16 @@ async function parseOutputEntry(
       if (!refRaw) continue;
       const [ch, vs] = refParts(refRaw);
       if (ch < ctx.startChapter || ch > ctx.endChapter) continue;
-      // #1160: a verse-range run touches only its own verses. Keyed on the
-      // leading verse, the same (chapter, verse) the sweep and apply use;
-      // the intro (verse 0) is outside every range.
-      if (ctx.verseRange && (vs < ctx.verseRange.start || vs > ctx.verseRange.end)) continue;
+      // #1160: a verse-range run touches only its own verses. A row is kept
+      // when any verse it covers is in the range, so a bridge such as 36:9-11
+      // in a 10-15 run still lands (it is staged at its leading verse, 9; the
+      // sweep is limited to in-range verses separately, in deleteUnkeptTns).
+      // The intro (verse 0) is outside every range.
+      if (ctx.verseRange) {
+        const { start, end } = ctx.verseRange;
+        const covered = vs > 0 ? coveredVersesFromRef(refRaw, vs) : [];
+        if (!covered.some((v) => v >= start && v <= end)) continue;
+      }
       const built = cls.kind === "tn"
         ? tnPayload(ctx.book, refRaw, row, uhbWordsByVerse)
         : tqPayload(ctx.book, refRaw, row);
@@ -1476,7 +1482,15 @@ export async function deleteUnkeptTns(
       ...(liveVerses.results ?? []).filter((p) => chapters.has(p.chapter)),
     ];
   }
-  const pairs = tnSweepScope(scopeInput, resolved.results ?? []);
+  // #1160: a verse-range run never sweeps a verse outside its range, even when
+  // it proposed a bridged note anchored there (36:9-11 in a 10-15 run is
+  // staged at verse 9). Content dedup still stops an exact re-insert of an
+  // existing verse-9 note; a reworded bridge can sit beside the old one, which
+  // is the safe side.
+  const range = job.verseRange;
+  const pairs = tnSweepScope(scopeInput, resolved.results ?? []).filter(
+    (p) => !range || (p.verse >= range.start && p.verse <= range.end),
+  );
   if (pairs.length === 0) return 0;
 
   // D1 caps bound parameters at 100 per statement. This query already binds 3
