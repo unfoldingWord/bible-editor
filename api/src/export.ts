@@ -2296,11 +2296,19 @@ export interface DcsCommitResult {
 }
 
 // Encode a UTF-8 string as base64 (the Gitea contents API expects base64).
-function utf8ToBase64(s: string): string {
+// Works in fixed byte chunks (#1182): building the binary string one byte at
+// a time left ~6M one-character strings live for JER UST (~200 MB in Node,
+// past the Worker's 128 MB). The chunk is a multiple of 3 bytes, so each
+// chunk's base64 has no padding and the joined result is byte-identical to
+// btoa over the whole input.
+const BASE64_CHUNK_BYTES = 3 * 8192;
+export function utf8ToBase64(s: string): string {
   const bytes = new TextEncoder().encode(s);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.length; i += BASE64_CHUNK_BYTES) {
+    parts.push(btoa(String.fromCharCode(...bytes.subarray(i, i + BASE64_CHUNK_BYTES))));
+  }
+  return parts.join("");
 }
 
 // Force the export branch to point at the repo's current master HEAD, creating
