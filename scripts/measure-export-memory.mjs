@@ -38,6 +38,7 @@ function oldUtf8ToBase64(s) {
 // instead of short-circuiting on equality.
 function masterVariant(text) {
   const i = text.indexOf(" the ", text.length >> 1);
+  if (i === -1) throw new Error(`masterVariant: no " the " in the second half of the book to edit`);
   return text.slice(0, i) + " a " + text.slice(i + 5);
 }
 

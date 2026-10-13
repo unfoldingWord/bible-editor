@@ -56,34 +56,43 @@ for (const n of [0x2000 * 3, 0x8000]) {
   same("x".repeat(n - 2) + "בּ" + "y", `Hebrew straddling byte ${n}`);
 }
 
+// Large inputs: compare against Buffer, not the old encoder. The old encoder
+// needs ~200 MB of heap on a book this size, which the test run should not pay.
+function sameAsBuffer(s, label) {
+  assert(utf8ToBase64(s) === Buffer.from(s, "utf8").toString("base64"), `${label}: matches Buffer`);
+}
+
 // ~6 MB of mixed Hebrew + ASCII + emoji, the size of JER UST.
 const unit = "\\zaln-s |x-strong=\"H1697\" x-content=\"דְּבַר\"\\*\\w word|x-occurrence=\"1\"\\w*\\zaln-e\\* 😀\n";
-const big = unit.repeat(Math.ceil(6_000_000 / Buffer.byteLength(unit)));
-same(big, `synthetic ${(Buffer.byteLength(big) / 1e6).toFixed(1)} MB book`);
+const repeats = Math.ceil(6_000_000 / Buffer.byteLength(unit));
+const big = unit.repeat(repeats);
+sameAsBuffer(big, `synthetic ${(Buffer.byteLength(big) / 1e6).toFixed(1)} MB book`);
 
 // Memory: encode the synthetic book in a child process with a capped old
-// space. The new encoder needs ~45 MB in Node; the old one needs ~200 MB
-// (scripts/measure-export-memory.mjs). The cap sits between, with room.
+// space. The new encoder needs ~28 MB in Node on JER UST, including the
+// ~21 MB baseline of loading the file and export.ts
+// (scripts/measure-export-memory.mjs, which also shows the old encoder
+// needing ~206 MB). The cap is the Worker's 128 MB, so the headroom is wide.
+// The child prints the encoded length so a crash, a missing export, or a
+// wrong result each fail with a visible reason.
 console.log("utf8ToBase64 memory");
-const CAP_MB = 96;
+const CAP_MB = 128;
 const exportUrl = new URL("./export.ts", import.meta.url).href;
-function encodeUnderCap(which) {
-  const code = `
-    import { utf8ToBase64 } from ${JSON.stringify(exportUrl)};
-    ${oldUtf8ToBase64.toString()}
-    const unit = ${JSON.stringify(unit)};
-    const big = unit.repeat(${Math.ceil(6_000_000 / Buffer.byteLength(unit))});
-    const out = ${which === "new" ? "utf8ToBase64" : "oldUtf8ToBase64"}(big);
-    if (out.length < 8_000_000) process.exit(3);
-  `;
-  const r = spawnSync(process.execPath, [
-    `--max-old-space-size=${CAP_MB}`, "--max-semi-space-size=1",
-    "--experimental-strip-types", "--no-warnings", "--input-type=module", "-e", code,
-  ], { encoding: "utf8" });
-  return r.status;
-}
-assert(encodeUnderCap("new") === 0, `new encoder encodes a 6 MB book within a ${CAP_MB} MB heap`);
-assert(encodeUnderCap("old") !== 0, `old encoder does not (the cap discriminates)`);
+const expectedLength = Buffer.from(big, "utf8").toString("base64").length;
+const childCode = `
+  import { utf8ToBase64 } from ${JSON.stringify(exportUrl)};
+  const big = ${JSON.stringify(unit)}.repeat(${repeats});
+  console.log("b64len=" + utf8ToBase64(big).length);
+`;
+const child = spawnSync(process.execPath, [
+  `--max-old-space-size=${CAP_MB}`, "--max-semi-space-size=1",
+  "--experimental-strip-types", "--no-warnings", "--input-type=module", "-e", childCode,
+], { encoding: "utf8" });
+if (child.status !== 0) console.error(child.stderr.slice(-2000));
+assert(
+  child.status === 0 && child.stdout.trim() === `b64len=${expectedLength}`,
+  `new encoder encodes a 6 MB book within a ${CAP_MB} MB heap (status ${child.status}, ${child.stdout.trim() || "no output"})`,
+);
 
 // Real data, when present (gitignored; not in CI):
 //   curl -s -o ../scripts/out/24-JER-ust.usfm https://git.door43.org/unfoldingWord/en_ust/raw/branch/master/24-JER.usfm
@@ -91,10 +100,11 @@ const jerPath = fileURLToPath(new URL("../../scripts/out/24-JER-ust.usfm", impor
 if (existsSync(jerPath)) {
   console.log("JER UST (real data)");
   const jer = readFileSync(jerPath, "utf8");
-  same(jer, "JER UST");
+  sameAsBuffer(jer, "JER UST");
   // The shrink guard is not changed by #1182; pin its verdict on the real
   // book so a later memory change to it cannot silently flip the result.
   const i = jer.indexOf(" the ", jer.length >> 1);
+  assert(i !== -1, `JER UST has " the " in its second half to edit`);
   const master = jer.slice(0, i) + " a " + jer.slice(i + 5);
   const self = usfmAlignmentShrinkRefused(jer, jer);
   assert(self.refused === false && self.offenders.length === 0, "guard: JER UST vs itself is not refused");
