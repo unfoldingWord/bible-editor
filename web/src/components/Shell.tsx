@@ -78,6 +78,8 @@ import { resolveSpanToSource } from "../lib/twlResolve";
 import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
+import { navHistory } from "../lib/navHistory";
+import { BackButton } from "./BackButton";
 import { createUhbStrongsCache } from "../lib/uhbStrongs";
 import { isTnMoveBlocked, isTnVerseLocked, planRefusedTnMoveRollback, tnLockLabel, tnLockingJobs } from "../lib/tnRangeLock";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
@@ -2832,6 +2834,77 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [runWithDirtyGate, chapter, book, onNavigate, requestJumpTab],
   );
 
+  // Back history (lib/navHistory.ts). Report every change of position — verse,
+  // chapter, book, or the note/question/word link in focus — so the Back button
+  // can return to it. The history is a module singleton because Shell remounts
+  // on a book change.
+  const navFocus = activeNoteId
+    ? { kind: "tn" as const, rowId: activeNoteId }
+    : activeQuestionId
+      ? { kind: "tq" as const, rowId: activeQuestionId }
+      : activeWordId
+        ? { kind: "twl" as const, rowId: activeWordId }
+        : null;
+  const navHint = (() => {
+    if (!navFocus || !data) return undefined;
+    const text =
+      navFocus.kind === "tn"
+        ? data.tn.find((r) => r.id === navFocus.rowId)
+        : navFocus.kind === "tq"
+          ? data.tq.find((r) => r.id === navFocus.rowId)
+          : data.twl.find((r) => r.id === navFocus.rowId);
+    if (!text) return undefined;
+    const raw =
+      navFocus.kind === "tn"
+        ? ((text as TnRow).note || (text as TnRow).quote)
+        : navFocus.kind === "tq"
+          ? ((text as TqRow).question || (text as TqRow).quote)
+          : (text as TwlRow).orig_words;
+    const flat = (raw ?? "").replace(/\s+/g, " ").trim();
+    return flat ? (flat.length > 60 ? `${flat.slice(0, 60)}…` : flat) : undefined;
+  })();
+  useEffect(() => {
+    navHistory.observe({
+      book,
+      chapter,
+      verse: activeVerse,
+      ...(navFocus ?? {}),
+      hint: navHint,
+    });
+  }, [book, chapter, activeVerse, navFocus?.kind, navFocus?.rowId, navHint]);
+
+  // Go to entry `index` of the Back history. Same-chapter row targets reuse the
+  // focus*Match helpers; anything else navigates through the URL and, for a
+  // row, stashes pendingRowJump (which names its own book, so a Back across
+  // books works too). One dirty-gate wraps all of it, and the history entry is
+  // only taken once the gate has let the jump through.
+  const goToSpot = useCallback(
+    (index: number) => {
+      runWithDirtyGate(() => {
+        const s = navHistory.takeBack(index);
+        if (!s) return;
+        if (s.book === book && s.chapter === chapter) {
+          if (s.kind === "tn" && s.rowId) focusNoteMatch(s.chapter, s.verse, s.rowId, true);
+          else if (s.kind === "tq" && s.rowId) focusQuestionMatch(s.chapter, s.verse, s.rowId, true);
+          else if (s.kind === "twl" && s.rowId) focusWordMatch(s.chapter, s.verse, s.rowId, true);
+          else {
+            setActiveVerse(s.verse);
+            setActiveNoteId(null);
+            setActiveWordId(null);
+            setActiveQuestionId(null);
+            requestScrollToActive();
+          }
+          return;
+        }
+        if (s.kind && s.rowId) {
+          pendingRowJump = { book: s.book, chapter: s.chapter, kind: s.kind, rowId: s.rowId, switchTab: true };
+        }
+        onNavigate?.(s.book, s.chapter, s.verse);
+      });
+    },
+    [runWithDirtyGate, book, chapter, onNavigate, focusNoteMatch, focusQuestionMatch, focusWordMatch, requestScrollToActive],
+  );
+
   // Jump to a lint issue from the topbar indicator. `ref` is "chapter:verse"
   // (or bare "chapter"). TN/tq/twl findings carry a rowId, so reuse the
   // focus*Match helpers above — the same row-jump mechanism the find overlay
@@ -3726,6 +3799,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <TopBar
           book={book}
           chapter={chapter}
+          backButton={<BackButton onGo={goToSpot} />}
           onNavigate={(b, c, v) => {
             setActiveVerse(v ?? 1);
             setActiveNoteId(null);
@@ -4187,6 +4261,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       <TopBar
         book={book}
         chapter={chapter}
+        backButton={<BackButton onGo={goToSpot} />}
         onNavigate={(b, c, v) => {
           runWithDirtyGate(() => {
             setActiveVerse(v ?? 1);
