@@ -11,7 +11,7 @@ function verseObjectsOf(dto: VerseDto | null | undefined): unknown[] | null {
 // UST that has unaligned words when exactly one does, otherwise null (both or
 // neither — the caller keeps whatever version it would have used). Each row is
 // judged against the source it covers, so a verse inside a bridge resolves to
-// its covering row, the same as the verse tiles' unaligned flag.
+// its covering row (the verse tiles key by row start, so they would not flag it).
 export function versionNeedingAlignment(
   verses: Record<string, Record<number, VerseDto>> | undefined,
   verse: number,
