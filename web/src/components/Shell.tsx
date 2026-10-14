@@ -57,6 +57,7 @@ import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, SECTION_HEADER_TAGS } from "../lib/usfm";
 import { chapterOpensWithoutMarker, introEditBase } from "../lib/verseIntro";
 import { verseHasUnalignedWork, countUnalignedTargetWords } from "../lib/alignment";
+import { versionNeedingAlignment } from "../lib/alignerVersion";
 import {
   analyzeAlignmentDelta,
   guardBlocksSave,
@@ -3294,13 +3295,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // allow entry to the aligner via the Alignment tab either.
       if (mode === "alignment" && editLocked) return;
       runWithDirtyGate(() => {
-        if (mode === "alignment" && !alignerTarget) {
-          setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: "ULT" });
+        if (mode === "alignment") {
+          // Entering from another tab: when exactly one of ULT/UST has
+          // unaligned words on the active verse, open on that one. Both or
+          // neither: keep the last version touched (ULT on a first visit).
+          const needing =
+            panelMode !== "alignment" ? versionNeedingAlignment(data?.verses, activeVerse) : null;
+          if (needing) {
+            setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: needing });
+          } else if (!alignerTarget) {
+            setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: "ULT" });
+          }
         }
         setPanelMode(mode);
       });
     },
-    [runWithDirtyGate, alignerTarget, chapter, activeVerse, editLocked],
+    [runWithDirtyGate, alignerTarget, chapter, activeVerse, editLocked, panelMode, data?.verses],
   );
 
   const dismissPendingNav = useCallback(() => setPendingNav(null), []);
