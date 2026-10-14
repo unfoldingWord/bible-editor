@@ -26,6 +26,8 @@ export interface NavSpot {
 export const SETTLE_MS = 2500;
 // Oldest entries fall off past this.
 export const MAX_ENTRIES = 25;
+// How long after a Back its own departure is still ignored.
+const SUPPRESS_MS = 5000;
 
 export function sameSpot(a: NavSpot, b: NavSpot): boolean {
   return (
@@ -55,6 +57,7 @@ export function createNavHistory(now: () => number = Date.now): NavHistory {
   let since = 0;
   // Set by takeBack: the next departure belongs to the Back jump itself.
   let suppressDeparture = false;
+  let suppressedAt = 0;
   const listeners = new Set<() => void>();
   const emit = () => listeners.forEach((fn) => fn());
 
@@ -76,7 +79,10 @@ export function createNavHistory(now: () => number = Date.now): NavHistory {
         current.book === spot.book &&
         current.chapter === spot.chapter &&
         current.verse === spot.verse;
-      if (current && !narrowed && !suppressDeparture && t - since >= SETTLE_MS) {
+      // The flag expires: a Back that lands where nothing changes never calls
+      // observe, and must not swallow some later, unrelated departure.
+      const suppressed = suppressDeparture && t - suppressedAt < SUPPRESS_MS;
+      if (current && !narrowed && !suppressed && t - since >= SETTLE_MS) {
         const top = stack[stack.length - 1];
         if (!top || !sameSpot(top, current)) {
           stack = [...stack, current].slice(-MAX_ENTRIES);
@@ -102,6 +108,7 @@ export function createNavHistory(now: () => number = Date.now): NavHistory {
       if (!target) return undefined;
       stack = stack.slice(0, i);
       suppressDeparture = true;
+      suppressedAt = now();
       emit();
       return target;
     },

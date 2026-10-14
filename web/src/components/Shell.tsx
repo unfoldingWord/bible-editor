@@ -2873,10 +2873,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     });
   }, [book, chapter, activeVerse, navFocus?.kind, navFocus?.rowId, navHint]);
 
-  // Go to entry `index` of the Back history. Same-chapter row targets reuse the
-  // focus*Match helpers; anything else navigates through the URL and, for a
-  // row, stashes pendingRowJump (which names its own book, so a Back across
-  // books works too). One dirty-gate wraps all of it, and the history entry is
+  // Go to entry `index` of the Back history. A cross-chapter or cross-book
+  // target navigates through the URL and, for a row, stashes pendingRowJump
+  // (which names its own book). A same-chapter target sets the focus state
+  // directly rather than calling focus*Match, which would nest a second
+  // dirty-gate inside this one. One gate wraps it all, and the history entry is
   // only taken once the gate has let the jump through.
   const goToSpot = useCallback(
     (index: number) => {
@@ -2884,25 +2885,26 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         const s = navHistory.takeBack(index);
         if (!s) return;
         if (s.book === book && s.chapter === chapter) {
-          if (s.kind === "tn" && s.rowId) focusNoteMatch(s.chapter, s.verse, s.rowId, true);
-          else if (s.kind === "tq" && s.rowId) focusQuestionMatch(s.chapter, s.verse, s.rowId, true);
-          else if (s.kind === "twl" && s.rowId) focusWordMatch(s.chapter, s.verse, s.rowId, true);
-          else {
-            setActiveVerse(s.verse);
-            setActiveNoteId(null);
-            setActiveWordId(null);
-            setActiveQuestionId(null);
-            requestScrollToActive();
-          }
+          // A row that was deleted or trashed since is dropped to its verse.
+          const cur = dataRef.current;
+          const rows = s.kind === "tn" ? cur?.tn : s.kind === "tq" ? cur?.tq : s.kind === "twl" ? cur?.twl : undefined;
+          const row = s.rowId ? rows?.find((r) => r.id === s.rowId) : undefined;
+          setActiveVerse(row ? row.verse : s.verse);
+          setActiveNoteId(row && s.kind === "tn" ? row.id : null);
+          setActiveQuestionId(row && s.kind === "tq" ? row.id : null);
+          setActiveWordId(row && s.kind === "twl" ? row.id : null);
+          if (row && s.kind) requestJumpTab(TAB_FOR_ROW_KIND[s.kind]);
+          requestScrollToActive();
           return;
         }
-        if (s.kind && s.rowId) {
-          pendingRowJump = { book: s.book, chapter: s.chapter, kind: s.kind, rowId: s.rowId, switchTab: true };
-        }
+        pendingRowJump =
+          s.kind && s.rowId
+            ? { book: s.book, chapter: s.chapter, kind: s.kind, rowId: s.rowId, switchTab: true }
+            : null;
         onNavigate?.(s.book, s.chapter, s.verse);
       });
     },
-    [runWithDirtyGate, book, chapter, onNavigate, focusNoteMatch, focusQuestionMatch, focusWordMatch, requestScrollToActive],
+    [runWithDirtyGate, book, chapter, onNavigate, requestJumpTab, requestScrollToActive],
   );
 
   // Jump to a lint issue from the topbar indicator. `ref` is "chapter:verse"

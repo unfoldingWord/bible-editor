@@ -21,7 +21,8 @@ const HOLD_MS = 450;
 const KIND_LABEL = { tn: "note", tq: "question", twl: "word link" } as const;
 
 export function describeSpot(s: NavSpot): string {
-  const place = `${bookName(s.book)} ${s.chapter === 0 ? "intro" : `${s.chapter}:${s.verse}`}`;
+  const where = s.chapter === 0 || s.verse === 0 ? `${s.chapter === 0 ? "" : `${s.chapter} `}intro` : `${s.chapter}:${s.verse}`;
+  const place = `${bookName(s.book)} ${where}`;
   return s.kind ? `${place} · ${KIND_LABEL[s.kind]}` : place;
 }
 
@@ -103,7 +104,10 @@ export function BackButton({ onGo }: Props) {
       <Menu
         open={menuAnchor !== null}
         anchorEl={menuAnchor}
-        onClose={() => setMenuAnchor(null)}
+        onClose={() => {
+          heldOpen.current = false;
+          setMenuAnchor(null);
+        }}
         slotProps={{ paper: { sx: { maxHeight: 360 } } }}
       >
         {/* Newest first: the top row is what plain Back does. */}
