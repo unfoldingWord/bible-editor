@@ -520,10 +520,31 @@ export function SideBySideAligner({
     />
   );
 
+  // Escape closes the dialog even when focus is not inside it. MUI's own Escape
+  // handling sits on the Dialog root, so it only sees the key while focus is
+  // within; with the focus trap off (disableEnforceFocus, #1053) a click on a
+  // non-focusable spot leaves focus on <body> and Escape did nothing. A
+  // document-level listener restores it. It defers to anything that already
+  // handled the key (defaultPrevented), and to a modal stacked above this one
+  // (the unsaved-changes gate, a menu), which owns its own Escape. Closed
+  // keepMounted modals carry MuiModal-hidden and are skipped.
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || e.isComposing) return;
+      const modals = document.querySelectorAll(".MuiModal-root:not(.MuiModal-hidden)");
+      if (modals[modals.length - 1] !== dialogRef.current) return;
+      onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
   return (
     // disableEnforceFocus: the pinned lexical box (PinnedLexBox) is portaled
     // outside this Dialog; a focus trap would fight text selection in it (#1053).
-    <Dialog open={open} onClose={onClose} fullScreen disableEnforceFocus>
+    <Dialog ref={dialogRef} open={open} onClose={onClose} fullScreen disableEnforceFocus>
       <Box sx={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
         {/* titlebar */}
         <Box
