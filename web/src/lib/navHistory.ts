@@ -66,8 +66,11 @@ function isSpot(x: unknown): x is NavSpot {
   const s = x as Record<string, unknown>;
   return (
     typeof s.book === "string" &&
+    /^[A-Za-z0-9]{3}$/.test(s.book) &&
     Number.isInteger(s.chapter) &&
+    (s.chapter as number) >= 0 &&
     Number.isInteger(s.verse) &&
+    (s.verse as number) >= 0 &&
     (s.kind === undefined || s.kind === "tn" || s.kind === "tq" || s.kind === "twl") &&
     (s.rowId === undefined || typeof s.rowId === "string") &&
     (s.hint === undefined || typeof s.hint === "string")

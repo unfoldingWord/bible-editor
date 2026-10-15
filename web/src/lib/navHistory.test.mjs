@@ -186,9 +186,13 @@ function setup() {
   assert(createNavHistory(Date.now, fakeStorage("not json")).entries().length === 0, "corrupt storage is ignored");
   assert(createNavHistory(Date.now, fakeStorage('[{"book":1},{"book":"ZEC","chapter":1,"verse":2}]')).entries().length === 1, "malformed entries are dropped");
   const throwing = { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); } };
-  const h = createNavHistory(() => 0, throwing);
+  let t = 0;
+  const h = createNavHistory(() => t, throwing);
   h.observe(verse(1, 1));
-  assert(h.entries().length === 0, "throwing storage does not break observe");
+  t += SETTLE_MS;
+  h.observe(verse(2, 1)); // records an entry, so tries to save
+  assert(h.entries().length === 1, "throwing storage does not break recording");
+  assert(createNavHistory(Date.now, fakeStorage('[{"book":"XYZW","chapter":1,"verse":1},{"book":"ZEC","chapter":-1,"verse":1}]')).entries().length === 0, "out-of-range entries are dropped");
 }
 
 if (failed) {
