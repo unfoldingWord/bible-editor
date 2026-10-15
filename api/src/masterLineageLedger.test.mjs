@@ -292,5 +292,82 @@ for (const [name, setup] of [
   ok(shas.includes("late-push"), "...while a genuine late push in the same window still is");
 }
 
+// Issue #691 re-review F1: a gap that opens AFTER the coverage floor. Its
+// backfill walks merge second parents back into history the repo has had for
+// years. Stamping those rows with that gap's opening time (later than the
+// floor) made every window between the floor and the gap read them as late
+// arrivals. A backfilled row's stamp is capped at its own commit date, so
+// only committed_at can admit it, exactly as before #691.
+{
+  const sqlite = new DatabaseSync(":memory:");
+  const dir = new URL("../migrations/", import.meta.url);
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    sqlite.exec(readFileSync(new URL(f, dir), "utf8"));
+  }
+  const mk = (sql, args) => ({
+    bind: (...a) => mk(sql, a),
+    async first() {
+      const r = sqlite.prepare(sql).all(...args);
+      return r.length ? r[0] : null;
+    },
+    async all() {
+      return { results: sqlite.prepare(sql).all(...args) };
+    },
+    async run() {
+      const r = sqlite.prepare(sql).run(...args);
+      return { success: true, meta: { changes: Number(r.changes) } };
+    },
+  });
+  const env = {
+    DB: {
+      prepare: (sql) => mk(sql, []),
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    },
+  };
+  const FLOOR = 3_000_000;
+  const GAP_AT = FLOOR + 30 * 86400; // a burst capped a poll a month after the floor
+  const NOW = GAP_AT + 3600;
+  sqlite
+    .prepare(
+      `INSERT INTO dcs_repo_polls (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
+                                    last_status, gap_since_sha, gap_at, gap_frontier_json, coverage_since)
+       VALUES ('en_ust', 'tip', ?, ?, ?, 'ok', 'prev-tip', ?, ?, ?)`,
+    )
+    .run(GAP_AT, GAP_AT, GAP_AT, GAP_AT, JSON.stringify(["ancient1"]), FLOOR);
+  const oldDate = new Date((FLOOR - 400 * 86400) * 1000).toISOString();
+  const histCommit = (sha, parent) => ({
+    sha,
+    commit: { message: `hand fix ${sha}`, author: { email: "h@x", name: "Editor", date: oldDate }, committer: { date: oldDate } },
+    author: null,
+    parents: parent ? [{ sha: parent }] : [],
+    files: [{ filename: "24-JER.usfm", status: "modified" }],
+  });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: (k) => (k.toLowerCase() === "x-hasmore" ? "false" : k.toLowerCase() === "x-pagecount" ? "1" : null) },
+    json: async () => [histCommit("ancient1", "ancient2"), histCommit("ancient2", null)],
+  });
+  let res;
+  try {
+    res = await backfillDcsRepoGap(env, "en_ust", NOW);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  ok(res.resolved === true && res.inserted === 2, "the post-floor gap's backfill walks into old history and closes");
+  const result = await readLedgerMasterLineage(env.DB, "en_ust", "24-JER.usfm", FLOOR + 86400, "tip");
+  const shas = (result.lineage?.commits ?? []).map((c) => c.sha);
+  ok(result.usable, "the ledger is usable once the post-floor gap is closed");
+  ok(
+    !shas.includes("ancient1") && !shas.includes("ancient2"),
+    "old history a post-floor gap's backfill reaches is not read as arriving inside a window between the floor and the gap",
+  );
+}
+
 if (failed) process.exit(1);
 console.log("masterLineageLedger: all assertions passed");

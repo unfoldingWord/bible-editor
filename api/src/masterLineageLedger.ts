@@ -143,8 +143,8 @@ export async function readLedgerMasterLineage(
   // gives us. Strictly greater, because the first clean poll stamps every
   // bootstrap row with seen_at = coverage_since, and a window starting at
   // that floor must not count the whole bootstrap batch as new. A backfilled
-  // row carries its gap's opening-poll time, not the backfill's own time
-  // (dcsCommitBackfill.ts), so backfilled history is not misread as late.
+  // row's seen_at is capped at its own commit date (dcsCommitBackfill.ts), so
+  // only committed_at can admit backfilled history; it is never read as late.
   // Poll lag can still admit a row that landed just before the window,
   // which only leans toward "human found".
   const rows = await db

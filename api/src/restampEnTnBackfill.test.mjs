@@ -63,7 +63,7 @@ console.log("restamp-en-tn-backfill-seen-at.sql");
   const d = freshDb();
   seed(d);
   d.exec(SCRIPT);
-  assert(seenAt(d, "en_tn", "backfilled") === GAP_AT, "an old en_tn row stamped after the floor is restamped to gap_at");
+  assert(seenAt(d, "en_tn", "backfilled") === FLOOR - 86400 * 30, "an old en_tn row stamped after the floor is restamped to its commit date");
   assert(seenAt(d, "en_tn", "recent") === FLOOR + 86400 + 60, "a commit dated after the floor keeps its stamp");
   assert(seenAt(d, "en_tn", "bootstrap") === FLOOR, "a row stamped at the floor (not after it) keeps its stamp");
   assert(seenAt(d, "en_ult", "other-repo") === BACKFILL_RAN, "another repo is not touched");
@@ -94,7 +94,7 @@ console.log("restamp-en-tn-backfill-seen-at.sql");
     .map((s) => s.trim())
     .filter(Boolean);
   assert(statements.length === 1, "the script holds exactly one statement");
-  assert(/^UPDATE dcs_commits\s+SET seen_at = \d+\s+WHERE repo = 'en_tn'/.test(statements[0]), "that statement updates only en_tn seen_at");
+  assert(/^UPDATE dcs_commits\s+SET seen_at = committed_at\s+WHERE repo = 'en_tn'/.test(statements[0]), "that statement updates only en_tn seen_at");
 }
 
 if (failed) {
