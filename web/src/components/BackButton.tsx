@@ -1,7 +1,8 @@
 // Always-visible "Back" control for the top bar. One click returns to the
 // newest remembered spot (verse, and the note/question/word link if one was
-// focused); press-and-hold, right-click, or the small arrow opens the list of
-// everywhere the person has been so they can pick an older one. See
+// focused). A forward arrow appears once you have gone back. Press-and-hold,
+// right-click, or the small arrow opens the whole history with a "you are
+// here" line: places ahead of it above, places behind it below. See
 // lib/navHistory.ts for what counts as a remembered spot.
 
 import { useRef, useState, useSyncExternalStore } from "react";
@@ -10,8 +11,10 @@ import ButtonGroup from "@mui/material/ButtonGroup";
 import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
 import ListItemText from "@mui/material/ListItemText";
+import Divider from "@mui/material/Divider";
 import Tooltip from "@mui/material/Tooltip";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
+import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
 import ArrowDropDownIcon from "@mui/icons-material/ArrowDropDown";
 import { bookName } from "../lib/bookNames";
 import { navHistory, type NavSpot } from "../lib/navHistory";
@@ -27,20 +30,23 @@ export function describeSpot(s: NavSpot): string {
 }
 
 interface Props {
-  // Jump to entry `index` of navHistory.entries(). The caller owns the actual
+  // Jump to entry `index` of navHistory.view().entries. The caller owns the actual
   // navigation (dirty-gate, chapter change, focusing the row).
   onGo: (index: number) => void;
 }
 
 export function BackButton({ onGo }: Props) {
-  const entries = useSyncExternalStore(navHistory.subscribe, navHistory.entries);
+  const { entries, here } = useSyncExternalStore(navHistory.subscribe, navHistory.view);
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
   const groupRef = useRef<HTMLDivElement>(null);
   const holdTimer = useRef<number | undefined>(undefined);
   const heldOpen = useRef(false);
 
-  const newest = entries[entries.length - 1];
-  const empty = entries.length === 0;
+  const newest = entries[here - 1];
+  const ahead = entries.length - here;
+  // Back is only dead when nothing lies behind the marker; the group is still
+  // live when there is something ahead, so forward and the list stay usable.
+  const empty = here === 0;
   const openMenu = () => {
     if (groupRef.current && entries.length > 0) setMenuAnchor(groupRef.current);
   };
@@ -51,7 +57,9 @@ export function BackButton({ onGo }: Props) {
         title={
           newest
             ? `Back to ${describeSpot(newest)} (hold for the list)`
-            : "Back: nothing to go back to yet"
+            : ahead > 0
+              ? "Nothing further back (hold for the list)"
+              : "Back: nothing to go back to yet"
         }
       >
         <span>
@@ -59,7 +67,7 @@ export function BackButton({ onGo }: Props) {
             ref={groupRef}
             size="small"
             variant="outlined"
-            disabled={empty}
+            disabled={entries.length === 0}
             aria-label="back"
             onContextMenu={(e) => {
               e.preventDefault();
@@ -67,6 +75,7 @@ export function BackButton({ onGo }: Props) {
             }}
           >
             <Button
+              disabled={empty}
               startIcon={<ArrowBackIcon fontSize="small" />}
               onPointerDown={() => {
                 heldOpen.current = false;
@@ -84,12 +93,22 @@ export function BackButton({ onGo }: Props) {
                   heldOpen.current = false;
                   return;
                 }
-                if (!empty) onGo(entries.length - 1);
+                if (!empty) onGo(here - 1);
               }}
               sx={{ textTransform: "none", whiteSpace: "nowrap" }}
             >
               Back
             </Button>
+            {ahead > 0 && (
+              <Button
+                size="small"
+                aria-label="forward"
+                onClick={() => onGo(here)}
+                sx={{ px: 0.25, minWidth: 0 }}
+              >
+                <ArrowForwardIcon fontSize="small" />
+              </Button>
+            )}
             <Button
               size="small"
               aria-label="show where you have been"
@@ -110,25 +129,40 @@ export function BackButton({ onGo }: Props) {
         }}
         slotProps={{ paper: { sx: { maxHeight: 360 } } }}
       >
-        {/* Newest first: the top row is what plain Back does. */}
-        {entries
-          .map((spot, index) => ({ spot, index }))
-          .reverse()
-          .map(({ spot, index }) => (
-            <MenuItem
-              key={`${index}:${spot.book}:${spot.chapter}:${spot.verse}:${spot.rowId ?? ""}`}
-              onClick={() => {
-                setMenuAnchor(null);
-                onGo(index);
-              }}
-            >
-              <ListItemText
-                primary={describeSpot(spot)}
-                secondary={spot.hint}
-                secondaryTypographyProps={{ noWrap: true, sx: { maxWidth: 280 } }}
-              />
-            </MenuItem>
-          ))}
+        {/* Newest first, with the "you are here" line where the person is:
+            places ahead of it above, places behind it below. The current
+            verse is not repeated; the line stands for it. */}
+        {(() => {
+          const row = (index: number) => {
+            const spot = entries[index];
+            return (
+              <MenuItem
+                key={`${index}:${spot.book}:${spot.chapter}:${spot.verse}:${spot.rowId ?? ""}`}
+                onClick={() => {
+                  setMenuAnchor(null);
+                  onGo(index);
+                }}
+              >
+                <ListItemText
+                  primary={describeSpot(spot)}
+                  secondary={spot.hint}
+                  secondaryTypographyProps={{ noWrap: true, sx: { maxWidth: 280 } }}
+                />
+              </MenuItem>
+            );
+          };
+          const ahead: number[] = [];
+          for (let i = entries.length - 1; i >= here; i--) ahead.push(i);
+          const behind: number[] = [];
+          for (let i = here - 1; i >= 0; i--) behind.push(i);
+          return [
+            ...ahead.map(row),
+            <MenuItem key="here" disabled sx={{ opacity: "1 !important", py: 0.25, minHeight: 0 }}>
+              <Divider sx={{ flex: 1, fontSize: 12, color: "text.secondary" }}>you are here</Divider>
+            </MenuItem>,
+            ...behind.map(row),
+          ];
+        })()}
       </Menu>
     </>
   );

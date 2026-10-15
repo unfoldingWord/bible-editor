@@ -1,8 +1,13 @@
-// "Back" history for the editor: where the translator was, down to the note.
+// Navigation history for the editor: where the translator was, down to the note.
 //
 // The point is to make leaving a spot safe. People stay put because wandering
 // off (scrolling, changing chapter, opening another note) loses their place, so
-// this keeps a stack of places they were and lets them jump back in one click.
+// this keeps a short list of places they were and lets them jump to any in one
+// click.
+//
+// The list is a general history, not a stack. Jumping to an entry does not
+// throw away the entries after it: the spot you left joins the list and the
+// "you are here" marker moves, so you can go forward again as well as back.
 //
 // A place is only recorded once the person has *settled* there for a moment.
 // Scrolling through ten verses must not bury the spot they were working on
@@ -24,10 +29,14 @@ export interface NavSpot {
 
 // How long a spot must be held before leaving it records it.
 export const SETTLE_MS = 2500;
-// Oldest entries fall off past this.
-export const MAX_ENTRIES = 25;
-// How long after a Back its own departure is still ignored.
-const SUPPRESS_MS = 5000;
+// The list never grows past this.
+export const MAX_ENTRIES = 10;
+// At most this many entries share one chapter. Within a chapter the ones kept
+// are the newest plus the ones farthest apart in verse (1 and 17 beat 15, 16
+// and 17), because neighbouring verses are easy to scroll between anyway.
+export const MAX_PER_CHAPTER = 3;
+// How long after a jump its own transitional positions are still ignored.
+const RESTORE_MS = 5000;
 
 export function sameSpot(a: NavSpot, b: NavSpot): boolean {
   return (
@@ -39,19 +48,71 @@ export function sameSpot(a: NavSpot, b: NavSpot): boolean {
   );
 }
 
+export interface NavView {
+  // Oldest → newest.
+  entries: readonly NavSpot[];
+  // Where "you are here" sits: entries[0..here) are back, entries[here..] are
+  // forward. Equal to entries.length when there is nothing ahead.
+  here: number;
+}
+
+// Trim to the per-chapter and overall limits, keeping `here` pointing at the
+// same gap. Pure, so the choice of what to keep is testable.
+export function prune(entries: readonly NavSpot[], here: number): NavView {
+  const drop = new Set<number>();
+
+  const byChapter = new Map<string, number[]>();
+  entries.forEach((e, i) => {
+    const k = `${e.book}:${e.chapter}`;
+    byChapter.set(k, [...(byChapter.get(k) ?? []), i]);
+  });
+  for (const idxs of byChapter.values()) {
+    if (idxs.length <= MAX_PER_CHAPTER) continue;
+    const kept = [idxs[idxs.length - 1]];
+    const rest = idxs.slice(0, -1);
+    while (kept.length < MAX_PER_CHAPTER) {
+      let best = -1;
+      let bestGap = -1;
+      for (const i of rest) {
+        if (kept.includes(i)) continue;
+        const gap = Math.min(...kept.map((k) => Math.abs(entries[k].verse - entries[i].verse)));
+        // Larger gap wins; on a tie the more recent entry (higher index).
+        if (gap > bestGap || (gap === bestGap && i > best)) {
+          best = i;
+          bestGap = gap;
+        }
+      }
+      kept.push(best);
+    }
+    for (const i of idxs) if (!kept.includes(i)) drop.add(i);
+  }
+
+  const live = entries.map((_, i) => i).filter((i) => !drop.has(i));
+  for (const i of live.slice(0, Math.max(0, live.length - MAX_ENTRIES))) drop.add(i);
+
+  const out: NavSpot[] = [];
+  let newHere = 0;
+  entries.forEach((e, i) => {
+    if (drop.has(i)) return;
+    if (i < here) newHere++;
+    out.push(e);
+  });
+  return { entries: out, here: newHere };
+}
+
 export interface NavHistory {
   // Report where the person is now. Call on every change of position.
   observe(spot: NavSpot): void;
-  // Entries oldest → newest; the last one is what plain "Back" goes to.
-  entries(): readonly NavSpot[];
-  // Take entry `index` (default: newest), dropping it and everything after it.
-  // The departure from the current spot is NOT recorded, so pressing Back twice
-  // walks further back instead of ping-ponging between two places.
-  takeBack(index?: number): NavSpot | undefined;
+  // The list plus the "you are here" marker. Same object until something changes.
+  view(): NavView;
+  // Jump to entry `index` (oldest-first index into view().entries). The spot
+  // being left joins the list and the marker moves to where the target was.
+  // Returns the target, or undefined for a bad index.
+  takeAt(index: number): NavSpot | undefined;
   subscribe(fn: () => void): () => void;
 }
 
-// Where the stack is kept between page loads. sessionStorage fits: it survives
+// Where the list is kept between page loads. sessionStorage fits: it survives
 // a reload and the browser's own back/forward, but stays per tab, so two tabs
 // don't trample each other's trail.
 export interface NavStorage {
@@ -59,7 +120,7 @@ export interface NavStorage {
   setItem(key: string, value: string): void;
 }
 
-const STORAGE_KEY = "bible-editor.navHistory.v1";
+const STORAGE_KEY = "bible-editor.navHistory.v2";
 
 function isSpot(x: unknown): x is NavSpot {
   if (!x || typeof x !== "object") return false;
@@ -77,13 +138,19 @@ function isSpot(x: unknown): x is NavSpot {
   );
 }
 
-function loadStack(storage: NavStorage | undefined): NavSpot[] {
-  if (!storage) return [];
+function load(storage: NavStorage | undefined): NavView {
+  const empty: NavView = { entries: [], here: 0 };
+  if (!storage) return empty;
   try {
-    const parsed: unknown = JSON.parse(storage.getItem(STORAGE_KEY) ?? "[]");
-    return Array.isArray(parsed) ? parsed.filter(isSpot).slice(-MAX_ENTRIES) : [];
+    const parsed: unknown = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null");
+    if (!parsed || typeof parsed !== "object") return empty;
+    const raw = (parsed as { entries?: unknown; here?: unknown });
+    if (!Array.isArray(raw.entries)) return empty;
+    const entries = raw.entries.filter(isSpot);
+    const here = Number.isInteger(raw.here) ? Math.min(Math.max(raw.here as number, 0), entries.length) : entries.length;
+    return prune(entries, here);
   } catch {
-    return [];
+    return empty;
   }
 }
 
@@ -91,16 +158,20 @@ export function createNavHistory(
   now: () => number = Date.now,
   storage?: NavStorage,
 ): NavHistory {
-  let stack: NavSpot[] = loadStack(storage);
+  let state: NavView = load(storage);
   let current: NavSpot | null = null;
   let since = 0;
-  // Set by takeBack: the next departure belongs to the Back jump itself.
-  let suppressDeparture = false;
-  let suppressedAt = 0;
+  // After a jump: where we expect to land. Positions seen on the way there
+  // (a chapter loading with the old verse) are not real departures.
+  let restoring: { spot: NavSpot; at: number } | null = null;
+  // The spot a jump landed on is worth recording even if left within SETTLE_MS.
+  let landed: NavSpot | null = null;
   const listeners = new Set<() => void>();
-  const emit = () => {
+
+  const set = (next: NavView) => {
+    state = next;
     try {
-      storage?.setItem(STORAGE_KEY, JSON.stringify(stack));
+      storage?.setItem(STORAGE_KEY, JSON.stringify({ entries: next.entries, here: next.here }));
     } catch {
       // Storage full or blocked: the in-memory history still works.
     }
@@ -109,13 +180,25 @@ export function createNavHistory(
 
   return {
     observe(spot) {
+      const t = now();
+      if (restoring && t - restoring.at < RESTORE_MS) {
+        const arrived = sameSpot(spot, restoring.spot);
+        if (arrived) {
+          landed = spot;
+          restoring = null;
+        }
+        current = spot;
+        since = t;
+        return;
+      }
+      restoring = null;
+
       if (current && sameSpot(current, spot)) {
         // Same place, maybe a refreshed hint (the note's text changed).
         current = { ...current, hint: spot.hint ?? current.hint };
+        if (landed) landed = current;
         return;
       }
-      const t = now();
-      let changed = false;
       // Opening a note inside the verse you were on narrows that spot rather
       // than leaving it, so the bare verse is not worth an entry of its own.
       const narrowed =
@@ -125,37 +208,51 @@ export function createNavHistory(
         current.book === spot.book &&
         current.chapter === spot.chapter &&
         current.verse === spot.verse;
-      // The flag expires: a Back that lands where nothing changes never calls
-      // observe, and must not swallow some later, unrelated departure.
-      const suppressed = suppressDeparture && t - suppressedAt < SUPPRESS_MS;
-      if (current && !narrowed && !suppressed && t - since >= SETTLE_MS) {
-        const top = stack[stack.length - 1];
-        if (!top || !sameSpot(top, current)) {
-          stack = [...stack, current].slice(-MAX_ENTRIES);
-          changed = true;
-        }
+      let entries = [...state.entries];
+      const settled = current !== null && (t - since >= SETTLE_MS || (landed !== null && sameSpot(landed, current)));
+      if (current && settled && !narrowed) {
+        entries = entries.filter((e) => !sameSpot(e, current!));
+        entries.push(current);
       }
-      suppressDeparture = false;
-      // Arriving at a place the stack already points to (walked back by hand)
-      // retires that entry: Back should never offer the place you stand on.
-      const kept = stack.filter((e) => !sameSpot(e, spot));
-      if (kept.length !== stack.length) {
-        stack = kept;
-        changed = true;
-      }
+      // Arriving at a place the list already holds (got there by hand)
+      // retires that entry: the list never offers the place you stand on.
+      entries = entries.filter((e) => !sameSpot(e, spot));
+      landed = null;
       current = spot;
       since = t;
-      if (changed) emit();
+      // Moving on by hand puts the marker back at the newest end; whatever was
+      // ahead of it stays in the list as ordinary recent places.
+      const next = prune(entries, entries.length);
+      const same =
+        next.here === state.here &&
+        next.entries.length === state.entries.length &&
+        next.entries.every((e, i) => e === state.entries[i]);
+      if (!same) set(next);
     },
-    entries: () => stack,
-    takeBack(index) {
-      const i = index ?? stack.length - 1;
-      const target = stack[i];
+    view: () => state,
+    takeAt(index) {
+      const target = state.entries[index];
       if (!target) return undefined;
-      stack = stack.slice(0, i);
-      suppressDeparture = true;
-      suppressedAt = now();
-      emit();
+      const items = state.entries.map((spot, i) => ({ spot, target: i === index, cur: false }));
+      if (current) items.splice(state.here, 0, { spot: current, target: false, cur: true });
+      // The target leaves the list (it is where we are now); an older copy of
+      // the spot we are leaving goes too, the fresh one is kept.
+      const entries: NavSpot[] = [];
+      let here = 0;
+      let passedTarget = false;
+      for (const it of items) {
+        if (it.target) {
+          passedTarget = true;
+          continue;
+        }
+        if (!it.cur && current && sameSpot(it.spot, current)) continue;
+        entries.push(it.spot);
+        if (!passedTarget) here++;
+      }
+      const next = prune(entries, here);
+      restoring = { spot: target, at: now() };
+      landed = null;
+      set(next);
       return target;
     },
     subscribe(fn) {
