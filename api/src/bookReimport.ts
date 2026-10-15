@@ -4967,11 +4967,11 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // push, where the commit is locally authored AND committed days before it
 // reaches Door43 so neither timestamp ever moves, can be seen only through
 // the ledger: readLedgerMasterLineage also admits a row whose `seen_at` is
-// after the window start (#691). seen_at is the poll that recorded the row
-// (or, for a backfilled row, the poll that opened its gap), so it is an
-// upper bound on arrival: a poll's lag can add a row that landed just before
-// the window, and a commit from a second gap opened while an older one was
-// still being backfilled gets the older gap's stamp and can be missed. The
+// after the window start (#691). seen_at is the poll that recorded the row,
+// so it is an upper bound on arrival: a poll's lag (or an outage) can add a
+// row that landed just before the window. A backfilled row's seen_at is
+// capped at its own commit date (dcsCommitBackfill.ts), so a commit pushed
+// late into a gap's hole can be missed as a late push. The
 // live-walk fallback (ledger unusable: stale tip, open gap, no coverage
 // floor) cannot see a plain late push at all, because Gitea exposes no push
 // time.

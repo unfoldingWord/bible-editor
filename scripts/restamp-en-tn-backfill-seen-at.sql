@@ -9,8 +9,9 @@
 -- human commit that arrived inside any TN window opened between the coverage
 -- floor and the backfill: merge_no_base clears get blocked and lineage
 -- confirmation withheld for TN books. No data is lost, but the gates misfire.
--- #1088's backfill stamps gap_at instead; rows the OLD code wrote keep their
--- stamp, because INSERT ... ON CONFLICT DO NOTHING never restamps.
+-- #1088's backfill caps the stamp at the commit date instead; rows the OLD
+-- code wrote keep their stamp, because INSERT ... ON CONFLICT DO NOTHING
+-- never restamps.
 --
 -- WHAT. Restamp each such row to its own commit date, which is what the
 -- fixed backfill writes for history older than its gap (dcsCommitBackfill.ts
