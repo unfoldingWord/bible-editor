@@ -182,7 +182,10 @@ export function createNavHistory(
     observe(spot) {
       const t = now();
       if (restoring && t - restoring.at < RESTORE_MS) {
-        const arrived = sameSpot(spot, restoring.spot);
+        // The row may be gone by now (Shell then lands on its verse), so the
+        // verse is what counts as arriving.
+        const r = restoring.spot;
+        const arrived = spot.book === r.book && spot.chapter === r.chapter && spot.verse === r.verse;
         if (arrived) {
           landed = spot;
           restoring = null;
@@ -217,12 +220,20 @@ export function createNavHistory(
       // Arriving at a place the list already holds (got there by hand)
       // retires that entry: the list never offers the place you stand on.
       entries = entries.filter((e) => !sameSpot(e, spot));
-      landed = null;
+      landed = narrowed && landed ? spot : null;
+      const firstSight = current === null;
       current = spot;
       since = t;
       // Moving on by hand puts the marker back at the newest end; whatever was
       // ahead of it stays in the list as ordinary recent places.
-      const next = prune(entries, entries.length);
+      // The first position seen after a page load is not a move: leave the
+      // restored marker where it was (minus any entry it just retired).
+      const next = prune(
+        entries,
+        firstSight
+          ? state.entries.slice(0, state.here).filter((e) => !sameSpot(e, spot)).length
+          : entries.length,
+      );
       const same =
         next.here === state.here &&
         next.entries.length === state.entries.length &&
@@ -233,8 +244,12 @@ export function createNavHistory(
     takeAt(index) {
       const target = state.entries[index];
       if (!target) return undefined;
+      // A second jump before the first has landed leaves from where the first
+      // was going, not from a position seen on the way.
+      const t = now();
+      const leaving = restoring && t - restoring.at < RESTORE_MS ? restoring.spot : current;
       const items = state.entries.map((spot, i) => ({ spot, target: i === index, cur: false }));
-      if (current) items.splice(state.here, 0, { spot: current, target: false, cur: true });
+      if (leaving) items.splice(state.here, 0, { spot: leaving, target: false, cur: true });
       // The target leaves the list (it is where we are now); an older copy of
       // the spot we are leaving goes too, the fresh one is kept.
       const entries: NavSpot[] = [];
@@ -245,12 +260,12 @@ export function createNavHistory(
           passedTarget = true;
           continue;
         }
-        if (!it.cur && current && sameSpot(it.spot, current)) continue;
+        if (!it.cur && leaving && sameSpot(it.spot, leaving)) continue;
         entries.push(it.spot);
         if (!passedTarget) here++;
       }
       const next = prune(entries, here);
-      restoring = { spot: target, at: now() };
+      restoring = { spot: target, at: t };
       landed = null;
       set(next);
       return target;

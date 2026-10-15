@@ -139,6 +139,7 @@ export function BackButton({ onGo }: Props) {
               <MenuItem
                 key={`${index}:${spot.book}:${spot.chapter}:${spot.verse}:${spot.rowId ?? ""}`}
                 onClick={() => {
+                  heldOpen.current = false;
                   setMenuAnchor(null);
                   onGo(index);
                 }}

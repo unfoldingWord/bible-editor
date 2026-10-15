@@ -121,6 +121,31 @@ function setup(storage) {
   assert(list(h) === "2:1 3:1 4:1 1:1", "what was ahead stays as recent places, newest last");
 }
 
+// --- a second jump before the first lands leaves from where the first was going ---
+{
+  const { h, visit } = setup();
+  for (const ch of [1, 2, 3, 4]) visit(verse(ch, 1));
+  // list 1 2 3, current 4
+  h.takeAt(2); // heading to 3
+  h.observe(verse(4, 1)); // still showing the old spot
+  const second = h.takeAt(h.view().here - 1); // Back again before arrival
+  assert(second.chapter === 2, "second Back goes one further back");
+  assert(!h.view().entries.some((e) => e.chapter === 2), "target is out of the list");
+  assert(h.view().entries.some((e) => e.chapter === 3), "the spot the first jump was heading to is kept");
+}
+
+// --- landing on the verse counts as arriving even if the row is gone ---
+{
+  const { h, visit, wait } = setup();
+  visit(note(2, 5, "gone"));
+  visit(verse(3, 1));
+  h.takeAt(0); // back to the note, which has since been deleted
+  h.observe(verse(2, 5)); // Shell falls back to the bare verse
+  wait(200);
+  h.observe(verse(9, 9));
+  assert(h.view().entries.some((e) => e.chapter === 2 && e.verse === 5), "the landing is recorded, not swallowed");
+}
+
 // --- bad index ---
 {
   const { h } = setup();
@@ -200,6 +225,8 @@ function setup(storage) {
   const b = setup(storage); // the page reloaded
   assert(list(b.h) === before, "entries are restored after a reload");
   assert(b.h.view().here === a.h.view().here, "the marker is restored too");
+  b.h.observe(verse(2, 1)); // first position after the reload (the page we were on)
+  assert(b.h.view().here === a.h.view().here && b.h.view().entries.length === a.h.view().entries.length, "the first position after a reload keeps the marker and forward entries");
 }
 
 // --- bad or missing storage never breaks the history ---
