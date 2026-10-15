@@ -237,6 +237,9 @@ function setup(storage) {
   assert(bad.view().entries.length === 0, "out-of-range entries are dropped");
   const clamped = createNavHistory(Date.now, fakeStorage('{"entries":[{"book":"ZEC","chapter":1,"verse":2}],"here":99}'));
   assert(clamped.view().here === 1, "marker is clamped into range");
+  const v1 = { getItem: (k) => (k === "bible-editor.navHistory.v1" ? '[{"book":"ZEC","chapter":3,"verse":2},{"book":"ZEC","chapter":5,"verse":4}]' : null), setItem() {} };
+  const migrated = createNavHistory(Date.now, v1);
+  assert(migrated.view().entries.length === 2 && migrated.view().here === 2, "an old v1 trail is carried over, all of it behind you");
   const throwing = { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); } };
   const { h, visit } = setup(throwing);
   visit(verse(1, 1));

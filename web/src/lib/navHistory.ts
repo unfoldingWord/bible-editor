@@ -36,7 +36,9 @@ export const MAX_ENTRIES = 10;
 // and 17), because neighbouring verses are easy to scroll between anyway.
 export const MAX_PER_CHAPTER = 3;
 // How long after a jump its own transitional positions are still ignored.
-const RESTORE_MS = 5000;
+// Generous: a chapter or book can take a while to load (or a tab sit in the
+// background) before the jump lands.
+const RESTORE_MS = 20000;
 
 export function sameSpot(a: NavSpot, b: NavSpot): boolean {
   return (
@@ -121,6 +123,7 @@ export interface NavStorage {
 }
 
 const STORAGE_KEY = "bible-editor.navHistory.v2";
+const OLD_STORAGE_KEY = "bible-editor.navHistory.v1";
 
 function isSpot(x: unknown): x is NavSpot {
   if (!x || typeof x !== "object") return false;
@@ -143,7 +146,15 @@ function load(storage: NavStorage | undefined): NavView {
   if (!storage) return empty;
   try {
     const parsed: unknown = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null");
-    if (!parsed || typeof parsed !== "object") return empty;
+    if (!parsed) {
+      // A tab that saved its history before the marker existed (v1: a bare
+      // array, everything behind you).
+      const old: unknown = JSON.parse(storage.getItem(OLD_STORAGE_KEY) ?? "null");
+      if (!Array.isArray(old)) return empty;
+      const entries = old.filter(isSpot);
+      return prune(entries, entries.length);
+    }
+    if (typeof parsed !== "object") return empty;
     const raw = (parsed as { entries?: unknown; here?: unknown });
     if (!Array.isArray(raw.entries)) return empty;
     const entries = raw.entries.filter(isSpot);
