@@ -51,15 +51,61 @@ export interface NavHistory {
   subscribe(fn: () => void): () => void;
 }
 
-export function createNavHistory(now: () => number = Date.now): NavHistory {
-  let stack: NavSpot[] = [];
+// Where the stack is kept between page loads. sessionStorage fits: it survives
+// a reload and the browser's own back/forward, but stays per tab, so two tabs
+// don't trample each other's trail.
+export interface NavStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+const STORAGE_KEY = "bible-editor.navHistory.v1";
+
+function isSpot(x: unknown): x is NavSpot {
+  if (!x || typeof x !== "object") return false;
+  const s = x as Record<string, unknown>;
+  return (
+    typeof s.book === "string" &&
+    /^[A-Za-z0-9]{3}$/.test(s.book) &&
+    Number.isInteger(s.chapter) &&
+    (s.chapter as number) >= 0 &&
+    Number.isInteger(s.verse) &&
+    (s.verse as number) >= 0 &&
+    (s.kind === undefined || s.kind === "tn" || s.kind === "tq" || s.kind === "twl") &&
+    (s.rowId === undefined || typeof s.rowId === "string") &&
+    (s.hint === undefined || typeof s.hint === "string")
+  );
+}
+
+function loadStack(storage: NavStorage | undefined): NavSpot[] {
+  if (!storage) return [];
+  try {
+    const parsed: unknown = JSON.parse(storage.getItem(STORAGE_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed.filter(isSpot).slice(-MAX_ENTRIES) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function createNavHistory(
+  now: () => number = Date.now,
+  storage?: NavStorage,
+): NavHistory {
+  let stack: NavSpot[] = loadStack(storage);
   let current: NavSpot | null = null;
   let since = 0;
   // Set by takeBack: the next departure belongs to the Back jump itself.
   let suppressDeparture = false;
   let suppressedAt = 0;
   const listeners = new Set<() => void>();
-  const emit = () => listeners.forEach((fn) => fn());
+  const emit = () => {
+    try {
+      storage?.setItem(STORAGE_KEY, JSON.stringify(stack));
+    } catch {
+      // Storage full or blocked: the in-memory history still works.
+    }
+    listeners.forEach((fn) => fn());
+  };
 
   return {
     observe(spot) {
@@ -123,4 +169,13 @@ export function createNavHistory(now: () => number = Date.now): NavHistory {
 
 // One history for the whole app: Shell remounts when the book changes, and the
 // history has to outlive that.
-export const navHistory: NavHistory = createNavHistory();
+export const navHistory: NavHistory = createNavHistory(
+  Date.now,
+  (() => {
+    try {
+      return typeof sessionStorage === "undefined" ? undefined : sessionStorage;
+    } catch {
+      return undefined;
+    }
+  })(),
+);

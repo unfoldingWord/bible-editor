@@ -3,6 +3,11 @@
 
 import { createNavHistory, SETTLE_MS, MAX_ENTRIES } from "./navHistory.ts";
 
+function fakeStorage(initial) {
+  const m = new Map(initial ? [["bible-editor.navHistory.v1", initial]] : []);
+  return { getItem: (k) => m.get(k) ?? null, setItem: (k, v) => void m.set(k, v), raw: () => m.get("bible-editor.navHistory.v1") };
+}
+
 let failed = 0;
 function assert(cond, msg) {
   if (!cond) {
@@ -155,6 +160,39 @@ function setup() {
   off();
   h.takeBack();
   assert(n === 1, "unsubscribed listener is not called");
+}
+
+// --- survives a reload (a new history over the same storage) ---
+{
+  let t = 1000;
+  const storage = fakeStorage();
+  const h1 = createNavHistory(() => t, storage);
+  h1.observe({ ...note(5, 4, "n1"), hint: "his house" });
+  t += SETTLE_MS;
+  h1.observe(verse(8, 1));
+  t += SETTLE_MS;
+  h1.observe(verse(9, 1));
+  const h2 = createNavHistory(() => t, storage); // the page reloaded
+  assert(h2.entries().length === 2, "entries are restored after a reload");
+  assert(h2.entries()[0].rowId === "n1" && h2.entries()[0].hint === "his house", "note and hint are restored");
+  const back = h2.takeBack();
+  assert(back.chapter === 8, "Back works on restored entries");
+  const h3 = createNavHistory(() => t, storage);
+  assert(h3.entries().length === 1, "a Back is saved too");
+}
+
+// --- bad or missing storage never breaks the history ---
+{
+  assert(createNavHistory(Date.now, fakeStorage("not json")).entries().length === 0, "corrupt storage is ignored");
+  assert(createNavHistory(Date.now, fakeStorage('[{"book":1},{"book":"ZEC","chapter":1,"verse":2}]')).entries().length === 1, "malformed entries are dropped");
+  const throwing = { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); } };
+  let t = 0;
+  const h = createNavHistory(() => t, throwing);
+  h.observe(verse(1, 1));
+  t += SETTLE_MS;
+  h.observe(verse(2, 1)); // records an entry, so tries to save
+  assert(h.entries().length === 1, "throwing storage does not break recording");
+  assert(createNavHistory(Date.now, fakeStorage('[{"book":"XYZW","chapter":1,"verse":1},{"book":"ZEC","chapter":-1,"verse":1}]')).entries().length === 0, "out-of-range entries are dropped");
 }
 
 if (failed) {
