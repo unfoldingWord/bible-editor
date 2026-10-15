@@ -2882,7 +2882,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const goToSpot = useCallback(
     (index: number) => {
       runWithDirtyGate(() => {
-        const s = navHistory.takeBack(index);
+        const s = navHistory.takeAt(index);
         if (!s) return;
         if (s.book === book && s.chapter === chapter) {
           // A row that was deleted or trashed since is dropped to its verse.
