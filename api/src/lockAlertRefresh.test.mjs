@@ -917,17 +917,36 @@ console.log("\n[#1127: a landed lock/push adds one sentence to the locked alerts
     await lockRoute("PUT");
     assert(snapshot() === afterDismiss, "a dismissed post-push alert stays dismissed across a lock refresh");
 
-    // A later night's reimport that raises (Door43's file moved) re-measures:
-    // the locked wording stays, the one-time push sentence goes.
-    await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
+    // Review F1: a later raise whose facts are otherwise identical (a manual
+    // re-import of the still-locked book) carries the push forward, so the
+    // dismissed post-push alerts do not pop back a second time.
+    const sameFacts = {
       noBaseCount: 1,
       noBaseRefs: ["1:6"],
       noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
       bookLocked: true,
-      observedAt: PUSH_AT + 86_400_000,
-    });
+    };
+    await raiseVerseMergeConflictAlert(env, BOOK, "ust", { ...sameFacts, observedAt: PUSH_AT + 86_400_000 });
+    for (const u of [ADMIN, EDITOR]) {
+      assert(live(u).length === 0, `${u}: an identical later raise leaves the dismissed post-push alert dismissed (got ${JSON.stringify(live(u))})`);
+    }
+    const keysNow = sqlite
+      .prepare(`SELECT username, condition_key FROM system_alerts WHERE source = ? AND resolved_at IS NULL ORDER BY username`)
+      .all(SOURCE);
+    assert(keysNow.length === 2 && keysNow.every((r) => /lockedPush/.test(r.condition_key ?? "")), "…and the standing keys still carry the push");
+
+    // A later night's reimport whose facts DID change (a new kept verse)
+    // re-measures: a new alert, with the locked wording and without the
+    // one-time push sentence.
+    await recordVerseMergeConflicts(env, BOOK, "ust", "UST", [
+      {
+        chapter: 1, verse: 10, action: "keep_alignment_refused", reason: "alignment_shrink",
+        overwrittenVersion: null, alignment: null, observedVersion: null,
+      },
+    ], PUSH_AT + 2 * 86_400_000);
+    await raiseVerseMergeConflictAlert(env, BOOK, "ust", { ...sameFacts, observedAt: PUSH_AT + 2 * 86_400_000 });
     const later = live(ADMIN)[0]?.message ?? "";
-    assert(/locked/.test(later) && !/pushed the app's version/.test(later), `a later raise keeps the locked wording without the push sentence (got: ${later})`);
+    assert(/1:10/.test(later) && /locked/.test(later) && !/pushed the app's version/.test(later), `a raise with new facts keeps the locked wording without the push sentence (got: ${later})`);
   }
 }
 
@@ -998,10 +1017,110 @@ console.log("\n[#1127: a push changes nothing on an alert with no lock-dependent
     ], 1000);
     await raiseVerseMergeConflictAlert(env, BOOK, "ust", { bookLocked: true, observedAt: 1000 });
     const snap = () =>
-      JSON.stringify(sqlite.prepare(`SELECT id, username, message, condition_key, dismissed_at, resolved_at FROM system_alerts WHERE source = ? ORDER BY id`).all(SOURCE));
+      JSON.stringify(sqlite.prepare(`SELECT id, username, message, condition_key, condition_observed_at, dismissed_at, resolved_at FROM system_alerts WHERE source = ? ORDER BY id`).all(SOURCE));
     const before = snap();
     await noteLockedPush(env, BOOK, "ust", push, PUSH_AT);
     assert(snap() === before, "an overwrite-only alert (no locked wording) is left as it was");
+  } else {
+    assert(false, "the #1127 exports exist");
+  }
+}
+
+console.log("\n[#1127 review 1: the push note changes nothing when no alert would take the sentence]");
+{
+  // The only lock-dependent row was resolved by a save after the last
+  // reimport; what is left live is an overwrite, which reads the same locked
+  // or not. Everything is dismissed. Rebuilding from the live rows would mint
+  // a new alert that says nothing about the push.
+  const { sqlite, env } = freshApp();
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES (?, 1, 900)`).run(BOOK);
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', ?, ?, 7, 4, 'update')`)
+    .run(`${BOOK}/1/9/UST`, BOOK);
+  await recordVerseMergeConflicts(env, BOOK, "ust", "UST", [
+    {
+      chapter: 1, verse: 8, action: "keep_alignment_refused", reason: "alignment_shrink",
+      overwrittenVersion: null, alignment: null, observedVersion: null,
+    },
+    {
+      chapter: 1, verse: 9, action: "adopt_conflict", reason: "both_changed",
+      overwrittenVersion: 4, alignment: null, observedVersion: null,
+    },
+  ], 1000);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", { bookLocked: true, observedAt: 1000 });
+  sqlite.prepare(`UPDATE system_alerts SET dismissed_at = 5000 WHERE source = ? AND resolved_at IS NULL`).run(SOURCE);
+  sqlite
+    .prepare(`UPDATE verse_merge_conflicts SET resolved_at = 6000, resolved_by = 7 WHERE book = ? AND chapter = 1 AND verse = 8`)
+    .run(BOOK);
+  const snapshot = () =>
+    JSON.stringify(sqlite.prepare(`SELECT id, username, message, condition_key, condition_observed_at, dismissed_at, resolved_at FROM system_alerts WHERE source = ? ORDER BY id`).all(SOURCE));
+  const before = snapshot();
+  if (typeof noteLockedPush === "function" && typeof lockedPushLanded === "function") {
+    await noteLockedPush(env, BOOK, "ust", lockedPushLanded(landedResult(), pushOpts()), PUSH_AT);
+    assert(snapshot() === before, `nothing is reminted or touched (got ${snapshot()})`);
+  } else {
+    assert(false, "the #1127 exports exist");
+  }
+}
+
+console.log("\n[#1127 review 1: a dismissed recipient who does not take the sentence is not reminted over live-row drift]");
+{
+  // Admin: a kept verse (locked wording, takes the sentence) and an overwrite.
+  // Editor: only the overwrite, which does not depend on the lock. Both
+  // dismissed; a save then resolved the overwrite. The push brings the
+  // admin's alert back once with the sentence; the editor's is left alone.
+  const { sqlite, env } = freshApp();
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES (?, 1, 900)`).run(BOOK);
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', ?, ?, 7, 4, 'update')`)
+    .run(`${BOOK}/1/9/UST`, BOOK);
+  await recordVerseMergeConflicts(env, BOOK, "ust", "UST", [
+    {
+      chapter: 1, verse: 8, action: "keep_alignment_refused", reason: "alignment_shrink",
+      overwrittenVersion: null, alignment: null, observedVersion: null,
+    },
+    {
+      chapter: 1, verse: 9, action: "adopt_conflict", reason: "both_changed",
+      overwrittenVersion: 4, alignment: null, observedVersion: null,
+    },
+  ], 1000);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", { bookLocked: true, observedAt: 1000 });
+  const editorRows = () =>
+    JSON.stringify(sqlite.prepare(`SELECT id, message, condition_key, condition_observed_at, dismissed_at, resolved_at FROM system_alerts WHERE source = ? AND username = ? ORDER BY id`).all(SOURCE, EDITOR));
+  assert(JSON.parse(editorRows()).length === 1, "setup: the editor has an overwrite alert");
+  sqlite.prepare(`UPDATE system_alerts SET dismissed_at = 5000 WHERE source = ? AND resolved_at IS NULL`).run(SOURCE);
+  sqlite
+    .prepare(`UPDATE verse_merge_conflicts SET resolved_at = 6000, resolved_by = 7 WHERE book = ? AND chapter = 1 AND verse = 9`)
+    .run(BOOK);
+  const editorBefore = editorRows();
+  if (typeof noteLockedPush === "function" && typeof lockedPushLanded === "function") {
+    await noteLockedPush(env, BOOK, "ust", lockedPushLanded(landedResult(), pushOpts()), PUSH_AT);
+    assert(editorRows() === editorBefore, `the editor's dismissed alert is untouched (got ${editorRows()})`);
+    const admin = sqlite
+      .prepare(`SELECT message FROM system_alerts WHERE source = ? AND username = ? AND dismissed_at IS NULL AND resolved_at IS NULL`)
+      .all(SOURCE, ADMIN);
+    assert(admin.length === 1 && /pushed the app's version/.test(admin[0].message), "the admin's alert comes back once, with the push sentence");
+  } else {
+    assert(false, "the #1127 exports exist");
+  }
+}
+
+console.log("\n[#1127 review 2: a -be- push whose pull request could not be opened says so]");
+{
+  const { sqlite, env, live } = freshApp();
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES (?, 1, 900)`).run(BOOK);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    bookLocked: true,
+    observedAt: 1000,
+  });
+  if (typeof noteLockedPush === "function" && typeof lockedPushLanded === "function") {
+    await noteLockedPush(env, BOOK, "ust", lockedPushLanded(landedResult({ prNumber: null, prReason: "error" }), pushOpts()), PUSH_AT);
+    const m = live(ADMIN)[0]?.message ?? "";
+    assert(/JER-be-bethoakes/.test(m) && /no pull request/i.test(m), `it names the branch and says no pull request is open (got: ${m})`);
+    assert(!/merges into master if its checks pass/.test(m), "…and does not promise an automatic merge");
   } else {
     assert(false, "the #1127 exports exist");
   }
@@ -1020,7 +1139,7 @@ console.log("\n[#1127: a failed lock read during the push note changes nothing (
   });
   sqlite.prepare(`UPDATE system_alerts SET dismissed_at = 5000 WHERE source = ? AND resolved_at IS NULL`).run(SOURCE);
   const snapshot = () =>
-    JSON.stringify(sqlite.prepare(`SELECT id, username, message, condition_key, dismissed_at, resolved_at FROM system_alerts WHERE source = ? ORDER BY id`).all(SOURCE));
+    JSON.stringify(sqlite.prepare(`SELECT id, username, message, condition_key, condition_observed_at, dismissed_at, resolved_at FROM system_alerts WHERE source = ? ORDER BY id`).all(SOURCE));
   const before = snapshot();
   const failingLockEnv = {
     ...env,
