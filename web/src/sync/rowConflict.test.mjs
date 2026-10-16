@@ -6,7 +6,7 @@
 // same-field conflict still must.
 
 import assert from "node:assert/strict";
-import { classifyRowPatchConflict } from "./rowConflict.ts";
+import { classifyRowPatchConflict, rowThreadDecision } from "./rowConflict.ts";
 
 let passed = 0;
 const check = (cond, msg) => {
@@ -118,6 +118,71 @@ check(
     { version: 3, occurrence: 3 },
   ) === "conflict",
   "numeric field changed on both sides to different values -> conflict",
+);
+
+// ---- rowThreadDecision (#1213) --------------------------------------------
+// After this user's own op on a row lands, the outbox threads the new version
+// into queued sibling ops. A sibling pinned to an older server version must not
+// be re-armed past another user's change to one of its fields.
+
+// Issue #1213 example: kept typing pinned at v1 (question "orig"); another user
+// changes question at v2; this user's reorder lands at v3; then the offline
+// Save drains. Threading must refuse, and the Save's 409 must prompt.
+{
+  const save = { patch: { question: "mine" }, baseline: { question: "orig" } };
+  const reorder = { patch: { sort_order: 5 } };
+  const afterReorder = { version: 3, question: "THEIRS", sort_order: 5 };
+  check(
+    rowThreadDecision(save.patch, save.baseline, reorder.patch, afterReorder) === "refuse_thread",
+    "#1213: pinned Save is not threaded past another user's change to its field",
+  );
+  // Not threaded -> dispatches with If-Match 1 -> 409 with current v3.
+  check(
+    classifyRowPatchConflict(save.patch, save.baseline, afterReorder) === "conflict",
+    "#1213: the un-threaded Save's 409 classifies as conflict (prompt), not auto-heal",
+  );
+}
+
+// Own-op chaining: two saves of the same field, the second typed on top of the
+// first (baseline = first save's value). Must still thread.
+check(
+  rowThreadDecision(
+    { question: "AB" },
+    { question: "A" },
+    { question: "A" },
+    { version: 2, question: "A" },
+  ) === "thread",
+  "own chained save (baseline = landed value) threads",
+);
+
+// Own chain whose second save's baseline was captured before the first landed
+// locally: the server value is exactly what our own landed op wrote.
+check(
+  rowThreadDecision(
+    { question: "AB" },
+    { question: "orig" },
+    { question: "A" },
+    { version: 2, question: "A" },
+  ) === "thread",
+  "own chained save whose baseline predates the first save still threads",
+);
+
+// Sibling edits a different field than the landed op; server untouched there.
+check(
+  rowThreadDecision(
+    { response: "R2" },
+    { response: "R1" },
+    { question: "Q2" },
+    { version: 2, question: "Q2", response: "R1" },
+  ) === "thread",
+  "sibling on an untouched field threads",
+);
+
+// Pre-baseline ops keep the old behaviour (thread).
+check(
+  rowThreadDecision({ question: "x" }, undefined, { sort_order: 1 }, { version: 2, question: "y" }) ===
+    "thread",
+  "op without a baseline keeps threading (old behaviour)",
 );
 
 console.log(`\nrowConflict.test.mjs: ${passed} checks passed`);
