@@ -1453,8 +1453,7 @@ function storedVerseMergeAlertState(
 // The lock is read here as it is now, with no lock/push override: the push has
 // already happened, so an alert this run's changed-file reimport raised with
 // the override wording ("tonight's export will write") is corrected to the
-// locked wording too. A failed lock read falls back to the unlocked wording
-// with no push sentence, as every raise does.
+// locked wording too. A failed lock read leaves the alert as it was.
 //
 // Nothing standing means nothing to note. A key that cannot be re-derived is
 // left for the next reimport, as the lock refresh leaves it. `observedAt` must
@@ -1482,13 +1481,28 @@ export async function noteLockedPushOnVerseMergeAlert(
       console.warn("verseMergeConflicts: lock/push left an alert it cannot re-derive", { book, resource });
       return;
     }
+    // Read the lock before raising. A failed read would make the raise fall
+    // back to the unlocked wording as a new condition, bringing dismissed
+    // alerts back with a guess on a locked book (#1129 review B1), so a failed
+    // read changes nothing here.
+    let bookLocked: boolean;
+    try {
+      bookLocked = (await effectiveBookLock(env, book)) != null;
+    } catch (e) {
+      console.error("verseMergeConflicts: lock/push note could not read the lock; alert left as it was", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return;
+    }
     const ordered = [...state.noBase].sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
     await raiseVerseMergeConflictAlert(env, book, resource, {
       recordingFailed: false,
       noBaseCount: state.noBaseCount,
       noBaseRefs: ordered.map((r) => `${r.chapter}:${r.verse}`),
       noBaseEditorRefs: ordered.map((r) => ({ chapter: r.chapter, verse: r.verse, version: r.version })),
-      bookLocked: async () => (await effectiveBookLock(env, book)) != null,
+      bookLocked,
       observedAt,
       lockedPush: push,
     });
