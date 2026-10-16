@@ -146,6 +146,16 @@ export interface LedgerRow {
    * Used solely to compute a gap's frontier (computeGapFrontier below).
    */
   parentShas: string[];
+  /**
+   * Issue #1200: the same parents, persisted as dcs_commits.parent_shas_json
+   * so the gap backfill can follow history it already holds without fetching
+   * it again. Set ONLY from the walk's own `allParentShas` (Gitea's `parents`
+   * array, which listMasterCommitsSince validates entry by entry whenever
+   * `files: true`, as every ledger walk passes) — never from the first-parent
+   * fallback above, which would record a merge as if it had one parent and
+   * let the backfill skip its second branch. NULL = unknown.
+   */
+  parentShasJson: string | null;
   authorName: string | null;
   authorEmail: string | null;
   committedAt: number | null;
@@ -306,6 +316,7 @@ export function ledgerRowsFromCommits(
       // fixture predating issue #692 item 2's rework) supplied only
       // `parentSha` — never fewer parents than the field we've always had.
       parentShas: c.allParentShas ?? (c.parentSha ? [c.parentSha] : []),
+      parentShasJson: Array.isArray(c.allParentShas) ? JSON.stringify(c.allParentShas) : null,
       authorName: c.authorName ?? null,
       authorEmail: c.authorEmail ?? null,
       committedAt: Number.isFinite(at) ? Math.floor(at / 1000) : null,
@@ -379,11 +390,18 @@ export function parseGapFrontier(json: string | null): string[] {
 
 // Exported so dcsCommitBackfill.ts (issue #692 item 2) writes the exact same
 // statement rather than a second copy that could drift from it.
+//
+// A conflict changes nothing that is already recorded: seen_at, the
+// classification and every other column keep the first walk's values. The one
+// exception (issue #1200) fills parent_shas_json on a row that predates
+// migration 0078 and so has none. A parent list is a fixed fact of the sha, so
+// filling it in later can only turn "unknown" into the truth.
 export const INSERT_COMMIT_SQL = `INSERT INTO dcs_commits
    (repo, sha, parent_sha, author_name, author_email, committed_at, message,
-    classification, classification_reason, files_json, seen_at)
- VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
- ON CONFLICT (repo, sha) DO NOTHING`;
+    classification, classification_reason, files_json, seen_at, parent_shas_json)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+ ON CONFLICT (repo, sha) DO UPDATE SET parent_shas_json = excluded.parent_shas_json
+   WHERE dcs_commits.parent_shas_json IS NULL AND excluded.parent_shas_json IS NOT NULL`;
 
 // ATTEMPT CLAIM (review finding F1). Written BEFORE the walk, in its own tiny
 // batch-free statement, because the alternative was a fetch loop with no exit:
@@ -555,6 +573,7 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
       r.reason,
       r.filesJson,
       nowSeconds,
+      r.parentShasJson,
     ),
   );
   const pollStatement = env.DB.prepare(UPSERT_POLL_SQL).bind(

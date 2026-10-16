@@ -80,6 +80,13 @@ const D1_MAX_BATCH_STATEMENTS = 100;
 // answers regardless of whether the CAS applied — but the concurrent-write
 // race test below needs the mock to actually decide whether a write landed,
 // not just record that it was attempted.
+function emptyLedgerExpansion(args) {
+  const [, seedsJson, gapSinceSha] = args;
+  return Array.from(new Set(JSON.parse(seedsJson)))
+    .filter((sha) => sha !== gapSinceSha)
+    .map((sha) => ({ sha }));
+}
+
 function mockDb(stateRow) {
   const executed = [];
   const runs = [];
@@ -92,6 +99,12 @@ function mockDb(stateRow) {
     },
     async first() {
       return current ? { ...current } : null;
+    },
+    // The ledger-expansion query (issue #1200) against an EMPTY ledger:
+    // nothing is known, so every distinct entry except gap_since_sha comes
+    // back as still to walk. The real query is tested on SQLite below.
+    async all() {
+      return { results: emptyLedgerExpansion(this.args) };
     },
     async run() {
       runs.push({ sql: this.sql, args: this.args });
@@ -447,6 +460,9 @@ async function main() {
             const repo = TRACKED_DCS_REPOS[callIndex++];
             return repo === "en_ult" ? state(null, null) : state("g", ["f"]);
           },
+          async all() {
+            return { results: emptyLedgerExpansion(this.args) };
+          },
           async run() {
             return { success: true };
           },
@@ -573,6 +589,38 @@ async function main() {
       assert(f.parent_shas_json === '["P"]', "  ...recording F's parents on the existing row so the next walk can follow them locally");
       const p = d.prepare(`SELECT parent_shas_json FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'P'`).get();
       assert(p.parent_shas_json === "[]", "  ...and a newly inserted root records an explicit empty parent list");
+    }
+
+    // Expansion stops at a held row with unknown parents (P) and at a held row
+    // whose recorded list is malformed (M): both are walked, never trusted.
+    {
+      for (const [label, setup, expectWalkFrom] of [
+        ["a known row's parent held without parents", (d) => (ledgerRow(d, "F", ["P"]), ledgerRow(d, "P", undefined)), "P"],
+        [
+          "a held row with a malformed parent list",
+          (d) =>
+            d
+              .prepare(
+                `INSERT INTO dcs_commits (repo, sha, committed_at, classification, seen_at, parent_shas_json) VALUES ('en_tn', 'F', 1, 'human', 1, '["P", 5]')`,
+              )
+              .run(),
+          "F",
+        ],
+      ]) {
+        const d = fresh();
+        setup(d);
+        openGap(d, ["F"]);
+        const seen = [];
+        globalThis.fetch = async (url) => {
+          seen.push(new URL(url).searchParams.get("sha"));
+          throw new Error("network");
+        };
+        const res = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+        assert(
+          res.resolved === false && gapRow(d).gap_since_sha === FAR && seen[0] === expectWalkFrom,
+          `#1200: ${label} is walked on Door43 (from ${expectWalkFrom}) and the gap stays open`,
+        );
+      }
     }
 
     // A duplicated frontier entry is walked once.

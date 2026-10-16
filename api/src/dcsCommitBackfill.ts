@@ -67,6 +67,29 @@
 // depends on closing it quickly (dcs_commits is not read for any gating
 // decision yet; see the module doc on dcsCommitPoll.ts).
 //
+// CONVERGENCE (issue #1200). The FIFO above, on its own, never finished on
+// en_tn: each entry walked 100 commits per tick and appended its sub-frontier,
+// entries on the same line of history each walked the same commits again, and
+// nothing removed an entry that a walk had already passed, so the frontier
+// grew (1,707 to 1,714 entries, measured 2026-10-16) faster than it drained.
+// Two changes make it drain, and neither stops the walk anywhere the old walk
+// would have continued:
+//   * the frontier is DEDUPED on every read and write. The same sha twice is
+//     the same walk twice.
+//   * an entry whose ledger row carries its full parent list
+//     (dcs_commits.parent_shas_json, migration 0078) is EXPANDED LOCALLY:
+//     replaced by its parents, recursively, until every remaining entry is a
+//     commit the ledger does not hold, or holds without parents. Those are
+//     exactly the edges a Door43 walk from the entry would follow (parents
+//     are a fixed fact of the sha, and expansion stops at gap_since_sha the
+//     same way computeGapFrontier does), minus the fetches for commits
+//     already held. It does NOT trust "the row exists": a row proves nothing
+//     about its ancestors (inserts land before the frontier write, a clean
+//     forward poll records no frontier, a bootstrap walk is time-bounded), so
+//     a row with no recorded parents is fetched again, and that fetch records
+//     them.
+// If expansion empties the frontier, the gap clears with no fetch at all.
+//
 // BOOTSTRAP GAPS, walked out fully. A bootstrap gap's gap_since_sha names a
 // sha this backward walk will never encounter (see above), so
 // listMasterCommitsSince eventually reaches a root commit and reports
@@ -144,6 +167,50 @@ const UPDATE_FRONTIER_SQL = `UPDATE dcs_repo_polls
    SET gap_frontier_json = ?3
  WHERE repo = ?1 AND gap_since_sha = ?2 AND gap_frontier_json = ?4`;
 
+// Issue #1200: the commits a walk from these entries would still have to
+// fetch. Seeds the frontier, follows dcs_commits.parent_shas_json through
+// every row that has a well-formed list (a JSON array of text shas), and
+// returns each reached sha that is NOT such a row: absent from the ledger, or
+// present with unknown parents. Neither the seed nor the recursion passes
+// through gap_since_sha (?3): the same far-edge rule as computeGapFrontier,
+// and a walk from gap_since_sha itself reaches its target at once. UNION (not
+// UNION ALL) dedupes and makes a revisited sha a no-op.
+const KNOWN_PARENTS = (alias: string) => `${alias}.parent_shas_json IS NOT NULL
+      AND json_valid(${alias}.parent_shas_json)
+      AND json_type(${alias}.parent_shas_json) = 'array'
+      AND NOT EXISTS (SELECT 1 FROM json_each(${alias}.parent_shas_json) bad WHERE bad.type != 'text')`;
+const UNCOVERED_FRONTIER_SQL = `WITH RECURSIVE reach(sha) AS (
+    SELECT s.value FROM json_each(?2) s WHERE s.type = 'text' AND s.value != ?3
+    UNION
+    SELECT p.value
+      FROM reach r
+      JOIN dcs_commits c ON c.repo = ?1 AND c.sha = r.sha AND ${KNOWN_PARENTS("c")}
+      JOIN json_each(c.parent_shas_json) p
+     WHERE p.value != ?3
+  )
+  SELECT r.sha AS sha FROM reach r
+   WHERE NOT EXISTS (SELECT 1 FROM dcs_commits k WHERE k.repo = ?1 AND k.sha = r.sha AND ${KNOWN_PARENTS("k")})`;
+
+/**
+ * The frontier with duplicates removed and every entry the ledger can already
+ * answer replaced by what it leads to (see CONVERGENCE in the module doc).
+ * Order: surviving original entries keep their place; newly reached ones
+ * follow, sorted, so the result does not depend on SQLite's row order.
+ */
+async function uncoveredFrontier(env: Env, repo: string, frontier: string[], gapSinceSha: string): Promise<string[]> {
+  const distinct = Array.from(new Set(frontier));
+  const res = await env.DB.prepare(UNCOVERED_FRONTIER_SQL)
+    .bind(repo, JSON.stringify(distinct), gapSinceSha)
+    .all<{ sha: string }>();
+  const uncovered = new Set((res.results ?? []).map((r) => r.sha));
+  const kept = distinct.filter((sha) => uncovered.has(sha));
+  const keptSet = new Set(kept);
+  const reached = Array.from(uncovered)
+    .filter((sha) => !keptSet.has(sha))
+    .sort();
+  return [...kept, ...reached];
+}
+
 /**
  * Backfill one repo's recorded gap by advancing a single frontier entry a
  * small, bounded amount. No-op (and cheap: one D1 read) when the repo has no
@@ -173,8 +240,17 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
     return { repo, attempted: true, fetched: 0, inserted: 0, resolved: true, status: "no_frontier" };
   }
 
+  // Issue #1200: drop duplicates and everything the ledger already answers
+  // before spending a fetch. An empty result means every branch of the hole
+  // is already in the ledger, so the gap clears with no Door43 walk.
+  const open = await uncoveredFrontier(env, repo, frontier, state.gap_since_sha);
+  if (open.length === 0) {
+    await env.DB.prepare(CLEAR_GAP_SQL).bind(repo, state.gap_since_sha, frontierJson).run();
+    return { repo, attempted: true, fetched: 0, inserted: 0, resolved: true, status: "ledger_covered" };
+  }
+
   // ONE entry per tick — see the module doc's "ONE ENTRY PER REPO PER TICK".
-  const [current, ...rest] = frontier;
+  const [current, ...rest] = open;
 
   const page = await listMasterCommitsSince(env, repo, null, state.gap_since_sha, {
     pageLimit: DCS_BACKFILL_PAGE_LIMIT,
@@ -215,6 +291,7 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
       r.reason,
       r.filesJson,
       seenAtFor(r.committedAt),
+      r.parentShasJson,
     ),
   );
   for (let i = 0; i < insertStatements.length; i += DCS_POLL_WRITE_BATCH) {
@@ -243,15 +320,17 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
   let status: string;
   let newFrontier: string[];
   if (isTransportFailure) {
-    // Put `current` (and every other untouched entry) back unchanged. The
-    // rows fetched before the failure (if any) are still inserted above —
-    // the next tick resumes the same entry, exactly like a mid-walk
-    // transport failure in the regular poll.
+    // Put `current` (and every other untouched entry) back. The rows fetched
+    // before the failure (if any) are still inserted above, with their
+    // parents, so next tick's expansion carries on from them, exactly like
+    // a mid-walk transport failure in the regular poll. The expanded
+    // frontier is written, not the raw one: expansion holds whether or not
+    // this walk got anywhere.
     status = page.incompleteReason;
-    newFrontier = frontier;
+    newFrontier = open;
   } else {
     const subFrontier = computeGapFrontier(rows, state.gap_since_sha);
-    newFrontier = [...rest, ...subFrontier];
+    newFrontier = Array.from(new Set([...rest, ...subFrontier]));
     status = reachedTarget
       ? "ok"
       : reachedHistoryEnd
