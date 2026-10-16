@@ -101,12 +101,13 @@ import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
-import { laneCheckHeldByRefusal, targetKey as outboxTargetKey } from "../sync/outboxTargeting";
+import { heldTextLaneMarks, targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 
 // #1218: my Text-lane mark on a verse whose earlier text save was turned down
 // shows as "waiting" (it is held in the outbox, not yet sent), not as done.
+// #1220: a held uncheck waits too, so `held` alone decides.
 function textLaneShade(checkers: number[] | undefined, meUserId: number | null, held: boolean): LaneShade {
-  if (held && meUserId != null && checkers?.includes(meUserId)) return "waiting";
+  if (held && meUserId != null) return "waiting";
   return shadeFromCheckers(checkers, meUserId);
 }
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
@@ -1727,30 +1728,36 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setHeldTextKey("");
     const unsubscribe = outbox.subscribe((ops) => {
         if (cancelled) return;
-        const verses = ops
-          .filter(
-            (o) =>
-              o.target.kind === "lane_check" &&
-              o.target.lane === "text" &&
-              o.target.book === book &&
-              o.target.chapter === chapter &&
-              o.status === "pending" &&
-              o.patch.checked === true &&
-              laneCheckHeldByRefusal(o, ops),
-          )
-          .map((o) => (o.target.kind === "lane_check" ? o.target.verse : 0))
-          .sort((a, b) => a - b);
-        setHeldTextKey([...new Set(verses)].join(","));
+        // "verse:1" for a held check, "verse:0" for a held uncheck (#1220).
+        const marks = heldTextLaneMarks(ops, book, chapter);
+        setHeldTextKey(
+          [...marks]
+            .sort((a, b) => a[0] - b[0])
+            .map(([v, c]) => `${v}:${c ? 1 : 0}`)
+            .join(","),
+        );
       });
     return () => {
       cancelled = true;
       unsubscribe();
     };
   }, [book, chapter]);
+  // verse -> the held mark's checked value; `.has(verse)` means waiting.
   const heldTextVerses = useMemo(
-    () => new Set(heldTextKey ? heldTextKey.split(",").map(Number) : []),
+    () =>
+      new Map<number, boolean>(
+        heldTextKey
+          ? heldTextKey.split(",").map((e) => {
+              const [v, c] = e.split(":");
+              return [Number(v), c === "1"] as [number, boolean];
+            })
+          : [],
+      ),
     [heldTextKey],
   );
+  // The bulk reply lands later; it re-applies the held marks as they are then.
+  const heldTextVersesRef = useRef(heldTextVerses);
+  heldTextVersesRef.current = heldTextVerses;
   const tileSet = useMemo<VerseTile[]>(() => {
     if (!versesForTiles) return [];
     const versesWithSomething = new Set<number>();
@@ -1986,14 +1993,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // book, so skip the optimistic apply rather than flip every checkbox
     // in the chapter and then silently revert them.
     if (editLocked) return;
-    for (const v of p.verses) applyLocalLaneCheck(v, p.lane, meUserId, p.checked);
+    // #1220: a save turned down while the dialog was open holds that verse's
+    // mark now, so drop it here too, as bulkLaneToggle does at open.
+    const verses = p.lane === "text" ? p.verses.filter((v) => !heldTextVerses.has(v)) : p.verses;
+    if (verses.length === 0) return;
+    for (const v of verses) applyLocalLaneCheck(v, p.lane, meUserId, p.checked);
     void api
-      .setLaneCheckBulk(book, chapter, p.lane, p.checked, p.verses)
-      .then((res) => replaceLaneChecksForLane(p.lane, res.checks))
+      .setLaneCheckBulk(book, chapter, p.lane, p.checked, verses)
+      .then((res) => {
+        replaceLaneChecksForLane(p.lane, res.checks);
+        // #1220: the server's list leaves out my held marks, so put them back
+        // on screen; otherwise a waiting verse would show open until sent.
+        if (p.lane !== "text") return;
+        for (const [v, c] of heldTextVersesRef.current) applyLocalLaneCheck(v, "text", meUserId, c);
+      })
       .catch(() => {
         /* leave optimistic state; a later load reconciles */
       });
-  }, [pendingBulk, book, chapter, meUserId, applyLocalLaneCheck, replaceLaneChecksForLane, editLocked]);
+  }, [pendingBulk, book, chapter, meUserId, applyLocalLaneCheck, replaceLaneChecksForLane, editLocked, heldTextVerses]);
 
   // In-context checkoff for the resource panels, scoped to the active verse.
   const resourceCheckoff = useMemo<ResourceCheckoff>(() => {
