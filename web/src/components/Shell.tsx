@@ -3502,7 +3502,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // See outbox.ts's OutboxOp.alignmentDraftKey (#1071): the aligner panel's
     // crash-draft key, which on a range row is not the PATCH's verse_start.
     draftKey?: string,
-  ): boolean => {
+    // false: nothing was queued (a guard toast is shown, or the text_edit
+    // confirm is open). Otherwise a promise of whether IndexedDB stored the op
+    // (#1196); callers that treat any non-false as queued keep doing so.
+  ): false | Promise<boolean> => {
     // The row this save targets, kept with a refused save's crash draft (#1074).
     const draftRow = draftKey ? alignmentDraftRow(base) : undefined;
     const delta = analyzeAlignmentDelta(base.content, content);
@@ -3556,16 +3559,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       );
       return false;
     }
-    void outbox.enqueueVerse(
-      book,
-      chapterNum,
-      verseNum,
-      bibleVersion,
-      expectedVersion,
-      { content, plain_text: plainText, alignment_intent: intent },
-      { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow, verseEnd: base.verse_end },
-    );
-    return true;
+    return outbox
+      .enqueueVerse(
+        book,
+        chapterNum,
+        verseNum,
+        bibleVersion,
+        expectedVersion,
+        { content, plain_text: plainText, alignment_intent: intent },
+        { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow, verseEnd: base.verse_end },
+      )
+      .then(
+        // Read-only mode hands back a no-op op without storing anything.
+        (op) => op.id !== "readonly-noop",
+        (e: unknown) => {
+          console.error(`[outbox] could not queue the ${book} ${chapterNum}:${verseNum} ${bibleVersion} save`, e);
+          return false;
+        },
+      );
   }, [book, pushPipelineToast]);
 
   // The aligner's "Words will be unaligned" confirm. A lock can land while it
@@ -3756,8 +3767,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // Returns whether a PATCH was queued. #986: when nothing was sent, say so,
     // and the panel keeps its edit and skips afterCommit, so "save, mark done,
     // next" does not mark the verse done or move on (its guard is freed here).
+    // #1196: read-only mode queues nothing (the outbox returns a no-op), and an
+    // IndexedDB write can reject, so the answer for a real enqueue is a
+    // promise the panel waits on.
     const enqueue = (bibleVersion: string, row: VerseDto | null) =>
-      (content: unknown, plain: string, _expectedVersion: number, draftGeneration?: string): boolean => {
+      (content: unknown, plain: string, _expectedVersion: number, draftGeneration?: string): boolean | Promise<boolean> => {
         const dropped = () => {
           saveDoneGuardRef.current.cancel();
           return false;
@@ -3769,8 +3783,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           );
           return dropped();
         }
+        if (isReadOnly()) {
+          pushPipelineToast(
+            `Saving is turned off here (view-only access or a locked book), so the ${bibleVersion} alignment for ${vref} was not saved and the verse was not marked done. Your changes are still in the aligner.`,
+            "error",
+          );
+          return dropped();
+        }
         // A false here already showed its own message.
-        if (!enqueueVerseSafely(
+        const queued = enqueueVerseSafely(
           dualTarget.chapter,
           row.verse,
           bibleVersion,
@@ -3784,15 +3805,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           draftGeneration,
           undefined,
           alignmentDraftKey(book, dualTarget.chapter, dualTarget.verse, bibleVersion),
-        )) {
-          return dropped();
-        }
-        // Optimistic local update so content-derived UI (the broken-alignment
-        // link) refreshes immediately — same as the single-panel aligner.
-        const newDto = { ...row, content, plain_text: plain } as VerseDto;
-        bookHook?.applyLocalVerse(newDto);
-        if (dualTarget.chapter === chapter) applyLocalVerse(newDto);
-        return true;
+        );
+        if (!queued) return dropped();
+        return queued.then((stored) => {
+          if (!stored) {
+            pushPipelineToast(
+              `The ${bibleVersion} alignment for ${vref} could not be stored on this device, so it was not saved and the verse was not marked done. Your changes are still in the aligner.`,
+              "error",
+            );
+            return dropped();
+          }
+          // Optimistic local update so content-derived UI (the broken-alignment
+          // link) refreshes immediately — same as the single-panel aligner.
+          const newDto = { ...row, content, plain_text: plain } as VerseDto;
+          bookHook?.applyLocalVerse(newDto);
+          if (dualTarget.chapter === chapter) applyLocalVerse(newDto);
+          return true;
+        });
       };
     const confirmUnalign = (bibleVersion: string, row: VerseDto | null) =>
       (lostWords: string[], commit: () => void) =>

@@ -105,3 +105,60 @@ export function createSaveDoneAndNextGuard() {
     },
   };
 }
+
+// One pending outbox write per aligner panel (#1196 item 2, review of #1207).
+// A save that starts while an earlier write is still pending waits for it to
+// settle and then runs against the panel's state at that time, so two saves
+// never race: an older save's late commit cannot clear a newer crash draft or
+// release the save-done-next guard under a newer save.
+export function createWriteLatch() {
+  let pending: Promise<void> | null = null;
+  return {
+    hold(write: Promise<unknown>): void {
+      const mine: Promise<void> = write.then(
+        () => {},
+        () => {},
+      ).then(() => {
+        if (pending === mine) pending = null;
+      });
+      pending = mine;
+    },
+    // Runs `fn` once the pending write settles and returns true; false (and
+    // `fn` not run) when nothing is pending, so the caller saves now.
+    after(fn: () => void): boolean {
+      if (!pending) return false;
+      void pending.then(fn);
+      return true;
+    },
+  };
+}
+export type WriteLatch = ReturnType<typeof createWriteLatch>;
+
+// How an aligner panel acts on its onSave answer (#986, #1196). false: nothing
+// was queued, so keep the edit and its crash draft and run no afterCommit.
+// void/true: queued synchronously (the single-panel aligner), commit now. A
+// promise (the dual aligner, whose IndexedDB write can reject): commit only
+// once it resolves true; false or a rejection means nothing was queued. The
+// latch, when given, holds later saves until the promise settles.
+// Returns whether the commit happened synchronously.
+export function settleOnSave(
+  queued: boolean | void | Promise<boolean>,
+  committed: (deferred: boolean) => void,
+  notQueued: () => void,
+  latch?: WriteLatch,
+): boolean {
+  if (queued === false) {
+    notQueued();
+    return false;
+  }
+  if (queued instanceof Promise) {
+    const settled = queued.then(
+      (ok) => (ok ? committed(true) : notQueued()),
+      () => notQueued(),
+    );
+    latch?.hold(settled);
+    return false;
+  }
+  committed(false);
+  return true;
+}
