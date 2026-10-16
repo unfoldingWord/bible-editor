@@ -48,6 +48,7 @@ import {
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
   loadRevertLineage,
+  ledgerProvesNoHumanCommit,
   readUnconfirmedRenders,
   foreignCommitDuringExport,
   exportRevertRaceAlertSource,
@@ -101,7 +102,9 @@ import {
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
 import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
-import { dcsResourceFile, fetchDcsMasterText, fileBlobShaAtCommit, fileHeadCommit, type ReimportResource } from "./dcsSources";
+import { dcsResourceFile, fetchDcsMasterText, fileBlobShaAtCommit, fileHeadCommit, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
+import { readLedgerMasterLineage, type LedgerLineageResult } from "./masterLineageLedger.ts";
+import { DCS_POLL_FETCH_TIMEOUT_MS } from "./dcsCommitPoll.ts";
 import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
 import { classifyMasterCommit, type MasterCommit } from "./masterLineage";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
@@ -1664,13 +1667,40 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
       ) {
         // #1029: rows D1 took from master via a bot push. dcs_reimport is read
-        // only so a later import supersedes an older ai_pipeline payload
-        // (buildRevertLineage). Only read when a report is on the table, tn/tq
-        // only; fails open.
+        // so a later import supersedes an older ai_pipeline payload
+        // (buildRevertLineage), and (#1159) counts as bot lineage itself only
+        // when the dcs_commits ledger proves no human commit to this book's
+        // file since master was last confirmed. Only read when a report is on
+        // the table, tn/tq only; fails open.
         let lineage: Map<string, Array<Record<string, unknown>>> | null = null;
         if (computeEntries && (resource === "tn" || resource === "tq")) {
+          // #1159: the ledger read. Any failure leaves it null, which keeps
+          // reimport writes out of the lineage (the warning stands).
+          let ledger: LedgerLineageResult | null = null;
+          const file = dcsResourceFile(book, resource);
+          if (file && priorConfirmed.at != null) {
+            try {
+              // Timeout required: a stalled Door43 connection must not stall
+              // the export step (same ceiling as the ledger poller, #853).
+              const repoHead = await repoHeadCommitSha(this.env, file.repo, { timeoutMs: DCS_POLL_FETCH_TIMEOUT_MS });
+              ledger = await readLedgerMasterLineage(this.env.DB, file.repo, file.path, priorConfirmed.at, repoHead);
+              if (!ledgerProvesNoHumanCommit(ledger)) {
+                console.log("export: revert lineage keeps reimport writes out (ledger did not prove a human-free window)", {
+                  book,
+                  resource,
+                  reason: ledger.usable ? "human_commit" : ledger.reason,
+                });
+              }
+            } catch (e) {
+              console.error("export: revert lineage ledger read failed; reimport writes stay out of the lineage", {
+                book,
+                resource,
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          }
           try {
-            lineage = await loadRevertLineage(this.env.DB, resource, book, priorConfirmed);
+            lineage = await loadRevertLineage(this.env.DB, resource, book, priorConfirmed, ledger);
           } catch (e) {
             console.error("export: revert lineage read failed; report keeps its unfiltered behaviour", {
               book,

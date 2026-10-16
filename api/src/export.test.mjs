@@ -2879,6 +2879,130 @@ function utf8Base64(s) {
   assert(!threw, `C1: a non-string note in a payload does not throw`);
 }
 
+// --- #1159: a bot push the nightly reimport adopted, then edited in the app ---
+// Benjamin's decision (option A): a dcs_reimport create/update counts as bot
+// lineage only when the dcs_commits ledger proves no human commit touched the
+// book's file since master was last confirmed. A human commit, or a ledger
+// that is missing, stale, gapped or too young, keeps the warning.
+{
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const { readLedgerMasterLineage } = await import("./masterLineageLedger.ts");
+  const migDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  const migs = readdirSync(migDir).filter((f) => f.endsWith(".sql")).sort().map((f) => readFileSync(join(migDir, f), "utf8"));
+  const shim = (sqlite) => {
+    const mk = (sql, args) => ({
+      bind: (...a) => mk(sql, a),
+      all: async () => ({ results: sqlite.prepare(sql).all(...args), success: true }),
+      first: async () => sqlite.prepare(sql).get(...args) ?? null,
+    });
+    return { prepare: (sql) => mk(sql, []) };
+  };
+  const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
+  const tsv = (note) => `${TN_HEADER}\n36:1\tab01\t\t\tword\t1\t${note}\n`;
+  const base = { ref_raw: "36:1", support_reference: "", quote: "word", occurrence: 1 };
+  const confirmed = { editId: 10, at: 1000 }; // our last good export
+  const goodPoll = { last_sha: "tip", last_status: "ok", gap_since_sha: null, last_success_at: 2000, coverage_since: 500 };
+  // The JER 2026-10-07 shape: BW Bot pushes X to master after our confirmed
+  // export, the reimport creates the row from master, Grant edits it to Z.
+  const jerEvents = [[20, "dcs_reimport", "create", "X", 1100], [30, null, "update", "Z", 1200]];
+  const botCommit = { sha: "bot1", classification: "ai", committed_at: 1050, files: ["tn_JER.tsv"] };
+  const run = async ({
+    events = jerEvents,
+    poll = goodPoll,
+    commits = [botCommit],
+    head = "tip",
+    conf = confirmed,
+    master = "X",
+    rendered = "Z",
+    withLedger = true,
+  } = {}) => {
+    const sqlite = new DatabaseSync(":memory:");
+    for (const m of migs) sqlite.exec(m);
+    for (const [id, source, action, note, at] of events) {
+      sqlite
+        .prepare(
+          `INSERT INTO edit_log (id, kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+           VALUES (?, 'tn', 'ab01', 'JER', NULL, NULL, 1, ?, ?, ?, ?)`,
+        )
+        .run(id, action, note == null ? null : JSON.stringify({ ...base, note }), source, at ?? id);
+    }
+    if (poll) {
+      sqlite
+        .prepare(
+          `INSERT INTO dcs_repo_polls (repo, last_sha, last_status, gap_since_sha, last_success_at, coverage_since)
+           VALUES ('en_tn', ?, ?, ?, ?, ?)`,
+        )
+        .run(poll.last_sha, poll.last_status, poll.gap_since_sha, poll.last_success_at, poll.coverage_since);
+    }
+    for (const c of commits) {
+      sqlite
+        .prepare(
+          `INSERT INTO dcs_commits (repo, sha, parent_sha, author_name, author_email, committed_at, message,
+                                    classification, classification_reason, files_json, seen_at)
+           VALUES ('en_tn', ?, NULL, 'someone', 'someone@example.org', ?, 'TN: JER 36', ?, 'test', ?, ?)`,
+        )
+        .run(c.sha, c.committed_at, c.classification, c.files == null ? null : JSON.stringify(c.files), c.seen_at ?? c.committed_at);
+    }
+    const db = shim(sqlite);
+    const ledger = withLedger && conf.at != null
+      ? await readLedgerMasterLineage(db, "en_tn", "tn_JER.tsv", conf.at, head)
+      : null;
+    const lineage = await loadRevertLineage(db, "tn", "JER", conf, ledger);
+    return tsvRevertReport(tsv(rendered), tsv(master), "tn", null, lineage).entries.length;
+  };
+
+  assert((await run()) === 0,
+    `#1159: adopted bot push + app edit + clean ledger -> 0 entries`);
+  assert((await run({ commits: [] })) === 0,
+    `#1159: clean ledger with no commit to the book's file is a complete negative -> 0 entries`);
+  assert((await run({ events: [[20, "dcs_reimport", "update", "X", 1100], [30, null, "update", "Z", 1200]] })) === 0,
+    `#1159: an adopted reimport UPDATE counts like a create -> 0 entries`);
+  assert(
+    (await run({ commits: [botCommit, { sha: "h2", classification: "human", committed_at: 1070, files: ["tn_EZK.tsv"] }] })) === 0,
+    `#1159: a human commit to ANOTHER book's file does not keep this book's warning`,
+  );
+
+  // Human commit to this book since the last good export -> kept.
+  assert(
+    (await run({ commits: [botCommit, { sha: "h1", classification: "human", committed_at: 1080, files: ["tn_JER.tsv"] }] })) === 1,
+    `#1159: human commit to the book in the ledger since the last good export -> warning kept`,
+  );
+  // #691 / PR #1190: a late push (authored before the window, seen after it).
+  assert(
+    (await run({ commits: [botCommit, { sha: "h1", classification: "human", committed_at: 900, seen_at: 1150, files: ["tn_JER.tsv"] }] })) === 1,
+    `#1159: a late-pushed human commit (seen after the last good export) -> warning kept`,
+  );
+
+  // Missing or stale ledger -> kept.
+  assert((await run({ withLedger: false })) === 1, `#1159: no ledger read -> warning kept`);
+  assert((await run({ poll: null })) === 1, `#1159: ledger poll row missing -> warning kept`);
+  assert((await run({ head: "newer" })) === 1, `#1159: ledger tip behind the live repo head (stale) -> warning kept`);
+  assert((await run({ head: null })) === 1, `#1159: live repo head unknown -> warning kept`);
+  assert((await run({ poll: { ...goodPoll, gap_since_sha: "gap" } })) === 1, `#1159: ledger has a coverage gap -> warning kept`);
+  assert((await run({ poll: { ...goodPoll, last_status: "page_cap" } })) === 1, `#1159: ledger's last poll failed -> warning kept`);
+  assert((await run({ poll: { ...goodPoll, coverage_since: 1001 } })) === 1,
+    `#1159: ledger coverage starts after the last good export -> warning kept`);
+  assert((await run({ commits: [{ ...botCommit, files: null }] })) === 1,
+    `#1159: a ledger row with an unknown file list -> warning kept`);
+  assert((await run({ conf: { editId: 10, at: null } })) === 1,
+    `#1159: no confirmed time to bound the ledger window -> warning kept`);
+
+  // The relaxation stays narrow even with a clean ledger.
+  assert((await run({ master: "H" })) === 1,
+    `#1159: master changed after the reimport (payload != master) -> warning kept`);
+  assert((await run({ events: [[5, "dcs_reimport", "create", "X", 900], [30, null, "update", "Z", 1200]] })) === 1,
+    `#1159: reimport write at or before the last good export -> warning kept`);
+  assert((await run({ conf: { editId: null, at: 1000 } })) === 0,
+    `#1159: no edit-id boundary, reimport write after master_confirmed_at -> 0 entries`);
+  assert((await run({ conf: { editId: null, at: 1000 }, events: [[20, "dcs_reimport", "create", "X", 1000], [30, null, "update", "Z", 1200]] })) === 1,
+    `#1159: no edit-id boundary, reimport write in the same second as master_confirmed_at -> warning kept`);
+  assert((await run({ events: [[20, "dcs_reimport", "restore", "X", 1100], [30, null, "update", "Z", 1200]] })) === 1,
+    `#1159: a reimport restore is not adoption lineage -> warning kept`);
+}
+
 // --- RECORD_PUSHED_RENDER_SQL tracks renders since master was last confirmed (#1029) ---
 {
   const { DatabaseSync } = await import("node:sqlite");

@@ -4,6 +4,7 @@
 
 import usfm from "usfm-js";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
+import type { LedgerLineageResult } from "./masterLineageLedger.ts";
 import { parseVerseContentJson } from "./contentJson.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 import { normalizeUsfmFormatting } from "./usfmFormat.ts";
@@ -1233,6 +1234,14 @@ const LINEAGE_FIELDS: Record<"tn" | "tq", Array<[string, string]>> = {
 // Door43, so neither may hide a row from the report. App edits (source NULL)
 // do not supersede: a translator editing the bot's row is the case this serves.
 //
+// #1159: `reimportIsBotOnly` lifts the dcs_reimport half of that rule. It is
+// true only when the dcs_commits ledger proves no human commit touched this
+// book's file since master was last confirmed (ledgerProvesNoHumanCommit), so
+// every reimport create/update in that window mirrors a bot or our own push.
+// A bot push the reimport adopted and an editor then improved in the app is
+// the case it serves. A restore still never counts, and master's cells must
+// still equal the payload, so a row master changed again still reports.
+//
 // The bot write must also be NEWER than where master was last confirmed
 // (edit_log id > master_confirmed_edit_id, or created_at > master_confirmed_at
 // when the id is NULL — strict, because a write in the same second as the
@@ -1253,14 +1262,16 @@ export function buildRevertLineage(
     created_at: number;
   }>,
   confirmed: { editId: number | null; at: number | null },
+  reimportIsBotOnly = false,
 ): Map<string, Array<Record<string, unknown>>> {
   const latest = new Map<string, (typeof rows)[number]>();
   for (const r of rows) if (r.source != null) latest.set(r.row_key, r);
   const afterConfirmed = (r: (typeof rows)[number]): boolean =>
     confirmed.editId != null ? r.id > confirmed.editId : confirmed.at != null ? r.created_at > confirmed.at : false;
+  const botSource = (s: string | null): boolean => s === "ai_pipeline" || (reimportIsBotOnly && s === "dcs_reimport");
   const lineage = new Map<string, Array<Record<string, unknown>>>();
   for (const [rowKey, r] of latest) {
-    if (r.source !== "ai_pipeline" || (r.action !== "create" && r.action !== "update") || r.payload_json == null) continue;
+    if (!botSource(r.source) || (r.action !== "create" && r.action !== "update") || r.payload_json == null) continue;
     if (!afterConfirmed(r)) continue;
     try {
       const p = JSON.parse(r.payload_json);
@@ -1272,26 +1283,45 @@ export function buildRevertLineage(
   return lineage;
 }
 
+// #1159: true only when a ledger read (readLedgerMasterLineage over the book's
+// file, windowed from master_confirmed_at) is complete and found no human
+// commit. Book-level on purpose: any human commit to the file keeps every
+// row's warning. A missing, stale, gapped or too-young ledger is not usable,
+// so it answers false and the warning stands.
+export function ledgerProvesNoHumanCommit(ledger: LedgerLineageResult | null): boolean {
+  return ledger != null && ledger.usable === true && ledger.lineage != null && ledger.lineage.incomplete === false && ledger.lineage.hasHumanCommit === false;
+}
+
 // Reads the tn/tq revert lineage for one (book, kind) from edit_log.
 // `confirmed` is the pair's master_confirmed_edit_id / master_confirmed_at as
-// read before tonight's push.
+// read before tonight's push. `ledger` is the dcs_commits read for the book's
+// file over the window starting at `confirmed.at` (#1159); null, or anything
+// short of a proven human-free window, keeps dcs_reimport writes out.
 export async function loadRevertLineage(
   db: D1Database,
   kind: "tn" | "tq",
   book: string,
   confirmed: { editId: number | null; at: number | null },
+  ledger: LedgerLineageResult | null = null,
 ): Promise<Map<string, Array<Record<string, unknown>>>> {
+  const reimportIsBotOnly = ledgerProvesNoHumanCommit(ledger);
   // Every machine write for the book, so a later one of any action supersedes
-  // an older bot payload. Payloads are only needed for ai_pipeline rows.
+  // an older bot payload. Payloads are only needed for rows that can count:
+  // ai_pipeline always, dcs_reimport only under a clean ledger and only past
+  // the confirmed point (a bootstrapped book holds thousands of full-row
+  // reimport payloads that buildRevertLineage's afterConfirmed would drop).
   const { results } = await db
     .prepare(
       `SELECT id, row_key, source, action, created_at,
-              CASE WHEN source = 'ai_pipeline' THEN payload_json END AS payload_json
+              CASE WHEN source = 'ai_pipeline'
+                     OR (?3 = 1 AND source = 'dcs_reimport'
+                         AND CASE WHEN ?4 IS NOT NULL THEN id > ?4 ELSE created_at > ?5 END)
+                   THEN payload_json END AS payload_json
          FROM edit_log
         WHERE kind = ?1 AND book = ?2 AND source IS NOT NULL
         ORDER BY id`,
     )
-    .bind(kind, book)
+    .bind(kind, book, reimportIsBotOnly ? 1 : 0, confirmed.editId, confirmed.at)
     .all<{
       id: number;
       row_key: string;
@@ -1300,7 +1330,7 @@ export async function loadRevertLineage(
       payload_json: string | null;
       created_at: number;
     }>();
-  return buildRevertLineage(results ?? [], confirmed);
+  return buildRevertLineage(results ?? [], confirmed, reimportIsBotOnly);
 }
 
 // True when master's row equals (on every content column) a full-row edit_log
