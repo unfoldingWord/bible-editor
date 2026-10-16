@@ -17,6 +17,7 @@ import { useCatalogs } from "../hooks/useCatalogs";
 import CheckIcon from "@mui/icons-material/Check";
 import { LANE_FILL, type LaneShade } from "../lib/laneChecks";
 import { movableNoteVerses } from "../lib/tnRangeLock";
+import type { PinnedSaveOpts } from "../hooks/usePinnedRowEdit";
 
 export type PanelMode = "resources" | "alignment" | "search";
 
@@ -163,7 +164,7 @@ interface Props {
   isNoteAiPending?: (rowId: string) => boolean;
   noteAiRecentlyCompletedAt?: (rowId: string) => number | null;
   onNoteVisibilityChange?: (rowId: string, isVisible: boolean) => void;
-  onWordSave: (id: string, patch: Partial<TwlRow>) => void;
+  onWordSave: (id: string, patch: Partial<TwlRow>, opts: PinnedSaveOpts) => void;
   onWordDelete: (id: string) => void;
   onWordCreate: () => void;
   onWordFocus: (row: TwlRow) => void;
@@ -172,11 +173,7 @@ interface Props {
   // table's "change reference" dropdown). Mirrors onNoteChangeVerse; the twl
   // variant never spans, so it takes no verseEnd.
   onWordChangeVerse?: (id: string, verse: number) => void;
-  onQuestionSave: (
-    id: string,
-    patch: Partial<TqRow>,
-    opts?: { restoredFromVersion?: number },
-  ) => void;
+  onQuestionSave: (id: string, patch: Partial<TqRow>, opts: PinnedSaveOpts) => void;
   onQuestionDelete: (id: string) => void;
   onQuestionCreate: () => void;
   // Mirrors onNoteFocus/onWordFocus for a manual click into a question row.

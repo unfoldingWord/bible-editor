@@ -3,7 +3,7 @@
 // the server's row back into a chapter cache that still hides it.
 
 import assert from "node:assert/strict";
-import { planRefusedRowDeleteRollback } from "./refusedRowRollback.ts";
+import { planRefusedRowDeleteRollback, planRefusedRowPatchRollback } from "./refusedRowRollback.ts";
 
 let passed = 0;
 const check = (cond, msg) => {
@@ -45,5 +45,22 @@ check(plan({ serverRows: [q("A"), q("C")] }).kind === "skip", "a row the server 
 check(plan({ cachedRows: server }).kind === "skip", "a row already back in the cache is left alone");
 check(plan({ cachedRows: undefined }).kind === "skip", "no chapter cache to restore into");
 check(plan({ serverRows: undefined }).kind === "skip", "no server list to restore from");
+
+// #1115: a refused tq/twl PATCH puts the server's values of its fields back.
+{
+  const patchPlan = (o) =>
+    planRefusedRowPatchRollback({
+      patch: { question: "typed" },
+      serverRow: { question: "server", response: "r" },
+      cachedRow: { question: "typed", response: "r" },
+      stillQueuedForTarget: false,
+      ...o,
+    });
+  const p = patchPlan({});
+  check(p && p.question === "server" && !("response" in p), "a refused PATCH restores only its own fields from the server");
+  check(patchPlan({ stillQueuedForTarget: true }) === null, "another PATCH of the row still draining settles the cache itself");
+  check(patchPlan({ cachedRow: { question: "server" } }) === null, "a cache already matching the server is left alone");
+  check(patchPlan({ serverRow: undefined }) === null, "no server row, nothing to restore");
+}
 
 console.log(`refusedRowRollback: ${passed} passed`);
