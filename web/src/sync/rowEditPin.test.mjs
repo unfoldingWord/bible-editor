@@ -118,6 +118,14 @@ check(
     }),
     "a field left out of the save (a history restore's dirty ref) does not reopen Save",
   );
+  check(
+    !rowSaveInFlight({ pin: v1, row: optimistic, local, submitted: { ...sub, settled: true }, keys }),
+    "a refused or discarded save reopens Save even when the cache rollback never lands",
+  );
+  check(
+    rebaseRowPin({ pin: v1, row: pinOf(2, "mine", "r1"), local, submitted: { version: 1, rowVersion: 2, shown: { question: "mine" }, settled: true }, keys }) === null,
+    "a settled save's leftover echo still never re-pins",
+  );
 }
 
 console.log(`rowEditPin: ${passed} passed`);

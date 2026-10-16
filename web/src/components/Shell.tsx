@@ -1298,6 +1298,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         const cur = dataRef.current;
         if (!cur || cur.book !== t.book) return;
         const chapterNo = cur.chapter;
+        const versionAtStart = (
+          cur[rowKind] as ReadonlyArray<TqRow | TwlRow>
+        ).find((r) => r.id === t.id)?.version;
         const server = await fetchRollbackChapter(t.book, chapterNo);
         const stillQueuedForTarget = await patchQueued();
         if (
@@ -1318,6 +1321,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           serverRow: find(server[rowKind]),
           cachedRow: find(now[rowKind]),
           stillQueuedForTarget,
+          // Skip if the row moved during the re-read (a newer save landed).
+          versionAtStart: versionAtStart ?? null,
         });
         if (plan) applyLocalRowPatch(rowKind, t.id, plan as Partial<TqRow & TwlRow>);
       } catch {

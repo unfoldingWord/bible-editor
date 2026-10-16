@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { drafts, rowKey } from "../sync/drafts";
 import type { RowKind } from "../sync/api";
+import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
 import {
   rebaseRowPin,
   rowPinBaseline,
@@ -52,6 +53,29 @@ export function usePinnedRowEdit<R extends RowLike, F extends RowFields>(args: {
   const [local, setLocal] = useState<F>(rowPin.shown);
   const [submitted, setSubmitted] = useState<RowSubmission | null>(null);
   const [hydrated, setHydrated] = useState(false);
+
+  // A save of this row refused (chapter locked) or discarded is no longer in
+  // flight, whether or not Shell's cache rollback lands (offline, navigated
+  // away, another save queued, or the server already holds the text).
+  useEffect(() => {
+    const mine = (op: OutboxOp) =>
+      op.action === "patch" &&
+      op.target.kind === "row" &&
+      op.target.rowKind === kind &&
+      op.target.id === row.id &&
+      op.target.book === row.book;
+    const settle = () => setSubmitted((s) => (s && !s.settled ? { ...s, settled: true } : s));
+    const offResult = onOutboxResult((op, result) => {
+      if (result.kind === "locked" && mine(op)) settle();
+    });
+    const offDiscard = onOutboxDiscard((op) => {
+      if (mine(op)) settle();
+    });
+    return () => {
+      offResult();
+      offDiscard();
+    };
+  }, [kind, row.id, row.book]);
 
   // Follow the server when the cached row's version moves, but only where it
   // cannot overwrite kept typing (rebaseRowPin). Adjusted during render so no

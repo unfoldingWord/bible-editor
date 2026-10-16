@@ -55,18 +55,25 @@ export function planRefusedRowDeleteRollback<R extends { id: string }>(args: {
 // #1115: a refused or discarded tq/twl PATCH left its optimistic text in the
 // cached row. Put the server's values of the patched fields back, unless
 // another PATCH of the row is still draining (its own result settles the
-// cache) or either copy of the row is missing. Null means nothing to do.
+// cache), either copy of the row is missing, or the cached row's version
+// changed since the re-read started (`versionAtStart`: a newer save or a
+// server push landed meanwhile and already settled it). The optimistic
+// restored_from_version mark of a history restore goes back too, and so do the
+// server's version and updated_at when the server has moved on, so the next
+// Save does not 409 for nothing. Null means nothing to do.
 export function planRefusedRowPatchRollback(args: {
   patch: Record<string, unknown>;
   serverRow: Record<string, unknown> | undefined;
   cachedRow: Record<string, unknown> | undefined;
   stillQueuedForTarget: boolean;
+  versionAtStart?: unknown;
 }): Record<string, unknown> | null {
-  const { patch, serverRow, cachedRow, stillQueuedForTarget } = args;
+  const { patch, serverRow, cachedRow, stillQueuedForTarget, versionAtStart } = args;
   if (stillQueuedForTarget || !serverRow || !cachedRow) return null;
+  if (versionAtStart !== undefined && cachedRow.version !== versionAtStart) return null;
   const out: Record<string, unknown> = {};
-  for (const k of Object.keys(patch)) {
-    if (cachedRow[k] !== serverRow[k]) out[k] = serverRow[k];
+  for (const k of [...Object.keys(patch), "restored_from_version", "version", "updated_at"]) {
+    if (k in serverRow && cachedRow[k] !== serverRow[k]) out[k] = serverRow[k];
   }
   return Object.keys(out).length > 0 ? out : null;
 }

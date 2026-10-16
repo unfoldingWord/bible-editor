@@ -61,6 +61,17 @@ check(plan({ serverRows: undefined }).kind === "skip", "no server list to restor
   check(patchPlan({ stillQueuedForTarget: true }) === null, "another PATCH of the row still draining settles the cache itself");
   check(patchPlan({ cachedRow: { question: "server" } }) === null, "a cache already matching the server is left alone");
   check(patchPlan({ serverRow: undefined }) === null, "no server row, nothing to restore");
+  check(
+    patchPlan({ cachedRow: { question: "newer", version: 4 }, versionAtStart: 3 }) === null,
+    "a row that moved during the re-read (a newer save landed) is left alone",
+  );
+  const moved = patchPlan({
+    serverRow: { question: "server", version: 5, updated_at: 9, restored_from_version: null },
+    cachedRow: { question: "typed", version: 4, updated_at: 1, restored_from_version: 2 },
+    versionAtStart: 4,
+  });
+  check(moved && moved.version === 5 && moved.updated_at === 9, "the server's newer version goes back with the text");
+  check(moved && moved.restored_from_version === null, "a refused history restore's restored_from_version mark goes back");
 }
 
 console.log(`refusedRowRollback: ${passed} passed`);

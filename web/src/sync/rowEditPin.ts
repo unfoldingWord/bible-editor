@@ -31,6 +31,9 @@ export interface RowPin<F extends RowFields> {
 export interface RowSubmission {
   version: number;
   rowVersion: number;
+  // Set when the save left the outbox without landing (refused or discarded):
+  // no longer in flight even if the cache still shows its text.
+  settled?: boolean;
   shown: RowFields;
 }
 
@@ -114,7 +117,7 @@ export function rowSaveInFlight<F extends RowFields>(args: {
   keys: readonly (keyof F & string)[];
 }): boolean {
   const { pin, row, local, submitted, keys } = args;
-  if (!submitted || submitted.version !== pin.version) return false;
+  if (!submitted || submitted.settled || submitted.version !== pin.version) return false;
   if (row.version !== submitted.rowVersion) return false;
   if (sameFields(local, pin.shown, keys)) return false;
   // Only the submitted fields: a history restore leaves a dirty ref unsent.
