@@ -369,6 +369,7 @@ if (existsSync(sqlPath) && !force) {
 const repaired = [];
 const refused = [];
 const clean = [];
+const cleanGlobOnly = [];
 const plainTextOnly = [];
 const plainTextDrift = [];
 const lockedSkipped = [];
@@ -400,7 +401,13 @@ for (const row of rows) {
 
   const r = repairVerse(row.content_json, row.plain_text ?? null);
 
-  if (r.status === "clean") { clean.push(ref); continue; }
+  if (r.status === "clean") {
+    clean.push(ref);
+    // The GLOB is looser than DETECT_RE (it has no (?!\d) after the three
+    // digits), so "5, 1000" is clean yet keeps matching the survivor query.
+    if (/[0-9], [0-9]{3}/.test(row.plain_text ?? "")) cleanGlobOnly.push({ ref, rowKey });
+    continue;
+  }
   if (r.status === "plain_text_only") { plainTextOnly.push({ ref, rowKey, newPlain: r.newPlain }); continue; }
   if (r.status === "refused") { refuse(r.why); continue; }
 
@@ -489,6 +496,12 @@ const expectedSurvivors = [
   ...plainTextOnly.map((d) => ({ rowKey: d.rowKey, why: "plain_text-only" })),
   ...lockedSkipped.map((d) => ({ rowKey: d.rowKey, why: "release-locked" })),
   ...excludedVerses.map((k) => ({ rowKey: k, why: "--exclude" })),
+  ...cleanGlobOnly.map((d) => ({ rowKey: d.rowKey, why: "no tree defect (GLOB-only match)" })),
+  // Same looseness after a repair: "3, 000 men and 5, 1000 horses" is repaired
+  // to "3,000 men and 5, 1000 horses", which the GLOB still matches.
+  ...repaired
+    .filter((r) => /[0-9], [0-9]{3}/.test(r.newPlain ?? ""))
+    .map((r) => ({ rowKey: r.rowKey, why: "repaired; GLOB-only match left" })),
 ];
 
 const books = [...new Set(repaired.map((r) => r.row.book))].sort();
