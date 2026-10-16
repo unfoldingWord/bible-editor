@@ -102,6 +102,7 @@ export const DCS_BACKFILL_PAGE_LIMIT = 2;
 interface GapState {
   gap_since_sha: string | null;
   gap_frontier_json: string | null;
+  gap_at?: number | null;
 }
 
 export interface BackfillResult {
@@ -145,7 +146,7 @@ const UPDATE_FRONTIER_SQL = `UPDATE dcs_repo_polls
  * backfillDcsGaps below.
  */
 export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: number): Promise<BackfillResult> {
-  const state = await env.DB.prepare(`SELECT gap_since_sha, gap_frontier_json FROM dcs_repo_polls WHERE repo = ?1`)
+  const state = await env.DB.prepare(`SELECT gap_since_sha, gap_frontier_json, gap_at FROM dcs_repo_polls WHERE repo = ?1`)
     .bind(repo)
     .first<GapState>();
 
@@ -179,6 +180,23 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
 
   const { rows } = ledgerRowsFromCommits(repo, page.commits);
   const ordered = [...rows].reverse(); // oldest-first, same discipline as pollDcsRepo
+  // seen_at for a backfilled row must never let readLedgerMasterLineage's
+  // `seen_at > confirmedAt` clause (#691) admit it as a late push. Stamping
+  // `now` read a bootstrap's whole backfilled history as late pushes for any
+  // window opened between the floor and the backfill. The gap's opening time
+  // (gap_at) is not enough either: a gap that opens AFTER the floor walks
+  // merge second parents back into years-old history, and gap_at would read
+  // all of it as arriving in every window between the floor and that gap
+  // (#691 re-review F1). So a backfilled row is stamped no later than its own
+  // commit date, which leaves committed_at as the only clause that admits
+  // it, exactly as before #691. It also keeps rows already past retention
+  // old on both clocks, so dcsCommitsSweep still removes them. Limit: a
+  // commit pushed late INTO a gap's hole is missed as a late push, the same
+  // miss every read had before #691. A row with no commit date falls back to
+  // gap_at; the read fails closed on it anyway (ledger_commit_time_unknown).
+  const gapStamp = state.gap_at ?? nowSeconds;
+  const seenAtFor = (committedAt: number | null) =>
+    committedAt === null ? gapStamp : Math.min(gapStamp, committedAt);
   const insertStatements = ordered.map((r) =>
     env.DB.prepare(INSERT_COMMIT_SQL).bind(
       r.repo,
@@ -191,7 +209,7 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
       r.classification,
       r.reason,
       r.filesJson,
-      nowSeconds,
+      seenAtFor(r.committedAt),
     ),
   );
   for (let i = 0; i < insertStatements.length; i += DCS_POLL_WRITE_BATCH) {
