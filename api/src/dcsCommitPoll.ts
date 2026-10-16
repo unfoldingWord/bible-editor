@@ -543,7 +543,10 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
     const candidates = computeGapFrontier(rows, sinceSha);
     if (candidates.length > 0) {
       const known = await env.DB.prepare(
-        `SELECT sha FROM dcs_commits WHERE repo = ?1 AND sha IN (SELECT value FROM json_each(?2))`,
+        // A row with unknown parents (written before migration 0078) does not
+        // count: its history is unproven, and the backfill re-fetches it.
+        `SELECT sha FROM dcs_commits WHERE repo = ?1 AND sha IN (SELECT value FROM json_each(?2))
+            AND ${wellFormedParentsSql("parent_shas_json")}`,
       )
         .bind(repo, JSON.stringify(candidates))
         .all<{ sha: string }>();

@@ -127,6 +127,7 @@ interface GapState {
   gap_since_sha: string | null;
   gap_frontier_json: string | null;
   gap_at?: number | null;
+  coverage_since?: number | null;
 }
 
 export interface BackfillResult {
@@ -178,12 +179,21 @@ const UPDATE_FRONTIER_SQL = `UPDATE dcs_repo_polls
 // UNION ALL) dedupes and makes a revisited sha a no-op. json_each reads the
 // list only when it is well-formed ('[]' otherwise), so a malformed stored
 // value can never raise a JSON error mid-query.
+//
+// Issue #1211: the recursion also stops at a row committed before the repo's
+// coverage floor (?4, NULL before a floor exists). Readers never use history
+// below the floor (masterLineageLedger.ts rejects windows before it, and a
+// backfilled row is stamped no later than its commit date), so walking a
+// merged side branch's fork point on down to the repo root bought nothing and
+// kept the gap, and with it the sweep pause, open for hundreds of ticks. A row
+// with no commit date is followed, as before.
 const UNCOVERED_FRONTIER_SQL = `WITH RECURSIVE reach(sha) AS (
     SELECT s.value FROM json_each(?2) s WHERE s.type = 'text' AND s.value != ?3
     UNION
     SELECT p.value
       FROM reach r
       JOIN dcs_commits c ON c.repo = ?1 AND c.sha = r.sha AND ${wellFormedParentsSql("c.parent_shas_json")}
+       AND (?4 IS NULL OR c.committed_at IS NULL OR c.committed_at >= ?4)
       JOIN json_each(CASE WHEN ${wellFormedParentsSql("c.parent_shas_json")} THEN c.parent_shas_json ELSE '[]' END) p
      WHERE p.value != ?3
   )
@@ -197,10 +207,16 @@ const UNCOVERED_FRONTIER_SQL = `WITH RECURSIVE reach(sha) AS (
  * Order: surviving original entries keep their place; newly reached ones
  * follow, sorted, so the result does not depend on SQLite's row order.
  */
-async function uncoveredFrontier(env: Env, repo: string, frontier: string[], gapSinceSha: string): Promise<string[]> {
+async function uncoveredFrontier(
+  env: Env,
+  repo: string,
+  frontier: string[],
+  gapSinceSha: string,
+  coverageFloor: number | null,
+): Promise<string[]> {
   const distinct = Array.from(new Set(frontier));
   const res = await env.DB.prepare(UNCOVERED_FRONTIER_SQL)
-    .bind(repo, JSON.stringify(distinct), gapSinceSha)
+    .bind(repo, JSON.stringify(distinct), gapSinceSha, coverageFloor)
     .all<{ sha: string }>();
   // A missing result set must not read as "nothing left to walk", which would
   // clear the gap. Throwing sends the caller down its no-expansion fallback.
@@ -221,7 +237,7 @@ async function uncoveredFrontier(env: Env, repo: string, frontier: string[], gap
  * backfillDcsGaps below.
  */
 export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: number): Promise<BackfillResult> {
-  const state = await env.DB.prepare(`SELECT gap_since_sha, gap_frontier_json, gap_at FROM dcs_repo_polls WHERE repo = ?1`)
+  const state = await env.DB.prepare(`SELECT gap_since_sha, gap_frontier_json, gap_at, coverage_since FROM dcs_repo_polls WHERE repo = ?1`)
     .bind(repo)
     .first<GapState>();
 
@@ -230,6 +246,7 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
   }
 
   const frontierJson = state.gap_frontier_json;
+  const coverageFloor = state.coverage_since ?? null;
   const frontier = parseGapFrontier(frontierJson);
 
   // An empty frontier with a gap still open — either a defensive case (the
@@ -255,7 +272,7 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
   let open: string[];
   let expansionFailed = false;
   try {
-    open = await uncoveredFrontier(env, repo, frontier, state.gap_since_sha);
+    open = await uncoveredFrontier(env, repo, frontier, state.gap_since_sha, coverageFloor);
   } catch (e) {
     console.error("dcs backfill expansion failed; walking one raw entry", repo, e instanceof Error ? e.message : String(e));
     expansionFailed = true;
@@ -346,8 +363,23 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
     status = page.incompleteReason;
     newFrontier = open;
   } else {
-    const subFrontier = computeGapFrontier(rows, state.gap_since_sha);
+    // Issue #1211: a fetched row older than the coverage floor contributes no
+    // parents (see UNCOVERED_FRONTIER_SQL), so a side branch's walk ends at
+    // its fork point instead of following master down to the root.
+    const visited = new Set(rows.map((r) => r.sha));
+    const windowRows = coverageFloor == null ? rows : rows.filter((r) => r.committedAt == null || r.committedAt >= coverageFloor);
+    const subFrontier = computeGapFrontier(windowRows, state.gap_since_sha).filter((sha) => !visited.has(sha));
     newFrontier = Array.from(new Set([...rest, ...subFrontier]));
+    // ...and anything left that the ledger already answers is dropped now,
+    // not a tick later, so a branch forked from ledgered history clears in
+    // the tick that walks it. A failed expansion keeps the raw frontier.
+    if (!expansionFailed && newFrontier.length > 0) {
+      try {
+        newFrontier = await uncoveredFrontier(env, repo, newFrontier, state.gap_since_sha, coverageFloor);
+      } catch (e) {
+        console.error("dcs backfill post-walk expansion failed", repo, e instanceof Error ? e.message : String(e));
+      }
+    }
     status = reachedTarget
       ? "ok"
       : reachedHistoryEnd
