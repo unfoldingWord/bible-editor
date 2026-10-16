@@ -40,9 +40,13 @@ export function verseMergeEditorConditionKey(
   // no-base wording. Omitted (not false) otherwise, so every unlocked key stays
   // byte-identical to the keys stored before #1006.
   noBaseBookLocked = false,
+  // Issue #1127: set only when this editor's alert carries the sentence about
+  // an admin lock/push that reached Door43 (verseMergeConflicts.ts).
+  lockedPush: unknown = null,
 ): string {
   const state: Record<string, unknown> = { refs: [...refs].sort() };
   if (noBaseBookLocked) state.noBaseBookLocked = true;
+  if (lockedPush != null) state.lockedPush = lockedPush;
   return reviewConditionKey("verse_merge_conflict_editor", { book, resource, username }, state);
 }
 

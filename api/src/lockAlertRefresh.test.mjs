@@ -934,8 +934,8 @@ console.log("\n[#1127: a landed lock/push adds one sentence to the locked alerts
 console.log("\n[#1127: a staged and a straight-to-master push are worded for what each one did]");
 {
   for (const [branchOverride, branch, prNumber, expect, forbid] of [
-    ["jer-fix", "jer-fix", 7, /review/, /straight to/],
-    ["master", "master", null, /master/, /review/],
+    ["jer-fix", "jer-fix", 7, /for review, on branch jer-fix \(PR #7\)/, /straight to/],
+    ["master", "master", null, /straight to its master/, /for review/],
   ]) {
     const { sqlite, env, live } = freshApp();
     if (typeof noteLockedPush !== "function" || typeof lockedPushLanded !== "function") {

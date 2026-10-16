@@ -13,6 +13,7 @@ import { orderTwlRows } from "./twlCanonicalOrder.ts";
 import { renderOccurrence } from "./occurrenceRule.ts";
 import type { UsfmValidationIssue, UsfmValidationRule } from "./usfmValidate.ts";
 import { findOverlappingRanges, VerseRangeOverlapError } from "./verseBridge.ts";
+import type { LockedPush } from "./verseMergeEditorAlerts.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
 
@@ -189,6 +190,37 @@ export function lockPushExportParams(
     throw new Error(`lockPushExportParams: unsafe staging branch ${JSON.stringify(branchName)}`);
   }
   return { book, resource, allowLocked: true, validateAndMerge: false, branchName };
+}
+
+// Issue #1127 (decision B): whether one export step of a lock/push (an
+// allowLocked run on a locked book) put the app's ULT/UST render on Door43, and
+// where. Only a step that committed counts: every guard return, a dry run, an
+// `unchanged` render (nothing pushed) and a failed step leave the alert alone.
+// `target` is what the branch does next, which decides the alert's wording:
+// `auto` is the generated `-be-` branch DCS validates and merges on its own,
+// `review` a staging branch nothing merges automatically (lockPushExportParams),
+// `master` an explicit branchName:"master" that committed straight to master.
+// `date` comes from the run's own timestamp, so a Workflow replay builds the same
+// alert condition.
+export function lockedPushLanded(
+  result: {
+    resource: string;
+    branch: string | null;
+    dcsCommitSha: string | null;
+    dcsSkippedReason: string | null;
+    prNumber: number | null;
+  },
+  opts: { allowLocked: boolean; bookLocked: boolean; branchOverride: string | null; observedAt: number },
+): LockedPush | null {
+  if (!opts.allowLocked || !opts.bookLocked) return null;
+  if (result.resource !== "ult" && result.resource !== "ust") return null;
+  if (result.dcsSkippedReason != null || !result.dcsCommitSha || !result.branch) return null;
+  return {
+    date: new Date(opts.observedAt).toISOString().slice(0, 10),
+    branch: result.branch,
+    prNumber: result.prNumber,
+    target: result.branch === "master" ? "master" : opts.branchOverride != null ? "review" : "auto",
+  };
 }
 
 export function branchOverrideAllowed(
