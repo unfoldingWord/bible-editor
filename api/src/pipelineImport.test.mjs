@@ -669,6 +669,11 @@ await (async () => {
       deleted: true, why: "Door43 sync that only cleared tags (old rule kept it)",
     },
     {
+      id: "dcsw", row: mkRow("dcsw", { note: "A reviewer fixed this on Door43." }),
+      log: [aiCreate("dcsw"), withKey("dcsw", ev("update", "dcs_reimport", null, { note: "A reviewer fixed this on Door43." }))],
+      deleted: false, why: "Door43 sync that changed the note's words stays (#1155 C)",
+    },
+    {
       id: "migr", row: mkRow("migr"),
       log: [withKey("migr", ev("create", "parallel_migration", 2, AI))],
       deleted: false, why: "migrated note stays (D4)",

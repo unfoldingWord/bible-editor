@@ -63,8 +63,38 @@ assert(verdict(row({ note: "Suggested text" }), [aiCreate(), ev("update", null, 
 // AI rewrote after the person's edit → baseline moves
 assert(!verdict(row({ note: "New AI text" }), [aiCreate(), ev("update", null, 5, { note: "mine" }), ev("update", "ai_pipeline", 7, { note: "New AI text" })]).kept, "AI rewrite after a person's edit → not kept");
 
-// reimport after AI, no human → not kept
-assert(!verdict(row({ note: "from master" }), [aiCreate(), ev("update", "dcs_reimport", null, { note: "from master" })]).kept, "dcs_reimport only → not kept");
+// A Door43 edit the nightly sync adopted (#1155 item 3, decision C): kept only
+// when the note's words changed, the same test an app save gets. The sync
+// logs user_id NULL on the nightly run.
+{
+  // The pristine/re-seed write logs the parsed TSV row (refRaw, tags, ...).
+  const synced = (over) => ev("update", "dcs_reimport", null, {
+    id: "ab12", refRaw: "40:5", chapter: 40, verse: 5, occurrence: 1, tags: null, ...AI_TEXT, ...over,
+  });
+  assert(verdict(row({ note: "from master" }), [aiCreate(), synced({ note: "from master" })]).reason === "edited", "Door43 change to the note's words → kept (#1155 C)");
+  assert(verdict(row({ quote: "אֱלֹהִים אֶחָד" }), [aiCreate(), synced({ quote: "אֱלֹהִים אֶחָד" })]).reason === "edited", "Door43 change to the quote → kept");
+  assert(verdict(row({ support_reference: "rc://*/ta/man/translate/figs-simile" }), [aiCreate(), synced({ support_reference: "rc://*/ta/man/translate/figs-simile" })]).reason === "edited", "Door43 change to the support reference → kept");
+  // The three-way merge logs only the columns it wrote (DB column names).
+  assert(verdict(row({ note: "Fixed on Door43." }), [aiCreate(), ev("update", "dcs_reimport", null, { note: "Fixed on Door43.", tags: "x" })]).reason === "edited", "merge adoption of a Door43 note fix → kept");
+  assert(verdict(row({ note: "from master" }), [aiCreate(), ev("update", "dcs_reimport", 5, { note: "from master" })]).reason === "edited", "manual pull (user id set) of a word change → kept");
+  // noise
+  assert(!verdict(row({ note: "The word  **God** means X.\n" }), [aiCreate(), synced({ note: "The word  **God** means X.\n" })]).kept, "Door43 spacing-only change → not kept");
+  assert(!verdict(row(), [aiCreate(), synced({})]).kept, "Door43 sync that re-sends the AI text → not kept");
+  assert(!verdict(row({ note: "The word “God” means X…" }), [ev("create", "ai_pipeline", 7, { ...AI_TEXT, note: 'The word "God" means X...' }), synced({ note: "The word “God” means X…" })]).kept, "Door43 curly-quote/ellipsis-only change → not kept");
+  assert(!verdict(row(), [aiCreate(), synced({ tags: "keyterm" })]).kept, "Door43 tag-only change → not kept");
+  assert(!verdict(row(), [aiCreate(), ev("update", "dcs_reimport", null, {})]).kept, "Door43 sync with an empty payload → not kept");
+  assert(!verdict(row({ verse: 6, ref_raw: "40:6" }), [aiCreate(), synced({ refRaw: "40:6", verse: 6 })]).kept, "Door43 position-only change → not kept (words only)");
+  // the baseline still moves with the AI and with reverts
+  assert(!verdict(row({ note: "New AI text" }), [aiCreate(), synced({ note: "from master" }), ev("update", "ai_pipeline", 7, { note: "New AI text" })]).kept, "Door43 fix the AI later rewrote → not kept");
+  assert(!verdict(row(), [aiCreate(), synced({ note: "from master" }), ev("update", null, 5, { note: AI_TEXT.note })]).kept, "Door43 fix reverted in the app to the AI text → not kept");
+  assert(!verdict(row(), [aiCreate(), synced({ note: "from master" }), synced({ note: AI_TEXT.note })]).kept, "Door43 fix reverted on Door43 → not kept");
+  // a create is not a change: the bulk import logs one for every row
+  assert(!verdict(row(), [ev("create", "dcs_reimport", null, { ...AI_TEXT, refRaw: "40:5", chapter: 40, verse: 5 })]).kept, "Door43 import create alone → not kept");
+  // a legacy note imported from Door43, then edited on Door43
+  assert(verdict(row({ note: "fixed" }), [ev("create", "dcs_reimport", null, { ...AI_TEXT, refRaw: "40:5" }), synced({ note: "fixed" })]).reason === "edited", "imported note edited later on Door43 → kept");
+  // restore that brings back different words
+  assert(verdict(row({ note: "older words" }), [aiCreate(), ev("restore", "dcs_reimport", null, { note: "older words" })]).reason === "edited", "Door43 restore with different words → kept");
+}
 
 // migration / hint
 assert(verdict(row(), [ev("create", "parallel_migration", 2, { ...AI_TEXT })]).reason === "migration", "parallel_migration → kept (D4)");
