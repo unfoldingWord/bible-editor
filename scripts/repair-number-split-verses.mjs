@@ -516,8 +516,10 @@ const scanPairs = [
   ),
 ].sort();
 // These land in a `--` comment line of a file applied to production; a quote or
-// line break would break the copy-pasted query or end the comment.
-const badPair = scanPairs.find((p) => !/^[A-Za-z0-9]+\/[A-Za-z0-9_-]+$/.test(p));
+// line break would break the copy-pasted query or end the comment. Book codes
+// must be uppercase as D1 stores them: the UPDATEs use the dump value verbatim,
+// so a lowercase dump would match nothing on apply.
+const badPair = scanPairs.find((p) => !/^[A-Z0-9]+\/[A-Za-z0-9_-]+$/.test(p));
 if (badPair) die(`dump row has an unexpected book/bible_version '${badPair}'; refusing to write it into the SQL`);
 
 const header = [
