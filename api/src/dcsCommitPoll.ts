@@ -474,8 +474,21 @@ export const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    -- walks the frontier it has — could never reach a hole that opened after
    -- an older one was already in progress; clearing the older gap would
    -- then report full coverage with those commits still missing.
-   gap_frontier_json = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL OR excluded.gap_frontier_json IS NOT NULL
-                              THEN excluded.gap_frontier_json ELSE dcs_repo_polls.gap_frontier_json END,
+   --
+   -- The caller's union is built from the state it READ, which a concurrent
+   -- poll may have changed since (issue #1211 review), so while a gap is open
+   -- the incoming frontier is ALSO unioned with the stored one here, deduped.
+   -- A stored value that is not a JSON array is replaced, as before.
+   gap_frontier_json = CASE
+     WHEN dcs_repo_polls.gap_since_sha IS NULL THEN excluded.gap_frontier_json
+     WHEN excluded.gap_frontier_json IS NULL THEN dcs_repo_polls.gap_frontier_json
+     WHEN dcs_repo_polls.gap_frontier_json IS NULL OR NOT json_valid(dcs_repo_polls.gap_frontier_json)
+          OR json_type(dcs_repo_polls.gap_frontier_json) != 'array' THEN excluded.gap_frontier_json
+     ELSE (SELECT json_group_array(u.value) FROM (
+             SELECT value FROM json_each(dcs_repo_polls.gap_frontier_json) WHERE type = 'text'
+             UNION
+             SELECT value FROM json_each(excluded.gap_frontier_json) WHERE type = 'text') u)
+   END,
    -- A clean post-migration poll establishes the floor once. Never advance it
    -- on later polls: moving it forward would make an older proven window
    -- unexpectedly fall back to live Gitea.

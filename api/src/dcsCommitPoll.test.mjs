@@ -804,7 +804,7 @@ async function main() {
       "a fresh page-cap gap's frontier is UNIONED with the already-open gap's frontier, not discarded",
     );
     assert(
-      /gap_frontier_json = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL OR excluded\.gap_frontier_json IS NOT NULL/.test(upsert.sql),
+      /WHEN excluded\.gap_frontier_json IS NULL THEN dcs_repo_polls\.gap_frontier_json/.test(upsert.sql) && /UNION/.test(upsert.sql),
       "  ...and the SQL guard applies that union even when an older gap already claimed gap_since_sha/gap_at",
     );
   }
