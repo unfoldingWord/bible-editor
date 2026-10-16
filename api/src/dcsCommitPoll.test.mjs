@@ -257,6 +257,14 @@ async function main() {
     const res2 = await pollDcsRepo({ DB: db2, DCS_BASE_URL: "https://example.test" }, "en_tq", NOW);
     assert(res2.fetched === 0 && inserts(db2).length === 0, "re-polling with the mark at the tip inserts nothing");
     assert(pollUpsert(db2).args[3] === NOW, "  ...but still stamps last_attempted_at, so the rate limit holds");
+    // Issue #1209: an empty walk has no tip row. Advancing the mark to that
+    // missing tip wrote last_sha = NULL, so the next poll fell back to the
+    // 30-day bootstrap window and hit page_cap on a busy repo (en_tn).
+    const up2 = pollUpsert(db2);
+    assert(
+      !(up2.args[8] === 1 && up2.args[1] == null),
+      "  ...and keeps the stored mark instead of overwriting it with NULL (#1209)",
+    );
   }
 
   // ── per-tick cap: 4 pages, then stop and RECORD the hole ─────────────────
