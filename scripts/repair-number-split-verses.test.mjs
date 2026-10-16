@@ -61,7 +61,8 @@ const dump = [row(UNLOCKED, 1), row(LOCKED, 1)];
 // The issue's success check: apply the generated file to a SQLite seeded with
 // the dump, then run the header's own survivor query. It must return the
 // number the header says to expect. Schema as in verify-number-split-repair.mjs.
-function survivorsAfterApply(sql) {
+// `outside` rows sit in the table but not in the dump, as production does.
+function survivorsAfterApply(sql, outside = []) {
   const db = new DatabaseSync(":memory:");
   db.exec(`
 CREATE TABLE verses (
@@ -78,7 +79,7 @@ CREATE TABLE edit_log (
   const ins = db.prepare(
     `INSERT INTO verses (book,chapter,verse,bible_version,content_json,plain_text,version) VALUES (?,?,?,?,?,?,?)`,
   );
-  for (const r of dump) ins.run(r.book, r.chapter, r.verse, r.bible_version, r.content_json, r.plain_text, r.version);
+  for (const r of [...dump, ...outside]) ins.run(r.book, r.chapter, r.verse, r.bible_version, r.content_json, r.plain_text, r.version);
   db.exec(sql);
   const lines = sql.split(/\r?\n/);
   const start = lines.findIndex((l) => l.includes("SELECT book, bible_version, chapter, verse FROM verses"));
@@ -94,39 +95,56 @@ function run(extraArgs, label) {
   const sqlPath = join(dir, "out.sql");
   writeFileSync(dumpPath, JSON.stringify(dump), "utf8");
   try {
-    execFileSync(
+    try {
+      execFileSync(
       process.execPath,
-      [scriptPath, dumpPath, "--out", sqlPath, "--force", ...extraArgs],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-    );
-  } catch (e) {
-    // The unlocked row's repair + the locked row's skip: no refusals, so this should exit 0.
-    console.error(e.stdout, e.stderr);
-    throw new Error(`${label}: CLI exited non-zero unexpectedly`);
+        [scriptPath, dumpPath, "--out", sqlPath, "--force", ...extraArgs],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      );
+    } catch (e) {
+      // The unlocked row's repair + the locked row's skip: no refusals, so this should exit 0.
+      console.error(e.stdout, e.stderr);
+      throw new Error(`${label}: CLI exited non-zero unexpectedly`);
+    }
+    return readFileSync(sqlPath, "utf8");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
-  const sql = readFileSync(sqlPath, "utf8");
-  rmSync(dir, { recursive: true, force: true });
-  return sql;
 }
 
-console.log(`no --book/--bible-version filter: survivor query must not be scoped to ${UNLOCKED} only`);
+// Rows production holds outside the dump: another book that still matches the
+// GLOB, and the scanned book in another resource. The documented workflow
+// dumps one book and resource in SQL and runs the CLI with no flags, so the
+// survivor query must not count these.
+const outside = [
+  { ...row(CANDIDATES.find((b) => b !== LOCKED && b !== UNLOCKED), 1) },
+  { ...row(UNLOCKED, 1), bible_version: "UST" },
+];
+const pairList = (books) => books.map((b) => `'${b}/ULT'`).sort().join(", ");
+
+console.log(`no --book/--bible-version filter: survivor query covers the dump's pairs, not ${UNLOCKED} alone and not the whole table`);
 {
   const sql = run([], "unfiltered");
   assert(sql.includes("Expect EXACTLY 1 survivor(s)"), `header expects exactly the 1 ${LOCKED} survivor`);
   const glob = sql.split("plain_text GLOB")[1].split("ORDER BY")[0];
-  assert(!glob.includes("book IN"), `survivor SELECT must not filter by book when the scan was unfiltered (got: ${glob})`);
-  const { got, expected } = survivorsAfterApply(sql);
+  assert(glob.includes(`IN (${pairList([LOCKED, UNLOCKED])})`), `survivor SELECT scopes to both scanned pairs (got: ${glob})`);
+  const { got, expected } = survivorsAfterApply(sql, outside);
   assert(got === expected && got === 1, `after apply, the header's survivor query returns what it expects (got ${got}, expected ${expected})`);
 }
 
-const scanList = [LOCKED, UNLOCKED].sort().map((b) => `'${b}'`).join(", ");
-console.log(`\n--book ${UNLOCKED},${LOCKED}: survivor query must scope to the SCAN (both), not the repaired book (${UNLOCKED} alone)`);
+console.log(`\n--book ${UNLOCKED},${LOCKED}: same scope as the unfiltered run`);
 {
   const sql = run(["--book", `${UNLOCKED},${LOCKED}`], "book-filtered");
-  const glob = sql.split("plain_text GLOB")[1].split("ORDER BY")[0];
-  assert(glob.includes(`book IN (${scanList})`), `survivor SELECT must include ${LOCKED} even though only ${UNLOCKED} was repaired (got: ${glob})`);
-  const { got, expected } = survivorsAfterApply(sql);
+  const { got, expected } = survivorsAfterApply(sql, outside);
   assert(got === expected && got === 1, `after apply, the header's survivor query returns what it expects (got ${got}, expected ${expected})`);
+}
+
+console.log(`\n--book ${UNLOCKED}: the ${LOCKED} row was not scanned, so it is neither expected nor counted`);
+{
+  const sql = run(["--book", UNLOCKED], "one-book");
+  assert(sql.includes("Expect 0 survivors"), "header expects 0 survivors");
+  const { got } = survivorsAfterApply(sql, outside);
+  assert(got === 0, `after apply, the header's survivor query returns 0 (got ${got})`);
 }
 
 console.log(`\nrepair-number-split-verses: all ${passed} assertions passed`);

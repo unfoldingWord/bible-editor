@@ -496,15 +496,21 @@ const versions = [...new Set(repaired.map((r) => r.row.bible_version))].sort();
 const inList = (xs) => xs.map((b) => `'${b}'`).join(", ");
 const stmtCount = repaired.length * 2;
 
-// The survivor query must match the scan's scope (everything --book/--bible-version
-// let through, i.e. what `rows` above was filtered to), NOT `books`/`versions`, which
-// are derived from `repaired` alone. expectedSurvivors — refused/plain_text_only/
-// locked/excluded — can and does land in books/versions that were scanned but never
-// repaired (see issue #985), so filtering the survivor SELECT down to `books` makes
-// it return 0 whenever every survivor sits outside those books, even on a fully
-// successful apply.
-const scanBooks = bookFilter ? [...bookFilter].sort() : [];
-const scanVersions = versionFilter ? [...versionFilter].sort() : [];
+// The survivor query must cover exactly what was scanned: every (book,
+// bible_version) pair present in `rows`, the dump after --book/--bible-version.
+// NOT `books`/`versions`, which come from `repaired` alone: expectedSurvivors
+// (refused / plain_text-only / locked / excluded) can and do sit in pairs that
+// were scanned but never repaired (issue #985), and filtering the SELECT to the
+// repaired books made it return 0 on a fully successful apply. And not the CLI
+// filters either: the documented dump is already scoped in SQL (one book, one
+// resource) and is run with no flags, so an unfiltered SELECT would count every
+// match in the whole table. Pairs, not book IN x version IN, so a dump of
+// 1CH/ULT + ISA/UST does not also count 1CH/UST. Values come from dump rows.
+const scanPairs = [...new Set(rows.map((r) => `${r.book}/${r.bible_version}`))].sort();
+// These land in a `--` comment line of a file applied to production; a quote or
+// line break would break the copy-pasted query or end the comment.
+const badPair = scanPairs.find((p) => !/^[A-Z0-9]+\/[A-Za-z0-9_-]+$/.test(p));
+if (badPair) die(`dump row has an unexpected book/bible_version '${badPair}'; refusing to write it into the SQL`);
 
 const header = [
   `-- Repair the number-split defect ("1, 000" → "1,000") — GitHub issue #452.`,
@@ -575,8 +581,7 @@ const header = [
     : ["--   Expect 0 survivors (every matching row in scope is repaired by this file):"]),
   "--     SELECT book, bible_version, chapter, verse FROM verses",
   "--      WHERE plain_text GLOB '*[0-9], [0-9][0-9][0-9]*'",
-  ...(scanBooks.length ? [`--        AND book IN (${inList(scanBooks)})`] : []),
-  ...(scanVersions.length ? [`--        AND bible_version IN (${inList(scanVersions)})`] : []),
+  `--        AND book || '/' || bible_version IN (${scanPairs.map(sqlStr).join(", ")})`,
   "--      ORDER BY book, bible_version, chapter, verse;",
   "--   If either number is wrong, re-dump and re-run this script; re-applying is safe.",
   ...(expectedSurvivors.length
