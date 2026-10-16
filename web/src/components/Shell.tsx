@@ -3473,7 +3473,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               bibleVersion,
               expectedVersion,
               { content, plain_text: plainText, alignment_intent: "confirmed_text_edit" },
-              { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow },
+              { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow, verseEnd: base.verse_end },
             );
             onConfirmedApply?.();
           },
@@ -3497,7 +3497,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bibleVersion,
       expectedVersion,
       { content, plain_text: plainText, alignment_intent: intent },
-      { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow },
+      { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow, verseEnd: base.verse_end },
     );
     return true;
   }, [book, pushPipelineToast]);
