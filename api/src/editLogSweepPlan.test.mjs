@@ -51,6 +51,12 @@ function freshDb() {
   assert.equal(elReads.length, 8, `one edit_log read per branch (got ${elReads.length}: ${elReads.join(" | ")})`);
   for (const x of elReads) assert.match(x, new RegExp(`USING INDEX ${INDEX} \\(kind=\\?`), `branch read uses ${INDEX}: ${x}`);
   console.log("  ok: all 8 branch reads use", INDEX);
+  // The outer DELETE seeks the aged rows by created_at (issue #1057 added a
+  // kind filter there; it must not turn the candidate read into a full scan).
+  const outer = details.filter((x) => /^(SEARCH|SCAN) edit_log\b/.test(x));
+  assert.equal(outer.length, 1, `one outer edit_log read (got ${outer.join(" | ")})`);
+  assert.match(outer[0], /^SEARCH edit_log USING (COVERING )?INDEX edit_log_recent \(created_at<\?\)/, `outer read seeks edit_log_recent: ${outer[0]}`);
+  console.log("  ok: outer DELETE seeks edit_log_recent");
 }
 
 // (3) The INDEXED BY hint changes the access path only, never the result.
