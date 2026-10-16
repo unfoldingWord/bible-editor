@@ -29,7 +29,7 @@ import { hoistOpeningPunctuation } from "./openingPunct.ts";
 import { NT_BOOKS } from "./dcsSources.ts";
 import { newRowId, isValidRowId, coerceRowId, deriveAltRowId } from "./rowId.ts";
 import { tnContentKey } from "./tnDedup.ts";
-import { classifyKept, loadEditLogs, type KeptRow } from "./keptNotes.ts";
+import { classifyKept, isDoor43PersonChange, loadEditLogs, type KeptRow } from "./keptNotes.ts";
 import { requiredOccurrence } from "./occurrenceRule.ts";
 import { resourcesWrittenBy } from "./chapterLock.ts";
 import {
@@ -1523,7 +1523,7 @@ export async function deleteUnkeptTns(
   const logs = await loadEditLogs(
     env,
     job.book,
-    candidates.filter((r) => r.updated_by != null || r.last_change_source === "dcs_sync").map((r) => r.id),
+    candidates.filter((r) => r.updated_by != null || isDoor43PersonChange(r)).map((r) => r.id),
   );
   await maybeTouchClaim(env, job.jobId, heartbeat);
   // A pristine row (updated_by NULL) is kept only for a named Door43 change

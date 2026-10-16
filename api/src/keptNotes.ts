@@ -191,7 +191,7 @@ function isHumanEvent(e: KeptLogEntry, before: State, after: State): boolean {
 // clears are not content writes and do not count.
 const DOOR43_NAMED_PREFIX = "Door43 (commits by ";
 const DOOR43_CONTENT_ACTIONS = new Set(["sync_merge", "sync_reseed"]);
-function isDoor43PersonChange(row: KeptRow): boolean {
+export function isDoor43PersonChange(row: KeptRow): boolean {
   return (
     row.last_change_source === DCS_SYNC_SOURCE &&
     DOOR43_CONTENT_ACTIONS.has(row.last_change_action ?? "") &&
@@ -199,16 +199,21 @@ function isDoor43PersonChange(row: KeptRow): boolean {
   );
 }
 
-// True unless the live words equal what the AI last wrote (the person's
-// commit then left this note as the AI had it). No AI write, or no create to
-// replay from: nothing to compare against, so it differs.
-function differsFromAi(row: KeptRow, allEntries: KeptLogEntry[]): boolean {
+// The decision covers a person fixing an AI-written note on Door43, so the
+// row must have an AI write, and its live words must differ from that write
+// (else the person's commit left this note as the AI had it; the actor names
+// every human in the file's window, not this row's author). A note master
+// always owned (no AI write) does not count: prod held 1,845 such rows with a
+// named merge, and keeping them would stop AI runs replacing old notes. An AI
+// write with no create to replay from cannot be compared, so it counts.
+function fixedAiNote(row: KeptRow, allEntries: KeptLogEntry[]): boolean {
   const entries = lastLife(allEntries);
   let lastAi = -1;
   entries.forEach((e, i) => {
     if (e.source === AI_SOURCE) lastAi = i;
   });
-  if (lastAi < 0 || entries[0].action !== "create") return true;
+  if (lastAi < 0) return false;
+  if (entries[0].action !== "create") return true;
   let state = EMPTY_STATE;
   for (const e of entries.slice(0, lastAi + 1)) state = applyPayload(state, parsePayload(e.payload_json));
   return !sameContent(contentOf(row), state);
@@ -232,7 +237,7 @@ export function classifyKept(
   allEntries: KeptLogEntry[],
 ): { kept: boolean; reason: KeptReason } {
   if (row.preserve === 1) return { kept: true, reason: "preserve" };
-  const door43 = isDoor43PersonChange(row) && differsFromAi(row, allEntries);
+  const door43 = isDoor43PersonChange(row) && fixedAiNote(row, allEntries);
   // A master-owned row (updated_by NULL, e.g. an AI note re-seeded from
   // master) is kept only for a named person's Door43 change.
   if (row.updated_by === null) {
@@ -396,7 +401,7 @@ export async function loadEditLogs(
 
 // The kept notes among the live, non-hint, non-trashed rows of the chapter
 // range. Pristine rows (updated_by NULL) are candidates only when a Door43
-// sync last changed them (#1155); a
+// sync naming a person last wrote them (#1155); a
 // preserve row always is.
 export async function loadKeptTns(
   env: Env,
@@ -410,7 +415,9 @@ export async function loadKeptTns(
        FROM tn_rows
       WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
         AND deleted_at IS NULL AND trashed_at IS NULL AND hint = 0
-        AND (preserve = 1 OR updated_by IS NOT NULL OR last_change_source = 'dcs_sync')
+        AND (preserve = 1 OR updated_by IS NOT NULL
+             OR (last_change_source = 'dcs_sync' AND last_change_action IN ('sync_merge', 'sync_reseed')
+                 AND last_change_actor LIKE 'Door43 (commits by %'))
       ORDER BY chapter, verse, sort_order, id`,
   )
     .bind(book, startChapter, endChapter)

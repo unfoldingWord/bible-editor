@@ -79,7 +79,9 @@ assert(!verdict(row({ note: "from master" }), [aiCreate(), ev("update", "dcs_rei
   const fixed = { note: "A reviewer fixed this on Door43." };
   assert(verdict(d43(NAMED, fixed), [aiCreate()]).reason === "door43", "named person's Door43 fix to an AI note → kept");
   assert(verdict(d43("Door43 (commits by A, B and others)", { ...fixed, last_change_action: "sync_merge" }), [aiCreate()]).reason === "door43", "named merge (several authors) → kept");
-  assert(verdict(d43(NAMED, fixed), []).reason === "door43", "named Door43 change to a note with no log → kept");
+  assert(!verdict(d43(NAMED, fixed), []).kept, "named Door43 change to a note with no log → not kept (no AI write to fix)");
+  assert(!verdict(d43(NAMED, { ...fixed, last_change_action: "sync_merge" }), [ev("create", "dcs_reimport", null, { ...AI_TEXT, refRaw: "40:5" })]).kept, "named merge onto a note master always owned → not kept");
+  assert(verdict(d43(NAMED, fixed), [ev("update", "ai_pipeline", 7, AI_TEXT)]).reason === "door43", "named fix to an AI note with no create in the log → kept");
   assert(!verdict(d43("Door43 (AI/bot push)", fixed), [aiCreate()]).kept, "bot push → not kept");
   assert(!verdict(d43("Door43 sync", fixed), [aiCreate()]).kept, "unnamed general Door43 sync → not kept");
   assert(!verdict(d43(NAMED, { ...fixed, last_change_action: "sync_reorder" }), [aiCreate()]).kept, "named reorder only → not kept");
