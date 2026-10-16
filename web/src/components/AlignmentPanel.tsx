@@ -78,6 +78,7 @@ import {
   refusedOpOrder,
   refusedSaveStillCurrent,
 } from "../sync/alignmentDraftSaveState";
+import { createWriteLatch, settleOnSave } from "../lib/saveChain";
 import { isVersionOnlyRebase, lostAlignedWords, sameVerseContent } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
@@ -172,13 +173,15 @@ interface Props {
   // the outbox op for generation-gated cleanup on PATCH success.
   // Returning false means nothing was queued (#986): the panel then keeps its
   // edit and crash draft and does not run afterCommit, so a save chain stalls
-  // (no "done" mark, no move). The caller says why.
+  // (no "done" mark, no move). The caller says why. A promise defers that
+  // answer until the outbox write settles (#1196: the dual aligner, where an
+  // IndexedDB put can reject); the panel commits only once it resolves true.
   onSave: (
     newContent: unknown,
     plainText: string,
     expectedVersion: number,
     draftGeneration?: string,
-  ) => boolean | void;
+  ) => boolean | void | Promise<boolean>;
   onCancel: () => void;
   onDirtyChange?: (dirty: boolean) => void;
   // Confirm-before-save for an alignment edit that would leave a previously
@@ -343,6 +346,12 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // an awaited draft and outbox read), which fire after a request settles,
     // never during a render, so it is written after commit (#1117).
     const verseRef = useRef(verse);
+    // #1196 item 2: the dual aligner's outbox write is async. A save started
+    // while one is pending waits for it (writeLatch), then re-runs through the
+    // newest handleSave; savedStateRef is the state the last stored save
+    // committed, so that re-run can tell nothing changed since.
+    const writeLatchRef = useRef(createWriteLatch());
+    const savedStateRef = useRef<AlignmentState | null>(null);
     useLayoutEffect(() => {
       verseRef.current = verse;
     });
@@ -402,6 +411,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
             const vo = (rec.content as { verseObjects?: unknown[] }).verseObjects;
             if (!Array.isArray(vo)) return;
             setState(parseAlignment(vo, sourceVerseObjectsRef.current));
+            // A save of the restored draft clears exactly this record (#1196).
+            lastDraftGenerationRef.current = rec.generation;
             setRestored(true);
           }).catch(() => {
             // Best effort, like the mount-time read: the draft is still there on reopen.
@@ -595,6 +606,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         const vo = (rec.content as { verseObjects?: unknown[] }).verseObjects;
         if (!Array.isArray(vo)) return;
         setState(parseAlignment(vo, sourceVerseObjects));
+        // A save of the restored draft clears exactly this record (#1196).
+        lastDraftGenerationRef.current = rec.generation;
         setRestored(true);
       });
       // `initial` excluded deliberately: it's only ever set by this same effect
@@ -993,6 +1006,17 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         afterCommit?.();
         return true;
       }
+      // An earlier save's outbox write is still pending: wait for it, then
+      // save whatever the panel holds then (#1196 item 2).
+      if (
+        writeLatchRef.current.after(() => {
+          if (!mountedRef.current) return;
+          if (stateRef.current === savedStateRef.current) afterCommit?.();
+          else latestSaveRef.current(afterCommit);
+        })
+      ) {
+        return false;
+      }
       const newVerseObjects = serializeAlignment(state);
       const newContent = { verseObjects: newVerseObjects };
       const plain = alignmentPlainText(state);
@@ -1011,7 +1035,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         // alignmentDrafts.ts's onOutboxResult listener (#508).
         const draftGeneration = lastDraftGenerationRef.current ?? mintAlignmentDraftGeneration();
         const priorPendingSave = pendingSaveRef.current;
-        pendingSaveRef.current = {
+        const thisPendingSave = {
           generation: draftGeneration,
           // A save still waiting on the outbox keeps the older baseline: if
           // both are refused, the panel goes back to what the server holds.
@@ -1020,26 +1044,43 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           savedContent: newContent,
           baseContent: verse.content,
         };
-        if (onSave(newContent, plain, verse.version, draftGeneration) === false) {
-          // Nothing was queued (#986): keep the edit on screen and its crash
-          // draft, and leave afterCommit unrun.
-          pendingSaveRef.current = priorPendingSave;
-          return false;
-        }
-        // Optimistic: the freshly-saved state is now the baseline. When the
-        // chapter cache eventually round-trips the new content, computedInitial
-        // recomputes and the useEffect resets state to it (idempotent).
-        setInitial(state);
-        setRestored(false);
-        // The alignment is now queued in the outbox; drop the crash-draft
-        // immediately. onOutboxResult also clears it when the PATCH lands
-        // (belt-and-suspenders in alignmentDrafts.ts) — generation-gated, so a
-        // draft written by continued dragging AFTER this point (a newer
-        // generation) survives both this clear and that later one.
-        void alignmentDrafts.clear(alignmentDraftKey(book, chapter, verseNum, bibleVersion));
-        lastDraftGenerationRef.current = undefined;
-        afterCommit?.();
-        return true;
+        pendingSaveRef.current = thisPendingSave;
+        // Nothing was queued (#986): keep the edit on screen and its crash
+        // draft, and leave afterCommit unrun.
+        const notQueued = () => {
+          if (pendingSaveRef.current === thisPendingSave) pendingSaveRef.current = priorPendingSave;
+        };
+        const committed = (deferred: boolean) => {
+          savedStateRef.current = state;
+          // Optimistic: the freshly-saved state is now the baseline. When the
+          // chapter cache eventually round-trips the new content, computedInitial
+          // recomputes and the useEffect resets state to it (idempotent).
+          setInitial(state);
+          setRestored(false);
+          // The alignment is now queued in the outbox; drop the crash-draft
+          // immediately. onOutboxResult also clears it when the PATCH lands
+          // (belt-and-suspenders in alignmentDrafts.ts) — generation-gated, so a
+          // draft written by continued dragging AFTER this point (a newer
+          // generation) survives both this clear and that later one.
+          const key = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
+          if (deferred) {
+            // #1196: the write settled after the user may have dragged on
+            // and persisted a newer draft; clear only the draft this save
+            // holds, and keep tracking a newer one.
+            void alignmentDrafts.clearGeneration(key, draftGeneration);
+            if (lastDraftGenerationRef.current === draftGeneration) lastDraftGenerationRef.current = undefined;
+          } else {
+            void alignmentDrafts.clear(key);
+            lastDraftGenerationRef.current = undefined;
+          }
+          afterCommit?.();
+        };
+        return settleOnSave(
+          onSave(newContent, plain, verse.version, draftGeneration),
+          committed,
+          notQueued,
+          writeLatchRef.current,
+        );
       };
       // Warn before unaligning a previously-aligned word. On "Cancel" the parent
       // runs nothing, so `commit` (and thus setInitial + afterCommit) never fires
@@ -1051,6 +1092,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       }
       return commit();
     }, [state, initial, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
+    const latestSaveRef = useRef(handleSave);
+    useEffect(() => {
+      latestSaveRef.current = handleSave;
+    });
 
     // Same two maps hebrewHighlight/onEnglishHover use, in the same roles:
     // posOwners (display-derived) says which CARD(s) own the position, and

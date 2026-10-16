@@ -170,13 +170,14 @@ export interface PanelSlot {
   twlForVerse: TwlRow[];
   posOffset: number;
   // draftGeneration (#508): forwarded verbatim from AlignmentPanel's onSave —
-  // see its doc comment and alignmentDrafts.ts. False: nothing was queued.
+  // see its doc comment and alignmentDrafts.ts. False: nothing was queued; a
+  // promise resolves to whether the outbox stored it (#1196).
   onSave: (
     newContent: unknown,
     plainText: string,
     expectedVersion: number,
     draftGeneration?: string,
-  ) => boolean | void;
+  ) => boolean | void | Promise<boolean>;
   onDirtyChange: (dirty: boolean) => void;
   // Confirm-before-save when this side's edit would unalign a previously aligned
   // word (forwarded to AlignmentPanel; see its onConfirmUnalign prop).

@@ -6,7 +6,7 @@
 //   node --experimental-strip-types --no-warnings src/lib/saveChain.test.mjs
 
 import assert from "node:assert/strict";
-import { createSaveDoneAndNextGuard, runSaveChain, runSaveDoneAndNext } from "./saveChain.ts";
+import { createSaveDoneAndNextGuard, createWriteLatch, runSaveChain, runSaveDoneAndNext, settleOnSave } from "./saveChain.ts";
 
 let failed = 0;
 function check(cond, msg) {
@@ -252,6 +252,80 @@ function check(cond, msg) {
   assert.equal(run(true), true, "the next click starts a new chain");
   assert.deepEqual(marked, [7], "once both sides queue, the verse is marked");
   assert.equal(advanced, 1, "and the aligner moves on");
+}
+
+// #1196 item 2: an aligner panel commits (new baseline, crash draft cleared,
+// afterCommit run) only when its onSave really queued something. The dual
+// aligner answers with a promise, because the IndexedDB write that queues the
+// PATCH can reject; before, any non-false answer committed at once, so a
+// rejected write cleared the crash draft and the verse was marked done with
+// nothing saved.
+{
+  const outcome = () => {
+    const seen = [];
+    return { seen, committed: () => seen.push("committed"), notQueued: () => seen.push("notQueued") };
+  };
+  // void (the single-panel aligner): commits synchronously, as before.
+  let o = outcome();
+  assert.equal(settleOnSave(undefined, o.committed, o.notQueued), true, "void commits synchronously");
+  assert.deepEqual(o.seen, ["committed"]);
+  // false: nothing was queued (#986).
+  o = outcome();
+  assert.equal(settleOnSave(false, o.committed, o.notQueued), false, "false is not a commit");
+  assert.deepEqual(o.seen, ["notQueued"]);
+  // A promise: nothing happens until it settles.
+  o = outcome();
+  let resolve;
+  const pending = new Promise((r) => (resolve = r));
+  assert.equal(settleOnSave(pending, o.committed, o.notQueued), false, "a promise defers the commit");
+  assert.deepEqual(o.seen, [], "no commit before the outbox write settles");
+  resolve(true);
+  await pending;
+  await Promise.resolve();
+  assert.deepEqual(o.seen, ["committed"], "a stored write commits");
+  // The write was refused (resolved false) or threw (rejected): not queued.
+  o = outcome();
+  const refused = Promise.resolve(false);
+  settleOnSave(refused, o.committed, o.notQueued);
+  await refused;
+  await Promise.resolve();
+  assert.deepEqual(o.seen, ["notQueued"], "a write that resolves false does not commit");
+  o = outcome();
+  const rejected = Promise.reject(new Error("QuotaExceededError"));
+  settleOnSave(rejected, o.committed, o.notQueued);
+  await rejected.catch(() => {});
+  await Promise.resolve();
+  assert.deepEqual(o.seen, ["notQueued"], "a rejected IndexedDB write does not commit");
+}
+
+// #1196 item 2 review (#1207): while one outbox write is pending, a second
+// save of the same panel must wait for it, then run against the panel's state
+// at that time. Before, it ran at once: two pending saves raced, and the older
+// one's late commit could clear the newer one's crash draft or release the
+// save-done-next guard.
+{
+  const latch = createWriteLatch();
+  assert.equal(latch.after(() => {}), false, "nothing pending: the caller saves now");
+  let resolve;
+  const write = new Promise((r) => (resolve = r));
+  const seen = [];
+  settleOnSave(write, () => seen.push("first committed"), () => seen.push("first notQueued"), latch);
+  assert.equal(latch.after(() => seen.push("second save")), true, "a save during a pending write waits");
+  assert.deepEqual(seen, [], "the second save does not start while the first write is pending");
+  resolve(true);
+  await write;
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+  assert.deepEqual(seen, ["first committed", "second save"], "the second save runs after the first settles");
+  assert.equal(latch.after(() => {}), false, "the latch is free once the write settled");
+
+  // A refused write frees the latch too.
+  const refused = Promise.reject(new Error("QuotaExceededError"));
+  settleOnSave(refused, () => {}, () => seen.push("refused"), latch);
+  latch.after(() => seen.push("after refused"));
+  await refused.catch(() => {});
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+  assert.deepEqual(seen.slice(2), ["refused", "after refused"]);
+  assert.equal(latch.after(() => {}), false);
 }
 
 if (failed) {
