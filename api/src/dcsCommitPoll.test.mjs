@@ -240,8 +240,16 @@ async function main() {
     await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tq", NOW);
     const ins = inserts(db);
     assert(
-      ins.every((s) => /ON CONFLICT \(repo, sha\) DO NOTHING/.test(s.sql)),
-      "every insert is ON CONFLICT (repo, sha) DO NOTHING — a re-poll cannot duplicate or re-stamp seen_at",
+      ins.every((s) =>
+        /ON CONFLICT \(repo, sha\) DO UPDATE SET parent_shas_json = excluded\.parent_shas_json\s+WHERE excluded\.parent_shas_json IS NOT NULL\s+AND NOT \(CASE/.test(
+          s.sql,
+        ) && !/,\s*\w+\s*=\s*excluded\./.test(s.sql.split("DO UPDATE SET")[1]),
+      ),
+      "every insert conflicts on (repo, sha) and only fills a missing parent list — a re-poll cannot duplicate or re-stamp seen_at",
+    );
+    assert(
+      ins.every((s) => s.args.length === 12 && Array.isArray(JSON.parse(s.args[11]))),
+      "  ...and records each commit's full parent list (#1200)",
     );
     // Second poll from the ADVANCED mark: the same commit is offered again by
     // the server (it is now the mark) and must not be re-inserted.

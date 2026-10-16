@@ -706,6 +706,13 @@ Highlights that bite repeatedly:
   row before expecting a ledger-gated change to quiet anything in prod. The read also needs the poll tip to equal the
   live head, and the poller runs at most every 30 minutes, so a commit to the repo shortly before an export step
   (any book) answers `ledger_tip_stale` and keeps the warning that night too.
+- **A `dcs_commits` row proves nothing about its ancestors.** Backfill inserts land before its frontier write, a
+  clean forward poll records no frontier for a merge's older second parent, and a bootstrap walk is time-bounded,
+  so "this sha is in the ledger" cannot end a gap walk (#1200). What can: `parent_shas_json` (migration 0078), the
+  full parent list Door43 returned. The backfill expands a frontier entry through rows that carry it and fetches
+  any row that does not (every row from before 0078). The retention sweep skips a repo while it has an open gap,
+  or it would delete that trail hourly (backfilled history is old on both clocks). A time cutoff (stop below `coverage_since`) was rejected:
+  committer dates are not monotone along parent edges, so nothing in the code bounds it.
 
 ## Stop conditions / goals
 

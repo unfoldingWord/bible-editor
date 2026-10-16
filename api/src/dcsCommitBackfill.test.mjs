@@ -80,6 +80,13 @@ const D1_MAX_BATCH_STATEMENTS = 100;
 // answers regardless of whether the CAS applied — but the concurrent-write
 // race test below needs the mock to actually decide whether a write landed,
 // not just record that it was attempted.
+function emptyLedgerExpansion(args) {
+  const [, seedsJson, gapSinceSha] = args;
+  return Array.from(new Set(JSON.parse(seedsJson)))
+    .filter((sha) => sha !== gapSinceSha)
+    .map((sha) => ({ sha }));
+}
+
 function mockDb(stateRow) {
   const executed = [];
   const runs = [];
@@ -92,6 +99,12 @@ function mockDb(stateRow) {
     },
     async first() {
       return current ? { ...current } : null;
+    },
+    // The ledger-expansion query (issue #1200) against an EMPTY ledger:
+    // nothing is known, so every distinct entry except gap_since_sha comes
+    // back as still to walk. The real query is tested on SQLite below.
+    async all() {
+      return { results: emptyLedgerExpansion(this.args) };
     },
     async run() {
       runs.push({ sql: this.sql, args: this.args });
@@ -447,6 +460,9 @@ async function main() {
             const repo = TRACKED_DCS_REPOS[callIndex++];
             return repo === "en_ult" ? state(null, null) : state("g", ["f"]);
           },
+          async all() {
+            return { results: emptyLedgerExpansion(this.args) };
+          },
           async run() {
             return { success: true };
           },
@@ -463,6 +479,265 @@ async function main() {
       results.filter((r) => r.repo !== "en_ult").every((r) => r.status === "error" || r.status === "fetch_failed"),
       "  ...every other repo's failing fetch is caught and reported, not thrown",
     );
+  }
+
+  // ── issue #1200: the walk must converge. Real SQLite through the real
+  // migrations (a JS mock comparing with === hid a NULL bug in #1193). ─────
+  {
+    const FAR = "far-edge";
+    const fresh = () => {
+      const d = new DatabaseSync(":memory:");
+      const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+      for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+        d.exec(readFileSync(join(dir, f), "utf8"));
+      }
+      return d;
+    };
+    const sqliteEnv = (d) => {
+      const stmt = (sql, args = []) => ({
+        sql,
+        args,
+        bind: (...a) => stmt(sql, a),
+        first: async () => d.prepare(sql).get(...args) ?? null,
+        all: async () => ({ results: d.prepare(sql).all(...args) }),
+        run: async () => {
+          d.prepare(sql).run(...args);
+          return { success: true };
+        },
+      });
+      return {
+        DB: {
+          prepare: (sql) => stmt(sql),
+          async batch(list) {
+            if (list.length > D1_MAX_BATCH_STATEMENTS) throw new Error("D1_ERROR: too many statements in batch");
+            d.exec("BEGIN");
+            try {
+              for (const s of list) d.prepare(s.sql).run(...s.args);
+              d.exec("COMMIT");
+            } catch (e) {
+              d.exec("ROLLBACK");
+              throw e;
+            }
+            return list.map(() => ({ success: true }));
+          },
+        },
+      };
+    };
+    const openGap = (d, frontier) =>
+      d
+        .prepare(`INSERT INTO dcs_repo_polls (repo, gap_since_sha, gap_at, gap_frontier_json) VALUES ('en_tn', ?, ?, ?)`)
+        .run(FAR, NOW - 86400, JSON.stringify(frontier));
+    // parents === undefined → a row written before migration 0078 (NULL).
+    const ledgerRow = (d, sha, parents) =>
+      d
+        .prepare(
+          `INSERT INTO dcs_commits (repo, sha, parent_sha, committed_at, classification, files_json, seen_at, parent_shas_json)
+           VALUES ('en_tn', ?, ?, ?, 'human', '[]', ?, ?)`,
+        )
+        .run(sha, parents?.[0] ?? null, NOW - 999, NOW - 999, parents === undefined ? null : JSON.stringify(parents));
+    const gapRow = (d) => d.prepare(`SELECT gap_since_sha, gap_frontier_json FROM dcs_repo_polls WHERE repo = 'en_tn'`).get();
+    const countingFetch = (pages) => {
+      const urls = mockGitea(pages);
+      return () => urls.length;
+    };
+
+    // A frontier entry whose whole history is already in the ledger is
+    // dropped with no Door43 fetch, and the gap clears.
+    {
+      const d = fresh();
+      ledgerRow(d, "F", ["P"]);
+      ledgerRow(d, "P", []); // a root
+      openGap(d, ["F"]);
+      globalThis.fetch = async () => {
+        throw new Error("must not fetch: F and its whole history are already in the ledger");
+      };
+      const res = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+      assert(res.resolved === true && res.fetched === 0, "#1200: an entry whose history is all in the ledger resolves without a Door43 fetch");
+      assert(gapRow(d).gap_since_sha === null, "  ...and the gap is really cleared in SQLite");
+    }
+
+    // A gap that still hides an uncovered commit is NOT cleared: F is known,
+    // but its second parent Q never reached the ledger.
+    {
+      const d = fresh();
+      ledgerRow(d, "F", ["P", "Q"]);
+      ledgerRow(d, "P", []);
+      openGap(d, ["F"]);
+      const seen = [];
+      globalThis.fetch = async (url) => {
+        seen.push(new URL(url).searchParams.get("sha"));
+        throw new Error("network");
+      };
+      const res = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+      const row = gapRow(d);
+      assert(res.resolved === false && row.gap_since_sha === FAR, "#1200: a gap whose uncovered merge parent Q is missing stays open");
+      assert(seen.every((s) => s === "Q") && seen.length > 0, "  ...and the only Door43 walk is from Q, not from the already-known F");
+      assert(JSON.parse(row.gap_frontier_json).join(",") === "Q", "  ...and the stored frontier is exactly the uncovered commit Q");
+    }
+
+    // A row written before migration 0078 has no recorded parents, so being
+    // in the ledger proves nothing about its history: it is still fetched.
+    {
+      const d = fresh();
+      ledgerRow(d, "F", undefined);
+      openGap(d, ["F"]);
+      const fetches = countingFetch([[commit("F", "hand fix", "h@x", { parent: "P" }), commit("P", "older", "h@x")]]);
+      const res = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+      assert(fetches() === 1, "#1200: a ledger row with unknown parents is walked on Door43, not trusted");
+      assert(res.resolved === true && gapRow(d).gap_since_sha === null, "  ...and that walk (reaching the root P) clears the gap");
+      const f = d.prepare(`SELECT parent_shas_json FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'F'`).get();
+      assert(f.parent_shas_json === '["P"]', "  ...recording F's parents on the existing row so the next walk can follow them locally");
+      const p = d.prepare(`SELECT parent_shas_json FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'P'`).get();
+      assert(p.parent_shas_json === "[]", "  ...and a newly inserted root records an explicit empty parent list");
+      const fRow = d
+        .prepare(
+          `SELECT parent_sha, author_name, author_email, committed_at, message, classification,
+                  classification_reason, files_json, seen_at
+             FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'F'`,
+        )
+        .get();
+      assert(
+        fRow.seen_at === NOW - 999 &&
+          fRow.committed_at === NOW - 999 &&
+          fRow.classification === "human" &&
+          fRow.classification_reason === null &&
+          fRow.files_json === "[]" &&
+          fRow.parent_sha === null &&
+          fRow.author_name === null &&
+          fRow.author_email === null &&
+          fRow.message === null,
+        "  ...and the refetch changes nothing else on the existing row (seen_at, classification, dates, files, author, message)",
+      );
+    }
+
+    // A stored parent list that is not a well-formed JSON array of text shas
+    // is replaced by the next fetch, so the sha is not re-walked forever.
+    for (const bad of ['["P", 5]', '["P"', '{"a":1}']) {
+      const d = fresh();
+      d.prepare(
+        `INSERT INTO dcs_commits (repo, sha, committed_at, classification, seen_at, parent_shas_json) VALUES ('en_tn', 'F', 1, 'human', 1, ?)`,
+      ).run(bad);
+      openGap(d, ["F"]);
+      countingFetch([[commit("F", "hand fix", "h@x", { parent: "P" }), commit("P", "older", "h@x")]]);
+      const res = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+      const f = d.prepare(`SELECT parent_shas_json, seen_at FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'F'`).get();
+      assert(
+        res.status !== "expansion_failed" && f.parent_shas_json === '["P"]' && f.seen_at === 1,
+        `#1200: a malformed stored parent list (${bad}) is overwritten by the fetched one, nothing else changes`,
+      );
+    }
+
+    // A well-formed stored list is never overwritten.
+    {
+      const d = fresh();
+      ledgerRow(d, "F", ["P"]);
+      const env = sqliteEnv(d);
+      await env.DB.batch([
+        env.DB.prepare(INSERT_COMMIT_SQL).bind("en_tn", "F", "Q", null, null, 1, null, "human", null, "[]", 1, '["Q"]'),
+      ]);
+      const f = d.prepare(`SELECT parent_shas_json FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'F'`).get();
+      assert(f.parent_shas_json === '["P"]', "#1200: a well-formed stored parent list is left as it is");
+    }
+
+    // If the expansion query fails (a D1 timeout or limit as the stored trail
+    // grows), the tick falls back to the old walk of one raw entry instead of
+    // making no progress, and never clears the gap on that path.
+    {
+      const failingExpansion = (d) => {
+        const env = sqliteEnv(d);
+        const prepare = env.DB.prepare;
+        env.DB.prepare = (sql) =>
+          sql.includes("WITH RECURSIVE")
+            ? {
+                bind: () => ({
+                  all: async () => {
+                    throw new Error("D1_ERROR: query exceeded limit");
+                  },
+                }),
+              }
+            : prepare(sql);
+        return env;
+      };
+      const d = fresh();
+      openGap(d, ["A", "A", "B"]);
+      const seen = [];
+      globalThis.fetch = async (url) => {
+        seen.push(new URL(url).searchParams.get("sha"));
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (k) => (k.toLowerCase() === "x-hasmore" ? "false" : null) },
+          json: async () => [commit("A", "genesis", "h@x")],
+        };
+      };
+      const res = await backfillDcsRepoGap(failingExpansion(d), "en_tn", NOW);
+      assert(seen.length === 1 && seen[0] === "A", "#1200: a failed expansion still walks one entry the old way");
+      assert(res.status === "expansion_failed" && res.resolved === false, "  ...and reports the failure, not a resolution");
+      const row = gapRow(d);
+      assert(row.gap_since_sha === FAR && JSON.parse(row.gap_frontier_json).join(",") === "B", "  ...advancing the frontier past the walked entry");
+
+      // The same path with nothing left afterwards still does not clear.
+      const d2 = fresh();
+      openGap(d2, ["A"]);
+      const res2 = await backfillDcsRepoGap(failingExpansion(d2), "en_tn", NOW);
+      assert(res2.resolved === false && gapRow(d2).gap_since_sha === FAR, "  ...and never clears the gap on that path, even when the walk empties the frontier");
+    }
+
+    // Expansion stops at a held row with unknown parents (P) and at a held row
+    // whose recorded list is malformed (M): both are walked, never trusted.
+    {
+      for (const [label, setup, expectWalkFrom] of [
+        ["a known row's parent held without parents", (d) => (ledgerRow(d, "F", ["P"]), ledgerRow(d, "P", undefined)), "P"],
+        [
+          "a held row with a malformed parent list",
+          (d) =>
+            d
+              .prepare(
+                `INSERT INTO dcs_commits (repo, sha, committed_at, classification, seen_at, parent_shas_json) VALUES ('en_tn', 'F', 1, 'human', 1, '["P", 5]')`,
+              )
+              .run(),
+          "F",
+        ],
+      ]) {
+        const d = fresh();
+        setup(d);
+        openGap(d, ["F"]);
+        const seen = [];
+        globalThis.fetch = async (url) => {
+          seen.push(new URL(url).searchParams.get("sha"));
+          throw new Error("network");
+        };
+        const res = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+        assert(
+          res.resolved === false && gapRow(d).gap_since_sha === FAR && seen[0] === expectWalkFrom,
+          `#1200: ${label} is walked on Door43 (from ${expectWalkFrom}) and the gap stays open`,
+        );
+      }
+    }
+
+    // A duplicated frontier entry is walked once.
+    {
+      const d = fresh();
+      openGap(d, ["X", "X"]);
+      const fetches = countingFetch([[commit("X", "genesis", "h@x")]]);
+      const res = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+      assert(fetches() === 1, "#1200: a duplicated frontier entry costs one walk");
+      assert(res.resolved === true && gapRow(d).gap_since_sha === null, "  ...and its duplicate does not keep the gap open for another tick");
+    }
+
+    // Local expansion stops at gap_since_sha, the same edge computeGapFrontier
+    // drops, so following stored parents never walks past the far edge.
+    {
+      const d = fresh();
+      ledgerRow(d, "F", [FAR]);
+      ledgerRow(d, FAR, ["older-than-the-hole"]);
+      openGap(d, ["F"]);
+      globalThis.fetch = async () => {
+        throw new Error("must not fetch");
+      };
+      const res = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+      assert(res.resolved === true && res.fetched === 0, "#1200: local expansion stops at gap_since_sha instead of following it into older history");
+    }
   }
 
   console.log("dcsCommitBackfill: all assertions passed");
