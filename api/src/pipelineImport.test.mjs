@@ -521,7 +521,7 @@ await (async () => {
     !/updated_by IS NULL/.test(sql) && !/FROM edit_log/.test(sql),
     "keep rule: the SELECT no longer filters on updated_by or the latest edit_log source",
   );
-  for (const col of ["updated_by", "quote", "note", "support_reference", "preserve", "ref_raw"]) {
+  for (const col of ["updated_by", "quote", "note", "support_reference", "preserve", "ref_raw", "last_change_source", "last_change_action", "last_change_actor"]) {
     assert(sql.includes(col), `keep rule: the SELECT returns ${col} for classifyKept`);
   }
 })();
@@ -629,6 +629,14 @@ await (async () => {
   });
   const cases = [
     { id: "pri1", row: mkRow("pri1", { updated_by: null }), log: [], deleted: true, why: "pristine row" },
+    {
+      id: "d43n", row: mkRow("d43n", { updated_by: null, note: "A reviewer fixed this on Door43.", last_change_source: "dcs_sync", last_change_action: "sync_reseed", last_change_actor: "Door43 (commits by Richard Mahn)" }),
+      log: [aiCreate("d43n")], deleted: false, why: "AI note a named person fixed on Door43 stays (#1155 A)",
+    },
+    {
+      id: "d43b", row: mkRow("d43b", { updated_by: null, note: "The bot rewrote this.", last_change_source: "dcs_sync", last_change_action: "sync_reseed", last_change_actor: "Door43 (AI/bot push)" }),
+      log: [aiCreate("d43b")], deleted: true, why: "AI note re-seeded by a bot push is swept",
+    },
     {
       id: "nolg", row: mkRow("nolg"), log: [],
       deleted: false, why: "updated_by set but no edit_log history (pruned) stays",

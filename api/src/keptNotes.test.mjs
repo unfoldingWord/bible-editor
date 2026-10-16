@@ -66,6 +66,41 @@ assert(!verdict(row({ note: "New AI text" }), [aiCreate(), ev("update", null, 5,
 // reimport after AI, no human → not kept
 assert(!verdict(row({ note: "from master" }), [aiCreate(), ev("update", "dcs_reimport", null, { note: "from master" })]).kept, "dcs_reimport only → not kept");
 
+// A Door43 change by a named person (#1155, decision A). The app keeps who
+// made the row's last change in last_change_actor; door43Actor writes
+// "Door43 (commits by NAME)" only for measured human commits, "Door43 (AI/bot
+// push)" for a bot-only window and the bare "Door43 sync" when unmeasured.
+{
+  const NAMED = "Door43 (commits by Richard Mahn)";
+  const d43 = (actor, over = {}) => row({
+    updated_by: null, last_change_source: "dcs_sync", last_change_action: "sync_reseed", last_change_actor: actor, ...over,
+  });
+  // A re-seed of an AI row logs nothing and resets updated_by to NULL.
+  const fixed = { note: "A reviewer fixed this on Door43." };
+  assert(verdict(d43(NAMED, fixed), [aiCreate()]).reason === "door43", "named person's Door43 fix to an AI note → kept");
+  assert(verdict(d43("Door43 (commits by A, B and others)", { ...fixed, last_change_action: "sync_merge" }), [aiCreate()]).reason === "door43", "named merge (several authors) → kept");
+  assert(!verdict(d43(NAMED, fixed), []).kept, "named Door43 change to a note with no log → not kept (no AI write to fix)");
+  assert(!verdict(d43(NAMED, { ...fixed, last_change_action: "sync_merge" }), [ev("create", "dcs_reimport", null, { ...AI_TEXT, refRaw: "40:5" })]).kept, "named merge onto a note master always owned → not kept");
+  assert(verdict(d43(NAMED, fixed), [ev("update", "ai_pipeline", 7, AI_TEXT)]).reason === "door43", "named fix to an AI note with no create in the log → kept");
+  assert(!verdict(d43("Door43 (AI/bot push)", fixed), [aiCreate()]).kept, "bot push → not kept");
+  assert(!verdict(d43("Door43 sync", fixed), [aiCreate()]).kept, "unnamed general Door43 sync → not kept");
+  assert(!verdict(d43(NAMED, { ...fixed, last_change_action: "sync_reorder" }), [aiCreate()]).kept, "named reorder only → not kept");
+  assert(!verdict(d43(NAMED, { note: "The word  **God**  means X." }), [aiCreate()]).kept, "named sync whose words still match the AI's → not kept");
+  assert(!verdict(d43(NAMED, { ...fixed, last_change_source: "user" }), [aiCreate()]).kept, "pristine row last changed elsewhere → not kept");
+  assert(!verdict(row({ ...fixed, updated_by: null }), [aiCreate()]).kept, "pristine row with no provenance → not kept");
+  // a named merge onto an AI-only row the app still marks edited
+  assert(verdict(d43(NAMED, { ...fixed, updated_by: 7, last_change_action: "sync_merge" }), [aiCreate(), ev("update", "dcs_reimport", null, fixed)]).reason === "door43", "named merge onto an AI-only row → kept");
+  // F1 (#1198 review): a bot push adopted onto a row with updated_by set
+  assert(!verdict(d43("Door43 (AI/bot push)", { ...fixed, updated_by: 7, last_change_action: "sync_merge" }), [aiCreate(), ev("update", "dcs_reimport", null, fixed)]).kept, "F1: adopted bot push onto an AI-only row → not kept");
+  // F2 (#1198 review): Door43 create A, Door43 update B, app save back to A stays kept
+  const A = { ...AI_TEXT, note: "Words A." };
+  assert(verdict(row({ ...A, updated_by: 5, last_change_source: "user", last_change_actor: "rich" }), [
+    ev("create", "dcs_reimport", null, { ...A, refRaw: "40:5" }),
+    ev("update", "dcs_reimport", null, { note: "Words B." }),
+    ev("update", null, 5, { note: "Words A." }),
+  ]).reason === "edited", "F2: app save back to the first Door43 text stays kept");
+}
+
 // migration / hint
 assert(verdict(row(), [ev("create", "parallel_migration", 2, { ...AI_TEXT })]).reason === "migration", "parallel_migration → kept (D4)");
 assert(!verdict(row({ note: "x" }), [ev("create", "parallel_migration", 2, { ...AI_TEXT }), ev("update", "ai_pipeline", 7, { note: "x" })]).kept, "migration note the AI later rewrote → not kept");
@@ -168,6 +203,7 @@ function fakeEnv(candidates, logs) {
   const load = await loadKeptTns(env, "EZK", 40, 40);
   assert(load.rows.map((r) => r.row.id).join() === "pres,edit,bad1", "loadKeptTns keeps preserve + edited + (bad ref, filtered later)");
   assert(/updated_by IS NOT NULL/.test(env.queries[0]) && /hint = 0/.test(env.queries[0]) && /trashed_at IS NULL/.test(env.queries[0]), "candidate query excludes pristine, hint and trashed rows");
+  assert(/last_change_actor LIKE 'Door43 \(commits by %'/.test(env.queries[0]) && /sync_reseed/.test(env.queries[0]) && /e.source = 'ai_pipeline'/.test(env.queries[0]), "candidate query admits AI-written notes a named person changed on Door43 (#1155)");
   const opts = await buildKeptOption(fakeEnv(cands, logs), "EZK", 40, 40);
   assert(opts.map((o) => o.rowId).join() === "pres,edit", "buildKeptOption drops the unsendable row");
   const hinted = await buildKeptOption(fakeEnv(cands, logs), "EZK", 40, 40, new Set(["edit"]));
@@ -178,7 +214,7 @@ function fakeEnv(candidates, logs) {
   const cands = Array.from({ length: 200 }, (_, i) => row({ id: `e${String(i).padStart(3, "0")}` }));
   const env = fakeEnv(cands, {});
   await loadKeptTns(env, "EZK", 1, 66);
-  assert(env.queries.filter((q) => /FROM edit_log/.test(q)).length === 3, "edit_log read in 3 chunks for 200 ids");
+  assert(env.queries.filter((q) => /FROM edit_log/.test(q) && !/FROM tn_rows/.test(q)).length === 3, "edit_log read in 3 chunks for 200 ids");
 }
 {
   const cands = Array.from({ length: MAX_KEPT + 1 }, (_, i) => row({ id: `a${(i + 1000).toString(36).padStart(3, "0")}`, preserve: 1 }));
