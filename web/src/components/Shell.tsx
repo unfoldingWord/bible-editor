@@ -1717,9 +1717,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // behind a turned-down text save (laneCheckHeldByRefusal). Kept as a joined key so
   // the outbox's frequent notifies only re-render when the set changes.
   const [heldTextKey, setHeldTextKey] = useState("");
-  useEffect(
-    () =>
-      outbox.subscribe((ops) => {
+  useEffect(() => {
+    // subscribe's first delivery is async and can land after a chapter change
+    // has cleaned this effect up; a late call must not write the old chapter's
+    // verse numbers into the new chapter's state.
+    let cancelled = false;
+    const unsubscribe = outbox.subscribe((ops) => {
+        if (cancelled) return;
         const verses = ops
           .filter(
             (o) =>
@@ -1734,9 +1738,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           .map((o) => (o.target.kind === "lane_check" ? o.target.verse : 0))
           .sort((a, b) => a - b);
         setHeldTextKey([...new Set(verses)].join(","));
-      }),
-    [book, chapter],
-  );
+      });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [book, chapter]);
   const heldTextVerses = useMemo(
     () => new Set(heldTextKey ? heldTextKey.split(",").map(Number) : []),
     [heldTextKey],
