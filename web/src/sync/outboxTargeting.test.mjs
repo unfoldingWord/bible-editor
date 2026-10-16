@@ -518,6 +518,41 @@ check(
       "FIX (#986): a retried save refused again keeps holding the check",
     );
   }
+  // #1196 item 1: the dual aligner opens on verse 7 inside a UST 6-9 range
+  // row. The UST PATCH targets the row's first verse (6, verseEnd 9) while
+  // the Text check targets 7, so the hold and the Retry move must treat a
+  // check inside the PATCH's verse range as the same verse.
+  {
+    const refusedRange = verseOp("v", 6, "UST", "failed", 100, 1, { lastError: "http 422" });
+    refusedRange.target = { ...refusedRange.target, verseEnd: 9 };
+    const inside = laneOp("lc", 7, 101, 2);
+    check(
+      pickNextOp([refusedRange, inside], new Set()) === undefined,
+      "FIX (#1196): a check on verse 7 waits behind a refused UST 6-9 range PATCH",
+    );
+    const lastVerse = laneOp("lc9", 9, 101, 2);
+    check(
+      pickNextOp([refusedRange, lastVerse], new Set()) === undefined,
+      "FIX (#1196): a check on the range's last verse waits too",
+    );
+    const outside = laneOp("lc10", 10, 101, 2);
+    check(
+      pickNextOp([refusedRange, outside], new Set()) === outside,
+      "a check on a verse past the range's end is not held",
+    );
+    const moved = laneChecksToKeepBehind(refusedRange, [refusedRange, inside, outside]);
+    check(
+      moved.length === 1 && moved[0] === inside,
+      "FIX (#1196): Retry of a refused range PATCH moves the in-range check behind it",
+    );
+    // An op stored before verseEnd existed (or a single-verse row) compares
+    // literally, as before.
+    const singleVerse = verseOp("v1", 6, "UST", "failed", 100, 1, { lastError: "http 422" });
+    check(
+      pickNextOp([singleVerse, inside], new Set()) === inside,
+      "a refused single-verse PATCH on verse 6 does not hold a check on verse 7",
+    );
+  }
   // No related verse op: unaffected.
   {
     const lc = laneOp("lc", 7, 101, 2);
