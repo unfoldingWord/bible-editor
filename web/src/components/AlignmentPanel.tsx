@@ -170,12 +170,15 @@ interface Props {
   // draftGeneration (#508): the generation of the crash-draft this save
   // captured (see alignmentDrafts.ts), so the caller can thread it through to
   // the outbox op for generation-gated cleanup on PATCH success.
+  // Returning false means nothing was queued (#986): the panel then keeps its
+  // edit and crash draft and does not run afterCommit, so a save chain stalls
+  // (no "done" mark, no move). The caller says why.
   onSave: (
     newContent: unknown,
     plainText: string,
     expectedVersion: number,
     draftGeneration?: string,
-  ) => void;
+  ) => boolean | void;
   onCancel: () => void;
   onDirtyChange?: (dirty: boolean) => void;
   // Confirm-before-save for an alignment edit that would leave a previously
@@ -980,7 +983,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       setSelectionAnchor(null);
     };
     // Returns true if the save COMMITTED synchronously, false if it was deferred
-    // behind the unalign confirm. `afterCommit` runs once the save actually lands
+    // behind the unalign confirm or onSave queued nothing. `afterCommit` runs once the save actually lands
     // — immediately on a clean save, or after "Save anyway"; it never runs if the
     // user cancels. Callers that navigate/close after saving (the dirty gates in
     // Shell) pass the nav as `afterCommit` so it waits for the real commit instead
@@ -995,7 +998,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       const plain = alignmentPlainText(state);
       // The commit closure captures `state`, so when it runs after a confirm the
       // optimistic baseline reset still uses the state that was saved.
-      const commit = () => {
+      const commit = (): boolean => {
         // Capture the generation of whatever pre-save draft this commit
         // represents. If the 400ms debounce never got to persist one (a save
         // committed within 400ms of the first drag), mint one now rather than
@@ -1007,6 +1010,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         // an up-to-date client — see lastDraftGenerationRef's doc comment and
         // alignmentDrafts.ts's onOutboxResult listener (#508).
         const draftGeneration = lastDraftGenerationRef.current ?? mintAlignmentDraftGeneration();
+        const priorPendingSave = pendingSaveRef.current;
         pendingSaveRef.current = {
           generation: draftGeneration,
           // A save still waiting on the outbox keeps the older baseline: if
@@ -1016,7 +1020,12 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           savedContent: newContent,
           baseContent: verse.content,
         };
-        onSave(newContent, plain, verse.version, draftGeneration);
+        if (onSave(newContent, plain, verse.version, draftGeneration) === false) {
+          // Nothing was queued (#986): keep the edit on screen and its crash
+          // draft, and leave afterCommit unrun.
+          pendingSaveRef.current = priorPendingSave;
+          return false;
+        }
         // Optimistic: the freshly-saved state is now the baseline. When the
         // chapter cache eventually round-trips the new content, computedInitial
         // recomputes and the useEffect resets state to it (idempotent).
@@ -1030,6 +1039,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         void alignmentDrafts.clear(alignmentDraftKey(book, chapter, verseNum, bibleVersion));
         lastDraftGenerationRef.current = undefined;
         afterCommit?.();
+        return true;
       };
       // Warn before unaligning a previously-aligned word. On "Cancel" the parent
       // runs nothing, so `commit` (and thus setInitial + afterCommit) never fires
@@ -1039,8 +1049,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         onConfirmUnalign(lostWords, commit);
         return false;
       }
-      commit();
-      return true;
+      return commit();
     }, [state, initial, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
 
     // Same two maps hebrewHighlight/onEnglishHover use, in the same roles:

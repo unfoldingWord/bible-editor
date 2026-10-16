@@ -654,6 +654,13 @@ export const outbox = {
     // eligibleForVersionThread) — so it keeps getting a fresh queue
     // position, as before.
     const preserveQueuePosition = isMaxAttemptsBlocked(op);
+    // #986: a refused verse op held the same-verse lane checks queued behind
+    // it (laneCheckHeld). Moving it to the back must move them too, the same
+    // as resolveConflict, or the check lands first and this retried PATCH's
+    // reopen deletes it. Computed from the pre-retry position.
+    const checksToMove = preserveQueuePosition
+      ? []
+      : laneChecksToKeepBehind({ ...op }, (await tx.store.getAll()) as OutboxOp[]);
     op.status = "pending";
     op.attempts = 0;
     op.hardAttempts = 0;
@@ -664,6 +671,11 @@ export const outbox = {
       op.seq = nextSeq();
     }
     await tx.store.put(op);
+    for (const lc of checksToMove) {
+      lc.queuedAt = op.queuedAt;
+      lc.seq = nextSeq();
+      await tx.store.put(lc);
+    }
     await tx.done;
     void notify();
     void drain();

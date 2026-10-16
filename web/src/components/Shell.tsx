@@ -3687,10 +3687,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }`;
     // PATCH key is the resolved row's verse_start — dualTarget.verse may sit
     // inside a range row now that slices resolve through buildVerseIndex.
+    // Returns whether a PATCH was queued. #986: when nothing was sent, say so,
+    // and the panel keeps its edit and skips afterCommit, so "save, mark done,
+    // next" does not mark the verse done or move on (its guard is freed here).
     const enqueue = (bibleVersion: string, row: VerseDto | null) =>
-      (content: unknown, plain: string, _expectedVersion: number, draftGeneration?: string) => {
-        if (!row) return;
-        enqueueVerseSafely(
+      (content: unknown, plain: string, _expectedVersion: number, draftGeneration?: string): boolean => {
+        const dropped = () => {
+          saveDoneGuardRef.current.cancel();
+          return false;
+        };
+        if (!row) {
+          pushPipelineToast(
+            `The ${bibleVersion} save for ${vref} didn't go through, so the verse was not marked done. Your changes are still in the aligner.`,
+            "error",
+          );
+          return dropped();
+        }
+        // A false here already showed its own message.
+        if (!enqueueVerseSafely(
           dualTarget.chapter,
           row.verse,
           bibleVersion,
@@ -3704,12 +3718,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           draftGeneration,
           undefined,
           alignmentDraftKey(book, dualTarget.chapter, dualTarget.verse, bibleVersion),
-        );
+        )) {
+          return dropped();
+        }
         // Optimistic local update so content-derived UI (the broken-alignment
         // link) refreshes immediately — same as the single-panel aligner.
         const newDto = { ...row, content, plain_text: plain } as VerseDto;
         bookHook?.applyLocalVerse(newDto);
         if (dualTarget.chapter === chapter) applyLocalVerse(newDto);
+        return true;
       };
     const confirmUnalign = (bibleVersion: string, row: VerseDto | null) =>
       (lostWords: string[], commit: () => void) =>
@@ -3761,7 +3778,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // that), so only the two AlignmentPanels' own save/restore disable.
       locked: alignerLock(dualTarget.chapter),
     };
-  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely, alignerLock, confirmAlignerUnalign]);
+  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely, alignerLock, confirmAlignerUnalign, pushPipelineToast]);
 
   // Prev/next verse for the dual aligner's titlebar arrows, within the current
   // chapter's verse list (excluding the intro tile). Null at the ends.
