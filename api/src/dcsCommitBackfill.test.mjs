@@ -575,6 +575,49 @@ async function main() {
       assert(JSON.parse(row.gap_frontier_json).join(",") === "Q", "  ...and the stored frontier is exactly the uncovered commit Q");
     }
 
+    // Issue #1211: a merged side branch forked from history the ledger holds
+    // below the coverage floor. The gap (far edge = the stop sha, which is
+    // not an ancestor of the branch) clears in the ONE tick that walks the
+    // branch, instead of following master's history down to the root.
+    {
+      const d = fresh();
+      const FLOOR = NOW - 10 * 86400;
+      const old = Math.floor(Date.parse("2025-01-01T00:00:00Z") / 1000);
+      const row = (sha, parents, at) =>
+        d
+          .prepare(
+            `INSERT INTO dcs_commits (repo, sha, parent_sha, committed_at, classification, files_json, seen_at, parent_shas_json)
+             VALUES ('en_tn', ?, ?, ?, 'human', '[]', ?, ?)`,
+          )
+          .run(sha, parents[0] ?? null, at, at, JSON.stringify(parents));
+      row("mark", ["base"], NOW - 999);
+      row("base", ["ancient"], old);
+      d.prepare(
+        `INSERT INTO dcs_repo_polls (repo, last_sha, gap_since_sha, gap_at, gap_frontier_json, coverage_since)
+         VALUES ('en_tn', 'mark', 'mark', ?, '["side-old"]', ?)`,
+      ).run(NOW - 60, FLOOR);
+      const fetches = countingFetch([
+        [
+          commit("side-old", "side fix", "h@x", { parent: "base", date: "2025-10-05T00:00:00Z" }),
+          commit("base", "fork point", "h@x", { parent: "ancient", date: "2025-01-01T00:00:00Z" }),
+          commit("ancient", "older", "h@x", { parent: "root0", date: "2024-12-01T00:00:00Z" }),
+        ],
+      ]);
+      const res = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+      assert(fetches() === 1, "#1211: the side branch costs one Door43 fetch");
+      assert(res.resolved === true && gapRow(d).gap_since_sha === null, "#1211: the gap clears in that tick, with no walk on toward the root");
+      const s = d.prepare(`SELECT parent_shas_json FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'side-old'`).get();
+      assert(s.parent_shas_json === '["base"]', "  ...and the side-branch commit is in the ledger");
+
+      // A frontier entry the ledger holds below the floor clears with no fetch.
+      d.prepare(`UPDATE dcs_repo_polls SET gap_since_sha = 'mark', gap_frontier_json = '["base"]' WHERE repo = 'en_tn'`).run();
+      globalThis.fetch = async () => {
+        throw new Error("must not fetch: base is in the ledger below the floor");
+      };
+      const res2 = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+      assert(res2.resolved === true && res2.fetched === 0, "#1211: ledger history below the coverage floor is not followed");
+    }
+
     // A row written before migration 0078 has no recorded parents, so being
     // in the ledger proves nothing about its history: it is still fetched.
     {
