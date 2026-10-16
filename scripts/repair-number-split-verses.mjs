@@ -497,6 +497,11 @@ const expectedSurvivors = [
   ...lockedSkipped.map((d) => ({ rowKey: d.rowKey, why: "release-locked" })),
   ...excludedVerses.map((k) => ({ rowKey: k, why: "--exclude" })),
   ...cleanGlobOnly.map((d) => ({ rowKey: d.rowKey, why: "no tree defect (GLOB-only match)" })),
+  // Same looseness after a repair: "3, 000 men and 5, 1000 horses" is repaired
+  // to "3,000 men and 5, 1000 horses", which the GLOB still matches.
+  ...repaired
+    .filter((r) => /[0-9], [0-9]{3}/.test(r.newPlain ?? ""))
+    .map((r) => ({ rowKey: r.rowKey, why: "repaired; GLOB-only match left" })),
 ];
 
 const books = [...new Set(repaired.map((r) => r.row.book))].sort();

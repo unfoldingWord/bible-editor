@@ -167,4 +167,19 @@ console.log("\na clean row whose plain_text matches the GLOB (\"5, 1000\") is an
   assert(sql.includes("no tree defect (GLOB-only match)"), "the clean row is listed under EXPECTED SURVIVORS with its reason");
 }
 
+console.log("\na repaired row that keeps a GLOB-only match (\"3, 000 ... 5, 1000\") is an expected survivor");
+{
+  const both = {
+    ...row(UNLOCKED, 1),
+    verse: 4,
+    content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "There were 3, 000 men and 5, 1000 horses." }] }),
+    plain_text: "There were 3, 000 men and 5, 1000 horses.",
+  };
+  const mixed = [row(UNLOCKED, 1), both, row(LOCKED, 1)];
+  const sql = run([], "repaired-glob", mixed);
+  const { got, expected } = survivorsAfterApply(sql, outside, mixed);
+  assert(got === 2 && expected === 2, `header expects the locked row + the repaired row's leftover match (got ${got}, expected ${expected})`);
+  assert(sql.includes("repaired; GLOB-only match left"), "the repaired row is listed under EXPECTED SURVIVORS with its reason");
+}
+
 console.log(`\nrepair-number-split-verses: all ${passed} assertions passed`);
