@@ -605,7 +605,10 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
     gapSince,
     gapSince ? nowSeconds : null,
     // ?9 — advance the (last_sha, last_committed_at) pair, or leave both.
-    advance ? 1 : 0,
+    // An empty walk has no tip (the mark is still master's tip), so it keeps
+    // the stored pair. Advancing to a missing tip wrote last_sha = NULL and
+    // sent the next poll back to the 30-day bootstrap window (issue #1209).
+    advance && tip != null ? 1 : 0,
     // ?10 — gap_frontier_json, part of the gap triple (only lands when this
     // is the gap that wins, per the CASE guards above).
     gapFrontierJson,
