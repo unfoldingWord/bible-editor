@@ -388,20 +388,37 @@ export function parseGapFrontier(json: string | null): string[] {
   }
 }
 
+/**
+ * SQL that is 1 when `col` holds a well-formed parent list (a JSON array whose
+ * every element is a text sha, '[]' for a root) and 0 otherwise, NULL
+ * included. The CASE keeps json_type/json_each away from text that is not
+ * valid JSON, which would raise an error rather than return false. Shared by
+ * the insert below and the backfill's expansion (issue #1200), so "which
+ * lists are trusted" and "which lists get replaced" cannot drift apart.
+ */
+export const wellFormedParentsSql = (col: string) =>
+  `(CASE WHEN ${col} IS NOT NULL AND json_valid(${col}) THEN
+      json_type(${col}) = 'array'
+      AND NOT EXISTS (SELECT 1 FROM json_each(${col}) bad WHERE bad.type != 'text')
+    ELSE 0 END)`;
+
 // Exported so dcsCommitBackfill.ts (issue #692 item 2) writes the exact same
 // statement rather than a second copy that could drift from it.
 //
 // A conflict changes nothing that is already recorded: seen_at, the
 // classification and every other column keep the first walk's values. The one
-// exception (issue #1200) fills parent_shas_json on a row that predates
-// migration 0078 and so has none. A parent list is a fixed fact of the sha, so
-// filling it in later can only turn "unknown" into the truth.
+// exception (issue #1200) fills parent_shas_json on a row whose stored list is
+// missing (every row from before migration 0078) or not well-formed, which
+// the backfill would otherwise refetch on every pass. A parent list is a
+// fixed fact of the sha, so filling it in can only turn "unknown" into the
+// truth; a well-formed list is never replaced.
 export const INSERT_COMMIT_SQL = `INSERT INTO dcs_commits
    (repo, sha, parent_sha, author_name, author_email, committed_at, message,
     classification, classification_reason, files_json, seen_at, parent_shas_json)
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
  ON CONFLICT (repo, sha) DO UPDATE SET parent_shas_json = excluded.parent_shas_json
-   WHERE dcs_commits.parent_shas_json IS NULL AND excluded.parent_shas_json IS NOT NULL`;
+   WHERE excluded.parent_shas_json IS NOT NULL
+     AND NOT ${wellFormedParentsSql("dcs_commits.parent_shas_json")}`;
 
 // ATTEMPT CLAIM (review finding F1). Written BEFORE the walk, in its own tiny
 // batch-free statement, because the alternative was a fetch loop with no exit:

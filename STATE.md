@@ -710,7 +710,8 @@ Highlights that bite repeatedly:
   clean forward poll records no frontier for a merge's older second parent, and a bootstrap walk is time-bounded,
   so "this sha is in the ledger" cannot end a gap walk (#1200). What can: `parent_shas_json` (migration 0078), the
   full parent list Door43 returned. The backfill expands a frontier entry through rows that carry it and fetches
-  any row that does not (every row from before 0078). A time cutoff (stop below `coverage_since`) was rejected:
+  any row that does not (every row from before 0078). The retention sweep skips a repo while it has an open gap,
+  or it would delete that trail hourly (backfilled history is old on both clocks). A time cutoff (stop below `coverage_since`) was rejected:
   committer dates are not monotone along parent edges, so nothing in the code bounds it.
 
 ## Stop conditions / goals

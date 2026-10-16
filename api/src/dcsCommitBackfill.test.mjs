@@ -619,10 +619,10 @@ async function main() {
       ).run(bad);
       openGap(d, ["F"]);
       countingFetch([[commit("F", "hand fix", "h@x", { parent: "P" }), commit("P", "older", "h@x")]]);
-      await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+      const res = await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
       const f = d.prepare(`SELECT parent_shas_json, seen_at FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'F'`).get();
       assert(
-        f.parent_shas_json === '["P"]' && f.seen_at === 1,
+        res.status !== "expansion_failed" && f.parent_shas_json === '["P"]' && f.seen_at === 1,
         `#1200: a malformed stored parent list (${bad}) is overwritten by the fetched one, nothing else changes`,
       );
     }

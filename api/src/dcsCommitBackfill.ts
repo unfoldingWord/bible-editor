@@ -117,6 +117,7 @@ import {
   computeGapFrontier,
   ledgerRowsFromCommits,
   parseGapFrontier,
+  wellFormedParentsSql,
 } from "./dcsCommitPoll.ts";
 
 /** Pages per repo per tick, spent on ONE frontier entry. */
@@ -174,22 +175,21 @@ const UPDATE_FRONTIER_SQL = `UPDATE dcs_repo_polls
 // present with unknown parents. Neither the seed nor the recursion passes
 // through gap_since_sha (?3): the same far-edge rule as computeGapFrontier,
 // and a walk from gap_since_sha itself reaches its target at once. UNION (not
-// UNION ALL) dedupes and makes a revisited sha a no-op.
-const KNOWN_PARENTS = (alias: string) => `${alias}.parent_shas_json IS NOT NULL
-      AND json_valid(${alias}.parent_shas_json)
-      AND json_type(${alias}.parent_shas_json) = 'array'
-      AND NOT EXISTS (SELECT 1 FROM json_each(${alias}.parent_shas_json) bad WHERE bad.type != 'text')`;
+// UNION ALL) dedupes and makes a revisited sha a no-op. json_each reads the
+// list only when it is well-formed ('[]' otherwise), so a malformed stored
+// value can never raise a JSON error mid-query.
 const UNCOVERED_FRONTIER_SQL = `WITH RECURSIVE reach(sha) AS (
     SELECT s.value FROM json_each(?2) s WHERE s.type = 'text' AND s.value != ?3
     UNION
     SELECT p.value
       FROM reach r
-      JOIN dcs_commits c ON c.repo = ?1 AND c.sha = r.sha AND ${KNOWN_PARENTS("c")}
-      JOIN json_each(c.parent_shas_json) p
+      JOIN dcs_commits c ON c.repo = ?1 AND c.sha = r.sha AND ${wellFormedParentsSql("c.parent_shas_json")}
+      JOIN json_each(CASE WHEN ${wellFormedParentsSql("c.parent_shas_json")} THEN c.parent_shas_json ELSE '[]' END) p
      WHERE p.value != ?3
   )
   SELECT r.sha AS sha FROM reach r
-   WHERE NOT EXISTS (SELECT 1 FROM dcs_commits k WHERE k.repo = ?1 AND k.sha = r.sha AND ${KNOWN_PARENTS("k")})`;
+   WHERE NOT EXISTS (SELECT 1 FROM dcs_commits k
+                      WHERE k.repo = ?1 AND k.sha = r.sha AND ${wellFormedParentsSql("k.parent_shas_json")})`;
 
 /**
  * The frontier with duplicates removed and every entry the ledger can already
@@ -203,8 +203,7 @@ async function uncoveredFrontier(env: Env, repo: string, frontier: string[], gap
     .bind(repo, JSON.stringify(distinct), gapSinceSha)
     .all<{ sha: string }>();
   // A missing result set must not read as "nothing left to walk", which would
-  // clear the gap. Throwing leaves the gap as it is; backfillDcsGaps reports
-  // the repo as `error` and the next tick tries again.
+  // clear the gap. Throwing sends the caller down its no-expansion fallback.
   if (!Array.isArray(res.results)) throw new Error("ledger expansion returned no result set");
   const uncovered = new Set(res.results.map((r) => r.sha));
   const kept = distinct.filter((sha) => uncovered.has(sha));
@@ -247,7 +246,21 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
   // Issue #1200: drop duplicates and everything the ledger already answers
   // before spending a fetch. An empty result means every branch of the hole
   // is already in the ledger, so the gap clears with no Door43 walk.
-  const open = await uncoveredFrontier(env, repo, frontier, state.gap_since_sha);
+  //
+  // If the expansion query itself fails (a D1 timeout or limit as the stored
+  // parent trail grows), fall back to the pre-#1200 tick: walk the first raw
+  // entry (deduped in JS only) so the backfill still makes progress. That
+  // path NEVER clears the gap, even if its walk empties the frontier: only a
+  // successful expansion may vouch that nothing is left.
+  let open: string[];
+  let expansionFailed = false;
+  try {
+    open = await uncoveredFrontier(env, repo, frontier, state.gap_since_sha);
+  } catch (e) {
+    console.error("dcs backfill expansion failed; walking one raw entry", repo, e instanceof Error ? e.message : String(e));
+    expansionFailed = true;
+    open = Array.from(new Set(frontier));
+  }
   if (open.length === 0) {
     await env.DB.prepare(CLEAR_GAP_SQL).bind(repo, state.gap_since_sha, frontierJson).run();
     return { repo, attempted: true, fetched: 0, inserted: 0, resolved: true, status: "ledger_covered" };
@@ -348,7 +361,15 @@ export async function backfillDcsRepoGap(env: Env, repo: string, nowSeconds: num
           : "page_cap";
   }
 
-  if (newFrontier.length === 0) {
+  if (expansionFailed) {
+    // See the fallback note above: never clear here. An emptied frontier
+    // leaves the row as it was; the rows just walked carry their parents, so
+    // the next successful expansion passes them without a fetch.
+    status = "expansion_failed";
+    if (newFrontier.length === 0) {
+      return { repo, attempted: true, fetched: page.commits.length, inserted: rows.length, resolved: false, status };
+    }
+  } else if (newFrontier.length === 0) {
     await env.DB.prepare(CLEAR_GAP_SQL).bind(repo, state.gap_since_sha, frontierJson).run();
     return { repo, attempted: true, fetched: page.commits.length, inserted: rows.length, resolved: true, status };
   }

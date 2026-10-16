@@ -241,9 +241,9 @@ async function main() {
     const ins = inserts(db);
     assert(
       ins.every((s) =>
-        /ON CONFLICT \(repo, sha\) DO UPDATE SET parent_shas_json = excluded\.parent_shas_json\s+WHERE dcs_commits\.parent_shas_json IS NULL AND excluded\.parent_shas_json IS NOT NULL$/.test(
+        /ON CONFLICT \(repo, sha\) DO UPDATE SET parent_shas_json = excluded\.parent_shas_json\s+WHERE excluded\.parent_shas_json IS NOT NULL\s+AND NOT \(CASE/.test(
           s.sql,
-        ),
+        ) && !/,\s*\w+\s*=\s*excluded\./.test(s.sql.split("DO UPDATE SET")[1]),
       ),
       "every insert conflicts on (repo, sha) and only fills a missing parent list — a re-poll cannot duplicate or re-stamp seen_at",
     );

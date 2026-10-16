@@ -47,10 +47,21 @@ export const DCS_COMMITS_RETENTION_SECONDS = 548 * 86400; // ~18 months
 // survive until its seen_at ages out too. A row is deleted only when it is
 // old on BOTH clocks. A backfilled row's seen_at is capped at its own
 // commit date (dcsCommitBackfill.ts), so backfilled history past the cutoff
-// is still old on both clocks and goes on the next sweep, as before.
+// is still old on both clocks and goes on the next sweep once its gap clears.
+//
+// NOT WHILE ITS REPO HAS AN OPEN GAP (issue #1200). The gap backfill walks
+// years-old history and follows the parent lists stored on rows it already
+// fetched (dcsCommitBackfill.ts, CONVERGENCE). Those rows are old on both
+// clocks, so sweeping them hourly threw that trail away and the walk fetched
+// the same commits again. Keeping a gapped repo's rows costs at most the
+// repo's own history until the gap clears; the next sweep after that removes
+// them as before. The subquery reads dcs_repo_polls (one row per tracked
+// repo) once; the DELETE was and stays a single scan of dcs_commits, since
+// COALESCE(committed_at, seen_at) cannot use an index.
 export const DCS_COMMITS_SWEEP_SQL = `
   DELETE FROM dcs_commits
-   WHERE COALESCE(committed_at, seen_at) < ?1 AND seen_at < ?1`;
+   WHERE COALESCE(committed_at, seen_at) < ?1 AND seen_at < ?1
+     AND repo NOT IN (SELECT repo FROM dcs_repo_polls WHERE gap_since_sha IS NOT NULL)`;
 
 // Companion to DCS_COMMITS_SWEEP_SQL, run with the SAME ?1 cutoff (ideally in
 // the same batch, so the floor raise and the deletion it accounts for commit
