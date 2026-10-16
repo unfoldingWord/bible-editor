@@ -105,3 +105,29 @@ export function createSaveDoneAndNextGuard() {
     },
   };
 }
+
+// How an aligner panel acts on its onSave answer (#986, #1196). false: nothing
+// was queued, so keep the edit and its crash draft and run no afterCommit.
+// void/true: queued synchronously (the single-panel aligner), commit now. A
+// promise (the dual aligner, whose IndexedDB write can reject): commit only
+// once it resolves true; false or a rejection means nothing was queued.
+// Returns whether the commit happened synchronously.
+export function settleOnSave(
+  queued: boolean | void | Promise<boolean>,
+  committed: () => void,
+  notQueued: () => void,
+): boolean {
+  if (queued === false) {
+    notQueued();
+    return false;
+  }
+  if (queued instanceof Promise) {
+    void queued.then(
+      (ok) => (ok ? committed() : notQueued()),
+      () => notQueued(),
+    );
+    return false;
+  }
+  committed();
+  return true;
+}

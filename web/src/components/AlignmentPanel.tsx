@@ -78,6 +78,7 @@ import {
   refusedOpOrder,
   refusedSaveStillCurrent,
 } from "../sync/alignmentDraftSaveState";
+import { settleOnSave } from "../lib/saveChain";
 import { isVersionOnlyRebase, lostAlignedWords, sameVerseContent } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
@@ -172,13 +173,15 @@ interface Props {
   // the outbox op for generation-gated cleanup on PATCH success.
   // Returning false means nothing was queued (#986): the panel then keeps its
   // edit and crash draft and does not run afterCommit, so a save chain stalls
-  // (no "done" mark, no move). The caller says why.
+  // (no "done" mark, no move). The caller says why. A promise defers that
+  // answer until the outbox write settles (#1196: the dual aligner, where an
+  // IndexedDB put can reject); the panel commits only once it resolves true.
   onSave: (
     newContent: unknown,
     plainText: string,
     expectedVersion: number,
     draftGeneration?: string,
-  ) => boolean | void;
+  ) => boolean | void | Promise<boolean>;
   onCancel: () => void;
   onDirtyChange?: (dirty: boolean) => void;
   // Confirm-before-save for an alignment edit that would leave a previously
@@ -983,7 +986,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       setSelectionAnchor(null);
     };
     // Returns true if the save COMMITTED synchronously, false if it was deferred
-    // behind the unalign confirm or onSave queued nothing. `afterCommit` runs once the save actually lands
+    // behind the unalign confirm or the outbox write, or onSave queued nothing. `afterCommit` runs once the save actually lands
     // — immediately on a clean save, or after "Save anyway"; it never runs if the
     // user cancels. Callers that navigate/close after saving (the dirty gates in
     // Shell) pass the nav as `afterCommit` so it waits for the real commit instead
@@ -1011,7 +1014,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         // alignmentDrafts.ts's onOutboxResult listener (#508).
         const draftGeneration = lastDraftGenerationRef.current ?? mintAlignmentDraftGeneration();
         const priorPendingSave = pendingSaveRef.current;
-        pendingSaveRef.current = {
+        const thisPendingSave = {
           generation: draftGeneration,
           // A save still waiting on the outbox keeps the older baseline: if
           // both are refused, the panel goes back to what the server holds.
@@ -1020,26 +1023,28 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           savedContent: newContent,
           baseContent: verse.content,
         };
-        if (onSave(newContent, plain, verse.version, draftGeneration) === false) {
-          // Nothing was queued (#986): keep the edit on screen and its crash
-          // draft, and leave afterCommit unrun.
-          pendingSaveRef.current = priorPendingSave;
-          return false;
-        }
-        // Optimistic: the freshly-saved state is now the baseline. When the
-        // chapter cache eventually round-trips the new content, computedInitial
-        // recomputes and the useEffect resets state to it (idempotent).
-        setInitial(state);
-        setRestored(false);
-        // The alignment is now queued in the outbox; drop the crash-draft
-        // immediately. onOutboxResult also clears it when the PATCH lands
-        // (belt-and-suspenders in alignmentDrafts.ts) — generation-gated, so a
-        // draft written by continued dragging AFTER this point (a newer
-        // generation) survives both this clear and that later one.
-        void alignmentDrafts.clear(alignmentDraftKey(book, chapter, verseNum, bibleVersion));
-        lastDraftGenerationRef.current = undefined;
-        afterCommit?.();
-        return true;
+        pendingSaveRef.current = thisPendingSave;
+        // Nothing was queued (#986): keep the edit on screen and its crash
+        // draft, and leave afterCommit unrun.
+        const notQueued = () => {
+          if (pendingSaveRef.current === thisPendingSave) pendingSaveRef.current = priorPendingSave;
+        };
+        const committed = () => {
+          // Optimistic: the freshly-saved state is now the baseline. When the
+          // chapter cache eventually round-trips the new content, computedInitial
+          // recomputes and the useEffect resets state to it (idempotent).
+          setInitial(state);
+          setRestored(false);
+          // The alignment is now queued in the outbox; drop the crash-draft
+          // immediately. onOutboxResult also clears it when the PATCH lands
+          // (belt-and-suspenders in alignmentDrafts.ts) — generation-gated, so a
+          // draft written by continued dragging AFTER this point (a newer
+          // generation) survives both this clear and that later one.
+          void alignmentDrafts.clear(alignmentDraftKey(book, chapter, verseNum, bibleVersion));
+          lastDraftGenerationRef.current = undefined;
+          afterCommit?.();
+        };
+        return settleOnSave(onSave(newContent, plain, verse.version, draftGeneration), committed, notQueued);
       };
       // Warn before unaligning a previously-aligned word. On "Cancel" the parent
       // runs nothing, so `commit` (and thus setInitial + afterCommit) never fires
