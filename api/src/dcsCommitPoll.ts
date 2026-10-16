@@ -528,10 +528,30 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
   const advance = dropped > 0 || !page.incomplete || advancesDespiteIncomplete(page.incompleteReason);
   // The tip is rows[0] — the walk is newest-first.
   const tip = rows[0] ?? null;
-  const gapSince =
+  let gapSince =
     dropped > 0 || (page.incomplete && advancesDespiteIncomplete(page.incompleteReason))
       ? (sinceSha ?? rows[rows.length - 1]?.sha ?? null)
       : null;
+  // Issue #1211: Gitea lists commits by committer date across branches, so a
+  // merge whose second parent is older than the stop sha has that parent (and
+  // its branch) listed AFTER the stop, and a clean walk never fetches it. Any
+  // parent of a new row that is neither in this walk, the stop sha, nor the
+  // ledger opens a gap toward the stop sha, so the backfill walks it. Skipped
+  // on bootstrap (no stop sha): that walk is time-bounded on purpose.
+  let missingParents: string[] = [];
+  if (gapSince == null && sinceSha != null && !page.incomplete) {
+    const candidates = computeGapFrontier(rows, sinceSha);
+    if (candidates.length > 0) {
+      const known = await env.DB.prepare(
+        `SELECT sha FROM dcs_commits WHERE repo = ?1 AND sha IN (SELECT value FROM json_each(?2))`,
+      )
+        .bind(repo, JSON.stringify(candidates))
+        .all<{ sha: string }>();
+      const have = new Set((known.results ?? []).map((r) => r.sha));
+      missingParents = candidates.filter((sha) => !have.has(sha));
+      if (missingParents.length > 0) gapSince = sinceSha;
+    }
+  }
   // NEAR edge(s) of the hole, for the backfill path (issue #692 item 2) to
   // resume from — see computeGapFrontier for why this is a SET, not the
   // single oldest-row's-first-parent the original version of this used
@@ -555,7 +575,7 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
   // which costs extra (harmless, ON-CONFLICT-DO-NOTHING) re-insertion of
   // already-covered ground on the way, not a correctness gap.
   const priorFrontier = state?.gap_since_sha != null ? parseGapFrontier(state.gap_frontier_json) : [];
-  const gapFrontier = gapSince != null ? Array.from(new Set([...priorFrontier, ...computeGapFrontier(rows, gapSince)])) : [];
+  const gapFrontier = gapSince != null ? Array.from(new Set([...priorFrontier, ...(missingParents.length > 0 ? missingParents : computeGapFrontier(rows, gapSince))])) : [];
   const gapFrontierJson = gapSince != null ? JSON.stringify(gapFrontier) : null;
   // Existing rows predate the floor and remain untrusted. The first exact
   // successful walk after migration establishes a conservative floor at its
