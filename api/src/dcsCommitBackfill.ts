@@ -202,7 +202,11 @@ async function uncoveredFrontier(env: Env, repo: string, frontier: string[], gap
   const res = await env.DB.prepare(UNCOVERED_FRONTIER_SQL)
     .bind(repo, JSON.stringify(distinct), gapSinceSha)
     .all<{ sha: string }>();
-  const uncovered = new Set((res.results ?? []).map((r) => r.sha));
+  // A missing result set must not read as "nothing left to walk", which would
+  // clear the gap. Throwing leaves the gap as it is; backfillDcsGaps reports
+  // the repo as `error` and the next tick tries again.
+  if (!Array.isArray(res.results)) throw new Error("ledger expansion returned no result set");
+  const uncovered = new Set(res.results.map((r) => r.sha));
   const kept = distinct.filter((sha) => uncovered.has(sha));
   const keptSet = new Set(kept);
   const reached = Array.from(uncovered)
