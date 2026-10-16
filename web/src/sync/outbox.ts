@@ -84,6 +84,11 @@ export interface VerseTarget {
   book: string;
   chapter: number;
   verse: number;
+  // Inclusive last verse of a range row (`\v 6-9` → verse 6, verseEnd 9).
+  // Absent for a single verse and on ops stored before #1196. Not part of
+  // targetKey or the PATCH URL; outboxTargeting.ts uses it to hold a lane
+  // check on any verse the row covers.
+  verseEnd?: number;
   bibleVersion: string;
 }
 export interface VerseStatusTarget {
@@ -359,18 +364,24 @@ export const outbox = {
       alignmentDraftGeneration?: string;
       alignmentDraftKey?: string;
       alignmentDraftRow?: AlignmentDraftRow;
+      /** The row's verse_end when it is a range row (#1196); see VerseTarget.verseEnd. */
+      verseEnd?: number | null;
     } = {},
   ): Promise<OutboxOp> {
+    const target: VerseTarget = {
+      kind: "verse",
+      book,
+      chapter,
+      verse,
+      ...(opts.verseEnd != null && opts.verseEnd > verse ? { verseEnd: opts.verseEnd } : {}),
+      bibleVersion,
+    };
     if (isReadOnly()) {
-      return noopOp(
-        { kind: "verse", book, chapter, verse, bibleVersion },
-        "patch",
-        patch as Record<string, unknown>,
-      );
+      return noopOp(target, "patch", patch as Record<string, unknown>);
     }
     const op: OutboxOp = {
       id: uid(),
-      target: { kind: "verse", book, chapter, verse, bibleVersion },
+      target,
       action: "patch",
       patch: patch as Record<string, unknown>,
       expectedVersion,

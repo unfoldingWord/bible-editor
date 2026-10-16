@@ -134,7 +134,8 @@ function verseSaveCanReopen(verse: OpTarget, lc: OpTarget): boolean {
 // right behind a verse save dispatch first whenever that save was parked
 // (retry, 409, max-attempts, a refusal) — and the late save then wiped the check. So a
 // lane check waits (stays pending) while a verse op for the same
-// book+chapter+verse that can reopen its lane (verseSaveCanReopen), queued
+// book+chapter+verse (verseSaveCovers: a range row covers each verse in its
+// span) that can reopen its lane (verseSaveCanReopen), queued
 // EARLIER than it, is unsettled. Verse ops queued after the check don't hold
 // it: an edit made after checking still reopens. A tn/tq check is never held,
 // so a stuck verse save cannot freeze an unrelated checkbox.
@@ -143,7 +144,7 @@ export function laneCheckHeld(lc: PickOp, ops: PickOp[]): boolean {
   return ops.some(
     (o) =>
       o.target.kind === "verse" &&
-      sameVerse(o.target, lc.target) &&
+      verseSaveCovers(o.target, lc.target) &&
       verseSaveCanReopen(o.target, lc.target) &&
       drainOrder(o, lc) < 0 &&
       verseOpUnsettled(o),
@@ -164,13 +165,20 @@ export function pickNextOp<T extends PickOp>(ops: T[], pinnedBlocked: ReadonlySe
   );
 }
 
-function sameVerse(a: OpTarget, b: OpTarget): boolean {
+// Whether a verse save covers this lane check's verse. A range row (a UST
+// `\v 6-9` block) is one row keyed by its first verse, so its PATCH targets
+// verse 6 while the dual aligner opened at verse 7 marks verse 7 (#1196): the
+// check is the same verse when it falls anywhere in the row's span. An op
+// stored without verseEnd (a single verse, or queued before the field
+// existed) covers just its own verse.
+function verseSaveCovers(verse: OpTarget, lc: OpTarget): boolean {
+  if (verse.kind !== "verse" || lc.kind !== "lane_check") return false;
+  const end = Math.max(verse.verse, verse.verseEnd ?? verse.verse);
   return (
-    a.kind !== "row" &&
-    b.kind !== "row" &&
-    a.book === b.book &&
-    a.chapter === b.chapter &&
-    a.verse === b.verse
+    verse.book === lc.book &&
+    verse.chapter === lc.chapter &&
+    lc.verse >= verse.verse &&
+    lc.verse <= end
   );
 }
 
@@ -190,7 +198,7 @@ export function laneChecksToKeepBehind<T extends PickOp>(requeued: PickOp, all: 
       (o) =>
         o.target.kind === "lane_check" &&
         o.status === "pending" &&
-        sameVerse(o.target, requeued.target) &&
+        verseSaveCovers(requeued.target, o.target) &&
         verseSaveCanReopen(requeued.target, o.target) &&
         drainOrder(requeued, o) < 0,
     )
