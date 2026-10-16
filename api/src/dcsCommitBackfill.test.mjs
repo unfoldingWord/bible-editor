@@ -189,11 +189,24 @@ async function main() {
     d.prepare(
       `INSERT INTO dcs_repo_polls (repo, gap_since_sha, gap_at, gap_frontier_json) VALUES ('en_ust', 'far-edge', ?, NULL)`,
     ).run(NOW - 86400);
+    d.prepare(
+      `INSERT INTO dcs_repo_polls (repo, gap_since_sha, gap_at, gap_frontier_json) VALUES ('en_tq', 'far-edge', ?, '[]')`,
+    ).run(NOW - 86400);
+    d.prepare(
+      `INSERT INTO dcs_repo_polls (repo, gap_since_sha, gap_at, gap_frontier_json) VALUES ('en_twl', 'far-edge', ?, '[]')`,
+    ).run(NOW - 86400);
+    // en_twl only: a concurrent poll appends a frontier entry right after the
+    // backfill reads the row, so the clear's guard must refuse.
+    const raceRepo = "en_twl";
     const realDb = {
       prepare(sql) {
         const bound = (args) => ({
           async first() {
-            return d.prepare(sql).get(...args) ?? null;
+            const row = d.prepare(sql).get(...args) ?? null;
+            if (args[0] === raceRepo) {
+              d.prepare(`UPDATE dcs_repo_polls SET gap_frontier_json = '["appended"]' WHERE repo = ?`).run(raceRepo);
+            }
+            return row;
           },
           async run() {
             d.prepare(sql).run(...args);
@@ -212,6 +225,15 @@ async function main() {
     assert(
       after.gap_since_sha === null && after.gap_at === null && after.gap_frontier_json === null,
       "  ...and the gap is actually cleared in SQLite, not reported resolved while it stays open forever",
+    );
+    await backfillDcsRepoGap({ DB: realDb }, "en_tq", NOW);
+    const tq = d.prepare(`SELECT gap_since_sha FROM dcs_repo_polls WHERE repo = 'en_tq'`).get();
+    assert(tq.gap_since_sha === null, "  ...a non-NULL frontier equal to the one read still clears");
+    await backfillDcsRepoGap({ DB: realDb }, raceRepo, NOW);
+    const twl = d.prepare(`SELECT gap_since_sha, gap_frontier_json FROM dcs_repo_polls WHERE repo = ?`).get(raceRepo);
+    assert(
+      twl.gap_since_sha === "far-edge" && twl.gap_frontier_json === '["appended"]',
+      "  ...and a frontier changed by a concurrent poll still blocks the clear (CAS guard intact)",
     );
   }
 
