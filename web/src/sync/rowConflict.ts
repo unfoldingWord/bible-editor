@@ -65,3 +65,41 @@ export function classifyRowPatchConflict(
   }
   return "auto_heal";
 }
+
+export type RowThreadDecision = "thread" | "refuse_thread";
+
+/**
+ * Should the outbox thread a freshly confirmed version into a queued sibling
+ * row patch (issue #1213)? Threading moves the sibling's If-Match forward after
+ * this user's own op on the row lands. For a sibling pinned to an older server
+ * version (its `baseline`), that would hide any other user's change made in
+ * between: the PATCH lands with a clean If-Match and overwrites it.
+ *
+ * @param patch     the sibling's PATCH body
+ * @param baseline  the sibling's pre-edit values (undefined: pre-baseline op)
+ * @param donePatch the PATCH body of our own op that just landed
+ * @param serverRow the full row from that op's 200 body
+ *
+ * Thread iff every patched field's server value is (a) already our target,
+ * (b) our baseline (nobody touched it), or (c) exactly what our own landed op
+ * wrote (own-op chaining). Anything else is another user's change: refuse, so
+ * the sibling keeps its old version, 409s, and the 409 path classifies it.
+ * Without a baseline nothing can be proved either way; keep the old behaviour.
+ */
+export function rowThreadDecision(
+  patch: Record<string, unknown>,
+  baseline: Record<string, unknown> | undefined,
+  donePatch: Record<string, unknown>,
+  serverRow: Record<string, unknown> | null | undefined,
+): RowThreadDecision {
+  if (!baseline) return "thread";
+  if (!serverRow || typeof serverRow !== "object") return "refuse_thread";
+  for (const key of Object.keys(patch)) {
+    const server = serverRow[key];
+    if (valuesEqual(server, patch[key])) continue;
+    if (valuesEqual(server, baseline[key])) continue;
+    if (key in donePatch && valuesEqual(server, donePatch[key])) continue;
+    return "refuse_thread";
+  }
+  return "thread";
+}

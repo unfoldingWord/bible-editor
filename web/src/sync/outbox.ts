@@ -19,7 +19,7 @@ import {
   type CheckLane,
 } from "./api";
 import { backoffMs } from "./backoff";
-import { classifyRowPatchConflict } from "./rowConflict";
+import { classifyRowPatchConflict, rowThreadDecision } from "./rowConflict";
 import {
   MAX_ATTEMPTS_SENTINEL,
   dropGuardAllows,
@@ -964,6 +964,22 @@ async function threadVersionToSiblings(done: OutboxOp, updated: unknown) {
         const outcome = rebaseVersePatch(o.patch, serverContent);
         if (outcome.kind === "refuse_thread") continue;
         if (outcome.kind === "rebased") o.patch = outcome.patch;
+      }
+      // Row ops pinned to an older version (#1115 pin, NoteCard's cached
+      // version): if another user changed one of the sibling's fields since its
+      // baseline, don't re-arm it past that change (#1213). It keeps its stale
+      // version, 409s, and the 409 path's classifyRowPatchConflict prompts.
+      if (
+        o.target.kind === "row" &&
+        o.action === "patch" &&
+        rowThreadDecision(
+          o.patch,
+          o.baseline,
+          done.patch ?? {},
+          updated as Record<string, unknown> | null | undefined,
+        ) === "refuse_thread"
+      ) {
+        continue;
       }
       o.expectedVersion = version;
       await tx.store.put(o);
