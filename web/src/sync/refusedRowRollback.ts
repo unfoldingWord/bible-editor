@@ -5,10 +5,14 @@
 // to bring it back. Shell re-reads the chapter and puts the server's row back;
 // this decides whether and where.
 //
-// Only DELETEs: a refused tn PATCH is already shown as unsaved by NoteCard
-// (its baseline is pinned to the server version) and kept in its draft, and
-// putting the server's text back into the cached row would make an idle card
-// re-sync to it and clear that draft.
+// tn PATCHes are left alone: a refused one is already shown as unsaved by
+// NoteCard (its baseline is pinned to the server version) and kept in its
+// draft, and putting the server's text back into the cached row would make an
+// idle card re-sync to it and clear that draft. tq/twl PATCHes do get their
+// fields put back (#1115, planRefusedRowPatchRollback below): their rows
+// compare against a pin (rowEditPin.ts) and keep their typing when the cache
+// changes under it, and a cache left holding refused text would show it as
+// saved after a remount.
 //
 // Pure (no React, no IndexedDB) so the decision is unit-tested in
 // refusedRowRollback.test.mjs.
@@ -46,4 +50,30 @@ export function planRefusedRowDeleteRollback<R extends { id: string }>(args: {
     }
   }
   return { kind: "restore", row: serverRows[idx], afterId };
+}
+
+// #1115: a refused or discarded tq/twl PATCH left its optimistic text in the
+// cached row. Put the server's values of the patched fields back, unless
+// another PATCH of the row is still draining (its own result settles the
+// cache), either copy of the row is missing, or the cached row's version
+// changed since the re-read started (`versionAtStart`: a newer save or a
+// server push landed meanwhile and already settled it). The optimistic
+// restored_from_version mark of a history restore goes back too, and so do the
+// server's version and updated_at when the server has moved on, so the next
+// Save does not 409 for nothing. Null means nothing to do.
+export function planRefusedRowPatchRollback(args: {
+  patch: Record<string, unknown>;
+  serverRow: Record<string, unknown> | undefined;
+  cachedRow: Record<string, unknown> | undefined;
+  stillQueuedForTarget: boolean;
+  versionAtStart?: unknown;
+}): Record<string, unknown> | null {
+  const { patch, serverRow, cachedRow, stillQueuedForTarget, versionAtStart } = args;
+  if (stillQueuedForTarget || !serverRow || !cachedRow) return null;
+  if (versionAtStart !== undefined && cachedRow.version !== versionAtStart) return null;
+  const out: Record<string, unknown> = {};
+  for (const k of [...Object.keys(patch), "restored_from_version", "version", "updated_at"]) {
+    if (k in serverRow && cachedRow[k] !== serverRow[k]) out[k] = serverRow[k];
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }

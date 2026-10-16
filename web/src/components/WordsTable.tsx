@@ -16,8 +16,21 @@ import type { TwlRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
 import { TwArticleDialog } from "./TwArticleDialog";
-import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
+import { draftDirtyBorderSx } from "../sync/drafts";
+import { usePinnedRowEdit, type PinnedSaveOpts } from "../hooks/usePinnedRowEdit";
 import { directionForText } from "../lib/direction";
+
+// Occurrence is hidden in the schema but real (round-trips to the TSV
+// Occurrence column). Display null as 1: the export coerces an OL quote's
+// null occurrence to 1, so 1 and null are equivalent on disk and must not
+// count as a dirty edit.
+type TwlShown = { orig_words: string; tw_link: string | null; occurrence: number };
+const TWL_KEYS = ["orig_words", "tw_link", "occurrence"] as const;
+const twlShown = (raw: Record<string, unknown>): TwlShown => ({
+  orig_words: (raw.orig_words as string | null) ?? "",
+  tw_link: (raw.tw_link as string | null) ?? null,
+  occurrence: (raw.occurrence as number | null) ?? 1,
+});
 
 export type WordDropPosition = "before" | "after";
 
@@ -76,7 +89,7 @@ interface Props {
   rows: TwlRow[];
   activeId: string | null;
   // Manual save: applies + enqueues. No autosave during typing.
-  onSave: (id: string, patch: Partial<TwlRow>) => void;
+  onSave: (id: string, patch: Partial<TwlRow>, opts: PinnedSaveOpts) => void;
   onDelete: (id: string) => void;
   onFocus: (row: TwlRow) => void;
   onReorder: (draggedId: string, refId: string, position: WordDropPosition) => void;
@@ -262,7 +275,7 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
               active={r.id === activeId}
               dragging={dragId === r.id}
               isDropTarget={dragId !== null && dragId !== r.id}
-              onSave={(p) => onSave(r.id, p)}
+              onSave={(p, o) => onSave(r.id, p, o)}
               onDelete={() => onDelete(r.id)}
               onFocus={() => onFocus(r)}
               onGripDragStart={() => setDragId(r.id)}
@@ -421,7 +434,7 @@ const WordRow = memo(function WordRow({
   active: boolean;
   dragging: boolean;
   isDropTarget: boolean;
-  onSave: (patch: Partial<TwlRow>) => void;
+  onSave: (patch: Partial<TwlRow>, opts: PinnedSaveOpts) => void;
   onDelete: () => void;
   onFocus: () => void;
   onGripDragStart?: () => void;
@@ -455,16 +468,25 @@ const WordRow = memo(function WordRow({
   verseOptions?: number[];
   onChangeVerse?: (verse: number) => void;
 }) {
-  const [quote, setQuote] = useState(row.orig_words ?? "");
-  const [twLink, setTwLink] = useState<string | null>(row.tw_link);
-  // Occurrence is hidden in the schema but real (round-trips to the TSV
-  // Occurrence column). Display null/0 as 1 — the export coerces an OL quote's
-  // null occurrence to 1, so 1 and null are equivalent on disk and must not
-  // count as a dirty edit.
-  const [occurrence, setOccurrence] = useState(row.occurrence ?? 1);
+  // #1115: fields compare against the server version they were typed against
+  // (a refused save stays unsaved here), not the optimistic cached row. Every
+  // input (typing, the article picker, the disambiguation menu) only sets
+  // local fields; Save is the one path that sends.
+  const edit = usePinnedRowEdit<TwlRow, TwlShown>({
+    kind: "twl",
+    row,
+    keys: TWL_KEYS,
+    shownOf: twlShown,
+    locked: false,
+    onSave: (patch, opts) => onSave(patch as Partial<TwlRow>, opts),
+  });
+  const { orig_words: quote, tw_link: twLink, occurrence } = edit.local;
+  const setQuote = (v: string) => edit.setField("orig_words", v);
+  const setTwLink = (v: string | null) => edit.setField("tw_link", v);
+  const setOccurrence = (v: number) => edit.setField("occurrence", v);
+  const { isDirty, saving } = edit;
   const [translateError, setTranslateError] = useState(false);
   const rowRef = useRef<HTMLDivElement | null>(null);
-  const savedRef = useRef({ quote: row.orig_words ?? "", twLink: row.tw_link, occurrence: row.occurrence ?? 1 });
   const catalogs = useCatalogs();
 
   // Alternative articles for the current link, from two sources unioned by link:
@@ -504,62 +526,6 @@ const WordRow = memo(function WordRow({
   const [refMenuAnchor, setRefMenuAnchor] = useState<HTMLElement | null>(null);
   const showRefPicker = !!onChangeVerse && (verseOptions?.length ?? 0) > 1;
 
-  useEffect(() => setQuote(row.orig_words ?? ""), [row.id, row.version, row.orig_words]);
-  useEffect(() => setTwLink(row.tw_link), [row.id, row.version, row.tw_link]);
-  useEffect(() => setOccurrence(row.occurrence ?? 1), [row.id, row.version, row.occurrence]);
-  useEffect(() => {
-    savedRef.current = { quote: row.orig_words ?? "", twLink: row.tw_link, occurrence: row.occurrence ?? 1 };
-    // Deliberately keyed on [row.id, row.version] only — this snapshot is the
-    // "last saved" baseline the draft-dirty check compares against, and it
-    // must rebase only when the server hands back a new confirmed version,
-    // not on every field-level change (those three fields only ever change
-    // together with a version bump anyway, via the three effects above).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [row.id, row.version]);
-
-  const draftKey = useMemo(() => rowKey("twl", row.book, row.id), [row.book, row.id]);
-
-  // Hydrate from any persisted draft on first mount so unsaved typing
-  // survives navigation.
-  const hydratedFromDraftRef = useRef(false);
-  useEffect(() => {
-    if (hydratedFromDraftRef.current) return;
-    void drafts.get(draftKey).then((rec) => {
-      if (hydratedFromDraftRef.current) return;
-      hydratedFromDraftRef.current = true;
-      const patch = (rec?.payload as { patch?: Partial<TwlRow> } | undefined)?.patch;
-      if (!patch) return;
-      if (typeof patch.orig_words === "string") setQuote(patch.orig_words);
-      if ("tw_link" in patch) setTwLink((patch.tw_link as string | null) ?? null);
-      if (typeof patch.occurrence === "number") setOccurrence(patch.occurrence);
-    });
-  }, [draftKey]);
-  const diff = useMemo<Partial<TwlRow>>(() => {
-    const out: Partial<TwlRow> = {};
-    if (quote !== (row.orig_words ?? "")) out.orig_words = quote;
-    if (twLink !== row.tw_link) out.tw_link = twLink;
-    // null/0 stored occurrence is equivalent to 1 for an OL quote (see export
-    // coercion), so only a real numeric change counts as dirty.
-    if (occurrence !== (row.occurrence ?? 1)) out.occurrence = occurrence;
-    return out;
-  }, [quote, twLink, occurrence, row.orig_words, row.tw_link, row.occurrence]);
-  const isDirty = Object.keys(diff).length > 0;
-
-  useEffect(() => {
-    if (isDirty) {
-      void drafts.set(draftKey, { patch: diff }, row.version, {
-        kind: "row",
-        rowKind: "twl",
-        id: row.id,
-        book: row.book,
-        chapter: row.chapter,
-        verse: row.verse,
-      });
-    } else {
-      void drafts.clear(draftKey);
-    }
-  }, [draftKey, isDirty, diff, row.version, row.id, row.book, row.chapter, row.verse]);
-
   const positionFromEvent = (e: React.DragEvent): WordDropPosition => {
     const rect = rowRef.current?.getBoundingClientRect();
     if (!rect) return "after";
@@ -579,16 +545,8 @@ const WordRow = memo(function WordRow({
     }
   };
 
-  const handleUndo = () => {
-    setQuote(savedRef.current.quote);
-    setTwLink(savedRef.current.twLink);
-    setOccurrence(savedRef.current.occurrence);
-  };
-
-  const handleSave = () => {
-    if (!isDirty) return;
-    onSave(diff);
-  };
+  const handleUndo = edit.undo;
+  const handleSave = () => edit.submit();
 
   return (
     <Box
@@ -916,13 +874,13 @@ const WordRow = memo(function WordRow({
           </Tooltip>
         )}
       </Box>
-      <Tooltip title={isDirty ? "save edits" : "no unsaved edits"}>
+      <Tooltip title={saving ? "saving…" : isDirty ? "save edits" : "no unsaved edits"}>
         <span style={{ gridArea: "save" }}>
           <IconButton
             size="small"
-            disabled={!isDirty}
+            disabled={!isDirty || saving}
             onClick={handleSave}
-            sx={{ p: 0.25, color: isDirty ? "primary.main" : "action.disabled" }}
+            sx={{ p: 0.25, color: isDirty && !saving ? "primary.main" : "action.disabled" }}
           >
             {isDirty ? (
               <SaveIcon fontSize="inherit" />
@@ -937,7 +895,7 @@ const WordRow = memo(function WordRow({
           <IconButton
             size="small"
             onClick={handleUndo}
-            disabled={!isDirty}
+            disabled={!isDirty || saving}
             sx={{ p: 0.25, color: "text.secondary", opacity: isDirty ? 1 : 0, transition: "opacity 150ms" }}
           >
             <UndoIcon fontSize="inherit" />

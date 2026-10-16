@@ -5,8 +5,10 @@ import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
+import UndoIcon from "@mui/icons-material/Undo";
 import type { TqRow } from "../sync/api";
-import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
+import { draftDirtyBorderSx } from "../sync/drafts";
+import { usePinnedRowEdit, type PinnedSaveOpts } from "../hooks/usePinnedRowEdit";
 import { buildFindRegex, nthMatchRange, type QuestionField } from "../lib/questionFind";
 import { TQ_HISTORY_FIELDS, type RowSnapshot } from "./rowHistoryFields";
 
@@ -18,12 +20,10 @@ interface Props {
   rows: TqRow[];
   // Apply local + enqueue. Caller is responsible for outbox.enqueueRow.
   // `opts.restoredFromVersion` marks the PATCH as a history revert so the
-  // history dialog can hide the phantom entry it writes.
-  onSave: (
-    id: string,
-    patch: Partial<TqRow>,
-    opts?: { restoredFromVersion?: number },
-  ) => void;
+  // history dialog can hide the phantom entry it writes. `expectedVersion` /
+  // `baseline` are the server version and values the edit was typed against
+  // (#1115), not the cached row's.
+  onSave: (id: string, patch: Partial<TqRow>, opts: PinnedSaveOpts) => void;
   onDelete: (id: string) => void;
   // When true, rows render read-only and the delete button is hidden. Used
   // while an AI pipeline is mid-flight for the chapter — the auto-apply step
@@ -43,6 +43,14 @@ interface Props {
   findQuery?: FindQuery | null;
   activeMatch?: ActiveMatch | null;
 }
+
+type TqShown = { ref_raw: string; question: string; response: string };
+const TQ_KEYS = ["ref_raw", "question", "response"] as const;
+const tqShown = (raw: Record<string, unknown>): TqShown => ({
+  ref_raw: (raw.ref_raw as string | null) ?? "",
+  question: (raw.question as string | null) ?? "",
+  response: (raw.response as string | null) ?? "",
+});
 
 type FindQuery = { find: string; regex: boolean; caseSensitive: boolean };
 type ActiveMatch = { rowId: string; field: QuestionField; occurrence: number };
@@ -80,6 +88,7 @@ function QuestionsTableInner({ rows, onSave, onDelete, locked = false, activeId 
         <span>Ref</span>
         <span>Question</span>
         <span>Response</span>
+        <span />
         <span />
         <span />
         <span />
@@ -126,14 +135,14 @@ const responsiveGridSx = {
   display: "grid",
   gap: 1,
   alignItems: "center",
-  gridTemplateColumns: "80px 1fr 1fr 46px 28px 28px",
-  gridTemplateAreas: '"ref question response ver save delete"',
+  gridTemplateColumns: "80px 1fr 1fr 46px 28px 28px 28px",
+  gridTemplateAreas: '"ref question response ver save undo delete"',
   [`@container (max-width: ${NARROW_BP_PX}px)`]: {
-    gridTemplateColumns: "1fr 46px 28px 28px",
+    gridTemplateColumns: "1fr 46px 28px 28px 28px",
     gridTemplateAreas: [
-      '"ref ver save delete"',
-      '"question question question question"',
-      '"response response response response"',
+      '"ref ver save undo delete"',
+      '"question question question question question"',
+      '"response response response response response"',
     ].join(" "),
     rowGap: 0.5,
   },
@@ -150,7 +159,7 @@ const Row = memo(function Row({
   activeMatch = null,
 }: {
   row: TqRow;
-  onSave: (patch: Partial<TqRow>, opts?: { restoredFromVersion?: number }) => void;
+  onSave: (patch: Partial<TqRow>, opts: PinnedSaveOpts) => void;
   onDelete: () => void;
   locked: boolean;
   active?: boolean;
@@ -158,9 +167,20 @@ const Row = memo(function Row({
   findQuery?: FindQuery | null;
   activeMatch?: ActiveMatch | null;
 }) {
-  const [refRaw, setRefRaw] = useState(row.ref_raw ?? "");
-  const [question, setQuestion] = useState(row.question ?? "");
-  const [response, setResponse] = useState(row.response ?? "");
+  // #1115: fields compare against the server version they were typed against
+  // (a refused save stays unsaved here), not the optimistic cached row.
+  const edit = usePinnedRowEdit<TqRow, TqShown>({
+    kind: "tq",
+    row,
+    keys: TQ_KEYS,
+    shownOf: tqShown,
+    locked,
+    onSave: (patch, opts) => onSave(patch as Partial<TqRow>, opts),
+  });
+  const { ref_raw: refRaw, question, response } = edit.local;
+  const setRefRaw = (v: string) => edit.setField("ref_raw", v);
+  const setQuestion = (v: string) => edit.setField("question", v);
+  const setResponse = (v: string) => edit.setField("response", v);
   const [historyOpen, setHistoryOpen] = useState(false);
 
   // Find highlight: the active match's field renders as a read-only block with
@@ -185,103 +205,29 @@ const Row = memo(function Row({
   const findRe = useMemo(() => (findQuery ? buildFindRegex(findQuery) : null), [findQuery]);
   // Not while the field holds unsaved text: the match index was computed on
   // the saved text, so the mark could land on the wrong occurrence.
-  const fieldDirty = (f: QuestionField) =>
-    (f === "question" ? question : response) !== (row[f] ?? "");
+  const fieldDirty = (f: QuestionField) => f in edit.diff;
   const readField: QuestionField | null =
     activeMatch && findRe && editingField !== activeMatch.field && !fieldDirty(activeMatch.field)
       ? activeMatch.field
       : null;
 
-  // Set by a history restore that fires while the REF lane has unsaved typing.
-  // The restore bumps row.version, which would otherwise make the resync below
-  // overwrite the user's in-progress ref with the server value. Carrying the
-  // ref in the restore PATCH instead is NOT an option: the server re-derives
-  // the `verse` column from ref_raw (api/src/rows.ts), so persisting a
-  // half-typed "1:" would relocate the row to verse 0.
-  const pendingRefRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (pendingRefRef.current != null) {
-      setRefRaw(pendingRefRef.current);
-      pendingRefRef.current = null;
-      return;
-    }
-    setRefRaw(row.ref_raw ?? "");
-  }, [row.id, row.version, row.ref_raw]);
-  useEffect(() => setQuestion(row.question ?? ""), [row.id, row.version, row.question]);
-  useEffect(() => setResponse(row.response ?? ""), [row.id, row.version, row.response]);
-
-  const draftKey = useMemo(() => rowKey("tq", row.book, row.id), [row.book, row.id]);
-
-  // Hydrate from any persisted draft on first mount so unsaved typing
-  // survives navigation. Subsequent server pushes are caught by the
-  // useEffects above (which only run when row.version changes).
-  const hydratedFromDraftRef = useRef(false);
-  useEffect(() => {
-    if (hydratedFromDraftRef.current) return;
-    void drafts.get(draftKey).then((rec) => {
-      if (hydratedFromDraftRef.current) return;
-      hydratedFromDraftRef.current = true;
-      const patch = (rec?.payload as { patch?: Partial<TqRow> } | undefined)?.patch;
-      if (!patch) return;
-      if (typeof patch.ref_raw === "string") setRefRaw(patch.ref_raw);
-      if (typeof patch.question === "string") setQuestion(patch.question);
-      if (typeof patch.response === "string") setResponse(patch.response);
-    });
-  }, [draftKey]);
-  const diff = useMemo<Partial<TqRow>>(() => {
-    const out: Partial<TqRow> = {};
-    if (refRaw !== (row.ref_raw ?? "")) out.ref_raw = refRaw;
-    if (question !== (row.question ?? "")) out.question = question;
-    if (response !== (row.response ?? "")) out.response = response;
-    return out;
-  }, [refRaw, question, response, row.ref_raw, row.question, row.response]);
-  const isDirty = Object.keys(diff).length > 0;
-
-  // Sync the draft store as the source of crash-recovery truth. Cleared
-  // when the user edits back to server state (so the orange border vanishes).
-  useEffect(() => {
-    if (locked) return;
-    if (isDirty) {
-      void drafts.set(draftKey, { patch: diff }, row.version, {
-        kind: "row",
-        rowKind: "tq",
-        id: row.id,
-        book: row.book,
-        chapter: row.chapter,
-        verse: row.verse,
-      });
-    } else {
-      void drafts.clear(draftKey);
-    }
-  }, [draftKey, isDirty, diff, row.version, row.id, row.book, row.chapter, row.verse, locked]);
-
-  const handleSave = () => {
-    if (!isDirty) return;
-    onSave(diff);
-  };
+  const { isDirty, saving } = edit;
+  const handleSave = () => edit.submit();
 
   const effectiveVersion = row.restored_from_version ?? row.version;
 
   // Restore a version picked in the history dialog: mirror it into the local
-  // fields, then PATCH only what actually differs from saved server state so
-  // picking the current version can't bump the version for nothing. The local
-  // mirror happens even when the patch is empty — the user asked for this
-  // version's text, which means discarding any unsaved typing on top of it.
+  // fields, then PATCH only what differs from the saved server state (the pin)
+  // so picking the current version can't bump the version for nothing. The
+  // local mirror happens even when the patch is empty. ref_raw is not in the
+  // snapshot and is not sent: the server re-derives `verse` from it, so a
+  // half-typed ref must stay unsaved, and the pin keeps it dirty across the
+  // version bump (rowEditPin.ts).
   const handleUseVersion = (snapshot: RowSnapshot, fromVersion: number) => {
-    const rawQuestion = snapshot.question ?? "";
-    const rawResponse = snapshot.response ?? "";
-    setQuestion(rawQuestion);
-    setResponse(rawResponse);
-    const patch: Partial<TqRow> = {};
-    if (rawQuestion !== (row.question ?? "")) patch.question = rawQuestion;
-    if (rawResponse !== (row.response ?? "")) patch.response = rawResponse;
-    if (Object.keys(patch).length === 0) return;
-    // ref_raw isn't part of the history snapshot, so the version bump this
-    // PATCH triggers would resync it from the server and silently drop an
-    // unsaved ref edit. Hold it across the bump so it stays as the user left
-    // it — unsaved, still dirty — rather than being clobbered or written.
-    if (refRaw !== (row.ref_raw ?? "")) pendingRefRef.current = refRaw;
-    onSave(patch, { restoredFromVersion: fromVersion });
+    edit.submit(
+      { question: snapshot.question ?? "", response: snapshot.response ?? "" },
+      { only: ["question", "response"], restoredFromVersion: fromVersion },
+    );
   };
 
   return (
@@ -434,7 +380,7 @@ const Row = memo(function Row({
             fields={TQ_HISTORY_FIELDS}
             title="Question history"
             currentVersion={row.version}
-            canRestore={!locked}
+            canRestore={!locked && !saving}
             effectiveVersion={effectiveVersion}
             onClose={() => setHistoryOpen(false)}
             onUseVersion={handleUseVersion}
@@ -444,19 +390,36 @@ const Row = memo(function Row({
       {locked ? (
         <span style={{ gridArea: "save" }} />
       ) : (
-        <Tooltip title={isDirty ? "save edits" : "no unsaved edits"}>
+        <Tooltip title={saving ? "saving…" : isDirty ? "save edits" : "no unsaved edits"}>
           <span style={{ gridArea: "save" }}>
             <IconButton
               size="small"
-              disabled={!isDirty}
+              disabled={!isDirty || saving}
               onClick={handleSave}
-              sx={{ p: 0.25, color: isDirty ? "primary.main" : "action.disabled" }}
+              sx={{ p: 0.25, color: isDirty && !saving ? "primary.main" : "action.disabled" }}
             >
               {isDirty ? (
                 <SaveIcon fontSize="inherit" />
               ) : (
                 <SaveOutlinedIcon fontSize="inherit" />
               )}
+            </IconButton>
+          </span>
+        </Tooltip>
+      )}
+      {locked ? (
+        <span style={{ gridArea: "undo" }} />
+      ) : (
+        <Tooltip title={isDirty && !saving ? "undo edits (back to the saved text)" : ""}>
+          <span style={{ gridArea: "undo" }}>
+            <IconButton
+              size="small"
+              aria-label="undo edits"
+              onClick={edit.undo}
+              disabled={!isDirty || saving}
+              sx={{ p: 0.25, color: "text.secondary", opacity: isDirty ? 1 : 0, transition: "opacity 150ms" }}
+            >
+              <UndoIcon fontSize="inherit" />
             </IconButton>
           </span>
         </Tooltip>

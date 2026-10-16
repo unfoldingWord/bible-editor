@@ -102,7 +102,7 @@ import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
 import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
-import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
+import { planRefusedRowDeleteRollback, planRefusedRowPatchRollback } from "../sync/refusedRowRollback";
 import { dropOwnRowDeleteClick, markOwnRowDelete, recordOwnRowDeleteClickOp } from "../sync/pendingRowDeletes";
 import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
 import { tnMoveRelay } from "../sync/tnMoveRelay";
@@ -1276,6 +1276,61 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
     [fetchRollbackChapter, applyLocalRowPatch],
   );
+  // #1115: a refused or discarded tq/twl PATCH left its text in the cache as
+  // if saved. Put the server's values back; the row keeps the typing on screen
+  // as unsaved (its pin, rowEditPin.ts), and a remount no longer shows the
+  // refused text as saved. tn is excluded (refusedRowRollback.ts).
+  const rollBackRefusedRowPatch = useCallback(
+    async (op: Pick<OutboxOp, "id" | "target" | "action" | "patch">) => {
+      const t = op.target;
+      if (t.kind !== "row" || t.rowKind === "tn" || op.action !== "patch") return;
+      const rowKind = t.rowKind;
+      try {
+        const key = outboxTargetKey(t);
+        const patchQueued = async () =>
+          siblingStillDraining(
+            (await outbox.list())
+              .filter((o) => o.action === "patch")
+              .map((o) => ({ id: o.id, status: o.status, targetKey: outboxTargetKey(o.target) })),
+            op.id,
+            key,
+          );
+        const cur = dataRef.current;
+        if (!cur || cur.book !== t.book) return;
+        const chapterNo = cur.chapter;
+        const versionAtStart = (
+          cur[rowKind] as ReadonlyArray<TqRow | TwlRow>
+        ).find((r) => r.id === t.id)?.version;
+        const server = await fetchRollbackChapter(t.book, chapterNo);
+        const stillQueuedForTarget = await patchQueued();
+        if (
+          !rollbackMayApply({
+            mounted: rollbackMountedRef.current,
+            liveBook: liveBookRef.current,
+            targetBook: t.book,
+          })
+        ) {
+          return;
+        }
+        const now = dataRef.current;
+        if (!now || now.book !== t.book || now.chapter !== chapterNo) return;
+        const find = (rows: ReadonlyArray<TqRow | TwlRow>) =>
+          rows.find((r) => r.id === t.id) as unknown as Record<string, unknown> | undefined;
+        const plan = planRefusedRowPatchRollback({
+          patch: op.patch,
+          serverRow: find(server[rowKind]),
+          cachedRow: find(now[rowKind]),
+          stillQueuedForTarget,
+          // Skip if the row moved during the re-read (a newer save landed).
+          versionAtStart: versionAtStart ?? null,
+        });
+        if (plan) applyLocalRowPatch(rowKind, t.id, plan as Partial<TqRow & TwlRow>);
+      } catch {
+        // Best-effort: the next chapter refetch catches up.
+      }
+    },
+    [fetchRollbackChapter, applyLocalRowPatch],
+  );
   // A chapter_locked refusal means this tab's view of the pipeline is stale:
   // refresh it (one reload at a time).
   const reloadLocks = useCallback(() => {
@@ -1299,13 +1354,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           void rollBackRefusedVerse(op);
           void rollBackRefusedRowDelete(op);
           void rollBackRefusedTnMove(op);
+          void rollBackRefusedRowPatch(op);
           pushPipelineToast(
-            "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+            // A refused row text edit stays on screen as unsaved (#1115); a
+            // move or reorder is put back instead.
+            op.target.kind === "row" &&
+              op.action === "patch" &&
+              !("verse" in op.patch) &&
+              !("sort_order" in op.patch)
+              ? "Not saved — the AI run for this chapter is mid-flight. Your edit is kept as unsaved; save it again after the run finishes."
+              : "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }
       }),
-    [pushPipelineToast, reloadLocks, rollBackRefusedVerse, rollBackRefusedRowDelete, rollBackRefusedTnMove],
+    [pushPipelineToast, reloadLocks, rollBackRefusedVerse, rollBackRefusedRowDelete, rollBackRefusedTnMove, rollBackRefusedRowPatch],
   );
   // #1075: a discarded verse op (an unresolvable 409, a refused save, discard
   // all) leaves its optimistic content in the caches just as a lock refusal
@@ -1316,9 +1379,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     () =>
       onOutboxDiscard((op) => {
         if (op.target.kind === "verse") void rollBackRefusedVerse(op);
-        else void rollBackRefusedRowDelete(op);
+        else {
+          void rollBackRefusedRowDelete(op);
+          void rollBackRefusedRowPatch(op);
+        }
       }),
-    [rollBackRefusedVerse, rollBackRefusedRowDelete],
+    [rollBackRefusedVerse, rollBackRefusedRowDelete, rollBackRefusedRowPatch],
   );
   // #1119: this tab's row DELETE refused or discarded in another tab (the
   // drain is shared across tabs, its announcements are not) gets the same
@@ -3850,8 +3916,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     kind: "tn" | "tq" | "twl",
     row: T,
     patch: Partial<T>,
-    opts?: { restoredFromVersion?: number; opId?: string },
+    opts?: {
+      restoredFromVersion?: number;
+      opId?: string;
+      // #1115: a tq/twl row sends the server version and values its edit was
+      // typed against (rowEditPin.ts). The cached `row` may hold refused or
+      // in-flight optimistic text at that version, or a newer server row the
+      // edit never saw; either way a 409 then reaches the conflict path.
+      expectedVersion?: number;
+      baseline?: Record<string, unknown>;
+    },
   ) => {
+    const { expectedVersion, baseline: pinnedBaseline, ...enqueueOpts } = opts ?? {};
     // Optimistic local apply mirrors what the server will do: any non-revert
     // patch clears the restored_from_version marker so the chip immediately
     // drops the v{N} override instead of waiting for the round-trip.
@@ -3867,14 +3943,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // classifyRowPatchConflict). Read from `row`, which still holds the version
     // we branched from — applyLocalRowPatch produces a new cached object.
     const rowRecord = row as unknown as Record<string, unknown>;
-    const baseline: Record<string, unknown> = {};
-    for (const field of Object.keys(patch)) baseline[field] = rowRecord[field];
+    const baseline: Record<string, unknown> = { ...pinnedBaseline };
+    for (const field of Object.keys(patch)) {
+      if (!(field in baseline)) baseline[field] = rowRecord[field];
+    }
     applyLocalRowPatch(kind, row.id, localPatch);
     // #1092: tie the op to the draft generation it saves, so its 200 cannot
     // clear typing that arrives while it is in flight.
     const draftGeneration = drafts.rowSaveGeneration(draftRowKey(kind, row.book, row.id));
-    return outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, {
-      ...opts,
+    return outbox.enqueueRow(kind, row.id, expectedVersion ?? row.version, patch as Record<string, unknown>, {
+      ...enqueueOpts,
       book: row.book,
       baseline,
       draftGeneration,
@@ -5125,9 +5203,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onNoteDelete={handleTrashNote}
           onNoteRestore={handleRestoreNote}
-          onWordSave={(id, patch) => {
+          onWordSave={(id, patch, opts) => {
             const row = data.twl.find((r) => r.id === id);
-            if (row) enqueueRow("twl", row, patch);
+            if (row) enqueueRow("twl", row, patch, opts);
           }}
           onWordDelete={(id) => {
             const row = data.twl.find((r) => r.id === id);
