@@ -559,6 +559,16 @@ console.log("\n[#931] a verse save's lane reopen DELETE finishes BEFORE the save
     true,
     "[source] every reopenLaneChecks call in verses.ts hands its broadcasts to executionCtx.waitUntil",
   );
+  // #1205: the PATCH, bridge and split routes act on a range row, so each
+  // passes the row's end (the 8th argument) and a lane reopen spans the range.
+  eq(
+    callSites.every((idx) => {
+      const args = argsAt(versesTs, idx + "reopenLaneChecks".length);
+      return /updated\.verse_end|bridgeEnd/.test(args);
+    }),
+    true,
+    "[source] every reopenLaneChecks call in verses.ts passes the row's verse_end (#1205)",
+  );
   // The verse.updated / verse.bridged / verse.split broadcast is scheduled
   // only AFTER the awaited reopen in its route, so another tab reacting to it
   // cannot PUT a lane check that the reopen DELETE then wipes.

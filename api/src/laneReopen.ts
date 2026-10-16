@@ -114,6 +114,14 @@ export const LANE_REOPEN_BROADCAST_CAP = 200;
 // before letting the save respond (#931). See the waitUntil parameter.
 export const LANE_REOPEN_BROADCAST_WAIT_MS = 1000;
 
+// #1205: the last verse a row covers. A range row (UST 6-9: verse 6,
+// verse_end 9) holds the text of every verse in 6..9, so a content change to it
+// stales the sign-off on all of them, not just the first. A null / smaller /
+// equal verse_end is a single verse.
+export function lastCoveredVerse(verse: number, verseEnd: number | null | undefined): number {
+  return verseEnd != null && verseEnd > verse ? verseEnd : verse;
+}
+
 export async function reopenLaneChecks(
   env: Env,
   book: string,
@@ -139,10 +147,14 @@ export async function reopenLaneChecks(
   // at most the cap. Omitted, the broadcasts are awaited in full as before
   // (rows.ts already runs the whole call inside waitUntil).
   waitUntil?: (p: Promise<unknown>) => void,
+  // #1205: the row's verse_end when it is a range row. Every verse from
+  // `verse` through it is reopened. Omitted / null = a single verse.
+  verseEnd: number | null = null,
 ): Promise<void> {
   if (lanes.length === 0) return;
   try {
-    const placeholders = lanes.map((_l, i) => `?${i + 4}`).join(", ");
+    const last = lastCoveredVerse(verse, verseEnd);
+    const placeholders = lanes.map((_l, i) => `?${i + 5}`).join(", ");
     // #686 item 3: this DELETE used to leave no trace at all — a checkoff
     // could vanish with nothing in edit_log explaining why. Paired in one
     // batch with a conditional audit INSERT, same `WHERE changes() > 0`
@@ -155,25 +167,35 @@ export async function reopenLaneChecks(
       env.DB
         .prepare(
           `DELETE FROM verse_lane_checks
-            WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND lane IN (${placeholders})`,
+            WHERE book = ?1 AND chapter = ?2 AND verse >= ?3 AND verse <= ?4 AND lane IN (${placeholders})`,
         )
-        .bind(book, chapter, verse, ...lanes),
+        .bind(book, chapter, verse, last, ...lanes),
       env.DB
         .prepare(
           `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
            SELECT 'verse_lane', ?1, ?2, NULL, NULL, NULL, 'update', ?3, 'lane_reopen'
             WHERE changes() > 0`,
         )
-        .bind(`${book}/${chapter}/${verse}`, book, JSON.stringify({ lanes, reason: "content_edit_reopen" })),
+        .bind(
+          `${book}/${chapter}/${verse}`,
+          book,
+          JSON.stringify(
+            last > verse
+              ? { lanes, reason: "content_edit_reopen", verse_end: last }
+              : { lanes, reason: "content_edit_reopen" },
+          ),
+        ),
     ]);
     // Nothing was checked here → nothing reopened → no need to notify anyone.
     if (!res.meta.changes || !broadcast) return;
     const broadcasts = (async () => {
-      for (const lane of lanes) {
-        await broadcastChapter(env, book, chapter, {
-          type: "lane_check.updated",
-          check: { book, chapter, verse, lane, checkers: [] },
-        });
+      for (let v = verse; v <= last; v++) {
+        for (const lane of lanes) {
+          await broadcastChapter(env, book, chapter, {
+            type: "lane_check.updated",
+            check: { book, chapter, verse: v, lane, checkers: [] },
+          });
+        }
       }
     })().catch(() => {
       /* best-effort, same as below */
@@ -223,7 +245,9 @@ const REOPEN_WRITE_BATCH = 45;
 export async function reopenLaneChecksBulk(
   env: Env,
   book: string,
-  entries: Array<{ chapter: number; verse: number; lanes: CheckLane[] }>,
+  // #1205: `verseEnd` (a range row's verse_end) widens the reopen to every
+  // verse from `verse` through it.
+  entries: Array<{ chapter: number; verse: number; verseEnd?: number | null; lanes: CheckLane[] }>,
   broadcast: boolean,
 ): Promise<void> {
   const withLanes = entries.filter((e) => e.lanes.length > 0);
@@ -240,19 +264,28 @@ export async function reopenLaneChecksBulk(
       // connection, so changes() in each INSERT reads its immediately
       // preceding DELETE's row count, not some other slice member's.
       const stmts = slice.flatMap((e) => {
-        const placeholders = e.lanes.map((_l, j) => `?${j + 4}`).join(", ");
+        const last = lastCoveredVerse(e.verse, e.verseEnd);
+        const placeholders = e.lanes.map((_l, j) => `?${j + 5}`).join(", ");
         return [
           env.DB.prepare(
             `DELETE FROM verse_lane_checks
-              WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND lane IN (${placeholders})`,
-          ).bind(book, e.chapter, e.verse, ...e.lanes),
+              WHERE book = ?1 AND chapter = ?2 AND verse >= ?3 AND verse <= ?4 AND lane IN (${placeholders})`,
+          ).bind(book, e.chapter, e.verse, last, ...e.lanes),
           env.DB
             .prepare(
               `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
                SELECT 'verse_lane', ?1, ?2, NULL, NULL, NULL, 'update', ?3, 'lane_reopen'
                 WHERE changes() > 0`,
             )
-            .bind(`${book}/${e.chapter}/${e.verse}`, book, JSON.stringify({ lanes: e.lanes, reason: "content_edit_reopen" })),
+            .bind(
+              `${book}/${e.chapter}/${e.verse}`,
+              book,
+              JSON.stringify(
+                last > e.verse
+                  ? { lanes: e.lanes, reason: "content_edit_reopen", verse_end: last }
+                  : { lanes: e.lanes, reason: "content_edit_reopen" },
+              ),
+            ),
         ];
       });
       const batchResults = await env.DB.batch(stmts);
@@ -265,19 +298,21 @@ export async function reopenLaneChecksBulk(
         // notify anyone (mirrors reopenLaneChecks's single-verse guard).
         if (!results[j]?.meta.changes) continue;
         const e = slice[j];
-        for (const lane of e.lanes) {
-          if (broadcastCount >= LANE_REOPEN_BROADCAST_CAP) {
-            droppedBroadcasts++;
-            continue;
-          }
-          broadcastCount++;
-          try {
-            await broadcastChapter(env, book, e.chapter, {
-              type: "lane_check.updated",
-              check: { book, chapter: e.chapter, verse: e.verse, lane, checkers: [] },
-            });
-          } catch {
-            // Best-effort: a single dropped broadcast must never fail the batch.
+        for (let v = e.verse; v <= lastCoveredVerse(e.verse, e.verseEnd); v++) {
+          for (const lane of e.lanes) {
+            if (broadcastCount >= LANE_REOPEN_BROADCAST_CAP) {
+              droppedBroadcasts++;
+              continue;
+            }
+            broadcastCount++;
+            try {
+              await broadcastChapter(env, book, e.chapter, {
+                type: "lane_check.updated",
+                check: { book, chapter: e.chapter, verse: v, lane, checkers: [] },
+              });
+            } catch {
+              // Best-effort: a single dropped broadcast must never fail the batch.
+            }
           }
         }
       }

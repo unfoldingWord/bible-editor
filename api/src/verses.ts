@@ -615,8 +615,17 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     const lanes = lanesToReopenOnVerseEdit(bibleVersion, delta.wordSequenceUnchanged);
     // The DELETE is awaited; the lane broadcasts get a bounded wait (see
     // reopenLaneChecks) so a slow Durable Object cannot hold the save open.
-    await reopenLaneChecks(c.env, updated.book, updated.chapter, updated.verse, lanes, true, (p) =>
-      c.executionCtx.waitUntil(p),
+    // A range row (UST 6-9) holds the text of every verse it covers, so the
+    // reopen spans verse..verse_end, not just the first verse (#1205).
+    await reopenLaneChecks(
+      c.env,
+      updated.book,
+      updated.chapter,
+      updated.verse,
+      lanes,
+      true,
+      (p) => c.executionCtx.waitUntil(p),
+      updated.verse_end,
     );
     // Broadcast only AFTER the reopen DELETE (#931): another tab reacting to
     // verse.updated could PUT a lane check that a still-running DELETE would
@@ -822,7 +831,9 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/bridge", requireEditor, async 
   // flight. reopenLaneChecks swallows its own errors, so this cannot fail.
   // It also runs BEFORE the verse.bridged broadcast below, so a tab reacting
   // to that event cannot PUT a check the DELETE then wipes.
-  await reopenLaneChecks(c.env, book, chapter, verse, ["text"], true, (p) => c.executionCtx.waitUntil(p));
+  // The bridged row now covers verse..bridgeEnd, including verses of a range the
+  // start row already held (#1205).
+  await reopenLaneChecks(c.env, book, chapter, verse, ["text"], true, (p) => c.executionCtx.waitUntil(p), bridgeEnd);
   c.executionCtx.waitUntil(
     (async () => {
       // Tell open tabs FIRST, then prune the orphaned per-verse status/checkoff
@@ -949,7 +960,9 @@ verses.post("/:book/:chapter/:verse/:bibleVersion/split", requireEditor, async (
   }));
   // Awaited before responding and before the verse.split broadcast — see
   // the bridge route (#931).
-  await reopenLaneChecks(c.env, book, chapter, verse, ["text"], true, (p) => c.executionCtx.waitUntil(p));
+  // The split bridge covered verse..bridgeEnd, and every verse in it is now a
+  // fresh row with seeded text, so a sign-off on any of them is stale (#1205).
+  await reopenLaneChecks(c.env, book, chapter, verse, ["text"], true, (p) => c.executionCtx.waitUntil(p), bridgeEnd);
   c.executionCtx.waitUntil(
     (async () => {
       if (startDto) {

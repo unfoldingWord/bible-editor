@@ -8351,7 +8351,7 @@ async function applyVerseRows(
     await confirmAdoptedConflicts(env, book, resource, confirmRefs, now);
   }
 
-  const reopenEntries: Array<{ chapter: number; verse: number; lanes: CheckLane[] }> = [];
+  const reopenEntries: Array<{ chapter: number; verse: number; verseEnd?: number | null; lanes: CheckLane[] }> = [];
   for (const a of landedAdoptions) {
     const lanes = lanesForAdoption(bibleVersion, a.beforePlainText, a.plainText, a.beforeContentJson, a.v.contentJson);
     if (lanes.length === 0) {
@@ -8360,7 +8360,14 @@ async function applyVerseRows(
       });
       continue;
     }
-    reopenEntries.push({ chapter: a.v.chapter, verse: a.v.verse, lanes });
+    // #1205: a range row's adoption changes the text of every verse it covers,
+    // before or after the adoption (master may regroup the range).
+    reopenEntries.push({
+      chapter: a.v.chapter,
+      verse: a.v.verse,
+      verseEnd: Math.max(a.v.verseEnd ?? a.v.verse, a.beforeVerseEnd ?? a.v.verse),
+      lanes,
+    });
   }
   await reopenLaneChecksBulk(env, book, reopenEntries, broadcastLaneReopens);
 
