@@ -6,7 +6,7 @@
 //   node --experimental-strip-types --no-warnings src/lib/saveChain.test.mjs
 
 import assert from "node:assert/strict";
-import { createSaveDoneAndNextGuard, runSaveChain, runSaveDoneAndNext } from "./saveChain.ts";
+import { createSaveDoneAndNextGuard, runSaveChain, runSaveDoneAndNext, settleOnSave } from "./saveChain.ts";
 
 let failed = 0;
 function check(cond, msg) {
@@ -252,6 +252,50 @@ function check(cond, msg) {
   assert.equal(run(true), true, "the next click starts a new chain");
   assert.deepEqual(marked, [7], "once both sides queue, the verse is marked");
   assert.equal(advanced, 1, "and the aligner moves on");
+}
+
+// #1196 item 2: an aligner panel commits (new baseline, crash draft cleared,
+// afterCommit run) only when its onSave really queued something. The dual
+// aligner answers with a promise, because the IndexedDB write that queues the
+// PATCH can reject; before, any non-false answer committed at once, so a
+// rejected write cleared the crash draft and the verse was marked done with
+// nothing saved.
+{
+  const outcome = () => {
+    const seen = [];
+    return { seen, committed: () => seen.push("committed"), notQueued: () => seen.push("notQueued") };
+  };
+  // void (the single-panel aligner): commits synchronously, as before.
+  let o = outcome();
+  assert.equal(settleOnSave(undefined, o.committed, o.notQueued), true, "void commits synchronously");
+  assert.deepEqual(o.seen, ["committed"]);
+  // false: nothing was queued (#986).
+  o = outcome();
+  assert.equal(settleOnSave(false, o.committed, o.notQueued), false, "false is not a commit");
+  assert.deepEqual(o.seen, ["notQueued"]);
+  // A promise: nothing happens until it settles.
+  o = outcome();
+  let resolve;
+  const pending = new Promise((r) => (resolve = r));
+  assert.equal(settleOnSave(pending, o.committed, o.notQueued), false, "a promise defers the commit");
+  assert.deepEqual(o.seen, [], "no commit before the outbox write settles");
+  resolve(true);
+  await pending;
+  await Promise.resolve();
+  assert.deepEqual(o.seen, ["committed"], "a stored write commits");
+  // The write was refused (resolved false) or threw (rejected): not queued.
+  o = outcome();
+  const refused = Promise.resolve(false);
+  settleOnSave(refused, o.committed, o.notQueued);
+  await refused;
+  await Promise.resolve();
+  assert.deepEqual(o.seen, ["notQueued"], "a write that resolves false does not commit");
+  o = outcome();
+  const rejected = Promise.reject(new Error("QuotaExceededError"));
+  settleOnSave(rejected, o.committed, o.notQueued);
+  await rejected.catch(() => {});
+  await Promise.resolve();
+  assert.deepEqual(o.seen, ["notQueued"], "a rejected IndexedDB write does not commit");
 }
 
 if (failed) {
