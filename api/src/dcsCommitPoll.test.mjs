@@ -28,7 +28,12 @@ import {
   pollBounds,
   pollDcsRepo,
   repoNeedsPoll,
+  UPSERT_POLL_SQL,
 } from "./dcsCommitPoll.ts";
+import { DatabaseSync } from "node:sqlite";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { TRACKED_DCS_REPOS } from "./dcsSources.ts";
 
 function assert(cond, msg) {
@@ -109,7 +114,9 @@ function fullPage(prefix) {
 // Documented at bookImport.ts's CHUNK and bookReimport.ts's WRITE_BATCH.
 const D1_MAX_BATCH_STATEMENTS = 100;
 
-function mockDb(stateRow) {
+// `ledgerShas`: shas the mock's dcs_commits already holds, returned by the
+// poll's missing-parent lookup (issue #1211). Every other all() is empty.
+function mockDb(stateRow, { ledgerShas = [] } = {}) {
   const executed = [];
   const batchSizes = [];
   const stmt = (sql) => ({
@@ -122,6 +129,10 @@ function mockDb(stateRow) {
       return stateRow ?? null;
     },
     async all() {
+      if (this.sql.includes("FROM dcs_commits") && this.args) {
+        const asked = JSON.parse(this.args[1]);
+        return { results: asked.filter((sha) => ledgerShas.includes(sha)).map((sha) => ({ sha })) };
+      }
       return { results: [] };
     },
     // The attempt claim (F1) is a single statement outside any batch.
@@ -793,7 +804,7 @@ async function main() {
       "a fresh page-cap gap's frontier is UNIONED with the already-open gap's frontier, not discarded",
     );
     assert(
-      /gap_frontier_json = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL OR excluded\.gap_frontier_json IS NOT NULL/.test(upsert.sql),
+      /WHEN excluded\.gap_frontier_json IS NULL THEN dcs_repo_polls\.gap_frontier_json/.test(upsert.sql) && /UNION/.test(upsert.sql),
       "  ...and the SQL guard applies that union even when an older gap already claimed gap_since_sha/gap_at",
     );
   }
@@ -814,6 +825,67 @@ async function main() {
     await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
     const upsert = pollUpsert(db);
     assert(upsert.args[9] === null, "a clean poll (no new gap) binds NULL for gap_frontier_json, never an empty-array union");
+  }
+
+  // ── issue #1211: a merge's older-dated second parent is queued, not lost ──
+  // Gitea orders the list by committer date across branches, so a merge whose
+  // second parent is older than the stop sha lists merge, first parent, stop
+  // sha, and the second parent's commits only AFTER the stop. A clean poll
+  // never fetches them, so the poll must queue the missing parent itself.
+  {
+    mockGitea([
+      [
+        commit("merge", "Merge pull request 'x' (#9) from side into master", "h@x", { parents: ["first", "side-old"] }),
+        commit("first", "hand fix", "h@x", { parent: "mark" }),
+        commit("mark", "the mark", "h@x"),
+        commit("side-old", "older side-branch fix", "h@x", { date: "2026-08-01T12:00:00Z", parent: "base" }),
+      ],
+    ]);
+    const db = mockDb({ repo: "en_tn", last_sha: "mark", last_attempted_at: NOW - 3600 });
+    const res = await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    const upsert = pollUpsert(db);
+    assert(res.status === "ok" && upsert.args[8] === 1, "#1211: the clean poll still advances its mark");
+    assert(upsert.args[6] === "mark", "#1211: the missing second parent opens a gap whose far edge is the stop sha");
+    assert(JSON.stringify(JSON.parse(upsert.args[9])) === '["side-old"]', "#1211: the missing second parent is queued in the frontier");
+  }
+  // ...and a parent the ledger already holds queues nothing.
+  {
+    mockGitea([
+      [
+        commit("merge", "Merge pull request 'x' (#9) from side into master", "h@x", { parents: ["first", "side-old"] }),
+        commit("first", "hand fix", "h@x", { parent: "mark" }),
+        commit("mark", "the mark", "h@x"),
+      ],
+    ]);
+    const db = mockDb({ repo: "en_tn", last_sha: "mark", last_attempted_at: NOW - 3600 }, { ledgerShas: ["side-old"] });
+    await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    const upsert = pollUpsert(db);
+    assert(upsert.args[6] === null && upsert.args[9] === null, "#1211: a second parent already in the ledger opens no gap");
+  }
+
+  // ── issue #1211 review: two overlapping polls each union their frontier
+  // with the state they READ, which can be stale. The upsert itself must
+  // union with the STORED frontier, so a later poll cannot erase an entry an
+  // earlier one wrote. Real SQLite through the real migrations. ────────────
+  {
+    const d = new DatabaseSync(":memory:");
+    const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+    for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) d.exec(readFileSync(join(dir, f), "utf8"));
+    const upsert = (frontier, gapSince = "mark") =>
+      d
+        .prepare(UPSERT_POLL_SQL)
+        .run("en_tn", "tip", NOW, NOW, NOW, "ok", gapSince, gapSince ? NOW : null, 1, frontier == null ? null : JSON.stringify(frontier), NOW);
+    const stored = () => d.prepare(`SELECT gap_since_sha, gap_frontier_json FROM dcs_repo_polls WHERE repo = 'en_tn'`).get();
+    upsert(["X"]);
+    upsert(["Y", "X"]);
+    upsert(["Y"]);
+    const got = JSON.parse(stored().gap_frontier_json).sort().join(",");
+    assert(got === "X,Y", `#1211: a stored frontier {X} plus an incoming {Y} ends as {X,Y}, deduped (got ${got})`);
+    upsert(null, null);
+    assert(JSON.parse(stored().gap_frontier_json).sort().join(",") === "X,Y", "  ...and a clean poll (NULL) still keeps the open gap's frontier");
+    d.prepare(`UPDATE dcs_repo_polls SET gap_since_sha = NULL, gap_frontier_json = NULL WHERE repo = 'en_tn'`).run();
+    upsert(["Z"]);
+    assert(stored().gap_frontier_json === '["Z"]', "  ...and with no gap open the incoming frontier is written as is");
   }
 
   console.log("dcsCommitPoll: all assertions passed");

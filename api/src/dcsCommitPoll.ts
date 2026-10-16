@@ -432,7 +432,7 @@ const CLAIM_ATTEMPT_SQL = `INSERT INTO dcs_repo_polls (repo, last_attempted_at)
  VALUES (?1, ?2)
  ON CONFLICT (repo) DO UPDATE SET last_attempted_at = excluded.last_attempted_at`;
 
-const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
+export const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
     last_status, gap_since_sha, gap_at, gap_frontier_json, coverage_since)
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10, ?11)
@@ -474,8 +474,21 @@ const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    -- walks the frontier it has — could never reach a hole that opened after
    -- an older one was already in progress; clearing the older gap would
    -- then report full coverage with those commits still missing.
-   gap_frontier_json = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL OR excluded.gap_frontier_json IS NOT NULL
-                              THEN excluded.gap_frontier_json ELSE dcs_repo_polls.gap_frontier_json END,
+   --
+   -- The caller's union is built from the state it READ, which a concurrent
+   -- poll may have changed since (issue #1211 review), so while a gap is open
+   -- the incoming frontier is ALSO unioned with the stored one here, deduped.
+   -- A stored value that is not a JSON array is replaced, as before.
+   gap_frontier_json = CASE
+     WHEN dcs_repo_polls.gap_since_sha IS NULL THEN excluded.gap_frontier_json
+     WHEN excluded.gap_frontier_json IS NULL THEN dcs_repo_polls.gap_frontier_json
+     WHEN dcs_repo_polls.gap_frontier_json IS NULL OR NOT json_valid(dcs_repo_polls.gap_frontier_json)
+          OR json_type(dcs_repo_polls.gap_frontier_json) != 'array' THEN excluded.gap_frontier_json
+     ELSE (SELECT json_group_array(u.value) FROM (
+             SELECT value FROM json_each(dcs_repo_polls.gap_frontier_json) WHERE type = 'text'
+             UNION
+             SELECT value FROM json_each(excluded.gap_frontier_json) WHERE type = 'text') u)
+   END,
    -- A clean post-migration poll establishes the floor once. Never advance it
    -- on later polls: moving it forward would make an older proven window
    -- unexpectedly fall back to live Gitea.
@@ -528,10 +541,33 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
   const advance = dropped > 0 || !page.incomplete || advancesDespiteIncomplete(page.incompleteReason);
   // The tip is rows[0] — the walk is newest-first.
   const tip = rows[0] ?? null;
-  const gapSince =
+  let gapSince =
     dropped > 0 || (page.incomplete && advancesDespiteIncomplete(page.incompleteReason))
       ? (sinceSha ?? rows[rows.length - 1]?.sha ?? null)
       : null;
+  // Issue #1211: Gitea lists commits by committer date across branches, so a
+  // merge whose second parent is older than the stop sha has that parent (and
+  // its branch) listed AFTER the stop, and a clean walk never fetches it. Any
+  // parent of a new row that is neither in this walk, the stop sha, nor the
+  // ledger opens a gap toward the stop sha, so the backfill walks it. Skipped
+  // on bootstrap (no stop sha): that walk is time-bounded on purpose.
+  let missingParents: string[] = [];
+  if (gapSince == null && sinceSha != null && !page.incomplete) {
+    const candidates = computeGapFrontier(rows, sinceSha);
+    if (candidates.length > 0) {
+      const known = await env.DB.prepare(
+        // A row with unknown parents (written before migration 0078) does not
+        // count: its history is unproven, and the backfill re-fetches it.
+        `SELECT sha FROM dcs_commits WHERE repo = ?1 AND sha IN (SELECT value FROM json_each(?2))
+            AND ${wellFormedParentsSql("parent_shas_json")}`,
+      )
+        .bind(repo, JSON.stringify(candidates))
+        .all<{ sha: string }>();
+      const have = new Set((known.results ?? []).map((r) => r.sha));
+      missingParents = candidates.filter((sha) => !have.has(sha));
+      if (missingParents.length > 0) gapSince = sinceSha;
+    }
+  }
   // NEAR edge(s) of the hole, for the backfill path (issue #692 item 2) to
   // resume from — see computeGapFrontier for why this is a SET, not the
   // single oldest-row's-first-parent the original version of this used
@@ -555,7 +591,7 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
   // which costs extra (harmless, ON-CONFLICT-DO-NOTHING) re-insertion of
   // already-covered ground on the way, not a correctness gap.
   const priorFrontier = state?.gap_since_sha != null ? parseGapFrontier(state.gap_frontier_json) : [];
-  const gapFrontier = gapSince != null ? Array.from(new Set([...priorFrontier, ...computeGapFrontier(rows, gapSince)])) : [];
+  const gapFrontier = gapSince != null ? Array.from(new Set([...priorFrontier, ...(missingParents.length > 0 ? missingParents : computeGapFrontier(rows, gapSince))])) : [];
   const gapFrontierJson = gapSince != null ? JSON.stringify(gapFrontier) : null;
   // Existing rows predate the floor and remain untrusted. The first exact
   // successful walk after migration establishes a conservative floor at its
