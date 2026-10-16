@@ -21,6 +21,7 @@
 import assert from "node:assert/strict";
 import { MAX_ATTEMPTS_SENTINEL } from "./refusalReason.ts";
 import {
+  drainOrder,
   eligibleForVersionThread,
   isMaxAttemptsBlocked,
   laneChecksToKeepBehind,
@@ -464,11 +465,58 @@ check(
     const lc = laneOp("lc", 7, 101, 2);
     check(pickNextOp([lc], new Set([ultKey])) === lc, "once the verse PATCH is done (deleted), the lane check dispatches");
   }
-  // A fatal (never re-sent) verse failure does not freeze the check.
+  // #986 (decision A): "done" waits for the verse text. A fatally refused
+  // verse save still sits in the outbox until the user retries or discards
+  // it, and the check waits with it, so the verse is never marked done while
+  // its text is unsaved.
   {
     const lc = laneOp("lc", 7, 101, 2);
     const ops = [verseOp("v", 7, "ULT", "failed", 100, 1, { lastError: "http 422" }), lc];
-    check(pickNextOp(ops, new Set()) === lc, "a fatally-refused verse op does not hold the lane check");
+    check(
+      pickNextOp(ops, new Set()) === undefined,
+      "FIX (#986): a lane check waits while an earlier verse PATCH for the same verse is refused (fatal)",
+    );
+    // Discard deletes the refused op, which releases the check.
+    check(pickNextOp([lc], new Set()) === lc, "FIX (#986): once the refused verse PATCH is discarded, the lane check dispatches");
+    // The fatal op still does not block its OWN target: a newer save of the
+    // same verse queued after it drains as before.
+    const younger = verseOp("v2", 7, "ULT", "pending", 102, 3);
+    check(
+      pickNextOp([...ops, younger], new Set()) === younger,
+      "a refused verse PATCH still does not block a newer save of the same verse",
+    );
+  }
+  // #986: Retry of a fatally refused op gives it a fresh queue position
+  // (outbox.ts retry()). The check it held must move back with it, or it
+  // sorts ahead of the retried PATCH, lands first, and the retried PATCH's
+  // server-side reopen deletes it.
+  {
+    const refused = verseOp("v", 7, "ULT", "failed", 100, 1, { lastError: "http 422" });
+    const held = laneOp("lc", 7, 101, 2);
+    const ahead = laneOp("lc0", 7, 99, 0);
+    // retry(): status pending, fresh queuedAt/seq.
+    const retried = { ...refused, status: "pending", lastError: undefined, queuedAt: 200, seq: 10 };
+    check(
+      pickNextOp([retried, held].sort(drainOrder), new Set()) === held,
+      "(#986 bug) without moving the held check, it dispatches ahead of the retried PATCH",
+    );
+    const moved = laneChecksToKeepBehind(refused, [ahead, refused, held]);
+    check(
+      moved.length === 1 && moved[0] === held,
+      "FIX (#986): Retry of a refused verse PATCH moves only the same-verse checks queued behind it",
+    );
+    const heldAfter = { ...held, queuedAt: 200, seq: 11 };
+    let snapshot = [retried, heldAfter].sort(drainOrder);
+    check(pickNextOp(snapshot, new Set()) === retried, "FIX (#986): after Retry the verse PATCH dispatches first");
+    // It lands (deleted from the store); then the check goes, last.
+    snapshot = snapshot.filter((o) => o !== retried);
+    check(pickNextOp(snapshot, new Set()) === heldAfter, "FIX (#986): the check lands after the retried verse PATCH");
+    // Retried and refused again: the check keeps waiting.
+    const refusedAgain = { ...retried, status: "failed", lastError: "http 422" };
+    check(
+      pickNextOp([refusedAgain, heldAfter], new Set()) === undefined,
+      "FIX (#986): a retried save refused again keeps holding the check",
+    );
   }
   // No related verse op: unaffected.
   {

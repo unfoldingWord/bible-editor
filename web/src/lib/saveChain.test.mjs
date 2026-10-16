@@ -220,6 +220,40 @@ function check(cond, msg) {
   }
 }
 
+// #986: a dirty side whose save queues nothing. Shell's dual enqueue returns
+// false and frees the guard; AlignmentPanel then skips afterCommit. So the
+// verse is neither marked done nor left, and the button works again.
+{
+  const guard = createSaveDoneAndNextGuard();
+  const marked = [];
+  let advanced = 0;
+  const order = [];
+  const run = (ustQueues) =>
+    guard.run({
+      steps: [
+        { dirty: true, save: (afterCommit) => { order.push("ult"); afterCommit(); } },
+        {
+          dirty: true,
+          save: (afterCommit) => {
+            order.push("ust");
+            if (ustQueues) afterCommit();
+            else guard.cancel(); // dropped: no afterCommit
+          },
+        },
+      ],
+      markDone: () => marked.push(7),
+      advance: () => { advanced++; },
+    });
+  run(false);
+  assert.deepEqual(order, ["ult", "ust"], "both dirty sides were tried");
+  assert.deepEqual(marked, [], "a dropped side save: the verse is not marked done");
+  assert.equal(advanced, 0, "a dropped side save: the aligner stays on the verse");
+  assert.equal(guard.running, false, "a dropped side save frees the button");
+  assert.equal(run(true), true, "the next click starts a new chain");
+  assert.deepEqual(marked, [7], "once both sides queue, the verse is marked");
+  assert.equal(advanced, 1, "and the aligner moves on");
+}
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);
