@@ -25,6 +25,7 @@ import {
   eligibleForVersionThread,
   isMaxAttemptsBlocked,
   laneCheckHeld,
+  heldTextLaneMarks,
   laneCheckHeldByRefusal,
   laneChecksToKeepBehind,
   refusedVerseOpsSupersededBy,
@@ -693,6 +694,25 @@ check(
       "a save retrying on its own (max attempts) holds the check but does not make it waiting",
     );
     check(!laneCheckHeldByRefusal(lc, [younger, lc]), "a refused save queued after the check does not make it waiting");
+  }
+  // #1220: held marks for the waiting look, in both directions. An UNcheck
+  // held behind a refused save is waiting too, and the latest held op per
+  // verse says what the screen shows.
+  {
+    const refused = verseOp("r", 7, "ULT", "failed", 100, 1, { lastError: "http 422" });
+    const check7 = laneOp("c7", 7, 101, 2);
+    const uncheck7 = { ...laneOp("u7", 7, 101, 2), patch: { checked: false } };
+    const m1 = heldTextLaneMarks([refused, check7], "ZEC", 1);
+    check(m1.size === 1 && m1.get(7) === true, "a held check is listed as checked");
+    const m2 = heldTextLaneMarks([refused, uncheck7], "ZEC", 1);
+    check(m2.size === 1 && m2.get(7) === false, "FIX (#1220): a held UNcheck is listed (as not checked)");
+    const recheck7 = laneOp("c7b", 7, 102, 3);
+    const m3 = heldTextLaneMarks([refused, uncheck7, recheck7], "ZEC", 1);
+    check(m3.get(7) === true, "the latest held op per verse wins");
+    check(heldTextLaneMarks([refused, check7], "ZEC", 2).size === 0, "another chapter lists nothing");
+    check(heldTextLaneMarks([check7], "ZEC", 1).size === 0, "an unheld check is not listed");
+    const tn = laneOp("t7", 7, 101, 2, "pending", "tn");
+    check(heldTextLaneMarks([refused, tn], "ZEC", 1).size === 0, "a tn check is never listed");
   }
 }
 

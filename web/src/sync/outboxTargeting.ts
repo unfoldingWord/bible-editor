@@ -243,3 +243,30 @@ export function refusedVerseOpsSupersededBy<T extends PickOp>(landed: PickOp, al
       drainOrder(o, landed) < 0,
   );
 }
+
+// #1220: this chapter's Text-lane marks held behind a refused verse save
+// (laneCheckHeldByRefusal), verse -> the checked value the screen shows.
+// Both directions count: a held uncheck is as unsent as a held check. When a
+// verse has several held ops, the latest in drain order is what the screen
+// shows.
+export function heldTextLaneMarks<T extends PickOp & Pick<OutboxOp, "patch">>(
+  ops: T[],
+  book: string,
+  chapter: number,
+): Map<number, boolean> {
+  const out = new Map<number, boolean>();
+  const held = ops
+    .filter(
+      (o) =>
+        o.target.kind === "lane_check" &&
+        o.target.lane === "text" &&
+        o.target.book === book &&
+        o.target.chapter === chapter &&
+        o.status === "pending" &&
+        typeof o.patch.checked === "boolean" &&
+        laneCheckHeldByRefusal(o, ops),
+    )
+    .sort(drainOrder);
+  for (const o of held) if (o.target.kind === "lane_check") out.set(o.target.verse, o.patch.checked === true);
+  return out;
+}
