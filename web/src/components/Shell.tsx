@@ -101,7 +101,7 @@ import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
-import { laneCheckHeld, targetKey as outboxTargetKey } from "../sync/outboxTargeting";
+import { laneCheckHeldByRefusal, targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 
 // #1218: my Text-lane mark on a verse whose earlier text save was turned down
 // shows as "waiting" (it is held in the outbox, not yet sent), not as done.
@@ -1714,7 +1714,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     return out;
   }, [versesForTiles]);
   // #1218: verses of this chapter whose Text-lane mark is held in the outbox
-  // behind a turned-down text save (laneCheckHeld). Kept as a joined key so
+  // behind a turned-down text save (laneCheckHeldByRefusal). Kept as a joined key so
   // the outbox's frequent notifies only re-render when the set changes.
   const [heldTextKey, setHeldTextKey] = useState("");
   useEffect(
@@ -1729,7 +1729,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               o.target.chapter === chapter &&
               o.status === "pending" &&
               o.patch.checked === true &&
-              laneCheckHeld(o, ops),
+              laneCheckHeldByRefusal(o, ops),
           )
           .map((o) => (o.target.kind === "lane_check" ? o.target.verse : 0))
           .sort((a, b) => a - b);
@@ -1948,10 +1948,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         .filter((t) => t.lanes.find((l) => l.lane === lane)?.applicable)
         .map((t) => t.verse);
       if (verses.length === 0) return;
-      const allMine = verses.every((v) => laneIndex.get(laneKey(v, lane))?.includes(meUserId));
+      // A waiting Text mark (#1218) is not done on the server, so it does not
+      // count as mine here either — the same rule as the chapter board's tally.
+      const allMine = verses.every(
+        (v) =>
+          laneIndex.get(laneKey(v, lane))?.includes(meUserId) &&
+          !(lane === "text" && heldTextVerses.has(v)),
+      );
       setPendingBulk({ lane, checked: !allMine, verses, chapter: data.chapter });
     },
-    [meUserId, tileSet, laneIndex, data],
+    [meUserId, tileSet, laneIndex, data, heldTextVerses],
   );
   // Run the confirmed bulk: optimistic apply + one direct PATCH (deliberate,
   // online action), reconciled from the server response.

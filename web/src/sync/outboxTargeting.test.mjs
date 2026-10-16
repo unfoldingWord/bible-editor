@@ -25,6 +25,7 @@ import {
   eligibleForVersionThread,
   isMaxAttemptsBlocked,
   laneCheckHeld,
+  laneCheckHeldByRefusal,
   laneChecksToKeepBehind,
   refusedVerseOpsSupersededBy,
   pickNextOp,
@@ -677,6 +678,21 @@ check(
       refusedVerseOpsSupersededBy(lc, [refused]).length === 0,
       "a landed lane check releases nothing",
     );
+
+    // The waiting look is only for a check held by a refused save.
+    check(laneCheckHeldByRefusal(lc, [refused, lc]), "FIX (#1218): a refused save makes the held check waiting");
+    for (const status of ["pending", "in_flight", "conflict"]) {
+      const holder = verseOp("h", 7, "ULT", status, 100, 1);
+      check(
+        laneCheckHeld(lc, [holder, lc]) && !laneCheckHeldByRefusal(lc, [holder, lc]),
+        `a ${status} save holds the check but does not make it waiting`,
+      );
+    }
+    check(
+      laneCheckHeld(lc, [maxed, lc]) && !laneCheckHeldByRefusal(lc, [maxed, lc]),
+      "a save retrying on its own (max attempts) holds the check but does not make it waiting",
+    );
+    check(!laneCheckHeldByRefusal(lc, [younger, lc]), "a refused save queued after the check does not make it waiting");
   }
 }
 

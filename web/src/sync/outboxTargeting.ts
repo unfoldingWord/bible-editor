@@ -140,6 +140,22 @@ function verseSaveCanReopen(verse: OpTarget, lc: OpTarget): boolean {
 // it: an edit made after checking still reopens. A tn/tq check is never held,
 // so a stuck verse save cannot freeze an unrelated checkbox.
 export function laneCheckHeld(lc: PickOp, ops: PickOp[]): boolean {
+  return laneCheckHeldWhere(lc, ops, verseOpUnsettled);
+}
+
+// #1218: whether this check is held by a REFUSED verse save, one that waits
+// for the user's Retry or Discard. Only then does the UI show the check as
+// waiting; a save that is merely queued, in flight or retrying on its own
+// settles without the user, so its check keeps the ordinary look.
+export function laneCheckHeldByRefusal(lc: PickOp, ops: PickOp[]): boolean {
+  return laneCheckHeldWhere(
+    lc,
+    ops,
+    (o) => o.status === "failed" && !willRetryOnItsOwn(o.lastError),
+  );
+}
+
+function laneCheckHeldWhere(lc: PickOp, ops: PickOp[], holds: (o: PickOp) => boolean): boolean {
   if (lc.target.kind !== "lane_check") return false;
   return ops.some(
     (o) =>
@@ -147,7 +163,7 @@ export function laneCheckHeld(lc: PickOp, ops: PickOp[]): boolean {
       verseSaveCovers(o.target, lc.target) &&
       verseSaveCanReopen(o.target, lc.target) &&
       drainOrder(o, lc) < 0 &&
-      verseOpUnsettled(o),
+      holds(o),
   );
 }
 
