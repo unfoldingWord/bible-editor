@@ -867,11 +867,16 @@ export async function raiseVerseMergeConflictAlert(
   // recipient whose standing alert was dismissed is left alone unless this
   // rebuild changes the lock wording of their own alert, judged from the rows
   // this raise read rather than an earlier read by the caller.
-  // `lockedPush` (#1127): an admin lock/push whose commit reached Door43. Every
-  // alert that uses the locked wording gains one sentence saying so, and the
-  // push joins that alert's condition key, so the alert stands once more for
-  // the push and a rebuild from the same facts (a replay, a lock refresh) mints
-  // nothing new.
+  // `notePush` (#1127): an admin lock/push whose commit reached Door43, set only
+  // by noteLockedPushOnVerseMergeAlert. Every alert that uses the locked wording
+  // gains one sentence saying so, and the push joins that alert's condition
+  // key, so the alert stands once more for the push. In this mode the raise
+  // writes ONLY those alerts: a recipient whose alert takes no sentence is left
+  // exactly as it was (no remint over live-row drift, no observation bump), and
+  // nothing is resolved or cleared. Without it, a raise carries a push already
+  // stored in a recipient's key forward while that recipient's facts are
+  // otherwise identical (a replay, a lock refresh, a re-import of the still
+  // locked book), so a dismissed post-push alert does not come back twice.
   opts: {
     recordingFailed?: boolean;
     noBaseCount?: number;
@@ -880,7 +885,7 @@ export async function raiseVerseMergeConflictAlert(
     noBaseEditorRefs?: NoBaseVerseRef[];
     observedAt?: number;
     lockRefresh?: boolean;
-    lockedPush?: LockedPush | null;
+    notePush?: LockedPush;
   } = {},
 ): Promise<void> {
   const source = `verse_merge_conflict:${book}:${resource}`;
@@ -936,6 +941,8 @@ export async function raiseVerseMergeConflictAlert(
   // the banner on a "0 conflict rows" run would erase the one place a human
   // could learn that tonight's export will still overwrite those verses.
   if (rows.length === 0 && !opts.recordingFailed && !opts.noBaseCount) {
+    // #1127: a push note only adds a sentence; it never clears an alert.
+    if (opts.notePush) return;
     try {
       // Clear by SOURCE, not just the admin's username: a still-undismissed
       // editor alert from an earlier run (see the editor fan-out below) named
@@ -1015,17 +1022,11 @@ export async function raiseVerseMergeConflictAlert(
   // break down, so the lead sentence says only what's true (0 adjudicated
   // conflicts) and lets `guidance` carry the noBaseCount story without
   // sounding like it's disagreeing with the sentence before it.
-  // #1127: the push sentence goes only where the locked wording is in use;
-  // elsewhere the alert says nothing the push contradicts.
-  const lockedPush = opts.lockedPush ?? null;
-  const pushSentence = lockedPush ? buildLockedPushSentence(book, resource, lockedPush) : "";
-  const adminPushNoted = pushSentence !== "" && (noBaseLockedWording || keptLockedWording);
-  const baseMessage =
+  const message =
     rows.length === 0
       ? `Sync flagged 0 verse(s) in ${book} ${resource.toUpperCase()} for adjudicated review.${guidance ? ` ${guidance}` : ""}`
       : `Sync flagged ${rows.length} verse(s) in ${book} ${resource.toUpperCase()} for review ` +
         `(${reasonBreakdown}).${refsClause} ${guidance}`;
-  const message = adminPushNoted ? `${baseMessage} ${pushSentence}` : baseMessage;
 
   // Editor fan-out: attribute each 'adopt_conflict' overwrite to the human
   // whose edit it replaced (see this file's header block above) and give
@@ -1077,13 +1078,6 @@ export async function raiseVerseMergeConflictAlert(
     const existing = editorMessages.get(username);
     editorMessages.set(username, existing ? `${existing} ${editor.message}` : editor.message);
   }
-  // #1127: an editor's alert uses the locked wording only through their own
-  // no-base verses.
-  const editorPushNoted = (username: string): boolean =>
-    pushSentence !== "" && noBaseLockedWording && perEditorNoBase.has(username);
-  for (const [username, msg] of editorMessages) {
-    if (editorPushNoted(username)) editorMessages.set(username, `${msg} ${pushSentence}`);
-  }
 
   // The full desired state for this source: the admin's summary plus one
   // entry per affected editor.
@@ -1092,7 +1086,7 @@ export async function raiseVerseMergeConflictAlert(
   // The condition is the measured set of adjudication-needed rows, not the
   // prose/count formatting. Sort every collection so traversal order and
   // capped display samples cannot create a new alert transition.
-  const condition = reviewConditionKey(
+  const adminCondition = (lockedPush: LockedPush | null): string => reviewConditionKey(
     "verse_merge_conflict",
     { book, resource },
     {
@@ -1119,11 +1113,11 @@ export async function raiseVerseMergeConflictAlert(
       ...(keptLockedWording ? { keptBookLocked: true } : {}),
       // #1127: added only with the push sentence, so every other key is
       // byte-identical to the ones stored before it.
-      ...(adminPushNoted ? { lockedPush } : {}),
+      ...(lockedPush ? { lockedPush } : {}),
     },
   );
-  const conditionForUser = (username: string): string => {
-    if (username === ALERT_USERNAME) return condition;
+  const conditionFor = (username: string, lockedPush: LockedPush | null): string => {
+    if (username === ALERT_USERNAME) return adminCondition(lockedPush);
     const refs = [perEditor.get(username)?.refs ?? [], perEditorNoBase.get(username)?.refs ?? []]
       .flat()
       .sort();
@@ -1133,9 +1127,17 @@ export async function raiseVerseMergeConflictAlert(
       username,
       refs,
       noBaseLockedWording && perEditorNoBase.has(username),
-      editorPushNoted(username) ? lockedPush : null,
+      lockedPush,
     );
   };
+  // #1127: whether a recipient's alert uses the locked wording, the only place
+  // the push sentence goes (elsewhere the alert says nothing a push
+  // contradicts). An editor's alert uses it only through their own no-base
+  // verses.
+  const takesPushSentence = (username: string): boolean =>
+    username === ALERT_USERNAME
+      ? noBaseLockedWording || keptLockedWording
+      : noBaseLockedWording && perEditorNoBase.has(username);
 
   // #1129: on a lock refresh, whether each recipient's own alert carries a
   // sentence whose wording the lock changes, and whether it uses the locked
@@ -1148,6 +1150,36 @@ export async function raiseVerseMergeConflictAlert(
       : { depends: perEditorNoBase.has(username), locked: noBaseLockedWording && perEditorNoBase.has(username) };
 
   try {
+    // Each recipient's latest standing alert: the lock refresh's dismissed
+    // check (#1129) and the push carry-forward (#1127) both read it.
+    const standing = await env.DB.prepare(
+      `SELECT username, condition_key, dismissed_at FROM system_alerts
+        WHERE source = ?1 AND resolved_at IS NULL ORDER BY id DESC`,
+    )
+      .bind(source)
+      .all<{ username: string; condition_key: string | null; dismissed_at: number | null }>();
+    const latest = new Map<string, { condition_key: string | null; dismissed_at: number | null }>();
+    for (const r of standing.results ?? []) if (!latest.has(r.username)) latest.set(r.username, r);
+
+    // #1127: the push each recipient's alert carries. With `notePush`, the new
+    // push wherever the locked wording is in use. Otherwise the push stored in
+    // the recipient's standing key, kept only when rebuilding with it gives
+    // that exact key back (same facts, still the locked wording); when the
+    // facts changed, the new alert is a real new measurement and drops it.
+    const pushFor = new Map<string, LockedPush>();
+    for (const username of desired.keys()) {
+      if (!takesPushSentence(username)) continue;
+      if (opts.notePush) {
+        pushFor.set(username, opts.notePush);
+        continue;
+      }
+      const key = latest.get(username)?.condition_key ?? null;
+      const stored = storedLockedPush(book, resource, username, key);
+      if (stored && conditionFor(username, stored) === key) pushFor.set(username, stored);
+    }
+    // #1127 review: a push note writes only the alerts that take its sentence.
+    if (opts.notePush && pushFor.size === 0) return;
+
     // #1129: a lock refresh rebuilds from the live rows, which a save can have
     // shrunk since the refresh decided to call this. For a recipient who
     // dismissed their alert, a rebuild mints a new key and brings it back, so
@@ -1155,14 +1187,6 @@ export async function raiseVerseMergeConflictAlert(
     // changes. Undismissed alerts are rebuilt as always.
     const keepDismissed = new Set<string>();
     if (opts.lockRefresh) {
-      const standing = await env.DB.prepare(
-        `SELECT username, condition_key, dismissed_at FROM system_alerts
-          WHERE source = ?1 AND resolved_at IS NULL ORDER BY id DESC`,
-      )
-        .bind(source)
-        .all<{ username: string; condition_key: string | null; dismissed_at: number | null }>();
-      const latest = new Map<string, { condition_key: string | null; dismissed_at: number | null }>();
-      for (const r of standing.results ?? []) if (!latest.has(r.username)) latest.set(r.username, r);
       for (const username of desired.keys()) {
         const row = latest.get(username);
         if (row?.dismissed_at == null) continue;
@@ -1181,11 +1205,13 @@ export async function raiseVerseMergeConflictAlert(
     }
     for (const [username, msg] of desired) {
       if (keepDismissed.has(username)) continue;
+      const push = pushFor.get(username) ?? null;
+      if (opts.notePush && !push) continue;
       await reconcileReviewAlert(env, {
         username,
         source,
-        conditionKey: conditionForUser(username),
-        message: msg,
+        conditionKey: conditionFor(username, push),
+        message: push ? `${msg} ${buildLockedPushSentence(book, resource, push)}` : msg,
         severity: "warning",
         observedAt: opts.observedAt,
       });
@@ -1196,7 +1222,7 @@ export async function raiseVerseMergeConflictAlert(
     // A recording failure makes the known rows an undercount: emit the
     // explicit incomplete-report warning above, but never infer that an
     // omitted recipient's condition resolved.
-    if (!opts.recordingFailed) {
+    if (!opts.recordingFailed && !opts.notePush) {
       const desiredUsers = new Set(desired.keys());
       for (const username of await activeReviewAlertUsernames(env, source)) {
         if (!desiredUsers.has(username)) await resolveReviewAlert(env, source, undefined, username, opts.observedAt);
@@ -1239,6 +1265,16 @@ function storedLockWording(book: string, resource: string, username: string, key
     | { noBaseBookLocked?: unknown }
     | undefined;
   return state?.noBaseBookLocked === true;
+}
+
+// #1127: the lock/push a stored verse-merge alert key carries, or null.
+function storedLockedPush(book: string, resource: string, username: string, key: string | null): LockedPush | null {
+  const state = (
+    username === ALERT_USERNAME
+      ? reviewConditionState(key, "verse_merge_conflict", { book, resource })
+      : reviewConditionState(key, "verse_merge_conflict_editor", { book, resource, username })
+  ) as { lockedPush?: unknown } | undefined;
+  return state?.lockedPush === undefined ? null : parseLockedPush(state.lockedPush);
 }
 
 // Issue #1110: re-derive a book's standing verse-merge alerts when an admin
@@ -1395,10 +1431,6 @@ async function rewordVerseMergeAlertForLock(
     bookLocked: lockedNow,
     observedAt,
     lockRefresh: true,
-    // #1127: a lock refresh re-words the stored measurement, and a lock/push
-    // noted in it is part of that measurement. The raise keeps its sentence
-    // only while the locked wording is still in use.
-    lockedPush: state.lockedPush,
   });
   // The raise is best-effort and can write nothing (a failed write, an
   // observation reconcileReviewAlert drops as older, or only dismissed alerts
@@ -1416,9 +1448,9 @@ function storedVerseMergeAlertState(
   book: string,
   resource: string,
   standing: { condition_key: string | null; condition_observed_at: number | null },
-): { noBase: NoBaseVerseRef[]; noBaseCount: number; lockedPush: LockedPush | null; observedAt: number } | null {
+): { noBase: NoBaseVerseRef[]; noBaseCount: number; observedAt: number } | null {
   const state = reviewConditionState(standing.condition_key, "verse_merge_conflict", { book, resource }) as
-    | { noBase?: unknown; noBaseCount?: unknown; recordingFailed?: unknown; rows?: unknown; lockedPush?: unknown }
+    | { noBase?: unknown; noBaseCount?: unknown; recordingFailed?: unknown; rows?: unknown }
     | undefined;
   const noBase = Array.isArray(state?.noBase) ? (state.noBase as NoBaseVerseRef[]) : null;
   if (
@@ -1435,7 +1467,6 @@ function storedVerseMergeAlertState(
   return {
     noBase,
     noBaseCount: state.noBaseCount,
-    lockedPush: state.lockedPush === undefined ? null : parseLockedPush(state.lockedPush),
     observedAt: standing.condition_observed_at,
   };
 }
@@ -1504,7 +1535,7 @@ export async function noteLockedPushOnVerseMergeAlert(
       noBaseEditorRefs: ordered.map((r) => ({ chapter: r.chapter, verse: r.verse, version: r.version })),
       bookLocked,
       observedAt,
-      lockedPush: push,
+      notePush: push,
     });
   } catch (e) {
     console.error("verseMergeConflicts: lock/push alert note failed", {

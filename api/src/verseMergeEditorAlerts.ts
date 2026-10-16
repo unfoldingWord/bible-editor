@@ -338,8 +338,13 @@ export function buildLockedPushSentence(book: string, resource: string, push: Lo
       : push.target === "review"
         ? `${what} for review, on branch ${push.branch}${pr}. Nothing merges that branch automatically; ` +
           `Door43's master keeps its own version until a maintainer merges it.`
-        : `${what} on branch ${push.branch}${pr}, which Door43 merges into master if its checks pass; ` +
-          `until then Door43's master keeps its own version.`;
+        : push.prNumber == null
+          ? // The merge bot acts only on an open pull request, and opening one
+            // failed (export.ts's ensureDcsPr), so do not promise a merge.
+            `${what} on branch ${push.branch}, but no pull request into master is open for it yet, so ` +
+            `nothing merges it until one is opened; Door43's master keeps its own version.`
+          : `${what} on branch ${push.branch}${pr}, which Door43 merges into master if its checks pass; ` +
+            `until then Door43's master keeps its own version.`;
   return `${where} The book is still locked, so later nightly exports keep skipping it.`;
 }
 
