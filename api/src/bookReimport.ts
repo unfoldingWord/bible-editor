@@ -4898,7 +4898,8 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // resolves to the FIRST mint — an earlier bound, i.e. a longer walk, which can
 // only make clearing harder. A flag whose mint log is absent (the log goes in a
 // second batch, so a lost log batch is possible; editLogSweep.ts also deletes
-// `update` rows past 180 days) gets NO window and is skipped, exactly as today.
+// tq/twl `update` rows past 180 days, though never tn ones since #1057) gets NO
+// window and is skipped, exactly as today.
 //
 // Every other guard is untouched and still applies to the derived window: the
 // 30-day bound (measured on the watermark, same as `flag_since`), a COMPLETE

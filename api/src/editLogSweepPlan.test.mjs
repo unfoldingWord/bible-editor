@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import { EDIT_LOG_SWEEP_SQL } from "./editLogSweep.ts";
 
 const INDEX = "edit_log_kind_action_created";
+const CANDIDATES = "edit_log_sweep_candidates";
 
 function freshDb() {
   const d = new DatabaseSync(":memory:");
@@ -41,6 +42,14 @@ function freshDb() {
   const cols = d.prepare(`PRAGMA index_info(${INDEX})`).all().map((r) => r.name);
   assert.deepEqual(cols, ["kind", "action", "created_at"], `${INDEX} indexes (kind, action, created_at)`);
   console.log("  ok: index columns");
+  // 0077's partial index: SQLite uses it only while the sweep's outer WHERE
+  // carries the same `kind <> 'tn'` term, so pin both halves.
+  const cand = d.prepare(`PRAGMA index_info(${CANDIDATES})`).all().map((r) => r.name);
+  assert.deepEqual(cand, ["created_at"], `${CANDIDATES} indexes (created_at)`);
+  const ddl = d.prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`).get(CANDIDATES).sql;
+  assert.match(ddl, /WHERE kind <> 'tn'\s*$/, `${CANDIDATES} is partial on kind <> 'tn': ${ddl}`);
+  assert.match(EDIT_LOG_SWEEP_SQL, /\bAND kind <> 'tn'\n/, "the sweep's outer WHERE carries the same kind <> 'tn' term");
+  console.log("  ok: partial index predicate matches the sweep");
 }
 
 // (2) Every edit_log read in the sweep's exempt branches uses the index.
@@ -51,6 +60,13 @@ function freshDb() {
   assert.equal(elReads.length, 8, `one edit_log read per branch (got ${elReads.length}: ${elReads.join(" | ")})`);
   for (const x of elReads) assert.match(x, new RegExp(`USING INDEX ${INDEX} \\(kind=\\?`), `branch read uses ${INDEX}: ${x}`);
   console.log("  ok: all 8 branch reads use", INDEX);
+  // The outer DELETE seeks the aged non-tn rows through migration 0077's
+  // partial index (issue #1057). Through edit_log_recent it would fetch every
+  // aged tn row's table row each hour just to skip it, a cost that only grows.
+  const outer = details.filter((x) => /^(SEARCH|SCAN) edit_log\b/.test(x));
+  assert.equal(outer.length, 1, `one outer edit_log read (got ${outer.join(" | ")})`);
+  assert.match(outer[0], new RegExp(`^SEARCH edit_log USING (COVERING )?INDEX ${CANDIDATES} \\(created_at<\\?\\)`), `outer read seeks ${CANDIDATES}: ${outer[0]}`);
+  console.log("  ok: outer DELETE seeks", CANDIDATES);
 }
 
 // (3) The INDEXED BY hint changes the access path only, never the result.

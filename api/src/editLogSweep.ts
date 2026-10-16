@@ -22,9 +22,18 @@
 // (edit_log spanned 93 days against the 180-day retention), so this is a
 // shield installed before the hazard goes live, not a repair.
 //
-// Branch (6) is the tn/tq/twl half, added by #653 — same hazard, different
+// Branch (6) is the tq/twl half, added by #653 — same hazard, different
 // table: a TSV row whose create is its only recoverable ancestor loses that
 // ancestor to age and becomes permanently unadjudicable.
+//
+// WHAT IS NEVER SWEPT (issue #1057). Every kind='tn' row, at any age. edit_log
+// is the only record of which person made each translation-note change (the
+// Door43 copy credits every change to one shared account), and the
+// study of where AI-written notes go wrong needs that history. Measured
+// 2026-10-16: tn was 43% of edit_log's rows but 14% of its payload bytes
+// (67 MB of a 1.21 GB database), so keeping it costs little. The outer
+// `kind <> 'tn'` is a negative test on purpose: a kind added later keeps the
+// 180-day limit unless someone decides otherwise.
 //
 // WHAT IS EXEMPT — per verse (row_key = BOOK/chapter/verse/RESOURCE), at
 // most seven rows outlive the retention window:
@@ -106,10 +115,11 @@
 //
 // Everything else older than the cutoff is deleted exactly as before —
 // post-watermark rows, books/resources with no watermark at all, and every
-// non-verse kind. (The TSV merge also folds edit_log for its ancestors, but
-// it is built to degrade gracefully when patches age out — see
-// tsvMerge.test.mjs's "create aged out" cases — so it is deliberately not
-// exempted here.)
+// kind other than verse and tn (tq, twl, verse_lane, verse_status), apart
+// from branch (6)'s tq/twl creates. (The TSV merge also folds edit_log for
+// its ancestors, but it is built to degrade gracefully when tq/twl patches
+// age out — see tsvMerge.test.mjs's "create aged out" cases — so their
+// updates are deliberately not exempted here.)
 //
 // SQL shape notes:
 //   - The exempt set is eight uncorrelated `NOT IN` subqueries, one per
@@ -142,6 +152,15 @@
 //     editLogSweepPlan.test.mjs pins the plan and proves the hint changes no
 //     result. What remains is the per-row brs LIKE join (a SCAN of
 //     book_resource_syncs for each aged verse row).
+//   - The outer candidate walk (issue #1057) reads migration 0077's partial
+//     index edit_log_sweep_candidates (created_at) WHERE kind <> 'tn', so it
+//     never visits the ever-growing set of aged tn rows. Through
+//     edit_log_recent it would fetch each aged tn row's table row every hour
+//     just to skip it (0.7 s vs 3.3 s per run on a synthetic 1.5M-row table).
+//     SQLite uses a partial index only when the query's WHERE implies the
+//     index's, so the outer `kind <> 'tn'` must keep that exact form. No
+//     INDEXED BY here: the planner picks it unprompted, and without the
+//     migration the sweep falls back to edit_log_recent rather than failing.
 //   - The candidate-scoped filter (`el.created_at < ?1`) can exempt a row
 //     that is not the GLOBAL newest-under-boundary (when the true newest is
 //     still younger than the cutoff) — a harmless overkeep: the row the
@@ -184,6 +203,8 @@ export const EDIT_LOG_RETENTION_SECONDS = 180 * 86400;
 export const EDIT_LOG_SWEEP_SQL = `
   DELETE FROM edit_log
    WHERE created_at < ?1
+     -- issue #1057: tn history is kept forever (see "WHAT IS NEVER SWEPT").
+     AND kind <> 'tn'
      AND id NOT IN (
          -- (1) today's merge ancestor: newest surviving
          -- 'create'/'update'/'bridge'/'split' at or before the precise id
@@ -299,8 +320,10 @@ export const EDIT_LOG_SWEEP_SQL = `
          WHERE rn = 1
      )
      AND id NOT IN (
-         -- (6) issue #653: the newest book-known 'create' per LIVE tn/tq/twl
-         -- row. bookReimport.ts's reconstructTsvBases now falls back to exactly
+         -- (6) issue #653: the newest book-known 'create' per LIVE tq/twl
+         -- row. (tn was here too until #1057; the outer kind <> 'tn' now
+         -- keeps every tn row, so reading tn here would only cost work.)
+         -- bookReimport.ts's reconstructTsvBases now falls back to exactly
          -- this row when a row's bounded history is empty — which is the state
          -- of every row created after its book's export boundary froze. Those
          -- are the rows the fallback exists for, and their create is the ONLY
@@ -316,14 +339,12 @@ export const EDIT_LOG_SWEEP_SQL = `
          -- their table, so a deleted row's history still ages out normally.
          SELECT MAX(el.id) AS keep_id
            FROM edit_log el INDEXED BY edit_log_kind_action_created
-          WHERE el.kind IN ('tn', 'tq', 'twl')
+          WHERE el.kind IN ('tq', 'twl')
             AND el.action = 'create'
             AND el.book IS NOT NULL
             AND el.created_at < ?1
             AND (
-              (el.kind = 'tn' AND EXISTS (
-                 SELECT 1 FROM tn_rows r WHERE r.id = el.row_key AND r.book = el.book AND r.deleted_at IS NULL))
-              OR (el.kind = 'tq' AND EXISTS (
+              (el.kind = 'tq' AND EXISTS (
                  SELECT 1 FROM tq_rows r WHERE r.id = el.row_key AND r.book = el.book AND r.deleted_at IS NULL))
               OR (el.kind = 'twl' AND EXISTS (
                  SELECT 1 FROM twl_rows r WHERE r.id = el.row_key AND r.book = el.book AND r.deleted_at IS NULL))

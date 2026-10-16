@@ -112,8 +112,8 @@ console.log("\n[a verse edited before the watermark keeps its merge ancestor acr
   sweep(d, 100000);
 
   assert(
-    survivingIds(d).join(",") === "2,3",
-    "the ancestor (2) AND the global-newest create/update (3, issue #573 gap 1a, protects latest_source) survive; older history and the tn row are swept",
+    survivingIds(d).join(",") === "2,3,4",
+    "the ancestor (2) AND the global-newest create/update (3, issue #573 gap 1a, protects latest_source) survive; older verse history is swept, and the tn row is kept (issue #1057: tn history is never swept)",
   );
   assert(
     mergeAncestorPayload(d, "ZEC", "1", "5", "ULT", 2) === '{"content":"v2"}',
@@ -405,26 +405,28 @@ console.log("\n[a legacy row with book IS NULL is still shielded — the join re
   assert(survivingIds(d).join(",") === "7", "NULL-book ancestor survives (merge accepts book IS NULL rows, so the shield must too)");
 }
 
-// ── issue #653, branch (6): the tn/tq/twl create shield ─────────────────────
+// ── issue #653, branch (6): the tq/twl create shield ────────────────────────
 //
 // reconstructTsvBases now falls back to a row's newest book-known 'create'
 // when its bounded history is empty — the state of every row created after its
 // book's export boundary froze. That create is the row's ONLY ancestor, so an
-// age-based sweep would silently expire the whole recovery.
-function tnRow(d, { id, book = "JER", deletedAt = null }) {
+// age-based sweep would silently expire the whole recovery. These cases use
+// tq: since issue #1057 tn history is never swept at all (see the #1057 cases
+// below), so branch (6) shields tq and twl only.
+function tqRow(d, { id, book = "JER", deletedAt = null }) {
   d.prepare(
-    `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, deleted_at)
-     VALUES (?, ?, 9, 9, '9:9', 'a note', 10, ?)`,
+    `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, deleted_at)
+     VALUES (?, ?, 9, 9, '9:9', 'q', 'r', 10, ?)`,
   ).run(id, book, deletedAt);
 }
 
-console.log("\n[#653: a LIVE tn row's newest book-known 'create' survives a full age-out sweep]");
+console.log("\n[#653: a LIVE tq row's newest book-known 'create' survives a full age-out sweep]");
 {
   const d = freshDb();
-  tnRow(d, { id: "ab12" });
-  logRow(d, { id: 1, kind: "tn", rowKey: "ab12", book: "JER", action: "create", createdAt: 1000, payload: '{"note":"life one"}' });
-  logRow(d, { id: 2, kind: "tn", rowKey: "ab12", book: "JER", action: "create", createdAt: 2000, payload: '{"note":"life two"}' });
-  logRow(d, { id: 3, kind: "tn", rowKey: "ab12", book: "JER", action: "update", createdAt: 3000, payload: '{"note":"an app edit"}' });
+  tqRow(d, { id: "ab12" });
+  logRow(d, { id: 1, kind: "tq", rowKey: "ab12", book: "JER", action: "create", createdAt: 1000, payload: '{"question":"life one"}' });
+  logRow(d, { id: 2, kind: "tq", rowKey: "ab12", book: "JER", action: "create", createdAt: 2000, payload: '{"question":"life two"}' });
+  logRow(d, { id: 3, kind: "tq", rowKey: "ab12", book: "JER", action: "update", createdAt: 3000, payload: '{"question":"an app edit"}' });
 
   sweep(d, 100000);
 
@@ -437,19 +439,19 @@ console.log("\n[#653: a LIVE tn row's newest book-known 'create' survives a full
 console.log("\n[#653: a book-NULL create is NOT shielded — the fallback refuses it, so sheltering it would buy nothing]");
 {
   const d = freshDb();
-  tnRow(d, { id: "cd34" });
-  logRow(d, { id: 5, kind: "tn", rowKey: "cd34", book: null, action: "create", createdAt: 1000, payload: '{"note":"another book"}' });
+  tqRow(d, { id: "cd34" });
+  logRow(d, { id: 5, kind: "tq", rowKey: "cd34", book: null, action: "create", createdAt: 1000, payload: '{"question":"another book"}' });
 
   sweep(d, 100000);
 
   assert(survivingIds(d).length === 0, "an entry the fold discards is not kept alive by this branch");
 }
 
-console.log("\n[#653: a DELETED tn row's create ages out normally — nothing will ever merge it again]");
+console.log("\n[#653: a DELETED tq row's create ages out normally — nothing will ever merge it again]");
 {
   const d = freshDb();
-  tnRow(d, { id: "ef56", deletedAt: 900 });
-  logRow(d, { id: 6, kind: "tn", rowKey: "ef56", book: "JER", action: "create", createdAt: 1000, payload: '{"note":"gone"}' });
+  tqRow(d, { id: "ef56", deletedAt: 900 });
+  logRow(d, { id: 6, kind: "tq", rowKey: "ef56", book: "JER", action: "create", createdAt: 1000, payload: '{"question":"gone"}' });
 
   sweep(d, 100000);
 
@@ -470,6 +472,57 @@ console.log("\n[#653: tq and twl get the same shield, and one kind's row does no
   sweep(d, 100000);
 
   assert(survivingIds(d).join(",") === "7", "the tq row's create survives; the twl entry with no live row does not");
+}
+
+// ── issue #1057: tn edit history is never swept ─────────────────────────────
+//
+// edit_log is the only record of which person made each tn change (the Door43
+// copy credits one shared account), so tn rows are exempt outright, whatever
+// their action, book or row liveness. Every other kind keeps the 180-day limit.
+console.log("\n[#1057: every aged tn row survives; aged tq/twl/verse_lane/verse_status rows are still swept]");
+{
+  const d = freshDb();
+  d.prepare(
+    `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, deleted_at)
+     VALUES ('tn01', 'JER', 9, 9, '9:9', 'a note', 10, NULL), ('tn02', 'JER', 9, 9, '9:9', 'gone', 20, 900)`,
+  ).run();
+  // tn: a live row's create and updates (one AI-authored), a deleted row's
+  // create and delete, and a book-NULL entry with no tn_rows row at all.
+  logRow(d, { id: 1, kind: "tn", rowKey: "tn01", book: "JER", action: "create", createdAt: 1000, payload: '{"note":"v1"}' });
+  logRow(d, { id: 2, kind: "tn", rowKey: "tn01", book: "JER", action: "update", createdAt: 1100, payload: '{"note":"v2"}' });
+  logRow(d, { id: 3, kind: "tn", rowKey: "tn01", book: "JER", action: "update", createdAt: 1200, payload: '{"note":"v3"}', source: "ai_pipeline" });
+  logRow(d, { id: 4, kind: "tn", rowKey: "tn02", book: "JER", action: "create", createdAt: 1000, payload: '{"note":"gone"}' });
+  logRow(d, { id: 5, kind: "tn", rowKey: "tn02", book: "JER", action: "delete", createdAt: 1300 });
+  logRow(d, { id: 6, kind: "tn", rowKey: "tn03", book: null, action: "update", createdAt: 1000, payload: '{"note":"legacy"}' });
+  // Every other kind, aged and shielded by no branch.
+  logRow(d, { id: 7, kind: "tq", rowKey: "tq01", book: "JER", action: "update", createdAt: 1000 });
+  logRow(d, { id: 8, kind: "twl", rowKey: "tw01", book: "JER", action: "update", createdAt: 1000 });
+  logRow(d, { id: 9, kind: "verse_lane", rowKey: "JER/9/9/ULT", book: "JER", action: "update", createdAt: 1000 });
+  logRow(d, { id: 10, kind: "verse_status", rowKey: "JER/9/9/ULT", book: "JER", action: "update", createdAt: 1000 });
+  // A watermarked verse: its merge ancestor stays, its older history goes.
+  syncRow(d, { book: "JER", resource: "ult", confirmedAt: 5000, editId: 12 });
+  logRow(d, { id: 11, rowKey: "JER/9/9/ULT", book: "JER", action: "create", createdAt: 1000, payload: '{"content":"v1"}' });
+  logRow(d, { id: 12, rowKey: "JER/9/9/ULT", book: "JER", action: "update", createdAt: 2000, payload: '{"content":"v2"}' });
+
+  sweep(d, 100000);
+
+  const ids = survivingIds(d);
+  assert(ids.filter((id) => id <= 6).join(",") === "1,2,3,4,5,6", `every aged tn row survives (got ${ids.join(",")})`);
+  assert(![7, 8, 9, 10].some((id) => ids.includes(id)), "aged tq, twl, verse_lane and verse_status rows are still deleted");
+  assert(ids.includes(12) && !ids.includes(11), "the verse keeps its exempt merge ancestor (12); its older create (11) is still swept");
+  assert(ids.join(",") === "1,2,3,4,5,6,12", `nothing else survives (got ${ids.join(",")})`);
+}
+
+console.log("\n[#1057: the cutoff still applies to every other kind]");
+{
+  const d = freshDb();
+  logRow(d, { id: 1, kind: "tn", rowKey: "tn01", book: "JER", action: "update", createdAt: 1000 });
+  logRow(d, { id: 2, kind: "tq", rowKey: "tq01", book: "JER", action: "update", createdAt: 9000 });
+  logRow(d, { id: 3, kind: "tq", rowKey: "tq01", book: "JER", action: "update", createdAt: 1000 });
+
+  sweep(d, 5000);
+
+  assert(survivingIds(d).join(",") === "1,2", "the aged tn row and the young tq row survive; the aged tq row goes");
 }
 
 // ── issue #727/#728 (PR #731 review), branches (7) and (8) ──────────────────

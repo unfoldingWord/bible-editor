@@ -201,7 +201,8 @@ export function classifyKept(
     return { kept: true, reason: "hint" };
   }
 
-  // No create in the log (history pruned after 180 days, or an imported row):
+  // No create in the log (an imported row; tn history is not swept, issue
+  // #1057):
   // there is no full-row baseline to replay, so fall back to the coarse rule
   // that keeps whenever the latest content write was not the AI's. Conservative:
   // it errs toward keeping.
@@ -232,8 +233,9 @@ export function classifyKept(
     firstHuman = human.findIndex((h) => h);
     baseline = firstHuman <= 0 ? EMPTY_STATE : states[firstHuman - 1];
   }
-  // Live content the log cannot explain: an update aged out of edit_log (the
-  // 180-day sweep) after a person made it. Someone changed the note, so keep.
+  // Live content the log cannot explain: a change that left no edit_log row
+  // (tn history is no longer swept, issue #1057, so age is not the cause).
+  // Someone changed the note, so keep.
   // Content only: live position can drift unlogged (see POSITION).
   const live = contentOf(row);
   const last = states[states.length - 1];
