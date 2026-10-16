@@ -62,7 +62,7 @@ const dump = [row(UNLOCKED, 1), row(LOCKED, 1)];
 // the dump, then run the header's own survivor query. It must return the
 // number the header says to expect. Schema as in verify-number-split-repair.mjs.
 // `outside` rows sit in the table but not in the dump, as production does.
-function survivorsAfterApply(sql, outside = []) {
+function survivorsAfterApply(sql, outside = [], rowsInDump = dump) {
   const db = new DatabaseSync(":memory:");
   db.exec(`
 CREATE TABLE verses (
@@ -79,7 +79,7 @@ CREATE TABLE edit_log (
   const ins = db.prepare(
     `INSERT INTO verses (book,chapter,verse,bible_version,content_json,plain_text,version) VALUES (?,?,?,?,?,?,?)`,
   );
-  for (const r of [...dump, ...outside]) ins.run(r.book, r.chapter, r.verse, r.bible_version, r.content_json, r.plain_text, r.version);
+  for (const r of [...rowsInDump, ...outside]) ins.run(r.book, r.chapter, r.verse, r.bible_version, r.content_json, r.plain_text, r.version);
   db.exec(sql);
   const lines = sql.split(/\r?\n/);
   const start = lines.findIndex((l) => l.includes("SELECT book, bible_version, chapter, verse FROM verses"));
@@ -89,11 +89,11 @@ CREATE TABLE edit_log (
   return { got: db.prepare(query).all().length, expected };
 }
 
-function run(extraArgs, label) {
+function run(extraArgs, label, rowsInDump = dump) {
   const dir = mkdtempSync(join(tmpdir(), "number-split-985-"));
   const dumpPath = join(dir, "dump.json");
   const sqlPath = join(dir, "out.sql");
-  writeFileSync(dumpPath, JSON.stringify(dump), "utf8");
+  writeFileSync(dumpPath, JSON.stringify(rowsInDump), "utf8");
   try {
     try {
       execFileSync(
@@ -145,6 +145,26 @@ console.log(`\n--book ${UNLOCKED}: the ${LOCKED} row was not scanned, so it is n
   assert(sql.includes("Expect 0 survivors"), "header expects 0 survivors");
   const { got } = survivorsAfterApply(sql, outside);
   assert(got === 0, `after apply, the header's survivor query returns 0 (got ${got})`);
+}
+
+// Issue #1191: a row the transform calls `clean` (no tree defect) can still match
+// the survivor GLOB. "5, 1000" is the case: DETECT_RE requires (?!\d) after the
+// three digits so it is not a defect, but the GLOB has no such guard. The row
+// keeps matching after apply, so the header must count it as an expected survivor.
+console.log("\na clean row whose plain_text matches the GLOB (\"5, 1000\") is an expected survivor");
+{
+  const cleanRow = {
+    ...row(UNLOCKED, 1),
+    verse: 2,
+    content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "There were 5, 1000 men." }] }),
+    plain_text: "There were 5, 1000 men.",
+  };
+  const nullPlain = { ...cleanRow, verse: 3, plain_text: null };
+  const mixed = [row(UNLOCKED, 1), cleanRow, nullPlain, row(LOCKED, 1)];
+  const sql = run([], "clean-glob", mixed);
+  const { got, expected } = survivorsAfterApply(sql, outside, mixed);
+  assert(got === 2 && expected === 2, `header expects the locked row + the clean GLOB-only row (got ${got}, expected ${expected})`);
+  assert(sql.includes("no tree defect (GLOB-only match)"), "the clean row is listed under EXPECTED SURVIVORS with its reason");
 }
 
 console.log(`\nrepair-number-split-verses: all ${passed} assertions passed`);
