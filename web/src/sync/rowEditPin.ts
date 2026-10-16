@@ -24,10 +24,13 @@ export interface RowPin<F extends RowFields> {
   raw: Record<string, unknown>;
 }
 
-// What this row's last Save sent: the pin version it was typed against and the
-// display values of the fields it carried.
+// What this row's last Save sent: the pin version it was typed against, the
+// cached row's version at the click (the optimistic apply lands at that
+// version, which can be newer than the pin), and the display values of the
+// fields it carried.
 export interface RowSubmission {
   version: number;
+  rowVersion: number;
   shown: RowFields;
 }
 
@@ -56,6 +59,11 @@ export function rebaseRowPin<F extends RowFields>(args: {
 }): { pin: RowPin<F>; local: F } | null {
   const { pin, row, local, submitted, keys } = args;
   if (row.version === pin.version) return null;
+  // The cache at the click's version holds our own optimistic text (or, after
+  // a refusal, the server's values put back), not a server confirmation of
+  // it: "the row equals what is on screen" would be our echo. Wait for the
+  // next version.
+  if (submitted && row.version === submitted.rowVersion) return null;
   const sent = submitted && submitted.version === pin.version ? submitted.shown : null;
   const next = { ...local };
   for (const k of keys) {
@@ -93,7 +101,7 @@ export function rowPinBaseline<F extends RowFields>(
 }
 
 // True while this row's Save is on its way: the cache shows exactly the
-// submitted text at the pinned version (the optimistic apply). A 200 moves the
+// submitted text at the click's version (the optimistic apply). A 200 moves the
 // version (the pin follows); a refusal or discard puts the server's values back
 // in the cache (Shell's rollback), which reopens Save and Undo. Derived from
 // the cache rather than outbox events, so an unrelated outbox update can never
@@ -107,7 +115,7 @@ export function rowSaveInFlight<F extends RowFields>(args: {
 }): boolean {
   const { pin, row, local, submitted, keys } = args;
   if (!submitted || submitted.version !== pin.version) return false;
-  if (row.version !== pin.version) return false;
+  if (row.version !== submitted.rowVersion) return false;
   if (sameFields(local, pin.shown, keys)) return false;
   for (const k of Object.keys(submitted.shown)) {
     if (submitted.shown[k] !== local[k as keyof F]) return false;

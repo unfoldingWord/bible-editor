@@ -46,14 +46,14 @@ check(
 {
   const r = rebaseRowPin({
     pin: v1, row: pinOf(2, "mine", "r1"), local: { question: "mine", response: "r1" },
-    submitted: { version: 1, shown: { question: "mine" } }, keys,
+    submitted: { version: 1, rowVersion: 1, shown: { question: "mine" } }, keys,
   });
   check(r && r.pin.version === 2, "own save landed: re-pin");
 }
 {
   const r = rebaseRowPin({
     pin: v1, row: pinOf(2, "mine", "r1"), local: { question: "mine more", response: "r1" },
-    submitted: { version: 1, shown: { question: "mine" } }, keys,
+    submitted: { version: 1, rowVersion: 1, shown: { question: "mine" } }, keys,
   });
   check(
     r && r.pin.version === 2 && r.local.question === "mine more",
@@ -63,10 +63,33 @@ check(
 check(
   rebaseRowPin({
     pin: v1, row: pinOf(2, "mine", "r1"), local: { question: "mine more", response: "r1" },
-    submitted: { version: 0, shown: { question: "mine" } }, keys,
+    submitted: { version: 0, rowVersion: 0, shown: { question: "mine" } }, keys,
   }) === null,
   "a submission against an older pin does not count as ours",
 );
+
+// Found in the live test: the pin is v1, the cache moved to v2 (another
+// user's save of the same field), and Save applied our text optimistically at
+// v2. That echo must not re-pin us to v2, or a discard leaves the typing
+// looking saved and the next Save overwrites the other user's text.
+{
+  const sub = { version: 1, rowVersion: 2, shown: { question: "mine" } };
+  const echo = pinOf(2, "mine", "r1");
+  check(
+    rebaseRowPin({ pin: v1, row: echo, local: { question: "mine", response: "r1" }, submitted: sub, keys }) === null,
+    "our own optimistic echo at a newer cached version does not re-pin",
+  );
+  check(
+    rowSaveInFlight({ pin: v1, row: echo, local: { question: "mine", response: "r1" }, submitted: sub, keys }),
+    "and it counts as in flight (no duplicate Save)",
+  );
+  check(
+    rebaseRowPin({ pin: v1, row: pinOf(2, "theirs", "r1"), local: { question: "mine", response: "r1" }, submitted: null, keys }) === null,
+    "after a discard the pin stays at v1 (their text differs from ours and from v1)",
+  );
+  const afterUndo = rebaseRowPin({ pin: v1, row: pinOf(2, "theirs", "r1"), local: v1.shown, submitted: null, keys });
+  check(afterUndo && afterUndo.local.question === "theirs", "Undo then follows the server's newer text");
+}
 
 // Diff and baseline.
 {
@@ -78,7 +101,7 @@ check(
 
 // In-flight gate.
 {
-  const sub = { version: 1, shown: { question: "mine" } };
+  const sub = { version: 1, rowVersion: 1, shown: { question: "mine" } };
   const local = { question: "mine", response: "r1" };
   const optimistic = pinOf(1, "mine", "r1");
   check(rowSaveInFlight({ pin: v1, row: optimistic, local, submitted: sub, keys }), "the optimistic cache at the pinned version means the save is in flight");

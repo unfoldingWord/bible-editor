@@ -132,7 +132,7 @@ export function usePinnedRowEdit<R extends RowLike, F extends RowFields>(args: {
     const patch: Partial<F> = {};
     for (const k of opts?.only ?? keys) if (k in all) patch[k] = all[k];
     if (Object.keys(patch).length === 0) return;
-    setSubmitted({ version: pin.version, shown: patch as RowFields });
+    setSubmitted({ version: pin.version, rowVersion: row.version, shown: patch as RowFields });
     onSave(patch, {
       expectedVersion: pin.version,
       baseline: rowPinBaseline(pin, patch),
@@ -143,9 +143,11 @@ export function usePinnedRowEdit<R extends RowLike, F extends RowFields>(args: {
   };
 
   // Discard unsaved typing: back to the server text the pin holds. The draft
-  // effect clears the draft once nothing differs.
+  // effect clears the draft once nothing differs. Forgetting the submission
+  // lets a pin older than the cached row follow it on the next render.
   const undo = () => {
     if (saving) return;
+    setSubmitted(null);
     setLocal(pin.shown);
   };
 
