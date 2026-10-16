@@ -10,6 +10,9 @@
 // HOS 8 report from Beth Oakes).
 
 import { DatabaseSync } from "node:sqlite";
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   lanesToReopenOnVerseEdit,
   lanesForAdoption,
@@ -252,6 +255,97 @@ console.log("\n[#686 item 3: reopenLaneChecks / reopenLaneChecksBulk leave an ed
     );
     eq(sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log`).all()[0].n, 60, "all 60 reopens are audited");
   }
+
+  // #1205: a content change to a RANGE row (UST 6-9) must reopen every verse the
+  // row covers, not just its first. Real SQLite with every real migration.
+  console.log("  #1205: a range row's reopen clears every covered verse (real migrations)");
+  {
+    const realDb = () => {
+      const d = new DatabaseSync(":memory:");
+      const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+      for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+        d.exec(readFileSync(join(dir, f), "utf8"));
+      }
+      return d;
+    };
+    const seed = (d) => {
+      const ins = d.prepare(
+        `INSERT INTO verse_lane_checks (book, chapter, verse, lane, checked_by, checked_at) VALUES (?, ?, ?, ?, ?, 100)`,
+      );
+      for (const v of [5, 6, 7, 8, 9, 10]) {
+        ins.run(BOOK, 3, v, "text", 42);
+        ins.run(BOOK, 3, v, "text", 43); // a second checker on the same verse
+      }
+      ins.run(BOOK, 3, 7, "tn", 42); // a lane this reopen does not target
+      ins.run(BOOK, 4, 7, "text", 42); // another chapter
+    };
+    const left = (d, chapter, lane = "text") =>
+      d
+        .prepare(`SELECT DISTINCT verse FROM verse_lane_checks WHERE book = ? AND chapter = ? AND lane = ? ORDER BY verse`)
+        .all(BOOK, chapter, lane)
+        .map((r) => r.verse);
+
+    const d1 = realDb();
+    seed(d1);
+    await reopenLaneChecks({ DB: makeDb(d1) }, BOOK, 3, 6, ["text"], false, undefined, 9);
+    eq(left(d1, 3), [5, 10], "6-9 range row: Text checks on 6, 7, 8, 9 are gone; 5 and 10 stay");
+    eq(left(d1, 3, "tn"), [7], "6-9 range row: a lane the reopen does not target (tn) is untouched");
+    eq(left(d1, 4), [7], "6-9 range row: the same verses in another chapter are untouched");
+    const log1 = d1.prepare(`SELECT row_key, payload_json FROM edit_log WHERE source = 'lane_reopen'`).all();
+    eq(log1.length, 1, "6-9 range row: one audit row");
+    eq(log1[0].row_key, `${BOOK}/3/6`, "6-9 range row: audit row_key names the row's first verse");
+    eq(JSON.parse(log1[0].payload_json).verse_end, 9, "6-9 range row: audit payload records verse_end");
+
+    const d2 = realDb();
+    seed(d2);
+    await reopenLaneChecks({ DB: makeDb(d2) }, BOOK, 3, 6, ["text"], false);
+    eq(left(d2, 3), [5, 7, 8, 9, 10], "single-verse call (no verseEnd): only verse 6 reopens, exactly as before");
+    const log2 = d2.prepare(`SELECT payload_json FROM edit_log WHERE source = 'lane_reopen'`).all();
+    eq("verse_end" in JSON.parse(log2[0].payload_json), false, "single-verse call: audit payload unchanged (no verse_end)");
+
+    const d3 = realDb();
+    seed(d3);
+    await reopenLaneChecks({ DB: makeDb(d3) }, BOOK, 3, 6, ["text"], false, undefined, null);
+    eq(left(d3, 3), [5, 7, 8, 9, 10], "verse_end NULL behaves as a single verse");
+    const d4 = realDb();
+    seed(d4);
+    await reopenLaneChecks({ DB: makeDb(d4) }, BOOK, 3, 6, ["text"], false, undefined, 6);
+    eq(left(d4, 3), [5, 7, 8, 9, 10], "verse_end equal to verse behaves as a single verse");
+
+    const d5 = realDb();
+    seed(d5);
+    await reopenLaneChecksBulk(
+      { DB: makeDb(d5) },
+      BOOK,
+      [
+        { chapter: 3, verse: 6, verseEnd: 9, lanes: ["text"] },
+        { chapter: 4, verse: 7, lanes: ["text"] },
+      ],
+      false,
+    );
+    eq(left(d5, 3), [5, 10], "bulk: a 6-9 range entry clears 6, 7, 8, 9 and leaves 5 and 10");
+    eq(left(d5, 4), [], "bulk: a plain entry still clears just its own verse");
+
+    // Broadcasts: one lane_check.updated per covered verse.
+    const d6 = realDb();
+    seed(d6);
+    const sent = [];
+    const room = {
+      idFromName: (n) => n,
+      get: () => ({
+        fetch: async (req) => {
+          sent.push(JSON.parse(await req.text()));
+          return new Response("ok");
+        },
+      }),
+    };
+    await reopenLaneChecks({ DB: makeDb(d6), CHAPTER_ROOM: room }, BOOK, 3, 6, ["text"], true, undefined, 9);
+    eq(
+      sent.map((m) => m.check?.verse).sort(),
+      [6, 7, 8, 9],
+      "range reopen broadcasts an empty-checker lane_check.updated for each covered verse",
+    );
+  }
 }
 
 console.log("\n[#686 item 3 (remainder): verse_statuses.updated_by, migration 0070]");
@@ -464,6 +558,16 @@ console.log("\n[#931] a verse save's lane reopen DELETE finishes BEFORE the save
     callSites.every((idx) => argsAt(versesTs, idx + "reopenLaneChecks".length).includes("executionCtx.waitUntil")),
     true,
     "[source] every reopenLaneChecks call in verses.ts hands its broadcasts to executionCtx.waitUntil",
+  );
+  // #1205: the PATCH, bridge and split routes act on a range row, so each
+  // passes the row's end (the 8th argument) and a lane reopen spans the range.
+  eq(
+    callSites.every((idx) => {
+      const args = argsAt(versesTs, idx + "reopenLaneChecks".length);
+      return /updated\.verse_end|bridgeEnd/.test(args);
+    }),
+    true,
+    "[source] every reopenLaneChecks call in verses.ts passes the row's verse_end (#1205)",
   );
   // The verse.updated / verse.bridged / verse.split broadcast is scheduled
   // only AFTER the awaited reopen in its route, so another tab reacting to it
