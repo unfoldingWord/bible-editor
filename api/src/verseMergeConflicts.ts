@@ -1151,15 +1151,25 @@ export async function raiseVerseMergeConflictAlert(
 
   try {
     // Each recipient's latest standing alert: the lock refresh's dismissed
-    // check (#1129) and the push carry-forward (#1127) both read it.
-    const standing = await env.DB.prepare(
-      `SELECT username, condition_key, dismissed_at FROM system_alerts
-        WHERE source = ?1 AND resolved_at IS NULL ORDER BY id DESC`,
-    )
-      .bind(source)
-      .all<{ username: string; condition_key: string | null; dismissed_at: number | null }>();
+    // check (#1129) and the push carry-forward (#1127) both read it. An
+    // ordinary raise only needs it to carry a push forward, so a failed read
+    // there costs at most one repeat pop-up, not the whole raise (#1127
+    // review); the lock refresh and the push note still need it and stop.
+    let standingRows: { username: string; condition_key: string | null; dismissed_at: number | null }[] = [];
+    try {
+      const standing = await env.DB.prepare(
+        `SELECT username, condition_key, dismissed_at FROM system_alerts
+          WHERE source = ?1 AND resolved_at IS NULL ORDER BY id DESC`,
+      )
+        .bind(source)
+        .all<{ username: string; condition_key: string | null; dismissed_at: number | null }>();
+      standingRows = standing.results ?? [];
+    } catch (e) {
+      if (opts.lockRefresh || opts.notePush) throw e;
+      console.warn(`verse merge alert: standing read failed, raising without push carry-forward: ${String(e)}`);
+    }
     const latest = new Map<string, { condition_key: string | null; dismissed_at: number | null }>();
-    for (const r of standing.results ?? []) if (!latest.has(r.username)) latest.set(r.username, r);
+    for (const r of standingRows) if (!latest.has(r.username)) latest.set(r.username, r);
 
     // #1127: the push each recipient's alert carries. With `notePush`, the new
     // push wherever the locked wording is in use. Otherwise the push stored in

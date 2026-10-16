@@ -771,8 +771,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             // The note's observation token, persisted in its own step the way
             // runChunkedReimport persists its own: a replay returns the same
             // value, and it is taken after this run's reimport raised (so it
-            // is not dropped as older than that raise). A later run's reimport
-            // takes its own token later still, so it is never shadowed.
+            // is not dropped as older than that raise). A run that starts
+            // later takes a later token. One narrow race remains: a nightly
+            // reimport of the same book that took its token before this step
+            // and raises after it has that raise dropped as older.
             const noteObservedAt = await step.do(`${stepName}-lock-push-observed`, async () => Date.now());
             await step.do(`${stepName}-lock-push-alert`, async () => {
               await noteLockedPushOnVerseMergeAlert(this.env, book, resource, landed, noteObservedAt);
