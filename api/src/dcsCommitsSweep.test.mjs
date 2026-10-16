@@ -156,6 +156,25 @@ console.log("\n[a stalled-boundary repo whose old rows age out is no longer read
   );
 }
 
+console.log("\n[issue #1200: a repo with an open gap keeps its rows until the gap clears]");
+{
+  // The gap backfill follows the parent lists stored on rows it already
+  // fetched (dcsCommitBackfill.ts CONVERGENCE). Backfilled history is old on
+  // both clocks, so without this exemption the hourly sweep deleted it within
+  // the hour and the walk fetched the same commits again.
+  const d = freshDb();
+  d.prepare(`INSERT INTO dcs_repo_polls (repo, gap_since_sha, gap_frontier_json) VALUES ('en_tn', 'far', '["x"]')`).run();
+  pollRow(d, { repo: "en_ult" });
+  commitRow(d, { repo: "en_tn", sha: "tn_old", committedAt: 1000, seenAt: 1000 });
+  commitRow(d, { repo: "en_ult", sha: "ult_old", committedAt: 1000, seenAt: 1000 });
+  commitRow(d, { repo: "en_tq", sha: "tq_old", committedAt: 1000, seenAt: 1000 });
+  sweep(d, 5000);
+  assert(survivingShas(d).join(",") === "tn_old", "only the gapped repo's old row survives; repos with no gap (or no poll row) sweep as before");
+  d.prepare(`UPDATE dcs_repo_polls SET gap_since_sha = NULL, gap_frontier_json = NULL WHERE repo = 'en_tn'`).run();
+  sweep(d, 5000);
+  assert(survivingShas(d).length === 0, "  ...and once the gap clears, the next sweep removes it");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

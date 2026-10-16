@@ -589,6 +589,98 @@ async function main() {
       assert(f.parent_shas_json === '["P"]', "  ...recording F's parents on the existing row so the next walk can follow them locally");
       const p = d.prepare(`SELECT parent_shas_json FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'P'`).get();
       assert(p.parent_shas_json === "[]", "  ...and a newly inserted root records an explicit empty parent list");
+      const fRow = d
+        .prepare(
+          `SELECT parent_sha, author_name, author_email, committed_at, message, classification,
+                  classification_reason, files_json, seen_at
+             FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'F'`,
+        )
+        .get();
+      assert(
+        fRow.seen_at === NOW - 999 &&
+          fRow.committed_at === NOW - 999 &&
+          fRow.classification === "human" &&
+          fRow.classification_reason === null &&
+          fRow.files_json === "[]" &&
+          fRow.parent_sha === null &&
+          fRow.author_name === null &&
+          fRow.author_email === null &&
+          fRow.message === null,
+        "  ...and the refetch changes nothing else on the existing row (seen_at, classification, dates, files, author, message)",
+      );
+    }
+
+    // A stored parent list that is not a well-formed JSON array of text shas
+    // is replaced by the next fetch, so the sha is not re-walked forever.
+    for (const bad of ['["P", 5]', '["P"', '{"a":1}']) {
+      const d = fresh();
+      d.prepare(
+        `INSERT INTO dcs_commits (repo, sha, committed_at, classification, seen_at, parent_shas_json) VALUES ('en_tn', 'F', 1, 'human', 1, ?)`,
+      ).run(bad);
+      openGap(d, ["F"]);
+      countingFetch([[commit("F", "hand fix", "h@x", { parent: "P" }), commit("P", "older", "h@x")]]);
+      await backfillDcsRepoGap(sqliteEnv(d), "en_tn", NOW);
+      const f = d.prepare(`SELECT parent_shas_json, seen_at FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'F'`).get();
+      assert(
+        f.parent_shas_json === '["P"]' && f.seen_at === 1,
+        `#1200: a malformed stored parent list (${bad}) is overwritten by the fetched one, nothing else changes`,
+      );
+    }
+
+    // A well-formed stored list is never overwritten.
+    {
+      const d = fresh();
+      ledgerRow(d, "F", ["P"]);
+      const env = sqliteEnv(d);
+      await env.DB.batch([
+        env.DB.prepare(INSERT_COMMIT_SQL).bind("en_tn", "F", "Q", null, null, 1, null, "human", null, "[]", 1, '["Q"]'),
+      ]);
+      const f = d.prepare(`SELECT parent_shas_json FROM dcs_commits WHERE repo = 'en_tn' AND sha = 'F'`).get();
+      assert(f.parent_shas_json === '["P"]', "#1200: a well-formed stored parent list is left as it is");
+    }
+
+    // If the expansion query fails (a D1 timeout or limit as the stored trail
+    // grows), the tick falls back to the old walk of one raw entry instead of
+    // making no progress, and never clears the gap on that path.
+    {
+      const failingExpansion = (d) => {
+        const env = sqliteEnv(d);
+        const prepare = env.DB.prepare;
+        env.DB.prepare = (sql) =>
+          sql.includes("WITH RECURSIVE")
+            ? {
+                bind: () => ({
+                  all: async () => {
+                    throw new Error("D1_ERROR: query exceeded limit");
+                  },
+                }),
+              }
+            : prepare(sql);
+        return env;
+      };
+      const d = fresh();
+      openGap(d, ["A", "A", "B"]);
+      const seen = [];
+      globalThis.fetch = async (url) => {
+        seen.push(new URL(url).searchParams.get("sha"));
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (k) => (k.toLowerCase() === "x-hasmore" ? "false" : null) },
+          json: async () => [commit("A", "genesis", "h@x")],
+        };
+      };
+      const res = await backfillDcsRepoGap(failingExpansion(d), "en_tn", NOW);
+      assert(seen.length === 1 && seen[0] === "A", "#1200: a failed expansion still walks one entry the old way");
+      assert(res.status === "expansion_failed" && res.resolved === false, "  ...and reports the failure, not a resolution");
+      const row = gapRow(d);
+      assert(row.gap_since_sha === FAR && JSON.parse(row.gap_frontier_json).join(",") === "B", "  ...advancing the frontier past the walked entry");
+
+      // The same path with nothing left afterwards still does not clear.
+      const d2 = fresh();
+      openGap(d2, ["A"]);
+      const res2 = await backfillDcsRepoGap(failingExpansion(d2), "en_tn", NOW);
+      assert(res2.resolved === false && gapRow(d2).gap_since_sha === FAR, "  ...and never clears the gap on that path, even when the walk empties the frontier");
     }
 
     // Expansion stops at a held row with unknown parents (P) and at a held row
