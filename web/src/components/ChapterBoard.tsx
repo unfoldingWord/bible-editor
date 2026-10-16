@@ -125,7 +125,8 @@ export function ChapterBoard({
       const lane = tile.lanes.find((l) => l.lane === laneKind);
       if (!lane || !lane.applicable) continue;
       applicable += 1;
-      if (lane.shade !== "open") done += 1;
+      // A waiting mark (#1218) has not reached the server, so it is not done yet.
+      if (lane.shade !== "open" && lane.shade !== "waiting") done += 1;
     }
     const percent = applicable === 0 ? 0 : Math.round((done / applicable) * 100);
     return { lane: laneKind, applicable, done, percent };

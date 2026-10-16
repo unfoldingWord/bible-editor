@@ -204,3 +204,26 @@ export function laneChecksToKeepBehind<T extends PickOp>(requeued: PickOp, all: 
     )
     .sort(drainOrder);
 }
+
+// #1218: a refused verse op stays in the outbox until the user retries or
+// discards it, and while it does it holds the same-verse lane checks queued
+// behind it (laneCheckHeld). When a NEWER save of the same target (same verse
+// and bibleVersion) lands, that save carried the verse's whole content, so
+// the older refused op is superseded: retrying it would only put its older
+// text back. These are the refused ops the caller drops once `landed` lands,
+// so the held checks can dispatch. Only refused (fatal) ops queued before the
+// landed one: an op that will retry on its own blocks its target, so no
+// younger save passes it, and a pending or conflicted sibling still has a
+// save to make.
+export function refusedVerseOpsSupersededBy<T extends PickOp>(landed: PickOp, all: T[]): T[] {
+  if (landed.target.kind !== "verse") return [];
+  const key = targetKey(landed.target);
+  return all.filter(
+    (o) =>
+      o.target.kind === "verse" &&
+      targetKey(o.target) === key &&
+      o.status === "failed" &&
+      !willRetryOnItsOwn(o.lastError) &&
+      drainOrder(o, landed) < 0,
+  );
+}
