@@ -127,9 +127,14 @@ export interface BackfillResult {
 // FLIGHT LOCK note). Binding the exact frontier this walk started from turns
 // that race into a no-op clear instead: the CAS fails, the gap survives with
 // whatever the concurrent write left it, and the next tick picks it up.
+// `IS`, not `=` (issue #1193): a gap opened before migration 0062 added the
+// column has a NULL frontier, and `NULL = NULL` never matches, so that gap
+// took the no_frontier path every tick, reported itself resolved, and stayed
+// open forever (en_ust in production since 2026-09-01). `IS` is SQLite's
+// null-safe equality and is the same as `=` for any non-NULL value.
 const CLEAR_GAP_SQL = `UPDATE dcs_repo_polls
    SET gap_since_sha = NULL, gap_frontier_json = NULL, gap_at = NULL
- WHERE repo = ?1 AND gap_since_sha = ?2 AND gap_frontier_json = ?3`;
+ WHERE repo = ?1 AND gap_since_sha = ?2 AND gap_frontier_json IS ?3`;
 
 // Replaces ONLY gap_frontier_json, and only while it is still the exact
 // value this walk started from — the same "don't clobber a concurrent
