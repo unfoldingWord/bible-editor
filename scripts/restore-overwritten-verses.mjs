@@ -39,8 +39,11 @@ import { createRequire } from "node:module";
 import path from "node:path";
 
 function wranglerEntry() {
+  // wrangler 4.13x's `exports` map no longer resolves the `bin/wrangler.js`
+  // subpath directly (see tests/concurrency/s9-verse-pin-release.spec.ts) —
+  // resolve `wrangler/package.json` instead and derive the bin path from it.
   const req = createRequire(path.join(API_DIR, "package.json"));
-  return req.resolve("wrangler/bin/wrangler.js");
+  return path.join(path.dirname(req.resolve("wrangler/package.json")), "bin", "wrangler.js");
 }
 
 const args = process.argv.slice(2);

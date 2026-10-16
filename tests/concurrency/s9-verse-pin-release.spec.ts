@@ -35,8 +35,19 @@ const apiDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../api");
 // Invoking `node <wrangler.js>` directly needs neither a shell nor a
 // platform-specific executable name, so the `--command` string reaches
 // wrangler as a single untouched argv entry on every platform.
-const wranglerBin = createRequire(resolve(apiDir, "package.json")).resolve(
-  "wrangler/bin/wrangler.js",
+//
+// As of wrangler 4.13x, `wrangler/package.json`'s `exports` map only lists
+// ".", "./experimental-config" and "./package.json" — `bin/wrangler.js` is
+// still shipped on disk (it's wrangler's own `bin.wrangler` target) but is no
+// longer a resolvable subpath, so `require.resolve("wrangler/bin/wrangler.js")`
+// now throws "Package subpath './bin/wrangler.js' is not defined by exports".
+// Resolve the one subpath that *is* exported (`wrangler/package.json`) and
+// derive the bin path from its directory instead.
+const wranglerBin = resolve(
+  dirname(
+    createRequire(resolve(apiDir, "package.json")).resolve("wrangler/package.json"),
+  ),
+  "bin/wrangler.js",
 );
 
 // Seed / clear a chapter-locking pipeline_jobs row directly in the LOCAL D1

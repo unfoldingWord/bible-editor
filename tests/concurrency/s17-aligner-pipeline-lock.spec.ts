@@ -24,8 +24,16 @@ import { csrfToken, newUserContext } from "./helpers";
 //      (positive control for check 1), then Reset discards it unsaved.
 
 const apiDir = resolve(dirname(fileURLToPath(import.meta.url)), "../../api");
-const wranglerBin = createRequire(resolve(apiDir, "package.json")).resolve(
-  "wrangler/bin/wrangler.js",
+
+// As of wrangler 4.13x, `wrangler/package.json`'s `exports` map no longer
+// resolves the `wrangler/bin/wrangler.js` subpath directly (see s9's longer
+// comment on the same lookup) — resolve `wrangler/package.json` instead and
+// derive the bin path from its directory.
+const wranglerBin = resolve(
+  dirname(
+    createRequire(resolve(apiDir, "package.json")).resolve("wrangler/package.json"),
+  ),
+  "bin/wrangler.js",
 );
 
 // Seed / clear a chapter-locking pipeline_jobs row in the LOCAL D1 file
