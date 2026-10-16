@@ -418,6 +418,17 @@ Highlights that bite repeatedly:
   also take Save off every unsaved-changes gate and auto-save path. Saving then
   commits locally and the refused PATCH is dropped, so the work is lost.
 
+- **A row editor that diffs against the cached row calls a refused save "saved".** Shell's
+  `enqueueRow` writes the patch into the cached row at an UNCHANGED version before the PATCH
+  is answered, so a refusal (chapter_locked drops the op; a drawer discard deletes it) leaves
+  the refused text in the cache looking saved. Pin the dirty baseline to `row.version`
+  (NoteCard's `savedRef`; tq/twl via `web/src/sync/rowEditBaseline.ts` since #1115), carry
+  that baseline in the draft so a remount over the polluted cache stays unsaved, and let a
+  same-version cache change reach only a clean row. Undo must also put the baseline back
+  into the cache (`applyLocalRowPatch`), or the next remount reads the refused text as saved.
+  Live-test refusals with Playwright `page.route` on the PATCH; `page.unroute` only removes
+  a route registered with the same predicate reference.
+
 - **A Playwright test can land a pipeline (chapter) lock live without waiting minutes.**
   The tab only re-reads pipeline jobs on a 120 s poll or a refocus throttled to 60 s
   (`pipelineStore.ts`). Call `page.clock.install()` before the page loads, then

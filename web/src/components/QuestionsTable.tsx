@@ -5,8 +5,16 @@ import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
+import UndoIcon from "@mui/icons-material/Undo";
 import type { TqRow } from "../sync/api";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
+import {
+  baselineFromDraft,
+  rebaseRowBaseline,
+  rowFieldDiff,
+  shouldSyncFromRow,
+  type RowBaseline,
+} from "../sync/rowEditBaseline";
 import { buildFindRegex, nthMatchRange, type QuestionField } from "../lib/questionFind";
 import { TQ_HISTORY_FIELDS, type RowSnapshot } from "./rowHistoryFields";
 
@@ -25,6 +33,9 @@ interface Props {
     opts?: { restoredFromVersion?: number },
   ) => void;
   onDelete: (id: string) => void;
+  // Put the last saved values back into the cached row (no PATCH). Undo uses
+  // it: a save the server refused left its text in the cache (#1115).
+  onRevert?: (id: string, patch: Partial<TqRow>) => void;
   // When true, rows render read-only and the delete button is hidden. Used
   // while an AI pipeline is mid-flight for the chapter — the auto-apply step
   // will overwrite TQs anyway.
@@ -44,10 +55,18 @@ interface Props {
   activeMatch?: ActiveMatch | null;
 }
 
+// The fields a question row edits, as its inputs show them (null as "").
+type TqFields = { ref_raw: string; question: string; response: string };
+const tqFields = (row: TqRow): TqFields => ({
+  ref_raw: row.ref_raw ?? "",
+  question: row.question ?? "",
+  response: row.response ?? "",
+});
+
 type FindQuery = { find: string; regex: boolean; caseSensitive: boolean };
 type ActiveMatch = { rowId: string; field: QuestionField; occurrence: number };
 
-function QuestionsTableInner({ rows, onSave, onDelete, locked = false, activeId = null, onFocus, findQuery = null, activeMatch = null }: Props) {
+function QuestionsTableInner({ rows, onSave, onDelete, onRevert, locked = false, activeId = null, onFocus, findQuery = null, activeMatch = null }: Props) {
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
@@ -83,6 +102,7 @@ function QuestionsTableInner({ rows, onSave, onDelete, locked = false, activeId 
         <span />
         <span />
         <span />
+        <span />
       </Box>
       {rows.map((r) => (
         <Row
@@ -90,6 +110,7 @@ function QuestionsTableInner({ rows, onSave, onDelete, locked = false, activeId 
           row={r}
           onSave={(p, opts) => onSave(r.id, p, opts)}
           onDelete={() => onDelete(r.id)}
+          onRevert={onRevert ? (p) => onRevert(r.id, p) : undefined}
           locked={locked}
           active={r.id === activeId}
           onFocus={onFocus ? () => onFocus(r) : undefined}
@@ -119,21 +140,21 @@ export const QuestionsTable = memo(
 const NARROW_BP_PX = 460;
 
 // Wide: ref lane (ranges like "1:1-3" fit), question + response share the rest,
-// then the version chip and two action cells. Narrow (container ≤
-// NARROW_BP_PX): ref shares the top row with the chip and action buttons; the
-// text fields drop to full-width rows beneath.
+// then the version chip and three action cells (undo, save, delete). Narrow
+// (container ≤ NARROW_BP_PX): ref shares the top row with the chip and action
+// buttons; the text fields drop to full-width rows beneath.
 const responsiveGridSx = {
   display: "grid",
   gap: 1,
   alignItems: "center",
-  gridTemplateColumns: "80px 1fr 1fr 46px 28px 28px",
-  gridTemplateAreas: '"ref question response ver save delete"',
+  gridTemplateColumns: "80px 1fr 1fr 46px 28px 28px 28px",
+  gridTemplateAreas: '"ref question response ver undo save delete"',
   [`@container (max-width: ${NARROW_BP_PX}px)`]: {
-    gridTemplateColumns: "1fr 46px 28px 28px",
+    gridTemplateColumns: "1fr 46px 28px 28px 28px",
     gridTemplateAreas: [
-      '"ref ver save delete"',
-      '"question question question question"',
-      '"response response response response"',
+      '"ref ver undo save delete"',
+      '"question question question question question"',
+      '"response response response response response"',
     ].join(" "),
     rowGap: 0.5,
   },
@@ -143,6 +164,7 @@ const Row = memo(function Row({
   row,
   onSave,
   onDelete,
+  onRevert,
   locked,
   active = false,
   onFocus,
@@ -152,6 +174,7 @@ const Row = memo(function Row({
   row: TqRow;
   onSave: (patch: Partial<TqRow>, opts?: { restoredFromVersion?: number }) => void;
   onDelete: () => void;
+  onRevert?: (patch: Partial<TqRow>) => void;
   locked: boolean;
   active?: boolean;
   onFocus?: () => void;
@@ -162,6 +185,17 @@ const Row = memo(function Row({
   const [question, setQuestion] = useState(row.question ?? "");
   const [response, setResponse] = useState(row.response ?? "");
   const [historyOpen, setHistoryOpen] = useState(false);
+
+  // #1115: the last server-confirmed values, pinned to row.version (see
+  // rowEditBaseline.ts). Shell's optimistic apply puts our saved text into the
+  // cached row at the SAME version, so a save the server refuses or the user
+  // discards would read as saved if we diffed against `row`. Rebased during
+  // render, like NoteCard's savedRef: the diff below reads it in this render.
+  const baselineRef = useRef<RowBaseline<TqFields> | null>(null);
+  baselineRef.current = rebaseRowBaseline(baselineRef.current, tqFields(row), row.version);
+  const base = baselineRef.current.fields;
+  const rowVersionRef = useRef(row.version);
+  rowVersionRef.current = row.version;
 
   // Find highlight: the active match's field renders as a read-only block with
   // the Nth match marked, until the user clicks into it (editingField). A new
@@ -186,7 +220,7 @@ const Row = memo(function Row({
   // Not while the field holds unsaved text: the match index was computed on
   // the saved text, so the mark could land on the wrong occurrence.
   const fieldDirty = (f: QuestionField) =>
-    (f === "question" ? question : response) !== (row[f] ?? "");
+    (f === "question" ? question : response) !== base[f];
   const readField: QuestionField | null =
     activeMatch && findRe && editingField !== activeMatch.field && !fieldDirty(activeMatch.field)
       ? activeMatch.field
@@ -199,50 +233,80 @@ const Row = memo(function Row({
   // the `verse` column from ref_raw (api/src/rows.ts), so persisting a
   // half-typed "1:" would relocate the row to verse 0.
   const pendingRefRef = useRef<string | null>(null);
+
+  const diff: Partial<TqRow> = rowFieldDiff({ ref_raw: refRaw, question, response }, base);
+  const isDirty = Object.keys(diff).length > 0;
+  // Read by the resync effect below, which runs after this render.
+  const dirtyRef = useRef(isDirty);
+  dirtyRef.current = isDirty;
+
+  // Resync from the cached row. A new version always resyncs (a 200, a
+  // restore, a WS upsert, an AI apply). A same-version change (a find/replace
+  // applied optimistically, a refetch carrying the server's text back over a
+  // refused save) only reaches a row with no unsaved typing (#1115).
+  const syncedVersionRef = useRef<number | null>(null);
   useEffect(() => {
+    const versionMoved = syncedVersionRef.current !== row.version;
+    syncedVersionRef.current = row.version;
+    if (!shouldSyncFromRow({ versionMoved, dirty: dirtyRef.current })) return;
     if (pendingRefRef.current != null) {
-      setRefRaw(pendingRefRef.current);
-      pendingRefRef.current = null;
-      return;
+      if (versionMoved) {
+        setRefRaw(pendingRefRef.current);
+        pendingRefRef.current = null;
+      }
+    } else {
+      setRefRaw(row.ref_raw ?? "");
     }
-    setRefRaw(row.ref_raw ?? "");
-  }, [row.id, row.version, row.ref_raw]);
-  useEffect(() => setQuestion(row.question ?? ""), [row.id, row.version, row.question]);
-  useEffect(() => setResponse(row.response ?? ""), [row.id, row.version, row.response]);
+    setQuestion(row.question ?? "");
+    setResponse(row.response ?? "");
+  }, [row.id, row.version, row.ref_raw, row.question, row.response]);
 
   const draftKey = useMemo(() => rowKey("tq", row.book, row.id), [row.book, row.id]);
 
   // Hydrate from any persisted draft on first mount so unsaved typing
-  // survives navigation. Subsequent server pushes are caught by the
-  // useEffects above (which only run when row.version changes).
+  // survives navigation. The draft also carries the baseline it was diffed
+  // against: a remount over a cache still holding a refused save's text
+  // would otherwise take that text as the saved state (#1115). `hydrated` is
+  // state so the restored baseline reaches the screen even when the typed
+  // text equals what the fields already show, and so the draft-write effect
+  // cannot clear the draft before it has been read (NoteCard does the same).
+  const [hydrated, setHydrated] = useState(false);
   const hydratedFromDraftRef = useRef(false);
   useEffect(() => {
     if (hydratedFromDraftRef.current) return;
-    void drafts.get(draftKey).then((rec) => {
-      if (hydratedFromDraftRef.current) return;
-      hydratedFromDraftRef.current = true;
-      const patch = (rec?.payload as { patch?: Partial<TqRow> } | undefined)?.patch;
-      if (!patch) return;
-      if (typeof patch.ref_raw === "string") setRefRaw(patch.ref_raw);
-      if (typeof patch.question === "string") setQuestion(patch.question);
-      if (typeof patch.response === "string") setResponse(patch.response);
-    });
+    drafts.get(draftKey).then(
+      (rec) => {
+        if (hydratedFromDraftRef.current) return;
+        hydratedFromDraftRef.current = true;
+        const restored = baselineFromDraft<TqFields>(rec?.payload, rec?.expectedVersion, rowVersionRef.current);
+        if (restored) baselineRef.current = restored;
+        const patch = (rec?.payload as { patch?: Partial<TqRow> } | undefined)?.patch;
+        if (patch) {
+          if (typeof patch.ref_raw === "string") setRefRaw(patch.ref_raw);
+          if (typeof patch.question === "string") setQuestion(patch.question);
+          if (typeof patch.response === "string") setResponse(patch.response);
+        }
+        setHydrated(true);
+      },
+      () => {
+        // A failed read restores nothing; the row falls back to the cache.
+        if (hydratedFromDraftRef.current) return;
+        hydratedFromDraftRef.current = true;
+        setHydrated(true);
+      },
+    );
   }, [draftKey]);
-  const diff = useMemo<Partial<TqRow>>(() => {
-    const out: Partial<TqRow> = {};
-    if (refRaw !== (row.ref_raw ?? "")) out.ref_raw = refRaw;
-    if (question !== (row.question ?? "")) out.question = question;
-    if (response !== (row.response ?? "")) out.response = response;
-    return out;
-  }, [refRaw, question, response, row.ref_raw, row.question, row.response]);
-  const isDirty = Object.keys(diff).length > 0;
 
   // Sync the draft store as the source of crash-recovery truth. Cleared
   // when the user edits back to server state (so the orange border vanishes).
+  // Keyed on the typed values, not the cached row: the optimistic apply of a
+  // save must not mint a new draft generation, or the save's 200 would leave
+  // the draft behind (drafts.rowSaveGeneration).
   useEffect(() => {
     if (locked) return;
     if (isDirty) {
-      void drafts.set(draftKey, { patch: diff }, row.version, {
+      const b = baselineRef.current!;
+      void drafts.set(draftKey, { patch: diff, baseline: b.fields }, b.version, {
         kind: "row",
         rowKind: "tq",
         id: row.id,
@@ -250,14 +314,27 @@ const Row = memo(function Row({
         chapter: row.chapter,
         verse: row.verse,
       });
-    } else {
+    } else if (hydrated) {
       void drafts.clear(draftKey);
     }
-  }, [draftKey, isDirty, diff, row.version, row.id, row.book, row.chapter, row.verse, locked]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftKey, isDirty, refRaw, question, response, row.version, row.id, row.book, row.chapter, row.verse, locked, hydrated]);
 
   const handleSave = () => {
     if (!isDirty) return;
     onSave(diff);
+  };
+
+  // Discard unsaved typing: back to the last saved values, on screen and in
+  // the cached row (a refused save left its text there), and drop the draft.
+  const handleUndo = () => {
+    pendingRefRef.current = null;
+    setRefRaw(base.ref_raw);
+    setQuestion(base.question);
+    setResponse(base.response);
+    void drafts.clear(draftKey);
+    const revert = rowFieldDiff(base, tqFields(row));
+    if (Object.keys(revert).length > 0) onRevert?.(revert);
   };
 
   const effectiveVersion = row.restored_from_version ?? row.version;
@@ -273,14 +350,14 @@ const Row = memo(function Row({
     setQuestion(rawQuestion);
     setResponse(rawResponse);
     const patch: Partial<TqRow> = {};
-    if (rawQuestion !== (row.question ?? "")) patch.question = rawQuestion;
-    if (rawResponse !== (row.response ?? "")) patch.response = rawResponse;
+    if (rawQuestion !== base.question) patch.question = rawQuestion;
+    if (rawResponse !== base.response) patch.response = rawResponse;
     if (Object.keys(patch).length === 0) return;
     // ref_raw isn't part of the history snapshot, so the version bump this
     // PATCH triggers would resync it from the server and silently drop an
     // unsaved ref edit. Hold it across the bump so it stays as the user left
     // it — unsaved, still dirty — rather than being clobbered or written.
-    if (refRaw !== (row.ref_raw ?? "")) pendingRefRef.current = refRaw;
+    if (refRaw !== base.ref_raw) pendingRefRef.current = refRaw;
     onSave(patch, { restoredFromVersion: fromVersion });
   };
 
@@ -441,6 +518,22 @@ const Row = memo(function Row({
           />
         </Suspense>
       )}
+      {/* Shown whenever the row is unsaved, locked or not: it never writes to
+          the server, and after a refused save it is the way to drop the
+          kept typing (#1115). */}
+      <Tooltip title={isDirty ? "discard unsaved edits — go back to the last saved version" : ""}>
+        <span style={{ gridArea: "undo" }}>
+          <IconButton
+            size="small"
+            aria-label="discard unsaved edits"
+            onClick={handleUndo}
+            disabled={!isDirty}
+            sx={{ p: 0.25, color: "warning.main", opacity: isDirty ? 1 : 0, transition: "opacity 150ms" }}
+          >
+            <UndoIcon fontSize="inherit" />
+          </IconButton>
+        </span>
+      </Tooltip>
       {locked ? (
         <span style={{ gridArea: "save" }} />
       ) : (

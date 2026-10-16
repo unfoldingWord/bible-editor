@@ -165,6 +165,8 @@ interface Props {
   onNoteVisibilityChange?: (rowId: string, isVisible: boolean) => void;
   onWordSave: (id: string, patch: Partial<TwlRow>) => void;
   onWordDelete: (id: string) => void;
+  // Put a word link's last saved values back into the cache (its Undo, #1115).
+  onWordRevert?: (id: string, patch: Partial<TwlRow>) => void;
   onWordCreate: () => void;
   onWordFocus: (row: TwlRow) => void;
   onWordReorder: (draggedId: string, refId: string, position: WordDropPosition) => void;
@@ -178,6 +180,8 @@ interface Props {
     opts?: { restoredFromVersion?: number },
   ) => void;
   onQuestionDelete: (id: string) => void;
+  // Put a question's last saved values back into the cache (its Undo, #1115).
+  onQuestionRevert?: (id: string, patch: Partial<TqRow>) => void;
   onQuestionCreate: () => void;
   // Mirrors onNoteFocus/onWordFocus for a manual click into a question row.
   // Optional — pinned (whole-chapter) question groups aren't wired to it yet.
@@ -408,12 +412,14 @@ export function ResourceColumn({
   onNoteVisibilityChange,
   onWordSave,
   onWordDelete,
+  onWordRevert,
   onWordCreate,
   onWordFocus,
   onWordReorder,
   onWordChangeVerse,
   onQuestionSave,
   onQuestionDelete,
+  onQuestionRevert,
   onQuestionCreate,
   onQuestionFocus,
   lockedTn = false,
@@ -1183,12 +1189,12 @@ export function ResourceColumn({
                 tqGroups.map(([verse, rows]) => (
                   <Fragment key={`tq-${verse}`}>
                     <VerseGroupHead verse={verse} active={verse === activeVerse} section="questions" />
-                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} findQuery={findQuestionQuery} activeMatch={activeQuestionMatch} />
+                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} onRevert={onQuestionRevert} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} findQuery={findQuestionQuery} activeMatch={activeQuestionMatch} />
                   </Fragment>
                 ))
               )
             ) : (
-              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} findQuery={findQuestionQuery} activeMatch={activeQuestionMatch} />
+              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} onRevert={onQuestionRevert} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} findQuery={findQuestionQuery} activeMatch={activeQuestionMatch} />
             )}
           </>
         )}
@@ -1313,6 +1319,7 @@ export function ResourceColumn({
             activeId={activeWordId}
             onSave={onWordSave}
             onDelete={onWordDelete}
+            onRevert={onWordRevert}
             onFocus={onWordFocus}
             onReorder={onWordReorder}
             onReorderPreview={onReorderPreview}

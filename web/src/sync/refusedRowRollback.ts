@@ -5,10 +5,11 @@
 // to bring it back. Shell re-reads the chapter and puts the server's row back;
 // this decides whether and where.
 //
-// Only DELETEs: a refused tn PATCH is already shown as unsaved by NoteCard
-// (its baseline is pinned to the server version) and kept in its draft, and
-// putting the server's text back into the cached row would make an idle card
-// re-sync to it and clear that draft.
+// Only DELETEs: a refused PATCH is shown as unsaved by its row, whose
+// baseline is pinned to the server version (NoteCard for tn; QuestionsTable
+// and WordsTable for tq/twl since #1115, see rowEditBaseline.ts), and kept in
+// its draft. Putting the server's text back into the cached row is the row's
+// own Undo, not something a refusal does.
 //
 // Pure (no React, no IndexedDB) so the decision is unit-tested in
 // refusedRowRollback.test.mjs.

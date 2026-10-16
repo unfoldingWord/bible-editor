@@ -103,6 +103,7 @@ import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
 import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
 import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
+import { isKeptRowEditOp } from "../sync/rowEditBaseline";
 import { dropOwnRowDeleteClick, markOwnRowDelete, recordOwnRowDeleteClickOp } from "../sync/pendingRowDeletes";
 import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
 import { tnMoveRelay } from "../sync/tnMoveRelay";
@@ -1300,7 +1301,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           void rollBackRefusedRowDelete(op);
           void rollBackRefusedTnMove(op);
           pushPipelineToast(
-            "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+            isKeptRowEditOp(op)
+              ? "Not saved — the AI run for this chapter is mid-flight. Your edit is still on screen, marked unsaved; save it again after the run finishes."
+              : "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }
@@ -5153,6 +5156,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             const row = data.tq.find((r) => r.id === id);
             if (row) enqueueRow("tq", row, patch, opts);
           }}
+          // #1115: Undo on a question/word link whose save was refused puts
+          // the last saved values back into the cache (no PATCH).
+          onQuestionRevert={(id, patch) => applyLocalRowPatch("tq", id, patch)}
+          onWordRevert={(id, patch) => applyLocalRowPatch("twl", id, patch)}
           onQuestionDelete={(id) => {
             const row = data.tq.find((r) => r.id === id);
             if (!row || isReadOnly()) return; // as for a word link (#1147 item 4)

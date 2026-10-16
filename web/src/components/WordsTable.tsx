@@ -17,7 +17,24 @@ import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
 import { TwArticleDialog } from "./TwArticleDialog";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
+import {
+  baselineFromDraft,
+  rebaseRowBaseline,
+  rowFieldDiff,
+  shouldSyncFromRow,
+  type RowBaseline,
+} from "../sync/rowEditBaseline";
 import { directionForText } from "../lib/direction";
+
+// The fields a word-link row edits, as its inputs hold them. A null/0 stored
+// occurrence shows as 1: the export coerces an OL quote's null occurrence to
+// 1, so 1 and null are equivalent on disk and must not count as an edit.
+type TwlFields = { orig_words: string; tw_link: string | null; occurrence: number };
+const twlFields = (row: TwlRow): TwlFields => ({
+  orig_words: row.orig_words ?? "",
+  tw_link: row.tw_link,
+  occurrence: row.occurrence ?? 1,
+});
 
 export type WordDropPosition = "before" | "after";
 
@@ -78,6 +95,9 @@ interface Props {
   // Manual save: applies + enqueues. No autosave during typing.
   onSave: (id: string, patch: Partial<TwlRow>) => void;
   onDelete: (id: string) => void;
+  // Put the last saved values back into the cached row (no PATCH). Undo uses
+  // it: a save the server refused left its values in the cache (#1115).
+  onRevert?: (id: string, patch: Partial<TwlRow>) => void;
   onFocus: (row: TwlRow) => void;
   onReorder: (draggedId: string, refId: string, position: WordDropPosition) => void;
   // Reorder stoplight, same as the notes: hovering a row's grip/arrows (or
@@ -134,7 +154,7 @@ interface Props {
 // ordering skips locked verses on every surface. See Shell's onWordReorder for
 // the lock-then-move sequence, and twlDisplayOrder for the display split.
 
-function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, onReorderPreview, readOnly = false, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild, suggestionAlternatives, verseOptions, onChangeVerse }: Props) {
+function WordsTableInner({ rows, activeId, onSave, onDelete, onRevert, onFocus, onReorder, onReorderPreview, readOnly = false, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild, suggestionAlternatives, verseOptions, onChangeVerse }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
@@ -264,6 +284,7 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
               isDropTarget={dragId !== null && dragId !== r.id}
               onSave={(p) => onSave(r.id, p)}
               onDelete={() => onDelete(r.id)}
+              onRevert={onRevert ? (p) => onRevert(r.id, p) : undefined}
               onFocus={() => onFocus(r)}
               onGripDragStart={() => setDragId(r.id)}
               onMoveUp={
@@ -398,6 +419,7 @@ const WordRow = memo(function WordRow({
   isDropTarget,
   onSave,
   onDelete,
+  onRevert,
   onFocus,
   onGripDragStart,
   onMoveUp,
@@ -423,6 +445,7 @@ const WordRow = memo(function WordRow({
   isDropTarget: boolean;
   onSave: (patch: Partial<TwlRow>) => void;
   onDelete: () => void;
+  onRevert?: (patch: Partial<TwlRow>) => void;
   onFocus: () => void;
   onGripDragStart?: () => void;
   // Reorder one slot within the verse. Undefined when already first/last.
@@ -464,7 +487,17 @@ const WordRow = memo(function WordRow({
   const [occurrence, setOccurrence] = useState(row.occurrence ?? 1);
   const [translateError, setTranslateError] = useState(false);
   const rowRef = useRef<HTMLDivElement | null>(null);
-  const savedRef = useRef({ quote: row.orig_words ?? "", twLink: row.tw_link, occurrence: row.occurrence ?? 1 });
+  // #1115: the last server-confirmed values, pinned to row.version (see
+  // rowEditBaseline.ts). Shell's optimistic apply puts our saved values into
+  // the cached row at the SAME version, so a save the server refuses or the
+  // user discards would read as saved if we diffed against `row`. Rebased
+  // during render (like NoteCard's savedRef) so the diff below reads it in
+  // this same render.
+  const baselineRef = useRef<RowBaseline<TwlFields> | null>(null);
+  baselineRef.current = rebaseRowBaseline(baselineRef.current, twlFields(row), row.version);
+  const base = baselineRef.current.fields;
+  const rowVersionRef = useRef(row.version);
+  rowVersionRef.current = row.version;
   const catalogs = useCatalogs();
 
   // Alternative articles for the current link, from two sources unioned by link:
@@ -504,50 +537,69 @@ const WordRow = memo(function WordRow({
   const [refMenuAnchor, setRefMenuAnchor] = useState<HTMLElement | null>(null);
   const showRefPicker = !!onChangeVerse && (verseOptions?.length ?? 0) > 1;
 
-  useEffect(() => setQuote(row.orig_words ?? ""), [row.id, row.version, row.orig_words]);
-  useEffect(() => setTwLink(row.tw_link), [row.id, row.version, row.tw_link]);
-  useEffect(() => setOccurrence(row.occurrence ?? 1), [row.id, row.version, row.occurrence]);
+  const diff: Partial<TwlRow> = rowFieldDiff({ orig_words: quote, tw_link: twLink, occurrence }, base);
+  const isDirty = Object.keys(diff).length > 0;
+  // Read by the resync effect below, which runs after this render.
+  const dirtyRef = useRef(isDirty);
+  dirtyRef.current = isDirty;
+
+  // Resync from the cached row. A new version always resyncs (a 200, a WS
+  // upsert, a reimport). A same-version change (a "build from source" quote
+  // applied optimistically, a refetch carrying the server's values back over
+  // a refused save) only reaches a row with no unsaved edits (#1115).
+  const syncedVersionRef = useRef<number | null>(null);
   useEffect(() => {
-    savedRef.current = { quote: row.orig_words ?? "", twLink: row.tw_link, occurrence: row.occurrence ?? 1 };
-    // Deliberately keyed on [row.id, row.version] only — this snapshot is the
-    // "last saved" baseline the draft-dirty check compares against, and it
-    // must rebase only when the server hands back a new confirmed version,
-    // not on every field-level change (those three fields only ever change
-    // together with a version bump anyway, via the three effects above).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [row.id, row.version]);
+    const versionMoved = syncedVersionRef.current !== row.version;
+    syncedVersionRef.current = row.version;
+    if (!shouldSyncFromRow({ versionMoved, dirty: dirtyRef.current })) return;
+    setQuote(row.orig_words ?? "");
+    setTwLink(row.tw_link);
+    setOccurrence(row.occurrence ?? 1);
+  }, [row.id, row.version, row.orig_words, row.tw_link, row.occurrence]);
 
   const draftKey = useMemo(() => rowKey("twl", row.book, row.id), [row.book, row.id]);
 
   // Hydrate from any persisted draft on first mount so unsaved typing
-  // survives navigation.
+  // survives navigation. The draft also carries the baseline it was diffed
+  // against: a remount over a cache still holding a refused save's values
+  // would otherwise take them as the saved state (#1115). `hydrated` is
+  // state so the restored baseline reaches the screen even when the draft's
+  // values equal what the fields already show, and so the draft-write effect
+  // cannot clear the draft before it has been read (NoteCard does the same).
+  const [hydrated, setHydrated] = useState(false);
   const hydratedFromDraftRef = useRef(false);
   useEffect(() => {
     if (hydratedFromDraftRef.current) return;
-    void drafts.get(draftKey).then((rec) => {
-      if (hydratedFromDraftRef.current) return;
-      hydratedFromDraftRef.current = true;
-      const patch = (rec?.payload as { patch?: Partial<TwlRow> } | undefined)?.patch;
-      if (!patch) return;
-      if (typeof patch.orig_words === "string") setQuote(patch.orig_words);
-      if ("tw_link" in patch) setTwLink((patch.tw_link as string | null) ?? null);
-      if (typeof patch.occurrence === "number") setOccurrence(patch.occurrence);
-    });
+    drafts.get(draftKey).then(
+      (rec) => {
+        if (hydratedFromDraftRef.current) return;
+        hydratedFromDraftRef.current = true;
+        const restored = baselineFromDraft<TwlFields>(rec?.payload, rec?.expectedVersion, rowVersionRef.current);
+        if (restored) baselineRef.current = restored;
+        const patch = (rec?.payload as { patch?: Partial<TwlRow> } | undefined)?.patch;
+        if (patch) {
+          if (typeof patch.orig_words === "string") setQuote(patch.orig_words);
+          if ("tw_link" in patch) setTwLink((patch.tw_link as string | null) ?? null);
+          if (typeof patch.occurrence === "number") setOccurrence(patch.occurrence);
+        }
+        setHydrated(true);
+      },
+      () => {
+        // A failed read restores nothing; the row falls back to the cache.
+        if (hydratedFromDraftRef.current) return;
+        hydratedFromDraftRef.current = true;
+        setHydrated(true);
+      },
+    );
   }, [draftKey]);
-  const diff = useMemo<Partial<TwlRow>>(() => {
-    const out: Partial<TwlRow> = {};
-    if (quote !== (row.orig_words ?? "")) out.orig_words = quote;
-    if (twLink !== row.tw_link) out.tw_link = twLink;
-    // null/0 stored occurrence is equivalent to 1 for an OL quote (see export
-    // coercion), so only a real numeric change counts as dirty.
-    if (occurrence !== (row.occurrence ?? 1)) out.occurrence = occurrence;
-    return out;
-  }, [quote, twLink, occurrence, row.orig_words, row.tw_link, row.occurrence]);
-  const isDirty = Object.keys(diff).length > 0;
 
+  // Keyed on the edited values, not the cached row: the optimistic apply of
+  // a save must not mint a new draft generation, or the save's 200 would
+  // leave the draft behind (drafts.rowSaveGeneration).
   useEffect(() => {
     if (isDirty) {
-      void drafts.set(draftKey, { patch: diff }, row.version, {
+      const b = baselineRef.current!;
+      void drafts.set(draftKey, { patch: diff, baseline: b.fields }, b.version, {
         kind: "row",
         rowKind: "twl",
         id: row.id,
@@ -555,10 +607,11 @@ const WordRow = memo(function WordRow({
         chapter: row.chapter,
         verse: row.verse,
       });
-    } else {
+    } else if (hydrated) {
       void drafts.clear(draftKey);
     }
-  }, [draftKey, isDirty, diff, row.version, row.id, row.book, row.chapter, row.verse]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftKey, isDirty, quote, twLink, occurrence, row.version, row.id, row.book, row.chapter, row.verse, hydrated]);
 
   const positionFromEvent = (e: React.DragEvent): WordDropPosition => {
     const rect = rowRef.current?.getBoundingClientRect();
@@ -579,10 +632,15 @@ const WordRow = memo(function WordRow({
     }
   };
 
+  // Discard unsaved edits: back to the last saved values, on screen and in
+  // the cached row (a refused save left its values there), and drop the draft.
   const handleUndo = () => {
-    setQuote(savedRef.current.quote);
-    setTwLink(savedRef.current.twLink);
-    setOccurrence(savedRef.current.occurrence);
+    setQuote(base.orig_words);
+    setTwLink(base.tw_link);
+    setOccurrence(base.occurrence);
+    void drafts.clear(draftKey);
+    const revert = rowFieldDiff(base, twlFields(row));
+    if (Object.keys(revert).length > 0) onRevert?.(revert);
   };
 
   const handleSave = () => {
