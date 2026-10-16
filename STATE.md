@@ -706,6 +706,15 @@ Highlights that bite repeatedly:
   row before expecting a ledger-gated change to quiet anything in prod. The read also needs the poll tip to equal the
   live head, and the poller runs at most every 30 minutes, so a commit to the repo shortly before an export step
   (any book) answers `ledger_tip_stale` and keeps the warning that night too.
+- **A Door43 edit to an AI-only tn note never reaches `classifyKept`.** `classifyKept` counts a `dcs_reimport`
+  word change as kept (#1155 C), but only for rows `loadKeptTns` / `deleteUnkeptTns` select, which need
+  `updated_by IS NOT NULL`. The reimport's AI-only re-seed (`sync_reseed`) sets `updated_by` NULL, so a person's
+  Door43 fix to an AI note turns the row pristine the night it is adopted, and the next AI run deletes it.
+  Door43 edits to legacy pristine notes (`sync_merge`, `updated_by` already NULL) are unprotected the same way.
+  Prod 2026-10-16: 1,199 live tn rows read `sync_reseed` + pristine (`last_change_actor`: 578 Richard Mahn, 517
+  "AI/bot push", 45 christopherrsmith, 42 "Door43 sync", 17 justplainjane47), 2,187 `sync_merge` + pristine,
+  1,001 `sync_merge` + edited. edit_log alone cannot tell re-seeds from adopted bot pushes; the live actor is a
+  candidate signal but names only the latest change, so widening the candidate set is a product choice.
 
 ## Stop conditions / goals
 

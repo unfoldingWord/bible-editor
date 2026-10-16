@@ -10,7 +10,8 @@
 // A note is "kept" when it is worth defending against an AI re-run:
 //   - the translator marked it preserve;
 //   - a person really edited it (content, verse/reference or occurrence
-//     differs from what the AI last wrote);
+//     differs from what the AI last wrote), in the app or on Door43 (a
+//     Door43 edit counts only when its words changed, #1155);
 //   - it came from the 2 Kings -> Isaiah migration (decision D4);
 //   - the AI expanded it from a translator's hint (decision D5).
 // Pristine rows (updated_by NULL) are never kept.
@@ -25,6 +26,7 @@ import type { Env } from "./index.ts";
 const AI_SOURCE = "ai_pipeline";
 const MIGRATION_SOURCE = "parallel_migration";
 const HINT_SOURCE = "hint_expansion";
+const REIMPORT_SOURCE = "dcs_reimport";
 // Scripts that rewrite quotes in bulk; their edit_log rows must never look
 // like a person's edit (scan-tn-quotes / rollback-tn-quotes, see PR C).
 const REPAIR_SOURCES = new Set(["quote_repair"]);
@@ -167,7 +169,18 @@ function isRepair(e: KeptLogEntry): boolean {
 // (#1180). AI Suggest output a person saves arrives as an ordinary save
 // and counts (D3). Reorders (payload only sort_order), whitespace-only saves
 // and tag-only saves change nothing after normalizing, so they do not count.
+//
+// A Door43 edit the nightly sync adopted (source dcs_reimport, update or
+// restore) counts too, but only when the words changed: quote, note or
+// support_reference after normalizing (#1155 item 3, decision C). Spacing,
+// typographic and tag-only syncs do not, and neither does a position change:
+// the reimport rewrites verse/ref_raw/occurrence with no person involved (see
+// POSITION). Its creates never count: the bulk import logs one for every row.
+// The nightly run logs user_id NULL, so no user is required here.
 function isHumanEvent(e: KeptLogEntry, before: State, after: State): boolean {
+  if (e.source === REIMPORT_SOURCE) {
+    return (e.action === "update" || e.action === "restore") && !sameContent(before, after);
+  }
   if (e.source != null || e.user_id == null || isRepair(e)) return false;
   if (e.action === "create") return after.note === "";
   return !sameContent(before, after) || !samePosition(before, after);
