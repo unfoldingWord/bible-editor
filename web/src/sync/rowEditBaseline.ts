@@ -70,6 +70,49 @@ export function resyncLocalFields<F extends object>(local: F, prevBase: F, row: 
   return out;
 }
 
+// The fields where kept typing and a server change collide: the user's value
+// and the row's new value both differ from `prevBase` (the value the user
+// typed against) and from each other. resyncLocalFields keeps the user's
+// typing there and the baseline rebases onto the server's value, so a plain
+// save would send If-Match at the new version and overwrite the other edit
+// with no prompt. See SaveBasis.
+export function conflictingFields<F extends object>(local: F, prevBase: F, row: F): (keyof F)[] {
+  return (Object.keys(local) as (keyof F)[]).filter(
+    (k) => local[k] !== prevBase[k] && row[k] !== prevBase[k] && local[k] !== row[k],
+  );
+}
+
+// What a row's next save is based on when it holds a conflict: the version
+// and values the user typed against, not the rebased baseline. Shell's
+// enqueueRow then sends that version as If-Match and records those values as
+// the op's baseline, so the server answers 409 and classifyRowPatchConflict
+// sees the server changed our field: the op goes to "conflict" and the
+// SyncStatusBar's conflict prompt runs, instead of a silent overwrite.
+export interface SaveBasis<F> {
+  version: number;
+  fields: F;
+  conflict: (keyof F)[];
+}
+
+// After the cached row changed: start a basis when a field conflicts, keep an
+// existing one (its older version still draws the 409), else none.
+export function nextSaveBasis<F extends object>(
+  prev: SaveBasis<F> | null,
+  args: { local: F; prevBase: F; prevVersion: number; row: F },
+): SaveBasis<F> | null {
+  if (prev) return prev;
+  const conflict = conflictingFields(args.local, args.prevBase, args.row);
+  return conflict.length > 0 ? { version: args.prevVersion, fields: args.prevBase, conflict } : null;
+}
+
+// A basis only matters while a conflicting field still holds unsaved typing;
+// once the user matches the server's value (or undoes), it is dropped, so a
+// later edit to that field is not sent against a stale version.
+export function activeSaveBasis<F extends object>(basis: SaveBasis<F> | null, local: F, base: F): SaveBasis<F> | null {
+  if (!basis) return null;
+  return basis.conflict.some((k) => local[k] !== base[k]) ? basis : null;
+}
+
 // The ids of rows of `rowKind` with an edit-field save still in the outbox
 // (pending, in flight, in conflict or failed). Reorders and moves are not
 // edits (see isKeptRowEditOp).

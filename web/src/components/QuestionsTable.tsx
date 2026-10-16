@@ -11,10 +11,13 @@ import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import {
   baselineFromDraft,
   rebaseRowBaseline,
+  activeSaveBasis,
+  nextSaveBasis,
   resyncLocalFields,
   rowFieldDiff,
   saveGateClosed,
   type RowBaseline,
+  type SaveBasis,
 } from "../sync/rowEditBaseline";
 import { useQueuedRowEdits } from "../hooks/useQueuedRowEdits";
 import { buildFindRegex, nthMatchRange, type QuestionField } from "../lib/questionFind";
@@ -32,7 +35,7 @@ interface Props {
   onSave: (
     id: string,
     patch: Partial<TqRow>,
-    opts?: { restoredFromVersion?: number },
+    opts?: { restoredFromVersion?: number; basis?: { version: number; fields: Record<string, unknown> } },
   ) => void;
   onDelete: (id: string) => void;
   // Put the last saved values back into the cached row (no PATCH). Undo uses
@@ -179,7 +182,7 @@ const Row = memo(function Row({
   activeMatch = null,
 }: {
   row: TqRow;
-  onSave: (patch: Partial<TqRow>, opts?: { restoredFromVersion?: number }) => void;
+  onSave: (patch: Partial<TqRow>, opts?: { restoredFromVersion?: number; basis?: { version: number; fields: Record<string, unknown> } }) => void;
   onDelete: () => void;
   onRevert?: (patch: Partial<TqRow>) => void;
   // An edit save of this row is still in the outbox; and the count of outbox
@@ -237,7 +240,14 @@ const Row = memo(function Row({
       ? activeMatch.field
       : null;
 
-  const diff: Partial<TqRow> = rowFieldDiff({ ref_raw: refRaw, question, response }, base);
+  const localFields: TqFields = { ref_raw: refRaw, question, response };
+  const diff: Partial<TqRow> = rowFieldDiff(localFields, base);
+  // Set when the server changed a field this row holds unsaved typing in (see
+  // SaveBasis): the next save is sent against the version the user typed
+  // against, so it 409s into the outbox's conflict prompt instead of silently
+  // overwriting the other edit. Dropped once no conflicting field is dirty.
+  const basisRef = useRef<SaveBasis<TqFields> | null>(null);
+  basisRef.current = activeSaveBasis(basisRef.current, localFields, base);
   const isDirty = Object.keys(diff).length > 0;
 
   // Save/Undo gate (#1115 review): off while a save of this row is queued, in
@@ -256,11 +266,20 @@ const Row = memo(function Row({
   // (api/src/rows.ts), so a half-typed "1:" would move the row to verse 0.
   // `syncBaseRef` is the baseline the fields were compared against before
   // this change (the render already rebased baselineRef).
-  const syncBaseRef = useRef<TqFields | null>(null);
+  const syncBaseRef = useRef<RowBaseline<TqFields> | null>(null);
   useEffect(() => {
-    const prevBase = syncBaseRef.current ?? base;
-    syncBaseRef.current = base;
-    const next = resyncLocalFields({ ref_raw: refRaw, question, response }, prevBase, tqFields(row));
+    const prev = syncBaseRef.current ?? baselineRef.current!;
+    syncBaseRef.current = baselineRef.current;
+    const rowFields = tqFields(row);
+    if (prev.version !== row.version) {
+      basisRef.current = nextSaveBasis(basisRef.current, {
+        local: localFields,
+        prevBase: prev.fields,
+        prevVersion: prev.version,
+        row: rowFields,
+      });
+    }
+    const next = resyncLocalFields(localFields, prev.fields, rowFields);
     setRefRaw(next.ref_raw);
     setQuestion(next.question);
     setResponse(next.response);
@@ -287,7 +306,9 @@ const Row = memo(function Row({
         const restored = baselineFromDraft<TqFields>(rec?.payload, rec?.expectedVersion, rowVersionRef.current);
         if (restored) {
           baselineRef.current = restored;
-          syncBaseRef.current = restored.fields;
+          syncBaseRef.current = restored;
+          const saved = (rec?.payload as { conflictBasis?: SaveBasis<TqFields> } | undefined)?.conflictBasis;
+          if (saved && typeof saved.version === "number" && Array.isArray(saved.conflict)) basisRef.current = saved;
         }
         const patch = (rec?.payload as { patch?: Partial<TqRow> } | undefined)?.patch;
         if (patch) {
@@ -315,7 +336,7 @@ const Row = memo(function Row({
     if (locked) return;
     if (isDirty) {
       const b = baselineRef.current!;
-      void drafts.set(draftKey, { patch: diff, baseline: b.fields }, b.version, {
+      void drafts.set(draftKey, { patch: diff, baseline: b.fields, ...(basisRef.current ? { conflictBasis: basisRef.current } : {}) }, b.version, {
         kind: "row",
         rowKind: "tq",
         id: row.id,
@@ -332,7 +353,8 @@ const Row = memo(function Row({
   const handleSave = () => {
     if (!isDirty || saving) return;
     setClickedAtSeq(outboxSeq);
-    onSave(diff);
+    const basis = basisRef.current;
+    onSave(diff, basis ? { basis: { version: basis.version, fields: basis.fields } } : undefined);
   };
 
   // A field typed back to its saved value by hand: put the saved value back
@@ -350,6 +372,7 @@ const Row = memo(function Row({
   // the cached row (a refused save left its text there), and drop the draft.
   const handleUndo = () => {
     if (saving) return;
+    basisRef.current = null;
     setRefRaw(base.ref_raw);
     setQuestion(base.question);
     setResponse(base.response);

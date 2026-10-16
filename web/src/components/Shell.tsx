@@ -3853,8 +3853,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     kind: "tn" | "tq" | "twl",
     row: T,
     patch: Partial<T>,
-    opts?: { restoredFromVersion?: number; opId?: string },
+    opts?: {
+      restoredFromVersion?: number;
+      opId?: string;
+      // #1115: the version and values a question/word-link save is based on
+      // when the server changed a field the user still holds unsaved typing
+      // in (SaveBasis in rowEditBaseline.ts). Sent as If-Match and recorded as
+      // the op's baseline, so the 409 reaches the conflict prompt instead of
+      // auto-healing over the other edit.
+      basis?: { version: number; fields: Record<string, unknown> };
+    },
   ) => {
+    const { basis, ...outboxOpts } = opts ?? {};
+    const from = (basis ? { ...row, ...basis.fields, version: basis.version } : row) as T;
     // Optimistic local apply mirrors what the server will do: any non-revert
     // patch clears the restored_from_version marker so the chip immediately
     // drops the v{N} override instead of waiting for the round-trip.
@@ -3869,15 +3880,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // value) from a genuine one and auto-heal the former (see
     // classifyRowPatchConflict). Read from `row`, which still holds the version
     // we branched from — applyLocalRowPatch produces a new cached object.
-    const rowRecord = row as unknown as Record<string, unknown>;
+    const rowRecord = from as unknown as Record<string, unknown>;
     const baseline: Record<string, unknown> = {};
     for (const field of Object.keys(patch)) baseline[field] = rowRecord[field];
     applyLocalRowPatch(kind, row.id, localPatch);
     // #1092: tie the op to the draft generation it saves, so its 200 cannot
     // clear typing that arrives while it is in flight.
     const draftGeneration = drafts.rowSaveGeneration(draftRowKey(kind, row.book, row.id));
-    return outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, {
-      ...opts,
+    return outbox.enqueueRow(kind, row.id, from.version, patch as Record<string, unknown>, {
+      ...outboxOpts,
       book: row.book,
       baseline,
       draftGeneration,
@@ -5128,9 +5139,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onNoteDelete={handleTrashNote}
           onNoteRestore={handleRestoreNote}
-          onWordSave={(id, patch) => {
+          onWordSave={(id, patch, opts) => {
             const row = data.twl.find((r) => r.id === id);
-            if (row) enqueueRow("twl", row, patch);
+            if (row) enqueueRow("twl", row, patch, opts);
           }}
           onWordDelete={(id) => {
             const row = data.twl.find((r) => r.id === id);

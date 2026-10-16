@@ -20,10 +20,13 @@ import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import {
   baselineFromDraft,
   rebaseRowBaseline,
+  activeSaveBasis,
+  nextSaveBasis,
   resyncLocalFields,
   rowFieldDiff,
   saveGateClosed,
   type RowBaseline,
+  type SaveBasis,
 } from "../sync/rowEditBaseline";
 import { useQueuedRowEdits } from "../hooks/useQueuedRowEdits";
 import { directionForText } from "../lib/direction";
@@ -95,7 +98,7 @@ interface Props {
   rows: TwlRow[];
   activeId: string | null;
   // Manual save: applies + enqueues. No autosave during typing.
-  onSave: (id: string, patch: Partial<TwlRow>) => void;
+  onSave: (id: string, patch: Partial<TwlRow>, opts?: { basis?: { version: number; fields: Record<string, unknown> } }) => void;
   onDelete: (id: string) => void;
   // Put the last saved values back into the cached row (no PATCH). Undo uses
   // it: a save the server refused left its values in the cache (#1115).
@@ -285,7 +288,7 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onRevert, onFocus, 
               active={r.id === activeId}
               dragging={dragId === r.id}
               isDropTarget={dragId !== null && dragId !== r.id}
-              onSave={(p) => onSave(r.id, p)}
+              onSave={(p, opts) => onSave(r.id, p, opts)}
               onDelete={() => onDelete(r.id)}
               onRevert={onRevert ? (p) => onRevert(r.id, p) : undefined}
               queued={queuedEdits.ids.has(r.id)}
@@ -450,7 +453,7 @@ const WordRow = memo(function WordRow({
   active: boolean;
   dragging: boolean;
   isDropTarget: boolean;
-  onSave: (patch: Partial<TwlRow>) => void;
+  onSave: (patch: Partial<TwlRow>, opts?: { basis?: { version: number; fields: Record<string, unknown> } }) => void;
   onDelete: () => void;
   onRevert?: (patch: Partial<TwlRow>) => void;
   // An edit save of this row is still in the outbox; and the count of outbox
@@ -548,7 +551,14 @@ const WordRow = memo(function WordRow({
   const [refMenuAnchor, setRefMenuAnchor] = useState<HTMLElement | null>(null);
   const showRefPicker = !!onChangeVerse && (verseOptions?.length ?? 0) > 1;
 
-  const diff: Partial<TwlRow> = rowFieldDiff({ orig_words: quote, tw_link: twLink, occurrence }, base);
+  const localFields: TwlFields = { orig_words: quote, tw_link: twLink, occurrence };
+  const diff: Partial<TwlRow> = rowFieldDiff(localFields, base);
+  // Set when the server changed a field this row holds unsaved typing in (see
+  // SaveBasis): the next save is sent against the version the user typed
+  // against, so it 409s into the outbox's conflict prompt instead of silently
+  // overwriting the other edit. Dropped once no conflicting field is dirty.
+  const basisRef = useRef<SaveBasis<TwlFields> | null>(null);
+  basisRef.current = activeSaveBasis(basisRef.current, localFields, base);
   const isDirty = Object.keys(diff).length > 0;
 
   // Save/Undo gate (#1115 review): off while a save of this row is queued, in
@@ -564,11 +574,20 @@ const WordRow = memo(function WordRow({
   // other field follows the row (including a "build from source" quote
   // applied to the cache). `syncBaseRef` is the baseline the fields were
   // compared against before this change (the render already rebased it).
-  const syncBaseRef = useRef<TwlFields | null>(null);
+  const syncBaseRef = useRef<RowBaseline<TwlFields> | null>(null);
   useEffect(() => {
-    const prevBase = syncBaseRef.current ?? base;
-    syncBaseRef.current = base;
-    const next = resyncLocalFields({ orig_words: quote, tw_link: twLink, occurrence }, prevBase, twlFields(row));
+    const prev = syncBaseRef.current ?? baselineRef.current!;
+    syncBaseRef.current = baselineRef.current;
+    const rowFields = twlFields(row);
+    if (prev.version !== row.version) {
+      basisRef.current = nextSaveBasis(basisRef.current, {
+        local: localFields,
+        prevBase: prev.fields,
+        prevVersion: prev.version,
+        row: rowFields,
+      });
+    }
+    const next = resyncLocalFields(localFields, prev.fields, rowFields);
     setQuote(next.orig_words);
     setTwLink(next.tw_link);
     setOccurrence(next.occurrence);
@@ -595,7 +614,9 @@ const WordRow = memo(function WordRow({
         const restored = baselineFromDraft<TwlFields>(rec?.payload, rec?.expectedVersion, rowVersionRef.current);
         if (restored) {
           baselineRef.current = restored;
-          syncBaseRef.current = restored.fields;
+          syncBaseRef.current = restored;
+          const saved = (rec?.payload as { conflictBasis?: SaveBasis<TwlFields> } | undefined)?.conflictBasis;
+          if (saved && typeof saved.version === "number" && Array.isArray(saved.conflict)) basisRef.current = saved;
         }
         const patch = (rec?.payload as { patch?: Partial<TwlRow> } | undefined)?.patch;
         if (patch) {
@@ -620,7 +641,7 @@ const WordRow = memo(function WordRow({
   useEffect(() => {
     if (isDirty) {
       const b = baselineRef.current!;
-      void drafts.set(draftKey, { patch: diff, baseline: b.fields }, b.version, {
+      void drafts.set(draftKey, { patch: diff, baseline: b.fields, ...(basisRef.current ? { conflictBasis: basisRef.current } : {}) }, b.version, {
         kind: "row",
         rowKind: "twl",
         id: row.id,
@@ -657,6 +678,7 @@ const WordRow = memo(function WordRow({
   // the cached row (a refused save left its values there), and drop the draft.
   const handleUndo = () => {
     if (saving) return;
+    basisRef.current = null;
     setQuote(base.orig_words);
     setTwLink(base.tw_link);
     setOccurrence(base.occurrence);
@@ -668,7 +690,8 @@ const WordRow = memo(function WordRow({
   const handleSave = () => {
     if (!isDirty || saving) return;
     setClickedAtSeq(outboxSeq);
-    onSave(diff);
+    const basis = basisRef.current;
+    onSave(diff, basis ? { basis: { version: basis.version, fields: basis.fields } } : undefined);
   };
 
   // A field edited back to its saved value by hand: put the saved value back

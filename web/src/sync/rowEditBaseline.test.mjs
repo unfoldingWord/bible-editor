@@ -6,8 +6,12 @@
 // the refused text optimistically at an unchanged version.
 
 import assert from "node:assert/strict";
+import { classifyRowPatchConflict } from "./rowConflict.ts";
 import {
+  activeSaveBasis,
   baselineFromDraft,
+  conflictingFields,
+  nextSaveBasis,
   rebaseRowBaseline,
   isKeptRowEditOp,
   queuedKeptEditIds,
@@ -79,6 +83,42 @@ check(baselineFromDraft({ baseline: null }, 3, 3) === null, "a malformed baselin
   // Our own save landing: the row now holds exactly what we typed.
   const landed = resyncLocalFields(local, prevBase, local);
   check(landed.question === "Who spoke here?" && rowFieldDiff(landed, local).question === undefined, "our own save landing leaves the row clean");
+}
+
+// Lost update (review round 2): A's refused question is kept; B then saves the
+// SAME field, so the version moves and A's baseline rebases to B's text. A
+// plain save would send If-Match at B's version and overwrite B silently. The
+// field is a conflict: A's next save must be based on the version A typed
+// against, so the server answers 409 and the outbox's conflict path runs.
+{
+  const prevBase = { question: "Who spoke?", response: "The LORD." };
+  const local = { question: "A: who spoke here?", response: "The LORD." };
+  const bByQuestion = { question: "B: who spoke there?", response: "The LORD." };
+  const bByResponse = { question: "Who spoke?", response: "B: Yahweh." };
+  check(JSON.stringify(conflictingFields(local, prevBase, bByQuestion)) === '["question"]', "a dirty field the server also changed is a conflict");
+  check(conflictingFields(local, prevBase, bByResponse).length === 0, "a change to another field is not");
+  check(conflictingFields(local, prevBase, { ...bByQuestion, question: local.question }).length === 0, "the server landing exactly our text is not");
+  check(conflictingFields(prevBase, prevBase, bByQuestion).length === 0, "a clean field the server changed is not");
+
+  const basis = nextSaveBasis(null, { local, prevBase, prevVersion: 3, row: bByQuestion });
+  check(basis?.version === 3 && basis.fields.question === "Who spoke?", "the save is based on the version A typed against");
+  check(nextSaveBasis(null, { local, prevBase, prevVersion: 3, row: bByResponse }) === null, "no basis when nothing conflicts");
+  const later = nextSaveBasis(basis, { local, prevBase: bByQuestion, prevVersion: 4, row: { ...bByQuestion, response: "C" } });
+  check(later === basis, "a later bump keeps the earlier basis");
+  check(activeSaveBasis(basis, local, bByQuestion) === basis, "active while the conflicting field is still dirty");
+  check(activeSaveBasis(basis, { ...local, question: bByQuestion.question }, bByQuestion) === null, "inactive once A's field matches the server again");
+
+  // End to end through the outbox's 409 classifier: the save's baseline is
+  // what the op compares the server row against.
+  const patch = { question: local.question };
+  check(
+    classifyRowPatchConflict(patch, { question: bByQuestion.question }, { ...bByQuestion, version: 4 }) === "auto_heal",
+    "(without a basis, the rebased baseline lets the 409 auto-heal: B's text would be overwritten)",
+  );
+  check(
+    classifyRowPatchConflict(patch, { question: basis.fields.question }, { ...bByQuestion, version: 4 }) === "conflict",
+    "with the basis, the 409 is a real conflict and reaches the user",
+  );
 }
 
 // The save gate (review item 2): Save and Undo are off while a save of the

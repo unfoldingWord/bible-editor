@@ -163,7 +163,7 @@ interface Props {
   isNoteAiPending?: (rowId: string) => boolean;
   noteAiRecentlyCompletedAt?: (rowId: string) => number | null;
   onNoteVisibilityChange?: (rowId: string, isVisible: boolean) => void;
-  onWordSave: (id: string, patch: Partial<TwlRow>) => void;
+  onWordSave: (id: string, patch: Partial<TwlRow>, opts?: { basis?: { version: number; fields: Record<string, unknown> } }) => void;
   onWordDelete: (id: string) => void;
   // Put a word link's last saved values back into the cache (its Undo, #1115).
   onWordRevert?: (id: string, patch: Partial<TwlRow>) => void;
@@ -177,7 +177,7 @@ interface Props {
   onQuestionSave: (
     id: string,
     patch: Partial<TqRow>,
-    opts?: { restoredFromVersion?: number },
+    opts?: { restoredFromVersion?: number; basis?: { version: number; fields: Record<string, unknown> } },
   ) => void;
   onQuestionDelete: (id: string) => void;
   // Put a question's last saved values back into the cache (its Undo, #1115).
