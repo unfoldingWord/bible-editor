@@ -11,10 +11,12 @@ import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import {
   baselineFromDraft,
   rebaseRowBaseline,
+  resyncLocalFields,
   rowFieldDiff,
-  shouldSyncFromRow,
+  saveGateClosed,
   type RowBaseline,
 } from "../sync/rowEditBaseline";
+import { useQueuedRowEdits } from "../hooks/useQueuedRowEdits";
 import { buildFindRegex, nthMatchRange, type QuestionField } from "../lib/questionFind";
 import { TQ_HISTORY_FIELDS, type RowSnapshot } from "./rowHistoryFields";
 
@@ -67,6 +69,7 @@ type FindQuery = { find: string; regex: boolean; caseSensitive: boolean };
 type ActiveMatch = { rowId: string; field: QuestionField; occurrence: number };
 
 function QuestionsTableInner({ rows, onSave, onDelete, onRevert, locked = false, activeId = null, onFocus, findQuery = null, activeMatch = null }: Props) {
+  const queuedEdits = useQueuedRowEdits("tq");
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
@@ -111,6 +114,8 @@ function QuestionsTableInner({ rows, onSave, onDelete, onRevert, locked = false,
           onSave={(p, opts) => onSave(r.id, p, opts)}
           onDelete={() => onDelete(r.id)}
           onRevert={onRevert ? (p) => onRevert(r.id, p) : undefined}
+          queued={queuedEdits.ids.has(r.id)}
+          outboxSeq={queuedEdits.seq}
           locked={locked}
           active={r.id === activeId}
           onFocus={onFocus ? () => onFocus(r) : undefined}
@@ -165,6 +170,8 @@ const Row = memo(function Row({
   onSave,
   onDelete,
   onRevert,
+  queued,
+  outboxSeq,
   locked,
   active = false,
   onFocus,
@@ -175,6 +182,10 @@ const Row = memo(function Row({
   onSave: (patch: Partial<TqRow>, opts?: { restoredFromVersion?: number }) => void;
   onDelete: () => void;
   onRevert?: (patch: Partial<TqRow>) => void;
+  // An edit save of this row is still in the outbox; and the count of outbox
+  // snapshots seen (useQueuedRowEdits), for the Save/Undo gate.
+  queued: boolean;
+  outboxSeq: number;
   locked: boolean;
   active?: boolean;
   onFocus?: () => void;
@@ -226,39 +237,34 @@ const Row = memo(function Row({
       ? activeMatch.field
       : null;
 
-  // Set by a history restore that fires while the REF lane has unsaved typing.
-  // The restore bumps row.version, which would otherwise make the resync below
-  // overwrite the user's in-progress ref with the server value. Carrying the
-  // ref in the restore PATCH instead is NOT an option: the server re-derives
-  // the `verse` column from ref_raw (api/src/rows.ts), so persisting a
-  // half-typed "1:" would relocate the row to verse 0.
-  const pendingRefRef = useRef<string | null>(null);
-
   const diff: Partial<TqRow> = rowFieldDiff({ ref_raw: refRaw, question, response }, base);
   const isDirty = Object.keys(diff).length > 0;
-  // Read by the resync effect below, which runs after this render.
-  const dirtyRef = useRef(isDirty);
-  dirtyRef.current = isDirty;
 
-  // Resync from the cached row. A new version always resyncs (a 200, a
-  // restore, a WS upsert, an AI apply). A same-version change (a find/replace
-  // applied optimistically, a refetch carrying the server's text back over a
-  // refused save) only reaches a row with no unsaved typing (#1115).
-  const syncedVersionRef = useRef<number | null>(null);
+  // Save/Undo gate (#1115 review): off while a save of this row is queued, in
+  // flight or in conflict, so Undo cannot be overtaken by the save landing and
+  // a double click cannot send two PATCHes. Reopens on a refusal or discard.
+  const [clickedAtSeq, setClickedAtSeq] = useState<number | null>(null);
+  const saving = saveGateClosed({ queued, clickedAtSeq, seq: outboxSeq });
+
+  // Resync from the cached row, field by field (resyncLocalFields): a field
+  // with unsaved typing keeps it through any change — a new version (a 200,
+  // a restore, a WS upsert, an AI run's apply after a refused save) or a
+  // same-version refetch — and still reads unsaved against the rebased
+  // baseline; every other field follows the row. This also keeps an unsaved
+  // ref across a history restore's version bump: carrying it in the restore
+  // PATCH is not an option, as the server re-derives `verse` from ref_raw
+  // (api/src/rows.ts), so a half-typed "1:" would move the row to verse 0.
+  // `syncBaseRef` is the baseline the fields were compared against before
+  // this change (the render already rebased baselineRef).
+  const syncBaseRef = useRef<TqFields | null>(null);
   useEffect(() => {
-    const versionMoved = syncedVersionRef.current !== row.version;
-    syncedVersionRef.current = row.version;
-    if (!shouldSyncFromRow({ versionMoved, dirty: dirtyRef.current })) return;
-    if (pendingRefRef.current != null) {
-      if (versionMoved) {
-        setRefRaw(pendingRefRef.current);
-        pendingRefRef.current = null;
-      }
-    } else {
-      setRefRaw(row.ref_raw ?? "");
-    }
-    setQuestion(row.question ?? "");
-    setResponse(row.response ?? "");
+    const prevBase = syncBaseRef.current ?? base;
+    syncBaseRef.current = base;
+    const next = resyncLocalFields({ ref_raw: refRaw, question, response }, prevBase, tqFields(row));
+    setRefRaw(next.ref_raw);
+    setQuestion(next.question);
+    setResponse(next.response);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [row.id, row.version, row.ref_raw, row.question, row.response]);
 
   const draftKey = useMemo(() => rowKey("tq", row.book, row.id), [row.book, row.id]);
@@ -279,7 +285,10 @@ const Row = memo(function Row({
         if (hydratedFromDraftRef.current) return;
         hydratedFromDraftRef.current = true;
         const restored = baselineFromDraft<TqFields>(rec?.payload, rec?.expectedVersion, rowVersionRef.current);
-        if (restored) baselineRef.current = restored;
+        if (restored) {
+          baselineRef.current = restored;
+          syncBaseRef.current = restored.fields;
+        }
         const patch = (rec?.payload as { patch?: Partial<TqRow> } | undefined)?.patch;
         if (patch) {
           if (typeof patch.ref_raw === "string") setRefRaw(patch.ref_raw);
@@ -321,14 +330,26 @@ const Row = memo(function Row({
   }, [draftKey, isDirty, refRaw, question, response, row.version, row.id, row.book, row.chapter, row.verse, locked, hydrated]);
 
   const handleSave = () => {
-    if (!isDirty) return;
+    if (!isDirty || saving) return;
+    setClickedAtSeq(outboxSeq);
     onSave(diff);
+  };
+
+  // A field typed back to its saved value by hand: put the saved value back
+  // into the cached row too, which may still hold a refused save's text, or
+  // a remount would take that text as saved (#1115 review). Not while a save
+  // is queued: the cache then holds what that save is sending.
+  const editField = <K extends keyof TqFields>(k: K, v: TqFields[K], set: (v: TqFields[K]) => void) => {
+    set(v);
+    if (!saving && v === base[k] && tqFields(row)[k] !== base[k]) {
+      onRevert?.({ [k]: base[k] } as Partial<TqRow>);
+    }
   };
 
   // Discard unsaved typing: back to the last saved values, on screen and in
   // the cached row (a refused save left its text there), and drop the draft.
   const handleUndo = () => {
-    pendingRefRef.current = null;
+    if (saving) return;
     setRefRaw(base.ref_raw);
     setQuestion(base.question);
     setResponse(base.response);
@@ -353,11 +374,10 @@ const Row = memo(function Row({
     if (rawQuestion !== base.question) patch.question = rawQuestion;
     if (rawResponse !== base.response) patch.response = rawResponse;
     if (Object.keys(patch).length === 0) return;
-    // ref_raw isn't part of the history snapshot, so the version bump this
-    // PATCH triggers would resync it from the server and silently drop an
-    // unsaved ref edit. Hold it across the bump so it stays as the user left
-    // it — unsaved, still dirty — rather than being clobbered or written.
-    if (refRaw !== base.ref_raw) pendingRefRef.current = refRaw;
+    // ref_raw isn't part of the history snapshot. An unsaved ref edit stays
+    // as the user left it (unsaved) across this PATCH's version bump: the
+    // resync above keeps any field with unsaved typing.
+    setClickedAtSeq(outboxSeq);
     onSave(patch, { restoredFromVersion: fromVersion });
   };
 
@@ -392,7 +412,7 @@ const Row = memo(function Row({
         )}
         <TextField
           value={refRaw}
-          onChange={(e) => setRefRaw(e.target.value)}
+          onChange={(e) => editField("ref_raw", e.target.value, setRefRaw)}
           size="small"
           spellCheck={false}
           variant="outlined"
@@ -420,7 +440,7 @@ const Row = memo(function Row({
       ) : (
         <TextField
           value={question}
-          onChange={(e) => setQuestion(e.target.value)}
+          onChange={(e) => editField("question", e.target.value, setQuestion)}
           inputRef={questionInputRef}
           size="small"
           multiline
@@ -445,7 +465,7 @@ const Row = memo(function Row({
       ) : (
         <TextField
           value={response}
-          onChange={(e) => setResponse(e.target.value)}
+          onChange={(e) => editField("response", e.target.value, setResponse)}
           inputRef={responseInputRef}
           size="small"
           multiline
@@ -521,13 +541,21 @@ const Row = memo(function Row({
       {/* Shown whenever the row is unsaved, locked or not: it never writes to
           the server, and after a refused save it is the way to drop the
           kept typing (#1115). */}
-      <Tooltip title={isDirty ? "discard unsaved edits — go back to the last saved version" : ""}>
+      <Tooltip
+        title={
+          !isDirty
+            ? ""
+            : saving
+              ? "can't discard while a save is in flight — wait for it to land"
+              : "discard unsaved edits — go back to the last saved version"
+        }
+      >
         <span style={{ gridArea: "undo" }}>
           <IconButton
             size="small"
             aria-label="discard unsaved edits"
             onClick={handleUndo}
-            disabled={!isDirty}
+            disabled={!isDirty || saving}
             sx={{ p: 0.25, color: "warning.main", opacity: isDirty ? 1 : 0, transition: "opacity 150ms" }}
           >
             <UndoIcon fontSize="inherit" />
@@ -537,13 +565,13 @@ const Row = memo(function Row({
       {locked ? (
         <span style={{ gridArea: "save" }} />
       ) : (
-        <Tooltip title={isDirty ? "save edits" : "no unsaved edits"}>
+        <Tooltip title={saving ? "saving…" : isDirty ? "save edits" : "no unsaved edits"}>
           <span style={{ gridArea: "save" }}>
             <IconButton
               size="small"
-              disabled={!isDirty}
+              disabled={!isDirty || saving}
               onClick={handleSave}
-              sx={{ p: 0.25, color: isDirty ? "primary.main" : "action.disabled" }}
+              sx={{ p: 0.25, color: isDirty && !saving ? "primary.main" : "action.disabled" }}
             >
               {isDirty ? (
                 <SaveIcon fontSize="inherit" />
@@ -576,7 +604,9 @@ const Row = memo(function Row({
   a.locked === b.locked &&
   a.active === b.active &&
   a.findQuery === b.findQuery &&
-  a.activeMatch === b.activeMatch);
+  a.activeMatch === b.activeMatch &&
+  a.queued === b.queued &&
+  a.outboxSeq === b.outboxSeq);
 
 // Read-only render of a question / response with the active find match marked
 // orange ("here I am") and scrolled into view. A real inline block (not the

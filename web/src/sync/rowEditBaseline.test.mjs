@@ -10,8 +10,10 @@ import {
   baselineFromDraft,
   rebaseRowBaseline,
   isKeptRowEditOp,
+  queuedKeptEditIds,
+  resyncLocalFields,
   rowFieldDiff,
-  shouldSyncFromRow,
+  saveGateClosed,
 } from "./rowEditBaseline.ts";
 
 let passed = 0;
@@ -58,12 +60,47 @@ check(baselineFromDraft({ patch: { question: "x" } }, 3, 3) === null, "a draft w
 check(baselineFromDraft(undefined, undefined, 3) === null, "no draft, no baseline");
 check(baselineFromDraft({ baseline: null }, 3, 3) === null, "a malformed baseline is ignored");
 
-// Resync from the cached row: a new version always wins (today's rule); a
-// same-version change (a find/replace applied optimistically, a merging
-// refetch carrying the server's text) only reaches a row with no unsaved typing.
-check(shouldSyncFromRow({ versionMoved: true, dirty: true }), "a new server version resyncs even dirty fields");
-check(shouldSyncFromRow({ versionMoved: false, dirty: false }), "a same-version change reaches a clean row");
-check(!shouldSyncFromRow({ versionMoved: false, dirty: true }), "a same-version change never overwrites kept typing");
+// Resync from the cached row, field by field (review item 1 on #1115): a field
+// holding unsaved typing keeps it, whatever moved; every other field takes the
+// row's value. The kept question below was refused during an AI run; the run's
+// apply (or another tab's save) then bumps the row with new text.
+{
+  const prevBase = { question: "Who spoke?", response: "The LORD." };
+  const local = { question: "Who spoke here?", response: "The LORD." };
+  const bumped = { question: "Who spoke (AI)?", response: "Yahweh." };
+  const next = resyncLocalFields(local, prevBase, bumped);
+  check(next.question === "Who spoke here?", "a new version never wipes a field's kept typing");
+  check(next.response === "Yahweh.", "a clean field takes the new version's value");
+  // The new baseline is the bumped row, so the kept field still reads unsaved.
+  check(rowFieldDiff(next, bumped).question === "Who spoke here?", "and the kept field still reads as unsaved against it");
+  // A same-version change (a find/replace applied to the cache) reaches a clean field.
+  const replaced = resyncLocalFields(prevBase, prevBase, { ...prevBase, response: "Yahweh of hosts." });
+  check(replaced.response === "Yahweh of hosts.", "a same-version change reaches a clean field");
+  // Our own save landing: the row now holds exactly what we typed.
+  const landed = resyncLocalFields(local, prevBase, local);
+  check(landed.question === "Who spoke here?" && rowFieldDiff(landed, local).question === undefined, "our own save landing leaves the row clean");
+}
+
+// The save gate (review item 2): Save and Undo are off while a save of the
+// row's edited fields is queued, in flight or in conflict, and from the click
+// until the outbox's next snapshot (which holds the new op). It never sticks:
+// a refusal or discard removes the op, and the next snapshot reopens it.
+{
+  const op = (rowKind, id, patch, action = "patch", kind = "row") => ({ target: { kind, rowKind, id, book: "ZEC" }, action, patch });
+  const ops = [
+    op("tq", "A", { question: "x" }),
+    op("tq", "B", { sort_order: 2 }),
+    op("twl", "C", { orig_words: "w" }),
+    op("tq", "D", {}, "delete"),
+    op("tq", "E", { response: "r" }),
+  ];
+  check(JSON.stringify(queuedKeptEditIds(ops, "tq")) === '["A","E"]', "queued question edits: only edit-field PATCHes of that kind");
+  check(JSON.stringify(queuedKeptEditIds(ops, "twl")) === '["C"]', "queued word-link edits likewise");
+  check(saveGateClosed({ queued: true, clickedAtSeq: null, seq: 5 }), "closed while a save is queued");
+  check(saveGateClosed({ queued: false, clickedAtSeq: 5, seq: 5 }), "closed from the click until the next snapshot");
+  check(!saveGateClosed({ queued: false, clickedAtSeq: 5, seq: 6 }), "open once a later snapshot shows nothing queued (landed, refused or discarded)");
+  check(!saveGateClosed({ queued: false, clickedAtSeq: null, seq: 6 }), "open with nothing queued");
+}
 
 // Diff semantics: only changed fields, null/undefined distinct from "".
 check(

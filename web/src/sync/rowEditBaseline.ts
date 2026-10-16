@@ -52,13 +52,45 @@ export function rowFieldDiff<F extends object>(local: F, base: F): Partial<F> {
   return out;
 }
 
-// Whether a change in the cached row should overwrite the row's local fields.
-// A new version always does (unchanged from before #1115). A same-version
-// change (a find/replace applied optimistically, a refetch carrying the
-// server's text back over the refused text) only reaches a row with no
-// unsaved typing, so it can never wipe kept work.
-export function shouldSyncFromRow(args: { versionMoved: boolean; dirty: boolean }): boolean {
-  return args.versionMoved || !args.dirty;
+// The row's local fields after the cached row changed, field by field: a field
+// holding unsaved typing (it differs from `prevBase`, the baseline it was
+// diffed against before this change) keeps it; every other field takes the
+// row's value. So kept typing survives a new version (an AI run's apply after
+// a chapter_locked refusal, another tab's save, the row's own reorder landing)
+// and a same-version refetch, while a clean field still follows the server and
+// a find/replace applied to the cache. The caller rebases the baseline onto
+// the new row, so a kept field still reads as unsaved, as NoteCard does. The
+// server stores these fields as sent, so our own save landing leaves the
+// row clean (local equals the new row).
+export function resyncLocalFields<F extends object>(local: F, prevBase: F, row: F): F {
+  const out = { ...local };
+  for (const k of Object.keys(local) as (keyof F)[]) {
+    if (local[k] === prevBase[k]) out[k] = row[k];
+  }
+  return out;
+}
+
+// The ids of rows of `rowKind` with an edit-field save still in the outbox
+// (pending, in flight, in conflict or failed). Reorders and moves are not
+// edits (see isKeptRowEditOp).
+export function queuedKeptEditIds(
+  ops: readonly { target: { kind: string; rowKind?: string; id?: string }; action: string; patch?: Record<string, unknown> }[],
+  rowKind: "tq" | "twl",
+): string[] {
+  const ids = new Set<string>();
+  for (const op of ops) {
+    if (op.target.rowKind === rowKind && op.target.id && isKeptRowEditOp(op)) ids.add(op.target.id);
+  }
+  return [...ids].sort();
+}
+
+// Save and Undo stay off while a save of the row is queued, so an Undo cannot
+// be overtaken by the save landing and a double click cannot send two PATCHes.
+// Also from the click until the outbox's next snapshot, which already holds
+// the new op (`seq` counts snapshots). Unlike NoteCard's savePendingVersion,
+// it reopens on a refusal or discard: those remove the op from the outbox.
+export function saveGateClosed(args: { queued: boolean; clickedAtSeq: number | null; seq: number }): boolean {
+  return args.queued || (args.clickedAtSeq !== null && args.clickedAtSeq === args.seq);
 }
 
 // Whether a refused row op is a question/word-link edit that the row keeps on

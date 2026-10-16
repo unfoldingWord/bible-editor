@@ -423,9 +423,14 @@ Highlights that bite repeatedly:
   is answered, so a refusal (chapter_locked drops the op; a drawer discard deletes it) leaves
   the refused text in the cache looking saved. Pin the dirty baseline to `row.version`
   (NoteCard's `savedRef`; tq/twl via `web/src/sync/rowEditBaseline.ts` since #1115), carry
-  that baseline in the draft so a remount over the polluted cache stays unsaved, and let a
-  same-version cache change reach only a clean row. Undo must also put the baseline back
-  into the cache (`applyLocalRowPatch`), or the next remount reads the refused text as saved.
+  that baseline in the draft so a remount over the polluted cache stays unsaved, and resync
+  from the cache field by field: a field with unsaved typing keeps it even when the version
+  moves (an AI run's apply after a chapter_locked refusal bumps it), and still reads unsaved
+  against the rebased baseline. Undo, and typing a field back to its saved value, must also
+  put the baseline back into the cache (`applyLocalRowPatch`), or the next remount reads the
+  refused text as saved. Gate Save/Undo on the outbox still holding the row's save, and make
+  the gate reopen when a refusal or discard removes the op (NoteCard's `savePendingVersion`
+  never reopens after a refusal).
   Live-test refusals with Playwright `page.route` on the PATCH; `page.unroute` only removes
   a route registered with the same predicate reference.
 
