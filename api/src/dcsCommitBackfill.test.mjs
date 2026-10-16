@@ -8,6 +8,10 @@
 import { DCS_BACKFILL_PAGE_LIMIT, backfillDcsGaps, backfillDcsRepoGap } from "./dcsCommitBackfill.ts";
 import { DCS_POLL_WRITE_BATCH, INSERT_COMMIT_SQL } from "./dcsCommitPoll.ts";
 import { TRACKED_DCS_REPOS } from "./dcsSources.ts";
+import { DatabaseSync } from "node:sqlite";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -169,6 +173,46 @@ async function main() {
     assert(!fetched, "  ...without spending a fetch, since there is nowhere to start walking from");
     const clr = clearRun(db);
     assert(clr && clr.args[0] === "en_tn" && clr.args[1] === "far-edge", "  ...clearing all three gap columns for this exact gap");
+  }
+
+  // ── issue #1193: a gap whose gap_frontier_json is SQL NULL (a row opened
+  // before migration 0062 added the column — en_ust's bootstrap gap in prod)
+  // must really clear. The mock above compares with JS ===, where
+  // null === null; SQLite's `=` never matches NULL, so this runs the real
+  // statement against real SQLite seeded through the real migrations.
+  {
+    const d = new DatabaseSync(":memory:");
+    const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+    for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+      d.exec(readFileSync(join(dir, f), "utf8"));
+    }
+    d.prepare(
+      `INSERT INTO dcs_repo_polls (repo, gap_since_sha, gap_at, gap_frontier_json) VALUES ('en_ust', 'far-edge', ?, NULL)`,
+    ).run(NOW - 86400);
+    const realDb = {
+      prepare(sql) {
+        const bound = (args) => ({
+          async first() {
+            return d.prepare(sql).get(...args) ?? null;
+          },
+          async run() {
+            d.prepare(sql).run(...args);
+            return { success: true };
+          },
+        });
+        return { bind: (...args) => bound(args) };
+      },
+    };
+    globalThis.fetch = async () => {
+      throw new Error("must not be called");
+    };
+    const res = await backfillDcsRepoGap({ DB: realDb }, "en_ust", NOW);
+    assert(res.status === "no_frontier", "a NULL-frontier gap takes the no_frontier path");
+    const after = d.prepare(`SELECT gap_since_sha, gap_at, gap_frontier_json FROM dcs_repo_polls WHERE repo = 'en_ust'`).get();
+    assert(
+      after.gap_since_sha === null && after.gap_at === null && after.gap_frontier_json === null,
+      "  ...and the gap is actually cleared in SQLite, not reported resolved while it stays open forever",
+    );
   }
 
   // ── a single-entry frontier that fits in one tick's budget: resolves ─────
