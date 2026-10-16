@@ -1722,6 +1722,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // has cleaned this effect up; a late call must not write the old chapter's
     // verse numbers into the new chapter's state.
     let cancelled = false;
+    // Drop the previous chapter's verses at once, so a same-numbered verse
+    // here does not flash amber until the first delivery arrives.
+    setHeldTextKey("");
     const unsubscribe = outbox.subscribe((ops) => {
         if (cancelled) return;
         const verses = ops
@@ -1962,7 +1965,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           laneIndex.get(laneKey(v, lane))?.includes(meUserId) &&
           !(lane === "text" && heldTextVerses.has(v)),
       );
-      setPendingBulk({ lane, checked: !allMine, verses, chapter: data.chapter });
+      // A waiting verse keeps its own held op, which is sent once its refused
+      // save is resolved. Bulk must not write it past that hold, or a later
+      // Retry of the refused save would reopen it.
+      const sendVerses = lane === "text" ? verses.filter((v) => !heldTextVerses.has(v)) : verses;
+      if (sendVerses.length === 0) return;
+      setPendingBulk({ lane, checked: !allMine, verses: sendVerses, chapter: data.chapter });
     },
     [meUserId, tileSet, laneIndex, data, heldTextVerses],
   );
