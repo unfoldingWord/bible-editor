@@ -698,6 +698,12 @@ Highlights that bite repeatedly:
   follow: a landed write and a non-adoption flag settle the row (prior_run NULL); an unsettled row is always an
   unlanded speculation, so a later run inherits its capture; step 7b and a run's start undo only their own run's
   rows plus any run's capture older than an hour (`STALE_SPECULATION_SECONDS`), never a younger foreign one.
+- **A ledger-gated relaxation is inert on any repo whose `dcs_repo_polls.gap_since_sha` is set, however old the
+  gap.** `readLedgerMasterLineage` refuses (`ledger_coverage_incomplete`) on any gap, even one below
+  `coverage_since`. Measured read-only 2026-10-16: `en_tn` (gap since 2026-09-11) and `en_ust` (since 2026-09-01)
+  both carry one, so #1159's export_revert relaxation (a reimport-adopted bot push counts as bot lineage only
+  under a clean ledger) fails closed for every TN book until the backfill clears the en_tn gap. Check the poll
+  row before expecting a ledger-gated change to quiet anything in prod.
 
 ## Stop conditions / goals
 

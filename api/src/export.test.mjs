@@ -2995,6 +2995,10 @@ function utf8Base64(s) {
     `#1159: master changed after the reimport (payload != master) -> warning kept`);
   assert((await run({ events: [[5, "dcs_reimport", "create", "X", 900], [30, null, "update", "Z", 1200]] })) === 1,
     `#1159: reimport write at or before the last good export -> warning kept`);
+  assert((await run({ conf: { editId: null, at: 1000 } })) === 0,
+    `#1159: no edit-id boundary, reimport write after master_confirmed_at -> 0 entries`);
+  assert((await run({ conf: { editId: null, at: 1000 }, events: [[20, "dcs_reimport", "create", "X", 1000], [30, null, "update", "Z", 1200]] })) === 1,
+    `#1159: no edit-id boundary, reimport write in the same second as master_confirmed_at -> warning kept`);
   assert((await run({ events: [[20, "dcs_reimport", "restore", "X", 1100], [30, null, "update", "Z", 1200]] })) === 1,
     `#1159: a reimport restore is not adoption lineage -> warning kept`);
 }
