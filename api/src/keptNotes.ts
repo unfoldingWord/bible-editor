@@ -417,7 +417,12 @@ export async function loadKeptTns(
         AND deleted_at IS NULL AND trashed_at IS NULL AND hint = 0
         AND (preserve = 1 OR updated_by IS NOT NULL
              OR (last_change_source = 'dcs_sync' AND last_change_action IN ('sync_merge', 'sync_reseed')
-                 AND last_change_actor LIKE 'Door43 (commits by %'))
+                 AND last_change_actor LIKE 'Door43 (commits by %'
+                 -- only AI-written notes can qualify (fixedAiNote); skips the
+                 -- master-only rows a named sync stamps (index edit_log_row)
+                 AND EXISTS (SELECT 1 FROM edit_log e
+                              WHERE e.kind = 'tn' AND e.row_key = tn_rows.id
+                                AND e.source = 'ai_pipeline')))
       ORDER BY chapter, verse, sort_order, id`,
   )
     .bind(book, startChapter, endChapter)

@@ -203,6 +203,7 @@ function fakeEnv(candidates, logs) {
   const load = await loadKeptTns(env, "EZK", 40, 40);
   assert(load.rows.map((r) => r.row.id).join() === "pres,edit,bad1", "loadKeptTns keeps preserve + edited + (bad ref, filtered later)");
   assert(/updated_by IS NOT NULL/.test(env.queries[0]) && /hint = 0/.test(env.queries[0]) && /trashed_at IS NULL/.test(env.queries[0]), "candidate query excludes pristine, hint and trashed rows");
+  assert(/last_change_actor LIKE 'Door43 \(commits by %'/.test(env.queries[0]) && /sync_reseed/.test(env.queries[0]) && /e.source = 'ai_pipeline'/.test(env.queries[0]), "candidate query admits AI-written notes a named person changed on Door43 (#1155)");
   const opts = await buildKeptOption(fakeEnv(cands, logs), "EZK", 40, 40);
   assert(opts.map((o) => o.rowId).join() === "pres,edit", "buildKeptOption drops the unsendable row");
   const hinted = await buildKeptOption(fakeEnv(cands, logs), "EZK", 40, 40, new Set(["edit"]));
@@ -213,7 +214,7 @@ function fakeEnv(candidates, logs) {
   const cands = Array.from({ length: 200 }, (_, i) => row({ id: `e${String(i).padStart(3, "0")}` }));
   const env = fakeEnv(cands, {});
   await loadKeptTns(env, "EZK", 1, 66);
-  assert(env.queries.filter((q) => /FROM edit_log/.test(q)).length === 3, "edit_log read in 3 chunks for 200 ids");
+  assert(env.queries.filter((q) => /FROM edit_log/.test(q) && !/FROM tn_rows/.test(q)).length === 3, "edit_log read in 3 chunks for 200 ids");
 }
 {
   const cands = Array.from({ length: MAX_KEPT + 1 }, (_, i) => row({ id: `a${(i + 1000).toString(36).padStart(3, "0")}`, preserve: 1 }));

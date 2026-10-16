@@ -521,7 +521,7 @@ await (async () => {
     !/updated_by IS NULL/.test(sql) && !/FROM edit_log/.test(sql),
     "keep rule: the SELECT no longer filters on updated_by or the latest edit_log source",
   );
-  for (const col of ["updated_by", "quote", "note", "support_reference", "preserve", "ref_raw"]) {
+  for (const col of ["updated_by", "quote", "note", "support_reference", "preserve", "ref_raw", "last_change_source", "last_change_action", "last_change_actor"]) {
     assert(sql.includes(col), `keep rule: the SELECT returns ${col} for classifyKept`);
   }
 })();
