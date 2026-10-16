@@ -83,6 +83,14 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **tq/twl rows compare against a pin, not the cache (#1115).** `web/src/sync/rowEditPin.ts` holds the rules:
+  the cache carries optimistic text at an unchanged version, so "the row equals what is on screen" is only a
+  server confirmation once the version moved past the one cached at the click. NoteCard's own rebase
+  (`savedRef`, render time) is unconditional, so a tn draft hydrated over a newer row re-pins to it. Live-testing a
+  chapter lock locally: insert a `pipeline_jobs` row (state `running`) with `wrangler d1 execute --local --file`;
+  after deleting it, `page.reload()`, because the client relearns locks only on a pipelineStore reload. A discard
+  can be driven from vite dev with `(await import("/src/sync/outbox.ts")).outbox.drop(id, { onlyIfStatus })`.
+
 - **Live-testing cross-tab outbox races and the viewer role locally.** 2026-10-09 (#1147): the chapter room's
   `row.deleted` usually heals a stale load (its step is replayed over a deferred merge), hiding the race. Silence
   one tab's room with Playwright `page.routeWebSocket(/\/api\/ws\/chapter\//, () => {})` and buffer its

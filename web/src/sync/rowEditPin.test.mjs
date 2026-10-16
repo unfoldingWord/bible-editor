@@ -111,6 +111,13 @@ check(
     !rowSaveInFlight({ pin: v1, row: pinOf(1, "mine", "r1"), local: { question: "mine2", response: "r1" }, submitted: sub, keys }),
     "new typing after the click is a new edit",
   );
+  check(
+    rowSaveInFlight({
+      pin: v1, row: pinOf(1, "mine", "r1"), local: { question: "mine", response: "unsent" },
+      submitted: sub, keys,
+    }),
+    "a field left out of the save (a history restore's dirty ref) does not reopen Save",
+  );
 }
 
 console.log(`rowEditPin: ${passed} passed`);

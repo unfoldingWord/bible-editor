@@ -1351,7 +1351,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           void rollBackRefusedTnMove(op);
           void rollBackRefusedRowPatch(op);
           pushPipelineToast(
-            "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+            // A refused row text edit stays on screen as unsaved (#1115); a
+            // move or reorder is put back instead.
+            op.target.kind === "row" &&
+              op.action === "patch" &&
+              !("verse" in op.patch) &&
+              !("sort_order" in op.patch)
+              ? "Not saved — the AI run for this chapter is mid-flight. Your edit is kept as unsaved; save it again after the run finishes."
+              : "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }

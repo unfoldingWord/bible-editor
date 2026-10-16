@@ -117,8 +117,10 @@ export function rowSaveInFlight<F extends RowFields>(args: {
   if (!submitted || submitted.version !== pin.version) return false;
   if (row.version !== submitted.rowVersion) return false;
   if (sameFields(local, pin.shown, keys)) return false;
+  // Only the submitted fields: a history restore leaves a dirty ref unsent.
   for (const k of Object.keys(submitted.shown)) {
     if (submitted.shown[k] !== local[k as keyof F]) return false;
+    if (row.shown[k as keyof F] !== local[k as keyof F]) return false;
   }
-  return sameFields(row.shown, local, keys);
+  return true;
 }
