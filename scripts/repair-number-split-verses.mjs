@@ -506,10 +506,18 @@ const stmtCount = repaired.length * 2;
 // resource) and is run with no flags, so an unfiltered SELECT would count every
 // match in the whole table. Pairs, not book IN x version IN, so a dump of
 // 1CH/ULT + ISA/UST does not also count 1CH/UST. Values come from dump rows.
-const scanPairs = [...new Set(rows.map((r) => `${r.book}/${r.bible_version}`))].sort();
+// A row with no usable book or resource was already REFUSED above, and the
+// table cannot hold such a row, so it adds no pair.
+const scanPairs = [
+  ...new Set(
+    rows
+      .filter((r) => typeof r.book === "string" && r.book.trim() && typeof r.bible_version === "string" && r.bible_version.trim())
+      .map((r) => `${r.book}/${r.bible_version}`),
+  ),
+].sort();
 // These land in a `--` comment line of a file applied to production; a quote or
 // line break would break the copy-pasted query or end the comment.
-const badPair = scanPairs.find((p) => !/^[A-Z0-9]+\/[A-Za-z0-9_-]+$/.test(p));
+const badPair = scanPairs.find((p) => !/^[A-Za-z0-9]+\/[A-Za-z0-9_-]+$/.test(p));
 if (badPair) die(`dump row has an unexpected book/bible_version '${badPair}'; refusing to write it into the SQL`);
 
 const header = [
