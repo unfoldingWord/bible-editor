@@ -703,7 +703,9 @@ Highlights that bite repeatedly:
   `coverage_since`. Measured read-only 2026-10-16: `en_tn` (gap since 2026-09-11) and `en_ust` (since 2026-09-01)
   both carry one, so #1159's export_revert relaxation (a reimport-adopted bot push counts as bot lineage only
   under a clean ledger) fails closed for every TN book until the backfill clears the en_tn gap. Check the poll
-  row before expecting a ledger-gated change to quiet anything in prod.
+  row before expecting a ledger-gated change to quiet anything in prod. The read also needs the poll tip to equal the
+  live head, and the poller runs at most every 30 minutes, so a commit to the repo shortly before an export step
+  (any book) answers `ledger_tip_stale` and keeps the warning that night too.
 
 ## Stop conditions / goals
 

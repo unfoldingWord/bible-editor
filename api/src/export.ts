@@ -1289,7 +1289,7 @@ export function buildRevertLineage(
 // row's warning. A missing, stale, gapped or too-young ledger is not usable,
 // so it answers false and the warning stands.
 export function ledgerProvesNoHumanCommit(ledger: LedgerLineageResult | null): boolean {
-  return ledger != null && ledger.usable && ledger.lineage != null && !ledger.lineage.incomplete && !ledger.lineage.hasHumanCommit;
+  return ledger != null && ledger.usable === true && ledger.lineage != null && ledger.lineage.incomplete === false && ledger.lineage.hasHumanCommit === false;
 }
 
 // Reads the tn/tq revert lineage for one (book, kind) from edit_log.
