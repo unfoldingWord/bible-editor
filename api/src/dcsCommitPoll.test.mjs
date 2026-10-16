@@ -28,7 +28,12 @@ import {
   pollBounds,
   pollDcsRepo,
   repoNeedsPoll,
+  UPSERT_POLL_SQL,
 } from "./dcsCommitPoll.ts";
+import { DatabaseSync } from "node:sqlite";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { TRACKED_DCS_REPOS } from "./dcsSources.ts";
 
 function assert(cond, msg) {
@@ -856,6 +861,31 @@ async function main() {
     await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
     const upsert = pollUpsert(db);
     assert(upsert.args[6] === null && upsert.args[9] === null, "#1211: a second parent already in the ledger opens no gap");
+  }
+
+  // ── issue #1211 review: two overlapping polls each union their frontier
+  // with the state they READ, which can be stale. The upsert itself must
+  // union with the STORED frontier, so a later poll cannot erase an entry an
+  // earlier one wrote. Real SQLite through the real migrations. ────────────
+  {
+    const d = new DatabaseSync(":memory:");
+    const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+    for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) d.exec(readFileSync(join(dir, f), "utf8"));
+    const upsert = (frontier, gapSince = "mark") =>
+      d
+        .prepare(UPSERT_POLL_SQL)
+        .run("en_tn", "tip", NOW, NOW, NOW, "ok", gapSince, gapSince ? NOW : null, 1, frontier == null ? null : JSON.stringify(frontier), NOW);
+    const stored = () => d.prepare(`SELECT gap_since_sha, gap_frontier_json FROM dcs_repo_polls WHERE repo = 'en_tn'`).get();
+    upsert(["X"]);
+    upsert(["Y", "X"]);
+    upsert(["Y"]);
+    const got = JSON.parse(stored().gap_frontier_json).sort().join(",");
+    assert(got === "X,Y", `#1211: a stored frontier {X} plus an incoming {Y} ends as {X,Y}, deduped (got ${got})`);
+    upsert(null, null);
+    assert(JSON.parse(stored().gap_frontier_json).sort().join(",") === "X,Y", "  ...and a clean poll (NULL) still keeps the open gap's frontier");
+    d.prepare(`UPDATE dcs_repo_polls SET gap_since_sha = NULL, gap_frontier_json = NULL WHERE repo = 'en_tn'`).run();
+    upsert(["Z"]);
+    assert(stored().gap_frontier_json === '["Z"]', "  ...and with no gap open the incoming frontier is written as is");
   }
 
   console.log("dcsCommitPoll: all assertions passed");

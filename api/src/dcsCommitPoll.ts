@@ -432,7 +432,7 @@ const CLAIM_ATTEMPT_SQL = `INSERT INTO dcs_repo_polls (repo, last_attempted_at)
  VALUES (?1, ?2)
  ON CONFLICT (repo) DO UPDATE SET last_attempted_at = excluded.last_attempted_at`;
 
-const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
+export const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
     last_status, gap_since_sha, gap_at, gap_frontier_json, coverage_since)
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10, ?11)
