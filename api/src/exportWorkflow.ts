@@ -58,6 +58,7 @@ import {
   classifyRevertSeverity,
   mechanicalOverwriteAlert,
   isMasterConfirmed,
+  lockedPushLanded,
   type AlignmentShrinkResult,
   type OffenderProvenance,
   type Resource,
@@ -101,7 +102,7 @@ import {
   readVerifiedPushedRenderText,
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
-import { retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
+import { noteLockedPushOnVerseMergeAlert, retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
 import { dcsResourceFile, fetchDcsMasterText, fileBlobShaAtCommit, fileHeadCommit, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
 import { readLedgerMasterLineage, type LedgerLineageResult } from "./masterLineageLedger.ts";
 import { DCS_POLL_FETCH_TIMEOUT_MS } from "./dcsCommitPoll.ts";
@@ -754,6 +755,38 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             resource,
             error: e instanceof Error ? e.message : String(e),
           });
+        }
+        // Issue #1127 (decision B): a lock/push whose commit reached Door43
+        // adds one sentence to the book's locked verse-merge alert. A skipped
+        // or failed step changes nothing (lockedPushLanded). Its own step, after
+        // this run's reimport raised; best-effort, never fails the run.
+        const landed = lockedPushLanded(itemResult, {
+          allowLocked: lockOverride,
+          bookLocked: lockedBooks.has(book),
+          branchOverride,
+          observedAt: alertObservedAt,
+        });
+        if (landed) {
+          try {
+            // The note's observation token, persisted in its own step the way
+            // runChunkedReimport persists its own: a replay returns the same
+            // value, and it is taken after this run's reimport raised (so it
+            // is not dropped as older than that raise). A run that starts
+            // later takes a later token. One narrow race remains: a nightly
+            // reimport of the same book that took its token before this step
+            // and raises after it has that raise dropped as older.
+            const noteObservedAt = await step.do(`${stepName}-lock-push-observed`, async () => Date.now());
+            await step.do(`${stepName}-lock-push-alert`, async () => {
+              await noteLockedPushOnVerseMergeAlert(this.env, book, resource, landed, noteObservedAt);
+              return landed;
+            });
+          } catch (e) {
+            console.error("export lock-push alert note failed", {
+              book,
+              resource,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
         }
       }
       // Post-export validate-and-merge is opt-in via params.validateAndMerge.

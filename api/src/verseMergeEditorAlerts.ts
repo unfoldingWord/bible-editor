@@ -301,6 +301,53 @@ function plainDate(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toISOString().slice(0, 10);
 }
 
+// Issue #1127 (decision B): an admin lock/push whose commit reached Door43
+// (export.ts's lockedPushLanded). Stored in the alert's condition key, so it
+// must stay small and replay-stable.
+export interface LockedPush {
+  /** YYYY-MM-DD of the run that pushed. */
+  date: string;
+  branch: string;
+  prNumber: number | null;
+  target: "auto" | "review" | "master";
+}
+
+/** A LockedPush read back from a stored condition key, or null if malformed. */
+export function parseLockedPush(value: unknown): LockedPush | null {
+  const v = value as Partial<LockedPush> | null | undefined;
+  if (!v || typeof v.date !== "string" || typeof v.branch !== "string") return null;
+  const prNumber = v.prNumber === null ? null : Number.isInteger(v.prNumber) ? (v.prNumber as number) : undefined;
+  if (prNumber === undefined) return null;
+  if (v.target !== "auto" && v.target !== "review" && v.target !== "master") return null;
+  return { date: v.date, branch: v.branch, prNumber, target: v.target };
+}
+
+// The one sentence decision B adds to an alert that uses the locked wording
+// ("the export skips it: Door43 keeps its own version"). It states only what
+// the export measured: its commit landed on that branch. Master has not moved
+// for an `auto` or `review` push at that point (a `-be-` branch merges after
+// DCS's own checks; a review branch waits for a maintainer), so neither says
+// Door43 was overwritten. The lock itself is unchanged, so later nightly
+// exports still skip the book.
+export function buildLockedPushSentence(book: string, resource: string, push: LockedPush): string {
+  const what = `On ${push.date} an admin pushed the app's version of ${book} ${resource.toUpperCase()} to Door43`;
+  const pr = push.prNumber != null ? ` (PR #${push.prNumber})` : "";
+  const where =
+    push.target === "master"
+      ? `${what}, straight to its master branch, so Door43 now holds the app's version of this file.`
+      : push.target === "review"
+        ? `${what} for review, on branch ${push.branch}${pr}. Nothing merges that branch automatically; ` +
+          `Door43's master keeps its own version until a maintainer merges it.`
+        : push.prNumber == null
+          ? // The merge bot acts only on an open pull request, and opening one
+            // failed (export.ts's ensureDcsPr), so do not promise a merge.
+            `${what} on branch ${push.branch}, but no pull request into master is open for it yet, so ` +
+            `nothing merges it until one is opened; Door43's master keeps its own version.`
+          : `${what} on branch ${push.branch}${pr}, which Door43 merges into master if its checks pass; ` +
+            `until then Door43's master keeps its own version.`;
+  return `${where} The book is still locked, so later nightly exports keep skipping it.`;
+}
+
 // Issue #624: a sync-warning alert used to name a flat, unjoined list of refs
 // (`Refs: 38:2, 41:9, …`) alongside a SEPARATE reason-count breakdown
 // (`1 alignment_shrink, 6 source_attr_ambiguous, …`) — nothing joined a given
