@@ -24,7 +24,10 @@ import {
   drainOrder,
   eligibleForVersionThread,
   isMaxAttemptsBlocked,
+  laneCheckHeld,
+  laneCheckHeldByRefusal,
   laneChecksToKeepBehind,
+  refusedVerseOpsSupersededBy,
   pickNextOp,
   shouldAnnounceResult,
   targetKey,
@@ -633,6 +636,63 @@ check(
     );
     const rowConflict = { ...op1FailedA, status: "conflict" };
     check(laneChecksToKeepBehind(rowConflict, [behind]).length === 0, "a row conflict moves no lane checks");
+  }
+  // #1218: a refused verse save held the done mark until Retry or Discard,
+  // even after a newer save of the same verse landed. The landed save
+  // supersedes the older refused op, so that op stops holding the check.
+  {
+    const refused = verseOp("v1", 7, "ULT", "failed", 100, 1, { lastError: "http 422" });
+    const lc = laneOp("lc", 7, 101, 2);
+    const landed = verseOp("v2", 7, "ULT", "in_flight", 102, 3);
+    check(laneCheckHeld(lc, [refused, lc, landed]), "a refused save holds the text check queued behind it");
+    const released = refusedVerseOpsSupersededBy(landed, [refused, lc, landed]);
+    check(
+      released.length === 1 && released[0] === refused,
+      "FIX (#1218): a newer landed save of the same verse supersedes the older refused op",
+    );
+    const after = [lc];
+    check(pickNextOp(after, new Set()) === lc, "FIX (#1218): with the superseded op gone, the check dispatches");
+
+    const maxed = verseOp("m", 7, "ULT", "failed", 100, 1, { lastError: MAX_ATTEMPTS_SENTINEL });
+    check(
+      refusedVerseOpsSupersededBy(landed, [maxed]).length === 0,
+      "a max-attempts failed op (it retries on its own) is not released",
+    );
+    const otherVersion = verseOp("u", 7, "UST", "failed", 100, 1, { lastError: "http 422" });
+    check(
+      refusedVerseOpsSupersededBy(landed, [otherVersion]).length === 0,
+      "a refused UST save is not released by a ULT save",
+    );
+    const otherVerse = verseOp("o", 8, "ULT", "failed", 100, 1, { lastError: "http 422" });
+    check(refusedVerseOpsSupersededBy(landed, [otherVerse]).length === 0, "a refused save of another verse is not released");
+    const younger = verseOp("y", 7, "ULT", "failed", 103, 4, { lastError: "http 422" });
+    check(
+      refusedVerseOpsSupersededBy(landed, [younger]).length === 0,
+      "a refused save queued AFTER the landed one is not released",
+    );
+    const pendingSibling = verseOp("p", 7, "ULT", "pending", 100, 1);
+    check(refusedVerseOpsSupersededBy(landed, [pendingSibling]).length === 0, "a pending sibling is not released");
+    const conflicted = verseOp("c", 7, "ULT", "conflict", 100, 1);
+    check(refusedVerseOpsSupersededBy(landed, [conflicted]).length === 0, "a conflicted sibling is not released");
+    check(
+      refusedVerseOpsSupersededBy(lc, [refused]).length === 0,
+      "a landed lane check releases nothing",
+    );
+
+    // The waiting look is only for a check held by a refused save.
+    check(laneCheckHeldByRefusal(lc, [refused, lc]), "FIX (#1218): a refused save makes the held check waiting");
+    for (const status of ["pending", "in_flight", "conflict"]) {
+      const holder = verseOp("h", 7, "ULT", status, 100, 1);
+      check(
+        laneCheckHeld(lc, [holder, lc]) && !laneCheckHeldByRefusal(lc, [holder, lc]),
+        `a ${status} save holds the check but does not make it waiting`,
+      );
+    }
+    check(
+      laneCheckHeld(lc, [maxed, lc]) && !laneCheckHeldByRefusal(lc, [maxed, lc]),
+      "a save retrying on its own (max attempts) holds the check but does not make it waiting",
+    );
+    check(!laneCheckHeldByRefusal(lc, [younger, lc]), "a refused save queued after the check does not make it waiting");
   }
 }
 

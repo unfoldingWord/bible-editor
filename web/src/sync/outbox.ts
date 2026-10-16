@@ -32,6 +32,7 @@ import {
   isMaxAttemptsBlocked,
   laneChecksToKeepBehind,
   pickNextOp,
+  refusedVerseOpsSupersededBy,
   shouldAnnounceResult,
   targetKey,
 } from "./outboxTargeting.ts";
@@ -988,6 +989,25 @@ async function threadVersionToSiblings(done: OutboxOp, updated: unknown) {
   await tx.done;
 }
 
+// #1218: delete the refused verse ops `landed` superseded
+// (refusedVerseOpsSupersededBy), in one readwrite tx that re-checks each
+// record the same way the "discard refused" flow does, so a Retry from
+// another tab between the read and the delete wins. Each deleted op is
+// announced to the discard listeners, exactly as a manual Discard would be.
+async function dropSupersededRefusals(landed: OutboxOp) {
+  if (landed.target.kind !== "verse") return;
+  const tx = (await db()).transaction(STORE, "readwrite");
+  const all = (await tx.store.getAll()) as OutboxOp[];
+  const dropped: OutboxOp[] = [];
+  for (const o of refusedVerseOpsSupersededBy(landed, all)) {
+    if (!dropGuardAllows(o, { onlyIfStatus: "failed", onlyIfRefused: true })) continue;
+    await tx.store.delete(o.id);
+    dropped.push(o);
+  }
+  await tx.done;
+  for (const o of dropped) for (const l of discardListeners) l(o);
+}
+
 // A reorder enqueues a patch whose only field is sort_order. Such patches are
 // last-write-wins and must never raise a user-facing conflict — they auto-heal
 // against the server's current version instead.
@@ -1191,6 +1211,18 @@ async function drainPass() {
 
     if (shouldAnnounceResult(result.kind, persisted)) {
       for (const l of resultListeners) l(next, result);
+    }
+    // #1218: this save superseded any older refused save of the same verse.
+    // Drop those (as the Discard button would) so they stop holding the
+    // verse's done mark. After the ok listeners, so the caches already hold
+    // the landed row when the discard listeners run. Best-effort: a failure
+    // leaves the refused op for the user to retry or discard, as before.
+    if (result.kind === "ok") {
+      try {
+        await dropSupersededRefusals(next);
+      } catch {
+        /* the refused op stays listed */
+      }
     }
     void notify();
   }

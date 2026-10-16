@@ -140,6 +140,22 @@ function verseSaveCanReopen(verse: OpTarget, lc: OpTarget): boolean {
 // it: an edit made after checking still reopens. A tn/tq check is never held,
 // so a stuck verse save cannot freeze an unrelated checkbox.
 export function laneCheckHeld(lc: PickOp, ops: PickOp[]): boolean {
+  return laneCheckHeldWhere(lc, ops, verseOpUnsettled);
+}
+
+// #1218: whether this check is held by a REFUSED verse save, one that waits
+// for the user's Retry or Discard. Only then does the UI show the check as
+// waiting; a save that is merely queued, in flight or retrying on its own
+// settles without the user, so its check keeps the ordinary look.
+export function laneCheckHeldByRefusal(lc: PickOp, ops: PickOp[]): boolean {
+  return laneCheckHeldWhere(
+    lc,
+    ops,
+    (o) => o.status === "failed" && !willRetryOnItsOwn(o.lastError),
+  );
+}
+
+function laneCheckHeldWhere(lc: PickOp, ops: PickOp[], holds: (o: PickOp) => boolean): boolean {
   if (lc.target.kind !== "lane_check") return false;
   return ops.some(
     (o) =>
@@ -147,7 +163,7 @@ export function laneCheckHeld(lc: PickOp, ops: PickOp[]): boolean {
       verseSaveCovers(o.target, lc.target) &&
       verseSaveCanReopen(o.target, lc.target) &&
       drainOrder(o, lc) < 0 &&
-      verseOpUnsettled(o),
+      holds(o),
   );
 }
 
@@ -203,4 +219,27 @@ export function laneChecksToKeepBehind<T extends PickOp>(requeued: PickOp, all: 
         drainOrder(requeued, o) < 0,
     )
     .sort(drainOrder);
+}
+
+// #1218: a refused verse op stays in the outbox until the user retries or
+// discards it, and while it does it holds the same-verse lane checks queued
+// behind it (laneCheckHeld). When a NEWER save of the same target (same verse
+// and bibleVersion) lands, that save carried the verse's whole content, so
+// the older refused op is superseded: retrying it would only put its older
+// text back. These are the refused ops the caller drops once `landed` lands,
+// so the held checks can dispatch. Only refused (fatal) ops queued before the
+// landed one: an op that will retry on its own blocks its target, so no
+// younger save passes it, and a pending or conflicted sibling still has a
+// save to make.
+export function refusedVerseOpsSupersededBy<T extends PickOp>(landed: PickOp, all: T[]): T[] {
+  if (landed.target.kind !== "verse") return [];
+  const key = targetKey(landed.target);
+  return all.filter(
+    (o) =>
+      o.target.kind === "verse" &&
+      targetKey(o.target) === key &&
+      o.status === "failed" &&
+      !willRetryOnItsOwn(o.lastError) &&
+      drainOrder(o, landed) < 0,
+  );
 }

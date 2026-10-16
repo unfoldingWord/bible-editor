@@ -45,6 +45,7 @@ import {
   laneAttribution,
   shadeFromCheckers,
   LANE_LABELS,
+  LANE_WAITING_NOTE,
   type LaneShade,
   type TextLaneCheck,
 } from "../lib/laneChecks";
@@ -100,7 +101,14 @@ import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
-import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
+import { laneCheckHeldByRefusal, targetKey as outboxTargetKey } from "../sync/outboxTargeting";
+
+// #1218: my Text-lane mark on a verse whose earlier text save was turned down
+// shows as "waiting" (it is held in the outbox, not yet sent), not as done.
+function textLaneShade(checkers: number[] | undefined, meUserId: number | null, held: boolean): LaneShade {
+  if (held && meUserId != null && checkers?.includes(meUserId)) return "waiting";
+  return shadeFromCheckers(checkers, meUserId);
+}
 import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
 import { planRefusedRowDeleteRollback, planRefusedRowPatchRollback } from "../sync/refusedRowRollback";
 import { dropOwnRowDeleteClick, markOwnRowDelete, recordOwnRowDeleteClickOp } from "../sync/pendingRowDeletes";
@@ -1705,6 +1713,44 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     return out;
   }, [versesForTiles]);
+  // #1218: verses of this chapter whose Text-lane mark is held in the outbox
+  // behind a turned-down text save (laneCheckHeldByRefusal). Kept as a joined key so
+  // the outbox's frequent notifies only re-render when the set changes.
+  const [heldTextKey, setHeldTextKey] = useState("");
+  useEffect(() => {
+    // subscribe's first delivery is async and can land after a chapter change
+    // has cleaned this effect up; a late call must not write the old chapter's
+    // verse numbers into the new chapter's state.
+    let cancelled = false;
+    // Drop the previous chapter's verses at once, so a same-numbered verse
+    // here does not flash amber until the first delivery arrives.
+    setHeldTextKey("");
+    const unsubscribe = outbox.subscribe((ops) => {
+        if (cancelled) return;
+        const verses = ops
+          .filter(
+            (o) =>
+              o.target.kind === "lane_check" &&
+              o.target.lane === "text" &&
+              o.target.book === book &&
+              o.target.chapter === chapter &&
+              o.status === "pending" &&
+              o.patch.checked === true &&
+              laneCheckHeldByRefusal(o, ops),
+          )
+          .map((o) => (o.target.kind === "lane_check" ? o.target.verse : 0))
+          .sort((a, b) => a - b);
+        setHeldTextKey([...new Set(verses)].join(","));
+      });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [book, chapter]);
+  const heldTextVerses = useMemo(
+    () => new Set(heldTextKey ? heldTextKey.split(",").map(Number) : []),
+    [heldTextKey],
+  );
   const tileSet = useMemo<VerseTile[]>(() => {
     if (!versesForTiles) return [];
     const versesWithSomething = new Set<number>();
@@ -1725,8 +1771,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
                 : laneApplicable(lane, versesWithTn.has(0), versesWithTq.has(0))
             : laneApplicable(lane, versesWithTn.has(verse), versesWithTq.has(verse));
         const checkers = laneIndex.get(laneKey(verse, lane));
-        const shade: LaneShade = applicable ? shadeFromCheckers(checkers, meUserId) : "open";
-        const title = `${LANE_LABELS[lane]} — ${applicable ? laneAttribution(checkers, meUserId) : "nothing to check"}`;
+        const shade: LaneShade = !applicable
+          ? "open"
+          : lane === "text"
+            ? textLaneShade(checkers, meUserId, heldTextVerses.has(verse))
+            : shadeFromCheckers(checkers, meUserId);
+        const title = `${LANE_LABELS[lane]} — ${
+          shade === "waiting" ? LANE_WAITING_NOTE : applicable ? laneAttribution(checkers, meUserId) : "nothing to check"
+        }`;
         return { lane, shade, applicable, title };
       });
     // Chapter-front USFM content (Psalm \d superscriptions, leading \p before \v 1)
@@ -1757,7 +1809,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const verseNums = [...versesWithSomething].filter((v) => v > 0).sort((a, b) => a - b);
     for (const v of verseNums) tiles.push({ verse: v, has: unalignedByVerse.get(v) ?? false, lanes: buildLanes(v) });
     return tiles;
-  }, [chapter, versesForTiles, unalignedByVerse, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl, introHasComment]);
+  }, [chapter, versesForTiles, unalignedByVerse, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl, introHasComment, heldTextVerses]);
 
   // Which alignment-attention refs (from the last nightly export) are already
   // fixed in the currently loaded chapter — re-parsed against live verse
@@ -1906,10 +1958,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         .filter((t) => t.lanes.find((l) => l.lane === lane)?.applicable)
         .map((t) => t.verse);
       if (verses.length === 0) return;
-      const allMine = verses.every((v) => laneIndex.get(laneKey(v, lane))?.includes(meUserId));
-      setPendingBulk({ lane, checked: !allMine, verses, chapter: data.chapter });
+      // A waiting Text mark (#1218) is not done on the server, so it does not
+      // count as mine here either — the same rule as the chapter board's tally.
+      const allMine = verses.every(
+        (v) =>
+          laneIndex.get(laneKey(v, lane))?.includes(meUserId) &&
+          !(lane === "text" && heldTextVerses.has(v)),
+      );
+      // A waiting verse keeps its own held op, which is sent once its refused
+      // save is resolved. Bulk must not write it past that hold, or a later
+      // Retry of the refused save would reopen it.
+      const sendVerses = lane === "text" ? verses.filter((v) => !heldTextVerses.has(v)) : verses;
+      if (sendVerses.length === 0) return;
+      setPendingBulk({ lane, checked: !allMine, verses: sendVerses, chapter: data.chapter });
     },
-    [meUserId, tileSet, laneIndex, data],
+    [meUserId, tileSet, laneIndex, data, heldTextVerses],
   );
   // Run the confirmed bulk: optimistic apply + one direct PATCH (deliberate,
   // online action), reconciled from the server response.
@@ -1959,11 +2022,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // Same reasoning as resourceCheckoff above — a locked book must not
       // offer the Text-lane checkbox either.
       canCheck: meUserId != null && !editLocked,
-      shade: (verse) => shadeFromCheckers(laneIndex.get(laneKey(verse, "text")), meUserId),
-      attribution: (verse) => laneAttribution(laneIndex.get(laneKey(verse, "text")), meUserId),
+      shade: (verse) => textLaneShade(laneIndex.get(laneKey(verse, "text")), meUserId, heldTextVerses.has(verse)),
+      attribution: (verse) =>
+        textLaneShade(laneIndex.get(laneKey(verse, "text")), meUserId, heldTextVerses.has(verse)) === "waiting"
+          ? LANE_WAITING_NOTE
+          : laneAttribution(laneIndex.get(laneKey(verse, "text")), meUserId),
       onToggle: (verse) => toggleLane(verse, "text"),
     }),
-    [laneIndex, meUserId, editLocked, toggleLane],
+    [laneIndex, meUserId, editLocked, toggleLane, heldTextVerses],
   );
 
   // Chapter board (verses × lanes overview) dialog.

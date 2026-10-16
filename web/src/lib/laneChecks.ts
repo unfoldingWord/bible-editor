@@ -7,7 +7,14 @@
 
 import type { CheckLane, VerseLaneCheck } from "../sync/api";
 
-export type LaneShade = "open" | "me" | "others" | "both";
+// "waiting" (#1218): my Text-lane done mark is set on this screen but not yet
+// sent, because an earlier save of the verse's text was turned down
+// (outboxTargeting.ts laneCheckHeld). The server and teammates still see it
+// open until that save is retried, discarded, or replaced by a newer save.
+export type LaneShade = "open" | "me" | "others" | "both" | "waiting";
+
+export const LANE_WAITING_NOTE =
+  "Waiting: this verse's text was turned down. Retry or discard it in the status bar.";
 
 // Per-verse Text-lane check control, threaded into the column/book scripture
 // views so the dense flowing/blocked text can show + toggle the Text check
@@ -32,6 +39,8 @@ export const LANE_FILL: Record<Exclude<LaneShade, "open">, { bg: string; fg: str
   others: { bg: "#A0DEDF", fg: "#014263" },
   me: { bg: "#70C9CC", fg: "#014263" },
   both: { bg: "#3F9CA0", fg: "#FFFFFF" },
+  // Kindle amber, so a mark that has not reached the server stands apart.
+  waiting: { bg: "#E59D33", fg: "#231F20" },
 };
 
 export function laneKey(verse: number, lane: CheckLane): string {
