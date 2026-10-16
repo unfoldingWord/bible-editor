@@ -3420,6 +3420,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Dismissing the unalign confirm without saving: any save chain waiting on it
   // (the gate's Save, the save-done-next button) is stalled for good, so free
   // the button's in-flight guard too.
+  // #1196: closing the dual aligner while a side's outbox write is pending
+  // unmounts the panel, whose waiting save then never commits, so its chain
+  // never reaches advance. Free the button's guard so it works on reopen.
+  const dualOpen = dualTarget != null;
+  useEffect(() => {
+    if (!dualOpen) saveDoneGuardRef.current.cancel();
+  }, [dualOpen]);
   const cancelAlignmentLoss = useCallback(() => {
     setPendingAlignmentLoss(null);
     saveDoneGuardRef.current.cancel();
@@ -3644,33 +3651,43 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         // Key the PATCH by the resolved row's verse_start — alignerTarget.verse
         // may sit INSIDE a range row (v7 of a UST 6-9 block) now that the
         // slice resolves through buildVerseIndex.
-        if (targetVerse) {
-          enqueueVerseSafely(
-            alignerTarget.chapter,
-            targetVerse.verse,
-            alignerTarget.bibleVersion,
-            targetVerse,
-            content,
-            plain,
-            "alignment_edit",
-            _expectedVersion,
-            undefined,
-            undefined,
-            draftGeneration,
-            undefined,
-            alignmentDraftKey(book, alignerTarget.chapter, alignerTarget.verse, alignerTarget.bibleVersion),
-          );
-        }
-        // Optimistically fold the new alignment into the local chapter cache so
-        // content-derived UI (the broken-alignment link, OL-anchored note
-        // highlights) updates immediately instead of waiting for a refetch.
-        // Mirrors the verse-text / section save paths; the outbox 200 handler
-        // bumps the version, so we keep targetVerse's version here.
-        if (targetVerse) {
+        // #1196: a write IndexedDB did not store (or a view-only no-op)
+        // resolves false, so the panel keeps the edit and its crash draft.
+        if (!targetVerse) return;
+        const queued = enqueueVerseSafely(
+          alignerTarget.chapter,
+          targetVerse.verse,
+          alignerTarget.bibleVersion,
+          targetVerse,
+          content,
+          plain,
+          "alignment_edit",
+          _expectedVersion,
+          undefined,
+          undefined,
+          draftGeneration,
+          undefined,
+          alignmentDraftKey(book, alignerTarget.chapter, alignerTarget.verse, alignerTarget.bibleVersion),
+        );
+        if (!queued) return false;
+        return queued.then((stored) => {
+          if (!stored) {
+            pushPipelineToast(
+              `The ${alignerTarget.bibleVersion} alignment for ${book} ${alignerTarget.chapter}:${targetVerse.verse} was not saved (saving is off here, or this device could not store it). Your changes are still in the aligner.`,
+              "error",
+            );
+            return false;
+          }
+          // Optimistically fold the new alignment into the local chapter cache so
+          // content-derived UI (the broken-alignment link, OL-anchored note
+          // highlights) updates immediately instead of waiting for a refetch.
+          // Mirrors the verse-text / section save paths; the outbox 200 handler
+          // bumps the version, so we keep targetVerse's version here.
           const newDto = { ...targetVerse, content, plain_text: plain } as VerseDto;
           bookHook?.applyLocalVerse(newDto);
           if (alignerTarget.chapter === chapter) applyLocalVerse(newDto);
-        }
+          return true;
+        });
       },
       onConfirmUnalign: (lostWords, commit) =>
         confirmAlignerUnalign(
@@ -3718,6 +3735,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     enqueueVerseSafely,
     alignerLock,
     confirmAlignerUnalign,
+    pushPipelineToast,
   ]);
 
   // Props for the side-by-side popup: ULT + UST slices against one shared
