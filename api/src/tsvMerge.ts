@@ -28,8 +28,9 @@
 //                                           master, D1 wins instead and the row
 //                                           is still flagged (keep_ai_master).
 //   - neither moved (equal, or only whitespace differs) -> nothing to do.
-// When no ancestor is recoverable at all (never exported / edit_log aged past
-// the 180-day sweep), attribution is impossible and we keep D1 — the
+// When no ancestor is recoverable at all (never exported / tq or twl edit_log
+// aged past the 180-day sweep; tn is never swept, issue #1057), attribution
+// is impossible and we keep D1 — the
 // pre-existing safe default, now surfaced as `keep_no_base` so "the merge could
 // not run here" is distinguishable from "nothing to merge".
 //

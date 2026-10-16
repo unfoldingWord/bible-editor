@@ -222,8 +222,8 @@ Highlights that bite repeatedly:
   retires a true warning. Immutable mint evidence exists in two places instead: `review_master_json._meta.flag_at`
   / `flag_since` for post-#653 flags, and the mint's own `edit_log` row (`action='update'`, payload carries
   `"review_kind":"merge_no_base"`, `logEditStmt` at `bookReimport.ts:2668`) for older ones. Note that edit_log is
-  *not* forever: `editLogSweep.ts` deletes `update` rows past 180 days (only the newest `create` per live row is
-  exempt), so mint evidence expires. #683 (`sweepStaleMergeNoBase`) derives a pre-#653 flag's window from the mint
+  *not* forever for tq/twl: `editLogSweep.ts` deletes their `update` rows past 180 days (only the newest `create`
+  per live row is exempt), so their mint evidence expires. tn rows are never swept (#1057). #683 (`sweepStaleMergeNoBase`) derives a pre-#653 flag's window from the mint
   run's persisted lineage, admitted only when `master_lineage_computed_at <= mintAt` proves that lineage is the
   mint's own and not a later overwrite.
 - **A column added by a migration is NULL for exactly the rows a backlog-draining fix cares about, because those

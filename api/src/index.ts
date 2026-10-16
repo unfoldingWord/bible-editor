@@ -439,9 +439,11 @@ export default {
       } catch (e) {
         console.error("dcs commit backfill tick failed", e instanceof Error ? e.message : String(e));
       }
-      // Once-per-hour edit_log retention sweep. 180 days is defensive — we
-      // don't have a real policy yet, but the table grows without bound
-      // otherwise (every keystroke that lands a PATCH writes a row). Gated
+      // Once-per-hour edit_log retention sweep. The policy (issue #1057):
+      // translation-note (tn) history is kept forever, because it is the only
+      // record of who changed each note; every other kind is deleted after
+      // 180 days, since the table otherwise grows without bound (every
+      // keystroke that lands a PATCH writes a row). Gated
       // on minute-of-hour so it fires ~once/hour instead of every 5 min.
       // The DELETE exempts each verse's three-way-merge ancestor (and its
       // pre-watermark AI baseline), or the merge would go permanently blind
