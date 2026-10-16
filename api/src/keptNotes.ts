@@ -13,7 +13,8 @@
 //     differs from what the AI last wrote);
 //   - it came from the 2 Kings -> Isaiah migration (decision D4);
 //   - the AI expanded it from a translator's hint (decision D5).
-// Pristine rows (updated_by NULL) are never kept.
+//   - its last change was a Door43 sync naming the person behind it (#1155).
+// Other pristine rows (updated_by NULL) are never kept.
 //
 // "Really edited" is the hard part: `updated_by` is set by reorders,
 // whitespace-only saves, edits reverted to the AI text, and repair scripts, so
@@ -25,6 +26,7 @@ import type { Env } from "./index.ts";
 const AI_SOURCE = "ai_pipeline";
 const MIGRATION_SOURCE = "parallel_migration";
 const HINT_SOURCE = "hint_expansion";
+const DCS_SYNC_SOURCE = "dcs_sync"; // tn_rows.last_change_source (0060)
 // Scripts that rewrite quotes in bulk; their edit_log rows must never look
 // like a person's edit (scan-tn-quotes / rollback-tn-quotes, see PR C).
 const REPAIR_SOURCES = new Set(["quote_repair"]);
@@ -62,6 +64,12 @@ export interface KeptRow {
   note: string | null;
   support_reference: string | null;
   preserve: number;
+  // Optional so callers that do not load them keep the old rule; undefined
+  // updated_by is treated as "not master-owned".
+  updated_by?: number | null;
+  last_change_source?: string | null;
+  last_change_action?: string | null;
+  last_change_actor?: string | null;
 }
 
 export interface KeptLogEntry {
@@ -79,6 +87,7 @@ export type KeptReason =
   | "edited"
   | "unexplained"
   | "fallback"
+  | "door43"
   | null;
 
 // Comparison only; never stored or sent. Folds the differences that make two
@@ -173,12 +182,39 @@ function isHumanEvent(e: KeptLogEntry, before: State, after: State): boolean {
   return !sameContent(before, after) || !samePosition(before, after);
 }
 
-export function classifyKept(
-  row: KeptRow,
-  allEntries: KeptLogEntry[],
-): { kept: boolean; reason: KeptReason } {
-  if (row.preserve === 1) return { kept: true, reason: "preserve" };
+// The row's last change was a Door43 sync that wrote its content and named
+// the person whose commits caused it (#1155, decision A). door43Actor stamps
+// "Door43 (commits by NAME)" only for measured human commits; a bot-only
+// window reads "Door43 (AI/bot push)" and an unmeasured one "Door43 sync",
+// and neither counts. Only the latest change is on the row, so a later bot
+// push over a person's fix ends the protection. Reorders, bridges and review
+// clears are not content writes and do not count.
+const DOOR43_NAMED_PREFIX = "Door43 (commits by ";
+const DOOR43_CONTENT_ACTIONS = new Set(["sync_merge", "sync_reseed"]);
+function isDoor43PersonChange(row: KeptRow): boolean {
+  return (
+    row.last_change_source === DCS_SYNC_SOURCE &&
+    DOOR43_CONTENT_ACTIONS.has(row.last_change_action ?? "") &&
+    (row.last_change_actor ?? "").startsWith(DOOR43_NAMED_PREFIX)
+  );
+}
 
+// True unless the live words equal what the AI last wrote (the person's
+// commit then left this note as the AI had it). No AI write, or no create to
+// replay from: nothing to compare against, so it differs.
+function differsFromAi(row: KeptRow, allEntries: KeptLogEntry[]): boolean {
+  const entries = lastLife(allEntries);
+  let lastAi = -1;
+  entries.forEach((e, i) => {
+    if (e.source === AI_SOURCE) lastAi = i;
+  });
+  if (lastAi < 0 || entries[0].action !== "create") return true;
+  let state = EMPTY_STATE;
+  for (const e of entries.slice(0, lastAi + 1)) state = applyPayload(state, parsePayload(e.payload_json));
+  return !sameContent(contentOf(row), state);
+}
+
+function lastLife(allEntries: KeptLogEntry[]): KeptLogEntry[] {
   const content = allEntries.filter(
     (e) => e.action === "create" || e.action === "update" || e.action === "restore",
   );
@@ -188,7 +224,29 @@ export function classifyKept(
   content.forEach((e, i) => {
     if (e.action === "create") start = i;
   });
-  const entries = content.slice(start);
+  return content.slice(start);
+}
+
+export function classifyKept(
+  row: KeptRow,
+  allEntries: KeptLogEntry[],
+): { kept: boolean; reason: KeptReason } {
+  if (row.preserve === 1) return { kept: true, reason: "preserve" };
+  const door43 = isDoor43PersonChange(row) && differsFromAi(row, allEntries);
+  // A master-owned row (updated_by NULL, e.g. an AI note re-seeded from
+  // master) is kept only for a named person's Door43 change.
+  if (row.updated_by === null) {
+    return door43 ? { kept: true, reason: "door43" } : { kept: false, reason: null };
+  }
+  const verdict = classifyByLog(row, allEntries);
+  return !verdict.kept && door43 ? { kept: true, reason: "door43" } : verdict;
+}
+
+function classifyByLog(
+  row: KeptRow,
+  allEntries: KeptLogEntry[],
+): { kept: boolean; reason: KeptReason } {
+  const entries = lastLife(allEntries);
 
   let lastAi = -1;
   let lastMigration = -1;
@@ -337,7 +395,8 @@ export async function loadEditLogs(
 }
 
 // The kept notes among the live, non-hint, non-trashed rows of the chapter
-// range. Pristine rows (updated_by NULL) are never candidates, except that a
+// range. Pristine rows (updated_by NULL) are candidates only when a Door43
+// sync last changed them (#1155); a
 // preserve row always is.
 export async function loadKeptTns(
   env: Env,
@@ -346,11 +405,12 @@ export async function loadKeptTns(
   endChapter: number,
 ): Promise<KeptLoad> {
   const rs = await env.DB.prepare(
-    `SELECT id, book, chapter, verse, ref_raw, quote, note, support_reference, preserve
+    `SELECT id, book, chapter, verse, ref_raw, quote, note, support_reference, preserve,
+            updated_by, last_change_source, last_change_action, last_change_actor
        FROM tn_rows
       WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
         AND deleted_at IS NULL AND trashed_at IS NULL AND hint = 0
-        AND (preserve = 1 OR updated_by IS NOT NULL)
+        AND (preserve = 1 OR updated_by IS NOT NULL OR last_change_source = 'dcs_sync')
       ORDER BY chapter, verse, sort_order, id`,
   )
     .bind(book, startChapter, endChapter)

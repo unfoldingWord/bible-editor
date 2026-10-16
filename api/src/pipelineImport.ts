@@ -1505,7 +1505,8 @@ export async function deleteUnkeptTns(
     const pairParams = slice.flatMap((pair) => [pair.chapter, pair.verse]);
     const rs = await env.DB.prepare(
       `SELECT id, version, book, chapter, verse, ref_raw, quote, note,
-              support_reference, preserve, updated_by
+              support_reference, preserve, updated_by,
+              last_change_source, last_change_action, last_change_actor
          FROM tn_rows
         WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
           AND deleted_at IS NULL AND trashed_at IS NULL
@@ -1522,12 +1523,13 @@ export async function deleteUnkeptTns(
   const logs = await loadEditLogs(
     env,
     job.book,
-    candidates.filter((r) => r.updated_by != null).map((r) => r.id),
+    candidates.filter((r) => r.updated_by != null || r.last_change_source === "dcs_sync").map((r) => r.id),
   );
   await maybeTouchClaim(env, job.jobId, heartbeat);
-  // A pristine row (updated_by NULL) is never kept, same as loadKeptTns.
+  // A pristine row (updated_by NULL) is kept only for a named Door43 change
+  // (#1155); classifyKept decides that too, same as loadKeptTns.
   const list = candidates
-    .filter((r) => r.updated_by == null || !classifyKept(r, logs.get(r.id) ?? []).kept)
+    .filter((r) => !classifyKept({ ...r, updated_by: r.updated_by ?? null }, logs.get(r.id) ?? []).kept)
     .map((r) => ({ id: r.id, version: r.version }));
   if (list.length === 0) return 0;
 
