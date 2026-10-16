@@ -23,6 +23,7 @@ import { readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 const SQLITE_FILES = new Set([
+  "src/bookLintReport.test.mjs",
   "src/tsvMergeIntegration.test.mjs",
   "src/tombstoneCollision.test.mjs",
   "src/reimportJourney.test.mjs",
@@ -50,11 +51,16 @@ const SQLITE_FILES = new Set([
   "src/chapters.test.mjs",
   "src/exportMergeState.test.mjs",
   "src/reimportUnstampedBranches.test.mjs",
+  "src/lockAlertRefresh.test.mjs",
+  "src/saveRoundTrips.test.mjs",
+  "src/pipelineVerseRange.test.mjs",
+  "src/tnRangeLock.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
   ["src/rowRestoreNoop.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/bookTrashSummary.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/selfLockCheckedRoutes.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/dismissReview.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/reviewFlagBroadcast.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/reimportJourney.test.mjs", "./src/tsResolveHook.mjs"],
@@ -65,7 +71,13 @@ const EXTRA_IMPORTS = new Map([
   ["src/aiRowDiffGate.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/masterLineagePersist.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/staleBaseGate.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/unconfirmedRenders.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/reimportUnstampedBranches.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/lockAlertRefresh.test.mjs", "./src/tsResolveHook.mjs"],
+  // saveRoundTrips.test.mjs drives the real rows.ts / verses.ts routers
+  // (issue #905), which import their siblings extensionless.
+  ["src/saveRoundTrips.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/tnRangeLock.test.mjs", "./src/tsResolveHook.mjs"],
   // verseMergeConflicts.test.mjs now imports retireVerseKeptAiMasterFlags
   // directly from verseMergeConflicts.ts (issue #760 fail-closed regression
   // test), which in turn imports "./auth" and "./index" without extensions.

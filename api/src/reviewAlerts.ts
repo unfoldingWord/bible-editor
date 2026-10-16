@@ -9,14 +9,41 @@ export function reviewConditionKey(
   return `review:v1:${family}:${stableJson(identity)}:${stableJson(state)}`;
 }
 
+/**
+ * The `state` a reviewConditionKey was built from, or undefined when `key` is
+ * not that family's key for that identity (a legacy null key, another family,
+ * or unparseable). Issue #1110: a lock change re-derives the verse-merge alert
+ * from its stored key, because the keep_no_base verses it names live nowhere
+ * else between reimports.
+ */
+export function reviewConditionState(
+  key: string | null | undefined,
+  family: string,
+  identity: Record<string, unknown>,
+): unknown {
+  const prefix = `review:v1:${family}:${stableJson(identity)}:`;
+  if (!key?.startsWith(prefix)) return undefined;
+  try {
+    return JSON.parse(key.slice(prefix.length));
+  } catch {
+    return undefined;
+  }
+}
+
 /** Stable per-recipient merge condition; unrelated editors never share an episode. */
 export function verseMergeEditorConditionKey(
   book: string,
   resource: string,
   username: string,
   refs: string[],
+  // Issue #1006: set only when this editor's alert carries the locked-book
+  // no-base wording. Omitted (not false) otherwise, so every unlocked key stays
+  // byte-identical to the keys stored before #1006.
+  noBaseBookLocked = false,
 ): string {
-  return reviewConditionKey("verse_merge_conflict_editor", { book, resource, username }, { refs: [...refs].sort() });
+  const state: Record<string, unknown> = { refs: [...refs].sort() };
+  if (noBaseBookLocked) state.noBaseBookLocked = true;
+  return reviewConditionKey("verse_merge_conflict_editor", { book, resource, username }, state);
 }
 
 function stableJson(value: unknown): string {

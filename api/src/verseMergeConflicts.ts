@@ -75,6 +75,7 @@
 import { Hono } from "hono";
 import type { Env } from "./index";
 import { requireAuth } from "./auth";
+import { effectiveBookLock } from "./bookLock.ts";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
@@ -88,15 +89,18 @@ import {
 } from "./verseMergeEditorAlerts.ts";
 import {
   CONFIRM_ADOPTED_CONFLICT_SQL,
-  DELETE_LOST_ADOPTION_CONFLICT_SQL,
+  DELETE_SPECULATIVE_CONFLICTS_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   RESOLVE_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
   RESOLVE_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   RESOLVE_CONVERGED_VERSE_MERGE_CONFLICT_SQL,
+  RESTORE_SPECULATIVE_CONFLICTS_SQL,
   RETIRE_KEPT_AI_MASTER_CONFLICTS_FOR_PAIR_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   SELECT_STANDING_KEPT_AI_MASTER_CONFLICT_PAIRS_SQL,
+  SETTLE_LANDED_CONFLICT_SQL,
+  SETTLE_SPECULATIVE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
 } from "./verseMergeConflictSql.ts";
 import {
@@ -104,6 +108,7 @@ import {
   reconcileReviewAlert,
   resolveReviewAlert,
   reviewConditionKey,
+  reviewConditionState,
   verseMergeEditorConditionKey,
 } from "./reviewAlerts.ts";
 
@@ -138,7 +143,11 @@ export interface VerseMergeConflictRow {
    * `verse_merge_conflicts.detected_at` — the durable "first flagged" date
    * (issue #624), preserved across re-detections of the SAME still-unresolved
    * conflict by the upsert's ON CONFLICT DO UPDATE (see that statement's doc
-   * comment). Optional: only populated on the ALERT READ path
+   * comment). It is reset to the run's timestamp in exactly two cases: a
+   * resolved row reactivated by a landed overwrite (CONFIRM_ADOPTED_CONFLICT_SQL,
+   * issue #996), and an unresolved audit-only row ('adopt' /
+   * 'adopt_no_visible_change') promoted to adopt_conflict (the upsert, issue
+   * #1124). Both start a new streak nobody has been alerted about. Optional: only populated on the ALERT READ path
    * (raiseVerseMergeConflictAlert), where it comes back from D1. It is not
    * read off THIS field on the write path: recordVerseMergeConflicts binds the
    * run's own timestamp into detected_at itself (`?9` in
@@ -152,6 +161,8 @@ export interface VerseMergeConflictRow {
 
 const WRITE_BATCH = 90;
 
+const conflictRefKey = (chapter: number, verse: number): string => `${chapter}:${verse}`;
+
 // Best-effort, batched per-verse upsert. Returns early (true — nothing failed,
 // there was just nothing to do) on an empty list so a quiet sync (the
 // overwhelming common case) never touches the table — in particular it never
@@ -161,8 +172,9 @@ const WRITE_BATCH = 90;
 // REPLACE: a REPLACE deletes-then-reinserts, which mints a new `id` and resets
 // `detected_at` on every re-detection of the SAME still-unresolved conflict —
 // making "how long has this been sitting unresolved" unrecoverable. The
-// DO UPDATE preserves the original `detected_at` (it's simply not in the SET
-// list). It does NOT blindly refresh the other columns to this run's values —
+// DO UPDATE preserves the original `detected_at` (its SET keeps the stored
+// value, except for an unresolved audit-only row promoted to adopt_conflict,
+// issue #1124). It does NOT blindly refresh the other columns to this run's values —
 // see the CASE expressions below, which refuse to downgrade a row still
 // awaiting human judgement and keep `overwritten_version` consistent with the
 // surviving action.
@@ -182,10 +194,15 @@ const WRITE_BATCH = 90;
 //
 // `now` is the caller's own Date.now()-derived timestamp (bookReimport.ts
 // already computes one per applyVerseRows call) — bound as detected_at's
-// value on INSERT and as last_recorded_at's value on every write, so
-// deleteLostAdoptionConflicts (called later in the same run) can match rows
-// touched by THIS run's speculative write by exact equality on
-// last_recorded_at.
+// value on INSERT and as last_recorded_at's value on every write.
+//
+// Issue #1137: `runId` names the logical run making these writes, stable
+// across its retries (the nightly path passes one per Workflow run and book;
+// a UI pull gets its own). Each adoption row's upsert records, durably on the
+// row, what it said before this run's speculation and which run owns it
+// (UPSERT_VERSE_MERGE_CONFLICT_SQL's prior_* columns), for the lost-race
+// cleanup and a retry's roll-back to put back. A ref recorded twice keeps its
+// first capture.
 export async function recordVerseMergeConflicts(
   env: Env,
   book: string,
@@ -193,6 +210,7 @@ export async function recordVerseMergeConflicts(
   bibleVersion: string,
   rows: VerseMergeConflictRow[],
   now: number,
+  runId: string | null = null,
 ): Promise<boolean> {
   if (rows.length === 0) return true;
   try {
@@ -212,6 +230,7 @@ export async function recordVerseMergeConflicts(
             now,
             bibleVersion,
             r.observedVersion,
+            runId,
           ),
         ),
       );
@@ -237,18 +256,34 @@ export async function recordVerseMergeConflicts(
 // just leaves a row that stays resolved/dormant one run longer than it
 // should — never a false-positive reactivation, which is the failure mode
 // this two-phase split exists to prevent.
+//
+// `now` is this run's timestamp (the same one recordVerseMergeConflicts got):
+// a row reactivated from resolved takes it as its new detected_at (issue #996),
+// and each ref's overwrittenVersion / alignment as its new recovery pointer and
+// snapshot (issue #1112). See CONFIRM_ADOPTED_CONFLICT_SQL.
 export async function confirmAdoptedConflicts(
   env: Env,
   book: string,
   resource: string,
-  refs: Array<{ chapter: number; verse: number }>,
+  refs: Array<Pick<VerseMergeConflictRow, "chapter" | "verse" | "overwrittenVersion" | "alignment">>,
+  now: number,
 ): Promise<void> {
   if (refs.length === 0) return;
   try {
     for (let i = 0; i < refs.length; i += WRITE_BATCH) {
       const slice = refs.slice(i, i + WRITE_BATCH);
       await env.DB.batch(
-        slice.map((r) => env.DB.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse)),
+        slice.map((r) =>
+          env.DB.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).bind(
+            book,
+            resource,
+            r.chapter,
+            r.verse,
+            now,
+            r.overwrittenVersion,
+            r.alignment ? JSON.stringify(r.alignment) : null,
+          ),
+        ),
       );
     }
   } catch (e) {
@@ -260,42 +295,39 @@ export async function confirmAdoptedConflicts(
   }
 }
 
-// Delete conflict rows for adoptions whose version-CAS write did NOT land
-// (see bookReimport.ts's applyVerseRows step 6b/7b): the row was written
-// speculatively BEFORE the CAS batch so a mid-batch failure can't erase
-// evidence of an overwrite that DID happen, but once the write is confirmed
-// lost (a human wrote the verse first), nothing was overwritten and the row
-// would misdirect a reviewer to a version that still holds their current
-// text. Best-effort: a delete failure just leaves a spurious flag (the
+// Undo the speculative conflict rows for adoptions whose version-CAS write did
+// NOT land (see bookReimport.ts's applyVerseRows step 6b/7b): the row was
+// written speculatively BEFORE the CAS batch so a mid-batch failure can't
+// erase evidence of an overwrite that DID happen, but once the write is
+// confirmed lost (a human wrote the verse first), nothing was overwritten and
+// the row would misdirect a reviewer to a version that still holds their
+// current text. Best-effort: a failure just leaves a spurious flag (the
 // documented failure-mode inversion this whole ordering exists to produce),
 // never a silently lost one.
 //
-// `now` MUST be the exact same timestamp passed to this run's
-// recordVerseMergeConflicts call (bookReimport.ts already computes one `now`
-// per applyVerseRows invocation and reuses it for both) — see
-// DELETE_LOST_ADOPTION_CONFLICT_SQL's doc comment for why this scoping
-// (on last_recorded_at, not detected_at) exists: it protects a row's prior
-// resolution (from an earlier night) from being wholesale deleted just
-// because THIS run's separate speculative write happened to lose its CAS
-// race, while still deleting a row that is provably this run's own
-// speculative write and nothing else.
+// Issue #1137 (superseding #1132's in-memory capture): a row that existed
+// before this run's speculation is put back from the capture the upsert
+// stored on it, and a row the speculation created is deleted
+// (RESTORE_/DELETE_/SETTLE_SPECULATIVE_CONFLICTS_SQL, one batch). Only rows
+// whose unsettled speculation `runId` still owns are touched (a landed
+// overwrite settled its row in its CAS batch; a non-adoption flag settles its
+// row), so a retry restores the state from before its dead first attempt, and
+// an overlapping run's landed alert or final flag is never rewound or deleted.
 export async function deleteLostAdoptionConflicts(
   env: Env,
   book: string,
   resource: string,
   refs: Array<{ chapter: number; verse: number }>,
-  now: number,
+  runId: string,
 ): Promise<void> {
   if (refs.length === 0) return;
+  const chapters = refs.map((r) => r.chapter);
+  const scope = [
+    book, resource, Math.min(...chapters), Math.max(...chapters),
+    JSON.stringify(refs.map((r) => conflictRefKey(r.chapter, r.verse))), runId, null,
+  ];
   try {
-    for (let i = 0; i < refs.length; i += WRITE_BATCH) {
-      const slice = refs.slice(i, i + WRITE_BATCH);
-      await env.DB.batch(
-        slice.map((r) =>
-          env.DB.prepare(DELETE_LOST_ADOPTION_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse, now),
-        ),
-      );
-    }
+    await env.DB.batch(settleSpeculationStmts(env, scope));
   } catch (e) {
     console.error("verseMergeConflicts: delete-lost-adoption failed", {
       book,
@@ -304,6 +336,66 @@ export async function deleteLostAdoptionConflicts(
     });
   }
 }
+
+// Issue #1137: a nightly chunk step and a UI pull call this as they start,
+// before any of their own writes. An unsettled row in these chapters is a
+// speculation that never landed (a landed one settles in its CAS batch). Two
+// kinds are put back here (or their row deleted), as step 7b would have:
+// those `runId` owns, left by an earlier attempt of the same run that died
+// between its upsert and its cleanup; and those any run wrote before
+// `staleBefore` (seconds), which no live run can still own (review A3: a UI
+// pull that died with a 502 is never retried and has no other cleanup). The
+// run then measures from honest state, so a run that no longer adopts the
+// verse leaves no pointer to an overwrite that never happened. One batch for
+// all `resources`. Best-effort, like the rest of this file.
+export async function rollBackDeadAttemptConflicts(
+  env: Env,
+  book: string,
+  resources: string[],
+  chapterFrom: number,
+  chapterTo: number,
+  runId: string,
+  staleBefore: number,
+): Promise<void> {
+  if (resources.length === 0) return;
+  try {
+    await env.DB.batch(
+      resources.flatMap((resource) =>
+        settleSpeculationStmts(env, [book, resource, chapterFrom, chapterTo, null, runId, staleBefore])),
+    );
+  } catch (e) {
+    console.error("verseMergeConflicts: roll-back of a dead attempt's conflict rows failed", {
+      book,
+      resources,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+function settleSpeculationStmts(env: Env, scope: unknown[]): D1PreparedStatement[] {
+  return [RESTORE_SPECULATIVE_CONFLICTS_SQL, DELETE_SPECULATIVE_CONFLICTS_SQL, SETTLE_SPECULATIVE_CONFLICTS_SQL]
+    .map((sql) => env.DB.prepare(sql).bind(...scope));
+}
+
+// Issue #1137: the statement bookReimport.ts puts in a master-adoption CAS
+// batch directly after a write and its changes()-gated edit_log row, so the
+// `refs` that write covers drop their speculative capture in the same
+// transaction, and only if that write landed (SETTLE_LANDED_CONFLICT_SQL).
+export function settleLandedConflictStmt(
+  env: Env,
+  book: string,
+  resource: string,
+  refs: Array<{ chapter: number; verse: number }>,
+): D1PreparedStatement {
+  return env.DB.prepare(SETTLE_LANDED_CONFLICT_SQL)
+    .bind(book, resource, JSON.stringify(refs.map((r) => conflictRefKey(r.chapter, r.verse))));
+}
+
+// A dead run's unsettled capture older than this (seconds) is rolled back by
+// any later run's start (rollBackDeadAttemptConflicts). A speculation and its
+// CAS are seconds apart inside one applyVerseRows call; an hour is far past
+// any Worker request or Workflow step that could still be holding one.
+export const STALE_SPECULATION_SECONDS = 3600;
 
 // Issue #789. Called from bookReimport.ts's applyVerseRows once per call,
 // with the (chapter, verse) refs THIS run measured as `keep_converged` /
@@ -763,12 +855,23 @@ export async function raiseVerseMergeConflictAlert(
   // each carrying its current D1 version so groupNoBaseVersesByEditor can
   // attribute it to the human who last edited it and give THEM their own
   // notice too — until this fix that warning reached only ALERT_USERNAME.
+  // `bookLocked` (issues #1006, #1110): the export skips this book+resource as
+  // the alert is raised, so neither the no-base sentence nor the kept-row
+  // sentences may warn that tonight's export will write. Either the known
+  // value or a reader; the reader runs only when the alert has a sentence
+  // that depends on the lock, so a run with none spends no D1 read on it.
+  // `lockRefresh` (#1129): set by refreshVerseMergeAlertsAfterLockChange. A
+  // recipient whose standing alert was dismissed is left alone unless this
+  // rebuild changes the lock wording of their own alert, judged from the rows
+  // this raise read rather than an earlier read by the caller.
   opts: {
     recordingFailed?: boolean;
     noBaseCount?: number;
     noBaseRefs?: string[];
+    bookLocked?: boolean | (() => Promise<boolean>);
     noBaseEditorRefs?: NoBaseVerseRef[];
     observedAt?: number;
+    lockRefresh?: boolean;
   } = {},
 ): Promise<void> {
   const source = `verse_merge_conflict:${book}:${resource}`;
@@ -843,15 +946,40 @@ export async function raiseVerseMergeConflictAlert(
   const reasonCounts = new Map<string, number>();
   for (const r of rows) reasonCounts.set(r.reason, (reasonCounts.get(r.reason) ?? 0) + 1);
   const reasonBreakdown = [...reasonCounts.entries()].map(([reason, n]) => `${n} ${reason}`).join(", ") || "none";
-  // Per-outcome guidance, classified by ACTION (never by the nullable
-  // overwritten_version pointer) — see buildMergeConflictGuidance. Pulled into
-  // that pure helper so the three-way overwritten / kept-alignment /
-  // kept-source-attr split is unit-testable without an Env, and so a refusal or
-  // a source-attr divergence can never be miscounted as an overwrite.
+  // Per-outcome guidance, classified by ACTION — refined, for 'adopt_conflict'
+  // only, by whether overwritten_version is null (issue #981: the #539 no-op
+  // guard keeps a pointer-less adopt_conflict row around, and that is not an
+  // overwrite) — see buildMergeConflictGuidance. Pulled into that pure helper
+  // so the split is unit-testable without an Env, and so a refusal or a
+  // source-attr divergence can never be miscounted as an overwrite.
+  // Issues #1006 / #1110: whether the no-base and kept-row sentences use the
+  // locked-book wording. The lock is read only when one of them is present. A
+  // failed read falls back to the unlocked wording, the one that asks someone
+  // to act, and never fails the alert.
+  const hasNoBase = (opts.noBaseCount ?? 0) > 0;
+  const hasKept = rows.some(rowWordingDependsOnLock);
+  let bookLocked = false;
+  let lockReadFailed = false;
+  if (hasNoBase || hasKept) {
+    try {
+      bookLocked = typeof opts.bookLocked === "function" ? await opts.bookLocked() : opts.bookLocked === true;
+    } catch (e) {
+      lockReadFailed = true;
+      console.error("verseMergeConflicts: lock read failed; using the unlocked wording", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  const noBaseLockedWording = bookLocked && hasNoBase;
+  const keptLockedWording = bookLocked && hasKept;
   const guidance = buildMergeConflictGuidance(rows, {
     recordingFailed: opts.recordingFailed,
     noBaseCount: opts.noBaseCount,
     noBaseRefs: opts.noBaseRefs,
+    noBaseBookLocked: noBaseLockedWording,
+    bookLocked: keptLockedWording,
   });
   // Issue #624: each ref grouped under its own reason, each group carrying
   // the oldest detected_at in that reason as a plain "first flagged" date —
@@ -898,6 +1026,8 @@ export async function raiseVerseMergeConflictAlert(
       verse: r.verse,
       overwrittenVersion: r.overwrittenVersion,
       reason: r.reason,
+      // Issue #996: dates each ref in the editor's message ("first flagged").
+      detectedAt: r.detectedAt,
     }));
   // keep_no_base verses (issue #544): NOTHING was overwritten, but the same
   // human needs the same warning the admin gets — see groupNoBaseVersesByEditor's
@@ -914,7 +1044,13 @@ export async function raiseVerseMergeConflictAlert(
   }));
   const usernameByKey = await lookupEditorUsernames(env, book, resource, [...overwrittenRefs, ...noBaseLookupRefs]);
   const perEditor = groupOverwrittenVersesByEditor(book, resource, overwrittenRefs, usernameByKey);
-  const perEditorNoBase = groupNoBaseVersesByEditor(book, resource, noBaseEditorRefs, usernameByKey);
+  const perEditorNoBase = groupNoBaseVersesByEditor(
+    book,
+    resource,
+    noBaseEditorRefs,
+    usernameByKey,
+    noBaseLockedWording,
+  );
 
   // Combine per-editor content: an editor can appear in BOTH maps in the same
   // run (an overwritten verse elsewhere in the book, plus a keep_no_base verse
@@ -952,6 +1088,13 @@ export async function raiseVerseMergeConflictAlert(
         .sort((a, b) => `${a.chapter}:${a.verse}`.localeCompare(`${b.chapter}:${b.verse}`)),
       noBaseCount: opts.noBaseCount ?? 0,
       recordingFailed: Boolean(opts.recordingFailed),
+      // Issue #1006: the locked wording ("ask an admin") and the unlocked one
+      // ("tonight's export will overwrite") are different conditions, so a
+      // dismissed locked alert cannot hide the warning after an unlock. Added
+      // only when locked, so unlocked keys match the ones already stored.
+      ...(noBaseLockedWording ? { noBaseBookLocked: true } : {}),
+      // Issue #1110: the same for the kept-row sentences.
+      ...(keptLockedWording ? { keptBookLocked: true } : {}),
     },
   );
   const conditionForUser = (username: string): string => {
@@ -959,11 +1102,59 @@ export async function raiseVerseMergeConflictAlert(
     const refs = [perEditor.get(username)?.refs ?? [], perEditorNoBase.get(username)?.refs ?? []]
       .flat()
       .sort();
-    return verseMergeEditorConditionKey(book, resource, username, refs);
+    return verseMergeEditorConditionKey(
+      book,
+      resource,
+      username,
+      refs,
+      noBaseLockedWording && perEditorNoBase.has(username),
+    );
   };
 
+  // #1129: on a lock refresh, whether each recipient's own alert carries a
+  // sentence whose wording the lock changes, and whether it uses the locked
+  // wording now. The admin's alert depends on the lock through the no-base and
+  // kept-row sentences; an editor's only through their no-base verses (an
+  // overwrite with a pointer reads the same either way).
+  const lockWordingFor = (username: string): { depends: boolean; locked: boolean } =>
+    username === ALERT_USERNAME
+      ? { depends: hasNoBase || hasKept, locked: noBaseLockedWording || keptLockedWording }
+      : { depends: perEditorNoBase.has(username), locked: noBaseLockedWording && perEditorNoBase.has(username) };
+
   try {
+    // #1129: a lock refresh rebuilds from the live rows, which a save can have
+    // shrunk since the refresh decided to call this. For a recipient who
+    // dismissed their alert, a rebuild mints a new key and brings it back, so
+    // it is written only when the lock wording of that recipient's own alert
+    // changes. Undismissed alerts are rebuilt as always.
+    const keepDismissed = new Set<string>();
+    if (opts.lockRefresh) {
+      const standing = await env.DB.prepare(
+        `SELECT username, condition_key, dismissed_at FROM system_alerts
+          WHERE source = ?1 AND resolved_at IS NULL ORDER BY id DESC`,
+      )
+        .bind(source)
+        .all<{ username: string; condition_key: string | null; dismissed_at: number | null }>();
+      const latest = new Map<string, { condition_key: string | null; dismissed_at: number | null }>();
+      for (const r of standing.results ?? []) if (!latest.has(r.username)) latest.set(r.username, r);
+      for (const username of desired.keys()) {
+        const row = latest.get(username);
+        if (row?.dismissed_at == null) continue;
+        const want = lockWordingFor(username);
+        // #1129 review B1: a failed lock read falls back to the unlocked
+        // wording, which is a guess. Do not bring back a dismissed alert on a
+        // lock this raise could not read; undismissed ones keep the fallback.
+        if (
+          !want.depends ||
+          lockReadFailed ||
+          want.locked === storedLockWording(book, resource, username, row.condition_key)
+        ) {
+          keepDismissed.add(username);
+        }
+      }
+    }
     for (const [username, msg] of desired) {
+      if (keepDismissed.has(username)) continue;
       await reconcileReviewAlert(env, {
         username,
         source,
@@ -992,6 +1183,216 @@ export async function raiseVerseMergeConflictAlert(
       error: e instanceof Error ? e.message : String(e),
     });
   }
+}
+
+// Issue #1110: a row whose alert sentence says an export will write over Door43
+// and so changes on a locked book: the kept rows, and an adopt_conflict with no
+// overwritten version (#981). An overwrite with a pointer reads the same either
+// way.
+function rowWordingDependsOnLock(r: { action: string; overwrittenVersion: number | null }): boolean {
+  return (
+    r.action === "keep_alignment_refused" ||
+    r.action === "source_attr_divergent" ||
+    r.action === "keep_local_structure" ||
+    (r.action === "adopt_conflict" && r.overwrittenVersion == null)
+  );
+}
+
+// #1129: whether a stored verse-merge alert key says its alert uses the locked
+// wording. The raise adds a lock flag to the key whenever it does. An editor's
+// key carries only noBaseBookLocked (verseMergeEditorConditionKey); kept rows
+// never reach an editor's alert, so a keptBookLocked there is ignored.
+function storedLockWording(book: string, resource: string, username: string, key: string | null): boolean {
+  if (username === ALERT_USERNAME) {
+    const state = reviewConditionState(key, "verse_merge_conflict", { book, resource }) as
+      | { noBaseBookLocked?: unknown; keptBookLocked?: unknown }
+      | undefined;
+    return state?.noBaseBookLocked === true || state?.keptBookLocked === true;
+  }
+  const state = reviewConditionState(key, "verse_merge_conflict_editor", { book, resource, username }) as
+    | { noBaseBookLocked?: unknown }
+    | undefined;
+  return state?.noBaseBookLocked === true;
+}
+
+// Issue #1110: re-derive a book's standing verse-merge alerts when an admin
+// locks or unlocks it (bookImport.ts's PUT/DELETE /:book/lock). The lock used
+// to be read only when a reimport raised the alert, and a reimport returns
+// before the alert path when Door43's file is unchanged, so after an unlock a
+// locked alert ("the export skips it") kept standing, and a dismissed one
+// stayed dismissed, while the first export after the unlock wrote over
+// Door43's version of those verses.
+//
+// The adjudicated verses come from verse_merge_conflicts as usual. keep_no_base
+// verses write no row: between reimports the only record of them is the
+// standing admin alert's condition key (raiseVerseMergeConflictAlert stores the
+// uncapped verse list, with versions, and the count there), so that is what
+// this re-raises them from. Only a (book, resource) with a standing admin alert
+// is touched; nothing standing means nothing to re-word. A legacy alert with no
+// parseable key, or one from a run whose recording failed (its table rows may
+// be incomplete), is left for the next reimport rather than re-derived from
+// partial facts. Best-effort: callers run this after the lock has landed.
+//
+// It re-words the stored measurement rather than taking a new one, so it
+// re-raises at that measurement's own observation time, not now: a reimport
+// that started before the lock change and raises after it carries a later
+// observation, and must still win (reconcileReviewAlert drops any observation
+// older than one already stored).
+//
+// It takes no lock value from its caller on purpose (#1110 review): a lock and
+// an unlock in quick succession run two of these after their responses, and
+// they can finish out of order. Each reads the effective lock itself, and
+// (#1118 item 3) checks again after every write: a pass re-words only when the
+// stored wording disagrees with the lock it just read, so a refresh stops only
+// once the wording matches the lock as read after its own last write. A stale
+// write from an older refresh is followed by that refresh's next pass, which
+// corrects it. A pass whose raise changed nothing (a failed write, or an
+// observation reconcileReviewAlert dropped) also stops the refresh. The pass
+// cap bounds a lock that keeps flipping, and also saves or reimports that keep
+// changing the alert's rows (#1129: the warning says which one it saw).
+const LOCK_REFRESH_MAX_PASSES = 4;
+
+export async function refreshVerseMergeAlertsAfterLockChange(env: Env, book: string): Promise<void> {
+  for (const resource of ["ult", "ust"]) {
+    // Every lock read this refresh made, a failed one as "failed", so the cap
+    // warning can say whether the lock changed, could not be read, or was
+    // never read (#1129 review A2).
+    const lockReads: Array<boolean | "failed"> = [];
+    const lockedNow = async (): Promise<boolean> => {
+      try {
+        const locked = (await effectiveBookLock(env, book)) != null;
+        lockReads.push(locked);
+        return locked;
+      } catch (e) {
+        lockReads.push("failed");
+        // Rethrown so the raise knows the read failed (#1129 review B1): it
+        // logs, falls back to the unlocked wording for undismissed alerts, and
+        // leaves dismissed ones alone.
+        throw e;
+      }
+    };
+    try {
+      let settled = false;
+      for (let pass = 0; pass < LOCK_REFRESH_MAX_PASSES && !settled; pass++) {
+        settled = !(await rewordVerseMergeAlertForLock(env, book, resource, lockedNow));
+      }
+      if (!settled) {
+        const why = lockReads.includes("failed")
+          ? "the lock could not be read during the alert refresh, so the wording may not match it"
+          : new Set(lockReads).size > 1
+            ? "the lock kept changing during the alert refresh"
+            : lockReads.length === 0
+              ? "the alert's rows kept changing during the alert refresh (saves or a reimport; the lock was not read, since nothing in the alert depends on it)"
+              : "the alert's rows kept changing during the alert refresh (saves or a reimport; the lock read the same each time)";
+        console.warn(`verseMergeConflicts: ${why}; left for the next change`, { book, resource });
+      }
+    } catch (e) {
+      console.error("verseMergeConflicts: lock-change alert refresh failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+}
+
+// One pass of refreshVerseMergeAlertsAfterLockChange: true when it re-raised
+// the alert AND a standing alert for the source changed (the caller then
+// checks again), false when there was nothing to re-word or the raise wrote
+// nothing.
+const STANDING_VERSE_MERGE_ALERTS_SQL = `SELECT id, username, condition_key, condition_observed_at, dismissed_at FROM system_alerts
+      WHERE source = ?1 AND resolved_at IS NULL
+      ORDER BY id DESC`;
+
+async function rewordVerseMergeAlertForLock(
+  env: Env,
+  book: string,
+  resource: string,
+  lockedNow: () => Promise<boolean>,
+): Promise<boolean> {
+  const source = `verse_merge_conflict:${book}:${resource}`;
+  type Standing = {
+    id: number;
+    username: string;
+    condition_key: string | null;
+    condition_observed_at: number | null;
+    dismissed_at: number | null;
+  };
+  const readStanding = async (): Promise<Standing[]> =>
+    (await env.DB.prepare(STANDING_VERSE_MERGE_ALERTS_SQL).bind(source).all<Standing>()).results ?? [];
+  const before = await readStanding();
+  const standing = before.find((r) => r.username === ALERT_USERNAME);
+  if (!standing) return false;
+  const state = reviewConditionState(standing.condition_key, "verse_merge_conflict", { book, resource }) as
+    | {
+        noBase?: unknown;
+        noBaseCount?: unknown;
+        recordingFailed?: unknown;
+        rows?: unknown;
+        noBaseBookLocked?: unknown;
+        keptBookLocked?: unknown;
+      }
+    | undefined;
+  const noBase = Array.isArray(state?.noBase) ? (state.noBase as NoBaseVerseRef[]) : null;
+  if (
+    standing.condition_observed_at == null ||
+    !state ||
+    state.recordingFailed !== false ||
+    typeof state.noBaseCount !== "number" ||
+    !noBase ||
+    !Array.isArray(state.rows) ||
+    !noBase.every((r) => Number.isInteger(r?.chapter) && Number.isInteger(r?.verse) && Number.isInteger(r?.version))
+  ) {
+    console.warn("verseMergeConflicts: lock change left an alert it cannot re-derive", { book, resource });
+    return false;
+  }
+  // Whether the alert would carry a lock-dependent sentence if raised now,
+  // judged from the LIVE rows (#1118 item 2). The stored rows are not a safe
+  // stand-in: a save can resolve a row during the day, and a chunked reimport
+  // can record rows and then fail before its raise step. This read only spares
+  // the raise when nothing can change; the raise re-checks each dismissed
+  // alert against the rows it reads itself (#1129 item 1).
+  const live = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL)
+    .bind(book, resource)
+    .all<{ action: string; overwritten_version: number | null }>();
+  const dependsOnLock =
+    state.noBaseCount > 0 ||
+    (live.results ?? []).some((r) =>
+      rowWordingDependsOnLock({ action: r.action, overwrittenVersion: r.overwritten_version }),
+    );
+  // #1110 round 2, #1118 item 2: a re-raise rebuilds the alert from the live
+  // rows, so once rows were resolved since the last reimport it mints a new
+  // key. For a DISMISSED alert that brings back what people dismissed, so it
+  // is re-raised only when something live still depends on the lock and the
+  // wording it stands under is wrong for the lock now. An undismissed alert
+  // is always rebuilt from the live rows, as before #1118: it then stops
+  // listing rows a save resolved, and stops naming a lock that is gone. An
+  // identical rebuild leaves the stored key as it was, which ends the refresh.
+  // #1129: the raise makes that call per recipient (lockRefresh). This only
+  // skips the raise when every standing alert is dismissed and nothing depends
+  // on the lock: an editor's wording depends on it only through no-base
+  // verses, which make the admin's depend on it too, so the raise would keep
+  // them all. Whether a dismissed editor's wording matches the lock needs the
+  // editor lookup, so that is left to the raise (#1129 review A1).
+  if (before.every((r) => r.dismissed_at != null) && !dependsOnLock) return false;
+  const ordered = [...noBase].sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
+  await raiseVerseMergeConflictAlert(env, book, resource, {
+    recordingFailed: false,
+    noBaseCount: state.noBaseCount,
+    noBaseRefs: ordered.map((r) => `${r.chapter}:${r.verse}`),
+    noBaseEditorRefs: ordered.map((r) => ({ chapter: r.chapter, verse: r.verse, version: r.version })),
+    // #1129: the raise reads the lock itself, once, and only if the rows it
+    // read carry a lock-dependent sentence, so the wording matches those rows.
+    bookLocked: lockedNow,
+    observedAt: standing.condition_observed_at,
+    lockRefresh: true,
+  });
+  // The raise is best-effort and can write nothing (a failed write, an
+  // observation reconcileReviewAlert drops as older, or only dismissed alerts
+  // it kept). Report a change only if a standing alert actually moved, so the
+  // caller does not repeat a pass that cannot land.
+  const fingerprint = (rows: Standing[]) => JSON.stringify(rows.map((r) => [r.id, r.condition_key]));
+  return fingerprint(await readStanding()) !== fingerprint(before);
 }
 
 interface VerseMergeConflictRecord {
@@ -1049,7 +1450,9 @@ verseMergeConflicts.get("/:book", async (c) => {
       overwrittenVersion: r.overwritten_version,
       alignment,
       // Issue #624: the durable "first flagged" date (never reset by
-      // re-detection of the same still-unresolved conflict — see
+      // re-detection of the same still-unresolved conflict; reset only when a
+      // resolved row is reactivated (#996) or an unresolved audit-only row is
+      // promoted to adopt_conflict (#1124) — see
       // VerseMergeConflictRow.detectedAt's doc comment), so the in-app
       // merge-review banner can show it per verse without a prod D1 query.
       detectedAt: r.detected_at,

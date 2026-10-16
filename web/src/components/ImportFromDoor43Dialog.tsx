@@ -164,7 +164,7 @@ export function ImportFromDoor43Dialog({
             size="small"
             autoFocus
             error={!refParsed.ok}
-            inputProps={{ inputMode: "numeric", pattern: "[0-9-]*" }}
+            inputProps={{ inputMode: "numeric", pattern: "[0-9\\-]*" }}
             helperText={
               refParsed.ok
                 ? refParsed.range.startChapter === refParsed.range.endChapter

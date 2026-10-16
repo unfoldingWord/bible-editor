@@ -29,6 +29,7 @@ import { hoistOpeningPunctuation } from "./openingPunct.ts";
 import { NT_BOOKS } from "./dcsSources.ts";
 import { newRowId, isValidRowId, coerceRowId, deriveAltRowId } from "./rowId.ts";
 import { tnContentKey } from "./tnDedup.ts";
+import { classifyKept, loadEditLogs, type KeptRow } from "./keptNotes.ts";
 import { requiredOccurrence } from "./occurrenceRule.ts";
 import { resourcesWrittenBy } from "./chapterLock.ts";
 import {
@@ -64,6 +65,16 @@ export interface ImportContext {
   book: string;
   startChapter: number;
   endChapter: number;
+  // Set only for a notes run limited to part of one chapter (#1160). The
+  // range is stored in pipeline_jobs.options_json and pollPipelineJob reads it
+  // back with storedVerseRange. When absent, a notes job is treated
+  // as a whole-chapter run and its TN sweep covers every verse of the chapters
+  // it proposed for (#1151). When present, staging drops every TSV row
+  // outside the range (the bot's output file holds the whole book, and the
+  // verses outside the range are master's copy, not this run's work) and the
+  // sweep stays per-verse, which matches the bot's own verse-range push
+  // (door43-push replaceChapter:false replaces only verses it has notes for).
+  verseRange?: { start: number; end: number } | null;
 }
 
 export interface ImportResult {
@@ -172,6 +183,11 @@ export function tnPayload(
       tags: row["Tags"] || null,
       support_reference: row["SupportReference"] || null,
       quote,
+      // The AI's quote before canonizing, kept so apply's TN dedup can tell a
+      // word the AI wrote in UHB bytes from one a loose canonize tier rewrote
+      // into them (isDistinctTwinTn, #966). Staging-only: applyTnInsert drops
+      // it before the edit_log audit, which records the row's columns.
+      ai_quote: rawQuote,
       occurrence,
       // Collapse bp-assistant's double-space-after-punctuation artifact so the
       // stored note matches DCS master's normalized form (see
@@ -198,6 +214,96 @@ export function tnPayload(
 // Exported for pipelineImport.test.mjs only.
 export function tnDedupQuote(quote: string | null): string | null {
   return quote == null ? null : quote.replace(/[\u2060\u200D\uFEFF]/g, "").normalize("NFC");
+}
+
+// A note already claimed in applyJobOutput's content-dedup set, kept with its
+// raw quote and ref so a fold collision can be re-checked (isDistinctTwinTn).
+// `trusted[i]` says whether word i's bytes may count as a UHB surface; null
+// means every word may (a live row: its stored bytes are what tC counts).
+export interface ClaimedTn {
+  quote: string | null;
+  refRaw: string | null;
+  trusted: boolean[] | null;
+}
+
+const QUOTE_WORD_SEP = /[ \u05BE]/; // space or maqaf, as canonizeQuote splits
+
+// #966: the fold above is wider than translationCore's identity. tC counts
+// each byte-distinct surface as its own occurrence sequence, and some verses
+// hold two surfaces that fold together: DAN 2:10 has kol both with a U+2060
+// word joiner and bare, and 1CH 22:19 has two ha'elohim that differ only in
+// mark order (issue #966 lists them). Two fold-equal quotes are therefore
+// separate notes only when, at some word,
+// BOTH sides are byte-identical to a UHB word of the verses the notes cover
+// and those two UHB words differ. Any word that is not a UHB surface counts as
+// matching: a legacy NFC row, a proposal staged before #959, an un-canonizable
+// word, a verse with no UHB loaded, a Gateway-Language quote. That keeps the
+// #962 doubling guard for all of those (doubling is the worse failure). NT
+// jobs pass an empty map, so they keep the fold unchanged.
+//
+// A proposal word counts only when the AI itself wrote it in those UHB bytes
+// (its staged `ai_quote` word equals the stored word, see proposalTrust). A
+// word staging rewrote is not evidence: the stripped tier keys on a fold that
+// keeps U+2060, so an AI `kol` with the joiner dropped and a vowel slip lands
+// on the bare twin. A proposal staged without `ai_quote` trusts no word.
+//
+// Accepted costs, all toward dedup: a legacy NFC row in a twin verse, which
+// cannot be told apart from either twin, blocks a re-proposal of either twin
+// with identical text; and an AI proposal in NFC or with joiners dropped is
+// still deduped against a live twin note. Twins are kept apart only when the
+// proposal arrives in exact UHB bytes.
+//
+// Why no canonizeQuote here, as staging does: within one fold bucket both
+// words share canonizeQuote's exact-tier key, so its exact tier resolves them
+// to the same UHB word unless that bucket is ambiguous, where it keeps only a
+// word that is already a UHB surface. That is this test. Its looser tiers key
+// on folds that keep U+2060, so they could resolve two fold-equal words to
+// different UHB words and split a real duplicate. Both sides are checked
+// against one candidate set (the union of the verses either ref covers), so a
+// live ref_raw that differs from the proposal's Reference cannot make them
+// resolve differently. A null ref_raw (tn_rows.ref_raw is NOT NULL, so only a
+// malformed payload) covers just the row's own verse. Exported for
+// pipelineImport.test.mjs only.
+export function isDistinctTwinTn(
+  chapter: number,
+  verse: number,
+  a: ClaimedTn,
+  b: ClaimedTn,
+  sourceWordsByVerse: Map<number, SourceWord[]>,
+): boolean {
+  if (a.quote == null || b.quote == null || a.quote === b.quote || sourceWordsByVerse.size === 0) return false;
+  const surfaces = new Set<string>();
+  const verses = new Set([...coveredVersesFromRef(a.refRaw, verse), ...coveredVersesFromRef(b.refRaw, verse)]);
+  for (const v of verses) {
+    for (const w of sourceWordsByVerse.get(chapter * 100000 + v) ?? []) surfaces.add(w.text);
+  }
+  const aw = a.quote.split(QUOTE_WORD_SEP);
+  const bw = b.quote.split(QUOTE_WORD_SEP);
+  if (aw.length !== bw.length) return false;
+  const surface = (c: ClaimedTn, w: string, i: number) =>
+    (c.trusted === null || c.trusted[i] === true) && surfaces.has(w);
+  return aw.some((w, i) => w !== bw[i] && surface(a, w, i) && surface(b, bw[i], i));
+}
+
+// Per-word trust for a staged proposal: a word is trusted only when it is
+// byte-identical to the AI's own word at the same position. No `ai_quote`
+// (staged before it was recorded) or a different word count trusts nothing,
+// so the proposal falls back to the fold.
+function proposalTrust(quote: string | null, aiQuote: unknown): boolean[] {
+  if (quote == null || typeof aiQuote !== "string") return [];
+  const words = quote.split(QUOTE_WORD_SEP);
+  const aiWords = aiQuote.split(QUOTE_WORD_SEP);
+  return words.length === aiWords.length ? words.map((w, i) => w === aiWords[i]) : [];
+}
+
+// The book's UHB/UGNT words, loaded at most ONCE per importJobOutput call (one
+// query, cap-safe) and shared by staging's quote canonize and apply's TN dedup
+// and verse canonize, which used to load the same rows twice.
+type SourceWordsLoader = () => Promise<Map<number, SourceWord[]>>;
+
+function onceSourceWords(env: Env, job: ImportContext): SourceWordsLoader {
+  let loaded: Promise<Map<number, SourceWord[]>> | null = null;
+  return () => (loaded ??= loadUhbSourceWords(env, job));
 }
 
 export function tqPayload(book: string, refRaw: string, row: Record<string, string>) {
@@ -303,8 +409,19 @@ async function parseOutputEntry(
     for (const row of rows) {
       const refRaw = row["Reference"];
       if (!refRaw) continue;
-      const [ch] = refParts(refRaw);
+      const [ch, vs] = refParts(refRaw);
       if (ch < ctx.startChapter || ch > ctx.endChapter) continue;
+      // #1160: a verse-range run touches only its own verses, keyed on the
+      // ANCHOR (leading) verse — the same (chapter, verse) the sweep and apply
+      // use. A bridge anchored inside that runs past the end (36:14-16 in a
+      // 10-15 run) is this run's note and lands. A bridge anchored before the
+      // start (36:9-11) is master's copy: the bot never anchors a note outside
+      // its window (bp-assistant notes-pipeline.js "Partial-chapter runs ...
+      // must never anchor ... outside their own verse window"), and importing
+      // it would meet only content dedup at a verse the sweep never touches —
+      // a stale duplicate of today's edit, or a resurrection of today's
+      // delete. The intro (verse 0) is outside every range.
+      if (ctx.verseRange && (vs < ctx.verseRange.start || vs > ctx.verseRange.end)) continue;
       const built = cls.kind === "tn"
         ? tnPayload(ctx.book, refRaw, row, uhbWordsByVerse)
         : tqPayload(ctx.book, refRaw, row);
@@ -417,12 +534,13 @@ export async function importJobOutput(
     abortState: null,
     abortErrorKind: null,
   };
+  const sourceWords = onceSourceWords(env, job);
   try {
-    const stageResult = await stageJobOutput(env, job, outputs, heartbeat, cancel);
+    const stageResult = await stageJobOutput(env, job, outputs, heartbeat, cancel, sourceWords);
     // Staging itself can abort (see the CHUNK loop in stageJobOutput) — when it
     // does, skip apply entirely rather than running it against a possibly
     // incomplete pending_imports set.
-    const applyResult = cancel.aborted ? undefined : await applyJobOutput(env, job, heartbeat, cancel);
+    const applyResult = cancel.aborted ? undefined : await applyJobOutput(env, job, heartbeat, cancel, sourceWords);
 
     // Deliberate stop wins over an incidental lease loss below: it is the more
     // specific AND the more actionable outcome (keep-and-record + stamp the
@@ -709,6 +827,7 @@ async function stageJobOutput(
   outputs: OutputEntry[],
   heartbeat: ClaimHeartbeat,
   cancel: CancelWatch,
+  sourceWords: SourceWordsLoader,
 ): Promise<ImportResult> {
   // Idempotency guard: staged_at is written ONLY after the final chunk below
   // commits, so it — not the mere existence of a pending_imports row — is the
@@ -740,10 +859,11 @@ async function stageJobOutput(
     .run();
 
   // UHB words for TN quote canonizing (see tnPayload), loaded ONCE per job —
-  // one query, cap-safe — and only when an OT job actually carries TN output.
+  // one query, cap-safe, shared with apply — and only when an OT job actually
+  // carries TN output.
   const uhbWordsByVerse =
     !NT_BOOKS.has(job.book) && outputs.some((e) => e.rawUrl && classify(e).kind === "tn")
-      ? await loadUhbSourceWords(env, job)
+      ? await sourceWords()
       : new Map<number, SourceWord[]>();
 
   const skipped: string[] = [];
@@ -885,6 +1005,7 @@ async function applyJobOutput(
   job: ImportContext,
   heartbeat: ClaimHeartbeat,
   cancel: CancelWatch,
+  sourceWords: SourceWordsLoader,
 ): Promise<ApplyResult> {
   // Look up the pipeline-starter's user id — every audit and updated_by
   // write is attributed to them, matching the contract that says the run
@@ -948,6 +1069,15 @@ async function applyJobOutput(
   // the rate limit and always actually read (see maybeCheckCancelled's
   // `opts.force`) — a fresh, sub-15s single-chapter stage would otherwise
   // consume the rate-limit window and leave this checkpoint unable to fire.
+  //
+  // The TN dedup's source words (isDistinctTwinTn, #966) load BEFORE this
+  // checkpoint and the deletes: a D1 error in that read must fail the apply
+  // while nothing is deleted yet, not between the deletes and their
+  // replacements. Reused from staging when it already loaded them; OT only.
+  const tnSourceWords =
+    tnProposals.length > 0 && !NT_BOOKS.has(job.book)
+      ? await sourceWords()
+      : new Map<number, SourceWord[]>();
   if (await maybeCheckCancelled(env, job.jobId, cancel, { force: true })) {
     result.affectedChapters = [...affected].sort((a, b) => a - b);
     return result;
@@ -972,10 +1102,15 @@ async function applyJobOutput(
   // identical proposals in one file also collapse. This is the last line of
   // defense against the re-run doubling (ISA 36/41): even if the sweep misses a
   // row, its content key blocks the second copy.
-  const claimedTnKeys = new Set<string>();
+  //
+  // Keyed on the FOLDED quote (tnDedupQuote), each key holding the raw quotes
+  // claimed under it: a fold collision is a duplicate unless the two quotes are
+  // byte-distinct UHB twins (isDistinctTwinTn, #966). OT only — an NT job keeps
+  // an empty source map, so its dedup is the plain fold.
+  const claimedTn = new Map<string, ClaimedTn[]>();
   if (tnProposals.length > 0) {
     const live = await env.DB.prepare(
-      `SELECT chapter, verse, occurrence, support_reference, quote, note
+      `SELECT chapter, verse, ref_raw, occurrence, support_reference, quote, note
          FROM tn_rows
         WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND deleted_at IS NULL`,
     )
@@ -983,6 +1118,7 @@ async function applyJobOutput(
       .all<{
         chapter: number;
         verse: number;
+        ref_raw: string | null;
         occurrence: number | null;
         support_reference: string | null;
         quote: string | null;
@@ -1000,9 +1136,11 @@ async function applyJobOutput(
     // occurrence matching. Its Hebrew encoding is folded for the key only
     // (tnDedupQuote), since tnPayload now canonizes proposals to UHB bytes.
     for (const r of live.results ?? []) {
-      claimedTnKeys.add(
-        tnContentKey({ ...r, quote: tnDedupQuote(r.quote), note: r.note ? curlifyText(r.note) : r.note }),
-      );
+      const key = tnContentKey({ ...r, quote: tnDedupQuote(r.quote), note: r.note ? curlifyText(r.note) : r.note });
+      const claim: ClaimedTn = { quote: r.quote, refRaw: r.ref_raw, trusted: null };
+      const list = claimedTn.get(key);
+      if (list) list.push(claim);
+      else claimedTn.set(key, [claim]);
     }
   }
 
@@ -1077,10 +1215,21 @@ async function applyJobOutput(
       quote: tnDedupQuote((payload.quote as string | null | undefined) ?? null),
       note: (payload.note as string | null | undefined) ?? null,
     });
+    const proposedQuote = (payload.quote as string | null | undefined) ?? null;
+    const claim: ClaimedTn = {
+      quote: proposedQuote,
+      refRaw: (payload.ref_raw as string | null | undefined) ?? null,
+      trusted: proposalTrust(proposedQuote, payload.ai_quote),
+    };
+    const claimedUnderKey = claimedTn.get(contentKey);
+    const claimKey = () => {
+      if (claimedUnderKey) claimedUnderKey.push(claim);
+      else claimedTn.set(contentKey, [claim]);
+    };
 
     const expanded = await applyTnHintExpansionIfMatch(env, p, job, userId, actor);
     if (expanded) {
-      claimedTnKeys.add(contentKey);
+      claimKey();
       affected.add(p.chapter);
       result.tnHintExpanded += 1;
       continue;
@@ -1089,8 +1238,9 @@ async function applyJobOutput(
     // note, an expanded hint, or a prior-AI row the sweep somehow missed). Keyed
     // on content, not id, so the fresh id bp-assistant mints each run can't
     // sneak a duplicate past. A genuinely new/changed note has a different key
-    // and still inserts.
-    if (claimedTnKeys.has(contentKey)) {
+    // and still inserts. A fold collision with a byte-distinct UHB twin is not a
+    // duplicate (#966, isDistinctTwinTn).
+    if (claimedUnderKey?.some((c) => !isDistinctTwinTn(p.chapter, p.verse, c, claim, tnSourceWords))) {
       // Resolve the proposal so it doesn't linger as an unreviewed item in the
       // pending-imports review endpoint — the note it proposes already exists,
       // so accepting (without inserting) is the truthful resolution.
@@ -1102,7 +1252,7 @@ async function applyJobOutput(
       result.tnSkippedDup += 1;
       continue;
     }
-    claimedTnKeys.add(contentKey);
+    claimKey();
     const k = verseKey(p);
     const sortOrder = (tnCounters.get(k) ?? tnBases.get(k) ?? 0) + 100;
     tnCounters.set(k, sortOrder);
@@ -1130,7 +1280,7 @@ async function applyJobOutput(
   // question silently. Proposal order is stable (ORDER BY kind, chapter, verse,
   // id), so which proposal wins the shared id is deterministic across re-runs
   // and each keeps landing on the same row. TN has the same idea in
-  // claimedTnKeys, keyed on content rather than id.
+  // claimedTn, keyed on content rather than id.
   const claimedTqIds = new Set<string>();
   for (const p of tqProposals) {
     const k = verseKey(p);
@@ -1153,9 +1303,10 @@ async function applyJobOutput(
   // so each verse's alignment canonize + U+FFFD heal read from memory instead
   // of issuing a per-verse D1 read (a whole-book generate would otherwise blow
   // the ~1000-subrequest budget). Empty map when there are no verse proposals.
+  // The same load staging and the TN dedup above use, so it is never repeated.
   const uhbWordsByVerse =
     verseProposals.length > 0
-      ? await loadUhbSourceWords(env, job)
+      ? await sourceWords()
       : new Map<number, SourceWord[]>();
 
   // #402: same group-boundary rule as the TQ loop above, keyed on verseKey
@@ -1228,17 +1379,19 @@ export async function deleteUnkeptTns(
   // starter on every note it creates, so a re-run's notes are NOT pristine and
   // a plain `updated_by IS NULL` sweep would skip them — leaving them in place
   // while the re-run inserts a full fresh set, DOUBLING every note (ISA 36/41,
-  // 2026-06). Class (b) is identified by the most-recent CONTENT-bearing
-  // edit_log entry (action IN create/update) still being source 'ai_pipeline'.
-  // The action filter matters: /preserve/hint/trash toggles write NULL-source
-  // audit rows (rows.ts), so an AI note that was preserved-then-unpreserved
-  // would otherwise look human-owned (its LATEST audit row is 'unpreserve',
-  // source NULL) and dodge the sweep forever. A real human content edit writes
-  // action 'update' source NULL, and a hint expansion writes 'hint_expansion'
-  // — both correctly take the latest content action off 'ai_pipeline', so an
-  // edited / hint-owned note is protected. The reimport never rewrites an AI
-  // row (its UPDATE/prune are updated_by-IS-NULL gated), so the content source
-  // stays 'ai_pipeline' reliably.
+  // 2026-06). Class (b) is every row with updated_by set that classifyKept
+  // (keptNotes.ts) does not keep. That is the SAME rule that built the
+  // `options.kept` list sent to the bot (#1152), so "what the bot was told to
+  // leave" and "what this sweep refuses to delete" cannot disagree. The old
+  // rule here (latest create/update source != 'ai_pipeline' means human-owned)
+  // kept ~100 rows the bot was never told to keep: reorder-only and
+  // whitespace-only saves, edits reverted to the AI text, quote-repair
+  // scripts, Door43 tag-only syncs. The bot deleted those from master, the AI
+  // rewrote them, and the sweep left the D1 copy standing, so every re-run
+  // grew a duplicate. classifyKept replays each row's full create/update/
+  // restore history, which is why the SELECT below reads rows and a second
+  // query (loadEditLogs) reads their history, instead of one correlated
+  // subquery on the latest source.
   //
   // trashed_at IS NULL: a trashed AI note is left alone — the content-dedup
   // claim set below (seeded from deleted_at IS NULL rows, which includes
@@ -1297,7 +1450,7 @@ export async function deleteUnkeptTns(
   // excluded verse's not-yet-deleted prior-run/pristine notes survive (mildly
   // stale) instead of being deleted — consistent with this module's existing
   // philosophy, and strictly better than deleting accepted notes. Content-
-  // dedup (`claimedTnKeys` in applyJobOutput) prevents the remainder inserts
+  // dedup (`claimedTn` in applyJobOutput) prevents the remainder inserts
   // from duplicating whatever survives.
   const resolved = await env.DB.prepare(
     `SELECT DISTINCT chapter, verse FROM pending_imports
@@ -1305,43 +1458,77 @@ export async function deleteUnkeptTns(
   )
     .bind(job.jobId)
     .all<{ chapter: number; verse: number }>();
-  const pairs = tnSweepScope(tnProposals, resolved.results ?? []);
+  // #1151: a whole-chapter notes run replaces the whole chapter in en_tn
+  // (bp-assistant#436), so a verse the run left empty must lose its old AI
+  // notes too. Add every verse that has a live note in a chapter this pass
+  // proposed for; tnSweepScope still drops the resolved verses, so the
+  // resumed-pass protection above holds unchanged (an empty verse has nothing
+  // to re-insert, so re-sweeping it on a resumed pass is harmless). Left out
+  // on purpose: verse 0 (the chapter intro — a noIntro run writes none, so an
+  // unproposed intro stays), chapters with no proposal in this pass (a chapter
+  // with no output reads as a failed chapter, not a wipe), and verse-range
+  // runs (they keep the per-verse scope).
+  let scopeInput: Array<{ chapter: number; verse: number }> = tnProposals;
+  if (job.pipelineType === "notes" && !job.verseRange) {
+    const chapters = new Set(tnProposals.map((p) => p.chapter));
+    const liveVerses = await env.DB.prepare(
+      `SELECT DISTINCT chapter, verse FROM tn_rows
+        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND verse > 0
+          AND deleted_at IS NULL`,
+    )
+      .bind(job.book, job.startChapter, job.endChapter)
+      .all<{ chapter: number; verse: number }>();
+    scopeInput = [
+      ...tnProposals,
+      ...(liveVerses.results ?? []).filter((p) => chapters.has(p.chapter)),
+    ];
+  }
+  // #1160: a verse-range run never sweeps a verse outside its range. Staging
+  // already drops proposals anchored outside it; this is the backstop.
+  const range = job.verseRange;
+  const pairs = tnSweepScope(scopeInput, resolved.results ?? []).filter(
+    (p) => !range || (p.verse >= range.start && p.verse <= range.end),
+  );
   if (pairs.length === 0) return 0;
 
-  // D1 caps bound parameters at 100 per statement. This query already binds 4
-  // fixed params (book, startChapter, endChapter, AI_SOURCE) before the pair
-  // params, so the chunk size must leave room: 4 + 2*CHUNK_PAIRS <= 100.
-  // 40 pairs -> 84 total, comfortable headroom below the cap.
+  // D1 caps bound parameters at 100 per statement. This query already binds 3
+  // fixed params (book, startChapter, endChapter) before the pair params, so
+  // the chunk size must leave room: 3 + 2*CHUNK_PAIRS <= 100. 40 pairs -> 83
+  // total, comfortable headroom below the cap.
   const CHUNK_PAIRS = 40;
-  const list: { id: string; version: number }[] = [];
+  const candidates: (KeptRow & { version: number; updated_by: number | null })[] = [];
   for (let i = 0; i < pairs.length; i += CHUNK_PAIRS) {
     const slice = pairs.slice(i, i + CHUNK_PAIRS);
     const pairClauses = slice
-      .map((_, idx) => `(t.chapter = ?${5 + idx * 2} AND t.verse = ?${6 + idx * 2})`)
+      .map((_, idx) => `(chapter = ?${4 + idx * 2} AND verse = ?${5 + idx * 2})`)
       .join(" OR ");
     const pairParams = slice.flatMap((pair) => [pair.chapter, pair.verse]);
     const rs = await env.DB.prepare(
-      `SELECT id, version FROM tn_rows t
+      `SELECT id, version, book, chapter, verse, ref_raw, quote, note,
+              support_reference, preserve, updated_by
+         FROM tn_rows
         WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
           AND deleted_at IS NULL AND trashed_at IS NULL
           AND preserve = 0 AND hint = 0
-          AND (${pairClauses})
-          AND (
-            updated_by IS NULL
-            OR (
-              SELECT source FROM edit_log
-                WHERE kind = 'tn' AND row_key = t.id
-                  AND (book = t.book OR book IS NULL)
-                  AND action IN ('create', 'update')
-                ORDER BY id DESC LIMIT 1
-            ) = ?4
-          )`,
+          AND (${pairClauses})`,
     )
-      .bind(job.book, job.startChapter, job.endChapter, AI_SOURCE, ...pairParams)
-      .all<{ id: string; version: number }>();
-    list.push(...(rs.results ?? []));
+      .bind(job.book, job.startChapter, job.endChapter, ...pairParams)
+      .all<KeptRow & { version: number; updated_by: number | null }>();
+    candidates.push(...(rs.results ?? []));
     await maybeTouchClaim(env, job.jobId, heartbeat);
   }
+  // Read the history AFTER the rows: an edit landing in between bumps the
+  // row's version, so the version-CAS in the delete below aborts that row.
+  const logs = await loadEditLogs(
+    env,
+    job.book,
+    candidates.filter((r) => r.updated_by != null).map((r) => r.id),
+  );
+  await maybeTouchClaim(env, job.jobId, heartbeat);
+  // A pristine row (updated_by NULL) is never kept, same as loadKeptTns.
+  const list = candidates
+    .filter((r) => r.updated_by == null || !classifyKept(r, logs.get(r.id) ?? []).kept)
+    .map((r) => ({ id: r.id, version: r.version }));
   if (list.length === 0) return 0;
 
   const now = Math.floor(Date.now() / 1000);
@@ -1635,7 +1822,7 @@ async function applyTnInsert(
                (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
              VALUES ('tn', ?1, ?2, ?3, NULL, 1, 'create', ?4, ?5)`,
           )
-          .bind(id, p.book, userId, JSON.stringify(payload), AI_SOURCE),
+          .bind(id, p.book, userId, JSON.stringify({ ...payload, ai_quote: undefined }), AI_SOURCE),
         env.DB
           .prepare(
             `UPDATE pending_imports

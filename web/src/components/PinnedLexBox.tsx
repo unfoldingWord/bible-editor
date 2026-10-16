@@ -50,6 +50,19 @@ export function usePinnedLexRefresh(source: SourceWord, lex: LexiconEntry | null
   }, [source.strong, lex]);
 }
 
+// The same fill-in for a whole source line at once: one effect per line
+// instead of one per word (HebrewLine, #899).
+export function usePinnedLexRefreshFrom(lexiconMap: Map<string, LexiconEntry | null>) {
+  useEffect(() => {
+    if (!pinned || pinned.lex) return;
+    const lex = lexiconMap.get(pinned.source.strong);
+    if (lex) {
+      pinned = { ...pinned, lex };
+      emit();
+    }
+  }, [lexiconMap]);
+}
+
 function unpinLex() {
   pinned = null;
   emit();

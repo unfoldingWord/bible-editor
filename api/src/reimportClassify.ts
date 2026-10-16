@@ -95,8 +95,8 @@ export interface ReimportableRow {
 //                        null/manual-source edit_log row, flipping this false).
 // Human-owned protections still block overwrite regardless of the above: a
 // tombstone (deleted_at), a note queued for deletion (trashed_at), or an
-// explicit preserve/hint flag (tn). This mirrors the pipelineImport deleteUnkeptTns
-// safety predicate; the caller re-asserts the same conditions at write time
+// explicit preserve/hint flag (tn). This was the pipelineImport deleteUnkeptTns
+// safety predicate before the sweep moved to classifyKept (#1152 PR B); the caller re-asserts the same conditions at write time
 // (version-CAS + flag re-assertion) so a human edit landing mid-import can't be
 // clobbered.
 export function isReimportableRow(r: ReimportableRow): boolean {

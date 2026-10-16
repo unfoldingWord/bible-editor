@@ -22,7 +22,7 @@ import { Button, Stack, Typography } from "@mui/material";
 //    module script but the server responded with a MIME type of text/html…"
 // The second is what Cloudflare's [assets] SPA fallback produces for a missing
 // hashed chunk, so it's the common real-world case — don't miss it.
-function isChunkLoadError(err: unknown): boolean {
+export function isChunkLoadError(err: unknown): boolean {
   const e = err as { name?: string; message?: string } | null;
   if (!e) return false;
   if (e.name === "ChunkLoadError") return true;

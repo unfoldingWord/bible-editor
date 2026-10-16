@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, shouldRecordRevertReport, shouldComputeRevertEntries, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, loadRevertLineage, readUnconfirmedRenders, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, exportRevertRaceAlertSource, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -2344,14 +2344,19 @@ function utf8Base64(s) {
   const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
   const tnRow = (ref, id, tags, quote, note) => `${ref}\t${id}\t${tags}\t\t${quote}\t1\t${note}`;
 
-  // Only Tags differs → "tags_only".
-  const masterTags = `${TN_HEADER}\n${tnRow("1:1", "ab01", "", "word", "a note")}\n`;
-  const renderedTags = `${TN_HEADER}\n${tnRow("1:1", "ab01", "keyword", "word", "a note")}\n`;
+  // #1029: tn/tq Tags are blanked on export by design, so a Tags-only
+  // difference is never reported. twl keeps Tags and still classifies.
+  const masterTags = `${TN_HEADER}\n${tnRow("1:1", "ab01", "ISSUE:MATCH_FAIL", "word", "a note")}\n`;
+  const renderedTags = `${TN_HEADER}\n${tnRow("1:1", "ab01", "", "word", "a note")}\n`;
   const rTags = tsvRevertReport(renderedTags, masterTags, "tn");
-  assert(
-    rTags.entries.length === 1 && rTags.entries[0].class === "tags_only",
-    `only the Tags column differing classifies as "tags_only"`,
+  assert(rTags.entries.length === 0, `tn: Tags-only difference is not reported`);
+  const TWL_HEADER = "Reference\tID\tTags\tOrigWords\tOccurrence\tTWLink";
+  const rTwlTags = tsvRevertReport(
+    `${TWL_HEADER}\n1:1\tab01\t\tw\t1\trc://*/tw/dict/bible/kt/god\n`,
+    `${TWL_HEADER}\n1:1\tab01\tkeep\tw\t1\trc://*/tw/dict/bible/kt/god\n`,
+    "twl",
   );
+  assert(rTwlTags.entries.length === 1 && rTwlTags.entries[0].class === "tags_only", `twl keeps tags_only`);
   assert(rTags.totalRows === 1, `totalRows counts master's rows`);
 
   // Only a double-space-vs-single-space difference in a text field → "whitespace_only".
@@ -2589,6 +2594,59 @@ function utf8Base64(s) {
   );
 }
 
+// --- foreignCommitDuringExport (#871): the freshness-gate/commitToDcs race ---
+// checkMasterFreshness pins master's head SHA once, before the shrink/
+// alignment guards' snapshot and before commitToDcs's several DCS round
+// trips. A commit landing on master inside that window is invisible to every
+// check above — this is exportOne's re-check, run right after commitToDcs,
+// to notice the pinned snapshot went stale mid-run.
+{
+  assert(
+    foreignCommitDuringExport("sha-pinned", "sha-different") === true,
+    `head resolved again after commitToDcs differs from the gate's pinned sha -> a foreign commit landed mid-export`,
+  );
+  assert(
+    foreignCommitDuringExport("sha-pinned", "sha-pinned") === false,
+    `head unchanged since the gate ran -> today's behaviour exactly, no race`,
+  );
+  assert(
+    foreignCommitDuringExport(null, "sha-different") === false,
+    `no pinned sha to compare against (dry run, or the gate never resolved one) -> nothing to detect a race against`,
+  );
+  assert(
+    foreignCommitDuringExport("sha-pinned", null) === false,
+    `post-commit head unresolvable -> fails CLOSED on "is this a race", not open; an unreadable head does not ` +
+      `PROVE nothing landed, but there is nothing to compare, so the report proceeds exactly as it did before ` +
+      `this check existed rather than block on missing information`,
+  );
+  assert(
+    foreignCommitDuringExport(null, null) === false,
+    `neither side known -> no race detected`,
+  );
+}
+
+// exportRevertRaceAlertSource (#871 review A1): writeAlert deletes any
+// undismissed alert with the same source before inserting, and the race banner
+// is never auto-cleared. So the source must be unique per race: race 1
+// (P1 -> F1) left undismissed must survive race 2 (P2 -> F2) on a later night.
+{
+  const race1 = exportRevertRaceAlertSource("JER", "ult", "p1sha", "f1sha");
+  const race2 = exportRevertRaceAlertSource("JER", "ult", "p2sha", "f2sha");
+  assert(race1 !== race2, `two different races on one pair must not share an alert source (got ${race1})`);
+  assert(
+    race1 === exportRevertRaceAlertSource("JER", "ult", "p1sha", "f1sha"),
+    `the same race re-detected keeps its source, so a re-run replaces it and a dismissal sticks`,
+  );
+  assert(
+    race1.startsWith("export_revert_race:JER:ult:"),
+    `source keeps the export_revert_race:<book>:<resource> prefix (got ${race1})`,
+  );
+  assert(
+    exportRevertRaceAlertSource("JER", "ult", "p1sha", "f2sha") !== race1,
+    `same pin, different foreign head is a different race`,
+  );
+}
+
 // --- three-way revert report (#870): report only where master moved off base ---
 // #869 suppresses the whole report when master's bytes equal our last publish.
 // When master DID move (a bot merged one JER chapter), the report used to list
@@ -2661,6 +2719,223 @@ function utf8Base64(s) {
   assert(
     tMoved.entries.length === 1 && tMoved.entries[0].ref === "1:9",
     `tsv: master changing only Reference counts as moved -> reported; got ${JSON.stringify(tMoved.entries)}`,
+  );
+}
+
+// --- #1029: false-alarm fixes ---
+{
+  const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
+  const row = (id, note) => `1:1\t${id}\t\t\tword\t1\t${note}`;
+  const tsv = (rows) => `${TN_HEADER}\n${rows.join("\n")}\n`;
+
+  // (a) master = render N-2, base = N-1 (unmerged), render = N.
+  const n2 = tsv([row("ab01", "v2")]);
+  const n = tsv([row("ab01", "v4")]);
+  const n2Sha = "sha-n2";
+  assert(
+    shouldComputeRevertEntries(true, n2, n2Sha, "sha-n1", ["sha-n2", "sha-n1"], true) === false,
+    `(a) master holds an older unmerged-PR render of ours, head commit is ours -> suppressed`,
+  );
+  // Third review C1: render K-1 confirmed, K pushed, PR K merges, a human
+  // reverts it on Door43. Master's bytes equal K-1 (listed), but the commit
+  // that last touched the file is the human's revert, not our export merge.
+  assert(
+    shouldComputeRevertEntries(true, n2, n2Sha, "sha-n1", ["sha-n2", "sha-n1"], false) === true,
+    `C1: master back on an older render of ours via a non-export commit -> still computed`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, n2, n2Sha, "sha-n1", ["sha-n2", "sha-n1"]) === true,
+    `C1: head commit unknown -> fails open (computed)`,
+  );
+  {
+    const { classifyMasterCommit } = await import("./masterLineage.ts");
+    const ours = { sha: "a", message: "bible-editor: JER tn nightly export (#7790)", authorEmail: "person@example.org" };
+    const revert = {
+      sha: "b",
+      message: 'Revert "bible-editor: JER tn nightly export (#7790)"\n\nThis reverts commit a.',
+      authorEmail: "person@example.org",
+    };
+    assert(classifyMasterCommit(ours).kind === "ours", `our export squash commit classifies ours`);
+    assert(classifyMasterCommit(revert).kind !== "ours", `a Door43 revert of our export does not classify ours`);
+  }
+  // Third review: books already lagging when migration 0075 lands have a NULL
+  // list; the prior pushed renders stand in for it.
+  assert(
+    JSON.stringify(readUnconfirmedRenders({ unconfirmed_renders_json: null, prev_pushed_blob_sha: "p0", pushed_blob_sha: "p1" })) ===
+      '["p0","p1"]',
+    `NULL list -> seeded from prev_pushed_blob_sha and pushed_blob_sha`,
+  );
+  assert(
+    JSON.stringify(readUnconfirmedRenders({ unconfirmed_renders_json: '["x"]', prev_pushed_blob_sha: "p0", pushed_blob_sha: "p1" })) ===
+      '["x"]',
+    `a stored list wins over the seed`,
+  );
+  assert(readUnconfirmedRenders(null) === null, `no row -> null`);
+  assert(
+    shouldComputeRevertEntries(true, n2, "sha-foreign", "sha-n1", ["sha-n2", "sha-n1"]) === true,
+    `(c) master bytes not in our render history -> still computed`,
+  );
+  assert(
+    shouldComputeRevertEntries(true, n2, n2Sha, "sha-n1", null) === true,
+    `no history -> fails open`,
+  );
+  const foreign = tsv([row("ab01", "hand edit on master")]);
+  assert(
+    tsvRevertReport(n, foreign, "tn", tsv([row("ab01", "v3")])).entries.length === 1,
+    `(c) a real foreign edit still reports substantive`,
+  );
+
+  // (b) row created on master + D1 by ai_pipeline, then edited in the app.
+  const botMaster = tsv([row("ab01", "bot note")]);
+  const appEdited = tsv([row("ab01", "translator edit")]);
+  const payload = { ref_raw: "1:1", support_reference: "", quote: "word", occurrence: 1, note: "bot note" };
+  assert(
+    tsvRevertReport(appEdited, botMaster, "tn", null, new Map([["ab01", [payload]]])).entries.length === 0,
+    `(b) master cells equal an ai_pipeline payload -> 0 entries`,
+  );
+  assert(
+    tsvRevertReport(appEdited, botMaster, "tn", null, new Map([["ab01", [{ ...payload, note: "other" }]]])).entries.length === 1,
+    `(c) master differs from every bot payload (foreign edit) -> substantive`,
+  );
+  assert(
+    tsvRevertReport(appEdited, botMaster, "tn", null, new Map([["ab01", [{ note: "bot note" }]]])).entries.length === 1,
+    `partial payload never matches -> fails open`,
+  );
+
+}
+
+// --- #1029 review: loadRevertLineage on the real schema (A2, AO1, AO2, C1) ---
+{
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const migDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  const migs = readdirSync(migDir).filter((f) => f.endsWith(".sql")).sort().map((f) => readFileSync(join(migDir, f), "utf8"));
+  // Minimal D1 shim over node:sqlite.
+  const shim = (sqlite) => {
+    const mk = (sql, args) => ({
+      bind: (...a) => mk(sql, a),
+      all: async () => ({ results: sqlite.prepare(sql).all(...args), success: true }),
+    });
+    return { prepare: (sql) => mk(sql, []) };
+  };
+  const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
+  const tsv = (note) => `${TN_HEADER}\n1:1\tab01\t\t\tword\t1\t${note}\n`;
+  const base = { ref_raw: "1:1", support_reference: "", quote: "word", occurrence: 1 };
+  // events: [id, source, action, note, created_at?]. Master holds `master`; tonight's render holds `rendered`.
+  const entries = async (events, confirmed, rendered = "Z", master = "X") => {
+    const sqlite = new DatabaseSync(":memory:");
+    for (const m of migs) sqlite.exec(m);
+    for (const [id, source, action, note, at] of events) {
+      sqlite
+        .prepare(
+          `INSERT INTO edit_log (id, kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+           VALUES (?, 'tn', 'ab01', 'EZK', NULL, NULL, 1, ?, ?, ?, ?)`,
+        )
+        .run(id, action, note == null ? null : JSON.stringify({ ...base, note }), source, at ?? id);
+    }
+    const lineage = await loadRevertLineage(shim(sqlite), "tn", "EZK", confirmed);
+    return tsvRevertReport(tsv(rendered), tsv(master), "tn", null, lineage).entries.length;
+  };
+  const before = { editId: 10, at: 10 }; // master last confirmed before the bot write
+
+  // The issue's case (b): bot writes X to master and D1, translator edits in the app.
+  assert((await entries([[20, "ai_pipeline", "create", "X"], [30, null, "update", "Z"]], before)) === 0,
+    `(b) bot write after the confirmed point, then an app edit -> 0 entries`);
+  // A2
+  assert((await entries([[20, "dcs_reimport", "update", "X"]], before)) === 1,
+    `A2: master equals an imported (possibly human) Door43 value -> still reported`);
+  assert((await entries([[20, "ai_pipeline", "create", "X"], [25, "ai_pipeline", "update", "X2"]], before)) === 1,
+    `A2: human restores an OLDER bot value on Door43 -> still reported`);
+  assert((await entries([[20, "ai_pipeline", "create", "X"], [25, "dcs_reimport", "update", "H"]], before)) === 1,
+    `A2: bot value superseded by an imported Door43 edit, then restored -> still reported`);
+  // AO1: a reimport 'restore' also supersedes the bot write.
+  assert((await entries([[20, "ai_pipeline", "create", "X"], [25, "dcs_reimport", "restore", "R"]], before)) === 1,
+    `AO1: bot value superseded by a reimport restore, then restored on Door43 -> still reported`);
+  // AO2: X (bot) -> Y (app, exported, merged, confirmed at 35) -> Z (app); a human restores X on Door43.
+  assert(
+    (await entries([[20, "ai_pipeline", "create", "X"], [30, null, "update", "Y"], [40, null, "update", "Z"]], { editId: 35, at: 35 })) === 1,
+    `AO2: bot write older than the confirmed point -> a human restore of it is still reported`,
+  );
+  // Timestamp fallback when master_confirmed_edit_id is NULL (warm-up).
+  assert((await entries([[20, "ai_pipeline", "create", "X", 900]], { editId: null, at: 1000 })) === 1,
+    `AO2: no edit-id boundary, bot write before master_confirmed_at -> reported`);
+  assert((await entries([[20, "ai_pipeline", "create", "X", 1100]], { editId: null, at: 1000 })) === 0,
+    `no edit-id boundary, bot write after master_confirmed_at -> 0 entries`);
+  // Same second as the confirmed render's D1 read: it may be inside that render,
+  // so it must not count (counting it could hide a later human restore).
+  assert((await entries([[20, "ai_pipeline", "create", "X", 1000]], { editId: null, at: 1000 })) === 1,
+    `no edit-id boundary, bot write in the same second as master_confirmed_at -> reported`);
+  assert((await entries([[20, "ai_pipeline", "create", "X"]], { editId: null, at: null })) === 1,
+    `no confirmed point at all -> lineage unused, reported (fails open)`);
+  // C1: a non-string content field must not throw (the report runs after the DCS commit).
+  let threw = false;
+  try {
+    await entries([[20, "ai_pipeline", "create", 7]], before);
+  } catch {
+    threw = true;
+  }
+  assert(!threw, `C1: a non-string note in a payload does not throw`);
+}
+
+// --- RECORD_PUSHED_RENDER_SQL tracks renders since master was last confirmed (#1029) ---
+{
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const db = new DatabaseSync(":memory:");
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) db.exec(readFileSync(join(dir, f), "utf8"));
+  db.prepare(
+    `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin)
+     VALUES ('JER', 'tn', 'x', 0, 'export')`,
+  ).run();
+  const record = (sha, readAt, confirm) =>
+    db.prepare(RECORD_PUSHED_RENDER_SQL).run("JER", "tn", sha, readAt, confirm, 1, `k/${sha}`);
+  const list = () =>
+    JSON.parse(db.prepare(`SELECT unconfirmed_renders_json j FROM book_resource_syncs WHERE book='JER'`).get().j);
+  db.prepare(
+    `UPDATE book_resource_syncs SET prev_pushed_blob_sha = 'S0', pushed_blob_sha = 'S1', pushed_read_at = 50
+      WHERE book = 'JER'`,
+  ).run();
+  record("S2", 60, 0);
+  assert(
+    JSON.stringify(list()) === '["S0","S1","S2"]',
+    `first unconfirmed push on a NULL list seeds it with prev/pushed renders; got ${JSON.stringify(list())}`,
+  );
+  record("A", 100, 1);
+  assert(JSON.stringify(list()) === '["A"]', `confirmed render resets the list to itself`);
+  record("B", 200, 0);
+  record("C", 300, 0);
+  assert(list().sort().join() === "A,B,C", `unmerged renders accumulate; got ${list()}`);
+  record("D", 400, 1);
+  assert(JSON.stringify(list()) === '["D"]', `a confirmed render resets again`);
+  // The cap keeps the 10 NEWEST renders: a lagging master holds a recent one,
+  // so dropping recent shas while keeping old ones brings the false alarm back.
+  const more = "EFGHIJKLMNOP".split("");
+  more.forEach((s, i) => record(s, 500 + i * 100, 0));
+  assert(
+    JSON.stringify(list()) === JSON.stringify("GHIJKLMNOP".split("")),
+    `cap keeps the 10 newest renders, oldest first; got ${JSON.stringify(list())}`,
+  );
+  // C2: pushing the same bytes again does not add a duplicate entry, and moves
+  // that sha to the newest position so the cap cannot evict it next.
+  record("P", 2000, 0);
+  assert(
+    JSON.stringify(list()) === JSON.stringify("GHIJKLMNOP".split("")),
+    `a repeated render sha is not appended twice; got ${JSON.stringify(list())}`,
+  );
+  record("G", 2100, 0);
+  assert(
+    JSON.stringify(list()) === JSON.stringify("HIJKLMNOPG".split("")),
+    `a repeated older sha moves to the newest position; got ${JSON.stringify(list())}`,
+  );
+  record("Q", 2200, 0);
+  assert(
+    JSON.stringify(list()) === JSON.stringify("IJKLMNOPGQ".split("")),
+    `the cap then evicts the oldest other render, not the repeated one; got ${JSON.stringify(list())}`,
   );
 }
 

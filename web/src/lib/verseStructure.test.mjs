@@ -4,6 +4,7 @@
 //   node --experimental-strip-types --no-warnings src/lib/verseStructure.test.mjs
 
 import { applyBridged, applySplit, applyStep, applyUpdated, mergeRefetched, replaySteps } from "./verseStructure.ts";
+import * as verseStructure from "./verseStructure.ts";
 
 let failed = 0;
 let passed = 0;
@@ -756,6 +757,47 @@ for (const sc of scenarios) {
     assert(done(4) === undefined, "A2: a status for a verse with no row (absorbed by a bridge) is not re-added");
     const eq = replaySteps(f, [{ type: "verseStatus", verse: 1, done: true, updatedAt: 100 }]);
     assert(eq === f, "A2: an equal timestamp cannot be proven newer — the fetch wins");
+  }
+  // #989 case 2: a same-version toggle (preserve / hint / trash, reorder-only
+  // sort_order) that the tab saw confirmed while a merging GET was in flight
+  // was reverted by that GET's older snapshot: the version did not move, so
+  // "strictly newer version wins" took the fetched row. Every such server
+  // write still stamps updated_at (api/src/rows.ts), so at equal version a
+  // local row whose server updated_at is STRICTLY newer is kept. An equal or
+  // older stamp cannot be proven newer (a late, older echo): the fetch wins,
+  // the same rule as verse statuses (A2).
+  {
+    const t = (id, extra = {}) => note(id, 7, { updated_at: 100, ...extra });
+    const local = payload({
+      tn: [t("own", { preserve: 1, updated_at: 160 }), t("tie", { hint: 1 }), t("late", { trashed_at: 90, updated_at: 95 })],
+      twl: [t("w", { sort_order: 5, updated_at: 130 })],
+    });
+    const fetched = payload({
+      tn: [t("own"), t("tie"), t("late", { updated_at: 120 })],
+      twl: [t("w", { sort_order: 1 })],
+    });
+    const out = mergeRefetched(local, fetched);
+    assert(out.tn?.[0]?.preserve === 1, "#989: an own preserve toggle confirmed during the window survives a same-version stale snapshot");
+    assert(out.twl?.[0]?.sort_order === 5, "#989: a reorder-only sort_order confirmed during the window survives the merge");
+    assert(out.tn?.[1] === fetched.tn[1], "#989: an equal updated_at cannot be proven newer, so the fetch wins");
+    assert(out.tn?.[2] === fetched.tn[2], "#989: an older local updated_at (a late echo) never overrides the snapshot");
+  }
+  // #989 case 1: a tab's own optimistic delete whose DELETE is still queued
+  // in the outbox must survive a SUPERSEDING merging GET. That GET's snapshot
+  // can still hold the row (the DELETE has not committed), so the inherited
+  // rowDelete step must carry over. A delete only ever removes a row, so
+  // replaying it is idempotent. Inserts, replacements and statuses are still
+  // dropped on supersede (#974 A3: replaying them can resurrect a row).
+  {
+    const keep = verseStructure.keepStepAcrossSupersede;
+    assert(typeof keep === "function", "#989: verseStructure exports keepStepAcrossSupersede");
+    if (typeof keep === "function") {
+      assert(keep({ type: "rowDelete", kind: "tq", id: "x" }) === true, "#989: an inherited rowDelete carries across a superseding merge");
+      assert(keep({ type: "split", bibleVersion: "ult", start: row(1, 2, "a"), newVerses: [] }) === true, "structure steps still carry over");
+      assert(keep({ type: "rowInsert", kind: "tn", row: note("n", 1) }) === false, "a rowInsert recorded before the new GET is still dropped");
+      assert(keep({ type: "rowReplace", kind: "tn", row: note("n", 2) }) === false, "a rowReplace recorded before the new GET is still dropped");
+      assert(keep({ type: "verseStatus", verse: 1, done: true, updatedAt: 1 }) === false, "a verseStatus recorded before the new GET is still dropped");
+    }
   }
 }
 

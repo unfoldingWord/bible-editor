@@ -1,4 +1,4 @@
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
 import UndoIcon from "@mui/icons-material/Undo";
@@ -278,6 +278,10 @@ export function DocColumn({
   // changes on every render. VerseSpan gets stable wrappers that read the
   // latest callbacks from a ref at call time (the verse number is passed in by
   // VerseSpan), so a new parent closure alone never re-renders a verse.
+  // Written during render for the same reason as BookView's
+  // latestCallbacksRef (#1117): the readers are click and input handlers, so
+  // a layout-effect write would also work, but these are the keystroke save
+  // callbacks and the move buys nothing without concurrent rendering.
   const latest = useRef({ onSelectVerse, onEditVerse, onSaveColumn, onOpenAligner, onMergeBridge, onSplitBridge, onOpenVerseComments, activeVerse });
   latest.current = { onSelectVerse, onEditVerse, onSaveColumn, onOpenAligner, onMergeBridge, onSplitBridge, onOpenVerseComments, activeVerse };
   const handleSelect = useCallback((verse: number) => {
@@ -777,8 +781,13 @@ const VerseSpan = memo(function VerseSpan({
   // Latest `isActive` for the native `beforeinput` guard below. The listener is
   // attached per element, not per render, so reading `isActive` straight out of
   // the closure that defined it would pin whatever value that render saw.
+  // Written in a layout effect, not during render, so a render React throws
+  // away (StrictMode's dev replay) never leaves it holding an uncommitted
+  // value; the listener only fires on user input, after the commit.
   const isActiveRef = useRef(isActive);
-  isActiveRef.current = isActive;
+  useLayoutEffect(() => {
+    isActiveRef.current = isActive;
+  });
 
   // Refuse input on a verse that is not (yet) the active one. The span stays
   // contentEditable regardless of `isActive` (see the comment on it below), so

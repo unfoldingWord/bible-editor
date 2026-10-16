@@ -9,13 +9,15 @@
 // column alignment, which is what makes find/replace and side-by-side
 // comparison readable when the scroll spans an entire book.
 
-import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, Fragment, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip, CircularProgress } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
 import UndoIcon from "@mui/icons-material/Undo";
 import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { type ChapterCopyBlock } from "../lib/chapterCopy";
+import { chapterHeightKey } from "../lib/chapterHeightKey";
+import { FontScaleContext } from "../theme";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type LaneShade, type TextLaneCheck } from "../lib/laneChecks";
 import type { ChapterState } from "../hooks/useBook";
@@ -55,6 +57,25 @@ interface SearchState {
 const READ_ONLY = new Set(["UHB", "UGNT"]);
 
 const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
+
+// Placeholder height for a loaded chapter the browser has never rendered
+// (content-visibility, #909): CHAPTER_HEAD_PX plus one row height per verse.
+// Once a chapter has rendered, `auto` makes the browser reuse its real size,
+// and ChapterBlock renders every chapter once as soon as it loads (see
+// layoutKey there, #1120), so this estimate is only a fallback for a
+// chapter whose size the browser has not recorded.
+// rowPxEstimate is the active chapter's measured average row height (see
+// BookView), kept per book. Each chapter copies the row height once, when it
+// first loads, and keeps it: a placeholder that changed size later would move
+// everything below it, and in a browser without scroll anchoring (Safari) the
+// view with it. The placeholder still scales with the chapter's current row
+// count, which changes only when a version column is toggled.
+// DEFAULT_ROW_PX is the fallback before a book's first measurement (ZEC,
+// 1400px wide).
+const CHAPTER_HEAD_PX = 60;
+const DEFAULT_ROW_PX = 150;
+let rowPxEstimate = { book: "", px: DEFAULT_ROW_PX };
+const rowPxFor = (book: string) => (rowPxEstimate.book === book ? rowPxEstimate.px : DEFAULT_ROW_PX);
 
 // Handed to every cell that never reads the lexicon (only the RTL source
 // column's HebrewLine does), so a lexicon batch landing — or a new chapter
@@ -191,8 +212,17 @@ export function BookView({
   const previousScrollNonce = useRef(scrollNonce);
   const firstLayoutRef = useRef(true);
   const restoredTargetRef = useRef<string | null>(null);
+  // Lets selectLocalVerse keep one identity for the memoized cells. This
+  // component's onSelectVerse is Shell's onSelectBookVerse, an inline arrow
+  // that ScriptureColumn forwards, so it is new every render;
+  // activeChapter / activeVerse change only on navigation. Written in a layout
+  // effect, not during render, so a render React throws away (StrictMode's dev
+  // replay) never leaves it holding uncommitted values. Its reader runs from a
+  // cell's click handler, which always comes after the commit's layout effects.
   const selectionContextRef = useRef({ activeChapter, activeVerse, onSelectVerse });
-  selectionContextRef.current = { activeChapter, activeVerse, onSelectVerse };
+  useLayoutEffect(() => {
+    selectionContextRef.current = { activeChapter, activeVerse, onSelectVerse };
+  });
   const selectLocalVerse = useCallback((chapter: number, verse: number) => {
     const current = selectionContextRef.current;
     const container = containerRef.current;
@@ -212,8 +242,18 @@ export function BookView({
   // see the scroll effect below.
   const [scrollPending, setScrollPending] = useState(false);
 
+  // The observer below is created once (its effect is keyed on the stable
+  // chapterObserver), so its callback reads onLoadChapter through this ref.
+  // onLoadChapter is useBook's loadChapter, which changes only with the book
+  // or `enabled`; the ref keeps the observer from calling a stale one after
+  // that. Written in a layout effect, not during render, so a render React
+  // throws away (StrictMode's dev replay) never leaves it holding an
+  // uncommitted value. Its reader is the IntersectionObserver callback, which
+  // the browser runs asynchronously, after any commit.
   const onLoadChapterRef = useRef(onLoadChapter);
-  onLoadChapterRef.current = onLoadChapter;
+  useLayoutEffect(() => {
+    onLoadChapterRef.current = onLoadChapter;
+  });
   const observerRef = useRef<IntersectionObserver | null>(null);
   const sentinelTargetsRef = useRef(new Map<Element, number>());
   const chapterObserver = useMemo<ChapterObserver>(() => ({
@@ -253,6 +293,14 @@ export function BookView({
   // handlers, so route each through a ref to its latest value and hand the
   // cells one stable function apiece (#890). Presence still passes through:
   // an omitted optional callback stays undefined below.
+  //
+  // Written during render (#1117). Since every reader is an input or click
+  // handler, a write in a no-deps useLayoutEffect would hand them the same
+  // value; it was left here because these are the keystroke save callbacks
+  // and the move buys nothing on this tree: no startTransition /
+  // useDeferredValue is in use, so a render React throws away (StrictMode's
+  // dev replay, the one retry after a render error) has the same props.
+  // Revisit if concurrent rendering arrives (e.g. a React 19 upgrade).
   const latestCallbacksRef = useRef({
     onEditVerse, onSaveColumn, onOpenAligner, onEditSection, onMergeBridge, onSplitBridge, onOpenVerseComments, textCheck,
   });
@@ -367,6 +415,74 @@ export function BookView({
     el?.scrollIntoView({ behavior: "auto", block: "center" });
   }, [findActiveMatch]);
 
+  // Keep rowPxEstimate (see CHAPTER_HEAD_PX) at the active chapter's real
+  // average row height, so a chapter loaded later takes about the space it
+  // will need. Re-measures when the chapter resizes: a column toggled, the
+  // window resized, a verse edited. The row count is read on every resize,
+  // since a toggled column can change it.
+  const activeReady = chapters.get(activeChapter)?.kind === "ready";
+  useEffect(() => {
+    const block = containerRef.current?.querySelector<HTMLElement>(`[data-chapter-block="${activeChapter}"]`);
+    if (!block) return;
+    const ro = new ResizeObserver(() => {
+      const rows = Number(block.dataset.rows);
+      if (!(rows > 0)) return;
+      const rowPx = Math.round((block.offsetHeight - CHAPTER_HEAD_PX) / rows);
+      if (rowPx > 0) rowPxEstimate = { book, px: rowPx };
+    });
+    ro.observe(block);
+    return () => ro.disconnect();
+  }, [book, activeChapter, activeReady]);
+
+  // A window resize, zoom or reading-text-size change re-wraps the text, but
+  // a skipped chapter keeps the height it had when last laid out and changes
+  // size when next drawn, which in a browser without scroll anchoring
+  // (Safari) moves the view. Once the scroll box's width and the reading
+  // scale have held still for 300 ms, bump wrapEpoch: every loaded chapter is
+  // laid out once more (ChapterBlock's layoutKey) while ColumnToggleAnchor
+  // holds the top row in place (#1131). The scroll box reserves its scrollbar
+  // gutter, so a scrollbar appearing after that re-layout does not change
+  // the width and schedule another one.
+  const { scale: readingScale } = useContext(FontScaleContext);
+  const [wrapEpoch, setWrapEpoch] = useState(0);
+  const wrapTimerRef = useRef(0);
+  const scheduleRewrap = useCallback(() => {
+    window.clearTimeout(wrapTimerRef.current);
+    wrapTimerRef.current = window.setTimeout(() => setWrapEpoch((n) => n + 1), 300);
+  }, []);
+  useEffect(() => () => window.clearTimeout(wrapTimerRef.current), []);
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    let width: number | null = null;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[entries.length - 1].contentRect.width;
+      if (width === null) width = w;
+      if (w === width) return;
+      width = w;
+      scheduleRewrap();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [scheduleRewrap]);
+  const scaleRef = useRef(readingScale);
+  useEffect(() => {
+    if (scaleRef.current === readingScale) return;
+    scaleRef.current = readingScale;
+    scheduleRewrap();
+  }, [readingScale, scheduleRewrap]);
+
+  // Chapters always laid out in full, never skipped by content-visibility:
+  // the active chapter with the two above it and the one below (the chapters
+  // the scroll-to-active effect loads before its single scroll), and Find's
+  // current match chapter with the one above it. Their real heights are then
+  // known before any scroll lands, so the landing never depends on the
+  // browser's scroll anchoring to absorb a chapter growing from its
+  // placeholder (Safari has none).
+  const isPinned = (ch: number) =>
+    (ch >= activeChapter - 2 && ch <= activeChapter + 1) ||
+    (findActiveMatch != null && (ch === findActiveMatch.chapter || ch === findActiveMatch.chapter - 1));
+
   const search = useMemo<SearchState | null>(() => {
     if (!findQuery) return null;
     const sourceQuery: SourceQueryKind = findQuery.regex
@@ -450,11 +566,14 @@ export function BookView({
           );
         })}
       </Box>
+      <ColumnToggleAnchor layoutKey={`${enabledVersionsKey}|${wrapEpoch}`} containerRef={containerRef} />
       <Box
         ref={containerRef}
         sx={(theme) => ({
           flex: 1,
           overflowY: "auto",
+          // See wrapEpoch: a scrollbar coming or going must not change the width.
+          scrollbarGutter: "stable",
           ...markHighlightSx(theme.palette.mode),
           ...bookTsDividerSx(),
           ...draftDirtyBorderSx(),
@@ -480,12 +599,16 @@ export function BookView({
             const isActiveChapter = ch === activeChapter;
             return (
               <ChapterBlock
-                key={ch}
+                // Keyed by book too, so a new book's chapters start with a
+                // fresh placeholder rather than the last book's row height.
+                key={`${book}-${ch}`}
                 book={book}
                 chapter={ch}
                 state={chapters.get(ch) ?? UNLOADED_STATE}
                 enabledVersions={stableEnabledVersions}
                 cols={cols}
+                wrapEpoch={wrapEpoch}
+                pinned={isPinned(ch)}
                 isActiveChapter={isActiveChapter}
                 activeVerse={isActiveChapter ? activeVerse : -1}
                 activeNoteQuote={isActiveChapter ? activeNoteQuote : null}
@@ -521,6 +644,74 @@ export function BookView({
   );
 }
 
+// Keeps the verse row at the top of the view in place across a version-column
+// toggle (#1120) or a settled width or text-size change (BookView's wrapEpoch,
+// #1131);
+// `layoutKey` changes with either. Both re-lay out every loaded chapter
+// (ChapterBlock's layoutKey), so all the chapters above the view change
+// height at once; browsers with scroll anchoring absorb that, Safari does
+// not, and the view jumped by the whole change above it (12,900 px on ZEC
+// for a toggle). A class component
+// because getSnapshotBeforeUpdate is the one place React runs code before a
+// commit changes the DOM, which is when the old position must be read.
+// Corrected in the commit and again on each of the next two frames (the new
+// column's cells fill in their text after the commit, and ChapterBlock keeps
+// chapters laid out for two frames), unless something else scrolled.
+interface ToggleAnchorSnapshot {
+  selector: string;
+  offset: number;
+}
+class ColumnToggleAnchor extends Component<{
+  layoutKey: string;
+  containerRef: React.MutableRefObject<HTMLDivElement | null>;
+}> {
+  private frame = 0;
+  getSnapshotBeforeUpdate(prev: { layoutKey: string }): ToggleAnchorSnapshot | null {
+    const container = this.props.containerRef.current;
+    if (prev.layoutKey === this.props.layoutKey || !container) return null;
+    const top = container.getBoundingClientRect().top;
+    // Chapter boxes first: reading a cell inside a skipped chapter would make
+    // the browser lay that chapter out.
+    for (const block of container.querySelectorAll<HTMLElement>("[data-chapter-block]")) {
+      const blockRect = block.getBoundingClientRect();
+      if (blockRect.bottom <= top) continue;
+      for (const cell of block.querySelectorAll<HTMLElement>("[data-find-cell]")) {
+        const r = cell.getBoundingClientRect();
+        if (r.bottom <= top) continue;
+        // Any column of that verse row: the toggled column may be this one.
+        const [ch, v] = (cell.dataset.findCell ?? "").split("-");
+        return { selector: `[data-find-cell^="${ch}-${v}-"]`, offset: r.top - top };
+      }
+      return { selector: `[data-chapter-block="${block.dataset.chapterBlock}"]`, offset: blockRect.top - top };
+    }
+    return null;
+  }
+  componentDidUpdate(_prev: unknown, _state: unknown, snapshot: ToggleAnchorSnapshot | null) {
+    if (!snapshot) return;
+    // scrollTop as this anchor last left it. A later correction runs only if
+    // it still holds: anything else that scrolled in between (the reader, a
+    // go-to-verse or Find jump, scroll-to-active once a chapter loads) wins.
+    let written: number | null = null;
+    const restore = (framesLeft: number) => {
+      const container = this.props.containerRef.current;
+      const el = container?.querySelector<HTMLElement>(snapshot.selector);
+      if (!container || !el) return;
+      if (written !== null && container.scrollTop !== written) return;
+      container.scrollTop += el.getBoundingClientRect().top - container.getBoundingClientRect().top - snapshot.offset;
+      written = container.scrollTop;
+      if (framesLeft > 0) this.frame = requestAnimationFrame(() => restore(framesLeft - 1));
+    };
+    cancelAnimationFrame(this.frame);
+    restore(2);
+  }
+  componentWillUnmount() {
+    cancelAnimationFrame(this.frame);
+  }
+  render() {
+    return null;
+  }
+}
+
 function countLoaded(chapters: Map<number, ChapterState>): number {
   let n = 0;
   for (const s of chapters.values()) if (s.kind === "ready") n++;
@@ -538,6 +729,8 @@ const ChapterBlock = memo(function ChapterBlock({
   state,
   enabledVersions,
   cols,
+  wrapEpoch,
+  pinned,
   isActiveChapter,
   activeVerse,
   activeNoteQuote,
@@ -570,6 +763,11 @@ const ChapterBlock = memo(function ChapterBlock({
   state: ChapterState;
   enabledVersions: string[];
   cols: number;
+  // Bumped once the scroll box's width or the reading scale settles after a
+  // change (see BookView).
+  wrapEpoch: number;
+  // Never skipped by content-visibility (see BookView's isPinned).
+  pinned: boolean;
   isActiveChapter: boolean;
   // -1 on every chapter but the active one.
   activeVerse: number;
@@ -632,6 +830,45 @@ const ChapterBlock = memo(function ChapterBlock({
     }
     return [...set].sort((a, b) => a - b);
   }, [readyData, enabledVersions]);
+  // This chapter's placeholder row height, copied when it first loads (see
+  // CHAPTER_HEAD_PX for why it must not change afterwards).
+  const placeholderRowPx = useRef<number | null>(null);
+  if (readyData && placeholderRowPx.current === null) placeholderRowPx.current = rowPxFor(book);
+  // Laid out in full when the chapter loads and whenever something that can
+  // change its height changes (its columns, rows or text; see
+  // chapterHeightKey), until the browser has recorded its real height as
+  // `auto`'s remembered size; only then may it be skipped (#1120). Otherwise
+  // a chapter the pre-loader fetched but never showed sat at the estimate,
+  // and one skipped across a column toggle kept its pre-toggle height; either
+  // changed size when next laid out, which moves the view in a browser
+  // without scroll anchoring. A data change that cannot change the height (an
+  // outbox result that only bumps a verse's version) keeps the key, so an
+  // off-screen chapter is not laid out for it (#1131). A settled width or
+  // text-size change (wrapEpoch) re-wraps the text, so it lays the chapter
+  // out again too.
+  // One object per change, so a column toggled off and back on within the
+  // two frames is measured again. Verse text fills in during the cells'
+  // passive effects, which run before this one; the size is recorded after
+  // the next frame's layout, so wait two frames.
+  const heightKey = useMemo(
+    () => (readyData ? chapterHeightKey(readyData.verses, enabledVersions, verseNums) : ""),
+    [readyData, enabledVersions, verseNums],
+  );
+  const layoutKey = useMemo(() => ({ key: heightKey, wrapEpoch }), [heightKey, wrapEpoch]);
+  const isReady = readyData !== null;
+  const [measuredKey, setMeasuredKey] = useState<{ key: string; wrapEpoch: number } | null>(null);
+  useEffect(() => {
+    if (!isReady) return;
+    let second = 0;
+    const first = requestAnimationFrame(() => {
+      second = requestAnimationFrame(() => setMeasuredKey(layoutKey));
+    });
+    return () => {
+      cancelAnimationFrame(first);
+      cancelAnimationFrame(second);
+    };
+  }, [isReady, layoutKey]);
+  const measured = measuredKey === layoutKey;
   // One CommentCounts object per comments change, not per render: Shell's
   // verseCommentCounts builds a fresh object on every call, which would
   // re-render the active row on any render of this block.
@@ -686,8 +923,27 @@ const ChapterBlock = memo(function ChapterBlock({
 
   const data = state.data;
 
+  // content-visibility: auto lets the browser skip layout and paint for a
+  // chapter scrolled far out of view without unmounting it, so an unsaved
+  // edit and the `[data-find-cell]` lookups survive (#909 step 1). The
+  // wrapper repeats the outer grid's column template and gap, so its rows
+  // line up with the header row and the other chapters.
   return (
-    <Fragment>
+    <Box
+      data-chapter-block={chapter}
+      data-rows={verseNums.length}
+      sx={{
+        gridColumn: `1 / span ${cols}`,
+        display: "grid",
+        gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+        gap: 1,
+        contentVisibility: pinned || !measured ? "visible" : "auto",
+        // Set on pinned chapters too: the browser records the real height of
+        // a laid-out chapter as `auto`'s remembered size, so one that unpins
+        // off screen keeps its height instead of dropping to the estimate.
+        containIntrinsicHeight: `auto ${CHAPTER_HEAD_PX + verseNums.length * (placeholderRowPx.current ?? rowPxFor(book))}px`,
+      }}
+    >
       <Box
         sx={{
           gridColumn: `1 / span ${cols}`,
@@ -791,7 +1047,7 @@ const ChapterBlock = memo(function ChapterBlock({
           />
         );
       })}
-    </Fragment>
+    </Box>
   );
 });
 
@@ -1343,8 +1599,13 @@ const VerseCell = memo(function VerseCell({
   // Latest `isActive` for the native `beforeinput` guard below. The listener is
   // attached per element, not per render, so reading `isActive` straight out of
   // the closure that defined it would pin whatever value that render saw.
+  // Written in a layout effect, not during render, so a render React throws
+  // away (StrictMode's dev replay) never leaves it holding an uncommitted
+  // value; the listener only fires on user input, after the commit.
   const isActiveRef = useRef(isActive);
-  isActiveRef.current = isActive;
+  useLayoutEffect(() => {
+    isActiveRef.current = isActive;
+  });
 
   // Refuse input on a verse that is not (yet) the active one. The span stays
   // contentEditable regardless of `isActive` (see the comment on it below), so

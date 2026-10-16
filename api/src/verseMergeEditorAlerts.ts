@@ -24,6 +24,13 @@ export interface OverwrittenVerseRef {
    * so the editor message does not call a comma correction a wording change.
    */
   reason?: string;
+  /**
+   * verse_merge_conflicts.detected_at for this overwrite (issue #996): when it
+   * was first flagged. The editor message dates its refs by it, so an alert
+   * re-raised only because some refs resolved does not read as a new
+   * overwrite. Absent (no-base refs, pure callers) means no date is shown.
+   */
+  detectedAt?: number | null;
 }
 
 // edit_log has no (book, chapter, verse, resource) columns of its own — only
@@ -125,6 +132,31 @@ export function describeOverwriteAxes(reasons: Array<string | undefined>): strin
   return "Door43's version was taken.";
 }
 
+// Issue #996: the editor's ref list, each ref dated by the day it was first
+// flagged. Editor alerts reconcile by condition key, built from the ref list,
+// so when some refs resolve the shrunken list is a new key and the alert comes
+// back. Without a date it read as a fresh overwrite. Refs are grouped by UTC
+// day, oldest first ("4:17@v6, 4:18@v3 (first flagged 2026-08-19); 3:2@v9
+// (first flagged 2026-10-05)"), so a new overwrite that shares the alert with
+// old ones keeps tonight's date instead of hiding under the oldest one. Dates
+// are message-only: the condition key still comes from `refs` alone, so this
+// changes no key and resurrects no dismissed alert. Refs without a date are
+// listed last, undated, so a caller that passes none gets the old text.
+function datedRefList(refs: string[], detectedAts: Array<number | null | undefined>): string {
+  const byDay = new Map<string, string[]>();
+  refs.forEach((ref, i) => {
+    const at = detectedAts[i];
+    const day = at == null ? "" : plainDate(at);
+    const group = byDay.get(day);
+    if (group) group.push(ref);
+    else byDay.set(day, [ref]);
+  });
+  return [...byDay.entries()]
+    .sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b)))
+    .map(([day, group]) => `${group.join(", ")}${day ? ` (first flagged ${day})` : ""}`)
+    .join("; ");
+}
+
 // Given the verses that were overwritten this run and the (key -> username)
 // lookup already fetched from D1, produce one message per affected editor. A
 // verse whose edit_log row has no user_id (an AI-pipeline edit with no human
@@ -137,17 +169,21 @@ export function groupOverwrittenVersesByEditor(
   overwritten: OverwrittenVerseRef[],
   usernameByKey: Map<string, string>,
 ): Map<string, { refs: string[]; message: string }> {
-  const byUser = new Map<string, { refs: string[]; reasons: Array<string | undefined> }>();
+  const byUser = new Map<
+    string,
+    { refs: string[]; reasons: Array<string | undefined>; detectedAts: Array<number | null | undefined> }
+  >();
   for (const ref of overwritten) {
     const username = usernameByKey.get(editLogKey(book, resource, ref));
     if (!username) continue;
-    const entry = byUser.get(username) ?? { refs: [], reasons: [] };
+    const entry = byUser.get(username) ?? { refs: [], reasons: [], detectedAts: [] };
     entry.refs.push(`${ref.chapter}:${ref.verse}@v${ref.overwrittenVersion}`);
     entry.reasons.push(ref.reason);
+    entry.detectedAts.push(ref.detectedAt);
     byUser.set(username, entry);
   }
   const out = new Map<string, { refs: string[]; message: string }>();
-  for (const [username, { refs, reasons }] of byUser) {
+  for (const [username, { refs, reasons, detectedAts }] of byUser) {
     // "Door43's sync", not "Door43's nightly sync": this fan-out fires from
     // raiseVerseMergeConflictAlert, which runs on both the 05:30 UTC cron AND
     // the user-triggered POST /:book/reimport route — the admin message in
@@ -171,7 +207,7 @@ export function groupOverwrittenVersesByEditor(
     const recovery = `Your ${recoverable} is still recoverable from each verse's version history, at the version number given after @v.`;
     const message =
       `Door43's sync overwrote your edit${refs.length === 1 ? "" : "s"} in ${book} ` +
-      `${resource.toUpperCase()} at ${refs.length} verse(s) with Door43's version: ${refs.join(", ")}. ` +
+      `${resource.toUpperCase()} at ${refs.length} verse(s) with Door43's version: ${datedRefList(refs, detectedAts)}. ` +
       `${axes} ${recovery}`;
     out.set(username, { refs, message });
   }
@@ -359,11 +395,52 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
 }
 
 export function buildMergeConflictGuidance(
-  rows: Array<{ action: string; reason?: string }>,
-  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
+  rows: Array<{ action: string; reason?: string; overwrittenVersion: number | null; chapter?: number; verse?: number }>,
+  // `bookLocked` (issue #1110): the book is locked, so the export skips it.
+  // It changes only the sentences that would otherwise say an export will
+  // write over Door43 (pointer-less adopt_conflict, keep_alignment_refused,
+  // source_attr_divergent, keep_local_structure); `noBaseBookLocked` does the
+  // same for the no-base sentence (issue #1006).
+  opts: {
+    recordingFailed?: boolean;
+    noBaseCount?: number;
+    noBaseRefs?: string[];
+    noBaseBookLocked?: boolean;
+    bookLocked?: boolean;
+  } = {},
 ): string {
-  const overwrittenRows = rows.filter((r) => r.action === "adopt_conflict");
+  // #539's no-op guard (bookReimport.ts ~7609-7674) keeps a CONFLICTED adopt
+  // whose bytes turned out to already match D1 as an `adopt_conflict` row
+  // with `overwrittenVersion` cleared to null, so the review banner still
+  // lists it — but nothing was actually overwritten, and a pointer-less row
+  // has no `@v` in its ref (buildGroupedRefsClause). `overwrittenVersion` is
+  // required (not optional) precisely so every caller must say which case a
+  // row is, rather than one being silently assumed.
+  // Loose `!= null` / `== null` (not `!==` / `===`) matches buildGroupedRefsClause's
+  // own `!= null` check and the editor fan-out's `.filter` above — an untyped
+  // .mjs caller that omits the field entirely gets the same "no @v" treatment
+  // a row explicitly carrying `null` gets, rather than silently reading as an
+  // overwrite it cannot point a `@v` at.
+  const adoptConflictRows = rows.filter((r) => r.action === "adopt_conflict");
+  const overwrittenRows = adoptConflictRows.filter((r) => r.overwrittenVersion != null);
+  const noOverwriteRows = adoptConflictRows.filter((r) => r.overwrittenVersion == null);
   const overwritten = overwrittenRows.length;
+  const noOverwrite = noOverwriteRows.length;
+  // (2026-10-02 sweep, round 3): `buildGroupedRefsClause`'s shared ref list
+  // also renders 'keep_alignment_refused' / 'source_attr_divergent' /
+  // 'keep_local_structure' rows with no `@v` (they too store
+  // `overwritten_version` NULL — verseMergeConflictSql.ts's
+  // SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL), so "the ref above with no @v"
+  // does not uniquely pick out a pointer-less adopt_conflict row when the
+  // banner also lists one of those. Name this clause's OWN refs inline
+  // instead, independent of that shared list's cap, so a pointer-less ref
+  // that falls into the shared list's "+N more" is still identified here.
+  const noOverwriteRefStrs = noOverwriteRows
+    .filter((r): r is typeof r & { chapter: number; verse: number } => r.chapter != null && r.verse != null)
+    .map((r) => `${r.chapter}:${r.verse}`);
+  const noOverwriteListed = noOverwriteRefStrs.slice(0, MERGE_CONFLICT_REFS_DISPLAY);
+  const noOverwriteMore = noOverwrite > noOverwriteListed.length ? `, +${noOverwrite - noOverwriteListed.length} more` : "";
+  const noOverwriteRefsClause = noOverwriteListed.length > 0 ? ` (${noOverwriteListed.join(", ")}${noOverwriteMore})` : "";
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
   const keptSourceAttr = rows.filter((r) => r.action === "source_attr_divergent").length;
   // Issue #728: the app's verse-bridge STRUCTURE was kept where Door43's
@@ -393,14 +470,44 @@ export function buildMergeConflictGuidance(
     overwritten > 0
       ? `${overwritten} took Door43's version over the editor's — ${overwriteAxes} ${overwriteRecovery}`
       : "",
+    // The #539 no-op guard only keeps a pointer-less row when master's
+    // ARRIVING bytes differed from D1 by more than Hebrew mark order (#977
+    // already drops the mark-order-only case before this point) — so the
+    // final bytes matching D1 is never "Door43 already matched D1"; it is
+    // canonizeAlignmentSource (canonizeHebrew.ts) mapping master's \zaln-s
+    // content/lemma onto D1's bytes. That mapping also matches through looser
+    // tiers (stripped marks, word-joiner fold), so master's incoming copy
+    // could be the WORSE one (under-pointed, cantillation-stripped, an older
+    // UHB alignment) — unlike 'source_attr_divergent' below, this is never
+    // framed as "Door43's fix" or D1's bytes as "stale"; only that the two
+    // copies differ on \zaln-s content/lemma and a human has to say which
+    // side is right.
+    noOverwrite > 0
+      ? `${noOverwrite} ${noOverwrite === 1 ? "was" : "were"} flagged for review but no app text was replaced` +
+        `${noOverwriteRefsClause} — Door43's copy differs from the app's only in the original-language source ` +
+        `attributes on \\zaln-s (x-content / x-lemma); ` +
+        (opts.bookLocked
+          ? `check which side is right; this book is locked, so the export skips it: Door43 keeps its ` +
+            `attributes until an admin resolves it.`
+          : `check which side is right before the next export, because the export will write the app's ` +
+            `attributes over Door43's.`)
+      : "",
+    // Issue #1110: the export skips a locked book, so on one these two must
+    // not say tonight's export will write. The unlocked wording is unchanged.
     keptAlignment > 0
       ? `${keptAlignment} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +
-        `change has NOT been taken, so tonight's export will still write over it until someone resolves it.`
+        (opts.bookLocked
+          ? `change has NOT been taken, and this book is locked, so the export skips it: Door43 keeps its own ` +
+            `version until an admin resolves it.`
+          : `change has NOT been taken, so tonight's export will still write over it until someone resolves it.`)
       : "",
     keptSourceAttr > 0
       ? `${keptSourceAttr} kept D1 because Door43's original-language source fix (the spelling/pointing/morphology ` +
         `on \\zaln-s) could not be placed unambiguously — the same source word repeats in the verse — so Door43's ` +
-        `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`
+        (opts.bookLocked
+          ? `change has NOT been taken, and this book is locked, so the export skips it: Door43 keeps its fix ` +
+            `until an admin resolves it by hand.`
+          : `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`)
       : "",
     // A 'keep_ai_master' sentence sat here until issue #749. It is gone with the
     // action itself: nothing of Door43's was taken, the next export publishes
@@ -411,18 +518,24 @@ export function buildMergeConflictGuidance(
       ? `${keptStructureOther} kept the app's verse grouping (a \\v a-b bridge, or its split) where Door43 now groups ` +
         `the verses differently: either no commit from a Door43 editor's own account was found behind Door43's ` +
         `change, or the two groupings could not be reconciled automatically. Door43's grouping has NOT been ` +
-        `taken, so the next export that runs for this resource writes the app's grouping over it.`
+        (opts.bookLocked
+          ? `taken, and this book is locked, so the export skips it: Door43 keeps its grouping until an admin ` +
+            `resolves it.`
+          : `taken, so the next export that runs for this resource writes the app's grouping over it.`)
       : "",
     keptStructureUnderLocal > 0
       ? `${keptStructureUnderLocal} verse(s) changed on Door43 that a bridge made in the app (not yet exported) ` +
-        `has since absorbed — the next export publishes the bridge, and Door43's change to that verse's own text ` +
-        `will be written over unless it is carried into the bridged verse first.`
+        (opts.bookLocked
+          ? `has since absorbed; this book is locked, so the export skips it: Door43 keeps its own text for ` +
+            `that verse until an admin resolves it.`
+          : `has since absorbed — the next export publishes the bridge, and Door43's change to that verse's own ` +
+            `text will be written over unless it is carried into the bridged verse first.`)
       : "",
     opts.recordingFailed
       ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +
         "(see worker logs) — this table and count may be missing rows from tonight's sync."
       : "",
-    opts.noBaseCount ? buildNoBaseSentence(opts.noBaseCount, opts.noBaseRefs) : "",
+    opts.noBaseCount ? buildNoBaseSentence(opts.noBaseCount, opts.noBaseRefs, opts.noBaseBookLocked) : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -476,7 +589,7 @@ export function alertMessageCarriesNoBaseWarning(message: string): boolean {
   );
 }
 
-export function buildNoBaseSentence(count: number, refs?: string[]): string {
+export function buildNoBaseSentence(count: number, refs?: string[], bookLocked = false): string {
   // Never list more refs than the count claims. Unreachable today (refs are
   // pushed on the same branch that increments the count, and nothing decrements
   // it), but the invariant is cheap to enforce and the helper is exported.
@@ -489,12 +602,19 @@ export function buildNoBaseSentence(count: number, refs?: string[]): string {
   // unlisted remainder to be a contiguous tail.
   const more = count > listed.length ? `; +${count - listed.length} more` : "";
   const where = listed.length > 0 ? ` Verses (sample): ${listed.join(", ")}${more}.` : "";
+  // Issue #1006: the export skips a locked book (exportWorkflow.ts,
+  // `book_locked:*`), so "tonight's export will overwrite" cannot happen there.
+  // keep_no_base fires only when D1 and master differ (verseMerge.ts returns
+  // keep_converged first), so "a different version" is what was measured.
+  const consequence = bookLocked
+    ? `Nothing was overwritten in these, and this book is locked, so the export skips it: Door43 keeps its ` +
+      `own, different version, and the app's version stays only here until an admin reconciles the two.`
+    : `Nothing was overwritten in these — but a Door43-side change to them will still be overwritten by ` +
+      `tonight's export.`;
   return (
     `${count} verse(s) could not be adjudicated: ${NO_BASE_ADMIN_FINGERPRINT} for them from before this ` +
     `book+resource's master-confirmed watermark, so the sync could not tell which side changed, and so it ` +
-    `kept the app's version.${where} ` +
-    `Nothing was overwritten in these — but a Door43-side change to them will still be overwritten by ` +
-    `tonight's export.`
+    `kept the app's version.${where} ${consequence}`
   );
 }
 
@@ -536,6 +656,10 @@ export function groupNoBaseVersesByEditor(
   resource: string,
   noBase: NoBaseVerseRef[],
   usernameByKey: Map<string, string>,
+  // Issue #1006: same meaning as buildNoBaseSentence's `bookLocked`. A locked
+  // book is not exported and its verses cannot be saved here, so neither the
+  // export warning nor "re-save here first" applies; the remedy is an admin.
+  bookLocked = false,
 ): Map<string, { refs: string[]; message: string }> {
   const byUser = new Map<string, string[]>();
   for (const ref of noBase) {
@@ -549,12 +673,17 @@ export function groupNoBaseVersesByEditor(
   }
   const out = new Map<string, { refs: string[]; message: string }>();
   for (const [username, refs] of byUser) {
+    const consequence = bookLocked
+      ? `Nothing has been overwritten, and because this book is locked, the export skips it, so Door43 keeps ` +
+        `its own, different version of ${refs.length === 1 ? "this verse" : "these verses"} for now. Ask an ` +
+        `admin to reconcile the two versions.`
+      : `Nothing has been overwritten — but if ` +
+        `Door43 has changed ${refs.length === 1 ? "it" : "them"} since, tonight's export will still overwrite your ` +
+        `text there unless you open and re-save the verse${refs.length === 1 ? "" : "s"} here first.`;
     const message =
       `Door43's sync could not tell whether your edit or a Door43-side edit is newer, for ${refs.length} ` +
       `verse(s) you last edited in ${book} ${resource.toUpperCase()}: ${refs.join(", ")} — ${NO_BASE_EDITOR_FINGERPRINT}, ` +
-      `so it kept your version for now. Nothing has been overwritten — but if ` +
-      `Door43 has changed ${refs.length === 1 ? "it" : "them"} since, tonight's export will still overwrite your ` +
-      `text there unless you open and re-save the verse${refs.length === 1 ? "" : "s"} here first.`;
+      `so it kept your version for now. ${consequence}`;
     out.set(username, { refs, message });
   }
   return out;

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Box,
   Typography,
   CircularProgress,
   Alert,
+  Backdrop,
   Dialog,
   DialogActions,
   DialogContent,
@@ -21,6 +22,7 @@ import { OpenChapterProvider } from "./NoteLinkPreview";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
+import { lintChapterForSavedOp, WHOLE_BOOK_LINT_MAX_AGE_MS } from "../hooks/lintRefreshScope";
 import { useBookLocks } from "../hooks/useBookLocks";
 import { useAlignmentAttention } from "../hooks/useAlignmentAttention";
 import { useLexicon } from "../hooks/useLexicon";
@@ -28,7 +30,7 @@ import { useAiDrafts } from "../hooks/useAiDrafts";
 import { useTwlFilters } from "../hooks/useTwlFilters";
 import { useUnsavedGuard } from "../hooks/useUnsavedGuard";
 import { outbox } from "../sync/outbox";
-import { api, ApiError, CHECK_LANES, setReadOnlyReason } from "../sync/api";
+import { api, ApiError, CHECK_LANES, isReadOnly, setReadOnlyReason } from "../sync/api";
 import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
 import { trackLockedKey } from "../lib/chapterStale";
@@ -49,12 +51,13 @@ import {
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
 import { shouldApplyUpsert } from "./rowUpsertGuard";
-import { drafts, verseKey, pinVerseBase, unpinVerseBaseIfIdle, registerVerseVersionReader } from "../sync/drafts";
+import { drafts, verseKey, rowKey as draftRowKey, pinVerseBase, pinEpoch, unpinVerseBaseIfIdle, holdVerseBaseForEditor, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, SECTION_HEADER_TAGS } from "../lib/usfm";
 import { chapterOpensWithoutMarker, introEditBase } from "../lib/verseIntro";
 import { verseHasUnalignedWork, countUnalignedTargetWords } from "../lib/alignment";
+import { versionNeedingAlignment } from "../lib/alignerVersion";
 import {
   analyzeAlignmentDelta,
   guardBlocksSave,
@@ -75,17 +78,16 @@ import { resolveSpanToSource } from "../lib/twlResolve";
 import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
+import { navHistory } from "../lib/navHistory";
+import { BackButton } from "./BackButton";
 import { createUhbStrongsCache } from "../lib/uhbStrongs";
+import { isTnMoveBlocked, isTnVerseLocked, planRefusedTnMoveRollback, tnLockLabel, tnLockingJobs } from "../lib/tnRangeLock";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import type { BookViewportRestore } from "./BookView";
 import { ResourceColumn, type AlignmentTabProps, type PanelMode, type ReorderPreview, type ResourceCheckoff, type ResourceLane } from "./ResourceColumn";
 import type { AlignerLock, AlignmentPanelHandle } from "./AlignmentPanel";
-import {
-  SideBySideAligner,
-  type PanelSlot,
-  type ReadingLineHandle,
-} from "./SideBySideAligner";
+import type { PanelSlot, ReadingLineHandle } from "./SideBySideAligner";
 import { TopBar } from "./TopBar";
 import { ExportUsfmButton } from "./ExportUsfmButton";
 import { PrintPreviewButton } from "./PrintPreviewButton";
@@ -97,7 +99,21 @@ import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
-import { onOutboxResult } from "../sync/outbox";
+import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "../sync/outbox";
+import { targetKey as outboxTargetKey } from "../sync/outboxTargeting";
+import { planRefusedVerseRollback, rollbackMayApply, siblingStillDraining } from "../sync/refusedVerseRollback";
+import { planRefusedRowDeleteRollback } from "../sync/refusedRowRollback";
+import { dropOwnRowDeleteClick, markOwnRowDelete, recordOwnRowDeleteClickOp } from "../sync/pendingRowDeletes";
+import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
+import { tnMoveRelay } from "../sync/tnMoveRelay";
+import { enqueueOwnTnMove } from "../sync/refusedTnMoves";
+import {
+  alignmentDraftKey,
+  alignmentDraftKeyForOp,
+  alignmentDraftRow,
+  isAlignerPanelSaveOp,
+} from "../sync/alignmentDraftSaveState";
+import { onAlignerSaveRefused } from "../sync/alignmentDrafts";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { UnsavedToasts } from "./UnsavedToasts";
 import { QuoteBuilderPopper } from "./QuoteBuilderPopper";
@@ -108,6 +124,14 @@ interface AlignerTarget {
   verse: number;
   bibleVersion: string;
 }
+
+// The dual-aligner popup (and the AlignmentPanel it hosts on each side) only
+// mounts once a translator opens it — lazy-loading keeps its ~35 KB, and the
+// AlignmentPanel chunk it would otherwise force into the eager graph, out of
+// the main bundle for every session that never touches it.
+const SideBySideAligner = lazy(() =>
+  import("./SideBySideAligner").then((m) => ({ default: m.SideBySideAligner })),
+);
 
 // Per-version slice of the alignment props: target verse, the source for the
 // verses that target covers (concatenated across a multi-verse range), and the
@@ -242,6 +266,10 @@ const TAB_FOR_ROW_KIND = {
 // a target has no threads yet.
 const EMPTY_COMMENT_THREADS: CommentThread[] = [];
 const EMPTY_COVERED_VERSES: number[] = [];
+// Shared identity for twlRowAlternatives' empty case (#896): `new Map()` on
+// every no-suggestions-loaded render broke WordsTable's `===` comparator on
+// every Shell render, not just when suggestions actually changed.
+const EMPTY_TWL_ROW_ALTERNATIVES: Map<string, string[]> = new Map();
 
 interface Props {
   book: string;
@@ -283,6 +311,13 @@ interface Props {
   syncWarnings?: ReactNode;
 }
 
+// #1045: why a locked aligner's unsaved-changes gate offers no Save.
+function alignerLockReason(lock: "chapter" | "book"): string {
+  return lock === "book"
+    ? "This book is locked"
+    : "An AI run is updating this chapter";
+}
+
 export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, onCommentActivity, onCommentThreadsViewed, authReady = false, notificationsMenu, syncWarnings }: Props) {
   const bookViewportRestoreRef = useRef<BookViewportRestore | null>(null);
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
@@ -303,6 +338,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalRowReplacement,
     applyLocalRowDelete,
     applyLocalRowInsert,
+    restoreRow,
     applyLocalVerse,
     applyRemoteVerse,
     applyLocalVerseBridge,
@@ -381,6 +417,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // row stay visible (floated to the verse) instead of vanishing, and lets a
   // chapter-intro comment always land on whichever tn row is the CURRENT
   // intro rather than the one it was created against.
+  // Keyed on a content signature (row ids + intro id), not `data` itself: `data`
+  // gets a new identity on every edit (verse text, drafts, lane checks, ...),
+  // which used to rebuild this Set/object — and everything indexComments derives
+  // from it — on every keystroke even though the row-id set rarely changes (#896).
+  const commentLiveRowsKey = data
+    ? [
+        ...data.tn.map((r) => rowKey("tn", r.id)),
+        ...data.tq.map((r) => rowKey("tq", r.id)),
+        ...data.twl.map((r) => rowKey("twl", r.id)),
+        "|",
+        data.tn.find((r) => r.verse === 0)?.id ?? "",
+      ].join(",")
+    : "";
   const commentLiveRows = useMemo<LiveRows | undefined>(() => {
     if (!data) return undefined;
     const rowIds = new Set<string>();
@@ -389,7 +438,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     for (const r of data.twl) rowIds.add(rowKey("twl", r.id));
     const introRow = data.tn.find((r) => r.verse === 0);
     return { rowIds, introRowId: introRow ? introRow.id : null };
-  }, [data]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [commentLiveRowsKey]);
   // A → B → A keeps A on screen, so the comments key never changes and A's
   // comments would not refetch, although the socket followed B meanwhile and
   // missed A's comment events. Bump the comments epoch when such a lock lifts
@@ -477,9 +527,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // debounced refetch the outbox listener below uses. Every RowKind counts:
       // tq and twl rows carry lint issues too (lintTqRows / lintTwlRows in
       // api/src/lint.ts), so no kind filter here (#887).
-      scheduleLintRefetch();
+      scheduleLintRefetch(row.chapter);
     },
-    onDelete: (kind, id) => applyLocalRowDelete(kind, id),
+    // A delete broadcast changes the lint set the same way, and this room's
+    // rows are all in `chapter` (#1135).
+    onDelete: (kind, id) => {
+      applyLocalRowDelete(kind, id);
+      scheduleLintRefetch(chapter);
+    },
     // Version-gated inside the hook (strictly newer than local AND above the
     // verse's tombstone) so a verse.updated that reordered behind the bridge
     // that deleted its row cannot resurrect it (#729).
@@ -732,10 +787,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // The lint report is otherwise fetched once per book, so a translator who
   // fixes a flagged note (e.g. unbalanced brackets around an Alternate
   // translation) would keep seeing the stale count until a reload. Refetch when
-  // a TN-row or verse write for THIS book lands successfully — those are the
-  // only edits the lint covers (TN flags + ULT/UST footnote integrity) —
-  // debounced so a burst of saves coalesces into one request.
+  // a row (tn, tq or twl) or verse write for THIS book lands successfully —
+  // all of them carry lint issues (#887, #1135) — debounced so a burst of
+  // saves coalesces into one request.
   const bookLintRefetch = bookLint.refetch;
+  // The chapter of each tq/twl row this tab deleted, keyed
+  // `${rowKind}:${book}:${id}`, until its DELETE's result arrives: the DELETE
+  // answers `{ ok: true }` with no row, and the chapter keeps the refresh to
+  // one chapter instead of the whole book (#1135).
+  const lintDeletedRowChapter = useRef(new Map<string, number>());
   const bookLintSettledAt = bookLint.lastSettledAt;
   const lintRefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Set when a lint-relevant change was skipped because the tab was hidden;
@@ -747,30 +807,48 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // endpoint filters `trashed_at IS NULL`, so trashing a flagged note drops the
   // count and restoring one adds it back.
   // A hidden tab can't see the chip, so defer to its return (#887).
-  const scheduleLintRefetch = useCallback(() => {
+  // `chapter` is the chapter the change landed in: when every change in the
+  // debounce window names the same one, only that chapter is re-linted and
+  // merged (#888). No chapter (focus refresh, a change whose chapter isn't
+  // known) re-lints the whole book.
+  const bookLintRefetchChapter = bookLint.refetchChapter;
+  const lintPendingScope = useRef<Set<number> | "book">(new Set());
+  const scheduleLintRefetch = useCallback((chapter?: number) => {
     if (document.hidden) {
       lintStaleWhileHidden.current = true;
       return;
     }
+    const scope = lintPendingScope.current;
+    if (chapter === undefined) lintPendingScope.current = "book";
+    else if (scope !== "book") scope.add(chapter);
     if (lintRefetchTimer.current) clearTimeout(lintRefetchTimer.current);
     lintRefetchTimer.current = setTimeout(() => {
       lintRefetchTimer.current = null;
+      const pending = lintPendingScope.current;
+      lintPendingScope.current = new Set();
       // Hidden since the timer was armed: defer to the tab's return instead.
       if (document.hidden) {
         lintStaleWhileHidden.current = true;
         return;
       }
-      bookLintRefetch();
+      if (pending !== "book" && pending.size === 1) bookLintRefetchChapter([...pending][0]);
+      else bookLintRefetch();
     }, 3000);
-  }, [bookLintRefetch]);
+  }, [bookLintRefetch, bookLintRefetchChapter]);
   useEffect(() => {
     const unsub = onOutboxResult((op, result) => {
       if (result.kind !== "ok") return;
       const t = op.target;
-      const touchesLint =
-        (t.kind === "row" && t.rowKind === "tn" && t.book === book) ||
-        (t.kind === "verse" && t.book === book);
-      if (touchesLint) scheduleLintRefetch();
+      // Every row kind, not just tn (#1135). A DELETE returns no row, so its
+      // chapter comes from the row as the user deleted it (recorded below).
+      let deletedChapter: number | undefined;
+      if (t.kind === "row" && op.action === "delete") {
+        const key = `${t.rowKind}:${t.book}:${t.id}`;
+        deletedChapter = lintDeletedRowChapter.current.get(key);
+        lintDeletedRowChapter.current.delete(key);
+      }
+      const ch = lintChapterForSavedOp(t, result.updated, book, deletedChapter);
+      if (ch !== null) scheduleLintRefetch(ch);
     });
     return () => {
       unsub();
@@ -778,6 +856,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         clearTimeout(lintRefetchTimer.current);
         lintRefetchTimer.current = null;
       }
+      lintPendingScope.current = new Set();
     };
   }, [book, scheduleLintRefetch]);
   // Self-heal a stale "issues to clean up" chip: when the tab regains focus or
@@ -792,7 +871,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   useEffect(() => {
     const refresh = () => {
       if (document.visibilityState !== "visible") return;
-      if (!lintStaleWhileHidden.current && Date.now() - bookLintSettledAt() < 60_000) return;
+      if (!lintStaleWhileHidden.current && Date.now() - bookLintSettledAt() < WHOLE_BOOK_LINT_MAX_AGE_MS) return;
       lintStaleWhileHidden.current = false;
       scheduleLintRefetch();
     };
@@ -984,17 +1063,321 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Surface a toast when the outbox drops an op because the chapter was
   // locked. The user's edit was rejected by the server (409 chapter_locked)
   // and discarded — retrying would race the auto-apply step.
+  //
+  // #1071: the tab learns of locks from a 120 s poll, so a refusal is often
+  // the first it hears of one. Re-read the jobs now so the lanes lock and the
+  // aligner's gates stop offering Save. A burst of refusals shares one
+  // reload. An aligner save is not lost: the panel and its crash draft keep
+  // the drags (AlignmentPanel, alignmentDrafts). A verse-history restore also
+  // sends alignment_edit but is not aligner work, so it keeps the old toast.
+  const lockReloadRef = useRef<Promise<void> | null>(null);
+  // #1073: the refused save's content was folded into the chapter and book
+  // caches optimistically, and the drop leaves it there, reading as saved
+  // (the aligner's Reset goes back to it, a reopened verse shows it). Re-read
+  // the chapter and put the server's row back. Read through refs: the GET
+  // resolves after renders this closure did not see. Every reader (here and
+  // in rollBackRefusedRowDelete below) runs only after an awaited outbox
+  // read or GET, so a write after commit gives them the same value (#1117).
+  const bookHookRef = useRef(bookHook);
+  const applyLocalVerseRef = useRef(applyLocalVerse);
+  const applyRemoteVerseRef = useRef(applyRemoteVerse);
+  // One chapter GET per refusal burst: a find/replace across a locked chapter
+  // is refused verse by verse, and every refusal reads the same chapter.
+  const rollbackFetchRef = useRef(new Map<string, Promise<ChapterPayload>>());
+  const liveBookRef = useRef(book);
+  useLayoutEffect(() => {
+    bookHookRef.current = bookHook;
+    applyLocalVerseRef.current = applyLocalVerse;
+    applyRemoteVerseRef.current = applyRemoteVerse;
+    liveBookRef.current = book;
+  });
+  // False once this Shell unmounts (React StrictMode's dev replay sets it
+  // back to true).
+  const rollbackMountedRef = useRef(false);
+  useEffect(() => {
+    rollbackMountedRef.current = true;
+    return () => {
+      rollbackMountedRef.current = false;
+    };
+  }, []);
+  // One retry after a short wait for a transient failure; the caller's guards
+  // run on whichever response lands. A second failure throws (the caller's
+  // catch gives up) and the next chapter refetch catches up.
+  const fetchRollbackChapter = useCallback(async (b: string, c: number): Promise<ChapterPayload> => {
+    const fetchKey = `${b}:${c}`;
+    const fetchChapter = () => {
+      let fetching = rollbackFetchRef.current.get(fetchKey);
+      if (!fetching) {
+        fetching = api.getChapter(b, c);
+        rollbackFetchRef.current.set(fetchKey, fetching);
+        const forget = () => {
+          rollbackFetchRef.current.delete(fetchKey);
+        };
+        fetching.then(forget, forget);
+      }
+      return fetching;
+    };
+    try {
+      return await fetchChapter();
+    } catch {
+      await new Promise((r) => setTimeout(r, 2000));
+      return await fetchChapter();
+    }
+  }, []);
+  const rollBackRefusedVerse = useCallback(async (op: OutboxOp) => {
+    const t = op.target;
+    if (t.kind !== "verse") return;
+    try {
+      const key = outboxTargetKey(t);
+      const queuedForTarget = async () =>
+        siblingStillDraining(
+          (await outbox.list()).map((o) => ({ id: o.id, status: o.status, targetKey: outboxTargetKey(o.target) })),
+          op.id,
+          key,
+        );
+      if (await queuedForTarget()) return;
+      // The rows the refusal left in each cache. A row that is not still these
+      // when the GET lands (the verse was saved or edited again meanwhile) is
+      // left alone, so the server's older row never overwrites newer work.
+      const chapterRow = () => {
+        const cur = dataRef.current;
+        return cur && cur.book === t.book && cur.chapter === t.chapter
+          ? cur.verses[t.bibleVersion]?.[t.verse]
+          : undefined;
+      };
+      const bookRow = () => {
+        const ch = t.book === book ? bookHookRef.current?.chapters.get(t.chapter) : undefined;
+        return ch?.kind === "ready" ? ch.data.verses[t.bibleVersion]?.[t.verse] : undefined;
+      };
+      const chapterBefore = chapterRow();
+      const bookBefore = bookRow();
+      const server = await fetchRollbackChapter(t.book, t.chapter);
+      const stillQueuedForTarget = await queuedForTarget();
+      const serverRow = server.verses[t.bibleVersion]?.[t.verse];
+      const apply = (
+        cachedBefore: VerseDto | undefined,
+        cachedRow: VerseDto | undefined,
+        force: (v: VerseDto) => void,
+        remote: (v: VerseDto) => void,
+      ) => {
+        const plan = planRefusedVerseRollback({ serverRow, cachedBefore, cachedRow, stillQueuedForTarget });
+        if (plan.kind === "force") force(plan.row);
+        else if (plan.kind === "remote") remote(plan.row);
+      };
+      // App keys Shell by book and hoists useBook, whose applies have no book
+      // check: once this Shell is gone (a book switch during the GET), its
+      // refs still hold the old book's snapshot, and an apply would write the
+      // old book's verse into the new book's cache. Apply nothing then.
+      if (
+        !rollbackMayApply({
+          mounted: rollbackMountedRef.current,
+          liveBook: liveBookRef.current,
+          targetBook: t.book,
+        })
+      ) {
+        return;
+      }
+      apply(chapterBefore, chapterRow(), applyLocalVerseRef.current, applyRemoteVerseRef.current);
+      const bh = bookHookRef.current;
+      if (bh) apply(bookBefore, bookRow(), bh.applyLocalVerse, bh.applyRemoteVerse);
+    } catch {
+      // Best-effort: the next chapter refetch catches up.
+    }
+  }, [book, fetchRollbackChapter]);
+  // #1108: a tq/twl DELETE hides its row before it is sent. A refusal (lock)
+  // or a discard means no 200 will follow, so the row stayed hidden although
+  // the server still has it. Re-read the chapter on screen and put the
+  // server's row back (planRefusedRowDeleteRollback decides). Refused PATCHes
+  // are left alone: see refusedRowRollback.ts.
+  // Read only after the awaited GET, so it is written after commit (#1117).
+  const restoreRowRef = useRef(restoreRow);
+  useLayoutEffect(() => {
+    restoreRowRef.current = restoreRow;
+  });
+  const rollBackRefusedRowDelete = useCallback(async (op: Pick<OutboxOp, "id" | "target" | "action">) => {
+    const t = op.target;
+    if (t.kind !== "row" || op.action !== "delete") return;
+    try {
+      const key = outboxTargetKey(t);
+      // Another DELETE of the row (another tab's) settles the cache itself.
+      const deleteQueued = async () =>
+        siblingStillDraining(
+          (await outbox.list())
+            .filter((o) => o.action === "delete")
+            .map((o) => ({ id: o.id, status: o.status, targetKey: outboxTargetKey(o.target) })),
+          op.id,
+          key,
+        );
+      if (await deleteQueued()) return;
+      // The op carries no chapter; the row was hidden from the chapter on
+      // screen. A chapter opened since loads fresh and has it anyway.
+      const cur = dataRef.current;
+      if (!cur || cur.book !== t.book) return;
+      const chapterNo = cur.chapter;
+      const server = await fetchRollbackChapter(t.book, chapterNo);
+      const stillQueuedForTarget = await deleteQueued();
+      if (
+        !rollbackMayApply({
+          mounted: rollbackMountedRef.current,
+          liveBook: liveBookRef.current,
+          targetBook: t.book,
+        })
+      ) {
+        return;
+      }
+      const now = dataRef.current;
+      if (!now || now.book !== t.book || now.chapter !== chapterNo) return;
+      const plan = planRefusedRowDeleteRollback<TnRow | TqRow | TwlRow>({
+        id: t.id,
+        serverRows: server[t.rowKind],
+        cachedRows: now[t.rowKind],
+        stillQueuedForTarget,
+      });
+      if (plan.kind === "restore") restoreRowRef.current(t.rowKind, plan.row, { afterId: plan.afterId });
+    } catch {
+      // Best-effort: the next chapter refetch catches up.
+    }
+  }, [fetchRollbackChapter]);
+  // #1165: a note MOVE the server refused (into a verse-range run's verses) was
+  // already applied to the cache, so the card would sit at the refused verse
+  // until a refetch. Put back the server's position only (verse, ref, sort
+  // order); the note's text and draft are untouched, which is why the general
+  // refused-PATCH rule in refusedRowRollback.ts does not apply here.
+  const rollBackRefusedTnMove = useCallback(
+    async (op: Pick<OutboxOp, "target" | "action" | "patch">) => {
+      const t = op.target;
+      if (t.kind !== "row" || t.rowKind !== "tn" || op.action !== "patch") return;
+      if (typeof op.patch?.verse !== "number") return;
+      try {
+        const cur = dataRef.current;
+        if (!cur || cur.book !== t.book) return;
+        const chapterNo = cur.chapter;
+        const server = await fetchRollbackChapter(t.book, chapterNo);
+        if (
+          !rollbackMayApply({
+            mounted: rollbackMountedRef.current,
+            liveBook: liveBookRef.current,
+            targetBook: t.book,
+          })
+        ) {
+          return;
+        }
+        const now = dataRef.current;
+        if (!now || now.book !== t.book || now.chapter !== chapterNo) return;
+        const plan = planRefusedTnMoveRollback({
+          patch: op.patch,
+          serverRow: server.tn.find((r) => r.id === t.id),
+          cachedRow: now.tn.find((r) => r.id === t.id),
+        });
+        if (plan) applyLocalRowPatch("tn", t.id, plan);
+      } catch {
+        // Best-effort: the next chapter refetch catches up.
+      }
+    },
+    [fetchRollbackChapter, applyLocalRowPatch],
+  );
+  // A chapter_locked refusal means this tab's view of the pipeline is stale:
+  // refresh it (one reload at a time).
+  const reloadLocks = useCallback(() => {
+    lockReloadRef.current ??= pipelineStore
+      .reload()
+      .catch(() => undefined)
+      .finally(() => {
+        lockReloadRef.current = null;
+      });
+  }, []);
   useEffect(
     () =>
-      onOutboxResult((_op, result) => {
+      onOutboxResult((op, result) => {
         if (result.kind === "locked") {
+          reloadLocks();
+          // An aligner save's toast waits for alignmentDrafts to say whether
+          // the drags were kept (onAlignerSaveRefused below), and so does its
+          // cache rollback: a mounted panel's reset to the server's row then
+          // finds the crash draft already written and restores the drags.
+          if (isAlignerPanelSaveOp(op)) return;
+          void rollBackRefusedVerse(op);
+          void rollBackRefusedRowDelete(op);
+          void rollBackRefusedTnMove(op);
           pushPipelineToast(
             "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
             "error",
           );
         }
       }),
-    [pushPipelineToast],
+    [pushPipelineToast, reloadLocks, rollBackRefusedVerse, rollBackRefusedRowDelete, rollBackRefusedTnMove],
+  );
+  // #1075: a discarded verse op (an unresolvable 409, a refused save, discard
+  // all) leaves its optimistic content in the caches just as a lock refusal
+  // does, so a reopened aligner or reading line would show the discarded
+  // text as saved and its next edit would pin the old version. Same rollback.
+  // A discarded row DELETE puts its hidden row back (#1108).
+  useEffect(
+    () =>
+      onOutboxDiscard((op) => {
+        if (op.target.kind === "verse") void rollBackRefusedVerse(op);
+        else void rollBackRefusedRowDelete(op);
+      }),
+    [rollBackRefusedVerse, rollBackRefusedRowDelete],
+  );
+  // #1119: this tab's row DELETE refused or discarded in another tab (the
+  // drain is shared across tabs, its announcements are not) gets the same
+  // rollback here, since this tab hid the row. Local outcomes are handled by
+  // the two listeners above. A refusal also gets the draining tab's toast and
+  // lock reload, so the row coming back here is explained (#1126 item 1).
+  useEffect(
+    () =>
+      rowDeleteOutcomes.on((o) => {
+        if (!(o.remote && o.own && o.kind === "abandoned")) return;
+        void rollBackRefusedRowDelete(o.op);
+        if (o.reason === "locked") {
+          reloadLocks();
+          pushPipelineToast(
+            "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+            "error",
+          );
+        }
+      }),
+    [pushPipelineToast, reloadLocks, rollBackRefusedRowDelete],
+  );
+  // #1174: this tab's note move refused in another tab (which drained it and
+  // rolled back its own view) gets the same rollback, toast and lock reload
+  // here. A move refused in this tab is handled by the result listener above.
+  useEffect(
+    () =>
+      tnMoveRelay.on((op) => {
+        void rollBackRefusedTnMove(op);
+        reloadLocks();
+        pushPipelineToast(
+          "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+          "error",
+        );
+      }),
+    [pushPipelineToast, reloadLocks, rollBackRefusedTnMove],
+  );
+  // #1071: say "kept" only when a crash draft or an open panel actually holds
+  // the refused drags. Two queued saves of one verse refused together get
+  // one toast.
+  const lastRefusalToastRef = useRef<{ key: string; at: number } | null>(null);
+  useEffect(
+    () =>
+      onAlignerSaveRefused((op, kept, heldInDraft) => {
+        // Kept only in the open panel's memory (no crash draft: read-only,
+        // or the draft write failed): rolling the cache back would reset
+        // that panel and lose the drags, so leave the cache until they save.
+        if (heldInDraft || !kept) void rollBackRefusedVerse(op);
+        const key = alignmentDraftKeyForOp(op);
+        const last = lastRefusalToastRef.current;
+        if (last && last.key === key && Date.now() - last.at < 3000) return;
+        lastRefusalToastRef.current = { key, at: Date.now() };
+        pushPipelineToast(
+          kept
+            ? "Alignment not saved — the AI run for this chapter is mid-flight. Your changes are kept in the aligner; save them after it finishes."
+            : "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+          "error",
+        );
+      }),
+    [pushPipelineToast, rollBackRefusedVerse],
   );
 
   // Derive the chapter lock from active pipeline jobs. A run only locks the
@@ -1039,17 +1422,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }),
     [lockForChapter, chapter],
   );
+  // #1165: a verse-range notes run locks only the notes anchored in its range,
+  // so `chapterLocks.tn` says a run holds notes and this says which ones.
+  const tnLockJobs = useMemo(() => tnLockingJobs(activeJobs, book, chapter), [activeJobs, book, chapter]);
+  const tnVerseLocked = useCallback((verse: number) => isTnVerseLocked(tnLockJobs, verse), [tnLockJobs]);
+  // The server refuses moving a note into a range run's verses (#1165), so the
+  // picker leaves them out and onNoteChangeVerse refuses them too.
+  const tnMoveBlocked = useCallback((verse: number) => isTnMoveBlocked(tnLockJobs, verse), [tnLockJobs]);
   // One banner line per active run, so a run's type and start time are never
   // attributed to another run's locked lanes.
   const lockBanners = useMemo(() => {
     const byJob = new Map<string, { pipelineType: string; startedAt: number; resources: string[] }>();
-    for (const [resource, label] of [
+    for (const [resource, baseLabel] of [
       ["verse", "scripture"],
       ["tn", "notes"],
       ["tq", "questions"],
     ] as const) {
       const lock = chapterLocks[resource];
       if (!lock) continue;
+      // The notes label names every locking run's verses (the union
+      // isTnVerseLocked enforces), not only this banner's job.
+      const label = resource === "tn" ? tnLockLabel(tnLockJobs) : baseLabel;
       const entry = byJob.get(lock.jobId);
       if (entry) entry.resources.push(label);
       else
@@ -1060,7 +1453,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         });
     }
     return Array.from(byJob, ([jobId, v]) => ({ jobId, ...v }));
-  }, [chapterLocks]);
+  }, [chapterLocks, tnLockJobs]);
 
   const handleSetNotePreserve = useCallback(
     async (id: string, value: boolean) => {
@@ -1114,7 +1507,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         applyLocalRowReplacement("tn", updated);
         // Trash bypasses the outbox, so refresh the lint chip directly — a
         // trashed note leaves the lint set (trashed_at IS NULL filter).
-        scheduleLintRefetch();
+        scheduleLintRefetch(updated.chapter);
         // The book-level trash indicator (#755) has no other way to learn a
         // row changed state — it lists the whole book, not just this chapter.
         setTrashRefreshSignal((n) => n + 1);
@@ -1145,7 +1538,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         applyLocalRowReplacement("tn", updated);
         // Restore re-adds the note to the lint set — refresh the chip (the
         // outbox listener won't fire for this direct API call).
-        scheduleLintRefetch();
+        scheduleLintRefetch(updated.chapter);
         setTrashRefreshSignal((n) => n + 1);
       } catch (e) {
         applyLocalRowPatch("tn", id, { trashed_at: Math.floor(Date.now() / 1000) });
@@ -1357,6 +1750,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Live lock state for a save that commits after an await or a confirm
   // (#1046): the render-time `bookLocked` a callback closed over can be stale
   // by the time it enqueues.
+  //
+  // This ref, alignerLockRef and chapterStaleRef below are written during
+  // render on purpose (#1117), unlike the rollback refs above: they are the
+  // gates a write checks just before it is sent, and a render-time write is
+  // the earliest point the new value is visible. A child's unmount cleanup
+  // or layout effect in the same commit runs before any layout effect of
+  // Shell's, so a write fired from one would still see the previous lock or
+  // stale flag. A render React throws away cannot leak a wrong value here:
+  // no startTransition / useDeferredValue is in use, so the only discarded
+  // renders are StrictMode's dev replay and React's one retry after a render
+  // error, and both compute the same value. Revisit if concurrent rendering
+  // arrives (e.g. a React 19 upgrade).
   const bookLockedRef = useRef(bookLocked);
   bookLockedRef.current = bookLocked;
   useEffect(() => {
@@ -1392,6 +1797,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bookLocked ? "book" : lockForChapter(chapterNum, "verse") ? "chapter" : false,
     [lockForChapter, bookLocked],
   );
+  // Live lock state for the unalign confirm's deferred commit (#1071), same
+  // reason as bookLockedRef; written during render for the reason given there.
+  const alignerLockRef = useRef(alignerLock);
+  alignerLockRef.current = alignerLock;
+  // Read by every route-chapter write (#892) right before it is sent; written
+  // during render for the reason given at bookLockedRef.
   const chapterStaleRef = useRef(chapterStale);
   chapterStaleRef.current = chapterStale;
 
@@ -1688,41 +2099,55 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // highlight source. Notes and words are mutually exclusive; clicking one
   // clears the other. Words use `orig_words` (Hebrew source words) which the
   // same matcher handles directly for UHB and via \zaln-s for ULT/UST.
-  const { activeQuote, activeOccurrence, activeQuotePartialGroups, activeQuoteCoveredVerses, activeQuoteVerse } =
-    useMemo(() => {
-      const empty = {
-        activeQuote: null as string | null,
-        activeOccurrence: null as number | null,
-        activeQuotePartialGroups: false,
-        activeQuoteCoveredVerses: EMPTY_COVERED_VERSES,
-        activeQuoteVerse: null as number | null,
+  const {
+    activeQuote,
+    activeOccurrence,
+    activeQuotePartialGroups,
+    activeQuoteCoveredVersesRaw,
+    activeQuoteVerse,
+  } = useMemo(() => {
+    const empty = {
+      activeQuote: null as string | null,
+      activeOccurrence: null as number | null,
+      activeQuotePartialGroups: false,
+      activeQuoteCoveredVersesRaw: EMPTY_COVERED_VERSES,
+      activeQuoteVerse: null as number | null,
+    };
+    if (!data) return empty;
+    if (activeNoteId) {
+      const r = data.tn.find((row) => row.id === activeNoteId);
+      if (!r) return empty;
+      const covered = noteCoveredVerses(r);
+      return {
+        activeQuote: r.quote ?? null,
+        activeOccurrence: r.occurrence ?? null,
+        activeQuotePartialGroups: covered.length > 1,
+        activeQuoteCoveredVersesRaw: covered,
+        // The note's own verse: its occurrence counts there (#957).
+        activeQuoteVerse: r.verse,
       };
-      if (!data) return empty;
-      if (activeNoteId) {
-        const r = data.tn.find((row) => row.id === activeNoteId);
-        if (!r) return empty;
-        const covered = noteCoveredVerses(r);
-        return {
-          activeQuote: r.quote ?? null,
-          activeOccurrence: r.occurrence ?? null,
-          activeQuotePartialGroups: covered.length > 1,
-          activeQuoteCoveredVerses: covered,
-          // The note's own verse: its occurrence counts there (#957).
-          activeQuoteVerse: r.verse,
-        };
-      }
-      if (activeWordId) {
-        const r = data.twl.find((row) => row.id === activeWordId);
-        return {
-          activeQuote: r?.orig_words ?? null,
-          activeOccurrence: r?.occurrence ?? null,
-          activeQuotePartialGroups: false,
-          activeQuoteCoveredVerses: r ? [r.verse] : EMPTY_COVERED_VERSES,
-          activeQuoteVerse: r?.verse ?? null,
-        };
-      }
-      return empty;
-    }, [activeNoteId, activeWordId, data]);
+    }
+    if (activeWordId) {
+      const r = data.twl.find((row) => row.id === activeWordId);
+      return {
+        activeQuote: r?.orig_words ?? null,
+        activeOccurrence: r?.occurrence ?? null,
+        activeQuotePartialGroups: false,
+        activeQuoteCoveredVersesRaw: r ? [r.verse] : EMPTY_COVERED_VERSES,
+        activeQuoteVerse: r?.verse ?? null,
+      };
+    }
+    return empty;
+  }, [activeNoteId, activeWordId, data]);
+  // ScriptureColumn compares activeNoteCoveredVerses by identity (#896): gate on
+  // the joined verse list so a data change that doesn't move the active note/word
+  // keeps the same array reference instead of forcing a full re-render.
+  const activeQuoteCoveredVersesKey = activeQuoteCoveredVersesRaw.join(",");
+  const activeQuoteCoveredVerses = useMemo(
+    () => (activeQuoteCoveredVersesKey ? activeQuoteCoveredVersesRaw : EMPTY_COVERED_VERSES),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeQuoteCoveredVersesKey],
+  );
 
   // Reorder "stoplight": while a note is dragged (or for ~3s after an arrow
   // move) ResourceColumn reports the moved note's candidate neighbours; we
@@ -1758,7 +2183,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
     [],
   );
-  const reorderHighlight = useMemo<ReorderHighlight | null>(() => {
+  const reorderHighlightRaw = useMemo<ReorderHighlight | null>(() => {
     if (!data || !reorderPreview) return null;
     // Notes AND word links: the ids in a preview come from whichever table the
     // user is reordering. A TWL row's source quote lives in `orig_words` rather
@@ -1790,6 +2215,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       nextVerse: next?.verse ?? null,
     };
   }, [data, reorderPreview]);
+  // ScriptureColumn compares reorderHighlight by identity (#896): `data` changing
+  // elsewhere (any unrelated edit) rebuilt this object every time even when the
+  // moved/prev/next quotes were unchanged. Gate on the field values themselves —
+  // including the verse fields (#957's bridged-verse disambiguation), since a
+  // reorder that swaps a same-quote/occurrence neighbour from one bridge verse
+  // to another must still produce a new object for rowHighlightsFor to pick up.
+  const reorderHighlightKey = reorderHighlightRaw
+    ? [
+        reorderHighlightRaw.movedQuote,
+        reorderHighlightRaw.movedOccurrence,
+        reorderHighlightRaw.movedVerse,
+        reorderHighlightRaw.prevQuote,
+        reorderHighlightRaw.prevOccurrence,
+        reorderHighlightRaw.prevVerse,
+        reorderHighlightRaw.nextQuote,
+        reorderHighlightRaw.nextOccurrence,
+        reorderHighlightRaw.nextVerse,
+      ].join("|")
+    : "";
+  const reorderHighlight = useMemo<ReorderHighlight | null>(
+    () => reorderHighlightRaw,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [reorderHighlightKey],
+  );
 
   // Quote-builder session: when active, clicking Hebrew words in the UHB
   // row of the active verse toggles them into selectedKeys; "Use selection"
@@ -2042,6 +2491,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         sort_order,
       });
       applyLocalRowInsert("twl", created);
+      scheduleLintRefetch(created.chapter);
       setActiveWordId(created.id);
       setActiveNoteId(null);
       setActiveQuestionId(null);
@@ -2059,7 +2509,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         );
       }
     },
-    [data, verseIndexByVersion, book, chapter, twTitles, lockedTwlVerses, applyLocalRowInsert],
+    [data, verseIndexByVersion, book, chapter, twTitles, lockedTwlVerses, applyLocalRowInsert, scheduleLintRefetch],
   );
 
   // Whether a per-verse suggestion is already covered on the active verse. Done
@@ -2127,8 +2577,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // matcher's suggestions back onto the row by source-key surfaces it. Values are
   // short article ids (e.g. "other/lover").
   const twlRowAlternatives = useMemo<Map<string, string[]>>(() => {
+    if (!data || verseTwlSuggestions.length === 0) return EMPTY_TWL_ROW_ALTERNATIVES;
     const map = new Map<string, string[]>();
-    if (!data || verseTwlSuggestions.length === 0) return map;
     // Each group carries its own verse — resolve and match per verse so that in
     // a bridge every verse's committed rows get alternatives from their OWN
     // verse's matcher, not only the leading/active one. Row ids are unique
@@ -2280,6 +2730,33 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     return dataRef.current?.tn ?? [];
   }, [mode, bookHook]);
 
+  // Translation-question twins of the find-in-notes state/getter above (the
+  // overlay's TQ scope). Same stable-getter contract as getSearchNotes.
+  const [findQuestionQuery, setFindQuestionQuery] = useState<
+    { find: string; regex: boolean; caseSensitive: boolean } | null
+  >(null);
+  const [activeQuestionMatch, setActiveQuestionMatch] = useState<
+    { rowId: string; field: "question" | "response"; occurrence: number } | null
+  >(null);
+
+  const getSearchQuestions = useCallback((): TqRow[] => {
+    if (mode === "book" && bookHook) {
+      const out: TqRow[] = [];
+      for (const cs of bookHook.chapters.values()) {
+        if (cs.kind === "ready") out.push(...cs.data.tq);
+      }
+      return out;
+    }
+    return dataRef.current?.tq ?? [];
+  }, [mode, bookHook]);
+
+  // A running pipeline holding tq makes the server 409 a tq PATCH, so the
+  // overlay skips those chapters' rows rather than enqueueing doomed writes.
+  const isQuestionLocked = useCallback(
+    (ch: number) => lockForChapter(ch, "tq") != null,
+    [lockForChapter],
+  );
+
   // Navigate to + activate a TN match from the find overlay. Cross-chapter
   // (book mode) routes through the URL so the chapter payload reloads; the
   // common same-chapter case just focuses the verse + note, and the bumped
@@ -2331,6 +2808,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [runWithDirtyGate, chapter, book, onNavigate, requestJumpTab],
   );
 
+  // Find's TQ hits always land on the Questions tab (unlike TN, which only
+  // switches tab when TQ is also on) — a stable wrapper for the overlay.
+  const focusQuestionMatchSwitching = useCallback(
+    (ch: number, v: number, questionId: string) => focusQuestionMatch(ch, v, questionId, true),
+    [focusQuestionMatch],
+  );
+
   const focusWordMatch = useCallback(
     (ch: number, v: number, wordId: string, switchTab = false) => {
       runWithDirtyGate(() => {
@@ -2348,6 +2832,79 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       });
     },
     [runWithDirtyGate, chapter, book, onNavigate, requestJumpTab],
+  );
+
+  // Back history (lib/navHistory.ts). Report every change of position — verse,
+  // chapter, book, or the note/question/word link in focus — so the Back button
+  // can return to it. The history is a module singleton because Shell remounts
+  // on a book change.
+  const navFocus = activeNoteId
+    ? { kind: "tn" as const, rowId: activeNoteId }
+    : activeQuestionId
+      ? { kind: "tq" as const, rowId: activeQuestionId }
+      : activeWordId
+        ? { kind: "twl" as const, rowId: activeWordId }
+        : null;
+  const navHint = (() => {
+    if (!navFocus || !data) return undefined;
+    const text =
+      navFocus.kind === "tn"
+        ? data.tn.find((r) => r.id === navFocus.rowId)
+        : navFocus.kind === "tq"
+          ? data.tq.find((r) => r.id === navFocus.rowId)
+          : data.twl.find((r) => r.id === navFocus.rowId);
+    if (!text) return undefined;
+    const raw =
+      navFocus.kind === "tn"
+        ? ((text as TnRow).note || (text as TnRow).quote)
+        : navFocus.kind === "tq"
+          ? ((text as TqRow).question || (text as TqRow).quote)
+          : (text as TwlRow).orig_words;
+    const flat = (raw ?? "").replace(/\s+/g, " ").trim();
+    return flat ? (flat.length > 60 ? `${flat.slice(0, 60)}…` : flat) : undefined;
+  })();
+  useEffect(() => {
+    navHistory.observe({
+      book,
+      chapter,
+      verse: activeVerse,
+      ...(navFocus ?? {}),
+      hint: navHint,
+    });
+  }, [book, chapter, activeVerse, navFocus?.kind, navFocus?.rowId, navHint]);
+
+  // Go to entry `index` of the Back history. A cross-chapter or cross-book
+  // target navigates through the URL and, for a row, stashes pendingRowJump
+  // (which names its own book). A same-chapter target sets the focus state
+  // directly rather than calling focus*Match, which would nest a second
+  // dirty-gate inside this one. One gate wraps it all, and the history entry is
+  // only taken once the gate has let the jump through.
+  const goToSpot = useCallback(
+    (index: number) => {
+      runWithDirtyGate(() => {
+        const s = navHistory.takeAt(index);
+        if (!s) return;
+        if (s.book === book && s.chapter === chapter) {
+          // A row that was deleted or trashed since is dropped to its verse.
+          const cur = dataRef.current;
+          const rows = s.kind === "tn" ? cur?.tn : s.kind === "tq" ? cur?.tq : s.kind === "twl" ? cur?.twl : undefined;
+          const row = s.rowId ? rows?.find((r) => r.id === s.rowId) : undefined;
+          setActiveVerse(row ? row.verse : s.verse);
+          setActiveNoteId(row && s.kind === "tn" ? row.id : null);
+          setActiveQuestionId(row && s.kind === "tq" ? row.id : null);
+          setActiveWordId(row && s.kind === "twl" ? row.id : null);
+          if (row && s.kind) requestJumpTab(TAB_FOR_ROW_KIND[s.kind]);
+          requestScrollToActive();
+          return;
+        }
+        pendingRowJump =
+          s.kind && s.rowId
+            ? { book: s.book, chapter: s.chapter, kind: s.kind, rowId: s.rowId, switchTab: true }
+            : null;
+        onNavigate?.(s.book, s.chapter, s.verse);
+      });
+    },
+    [runWithDirtyGate, book, chapter, onNavigate, requestJumpTab, requestScrollToActive],
   );
 
   // Jump to a lint issue from the topbar indicator. `ref` is "chapter:verse"
@@ -2402,12 +2959,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // [chapter, initialVerse] — internal same-chapter verse selection sets
   // activeVerse directly without an URL push, so initialVerse doesn't change
   // and this won't clobber it. Skips the initial mount.
-  const chapterResetMounted = useRef(false);
+  //
+  // Detected by comparing against the previous (chapter, initialVerse) this
+  // effect actually saw, not a boolean latch (#842 step 4): a latch that's
+  // already flipped true survives a React StrictMode replay (setup → cleanup
+  // → setup) of this same first commit, so the replayed setup would see
+  // "not the initial mount" and fire the whole reset — 13 setState calls
+  // plus closeComments() — on mount, in dev only. Comparing keys instead
+  // means the replay's (chapter, initialVerse) still equals what was just
+  // recorded, so it reads as a no-op re-run of the same commit either way.
+  const chapterResetKey = useRef<{ chapter: number; initialVerse: number } | null>(null);
   useEffect(() => {
-    if (!chapterResetMounted.current) {
-      chapterResetMounted.current = true;
-      return;
-    }
+    const prev = chapterResetKey.current;
+    chapterResetKey.current = { chapter, initialVerse };
+    if (!prev || (prev.chapter === chapter && prev.initialVerse === initialVerse)) return;
     setActiveVerse(initialVerse);
     setActiveNoteId(null);
     setActiveWordId(null);
@@ -2639,6 +3204,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // in-memory alignment + reading dirtiness here plus unsaved drafts internally.
   useUnsavedGuard(alignmentDirty || dualDirty);
 
+  // #1045: a lock that lands while an aligner holds unsaved drags. Saving them
+  // then commits locally (baseline reset, crash draft cleared) and queues a
+  // PATCH the server refuses with 409 chapter_locked, which the outbox drops,
+  // so the drags are lost. While locked, the gates below leave out Save and
+  // the update reload skips its auto-save; the drags stay in the panel and its
+  // crash draft and can be saved once the lock lifts. handleSave itself is
+  // left alone on purpose (#943): refusing there would drop them silently.
+  const singleAlignerLocked =
+    panelMode === "alignment" && alignerTarget ? alignerLock(alignerTarget.chapter) : false;
+  // Only the alignment panels' drags: a dirty reading line keeps the dual
+  // gate's Save, which refuses out loud under a book lock (#1046, s18) and is
+  // rejected with a toast under a chapter lock (s9 check (b)).
+  const dualAlignmentLocked =
+    (dualLeftDirty || dualRightDirty) && dualTarget ? alignerLock(dualTarget.chapter) : false;
+
   // Save-aware reload for the "App update available" chip. A bare reload would
   // drop unsaved in-memory alignment drags (they only reach the durable outbox
   // on save). If the single alignment panel is dirty, save first, then wait for
@@ -2646,17 +3226,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // IndexedDB serializes AFTER the save's write, so its resolution means the op
   // is durably queued (it survives the reload and drains after) — before
   // tearing the page down. Text/note/row drafts already persist across reload;
-  // the beforeunload guard covers the other unload paths.
+  // the beforeunload guard covers the other unload paths. A locked aligner
+  // (#1045) reloads without saving: the beforeunload guard still asks, and the
+  // crash draft brings the drags back when the verse's aligner reopens.
   const reloadForUpdate = useCallback(() => {
     const reload = () => window.location.reload();
-    if (panelMode === "alignment" && alignmentDirty && alignmentPanelRef.current) {
+    if (
+      panelMode === "alignment" &&
+      alignmentDirty &&
+      !singleAlignerLocked &&
+      alignmentPanelRef.current
+    ) {
       alignmentPanelRef.current.save(() => {
         void outbox.list().then(reload);
       });
     } else {
       reload();
     }
-  }, [panelMode, alignmentDirty]);
+  }, [panelMode, alignmentDirty, singleAlignerLocked]);
   const requestDualAction = useCallback(
     (run: () => void) => {
       if (dualDirty) setPendingDualAction({ run });
@@ -2738,7 +3325,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // stalls the chain, so the verse stays unmarked and the aligner stays put.
   // `verse` is the verse the click started on (captured in the button's
   // render); the guard ignores a second click while this chain still runs,
-  // and cancelling the unalign confirm releases it (cancelAlignmentLoss).
+  // and cancelling the unalign confirm releases it (cancelAlignmentLoss), as
+  // does a reading-line save refused under a book lock (onSaveReading, #1050).
   const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
   const dualSaveDoneAndNext = useCallback(
     (verse: number, next: number) => {
@@ -2782,13 +3370,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // allow entry to the aligner via the Alignment tab either.
       if (mode === "alignment" && editLocked) return;
       runWithDirtyGate(() => {
-        if (mode === "alignment" && !alignerTarget) {
-          setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: "ULT" });
+        if (mode === "alignment") {
+          // Entering from another tab: when exactly one of ULT/UST has
+          // unaligned words on the active verse, open on that one. Both or
+          // neither: keep the last version touched (ULT on a first visit).
+          const needing =
+            panelMode !== "alignment" ? versionNeedingAlignment(data?.verses, activeVerse) : null;
+          if (needing) {
+            setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: needing });
+          } else if (!alignerTarget) {
+            setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: "ULT" });
+          }
         }
         setPanelMode(mode);
       });
     },
-    [runWithDirtyGate, alignerTarget, chapter, activeVerse, editLocked],
+    [runWithDirtyGate, alignerTarget, chapter, activeVerse, editLocked, panelMode, data?.verses],
   );
 
   const dismissPendingNav = useCallback(() => setPendingNav(null), []);
@@ -2836,7 +3433,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // the save must not be queued (e.g. a book lock landed while the confirm
     // was open, #1046). The caller shows its own message.
     refuseCommit?: () => boolean,
+    // See outbox.ts's OutboxOp.alignmentDraftKey (#1071): the aligner panel's
+    // crash-draft key, which on a range row is not the PATCH's verse_start.
+    draftKey?: string,
   ): boolean => {
+    // The row this save targets, kept with a refused save's crash draft (#1074).
+    const draftRow = draftKey ? alignmentDraftRow(base) : undefined;
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
     // predicate lives in guardBlocksSave — DO NOT inline a narrowing such as
@@ -2871,7 +3473,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               bibleVersion,
               expectedVersion,
               { content, plain_text: plainText, alignment_intent: "confirmed_text_edit" },
-              { draftGeneration, alignmentDraftGeneration },
+              { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow },
             );
             onConfirmedApply?.();
           },
@@ -2895,10 +3497,38 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bibleVersion,
       expectedVersion,
       { content, plain_text: plainText, alignment_intent: intent },
-      { draftGeneration, alignmentDraftGeneration },
+      { draftGeneration, alignmentDraftGeneration, alignmentDraftKey: draftKey, alignmentDraftRow: draftRow },
     );
     return true;
   }, [book, pushPipelineToast]);
+
+  // The aligner's "Words will be unaligned" confirm. A lock can land while it
+  // is open (#1071), and committing then resets the panel's baseline and
+  // clears its crash draft for a save that is refused (chapter lock) or
+  // silently dropped (book lock). So "Save anyway" re-checks the live lock
+  // and refuses out loud: nothing is queued, the panel stays dirty with its
+  // crash draft, and a gate's pending nav (afterCommit) does not run.
+  // Mirrors the dual reading line's refuseCommit (#1046).
+  const confirmAlignerUnalign = useCallback(
+    (chapterNum: number, ref: string, lostWords: string[], commit: () => void) =>
+      setPendingAlignmentLoss({
+        ref,
+        lostWords,
+        commit: () => {
+          const lock = alignerLockRef.current(chapterNum);
+          if (lock) {
+            saveDoneGuardRef.current.cancel();
+            pushPipelineToast(
+              `${alignerLockReason(lock)}, so the alignment was not saved. Your changes are kept in the aligner; save them once the lock lifts.`,
+              "error",
+            );
+            return;
+          }
+          commit();
+        },
+      }),
+    [pushPipelineToast],
+  );
 
   // Compute the alignment panel's props from the current chapter cache.
   // Memoized so identity stays stable when the chapter hasn't changed under
@@ -2950,6 +3580,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             undefined,
             undefined,
             draftGeneration,
+            undefined,
+            alignmentDraftKey(book, alignerTarget.chapter, alignerTarget.verse, alignerTarget.bibleVersion),
           );
         }
         // Optimistically fold the new alignment into the local chapter cache so
@@ -2964,11 +3596,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }
       },
       onConfirmUnalign: (lostWords, commit) =>
-        setPendingAlignmentLoss({
-          ref: `${book} ${alignerTarget.chapter}:${targetVerse?.verse ?? alignerTarget.verse} ${alignerTarget.bibleVersion}`,
+        confirmAlignerUnalign(
+          alignerTarget.chapter,
+          `${book} ${alignerTarget.chapter}:${targetVerse?.verse ?? alignerTarget.verse} ${alignerTarget.bibleVersion}`,
           lostWords,
           commit,
-        }),
+        ),
       onCancel: () => {
         setPanelMode("resources");
       },
@@ -3007,6 +3640,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalVerse,
     enqueueVerseSafely,
     alignerLock,
+    confirmAlignerUnalign,
   ]);
 
   // Props for the side-by-side popup: ULT + UST slices against one shared
@@ -3068,6 +3702,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           undefined,
           undefined,
           draftGeneration,
+          undefined,
+          alignmentDraftKey(book, dualTarget.chapter, dualTarget.verse, bibleVersion),
         );
         // Optimistic local update so content-derived UI (the broken-alignment
         // link) refreshes immediately — same as the single-panel aligner.
@@ -3077,11 +3713,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       };
     const confirmUnalign = (bibleVersion: string, row: VerseDto | null) =>
       (lostWords: string[], commit: () => void) =>
-        setPendingAlignmentLoss({
-          ref: `${book} ${dualTarget.chapter}:${row?.verse ?? dualTarget.verse} ${bibleVersion}`,
+        confirmAlignerUnalign(
+          dualTarget.chapter,
+          `${book} ${dualTarget.chapter}:${row?.verse ?? dualTarget.verse} ${bibleVersion}`,
           lostWords,
           commit,
-        });
+        );
     const left: PanelSlot = {
       bibleVersion: "ULT",
       verse: ult.targetVerse,
@@ -3124,7 +3761,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // that), so only the two AlignmentPanels' own save/restore disable.
       locked: alignerLock(dualTarget.chapter),
     };
-  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely, alignerLock]);
+  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse, enqueueVerseSafely, alignerLock, confirmAlignerUnalign]);
 
   // Prev/next verse for the dual aligner's titlebar arrows, within the current
   // chapter's verse list (excluding the intro tile). Null at the ends.
@@ -3164,6 +3801,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <TopBar
           book={book}
           chapter={chapter}
+          backButton={<BackButton onGo={goToSpot} />}
           onNavigate={(b, c, v) => {
             setActiveVerse(v ?? 1);
             setActiveNoteId(null);
@@ -3195,7 +3833,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     kind: "tn" | "tq" | "twl",
     row: T,
     patch: Partial<T>,
-    opts?: { restoredFromVersion?: number },
+    opts?: { restoredFromVersion?: number; opId?: string },
   ) => {
     // Optimistic local apply mirrors what the server will do: any non-revert
     // patch clears the restored_from_version marker so the chip immediately
@@ -3215,7 +3853,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const baseline: Record<string, unknown> = {};
     for (const field of Object.keys(patch)) baseline[field] = rowRecord[field];
     applyLocalRowPatch(kind, row.id, localPatch);
-    void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, { ...opts, book: row.book, baseline });
+    // #1092: tie the op to the draft generation it saves, so its 200 cannot
+    // clear typing that arrives while it is in flight.
+    const draftGeneration = drafts.rowSaveGeneration(draftRowKey(kind, row.book, row.id));
+    return outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, {
+      ...opts,
+      book: row.book,
+      baseline,
+      draftGeneration,
+    });
   };
 
   // Draft-write path. Every keystroke in a verse-text cell calls this; it
@@ -3267,7 +3913,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     bibleVersion: string,
     plain: string,
     base: VerseDto,
-    afterCommit?: () => void,
+    // `queued: false` marks the no-op path below: nothing was queued, so a
+    // reading line ends its pin hold as a clean line does (#1060).
+    afterCommit?: (outcome?: { queued: boolean }) => void,
     // #1046: re-checked at the point of commit (after the draft lookup, and
     // again on the collateral-loss confirm's "Save anyway"). True refuses the
     // save: nothing is queued or applied and afterCommit does not run.
@@ -3302,6 +3950,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // leaves an orphaned draft (dirty border + SyncStatusBar entry + "unsaved
     // edits" toast whose Save button re-hits this guard and never resolves).
     if (oldEditable === normalizeEditable(plain)) {
+      // The pin as of this no-op: a pin taken or handed on after it (a new
+      // keystroke, a save queued meanwhile) is not this release's to drop.
+      const epoch = pinEpoch(key);
       void drafts
         .get(key)
         .then((draft) => {
@@ -3313,12 +3964,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           // pin then poisons every later save of this verse (#563). IfIdle:
           // a keystroke landing while this get() was in flight re-pins the
           // session synchronously, and that pin must survive.
-          else if (!draft) unpinVerseBaseIfIdle(key);
+          else if (!draft) unpinVerseBaseIfIdle(key, epoch);
         })
         .catch(() => {
           /* conservative: leave an unreadable draft in place */
         });
-      afterCommit?.();
+      afterCommit?.({ queued: false });
       return;
     }
     // `plain` is raw DOM textContent, so the dropped-marker-chip guard applies
@@ -3343,23 +3994,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       (result.content as { verseObjects?: unknown[] } | null)?.verseObjects,
     );
     const newlyUnaligned = afterUnaligned - beforeUnaligned;
-    if (newlyUnaligned > 0) {
-      pushPipelineToast(
-        `This edit left ${newlyUnaligned} word${newlyUnaligned > 1 ? "s" : ""} unaligned in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — re-align in the Alignment panel.`,
-        "info",
-      );
-    }
-    // The editor handed back text with none of its paragraph/poetry marks and
-    // no word changed, so the engine restored them rather than wipe the verse's
-    // lineation (#606). That is the right call for a dropped-chip capture, but
-    // it also overrides a translator who genuinely meant to remove every mark in
-    // the same save — so say so, and name the way to do it.
-    if (result.markerCaptureGuarded) {
-      pushPipelineToast(
-        `Paragraph and poetry marks were restored in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — the editor lost them during this edit. To remove them on purpose, delete the marks in a save of their own.`,
-        "info",
-      );
-    }
+    // Both notices describe a save that goes ahead, so they run only once it
+    // is queued: never ahead of a refusal or a cancelled confirm (#1050).
+    const notifyQueued = () => {
+      if (newlyUnaligned > 0) {
+        pushPipelineToast(
+          `This edit left ${newlyUnaligned} word${newlyUnaligned > 1 ? "s" : ""} unaligned in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — re-align in the Alignment panel.`,
+          "info",
+        );
+      }
+      // The editor handed back text with none of its paragraph/poetry marks and
+      // no word changed, so the engine restored them rather than wipe the verse's
+      // lineation (#606). That is the right call for a dropped-chip capture, but
+      // it also overrides a translator who genuinely meant to remove every mark in
+      // the same save — so say so, and name the way to do it.
+      if (result.markerCaptureGuarded) {
+        pushPipelineToast(
+          `Paragraph and poetry marks were restored in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — the editor lost them during this edit. To remove them on purpose, delete the marks in a save of their own.`,
+          "info",
+        );
+      }
+    };
     const newPlainText = extractPlainText(result.content);
     const newDto = {
       ...effectiveBase,
@@ -3383,6 +4038,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // also run afterCommit, since that path never reaches the `applyLocal();
       // afterCommit?.();` below.
       const onConfirmedApply = () => {
+        notifyQueued();
         applyLocal();
         afterCommit?.();
       };
@@ -3390,6 +4046,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, onConfirmedApply, draftGeneration, undefined, refuseCommit)) {
         return;
       }
+      notifyQueued();
       applyLocal();
       afterCommit?.();
     };
@@ -3606,6 +4263,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       <TopBar
         book={book}
         chapter={chapter}
+        backButton={<BackButton onGo={goToSpot} />}
         onNavigate={(b, c, v) => {
           runWithDirtyGate(() => {
             setActiveVerse(v ?? 1);
@@ -3771,7 +4429,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           {formatRelative(b.startedAt)}. Editing is locked for{" "}
           {b.resources.join(", ")} in this chapter; everything else stays
           editable.
-          {b.resources.includes("notes")
+          {b.resources.some((r) => r.startsWith("notes"))
             ? " You can still mark notes to keep before the new set lands."
             : ""}
         </Alert>
@@ -3977,6 +4635,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onScrollToNoteMatch={focusNoteMatch}
           onNoteQueryChange={setFindNoteQuery}
           onActiveNoteMatchChange={setActiveNoteMatch}
+          searchQuestions={getSearchQuestions}
+          onScrollToQuestionMatch={focusQuestionMatchSwitching}
+          onQuestionQueryChange={setFindQuestionQuery}
+          onActiveQuestionMatchChange={setActiveQuestionMatch}
+          isQuestionLocked={isQuestionLocked}
+          onReplaceQuestion={(row, patch) => {
+            // Find/replace on a translation question rewrites question /
+            // response only. Same path as onReplaceNote: enqueueRow carries the
+            // live row version as If-Match; the book cache is patched too so a
+            // cross-chapter row updates in book view. Not onQuestionSave —
+            // that one is active-chapter only.
+            enqueueRow("tq", row, patch);
+            bookHook?.applyLocalRowPatch("tq", row.chapter, row.id, {
+              ...patch,
+              restored_from_version: null,
+            });
+          }}
           lexiconMap={lexiconMap}
           twl={data.twl}
           locked={Boolean(chapterLocks.verse)}
@@ -4030,6 +4705,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeQuestionId={activeQuestionId}
           findNoteQuery={findNoteQuery}
           activeNoteMatch={activeNoteMatch}
+          findQuestionQuery={findQuestionQuery}
+          activeQuestionMatch={activeQuestionMatch}
           scrollNonce={scrollNonce}
           jumpTab={jumpTab}
           onNoteChange={(id, patch) => {
@@ -4096,7 +4773,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
                   nfc(res.quote) !== nfc(r.quote ?? "") || res.note !== (r.note ?? "");
                 if (!changed) return;
                 applyLocalRowPatch("tn", r.id, patch);
-                void outbox.enqueueRow("tn", r.id, r.version, patch, { book: r.book });
+                // #1092: record the draft this save carries (usually none),
+                // so its 200 keeps typing that arrives while it is in flight.
+                void outbox.enqueueRow("tn", r.id, r.version, patch, {
+                  book: r.book,
+                  draftGeneration: drafts.rowSaveGeneration(draftRowKey("tn", r.book, r.id)),
+                });
               },
             });
           }}
@@ -4177,6 +4859,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               sort_order,
             }));
             applyLocalRowInsert("tn", created);
+            // A new row can add lint flags (a blank note is one). The room's
+            // row.upserted echo also re-lints, but only while the socket is up;
+            // the HTTP response is the source of truth (#1143).
+            scheduleLintRefetch(created.chapter);
             setActiveNoteId(created.id);
             setActiveWordId(null);
             setActiveQuestionId(null);
@@ -4200,6 +4886,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               sort_order,
             }));
             applyLocalRowInsert("tn", created, { afterId: refId });
+            scheduleLintRefetch(created.chapter);
             setActiveNoteId(created.id);
             setActiveWordId(null);
             setActiveQuestionId(null);
@@ -4248,8 +4935,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
                     : `${chapter}:${verse}`;
             const effectiveVerse = chapter === 0 ? 0 : verse;
             if (row.verse === effectiveVerse && row.ref_raw === ref_raw) return;
+            // #1165: the server refuses a move into a verse-range run's verses
+            // (the run would sweep the moved note). The picker leaves them out;
+            // this catches a picker opened before the run's lock arrived.
+            if (effectiveVerse !== row.verse && tnMoveBlocked(effectiveVerse)) {
+              pushPipelineToast(
+                `Can't move the note to v${effectiveVerse} while the AI notes run for those verses is in progress.`,
+                "error",
+              );
+              return;
+            }
             const sort_order = pickSortOrder(sortedForVerse(tn, effectiveVerse), null, "after");
-            enqueueRow("tn", row, { verse: effectiveVerse, ref_raw, sort_order });
+            // #1174: remember the op as this tab's, so a refusal drained by
+            // another tab is rolled back here too. Marked before it is queued:
+            // another tab can drain and relay it before the put resolves here.
+            enqueueOwnTnMove(tnMoveRelay, crypto.randomUUID(), (opId) =>
+              enqueueRow("tn", row, { verse: effectiveVerse, ref_raw, sort_order }, { opId }),
+            ).catch((e) => console.error("Shell: could not queue the note move", e));
             // Follow the note to its new verse: the resource column only renders
             // notes in displayVerseRange, so without this the moved card vanishes
             // from view. Navigating there confirms the move landed. Must match
@@ -4286,6 +4988,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               sort_order,
             }));
             applyLocalRowInsert("twl", created);
+            scheduleLintRefetch(created.chapter);
             setActiveWordId(created.id);
             setActiveNoteId(null);
             setActiveQuestionId(null);
@@ -4392,6 +5095,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               response: "",
             }));
             applyLocalRowInsert("tq", created);
+            scheduleLintRefetch(created.chapter);
             setActiveQuestionId(created.id);
             setActiveNoteId(null);
             setActiveWordId(null);
@@ -4410,10 +5114,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onWordDelete={(id) => {
             const row = data.twl.find((r) => r.id === id);
-            if (!row) return;
+            // Read-only (viewer, locked book): the outbox would not queue the
+            // DELETE, so hiding the row would only fake it (#1147 item 4).
+            if (!row || isReadOnly()) return;
             applyLocalRowDelete("twl", id);
             if (activeWordId === id) setActiveWordId(null);
-            void outbox.enqueueDeleteRow("twl", id, row.version, row.book);
+            const click = markOwnRowDelete("twl", row.book, id); // a refetch keeps it hidden (#1107)
+            lintDeletedRowChapter.current.set(`twl:${row.book}:${id}`, row.chapter); // #1135
+            // No op queued: drop the click's mark so a load doesn't hide the row (#1126 item 9).
+            void outbox
+              .enqueueDeleteRow("twl", id, row.version, row.book)
+              .then(
+                (op) => recordOwnRowDeleteClickOp(op, click),
+                (e) => {
+                  console.error("Shell: could not queue the word-link delete", e);
+                  dropOwnRowDeleteClick({ rowKind: "twl", book: row.book, id }, click);
+                },
+              );
           }}
           onQuestionSave={(id, patch, opts) => {
             const row = data.tq.find((r) => r.id === id);
@@ -4421,12 +5138,25 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onQuestionDelete={(id) => {
             const row = data.tq.find((r) => r.id === id);
-            if (!row) return;
+            if (!row || isReadOnly()) return; // as for a word link (#1147 item 4)
             applyLocalRowDelete("tq", id);
             if (activeQuestionId === id) setActiveQuestionId(null);
-            void outbox.enqueueDeleteRow("tq", id, row.version, row.book);
+            const click = markOwnRowDelete("tq", row.book, id); // a refetch keeps it hidden (#1107)
+            lintDeletedRowChapter.current.set(`tq:${row.book}:${id}`, row.chapter); // #1135
+            // No op queued: drop the click's mark so a load doesn't hide the row (#1126 item 9).
+            void outbox
+              .enqueueDeleteRow("tq", id, row.version, row.book)
+              .then(
+                (op) => recordOwnRowDeleteClickOp(op, click),
+                (e) => {
+                  console.error("Shell: could not queue the question delete", e);
+                  dropOwnRowDeleteClick({ rowKind: "tq", book: row.book, id }, click);
+                },
+              );
           }}
           lockedTn={Boolean(chapterLocks.tn)}
+          tnVerseLocked={tnVerseLocked}
+          tnMoveBlocked={tnMoveBlocked}
           lockedTq={Boolean(chapterLocks.tq)}
           // bookLocked, not editLocked: NoteCard reads readOnly at unmount to
           // decide whether to discard an abandoned blank stub, and the stale
@@ -4489,77 +5219,121 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <DialogTitle>Unsaved alignment changes</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            You have unsaved changes in the alignment editor. Save them before switching
-            verses, discard them, or cancel to stay here.
+            {singleAlignerLocked
+              ? `${alignerLockReason(singleAlignerLocked)}, so your alignment changes can't be saved right now. They are kept here: stay on this verse and save them once the lock lifts.`
+              : "You have unsaved changes in the alignment editor. Save them before switching verses, discard them, or cancel to stay here."}
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={dismissPendingNav}>Cancel</Button>
-          <Button color="error" onClick={() => resolvePendingNav("discard")}>
-            Discard
-          </Button>
-          <Button variant="contained" onClick={() => resolvePendingNav("save")}>
-            Save
-          </Button>
+          {/* #1045: no Save or Discard while locked; see singleAlignerLocked. */}
+          {singleAlignerLocked ? (
+            <Button variant="contained" onClick={dismissPendingNav}>
+              Keep editing
+            </Button>
+          ) : (
+            <>
+              <Button onClick={dismissPendingNav}>Cancel</Button>
+              <Button color="error" onClick={() => resolvePendingNav("discard")}>
+                Discard
+              </Button>
+              <Button variant="contained" onClick={() => resolvePendingNav("save")}>
+                Save
+              </Button>
+            </>
+          )}
         </DialogActions>
       </Dialog>
       {dualAlignerProps && (
-        <SideBySideAligner
-          open
-          onClose={requestCloseDual}
-          book={dualAlignerProps.book}
-          chapter={dualAlignerProps.chapter}
-          verseNum={dualAlignerProps.verseNum}
-          vref={dualAlignerProps.vref}
-          sourceLabel={dualAlignerProps.sourceLabel}
-          sourceVerse={dualAlignerProps.sourceVerse}
-          twlForVerse={dualAlignerProps.twlForVerse}
-          lexiconMap={lexiconMap}
-          left={dualAlignerProps.left}
-          right={dualAlignerProps.right}
-          locked={dualAlignerProps.locked}
-          onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
-          onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
-          onSaveDoneAndNext={
-            dualNav.next != null && textLaneCheck.canCheck && !dualAlignerProps.locked
-              ? () => dualSaveDoneAndNext(dualAlignerProps.verseNum, dualNav.next!)
-              : undefined
+        <Suspense
+          // #939 review (A1): before lazy-loading, SideBySideAligner's Dialog
+          // mounted synchronously and blocked the single AlignmentPanel behind
+          // it immediately. A null fallback instead leaves that panel visible
+          // and interactive while the chunk downloads — drags made in that
+          // window, followed by a same-verse save in the dual aligner once it
+          // mounts, hit AlignmentPanel's sync-effect full reset (AlignmentPanel
+          // .tsx) and are silently dropped. A blocking Backdrop closes the
+          // window the same way the eager Dialog used to: nothing in the
+          // single panel is reachable until the real dual-aligner Dialog
+          // replaces it.
+          fallback={
+            <Backdrop open sx={{ color: "#fff", zIndex: (theme) => theme.zIndex.modal + 1 }}>
+              <CircularProgress color="inherit" />
+            </Backdrop>
           }
-          // Lane checks live on the loaded chapter's useChapter state; only
-          // wire when the dual popup is on that same chapter (verse arrows
-          // already no-op across chapters for the same reason).
-          textCheck={
-            dualAlignerProps.chapter === chapter ? textLaneCheck : undefined
-          }
-          onSaveReading={(bv, plain, base, afterCommit) => {
-            // #1046: the reading line locks once a book lock lands, but an
-            // edit typed before it can still reach here through the close /
-            // verse-nav gate's Save, and a save already under way can see the
-            // lock land during its draft lookup or its "Words will be
-            // unaligned" confirm. The outbox would drop it silently
-            // (read-only mode), so refuse it out loud instead, now and again
-            // at the point of commit, and skip afterCommit: the line stays
-            // dirty and the gate's close/nav does not run. The message names
-            // Discard, not Undo: Undo is hidden while that side also has
-            // unsaved alignment drags.
-            const refuseIfBookLocked = () => {
-              if (!bookLockedRef.current) return false;
-              pushPipelineToast(
-                `This book is locked, so the ${bv} reading-text edit was not saved. To drop it, close the aligner and choose Discard.`,
-                "error",
-              );
-              return true;
-            };
-            if (refuseIfBookLocked()) return;
-            // base.verse, not verseNum — each side's row may start at a
-            // different verse (ULT v7 singleton vs UST 6-9 range row).
-            // afterCommit threads through so ReadingLineHandle.save (and thus
-            // the resolveDualAction save chain, #490) only proceeds once this
-            // actually lands — synchronously, or after the collateral-loss
-            // confirm's "Save anyway".
-            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit, refuseIfBookLocked);
-          }}
-        />
+        >
+          <SideBySideAligner
+            open
+            onClose={requestCloseDual}
+            book={dualAlignerProps.book}
+            chapter={dualAlignerProps.chapter}
+            verseNum={dualAlignerProps.verseNum}
+            vref={dualAlignerProps.vref}
+            sourceLabel={dualAlignerProps.sourceLabel}
+            sourceVerse={dualAlignerProps.sourceVerse}
+            twlForVerse={dualAlignerProps.twlForVerse}
+            lexiconMap={lexiconMap}
+            left={dualAlignerProps.left}
+            right={dualAlignerProps.right}
+            locked={dualAlignerProps.locked}
+            onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
+            onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
+            onSaveDoneAndNext={
+              dualNav.next != null && textLaneCheck.canCheck && !dualAlignerProps.locked
+                ? () => dualSaveDoneAndNext(dualAlignerProps.verseNum, dualNav.next!)
+                : undefined
+            }
+            // Lane checks live on the loaded chapter's useChapter state; only
+            // wire when the dual popup is on that same chapter (verse arrows
+            // already no-op across chapters for the same reason).
+            textCheck={
+              dualAlignerProps.chapter === chapter ? textLaneCheck : undefined
+            }
+            onSaveReading={(bv, plain, base, afterCommit) => {
+              // #1046: the reading line locks once a book lock lands, but an
+              // edit typed before it can still reach here through the close /
+              // verse-nav gate's Save, and a save already under way can see the
+              // lock land during its draft lookup or its "Words will be
+              // unaligned" confirm. The outbox would drop it silently
+              // (read-only mode), so refuse it out loud instead, now and again
+              // at the point of commit, and skip afterCommit: the line stays
+              // dirty and the gate's close/nav does not run. The message names
+              // Discard, not Undo: Undo is hidden while that side also has
+              // unsaved alignment drags.
+              //
+              // A refusal stalls any save chain this save is part of for good,
+              // so it also frees the "save, mark done, next" button's in-flight
+              // guard, as cancelling the unalign confirm does (#1050). The pin
+              // needs nothing here: the line's hold (#1060) keeps it while the
+              // edit stays on screen and releases it when the line goes clean.
+              const refuseIfBookLocked = () => {
+                if (!bookLockedRef.current) return false;
+                saveDoneGuardRef.current.cancel();
+                pushPipelineToast(
+                  `This book is locked, so the ${bv} reading-text edit was not saved. To drop it, close the aligner and choose Discard.`,
+                  "error",
+                );
+                return true;
+              };
+              if (refuseIfBookLocked()) return;
+              // base.verse, not verseNum — each side's row may start at a
+              // different verse (ULT v7 singleton vs UST 6-9 range row).
+              // afterCommit threads through so ReadingLineHandle.save (and thus
+              // the resolveDualAction save chain, #490) only proceeds once this
+              // actually lands — synchronously, or after the collateral-loss
+              // confirm's "Save anyway".
+              saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit, refuseIfBookLocked);
+            }}
+            // #1060: the reading line writes no draft, so it holds the verse
+            // base itself from its first dirty keystroke; saveVerseDraft's
+            // pinVerseBase above then finds that pin instead of pinning the
+            // version on screen at Save time. Same key as the save.
+            onHoldReadingBase={(bv, base) =>
+              holdVerseBaseForEditor(verseKey(book, dualAlignerProps.chapter, base.verse, bv), base)
+            }
+            // #1075: a bridge or split under unsaved work dropped it; say so.
+            onUnsavedDropped={(message) => pushPipelineToast(message, "error")}
+          />
+        </Suspense>
       )}
       <Dialog open={!!pendingAlignmentLoss} onClose={cancelAlignmentLoss}>
         <DialogTitle>
@@ -4605,18 +5379,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <DialogTitle>Unsaved changes</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            You have unsaved changes in the side-by-side aligner (alignment edits or reading text).
-            Save them, discard them, or cancel to keep editing.
+            {dualAlignmentLocked
+              ? `${alignerLockReason(dualAlignmentLocked)}, so your alignment changes can't be saved right now. They are kept here: stay on this verse and save them once the lock lifts.`
+              : "You have unsaved changes in the side-by-side aligner (alignment edits or reading text). Save them, discard them, or cancel to keep editing."}
           </DialogContentText>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setPendingDualAction(null)}>Cancel</Button>
-          <Button color="error" onClick={() => resolveDualAction("discard")}>
-            Discard
-          </Button>
-          <Button variant="contained" onClick={() => resolveDualAction("save")}>
-            Save
-          </Button>
+          {/* #1045: no Save or Discard while locked; see dualAlignmentLocked. */}
+          {dualAlignmentLocked ? (
+            <Button variant="contained" onClick={() => setPendingDualAction(null)}>
+              Keep editing
+            </Button>
+          ) : (
+            <>
+              <Button onClick={() => setPendingDualAction(null)}>Cancel</Button>
+              <Button color="error" onClick={() => resolveDualAction("discard")}>
+                Discard
+              </Button>
+              <Button variant="contained" onClick={() => resolveDualAction("save")}>
+                Save
+              </Button>
+            </>
+          )}
         </DialogActions>
       </Dialog>
       <Snackbar

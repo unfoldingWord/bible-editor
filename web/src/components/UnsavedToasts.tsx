@@ -40,6 +40,11 @@ export function UnsavedToasts({ book, onSaveVerseDraft, onJumpTo }: Props) {
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState(false);
 
+  // NOT subscribeDirtyDrafts: offscreenDrafts below matches a draft's
+  // CURRENT `generation` against in-flight outbox ops
+  // (verseDraftHasActiveSave), and a generation changes on every keystroke
+  // without changing the key set — exactly what that dedup would freeze.
+  // See #901's review (2026-10-02).
   useEffect(() => drafts.subscribe(setDraftList), []);
   useEffect(() => outbox.subscribe(setOps), []);
 

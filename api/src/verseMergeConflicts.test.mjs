@@ -56,8 +56,21 @@
 // SQL, and tests the pure grouping logic directly (no D1 needed) — same
 // split as chapterLock.test.mjs.
 
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { raiseVerseMergeConflictAlert, retireVerseKeptAiMasterFlags, resolveConvergedVerseMergeConflicts } from "./verseMergeConflicts.ts";
+import { fileURLToPath } from "node:url";
+import { reviewConditionKey, verseMergeEditorConditionKey } from "./reviewAlerts.ts";
+import {
+  confirmAdoptedConflicts,
+  deleteLostAdoptionConflicts,
+  raiseVerseMergeConflictAlert,
+  recordVerseMergeConflicts,
+  resolveConvergedVerseMergeConflicts,
+  retireVerseKeptAiMasterFlags,
+  rollBackDeadAttemptConflicts,
+  settleLandedConflictStmt,
+} from "./verseMergeConflicts.ts";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
@@ -75,7 +88,9 @@ import {
 } from "./verseMergeEditorAlerts.ts";
 import {
   CONFIRM_ADOPTED_CONFLICT_SQL,
-  DELETE_LOST_ADOPTION_CONFLICT_SQL,
+  DELETE_SPECULATIVE_CONFLICTS_SQL,
+  RESTORE_SPECULATIVE_CONFLICTS_SQL,
+  SETTLE_SPECULATIVE_CONFLICTS_SQL,
   RESOLVE_VERSE_MERGE_CONFLICT_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
   CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
@@ -190,30 +205,127 @@ function assert(cond, msg) {
 
 {
   // Issue #633 / #788 admin guidance: same text-side vs alignment distinction.
-  const w = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_wording" }]);
+  // overwrittenVersion is a real pointer in each case: all of these are
+  // overwrites that actually replaced text (see the #981 block below for the
+  // pointer-less case).
+  const w = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_wording", overwrittenVersion: 1 }]);
   assert(w.includes("The wording changed."), "admin wording-only names wording");
   assert(w.includes("replaced text is still"), "admin wording-only keeps text recovery");
 
-  const p = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_punctuation" }]);
+  const p = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_punctuation", overwrittenVersion: 1 }]);
   assert(p.includes("The punctuation changed (the wording did not)."), "admin punctuation-only names punctuation");
   assert(p.includes("previous punctuation is still"), "admin punctuation-only keeps punctuation recovery");
 
-  const a = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_alignment" }]);
+  const a = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_alignment", overwrittenVersion: 1 }]);
   assert(a.includes("The alignment changed (the wording and punctuation did not)."), "admin alignment-only names alignment");
   assert(a.includes("previous alignment is still"), "admin alignment-only recovers alignment");
   assert(!a.includes("replaced text"), "admin alignment-only must not claim replaced text");
 
-  const legacy = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed" }]);
+  const legacy = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 1 }]);
   assert(legacy.includes("The wording and alignment changed."), "legacy both_changed keeps its original two-axis meaning");
   assert(!legacy.includes("punctuation"), "legacy both_changed does not invent a punctuation claim");
 
-  const prototypeKey = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "__proto__" }]);
+  const prototypeKey = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "__proto__", overwrittenVersion: 1 }]);
   assert(prototypeKey.includes("The wording and alignment changed."), "prototype-key reason takes the fail-safe warning");
 
   // adopt_no_visible_change is not alertable — if it somehow reached guidance
   // it is not an adopt_conflict, so it must not count as an overwrite.
-  const silent = buildMergeConflictGuidance([{ action: "adopt_no_visible_change", reason: "both_changed_no_visible" }]);
+  const silent = buildMergeConflictGuidance([{ action: "adopt_no_visible_change", reason: "both_changed_no_visible", overwrittenVersion: null }]);
   assert(!silent.includes("took Door43's version"), "no-visible-change action is not an overwrite sentence");
+}
+
+{
+  // Issue #981: the #539 no-op guard (bookReimport.ts ~7609-7674) keeps a
+  // conflicted byte no-op as `adopt_conflict` with `overwrittenVersion`
+  // cleared to null, so the review banner still lists it. Per that guard's
+  // own comment, a surviving pointer-less row is never "D1 already matched
+  // Door43" — #977 already drops the case where master's arriving bytes
+  // differ from D1 only in Hebrew mark order, so a row that gets here had
+  // master's bytes differ from D1 by more; the final match happens because
+  // canonizeAlignmentSource (canonizeHebrew.ts) maps master's \zaln-s
+  // content/lemma onto D1's bytes. That mapping falls through looser tiers
+  // too (stripped marks, word-joiner fold), so master's incoming copy could
+  // be the WORSE one (under-pointed, cantillation-stripped, an older UHB
+  // alignment) — the admin sentence must not call this an overwrite, must
+  // not point at a missing @v, must not claim D1 already matched Door43, and
+  // (2026-10-02 sweep, round 2) must NOT assert which side is right either:
+  // no "Door43's fix" / D1's "stale" bytes framing, just that the two copies
+  // differ on \zaln-s content/lemma and a human has to judge which is right.
+  const pointerless = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
+  ]);
+  assert(!pointerless.includes("took Door43's version over the editor's"), "pointer-less adopt_conflict is not an overwrite");
+  assert(
+    !pointerless.includes("the version number given after @v"),
+    "pointer-less adopt_conflict does not claim a recovery version number exists",
+  );
+  assert(!pointerless.includes("D1 already matched Door43"), "pointer-less adopt_conflict must not claim D1 already matched Door43");
+  assert(!pointerless.includes("Door43's fix"), "pointer-less adopt_conflict must not assume Door43 holds the correct side");
+  assert(!pointerless.includes("stale"), "pointer-less adopt_conflict must not assume D1 holds the stale side");
+  assert(!pointerless.includes("morphology"), "pointer-less adopt_conflict must not claim morph changed — canonizeAlignmentSource only rewrites content/lemma");
+  assert(
+    pointerless.includes(
+      "1 was flagged for review but no app text was replaced (3:4) — Door43's copy differs from the app's " +
+        "only in the original-language source attributes on \\zaln-s (x-content / x-lemma)",
+    ),
+    "pointer-less adopt_conflict states only what was measured, naming its OWN ref (3:4) inline",
+  );
+  assert(pointerless.includes("check which side is right"), "pointer-less adopt_conflict leaves the judgment call to a human");
+
+  // Issue #981, round 3: "the ref above with no @v" does not uniquely pick
+  // out a pointer-less adopt_conflict row — keep_alignment_refused /
+  // source_attr_divergent / keep_local_structure rows are stored with
+  // overwritten_version NULL too (verseMergeConflictSql.ts's
+  // SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL), so buildGroupedRefsClause prints
+  // THEM without @v as well. A keep_alignment_refused ref sitting beside a
+  // pointer-less adopt_conflict ref must not be swept into "Door43's copy
+  // differs only in source attributes" — that's a live, unresolved Door43
+  // change, not a source-attribute no-op.
+  const ambiguous = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
+    { action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, chapter: 5, verse: 2 },
+  ]);
+  assert(
+    ambiguous.includes("no app text was replaced (3:4)"),
+    "the pointer-less clause names only its own ref (3:4), not the keep_alignment_refused ref beside it",
+  );
+  assert(
+    !ambiguous.includes("5:2) —") && !/\(3:4, 5:2\)/.test(ambiguous),
+    "5:2 (a live kept-alignment refusal) must never be folded into the source-attributes-only clause",
+  );
+
+  // A row WITH a pointer still reads as an overwrite and still gives the @v
+  // recovery sentence, even mixed with a pointer-less row in the same run.
+  const mixed = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 4, chapter: 1, verse: 1 },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
+  ]);
+  assert(mixed.includes("1 took Door43's version over the editor's"), "pointered row still counts as an overwrite");
+  assert(mixed.includes("at the version number given after @v in its ref above"), "pointered row keeps its @v recovery sentence");
+  assert(
+    mixed.includes("1 was flagged for review but no app text was replaced (3:4)"),
+    "pointer-less row in the same run still gets its own clause, naming only its own ref",
+  );
+
+  // Plural agreement: two pointer-less rows read "were", list both refs, and
+  // cap/"+N more" like the shared ref clause does.
+  const twoPointerless = buildMergeConflictGuidance([
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 3, verse: 4 },
+    { action: "adopt_conflict", reason: "both_changed", overwrittenVersion: null, chapter: 6, verse: 1 },
+  ]);
+  assert(
+    twoPointerless.includes("2 were flagged for review but no app text was replaced (3:4, 6:1) —"),
+    "two pointer-less rows agree as 'were' and list both their own refs",
+  );
+
+  // overwrittenVersion omitted entirely (an untyped caller) reads the same as
+  // an explicit null — loose equality, matching buildGroupedRefsClause's own
+  // `!= null` convention, so an untyped row never silently becomes an
+  // overwrite it cannot point a @v at. No chapter/verse here either: the ref
+  // clause degrades to naming no refs rather than guessing.
+  const omitted = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed" }]);
+  assert(!omitted.includes("took Door43's version over the editor's"), "omitted overwrittenVersion is treated as pointer-less, not as an overwrite");
+  assert(omitted.includes("1 was flagged for review but no app text was replaced"), "omitted overwrittenVersion gets the pointer-less clause");
 }
 
 {
@@ -283,6 +395,129 @@ function assert(cond, msg) {
   const noBase = [{ chapter: 4, verse: 4, version: 1 }];
   const grouped = groupNoBaseVersesByEditor("MIC", "ult", noBase, new Map());
   assert(grouped.size === 0, "no username found -> no alert entry");
+}
+
+{
+  // Issue #1006 (ZEC UST 1:6, system_alerts 1305). A locked book is skipped by
+  // the export (exportWorkflow.ts, `book_locked:*`), so the translator's
+  // keep_no_base alert must not claim tonight's export will overwrite their
+  // text, and must not name re-saving as the remedy: a locked book's verses
+  // cannot be saved here, and nothing from it is exported anyway.
+  const noBase = [{ chapter: 1, verse: 6, version: 2 }];
+  const usernameByKey = new Map([
+    [editLogKey("ZEC", "ust", { chapter: 1, verse: 6, overwrittenVersion: 2 }), "deferredreward"],
+  ]);
+  const locked = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey, true).get("deferredreward");
+  assert(!!locked, "locked book: the editor is still told about the verse");
+  assert(!/tonight's export/i.test(locked.message), "locked book: no claim that tonight's export overwrites anything");
+  assert(!/re-?sav/i.test(locked.message), "locked book: re-saving is not named as the remedy");
+  assert(/locked/i.test(locked.message), "locked book: says the book is locked");
+  assert(/admin/i.test(locked.message), "locked book: names asking an admin as the remedy");
+  assert(locked.message.includes("Nothing has been overwritten"), "locked book: still denies an overwrite");
+  assert(alertMessageCarriesNoBaseWarning(locked.message), "locked book: keeps the no-base fingerprint");
+  assert(locked.message.includes("ZEC UST: 1:6"), "locked book: still names the verse");
+
+  // Unlocked wording is unchanged, byte for byte, whether the flag is omitted
+  // or passed false.
+  const unlockedText =
+    "Door43's sync could not tell whether your edit or a Door43-side edit is newer, for 1 verse(s) you last " +
+    "edited in ZEC UST: 1:6 — no earlier version was recoverable to compare against, so it kept your version " +
+    "for now. Nothing has been overwritten — but if Door43 has changed it since, tonight's export will still " +
+    "overwrite your text there unless you open and re-save the verse here first.";
+  const omitted = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey).get("deferredreward");
+  const explicit = groupNoBaseVersesByEditor("ZEC", "ust", noBase, usernameByKey, false).get("deferredreward");
+  assert(omitted.message === unlockedText, "unlocked (flag omitted): wording unchanged");
+  assert(explicit.message === unlockedText, "unlocked (flag false): wording unchanged");
+}
+
+{
+  // Issue #1006, admin side: buildNoBaseSentence / buildMergeConflictGuidance
+  // carry the same false "tonight's export" claim for a locked book.
+  const locked = buildMergeConflictGuidance([], { noBaseCount: 1, noBaseRefs: ["1:6"], noBaseBookLocked: true });
+  assert(!/tonight's export/i.test(locked), "locked book (admin): no claim that tonight's export overwrites anything");
+  assert(!/re-?sav/i.test(locked), "locked book (admin): re-saving is not named as the remedy");
+  assert(/locked/i.test(locked), "locked book (admin): says the book is locked");
+  assert(/admin/i.test(locked), "locked book (admin): says an admin reconciles it");
+  assert(locked.includes("Nothing was overwritten"), "locked book (admin): still denies an overwrite");
+  assert(locked.includes("Verses (sample): 1:6."), "locked book (admin): still names the verse");
+  assert(locked.includes(NO_BASE_ADMIN_FINGERPRINT), "locked book (admin): keeps the no-base fingerprint");
+  assert(buildNoBaseSentence(1, ["1:6"], true) === locked, "the guidance passes the lock through to buildNoBaseSentence");
+
+  const unlockedText =
+    "1 verse(s) could not be adjudicated: no ancestor was recoverable for them from before this book+resource's " +
+    "master-confirmed watermark, so the sync could not tell which side changed, and so it kept the app's " +
+    "version. Verses (sample): 1:6. Nothing was overwritten in these — but a Door43-side change to them will " +
+    "still be overwritten by tonight's export.";
+  assert(buildNoBaseSentence(1, ["1:6"]) === unlockedText, "unlocked (flag omitted): admin wording unchanged");
+  assert(buildNoBaseSentence(1, ["1:6"], false) === unlockedText, "unlocked (flag false): admin wording unchanged");
+  assert(
+    buildMergeConflictGuidance([], { noBaseCount: 1, noBaseRefs: ["1:6"], noBaseBookLocked: false }) === unlockedText,
+    "unlocked guidance: wording unchanged",
+  );
+}
+
+{
+  // Issue #1110: on a locked book with keep_no_base AND kept rows
+  // (keep_alignment_refused, source_attr_divergent), #1006's "the export skips
+  // it" sentence sat beside older sentences that still said tonight's export
+  // will write. A locked book is not exported, so none may say so.
+  const rows = [
+    { action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, chapter: 1, verse: 8 },
+    { action: "source_attr_divergent", reason: "source_attr_ambiguous", overwrittenVersion: null, chapter: 1, verse: 9 },
+  ];
+  const opts = { noBaseCount: 1, noBaseRefs: ["1:6"] };
+  const locked = buildMergeConflictGuidance(rows, { ...opts, noBaseBookLocked: true, bookLocked: true });
+  assert(!/tonight's export/i.test(locked), `locked book (kept rows + no-base): no sentence claims tonight's export writes (got: ${locked})`);
+  assert(locked.includes("1 kept the editor's version because adopting Door43's would have cost alignment"),
+    "locked book: the alignment-refused verse is still reported");
+  assert(locked.includes("1 kept D1 because Door43's original-language source fix"),
+    "locked book: the source-attr verse is still reported");
+  assert((locked.match(/this book is locked/g) ?? []).length === 3, "locked book: each kept sentence names the lock");
+
+  // Unlocked: byte-identical to the wording before this change.
+  const unlockedText =
+    "1 kept the editor's version because adopting Door43's would have cost alignment — Door43's change has NOT " +
+    "been taken, so tonight's export will still write over it until someone resolves it. 1 kept D1 because " +
+    "Door43's original-language source fix (the spelling/pointing/morphology on \\zaln-s) could not be placed " +
+    "unambiguously — the same source word repeats in the verse — so Door43's change has NOT been taken, and " +
+    "tonight's export will write over it until someone resolves it by hand. " +
+    buildNoBaseSentence(1, ["1:6"]);
+  assert(buildMergeConflictGuidance(rows, opts) === unlockedText, "unlocked (flags omitted): kept wording unchanged");
+  assert(
+    buildMergeConflictGuidance(rows, { ...opts, noBaseBookLocked: false, bookLocked: false }) === unlockedText,
+    "unlocked (flags false): kept wording unchanged",
+  );
+}
+
+{
+  // Issue #1110 review (A3): the pointer-less adopt_conflict and the two
+  // keep_local_structure sentences also promised the next export would write
+  // over Door43. A locked book is skipped by the export, so none may say so.
+  const rows = [
+    { action: "adopt_conflict", reason: "source_attr_only", overwrittenVersion: null, chapter: 2, verse: 1 },
+    { action: "keep_local_structure", reason: "no_human_commit", overwrittenVersion: null, chapter: 2, verse: 2 },
+    { action: "keep_local_structure", reason: "master_moved_under_local_bridge", overwrittenVersion: null, chapter: 2, verse: 3 },
+  ];
+  const locked = buildMergeConflictGuidance(rows, { bookLocked: true });
+  assert(!/next export|tonight's export|will write|written over|writes the app's/i.test(locked),
+    `locked book (pointer-less + structure rows): no sentence claims an export will write (got: ${locked})`);
+  assert((locked.match(/this book is locked/g) ?? []).length === 3, "locked book: each of the three sentences names the lock");
+  assert(locked.includes("1 was flagged for review but no app text was replaced (2:1)"), "locked book: the pointer-less verse is still named");
+  assert(locked.includes("1 kept the app's verse grouping"), "locked book: the kept grouping is still reported");
+  assert(locked.includes("1 verse(s) changed on Door43 that a bridge made in the app"), "locked book: the absorbed verse is still reported");
+
+  const unlockedText =
+    "1 was flagged for review but no app text was replaced (2:1) — Door43's copy differs from the app's only in the " +
+    "original-language source attributes on \\zaln-s (x-content / x-lemma); check which side is right before the " +
+    "next export, because the export will write the app's attributes over Door43's. 1 kept the app's verse " +
+    "grouping (a \\v a-b bridge, or its split) where Door43 now groups the verses differently: either no commit " +
+    "from a Door43 editor's own account was found behind Door43's change, or the two groupings could not be " +
+    "reconciled automatically. Door43's grouping has NOT been taken, so the next export that runs for this " +
+    "resource writes the app's grouping over it. 1 verse(s) changed on Door43 that a bridge made in the app (not " +
+    "yet exported) has since absorbed — the next export publishes the bridge, and Door43's change to that verse's " +
+    "own text will be written over unless it is carried into the bridged verse first.";
+  assert(buildMergeConflictGuidance(rows) === unlockedText, "unlocked (flag omitted): wording unchanged");
+  assert(buildMergeConflictGuidance(rows, { bookLocked: false }) === unlockedText, "unlocked (flag false): wording unchanged");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -399,7 +634,8 @@ function verseDb() {
     id INTEGER PRIMARY KEY AUTOINCREMENT, book TEXT, resource TEXT, chapter INTEGER,
     verse INTEGER, action TEXT, reason TEXT, overwritten_version INTEGER, alignment TEXT,
     detected_at INTEGER, resolved_at INTEGER, resolved_by INTEGER, last_recorded_at INTEGER,
-    recorded_generation INTEGER NOT NULL DEFAULT 0
+    recorded_generation INTEGER NOT NULL DEFAULT 0,
+    prior_json TEXT, prior_run TEXT
   )`);
   // Required for UPSERT_VERSE_MERGE_CONFLICT_SQL's `ON CONFLICT (book,
   // resource, chapter, verse)` clause to have anything to conflict against —
@@ -760,15 +996,24 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
 
 function upsertConflict(
   d,
-  { book, resource, chapter, verse, action, reason, overwrittenVersion, now, bibleVersion = null, observedVersion = null },
+  { book, resource, chapter, verse, action, reason, overwrittenVersion, now, bibleVersion = null, observedVersion = null, runId = null },
 ) {
   return d
     .prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL)
-    .run(book, resource, chapter, verse, action, reason, overwrittenVersion, null, now, bibleVersion, observedVersion);
+    .run(book, resource, chapter, verse, action, reason, overwrittenVersion, null, now, bibleVersion, observedVersion, runId);
 }
 
-function confirmAdopted(d, { book, resource, chapter, verse }) {
-  return d.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).run(book, resource, chapter, verse);
+// The lost-race cleanup's three statements (issue #1137), in production order,
+// for one ref and the run that lost.
+function lostCleanup(d, book, resource, chapter, verse, runId) {
+  const scope = [book, resource, chapter, chapter, JSON.stringify([`${chapter}:${verse}`]), runId];
+  for (const sql of [RESTORE_SPECULATIVE_CONFLICTS_SQL, DELETE_SPECULATIVE_CONFLICTS_SQL, SETTLE_SPECULATIVE_CONFLICTS_SQL]) {
+    d.prepare(sql).run(...scope);
+  }
+}
+
+function confirmAdopted(d, { book, resource, chapter, verse, now, overwrittenVersion = null, alignment = null }) {
+  return d.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).run(book, resource, chapter, verse, now, overwrittenVersion, alignment);
 }
 
 {
@@ -794,7 +1039,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   const tonight = 5000;
   upsertConflict(d, {
     book: "ZEC", resource: "ult", chapter: 6, verse: 1,
-    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 9, now: tonight,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 9, now: tonight, runId: "run-tonight",
   });
   {
     // Immediately after the SPECULATIVE upsert — before we know whether the
@@ -806,7 +1051,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   }
 
   // Tonight's CAS attempt LOSES its race (a human saved first).
-  d.prepare(DELETE_LOST_ADOPTION_CONFLICT_SQL).run("ZEC", "ult", 6, 1, tonight);
+  lostCleanup(d, "ZEC", "ult", 6, 1, "run-tonight");
 
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=6 AND verse=1`).get();
   assert(!!row, "row SURVIVES a lost CAS on a previously-resolved verse");
@@ -844,7 +1089,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
 
   // Tonight's CAS attempt LANDS — confirmAdoptedConflicts is called for
   // exactly this ref (bookReimport.ts's landedAdoptions).
-  confirmAdopted(d, { book: "ZEC", resource: "ult", chapter: 6, verse: 2 });
+  confirmAdopted(d, { book: "ZEC", resource: "ult", chapter: 6, verse: 2, now: tonight, overwrittenVersion: 9 });
 
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=6 AND verse=2`).get();
   assert(row.resolved_at === null, "CONFIRMED landed adoption -> resolved_at cleared, genuinely active");
@@ -854,11 +1099,10 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
     .get().c;
   assert(activeCount === 1, "now visible to the same query the banner and GET route use");
 
-  // Documented, deliberately NOT fixed here (unchanged from the six-angle
-  // review): the pre-existing "keep the EARLIEST pointer" COALESCE means
-  // overwritten_version still shows the OLD (v2) pointer, not tonight's real
-  // v9 overwrite. Pinned so a future change to the CASE logic is deliberate.
-  assert(row.overwritten_version === 2, "documented limitation: overwritten_version still shows the OLD pointer (v2), not v9");
+  // Issue #1112 (this used to pin the old pointer as a known limitation): the
+  // confirm that reactivates a RESOLVED row takes tonight's real overwrite
+  // (v9), not the resolved v2 pointer.
+  assert(row.overwritten_version === 9, `reactivated row points at tonight's overwrite (v9), not the resolved v2 (got v${row.overwritten_version})`);
 }
 
 {
@@ -883,10 +1127,10 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
 // ─────────────────────────────────────────────────────────────────────────
 // Part 5: lost-adoption cleanup must not destroy a row's prior history just
 // because a LATER, unrelated CAS attempt on the same verse lost its race.
-// DELETE_LOST_ADOPTION_CONFLICT_SQL is scoped to
-// `last_recorded_at = ?5 AND resolved_at IS NULL` for exactly this reason —
-// see verseMergeConflictSql.ts's doc comment for why last_recorded_at (not
-// detected_at) is the right signal for "touched by this run".
+// Since issue #1137 the cleanup touches only rows whose speculation the losing
+// run still owns (prior_run), restores a row that existed before it from the
+// capture its upsert stored, and deletes only a row it created that nobody
+// has resolved (verseMergeConflictSql.ts's *_SPECULATIVE_CONFLICTS_SQL).
 // ─────────────────────────────────────────────────────────────────────────
 
 {
@@ -898,20 +1142,18 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   const now = 9999;
   upsertConflict(d, {
     book: "ZEC", resource: "ult", chapter: 5, verse: 5,
-    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 3, now,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 3, now, runId: "run-tonight",
   });
-  d.prepare(DELETE_LOST_ADOPTION_CONFLICT_SQL).run("ZEC", "ult", 5, 5, now);
+  lostCleanup(d, "ZEC", "ult", 5, 5, "run-tonight");
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=5 AND verse=5`).get();
   assert(!row, "brand-new-this-run speculative row: still deleted when its CAS is lost (matches original behavior)");
 }
 
 {
   // Case B: a row still-active (never resolved) from a prior night, re-hit
-  // by a fresh event this run whose CAS attempt loses. This row was NEVER
-  // specially protected (only a RESOLVED row's resolved_at IS NULL exclusion
-  // protects it) — it is still deleted, matching this cleanup's original,
-  // pre-review behavior for the never-resolved case. (The resolved case is
-  // covered exhaustively in Part 4 above.)
+  // by a fresh event this run whose CAS attempt loses. Until issue #1132 it
+  // was deleted, taking a pending alert with it; now it is put back exactly
+  // as the prior night left it (cases (j)-(y) below cover the details).
   const d = verseDb();
   upsertConflict(d, {
     book: "MIC", resource: "ult", chapter: 1, verse: 1,
@@ -920,11 +1162,14 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   const tonight = 5000;
   upsertConflict(d, {
     book: "MIC", resource: "ult", chapter: 1, verse: 1,
-    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 4, now: tonight,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 4, now: tonight, runId: "run-tonight",
   });
-  d.prepare(DELETE_LOST_ADOPTION_CONFLICT_SQL).run("MIC", "ult", 1, 1, tonight);
+  lostCleanup(d, "MIC", "ult", 1, 1, "run-tonight");
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='MIC' AND chapter=1 AND verse=1`).get();
-  assert(!row, "never-resolved row re-touched this run: still deleted on a lost CAS, unregressed from original behavior");
+  assert(
+    !!row && row.last_recorded_at === 100 && row.prior_run === null,
+    "never-resolved row re-touched this run: put back as the prior night left it on a lost CAS, its capture cleared",
+  );
 }
 
 {
@@ -932,15 +1177,16 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   // confirm it holds via the DELETE statement directly (not just via the
   // full upsert-then-delete sequence already exercised above): a resolved
   // row's resolved_at IS NULL exclusion means the delete never matches it,
-  // regardless of last_recorded_at.
+  // even for a row this run's speculation created.
   const d = verseDb();
   d.prepare(
-    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by, last_recorded_at)
-     VALUES ('ZEC', 'ult', 7, 7, 'adopt_conflict', 'both_changed', 2, 50, 150, 30, 5000)`,
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by, last_recorded_at, prior_run)
+     VALUES ('ZEC', 'ult', 7, 7, 'adopt_conflict', 'both_changed', 2, 50, 150, 30, 5000, 'run-tonight')`,
   ).run();
-  d.prepare(DELETE_LOST_ADOPTION_CONFLICT_SQL).run("ZEC", "ult", 7, 7, 5000);
+  lostCleanup(d, "ZEC", "ult", 7, 7, "run-tonight");
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=7 AND verse=7`).get();
-  assert(!!row && row.resolved_at === 150, "a resolved row is excluded from the delete purely by resolved_at IS NULL, even with a matching last_recorded_at");
+  assert(!!row && row.resolved_at === 150, "a resolved row is excluded from the delete purely by resolved_at IS NULL, even one this run created");
+  assert(row?.prior_run === null, "the resolved row the delete left is settled");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1827,11 +2073,13 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   assert(!g.includes("took Door43's version"), "…and never reports it as an overwrite");
 
   // A mixed set is counted per-action, not lumped: one adopt_conflict is an
-  // overwrite, one source_attr_divergent is a kept-D1 divergence.
+  // overwrite, one source_attr_divergent is a kept-D1 divergence. A real
+  // pointer (overwrittenVersion set) so this exercises the overwrite branch,
+  // not the #981 pointer-less one tested above.
   const mixed = buildMergeConflictGuidance([
-    { action: "adopt_conflict" },
-    { action: "source_attr_divergent" },
-    { action: "keep_alignment_refused" },
+    { action: "adopt_conflict", overwrittenVersion: 1 },
+    { action: "source_attr_divergent", overwrittenVersion: null },
+    { action: "keep_alignment_refused", overwrittenVersion: null },
   ]);
   assert(mixed.includes("1 took Door43's version"), "adopt_conflict counted as an overwrite");
   assert(mixed.includes("1 kept the editor's version because adopting Door43's would have cost alignment"),
@@ -1847,7 +2095,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   const ai = buildMergeConflictGuidance([{ action: "keep_ai_master" }]);
   assert(ai === "", "a keep_ai_master row produces no guidance sentence at all (#749)");
 
-  const withAi = buildMergeConflictGuidance([{ action: "adopt_conflict" }, { action: "keep_ai_master" }]);
+  const withAi = buildMergeConflictGuidance([{ action: "adopt_conflict", overwrittenVersion: 1 }, { action: "keep_ai_master" }]);
   assert(withAi.includes("1 took Door43's version"),
     "…and its presence does not disturb the adopt_conflict count beside it");
   assert(!withAi.includes("kept the editor's version even though Door43 changed too"),
@@ -2391,6 +2639,1071 @@ console.log("\n[a no-op adopt_conflict does not inherit an old audit row's point
   });
   const kept = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='MIC' AND chapter=5 AND verse=11`).get();
   assert(kept.overwritten_version === 3, "a real prior adopt_conflict keeps the pointer its human still needs");
+}
+
+// Issue #1006: the lock flag reaches BOTH stored messages through the real
+// raise path (admin banner + the translator's own keep_no_base alert).
+console.log("\n[locked book: keep_no_base alerts make no export claim (issue #1006)]");
+for (const bookLocked of [true, false]) {
+  const d = verseDb();
+  d.exec(`ALTER TABLE system_alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    ALTER TABLE system_alerts ADD COLUMN condition_key TEXT;
+    ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
+    ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
+    CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+      user_id INTEGER, new_version INTEGER);`);
+  d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
+  d.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, new_version) VALUES ('verse', 'ZEC/1/6/UST', 'ZEC', 7, 2)`,
+  ).run();
+  const make = (sql, args = []) => ({
+    bind: (...next) => make(sql, next),
+    all: async () => ({ results: d.prepare(sql).all(...args) }),
+    run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+  });
+  await raiseVerseMergeConflictAlert({ DB: { prepare: (sql) => make(sql) } }, "ZEC", "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    bookLocked,
+    observedAt: 100,
+  });
+  const msg = (u) =>
+    d.prepare(`SELECT message FROM system_alerts WHERE username=? AND source='verse_merge_conflict:ZEC:ust'`).get(u)
+      ?.message ?? "";
+  const label = bookLocked ? "locked" : "unlocked";
+  for (const [who, m] of [["admin", msg("deferredreward")], ["editor", msg("bethoakes")]]) {
+    assert(alertMessageCarriesNoBaseWarning(m), `${label} ${who}: alert raised with the no-base warning`);
+    assert(/tonight's export/i.test(m) === !bookLocked,
+      `${label} ${who}: the "tonight's export" warning appears only for an unlocked book`);
+    assert(/this book is locked/i.test(m) === bookLocked, `${label} ${who}: the lock is named only when locked`);
+  }
+}
+
+// Issue #1006 review (A2): the lock state is part of the alert condition. A
+// dismissed locked-book alert (nothing to act on) must not keep the unlocked
+// "tonight's export will overwrite" warning hidden after the book is unlocked.
+// Unlocked condition keys stay byte-identical to the pre-#1006 keys, so this
+// deploy does not resurrect alerts people already dismissed.
+console.log("\n[locked -> dismissed -> unlocked: the overwrite warning comes back (issue #1006 review)]");
+{
+  const d = verseDb();
+  d.exec(`ALTER TABLE system_alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    ALTER TABLE system_alerts ADD COLUMN condition_key TEXT;
+    ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
+    ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
+    CREATE UNIQUE INDEX system_alerts_one_standing_review_test
+      ON system_alerts(username, source)
+      WHERE kind='review' AND condition_key IS NOT NULL AND dismissed_at IS NULL AND resolved_at IS NULL;
+    CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+      user_id INTEGER, new_version INTEGER);`);
+  d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
+  d.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, new_version) VALUES ('verse', 'ZEC/1/6/UST', 'ZEC', 7, 2)`,
+  ).run();
+  const make = (sql, args = []) => ({
+    bind: (...next) => make(sql, next),
+    all: async () => ({ results: d.prepare(sql).all(...args) }),
+    run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+  });
+  const raise = (bookLocked, observedAt) =>
+    raiseVerseMergeConflictAlert({ DB: { prepare: (sql) => make(sql) } }, "ZEC", "ust", {
+      noBaseCount: 1,
+      noBaseRefs: ["1:6"],
+      noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+      bookLocked,
+      observedAt,
+    });
+  const live = (u) =>
+    d.prepare(
+      `SELECT message, condition_key FROM system_alerts
+        WHERE username=? AND source='verse_merge_conflict:ZEC:ust' AND dismissed_at IS NULL AND resolved_at IS NULL`,
+    ).all(u);
+
+  await raise(true, 100);
+  d.prepare(`UPDATE system_alerts SET dismissed_at = 150 WHERE source='verse_merge_conflict:ZEC:ust'`).run();
+  await raise(true, 200);
+  for (const u of ["deferredreward", "bethoakes"]) {
+    assert(live(u).length === 0, `${u}: a dismissed locked alert stays dismissed while the book stays locked`);
+  }
+
+  await raise(false, 300);
+  const expectedKeys = {
+    deferredreward: reviewConditionKey(
+      "verse_merge_conflict",
+      { book: "ZEC", resource: "ust" },
+      { rows: [], noBase: [{ chapter: 1, verse: 6, version: 2 }], noBaseCount: 1, recordingFailed: false },
+    ),
+    bethoakes: verseMergeEditorConditionKey("ZEC", "ust", "bethoakes", ["1:6"]),
+  };
+  for (const u of ["deferredreward", "bethoakes"]) {
+    const rows = live(u);
+    assert(rows.length === 1, `${u}: after the unlock, a fresh undismissed alert is raised`);
+    assert(/tonight's export/i.test(rows[0]?.message ?? ""), `${u}: …carrying the unlocked overwrite warning`);
+    assert(rows[0]?.condition_key === expectedKeys[u], `${u}: the unlocked condition key is unchanged from before #1006`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Issue #996: the editor's "Door43's sync overwrote your edits" alert carries
+// each ref's first-flagged date, so an alert re-raised because its ref list
+// only SHRANK (some rows resolved, nothing new tonight) reads as old, and a
+// genuinely new overwrite sharing the alert with old ones is dated tonight
+// instead of hiding under the oldest date.
+// ─────────────────────────────────────────────────────────────────────────
+console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)]");
+{
+  const AUG19 = Date.UTC(2026, 7, 19, 5, 30) / 1000;
+  const OCT05 = Date.UTC(2026, 9, 5, 5, 30) / 1000;
+  const users = (refs) => new Map(refs.map((r) => [editLogKey("EZK", "ust", r), "bcameron93"]));
+
+  // Every ref from the same day: one date, after the list (the shrink case).
+  const sameDay = [
+    { chapter: 4, verse: 17, overwrittenVersion: 6, detectedAt: AUG19 },
+    { chapter: 4, verse: 18, overwrittenVersion: 3, detectedAt: AUG19 + 40 },
+  ];
+  const one = groupOverwrittenVersesByEditor("EZK", "ust", sameDay, users(sameDay)).get("bcameron93").message;
+  assert(
+    one.includes("with Door43's version: 4:17@v6, 4:18@v3 (first flagged 2026-08-19)."),
+    `same-day refs share one first-flagged date (got: ${one})`,
+  );
+
+  // Old and new refs in one alert: each group carries its own date, oldest
+  // first, so tonight's overwrite is not dated by the August rows.
+  const mixed = [
+    { chapter: 3, verse: 2, overwrittenVersion: 9, detectedAt: OCT05 },
+    { chapter: 4, verse: 17, overwrittenVersion: 6, detectedAt: AUG19 },
+  ];
+  const two = groupOverwrittenVersesByEditor("EZK", "ust", mixed, users(mixed)).get("bcameron93");
+  assert(
+    two.message.includes(
+      "with Door43's version: 4:17@v6 (first flagged 2026-08-19); 3:2@v9 (first flagged 2026-10-05).",
+    ),
+    `old and new refs are dated separately, oldest first (got: ${two.message})`,
+  );
+  assert(two.refs.join(",") === "3:2@v9,4:17@v6", "the refs that feed the condition key keep their order and shape");
+
+  // No detectedAt (a caller without dates): the message is exactly the old one.
+  const undated = [{ chapter: 5, verse: 1, overwrittenVersion: 2 }];
+  const plain = groupOverwrittenVersesByEditor("EZK", "ust", undated, users(undated)).get("bcameron93").message;
+  assert(
+    plain.startsWith("Door43's sync overwrote your edit in EZK UST at 1 verse(s) with Door43's version: 5:1@v2. "),
+    `no detectedAt -> no invented date (got: ${plain})`,
+  );
+}
+
+// The same, end to end on a database built from the real migrations: the real
+// writers (recordVerseMergeConflicts, confirmAdoptedConflicts) and the real
+// alert path (raiseVerseMergeConflictAlert).
+{
+  const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  const migrationSql = readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort()
+    .map((f) => readFileSync(join(migrationsDir, f), "utf8"));
+  const JUN10 = Date.UTC(2026, 5, 10, 5, 30) / 1000;
+  const AUG19 = Date.UTC(2026, 7, 19, 5, 30) / 1000;
+  const OCT05 = Date.UTC(2026, 9, 5, 5, 30) / 1000;
+  const SOURCE = "verse_merge_conflict:EZK:ust";
+
+  function migratedEnv() {
+    const sqlite = new DatabaseSync(":memory:");
+    for (const sql of migrationSql) sqlite.exec(sql);
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'bcameron93')`).run();
+    const stmt = (sql, args = []) => ({
+      _sql: sql,
+      _args: args,
+      bind: (...next) => stmt(sql, next),
+      all: async () => ({ results: sqlite.prepare(sql).all(...args) }),
+      first: async () => sqlite.prepare(sql).get(...args) ?? null,
+      run: async () => ({ meta: { changes: Number(sqlite.prepare(sql).run(...args).changes) } }),
+    });
+    const env = {
+      DB: {
+        prepare: (sql) => stmt(sql),
+        batch: async (stmts) => {
+          sqlite.exec("BEGIN");
+          try {
+            // Like D1, a SELECT inside a batch returns its rows (issue #1132's
+            // prior-row capture rides in the upsert's own batch).
+            const out = stmts.map((s) =>
+              /^\s*SELECT/i.test(s._sql)
+                ? { results: sqlite.prepare(s._sql).all(...s._args), meta: { changes: 0 } }
+                : { meta: { changes: Number(sqlite.prepare(s._sql).run(...s._args).changes) } });
+            sqlite.exec("COMMIT");
+            return out;
+          } catch (e) {
+            sqlite.exec("ROLLBACK");
+            throw e;
+          }
+        },
+      },
+    };
+    return { sqlite, env };
+  }
+  // bcameron93 wrote `version` of the verse, so an overwrite pointing at it is theirs.
+  const authored = (sqlite, chapter, verse, version) =>
+    sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', ?, 'EZK', 7, ?, 'update')`,
+    ).run(`EZK/${chapter}/${verse}/UST`, version);
+  const overwrite = (chapter, verse, overwrittenVersion) => ({
+    chapter, verse, action: "adopt_conflict", reason: "both_changed_wording",
+    overwrittenVersion, alignment: null, observedVersion: null,
+  });
+  const humanResolve = (sqlite, chapter, verse, at) =>
+    sqlite.prepare(
+      `UPDATE verse_merge_conflicts SET resolved_at = ?, resolved_by = 7
+        WHERE book = 'EZK' AND resource = 'ust' AND chapter = ? AND verse = ?`,
+    ).run(at, chapter, verse);
+  const row = (sqlite, chapter, verse) =>
+    sqlite.prepare(`SELECT * FROM verse_merge_conflicts WHERE book = 'EZK' AND resource = 'ust' AND chapter = ? AND verse = ?`)
+      .get(chapter, verse);
+  const editorAlerts = (sqlite) =>
+    sqlite.prepare(`SELECT * FROM system_alerts WHERE username = 'bcameron93' AND source = ? ORDER BY id`).all(SOURCE);
+
+  // (a) The issue's own case: the standing list only shrinks. Two refs first
+  // flagged 2026-08-19; one is resolved; tonight's re-raise names the other
+  // with its August date.
+  {
+    const { sqlite, env } = migratedEnv();
+    authored(sqlite, 4, 17, 6);
+    authored(sqlite, 4, 18, 3);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 17, 6), overwrite(4, 18, 3)], AUG19);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: AUG19 * 1000 });
+    humanResolve(sqlite, 4, 18, AUG19 + 86400);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const live = editorAlerts(sqlite).filter((a) => a.resolved_at == null);
+    assert(live.length === 1, "shrink: one standing editor alert");
+    assert(
+      live[0]?.message.includes("at 1 verse(s) with Door43's version: 4:17@v6 (first flagged 2026-08-19)."),
+      `shrink: the re-raised alert carries the remaining ref's August date (got: ${live[0]?.message})`,
+    );
+    assert(
+      live[0]?.condition_key === verseMergeEditorConditionKey("EZK", "ust", "bcameron93", ["4:17@v6"]),
+      "shrink: the condition key keeps its pre-#996 shape (dates are message-only)",
+    );
+
+    // Stickiness: dismiss it; the next run with the same rows leaves it down,
+    // even though the message wording changed with this fix.
+    sqlite.prepare(`UPDATE system_alerts SET dismissed_at = ? WHERE id = ?`).run(OCT05 + 60, live[0].id);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: (OCT05 + 120) * 1000 });
+    const shown = editorAlerts(sqlite).filter((a) => a.resolved_at == null && a.dismissed_at == null);
+    assert(shown.length === 0, "shrink: a dismissed alert stays dismissed on the next run");
+  }
+
+  // (b) The PR #1001 review case: a verse overwritten in June, resolved by a
+  // person, then overwritten again tonight. The reactivated row is dated
+  // tonight, not June, so the editor is not told this is an old, known loss.
+  {
+    const { sqlite, env } = migratedEnv();
+    authored(sqlite, 4, 20, 4);
+    // bcameron93 also wrote v11, tonight's overwritten version, so the alert is
+    // theirs (since #1112 the reactivated row points at v11, not June's v4).
+    authored(sqlite, 4, 20, 11);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 20, 4)], JUN10);
+    humanResolve(sqlite, 4, 20, JUN10 + 86400);
+    // Tonight: the speculative upsert, the CAS lands, the confirm reactivates.
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 20, 11)], OCT05);
+    assert(row(sqlite, 4, 20).detected_at === JUN10, "reactivation: the speculative upsert alone leaves detected_at alone");
+    await confirmAdoptedConflicts(env, "EZK", "ust", [overwrite(4, 20, 11)], OCT05);
+    const r = row(sqlite, 4, 20);
+    assert(r.resolved_at === null && r.resolved_by === null, "reactivation: the row is active again");
+    assert(r.detected_at === OCT05, `reactivation: detected_at is tonight, not June (got ${r.detected_at})`);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const msg = editorAlerts(sqlite).find((a) => a.resolved_at == null)?.message ?? "";
+    assert(msg.includes("(first flagged 2026-10-05)"), `reactivation: the editor alert is dated tonight (got: ${msg})`);
+    assert(!msg.includes("2026-06-10"), "reactivation: the June date does not appear");
+  }
+
+  // (c) A still-UNRESOLVED row whose overwrite is confirmed again keeps its
+  // original detected_at: the reset is only for a row coming back from resolved.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 21, 5)], AUG19);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 21, 8)], OCT05);
+    await confirmAdoptedConflicts(env, "EZK", "ust", [overwrite(4, 21, 8)], OCT05);
+    const r = row(sqlite, 4, 21);
+    assert(r.detected_at === AUG19, `unresolved re-confirm: detected_at keeps its first date (got ${r.detected_at})`);
+    assert(r.last_recorded_at === OCT05, "unresolved re-confirm: last_recorded_at still records tonight");
+    // Issue #1112's other half: a row still waiting for a human keeps its FIRST
+    // recovery pointer. Its v5 text is what that human has not yet looked at.
+    assert(r.overwritten_version === 5, `unresolved re-confirm: the first pointer (v5) is kept (got v${r.overwritten_version})`);
+  }
+
+  // (e) Issue #1112: a verse overwritten in June (v4, bcameron93's text),
+  // resolved by a person, then overwritten again tonight (v11, jdoe's text).
+  // The reactivated row, and the editor alert raised from it, point at v11 and
+  // go to jdoe. June's pointer and June's lost-word snapshot describe a loss
+  // someone already dealt with.
+  {
+    const { sqlite, env } = migratedEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (8, 8008, 'jdoe')`).run();
+    authored(sqlite, 4, 20, 4);
+    sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', 'EZK/4/20/UST', 'EZK', 8, 11, 'update')`,
+    ).run();
+    const june = { ...overwrite(4, 20, 4), alignment: { beforeAligned: 6, afterAligned: 4, lostWords: ["june"] } };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [june], JUN10);
+    humanResolve(sqlite, 4, 20, JUN10 + 86400);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 20, 11)], OCT05);
+    await confirmAdoptedConflicts(env, "EZK", "ust", [overwrite(4, 20, 11)], OCT05);
+    const r = row(sqlite, 4, 20);
+    assert(r.resolved_at === null, "re-overwrite: the row is active again");
+    assert(r.overwritten_version === 11, `re-overwrite: the pointer is tonight's v11, not June's v4 (got v${r.overwritten_version})`);
+    assert(r.alignment === null, `re-overwrite: June's lost-word snapshot is not carried over (got ${r.alignment})`);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const live = (user) =>
+      sqlite.prepare(`SELECT * FROM system_alerts WHERE username = ? AND source = ? AND resolved_at IS NULL ORDER BY id`)
+        .all(user, SOURCE);
+    const jdoe = live("jdoe");
+    assert(
+      jdoe.length === 1 && jdoe[0].message.includes("4:20@v11 (first flagged 2026-10-05)"),
+      `re-overwrite: v11's author is alerted at v11 (got: ${jdoe.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+    assert(live("bcameron93").length === 0, "re-overwrite: v4's author is not told Door43 overwrote them tonight");
+  }
+
+  // (d) A resolved row whose adoption LOSES its CAS race (no confirm) keeps
+  // its resolution and its date: nothing was overwritten tonight.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 22, 5)], JUN10);
+    humanResolve(sqlite, 4, 22, JUN10 + 86400);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 22, 9)], OCT05, "run-tonight");
+    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 22 }], "run-tonight");
+    const r = row(sqlite, 4, 22);
+    assert(r.resolved_at === JUN10 + 86400, "lost CAS: the resolution stands");
+    assert(r.detected_at === JUN10, "lost CAS: detected_at is untouched");
+  }
+
+  // Issue #1124: one rule for which overwrite an unresolved row describes,
+  // applied to the pointer and the lost-word snapshot together.
+  const snap = (word) => ({ beforeAligned: 6, afterAligned: 4, lostWords: [word] });
+  const lostWords = (r) => (r.alignment == null ? null : JSON.parse(r.alignment).lostWords.join(","));
+  const jdoe = (sqlite) => sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (8, 8008, 'jdoe')`).run();
+  const authoredBy = (sqlite, userId, chapter, verse, version) =>
+    sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action) VALUES ('verse', ?, 'EZK', ?, ?, 'update')`,
+    ).run(`EZK/${chapter}/${verse}/UST`, userId, version);
+  const liveFor = (sqlite, user) =>
+    sqlite.prepare(`SELECT * FROM system_alerts WHERE username = ? AND source = ? AND resolved_at IS NULL ORDER BY id`)
+      .all(user, SOURCE);
+
+  // (f) An unresolved adopt_conflict (v5, August's lost words) overwritten
+  // again tonight (v8, other lost words). The row keeps BOTH from August: the
+  // pointer and the snapshot describe the same overwrite, the first one the
+  // editor has not looked at yet.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 23, 5), alignment: snap("august") }], AUG19);
+    const tonight = { ...overwrite(4, 23, 8), alignment: snap("october") };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [tonight], OCT05);
+    await confirmAdoptedConflicts(env, "EZK", "ust", [tonight], OCT05);
+    const r = row(sqlite, 4, 23);
+    assert(r.overwritten_version === 5, `unresolved re-overwrite: the first pointer (v5) is kept (got v${r.overwritten_version})`);
+    assert(lostWords(r) === "august", `unresolved re-overwrite: the snapshot is v5's, matching the pointer (got ${lostWords(r)})`);
+
+    // A clean adopt re-detected on the same unresolved row does not swap the
+    // snapshot under the kept adopt_conflict pointer either.
+    const clean = { ...overwrite(4, 23, 9), action: "adopt", reason: "master_only", alignment: snap("clean") };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [clean], OCT05 + 86400);
+    const r2 = row(sqlite, 4, 23);
+    assert(r2.action === "adopt_conflict" && r2.overwritten_version === 5, "unresolved + clean adopt: still the v5 adopt_conflict");
+    assert(lostWords(r2) === "august", `unresolved + clean adopt: the snapshot stays v5's (got ${lostWords(r2)})`);
+  }
+
+  // (g) An unresolved audit-only row (adopt_no_visible_change at v3,
+  // bcameron93's text: nobody was ever alerted) promoted tonight by a LANDED
+  // adopt_conflict that overwrote v7 (jdoe's text). The row describes
+  // tonight's overwrite: pointer v7, tonight's snapshot, tonight's date, and
+  // the editor alert goes to jdoe.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authored(sqlite, 4, 24, 3);
+    authoredBy(sqlite, 8, 4, 24, 7);
+    const audit = { ...overwrite(4, 24, 3), action: "adopt_no_visible_change", reason: "both_changed_markers_only", alignment: snap("audit") };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [audit], AUG19);
+    const tonight = { ...overwrite(4, 24, 7), alignment: snap("october") };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [tonight], OCT05);
+    await confirmAdoptedConflicts(env, "EZK", "ust", [tonight], OCT05);
+    const r = row(sqlite, 4, 24);
+    assert(r.action === "adopt_conflict" && r.resolved_at === null, "promotion: the row is an active adopt_conflict");
+    assert(r.overwritten_version === 7, `promotion: the pointer is tonight's v7, not the audit row's v3 (got v${r.overwritten_version})`);
+    assert(lostWords(r) === "october", `promotion: the snapshot is tonight's (got ${lostWords(r)})`);
+    assert(r.detected_at === OCT05, `promotion: first flagged tonight, not on the audit row's date (got ${r.detected_at})`);
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const toJdoe = liveFor(sqlite, "jdoe");
+    assert(
+      toJdoe.length === 1 && toJdoe[0].message.includes("4:24@v7 (first flagged 2026-10-05)"),
+      `promotion: v7's author is alerted at v7 (got: ${toJdoe.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+    assert(liveFor(sqlite, "bcameron93").length === 0, "promotion: v3's author is not told Door43 overwrote them");
+  }
+
+  // (h) The same promotion, but tonight's CAS LOSES (a human saved first):
+  // nothing was overwritten, so nothing may point at v7 or alert anyone. The
+  // lost-CAS cleanup puts the audit row back as it was (issue #1132; case (m)
+  // checks every column).
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authored(sqlite, 4, 25, 3);
+    authoredBy(sqlite, 8, 4, 25, 7);
+    const audit = { ...overwrite(4, 25, 3), action: "adopt_no_visible_change", reason: "both_changed_markers_only" };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [audit], AUG19);
+    const prior = "run-tonight";
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 25, 7), alignment: snap("october") }], OCT05, prior);
+    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 25 }], prior);
+    const claims = sqlite.prepare(
+      `SELECT COUNT(*) c FROM verse_merge_conflicts WHERE book = 'EZK' AND chapter = 4 AND verse = 25 AND overwritten_version = 7`,
+    ).get().c;
+    assert(claims === 0, "lost promotion: no row claims tonight's v7 was overwritten");
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    assert(liveFor(sqlite, "jdoe").length === 0 && liveFor(sqlite, "bcameron93").length === 0, "lost promotion: no editor is alerted");
+  }
+
+  // (i) A RESOLVED row WITH a stored pointer whose re-overwrite loses its CAS
+  // keeps its June pointer AND its June snapshot: the speculative upsert does
+  // not swap either, so a lost race leaves the row exactly as the person who
+  // resolved it saw it. (A resolved row whose stored pointer is NULL does take
+  // tonight's pointer and snapshot speculatively; the lost-race cleanup puts
+  // them back, case (l).)
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 26, 4), alignment: snap("june") }], JUN10);
+    humanResolve(sqlite, 4, 26, JUN10 + 86400);
+    const before = row(sqlite, 4, 26);
+    const prior = "run-tonight";
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 26, 11), alignment: snap("october") }], OCT05, prior);
+    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 26 }], prior);
+    const r = row(sqlite, 4, 26);
+    assert(r.resolved_at === before.resolved_at && r.detected_at === before.detected_at, "resolved lost CAS: resolution and date stand");
+    assert(r.overwritten_version === 4, `resolved lost CAS: the pointer stays v4 (got v${r.overwritten_version})`);
+    assert(lostWords(r) === "june", `resolved lost CAS: the snapshot stays June's, matching the pointer (got ${lostWords(r)})`);
+  }
+
+  // Issue #1132: a lost race puts back the row tonight's speculative upsert
+  // changed, instead of deleting it. Since issue #1137 the upsert stores each
+  // touched row's prior state on the row itself, under tonight's run id; the
+  // lost-race cleanup restores a row that existed and deletes only a row this
+  // run created.
+  const lostRace = (env, chapter, verse, _now, runId) =>
+    deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter, verse }], runId);
+  const speculative = (r) => ({
+    action: r.action, reason: r.reason, overwritten_version: r.overwritten_version, alignment: r.alignment,
+    detected_at: r.detected_at, last_recorded_at: r.last_recorded_at, resolved_at: r.resolved_at, resolved_by: r.resolved_by,
+  });
+
+  // (j) The issue's own case: Monday's unresolved adopt_conflict at v5, which
+  // its editor has not reviewed yet. Tuesday's overwrite of the same verse
+  // loses its race (a person saved first). Monday's row, its v5 pointer, its
+  // snapshot and its dates survive, and its editor alert still raises.
+  {
+    const { sqlite, env } = migratedEnv();
+    authored(sqlite, 4, 27, 5);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 27, 5), alignment: snap("monday") }], AUG19);
+    const monday = speculative(row(sqlite, 4, 27));
+    const prior = "run-tonight";
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 27, 8), alignment: snap("tuesday") }], OCT05, prior);
+    await lostRace(env, 4, 27, OCT05, prior);
+    const r = row(sqlite, 4, 27);
+    assert(!!r, "lost race on a pending alert row: Monday's row is not deleted");
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(monday),
+      `lost race on a pending alert row: the row is exactly Monday's (got ${JSON.stringify(r && speculative(r))})`,
+    );
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const live = liveFor(sqlite, "bcameron93");
+    assert(
+      live.length === 1 && live[0].message.includes("4:27@v5 (first flagged 2026-08-19)"),
+      `lost race on a pending alert row: Monday's editor alert still raises (got: ${live.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+  }
+
+  // (k) A row this run CREATED speculatively is still deleted on a lost race:
+  // nothing existed before it.
+  {
+    const { sqlite, env } = migratedEnv();
+    const prior = "run-tonight";
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 28, 6)], OCT05, prior);
+    await lostRace(env, 4, 28, OCT05, prior);
+    assert(!row(sqlite, 4, 28), "lost race on a brand-new row: the row is deleted");
+  }
+
+  // (l) A RESOLVED row with a NULL stored pointer (a kept-D1 flag someone
+  // resolved, or a resolved #978 no-op adopt_conflict) takes tonight's pointer
+  // and snapshot through the upsert's COALESCE. After a lost race it is back
+  // exactly as it was: it does not claim an overwrite that never landed.
+  {
+    const { sqlite, env } = migratedEnv();
+    const kept = { ...overwrite(4, 29, null), action: "keep_alignment_refused", reason: "alignment_shrink" };
+    const noop = { ...overwrite(4, 30, null), reason: "no_op_conflicted" };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [kept, noop], AUG19);
+    humanResolve(sqlite, 4, 29, AUG19 + 86400);
+    humanResolve(sqlite, 4, 30, AUG19 + 86400);
+    const before29 = speculative(row(sqlite, 4, 29));
+    const before30 = speculative(row(sqlite, 4, 30));
+    const prior = "run-tonight";
+    await recordVerseMergeConflicts(
+      env, "EZK", "ust", "UST",
+      [{ ...overwrite(4, 29, 9), alignment: snap("october") }, { ...overwrite(4, 30, 9), alignment: snap("october") }],
+      OCT05, prior,
+    );
+    await deleteLostAdoptionConflicts(env, "EZK", "ust", [{ chapter: 4, verse: 29 }, { chapter: 4, verse: 30 }], prior);
+    const after29 = speculative(row(sqlite, 4, 29));
+    const after30 = speculative(row(sqlite, 4, 30));
+    assert(JSON.stringify(after29) === JSON.stringify(before29), `resolved NULL-pointer kept row: unchanged by a lost race (got ${JSON.stringify(after29)})`);
+    assert(JSON.stringify(after30) === JSON.stringify(before30), `resolved NULL-pointer no-op row: unchanged by a lost race (got ${JSON.stringify(after30)})`);
+  }
+
+  // (m) An unresolved audit-only row promoted tonight (#1124) whose CAS loses
+  // goes back to being the audit row it was: v3, its own date, no alert.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authored(sqlite, 4, 31, 3);
+    authoredBy(sqlite, 8, 4, 31, 7);
+    const audit = { ...overwrite(4, 31, 3), action: "adopt_no_visible_change", reason: "both_changed_markers_only" };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [audit], AUG19);
+    const before = speculative(row(sqlite, 4, 31));
+    const prior = "run-tonight";
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 31, 7), alignment: snap("october") }], OCT05, prior);
+    await lostRace(env, 4, 31, OCT05, prior);
+    const after = row(sqlite, 4, 31);
+    assert(
+      after != null && JSON.stringify(speculative(after)) === JSON.stringify(before),
+      `lost promotion: the audit row is restored (got ${JSON.stringify(after && speculative(after))})`,
+    );
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    assert(liveFor(sqlite, "jdoe").length === 0 && liveFor(sqlite, "bcameron93").length === 0, "lost promotion: no editor is alerted");
+  }
+
+  // (n) The person whose save beat the CAS also resolved Monday's row (their
+  // save resolves it) between the upsert and the cleanup. Their resolution
+  // stands; the rest of the row is Monday's.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 32, 5), alignment: snap("monday") }], AUG19);
+    const prior = "run-tonight";
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 32, 8), alignment: snap("tuesday") }], OCT05, prior);
+    humanResolve(sqlite, 4, 32, OCT05 + 30);
+    await lostRace(env, 4, 32, OCT05, prior);
+    const r = row(sqlite, 4, 32);
+    assert(r?.resolved_at === OCT05 + 30 && r?.resolved_by === 7, "resolved mid-race: the person's resolution stands");
+    assert(
+      r?.overwritten_version === 5 && lostWords(r) === "monday" && r?.last_recorded_at === AUG19,
+      `resolved mid-race: Monday's pointer, snapshot and last_recorded_at are back (got v${r?.overwritten_version}, ${r && lostWords(r)}, ${r?.last_recorded_at})`,
+    );
+  }
+
+  // (o) Another write touched the row after tonight's upsert (a later run
+  // recorded it again): the cleanup leaves that newer state alone.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 33, 5), alignment: snap("monday") }], AUG19);
+    const prior = "run-tonight";
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 33, 8)], OCT05, prior);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 33, 9)], OCT05 + 60, "run-later");
+    await lostRace(env, 4, 33, OCT05, prior);
+    const r = row(sqlite, 4, 33);
+    assert(r?.last_recorded_at === OCT05 + 60, "later write: the cleanup does not undo a write it did not make");
+  }
+
+  // (p) A Workflow retry: an earlier attempt of THIS run (it died before its
+  // CAS) already touched the row. The retry keeps that attempt's capture of
+  // the real prior state (issue #1137), so a lost race puts back the audit
+  // row rather than the promotion that never landed.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 34, 7);
+    const audit = { ...overwrite(4, 34, 3), action: "adopt_no_visible_change", reason: "both_changed_markers_only" };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [audit], AUG19);
+    const prior = "run-tonight";
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 34, 7)], OCT05, prior); // attempt 1 dies here
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 34, 7)], OCT05 + 60, prior); // the retry
+    await lostRace(env, 4, 34, OCT05 + 60, prior);
+    const claims = sqlite.prepare(
+      `SELECT COUNT(*) c FROM verse_merge_conflicts WHERE book = 'EZK' AND chapter = 4 AND verse = 34 AND overwritten_version = 7`,
+    ).get().c;
+    assert(claims === 0, "retry after a dead attempt: no row claims the v7 overwrite that never landed");
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    assert(liveFor(sqlite, "jdoe").length === 0, "retry after a dead attempt: v7's author is not alerted");
+  }
+
+  // (q) Two overlapping runs on one verse (the nightly Workflow takes no book
+  // import lock). June's resolved adopt_conflict points at v4. Run A upserts;
+  // run B upserts on top of A's unsettled speculation; A's CAS lands (its
+  // reimport edit_log row and the settle commit with it) and its confirm
+  // reactivates the row at v11; B's CAS loses. B's cleanup must not rewind
+  // A's landed alert to June's v4.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authored(sqlite, 4, 35, 4);
+    authoredBy(sqlite, 8, 4, 35, 11);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{ ...overwrite(4, 35, 4), alignment: snap("june") }], JUN10);
+    humanResolve(sqlite, 4, 35, JUN10 + 86400);
+    const tonightA = { ...overwrite(4, 35, 11), alignment: snap("october"), observedVersion: 11 };
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [tonightA], OCT05, "run-A"); // run A
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [tonightA], OCT05 + 20, "run-B"); // run B
+    // A's CAS landed: its reimport edit_log row and the settle, in one batch.
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+         VALUES ('verse', 'EZK/4/35/UST', 'EZK', NULL, 11, 12, 'update', 'dcs_reimport')`,
+      ),
+      settleLandedConflictStmt(env, "EZK", "ust", [tonightA]),
+    ]);
+    await confirmAdoptedConflicts(env, "EZK", "ust", [tonightA], OCT05);
+    await lostRace(env, 4, 35, OCT05 + 20, "run-B"); // B's CAS lost
+    const r = row(sqlite, 4, 35);
+    assert(r?.resolved_at === null, "overlapping runs: A's landed overwrite stays active");
+    assert(
+      r?.overwritten_version === 11 && lostWords(r) === "october" && r?.detected_at === OCT05,
+      `overlapping runs: the row keeps A's v11, its snapshot and date (got v${r?.overwritten_version}, ${r && lostWords(r)}, ${r?.detected_at})`,
+    );
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const toJdoe = liveFor(sqlite, "jdoe");
+    assert(
+      toJdoe.length === 1 && toJdoe[0].message.includes("4:35@v11"),
+      `overlapping runs: v11's author is alerted (got: ${toJdoe.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+    assert(liveFor(sqlite, "bcameron93").length === 0, "overlapping runs: v4's author is not told to recover June's loss");
+  }
+
+  // (r) A ref listed twice in one call keeps its first capture: the second
+  // upsert sees this run's own unsettled speculation (issue #1137; case (y)
+  // runs the lost race).
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 36, 4)], AUG19);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [overwrite(4, 36, 5), overwrite(4, 36, 6), overwrite(4, 37, 5)], OCT05, "run-tonight");
+    const r36 = row(sqlite, 4, 36);
+    const r37 = row(sqlite, 4, 37);
+    assert(
+      r36.prior_run === "run-tonight" && JSON.parse(r36.prior_json).last_recorded_at === AUG19,
+      `repeated ref: the capture is the row from before tonight (got ${r36.prior_json})`,
+    );
+    assert(r37.prior_run === "run-tonight" && r37.prior_json === null, "a ref tonight created: owned by tonight's run, nothing to put back");
+  }
+
+  // Issue #1137: the crash/retry and overlapping-run cases. A "run" is one
+  // logical reimport (a nightly Workflow run, retried attempt by attempt, or
+  // one UI pull); an attempt is one execution of it. The adapter below is the
+  // only part of this section that knows the writers' signatures:
+  //   begin()     — an attempt starts (the nightly chunk step's entry)
+  //   record(rs)  — the speculative upsert (step 6b)
+  //   land(rs)    — the CAS lands: its reimport edit_log row, then the confirm
+  //   lost(refs)  — the CAS lost: the lost-race cleanup (step 7b)
+  const reimportLanded = (sqlite, r) =>
+    sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+       VALUES ('verse', ?, 'EZK', NULL, ?, ?, 'update', 'dcs_reimport')`,
+    ).run(`EZK/${r.chapter}/${r.verse}/UST`, r.observedVersion, r.observedVersion + 1);
+  // The settle that closes a CAS batch, for one ref, placed right after that
+  // ref's write and edit_log row as bookReimport.ts places it.
+  const settleOne = (env, r) => settleLandedConflictStmt(env, "EZK", "ust", [r]);
+  // A dead run's capture older than this is rolled back by any later run.
+  const STALE_SECONDS = 3600;
+  let runSeq = 0;
+  const run1137 = (sqlite, env, { startedAt, nightly }) => {
+    // A nightly run's id is stable across its attempts; a UI pull is never
+    // retried, and every one gets its own (bookReimport.ts's applyVerseRows).
+    const runId = `${nightly ? "nightly" : "ui"}:${startedAt}:${++runSeq}`;
+    return {
+      attempt(now) {
+        return {
+          // A nightly chunk step's entry (reimportStagedChunk) or a UI pull's
+          // (runReimport): roll back this run's own dead attempts, and any
+          // run's capture older than STALE_SECONDS.
+          begin: () => rollBackDeadAttemptConflicts(env, "EZK", ["ust"], 4, 4, runId, now - STALE_SECONDS),
+          record: (rows) => recordVerseMergeConflicts(env, "EZK", "ust", "UST", rows, now, runId),
+          // The CAS batch, landing: each write's reimport edit_log row, then its settle.
+          cas: (rows) =>
+            env.DB.batch(rows.flatMap((r) => [
+              env.DB.prepare(
+                `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+                 VALUES ('verse', ?, 'EZK', NULL, ?, ?, 'update', 'dcs_reimport')`,
+              ).bind(`EZK/${r.chapter}/${r.verse}/UST`, r.observedVersion, r.observedVersion + 1),
+              settleOne(env, r),
+            ])),
+          land: async function (rows) {
+            await this.cas(rows);
+            await confirmAdoptedConflicts(env, "EZK", "ust", rows.filter((r) => r.action === "adopt_conflict"), now);
+          },
+          // The CAS batch, losing (the version moved): the write and its gated
+          // edit_log row change nothing, then the settle; then step 7b.
+          casLost: async (rows) => {
+            await env.DB.batch(rows.flatMap((r) => [
+              env.DB.prepare(`UPDATE verses SET version = version WHERE 0`),
+              settleOne(env, r),
+            ]));
+            await deleteLostAdoptionConflicts(env, "EZK", "ust", rows.map((r) => ({ chapter: r.chapter, verse: r.verse })), runId);
+          },
+          lost: (refs) => deleteLostAdoptionConflicts(env, "EZK", "ust", refs, runId),
+        };
+      },
+    };
+  };
+  const ow = (chapter, verse, version, extra = {}) => ({ ...overwrite(chapter, verse, version), observedVersion: version, ...extra });
+  const claimsOverwriteOf = (sqlite, chapter, verse, version) =>
+    sqlite.prepare(
+      `SELECT COUNT(*) c FROM verse_merge_conflicts WHERE book = 'EZK' AND chapter = ? AND verse = ? AND overwritten_version = ?`,
+    ).get(chapter, verse, version).c;
+  const auditRow = (chapter, verse) => ({ ...ow(chapter, verse, 3), action: "adopt_no_visible_change", reason: "both_changed_markers_only" });
+
+  // (s) Item 2: Monday's unreviewed adopt_conflict (v5). Tonight's attempt 1
+  // upserts and dies before its CAS; the retry upserts again and loses its
+  // race. Monday's row comes back whole and its editor is still alerted.
+  {
+    const { sqlite, env } = migratedEnv();
+    authored(sqlite, 4, 40, 5);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [ow(4, 40, 5, { alignment: snap("monday") })], AUG19);
+    const monday = speculative(row(sqlite, 4, 40));
+    const R = run1137(sqlite, env, { startedAt: OCT05, nightly: true });
+    const tonight = ow(4, 40, 8, { alignment: snap("tuesday") });
+    const a1 = R.attempt(OCT05);
+    await a1.begin();
+    await a1.record([tonight]); // dies here
+    const a2 = R.attempt(OCT05 + 60);
+    await a2.begin();
+    await a2.record([tonight]);
+    await a2.lost([{ chapter: 4, verse: 40 }]);
+    const r = row(sqlite, 4, 40);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(monday),
+      `#1137 dead attempt + lost retry: Monday's row is back exactly (got ${JSON.stringify(r && speculative(r))})`,
+    );
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const live = liveFor(sqlite, "bcameron93");
+    assert(
+      live.length === 1 && live[0].message.includes("4:40@v5"),
+      `#1137 dead attempt + lost retry: Monday's alert still raises (got: ${live.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+  }
+
+  // (t) Item 1: attempt 1 promotes an audit row to an adopt_conflict at v7 and
+  // dies before its CAS; a person saves the verse; the retry measures
+  // something that is not an adoption and writes no row for it. Nothing may
+  // still claim the v7 overwrite.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 41, 7);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 41)], AUG19);
+    const before = speculative(row(sqlite, 4, 41));
+    const R = run1137(sqlite, env, { startedAt: OCT05, nightly: true });
+    const a1 = R.attempt(OCT05);
+    await a1.begin();
+    await a1.record([ow(4, 41, 7)]); // dies here
+    const a2 = R.attempt(OCT05 + 60);
+    await a2.begin(); // and records nothing for 4:41
+    assert(claimsOverwriteOf(sqlite, 4, 41, 7) === 0, "#1137 dead attempt + non-adopting retry: no row claims the unlanded v7 overwrite");
+    const r = row(sqlite, 4, 41);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(before),
+      `#1137 dead attempt + non-adopting retry: the audit row is back (got ${JSON.stringify(r && speculative(r))})`,
+    );
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    assert(liveFor(sqlite, "jdoe").length === 0, "#1137 dead attempt + non-adopting retry: v7's author is not alerted");
+  }
+
+  // (t2) The guard on (t): attempt 1's CAS LANDED (its CAS batch committed)
+  // and it died before anything after the CAS ran. The overwrite is real, so
+  // the retry must keep the row's claim.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 47)], AUG19);
+    const R = run1137(sqlite, env, { startedAt: OCT05, nightly: true });
+    const a1 = R.attempt(OCT05);
+    await a1.begin();
+    await a1.record([ow(4, 47, 7)]);
+    await a1.cas([ow(4, 47, 7)]); // the CAS landed; the attempt died right after
+    const a2 = R.attempt(OCT05 + 60);
+    await a2.begin(); // D1 now equals master: the retry records nothing for 4:47
+    assert(claimsOverwriteOf(sqlite, 4, 47, 7) === 1, "#1137 dead attempt whose CAS landed: the retry keeps the v7 claim");
+  }
+
+  // (u) Item 6: nightly run B starts; a UI pull A upserts a brand-new row,
+  // then B upserts the same verse; A's CAS lands and confirms; B's loses. A's
+  // landed alert survives B's cleanup.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 42, 11);
+    const tonight = ow(4, 42, 11, { alignment: snap("october") });
+    const B = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05 + 40);
+    const A = run1137(sqlite, env, { startedAt: OCT05 + 30, nightly: false }).attempt(OCT05 + 30);
+    await B.begin();
+    await A.begin();
+    await A.record([tonight]);
+    await B.record([tonight]);
+    await A.land([tonight]);
+    await B.lost([{ chapter: 4, verse: 42 }]);
+    assert(claimsOverwriteOf(sqlite, 4, 42, 11) === 1, "#1137 overlap (UI lands, nightly loses): the landed v11 row survives");
+    await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+    const toJdoe = liveFor(sqlite, "jdoe");
+    assert(
+      toJdoe.length === 1 && toJdoe[0].message.includes("4:42@v11"),
+      `#1137 overlap (UI lands, nightly loses): v11's author is alerted (got: ${toJdoe.map((a) => a.message).join(" | ") || "no alert"})`,
+    );
+  }
+
+  // (v) Item 4, first half: a UI pull A upserts, lands and confirms a new row
+  // AFTER nightly run B started; B then upserts the same verse and loses. A's
+  // row is genuine, not a dead attempt of B's, and survives.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 45, 11);
+    const tonight = ow(4, 45, 11);
+    const B = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05 + 20);
+    const A = run1137(sqlite, env, { startedAt: OCT05 + 10, nightly: false }).attempt(OCT05 + 10);
+    await B.begin();
+    await A.begin();
+    await A.record([tonight]);
+    await A.land([tonight]);
+    await B.record([tonight]);
+    await B.lost([{ chapter: 4, verse: 45 }]);
+    assert(claimsOverwriteOf(sqlite, 4, 45, 11) === 1, "#1137 overlap (genuine row from another run): A's landed v11 row survives B's lost race");
+  }
+
+  // (w) Item 4, second half: nightly X and UI pull Y both upsert a promotion
+  // of the same audit row and both lose. Neither overwrite landed, so the row
+  // ends as the audit row, whichever cleanup runs last.
+  {
+    for (const order of ["XY", "YX"]) {
+      const { sqlite, env } = migratedEnv();
+      jdoe(sqlite);
+      authoredBy(sqlite, 8, 4, 43, 7);
+      await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 43)], AUG19);
+      const before = speculative(row(sqlite, 4, 43));
+      const X = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+      const Y = run1137(sqlite, env, { startedAt: OCT05 + 30, nightly: false }).attempt(OCT05 + 30);
+      await X.begin();
+      await X.record([ow(4, 43, 7)]);
+      await Y.begin();
+      await Y.record([ow(4, 43, 7)]);
+      for (const who of order) await (who === "X" ? X : Y).lost([{ chapter: 4, verse: 43 }]);
+      assert(claimsOverwriteOf(sqlite, 4, 43, 7) === 0, `#1137 overlap, both lose (${order}): no row claims the v7 overwrite`);
+      const r = row(sqlite, 4, 43);
+      assert(
+        r != null && JSON.stringify(speculative(r)) === JSON.stringify(before),
+        `#1137 overlap, both lose (${order}): the audit row is back (got ${JSON.stringify(r && speculative(r))})`,
+      );
+    }
+  }
+
+  // (x) Item 3: a UI pull D upserts a promotion and dies before its CAS; a
+  // later UI pull P upserts the same verse and loses. P must not put back D's
+  // unlanded speculative row as if it were the real prior state.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 44, 7);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 44)], AUG19);
+    const D = run1137(sqlite, env, { startedAt: OCT05, nightly: false }).attempt(OCT05);
+    await D.begin();
+    await D.record([ow(4, 44, 7)]); // dies here
+    const P = run1137(sqlite, env, { startedAt: OCT05 + 3600, nightly: false }).attempt(OCT05 + 3600);
+    await P.begin();
+    await P.record([ow(4, 44, 7)]);
+    await P.lost([{ chapter: 4, verse: 44 }]);
+    assert(claimsOverwriteOf(sqlite, 4, 44, 7) === 0, "#1137 dead UI pull + later lost pull: no row claims the unlanded v7 overwrite");
+  }
+
+  // (y) Items 5 and 7: a ref listed twice in one record call, then a lost
+  // race. Monday's pending alert row survives instead of being deleted.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [ow(4, 46, 5, { alignment: snap("monday") })], AUG19);
+    const monday = speculative(row(sqlite, 4, 46));
+    const a = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+    await a.begin();
+    await a.record([ow(4, 46, 8), ow(4, 46, 9)]);
+    await a.lost([{ chapter: 4, verse: 46 }]);
+    const r = row(sqlite, 4, 46);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(monday),
+      `#1137 repeated ref + lost race: Monday's row is back (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review A1, first case: run A speculates an adoption on an audit row; an
+  // overlapping run B records a final, non-adoption flag on the same verse
+  // (keep_alignment_refused: D1 kept, nothing overwritten); A's CAS loses. B's
+  // flag stands: A's restore must not rewind it to the audit row.
+  const keptFlag = (chapter, verse, version) => ({
+    ...ow(chapter, verse, null), action: "keep_alignment_refused", reason: "alignment_shrink", observedVersion: version,
+  });
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 48)], AUG19);
+    const A = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+    const B = run1137(sqlite, env, { startedAt: OCT05 + 30, nightly: false }).attempt(OCT05 + 30);
+    await A.begin();
+    await A.record([ow(4, 48, 7)]);
+    await B.begin();
+    await B.record([keptFlag(4, 48, 7)]);
+    await A.casLost([ow(4, 48, 7)]);
+    const r = row(sqlite, 4, 48);
+    assert(
+      r?.action === "keep_alignment_refused" && r?.last_recorded_at === OCT05 + 30,
+      `#1137 A1: another run's final keep flag survives a lost race's restore (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review A1, second case: a UI pull D speculates an adoption and dies; a
+  // later run B records a final keep flag on the verse; a later nightly run N
+  // speculates an adoption and loses. N must put back B's flag, not the state
+  // from before D's dead speculation.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 49)], AUG19);
+    const D = run1137(sqlite, env, { startedAt: OCT05, nightly: false }).attempt(OCT05);
+    await D.begin();
+    await D.record([ow(4, 49, 7)]); // dies here
+    const B = run1137(sqlite, env, { startedAt: OCT05 + 60, nightly: false }).attempt(OCT05 + 60);
+    await B.begin();
+    await B.record([keptFlag(4, 49, 7)]);
+    const N = run1137(sqlite, env, { startedAt: OCT05 + 120, nightly: true }).attempt(OCT05 + 120);
+    await N.begin();
+    await N.record([ow(4, 49, 7)]);
+    await N.casLost([ow(4, 49, 7)]);
+    const r = row(sqlite, 4, 49);
+    assert(
+      r?.action === "keep_alignment_refused" && r?.last_recorded_at === OCT05 + 60,
+      `#1137 A1: a later lost race puts back the keep flag, not the state before a dead pull (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review A2: a non-adoption reimport write (a source-attribute reconcile, an
+  // AI reseed) logs dcs_reimport at the verse's observed version, and then the
+  // adoption's CAS loses (the version moved under it). That write is not the
+  // adoption landing: no row may claim the v7 overwrite.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 50, 7);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 50)], AUG19);
+    const before = speculative(row(sqlite, 4, 50));
+    const A = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+    await A.begin();
+    await A.record([ow(4, 50, 7)]);
+    reimportLanded(sqlite, ow(4, 50, 7)); // the reconcile write: dcs_reimport, v7 -> v8
+    await A.casLost([ow(4, 50, 7)]);
+    assert(claimsOverwriteOf(sqlite, 4, 50, 7) === 0, "#1137 A2: a same-version non-adoption reimport write is not read as the adoption landing");
+    const r = row(sqlite, 4, 50);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(before),
+      `#1137 A2: the audit row is back (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review A3: a UI pull D speculates and dies before its CAS (a 502); two
+  // hours later another pull P runs the chapter and no longer adopts the
+  // verse. P's start rolls back D's stale, unlanded capture.
+  {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 51, 7);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 51)], AUG19);
+    const before = speculative(row(sqlite, 4, 51));
+    const D = run1137(sqlite, env, { startedAt: OCT05, nightly: false }).attempt(OCT05);
+    await D.begin();
+    await D.record([ow(4, 51, 7)]); // dies here
+    const P = run1137(sqlite, env, { startedAt: OCT05 + 7200, nightly: false }).attempt(OCT05 + 7200);
+    await P.begin(); // and records nothing for 4:51
+    assert(claimsOverwriteOf(sqlite, 4, 51, 7) === 0, "#1137 A3: a later pull rolls back a dead pull's stale unlanded claim");
+    const r = row(sqlite, 4, 51);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(before),
+      `#1137 A3: the audit row is back (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review F2: the keep_local_structure carve-out. Run A speculates a
+  // promotion of an audit row to adopt_conflict; a keep_local_structure flag
+  // then lands on the same verse (step 7s's late flags, no run id). The row
+  // still shows A's adopt_conflict (the upsert keeps an unresolved
+  // adopt_conflict over keep_local_structure), so A's capture must survive the
+  // flag, and A's lost CAS must put the audit row back.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 53)], AUG19);
+    const before = speculative(row(sqlite, 4, 53));
+    const A = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+    await A.begin();
+    await A.record([ow(4, 53, 7)]);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [{
+      ...ow(4, 53, null), action: "keep_local_structure", reason: "anchor_keep_alignment_refused", observedVersion: 7,
+    }], OCT05);
+    const mid = row(sqlite, 4, 53);
+    assert(mid?.action === "adopt_conflict" && mid?.prior_run != null, "#1137 F2: the carve-out keeps A's adopt_conflict and A's capture");
+    await A.casLost([ow(4, 53, 7)]);
+    const r = row(sqlite, 4, 53);
+    assert(
+      r != null && JSON.stringify(speculative(r)) === JSON.stringify(before) && r.prior_run === null,
+      `#1137 F2: A's lost CAS puts the audit row back (got ${JSON.stringify(r && speculative(r))})`,
+    );
+  }
+
+  // Review E1 (open, see the follow-up issue): two overlapping runs speculate
+  // on one verse with different outcomes. A (a clean `adopt`) and B (an
+  // `adopt_conflict` from a different master revision) both upsert; only one
+  // CAS can land, since both expect the version they read. The second upsert
+  // is computed over the first one's speculative row, and the row cannot be
+  // recomputed from the pre-chain capture inside the CAS batch, so when A
+  // lands the row can still show B's adopt_conflict (an alert A's own merge
+  // judged unnecessary). What does hold, and is pinned here: whichever run
+  // lands, the row is settled, still claims the v7 overwrite that really
+  // happened (no alert or recovery pointer is lost), and when the
+  // adopt_conflict run lands its author is alerted.
+  for (const [order, lands] of [["AB", "A"], ["AB", "B"], ["BA", "A"], ["BA", "B"]]) {
+    const { sqlite, env } = migratedEnv();
+    jdoe(sqlite);
+    authoredBy(sqlite, 8, 4, 54, 7);
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 54)], AUG19);
+    const A = run1137(sqlite, env, { startedAt: OCT05, nightly: true }).attempt(OCT05);
+    const B = run1137(sqlite, env, { startedAt: OCT05 + 30, nightly: false }).attempt(OCT05 + 30);
+    const cleanA = ow(4, 54, 7, { action: "adopt", reason: "master_only" });
+    const conflictB = ow(4, 54, 7, { alignment: snap("b") });
+    await A.begin();
+    await B.begin();
+    for (const who of order) await (who === "A" ? A.record([cleanA]) : B.record([conflictB]));
+    if (lands === "A") {
+      await A.land([cleanA]);
+      await B.casLost([conflictB]);
+    } else {
+      await B.land([conflictB]);
+      await A.casLost([cleanA]);
+    }
+    const r = row(sqlite, 4, 54);
+    assert(r?.prior_run === null, `#1137 E1 (${order}, ${lands} lands): the row is settled`);
+    assert(claimsOverwriteOf(sqlite, 4, 54, 7) === 1, `#1137 E1 (${order}, ${lands} lands): the row still points at the landed v7 overwrite`);
+    if (lands === "B") {
+      await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: OCT05 * 1000 });
+      assert(
+        r?.action === "adopt_conflict" && lostWords(r) === "b" && liveFor(sqlite, "jdoe").length === 1,
+        `#1137 E1 (${order}, B lands): B's adopt_conflict stands and v7's author is alerted`,
+      );
+    }
+  }
+
+  // Review A3's guard: a capture younger than the threshold may belong to a
+  // run still in flight, so another run's start leaves it alone.
+  {
+    const { sqlite, env } = migratedEnv();
+    await recordVerseMergeConflicts(env, "EZK", "ust", "UST", [auditRow(4, 52)], AUG19);
+    const X = run1137(sqlite, env, { startedAt: OCT05, nightly: false }).attempt(OCT05);
+    await X.begin();
+    await X.record([ow(4, 52, 7)]); // still in flight
+    const P = run1137(sqlite, env, { startedAt: OCT05 + 60, nightly: false }).attempt(OCT05 + 60);
+    await P.begin();
+    assert(row(sqlite, 4, 52)?.prior_run != null, "#1137 A3: a young capture from another run is not rolled back");
+  }
 }
 
 if (failed) {

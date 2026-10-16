@@ -27,6 +27,7 @@ import {
   maybeCheckCancelled,
   tnPayload,
   tnDedupQuote,
+  isDistinctTwinTn,
   tqPayload,
   applyTnHintExpansionIfMatch,
   outputKindAllowedFor,
@@ -435,13 +436,13 @@ function tnProposal(chapter, verse) {
 }
 
 function selectCalls(calls) {
-  return calls.filter((c) => /SELECT id, version FROM tn_rows/.test(c.sql));
+  return calls.filter((c) => /SELECT id, version, book, chapter/.test(c.sql));
 }
 
 function pairsFromArgs(args) {
-  // args = [book, startChapter, endChapter, AI_SOURCE, ch1, v1, ch2, v2, ...]
+  // args = [book, startChapter, endChapter, ch1, v1, ch2, v2, ...]
   const pairs = [];
-  for (let i = 4; i < args.length; i += 2) {
+  for (let i = 3; i < args.length; i += 2) {
     pairs.push({ chapter: args[i], verse: args[i + 1] });
   }
   return pairs;
@@ -509,14 +510,20 @@ await (async () => {
     "preserve = 0",
     "hint = 0",
     "chapter BETWEEN",
-    "updated_by IS NULL",
   ]) {
     assert(sql.includes(guard), `guard-preservation: generated SQL retains "${guard}"`);
   }
+  // The keep decision moved out of SQL into classifyKept (#1152 PR B): the
+  // SELECT must return every candidate (no updated_by / latest-source filter,
+  // or a row classifyKept would delete is never seen) and must hand back the
+  // columns classifyKept reads.
   assert(
-    /FROM edit_log/.test(sql) && /action IN \('create', 'update'\)/.test(sql),
-    "guard-preservation: generated SQL retains the edit_log latest-content-source subquery",
+    !/updated_by IS NULL/.test(sql) && !/FROM edit_log/.test(sql),
+    "keep rule: the SELECT no longer filters on updated_by or the latest edit_log source",
   );
+  for (const col of ["updated_by", "quote", "note", "support_reference", "preserve", "ref_raw"]) {
+    assert(sql.includes(col), `keep rule: the SELECT returns ${col} for classifyKept`);
+  }
 })();
 
 // --- Test 2b: Codex finding — a verse with an accepted proposal must be
@@ -598,7 +605,122 @@ await (async () => {
     inputKeys.every((k) => seenSet.has(k)),
     "binding integrity: union of bound pairs across all statements equals the input pairs exactly",
   );
-});
+})();
+
+// --- #1152 PR B: the sweep deletes exactly what classifyKept does not keep ---
+// Drives the REAL deleteUnkeptTns with candidate rows + edit_log history and
+// asserts which ids reach the delete batch. Each case is a row class where the
+// old sweep rule (latest create/update source != 'ai_pipeline' => human-owned)
+// and classifyKept disagreed on prod (measured 2026-10-06 on EZK/ISA/DAN/ZEC:
+// 66 rows with latest source NULL, 35 with dcs_reimport, all kept by the old
+// sweep and NOT in the kept list sent to the bot).
+await (async () => {
+  const { classifyKept } = await import("./keptNotes.ts");
+  const AI = { quote: "q", note: "AI wrote this note.", support_reference: "rc://*/ta/man/translate/figs-metaphor" };
+  let ts = 5_000;
+  const ev = (action, source, user_id, payload) => ({
+    action, source, user_id, created_at: (ts += 10), payload_json: JSON.stringify(payload),
+  });
+  const aiCreate = (id) => ({ row_key: id, ...ev("create", "ai_pipeline", 7, AI) });
+  const withKey = (id, e) => ({ row_key: id, ...e });
+  const mkRow = (id, over = {}) => ({
+    id, version: 3, book: "DAN", chapter: 11, verse: 32, ref_raw: "11:32",
+    preserve: 0, updated_by: 7, ...AI, ...over,
+  });
+  const cases = [
+    { id: "pri1", row: mkRow("pri1", { updated_by: null }), log: [], deleted: true, why: "pristine row" },
+    {
+      id: "nolg", row: mkRow("nolg"), log: [],
+      deleted: false, why: "updated_by set but no edit_log history (pruned) stays",
+    },
+    { id: "aiof", row: mkRow("aiof"), log: [aiCreate("aiof")], deleted: true, why: "AI-only row" },
+    {
+      id: "edit", row: mkRow("edit", { note: "A translator rewrote this." }),
+      log: [aiCreate("edit"), withKey("edit", ev("update", null, 9, { note: "A translator rewrote this." }))],
+      deleted: false, why: "real human edit stays",
+    },
+    {
+      id: "wsps", row: mkRow("wsps", { note: "AI wrote this note. " }),
+      log: [aiCreate("wsps"), withKey("wsps", ev("update", null, 9, { note: "AI wrote this note. " }))],
+      deleted: true, why: "whitespace-only human save (old rule kept it)",
+    },
+    {
+      id: "reor", row: mkRow("reor"),
+      log: [aiCreate("reor"), withKey("reor", ev("update", null, 9, { sort_order: 200 }))],
+      deleted: true, why: "reorder-only save (old rule kept it)",
+    },
+    {
+      id: "rvrt", row: mkRow("rvrt"),
+      log: [
+        aiCreate("rvrt"),
+        withKey("rvrt", ev("update", null, 9, { note: "Changed." })),
+        withKey("rvrt", ev("update", null, 9, { note: AI.note })),
+      ],
+      deleted: true, why: "edited then reverted to the AI text (old rule kept it)",
+    },
+    {
+      id: "rpar", row: mkRow("rpar", { quote: "q2" }),
+      log: [aiCreate("rpar"), withKey("rpar", ev("update", "quote_repair", 2, { quote: "q2" }))],
+      deleted: true, why: "quote-repair script rewrite (old rule kept it)",
+    },
+    {
+      id: "dcsr", row: mkRow("dcsr"),
+      log: [aiCreate("dcsr"), withKey("dcsr", ev("update", "dcs_reimport", null, { tags: null }))],
+      deleted: true, why: "Door43 sync that only cleared tags (old rule kept it)",
+    },
+    {
+      id: "migr", row: mkRow("migr"),
+      log: [withKey("migr", ev("create", "parallel_migration", 2, AI))],
+      deleted: false, why: "migrated note stays (D4)",
+    },
+  ];
+
+  const deletedIds = [];
+  const logRows = cases.flatMap((c) => c.log);
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              sql, args,
+              async all() {
+                if (/FROM pending_imports/.test(sql)) return { results: [] };
+                if (/SELECT id, version, book, chapter/.test(sql)) return { results: cases.map((c) => c.row) };
+                if (/FROM edit_log/.test(sql)) {
+                  const wanted = new Set(args.slice(1));
+                  return { results: logRows.filter((e) => wanted.has(e.row_key)) };
+                }
+                return { results: [] };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts) {
+        return stmts.map((st) => {
+          if (/^\s*UPDATE tn_rows/.test(st.sql)) {
+            deletedIds.push(st.args[2]);
+            return { meta: { changes: 1 } };
+          }
+          return { meta: { changes: 0 } };
+        });
+      },
+    },
+  };
+
+  const n = await deleteUnkeptTns(env, job11, 1, "AI pipeline", [tnProposal(11, 32)], newHeartbeat());
+  assert(n === deletedIds.length, `kept-rule sweep: returned count (${n}) matches deletes issued (${deletedIds.length})`);
+  for (const c of cases) {
+    assert(deletedIds.includes(c.id) === c.deleted, `kept-rule sweep: ${c.why} -> ${c.deleted ? "deleted" : "kept"}`);
+    if (c.row.updated_by != null) {
+      assert(
+        classifyKept(c.row, c.log).kept === !c.deleted,
+        `kept-rule sweep: ${c.id} verdict equals classifyKept (the list the bot was sent)`,
+      );
+    }
+  }
+})();
 
 // --- error-path release is CAS'd too: a pass that already lost the lease must
 //     NOT null out the new owner's claim when it later throws ---
@@ -972,7 +1094,10 @@ function buildFakeAbortDb(flipAfterProposals, opts = {}) {
     if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no accepted TN proposals yet
     }
-    if (/SELECT id, version FROM tn_rows t/.test(sql)) {
+    if (/SELECT DISTINCT chapter, verse FROM tn_rows/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #1151 whole-chapter scope: no extra verses
+    }
+    if (/SELECT id, version, book, chapter/.test(sql)) {
       return { changes: 0, rows: seedTnDeleteRows, single: null };
     }
     if (/UPDATE tn_rows\s+SET deleted_at/.test(sql)) {
@@ -1007,6 +1132,9 @@ function buildFakeAbortDb(flipAfterProposals, opts = {}) {
     if (/UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(sql)) {
       releaseCalls.push({ sql, args });
       return { changes: 1, rows: [], single: null };
+    }
+    if (/FROM verses/.test(sql) && /bible_version = \?4/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #966 apply UHB preload (TN dedup) — no source verses
     }
     throw new Error(`fakeAbortDb: unhandled SQL: ${sql}`);
   }
@@ -1315,8 +1443,11 @@ await (async () => {
         single: null,
       };
     }
-    if (/SELECT id, version FROM tn_rows t/.test(sql)) {
+    if (/SELECT id, version, book, chapter/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no unkept TNs in scope
+    }
+    if (/SELECT DISTINCT chapter, verse FROM tn_rows/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #1151 whole-chapter scope: no extra verses
     }
     if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no accepted TN proposals yet
@@ -3167,16 +3298,19 @@ await (async () => {
         single: null,
       };
     }
+    if (/SELECT DISTINCT chapter, verse FROM tn_rows/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #1151 whole-chapter scope: no extra verses
+    }
     if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no accepted TN proposals yet
     }
-    if (/SELECT id, version FROM tn_rows t\b/.test(sql)) {
+    if (/SELECT id, version, book, chapter/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // nothing UNKEPT — the live row is preserved
     }
     if (/SELECT id, version FROM tn_rows\s+WHERE id = \?1/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no hint stub matches
     }
-    if (/SELECT chapter, verse, occurrence, support_reference, quote, note\s+FROM tn_rows/.test(sql)) {
+    if (/SELECT chapter, verse, ref_raw, occurrence, support_reference, quote, note\s+FROM tn_rows/.test(sql)) {
       // The LIVE, pre-fix row: same content, but STORED with straight quotes
       // (as a pre-fix AI run, or a translator who typed straight quotes,
       // would have left it) — preserved and un-swept, so it's still here.
@@ -3208,6 +3342,9 @@ await (async () => {
     if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) {
       skippedDupAcceptCount += 1;
       return { changes: 1, rows: [], single: null };
+    }
+    if (/FROM verses/.test(sql) && /bible_version = \?4/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // #966 apply UHB preload (TN dedup) — no source verses
     }
     throw new Error(`fakeTnDedupDriftDb: unhandled SQL: ${sql}`);
   }
@@ -3696,5 +3833,429 @@ await (async () => {
     );
   }
 }
+
+// ─── #966: byte-distinct Hebrew twins stay separate notes at AI apply ───────
+// translationCore counts each byte-distinct surface as its own occurrence
+// sequence (quoteExact, lint.ts): DAN 2:10 holds both `כָּ⁠ל` (U+2060) and bare
+// `כָּל`. The #962 fold (tnDedupQuote) merged them, so a proposal quoting one
+// twin was dropped as a duplicate of a live note quoting the other. Driven
+// through the REAL importJobOutput (staging + apply) against a migrated
+// node:sqlite database, so the SQL, the staging canonize and the apply dedup
+// all run for real. Every fixture is spelled in \u escapes and its byte
+// difference is asserted below, so no case can pass on identical bytes.
+await (async () => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+
+  const KOL_WJ = "\u05db\u05bc\u05b8\u2060\u05dc"; // kol, UHB bytes (dagesh, qamats) with the U+2060 word joiner
+  const KOL = "\u05db\u05bc\u05b8\u05dc"; // kol, UHB bytes, bare
+  const KOL_NFC = "\u05db\u05b8\u05bc\u05dc"; // kol in NFC order (qamats, dagesh), no joiner: a legacy AI row
+  const KOL_PATAH = "\u05db\u05bc\u05b7\u05dc"; // kol with the joiner dropped AND patah for qamats: an AI slip
+  const KOH_UHB = "\u05db\u05bc\u05b9\u05a5\u05d4"; // koh, dagesh before holam (UHB)
+  const KOH_NFC = "\u05db\u05b9\u05bc\u05a5\u05d4"; // koh, holam before dagesh (NFC)
+  const LOGOS = "\u03bb\u03cc\u03b3\u03bf\u03c2"; // logos, precomposed omicron-tonos
+  const LOGOS_DECOMP = "\u03bb\u03bf\u0301\u03b3\u03bf\u03c2"; // logos, omicron + combining acute
+  const hex = (s) => Buffer.from(s).toString("hex");
+  for (const [a, b] of [[KOL_WJ, KOL], [KOL, KOL_NFC], [KOH_UHB, KOH_NFC], [LOGOS, LOGOS_DECOMP]]) {
+    assert(a !== b, `#966 precondition: ${hex(a)} and ${hex(b)} differ in bytes`);
+    assert(tnDedupQuote(a) === tnDedupQuote(b), `#966 precondition: ${hex(a)} and ${hex(b)} fold together`);
+  }
+
+  const migrations = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  const migrationSql = readdirSync(migrations).filter((f) => f.endsWith(".sql")).sort()
+    .map((f) => readFileSync(join(migrations, f), "utf8"));
+
+  // One job against a fresh database. `source` maps verse -> UHB/UGNT word
+  // texts; `live` rows are preserved (deleteUnkeptTns keeps them, so only the
+  // content dedup stands between a re-proposal and a second copy); `tsv` rows
+  // go through staging; `prestaged` rows are written to pending_imports as-is
+  // (staged_at set), modelling a proposal staged before #959.
+  async function runJob({ book, chapter, source = {}, live = [], tsv = [], prestaged = [], failSourceRead = false }) {
+    const sqlite = new DatabaseSync(":memory:");
+    for (const sql of migrationSql) sqlite.exec(sql);
+    let sourceReads = 0;
+    const mk = (sql, args) => ({
+      sql, args,
+      bind: (...a) => mk(sql, a),
+      all() {
+        if (/FROM verses/.test(sql) && /bible_version = \?4/.test(sql)) {
+          sourceReads += 1;
+          if (failSourceRead) throw new Error("D1: source read failed");
+        }
+        return { results: sqlite.prepare(sql).all(...args), success: true };
+      },
+      first() { const r = sqlite.prepare(sql).all(...args); return r.length ? r[0] : null; },
+      run() { const r = sqlite.prepare(sql).run(...args); return { success: true, meta: { changes: Number(r.changes) } }; },
+    });
+    const env = { DB: { prepare: (sql) => mk(sql, []), async batch(stmts) { return stmts.map((s) => s.run()); } } };
+
+    const srcVersion = book === "TIT" ? "UGNT" : "UHB";
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator9')`).run();
+    sqlite.prepare(
+      `INSERT INTO pipeline_jobs (job_id, user_id, pipeline_type, book, start_chapter, end_chapter, session_key, state, staged_at)
+       VALUES ('job-966', 1, 'notes', ?, ?, ?, 'sess', 'running', ?)`,
+    ).run(book, chapter, chapter, prestaged.length ? 1000 : null);
+    for (const [v, texts] of Object.entries(source)) {
+      const verseObjects = texts.map((text) => ({ type: "word", tag: "w", text, strong: "H3605", lemma: "", morph: "" }));
+      sqlite.prepare(
+        `INSERT INTO verses (book, chapter, verse, bible_version, content_json) VALUES (?, ?, ?, ?, ?)`,
+      ).run(book, chapter, Number(v), srcVersion, JSON.stringify({ verseObjects }));
+    }
+    for (const r of live) {
+      sqlite.prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, quote, occurrence, note, sort_order, preserve, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 100, ?, 1)`,
+      ).run(r.id, book, chapter, r.verse, r.ref ?? `${chapter}:${r.verse}`, r.quote, r.occ ?? 1, r.note ?? "n", r.preserve ?? 1);
+    }
+    for (const r of prestaged) {
+      const payload = { id: r.id, book, chapter, verse: r.verse, ref_raw: r.ref ?? `${chapter}:${r.verse}`, tags: null,
+        support_reference: null, quote: r.quote, occurrence: r.occ ?? 1, note: r.note ?? "n" };
+      sqlite.prepare(
+        `INSERT INTO pending_imports (job_id, kind, book, chapter, verse, payload_json) VALUES ('job-966', 'tn', ?, ?, ?, ?)`,
+      ).run(book, chapter, r.verse, JSON.stringify(payload));
+    }
+    const tsvText = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n" +
+      tsv.map((r) => `${r.ref ?? `${chapter}:${r.verse}`}\t${r.id}\t\t\t${r.quote}\t${r.occ ?? 1}\t${r.note ?? "n"}\n`).join("");
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(tsvText, { status: 200 });
+    let result;
+    let error = null;
+    try {
+      result = await importJobOutput(
+        env,
+        { jobId: "job-966", pipelineType: "notes", book, startChapter: chapter, endChapter: chapter },
+        tsv.length ? [{ repo: "unfoldingWord/en_tn", rawUrl: `https://example.invalid/tn_${book}.tsv` }] : [],
+      );
+    } catch (e) {
+      if (!failSourceRead) throw e;
+      error = e;
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    const rows = sqlite.prepare(
+      `SELECT id, quote FROM tn_rows WHERE book = ? AND deleted_at IS NULL ORDER BY id`,
+    ).all(book);
+    return { result, rows, sourceReads, error };
+  }
+
+  // 1. The issue's case: live `כָּ⁠ל`, proposal bare `כָּל`, every other field
+  // identical, both words in the verse's UHB. Two notes, not one.
+  {
+    const { result, rows, sourceReads } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL_WJ, KOL] },
+      live: [{ id: "aaaa", verse: 10, quote: KOL_WJ }],
+      tsv: [{ id: "bbbb", verse: 10, quote: KOL }],
+    });
+    assert(result.applied?.tnCreated === 1 && result.applied?.tnSkippedDup === 0,
+      `#966: a proposal quoting bare כָּל is NOT deduped against a live כָּ⁠ל note (created=${result.applied?.tnCreated}, skippedDup=${result.applied?.tnSkippedDup})`);
+    assert(rows.length === 2 && rows.some((r) => r.quote === KOL_WJ) && rows.some((r) => r.quote === KOL),
+      "#966: both twin notes exist after apply, each in its own bytes");
+    assert(sourceReads === 1, `#966: staging and apply share ONE UHB preload query per job (got ${sourceReads})`);
+  }
+  // 1b. Mark-order twins (1CH 22:19's shape), the other way round.
+  {
+    const { result, rows } = await runJob({
+      book: "JER", chapter: 29, source: { 4: [KOH_UHB, KOH_NFC] },
+      live: [{ id: "aaaa", verse: 4, quote: KOH_NFC }],
+      tsv: [{ id: "bbbb", verse: 4, quote: KOH_UHB }],
+    });
+    assert(result.applied?.tnCreated === 1 && rows.length === 2,
+      `#966: mark-order twins that are both UHB surfaces stay two notes (created=${result.applied?.tnCreated}, rows=${rows.length})`);
+  }
+
+  // 2. #959/#962 doubling guard: a live NFC row with the joiner dropped and its
+  // re-proposal (canonized to UHB bytes at staging) are ONE note.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOH_UHB, KOL_WJ] },
+      live: [{ id: "aaaa", verse: 10, quote: `${KOH_NFC} ${KOL_NFC}` }],
+      tsv: [{ id: "bbbb", verse: 10, quote: `${KOH_NFC} ${KOL_NFC}` }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && result.applied?.tnCreated === 0 && rows.length === 1,
+      `#966: a live NFC row still dedups its canonized re-proposal (created=${result.applied?.tnCreated}, skippedDup=${result.applied?.tnSkippedDup})`);
+  }
+
+  // 3. A proposal staged before #959 (raw NFC in pending_imports) against a live
+  // row in UHB bytes: still one note.
+  {
+    const { result, rows, sourceReads } = await runJob({
+      book: "JER", chapter: 29, source: { 4: [KOH_UHB] },
+      live: [{ id: "aaaa", verse: 4, quote: KOH_UHB }],
+      prestaged: [{ id: "bbbb", verse: 4, quote: KOH_NFC }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: an uncanonized pre-#959 proposal still dedups (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+    assert(sourceReads === 1, `#966: an already-staged job's apply loads the UHB once (got ${sourceReads})`);
+  }
+
+  // 4. A live row that cannot be canonized (no UHB loaded for its verse) holds
+  // NFC with the joiner dropped; the AI re-emits UHB bytes. Still one note.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 9: [KOL] },
+      live: [{ id: "aaaa", verse: 10, quote: KOL_NFC }],
+      tsv: [{ id: "bbbb", verse: 10, quote: KOL_WJ }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: no UHB words for the verse falls back to the fold (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+  }
+
+  // 5. A legacy NFC row in a twin verse is ambiguous (it could be either twin):
+  // a re-run must not add a second copy of it.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL_WJ, KOL] },
+      live: [{ id: "aaaa", verse: 10, quote: KOL_NFC }],
+      tsv: [{ id: "bbbb", verse: 10, quote: KOL_WJ }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: an ambiguous legacy NFC row in a twin verse still dedups a re-proposal (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+  }
+
+  // 6. A live row whose ref_raw is a range resolves its twin against the words
+  // of every verse it covers, the same candidates the proposal is checked on.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL], 11: [KOL_WJ] },
+      live: [{ id: "aaaa", verse: 10, ref: "2:10-11", quote: KOL_WJ }],
+      tsv: [{ id: "bbbb", verse: 10, quote: KOL }],
+    });
+    assert(result.applied?.tnCreated === 1 && rows.length === 2,
+      `#966: twins resolved across a live row's verse range stay two notes (created=${result.applied?.tnCreated}, rows=${rows.length})`);
+  }
+
+  // 6b. A proposal that is a UHB surface only because staging's LOOSE tier
+  // rewrote it is not evidence of a twin. The AI re-proposes the live `כָּ⁠ל`
+  // note but drops the joiner and writes patah for qamats: the exact tier
+  // misses, the stripped tier (whose key keeps U+2060) resolves only to bare
+  // `כָּל`, and staging stores that. Still one note.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL_WJ, KOL] },
+      live: [{ id: "aaaa", verse: 10, quote: KOL_WJ }],
+      tsv: [{ id: "bbbb", verse: 10, quote: KOL_PATAH }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: a loose-tier rewrite to the other twin still dedups (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+  }
+  // 6c. A proposal staged before the AI's own quote was recorded (no ai_quote
+  // in the payload) cannot prove its bytes came from the AI: it dedups.
+  {
+    const { result, rows } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL_WJ, KOL] },
+      live: [{ id: "aaaa", verse: 10, quote: KOL_WJ }],
+      prestaged: [{ id: "bbbb", verse: 10, quote: KOL }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: an already-staged twin proposal with no recorded AI quote fails safe to dedup (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+  }
+
+  // 7. NT keeps the #962 fold: composition and joiner differences still dedup,
+  // even with both forms present in the loaded UGNT.
+  {
+    const { result, rows, sourceReads } = await runJob({
+      book: "TIT", chapter: 1, source: { 3: [LOGOS, LOGOS_DECOMP] },
+      live: [{ id: "aaaa", verse: 3, quote: LOGOS_DECOMP }],
+      tsv: [{ id: "bbbb", verse: 3, quote: LOGOS }],
+    });
+    assert(result.applied?.tnSkippedDup === 1 && rows.length === 1,
+      `#966: an NT re-proposal differing only in composition still dedups (skippedDup=${result.applied?.tnSkippedDup}, rows=${rows.length})`);
+    assert(sourceReads === 0, `#966: an NT notes-only job loads no source words (got ${sourceReads})`);
+  }
+
+  // 7b. An already-staged job whose source-word read fails must stop BEFORE
+  // the delete phase: the unkept (pristine, updated_by NULL) note stays live
+  // rather than being swept with no replacement written.
+  {
+    const { result, rows, error } = await runJob({
+      book: "DAN", chapter: 2, source: { 10: [KOL] }, failSourceRead: true,
+      live: [{ id: "aaaa", verse: 10, quote: KOL, note: "old", preserve: 0 }],
+      prestaged: [{ id: "bbbb", verse: 10, quote: KOL, note: "new" }],
+    });
+    assert(rows.length === 1 && rows[0].id === "aaaa",
+      `#966: a failed source-word read deletes nothing (rows=${JSON.stringify(rows.map((r) => r.id))}, tnDeleted=${result?.applied?.tnDeleted}, error=${error?.message ?? result?.error ?? "none"})`);
+  }
+
+  // 8. A null ref_raw (tn_rows.ref_raw is NOT NULL, so only a malformed
+  // payload) covers just the row's own verse: twins there still split, and a
+  // proposal with no trusted word still folds.
+  {
+    const w = (text) => ({ text, strong: "H3605", lemma: "", morph: "" });
+    const words = new Map([[2 * 100000 + 10, [w(KOL_WJ), w(KOL)]]]);
+    const live = { quote: KOL_WJ, refRaw: null, trusted: null };
+    assert(isDistinctTwinTn(2, 10, live, { quote: KOL, refRaw: null, trusted: [true] }, words),
+      "#966: null ref_raw on both sides still resolves the verse's twins");
+    assert(!isDistinctTwinTn(2, 10, live, { quote: KOL, refRaw: null, trusted: [] }, words),
+      "#966: an untrusted proposal word is not a twin, whatever its bytes");
+    assert(!isDistinctTwinTn(2, 11, live, { quote: KOL, refRaw: null, trusted: [true] }, words),
+      "#966: null ref_raw does not reach another verse's words");
+  }
+})();
+
+// ── #1151: a whole-chapter notes run retires old AI notes in verses it left empty ──
+// The bot's whole-chapter notes run replaces the whole chapter in en_tn
+// (unfoldingWord/bp-assistant#436). The sweep used to cover only the verses
+// that had a proposal, so an old AI note in a verse the new run left empty
+// stayed live in D1 and the next export wrote it back (EZK 40, 2026-10-06:
+// 35 rows in verses 11, 25-36, 41, 47). These cases drive the REAL
+// deleteUnkeptTns against the real migrated schema in node:sqlite, so the
+// guards are what SQLite actually does, not what a fake DB returns.
+await (async () => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const migDir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  const migrations = readdirSync(migDir).filter((f) => f.endsWith(".sql")).sort()
+    .map((f) => readFileSync(join(migDir, f), "utf8"));
+
+  const AI_NOTE = { quote: "q", note: "AI wrote this note.", support_reference: "rc://*/ta/man/translate/figs-metaphor" };
+  function freshSweepEnv() {
+    const sqlite = new DatabaseSync(":memory:");
+    for (const m of migrations) sqlite.exec(m);
+    // pending_imports.job_id references pipeline_jobs (which references
+    // users); the sweep never reads either, so skip seeding them.
+    sqlite.exec("PRAGMA foreign_keys = OFF");
+    const stmt =(sql, args = []) => ({
+      sql, args,
+      bind: (...a) => stmt(sql, a),
+      async all() { return { results: sqlite.prepare(sql).all(...args) }; },
+      async first() { return sqlite.prepare(sql).all(...args)[0] ?? null; },
+      async run() { return { meta: { changes: Number(sqlite.prepare(sql).run(...args).changes) } }; },
+    });
+    const DB = {
+      prepare: (sql) => stmt(sql),
+      async batch(stmts) {
+        const out = [];
+        for (const st of stmts) out.push(await st.run());
+        return out;
+      },
+    };
+    let seq = 0;
+    // kind: "ai" (AI-created, untouched), "human" (AI-created then a real
+    // translator rewrite), "added" (a translator's "Add note": empty create,
+    // then a save), "pristine" (bootstrap import, updated_by NULL).
+    const addTn = (book, chapter, verse, { kind = "ai", preserve = 0, hint = 0, trashed = false } = {}) => {
+      const id = `t${String(++seq).padStart(3, "0")}`;
+      const note = kind === "human" || kind === "added" ? "A translator rewrote this." : AI_NOTE.note;
+      sqlite.prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, quote, note, support_reference,
+           preserve, hint, trashed_at, updated_by, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 3)`,
+      ).run(id, book, chapter, verse, `${chapter}:${verse}`, AI_NOTE.quote, note, AI_NOTE.support_reference,
+        preserve, hint, trashed ? 1 : null, kind === "pristine" ? null : 7);
+      if (kind !== "pristine") {
+        const log = sqlite.prepare(
+          `INSERT INTO edit_log (kind, row_key, book, user_id, action, source, payload_json, created_at)
+           VALUES ('tn', ?, ?, ?, ?, ?, ?, ?)`,
+        );
+        if (kind === "added") {
+          log.run(id, book, 9, "create", null, JSON.stringify({ ...AI_NOTE, note: "" }), 1000 + seq);
+        } else {
+          log.run(id, book, 7, "create", "ai_pipeline", JSON.stringify(AI_NOTE), 1000 + seq);
+        }
+        if (kind === "human" || kind === "added") {
+          log.run(id, book, 9, "update", null, JSON.stringify({ note }), 2000 + seq);
+        }
+      }
+      return id;
+    };
+    const accept = (jobId, book, chapter, verse) =>
+      sqlite.prepare(
+        `INSERT INTO pending_imports (job_id, kind, book, chapter, verse, payload_json, accepted_at)
+         VALUES (?, 'tn', ?, ?, ?, '{}', 1)`,
+      ).run(jobId, book, chapter, verse);
+    const live = (id) =>
+      sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE id = ?`).get(id).deleted_at == null;
+    return { env: { DB }, addTn, accept, live };
+  }
+  const prop = (book, chapter, verse) => ({ ...tnProposal(chapter, verse), book });
+  const ezk40 = { jobId: "job-ezk40", pipelineType: "notes", book: "EZK", startChapter: 40, endChapter: 40 };
+
+  // 1. Whole-chapter job: proposals in v1-2 only. Verse 3 got no new notes.
+  {
+    const t = freshSweepEnv();
+    const v1Ai = t.addTn("EZK", 40, 1);
+    const v3Ai = t.addTn("EZK", 40, 3);
+    const v3Pristine = t.addTn("EZK", 40, 3, { kind: "pristine" });
+    const v3Preserve = t.addTn("EZK", 40, 3, { preserve: 1 });
+    const v3Hint = t.addTn("EZK", 40, 3, { hint: 1 });
+    const v3Trashed = t.addTn("EZK", 40, 3, { trashed: true });
+    const v3Human = t.addTn("EZK", 40, 3, { kind: "human" });
+    const v3Added = t.addTn("EZK", 40, 3, { kind: "added" });
+    const introAi = t.addTn("EZK", 40, 0);
+    const otherBook = t.addTn("JER", 40, 3);
+    await deleteUnkeptTns(t.env, ezk40, 1, "AI pipeline", [prop("EZK", 40, 1), prop("EZK", 40, 2)], newHeartbeat());
+    assert(!t.live(v1Ai), "#1151 chapter run: AI note in a proposed verse is swept (unchanged)");
+    assert(!t.live(v3Ai), "#1151 chapter run: old AI note in verse 3 (no new notes there) is swept");
+    assert(!t.live(v3Pristine), "#1151 chapter run: pristine note in verse 3 is swept");
+    assert(t.live(v3Preserve), "#1151 chapter run: preserve note in verse 3 stays");
+    assert(t.live(v3Hint), "#1151 chapter run: hint stub in verse 3 stays");
+    assert(t.live(v3Trashed), "#1151 chapter run: trashed note in verse 3 stays trashed, not deleted");
+    assert(t.live(v3Human), "#1151 chapter run: human-edited note in verse 3 stays");
+    assert(t.live(v3Added), "#1151 chapter run: a translator's own added note in verse 3 stays");
+    assert(t.live(introAi), "#1151 chapter run: chapter intro (verse 0) is not swept when the run proposed no intro");
+    assert(t.live(otherBook), "#1151 chapter run: another book's note in the same chapter/verse stays");
+  }
+
+  // 2. The same job with a verse range keeps today's per-verse scope.
+  {
+    const t = freshSweepEnv();
+    const v1Ai = t.addTn("EZK", 40, 1);
+    const v3Ai = t.addTn("EZK", 40, 3);
+    const rangeJob = { ...ezk40, verseRange: { start: 1, end: 2 } };
+    await deleteUnkeptTns(t.env, rangeJob, 1, "AI pipeline", [prop("EZK", 40, 1), prop("EZK", 40, 2)], newHeartbeat());
+    assert(!t.live(v1Ai), "#1151 verse-range run: AI note inside the range is swept");
+    assert(t.live(v3Ai), "#1151 verse-range run: AI note outside the range (verse 3) stays");
+  }
+
+  // 3. Resumed pass: an earlier pass of THIS job already filled verse 5 (it
+  //    has an accepted proposal). The chapter-wide sweep must leave verse 5
+  //    alone and still sweep the unresolved and the empty verses.
+  {
+    const t = freshSweepEnv();
+    const v5FirstPass = t.addTn("EZK", 40, 5);
+    t.accept(ezk40.jobId, "EZK", 40, 5);
+    const v6Old = t.addTn("EZK", 40, 6);
+    const v9Old = t.addTn("EZK", 40, 9);
+    await deleteUnkeptTns(t.env, ezk40, 1, "AI pipeline", [prop("EZK", 40, 6)], newHeartbeat());
+    assert(t.live(v5FirstPass), "#1151 resumed pass: a verse an earlier pass already filled is not re-swept");
+    assert(!t.live(v6Old), "#1151 resumed pass: the unresolved verse is swept");
+    assert(!t.live(v9Old), "#1151 resumed pass: an empty verse is swept");
+  }
+
+  // 4. DAN 11 shape on the chapter-wide path: the first pass resolved verses
+  //    1-31; the resumed pass holds 32-45. Its notes in 1-31 must survive.
+  {
+    const t = freshSweepEnv();
+    const dan = { ...job11, jobId: "job-dan11-wide" };
+    const early = [];
+    for (let v = 1; v <= 31; v++) {
+      early.push(t.addTn("DAN", 11, v));
+      t.accept(dan.jobId, "DAN", 11, v);
+    }
+    const v40Old = t.addTn("DAN", 11, 40);
+    const proposals = [];
+    for (let v = 32; v <= 45; v++) proposals.push(prop("DAN", 11, v));
+    await deleteUnkeptTns(t.env, dan, 1, "AI pipeline", proposals, newHeartbeat());
+    assert(early.every((id) => t.live(id)), "#1151 DAN 11 chapter-wide: all 31 first-pass notes survive the resumed pass");
+    assert(!t.live(v40Old), "#1151 DAN 11 chapter-wide: an old note in a still-unresolved verse is swept");
+  }
+
+  // 5. A multi-chapter job widens only the chapters this pass has proposals
+  //    for: a chapter with no output at all is more likely a failed chapter
+  //    than a deliberate wipe, so its notes stay.
+  {
+    const t = freshSweepEnv();
+    const twoCh = { ...ezk40, jobId: "job-ezk40-41", endChapter: 41 };
+    const ch40v3 = t.addTn("EZK", 40, 3);
+    const ch41v3 = t.addTn("EZK", 41, 3);
+    await deleteUnkeptTns(t.env, twoCh, 1, "AI pipeline", [prop("EZK", 40, 1)], newHeartbeat());
+    assert(!t.live(ch40v3), "#1151 multi-chapter: an empty verse in a chapter with proposals is swept");
+    assert(t.live(ch41v3), "#1151 multi-chapter: a chapter with no proposals in this pass is left alone");
+  }
+})();
 
 console.log("pipelineImport (claim guard): all assertions passed");

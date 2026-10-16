@@ -1569,6 +1569,17 @@ export function lintOrphanedBlankText(verses: VerseRow[]): LintIssue[] {
 // number of unconsumed opens. `entries` is sorted defensively (chapter, then
 // verse) rather than trusting caller order, since a mis-ordered scan could
 // consume a closer against an opener that doesn't actually precede it.
+const QUOTATION_MARK_CHECK = "Quotation Mark";
+const PAIRED_PUNCTUATION_CHECK = "Paired punctuation";
+
+/** The two checks whose result for any verse depends on verses before or after
+ *  it in the book (quoteIssues and lintPairedPunctuation). An edit in one
+ *  chapter can add or remove one of these issues in ANY chapter, so a
+ *  chapter-scoped lint (#888) recomputes them over the whole book and the
+ *  client replaces all of them on every merge. Every other check reads one row
+ *  (plus that row's own chapter of source text) and is chapter-local. */
+export const BOOK_WIDE_CHECKS: ReadonlySet<string> = new Set([QUOTATION_MARK_CHECK, PAIRED_PUNCTUATION_CHECK]);
+
 function quoteIssues(verses: VerseRow[]): LintIssue[] {
   const entries: Array<{ ref: string; chapter: number; verse: number; text: string }> = [];
   for (const v of verses) {
@@ -1595,7 +1606,7 @@ function quoteIssues(verses: VerseRow[]): LintIssue[] {
       } else if (ch === "”") {
         if (openCount === 0) {
           issues.push({
-            check: "Quotation Mark",
+            check: QUOTATION_MARK_CHECK,
             bucket: "flag",
             ref: e.ref,
             message: `Closing quote '”' at character ${i + 1} has no opening quote anywhere earlier in the book.`,
@@ -1625,14 +1636,21 @@ export function lintUsfmVerses(
 }
 
 /** Same issue groups/order as the individual checks, with one JSON parse per
- * row for the independent checks. Book-spanning checks still see every verse. */
-export function lintTranslationRows(verses: VerseRow[], source: Map<string, SourceToken[]>) {
+ * row for the independent checks. Book-spanning checks still see every verse.
+ *
+ * `chapter` (#888) limits the chapter-local checks to that chapter's rows; the
+ * BOOK_WIDE_CHECKS still run over every verse passed in, so they match an
+ * unscoped call exactly. `source` then only needs that chapter: every source
+ * lookup is keyed by the row's own chapter (wordsForRow refuses a span into
+ * another chapter). Without `chapter` the output is unchanged. */
+export function lintTranslationRows(verses: VerseRow[], source: Map<string, SourceToken[]>, chapter?: number) {
+  const scoped = chapter === undefined ? verses : verses.filter((v) => v.chapter === chapter);
   const alignment: LintIssue[] = [];
   const usfm: LintIssue[] = quoteIssues(verses);
   const orphaned: LintIssue[] = [];
   const quality: LintIssue[] = [];
   try {
-    for (const row of verses) {
+    for (const row of scoped) {
       const rows = [row];
       alignment.push(...lintAlignmentOccurrences(rows, source));
       usfm.push(...lintUsfmVerseRows(rows, source));
@@ -1641,7 +1659,7 @@ export function lintTranslationRows(verses: VerseRow[], source: Map<string, Sour
     }
     return {
       alignment, usfm, orphaned, quality,
-      opening: lintChapterOpeningMarkers(verses),
+      opening: lintChapterOpeningMarkers(scoped),
       punctuation: lintPairedPunctuation(verses),
     };
   } finally {
@@ -2004,7 +2022,7 @@ export function lintPairedPunctuation(verses: VerseRow[]): LintIssue[] {
           stack.pop();
         } else if (!pairC.apostropheAmbiguous) {
           issues.push({
-            check: "Paired punctuation",
+            check: PAIRED_PUNCTUATION_CHECK,
             bucket: "flag",
             ref,
             message: `closing ${pairC.close} has no matching opening ${pairC.open}: “${excerptAround(prose, i)}”.`,
@@ -2021,7 +2039,7 @@ export function lintPairedPunctuation(verses: VerseRow[]): LintIssue[] {
   for (const { open, close, name } of PAIRED_MARKS) {
     for (const o of stacks.get(open)!) {
       issues.push({
-        check: "Paired punctuation",
+        check: PAIRED_PUNCTUATION_CHECK,
         bucket: "flag",
         ref: o.ref,
         message: `opening ${open} (${name}) is never closed — no matching ${close} found by the end of the book: “${o.excerpt}”.`,

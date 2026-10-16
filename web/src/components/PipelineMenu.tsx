@@ -36,7 +36,8 @@ import type {
 } from "../sync/api";
 import { getSessionKey, pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { currentPipelineUserId } from "../sync/pipelineSession";
-import { parseChapterRange } from "../lib/refParser";
+import { parsePipelineRange } from "../lib/refParser";
+import { defaultNotesInput, jobScopeLabel, notesStartBlock } from "../lib/pipelineScope";
 
 interface Props {
   book: string;
@@ -186,19 +187,31 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
   const [genOpts, setGenOpts] = useState<GenUiState>(() => loadGenOpts());
   const [conflict, setConflict] = useState<PipelineConflictExisting | null>(null);
   const [refInput, setRefInput] = useState("");
+  // True once the user has typed in the field; until then the field follows
+  // defaultNotesInput as the job store changes (issue #1166).
+  const [refTouched, setRefTouched] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
 
   useEffect(() => pipelineStore.subscribe(setActiveJobs), []);
 
   // Re-load from localStorage whenever the dialog opens for a generate run, so
   // a change made in a different tab is reflected.
+  // A fresh dialog starts untyped, so the prefill effect below owns the field.
   useEffect(() => {
     if (confirm?.type === "generate") setGenOpts(loadGenOpts());
-    if (confirm) setRefInput(String(chapter));
+    if (confirm) setRefTouched(false);
   }, [confirm, book, chapter]);
 
   const genNothingSelected = !genOpts.ult && !genOpts.ust;
-  const refParsed = useMemo(() => parseChapterRange(refInput, book), [refInput, book]);
+  // Verse ranges ("36:10-15") are for the notes pipeline only (issue #1160):
+  // the bot can rerun part of a chapter's notes, not part of a ULT/UST or tq run.
+  // A run with a follow-up chain can't take one (the server refuses it), so the
+  // field shows the same inline error and Start stays disabled.
+  const allowVerses = confirm?.type === "notes" && !confirm.followUpChain;
+  const refParsed = useMemo(
+    () => parsePipelineRange(refInput, book, allowVerses),
+    [refInput, book, allowVerses],
+  );
 
   // "In progress" for the chapter = queued/dispatching/running/paused. A
   // failed or cancelled job covering the chapter must NOT disable the menu —
@@ -219,6 +232,46 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
         j.state !== "cancelled" &&
         (me == null || j.user_id === me),
     );
+  // Notes can run on part of a chapter (issue #1160), and the server queues a
+  // different verse range (or the whole chapter) behind a running one. So the
+  // notes item stays open while a notes run is going, and only the dialog
+  // blocks, when what the user typed is the same scope as their own active
+  // run (issue #1166; same rule as findSameScopeJob in api/src/pipelines.ts),
+  // or a multi-chapter span that includes it (see notesStartBlock).
+  const ownNotesRun = confirm?.type === "notes" ? runningType("notes") : undefined;
+  const hasOwnNotesRun = Boolean(ownNotesRun);
+  // Until the user types, the field follows the store: empty while their own
+  // notes run covers the chapter, the chapter otherwise. Re-applied when the
+  // store catches up after the dialog opened, or when that run finishes; never
+  // over typed input.
+  useEffect(() => {
+    if (confirm && !refTouched) setRefInput(defaultNotesInput(chapter, hasOwnNotesRun));
+  }, [confirm, chapter, hasOwnNotesRun, refTouched]);
+  // The field is empty because of ownNotesRun and nothing is typed yet: Start
+  // stays disabled, the hint asks for a scope.
+  const awaitingNotesScope = hasOwnNotesRun && refInput.trim() === "";
+  const notesBlock =
+    confirm?.type === "notes" && refParsed.ok
+      ? notesStartBlock(
+          activeJobs.filter(
+            (j) =>
+              j.pipeline_type === "notes" &&
+              j.state !== "done" &&
+              j.state !== "failed" &&
+              j.state !== "cancelled" &&
+              (me == null || j.user_id === me),
+          ),
+          {
+            book: refParsed.range.book,
+            startChapter: refParsed.range.startChapter,
+            endChapter: refParsed.range.endChapter,
+            verseRange:
+              refParsed.range.verseStart !== undefined && refParsed.range.verseEnd !== undefined
+                ? { start: refParsed.range.verseStart, end: refParsed.range.verseEnd }
+                : null,
+          },
+        )
+      : null;
 
   const close = () => setAnchorEl(null);
 
@@ -227,7 +280,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
     if (!refParsed.ok) return;
     const isMacro = Boolean(confirm.followUpChain);
     if (confirm.type === "generate" && !isMacro && genNothingSelected) return;
-    const { book: rangeBook, startChapter, endChapter } = refParsed.range;
+    const { book: rangeBook, startChapter, endChapter, verseStart, verseEnd } = refParsed.range;
     const chapters: number[] = [];
     for (let c = startChapter; c <= endChapter; c++) chapters.push(c);
     setSubmitting(true);
@@ -245,6 +298,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
           book: rangeBook,
           startChapter: ch,
           endChapter: ch,
+          ...(verseStart !== undefined && verseEnd !== undefined ? { verseStart, verseEnd } : {}),
           sessionKey: getSessionKey(),
           ...(wire.options ? { options: wire.options } : {}),
           ...(wire.followUpOptions ? { followUpOptions: wire.followUpOptions } : {}),
@@ -254,9 +308,11 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
         if (res.status !== "already_running") startedCount++;
       }
       const rangeLabel =
-        chapters.length === 1
-          ? `${rangeBook} ${startChapter}`
-          : `${rangeBook} ${startChapter}-${endChapter}`;
+        verseStart !== undefined
+          ? `${rangeBook} ${startChapter}:${verseStart}${verseEnd !== verseStart ? `-${verseEnd}` : ""}`
+          : chapters.length === 1
+            ? `${rangeBook} ${startChapter}`
+            : `${rangeBook} ${startChapter}-${endChapter}`;
       if (startedCount > 0) {
         // Single-chapter run that didn't win the bot slot — it's waiting in
         // line. Surface the position instead of "Started".
@@ -320,10 +376,13 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
       <Menu anchorEl={anchorEl} open={Boolean(anchorEl)} onClose={close}>
         {OPTIONS.map((opt) => {
           const running = runningType(opt.type);
+          // Notes: a run on this chapter doesn't close the item; the dialog
+          // blocks only the same scope (see notesBlock).
+          const blocks = Boolean(running) && opt.type !== "notes";
           return (
             <MenuItem
               key={opt.key}
-              disabled={Boolean(running)}
+              disabled={blocks}
               onClick={() => {
                 close();
                 setConfirm(opt);
@@ -333,7 +392,15 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
                 primary={opt.label}
                 secondary={
                   running
-                    ? `Already running (${running.state})`
+                    ? blocks
+                      ? `Already running (${running.state})`
+                      : `Running for ${jobScopeLabel(running)} (${running.state}). ${
+                          running.verse_range == null
+                            ? "A verse range can queue behind it."
+                            : running.verse_range === "invalid"
+                              ? "A different scope can queue behind it."
+                              : "Other verses can queue behind it."
+                        }`
                     : `${opt.description} ${opt.approxDuration}`
                 }
               />
@@ -373,18 +440,29 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
           <Box sx={{ mt: 2, display: "flex", alignItems: "flex-start", gap: 1.5 }}>
             <Typography sx={{ pt: 1, fontWeight: 500 }}>{book}</Typography>
             <TextField
-              label="Chapter or range"
+              label={allowVerses ? "Chapter, range, or verses" : "Chapter or range"}
               value={refInput}
-              onChange={(e) => setRefInput(e.target.value.replace(/[^\d-]/g, ""))}
+              onChange={(e) => {
+                setRefTouched(true);
+                setRefInput(e.target.value.replace(/[^\d:-]/g, ""));
+              }}
               disabled={submitting}
               fullWidth
               size="small"
               autoFocus
-              error={!refParsed.ok}
-              inputProps={{ inputMode: "numeric", pattern: "[0-9-]*" }}
+              error={(!refParsed.ok && !awaitingNotesScope) || Boolean(notesBlock)}
+              inputProps={{ inputMode: allowVerses ? "text" : "numeric", pattern: "[0-9:\\-]*" }}
               helperText={
-                refParsed.ok
-                  ? refParsed.range.startChapter === refParsed.range.endChapter
+                awaitingNotesScope && ownNotesRun
+                  ? `Your notes run for ${jobScopeLabel(ownNotesRun)} is ${ownNotesRun.state}. Type the verses for another run (e.g. ${chapter}:6-8), or ${chapter} for the whole chapter.`
+                  : notesBlock?.kind === "same"
+                  ? `Already running for ${jobScopeLabel(notesBlock.job)} (${notesBlock.job.state}). Pick other verses to queue another run.`
+                  : notesBlock?.kind === "span"
+                  ? `Your notes run for ${jobScopeLabel(notesBlock.job)} is ${notesBlock.job.state}, and this span would queue a whole-chapter rerun behind it. Start the other chapters on their own.`
+                  : refParsed.ok
+                  ? refParsed.range.verseStart !== undefined
+                    ? `Runs once for ${refParsed.range.book} ${refParsed.range.startChapter}:${refParsed.range.verseStart}${refParsed.range.verseEnd !== refParsed.range.verseStart ? `-${refParsed.range.verseEnd}` : ""}. Notes outside these verses are left alone.`
+                    : refParsed.range.startChapter === refParsed.range.endChapter
                     ? `Runs once for ${refParsed.range.book} ${refParsed.range.startChapter}.`
                     : `Runs ${refParsed.range.endChapter - refParsed.range.startChapter + 1} times across ${refParsed.range.book} ${refParsed.range.startChapter}-${refParsed.range.endChapter}.`
                   : refParsed.error
@@ -463,6 +541,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
             disabled={
               submitting ||
               !refParsed.ok ||
+              Boolean(notesBlock) ||
               (confirm?.type === "generate" &&
                 !confirm.followUpChain &&
                 genNothingSelected)
@@ -483,12 +562,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
                   ? `${conflict.started_by_username} started `
                   : "Someone already started "}
                 <strong>{TYPE_LABEL[conflict.pipeline_type]}</strong> for{" "}
-                <strong>
-                  {conflict.book} {conflict.start_chapter}
-                  {conflict.end_chapter !== conflict.start_chapter
-                    ? `–${conflict.end_chapter}`
-                    : ""}
-                </strong>{" "}
+                <strong>{jobScopeLabel(conflict)}</strong>{" "}
                 {relativeMinutes(conflict.created_at)} ago.
               </DialogContentText>
               <DialogContentText sx={{ mt: 1, fontSize: "0.875rem" }}>

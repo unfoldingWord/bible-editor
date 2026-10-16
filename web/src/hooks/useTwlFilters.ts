@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../sync/api";
 import { twlFilterKey } from "../lib/hebrew";
 
@@ -92,11 +92,18 @@ export function useTwlFilters(book: string): TwlFilters {
     };
   }, [book]);
 
-  return {
-    settled,
-    isUnlinked: (origWords, twLink) =>
-      sets.unlinked.has(`${twlFilterKey(origWords)}|${twLink}`),
-    isDeletedHere: (reference, origWords) =>
-      sets.deleted.has(`${reference}|${twlFilterKey(origWords)}`),
-  };
+  // Referentially stable across renders that don't change `sets`/`settled` —
+  // it's a dep of several Shell memos (twlRowAlternatives, isTwlSuggestionExcluded,
+  // twlBlockedArticleIds), and returning a fresh object/closures every render
+  // defeated those memos on every Shell re-render, not just filter updates (#896).
+  return useMemo<TwlFilters>(
+    () => ({
+      settled,
+      isUnlinked: (origWords, twLink) =>
+        sets.unlinked.has(`${twlFilterKey(origWords)}|${twLink}`),
+      isDeletedHere: (reference, origWords) =>
+        sets.deleted.has(`${reference}|${twlFilterKey(origWords)}`),
+    }),
+    [sets, settled],
+  );
 }

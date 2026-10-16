@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -49,14 +50,35 @@ import {
   groupsForCard as groupsForCardId,
   makeEnglishHover,
   makeHebrewHover,
-  resolveEnglishHighlight,
-  resolveHebrewHighlight,
   resolveSourcePos,
   type HoverCtx,
 } from "../lib/alignmentHover";
+import {
+  createHoverStore,
+  useEnglishHighlightTone,
+  useHebrewHighlightTone,
+  type HoverStore,
+} from "../lib/hoverStore";
 import type { TwlRow, VerseDto } from "../sync/api";
-import { alignmentDrafts, alignmentDraftKey, mintAlignmentDraftGeneration } from "../sync/alignmentDrafts";
-import { isVersionOnlyRebase, lostAlignedWords } from "../lib/alignmentDelta";
+import {
+  alignmentDrafts,
+  alignmentDraftKey,
+  mintAlignmentDraftGeneration,
+  newestCommittedAlignerSave,
+  noteRefusalKeptInPanel,
+  onAlignerSaveRefused,
+} from "../sync/alignmentDrafts";
+import { onOutboxResult, outbox } from "../sync/outbox";
+import {
+  alignmentDraftFitsRow,
+  alignmentDraftKeyForOp,
+  alignmentDraftRow,
+  isAlignerPanelSaveOp,
+  refusedDraftMayRehydrate,
+  refusedOpOrder,
+  refusedSaveStillCurrent,
+} from "../sync/alignmentDraftSaveState";
+import { isVersionOnlyRebase, lostAlignedWords, sameVerseContent } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
 import {
@@ -71,11 +93,7 @@ import { SourceTooltipBody } from "./SourceTooltipBody";
 import { LexTooltip } from "./LexTooltip";
 import { UhbStrip, buildTwHintMap, twHintFromMap } from "./UhbStrip";
 import { directionForVersion } from "../lib/direction";
-import {
-  type HoverHighlight,
-  type HighlightCtx,
-  hoverShadow,
-} from "../lib/highlightTypes";
+import { type HighlightCtx, hoverShadow } from "../lib/highlightTypes";
 
 const WORD_IDS_MIME = "text/word-ids";
 const SOURCE_ID_MIME = "text/source-id";
@@ -171,13 +189,16 @@ interface Props {
   // doesn't wire the confirm).
   onConfirmUnalign?: (lostWords: string[], commit: () => void) => void;
   // Side-by-side mode (all optional; absent = standalone single-panel behavior).
-  // When `hover`/`onHoverChange` are provided the hover state is controlled by a
-  // shared parent so two panels cross-highlight the same Hebrew. Likewise
-  // `hoverLink`/`onToggleHoverLink` let the parent keep both toolbars in sync.
-  // `renderUhbStrip={false}` suppresses the per-panel source strip (the parent
-  // renders one shared strip). `onOpenDual` adds a "Side-by-side" action.
-  hover?: HoverHighlight;
-  onHoverChange?: (h: HoverHighlight) => void;
+  // When `hoverStore` is provided, hover state is a store SHARED with a parent
+  // (and typically a sibling panel) so two panels cross-highlight the same
+  // Hebrew — see hoverStore.ts for why this is a subscribe/getSnapshot store
+  // rather than a lifted `hover`/`onHoverChange` value+setter pair (#900: the
+  // latter forces the parent that owns the state to re-render on every
+  // mouseenter/mouseleave). Likewise `hoverLink`/`onToggleHoverLink` let the
+  // parent keep both toolbars in sync. `renderUhbStrip={false}` suppresses the
+  // per-panel source strip (the parent renders one shared strip). `onOpenDual`
+  // adds a "Side-by-side" action.
+  hoverStore?: HoverStore;
   hoverLink?: boolean;
   onToggleHoverLink?: () => void;
   renderUhbStrip?: boolean;
@@ -231,8 +252,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       onCancel,
       onDirtyChange,
       onConfirmUnalign,
-      hover: hoverProp,
-      onHoverChange,
+      hoverStore: hoverStoreProp,
       hoverLink: hoverLinkProp,
       onToggleHoverLink,
       renderUhbStrip = true,
@@ -272,8 +292,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // already dragged in that window — the hydration guards on this ref so a
     // restore never clobbers a fresh edit (see the reset/hydration effect).
     const stateRef = useRef(state);
+    const initialRef = useRef(initial);
     useEffect(() => {
       stateRef.current = state;
+      initialRef.current = initial;
     });
     // (target key, verse.content) the panel last synced `initial`/`state` to.
     // Lets the reset effect tell a version-only bump (our own save
@@ -287,6 +309,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     const lastSyncRef = useRef<{ key: string; content: unknown; sourceContent: unknown } | null>(
       null,
     );
+    // The crash-draft read the last full reset started; see guard (3) in the
+    // reset effect below.
+    const hydrationTokenRef = useRef<object | null>(null);
     // The generation (see alignmentDrafts.ts) of the most recently PERSISTED
     // crash-draft for the CURRENT dirty session, or undefined if nothing has
     // been persisted yet (e.g. Save fires before the 400ms debounce below
@@ -296,18 +321,118 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // Save (#508). Reset to undefined whenever the panel resyncs to a
     // genuinely different target/content or the user explicitly discards.
     const lastDraftGenerationRef = useRef<string | undefined>(undefined);
+    // #1071: the panel's last committed save (its op's draft generation, the
+    // baseline from before it, and the verse it was built on), until the
+    // outbox reports on it. A save refused as chapter_locked (a lock this tab
+    // had not polled yet) is dropped from the outbox, so put the old baseline
+    // back: the drags read as unsaved again, the gates guard them and the
+    // persist effect keeps them in the crash draft. The op's generation is
+    // unique to this commit, and refusedSaveStillCurrent skips the restore
+    // when a foreign change has replaced the verse since.
+    const pendingSaveRef = useRef<{
+      generation: string;
+      baseline: AlignmentState | null;
+      version: number;
+      savedContent: unknown;
+      baseContent: unknown;
+    } | null>(null);
+    // Read only by the outbox-result and refusal listeners (the second after
+    // an awaited draft and outbox read), which fire after a request settles,
+    // never during a render, so it is written after commit (#1117).
+    const verseRef = useRef(verse);
+    useLayoutEffect(() => {
+      verseRef.current = verse;
+    });
+    useEffect(
+      () =>
+        onOutboxResult((op, result) => {
+          const pending = pendingSaveRef.current;
+          if (!pending || op.alignmentDraftGeneration !== pending.generation) return;
+          if (result.kind === "ok") pendingSaveRef.current = null;
+          else if (result.kind === "locked") {
+            pendingSaveRef.current = null;
+            if (refusedSaveStillCurrent(pending, verseRef.current)) {
+              setInitial(pending.baseline);
+              noteRefusalKeptInPanel(pending.generation);
+            }
+          }
+        }),
+      [],
+    );
+    // #1077: a refused save's crash draft is written after the 409, which can
+    // land after this panel's one-time draft read (Saved at the gate and
+    // reopened before the refusal; or A saved, then B refused after A's row
+    // reset the panel and dropped its record of B). Re-read it then, only
+    // when refusedDraftMayRehydrate says nothing newer can be overwritten
+    // and the draft fits the row the panel shows.
+    // Read only inside the listener's awaited .then, so written after commit
+    // like verseRef (#1117).
+    const sourceVerseObjectsRef = useRef(sourceVerseObjects);
+    useLayoutEffect(() => {
+      sourceVerseObjectsRef.current = sourceVerseObjects;
+    });
+    useEffect(
+      () =>
+        onAlignerSaveRefused((op, _kept, heldInDraft) => {
+          const draftKey = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
+          if (!heldInDraft || alignmentDraftKeyForOp(op) !== draftKey) return;
+          const refused = refusedOpOrder(op);
+          void Promise.all([alignmentDrafts.get(draftKey), outbox.list()]).then(([rec, ops]) => {
+            const base = verseRef.current;
+            if (!mountedRef.current || !rec || !base || !alignmentDraftFitsRow(rec, base, verseNum)) return;
+            const otherSaves = ops
+              .filter((o) => o.id !== op.id && isAlignerPanelSaveOp(o) && alignmentDraftKeyForOp(o) === draftKey)
+              .map(refusedOpOrder);
+            const committed = newestCommittedAlignerSave(draftKey);
+            if (committed) otherSaves.push(committed);
+            if (
+              !refusedDraftMayRehydrate({
+                panelClean: stateRef.current === initialRef.current,
+                panelHasPendingSave: pendingSaveRef.current !== null,
+                refused,
+                draftFrom: rec.refusedFrom,
+                otherSaves,
+              })
+            ) {
+              return;
+            }
+            const vo = (rec.content as { verseObjects?: unknown[] }).verseObjects;
+            if (!Array.isArray(vo)) return;
+            setState(parseAlignment(vo, sourceVerseObjectsRef.current));
+            setRestored(true);
+          }).catch(() => {
+            // Best effort, like the mount-time read: the draft is still there on reopen.
+          });
+        }),
+      [book, chapter, verseNum, bibleVersion],
+    );
+    // False once the panel really unmounts (React StrictMode's dev replay sets
+    // it back to true), so a crash-draft read resolving after unmount does
+    // nothing, the way the old effect-cleanup flag behaved.
+    const mountedRef = useRef(false);
+    useEffect(() => {
+      mountedRef.current = true;
+      return () => {
+        mountedRef.current = false;
+      };
+    }, []);
     const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
     const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
     const [hideUhbStrip, setHideUhbStrip] = useState<boolean>(() => readFlag(LS_HIDE_UHB));
     const [colorize, setColorize] = useState<boolean>(() => readFlag(LS_COLORIZE));
-    // hover + hoverLink are controlled when the side-by-side parent passes them
-    // in; otherwise they're local (standalone single-panel behavior unchanged).
+    // hoverLink is controlled when the side-by-side parent passes it in;
+    // otherwise it's local (standalone single-panel behavior unchanged).
     const [localHoverLink, setLocalHoverLink] = useState<boolean>(() => readFlag(LS_HOVERLINK));
     const hoverLink = hoverLinkProp !== undefined ? hoverLinkProp : localHoverLink;
-    const [localHover, setLocalHover] = useState<HoverHighlight>(null);
-    const hover = hoverProp !== undefined ? hoverProp : localHover;
-    const setHover: (h: HoverHighlight) => void = onHoverChange ?? setLocalHover;
+    // Hover itself is never React state (#900) — it lives in an external store,
+    // local to this panel unless a side-by-side parent shares one so both
+    // panels cross-highlight the same Hebrew. The ref keeps a standalone
+    // panel's store identity stable across this component's own re-renders
+    // (created once, on first render, never replaced).
+    const localHoverStoreRef = useRef<HoverStore | null>(null);
+    if (!localHoverStoreRef.current) localHoverStoreRef.current = createHoverStore(null);
+    const hoverStore = hoverStoreProp ?? localHoverStoreRef.current;
     // Session-scoped ghost rejections (keyed by dismissedGhostKey). Suppresses a
     // suggestion the user dismissed via the chip's × so it can't immediately
     // regenerate on the next render — the "predicted alignment" circle fix.
@@ -344,7 +469,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       setLocalHoverLink((cur) => {
         const next = !cur;
         writeFlag(LS_HOVERLINK, next);
-        if (!next) setHover(null);
+        if (!next) hoverStore.setHover(null);
         return next;
       });
     };
@@ -414,6 +539,19 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       lastDraftGenerationRef.current = undefined;
       lastSyncRef.current =
         verse != null ? { key: targetKey, content: verse.content, sourceContent: currentSourceContent } : null;
+      hydrationTokenRef.current = null;
+      // #1071: a full reset to anything but the pending save's own optimistic
+      // content (a foreign change, or a refetch back to the server's copy)
+      // means the panel no longer shows that save, so a later refusal must
+      // not put its old baseline back (a phantom-dirty panel's persist write
+      // would then overwrite the refusal's crash draft). That draft carries
+      // the drags and is restored when the verse's aligner next opens.
+      if (
+        pendingSaveRef.current &&
+        !sameVerseContent(verse?.content, pendingSaveRef.current.savedContent)
+      ) {
+        pendingSaveRef.current = null;
+      }
 
       if (!computedInitial || !verse) return;
       // Attempt to restore a crash-saved alignment draft (Fix C — a browser
@@ -428,16 +566,23 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       // content change per the isRebase gate above, so that's the correct
       // call here); (2) the user must not have started editing in the
       // async-read window (stateRef still === computedInitial) so a restore
-      // never overwrites a fresh drag; (3) the `cancelled` flag drops a
-      // resolution whose verse changed again. `initial` stays computedInitial
-      // so the restored state reads as dirty (state !== initial) and can be
-      // saved or reset.
+      // never overwrites a fresh drag; (3) the token drops a resolution whose
+      // verse changed again. `initial` stays computedInitial so the restored
+      // state reads as dirty (state !== initial) and can be saved or reset.
+      // (3) is a token that only the next FULL reset replaces, not an effect
+      // cleanup (#1071): React StrictMode replays this effect on mount, and
+      // the replay takes the rebase path above, so a cleanup flag cancelled
+      // every mount's read and a crash draft was never restored in dev.
       const draftKey = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
-      const baseVersion = verse.version;
-      let cancelled = false;
+      const baseRow = verse;
+      const token = {};
+      hydrationTokenRef.current = token;
       void alignmentDrafts.get(draftKey).then((rec) => {
-        if (cancelled || !rec) return;
-        if (rec.expectedVersion !== baseVersion) {
+        if (!mountedRef.current || hydrationTokenRef.current !== token || !rec) return;
+        // Same version AND same row (#1074): after a bridge or split the
+        // draft key is unchanged but the verse now resolves to another row,
+        // whose version can equal the draft's.
+        if (!alignmentDraftFitsRow(rec, baseRow, verseNum)) {
           void alignmentDrafts.clear(draftKey);
           return;
         }
@@ -449,9 +594,6 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         setState(parseAlignment(vo, sourceVerseObjects));
         setRestored(true);
       });
-      return () => {
-        cancelled = true;
-      };
       // `initial` excluded deliberately: it's only ever set by this same effect
       // (setInitial above), and it's read here only to detect an in-progress
       // drag (stateRef.current === initial) at the moment this effect fires.
@@ -484,9 +626,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       if (!dirty || !state || !verse) return;
       const key = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
       const baseVersion = verse.version;
+      const baseRow = alignmentDraftRow(verse);
       const t = setTimeout(() => {
         const content = { verseObjects: serializeAlignment(state) };
-        void alignmentDrafts.set(key, content, baseVersion).then((generation) => {
+        void alignmentDrafts.set(key, content, baseVersion, baseRow).then((generation) => {
           lastDraftGenerationRef.current = generation;
         });
       }, 400);
@@ -685,35 +828,26 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
 
     // Hover handlers. They no-op when hoverLink is off so the chips can fire
     // them unconditionally; the payloads themselves are built in alignmentHover.
+    // Writing to hoverStore (not React state) is what keeps a hover event from
+    // re-rendering this whole panel (#900) — see hoverStore.ts.
     const onEnglishHover = useCallback(
       (wordId: string, text: string, occurrence: string, groupIdOverride?: string) => {
         if (!hoverLink) return;
-        setHover(makeEnglishHover(hoverCtx, wordId, text, occurrence, groupIdOverride));
+        hoverStore.setHover(makeEnglishHover(hoverCtx, wordId, text, occurrence, groupIdOverride));
       },
-      [hoverLink, hoverCtx, setHover],
+      [hoverLink, hoverCtx, hoverStore],
     );
     const onHebrewHover = useCallback(
       (pos: number, groupIdOverride?: string) => {
         if (!hoverLink) return;
         if (pos < 0 && !groupIdOverride) return;
-        setHover(makeHebrewHover(hoverCtx, pos, groupIdOverride));
+        hoverStore.setHover(makeHebrewHover(hoverCtx, pos, groupIdOverride));
       },
-      [hoverLink, hoverCtx, setHover],
+      [hoverLink, hoverCtx, hoverStore],
     );
     const onHoverLeave = useCallback(() => {
-      setHover(null);
-    }, [setHover]);
-
-    const englishHighlight = useCallback(
-      (wordId: string, text: string, occurrence: string, groupIdOverride?: string) =>
-        resolveEnglishHighlight(hoverCtx, hover, wordId, text, occurrence, groupIdOverride),
-      [hoverCtx, hover],
-    );
-    const hebrewHighlight = useCallback(
-      (pos: number, groupIdOverride?: string) =>
-        resolveHebrewHighlight(hoverCtx, hover, pos, groupIdOverride),
-      [hoverCtx, hover],
-    );
+      hoverStore.setHover(null);
+    }, [hoverStore]);
 
     const hctx: HighlightCtx = useMemo(
       () => ({
@@ -725,8 +859,16 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         onEnglishEnter: onEnglishHover,
         onHebrewEnter: onHebrewHover,
         onLeave: onHoverLeave,
-        englishHighlight,
-        hebrewHighlight,
+        // Hooks, not precomputed tones — each chip/card subscribes to its own
+        // slice of the live hover store (see the field docs in
+        // highlightTypes.ts and hoverStore.ts). Deliberately NOT `hover` (nor
+        // anything derived from it) in this useMemo's deps: that's the value
+        // that used to force this whole memo — and everything downstream of
+        // it — to rebuild on every mouseenter/mouseleave.
+        useEnglishHighlight: (wordId, text, occurrence, groupIdOverride) =>
+          useEnglishHighlightTone(hoverCtx, hoverStore, wordId, text, occurrence, groupIdOverride),
+        useHebrewHighlight: (pos, groupIdOverride) =>
+          useHebrewHighlightTone(hoverCtx, hoverStore, pos, groupIdOverride),
       }),
       [
         colorize,
@@ -737,8 +879,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         onEnglishHover,
         onHebrewHover,
         onHoverLeave,
-        englishHighlight,
-        hebrewHighlight,
+        hoverCtx,
+        hoverStore,
       ],
     );
 
@@ -865,6 +1007,15 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         // an up-to-date client — see lastDraftGenerationRef's doc comment and
         // alignmentDrafts.ts's onOutboxResult listener (#508).
         const draftGeneration = lastDraftGenerationRef.current ?? mintAlignmentDraftGeneration();
+        pendingSaveRef.current = {
+          generation: draftGeneration,
+          // A save still waiting on the outbox keeps the older baseline: if
+          // both are refused, the panel goes back to what the server holds.
+          baseline: pendingSaveRef.current ? pendingSaveRef.current.baseline : initial,
+          version: verse.version,
+          savedContent: newContent,
+          baseContent: verse.content,
+        };
         onSave(newContent, plain, verse.version, draftGeneration);
         // Optimistic: the freshly-saved state is now the baseline. When the
         // chapter cache eventually round-trips the new content, computedInitial
@@ -890,7 +1041,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       }
       commit();
       return true;
-    }, [state, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
+    }, [state, initial, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
 
     // Same two maps hebrewHighlight/onEnglishHover use, in the same roles:
     // posOwners (display-derived) says which CARD(s) own the position, and
@@ -1931,7 +2082,7 @@ function SourceWordTypography({
   reused: boolean;
 }) {
   const [hover, setHover] = useState(false);
-  const tone = hctx.hebrewHighlight(pos, groupId);
+  const tone = hctx.useHebrewHighlight(pos, groupId);
   const showInfo = hctx.showSourceInfo;
   return (
     <LexTooltip
@@ -2076,7 +2227,7 @@ function AlignedChip({
   occurrences: string;
   hctx: HighlightCtx;
 }) {
-  const tone = hctx.englishHighlight(wordId, text, occurrence);
+  const tone = hctx.useEnglishHighlight(wordId, text, occurrence);
   const hueDeg = hctx.colorize ? hctx.matchHues.get(`${text}|${occurrence}`) : undefined;
   const accent = hueDeg != null ? chipAccentColor(hueDeg, hctx.themeMode) : undefined;
   const supColor = hueDeg != null ? chipSupColor(hueDeg, hctx.themeMode) : "text.disabled";
@@ -2123,7 +2274,7 @@ function SelectableChip({
   idsForDrag: () => string[];
   hctx: HighlightCtx;
 }) {
-  const tone = hctx.englishHighlight(wordId, text, occurrence);
+  const tone = hctx.useEnglishHighlight(wordId, text, occurrence);
   const hueDeg =
     !selected && hctx.colorize
       ? hctx.matchHues.get(`${text}|${occurrence}`)
@@ -2184,7 +2335,7 @@ function SimpleDraggableChip({
   onUnalign?: () => void;
   hctx: HighlightCtx;
 }) {
-  const tone = hctx.englishHighlight(wordId, text, occurrence, groupId);
+  const tone = hctx.useEnglishHighlight(wordId, text, occurrence, groupId);
   const hueDeg = hctx.colorize ? hctx.matchHues.get(`${text}|${occurrence}`) : undefined;
   const accent = hueDeg != null ? chipAccentColor(hueDeg, hctx.themeMode) : undefined;
   const supColor = hueDeg != null ? chipSupColor(hueDeg, hctx.themeMode) : "primary.dark";

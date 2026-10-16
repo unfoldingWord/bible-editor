@@ -95,6 +95,12 @@ export interface VerseOpExitInfo {
   // extractEditableText(op.patch.content), precomputed by the announcing tab
   // so a receiving tab can run the legacy provenance check without the op.
   editableText?: string;
+  // #1060: which op this was, the version it was saved against, and (on "ok")
+  // the row the server stored, so the tab that QUEUED it can move a live
+  // reading-line hold forward even when another tab drained it.
+  opId?: string;
+  expectedVersion?: number;
+  landed?: { version: number; content: unknown };
 }
 
 export function verseOpExitInfo(op: OutboxOp, exit: VerseOpExit): VerseOpExitInfo {
@@ -163,4 +169,97 @@ export function generationForSavedPlain(
   const payload = draft.payload as { plainText?: unknown };
   const generation = draft.generation ?? `legacy:${draft.updatedAt}`;
   return payload.plainText === plain ? generation : undefined;
+}
+
+// Whether a landed (200) row op should clear that row's draft (#1092). A row
+// draft holds the typed fields as `payload.patch`; the op clears it only when
+// it saved at least one of them. A move ("change reference": verse, ref_raw,
+// sort_order) or a reorder (sort_order) carries none of the typed fields, so
+// clearing on its 200 left the typing only in React state and the status bar
+// saying "saved". Deletes, and drafts without a patch object, keep the
+// earlier clear-on-200 behavior.
+export function rowOpClearsDraft(
+  op: Pick<OutboxOp, "action" | "patch">,
+  draft: Pick<DraftRecord, "payload">,
+): boolean {
+  if (op.action !== "patch") return true;
+  const patch = (draft.payload as { patch?: unknown }).patch;
+  if (!patch || typeof patch !== "object") return true;
+  const fields = Object.keys(patch);
+  if (fields.length === 0) return true;
+  return fields.some((field) => Object.prototype.hasOwnProperty.call(op.patch, field));
+}
+
+// A row op's draftGeneration when no draft existed for the row at enqueue
+// (#1092 review). Distinct from an absent field, which marks a legacy op
+// queued before row ops carried a generation.
+export const NO_ROW_DRAFT = "no-draft";
+
+// Whether the 200 handler for a row op may delete the row draft it just read
+// (#1092 review). `latestAt200` is the key's latest in-memory draft generation
+// when the 200 was handled, `latestNow` the same at the moment of the read;
+// both are undefined in a tab that never wrote this draft (a reload after
+// Save, or another tab holding the drain lock). Typing after the save (a
+// keystroke while it is in flight, or NoteCard re-setting a still-dirty draft
+// when the row version bumps, which runs before the 200 handler) shows up as
+// a different generation or a later updatedAt, and must never be deleted.
+//   - op.draftGeneration = a generation: clear only that stored generation,
+//     and only while no newer set() has started in this tab. Only the tab
+//     holding the drain lock runs this, so latestNow can be that tab's own
+//     OLDER typing on the note while the store holds another tab's saved
+//     generation (#1100): that still clears (ownGenerationSuperseded).
+//   - op.draftGeneration = NO_ROW_DRAFT: clear only a draft written before the
+//     op was first queued (a prior session's draft the save stored). A 409
+//     resolve or a retry moves queuedAt to "now", so this compares against
+//     firstQueuedAt when the op has it (#1100); legacy ops use queuedAt.
+//   - no field (legacy op): fall back to the generation read at the 200.
+export function rowDraftClearAfterOk(
+  op: Pick<OutboxOp, "action" | "patch" | "draftGeneration" | "queuedAt" | "firstQueuedAt">,
+  latestAt200: string | undefined,
+  latestNow: string | undefined,
+  rec: Pick<DraftRecord, "payload" | "generation" | "updatedAt"> | undefined,
+): boolean {
+  if (!rec) return false;
+  if (!rowOpClearsDraft(op, rec)) return false;
+  const saved = op.draftGeneration;
+  if (saved === NO_ROW_DRAFT) {
+    return latestNow === undefined && rec.updatedAt < (op.firstQueuedAt ?? op.queuedAt);
+  }
+  if (saved !== undefined) {
+    if (rec.generation !== saved) return false;
+    if (latestNow === undefined || latestNow === saved) return true;
+    return ownGenerationSuperseded(latestNow, rec);
+  }
+  if (latestNow !== latestAt200) return false;
+  if (latestAt200 !== undefined && rec.generation !== latestAt200) return false;
+  return true;
+}
+
+// After the 200 handler deleted a row draft: whether this tab's in-memory
+// marks for the key (pendingKeys, latestGenerationByKey) go too (#1100 review
+// F1). `latest` is the key's mark now, `checked` the one rowDraftClearAfterOk
+// decided on. A set() after the decision replaces the mark with a new
+// generation, so a mark still equal to `checked` (including this tab's own
+// older generation, superseded in the store) or to the deleted record is not
+// live typing; leaving it set kept the leave-page guard on and let a later
+// save carry the stale generation.
+export function rowDraftMarksReleasable(
+  latest: string | undefined,
+  checked: string | undefined,
+  recGeneration: string | undefined,
+): boolean {
+  return latest === undefined || latest === recGeneration || latest === checked;
+}
+
+// Whether this tab's latest set() for a key (`own`) began strictly before the
+// stored record was written (#1100). The store then already replaced that
+// typing with the record, so the record decides the clear. The caller flushes
+// this tab's queued write before reading the store, so own typing newer than
+// the record either is the record or started after the flush and carries a
+// later time. A generation is "<Date.now()>:<seq>:<random>" (drafts.ts
+// nextGeneration); one without a readable time, or a set() in the same
+// millisecond as the record, keeps the draft.
+function ownGenerationSuperseded(own: string, rec: Pick<DraftRecord, "updatedAt">): boolean {
+  const startedAt = Number(own.split(":", 1)[0]);
+  return Number.isFinite(startedAt) && startedAt < rec.updatedAt;
 }

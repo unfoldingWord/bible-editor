@@ -2,7 +2,7 @@
 // sending the editor to a new Door43 tab. Fetches raw markdown on open and
 // renders it with react-markdown; internal links resolve to Door43 (new tab).
 
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -13,9 +13,11 @@ import {
   CircularProgress,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { fetchTwArticle, twArticleDcsUrl, twShort } from "../lib/twArticle";
+
+const MarkdownView = lazy(() =>
+  import("./MarkdownView").then((m) => ({ default: m.MarkdownView })),
+);
 
 interface Props {
   articleId: string | null;
@@ -145,12 +147,11 @@ export function TwArticleDialog({ articleId, onClose }: Props) {
                 add rehype-raw or skipHtml:false here without a sanitizer
                 (e.g. rehype-sanitize) — doing so turns a Door43 compromise into
                 stored XSS in the editor. */}
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={{ a: mdLink(dcsUrl) }}
-            >
-              {markdown}
-            </ReactMarkdown>
+            <Suspense fallback={null}>
+              <MarkdownView components={{ a: mdLink(dcsUrl) }}>
+                {markdown}
+              </MarkdownView>
+            </Suspense>
           </Box>
         )}
       </DialogContent>

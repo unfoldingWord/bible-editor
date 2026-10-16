@@ -1,11 +1,13 @@
 import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Chip, Paper, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
+import type { Theme } from "@mui/material/styles";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import type { TqRow } from "../sync/api";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
+import { buildFindRegex, nthMatchRange, type QuestionField } from "../lib/questionFind";
 import { TQ_HISTORY_FIELDS, type RowSnapshot } from "./rowHistoryFields";
 
 const RowHistoryDialog = lazy(() =>
@@ -36,9 +38,16 @@ interface Props {
   // onFocus. Optional — callers that don't track an active question (e.g. the
   // pinned-chapter groups aren't wired for this yet) can omit it.
   onFocus?: (row: TqRow) => void;
+  // Find/replace highlight. The active match's row shows that field as a
+  // read-only block with the Nth match marked (see QuestionFindReadView).
+  findQuery?: FindQuery | null;
+  activeMatch?: ActiveMatch | null;
 }
 
-function QuestionsTableInner({ rows, onSave, onDelete, locked = false, activeId = null, onFocus }: Props) {
+type FindQuery = { find: string; regex: boolean; caseSensitive: boolean };
+type ActiveMatch = { rowId: string; field: QuestionField; occurrence: number };
+
+function QuestionsTableInner({ rows, onSave, onDelete, locked = false, activeId = null, onFocus, findQuery = null, activeMatch = null }: Props) {
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
@@ -84,6 +93,8 @@ function QuestionsTableInner({ rows, onSave, onDelete, locked = false, activeId 
           locked={locked}
           active={r.id === activeId}
           onFocus={onFocus ? () => onFocus(r) : undefined}
+          findQuery={activeMatch && activeMatch.rowId === r.id ? findQuery : null}
+          activeMatch={activeMatch && activeMatch.rowId === r.id ? activeMatch : null}
         />
       ))}
     </Paper>
@@ -94,7 +105,12 @@ function QuestionsTableInner({ rows, onSave, onDelete, locked = false, activeId 
 // useMemo) referentially stable, so the questions table skips re-render.
 export const QuestionsTable = memo(
   QuestionsTableInner,
-  (a, b) => a.rows === b.rows && a.locked === b.locked && a.activeId === b.activeId,
+  (a, b) =>
+    a.rows === b.rows &&
+    a.locked === b.locked &&
+    a.activeId === b.activeId &&
+    a.findQuery === b.findQuery &&
+    a.activeMatch === b.activeMatch,
 );
 
 // Container-query breakpoint: under this table width the ref lane + two text
@@ -130,6 +146,8 @@ const Row = memo(function Row({
   locked,
   active = false,
   onFocus,
+  findQuery = null,
+  activeMatch = null,
 }: {
   row: TqRow;
   onSave: (patch: Partial<TqRow>, opts?: { restoredFromVersion?: number }) => void;
@@ -137,11 +155,42 @@ const Row = memo(function Row({
   locked: boolean;
   active?: boolean;
   onFocus?: () => void;
+  findQuery?: FindQuery | null;
+  activeMatch?: ActiveMatch | null;
 }) {
   const [refRaw, setRefRaw] = useState(row.ref_raw ?? "");
   const [question, setQuestion] = useState(row.question ?? "");
   const [response, setResponse] = useState(row.response ?? "");
   const [historyOpen, setHistoryOpen] = useState(false);
+
+  // Find highlight: the active match's field renders as a read-only block with
+  // the Nth match marked, until the user clicks into it (editingField). A new
+  // find target returns to the read view so the mark shows. Never select text
+  // inside the textarea instead — that would steal focus from the find input
+  // and break Enter-to-advance.
+  const [editingField, setEditingField] = useState<QuestionField | null>(null);
+  useEffect(() => {
+    setEditingField(null);
+  }, [activeMatch?.field, activeMatch?.occurrence, row.id]);
+  const questionInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const responseInputRef = useRef<HTMLTextAreaElement | null>(null);
+  useEffect(() => {
+    if (!editingField) return;
+    const el = (editingField === "question" ? questionInputRef : responseInputRef).current;
+    if (el) {
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    }
+  }, [editingField]);
+  const findRe = useMemo(() => (findQuery ? buildFindRegex(findQuery) : null), [findQuery]);
+  // Not while the field holds unsaved text: the match index was computed on
+  // the saved text, so the mark could land on the wrong occurrence.
+  const fieldDirty = (f: QuestionField) =>
+    (f === "question" ? question : response) !== (row[f] ?? "");
+  const readField: QuestionField | null =
+    activeMatch && findRe && editingField !== activeMatch.field && !fieldDirty(activeMatch.field)
+      ? activeMatch.field
+      : null;
 
   // Set by a history restore that fires while the REF lane has unsaved typing.
   // The restore bumps row.version, which would otherwise make the resync below
@@ -283,34 +332,56 @@ const Row = memo(function Row({
           }}
         />
       </Stack>
-      <TextField
-        value={question}
-        onChange={(e) => setQuestion(e.target.value)}
-        size="small"
-        multiline
-        spellCheck
-        variant="outlined"
-        sx={{ gridArea: "question" }}
-        InputProps={{
-          readOnly: locked,
-          ...(isDirty ? { "data-dirty": "true" } : {}),
-        }}
-        inputProps={{ style: { fontSize: 13, padding: "3px 6px" } }}
-      />
-      <TextField
-        value={response}
-        onChange={(e) => setResponse(e.target.value)}
-        size="small"
-        multiline
-        spellCheck
-        variant="outlined"
-        sx={{ gridArea: "response" }}
-        InputProps={{
-          readOnly: locked,
-          ...(isDirty ? { "data-dirty": "true" } : {}),
-        }}
-        inputProps={{ style: { fontSize: 13, padding: "3px 6px" } }}
-      />
+      {readField === "question" && findRe && activeMatch ? (
+        <QuestionFindReadView
+          text={question}
+          re={findRe}
+          occurrence={activeMatch.occurrence}
+          gridArea="question"
+          onActivate={() => setEditingField("question")}
+        />
+      ) : (
+        <TextField
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          inputRef={questionInputRef}
+          size="small"
+          multiline
+          spellCheck
+          variant="outlined"
+          sx={{ gridArea: "question" }}
+          InputProps={{
+            readOnly: locked,
+            ...(isDirty ? { "data-dirty": "true" } : {}),
+          }}
+          inputProps={{ style: { fontSize: 13, padding: "3px 6px" } }}
+        />
+      )}
+      {readField === "response" && findRe && activeMatch ? (
+        <QuestionFindReadView
+          text={response}
+          re={findRe}
+          occurrence={activeMatch.occurrence}
+          gridArea="response"
+          onActivate={() => setEditingField("response")}
+        />
+      ) : (
+        <TextField
+          value={response}
+          onChange={(e) => setResponse(e.target.value)}
+          inputRef={responseInputRef}
+          size="small"
+          multiline
+          spellCheck
+          variant="outlined"
+          sx={{ gridArea: "response" }}
+          InputProps={{
+            readOnly: locked,
+            ...(isDirty ? { "data-dirty": "true" } : {}),
+          }}
+          inputProps={{ style: { fontSize: 13, padding: "3px 6px" } }}
+        />
+      )}
       <Stack sx={{ gridArea: "ver", alignItems: "center", gap: 0.25, minWidth: 0 }}>
         <Tooltip
           title={
@@ -408,4 +479,85 @@ const Row = memo(function Row({
   // Skip sibling question rows when the table re-renders; row is stable unless
   // THIS question changed. Callbacks (onSave/onDelete/onFocus) intentionally
   // ignored — active is the only externally-driven flag that must repaint.
-  a.row === b.row && a.locked === b.locked && a.active === b.active);
+  a.row === b.row &&
+  a.locked === b.locked &&
+  a.active === b.active &&
+  a.findQuery === b.findQuery &&
+  a.activeMatch === b.activeMatch);
+
+// Read-only render of a question / response with the active find match marked
+// orange ("here I am") and scrolled into view. A real inline block (not the
+// textarea), so nothing steals focus from the find input. Clicking it swaps
+// back to the editable field. Mirrors NoteBodyReadView in NoteCard.tsx.
+function QuestionFindReadView({
+  text,
+  re,
+  occurrence,
+  gridArea,
+  onActivate,
+}: {
+  text: string;
+  re: RegExp;
+  occurrence: number;
+  gridArea: string;
+  onActivate: () => void;
+}) {
+  const markRef = useRef<HTMLElement | null>(null);
+  const range = useMemo(() => nthMatchRange(text, re, occurrence), [text, re, occurrence]);
+  useEffect(() => {
+    markRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [range]);
+  return (
+    <Box
+      onMouseDown={(e: React.MouseEvent) => {
+        if (e.button !== 0) return;
+        // The read block is replaced by the textarea in the same commit; stop
+        // the browser's default focus handling from fighting the focus() call.
+        e.preventDefault();
+        onActivate();
+      }}
+      title="click to edit"
+      tabIndex={0}
+      onFocus={onActivate}
+      sx={{
+        gridArea,
+        cursor: "text",
+        whiteSpace: "pre-wrap",
+        overflowWrap: "break-word",
+        wordBreak: "break-word",
+        minHeight: 30,
+        px: "6px",
+        py: "3px",
+        border: "1px solid",
+        borderColor: "divider",
+        borderRadius: 1,
+        fontSize: 13,
+        lineHeight: 1.4375,
+        "&:hover": { borderColor: "text.primary" },
+      }}
+    >
+      {range ? (
+        <>
+          {text.slice(0, range.start)}
+          <Box
+            component="mark"
+            ref={markRef}
+            sx={{
+              borderRadius: "2px",
+              padding: "0 1px",
+              color: "inherit",
+              backgroundColor: (t: Theme) =>
+                t.palette.mode === "dark" ? "rgba(251, 146, 60, 0.5)" : "#fb923c",
+              outline: (t: Theme) => `2px solid ${t.palette.mode === "dark" ? "#fb923c" : "#c2410c"}`,
+            }}
+          >
+            {text.slice(range.start, range.end)}
+          </Box>
+          {text.slice(range.end)}
+        </>
+      ) : (
+        text || " "
+      )}
+    </Box>
+  );
+}

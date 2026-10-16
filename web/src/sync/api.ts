@@ -3,6 +3,7 @@
 // from the same origin as the Worker).
 
 import type { LexiconEntry } from "../hooks/lexiconStore";
+import type { JobVerseRange } from "../lib/pipelineScope";
 
 export type RowKind = "tn" | "tq" | "twl";
 
@@ -235,15 +236,30 @@ export interface BookLintIssue {
   ours?: Record<string, unknown>;
   reviewKind?: string;
   reviewReason?: string | null;
+  /** Chapter of the row the issue came from, or null for a book-wide check
+   *  (curly quotes, paired punctuation) that any chapter's edit can change.
+   *  Drives the chapter merge (#888, mergeChapterReport.ts). */
+  chapter: number | null;
+  /** Check-group index; the server emits issues in (section, chapter) order. */
+  section: number;
 }
 
+// Mirror of api/src/bookLintReport.ts's BookLintReport. Since #888 `issues`
+// holds only the "flag" bucket; escalate issues arrive as counts.
 export interface BookLintReport {
   book: string;
+  /** The server's lint-schema version (#1135); absent from servers before it.
+   *  A chapter report merges only into a base of the same version. */
+  lintVersion?: number;
+  /** null = whole book; N = chapter N's issues plus every book-wide one. */
+  chapter: number | null;
   total: number;
   /** Issues needing a human decision (the "flag" bucket). */
   flagCount: number;
   /** Integrity issues (footnotes) — secondary, count only. */
   escalateCount: number;
+  /** Escalate counts by chapter, so a chapter response can replace one. */
+  escalateByChapter: Record<number, number>;
   issues: BookLintIssue[];
 }
 
@@ -291,6 +307,8 @@ export interface PipelineConflictExisting {
   created_at: number;
   updated_at: number;
   started_by_username: string | null;
+  /** See PipelineJobRow.verse_range (issue #1166). */
+  verse_range?: JobVerseRange;
 }
 export interface PipelineConflictBody {
   error: "conflict";
@@ -1160,6 +1178,12 @@ export interface PipelineStartRequest {
   book: string;
   startChapter: number;
   endChapter?: number;
+  /**
+   * Verse-range notes run (issue #1160): both set, one chapter only
+   * (startChapter === endChapter), notes only. The server rejects anything else.
+   */
+  verseStart?: number;
+  verseEnd?: number;
   sessionKey: string;
   options?: PipelineRequestOptions;
   /**
@@ -1291,6 +1315,18 @@ export interface PipelineJobRow {
    * pipelineStore.start() before the first list refresh.
    */
   locks_resources?: ("verse" | "tn" | "tq" | "twl")[];
+  /**
+   * Verse range of a notes run (issue #1166): null = whole chapter, "invalid"
+   * = a stored range the server could not read (shown as unknown, never as
+   * whole chapter). Absent on optimistic rows from an older server.
+   */
+  verse_range?: JobVerseRange;
+  /**
+   * #1165: the anchor verses a verse-range notes run locks; null means its tn
+   * lock covers the whole chapter. Server-derived (chapterLock.ts
+   * tnLockVerseRange). Absent locks the whole chapter (web/src/lib/tnRangeLock.ts).
+   */
+  locks_tn_verse_range?: { start: number; end: number } | null;
   created_at: number;
   updated_at: number;
   last_polled_at: number | null;
@@ -1693,9 +1729,13 @@ export const api = {
     ),
 
   // DCS-validation summary for a book (issues that need a human decision).
-  // Book-level, fetched once per book change by useBookLint.
-  getBookLint: (book: string, signal?: AbortSignal) =>
-    request<BookLintReport>(`/api/books/${encodeURIComponent(book)}/lint`, { signal }),
+  // Whole book on book load / focus refresh; one chapter after a save, which
+  // useBookLint merges into the cached report (#888).
+  getBookLint: (book: string, signal?: AbortSignal, chapter?: number) =>
+    request<BookLintReport>(
+      `/api/books/${encodeURIComponent(book)}/lint${chapter === undefined ? "" : `?chapter=${chapter}`}`,
+      { signal },
+    ),
 
   getCatalogs: () => request<Catalogs>(`/api/catalogs`),
 

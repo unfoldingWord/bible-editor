@@ -19,13 +19,15 @@ import {
   type TwlOrderLock,
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
-import { onOutboxResult } from "../sync/outbox";
+import { onOutboxResult, outbox } from "../sync/outbox";
+import { applyCommittedRowDeletes, hidingPendingRowDeletes, rowDeleteHooks } from "../sync/pendingRowDeletes";
+import { rowDeleteOutcomes } from "../sync/rowDeleteOutcomes";
 import { createChapterFetchSequencer, type ChapterFetchSequencer } from "./chapterFetchSequencer";
 import { currentRouteFetcher, isChapterLocked, trackNavigation, updateIfCurrent, type ChapterRoute, type NavigationGen } from "../lib/chapterStale";
 import {
   applyStep,
   applyUpdated,
-  isStructureStep,
+  keepStepAcrossSupersede,
   mergeRefetched,
   reduceVerses,
   replaySteps,
@@ -73,6 +75,16 @@ export interface UseChapterReturn {
   applyLocalRowReplacement: (kind: "tn" | "tq" | "twl", row: TnRow | TqRow | TwlRow) => void;
   applyLocalRowDelete: (kind: "tn" | "tq" | "twl", id: string) => void;
   applyLocalRowInsert: (
+    kind: "tn" | "tq" | "twl",
+    row: TnRow | TqRow | TwlRow,
+    position?: { afterId?: string },
+  ) => void;
+  /**
+   * Put back a row whose own DELETE the server refused or the user discarded
+   * (#1108): forget its queued `rowDelete` replay step so a pending merging
+   * refetch cannot hide it again, then re-insert the server's row.
+   */
+  restoreRow: (
     kind: "tn" | "tq" | "twl",
     row: TnRow | TqRow | TwlRow,
     position?: { afterId?: string },
@@ -127,6 +139,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   // The route this render is for. Written before the state hooks so every
   // local-apply updater (run while React processes the state queue) compares
   // against the current route, not the one its callback was created under.
+  // Must stay a render-time write (#1117): an updater queued before a route
+  // change runs while React renders this hook for the new route, which is
+  // before any effect, so a layout-effect write would land too late.
   const routeRef = useRef<ChapterRoute>({ book, chapter });
   routeRef.current = { book, chapter };
   // Bumped on every move to a new (book, chapter), including back to one just
@@ -182,8 +197,9 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       setStatus("error");
     },
     // A row / status step recorded before a newer merging GET was sent is in
-    // that GET's snapshot already; only verse-structure steps carry over.
-    keepOnSupersede: isStructureStep,
+    // that GET's snapshot already; verse-structure steps carry over, and so do
+    // row deletes, whose own DELETE may still be queued (#989).
+    keepOnSupersede: keepStepAcrossSupersede,
   });
 
   const refetch = useCallback((opts?: RefetchOptions) => {
@@ -202,9 +218,21 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     // `refetch` captured on an earlier chapter (a "Refresh" toast, the
     // post-unlock refetch) fetches the current chapter instead of replacing
     // its GET with the old one and leaving the view locked (#892).
+    //
+    // A row whose own tq/twl DELETE (this tab's) is draining in the outbox,
+    // or committed while the GET ran, is left out of whatever lands (#1107):
+    // the GET can be answered before the DELETE commits (offline, then the
+    // reconnect GET races the drain). A DELETE refused as chapter_locked or
+    // discarded meanwhile is not hidden: Shell's #1108 rollback restores that
+    // row (the same two triggers). Outcomes drained in another tab count too
+    // (rowDeleteOutcomes, #1119).
     const fetchRoute = currentRouteFetcher(routeRef, (b, c, s) => api.getChapter(b, c, s));
     return sequencer.current!.refetch(
-      (signal, onAttempt) => fetchWithRetry(fetchRoute, { signal, onAttempt }),
+      hidingPendingRowDeletes(
+        (signal, onAttempt) => fetchWithRetry(fetchRoute, { signal, onAttempt }),
+        () => outbox.list(),
+        rowDeleteHooks(rowDeleteOutcomes),
+      ),
       opts?.keepNewerLocal === true,
     );
   }, []);
@@ -259,11 +287,19 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       sequencer.current?.record({ type: "rowDelete", kind, id });
       mutate((prev) => {
         const list = prev[kind] as Array<TnRow | TqRow | TwlRow>;
+        if (!list.some((r) => r.id === id)) return prev; // nothing to remove: no re-render
         const next = list.filter((r) => r.id !== id);
         return { ...prev, [kind]: next } as ChapterPayload;
       });
     },
     [mutate],
+  );
+  // A committed row DELETE heard from any tab removes its row, after a load
+  // landed too: another tab's DELETE queued and committed between a load's
+  // two outbox reads can land its stale row (#1147 item 1).
+  useEffect(
+    () => applyCommittedRowDeletes(rowDeleteOutcomes, () => routeRef.current.book, applyLocalRowDelete),
+    [applyLocalRowDelete],
   );
 
   const applyLocalRowInsert = useCallback<UseChapterReturn["applyLocalRowInsert"]>(
@@ -294,6 +330,14 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       });
     },
     [book, chapter, mutate],
+  );
+
+  const restoreRow = useCallback<UseChapterReturn["restoreRow"]>(
+    (kind, row, position) => {
+      sequencer.current?.forget((s) => s.type === "rowDelete" && s.kind === kind && s.id === row.id);
+      applyLocalRowInsert(kind, row, position);
+    },
+    [applyLocalRowInsert],
   );
 
   // The verse map is reduced by lib/verseStructure.ts so the WS reorder rules
@@ -486,6 +530,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     applyLocalRowReplacement,
     applyLocalRowDelete,
     applyLocalRowInsert,
+    restoreRow,
     applyLocalVerse,
     applyRemoteVerse,
     applyLocalVerseBridge,

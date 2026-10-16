@@ -142,6 +142,9 @@ interface Props {
   book: string;
   chapter: number;
   onNavigate: (book: string, chapter: number, verse?: number) => void;
+  // The Back control; never collapses into the "more" menu, so a place is
+  // always one visible click away.
+  backButton?: ReactNode;
   pipelineMenu?: ReactNode;
   pipelineStatus?: ReactNode;
   logosSyncToggle?: ReactNode;
@@ -164,6 +167,7 @@ export function TopBar({
   book,
   chapter,
   onNavigate,
+  backButton,
   pipelineMenu,
   pipelineStatus,
   logosSyncToggle,
@@ -448,6 +452,7 @@ export function TopBar({
           </IconButton>
         </Tooltip>
       )}
+      {backButton}
       <FormControl size="small">
         <Autocomplete<string, false, true, false>
           size="small"

@@ -39,6 +39,11 @@
 // mount GET (`keepOnSupersede`): an event that reached the tab before the new
 // GET was sent is already in its snapshot, and replaying it could resurrect a
 // row deleted while the socket was down (that row.deleted broadcast is lost).
+// Row deletes are the exception (#989, lib/verseStructure.ts
+// `keepStepAcrossSupersede`): the tab's own delete is applied before its
+// DELETE commits, so the new snapshot can still hold the row. A delete made
+// with no merge pending has no step at all; useChapter's loader hides it
+// from the payload while its DELETE drains (#1107, sync/pendingRowDeletes.ts).
 // A plain refetch or a reset drops it; the resolving
 // or failing latest request clears it.
 
@@ -82,6 +87,12 @@ export interface ChapterFetchSequencer<P, S> {
   refetch(load: ChapterLoader<P>, merge: boolean): Promise<void>;
   /** Record a step for replay while a merging refetch is pending. */
   record(step: S): void;
+  /**
+   * Drop queued steps that match `pred` (no-op with no merge pending). A
+   * refused or discarded row DELETE restores its row, and its own `rowDelete`
+   * step must not hide it again when a pending merge lands (#1108).
+   */
+  forget(pred: (step: S) => boolean): void;
   /** Chapter change or unmount: abort and forget everything in flight. */
   reset(): void;
 }
@@ -164,6 +175,9 @@ export function createChapterFetchSequencer<P, S>(cb: ChapterFetchCallbacks<P, S
     },
     record(step: S): void {
       queue?.push(step);
+    },
+    forget(pred: (step: S) => boolean): void {
+      if (queue) queue = queue.filter((s) => !pred(s));
     },
     reset(): void {
       current?.ctrl.abort();

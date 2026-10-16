@@ -2,7 +2,7 @@
 // Run: node --experimental-strip-types --no-warnings src/hardRejectGuard.test.mjs
 
 import assert from "node:assert/strict";
-import { buildHardRejectAlertMessage, hardRejectRows } from "./hardRejectGuard.ts";
+import { bracketProblems, buildHardRejectAlertMessage, hardRejectRows } from "./hardRejectGuard.ts";
 
 let passed = 0;
 function t(name, fn) {
@@ -112,42 +112,45 @@ t("a whitespace-only twl OrigWords is still judged only on Occurrence", () => {
   assert.deepEqual(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "   ", "1", "rc://x"])), []);
 });
 
-console.log("[hardRejectRows — tn Note brackets (validate_tn_files.py check 13, a hard error)]");
-// Live prod shape (issue #1015): JER 17:4 ny7v, the second alternate translation
-// never closed. Door43's validate-be failed on exactly this row two nights running.
-const NY7V_NOTE =
-  "Yahweh is leaving out some of the words. Alternate translation: [And you shall loosen your hand] or [And you shall lose your own control of the inheritance that I gave to you";
-t("an unclosed [ in the Note is rejected, naming the row and the character position", () => {
-  const rows = hardRejectRows("tn", tnTsv(["17:4", "ny7v", "", "rc://*/ta/man/translate/figs-ellipsis", "וְ⁠שָׁמַטְתָּ֗ה", "1", NY7V_NOTE]));
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].ref, "17:4");
-  assert.equal(rows[0].rowId, "ny7v");
-  assert.match(rows[0].reason, /Opening bracket '\[' at character \d+ has no matching closing bracket/);
+console.log("[hardRejectRows — tn Note brackets (validate_tn_files.py check 13, a WARNING since en_tn #7778)]");
+// Issue #1149: en_tn d6fc28c11c (2026-09-28) set every check-13 error to
+// severity="warning", so Door43 merges a Note with unpaired brackets. Holding the
+// book for it stranded every other edit. Live prod shape (2026-10-06): JER 34:15
+// mgn7, the second alternate translation never closed; Door43's validator run on
+// those bytes exits 0. lint.ts still flags it in-app via bracketProblems.
+const MGN7_NOTE =
+  "Yahweh is stating the pronoun **you** separately, even though the verb translated as **you turned** already includes this meaning. He is doing that for emphasis. If a speaker of your language would use an explicit pronoun for the same purpose, you may want to use that construction in your translation. If not, your language may have other ways of showing the meaning here. Alternate translation: [And you, you indeed turned] or [And you indeed turned";
+t("an unclosed [ in the Note does NOT hold the book (the mgn7 hold, #1149)", () => {
+  assert.deepEqual(hardRejectRows("tn", tnTsv(["34:15", "mgn7", "", "rc://*/ta/man/translate/writing-pronouns", "וַ⁠תָּשֻׁ֨בוּ אַתֶּ֜ם", "1", MGN7_NOTE])), []);
 });
-t("a stray ] and a mismatched [[ ] are both rejected", () => {
-  assert.match(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "see this] here"]))[0].reason, /Closing bracket/);
-  assert.match(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "[[x] y"]))[0].reason, /bracket sizes must match/);
+t("a stray ] and a mismatched [[ ] do not hold the book either", () => {
+  assert.deepEqual(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "see this] here"])), []);
+  assert.deepEqual(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "[[x] y"])), []);
+});
+t("a bad Occurrence still holds the book when the Note also has a bracket problem, and only the Occurrence is named", () => {
+  const rows = hardRejectRows("tn", tnTsv(["34:15", "mgn7", "", "", "q", "x", MGN7_NOTE]));
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].reason, /Occurrence 'x'/);
+});
+
+console.log("[bracketProblems — the in-app lint flag (lint.ts)]");
+t("an unclosed [ is reported with its character position", () => {
+  assert.deepEqual(bracketProblems(MGN7_NOTE), ["Opening bracket '[' at character 430 has no matching closing bracket."]);
+});
+t("a stray ] and a mismatched [[ ] are reported", () => {
+  assert.match(bracketProblems("see this] here")[0], /Closing bracket/);
+  assert.match(bracketProblems("[[x] y")[0], /bracket sizes must match/);
 });
 t("balanced brackets, including [[rc://...]] links, pass", () => {
-  assert.deepEqual(
-    hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "Alternate translation: [a] or [b] (See: [[rc://*/ta/man/translate/figs-ellipsis]])"])),
-    [],
-  );
-});
-t("brackets in the Quote are not judged (the validator checks the Note only)", () => {
-  assert.deepEqual(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "[x", "1", "fine"])), []);
-});
-t("twl has no Note column, so brackets never hold a twl book", () => {
-  assert.deepEqual(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "[x", "1", "rc://x"])), []);
+  assert.deepEqual(bracketProblems("Alternate translation: [a] or [b] (See: [[rc://*/ta/man/translate/figs-ellipsis]])"), []);
 });
 
 console.log("[buildHardRejectAlertMessage]");
-t("names the ref, row id and the validator's reason, and does not tell the translator to fix an Occurrence", () => {
-  const rejects = hardRejectRows("tn", tnTsv(["17:4", "ny7v", "", "", "", "", NY7V_NOTE]));
+t("names the ref, row id and the validator's reason", () => {
+  const rejects = hardRejectRows("tn", tnTsv(["17:4", "ny7v", "", "", "q", "x", "a note"]));
   const msg = buildHardRejectAlertMessage("JER", "tn", rejects);
   assert.match(msg, /JER TN/);
-  assert.match(msg, /17:4 \(ny7v\): Note: Opening bracket .* closing bracket\. Fix/);
-  assert.doesNotMatch(msg, /Fix the Occurrence/);
+  assert.match(msg, /17:4 \(ny7v\): Occurrence 'x' must be a non-negative integer or -1\. Fix/);
 });
 t("caps the sample at 6 rows and counts the rest", () => {
   const rejects = Array.from({ length: 8 }, (_, i) => ({ ref: `1:${i + 1}`, rowId: `r00${i}`, reason: "x" }));
@@ -157,9 +160,11 @@ t("caps the sample at 6 rows and counts the rest", () => {
   assert.doesNotMatch(msg, /r006/);
 });
 
-t("two problems in one Note count as one row", () => {
-  const rejects = hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "", "", "stray] and [open"]));
-  assert.equal(rejects.length, 2);
+t("two problems on one row count as one row", () => {
+  const rejects = [
+    { ref: "1:1", rowId: "abcd", reason: "x" },
+    { ref: "1:1", rowId: "abcd", reason: "y" },
+  ];
   assert.match(buildHardRejectAlertMessage("JER", "tn", rejects), /HELD JER TN: 1 row\(s\)/);
 });
 

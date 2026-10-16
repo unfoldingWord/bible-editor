@@ -10,7 +10,7 @@ import SearchIcon from "@mui/icons-material/Search";
 import UndoIcon from "@mui/icons-material/Undo";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
-import type { ChapterPayload, TnRow, TwlRow, VerseDto } from "../sync/api";
+import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { DocColumn } from "./DocColumn";
 import { VerseBridgeButtons } from "./VerseBridgeButtons";
@@ -98,6 +98,8 @@ interface Props {
   // Find/replace target for translation notes (body only). Forwarded to the
   // overlay; Shell carries the live row version into the outbox If-Match.
   onReplaceNote: (row: TnRow, newNote: string) => void;
+  // Same for translation questions (question / response text only).
+  onReplaceQuestion: (row: TqRow, patch: { question?: string; response?: string }) => void;
   // Shared with the rest of the shell — bumped here on the "go to active"
   // click, and shipped to ResourceColumn so it can scroll the active
   // note/word/verse-group into view alongside the scripture.
@@ -109,11 +111,19 @@ interface Props {
   // matched note. Stable identities so this component's memo still skips
   // re-renders on every note keystroke.
   searchNotes: () => TnRow[];
-  onScrollToNoteMatch: (chapter: number, verse: number, noteId: string) => void;
+  onScrollToNoteMatch: (chapter: number, verse: number, noteId: string, switchTab?: boolean) => void;
   // Lift the TN find query + active body match so note cards can highlight
   // matches (forwarded straight to the overlay).
   onNoteQueryChange: (query: { find: string; regex: boolean; caseSensitive: boolean } | null) => void;
   onActiveNoteMatchChange: (match: { noteId: string; occurrence: number } | null) => void;
+  // Translation-question twins of the find-overlay TN props above.
+  searchQuestions: () => TqRow[];
+  onScrollToQuestionMatch: (chapter: number, verse: number, rowId: string) => void;
+  onQuestionQueryChange: (query: { find: string; regex: boolean; caseSensitive: boolean } | null) => void;
+  onActiveQuestionMatchChange: (
+    match: { rowId: string; field: "question" | "response"; occurrence: number } | null,
+  ) => void;
+  isQuestionLocked: (chapter: number) => boolean;
   // Pre-loaded UHB strong → entry map (Shell collects from useChapter +
   // useBook) so per-word hover tooltips don't shimmer.
   lexiconMap: Map<string, LexiconEntry | null>;
@@ -242,6 +252,7 @@ function ScriptureColumnInner({
   onOpenBookAligner,
   onReplaceVerse,
   onReplaceNote,
+  onReplaceQuestion,
   scrollNonce,
   bookViewportRestoreRef,
   onRequestScrollToActive,
@@ -249,6 +260,11 @@ function ScriptureColumnInner({
   onScrollToNoteMatch,
   onNoteQueryChange,
   onActiveNoteMatchChange,
+  searchQuestions,
+  onScrollToQuestionMatch,
+  onQuestionQueryChange,
+  onActiveQuestionMatchChange,
+  isQuestionLocked,
   lexiconMap,
   twl,
   onSelectVerse,
@@ -330,7 +346,8 @@ function ScriptureColumnInner({
     setFindQuery(null);
     setFindNav(null);
     onActiveNoteMatchChange(null);
-  }, [onActiveNoteMatchChange]);
+    onActiveQuestionMatchChange(null);
+  }, [onActiveNoteMatchChange, onActiveQuestionMatchChange]);
 
   // Stable callback identities so the overlay's effect deps don't churn.
   const onFindQueryChange = useCallback((q: FindQuery | null) => setFindQuery(q), []);
@@ -390,17 +407,26 @@ function ScriptureColumnInner({
   // Stacked/columns scroll-to-match: BookView handles book mode internally.
   // Runs exactly once per navigation request (keyed on `findNav`, whose seq
   // changes every time) — `activeVerse`, `chapter` and `onSelectVerse` are
-  // read through refs on purpose: Shell hands us a fresh `onSelectVerse`
-  // arrow on every render, so keeping it (or activeVerse) in the deps made
-  // this re-fire on the very re-render a manual verse click causes and pull
-  // the user straight back to the match. In stacked mode an explicit
+  // read through refs on purpose: a manual verse click changes activeVerse,
+  // so keeping it in the deps made this re-fire on the very re-render that
+  // click causes and pull the user straight back to the match. (This
+  // component's onSelectVerse prop is now Shell's stable requestSelectVerse;
+  // it used to be a fresh arrow every render, with the same effect. Book
+  // mode's onSelectBookVerse, forwarded to BookView, is still an inline
+  // arrow.) In stacked mode an explicit
   // prev/next promotes the match verse to "active" so its full editable
   // card expands; the active-verse
   // effect below then scrolls the expanded card into view. The auto-jump
   // while typing only scrolls the (still inactive, but visible and
   // highlighted) row into view.
+  // Written in a layout effect, not during render, so a render React throws
+  // away (StrictMode's dev replay) never leaves it holding uncommitted values.
+  // Its readers are the find effect below (passive, so it runs after every
+  // layout effect of the commit) and selectLocalVerse (click handlers).
   const findNavCtxRef = useRef({ activeVerse, chapter, onSelectVerse });
-  findNavCtxRef.current = { activeVerse, chapter, onSelectVerse };
+  useLayoutEffect(() => {
+    findNavCtxRef.current = { activeVerse, chapter, onSelectVerse };
+  });
   const localSelectionRef = useRef<number | null>(null);
   const localRowAnchorRef = useRef<{ top: number; scroller: HTMLElement } | null>(null);
   const selectLocalVerse = useCallback((verse: number, onAccepted?: () => void) => {
@@ -627,12 +653,18 @@ function ScriptureColumnInner({
               enabledVersions={enabledVersions}
               onReplaceVerse={onReplaceVerse}
               onReplaceNote={onReplaceNote}
+              onReplaceQuestion={onReplaceQuestion}
               onScrollToMatch={onFindScrollToMatch}
               onQueryChange={onFindQueryChange}
               searchNotes={searchNotes}
               onScrollToNoteMatch={onScrollToNoteMatch}
               onNoteQueryChange={onNoteQueryChange}
               onActiveNoteMatchChange={onActiveNoteMatchChange}
+              searchQuestions={searchQuestions}
+              onScrollToQuestionMatch={onScrollToQuestionMatch}
+              onQuestionQueryChange={onQuestionQueryChange}
+              onActiveQuestionMatchChange={onActiveQuestionMatchChange}
+              isQuestionLocked={isQuestionLocked}
               bookLocked={bookLocked}
             />
           </Suspense>
@@ -808,6 +840,10 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     a.twl === b.twl &&
     a.locked === b.locked &&
     a.bookLocked === b.bookLocked &&
+    // The question getter/lock lookup change with mode / pipeline jobs; the
+    // overlay must see the fresh ones.
+    a.searchQuestions === b.searchQuestions &&
+    a.isQuestionLocked === b.isQuestionLocked &&
     a.textCheck === b.textCheck &&
     // Shell memoizes verseCommentCounts on the comments index, so a new
     // reference here means "a comment was added/edited/resolved/deleted" and

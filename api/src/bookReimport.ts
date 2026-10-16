@@ -15,8 +15,10 @@
 //      reimport — it's promoted to a deleted_at tombstone by the nightly job.)
 //   2. AI-only — the AI pipeline wrote the row (so updated_by is the pipeline
 //      starter's id) but no human has edited it since: the latest content-bearing
-//      edit_log entry is source='ai_pipeline'. This is the same signal the AI
-//      pipeline sweep uses in pipelineImport.ts deleteUnkeptTns. An AI-only row is
+//      edit_log entry is source='ai_pipeline'. This coarse signal is what the AI
+//      pipeline sweep (pipelineImport.ts deleteUnkeptTns) used before #1152 PR B;
+//      the sweep now uses classifyKept (keptNotes.ts) and this reimport rule
+//      stays deliberately more conservative (it keeps more). An AI-only row is
 //      re-seeded from master exactly like a pristine one AND reclaimed to
 //      master-owned (updated_by → NULL), counted as `reimported_ai` (NOT the
 //      misleading `skipped_edited`). Its write is guarded by version-CAS + the
@@ -108,6 +110,7 @@ import {
   tsvRefMoved,
   computeTsvMerge,
   detectTornTsvRef,
+  advanceTsvBaseThroughSyncWrites,
   foldTsvBase,
   foldTsvRefBase,
   type TsvMergeSide,
@@ -149,6 +152,9 @@ import {
   raiseVerseMergeConflictAlert,
   resolveConvergedVerseMergeConflicts,
   activeKeptVerseMergeConflictRefs,
+  rollBackDeadAttemptConflicts,
+  settleLandedConflictStmt,
+  STALE_SPECULATION_SECONDS,
 } from "./verseMergeConflicts.ts";
 import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
@@ -938,8 +944,9 @@ export const applyVerseRowsForTest = (
   userId: number | null,
   cutoff: MergeCutoff | null,
   broadcastLaneReopens?: boolean,
+  runId?: string,
 ): Promise<ReimportCounts> =>
-  applyVerseRows(env, book, bibleVersion, verses, userId, cutoff, broadcastLaneReopens);
+  applyVerseRows(env, book, bibleVersion, verses, userId, cutoff, broadcastLaneReopens, runId);
 export const clearTombstoneBlockAlertForTest = (
   env: Env,
   book: string,
@@ -961,7 +968,9 @@ export const planAndStageBookResourcesForTest = (
   resources: Resource[],
   instanceId: string,
   staleBaseOverrideResource?: Resource,
-): Promise<ReimportPlan> => planAndStageBookResources(env, book, resources, instanceId, staleBaseOverrideResource);
+  lockOverrideResource?: Resource,
+): Promise<ReimportPlan> =>
+  planAndStageBookResources(env, book, resources, instanceId, staleBaseOverrideResource, undefined, lockOverrideResource);
 
 export const persistMasterLineageForTest = (
   env: Env,
@@ -1269,9 +1278,22 @@ async function runReimport(
   // nulls a refused resource out, exactly as the TSV truncation gate does for
   // tn/tq/twl a few lines further down.
   let [ultRaw, ustRaw] = [null as string | null, null as string | null];
+  // #1063: resolve master's file-commit SHA BEFORE the verse fetch and fetch
+  // pinned to it (the nightly's pattern), so the lineage walk below can withhold
+  // #658's stamp for a merge that landed after this file was read (#1058). A
+  // null SHA falls back to the unpinned URL and withholds the stamp. TSV stays
+  // unpinned: a pinned TSV fetch is completeness-verified, which widens the prune.
+  const ultFile = dcsResourceFile(book, "ult");
+  const ustFile = dcsResourceFile(book, "ust");
+  const [ultSha, ustSha] = await Promise.all([
+    want.has("ult") && ultFile ? fileCommitSha(env, ultFile.repo, ultFile.path) : Promise.resolve(null),
+    want.has("ust") && ustFile ? fileCommitSha(env, ustFile.repo, ustFile.path) : Promise.resolve(null),
+  ]);
+  const verseUrl = (file: { repo: string; path: string } | null, sha: string | null, fallback: string) =>
+    file ? dcsRawUrl(env, file.repo, file.path, sha ?? undefined) : fallback;
   const [ultFetched, ustFetched, tnFetch, tqFetch, twlFetch] = await Promise.all([
-    want.has("ult") ? fetchText(urls.ult) : Promise.resolve(null),
-    want.has("ust") ? fetchText(urls.ust) : Promise.resolve(null),
+    want.has("ult") ? fetchText(verseUrl(ultFile, ultSha, urls.ult)) : Promise.resolve(null),
+    want.has("ust") ? fetchText(verseUrl(ustFile, ustSha, urls.ust)) : Promise.resolve(null),
     want.has("tn") && tnFile
       ? fetchTsvMasterVerified(env, tnFile.repo, tnFile.path)
       : Promise.resolve({ raw: null, verifiedComplete: false }),
@@ -1350,10 +1372,9 @@ async function runReimport(
     const file = dcsResourceFile(book, resource);
     if (!file) continue;
     const state = await resourceSyncState(env, book, resource);
-    // This route has no SHA gate of its own, so master's file-commit SHA is
-    // resolved here. One subrequest, on a human-triggered request, only for a
-    // verse resource that was actually fetched.
-    const masterSha = await fileCommitSha(env, file.repo, file.path);
+    // This route has no SHA gate of its own; the SHA resolved before the fetch
+    // (#1063) is the commit this file was read at.
+    const masterSha = resource === "ult" ? ultSha : ustSha;
     const { decision, hold } = await evaluateStaleBaseReplacement(env, {
       book,
       resource,
@@ -1500,6 +1521,10 @@ async function runReimport(
           stats,
           ownDeclines.get(resource) ?? null,
           alertObservedAt,
+          // #1063: the verse files were fetched pinned; #658 may only stamp a
+          // merge at or before that commit. TSV keeps the unpinned behavior:
+          // its cutoff below is the pre-walk read, so a stamp cannot reach it.
+          resource === "ult" ? ultSha : resource === "ust" ? ustSha : undefined,
         )
       : null;
     perResource[resource].merge_no_base_cleared += stats.noBaseCleared;
@@ -1557,6 +1582,19 @@ async function runReimport(
   // rows independently and a chapter can be locked for one kind and open for
   // another.
   const nonLockedChapters: Record<TsvKind, Set<number>> = { tn: new Set(), tq: new Set(), twl: new Set() };
+  // Issue #1137 (review A3): this path is never retried, so a pull that died
+  // between a verse's speculative conflict upsert and its CAS (a 502) leaves
+  // that unlanded claim for no one to clean up. Before writing, roll back any
+  // run's unsettled capture in these chapters older than
+  // STALE_SPECULATION_SECONDS (no live run can own one that old). The run id
+  // is fresh, so it matches no row: only stale captures qualify. One batch.
+  const pullVerseResources = (["ult", "ust"] as const).filter((r) => want.has(r) && (r === "ult" ? ultRaw : ustRaw));
+  if (pullVerseResources.length > 0 && chapters.length > 0) {
+    await rollBackDeadAttemptConflicts(
+      env, book, [...pullVerseResources], Math.min(...chapters), Math.max(...chapters), crypto.randomUUID(),
+      Math.floor(Date.now() / 1000) - STALE_SPECULATION_SECONDS,
+    );
+  }
   for (const chapter of chapters) {
     const lockedRes = await lockedResourcesForChapter(env, book, chapter);
     for (const r of resources) {
@@ -1631,6 +1669,7 @@ async function runReimport(
       recordingFailed: perResource.ult.merge_record_failed === true,
       noBaseCount: perResource.ult.merge_no_base,
       noBaseRefs: perResource.ult.merge_no_base_refs,
+      bookLocked: () => bookLockedForAlert(env, book, "ult"),
       noBaseEditorRefs: perResource.ult.merge_no_base_editor_refs,
       observedAt: alertObservedAt,
     });
@@ -1640,6 +1679,7 @@ async function runReimport(
       recordingFailed: perResource.ust.merge_record_failed === true,
       noBaseCount: perResource.ust.merge_no_base,
       noBaseRefs: perResource.ust.merge_no_base_refs,
+      bookLocked: () => bookLockedForAlert(env, book, "ust"),
       noBaseEditorRefs: perResource.ust.merge_no_base_editor_refs,
       observedAt: alertObservedAt,
     });
@@ -1836,6 +1876,15 @@ export async function applyTsvRows(
   const now = Math.floor(Date.now() / 1000);
   const masterConfirmedAt = cutoff?.confirmedAt ?? null;
   const masterEditId = cutoff?.editId ?? null;
+  // Door43 master is authoritative for a locked book's tn/tq/twl merge too
+  // (issue #950 — verseMerge.ts step 3b's rule for verse content, mirrored
+  // here for TSV fields). Read here, just before the row read below, not
+  // carried on the cutoff — same reasoning as applyVerseRows's own copy of
+  // this line: the cutoff can be minutes old in the chunked nightly, and a
+  // lock or unlock in between must be honored. Gated on masterConfirmedAt so
+  // an (book, resource) never yet confirmed on master still falls back to the
+  // pre-existing ancestor-free handling exactly as before this fix.
+  const bookLocked = masterConfirmedAt != null && (await effectiveBookLock(env, book)) != null;
   // #686, hoisted ONCE per (book, kind) rather than evaluated per row. The
   // lineage is measured once per (book, resource) per run and rides in on the
   // cutoff, so every row in this call gets the identical string — and the
@@ -1858,7 +1907,7 @@ export async function applyTsvRows(
     const inClause = slice.map((_, j) => `?${j + 3}`).join(", ");
     // latest_source: source of the latest content-bearing edit_log entry, so we
     // can tell an AI-only row (updated_by set, latest source = ai_pipeline) apart
-    // from a human edit. Mirrors the deleteUnkeptTns correlated subquery.
+    // from a human edit. Same subquery deleteUnkeptTns used before it moved to classifyKept.
     const rs = await env.DB.prepare(
       // review_reason is selected alongside review_kind because two flag writers
       // below compare against it to avoid re-writing an identical message every
@@ -2220,7 +2269,12 @@ export async function applyTsvRows(
     // and rows fall back to computeEditedFieldMerge exactly as before this fix.
     const bases =
       masterConfirmedAt != null
-        ? await reconstructTsvBases(env, book, kind, editedCandidates.map((c) => c.row.id), masterConfirmedAt, masterEditId)
+        ? await reconstructTsvBases(
+            env, book, kind, editedCandidates.map((c) => c.row.id), masterConfirmedAt, masterEditId,
+            // #1090: while locked the boundary is frozen, so the sync's own
+            // later writes advance the content ancestor.
+            bookLocked,
+          )
         : new Map<string, TsvBaseRecord>();
     for (const { row, cur } of editedCandidates) {
       const fields: Record<string, unknown> = {};
@@ -2299,6 +2353,9 @@ export async function applyTsvRows(
             masterMayHoldHumanEdit: masterMayHoldHuman,
             // #653: a create-as-ancestor base may exonerate, never convict.
             baseProvisional: bases.get(row.id)?.provisional === true,
+            // #950: master is authoritative for a both-moved field while the
+            // book is locked, same as verseMerge.ts's masterAuthoritative.
+            bookLocked,
           },
         );
         if (merge.action === "keep_no_base") {
@@ -2705,8 +2762,12 @@ export async function applyTsvRows(
         // not to this row. Naming them as this row's own edit would be a claim
         // the measurement does not make.
         const whoConflict = humanCommitEvidenceClause(cutoff?.lineage);
+        // #1090: "a different change saved in the app", not "your app-side
+        // change". What was measured is that D1's value differs from the
+        // ancestor; the writer can be a translator or an AI auto-apply, so
+        // the text claims neither.
         const reason =
-          `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
+          `A Door43 edit to this row's ${labels.join(" and ")} was merged over a different change saved in the app. ` +
           `Please double-check it.` +
           whoConflict;
         const reviewKind = "merge_conflict";
@@ -3458,6 +3519,7 @@ async function reconstructTsvBases(
   ids: string[],
   cutoff: number,
   boundaryId: number | null,
+  advanceThroughSyncWrites = false,
 ): Promise<Map<string, TsvBaseRecord>> {
   const out = new Map<string, TsvBaseRecord>();
   const entriesById = new Map<string, TsvEditLogEntry[]>();
@@ -3621,9 +3683,52 @@ async function reconstructTsvBases(
       provisionalIds.add(id);
     }
   }
+  // LOCKED BOOK: ADVANCE THROUGH THE SYNC'S OWN WRITES (#1090). Only when the
+  // caller says the book is locked, so an unlocked book's ancestor is exactly
+  // the bounded fold above, as before. The entries ABOVE the boundary (the
+  // bounded read's exact complement) are read once per WRITE_BATCH ids, with
+  // their edit_log source; advanceTsvBaseThroughSyncWrites (tsvMerge.ts)
+  // overlays only the sync's ('dcs_reimport') writes onto the content
+  // ancestor. Not applied to a provisional row (#653): its base already sits
+  // above the boundary and may only exonerate, a rule this does not revisit.
+  // Not applied to the reference ancestor either, which keeps bounded entries
+  // only, for the reason the fallback block above gives.
+  const postBoundaryById = new Map<string, TsvEditLogEntry[]>();
+  if (advanceThroughSyncWrites) {
+    const aboveClause = boundaryId != null ? `id > ?3` : `created_at >= ?3`;
+    for (let i = 0; i < ids.length; i += WRITE_BATCH) {
+      const slice = ids.slice(i, i + WRITE_BATCH);
+      const inClause = slice.map((_, j) => `?${j + 4}`).join(", ");
+      const rs = await env.DB.prepare(
+        `SELECT row_key, action, payload_json, book, source FROM edit_log
+          WHERE kind = ?2 AND (book = ?1 OR book IS NULL)
+            AND action IN ('create', 'update', 'restore')
+            AND ${aboveClause}
+            AND row_key IN (${inClause})
+          ORDER BY row_key ASC, id ASC`,
+      )
+        .bind(book, kind, boundaryBind, ...slice)
+        .all<{ row_key: string; action: string; payload_json: string | null; book: string | null; source: string | null }>();
+      for (const r of rs.results) {
+        let payload: Record<string, unknown> | null = null;
+        if (r.payload_json) {
+          try {
+            const p = JSON.parse(r.payload_json);
+            if (p && typeof p === "object" && !Array.isArray(p)) payload = p as Record<string, unknown>;
+          } catch {
+            /* unparseable payload — treat as no content for this entry */
+          }
+        }
+        const list = postBoundaryById.get(r.row_key) ?? [];
+        list.push({ action: r.action, payload, bookKnown: r.book != null, source: r.source });
+        postBoundaryById.set(r.row_key, list);
+      }
+    }
+  }
   for (const id of ids) {
     const entries = entriesById.get(id) ?? [];
     const provisional = provisionalIds.has(id);
+    const content = foldTsvBase(kind, entries);
     // Both folds read the SAME entries whenever the entries are BOUNDED — the
     // reference ancestor then costs no extra D1 read, which is what keeps it
     // affordable on the unchunked full-book paths this function's header
@@ -3634,7 +3739,10 @@ async function reconstructTsvBases(
     // a field leaves that field absent, which computeTsvMerge reads as
     // unattributable (no_base) for that field alone.
     out.set(id, {
-      content: foldTsvBase(kind, entries),
+      content:
+        advanceThroughSyncWrites && !provisional
+          ? advanceTsvBaseThroughSyncWrites(kind, content, postBoundaryById.get(id) ?? [])
+          : content,
       ref: provisional ? null : foldTsvRefBase(entries),
       provisional,
     });
@@ -4564,6 +4672,10 @@ async function loadMasterLineage(
   // so it is judged here rather than paying a second Gitea fetch for it.
   ownDecline: ResourceSyncState | null = null,
   observedAt = Date.now(),
+  // #1058: the master commit the caller's file was fetched at, so #658's stamp
+  // is only accepted for a merge that file can contain. See
+  // accountOwnPublishDecline's `pinnedSha`.
+  pinnedSha?: string | null,
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
   if (!file) return null;
@@ -4573,7 +4685,7 @@ async function loadMasterLineage(
     // rewritten never GETS a watermark (recognition never fires), so gating the
     // detector on one would leave it blind for exactly the pairs it exists for
     // (cold review F3 / Codex P1 on this change).
-    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline, observedAt, stats);
+    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline, observedAt, stats, pinnedSha);
     return null;
   }
   // Prefer the repo-scoped ledger when it can prove a current, gap-free,
@@ -4592,7 +4704,7 @@ async function loadMasterLineage(
         incomplete: false,
         incompleteReason: "",
       };
-      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt, stats);
+      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt, stats, pinnedSha);
       const humans = classified.filter((c) => c.kind === "human");
       let humanRefs: HumanRefEvidence | null = null;
       if (humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
@@ -4650,7 +4762,7 @@ async function loadMasterLineage(
     });
   }
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
-  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline, observedAt, stats);
+  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline, observedAt, stats, pinnedSha);
   const commits = page.commits.map(classifyMasterCommit);
   // #557: narrow "a human touched this file" to "a human touched THIS verse",
   // but only where it is affordable and only where the file-level answer is
@@ -4842,7 +4954,7 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // one — so the slack is free in the only direction that matters. A day also
 // absorbs modest author-date backdating.
 //
-// A SHARED LIMIT, NOT THIS TIER'S — NARROWED BY #691, NOT CLOSED. Every
+// A SHARED LIMIT, NOT THIS TIER'S — CLOSED FOR THE LEDGER, NOT THE LIVE WALK. Every
 // date-bounded walk here (listMasterCommitsSince's sinceTime) compares
 // COMMITTER date, not author date (see that function's own comment), which
 // already closes the rebase/cherry-pick class of backdating: those move the
@@ -4851,22 +4963,18 @@ const NO_BASE_TIER2_SLACK_SECONDS = 86400;
 // dcs_commits ledger first — the same pattern loadMasterLineage (above)
 // already uses for the mint gate — which buys the same committer-date answer
 // from a store PROVEN gap-free by sha-continuity polling, without a live
-// Gitea round trip and its failure modes (timeouts, page caps). What neither
-// the live walk NOR the ledger can catch, even so: a PLAIN late push, where
-// the commit is locally authored AND committed days before it reaches
-// Door43, so neither timestamp ever moves. The dcs_commits row for such a
-// commit DOES exist once the poller's sha-continuity walk discovers it
-// (`seen_at` records exactly when) — but readLedgerMasterLineage's own read
-// filters on `committed_at`, the same field the live walk keys on, not on
-// `seen_at`. VERIFIED directly: a ledger with full, gap-free coverage
-// starting well before `windowStart` still returns zero commits for a row
-// whose `committed_at` itself predates `windowStart`. Closing that fully
-// would mean widening readLedgerMasterLineage's own comparison to admit a row
-// on `seen_at` too — a change to that shared, separately-audited module,
-// which this fix does not make (see the PR that introduced this comment for
-// why). So the honest residual is: a plain late push is invisible to every
-// walk here, live or ledger-backed, regardless of how current the ledger's
-// coverage is. Tracked as issue #691.
+// Gitea round trip and its failure modes (timeouts, page caps). A PLAIN late
+// push, where the commit is locally authored AND committed days before it
+// reaches Door43 so neither timestamp ever moves, can be seen only through
+// the ledger: readLedgerMasterLineage also admits a row whose `seen_at` is
+// after the window start (#691). seen_at is the poll that recorded the row,
+// so it is an upper bound on arrival: a poll's lag (or an outage) can add a
+// row that landed just before the window. A backfilled row's seen_at is
+// capped at its own commit date (dcsCommitBackfill.ts), so a commit pushed
+// late into a gap's hole can be missed as a late push. The
+// live-walk fallback (ledger unusable: stale tip, open gap, no coverage
+// floor) cannot see a plain late push at all, because Gitea exposes no push
+// time.
 interface NoBaseFallbackWindow {
   /** Where the walk must start: see the tier notes above. */
   windowStart: number;
@@ -5217,13 +5325,13 @@ async function clearResolvedMergeNoBase(
       // fails closed on anything but a current, gap-free ledger whose coverage
       // reaches back to windowStart, so trying it here is always safe: worst
       // case it refuses and the live walk below runs exactly as it always has.
-      // What it buys when it IS usable: the same committer-date answer the
-      // live walk would give, but from a store already proven gap-free by
-      // sha-continuity polling — so this survives a live Gitea hiccup (a
-      // timeout or page cap) that would otherwise force a refusal. See
-      // NoBaseFallbackWindow's comment for the honest limit: neither this nor
-      // the live walk can see a PLAIN late push (author and committer date
-      // both unmoved).
+      // What it buys when it IS usable: the committer-date answer the live
+      // walk would give, plus commits first seen (seen_at) after windowStart,
+      // from a store already proven gap-free by sha-continuity polling — so
+      // this survives a live Gitea hiccup (a timeout or page cap) that would
+      // otherwise force a refusal. See NoBaseFallbackWindow's comment for the
+      // limit: the ledger can catch a PLAIN late push (author and committer
+      // date both unmoved); the live-walk fallback cannot.
       const fetched = await masterCommitsSinceViaLedgerOrLive(env, file, windowStart, book, kind);
       walk = fetched.page;
       walkSince = windowStart;
@@ -5383,8 +5491,8 @@ async function clearResolvedMergeNoBase(
     //     NoBaseFallbackWindow's #691 note: committer-date backdating (a
     //     rebase or cherry-pick) is caught, live or via the ledger the
     //     revisit's own gate already tries first; a PLAIN late push — author
-    //     AND committer date both unmoved — is invisible to both, exactly as
-    //     for every other walk here (issue #691).
+    //     AND committer date both unmoved — is caught by the ledger's seen_at
+    //     but still invisible to the live fallback (issue #691).
     //
     // #861: when `walk` is the repo-scoped ledger page, `walk.commits[0]?.sha`
     // can be a Gitea merge-wrapper commit — exactly the shape our own nightly
@@ -6373,6 +6481,46 @@ function buildStructureAdoptionStmts(
   return stmts;
 }
 
+// Issue #1137: one structure component's statements as the CAS batch sends
+// them: buildStructureAdoptionStmts's anchor write and its edit_log row, then
+// ONE settleLandedConflictStmt for the anchor and every absorbed row, then the
+// rest (per absorbed row: delete, log; per recreated row: insert, log).
+// Results: anchor at +0, absorbed row j at +3 + 2j, recreated row j at
+// +3 + 2(absorbed + j). The settle is gated on the anchor's log row, and that
+// is exact for the absorbed rows too: within the batch's one transaction the
+// anchor lands only if every absorbed row is still at its read version
+// (buildStructureAdoptionStmts's bridge guards), and each delete then needs
+// only that and the anchor at its new version, covering it. One statement,
+// not one per row (#1137 review C1), so a component costs one more than
+// before: 3 + 2 × (absorbed + recreated), at most 83 for
+// MAX_STRUCTURE_COMPONENT_ROWS (40), under D1's 100 per batch. The statement
+// after the settle (an absorbed delete or a recreated insert) does not read
+// changes().
+function structureComponentSize(aw: StructureAnchorWrite): number {
+  return 3 + 2 * (aw.adoption.absorbed.length + aw.adoption.recreated.length);
+}
+
+function structureComponentStmts(
+  env: Env,
+  book: string,
+  bibleVersion: string,
+  resource: string,
+  userId: number | null,
+  now: number,
+  door43: string,
+  aw: StructureAnchorWrite,
+): D1PreparedStatement[] {
+  const built = buildStructureAdoptionStmts(env, book, bibleVersion, userId, now, door43, aw);
+  const ad = aw.adoption;
+  const settle = settleLandedConflictStmt(env, book, resource, [
+    { chapter: ad.chapter, verse: ad.anchor.verse },
+    ...ad.absorbed.map((row) => ({ chapter: ad.chapter, verse: row.verse })),
+  ]);
+  return [built[0], built[1], settle, ...built.slice(2)];
+}
+
+export const structureComponentForTest = { size: structureComponentSize, stmts: structureComponentStmts };
+
 async function applyVerseRows(
   env: Env,
   book: string,
@@ -6392,9 +6540,16 @@ async function applyVerseRows(
   // relying on a per-call cap. Defaults true so any caller that forgets to
   // pass it keeps the pre-existing (safer, notifying) behavior.
   broadcastLaneReopens: boolean = true,
+  // Issue #1137: names this logical run, stable across Workflow step retries
+  // (the nightly path passes one per Workflow run and book). It marks the
+  // speculative verse_merge_conflicts rows step 6b writes, so 7b and a retry's
+  // roll-back (rollBackDeadAttemptConflicts) settle only this run's own.
+  // Omitted (a UI pull, which is never retried), the call mints its own.
+  runId?: string,
 ): Promise<ReimportCounts> {
   const counts = zeroCounts();
   if (verses.length === 0) return counts;
+  const run = runId ?? crypto.randomUUID();
 
   // Heal AI-mangled U+FFFD source attributes before the diff so we never write
   // (or no-op against) upstream's garbled bytes. No-op + zero extra reads unless
@@ -6671,7 +6826,7 @@ async function applyVerseRows(
       });
     }
   }
-  const plan = planStructure(existingRs.results, verses, cutoff, structuralEdits);
+  const plan = planStructure(existingRs.results, verses, cutoff, structuralEdits, bookLocked);
   counts.structure_unclassified += plan.unclassified;
   counts.structure_kept_local += plan.keptLocal.length;
   counts.structure_refused += plan.conflicts.length;
@@ -7691,11 +7846,29 @@ async function applyVerseRows(
         (row) => row.chapter === a.v.chapter && row.verse === a.v.verse && row.adopted,
       );
       if (!mc || mc.action !== "adopt_conflict") continue;
+      // Issue #1081: for a split anchor, `beforeContentJson` is D1's WHOLE
+      // bridged row, while `a.v.contentJson` is only master's anchor piece.
+      // Compare the bridge with everything this adoption stores over its range:
+      // the post-canonize anchor plus the recreated rows step 7s inserts, joined
+      // the way joinVerseContentJson joins them (a space between pieces, which
+      // both visible axes ignore). A null join (an off-shape piece) is passed as
+      // null, which the classifier reads as every axis changed: fail-closed.
+      // Issue #1086, the mirror: for a bridge anchor, `beforeContentJson` is
+      // only D1's anchor verse while `a.v.contentJson` is master's whole bridge,
+      // so the before side is the anchor joined with the rows the bridge absorbs
+      // (read by the same `existing` SELECT), with the same null fail-closed.
+      const ad = anchorByKey.get(structureKey(a.v.chapter, a.v.verse));
+      const before = ad?.kind === "bridge"
+        ? joinVerseContentJson([a.beforeContentJson, ...ad.absorbed.map((r) => r.content_json)])
+        : a.beforeContentJson;
+      const after = ad?.kind === "split"
+        ? joinVerseContentJson([a.v.contentJson, ...ad.recreated.map((m) => m.contentJson)])
+        : a.v.contentJson;
       const refined = refineAdoptConflictForVisibleChange(
         "adopt_conflict",
         a.merge.reason,
-        a.beforeContentJson,
-        a.v.contentJson,
+        before,
+        after,
       );
       mc.action = refined.action;
       mc.reason = refined.reason;
@@ -7724,7 +7897,9 @@ async function applyVerseRows(
       alignment: mc.alignment,
       observedVersion: mc.observedVersion,
     }));
-    const recorded = await recordVerseMergeConflicts(env, book, resource, bibleVersion, allConflictRows, now);
+    // Issue #1137: `run` makes each adoption row record, durably, what it said
+    // before this run's speculation, for 7b (or a retry) to put back.
+    const recorded = await recordVerseMergeConflicts(env, book, resource, bibleVersion, allConflictRows, now, run);
     if (!recorded) recordFailed = true;
   }
 
@@ -7798,17 +7973,24 @@ async function applyVerseRows(
     // recovery boundary, not optional telemetry: a write batch followed by a
     // separate log batch can commit the new verse bytes and then lose history
     // permanently. Pairing also guarantees a lost CAS mints no phantom log.
-    const ADOPTION_PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+    //
+    // Issue #1137: each pair is followed by settleLandedConflictStmt, gated on
+    // the pair's edit_log row (changes() > 0), so it drops the speculative
+    // capture of that verse's conflict row only when this write landed, in
+    // the same transaction as the write. An attempt that dies right after
+    // this batch leaves no unsettled row for a retry to roll back as if the
+    // overwrite had never happened; a lost CAS leaves the capture for 7b.
+    const ADOPTION_PAIR_BATCH = Math.floor(WRITE_BATCH / 3);
     for (let i = 0; i < contentOnlyAdoptions.length; i += ADOPTION_PAIR_BATCH) {
       const slice = contentOnlyAdoptions.slice(i, i + ADOPTION_PAIR_BATCH);
       try {
-        const results = await env.DB.batch(
+        const results = await env.DB.batch([
           // #686: master-adoption of an out-of-band Door43 correction over a
           // human-edited verse — the second key attribution site. sync_merge,
           // and the actor MUST be the measured commit author (never a
           // fallback built here) — this is the write computeVerseMerge only
           // reaches when the human's own edit did NOT explain the difference.
-          slice.flatMap((a) => [
+          ...slice.flatMap((a) => [
             env.DB.prepare(
               `UPDATE verses
                   SET content_json = ?1, plain_text = ?2, verse_end = ?3,
@@ -7825,10 +8007,11 @@ async function applyVerseRows(
               book, userId, a.oldVersion, a.oldVersion + 1, "update",
               { plain_text: a.plainText, content: a.v.contentJson },
             ),
+            settleLandedConflictStmt(env, book, resource, [a.v]),
           ]),
-        );
+        ]);
         slice.forEach((a, j) => {
-          if ((results[j * 2]?.meta.changes ?? 0) > 0) {
+          if ((results[j * 3]?.meta.changes ?? 0) > 0) {
             counts.merge_adopted++;
             if (a.cosmeticHuman) counts.merge_cosmetic_adopted++;
             adoptionsApplied.add(`${a.v.chapter}:${a.v.verse}`);
@@ -7991,7 +8174,7 @@ async function applyVerseRows(
     let group: StructureAnchorWrite[] = [];
     let groupSize = 0;
     for (const aw of staged) {
-      const size = 2 + 2 * (aw.adoption.absorbed.length + aw.adoption.recreated.length);
+      const size = structureComponentSize(aw);
       if (group.length > 0 && groupSize + size > WRITE_BATCH) {
         groups.push(group);
         group = [];
@@ -8007,7 +8190,7 @@ async function applyVerseRows(
       const offsets: number[] = [];
       for (const aw of g) {
         offsets.push(stmts.length);
-        stmts.push(...buildStructureAdoptionStmts(env, book, bibleVersion, userId, now, door43, aw));
+        stmts.push(...structureComponentStmts(env, book, bibleVersion, resource, userId, now, door43, aw));
       }
       try {
         const results = await env.DB.batch(stmts);
@@ -8040,14 +8223,14 @@ async function applyVerseRows(
           let landed = 0;
           ad.absorbed.forEach((row, j) => {
             subs++;
-            if ((results[off + 2 + 2 * j]?.meta.changes ?? 0) > 0) {
+            if ((results[off + 3 + 2 * j]?.meta.changes ?? 0) > 0) {
               landed++;
               adoptionsApplied.add(structureKey(ad.chapter, row.verse));
             }
           });
           ad.recreated.forEach((_m, j) => {
             subs++;
-            if ((results[off + 2 + 2 * (ad.absorbed.length + j)]?.meta.changes ?? 0) > 0) landed++;
+            if ((results[off + 3 + 2 * (ad.absorbed.length + j)]?.meta.changes ?? 0) > 0) landed++;
           });
           if (landed === subs) {
             counts.structure_adopted++;
@@ -8162,9 +8345,9 @@ async function applyVerseRows(
   // inserted unresolved.
   const confirmRefs = mergeConflicts
     .filter((mc) => mc.adopted && mc.action === "adopt_conflict" && adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
-    .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
+    .map((mc) => ({ chapter: mc.chapter, verse: mc.verse, overwrittenVersion: mc.overwrittenVersion, alignment: mc.alignment }));
   if (confirmRefs.length > 0) {
-    await confirmAdoptedConflicts(env, book, resource, confirmRefs);
+    await confirmAdoptedConflicts(env, book, resource, confirmRefs, now);
   }
 
   const reopenEntries: Array<{ chapter: number; verse: number; lanes: CheckLane[] }> = [];
@@ -8182,9 +8365,13 @@ async function applyVerseRows(
 
   // 7b. FIX 3 (cleanup half): the CAS batch above may have lost the race on
   // some adoptions (a human wrote the verse first). Their conflict row was
-  // written speculatively in step 6b before we knew that — delete it now so
+  // written speculatively in step 6b before we knew that — undo it now so
   // it never misdirects a reviewer to a version that still holds their
-  // current text. Refused verses (never attempted a write) are untouched —
+  // current text. Issues #1132/#1137: "undo" means delete a row 6b created,
+  // and put a row that existed before 6b back as 6b found it (from the
+  // capture its upsert stored on the row), so an earlier night's unreviewed
+  // alert is not lost to tonight's race. Refused
+  // verses (never attempted a write) are untouched —
   // `mc.adopted` is false for `keep_alignment_refused`, and
   // deleteLostAdoptionConflicts is additionally scoped to
   // `action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')` as a second, independent guard.
@@ -8211,11 +8398,10 @@ async function applyVerseRows(
     .filter((mc) => mc.adopted && !adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
     .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
   if (lostAdoptionRefs.length > 0) {
-    // Same `now` passed to step 6b's recordVerseMergeConflicts call above —
-    // required for deleteLostAdoptionConflicts's detected_at-based scoping to
-    // correctly identify only THIS run's own speculative rows (see that
+    // Same `run` passed to step 6b's recordVerseMergeConflicts call above:
+    // only rows whose speculation this run still owns are undone (see that
     // function's doc comment).
-    await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs, now);
+    await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs, run);
   }
 
   // 8. Tally this run's landed merge conflicts. FIX 2: excludes a clean
@@ -8889,6 +9075,12 @@ async function accountOwnPublishDecline(
   sync: ResourceSyncState,
   observedAt = Date.now(),
   stats?: LineageStats,
+  // #1058: the master commit the caller's file was fetched at. The walk reads
+  // master's CURRENT tip, so our merge can be in it yet newer than that file;
+  // #658's stamp is then withheld (see below). `undefined` means the caller did
+  // not pin its file and keeps the unpinned behavior; `null` means it pinned
+  // but the sha is unknown, which proves nothing.
+  pinnedSha?: string | null,
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   try {
@@ -8984,7 +9176,28 @@ async function accountOwnPublishDecline(
       // getMasterConfirmedAt is re-read for chunk apply, so tonight's merge can
       // recover the newly confirmed ancestor. Absent/incomplete/human evidence
       // deliberately declines to the existing conservative behavior.
+      //
+      // #1058: and only when our merge is at or before the commit the caller's
+      // file was fetched at. Otherwise the stamp certifies a render that file
+      // predates, and the TSV prune deletes that render's AI-only rows. The
+      // walk is newest first (git order on the live path, committed_at on the
+      // ledger), so "at or before" is "at or after the pinned sha's position";
+      // a pinned sha missing from the walk proves nothing. Withholding is the
+      // safe direction: next night's file head is at or after this merge.
+      const mergeIdx = commits.findIndex((c) => c.sha === judged.mergeSha);
+      const pinIdx = pinnedSha == null ? -1 : commits.findIndex((c) => c.sha === pinnedSha);
+      const mergeInPinnedFile = pinnedSha === undefined || (pinIdx >= 0 && mergeIdx >= pinIdx);
+      if (!mergeInPinnedFile) {
+        console.log("reimport #658 stamp withheld: our merge is not at or before the fetched file's commit (#1058)", {
+          book,
+          resource,
+          mergeSha: judged.mergeSha,
+          pinnedSha,
+          pinnedInWalk: pinIdx >= 0,
+        });
+      }
       const lineageConfirmed =
+        mergeInPinnedFile &&
         !page.incomplete &&
         commits.every((commit) => commit.kind !== "human") &&
         pushedReadAt != null
@@ -9082,7 +9295,8 @@ export const accountOwnPublishDeclineForTest = (
   walked: MasterCommitPage | null,
   sync: ResourceSyncState,
   observedAt = Date.now(),
-): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync, observedAt);
+  pinnedSha?: string | null,
+): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync, observedAt, undefined, pinnedSha);
 
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
@@ -9424,6 +9638,12 @@ async function markOwnPublishConverged(
               -- misreport which run established the watermark the admin panel
               -- shows.
               origin = CASE WHEN ?4 IS NOT NULL THEN 'own_publish' ELSE origin END,
+              -- #1029: master is confirmed at this render, so older renders no
+              -- longer count as "master lagging". Only when ?3 is still the
+              -- current pushed render (a newer push since the read keeps the list).
+              unconfirmed_renders_json =
+                CASE WHEN pushed_read_at = ?3 AND pushed_blob_sha IS NOT NULL
+                     THEN json_array(pushed_blob_sha) ELSE unconfirmed_renders_json END,
               -- Free reset of the inertness detector: a match is exactly the
               -- evidence that recognition is working for this (book, resource).
               own_publish_declines = 0
@@ -9482,7 +9702,10 @@ async function markLineageConfirmedConverged(
                    THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?4)
                    ELSE master_confirmed_edit_id END,
             own_publish_declines = 0,
-            own_publish_rewrite_sha = NULL
+            own_publish_rewrite_sha = NULL,
+            -- #1029: confirmed at this render (the CAS below pins it), so older
+            -- renders no longer count as "master lagging".
+            unconfirmed_renders_json = json_array(?5)
       WHERE book = ?1 AND resource = ?2
         AND pushed_blob_sha = ?5
         AND pushed_read_at = ?3
@@ -9509,6 +9732,15 @@ export const markLineageConfirmedConvergedForTest = (
   resource: Resource,
   candidate: { pushedBlobSha: string; pushedReadAt: number; pushedEditId: number | null },
 ): Promise<boolean> => markLineageConfirmedConverged(env, book, resource, candidate);
+
+export const markOwnPublishConvergedForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+  readAt: number,
+  pushedEditId: number | null,
+  masterSha: string | null,
+): Promise<boolean> => markOwnPublishConverged(env, book, resource, readAt, pushedEditId, masterSha);
 
 export async function storedResourceSha(env: Env, book: string, resource: Resource): Promise<string | null> {
   const row = await env.DB.prepare(
@@ -10183,6 +10415,9 @@ async function planAndStageBookResources(
   // written anyway rather than skipped because an operator approved.
   staleBaseOverrideResource?: Resource,
   alertObservedAt = Date.now(),
+  // Issue #1110 review: runChunkedReimport's `lockOverrideResource`, for the
+  // own-publish convergence re-raise below (see bookLockedForAlert).
+  lockOverrideResource?: Resource,
 ): Promise<ReimportPlan> {
   const maxRow = await env.DB
     .prepare(`SELECT MAX(chapter) AS m FROM verses WHERE book = ?1`)
@@ -10344,6 +10579,10 @@ async function planAndStageBookResources(
           noBaseCount: 0,
           noBaseRefs: [],
           noBaseEditorRefs: [],
+          // Issue #1110 review: the rows left standing can still carry
+          // lock-dependent sentences, and on a book whose resources are all
+          // unchanged this is the run's last raise.
+          bookLocked: () => bookLockedForAlert(env, book, resource, lockOverrideResource),
           observedAt: alertObservedAt,
         });
       }
@@ -10492,6 +10731,9 @@ async function planAndStageBookResources(
       // verdict that means "we measured a difference" (see accountOwnPublishDecline).
       own.reason === "content_differs" ? sync : null,
       alertObservedAt,
+      // #1058: the file above was fetched at masterSha; #658 may only stamp a
+      // merge at or before it.
+      masterSha,
     );
     let confirmedBaseR2Key: string | null = null;
     // #857: read after loadMasterLineage, not reused from `stageCutoff` —
@@ -10573,8 +10815,25 @@ async function reimportStagedChunk(
   staged: StagedResource[],
   changedTsv: Partial<Record<TsvKind, number[]>>,
   userId: number | null,
+  // Issue #1137: the run's id, stable across this step's retries (see
+  // applyVerseRows's runId).
+  runId?: string,
 ): Promise<Record<Resource, ReimportCounts>> {
   const perResource = freshPerResource();
+
+  // Issue #1137: before this attempt writes anything, settle whatever an
+  // earlier, dead attempt of this same step (or any dead run, after
+  // STALE_SPECULATION_SECONDS) left speculative in these chapters
+  // (rollBackDeadAttemptConflicts): an overwrite that never landed is put
+  // back, so a retry that no longer adopts a verse leaves no pointer to it.
+  // One D1 batch per attempt, only when this chunk applies verse rows.
+  const verseResources = staged.filter((e) => e.changed && (e.resource === "ult" || e.resource === "ust")).map((e) => e.resource);
+  if (runId && verseResources.length > 0) {
+    await rollBackDeadAttemptConflicts(
+      env, book, verseResources, startChapter, endChapter, runId,
+      Math.floor(Date.now() / 1000) - STALE_SPECULATION_SECONDS,
+    );
+  }
 
   // Read + parse each staged file ONCE for the whole chunk (not per chapter).
   // The old per-chapter calls re-parsed the entire book each time (usfm.toJSON
@@ -10751,7 +11010,7 @@ async function reimportStagedChunk(
       addCounts(
         perResource.ult,
         await applyVerseRows(
-          env, book, "ULT", versesByChapter.ult.get(chapter) ?? [], userId, masterConfirmedAtUlt, false,
+          env, book, "ULT", versesByChapter.ult.get(chapter) ?? [], userId, masterConfirmedAtUlt, false, runId,
         ),
       );
     }
@@ -10759,12 +11018,40 @@ async function reimportStagedChunk(
       addCounts(
         perResource.ust,
         await applyVerseRows(
-          env, book, "UST", versesByChapter.ust.get(chapter) ?? [], userId, masterConfirmedAtUst, false,
+          env, book, "UST", versesByChapter.ust.get(chapter) ?? [], userId, masterConfirmedAtUst, false, runId,
         ),
       );
     }
   }
   return perResource;
+}
+
+// Issues #1006 / #1110: whether a resource's verse-merge alert should use the
+// locked-book wording ("the export skips it") instead of "tonight's export
+// will write", for its no-base and kept-row sentences. True only when the book
+// is locked as the alert is raised (an unlock part-way through the run means
+// the export will not skip it), and this run is not an admin lock/push for
+// this resource (that run's export pushes D1 over Door43). A failed lock read
+// falls back to the overwrite warning, the wording that asks someone to act,
+// and never fails the alert. Passed to the alert as a reader, so it costs a D1
+// read only when the alert has a sentence that depends on the lock.
+export async function bookLockedForAlert(
+  env: Env,
+  book: string,
+  resource: Resource,
+  lockOverrideResource?: Resource,
+): Promise<boolean> {
+  if (lockOverrideResource === resource) return false;
+  try {
+    return (await effectiveBookLock(env, book)) != null;
+  } catch (e) {
+    console.error("reimport merge alert: lock re-read failed; using the unlocked wording", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return false;
+  }
 }
 
 // Orchestrate a chunked, SHA-gated, diff-aware reimport of one book as a series
@@ -10801,11 +11088,17 @@ export async function runChunkedReimport(
   // row's own `updated_by`/pristine columns (sync writes clear or leave those
   // alone regardless of who triggered the run), so this cannot affect
   // isPristineTsv or any pristine-write predicate.
+  // `lockOverrideResource` — issue #1006 review: set by exportWorkflow.ts only
+  // when this run's export will push this ONE resource of a locked book
+  // (an admin lock/push, allowLocked). It changes only the verse-merge alert's
+  // lock wording: that export does write D1 over Door43, so the alert must not say
+  // the export skips the book.
   opts: {
     chunk?: number;
     mergeRefusalOverrideResource?: Resource;
     idBlockedOverrideResource?: Resource;
     staleBaseOverrideResource?: Resource;
+    lockOverrideResource?: Resource;
     userId?: number | null;
   } = {},
 ): Promise<ReimportResult> {
@@ -10824,7 +11117,16 @@ export async function runChunkedReimport(
   const plan = await step.do(
     `reimport-fetch-${book}`,
     { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-    async () => planAndStageBookResources(env, book, resources, instanceId, opts.staleBaseOverrideResource, alertObservedAt),
+    async () =>
+      planAndStageBookResources(
+        env,
+        book,
+        resources,
+        instanceId,
+        opts.staleBaseOverrideResource,
+        alertObservedAt,
+        opts.lockOverrideResource,
+      ),
   );
 
   // Own-publish recognition already ran inside planAndStageBookResources (it
@@ -10946,7 +11248,9 @@ export async function runChunkedReimport(
     const counts = await step.do(
       `reimport-${book}-ch${start}-${end}`,
       { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, opts.userId ?? null),
+      async () => reimportStagedChunk(
+        env, book, start, end, changed, changedTsv, opts.userId ?? null, `${instanceId}:${book}:${alertObservedAt}`,
+      ),
     );
     mergePerResource(perResource, counts);
   }
@@ -10964,6 +11268,7 @@ export async function runChunkedReimport(
         recordingFailed: perResource[e.resource].merge_record_failed === true,
         noBaseCount: perResource[e.resource].merge_no_base,
         noBaseRefs: perResource[e.resource].merge_no_base_refs,
+        bookLocked: () => bookLockedForAlert(env, book, e.resource, opts.lockOverrideResource),
         noBaseEditorRefs: perResource[e.resource].merge_no_base_editor_refs,
         observedAt: alertObservedAt,
       });

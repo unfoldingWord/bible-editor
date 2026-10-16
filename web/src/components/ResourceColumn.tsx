@@ -1,21 +1,22 @@
-import { Fragment, type Ref, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip, Link } from "@mui/material";
+import { Fragment, lazy, type Ref, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Box, Stack, Typography, Chip, Button, Tooltip, Link } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
-import PushPinIcon from "@mui/icons-material/PushPin";
-import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
+import DoneAllIcon from "@mui/icons-material/DoneAll";
 import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, TwlOrderLock, CommentRowKind } from "../sync/api";
+import { alignmentPanelRowKey } from "../sync/alignmentDraftSaveState";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { TwlSuggestions } from "./TwlSuggestions";
 import { QuestionsTable } from "./QuestionsTable";
-import { AlignmentPanel, type AlignerLock, type AlignmentPanelHandle } from "./AlignmentPanel";
+import type { AlignerLock, AlignmentPanelHandle } from "./AlignmentPanel";
 import { noteOverlapsRange } from "../lib/verseRange";
 import { hasLeftNoteVerse, type ActiveLocation } from "../lib/noteGuard";
 import { canonicalTwlOrder, twlDisplayOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import CheckIcon from "@mui/icons-material/Check";
 import { LANE_FILL, type LaneShade } from "../lib/laneChecks";
+import { movableNoteVerses } from "../lib/tnRangeLock";
 
 export type PanelMode = "resources" | "alignment" | "search";
 
@@ -37,6 +38,13 @@ export interface ResourceCheckoff {
 // CSP frame-src (api/src/index.ts) — adding a different host requires updating
 // both.
 const SEARCH_IFRAME_URL = "https://swunrow.pythonanywhere.com/";
+
+// The alignment tab is off by default (panelMode starts "resources" in
+// Shell), so most sessions never need AlignmentPanel's DnD aligner code.
+// forwardRef components work through lazy() same as any other.
+const AlignmentPanel = lazy(() =>
+  import("./AlignmentPanel").then((m) => ({ default: m.AlignmentPanel })),
+);
 
 // Candidate slot for the reorder "stoplight" — the moved note plus the note
 // ids that would become its predecessor / successor at the current drag target
@@ -106,6 +114,11 @@ interface Props {
   // active match (by note id + occurrence index) is emphasized + scrolled to.
   findNoteQuery?: { find: string; regex: boolean; caseSensitive: boolean } | null;
   activeNoteMatch?: { noteId: string; occurrence: number } | null;
+  // Find-in-questions highlight (TQ scope): only the row holding the active
+  // match receives the query, so typing in the find box doesn't re-render
+  // every question row.
+  findQuestionQuery?: { find: string; regex: boolean; caseSensitive: boolean } | null;
+  activeQuestionMatch?: { rowId: string; field: "question" | "response"; occurrence: number } | null;
   // Bumped by Shell's "go to active" button so the resource column can
   // recentre on the active note / word / verse group alongside the
   // scripture column.
@@ -175,6 +188,12 @@ interface Props {
   // propagates read-only to that tab's children.
   lockedTn?: boolean;
   lockedTq?: boolean;
+  // #1165: which notes `lockedTn` covers, by anchor verse. A verse-range notes
+  // run locks only its range; absent means every note in the chapter.
+  tnVerseLocked?: (verse: number) => boolean;
+  // Verses a note may not be moved to (a verse-range run's range; the server
+  // refuses the move). Left out of the note "change reference" picker.
+  tnMoveBlocked?: (verse: number) => boolean;
   // The whole BOOK is locked (server-enforced, hard freeze, no carve-outs —
   // unlike lockedTn/lockedTq above, which are per-resource chapter-pipeline
   // locks with a preserve/hint carve-out on NoteCard). ORed into every
@@ -368,6 +387,8 @@ export function ResourceColumn({
   activeQuestionId = null,
   findNoteQuery,
   activeNoteMatch,
+  findQuestionQuery,
+  activeQuestionMatch,
   scrollNonce,
   jumpTab = null,
   onNoteChange,
@@ -396,6 +417,8 @@ export function ResourceColumn({
   onQuestionCreate,
   onQuestionFocus,
   lockedTn = false,
+  tnVerseLocked,
+  tnMoveBlocked,
   lockedTq = false,
   bookLocked = false,
   onSetNotePreserve,
@@ -427,13 +450,31 @@ export function ResourceColumn({
   commentCountsForRow,
   onOpenRowComments,
 }: Props) {
+  // #1165: the note move picker leaves out verses a range run has locked.
+  // Same array when nothing is blocked, so cards don't re-render for nothing.
+  const noteVerseOptions = useMemo(
+    () => (tnMoveBlocked ? movableNoteVerses(verseOptions, tnMoveBlocked) : verseOptions),
+    [verseOptions, tnMoveBlocked],
+  );
   // Where the user's focus currently is, mirrored into a ref for NoteCard's
   // abandoned-blank-stub discard (see hasLeftNoteVerse in noteGuard.ts).
-  // Written during render, not in an effect: in per-verse mode the card for
-  // the OLD verse unmounts in the same commit that changes activeVerse, so
-  // its own props are stale by the time its unmount cleanup runs — reading a
-  // parent ref that was already updated during the parent's render is the
-  // only way that cleanup can see the NEW location.
+  // In per-verse mode the card for the OLD verse unmounts in the same commit
+  // that changes activeVerse, so its own props are stale by the time its
+  // unmount cleanup runs; this parent ref is how that cleanup sees the NEW
+  // location. Its readers are NoteCard's discard effect and unmount cleanup,
+  // both passive. A useEffect write here would be too late: React runs the
+  // removed card's passive cleanup before this component's passive effects.
+  // A useLayoutEffect write would land in time and would also keep a render
+  // React throws away from leaking in, but it is left as a render-time write
+  // on purpose (#1011): this feeds the blank-stub discard, which deletes a
+  // note when it misjudges, and the move buys nothing on this tree. No
+  // startTransition / useDeferredValue is in use, so a render of this
+  // component that React throws away is StrictMode's dev replay or React's
+  // one retry after a render error, and both re-render with the same props.
+  // A lazy() child that suspends throws away only the render inside its own
+  // Suspense boundary, and this component sits above every boundary (its own
+  // wraps only AlignmentPanel). Revisit if concurrent rendering arrives
+  // (e.g. a React 19 upgrade).
   const activeLocRef = useRef<ActiveLocation>({ book, chapter, verse: activeVerse });
   activeLocRef.current = { book, chapter, verse: activeVerse };
 
@@ -956,34 +997,38 @@ export function ResourceColumn({
       </Stack>
       {panelMode === "alignment" ? (
         alignmentProps ? (
-          <AlignmentPanel
-            // Remount on any target change (version OR verse). Without a key,
-            // React reuses the instance and the panel's `state` only resets via
-            // a passive useEffect that runs AFTER paint — leaving a window where
-            // `state` still holds the PREVIOUS version's alignment while `verse`
-            // / `onSave` are already bound to the new target. A save landing in
-            // that window writes the old content to the new row (e.g. UST
-            // alignment saved onto the ULT verse). Keying forces a fresh mount
-            // whose useState(computedInitial) seeds the correct state
-            // synchronously, closing the race.
-            key={`${alignmentProps.bibleVersion}:${alignmentProps.chapter}:${alignmentProps.verseNum}`}
-            ref={alignmentProps.panelRef}
-            book={alignmentProps.book}
-            chapter={alignmentProps.chapter}
-            verseNum={alignmentProps.verseNum}
-            bibleVersion={alignmentProps.bibleVersion}
-            verse={alignmentProps.verse}
-            sourceVerse={alignmentProps.sourceVerse}
-            sourceLabel={alignmentProps.sourceLabel}
-            twlForVerse={alignmentProps.twlForVerse}
-            onSave={alignmentProps.onSave}
-            onConfirmUnalign={alignmentProps.onConfirmUnalign}
-            onCancel={alignmentProps.onCancel}
-            onDirtyChange={alignmentProps.onDirtyChange}
-            onOpenDual={alignmentProps.onOpenDual}
-            onRestoreVersion={alignmentProps.onRestoreVersion}
-            locked={alignmentProps.locked}
-          />
+          <Suspense fallback={null}>
+            <AlignmentPanel
+              // Remount on any target change (version OR verse). Without a key,
+              // React reuses the instance and the panel's `state` only resets via
+              // a passive useEffect that runs AFTER paint — leaving a window where
+              // `state` still holds the PREVIOUS version's alignment while `verse`
+              // / `onSave` are already bound to the new target. A save landing in
+              // that window writes the old content to the new row (e.g. UST
+              // alignment saved onto the ULT verse). Keying forces a fresh mount
+              // whose useState(computedInitial) seeds the correct state
+              // synchronously, closing the race. Also keyed by the row (start
+              // verse + bridge end), so a bridge or split by another editor
+              // remounts it fresh on the new row (#1074).
+              key={`${alignmentProps.bibleVersion}:${alignmentProps.chapter}:${alignmentProps.verseNum}:${alignmentPanelRowKey(alignmentProps.verse)}`}
+              ref={alignmentProps.panelRef}
+              book={alignmentProps.book}
+              chapter={alignmentProps.chapter}
+              verseNum={alignmentProps.verseNum}
+              bibleVersion={alignmentProps.bibleVersion}
+              verse={alignmentProps.verse}
+              sourceVerse={alignmentProps.sourceVerse}
+              sourceLabel={alignmentProps.sourceLabel}
+              twlForVerse={alignmentProps.twlForVerse}
+              onSave={alignmentProps.onSave}
+              onConfirmUnalign={alignmentProps.onConfirmUnalign}
+              onCancel={alignmentProps.onCancel}
+              onDirtyChange={alignmentProps.onDirtyChange}
+              onOpenDual={alignmentProps.onOpenDual}
+              onRestoreVersion={alignmentProps.onRestoreVersion}
+              locked={alignmentProps.locked}
+            />
+          </Suspense>
         ) : (
           <Box sx={{ p: 3 }}>
             <Typography variant="body2" color="text.secondary">
@@ -1010,7 +1055,7 @@ export function ResourceColumn({
               onTogglePin={() => togglePinned("notes")}
               onAdd={onNoteCreate}
               sticky
-              hideAdd={lockedTn || bookLocked}
+              hideAdd={(lockedTn && (tnVerseLocked?.(activeVerse) ?? true)) || bookLocked}
               lane="tn"
               checkoff={checkoff}
             />
@@ -1138,12 +1183,12 @@ export function ResourceColumn({
                 tqGroups.map(([verse, rows]) => (
                   <Fragment key={`tq-${verse}`}>
                     <VerseGroupHead verse={verse} active={verse === activeVerse} section="questions" />
-                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} />
+                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} findQuery={findQuestionQuery} activeMatch={activeQuestionMatch} />
                   </Fragment>
                 ))
               )
             ) : (
-              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} />
+              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} findQuery={findQuestionQuery} activeMatch={activeQuestionMatch} />
             )}
           </>
         )}
@@ -1327,7 +1372,7 @@ export function ResourceColumn({
           onDelete={(opts) => onNoteDelete(r.id, opts)}
           onRestore={() => onNoteRestore(r.id)}
           onInsertAfter={() => onNoteInsertAfter(r.id)}
-          verseOptions={verseOptions}
+          verseOptions={noteVerseOptions}
           onChangeVerse={(v, vEnd) => onNoteChangeVerse(r.id, v, vEnd)}
           onFocus={() => onNoteFocus(r)}
           // r.verse is the row's START verse (a bridged row spans r.verse →
@@ -1398,7 +1443,7 @@ export function ResourceColumn({
           isAiPending={isNoteAiPending?.(r.id) ?? false}
           aiRecentlyCompletedAt={noteAiRecentlyCompletedAt?.(r.id) ?? null}
           onVisibilityChange={onNoteVisibilityChange}
-          locked={lockedTn}
+          locked={lockedTn && (tnVerseLocked?.(r.verse) ?? true)}
           bookLocked={bookLocked}
           onSetPreserve={
             onSetNotePreserve ? (value) => onSetNotePreserve(r.id, value) : undefined
@@ -1504,12 +1549,29 @@ function SectionHead({
   const laneApplicable = checkoff && lane ? checkoff.applicable(lane) : false;
   const shade = checkoff && lane && laneApplicable ? checkoff.shade(lane) : "open";
   const fill = shade !== "open" ? LANE_FILL[shade as Exclude<LaneShade, "open">] : null;
+  const pill = {
+    display: "flex",
+    alignItems: "center",
+    gap: 0.5,
+    cursor: "pointer",
+    px: 0.75,
+    height: 20,
+    borderRadius: 1,
+    fontSize: 11,
+    whiteSpace: "nowrap",
+    userSelect: "none",
+  } as const;
+  const lowerTitle = title.toLowerCase();
+  // One flex-wrap row: title, count, scope toggle, spacer, approvals, new. On a
+  // narrow panel the right-hand group wraps below instead of being clipped.
   return (
     <Stack
       direction="row"
-      spacing={1}
       alignItems="center"
       sx={{
+        flexWrap: "wrap",
+        columnGap: 1,
+        rowGap: 0.25,
         pb: 0.25,
         mb: 0.25,
         borderBottom: "1px solid",
@@ -1532,13 +1594,61 @@ function SectionHead({
         variant="outlined"
         sx={{ height: 18, fontFamily: "monospace", fontSize: 10 }}
       />
-      <Tooltip
-        title={pinned ? `unpin — show ${title.toLowerCase()} for the active verse only` : `pin — show ${title.toLowerCase()} for every verse in this chapter`}
+      {/* New sits beside the title, away from the check buttons on the right, so a
+          click aimed at "+" can't land on "✓✓ ch" (which checks the whole chapter). */}
+      {hideAdd ? null : (
+        <Tooltip title={`New ${lowerTitle.replace(/s$/, "")}`}>
+          <Button
+            size="small"
+            aria-label={`New ${lowerTitle.replace(/s$/, "")}`}
+            color="success"
+            variant="outlined"
+            sx={{ minWidth: 0, px: 0.5, height: 20 }}
+            onClick={onAdd}
+          >
+            <AddIcon fontSize="small" />
+          </Button>
+        </Tooltip>
+      )}
+      {/* What is shown: a two-option segmented control, so both choices are
+          visible and the active one is filled (not a label that names the
+          current state and reads like a button for the other). */}
+      <Box
+        role="group"
+        aria-label={`${title}: which verses to show`}
+        sx={{ display: "flex", border: "1px solid", borderColor: "divider", borderRadius: 1, overflow: "hidden" }}
       >
-        <IconButton size="small" onClick={onTogglePin} sx={{ p: 0.25, color: pinned ? "primary.main" : "text.disabled" }}>
-          {pinned ? <PushPinIcon fontSize="inherit" sx={{ fontSize: 16 }} /> : <PushPinOutlinedIcon fontSize="inherit" sx={{ fontSize: 16 }} />}
-        </IconButton>
-      </Tooltip>
+        {[
+          { on: !pinned, label: "verse", tip: `Show ${lowerTitle} for the active verse only` },
+          { on: pinned, label: "chapter", tip: `Show ${lowerTitle} for every verse in this chapter` },
+        ].map((o) => (
+          <Tooltip key={o.label} title={o.tip}>
+            <Box
+              role="button"
+              aria-pressed={o.on}
+              tabIndex={0}
+              onClick={() => {
+                if (!o.on) onTogglePin();
+              }}
+              onKeyDown={(e) => {
+                if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
+                  e.preventDefault();
+                  if (!o.on) onTogglePin();
+                }
+              }}
+              sx={{
+                ...pill,
+                borderRadius: 0,
+                bgcolor: o.on ? "primary.main" : "transparent",
+                color: o.on ? "primary.contrastText" : "text.secondary",
+              }}
+            >
+              {o.label}
+            </Box>
+          </Tooltip>
+        ))}
+      </Box>
+      <Box sx={{ flex: 1 }} />
       {checkoff && lane && laneApplicable && checkoff.canCheck && !pinned && (
         <Tooltip
           title={`${title} for this verse — ${checkoff.attribution(lane)} · click to ${shade === "me" || shade === "both" ? "uncheck" : "check"}`}
@@ -1546,50 +1656,45 @@ function SectionHead({
           <Box
             role="checkbox"
             aria-checked={shade !== "open"}
+            aria-label={`${title} checked for this verse`}
+            tabIndex={0}
             onClick={() => checkoff.onToggle(lane)}
+            onKeyDown={(e) => {
+              if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
+                e.preventDefault();
+                checkoff.onToggle(lane);
+              }
+            }}
             sx={{
-              display: "flex",
-              alignItems: "center",
-              gap: 0.5,
-              cursor: "pointer",
-              px: 0.75,
-              height: 20,
-              borderRadius: 1,
-              fontSize: 11,
-              userSelect: "none",
+              ...pill,
               bgcolor: fill ? fill.bg : "transparent",
               color: fill ? fill.fg : "text.secondary",
               border: fill ? "none" : "1px solid",
               borderColor: fill ? "transparent" : "divider",
             }}
           >
-            <CheckIcon sx={{ fontSize: 13 }} /> done
+            <CheckIcon sx={{ fontSize: 13 }} /> vrs
           </Box>
         </Tooltip>
       )}
       {checkoff && lane && laneApplicable && checkoff.canCheck && (
-        <Tooltip title={`check ${title.toLowerCase()} for every applicable verse in this chapter`}>
-          <Typography
-            variant="caption"
+        <Tooltip title={`Check ${lowerTitle} for every applicable verse in this chapter (asks for confirmation)`}>
+          <Box
+            role="button"
+            aria-label={`Check ${lowerTitle} for the whole chapter`}
+            tabIndex={0}
             onClick={() => checkoff.onBulkToggle(lane)}
-            sx={{ color: "primary.main", cursor: "pointer", whiteSpace: "nowrap", ml: 0.25 }}
+            onKeyDown={(e) => {
+              if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
+                e.preventDefault();
+                checkoff.onBulkToggle(lane);
+              }
+            }}
+            sx={{ ...pill, color: "primary.main", border: "1px dashed", borderColor: "primary.main" }}
           >
-            all
-          </Typography>
+            <DoneAllIcon sx={{ fontSize: 13 }} /> ch
+          </Box>
         </Tooltip>
-      )}
-      <Box sx={{ flex: 1 }} />
-      {hideAdd ? null : (
-        <Button
-          size="small"
-          startIcon={<AddIcon fontSize="small" />}
-          color="success"
-          variant="outlined"
-          sx={{ minWidth: 0, fontSize: 11 }}
-          onClick={onAdd}
-        >
-          new
-        </Button>
       )}
     </Stack>
   );

@@ -83,12 +83,26 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **Live-testing cross-tab outbox races and the viewer role locally.** 2026-10-09 (#1147): the chapter room's
+  `row.deleted` usually heals a stale load (its step is replayed over a deferred merge), hiding the race. Silence
+  one tab's room with Playwright `page.routeWebSocket(/\/api\/ws\/chapter\//, () => {})` and buffer its
+  `be-row-delete-outcomes` BroadcastChannel in an init script to hold an outcome past a load. `/api/auth/dev` can
+  never mint a viewer (`user_roles` CHECK allows only admin/editor), so fake one by rewriting `role` in the
+  `/api/auth/me` response; the client sets `isReadOnly()` from it.
+
 - **Server-side, Hebrew mark order is data, so never blanket-NFC a D1-vs-master compare.** 2026-09-25: the sync
   canonizes `x-lemma` to UHB mark order while Door43 master is NFC, so 21 locked-book verses nobody touched hit the
   #539 no-op guard as `adopt_conflict`, kept the flag, and their editors got false "Door43 overwrote your edits"
   alerts (issue #977). NFC in `verseMerge.ts`'s `stableKey` was tried and rejected in review: a Door43 fix that puts
   source attrs INTO UHB bytes would then read as converged and be reverted on export. The fix lives in the no-op
   guard instead: drop the row only when D1 already equals canonized master AND raw master is NFC-equal to D1.
+
+- **AI-apply TN dedup: fold to find candidates, split only on proven UHB twins; never key byte-exactly.** Issue
+  #966: the #962 fold (NFC + strip joiners) merged twins tC counts separately (DAN 2:10 kol with/without U+2060).
+  Keying byte-exactly after canonizing (PR #973's first shape) reopened AI TN doubling for every quote that could
+  not be canonized: pre-#959 proposals, verses with no UHB loaded, legacy NFC rows. `isDistinctTwinTn` in
+  `pipelineImport.ts` splits a fold collision only when both words are byte-identical, different UHB surfaces;
+  NT keeps the plain fold. The nightly reimport's `planTnContentDedup` stays byte-exact and was not touched.
 
 - **A locked book freezes the merge ancestor, so Door43 is authoritative for it — and a markers-only overwrite
   is logged, never alerted.** Measured 2026-09-24 (ZEC 1:17 ULT, Rich): the book was locked on 09-17, so the
@@ -100,8 +114,18 @@ Highlights that bite repeatedly:
   lock is to prevent problems from the BE side"), but only on verses master actually moved since the ancestor
   (`verseMerge.ts` step 3b), so an unlock → fix → re-lock → `lock/push` fix still in review is not reverted; and
   a markers-only overwrite is a real overwrite worth seeing in history (#951) but not a data-loss alert. Only a
-  run's own `adopt_conflict` may reactivate a resolved flag. Open: structure paths (#949) and tn/tq/twl (#950)
-  do not honor the lock yet.
+  run's own `adopt_conflict` may reactivate a resolved flag. Structure paths honor the lock since #999
+  (#949); tn/tq/twl follow it since #950 (PR #1091).
+
+- **On a locked book the TSV ancestor advances through the sync's own writes; the verse ancestor cannot (#1090).**
+  Every tn/tq/twl edit_log row with `source = 'dcs_reimport'` carries master's own value for each content field it
+  names (adoptions log only `merge.writeFields`, overwrites/creates log master's row), so right after it D1 and
+  Door43 agreed on that field: a valid ancestor. `reconstructTsvBases(..., bookLocked)` overlays those writes past
+  the frozen boundary, so a second Door43 edit to an already-adopted note adopts cleanly instead of flagging
+  "merged over your app-side change". The same trick is unsafe for verses: the source-attr reconcile writes
+  `dcs_reimport` rows over a translator's wording (`verseMerge.ts` step 3b comment), so verse step 3b keeps the
+  false flag by design. A row whose LATEST edit is an AI apply never reaches the TSV merge at all (it is AI-only,
+  overwritten via `update_ai`).
 
 - **D1 allows at most 5 terms in a compound SELECT (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`); node:sqlite allows
   500.** A 6-term `UNION ALL` fails on local workerd and remote D1 with `too many terms in compound SELECT`
@@ -390,6 +414,17 @@ Highlights that bite repeatedly:
   blanket write-block in `request()` also kills writes the server deliberately still
   allows — it made comments vanish and made unlocking impossible from the UI. Split
   read-only into named reasons rather than one global boolean.
+  A third corollary (#1045): a lock that lands on work already typed or dragged must
+  also take Save off every unsaved-changes gate and auto-save path. Saving then
+  commits locally and the refused PATCH is dropped, so the work is lost.
+
+- **A Playwright test can land a pipeline (chapter) lock live without waiting minutes.**
+  The tab only re-reads pipeline jobs on a 120 s poll or a refocus throttled to 60 s
+  (`pipelineStore.ts`). Call `page.clock.install()` before the page loads, then
+  `page.clock.fastForward(61_000)` and dispatch `visibilitychange` (s17's
+  `refreshPipelineJobs`). A spec that saves to the seeded ZEC fixture must restore the
+  verse in `finally`. If it times out, the restore dies with the test and the seed
+  drifts, which breaks later runs. Re-run `import-ZEC.sql` to reset it.
 
 - **"Where is the user?" has no single source in this app — and both available sources
   are blind in a different direction.** `activeVerse` is Shell-LOCAL state
@@ -636,7 +671,33 @@ Highlights that bite repeatedly:
   this run's own confirmed render. It is not "never newer than the post-walk read": an outside confirm with a
   null edit id can push `master_confirmed_at` past the run's `pushed_read_at`, so the stamp's SQL edit-id gate
   leaves the row's edit id at the fetch-time value while the paired edit id is the own stamp's. Corollary for tests: a DB-side advance injected during staging now reads as an outside
-  writer, so a test of the legitimate path has to drive the real #658 stamp.
+  writer, so a test of the legitimate path has to drive the real #658 stamp. The own stamp is only legitimate
+  for a merge the staged file can contain (#1058): the walk reads master's current tip, not `masterSha`, so
+  `accountOwnPublishDecline` withholds the stamp unless our merge sits at or after `masterSha`'s position in the
+  newest-first walk (a missing or unknown `masterSha` withholds too). Next night's file head is past the merge, so
+  the stamp lands then. The admin "Pull from Door43" path (`runReimport`) pins ULT/UST the same way (#1063), because
+  it re-reads the verse cutoff after the walk. Its TSV fetch stays unpinned on purpose: a `ref`-pinned TSV fetch
+  comes back completeness-verified, which widens the prune's covered chapters, and that path's TSV cutoff is the
+  pre-walk read anyway.
+- **The dual aligner's reading line decides whether to resync from its dirty state, not from focus.** Until #1067
+  the unfocused resync compared the box against text `onInput` keeps equal to the box, so any verse change replaced
+  a dirty line that had merely lost focus (clicked into the alignment panel), marked it clean and released its pin.
+  Two specs (s18 "cancelled unalign confirm" step 3, s19 pin-release step 3) asserted that overwrite as a way an
+  edit "goes away". A dirty line now keeps its text and its pin on any server change, so Save is a 409 and a merge
+  prompt; the only resync that cleans a dirty line is a verse that moved onto the line's own text. Keeping the edit
+  is only safe while the slot points at the same ROW: a bridge or split by another editor remaps it, and the save
+  then keys on the new row and lands with a 200 (measured: v7-only text replaced the whole 6-7 row). So the line is
+  keyed by row start + `verse_end` and remounts, dropping the edit, when the row changes.
+- **A speculative write that must be undone needs its "before" state on the row, not in memory.** #1132 kept the
+  pre-upsert `verse_merge_conflicts` row in memory, which a crashed Workflow attempt, a retry, or an overlapping
+  run cannot see, so each of those either deleted an earlier night's pending alert or kept a pointer to an
+  overwrite that never landed (#1137). Since migration 0076 the speculative upsert stores `prior_json` /
+  `prior_run` on the row. Whether the overwrite landed is decided inside the CAS batch itself: a settle statement
+  directly after each write's changes()-gated edit_log row. Do not infer "landed" from edit_log by version: a
+  source-attribute reconcile or AI reseed logs `dcs_reimport` at the same version (#1137 review A2). Rules that
+  follow: a landed write and a non-adoption flag settle the row (prior_run NULL); an unsettled row is always an
+  unlanded speculation, so a later run inherits its capture; step 7b and a run's start undo only their own run's
+  rows plus any run's capture older than an hour (`STALE_SPECULATION_SECONDS`), never a younger foreign one.
 
 ## Stop conditions / goals
 
