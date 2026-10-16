@@ -1007,6 +1007,45 @@ console.log("\n[#1127: a push changes nothing on an alert with no lock-dependent
   }
 }
 
+console.log("\n[#1127: a failed lock read during the push note changes nothing (as #1129 review B1)]");
+{
+  const { sqlite, env } = freshApp();
+  sqlite.prepare(`INSERT INTO book_locks (book, locked, set_at) VALUES (?, 1, 900)`).run(BOOK);
+  await raiseVerseMergeConflictAlert(env, BOOK, "ust", {
+    noBaseCount: 1,
+    noBaseRefs: ["1:6"],
+    noBaseEditorRefs: [{ chapter: 1, verse: 6, version: 2 }],
+    bookLocked: true,
+    observedAt: 1000,
+  });
+  sqlite.prepare(`UPDATE system_alerts SET dismissed_at = 5000 WHERE source = ? AND resolved_at IS NULL`).run(SOURCE);
+  const snapshot = () =>
+    JSON.stringify(sqlite.prepare(`SELECT id, username, message, condition_key, dismissed_at, resolved_at FROM system_alerts WHERE source = ? ORDER BY id`).all(SOURCE));
+  const before = snapshot();
+  const failingLockEnv = {
+    ...env,
+    DB: {
+      ...env.DB,
+      prepare: (sql) => {
+        if (/FROM book_locks/.test(sql)) throw new Error("simulated book_locks read failure");
+        return env.DB.prepare(sql);
+      },
+    },
+  };
+  if (typeof noteLockedPush === "function" && typeof lockedPushLanded === "function") {
+    const realError = console.error;
+    console.error = () => {};
+    try {
+      await noteLockedPush(failingLockEnv, BOOK, "ust", lockedPushLanded(landedResult(), pushOpts()), PUSH_AT);
+    } finally {
+      console.error = realError;
+    }
+    assert(snapshot() === before, "no unlocked-wording alert is minted on a lock the note could not read");
+  } else {
+    assert(false, "the #1127 exports exist");
+  }
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
