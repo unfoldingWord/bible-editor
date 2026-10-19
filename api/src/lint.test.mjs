@@ -532,6 +532,29 @@ t("reform: 1CH 22:19 shape — יְהוָה/הָאֱלֹהִים both stamped oc
   assert.equal(reusedChecks(lintUsfmVerses([v], src)).length, 0);
 });
 
+// #1225 review: the reversal pre-check reads RESOLVED keys when a source is
+// supplied. An identical same-order split where one chain carries a wrong
+// x-occurrence/x-occurrences must not resolve into a "reversed" order.
+const zAo = (occ, occs) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="${occs}" x-content="A"\\*`;
+const pairA = (a, b) => a + b + `\\w x\\w* \\w y\\w*\\zaln-e\\*\\zaln-e\\* `;
+for (const [label, bad] of [
+  ["first word mis-totaled", pairA(zAo(1, 1), zAo(2, 2))],
+  ["second word mis-totaled", pairA(zAo(1, 2), zAo(2, 3))],
+  ["both mis-numbered", pairA(zAo(2, 1), zAo(3, 1))],
+  ["first occurrence wrong", pairA(zAo(3, 2), zAo(2, 2))],
+]) {
+  t(`reform: identical same-order split with a bad occurrence (${label}) is NOT flagged as reversal`, () => {
+    const usfmText = `\\c 1\n\\p\n\\v 1 ` + pairA(zAo(1, 2), zAo(2, 2)) + bad + `\n`;
+    const src = [srcVerse(1, 1, ["A", "A"])];
+    assert.equal(reusedChecks(lintUsfmVerses([verseFromUsfm(usfmText)], src)).length, 0);
+  });
+}
+t("reform: same-content reversal [A|1,A|2] + [A|2,A|1] still flags with a real source", () => {
+  const usfmText = `\\c 1\n\\p\n\\v 1 ` + pairA(zAo(1, 2), zAo(2, 2)) + pairA(zAo(2, 2), zAo(1, 2)) + `\n`;
+  const src = [srcVerse(1, 1, ["A", "A"])];
+  assert.equal(reusedChecks(lintUsfmVerses([verseFromUsfm(usfmText)], src)).length, 1);
+});
+
 t("reform: LEV-24:10-shaped false positive (standalone + compound sharing a mis-totaled token) is closed once the real source is supplied", () => {
   const usfmText =
     `\\c 1\n\\p\n\\v 1 ` +
