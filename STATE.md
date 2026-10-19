@@ -433,6 +433,12 @@ Highlights that bite repeatedly:
   also take Save off every unsaved-changes gate and auto-save path. Saving then
   commits locally and the refused PATCH is dropped, so the work is lost.
 
+- **While an MUI Popover/Menu is open, Playwright `getByRole` cannot see the rest of the app.**
+  The Popover is a Modal and sets `aria-hidden` on its siblings, so a toolbar check made with the
+  menu open times out. Use a CSS locator (`[aria-label="..."]`) for those. The Scripture mode
+  buttons are found by aria-label too (e.g. "parallel-column doc view of the current chapter"),
+  not by their visible text.
+
 - **A Playwright test can land a pipeline (chapter) lock live without waiting minutes.**
   The tab only re-reads pipeline jobs on a 120 s poll or a refocus throttled to 60 s
   (`pipelineStore.ts`). Call `page.clock.install()` before the page loads, then

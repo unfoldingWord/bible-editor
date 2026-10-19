@@ -31,6 +31,8 @@ import type { CommentCounts } from "../lib/commentsIndex";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
 import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow, rowHighlightsFor, sourceForTargetRow } from "../lib/verseRange";
 import { directionForBook, directionForVersion } from "../lib/direction";
+import { useBoolPref } from "../hooks/usePref";
+import { PREF_COLUMNS_EMPHASIZE_ACTIVE } from "../lib/prefStore";
 import {
   classifySourceQuery,
   matchSourceVerse,
@@ -229,8 +231,6 @@ const VerseHistoryDialog = lazy(() =>
   import("./VerseHistoryDialog").then((m) => ({ default: m.VerseHistoryDialog })),
 );
 
-const EMPHASIZE_ACTIVE_KEY = "be:columnsEmphasizeActive";
-
 function ScriptureColumnInner({
   book,
   chapter,
@@ -300,23 +300,10 @@ function ScriptureColumnInner({
   const [findOpen, setFindOpen] = useState(() => loadFindOpen(book));
   // Columns mode: stronger tint + coloured verse number on the active verse so the eye can find
   // it in the continuous flow (rows/book modes already set it apart). On by
-  // default; the toolbar toggle turns it off and the choice persists.
-  const [emphasizeActive, setEmphasizeActive] = useState(() => {
-    try {
-      return localStorage.getItem(EMPHASIZE_ACTIVE_KEY) !== "0";
-    } catch {
-      return true;
-    }
-  });
-  const toggleEmphasizeActive = () => {
-    const next = !emphasizeActive;
-    setEmphasizeActive(next);
-    try {
-      localStorage.setItem(EMPHASIZE_ACTIVE_KEY, next ? "1" : "0");
-    } catch {
-      /* ignore */
-    }
-  };
+  // default; the toolbar toggle and the top bar's Display settings menu both
+  // turn it off, sharing one persisted value (#1228).
+  const [emphasizeActive, setEmphasizeActive] = useBoolPref(PREF_COLUMNS_EMPHASIZE_ACTIVE, true);
+  const toggleEmphasizeActive = () => setEmphasizeActive(!emphasizeActive);
   // A book lock still lets translators search a locked book (to compare past
   // work) — only replace is a hard freeze, since the writes would appear to
   // work and then fail (423) for every match. FindReplaceOverlay itself
