@@ -3432,6 +3432,47 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   assert(reused.size === 0, `identical position sequence [7]+[7] is a legitimate split, not reuse (got ${[...reused]})`);
 }
 
+// ─── #425: reversed \zaln nesting over the same source tokens ──────────────
+// HAB 1:3 UST: chain [A,B] and chain [B,A] claim the same two source words in
+// opposite nesting order. Ruling A (2026-10-15): that is a defect, and the
+// marker must agree with api-side lint (hasReusedSourceToken). parseAlignment's
+// canonical sort (run when the source verse is passed, as the panel does) used
+// to make the two chains identical and so exempt them as a split.
+{
+  const zA = (occ = 1, occs = 1, c = "A") => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="${occs}" x-content="${c}"\\*`;
+  const zB = () => `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*`;
+  const verseOf = (body) => usfm.toJSON(`\\c 1\n\\p\n\\v 1 ${body}\n`).chapters["1"]["1"].verseObjects;
+  const srcAB = verseOf(`\\w A|strong="H1"\\w* \\w B|strong="H2"\\w*`);
+  const srcAA = verseOf(`\\w A|strong="H1"\\w* \\w A|strong="H1"\\w*`);
+  const keyOf = (s) => `c${s.content}|${s.occurrence}`;
+  const reusedOf = (body, src) => findReusedSourceWordIds(parseAlignment(verseOf(body), src).groups, keyOf);
+  const pair = (o1, o2) => `${o1}\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ${o2}\\w x3\\w* \\w x4\\w*\\zaln-e\\*\\zaln-e\\*`;
+
+  console.log("\n[Case] #425 HAB 1:3 shape: [A,B] + [B,A] flags with the source passed");
+  const hab = reusedOf(pair(zA() + zB(), zB() + zA()), srcAB);
+  assert(hab.size === 4, `all four source words of the reversed pair are flagged (got ${hab.size})`);
+
+  console.log("\n[Case] #425 identical same-order split [A,B] + [A,B] stays exempt with the source passed");
+  assert(reusedOf(pair(zA() + zB(), zA() + zB()), srcAB).size === 0, `same-order split is not reuse`);
+
+  console.log("\n[Case] #425 identically reversed split [B,A] + [B,A] stays exempt");
+  assert(reusedOf(pair(zB() + zA(), zB() + zA()), srcAB).size === 0, `two chains reversed the same way still match each other`);
+
+  console.log("\n[Case] #425 a lone reversed chain (ZEC 6:13 shape) is not reuse");
+  assert(
+    reusedOf(`${zB()}${zA()}\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\*`, srcAB).size === 0,
+    `one reversed compound alone claims each word once`,
+  );
+
+  // Same-content reversal [A|1,A|2] + [A|2,A|1]: also reversed nesting, so the
+  // marker flags it. api-side lint does NOT (its signature strips occurrence;
+  // see "KNOWN GAP: same-content reversal" in api/src/lint.test.mjs). Pinned
+  // here so the remaining lint-side gap is visible, not silently "fixed".
+  console.log("\n[Case] #425 same-content reversal [A|1,A|2] + [A|2,A|1] flags in the marker");
+  const same = reusedOf(pair(zA(1, 2) + zA(2, 2), zA(2, 2) + zA(1, 2)), srcAA);
+  assert(same.size === 4, `same-content reversed nesting is flagged by the marker (got ${same.size})`);
+}
+
 {
   // Regression for the gap review found: a compound of THREE overlapping a
   // standalone. Neither stripCompoundOverlaps bail-out fires here (kept.length

@@ -1055,9 +1055,9 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 //     absorbed into the hole above when the reversed tokens share the SAME
 //     content (see the same-content-reversal instance above) — in that case
 //     the signature collapses just like any other occurrence-only difference.
-//     The aligner's marker resolves the HAB 1:3 case to one canonical source
-//     order and exempts it as a split. A real encoding oddity, not a false
-//     positive — do not weaken either detector to reconcile it.
+//     Ruling A on #425 (2026-10-15): reversed nesting IS a defect. The
+//     aligner's marker now reads each chain's pre-sort nesting order and flags
+//     it too, so both detectors agree on HAB 1:3. Do not make this check sort.
 //
 // The single verse this fix stops flagging that the
 // right reason: its real reuse (שִׁמְעָם claimed by a compound and a standalone)
