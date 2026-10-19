@@ -703,15 +703,26 @@ export function positionsShareOwner(
 // delete a flagged chip from a partly-overlapping compound and leave the marker
 // invisible on the very verse lint flags (AMO 3:2 UST — see that function).
 //
-// Sequence order is DOCUMENT order, matching the api-side join — sorting would
-// exempt the reversed-nesting defect ([A,B] plus [B,A] over the same tokens,
-// HAB 1:3 UST) by making the two chains look identical.
+// Sequence order is DOCUMENT (nesting) order, matching the api-side join —
+// sorting would exempt the reversed-nesting defect ([A,B] plus [B,A] over the
+// same tokens, HAB 1:3 UST) by making the two chains look identical. Ruling A
+// on #425 (2026-10-15): that shape IS a defect. parseAlignment sorts each
+// compound into canonical source order when it gets the source verse, so the
+// pre-sort order is read back from nestingOrderOf. The side table is keyed on
+// the sorted `source` array: an edit that rebuilds a group's source drops the
+// entry, and the canonical order is what such a verse exports anyway.
+// Known remaining disagreement: same-content reversal ([A|1,A|2] + [A|2,A|1])
+// flags here but not in lint, whose signature strips occurrence.
 //
 // Returns the IDS of the offending source words, not positions, so the caller
 // marks chips by identity and can't mismatch position spaces (chips resolve
 // their own `pos` through the fallback chain for hover).
 //
 // Display/report only; nothing is fixed here.
+// Canonically sorted `source` array -> that group's original nesting order.
+// Filled by withSourceCoverage only for groups its sort reordered.
+const nestingOrderOf = new WeakMap<SourceWord[], SourceWord[]>();
+
 export function findReusedSourceWordIds(
   groups: AlignmentGroup[],
   keyOf: (s: SourceWord) => string | null,
@@ -719,7 +730,7 @@ export function findReusedSourceWordIds(
   const sequencesByToken = new Map<string, Set<string>>();
   for (const g of groups) {
     const tokens: string[] = [];
-    for (const s of g.source) {
+    for (const s of nestingOrderOf.get(g.source) ?? g.source) {
       const k = keyOf(s);
       if (k !== null && !tokens.includes(k)) tokens.push(k);
     }
@@ -1484,7 +1495,11 @@ function withSourceCoverage(
     });
     withPos.sort((a, b) => a.key - b.key || a.i - b.i);
     if (withPos.every((x, idx) => x.i === idx)) return g; // already canonical
-    return { ...g, source: withPos.map((x) => x.s) };
+    const source = withPos.map((x) => x.s);
+    // Remember the original nesting so findReusedSourceWordIds can still see
+    // a reversed-nesting defect (#425) after this sort hides it.
+    nestingOrderOf.set(source, g.source);
+    return { ...g, source };
   });
   base = { ...base, sourceGroups: sortedGroups };
   const covered = new Set<number>();
