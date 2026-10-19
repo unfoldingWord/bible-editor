@@ -83,6 +83,13 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **Columns mode verse styling must reach block children.** A DocColumn verse is a `display: inline` span, but a
+  poetry/paragraph verse's contentEditable carries `be-q`/`be-para`/`be-line` (block) and mid-verse `\q` lines render
+  as `<div>`s. A block splits the inline span, and the span's background/box-shadow never paints behind it, so a style
+  set only on the outer span vanishes on poetry (the active-verse tint was invisible on poetry until
+  `activeVerseTintSx`). Style the block children too, and keep inline `background` off the contentEditable. Emotion
+  splits selector lists on every comma, including inside `:is()`, so spell selectors out.
+
 - **tq/twl rows compare against a pin, not the cache (#1115).** `web/src/sync/rowEditPin.ts` holds the rules:
   the cache carries optimistic text at an unchanged version, so "the row equals what is on screen" is only a
   server confirmation once the version moved past the one cached at the click. NoteCard's own rebase

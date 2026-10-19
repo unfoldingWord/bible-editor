@@ -10,6 +10,7 @@ import SearchIcon from "@mui/icons-material/Search";
 import UndoIcon from "@mui/icons-material/Undo";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
+import HighlightIcon from "@mui/icons-material/Highlight";
 import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { DocColumn } from "./DocColumn";
@@ -228,6 +229,8 @@ const VerseHistoryDialog = lazy(() =>
   import("./VerseHistoryDialog").then((m) => ({ default: m.VerseHistoryDialog })),
 );
 
+const EMPHASIZE_ACTIVE_KEY = "be:columnsEmphasizeActive";
+
 function ScriptureColumnInner({
   book,
   chapter,
@@ -295,6 +298,25 @@ function ScriptureColumnInner({
   // remounts this column (useChapter nulls its payload → Shell's `!data` gate
   // unmounts us) comes back open instead of vanishing. See ../lib/findState.
   const [findOpen, setFindOpen] = useState(() => loadFindOpen(book));
+  // Columns mode: stronger tint + coloured verse number on the active verse so the eye can find
+  // it in the continuous flow (rows/book modes already set it apart). On by
+  // default; the toolbar toggle turns it off and the choice persists.
+  const [emphasizeActive, setEmphasizeActive] = useState(() => {
+    try {
+      return localStorage.getItem(EMPHASIZE_ACTIVE_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const toggleEmphasizeActive = () => {
+    const next = !emphasizeActive;
+    setEmphasizeActive(next);
+    try {
+      localStorage.setItem(EMPHASIZE_ACTIVE_KEY, next ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  };
   // A book lock still lets translators search a locked book (to compare past
   // work) — only replace is a hard freeze, since the writes would appear to
   // work and then fail (423) for every match. FindReplaceOverlay itself
@@ -622,6 +644,20 @@ function ScriptureColumnInner({
             ))}
           </ToggleButtonGroup>
         )}
+        {mode === "columns" && (
+          <Tooltip title={emphasizeActive ? "strong active-verse highlight: on (click for the faint one)" : "strong active-verse highlight: off (click to turn on)"}>
+            <ToggleButton
+              size="small"
+              value="emphasize"
+              selected={emphasizeActive}
+              onChange={toggleEmphasizeActive}
+              aria-label="strong active-verse highlight"
+              sx={{ px: 0.5, py: 0.25 }}
+            >
+              <HighlightIcon sx={{ fontSize: 16 }} />
+            </ToggleButton>
+          </Tooltip>
+        )}
         <Box sx={{ flex: 1 }} />
         <Tooltip title="scroll the active verse + its resources back into view">
           <Button
@@ -755,6 +791,7 @@ function ScriptureColumnInner({
                 verseNumbers={verseNumbers}
                 chapter={chapter}
                 activeVerse={activeVerse}
+                emphasizeActive={emphasizeActive}
                 readOnly={READ_ONLY_VERSIONS.has(v) || effectiveLocked}
                 textCheck={READ_ONLY_VERSIONS.has(v) ? undefined : textCheck}
                 rtl={directionForVersion(v) === "rtl"}
