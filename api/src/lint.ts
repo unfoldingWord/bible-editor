@@ -1031,9 +1031,9 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 // identically, so a token they share is not reported. Instances of the class:
 //   - `[A|1, B|1]` + `[A|1, B|2]` both sign as "A,B" (the original case below).
 //   - `[A|1, A|2]` + `[A|2, A|3]` both sign as "A,A" (share the A|2 token).
-//   - `[A|1, A|2]` + `[A|2, A|1]` both sign as "A,A" (same-content reversal —
-//     see the HAB 1:3 note below for why this differs from DIFFERENT-content
-//     reversal, which still flags).
+//   (`[A|1, A|2]` + `[A|2, A|1]`, same-content reversal, also signs "A,A" but
+//   is NO LONGER in the hole: a separate permutation check in
+//   hasReusedSourceToken flags it, #1225.)
 //   - `[A|1, B|1, C|1]` + `[A|1, B|2, C|1]` both sign as "A,B,C" (the differing
 //     occurrence sits in the middle, not at an edge).
 // That shape is STRUCTURALLY IDENTICAL to the JER 33:7 split this fix
@@ -1051,10 +1051,9 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 //   - HAB 1:3 — NOT an occurrence artefact at all, and NOT an instance of the
 //     class above: the two chains carry the SAME keys but with DIFFERENT
 //     x-content (אָוֶן vs וְעָמָל) in REVERSED nesting order, so their signatures
-//     genuinely differ and this check still flags. Reversed nesting is only
-//     absorbed into the hole above when the reversed tokens share the SAME
-//     content (see the same-content-reversal instance above) — in that case
-//     the signature collapses just like any other occurrence-only difference.
+//     genuinely differ and this check still flags. Same-content reversal
+//     collapses in the signature, but the permutation check in
+//     hasReusedSourceToken flags it (#1225).
 //     Ruling A on #425 (2026-10-15): reversed nesting IS a defect. The
 //     aligner's marker now reads each chain's pre-sort nesting order and flags
 //     it too, so both detectors agree on HAB 1:3. Do not make this check sort.
@@ -1306,6 +1305,23 @@ function pickBestPositions(
 function hasReusedSourceToken(nodes: unknown[], srcTokens: string[] = []): boolean {
   const chains = resolveChainPositions(findTopLevelZalns(nodes).map(collectZalnChainWords), srcTokens);
   const chainKeysByToken = new Map<string, Set<string>>();
+  // Same-content reversal (#1225): chains over the SAME full keys in a
+  // different nesting order. The occurrence-stripped signature below collapses
+  // [A|1,A|2] and [A|2,A|1] to one "A,A", but Ruling A on #425 makes reversed
+  // nesting a defect, and the aligner marker flags it. Compared on FULL keys
+  // (occurrence kept) as a permutation, so the occurrence-only hole (chains
+  // whose key SETS differ, e.g. [A|1,B|1] + [A|1,B|2]) is untouched, and an
+  // identical same-order split (same order) is not a reversal.
+  const orderBySet = new Map<string, string>();
+  for (const keys of chains) {
+    const uniqueKeys = [...new Set(keys)];
+    if (uniqueKeys.length < 2) continue;
+    const order = uniqueKeys.join("\u0001");
+    const setKey = [...uniqueKeys].sort().join("\u0001");
+    const seen = orderBySet.get(setKey);
+    if (seen === undefined) orderBySet.set(setKey, order);
+    else if (seen !== order) return true;
+  }
   for (const keys of chains) {
     // De-duplicate WITHIN the chain before taking its identity, exactly as
     // findReusedSourceWordIds does per group (`!tokens.includes(k)`). Without

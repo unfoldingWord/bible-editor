@@ -460,20 +460,28 @@ t("KNOWN GAP: [A|1,B|1] + [A|1,B|2] is not reported (occurrence-insensitive sign
   assert.equal(reusedChecks(i).length, 0);
 });
 
-// Another instance of the SAME accepted hole above, not the HAB 1:3 shape:
-// `[A|1,A|2]` and `[A|2,A|1]` are a same-content reversal — the two chains'
-// unique-key lists agree on content sequence ("A,A") and differ only in
-// occurrence order, so they sign identically and collapse. HAB 1:3 still
-// flags because its two chains carry DIFFERENT x-content (אָוֶן vs וְעָמָל) in
-// reversed order, which keeps the signatures genuinely distinct — reversed
-// nesting alone is not what falls into this hole, only reversed nesting of
-// the SAME content.
-t("KNOWN GAP: same-content reversal [A|1,A|2] + [A|2,A|1] is not reported", () => {
+// Same-content reversal: `[A|1,A|2]` + `[A|2,A|1]` claim the SAME two tokens in
+// REVERSED nesting order. Their occurrence-stripped signatures collide ("A,A"),
+// but under Ruling A on #425 reversed nesting is a defect, so lint flags it to
+// agree with the aligner marker (#1225). The check is a permutation test on the
+// full keys, so it does NOT reopen the occurrence-only hole pinned above.
+t("same-content reversal [A|1,A|2] + [A|2,A|1] flags (#425 ruling, #1225)", () => {
   const zA = (occ) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="2" x-content="A"\\*`;
   const usfmText =
     `\\c 1\n\\p\n\\v 1 ` +
     zA(1) + zA(2) + `\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ` +
     zA(2) + zA(1) + `\\w x3\\w* \\w x4\\w*\\zaln-e\\*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(reusedChecks(i).length, 1);
+});
+
+// Guard: the SAME order written twice (identical split) is not a reversal.
+t("identical same-order [A|1,A|2] twice is NOT flagged", () => {
+  const zA = (occ) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="2" x-content="A"\\*`;
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    zA(1) + zA(2) + `\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    zA(1) + zA(2) + `\\w x3\\w* \\w x4\\w*\\zaln-e\\*\\zaln-e\\*\n`;
   const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
   assert.equal(reusedChecks(i).length, 0);
 });
@@ -522,6 +530,29 @@ t("reform: 1CH 22:19 shape — יְהוָה/הָאֱלֹהִים both stamped oc
   // each chain to its own real position instead of both claiming the first.
   const src = [srcVerse(22, 19, ["יְהוָה", "הָאֱלֹהִים", "filler", "הָאֱלֹהִים"])];
   assert.equal(reusedChecks(lintUsfmVerses([v], src)).length, 0);
+});
+
+// #1225 review: the reversal pre-check reads RESOLVED keys when a source is
+// supplied. An identical same-order split where one chain carries a wrong
+// x-occurrence/x-occurrences must not resolve into a "reversed" order.
+const zAo = (occ, occs) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="${occs}" x-content="A"\\*`;
+const pairA = (a, b) => a + b + `\\w x\\w* \\w y\\w*\\zaln-e\\*\\zaln-e\\* `;
+for (const [label, bad] of [
+  ["first word mis-totaled", pairA(zAo(1, 1), zAo(2, 2))],
+  ["second word mis-totaled", pairA(zAo(1, 2), zAo(2, 3))],
+  ["both mis-numbered", pairA(zAo(2, 1), zAo(3, 1))],
+  ["first occurrence wrong", pairA(zAo(3, 2), zAo(2, 2))],
+]) {
+  t(`reform: identical same-order split with a bad occurrence (${label}) is NOT flagged as reversal`, () => {
+    const usfmText = `\\c 1\n\\p\n\\v 1 ` + pairA(zAo(1, 2), zAo(2, 2)) + bad + `\n`;
+    const src = [srcVerse(1, 1, ["A", "A"])];
+    assert.equal(reusedChecks(lintUsfmVerses([verseFromUsfm(usfmText)], src)).length, 0);
+  });
+}
+t("reform: same-content reversal [A|1,A|2] + [A|2,A|1] still flags with a real source", () => {
+  const usfmText = `\\c 1\n\\p\n\\v 1 ` + pairA(zAo(1, 2), zAo(2, 2)) + pairA(zAo(2, 2), zAo(1, 2)) + `\n`;
+  const src = [srcVerse(1, 1, ["A", "A"])];
+  assert.equal(reusedChecks(lintUsfmVerses([verseFromUsfm(usfmText)], src)).length, 1);
 });
 
 t("reform: LEV-24:10-shaped false positive (standalone + compound sharing a mis-totaled token) is closed once the real source is supplied", () => {

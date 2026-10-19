@@ -711,8 +711,8 @@ export function positionsShareOwner(
 // pre-sort order is read back from nestingOrderOf. The side table is keyed on
 // the sorted `source` array: an edit that rebuilds a group's source drops the
 // entry, and the canonical order is what such a verse exports anyway.
-// Known remaining disagreement: same-content reversal ([A|1,A|2] + [A|2,A|1])
-// flags here but not in lint, whose signature strips occurrence.
+// Same-content reversal ([A|1,A|2] + [A|2,A|1]) flags here and, since #1225,
+// in lint too (a permutation check beside its occurrence-stripped signature).
 //
 // Returns the IDS of the offending source words, not positions, so the caller
 // marks chips by identity and can't mismatch position spaces (chips resolve
