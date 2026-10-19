@@ -379,7 +379,7 @@ export function DocColumn({
           textAlign: rtl ? "right" : "left",
           ...markHighlightSx(theme.palette.mode),
           ...draftDirtyBorderSx(),
-          ...activeVerseTintSx(),
+          ...activeVerseTintSx(theme.palette.mode),
         })}
       >
         {verseNumbers.map((v) => {
@@ -491,7 +491,7 @@ function findPreviousVerse(
 // Spelled out per class rather than `:is(a, b, c)`: emotion splits selector
 // lists on every comma, including those inside `:is()`.
 const TINT_BLOCKS = [".be-q", ".be-para", ".be-line"];
-function activeVerseTintSx() {
+function activeVerseTintSx(mode: "light" | "dark") {
   // Matches a block only when no other tinted block inside the verse encloses
   // it (`\q2` inside a `be-q` leading line would otherwise double the alpha).
   const rules = (sel: string, alpha: number) => {
@@ -508,6 +508,9 @@ function activeVerseTintSx() {
     ...rules(".be-verse-active", 0.14),
     // Stronger tint when the toolbar's "highlight active verse" toggle is on.
     ...rules(".be-verse-active.be-verse-emph", 0.26),
+    // Verse number on the emphasized verse: theme-aware, so it stays legible
+    // on the tint in dark mode too (VerseSpan leaves its inline colour unset).
+    "& .be-verse-emph > .be-vnum": { color: mode === "dark" ? "#7fd1f0" : "#0b5f86" },
   };
 }
 
@@ -885,11 +888,12 @@ const VerseSpan = memo(function VerseSpan({
     >
       <span
         ref={setMarkerRef}
+        className="be-vnum"
         style={{
           fontFamily: "monospace",
           fontSize: 10,
           fontWeight: isRange || emphasize ? 700 : 600,
-          color: isRange ? "#014263" : emphasize ? "#0b5f86" : "#9aa0a6",
+          color: isRange ? "#014263" : emphasize ? undefined : "#9aa0a6",
           verticalAlign: "1px",
           marginRight: 4,
           borderBottom:
