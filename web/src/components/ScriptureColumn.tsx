@@ -645,13 +645,13 @@ function ScriptureColumnInner({
           </ToggleButtonGroup>
         )}
         {mode === "columns" && (
-          <Tooltip title={emphasizeActive ? "active verse highlight: on (click to turn off)" : "active verse highlight: off (click to turn on)"}>
+          <Tooltip title={emphasizeActive ? "strong active-verse highlight: on (click for the faint one)" : "strong active-verse highlight: off (click to turn on)"}>
             <ToggleButton
               size="small"
               value="emphasize"
               selected={emphasizeActive}
               onChange={toggleEmphasizeActive}
-              aria-label="highlight active verse"
+              aria-label="strong active-verse highlight"
               sx={{ px: 0.5, py: 0.25 }}
             >
               <HighlightIcon sx={{ fontSize: 16 }} />

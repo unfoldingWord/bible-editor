@@ -492,13 +492,18 @@ function findPreviousVerse(
 // lists on every comma, including those inside `:is()`.
 const TINT_BLOCKS = [".be-q", ".be-para", ".be-line"];
 function activeVerseTintSx() {
-  const rules = (sel: string, alpha: number) => ({
-    [[
-      `& ${sel}`,
-      ...TINT_BLOCKS.map((b) => `& ${sel} ${b}`),
-      `& ${sel} div${TINT_BLOCKS.map((b) => `:not(${b} div)`).join("")}`,
-    ].join(", ")]: { backgroundColor: `rgba(49,173,227,${alpha})` },
-  });
+  // Matches a block only when no other tinted block inside the verse encloses
+  // it (`\q2` inside a `be-q` leading line would otherwise double the alpha).
+  const rules = (sel: string, alpha: number) => {
+    const outermost = [...TINT_BLOCKS, "div"].map((b) => `:not(${sel} ${b} *)`).join("");
+    return {
+      [[
+        `& ${sel}`,
+        ...TINT_BLOCKS.map((b) => `& ${sel} ${b}${outermost}`),
+        `& ${sel} div${outermost}`,
+      ].join(", ")]: { backgroundColor: `rgba(49,173,227,${alpha})` },
+    };
+  };
   return {
     ...rules(".be-verse-active", 0.14),
     // Stronger tint when the toolbar's "highlight active verse" toggle is on.
@@ -884,7 +889,7 @@ const VerseSpan = memo(function VerseSpan({
           fontFamily: "monospace",
           fontSize: 10,
           fontWeight: isRange || emphasize ? 700 : 600,
-          color: isRange ? "#014263" : emphasize ? "#1f8fc4" : "#9aa0a6",
+          color: isRange ? "#014263" : emphasize ? "#0b5f86" : "#9aa0a6",
           verticalAlign: "1px",
           marginRight: 4,
           borderBottom:
