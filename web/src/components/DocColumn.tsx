@@ -59,7 +59,8 @@ interface Props {
   verseNumbers: number[];
   chapter: number;
   activeVerse: number;
-  // Ring + stronger tint on the active verse (toolbar toggle, default on).
+  // Stronger tint + coloured verse number on the active verse (toolbar
+  // toggle, default on).
   emphasizeActive?: boolean;
   readOnly?: boolean;
   rtl?: boolean;
@@ -378,6 +379,7 @@ export function DocColumn({
           textAlign: rtl ? "right" : "left",
           ...markHighlightSx(theme.palette.mode),
           ...draftDirtyBorderSx(),
+          ...activeVerseTintSx(),
         })}
       >
         {verseNumbers.map((v) => {
@@ -478,6 +480,30 @@ function findPreviousVerse(
     if ((dto.verse_end ?? dto.verse) < verse) return dto;
   }
   return null;
+}
+
+// Active-verse tint. The verse span is `display: inline`, so when the verse
+// starts a poetry/paragraph line (its contentEditable carries `be-q` /
+// `be-para` / `be-line`, all block) or holds mid-verse `\q` lines (<div>s),
+// those blocks split the inline span and its own background never paints
+// behind them. So the tint also goes on the outermost block children; blocks
+// nested inside an already-tinted block are skipped so the alpha doesn't stack.
+// Spelled out per class rather than `:is(a, b, c)`: emotion splits selector
+// lists on every comma, including those inside `:is()`.
+const TINT_BLOCKS = [".be-q", ".be-para", ".be-line"];
+function activeVerseTintSx() {
+  const rules = (sel: string, alpha: number) => ({
+    [[
+      `& ${sel}`,
+      ...TINT_BLOCKS.map((b) => `& ${sel} ${b}`),
+      `& ${sel} div${TINT_BLOCKS.map((b) => `:not(${b} div)`).join("")}`,
+    ].join(", ")]: { backgroundColor: `rgba(49,173,227,${alpha})` },
+  });
+  return {
+    ...rules(".be-verse-active", 0.14),
+    // Stronger tint when the toolbar's "highlight active verse" toggle is on.
+    ...rules(".be-verse-active.be-verse-emph", 0.26),
+  };
 }
 
 // memo: see #895 — a verse click must only re-render the rows whose props change.
@@ -838,18 +864,12 @@ const VerseSpan = memo(function VerseSpan({
     <span
       data-find-cell={`${chapter}-${verseNum}-${bibleVersion}`}
       onClick={() => onSelect(verseNum)}
+      // Tint comes from activeVerseTintSx on the column body.
+      className={isActive ? (emphasize ? "be-verse-active be-verse-emph" : "be-verse-active") : undefined}
       style={{
         display: "inline",
         borderRadius: 4,
         padding: "1px 2px",
-        backgroundColor: emphasize
-          ? "rgba(49,173,227,0.24)"
-          : isActive
-            ? "rgba(49,173,227,0.14)"
-            : "transparent",
-        // Ring around the whole verse; across line breaks it draws as one
-        // band (open at the wrap points) rather than a box per line.
-        boxShadow: emphasize ? "0 0 0 2px #31ADE3" : undefined,
         // RTL only: isolate each verse as its own bidi unit. In the continuous
         // columns flow the bare LTR verse marker ("6:3") otherwise reorders
         // against the neighboring verses' Hebrew runs and lands between the
@@ -863,8 +883,8 @@ const VerseSpan = memo(function VerseSpan({
         style={{
           fontFamily: "monospace",
           fontSize: 10,
-          fontWeight: isRange ? 700 : 600,
-          color: isRange ? "#014263" : "#9aa0a6",
+          fontWeight: isRange || emphasize ? 700 : 600,
+          color: isRange ? "#014263" : emphasize ? "#1f8fc4" : "#9aa0a6",
           verticalAlign: "1px",
           marginRight: 4,
           borderBottom:
@@ -1089,9 +1109,10 @@ const VerseSpan = memo(function VerseSpan({
           // parent re-render can't reset the DOM and wipe this keystroke.
           dirtyRef.current = true;
         }}
+        // No inline background: activeVerseTintSx must reach this span when
+        // it is a poetry/paragraph block (an inline style would override it).
         style={{
           outline: "none",
-          background: "transparent",
         }}
         className={leadingClass ? `be-verse-span ${leadingClass}` : "be-verse-span"}
       />

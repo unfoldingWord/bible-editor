@@ -298,7 +298,7 @@ function ScriptureColumnInner({
   // remounts this column (useChapter nulls its payload → Shell's `!data` gate
   // unmounts us) comes back open instead of vanishing. See ../lib/findState.
   const [findOpen, setFindOpen] = useState(() => loadFindOpen(book));
-  // Columns mode: ring + stronger tint on the active verse so the eye can find
+  // Columns mode: stronger tint + coloured verse number on the active verse so the eye can find
   // it in the continuous flow (rows/book modes already set it apart). On by
   // default; the toolbar toggle turns it off and the choice persists.
   const [emphasizeActive, setEmphasizeActive] = useState(() => {
@@ -309,14 +309,13 @@ function ScriptureColumnInner({
     }
   });
   const toggleEmphasizeActive = () => {
-    setEmphasizeActive((prev) => {
-      try {
-        localStorage.setItem(EMPHASIZE_ACTIVE_KEY, prev ? "0" : "1");
-      } catch {
-        /* ignore */
-      }
-      return !prev;
-    });
+    const next = !emphasizeActive;
+    setEmphasizeActive(next);
+    try {
+      localStorage.setItem(EMPHASIZE_ACTIVE_KEY, next ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
   };
   // A book lock still lets translators search a locked book (to compare past
   // work) — only replace is a hard freeze, since the writes would appear to
