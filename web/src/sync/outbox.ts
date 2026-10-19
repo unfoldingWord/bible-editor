@@ -38,6 +38,7 @@ import {
 } from "./outboxTargeting.ts";
 import { rebaseVersePatch } from "./verseRebase.ts";
 import { noteOwnVerseOp } from "./ownVerseOps.ts";
+import { createOutboxChangeRelay } from "./outboxChangeRelay.ts";
 import type { AlignmentDraftRow } from "./alignmentDraftSaveState.ts";
 
 const DB_NAME = "bible-editor-outbox";
@@ -220,7 +221,18 @@ let notifyScheduled = false;
 // resolves), so a swallowed notify in that window doesn't strand the UI on a
 // stale snapshot — we loop and re-read.
 let notifyPendingRerun = false;
-async function notify() {
+// #1220 item 4: every local outbox change is announced to the other tabs,
+// which re-read through notifyLocal (never re-announcing). See
+// outboxChangeRelay.ts.
+const changeRelay = createOutboxChangeRelay({
+  channel: typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("be-outbox-changes") : null,
+  onRemoteChange: () => void notifyLocal(),
+});
+function notify() {
+  changeRelay.announce();
+  return notifyLocal();
+}
+async function notifyLocal() {
   if (subscribers.size === 0) return;
   if (notifyScheduled) {
     // A read+dispatch is in flight. Its listAll() may have already resolved,
