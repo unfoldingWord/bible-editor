@@ -15,6 +15,8 @@ import {
   CircularProgress,
   Popover,
   Button,
+  FormControlLabel,
+  Switch,
 } from "@mui/material";
 import FormatSizeIcon from "@mui/icons-material/FormatSize";
 import RemoveIcon from "@mui/icons-material/Remove";
@@ -30,6 +32,7 @@ import CloudDownloadIcon from "@mui/icons-material/CloudDownload";
 import MoreVertIcon from "@mui/icons-material/MoreVert";
 import LogoutIcon from "@mui/icons-material/Logout";
 import AdminPanelSettingsIcon from "@mui/icons-material/AdminPanelSettings";
+import SettingsIcon from "@mui/icons-material/Settings";
 import { api, getRole, type BookListEntry, type BookSummary } from "../sync/api";
 import { SyncStatusBar } from "./SyncStatusBar";
 import { VersionIndicator } from "./VersionIndicator";
@@ -43,15 +46,67 @@ import {
   FONT_SCALE_STEP,
   FONT_SCALE_DEFAULT,
 } from "../theme";
+import { useBoolPref } from "../hooks/usePref";
+import { PREF_COLUMNS_EMPHASIZE_ACTIVE } from "../lib/prefStore";
+
+// The −/＋ and reset controls for the reading-text scale, shared by the
+// "Aa" popover and the Display settings menu.
+function FontSizeSteps() {
+  const { scale, setScale } = useContext(FontScaleContext);
+  const pct = Math.round(scale * 100);
+  return (
+    <>
+      <Stack direction="row" alignItems="center" spacing={1}>
+        <Tooltip title="smaller">
+          <span>
+            <IconButton
+              size="small"
+              onClick={() => setScale(scale - FONT_SCALE_STEP)}
+              disabled={scale <= FONT_SCALE_MIN + 1e-6}
+              aria-label="decrease reading text size"
+            >
+              <RemoveIcon fontSize="small" />
+            </IconButton>
+          </span>
+        </Tooltip>
+        <Typography
+          variant="body2"
+          sx={{ flex: 1, textAlign: "center", fontVariantNumeric: "tabular-nums" }}
+        >
+          {pct}%
+        </Typography>
+        <Tooltip title="larger">
+          <span>
+            <IconButton
+              size="small"
+              onClick={() => setScale(scale + FONT_SCALE_STEP)}
+              disabled={scale >= FONT_SCALE_MAX - 1e-6}
+              aria-label="increase reading text size"
+            >
+              <AddIcon fontSize="small" />
+            </IconButton>
+          </span>
+        </Tooltip>
+      </Stack>
+      <Button
+        size="small"
+        fullWidth
+        onClick={() => setScale(FONT_SCALE_DEFAULT)}
+        disabled={Math.abs(scale - FONT_SCALE_DEFAULT) < 1e-6}
+        sx={{ mt: 0.75, textTransform: "none" }}
+      >
+        Reset to 100%
+      </Button>
+    </>
+  );
+}
 
 // Compact "Aa" control for the reading-text font scale. Lives beside the
 // theme toggle; opens a small popover with −/＋ and a reset. Scales the ULT/UST
 // editors and note bodies via the `--be-reading-scale` CSS var.
 function FontSizeControl() {
-  const { scale, setScale } = useContext(FontScaleContext);
   const anchorRef = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
-  const pct = Math.round(scale * 100);
 
   return (
     <>
@@ -76,48 +131,73 @@ function FontSizeControl() {
           <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>
             Reading text size
           </Typography>
-          <Stack direction="row" alignItems="center" spacing={1}>
-            <Tooltip title="smaller">
-              <span>
-                <IconButton
-                  size="small"
-                  onClick={() => setScale(scale - FONT_SCALE_STEP)}
-                  disabled={scale <= FONT_SCALE_MIN + 1e-6}
-                  aria-label="decrease reading text size"
-                >
-                  <RemoveIcon fontSize="small" />
-                </IconButton>
-              </span>
-            </Tooltip>
-            <Typography
-              variant="body2"
-              sx={{ flex: 1, textAlign: "center", fontVariantNumeric: "tabular-nums" }}
-            >
-              {pct}%
-            </Typography>
-            <Tooltip title="larger">
-              <span>
-                <IconButton
-                  size="small"
-                  onClick={() => setScale(scale + FONT_SCALE_STEP)}
-                  disabled={scale >= FONT_SCALE_MAX - 1e-6}
-                  aria-label="increase reading text size"
-                >
-                  <AddIcon fontSize="small" />
-                </IconButton>
-              </span>
-            </Tooltip>
-          </Stack>
-          <Button
-            size="small"
-            fullWidth
-            onClick={() => setScale(FONT_SCALE_DEFAULT)}
-            disabled={Math.abs(scale - FONT_SCALE_DEFAULT) < 1e-6}
-            sx={{ mt: 0.75, textTransform: "none" }}
-          >
-            Reset to 100%
-          </Button>
+          <FontSizeSteps />
         </Box>
+      </Popover>
+    </>
+  );
+}
+
+// Display settings (issue #1228): one gear menu for the per-browser view
+// prefs. Dark mode and text size share the state of their own top-bar buttons
+// (main.tsx contexts); the columns highlight shares the Scripture toolbar's
+// toggle via useBoolPref, so every copy of a control stays in step.
+function DisplaySettingsControl() {
+  const { mode, toggle } = useContext(ThemeModeContext);
+  const [emphasizeActive, setEmphasizeActive] = useBoolPref(PREF_COLUMNS_EMPHASIZE_ACTIVE, true);
+  const anchorRef = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  const rowSx = { mx: 0, justifyContent: "space-between" } as const;
+
+  return (
+    <>
+      <Tooltip title="Display settings">
+        <IconButton
+          ref={anchorRef}
+          size="small"
+          onClick={() => setOpen(true)}
+          aria-label="display settings"
+        >
+          <SettingsIcon fontSize="small" />
+        </IconButton>
+      </Tooltip>
+      <Popover
+        open={open}
+        anchorEl={anchorRef.current}
+        onClose={() => setOpen(false)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+        transformOrigin={{ vertical: "top", horizontal: "right" }}
+      >
+        <Stack spacing={1} sx={{ px: 1.5, py: 1, width: 260 }} data-testid="display-settings">
+          <Typography variant="caption" color="text.secondary">
+            Display settings
+          </Typography>
+          <FormControlLabel
+            labelPlacement="start"
+            label="Dark mode"
+            sx={rowSx}
+            control={<Switch size="small" checked={mode === "dark"} onChange={toggle} />}
+          />
+          <FormControlLabel
+            labelPlacement="start"
+            label="Strong active-verse highlight (columns)"
+            sx={rowSx}
+            control={
+              <Switch
+                size="small"
+                checked={emphasizeActive}
+                onChange={(e) => setEmphasizeActive(e.target.checked)}
+              />
+            }
+          />
+          <Divider />
+          <Box>
+            <Typography variant="body2" sx={{ mb: 0.5 }}>
+              Reading text size
+            </Typography>
+            <FontSizeSteps />
+          </Box>
+        </Stack>
       </Popover>
     </>
   );
@@ -135,6 +215,9 @@ const COLLAPSE_ORDER = [
   "font",
   "download",
   "print",
+  // Last to go, so the menu holding dark mode and text size stays reachable
+  // in the bar for as long as possible (#1228).
+  "settings",
 ] as const;
 type CollapseKey = (typeof COLLAPSE_ORDER)[number];
 
@@ -322,6 +405,7 @@ export function TopBar({
     font: <FontSizeControl />,
     download: exportMenu,
     print: printPreview,
+    settings: <DisplaySettingsControl />,
   };
   const isPresent = (k: CollapseKey) => Boolean(nodes[k]) && slotWidths.current[k] !== 0;
   const present = COLLAPSE_ORDER.filter(isPresent);
@@ -656,6 +740,7 @@ export function TopBar({
       {inBar("print")}
       {inBar("font")}
       {inBar("dark")}
+      {inBar("settings")}
       <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       {pipelineMenu}
       {pipelineStatus}
