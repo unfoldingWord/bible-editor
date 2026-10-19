@@ -59,6 +59,8 @@ interface Props {
   verseNumbers: number[];
   chapter: number;
   activeVerse: number;
+  // Ring + stronger tint on the active verse (toolbar toggle, default on).
+  emphasizeActive?: boolean;
   readOnly?: boolean;
   rtl?: boolean;
   activeNoteQuote?: string | null;
@@ -140,6 +142,7 @@ export function DocColumn({
   verseNumbers,
   chapter,
   activeVerse,
+  emphasizeActive,
   readOnly,
   rtl,
   activeNoteQuote,
@@ -410,6 +413,7 @@ export function DocColumn({
                 prevHighlights={hl?.prevHighlights ?? null}
                 nextHighlights={hl?.nextHighlights ?? null}
                 isActive={isActive}
+                emphasize={isActive && !!emphasizeActive}
                 readOnly={!!readOnly}
                 rtl={!!rtl}
                 lexiconMap={lexiconMap}
@@ -492,6 +496,7 @@ const VerseSpan = memo(function VerseSpan({
   prevHighlights,
   nextHighlights,
   isActive,
+  emphasize,
   readOnly,
   rtl,
   lexiconMap,
@@ -537,6 +542,8 @@ const VerseSpan = memo(function VerseSpan({
   prevHighlights?: Set<string> | null;
   nextHighlights?: Set<string> | null;
   isActive: boolean;
+  // Only ever true on the active verse, so toggling it re-renders one row.
+  emphasize: boolean;
   readOnly: boolean;
   rtl: boolean;
   lexiconMap?: Map<string, LexiconEntry | null>;
@@ -835,7 +842,14 @@ const VerseSpan = memo(function VerseSpan({
         display: "inline",
         borderRadius: 4,
         padding: "1px 2px",
-        backgroundColor: isActive ? "rgba(49,173,227,0.14)" : "transparent",
+        backgroundColor: emphasize
+          ? "rgba(49,173,227,0.24)"
+          : isActive
+            ? "rgba(49,173,227,0.14)"
+            : "transparent",
+        // Ring around the whole verse; across line breaks it draws as one
+        // band (open at the wrap points) rather than a box per line.
+        boxShadow: emphasize ? "0 0 0 2px #31ADE3" : undefined,
         // RTL only: isolate each verse as its own bidi unit. In the continuous
         // columns flow the bare LTR verse marker ("6:3") otherwise reorders
         // against the neighboring verses' Hebrew runs and lands between the
