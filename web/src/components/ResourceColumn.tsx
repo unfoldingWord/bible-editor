@@ -1575,11 +1575,17 @@ function SectionHead({
         borderColor: "divider",
         ...(sticky
           ? {
+              // The scroll body has py:1 and sticky `top` is inset by that
+              // padding, so top:0 left an 8px strip above the bar where
+              // scrolled content showed through. top:-8 sticks it flush to the
+              // scrollport edge; mt:-1 + the extra 8px of pt cancel out at
+              // rest so the bar's resting layout is unchanged.
               position: "sticky",
-              top: 0,
+              top: -8,
+              mt: -1,
               bgcolor: "background.paper",
               zIndex: 2,
-              pt: 0.25,
+              pt: 1.25,
             }
           : {}),
       }}
