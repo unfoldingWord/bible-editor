@@ -45,6 +45,8 @@ import {
   RESOURCE_TARGETS,
   usfmRevertReport,
   tsvRevertReport,
+  narrowRevertEntriesByLineage,
+  type StoredMasterLineage,
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
   loadRevertLineage,
@@ -1476,10 +1478,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // #1029: where master was last confirmed, read before tonight's push;
       // bounds which bot writes the revert lineage may count.
       let priorConfirmed: { editId: number | null; at: number | null } = { editId: null, at: null };
+      // #1231: the lineage the sync persisted, which narrows the revert report
+      // to rows a person may have touched (narrowRevertEntriesByLineage).
+      // Null keeps the full report.
+      let storedLineage: StoredMasterLineage | null = null;
       try {
         const prior = await this.env.DB.prepare(
           `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key,
-                  unconfirmed_renders_json, master_confirmed_edit_id, master_confirmed_at
+                  unconfirmed_renders_json, master_confirmed_edit_id, master_confirmed_at,
+                  master_lineage_json, master_lineage_sha, master_lineage_confirmed_at
              FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
         )
           .bind(book, resource)
@@ -1491,11 +1498,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             unconfirmed_renders_json: string | null;
             master_confirmed_edit_id: number | null;
             master_confirmed_at: number | null;
+            master_lineage_json: string | null;
+            master_lineage_sha: string | null;
+            master_lineage_confirmed_at: number | null;
           }>();
         priorConfirmed = {
           editId: prior?.master_confirmed_edit_id ?? null,
           at: prior?.master_confirmed_at ?? null,
         };
+        storedLineage = prior
+          ? {
+              json: prior.master_lineage_json ?? null,
+              sha: prior.master_lineage_sha ?? null,
+              confirmedAt: prior.master_lineage_confirmed_at ?? null,
+            }
+          : null;
         unconfirmedRenderShas = readUnconfirmedRenders(prior);
         const pointer = priorPublishPointer(prior, r2Key);
         priorPushedBlobSha = pointer.blobSha;
@@ -1687,12 +1704,32 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           console.log(`export: no last-publish base for ${book} ${resource}; revert report lists every differing row`);
         }
       }
+      // #1231: drop reported rows the persisted lineage proves no person
+      // touched since master was last confirmed. Pinned to the same master
+      // commit the report diffs against (fresh.masterSha) and to the confirmed
+      // point read before tonight's push; any mismatch or gap keeps every row.
+      const narrowByLineage = <E extends { ref: string }>(entries: E[]): E[] => {
+        if (entries.length === 0) return entries;
+        const n = narrowRevertEntriesByLineage(entries, storedLineage, {
+          masterSha: fresh.masterSha,
+          confirmedAt: priorConfirmed.at,
+        });
+        console.log("export: revert report lineage narrowing", {
+          book,
+          resource,
+          narrowed: n.narrowed,
+          reason: n.reason || undefined,
+          reported: n.entries.length,
+          dropped: n.dropped,
+        });
+        return n.entries;
+      };
       if (
         (resource === "ult" || resource === "ust") &&
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
         const entries = computeEntries
-          ? usfmRevertReport(built.content, usfmMasterContentForRevertReport as string, revertBase).entries
+          ? narrowByLineage(usfmRevertReport(built.content, usfmMasterContentForRevertReport as string, revertBase).entries)
           : [];
         await this.recordExportRevertReport(book, resource, "usfm", entries, mechanical, branch, instanceId, alertObservedAt);
       } else if (
@@ -1743,13 +1780,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           }
         }
         const entries = computeEntries
-          ? tsvRevertReport(
-              built.content,
-              tsvMasterContentForRevertReport as string,
-              resource as "tn" | "tq" | "twl",
-              revertBase,
-              lineage,
-            ).entries
+          ? narrowByLineage(
+              tsvRevertReport(
+                built.content,
+                tsvMasterContentForRevertReport as string,
+                resource as "tn" | "tq" | "twl",
+                revertBase,
+                lineage,
+              ).entries,
+            )
           : [];
         await this.recordExportRevertReport(book, resource, "tsv", entries, mechanical, branch, instanceId, alertObservedAt);
       }
