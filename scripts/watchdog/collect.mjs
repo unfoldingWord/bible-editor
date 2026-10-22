@@ -7,6 +7,10 @@
 //
 //   node --experimental-strip-types --no-warnings scripts/watchdog/collect.mjs <outDir> [YYYY-MM-DD]
 //
+// The export_revert check (#1233) also needs DOOR43_TOKEN in the environment
+// (`source ~/.config/door43.env`) for read-only Door43 GETs; without it that
+// check is recorded as a failed step.
+//
 // Writes <outDir>/bundle.json (everything below) and <outDir>/summary.md.
 // It changes nothing. The one repair it knows how to prove — resolving review
 // rows whose flagged version has no visible difference from D1 now (the
@@ -172,6 +176,63 @@ if (proven.length > 0) {
   fs.writeFileSync(path.join(OUT, "proposed-resolve.sql"), sql + "\n");
 }
 
+// export_revert alerts (#1233): for each one raised tonight, compare Door43's
+// file at our previous export with master at tonight's export's first parent
+// (exportRevertCheck.mjs). A ref unchanged between them is a false alarm:
+// master never moved there. Any doubt leaves the ref unknown. Door43 GETs and
+// read-only D1 SELECTs only; no proposal SQL is written for these, the routine
+// reads the verdict and decides.
+bundle.exportReverts = [];
+const revertAlerts = (bundle.newAlerts ?? []).filter((x) => String(x.source).startsWith("export_revert:"));
+// Loaded here, not statically, so a load failure in exportRevertCheck.mjs or
+// export.ts's import graph lands in bundle.errors instead of killing the run.
+const erc =
+  revertAlerts.length === 0
+    ? null
+    : await import("./exportRevertCheck.mjs").catch((e) => {
+        bundle.errors.push({ step: "load exportRevertCheck.mjs", error: String(e?.stack ?? e?.message ?? e).slice(0, 2000) });
+        return null;
+      });
+for (const a of erc ? revertAlerts : []) {
+  const [, book, resource] = String(a.source).split(":");
+  const res = step(`export_revert check ${a.id} ${book} ${resource}`, () => {
+    if (!process.env.DOOR43_TOKEN) throw new Error("DOOR43_TOKEN not set (source ~/.config/door43.env)");
+    const pair = `book = ${sqlStr(book)} AND resource = ${sqlStr(resource)}`;
+    const [meta] = q(`SELECT event_key, created_at FROM system_alerts WHERE id = ${Number(a.id)}`);
+    // export_reverts is a replace-all snapshot per (book, resource): its rows
+    // are this alert's only if no newer alert for the pair exists tonight and
+    // the pair's current generation is the one in the alert's event_key.
+    const rows = q(`SELECT ref, detected_at FROM export_reverts WHERE ${pair} ORDER BY id`);
+    const [generation] = q(`SELECT generation, observed_at FROM export_revert_generations WHERE ${pair}`);
+    const [sync] = q(`SELECT pushed_blob_sha, prev_pushed_blob_sha, unconfirmed_renders_json FROM book_resource_syncs WHERE ${pair}`);
+    const newer = revertAlerts.filter((x) => x.source === a.source && x.id > a.id).map((x) => x.id);
+    const snapshot = erc.snapshotStatus({
+      alert: { id: a.id, eventKey: meta?.event_key ?? null, createdAtS: Number(meta?.created_at) },
+      book,
+      resource,
+      newerAlertId: newer.length ? Math.max(...newer) : null,
+      generation: generation ?? null,
+      detectedAt: rows.map((r) => Number(r.detected_at)),
+    });
+    const out = erc.checkExportRevertAlert(
+      {
+        alertId: a.id,
+        book,
+        resource,
+        alertCreatedAtMs: Number(meta?.created_at) * 1000,
+        refs: rows.map((r) => r.ref),
+        snapshot,
+        knownRenders: erc.knownRenderShas(sync ?? null),
+        pushedBlobSha: sync?.pushed_blob_sha ?? null,
+      },
+      process.env.DOOR43_TOKEN,
+    );
+    const at = rows.map((r) => r.detected_at);
+    return { ...out, alertCreated: a.created, detectedAt: at.length ? [Math.min(...at), Math.max(...at)] : null };
+  });
+  if (res) bundle.exportReverts.push(res);
+}
+
 fs.writeFileSync(path.join(OUT, "bundle.json"), JSON.stringify(bundle, null, 1));
 
 const byStatus = bundle.syncRun?.byStatus ?? null;
@@ -202,6 +263,29 @@ const summary = [
     ? `- Open review rows: ${active.length} (proven false: ${proven.length}, real: ${real.length}, other: ${other.length})`
     : `- Open review rows: unknown (query failed)`,
   `- Proposed resolve: ${proven.length} row(s), ${qualifying.length} editor alert(s)${proven.length ? " — see proposed-resolve.sql" : ""}`,
+  ``,
+  `## export_revert alerts`,
+  ``,
+  ...(bundle.exportReverts.length === 0
+    ? [
+        revertAlerts.length > 0 && !erc
+          ? `- CHECK FAILED TO LOAD: ${revertAlerts.length} export_revert alert(s) unchecked (see errors, step "load exportRevertCheck.mjs").`
+          : `- None checked${bundle.errors.some((e) => e.step.startsWith("export_revert check")) ? " (a check failed, see errors)" : ""}.`,
+      ]
+    : bundle.exportReverts.map((r) => {
+        const verdict =
+          r.realRefs.length === 0 && r.unknownRefs.length === 0 && r.falseRefs.length > 0
+            ? "FALSE ALARM (every ref unchanged on master since our last export, parsed verse/row comparison)"
+            : r.realRefs.length > 0
+              ? "REAL at some refs"
+              : "UNDECIDED";
+        const list = (xs) => (xs.length ? `${xs.length} (${xs.slice(0, 15).join(", ")}${xs.length > 15 ? ", …" : ""})` : "0");
+        return (
+          `- Alert ${r.alertId} ${r.book} ${r.resource}: ${verdict}. ${r.status}; prev export ${r.prevExportSha?.slice(0, 10) ?? "none"}, ` +
+          `master ${r.masterSha?.slice(0, 10) ?? "none"}${r.exportSha ? ` (parent of ${r.exportSha.slice(0, 10)})` : ""}. ` +
+          `unchanged on master since our last export (parsed verse/row comparison) ${list(r.falseRefs)}; real ${list(r.realRefs)}; unknown ${list(r.unknownRefs)}`
+        );
+      })),
 ].join("\n");
 fs.writeFileSync(path.join(OUT, "summary.md"), summary + "\n");
 console.log(summary);
