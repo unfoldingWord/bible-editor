@@ -1078,7 +1078,8 @@ function canonicalizeForRevertCompare(s: string): string {
 // round-trips whitespace/line-break placement inconsistently between two
 // otherwise-equivalent inputs — comparing the PARSED structure is what lets
 // the formatting/substantive split below be meaningful instead of noisy.
-function verseTextByRef(usfmText: string): Map<string, string> | null {
+// Exported (#1233) so scripts/watchdog/exportRevertCheck.mjs judges "did master move at this ref" with this same split.
+export function verseTextByRef(usfmText: string): Map<string, string> | null {
   let json: { chapters?: Record<string, Record<string, unknown>> };
   try {
     json = usfm.toJSON(usfmText);
@@ -1168,7 +1169,8 @@ export interface TsvRevertReport {
 // needs the full row to diff field-by-field. A duplicate ID overwrites the
 // earlier entry in the Map; duplicate-ID detection is checkTsvShrink's job
 // (countDuplicateMasterIds), not this purely-observational report's.
-function parseTsvRowsById(raw: string): Map<string, string[]> | null {
+// Exported (#1233) for scripts/watchdog/exportRevertCheck.mjs, same reason as verseTextByRef.
+export function parseTsvRowsById(raw: string): Map<string, string[]> | null {
   const lines = raw.split(/\r?\n/).filter((l) => l.length > 0);
   if (lines.length === 0) return new Map();
   const header = lines[0].split("\t");
