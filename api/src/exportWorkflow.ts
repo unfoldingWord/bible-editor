@@ -50,6 +50,7 @@ import {
   loadRevertLineage,
   ledgerProvesNoHumanCommit,
   readUnconfirmedRenders,
+  confirmedRenderBaseSha,
   foreignCommitDuringExport,
   exportRevertRaceAlertSource,
   masterIsOurLastPublish,
@@ -1687,12 +1688,29 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           console.log(`export: no last-publish base for ${book} ${resource}; revert report lists every differing row`);
         }
       }
+      // The render master was last confirmed holding, when the last push never
+      // merged (see confirmedRenderBaseSha). Door43's blob by sha, verified
+      // like the base above; one extra fetch, only on such nights.
+      const confirmedSha = computeEntries ? confirmedRenderBaseSha(unconfirmedRenderShas, priorPushedBlobSha) : null;
+      let confirmedBase: string | null = null;
+      if (confirmedSha != null) {
+        try {
+          confirmedBase = await readVerifiedPushedRenderText(this.env, book, resource, null, confirmedSha);
+        } catch (e) {
+          console.error("export: confirmed-render base read failed; revert report uses the last-publish base only", {
+            book,
+            resource,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+      const revertBases = [revertBase, confirmedBase].filter((b): b is string => b != null);
       if (
         (resource === "ult" || resource === "ust") &&
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
         const entries = computeEntries
-          ? usfmRevertReport(built.content, usfmMasterContentForRevertReport as string, revertBase).entries
+          ? usfmRevertReport(built.content, usfmMasterContentForRevertReport as string, revertBases).entries
           : [];
         await this.recordExportRevertReport(book, resource, "usfm", entries, mechanical, branch, instanceId, alertObservedAt);
       } else if (
@@ -1747,7 +1765,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
               built.content,
               tsvMasterContentForRevertReport as string,
               resource as "tn" | "tq" | "twl",
-              revertBase,
+              revertBases,
               lineage,
             ).entries
           : [];

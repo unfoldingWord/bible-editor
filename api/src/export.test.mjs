@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, loadRevertLineage, readUnconfirmedRenders, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, exportRevertRaceAlertSource, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, masterIsOurLastPublish, priorPublishPointer, RECORD_PUSHED_RENDER_SQL, loadRevertLineage, readUnconfirmedRenders, confirmedRenderBaseSha, shouldRecordRevertReport, shouldComputeRevertEntries, foreignCommitDuringExport, exportRevertRaceAlertSource, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -3199,6 +3199,62 @@ function utf8Base64(s) {
   assert(
     mixedKinds.substantive === 6,
     `substantive count is the sum of usfm (2) and tsv (4) substantive entries, not just one side`,
+  );
+}
+
+// --- revert base when the last push never merged (EZK UST, 2026-10-22) ---
+// Master still held render N-1 (the 10-20 export) because PR 4817 (render N,
+// 10-21) never merged, then a hand-edit landed on master elsewhere in the
+// file. With only N as base, every verse translators changed between N-1 and
+// N read as "master moved here": 11 false rows. N-1, the first entry of
+// unconfirmed_renders_json, is the second base.
+{
+  assert(
+    confirmedRenderBaseSha(["c", "n"], "n") === "c",
+    `the confirmed render is the extra base when the last push is unconfirmed`,
+  );
+  assert(confirmedRenderBaseSha(["n"], "n") === null, `list is just the last push -> no extra base`);
+  assert(confirmedRenderBaseSha(null, "n") === null, `no list -> no extra base`);
+  assert(confirmedRenderBaseSha([], "n") === null, `empty list -> no extra base`);
+
+  const verseUsfm = (verses) => `\\id EZK\n\\c 9\n\\p\n` + verses.map(([v, t]) => `\\v ${v} ${t}\n`).join("");
+  const confirmed = verseUsfm([[3, "cherubim"], [4, "old four"], [5, "old five"]]);
+  const lastPush = verseUsfm([[3, "cherubim"], [4, "new four"], [5, "old five"]]);
+  // Hand-edit on the lagging master: v3. v4 is still the confirmed render's text.
+  const master = verseUsfm([[3, "cherubs"], [4, "old four"], [5, "old five"]]);
+  const rendered = verseUsfm([[3, "cherubs"], [4, "newer four"], [5, "newer five"]]);
+  assert(
+    usfmRevertReport(rendered, master, lastPush).entries.map((e) => e.ref).join(",") === "9:4",
+    `usfm: last push alone as base reports our own v4 work (the false alarm)`,
+  );
+  const r = usfmRevertReport(rendered, master, [lastPush, confirmed]);
+  assert(r.entries.length === 0, `usfm: with the confirmed render as a second base nothing is reported; got ${JSON.stringify(r.entries)}`);
+  // A real revert of the hand-edit still reports: our render carries the old v3.
+  const rRevert = usfmRevertReport(confirmed, master, [lastPush, confirmed]);
+  assert(
+    rRevert.entries.length === 1 && rRevert.entries[0].ref === "9:3" && rRevert.entries[0].class === "substantive",
+    `usfm: reverting the hand-edit is still reported with both bases; got ${JSON.stringify(rRevert.entries)}`,
+  );
+  assert(usfmRevertReport(rendered, master, []).entries.length === 2, `usfm: empty base list -> fail open, every differing verse`);
+
+  const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
+  const tnRow = (ref, id, note) => `${ref}\t${id}\t\t\tword\t1\t${note}`;
+  const tsv = (rows) => `${TN_HEADER}\n${rows.join("\n")}\n`;
+  const tConfirmed = tsv([tnRow("9:3", "ab01", "old"), tnRow("9:4", "ab02", "old")]);
+  const tLastPush = tsv([tnRow("9:3", "ab01", "old"), tnRow("9:4", "ab02", "new")]);
+  const tMaster = tsv([tnRow("9:3", "ab01", "hand"), tnRow("9:4", "ab02", "old")]);
+  const tRendered = tsv([tnRow("9:3", "ab01", "hand"), tnRow("9:4", "ab02", "newer")]);
+  assert(
+    tsvRevertReport(tRendered, tMaster, "tn", tLastPush).entries.map((e) => e.ref).join(",") === "9:4",
+    `tsv: last push alone as base reports our own 9:4 work`,
+  );
+  assert(
+    tsvRevertReport(tRendered, tMaster, "tn", [tLastPush, tConfirmed]).entries.length === 0,
+    `tsv: with the confirmed render as a second base nothing is reported`,
+  );
+  assert(
+    tsvRevertReport(tConfirmed, tMaster, "tn", [tLastPush, tConfirmed]).entries.map((e) => e.ref).join(",") === "9:3",
+    `tsv: reverting the hand-edit is still reported with both bases`,
   );
 }
 
