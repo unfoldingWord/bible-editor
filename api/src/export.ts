@@ -14,6 +14,7 @@ import { renderOccurrence } from "./occurrenceRule.ts";
 import type { UsfmValidationIssue, UsfmValidationRule } from "./usfmValidate.ts";
 import { findOverlappingRanges, VerseRangeOverlapError } from "./verseBridge.ts";
 import type { LockedPush } from "./verseMergeEditorAlerts.ts";
+import { masterMayHoldHumanEditForVerse, parseTsvRefColumn, type MasterLineageSummary } from "./masterLineage.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
 
@@ -1251,6 +1252,121 @@ export function tsvRevertReport(
     entries.push({ ref, class: "substantive", fields: diffFields });
   }
   return { entries, totalRows: master.size };
+}
+
+// ── Narrowing the revert report by master's measured lineage (#1231) ──────
+//
+// The per-row base above is our LAST push. When that push never merged,
+// master never held it, so every verse our translators changed between the
+// render master last held and that push reads as "master moved here" (EZK
+// UST, alert 1327: 11 false rows). Adding more of our renders as bases was
+// tried in #1232 and rejected: it can hide a person's revert to older text,
+// and still false-alarms on merged-but-unconfirmed renders.
+//
+// Instead, ask the lineage the nightly sync already measured and persisted
+// (book_resource_syncs.master_lineage_*, written by bookReimport.ts's
+// persistMasterLineage): which verses did a person touch on master since it
+// was last confirmed holding our render? A reported row whose ref no person
+// touched holds our own render's text, so overwriting it loses nothing.
+//
+// Narrowing happens only when ALL of these hold; anything else returns the
+// entries unchanged (today's full report):
+//   - the lineage parses as an object, its walk is complete
+//     (`incomplete === false`), it found a human commit
+//     (`hasHumanCommit` and `mayHoldHumanEdit` both true), and every human
+//     commit was mapped to refs (`refsComplete === true`). A window with NO
+//     human commit persists `refsComplete: false` by construction, so it keeps
+//     the full report too; that is the conservative direction.
+//   - `counts.ai === 0`: only human commits are mapped to refs, so an AI
+//     pipeline push in the window could have moved any verse unmeasured.
+//   - `master_lineage_sha` equals the master commit the report diffs against
+//     (`fresh.masterSha`, the file head the master text was fetched at). Both
+//     must be non-empty strings: two nulls are not a match.
+//   - `master_lineage_confirmed_at` equals master_confirmed_at as read before
+//     tonight's push, so the walk covers the window back to the render master
+//     was last confirmed holding. Both must be finite numbers.
+//
+// Per row, refs are expanded with masterLineage.ts's own parseTsvRefColumn
+// (USFM "3:14-15" bridges included) and the row is kept if any verse may hold
+// a human edit (masterMayHoldHumanEditForVerse, which itself fails closed on
+// a malformed ref set). A ref that will not parse is kept.
+//
+// Known limit: an `ours` commit is trusted to carry our own render. A person
+// who edited our `-be-` branch before it merged is hidden inside our squash
+// commit; that hazard is shared with every other lineage reader here.
+export interface StoredMasterLineage {
+  json: string | null;
+  sha: string | null;
+  confirmedAt: number | null;
+}
+
+export interface RevertLineageNarrowing<E> {
+  entries: E[];
+  narrowed: boolean;
+  dropped: number;
+  /** Why narrowing did not run, for the log. Empty when it ran. */
+  reason: string;
+}
+
+function usableRevertLineage(
+  masterLineage: StoredMasterLineage | null,
+  current: { masterSha: string | null; confirmedAt: number | null },
+): { lineage: MasterLineageSummary | null; reason: string } {
+  if (masterLineage == null || masterLineage.json == null) return { lineage: null, reason: "no_lineage" };
+  const { sha, confirmedAt } = masterLineage;
+  if (typeof sha !== "string" || sha.length === 0 || typeof current.masterSha !== "string" || current.masterSha.length === 0) {
+    return { lineage: null, reason: "sha_unknown" };
+  }
+  if (sha !== current.masterSha) return { lineage: null, reason: "lineage_stale" };
+  if (
+    typeof confirmedAt !== "number" ||
+    !Number.isFinite(confirmedAt) ||
+    typeof current.confirmedAt !== "number" ||
+    !Number.isFinite(current.confirmedAt)
+  ) {
+    return { lineage: null, reason: "confirmed_unknown" };
+  }
+  if (confirmedAt !== current.confirmedAt) return { lineage: null, reason: "confirmed_moved" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(masterLineage.json);
+  } catch {
+    return { lineage: null, reason: "unparseable" };
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return { lineage: null, reason: "unparseable" };
+  const l = parsed as Partial<MasterLineageSummary>;
+  if (l.incomplete !== false) return { lineage: null, reason: "incomplete" };
+  if (l.hasHumanCommit !== true || l.mayHoldHumanEdit !== true) return { lineage: null, reason: "no_human_refs" };
+  if (l.refsComplete !== true || !Array.isArray(l.humanRefs) || l.humanRefs.length === 0) {
+    return { lineage: null, reason: "refs_incomplete" };
+  }
+  // masterMayHoldHumanEditForVerse would keep every row on a malformed set
+  // anyway; refusing here makes the log say so instead of "narrowed".
+  if (!l.humanRefs.every((r) => typeof r === "string" && /^\d+:(?:\d+|\*)$/.test(r))) {
+    return { lineage: null, reason: "refs_malformed" };
+  }
+  const ai = (l.counts as { ai?: unknown } | undefined)?.ai;
+  if (typeof ai !== "number" || ai !== 0) return { lineage: null, reason: "ai_commit_or_unknown" };
+  return { lineage: l as MasterLineageSummary, reason: "" };
+}
+
+export function narrowRevertEntriesByLineage<E extends { ref: string }>(
+  entries: E[],
+  masterLineage: StoredMasterLineage | null,
+  current: { masterSha: string | null; confirmedAt: number | null },
+): RevertLineageNarrowing<E> {
+  const { lineage, reason } = usableRevertLineage(masterLineage, current);
+  if (lineage === null) return { entries, narrowed: false, dropped: 0, reason };
+  const kept = entries.filter((e) => {
+    const keys = typeof e.ref === "string" ? parseTsvRefColumn(e.ref) : null;
+    if (keys === null) return true;
+    for (const key of keys) {
+      const [c, v] = key.split(":").map(Number);
+      if (masterMayHoldHumanEditForVerse(lineage, c, v)) return true;
+    }
+    return false;
+  });
+  return { entries: kept, narrowed: true, dropped: entries.length - kept.length, reason: "" };
 }
 
 const LINEAGE_FIELDS: Record<"tn" | "tq", Array<[string, string]>> = {
