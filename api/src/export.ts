@@ -1104,6 +1104,11 @@ export interface UsfmRevertEntry {
   class: "formatting" | "substantive";
 }
 
+function revertBaseList(base: string | readonly string[] | null): readonly string[] {
+  if (base == null) return [];
+  return typeof base === "string" ? [base] : base;
+}
+
 export interface UsfmRevertReport {
   entries: UsfmRevertEntry[];
   totalVerses: number;
@@ -1126,23 +1131,28 @@ export interface UsfmRevertReport {
 // the whole book. Equality with base is exact (same parsed structure), not
 // canonicalized, so a cosmetic-only move on master still reports. Fails open:
 // a null or unparseable base reports every differing verse, as before.
+//
+// An array is several renders of ours (see confirmedRenderBaseSha): a verse
+// where master equals ANY of them is our own bytes, so it is not reported.
 export function usfmRevertReport(
   renderedUsfm: string,
   masterUsfm: string,
-  baseUsfm: string | null = null,
+  baseUsfm: string | readonly string[] | null = null,
 ): UsfmRevertReport {
   const rendered = verseTextByRef(renderedUsfm);
   const master = verseTextByRef(masterUsfm);
   // Either side failing to parse leaves us with no reliable comparison — this
   // report is observational only, so decline to report rather than guess.
   if (rendered === null || master === null) return { entries: [], totalVerses: 0 };
-  const base = baseUsfm == null ? null : verseTextByRef(baseUsfm);
+  const bases = revertBaseList(baseUsfm)
+    .map(verseTextByRef)
+    .filter((b): b is NonNullable<typeof b> => b !== null);
   const entries: UsfmRevertEntry[] = [];
   for (const [ref, masterText] of master) {
     const renderedText = rendered.get(ref);
     if (renderedText === undefined) continue; // verse absent from render — not our concern here
     if (renderedText === masterText) continue; // byte-identical, nothing overwritten
-    if (base !== null && base.get(ref) === masterText) continue; // master never moved here — the difference is ours
+    if (bases.some((base) => base.get(ref) === masterText)) continue; // master never moved here — the difference is ours
     const same = canonicalizeForRevertCompare(masterText) === canonicalizeForRevertCompare(renderedText);
     entries.push({ ref, class: same ? "formatting" : "substantive" });
   }
@@ -1197,12 +1207,12 @@ function parseTsvRowsById(raw: string): Map<string, string[]> | null {
 // a differing row is reported only if master's row also differs from our last
 // publish's row (every cell, Reference included, compared exactly). A row
 // absent from base is new on master, so it counts as moved. Fails open on a
-// null or unparseable base.
+// null or unparseable base. An array works as in usfmRevertReport.
 export function tsvRevertReport(
   renderedTsv: string,
   masterTsv: string,
   kind: "tn" | "tq" | "twl",
-  baseTsv: string | null = null,
+  baseTsv: string | readonly string[] | null = null,
   // #1029: per row (tn/tq), the AI pipeline's payload when it is the row's
   // latest machine write (see buildRevertLineage), in D1 column names. A row
   // whose master cells equal it was written to master by the bot and mirrored
@@ -1215,13 +1225,15 @@ export function tsvRevertReport(
   const rendered = parseTsvRowsById(renderedTsv);
   const master = parseTsvRowsById(masterTsv);
   if (rendered === null || master === null) return { entries: [], totalRows: 0 };
-  const base = baseTsv == null ? null : parseTsvRowsById(baseTsv);
+  const bases = revertBaseList(baseTsv)
+    .map(parseTsvRowsById)
+    .filter((b): b is Map<string, string[]> => b !== null);
   const entries: TsvRevertEntry[] = [];
   for (const [id, masterCells] of master) {
     const renderedCells = rendered.get(id);
     if (!renderedCells) continue; // row absent from render — not our concern here
-    const baseCells = base?.get(id);
-    if (baseCells && baseCells.join("\t") === masterCells.join("\t")) continue; // master never moved here — the difference is ours
+    const masterRow = masterCells.join("\t");
+    if (bases.some((base) => base.get(id)?.join("\t") === masterRow)) continue; // master never moved here — the difference is ours
     if (lineage && kind !== "twl" && masterMatchesLineage(masterCells, lineage.get(id), kind)) continue;
     const diffFields: string[] = [];
     const tagsIdx = headers.indexOf("Tags");
@@ -1597,6 +1609,25 @@ export function readUnconfirmedRenders(
   } catch {
     return null;
   }
+}
+
+// The per-row revert base, beside the last push, when that push never reached
+// master. The last push is one base, but when its export PR did not merge,
+// master still holds an older render of ours. If a hand-edit then lands on
+// that lagging master, the file-level check above rightly declines to
+// suppress, and with only the last push as base every verse our translators
+// changed between the older render and the last push reads as "master moved
+// here" (EZK UST, 2026-10-22: PR 4817 unmerged plus a cherubs edit on master
+// gave 11 false rows). unconfirmed_renders_json is reset to [the confirmed
+// render] whenever master is confirmed and each later push is appended, so its
+// first entry is the render master was last seen holding. null when it adds
+// nothing: no list, or the list starts at the last push itself.
+export function confirmedRenderBaseSha(
+  unconfirmedRenderShas: readonly string[] | null,
+  priorPushedBlobSha: string | null,
+): string | null {
+  const first = unconfirmedRenderShas?.[0] ?? null;
+  return first != null && first !== priorPushedBlobSha ? first : null;
 }
 
 // And what suppression cannot hide: rows or verses present on master but absent
