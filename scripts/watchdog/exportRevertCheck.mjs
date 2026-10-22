@@ -182,6 +182,22 @@ export function knownRenderShas(syncRow) {
   return new Set([...list, syncRow.pushed_blob_sha, syncRow.prev_pushed_blob_sha].filter((x) => typeof x === "string" && x));
 }
 
+// Pure: are the picked commits provably the alert's export and our own
+// previous render? null = yes; otherwise the status (every ref unknown).
+//   exportBlobSha  blob of the file at the picked export commit
+//   prevBlobSha    blob of the file at the picked previous export commit
+//   pushedBlobSha  book_resource_syncs.pushed_blob_sha: the render the alert's
+//                  export pushed. Pinning the export commit to it stops an
+//                  EARLIER export's merge (inside the clock-skew slack) from
+//                  standing in for tonight's while tonight's is unmerged.
+//   knownRenders   knownRenderShas() for the pair
+export function renderPinStatus({ exportBlobSha, prevBlobSha, pushedBlobSha, knownRenders }) {
+  if (!pushedBlobSha || exportBlobSha !== pushedBlobSha) return "export_not_this_render";
+  if (!knownRenders.has(prevBlobSha)) return "prev_not_our_render";
+  if (prevBlobSha === exportBlobSha) return "prev_is_this_render";
+  return null;
+}
+
 // ── Door43 GETs (impure, synchronous) ────────────────────────────────────────
 
 // The token goes in on stdin as a curl config line, not argv, so it never
@@ -228,9 +244,10 @@ export function fetchFileAt(repo, path, sha, token) {
 }
 
 // One alert, end to end. `snapshot` is snapshotStatus()'s result (null = the
-// refs are this alert's); `knownRenders` is knownRenderShas() for the pair.
+// refs are this alert's); `knownRenders` is knownRenderShas() for the pair;
+// `pushedBlobSha` is book_resource_syncs.pushed_blob_sha (see renderPinStatus).
 // Throws on any Door43 failure; collect.mjs wraps this in step().
-export function checkExportRevertAlert({ alertId, book, resource, alertCreatedAtMs, refs, snapshot, knownRenders }, token) {
+export function checkExportRevertAlert({ alertId, book, resource, alertCreatedAtMs, refs, snapshot, knownRenders, pushedBlobSha }, token) {
   const file = dcsResourceFile(book, resource);
   if (!file) throw new Error(`no Door43 file for ${book} ${resource}`);
   const base = { alertId, book, resource, repo: file.repo, path: file.path, refs: refs.length };
@@ -240,11 +257,12 @@ export function checkExportRevertAlert({ alertId, book, resource, alertCreatedAt
   });
   const pick = pickExportCommits(commits, { book, resource, alertCreatedAtMs });
   if (pick.status !== "ok") return { ...base, ...pick, ...allUnknown(refs) };
+  const exportBlobSha = fetchFileAt(file.repo, file.path, pick.exportSha, token).blobSha;
   const prev = fetchFileAt(file.repo, file.path, pick.prevExportSha, token);
-  if (!knownRenders.has(prev.blobSha)) {
-    return { ...base, ...pick, status: "prev_not_our_render", prevBlobSha: prev.blobSha, ...allUnknown(refs) };
-  }
+  const pin = renderPinStatus({ exportBlobSha, prevBlobSha: prev.blobSha, pushedBlobSha, knownRenders });
+  const shas = { exportBlobSha, prevBlobSha: prev.blobSha, pushedBlobSha: pushedBlobSha ?? null };
+  if (pin) return { ...base, ...pick, ...shas, status: pin, ...allUnknown(refs) };
   const master = fetchFileAt(file.repo, file.path, pick.masterSha, token);
   const verdict = classifyExportRevertRefs(refs, prev.text, master.text, resource);
-  return { ...base, ...pick, prevBlobSha: prev.blobSha, masterBlobSha: master.blobSha, ...verdict };
+  return { ...base, ...pick, ...shas, masterBlobSha: master.blobSha, ...verdict };
 }

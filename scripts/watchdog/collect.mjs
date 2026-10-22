@@ -223,6 +223,7 @@ for (const a of erc ? revertAlerts : []) {
         refs: rows.map((r) => r.ref),
         snapshot,
         knownRenders: erc.knownRenderShas(sync ?? null),
+        pushedBlobSha: sync?.pushed_blob_sha ?? null,
       },
       process.env.DOOR43_TOKEN,
     );
@@ -266,7 +267,11 @@ const summary = [
   `## export_revert alerts`,
   ``,
   ...(bundle.exportReverts.length === 0
-    ? [`- None checked${bundle.errors.some((e) => e.step.startsWith("export_revert check")) ? " (a check failed, see errors)" : ""}.`]
+    ? [
+        revertAlerts.length > 0 && !erc
+          ? `- CHECK FAILED TO LOAD: ${revertAlerts.length} export_revert alert(s) unchecked (see errors, step "load exportRevertCheck.mjs").`
+          : `- None checked${bundle.errors.some((e) => e.step.startsWith("export_revert check")) ? " (a check failed, see errors)" : ""}.`,
+      ]
     : bundle.exportReverts.map((r) => {
         const verdict =
           r.realRefs.length === 0 && r.unknownRefs.length === 0 && r.falseRefs.length > 0

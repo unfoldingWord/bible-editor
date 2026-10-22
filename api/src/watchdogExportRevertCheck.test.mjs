@@ -11,6 +11,7 @@ import {
   isOurExportSubject,
   knownRenderShas,
   pickExportCommits,
+  renderPinStatus,
   snapshotStatus,
 } from "../../scripts/watchdog/exportRevertCheck.mjs";
 
@@ -174,6 +175,24 @@ const alertAt = Date.parse("2026-10-22T05:39:58Z");
 {
   const p = pickExportCommits(ezk, { book: "EZK", resource: "ult", alertCreatedAtMs: alertAt });
   assert(p.status === "export_not_merged" && p.prevExportSha === undefined, "walk: other resource's subjects never match");
+}
+{
+  // B1: tonight's export is unmerged, but an EARLIER export merged one minute
+  // before the alert, inside the clock-skew slack. The walk picks it; pinning
+  // its blob to tonight's pushed render must turn every ref unknown.
+  const earlier = c("e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0", "2026-10-22T05:38:58Z", "bible-editor: EZK ust → master (review requested) (#4819)", "05bcc1533af6ab3c0d710e24ce2e8f47f8837d0f");
+  const p = pickExportCommits([earlier, ...ezk.slice(1)], { book: "EZK", resource: "ust", alertCreatedAtMs: alertAt });
+  assert(p.status === "ok" && p.exportSha.startsWith("e0e0"), "walk: an earlier merge inside the slack is picked (the case B1 guards)");
+  const known = new Set(["2d20", "17b7", "8eff"]);
+  const pin = renderPinStatus({ exportBlobSha: "17b7", prevBlobSha: "2d20", pushedBlobSha: "8eff", knownRenders: known });
+  assert(pin === "export_not_this_render", "pin: export commit's blob is not tonight's pushed render -> export_not_this_render (all unknown)");
+}
+{
+  const known = new Set(["2d20", "8eff"]);
+  assert(renderPinStatus({ exportBlobSha: "8eff", prevBlobSha: "2d20", pushedBlobSha: "8eff", knownRenders: known }) === null, "pin: export = pushed render, prev is ours -> verdict allowed");
+  assert(renderPinStatus({ exportBlobSha: "8eff", prevBlobSha: "2d20", pushedBlobSha: null, knownRenders: known }) === "export_not_this_render", "pin: no pushed_blob_sha recorded -> export_not_this_render");
+  assert(renderPinStatus({ exportBlobSha: "8eff", prevBlobSha: "aaaa", pushedBlobSha: "8eff", knownRenders: known }) === "prev_not_our_render", "pin: prev blob not one of our renders -> prev_not_our_render");
+  assert(renderPinStatus({ exportBlobSha: "8eff", prevBlobSha: "8eff", pushedBlobSha: "8eff", knownRenders: known }) === "prev_is_this_render", "pin: prev blob equals the export's blob -> prev_is_this_render");
 }
 assert(isOurExportSubject("bible-editor: EZK ust → master (review requested) (#9)", "EZK", "ust"), "subject: review-requested variant matches");
 assert(!isOurExportSubject('Revert "bible-editor: EZK ust → master (#4821)" (#4822)', "EZK", "ust"), "subject: a human revert does not match");
