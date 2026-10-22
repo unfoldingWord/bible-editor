@@ -5,10 +5,13 @@
 //   node --experimental-strip-types --no-warnings src/watchdogExportRevertCheck.test.mjs
 
 import {
+  checkExportRevertAlert,
   classifyExportRevertRefs,
   fetchFileAt,
   isOurExportSubject,
+  knownRenderShas,
   pickExportCommits,
+  snapshotStatus,
 } from "../../scripts/watchdog/exportRevertCheck.mjs";
 
 function assert(cond, msg) {
@@ -89,6 +92,46 @@ const tnMaster = tn([
   assert(same(r.unknownRefs, ["1:1"]) && r.falseRefs.length === 0, "tsv: unparseable side -> unknown, never false");
 }
 
+{
+  // Same ID twice on master (once at the alerted ref, once elsewhere).
+  const dupMaster = tn([
+    ["1:1", "ab12", "", "rc://*/ta/man/translate/figs-metaphor", "word", "1", "Note A"],
+    ["1:1", "cd34", "", "", "other", "1", "Note B"],
+    ["1:2", "ab12", "", "", "x", "1", "Copy with a duplicated ID"],
+  ]);
+  const r = classifyExportRevertRefs(["1:1", "1:2"], tnPrev, dupMaster, "tn");
+  assert(same(r.unknownRefs, ["1:1", "1:2"]) && r.falseRefs.length === 0, "tsv: duplicated ID on either side -> unknown at every ref it sits at");
+  const r2 = classifyExportRevertRefs(["1:1"], dupMaster, tnPrev, "tn");
+  assert(same(r2.unknownRefs, ["1:1"]), "tsv: duplicated ID in the previous export -> unknown");
+}
+
+// --- snapshot tie and our-render set -----------------------------------
+{
+  const gen = { generation: "g7" };
+  const alert = { id: 1327, eventKey: "g7:export_revert:EZK:ust", createdAtS: 1792820398 };
+  const ok = { alert, book: "EZK", resource: "ust", newerAlertId: null, generation: gen, detectedAt: [1792820390, 1792820391] };
+  assert(snapshotStatus(ok) === null, "snapshot: generation matches, rows just before the alert -> tied");
+  assert(snapshotStatus({ ...ok, newerAlertId: 1400 }) === "superseded_snapshot", "snapshot: newer alert for the pair -> superseded_snapshot");
+  assert(snapshotStatus({ ...ok, generation: { generation: "g8" } }) === "snapshot_generation_mismatch", "snapshot: other generation -> mismatch");
+  assert(snapshotStatus({ ...ok, generation: null }) === "snapshot_generation_mismatch", "snapshot: no generation row -> mismatch");
+  assert(snapshotStatus({ ...ok, detectedAt: [1792820390, 1792820398 + 3600] }) === "snapshot_time_mismatch", "snapshot: a row written an hour after the alert -> time mismatch");
+  assert(snapshotStatus({ ...ok, detectedAt: [] }) === "no_snapshot_rows", "snapshot: no rows -> no_snapshot_rows");
+  const r = checkExportRevertAlert(
+    { alertId: 1, book: "EZK", resource: "ust", alertCreatedAtMs: 0, refs: ["9:3", "9:4"], snapshot: "superseded_snapshot", knownRenders: new Set() },
+    "",
+  );
+  assert(r.status === "superseded_snapshot" && same(r.unknownRefs, ["9:3", "9:4"]) && r.falseRefs.length === 0, "check: untied snapshot -> every ref unknown, no Door43 call");
+}
+{
+  const k = knownRenderShas({
+    pushed_blob_sha: "8eff",
+    prev_pushed_blob_sha: "17b7",
+    unconfirmed_renders_json: JSON.stringify(["2d20", "17b7", "8eff"]),
+  });
+  assert(same([...k].sort(), ["17b7", "2d20", "8eff"]), "renders: union of unconfirmed_renders_json and pushed/prev_pushed blob shas");
+  assert(knownRenderShas(null).size === 0, "renders: no sync row -> empty set");
+}
+
 // --- history walk -------------------------------------------------------
 // Trimmed from the real Door43 history of en_ust/26-EZK.usfm (2026-10-22).
 const c = (sha, created, message, parent) => ({ sha, created, commit: { message }, parents: [{ sha: parent }] });
@@ -111,16 +154,26 @@ const alertAt = Date.parse("2026-10-22T05:39:58Z");
   );
 }
 {
-  // Tonight's export PR not merged yet: master is the newest commit before the alert.
+  // Tonight's export PR not merged yet: master's state at export time cannot be
+  // pinned from dates, so the walk fails closed.
   const p = pickExportCommits(ezk.slice(1), { book: "EZK", resource: "ust", alertCreatedAtMs: alertAt });
-  assert(
-    p.status === "export_not_merged" && p.exportSha === null && p.masterSha.startsWith("05bcc1533a") && p.prevExportSha.startsWith("22d88ce53d"),
-    "walk: unmerged export -> master = newest commit before the alert",
-  );
+  assert(p.status === "export_not_merged" && p.prevExportSha === undefined, "walk: unmerged export -> export_not_merged, nothing to compare");
+}
+{
+  const bad = [ezk[0], { ...ezk[1], created: "not a date" }, ...ezk.slice(2)];
+  const p = pickExportCommits(bad, { book: "EZK", resource: "ust", alertCreatedAtMs: alertAt });
+  assert(p.status === "unparseable_date" && p.prevExportSha === undefined, "walk: an unparseable commit date -> unparseable_date");
+}
+{
+  // An old-dated human commit above tonight's export makes the walk stop early;
+  // that must not yield a verdict.
+  const odd = [{ ...ezk[1], created: "2020-01-01T00:00:00Z" }, ezk[0], ...ezk.slice(2)];
+  const p = pickExportCommits(odd, { book: "EZK", resource: "ust", alertCreatedAtMs: alertAt });
+  assert(p.status !== "ok", "walk: old-dated commit ahead of the export -> no confident pick");
 }
 {
   const p = pickExportCommits(ezk, { book: "EZK", resource: "ult", alertCreatedAtMs: alertAt });
-  assert(p.status === "no_master_commit" || p.status === "no_prev_export", "walk: other resource's subjects never match");
+  assert(p.status === "export_not_merged" && p.prevExportSha === undefined, "walk: other resource's subjects never match");
 }
 assert(isOurExportSubject("bible-editor: EZK ust → master (review requested) (#9)", "EZK", "ust"), "subject: review-requested variant matches");
 assert(!isOurExportSubject('Revert "bible-editor: EZK ust → master (#4821)" (#4822)', "EZK", "ust"), "subject: a human revert does not match");
@@ -135,6 +188,16 @@ assert(!isOurExportSubject("bible-editor: EZKX ust → master", "EZK", "ust"), "
     threw = /non-full sha/.test(String(e?.message));
   }
   assert(threw, "fetchFileAt refuses a short sha (Door43 would silently serve master)");
+}
+
+{
+  let threw = false;
+  try {
+    fetchFileAt("en_ust", "26-EZK.usfm", "22d88ce53d3968440ba2d4815c411c1568e765cb", 'abc" -o /tmp/x');
+  } catch (e) {
+    threw = /DOOR43_TOKEN contains/.test(String(e?.message));
+  }
+  assert(threw, "a token with quotes or spaces is refused before curl runs");
 }
 
 console.log("watchdogExportRevertCheck: all passed");

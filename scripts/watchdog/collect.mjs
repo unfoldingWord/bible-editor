@@ -22,7 +22,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { classifyVisibleAdoptionChange } from "../../api/src/visibleAdoptionChange.ts";
-import { checkExportRevertAlert } from "./exportRevertCheck.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const OUT = process.argv[2];
@@ -179,21 +178,52 @@ if (proven.length > 0) {
 
 // export_revert alerts (#1233): for each one raised tonight, compare Door43's
 // file at our previous export with master at tonight's export's first parent
-// (exportRevertCheck.mjs). A ref where they are identical is a false alarm:
-// master never moved there. Door43 GETs only; no proposal SQL is written for
-// these, the routine reads the verdict and decides.
+// (exportRevertCheck.mjs). A ref unchanged between them is a false alarm:
+// master never moved there. Any doubt leaves the ref unknown. Door43 GETs and
+// read-only D1 SELECTs only; no proposal SQL is written for these, the routine
+// reads the verdict and decides.
 bundle.exportReverts = [];
-for (const a of (bundle.newAlerts ?? []).filter((x) => String(x.source).startsWith("export_revert:"))) {
+const revertAlerts = (bundle.newAlerts ?? []).filter((x) => String(x.source).startsWith("export_revert:"));
+// Loaded here, not statically, so a load failure in exportRevertCheck.mjs or
+// export.ts's import graph lands in bundle.errors instead of killing the run.
+const erc =
+  revertAlerts.length === 0
+    ? null
+    : await import("./exportRevertCheck.mjs").catch((e) => {
+        bundle.errors.push({ step: "load exportRevertCheck.mjs", error: String(e?.stack ?? e?.message ?? e).slice(0, 2000) });
+        return null;
+      });
+for (const a of erc ? revertAlerts : []) {
   const [, book, resource] = String(a.source).split(":");
   const res = step(`export_revert check ${a.id} ${book} ${resource}`, () => {
     if (!process.env.DOOR43_TOKEN) throw new Error("DOOR43_TOKEN not set (source ~/.config/door43.env)");
-    // export_reverts is a replace-all snapshot per (book, resource), so its
-    // current rows are the export that raised this alert. Rows are inserted in
-    // batches, so detected_at can span a few seconds; the range is recorded.
-    const rows = q(`SELECT ref, detected_at FROM export_reverts
-                     WHERE book = ${sqlStr(book)} AND resource = ${sqlStr(resource)} ORDER BY id`);
-    const out = checkExportRevertAlert(
-      { alertId: a.id, book, resource, alertCreatedAtMs: Date.parse(`${String(a.created).replace(" ", "T")}Z`), refs: rows.map((r) => r.ref) },
+    const pair = `book = ${sqlStr(book)} AND resource = ${sqlStr(resource)}`;
+    const [meta] = q(`SELECT event_key, created_at FROM system_alerts WHERE id = ${Number(a.id)}`);
+    // export_reverts is a replace-all snapshot per (book, resource): its rows
+    // are this alert's only if no newer alert for the pair exists tonight and
+    // the pair's current generation is the one in the alert's event_key.
+    const rows = q(`SELECT ref, detected_at FROM export_reverts WHERE ${pair} ORDER BY id`);
+    const [generation] = q(`SELECT generation, observed_at FROM export_revert_generations WHERE ${pair}`);
+    const [sync] = q(`SELECT pushed_blob_sha, prev_pushed_blob_sha, unconfirmed_renders_json FROM book_resource_syncs WHERE ${pair}`);
+    const newer = revertAlerts.filter((x) => x.source === a.source && x.id > a.id).map((x) => x.id);
+    const snapshot = erc.snapshotStatus({
+      alert: { id: a.id, eventKey: meta?.event_key ?? null, createdAtS: Number(meta?.created_at) },
+      book,
+      resource,
+      newerAlertId: newer.length ? Math.max(...newer) : null,
+      generation: generation ?? null,
+      detectedAt: rows.map((r) => Number(r.detected_at)),
+    });
+    const out = erc.checkExportRevertAlert(
+      {
+        alertId: a.id,
+        book,
+        resource,
+        alertCreatedAtMs: Number(meta?.created_at) * 1000,
+        refs: rows.map((r) => r.ref),
+        snapshot,
+        knownRenders: erc.knownRenderShas(sync ?? null),
+      },
       process.env.DOOR43_TOKEN,
     );
     const at = rows.map((r) => r.detected_at);
@@ -240,7 +270,7 @@ const summary = [
     : bundle.exportReverts.map((r) => {
         const verdict =
           r.realRefs.length === 0 && r.unknownRefs.length === 0 && r.falseRefs.length > 0
-            ? "FALSE ALARM (master never moved at any ref)"
+            ? "FALSE ALARM (every ref unchanged on master since our last export, parsed verse/row comparison)"
             : r.realRefs.length > 0
               ? "REAL at some refs"
               : "UNDECIDED";
@@ -248,7 +278,7 @@ const summary = [
         return (
           `- Alert ${r.alertId} ${r.book} ${r.resource}: ${verdict}. ${r.status}; prev export ${r.prevExportSha?.slice(0, 10) ?? "none"}, ` +
           `master ${r.masterSha?.slice(0, 10) ?? "none"}${r.exportSha ? ` (parent of ${r.exportSha.slice(0, 10)})` : ""}. ` +
-          `false ${list(r.falseRefs)}; real ${list(r.realRefs)}; unknown ${list(r.unknownRefs)}`
+          `unchanged on master since our last export (parsed verse/row comparison) ${list(r.falseRefs)}; real ${list(r.realRefs)}; unknown ${list(r.unknownRefs)}`
         );
       })),
 ].join("\n");
