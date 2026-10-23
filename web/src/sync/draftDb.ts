@@ -1,4 +1,6 @@
-// The drafts database connection, cached but recoverable (#1102). The browser
+// An IndexedDB connection, cached but recoverable (#1102). Used by the text
+// drafts, and since the aligner's "could not be stored" reports, by the outbox
+// and the aligner crash drafts too. The browser
 // can close an open IndexedDB connection on its own: site data cleared, Safari
 // dropping a long-backgrounded tab, another tab deleting or upgrading the
 // database. A cache that never resets then fails every later backup write
@@ -91,5 +93,7 @@ export function createDraftDbConnection<D extends Closable>(
     });
   }
 
-  return { run, handle: () => handle };
+  // `connect` is for callers that hold the handle across awaits: it gets the
+  // cache-drop on terminated/blocking/failed open, but not run()'s retry.
+  return { run, connect, handle: () => handle };
 }

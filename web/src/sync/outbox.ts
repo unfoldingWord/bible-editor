@@ -6,6 +6,7 @@
 // crashes — see docs/plan.md "Save protocol".
 
 import { openDB, type IDBPDatabase } from "idb";
+import { createDraftDbConnection } from "./draftDb";
 import {
   api,
   ApiError,
@@ -183,21 +184,23 @@ export interface OutboxOp {
 
 type Subscriber = (ops: OutboxOp[]) => void;
 
-let dbp: Promise<IDBPDatabase> | null = null;
-function db() {
-  if (!dbp) {
-    dbp = openDB(DB_NAME, DB_VERSION, {
-      upgrade(db) {
-        if (!db.objectStoreNames.contains(STORE)) {
-          const store = db.createObjectStore(STORE, { keyPath: "id" });
-          store.createIndex("queuedAt", "queuedAt");
-          store.createIndex("status", "status");
-        }
-      },
-    });
-  }
-  return dbp;
-}
+// Cached, but reopened if the browser closes the connection (#1102's helper).
+// A cache that never reset left every later save failing with "could not be
+// stored on this device" until the page was refreshed. The enqueue writes go
+// through conn.run, which also retries once on a closed connection.
+const conn = createDraftDbConnection<IDBPDatabase>(({ terminated, blocking }) =>
+  openDB(DB_NAME, DB_VERSION, {
+    upgrade(db) {
+      if (!db.objectStoreNames.contains(STORE)) {
+        const store = db.createObjectStore(STORE, { keyPath: "id" });
+        store.createIndex("queuedAt", "queuedAt");
+        store.createIndex("status", "status");
+      }
+    },
+    terminated,
+    blocking,
+  }));
+const db = conn.connect;
 
 const subscribers = new Set<Subscriber>();
 
@@ -333,7 +336,7 @@ export const outbox = {
       ...(opts.baseline !== undefined ? { baseline: opts.baseline } : {}),
       ...(opts.draftGeneration ? { draftGeneration: opts.draftGeneration } : {}),
     };
-    await (await db()).put(STORE, op);
+    await conn.run((d) => d.put(STORE, op));
     void notify();
     void drain();
     return op;
@@ -359,7 +362,7 @@ export const outbox = {
       attempts: 0,
       status: "pending",
     };
-    await (await db()).put(STORE, op);
+    await conn.run((d) => d.put(STORE, op));
     void notify();
     void drain();
     return op;
@@ -409,7 +412,7 @@ export const outbox = {
     };
     // #1060: remember it was queued here, before any drain can see it land.
     noteOwnVerseOp(op.id);
-    await (await db()).put(STORE, op);
+    await conn.run((d) => d.put(STORE, op));
     void notify();
     void drain();
     return op;

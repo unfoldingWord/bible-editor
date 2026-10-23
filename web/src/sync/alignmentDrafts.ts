@@ -15,6 +15,7 @@
 // aligner mount. Nothing here ever produces a PATCH — the outbox is untouched.
 
 import { openDB, type IDBPDatabase } from "idb";
+import { createDraftDbConnection } from "./draftDb";
 import { isReadOnly } from "./api";
 import { onOutboxResult, type OutboxOp } from "./outbox";
 import {
@@ -61,19 +62,19 @@ export interface AlignmentDraftRecord {
   row?: AlignmentDraftRow;
 }
 
-let dbp: Promise<IDBPDatabase> | null = null;
-function db() {
-  if (!dbp) {
-    dbp = openDB(DB_NAME, DB_VERSION, {
-      upgrade(d) {
-        if (!d.objectStoreNames.contains(STORE)) {
-          d.createObjectStore(STORE, { keyPath: "key" });
-        }
-      },
-    });
-  }
-  return dbp;
-}
+// Cached, but reopened if the browser closes the connection (#1102's helper),
+// so a failed aligner save still has a crash draft to fall back on.
+const conn = createDraftDbConnection<IDBPDatabase>(({ terminated, blocking }) =>
+  openDB(DB_NAME, DB_VERSION, {
+    upgrade(d) {
+      if (!d.objectStoreNames.contains(STORE)) {
+        d.createObjectStore(STORE, { keyPath: "key" });
+      }
+    },
+    terminated,
+    blocking,
+  }));
+const db = conn.connect;
 
 // The panel's draft key. Defined in alignmentDraftSaveState.ts (no IndexedDB
 // there, so it is unit-testable) and re-exported for existing callers.
@@ -135,7 +136,7 @@ export const alignmentDrafts = {
       generation,
       row,
     };
-    await (await db()).put(STORE, rec);
+    await conn.run((d) => d.put(STORE, rec));
     return generation;
   },
 

@@ -123,4 +123,16 @@ function harness() {
   assert.equal(opens, 2);
 }
 
+// connect() (outbox, aligner drafts): a terminated connection is not handed
+// out again; the next connect() opens a fresh one.
+{
+  const { conn, opened } = harness();
+  const first = await conn.connect();
+  assert.equal(await conn.connect(), first, "cached while healthy");
+  opened[0].callbacks.terminated();
+  const second = await conn.connect();
+  assert.notEqual(second, first);
+  assert.equal(opened.length, 2);
+}
+
 console.log("draftDb.test.mjs: ok");
