@@ -83,6 +83,7 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **Every IndexedDB store must open through `createDraftDbConnection` (`web/src/sync/draftDb.ts`), never a bare cached `openDB` promise.** The browser can close a connection on its own; a cache that never resets fails every later write until the page is refreshed. That is what made aligner saves report "could not be stored on this device" until a reload. Writes that must land go through `conn.run` (reopens and retries on `InvalidStateError`); `conn.connect` only drops the cache on a close event. `lexiconCache.ts` still uses the bare pattern (only a cache, so low stakes).
 - **Columns mode verse styling must reach block children.** A DocColumn verse is a `display: inline` span, but a
   poetry/paragraph verse's contentEditable carries `be-q`/`be-para`/`be-line` (block) and mid-verse `\q` lines render
   as `<div>`s. A block splits the inline span, and the span's background/box-shadow never paints behind it, so a style
