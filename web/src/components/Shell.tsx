@@ -30,6 +30,7 @@ import { useAiDrafts } from "../hooks/useAiDrafts";
 import { useTwlFilters } from "../hooks/useTwlFilters";
 import { useUnsavedGuard } from "../hooks/useUnsavedGuard";
 import { outbox } from "../sync/outbox";
+import { storageFailureReason } from "../sync/storageFailure";
 import { api, ApiError, CHECK_LANES, isReadOnly, setReadOnlyReason } from "../sync/api";
 import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlVerseSuggestions, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
@@ -3477,6 +3478,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // and cancelling the unalign confirm releases it (cancelAlignmentLoss), as
   // does a reading-line save refused under a book lock (onSaveReading, #1050).
   const saveDoneGuardRef = useRef(createSaveDoneAndNextGuard());
+  // Why the last enqueueVerseSafely write was refused by IndexedDB, for the
+  // aligners' "could not be stored" toasts. Set just before its promise
+  // resolves false, so a caller's .then always reads its own failure.
+  const lastStoreFailureRef = useRef("");
   const dualSaveDoneAndNext = useCallback(
     (verse: number, next: number) => {
       // #943: this only reaches the dual aligner while dualTarget.chapter ===
@@ -3661,9 +3666,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       )
       .then(
         // Read-only mode hands back a no-op op without storing anything.
-        (op) => op.id !== "readonly-noop",
+        (op) => {
+          const stored = op.id !== "readonly-noop";
+          lastStoreFailureRef.current = stored ? "" : "saving is turned off here";
+          return stored;
+        },
         (e: unknown) => {
           console.error(`[outbox] could not queue the ${book} ${chapterNum}:${verseNum} ${bibleVersion} save`, e);
+          lastStoreFailureRef.current = storageFailureReason(e);
           return false;
         },
       );
@@ -3756,7 +3766,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         return queued.then((stored) => {
           if (!stored) {
             pushPipelineToast(
-              `The ${alignerTarget.bibleVersion} alignment for ${book} ${alignerTarget.chapter}:${targetVerse.verse} was not saved (saving is off here, or this device could not store it). Your changes are still in the aligner.`,
+              `The ${alignerTarget.bibleVersion} alignment for ${book} ${alignerTarget.chapter}:${targetVerse.verse} was not saved (${lastStoreFailureRef.current || "no reason given"}). Your changes are still in the aligner.`,
               "error",
             );
             return false;
@@ -3911,7 +3921,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         return queued.then((stored) => {
           if (!stored) {
             pushPipelineToast(
-              `The ${bibleVersion} alignment for ${vref} could not be stored on this device, so it was not saved and the verse was not marked done. Your changes are still in the aligner.`,
+              `The ${bibleVersion} alignment for ${vref} could not be stored on this device (${lastStoreFailureRef.current || "no reason given"}), so it was not saved and the verse was not marked done. Your changes are still in the aligner.`,
               "error",
             );
             return dropped();
