@@ -747,7 +747,7 @@ function utf8Base64(s) {
       throw new Error(`unexpected ${m} ${u}`);
     };
     const r7 = await ensureDcsPr(cfg, "t", "b");
-    assert(r7.number === 77 && r7.created && r7.reason === "created_after_5xx", `create 504 re-looks-up and keeps a PR Gitea created anyway`);
+    assert(r7.number === 77 && !r7.created && r7.reason === "created_after_5xx", `create 504 re-looks-up and keeps a PR Gitea created anyway`);
 
     // Create 504 and no PR appears → still the original failure.
     globalThis.fetch = async (url, init = {}) => {

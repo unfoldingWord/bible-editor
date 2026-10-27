@@ -2938,10 +2938,11 @@ export async function ensureDcsPr(
   // A 5xx from the create can be a gateway timeout in front of a create that
   // Gitea committed anyway (2CH UST 2026-10-27: a 504, yet PR #4828 opened and
   // merged, issue #1236). Look once more; only an open PR for this exact head
-  // counts. A failed or empty lookup keeps the original error.
+  // counts. A failed or empty lookup keeps the original error. `created` stays
+  // false: the lookup cannot tell our create from a concurrent one.
   if (createRes.status >= 500) {
     const after = await findDcsOpenPr(config).catch(() => null);
-    if (after != null) return { number: after, created: true, reason: "created_after_5xx" };
+    if (after != null) return { number: after, created: false, reason: "created_after_5xx" };
   }
   throw new Error(failure);
 }
