@@ -45,7 +45,8 @@ import {
   RESOURCE_TARGETS,
   usfmRevertReport,
   tsvRevertReport,
-  narrowRevertEntriesByLineage,
+  partitionRevertEntriesByLineage,
+  planRevertReportAlerts,
   type StoredMasterLineage,
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
@@ -57,8 +58,6 @@ import {
   masterIsOurLastPublish,
   priorPublishPointer,
   RECORD_PUSHED_RENDER_SQL,
-  classifyRevertSeverity,
-  mechanicalOverwriteAlert,
   isMasterConfirmed,
   lockedPushLanded,
   type AlignmentShrinkResult,
@@ -1478,9 +1477,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // #1029: where master was last confirmed, read before tonight's push;
       // bounds which bot writes the revert lineage may count.
       let priorConfirmed: { editId: number | null; at: number | null } = { editId: null, at: null };
-      // #1231: the lineage the sync persisted, which narrows the revert report
-      // to rows a person may have touched (narrowRevertEntriesByLineage).
-      // Null keeps the full report.
+      // #1231: the lineage the sync persisted, which splits the revert report's
+      // alerts into rows a person may have
+      // touched and rows that are most likely ours
+      // (partitionRevertEntriesByLineage). Null keeps every row in attention.
       let storedLineage: StoredMasterLineage | null = null;
       try {
         const prior = await this.env.DB.prepare(
@@ -1704,34 +1704,42 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           console.log(`export: no last-publish base for ${book} ${resource}; revert report lists every differing row`);
         }
       }
-      // #1231: drop reported rows the persisted lineage proves no person
-      // touched since master was last confirmed. Pinned to the same master
-      // commit the report diffs against (fresh.masterSha) and to the confirmed
-      // point read before tonight's push; any mismatch or gap keeps every row.
-      const narrowByLineage = <E extends { ref: string }>(entries: E[]): E[] => {
-        if (entries.length === 0) return entries;
-        const n = narrowRevertEntriesByLineage(entries, storedLineage, {
+      // #1231 (option B): label reported USFM rows the persisted lineage
+      // shows no person touched since master was last confirmed as
+      // probablyOurs. Every row is still recorded; only the loud alerts skip
+      // probablyOurs. Pinned to the same master commit the report diffs
+      // against (fresh.masterSha) and to the confirmed point read before
+      // tonight's push; any mismatch or gap, and every TSV row, stays in
+      // attention.
+      const partitionByLineage = <E extends { ref: string }>(kind: "usfm" | "tsv", entries: E[]) => {
+        const n = partitionRevertEntriesByLineage(entries, kind, storedLineage, {
           masterSha: fresh.masterSha,
           confirmedAt: priorConfirmed.at,
         });
-        console.log("export: revert report lineage narrowing", {
-          book,
-          resource,
-          narrowed: n.narrowed,
-          reason: n.reason || undefined,
-          reported: n.entries.length,
-          dropped: n.dropped,
-        });
-        return n.entries;
+        if (entries.length > 0) {
+          console.log("export: revert report lineage partition", {
+            book,
+            resource,
+            kind,
+            partitioned: n.partitioned,
+            reason: n.reason || undefined,
+            attention: n.attention.length,
+            probablyOurs: n.probablyOurs.length,
+          });
+        }
+        return { attention: n.attention, probablyOurs: n.probablyOurs };
       };
       if (
         (resource === "ult" || resource === "ust") &&
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
-        const entries = computeEntries
-          ? narrowByLineage(usfmRevertReport(built.content, usfmMasterContentForRevertReport as string, revertBase).entries)
-          : [];
-        await this.recordExportRevertReport(book, resource, "usfm", entries, mechanical, branch, instanceId, alertObservedAt);
+        const report = partitionByLineage(
+          "usfm",
+          computeEntries
+            ? usfmRevertReport(built.content, usfmMasterContentForRevertReport as string, revertBase).entries
+            : [],
+        );
+        await this.recordExportRevertReport(book, resource, "usfm", report, mechanical, branch, instanceId, alertObservedAt);
       } else if (
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
@@ -1779,18 +1787,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             });
           }
         }
-        const entries = computeEntries
-          ? narrowByLineage(
-              tsvRevertReport(
+        const report = partitionByLineage(
+          "tsv",
+          computeEntries
+            ? tsvRevertReport(
                 built.content,
                 tsvMasterContentForRevertReport as string,
                 resource as "tn" | "tq" | "twl",
                 revertBase,
                 lineage,
-              ).entries,
-            )
-          : [];
-        await this.recordExportRevertReport(book, resource, "tsv", entries, mechanical, branch, instanceId, alertObservedAt);
+              ).entries
+            : [],
+        );
+        await this.recordExportRevertReport(book, resource, "tsv", report, mechanical, branch, instanceId, alertObservedAt);
       }
 
       if (!commit.branchTouched) {
@@ -3209,8 +3218,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // write a non-blocking, observational alert naming only what was measured
   // (class breakdown + refs) — never a cause, per this file's established
   // "state only a cause you measured" discipline (see the comment above
-  // buildAlignmentShrinkAlertMessage). severity is always "warning": this
-  // never blocks the export, so it must never read as "error". kind is
+  // buildAlignmentShrinkAlertMessage). severity is "warning" ("info" for the
+  // #1231 probably-ours record): this never blocks the export, so it must
+  // never read as "error". kind is
   // "record" (issue #535): "master moved because we exported, as expected"
   // is nothing to decide, so it belongs in the admin panel's activity log,
   // not a personal alert.
@@ -3218,12 +3228,18 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     kind: "usfm" | "tsv",
-    entries: Array<UsfmRevertEntry | TsvRevertEntry>,
+    report: {
+      attention: Array<UsfmRevertEntry | TsvRevertEntry>;
+      probablyOurs: Array<UsfmRevertEntry | TsvRevertEntry>;
+    },
     mechanical: boolean,
     branch: string,
     generation: string,
     observedAt = Date.now(),
   ): Promise<void> {
+    // #1231: export_reverts records EVERY entry, attention and probablyOurs
+    // alike; nothing is hidden there. Only the alerts below tell them apart.
+    const entries = [...report.attention, ...report.probablyOurs];
     if (entries.length === 0) {
       const cleared = await this.clearExportReverts(book, resource, generation, observedAt);
       if (cleared === "recorded") {
@@ -3234,7 +3250,6 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       return;
     }
     const recorded = await this.recordExportReverts(book, resource, entries, generation, observedAt);
-    const label = `${book} ${resource.toUpperCase()}`;
     if (recorded === "failed") {
       // recordExportReverts already logged the underlying error; the alert
       // must not go on to claim these findings were recorded (see its own
@@ -3249,63 +3264,33 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
     if (recorded === "superseded") return;
     await this.resolveExportRevertPersistence(book, resource, generation, observedAt);
-    const byClass = new Map<string, number>();
-    for (const e of entries) byClass.set(e.class, (byClass.get(e.class) ?? 0) + 1);
-    const breakdown = [...byClass.entries()].map(([cls, n]) => `${n} ${cls}`).join(", ");
-    const sampleRefs = entries.slice(0, 10).map((e) => e.ref).join(", ");
-    const extra = entries.length - 10;
-    const severity =
-      kind === "usfm"
-        ? classifyRevertSeverity(entries as UsfmRevertEntry[], [])
-        : classifyRevertSeverity([], entries as TsvRevertEntry[]);
-    const escalateNote = severity.escalate
-      ? ` This is a larger-than-usual number of reverts for one export (${severity.reason}).`
-      : "";
-    await this.writeAlert(
-      `export_revert:${book}:${resource}`,
-      `${label} shipped to Door43 and overwrote master's current content on ${entries.length} row(s)/verse(s) ` +
-        `(${breakdown}): ${sampleRefs}${extra > 0 ? ` (+${extra} more)` : ""}.${escalateNote} This does not block ` +
-        `the export; it is a record of what changed on master, in case a hand-edit there was lost.`,
-      `${this.env.DCS_BASE_URL}/unfoldingWord`,
-      "warning",
-      "record",
-      `${generation}:export_revert:${book}:${resource}`,
-      { book, resource, generation, observedAt },
-    );
-
-    // Second, distinct alert: "mechanical" means no HUMAN contributor was
-    // recorded for this book+resource since the last export (contributorsFor
-    // filters to `source IS NULL`) — but our own AI pipeline and reimport
-    // writes also carry no contributor, so this does NOT by itself mean the
-    // revert is someone else's out-of-band work; see mechanicalOverwriteAlert's
-    // comment in export.ts for the measured-vs-asserted distinction and the
-    // 2026-08-10 1CH incident that first motivated this alert (one real
-    // example of the out-of-band case, not proof every mechanical revert is
-    // one). Distinct `source` so it never collides with or overwrites the
-    // export_revert alert above. Best-effort, same as every other alert in
-    // this file — never allowed to fail the export.
-    try {
-      const mechAlert =
-        kind === "usfm"
-          ? mechanicalOverwriteAlert(mechanical, entries as UsfmRevertEntry[], [])
-          : mechanicalOverwriteAlert(mechanical, [], entries as TsvRevertEntry[]);
-      if (mechAlert.alert) {
-        await this.writeAlert(
-          `mechanical_overwrite:${book}:${resource}`,
-          `${label}: ${mechAlert.reason} Branch \`${branch}\`, first refs: ${sampleRefs}${extra > 0 ? ` (+${extra} more)` : ""}. This does not block the export.`,
-          `${this.env.DCS_BASE_URL}/unfoldingWord`,
-          "warning",
-          "record",
-          `${generation}:mechanical_overwrite:${book}:${resource}`,
-          { book, resource, generation, observedAt },
-        );
-      }
-    } catch (e) {
-      console.error("mechanical overwrite alert failed", {
-        book,
-        resource,
-        error: e instanceof Error ? e.message : String(e),
-      });
+    // export_revert and mechanical_overwrite name `attention` rows only, so a
+    // night whose every row is probablyOurs writes neither; probablyOurs gets
+    // one quiet "info" record (revert_probably_ours). See
+    // planRevertReportAlerts. The mechanical_overwrite alert's own caveats
+    // live on mechanicalOverwriteAlert in export.ts (the 2026-08-10 1CH
+    // incident; "mechanical" does not prove someone else's edit). writeAlert
+    // is best-effort, so a failed alert write never fails the export.
+    const alerts = planRevertReportAlerts({
+      book,
+      resource,
+      kind,
+      attention: report.attention,
+      probablyOurs: report.probablyOurs,
+      mechanical,
+      branch,
+      generation,
+    });
+    for (const a of alerts) {
+      await this.writeAlert(
+        a.source,
+        a.message,
+        `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        a.severity,
+        "record",
+        a.eventKey,
+        { book, resource, generation, observedAt },
+      );
     }
   }
 

@@ -1276,10 +1276,10 @@ const TSV_VERSE_SEGMENT_RE = /^(\d+)(?:-(\d+))?$/;
 // unparseable segment discards the WHOLE ref, which is incomplete, which is
 // master-wins for the row it belongs to.
 //
-// Exported for the export-revert report's lineage filter (#1231,
-// export.ts's narrowRevertEntriesByLineage), which has to read a Reference
+// Exported for the export-revert report's lineage partition (#1231,
+// export.ts's partitionRevertEntriesByLineage), which has to read a Reference
 // cell exactly the way these refs were produced, or a touched row would be
-// missed.
+// mislabelled as probably ours.
 export function parseTsvRefColumn(ref: string): string[] | null {
   const trimmed = ref.trim();
   const colon = trimmed.indexOf(":");

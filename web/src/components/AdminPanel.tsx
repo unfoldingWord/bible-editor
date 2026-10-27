@@ -402,7 +402,8 @@ function SyncStatusTab() {
 // ── Tab: Sync activity ───────────────────────────────────────────────────
 
 // `source` for these entries currently includes export_revert,
-// mechanical_overwrite, and reimport_kept_over_door43 book/resource events
+// mechanical_overwrite, revert_probably_ours (#1231), and
+// reimport_kept_over_door43 book/resource events
 // (see admin.ts's /sync-activity route) — parsed for a compact column;
 // falls back to showing the raw source if a future source doesn't fit that
 // shape rather than hiding the row.
