@@ -17,6 +17,7 @@ import {
   snapshotStatus,
   splitResults,
   splitRevertRefs,
+  splitRevertRows,
   splitVerdict,
 } from "../../scripts/watchdog/exportRevertCheck.mjs";
 import { planRevertReportAlerts } from "./export.ts";
@@ -300,6 +301,81 @@ assert(!isOurExportSubject("bible-editor: EZKX ust → master", "EZK", "ust"), "
     const s = splitRevertRefs(["9:5", ...po], groupRevertAlerts(alerts)[0]);
     assert(s.probablyOursRefs.length === 300 && s.exportRevertRefs.length === 3, "split: >300 probably ours -> the 2 unlisted are checked under export_revert");
     assert(/^inexact/.test(s.split), "split: truncated record list -> inexact");
+  }
+
+  // #1243: rows that carry the stored probably_ours mark split by it, so a
+  // report past the record's 300-ref list is still exact.
+  {
+    const po = Array.from({ length: 302 }, (_, i) => `${10 + Math.floor(i / 40)}:${(i % 40) + 1}`);
+    const g = groupRevertAlerts(plan(["9:5"], po))[0];
+    const rows = [{ ref: "9:5", probably_ours: 0 }, ...po.map((ref) => ({ ref, probably_ours: 1 }))];
+    const s = splitRevertRows(rows, g);
+    assert(
+      same(s.exportRevertRefs, ["9:5"]) && same(s.probablyOursRefs, po) && s.split === "exact",
+      "split: >300 probably-ours rows with the stored mark -> exact, every one quiet",
+    );
+    // Rows written before the column existed read NULL: the message parse
+    // stands in, with its truncation note.
+    const old = splitRevertRows(rows.map((r) => ({ ref: r.ref, probably_ours: null })), g);
+    const legacy = splitRevertRefs(rows.map((r) => r.ref), g);
+    assert(same(old, legacy) && /^inexact/.test(old.split), "split: NULL marks (pre-migration rows) -> the message-parse fallback");
+    // Rows from a collector that did not select the column (it is not in
+    // prod yet) carry no mark at all: same fallback.
+    assert(same(splitRevertRows(rows.map((r) => ({ ref: r.ref })), g), legacy), "split: no mark selected -> the message-parse fallback");
+    // A snapshot with even one NULL is not trusted to be one run's marks.
+    const mixed = splitRevertRows([{ ref: "9:5", probably_ours: 0 }, ...po.map((ref, i) => ({ ref, probably_ours: i ? 1 : null }))], g);
+    assert(same(mixed, legacy), "split: any NULL mark -> the message-parse fallback");
+  }
+  // Marked probably ours, but the record's best-effort write is missing:
+  // those rows would have no section, so they go loud, flagged.
+  {
+    const g = groupRevertAlerts(plan(["9:5"], ["9:3"]).filter((a) => a.source.startsWith("export_revert:")))[0];
+    const s = splitRevertRows([{ ref: "9:5", probably_ours: 0 }, { ref: "9:3", probably_ours: 1 }], g);
+    assert(same(s.exportRevertRefs, ["9:5", "9:3"]) && s.probablyOursRefs.length === 0, "split: marked rows with no record -> checked under export_revert");
+    assert(/^inexact: 1 row\(s\) marked probably ours/.test(s.split), "split: marked rows with no record -> flagged inexact");
+    const t = splitRevertRows([{ ref: "9:5", probably_ours: 0 }], g);
+    assert(same(t.exportRevertRefs, ["9:5"]) && t.split === "exact", "split: attention-only marked rows, export_revert alone -> exact");
+  }
+  // Marked attention, but the export_revert alert's write is missing: the rows
+  // keep their side and the split says the loud alert is missing.
+  {
+    const g = groupRevertAlerts(plan(["9:5"], ["9:3"]).filter((a) => a.source.startsWith("revert_probably_ours:")))[0];
+    const s = splitRevertRows([{ ref: "9:5", probably_ours: 0 }, { ref: "9:3", probably_ours: 1 }], g);
+    assert(same(s.exportRevertRefs, ["9:5"]) && same(s.probablyOursRefs, ["9:3"]), "split: marks kept when the export_revert alert is missing");
+    assert(s.split === "exact by row marks; export_revert alert missing for 1 row(s)", "split: missing export_revert alert is flagged with row marks");
+    const res = splitResults({ status: "ok", falseRefs: ["9:3"], realRefs: [], unknownRefs: ["9:5"] }, s, g);
+    const { loud } = revertSummaryLines(res.map((r) => ({ ...r, book: "EZK", resource: "ust" })));
+    assert(loud.some((l) => l.includes("no export_revert alert found") && l.includes("export_revert alert missing for 1 row(s)")), "summary: the missing-alert note reaches the loud section");
+  }
+  // Marks and alert counts disagree (USFM): sides follow the marks, the split
+  // is unverified and names both counts.
+  {
+    const g = groupRevertAlerts(plan(["9:5"], ["9:3", "9:4"]))[0];
+    const s = splitRevertRows([{ ref: "9:5", probably_ours: 0 }, { ref: "9:3", probably_ours: 1 }, { ref: "9:4", probably_ours: 0 }], g);
+    assert(same(s.exportRevertRefs, ["9:5", "9:4"]) && same(s.probablyOursRefs, ["9:3"]), "split: count mismatch keeps the mark split");
+    assert(
+      s.split === "unverified: probably-ours record names 2 row(s), 1 marked probably ours; export_revert alert names 1 row(s), 2 marked attention",
+      "split: count mismatch with row marks -> unverified, both counts named",
+    );
+    const ok = splitRevertRows([{ ref: "9:5", probably_ours: 0 }, { ref: "9:3", probably_ours: 1 }, { ref: "9:4", probably_ours: 1 }], g);
+    assert(ok.split === "exact", "split: counts that match the marks -> exact");
+  }
+  // TSV: no count check with row marks (several tn rows share one Reference).
+  {
+    const alerts = planRevertReportAlerts({
+      book: "EZK",
+      resource: "tn",
+      kind: "tsv",
+      attention: ["1:1", "1:1", "1:2"].map((ref) => ({ ref, class: "substantive" })),
+      probablyOurs: [],
+      mechanical: false,
+      branch: "live-snapshot",
+      generation: "g8",
+    })
+      .filter((a) => !a.source.startsWith("mechanical_overwrite:"))
+      .map((a, i) => ({ id: 1700 + i, source: a.source, event_key: a.eventKey, created_at: 1792820398, message: a.message }));
+    const s = splitRevertRows([{ ref: "1:1", probably_ours: 0 }, { ref: "1:2", probably_ours: 0 }], groupRevertAlerts(alerts)[0]);
+    assert(same(s.exportRevertRefs, ["1:1", "1:2"]) && s.split === "exact", "split: tsv row marks -> exact, no count check");
   }
 
   // A lone probably-ours record whose list is a strict subset of the snapshot
