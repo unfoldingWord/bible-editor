@@ -236,7 +236,7 @@ export function staleSkipAlertMessage(
       `Door43 failed (no answer, an error status, or an unreadable reply; synced ` +
       `${(watermark ?? "none").slice(0, 8)}), so the export could not confirm master had not moved and did not push.`;
     // A withhold this run recorded is the measured cause of any lag; the
-    // "may well be current" reassurance would contradict it.
+    // "retries" reassurance would contradict it.
     if (withhold) return `${head} ${staleSkipRemedy(withhold)}`;
     return (
       `${head} The edits stay in the app and the next nightly export retries. If this repeats night after night, ` +
