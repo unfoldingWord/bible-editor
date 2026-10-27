@@ -210,6 +210,11 @@ const revertMeta =
       )
     : null;
 const created = new Map(revertAlerts.map((a) => [a.id, a.created]));
+// Which summary section(s) a failed step leaves unchecked.
+const revertFailed = new Set();
+if (erc && revertAlerts.length > 0 && !revertMeta) {
+  for (const a of revertAlerts) revertFailed.add(String(a.source).split(":")[0]);
+}
 for (const g of erc && revertMeta ? erc.groupRevertAlerts(revertMeta) : []) {
   const { book, resource, anchor } = g;
   const res = step(`export_revert check ${anchor.id} ${book} ${resource}`, () => {
@@ -260,6 +265,7 @@ for (const g of erc && revertMeta ? erc.groupRevertAlerts(revertMeta) : []) {
       }));
   });
   if (res) bundle.exportReverts.push(...res);
+  else for (const a of [g.exportRevert, g.probablyOurs]) if (a) revertFailed.add(a.group);
 }
 
 fs.writeFileSync(path.join(OUT, "bundle.json"), JSON.stringify(bundle, null, 1));
@@ -270,11 +276,15 @@ const runRecorded = byStatus != null && has("run_started") && has("run_completed
 const complete = bundle.errors.length === 0 && runRecorded && bundle.newAlerts != null;
 const n = (x) => (x == null ? "unknown" : String(x));
 const activeOk = !bundle.errors.some((e) => e.step === "open review rows");
-const revertLines = erc ? erc.revertSummaryLines(bundle.exportReverts) : { loud: [], quiet: [] };
-const revertNoneLine =
-  revertAlerts.length > 0 && !erc
-    ? `- CHECK FAILED TO LOAD: ${revertAlerts.length} export_revert / revert_probably_ours alert(s) unchecked (see errors, step "load exportRevertCheck.mjs").`
-    : `- None checked${bundle.errors.some((e) => e.step.startsWith("export_revert")) ? " (a check failed, see errors)" : ""}.`;
+// Without exportRevertCheck.mjs (no alerts, or it failed to load) each section
+// says so for its own alerts.
+const notLoaded = (prefix) => {
+  const k = revertAlerts.filter((a) => String(a.source).startsWith(`${prefix}:`)).length;
+  return [k > 0 ? `- CHECK FAILED TO LOAD: ${k} ${prefix} alert(s) unchecked (see errors, step "load exportRevertCheck.mjs").` : `- None checked.`];
+};
+const revertLines = erc
+  ? erc.revertSummaryLines(bundle.exportReverts, { failed: [...revertFailed] })
+  : { loud: notLoaded("export_revert"), quiet: notLoaded("revert_probably_ours") };
 const summary = [
   `# Sync watchdog ${day}`,
   ``,
@@ -300,11 +310,11 @@ const summary = [
   ``,
   `## export_revert alerts`,
   ``,
-  ...(revertLines.loud.length === 0 ? [revertNoneLine] : revertLines.loud),
+  ...revertLines.loud,
   ``,
   `## revert_probably_ours records`,
   ``,
-  ...(revertLines.quiet.length === 0 ? [revertNoneLine] : revertLines.quiet),
+  ...revertLines.quiet,
 ].join("\n");
 fs.writeFileSync(path.join(OUT, "summary.md"), summary + "\n");
 console.log(summary);

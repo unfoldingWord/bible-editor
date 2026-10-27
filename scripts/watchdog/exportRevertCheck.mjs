@@ -285,19 +285,28 @@ function probablyOursList(message) {
 // Pure: split the snapshot's refs between a group's two alerts. Returns
 // {exportRevertRefs, probablyOursRefs, split}; split is "exact", or
 // "inexact: …" / "unverified: …" with the reason.
+//
+// A lone alert owns every row by construction, so no count is compared there:
+// export_reverts is UNIQUE(book, resource, ref) and a TSV Reference often
+// carries several tn rows, so a TSV alert's "on N row(s)" routinely exceeds
+// the snapshot's row count (#1240 review F1). The mixed case compares counts
+// for USFM only, where one verse ref is one entry; export.ts partitions USFM
+// only (tsv_not_partitioned), so a mixed TSV report is not expected, and if
+// one appears its counts are not comparable.
 export function splitRevertRefs(rowRefs, group) {
   const rows = [...new Set(rowRefs)];
-  const erCount = group.exportRevert ? exportRevertCount(group.exportRevert.message) : 0;
-  const po = group.probablyOurs ? probablyOursList(group.probablyOurs.message) : { count: 0, refs: [], unlisted: 0 };
-  const countMismatch =
-    erCount !== null && po !== null && erCount + po.count === rows.length
-      ? null
-      : `unverified: alerts name ${erCount ?? "?"} export_revert + ${po?.count ?? "?"} probably-ours row(s), snapshot has ${rows.length}`;
-  if (!group.exportRevert) return { exportRevertRefs: [], probablyOursRefs: rows, split: countMismatch ?? "exact" };
-  if (!group.probablyOurs) return { exportRevertRefs: rows, probablyOursRefs: [], split: countMismatch ?? "exact" };
+  if (!group.exportRevert) return { exportRevertRefs: [], probablyOursRefs: rows, split: "exact" };
+  if (!group.probablyOurs) return { exportRevertRefs: rows, probablyOursRefs: [], split: "exact" };
+  const po = probablyOursList(group.probablyOurs.message);
   if (po === null) {
     return { exportRevertRefs: rows, probablyOursRefs: [], split: "unverified: the probably-ours record's ref list did not parse" };
   }
+  const erCount = exportRevertCount(group.exportRevert.message);
+  const usfm = group.resource === "ult" || group.resource === "ust";
+  const countMismatch =
+    !usfm || (erCount !== null && erCount + po.count === rows.length)
+      ? null
+      : `unverified: alerts name ${erCount ?? "?"} export_revert + ${po.count} probably-ours row(s), snapshot has ${rows.length}`;
   const inRows = new Set(rows);
   const listed = new Set(po.refs.filter((r) => inRows.has(r)));
   const split =
@@ -321,7 +330,9 @@ export function splitVerdict(verdict, refs) {
 // export_revert heading: every export_revert alert, plus any probably-ours
 // record with a REAL ref (the edit history missed a hand-edit, as serious as
 // an export_revert REAL). `quiet` is the per-record probably-ours tally.
-export function revertSummaryLines(results) {
+// `failed` names the groups ('export_revert' / 'revert_probably_ours') with
+// at least one alert whose check failed; each section notes only its own.
+export function revertSummaryLines(results, { failed = [] } = {}) {
   const list = (xs) => (xs.length ? `${xs.length} (${xs.slice(0, 15).join(", ")}${xs.length > 15 ? ", …" : ""})` : "0");
   const where = (r) =>
     `${r.status}; prev export ${r.prevExportSha?.slice(0, 10) ?? "none"}, ` +
@@ -354,6 +365,14 @@ export function revertSummaryLines(results) {
         `unchanged on master since our last export (parsed verse/row comparison) ${list(r.falseRefs)}; real ${list(r.realRefs)}; unknown ${list(r.unknownRefs)}${splitNote(r)}`,
     );
   }
+  const checkedEr = results.some((r) => r.group !== "revert_probably_ours");
+  if (failed.includes("export_revert")) loud.push("- An export_revert check failed, see errors.");
+  else if (!checkedEr && quiet.length > 0) {
+    loud.unshift(`- No export_revert alerts tonight (${quiet.length} probably-ours record(s) checked below).`);
+  }
+  if (failed.includes("revert_probably_ours")) quiet.push("- A revert_probably_ours check failed, see errors.");
+  if (loud.length === 0) loud.push("- None checked.");
+  if (quiet.length === 0) quiet.push("- None checked.");
   return { loud, quiet };
 }
 

@@ -301,11 +301,51 @@ assert(!isOurExportSubject("bible-editor: EZKX ust → master", "EZK", "ust"), "
     assert(/^inexact/.test(s.split), "split: truncated record list -> inexact");
   }
 
-  // Alert count disagrees with the snapshot (e.g. an alert write failed):
-  // every row is still checked, and the split is flagged.
+  // A lone alert owns every row: no count comparison, so no false
+  // "unverified" note.
   {
     const s = splitRevertRefs(["9:3", "9:4", "9:7"], groupRevertAlerts(plan([], ["9:3", "9:4"]))[0]);
-    assert(s.probablyOursRefs.length === 3 && /^unverified/.test(s.split), "split: count mismatch -> every row checked, unverified");
+    assert(s.probablyOursRefs.length === 3 && s.split === "exact", "split: lone alert -> every row, exact without a count check");
+  }
+
+  // Mixed USFM night whose counts disagree with the snapshot: every row is
+  // still checked, and the split is flagged.
+  {
+    const s = splitRevertRefs(["9:3", "9:4", "9:5", "9:7"], groupRevertAlerts(plan(["9:5"], ["9:3", "9:4"]))[0]);
+    assert(same(s.exportRevertRefs, ["9:5", "9:7"]) && /^unverified/.test(s.split), "split: mixed usfm count mismatch -> unverified, extra rows on the loud side");
+  }
+
+  // TSV export_revert-only night (#1240 review F1): several tn rows share a
+  // Reference, so the alert's row count exceeds export_reverts' unique refs.
+  {
+    const alerts = planRevertReportAlerts({
+      book: "EZK",
+      resource: "tn",
+      kind: "tsv",
+      attention: ["1:1", "1:1", "1:1", "1:2"].map((ref) => ({ ref, class: "substantive", fields: ["Note"] })),
+      probablyOurs: [],
+      mechanical: false,
+      branch: "live-snapshot",
+      generation: "g7",
+    })
+      .filter((a) => a.source.startsWith("export_revert:"))
+      .map((a) => ({ id: 1600, source: a.source, event_key: a.eventKey, created_at: 1792820398, message: a.message }));
+    assert(alerts.length === 1 && / on 4 row\(s\)/.test(alerts[0].message), "fixture: tsv alert counts 4 rows over 2 refs");
+    const s = splitRevertRefs(["1:1", "1:2"], groupRevertAlerts(alerts)[0]);
+    assert(same(s.exportRevertRefs, ["1:1", "1:2"]) && s.split === "exact", "split: tsv duplicate refs -> exact, no unverified note");
+    const { loud } = revertSummaryLines([{ ...splitVerdict({ status: "ok", falseRefs: ["1:1"], realRefs: [], unknownRefs: ["1:2"] }, s.exportRevertRefs), group: "export_revert", alertId: 1600, book: "EZK", resource: "tn", split: s.split }]);
+    assert(loud.length === 1 && !/unverified|Ref split/.test(loud[0]), "summary: tsv export_revert line carries no split note");
+  }
+
+  // Section wording (#1240 review F5).
+  {
+    const po = { status: "ok", falseRefs: ["1:1"], realRefs: [], unknownRefs: [], group: "revert_probably_ours", alertId: 1700, book: "JOL", resource: "ult" };
+    const a = revertSummaryLines([po]);
+    assert(a.loud[0] === "- No export_revert alerts tonight (1 probably-ours record(s) checked below)." && a.loud.length === 1, "summary: probably-ours-only night says no export_revert alerts, not 'None checked'");
+    const b = revertSummaryLines([], { failed: ["revert_probably_ours"] });
+    assert(same(b.loud, ["- None checked."]) && same(b.quiet, ["- A revert_probably_ours check failed, see errors."]), "summary: a failed probably-ours check is noted only in its own section");
+    const c = revertSummaryLines([po], { failed: ["export_revert"] });
+    assert(same(c.loud, ["- An export_revert check failed, see errors."]) && c.quiet.length === 1, "summary: a failed export_revert check is noted only in the loud section");
   }
 
   // A newer report for the same pair supersedes the older group.
