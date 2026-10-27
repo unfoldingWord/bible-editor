@@ -732,6 +732,50 @@ function utf8Base64(s) {
     const r5 = await ensureDcsPr(cfg, "t", "b");
     assert(!r5.created && r5.reason === "no_diff", `ensureDcsPr treats 422 as a benign no-op`);
 
+    // Create 504 but Gitea committed the PR anyway (issue #1236, 2CH UST
+    // 2026-10-27) → the follow-up lookup finds it and its number is kept.
+    lookups = 0;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) {
+        lookups++;
+        return lookups === 1 ? okJson({ message: "Not Found" }, 404) : okJson({ number: 77, state: "open" });
+      }
+      if (isList(u, m)) return okJson([]);
+      if (u.endsWith("/pulls") && m === "POST") return new Response("error code: 504", { status: 504 });
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const r7 = await ensureDcsPr(cfg, "t", "b");
+    assert(r7.number === 77 && !r7.created && r7.reason === "created_after_5xx", `create 504 re-looks-up and keeps a PR Gitea created anyway`);
+
+    // Create 504 and no PR appears → still the original failure.
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) return okJson([]);
+      if (u.endsWith("/pulls") && m === "POST") return new Response("error code: 504", { status: 504 });
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    let e8 = null;
+    try { await ensureDcsPr(cfg, "t", "b"); } catch (e) { e8 = e; }
+    assert(e8 && /^dcs_pull_create_failed: 504/.test(e8.message), `create 504 with no PR found still throws dcs_pull_create_failed`);
+
+    // Create 504 and the lookup itself fails → the create error, not the lookup's.
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (u.endsWith("/pulls") && m === "POST") return new Response("error code: 504", { status: 504 });
+      if (isLookup(u, m) && lookups++ === 0) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) return okJson([]);
+      return new Response("error code: 502", { status: 502 });
+    };
+    lookups = 0;
+    let e9 = null;
+    try { await ensureDcsPr(cfg, "t", "b"); } catch (e) { e9 = e; }
+    assert(e9 && /^dcs_pull_create_failed: 504/.test(e9.message), `a failed follow-up lookup keeps the create's 504 error`);
+
     // Head == base is a guarded no-op (no network at all).
     const r6 = await ensureDcsPr({ ...cfg, branch: "master" }, "t", "b");
     assert(!r6.created && r6.reason === "head_equals_base", `ensureDcsPr skips when head == base`);

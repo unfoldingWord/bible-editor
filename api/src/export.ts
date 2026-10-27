@@ -2725,7 +2725,7 @@ export interface DcsPrConfig {
 export interface DcsPrResult {
   number: number | null;
   created: boolean;
-  reason: "head_equals_base" | "existing" | "created" | "raced" | "no_diff";
+  reason: "head_equals_base" | "existing" | "created" | "created_after_5xx" | "raced" | "no_diff";
 }
 
 function dcsPrHeaders(token: string): Record<string, string> {
@@ -2934,7 +2934,17 @@ export async function ensureDcsPr(
       ? { number: raced, created: false, reason: "raced" }
       : { number: null, created: false, reason: "no_diff" };
   }
-  throw new Error(`dcs_pull_create_failed: ${createRes.status} ${await createRes.text()}`);
+  const failure = `dcs_pull_create_failed: ${createRes.status} ${await createRes.text()}`;
+  // A 5xx from the create can be a gateway timeout in front of a create that
+  // Gitea committed anyway (2CH UST 2026-10-27: a 504, yet PR #4828 opened and
+  // merged, issue #1236). Look once more; only an open PR for this exact head
+  // counts. A failed or empty lookup keeps the original error. `created` stays
+  // false: the lookup cannot tell our create from a concurrent one.
+  if (createRes.status >= 500) {
+    const after = await findDcsOpenPr(config).catch(() => null);
+    if (after != null) return { number: after, created: false, reason: "created_after_5xx" };
+  }
+  throw new Error(failure);
 }
 
 // POST /repos/{owner}/{repo}/pulls/{index}/update — "merge base into head"
