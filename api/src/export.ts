@@ -1410,6 +1410,11 @@ export interface RevertReportAlert {
   eventKey: string;
 }
 
+// The export_reverts rows carry no probably-ours marker, so this record alert is
+// the only place the labelling survives: list every ref (#1231 review F1), with
+// a cap only so a pathological night cannot write an unbounded message.
+const PROBABLY_OURS_LISTED_REFS = 300;
+
 export function planRevertReportAlerts(p: {
   book: string;
   resource: Resource;
@@ -1422,8 +1427,8 @@ export function planRevertReportAlerts(p: {
 }): RevertReportAlert[] {
   const { book, resource, kind, attention, probablyOurs, mechanical, branch, generation } = p;
   const label = `${book} ${resource.toUpperCase()}`;
-  const sample = (list: Array<{ ref: string }>) =>
-    `${list.slice(0, 10).map((e) => e.ref).join(", ")}${list.length > 10 ? ` (+${list.length - 10} more)` : ""}`;
+  const sample = (list: Array<{ ref: string }>, n = 10) =>
+    `${list.slice(0, n).map((e) => e.ref).join(", ")}${list.length > n ? ` (+${list.length - n} more)` : ""}`;
   const out: RevertReportAlert[] = [];
   if (attention.length > 0) {
     const byClass = new Map<string, number>();
@@ -1467,7 +1472,7 @@ export function planRevertReportAlerts(p: {
       source: `revert_probably_ours:${book}:${resource}`,
       message:
         `${label}: tonight's export replaced master's text on ${probablyOurs.length} verse(s) that are most likely ` +
-        `our translators' own work, not a lost hand-edit: ${sample(probablyOurs)}. The stored Door43 edit history ` +
+        `our translators' own work, not a lost hand-edit: ${sample(probablyOurs, PROBABLY_OURS_LISTED_REFS)}. The stored Door43 edit history ` +
         `shows no person touched these verses since master last held our export. They are included in tonight's ` +
         `export-revert records for ${label}; nothing to do unless you expected a hand-edit at one of them.`,
       severity: "info",

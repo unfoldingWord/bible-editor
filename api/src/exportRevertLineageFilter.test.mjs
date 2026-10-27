@@ -216,11 +216,13 @@ function usfm(v93, v101, v1415 = "a bridged verse") {
   eq(q.eventKey, "gen1:revert_probably_ours:EZK:ust", "quiet alert event key follows the export_revert pattern");
   eq(q.message.includes("11 verse(s)"), true, "quiet alert gives the count");
   eq(
-    q.message.includes("10:1, 10:2, 10:3, 10:4, 10:5, 10:6, 10:7, 10:8, 10:9, 10:10 (+1 more)"),
+    q.message.includes("10:1, 10:2, 10:3, 10:4, 10:5, 10:6, 10:7, 10:8, 10:9, 10:10, 10:11."),
     true,
-    "quiet alert lists the first 10 refs and +N more",
+    "quiet alert lists every probably-ours ref, not just the first 10",
   );
-  eq(q.message.includes("10:11"), false, "quiet alert stops at 10 refs");
+  const ours301 = Array.from({ length: 301 }, (_, i) => sub(`20:${i + 1}`));
+  const big = planRevertReportAlerts({ ...base, attention: [], probablyOurs: ours301 })[0];
+  eq(big.message.includes("20:300 (+1 more)"), true, "quiet alert caps a pathological list at 300 refs");
   eq(/no person touched/.test(q.message), true, "quiet alert says no person touched these verses");
 
   // Mixed: the loud alerts count only attention.
