@@ -8,12 +8,17 @@ import {
   checkExportRevertAlert,
   classifyExportRevertRefs,
   fetchFileAt,
+  groupRevertAlerts,
   isOurExportSubject,
   knownRenderShas,
   pickExportCommits,
   renderPinStatus,
+  revertSummaryLines,
   snapshotStatus,
+  splitRevertRefs,
+  splitVerdict,
 } from "../../scripts/watchdog/exportRevertCheck.mjs";
+import { planRevertReportAlerts } from "./export.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -217,6 +222,101 @@ assert(!isOurExportSubject("bible-editor: EZKX ust → master", "EZK", "ust"), "
     threw = /DOOR43_TOKEN contains/.test(String(e?.message));
   }
   assert(threw, "a token with quotes or spaces is refused before curl runs");
+}
+
+// --- revert_probably_ours records (#1240) --------------------------------
+// The alerts come from export.ts's own planRevertReportAlerts, so a change to
+// either message's wording breaks these tests instead of silently breaking
+// the split. `rowsOf` stands in for export_reverts, which holds every entry.
+{
+  const entry = (ref) => ({ ref, class: "substantive" });
+  const plan = (attention, probablyOurs) =>
+    planRevertReportAlerts({
+      book: "EZK",
+      resource: "ust",
+      kind: "usfm",
+      attention: attention.map(entry),
+      probablyOurs: probablyOurs.map(entry),
+      mechanical: false,
+      branch: "live-snapshot",
+      generation: "g7",
+    })
+      .filter((a) => !a.source.startsWith("mechanical_overwrite:"))
+      .map((a, i) => ({ id: 1400 + i, source: a.source, event_key: a.eventKey, created_at: 1792820398, message: a.message }));
+
+  // A night whose every row is probably ours: no export_revert alert at all.
+  {
+    const alerts = plan([], ["9:3", "9:4"]);
+    assert(alerts.length === 1 && alerts[0].source === "revert_probably_ours:EZK:ust", "fixture: probably-ours-only night writes no export_revert alert");
+    const groups = groupRevertAlerts(alerts);
+    assert(groups.length === 1 && groups[0].exportRevert === null && groups[0].probablyOurs?.id === 1400, "group: a probably-ours-only night still yields a check");
+    assert(groups[0].generation === "g7" && groups[0].newerAlertId === null, "group: generation read from the event_key");
+    const s = splitRevertRefs(["9:3", "9:4"], groups[0]);
+    assert(same(s.probablyOursRefs, ["9:3", "9:4"]) && s.exportRevertRefs.length === 0 && s.split === "exact", "split: probably-ours-only night -> every row is probably ours, exact");
+    const snap = snapshotStatus({
+      alert: groups[0].anchor,
+      book: "EZK",
+      resource: "ust",
+      newerAlertId: null,
+      generation: { generation: "g7" },
+      detectedAt: [1792820390],
+    });
+    assert(snap === null, "snapshot: a revert_probably_ours event_key ties the snapshot too");
+  }
+
+  // Mixed night: two loud rows, two probably-ours rows, one alert each.
+  {
+    const alerts = plan(["9:5", "9:6"], ["9:3", "9:4"]);
+    const groups = groupRevertAlerts(alerts);
+    assert(groups.length === 1 && groups[0].exportRevert && groups[0].probablyOurs, "group: both alerts of one report form one group (one Door43 check)");
+    const s = splitRevertRefs(["9:3", "9:4", "9:5", "9:6"], groups[0]);
+    assert(
+      same(s.exportRevertRefs, ["9:5", "9:6"]) && same(s.probablyOursRefs, ["9:3", "9:4"]) && s.split === "exact",
+      "split: mixed night -> export_revert keeps only its own refs",
+    );
+    const verdict = { status: "ok", falseRefs: ["9:3", "9:5"], realRefs: ["9:4"], unknownRefs: ["9:6"] };
+    const er = splitVerdict(verdict, s.exportRevertRefs);
+    const po = splitVerdict(verdict, s.probablyOursRefs);
+    assert(same(er.falseRefs, ["9:5"]) && same(er.unknownRefs, ["9:6"]) && er.realRefs.length === 0 && er.refs === 2, "verdict: export_revert counts only its own refs");
+    assert(same(po.falseRefs, ["9:3"]) && same(po.realRefs, ["9:4"]) && po.refs === 2, "verdict: probably-ours counts only its own refs");
+    const { loud, quiet } = revertSummaryLines([
+      { ...er, group: "export_revert", alertId: 1400, book: "EZK", resource: "ust" },
+      { ...po, group: "revert_probably_ours", alertId: 1401, book: "EZK", resource: "ust", split: s.split },
+    ]);
+    assert(loud.some((l) => l.includes("Alert 1400") && l.includes("UNDECIDED")), "summary: export_revert line in the loud section");
+    assert(
+      loud.some((l) => l.includes("1401") && l.includes("REAL") && l.includes("9:4") && /edit history missed a hand-edit/.test(l)),
+      "summary: a REAL probably-ours ref is reported in the loud section",
+    );
+    assert(quiet.some((l) => l.includes("1401") && l.includes("probably ours: 1 confirmed ours, 0 undecided, 1 REAL")), "summary: quiet probably-ours tally");
+  }
+
+  // More probably-ours refs than the record lists: the unlisted ones fall on
+  // the loud side, and the split says so.
+  {
+    const po = Array.from({ length: 302 }, (_, i) => `${10 + Math.floor(i / 40)}:${(i % 40) + 1}`);
+    const alerts = plan(["9:5"], po);
+    const s = splitRevertRefs(["9:5", ...po], groupRevertAlerts(alerts)[0]);
+    assert(s.probablyOursRefs.length === 300 && s.exportRevertRefs.length === 3, "split: >300 probably ours -> the 2 unlisted are checked under export_revert");
+    assert(/^inexact/.test(s.split), "split: truncated record list -> inexact");
+  }
+
+  // Alert count disagrees with the snapshot (e.g. an alert write failed):
+  // every row is still checked, and the split is flagged.
+  {
+    const s = splitRevertRefs(["9:3", "9:4", "9:7"], groupRevertAlerts(plan([], ["9:3", "9:4"]))[0]);
+    assert(s.probablyOursRefs.length === 3 && /^unverified/.test(s.split), "split: count mismatch -> every row checked, unverified");
+  }
+
+  // A newer report for the same pair supersedes the older group.
+  {
+    const older = plan(["9:5"], ["9:3"]);
+    const newer = plan([], ["9:3"]).map((a) => ({ ...a, id: 1500, event_key: a.event_key.replace("g7", "g8") }));
+    const groups = groupRevertAlerts([...older, ...newer]);
+    const g7 = groups.find((g) => g.generation === "g7");
+    const g8 = groups.find((g) => g.generation === "g8");
+    assert(g7.newerAlertId === 1500 && g8.newerAlertId === null, "group: an older report is superseded by a newer one of either source");
+  }
 }
 
 console.log("watchdogExportRevertCheck: all passed");
