@@ -15,8 +15,8 @@ export const DELETE_EXPORT_REVERTS_FOR_GENERATION_SQL = `DELETE FROM export_reve
                  WHERE book = ?1 AND resource = ?2 AND generation = ?3 AND observed_at = ?4)`;
 
 export const INSERT_EXPORT_REVERT_FOR_GENERATION_SQL = `INSERT OR REPLACE INTO export_reverts
-    (book, resource, ref, class, fields)
-  SELECT ?1, ?2, ?3, ?4, ?5
+    (book, resource, ref, class, fields, probably_ours)
+  SELECT ?1, ?2, ?3, ?4, ?5, ?8
    WHERE EXISTS (SELECT 1 FROM export_revert_generations
                   WHERE book = ?1 AND resource = ?2 AND generation = ?6 AND observed_at = ?7)`;
 

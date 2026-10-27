@@ -2901,6 +2901,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     entries: Array<UsfmRevertEntry | TsvRevertEntry>,
+    // #1243: the entries the lineage partition labelled probably ours; each
+    // row's probably_ours column is 1 for these, 0 for the rest.
+    probablyOurs: ReadonlySet<UsfmRevertEntry | TsvRevertEntry>,
     generation: string,
     observedAt: number,
   ): Promise<"recorded" | "superseded" | "failed"> {
@@ -2940,6 +2943,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
               "fields" in e && e.fields ? JSON.stringify(e.fields) : null,
               generation,
               observedAt,
+              probablyOurs.has(e) ? 1 : 0,
             ),
           ),
         );
@@ -3238,7 +3242,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     observedAt = Date.now(),
   ): Promise<void> {
     // #1231: export_reverts records EVERY entry, attention and probablyOurs
-    // alike; nothing is hidden there. Only the alerts below tell them apart.
+    // alike; nothing is hidden there. Each row's probably_ours column (#1243)
+    // and the alerts below tell them apart.
     const entries = [...report.attention, ...report.probablyOurs];
     if (entries.length === 0) {
       const cleared = await this.clearExportReverts(book, resource, generation, observedAt);
@@ -3249,7 +3254,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
       return;
     }
-    const recorded = await this.recordExportReverts(book, resource, entries, generation, observedAt);
+    const recorded = await this.recordExportReverts(
+      book,
+      resource,
+      entries,
+      new Set(report.probablyOurs),
+      generation,
+      observedAt,
+    );
     if (recorded === "failed") {
       // recordExportReverts already logged the underlying error; the alert
       // must not go on to claim these findings were recorded (see its own

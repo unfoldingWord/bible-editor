@@ -185,7 +185,7 @@ if (proven.length > 0) {
 //
 // #1240: the quiet `revert_probably_ours:` record of the same report is
 // checked too, in the same Door43 pass (one per report), and reported in its
-// own section. exportRevertCheck.mjs's groupRevertAlerts / splitRevertRefs say
+// own section. exportRevertCheck.mjs's groupRevertAlerts / splitRevertRows say
 // which export_reverts rows belong to which alert.
 bundle.exportReverts = [];
 const revertAlerts = (bundle.newAlerts ?? []).filter((x) =>
@@ -215,6 +215,19 @@ const revertFailed = new Set();
 if (erc && revertAlerts.length > 0 && !revertMeta) {
   for (const a of revertAlerts) revertFailed.add(String(a.source).split(":")[0]);
 }
+// #1243: export_reverts.probably_ours (migration 0079) arrives with the next
+// deploy, so the collector may run against a D1 without it. Its absence is
+// expected, not an error, so it is probed with PRAGMA rather than a SELECT
+// that would fail. Without it (or if the probe itself fails, which is an
+// error), splitRevertRows falls back to the record message parse.
+const hasProbablyOurs =
+  erc && revertMeta
+    ? Boolean(
+        step("export_reverts columns", () =>
+          q(`PRAGMA table_info(export_reverts)`).some((c) => c.name === "probably_ours"),
+        ),
+      )
+    : false;
 for (const g of erc && revertMeta ? erc.groupRevertAlerts(revertMeta) : []) {
   const { book, resource, anchor } = g;
   const res = step(`export_revert check ${anchor.id} ${book} ${resource}`, () => {
@@ -223,7 +236,9 @@ for (const g of erc && revertMeta ? erc.groupRevertAlerts(revertMeta) : []) {
     // export_reverts is a replace-all snapshot per (book, resource): its rows
     // are this report's only if no newer report for the pair exists tonight
     // and the pair's current generation is the one in the alert's event_key.
-    const rows = q(`SELECT ref, detected_at FROM export_reverts WHERE ${pair} ORDER BY id`);
+    const rows = q(
+      `SELECT ref, detected_at${hasProbablyOurs ? ", probably_ours" : ""} FROM export_reverts WHERE ${pair} ORDER BY id`,
+    );
     const [generation] = q(`SELECT generation, observed_at FROM export_revert_generations WHERE ${pair}`);
     const [sync] = q(`SELECT pushed_blob_sha, prev_pushed_blob_sha, unconfirmed_renders_json FROM book_resource_syncs WHERE ${pair}`);
     const snapshot = erc.snapshotStatus({
@@ -249,7 +264,7 @@ for (const g of erc && revertMeta ? erc.groupRevertAlerts(revertMeta) : []) {
     );
     const at = rows.map((r) => r.detected_at);
     const detectedAt = at.length ? [Math.min(...at), Math.max(...at)] : null;
-    const split = erc.splitRevertRefs(rows.map((r) => r.ref), g);
+    const split = erc.splitRevertRows(rows, g);
     return erc.splitResults(out, split, g).map((r) => ({ ...r, alertCreated: created.get(Number(r.alertId)), detectedAt }));
   });
   if (res) bundle.exportReverts.push(...res);

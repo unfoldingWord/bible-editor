@@ -17,6 +17,7 @@ import {
   snapshotStatus,
   splitResults,
   splitRevertRefs,
+  splitRevertRows,
   splitVerdict,
 } from "../../scripts/watchdog/exportRevertCheck.mjs";
 import { planRevertReportAlerts } from "./export.ts";
@@ -300,6 +301,40 @@ assert(!isOurExportSubject("bible-editor: EZKX ust → master", "EZK", "ust"), "
     const s = splitRevertRefs(["9:5", ...po], groupRevertAlerts(alerts)[0]);
     assert(s.probablyOursRefs.length === 300 && s.exportRevertRefs.length === 3, "split: >300 probably ours -> the 2 unlisted are checked under export_revert");
     assert(/^inexact/.test(s.split), "split: truncated record list -> inexact");
+  }
+
+  // #1243: rows that carry the stored probably_ours mark split by it, so a
+  // report past the record's 300-ref list is still exact.
+  {
+    const po = Array.from({ length: 302 }, (_, i) => `${10 + Math.floor(i / 40)}:${(i % 40) + 1}`);
+    const g = groupRevertAlerts(plan(["9:5"], po))[0];
+    const rows = [{ ref: "9:5", probably_ours: 0 }, ...po.map((ref) => ({ ref, probably_ours: 1 }))];
+    const s = splitRevertRows(rows, g);
+    assert(
+      same(s.exportRevertRefs, ["9:5"]) && same(s.probablyOursRefs, po) && s.split === "exact",
+      "split: >300 probably-ours rows with the stored mark -> exact, every one quiet",
+    );
+    // Rows written before the column existed read NULL: the message parse
+    // stands in, with its truncation note.
+    const old = splitRevertRows(rows.map((r) => ({ ref: r.ref, probably_ours: null })), g);
+    const legacy = splitRevertRefs(rows.map((r) => r.ref), g);
+    assert(same(old, legacy) && /^inexact/.test(old.split), "split: NULL marks (pre-migration rows) -> the message-parse fallback");
+    // Rows from a collector that did not select the column (it is not in
+    // prod yet) carry no mark at all: same fallback.
+    assert(same(splitRevertRows(rows.map((r) => ({ ref: r.ref })), g), legacy), "split: no mark selected -> the message-parse fallback");
+    // A snapshot with even one NULL is not trusted to be one run's marks.
+    const mixed = splitRevertRows([{ ref: "9:5", probably_ours: 0 }, ...po.map((ref, i) => ({ ref, probably_ours: i ? 1 : null }))], g);
+    assert(same(mixed, legacy), "split: any NULL mark -> the message-parse fallback");
+  }
+  // Marked probably ours, but the record's best-effort write is missing:
+  // those rows would have no section, so they go loud, flagged.
+  {
+    const g = groupRevertAlerts(plan(["9:5"], ["9:3"]).filter((a) => a.source.startsWith("export_revert:")))[0];
+    const s = splitRevertRows([{ ref: "9:5", probably_ours: 0 }, { ref: "9:3", probably_ours: 1 }], g);
+    assert(same(s.exportRevertRefs, ["9:5", "9:3"]) && s.probablyOursRefs.length === 0, "split: marked rows with no record -> checked under export_revert");
+    assert(/^inexact: 1 row\(s\) marked probably ours/.test(s.split), "split: marked rows with no record -> flagged inexact");
+    const t = splitRevertRows([{ ref: "9:5", probably_ours: 0 }], g);
+    assert(same(t.exportRevertRefs, ["9:5"]) && t.split === "exact", "split: attention-only marked rows, export_revert alone -> exact");
   }
 
   // A lone probably-ours record whose list is a strict subset of the snapshot

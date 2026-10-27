@@ -1410,9 +1410,10 @@ export interface RevertReportAlert {
   eventKey: string;
 }
 
-// The export_reverts rows carry no probably-ours marker, so this record alert is
-// the only place the labelling survives: list every ref (#1231 review F1), with
-// a cap only so a pathological night cannot write an unbounded message.
+// List every probably-ours ref in the record (#1231 review F1), with a cap only
+// so a pathological night cannot write an unbounded message. Since #1243 each
+// export_reverts row also stores its label (probably_ours); this list stays the
+// watchdog's fallback for rows written before that column existed.
 const PROBABLY_OURS_LISTED_REFS = 300;
 
 export function planRevertReportAlerts(p: {

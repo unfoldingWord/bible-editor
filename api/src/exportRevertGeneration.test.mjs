@@ -1,3 +1,4 @@
+import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import {
   CLAIM_EXPORT_REVERT_GENERATION_SQL,
@@ -19,7 +20,8 @@ function ok(value, message) {
 const db = new DatabaseSync(":memory:");
 db.exec(`CREATE TABLE export_reverts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, book TEXT NOT NULL, resource TEXT NOT NULL,
-  ref TEXT NOT NULL, class TEXT NOT NULL, fields TEXT, detected_at INTEGER DEFAULT 1
+  ref TEXT NOT NULL, class TEXT NOT NULL, fields TEXT, detected_at INTEGER DEFAULT 1,
+  probably_ours INTEGER
 );
 CREATE UNIQUE INDEX export_reverts_unique ON export_reverts(book,resource,ref);
 CREATE TABLE export_revert_generations (
@@ -45,8 +47,8 @@ ok(Number(claim.run("JER", "ust", "old", 100).changes) === 1, "older workflow in
 db.prepare(`INSERT INTO export_reverts(book,resource,ref,class) VALUES ('JER','ust','1:1','substantive')`).run();
 ok(Number(del.run("JER", "ust", "old", 100).changes) === 1, "older claim can clear the prior snapshot while current");
 ok(Number(claim.run("JER", "ust", "new", 200).changes) === 1, "newer workflow supersedes the older claim");
-ok(Number(insert.run("JER", "ust", "1:2", "substantive", null, "new", 200).changes) === 1, "newer workflow writes its row");
-ok(Number(insert.run("JER", "ust", "1:3", "substantive", null, "old", 100).changes) === 0, "late older insert is rejected by the generation guard");
+ok(Number(insert.run("JER", "ust", "1:2", "substantive", null, "new", 200, 0).changes) === 1, "newer workflow writes its row");
+ok(Number(insert.run("JER", "ust", "1:3", "substantive", null, "old", 100, 0).changes) === 0, "late older insert is rejected by the generation guard");
 ok(Number(del.run("JER", "ust", "old", 100).changes) === 0, "late older delete cannot erase the newer snapshot");
 ok(Number(claim.run("JER", "ust", "old", 100).changes) === 0, "older workflow cannot reclaim the pair");
 ok(current.get("JER", "ust", "new", 200)?.ok === 1, "newer generation remains authoritative");
@@ -66,6 +68,31 @@ ok(Number(record.run('deferredreward','warning','export_revert:JER:ust','new eve
   "current workflow appends its telemetry");
 ok(Number(resolve.run('deferredreward','export_revert_persistence:JER:ust',200,'JER','ust','new').changes) === 1,
   "current workflow resolves the older persistence condition");
+
+console.log("\n[#1243: the insert writes the probably-ours mark per row, against the real migrations]");
+{
+  const real = new DatabaseSync(":memory:");
+  const dir = new URL("../migrations/", import.meta.url);
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    real.exec(readFileSync(new URL(f, dir), "utf8"));
+  }
+  const cols = real.prepare("PRAGMA table_info(export_reverts)").all();
+  const col = cols.find((c) => c.name === "probably_ours");
+  ok(col && col.notnull === 0 && col.dflt_value === null, "migrations add a nullable probably_ours column with no default");
+  // A row written the old way (before the column existed) reads back NULL:
+  // the watchdog keys its message-parse fallback on that.
+  real.prepare(`INSERT INTO export_reverts(book,resource,ref,class) VALUES ('EZK','tn','1:1','substantive')`).run();
+  ok(real.prepare(`SELECT probably_ours FROM export_reverts WHERE book='EZK'`).get().probably_ours === null,
+    "a row inserted without the column reads back NULL (written before the migration)");
+  ok(Number(real.prepare(CLAIM_EXPORT_REVERT_GENERATION_SQL).run("EZK", "ust", "g1", 300).changes) === 1, "claim on the real schema");
+  const ins = real.prepare(INSERT_EXPORT_REVERT_FOR_GENERATION_SQL);
+  ok(Number(ins.run("EZK", "ust", "9:5", "substantive", null, "g1", 300, 0).changes) === 1, "attention row written");
+  ok(Number(ins.run("EZK", "ust", "9:3", "formatting", null, "g1", 300, 1).changes) === 1, "probably-ours row written");
+  const marks = Object.fromEntries(
+    real.prepare(`SELECT ref, probably_ours FROM export_reverts WHERE book='EZK' AND resource='ust'`).all().map((r) => [r.ref, r.probably_ours]),
+  );
+  ok(marks["9:5"] === 0 && marks["9:3"] === 1, "the insert stores 0 for attention and 1 for probably ours");
+}
 
 if (failed) process.exitCode = 1;
 else console.log("exportRevertGeneration.test.mjs: all assertions passed");
