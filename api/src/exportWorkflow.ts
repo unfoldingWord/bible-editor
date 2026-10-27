@@ -120,7 +120,7 @@ import {
   staleBaseOverrideAllowed,
   classifyReimportOutcome,
 } from "./reimportSyncGate";
-import { readSyncWithhold, staleSkipRemedy } from "./syncWithholds";
+import { readSyncWithhold, staleSkipAlertMessage } from "./syncWithholds";
 import { lockedBooksIn } from "./bookLock";
 import {
   PUBLISHED_RELEASE_TAG,
@@ -1063,7 +1063,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // to R2 only and can't clobber anything.
     const fresh = dcsAllowed ? await this.checkMasterFreshness(book, resource) : { ok: true as const, detail: "dry", masterSha: null, watermark: null, headIsOurExport: false };
     if (!fresh.ok) {
-      await this.recordStaleSkipAlert(book, resource, fresh.masterSha, fresh.watermark, instanceId);
+      await this.recordStaleSkipAlert(book, resource, fresh.detail, fresh.masterSha, fresh.watermark, instanceId);
       const reason = `stale_master:${fresh.detail}`;
       await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
       return {
@@ -2402,10 +2402,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // moments earlier in this instance persisted it (bookReimport.ts,
   // syncWithholds.ts) — and states that measured cause instead. Absent a
   // recorded reason, says so rather than guessing one (staleSkipRemedy's `null`
-  // branch).
+  // branch). Issue #1237: a skip because Door43 did not answer
+  // (`master_sha_unknown`) says that, not "D1 is behind" (staleSkipAlertMessage).
   private async recordStaleSkipAlert(
     book: string,
     resource: Resource,
+    detail: string,
     masterSha: string | null,
     watermark: string | null,
     instanceId: string,
@@ -2415,10 +2417,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // a mismatched instanceId (a stale row from a previous night) must read
     // as "no reason recorded", not as tonight's measured cause.
     const withhold = await readSyncWithhold(this.env, book, resource, instanceId);
-    const message =
-      `Benjamin — nightly export skipped ${book} ${resource.toUpperCase()} to avoid reverting master ` +
-      `(D1 is behind: master ${(masterSha ?? "unknown").slice(0, 8)} vs synced ${(watermark ?? "none").slice(0, 8)}). ` +
-      staleSkipRemedy(withhold);
+    const message = staleSkipAlertMessage(book, resource, detail, masterSha, watermark, withhold);
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 

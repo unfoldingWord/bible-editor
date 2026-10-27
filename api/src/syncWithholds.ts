@@ -212,3 +212,36 @@ export function staleSkipRemedy(withhold: SyncWithhold | null): string {
   const n = withhold.count > 0 ? `${withhold.count} ` : "";
   return REASON_TEXT[withhold.reason](n);
 }
+
+/**
+ * The whole export_stale banner text. `detail` is checkMasterFreshness's
+ * measured outcome (exportWorkflow.ts). Only `master_ahead` measured master
+ * past the watermark; `master_sha_unknown` means Door43 did not answer, so
+ * saying "D1 is behind" there asserts what nobody measured (issue #1237:
+ * ECC/EZK/ISA UST 2026-10-27, whose master heads all equalled the watermark).
+ * A withhold this run recorded is still a measured cause and is still named.
+ */
+export function staleSkipAlertMessage(
+  book: string,
+  resource: string,
+  detail: string,
+  masterSha: string | null,
+  watermark: string | null,
+  withhold: SyncWithhold | null,
+): string {
+  const res = resource.toUpperCase();
+  if (detail === "master_sha_unknown") {
+    return (
+      `Benjamin — nightly export skipped ${book} ${res}: Door43 did not answer when asked for master's latest ` +
+      `commit for this file (synced ${(watermark ?? "none").slice(0, 8)}), so the export could not confirm ` +
+      `master had not moved and did not push. The app may well be current; its edits stay in the app and the ` +
+      `next nightly export retries on its own.` +
+      (withhold ? ` ${staleSkipRemedy(withhold)}` : "")
+    );
+  }
+  return (
+    `Benjamin — nightly export skipped ${book} ${res} to avoid reverting master ` +
+    `(D1 is behind: master ${(masterSha ?? "unknown").slice(0, 8)} vs synced ${(watermark ?? "none").slice(0, 8)}). ` +
+    staleSkipRemedy(withhold)
+  );
+}
