@@ -267,7 +267,8 @@ admin.get("/merge-flags", async (c) => {
 // written by exportWorkflow.ts's recordExportRevertReport and
 // bookReimport.ts's kept-over-Door43 measurement for a night's
 // "shipped to Door43 and overwrote master's content" / mechanical-overwrite /
-// app-kept-at-scale records. These are non-blocking and need no human decision, so
+// probably-our-own-work (revert_probably_ours, #1231) / app-kept-at-scale
+// records. These are non-blocking and need no human decision, so
 // GET /api/alerts/me deliberately excludes them (kind != 'review') — this is
 // their only home. Deliberately NOT filtered by dismissed_at: this is a log
 // of what happened, not a to-do list, so a dismissed row (dismissal only

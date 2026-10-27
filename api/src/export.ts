@@ -14,6 +14,7 @@ import { renderOccurrence } from "./occurrenceRule.ts";
 import type { UsfmValidationIssue, UsfmValidationRule } from "./usfmValidate.ts";
 import { findOverlappingRanges, VerseRangeOverlapError } from "./verseBridge.ts";
 import type { LockedPush } from "./verseMergeEditorAlerts.ts";
+import { masterMayHoldHumanEditForVerse, parseTsvRefColumn, type MasterLineageSummary } from "./masterLineage.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
 
@@ -1253,6 +1254,232 @@ export function tsvRevertReport(
     entries.push({ ref, class: "substantive", fields: diffFields });
   }
   return { entries, totalRows: master.size };
+}
+
+// ── Partitioning the revert report by master's measured lineage (#1231) ───
+//
+// The per-row base above is our LAST push. When that push never merged,
+// master never held it, so every verse our translators changed between the
+// render master last held and that push reads as "master moved here" (EZK
+// UST, alert 1327: 11 false rows). Adding more of our renders as bases was
+// tried in #1232 and rejected: it can hide a person's revert to older text,
+// and still false-alarms on merged-but-unconfirmed renders.
+//
+// Instead, ask the lineage the nightly sync already measured and persisted
+// (book_resource_syncs.master_lineage_*, written by bookReimport.ts's
+// persistMasterLineage): which verses did a person touch on master since it
+// was last confirmed holding our render? A reported row whose ref no person
+// touched most likely holds our own render's text, so overwriting it loses
+// nothing.
+//
+// Option B on #1231 (Benjamin's decision): nothing is dropped. Every row is
+// still recorded in export_reverts; the partition only decides which rows the
+// loud export_revert / mechanical_overwrite alerts name (`attention`) and
+// which go into one quiet record alert (`probablyOurs`). Option A (#1234)
+// dropped the probablyOurs rows and was rejected: the report is the one check
+// independent of the lineage the verse merge also trusts, so a lineage blind
+// spot must still leave a visible record.
+//
+// USFM only (ult/ust). TSV (tn/tq/twl) rows all stay in `attention`, because
+// a TSV row's Reference can move: a row a person edited at 5:2 that a later
+// commit of ours moved to 5:3 reports under 5:3, which is not in humanRefs,
+// and would be mislabelled ours (Codex F2 on #1234). Keying TSV by row ID
+// would fix that and is not done here.
+//
+// The partition runs only when ALL of these hold; anything else puts every
+// row in `attention` (today's full report):
+//   - the lineage parses as an object, its walk is complete
+//     (`incomplete === false`), it found a human commit
+//     (`hasHumanCommit` and `mayHoldHumanEdit` both true), and every human
+//     commit was mapped to refs (`refsComplete === true`). A window with NO
+//     human commit persists `refsComplete: false` by construction, so it keeps
+//     the full report too; that is the conservative direction.
+//   - `counts.ai === 0`: only human commits are mapped to refs, so an AI
+//     pipeline push in the window could have moved any verse unmeasured.
+//   - `master_lineage_sha` equals the master commit the report diffs against
+//     (`fresh.masterSha`, the file head the master text was fetched at). Both
+//     must be non-empty strings: two nulls are not a match.
+//   - `master_lineage_confirmed_at` equals master_confirmed_at as read before
+//     tonight's push, so the walk covers the window back to the render master
+//     was last confirmed holding. Both must be finite numbers.
+//
+// Per row, refs are expanded with masterLineage.ts's own parseTsvRefColumn
+// (USFM "3:14-15" bridges included) and the row needs attention if any verse
+// may hold a human edit (masterMayHoldHumanEditForVerse, which itself fails
+// closed on a malformed ref set). A ref that will not parse needs attention.
+//
+// Known limit: an `ours` commit is trusted to carry our own render. A person
+// who edited our `-be-` branch before it merged is hidden inside our squash
+// commit; that hazard is shared with every other lineage reader here.
+export interface StoredMasterLineage {
+  json: string | null;
+  sha: string | null;
+  confirmedAt: number | null;
+}
+
+export interface RevertLineagePartition<E> {
+  /** Rows a person may have touched, or every row when the lineage is unusable. */
+  attention: E[];
+  /** Rows the lineage shows no person touched: most likely our own work. */
+  probablyOurs: E[];
+  partitioned: boolean;
+  /** Why the partition did not run, for the log. Empty when it ran. */
+  reason: string;
+}
+
+function usableRevertLineage(
+  masterLineage: StoredMasterLineage | null,
+  current: { masterSha: string | null; confirmedAt: number | null },
+): { lineage: MasterLineageSummary | null; reason: string } {
+  if (masterLineage == null || masterLineage.json == null) return { lineage: null, reason: "no_lineage" };
+  const { sha, confirmedAt } = masterLineage;
+  if (typeof sha !== "string" || sha.length === 0 || typeof current.masterSha !== "string" || current.masterSha.length === 0) {
+    return { lineage: null, reason: "sha_unknown" };
+  }
+  if (sha !== current.masterSha) return { lineage: null, reason: "lineage_stale" };
+  if (
+    typeof confirmedAt !== "number" ||
+    !Number.isFinite(confirmedAt) ||
+    typeof current.confirmedAt !== "number" ||
+    !Number.isFinite(current.confirmedAt)
+  ) {
+    return { lineage: null, reason: "confirmed_unknown" };
+  }
+  if (confirmedAt !== current.confirmedAt) return { lineage: null, reason: "confirmed_moved" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(masterLineage.json);
+  } catch {
+    return { lineage: null, reason: "unparseable" };
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return { lineage: null, reason: "unparseable" };
+  const l = parsed as Partial<MasterLineageSummary>;
+  if (l.incomplete !== false) return { lineage: null, reason: "incomplete" };
+  if (l.hasHumanCommit !== true || l.mayHoldHumanEdit !== true) return { lineage: null, reason: "no_human_refs" };
+  if (l.refsComplete !== true || !Array.isArray(l.humanRefs) || l.humanRefs.length === 0) {
+    return { lineage: null, reason: "refs_incomplete" };
+  }
+  // masterMayHoldHumanEditForVerse would keep every row on a malformed set
+  // anyway; refusing here makes the log say so instead of "narrowed".
+  if (!l.humanRefs.every((r) => typeof r === "string" && /^\d+:(?:\d+|\*)$/.test(r))) {
+    return { lineage: null, reason: "refs_malformed" };
+  }
+  const ai = (l.counts as { ai?: unknown } | undefined)?.ai;
+  if (typeof ai !== "number" || ai !== 0) return { lineage: null, reason: "ai_commit_or_unknown" };
+  return { lineage: l as MasterLineageSummary, reason: "" };
+}
+
+export function partitionRevertEntriesByLineage<E extends { ref: string }>(
+  entries: E[],
+  kind: "usfm" | "tsv",
+  masterLineage: StoredMasterLineage | null,
+  current: { masterSha: string | null; confirmedAt: number | null },
+): RevertLineagePartition<E> {
+  // TSV References can move between commits; see the header comment.
+  if (kind === "tsv") return { attention: entries, probablyOurs: [], partitioned: false, reason: "tsv_not_partitioned" };
+  const { lineage, reason } = usableRevertLineage(masterLineage, current);
+  if (lineage === null) return { attention: entries, probablyOurs: [], partitioned: false, reason };
+  const attention: E[] = [];
+  const probablyOurs: E[] = [];
+  for (const e of entries) {
+    const keys = typeof e.ref === "string" ? parseTsvRefColumn(e.ref) : null;
+    const touched =
+      keys === null ||
+      keys.some((key) => {
+        const [c, v] = key.split(":").map(Number);
+        return masterMayHoldHumanEditForVerse(lineage, c, v);
+      });
+    (touched ? attention : probablyOurs).push(e);
+  }
+  return { attention, probablyOurs, partitioned: true, reason: "" };
+}
+
+// The alerts one export-revert report writes, as data so the choice is
+// testable. exportWorkflow.ts's recordExportRevertReport writes them after
+// every entry, attention and probablyOurs alike, is recorded in
+// export_reverts. The loud alerts (export_revert, mechanical_overwrite) are
+// built from `attention` only, so a night whose every row is probablyOurs
+// writes neither. probablyOurs gets one quiet record alert of its own, whose
+// source must not start with `export_revert`: the sync watchdog
+// (scripts/watchdog/collect.mjs) checks every `export_revert:` alert against
+// Door43.
+export interface RevertReportAlert {
+  source: string;
+  message: string;
+  severity: "warning" | "info";
+  eventKey: string;
+}
+
+// The export_reverts rows carry no probably-ours marker, so this record alert is
+// the only place the labelling survives: list every ref (#1231 review F1), with
+// a cap only so a pathological night cannot write an unbounded message.
+const PROBABLY_OURS_LISTED_REFS = 300;
+
+export function planRevertReportAlerts(p: {
+  book: string;
+  resource: Resource;
+  kind: "usfm" | "tsv";
+  attention: Array<UsfmRevertEntry | TsvRevertEntry>;
+  probablyOurs: Array<UsfmRevertEntry | TsvRevertEntry>;
+  mechanical: boolean;
+  branch: string;
+  generation: string;
+}): RevertReportAlert[] {
+  const { book, resource, kind, attention, probablyOurs, mechanical, branch, generation } = p;
+  const label = `${book} ${resource.toUpperCase()}`;
+  const sample = (list: Array<{ ref: string }>, n = 10) =>
+    `${list.slice(0, n).map((e) => e.ref).join(", ")}${list.length > n ? ` (+${list.length - n} more)` : ""}`;
+  const out: RevertReportAlert[] = [];
+  if (attention.length > 0) {
+    const byClass = new Map<string, number>();
+    for (const e of attention) byClass.set(e.class, (byClass.get(e.class) ?? 0) + 1);
+    const breakdown = [...byClass.entries()].map(([cls, n]) => `${n} ${cls}`).join(", ");
+    const severity =
+      kind === "usfm"
+        ? classifyRevertSeverity(attention as UsfmRevertEntry[], [])
+        : classifyRevertSeverity([], attention as TsvRevertEntry[]);
+    const escalateNote = severity.escalate
+      ? ` This is a larger-than-usual number of reverts for one export (${severity.reason}).`
+      : "";
+    out.push({
+      source: `export_revert:${book}:${resource}`,
+      message:
+        `${label} shipped to Door43 and overwrote master's current content on ${attention.length} row(s)/verse(s) ` +
+        `(${breakdown}): ${sample(attention)}.${escalateNote} This does not block ` +
+        `the export; it is a record of what changed on master, in case a hand-edit there was lost.`,
+      severity: "warning",
+      eventKey: `${generation}:export_revert:${book}:${resource}`,
+    });
+    // "mechanical" means no HUMAN contributor was recorded for this
+    // book+resource since the last export; see mechanicalOverwriteAlert's
+    // comment for what that does and does not prove. Distinct `source` so it
+    // never collides with the export_revert alert above.
+    const mechAlert =
+      kind === "usfm"
+        ? mechanicalOverwriteAlert(mechanical, attention as UsfmRevertEntry[], [])
+        : mechanicalOverwriteAlert(mechanical, [], attention as TsvRevertEntry[]);
+    if (mechAlert.alert) {
+      out.push({
+        source: `mechanical_overwrite:${book}:${resource}`,
+        message: `${label}: ${mechAlert.reason} Branch \`${branch}\`, first refs: ${sample(attention)}. This does not block the export.`,
+        severity: "warning",
+        eventKey: `${generation}:mechanical_overwrite:${book}:${resource}`,
+      });
+    }
+  }
+  if (probablyOurs.length > 0) {
+    out.push({
+      source: `revert_probably_ours:${book}:${resource}`,
+      message:
+        `${label}: tonight's export replaced master's text on ${probablyOurs.length} verse(s) that are most likely ` +
+        `our translators' own work, not a lost hand-edit: ${sample(probablyOurs, PROBABLY_OURS_LISTED_REFS)}. The stored Door43 edit history ` +
+        `shows no person touched these verses since master last held our export. They are included in tonight's ` +
+        `export-revert records for ${label}; nothing to do unless you expected a hand-edit at one of them.`,
+      severity: "info",
+      eventKey: `${generation}:revert_probably_ours:${book}:${resource}`,
+    });
+  }
+  return out;
 }
 
 const LINEAGE_FIELDS: Record<"tn" | "tq", Array<[string, string]>> = {
