@@ -29,7 +29,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { staleSkipRemedy, recordSyncWithhold, clearSyncWithhold, readSyncWithhold } from "./syncWithholds.ts";
+import { staleSkipRemedy, staleSkipAlertMessage, recordSyncWithhold, clearSyncWithhold, readSyncWithhold } from "./syncWithholds.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -281,6 +281,31 @@ function freshEnv() {
   const env = freshEnv();
   await recordSyncWithhold(env, "JER", "ult", "chapters_locked", 1, 1_700_000_000_000, "run-A");
   eq(await readSyncWithhold(env, "JER", "ust", "run-A"), null, "a withhold on ult does not leak onto ust");
+}
+
+console.log("\n[staleSkipAlertMessage]");
+{
+  // Issue #1237 (ECC UST 2026-10-27): Door43 did not answer the head-commit
+  // read, master was in fact at the watermark, yet the banner said "D1 is
+  // behind" twice. The unknown case must not claim it.
+  const unknown = staleSkipAlertMessage("ECC", "ust", "master_sha_unknown", null, "3be0b831606bf795", null);
+  eq(/behind/i.test(unknown), false, "master_sha_unknown does not say D1 is behind");
+  eq(unknown.includes("from Door43 failed"), true, "master_sha_unknown names the failed Door43 read");
+  eq(unknown.includes("next nightly export retries"), true, "master_sha_unknown says the next export retries");
+  eq(unknown.includes("If this repeats"), true, "master_sha_unknown says what a repeat means (a 401/404 never self-heals)");
+  eq(unknown.includes("synced 3be0b831"), true, "master_sha_unknown keeps the watermark short sha");
+  eq(unknown.includes("recorded no reason"), false, "master_sha_unknown with no withhold adds no remedy sentence");
+  const withWithhold = staleSkipAlertMessage("ECC", "ust", "master_sha_unknown", null, "3be0b831", withhold({ reason: "chapters_locked", count: 2 }));
+  eq(withWithhold.endsWith(staleSkipRemedy(withhold({ reason: "chapters_locked", count: 2 }))), true, "a withhold recorded this run is still named");
+  eq(/edits stay in the app|retries/.test(withWithhold), false, "with a withhold, no reassurance contradicts it");
+
+  // master_ahead keeps the measured "behind" text, byte for byte as before.
+  eq(
+    staleSkipAlertMessage("JER", "ult", "master_ahead", "aaaaaaaabbbb", "ccccccccdddd", null),
+    "Benjamin — nightly export skipped JER ULT to avoid reverting master (D1 is behind: master aaaaaaaa vs synced cccccccc). " +
+      staleSkipRemedy(null),
+    "master_ahead text is unchanged",
+  );
 }
 
 if (failed > 0) {

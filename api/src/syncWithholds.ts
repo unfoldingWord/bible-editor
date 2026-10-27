@@ -212,3 +212,41 @@ export function staleSkipRemedy(withhold: SyncWithhold | null): string {
   const n = withhold.count > 0 ? `${withhold.count} ` : "";
   return REASON_TEXT[withhold.reason](n);
 }
+
+/**
+ * The whole export_stale banner text. `detail` is checkMasterFreshness's
+ * measured outcome (exportWorkflow.ts). Only `master_ahead` measured master
+ * past the watermark; `master_sha_unknown` means the head read failed, so
+ * saying "D1 is behind" there asserts what nobody measured (issue #1237:
+ * ECC/EZK/ISA UST 2026-10-27, whose master heads all equalled the watermark).
+ * A withhold this run recorded is still a measured cause and is still named.
+ */
+export function staleSkipAlertMessage(
+  book: string,
+  resource: string,
+  detail: string,
+  masterSha: string | null,
+  watermark: string | null,
+  withhold: SyncWithhold | null,
+): string {
+  const res = resource.toUpperCase();
+  if (detail === "master_sha_unknown") {
+    const head =
+      `Benjamin — nightly export skipped ${book} ${res}: reading master's latest commit for this file from ` +
+      `Door43 failed (no answer, an error status, or an unreadable reply; synced ` +
+      `${(watermark ?? "none").slice(0, 8)}), so the export could not confirm master had not moved and did not push.`;
+    // A withhold this run recorded is the measured cause of any lag; the
+    // "retries" reassurance would contradict it.
+    if (withhold) return `${head} ${staleSkipRemedy(withhold)}`;
+    return (
+      `${head} The edits stay in the app and the next nightly export retries. If this repeats night after night, ` +
+      `Door43 is answering with an error, not just slow: check the service token, and whether the file was moved ` +
+      `or removed on master.`
+    );
+  }
+  return (
+    `Benjamin — nightly export skipped ${book} ${res} to avoid reverting master ` +
+    `(D1 is behind: master ${(masterSha ?? "unknown").slice(0, 8)} vs synced ${(watermark ?? "none").slice(0, 8)}). ` +
+    staleSkipRemedy(withhold)
+  );
+}
