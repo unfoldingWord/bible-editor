@@ -209,7 +209,7 @@ const revertMeta =
             WHERE id IN (${revertAlerts.map((a) => Number(a.id)).join(",")}) ORDER BY id`),
       )
     : null;
-const created = new Map(revertAlerts.map((a) => [a.id, a.created]));
+const created = new Map(revertAlerts.map((a) => [Number(a.id), a.created]));
 // Which summary section(s) a failed step leaves unchecked.
 const revertFailed = new Set();
 if (erc && revertAlerts.length > 0 && !revertMeta) {
@@ -250,19 +250,7 @@ for (const g of erc && revertMeta ? erc.groupRevertAlerts(revertMeta) : []) {
     const at = rows.map((r) => r.detected_at);
     const detectedAt = at.length ? [Math.min(...at), Math.max(...at)] : null;
     const split = erc.splitRevertRefs(rows.map((r) => r.ref), g);
-    return [
-      [g.exportRevert, split.exportRevertRefs],
-      [g.probablyOurs, split.probablyOursRefs],
-    ]
-      .filter(([a]) => a)
-      .map(([a, refs]) => ({
-        ...erc.splitVerdict(out, refs),
-        group: a.group,
-        alertId: a.id,
-        split: split.split,
-        alertCreated: created.get(a.id),
-        detectedAt,
-      }));
+    return erc.splitResults(out, split, g).map((r) => ({ ...r, alertCreated: created.get(Number(r.alertId)), detectedAt }));
   });
   if (res) bundle.exportReverts.push(...res);
   else for (const a of [g.exportRevert, g.probablyOurs]) if (a) revertFailed.add(a.group);

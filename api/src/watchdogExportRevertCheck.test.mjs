@@ -15,6 +15,7 @@ import {
   renderPinStatus,
   revertSummaryLines,
   snapshotStatus,
+  splitResults,
   splitRevertRefs,
   splitVerdict,
 } from "../../scripts/watchdog/exportRevertCheck.mjs";
@@ -301,12 +302,27 @@ assert(!isOurExportSubject("bible-editor: EZKX ust → master", "EZK", "ust"), "
     assert(/^inexact/.test(s.split), "split: truncated record list -> inexact");
   }
 
-  // A lone alert owns every row: no count comparison, so no false
-  // "unverified" note.
+  // A lone probably-ours record whose list is a strict subset of the snapshot
+  // (its report's export_revert alert write failed): the unlisted row goes
+  // loud, and the split is flagged (#1240 review round 2, A1).
   {
-    const s = splitRevertRefs(["9:3", "9:4", "9:7"], groupRevertAlerts(plan([], ["9:3", "9:4"]))[0]);
-    assert(s.probablyOursRefs.length === 3 && s.split === "exact", "split: lone alert -> every row, exact without a count check");
+    const g = groupRevertAlerts(plan([], ["9:3", "9:4"]))[0];
+    const s = splitRevertRefs(["9:3", "9:4", "9:7"], g);
+    assert(same(s.probablyOursRefs, ["9:3", "9:4"]) && same(s.exportRevertRefs, ["9:7"]), "split: lone record -> only its listed refs are quiet");
+    assert(/^unverified/.test(s.split), "split: lone record count below the snapshot -> unverified");
+    const res = splitResults({ status: "ok", falseRefs: ["9:3", "9:4"], realRefs: ["9:7"], unknownRefs: [] }, s, g);
+    const er = res.find((r) => r.group === "export_revert");
+    assert(er && er.alertId === null && same(er.realRefs, ["9:7"]), "results: unlisted rows get an export_revert entry with no alert id");
+    const { loud } = revertSummaryLines(res.map((r) => ({ ...r, book: "EZK", resource: "ust" })));
+    assert(
+      loud.some((l) => l.includes("not in probably-ours record 1400") && l.includes("no export_revert alert found") && l.includes("REAL")),
+      "summary: unlisted rows of a lone record are reported in the loud section",
+    );
+    const t = splitRevertRefs(["9:5", ...Array.from({ length: 301 }, (_, i) => `${10 + Math.floor(i / 40)}:${(i % 40) + 1}`)], groupRevertAlerts(plan([], Array.from({ length: 301 }, (_, i) => `${10 + Math.floor(i / 40)}:${(i % 40) + 1}`)))[0]);
+    assert(t.exportRevertRefs.length === 2 && /^unverified/.test(t.split), "split: lone truncated record -> unlisted rows loud, flagged");
   }
+  // A lone export_revert alert owns every row with no count check (F1);
+  // see the TSV case below.
 
   // Mixed USFM night whose counts disagree with the snapshot: every row is
   // still checked, and the split is flagged.
@@ -356,6 +372,17 @@ assert(!isOurExportSubject("bible-editor: EZKX ust → master", "EZK", "ust"), "
     const g7 = groups.find((g) => g.generation === "g7");
     const g8 = groups.find((g) => g.generation === "g8");
     assert(g7.newerAlertId === 1500 && g8.newerAlertId === null, "group: an older report is superseded by a newer one of either source");
+  }
+
+  // A newer alert whose event_key does not parse supersedes nothing (A2).
+  {
+    const valid = plan(["9:5"], ["9:3"]);
+    const bad = { ...valid[0], id: 1600, event_key: "garbage" };
+    const groups = groupRevertAlerts([...valid, bad]);
+    const g7 = groups.find((g) => g.generation === "g7");
+    const junk = groups.find((g) => g.generation === null);
+    assert(g7.newerAlertId === null, "group: a malformed newer alert does not supersede a valid report");
+    assert(junk && junk.newerAlertId === null && snapshotStatus({ alert: junk.anchor, book: "EZK", resource: "ust", newerAlertId: null, generation: { generation: "g7" }, detectedAt: [1792820390] }) === "snapshot_generation_mismatch", "group: the malformed alert's own group fails the snapshot tie");
   }
 }
 
