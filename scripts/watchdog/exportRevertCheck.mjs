@@ -18,7 +18,8 @@
 // failure) makes the ref UNKNOWN, never false.
 //
 // Pure parts (classifyExportRevertRefs, pickExportCommits, snapshotStatus,
-// knownRenderShas) have unit tests in api/src/watchdogExportRevertCheck.test.mjs.
+// knownRenderShas, and the #1240 groupRevertAlerts / splitRevertRefs /
+// splitVerdict / revertSummaryLines) have unit tests in api/src/watchdogExportRevertCheck.test.mjs.
 // The Door43 fetches are thin synchronous curl wrappers so collect.mjs's
 // synchronous step() can call them.
 import { execFileSync } from "node:child_process";
@@ -155,13 +156,16 @@ const SNAPSHOT_AFTER_ALERT_S = 2 * 60;
 // Pure: is the current export_reverts snapshot for (book, resource) provably
 // the one this alert reported? null = yes; otherwise the status to report
 // (every ref unknown).
-//   alert          {id, eventKey, createdAtS}
+//   alert          {id, eventKey, createdAtS, group?}; group is the alert's
+//                  source prefix, 'export_revert' (default) or
+//                  'revert_probably_ours' (#1240)
 //   newerAlertId   id of a newer alert for the same pair in this run, or null
 //   generation     export_revert_generations row {generation} for the pair, or null
 //   detectedAt     detected_at of every snapshot row
 export function snapshotStatus({ alert, book, resource, newerAlertId, generation, detectedAt }) {
   if (newerAlertId != null) return "superseded_snapshot";
-  if (!generation || alert.eventKey !== `${generation.generation}:export_revert:${book}:${resource}`) {
+  const group = alert.group ?? "export_revert";
+  if (!generation || alert.eventKey !== `${generation.generation}:${group}:${book}:${resource}`) {
     return "snapshot_generation_mismatch";
   }
   if (detectedAt.length === 0) return "no_snapshot_rows";
@@ -196,6 +200,218 @@ export function renderPinStatus({ exportBlobSha, prevBlobSha, pushedBlobSha, kno
   if (!knownRenders.has(prevBlobSha)) return "prev_not_our_render";
   if (prevBlobSha === exportBlobSha) return "prev_is_this_render";
   return null;
+}
+
+// ── export_revert vs revert_probably_ours (#1240) ───────────────────────────
+// Since #1231 one export-revert report writes up to two record alerts that
+// share a generation (planRevertReportAlerts, export.ts): `export_revert:` for
+// rows a person may have hand-edited, and a quiet `revert_probably_ours:` for
+// rows the stored edit history says no person touched. export_reverts holds
+// every row of both with no marker column, so the split comes from the alerts:
+//   - only one alert: every row belongs to it;
+//   - both: the probably-ours record lists its refs (up to
+//     PROBABLY_OURS_LISTED_REFS, then "(+K more)"); the rest are export_revert's.
+// Each side's "on N ..." count is checked against the snapshot. Any shortfall
+// flags the split and puts the doubtful rows on the export_revert (loud)
+// side. Every row gets the same Door43 proof either way; the split only
+// decides which section of the summary reports it.
+export const REVERT_ALERT_GROUPS = ["export_revert", "revert_probably_ours"];
+
+// {group, book, resource} for a `<group>:<BOOK>:<res>` source, else null.
+export function revertAlertSource(source) {
+  const [group, book, resource] = String(source ?? "").split(":");
+  return REVERT_ALERT_GROUPS.includes(group) && book && resource ? { group, book, resource } : null;
+}
+
+// Pure: one group per export-revert report. `alerts` are system_alerts rows
+// {id, source, event_key, created_at, message}; other sources are ignored.
+// A report is the alerts of one pair whose event_key carries the same
+// generation; an alert whose event_key does not parse is a group of its own
+// (snapshotStatus then calls it a mismatch). `anchor` is the alert the
+// snapshot tie is checked against (export_revert when present).
+// `newerAlertId` is the newest alert of a LATER report for the pair, so either
+// source supersedes.
+export function groupRevertAlerts(alerts) {
+  const groups = new Map();
+  for (const a of alerts) {
+    const src = revertAlertSource(a.source);
+    if (!src) continue;
+    const { group, book, resource } = src;
+    const suffix = `:${group}:${book}:${resource}`;
+    const eventKey = a.event_key ?? null;
+    const generation = typeof eventKey === "string" && eventKey.endsWith(suffix) ? eventKey.slice(0, -suffix.length) : null;
+    const key = generation !== null ? `${book}:${resource}:${generation}` : `id:${a.id}`;
+    if (!groups.has(key)) groups.set(key, { book, resource, generation, exportRevert: null, probablyOurs: null });
+    const g = groups.get(key);
+    const alert = { id: a.id, group, eventKey, createdAtS: Number(a.created_at), message: String(a.message ?? "") };
+    const slot = group === "export_revert" ? "exportRevert" : "probablyOurs";
+    if (!g[slot] || g[slot].id < a.id) g[slot] = alert;
+  }
+  const out = [...groups.values()].map((g) => ({ ...g, anchor: g.exportRevert ?? g.probablyOurs }));
+  const ids = (g) => [g.exportRevert?.id, g.probablyOurs?.id].filter((x) => x != null);
+  // Only a report whose event_key parsed may supersede another: a malformed
+  // alert proves nothing about which report the snapshot belongs to, so it
+  // must not cancel a valid report's Door43 proof. Its own group still fails
+  // the snapshot tie (snapshotStatus), so it never yields a verdict.
+  for (const g of out) {
+    const top = Math.max(...ids(g));
+    const later = out
+      .filter((o) => o !== g && o.generation !== null && o.book === g.book && o.resource === g.resource)
+      .flatMap(ids)
+      .filter((id) => id > top);
+    g.newerAlertId = later.length ? Math.max(...later) : null;
+  }
+  return out;
+}
+
+// "… overwrote master's current content on N row(s)/verse(s) …"
+function exportRevertCount(message) {
+  const m = message.match(/ on (\d+) row\(s\)\/verse\(s\) /);
+  return m ? Number(m[1]) : null;
+}
+
+// "… replaced master's text on N verse(s) that are … not a lost hand-edit:
+// <ref>, <ref> (+K more). The stored Door43 edit history …"
+// {count, refs, unlisted}, or null when the wording does not match.
+function probablyOursList(message) {
+  const m = message.match(/ on (\d+) verse\(s\) that .*?not a lost hand-edit: (.*?)\. The stored Door43 edit history /s);
+  if (!m) return null;
+  let list = m[2];
+  let unlisted = 0;
+  const more = list.match(/ \(\+(\d+) more\)$/);
+  if (more) {
+    unlisted = Number(more[1]);
+    list = list.slice(0, -more[0].length);
+  }
+  return { count: Number(m[1]), refs: list ? list.split(", ") : [], unlisted };
+}
+
+// Pure: split the snapshot's refs between a group's two alerts. Returns
+// {exportRevertRefs, probablyOursRefs, split}; split is "exact", or
+// "inexact: …" / "unverified: …" with the reason.
+//
+// A lone export_revert alert owns every row by construction, so no count is
+// compared there: export_reverts is UNIQUE(book, resource, ref) and a TSV
+// Reference often carries several tn rows, so a TSV alert's "on N row(s)"
+// routinely exceeds the snapshot's row count (#1240 review F1).
+//
+// A probably-ours record is never trusted to own rows it does not list, even
+// alone: writeAlert is best-effort, so the export_revert alert of the same
+// report can be missing while the record landed. Its listed refs go quiet and
+// every other row goes to the export_revert (loud) side, which collect.mjs
+// reports even with no export_revert alert to name.
+//
+// Counts are compared for USFM only, where one verse ref is one entry;
+// export.ts partitions USFM only (tsv_not_partitioned), so a probably-ours
+// record on a TSV resource is not expected, and if one appears its counts are
+// not comparable.
+export function splitRevertRefs(rowRefs, group) {
+  const rows = [...new Set(rowRefs)];
+  if (!group.probablyOurs) return { exportRevertRefs: rows, probablyOursRefs: [], split: "exact" };
+  const po = probablyOursList(group.probablyOurs.message);
+  if (po === null) {
+    return { exportRevertRefs: rows, probablyOursRefs: [], split: "unverified: the probably-ours record's ref list did not parse" };
+  }
+  const erCount = group.exportRevert ? exportRevertCount(group.exportRevert.message) : 0;
+  const usfm = group.resource === "ult" || group.resource === "ust";
+  const countMismatch =
+    !usfm || (erCount !== null && erCount + po.count === rows.length)
+      ? null
+      : `unverified: alerts name ${erCount ?? "?"} export_revert${group.exportRevert ? "" : " (no alert found)"} + ${po.count} probably-ours row(s), snapshot has ${rows.length}`;
+  const inRows = new Set(rows);
+  const listed = new Set(po.refs.filter((r) => inRows.has(r)));
+  const split =
+    countMismatch ??
+    (listed.size !== po.refs.length
+      ? `unverified: ${po.refs.length - listed.size} listed probably-ours ref(s) not in the snapshot`
+      : po.unlisted > 0
+        ? `inexact: ${po.unlisted} probably-ours ref(s) not listed in the record, checked under export_revert`
+        : "exact");
+  return { exportRevertRefs: rows.filter((r) => !listed.has(r)), probablyOursRefs: rows.filter((r) => listed.has(r)), split };
+}
+
+// Pure: one check's verdict restricted to `refs` (one alert's share).
+export function splitVerdict(verdict, refs) {
+  const keep = new Set(refs);
+  const only = (xs) => (xs ?? []).filter((r) => keep.has(r));
+  return { ...verdict, refs: keep.size, falseRefs: only(verdict.falseRefs), realRefs: only(verdict.realRefs), unknownRefs: only(verdict.unknownRefs) };
+}
+
+// Pure: the bundle entries for one report: one per alert, each with its own
+// share of the verdict. Rows on the export_revert side with no export_revert
+// alert (see splitRevertRefs) still get an entry, alertId null, so they are
+// reported in the loud section.
+export function splitResults(verdict, split, group) {
+  const out = [];
+  if (group.exportRevert || split.exportRevertRefs.length > 0) {
+    out.push({
+      ...splitVerdict(verdict, split.exportRevertRefs),
+      group: "export_revert",
+      alertId: group.exportRevert?.id ?? null,
+      recordId: group.exportRevert ? undefined : group.probablyOurs?.id,
+      split: split.split,
+    });
+  }
+  if (group.probablyOurs) {
+    out.push({ ...splitVerdict(verdict, split.probablyOursRefs), group: "revert_probably_ours", alertId: group.probablyOurs.id, split: split.split });
+  }
+  return out;
+}
+
+// Pure: summary.md lines for the checked alerts. `loud` goes under the
+// export_revert heading: every export_revert alert, plus any probably-ours
+// record with a REAL ref (the edit history missed a hand-edit, as serious as
+// an export_revert REAL). `quiet` is the per-record probably-ours tally.
+// `failed` names the groups ('export_revert' / 'revert_probably_ours') with
+// at least one alert whose check failed; each section notes only its own.
+export function revertSummaryLines(results, { failed = [] } = {}) {
+  const list = (xs) => (xs.length ? `${xs.length} (${xs.slice(0, 15).join(", ")}${xs.length > 15 ? ", …" : ""})` : "0");
+  const where = (r) =>
+    `${r.status}; prev export ${r.prevExportSha?.slice(0, 10) ?? "none"}, ` +
+    `master ${r.masterSha?.slice(0, 10) ?? "none"}${r.exportSha ? ` (parent of ${r.exportSha.slice(0, 10)})` : ""}`;
+  const splitNote = (r) => (r.split && r.split !== "exact" ? ` Ref split ${r.split}.` : "");
+  const loud = [];
+  const quiet = [];
+  for (const r of results) {
+    if (r.group === "revert_probably_ours") {
+      quiet.push(
+        `- Record ${r.alertId} ${r.book} ${r.resource}: probably ours: ${r.falseRefs.length} confirmed ours, ` +
+          `${r.unknownRefs.length} undecided, ${r.realRefs.length} REAL. ${where(r)}.${splitNote(r)}`,
+      );
+      if (r.realRefs.length > 0) {
+        loud.push(
+          `- Record ${r.alertId} ${r.book} ${r.resource} (revert_probably_ours): REAL at some refs: the edit history missed a hand-edit ` +
+            `that tonight's export overwrote. real ${list(r.realRefs)}. ${where(r)}.${splitNote(r)}`,
+        );
+      }
+      continue;
+    }
+    const verdict =
+      r.realRefs.length === 0 && r.unknownRefs.length === 0 && r.falseRefs.length > 0
+        ? "FALSE ALARM (every ref unchanged on master since our last export, parsed verse/row comparison)"
+        : r.realRefs.length > 0
+          ? "REAL at some refs"
+          : "UNDECIDED";
+    // alertId null: rows the probably-ours record does not list, in a report
+    // whose export_revert alert was not found (splitRevertRefs).
+    const who =
+      r.alertId == null
+        ? `Refs not in probably-ours record ${r.recordId ?? "?"} ${r.book} ${r.resource} (no export_revert alert found)`
+        : `Alert ${r.alertId} ${r.book} ${r.resource}`;
+    loud.push(
+      `- ${who}: ${verdict}. ${where(r)}. ` +
+        `unchanged on master since our last export (parsed verse/row comparison) ${list(r.falseRefs)}; real ${list(r.realRefs)}; unknown ${list(r.unknownRefs)}${splitNote(r)}`,
+    );
+  }
+  const checkedEr = results.some((r) => r.group !== "revert_probably_ours");
+  if (failed.includes("export_revert")) loud.push("- An export_revert check failed, see errors.");
+  else if (!checkedEr && quiet.length > 0) {
+    loud.unshift(`- No export_revert alerts tonight (${quiet.length} probably-ours record(s) checked below).`);
+  }
+  if (failed.includes("revert_probably_ours")) quiet.push("- A revert_probably_ours check failed, see errors.");
+  if (loud.length === 0) loud.push("- None checked.");
+  if (quiet.length === 0) quiet.push("- None checked.");
+  return { loud, quiet };
 }
 
 // ── Door43 GETs (impure, synchronous) ────────────────────────────────────────
