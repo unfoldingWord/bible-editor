@@ -297,7 +297,7 @@ console.log("\n[staleSkipAlertMessage]");
   eq(unknown.includes("recorded no reason"), false, "master_sha_unknown with no withhold adds no remedy sentence");
   const withWithhold = staleSkipAlertMessage("ECC", "ust", "master_sha_unknown", null, "3be0b831", withhold({ reason: "chapters_locked", count: 2 }));
   eq(withWithhold.endsWith(staleSkipRemedy(withhold({ reason: "chapters_locked", count: 2 }))), true, "a withhold recorded this run is still named");
-  eq(/may well be current|Nothing showed the app out of date|retries/.test(withWithhold), false, "with a withhold, no reassurance contradicts it");
+  eq(/edits stay in the app|retries/.test(withWithhold), false, "with a withhold, no reassurance contradicts it");
 
   // master_ahead keeps the measured "behind" text, byte for byte as before.
   eq(

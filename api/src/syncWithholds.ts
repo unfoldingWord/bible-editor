@@ -239,9 +239,9 @@ export function staleSkipAlertMessage(
     // "may well be current" reassurance would contradict it.
     if (withhold) return `${head} ${staleSkipRemedy(withhold)}`;
     return (
-      `${head} Nothing showed the app out of date; its edits stay in the app and the next nightly export retries. ` +
-      `If this repeats night after night, Door43 is answering with an error (check the service token and the ` +
-      `file path), not just slow.`
+      `${head} The edits stay in the app and the next nightly export retries. If this repeats night after night, ` +
+      `Door43 is answering with an error, not just slow: check the service token, and whether the file was moved ` +
+      `or removed on master.`
     );
   }
   return (
