@@ -290,12 +290,14 @@ console.log("\n[staleSkipAlertMessage]");
   // behind" twice. The unknown case must not claim it.
   const unknown = staleSkipAlertMessage("ECC", "ust", "master_sha_unknown", null, "3be0b831606bf795", null);
   eq(/behind/i.test(unknown), false, "master_sha_unknown does not say D1 is behind");
-  eq(unknown.includes("Door43 did not answer"), true, "master_sha_unknown names the unanswered Door43 read");
-  eq(unknown.includes("retries on its own"), true, "master_sha_unknown says the next export retries");
+  eq(unknown.includes("from Door43 failed"), true, "master_sha_unknown names the failed Door43 read");
+  eq(unknown.includes("next nightly export retries"), true, "master_sha_unknown says the next export retries");
+  eq(unknown.includes("If this repeats"), true, "master_sha_unknown says what a repeat means (a 401/404 never self-heals)");
   eq(unknown.includes("synced 3be0b831"), true, "master_sha_unknown keeps the watermark short sha");
   eq(unknown.includes("recorded no reason"), false, "master_sha_unknown with no withhold adds no remedy sentence");
   const withWithhold = staleSkipAlertMessage("ECC", "ust", "master_sha_unknown", null, "3be0b831", withhold({ reason: "chapters_locked", count: 2 }));
   eq(withWithhold.endsWith(staleSkipRemedy(withhold({ reason: "chapters_locked", count: 2 }))), true, "a withhold recorded this run is still named");
+  eq(/may well be current|Nothing showed the app out of date|retries/.test(withWithhold), false, "with a withhold, no reassurance contradicts it");
 
   // master_ahead keeps the measured "behind" text, byte for byte as before.
   eq(
