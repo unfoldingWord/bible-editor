@@ -340,10 +340,14 @@ export function splitRevertRefs(rowRefs, group) {
 // the whole snapshot to splitRevertRefs' message parse, since a replace-all
 // snapshot is one run's rows and a partial label set means something is off.
 //
-// No alert counts are compared here: the label is the export's own partition.
-// The one doubt left is a missing record: writeAlert is best-effort, so rows
-// labelled probably ours can lack the revert_probably_ours record that would
-// report them. Those go to the export_revert (loud) side, flagged.
+// The label decides which side each row is on. The alerts are still checked,
+// so a failed best-effort writeAlert or a disagreement stays visible:
+//   - rows labelled probably ours with no revert_probably_ours record would
+//     have no section, so they go to the export_revert (loud) side, flagged;
+//   - rows labelled 0 with no export_revert alert keep their side, but the
+//     split notes the loud alert is missing;
+//   - USFM only (TSV is never partitioned, see splitRevertRefs): each alert's
+//     "on N" count must equal its labelled rows, else the split is unverified.
 export function splitRevertRows(rows, group) {
   const labelled = rows.length > 0 && rows.every((r) => r.probably_ours === 0 || r.probably_ours === 1);
   if (!labelled) return splitRevertRefs(rows.map((r) => r.ref), group);
@@ -356,7 +360,35 @@ export function splitRevertRows(rows, group) {
       split: `inexact: ${ours.size} row(s) marked probably ours, no revert_probably_ours record found, checked under export_revert`,
     };
   }
-  return { exportRevertRefs: refs.filter((r) => !ours.has(r)), probablyOursRefs: refs.filter((r) => ours.has(r)), split: "exact" };
+  const exportRevertRefs = refs.filter((r) => !ours.has(r));
+  const probablyOursRefs = refs.filter((r) => ours.has(r));
+  const mismatches = [];
+  if (group.resource === "ult" || group.resource === "ust") {
+    if (group.probablyOurs) {
+      const po = probablyOursList(group.probablyOurs.message);
+      if (po === null) mismatches.push("the probably-ours record's count did not parse");
+      else if (po.count !== probablyOursRefs.length) {
+        mismatches.push(`probably-ours record names ${po.count} row(s), ${probablyOursRefs.length} marked probably ours`);
+      }
+    }
+    if (group.exportRevert) {
+      const n = exportRevertCount(group.exportRevert.message);
+      if (n !== exportRevertRefs.length) {
+        mismatches.push(`export_revert alert names ${n ?? "?"} row(s), ${exportRevertRefs.length} marked attention`);
+      }
+    }
+  }
+  const missing =
+    !group.exportRevert && exportRevertRefs.length > 0
+      ? `export_revert alert missing for ${exportRevertRefs.length} row(s)`
+      : null;
+  const split =
+    mismatches.length > 0
+      ? `unverified: ${[...mismatches, ...(missing ? [missing] : [])].join("; ")}`
+      : missing
+        ? `exact by row marks; ${missing}`
+        : "exact";
+  return { exportRevertRefs, probablyOursRefs, split };
 }
 
 // Pure: one check's verdict restricted to `refs` (one alert's share).
