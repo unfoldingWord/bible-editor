@@ -54,7 +54,7 @@ import { useCatalogs } from "../hooks/useCatalogs";
 import { useNoteTemplates } from "../hooks/useNoteTemplates";
 import { CatalogPicker } from "./CatalogPicker";
 import { shortSupport } from "../lib/supportReference";
-import { TCM, buildSH } from "../lib/noteTemplates";
+import { TCM, SH } from "../lib/noteTemplates";
 import {
   hasLeftNoteVerse,
   isAbandonedBlankStub,
@@ -2209,7 +2209,7 @@ function NoteCardInner({
               variant="outlined"
               disabled={readOnly}
               onClick={() => {
-                const t = buildSH(row.book);
+                const t = SH;
                 setNote(t);
                 stashEdit({ note: t });
               }}
