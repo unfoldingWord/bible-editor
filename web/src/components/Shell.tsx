@@ -3188,8 +3188,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // rows visible while the new ones load, so a miss against stale data would
     // wrongly look like a deleted row.
     if (data.chapter !== chapter) return;
-    const rows = jump.kind === "tn" ? data.tn : jump.kind === "tq" ? data.tq : data.twl;
-    if (!rows.some((r) => r.id === jump.rowId)) {
+    const rows: { id: string; verse: number }[] =
+      jump.kind === "tn" ? data.tn : jump.kind === "tq" ? data.tq : data.twl;
+    const target = rows.find((r) => r.id === jump.rowId);
+    if (!target) {
       // The chapter loaded and the row isn't in it — a stale lint report, or the
       // row was deleted. Drop the stash instead of leaving it to fire on some
       // unrelated later visit to this chapter.
@@ -3198,6 +3200,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     const { switchTab, kind } = jump;
     pendingRowJump = null;
+    // The hash can't carry verse 0 (App's navigate drops any verse <= 1), so a
+    // chapter-intro row arrives with activeVerse 1 and its card stays hidden.
+    // Select the row's own verse rather than trusting the route.
+    setActiveVerse(target.verse);
     setActiveNoteId(kind === "tn" ? jump.rowId : null);
     setActiveQuestionId(kind === "tq" ? jump.rowId : null);
     setActiveWordId(kind === "twl" ? jump.rowId : null);
