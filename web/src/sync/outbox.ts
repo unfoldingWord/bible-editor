@@ -31,10 +31,13 @@ import {
   eligibleForVersionThread,
   isMaxAttemptsBlocked,
   laneChecksToKeepBehind,
+  activeRetryHoldWakeAt,
   pickNextOp,
   refusedVerseOpsSupersededBy,
+  releaseRetryHoldsOnRefresh,
   shouldAnnounceResult,
   targetKey,
+  type RetryHold,
 } from "./outboxTargeting.ts";
 import { rebaseVersePatch } from "./verseRebase.ts";
 import { noteOwnVerseOp } from "./ownVerseOps.ts";
@@ -728,6 +731,13 @@ let drainTimer: ReturnType<typeof setTimeout> | null = null;
 // recovery age) would otherwise clobber a short due retry (~250ms backoff)
 // and an op due in 250ms could wait the full recovery age.
 let drainTimerAt = 0;
+// Retry backoffs that must outlive the pass that set them (#1249, see
+// RetryHold in outboxTargeting.ts), keyed by targetKey. In memory, per tab.
+const retryHolds = new Map<string, RetryHold>();
+// Bumped by every successful silent refresh in this tab. drainPass compares it
+// across a dispatch to tell whether that attempt already ran on a refreshed
+// session (RetryHold.afterRefresh).
+let authRefreshGen = 0;
 
 type Result =
   | { kind: "ok"; updated: unknown }
@@ -1065,8 +1075,14 @@ async function drainPass() {
     //
     // The pick itself (blocked set + lane-check hold) is pickNextOp in
     // outboxTargeting.ts so it can be unit-tested without IndexedDB.
-    let next = pickNextOp(ops, pinnedBlocked);
+    let next = pickNextOp(ops, pinnedBlocked, retryHolds);
     if (!next) {
+      // An op is still inside its retry backoff (#1249). The retry branch
+      // scheduled its wakeup, but scheduleDrain keeps only the earliest timer,
+      // so a shorter one may have fired since and spent it. Re-arm for the
+      // hold's expiry so the op is never stranded.
+      const holdWakeAt = activeRetryHoldWakeAt(ops, retryHolds);
+      if (holdWakeAt !== undefined) scheduleDrain(Math.max(0, holdWakeAt - Date.now()));
       // No pending work, but recoverInFlight skipped a young in-flight op
       // (its dispatching tab may have crashed/reloaded). Nothing else will
       // re-check it — the retry-backoff and online/focus triggers only fire
@@ -1097,8 +1113,12 @@ async function drainPass() {
     await tx.store.put(fresh);
     await tx.done;
     next = fresh;
+    // Picked, so any hold on this target no longer applies; the retry branch
+    // below sets a new one if this attempt fails too.
+    retryHolds.delete(targetKey(next.target));
     void notify();
 
+    const refreshGenAtDispatch = authRefreshGen;
     let result: Result;
     try {
       result = await dispatch(next);
@@ -1196,7 +1216,16 @@ async function drainPass() {
           next.status = "pending";
           next.lastError = result.reason;
           await (await db()).put(STORE, next);
-          scheduleDrain(backoffMs(next.attempts));
+          const waitMs = backoffMs(next.attempts);
+          // Hold the target for the backoff across passes too (#1249): a
+          // wakeup during this pass (onAuthRefreshed from this very request's
+          // refresh, an enqueue) starts a new pass with an empty pinnedBlocked.
+          retryHolds.set(targetKey(next.target), {
+            opId: next.id,
+            until: Date.now() + waitMs,
+            afterRefresh: authRefreshGen !== refreshGenAtDispatch,
+          });
+          scheduleDrain(waitMs);
           pinnedBlocked.add(targetKey(next.target));
         }
       } else {
@@ -1355,15 +1384,32 @@ async function reviveAndDrain() {
 // off an initial drain (which runs recoverInFlight first) so any ops left
 // stranded by a previous tab crash get re-armed at startup.
 if (typeof window !== "undefined") {
-  window.addEventListener("online", () => void reviveAndDrain());
+  // online and focus also end any retry backoff (#1249): both are one-off
+  // events from the browser or the user, so they cannot drive a retry loop,
+  // and they are the moments a parked save is most likely to go through.
+  window.addEventListener("online", () => {
+    retryHolds.clear();
+    void reviveAndDrain();
+  });
   // Focus revives too, not just drains. A run of 5xx can exhaust the retry
   // cap while the laptop never goes offline and the session never refreshes —
   // and `online` / onAuthRefreshed were the only two revival triggers, so
   // those ops sat as `failed` forever with nothing left to retry them. The
   // failed-ops panel tells the user they "keep trying on their own", which
   // has to be true: coming back to the tab is the moment to re-check.
-  window.addEventListener("focus", () => void reviveAndDrain());
-  // A successful silent refresh means auth-stalled ops can move again.
-  onAuthRefreshed(() => void reviveAndDrain());
+  window.addEventListener("focus", () => {
+    retryHolds.clear();
+    void reviveAndDrain();
+  });
+  // A successful silent refresh means auth-stalled ops can move again. It
+  // releases only the holds of ops whose last attempt did not already run on
+  // a refreshed session (#1249): a save that failed auth even after a refresh
+  // waits out its backoff, or every refresh, including the one inside its own
+  // retry, would re-send it at once.
+  onAuthRefreshed(() => {
+    authRefreshGen++;
+    releaseRetryHoldsOnRefresh(retryHolds);
+    void reviveAndDrain();
+  });
   void drain();
 }
