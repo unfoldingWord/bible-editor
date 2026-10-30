@@ -405,8 +405,30 @@ export function onAuthError(fn: AuthErrorListener): () => void {
   authErrorListeners.add(fn);
   return () => authErrorListeners.delete(fn);
 }
-function emitAuthError() {
+// Requests (`METHOD path`) that raised the banner and have not succeeded since.
+const authFailedRequests = new Set<string>();
+function emitAuthError(requestKey: string) {
+  authFailedRequests.add(requestKey);
   for (const fn of authErrorListeners) {
+    try { fn(); } catch { /* listener bug — don't break the request pipeline */ }
+  }
+}
+
+// Fired on evidence the session works again: a request succeeded on its retry
+// after a refresh, or a request that raised onAuthError later succeeded.
+// App.tsx clears "session expired" on this, not on onAuthRefreshed (#1251): a
+// refresh can succeed while every request still fails auth, and clearing on
+// it toggled the banner on each refresh, which restarted the alerts poll
+// (~550 GETs a minute). An unrelated GET succeeding does not count, so a
+// stuck save keeps its banner (#1248).
+type AuthRecoveredListener = () => void;
+const authRecoveredListeners = new Set<AuthRecoveredListener>();
+export function onAuthRecovered(fn: AuthRecoveredListener): () => void {
+  authRecoveredListeners.add(fn);
+  return () => authRecoveredListeners.delete(fn);
+}
+function emitAuthRecovered() {
+  for (const fn of authRecoveredListeners) {
     try { fn(); } catch { /* listener bug — don't break the request pipeline */ }
   }
 }
@@ -525,6 +547,7 @@ async function request<T>(
   // blanket isReadOnly() check here previously threw a fake 403 on those
   // calls before they ever left the browser, which made unlocking impossible.
   const method = (init?.method ?? "GET").toUpperCase();
+  const requestKey = `${method} ${path}`;
   if (isViewerReadOnly() && method !== "GET" && method !== "HEAD") {
     throw new ApiError(403, "read_only");
   }
@@ -595,7 +618,7 @@ async function request<T>(
       }
       // Refresh failed — token is dead or user was revoked. Surface to UI so
       // the user sees *why* their edits are queueing forever.
-      emitAuthError();
+      emitAuthError(requestKey);
       throw new ApiError(401, "HTTP 401");
     }
 
@@ -627,14 +650,13 @@ async function request<T>(
           return await request<T>(path, init, true);
         }
         // Refresh failed — the session is dead, not just the CSRF cookie.
-        emitAuthError();
+        emitAuthError(requestKey);
         throw new ApiError(401, "HTTP 401");
       }
       // The refresh succeeded but the retry still failed on auth (#1248).
       // Both branches above are one-shot, so without this the request throws
-      // silently: the outbox keeps the op queued as `retry`, and the refresh's
-      // onAuthRefreshed has just cleared any "session expired" banner. Raise it
-      // again. Only for auth failures — a 403 for any other reason (forbidden,
+      // silently: the outbox keeps the op queued as `retry` with no "session
+      // expired" banner. Raise it. Only for auth failures — a 403 for any other reason (forbidden,
       // read-only source) is not an expired session. Status and body stay as
       // they are so the outbox's classification is unchanged.
       if (
@@ -642,10 +664,13 @@ async function request<T>(
         (res.status === 401 ||
           (res.status === 403 && (body as { error?: string } | null)?.error === "csrf_mismatch"))
       ) {
-        emitAuthError();
+        emitAuthError(requestKey);
       }
       throw new ApiError(res.status, `HTTP ${res.status}`, body);
     }
+    // Evidence the session works (see onAuthRecovered). Delete first so a
+    // retried request also forgets its own earlier failure.
+    if (authFailedRequests.delete(requestKey) || _retriedAfterRefresh) emitAuthRecovered();
     try {
       return (await res.json()) as T;
     } catch (e) {

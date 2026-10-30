@@ -12,7 +12,7 @@ import {
   devSignIn,
   fetchAuthMe,
   onAuthError,
-  onAuthRefreshed,
+  onAuthRecovered,
   setReadOnlyReason,
   setRole,
   updateLastLocation,
@@ -183,11 +183,13 @@ export function App() {
   }, []);
 
   useEffect(() => onAuthError(() => setSessionExpired(true)), []);
-  // A later *successful* silent refresh (api.ts fires onAuthRefreshed) means
-  // the session is alive after all — a transient network blip / timeout during
-  // one refresh attempt must not leave "session expired" up forever while the
-  // outbox drains fine.
-  useEffect(() => onAuthRefreshed(() => setSessionExpired(false)), []);
+  // Clear it once a request shows the session works again (api.ts fires
+  // onAuthRecovered) — a transient network blip / timeout during one refresh
+  // attempt must not leave "session expired" up forever while the outbox
+  // drains fine. Not on a successful refresh alone (#1251): the refresh can
+  // succeed while every request still fails auth, and clearing on it toggled
+  // the banner on each refresh, restarting the alerts poll each time.
+  useEffect(() => onAuthRecovered(() => setSessionExpired(false)), []);
   // The auth gate can also land back on "ready" via a path that never goes
   // through refreshAuthOnce() — dev mode's silent /api/auth/dev mint on a
   // cold load, or a fresh /api/auth/me 200. Either means the session is fine,
