@@ -1153,7 +1153,11 @@ function renumberTargetOccurrences(nodes: unknown[]): unknown[] {
       const o = n as Record<string, unknown>;
       const fix = wanted.get(o);
       if (fix) return { ...o, ...fix };
-      if (Array.isArray(o["children"])) return { ...o, children: rebuild(o["children"] as unknown[]) };
+      if (Array.isArray(o["children"])) {
+        const kids = o["children"] as unknown[];
+        const next = rebuild(kids);
+        return next.every((k, i) => k === kids[i]) ? n : { ...o, children: next };
+      }
       return n;
     });
   return rebuild(nodes);
