@@ -263,13 +263,16 @@ export interface BookLintReport {
   issues: BookLintIssue[];
 }
 
+// Plain field declarations, not constructor parameter properties: Node's
+// strip-types loader can't erase those, and the web unit tests import this
+// module directly (authRetry.test.mjs).
 export class ApiError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-    public body?: unknown,
-  ) {
+  status: number;
+  body?: unknown;
+  constructor(status: number, message: string, body?: unknown) {
     super(message);
+    this.status = status;
+    this.body = body;
   }
 }
 
