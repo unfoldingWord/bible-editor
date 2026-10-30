@@ -195,4 +195,23 @@ const save = () => api.patchVerse("ZEC", 1, 1, "ULT", 3, { content: {} });
   assert.equal(r2.recovered, 0, "a stale alerts key does not clear the new stuck-save banner");
 }
 
+// Re-review of #1251 (Codex): a save is stuck after a refresh, then another
+// request's refresh fails, then a refresh succeeds (e.g. the WebSocket's).
+// The failed refresh is resolved, but the save is still stuck, so the banner
+// stays until the save itself succeeds.
+{
+  const r1 = await run(() => json(401, {}), save);
+  assert.equal(r1.authError, 1);
+  ev = { authError: 0, refreshed: 0, recovered: 0 };
+  globalThis.fetch = async (url) =>
+    String(url) === "/api/auth/refresh" ? json(503, {}) : json(401, {});
+  await fetchAlerts();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ev.authError, 1);
+  const r2 = await run(() => json(200, {}), () => refreshAuthOnce());
+  assert.equal(r2.recovered, 0, "a refresh does not clear the banner while a save is stuck after a refresh");
+  const r3 = await run(() => json(200, { version: 10 }), save);
+  assert.equal(r3.recovered, 1);
+}
+
 console.log("authRecovered.test.mjs: all assertions passed");

@@ -503,7 +503,12 @@ export async function refreshAuthOnce(): Promise<boolean> {
       });
       if (res.ok) {
         emitAuthRefreshed();
-        if (refreshFailedRaised) emitAuthRecovered();
+        // The failed refresh is resolved. Clear the banner only if no request
+        // is still stuck after a refresh (a keyed failure keeps it up).
+        if (refreshFailedRaised) {
+          if (authFailedRequests.size === 0) emitAuthRecovered();
+          refreshFailedRaised = false;
+        }
       }
       return res.ok;
     } catch {
