@@ -5,6 +5,7 @@ import {
   alignmentDraftRow,
   alignmentPanelRowKey,
   alignmentDraftKeyForOp,
+  hasUnsavedVerseTextOp,
   isAlignerPanelSaveOp,
   isAlignmentSaveOp,
   refusalMayReplaceDraft,
@@ -244,4 +245,44 @@ assert.equal(alignmentPanelRowKey(null), "none");
   );
 }
 
-console.log("alignmentDraftSaveState: 43 passed");
+// #1248: the aligner warns while the outbox holds a text change for its verse.
+{
+  const at = { book: "ZEC", chapter: 6, verse: 1, bibleVersion: "ULT" };
+  const textOp = (o = {}) => op({ patch: { content: {}, alignment_intent: "text_edit" }, ...o });
+  assert.equal(hasUnsavedVerseTextOp([], at), false, "empty outbox: no warning");
+  assert.equal(hasUnsavedVerseTextOp([textOp()], at), true, "a queued text edit on the verse warns");
+  for (const status of ["pending", "in_flight", "conflict", "failed"]) {
+    assert.equal(hasUnsavedVerseTextOp([textOp({ status })], at), true, `a ${status} text edit warns`);
+  }
+  assert.equal(
+    hasUnsavedVerseTextOp([op({ alignmentDraftGeneration: "g1" })], at),
+    false,
+    "the aligner panel's own save does not warn",
+  );
+  assert.equal(hasUnsavedVerseTextOp([op()], at), true, "a history restore (no draft generation) warns");
+  assert.equal(
+    hasUnsavedVerseTextOp([textOp({ target: { ...textOp().target, bibleVersion: "UST" } })], at),
+    false,
+    "the other bible version does not warn",
+  );
+  assert.equal(
+    hasUnsavedVerseTextOp([textOp({ target: { ...textOp().target, verse: 2 } })], at),
+    false,
+    "another verse does not warn",
+  );
+  assert.equal(
+    hasUnsavedVerseTextOp([textOp({ target: { ...textOp().target, chapter: 7 } })], at),
+    false,
+    "another chapter does not warn",
+  );
+  assert.equal(
+    hasUnsavedVerseTextOp([op({ target: { kind: "verse_status", book: "ZEC", chapter: 6, verse: 1 } })], at),
+    false,
+    "a verse-status op is not a text edit",
+  );
+  const rangeOp = textOp({ target: { ...textOp().target, verse: 6, verseEnd: 9 } });
+  assert.equal(hasUnsavedVerseTextOp([rangeOp], { ...at, verse: 7 }), true, "a verse inside a range row warns");
+  assert.equal(hasUnsavedVerseTextOp([rangeOp], { ...at, verse: 10 }), false, "a verse past the range does not");
+}
+
+console.log("alignmentDraftSaveState: 43 passed, plus #1248 cases");
