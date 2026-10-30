@@ -91,7 +91,7 @@ export function shouldAnnounceResult(kind: OutboxResult["kind"], persisted: bool
 }
 
 /** The subset of an OutboxOp the drain's pick needs to read. */
-export type PickOp = Pick<OutboxOp, "target" | "status" | "lastError" | "queuedAt" | "seq">;
+export type PickOp = Pick<OutboxOp, "id" | "target" | "status" | "lastError" | "queuedAt" | "seq">;
 
 // The drain's queue order: queuedAt, then seq as the same-millisecond
 // tiebreak (listAll sorts by exactly this).
@@ -167,14 +167,74 @@ function laneCheckHeldWhere(lc: PickOp, ops: PickOp[], holds: (o: PickOp) => boo
   );
 }
 
+// #1249: a retry's backoff, kept per target across drain passes. drainPass's
+// own pinnedBlocked set lives for one pass only, and drain() starts a new pass
+// whenever a wakeup arrived during the last one. A request that refreshes the
+// session fires onAuthRefreshed mid-pass, so a save that kept failing on auth
+// after a successful refresh was picked again by the very next pass, with no
+// backoff (~6 PATCH/s, measured). The retry branch records a hold here, keyed
+// by targetKey so younger ops for the same target keep their FIFO place.
+// `afterRefresh`: the failed attempt already ran on a refreshed session, so a
+// later refresh is no reason to retry early (see releaseRetryHoldsOnRefresh).
+export interface RetryHold {
+  opId: string;
+  until: number;
+  afterRefresh: boolean;
+}
+
+// A hold applies only while it has not expired and its op is still pending in
+// this snapshot. Once the op lands or is discarded, the next edit to that
+// target goes out at once instead of waiting out a stale backoff.
+function activeRetryHolds(
+  ops: PickOp[],
+  holds: ReadonlyMap<string, RetryHold>,
+  now: number,
+): RetryHold[] {
+  if (holds.size === 0) return [];
+  const pending = new Set(ops.filter((o) => o.status === "pending").map((o) => o.id));
+  return [...holds.values()].filter((h) => h.until > now && pending.has(h.opId));
+}
+
+// When the earliest active hold expires, so a pass that found nothing to pick
+// can schedule the wakeup itself. scheduleDrain keeps an earlier timer over a
+// later one, so the retry branch's own wakeup can be lost to a shorter timer
+// that fires while the hold is still active.
+export function activeRetryHoldWakeAt(
+  ops: PickOp[],
+  holds: ReadonlyMap<string, RetryHold>,
+  now: number = Date.now(),
+): number | undefined {
+  const times = activeRetryHolds(ops, holds, now).map((h) => h.until);
+  return times.length ? Math.min(...times) : undefined;
+}
+
+// A successful refresh is new information only for an op whose last attempt
+// did not run on a refreshed session (its own refresh failed, or it never got
+// that far). Release those so they drain at once. Keep the rest: their attempt
+// already had a fresh session and still failed, and releasing them would let
+// every refresh (including the alerts poll's) restart the retry loop.
+export function releaseRetryHoldsOnRefresh(holds: Map<string, RetryHold>): void {
+  for (const [k, h] of holds) if (!h.afterRefresh) holds.delete(k);
+}
+
 // Which op drainPass dispatches next, given this iteration's snapshot (sorted
-// in drain order) and the targets this pass has already parked. A target with
-// a conflicted or max-attempts-failed op is blocked (see isMaxAttemptsBlocked);
-// a lane check behind an unsettled verse save is held (laneCheckHeld).
-export function pickNextOp<T extends PickOp>(ops: T[], pinnedBlocked: ReadonlySet<string>): T | undefined {
+// in drain order), the targets this pass has already parked, and the retry
+// holds carried across passes (#1249). A target with a conflicted or
+// max-attempts-failed op is blocked (see isMaxAttemptsBlocked); a lane check
+// behind an unsettled verse save is held (laneCheckHeld).
+export function pickNextOp<T extends PickOp>(
+  ops: T[],
+  pinnedBlocked: ReadonlySet<string>,
+  holds: ReadonlyMap<string, RetryHold> = new Map(),
+  now: number = Date.now(),
+): T | undefined {
   const blocked = new Set(pinnedBlocked);
   for (const o of ops) {
     if (o.status === "conflict" || isMaxAttemptsBlocked(o)) blocked.add(targetKey(o.target));
+  }
+  for (const h of activeRetryHolds(ops, holds, now)) {
+    const held = ops.find((o) => o.id === h.opId);
+    if (held) blocked.add(targetKey(held.target));
   }
   return ops.find(
     (o) => o.status === "pending" && !blocked.has(targetKey(o.target)) && !laneCheckHeld(o, ops),
