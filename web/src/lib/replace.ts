@@ -1115,6 +1115,54 @@ function smartRebuildRange(
   return { content: { verseObjects: outVOs }, plainText: normalize(newRaw), preservedAlignment: true };
 }
 
+// Renumber target `\w` occurrence/occurrences from document position, as the
+// server does on every verse PATCH (api/src/importParsers.ts
+// recomputeTargetOccurrences). The edit tiers keep an edited leaf's old numbers
+// (remove -> removing stays 1/1), so a verse that now holds the same word twice
+// carried two "removing 1/1" until the server round-trip -- and the aligner keys
+// target tokens by `text|occurrence`, so the second one was unreachable (EZK
+// 12:3 UST). Copy-on-change: untouched nodes keep identity, and the input tree
+// (often the live React state) is never mutated.
+function renumberTargetOccurrences(nodes: unknown[]): unknown[] {
+  const words: Array<Record<string, unknown>> = [];
+  const collect = (list: unknown[]): void => {
+    for (const n of list) {
+      if (!n || typeof n !== "object") continue;
+      const o = n as Record<string, unknown>;
+      if (o["type"] === "word" && o["tag"] === "w" && typeof o["text"] === "string") words.push(o);
+      else if (Array.isArray(o["children"])) collect(o["children"] as unknown[]);
+    }
+  };
+  collect(nodes);
+  const totals = new Map<string, number>();
+  for (const w of words) totals.set(w["text"] as string, (totals.get(w["text"] as string) ?? 0) + 1);
+  const running = new Map<string, number>();
+  const wanted = new Map<Record<string, unknown>, { occurrence: string; occurrences: string }>();
+  for (const w of words) {
+    const key = w["text"] as string;
+    const n = (running.get(key) ?? 0) + 1;
+    running.set(key, n);
+    const occurrence = String(n);
+    const occurrences = String(totals.get(key));
+    if (w["occurrence"] !== occurrence || w["occurrences"] !== occurrences) wanted.set(w, { occurrence, occurrences });
+  }
+  if (wanted.size === 0) return nodes;
+  const rebuild = (list: unknown[]): unknown[] =>
+    list.map((n) => {
+      if (!n || typeof n !== "object") return n;
+      const o = n as Record<string, unknown>;
+      const fix = wanted.get(o);
+      if (fix) return { ...o, ...fix };
+      if (Array.isArray(o["children"])) {
+        const kids = o["children"] as unknown[];
+        const next = rebuild(kids);
+        return next.every((k, i) => k === kids[i]) ? n : { ...o, children: next };
+      }
+      return n;
+    });
+  return rebuild(nodes);
+}
+
 // Smart replace: given the verse content, the plain text the match was
 // found in, the regex used, and the literal active-match info, produce a
 // new content + plain text. Tries to keep alignment when possible.
@@ -1132,7 +1180,7 @@ export function smartReplaceVerse(
   const result = smartReplaceVerseImpl(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText);
   const verseObjectsOut = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (Array.isArray(verseObjectsOut)) {
-    const hoisted = pruneEmptyText(hoistOpeningPunctuation(verseObjectsOut));
+    const hoisted = renumberTargetOccurrences(pruneEmptyText(hoistOpeningPunctuation(verseObjectsOut)));
     const newContent = { verseObjects: hoisted };
     // The hoist can change the verse's raw text (stepping an opener over a
     // sibling's leading whitespace — see openingPunct.ts), so `result.plainText`
@@ -2405,8 +2453,8 @@ export function smartEditVerse(
     // Hoist any opening quote/bracket the relayout tiers stranded inside the
     // preceding word's \zaln milestone out to a top-level text node — Door43
     // renders a stray space after it otherwise (see JER 31:10 / #777).
-    const normalized = pruneEmptyText(
-      pruneDeadMilestones(hoistOpeningPunctuation(normalizeWordPunctuation(verseObjects))),
+    const normalized = renumberTargetOccurrences(
+      pruneEmptyText(pruneDeadMilestones(hoistOpeningPunctuation(normalizeWordPunctuation(verseObjects)))),
     );
     const newContent = { verseObjects: normalized };
     // See smartReplaceVerse's identical guard: the hoist inside this pass can

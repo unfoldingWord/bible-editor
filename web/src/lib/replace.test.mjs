@@ -2834,6 +2834,45 @@ function countAllMilestones(nodes) {
   }
 }
 
+// Case 80: an edit that makes a word appear twice renumbers it 1/2, 2/2 on the
+// client (EZK 12:3 UST). The tiers kept the edited leaf's old 1/1, so the
+// aligner saw two "removing 1/1" and the second could not be placed. The input
+// tree must stay untouched (it is live React state).
+{
+  console.log("\n[Case 80] remove -> removing next to an existing removing renumbers occurrences");
+  const verse = () => ({
+    verseObjects: [
+      zaln("H1", [w("they", "1", "1"), t(" "), w("remove", "1", "1")]),
+      t(" "),
+      zaln("H2", [w("it", "1", "2")]),
+      t(" and "),
+      zaln("H3", [w("removing", "1", "1")]),
+      t(" "),
+      zaln("H4", [w("it", "2", "2")]),
+    ],
+  });
+  const occOf = (content, re) => {
+    const out = [];
+    const walk = (nodes) => {
+      for (const n of nodes ?? []) {
+        if (n?.type === "word" && n.tag === "w" && re.test(n.text)) out.push(`${n.text} ${n.occurrence}/${n.occurrences}`);
+        if (Array.isArray(n?.children)) walk(n.children);
+      }
+    };
+    walk(content.verseObjects);
+    return out.join(",");
+  };
+  const input = verse();
+  const before = JSON.stringify(input);
+  const r = smartEditVerse(input, "they remove it and removing it", "they removing it and removing it");
+  const occ = occOf(r.content, /^removing$/);
+  assert(occ === "removing 1/2,removing 2/2", `both removing words are numbered 1/2 and 2/2 (got ${occ})`);
+  assert(JSON.stringify(input) === before, "the input tree is not mutated");
+  const back = smartEditVerse(r.content, "they removing it and removing it", "they remove it and removing it");
+  const occ2 = occOf(back.content, /^remov/);
+  assert(occ2 === "remove 1/1,removing 1/1", `reverting renumbers back to 1/1 each (got ${occ2})`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
