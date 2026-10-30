@@ -166,3 +166,22 @@ export function refusedDraftMayRehydrate(args: {
   if (draftFrom.queuedAt !== refused.queuedAt || draftFrom.seq !== refused.seq) return false;
   return !otherSaves.some((o) => opIsAfter(o, refused));
 }
+
+// #1248: does the outbox still hold a text change for the verse the aligner
+// shows? Every op still in the outbox is unsaved, whatever its status
+// (pending, in_flight, conflict, failed). The aligner reads the local copy,
+// so without a warning a stuck save looks saved there. The panel's own saves
+// are excluded. A range row's op is keyed by its first verse, so a verse
+// inside the range matches through verseEnd.
+export function hasUnsavedVerseTextOp(
+  ops: ReadonlyArray<Pick<OutboxOp, "target" | "patch" | "alignmentDraftGeneration">>,
+  at: { book: string; chapter: number; verse: number; bibleVersion: string },
+): boolean {
+  return ops.some((op) => {
+    const t = op.target;
+    if (t.kind !== "verse") return false;
+    if (t.book !== at.book || t.chapter !== at.chapter || t.bibleVersion !== at.bibleVersion) return false;
+    if (at.verse < t.verse || at.verse > (t.verseEnd ?? t.verse)) return false;
+    return !isAlignerPanelSaveOp(op);
+  });
+}

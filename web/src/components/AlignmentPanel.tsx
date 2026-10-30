@@ -11,6 +11,7 @@ import {
   useState,
 } from "react";
 import {
+  Alert,
   Box,
   Typography,
   Stack,
@@ -73,6 +74,7 @@ import {
   alignmentDraftFitsRow,
   alignmentDraftKeyForOp,
   alignmentDraftRow,
+  hasUnsavedVerseTextOp,
   isAlignerPanelSaveOp,
   refusedDraftMayRehydrate,
   refusedOpOrder,
@@ -430,6 +432,21 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         mountedRef.current = false;
       };
     }, []);
+    // #1248: warn (not block) while a text change to this verse is still in
+    // the outbox. The panel shows the local copy, so a save stuck on auth
+    // otherwise looks saved here. Subscribed, so it clears when the op drains.
+    const [unsavedTextEdit, setUnsavedTextEdit] = useState(false);
+    useEffect(() => {
+      let live = true;
+      const at = { book, chapter, verse: verseNum, bibleVersion };
+      const unsubscribe = outbox.subscribe((ops) => {
+        if (live) setUnsavedTextEdit(hasUnsavedVerseTextOp(ops, at));
+      });
+      return () => {
+        live = false;
+        unsubscribe();
+      };
+    }, [book, chapter, verseNum, bibleVersion]);
     const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
     const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
@@ -1171,6 +1188,11 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         // refuse; this keeps the drag ghost from appearing at all).
         onDragStartCapture={locked ? (e) => e.preventDefault() : undefined}
       >
+        {unsavedTextEdit && (
+          <Alert severity="warning" sx={{ borderRadius: 0, py: 0, flexShrink: 0 }}>
+            This verse has an edit that hasn't saved yet.
+          </Alert>
+        )}
         {!state && (
           <Box sx={{ p: 3 }}>
             <Typography variant="body2" color="text.secondary">
