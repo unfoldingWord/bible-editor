@@ -1190,7 +1190,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       >
         {unsavedTextEdit && (
           <Alert severity="warning" sx={{ borderRadius: 0, py: 0, flexShrink: 0 }}>
-            This verse has a text edit that hasn't saved yet.
+            This verse has an edit that hasn't saved yet.
           </Alert>
         )}
         {!state && (
