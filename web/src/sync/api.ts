@@ -630,6 +630,20 @@ async function request<T>(
         emitAuthError();
         throw new ApiError(401, "HTTP 401");
       }
+      // The refresh succeeded but the retry still failed on auth (#1248).
+      // Both branches above are one-shot, so without this the request throws
+      // silently: the outbox keeps the op queued as `retry`, and the refresh's
+      // onAuthRefreshed has just cleared any "session expired" banner. Raise it
+      // again. Only for auth failures — a 403 for any other reason (forbidden,
+      // read-only source) is not an expired session. Status and body stay as
+      // they are so the outbox's classification is unchanged.
+      if (
+        _retriedAfterRefresh &&
+        (res.status === 401 ||
+          (res.status === 403 && (body as { error?: string } | null)?.error === "csrf_mismatch"))
+      ) {
+        emitAuthError();
+      }
       throw new ApiError(res.status, `HTTP ${res.status}`, body);
     }
     try {
