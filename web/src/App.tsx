@@ -13,6 +13,7 @@ import {
   fetchAuthMe,
   onAuthError,
   onAuthRecovered,
+  resetAuthFailures,
   setReadOnlyReason,
   setRole,
   updateLastLocation,
@@ -197,7 +198,10 @@ export function App() {
   // (e.g. a background request's 401 firing before the mint lands) must not
   // outlive it.
   useEffect(() => {
-    if (auth.kind === "ready") setSessionExpired(false);
+    if (auth.kind === "ready") {
+      setSessionExpired(false);
+      resetAuthFailures();
+    }
   }, [auth.kind]);
 
   // Shell has acted on a `?c=<id>` deep link. Clear it from the URL AND from

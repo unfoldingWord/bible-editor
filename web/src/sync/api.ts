@@ -405,29 +405,50 @@ export function onAuthError(fn: AuthErrorListener): () => void {
   authErrorListeners.add(fn);
   return () => authErrorListeners.delete(fn);
 }
-// Requests (`METHOD path`) that raised the banner and have not succeeded since.
+// Requests (`METHOD path`) whose retry still failed auth after a successful
+// refresh (#1248), and have not succeeded since.
 const authFailedRequests = new Set<string>();
-function emitAuthError(requestKey: string) {
-  authFailedRequests.add(requestKey);
+// The banner went up because a refresh itself failed (a network blip, a
+// timeout, a dead session). Then a later successful refresh is the evidence,
+// whoever ran it: the WebSocket's reconnect refresh runs outside request(),
+// and the request that raised the banner may be the paused alerts poll. A
+// plain 200 is not: reads are unauthenticated, so they succeed either way.
+// Clearing on that refresh cannot loop: a request still failing after it
+// raises a keyed failure, which a refresh does not clear.
+let refreshFailedRaised = false;
+function emitAuthError(requestKey?: string) {
+  if (requestKey) authFailedRequests.add(requestKey);
+  else refreshFailedRaised = true;
   for (const fn of authErrorListeners) {
     try { fn(); } catch { /* listener bug — don't break the request pipeline */ }
   }
 }
 
 // Fired on evidence the session works again: a request succeeded on its retry
-// after a refresh, or a request that raised onAuthError later succeeded.
+// after a refresh, a request that raised onAuthError later succeeded, or a
+// refresh succeeded after a failed refresh raised it (refreshFailedRaised).
 // App.tsx clears "session expired" on this, not on onAuthRefreshed (#1251): a
 // refresh can succeed while every request still fails auth, and clearing on
 // it toggled the banner on each refresh, which restarted the alerts poll
-// (~550 GETs a minute). An unrelated GET succeeding does not count, so a
-// stuck save keeps its banner (#1248).
+// (~550 GETs a minute). An unrelated GET succeeding does not count while a
+// save is stuck after a refresh, so that save keeps its banner (#1248).
 type AuthRecoveredListener = () => void;
 const authRecoveredListeners = new Set<AuthRecoveredListener>();
 export function onAuthRecovered(fn: AuthRecoveredListener): () => void {
   authRecoveredListeners.add(fn);
   return () => authRecoveredListeners.delete(fn);
 }
+// Forget every recorded failure: the banner is down, so a request still
+// failing raises it afresh, and a stale key cannot clear a later banner.
+// App.tsx also calls this when it clears the banner on its own.
+export function resetAuthFailures() {
+  authFailedRequests.clear();
+  refreshFailedRaised = false;
+}
 function emitAuthRecovered() {
+  // Nothing recorded means no banner raised here, so nothing to clear.
+  if (authFailedRequests.size === 0 && !refreshFailedRaised) return;
+  resetAuthFailures();
   for (const fn of authRecoveredListeners) {
     try { fn(); } catch { /* listener bug — don't break the request pipeline */ }
   }
@@ -480,7 +501,10 @@ export async function refreshAuthOnce(): Promise<boolean> {
         credentials: "include",
         signal: ctrl.signal,
       });
-      if (res.ok) emitAuthRefreshed();
+      if (res.ok) {
+        emitAuthRefreshed();
+        if (refreshFailedRaised) emitAuthRecovered();
+      }
       return res.ok;
     } catch {
       // Timeout or network error — treat as a failed refresh. Resolving
@@ -618,7 +642,7 @@ async function request<T>(
       }
       // Refresh failed — token is dead or user was revoked. Surface to UI so
       // the user sees *why* their edits are queueing forever.
-      emitAuthError(requestKey);
+      emitAuthError();
       throw new ApiError(401, "HTTP 401");
     }
 
@@ -650,7 +674,7 @@ async function request<T>(
           return await request<T>(path, init, true);
         }
         // Refresh failed — the session is dead, not just the CSRF cookie.
-        emitAuthError(requestKey);
+        emitAuthError();
         throw new ApiError(401, "HTTP 401");
       }
       // The refresh succeeded but the retry still failed on auth (#1248).
@@ -668,9 +692,8 @@ async function request<T>(
       }
       throw new ApiError(res.status, `HTTP ${res.status}`, body);
     }
-    // Evidence the session works (see onAuthRecovered). Delete first so a
-    // retried request also forgets its own earlier failure.
-    if (authFailedRequests.delete(requestKey) || _retriedAfterRefresh) emitAuthRecovered();
+    // Evidence the session works (see onAuthRecovered).
+    if (authFailedRequests.has(requestKey) || _retriedAfterRefresh) emitAuthRecovered();
     try {
       return (await res.json()) as T;
     } catch (e) {

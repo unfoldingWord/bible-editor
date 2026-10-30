@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 // request() reads the be_csrf cookie for the X-CSRF-Token header.
 globalThis.document = { cookie: "be_csrf=test-token" };
 
-const { api, fetchAlerts, onAuthError, onAuthRefreshed, onAuthRecovered } = await import("./api.ts");
+const { api, fetchAlerts, onAuthError, onAuthRefreshed, onAuthRecovered, refreshAuthOnce } = await import("./api.ts");
 
 let ev;
 onAuthError(() => { ev.authError++; });
@@ -99,12 +99,22 @@ const save = () => api.patchVerse("ZEC", 1, 1, "ULT", 3, { content: {} });
   assert.equal(r.recovered, 0, "a later plain 200 on the same request is not a new recovery");
 }
 
-// 401, refresh succeeds, retry succeeds: the session works.
+// With no banner up, a 401 → refresh → 200 has nothing to clear.
 {
   const r = await run((u, i) => (i === 1 ? json(401, {}) : json(200, { alerts: [] })), fetchAlerts);
   assert.equal(r.refreshed, 1);
   assert.equal(r.authError, 0);
-  assert.equal(r.recovered, 1, "a retry that succeeds after a refresh is a recovery");
+  assert.equal(r.recovered, 0, "no banner raised, so no recovery event");
+}
+
+// With a banner up, any request that succeeds on its retry after a refresh is
+// a recovery: that request needed auth, and the session now serves it.
+{
+  const r1 = await run(() => json(401, {}), save);
+  assert.equal(r1.authError, 1);
+  const r2 = await run((u, i) => (i === 1 ? json(401, {}) : json(200, { alerts: [] })), fetchAlerts);
+  assert.equal(r2.refreshed, 1);
+  assert.equal(r2.recovered, 1, "a retry that succeeds after a refresh is a recovery");
 }
 
 // csrf_mismatch on the save, refresh succeeds, retry csrf again → banner; the
@@ -131,6 +141,58 @@ const save = () => api.patchVerse("ZEC", 1, 1, "ULT", 3, { content: {} });
   assert.equal(ev.recovered, 0);
   const r = await run((u, i) => (i === 1 ? json(401, {}) : json(200, { version: 7 })), save);
   assert.equal(r.recovered, 1, "the session working again clears the banner");
+}
+
+// Review of #1251: a refresh that failed raised the banner, and the session
+// then recovers through a refresh outside request() (the WebSocket's reconnect
+// refresh). The paused alerts poll never retries, and reads are
+// unauthenticated, so their plain 200s prove nothing. The refresh itself must
+// clear it.
+{
+  ev = { authError: 0, refreshed: 0, recovered: 0 };
+  globalThis.fetch = async (url) =>
+    String(url) === "/api/auth/refresh" ? json(503, {}) : json(401, {});
+  await fetchAlerts();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ev.authError, 1);
+  // A plain 200 on an unauthenticated read is not evidence.
+  const r1 = await run(() => json(200, {}), () => api.getChapter("ZEC", 1));
+  assert.equal(r1.recovered, 0, "a plain read 200 does not clear a refresh-failed banner");
+  const r2 = await run(() => json(200, {}), () => refreshAuthOnce());
+  assert.equal(r2.refreshed, 1);
+  assert.equal(r2.recovered, 1, "a later successful refresh clears a refresh-failed banner");
+}
+
+// ...but a refresh does not clear a banner raised by a retry that failed after
+// a successful refresh (the #1251 rule), even from outside request().
+{
+  const r1 = await run(() => json(401, {}), save);
+  assert.equal(r1.authError, 1);
+  const r2 = await run(() => json(200, {}), () => refreshAuthOnce());
+  assert.equal(r2.recovered, 0, "a refresh alone does not clear a stuck save's banner");
+  const r3 = await run(() => json(200, { version: 8 }), save);
+  assert.equal(r3.recovered, 1);
+}
+
+// A recovery forgets every recorded failure, so a stale key cannot clear a
+// later banner: alerts and the save both fail after refresh, the save
+// recovers, then a later save gets stuck again and an alerts 200 must not
+// clear that new banner.
+{
+  await run(() => json(401, {}), async () => {
+    await fetchAlerts();
+    await new Promise((r) => setTimeout(r, 0));
+    await save();
+  });
+  const r1 = await run(() => json(200, { version: 9 }), save);
+  assert.equal(r1.recovered, 1);
+  const r2 = await run((u) => (u === patchUrl ? json(401, {}) : json(200, { alerts: [] })), async () => {
+    await save().catch(() => {});
+    await new Promise((r) => setTimeout(r, 0));
+    await fetchAlerts();
+  });
+  assert.equal(r2.authError, 1);
+  assert.equal(r2.recovered, 0, "a stale alerts key does not clear the new stuck-save banner");
 }
 
 console.log("authRecovered.test.mjs: all assertions passed");
