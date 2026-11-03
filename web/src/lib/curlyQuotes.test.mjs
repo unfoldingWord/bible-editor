@@ -104,6 +104,10 @@ function assert(cond, msg) {
     "editable: line breaks become single spaces so words do not join",
   );
   assert(
+    pasteReplacement("1:6\rBut", "x", "editable") === "1:6 But",
+    "editable: a bare CR line break also becomes a space",
+  );
+  assert(
     pasteReplacement(`a\n"b"`, " ", "field") === "a\n“b”",
     "field: line breaks are left alone",
   );
