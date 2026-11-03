@@ -795,6 +795,61 @@ console.log("\n[reference-move attribution at the caller]");
     eq(afterSecond.review_reason, afterFirst.review_reason, "…the reason text itself is unchanged");
   }
 
+  // 6b. #1258: a ref_moved mint records WHEN it was raised (`_meta.flag_at`)
+  //     and the watermark it is bounded by (`flag_since`), exactly as the
+  //     merge_no_base mint does. A later run that only re-words the same kind
+  //     of flag (theirs_moved -> both_moved) keeps the FIRST mint's time, so
+  //     the flag's age is not reset by a re-stamp.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const boundary = seedMoved(sqlite);
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const opts = { confirmedAt: 200, editId: boundary };
+    const readFlag = () =>
+      sqlite.prepare(`SELECT version, review_kind, review_reason, review_master_json FROM tq_rows WHERE id='mv01'`).all()[0];
+    const T1 = Math.floor(FIXED_NOW_MS / 1000);
+    await applyTsvRows(env, BOOK, "tq", [masterAt("1:9", 1, 9)], null, opts);
+    const first = readFlag();
+    eq(first.review_kind, "ref_moved", "#1258: the master-side move is flagged ref_moved");
+    eq(parseSnap(first.review_master_json)._meta?.flag_at, T1, "#1258: …and the ref_moved mint records flag_at = the run's now");
+    eq(parseSnap(first.review_master_json)._meta?.flag_since, 200, "#1258: …and flag_since = the run's watermark");
+
+    // A day later the app ALSO moves the row (1:2 -> 1:6), so both sides moved:
+    // same kind, different reason, so the flag is re-written.
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=6, ref_raw='1:6' WHERE id='mv01'`).run();
+    const savedNow = Date.now;
+    Date.now = () => FIXED_NOW_MS + 86400 * 1000;
+    try {
+      await applyTsvRows(env, BOOK, "tq", [masterAt("1:9", 1, 9)], null, opts);
+    } finally {
+      Date.now = savedNow;
+    }
+    const second = readFlag();
+    eq(second.review_kind, "ref_moved", "#1258 re-stamp: still a ref_moved flag");
+    eq(second.review_reason !== first.review_reason, true, "#1258 re-stamp: …whose reason WAS rewritten (the write happened)");
+    eq(second.version > first.version, true, "#1258 re-stamp: …as a real versioned write");
+    eq(parseSnap(second.review_master_json)._meta?.flag_at, T1, "#1258 re-stamp: …but flag_at keeps the FIRST mint's time");
+    eq(parseSnap(second.review_master_json)._meta?.flag_since, 200, "#1258 re-stamp: …and its flag_since");
+  }
+
+  // 6c. #1258: a ref_moved re-stamp over a flag raised BEFORE flag_at existed
+  //     (no snapshot) has no first mint to keep, so it records this run's.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const boundary = seedMoved(sqlite, { reviewKind: "ref_moved" });
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    await applyTsvRows(env, BOOK, "tq", [masterAt("1:9", 1, 9)], null, { confirmedAt: 200, editId: boundary });
+    const row = sqlite.prepare(`SELECT review_reason, review_master_json FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_reason.includes("A Door43 editor moved this row"), true, "#1258: the pre-flag_at ref_moved flag is re-worded");
+    eq(
+      parseSnap(row.review_master_json)._meta?.flag_at,
+      Math.floor(FIXED_NOW_MS / 1000),
+      "#1258: …and, having no earlier flag_at to keep, records this run's",
+    );
+  }
+
   // 7. The references AGREE again, and a flag from an earlier run is still on
   //    the row (issue #588). Before the fix nothing cleared it: the only clear
   //    lived in the ours_moved branch, so a resolved reference kept its cleanup
@@ -1197,6 +1252,48 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(reRun.review_kind, "merge_conflict", "…still flagged the same way");
     eq(reRun.review_reason, reasonBefore, "…and the reason is NOT rewritten for identity drift alone");
     eq(reRun.review_reason.includes(ISO_NAME("Richard Mahn")), false, "…so no churn from the newly measured commit");
+  }
+
+  // 3c. #1258: a merge_conflict mint records `_meta.flag_at` (the run's now)
+  //     and `flag_since` (the run's watermark), as the merge_no_base mint does.
+  //     A later run whose finding changes (a second field now collides too)
+  //     re-writes the reason but keeps the FIRST mint's flag_at.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const opts = { confirmedAt: 200, editId: boundary, lineage: HAS_HUMAN };
+    const readFlag = () =>
+      sqlite.prepare(`SELECT version, review_kind, review_reason, review_master_json FROM tq_rows WHERE id='ai01'`).all()[0];
+    const T1 = Math.floor(FIXED_NOW_MS / 1000);
+    await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, opts);
+    const first = readFlag();
+    eq(first.review_kind, "merge_conflict", "#1258: the collision is flagged merge_conflict");
+    eq(parseSnap(first.review_master_json)._meta?.flag_at, T1, "#1258: …and the merge_conflict mint records flag_at = the run's now");
+    eq(parseSnap(first.review_master_json)._meta?.flag_since, 200, "#1258: …and flag_since = the run's watermark");
+    eq(parseSnap(first.review_master_json).response, "a maintainer's fix", "#1258: …next to Door43's own values, unchanged");
+
+    // A day later both sides have moved the question as well: same kind of
+    // flag, a different finding ("question and response"), so it is re-written.
+    sqlite
+      .prepare(`UPDATE tq_rows SET question = 'our reworded question', response = 'our response', version = version + 1 WHERE id='ai01'`)
+      .run();
+    const savedNow = Date.now;
+    Date.now = () => FIXED_NOW_MS + 86400 * 1000;
+    try {
+      await applyTsvRows(
+        env, BOOK, "tq",
+        [{ ...masterRowAt("a second maintainer fix"), question: "master's reworded question" }],
+        null, opts,
+      );
+    } finally {
+      Date.now = savedNow;
+    }
+    const second = readFlag();
+    eq(second.review_kind, "merge_conflict", "#1258 re-stamp: still a merge_conflict flag");
+    eq(second.review_reason.includes("question and response"), true, "#1258 re-stamp: …whose reason WAS rewritten for the new finding");
+    eq(second.version > first.version + 1, true, "#1258 re-stamp: …as a real versioned write");
+    eq(parseSnap(second.review_master_json)._meta?.flag_at, T1, "#1258 re-stamp: …but flag_at keeps the FIRST mint's time");
+    eq(parseSnap(second.review_master_json)._meta?.flag_since, 200, "#1258 re-stamp: …and its flag_since");
   }
 
   // 4. No lineage at all — the field an in-flight Workflow's memoized plan does
