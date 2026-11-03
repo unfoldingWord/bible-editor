@@ -824,6 +824,9 @@ const ChapterBlock = memo(function ChapterBlock({
     if (!readyData) return [] as number[];
     const set = new Set<number>();
     for (const v of enabledVersions) {
+      // T4T is a read-only overlay: it must not add rows (its headings parse
+      // as verse 0, and its versification can differ from ULT's).
+      if (v === "T4T") continue;
       const m = readyData.verses[v];
       if (!m) continue;
       for (const k of Object.keys(m)) set.add(parseInt(k, 10));

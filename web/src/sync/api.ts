@@ -756,7 +756,8 @@ export async function fetchLexiconEntries(strongs: string[]): Promise<LexiconEnt
 // (served from R2, never D1). Parsed client-side by lib/t4t.ts.
 export async function fetchT4tUsfm(book: string): Promise<string> {
   const res = await request<{ usfm?: string }>(`/api/t4t/${encodeURIComponent(book)}`);
-  return res.usfm ?? "";
+  if (typeof res.usfm !== "string" || res.usfm === "") throw new Error("T4T: empty response");
+  return res.usfm;
 }
 
 // GET /api/alerts/me — undismissed banner alerts targeted at this user.
