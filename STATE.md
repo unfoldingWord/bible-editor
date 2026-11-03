@@ -241,11 +241,15 @@ Highlights that bite repeatedly:
   per live row is exempt), so their mint evidence expires. tn rows are never swept (#1057). #683 (`sweepStaleMergeNoBase`) derives a pre-#653 flag's window from the mint
   run's persisted lineage, admitted only when `master_lineage_computed_at <= mintAt` proves that lineage is the
   mint's own and not a later overwrite.
-- **Only `merge_no_base` flags carry `_meta.flag_at`; `merge_conflict` and `ref_moved` mints do not** (only
-  `bookReimport.ts:2432` passes `mint` to `masterReviewSnapshot`). Their mint evidence is the sync's own edit_log
-  row: `source='dcs_reimport'`, `action='update'`, payload = the changed fields only (`:3217`), so a non-null
-  `review_kind` in it means that write set the flag. On 2026-11-03, 8 of 9 new tn flags had no `flag_at` and all 9
-  had that edit_log row (#1256, `scripts/watchdog/tsvReviewFlags.mjs`). Querying flagged rows: no `ORDER BY`. With
+- **Every sync-minted flag carries `_meta.flag_at` since #1258; flags minted before that deploy may not.** Until
+  #1258 only the merge_no_base mint passed `mint` to `masterReviewSnapshot`; on 2026-11-03, 8 of 9 new tn flags
+  (merge_conflict) had no `flag_at`. Now ref_moved and merge_conflict mint it too, and a same-kind re-stamp (only
+  the reason changed) keeps the existing `flag_at`/`flag_since` (`keptOrNewMint`). A pre-#1258 flag that is
+  re-stamped after the deploy has none to keep, so it gets the re-stamp time: later than its true mint. For those
+  older flags the mint evidence is still the sync's own edit_log row: `source='dcs_reimport'`, `action='update'`,
+  payload = the changed fields only, so a non-null `review_kind` in it means that write set the flag (#1256,
+  `scripts/watchdog/tsvReviewFlags.mjs`). `flag_since` on a ref_moved/merge_conflict row changes no clearing: every
+  clear that reads it filters `review_kind = 'merge_no_base'`. Querying flagged rows: no `ORDER BY`. With
   one, D1 scans tn_rows' primary-key index (81,332 rows read) instead of the partial `idx_tn_rows_review_book` (65).
   And write the edit_log action filter as `+e.action = 'update'`: a plain `e.action =` term makes the planner walk
   `edit_log_kind_action_created` (26,577 rows read) instead of `edit_log_row_by_book`.

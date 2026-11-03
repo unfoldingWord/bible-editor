@@ -10,8 +10,12 @@
 // rows.ts's non-versioning fast paths (reorder drag, preserve/hint and trash
 // toggles) move updated_at and leave review_kind standing (STATE.md). Mint
 // evidence, in order:
-//   1. review_master_json._meta.flag_at — written only by the merge_no_base
-//      mint (bookReimport.ts masterReviewSnapshot's `mint` argument);
+//   1. review_master_json._meta.flag_at — written by every sync mint
+//      (bookReimport.ts masterReviewSnapshot's `mint` argument). Before #1258
+//      only merge_no_base wrote it, so an older merge_conflict / ref_moved flag
+//      may lack it. A same-kind re-stamp keeps the first mint's flag_at, so it
+//      does not count as set tonight; a re-stamp of a flag that had no flag_at
+//      records the re-stamp time;
 //   2. the sync's own edit_log write of the flag (source 'dcs_reimport',
 //      action 'update' — the clears log as 'sync_clear_review' — with a
 //      payload of changed fields carrying a non-null review_kind). merge_conflict

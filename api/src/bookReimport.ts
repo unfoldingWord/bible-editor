@@ -1914,7 +1914,10 @@ export async function applyTsvRows(
       // below compare against it to avoid re-writing an identical message every
       // night — and a version bump is not free (#539). Without the column those
       // comparisons run against `undefined` and never short-circuit.
-      `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, ${pristineCols}, review_kind, review_reason,
+      // review_master_json is selected for the same two writers (#1258): a
+      // re-stamp of the same kind of flag keeps the first mint's `_meta.flag_at`
+      // (snapshotMint), so it has to read the snapshot already on the row.
+      `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, ${pristineCols}, review_kind, review_reason, review_master_json,
               (SELECT source FROM edit_log
                  WHERE kind = ?2 AND row_key = ${kind}_rows.id
                    AND (book = ?1 OR book IS NULL)
@@ -2541,6 +2544,16 @@ export async function applyTsvRows(
       const surfaceField = kind === "twl" ? "orig_words" : "quote";
       const adoptedSurface = adopted && surfaceField in fields;
 
+      // #1258: the `mint` for a ref_moved or merge_conflict snapshot. A write
+      // over a flag of the SAME kind is a re-stamp (only the reason changed),
+      // so it keeps that flag's recorded mint and the flag's age is not reset.
+      // Anything else (no flag, another kind, or a flag raised before mints
+      // were recorded on these kinds) is a mint now, bounded by this run's
+      // watermark, exactly as the merge_no_base mint above.
+      const keptOrNewMint = (reviewKind: string): { at: number; since: number | null } =>
+        (cur.review_kind === reviewKind ? snapshotMint(cur.review_master_json as string | null) : null) ??
+        { at: now, since: masterConfirmedAt };
+
       // Only ever raise a ref_moved flag over nothing or over an existing
       // ref_moved. A `merge_conflict` set by the block below (or by a previous
       // run and not yet acknowledged) says something this one does not and must
@@ -2556,7 +2569,10 @@ export async function applyTsvRows(
         // flag. Inside the dedup guard above deliberately — a night that writes
         // no new flag writes no new snapshot either, so this cannot re-bump a
         // version on its own.
-        fields.review_master_json = masterReviewSnapshot(kind, row);
+        //
+        // #1258: the mint is recorded here too, and a re-worded ref_moved keeps
+        // the first one's (keptOrNewMint), so the flag's age survives a re-stamp.
+        fields.review_master_json = masterReviewSnapshot(kind, row, keptOrNewMint("ref_moved"));
       };
 
       if (refMove === "ours_moved" && !adoptedSurface) {
@@ -2800,8 +2816,9 @@ export async function applyTsvRows(
           fields.review_reason = reason;
           // #653: master's own values for the row, so "Door43's edit was merged
           // over yours" can be checked rather than believed. Inside the dedup
-          // guard for the same reason as flagRefMoved's.
-          fields.review_master_json = masterReviewSnapshot(kind, row);
+          // guard for the same reason as flagRefMoved's. #1258: with its mint,
+          // kept from the existing flag when this only re-words a merge_conflict.
+          fields.review_master_json = masterReviewSnapshot(kind, row, keptOrNewMint(reviewKind));
         }
       }
 
@@ -3429,6 +3446,25 @@ function snapshotFlagSince(json: string | null): number | null {
     if (!meta || typeof meta !== "object") return null;
     const since = (meta as Record<string, unknown>).flag_since;
     return typeof since === "number" && Number.isFinite(since) ? since : null;
+  } catch {
+    return null;
+  }
+}
+
+// The whole mint a stored snapshot carries, for a re-stamp to keep (#1258).
+// Null unless `flag_at` is a usable number, for the same reason as above. A
+// `flag_since` that is not a number comes back null (the mint recorded no
+// watermark), never a coerced 0.
+function snapshotMint(json: string | null): { at: number; since: number | null } | null {
+  if (!json) return null;
+  try {
+    const p = JSON.parse(json);
+    if (!p || typeof p !== "object" || Array.isArray(p)) return null;
+    const meta = (p as Record<string, unknown>)._meta;
+    if (!meta || typeof meta !== "object") return null;
+    const { flag_at: at, flag_since: since } = meta as Record<string, unknown>;
+    if (typeof at !== "number" || !Number.isFinite(at)) return null;
+    return { at, since: typeof since === "number" && Number.isFinite(since) ? since : null };
   } catch {
     return null;
   }
