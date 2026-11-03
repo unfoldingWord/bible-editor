@@ -2088,7 +2088,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // `data.verses` / versesForTiles, which feed tiles, lane checks, the
   // TN/TQ/TWL verse range and alignment lookups. Memoized so the column's
   // memo comparator (identity on versesByVersion / bookChapters) holds.
-  const t4tBook = useT4t(book, enabledVersions.includes(T4T_VERSION));
+  const t4t = useT4t(book, enabledVersions.includes(T4T_VERSION));
+  const t4tBook = t4t.verses;
   const columnVerses = useMemo(() => {
     if (!data) return undefined;
     if (!t4tBook) return data.verses;
@@ -4709,6 +4710,25 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             : ""}
         </Alert>
       ))}
+      {t4t.failed && (
+        <Alert
+          severity="warning"
+          data-testid="t4t-unavailable"
+          action={
+            <Button color="inherit" size="small" onClick={t4t.retry} data-testid="t4t-retry">
+              Retry
+            </Button>
+          }
+          sx={{
+            borderRadius: 0,
+            borderBottom: "1px solid",
+            borderColor: "divider",
+            py: 0,
+          }}
+        >
+          T4T unavailable for {book}.
+        </Alert>
+      )}
       {chapterStale && (
         // The stale copy is locked until the new chapter lands (#892); say so,
         // especially when the load is retrying (offline / slow network).
