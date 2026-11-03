@@ -46,7 +46,7 @@ type Scope = "chapter" | "book";
 
 // Original-language source texts are upstream, read-only resources — not
 // translation output anyone is formatting here.
-const SOURCE_VERSIONS = new Set(["UHB", "UGNT"]);
+const SOURCE_VERSIONS = new Set(["UHB", "UGNT", "T4T"]);
 
 export function PrintPreviewButton({ book, chapter, enabledVersions, chapterVersesFor }: Props) {
   const [open, setOpen] = useState(false);

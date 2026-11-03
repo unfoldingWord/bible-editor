@@ -55,7 +55,7 @@ import {
 // UHB / UGNT are upstream source texts — the worker returns 403 on PATCH.
 // Filtering replace matches here keeps the outbox from queueing ops that
 // will fatally fail.
-const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT"]);
+const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT", "T4T"]);
 
 // Debounce corpus scans and highlights; typing never requests a scroll.
 const FIND_DEBOUNCE_MS = 180;
@@ -1507,9 +1507,11 @@ function collectMatches(
   // In source mode we want to search UHB/UGNT even if the user hasn't
   // ticked them in the version toggles (in stacked mode they aren't toggle-
   // able at all, but the active verse's source row is still shown).
+  // T4T is a read-only reference version: never a find/replace target.
+  const scannable = enabledVersions.filter((v) => v !== "T4T");
   const versionsToScan = sourceMode
-    ? Array.from(new Set([...enabledVersions, "UHB", "UGNT"]))
-    : enabledVersions;
+    ? Array.from(new Set([...scannable, "UHB", "UGNT"]))
+    : scannable;
   // Everything collectChapterMatches' output depends on besides the
   // chapter's own content — a query/version/scope change must still rescan
   // every chapter even though none of their ChapterState objects changed.

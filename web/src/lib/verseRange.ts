@@ -230,6 +230,8 @@ export function rowHighlightsFor(
   partialGroups = false,
   fallbackSource?: unknown,
 ): Set<HighlightKey> {
+  // T4T is a read-only reference with no alignment: never highlighted.
+  if (bibleVersion === "T4T") return new Set();
   if (target && isRangeRow(target)) {
     const [start, end] = verseSpan(target);
     if (noteVerse != null && noteVerse > start && noteVerse <= end) {

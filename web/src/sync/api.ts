@@ -752,6 +752,14 @@ export async function fetchLexiconEntries(strongs: string[]): Promise<LexiconEnt
   return res.entries ?? [];
 }
 
+// GET /api/t4t/:book — raw USFM of the read-only T4T reference version
+// (served from R2, never D1). Parsed client-side by lib/t4t.ts.
+export async function fetchT4tUsfm(book: string): Promise<string> {
+  const res = await request<{ usfm?: string }>(`/api/t4t/${encodeURIComponent(book)}`);
+  if (typeof res.usfm !== "string" || res.usfm === "") throw new Error("T4T: empty response");
+  return res.usfm;
+}
+
 // GET /api/alerts/me — undismissed banner alerts targeted at this user.
 // Empty array when there's nothing to show; null on a 401 (not signed in
 // yet), so the caller can tell "no alerts" from "didn't get an answer". Used

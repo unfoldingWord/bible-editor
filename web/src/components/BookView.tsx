@@ -54,7 +54,7 @@ interface SearchState {
   sourceQuery: SourceQueryKind;
 }
 
-const READ_ONLY = new Set(["UHB", "UGNT"]);
+const READ_ONLY = new Set(["UHB", "UGNT", "T4T"]);
 
 const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
 
@@ -824,6 +824,9 @@ const ChapterBlock = memo(function ChapterBlock({
     if (!readyData) return [] as number[];
     const set = new Set<number>();
     for (const v of enabledVersions) {
+      // T4T is a read-only overlay: it must not add rows (its headings parse
+      // as verse 0, and its versification can differ from ULT's).
+      if (v === "T4T") continue;
       const m = readyData.verses[v];
       if (!m) continue;
       for (const k of Object.keys(m)) set.add(parseInt(k, 10));
@@ -1194,6 +1197,7 @@ const VerseRow = memo(function VerseRow({
                 bridgeNoteVerse != null &&
                 bv !== "UHB" &&
                 bv !== "UGNT" &&
+                bv !== "T4T" &&
                 dto?.verse_end != null &&
                 dto.verse_end >= bridgeNoteVerse
               }
@@ -1203,7 +1207,7 @@ const VerseRow = memo(function VerseRow({
               activeNoteVerse={activeNoteVerse}
               reorderHighlight={reorderHighlight}
               activeSourceContent={activeSourceContent}
-              search={search}
+              search={bv === "T4T" ? null : search}
               findActiveMatch={findActiveMatch?.bibleVersion === bv ? findActiveMatch : null}
               lexiconMap={directionForVersion(bv) === "rtl" ? lexiconMap : EMPTY_LEX}
               twl={twl}

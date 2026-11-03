@@ -581,6 +581,12 @@ Highlights that bite repeatedly:
   order; milestones come out NFC. Skipping this silently breaks alignment matching.
 - **`usfm-js` parks leading punctuation/markers on the node's `text`** — markers can carry text; opening
   quotes after a marker live on the marker node, not as a sibling.
+- **The shared verse renderer (`segmentByParagraphs` in `highlight.ts`) silently drops the text of character
+  markers it does not know** (`\add`, `\bd`, `\sc`), and `usfm-js` parses an unnumbered `\li` as a character
+  marker that nests every following line as `children`. ULT/UST don't use these; T4T does, so `lib/t4t.ts`
+  normalizes T4T before rendering. Any new USFM source: diff rendered text against `plain_text` over the whole
+  corpus before shipping (T4T: 29 of 31,831 verses lost words before the fix). DCS also gzips raw files and
+  then sends no Content-Length, so a length check needs `dcsFileSize`.
 - **A real `\d` (Psalm superscription) node from `usfm-js@3.5.0` never carries a `type` field, and — measured
   directly against the repo's pinned version, not assumed — when `\zaln-s`/`\w` alignment markup follows `\d`
   on the same or next line, `usfm-js` does NOT nest that markup as `\d`'s `children`: `\d` parses to a bare

@@ -35,7 +35,7 @@ type Scope = "chapter" | "book";
 
 // Original-language source texts are not offered for USFM export — they're
 // upstream, read-only resources, not translation output the user edits here.
-const SOURCE_VERSIONS = new Set(["UHB", "UGNT"]);
+const SOURCE_VERSIONS = new Set(["UHB", "UGNT", "T4T"]);
 
 function download(filename: string, contents: string): void {
   const blob = new Blob([contents], { type: "text/plain;charset=utf-8" });
