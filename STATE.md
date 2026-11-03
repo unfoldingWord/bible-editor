@@ -241,6 +241,14 @@ Highlights that bite repeatedly:
   per live row is exempt), so their mint evidence expires. tn rows are never swept (#1057). #683 (`sweepStaleMergeNoBase`) derives a pre-#653 flag's window from the mint
   run's persisted lineage, admitted only when `master_lineage_computed_at <= mintAt` proves that lineage is the
   mint's own and not a later overwrite.
+- **Only `merge_no_base` flags carry `_meta.flag_at`; `merge_conflict` and `ref_moved` mints do not** (only
+  `bookReimport.ts:2432` passes `mint` to `masterReviewSnapshot`). Their mint evidence is the sync's own edit_log
+  row: `source='dcs_reimport'`, `action='update'`, payload = the changed fields only (`:3217`), so a non-null
+  `review_kind` in it means that write set the flag. On 2026-11-03, 8 of 9 new tn flags had no `flag_at` and all 9
+  had that edit_log row (#1256, `scripts/watchdog/tsvReviewFlags.mjs`). Querying flagged rows: no `ORDER BY`. With
+  one, D1 scans tn_rows' primary-key index (81,332 rows read) instead of the partial `idx_tn_rows_review_book` (65).
+  And write the edit_log action filter as `+e.action = 'update'`: a plain `e.action =` term makes the planner walk
+  `edit_log_kind_action_created` (26,577 rows read) instead of `edit_log_row_by_book`.
 - **A column added by a migration is NULL for exactly the rows a backlog-draining fix cares about, because those
   rows are stuck precisely for want of a later run to fill it.** #683's first cut derived its window from
   `book_resource_syncs.master_lineage_confirmed_at` (migration 0058, deployed 2026-08-31). Measured read-only in

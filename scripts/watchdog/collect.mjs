@@ -22,6 +22,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { classifyVisibleAdoptionChange } from "../../api/src/visibleAdoptionChange.ts";
+import { TSV_KINDS, classifyTsvReviewFlags, sinceEpoch, tsvReviewFlagsLine, tsvReviewFlagsSql } from "./tsvReviewFlags.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const OUT = process.argv[2];
@@ -129,6 +130,18 @@ for (const r of active) {
   }
 }
 bundle.openReviews = { provenFalse: proven, real, other };
+
+// #1256: tn/tq/twl rows the sync flags directly (review_kind), which the
+// verse rows above never include. Reported only: never proposed for resolve.
+const tsvFailed = [];
+const tsvByKind = {};
+for (const kind of TSV_KINDS) {
+  tsvByKind[kind] = step(`open TSV review flags ${kind}`, () => q(tsvReviewFlagsSql(kind)));
+  if (tsvByKind[kind] == null) tsvFailed.push(kind);
+}
+bundle.openReviews.tsv = classifyTsvReviewFlags(tsvByKind, sinceEpoch(day));
+// Which kinds are missing from tsv when a query failed (also in bundle.errors).
+bundle.openReviews.tsvFailedKinds = tsvFailed;
 
 // The repair, as a proposal. Only EDITOR alerts qualify, and only when every
 // ref they name is in the proven set. Admin summary alerts are never proposed:
@@ -309,6 +322,7 @@ const summary = [
   activeOk
     ? `- Open review rows: ${active.length} (proven false: ${proven.length}, real: ${real.length}, other: ${other.length})`
     : `- Open review rows: unknown (query failed)`,
+  tsvReviewFlagsLine(bundle.openReviews.tsv, { failed: tsvFailed }),
   `- Proposed resolve: ${proven.length} row(s), ${qualifying.length} editor alert(s)${proven.length ? " — see proposed-resolve.sql" : ""}`,
   ``,
   `## export_revert alerts`,
