@@ -54,7 +54,7 @@ interface SearchState {
   sourceQuery: SourceQueryKind;
 }
 
-const READ_ONLY = new Set(["UHB", "UGNT"]);
+const READ_ONLY = new Set(["UHB", "UGNT", "T4T"]);
 
 const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
 
@@ -1194,6 +1194,7 @@ const VerseRow = memo(function VerseRow({
                 bridgeNoteVerse != null &&
                 bv !== "UHB" &&
                 bv !== "UGNT" &&
+                bv !== "T4T" &&
                 dto?.verse_end != null &&
                 dto.verse_end >= bridgeNoteVerse
               }
@@ -1203,7 +1204,7 @@ const VerseRow = memo(function VerseRow({
               activeNoteVerse={activeNoteVerse}
               reorderHighlight={reorderHighlight}
               activeSourceContent={activeSourceContent}
-              search={search}
+              search={bv === "T4T" ? null : search}
               findActiveMatch={findActiveMatch?.bibleVersion === bv ? findActiveMatch : null}
               lexiconMap={directionForVersion(bv) === "rtl" ? lexiconMap : EMPTY_LEX}
               twl={twl}

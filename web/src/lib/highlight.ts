@@ -1120,6 +1120,15 @@ function segmentByParagraphs(
       // silently dropping "Selah" (and any alignment on it) from the render
       // while extractEditableText still includes it, the classic
       // content-drop-on-save signature also fixed for `\d` below.
+      // T4T's `\add` supplied words (renamed to a private tag by lib/t4t.ts,
+      // so no ULT/UST node can reach this branch): render italic.
+      if (o["tag"] === "t4t-add") {
+        current.html += "<em>";
+        if (typeof o["text"] === "string") current.html += escapeHtml(String(o["text"]));
+        if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
+        current.html += "</em>";
+        continue;
+      }
       if (isCharacterWrapper(o)) {
         current.html += '<span class="be-qs">';
         if (Array.isArray(o["children"]) && (o["children"] as unknown[]).length > 0) {
@@ -1361,7 +1370,7 @@ export function highlightsFor(
   sourceContent?: unknown,
   partialGroups = false,
 ): Set<HighlightKey> {
-  if (!quote) return new Set();
+  if (!quote || bibleVersion === "T4T") return new Set();
   const verseObjects = (verseContent as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(verseObjects)) return new Set();
   const occ = occurrence ?? 1;

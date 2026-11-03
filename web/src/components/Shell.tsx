@@ -20,12 +20,14 @@ import LockIcon from "@mui/icons-material/Lock";
 import { useChapter } from "../hooks/useChapter";
 import { OpenChapterProvider } from "./NoteLinkPreview";
 import { useChapterRoom } from "../hooks/useChapterRoom";
-import type { UseBookReturn } from "../hooks/useBook";
+import type { ChapterState, UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
 import { lintChapterForSavedOp, WHOLE_BOOK_LINT_MAX_AGE_MS } from "../hooks/lintRefreshScope";
 import { useBookLocks } from "../hooks/useBookLocks";
 import { useAlignmentAttention } from "../hooks/useAlignmentAttention";
 import { useLexicon } from "../hooks/useLexicon";
+import { useT4t, type T4tBook } from "../hooks/useT4t";
+import { T4T_VERSION } from "../lib/t4t";
 import { useAiDrafts } from "../hooks/useAiDrafts";
 import { useTwlFilters } from "../hooks/useTwlFilters";
 import { useUnsavedGuard } from "../hooks/useUnsavedGuard";
@@ -2072,11 +2074,53 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         for (const v of Object.keys(cs.data.verses)) set.add(v);
       }
     }
+    // T4T (read-only reference) is never in the chapter payload — it is
+    // fetched separately, and only once enabled — so offer it explicitly or it
+    // could never be switched on in the version picker.
+    if (set.size > 0) set.add(T4T_VERSION);
     return [...set];
     // `bookHook?.chapters` rather than `bookHook`: narrower — the hook object
     // also changes on summary/summaryStatus, which don't affect this set.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [versesForTiles, mode, bookHook?.chapters]);
+
+  // T4T is merged ONLY into what the scripture column renders — never into
+  // `data.verses` / versesForTiles, which feed tiles, lane checks, the
+  // TN/TQ/TWL verse range and alignment lookups. Memoized so the column's
+  // memo comparator (identity on versesByVersion / bookChapters) holds.
+  const t4tBook = useT4t(book, enabledVersions.includes(T4T_VERSION));
+  const columnVerses = useMemo(() => {
+    if (!data) return undefined;
+    if (!t4tBook) return data.verses;
+    return { ...data.verses, [T4T_VERSION]: t4tBook.get(data.chapter) ?? {} };
+  }, [data?.verses, data?.chapter, t4tBook]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Per-chapter merge cache keyed on the ChapterState object, so an edit in one
+  // chapter does not hand every other chapter a fresh identity.
+  const [t4tMergeCache] = useState(() => new WeakMap<object, { t4t: T4tBook; cs: ChapterState }>());
+  const columnBookChapters = useMemo(() => {
+    if (!bookHook || mode !== "book") return undefined;
+    if (!t4tBook) return bookHook.chapters;
+    const out = new Map<number, ChapterState>();
+    for (const [ch, cs] of bookHook.chapters) {
+      if (cs.kind !== "ready") {
+        out.set(ch, cs);
+        continue;
+      }
+      const hit = t4tMergeCache.get(cs);
+      if (hit && hit.t4t === t4tBook) {
+        out.set(ch, hit.cs);
+        continue;
+      }
+      const merged: ChapterState = {
+        ...cs,
+        data: { ...cs.data, verses: { ...cs.data.verses, [T4T_VERSION]: t4tBook.get(ch) ?? {} } },
+      };
+      t4tMergeCache.set(cs, { t4t: t4tBook, cs: merged });
+      out.set(ch, merged);
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookHook?.chapters, mode, t4tBook, t4tMergeCache]);
 
   // Range-aware lookup: ChapterPayload.verses is keyed by verse_start, so a
   // row anchored mid-bridge (e.g. verse 9 of a `\v 8-9` row) misses a direct
@@ -4757,7 +4801,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           textCheck={textLaneCheck}
           verseCommentCounts={verseCommentCounts}
           onOpenVerseComments={onOpenVerseComments}
-          versesByVersion={data.verses}
+          versesByVersion={columnVerses ?? data.verses}
           verseNumbers={verseNumbers}
           activeVerse={activeVerse}
           activeNoteQuote={activeQuote}
@@ -4770,7 +4814,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           enabledVersions={displayedVersions}
           availableVersions={availableVersions}
           bookChapterList={bookChapterList}
-          bookChapters={bookHook && mode === "book" ? bookHook.chapters : undefined}
+          bookChapters={columnBookChapters}
           bookViewportRestoreRef={bookViewportRestoreRef}
           onLoadBookChapter={bookHook ? bookHook.loadChapter : undefined}
           onSelectBookVerse={(ch, v, viewport, onAccepted) => {

@@ -206,9 +206,10 @@ const VERSION_LABEL: Record<string, string> = {
   UST: "UST",
   UHB: "UHB",
   UGNT: "UGNT",
+  T4T: "T4T",
 };
 
-const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT"]);
+const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT", "T4T"]);
 
 // Stable empty column so a missing version (`indexByVersion["ULT"] ?? …`)
 // doesn't hand InactiveVerseRow a fresh `{}` each render and defeat its memo.
@@ -792,7 +793,7 @@ function ScriptureColumnInner({
                 scrollNonce={scrollNonce}
                 lexiconMap={v === "UHB" ? lexiconMap : undefined}
                 twl={v === "UHB" ? twl : undefined}
-                search={search}
+                search={v === "T4T" ? null : search}
                 findActiveMatch={findScrollTarget}
                 onSelectVerse={selectLocalVerse}
                 onEditVerse={(verseNum, plain, base) => onEditVerse(verseNum, v, plain, base)}
@@ -971,6 +972,8 @@ function StackedBody({
 }) {
   const ult = indexByVersion["ULT"] ?? EMPTY_COLUMN;
   const ust = indexByVersion["UST"] ?? EMPTY_COLUMN;
+  // Present only when the user enabled the read-only T4T reference version.
+  const t4t = indexByVersion["T4T"];
   const uhb = indexByVersion["UHB"] ?? indexByVersion["UGNT"] ?? EMPTY_COLUMN;
   const uhbLabel = isHebrew ? "UHB" : "UGNT";
   // OL-anchor the ULT/UST highlights on the active verse's source (UHB/UGNT)
@@ -1209,6 +1212,20 @@ function StackedBody({
                   ustV && ustStart >= 1 ? onSplitBridge : undefined
                 }
               />
+              {t4t?.[v] && (
+                <ActiveLine
+                  book={book}
+                  bibleVersion="T4T"
+                  label={isRangeRow(t4t[v]) ? `T4T ${formatVerseLabel(t4t[v])}` : "T4T"}
+                  chapter={chapter}
+                  verseNum={t4t[v].verse}
+                  text={t4t[v].plain_text ?? ""}
+                  content={t4t[v].content}
+                  search={null}
+                  findActiveMatch={null}
+                  readOnly
+                />
+              )}
               {uhbV && (
                 <ActiveLine
                   book={book}
@@ -1249,6 +1266,8 @@ function StackedBody({
           !!activeNoteQuote;
         const showUlt = !!ultV && isFirstOfRange(ultV, v);
         const showUst = !!ustV && isFirstOfRange(ustV, v);
+        const t4tV = t4t?.[v];
+        const showT4t = !!t4tV && isFirstOfRange(t4tV, v);
         return (
           <InactiveVerseRow
             key={v}
@@ -1259,6 +1278,8 @@ function StackedBody({
             uhb={uhb}
             ultPrev={showUlt ? findPrevRowInColumn(ult, ultV.verse) : null}
             ustPrev={showUst ? findPrevRowInColumn(ust, ustV.verse) : null}
+            t4tV={t4tV}
+            t4tPrev={showT4t && t4t ? findPrevRowInColumn(t4t, t4tV.verse) : null}
             noteQuote={coverHighlight ? activeNoteQuote : null}
             noteOccurrence={coverHighlight ? activeNoteOccurrence : null}
             noteVerse={coverHighlight ? activeNoteVerse ?? null : null}
@@ -1292,6 +1313,8 @@ const InactiveVerseRow = memo(
     uhb,
     ultPrev,
     ustPrev,
+    t4tV,
+    t4tPrev,
     noteQuote,
     noteOccurrence,
     noteVerse,
@@ -1309,6 +1332,9 @@ const InactiveVerseRow = memo(
     uhb: Record<number, VerseDto>;
     ultPrev: VerseDto | null;
     ustPrev: VerseDto | null;
+    // Read-only T4T reference row; undefined unless T4T is enabled.
+    t4tV?: VerseDto;
+    t4tPrev?: VerseDto | null;
     noteQuote: string | null;
     noteOccurrence: number | null;
     noteVerse: number | null;
@@ -1340,6 +1366,7 @@ const InactiveVerseRow = memo(
     // underneath it. For singletons, dto.verse === v always.
     const showUlt = ultV && isFirstOfRange(ultV, v);
     const showUst = ustV && isFirstOfRange(ustV, v);
+    const showT4t = t4tV && isFirstOfRange(t4tV, v);
     return (
       <Box
         data-scripture-verse={v}
@@ -1503,6 +1530,29 @@ const InactiveVerseRow = memo(
             </Box>
           </>
         )}
+        {showT4t && (
+          <>
+            <Typography
+              component="span"
+              variant="caption"
+              sx={{
+                gridColumn: 1,
+                gridRow: 4,
+                fontFamily: "monospace",
+                color: "text.disabled",
+                fontWeight: 600,
+                fontSize: 10,
+                textAlign: "right",
+              }}
+            >
+              {isRangeRow(t4tV) ? `T4T ${formatVerseLabel(t4tV)}` : "T4T"}
+            </Typography>
+            <Box sx={{ gridColumn: 2, gridRow: 4, minWidth: 0 }}>
+              {/* Read-only reference: no find marks, no note highlights. */}
+              <StackedRowBody dto={t4tV} prevDto={t4tPrev ?? null} search={null} />
+            </Box>
+          </>
+        )}
       </Box>
     );
   },
@@ -1513,6 +1563,8 @@ const InactiveVerseRow = memo(
     a.ustV === b.ustV &&
     a.ultPrev === b.ultPrev &&
     a.ustPrev === b.ustPrev &&
+    a.t4tV === b.t4tV &&
+    a.t4tPrev === b.t4tPrev &&
     a.noteQuote === b.noteQuote &&
     a.noteOccurrence === b.noteOccurrence &&
     a.noteVerse === b.noteVerse &&
