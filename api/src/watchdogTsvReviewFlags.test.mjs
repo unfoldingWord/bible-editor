@@ -97,7 +97,7 @@ assert(rows.map((r) => `${r.kind}/${r.book}/${r.id}`).join(",") ===
 // --- summary line -------------------------------------------------------
 assert(
   tsvReviewFlagsLine(rows, { failed: [] }) ===
-    "- TSV review flags: 8 open (2 set tonight: 1 by flag_at, 1 by sync edit_log; 2 more touched tonight with no mint time); " +
+    "- TSV review flags: 8 open (2 set tonight: 1 new by flag_at, 1 new or re-stamped by sync edit_log; 2 more touched tonight with no mint time); " +
       "tn=6, tq=2, twl=0; tonight: tn EZK logd merge_conflict, tn EZK mint merge_no_base, " +
       "tn EZK nomt merge_conflict (touched, no mint time), tq HOS isoa ref_moved (touched, no mint time)",
   "summary line: totals, split by evidence, per kind, tonight's rows",
@@ -122,6 +122,7 @@ assert(TSV_KINDS.join(",") === "tn,tq,twl", "three TSV kinds");
 for (const k of TSV_KINDS) {
   const sql = tsvReviewFlagsSql(k);
   assert(sql.includes(`FROM ${k}_rows t`) && sql.includes(`e.kind = '${k}'`), `${k}: queries its own table and edit_log kind`);
+  assert(sql.includes("e.source = 'dcs_reimport'") && sql.includes("+e.action = 'update'"), `${k}: mint evidence is the sync's update write, not its sync_clear_review audit row (unary + keeps the edit_log_row_by_book plan)`);
   assert(/review_kind IS NOT NULL AND t\.deleted_at IS NULL/.test(sql), `${k}: open, live flags only`);
   assert(!/ORDER BY/i.test(sql), `${k}: no ORDER BY (it would scan the PK index instead of the partial review index)`);
   assert(/substr\(t\.review_reason,\s*1,\s*\d+\)/.test(sql), `${k}: reason is clipped`);

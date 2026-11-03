@@ -140,6 +140,8 @@ for (const kind of TSV_KINDS) {
   if (tsvByKind[kind] == null) tsvFailed.push(kind);
 }
 bundle.openReviews.tsv = classifyTsvReviewFlags(tsvByKind, sinceEpoch(day));
+// Which kinds are missing from tsv when a query failed (also in bundle.errors).
+bundle.openReviews.tsvFailedKinds = tsvFailed;
 
 // The repair, as a proposal. Only EDITOR alerts qualify, and only when every
 // ref they name is in the proven set. Admin summary alerts are never proposed:

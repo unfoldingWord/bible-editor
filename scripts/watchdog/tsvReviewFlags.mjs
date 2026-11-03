@@ -12,7 +12,8 @@
 // evidence, in order:
 //   1. review_master_json._meta.flag_at — written only by the merge_no_base
 //      mint (bookReimport.ts masterReviewSnapshot's `mint` argument);
-//   2. the sync's own edit_log write of the flag (source 'dcs_reimport', a
+//   2. the sync's own edit_log write of the flag (source 'dcs_reimport',
+//      action 'update' — the clears log as 'sync_clear_review' — with a
 //      payload of changed fields carrying a non-null review_kind). merge_conflict
 //      and ref_moved re-write the flag when their reason changes, so this is
 //      "the sync last set this flag at", which may be a re-stamp of an older
@@ -33,12 +34,16 @@ export const TSV_KINDS = ["tn", "tq", "twl"];
 // classifyTsvReviewFlags instead. The edit_log lookup is a correlated scalar
 // subquery on edit_log_row_by_book (kind, book, row_key), so it cannot
 // multiply rows; book is matched too because 4-character ids repeat across books.
+// The unary + on e.action keeps that term out of index selection: without it
+// the planner walks edit_log_kind_action_created (kind, action) instead and
+// reads 26,577 rows for tn on 2026-11-03, against 65 this way.
 export function tsvReviewFlagsSql(kind) {
   if (!TSV_KINDS.includes(kind)) throw new Error(`not a TSV kind: ${kind}`);
   return `SELECT t.book, t.id, t.review_kind, substr(t.review_reason, 1, 300) review_reason, t.version, t.updated_at,
             json_extract(t.review_master_json, '$._meta.flag_at') flag_at,
             (SELECT max(e.created_at) FROM edit_log e
               WHERE e.kind = '${kind}' AND e.book = t.book AND e.row_key = t.id AND e.source = 'dcs_reimport'
+                AND +e.action = 'update'
                 AND json_extract(e.payload_json, '$.review_kind') IS NOT NULL) mint_logged_at
        FROM ${kind}_rows t
       WHERE t.review_kind IS NOT NULL AND t.deleted_at IS NULL`;
@@ -109,7 +114,7 @@ export function tsvReviewFlagsLine(rows, { failed = [] } = {}) {
   const set = rows.filter((r) => r.tonight === "set");
   const touched = rows.filter((r) => r.tonight === "touched_no_mint");
   const byFlag = set.filter((r) => r.mintSource === "flag_at").length;
-  const split = set.length ? `: ${byFlag} by flag_at, ${set.length - byFlag} by sync edit_log` : "";
+  const split = set.length ? `: ${byFlag} new by flag_at, ${set.length - byFlag} new or re-stamped by sync edit_log` : "";
   const perKind = TSV_KINDS.map((k) => `${k}=${rows.filter((r) => r.kind === k).length}`).join(", ");
   const tonight = rows.filter((r) => r.tonight != null);
   const shown = tonight
