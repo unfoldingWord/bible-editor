@@ -8,7 +8,7 @@
 // Not a test framework; failures exit non-zero. Mirrors
 // src/lib/replace.test.mjs.
 
-import { curlifyString, curlifyPaste } from "./curlyQuotes.ts";
+import { curlifyString, curlifyPaste, pasteReplacement } from "./curlyQuotes.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -71,6 +71,32 @@ function assert(cond, msg) {
   assert(
     curlifyPaste(`"a" "b"`, "x") === "”a” “b”",
     `only the FIRST quote uses prev context (got ${JSON.stringify(curlifyPaste(`"a" "b"`, "x"))})`,
+  );
+}
+
+// Pasting T4T (or any rich source) into a verse editor: the default paste
+// carried the copied cell's <em> and color/background spans into the editor,
+// where they survived the save and styled later typing, until the verse
+// remounted. A contentEditable paste must always go in as plain text, even
+// when there is no straight quote or "..." to rewrite. Fields keep the
+// browser default in that case (they never take HTML).
+{
+  const t4t = "So tell this to the people: I will help you again.";
+  assert(
+    pasteReplacement(t4t, "x", "editable") === t4t,
+    "editable: plain text with no quotes is still inserted as plain text",
+  );
+  assert(
+    pasteReplacement(t4t, "x", "field") === null,
+    "field: plain text with no quotes keeps the browser default",
+  );
+  assert(
+    pasteReplacement(`say "hi"`, " ", "field") === "say “hi”",
+    "field: straight quotes are still curled",
+  );
+  assert(
+    pasteReplacement(`say "hi"`, " ", "editable") === "say “hi”",
+    "editable: straight quotes are still curled",
   );
 }
 

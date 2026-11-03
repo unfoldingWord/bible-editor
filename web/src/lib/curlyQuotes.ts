@@ -53,6 +53,24 @@ export function curlifyPaste(text: string, prev: string | undefined): string {
   return curlifyString(text, prev);
 }
 
+// What a paste should insert, or null to let the browser's default paste run.
+// An input/textarea only needs rewriting when the text has straight quotes or
+// a "..." run. A contentEditable always takes the plain text: the browser's
+// default pastes the clipboard's text/html, which carries the source's markup
+// (T4T's <em> for \add, the copied cell's color and background spans) into
+// the verse editor. textContent still saves the right words, but the foreign
+// markup stays in the DOM after the save (the repaint is skipped because the
+// text already matches) and newly typed text inherits its italics and color
+// until the verse remounts.
+export function pasteReplacement(
+  text: string,
+  prev: string | undefined,
+  target: "field" | "editable",
+): string | null {
+  if (target === "field" && !/['"]/.test(text) && !/\.\.\.+/.test(text)) return null;
+  return curlifyPaste(text, prev);
+}
+
 function isTextInput(el: EventTarget | null): el is HTMLInputElement {
   if (!(el instanceof HTMLInputElement)) return false;
   const t = (el.type || "text").toLowerCase();
@@ -146,14 +164,14 @@ function handlePaste(e: ClipboardEvent) {
   const target = e.target;
   const text = e.clipboardData?.getData("text/plain");
   if (!text) return;
-  if (!/['"]/.test(text) && !/\.\.\.+/.test(text)) return;
 
   if (isTextInput(target) || isTextarea(target)) {
     if (target.readOnly || target.disabled) return;
     const start = target.selectionStart ?? target.value.length;
     const end = target.selectionEnd ?? start;
     const prev = start > 0 ? target.value[start - 1] : undefined;
-    const seeded = curlifyPaste(text, prev);
+    const seeded = pasteReplacement(text, prev, "field");
+    if (seeded === null) return;
     e.preventDefault();
     setNativeValue(target, target.value.slice(0, start) + seeded + target.value.slice(end));
     const caret = start + seeded.length;
@@ -170,7 +188,8 @@ function handlePaste(e: ClipboardEvent) {
         prev = (r.startContainer as Text).data[r.startOffset - 1];
       }
     }
-    const seeded = curlifyPaste(text, prev);
+    const seeded = pasteReplacement(text, prev, "editable");
+    if (seeded === null) return;
     e.preventDefault();
     document.execCommand("insertText", false, seeded);
   }
