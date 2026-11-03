@@ -113,6 +113,7 @@ import {
   advanceTsvBaseThroughSyncWrites,
   foldTsvBase,
   foldTsvRefBase,
+  TSV_ANCESTOR_ACTIONS_SQL,
   type TsvMergeSide,
   type TsvRefSide,
   type TsvEditLogEntry,
@@ -3537,7 +3538,7 @@ async function reconstructTsvBases(
     const rs = await env.DB.prepare(
       `SELECT row_key, action, payload_json, book FROM edit_log
         WHERE kind = ?2 AND (book = ?1 OR book IS NULL)
-          AND action IN ('create', 'update', 'restore')
+          AND action IN (${TSV_ANCESTOR_ACTIONS_SQL})
           AND ${boundaryClause}
           AND row_key IN (${inClause})
         ORDER BY row_key ASC, id ASC`,
@@ -3702,7 +3703,7 @@ async function reconstructTsvBases(
       const rs = await env.DB.prepare(
         `SELECT row_key, action, payload_json, book, source FROM edit_log
           WHERE kind = ?2 AND (book = ?1 OR book IS NULL)
-            AND action IN ('create', 'update', 'restore')
+            AND action IN (${TSV_ANCESTOR_ACTIONS_SQL})
             AND ${aboveClause}
             AND row_key IN (${inClause})
           ORDER BY row_key ASC, id ASC`,

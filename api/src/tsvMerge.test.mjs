@@ -1092,6 +1092,34 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   eq(advanceTsvBaseThroughSyncWrites("tn", null, [human({ note: "app" })]), null, "#1090: no base and no sync write stays null");
 }
 
+// ── #1255: a restore_maintainer_cleanup repair's {fields:[{field,to}]} payload ──
+{
+  const repair = {
+    action: "restore_maintainer_cleanup",
+    payload: { incident: "x", fields: [{ field: "note", from: "*bad**", to: "**good**" }] },
+    bookKnown: true,
+  };
+  const base = foldTsvBase("tn", [{ action: "create", payload: { note: "draft", quote: "q0" }, bookKnown: true }, { action: "update", payload: { note: "*bad**" }, bookKnown: true }, repair]);
+  eq(base.note, "**good**", "#1255: the repair's `to` value is the folded note");
+  eq(base.quote, "q0", "#1255: a field the repair did not list keeps its earlier value");
+  const malformed = foldTsvBase("tn", [
+    { action: "update", payload: { note: "kept" }, bookKnown: true },
+    { action: "restore_maintainer_cleanup", payload: { fields: [{ field: "note" }, { to: "x" }, null, "note"] }, bookKnown: true },
+  ]);
+  eq(malformed.note, "kept", "#1255: list entries without a string field and a `to` key are ignored, never guessed");
+  const both = foldTsvBase("tn", [
+    { action: "update", payload: { quote: "direct quote", fields: [{ field: "note", from: "a", to: "listed note" }] }, bookKnown: true },
+  ]);
+  eq(both.quote, "direct quote", "#1255: a column carried directly next to a `fields` list is still folded");
+  eq(both.note, "listed note", "#1255: …and so is the listed one");
+  const ref = foldTsvRefBase([
+    { action: "create", payload: { chapter: 1, verse: 2, ref_raw: "1:2" }, bookKnown: true },
+    { action: "restore_maintainer_cleanup", payload: { fields: [{ field: "ref_raw", from: "1:2", to: "1:3" }, { field: "verse", from: 2, to: 3 }] }, bookKnown: true },
+  ]);
+  eq(ref.ref_raw, "1:3", "#1255: foldTsvRefBase reads the same repair shape (ref_raw)");
+  eq(ref.verse, 3, "#1255: …and verse");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) FAILED`);
   process.exit(1);
