@@ -4880,6 +4880,32 @@ console.log("\n[#1255: a restore_maintainer_cleanup repair is part of the TSV me
     eq(row.review_kind, "merge_conflict", "a translator edit after the boundary still flags a merge_conflict");
     eq(counts.merge_conflicts, 1, "…counted as one conflict");
   }
+
+  // 3. The data-loss direction #1255 names: a translator edits the row after
+  //    the boundary and Door43 is untouched (still the repaired text). Before
+  //    the fix the stale ancestor made master's unchanged note read as a Door43
+  //    edit, so master overwrote the translator. Now only D1 moved: keep it.
+  //
+  //    ABLATION: same as case 1; without the fix this row's note becomes
+  //    REPAIRED and it is flagged merge_conflict.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite);
+    sqlite.prepare(`UPDATE tn_rows SET note = 'the translator''s later wording', version = 5 WHERE book = ? AND id = 'rm01'`).run(BOOK);
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tn', 'rm01', ?, 'update', ?, 300)`,
+      )
+      .run(BOOK, JSON.stringify({ note: "the translator's later wording" }));
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(REPAIRED)], null, {
+      confirmedAt: 200, editId: boundary, lineage,
+    });
+    const row = readRow(sqlite);
+    eq(row.note, "the translator's later wording", "a translator edit with Door43 untouched is KEPT, not overwritten by master");
+    eq(row.review_kind, null, "…and not flagged");
+    eq(counts.merge_conflicts, 0, "…no merge_conflicts counted");
+  }
 }
 
 if (failed > 0) {

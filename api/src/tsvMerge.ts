@@ -610,12 +610,18 @@ export const TSV_ANCESTOR_ACTIONS_SQL = TSV_ANCESTOR_ACTIONS.map((a) => `'${a}'`
 // list (restore_maintainer_cleanup, #1255) is flattened to `{field: to}`, the
 // value it wrote. Decided by the payload's shape rather than the action name
 // (the #580 lesson in export.ts). A list entry without a string `field` and a
-// `to` key is dropped, so a malformed entry leaves the field absent, which
-// withholds, instead of folding a guessed value.
+// `to` key is dropped rather than guessed. Note what dropping means in a fold:
+// the field keeps its value from an EARLIER entry (the pre-repair text), not
+// absence, so a malformed repair entry degrades to the pre-#1255 ancestor. On
+// 2026-11-03 prod's only array-valued `fields` payloads were the 14 well-formed
+// restore_maintainer_cleanup rows (json_type check). The list is overlaid on the
+// payload rather than replacing it, so a payload that also carried columns
+// directly keeps them (no writer does today: on 2026-11-03 prod held no
+// create/update/restore payload with a `fields` key).
 function contentPayload(payload: Record<string, unknown>): Record<string, unknown> {
   const list = payload.fields;
   if (!Array.isArray(list)) return payload;
-  const out: Record<string, unknown> = {};
+  const out: Record<string, unknown> = { ...payload };
   for (const item of list) {
     if (!item || typeof item !== "object") continue;
     const { field } = item as { field?: unknown };
