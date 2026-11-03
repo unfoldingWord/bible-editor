@@ -3418,6 +3418,10 @@ const REVIEW_SNAPSHOT_FIELDS: Record<TsvKind, readonly string[]> = {
 // deliberately leave review_kind standing), and even a true mint time is the
 // wrong end of the range, since the commit that could justify the flag may sit
 // anywhere back to that run's watermark.
+//
+// On a same-kind re-stamp (#1258, keptOrNewMint) the Door43 values are
+// tonight's while `_meta.flag_at` / `flag_since` stay the first mint's, so
+// flag_at is the flag's age, not the time these values were captured.
 function masterReviewSnapshot(
   kind: TsvKind,
   row: ParsedTsvRow,
