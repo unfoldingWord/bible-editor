@@ -1,5 +1,5 @@
 import { lazy, Suspense, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Box, Stack, Typography, Paper, IconButton, Tooltip, ToggleButton, ToggleButtonGroup, Button, Chip } from "@mui/material";
+import { Box, Stack, Typography, Paper, IconButton, Tooltip, ToggleButton, ToggleButtonGroup, Button, Chip, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle } from "@mui/material";
 import HistoryIcon from "@mui/icons-material/History";
 import type { BookViewportPosition, BookViewportRestore } from "./BookView";
 import { AlignLinkButton } from "./AlignLinkButton";
@@ -25,6 +25,7 @@ import { highlightsFor, isPaintableHtml, overlayFindMarks, renderEditableHTML, r
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractEditableText, extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { introEditBase } from "../lib/verseIntro";
+import { t4tToUstPlain } from "../lib/t4t";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -187,6 +188,9 @@ interface Props {
   // scripture editing has no preserve/hint carve-out to keep separate, so a
   // single combined flag is enough here.
   bookLocked?: boolean;
+  // Signed-in user is a global read-only viewer. Hides edit-only shortcuts
+  // such as "Copy T4T to UST".
+  isViewer?: boolean;
   // Per-verse Text-lane checkoff, forwarded to the column/book scripture views.
   textCheck?: TextLaneCheck;
   // Internal comments anchored to a verse (not to a tn/tq/twl row). Rendered as
@@ -284,6 +288,7 @@ function ScriptureColumnInner({
   onEditBookSection,
   locked = false,
   bookLocked = false,
+  isViewer = false,
   textCheck,
   verseCommentCounts,
   onOpenVerseComments,
@@ -727,6 +732,7 @@ function ScriptureColumnInner({
               onSplitVerseBridge ? (verseNum) => onSplitVerseBridge(chapter, verseNum, "UST") : undefined
             }
             locked={effectiveLocked}
+            isViewer={isViewer}
           />
         ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onSaveBookVerse && onOpenBookAligner ? (
           <Suspense fallback={null}>
@@ -865,6 +871,7 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     a.twl === b.twl &&
     a.locked === b.locked &&
     a.bookLocked === b.bookLocked &&
+    a.isViewer === b.isViewer &&
     // The question getter/lock lookup change with mode / pipeline jobs; the
     // overlay must see the fresh ones.
     a.searchQuestions === b.searchQuestions &&
@@ -925,6 +932,7 @@ function StackedBody({
   onMergeBridge,
   onSplitBridge,
   locked,
+  isViewer,
 }: {
   book: string;
   indexByVersion: Record<string, Record<number, VerseDto>>;
@@ -969,6 +977,7 @@ function StackedBody({
   onMergeBridge?: (verse: number) => void;
   onSplitBridge?: (verse: number) => void;
   locked: boolean;
+  isViewer: boolean;
 }) {
   const ult = indexByVersion["ULT"] ?? EMPTY_COLUMN;
   const ust = indexByVersion["UST"] ?? EMPTY_COLUMN;
@@ -976,6 +985,8 @@ function StackedBody({
   const t4t = indexByVersion["T4T"];
   const uhb = indexByVersion["UHB"] ?? indexByVersion["UGNT"] ?? EMPTY_COLUMN;
   const uhbLabel = isHebrew ? "UHB" : "UGNT";
+  // "Copy T4T to UST" waiting on the overwrite confirm (UST already has text).
+  const [pendingT4tCopy, setPendingT4tCopy] = useState<{ run: () => void; ref: string } | null>(null);
   // OL-anchor the ULT/UST highlights on the active verse's source (UHB/UGNT)
   // verse so reordered translations still light up. During a preview the
   // yellow follows the MOVED note (so a hover over a non-selected note's grip
@@ -1212,6 +1223,39 @@ function StackedBody({
                   ustV && ustStart >= 1 ? onSplitBridge : undefined
                 }
               />
+              {t4t?.[v] && !locked && !isViewer && ustV && ustEditBase && (() => {
+                const t4tV = t4t[v];
+                const copyT4t = () => {
+                  const t4tPlain = t4tToUstPlain(t4tV.content);
+                  if (!t4tPlain) return;
+                  // Keep any line markers the UST verse opens with (`\q1 `,
+                  // `\p `) so its poetry/paragraph layout survives; everything
+                  // after them is replaced. Same save path as typing in the
+                  // UST line: smartEditVerse + outbox with If-Match.
+                  const lead = extractEditableText(ustEditBase.content).match(/^(?:\\[a-z]+\d* )+/)?.[0] ?? "";
+                  onSaveVerse(ustStart, "UST", lead + t4tPlain, ustEditBase);
+                };
+                return (
+                  <Box sx={{ display: "flex", justifyContent: "flex-end", mt: 0.25 }}>
+                    <Button
+                      size="small"
+                      variant="text"
+                      data-testid="copy-t4t-to-ust"
+                      sx={{ fontSize: 11, py: 0, minHeight: 0, textTransform: "none" }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if ((ustV.plain_text ?? "").trim()) {
+                          setPendingT4tCopy({ run: copyT4t, ref: `${chapter}:${formatVerseLabel(ustV)}` });
+                        } else {
+                          copyT4t();
+                        }
+                      }}
+                    >
+                      Copy T4T to UST
+                    </Button>
+                  </Box>
+                );
+              })()}
               {t4t?.[v] && (
                 <ActiveLine
                   book={book}
@@ -1292,6 +1336,28 @@ function StackedBody({
           />
         );
       })}
+      <Dialog open={!!pendingT4tCopy} onClose={() => setPendingT4tCopy(null)} maxWidth="xs">
+        <DialogTitle>Replace UST text?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            UST {pendingT4tCopy?.ref} already has text. Copying T4T replaces it, and words that change lose
+            their alignment, the same as retyping them.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPendingT4tCopy(null)}>Cancel</Button>
+          <Button
+            variant="contained"
+            data-testid="confirm-copy-t4t"
+            onClick={() => {
+              pendingT4tCopy?.run();
+              setPendingT4tCopy(null);
+            }}
+          >
+            Replace
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }
