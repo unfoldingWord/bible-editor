@@ -98,6 +98,19 @@ function assert(cond, msg) {
     pasteReplacement(`say "hi"`, " ", "editable") === "say “hi”",
     "editable: straight quotes are still curled",
   );
+  // A drag-copy of a T4T verse carries its "1:6" label on its own line.
+  assert(
+    pasteReplacement("1:6\nBut I punished\r\n\r\nthem.\n", "x", "editable") === "1:6 But I punished them. ",
+    "editable: line breaks become single spaces so words do not join",
+  );
+  assert(
+    pasteReplacement("1:6\rBut", "x", "editable") === "1:6 But",
+    "editable: a bare CR line break also becomes a space",
+  );
+  assert(
+    pasteReplacement(`a\n"b"`, " ", "field") === "a\n“b”",
+    "field: line breaks are left alone",
+  );
 }
 
 if (failed > 0) {

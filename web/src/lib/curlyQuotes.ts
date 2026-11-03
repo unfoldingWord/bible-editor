@@ -68,7 +68,10 @@ export function pasteReplacement(
   target: "field" | "editable",
 ): string | null {
   if (target === "field" && !/['"]/.test(text) && !/\.\.\.+/.test(text)) return null;
-  return curlifyPaste(text, prev);
+  // insertText turns a newline into a <br> or block split, which textContent
+  // reads as nothing, so the words either side would save joined ("1:6But").
+  const flat = target === "editable" ? text.replace(/[ \t]*[\r\n][ \t\r\n]*/g, " ") : text;
+  return curlifyPaste(flat, prev);
 }
 
 function isTextInput(el: EventTarget | null): el is HTMLInputElement {
