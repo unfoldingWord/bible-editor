@@ -1,48 +1,46 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { fetchT4tUsfm, type VerseDto } from "../sync/api";
 import { parseT4tBook } from "../lib/t4t";
+import { createT4tLoader } from "../lib/t4tLoader";
 
 export type T4tBook = Map<number, Record<number, VerseDto>>;
 
-// Parsed T4T books, cached per book for the session (the text is static).
-const cache = new Map<string, T4tBook>();
-const inflight = new Map<string, Promise<T4tBook>>();
+const loadT4t = createT4tLoader(fetchT4tUsfm, parseT4tBook);
 
-function loadT4t(book: string): Promise<T4tBook> {
-  const hit = cache.get(book);
-  if (hit) return Promise.resolve(hit);
-  let p = inflight.get(book);
-  if (!p) {
-    p = fetchT4tUsfm(book)
-      .then((text) => {
-        const parsed = parseT4tBook(book, text);
-        cache.set(book, parsed);
-        return parsed;
-      })
-      .finally(() => inflight.delete(book));
-    inflight.set(book, p);
-  }
-  return p;
-}
+export type T4tState = {
+  // The read-only T4T book, or null while disabled / loading / failed.
+  verses: T4tBook | null;
+  // True when the last load for this book failed (shown as "T4T unavailable").
+  failed: boolean;
+  retry: () => void;
+};
 
-// The read-only T4T book, or null while disabled / loading / unavailable.
 // Fetches only when `enabled` (the user turned T4T on in the version picker).
-export function useT4t(book: string, enabled: boolean): T4tBook | null {
+export function useT4t(book: string, enabled: boolean): T4tState {
   const [data, setData] = useState<{ book: string; verses: T4tBook } | null>(null);
+  const [failedBook, setFailedBook] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     if (!enabled || !book) return;
     let cancelled = false;
+    setFailedBook(null);
     loadT4t(book).then(
       (verses) => {
         if (!cancelled) setData({ book, verses });
       },
       (err) => {
         console.warn("T4T load failed", book, err);
+        if (!cancelled) setFailedBook(book);
       },
     );
     return () => {
       cancelled = true;
     };
-  }, [book, enabled]);
-  return enabled && data?.book === book ? data.verses : null;
+  }, [book, enabled, attempt]);
+  const retry = useCallback(() => setAttempt((n) => n + 1), []);
+  return {
+    verses: enabled && data?.book === book ? data.verses : null,
+    failed: enabled && failedBook === book,
+    retry,
+  };
 }
