@@ -98,3 +98,29 @@ export function parseT4tBook(book: string, text: string): Map<number, Record<num
   }
   return out;
 }
+
+// T4T figure-of-speech tags: square brackets holding only uppercase letters,
+// commas and spaces, e.g. `[RHQ]`, `[MTY, IDI]`. Brackets with any other
+// content (lowercase words, digits) are real text and are kept.
+const FIGURE_TAG_RE = /\s*\[[A-Z][A-Z, ]*\]/g;
+
+// Plain text to seed a UST verse from a parsed T4T verse ("Copy T4T to UST").
+// Each `\add X\add*` (italic implied words) becomes `{X}`, the UST convention;
+// figure tags are dropped; doubled spaces and spaces before closing punctuation
+// are collapsed. `◄a/b►` alternates are kept as-is. A bridge's content is the
+// whole bridge, so a bridged T4T row copies all of it.
+export function t4tToUstPlain(content: unknown): string {
+  const vos = (content as { verseObjects?: unknown[] } | null)?.verseObjects ?? [];
+  const mapped = vos.map((vo) => {
+    const o = vo as Record<string, unknown> | null;
+    if (o && o["tag"] === T4T_ADD_TAG && typeof o["text"] === "string") {
+      return { type: "text", text: `{${(o["text"] as string).trim()}}` };
+    }
+    return vo;
+  });
+  return extractPlainText({ verseObjects: mapped })
+    .replace(FIGURE_TAG_RE, "")
+    .replace(/\s+/g, " ")
+    .replace(/\s+([.,;:!?’”)\]])/g, "$1")
+    .trim();
+}

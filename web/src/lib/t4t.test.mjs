@@ -3,7 +3,7 @@
 // Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/t4t.test.mjs
 
-import { parseT4tBook, T4T_ADD_TAG } from "./t4t.ts";
+import { parseT4tBook, T4T_ADD_TAG, t4tToUstPlain } from "./t4t.ts";
 import { renderHighlightedHTML } from "./highlight.ts";
 
 let failed = 0;
@@ -78,6 +78,26 @@ assert(!!ch1?.[0], "front stored as verse 0");
   for (const w of ["Reuben;", "Simeon", "and sons", "Levi."]) {
     assert(r2.includes(w), `\\li run renders ${w} (got ${JSON.stringify(r2)})`);
   }
+}
+
+// Copy T4T → UST: \add → {X}, figure tags dropped, spacing tidied.
+{
+  const got1 = t4tToUstPlain(bridge?.content);
+  assert(
+    got1 === "Your ancestors {have died}. ◄repented/turned away►",
+    `bridge copies with {add}, no [RHQ] (got ${JSON.stringify(got1)})`,
+  );
+  const src = [
+    "\\c 2",
+    "\\p",
+    "\\v 1 He said [MTY, IDI], “Go \\add to them\\add* now [RHQ]?” Keep [see 3:4] and [Note].",
+    "",
+  ].join("\n");
+  const got2 = t4tToUstPlain(parseT4tBook("ZEC", src).get(2)?.[1]?.content);
+  assert(
+    got2 === "He said, “Go {to them} now?” Keep [see 3:4] and [Note].",
+    `multi-tag and non-tag brackets (got ${JSON.stringify(got2)})`,
+  );
 }
 
 if (failed) {

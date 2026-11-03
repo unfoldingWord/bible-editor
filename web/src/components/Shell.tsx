@@ -4931,6 +4931,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           twl={data.twl}
           locked={Boolean(chapterLocks.verse)}
           bookLocked={editLocked}
+          isViewer={isViewer}
         />
         </Box>
         <Box
