@@ -10,8 +10,12 @@
 // rows.ts's non-versioning fast paths (reorder drag, preserve/hint and trash
 // toggles) move updated_at and leave review_kind standing (STATE.md). Mint
 // evidence, in order:
-//   1. review_master_json._meta.flag_at — written only by the merge_no_base
-//      mint (bookReimport.ts masterReviewSnapshot's `mint` argument);
+//   1. review_master_json._meta.flag_at — written by every sync mint
+//      (bookReimport.ts masterReviewSnapshot's `mint` argument). Before #1258
+//      only merge_no_base wrote it, so an older merge_conflict / ref_moved flag
+//      may lack it. A same-kind re-stamp keeps the first mint's flag_at, so it
+//      is not "set tonight"; a re-stamp of a flag that had no flag_at records
+//      the re-stamp time;
 //   2. the sync's own edit_log write of the flag (source 'dcs_reimport',
 //      action 'update' — the clears log as 'sync_clear_review' — with a
 //      payload of changed fields carrying a non-null review_kind). merge_conflict
@@ -21,6 +25,12 @@
 //      180 days (editLogSweep.ts), so for an old flag this can be absent.
 // With neither, an updated_at since 05:30 UTC is reported only as "touched
 // tonight with no mint time", never as "set tonight".
+//
+// A flag whose flag_at is before tonight but whose sync edit_log write is
+// tonight is "re-stamped tonight": an old flag the sync re-wrote with a new
+// reason (#1258). For merge_conflict that means tonight's sync merged a new
+// Door43 edit over a different app value, so it is reported, but separately
+// from "set tonight", because the flag itself is not new.
 //
 // Times are compared here in JS, not in SQL: if a column ever held ISO text,
 // SQLite would sort it above every integer and `>= unixepoch(...)` would
@@ -71,7 +81,8 @@ export function toEpochSeconds(v) {
 
 // rowsByKind: { tn: [...], tq: [...], twl: [...] } as tsvReviewFlagsSql
 // returns them (a missing or null kind contributes nothing). Each row gets
-// `tonight`: "set" (mint evidence at or after since), "touched_no_mint" (no
+// `tonight`: "set" (mint evidence at or after since), "restamped" (flag_at
+// before since, sync edit_log write at or after since), "touched_no_mint" (no
 // mint evidence, updated_at at or after since) or null.
 export function classifyTsvReviewFlags(rowsByKind, since) {
   const out = [];
@@ -83,7 +94,15 @@ export function classifyTsvReviewFlags(rowsByKind, since) {
       const [mintAt, mintSource] =
         flagAt != null ? [flagAt, "flag_at"] : mintLoggedAt != null ? [mintLoggedAt, "edit_log"] : [null, null];
       const tonight =
-        mintAt != null ? (mintAt >= since ? "set" : null) : updatedAt != null && updatedAt >= since ? "touched_no_mint" : null;
+        mintAt != null
+          ? mintAt >= since
+            ? "set"
+            : mintSource === "flag_at" && mintLoggedAt != null && mintLoggedAt >= since
+              ? "restamped"
+              : null
+          : updatedAt != null && updatedAt >= since
+            ? "touched_no_mint"
+            : null;
       out.push({
         kind,
         book: r.book,
@@ -107,22 +126,26 @@ export function classifyTsvReviewFlags(rowsByKind, since) {
   });
 }
 
+const TONIGHT_MARK = { touched_no_mint: " (touched, no mint time)", restamped: " (re-stamped)" };
+
 // The one summary.md line. Any failed kind makes the whole line unknown: a
 // partial total would read as a clean count.
 export function tsvReviewFlagsLine(rows, { failed = [] } = {}) {
   if (failed.length) return `- TSV review flags: unknown (query failed: ${failed.join(", ")})`;
   const set = rows.filter((r) => r.tonight === "set");
   const touched = rows.filter((r) => r.tonight === "touched_no_mint");
+  const restamped = rows.filter((r) => r.tonight === "restamped");
   const byFlag = set.filter((r) => r.mintSource === "flag_at").length;
   const split = set.length ? `: ${byFlag} new by flag_at, ${set.length - byFlag} new or re-stamped by sync edit_log` : "";
   const perKind = TSV_KINDS.map((k) => `${k}=${rows.filter((r) => r.kind === k).length}`).join(", ");
   const tonight = rows.filter((r) => r.tonight != null);
   const shown = tonight
     .slice(0, 20)
-    .map((r) => `${r.kind} ${r.book} ${r.id} ${r.reviewKind}${r.tonight === "touched_no_mint" ? " (touched, no mint time)" : ""}`);
+    .map((r) => `${r.kind} ${r.book} ${r.id} ${r.reviewKind}${TONIGHT_MARK[r.tonight] ?? ""}`);
   const list = tonight.length ? `; tonight: ${shown.join(", ")}${tonight.length > 20 ? ", …" : ""}` : "";
   return (
     `- TSV review flags: ${rows.length} open (${set.length} set tonight${split}; ` +
-    `${touched.length} more touched tonight with no mint time); ${perKind}${list}`
+    `${touched.length} more touched tonight with no mint time; ` +
+    `${restamped.length} re-stamped tonight (old flag, new reason)); ${perKind}${list}`
   );
 }

@@ -64,6 +64,11 @@ const rows = classifyTsvReviewFlags(
       row({ id: "nomt", updated_at: SINCE + 60 }),
       // Untouched old flag.
       row({ id: "cold", flag_at: SINCE - 5, updated_at: SINCE - 5 }),
+      // #1258: an old flag the sync re-wrote tonight with a new reason. flag_at
+      // keeps the first mint, the sync's edit_log write is tonight.
+      row({ id: "rsta", flag_at: SINCE - 86400 * 3, mint_logged_at: SINCE + 700, updated_at: SINCE + 700 }),
+      // Old flag_at and an old edit_log write: not tonight at all.
+      row({ id: "rstb", flag_at: SINCE - 86400 * 3, mint_logged_at: SINCE - 86400, updated_at: SINCE + 30 }),
     ],
     tq: [
       // ISO text before tonight. As raw SQLite `>= unixepoch(...)` this would
@@ -77,13 +82,18 @@ const rows = classifyTsvReviewFlags(
   SINCE,
 );
 const by = Object.fromEntries(rows.map((r) => [r.id, r]));
-assert(rows.length === 8, "every flag row is kept");
+assert(rows.length === 10, "every flag row is kept");
 assert(by.mint.tonight === "set" && by.mint.mintSource === "flag_at" && by.mint.mintAt === SINCE + 520, "flag_at tonight → set (by flag_at)");
 assert(by.oldf.tonight === null, "old flag_at + updated_at tonight → NOT set tonight, NOT touched-no-mint");
 assert(by.logd.tonight === "set" && by.logd.mintSource === "edit_log" && by.logd.mintAt === SINCE + 900, "no flag_at, edit_log tonight → set (by edit_log)");
 assert(by.oldl.tonight === null, "old edit_log mint + updated_at tonight → not tonight");
 assert(by.nomt.tonight === "touched_no_mint" && by.nomt.mintAt === null && by.nomt.mintSource === null, "no mint evidence + updated_at tonight → touched, not set");
 assert(by.cold.tonight === null, "old untouched flag → not tonight");
+assert(
+  by.rsta.tonight === "restamped" && by.rsta.mintSource === "flag_at" && by.rsta.mintAt === SINCE - 86400 * 3,
+  "old flag_at + sync edit_log write tonight → re-stamped tonight (not set; mint stays the first one)",
+);
+assert(by.rstb.tonight === null, "old flag_at + old edit_log write → not tonight");
 assert(by.isob.tonight === null, "ISO updated_at before tonight is not tonight (no text-vs-integer compare)");
 assert(by.isoa.tonight === "touched_no_mint" && by.isoa.updatedAt === SINCE + 1800, "ISO updated_at after tonight → touched, converted to seconds");
 assert(
@@ -91,19 +101,20 @@ assert(
   "row carries kind, book, review kind, reason, version",
 );
 assert(rows.map((r) => `${r.kind}/${r.book}/${r.id}`).join(",") ===
-  "tn/EZK/cold,tn/EZK/logd,tn/EZK/mint,tn/EZK/nomt,tn/EZK/oldf,tn/EZK/oldl,tq/HOS/isoa,tq/HOS/isob",
+  "tn/EZK/cold,tn/EZK/logd,tn/EZK/mint,tn/EZK/nomt,tn/EZK/oldf,tn/EZK/oldl,tn/EZK/rsta,tn/EZK/rstb,tq/HOS/isoa,tq/HOS/isob",
   "rows sorted by kind, book, id");
 
 // --- summary line -------------------------------------------------------
 assert(
   tsvReviewFlagsLine(rows, { failed: [] }) ===
-    "- TSV review flags: 8 open (2 set tonight: 1 new by flag_at, 1 new or re-stamped by sync edit_log; 2 more touched tonight with no mint time); " +
-      "tn=6, tq=2, twl=0; tonight: tn EZK logd merge_conflict, tn EZK mint merge_no_base, " +
-      "tn EZK nomt merge_conflict (touched, no mint time), tq HOS isoa ref_moved (touched, no mint time)",
-  "summary line: totals, split by evidence, per kind, tonight's rows",
+    "- TSV review flags: 10 open (2 set tonight: 1 new by flag_at, 1 new or re-stamped by sync edit_log; 2 more touched tonight with no mint time; " +
+      "1 re-stamped tonight (old flag, new reason)); " +
+      "tn=8, tq=2, twl=0; tonight: tn EZK logd merge_conflict, tn EZK mint merge_no_base, " +
+      "tn EZK nomt merge_conflict (touched, no mint time), tn EZK rsta merge_conflict (re-stamped), tq HOS isoa ref_moved (touched, no mint time)",
+  "summary line: totals, split by evidence, re-stamps counted apart, per kind, tonight's rows",
 );
 assert(
-  tsvReviewFlagsLine([], { failed: [] }) === "- TSV review flags: 0 open (0 set tonight; 0 more touched tonight with no mint time); tn=0, tq=0, twl=0",
+  tsvReviewFlagsLine([], { failed: [] }) === "- TSV review flags: 0 open (0 set tonight; 0 more touched tonight with no mint time; 0 re-stamped tonight (old flag, new reason)); tn=0, tq=0, twl=0",
   "summary line with no flags",
 );
 assert(
