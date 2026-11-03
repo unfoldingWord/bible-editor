@@ -55,6 +55,31 @@ assert(html.includes("[RHQ]"), "[RHQ] renders");
 // Chapter front (heading before \v 1) → verse 0.
 assert(!!ch1?.[0], "front stored as verse 0");
 
+// \bd / \sc text and an unnumbered \li run (which usfm-js nests as children,
+// GEN 46:8-25 / DAN 5:27 shapes) must all still render.
+{
+  const src = [
+    "\\c 5",
+    "\\p",
+    "\\v 1 “\\bd You\\bd* are \\sc Tekel\\sc* here.",
+    "\\v 2 A list:",
+    "\\li Reuben;",
+    "\\li Simeon \\add and sons\\add* too;",
+    "\\li Levi.",
+    "",
+  ].join("\n");
+  const ch5 = parseT4tBook("DAN", src).get(5);
+  const strip = (h) => h.replace(/<\/?(em|mark|span)[^>]*>/g, "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
+  const r1 = strip(renderHighlightedHTML(ch5?.[1]?.content?.verseObjects ?? [], new Set()));
+  assert(r1.includes("“You are Tekel here."), `\\bd/\\sc text renders (got ${JSON.stringify(r1)})`);
+  const vos2 = ch5?.[2]?.content?.verseObjects ?? [];
+  assert(!vos2.some((v) => Array.isArray(v.children)), "nested \\li children flattened");
+  const r2 = strip(renderHighlightedHTML(vos2, new Set()));
+  for (const w of ["Reuben;", "Simeon", "and sons", "Levi."]) {
+    assert(r2.includes(w), `\\li run renders ${w} (got ${JSON.stringify(r2)})`);
+  }
+}
+
 if (failed) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);

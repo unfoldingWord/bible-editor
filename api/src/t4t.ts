@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { Env } from "./index";
-import { BOOK_NUMBERS, DCS_OWNER } from "./dcsSources";
+import { BOOK_NUMBERS, DCS_OWNER, dcsFileSize } from "./dcsSources";
 
 // Read-only English T4T (Translation for Translators) scripture, shown beside
 // ULT/UST as a reference. Deliberately NOT stored in the D1 `verses` table:
@@ -30,7 +30,8 @@ t4t.get("/:book", async (c) => {
   }
 
   const base = (c.env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
-  const url = `${base}/${DCS_OWNER}/${T4T_REPO}/raw/branch/master/${BOOK_NUMBERS[book]}-${book}.usfm`;
+  const path = `${BOOK_NUMBERS[book]}-${book}.usfm`;
+  const url = `${base}/${DCS_OWNER}/${T4T_REPO}/raw/branch/master/${path}`;
   let res: Response;
   try {
     res = await fetch(url);
@@ -44,14 +45,14 @@ t4t.get("/:book", async (c) => {
     return c.json({ error: "upstream_error", status: res.status }, 502);
   }
   const buf = await res.arrayBuffer();
-  const cl = res.headers.get("content-length");
-  const expected = cl == null ? null : Number(cl);
   // Reject a truncated or empty body: caching it in R2 would serve the
-  // partial text forever (nothing refreshes this key).
-  if (
-    buf.byteLength === 0 ||
-    (expected != null && Number.isFinite(expected) && buf.byteLength !== expected)
-  ) {
+  // partial text forever (nothing refreshes this key). Content-Length alone
+  // is not enough — DCS gzips the raw endpoint and then sends none (measured
+  // 2026-11-03) — so compare against the size Gitea records for the file
+  // (dcsFileSize, same check as fetchDcsMasterTextVerified). Fail closed when
+  // that size is unavailable.
+  const expected = await dcsFileSize(c.env, T4T_REPO, path);
+  if (buf.byteLength === 0 || expected == null || buf.byteLength !== expected) {
     console.error("t4t: truncated or empty DCS body", { book, expected, got: buf.byteLength });
     return c.json({ error: "upstream_truncated" }, 502);
   }

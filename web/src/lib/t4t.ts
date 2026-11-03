@@ -18,18 +18,42 @@ export const T4T_VERSION = "T4T";
 // italic. Renaming keeps that render branch from ever touching ULT/UST.
 export const T4T_ADD_TAG = "t4t-add";
 
-function renameAdd(vos: unknown[]): unknown[] {
-  return vos.map((vo) => {
-    if (!vo || typeof vo !== "object") return vo;
-    const o = vo as Record<string, unknown>;
-    const out: Record<string, unknown> = { ...o };
-    if (o["tag"] === "add") {
-      out["tag"] = T4T_ADD_TAG;
-      delete out["endTag"];
+// Other character styles T4T uses (`\bd`, `\sc`) are not drawn by the shared
+// renderer either; their text is kept as plain text.
+const PLAIN_CHAR_TAGS = new Set(["bd", "sc", "it", "em", "bdit", "no", "nd"]);
+
+// Normalize usfm-js output for display. Measured over all 66 T4T books: besides
+// `\add`, `\bd` and `\sc` lose their text in the renderer, and an unnumbered
+// `\li` is parsed as a character marker that swallows everything after it as
+// nested `children` (GEN 46:8-25 nests 20 deep). The tree is flattened: each
+// node is emitted without its children, then its children follow as siblings.
+function normalize(vos: unknown[]): unknown[] {
+  const out: unknown[] = [];
+  for (const vo of vos) {
+    if (!vo || typeof vo !== "object") {
+      out.push(vo);
+      continue;
     }
-    if (Array.isArray(o["children"])) out["children"] = renameAdd(o["children"] as unknown[]);
-    return out;
-  });
+    const o = vo as Record<string, unknown>;
+    const tag = typeof o["tag"] === "string" ? (o["tag"] as string) : null;
+    const text = typeof o["text"] === "string" ? (o["text"] as string) : null;
+    const children = Array.isArray(o["children"]) ? (o["children"] as unknown[]) : null;
+    if (tag === "add" || tag === "add*") {
+      if (text) out.push({ tag: T4T_ADD_TAG, text });
+    } else if (tag && PLAIN_CHAR_TAGS.has(tag)) {
+      if (text) out.push({ type: "text", text });
+    } else if (tag === "li") {
+      out.push({ tag: "li1", content: text ?? "" });
+    } else if (children) {
+      const rest: Record<string, unknown> = { ...o };
+      delete rest["children"];
+      out.push(rest);
+    } else {
+      out.push(o);
+    }
+    if (children) out.push(...normalize(children));
+  }
+  return out;
 }
 
 // Parse a whole T4T book into chapter → verse-start → VerseDto. Bridges
@@ -56,7 +80,7 @@ export function parseT4tBook(book: string, text: string): Map<number, Record<num
           if (end > verse) verseEnd = end;
         }
       }
-      const content = { verseObjects: renameAdd(verseObj.verseObjects ?? []) };
+      const content = { verseObjects: normalize(verseObj.verseObjects ?? []) };
       verses[verse] = {
         book,
         chapter,
