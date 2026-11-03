@@ -1226,7 +1226,7 @@ function StackedBody({
               {/* Only when T4T and UST cover the same verse span: a T4T 1-3
                   bridge pasted into UST verse 1 alone would duplicate 2-3. */}
               {t4t?.[v] && !locked && !isViewer && ustV && ustEditBase &&
-                t4t[v].verse === ustV.verse && (t4t[v].verse_end ?? null) === (ustV.verse_end ?? null) && (() => {
+                t4t[v].verse === ustV.verse && (t4t[v].verse_end ?? t4t[v].verse) === (ustV.verse_end ?? ustV.verse) && (() => {
                 const t4tV = t4t[v];
                 const copyT4t = () => {
                   const t4tPlain = t4tToUstPlain(t4tV.content);
