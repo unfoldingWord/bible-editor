@@ -590,7 +590,40 @@ export function computeTsvMerge(
 // legitimate part of the published content, exactly as on the verse side.
 
 // Actions whose edit_log payload carries row content worth folding.
-const CONTENT_ACTIONS = new Set(["create", "update", "restore"]);
+//
+// `restore_maintainer_cleanup` (#1255) is the 2026-08-11 data repair that put a
+// Door43 maintainer's cleanup back into 14 tn rows after an export reverted it.
+// It changed D1's content, so leaving it out made the ancestor the pre-repair
+// text while D1 and Door43 both held the repaired text: the next Door43 edit to
+// such a row read as "both changed" and flagged a merge_conflict nobody caused
+// (HOS vy1x, ISA frjp / l4er, MIC vge6 on 2026-11-03). Its payload lists only the
+// changed fields, as `{fields: [{field, from, to}]}`; contentPayload reads it.
+//
+// Exported as SQL too, so reconstructTsvBases' `action IN (...)` filters and
+// this fold read one list and cannot drift apart.
+export const TSV_ANCESTOR_ACTIONS = ["create", "update", "restore", "restore_maintainer_cleanup"] as const;
+const CONTENT_ACTIONS: ReadonlySet<string> = new Set(TSV_ANCESTOR_ACTIONS);
+export const TSV_ANCESTOR_ACTIONS_SQL = TSV_ANCESTOR_ACTIONS.map((a) => `'${a}'`).join(", ");
+
+// The row content an edit_log payload carries, keyed by column. Most writers log
+// the columns directly. A data repair that logs a `fields: [{field, from, to}]`
+// list (restore_maintainer_cleanup, #1255) is flattened to `{field: to}`, the
+// value it wrote. Decided by the payload's shape rather than the action name
+// (the #580 lesson in export.ts). A list entry without a string `field` and a
+// `to` key is dropped, so a malformed entry leaves the field absent, which
+// withholds, instead of folding a guessed value.
+function contentPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const list = payload.fields;
+  if (!Array.isArray(list)) return payload;
+  const out: Record<string, unknown> = {};
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const { field } = item as { field?: unknown };
+    if (typeof field !== "string" || !Object.prototype.hasOwnProperty.call(item, "to")) continue;
+    out[field] = (item as { to: unknown }).to;
+  }
+  return out;
+}
 
 // Read one canonical field from a heterogeneously-shaped payload, honoring both
 // snake_case (DB/ParsedTsvRow) and camelCase (request body) spellings. Returns
@@ -738,7 +771,7 @@ export function foldTsvRefBase(entries: TsvEditLogEntry[]): TsvRefSide | null {
     // a wrong content ancestor mis-merges one field rather than unblocking an
     // overwrite, so it didn't need to land under this same fix.)
     if (e.bookKnown === false) continue;
-    const p = e.payload;
+    const p = contentPayload(e.payload);
     for (const k of ["chapter", "verse"] as const) {
       if (!Object.prototype.hasOwnProperty.call(p, k)) continue;
       const n = refNumber(p[k]);
@@ -783,8 +816,9 @@ export function foldTsvBase(kind: TsvMergeKind, entries: TsvEditLogEntry[]): Tsv
     // separately instead of fixing it there), but it is still worth less than
     // no entry at all, so it is skipped the same way.
     if (e.bookKnown === false) continue;
+    const p = contentPayload(e.payload);
     for (const f of fields) {
-      const { present, value } = readPayloadField(e.payload, f);
+      const { present, value } = readPayloadField(p, f);
       if (!present) continue;
       if (base === null) base = {};
       if (f === "occurrence") {

@@ -4797,6 +4797,91 @@ for (const locked of [true, false]) {
   }
 }
 
+console.log("\n[#1255: a restore_maintainer_cleanup repair is part of the TSV merge ancestor — real applyTsvRows]");
+{
+  // The 2026-11-03 shape (HOS vy1x, ISA frjp / l4er, MIC vge6). A translator's
+  // note carried a markdown defect; the 2026-08-11 data repair put the Door43
+  // maintainer's fixed text back and logged it as restore_maintainer_cleanup
+  // with a `{fields: [{field, from, to}]}` payload. D1 and Door43 then agreed on
+  // the fixed text. When Door43 later reworded the note (en_tn #7940), the fold
+  // skipped the repair, took the defective text as the ancestor, read D1 as
+  // changed too, and flagged a merge_conflict nobody caused.
+  //
+  // ABLATION: drop 'restore_maintainer_cleanup' from TSV_ANCESTOR_ACTIONS (or
+  // the contentPayload call in foldTsvBase) and the first case flags again.
+  const DEFECT = "as if they were **strangers** who would *swallow it up** or eat it all.";
+  const REPAIRED = "as if they were **strangers** who would **swallow it up** or eat it all.";
+  const REWORDED = "as if they were **strangers** who would **swallow it up**. If this meaning would not be clear in your language, you could use a comparable expression.";
+  const seed = (sqlite) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version)
+         VALUES ('rm01', ?, 8, 7, '8:7', ?, 10, 7, 4)`,
+      )
+      .run(BOOK, REPAIRED);
+    const log = sqlite.prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, source, created_at)
+       VALUES ('tn', 'rm01', ?, ?, ?, ?, ?)`,
+    );
+    log.run(BOOK, "create", JSON.stringify({ chapter: 8, verse: 7, ref_raw: "8:7", note: "first draft" }), "ai_pipeline", 100);
+    log.run(BOOK, "update", JSON.stringify({ note: DEFECT }), null, 110);
+    const repair = log.run(
+      BOOK,
+      "restore_maintainer_cleanup",
+      JSON.stringify({ incident: "test-cleanup", fields: [{ field: "note", from: DEFECT, to: REPAIRED }] }),
+      "data_repair",
+      150,
+    );
+    return Number(repair.lastInsertRowid);
+  };
+  const masterTn = (note) => ({
+    id: "rm01", idCoerced: false, refRaw: "8:7", chapter: 8, verse: 7,
+    occurrence: null, tags: null, support_reference: null, quote: null, note,
+  });
+  const lineage = {
+    mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["fa8da064aa"],
+  };
+  const readRow = (sqlite) =>
+    sqlite.prepare(`SELECT note, review_kind, version FROM tn_rows WHERE book = ? AND id = 'rm01'`).all(BOOK)[0];
+
+  // 1. Nobody touched the row in the app after the repair: Door43's rewording
+  //    adopts cleanly, with no flag.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(REWORDED)], null, {
+      confirmedAt: 200, editId: boundary, lineage,
+    });
+    const row = readRow(sqlite);
+    eq(row.note, REWORDED, "Door43's rewording lands");
+    eq(row.review_kind, null, "…and the row is NOT flagged: the repair's text is the ancestor, so only Door43 moved");
+    eq(counts.merge_conflicts, 0, "…no merge_conflicts counted");
+    eq(counts.merge_adopted, 1, "…counted as one clean adoption");
+  }
+
+  // 2. The fix must not hide a real conflict: a translator edit AFTER the
+  //    boundary still collides with Door43's rewording and is still flagged.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite);
+    sqlite.prepare(`UPDATE tn_rows SET note = 'the translator''s later wording', version = 5 WHERE book = ? AND id = 'rm01'`).run(BOOK);
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tn', 'rm01', ?, 'update', ?, 300)`,
+      )
+      .run(BOOK, JSON.stringify({ note: "the translator's later wording" }));
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(REWORDED)], null, {
+      confirmedAt: 200, editId: boundary, lineage,
+    });
+    const row = readRow(sqlite);
+    eq(row.review_kind, "merge_conflict", "a translator edit after the boundary still flags a merge_conflict");
+    eq(counts.merge_conflicts, 1, "…counted as one conflict");
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
