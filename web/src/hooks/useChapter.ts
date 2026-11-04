@@ -123,7 +123,7 @@ export interface UseChapterReturn {
   /** Optimistically add/remove my own stamp on a (verse, lane). */
   applyLocalLaneCheck: (verse: number, lane: CheckLane, userId: number, checked: boolean) => void;
   /** Authoritative: replace a (verse, lane)'s checker set (server result / WS). */
-  applyLaneCheckers: (verse: number, lane: CheckLane, checkers: number[]) => void;
+  applyLaneCheckers: (verse: number, lane: CheckLane, checkers: number[], checkerNames?: (string | null)[]) => void;
   /** Authoritative: replace every check for one lane in the chapter (bulk result). */
   replaceLaneChecksForLane: (lane: CheckLane, checks: VerseLaneCheck[]) => void;
   /**
@@ -444,17 +444,18 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   );
 
   const applyLaneCheckers = useCallback<UseChapterReturn["applyLaneCheckers"]>(
-    (verse, lane, checkers) => {
+    (verse, lane, checkers, checkerNames) => {
       mutate((prev) => {
         const rest = prev.verseLaneChecks.filter((c) => !(c.verse === verse && c.lane === lane));
         const now = Math.floor(Date.now() / 1000);
-        const added: VerseLaneCheck[] = checkers.map((checked_by) => ({
+        const added: VerseLaneCheck[] = checkers.map((checked_by, i) => ({
           book: prev.book,
           chapter: prev.chapter,
           verse,
           lane,
           checked_by,
           checked_at: now,
+          checked_by_name: checkerNames?.[i] ?? null,
         }));
         return { ...prev, verseLaneChecks: [...rest, ...added] };
       });
@@ -513,7 +514,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
       if (op.target.kind === "lane_check") {
         const s = result.updated as LaneCheckState;
         if (s && s.book === book && s.chapter === chapter) {
-          applyLaneCheckers(s.verse, s.lane, s.checkers);
+          applyLaneCheckers(s.verse, s.lane, s.checkers, s.checkerNames);
         }
       }
     });

@@ -109,7 +109,7 @@ chapters.get("/:book/:chapter", async (c) => {
       .bind(book, chapter),
     db
       .prepare(
-        "SELECT * FROM verse_lane_checks WHERE book = ?1 AND chapter = ?2",
+        LANE_CHECKS_WITH_NAMES_SQL + " WHERE l.book = ?1 AND l.chapter = ?2",
       )
       .bind(book, chapter),
     db
@@ -228,6 +228,11 @@ chapters.patch("/:book/:chapter/:verse/status", requireEditor, async (c) => {
 
 // --- Per-resource checkoff lanes (supersedes the single done flag above) ---
 
+// Each check row plus the checker's DCS username, so a lane tooltip can name
+// who checked it. LEFT JOIN: a missing user still returns the check (name null).
+const LANE_CHECKS_WITH_NAMES_SQL =
+  "SELECT l.*, u.dcs_username AS checked_by_name FROM verse_lane_checks l LEFT JOIN users u ON u.id = l.checked_by";
+
 function isCheckLane(s: string): s is CheckLane {
   return (CHECK_LANES as readonly string[]).includes(s);
 }
@@ -238,16 +243,17 @@ async function laneCheckersFor(
   chapter: number,
   verse: number,
   lane: CheckLane,
-): Promise<number[]> {
+): Promise<{ checkers: number[]; checkerNames: (string | null)[] }> {
   const r = await db
     .prepare(
-      `SELECT checked_by FROM verse_lane_checks
-        WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND lane = ?4
-        ORDER BY checked_by`,
+      `SELECT l.checked_by, u.dcs_username AS name FROM verse_lane_checks l
+         LEFT JOIN users u ON u.id = l.checked_by
+        WHERE l.book = ?1 AND l.chapter = ?2 AND l.verse = ?3 AND l.lane = ?4
+        ORDER BY l.checked_by`,
     )
     .bind(book, chapter, verse, lane)
-    .all<{ checked_by: number }>();
-  return r.results.map((x) => x.checked_by);
+    .all<{ checked_by: number; name: string | null }>();
+  return { checkers: r.results.map((x) => x.checked_by), checkerNames: r.results.map((x) => x.name) };
 }
 
 // Toggle MY check stamp on one (verse, lane). Idempotent: re-PUTting the same
@@ -292,8 +298,7 @@ chapters.patch("/:book/:chapter/:verse/lanes/:lane", requireEditor, async (c) =>
       )
       .bind(`${book}/${chapter}/${verse}/${lane}`, book, userId, JSON.stringify({ lane, checked: parsed.data.checked })),
   ]);
-  const checkers = await laneCheckersFor(c.env.DB, book, chapter, verse, lane);
-  const check = { book, chapter, verse, lane, checkers };
+  const check = { book, chapter, verse, lane, ...(await laneCheckersFor(c.env.DB, book, chapter, verse, lane)) };
   c.executionCtx.waitUntil(
     broadcastChapter(c.env, book, chapter, { type: "lane_check.updated", check }),
   );
@@ -349,7 +354,7 @@ chapters.patch("/:book/:chapter/lanes/:lane/bulk", requireEditor, async (c) => {
   );
   await c.env.DB.batch(stmts);
   const all = await c.env.DB
-    .prepare(`SELECT * FROM verse_lane_checks WHERE book = ?1 AND chapter = ?2 AND lane = ?3`)
+    .prepare(LANE_CHECKS_WITH_NAMES_SQL + " WHERE l.book = ?1 AND l.chapter = ?2 AND l.lane = ?3")
     .bind(book, chapter, lane)
     .all<VerseLaneCheck>();
   c.executionCtx.waitUntil(
