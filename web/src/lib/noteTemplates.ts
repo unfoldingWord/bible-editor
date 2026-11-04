@@ -8,7 +8,7 @@
 // Wording matches docs/samples/en_tn_tn_ZEC.tsv (TCM); SH is the current team template.
 
 export const TCM =
-  "This could mean: (1) NOTE Alternate translation: [ALT] (2) NOTE Alternate translation: [ALT]";
+  "This could mean: (1) NOTE, Alternate translation: [ALT] or (2) NOTE. Alternate translation: [ALT]";
 
 export const SH =
   "See how you translated the same/similar expression \u201cSIMILAR_EXPRESSION\u201d in [1:1](../01/01.md).";
