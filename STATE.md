@@ -752,6 +752,10 @@ Highlights that bite repeatedly:
   any row that does not (every row from before 0078). The retention sweep skips a repo while it has an open gap,
   or it would delete that trail hourly (backfilled history is old on both clocks). A time cutoff (stop below `coverage_since`) was rejected:
   committer dates are not monotone along parent edges, so nothing in the code bounds it.
+- **Local `wrangler dev` can start real AI runs.** The main checkout's `api/.dev.vars` carries `BT_API_TOKEN`, so a
+  local `/api/pipelines/start` dispatches to the real bot unless `PIPELINE_API_BASE` points somewhere dead. Live-test
+  pipeline UI with `wrangler dev ... --var PIPELINE_API_BASE:http://127.0.0.1:9`; a start then fails with 502
+  `upstream_unreachable` (measured 2026-11-04).
 
 ## Stop conditions / goals
 

@@ -247,13 +247,12 @@ export async function reopenLaneChecksBulk(
   book: string,
   // #1205: `verseEnd` (a range row's verse_end) widens the reopen to every
   // verse from `verse` through it.
-  entries: Array<{ chapter: number; verse: number; verseEnd?: number | null; lanes: CheckLane[] }>,
+  entries: LaneReopenEntry[],
   broadcast: boolean,
 ): Promise<void> {
   const withLanes = entries.filter((e) => e.lanes.length > 0);
   if (withLanes.length === 0) return;
-  let broadcastCount = 0;
-  let droppedBroadcasts = 0;
+  const reopened: LaneReopenEntry[] = [];
   for (let i = 0; i < withLanes.length; i += REOPEN_WRITE_BATCH) {
     const slice = withLanes.slice(i, i + REOPEN_WRITE_BATCH);
     try {
@@ -293,36 +292,57 @@ export async function reopenLaneChecksBulk(
       // DELETE's result is at the even index.
       const results = slice.map((_e, j) => batchResults[j * 2]);
       if (!broadcast) continue;
+      // Nothing was checked for this verse → nothing reopened → no need to
+      // notify anyone (mirrors reopenLaneChecks's single-verse guard).
       for (let j = 0; j < slice.length; j++) {
-        // Nothing was checked for this verse → nothing reopened → no need to
-        // notify anyone (mirrors reopenLaneChecks's single-verse guard).
-        if (!results[j]?.meta.changes) continue;
-        const e = slice[j];
-        for (let v = e.verse; v <= lastCoveredVerse(e.verse, e.verseEnd); v++) {
-          for (const lane of e.lanes) {
-            if (broadcastCount >= LANE_REOPEN_BROADCAST_CAP) {
-              droppedBroadcasts++;
-              continue;
-            }
-            broadcastCount++;
-            try {
-              await broadcastChapter(env, book, e.chapter, {
-                type: "lane_check.updated",
-                check: { book, chapter: e.chapter, verse: v, lane, checkers: [] },
-              });
-            } catch {
-              // Best-effort: a single dropped broadcast must never fail the batch.
-            }
-          }
-        }
+        if (results[j]?.meta.changes) reopened.push(slice[j]);
       }
     } catch {
       // Best-effort: a batch failure here just leaves those checkoffs as-is;
       // a later edit reopens them.
     }
   }
+  await broadcastLaneReopens(env, book, reopened, "reopenLaneChecksBulk");
+}
+
+export type LaneReopenEntry = { chapter: number; verse: number; verseEnd?: number | null; lanes: CheckLane[] };
+
+// The broadcast half of a many-verse reopen whose DELETEs already ran: one
+// empty-checker `lane_check.updated` per covered (verse, lane), capped at
+// LANE_REOPEN_BROADCAST_CAP across the whole call (the rest are dropped and
+// counted, never silently). Shared by reopenLaneChecksBulk and the AI pipeline
+// apply (pipelineImport.ts), which deletes the checks inside its own per-verse
+// write batch and so cannot route through reopenLaneChecksBulk's DELETE.
+// Best-effort: never throws.
+export async function broadcastLaneReopens(
+  env: Env,
+  book: string,
+  entries: LaneReopenEntry[],
+  logLabel: string,
+): Promise<void> {
+  let broadcastCount = 0;
+  let droppedBroadcasts = 0;
+  for (const e of entries) {
+    for (let v = e.verse; v <= lastCoveredVerse(e.verse, e.verseEnd); v++) {
+      for (const lane of e.lanes) {
+        if (broadcastCount >= LANE_REOPEN_BROADCAST_CAP) {
+          droppedBroadcasts++;
+          continue;
+        }
+        broadcastCount++;
+        try {
+          await broadcastChapter(env, book, e.chapter, {
+            type: "lane_check.updated",
+            check: { book, chapter: e.chapter, verse: v, lane, checkers: [] },
+          });
+        } catch {
+          // Best-effort: a single dropped broadcast must never fail the caller.
+        }
+      }
+    }
+  }
   if (droppedBroadcasts > 0) {
-    console.error("reopenLaneChecksBulk: broadcast dropped past cap", {
+    console.error(`${logLabel}: broadcast dropped past cap`, {
       book,
       dropped: droppedBroadcasts,
       cap: LANE_REOPEN_BROADCAST_CAP,

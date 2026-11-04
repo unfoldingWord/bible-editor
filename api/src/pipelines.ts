@@ -134,6 +134,11 @@ export const StartBody = z
     // generate -> notes -> tqs. Mutually exclusive with followUpOptions
     // (we'd otherwise need to define an ordering between them).
     followUpChain: z.array(ChainStep).min(1).max(4).optional(),
+    // The user has confirmed that this run may replace the text of verses
+    // whose Text lane is checked off (and so clear those checks). Without it a
+    // run that writes verse text over checked verses is refused with 409
+    // checked_verses — see checkedVersesConfirmationRequired.
+    confirmCheckedVerses: z.boolean().optional(),
   })
   .refine((b) => !(b.followUpOptions && b.followUpChain), {
     message: "follow_up_options_and_chain_mutually_exclusive",
@@ -152,6 +157,52 @@ export const StartBody = z
         !b.followUpChain),
     { message: "verse_range_is_one_chapter_notes_only" },
   );
+
+// Whether a run writes ULT/UST verse content: a generate run (any options —
+// alignOnly too, since it still rewrites content_json and so reopens the Text
+// check, see pipelineImport.ts's applyVerseUpdate) or a chain with a generate
+// step. Notes / questions runs never touch verse content.
+export function runWritesVerseText(b: {
+  pipelineType: string;
+  followUpChain?: Array<{ pipelineType: string }>;
+}): boolean {
+  return b.pipelineType === "generate" || (b.followUpChain ?? []).some((s) => s.pipelineType === "generate");
+}
+
+// Distinct verses in the chapter range whose Text lane someone has checked off.
+// Generate runs are always whole-chapter, so there is no verse range here.
+export async function countCheckedTextVerses(
+  env: Env,
+  book: string,
+  startChapter: number,
+  endChapter: number,
+): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM (
+       SELECT DISTINCT chapter, verse FROM verse_lane_checks
+        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND lane = 'text'
+     )`,
+  )
+    .bind(book, startChapter, endChapter)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+// The /start gate, same shape as bookLock.ts's requireAutoMergeConfirmation: a
+// run that would replace checked-off verse text needs the explicit
+// confirmCheckedVerses flag. Returns the count to show the user, or null when
+// the run may start.
+export async function checkedVersesConfirmationRequired(
+  env: Env,
+  book: string,
+  startChapter: number,
+  endChapter: number,
+  body: { pipelineType: string; followUpChain?: Array<{ pipelineType: string }>; confirmCheckedVerses?: boolean },
+): Promise<{ count: number } | null> {
+  if (body.confirmCheckedVerses === true || !runWritesVerseText(body)) return null;
+  const count = await countCheckedTextVerses(env, book, startChapter, endChapter);
+  return count > 0 ? { count } : null;
+}
 
 // storedVerseRange lives in storedVerseRange.ts so chapterLock.ts can read a
 // job's range without importing this module; re-exported for existing callers.
@@ -1920,6 +1971,12 @@ pipelines.post("/start", requireEditor, async (c) => {
     );
   }
 
+  // Generating ULT/UST replaces verse text and clears the Text checkoffs on
+  // every verse it writes (pipelineImport.ts's applyVerseUpdate). Ask first:
+  // the menu shows the count and retries with confirmCheckedVerses.
+  const checked = await checkedVersesConfirmationRequired(c.env, book, startChapter, endChapter, parsed.data);
+  if (checked) return c.json({ error: "checked_verses", count: checked.count }, 409);
+
   // For notes pipelines, gather any hint=1 stubs the editor has queued in
   // the chapter range and fold them into options.hints. The proxy is the
   // authoritative source (not the client) so D1 state at start time wins
@@ -2090,6 +2147,21 @@ pipelines.post("/start", requireEditor, async (c) => {
     queuePosition: snap.positions.get(jobId)?.position,
   };
   return c.json(resp);
+});
+
+// GET /api/pipelines/checked-text?book=&startChapter=&endChapter=
+// How many verses in the range have a Text checkoff. The menu starts one run
+// per chapter, so it asks once for the whole range before starting any of
+// them; /start's own 409 checked_verses only sees its one chapter. Registered
+// before /:jobId so that route does not swallow it.
+pipelines.get("/checked-text", requireEditor, async (c) => {
+  const book = (c.req.query("book") ?? "").toUpperCase();
+  const startChapter = parseInt(c.req.query("startChapter") ?? "", 10);
+  const endChapter = parseInt(c.req.query("endChapter") ?? "", 10);
+  if (!book || !Number.isFinite(startChapter) || !Number.isFinite(endChapter)) {
+    return c.json({ error: "invalid_params" }, 400);
+  }
+  return c.json({ count: await countCheckedTextVerses(c.env, book, startChapter, endChapter) });
 });
 
 // GET /api/pipelines/:jobId

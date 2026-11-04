@@ -47,6 +47,13 @@ import {
   shouldCheckCancel,
   CANCEL_CHECK_INTERVAL_SECONDS,
 } from "./pipelineImportClaim.ts";
+import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
+import {
+  broadcastLaneReopens,
+  lanesToReopenOnVerseEdit,
+  lastCoveredVerse,
+  type LaneReopenEntry,
+} from "./laneReopen.ts";
 
 interface OutputEntry {
   type?: string;
@@ -1316,11 +1323,15 @@ async function applyJobOutput(
   // a stale UST (or vice versa); checking only at a verse-group boundary
   // ensures ULT+UST for one reference are never split.
   let versePrevKey: number | null = null;
+  // Checkoffs each landed verse write reopened (its DELETE runs inside that
+  // verse's own write batch — see applyVerseUpdate). Broadcast once, after the
+  // loop, under the shared LANE_REOPEN_BROADCAST_CAP.
+  const reopened: LaneReopenEntry[] = [];
   for (const p of verseProposals) {
     const k = verseKey(p);
     if (k !== versePrevKey && (await maybeCheckCancelled(env, job.jobId, cancel))) break;
     versePrevKey = k;
-    const outcome = await applyVerseUpdate(env, p, userId, uhbWordsByVerse, actor);
+    const outcome = await applyVerseUpdate(env, p, userId, uhbWordsByVerse, actor, reopened);
     if (outcome === "conflict") {
       result.verseSkippedConflict += 1;
     } else {
@@ -1329,6 +1340,10 @@ async function applyJobOutput(
     }
     await maybeTouchClaim(env, job.jobId, heartbeat);
   }
+  // Also after a cancellation `break`: every verse written before it landed.
+  // The chapter.pipeline_applied hint the poller sends afterwards only offers
+  // a refresh, so this is what clears the green check in open tabs live.
+  await broadcastLaneReopens(env, job.book, reopened, "pipeline apply lane reopen");
 
   result.affectedChapters = [...affected].sort((a, b) => a - b);
   return result;
@@ -2159,6 +2174,8 @@ async function applyVerseUpdate(
   userId: number,
   uhbWordsByVerse: Map<number, SourceWord[]>,
   actor: string,
+  // Out: the checkoffs this write reopened, for the caller to broadcast.
+  reopened: LaneReopenEntry[],
 ): Promise<"applied" | "conflict"> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const book = String(payload.book ?? p.book);
@@ -2280,11 +2297,65 @@ async function applyVerseUpdate(
   // content_json, so this is our one chance to preserve the PRE-AI state ("v0")
   // for verse history — see the guarded baseline insert below.
   const existing = await env.DB.prepare(
-    `SELECT version, content_json, plain_text, updated_at FROM verses
+    `SELECT version, content_json, plain_text, updated_at, verse_end FROM verses
       WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
   )
     .bind(book, chapter, verse, bibleVersion)
-    .first<{ version: number; content_json: string; plain_text: string | null; updated_at: number }>();
+    .first<{
+      version: number;
+      content_json: string;
+      plain_text: string | null;
+      updated_at: number;
+      verse_end: number | null;
+    }>();
+
+  // An AI verse write reopens the same checkoffs a human edit of the verse
+  // would (verses.ts → lanesToReopenOnVerseEdit): 'text' always, plus 'tw' for
+  // a ULT write that changed a `\w` word. Unparseable content on either side
+  // fails toward "changed" (reopen), never toward a stale check. The DELETE
+  // rides in this verse's own write batch (no extra subrequest per verse) and
+  // spans every verse the row covers before or after the write (#1205).
+  let wordSequenceUnchanged = false;
+  if (existing) {
+    try {
+      wordSequenceUnchanged = analyzeAlignmentDelta(
+        JSON.parse(existing.content_json),
+        JSON.parse(contentJson),
+      ).wordSequenceUnchanged;
+    } catch {
+      /* fail toward reopen */
+    }
+  }
+  const reopenLanes = lanesToReopenOnVerseEdit(bibleVersion, wordSequenceUnchanged);
+  const reopenLast = Math.max(
+    lastCoveredVerse(verse, verseEnd),
+    lastCoveredVerse(verse, existing?.verse_end),
+  );
+  const reopenEntry: LaneReopenEntry = {
+    chapter,
+    verse,
+    verseEnd: reopenLast > verse ? reopenLast : null,
+    lanes: reopenLanes,
+  };
+  const lanePlaceholders = (first: number) => reopenLanes.map((_l, i) => `?${first + i}`).join(", ");
+  // Same audit row reopenLaneChecks writes, conditional on the DELETE just
+  // before it having removed something (D1 runs a batch sequentially on one
+  // connection, so changes() reads that DELETE's count).
+  const reopenAudit = env.DB
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+       SELECT 'verse_lane', ?1, ?2, NULL, NULL, NULL, 'update', ?3, 'lane_reopen'
+        WHERE changes() > 0`,
+    )
+    .bind(
+      `${book}/${chapter}/${verse}`,
+      book,
+      JSON.stringify(
+        reopenLast > verse
+          ? { lanes: reopenLanes, reason: "ai_pipeline_reopen", verse_end: reopenLast }
+          : { lanes: reopenLanes, reason: "ai_pipeline_reopen" },
+      ),
+    );
 
   const now = Math.floor(Date.now() / 1000);
   if (existing) {
@@ -2397,7 +2468,23 @@ async function applyVerseUpdate(
               )`,
         )
         .bind(p.id, userId, book, chapter, verse, bibleVersion, newVersion),
+      // Reopen the checkoffs (see reopenLanes above), self-gated on this
+      // write having landed exactly like the statements before it, so a lost
+      // CAS clears nothing. Then its conditional audit row.
+      env.DB
+        .prepare(
+          `DELETE FROM verse_lane_checks
+            WHERE book = ?1 AND chapter = ?2 AND verse >= ?3 AND verse <= ?4
+              AND lane IN (${lanePlaceholders(7)})
+              AND EXISTS (
+                SELECT 1 FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?5
+                  AND version = ?6 AND last_change_source = 'ai_pipeline'
+              )`,
+        )
+        .bind(book, chapter, verse, reopenLast, bibleVersion, newVersion, ...reopenLanes),
+      reopenAudit,
     ]);
+    if ((results[4]?.meta?.changes ?? 0) > 0) reopened.push(reopenEntry);
     if ((results[0]?.meta?.changes ?? 0) === 0) {
       // Lost the race: someone else's write landed between our SELECT and the
       // UPDATE above — none of the audit/accept statements fired (they all
@@ -2421,7 +2508,7 @@ async function applyVerseUpdate(
 
   // The verse should exist from the initial book import; this branch is the
   // defensive case where the seed missed something. Insert as a brand-new row.
-  await env.DB.batch([
+  const insertResults = await env.DB.batch([
     env.DB
       .prepare(
         `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, updated_by, ${PROVENANCE_COLUMNS.join(", ")})
@@ -2450,6 +2537,17 @@ async function applyVerseUpdate(
         `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,
       )
       .bind(p.id, userId),
+    // Checkoffs are keyed by verse, not by row, so one can exist even here.
+    // Ungated: this batch is all-or-nothing (a failed INSERT rolls it back).
+    env.DB
+      .prepare(
+        `DELETE FROM verse_lane_checks
+          WHERE book = ?1 AND chapter = ?2 AND verse >= ?3 AND verse <= ?4
+            AND lane IN (${lanePlaceholders(5)})`,
+      )
+      .bind(book, chapter, verse, reopenLast, ...reopenLanes),
+    reopenAudit,
   ]);
+  if ((insertResults[3]?.meta?.changes ?? 0) > 0) reopened.push(reopenEntry);
   return "applied";
 }

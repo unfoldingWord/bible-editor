@@ -2016,12 +2016,15 @@ function buildFakeVerseBoundaryDb(flipAfterProposals) {
     if (/SELECT chapter, verse, content_json FROM verses/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no UHB/UGNT source rows loaded
     }
-    if (/SELECT version, content_json, plain_text, updated_at FROM verses/.test(sql)) {
+    if (/SELECT version, content_json, plain_text, updated_at, verse_end FROM verses/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no existing verse row — insert branch
     }
     if (/INSERT INTO verses/.test(sql)) {
       verseInsertCount += 1;
       return { changes: 1, rows: [], single: null };
+    }
+    if (/DELETE FROM verse_lane_checks/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // nothing checked off
     }
     if (/INSERT INTO edit_log/.test(sql)) {
       return { changes: 1, rows: [], single: null };
@@ -2173,12 +2176,15 @@ await (async () => {
     if (/SELECT chapter, verse, content_json FROM verses/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no UHB/UGNT source rows loaded
     }
-    if (/SELECT version, content_json, plain_text, updated_at FROM verses/.test(sql)) {
+    if (/SELECT version, content_json, plain_text, updated_at, verse_end FROM verses/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no existing verse row — insert branch
     }
     if (/INSERT INTO verses/.test(sql)) {
       insertedArgs = args;
       return { changes: 1, rows: [], single: null };
+    }
+    if (/DELETE FROM verse_lane_checks/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // nothing checked off
     }
     if (/INSERT INTO edit_log/.test(sql)) {
       return { changes: 1, rows: [], single: null };
@@ -3531,6 +3537,7 @@ await (async () => {
   let verseUpdateAttempted = false;
   let editLogSql = null;
   let pendingAcceptSql = null;
+  let laneReopenSql = null;
 
   function dispatch(sql, args) {
     if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
@@ -3572,7 +3579,7 @@ await (async () => {
     if (/SELECT chapter, verse, content_json FROM verses/.test(sql)) {
       return { changes: 0, rows: [], single: null }; // no UHB/UGNT source rows loaded
     }
-    if (/SELECT version, content_json, plain_text, updated_at FROM verses/.test(sql)) {
+    if (/SELECT version, content_json, plain_text, updated_at, verse_end FROM verses/.test(sql)) {
       // A live row exists at version 5 — a concurrent write already moved past
       // the version the pipeline is about to write with.
       return { changes: 0, rows: [], single: { version: 5, content_json: "{}", plain_text: "", updated_at: 1000 } };
@@ -3583,6 +3590,14 @@ await (async () => {
       // above); simulate that a concurrent write already bumped it past that,
       // so this CAS'd UPDATE matches zero rows — exactly what D1 would report.
       return { changes: 0, rows: [], single: null };
+    }
+    if (/DELETE FROM verse_lane_checks/.test(sql)) {
+      laneReopenSql = sql;
+      // Same EXISTS gate as the bookkeeping below: false, so nothing reopens.
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/INSERT INTO edit_log/.test(sql) && /lane_reopen/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // its changes() > 0 gate is false
     }
     if (/INSERT INTO edit_log/.test(sql)) {
       editLogSql = sql;
@@ -3666,6 +3681,10 @@ await (async () => {
   assert(
     /EXISTS[\s\S]*last_change_source = 'ai_pipeline'/.test(pendingAcceptSql),
     "#775 verse CAS: the pending_imports accept self-gates the same way",
+  );
+  assert(
+    laneReopenSql !== null && /EXISTS[\s\S]*last_change_source = 'ai_pipeline'/.test(laneReopenSql),
+    "AI verse write: the checkoff-reopen DELETE self-gates the same way, so a lost CAS clears no check",
   );
   assert(result.applied?.verseUpdated === 0, `#775 verse CAS: verseUpdated stays 0 on a lost CAS (got ${result.applied?.verseUpdated})`);
   assert(

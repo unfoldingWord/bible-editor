@@ -1279,6 +1279,12 @@ export interface PipelineStartRequest {
    * chapter unlocked between steps. Mutually exclusive with followUpOptions.
    */
   followUpChain?: PipelineChainStep[];
+  /**
+   * The user confirmed replacing checked-off verse text. Without it a ULT/UST
+   * run over verses with a Text check is refused with 409
+   * `{ error: "checked_verses", count }`.
+   */
+  confirmCheckedVerses?: boolean;
 }
 
 export interface PipelineStartResponse {
@@ -2140,6 +2146,13 @@ export const api = {
       body: JSON.stringify(body),
       signal,
     }),
+
+  // Verses in the chapter range with a Text checkoff — asked once before a
+  // ULT/UST run so the user can confirm replacing checked text.
+  pipelineCheckedText: (book: string, startChapter: number, endChapter: number) =>
+    request<{ count: number }>(
+      `/api/pipelines/checked-text?book=${encodeURIComponent(book)}&startChapter=${startChapter}&endChapter=${endChapter}`,
+    ),
 
   pipelineStatus: (jobId: string, signal?: AbortSignal) =>
     request<PipelineStatusResponse>(
