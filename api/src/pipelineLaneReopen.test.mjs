@@ -16,7 +16,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { importJobOutput } from "./pipelineImport.ts";
-import { checkedVersesConfirmationRequired, countCheckedTextVerses } from "./pipelines.ts";
+import { checkedVersesConfirmationRequired, countCheckedVerses } from "./pipelines.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -141,6 +141,12 @@ function setup({ proposals, beforeBatch } = {}) {
 const run = (env) =>
   importJobOutput(env, { jobId: JOB, pipelineType: "generate", book: BOOK, startChapter: 2, endChapter: 2 }, []);
 
+// [lane, chapter, sorted verses of the checks carried] per lane_check.bulk sent.
+const bulkSummary = (sent) =>
+  sent
+    .filter((m) => m.type === "lane_check.bulk")
+    .map((m) => [m.lane, m.chapter, m.checks.map((c) => c.verse).sort((a, b) => a - b)]);
+
 const lanesLeft = (sqlite, verse) =>
   [
     ...new Set(
@@ -176,15 +182,71 @@ console.log("\n[AI ULT write that changes a word reopens 'text' and 'tw'; UST wr
     "each reopen leaves one lane_reopen audit row",
   );
   eq(
-    sent
-      .filter((m) => m.type === "lane_check.updated")
-      .map((m) => [m.check.verse, m.check.lane, m.check.checkers.length]),
+    bulkSummary(sent),
     [
-      [1, "text", 0],
-      [1, "tw", 0],
-      [2, "text", 0],
+      ["text", 2, [3, 3]],
+      ["tw", 2, [2, 2, 3, 3]],
     ],
-    "live tabs get one empty-checker lane_check.updated per reopened (verse, lane)",
+    "live tabs get ONE lane_check.bulk per reopened (chapter, lane), carrying that lane's current checks",
+  );
+  eq(sent.filter((m) => m.type === "lane_check.updated").length, 0, "no per-verse broadcasts");
+}
+
+console.log("\n[An editor re-checks a verse mid-run: the bulk broadcast carries the re-check, not a stale clear]");
+{
+  let batches = 0;
+  const { sqlite, env, sent } = setup({
+    proposals: [
+      { verse: 1, bibleVersion: "ULT", contentJson: content("the", "cat"), plainText: "the cat" },
+      { verse: 2, bibleVersion: "UST", contentJson: content("a", "cat"), plainText: "a cat" },
+    ],
+    // After verse 1's write cleared its Text check, the editor checks it again.
+    beforeBatch: (db, stmts) => {
+      if (!stmts.some((s) => /UPDATE verses\s+SET content_json/.test(s.sql))) return;
+      if (++batches === 2) {
+        db.prepare(
+          `INSERT INTO verse_lane_checks (book, chapter, verse, lane, checked_by, checked_at) VALUES (?, 2, 1, 'text', 1, 200)`,
+        ).run(BOOK);
+      }
+    },
+  });
+  await run(env);
+  eq(lanesLeft(sqlite, 1), ["text", "tn"], "sanity: the re-check is in D1");
+  eq(
+    bulkSummary(sent).find(([lane]) => lane === "text"),
+    ["text", 2, [1, 3, 3]],
+    "the Text bulk event shows verse 1 checked again",
+  );
+}
+
+console.log("\n[A throw mid-apply still announces the verses already written]");
+{
+  let batches = 0;
+  const { sqlite, env, sent } = setup({
+    proposals: [
+      { verse: 1, bibleVersion: "ULT", contentJson: content("the", "cat"), plainText: "the cat" },
+      { verse: 2, bibleVersion: "UST", contentJson: content("a", "cat"), plainText: "a cat" },
+    ],
+    beforeBatch: (_db, stmts) => {
+      if (!stmts.some((s) => /UPDATE verses\s+SET content_json/.test(s.sql))) return;
+      if (++batches === 2) throw new Error("D1 hiccup");
+    },
+  });
+  let threw = null;
+  try {
+    await run(env);
+  } catch (e) {
+    threw = e;
+  }
+  eq(threw?.message, "D1 hiccup", "sanity: the apply failed on verse 2");
+  eq(lanesLeft(sqlite, 1), ["tn"], "sanity: verse 1's write and its reopen landed");
+  eq(
+    bulkSummary(sent),
+    [
+      ["text", 2, [2, 2, 3, 3]],
+      ["tw", 2, [2, 2, 3, 3]],
+    ],
+    "verse 1's reopened lanes are still broadcast (current state: 2 and 3 still checked)",
   );
 }
 
@@ -223,7 +285,7 @@ console.log("\n[AI verse write that loses its CAS reopens nothing]");
     0,
     "lost CAS: no reopen audit row",
   );
-  eq(sent.filter((m) => m.type === "lane_check.updated").length, 0, "lost CAS: no reopen broadcast");
+  eq(sent.filter((m) => /^lane_check\./.test(m.type)).length, 0, "lost CAS: no reopen broadcast");
 }
 
 console.log("\n[/start gate: a run that writes verse text over checked verses needs confirmCheckedVerses]");
@@ -233,8 +295,17 @@ console.log("\n[/start gate: a run that writes verse text over checked verses ne
   sqlite
     .prepare(`INSERT INTO verse_lane_checks (book, chapter, verse, lane, checked_by, checked_at) VALUES (?, 5, 1, 'tn', 1, 100)`)
     .run(BOOK);
-  eq(await countCheckedTextVerses(env, BOOK, 2, 2), 3, "counts distinct Text-checked verses, not checker rows");
-  eq(await countCheckedTextVerses(env, BOOK, 3, 9), 0, "a Notes check alone does not count");
+  eq(await countCheckedVerses(env, BOOK, 2, 2), 3, "counts distinct verses, not checker or lane rows");
+  eq(await countCheckedVerses(env, BOOK, 3, 9), 0, "a Notes check alone does not count");
+  sqlite
+    .prepare(`INSERT INTO verse_lane_checks (book, chapter, verse, lane, checked_by, checked_at) VALUES (?, 6, 4, 'tw', 1, 100)`)
+    .run(BOOK);
+  eq(await countCheckedVerses(env, BOOK, 6, 6), 1, "a Words check alone counts (a ULT word change clears it)");
+  eq(
+    await checkedVersesConfirmationRequired(env, BOOK, 6, 6, { pipelineType: "generate" }),
+    { count: 1 },
+    "generate over a Words-only checked verse asks",
+  );
   eq(
     await checkedVersesConfirmationRequired(env, BOOK, 2, 2, { pipelineType: "generate" }),
     { count: 3 },

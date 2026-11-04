@@ -48,12 +48,44 @@ import {
   CANCEL_CHECK_INTERVAL_SECONDS,
 } from "./pipelineImportClaim.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
-import {
-  broadcastLaneReopens,
-  lanesToReopenOnVerseEdit,
-  lastCoveredVerse,
-  type LaneReopenEntry,
-} from "./laneReopen.ts";
+import { lanesToReopenOnVerseEdit, lastCoveredVerse } from "./laneReopen.ts";
+import { broadcastChapter } from "./wsEvents.ts";
+import type { CheckLane, VerseLaneCheck } from "./types";
+
+// Lanes whose checkoffs an apply reopened, per chapter.
+type ReopenedLanes = Map<number, Set<CheckLane>>;
+
+// Tell open tabs about the checkoffs an apply reopened: ONE `lane_check.bulk`
+// per (chapter, lane), carrying that lane's CURRENT checks read back from D1 —
+// the same shape the bulk toggle route (chapters.ts) broadcasts, which the web
+// applies by replacing the whole lane for the chapter. Per chapter, not per
+// verse, for the subrequest budget (a whole-book apply already spends ~2 per
+// verse, and the cron can apply several jobs in one invocation — the same
+// reason pipelines.ts sends one chapter.pipeline_applied hint per chapter). And
+// reading current state means a verse an editor re-checked mid-run shows
+// checked, not a stale "cleared". Best-effort: never throws.
+async function broadcastReopenedLanes(env: Env, book: string, reopened: ReopenedLanes): Promise<void> {
+  for (const [chapter, lanes] of reopened) {
+    for (const lane of lanes) {
+      try {
+        const all = await env.DB
+          .prepare(`SELECT * FROM verse_lane_checks WHERE book = ?1 AND chapter = ?2 AND lane = ?3`)
+          .bind(book, chapter, lane)
+          .all<VerseLaneCheck>();
+        await broadcastChapter(env, book, chapter, {
+          type: "lane_check.bulk",
+          book,
+          chapter,
+          lane,
+          checks: all.results ?? [],
+        });
+      } catch {
+        // A missed hint leaves that tab stale until it refreshes, which the
+        // chapter.pipeline_applied prompt already asks for.
+      }
+    }
+  }
+}
 
 interface OutputEntry {
   type?: string;
@@ -1324,26 +1356,29 @@ async function applyJobOutput(
   // ensures ULT+UST for one reference are never split.
   let versePrevKey: number | null = null;
   // Checkoffs each landed verse write reopened (its DELETE runs inside that
-  // verse's own write batch — see applyVerseUpdate). Broadcast once, after the
-  // loop, under the shared LANE_REOPEN_BROADCAST_CAP.
-  const reopened: LaneReopenEntry[] = [];
-  for (const p of verseProposals) {
-    const k = verseKey(p);
-    if (k !== versePrevKey && (await maybeCheckCancelled(env, job.jobId, cancel))) break;
-    versePrevKey = k;
-    const outcome = await applyVerseUpdate(env, p, userId, uhbWordsByVerse, actor, reopened);
-    if (outcome === "conflict") {
-      result.verseSkippedConflict += 1;
-    } else {
-      affected.add(p.chapter);
-      result.verseUpdated += 1;
+  // verse's own write batch — see applyVerseUpdate). Announced once per
+  // (chapter, lane) after the loop — in `finally`, so a cancellation `break` or
+  // a throw mid-loop still announces every verse written before it. The
+  // chapter.pipeline_applied hint the poller sends afterwards only offers a
+  // refresh, so this is what clears the green check in open tabs live.
+  const reopened: ReopenedLanes = new Map();
+  try {
+    for (const p of verseProposals) {
+      const k = verseKey(p);
+      if (k !== versePrevKey && (await maybeCheckCancelled(env, job.jobId, cancel))) break;
+      versePrevKey = k;
+      const outcome = await applyVerseUpdate(env, p, userId, uhbWordsByVerse, actor, reopened);
+      if (outcome === "conflict") {
+        result.verseSkippedConflict += 1;
+      } else {
+        affected.add(p.chapter);
+        result.verseUpdated += 1;
+      }
+      await maybeTouchClaim(env, job.jobId, heartbeat);
     }
-    await maybeTouchClaim(env, job.jobId, heartbeat);
+  } finally {
+    await broadcastReopenedLanes(env, job.book, reopened);
   }
-  // Also after a cancellation `break`: every verse written before it landed.
-  // The chapter.pipeline_applied hint the poller sends afterwards only offers
-  // a refresh, so this is what clears the green check in open tabs live.
-  await broadcastLaneReopens(env, job.book, reopened, "pipeline apply lane reopen");
 
   result.affectedChapters = [...affected].sort((a, b) => a - b);
   return result;
@@ -2175,7 +2210,7 @@ async function applyVerseUpdate(
   uhbWordsByVerse: Map<number, SourceWord[]>,
   actor: string,
   // Out: the checkoffs this write reopened, for the caller to broadcast.
-  reopened: LaneReopenEntry[],
+  reopened: ReopenedLanes,
 ): Promise<"applied" | "conflict"> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const book = String(payload.book ?? p.book);
@@ -2331,11 +2366,10 @@ async function applyVerseUpdate(
     lastCoveredVerse(verse, verseEnd),
     lastCoveredVerse(verse, existing?.verse_end),
   );
-  const reopenEntry: LaneReopenEntry = {
-    chapter,
-    verse,
-    verseEnd: reopenLast > verse ? reopenLast : null,
-    lanes: reopenLanes,
+  const noteReopened = () => {
+    const set = reopened.get(chapter) ?? new Set<CheckLane>();
+    for (const l of reopenLanes) set.add(l);
+    reopened.set(chapter, set);
   };
   const lanePlaceholders = (first: number) => reopenLanes.map((_l, i) => `?${first + i}`).join(", ");
   // Same audit row reopenLaneChecks writes, conditional on the DELETE just
@@ -2484,7 +2518,7 @@ async function applyVerseUpdate(
         .bind(book, chapter, verse, reopenLast, bibleVersion, newVersion, ...reopenLanes),
       reopenAudit,
     ]);
-    if ((results[4]?.meta?.changes ?? 0) > 0) reopened.push(reopenEntry);
+    if ((results[4]?.meta?.changes ?? 0) > 0) noteReopened();
     if ((results[0]?.meta?.changes ?? 0) === 0) {
       // Lost the race: someone else's write landed between our SELECT and the
       // UPDATE above — none of the audit/accept statements fired (they all
@@ -2548,6 +2582,6 @@ async function applyVerseUpdate(
       .bind(book, chapter, verse, reopenLast, ...reopenLanes),
     reopenAudit,
   ]);
-  if ((insertResults[3]?.meta?.changes ?? 0) > 0) reopened.push(reopenEntry);
+  if ((insertResults[3]?.meta?.changes ?? 0) > 0) noteReopened();
   return "applied";
 }

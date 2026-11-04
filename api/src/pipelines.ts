@@ -135,7 +135,7 @@ export const StartBody = z
     // (we'd otherwise need to define an ordering between them).
     followUpChain: z.array(ChainStep).min(1).max(4).optional(),
     // The user has confirmed that this run may replace the text of verses
-    // whose Text lane is checked off (and so clear those checks). Without it a
+    // with a Text or Words checkoff (and so clear those checks). Without it a
     // run that writes verse text over checked verses is refused with 409
     // checked_verses — see checkedVersesConfirmationRequired.
     confirmCheckedVerses: z.boolean().optional(),
@@ -169,9 +169,10 @@ export function runWritesVerseText(b: {
   return b.pipelineType === "generate" || (b.followUpChain ?? []).some((s) => s.pipelineType === "generate");
 }
 
-// Distinct verses in the chapter range whose Text lane someone has checked off.
+// Distinct verses in the chapter range with a Text or Words checkoff — the
+// lanes a verse write can clear (Words when a ULT word changes).
 // Generate runs are always whole-chapter, so there is no verse range here.
-export async function countCheckedTextVerses(
+export async function countCheckedVerses(
   env: Env,
   book: string,
   startChapter: number,
@@ -180,7 +181,7 @@ export async function countCheckedTextVerses(
   const row = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM (
        SELECT DISTINCT chapter, verse FROM verse_lane_checks
-        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND lane = 'text'
+        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND lane IN ('text', 'tw')
      )`,
   )
     .bind(book, startChapter, endChapter)
@@ -200,7 +201,7 @@ export async function checkedVersesConfirmationRequired(
   body: { pipelineType: string; followUpChain?: Array<{ pipelineType: string }>; confirmCheckedVerses?: boolean },
 ): Promise<{ count: number } | null> {
   if (body.confirmCheckedVerses === true || !runWritesVerseText(body)) return null;
-  const count = await countCheckedTextVerses(env, book, startChapter, endChapter);
+  const count = await countCheckedVerses(env, book, startChapter, endChapter);
   return count > 0 ? { count } : null;
 }
 
@@ -1971,7 +1972,7 @@ pipelines.post("/start", requireEditor, async (c) => {
     );
   }
 
-  // Generating ULT/UST replaces verse text and clears the Text checkoffs on
+  // Generating ULT/UST replaces verse text and clears the Text/Words checkoffs on
   // every verse it writes (pipelineImport.ts's applyVerseUpdate). Ask first:
   // the menu shows the count and retries with confirmCheckedVerses.
   const checked = await checkedVersesConfirmationRequired(c.env, book, startChapter, endChapter, parsed.data);
@@ -2149,19 +2150,19 @@ pipelines.post("/start", requireEditor, async (c) => {
   return c.json(resp);
 });
 
-// GET /api/pipelines/checked-text?book=&startChapter=&endChapter=
-// How many verses in the range have a Text checkoff. The menu starts one run
+// GET /api/pipelines/checked-verses?book=&startChapter=&endChapter=
+// How many verses in the range have a Text or Words checkoff. The menu starts one run
 // per chapter, so it asks once for the whole range before starting any of
 // them; /start's own 409 checked_verses only sees its one chapter. Registered
 // before /:jobId so that route does not swallow it.
-pipelines.get("/checked-text", requireEditor, async (c) => {
+pipelines.get("/checked-verses", requireEditor, async (c) => {
   const book = (c.req.query("book") ?? "").toUpperCase();
   const startChapter = parseInt(c.req.query("startChapter") ?? "", 10);
   const endChapter = parseInt(c.req.query("endChapter") ?? "", 10);
   if (!book || !Number.isFinite(startChapter) || !Number.isFinite(endChapter)) {
     return c.json({ error: "invalid_params" }, 400);
   }
-  return c.json({ count: await countCheckedTextVerses(c.env, book, startChapter, endChapter) });
+  return c.json({ count: await countCheckedVerses(c.env, book, startChapter, endChapter) });
 });
 
 // GET /api/pipelines/:jobId

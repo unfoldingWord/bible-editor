@@ -186,8 +186,8 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
   const [activeJobs, setActiveJobs] = useState<PipelineJob[]>([]);
   const [genOpts, setGenOpts] = useState<GenUiState>(() => loadGenOpts());
   const [conflict, setConflict] = useState<PipelineConflictExisting | null>(null);
-  // Verses in the run's range with a Text checkoff the run would clear; set
-  // while the "replace checked text?" confirmation is open.
+  // Verses in the run's range with a Text or Words checkoff the run would
+  // clear; set while the "replace checked text?" confirmation is open.
   const [checkedCount, setCheckedCount] = useState<number | null>(null);
   const [refInput, setRefInput] = useState("");
   // True once the user has typed in the field; until then the field follows
@@ -289,7 +289,7 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
     setCheckedCount(null);
     setSubmitting(true);
     try {
-      // Generating ULT/UST replaces verse text and clears its Text checkoffs.
+      // Generating ULT/UST replaces verse text and clears its Text/Words checkoffs.
       // Ask once for the whole range before starting any chapter's run (one
       // run per chapter, so a per-chapter refusal could start some and not
       // others). The server also refuses an unconfirmed run itself (409
@@ -298,7 +298,12 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
         !confirmCheckedVerses &&
         (confirm.type === "generate" || confirm.followUpChain?.some((s) => s.pipelineType === "generate"))
       ) {
-        const { count } = await api.pipelineCheckedText(rangeBook, startChapter, endChapter);
+        // A failed count must not block the run: fall through and let the
+        // server's own 409 checked_verses gate ask instead.
+        const count = await api
+          .pipelineCheckedVerses(rangeBook, startChapter, endChapter)
+          .then((r) => r.count)
+          .catch(() => 0);
         if (count > 0) {
           setCheckedCount(count);
           return;
@@ -363,7 +368,8 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
           | { error?: string; jobId?: string; count?: number }
           | undefined;
         if (e.status === 409 && body?.error === "checked_verses") {
-          // A Text check landed after the count above. Confirming re-runs the
+          // A Text/Words check landed after the count above, or the count
+          // failed. Confirming re-runs the
           // whole loop; chapters already started come back already_running.
           setCheckedCount((body as { count?: number }).count ?? 1);
         } else if (e.status === 409 && body?.error === "conflict") {
@@ -584,8 +590,8 @@ export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
         <DialogContent>
           <DialogContentText>
             {checkedCount === 1
-              ? "1 verse in this range is checked off."
-              : `${checkedCount} verses in this range are checked off.`}{" "}
+              ? "1 verse in this range has Text or Words checked off."
+              : `${checkedCount} verses in this range have Text or Words checked off.`}{" "}
             Generating will replace their text and clear those checks. Continue?
           </DialogContentText>
         </DialogContent>
