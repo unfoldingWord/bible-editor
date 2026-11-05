@@ -144,6 +144,8 @@ export interface VerseLaneCheck {
   lane: CheckLane;
   checked_by: number;
   checked_at: number;
+  // Checker's DCS username (LEFT JOIN users); absent from older servers.
+  checked_by_name?: string | null;
 }
 
 // Response from a lane toggle / WS event: the full checker set for one (verse,
@@ -154,6 +156,9 @@ export interface LaneCheckState {
   verse: number;
   lane: CheckLane;
   checkers: number[];
+  // DCS usernames, index-aligned with `checkers` (null = unknown user).
+  // Optional so old servers / clients interoperate.
+  checkerNames?: (string | null)[];
 }
 
 // A verse whose TWL link order a human has taken over. Its presence is the whole

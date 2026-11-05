@@ -173,6 +173,8 @@ export interface VerseLaneCheck {
   lane: CheckLane;
   checked_by: number;
   checked_at: number;
+  // Checker's DCS username (LEFT JOIN users); absent from older servers.
+  checked_by_name?: string | null;
 }
 
 // A per-verse manual order lock for TWL: while locked, automatic canonical

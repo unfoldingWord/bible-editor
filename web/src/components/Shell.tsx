@@ -42,6 +42,7 @@ import type { CommentTarget, NewCommentDraft, OpenCommentsFn } from "./commentsT
 import { targetKey, targetsMatch } from "./commentsTarget";
 import {
   indexLaneChecks,
+  indexCheckerNames,
   laneKey,
   laneApplicable,
   laneAttribution,
@@ -596,7 +597,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       applyLocalVerseStatus(status.verse, status.done === 1, status.updated_at);
     },
     onLaneCheckUpdate: (check) => {
-      applyLaneCheckers(check.verse, check.lane, check.checkers);
+      applyLaneCheckers(check.verse, check.lane, check.checkers, check.checkerNames);
     },
     onLaneCheckBulkUpdate: (lane, checks) => {
       replaceLaneChecksForLane(lane, checks);
@@ -1679,6 +1680,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     () => indexLaneChecks(verseLaneChecksForTiles ?? []),
     [verseLaneChecksForTiles],
   );
+  // checker user id -> DCS username, so lane tooltips can name who checked.
+  const checkerNames = useMemo(
+    () => indexCheckerNames(verseLaneChecksForTiles ?? []),
+    [verseLaneChecksForTiles],
+  );
   // Which verses actually have notes / questions — drives "nothing to check"
   // (N/A) vs an unchecked lane.
   // Add every verse a row covers, not just its leading verse, so a bridged note
@@ -1786,7 +1792,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             ? textLaneShade(checkers, meUserId, heldTextVerses.has(verse))
             : shadeFromCheckers(checkers, meUserId);
         const title = `${LANE_LABELS[lane]} — ${
-          shade === "waiting" ? LANE_WAITING_NOTE : applicable ? laneAttribution(checkers, meUserId) : "nothing to check"
+          shade === "waiting" ? LANE_WAITING_NOTE : applicable ? laneAttribution(checkers, meUserId, checkerNames) : "nothing to check"
         }`;
         return { lane, shade, applicable, title };
       });
@@ -1818,7 +1824,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const verseNums = [...versesWithSomething].filter((v) => v > 0).sort((a, b) => a - b);
     for (const v of verseNums) tiles.push({ verse: v, has: unalignedByVerse.get(v) ?? false, lanes: buildLanes(v) });
     return tiles;
-  }, [chapter, versesForTiles, unalignedByVerse, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl, introHasComment, heldTextVerses]);
+  }, [chapter, versesForTiles, unalignedByVerse, laneIndex, checkerNames, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl, introHasComment, heldTextVerses]);
 
   // Which alignment-attention refs (from the last nightly export) are already
   // fixed in the currently loaded chapter — re-parsed against live verse
@@ -2028,11 +2034,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       canCheck: meUserId != null && !editLocked,
       applicable: applic,
       shade: (lane) => (applic(lane) ? shadeFromCheckers(checkersOf(lane), meUserId) : "open"),
-      attribution: (lane) => laneAttribution(checkersOf(lane), meUserId),
+      attribution: (lane) => laneAttribution(checkersOf(lane), meUserId, checkerNames),
       onToggle: (lane) => toggleLane(activeVerse, lane),
       onBulkToggle: (lane) => bulkLaneToggle(lane),
     };
-  }, [activeVerse, laneIndex, versesWithTn, versesWithTq, meUserId, editLocked, toggleLane, bulkLaneToggle]);
+  }, [activeVerse, laneIndex, checkerNames, versesWithTn, versesWithTq, meUserId, editLocked, toggleLane, bulkLaneToggle]);
 
   // Text-lane checkoff for the column/book scripture views (per verse). Text is
   // always applicable. Memoized so BookView's memoized verse subtree is stable.
@@ -2045,10 +2051,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       attribution: (verse) =>
         textLaneShade(laneIndex.get(laneKey(verse, "text")), meUserId, heldTextVerses.has(verse)) === "waiting"
           ? LANE_WAITING_NOTE
-          : laneAttribution(laneIndex.get(laneKey(verse, "text")), meUserId),
+          : laneAttribution(laneIndex.get(laneKey(verse, "text")), meUserId, checkerNames),
       onToggle: (verse) => toggleLane(verse, "text"),
     }),
-    [laneIndex, meUserId, editLocked, toggleLane, heldTextVerses],
+    [laneIndex, checkerNames, meUserId, editLocked, toggleLane, heldTextVerses],
   );
 
   // Chapter board (verses × lanes overview) dialog.
