@@ -78,13 +78,29 @@ export function laneApplicable(lane: CheckLane, hasTn: boolean, hasTq: boolean):
   return hasTq;
 }
 
-// Human attribution string. We only have user ids client-side (no name map yet),
-// so others render as counts rather than names.
-export function laneAttribution(checkers: number[] | undefined, meId: number | null): string {
+// user id -> DCS username, from every check row in the chapter that carries one
+// (`checked_by_name`, sent by the server since the lane-names change).
+export function indexCheckerNames(checks: VerseLaneCheck[]): Map<number, string> {
+  const m = new Map<number, string>();
+  for (const c of checks) if (c.checked_by_name) m.set(c.checked_by, c.checked_by_name);
+  return m;
+}
+
+// Human attribution string: "you", "bwright", "you + bwright, jsmith". A
+// checker whose name is unknown (older server, deleted user) is counted
+// instead: "someone else", "3 people", "you + 1 other", "bwright, 1 other".
+export function laneAttribution(
+  checkers: number[] | undefined,
+  meId: number | null,
+  names?: Map<number, string>,
+): string {
   if (!checkers || checkers.length === 0) return "open";
-  const others = checkers.filter((id) => id !== meId).length;
+  const others = checkers.filter((id) => id !== meId);
   const mine = meId != null && checkers.includes(meId);
-  if (mine && others === 0) return "you";
-  if (mine) return others === 1 ? "you + 1 other" : `you + ${others} others`;
-  return others === 1 ? "someone else" : `${others} people`;
+  if (mine && others.length === 0) return "you";
+  const known = others.map((id) => names?.get(id)).filter((n): n is string => !!n);
+  const unknown = others.length - known.length;
+  if (!mine && known.length === 0) return unknown === 1 ? "someone else" : `${unknown} people`;
+  const parts = unknown === 0 ? known : [...known, unknown === 1 ? "1 other" : `${unknown} others`];
+  return mine ? `you + ${parts.join(", ")}` : parts.join(", ");
 }
