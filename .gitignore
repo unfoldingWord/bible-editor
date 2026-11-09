@@ -49,3 +49,7 @@ reports/
 
 # Per-worktree in-flight status and review scratch (CLAUDE.md "Project state").
 .claude/state/
+
+# Claude Code per-machine permission list: "don't ask again" can save
+# approved commands verbatim, secrets included. Never commit it.
+**/.claude/settings.local.json
