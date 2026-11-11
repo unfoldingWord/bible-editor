@@ -80,11 +80,23 @@ function curlifyTextWithContext(
   return { text: out, changed };
 }
 
+// usfm-js also types these INLINE character markers "quote" (\qs Selah\qs*,
+// \qac, \qt, \qt1-\qt5, nested \+qt, and the \qt-s ... \qt-e\* milestones;
+// every type "quote" entry with an endTag in usfm-js's USFM.js). They sit
+// inside a line, so they must not reset the context: `Yahweh\qs 's\qs*`
+// curls to ’s, not ‘s (#1281). Matched by tag, not endTag, because a \qs can
+// arrive unclosed ({tag:"qs", endTag:""}). Same set in both copies.
+const INLINE_QUOTE_TAGS: ReadonlySet<string> = new Set([
+  "qs", "qac", "qt", "qt1", "qt2", "qt3", "qt4", "qt5", "+qt",
+  "qt-s", "qt1-s", "qt2-s", "qt3-s", "qt4-s", "qt5-s",
+]);
+
 // Mutates in place. Walks every node's own `.text` in document order, except
 // `\zaln-s` milestones (source-owned attributes, never touched); milestone
 // children (the aligned target words) are walked normally.
 //
-// Like the API copy: a `\p`/`\q#` line marker starts a new line, so a quote
+// Like the API copy: a `\p`/`\q#` line marker (not one of the
+// INLINE_QUOTE_TAGS above) starts a new line, so a quote
 // right after it opens even when the text before the marker ends in a letter
 // or comma ("said,\q1 'Turn" → ‘Turn, not ’Turn).
 function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
@@ -94,7 +106,10 @@ function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
     for (const node of nodes) {
       if (!node || typeof node !== "object") continue;
       const o = node as Record<string, unknown>;
-      if (o["type"] === "paragraph" || o["type"] === "quote") {
+      const isLineMarker =
+        o["type"] === "paragraph" ||
+        (o["type"] === "quote" && !(typeof o["tag"] === "string" && INLINE_QUOTE_TAGS.has(o["tag"])));
+      if (isLineMarker) {
         prevCurled = "\n";
         prevRaw = "\n";
       }

@@ -1603,6 +1603,44 @@ function countNodes(nodes) {
   );
 }
 
+// #1281: usfm-js also types the INLINE character markers \qs, \qac, \qt,
+// \qt1-\qt5, \+qt and the \qt-s ... \qt-e\* milestones as "quote". They sit
+// inside a line, not at the start of one, so they must not reset the context:
+// `Yahweh\qs 's\qs*` curls to ’s (closing), not ‘s. Shapes are what
+// usfm.toJSON produces for each (checked against usfm-js's USFM.js).
+for (const tag of ["qs", "qac", "qt", "qt1", "qt2", "qt3", "qt4", "qt5", "+qt"]) {
+  const verseObjects = [
+    { type: "text", text: "Yahweh" },
+    { tag, type: "quote", text: "'s", endTag: `${tag}*` },
+  ];
+  curlifyVerseObjects(verseObjects);
+  assert(
+    verseObjects[1].text === "’s",
+    `\\${tag} after a word is not a line break: 's curls to ’s (got ${JSON.stringify(verseObjects[1].text)})`,
+  );
+}
+for (const n of ["", "1", "2", "3", "4", "5"]) {
+  const verseObjects = [
+    { type: "text", text: "Yahweh" },
+    { tag: `qt${n}-s`, type: "quote", attrib: ' |who="x"', children: [{ type: "text", text: "'s" }], endTag: `qt${n}-e\\*` },
+  ];
+  curlifyVerseObjects(verseObjects);
+  assert(
+    verseObjects[1].children[0].text === "’s",
+    `\\qt${n}-s milestone after a word is not a line break (got ${JSON.stringify(verseObjects[1].children[0].text)})`,
+  );
+}
+{
+  // Real parse, including a \qs left unclosed upstream ({tag:"qs"} with no endTag).
+  const parsed = usfm.toJSON("\\id GEN\n\\c 1\n\\v 1 Yahweh\\qs 's\\qs* house").chapters["1"]["1"].verseObjects;
+  curlifyVerseObjects(parsed);
+  const qs = parsed.find((o) => o.tag === "qs");
+  assert(qs && qs.text === "’s", `parsed Yahweh\\qs 's\\qs* curls to ’s (got ${JSON.stringify(qs && qs.text)})`);
+  const unclosed = [{ type: "text", text: "Yahweh" }, { tag: "qs", type: "quote", text: "'s", endTag: "" }];
+  curlifyVerseObjects(unclosed);
+  assert(unclosed[1].text === "’s", `unclosed \\qs after a word curls to ’s (got ${JSON.stringify(unclosed[1].text)})`);
+}
+
 // Ordering regression (found in independent review): curling can make two
 // `\w` nodes' text byte-identical — one already curly ("LORD’s"), one
 // AI-written straight ("LORD's") — and recomputeTargetOccurrences keys

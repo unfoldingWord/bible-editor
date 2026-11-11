@@ -543,6 +543,17 @@ export function curlifyText(text: string): string {
   return curlifyTextWithContext(text, undefined, undefined).text;
 }
 
+// usfm-js also types these INLINE character markers "quote" (\qs Selah\qs*,
+// \qac, \qt, \qt1-\qt5, nested \+qt, and the \qt-s ... \qt-e\* milestones;
+// every type "quote" entry with an endTag in usfm-js's USFM.js). They sit
+// inside a line, so they must not reset the context: `Yahweh\qs 's\qs*`
+// curls to ’s, not ‘s (#1281). Matched by tag, not endTag, because a \qs can
+// arrive unclosed ({tag:"qs", endTag:""}). Same set in both copies.
+const INLINE_QUOTE_TAGS: ReadonlySet<string> = new Set([
+  "qs", "qac", "qt", "qt1", "qt2", "qt3", "qt4", "qt5", "+qt",
+  "qt-s", "qt1-s", "qt2-s", "qt3-s", "qt4-s", "qt5-s",
+]);
+
 // Mutates `verseObjects` in place (like healReplacementChars /
 // canonizeAlignmentSource); returns whether anything changed.
 //
@@ -560,7 +571,8 @@ export function curlifyText(text: string): string {
 // count, or touch Hebrew/Greek. No-op (identity) on a verse with no straight
 // quotes, the common case.
 //
-// A `\p`/`\q#` line marker (type "paragraph"/"quote") starts a new line, so
+// A `\p`/`\q#` line marker (type "paragraph"/"quote", but not one of the
+// INLINE_QUOTE_TAGS above) starts a new line, so
 // the context resets to a newline before that node's own text and children: a
 // quote right after it opens even when the text before the marker ends in a
 // letter or comma ("said,\q1 'Turn" → ‘Turn, not ’Turn) (#1277). Same rule as
@@ -574,7 +586,10 @@ export function curlifyVerseObjects(verseObjects: unknown[]): boolean {
     for (const node of nodes) {
       if (!node || typeof node !== "object") continue;
       const o = node as Record<string, unknown>;
-      if (o["type"] === "paragraph" || o["type"] === "quote") {
+      const isLineMarker =
+        o["type"] === "paragraph" ||
+        (o["type"] === "quote" && !(typeof o["tag"] === "string" && INLINE_QUOTE_TAGS.has(o["tag"])));
+      if (isLineMarker) {
         prevCurled = "\n";
         prevRaw = "\n";
       }

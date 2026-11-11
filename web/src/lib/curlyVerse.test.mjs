@@ -280,6 +280,27 @@ console.log("occurrences are renumbered when the curl makes two words the same")
   assert(ws.join(", ") === "don’t 1/2, don’t 2/2", `numbered 1/2 and 2/2 (got ${ws.join(", ")})`);
 }
 
+console.log("an inline \\qs / \\qac / \\qt / \\+qt is not a line break (#1281)");
+{
+  // usfm-js types these inline character markers "quote", like \q1, but they
+  // sit inside a line. Shapes are what usfm.toJSON produces.
+  for (const tag of ["qs", "qac", "qt", "qt1", "qt2", "qt3", "qt4", "qt5", "+qt"]) {
+    const out = curlifyVerseContent({ verseObjects: [t("Yahweh"), { tag, type: "quote", text: "'s", endTag: `${tag}*` }] });
+    assert(out.verseObjects[1].text === "’s", `\\${tag}: 's curls to ’s (got ${JSON.stringify(out.verseObjects[1].text)})`);
+  }
+  for (const n of ["", "1", "2", "3", "4", "5"]) {
+    const ms = { tag: `qt${n}-s`, type: "quote", attrib: ' |who="x"', children: [t("'s")], endTag: `qt${n}-e\\*` };
+    const out = curlifyVerseContent({ verseObjects: [t("Yahweh"), ms] });
+    const got = out.verseObjects[1].children[0].text;
+    assert(got === "’s", `\\qt${n}-s milestone: 's curls to ’s (got ${JSON.stringify(got)})`);
+  }
+  const unclosed = curlifyVerseContent({ verseObjects: [t("Yahweh"), { tag: "qs", type: "quote", text: "'s", endTag: "" }] });
+  assert(unclosed.verseObjects[1].text === "’s", `unclosed \\qs: 's curls to ’s (got ${JSON.stringify(unclosed.verseObjects[1].text)})`);
+  // A real line marker still resets: said,\q1 "Turn back." opens.
+  const q1 = curlifyVerseContent({ verseObjects: [t("He said,"), { tag: "q1", type: "quote", text: "\"Turn back.\"\n" }] });
+  assert(q1.verseObjects[1].text === "“Turn back.”\n", `\\q1 still opens (got ${JSON.stringify(q1.verseObjects[1].text)})`);
+}
+
 console.log("adoptBaseQuotes");
 {
   assert(adoptBaseQuotes("a ’b’ c", "a 'b' c") === "a ’b’ c", "unchanged straight → base curly");
