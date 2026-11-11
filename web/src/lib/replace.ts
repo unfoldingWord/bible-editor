@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, isHeaderLabelNode, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 import { hoistOpeningPunctuation, concatVerseText, OPENING_PUNCT_RE } from "./openingPunct.ts";
@@ -1389,10 +1389,14 @@ function smartReplaceVerseImpl(
   // reads `namethis`, so `et` matched across the seam first and the save
   // edited `name`/`this` instead of `set`, and a phrase spanning the marker
   // found nothing in raw and flattened the verse. When the two texts' characters
-  // don't line up (a stale stored plain text, or `\sp` label text that raw keeps
-  // and extractPlainText skips), it falls back to the old occurrence count, which
-  // counts in raw and so can still land on such text.
-  const mapped = locatePlainRangeInRaw(plainText, raw, matchStartInPlain, matchLenInPlain);
+  // don't line up (a stale stored plain text), it falls back to the old
+  // occurrence count in raw.
+  // Both search a copy of raw with header-label text (`\sp The man speaking`)
+  // blanked: raw keeps that text but the plain and editable texts skip it, so
+  // the lockstep walk failed after a label and the occurrence count could land
+  // in it (`man` edited the label's `man`, #1311). Blanking keeps every offset.
+  const labelFree = blankHeaderLabels(raw, leaves);
+  const mapped = locatePlainRangeInRaw(plainText, labelFree, matchStartInPlain, matchLenInPlain);
   // A whitespace-only match at a marker with no text node beside it: the space
   // is in the plain text only (the marker is the separator), so the tree has
   // nothing to replace. For find/replace, leave the verse as it is; counting
@@ -1413,7 +1417,7 @@ function smartReplaceVerseImpl(
   const rawRegex = relaxWhitespace(regex);
   const rawMatch = located
     ? { index: located.start, length: located.end - located.start }
-    : nthMatchIn(raw, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1);
+    : nthMatchIn(labelFree, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1);
 
   // If the raw search yields nothing (normalization wiped a match, or
   // the match text spans an inline marker token like "\p " that has no
@@ -1690,6 +1694,33 @@ function locatePlainRangeInRaw(plain: string, raw: string, start: number, len: n
   return { start: rs, end: Math.max(rs, e) };
 }
 
+// `raw` (walkLeaves over the same tree) with the text of each header-label
+// leaf (`\sp`, `\sr`, `\r`, `\cl`: isHeaderLabelNode) replaced by spaces of the
+// same length, so raw offsets still hold. The plain and editable texts skip
+// that text, so a lockstep walk or an occurrence count over it must too.
+function blankHeaderLabels(raw: string, leaves: Leaf[]): string {
+  let out = raw;
+  for (const l of leaves) {
+    if (isHeaderLabelNode(l.node) && l.end > l.start) out = out.slice(0, l.start) + " ".repeat(l.end - l.start) + out.slice(l.end);
+  }
+  return out;
+}
+
+// Header-label texts in document order (see blankHeaderLabels).
+function headerLabelTexts(nodes: unknown[]): string[] {
+  const out: string[] = [];
+  const walk = (ns: unknown[]) => {
+    for (const n of ns ?? []) {
+      if (!n || typeof n !== "object") continue;
+      if (isHeaderLabelNode(n)) out.push(String((n as Record<string, unknown>)["text"] ?? ""));
+      const children = (n as Record<string, unknown>)["children"];
+      if (Array.isArray(children)) walk(children);
+    }
+  };
+  walk(nodes);
+  return out;
+}
+
 // Is `result` exactly the replacement the translator asked for: its visible
 // text is the plain text with the match replaced, and every line marker of the
 // original verse is still there? Guards the paths that read fused raw text
@@ -1726,7 +1757,13 @@ function isExactReplace(
   const original = { verseObjects };
   const typedCoords = plainText !== extractPlainText(original) && plainText === strippedText(original);
   const got = typedCoords ? strippedText(result.content) : extractPlainText(result.content);
-  return got === want && lineMarkers(out) === lineMarkers(verseObjects);
+  // Neither text shows a header label, so check those separately: a match
+  // that spans one (`said the` around `\sp …`) must not rewrite it.
+  return (
+    got === want &&
+    lineMarkers(out) === lineMarkers(verseObjects) &&
+    JSON.stringify(headerLabelTexts(out)) === JSON.stringify(headerLabelTexts(verseObjects))
+  );
 }
 
 // Plain-text diff: the smallest contiguous substring change that turns
@@ -3060,6 +3097,9 @@ function localizedRewriteVerse(
 
   const cloned = cloneVerseObjects(verseObjects);
   const rawTotal = rebuildRaw(cloned);
+  // Header-label text blanked, so the search below and the insertion mapping
+  // skip it as the plain and editable texts do (see blankHeaderLabels, #1311).
+  const labelFree = blankHeaderLabels(rawTotal, walkLeaves(cloned).leaves);
 
   // Map plain-text positions to raw-text positions. For oldLen > 0 we find
   // the Nth occurrence of the matchText in raw, treating each literal space
@@ -3095,7 +3135,7 @@ function localizedRewriteVerse(
     const rawRegex = new RegExp(escaped.replace(/ /g, "\\s+"), "g");
     let m: RegExpExecArray | null;
     let count = 0;
-    while ((m = rawRegex.exec(rawTotal)) !== null) {
+    while ((m = rawRegex.exec(labelFree)) !== null) {
       count++;
       if (count === occurrence) {
         rawStart = m.index;
@@ -3112,14 +3152,14 @@ function localizedRewriteVerse(
     // delta — splitting the neighbouring word when the insertion abuts it
     // (the letter-migration corruption). Fall back to the length proxy only
     // if the content streams disagree (shouldn't happen for a clean edit).
-    const mapped = mapStrippedPosToRaw(prefixNoMarkers, rawTotal, prefixNoMarkers.length);
+    const mapped = mapStrippedPosToRaw(prefixNoMarkers, labelFree, prefixNoMarkers.length);
     rawStart = mapped >= 0 ? mapped : Math.min(prefixNoMarkers.length, rawTotal.length);
     if (mapped >= 0 && newSubstring.length > 0) {
       const isWS = (c: string | undefined): boolean => c !== undefined && /\s/.test(c);
       padRight =
         isWS(oldPlain[start]) &&
         rawStart < rawTotal.length &&
-        !isWS(rawTotal[rawStart]) &&
+        !isWS(labelFree[rawStart]) &&
         !isWS(newSubstring[newSubstring.length - 1]);
     }
   }
