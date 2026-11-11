@@ -172,6 +172,19 @@ console.log("curlifyVerseContent leaves curled content alone");
   assert(curlifyVerseContent(ms) === ms, "zaln source attributes are never curled");
 }
 
+console.log("occurrences are renumbered when the curl makes two words the same");
+{
+  // The engine numbers occurrences before the curl, so don’t + don't stayed
+  // two "don’t 1/1" and the aligner (keyed by text|occurrence) lost one.
+  const wo = (text, occ, occs) => ({ text, tag: "w", type: "word", occurrence: occ, occurrences: occs });
+  const content = { verseObjects: [zaln("H1", [wo("don’t", "1", "1")]), t(" "), wo("don't", "1", "1"), t(".")] };
+  const out = curlifyVerseContent(content);
+  const ws = [];
+  const walk = (nodes) => { for (const n of nodes) { if (n.type === "word") ws.push(`${n.text} ${n.occurrence}/${n.occurrences}`); if (n.children) walk(n.children); } };
+  walk(out.verseObjects);
+  assert(ws.join(", ") === "don’t 1/2, don’t 2/2", `numbered 1/2 and 2/2 (got ${ws.join(", ")})`);
+}
+
 console.log("adoptBaseQuotes");
 {
   assert(adoptBaseQuotes("a ’b’ c", "a 'b' c") === "a ’b’ c", "unchanged straight → base curly");

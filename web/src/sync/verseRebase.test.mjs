@@ -268,4 +268,43 @@ const sourceOf = (content, word) => (wordSources(content).find(([tx]) => tx === 
   );
 }
 
+// ── #1273: a curled op rebased onto a server tree that still has ' ───────────
+//
+// Text saves curl straight quotes, so a queued op carries `baby’s` while the
+// server row (stored data, an aligner save, an old-build tab) can still hold
+// the aligned word as `baby's`. Diffing raw ' against ’ made the engine treat
+// the untouched word as edited and drop its alignment, and the guard does not
+// catch it (the LCS skips words whose text changed).
+{
+  console.log("\n[#1273] Rebasing a curled op onto a straight-quote server tree keeps the word aligned");
+  const server = {
+    verseObjects: [
+      zaln("H1", [w("the")]), t(" "), zaln("H2", [w("baby's")]), t(" "), zaln("H3", [w("toy")]), t(" "),
+      zaln("H4", [w("was")]), t(" "), zaln("H5", [w("red")]), t("."),
+    ],
+  };
+  // The op's own edit: "very" added before "red"; its tree is already curled.
+  const op = {
+    verseObjects: [
+      zaln("H1", [w("the")]), t(" "), zaln("H2", [w("baby’s")]), t(" "), zaln("H3", [w("toy")]), t(" "),
+      zaln("H4", [w("was")]), t(" "), w("very"), t(" "), zaln("H5", [w("red")]), t("."),
+    ],
+  };
+  const out = rebaseVersePatch({ content: op, alignment_intent: "text_edit" }, server);
+  check(out.kind === "rebased", "rebased");
+  check(extractEditableText(out.patch.content) === "the baby’s toy was very red.", "op text applied, curled");
+  check(sourceOf(out.patch.content, "baby’s") === "H2", "baby’s keeps its H2 alignment");
+  check(sourceOf(out.patch.content, "was") === "H4" && sourceOf(out.patch.content, "toy") === "H3", "words between keep theirs");
+
+  // An op queued by an older build (straight quote still in its tree) matches too.
+  const oldOp = { verseObjects: [...op.verseObjects] };
+  oldOp.verseObjects[2] = zaln("H2", [w("baby's")]);
+  const out2 = rebaseVersePatch({ content: oldOp, alignment_intent: "text_edit" }, server);
+  check(sourceOf(out2.patch.content, "baby’s") === "H2", "an old-build straight-quote op also keeps the alignment (curled)");
+
+  // Restores are tagged alignment_edit and must never be curled.
+  const restore = rebaseVersePatch({ content: server, alignment_intent: "alignment_edit" }, server);
+  check(restore.kind === "verbatim", "an alignment_edit (restore) op is still sent verbatim");
+}
+
 console.log(`\nverseRebase: all ${passed} checks passed.`);
