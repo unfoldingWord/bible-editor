@@ -92,7 +92,9 @@ Highlights that bite repeatedly:
   (`adoptBaseQuotes`): before that, retyping a stored `Yahweh’s` as `Yahweh's` plus an edit at the far end of ZEC
   6:15 UST silently unaligned the words between them (aligned 20 → 18, no confirm). The curl is not in
   `enqueueVerseSafely`: history restore must re-save bytes exactly. Find/replace and section/aligner saves do not
-  curl.
+  curl on their own, but a text op (find/replace included) rebased after a 409 or a sibling save is curled on both
+  sides (`verseRebase.ts`), so the rebase never reads a quote change as an edited word. History restores
+  (`alignment_edit`) are never curled.
 
 - **Columns mode verse styling must reach block children.** A DocColumn verse is a `display: inline` span, but a
   poetry/paragraph verse's contentEditable carries `be-q`/`be-para`/`be-line` (block) and mid-verse `\q` lines render

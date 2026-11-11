@@ -126,8 +126,9 @@ export function rebaseVersePatch(
   // alignment, which the guard does not catch. Curl both sides and rebase
   // curled onto curled. The early returns above stay raw: alignment_edit
   // (which history restores use) and section_edit ops are never curled.
-  const curledServer = curlifyVerseContent(serverContent);
+  let curledServer: unknown;
   try {
+    curledServer = curlifyVerseContent(serverContent);
     serverText = extractEditableText(curledServer);
     opText = extractEditableText(curlifyVerseContent(content));
   } catch {
