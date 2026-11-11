@@ -3259,6 +3259,84 @@ function countAllMilestones(nodes) {
   wordChange("eyes. -> EYES! (case-insensitive, word recased)", "eyes.", "EYES!", "gi", "EYES");
 }
 
+// Case 86: punctuation-only find/replace over a split possessive (#1304). ZEC
+// stores `Yahweh’s` as `\w Yahweh\w*’\w s\w*` inside one milestone, so the
+// window holds one WORD_RUN_RE token (`’` is a connector) against two `\w`
+// pieces. The #1292 widened path compared tokens to pieces 1:1 and bailed, and
+// the old path rebuilt the words unaligned (the save guard refused it).
+{
+  console.log("\nCase 86: punctuation-only find/replace over a split possessive (#1304)");
+  const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+  const verse = (c, v) => ({ verseObjects: JSON.parse(JSON.stringify(zecUlt.chapters[c][v].verseObjects)) });
+  const sig = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("+")}`).join("|");
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const punctOnly = (label, content, find, repl) => {
+    const plain = extractPlainText(content);
+    const i = plain.indexOf(find);
+    assert(i >= 0, `${label}: setup: verse contains ${JSON.stringify(find)}`);
+    const want = plain.slice(0, i) + repl + plain.slice(i + find.length);
+    const r = smartReplaceVerse(JSON.parse(JSON.stringify(content)), plain, new RegExp(esc(find), "g"), i, find.length, repl);
+    assert(r.plainText === want, `${label}: plain text is the replaced text (got ${JSON.stringify(r.plainText)})`);
+    assert(extractPlainText(r.content) === r.plainText, `${label}: plainText matches the tree`);
+    assert(sig(r.content) === sig(content), `${label}: every word keeps its alignment (got ${sig(r.content)})`);
+    const delta = analyzeAlignmentDelta(content, r.content);
+    assert(delta.unexpectedLosses.length === 0 && delta.afterAligned === delta.beforeAligned,
+      `${label}: the save guard sees no loss (${delta.beforeAligned} -> ${delta.afterAligned}, losses ${JSON.stringify(delta.unexpectedLosses.map((l) => l.text))})`);
+    const fr = findReplaceVerse(JSON.parse(JSON.stringify(content)), plain, new RegExp(esc(find), "g"), i, find.length, repl);
+    assert(sig(fr.content) === sig(content), `${label}: findReplaceVerse (the overlay's entry) keeps every word aligned`);
+    return r;
+  };
+
+  // The issue's shape: `Yahweh’s` ending a sentence. ZEC has no literal
+  // `Yahweh’s.`, so take the real ZEC 9:1 tree and make the text leaf after the
+  // H3068 milestone (`of Yahweh’s`) read ". " instead of " ".
+  {
+    const content = verse("9", "1");
+    const at = content.verseObjects.findIndex((n) => n.tag === "zaln" && n.strong === "H3068");
+    assert(content.verseObjects[at + 1]?.text === " ", `setup: ZEC 9:1 has a " " leaf after the H3068 milestone`);
+    content.verseObjects[at + 1] = { type: "text", text: ". " };
+    const r = punctOnly("Yahweh’s. -> Yahweh’s! (ZEC 9:1, sentence end)", content, "Yahweh’s.", "Yahweh’s!");
+    assert(/(^|\|)Yahweh:H3068\|s:H3068(\||$)/.test(sig(r.content)), `Yahweh’s. -> Yahweh’s!: both pieces still sit under H3068 (got ${sig(r.content)})`);
+    // A match that starts mid-word (`ahweh’s.`) is the same change.
+    punctOnly("ahweh’s. -> ahweh’s! (mid-word start)", content, "ahweh’s.", "ahweh’s!");
+  }
+  // Unmodified real trees: a match that ends inside the next word.
+  punctOnly("Yahweh’s w -> Yahweh’s, w (ZEC 9:1)", verse("9", "1"), "Yahweh’s w", "Yahweh’s, w");
+  punctOnly("warrior’s s -> warrior’s: s (ZEC 9:13)", verse("9", "13"), "warrior’s s", "warrior’s: s");
+  punctOnly("Yahweh’s h -> Yahweh’s—h (ZEC 14:20)", verse("14", "20"), "Yahweh’s h", "Yahweh’s—h");
+
+  // A word change across a split possessive is still a word change: only the
+  // changed word goes bare, the possessive keeps its alignment.
+  {
+    const content = verse("9", "1");
+    const plain = extractPlainText(content);
+    const i = plain.indexOf("Yahweh’s w");
+    const r = smartReplaceVerse(content, plain, /Yahweh’s w/g, i, "Yahweh’s w".length, "Yahweh’s, sw");
+    assert(!/(^|\|)word:H1697(\||$)/.test(sig(r.content)), `word change across a possessive: "word" -> "sword" is not kept as "word" (got ${sig(r.content)})`);
+    assert(r.plainText.includes("Yahweh’s, sword"), `word change across a possessive: plain text (got ${JSON.stringify(r.plainText)})`);
+  }
+
+  // Shape 2 of #1304: a match that crosses a marker carrying text (usfm-js parks
+  // ZEC 1:14's line-leading `“` on the `\q1` node). The widened relayout still
+  // skips it, so it stays refused; it must never move the opener before the
+  // line break.
+  {
+    const content = verse("1", "14");
+    const plain = extractPlainText(content);
+    const find = "s: “";
+    const i = plain.indexOf(find);
+    assert(i >= 0, `marker window: setup: ZEC 1:14 contains ${JSON.stringify(find)}`);
+    const r = smartReplaceVerse(JSON.parse(JSON.stringify(content)), plain, /s: “/g, i, find.length, "s, “");
+    const ed = extractEditableText(r.content);
+    assert(!/“\s*\\q1/.test(ed), `marker window: the opener is not moved before the line break (got ${JSON.stringify(ed)})`);
+    assert(/\\q1 “I have/.test(ed), `marker window: the opener stays after its \\q1 (got ${JSON.stringify(ed)})`);
+    const delta = analyzeAlignmentDelta(content, r.content);
+    const kept = sig(r.content) === sig(content) && delta.unexpectedLosses.length === 0;
+    assert(kept || delta.unexpectedLosses.length > 0,
+      `marker window: either every word keeps its alignment or the save guard refuses it (losses ${JSON.stringify(delta.unexpectedLosses.map((l) => l.text))})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
