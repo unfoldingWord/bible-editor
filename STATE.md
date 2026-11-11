@@ -212,6 +212,15 @@ Highlights that bite repeatedly:
   to the previous line. The AI pipeline stores the opener
   correctly (leading child of the following milestone); this was ours.
 
+- **A line marker with no text node on either side (`H1[say] \q1 H2[The]`) puts a space in the stripped text that
+  the tree does not have (#1286).** `stripMarkerTokens` adds it so the two words don't fuse, so the engine diffs
+  `say The` against a tree holding `sayThe`, and the diff's common prefix/suffix can claim that space as the
+  separator of an inserted word. Saves reach the shape: type a line break before a dash between two aligned words,
+  then find/replace the dash with nothing (`replace.test.mjs` Case 83); a word-final milestone before a verse-final
+  `\p` also exists in prod (JER 43:1 UST). `localizedRewriteVerse` now writes the space after a line-start
+  insertion (`"Word ` used to save as `“WordThe`). A word typed at the END of the previous line still fuses
+  (`sayWord`, #1294). The reassembly tier returns null for this shape, so word edits there take the diff tiers.
+
 - **A direct-SQL data repair that leaves `updated_by` NULL is undone by the nightly sync.** `reimportClassify.ts
   isReimportableRow` reads `updated_by IS NULL` as "pristine, master owns this row", so on the next night the
   upstream file changes, the pre-export DCS→D1 sync writes master's old bytes back over the repair before the export
