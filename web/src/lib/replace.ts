@@ -1390,6 +1390,39 @@ function smartReplaceVerseImpl(
     return relayoutPunctuation(cloned, rawStart, rawEnd, replaceText);
   }
 
+  // The same punctuation-only change, but a match edge lands INSIDE a leaf
+  // (#1292): find `eyes.` ends one character into the top-level `". "` text
+  // leaf after the word, so the boundary gate above fails and the localized
+  // rewrite rebuilt `eyes` unaligned (the save guard then refused it). Widen
+  // the range to the edges of the straddled leaves, carrying their text
+  // outside the match into the replacement verbatim, and re-lay punctuation
+  // when the words are still unchanged 1:1. A straddled edge must be a `\w`
+  // or a plain text leaf, never a marker that carries text. Words are compared
+  // on the matched raw text, so a case-insensitive find that recases a word
+  // is still a word change and skips this.
+  if (affected.length > 0 && (!startsAtBoundary || !endsAtBoundary)) {
+    const first = affected[0];
+    const last = affected[affected.length - 1];
+    const plainLeaf = (l: Leaf) => isWordLeaf(l.node) || (l.node["type"] === "text" && !l.node["children"]);
+    // Every leaf in the window must be plain: a marker carrying text (usfm-js
+    // parks a line-leading `“` on the `\q1` node) would have its text written
+    // into the first gap leaf, moving the opener before the line break.
+    if (affected.every(plainLeaf) && (startsAtBoundary || plainLeaf(first)) && (endsAtBoundary || plainLeaf(last))) {
+      const widenedMatchWords = [...raw.slice(first.start, last.end).matchAll(WORD_RUN_RE)].map((m) => m[0]);
+      const widenedReplace = raw.slice(first.start, rawStart) + replaceText + raw.slice(rawEnd, last.end);
+      const widenedReplaceWords = [...widenedReplace.matchAll(WORD_RUN_RE)].map((m) => m[0]);
+      const widenedWordsUnchanged =
+        widenedMatchWords.length > 0 &&
+        widenedMatchWords.length === wordLeaves.length &&
+        wordLeaves.every((l, i) => String(l.node["text"]) === widenedMatchWords[i]) &&
+        widenedReplaceWords.length === widenedMatchWords.length &&
+        widenedMatchWords.every((mw, i) => mw === widenedReplaceWords[i]);
+      if (widenedWordsUnchanged) {
+        return relayoutPunctuation(cloned, first.start, last.end, widenedReplace);
+      }
+    }
+  }
+
   // Combined word + punctuation edit (the "fix the whole verse at once" flow):
   // the word count / identities changed AND/OR punctuation changed, but the
   // surviving words still map 1:1 onto the old \w leaves. Keep every survivor's

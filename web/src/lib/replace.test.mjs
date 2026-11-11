@@ -19,6 +19,12 @@ import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 import { OPENING_PUNCT_RE } from "./openingPunct.ts";
 import { curlifyVerseContent } from "./curlyVerse.ts";
 import { findReplaceVerse, replaceAllInVerse } from "./findReplaceVerse.ts";
+import usfm from "usfm-js";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 let failed = 0;
 function assert(cond, msg) {
@@ -3150,6 +3156,86 @@ function countAllMilestones(nodes) {
   assert(/^Then ?, The one\.$/.test(pr.plainText), `deleted word: the comma survives and no words fuse (got ${JSON.stringify(pr.plainText)})`);
   assert(extractPlainText(pr.content) === pr.plainText, `deleted word: plainText matches the tree (got ${JSON.stringify(extractPlainText(pr.content))})`);
   assert(words(pr.content) === "Then:H0|The:H2|one:H3", `deleted word: every surviving word keeps its alignment (got ${words(pr.content)})`);
+}
+
+// Case 85: a find/replace that changes only the punctuation after an aligned
+// word keeps that word aligned (#1292). Real trees from docs/samples (en_ult
+// ZEC, parsed with usfm-js). The match `eyes.` ends one character into the
+// top-level `". "` text leaf, so it failed the leaf-boundary gate and fell to
+// the localized rewrite, which rebuilt `eyes` unaligned; the save guard then
+// refused it as collateral loss.
+{
+  console.log("\nCase 85: punctuation-only find/replace after an aligned word (#1292)");
+  const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+  const verse = (c, v) => ({ verseObjects: JSON.parse(JSON.stringify(zecUlt.chapters[c][v].verseObjects)) });
+  const sig = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("+")}`).join("|");
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const run = (c, v, find, repl, flags = "g") => {
+    const content = verse(c, v);
+    const plain = extractPlainText(content);
+    const i = plain.indexOf(find);
+    const r = smartReplaceVerse(content, plain, new RegExp(esc(find), flags), i, find.length, repl);
+    return { content, plain, i, r, want: plain.slice(0, i) + repl + plain.slice(i + find.length) };
+  };
+  const punctOnly = (label, c, v, find, repl) => {
+    const { content, plain, i, r, want } = run(c, v, find, repl);
+    assert(i >= 0, `${label}: setup: ZEC ${c}:${v} ULT contains ${JSON.stringify(find)}`);
+    assert(r.plainText === want, `${label}: plain text is the replaced text (got ${JSON.stringify(r.plainText)})`);
+    assert(extractPlainText(r.content) === r.plainText, `${label}: plainText matches the tree`);
+    assert(sig(r.content) === sig(content), `${label}: every word keeps its alignment (got ${sig(r.content)})`);
+    const delta = analyzeAlignmentDelta(content, r.content);
+    assert(delta.unexpectedLosses.length === 0 && delta.afterAligned === delta.beforeAligned,
+      `${label}: the save guard sees no loss (${delta.beforeAligned} -> ${delta.afterAligned}, losses ${JSON.stringify(delta.unexpectedLosses)})`);
+    const fr = findReplaceVerse(content, plain, new RegExp(esc(find), "g"), i, find.length, repl);
+    assert(sig(fr.content) === sig(content), `${label}: findReplaceVerse (the overlay's entry) keeps every word aligned`);
+    return r;
+  };
+  const eyes = punctOnly("eyes. -> eyes!", "3", "9", "eyes.", "eyes!");
+  assert(/(^|\|)eyes:H5869a(\||$)/.test(sig(eyes.content)), `eyes. -> eyes!: eyes still sits under H5869a (got ${sig(eyes.content)})`);
+  punctOnly("us.’ -> us!’ (ZEC 1:6)", "1", "6", "us.’", "us!’");
+  // The match edge lands inside the WORD leaf: the change is still punctuation only.
+  punctOnly("yes. -> yes! (mid-word start)", "3", "9", "yes.", "yes!");
+
+  // A window that holds a marker carrying text (usfm-js parks a line-leading
+  // `“` on the `\q1` node) must not take the widened relayout: it would write
+  // the opener into the gap before the line break (review of #1292). It falls
+  // back to the old path, which the save guard refuses as before.
+  {
+    const tw = (text) => ({ text, tag: "w", type: "word", occurrence: "1", occurrences: "1" });
+    const tt = (text) => ({ type: "text", text });
+    const tz = (strong, children) => ({ tag: "zaln", type: "milestone", strong, children, endTag: "zaln-e\\*" });
+    const content = { verseObjects: [tz("H1", [tw("Armies")]), tt(":\n"), { tag: "q1", type: "quote", text: "“" }, tz("H2", [tw("I")]), tt(" "), tz("H3", [tw("go")]), tt(".”")] };
+    const plain = extractPlainText(content);
+    const i = plain.indexOf("s: “");
+    const r = smartReplaceVerse(content, plain, /s: “/g, i, 4, "s, “");
+    const ed = extractEditableText(r.content);
+    assert(!/“\\q1/.test(ed), `marker carrying an opener: the opener is not moved before the line break (got ${JSON.stringify(ed)})`);
+  }
+
+  // Typing the same change already kept alignment (whole-verse relayout tier).
+  {
+    const content = verse("3", "9");
+    const ed = extractEditableText(content);
+    const r = smartEditVerse(content, ed, ed.replace("eyes.", "eyes!"));
+    assert(sig(r.content) === sig(content), `typed eyes. -> eyes!: every word keeps its alignment (got ${sig(r.content)})`);
+  }
+
+  // Guards: a replace that changes a word behaves as before (output pinned from
+  // the pre-#1292 engine): only the edited word goes bare, every other word
+  // keeps its alignment, and the guard sees no collateral loss.
+  const wordChange = (label, find, repl, flags, wantWord) => {
+    const { content, r, want } = run("3", "9", find, repl, flags);
+    assert(r.plainText === want, `${label}: plain text (got ${JSON.stringify(r.plainText)})`);
+    assert(r.preservedAlignment === false, `${label}: reported as not preserving alignment`);
+    const expected = sig(content).replace("eyes:H5869a", `${wantWord}:`);
+    assert(sig(r.content) === expected, `${label}: only the edited word goes bare (got ${sig(r.content)})`);
+    const delta = analyzeAlignmentDelta(content, r.content);
+    assert(delta.unexpectedLosses.length === 0 && delta.afterAligned === delta.beforeAligned - 1,
+      `${label}: one word unaligned, no collateral loss (${delta.beforeAligned} -> ${delta.afterAligned})`);
+  };
+  wordChange("eyes. -> eye! (word changed)", "eyes.", "eye!", "g", "eye");
+  // A case-insensitive find that recases the word is a word change too.
+  wordChange("eyes. -> EYES! (case-insensitive, word recased)", "eyes.", "EYES!", "gi", "EYES");
 }
 
 if (failed > 0) {
