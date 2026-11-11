@@ -3535,6 +3535,21 @@ function countAllMilestones(nodes) {
   check(": “ -> , “ (textless \\q1, gap only)", hand([w("Armies")]), ": “", ", “", "Armies: \\q1 “I", "Armies, \\q1 “I");
   check("␣“ -> ␣‘ (textless \\q1, gap only, starts inside the :␤ leaf)", hand([w("Armies")]), " “", " ‘", "Armies: \\q1 “I", "Armies: \\q1 ‘I");
 
+  // An opener added where nothing followed the break goes after it (review of
+  // #1309): with no old text after the `\q1`, the whole new gap used to land
+  // before it (`Armies: “\q1 I`).
+  const bare = { verseObjects: [zaln("H1", [w("Armies")]), t(":\n"), { tag: "q1", type: "quote" }, zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+  check("Armies: I -> Armies: “I (textless \\q1, nothing after it)", bare, "Armies: I", "Armies: “I", "Armies: \\q1 I", "Armies: \\q1 “I");
+  check("Armies: I -> Armies, “I (textless \\q1, both sides changed)", bare, "Armies: I", "Armies, “I", "Armies: \\q1 I", "Armies, \\q1 “I");
+  const emptied = { verseObjects: [zaln("H1", [w("Armies")]), t(":\n"), { tag: "q1", type: "quote", text: "" }, zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+  check("Armies: I -> Armies: “I (\\q1 text \"\")", emptied, "Armies: I", "Armies: “I", "Armies: \\q1 I", "Armies: \\q1 “I");
+  const q2 = { verseObjects: [zaln("H1", [w("my"), t(" "), w("shepherd"), t(",")]), t("\n"), { tag: "q2", type: "quote" }, zaln("H2", [w("and"), t(" "), w("against")]), t(".")] };
+  check("shepherd, and -> shepherd, “and (textless \\q2)", q2, "shepherd, and", "shepherd, “and", "shepherd, \\q2 and", "shepherd, \\q2 “and");
+  // A character outside the BMP before the break stays before it (review of
+  // #1309): the side check compared code points against UTF-16 units.
+  const astral = { verseObjects: [zaln("H1", [w("A")]), t("😀\n"), { tag: "q1", type: "quote", text: "“" }, zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+  check("😀 “ -> 😀 ‘ (astral character before the break)", astral, "😀 “", "😀 ‘", "A😀 \\q1 “I", "A😀 \\q1 ‘I");
+
   // A line-leading `—` stays after its `\q1`, a line-ending `—` before its
   // `\q1` (the ZEC 13:7 shapes; the sample file keeps that verse's dashes
   // inside the `\w` words, so these trees store them as text, as the AI
