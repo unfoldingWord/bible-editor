@@ -3545,6 +3545,10 @@ function countAllMilestones(nodes) {
   check("Armies: I -> Armies: “I (\\q1 text \"\")", emptied, "Armies: I", "Armies: “I", "Armies: \\q1 I", "Armies: \\q1 “I");
   const q2 = { verseObjects: [zaln("H1", [w("my"), t(" "), w("shepherd"), t(",")]), t("\n"), { tag: "q2", type: "quote" }, zaln("H2", [w("and"), t(" "), w("against")]), t(".")] };
   check("shepherd, and -> shepherd, “and (textless \\q2)", q2, "shepherd, and", "shepherd, “and", "shepherd, \\q2 and", "shepherd, \\q2 “and");
+  // Only an added OPENER moves after such a break: a line-ending dash stays
+  // before it (the ZEC 8:11 ULT shape `people— \q1 this`).
+  const dashEnd = { verseObjects: [zaln("H1", [w("people")]), t("—\n"), { tag: "q1", type: "quote" }, zaln("H2", [w("this")]), t(" "), zaln("H3", [w("is")]), t(".")] };
+  check("people— this -> people,— this (line-ending dash, nothing after the \\q1)", dashEnd, "people— this", "people,— this", "people— \\q1 this", "people,— \\q1 this");
   // A character outside the BMP before the break stays before it (review of
   // #1309): the side check compared code points against UTF-16 units.
   const astral = { verseObjects: [zaln("H1", [w("A")]), t("😀\n"), { tag: "q1", type: "quote", text: "“" }, zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };

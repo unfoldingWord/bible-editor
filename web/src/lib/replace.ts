@@ -22,7 +22,7 @@
 import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText, extractPlainText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
-import { hoistOpeningPunctuation, concatVerseText } from "./openingPunct.ts";
+import { hoistOpeningPunctuation, concatVerseText, OPENING_PUNCT_RE } from "./openingPunct.ts";
 import { WORD_CHAR, WORD_RUN_RE } from "./wordRun.ts";
 
 export interface SmartReplaceResult {
@@ -566,10 +566,24 @@ function rangeHoldsLineBreak(nodes: unknown[], rawStart: number, rawEnd: number)
 // before-text (`—␤ | “` -> `— ‘`, a line-ending dash) that stays before it.
 // When both sides changed, closing punctuation goes before the break and the
 // rest after it (splitGapAtMarker). Whitespace matches whitespace: raw holds
-// `\n` where the find/replace text holds a space.
+// `\n` where the find/replace text holds a space. When nothing followed the old
+// break, only opening punctuation that ends the new gap (it leads the next
+// line's first word) goes after the break, and everything else stays before it
+// as before: `:␤ |` -> `: “` gives `: | “`, while `—␤ |` -> `,— ` keeps the
+// line-ending dash before the break (review of #1309).
 function splitGapAtOldMarker(gap: string, oldBefore: string, oldAfter: string): { before: string; after: string } {
-  const same = (a: string, b: string) =>
-    a.length === b.length && [...a].every((ch, i) => ch === b[i] || (/\s/.test(ch) && /\s/.test(b[i])));
+  if (oldAfter === "") {
+    let cut = gap.length;
+    while (cut > 0 && OPENING_PUNCT_RE.test(gap[cut - 1])) cut--;
+    return { before: gap.slice(0, cut), after: gap.slice(cut) };
+  }
+  // Compare UTF-16 unit by unit, as the slices are cut: a character outside the
+  // BMP (`😀`) is two units.
+  const same = (a: string, b: string) => {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i] && !(/\s/.test(a[i]) && /\s/.test(b[i]))) return false;
+    return true;
+  };
   const cut = gap.length - oldAfter.length;
   if (cut >= 0 && same(gap.slice(cut), oldAfter)) return { before: gap.slice(0, cut), after: gap.slice(cut) };
   if (gap.length >= oldBefore.length && same(gap.slice(0, oldBefore.length), oldBefore)) {
