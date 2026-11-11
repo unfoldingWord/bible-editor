@@ -68,7 +68,7 @@ import {
   guardBlocksSave,
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
-import { bridgeNoteAnchor, buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, versesFromKey } from "../lib/verseRange";
+import { bridgeNoteAnchor, buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, verseSpan, versesFromKey } from "../lib/verseRange";
 import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
@@ -2158,8 +2158,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   );
 
   // The widest range row across all versions that covers activeVerse. Used to
-  // scope TN/TQ/TWL filtering in ResourceColumn — if UST 6-9 covers the active
+  // scope TN/TQ filtering in ResourceColumn — if UST 6-9 covers the active
   // verse, the user sees notes for verses 6-9, not just the navigated one.
+  // TWL uses twlVerseRange below instead.
   // For singletons (the common case) this reduces to [activeVerse, activeVerse].
   const displayVerseRange = useMemo<readonly [number, number]>(() => {
     if (!versesForTiles || activeVerse === 0) return [activeVerse, activeVerse] as const;
@@ -2190,6 +2191,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     return [start, end] as const;
   }, [versesForTiles, activeVerse, activeNoteId, data]);
+
+  // TWL links point at ULT words only, so the Words panel follows the ULT
+  // verse alone: a UST bridge (or a bridged note) must not pull in the
+  // neighbouring verses' links. Widens only when the ULT itself is bridged.
+  const twlVerseRange = useMemo<readonly [number, number]>(() => {
+    const ult = activeVerse === 0 ? undefined : verseIndexByVersion["ULT"]?.[activeVerse];
+    return ult ? verseSpan(ult) : ([activeVerse, activeVerse] as const);
+  }, [verseIndexByVersion, activeVerse]);
 
   const visibleVersions = useMemo(
     () => enabledVersions.filter((v) => availableVersions.includes(v)),
@@ -5013,6 +5022,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeVerse={activeVerse}
           checkoff={resourceCheckoff}
           displayVerseRange={displayVerseRange}
+          twlVerseRange={twlVerseRange}
           tn={data.tn}
           tq={data.tq}
           twl={data.twl}
