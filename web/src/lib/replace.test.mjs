@@ -3662,6 +3662,14 @@ function countAllMilestones(nodes) {
     assert(extractEditableText(r.content) === "The woman spoke \\q1 the man ran.", `said -> spoke before the label (got ${JSON.stringify(extractEditableText(r.content))})`);
     assert(labels(r.content) === labels(verse), `said -> spoke: the label is untouched (got ${labels(r.content)})`);
   }
+  // A match that spans the label (and the line break after it) keeps both and
+  // every untouched word; main found no such text in raw and flattened the verse.
+  {
+    const r = findReplaceVerse(clone(verse), plain, /said the/g, plain.indexOf("said the"), 8, "said a");
+    assert(extractEditableText(r.content) === "The woman said \\q1 a man ran.", `said the -> said a across the label (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(verse), `said the -> said a: the label is untouched (got ${labels(r.content)})`);
+    assert(words(r.content) === "The:H0|woman:H1|said:H2|a:|man:H4|ran:H5", `said the -> said a: untouched words keep their alignment (got ${words(r.content)})`);
+  }
   // A bare-seam verse (Case 87's shape) with a label before the match.
   {
     const bare = { verseObjects: [sp(), zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), q1(), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(".")] };
