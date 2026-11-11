@@ -3349,6 +3349,135 @@ function countAllMilestones(nodes) {
   }
 }
 
+// Case 87: find/replace beside a marker with no text node on either side (the
+// Case 83 shape, `H1[name] \q1 H2[this]`) edits the match the translator
+// picked (#1307). The stored plain text reads `name this` (extractPlainText
+// puts a space at the marker), but the engine's raw text joins the leaves as
+// `namethis`. It counted the match's occurrence in the plain text and took
+// that occurrence in raw, so `et` (visible only in `set`) matched across the
+// seam first and saved `my namat\q1 his set.`; a phrase spanning the marker
+// (`name this`) found nothing in raw and flattened the verse.
+{
+  console.log("\n[Case 87] Find/replace beside a marker with no text on either side edits the picked match (#1307)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const markers = (content) => (extractEditableText(content).match(/\\q1/g) ?? []).length;
+  // Build the bare-marker tree the way the app reaches it: a line break typed
+  // after `name`, before the dash, then the dash replaced with nothing.
+  const bareTree = (tail) => {
+    const dashed = { verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), t("—"), zaln("H2", [w("this")]), ...tail] };
+    const old = extractEditableText(dashed);
+    const broken = curlifyVerseContent(smartEditVerse(dashed, old, old.replace("name", "name\\q1 "), { capturedFromDom: true }).content);
+    const p = extractPlainText(broken);
+    return findReplaceVerse(broken, p, /—/g, p.indexOf("—"), 1, "").content;
+  };
+  const bare = bareTree([t(" "), zaln("H3", [w("set")]), t(".")]);
+  const shape = bare.verseObjects.map((n) => (n.tag === "zaln" ? n.strong : n.type === "text" ? JSON.stringify(n.text) : `\\${n.tag}`)).join(" ");
+  assert(shape === 'H0 " " H1 \\q1 H2 " " H3 "."', `setup: no text node either side of the marker (got ${shape})`);
+  const plain = extractPlainText(bare);
+  assert(plain === "my name this set.", `setup: stored plain text is spaced (got ${JSON.stringify(plain)})`);
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const one = (label, content, storedPlain, find, re, repl, wantEditable, wantWords, at = storedPlain.indexOf(find)) => {
+    for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+      const r = fn(clone(content), storedPlain, re, at, find.length, repl);
+      const ed = extractEditableText(r.content);
+      assert(ed === wantEditable, `${label} (${entry}): ${JSON.stringify(wantEditable)} (got ${JSON.stringify(ed)})`);
+      assert(markers(r.content) === markers(content), `${label} (${entry}): the line break survives`);
+      assert(words(r.content) === wantWords, `${label} (${entry}): untouched words keep their alignment (got ${words(r.content)})`);
+    }
+  };
+  // The issue's repro: `et` is visible only in `set`.
+  one("et -> at", bare, plain, "et", /et/g, "at", "my name\\q1 this sat.", "my:H0|name:H1|this:H2|sat:");
+  // A phrase spanning the marker keeps the marker and every untouched word.
+  one("name this -> name that", bare, plain, "name this", /name this/g, "name that", "my name\\q1 that set.", "my:H0|name:H1|that:|set:H3");
+  // A replacement the in-place paths can't take (it adds a word) reaches the
+  // localized rewrite, which counted occurrences the same way. It keeps the
+  // untouched `s` of `set` under H3, as it does in a verse with no marker.
+  one("et -> a t (localized rewrite)", bare, plain, "et", /et/g, "a t", "my name\\q1 this sa t.", "my:H0|name:H1|this:H2|s:H3|a:|t:");
+  {
+    const flat = { verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), t(" "), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(".")] };
+    const fp = extractPlainText(flat);
+    const r = smartReplaceVerse(flat, fp, /et/g, fp.indexOf("et"), 2, "a t");
+    assert(words(r.content) === "my:H0|name:H1|this:H2|s:H3|a:|t:", `et -> a t: the same alignment as in a verse with no marker (got ${words(r.content)})`);
+  }
+  // A row saved before #1305 stores the fused text; the match the translator
+  // picked there is still the one edited.
+  const fused = "my namethis set.";
+  one("et -> at on a fused stored row", bare, fused, "et", /et/g, "at", "my name\\q1 this sat.", "my:H0|name:H1|this:H2|sat:", fused.lastIndexOf("et"));
+  // Replace all: two real matches after the marker, none across it.
+  {
+    const two = bareTree([t(" "), zaln("H3", [w("set")]), t(" "), zaln("H4", [w("met")]), t(".")]);
+    const p2 = extractPlainText(two);
+    const r = replaceAllInVerse(clone(two), p2, /et/g, 2, "at");
+    const ed = extractEditableText(r.content);
+    assert(ed === "my name\\q1 this sat mat.", `replace all et -> at: ${JSON.stringify("my name\\q1 this sat mat.")} (got ${JSON.stringify(ed)})`);
+    assert(words(r.content) === "my:H0|name:H1|this:H2|sat:|mat:", `replace all et -> at: untouched words keep their alignment (got ${words(r.content)})`);
+  }
+  // The phrase at the marker and again later: the one picked (at the marker) is
+  // the one edited. The old occurrence count found nothing at the fused seam and
+  // edited the later one.
+  {
+    const twice = bareTree([t(" "), zaln("H3", [w("set")]), t(" "), zaln("H4", [w("name")]), t(" "), zaln("H5", [w("this")]), t(".")]);
+    const p2 = extractPlainText(twice);
+    one("name this -> name that at the marker, phrase repeated later", twice, p2, "name this", /name this/g, "name that",
+      "my name\\q1 that set name this.", "my:H0|name:H1|that:|set:H3|name:H4|this:H5");
+  }
+  // Punctuation typed across the marker: no path can keep the line break and
+  // the text exact, so the result is the flat rebuild with the exact text (as
+  // before), never a wrong text that keeps the marker.
+  for (const [find, repl] of [["e t", "e-t"], ["me th", "me, th"]]) {
+    const r = smartReplaceVerse(clone(bare), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
+    const want = plain.replace(find, repl);
+    assert(extractPlainText(r.content) === want, `${find} -> ${repl} across the marker: text ${JSON.stringify(want)} (got ${JSON.stringify(extractPlainText(r.content))})`);
+  }
+
+  // The space at a bare marker exists only in the plain text: the tree has no
+  // whitespace there to replace. Replacing it is a no-op for the tree; it must
+  // not pick some other whitespace in raw, or flatten the verse (review of #1307).
+  {
+    const seam = plain.indexOf(" ", plain.indexOf("name"));
+    const r = findReplaceVerse(clone(bare), plain, / /g, seam, 1, "_");
+    assert(r.plainText === plain && extractEditableText(r.content) === extractEditableText(bare),
+      `space at the marker -> _: no-op (got ${JSON.stringify(extractEditableText(r.content))})`);
+    const all = replaceAllInVerse(clone(bare), plain, / /g, 3, "_");
+    assert(extractPlainText(all.content) === "my_name this_set.", `replace all space -> _: the other spaces are replaced (got ${JSON.stringify(extractPlainText(all.content))})`);
+    assert(markers(all.content) === 1, `replace all space -> _: the line break survives (got ${JSON.stringify(extractEditableText(all.content))})`);
+  }
+  // A typed save reaches the same engine: punctuation typed right after the
+  // line-break chip diffs as the stripped-only space -> `—`. That is not a
+  // find/replace no-op: the typed character must not be dropped (review of
+  // #1307). A `\qs` wrapper keeps the whole-verse relayout tiers out, so the
+  // diff tier runs. Main puts the character at the next raw space (`this—set`),
+  // wrong but visible; the typed path keeps that behavior here.
+  {
+    const selah = { verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), { type: "quote", tag: "q1" }, zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(". "),
+      { tag: "qs", type: "quote", endTag: "qs*", children: [zaln("H5", [w("Selah")])] }] };
+    const old = extractEditableText(selah);
+    for (const ch of ["—", ";", ":", ".", "!"]) {
+      const r = smartEditVerse(clone(selah), old, old.replace("\\q1 this", `\\q1 ${ch}this`), { capturedFromDom: true });
+      const got = extractEditableText(r.content);
+      assert(got.split(ch).length === old.split(ch).length + 1, `typed ${ch} after a bare \\q1 is not dropped (got ${JSON.stringify(got)})`);
+      assert(words(r.content) === "my:H0|name:H1|this:H2|set:H3|Selah:H5", `typed ${ch} after a bare \\q1: every word keeps its alignment (got ${words(r.content)})`);
+    }
+  }
+  // Replace all where one step changes the tree but nothing visible (removing
+  // the space leaf before a marker, which still separates the words): that
+  // step is skipped, and the later matches are still replaced.
+  {
+    const spaced = (tail) => ({ verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), t(" "), { type: "quote", tag: "q1" }, zaln("H2", [w("this")]), ...tail] });
+    const two = spaced([t(" "), zaln("H4", [w("name")]), t(" "), zaln("H5", [w("again")]), t(".")]);
+    const p2 = extractPlainText(two);
+    assert(p2 === "my name this name again.", `setup: plain text (got ${JSON.stringify(p2)})`);
+    const r = replaceAllInVerse(clone(two), p2, /name /g, 2, "name");
+    assert(r.plainText === "my name this nameagain.", `replace all "name " -> "name" past an invisible step (got ${JSON.stringify(r.plainText)})`);
+    assert(markers(r.content) === 1, `replace all "name " -> "name": the line break survives`);
+    // Skipped steps don't use up the replace all's step budget.
+    const three = spaced([t(" "), zaln("H4", [w("name")]), t(" "), zaln("H5", [w("one")]), t(" "), zaln("H6", [w("name")]), t(" "), zaln("H7", [w("two")]), t(".")]);
+    const p3 = extractPlainText(three);
+    const r3 = replaceAllInVerse(clone(three), p3, /name /g, 3, "name");
+    assert(r3.plainText === "my name this nameone nametwo.", `replace all, a skipped step then two real ones (got ${JSON.stringify(r3.plainText)})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
