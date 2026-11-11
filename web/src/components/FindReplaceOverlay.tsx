@@ -34,7 +34,7 @@ import type { ChapterState } from "../hooks/useBook";
 import type { TnRow, TqRow, VerseDto } from "../sync/api";
 import { drafts, rowKey } from "../sync/drafts";
 import type { ChapterData } from "../lib/verseStructure";
-import { findReplaceVerse, replaceAllInVerse } from "../lib/findReplaceVerse";
+import { bibleReplaceSummaryText, findReplaceVerse, replaceAllInVerse } from "../lib/findReplaceVerse";
 import { loadFindDraft, saveFindDraft } from "../lib/findState";
 import {
   applyQuestionMatch,
@@ -163,7 +163,9 @@ interface Props {
     newContent: unknown,
     newPlainText: string,
     base: VerseDto,
-  ) => void;
+    // true when the save was queued; false when the alignment guard refused
+    // it (the caller shows the reason). Only queued verses count as replaced.
+  ) => boolean;
   // Replace target for translation notes — only the note BODY is rewritten
   // (id is the primary key, support_reference is a structured rc:// link, so
   // both are off-limits). Shell carries the live row's version into the
@@ -624,12 +626,19 @@ export function FindReplaceOverlay({
 
   // Status surfaced after a replace so the user sees what happened.
   //  - bible: how many verses changed + where alignment milestones were
-  //    destroyed (no inline indicator otherwise) + read-only matches skipped.
+  //    destroyed (no inline indicator otherwise) + read-only matches skipped
+  //    + verses the save's alignment guard refused (not saved, #1285).
   //  - tn: how many note bodies changed, plus matches we deliberately did NOT
   //    touch — structured (id/SR-only) and any replace that would blank a note.
   // Cleared on the next find-query / scope change.
   type ReplaceSummary =
-    | { scope: "bible"; versesReplaced: number; alignmentLost: number; readOnlySkipped: number }
+    | {
+        scope: "bible";
+        versesReplaced: number;
+        alignmentLost: number;
+        readOnlySkipped: number;
+        alignmentRefused: number;
+      }
     | {
         scope: "tn";
         matchesReplaced: number;
@@ -681,16 +690,20 @@ export function FindReplaceOverlay({
       replace,
     );
     if (result.plainText === text) return;
-    setReplaceSummary({
-      scope: "bible",
-      versesReplaced: 1,
-      alignmentLost: result.preservedAlignment ? 0 : 1,
-      readOnlySkipped: 0,
-    });
     // The replace will trigger a matches reshape (the current match is
     // gone); flag the upcoming reshape so we scroll to whatever's next.
     wantsScrollRef.current = { activate: true, nearest: false };
-    onReplaceVerse(m.chapter, m.verse, m.bibleVersion, result.content, result.plainText, verse);
+    const queued = onReplaceVerse(m.chapter, m.verse, m.bibleVersion, result.content, result.plainText, verse);
+    // Refused: nothing changes, so no reshape is coming; don't leave the
+    // scroll flag armed for an unrelated later one.
+    if (!queued) wantsScrollRef.current = null;
+    setReplaceSummary({
+      scope: "bible",
+      versesReplaced: queued ? 1 : 0,
+      alignmentLost: queued && !result.preservedAlignment ? 1 : 0,
+      readOnlySkipped: 0,
+      alignmentRefused: queued ? 0 : 1,
+    });
   };
 
   const doReplaceAllBible = () => {
@@ -715,6 +728,7 @@ export function FindReplaceOverlay({
     }
     let versesReplaced = 0;
     let alignmentLost = 0;
+    let alignmentRefused = 0;
     for (const [key, list] of byVerse) {
       const [chStr, vStr, bv] = key.split("|");
       const ch = parseInt(chStr, 10);
@@ -732,11 +746,14 @@ export function FindReplaceOverlay({
         preservedAlignment: preservedThisVerse,
       } = replaceAllInVerse(verse.content, verse.plain_text ?? "", compiled.re, list.length, replace);
       if (plainText === verse.plain_text) continue;
+      if (!onReplaceVerse(ch, v, bv, content, plainText, verse)) {
+        alignmentRefused += 1;
+        continue;
+      }
       versesReplaced += 1;
       if (!preservedThisVerse) alignmentLost += 1;
-      onReplaceVerse(ch, v, bv, content, plainText, verse);
     }
-    setReplaceSummary({ scope: "bible", versesReplaced, alignmentLost, readOnlySkipped });
+    setReplaceSummary({ scope: "bible", versesReplaced, alignmentLost, readOnlySkipped, alignmentRefused });
   };
 
   // ---- Translation-note replace ----------------------------------------
@@ -1343,7 +1360,9 @@ export function FindReplaceOverlay({
       </Stack>
       {replaceSummary &&
         ((replaceSummary.scope === "bible" &&
-          (replaceSummary.versesReplaced > 0 || replaceSummary.readOnlySkipped > 0)) ||
+          (replaceSummary.versesReplaced > 0 ||
+            replaceSummary.readOnlySkipped > 0 ||
+            replaceSummary.alignmentRefused > 0)) ||
           (replaceSummary.scope === "tn" &&
             (replaceSummary.matchesReplaced > 0 ||
               replaceSummary.structuralSkipped > 0 ||
@@ -1356,7 +1375,7 @@ export function FindReplaceOverlay({
           <Alert
             severity={
               replaceSummary.scope === "bible"
-                ? replaceSummary.alignmentLost > 0
+                ? replaceSummary.alignmentLost > 0 || replaceSummary.alignmentRefused > 0
                   ? "warning"
                   : "success"
                 : replaceSummary.scope === "tq"
@@ -1373,16 +1392,7 @@ export function FindReplaceOverlay({
             onClose={() => setReplaceSummary(null)}
           >
             {replaceSummary.scope === "bible" ? (
-              <>
-                replaced {replaceSummary.versesReplaced} verse
-                {replaceSummary.versesReplaced === 1 ? "" : "s"}
-                {replaceSummary.alignmentLost > 0 &&
-                  ` — alignment milestones destroyed in ${replaceSummary.alignmentLost}`}
-                {replaceSummary.readOnlySkipped > 0 &&
-                  ` — ${replaceSummary.readOnlySkipped} match${
-                    replaceSummary.readOnlySkipped === 1 ? "" : "es"
-                  } in UHB/UGNT skipped (read-only)`}
-              </>
+              bibleReplaceSummaryText(replaceSummary)
             ) : replaceSummary.scope === "tq" ? (
               <>
                 replaced {replaceSummary.matchesReplaced} match
