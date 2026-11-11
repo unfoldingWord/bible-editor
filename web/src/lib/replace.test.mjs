@@ -3699,6 +3699,45 @@ function countAllMilestones(nodes) {
   }
 }
 
+// Case 91: a find/replace across a bare line marker that changes the word
+// count keeps the line break beside the words it did not change (#1311, item
+// 1). On Case 87's tree, `name this` -> `name of that`: smartRebuildRange bails
+// (raw `namethis` is one token) and the localized rewrite emitted the whole
+// replacement and then the zero-width `\q1`, saving `my name of that\q1 set.`.
+// The text was exact and the marker count unchanged, so the seam guard kept
+// it: the line break moved past two words (and unaligned `name`).
+{
+  console.log("\n[Case 91] Find/replace across a bare line marker keeps the break beside the untouched words (#1311)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const markers = (content) => (extractEditableText(content).match(/\\q1/g) ?? []).length;
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const q1 = () => ({ type: "quote", tag: "q1" });
+  const aligned = { verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), q1(), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(".")] };
+  const draft = { verseObjects: [w("my"), t(" "), w("name"), q1(), w("this"), t(" "), w("set"), t(".")] };
+  const plain = extractPlainText(aligned);
+  assert(plain === "my name this set." && extractPlainText(draft) === plain, `setup: plain text (got ${JSON.stringify(plain)})`);
+  const run = (label, find, repl, wantEditable, wantWords) => {
+    for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+      const r = fn(clone(aligned), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
+      const ed = extractEditableText(r.content);
+      assert(ed === wantEditable, `${label} (${entry}): ${JSON.stringify(wantEditable)} (got ${JSON.stringify(ed)})`);
+      assert(markers(r.content) === 1, `${label} (${entry}): the line break survives`);
+      assert(words(r.content) === wantWords, `${label} (${entry}): untouched words keep their alignment, ${wantWords} (got ${words(r.content)})`);
+    }
+    // An unaligned draft: the save guard has no alignment to protect here, so
+    // the engine's result is what saves.
+    const d = findReplaceVerse(clone(draft), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
+    assert(extractEditableText(d.content) === wantEditable, `${label} (unaligned draft): ${JSON.stringify(wantEditable)} (got ${JSON.stringify(extractEditableText(d.content))})`);
+  };
+  // The issue's repro: `name` is unchanged, so the break stays after it.
+  run("name this -> name of that", "name this", "name of that", "my name\\q1 of that set.", "my:H0|name:H1|of:|that:|set:H3");
+  // `this` is unchanged, so the break stays before it.
+  run("name this -> the name this", "name this", "the name this", "my the name\\q1 this set.", "my:H0|the:|name:H1|this:H2|set:H3");
+  // No word of the match survives: the break stays between the untouched
+  // `my` and `set` (pinned; it lands after the replacement).
+  run("name this -> a b c", "name this", "a b c", "my a b c\\q1 set.", "my:H0|a:|b:|c:|set:H3");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
