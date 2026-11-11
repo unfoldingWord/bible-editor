@@ -3334,8 +3334,8 @@ function countAllMilestones(nodes) {
   // skips such a window: run, it would write `, “` into the `:\n` leaf before
   // the `\q1` and empty the marker's `“`, moving the opener before the line
   // break. (The path the replace falls back to has its own problem on this
-  // verse, filed separately: it drops the `\q1`. This case only pins that the
-  // widened relayout stays out.)
+  // verse, #1309: it drops the `\q1`. This case only pins that the widened
+  // relayout stays out.)
   {
     const content = verse("1", "14");
     const plain = extractPlainText(content);
