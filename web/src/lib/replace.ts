@@ -2679,6 +2679,15 @@ function localizedRewriteVerse(
   // prefix and use that length instead.
   let rawStart = -1;
   let rawLen = oldLen;
+  // A line marker with no text node on either side (`H1[say] \q1 H2[The]`)
+  // reads `say The` in the stripped text (stripMarkerTokens adds the space so
+  // the two words don't fuse), but the tree holds `sayThe`. The diff's common
+  // suffix claims that space, so an insertion at the line start has no
+  // separator of its own and lands glued to the next word: `"Word ` typed after
+  // `\q1` saved `“WordThe` (#1286). Write the space into the tree after the
+  // insertion instead. The insertion lands after the marker, which keeps
+  // separating it from the previous line's last word.
+  let padRight = false;
   if (oldLen > 0) {
     const matchText = oldPlain.slice(start, start + oldLen);
     let occurrence = 1;
@@ -2710,6 +2719,14 @@ function localizedRewriteVerse(
     // if the content streams disagree (shouldn't happen for a clean edit).
     const mapped = mapStrippedPosToRaw(prefixNoMarkers, rawTotal, prefixNoMarkers.length);
     rawStart = mapped >= 0 ? mapped : Math.min(prefixNoMarkers.length, rawTotal.length);
+    if (mapped >= 0 && newSubstring.length > 0) {
+      const isWS = (c: string | undefined): boolean => c !== undefined && /\s/.test(c);
+      padRight =
+        isWS(oldPlain[start]) &&
+        rawStart < rawTotal.length &&
+        !isWS(rawTotal[rawStart]) &&
+        !isWS(newSubstring[newSubstring.length - 1]);
+    }
   }
   if (rawStart < 0) {
     // Couldn't map — bail to flat tokenization so we at least emit \w
@@ -2739,6 +2756,7 @@ function localizedRewriteVerse(
     if (newSubstring.length > 0) {
       for (const t of tokenizeEditableText(newSubstring)) out.push(t);
     }
+    if (padRight) out.push({ type: "text", text: " " });
   };
 
   let pos = 0;
