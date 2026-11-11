@@ -3067,8 +3067,8 @@ function countAllMilestones(nodes) {
 // but that space exists only in the stripped text (stripMarkerTokens adds it so
 // the two words don't fuse); the tree holds `sayThe`. A word inserted at the
 // line start took that space as its own separator, so `"Word ` saved as
-// `“WordThe` (#1286). (A word typed at the END of the previous line fuses the
-// same way on the other side, `sayWord`: #1294.)
+// `“WordThe` (#1286). A word typed at the END of the previous line fused the
+// same way on the other side, `sayWord` (#1294).
 {
   console.log("\n[Case 83] Word inserted beside a marker with no text on either side keeps its space (#1286)");
   const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
@@ -3111,6 +3111,15 @@ function countAllMilestones(nodes) {
     assert(got === want, `${label}: ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
     assert(words(out) === "Then:H0|say:H1|Word:|The:H2|one:H3", `${label}: every old word keeps its alignment (got ${words(out)})`);
   }
+  // The repair separates only where the typed text has a space: a stored
+  // possessive (`H2[Yahweh] "’s"`, two top-level nodes that read as one word)
+  // stays joined when a marker moves. Moving the marker off the bare seam also
+  // used to fuse `the` with `Yahweh` (`theYahweh’s`), the same lost space. (The
+  // space before `\\q1` is where reconcileMarkers already puts the gap.)
+  const possessive = { verseObjects: [zaln("H0", [w("Then")]), t(" "), zaln("H1", [w("the")]), { type: "quote", tag: "q1" }, zaln("H2", [w("Yahweh")]), t("’s"), t(" "), zaln("H3", [w("word")]), t(".")] };
+  const moved = save(possessive, (s) => s.replace("Then the\\q1 ", "Then\\q1 the "));
+  assert(extractEditableText(moved) === "Then \\q1 the Yahweh’s word.", `possessive stays joined when the marker moves (got ${JSON.stringify(extractEditableText(moved))})`);
+  assert(words(moved) === "Then:H0|the:H1|Yahweh:H2|word:H3", `possessive: every word keeps its alignment (got ${words(moved)})`);
 }
 
 // Case 84: find/replace must not leave a \zaln milestone that wraps no \w word
