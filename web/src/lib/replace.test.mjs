@@ -3619,6 +3619,78 @@ function countAllMilestones(nodes) {
   }
 }
 
+// Case 90: a `\sp` speaker label before the match (#1311, item 3). The plain
+// and editable texts skip the label (it lives in the header band), but the
+// engine's raw text keeps it, so the plain-to-raw mapping failed and the
+// fallback counted the match's occurrence in raw, label included. In Song of
+// Songs a find for `man` after `\sp The man speaking` edited the label's `man`
+// instead (`The woman said boy\q1 the man ran.`), and a bare-seam verse with a
+// label before the match got the #1307 wrong-word edit back.
+{
+  console.log("\n[Case 90] Find/replace and typed edits after a \\sp label edit the picked match (#1311)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const labels = (content) => JSON.stringify(content.verseObjects.filter((n) => n.tag === "sp" || n.tag === "qa").map((n) => n.text));
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const sp = () => ({ tag: "sp", text: "The man speaking\n" });
+  const q1 = () => ({ tag: "q1", type: "quote" });
+  const verse = { verseObjects: [zaln("H0", [w("The")]), t(" "), zaln("H1", [w("woman")]), t(" "), zaln("H2", [w("said")]), t("\n"), sp(), q1(),
+    zaln("H3", [w("the")]), t(" "), zaln("H4", [w("man")]), t(" "), zaln("H5", [w("ran")]), t(".")] };
+  const plain = extractPlainText(verse);
+  assert(plain === "The woman said the man ran.", `setup: plain text skips the label (got ${JSON.stringify(plain)})`);
+  const at = plain.indexOf(" man") + 1;
+  for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+    const r = fn(clone(verse), plain, /man/g, at, 3, "boy");
+    const ed = extractEditableText(r.content);
+    assert(ed === "The woman said \\q1 the boy ran.", `${entry}: man -> boy after the label edits the picked man (got ${JSON.stringify(ed)})`);
+    assert(labels(r.content) === labels(verse), `${entry}: man -> boy: the label is untouched (got ${labels(r.content)})`);
+    assert(words(r.content) === "The:H0|woman:H1|said:H2|the:H3|boy:|ran:H5", `${entry}: man -> boy: untouched words keep their alignment (got ${words(r.content)})`);
+  }
+  // The typed path reaches the same engine.
+  {
+    const old = extractEditableText(verse);
+    const r = smartEditVerse(clone(verse), old, old.replace("the man", "the boy"), { capturedFromDom: true });
+    assert(extractEditableText(r.content) === "The woman said \\q1 the boy ran.", `typed the man -> the boy (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(verse), `typed the man -> the boy: the label is untouched (got ${labels(r.content)})`);
+    // A word typed at the start of the labelled line.
+    const ins = smartEditVerse(clone(verse), old, old.replace("\\q1 the", "\\q1 now the"), { capturedFromDom: true });
+    assert(extractEditableText(ins.content) === "The woman said \\q1 now the man ran.", `typed a word after the label (got ${JSON.stringify(extractEditableText(ins.content))})`);
+    assert(labels(ins.content) === labels(verse), `typed a word after the label: the label is untouched (got ${labels(ins.content)})`);
+  }
+  // A match just before the label leaves it alone too.
+  {
+    const r = findReplaceVerse(clone(verse), plain, /said/g, plain.indexOf("said"), 4, "spoke");
+    assert(extractEditableText(r.content) === "The woman spoke \\q1 the man ran.", `said -> spoke before the label (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(verse), `said -> spoke: the label is untouched (got ${labels(r.content)})`);
+  }
+  // A bare-seam verse (Case 87's shape) with a label before the match.
+  {
+    const bare = { verseObjects: [sp(), zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), q1(), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(".")] };
+    const p = extractPlainText(bare);
+    assert(p === "my name this set.", `setup: bare seam after a label (got ${JSON.stringify(p)})`);
+    const r = findReplaceVerse(clone(bare), p, /et/g, p.indexOf("et"), 2, "at");
+    assert(extractEditableText(r.content) === "my name\\q1 this sat.", `et -> at after a label and a bare seam (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(bare), `et -> at: the label is untouched (got ${labels(r.content)})`);
+    assert(words(r.content) === "my:H0|name:H1|this:H2|sat:", `et -> at: untouched words keep their alignment (got ${words(r.content)})`);
+  }
+  // `\qa` (the LAM acrostic heading, stored as usfm-js parses it): the plain
+  // text keeps its label, so find/replace maps through it. In the samples and
+  // in D1 it always ends the verse before the one it heads, so no match comes
+  // after it. A typed save moves the label to `content` first (liftMarkerText,
+  // #708), so the typed path never sees it in raw. Pinned, not changed.
+  {
+    const qa = { verseObjects: [zaln("H0", [w("the")]), t(" "), zaln("H1", [w("man")]), t(" "), zaln("H2", [w("ran")]), t(".\n"), { tag: "qa", type: "quote", text: "BETH\n" }, q1()] };
+    const p = extractPlainText(qa);
+    assert(p === "the man ran. BETH", `setup: \\qa label in the plain text (got ${JSON.stringify(p)})`);
+    const r = findReplaceVerse(clone(qa), p, /man/g, p.indexOf("man"), 3, "boy");
+    assert(extractPlainText(r.content) === "the boy ran. BETH" && labels(r.content) === labels(qa), `man -> boy before a \\qa label (got ${JSON.stringify(extractPlainText(r.content))} ${labels(r.content)})`);
+    const old = extractEditableText(qa);
+    const typed = smartEditVerse(clone(qa), old, old.replace("man", "boy"), { capturedFromDom: true });
+    const heading = typed.content.verseObjects.find((n) => n.tag === "qa");
+    assert(extractEditableText(typed.content) === "the boy ran. \\q1" && heading?.content === "BETH",
+      `typed man -> boy before a \\qa label: the label is kept on content (got ${JSON.stringify(extractEditableText(typed.content))} ${JSON.stringify(heading)})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
