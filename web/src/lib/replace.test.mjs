@@ -3583,6 +3583,42 @@ function countAllMilestones(nodes) {
     "shepherd, \\q2 and", "shepherd; \\q2 and");
 }
 
+// Case 89: a typed edit across a bare line marker in a verse that also has a
+// line marker right after punctuation (`them.\q1 And`) (#1311, item 2). The
+// typed path diffs the marker-stripped text, which puts no space at
+// `them.\q1 And` (`them.And`: the two would not fuse), but the exact-text guard
+// for a change across the bare seam compared that with the tree's plain text,
+// which has a space at every marker (`them. And`). Every typed edit across the
+// seam failed the guard and fell to the flat rebuild, which dropped both line
+// breaks and unaligned the whole verse. The `\qs` wrapper keeps the reassembly
+// and relayout tiers out, so the diff tier runs (as in Case 87).
+{
+  console.log("\n[Case 89] Typed edit across a bare line marker keeps the line breaks beside punctuation (#1311)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const markers = (content) => (extractEditableText(content).match(/\\q1/g) ?? []).length;
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const selah = () => ({ tag: "qs", type: "quote", endTag: "qs*", children: [zaln("H9", [w("Selah")])] });
+  // `between`: what sits between `them.` and `And`.
+  const verse = (between) => ({ verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), { type: "quote", tag: "q1" }, zaln("H2", [w("this")]),
+    t(" "), zaln("H3", [w("them")]), ...between, zaln("H4", [w("And")]), t(" "), zaln("H5", [w("so")]), t(". "), selah()] });
+  const tight = verse([t("."), { type: "quote", tag: "q1" }]);
+  // Control: a space text node before the second marker, so both texts agree there.
+  const spaced = verse([t(". "), { type: "quote", tag: "q1" }]);
+  const old = extractEditableText(tight);
+  assert(old === "my name\\q1 this them.\\q1 And so. Selah", `setup: editable text (got ${JSON.stringify(old)})`);
+  for (const [from, to] of [["name\\q1 this", "nom\\q1 that"], ["name\\q1 this", "nam\\q1 his"]]) {
+    const r = smartEditVerse(clone(tight), old, old.replace(from, to), { capturedFromDom: true });
+    const got = extractEditableText(r.content);
+    const want = old.replace(from, to);
+    assert(got === want, `typed ${from} -> ${to}: ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
+    assert(markers(r.content) === 2, `typed ${from} -> ${to}: both line breaks survive`);
+    const oldSpaced = extractEditableText(spaced);
+    const ctl = smartEditVerse(clone(spaced), oldSpaced, oldSpaced.replace(from, to), { capturedFromDom: true });
+    assert(words(r.content) === words(ctl.content),
+      `typed ${from} -> ${to}: alignment as with a space before the second marker, ${words(ctl.content)} (got ${words(r.content)})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
