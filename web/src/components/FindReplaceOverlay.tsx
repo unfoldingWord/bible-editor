@@ -34,7 +34,7 @@ import type { ChapterState } from "../hooks/useBook";
 import type { TnRow, TqRow, VerseDto } from "../sync/api";
 import { drafts, rowKey } from "../sync/drafts";
 import type { ChapterData } from "../lib/verseStructure";
-import { smartReplaceVerse } from "../lib/replace";
+import { findReplaceVerse } from "../lib/findReplaceVerse";
 import { loadFindDraft, saveFindDraft } from "../lib/findState";
 import {
   applyQuestionMatch,
@@ -672,7 +672,7 @@ export function FindReplaceOverlay({
     if (!verse) return;
     if (!compiled.re) return;
     const text = verse.plain_text ?? "";
-    const result = smartReplaceVerse(
+    const result = findReplaceVerse(
       verse.content,
       text,
       compiled.re,
@@ -735,7 +735,7 @@ export function FindReplaceOverlay({
         const localRe = new RegExp(compiled.re.source, compiled.re.flags);
         const next = localRe.exec(plainText);
         if (!next) break;
-        const result = smartReplaceVerse(
+        const result = findReplaceVerse(
           content,
           plainText,
           compiled.re,
