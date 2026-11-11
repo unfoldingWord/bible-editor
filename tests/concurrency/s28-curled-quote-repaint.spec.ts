@@ -113,7 +113,7 @@ for (const mode of ["stacked", "columns", "book"] as const) {
     await page.waitForTimeout(1500);
     const shown = (await cell.textContent()) ?? "";
     const dirtyAttr = await cell.getAttribute("data-dirty");
-    console.log(`[s26] ${mode} case1 PATCHes:`, patches.length, "| cell shows:", shown.match(/Yahweh.s/)?.[0], "| data-dirty:", dirtyAttr);
+    console.log(`[s28] ${mode} case1 PATCHes:`, patches.length, "| cell shows:", shown.match(/Yahweh.s/)?.[0], "| data-dirty:", dirtyAttr);
     expect.soft(patches.length, "a quote-only change is a no-op save").toBe(0);
     expect.soft(shown, "the cell repaints with the stored curly form").toContain("Yahweh’s temple");
 
@@ -134,7 +134,7 @@ for (const mode of ["stacked", "columns", "book"] as const) {
     await expect.poll(async () => (await serverVerse()).version).toBeGreaterThan(before.version);
     const after = await serverVerse();
     const alignedAfter = alignedCount(JSON.parse(after.content_json));
-    console.log(`[s26] ${mode} case1 two-sided edit: confirm shown:`, confirmShown, "| aligned words before/after:", alignedBefore, alignedAfter, "|", after.plain_text);
+    console.log(`[s28] ${mode} case1 two-sided edit: confirm shown:`, confirmShown, "| aligned words before/after:", alignedBefore, alignedAfter, "|", after.plain_text);
     expect.soft(confirmShown, "no unalign confirm for edits that do not touch Yahweh’s").toBe(false);
     expect.soft(alignedAfter, "the two-sided edit unaligns nothing").toBe(alignedBefore);
     await context.close();
@@ -178,8 +178,8 @@ for (const variant of [
     const dialog = page.getByRole("dialog").filter({ hasText: "reading text" });
     const editable = dialog.locator('[contenteditable="true"]:visible');
     await editable.first().waitFor({ state: "visible" });
-    await editable.first().evaluate((el) => el.setAttribute("data-s26-line", "ULT"));
-    const line = dialog.locator('[data-s26-line="ULT"]');
+    await editable.first().evaluate((el) => el.setAttribute("data-s28-line", "ULT"));
+    const line = dialog.locator('[data-s28-line="ULT"]');
     const lineBox = line.locator("..");
     const save = lineBox.getByRole("button", { name: "Save ULT", exact: true });
 
@@ -196,7 +196,7 @@ for (const variant of [
     await page.waitForTimeout(1500);
     const shown = (await line.textContent()) ?? "";
     const focused = await line.evaluate((el) => document.activeElement === el);
-    console.log(`[s26] dual ${variant.name}: PATCHes:`, patches.length, "| line focused:", focused, "| line ends:", shown.slice(-20));
+    console.log(`[s28] dual ${variant.name}: PATCHes:`, patches.length, "| line focused:", focused, "| line ends:", shown.slice(-20));
 
     // Type a character and delete it in the line.
     await line.click();
@@ -211,7 +211,7 @@ for (const variant of [
       .waitFor({ state: "visible", timeout: 1500 })
       .then(() => true)
       .catch(() => false);
-    console.log(`[s26] dual ${variant.name}: Save enabled after type-and-undo:`, dirtyAfterUndo, "| unsaved prompt on close:", gateShown);
+    console.log(`[s28] dual ${variant.name}: Save enabled after type-and-undo:`, dirtyAfterUndo, "| unsaved prompt on close:", gateShown);
     expect.soft(patches.length).toBe(variant.patches);
     expect.soft(shown, "the line shows the curled text after its save").toContain(variant.shows);
     expect.soft(shown).not.toMatch(/['"]/);
