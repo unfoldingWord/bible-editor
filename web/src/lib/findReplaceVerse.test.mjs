@@ -10,7 +10,7 @@
 //   node --experimental-strip-types --no-warnings src/lib/findReplaceVerse.test.mjs
 
 import assert from "node:assert/strict";
-import { findReplaceVerse, replaceAllInVerse } from "./findReplaceVerse.ts";
+import { finalizeFindReplace, findReplaceVerse, replaceAllInVerse } from "./findReplaceVerse.ts";
 import { smartReplaceVerse } from "./replace.ts";
 import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { rebaseVersePatch } from "../sync/verseRebase.ts";
@@ -200,6 +200,25 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   const r = replaceAllInVerse(verse, plain, /’/g, 2, "'");
   check(r.plainText === plain, `plainText unchanged, so nothing is queued (got ${JSON.stringify(r.plainText)})`);
   check(JSON.stringify(r.content) === JSON.stringify(verse), "content unchanged");
+}
+
+// ── finalizeFindReplace directly ─────────────────────────────────────────────
+{
+  console.log("\n[#1276] finalizeFindReplace");
+  const verse = { verseObjects: [zaln("H1", [w("the")]), t(" "), zaln("H2", [w("baby’s")]), t(" "), zaln("H3", [w("toy")])] };
+  const plain = "the baby’s toy";
+  const same = { content: verse, plainText: plain, preservedAlignment: true };
+  check(finalizeFindReplace(verse, plain, same) === same, "an unchanged result is returned as is");
+
+  const straight = { verseObjects: [zaln("H1", [w("the")]), t(" "), zaln("H2", [w("baby's")]), t(" "), zaln("H3", [w("toy")])] };
+  const undone = finalizeFindReplace(verse, plain, { content: straight, plainText: "the baby's toy", preservedAlignment: false });
+  check(undone.content === verse && undone.plainText === plain, "a change the curl undoes hands back the saved verse and plain text");
+
+  const changed = { verseObjects: [zaln("H1", [w("a")]), t(" "), zaln("H2", [w("baby's")]), t(" "), zaln("H3", [w("toy")])] };
+  const out = finalizeFindReplace(verse, plain, { content: changed, plainText: "a baby's toy", preservedAlignment: false });
+  check(out.plainText === "a baby’s toy" && extractPlainText(out.content) === out.plainText, "a real change is curled, plain text from the tree");
+  check(out.preservedAlignment === false, "the steps' preservedAlignment is kept");
+  check(alignedWords(changed)[1] === "baby's:H2", "the engine's tree is not mutated");
 }
 
 // ── Quote-free replaces are untouched ────────────────────────────────────────
