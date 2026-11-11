@@ -32,6 +32,15 @@ export function finalizeFindReplace(
   // The engine changed nothing (`toy` → `toy`): stay a no-op, even when the
   // verse holds a legacy straight quote the curl would otherwise rewrite.
   if (result.plainText === plainText) return result;
+  // The same, judged on the tree's own plain text: beside a line marker with
+  // no text node on either side, the engine's plainText reads `namethis`
+  // while the stored one reads `name this`, so the check above missed a
+  // same-text replace there and the curl queued a save of an unrelated quote
+  // (#1311). Checked before the curl, so the curl can't make it a change.
+  const contentPlain = extractPlainText(content);
+  if (extractPlainText(result.content) === contentPlain) {
+    return { ...result, content, plainText, preservedAlignment: true };
+  }
   const curled = curlifyVerseContent(result.content);
   // The saved plain text is the tree's, as every other verse save stores it.
   // The engine's own plainText adds nothing at a line marker, so with no text
@@ -41,7 +50,7 @@ export function finalizeFindReplace(
   // the engine's plain text differed from the stored one only at such a
   // marker (a same-text replace). Hand back the verse and the caller's own
   // plain text, so nothing is queued (no version bump).
-  if (curledPlain === extractPlainText(content)) {
+  if (curledPlain === contentPlain) {
     return { ...result, content, plainText, preservedAlignment: true };
   }
   return { ...result, content: curled, plainText: curledPlain };
