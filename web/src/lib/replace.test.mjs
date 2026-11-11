@@ -3218,9 +3218,9 @@ function countAllMilestones(nodes) {
   punctOnly("yes. -> yes! (mid-word start)", "3", "9", "yes.", "yes!");
 
   // A window that holds a marker carrying text (usfm-js parks a line-leading
-  // `“` on the `\q1` node) must not take the widened relayout: it would write
-  // the opener into the gap before the line break (review of #1292). It falls
-  // back to the old path, which the save guard refuses as before.
+  // `“` on the `\q1` node) must not move the opener into the gap before the
+  // line break (review of #1292). Since #1309 the widened relayout takes this
+  // window and keeps the opener after the break (Case 88).
   {
     const tw = (text) => ({ text, tag: "w", type: "word", occurrence: "1", occurrences: "1" });
     const tt = (text) => ({ type: "text", text });
@@ -3330,12 +3330,9 @@ function countAllMilestones(nodes) {
   punctOnly("Yahweh’s word -> Yahweh’s, word (ZEC 9:1, boundary-aligned)", verse("9", "1"), "Yahweh’s word", "Yahweh’s, word");
 
   // Shape 2 of #1304: a match that crosses a marker carrying text (usfm-js parks
-  // ZEC 1:14's line-leading `“` on the `\q1` node). The widened relayout still
-  // skips such a window: run, it would write `, “` into the `:\n` leaf before
-  // the `\q1` and empty the marker's `“`, moving the opener before the line
-  // break. (The path the replace falls back to has its own problem on this
-  // verse, #1309: it drops the `\q1`. This case only pins that the widened
-  // relayout stays out.)
+  // ZEC 1:14's line-leading `“` on the `\q1` node). The opener must not move
+  // before the line break. Since #1309 the widened relayout splits the gap at
+  // the `\q1` and keeps the `“` on it; Case 88 pins the full result.
   {
     const content = verse("1", "14");
     const plain = extractPlainText(content);
@@ -3476,6 +3473,114 @@ function countAllMilestones(nodes) {
     const r3 = replaceAllInVerse(clone(three), p3, /name /g, 3, "name");
     assert(r3.plainText === "my name this nameone nametwo.", `replace all, a skipped step then two real ones (got ${JSON.stringify(r3.plainText)})`);
   }
+}
+
+// Case 88: a punctuation-only find/replace across a line break keeps the
+// line break, and keeps text on the side of it where it was (#1309). ZEC 1:14
+// ULT stores `Armies` `":\n"` `\q1` and usfm-js parks the line-leading `“` on
+// the `\q1` node. A match that started inside `Armies` (`s: “`) fell to the
+// localized rewrite, which dropped the `\q1`; a boundary-aligned match
+// (`Armies: “`) took the punctuation relayout, which wrote `, “` into the `:\n`
+// leaf and emptied the marker, moving the opener to the previous line. A `\q1`
+// with no text (the opener in its own text node) was invisible to the relayout
+// and got the same result. ZEC 13:7 has a line-leading `—` after one `\q1` and
+// a line-ending `—` before another; each must stay on its own line.
+{
+  console.log("\nCase 88: punctuation-only find/replace across a line break keeps the line break (#1309)");
+  const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+  const verse = (c, v) => ({ verseObjects: JSON.parse(JSON.stringify(zecUlt.chapters[c][v].verseObjects)) });
+  const sig = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("+")}`).join("|");
+  const markers = (content) => (extractEditableText(content).match(/\\q\d?/g) ?? []).length;
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  // `wantFrom`/`wantTo`: the editable text around the change, before and after.
+  const check = (label, content, find, repl, wantFrom, wantTo) => {
+    const plain = extractPlainText(content);
+    const i = plain.indexOf(find);
+    assert(i >= 0, `${label}: setup: verse contains ${JSON.stringify(find)}`);
+    const before = extractEditableText(content);
+    assert(before.includes(wantFrom), `${label}: setup: editable text contains ${JSON.stringify(wantFrom)}`);
+    const wantEditable = before.replace(wantFrom, wantTo);
+    const wantPlain = plain.slice(0, i) + repl + plain.slice(i + find.length);
+    for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+      const r = fn(clone(content), plain, new RegExp(esc(find), "g"), i, find.length, repl);
+      const ed = extractEditableText(r.content);
+      assert(ed === wantEditable, `${label} (${entry}): editable text ends ${JSON.stringify(wantTo)} (got ${JSON.stringify(ed.slice(Math.max(0, ed.indexOf(wantTo.slice(0, 4)) - 10)))})`);
+      assert(markers(r.content) === markers(content), `${label} (${entry}): every line break survives (${markers(content)} -> ${markers(r.content)})`);
+      assert(sig(r.content) === sig(content), `${label} (${entry}): every word keeps its alignment (got ${sig(r.content)})`);
+      assert(extractPlainText(r.content) === wantPlain, `${label} (${entry}): plain text is the replaced text (got ${JSON.stringify(extractPlainText(r.content))})`);
+      const delta = analyzeAlignmentDelta(content, r.content);
+      assert(delta.unexpectedLosses.length === 0 && delta.afterAligned === delta.beforeAligned,
+        `${label} (${entry}): the save guard sees no loss (${delta.beforeAligned} -> ${delta.afterAligned})`);
+    }
+  };
+
+  // Repro 1: the window starts inside `Armies` (the widened path).
+  check("repro 1: s: “ -> s, “ (ZEC 1:14)", verse("1", "14"), "s: “", "s, “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  // Repro 2: the window is boundary-aligned.
+  check("repro 2: Armies: “ -> Armies, “ (ZEC 1:14)", verse("1", "14"), "Armies: “", "Armies, “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  // The opener itself changed or removed: the new opener (or nothing) follows the line break.
+  check("Armies: “ -> Armies: ‘ (ZEC 1:14)", verse("1", "14"), "Armies: “", "Armies: ‘", "Armies: \\q1 “I", "Armies: \\q1 ‘I");
+  check("Armies: “ -> Armies; ‘ (ZEC 1:14, both sides changed)", verse("1", "14"), "Armies: “", "Armies; ‘", "Armies: \\q1 “I", "Armies; \\q1 ‘I");
+  check("s: “ -> s: (ZEC 1:14, opener removed)", verse("1", "14"), "s: “", "s: ", "Armies: \\q1 “I", "Armies: \\q1 I");
+
+  // Repro 3: the `\q1` carries no text; the opener is its own text node.
+  const hand = (first) => ({ verseObjects: [zaln("H1", first), t(":\n"), { tag: "q1", type: "quote" }, t("“"), zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] });
+  check("repro 3: rmies: “ -> rmies, “ (textless \\q1)", hand([w("Armies")]), "rmies: “", "rmies, “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  check("repro 3: Armies: “ -> Armies, “ (textless \\q1)", hand([w("Armies")]), "Armies: “", "Armies, “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  check("repro 3: Yahweh’s: “ -> Yahweh’s, “ (textless \\q1, split possessive)", hand([w("Yahweh"), t("’"), w("s")]), "Yahweh’s: “", "Yahweh’s, “", "Yahweh’s: \\q1 “I", "Yahweh’s, \\q1 “I");
+
+  // A match with no word in it (only the gap) crosses the line break too.
+  check(": “ -> , “ (ZEC 1:14, gap only)", verse("1", "14"), ": “", ", “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  check(": “ -> , “ (textless \\q1, gap only)", hand([w("Armies")]), ": “", ", “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  check("␣“ -> ␣‘ (textless \\q1, gap only, starts inside the :␤ leaf)", hand([w("Armies")]), " “", " ‘", "Armies: \\q1 “I", "Armies: \\q1 ‘I");
+
+  // An opener added where nothing followed the break goes after it (review of
+  // #1309): with no old text after the `\q1`, the whole new gap used to land
+  // before it (`Armies: “\q1 I`).
+  const bare = { verseObjects: [zaln("H1", [w("Armies")]), t(":\n"), { tag: "q1", type: "quote" }, zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+  check("Armies: I -> Armies: “I (textless \\q1, nothing after it)", bare, "Armies: I", "Armies: “I", "Armies: \\q1 I", "Armies: \\q1 “I");
+  check("Armies: I -> Armies, “I (textless \\q1, both sides changed)", bare, "Armies: I", "Armies, “I", "Armies: \\q1 I", "Armies, \\q1 “I");
+  const emptied = { verseObjects: [zaln("H1", [w("Armies")]), t(":\n"), { tag: "q1", type: "quote", text: "" }, zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+  check("Armies: I -> Armies: “I (\\q1 text \"\")", emptied, "Armies: I", "Armies: “I", "Armies: \\q1 I", "Armies: \\q1 “I");
+  const q2 = { verseObjects: [zaln("H1", [w("my"), t(" "), w("shepherd"), t(",")]), t("\n"), { tag: "q2", type: "quote" }, zaln("H2", [w("and"), t(" "), w("against")]), t(".")] };
+  check("shepherd, and -> shepherd, “and (textless \\q2)", q2, "shepherd, and", "shepherd, “and", "shepherd, \\q2 and", "shepherd, \\q2 “and");
+  // Only an added OPENER moves after such a break: a line-ending dash stays
+  // before it (the ZEC 8:11 ULT shape `people— \q1 this`).
+  const dashEnd = { verseObjects: [zaln("H1", [w("people")]), t("—\n"), { tag: "q1", type: "quote" }, zaln("H2", [w("this")]), t(" "), zaln("H3", [w("is")]), t(".")] };
+  check("people— this -> people,— this (line-ending dash, nothing after the \\q1)", dashEnd, "people— this", "people,— this", "people— \\q1 this", "people,— \\q1 this");
+  // A character outside the BMP before the break stays before it (review of
+  // #1309): the side check compared code points against UTF-16 units.
+  const astral = { verseObjects: [zaln("H1", [w("A")]), t("😀\n"), { tag: "q1", type: "quote", text: "“" }, zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+  check("😀 “ -> 😀 ‘ (astral character before the break)", astral, "😀 “", "😀 ‘", "A😀 \\q1 “I", "A😀 \\q1 ‘I");
+
+  // A line-leading `—` stays after its `\q1`, a line-ending `—` before its
+  // `\q1` (the ZEC 13:7 shapes; the sample file keeps that verse's dashes
+  // inside the `\w` words, so these trees store them as text, as the AI
+  // pipeline does).
+  const leading = { verseObjects: [zaln("H1", [w("companion"), t("”")]), t("\n"), { tag: "q1", type: "quote" }, zaln("H2", [t("—"), w("the")]), t(" "), zaln("H3", [w("declaration")]), t(".")] };
+  check("companion” —the -> companion,” —the (line-leading dash)", leading, "companion” —the", "companion,” —the",
+    "companion” \\q1 —the", "companion,” \\q1 —the");
+  const ending = { verseObjects: [zaln("H1", [w("Armies"), t("—")]), t("\n"), { tag: "q1", type: "quote" }, t("“"), zaln("H2", [w("Strike")]), t(" "), zaln("H3", [w("him")]), t(".”")] };
+  check("Armies— “Strike -> Armies— ‘Strike (line-ending dash)", ending, "Armies— “Strike", "Armies— ‘Strike",
+    "Armies— \\q1 “Strike", "Armies— \\q1 ‘Strike");
+  // Two breaks in one gap (`\p \q1`, the ZEC 13:7 verse end) act as one: the
+  // opener stays after both.
+  const twoBreaks = { verseObjects: [zaln("H1", [w("say")]), t(",\n"), { tag: "p", type: "paragraph" }, { tag: "q1", type: "quote" }, t("“"), zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+  check("say, “I -> say; “I (\\p \\q1)", twoBreaks, "say, “I", "say; “I", "say, \\p \\q1 “I", "say; \\p \\q1 “I");
+  // Text between two breaks (not in the samples) keeps both breaks; the text
+  // after the first one stays after it.
+  {
+    const between = { verseObjects: [zaln("H1", [w("say")]), t(",\n"), { tag: "q1", type: "quote", text: "“" }, { tag: "q2", type: "quote" }, zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+    const p = extractPlainText(between);
+    const r = findReplaceVerse(clone(between), p, /say, “ I/g, p.indexOf("say, “ I"), "say, “ I".length, "say; “ I");
+    const ed = extractEditableText(r.content);
+    assert(ed === "say; \\q1 “ \\q2 I go.”", `text between two breaks: both breaks kept, opener after the first (got ${JSON.stringify(ed)})`);
+    assert(sig(r.content) === sig(between), `text between two breaks: every word keeps its alignment (got ${sig(r.content)})`);
+  }
+  // A line break with nothing after it: the new punctuation stays before it, as before.
+  check("shepherd, and -> shepherd; and (ZEC 13:7, nothing after the \\q2)", verse("13", "7"), "shepherd, and", "shepherd; and",
+    "shepherd, \\q2 and", "shepherd; \\q2 and");
 }
 
 if (failed > 0) {
