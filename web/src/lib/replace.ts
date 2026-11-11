@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText, extractPlainText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 import { hoistOpeningPunctuation, concatVerseText, OPENING_PUNCT_RE } from "./openingPunct.ts";
@@ -1714,7 +1714,19 @@ function isExactReplace(
     return n;
   };
   const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  return Array.isArray(out) && extractPlainText(result.content) === want && lineMarkers(out) === lineMarkers(verseObjects);
+  if (!Array.isArray(out)) return false;
+  // Read the result in the caller's coordinates. Find/replace passes the
+  // tree's plain text, which has a space at every line marker; a typed save
+  // (smartEditVerse) passes the marker-stripped editable text, which has one
+  // only where the words would otherwise fuse (`them.\q1 And` reads
+  // `them.And`). Comparing the typed text with the tree's plain text failed
+  // every typed edit across a bare seam in a verse with such a marker, and
+  // the flat rebuild dropped all its line breaks (#1311).
+  const strippedText = (c: unknown) => normalize(normalizeEditable(stripMarkerTokens(extractEditableText(c))));
+  const original = { verseObjects };
+  const typedCoords = plainText !== extractPlainText(original) && plainText === strippedText(original);
+  const got = typedCoords ? strippedText(result.content) : extractPlainText(result.content);
+  return got === want && lineMarkers(out) === lineMarkers(verseObjects);
 }
 
 // Plain-text diff: the smallest contiguous substring change that turns
