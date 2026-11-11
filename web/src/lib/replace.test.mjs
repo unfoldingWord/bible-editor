@@ -18,6 +18,7 @@ import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 import { OPENING_PUNCT_RE } from "./openingPunct.ts";
 import { curlifyVerseContent } from "./curlyVerse.ts";
+import { findReplaceVerse } from "./findReplaceVerse.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -3051,6 +3052,47 @@ function countAllMilestones(nodes) {
     assert(got === want, `chain 2, ${label}: ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
     assert(words(out) === "say:H1|Word:|The:H2|one:H3", `chain 2, ${label}: every old word keeps its alignment (got ${words(out)})`);
   }
+}
+
+// Case 83: a marker with NO text node on either side (`H1[say] \q1 H2[The]`).
+// Real saves reach it: type a line break before a dash between two aligned
+// words, then find/replace the dash with nothing. The editable text shows
+// `say\q1 The`, and the marker-stripped text the engine diffs reads `say The`,
+// but that space exists only in the stripped text (stripMarkerTokens adds it so
+// the two words don't fuse); the tree holds `sayThe`. A word inserted at the
+// line start took that space as its own separator, so `"Word ` saved as
+// `“WordThe` (#1286). (A word typed at the END of the previous line fuses the
+// same way on the other side, `sayWord`: #1294.)
+{
+  console.log("\n[Case 83] Word inserted beside a marker with no text on either side keeps its space (#1286)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const chunks = (content) => extractEditableText(content).replace(/\\q1/g, " ").trim().split(/\s+/).join(" ");
+  const save = (content, edit) => {
+    const old = extractEditableText(content);
+    const next = edit(old);
+    assert(next !== old, `edit changes the text (${JSON.stringify(old)})`);
+    return curlifyVerseContent(smartEditVerse(content, old, next, { capturedFromDom: true }).content);
+  };
+  const dashed = { verseObjects: [zaln("H0", [w("Then")]), t(" "), zaln("H1", [w("say")]), t("—"), zaln("H2", [w("The")]), t(" "), zaln("H3", [w("one")]), t(".")] };
+  const broken = save(dashed, (s) => s.replace("say", "say\\q1 "));
+  const plain = extractPlainText(broken);
+  const bare = findReplaceVerse(broken, plain, /—/g, plain.indexOf("—"), 1, "").content;
+  const shape = bare.verseObjects.map((n) => (n.tag === "zaln" ? n.strong : n.type === "text" ? JSON.stringify(n.text) : `\\${n.tag}`)).join(" ");
+  assert(shape === 'H0 " " H1 \\q1 H2 " " H3 "."', `setup: no text node either side of the marker (got ${shape})`);
+  for (const [label, edit, want] of [
+    ['"Word at the line start', (s) => s.replace("\\q1 The", '\\q1 "Word The'), "Then say “Word The one."],
+    ["—Word at the line start", (s) => s.replace("\\q1 The", "\\q1 —Word The"), "Then say —Word The one."],
+    ["(Word) at the line start", (s) => s.replace("\\q1 The", "\\q1 (Word) The"), "Then say (Word) The one."],
+    ["Word at the line start", (s) => s.replace("\\q1 The", "\\q1 Word The"), "Then say Word The one."],
+  ]) {
+    const out = save(bare, edit);
+    assert(chunks(out) === want, `${label}: ${JSON.stringify(want)} (got ${JSON.stringify(extractEditableText(out))})`);
+    assert(words(out) === "Then:H0|say:H1|Word:|The:H2|one:H3", `${label}: every old word keeps its alignment (got ${words(out)})`);
+  }
+  // The issue's own repro, on the synthetic shape.
+  const verse = { verseObjects: [zaln("H1", [w("say")]), { type: "quote", tag: "q1" }, zaln("H2", [w("The")]), t(" "), zaln("H3", [w("one")]), t(".")] };
+  const got = extractEditableText(save(verse, (s) => s.replace("The", '"Word The')));
+  assert(got === "say\\q1 “Word The one.", `issue repro: ${JSON.stringify("say\\q1 “Word The one.")} (got ${JSON.stringify(got)})`);
 }
 
 if (failed > 0) {
