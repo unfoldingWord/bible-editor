@@ -242,7 +242,7 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     "a refused single replace leads with the refusal, no \"replaced 0 verses\"",
   );
   check(
-    s(1, 0, 0, 2) === "replaced 1 verse — 2 verses not replaced: it would lose word alignment",
+    s(1, 0, 0, 2) === "replaced 1 verse — 2 verses not replaced: they would lose word alignment",
     "replace-all with refusals: counts saved and refused verses separately",
   );
   check(

@@ -163,8 +163,10 @@ interface Props {
     newContent: unknown,
     newPlainText: string,
     base: VerseDto,
-    // true when the save was queued; false when the alignment guard refused
-    // it (the caller shows the reason). Only queued verses count as replaced.
+    // false when the alignment guard refused the save (the caller shows the
+    // reason); true when it was handed to the outbox. A hand-off that later
+    // fails (read-only viewer, IndexedDB write error) still returns true.
+    // Only verses that returned true count as replaced.
   ) => boolean;
   // Replace target for translation notes — only the note BODY is rewritten
   // (id is the primary key, support_reference is a structured rc:// link, so

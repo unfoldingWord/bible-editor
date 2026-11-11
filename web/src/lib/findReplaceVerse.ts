@@ -112,7 +112,9 @@ export function bibleReplaceSummaryText(s: BibleReplaceCounts): string {
   }
   if (s.alignmentLost > 0) parts.push(`alignment milestones destroyed in ${s.alignmentLost}`);
   if (s.alignmentRefused > 0) {
-    parts.push(`${plural(s.alignmentRefused, "verse", "verses")} not replaced: it would lose word alignment`);
+    parts.push(
+      `${plural(s.alignmentRefused, "verse", "verses")} not replaced: ${s.alignmentRefused === 1 ? "it" : "they"} would lose word alignment`,
+    );
   }
   if (s.readOnlySkipped > 0) {
     parts.push(`${plural(s.readOnlySkipped, "match", "matches")} in UHB/UGNT skipped (read-only)`);
