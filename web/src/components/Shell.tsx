@@ -58,6 +58,7 @@ import { shouldApplyUpsert } from "./rowUpsertGuard";
 import { drafts, verseKey, rowKey as draftRowKey, pinVerseBase, pinEpoch, unpinVerseBaseIfIdle, holdVerseBaseForEditor, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
+import { adoptBaseQuotes, curlifyVerseContent } from "../lib/curlyVerse";
 import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, SECTION_HEADER_TAGS } from "../lib/usfm";
 import { chapterOpensWithoutMarker, introEditBase } from "../lib/verseIntro";
 import { verseHasUnalignedWork, countUnalignedTargetWords } from "../lib/alignment";
@@ -4218,6 +4219,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const pinned = pinVerseBase(key, base);
     const effectiveBase = { ...base, version: pinned.version, content: pinned.content } as VerseDto;
     const oldEditable = extractEditableText(effectiveBase.content);
+    // Saves curl straight quotes (below), so a ' typed or shown where the verse
+    // already has ’ is not a real edit. Read it as unchanged, or the engine
+    // rewrites everything between it and the real edit and drops those words'
+    // alignment (#1273). `plain` itself stays raw: the draft lookups below
+    // match against it.
+    const typedEditable = adoptBaseQuotes(oldEditable, normalizeEditable(plain));
     // No-op guard: a focus/blur (or any save) with no actual text change must
     // not enqueue a PATCH — it would bump the verse version server-side for
     // nothing, adding noisy history and leaving a stale expected_version that a
@@ -4231,7 +4238,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // and only cleared by the outbox-200 listener, so returning without clearing
     // leaves an orphaned draft (dirty border + SyncStatusBar entry + "unsaved
     // edits" toast whose Save button re-hits this guard and never resolves).
-    if (oldEditable === normalizeEditable(plain)) {
+    if (oldEditable === typedEditable) {
       // The pin as of this no-op: a pin taken or handed on after it (a new
       // keystroke, a save queued meanwhile) is not this release's to drop.
       const epoch = pinEpoch(key);
@@ -4254,11 +4261,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       afterCommit?.({ queued: false });
       return;
     }
-    // `plain` is raw DOM textContent, so the dropped-marker-chip guard applies
-    // here and only here — see smartEditVerse's `capturedFromDom` (#606).
-    const result = smartEditVerse(effectiveBase.content, oldEditable, plain, {
+    // `typedEditable` comes from the DOM capture (normalized, which the engine
+    // does itself first anyway), so the dropped-marker-chip guard applies here
+    // and only here — see smartEditVerse's `capturedFromDom` (#606).
+    const engineResult = smartEditVerse(effectiveBase.content, oldEditable, typedEditable, {
       capturedFromDom: true,
     });
+    // Curl any straight quote left in the verse (#1273): the typing
+    // interceptor misses multi-character inserts, IME, drops and Copy T4T to
+    // UST. Done on the engine's result, never on the typed text, which would
+    // stop an untouched `baby's` matching its aligned word. Only `.text`
+    // changes, so alignment and word counts are unaffected.
+    const result = { ...engineResult, content: curlifyVerseContent(engineResult.content) };
     // Heads-up when this save drops alignment. Editing a word's text or order
     // unaligns that word by design — the engine preserves only the words it
     // didn't have to touch — and the loss is otherwise easy to miss: the editor
