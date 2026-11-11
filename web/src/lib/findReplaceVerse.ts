@@ -56,7 +56,7 @@ export function findReplaceVerse(
   matchLenInPlain: number,
   replaceText: string,
 ): SmartReplaceResult {
-  const result = smartReplaceVerse(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText);
+  const result = smartReplaceVerse(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, { findReplace: true });
   return finalizeFindReplace(content, plainText, result);
 }
 
@@ -87,7 +87,7 @@ export function replaceAllInVerse(
     localRe.lastIndex = from;
     const next = localRe.exec(curPlain);
     if (!next) break;
-    const result = smartReplaceVerse(curContent, curPlain, regex, next.index, next[0].length, replaceText);
+    const result = smartReplaceVerse(curContent, curPlain, regex, next.index, next[0].length, replaceText, { findReplace: true });
     // Re-scan the tree's own plain text, as the first step scanned the stored
     // one. The engine's plainText adds nothing at a line marker with no text
     // node beside it (`namethis` for `name \q1 this`), so the next step's

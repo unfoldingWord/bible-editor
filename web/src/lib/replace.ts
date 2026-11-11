@@ -1197,8 +1197,13 @@ export function smartReplaceVerse(
   matchStartInPlain: number,
   matchLenInPlain: number,
   replaceText: string,
+  // Find/replace callers (findReplaceVerse.ts) pass `findReplace: true`: a
+  // whitespace-only match at a bare marker is then a no-op (see the Impl).
+  // Typed saves (smartEditVerse) don't, so a character typed beside the chip
+  // keeps the old placement instead of being dropped.
+  options: { findReplace?: boolean } = {},
 ): SmartReplaceResult {
-  const result = smartReplaceVerseImpl(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText);
+  const result = smartReplaceVerseImpl(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options);
   const verseObjectsOut = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (Array.isArray(verseObjectsOut)) {
     // Also drop any \zaln milestone left with no \w word, as smartEditVerse's
@@ -1227,6 +1232,7 @@ function smartReplaceVerseImpl(
   matchStartInPlain: number,
   matchLenInPlain: number,
   replaceText: string,
+  options: { findReplace?: boolean },
 ): SmartReplaceResult {
   const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
   // No verseObjects to work with — just rebuild the verse from the new
@@ -1256,14 +1262,19 @@ function smartReplaceVerseImpl(
   // don't line up (a stale stored plain text, or `\sp` label text that raw keeps
   // and extractPlainText skips), it falls back to the old occurrence count, which
   // counts in raw and so can still land on such text.
-  const located = locatePlainRangeInRaw(plainText, raw, matchStartInPlain, matchLenInPlain);
+  const mapped = locatePlainRangeInRaw(plainText, raw, matchStartInPlain, matchLenInPlain);
   // A whitespace-only match at a marker with no text node beside it: the space
   // is in the plain text only (the marker is the separator), so the tree has
-  // nothing to replace. Leave the verse as it is; counting occurrences instead
-  // would pick some other whitespace in raw, or none and flatten the verse.
-  if (located && located.end === located.start) {
+  // nothing to replace. For find/replace, leave the verse as it is; counting
+  // occurrences instead would pick some other whitespace in raw, or none and
+  // flatten the verse. A typed save gets here when a character is typed right
+  // after the line-break chip (the stripped-only space -> `—`); a no-op would
+  // drop it, so it keeps the old occurrence count, as before #1307.
+  const emptyAtSeam = mapped !== null && mapped.end === mapped.start;
+  if (emptyAtSeam && options.findReplace) {
     return { content, plainText, preservedAlignment: true };
   }
+  const located = emptyAtSeam ? null : mapped;
   // Raw can contain `\n` (or multi-space) where plainText has a single space —
   // notably around `{...}` word-addition markers and across line-broken
   // `\w` tokens. The strict regex was derived from normalized plainText, so
