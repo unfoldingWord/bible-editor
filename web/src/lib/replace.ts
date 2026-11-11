@@ -2140,6 +2140,41 @@ function reconcileMarkers(content: unknown, newPlain: string): SmartReplaceResul
     else kids.shift();
     return closing;
   };
+  // The mirror of pullLeadingClosing: text that trails the PREVIOUS milestone's
+  // last word but was typed AFTER the marker belongs to the new line. The
+  // punctuation relayout writes a whole inter-word gap into the first text leaf
+  // it finds, so an opener typed at the start of a `\q1` line lands in the
+  // previous milestone's own trailing comma leaf (`H1[say ",“"]`), before the
+  // marker, and the save-time curl then reads it as a closing quote (#1282).
+  // Split that trailing run at `leadPunct` (what the translator typed before the
+  // marker); keep the prefix in the milestone and return the rest for the caller
+  // to emit after the marker. Returns "" (node untouched) when the typed
+  // position can't be matched or nothing but whitespace would move.
+  const pullTrailingAfterLead = (node: unknown, leadPunct: string): string => {
+    const top = (node as { children?: unknown } | null)?.children;
+    if (isBareText(node) || !Array.isArray(top)) return "";
+    let kids: unknown[] = top;
+    // Descend into a nested milestone that ends the node (`H1[H2[w ","]]`).
+    while (kids.length > 0 && !isBareText(kids[kids.length - 1])) {
+      const inner = (kids[kids.length - 1] as { children?: unknown } | null)?.children;
+      if (!Array.isArray(inner)) return "";
+      kids = inner;
+    }
+    let first = kids.length;
+    while (first > 0 && isBareText(kids[first - 1])) first--;
+    if (first === kids.length || first === 0) return "";
+    const leaves = kids.slice(first) as { text: string }[];
+    const trailing = leaves.map((l) => l.text).join("");
+    let keep = splitAtLead(trailing, leadPunct);
+    if (keep < 0 || trailing.slice(keep).trim() === "") return "";
+    const moved = trailing.slice(keep);
+    for (const leaf of leaves) {
+      const kept = leaf.text.slice(0, keep);
+      keep -= kept.length;
+      leaf.text = kept;
+    }
+    return moved;
+  };
   const out: unknown[] = [];
   let wordCount = 0;
   let mi = 0;
@@ -2154,11 +2189,21 @@ function reconcileMarkers(content: unknown, newPlain: string): SmartReplaceResul
       // breaks the line right before it. If this node's leading text is closing
       // punctuation that belongs to the PREVIOUS line (the no-gap milestone shape
       // above), pull it out and emit it BEFORE the marker so it stays on that line.
+      // Likewise, text trailing the previous node that was typed AFTER the
+      // marker moves past it. Only when the marker anchors exactly at that
+      // node's end (not inside a multi-word milestone it merely lands after),
+      // and never together with pullLeadingClosing, which would swap the two
+      // runs' order in the text.
+      let opening = "";
       if (flushable()) {
-        const closing = pullLeadingClosing(node, markers[mi].leadPunct);
+        if (markers[mi].wordsBefore === wordCount && out.length > 0) {
+          opening = pullTrailingAfterLead(out[out.length - 1], markers[mi].leadPunct);
+        }
+        const closing = opening ? "" : pullLeadingClosing(node, markers[mi].leadPunct);
         if (closing) out.push({ type: "text", text: closing });
       }
       while (flushable()) out.push(markers[mi++].node);
+      if (opening) out.push({ type: "text", text: opening });
       out.push(node);
       wordCount += nodeWords;
       ni++;
