@@ -11,7 +11,8 @@
 
 import assert from "node:assert/strict";
 import { bibleReplaceSummaryText, finalizeFindReplace, findReplaceVerse, replaceAllInVerse } from "./findReplaceVerse.ts";
-import { smartReplaceVerse } from "./replace.ts";
+import { smartEditVerse, smartReplaceVerse } from "./replace.ts";
+import { curlifyVerseContent } from "./curlyVerse.ts";
 import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { rebaseVersePatch } from "../sync/verseRebase.ts";
 
@@ -228,6 +229,73 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   const a = findReplaceVerse(verse, "he sees clearly", /sees/g, 3, 4, "saw");
   const b = smartReplaceVerse(verse, "he sees clearly", /sees/g, 3, 4, "saw");
   check(JSON.stringify(a) === JSON.stringify(b), "same content, plainText and preservedAlignment");
+}
+
+// #1305: a line marker with no text node on either side (`H1[name] \q1
+// H2[this]`) separates two words only by being a marker. The engine's own
+// plainText adds nothing at a marker, so the saved plain_text read
+// `my namethis is` (ZEC 10:12 ULT, after removing the dash in `name\q1 —this`).
+// The saved plain text must be the tree's, as every other verse save stores.
+{
+  console.log("\n[#1305] find/replace beside a bare line marker saves the tree's plain text");
+  // As the app builds it: a line break typed after `name`, before the dash.
+  const unbroken = {
+    verseObjects: [
+      zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), t("—"), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("is")]), t("."),
+    ],
+  };
+  const typed = extractEditableText(unbroken);
+  const dashed = curlifyVerseContent(
+    smartEditVerse(unbroken, typed, typed.replace("name", "name\\q1 "), { capturedFromDom: true }).content,
+  );
+  check(extractEditableText(dashed) === "my name\\q1 —this is.", `setup: line break before the dash (got ${JSON.stringify(extractEditableText(dashed))})`);
+  const plain = extractPlainText(dashed);
+  check(plain === "my name —this is.", `setup: stored plain text (got ${JSON.stringify(plain)})`);
+  const one = findReplaceVerse(dashed, plain, /—/g, plain.indexOf("—"), 1, "");
+  const shape = one.content.verseObjects
+    .map((n) => (n.tag === "zaln" ? n.strong : n.type === "text" ? JSON.stringify(n.text) : `\\${n.tag}`))
+    .join(" ");
+  check(shape === 'H0 " " H1 \\q1 H2 " " H3 "."', `setup: no text node either side of the marker (got ${shape})`);
+  check(one.plainText === "my name this is.", `replace: plain text keeps the words apart (got ${JSON.stringify(one.plainText)})`);
+  check(one.plainText === extractPlainText(one.content), "replace: plain text is the saved tree's");
+  const all = replaceAllInVerse(dashed, plain, /—/g, 1, "");
+  check(all.plainText === "my name this is.", `replace all: plain text keeps the words apart (got ${JSON.stringify(all.plainText)})`);
+  check(all.plainText === extractPlainText(all.content), "replace all: plain text is the saved tree's");
+  // The bare-marker verse as now stored: a replace that changes nothing, and
+  // a replace all with no match, stay no-ops (the overlay compares plainText
+  // with the stored plain text).
+  const stored = one.content;
+  const storedPlain = extractPlainText(stored);
+  const same = findReplaceVerse(stored, storedPlain, /this/g, storedPlain.indexOf("this"), 4, "this");
+  check(same.plainText === storedPlain, `same-text replace is a no-op (got ${JSON.stringify(same.plainText)})`);
+  const none = replaceAllInVerse(stored, storedPlain, /zzz/g, 1, "x");
+  check(none.plainText === storedPlain && none.content === stored, "replace all with no match is a no-op");
+  // A row saved before the fix stores the fused text: still a no-op.
+  const fused = "my namethis is.";
+  const legacy = findReplaceVerse(stored, fused, /this/g, fused.indexOf("this"), 4, "this");
+  check(legacy.plainText === fused, `same-text replace on a fused stored row is a no-op (got ${JSON.stringify(legacy.plainText)})`);
+  // The stored plain text now has a space the engine's own text lacks: a
+  // match after the marker must still land on the right characters.
+  const after = findReplaceVerse(stored, storedPlain, /this/g, storedPlain.indexOf("this"), 4, "that");
+  check(after.plainText === "my name that is.", `replace after the marker (got ${JSON.stringify(after.plainText)})`);
+  // Alignment as the same replace leaves it in a verse with no marker (the
+  // replaced word itself is new, so it is unaligned there too).
+  const flat = {
+    verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), t(" "), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("is")]), t(".")],
+  };
+  const flatPlain = extractPlainText(flat);
+  const flatAfter = alignedWords(findReplaceVerse(flat, flatPlain, /this/g, flatPlain.indexOf("this"), 4, "that").content).join(" ");
+  check(
+    alignedWords(after.content).join(" ") === flatAfter,
+    `replace after the marker: alignment as without the marker, ${flatAfter} (got ${alignedWords(after.content).join(" ")})`,
+  );
+  const twice = replaceAllInVerse(stored, storedPlain, /is/g, 2, "as");
+  check(twice.plainText === "my name thas as.", `replace all, two matches after the marker (got ${JSON.stringify(twice.plainText)})`);
+  const flatTwice = alignedWords(replaceAllInVerse(flat, flatPlain, /is/g, 2, "as").content).join(" ");
+  check(
+    alignedWords(twice.content).join(" ") === flatTwice,
+    `replace all: alignment as without the marker, ${flatTwice} (got ${alignedWords(twice.content).join(" ")})`,
+  );
 }
 
 // #1285: the summary counts only verses queued for save. A verse the save's
