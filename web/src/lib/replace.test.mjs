@@ -3349,6 +3349,64 @@ function countAllMilestones(nodes) {
   }
 }
 
+// Case 87: find/replace beside a marker with no text node on either side (the
+// Case 83 shape, `H1[name] \q1 H2[this]`) edits the match the translator
+// picked (#1307). The stored plain text reads `name this` (extractPlainText
+// puts a space at the marker), but the engine's raw text joins the leaves as
+// `namethis`. It counted the match's occurrence in the plain text and took
+// that occurrence in raw, so `et` (visible only in `set`) matched across the
+// seam first and saved `my namat\q1 his set.`; a phrase spanning the marker
+// (`name this`) found nothing in raw and flattened the verse.
+{
+  console.log("\n[Case 87] Find/replace beside a marker with no text on either side edits the picked match (#1307)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const markers = (content) => (extractEditableText(content).match(/\\q1/g) ?? []).length;
+  // Build the bare-marker tree the way the app reaches it: a line break typed
+  // after `name`, before the dash, then the dash replaced with nothing.
+  const bareTree = (tail) => {
+    const dashed = { verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), t("—"), zaln("H2", [w("this")]), ...tail] };
+    const old = extractEditableText(dashed);
+    const broken = curlifyVerseContent(smartEditVerse(dashed, old, old.replace("name", "name\\q1 "), { capturedFromDom: true }).content);
+    const p = extractPlainText(broken);
+    return findReplaceVerse(broken, p, /—/g, p.indexOf("—"), 1, "").content;
+  };
+  const bare = bareTree([t(" "), zaln("H3", [w("set")]), t(".")]);
+  const shape = bare.verseObjects.map((n) => (n.tag === "zaln" ? n.strong : n.type === "text" ? JSON.stringify(n.text) : `\\${n.tag}`)).join(" ");
+  assert(shape === 'H0 " " H1 \\q1 H2 " " H3 "."', `setup: no text node either side of the marker (got ${shape})`);
+  const plain = extractPlainText(bare);
+  assert(plain === "my name this set.", `setup: stored plain text is spaced (got ${JSON.stringify(plain)})`);
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const one = (label, content, storedPlain, find, re, repl, wantEditable, wantWords, at = storedPlain.indexOf(find)) => {
+    for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+      const r = fn(clone(content), storedPlain, re, at, find.length, repl);
+      const ed = extractEditableText(r.content);
+      assert(ed === wantEditable, `${label} (${entry}): ${JSON.stringify(wantEditable)} (got ${JSON.stringify(ed)})`);
+      assert(markers(r.content) === markers(content), `${label} (${entry}): the line break survives`);
+      assert(words(r.content) === wantWords, `${label} (${entry}): untouched words keep their alignment (got ${words(r.content)})`);
+    }
+  };
+  // The issue's repro: `et` is visible only in `set`.
+  one("et -> at", bare, plain, "et", /et/g, "at", "my name\\q1 this sat.", "my:H0|name:H1|this:H2|sat:");
+  // A phrase spanning the marker keeps the marker and every untouched word.
+  one("name this -> name that", bare, plain, "name this", /name this/g, "name that", "my name\\q1 that set.", "my:H0|name:H1|that:|set:H3");
+  // A replacement the in-place paths can't take (it adds a word) reaches the
+  // localized rewrite, which counted occurrences the same way.
+  one("et -> a t (localized rewrite)", bare, plain, "et", /et/g, "a t", "my name\\q1 this sa t.", "my:H0|name:H1|this:H2|sa:|t:");
+  // A row saved before #1305 stores the fused text; the match the translator
+  // picked there is still the one edited.
+  const fused = "my namethis set.";
+  one("et -> at on a fused stored row", bare, fused, "et", /et/g, "at", "my name\\q1 this sat.", "my:H0|name:H1|this:H2|sat:", fused.lastIndexOf("et"));
+  // Replace all: two real matches after the marker, none across it.
+  {
+    const two = bareTree([t(" "), zaln("H3", [w("set")]), t(" "), zaln("H4", [w("met")]), t(".")]);
+    const p2 = extractPlainText(two);
+    const r = replaceAllInVerse(clone(two), p2, /et/g, 2, "at");
+    const ed = extractEditableText(r.content);
+    assert(ed === "my name\\q1 this sat mat.", `replace all et -> at: ${JSON.stringify("my name\\q1 this sat mat.")} (got ${JSON.stringify(ed)})`);
+    assert(words(r.content) === "my:H0|name:H1|this:H2|sat:|mat:", `replace all et -> at: untouched words keep their alignment (got ${words(r.content)})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
