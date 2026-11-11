@@ -16,10 +16,12 @@
 // exactly. Curling the typed string first would turn an untouched `baby's`
 // into `baby’s`, the engine would treat it as an edited word and drop its
 // alignment, and the save guard would not notice. Curling the result tree
-// changes only `.text` strings: no node is added, removed or moved, and the
-// tokenizer treats ' and ’ alike, so word counts and alignment are unchanged.
+// changes only `.text` strings, and the tokenizer treats ' and ’ alike, so
+// word counts and alignment are unchanged. The one move afterwards is the
+// engine's own opening-quote hoist (#1278): no \w word or milestone changes.
 
 import { renumberTargetOccurrences } from "./replace.ts";
+import { hoistOpeningPunctuation } from "./openingPunct.ts";
 
 const CURLY_LDQUO = "“";
 const CURLY_RDQUO = "”";
@@ -163,11 +165,20 @@ export function adoptBaseQuotes(base: string, typed: string): string {
 // Occurrences are renumbered afterwards: the engine numbers them before the
 // curl, so `don’t` plus a typed `don't` would otherwise stay two "don’t 1/1",
 // and the aligner keys target tokens by text|occurrence (the EZK 12:3 bug).
+//
+// The opening-quote hoist runs again on the curled tree (#1278). The engine
+// hoists an opener out of the preceding word's \zaln milestone (#777), but it
+// only recognizes curly openers, and a pasted `"` reaches it straight: a
+// straight `"` pasted before an aligned word whose milestone ends in its own
+// comma stayed there as `, "` and was curled in place to `, “`, which Door43
+// renders with a space after the quote. The hoist keeps its own rules (never
+// across a \q/\p marker) and is idempotent, so content the engine already
+// laid out is unchanged.
 export function curlifyVerseContent<T>(content: T): T {
   const vo = (content as { verseObjects?: unknown } | null)?.verseObjects;
   if (!Array.isArray(vo) || !hasStraightQuoteText(vo)) return content;
   const copy = structuredClone(content) as T & { verseObjects: unknown[] };
   curlifyVerseObjectsInPlace(copy.verseObjects);
-  copy.verseObjects = renumberTargetOccurrences(copy.verseObjects);
+  copy.verseObjects = renumberTargetOccurrences(hoistOpeningPunctuation(copy.verseObjects));
   return copy;
 }

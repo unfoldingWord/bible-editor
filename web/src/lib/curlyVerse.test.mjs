@@ -164,6 +164,101 @@ console.log("a ' typed (or still shown) where the saved verse has ’, plus an e
   assert(r2 !== null && r2.plain === "the baby‘s toy is red.", "a deliberate ’ → ‘ change is still saved");
 }
 
+// #1278: the engine moves an opening quote out of the preceding word's \zaln
+// milestone (hoistOpeningPunctuation, #777), but only a curly one. A straight
+// quote reaches the engine as typed and is curled afterwards, so it has to end
+// up in the same place a typed curly quote would: glued to the word after it,
+// as top-level text, never as trailing text inside the previous milestone.
+function strandedOpener(nodes) {
+  for (const n of nodes ?? []) {
+    if (!n || n.type !== "milestone" || n.tag !== "zaln" || !Array.isArray(n.children)) continue;
+    const flat = [];
+    const flatten = (kids) => {
+      for (const k of kids) {
+        if (!k || typeof k !== "object") continue;
+        if (k.type === "word" && k.tag === "w") flat.push(null);
+        else if (k.type === "text") flat.push(k.text ?? "");
+        else if (Array.isArray(k.children)) flatten(k.children);
+      }
+    };
+    flatten(n.children);
+    const trailing = flat.slice(flat.lastIndexOf(null) + 1).join("");
+    if (/[“‘"']/.test(trailing)) return `${n.strong} ends with ${JSON.stringify(trailing)}`;
+    const inner = strandedOpener(n.children);
+    if (inner) return inner;
+  }
+  return null;
+}
+
+console.log("pasted straight opening quote lands where a typed curly one would (#1278)");
+{
+  // H1 holds its comma inside the milestone (the JER 31:18 shape, #777).
+  const commaInside = () => ({
+    verseObjects: [
+      zaln("H1", [w("say"), t(",")]), t(" "), zaln("H2", [w("The")]), t(" "), zaln("H3", [w("one")]), t("."),
+    ],
+  });
+  const commaOutside = () => ({
+    verseObjects: [
+      zaln("H1", [w("say")]), t(", "), zaln("H2", [w("The")]), t(" "), zaln("H3", [w("one")]), t("."),
+    ],
+  });
+  const cases = [
+    ["\"The pasted over The, comma inside H1", commaInside, "say, \"The one.", "say, “The one.", "say@H1 The@H2 one@H3"],
+    ["'The pasted over The, comma inside H1", commaInside, "say, 'The one.", "say, ‘The one.", "say@H1 The@H2 one@H3"],
+    ["\"The pasted over The, comma outside H1", commaOutside, "say, \"The one.", "say, “The one.", "say@H1 The@H2 one@H3"],
+    [" \"Go inserted after say, (the issue's shape)", commaInside, "say, \"Go The one.", "say, “Go The one.", "say@H1 Go@- The@H2 one@H3"],
+    [" \"Go inserted after say (no comma)", () => ({
+      verseObjects: [zaln("H1", [w("He")]), t(" "), zaln("H2", [w("said")]), t(" "), zaln("H3", [w("Turn")]), t(".")],
+    }), "He said \"Go Turn.", "He said “Go Turn.", "He@H1 said@H2 Go@- Turn@H3"],
+  ];
+  for (const [label, mk, straight, curly, words] of cases) {
+    const r = saveEdit(mk(), straight);
+    const rc = saveEdit(mk(), curly);
+    assert(r.plain === curly, `${label}: plain curled (got ${JSON.stringify(r.plain)})`);
+    const stranded = strandedOpener(r.content.verseObjects);
+    assert(stranded === null, `${label}: no opener left inside a milestone (${stranded})`);
+    assert(
+      JSON.stringify(r.content) === JSON.stringify(rc.content),
+      `${label}: same tree as typing the curly quote (got ${JSON.stringify(r.content.verseObjects)}, want ${JSON.stringify(rc.content.verseObjects)})`,
+    );
+    assert(alignedWords(r.content).join(" ") === words, `${label}: alignment kept (got ${alignedWords(r.content).join(" ")})`);
+    assert(!guardBlocksSave(r.delta, "text_edit"), `${label}: save guard does not block`);
+  }
+}
+
+console.log("a straight opener is never moved across a \\q1 marker (#1278)");
+{
+  // Hand-built: the opener is stranded in H1 with a line-break marker after
+  // it. The hoist's rule is never to move text across a line break, so the
+  // curled “ stays in H1 (left for a hand fix, as for a typed curly quote).
+  const content = {
+    verseObjects: [zaln("H1", [w("say"), t(", \"")]), q("q1"), zaln("H2", [w("The")]), t(".")],
+  };
+  const out = curlifyVerseContent(content);
+  assert(
+    JSON.stringify(out.verseObjects) ===
+      JSON.stringify([zaln("H1", [w("say"), t(", “")]), q("q1"), zaln("H2", [w("The")]), t(".")]),
+    `“ curled in place, not moved past \\q1 (got ${JSON.stringify(out.verseObjects)})`,
+  );
+}
+
+console.log("curlifyVerseContent hoists a curled opener stranded in a milestone (#1278)");
+{
+  // usfm-js keeps the newline between milestones as its own text node; the
+  // opener steps over it so it stays glued to the next \zaln-s (#777).
+  const content = {
+    verseObjects: [zaln("H1", [w("say"), t(", \"")]), t("\n"), zaln("H2", [w("The")]), t(".")],
+  };
+  const out = curlifyVerseContent(content);
+  assert(
+    JSON.stringify(out.verseObjects) ===
+      JSON.stringify([zaln("H1", [w("say")]), t(",\n“"), zaln("H2", [w("The")]), t(".")]),
+    `“ moved out of H1 and glued to H2 (got ${JSON.stringify(out.verseObjects)})`,
+  );
+  assert(content.verseObjects[0].children[1].text === ", \"", "input is not mutated");
+}
+
 console.log("curlifyVerseContent leaves curled content alone");
 {
   const content = { verseObjects: [zaln("H1", [w("baby’s")]), t(" “ok”")] };
