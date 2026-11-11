@@ -2297,6 +2297,77 @@ function reconcileMarkers(content: unknown, newPlain: string): SmartReplaceResul
   };
 }
 
+// After reconcileMarkers: put back a word separator the edit lost at a seam
+// between two top-level nodes (#1294). A marker with no text node on either side
+// (`H1[say] \q1 H2[The]`) reads `say The` in the stripped text, but that space
+// exists only there (stripMarkerTokens adds it). A word typed at the END of the
+// line (`say Word\q1 The`) diffs with the common prefix claiming that space as
+// its separator, and once the marker moves past the new word nothing in the tree
+// separates it from `say`: it saved as `sayWord`. Only a seam between two
+// adjacent content nodes (no marker between them) whose texts fuse into one
+// token is touched, and only where `newStripped` has whitespace at that spot, so
+// a stored `H1[Yahweh] "’s"` stays joined. If the run after the seam ends in a
+// whitespace-only text node right before a marker the translator typed with no
+// space before it, that node is the misplaced separator and moves to the seam;
+// otherwise a new " " goes in. Returns null when nothing changes, or when the
+// tree's text and `newStripped` disagree outside whitespace.
+function separateFusedSeams(verseObjects: unknown[], newStripped: string, layout: string): unknown[] | null {
+  const isLayoutMarker = (n: unknown): boolean =>
+    isInFlowMarker(n) && !isCharacterWrapper(n) && !isAcrosticHeading(n);
+  const isWS = (c: string): boolean => /\s/.test(c);
+  const raws = verseObjects.map(rawTextOfNode);
+  const starts: number[] = [];
+  let raw = "";
+  for (const r of raws) {
+    starts.push(raw.length);
+    raw += r;
+  }
+  // wsBefore[i]: newStripped has whitespace right before the non-whitespace
+  // char that raw[i] matches.
+  const wsBefore: boolean[] = [];
+  let s = 0;
+  for (let i = 0; i < raw.length; i++) {
+    if (isWS(raw[i])) continue;
+    let sawWS = false;
+    while (s < newStripped.length && isWS(newStripped[s])) {
+      sawWS = true;
+      s++;
+    }
+    if (newStripped[s] !== raw[i]) return null;
+    wsBefore[i] = sawWS;
+    s++;
+  }
+  if (newStripped.slice(s).trim() !== "") return null;
+
+  const tokens = [...layout.matchAll(new RegExp(MARKER_TOKEN_RE.source, MARKER_TOKEN_RE.flags))];
+  const insertBefore = new Map<number, unknown>();
+  const removed = new Set<number>();
+  for (let i = 0; i + 1 < verseObjects.length; i++) {
+    if (isLayoutMarker(verseObjects[i]) || isLayoutMarker(verseObjects[i + 1])) continue;
+    if (!raws[i] || !raws[i + 1] || !joinWouldFuse(raws[i], raws[i + 1])) continue;
+    if (!wsBefore[starts[i + 1]]) continue;
+    // The first layout marker after the seam; reconcileMarkers emits them in
+    // layout order, so its ordinal finds its token in the typed layout.
+    let m = i + 2;
+    while (m < verseObjects.length && !isLayoutMarker(verseObjects[m])) m++;
+    const ws = verseObjects[m - 1] as { type?: unknown; text?: unknown } | undefined;
+    const token = tokens[verseObjects.slice(0, m).filter(isLayoutMarker).length];
+    const movable =
+      m < verseObjects.length && m - 1 > i + 1 && !removed.has(m - 1) &&
+      ws?.type === "text" && typeof ws.text === "string" && ws.text.trim() === "" &&
+      !!token && (token.index ?? 0) > 0 && !isWS(layout[(token.index ?? 0) - 1]);
+    if (movable) removed.add(m - 1);
+    insertBefore.set(i + 1, movable ? ws : { type: "text", text: " " });
+  }
+  if (insertBefore.size === 0) return null;
+  const out: unknown[] = [];
+  verseObjects.forEach((node, k) => {
+    if (insertBefore.has(k)) out.push(insertBefore.get(k));
+    if (!removed.has(k)) out.push(node);
+  });
+  return out;
+}
+
 // Top-level entry point for "the user just typed in a contentEditable
 // representation of this verse's plain text — please update the
 // verseObjects without nuking alignment for unchanged parts."
@@ -2520,9 +2591,12 @@ export function smartEditVerse(
     const rc = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
     const preReconcile = Array.isArray(rc) ? { verseObjects: pruneDeadMilestones(rc) } : result.content;
     const reconciled = reconcileMarkers(preReconcile, markerLayout);
+    // A word that now ends a line can sit glued to the word before it (#1294).
+    const rv = (reconciled.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    const separated = Array.isArray(rv) ? separateFusedSeams(rv, newStripped, markerLayout) : null;
     result = {
-      content: reconciled.content,
-      plainText: reconciled.plainText,
+      content: separated ? { verseObjects: separated } : reconciled.content,
+      plainText: separated ? normalize(rebuildRaw(separated)) : reconciled.plainText,
       preservedAlignment: result.preservedAlignment,
     };
   }
