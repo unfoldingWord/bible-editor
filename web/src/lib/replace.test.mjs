@@ -18,7 +18,7 @@ import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 import { OPENING_PUNCT_RE } from "./openingPunct.ts";
 import { curlifyVerseContent } from "./curlyVerse.ts";
-import { findReplaceVerse } from "./findReplaceVerse.ts";
+import { findReplaceVerse, replaceAllInVerse } from "./findReplaceVerse.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -3093,6 +3093,63 @@ function countAllMilestones(nodes) {
   const verse = { verseObjects: [zaln("H1", [w("say")]), { type: "quote", tag: "q1" }, zaln("H2", [w("The")]), t(" "), zaln("H3", [w("one")]), t(".")] };
   const got = extractEditableText(save(verse, (s) => s.replace("The", '"Word The')));
   assert(got === "say\\q1 “Word The one.", `issue repro: ${JSON.stringify("say\\q1 “Word The one.")} (got ${JSON.stringify(got)})`);
+}
+
+// Case 84: find/replace must not leave a \zaln milestone that wraps no \w word
+// (#1296). Deleting the comma from `H1[say ", "] \q1` drops to the localized
+// rewrite, which split H1 into `H1[say]` + `H1[" "]`; usfm-js exports the second
+// as a dangling `\zaln-s …\* \zaln-e\*`. smartEditVerse prunes that shape, the
+// find/replace path did not. The leftover whitespace must stay as bare text so
+// the words on either side don't fuse.
+{
+  console.log("\n[Case 84] Find/replace leaves no word-less \\zaln milestone (#1296)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const deadZaln = (nodes) =>
+    (nodes ?? []).some((n) => {
+      if (!n || !Array.isArray(n.children)) return false;
+      if (n.tag === "zaln" && alignedWords({ verseObjects: n.children }).length === 0) return true;
+      return deadZaln(n.children);
+    });
+  const check = (label, r, wantPlain, wantWords) => {
+    const vo = r.content.verseObjects;
+    assert(!deadZaln(vo), `${label}: no \\zaln milestone without a \\w word (got ${JSON.stringify(vo)})`);
+    const qi = vo.findIndex((n) => n.tag === "q1");
+    if (qi >= 0) {
+      assert(vo[qi - 1]?.type === "text" && vo[qi - 1]?.text === " ", `${label}: the space before \\q1 is a top-level text node (got ${JSON.stringify(vo[qi - 1])})`);
+    }
+    assert(r.plainText === wantPlain, `${label}: plain text ${JSON.stringify(wantPlain)} (got ${JSON.stringify(r.plainText)})`);
+    assert(extractPlainText(r.content) === r.plainText, `${label}: plainText matches the tree (got ${JSON.stringify(extractPlainText(r.content))})`);
+    assert(words(r.content) === wantWords, `${label}: every surviving word keeps its alignment (got ${words(r.content)})`);
+  };
+  // The issue's repro: replace-all of `,` on the Case 82 chain-1 tree.
+  const tail = () => [{ type: "quote", tag: "q1" }, zaln("H2", [w("The")]), t(" "), zaln("H3", [w("one")]), t(".")];
+  const stored = { verseObjects: [zaln("H0", [w("Then")]), t(" "), zaln("H1", [w("say"), t(",")]), t("\n"), ...tail()] };
+  const old = extractEditableText(stored);
+  const relaid = curlifyVerseContent(smartEditVerse(stored, old, old.replace("Then", "Then,"), { capturedFromDom: true }).content);
+  const rvo = relaid.verseObjects;
+  const rqi = rvo.findIndex((n) => n.tag === "q1");
+  const h1 = rvo[rqi - 1];
+  assert(
+    h1?.tag === "zaln" && h1.strong === "H1" && words({ verseObjects: [h1] }) === "say:H1" && h1.children.at(-1)?.text === ", ",
+    `setup: H1 holds say + ", " and sits right before \\q1 (got ${JSON.stringify(h1)})`,
+  );
+  const relaidPlain = extractPlainText(relaid);
+  check("replace-all of ,", replaceAllInVerse(relaid, relaidPlain, /,/g, 10, ""), "Then say The one.", "Then:H0|say:H1|The:H2|one:H3");
+  // The same tree built by hand, so the case doesn't depend on the save chain.
+  const direct = { verseObjects: [zaln("H0", [w("Then")]), t(" "), zaln("H1", [w("say"), t(", ")]), ...tail()] };
+  const dplain = extractPlainText(direct);
+  const ci = dplain.indexOf(",");
+  check("direct smartReplaceVerse", smartReplaceVerse(direct, dplain, /,/g, ci, 1, ""), "Then say The one.", "Then:H0|say:H1|The:H2|one:H3");
+  check("single findReplaceVerse", findReplaceVerse(direct, dplain, /,/g, ci, 1, ""), "Then say The one.", "Then:H0|say:H1|The:H2|one:H3");
+  // A deleted word whose milestone also held punctuation: the comma survives as
+  // bare text, outside any milestone.
+  const punct = { verseObjects: [zaln("H0", [w("Then")]), t(" "), zaln("H1", [w("say"), t(",")]), t(" "), zaln("H2", [w("The")]), t(" "), zaln("H3", [w("one")]), t(".")] };
+  const pplain = extractPlainText(punct);
+  const pr = smartReplaceVerse(punct, pplain, /say/g, pplain.indexOf("say"), 3, "");
+  assert(!deadZaln(pr.content.verseObjects), `deleted word: no \\zaln milestone without a \\w word (got ${JSON.stringify(pr.content.verseObjects)})`);
+  assert(/^Then ?, The one\.$/.test(pr.plainText), `deleted word: the comma survives and no words fuse (got ${JSON.stringify(pr.plainText)})`);
+  assert(extractPlainText(pr.content) === pr.plainText, `deleted word: plainText matches the tree (got ${JSON.stringify(extractPlainText(pr.content))})`);
+  assert(words(pr.content) === "Then:H0|The:H2|one:H3", `deleted word: every surviving word keeps its alignment (got ${words(pr.content)})`);
 }
 
 if (failed > 0) {

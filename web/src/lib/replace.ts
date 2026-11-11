@@ -1180,7 +1180,13 @@ export function smartReplaceVerse(
   const result = smartReplaceVerseImpl(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText);
   const verseObjectsOut = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (Array.isArray(verseObjectsOut)) {
-    const hoisted = renumberTargetOccurrences(pruneEmptyText(hoistOpeningPunctuation(verseObjectsOut)));
+    // Also drop any \zaln milestone left with no \w word, as smartEditVerse's
+    // final pass does: the localized rewrite splits a milestone around the
+    // change, and the after-half can hold only whitespace or punctuation
+    // (deleting the comma from `H1[say ", "] \q1` left `H1[" "]`), which
+    // usfm-js exports as a dangling `\zaln-s …\* \zaln-e\*` (#1296). Its
+    // children are kept as bare text, so the neighbouring words don't fuse.
+    const hoisted = renumberTargetOccurrences(pruneEmptyText(pruneDeadMilestones(hoistOpeningPunctuation(verseObjectsOut))));
     const newContent = { verseObjects: hoisted };
     // The hoist can change the verse's raw text (stepping an opener over a
     // sibling's leading whitespace — see openingPunct.ts), so `result.plainText`
