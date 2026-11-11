@@ -1404,7 +1404,10 @@ function smartReplaceVerseImpl(
     const first = affected[0];
     const last = affected[affected.length - 1];
     const plainLeaf = (l: Leaf) => isWordLeaf(l.node) || (l.node["type"] === "text" && !l.node["children"]);
-    if ((startsAtBoundary || plainLeaf(first)) && (endsAtBoundary || plainLeaf(last))) {
+    // Every leaf in the window must be plain: a marker carrying text (usfm-js
+    // parks a line-leading `“` on the `\q1` node) would have its text written
+    // into the first gap leaf, moving the opener before the line break.
+    if (affected.every(plainLeaf) && (startsAtBoundary || plainLeaf(first)) && (endsAtBoundary || plainLeaf(last))) {
       const widenedMatchWords = [...raw.slice(first.start, last.end).matchAll(WORD_RUN_RE)].map((m) => m[0]);
       const widenedReplace = raw.slice(first.start, rawStart) + replaceText + raw.slice(rawEnd, last.end);
       const widenedReplaceWords = [...widenedReplace.matchAll(WORD_RUN_RE)].map((m) => m[0]);

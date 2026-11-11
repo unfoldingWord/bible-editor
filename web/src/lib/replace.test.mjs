@@ -3196,6 +3196,22 @@ function countAllMilestones(nodes) {
   // The match edge lands inside the WORD leaf: the change is still punctuation only.
   punctOnly("yes. -> yes! (mid-word start)", "3", "9", "yes.", "yes!");
 
+  // A window that holds a marker carrying text (usfm-js parks a line-leading
+  // `“` on the `\q1` node) must not take the widened relayout: it would write
+  // the opener into the gap before the line break (review of #1292). It falls
+  // back to the old path, which the save guard refuses as before.
+  {
+    const tw = (text) => ({ text, tag: "w", type: "word", occurrence: "1", occurrences: "1" });
+    const tt = (text) => ({ type: "text", text });
+    const tz = (strong, children) => ({ tag: "zaln", type: "milestone", strong, children, endTag: "zaln-e\\*" });
+    const content = { verseObjects: [tz("H1", [tw("Armies")]), tt(":\n"), { tag: "q1", type: "quote", text: "“" }, tz("H2", [tw("I")]), tt(" "), tz("H3", [tw("go")]), tt(".”")] };
+    const plain = extractPlainText(content);
+    const i = plain.indexOf("s: “");
+    const r = smartReplaceVerse(content, plain, /s: “/g, i, 4, "s, “");
+    const ed = extractEditableText(r.content);
+    assert(!/“\\q1/.test(ed), `marker carrying an opener: the opener is not moved before the line break (got ${JSON.stringify(ed)})`);
+  }
+
   // Typing the same change already kept alignment (whole-verse relayout tier).
   {
     const content = verse("3", "9");
