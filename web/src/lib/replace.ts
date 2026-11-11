@@ -2140,6 +2140,54 @@ function reconcileMarkers(content: unknown, newPlain: string): SmartReplaceResul
     else kids.shift();
     return closing;
   };
+  // The mirror of pullLeadingClosing: text that trails the PREVIOUS milestone's
+  // last word but was typed AFTER the marker belongs to the new line. The
+  // punctuation relayout writes a whole inter-word gap into the first text leaf
+  // it finds, so an opener typed at the start of a `\q1` line lands in the
+  // previous milestone's own trailing comma leaf (`H1[say ",“"]`), before the
+  // marker, and the save-time curl then reads it as a closing quote (#1282).
+  // Split that trailing run at the first marker's `leadPunct` (what the
+  // translator typed before it); keep the prefix in the milestone. When several
+  // markers flush at this one anchor (`\q1 “\q2`), each later marker's
+  // `leadPunct` is the text typed between it and the marker before, so the rest
+  // is split the same way: pieces[k] is the text to emit right after marker k.
+  // Returns null (node untouched) when any typed position can't be matched,
+  // nothing but whitespace would move, or the run holds a letter or digit (a
+  // legacy word kept as a text leaf is never pulled out of its milestone).
+  const pullTrailingAfterLead = (node: unknown, leads: string[]): string[] | null => {
+    const top = (node as { children?: unknown } | null)?.children;
+    if (isBareText(node) || !Array.isArray(top)) return null;
+    let kids: unknown[] = top;
+    // Descend into a nested milestone that ends the node (`H1[H2[w ","]]`).
+    while (kids.length > 0 && !isBareText(kids[kids.length - 1])) {
+      const inner = (kids[kids.length - 1] as { children?: unknown } | null)?.children;
+      if (!Array.isArray(inner)) return null;
+      kids = inner;
+    }
+    let first = kids.length;
+    while (first > 0 && isBareText(kids[first - 1])) first--;
+    if (first === kids.length || first === 0) return null;
+    const leaves = kids.slice(first) as { text: string }[];
+    const trailing = leaves.map((l) => l.text).join("");
+    let keep = splitAtLead(trailing, leads[0]);
+    if (keep < 0) return null;
+    let rest = trailing.slice(keep);
+    if (rest.trim() === "" || /[\p{L}\p{N}]/u.test(rest)) return null;
+    const pieces: string[] = [];
+    for (let k = 1; k < leads.length; k++) {
+      const split = splitAtLead(rest, leads[k]);
+      if (split < 0) return null;
+      pieces.push(rest.slice(0, split));
+      rest = rest.slice(split);
+    }
+    pieces.push(rest);
+    for (const leaf of leaves) {
+      const kept = leaf.text.slice(0, keep);
+      keep -= kept.length;
+      leaf.text = kept;
+    }
+    return pieces;
+  };
   const out: unknown[] = [];
   let wordCount = 0;
   let mi = 0;
@@ -2154,11 +2202,27 @@ function reconcileMarkers(content: unknown, newPlain: string): SmartReplaceResul
       // breaks the line right before it. If this node's leading text is closing
       // punctuation that belongs to the PREVIOUS line (the no-gap milestone shape
       // above), pull it out and emit it BEFORE the marker so it stays on that line.
+      // Likewise, text trailing the previous node that was typed AFTER the
+      // marker moves past it. Only when the marker anchors exactly at that
+      // node's end (not inside a multi-word milestone it merely lands after),
+      // and never together with pullLeadingClosing, which would swap the two
+      // runs' order in the text.
+      let opening: string[] | null = null;
       if (flushable()) {
-        const closing = pullLeadingClosing(node, markers[mi].leadPunct);
+        if (markers[mi].wordsBefore === wordCount && out.length > 0) {
+          const leads: string[] = [];
+          for (let j = mi; j < markers.length && markers[j].wordsBefore <= wordCount; j++) {
+            leads.push(markers[j].leadPunct);
+          }
+          opening = pullTrailingAfterLead(out[out.length - 1], leads);
+        }
+        const closing = opening ? "" : pullLeadingClosing(node, markers[mi].leadPunct);
         if (closing) out.push({ type: "text", text: closing });
       }
-      while (flushable()) out.push(markers[mi++].node);
+      for (let k = 0; flushable(); k++) {
+        out.push(markers[mi++].node);
+        if (opening?.[k]) out.push({ type: "text", text: opening[k] });
+      }
       out.push(node);
       wordCount += nodeWords;
       ni++;
