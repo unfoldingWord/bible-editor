@@ -1548,6 +1548,61 @@ function countNodes(nodes) {
   assert(JSON.stringify(verseObjects) === before, "no-quote verse: byte-identical after the pass");
 }
 
+// #1277: a `\p` / `\q#` line marker starts a new line, so a quote right after
+// it opens even when the text before the marker ends in a comma or letter.
+// Shapes below are what usfm-js produces for an inline marker
+// (`said,\q1 "Turn back."`): no "\n" survives on the text before it, and the
+// opener is parked on the marker node's own `text`. Mirrors the web copy
+// (web/src/lib/curlyVerse.ts curlifyVerseObjectsInPlace).
+{
+  const verseObjects = [
+    { type: "text", text: "He said," },
+    { tag: "q1", type: "quote", text: '"Turn back."\n' },
+  ];
+  const changed = curlifyVerseObjects(verseObjects);
+  assert(changed === true, "\\q1 parked quote: reports a change");
+  assert(
+    verseObjects[1].text === "“Turn back.”\n",
+    `quote parked on a \\q1 marker after "said," opens (got ${JSON.stringify(verseObjects[1].text)})`,
+  );
+}
+{
+  const verseObjects = [
+    { type: "text", text: "He said," },
+    { tag: "p", type: "paragraph", text: '"Turn back."\n' },
+  ];
+  const changed = curlifyVerseObjects(verseObjects);
+  assert(changed === true, "\\p parked quote: reports a change");
+  assert(
+    verseObjects[1].text === "“Turn back.”\n",
+    `quote parked on a \\p marker after "said," opens (got ${JSON.stringify(verseObjects[1].text)})`,
+  );
+}
+{
+  const verseObjects = [
+    { type: "text", text: "He said," },
+    { tag: "p", nextChar: "\n", type: "paragraph" },
+    { type: "text", text: '"Turn back."' },
+  ];
+  const changed = curlifyVerseObjects(verseObjects);
+  assert(changed === true, "text node after \\p: reports a change");
+  assert(
+    verseObjects[2].text === "“Turn back.”",
+    `quote in a text node right after a bare \\p marker opens (got ${JSON.stringify(verseObjects[2].text)})`,
+  );
+}
+{
+  const verseObjects = [
+    { type: "text", text: "He said," },
+    { tag: "q1", type: "quote", text: "'Turn back.'\n" },
+  ];
+  curlifyVerseObjects(verseObjects);
+  assert(
+    verseObjects[1].text === "‘Turn back.’\n",
+    `single quote parked on a \\q1 marker opens (got ${JSON.stringify(verseObjects[1].text)})`,
+  );
+}
+
 // Ordering regression (found in independent review): curling can make two
 // `\w` nodes' text byte-identical — one already curly ("LORD’s"), one
 // AI-written straight ("LORD's") — and recomputeTargetOccurrences keys
