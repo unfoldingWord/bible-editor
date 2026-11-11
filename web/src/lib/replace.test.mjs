@@ -3390,8 +3390,15 @@ function countAllMilestones(nodes) {
   // A phrase spanning the marker keeps the marker and every untouched word.
   one("name this -> name that", bare, plain, "name this", /name this/g, "name that", "my name\\q1 that set.", "my:H0|name:H1|that:|set:H3");
   // A replacement the in-place paths can't take (it adds a word) reaches the
-  // localized rewrite, which counted occurrences the same way.
-  one("et -> a t (localized rewrite)", bare, plain, "et", /et/g, "a t", "my name\\q1 this sa t.", "my:H0|name:H1|this:H2|sa:|t:");
+  // localized rewrite, which counted occurrences the same way. It keeps the
+  // untouched `s` of `set` under H3, as it does in a verse with no marker.
+  one("et -> a t (localized rewrite)", bare, plain, "et", /et/g, "a t", "my name\\q1 this sa t.", "my:H0|name:H1|this:H2|s:H3|a:|t:");
+  {
+    const flat = { verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), t(" "), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(".")] };
+    const fp = extractPlainText(flat);
+    const r = smartReplaceVerse(flat, fp, /et/g, fp.indexOf("et"), 2, "a t");
+    assert(words(r.content) === "my:H0|name:H1|this:H2|s:H3|a:|t:", `et -> a t: the same alignment as in a verse with no marker (got ${words(r.content)})`);
+  }
   // A row saved before #1305 stores the fused text; the match the translator
   // picked there is still the one edited.
   const fused = "my namethis set.";

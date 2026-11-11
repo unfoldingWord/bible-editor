@@ -1242,18 +1242,29 @@ function smartReplaceVerseImpl(
     };
   }
 
-  // Determine which occurrence (1-based) the active match is, then find
-  // the corresponding occurrence in the raw verseObjects concatenation.
-  const occurrenceNum = countMatchesBefore(plainText, regex, matchStartInPlain) + 1;
   const cloned = cloneVerseObjects(verseObjects);
   const { raw, leaves } = walkLeaves(cloned);
+  // Locate the active match in the raw verseObjects concatenation by its
+  // position: walk the plain text and raw in lockstep (same characters, any
+  // whitespace). Counting the match's occurrence in the plain text and taking
+  // that occurrence in raw went wrong beside a line marker with no text node
+  // on either side (`H1[name] \q1 H2[this]`, #1307): the stored plain text
+  // reads `name this` (extractPlainText puts a space at the marker) but raw
+  // reads `namethis`, so `et` matched across the seam first and the save
+  // edited `name`/`this` instead of `set`, and a phrase spanning the marker
+  // found nothing in raw and flattened the verse. The occurrence count stays
+  // as the fallback for a plain text whose characters don't line up with raw
+  // (`\sp` label text, which raw keeps and extractPlainText skips).
+  const located = locatePlainRangeInRaw(plainText, raw, matchStartInPlain, matchLenInPlain);
   // Raw can contain `\n` (or multi-space) where plainText has a single space —
   // notably around `{...}` word-addition markers and across line-broken
   // `\w` tokens. The strict regex was derived from normalized plainText, so
   // when we search raw, treat each literal space as `\s+` so the same
   // structural match anchors regardless of internal whitespace.
   const rawRegex = relaxWhitespace(regex);
-  const rawMatch = nthMatchIn(raw, rawRegex, occurrenceNum);
+  const rawMatch = located
+    ? { index: located.start, length: located.end - located.start }
+    : nthMatchIn(raw, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1);
 
   // If the raw search yields nothing (normalization wiped a match, or
   // the match text spans an inline marker token like "\p " that has no
@@ -1273,7 +1284,21 @@ function smartReplaceVerseImpl(
 
   const rawStart = rawMatch.index;
   const rawEnd = rawStart + rawMatch.length;
-  const rawMatchText = raw.slice(rawStart, rawEnd);
+  // A match that crosses such a marker has a space in the plain text that raw
+  // lacks (`name this` against raw `namethis`). Read its words from the plain
+  // text, and keep a result only when its visible text is exactly the
+  // replacement and its line markers are all still there; otherwise fall to
+  // the next path, and last to the flat rebuild the old code reached here.
+  const plainMatchText = plainText.slice(matchStartInPlain, matchStartInPlain + matchLenInPlain);
+  const acrossSeam =
+    located !== null && raw.slice(rawStart, rawEnd).replace(/\s+/g, " ") !== plainMatchText.replace(/\s+/g, " ");
+  const rawMatchText = acrossSeam ? plainMatchText : raw.slice(rawStart, rawEnd);
+  const flatRebuild = (): SmartReplaceResult => {
+    const newPlain = normalize(plainText.slice(0, matchStartInPlain) + replaceText + plainText.slice(matchStartInPlain + matchLenInPlain));
+    return { content: { verseObjects: tokenizeEditableText(newPlain) }, plainText: newPlain, preservedAlignment: false };
+  };
+  const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null =>
+    r && (!acrossSeam || isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText)) ? r : null;
 
   // Smart in-place path requires:
   //   (a) match boundaries align with leaf boundaries — no mid-leaf splits;
@@ -1363,11 +1388,11 @@ function smartReplaceVerseImpl(
     }
     const verseObjectsOut = anyChanged ? stripLiftedMarkers(liftEditedOutOfZaln(cloned)) : cloned;
     const newRaw = rebuildRaw(verseObjectsOut);
-    return {
-      content: { verseObjects: verseObjectsOut },
-      plainText: normalize(newRaw),
-      preservedAlignment: true,
-    };
+    // `cloned` is edited in place, so a refused result can't fall through.
+    return (
+      keep({ content: { verseObjects: verseObjectsOut }, plainText: normalize(newRaw), preservedAlignment: true }) ??
+      flatRebuild()
+    );
   }
 
   // Single-leaf in-place edit: the change starts and ends within ONE word
@@ -1378,7 +1403,8 @@ function smartReplaceVerseImpl(
   // Same unalign rule as the preserve path: the edited leaf gets lifted
   // out of its `\zaln-s` ancestor — sibling content like `\qs` / `\f`
   // and the OTHER half of a multi-word milestone survive intact.
-  if (affected.length === 1 && isWordLeaf(affected[0].node)) {
+  // (Not across a seam: the match there holds a space the leaf doesn't.)
+  if (!acrossSeam && affected.length === 1 && isWordLeaf(affected[0].node)) {
     const leaf = affected[0];
     const leafText = String(leaf.node["text"]);
     const newLeafText =
@@ -1420,7 +1446,7 @@ function smartReplaceVerseImpl(
     wordsMatchLeaves &&
     matchWords.every((mw, i) => mw === replaceWords[i]);
   if (wordsUnchanged) {
-    const relaid = relayoutPunctuation(cloned, rawStart, rawEnd, replaceText);
+    const relaid = keep(relayoutPunctuation(cloned, rawStart, rawEnd, replaceText));
     if (relaid) return relaid;
   }
 
@@ -1438,7 +1464,9 @@ function smartReplaceVerseImpl(
   // or a plain text leaf, never a marker that carries text. Words are compared
   // on the matched raw text, so a case-insensitive find that recases a word
   // is still a word change and skips this.
-  if (affected.length > 0 && (!startsAtBoundary || !endsAtBoundary)) {
+  // (Not across a seam: the widened words are read from raw, where the words
+  // on either side of the marker are fused.)
+  if (!acrossSeam && affected.length > 0 && (!startsAtBoundary || !endsAtBoundary)) {
     const first = affected[0];
     const last = affected[affected.length - 1];
     const plainLeaf = (l: Leaf) => isWordLeaf(l.node) || (l.node["type"] === "text" && !l.node["children"]);
@@ -1469,14 +1497,63 @@ function smartReplaceVerseImpl(
   // UNITS (so split possessives like "Yahweh’s" / "Asherahs" are handled) and
   // bails internally if it can't map cleanly.
   if (startsAtBoundary && endsAtBoundary && matchWords.length > 0 && replaceWords.length > 0) {
-    const rebuilt = smartRebuildRange(cloned, raw, rawStart, rawEnd, matchWords, replaceText, replaceWords);
+    const rebuilt = keep(smartRebuildRange(cloned, raw, rawStart, rawEnd, matchWords, replaceText, replaceWords));
     if (rebuilt) return rebuilt;
   }
 
   // Structural mismatch — fall through to the localized rewrite so only
   // the milestones overlapping the change are destroyed (rather than the
-  // whole verse).
-  return localizedRewriteVerse(content, plainText, matchStartInPlain, matchLenInPlain, replaceText);
+  // whole verse). It rebuilds from `content`, not the `cloned` the paths
+  // above may have marked. Hand it the located range so it doesn't recount
+  // occurrences itself (#1307).
+  const rewritten = localizedRewriteVerse(content, plainText, matchStartInPlain, matchLenInPlain, replaceText, located ?? undefined);
+  return keep(rewritten) ?? flatRebuild();
+}
+
+// Map a match in the plain text (`start`, `len`) to its range in raw, the
+// leaves' text joined (walkLeaves / rebuildRaw), by walking both in lockstep:
+// non-whitespace characters must agree, whitespace runs of any width (or none,
+// at a line marker with no text node beside it) line up with each other.
+// Returns null when the characters disagree (the caller falls back to
+// counting occurrences), for an empty match, and for a whitespace-only match
+// that has no whitespace in raw.
+function locatePlainRangeInRaw(plain: string, raw: string, start: number, len: number): { start: number; end: number } | null {
+  if (len <= 0) return null;
+  const s = mapStrippedPosToRaw(plain, raw, start);
+  const e = mapStrippedPosToRaw(plain, raw, start + len);
+  if (s < 0 || e < 0) return null;
+  // A match starting on a character starts there in raw too, past any raw
+  // whitespace before it (as the old `\s+`-relaxed regex search anchored).
+  let rs = s;
+  if (!/\s/.test(plain[start])) while (rs < raw.length && /\s/.test(raw[rs])) rs++;
+  return e > rs ? { start: rs, end: e } : null;
+}
+
+// Is `result` exactly the replacement the translator asked for: its visible
+// text is the plain text with the match replaced, and every line marker of the
+// original verse is still there? Guards the paths that read fused raw text
+// when a match crosses a marker with no text node beside it (#1307).
+function isExactReplace(
+  verseObjects: unknown[],
+  result: SmartReplaceResult,
+  plainText: string,
+  start: number,
+  len: number,
+  replaceText: string,
+): boolean {
+  const want = normalize(plainText.slice(0, start) + replaceText + plainText.slice(start + len));
+  const lineMarkers = (nodes: unknown[]): number => {
+    let n = 0;
+    for (const node of nodes ?? []) {
+      if (!node || typeof node !== "object") continue;
+      if (isInFlowMarker(node) && !isCharacterWrapper(node)) n++;
+      const children = (node as Record<string, unknown>)["children"];
+      if (Array.isArray(children)) n += lineMarkers(children);
+    }
+    return n;
+  };
+  const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  return Array.isArray(out) && extractPlainText(result.content) === want && lineMarkers(out) === lineMarkers(verseObjects);
 }
 
 // Plain-text diff: the smallest contiguous substring change that turns
@@ -2793,6 +2870,10 @@ function localizedRewriteVerse(
   start: number,
   oldLen: number,
   newSubstring: string,
+  // The change's range in raw, when the caller has already located it
+  // (smartReplaceVerse, #1307). Without it, an oldLen > 0 change is found by
+  // counting occurrences below.
+  rawRange?: { start: number; end: number },
 ): SmartReplaceResult {
   const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(verseObjects)) {
@@ -2826,7 +2907,10 @@ function localizedRewriteVerse(
   // insertion instead. The insertion lands after the marker, which keeps
   // separating it from the previous line's last word.
   let padRight = false;
-  if (oldLen > 0) {
+  if (oldLen > 0 && rawRange) {
+    rawStart = rawRange.start;
+    rawLen = rawRange.end - rawRange.start;
+  } else if (oldLen > 0) {
     const matchText = oldPlain.slice(start, start + oldLen);
     let occurrence = 1;
     let scan = oldPlain.indexOf(matchText);

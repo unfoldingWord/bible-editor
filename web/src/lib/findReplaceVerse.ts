@@ -78,10 +78,15 @@ export function replaceAllInVerse(
     const next = localRe.exec(curPlain);
     if (!next) break;
     const result = smartReplaceVerse(curContent, curPlain, regex, next.index, next[0].length, replaceText);
-    if (result.plainText === curPlain) break;
+    // Re-scan the tree's own plain text, as the first step scanned the stored
+    // one. The engine's plainText adds nothing at a line marker with no text
+    // node beside it (`namethis` for `name \q1 this`), so the next step's
+    // search matched across the line break (#1307).
+    const nextPlain = extractPlainText(result.content);
+    if (result.plainText === curPlain || nextPlain === curPlain) break;
     if (!result.preservedAlignment) preserved = false;
     curContent = result.content;
-    curPlain = result.plainText;
+    curPlain = nextPlain;
   }
   return finalizeFindReplace(content, plainText, {
     content: curContent,
