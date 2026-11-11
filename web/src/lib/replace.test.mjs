@@ -2964,6 +2964,49 @@ function countAllMilestones(nodes) {
   assert(wordsS === "Strike:H0|my:H1|companion:H1|the:H2|declaration:H3", `stored em-dash: every word keeps its alignment (got ${wordsS})`);
 }
 
+// Case 81b: review follow-ups to Case 81 (#1282).
+{
+  console.log("\n[Case 81b] Text moved past a marker lands after the marker it was typed after (#1282)");
+  const brief = (content) =>
+    JSON.stringify(
+      content.verseObjects.map((n) =>
+        n.tag === "zaln" ? n.children.map((k) => k.text).join("") : n.type === "text" ? n.text : `\\${n.tag}`,
+      ),
+    );
+  const tail = () => [zaln("H2", [w("The")]), t(" "), zaln("H3", [w("one")]), t(".")];
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  // Two markers at one anchor, quote typed BETWEEN them: it stays on the \q1 line.
+  {
+    const verse = { verseObjects: [zaln("H1", [w("say"), t(",")]), { type: "quote", tag: "q1" }, { type: "quote", tag: "q2" }, ...tail()] };
+    const old = extractEditableText(verse);
+    const r = smartEditVerse(verse, old, old.replace("\\q2", "“\\q2"), { capturedFromDom: true });
+    const got = brief(curlifyVerseContent(r.content));
+    const want = JSON.stringify(["say,", "\\q1", "“", "\\q2", "The", " ", "one", "."]);
+    assert(got === want, `quote typed between \\q1 and \\q2 stays between them (got ${got})`);
+    assert(words(r.content) === "say:H1|The:H2|one:H3", "two markers: every word keeps its alignment");
+  }
+  // Quote typed after the LAST of two markers lands after both.
+  for (const [first, type] of [["p", "paragraph"], ["b", "paragraph"], ["q1", "quote"]]) {
+    const second = first === "q1" ? "q2" : "q1";
+    const verse = { verseObjects: [zaln("H1", [w("say"), t(",")]), { type, tag: first }, { type: "quote", tag: second }, ...tail()] };
+    const old = extractEditableText(verse);
+    const r = smartEditVerse(verse, old, old.replace("The", "“The"), { capturedFromDom: true });
+    const got = brief(curlifyVerseContent(r.content));
+    const want = JSON.stringify(["say,", `\\${first}`, `\\${second}`, "“", "The", " ", "one", "."]);
+    assert(got === want, `quote typed after \\${first} \\${second} lands after both (got ${got})`);
+    assert(words(r.content) === "say:H1|The:H2|one:H3", `\\${first} \\${second}: every word keeps its alignment`);
+  }
+  // Never move WORD text out of a milestone: a legacy non-\w word ("and" as a
+  // text leaf) trailing the milestone before the marker stays where it is.
+  {
+    const verse = { verseObjects: [zaln("H1", [w("say"), t(" and")]), { type: "quote", tag: "q1" }, ...tail()] };
+    const old = extractEditableText(verse);
+    const r = smartEditVerse(verse, old, old.replace("\\q1", "\\q2"), { capturedFromDom: true });
+    const got = extractEditableText(r.content);
+    assert(got === "say and\\q2 The one.", `word text in the milestone's trailing leaf is not moved (got ${JSON.stringify(got)})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
