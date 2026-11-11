@@ -3412,6 +3412,23 @@ function countAllMilestones(nodes) {
     assert(ed === "my name\\q1 this sat mat.", `replace all et -> at: ${JSON.stringify("my name\\q1 this sat mat.")} (got ${JSON.stringify(ed)})`);
     assert(words(r.content) === "my:H0|name:H1|this:H2|sat:|mat:", `replace all et -> at: untouched words keep their alignment (got ${words(r.content)})`);
   }
+  // The phrase at the marker and again later: the one picked (at the marker) is
+  // the one edited. The old occurrence count found nothing at the fused seam and
+  // edited the later one.
+  {
+    const twice = bareTree([t(" "), zaln("H3", [w("set")]), t(" "), zaln("H4", [w("name")]), t(" "), zaln("H5", [w("this")]), t(".")]);
+    const p2 = extractPlainText(twice);
+    one("name this -> name that at the marker, phrase repeated later", twice, p2, "name this", /name this/g, "name that",
+      "my name\\q1 that set name this.", "my:H0|name:H1|that:|set:H3|name:H4|this:H5");
+  }
+  // Punctuation typed across the marker: no path can keep the line break and
+  // the text exact, so the result is the flat rebuild with the exact text (as
+  // before), never a wrong text that keeps the marker.
+  for (const [find, repl] of [["e t", "e-t"], ["me th", "me, th"]]) {
+    const r = smartReplaceVerse(clone(bare), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
+    const want = plain.replace(find, repl);
+    assert(extractPlainText(r.content) === want, `${find} -> ${repl} across the marker: text ${JSON.stringify(want)} (got ${JSON.stringify(extractPlainText(r.content))})`);
+  }
 }
 
 if (failed > 0) {
