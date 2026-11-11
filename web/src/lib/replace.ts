@@ -1452,6 +1452,21 @@ function smartReplaceVerseImpl(
   };
   const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null =>
     r && (!acrossSeam || isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText)) ? r : null;
+  // Every path refused a change across the seam. Retry it without the whole
+  // words the match and the replacement share at one end, so a marker beside
+  // such a word falls outside the change and stays put (`name this` -> `name
+  // of that` becomes `this` -> `of that`, after the `\q1`; #1311). The retry
+  // must still pass the guard for the whole match; otherwise the flat rebuild.
+  const refused = (): SmartReplaceResult => {
+    for (const n of narrowedReplaces(plainMatchText, replaceText)) {
+      const start = matchStartInPlain + n.trimStart;
+      const len = matchLenInPlain - n.trimStart - n.trimEnd;
+      const re = new RegExp(plainText.slice(start, start + len).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+      const r = keep(smartReplaceVerseImpl(content, plainText, re, start, len, n.replaceText, options));
+      if (r) return r;
+    }
+    return flatRebuild();
+  };
 
   // Smart in-place path requires:
   //   (a) match boundaries align with leaf boundaries — no mid-leaf splits;
@@ -1541,10 +1556,11 @@ function smartReplaceVerseImpl(
     }
     const verseObjectsOut = anyChanged ? stripLiftedMarkers(liftEditedOutOfZaln(cloned)) : cloned;
     const newRaw = rebuildRaw(verseObjectsOut);
-    // `cloned` is edited in place, so a refused result can't fall through.
+    // `cloned` is edited in place, so a refused result can't fall through
+    // (the retry starts again from `content`).
     return (
       keep({ content: { verseObjects: verseObjectsOut }, plainText: normalize(newRaw), preservedAlignment: true }) ??
-      flatRebuild()
+      refused()
     );
   }
 
@@ -1672,7 +1688,7 @@ function smartReplaceVerseImpl(
   // above may have marked. Hand it the located range so it doesn't recount
   // occurrences itself (#1307).
   const rewritten = localizedRewriteVerse(content, plainText, matchStartInPlain, matchLenInPlain, replaceText, located ?? undefined);
-  return keep(rewritten) ?? flatRebuild();
+  return keep(rewritten) ?? refused();
 }
 
 // Map a match in the plain text (`start`, `len`) to its range in raw, the
@@ -1759,11 +1775,135 @@ function isExactReplace(
   const got = typedCoords ? strippedText(result.content) : extractPlainText(result.content);
   // Neither text shows a header label, so check those separately: a match
   // that spans one (`said the` around `\sp …`) must not rewrite it.
-  return (
-    got === want &&
-    lineMarkers(out) === lineMarkers(verseObjects) &&
-    JSON.stringify(headerLabelTexts(out)) === JSON.stringify(headerLabelTexts(verseObjects))
-  );
+  if (
+    got !== want ||
+    lineMarkers(out) !== lineMarkers(verseObjects) ||
+    JSON.stringify(headerLabelTexts(out)) !== JSON.stringify(headerLabelTexts(verseObjects))
+  ) {
+    return false;
+  }
+  // Each line marker keeps its place beside the words the replace did not
+  // change. The count alone let `name this` -> `name of that` save `my name of
+  // that\q1 set.`, the break moved past two words (#1311). Positions are counts
+  // of non-whitespace characters before the marker, the same in either text.
+  // A marker before the change (or after `name`, which both texts start with)
+  // keeps its count; one after it shifts by the length change; one between
+  // changed words may sit anywhere inside the replacement.
+  const coordText = (vo: unknown[]) => (typedCoords ? strippedText({ verseObjects: vo }) : extractPlainText({ verseObjects: vo }));
+  const before = markerOffsets(coordText(withMarkerSentinels(verseObjects)));
+  const after = markerOffsets(coordText(withMarkerSentinels(out)));
+  if (before.length !== after.length) return false;
+  const matchText = plainText.slice(start, start + len);
+  const s = nonWsCount(plainText.slice(0, start));
+  const e = s + nonWsCount(matchText);
+  const r = nonWsCount(replaceText);
+  const { pre, post } = sharedWordEdges(matchText, replaceText);
+  return before.every((n, i) => {
+    const m = after[i];
+    if (n <= s + pre && m === n) return true;
+    if (n >= e - post && m === n + r - (e - s)) return true;
+    return n > s + pre && n < e - post && m >= s + pre && m <= s + r - post;
+  });
+}
+
+// Non-whitespace characters in `s`, by code point.
+function nonWsCount(s: string): number {
+  let n = 0;
+  for (const ch of s) if (!/\s/.test(ch)) n++;
+  return n;
+}
+
+// A copy of `nodes` with a sentinel text node before every line marker (as
+// isExactReplace counts them), so a text extractor shows where each one is.
+const MARKER_SENTINEL = "\u0001";
+function withMarkerSentinels(nodes: unknown[]): unknown[] {
+  const out: unknown[] = [];
+  for (const n of nodes ?? []) {
+    if (n && typeof n === "object") {
+      if (isInFlowMarker(n) && !isCharacterWrapper(n)) out.push({ type: "text", text: MARKER_SENTINEL });
+      const children = (n as Record<string, unknown>)["children"];
+      out.push(Array.isArray(children) ? { ...(n as Record<string, unknown>), children: withMarkerSentinels(children) } : n);
+    } else {
+      out.push(n);
+    }
+  }
+  return out;
+}
+
+// For each sentinel in `text`, the count of non-whitespace characters before it.
+function markerOffsets(text: string): number[] {
+  const out: number[] = [];
+  let n = 0;
+  for (const ch of text) {
+    if (ch === MARKER_SENTINEL) out.push(n);
+    else if (!/\s/.test(ch)) n++;
+  }
+  return out;
+}
+
+// `s` as alternating gap and word tokens (WORD_RUN_RE), starting and ending
+// with a gap, either possibly empty: `name this` -> ["", "name", " ", "this", ""].
+function wordTokens(s: string): string[] {
+  const out: string[] = [];
+  let last = 0;
+  for (const m of s.matchAll(WORD_RUN_RE)) {
+    const at = m.index ?? 0;
+    out.push(s.slice(last, at), m[0]);
+    last = at + m[0].length;
+  }
+  out.push(s.slice(last));
+  return out;
+}
+
+const sameToken = (a: string, b: string) => a.replace(/\s+/g, " ") === b.replace(/\s+/g, " ");
+
+// How many leading and trailing tokens `a` and `b` share, whole tokens only.
+function sharedTokenCounts(a: string[], b: string[]): { lead: number; trail: number } {
+  let lead = 0;
+  while (lead < a.length && lead < b.length && sameToken(a[lead], b[lead])) lead++;
+  let trail = 0;
+  while (trail < a.length && trail < b.length && sameToken(a[a.length - 1 - trail], b[b.length - 1 - trail])) trail++;
+  return { lead, trail };
+}
+
+// The words a match and its replacement share at the start and at the end,
+// as non-whitespace character counts (`name this` / `name of that`: 4 and 0).
+function sharedWordEdges(match: string, replacement: string): { pre: number; post: number } {
+  const a = wordTokens(match);
+  const { lead, trail } = sharedTokenCounts(a, wordTokens(replacement));
+  return {
+    pre: nonWsCount(a.slice(0, lead).join("")),
+    post: nonWsCount(a.slice(a.length - trail).join("")),
+  };
+}
+
+// Narrower versions of a replace: the match and the replacement each without
+// the whole tokens they share at the start, or else at the end, as long as
+// the narrowed match still holds a non-whitespace character. Character counts
+// are in the match (`trimStart`, `trimEnd`); `replaceText` is what replaces
+// the rest.
+function narrowedReplaces(match: string, replacement: string): { trimStart: number; trimEnd: number; replaceText: string }[] {
+  const a = wordTokens(match);
+  const b = wordTokens(replacement);
+  const { lead, trail } = sharedTokenCounts(a, b);
+  const out: { trimStart: number; trimEnd: number; replaceText: string }[] = [];
+  for (let k = Math.min(lead, a.length - 1); k > 0; k--) {
+    const rest = a.slice(k).join("");
+    if (!/\S/.test(rest)) continue;
+    const trimStart = a.slice(0, k).join("").length;
+    // Only a strictly narrower range (an empty leading gap trims nothing), so
+    // the retry this feeds always ends.
+    if (trimStart > 0) out.push({ trimStart, trimEnd: 0, replaceText: b.slice(k).join("") });
+    break;
+  }
+  for (let k = Math.min(trail, a.length - 1); k > 0; k--) {
+    const rest = a.slice(0, a.length - k).join("");
+    if (!/\S/.test(rest)) continue;
+    const trimEnd = a.slice(a.length - k).join("").length;
+    if (trimEnd > 0) out.push({ trimStart: 0, trimEnd, replaceText: b.slice(0, b.length - k).join("") });
+    break;
+  }
+  return out;
 }
 
 // Plain-text diff: the smallest contiguous substring change that turns
