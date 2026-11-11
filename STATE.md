@@ -205,7 +205,11 @@ Highlights that bite repeatedly:
   not fixable from the app by moving the quote (that changes no plain text → no-op save); with the hoist deployed
   any text edit to the verse re-lays it, otherwise repair with `scripts/scan-opening-punct.mjs` or by hand on
   Door43. A `\q`/`\p` marker right after the opener blocks the hoist on purpose (never move text across a line
-  break) — those stay flagged for a hand fix. The AI pipeline stores the opener
+  break) — those stay flagged for a hand fix. The reconcile handles that case instead (#1282): `reconcileMarkers`
+  splits the previous milestone's trailing text at what was typed before the marker and moves the rest after it.
+  Before that, an opener typed at a `\q`/`\p` line start after `H1[say ","]` stayed before the marker (a straight
+  `"` then curled as `”`), and a punctuation-only edit anywhere in ZEC 13:7 ULT moved its stored line-leading `—`
+  to the previous line. The AI pipeline stores the opener
   correctly (leading child of the following milestone); this was ours.
 
 - **A direct-SQL data repair that leaves `updated_by` NULL is undone by the nightly sync.** `reimportClassify.ts
