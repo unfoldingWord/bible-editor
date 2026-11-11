@@ -150,11 +150,13 @@ function sameOrStraightened(baseCh: string, typedCh: string): boolean {
 
 // Where the typed text has a straight quote at a spot the saved verse already
 // has curled, use the saved curly form, so the edit engine sees no change
-// there. Two passes: the unchanged lead and tail (the same common
-// prefix/suffix the engine diffs on), then, between the first and last real
+// there. Three passes: the unchanged lead and tail (the same common
+// prefix/suffix the engine diffs on); then, between the first and last real
 // edit, every whitespace-separated word that matches a saved word except for
-// straight-for-curly quotes (#1290). Anything else is kept as typed and
-// curled after the engine runs.
+// straight-for-curly quotes (#1290); then the same at the engine's own word
+// granularity, so a retype inside a word that also gained punctuation
+// (`Yahweh's,` for `Yahweh’s`, or a new opener before it) is caught too
+// (#1293). Anything else is kept as typed and curled after the engine runs.
 //
 // Needed because the save curls every straight quote anyway, so ' for ’ is
 // not a real edit, but the engine matches words by exact text: a stored
@@ -174,8 +176,17 @@ export function adoptBaseQuotes(base: string, typed: string): string {
   while (s < n - p && sameOrStraightened(base[base.length - 1 - s], typed[typed.length - 1 - s])) s++;
   const leadTail = base.slice(0, p) + typed.slice(p, typed.length - s) + base.slice(base.length - s);
   if (!/['"]/.test(leadTail) || !/[‘’“”]/.test(base)) return leadTail;
-  return adoptBaseQuoteWords(base, leadTail);
+  const words = adoptBaseQuoteWords(base, leadTail, /\S+/g);
+  if (!/'/.test(words)) return words;
+  return adoptBaseQuoteWords(base, words, WORD_RUN_RE);
 }
+
+// The edit engine's word run, kept identical to replace.ts WORD_CHAR /
+// WORD_RUN_RE (not exported there; alignmentReassembly.ts keeps the same
+// copy). A ' or ’ between letters is part of the word, so `Yahweh's,` holds
+// the run `Yahweh's`; ‘ is not, so a deliberate ’ → ‘ never pairs up.
+const WORD_CHAR = "[\\p{L}\\p{M}\\p{N}\\u200d\\u2060]";
+const WORD_RUN_RE = new RegExp(`${WORD_CHAR}+(?:[-'\u2019]${WORD_CHAR}+|(?<=\\p{N}),\\p{N}+)*`, "gu");
 
 const MAX_LCS_CELLS = 10_000_000;
 
@@ -184,11 +195,12 @@ const foldQuotes = (s: string): string => s.replace(/[‘’]/g, "'").replace(/[
 // Word-level pass of adoptBaseQuotes: matches typed words to saved words in
 // order (longest common subsequence, compared with quotes folded) and swaps in
 // the saved word where the only difference is a straight quote typed for its
-// curly one. Curly and straight quotes are one UTF-16 unit each, so a swap
-// never shifts offsets and the typed whitespace stays exactly as typed.
-function adoptBaseQuoteWords(base: string, typed: string): string {
-  const baseWords = base.match(/\S+/g) ?? [];
-  const typedSpans = [...typed.matchAll(/\S+/g)].map((m) => ({ start: m.index ?? 0, text: m[0] }));
+// curly one. `wordRe` (global) says what a word is: whitespace-separated, or
+// the engine's word run. Curly and straight quotes are one UTF-16 unit each,
+// so a swap never shifts offsets and everything between words stays as typed.
+function adoptBaseQuoteWords(base: string, typed: string, wordRe: RegExp): string {
+  const baseWords = base.match(wordRe) ?? [];
+  const typedSpans = [...typed.matchAll(wordRe)].map((m) => ({ start: m.index ?? 0, text: m[0] }));
   const bf = baseWords.map(foldQuotes);
   const tf = typedSpans.map((t) => foldQuotes(t.text));
   // Words equal after folding at both ends pair up in order; the LCS only

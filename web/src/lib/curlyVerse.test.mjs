@@ -391,6 +391,67 @@ console.log("ZEC 6:15 UST: 's retyped over ’s plus edits at both ends keeps ev
   assert(JSON.stringify(base) === baseJson, "base content is not mutated");
 }
 
+// #1293: the word pass above pairs whole whitespace-separated words, so a
+// retype plus another change in the same word (`Yahweh's,` typed for stored
+// `Yahweh’s`) was not paired, and the engine, which matches by word run
+// (`Yahweh's` vs `Yahweh’s`), dropped its alignment. A second pass at the
+// engine's word granularity reconciles the quote inside the unchanged word.
+console.log("adoptBaseQuotes reconciles a retyped quote inside a word that also changed (#1293)");
+{
+  const cases = [
+    ["X A Yahweh's, B Y", "X A Yahweh’s, B Y", "comma added (the issue case)"],
+    ["X A \"Yahweh's B Y", "X A \"Yahweh’s B Y", "new opener added, opener kept as typed"],
+    ["X A \"Yahweh's, B Y", "X A \"Yahweh’s, B Y", "opener and comma added"],
+    ["X A Yahweh's, very B Y", "X A Yahweh’s, very B Y", "comma and a new word added"],
+    ["X A Yahwehx's, B Y", "X A Yahwehx's, B Y", "a word whose letters changed keeps the typed quote"],
+  ];
+  for (const [typed, want, label] of cases) {
+    const got = adoptBaseQuotes("A Yahweh’s B", typed);
+    assert(got === want, `${label} (got ${JSON.stringify(got)})`);
+  }
+  // The straight retype of don’t forces the word-run pass to run, so the ‘
+  // case below is not passed vacuously.
+  const got = adoptBaseQuotes("A Yahweh’s B don’t", "X A Yahweh‘s, B don't, Y");
+  assert(
+    got === "X A Yahweh‘s, B don’t, Y",
+    `a deliberate ’ → ‘ inside a changed word stays (got ${JSON.stringify(got)})`,
+  );
+}
+
+console.log("ZEC 6:15 UST: 's retyped with punctuation added in the same word keeps every alignment (#1293)");
+{
+  const mk = () => ({
+    verseObjects: [
+      zaln("H1129", [w("to"), t(" "), w("build")]), t(" "),
+      zaln("H3068", [w("Yahweh"), t("’"), w("s")]), t(" "),
+      w("temple"), t(". "), w("When"), t(" "),
+      zaln("H3068", [w("Yahweh")]), t(", "),
+      zaln("H0430", [w("your"), t(" "), w("God")]), t("."),
+    ],
+  });
+  const cases = [
+    ["Yahweh's,", "Yahweh’s,"],
+    ["\"Yahweh's", "“Yahweh’s"],
+    ["\"Yahweh's,", "“Yahweh’s,"],
+  ];
+  for (const [retyped, saved] of cases) {
+    const base = mk();
+    const baseJson = JSON.stringify(base);
+    const before = alignedWords(base).join(" ");
+    const typed = `Then ${extractEditableText(base).replace("Yahweh’s", retyped)} Amen.`;
+    const r = saveEdit(base, typed);
+    assert(
+      r.plain === `Then to build ${saved} temple. When Yahweh, your God. Amen.`,
+      `${retyped}: plain (got ${JSON.stringify(r.plain)})`,
+    );
+    const words = alignedWords(r.content).join(" ");
+    assert(words.includes("Yahweh@H3068 s@H3068"), `${retyped}: Yahweh / s still aligned to H3068 (got ${words})`);
+    assert(words === `Then@- ${before} Amen@-`, `${retyped}: every old word keeps its alignment (got ${words})`);
+    assert(!guardBlocksSave(r.delta, "text_edit"), `${retyped}: save guard does not block`);
+    assert(JSON.stringify(base) === baseJson, `${retyped}: base content is not mutated`);
+  }
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
