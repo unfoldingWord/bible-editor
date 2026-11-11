@@ -559,6 +559,12 @@ export function curlifyText(text: string): string {
 // attribute is ever assigned — so this can never unalign a word, alter a word
 // count, or touch Hebrew/Greek. No-op (identity) on a verse with no straight
 // quotes, the common case.
+//
+// A `\p`/`\q#` line marker (type "paragraph"/"quote") starts a new line, so
+// the context resets to a newline before that node's own text and children: a
+// quote right after it opens even when the text before the marker ends in a
+// letter or comma ("said,\q1 'Turn" → ‘Turn, not ’Turn) (#1277). Same rule as
+// web/src/lib/curlyVerse.ts.
 export function curlifyVerseObjects(verseObjects: unknown[]): boolean {
   if (!Array.isArray(verseObjects)) return false;
   let changed = false;
@@ -568,6 +574,10 @@ export function curlifyVerseObjects(verseObjects: unknown[]): boolean {
     for (const node of nodes) {
       if (!node || typeof node !== "object") continue;
       const o = node as Record<string, unknown>;
+      if (o["type"] === "paragraph" || o["type"] === "quote") {
+        prevCurled = "\n";
+        prevRaw = "\n";
+      }
       const isSourceMilestone = o["type"] === "milestone" && o["tag"] === "zaln";
       const text = o["text"];
       if (!isSourceMilestone && typeof text === "string" && text.length > 0) {

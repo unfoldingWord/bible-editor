@@ -82,9 +82,9 @@ function curlifyTextWithContext(
 // `\zaln-s` milestones (source-owned attributes, never touched); milestone
 // children (the aligned target words) are walked normally.
 //
-// One difference from the API copy: a `\p`/`\q#` line marker starts a new
-// line, so a quote right after it opens even when the text before the marker
-// ends in a letter or comma ("said,\q1 'Turn" → ‘Turn, not ’Turn).
+// Like the API copy: a `\p`/`\q#` line marker starts a new line, so a quote
+// right after it opens even when the text before the marker ends in a letter
+// or comma ("said,\q1 'Turn" → ‘Turn, not ’Turn).
 function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
   let prevCurled: string | undefined;
   let prevRaw: string | undefined;
