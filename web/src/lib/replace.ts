@@ -541,6 +541,24 @@ function isLineBreakMarkerNode(node: unknown): boolean {
   return true;
 }
 
+// True when a line-break marker sits strictly inside raw [rawStart, rawEnd).
+function rangeHoldsLineBreak(nodes: unknown[], rawStart: number, rawEnd: number): boolean {
+  let pos = 0;
+  let found = false;
+  const walk = (arr: unknown[]) => {
+    for (const n of arr) {
+      if (found) return;
+      const o = n as Record<string, unknown> | null;
+      if (!o) continue;
+      if (isLineBreakMarkerNode(o) && pos > rawStart && pos < rawEnd) found = true;
+      if (typeof o["text"] === "string") pos += (o["text"] as string).length;
+      if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
+    }
+  };
+  walk(nodes);
+  return found;
+}
+
 // Split a new gap's text at a line break, given the old gap's text before and
 // after it (#1309). Keep the part the replace did not change on its old side:
 // when the new gap still ends with the old after-text (`, “` against `:␤ | “`)
@@ -1561,10 +1579,15 @@ function smartReplaceVerseImpl(
   // (`Yahweh’s: \q1 “I`, #1309) otherwise took smartRebuildRange, which writes
   // the range's trailing gap before a line marker that ends the range, moving
   // the opener to the previous line.
+  // A match with no word at all (`: “` -> `, “`) takes the relayout too when it
+  // crosses a line break; the localized rewrite drops the break (#1309). Other
+  // word-less matches keep the localized rewrite, which is fine without one.
+  const gapOnlyAtBreak = (start: number, end: number, words: number) =>
+    words === 0 && replaceWords.length === 0 && rangeHoldsLineBreak(cloned, start, end);
   const wordsUnchanged =
     startsAtBoundary &&
     endsAtBoundary &&
-    matchWords.length > 0 &&
+    (matchWords.length > 0 || gapOnlyAtBreak(rawStart, rawEnd, matchWords.length)) &&
     matchWords.length === replaceWords.length &&
     matchWords.every((mw, i) => mw === replaceWords[i]);
   if (wordsUnchanged) {
@@ -1602,7 +1625,7 @@ function smartReplaceVerseImpl(
       const widenedReplace = raw.slice(first.start, rawStart) + replaceText + raw.slice(rawEnd, last.end);
       const widenedReplaceWords = [...widenedReplace.matchAll(WORD_RUN_RE)].map((m) => m[0]);
       const widenedWordsUnchanged =
-        widenedMatchWords.length > 0 &&
+        (widenedMatchWords.length > 0 || gapOnlyAtBreak(first.start, last.end, widenedMatchWords.length)) &&
         widenedReplaceWords.length === widenedMatchWords.length &&
         widenedMatchWords.every((mw, i) => mw === widenedReplaceWords[i]);
       if (widenedWordsUnchanged) {

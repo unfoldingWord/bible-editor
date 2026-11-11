@@ -3530,6 +3530,11 @@ function countAllMilestones(nodes) {
   check("repro 3: Armies: “ -> Armies, “ (textless \\q1)", hand([w("Armies")]), "Armies: “", "Armies, “", "Armies: \\q1 “I", "Armies, \\q1 “I");
   check("repro 3: Yahweh’s: “ -> Yahweh’s, “ (textless \\q1, split possessive)", hand([w("Yahweh"), t("’"), w("s")]), "Yahweh’s: “", "Yahweh’s, “", "Yahweh’s: \\q1 “I", "Yahweh’s, \\q1 “I");
 
+  // A match with no word in it (only the gap) crosses the line break too.
+  check(": “ -> , “ (ZEC 1:14, gap only)", verse("1", "14"), ": “", ", “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  check(": “ -> , “ (textless \\q1, gap only)", hand([w("Armies")]), ": “", ", “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  check("␣“ -> ␣‘ (textless \\q1, gap only, starts inside the :␤ leaf)", hand([w("Armies")]), " “", " ‘", "Armies: \\q1 “I", "Armies: \\q1 ‘I");
+
   // A line-leading `—` stays after its `\q1`, a line-ending `—` before its
   // `\q1` (the ZEC 13:7 shapes; the sample file keeps that verse's dashes
   // inside the `\w` words, so these trees store them as text, as the AI
