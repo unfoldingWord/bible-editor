@@ -3429,6 +3429,36 @@ function countAllMilestones(nodes) {
     const want = plain.replace(find, repl);
     assert(extractPlainText(r.content) === want, `${find} -> ${repl} across the marker: text ${JSON.stringify(want)} (got ${JSON.stringify(extractPlainText(r.content))})`);
   }
+
+  // The space at a bare marker exists only in the plain text: the tree has no
+  // whitespace there to replace. Replacing it is a no-op for the tree; it must
+  // not pick some other whitespace in raw, or flatten the verse (review of #1307).
+  {
+    const seam = plain.indexOf(" ", plain.indexOf("name"));
+    const r = findReplaceVerse(clone(bare), plain, / /g, seam, 1, "_");
+    assert(r.plainText === plain && extractEditableText(r.content) === extractEditableText(bare),
+      `space at the marker -> _: no-op (got ${JSON.stringify(extractEditableText(r.content))})`);
+    const all = replaceAllInVerse(clone(bare), plain, / /g, 3, "_");
+    assert(extractPlainText(all.content) === "my_name this_set.", `replace all space -> _: the other spaces are replaced (got ${JSON.stringify(extractPlainText(all.content))})`);
+    assert(markers(all.content) === 1, `replace all space -> _: the line break survives (got ${JSON.stringify(extractEditableText(all.content))})`);
+  }
+  // Replace all where one step changes the tree but nothing visible (removing
+  // the space leaf before a marker, which still separates the words): that
+  // step is skipped, and the later matches are still replaced.
+  {
+    const spaced = (tail) => ({ verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), t(" "), { type: "quote", tag: "q1" }, zaln("H2", [w("this")]), ...tail] });
+    const two = spaced([t(" "), zaln("H4", [w("name")]), t(" "), zaln("H5", [w("again")]), t(".")]);
+    const p2 = extractPlainText(two);
+    assert(p2 === "my name this name again.", `setup: plain text (got ${JSON.stringify(p2)})`);
+    const r = replaceAllInVerse(clone(two), p2, /name /g, 2, "name");
+    assert(r.plainText === "my name this nameagain.", `replace all "name " -> "name" past an invisible step (got ${JSON.stringify(r.plainText)})`);
+    assert(markers(r.content) === 1, `replace all "name " -> "name": the line break survives`);
+    // Skipped steps don't use up the replace all's step budget.
+    const three = spaced([t(" "), zaln("H4", [w("name")]), t(" "), zaln("H5", [w("one")]), t(" "), zaln("H6", [w("name")]), t(" "), zaln("H7", [w("two")]), t(".")]);
+    const p3 = extractPlainText(three);
+    const r3 = replaceAllInVerse(clone(three), p3, /name /g, 3, "name");
+    assert(r3.plainText === "my name this nameone nametwo.", `replace all, a skipped step then two real ones (got ${JSON.stringify(r3.plainText)})`);
+  }
 }
 
 if (failed > 0) {
