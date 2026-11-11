@@ -10,7 +10,7 @@
 //   node --experimental-strip-types --no-warnings src/lib/findReplaceVerse.test.mjs
 
 import assert from "node:assert/strict";
-import { finalizeFindReplace, findReplaceVerse, replaceAllInVerse } from "./findReplaceVerse.ts";
+import { bibleReplaceSummaryText, finalizeFindReplace, findReplaceVerse, replaceAllInVerse } from "./findReplaceVerse.ts";
 import { smartReplaceVerse } from "./replace.ts";
 import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { rebaseVersePatch } from "../sync/verseRebase.ts";
@@ -228,6 +228,28 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   const a = findReplaceVerse(verse, "he sees clearly", /sees/g, 3, 4, "saw");
   const b = smartReplaceVerse(verse, "he sees clearly", /sees/g, 3, 4, "saw");
   check(JSON.stringify(a) === JSON.stringify(b), "same content, plainText and preservedAlignment");
+}
+
+// #1285: the summary counts only verses queued for save. A verse the save's
+// alignment guard refused is reported as not replaced, never as "replaced".
+{
+  const s = (versesReplaced, alignmentLost, readOnlySkipped, alignmentRefused) =>
+    bibleReplaceSummaryText({ versesReplaced, alignmentLost, readOnlySkipped, alignmentRefused });
+  check(s(1, 0, 0, 0) === "replaced 1 verse", "a saved replace: replaced 1 verse");
+  check(s(3, 1, 0, 0) === "replaced 3 verses — alignment milestones destroyed in 1", "unchanged wording for alignment loss");
+  check(
+    s(0, 0, 0, 1) === "1 verse not replaced: it would lose word alignment",
+    "a refused single replace leads with the refusal, no \"replaced 0 verses\"",
+  );
+  check(
+    s(1, 0, 0, 2) === "replaced 1 verse — 2 verses not replaced: they would lose word alignment",
+    "replace-all with refusals: counts saved and refused verses separately",
+  );
+  check(
+    s(0, 0, 2, 1) === "1 verse not replaced: it would lose word alignment — 2 matches in UHB/UGNT skipped (read-only)",
+    "refusal plus read-only skips",
+  );
+  check(s(0, 0, 1, 0) === "replaced 0 verses — 1 match in UHB/UGNT skipped (read-only)", "unchanged wording for read-only skips");
 }
 
 console.log(`\nfindReplaceVerse: all ${passed} checks passed.`);

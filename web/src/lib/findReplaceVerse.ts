@@ -89,3 +89,35 @@ export function replaceAllInVerse(
     preservedAlignment: preserved,
   });
 }
+
+// The overlay's scripture summary line after a replace. Counts come from the
+// save path, not the engine: `versesReplaced` is verses queued for save, and
+// `alignmentRefused` is verses the save's alignment guard refused (it shows
+// its own toast; nothing is saved), so a refused replace is never reported as
+// replaced (#1285). With nothing replaced and a refusal, the line leads with
+// the refusal instead of "replaced 0 verses".
+export interface BibleReplaceCounts {
+  versesReplaced: number;
+  alignmentLost: number;
+  readOnlySkipped: number;
+  alignmentRefused: number;
+}
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+export function bibleReplaceSummaryText(s: BibleReplaceCounts): string {
+  const parts: string[] = [];
+  if (s.versesReplaced > 0 || s.alignmentRefused === 0) {
+    parts.push(`replaced ${plural(s.versesReplaced, "verse", "verses")}`);
+  }
+  if (s.alignmentLost > 0) parts.push(`alignment milestones destroyed in ${s.alignmentLost}`);
+  if (s.alignmentRefused > 0) {
+    parts.push(
+      `${plural(s.alignmentRefused, "verse", "verses")} not replaced: ${s.alignmentRefused === 1 ? "it" : "they"} would lose word alignment`,
+    );
+  }
+  if (s.readOnlySkipped > 0) {
+    parts.push(`${plural(s.readOnlySkipped, "match", "matches")} in UHB/UGNT skipped (read-only)`);
+  }
+  return parts.join(" — ");
+}

@@ -98,7 +98,7 @@ interface Props {
   // Find/replace target. Used in all three modes — book mode passes a
   // chapter from the book cache; stacked/columns always pass the current
   // chapter. Shell dual-applies to useChapter when the chapter is loaded.
-  onReplaceVerse: (chapter: number, verse: number, bibleVersion: string, newContent: unknown, newPlainText: string, base: VerseDto) => void;
+  onReplaceVerse: (chapter: number, verse: number, bibleVersion: string, newContent: unknown, newPlainText: string, base: VerseDto) => boolean;
   // Find/replace target for translation notes (body only). Forwarded to the
   // overlay; Shell carries the live row version into the outbox If-Match.
   onReplaceNote: (row: TnRow, newNote: string) => void;

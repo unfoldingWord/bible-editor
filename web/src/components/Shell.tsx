@@ -4896,11 +4896,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               plain_text: newPlainText,
               content: newContent,
             } as VerseDto;
+            // false: the alignment guard refused the save (it showed a toast,
+            // nothing was queued), so the overlay must not count it (#1285).
             if (!enqueueVerseSafely(ch, verseNum, bibleVersion, base, newContent, newPlainText, "find_replace")) {
-              return;
+              return false;
             }
             bookHook?.applyLocalVerse(newDto);
             if (ch === chapter) applyLocalVerse(newDto);
+            return true;
           }}
           onReplaceNote={(row, newNote) => {
             // Find/replace on a translation note rewrites the BODY only (id is
