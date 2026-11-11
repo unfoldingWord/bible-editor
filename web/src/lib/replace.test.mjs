@@ -17,6 +17,7 @@ import {
 import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 import { OPENING_PUNCT_RE } from "./openingPunct.ts";
+import { curlifyVerseContent } from "./curlyVerse.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -2871,6 +2872,96 @@ function countAllMilestones(nodes) {
   const back = smartEditVerse(r.content, "they removing it and removing it", "they remove it and removing it");
   const occ2 = occOf(back.content, /^remov/);
   assert(occ2 === "remove 1/1,removing 1/1", `reverting renumbers back to 1/1 each (got ${occ2})`);
+}
+
+// Case 81: an opening quote typed at the start of a \q1 / \p line, where the
+// previous milestone holds its own trailing comma (`H1[say ","]`). The
+// punctuation relayout wrote the whole gap `,“` into H1's comma leaf, and
+// reconcileMarkers only re-split top-level gaps, so the quote stayed before the
+// marker, at the end of the previous line. A pasted straight `"` landed the same
+// way and the save-time curl, seeing the comma before it, turned it into a
+// CLOSING `”` (#1282). The quote must sit after the marker, glued to `The`.
+{
+  console.log("\n[Case 81] Opening quote typed at the start of a \\q1 / \\p line lands after the marker (#1282)");
+  const markers = { q1: { type: "quote", tag: "q1" }, p: { type: "paragraph", tag: "p" } };
+  for (const tag of ["q1", "p"]) {
+    for (const comma of [true, false]) {
+      for (const typed of ["“", '"']) {
+        const label = `\\${tag}, ${comma ? "comma" : "no comma"}, typed ${JSON.stringify(typed)}`;
+        const verse = {
+          verseObjects: [
+            zaln("H1", comma ? [w("say"), t(",")] : [w("say")]),
+            { ...markers[tag] },
+            zaln("H2", [w("The")]),
+            t(" "),
+            zaln("H3", [w("one")]),
+            t("."),
+          ],
+        };
+        const old = extractEditableText(verse);
+        const r = smartEditVerse(verse, old, old.replace("The", `${typed}The`), { capturedFromDom: true });
+        // The save path curls the engine's result tree (#1273).
+        const content = curlifyVerseContent(r.content);
+        const sep = comma ? "," : "";
+        const wantEditable = `say${sep}\\${tag} “The one.`;
+        const gotEditable = extractEditableText(content);
+        assert(gotEditable === wantEditable, `${label}: quote is after the marker (got ${JSON.stringify(gotEditable)})`);
+        const gotPlain = extractPlainText(content);
+        const wantPlain = comma ? "say, “The one." : "say “The one.";
+        assert(gotPlain === wantPlain, `${label}: plain text is ${JSON.stringify(wantPlain)} (got ${JSON.stringify(gotPlain)})`);
+        const vo = content.verseObjects;
+        const h1Text = vo[0].children.filter((c) => c.type === "text").map((c) => c.text).join("");
+        assert(h1Text === sep, `${label}: H1 keeps only ${JSON.stringify(sep)} as trailing text (got ${JSON.stringify(h1Text)})`);
+        const words = alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+        assert(words === "say:H1|The:H2|one:H3", `${label}: every word keeps its alignment (got ${words})`);
+        assert(r.preservedAlignment === true, `${label}: preservedAlignment stays true`);
+      }
+    }
+  }
+  // Nested (compound) milestone ending in its own comma: `H0[H1[say ","]]`.
+  const nested = {
+    verseObjects: [
+      zaln("H0", [zaln("H1", [w("say"), t(",")])]),
+      { type: "quote", tag: "q1" },
+      zaln("H2", [w("The")]),
+      t(" "),
+      zaln("H3", [w("one")]),
+      t("."),
+    ],
+  };
+  const oldN = extractEditableText(nested);
+  const rN = smartEditVerse(nested, oldN, oldN.replace("The", '"The'), { capturedFromDom: true });
+  const cN = curlifyVerseContent(rN.content);
+  const gotN = extractEditableText(cN);
+  assert(gotN === "say,\\q1 “The one.", `nested milestone: quote is after the marker (got ${JSON.stringify(gotN)})`);
+  const wordsN = alignedWords(cN).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  assert(wordsN === "say:H0/H1|The:H2|one:H3", `nested milestone: every word keeps its alignment (got ${wordsN})`);
+  // A typed line-leading em-dash takes the same path.
+  const dashBase = {
+    verseObjects: [zaln("H1", [w("say"), t(",")]), { type: "quote", tag: "q1" }, zaln("H2", [w("The")]), t(" "), zaln("H3", [w("one")]), t(".")],
+  };
+  const oldD = extractEditableText(dashBase);
+  const gotD = extractEditableText(smartEditVerse(dashBase, oldD, oldD.replace("The", "—The"), { capturedFromDom: true }).content);
+  assert(gotD === "say,\\q1 —The one.", `typed em-dash: lands after the marker (got ${JSON.stringify(gotD)})`);
+  // A STORED line-leading dash (ZEC 13:7 ULT keeps it as the leading child of the
+  // next milestone, after `\n` + `\q1`) must stay on its line when the translator
+  // edits punctuation elsewhere in the verse. The relayout used to fold it into
+  // the previous milestone's `”` leaf and the reconcile kept it before the marker.
+  const stored = {
+    verseObjects: [
+      zaln("H0", [w("Strike")]), t(" "),
+      zaln("H1", [w("my"), t(" "), w("companion"), t("”")]), t("\n"),
+      { type: "quote", tag: "q1" },
+      zaln("H2", [t("—"), w("the")]), t(" "),
+      zaln("H3", [w("declaration")]), t("."),
+    ],
+  };
+  const oldS = extractEditableText(stored);
+  const rS = smartEditVerse(stored, oldS, oldS.replace("Strike", "Strike,"), { capturedFromDom: true });
+  const gotS = extractEditableText(rS.content);
+  assert(/companion”\s*\\q1 —the declaration\.$/.test(gotS), `stored em-dash stays after the marker on an unrelated edit (got ${JSON.stringify(gotS)})`);
+  const wordsS = alignedWords(rS.content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  assert(wordsS === "Strike:H0|my:H1|companion:H1|the:H2|declaration:H3", `stored em-dash: every word keeps its alignment (got ${wordsS})`);
 }
 
 if (failed > 0) {
