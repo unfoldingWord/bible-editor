@@ -97,10 +97,20 @@ for (const mode of ["stacked", "columns", "book"] as const) {
       .locator('[data-find-cell="6-15-UST"][contenteditable="true"], [data-find-cell="6-15-UST"] [contenteditable="true"]')
       .first();
     await cell.waitFor({ timeout: 10_000 });
+    // UST's own save button, never ULT's: stacked keeps it beside the cell;
+    // book and columns mode render it inside the UST verse's data-find-cell.
     const saveButton = () =>
       mode === "stacked"
         ? cell.locator("xpath=..").locator('[aria-label="save edits"] button')
-        : page.getByRole("button", { name: "save verse 15" }).first();
+        : page.locator('[data-find-cell="6-15-UST"]').getByRole("button", { name: "save verse 15" });
+    // A draft shows the button; a cleared draft disables it (stacked, where
+    // its tooltip turns to "no unsaved edits") or hides it.
+    const expectDraftCleared = async () => {
+      if (mode === "stacked") {
+        await expect(cell).not.toHaveAttribute("data-dirty", "true");
+        await expect(cell.locator("xpath=..").locator('[aria-label="no unsaved edits"] button')).toBeDisabled();
+      } else await expect(saveButton()).toBeHidden();
+    };
 
     // Select the stored `’s` of `Yahweh’s` and paste a straight `'s` over it.
     await cell.click();
@@ -108,7 +118,14 @@ for (const mode of ["stacked", "columns", "book"] as const) {
     await page.keyboard.insertText("'s");
     await expect(cell).toContainText("Yahweh's temple");
     await page.waitForTimeout(500);
+    // The click must reach UST's save: its button is there and live because
+    // this paste made a UST draft.
+    await expect(saveButton()).toHaveCount(1);
+    await expect(saveButton()).toBeVisible();
+    await expect(saveButton()).toBeEnabled();
     await saveButton().click();
+    // That save took the no-op path and cleared the draft.
+    await expectDraftCleared();
     // Let any repaint / queued PATCH land.
     await page.waitForTimeout(1500);
     const shown = (await cell.textContent()) ?? "";
@@ -125,6 +142,8 @@ for (const mode of ["stacked", "columns", "book"] as const) {
     await page.keyboard.press("ControlOrMeta+End");
     await page.keyboard.insertText(" Amen.");
     await page.waitForTimeout(500);
+    await expect(saveButton()).toBeVisible();
+    await expect(saveButton()).toBeEnabled();
     await saveButton().click();
     const confirmShown = await unalignConfirm
       .waitFor({ state: "visible", timeout: 2500 })
@@ -132,7 +151,14 @@ for (const mode of ["stacked", "columns", "book"] as const) {
       .catch(() => false);
     if (confirmShown) await unalignConfirm.getByRole("button", { name: /save anyway/i }).click();
     await expect.poll(async () => (await serverVerse()).version).toBeGreaterThan(before.version);
+    await page.waitForTimeout(500);
     const after = await serverVerse();
+    // Exactly the one save, and it carried both edits.
+    expect(patches.length, "the two-sided edit is one PATCH").toBe(1);
+    expect(after.version).toBe(before.version + 1);
+    expect(after.plain_text.startsWith("Then ")).toBe(true);
+    expect(after.plain_text.endsWith(" Amen.")).toBe(true);
+    await expectDraftCleared();
     const alignedAfter = alignedCount(JSON.parse(after.content_json));
     console.log(`[s28] ${mode} case1 two-sided edit: confirm shown:`, confirmShown, "| aligned words before/after:", alignedBefore, alignedAfter, "|", after.plain_text);
     expect.soft(confirmShown, "no unalign confirm for edits that do not touch Yahweh’s").toBe(false);
@@ -143,20 +169,20 @@ for (const mode of ["stacked", "columns", "book"] as const) {
 
 for (const variant of [
   // A real edit typed at the end: saved, and curled by the save.
-  { name: "typed edit", ref: ULT_72, needle: null, insert: " the dog's bone", patches: 1, shows: "the dog’s bone", backAtOnce: false },
+  { name: "typed edit", user: "curl1279dualtyped", ref: ULT_72, needle: null, insert: " the dog's bone", patches: 1, shows: "the dog’s bone", backAtOnce: false },
   // The same, clicking straight back into the line after Save, so the line
   // may be focused again by the time the saved text reaches it.
-  { name: "typed edit, straight back into the line", ref: ULT_72, needle: null, insert: " a cat's tail", patches: 1, shows: "a cat’s tail", backAtOnce: true },
+  { name: "typed edit, straight back into the line", user: "curl1279dualback", ref: ULT_72, needle: null, insert: " a cat's tail", patches: 1, shows: "a cat’s tail", backAtOnce: true },
   // Only ’ → ' (with the ! before it, so the insert is multi-character and
   // the typing interceptor does not curl it): a no-op save.
-  { name: "quote-only paste", ref: ULT_615, needle: "God!’", insert: "!'", patches: 0, shows: "God!’”", backAtOnce: false },
+  { name: "quote-only paste", user: "curl1279dualquote", ref: ULT_615, needle: "God!’", insert: "!'", patches: 0, shows: "God!’”", backAtOnce: false },
 ]) {
   test(`dual aligner (${variant.name}): after Save the reading line shows the curled text and stays clean`, async ({
     browser,
   }) => {
     test.setTimeout(90_000);
     const r = variant.ref;
-    const { context } = await newUserContext(browser, `curl1279dual${variant.patches}${variant.backAtOnce ? "b" : ""}`);
+    const { context } = await newUserContext(browser, variant.user);
     const page = await context.newPage();
     const serverVerse = async (): Promise<VerseRow> => {
       const res = await context.request.get(versePath(r));
@@ -184,7 +210,11 @@ for (const variant of [
     const save = lineBox.getByRole("button", { name: "Save ULT", exact: true });
 
     await line.click();
-    if (variant.needle) await selectText(page, line, variant.needle, variant.needle.length - 2, 2);
+    // `God!’` → select its last two characters, `!’`.
+    if (variant.needle) {
+      await selectText(page, line, variant.needle, variant.needle.length - 2, 2);
+      expect(await page.evaluate(() => window.getSelection()?.toString())).toBe("!’");
+    }
     else await page.keyboard.press("ControlOrMeta+End");
     await page.keyboard.insertText(variant.insert);
     await expect(save).toBeEnabled();
@@ -214,7 +244,8 @@ for (const variant of [
     console.log(`[s28] dual ${variant.name}: Save enabled after type-and-undo:`, dirtyAfterUndo, "| unsaved prompt on close:", gateShown);
     expect.soft(patches.length).toBe(variant.patches);
     expect.soft(shown, "the line shows the curled text after its save").toContain(variant.shows);
-    expect.soft(shown).not.toMatch(/['"]/);
+    // Straight quotes only: the curly ’ and ” the verse holds do not match.
+    expect.soft(shown, "no straight quote left in the line").not.toMatch(/['"]/);
     expect.soft(dirtyAfterUndo, "type-and-undo leaves the line clean").toBe(false);
     expect.soft(gateShown, "no unsaved-changes prompt").toBe(false);
     await context.close();
