@@ -1123,7 +1123,7 @@ function smartRebuildRange(
 // target tokens by `text|occurrence`, so the second one was unreachable (EZK
 // 12:3 UST). Copy-on-change: untouched nodes keep identity, and the input tree
 // (often the live React state) is never mutated.
-function renumberTargetOccurrences(nodes: unknown[]): unknown[] {
+export function renumberTargetOccurrences(nodes: unknown[]): unknown[] {
   const words: Array<Record<string, unknown>> = [];
   const collect = (list: unknown[]): void => {
     for (const n of list) {

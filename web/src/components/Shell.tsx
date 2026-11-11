@@ -4261,8 +4261,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       afterCommit?.({ queued: false });
       return;
     }
-    // `plain` is raw DOM textContent, so the dropped-marker-chip guard applies
-    // here and only here — see smartEditVerse's `capturedFromDom` (#606).
+    // `typedEditable` comes from the DOM capture (normalized, which the engine
+    // does itself first anyway), so the dropped-marker-chip guard applies here
+    // and only here — see smartEditVerse's `capturedFromDom` (#606).
     const engineResult = smartEditVerse(effectiveBase.content, oldEditable, typedEditable, {
       capturedFromDom: true,
     });

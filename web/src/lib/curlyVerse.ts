@@ -19,6 +19,8 @@
 // changes only `.text` strings: no node is added, removed or moved, and the
 // tokenizer treats ' and ’ alike, so word counts and alignment are unchanged.
 
+import { renumberTargetOccurrences } from "./replace.ts";
+
 const CURLY_LDQUO = "“";
 const CURLY_RDQUO = "”";
 const CURLY_LSQUO = "‘";
@@ -157,10 +159,15 @@ export function adoptBaseQuotes(base: string, typed: string): string {
 // mutates `content`: the engine's result shares untouched nodes with the
 // pinned base and the chapter cache, so a curled copy is built instead. Returns
 // `content` itself (same reference) when there is nothing to curl.
+//
+// Occurrences are renumbered afterwards: the engine numbers them before the
+// curl, so `don’t` plus a typed `don't` would otherwise stay two "don’t 1/1",
+// and the aligner keys target tokens by text|occurrence (the EZK 12:3 bug).
 export function curlifyVerseContent<T>(content: T): T {
   const vo = (content as { verseObjects?: unknown } | null)?.verseObjects;
   if (!Array.isArray(vo) || !hasStraightQuoteText(vo)) return content;
   const copy = structuredClone(content) as T & { verseObjects: unknown[] };
   curlifyVerseObjectsInPlace(copy.verseObjects);
+  copy.verseObjects = renumberTargetOccurrences(copy.verseObjects);
   return copy;
 }

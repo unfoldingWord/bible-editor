@@ -35,6 +35,7 @@
 import { smartEditVerse } from "../lib/replace.ts";
 import { extractEditableText, extractPlainText } from "../lib/usfm.ts";
 import { nfc } from "../lib/hebrew.ts";
+import { curlifyVerseContent } from "../lib/curlyVerse.ts";
 
 // Structural view of a verse PATCH op's payload (what enqueueVerse stores).
 // `alignment_intent` is api.ts's AlignmentIntent, typed loosely here so this
@@ -118,24 +119,38 @@ export function rebaseVersePatch(
   if (intent === "section_edit") {
     return { kind: "verbatim" };
   }
+  // Text saves curl straight quotes (#1273), so the op's tree can hold
+  // `baby’s` where the server's still holds `baby's` (stored data, an aligner
+  // save, a history restore, an older tab), or the other way round. Diffing
+  // those raw makes the engine treat the untouched word as edited and drop its
+  // alignment, which the guard does not catch. Curl both sides and rebase
+  // curled onto curled. The early returns above stay raw: alignment_edit
+  // (which history restores use) and section_edit ops are never curled.
+  const curledServer = curlifyVerseContent(serverContent);
+  try {
+    serverText = extractEditableText(curledServer);
+    opText = extractEditableText(curlifyVerseContent(content));
+  } catch {
+    return { kind: "verbatim" };
+  }
   // Text unchanged (nfc-compared) → adopt the server tree wholesale rather
   // than handing smartEditVerse two byte-unequal strings. The engine's own
   // early-return compares RAW strings, so a pure combining-mark-order
   // difference (UHB vs NFC Hebrew) would otherwise run the diff tiers over a
   // phantom "edit" and could churn marks on words the translator never
   // touched. Same outcome as the engine's no-op branch, made mark-order-safe.
-  if (textUnchanged) {
+  if (nfc(serverText) === nfc(opText)) {
     return {
       kind: "rebased",
       patch: {
         ...patch,
-        content: serverContent,
-        plain_text: extractPlainText(serverContent),
+        content: curledServer,
+        plain_text: extractPlainText(curledServer),
       },
     };
   }
   try {
-    const result = smartEditVerse(serverContent, serverText, opText);
+    const result = smartEditVerse(curledServer, serverText, opText);
     return {
       kind: "rebased",
       patch: {
