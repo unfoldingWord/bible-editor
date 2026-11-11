@@ -3478,6 +3478,76 @@ function countAllMilestones(nodes) {
   }
 }
 
+// Case 88: a punctuation-only find/replace across a line break keeps the
+// line break, and keeps text on the side of it where it was (#1309). ZEC 1:14
+// ULT stores `Armies` `":\n"` `\q1` and usfm-js parks the line-leading `“` on
+// the `\q1` node. A match that started inside `Armies` (`s: “`) fell to the
+// localized rewrite, which dropped the `\q1`; a boundary-aligned match
+// (`Armies: “`) took the punctuation relayout, which wrote `, “` into the `:\n`
+// leaf and emptied the marker, moving the opener to the previous line. A `\q1`
+// with no text (the opener in its own text node) was invisible to the relayout
+// and got the same result. ZEC 13:7 has a line-leading `—` after one `\q1` and
+// a line-ending `—` before another; each must stay on its own line.
+{
+  console.log("\nCase 88: punctuation-only find/replace across a line break keeps the line break (#1309)");
+  const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+  const verse = (c, v) => ({ verseObjects: JSON.parse(JSON.stringify(zecUlt.chapters[c][v].verseObjects)) });
+  const sig = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("+")}`).join("|");
+  const markers = (content) => (extractEditableText(content).match(/\\q\d?/g) ?? []).length;
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  // `wantFrom`/`wantTo`: the editable text around the change, before and after.
+  const check = (label, content, find, repl, wantFrom, wantTo) => {
+    const plain = extractPlainText(content);
+    const i = plain.indexOf(find);
+    assert(i >= 0, `${label}: setup: verse contains ${JSON.stringify(find)}`);
+    const before = extractEditableText(content);
+    assert(before.includes(wantFrom), `${label}: setup: editable text contains ${JSON.stringify(wantFrom)}`);
+    const wantEditable = before.replace(wantFrom, wantTo);
+    const wantPlain = plain.slice(0, i) + repl + plain.slice(i + find.length);
+    for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+      const r = fn(clone(content), plain, new RegExp(esc(find), "g"), i, find.length, repl);
+      const ed = extractEditableText(r.content);
+      assert(ed === wantEditable, `${label} (${entry}): editable text ends ${JSON.stringify(wantTo)} (got ${JSON.stringify(ed.slice(Math.max(0, ed.indexOf(wantTo.slice(0, 4)) - 10)))})`);
+      assert(markers(r.content) === markers(content), `${label} (${entry}): every line break survives (${markers(content)} -> ${markers(r.content)})`);
+      assert(sig(r.content) === sig(content), `${label} (${entry}): every word keeps its alignment (got ${sig(r.content)})`);
+      assert(extractPlainText(r.content) === wantPlain, `${label} (${entry}): plain text is the replaced text (got ${JSON.stringify(extractPlainText(r.content))})`);
+      const delta = analyzeAlignmentDelta(content, r.content);
+      assert(delta.unexpectedLosses.length === 0 && delta.afterAligned === delta.beforeAligned,
+        `${label} (${entry}): the save guard sees no loss (${delta.beforeAligned} -> ${delta.afterAligned})`);
+    }
+  };
+
+  // Repro 1: the window starts inside `Armies` (the widened path).
+  check("repro 1: s: “ -> s, “ (ZEC 1:14)", verse("1", "14"), "s: “", "s, “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  // Repro 2: the window is boundary-aligned.
+  check("repro 2: Armies: “ -> Armies, “ (ZEC 1:14)", verse("1", "14"), "Armies: “", "Armies, “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  // The opener itself changed or removed: the new opener (or nothing) follows the line break.
+  check("Armies: “ -> Armies: ‘ (ZEC 1:14)", verse("1", "14"), "Armies: “", "Armies: ‘", "Armies: \\q1 “I", "Armies: \\q1 ‘I");
+  check("Armies: “ -> Armies; ‘ (ZEC 1:14, both sides changed)", verse("1", "14"), "Armies: “", "Armies; ‘", "Armies: \\q1 “I", "Armies; \\q1 ‘I");
+  check("s: “ -> s: (ZEC 1:14, opener removed)", verse("1", "14"), "s: “", "s: ", "Armies: \\q1 “I", "Armies: \\q1 I");
+
+  // Repro 3: the `\q1` carries no text; the opener is its own text node.
+  const hand = (first) => ({ verseObjects: [zaln("H1", first), t(":\n"), { tag: "q1", type: "quote" }, t("“"), zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] });
+  check("repro 3: rmies: “ -> rmies, “ (textless \\q1)", hand([w("Armies")]), "rmies: “", "rmies, “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  check("repro 3: Armies: “ -> Armies, “ (textless \\q1)", hand([w("Armies")]), "Armies: “", "Armies, “", "Armies: \\q1 “I", "Armies, \\q1 “I");
+  check("repro 3: Yahweh’s: “ -> Yahweh’s, “ (textless \\q1, split possessive)", hand([w("Yahweh"), t("’"), w("s")]), "Yahweh’s: “", "Yahweh’s, “", "Yahweh’s: \\q1 “I", "Yahweh’s, \\q1 “I");
+
+  // A line-leading `—` stays after its `\q1`, a line-ending `—` before its
+  // `\q1` (the ZEC 13:7 shapes; the sample file keeps that verse's dashes
+  // inside the `\w` words, so these trees store them as text, as the AI
+  // pipeline does).
+  const leading = { verseObjects: [zaln("H1", [w("companion"), t("”")]), t("\n"), { tag: "q1", type: "quote" }, zaln("H2", [t("—"), w("the")]), t(" "), zaln("H3", [w("declaration")]), t(".")] };
+  check("companion” —the -> companion,” —the (line-leading dash)", leading, "companion” —the", "companion,” —the",
+    "companion” \\q1 —the", "companion,” \\q1 —the");
+  const ending = { verseObjects: [zaln("H1", [w("Armies"), t("—")]), t("\n"), { tag: "q1", type: "quote" }, t("“"), zaln("H2", [w("Strike")]), t(" "), zaln("H3", [w("him")]), t(".”")] };
+  check("Armies— “Strike -> Armies— ‘Strike (line-ending dash)", ending, "Armies— “Strike", "Armies— ‘Strike",
+    "Armies— \\q1 “Strike", "Armies— \\q1 ‘Strike");
+  // A line break with nothing after it: the new punctuation stays before it, as before.
+  check("shepherd, and -> shepherd; and (ZEC 13:7, nothing after the \\q2)", verse("13", "7"), "shepherd, and", "shepherd; and",
+    "shepherd, \\q2 and", "shepherd; \\q2 and");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
