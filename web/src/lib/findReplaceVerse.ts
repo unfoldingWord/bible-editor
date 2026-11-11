@@ -76,8 +76,15 @@ export function replaceAllInVerse(
   let curContent = content;
   let curPlain = plainText;
   let preserved = true;
-  for (let i = 0; i < maxIters; i++) {
-    const localRe = new RegExp(regex.source, regex.flags);
+  // Where the next search starts. A step with no visible change is skipped
+  // (not applied) and the search moves past its match, so a later match still
+  // gets replaced; only applied steps count toward `maxIters`. Every pass
+  // either applies a step or moves `from` forward, so the loop ends.
+  let from = 0;
+  const globalFlags = regex.flags.includes("g") ? regex.flags : regex.flags + "g";
+  for (let applied = 0; applied < maxIters; ) {
+    const localRe = new RegExp(regex.source, globalFlags);
+    localRe.lastIndex = from;
     const next = localRe.exec(curPlain);
     if (!next) break;
     const result = smartReplaceVerse(curContent, curPlain, regex, next.index, next[0].length, replaceText);
@@ -86,10 +93,18 @@ export function replaceAllInVerse(
     // node beside it (`namethis` for `name \q1 this`), so the next step's
     // search matched across the line break (#1307).
     const nextPlain = extractPlainText(result.content);
-    if (result.plainText === curPlain || nextPlain === curPlain) break;
+    // No visible change: the engine changed nothing, or only the tree beside
+    // such a marker (removing the space leaf before it, which the marker
+    // still stands in for). Skip this match.
+    if (result.plainText === curPlain || nextPlain === extractPlainText(curContent)) {
+      from = next.index + Math.max(1, next[0].length);
+      continue;
+    }
     if (!result.preservedAlignment) preserved = false;
     curContent = result.content;
     curPlain = nextPlain;
+    from = 0;
+    applied++;
   }
   return finalizeFindReplace(content, plainText, {
     content: curContent,

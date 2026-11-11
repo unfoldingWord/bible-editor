@@ -1252,10 +1252,18 @@ function smartReplaceVerseImpl(
   // reads `name this` (extractPlainText puts a space at the marker) but raw
   // reads `namethis`, so `et` matched across the seam first and the save
   // edited `name`/`this` instead of `set`, and a phrase spanning the marker
-  // found nothing in raw and flattened the verse. The occurrence count stays
-  // as the fallback for a plain text whose characters don't line up with raw
-  // (`\sp` label text, which raw keeps and extractPlainText skips).
+  // found nothing in raw and flattened the verse. When the two texts' characters
+  // don't line up (a stale stored plain text, or `\sp` label text that raw keeps
+  // and extractPlainText skips), it falls back to the old occurrence count, which
+  // counts in raw and so can still land on such text.
   const located = locatePlainRangeInRaw(plainText, raw, matchStartInPlain, matchLenInPlain);
+  // A whitespace-only match at a marker with no text node beside it: the space
+  // is in the plain text only (the marker is the separator), so the tree has
+  // nothing to replace. Leave the verse as it is; counting occurrences instead
+  // would pick some other whitespace in raw, or none and flatten the verse.
+  if (located && located.end === located.start) {
+    return { content, plainText, preservedAlignment: true };
+  }
   // Raw can contain `\n` (or multi-space) where plainText has a single space —
   // notably around `{...}` word-addition markers and across line-broken
   // `\w` tokens. The strict regex was derived from normalized plainText, so
@@ -1515,8 +1523,8 @@ function smartReplaceVerseImpl(
 // non-whitespace characters must agree, whitespace runs of any width (or none,
 // at a line marker with no text node beside it) line up with each other.
 // Returns null when the characters disagree (the caller falls back to
-// counting occurrences), for an empty match, and for a whitespace-only match
-// that has no whitespace in raw.
+// counting occurrences) and for an empty match. A whitespace-only match that
+// has no whitespace in raw (the space at a bare marker) maps to an empty range.
 function locatePlainRangeInRaw(plain: string, raw: string, start: number, len: number): { start: number; end: number } | null {
   if (len <= 0) return null;
   const s = mapStrippedPosToRaw(plain, raw, start);
@@ -1526,7 +1534,7 @@ function locatePlainRangeInRaw(plain: string, raw: string, start: number, len: n
   // whitespace before it (as the old `\s+`-relaxed regex search anchored).
   let rs = s;
   if (!/\s/.test(plain[start])) while (rs < raw.length && /\s/.test(raw[rs])) rs++;
-  return e > rs ? { start: rs, end: e } : null;
+  return { start: rs, end: Math.max(rs, e) };
 }
 
 // Is `result` exactly the replacement the translator asked for: its visible
