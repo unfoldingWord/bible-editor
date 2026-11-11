@@ -143,7 +143,7 @@ console.log("quote right after a mid-verse \\q1 marker curls as opening");
   assert(alignedWords(r.content).join(" ") === "He@H1 said@H2 Turn@H3 back@H4", "alignment kept");
 }
 
-console.log("editor still showing ' where the saved verse has ’ (not yet repainted) unaligns nothing");
+console.log("a ' typed (or still shown) where the saved verse has ’, plus an edit elsewhere, unaligns nothing");
 {
   const mk = () => ({
     verseObjects: [

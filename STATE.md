@@ -83,6 +83,17 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **Curl a verse's straight quotes on the engine's RESULT tree, never on the typed text (#1273).** The typing
+  interceptor (`curlyQuotes.ts`) only curls a single typed quote, so `saveVerseDraft` curls the tree that
+  `smartEditVerse` returns (`curlifyVerseContent`, `web/src/lib/curlyVerse.ts`). Curling the typed string first
+  makes an untouched aligned `baby's` stop matching its `\w` by surface text, so it comes back unaligned, and
+  `analyzeAlignmentDelta`/`guardBlocksSave` do not catch it (the LCS skips words whose text changed). For the same
+  reason the save reads a straight quote typed where the saved verse has the curly form as unchanged
+  (`adoptBaseQuotes`): before that, retyping a stored `Yahweh’s` as `Yahweh's` plus an edit at the far end of ZEC
+  6:15 UST silently unaligned the words between them (aligned 20 → 18, no confirm). The curl is not in
+  `enqueueVerseSafely`: history restore must re-save bytes exactly. Find/replace and section/aligner saves do not
+  curl.
+
 - **Columns mode verse styling must reach block children.** A DocColumn verse is a `display: inline` span, but a
   poetry/paragraph verse's contentEditable carries `be-q`/`be-para`/`be-line` (block) and mid-verse `\q` lines render
   as `<div>`s. A block splits the inline span, and the span's background/box-shadow never paints behind it, so a style
