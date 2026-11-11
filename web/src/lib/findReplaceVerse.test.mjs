@@ -10,7 +10,7 @@
 //   node --experimental-strip-types --no-warnings src/lib/findReplaceVerse.test.mjs
 
 import assert from "node:assert/strict";
-import { findReplaceVerse } from "./findReplaceVerse.ts";
+import { findReplaceVerse, replaceAllInVerse } from "./findReplaceVerse.ts";
 import { smartReplaceVerse } from "./replace.ts";
 import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { rebaseVersePatch } from "../sync/verseRebase.ts";
@@ -153,6 +153,53 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   const plain = "the baby's toy.";
   const r = findReplaceVerse(verse, plain, /toy/gi, 11, 3, "toy");
   check(r.plainText === plain, `plainText unchanged (got ${JSON.stringify(r.plainText)})`);
+}
+
+// ── Replace all: a step the curl would undo must not stop later matches ─────
+//
+// Replace all replaces one match at a time. Curling after each step made a
+// step the curl undoes look like "no change", so the loop stopped and later
+// real matches in the same verse were skipped (case-insensitive `don’t` →
+// `Don't` on "Don’t go and don’t stay." left the second one alone).
+{
+  console.log("\n[#1276 A1] replace all: a curl-undone first match does not stop the rest");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("Don’t")]), t(" "), zaln("H2", [w("go")]), t(" "), zaln("H3", [w("and")]), t(" "),
+      zaln("H4", [w("don’t")]), t(" "), zaln("H5", [w("stay")]), t("."),
+    ],
+  };
+  const plain = "Don’t go and don’t stay.";
+  const r = replaceAllInVerse(verse, plain, /don’t/gi, 2, "Don't");
+  check(r.plainText === "Don’t go and Don’t stay.", `every match replaced, curled (got ${JSON.stringify(r.plainText)})`);
+  check(r.plainText === extractPlainText(r.content), "plainText is the saved tree's plain text");
+  check(!hasStraightQuote(r.content), "no straight quote left in the saved tree");
+  check(
+    ["go:H2", "and:H3", "stay:H5"].every((x) => alignedWords(r.content).includes(x)),
+    `untouched words keep alignment (${alignedWords(r.content).join(" ")})`,
+  );
+}
+
+// Finding a straight quote: curling after the first step turned the verse's
+// other straight quotes curly, so the next pass found nothing and the
+// replace-all count the confirm dialog showed was not honored.
+{
+  console.log("\n[#1276 A2] replace all of a straight quote replaces every one");
+  const verse = { verseObjects: [zaln("H1", [w("a's")]), t(" "), zaln("H2", [w("b's")])] };
+  const r = replaceAllInVerse(verse, "a's b's", /'/g, 2, "X");
+  check(r.plainText === "aXs bXs", `both matches replaced (got ${JSON.stringify(r.plainText)})`);
+}
+
+// Replace all of ’ → ' is still a no-op for the verse as a whole.
+{
+  console.log("\n[#1276] replace all ’ → ' changes nothing");
+  const verse = {
+    verseObjects: [zaln("H1", [w("baby’s")]), t(" "), zaln("H2", [w("Yahweh’s")]), t(" "), zaln("H3", [w("toy")])],
+  };
+  const plain = "baby’s Yahweh’s toy";
+  const r = replaceAllInVerse(verse, plain, /’/g, 2, "'");
+  check(r.plainText === plain, `plainText unchanged, so nothing is queued (got ${JSON.stringify(r.plainText)})`);
+  check(JSON.stringify(r.content) === JSON.stringify(verse), "content unchanged");
 }
 
 // ── Quote-free replaces are untouched ────────────────────────────────────────

@@ -34,7 +34,7 @@ import type { ChapterState } from "../hooks/useBook";
 import type { TnRow, TqRow, VerseDto } from "../sync/api";
 import { drafts, rowKey } from "../sync/drafts";
 import type { ChapterData } from "../lib/verseStructure";
-import { findReplaceVerse } from "../lib/findReplaceVerse";
+import { findReplaceVerse, replaceAllInVerse } from "../lib/findReplaceVerse";
 import { loadFindDraft, saveFindDraft } from "../lib/findState";
 import {
   applyQuestionMatch,
@@ -723,31 +723,14 @@ export function FindReplaceOverlay({
       if (!state || state.kind !== "ready") continue;
       const verse = state.data.verses[bv]?.[v];
       if (!verse) continue;
-      let content: unknown = verse.content;
-      let plainText = verse.plain_text ?? "";
-      // Replace one occurrence at a time, re-scanning the current plain
-      // text. Cap iterations at the original match count so a runaway
-      // replace pattern (where the result keeps matching the regex) can't
-      // loop forever — same safety the per-verse counter gives us.
-      const maxIters = list.length;
-      let preservedThisVerse = true;
-      for (let i = 0; i < maxIters; i++) {
-        const localRe = new RegExp(compiled.re.source, compiled.re.flags);
-        const next = localRe.exec(plainText);
-        if (!next) break;
-        const result = findReplaceVerse(
-          content,
-          plainText,
-          compiled.re,
-          next.index,
-          next[0].length,
-          replace,
-        );
-        if (result.plainText === plainText) break;
-        if (!result.preservedAlignment) preservedThisVerse = false;
-        content = result.content;
-        plainText = result.plainText;
-      }
+      // Cap iterations at the original match count so a runaway replace
+      // pattern (where the result keeps matching the regex) can't loop
+      // forever — same safety the per-verse counter gives us.
+      const {
+        content,
+        plainText,
+        preservedAlignment: preservedThisVerse,
+      } = replaceAllInVerse(verse.content, verse.plain_text ?? "", compiled.re, list.length, replace);
       if (plainText === verse.plain_text) continue;
       versesReplaced += 1;
       if (!preservedThisVerse) alignmentLost += 1;

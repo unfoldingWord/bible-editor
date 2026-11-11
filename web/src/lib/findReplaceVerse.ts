@@ -41,3 +41,31 @@ export function findReplaceVerse(
   }
   return { ...result, content: curled, plainText: curledPlain };
 }
+
+// Replace-all within one verse: replace one occurrence at a time, re-scanning
+// the current plain text (normalize() inside smartReplaceVerse can collapse
+// whitespace and shift later match indices). `maxIters` (the verse's original
+// match count) stops a replacement that keeps matching the regex from looping
+// forever. `preservedAlignment` is false when any step lost alignment.
+export function replaceAllInVerse(
+  content: unknown,
+  plainText: string,
+  regex: RegExp,
+  maxIters: number,
+  replaceText: string,
+): SmartReplaceResult {
+  let curContent = content;
+  let curPlain = plainText;
+  let preserved = true;
+  for (let i = 0; i < maxIters; i++) {
+    const localRe = new RegExp(regex.source, regex.flags);
+    const next = localRe.exec(curPlain);
+    if (!next) break;
+    const result = findReplaceVerse(curContent, curPlain, regex, next.index, next[0].length, replaceText);
+    if (result.plainText === curPlain) break;
+    if (!result.preservedAlignment) preserved = false;
+    curContent = result.content;
+    curPlain = result.plainText;
+  }
+  return { content: curContent, plainText: curPlain, preservedAlignment: preserved };
+}
