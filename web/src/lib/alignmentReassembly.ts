@@ -36,6 +36,7 @@
 
 import { nfc } from "./hebrew.ts";
 import { isInFlowMarker, isCharacterWrapper } from "./usfm.ts";
+import { WORD_RUN_RE } from "./wordRun.ts";
 
 export interface ReassemblyResult {
   verseObjects: unknown[];
@@ -45,15 +46,10 @@ export interface ReassemblyResult {
   preservedAlignment: boolean;
 }
 
-// Word characters — kept byte-identical to replace.ts WORD_CHAR / WORD_RUN_RE so
-// the two tokenize the same way (intra-word apostrophe/hyphen, grouping comma
-// between digits, ZWJ/word-joiner). If they drift, reassembly and the diff tiers
-// will disagree about word boundaries and the fallback will fire spuriously.
-const WORD_CHAR = "[\\p{L}\\p{M}\\p{N}\\u200d\\u2060]";
-const WORD_RUN_RE = new RegExp(
-  `${WORD_CHAR}+(?:[-'’]${WORD_CHAR}+|(?<=\\p{N}),\\p{N}+)*`,
-  "gu",
-);
+// WORD_RUN_RE comes from wordRun.ts, the same copy replace.ts uses, so reassembly
+// and the diff tiers agree on word boundaries (intra-word apostrophe/hyphen,
+// grouping comma between digits, ZWJ/word-joiner). If they drifted, the
+// fallback would fire spuriously.
 
 function tokenize(text: string): string[] {
   return [...text.matchAll(WORD_RUN_RE)].map((m) => m[0]);

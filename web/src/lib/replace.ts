@@ -23,6 +23,7 @@ import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeadin
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 import { hoistOpeningPunctuation, concatVerseText } from "./openingPunct.ts";
+import { WORD_CHAR, WORD_RUN_RE } from "./wordRun.ts";
 
 export interface SmartReplaceResult {
   content: unknown;
@@ -90,21 +91,8 @@ function isWordLeaf(node: Record<string, unknown>): boolean {
   return node["type"] === "word" && node["tag"] === "w";
 }
 
-// Word characters: Unicode letters/marks/numbers plus the zero-width joiner
-// (U+200D) and word-joiner (U+2060) that ride inside some Hebrew/Greek tokens.
-// Defined once so WORD_RUN_RE and WORD_CORE_RE can't drift apart.
-const WORD_CHAR = "[\\p{L}\\p{M}\\p{N}\\u200d\\u2060]";
-// A word run plus its intra-word connectors. \p{N} is required because the UST
-// writes literal counts (`\w 30\w*`) for measurements — "30" must be a
-// draggable chip. Connectors bind two runs into ONE token: hyphen, straight /
-// curly apostrophe (don't, hello-world, Isaiah's), and — ONLY between digits —
-// the grouping comma, so "300,000" aligns as one chip instead of splitting like
-// the legacy tools (string-punctuation-tokenizer / tCreate) did. A comma not
-// flanked by digits ("a, b") stays a separator.
-const WORD_RUN_RE = new RegExp(
-  `${WORD_CHAR}+(?:[-'\u2019]${WORD_CHAR}+|(?<=\\p{N}),\\p{N}+)*`,
-  "gu",
-);
+// WORD_CHAR / WORD_RUN_RE (the engine's word pattern) live in wordRun.ts, one
+// copy shared with alignmentReassembly.ts and curlyVerse.ts (#1301).
 
 // Re-tokenize a plain string into a flat verseObjects-style array. Each
 // word run becomes a `\w` node so the aligner has draggable targets;

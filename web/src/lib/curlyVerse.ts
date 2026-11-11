@@ -22,6 +22,7 @@
 
 import { renumberTargetOccurrences } from "./replace.ts";
 import { hoistOpeningPunctuation } from "./openingPunct.ts";
+import { WORD_RUN_RE } from "./wordRun.ts";
 
 const CURLY_LDQUO = "“";
 const CURLY_RDQUO = "”";
@@ -181,12 +182,10 @@ export function adoptBaseQuotes(base: string, typed: string): string {
   return adoptBaseQuoteWords(base, words, WORD_RUN_RE);
 }
 
-// The edit engine's word run, kept identical to replace.ts WORD_CHAR /
-// WORD_RUN_RE (not exported there; alignmentReassembly.ts keeps the same
-// copy). A ' or ’ between letters is part of the word, so `Yahweh's,` holds
-// the run `Yahweh's`; ‘ is not, so a deliberate ’ → ‘ never pairs up.
-const WORD_CHAR = "[\\p{L}\\p{M}\\p{N}\\u200d\\u2060]";
-const WORD_RUN_RE = new RegExp(`${WORD_CHAR}+(?:[-'\u2019]${WORD_CHAR}+|(?<=\\p{N}),\\p{N}+)*`, "gu");
+// WORD_RUN_RE is the edit engine's word run, imported from wordRun.ts (the one
+// copy replace.ts and alignmentReassembly.ts also use). A ' or ’ between
+// letters is part of the word, so `Yahweh's,` holds the run `Yahweh's`; ‘ is
+// not, so a deliberate ’ → ‘ never pairs up.
 
 const MAX_LCS_CELLS = 10_000_000;
 
