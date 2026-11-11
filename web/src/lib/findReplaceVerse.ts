@@ -33,11 +33,14 @@ export function finalizeFindReplace(
   // verse holds a legacy straight quote the curl would otherwise rewrite.
   if (result.plainText === plainText) return result;
   const curled = curlifyVerseContent(result.content);
-  // Nothing to curl: the engine's result, byte for byte.
-  if (curled === result.content) return result;
+  // The saved plain text is the tree's, as every other verse save stores it.
+  // The engine's own plainText adds nothing at a line marker, so with no text
+  // node either side of it (`name \q1 this`) it read `namethis` (#1305).
   const curledPlain = extractPlainText(curled);
-  // The curl undid the whole change (a ’ → ' replace): hand back the verse
-  // and the caller's own plain text, so nothing is queued (no version bump).
+  // No visible change: the curl undid the whole change (a ’ → ' replace), or
+  // the engine's plain text differed from the stored one only at such a
+  // marker (a same-text replace). Hand back the verse and the caller's own
+  // plain text, so nothing is queued (no version bump).
   if (curledPlain === extractPlainText(content)) {
     return { ...result, content, plainText, preservedAlignment: true };
   }
