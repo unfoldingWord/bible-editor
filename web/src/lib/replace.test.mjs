@@ -3099,6 +3099,18 @@ function countAllMilestones(nodes) {
   const verse = { verseObjects: [zaln("H1", [w("say")]), { type: "quote", tag: "q1" }, zaln("H2", [w("The")]), t(" "), zaln("H3", [w("one")]), t(".")] };
   const got = extractEditableText(save(verse, (s) => s.replace("The", '"Word The')));
   assert(got === "say\\q1 “Word The one.", `issue repro: ${JSON.stringify("say\\q1 “Word The one.")} (got ${JSON.stringify(got)})`);
+  // The other side of the marker (#1294): a word typed at the END of the line
+  // before the marker took the stripped-only space as its separator and saved
+  // fused to the word before it (`sayWord\q1 The`).
+  for (const [label, edit, want] of [
+    ["Word at the line end", (s) => s.replace("say\\q1 ", "say Word\\q1 "), "Then say Word\\q1 The one."],
+    ["Word, at the line end", (s) => s.replace("say\\q1 ", "say Word,\\q1 "), "Then say Word,\\q1 The one."],
+  ]) {
+    const out = save(bare, edit);
+    const got = extractEditableText(out);
+    assert(got === want, `${label}: ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
+    assert(words(out) === "Then:H0|say:H1|Word:|The:H2|one:H3", `${label}: every old word keeps its alignment (got ${words(out)})`);
+  }
 }
 
 // Case 84: find/replace must not leave a \zaln milestone that wraps no \w word
