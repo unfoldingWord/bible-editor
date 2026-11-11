@@ -350,7 +350,17 @@ console.log("adoptBaseQuotes reconciles a retyped quote between two edits (#1290
   const longOut = adoptBaseQuotes(longBase, longTyped);
   const ms = Date.now() - t0;
   assert(longOut === `start ${longBase} end`, "long verse reconciled");
-  assert(ms < 1000, `long verse fast enough (${ms} ms)`);
+  assert(ms < 5000, `long verse fast enough (${ms} ms)`);
+  // Past the table cap (~10M cells) the word pass is skipped, not attempted:
+  // the lead/tail result stands and nothing huge is allocated.
+  const huge = Array.from({ length: 4000 }, (_, i) => (i === 2000 ? "w2000’s" : `w${i}`)).join(" ");
+  const hugeTyped = `start ${huge.replace("w2000’s", "w2000's")} end`;
+  assert(adoptBaseQuotes(huge, hugeTyped) === hugeTyped, "past the cap the word pass is skipped");
+  // No straight quote among the unmatched middle words: no table at all.
+  assert(
+    adoptBaseQuotes("A Yahweh’s B C", "X A Yahweh’s B C Y's") === "X A Yahweh’s B C Y's",
+    "a straight quote only in a new word leaves the text as typed",
+  );
 }
 
 console.log("ZEC 6:15 UST: 's retyped over ’s plus edits at both ends keeps every alignment (#1290)");

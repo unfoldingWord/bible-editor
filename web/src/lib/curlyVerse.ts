@@ -177,6 +177,8 @@ export function adoptBaseQuotes(base: string, typed: string): string {
   return adoptBaseQuoteWords(base, leadTail);
 }
 
+const MAX_LCS_CELLS = 10_000_000;
+
 const foldQuotes = (s: string): string => s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
 
 // Word-level pass of adoptBaseQuotes: matches typed words to saved words in
@@ -200,7 +202,12 @@ function adoptBaseQuoteWords(base: string, typed: string): string {
   for (let k = 1; k <= hi; k++) pairs.push([bf.length - k, tf.length - k]);
   const bm = bf.length - lo - hi;
   const tm = tf.length - lo - hi;
-  if (bm > 0 && tm > 0) {
+  // Only the unmatched middle needs the table, and only when a word there
+  // holds a straight quote. Cap the table (~40 MB) so a pasted wall of text
+  // can't exhaust memory on save; past the cap the lead/tail result stands.
+  let middleHasStraight = false;
+  for (let j = lo; j < tf.length - hi && !middleHasStraight; j++) middleHasStraight = /['"]/.test(typedSpans[j].text);
+  if (bm > 0 && tm > 0 && middleHasStraight && (bm + 1) * (tm + 1) <= MAX_LCS_CELLS) {
     // len[i][j] = LCS length of bf[lo+i..] and tf[lo+j..], flattened.
     const w = tm + 1;
     const len = new Uint32Array((bm + 1) * w);
