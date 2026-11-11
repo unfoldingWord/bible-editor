@@ -96,6 +96,11 @@ Highlights that bite repeatedly:
   sides (`verseRebase.ts`), so the rebase never reads a quote change as an edited word. History restores
   (`alignment_edit`) are never curled.
 
+- **Any step that curls quotes AFTER the edit engine must re-run the opening-quote hoist (#1278).**
+  `hoistOpeningPunctuation` only recognizes curly openers, so `curlifyVerseContent` hoists again on the curled tree.
+  Without it, a straight `"` pasted before an aligned word whose milestone ends in its own comma (the JER 31:18
+  shape) stayed inside that milestone and was curled in place to `, “` (the #777 stray-space shape).
+
 - **Columns mode verse styling must reach block children.** A DocColumn verse is a `display: inline` span, but a
   poetry/paragraph verse's contentEditable carries `be-q`/`be-para`/`be-line` (block) and mid-verse `\q` lines render
   as `<div>`s. A block splits the inline span, and the span's background/box-shadow never paints behind it, so a style
