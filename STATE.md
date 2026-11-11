@@ -91,8 +91,8 @@ Highlights that bite repeatedly:
   reason the save reads a straight quote typed where the saved verse has the curly form as unchanged
   (`adoptBaseQuotes`): before that, retyping a stored `Yahweh’s` as `Yahweh's` plus an edit at the far end of ZEC
   6:15 UST silently unaligned the words between them (aligned 20 → 18, no confirm). The curl is not in
-  `enqueueVerseSafely`: history restore must re-save bytes exactly. Find/replace and section/aligner saves do not
-  curl on their own, but a text op (find/replace included) rebased after a 409 or a sibling save is curled on both
+  `enqueueVerseSafely`: history restore must re-save bytes exactly. Find/replace curls its result tree too
+  (`findReplaceVerse.ts`, #1276); section/aligner saves do not curl on their own, but a text op (find/replace included) rebased after a 409 or a sibling save is curled on both
   sides (`verseRebase.ts`), so the rebase never reads a quote change as an edited word. History restores
   (`alignment_edit`) are never curled.
 
