@@ -150,15 +150,18 @@ function sameOrStraightened(baseCh: string, typedCh: string): boolean {
 
 // Where the typed text has a straight quote at a spot the saved verse already
 // has curled, use the saved curly form, so the edit engine sees no change
-// there. Only the unchanged lead and tail are reconciled (the same common
-// prefix/suffix the engine diffs on); the edited middle is kept as typed and
+// there. Two passes: the unchanged lead and tail (the same common
+// prefix/suffix the engine diffs on), then, between the first and last real
+// edit, every whitespace-separated word that matches a saved word except for
+// straight-for-curly quotes (#1290). Anything else is kept as typed and
 // curled after the engine runs.
 //
 // Needed because the save curls every straight quote anyway, so ' for ’ is
-// not a real edit, but the engine diffs characters: a stored `Yahweh’s` that
-// was retyped as `Yahweh's` (seen live on ZEC 6:15 UST, with a second edit at
-// the far end of the verse) made the engine rewrite everything between the
-// two spots and silently drop the alignment of the words there. The same
+// not a real edit, but the engine matches words by exact text: a stored
+// `Yahweh’s` retyped as `Yahweh's` (seen live on ZEC 6:15 UST) read as an
+// edited word and silently lost its alignment, and with only a far-end edit
+// the engine also rewrote everything in between. The lead/tail pass alone
+// missed a retype with real edits on both sides of it (#1290). The same
 // applies to an editor that still shows a ' the save has already curled.
 // Only straight-for-curly counts as unchanged: a deliberate ’ → ‘ change is
 // still a change.
@@ -169,7 +172,74 @@ export function adoptBaseQuotes(base: string, typed: string): string {
   while (p < n && sameOrStraightened(base[p], typed[p])) p++;
   let s = 0;
   while (s < n - p && sameOrStraightened(base[base.length - 1 - s], typed[typed.length - 1 - s])) s++;
-  return base.slice(0, p) + typed.slice(p, typed.length - s) + base.slice(base.length - s);
+  const leadTail = base.slice(0, p) + typed.slice(p, typed.length - s) + base.slice(base.length - s);
+  if (!/['"]/.test(leadTail) || !/[‘’“”]/.test(base)) return leadTail;
+  return adoptBaseQuoteWords(base, leadTail);
+}
+
+const MAX_LCS_CELLS = 10_000_000;
+
+const foldQuotes = (s: string): string => s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
+
+// Word-level pass of adoptBaseQuotes: matches typed words to saved words in
+// order (longest common subsequence, compared with quotes folded) and swaps in
+// the saved word where the only difference is a straight quote typed for its
+// curly one. Curly and straight quotes are one UTF-16 unit each, so a swap
+// never shifts offsets and the typed whitespace stays exactly as typed.
+function adoptBaseQuoteWords(base: string, typed: string): string {
+  const baseWords = base.match(/\S+/g) ?? [];
+  const typedSpans = [...typed.matchAll(/\S+/g)].map((m) => ({ start: m.index ?? 0, text: m[0] }));
+  const bf = baseWords.map(foldQuotes);
+  const tf = typedSpans.map((t) => foldQuotes(t.text));
+  // Words equal after folding at both ends pair up in order; the LCS only
+  // runs on what is left between them.
+  let lo = 0;
+  while (lo < bf.length && lo < tf.length && bf[lo] === tf[lo]) lo++;
+  let hi = 0;
+  while (hi < bf.length - lo && hi < tf.length - lo && bf[bf.length - 1 - hi] === tf[tf.length - 1 - hi]) hi++;
+  const pairs: Array<[number, number]> = [];
+  for (let i = 0; i < lo; i++) pairs.push([i, i]);
+  for (let k = 1; k <= hi; k++) pairs.push([bf.length - k, tf.length - k]);
+  const bm = bf.length - lo - hi;
+  const tm = tf.length - lo - hi;
+  // Only the unmatched middle needs the table, and only when a word there
+  // holds a straight quote. Cap the table (~40 MB) so a pasted wall of text
+  // can't exhaust memory on save; past the cap the lead/tail result stands.
+  let middleHasStraight = false;
+  for (let j = lo; j < tf.length - hi && !middleHasStraight; j++) middleHasStraight = /['"]/.test(typedSpans[j].text);
+  if (bm > 0 && tm > 0 && middleHasStraight && (bm + 1) * (tm + 1) <= MAX_LCS_CELLS) {
+    // len[i][j] = LCS length of bf[lo+i..] and tf[lo+j..], flattened.
+    const w = tm + 1;
+    const len = new Uint32Array((bm + 1) * w);
+    for (let i = bm - 1; i >= 0; i--) {
+      for (let j = tm - 1; j >= 0; j--) {
+        len[i * w + j] =
+          bf[lo + i] === tf[lo + j]
+            ? len[(i + 1) * w + j + 1] + 1
+            : Math.max(len[(i + 1) * w + j], len[i * w + j + 1]);
+      }
+    }
+    let i = 0;
+    let j = 0;
+    while (i < bm && j < tm) {
+      if (bf[lo + i] === tf[lo + j]) {
+        pairs.push([lo + i, lo + j]);
+        i++;
+        j++;
+      } else if (len[(i + 1) * w + j] >= len[i * w + j + 1]) i++;
+      else j++;
+    }
+  }
+  let out = typed;
+  for (const [bi, ti] of pairs) {
+    const b = baseWords[bi];
+    const { start, text } = typedSpans[ti];
+    if (b === text || !/['"]/.test(text)) continue;
+    let straightened = true;
+    for (let c = 0; c < b.length && straightened; c++) straightened = sameOrStraightened(b[c], text[c]);
+    if (straightened) out = out.slice(0, start) + b + out.slice(start + b.length);
+  }
+  return out;
 }
 
 // Returns verse content with every straight quote in its text curled. Never

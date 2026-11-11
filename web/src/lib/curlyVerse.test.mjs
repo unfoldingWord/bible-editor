@@ -309,6 +309,88 @@ console.log("adoptBaseQuotes");
   assert(adoptBaseQuotes("x “y” z", "x \"y\" z") === "x “y” z", "double quotes too");
 }
 
+// #1290: the lead/tail pass alone stops at the first and last real edit, so a
+// ' retyped over ’ between two edits stayed straight, the engine read
+// `Yahweh's` as an edited word, and its alignment was dropped silently.
+console.log("adoptBaseQuotes reconciles a retyped quote between two edits (#1290)");
+{
+  assert(
+    adoptBaseQuotes("A Yahweh’s B", "X A Yahweh's B Y") === "X A Yahweh’s B Y",
+    `issue case (got ${JSON.stringify(adoptBaseQuotes("A Yahweh’s B", "X A Yahweh's B Y"))})`,
+  );
+  assert(
+    adoptBaseQuotes("a “b” c ’d", "x a \"b\" c 'd y") === "x a “b” c ’d y",
+    "double and single quotes in the middle",
+  );
+  assert(
+    adoptBaseQuotes("A Yahweh’s B", "X A Yahweh‘s B Y") === "X A Yahweh‘s B Y",
+    "a deliberate ’ → ‘ in the middle is still a change",
+  );
+  assert(
+    adoptBaseQuotes("A Yahweh’s B", "X A Yahwehx's B Y") === "X A Yahwehx's B Y",
+    "an edited word with a quote is kept as typed",
+  );
+  assert(
+    adoptBaseQuotes("A B C", "X A 'B' C Y") === "X A 'B' C Y",
+    "a new straight quote in the middle is kept as typed",
+  );
+  assert(
+    adoptBaseQuotes("Yahweh’s A Yahweh’s B", "X Yahweh's B Y") === "X Yahweh’s B Y",
+    "a repeated word, one deleted",
+  );
+  assert(
+    adoptBaseQuotes("A  Yahweh’s\nB", "X A  Yahweh's\nB  Y") === "X A  Yahweh’s\nB  Y",
+    "typed whitespace is kept exactly",
+  );
+  // Long verse: ~3000 tokens each side, edits at both ends, a retype in the middle.
+  const words = Array.from({ length: 3000 }, (_, i) => (i % 97 === 0 ? `w${i}’s` : `w${i}`));
+  const longBase = words.join(" ");
+  const longTyped = `start ${longBase.replace("w1455’s", "w1455's")} end`;
+  const t0 = Date.now();
+  const longOut = adoptBaseQuotes(longBase, longTyped);
+  const ms = Date.now() - t0;
+  assert(longOut === `start ${longBase} end`, "long verse reconciled");
+  assert(ms < 5000, `long verse fast enough (${ms} ms)`);
+  // Past the table cap (~10M cells) the word pass is skipped, not attempted:
+  // the lead/tail result stands and nothing huge is allocated.
+  const huge = Array.from({ length: 4000 }, (_, i) => (i === 2000 ? "w2000’s" : `w${i}`)).join(" ");
+  const hugeTyped = `start ${huge.replace("w2000’s", "w2000's")} end`;
+  assert(adoptBaseQuotes(huge, hugeTyped) === hugeTyped, "past the cap the word pass is skipped");
+  // No straight quote among the unmatched middle words: no table at all.
+  assert(
+    adoptBaseQuotes("A Yahweh’s B C", "X A Yahweh’s B C Y's") === "X A Yahweh’s B C Y's",
+    "a straight quote only in a new word leaves the text as typed",
+  );
+}
+
+console.log("ZEC 6:15 UST: 's retyped over ’s plus edits at both ends keeps every alignment (#1290)");
+{
+  // The D1 shape of `Yahweh’s`: \w Yahweh, a ’ text node, \w s, in one milestone.
+  const base = {
+    verseObjects: [
+      zaln("H1129", [w("to"), t(" "), w("build")]), t(" "),
+      zaln("H3068", [w("Yahweh"), t("’"), w("s")]), t(" "),
+      w("temple"), t(". "), w("When"), t(" "),
+      zaln("H3068", [w("Yahweh")]), t(", "),
+      zaln("H0430", [w("your"), t(" "), w("God")]), t("."),
+    ],
+  };
+  const baseJson = JSON.stringify(base);
+  const before = alignedWords(base).join(" ");
+  const typed = `Then ${extractEditableText(base).replace("Yahweh’s", "Yahweh's")} Amen.`;
+  const r = saveEdit(base, typed);
+  assert(
+    r.plain === "Then to build Yahweh’s temple. When Yahweh, your God. Amen.",
+    `plain (got ${JSON.stringify(r.plain)})`,
+  );
+  assert(
+    alignedWords(r.content).join(" ") === `Then@- ${before} Amen@-`,
+    `every old word keeps its alignment (got ${alignedWords(r.content).join(" ")})`,
+  );
+  assert(!guardBlocksSave(r.delta, "text_edit"), "save guard does not block");
+  assert(JSON.stringify(base) === baseJson, "base content is not mutated");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
