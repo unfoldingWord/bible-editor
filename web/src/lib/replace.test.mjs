@@ -3442,6 +3442,23 @@ function countAllMilestones(nodes) {
     assert(extractPlainText(all.content) === "my_name this_set.", `replace all space -> _: the other spaces are replaced (got ${JSON.stringify(extractPlainText(all.content))})`);
     assert(markers(all.content) === 1, `replace all space -> _: the line break survives (got ${JSON.stringify(extractEditableText(all.content))})`);
   }
+  // A typed save reaches the same engine: punctuation typed right after the
+  // line-break chip diffs as the stripped-only space -> `—`. That is not a
+  // find/replace no-op: the typed character must not be dropped (review of
+  // #1307). A `\qs` wrapper keeps the whole-verse relayout tiers out, so the
+  // diff tier runs. Main puts the character at the next raw space (`this—set`),
+  // wrong but visible; the typed path keeps that behavior here.
+  {
+    const selah = { verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), { type: "quote", tag: "q1" }, zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(". "),
+      { tag: "qs", type: "quote", endTag: "qs*", children: [zaln("H5", [w("Selah")])] }] };
+    const old = extractEditableText(selah);
+    for (const ch of ["—", ";", ":", ".", "!"]) {
+      const r = smartEditVerse(clone(selah), old, old.replace("\\q1 this", `\\q1 ${ch}this`), { capturedFromDom: true });
+      const got = extractEditableText(r.content);
+      assert(got.split(ch).length === old.split(ch).length + 1, `typed ${ch} after a bare \\q1 is not dropped (got ${JSON.stringify(got)})`);
+      assert(words(r.content) === "my:H0|name:H1|this:H2|set:H3|Selah:H5", `typed ${ch} after a bare \\q1: every word keeps its alignment (got ${words(r.content)})`);
+    }
+  }
   // Replace all where one step changes the tree but nothing visible (removing
   // the space leaf before a marker, which still separates the words): that
   // step is skipped, and the later matches are still replaced.
