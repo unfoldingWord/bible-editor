@@ -538,35 +538,67 @@ function pruneEmptyText(nodes: unknown[]): unknown[] {
 // first existing text leaf of that gap (emptying any extras), and splice a new
 // text node beside the boundary word for a leading / trailing gap that has no
 // text leaf inside the range. The words never move, so their alignment survives.
+//
+// Words are matched as WORD UNITS, as relayoutUnchangedWords does: consecutive
+// `\w` leaves plus the connector text between them that together equal one
+// WORD_RUN_RE token of `replaceText`. ZEC stores `Yahweh’s` as `\w Yahweh\w*’\w
+// s\w*` (#1304); the `’` leaf inside the unit is kept, not overwritten with a
+// gap. When every unit is one leaf this is the plain 1:1 walk. Returns null
+// (the caller falls through) when the leaves don't spell `replaceText`'s words
+// or the rebuilt range isn't `replaceText`.
 function relayoutPunctuation(
-  verseObjects: unknown[],
+  input: unknown[],
   rawStart: number,
   rawEnd: number,
   replaceText: string,
-): SmartReplaceResult {
+): SmartReplaceResult | null {
+  // Work on a copy: on a bail the caller's tree must be untouched, because the
+  // caller falls through to other paths with it.
+  const verseObjects = cloneVerseObjects(input);
+  const oldRaw = rebuildRaw(verseObjects);
+  const expectedRaw = oldRaw.slice(0, rawStart) + replaceText + oldRaw.slice(rawEnd);
   const leaves = walkLeavesWithParents(verseObjects);
   const affected = leaves.filter((l) => l.start < rawEnd && l.end > rawStart);
   const wordLeaves = affected.filter((l) => isWordLeaf(l.node));
+  const newWords = [...replaceText.matchAll(WORD_RUN_RE)].map((m) => m[0]);
   const gaps = nonWordGaps(replaceText);
   const textNode = (text: string) => ({ type: "text", text });
   const insertions: { parent: unknown[]; index: number; node: unknown }[] = [];
 
-  let wi = 0; // words consumed so far → gaps[wi] is the gap before the next word
+  let wi = 0; // units consumed so far → gaps[wi] is the gap before the next unit
+  let inUnit = false; // inside a multi-leaf word unit
+  let acc = ""; // text of the current unit so far
   let gapHasLeaf = false; // a text leaf has already carried gaps[wi]
   for (const leaf of affected) {
+    const text = String(leaf.node["text"]);
     if (isWordLeaf(leaf.node)) {
-      // Leading gap for this word had no text leaf in range — splice it before
-      // the word (covers the range-edge gap, e.g. the opening "{").
-      if (!gapHasLeaf && gaps[wi]) {
-        insertions.push({ parent: leaf.parent, index: leaf.index, node: textNode(gaps[wi]) });
+      if (!inUnit) {
+        if (wi >= newWords.length) return null;
+        // Leading gap for this unit had no text leaf in range — splice it
+        // before the word (covers the range-edge gap, e.g. the opening "{").
+        if (!gapHasLeaf && gaps[wi]) {
+          insertions.push({ parent: leaf.parent, index: leaf.index, node: textNode(gaps[wi]) });
+        }
+        inUnit = true;
+        acc = text;
+      } else {
+        acc += text; // the `s` of `Yahweh’s`
       }
-      wi++;
-      gapHasLeaf = false;
+      if (acc === newWords[wi]) {
+        inUnit = false;
+        wi++;
+        gapHasLeaf = false;
+      } else if (!newWords[wi].startsWith(acc)) return null;
+    } else if (inUnit) {
+      // Connector inside the unit (the `’` of `Yahweh’s`): keep it as is.
+      acc += text;
+      if (!newWords[wi].startsWith(acc)) return null;
     } else {
       leaf.node["text"] = gapHasLeaf ? "" : (gaps[wi] ?? "");
       gapHasLeaf = true;
     }
   }
+  if (inUnit || wi !== newWords.length) return null;
   // Trailing gap after the last word (e.g. the closing "}").
   if (!gapHasLeaf && gaps[wi] && wordLeaves.length > 0) {
     const lastWord = wordLeaves[wordLeaves.length - 1];
@@ -589,6 +621,7 @@ function relayoutPunctuation(
 
   const pruned = pruneEmptyText(verseObjects);
   const newRaw = rebuildRaw(pruned);
+  if (newRaw !== expectedRaw) return null;
   return { content: { verseObjects: pruned }, plainText: normalize(newRaw), preservedAlignment: true };
 }
 
@@ -1387,7 +1420,8 @@ function smartReplaceVerseImpl(
     wordsMatchLeaves &&
     matchWords.every((mw, i) => mw === replaceWords[i]);
   if (wordsUnchanged) {
-    return relayoutPunctuation(cloned, rawStart, rawEnd, replaceText);
+    const relaid = relayoutPunctuation(cloned, rawStart, rawEnd, replaceText);
+    if (relaid) return relaid;
   }
 
   // The same punctuation-only change, but a match edge lands INSIDE a leaf
@@ -1396,7 +1430,11 @@ function smartReplaceVerseImpl(
   // rewrite rebuilt `eyes` unaligned (the save guard then refused it). Widen
   // the range to the edges of the straddled leaves, carrying their text
   // outside the match into the replacement verbatim, and re-lay punctuation
-  // when the words are still unchanged 1:1. A straddled edge must be a `\w`
+  // when the words are still unchanged. Words are compared as WORD_RUN_RE
+  // tokens; relayoutPunctuation maps them onto the `\w` leaves, so a split
+  // possessive (`Yahweh’s` = two `\w` pieces, one token) qualifies (#1304),
+  // and it returns null when the leaves don't spell the tokens (a `\w` that
+  // still holds punctuation, `Jerusalem.`). A straddled edge must be a `\w`
   // or a plain text leaf, never a marker that carries text. Words are compared
   // on the matched raw text, so a case-insensitive find that recases a word
   // is still a word change and skips this.
@@ -1413,12 +1451,11 @@ function smartReplaceVerseImpl(
       const widenedReplaceWords = [...widenedReplace.matchAll(WORD_RUN_RE)].map((m) => m[0]);
       const widenedWordsUnchanged =
         widenedMatchWords.length > 0 &&
-        widenedMatchWords.length === wordLeaves.length &&
-        wordLeaves.every((l, i) => String(l.node["text"]) === widenedMatchWords[i]) &&
         widenedReplaceWords.length === widenedMatchWords.length &&
         widenedMatchWords.every((mw, i) => mw === widenedReplaceWords[i]);
       if (widenedWordsUnchanged) {
-        return relayoutPunctuation(cloned, first.start, last.end, widenedReplace);
+        const relaid = relayoutPunctuation(cloned, first.start, last.end, widenedReplace);
+        if (relaid) return relaid;
       }
     }
   }
