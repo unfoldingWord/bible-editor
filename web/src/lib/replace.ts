@@ -529,6 +529,38 @@ function pruneEmptyText(nodes: unknown[]): unknown[] {
   return out;
 }
 
+// A line-break marker whose sides the punctuation relayout must respect: an
+// in-flow `\q*`/`\p`/`\b` node that is not a content wrapper (no children, no
+// end tag). It may carry text: usfm-js parks a line-leading opener on it
+// (ZEC 1:14 ULT `\q1 “I`), and that text follows the line break.
+function isLineBreakMarkerNode(node: unknown): boolean {
+  if (!isInFlowMarker(node) || isCharacterWrapper(node)) return false;
+  const o = node as Record<string, unknown>;
+  if (Array.isArray(o["children"]) && o["children"].length > 0) return false;
+  if (typeof o["endTag"] === "string" && o["endTag"] !== "") return false;
+  return true;
+}
+
+// Split a new gap's text at a line break, given the old gap's text before and
+// after it (#1309). Keep the part the replace did not change on its old side:
+// when the new gap still ends with the old after-text (`, “` against `:␤ | “`)
+// that stays after the break; else when it still starts with the old
+// before-text (`—␤ | “` -> `— ‘`, a line-ending dash) that stays before it.
+// When both sides changed, closing punctuation goes before the break and the
+// rest after it (splitGapAtMarker). Whitespace matches whitespace: raw holds
+// `\n` where the find/replace text holds a space.
+function splitGapAtOldMarker(gap: string, oldBefore: string, oldAfter: string): { before: string; after: string } {
+  const same = (a: string, b: string) =>
+    a.length === b.length && [...a].every((ch, i) => ch === b[i] || (/\s/.test(ch) && /\s/.test(b[i])));
+  const cut = gap.length - oldAfter.length;
+  if (cut >= 0 && same(gap.slice(cut), oldAfter)) return { before: gap.slice(0, cut), after: gap.slice(cut) };
+  if (gap.length >= oldBefore.length && same(gap.slice(0, oldBefore.length), oldBefore)) {
+    return { before: gap.slice(0, oldBefore.length), after: gap.slice(oldBefore.length) };
+  }
+  const { closing, rest } = splitGapAtMarker(gap);
+  return { before: closing, after: rest };
+}
+
 // Punctuation-only relayout. Precondition: within [rawStart, rawEnd] the `\w`
 // words are UNCHANGED (same texts, 1:1) and only the surrounding punctuation /
 // whitespace differs — a translator wrapping an already-aligned phrase in
@@ -543,9 +575,18 @@ function pruneEmptyText(nodes: unknown[]): unknown[] {
 // `\w` leaves plus the connector text between them that together equal one
 // WORD_RUN_RE token of `replaceText`. ZEC stores `Yahweh’s` as `\w Yahweh\w*’\w
 // s\w*` (#1304); the `’` leaf inside the unit is kept, not overwritten with a
-// gap. When every unit is one leaf this is the plain 1:1 walk. Returns null
-// (the caller falls through) when the leaves don't spell `replaceText`'s words
-// or the rebuilt range isn't `replaceText`.
+// gap. When every unit is one leaf this is the plain 1:1 walk.
+//
+// A gap that holds a line break (`\q1`, `\p`, with or without text of its own)
+// is split at it (#1309): the text before the break goes into the gap's first
+// leaf before it, the text after into the marker's own text or the first leaf
+// after it, each spliced in beside the marker when the gap has no such leaf
+// (splitGapAtOldMarker picks the split). Writing the whole gap into its first
+// leaf moved a line-leading `“` to the end of the previous line. The self-check
+// below can't catch that (raw reads the same on either side of a marker), so
+// the split has to be right by construction. Returns null (the caller falls
+// through) when the leaves don't spell `replaceText`'s words, a line break sits
+// inside a word or carries a word, or the rebuilt range isn't `replaceText`.
 function relayoutPunctuation(
   input: unknown[],
   rawStart: number,
@@ -557,28 +598,52 @@ function relayoutPunctuation(
   const verseObjects = cloneVerseObjects(input);
   const oldRaw = rebuildRaw(verseObjects);
   const expectedRaw = oldRaw.slice(0, rawStart) + replaceText + oldRaw.slice(rawEnd);
-  const leaves = walkLeavesWithParents(verseObjects);
-  const affected = leaves.filter((l) => l.start < rawEnd && l.end > rawStart);
-  const wordLeaves = affected.filter((l) => isWordLeaf(l.node));
+  // Text leaves (as walkLeavesWithParents) plus line-break markers with no
+  // text, as zero-width entries, so a gap can be split at them.
+  type Item = ParentLeaf & { marker: boolean };
+  const items: Item[] = [];
+  let pos = 0;
+  const walk = (nodes: unknown[]) => {
+    for (let i = 0; i < nodes.length; i++) {
+      const o = nodes[i] as Record<string, unknown> | null;
+      if (!o) continue;
+      const marker = isLineBreakMarkerNode(o);
+      const text = o["text"];
+      const len = typeof text === "string" ? text.length : 0;
+      if (typeof text === "string" || marker) items.push({ node: o, parent: nodes, index: i, start: pos, end: pos + len, marker });
+      pos += len;
+      const children = o["children"];
+      if (Array.isArray(children)) walk(children);
+    }
+  };
+  walk(verseObjects);
+  // A line break strictly inside the range splits its gap. One at the range
+  // start (the match begins with the marker's own text) is an ordinary leaf.
+  const splitsGap = (it: Item) => it.marker && it.start > rawStart && it.start < rawEnd;
+  const affected = items.filter((l) => splitsGap(l) || (l.start < rawEnd && l.end > rawStart));
   const newWords = [...replaceText.matchAll(WORD_RUN_RE)].map((m) => m[0]);
   const gaps = nonWordGaps(replaceText);
   const textNode = (text: string) => ({ type: "text", text });
   const insertions: { parent: unknown[]; index: number; node: unknown }[] = [];
 
+  // Walk the range once, collecting each gap's leaves and markers; write after.
+  const gapItems: Item[][] = [[]];
+  const unitFirst: Item[] = []; // first `\w` leaf of each unit
+  let lastWord: Item | null = null;
   let wi = 0; // units consumed so far → gaps[wi] is the gap before the next unit
   let inUnit = false; // inside a multi-leaf word unit
   let acc = ""; // text of the current unit so far
-  let gapHasLeaf = false; // a text leaf has already carried gaps[wi]
   for (const leaf of affected) {
-    const text = String(leaf.node["text"]);
-    if (isWordLeaf(leaf.node)) {
+    const text = typeof leaf.node["text"] === "string" ? String(leaf.node["text"]) : "";
+    if (splitsGap(leaf)) {
+      // A break inside a word unit, or a marker carrying a word, is not a
+      // punctuation-only gap.
+      if (inUnit || [...text.matchAll(WORD_RUN_RE)].length > 0) return null;
+      gapItems[wi].push(leaf);
+    } else if (isWordLeaf(leaf.node)) {
       if (!inUnit) {
         if (wi >= newWords.length) return null;
-        // Leading gap for this unit had no text leaf in range — splice it
-        // before the word (covers the range-edge gap, e.g. the opening "{").
-        if (!gapHasLeaf && gaps[wi]) {
-          insertions.push({ parent: leaf.parent, index: leaf.index, node: textNode(gaps[wi]) });
-        }
+        unitFirst[wi] = leaf;
         inUnit = true;
         acc = text;
       } else {
@@ -586,23 +651,56 @@ function relayoutPunctuation(
       }
       if (acc === newWords[wi]) {
         inUnit = false;
+        lastWord = leaf;
         wi++;
-        gapHasLeaf = false;
+        gapItems[wi] = [];
       } else if (!newWords[wi].startsWith(acc)) return null;
     } else if (inUnit) {
       // Connector inside the unit (the `’` of `Yahweh’s`): keep it as is.
       acc += text;
       if (!newWords[wi].startsWith(acc)) return null;
     } else {
-      leaf.node["text"] = gapHasLeaf ? "" : (gaps[wi] ?? "");
-      gapHasLeaf = true;
+      gapItems[wi].push(leaf);
     }
   }
   if (inUnit || wi !== newWords.length) return null;
-  // Trailing gap after the last word (e.g. the closing "}").
-  if (!gapHasLeaf && gaps[wi] && wordLeaves.length > 0) {
-    const lastWord = wordLeaves[wordLeaves.length - 1];
-    insertions.push({ parent: lastWord.parent, index: lastWord.index + 1, node: textNode(gaps[wi]) });
+
+  const setText = (list: Item[], text: string): boolean => {
+    if (list.length === 0) return false;
+    list.forEach((it, k) => (it.node["text"] = k === 0 ? text : ""));
+    return true;
+  };
+  const textOf = (list: Item[]) => list.map((it) => String(it.node["text"])).join("");
+  for (let g = 0; g <= wi; g++) {
+    const entries = gapItems[g];
+    const gap = gaps[g] ?? "";
+    const firstBreak = entries.findIndex(splitsGap);
+    if (firstBreak < 0) {
+      if (setText(entries, gap) || !gap) continue;
+      // No text leaf in range for this gap: splice it before the unit's first
+      // word (the opening "{"), or after the last word for the trailing gap
+      // (the closing "}").
+      if (g < newWords.length) insertions.push({ parent: unitFirst[g].parent, index: unitFirst[g].index, node: textNode(gap) });
+      else if (lastWord) insertions.push({ parent: lastWord.parent, index: lastWord.index + 1, node: textNode(gap) });
+      continue;
+    }
+    // Split at the first break. Everything after it that holds text (a
+    // marker's own text included: it follows its line break) is the "after"
+    // side, so consecutive breaks (`\p \q1`) act as one. Text between two
+    // breaks, a shape the samples don't have, joins the after-text: every
+    // marker is kept, which beats bailing to the localized rewrite.
+    const beforeItems = entries.slice(0, firstBreak);
+    const afterItems = entries.slice(firstBreak).filter((it) => typeof it.node["text"] === "string");
+    const { before, after } = splitGapAtOldMarker(gap, textOf(beforeItems), textOf(afterItems));
+    if (!setText(beforeItems, before) && before) {
+      const first = entries[firstBreak];
+      insertions.push({ parent: first.parent, index: first.index, node: textNode(before) });
+    }
+    if (!setText(afterItems, after) && after) {
+      // Only textless markers from the first break on: splice after the last.
+      const lastBreak = entries[entries.length - 1];
+      insertions.push({ parent: lastBreak.parent, index: lastBreak.index + 1, node: textNode(after) });
+    }
   }
 
   // Apply splices grouped by array, highest index first so earlier indices in
@@ -1457,12 +1555,17 @@ function smartReplaceVerseImpl(
   // (MIC 5:14 `the {poles … goddess} Asherah`). The localized rewrite would
   // re-tokenize the whole range UNALIGNED; instead keep every \w (and its
   // milestone) put and just re-lay the new punctuation around them.
+  // Words are compared as WORD_RUN_RE tokens, not 1:1 against the `\w` leaves:
+  // relayoutPunctuation maps tokens onto word units itself and returns null
+  // when the leaves don't spell them. A split possessive before a line break
+  // (`Yahweh’s: \q1 “I`, #1309) otherwise took smartRebuildRange, which writes
+  // the range's trailing gap before a line marker that ends the range, moving
+  // the opener to the previous line.
   const wordsUnchanged =
     startsAtBoundary &&
     endsAtBoundary &&
     matchWords.length > 0 &&
     matchWords.length === replaceWords.length &&
-    wordsMatchLeaves &&
     matchWords.every((mw, i) => mw === replaceWords[i]);
   if (wordsUnchanged) {
     const relaid = keep(relayoutPunctuation(cloned, rawStart, rawEnd, replaceText));
@@ -1489,10 +1592,12 @@ function smartReplaceVerseImpl(
     const first = affected[0];
     const last = affected[affected.length - 1];
     const plainLeaf = (l: Leaf) => isWordLeaf(l.node) || (l.node["type"] === "text" && !l.node["children"]);
-    // Every leaf in the window must be plain: a marker carrying text (usfm-js
-    // parks a line-leading `“` on the `\q1` node) would have its text written
-    // into the first gap leaf, moving the opener before the line break.
-    if (affected.every(plainLeaf) && (startsAtBoundary || plainLeaf(first)) && (endsAtBoundary || plainLeaf(last))) {
+    // Every leaf in the window must be plain or a line-break marker carrying
+    // text (usfm-js parks a line-leading `“` on the `\q1` node, ZEC 1:14):
+    // relayoutPunctuation keeps that text after the break (#1309). A straddled
+    // edge must be plain.
+    const windowLeaf = (l: Leaf) => plainLeaf(l) || isLineBreakMarkerNode(l.node);
+    if (affected.every(windowLeaf) && (startsAtBoundary || plainLeaf(first)) && (endsAtBoundary || plainLeaf(last))) {
       const widenedMatchWords = [...raw.slice(first.start, last.end).matchAll(WORD_RUN_RE)].map((m) => m[0]);
       const widenedReplace = raw.slice(first.start, rawStart) + replaceText + raw.slice(rawEnd, last.end);
       const widenedReplaceWords = [...widenedReplace.matchAll(WORD_RUN_RE)].map((m) => m[0]);
