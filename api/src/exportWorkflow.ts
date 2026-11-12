@@ -1242,9 +1242,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // (`xf8f`, Occurrence NULL) and all of JER TN on one more (`bfyt`), both
     // arrived-from-master defects. `renderOccurrence` (occurrenceRule.ts) now
     // heals the cell at render time to the one value each validator will accept,
-    // so the render is legal by construction and the guard below finds nothing.
+    // so the render is legal by construction and the guard below finds no
+    // Occurrence problem. It can still find a malformed twl TWLink (#1324): that
+    // is also a Door43 hard error, but it is a real row a translator can fix, so
+    // the HOLD names it.
     //
-    // The guard stays as a drift backstop: a hit here means the renderer and the
+    // For Occurrence the guard stays as a drift backstop: a hit means the renderer and the
     // guard's transcription of the validators have diverged, which IS worth a
     // hold. Note what this shifts — the twl "add word" stub (blank
     // OrigWords/TWLink, NULL occurrence) used to be caught incidentally by its
@@ -3451,7 +3454,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
   // Banner alert when the hard-reject gate holds an export because the render
   // contains a row DCS's validator counts as a real error (a blank or malformed
-  // Occurrence). Unlike the blank-field banner this replaces, this one states a
+  // Occurrence, or a malformed twl TWLink). Unlike the blank-field banner this replaces, this one states a
   // cause the code measured: it names the offending refs and the validator's own
   // reason for each. Wording claims only that WE refused — the DCS run has not
   // happened, so it must not say DCS rejected anything yet.
