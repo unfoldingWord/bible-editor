@@ -855,7 +855,7 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
     // the export writes OrigWords as stored, so it holds the book's TWL export.
     const quoteProblem = origWordsQuoteProblem(r.orig_words);
     if (quoteProblem) {
-      issues.push({ check: "Straight quote in OrigWords", bucket: "flag", ref, rowId: r.id, message: `OrigWords "${r.orig_words}": ${quoteProblem}` });
+      issues.push({ check: "Straight quote in OrigWords", bucket: "flag", ref, rowId: r.id, message: quoteProblem });
     }
     // Issue #1316: only null and exactly "" are blank here, matching Door43's
     // `if not twlink`. Whitespace-only fails TWLINK_RE there (a hard error), so

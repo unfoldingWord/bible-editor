@@ -3458,7 +3458,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
   // Banner alert when the hard-reject gate holds an export because the render
   // contains a row DCS's validator counts as a real error (a blank or malformed
-  // Occurrence, or a malformed twl TWLink). Unlike the blank-field banner this replaces, this one states a
+  // Occurrence, a malformed twl TWLink, or a straight quote in any tn/tq/twl
+  // row). Unlike the blank-field banner this replaces, this one states a
   // cause the code measured: it names the offending refs and the validator's own
   // reason for each. Wording claims only that WE refused — the DCS run has not
   // happened, so it must not say DCS rejected anything yet.
