@@ -339,6 +339,17 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     "refusal plus read-only skips",
   );
   check(s(0, 0, 1, 0) === "replaced 0 verses — 1 match in UHB/UGNT skipped (read-only)", "unchanged wording for read-only skips");
+  // A verse whose stored text is out of date beside a header label (#1339).
+  const stale = (versesReplaced, staleRefused) =>
+    bibleReplaceSummaryText({ versesReplaced, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, staleRefused });
+  check(
+    stale(0, 1) === "1 verse not replaced: its saved search text is out of date, so the match could not be placed",
+    "a stale-text refusal leads with the refusal, no \"replaced 0 verses\"",
+  );
+  check(
+    stale(2, 3) === "replaced 2 verses — 3 verses not replaced: their saved search text is out of date, so the match could not be placed",
+    "replace-all with stale-text refusals: counts both",
+  );
 }
 
 console.log(`\nfindReplaceVerse: all ${passed} checks passed.`);
