@@ -3656,6 +3656,21 @@ function countAllMilestones(nodes) {
     assert(extractEditableText(ins.content) === "The woman said \\q1 now the man ran.", `typed a word after the label (got ${JSON.stringify(extractEditableText(ins.content))})`);
     assert(labels(ins.content) === labels(verse), `typed a word after the label: the label is untouched (got ${labels(ins.content)})`);
   }
+  // Deleting the word right before the label (found by the differential:
+  // ZEC 8:10 with a label injected, `days` deleted). The deletion's trailing
+  // space mapped past the blanked label text, so the range covered the label,
+  // the guard refused every result that dropped it, and the flat rebuild lost
+  // the label, the line break and every alignment.
+  {
+    const old = extractEditableText(verse);
+    const r = smartEditVerse(clone(verse), old, old.replace("woman said", "woman"), { capturedFromDom: true });
+    assert(extractEditableText(r.content) === "The woman \\q1 the man ran.", `typed delete of the word before the label (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(verse), `typed delete before the label: the label is untouched (got ${labels(r.content)})`);
+    assert(words(r.content) === "The:H0|woman:H1|the:H3|man:H4|ran:H5", `typed delete before the label: untouched words keep their alignment (got ${words(r.content)})`);
+    const f = findReplaceVerse(clone(verse), plain, /said /g, plain.indexOf("said "), 5, "");
+    assert(labels(f.content) === labels(verse) && words(f.content) === "The:H0|woman:H1|the:H3|man:H4|ran:H5",
+      `find "said " -> "" before the label keeps it and the alignment (got ${labels(f.content)} ${words(f.content)})`);
+  }
   // A match just before the label leaves it alone too.
   {
     const r = findReplaceVerse(clone(verse), plain, /said/g, plain.indexOf("said"), 4, "spoke");
