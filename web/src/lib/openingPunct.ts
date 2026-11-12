@@ -14,7 +14,8 @@
 import { isInFlowMarker, isCharacterWrapper } from "./usfm.ts";
 
 // `¿` opens a Spanish question and leads the next word the same way (#1315).
-// The api copy (api/src/openingPunct.ts) does not have it yet.
+// The api copy (api/src/openingPunct.ts) and scripts/scan-opening-punct.mjs
+// carry the same list (#1325); change all three together.
 export const OPENING_PUNCT_RE = /[“‘(\[{¿]/u;
 
 interface Slot {

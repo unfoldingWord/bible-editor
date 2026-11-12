@@ -188,6 +188,23 @@ t("intra-word U+2060 joiner is NOT flagged as glued", () => {
   assert.equal(i.filter((x) => x.check === "Glued alignment").length, 0);
 });
 
+// Opener stranded inside an alignment milestone (#778; `¿` added in #1325).
+const strandedOpenerVerse = (opener) =>
+  verseFromUsfm(
+    `\\c 1\n\\p\n\\v 1 \\zaln-s |x-strong="H1" x-content="אמר"\\*\\w dijo\\w*: ${opener}\\zaln-e\\*` +
+      `\\zaln-s |x-strong="H2" x-content="מי"\\*\\w Quién\\w*\\zaln-e\\* es?\n`,
+  );
+t("a ‘ stranded at the end of a milestone is flagged as 'Opening punctuation inside alignment'", () => {
+  const hits = lintUsfmVerses([strandedOpenerVerse("‘")]).filter((x) => x.check === "Opening punctuation inside alignment");
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].bucket, "flag");
+});
+t("a ¿ stranded at the end of a milestone is flagged as 'Opening punctuation inside alignment' (#1325)", () => {
+  const hits = lintUsfmVerses([strandedOpenerVerse("¿")]).filter((x) => x.check === "Opening punctuation inside alignment");
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].bucket, "flag");
+});
+
 // Multi-verse variant of verseFromUsfm: returns one VerseRow per \v in the
 // given text, across however many \c chapters it contains (verseFromUsfm only
 // ever returns chapter 1 verse 1). Shared by the quote-pairing tests here and

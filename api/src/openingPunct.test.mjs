@@ -203,6 +203,24 @@ console.log("\n[hoistOpeningPunctuation]");
   );
 }
 
+{
+  // #1325: `¿` opens a Spanish question, so a stranded `¿` is the same defect
+  // as a stranded `‘`. Mirrors web/src/lib/openingPunct.test.mjs Case j.
+  console.log("\n[¿ is an opener (#1325)]");
+  const vos = [zaln([w("dijo"), t(": ¿")]), zaln([w("Quién")]), t(" es?")];
+  assert(hasOpeningPunctInsideMilestone(vos) === true, "the detector flags a stranded ¿ in a milestone's trailing text");
+  const out = hoistOpeningPunctuation(vos);
+  assert(raw(out) === raw(vos), `raw text unchanged (${JSON.stringify(raw(out))} vs ${JSON.stringify(raw(vos))})`);
+  assert(
+    out.length === 4 && out[1].type === "text" && out[1].text === ": ¿",
+    `": ¿" lands right after the milestone as a top-level text node (got ${JSON.stringify(out)})`,
+  );
+  assert(out[0].children.length === 1, "the milestone keeps only its word");
+  assert(hasOpeningPunctInsideMilestone(out) === false, "the hoisted tree no longer trips the detector");
+  const again = hoistOpeningPunctuation(out);
+  assert(JSON.stringify(again) === JSON.stringify(out), "a second pass is idempotent");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

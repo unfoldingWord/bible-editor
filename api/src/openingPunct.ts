@@ -19,7 +19,8 @@
 // renderer inserts a stray space after it (JER 31:10 / JER 31:18 on en_ult
 // master).
 
-export const OPENING_PUNCT_RE = /[“‘(\[{]/u;
+// Same list as web/src/lib/openingPunct.ts, `¿` included (#1315, #1325).
+export const OPENING_PUNCT_RE = /[“‘(\[{¿]/u;
 
 function isWordLeaf(node: Record<string, unknown>): boolean {
   return node["type"] === "word" && node["tag"] === "w";
