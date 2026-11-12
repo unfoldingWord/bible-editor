@@ -242,6 +242,32 @@ t("tq has no Occurrence rule: a blank or odd Occurrence alone does not hold", ()
   assert.deepEqual(hardRejectRows("tq", tqTsv(["1:1", "abcd", "", "", "", "Who?", "God."])), []);
   assert.deepEqual(hardRejectRows("tq", `${TQ_H}\n`), []);
 });
+// Issue #1342: why tq needs no Occurrence hold. Door43's validate_tq_files.py
+// (en_tq master 7b8c3ef510, fetched 2026-11-12) errors on
+// `occurrence != "" and not OCCURRENCE_RE.fullmatch(occurrence)` with
+// OCCURRENCE_RE = ^(?:-1|[0-9]+)$. buildTqTsv renders Occurrence through
+// renderOccurrence("tq", ...), so whatever D1 holds, the cell must come out
+// blank or matching that pattern. (hardRejectRows has no tq Occurrence rule,
+// so this test reads the rendered cell itself rather than asking the guard.)
+const TQ_DOOR43_OCCURRENCE_RE = /^(?:-1|[0-9]+)$/;
+t("the real tq render (buildTqTsv) never writes an Occurrence Door43 would reject, whatever D1 holds", () => {
+  const stored = ["x", "2", "", " 1 ", "1e21", NaN, 1.5, -2, -100, 1e21, Infinity, -Infinity, null, 0, -1, 3];
+  const rendered = buildTqTsv(stored.map((occurrence, i) => tqRow(`r${i}`, { quote: i % 2 ? "אֵת" : "it’s", occurrence })))
+    .split("\n")
+    .slice(1)
+    .filter((l) => l !== "")
+    .map((l) => l.split("\t")[4]);
+  assert.equal(rendered.length, stored.length);
+  rendered.forEach((cell, i) => {
+    assert.ok(cell === "" || TQ_DOOR43_OCCURRENCE_RE.test(cell), `stored ${String(stored[i])} rendered ${JSON.stringify(cell)}`);
+  });
+  // Legal values pass through untouched (-1 and 0 on a Gateway-Language quote).
+  const legal = buildTqTsv([tqRow("a", { quote: "it’s", occurrence: -1 }), tqRow("b", { quote: "it’s", occurrence: 0 }), tqRow("c", { occurrence: 3 }), tqRow("d", { occurrence: null })])
+    .split("\n")
+    .slice(1, 5)
+    .map((l) => l.split("\t")[4]);
+  assert.deepEqual(legal, ["-1", "0", "3", ""]);
+});
 t("the real tn render (buildTnTsv): a quote in quote / support_reference / ref_raw / id holds; note and tags do not", () => {
   const tsv = buildTnTsv([
     tnRow("aaaa", { quote: "אֵ'ת" }),

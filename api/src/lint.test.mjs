@@ -803,6 +803,54 @@ t("twl OrigWords with curly quotes, or none, is not flagged for quotes", () => {
     assert.equal(lintTwlRows([twl({ orig_words: words })]).filter((x) => x.check === "Straight quote in OrigWords").length, 0, JSON.stringify(words));
   }
 });
+// Issue #1342: the same Door43 check is an error in tn (check 15) and tq
+// (check 13), and the export writes tn Quote / SupportReference and tq Quote as
+// stored, so since #1336 one holds the book's export. An AI import or reimport
+// write is not gated by the rows API, so lint is where it first shows.
+t("tn Quote with a straight quote is flagged with the curly-quote fix", () => {
+  for (const quote of ["אֵ'ת", 'say "this"']) {
+    const i = lintTnRows([tn({ chapter: 3, verse: 5, ref_raw: "3:5", id: "xf8f", quote })]);
+    const bad = i.filter((x) => x.check === "Straight quote in Quote");
+    assert.equal(bad.length, 1, quote);
+    assert.equal(bad[0].bucket, "flag");
+    assert.equal(bad[0].ref, "3:5");
+    assert.equal(bad[0].rowId, "xf8f");
+    assert.match(bad[0].message, /^Quote cannot contain a straight quote/);
+    assert.match(bad[0].message, /use a curly quote \(’ “ ”\) or remove it/);
+    assert.ok(bad[0].message.length <= 200);
+  }
+});
+t("tn SupportReference with a straight quote is flagged, without the curly-quote fix", () => {
+  const i = lintTnRows([tn({ id: "xf8f", support_reference: "rc://*/ta/man/translate/figs-o'x" })]);
+  const bad = i.filter((x) => x.check === "Straight quote in SupportReference");
+  assert.equal(bad.length, 1);
+  assert.equal(bad[0].bucket, "flag");
+  assert.equal(bad[0].rowId, "xf8f");
+  assert.match(bad[0].message, /^SupportReference cannot contain a straight quote \('\)/);
+  assert.doesNotMatch(bad[0].message, /curly quote \(/);
+  assert.ok(bad[0].message.length <= 200);
+});
+t("tq Quote with a straight quote is flagged with the curly-quote fix", () => {
+  const i = lintTqRows([tq({ chapter: 2, verse: 4, id: "q1ab", quote: "it's \"x\"" })]);
+  const bad = i.filter((x) => x.check === "Straight quote in Quote");
+  assert.equal(bad.length, 1);
+  assert.equal(bad[0].bucket, "flag");
+  assert.equal(bad[0].ref, "2:4");
+  assert.equal(bad[0].rowId, "q1ab");
+  assert.match(bad[0].message, /straight quote \(' and "\)/);
+  assert.match(bad[0].message, /use a curly quote \(’ “ ”\) or remove it/);
+});
+t("tn/tq: curly or no quotes in Quote/SupportReference, and straight quotes in Note/Question/Response, are not flagged", () => {
+  const quoteChecks = (i) => i.filter((x) => x.check.startsWith("Straight quote in"));
+  for (const quote of ["it’s", "“this”", "אֵת", "", null, undefined]) {
+    assert.equal(quoteChecks(lintTnRows([tn({ quote })])).length, 0, JSON.stringify(quote));
+    assert.equal(quoteChecks(lintTqRows([tq({ quote })])).length, 0, JSON.stringify(quote));
+  }
+  assert.equal(quoteChecks(lintTnRows([tn({ support_reference: "rc://*/ta/man/translate/figs-metaphor" })])).length, 0);
+  // Curled at export (educateQuotes), so Door43 never sees them straight.
+  assert.equal(quoteChecks(lintTnRows([tn({ note: 'He said "go" and it\'s done.' })])).length, 0);
+  assert.equal(quoteChecks(lintTqRows([tq({ question: "Who's there?", response: 'He said "go".' })])).length, 0);
+});
 
 // Chapter-opening paragraph marker (#378). Built from real usfm-js output so the
 // tests exercise the actual node placement: a `\p` before `\v 1` lands on the
