@@ -3831,6 +3831,89 @@ function countAllMilestones(nodes) {
   }
 }
 
+// Case 92: the gaps left in the punctuation relayout across a line break after
+// #1309 (#1315). Each repro is a find/replace that keeps every word and only
+// changes the punctuation beside a line marker; the text must stay on its line.
+{
+  console.log("\n[Case 92] Punctuation-only find/replace across a line break: the #1309 gaps (#1315)");
+  const sig = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("+")}`).join("|");
+  // Every line marker, `\p` and `\ts\*` included (Case 88 counts only `\q`).
+  const markers = (content) => (extractEditableText(content).match(/\\(q\d?|p|ts\\\*)(?![a-z])/g) ?? []).join(" ");
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const check = (label, content, find, repl, want) => {
+    const plain = extractPlainText(content);
+    const i = plain.indexOf(find);
+    assert(i >= 0, `${label}: setup: verse contains ${JSON.stringify(find)} (plain ${JSON.stringify(plain)})`);
+    const wantPlain = plain.slice(0, i) + repl + plain.slice(i + find.length);
+    for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+      const r = fn(clone(content), plain, new RegExp(esc(find), "g"), i, find.length, repl);
+      const ed = extractEditableText(r.content);
+      assert(ed === want, `${label} (${entry}): ${JSON.stringify(want)} (got ${JSON.stringify(ed)})`);
+      assert(markers(r.content) === markers(content), `${label} (${entry}): every line marker survives (${markers(content)} -> ${markers(r.content)})`);
+      assert(sig(r.content) === sig(content), `${label} (${entry}): every word keeps its alignment (got ${sig(r.content)})`);
+      assert(extractPlainText(r.content) === wantPlain, `${label} (${entry}): plain text is the replaced text (got ${JSON.stringify(extractPlainText(r.content))})`);
+      const delta = analyzeAlignmentDelta(content, r.content);
+      assert(delta.unexpectedLosses.length === 0 && delta.afterAligned === delta.beforeAligned,
+        `${label} (${entry}): the save guard sees no loss (${delta.beforeAligned} -> ${delta.afterAligned})`);
+    }
+  };
+  const Z = (strong, word) =>
+    `\\zaln-s |x-strong="${strong}" x-lemma="x" x-morph="x" x-occurrence="1" x-occurrences="1" x-content="x"\\*\\w ${word}|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*`;
+  const parsed = (body) => ({ verseObjects: usfm.toJSON(`\\id ZEC\n\\c 1\n\\p\n\\v 1 ${body}\n`).chapters["1"]["1"].verseObjects });
+
+  // Item 1: two breaks with a text leaf between them. usfm-js makes that leaf
+  // from a blank line after `\p` (`",\n" \p "\n" \q1("“")`). All the after-text
+  // went into the leaf between the breaks and the `\q1` was emptied, so the
+  // opener moved off the `\q1` line onto the `\p` line.
+  const blankAfterP = parsed(`${Z("H1", "say")},\n\\p\n\n\\q1 “${Z("H2", "I")} ${Z("H3", "go")}.”`);
+  assert(extractEditableText(blankAfterP) === "say, \\p \\q1 “I go.”", `item 1: setup: editable text (got ${JSON.stringify(extractEditableText(blankAfterP))})`);
+  check("item 1: say, “I -> say; “I (blank line after \\p)", blankAfterP, "say, “I", "say; “I", "say; \\p \\q1 “I go.”");
+  check("item 1: say, “I -> say, ‘I (blank line after \\p, opener changed)", blankAfterP, "say, “I", "say, ‘I", "say, \\p \\q1 ‘I go.”");
+  // The same blank line with nothing after the `\q1`: an added opener went
+  // into the blank leaf, between `\p` and `\q1` (`say, “ I`, on main too).
+  const blankAfterPBare = parsed(`${Z("H1", "say")},\n\\p\n\n\\q1 ${Z("H2", "I")} ${Z("H3", "go")}.`);
+  check("item 1: say, I -> say, “I (blank line after \\p, bare \\q1)", blankAfterPBare, "say, I", "say, “I", "say, \\p \\q1 “I go.");
+  check("item 1: say, I -> say; I (blank line after \\p, bare \\q1)", blankAfterPBare, "say, I", "say; I", "say; \\p \\q1 I go.");
+
+  // Item 2 (pinned, main's behaviour kept): a `\ts\*` stays a split point. The
+  // plain text puts a space at a bare `\ts\*` as at a `\q1`, so splitting
+  // there is what saves the text that was typed: with `\ts\*` left out of the
+  // split, `say; “I` saved as `say; “ I` (the opener written before it).
+  const ts = () => ({ tag: "ts\\*", nextChar: "\n" });
+  const tsAfter = { verseObjects: [zaln("H1", [w("say")]), t(",\n"), ts(), t("“"), zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+  check("item 2 (pin): say, “I -> say; “I (opener after \\ts\\*)", tsAfter, "say, “I", "say; “I", "say; \\ts\\* “I go.”");
+  const tsBefore = { verseObjects: [zaln("H1", [w("say")]), t(", “\n"), ts(), zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+  check("item 2 (pin): say, “ I -> say; “I (opener glued to the word goes after \\ts\\*)", tsBefore, "say, “ I", "say; “I", "say; \\ts\\* “I go.”");
+  check("item 2 (pin): say, “ I -> say; “ I (opener with a space after it stays before \\ts\\*)", tsBefore, "say, “ I", "say; “ I", "say; “ \\ts\\* I go.”");
+
+  // Item 4: an added opener followed by more punctuation (`“—`) after a bare
+  // break went before the break; only an opener that ended the gap moved.
+  const bareQ1 = { verseObjects: [zaln("H1", [w("people")]), t(":\n"), { tag: "q1", type: "quote" }, zaln("H2", [w("this")]), t(" "), zaln("H3", [w("is")]), t(".")] };
+  check("item 4: people: this -> people: “—this (bare \\q1)", bareQ1, "people: this", "people: “—this", "people: \\q1 “—this is.");
+  // Its neighbours, as on main: a closing dash, and an opener with a space
+  // after it, stay before the break.
+  check("item 4: people: this -> people,— this (bare \\q1)", bareQ1, "people: this", "people,— this", "people,— \\q1 this is.");
+  check("item 4: people: this -> people: “ this (bare \\q1)", bareQ1, "people: this", "people: “ this", "people: “ \\q1 this is.");
+
+  // Item 5: `¿` opens a Spanish question; it leads the next line's first word
+  // like `“`.
+  assert(OPENING_PUNCT_RE.test("¿"), "item 5: ¿ is opening punctuation");
+  const spanish = { verseObjects: [zaln("H1", [w("dijo")]), t(":\n"), { tag: "q1", type: "quote" }, zaln("H2", [w("Quién")]), t(" "), zaln("H3", [w("es")]), t("?")] };
+  check("item 5: dijo: Quién -> dijo: ¿Quién (bare \\q1)", spanish, "dijo: Quién", "dijo: ¿Quién", "dijo: \\q1 ¿Quién es?");
+
+  // Item 6: a `\q1` carrying the opener with no text before it (the seam
+  // `say\q1 “I`). With an empty before-text the "before side unchanged" rule
+  // always matched and put `, ‘` after the break; the guard refused that, and
+  // the fallback dropped the `\q1` and unaligned every word.
+  const seam = { verseObjects: [zaln("H1", [w("say")]), { tag: "q1", type: "quote", text: "“" }, zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
+  check("item 6: say “I -> say, ‘I (seam, \\q1 carries the opener)", seam, "say “I", "say, ‘I", "say, \\q1 ‘I go.”");
+  // Its neighbours keep main's layout: with no closing punctuation added,
+  // nothing new goes before the break.
+  check("item 6 (pin): say “I -> say ‘I (seam)", seam, "say “I", "say ‘I", "say\\q1 ‘I go.”");
+  check("item 6 (pin): say “I -> say I (seam)", seam, "say “I", "say I", "say\\q1 I go.”");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

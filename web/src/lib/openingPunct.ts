@@ -13,7 +13,9 @@
 
 import { isInFlowMarker, isCharacterWrapper } from "./usfm.ts";
 
-export const OPENING_PUNCT_RE = /[“‘(\[{]/u;
+// `¿` opens a Spanish question and leads the next word the same way (#1315).
+// The api copy (api/src/openingPunct.ts) does not have it yet.
+export const OPENING_PUNCT_RE = /[“‘(\[{¿]/u;
 
 interface Slot {
   kind: "word" | "text";

@@ -533,6 +533,12 @@ function pruneEmptyText(nodes: unknown[]): unknown[] {
 // in-flow `\q*`/`\p`/`\b` node that is not a content wrapper (no children, no
 // end tag). It may carry text: usfm-js parks a line-leading opener on it
 // (ZEC 1:14 ULT `\q1 “I`), and that text follows the line break.
+// A `\ts\*` counts too, on purpose (#1315): the plain text puts a space at a
+// bare `\ts\*` as at a `\q1`, so the split is what saves the text that was
+// typed. Left out, `say, \ts\* “I` -> `say; “I` wrote the opener before the
+// `\ts\*` and saved `say; “ I`. A `\ts\*` inside a split possessive still
+// makes the relayout bail, but find can't reach that: the plain text reads
+// `Yahweh’ s` there, and the fallback keeps the marker and the alignment.
 function isLineBreakMarkerNode(node: unknown): boolean {
   if (!isInFlowMarker(node) || isCharacterWrapper(node)) return false;
   const o = node as Record<string, unknown>;
@@ -566,15 +572,21 @@ function rangeHoldsLineBreak(nodes: unknown[], rawStart: number, rawEnd: number)
 // before-text (`—␤ | “` -> `— ‘`, a line-ending dash) that stays before it.
 // When both sides changed, closing punctuation goes before the break and the
 // rest after it (splitGapAtMarker). Whitespace matches whitespace: raw holds
-// `\n` where the find/replace text holds a space. When nothing followed the old
-// break, only opening punctuation that ends the new gap (it leads the next
-// line's first word) goes after the break, and everything else stays before it
-// as before: `:␤ |` -> `: “` gives `: | “`, while `—␤ |` -> `,— ` keeps the
-// line-ending dash before the break (review of #1309).
+// `\n` where the find/replace text holds a space. The `\n` is then saved as
+// that space (`:␤` -> `, `); the export's normalizeUsfmFormatting puts the
+// marker on its own line and drops the space, so the USFM does not change
+// (checked for `\q1` and `\p`, #1315). When nothing followed the old break,
+// opening punctuation that leads the new gap's last run without whitespace
+// (it leads the next line's first word) goes after the break with whatever
+// follows it in that run, and everything else stays before it as before:
+// `:␤ |` -> `: “` gives `: | “`, `: “—` gives `: | “—` (#1315), while `—␤ |`
+// -> `,— ` keeps the line-ending dash before the break (review of #1309), and
+// so does an opener with a space after it.
 function splitGapAtOldMarker(gap: string, oldBefore: string, oldAfter: string): { before: string; after: string } {
   if (oldAfter === "") {
-    let cut = gap.length;
-    while (cut > 0 && OPENING_PUNCT_RE.test(gap[cut - 1])) cut--;
+    const run = gap.length - (gap.match(/\S*$/u)?.[0].length ?? 0);
+    const opener = gap.slice(run).search(OPENING_PUNCT_RE);
+    const cut = opener < 0 ? gap.length : run + opener;
     return { before: gap.slice(0, cut), after: gap.slice(cut) };
   }
   // Compare UTF-16 unit by unit, as the slices are cut: a character outside the
@@ -586,10 +598,14 @@ function splitGapAtOldMarker(gap: string, oldBefore: string, oldAfter: string): 
   };
   const cut = gap.length - oldAfter.length;
   if (cut >= 0 && same(gap.slice(cut), oldAfter)) return { before: gap.slice(0, cut), after: gap.slice(cut) };
+  const { closing, rest } = splitGapAtMarker(gap);
+  // An empty before-text matches every gap, and at the seam `say\q1 “I` it put
+  // all of `, ‘` after the break (#1315). There closing punctuation the gap
+  // starts with goes before the break; whitespace alone stays after it.
+  if (oldBefore === "") return /\S/u.test(closing) ? { before: closing, after: rest } : { before: "", after: gap };
   if (gap.length >= oldBefore.length && same(gap.slice(0, oldBefore.length), oldBefore)) {
     return { before: gap.slice(0, oldBefore.length), after: gap.slice(oldBefore.length) };
   }
-  const { closing, rest } = splitGapAtMarker(gap);
   return { before: closing, after: rest };
 }
 
@@ -721,17 +737,33 @@ function relayoutPunctuation(
     // side, so consecutive breaks (`\p \q1`) act as one. Text between two
     // breaks, a shape the samples don't have, joins the after-text: every
     // marker is kept, which beats bailing to the localized rewrite.
+    // Whitespace alone between two breaks is emptied and left out of the
+    // after-text (#1315): usfm-js makes a `"\n"` leaf from a blank line after
+    // `\p` (`,␤ \p ␤ \q1 “`), and writing the after-text into that leaf put
+    // the opener on the `\p` line, off the `\q1` line it leads. The gap's
+    // space goes before the first break instead.
+    let lastBreak = firstBreak;
+    entries.forEach((it, k) => {
+      if (splitsGap(it)) lastBreak = k;
+    });
     const beforeItems = entries.slice(0, firstBreak);
-    const afterItems = entries.slice(firstBreak).filter((it) => typeof it.node["text"] === "string");
+    const afterItems: Item[] = [];
+    for (let k = firstBreak; k < entries.length; k++) {
+      const it = entries[k];
+      if (typeof it.node["text"] !== "string") continue;
+      if (k < lastBreak && /^\s*$/.test(String(it.node["text"]))) it.node["text"] = "";
+      else afterItems.push(it);
+    }
     const { before, after } = splitGapAtOldMarker(gap, textOf(beforeItems), textOf(afterItems));
     if (!setText(beforeItems, before) && before) {
       const first = entries[firstBreak];
       insertions.push({ parent: first.parent, index: first.index, node: textNode(before) });
     }
     if (!setText(afterItems, after) && after) {
-      // Only textless markers from the first break on: splice after the last.
-      const lastBreak = entries[entries.length - 1];
-      insertions.push({ parent: lastBreak.parent, index: lastBreak.index + 1, node: textNode(after) });
+      // Only textless markers (and emptied whitespace) from the first break
+      // on: splice after the last break.
+      const last = entries[lastBreak];
+      insertions.push({ parent: last.parent, index: last.index + 1, node: textNode(after) });
     }
   }
 
