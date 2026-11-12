@@ -12,6 +12,12 @@ interface Props {
   // When false, the editor can only pick a value from `options` (no free text).
   // Defaults to true so callers keep the freeSolo behaviour unless they opt out.
   freeSolo?: boolean;
+  // Checks every value before it is committed, typed or picked: `options` can
+  // come from a stale cached catalog (useCatalogs keeps one in localStorage),
+  // so being on the list proves nothing. Return a message to refuse it: the
+  // picker stays open and shows the message under the input instead of
+  // calling onChange. Omit to accept anything.
+  validate?: (typed: string) => string | null;
   onChange: (value: string | null) => void;
 }
 
@@ -33,9 +39,11 @@ export function CatalogPicker({
   color = "default",
   variant = "outlined",
   freeSolo = true,
+  validate,
   onChange,
 }: Props) {
   const [open, setOpen] = useState(false);
+  const [invalid, setInvalid] = useState<string | null>(null);
   const shown = display ? display(value) : (value ?? "—");
   // With freeSolo off, MUI requires the current value to be one of the options
   // or it warns and drops it. Inject a legacy off-list value so the row's
@@ -50,6 +58,9 @@ export function CatalogPicker({
   // clear so the dropdown stays mounted and the input keeps focus,
   // ready for the user to type a replacement.
   const justClearedRef = useRef(false);
+  // Set when validate refuses a value, so the close MUI fires right after a
+  // refused option pick (reason "selectOption") is skipped.
+  const justRefusedRef = useRef(false);
 
   if (!open) {
     return (
@@ -58,7 +69,10 @@ export function CatalogPicker({
         size={size}
         variant={variant}
         color={color}
-        onClick={() => setOpen(true)}
+        onClick={() => {
+          setInvalid(null);
+          setOpen(true);
+        }}
         // minWidth: 0 + maxWidth so the chip shrinks inside a constrained
         // grid/flex cell and ellipsis-truncates the label instead of pushing
         // neighbouring controls (e.g. the save button) off the row.
@@ -79,6 +93,11 @@ export function CatalogPicker({
       PopperComponent={FixedWidthPopper}
       size="small"
       filterOptions={(opts, state) => {
+        // The option list would cover the refusal message under the input, so
+        // it is emptied while the message shows (a freeSolo picker with no
+        // options draws no list). `open` stays true, so blur and Escape still
+        // close the picker; the next keystroke clears the message.
+        if (invalid !== null) return [];
         const q = state.inputValue.toLowerCase().trim();
         if (!q) return opts.slice(0, 50);
         return opts.filter((o) => o.toLowerCase().includes(q)).slice(0, 50);
@@ -93,8 +112,22 @@ export function CatalogPicker({
           {display ? display(opt) : opt}
         </li>
       )}
+      onInputChange={(_e, _text, reason) => {
+        // "reset" is MUI rewriting the input itself (e.g. to a picked option's
+        // label), not the editor typing, so it does not clear the message.
+        if (invalid && reason !== "reset") setInvalid(null);
+      }}
       onChange={(_e, next, reason) => {
         const val = typeof next === "string" ? next : null;
+        justRefusedRef.current = false;
+        if (validate && val !== null) {
+          const problem = validate(val);
+          if (problem) {
+            setInvalid(problem);
+            justRefusedRef.current = true;
+            return;
+          }
+        }
         onChange(val);
         if (reason === "clear") {
           // Stay open, eat the next blur-driven close, and grab focus
@@ -113,6 +146,12 @@ export function CatalogPicker({
       }}
       onClose={(_e, reason) => {
         if (justClearedRef.current) return;
+        // Picking a listed option MUI then closes with "selectOption"; when
+        // validate refused that option, stay open so its message is seen.
+        if (reason === "selectOption" && justRefusedRef.current) {
+          justRefusedRef.current = false;
+          return;
+        }
         if (reason === "blur" || reason === "escape" || reason === "selectOption") {
           setOpen(false);
         }
@@ -126,6 +165,8 @@ export function CatalogPicker({
           placeholder={placeholder ?? "type to filter…"}
           variant="outlined"
           size="small"
+          error={invalid !== null}
+          helperText={invalid ?? undefined}
         />
       )}
     />

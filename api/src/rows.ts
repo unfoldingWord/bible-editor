@@ -20,6 +20,7 @@ import { reopenLaneChecks } from "./laneReopen";
 import { refParts, coveredVersesFromRef } from "./importParsers";
 import { requiredOccurrence } from "./occurrenceRule";
 import { findRawTabField } from "./rawTabGuard";
+import { isMalformedTwLink, MALFORMED_TW_LINK_HINT } from "./twLinkShape";
 import { isValidChapterZeroRef } from "./chapterZeroGuard";
 import { normalizeBookCode, CHAPTER_EXISTS_SQL } from "./rowsCreateGuard";
 import { isValidTwlRefRaw } from "./twlRefGuard";
@@ -288,6 +289,17 @@ rows.post("/:kind", requireEditor, async (c) => {
   if (tabField) {
     return c.json(
       { error: "invalid_body", message: `Field '${tabField}' contains a raw TAB character, which is not allowed.` },
+      400,
+    );
+  }
+
+  // A tw_link Door43 would reject blocks the book's whole TWL export (see
+  // twLinkShape.ts, issue #1316). null and "" stay allowed: the "+" stub row is
+  // created with tw_link "" and lint flags it until it is filled in.
+  // Whitespace-only is refused, since Door43 hard-fails it.
+  if (isMalformedTwLink(data.tw_link as string | null | undefined)) {
+    return c.json(
+      { error: "invalid_body", message: `TWLink "${data.tw_link}" is not a valid link. ${MALFORMED_TW_LINK_HINT}` },
       400,
     );
   }
@@ -680,6 +692,15 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   if (tabField) {
     return c.json(
       { error: "invalid_body", message: `Field '${tabField}' contains a raw TAB character, which is not allowed.` },
+      400,
+    );
+  }
+
+  // Same tw_link shape guard as the create route (issue #1316).
+  const patchedTwLink = (patch as Record<string, unknown>).tw_link as string | null | undefined;
+  if (isMalformedTwLink(patchedTwLink)) {
+    return c.json(
+      { error: "invalid_body", message: `TWLink "${patchedTwLink}" is not a valid link. ${MALFORMED_TW_LINK_HINT}` },
       400,
     );
   }

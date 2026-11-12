@@ -697,6 +697,49 @@ t("empty twl TWLink flagged", () => {
 t("twl with both fields present passes", () => {
   assert.equal(lintTwlRows([twl({})]).length, 0);
 });
+// Issue #1316: Door43's validate_twl_files.py raises a HARD error for a
+// non-blank TWLink that fails ^rc://[^/]+/[^/]+/[^/]+/[^ \\]+$, so one bare
+// word blocks the whole book's TWL export.
+t("twl bare-word TWLink ('trouble') flagged as malformed", () => {
+  const i = lintTwlRows([twl({ chapter: 4, verse: 6, id: "qbg9", tw_link: "trouble" })]);
+  const bad = i.filter((x) => x.check === "Malformed TWLink");
+  assert.equal(bad.length, 1);
+  assert.equal(bad[0].bucket, "flag");
+  assert.equal(bad[0].ref, "4:6");
+  assert.equal(bad[0].rowId, "qbg9");
+  assert.ok(bad[0].message.includes("rc://"), "the message shows the shape a translator should use");
+  assert.equal(i.filter((x) => x.check === "Empty TWLink").length, 0, "a bare word is not blank");
+});
+t("twl links Door43 rejects are flagged; links it accepts are not", () => {
+  const malformed = (link) =>
+    lintTwlRows([twl({ tw_link: link })]).filter((x) => x.check === "Malformed TWLink").length;
+  assert.equal(malformed("rc://*/tw/dict/bible/other/trouble"), 0);
+  assert.equal(malformed("rc://*/tw/dict/bible/kt/god"), 0);
+  assert.equal(malformed("rc://en/tw/dict/bible/names/abraham"), 0);
+  assert.equal(malformed("rc://*/tw/dict"), 1, "too few path segments");
+  assert.equal(malformed("tw/dict/bible/other/trouble"), 1, "no rc:// scheme");
+  assert.equal(malformed(" rc://*/tw/dict/bible/other/trouble"), 1, "leading space");
+  assert.equal(malformed("rc://*/tw/dict/bible/other/big trouble"), 1, "space in the slug");
+  // The regex's [^ \\] accepts control characters, but the export's tsvCell
+  // turns a newline into a literal backslash-n, which Door43 then rejects.
+  assert.equal(malformed("rc://*/tw/dict/bible/kt/god\n"), 1, "trailing newline");
+  assert.equal(malformed("rc://*/tw/dict/bible/kt/god\r"), 1, "carriage return");
+  assert.equal(malformed("rc://*/tw/dict/bible/kt/go\td"), 1, "tab");
+});
+t("whitespace-only TWLink is 'Malformed TWLink' only (Door43 hard-fails it; only \"\" is blank there)", () => {
+  for (const link of ["   ", " ", "\t"]) {
+    const i = lintTwlRows([twl({ tw_link: link })]);
+    assert.equal(i.filter((x) => x.check === "Malformed TWLink").length, 1, JSON.stringify(link));
+    assert.equal(i.filter((x) => x.check === "Empty TWLink").length, 0, JSON.stringify(link));
+  }
+});
+t("blank TWLink is only 'Empty TWLink', never also 'Malformed TWLink'", () => {
+  for (const link of ["", null]) {
+    const i = lintTwlRows([twl({ tw_link: link })]);
+    assert.equal(i.filter((x) => x.check === "Malformed TWLink").length, 0);
+    assert.equal(i.filter((x) => x.check === "Empty TWLink").length, 1);
+  }
+});
 
 // Chapter-opening paragraph marker (#378). Built from real usfm-js output so the
 // tests exercise the actual node placement: a `\p` before `\v 1` lands on the

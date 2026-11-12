@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { Env } from "./index";
 import { buildTermMapFromArticles, type TwArticleLite } from "./twlMatcher";
 import { TA_SUPPORT_REFERENCES } from "./taSupportReferences";
+import { isMalformedTwLink } from "./twLinkShape";
 
 export const catalogs = new Hono<{ Bindings: Env }>();
 
@@ -111,7 +112,9 @@ catalogs.get("/", async (c) => {
     }
   }
   for (const r of usage.results) {
-    if (r.value && !seen.has(r.value)) {
+    // A stored link Door43 would reject is not offered back to the picker
+    // (issue #1316) — the row keeps it, and lint flags it, until it is fixed.
+    if (r.value && !seen.has(r.value) && !isMalformedTwLink(r.value)) {
       seen.add(r.value);
       twLinks.push(r.value);
     }
