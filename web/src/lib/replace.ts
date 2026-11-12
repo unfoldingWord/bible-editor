@@ -598,12 +598,14 @@ function splitGapAtOldMarker(gap: string, oldBefore: string, oldAfter: string): 
   };
   const cut = gap.length - oldAfter.length;
   if (cut >= 0 && same(gap.slice(cut), oldAfter)) return { before: gap.slice(0, cut), after: gap.slice(cut) };
-  // An empty before-text tells nothing: every gap starts with it. At the seam
-  // `say\q1 “I` it put all of `, ‘` after the break (#1315).
-  if (oldBefore !== "" && gap.length >= oldBefore.length && same(gap.slice(0, oldBefore.length), oldBefore)) {
+  const { closing, rest } = splitGapAtMarker(gap);
+  // An empty before-text matches every gap, and at the seam `say\q1 “I` it put
+  // all of `, ‘` after the break (#1315). There closing punctuation the gap
+  // starts with goes before the break; whitespace alone stays after it.
+  if (oldBefore === "") return /\S/u.test(closing) ? { before: closing, after: rest } : { before: "", after: gap };
+  if (gap.length >= oldBefore.length && same(gap.slice(0, oldBefore.length), oldBefore)) {
     return { before: gap.slice(0, oldBefore.length), after: gap.slice(oldBefore.length) };
   }
-  const { closing, rest } = splitGapAtMarker(gap);
   return { before: closing, after: rest };
 }
 
@@ -735,17 +737,22 @@ function relayoutPunctuation(
     // side, so consecutive breaks (`\p \q1`) act as one. Text between two
     // breaks, a shape the samples don't have, joins the after-text: every
     // marker is kept, which beats bailing to the localized rewrite.
-    // Whitespace alone after the first break, beside other text there, is
-    // emptied and left out of the after-text (#1315): usfm-js makes a `"\n"`
-    // leaf from a blank line after `\p` (`,␤ \p ␤ \q1 “`), and writing the
-    // after-text into that leaf moved the opener off the `\q1` line. The
-    // gap's space goes before the break instead.
+    // Whitespace alone between two breaks is emptied and left out of the
+    // after-text (#1315): usfm-js makes a `"\n"` leaf from a blank line after
+    // `\p` (`,␤ \p ␤ \q1 “`), and writing the after-text into that leaf put
+    // the opener on the `\p` line, off the `\q1` line it leads. The gap's
+    // space goes before the first break instead.
+    let lastBreak = firstBreak;
+    entries.forEach((it, k) => {
+      if (splitsGap(it)) lastBreak = k;
+    });
     const beforeItems = entries.slice(0, firstBreak);
-    let afterItems = entries.slice(firstBreak).filter((it) => typeof it.node["text"] === "string");
-    const blank = (it: Item) => /^\s*$/.test(String(it.node["text"]));
-    if (afterItems.length > 1 && !afterItems.every(blank)) {
-      for (const it of afterItems) if (blank(it)) it.node["text"] = "";
-      afterItems = afterItems.filter((it) => !blank(it));
+    const afterItems: Item[] = [];
+    for (let k = firstBreak; k < entries.length; k++) {
+      const it = entries[k];
+      if (typeof it.node["text"] !== "string") continue;
+      if (k < lastBreak && /^\s*$/.test(String(it.node["text"]))) it.node["text"] = "";
+      else afterItems.push(it);
     }
     const { before, after } = splitGapAtOldMarker(gap, textOf(beforeItems), textOf(afterItems));
     if (!setText(beforeItems, before) && before) {
@@ -753,9 +760,10 @@ function relayoutPunctuation(
       insertions.push({ parent: first.parent, index: first.index, node: textNode(before) });
     }
     if (!setText(afterItems, after) && after) {
-      // Only textless markers from the first break on: splice after the last.
-      const lastBreak = entries[entries.length - 1];
-      insertions.push({ parent: lastBreak.parent, index: lastBreak.index + 1, node: textNode(after) });
+      // Only textless markers (and emptied whitespace) from the first break
+      // on: splice after the last break.
+      const last = entries[lastBreak];
+      insertions.push({ parent: last.parent, index: last.index + 1, node: textNode(after) });
     }
   }
 

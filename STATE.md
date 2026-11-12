@@ -211,6 +211,8 @@ Highlights that bite repeatedly:
   `"` then curled as `”`), and a punctuation-only edit anywhere in ZEC 13:7 ULT moved its stored line-leading `—`
   to the previous line. The AI pipeline stores the opener
   correctly (leading child of the following milestone); this was ours.
+  `relayoutPunctuation` must keep treating `\ts\*` as a line break (#1315): the plain text puts a space at a bare
+  `\ts\*` as at a `\q1`, so leaving it out of the split saved `say; “I` as `say; “ I`.
 
 - **A line marker with no text node on either side (`H1[say] \q1 H2[The]`) puts a space in the stripped text that
   the tree does not have (#1286).** `stripMarkerTokens` adds it so the two words don't fuse, so the engine diffs
