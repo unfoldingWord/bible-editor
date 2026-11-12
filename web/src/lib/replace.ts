@@ -1362,8 +1362,10 @@ export function smartReplaceVerse(
   // Find/replace callers (findReplaceVerse.ts) pass `findReplace: true`: a
   // whitespace-only match at a bare marker is then a no-op (see the Impl).
   // Typed saves (smartEditVerse) don't, so a character typed beside the chip
-  // keeps the old placement instead of being dropped.
-  options: { findReplace?: boolean } = {},
+  // keeps the old placement instead of being dropped. They pass `typed: true`
+  // instead: `plainText` is then the marker-stripped editable text, which the
+  // exact-text guard reads results in (isExactReplace).
+  options: { findReplace?: boolean; typed?: boolean } = {},
 ): SmartReplaceResult {
   const result = smartReplaceVerseImpl(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options);
   const verseObjectsOut = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
@@ -1394,7 +1396,7 @@ function smartReplaceVerseImpl(
   matchStartInPlain: number,
   matchLenInPlain: number,
   replaceText: string,
-  options: { findReplace?: boolean },
+  options: { findReplace?: boolean; typed?: boolean },
 ): SmartReplaceResult {
   const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
   // No verseObjects to work with — just rebuild the verse from the new
@@ -1503,11 +1505,23 @@ function smartReplaceVerseImpl(
   // the label unchecked (a user regex like `.` can still match the search
   // copy's LABEL_FILL when the occurrence count runs).
   const guarded = acrossSeam || rangeTouchesLabel(leaves, rawStart, rawEnd);
+  // A range over a line break that does have text beside it (ZEC 6:13 ULT
+  // `throne` `".\n"` `\q1` `And`): raw reads like the plain text, so the guard
+  // above never ran, and `throne. And` -> `throne. So then` saved the break after
+  // the new words (`throne. So then\q1 he`, #1321). Check where each break
+  // lands; when one moved past a word the replace kept, try the narrowed retry,
+  // and when no retry keeps it in place, use the first result as before. Never
+  // the flat rebuild here: every replace across an ordinary line break comes
+  // this way. Computed before any path edits `cloned`.
+  const breakInRange = !guarded && rangeHoldsLineBreak(cloned, rawStart, rawEnd);
   const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null => {
+    if (r && breakInRange && !isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true, options.typed === true)) {
+      return narrowedExact() ?? r;
+    }
     if (!r || !guarded) return r;
-    if (isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) return r;
+    if (isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true, options.typed === true)) return r;
     // Copied: the paths below go on editing `cloned`, which it may share nodes with.
-    if (!movedMarker && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, false)) {
+    if (!movedMarker && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, false, options.typed === true)) {
       const vo = (r.content as { verseObjects?: unknown[] } | null)?.verseObjects;
       movedMarker = Array.isArray(vo) ? { ...r, content: { verseObjects: cloneVerseObjects(vo) } } : r;
     }
@@ -1528,6 +1542,18 @@ function smartReplaceVerseImpl(
       if (r) return r;
     }
     return movedMarker ?? flatRebuild();
+  };
+  // The same narrowed retry for `breakInRange`: a result counts only when it
+  // passes the whole match's position check.
+  const narrowedExact = (): SmartReplaceResult | null => {
+    for (const n of narrowedReplaces(plainMatchText, replaceText)) {
+      const start = matchStartInPlain + n.trimStart;
+      const len = matchLenInPlain - n.trimStart - n.trimEnd;
+      const re = new RegExp(plainText.slice(start, start + len).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+      const r = smartReplaceVerseImpl(content, plainText, re, start, len, n.replaceText, options);
+      if (r && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true, options.typed === true)) return r;
+    }
+    return null;
   };
 
   // Smart in-place path requires:
@@ -1859,6 +1885,8 @@ function isExactReplace(
   // Also require every line marker to keep its place (below); false checks
   // only the text, the marker count and the labels, as before #1311.
   checkPositions: boolean,
+  // smartEditVerse's call: `plainText` is the marker-stripped editable text.
+  typed: boolean,
 ): boolean {
   const want = normalize(plainText.slice(0, start) + replaceText + plainText.slice(start + len));
   const lineMarkers = (nodes: unknown[]): number => {
@@ -1880,9 +1908,14 @@ function isExactReplace(
   // `them.And`). Comparing the typed text with the tree's plain text failed
   // every typed edit across a bare seam in a verse with such a marker, and
   // the flat rebuild dropped all its line breaks (#1311).
+  // The two texts agree on a verse with no such marker, so the original alone
+  // can't tell them apart; the typed caller says so. A typed edit that adds
+  // punctuation at a bare marker (`name\q1 this` -> `name,\q1 this`) types
+  // `name,this`, which the plain text reads as `name, this`: every result was
+  // refused, and the fallback unaligned `name` and `this` (#1321).
   const strippedText = (c: unknown) => normalize(normalizeEditable(stripMarkerTokens(extractEditableText(c))));
   const original = { verseObjects };
-  const typedCoords = plainText !== extractPlainText(original) && plainText === strippedText(original);
+  const typedCoords = (typed || plainText !== extractPlainText(original)) && plainText === strippedText(original);
   const got = typedCoords ? strippedText(result.content) : extractPlainText(result.content);
   // Neither text shows a header label, so check those separately: a match
   // that spans one (`said the` around `\sp …`) must not rewrite it.
@@ -3134,6 +3167,7 @@ export function smartEditVerse(
           diff.start,
           diff.oldLen,
           diff.newSubstring,
+          { typed: true },
         );
       } else {
         // Pure insertion — no matchText, can't do word-count preserve.
