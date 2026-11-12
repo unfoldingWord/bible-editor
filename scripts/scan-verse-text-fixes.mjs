@@ -77,7 +77,7 @@ const rows = dumpPaths.flatMap((p) => loadRows(resolve(p)));
 // silently roll a verse back to NULLs. Dump with SELECT *.
 const NEEDED = ["book", "chapter", "verse", "bible_version", "content_json", "plain_text", "version", "updated_by",
   "last_change_action", "last_change_source", "last_change_actor"];
-const missing = NEEDED.filter((c) => rows.length && !(c in rows[0]));
+const missing = NEEDED.filter((c) => rows.some((r) => !(c in r)));
 if (missing.length) {
   console.error(`dump is missing column(s) ${missing.join(", ")} — dump with SELECT * FROM verses`);
   process.exit(1);
