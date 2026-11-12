@@ -12,10 +12,14 @@ export const TW_LINK_RE = /^rc:\/\/[^/]+\/[^/]+\/[^/]+\/[^ \\]+$/;
 // the rewritten cell then fails TW_LINK_RE.
 const TSV_REWRITTEN_RE = /[\r\n\t]/;
 
+// Door43's _flag_straight_quotes is an error-severity check on any row holding
+// a straight ' or " (issue #1327), though TW_LINK_RE accepts both.
+export const STRAIGHT_QUOTE_RE = /['"]/;
+
 // True for a link Door43 would reject once exported. Only null/undefined and
 // exactly "" are blank (still saved; lint flags "Empty TWLink"); whitespace-only
 // is malformed, as in Door43.
 export function isMalformedTwLink(link: string | null | undefined): boolean {
   if (link == null || link === "") return false;
-  return TSV_REWRITTEN_RE.test(link) || !TW_LINK_RE.test(link);
+  return TSV_REWRITTEN_RE.test(link) || STRAIGHT_QUOTE_RE.test(link) || !TW_LINK_RE.test(link);
 }

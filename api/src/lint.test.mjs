@@ -742,6 +742,11 @@ t("twl links Door43 rejects are flagged; links it accepts are not", () => {
   assert.equal(malformed("rc://*/tw/dict/bible/kt/god\n"), 1, "trailing newline");
   assert.equal(malformed("rc://*/tw/dict/bible/kt/god\r"), 1, "carriage return");
   assert.equal(malformed("rc://*/tw/dict/bible/kt/go\td"), 1, "tab");
+  // Issue #1327: TWLINK_RE accepts a straight quote, but Door43's
+  // _flag_straight_quotes raises an error-severity check on the whole row.
+  assert.equal(malformed("rc://*/tw/dict/bible/names/o'neil"), 1, "straight single quote");
+  assert.equal(malformed('rc://*/tw/dict/bible/kt/"god"'), 1, "straight double quote");
+  assert.equal(malformed("rc://*/tw/dict/bible/names/o’neil"), 0, "a curly apostrophe is not a straight quote");
 });
 t("whitespace-only TWLink is 'Malformed TWLink' only (Door43 hard-fails it; only \"\" is blank there)", () => {
   for (const link of ["   ", " ", "\t"]) {

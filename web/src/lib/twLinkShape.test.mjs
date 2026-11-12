@@ -3,7 +3,9 @@
 // Run from web/: node --experimental-strip-types --no-warnings src/lib/twLinkShape.test.mjs
 
 import { readFileSync } from "node:fs";
-import { isMalformedTwLink, TW_LINK_RE } from "./twLinkShape.ts";
+import * as twLinkShape from "./twLinkShape.ts";
+
+const { isMalformedTwLink, STRAIGHT_QUOTE_RE, TW_LINK_RE } = twLinkShape;
 
 let failed = 0;
 function assert(cond, msg) {
@@ -22,6 +24,11 @@ assert(!isMalformedTwLink("rc://en/tw/dict/bible/names/abraham"), "a language-pi
 assert(isMalformedTwLink("   "), "whitespace-only is malformed (Door43 treats only \"\" as blank)");
 assert(isMalformedTwLink("rc://*/tw/dict/bible/kt/god\n"), "a trailing newline is malformed (export writes a literal \\n)");
 assert(isMalformedTwLink("rc://*/tw/dict/bible/kt/go\td"), "a tab is malformed");
+// Issue #1327: Door43's _flag_straight_quotes is an error-severity check, and
+// TW_LINK_RE alone accepts a straight quote.
+assert(isMalformedTwLink("rc://*/tw/dict/bible/names/o'neil"), "a straight single quote is malformed");
+assert(isMalformedTwLink('rc://*/tw/dict/bible/kt/"god"'), "a straight double quote is malformed");
+assert(!isMalformedTwLink("rc://*/tw/dict/bible/names/o’neil"), "a curly apostrophe is fine (not a straight quote)");
 assert(!isMalformedTwLink(""), "blank is not malformed (lint flags it as empty instead)");
 assert(!isMalformedTwLink(null), "null is not malformed");
 
@@ -31,6 +38,10 @@ const apiSrc = readFileSync(new URL("../../../api/src/twLinkShape.ts", import.me
 assert(
   apiSrc.includes(`export const TW_LINK_RE = ${TW_LINK_RE.toString()};`),
   "web TW_LINK_RE is identical to api/src/twLinkShape.ts",
+);
+assert(
+  apiSrc.includes(`const STRAIGHT_QUOTE_RE = ${String(STRAIGHT_QUOTE_RE)};`),
+  "web STRAIGHT_QUOTE_RE is identical to api/src/twLinkShape.ts",
 );
 
 if (failed > 0) {

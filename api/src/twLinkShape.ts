@@ -28,12 +28,20 @@ export const TW_LINK_RE = /^rc:\/\/[^/]+\/[^/]+\/[^/]+\/[^ \\]+$/;
 // Characters tsvCell rewrites on export (see above).
 const TSV_REWRITTEN_RE = /[\r\n\t]/;
 
+// Straight quotes (issue #1327). TWLINK_RE accepts them, but Door43's
+// `_flag_straight_quotes` (same file) raises an error-severity check on any row
+// whose raw line holds ' or ", which blocks the book's TWL push just the same.
+// The TWL export writes tw_link unchanged (no quote curling), and no real
+// article slug contains a quote. Curly quotes are not flagged there, so only
+// U+0027 and U+0022 are refused here.
+export const STRAIGHT_QUOTE_RE = /['"]/;
+
 // True for a link Door43 would reject once exported. Only null/undefined and
 // exactly "" are blank: those stay a lint "Empty TWLink" flag and are still
 // accepted on save, as before #1316. Whitespace-only is malformed, as in Door43.
 export function isMalformedTwLink(link: string | null | undefined): boolean {
   if (link == null || link === "") return false;
-  return TSV_REWRITTEN_RE.test(link) || !TW_LINK_RE.test(link);
+  return TSV_REWRITTEN_RE.test(link) || STRAIGHT_QUOTE_RE.test(link) || !TW_LINK_RE.test(link);
 }
 
 // One sentence a translator can act on, shared by the lint flag and the 400.

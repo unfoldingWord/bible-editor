@@ -147,6 +147,10 @@ for (const bad of [
   // literal backslash-n, which Door43 rejects.
   "rc://*/tw/dict/bible/kt/god\n",
   "rc://*/tw/dict/bible/kt/god\r",
+  // Issue #1327: TWLINK_RE accepts a straight quote, but Door43's
+  // _flag_straight_quotes is an error-severity check on the row.
+  "rc://*/tw/dict/bible/names/o'neil",
+  'rc://*/tw/dict/bible/kt/"god"',
 ]) {
   const { sqlite, patch } = freshApp();
   const res = await patch({ tw_link: bad });
@@ -171,6 +175,12 @@ console.log("\n[POST with a bare word as the link is refused and no row is inser
   eq(res.status, 400, 'POST tw_link="trouble" -> 400');
   eq(rowCount(sqlite), 1, "…no row is inserted");
   eq(logCount(sqlite), 0, "…and nothing is written to the audit log");
+}
+{
+  const { sqlite, create } = freshApp();
+  const res = await create({ tw_link: "rc://*/tw/dict/bible/names/o'neil" });
+  eq(res.status, 400, "POST tw_link with a straight quote -> 400");
+  eq(rowCount(sqlite), 1, "…no row is inserted");
 }
 {
   const { sqlite, create } = freshApp();
