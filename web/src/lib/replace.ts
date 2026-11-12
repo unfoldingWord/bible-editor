@@ -1396,7 +1396,7 @@ function smartReplaceVerseImpl(
   // the lockstep walk failed after a label and the occurrence count could land
   // in it (`man` edited the label's `man`, #1311). Blanking keeps every offset.
   const labelFree = blankHeaderLabels(raw, leaves);
-  const mapped = locatePlainRangeInRaw(plainText, labelFree, matchStartInPlain, matchLenInPlain);
+  const mapped = keepLabelsOutOfEdges(locatePlainRangeInRaw(plainText, labelFree, matchStartInPlain, matchLenInPlain), labelFree, leaves);
   // A whitespace-only match at a marker with no text node beside it: the space
   // is in the plain text only (the marker is the separator), so the tree has
   // nothing to replace. For find/replace, leave the verse as it is; counting
@@ -1731,6 +1731,26 @@ function blankHeaderLabels(raw: string, leaves: Leaf[]): string {
     if (isHeaderLabelNode(l.node) && l.end > l.start) out = out.slice(0, l.start) + " ".repeat(l.end - l.start) + out.slice(l.end);
   }
   return out;
+}
+
+// A located range whose leading or trailing whitespace runs over a blanked
+// header label (`said ` -> `` before `\sp The man speaking`): a match's edge
+// whitespace maps across the blanked text, so the range would cover the label
+// and the replace would drop it. Pull that edge back to the label. A label with
+// matched text on both sides (`said the` around it) stays inside (#1311).
+function keepLabelsOutOfEdges(
+  range: { start: number; end: number } | null,
+  labelFree: string,
+  leaves: Leaf[],
+): { start: number; end: number } | null {
+  if (!range) return range;
+  let { start, end } = range;
+  for (const l of leaves) {
+    if (!isHeaderLabelNode(l.node) || l.end <= l.start || l.start < start || l.end > end) continue;
+    if (!/\S/.test(labelFree.slice(start, l.start))) start = l.end;
+    else if (!/\S/.test(labelFree.slice(l.end, end))) end = l.start;
+  }
+  return { start, end: Math.max(start, end) };
 }
 
 // Header-label texts in document order (see blankHeaderLabels).
