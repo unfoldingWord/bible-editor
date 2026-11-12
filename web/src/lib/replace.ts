@@ -435,12 +435,25 @@ function relaxWhitespace(regex: RegExp): RegExp {
 }
 
 // Find the Nth (1-based) occurrence of `regex` in `text`. Returns null if
-// fewer than `n` matches exist.
-function nthMatchIn(text: string, regex: RegExp, n: number): { index: number; length: number } | null {
+// fewer than `n` matches exist. A match over one of the `skip` ranges is not
+// counted, and the search goes on from that range's end.
+function nthMatchIn(
+  text: string,
+  regex: RegExp,
+  n: number,
+  skip: { start: number; end: number }[] = [],
+): { index: number; length: number } | null {
   const local = new RegExp(regex.source, regex.flags.includes("g") ? regex.flags : regex.flags + "g");
   let m: RegExpExecArray | null;
   let count = 0;
   while ((m = local.exec(text)) !== null) {
+    const start = m.index;
+    const end = start + Math.max(1, m[0].length);
+    const hit = skip.find((r) => r.start < end && r.end > start);
+    if (hit) {
+      local.lastIndex = Math.max(hit.end, start + 1);
+      continue;
+    }
     count++;
     if (count === n) return { index: m.index, length: m[0].length };
     if (m[0].length === 0) local.lastIndex++;
@@ -1362,8 +1375,10 @@ export function smartReplaceVerse(
   // Find/replace callers (findReplaceVerse.ts) pass `findReplace: true`: a
   // whitespace-only match at a bare marker is then a no-op (see the Impl).
   // Typed saves (smartEditVerse) don't, so a character typed beside the chip
-  // keeps the old placement instead of being dropped.
-  options: { findReplace?: boolean } = {},
+  // keeps the old placement instead of being dropped. They pass `typed: true`
+  // instead: `plainText` is then the marker-stripped editable text, which the
+  // exact-text guard reads results in (isExactReplace).
+  options: { findReplace?: boolean; typed?: boolean } = {},
 ): SmartReplaceResult {
   const result = smartReplaceVerseImpl(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options);
   const verseObjectsOut = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
@@ -1394,7 +1409,7 @@ function smartReplaceVerseImpl(
   matchStartInPlain: number,
   matchLenInPlain: number,
   replaceText: string,
-  options: { findReplace?: boolean },
+  options: { findReplace?: boolean; typed?: boolean },
 ): SmartReplaceResult {
   const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
   // No verseObjects to work with — just rebuild the verse from the new
@@ -1430,7 +1445,22 @@ function smartReplaceVerseImpl(
   // see blankHeaderLabels for why the two copies blank it differently.
   const labelFree = blankHeaderLabels(raw, leaves, " ");
   const labelSearch = blankHeaderLabels(raw, leaves, LABEL_FILL);
-  const mapped = keepLabelsOutOfEdges(locatePlainRangeInRaw(plainText, labelFree, matchStartInPlain, matchLenInPlain), labelFree, leaves);
+  let walked = locatePlainRangeInRaw(plainText, labelFree, matchStartInPlain, matchLenInPlain);
+  // A row stored before #711 kept a `\sp` label's text in its plain text, where
+  // the label sits in the tree, so the walk over the label-free text misses.
+  // Walk raw with the label text instead. The occurrence count below would
+  // count the label's matches in the stored text and edit a later word, or
+  // land in the label and flatten the verse (#1321). A match on the label's
+  // own text is not verse text: find/replace leaves the verse as it is.
+  if (!walked && leaves.some((l) => isHeaderLabelNode(l.node) && l.end > l.start)) {
+    const viaLabels = locatePlainRangeInRaw(plainText, raw, matchStartInPlain, matchLenInPlain);
+    if (viaLabels) {
+      const inLabel = leaves.some((l) => isHeaderLabelNode(l.node) && /\S/.test(raw.slice(Math.max(viaLabels.start, l.start), Math.min(viaLabels.end, l.end))));
+      if (!inLabel) walked = viaLabels;
+      else if (options.findReplace) return { content, plainText, preservedAlignment: true };
+    }
+  }
+  const mapped = keepLabelsOutOfEdges(walked, labelFree, leaves);
   // A whitespace-only match at a marker with no text node beside it: the space
   // is in the plain text only (the marker is the separator), so the tree has
   // nothing to replace. For find/replace, leave the verse as it is; counting
@@ -1451,7 +1481,12 @@ function smartReplaceVerseImpl(
   const rawRegex = relaxWhitespace(regex);
   const rawMatch = located
     ? { index: located.start, length: located.end - located.start }
-    : nthMatchIn(labelSearch, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1);
+    : // A match over a label's blanked text is not counted: a `\S+` or `.` regex
+      // matches LABEL_FILL, and the plain text it is counted against has no
+      // label. The search goes on after the label, so `\S+` still finds the
+      // word right after it (#1321).
+      nthMatchIn(labelSearch, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1,
+        leaves.filter((l) => isHeaderLabelNode(l.node) && l.end > l.start));
 
   // If the raw search yields nothing (normalization wiped a match, or
   // the match text spans an inline marker token like "\p " that has no
@@ -1513,13 +1548,13 @@ function smartReplaceVerseImpl(
   // this way. Computed before any path edits `cloned`.
   const breakInRange = !guarded && rangeHoldsLineBreak(cloned, rawStart, rawEnd);
   const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null => {
-    if (r && breakInRange && !isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) {
+    if (r && breakInRange && !isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true, options.typed === true)) {
       return narrowedExact() ?? r;
     }
     if (!r || !guarded) return r;
-    if (isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) return r;
+    if (isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true, options.typed === true)) return r;
     // Copied: the paths below go on editing `cloned`, which it may share nodes with.
-    if (!movedMarker && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, false)) {
+    if (!movedMarker && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, false, options.typed === true)) {
       const vo = (r.content as { verseObjects?: unknown[] } | null)?.verseObjects;
       movedMarker = Array.isArray(vo) ? { ...r, content: { verseObjects: cloneVerseObjects(vo) } } : r;
     }
@@ -1549,7 +1584,7 @@ function smartReplaceVerseImpl(
       const len = matchLenInPlain - n.trimStart - n.trimEnd;
       const re = new RegExp(plainText.slice(start, start + len).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
       const r = smartReplaceVerseImpl(content, plainText, re, start, len, n.replaceText, options);
-      if (r && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) return r;
+      if (r && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true, options.typed === true)) return r;
     }
     return null;
   };
@@ -1883,6 +1918,8 @@ function isExactReplace(
   // Also require every line marker to keep its place (below); false checks
   // only the text, the marker count and the labels, as before #1311.
   checkPositions: boolean,
+  // smartEditVerse's call: `plainText` is the marker-stripped editable text.
+  typed: boolean,
 ): boolean {
   const want = normalize(plainText.slice(0, start) + replaceText + plainText.slice(start + len));
   const lineMarkers = (nodes: unknown[]): number => {
@@ -1904,9 +1941,14 @@ function isExactReplace(
   // `them.And`). Comparing the typed text with the tree's plain text failed
   // every typed edit across a bare seam in a verse with such a marker, and
   // the flat rebuild dropped all its line breaks (#1311).
+  // The two texts agree on a verse with no such marker, so the original alone
+  // can't tell them apart; the typed caller says so. A typed edit that adds
+  // punctuation at a bare marker (`name\q1 this` -> `name,\q1 this`) types
+  // `name,this`, which the plain text reads as `name, this`: every result was
+  // refused, and the fallback unaligned `name` and `this` (#1321).
   const strippedText = (c: unknown) => normalize(normalizeEditable(stripMarkerTokens(extractEditableText(c))));
   const original = { verseObjects };
-  const typedCoords = plainText !== extractPlainText(original) && plainText === strippedText(original);
+  const typedCoords = (typed || plainText !== extractPlainText(original)) && plainText === strippedText(original);
   const got = typedCoords ? strippedText(result.content) : extractPlainText(result.content);
   // Neither text shows a header label, so check those separately: a match
   // that spans one (`said the` around `\sp …`) must not rewrite it.
@@ -3158,6 +3200,7 @@ export function smartEditVerse(
           diff.start,
           diff.oldLen,
           diff.newSubstring,
+          { typed: true },
         );
       } else {
         // Pure insertion — no matchText, can't do word-count preserve.
