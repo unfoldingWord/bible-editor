@@ -76,4 +76,47 @@ const cleared = { quote: "", note: "Some note.", support_reference: SR };
   check(Object.keys(patch).length === 0, "restoring the current content sends an empty patch");
 }
 
+// The quote builder's re-anchor writes {quote, occurrence} from UHB tokens in
+// legacy combining-mark order (dagesh before vowel); a stored quote may be NFC.
+// Those are the same quote, so a restore across them is note-only for the
+// Occurrence rule and must not undo the re-anchor's occurrence.
+{
+  const legacy = "בַּיּוֹם"; // dagesh, then patah
+  const nfcForm = legacy.normalize("NFC");
+  check(legacy !== nfcForm, "fixture: legacy-order and NFC quotes differ byte-wise");
+  const patch = buildTnRestorePatch(
+    { quote: legacy, note: "Older note.", support_reference: SR, occurrence: 1 },
+    { quote: nfcForm, note: "Some note.", support_reference: SR },
+    3,
+  );
+  check(patch.note === "Older note.", "NFC-equal quote: the note is restored");
+  check(
+    !("occurrence" in patch),
+    `NFC-equal but byte-different quote sends no occurrence (got ${JSON.stringify(patch.occurrence)})`,
+  );
+}
+
+{
+  const patch = buildTnRestorePatch(
+    { quote: ` ${HEB}  `, note: "Older note.", support_reference: SR, occurrence: 1 },
+    { quote: HEB.replace(" ", "  "), note: "Some note.", support_reference: SR },
+    3,
+  );
+  check(patch.note === "Older note.", "whitespace-only quote change: the note is restored");
+  check(
+    !("occurrence" in patch),
+    `a whitespace-only quote difference sends no occurrence (got ${JSON.stringify(patch.occurrence)})`,
+  );
+}
+
+{
+  const patch = buildTnRestorePatch(
+    { quote: HEB, note: "Some note.", support_reference: SR, occurrence: 2 },
+    { quote: "דָּבָר", note: "Some note.", support_reference: SR },
+    1,
+  );
+  check(patch.quote === HEB, "a genuinely different Hebrew quote is restored");
+  check(patch.occurrence === 2, "a genuinely different Hebrew quote still sends its occurrence");
+}
+
 console.log(`\n${passed} assertions passed`);
