@@ -96,6 +96,26 @@ const GL = "the Chaldeans, the ones laying siege";
      "but OL quote + 0 still heals to 1 — the long-standing rule, unchanged");
 }
 
+// ─── tn general note: a blank Quote means Occurrence blank or 0, never 1 ──
+// Prod tn EZK 33:7-9 `criy`: the quote was cleared in the app but Occurrence
+// stayed 1, the only blank-quote row in D1 with a non-zero Occurrence. en_tn
+// master's blank-quote rows carry blank or 0.
+{
+  console.log("\n[tn] clearing the Quote moves a non-zero Occurrence to 0");
+  eq(requiredOccurrence("tn", "", 1), 0, "THE EZK 33:7-9 criy CASE: blank quote + 1 -> 0");
+  eq(requiredOccurrence("tn", null, 1), 0, "null quote + 1 -> 0");
+  eq(requiredOccurrence("tn", undefined, 3), 0, "quote key absent + 3 -> 0");
+  eq(requiredOccurrence("tn", "", -1), 0, "blank quote + -1 -> 0 (nothing to count)");
+  eq(requiredOccurrence("tn", "", NaN), 0, "blank quote + NaN -> 0, not the 1 a quoted row gets");
+  eq(requiredOccurrence("tn", "", "2"), 0, "blank quote + string '2' -> 0");
+  eq(requiredOccurrence("tn", "", 0), null, "blank quote + 0 is already right -> untouched");
+  eq(requiredOccurrence("tn", "   ", 1), null,
+     "whitespace-only quote is NOT blank to the validator -> its 1 stands");
+  eq(requiredOccurrence("tq", "", 1), null, "tq is out of scope: blank quote + 1 untouched");
+  eq(renderOccurrence("tn", "", 1), 0, "a stored criy-shaped row renders 0");
+  eq(renderOccurrence("tn", null, 2), 0, "null quote + 2 renders 0");
+}
+
 // ─── tq: its validator permits a blank Occurrence, so nothing is forced ──
 // validate_tq_files.py: `if occurrence != "" and not RE.fullmatch(...)`
 {
@@ -123,7 +143,7 @@ const GL = "the Chaldeans, the ones laying siege";
   eq(requiredOccurrence("tn", "some quote", -2), 1,
      "tn -2 violates ^(?:-1|[0-9]+)$ -> forced to 1");
   eq(requiredOccurrence("tq", "some quote", -2), 1, "tq -2 -> 1");
-  eq(requiredOccurrence("tn", "", -2), 1, "tn -2 is invalid even with a blank quote");
+  eq(requiredOccurrence("tn", "", -2), 0, "tn -2 with a blank quote -> 0 (the general-note rule)");
 }
 
 // ─── non-numeric junk is treated as absent, never coerced into the cell ──
@@ -204,6 +224,7 @@ const GL = "the Chaldeans, the ones laying siege";
   // A general tn note keeps the blank that its validator explicitly allows.
   const generalCell = createThenRender("tn", "", undefined);
   eq(generalCell, "", "quote-less tn note still renders a blank Occurrence (legal, and no churn)");
+  eq(createThenRender("tn", "", 1), "0", "a tn note created with a blank quote and occurrence 1 renders 0");
 }
 
 console.log(failed === 0 ? "\nAll occurrenceRule tests passed." : `\n${failed} test(s) FAILED.`);
