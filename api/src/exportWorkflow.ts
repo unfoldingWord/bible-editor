@@ -1261,7 +1261,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // lint.ts flags it in-app (issue #1149, which reversed #1015's hold). A
     // clean render clears any stale HELD banner — on a dry run too, since the
     // clear only reads the bytes (the HOLD itself needs dcsAllowed).
-    if (resource === "tn" || resource === "twl") {
+    //
+    // tq joined for #1336: Door43's straight-quote check is an error in all
+    // three TSV validators (twl since #1334). tq has no Occurrence rule, so
+    // a straight quote is the only thing that holds it.
+    if (resource === "tn" || resource === "tq" || resource === "twl") {
       const rejects = hardRejectRows(resource, built.content);
       if (rejects.length === 0) {
         // The rows were fixed (or deleted): clear the HELD banner so it does not

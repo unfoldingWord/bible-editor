@@ -28,7 +28,7 @@ import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
 import { extractPlainText, isInFlowMarker, isTsMilestone } from "./importParsers.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
-import { isMalformedTwLink, malformedTwLinkHint } from "./twLinkShape.ts";
+import { isMalformedTwLink, malformedTwLinkHint, origWordsQuoteProblem } from "./twLinkShape.ts";
 import { hasOpeningPunctInsideMilestone } from "./openingPunct.ts";
 import { bracketProblems } from "./hardRejectGuard.ts";
 
@@ -850,6 +850,12 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
     const ref = `${r.chapter}:${r.verse}`;
     if (isBlankRequired(r.orig_words)) {
       issues.push({ check: "Empty OrigWords", bucket: "flag", ref, rowId: r.id, message: "Empty OrigWords — DCS only warns, so this row publishes blank on the next export. Add the original-language word(s) or delete the row." });
+    }
+    // Issue #1336: a straight quote is an error-severity check in Door43, and
+    // the export writes OrigWords as stored, so it holds the book's TWL export.
+    const quoteProblem = origWordsQuoteProblem(r.orig_words);
+    if (quoteProblem) {
+      issues.push({ check: "Straight quote in OrigWords", bucket: "flag", ref, rowId: r.id, message: `OrigWords "${r.orig_words}": ${quoteProblem}` });
     }
     // Issue #1316: only null and exactly "" are blank here, matching Door43's
     // `if not twlink`. Whitespace-only fails TWLINK_RE there (a hard error), so
