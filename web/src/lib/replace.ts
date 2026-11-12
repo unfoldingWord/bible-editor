@@ -1503,7 +1503,19 @@ function smartReplaceVerseImpl(
   // the label unchecked (a user regex like `.` can still match the search
   // copy's LABEL_FILL when the occurrence count runs).
   const guarded = acrossSeam || rangeTouchesLabel(leaves, rawStart, rawEnd);
+  // A range over a line break that does have text beside it (ZEC 6:13 ULT
+  // `throne` `".\n"` `\q1` `And`): raw reads like the plain text, so the guard
+  // above never ran, and `throne. And` -> `throne. So then` saved the break after
+  // the new words (`throne. So then\q1 he`, #1321). Check where each break
+  // lands; when one moved past a word the replace kept, try the narrowed retry,
+  // and when no retry keeps it in place, use the first result as before. Never
+  // the flat rebuild here: every replace across an ordinary line break comes
+  // this way. Computed before any path edits `cloned`.
+  const breakInRange = !guarded && rangeHoldsLineBreak(cloned, rawStart, rawEnd);
   const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null => {
+    if (r && breakInRange && !isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) {
+      return narrowedExact() ?? r;
+    }
     if (!r || !guarded) return r;
     if (isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) return r;
     // Copied: the paths below go on editing `cloned`, which it may share nodes with.
@@ -1528,6 +1540,18 @@ function smartReplaceVerseImpl(
       if (r) return r;
     }
     return movedMarker ?? flatRebuild();
+  };
+  // The same narrowed retry for `breakInRange`: a result counts only when it
+  // passes the whole match's position check.
+  const narrowedExact = (): SmartReplaceResult | null => {
+    for (const n of narrowedReplaces(plainMatchText, replaceText)) {
+      const start = matchStartInPlain + n.trimStart;
+      const len = matchLenInPlain - n.trimStart - n.trimEnd;
+      const re = new RegExp(plainText.slice(start, start + len).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+      const r = smartReplaceVerseImpl(content, plainText, re, start, len, n.replaceText, options);
+      if (r && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) return r;
+    }
+    return null;
   };
 
   // Smart in-place path requires:
