@@ -20,7 +20,7 @@ import { reopenLaneChecks } from "./laneReopen";
 import { refParts, coveredVersesFromRef } from "./importParsers";
 import { requiredOccurrence } from "./occurrenceRule";
 import { findRawTabField } from "./rawTabGuard";
-import { isMalformedTwLink, MALFORMED_TW_LINK_HINT } from "./twLinkShape";
+import { isMalformedTwLink, malformedTwLinkHint } from "./twLinkShape";
 import { isValidChapterZeroRef } from "./chapterZeroGuard";
 import { normalizeBookCode, CHAPTER_EXISTS_SQL } from "./rowsCreateGuard";
 import { isValidTwlRefRaw } from "./twlRefGuard";
@@ -299,7 +299,7 @@ rows.post("/:kind", requireEditor, async (c) => {
   // Whitespace-only is refused, since Door43 hard-fails it.
   if (isMalformedTwLink(data.tw_link as string | null | undefined)) {
     return c.json(
-      { error: "invalid_body", message: `TWLink "${data.tw_link}" is not a valid link. ${MALFORMED_TW_LINK_HINT}` },
+      { error: "invalid_body", message: `TWLink "${data.tw_link}" is not a valid link. ${malformedTwLinkHint(data.tw_link as string)}` },
       400,
     );
   }
@@ -700,7 +700,7 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   const patchedTwLink = (patch as Record<string, unknown>).tw_link as string | null | undefined;
   if (isMalformedTwLink(patchedTwLink)) {
     return c.json(
-      { error: "invalid_body", message: `TWLink "${patchedTwLink}" is not a valid link. ${MALFORMED_TW_LINK_HINT}` },
+      { error: "invalid_body", message: `TWLink "${patchedTwLink}" is not a valid link. ${malformedTwLinkHint(patchedTwLink)}` },
       400,
     );
   }

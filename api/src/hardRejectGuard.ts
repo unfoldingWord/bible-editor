@@ -34,6 +34,20 @@
 //        #1316 made the editor refuse a malformed link on save and flag any
 //        already stored, but a link stored before #1316 still exported and
 //        would fail the -be- PR with no banner naming the row.
+//   twl straight quotes (`validate_twl_files.py` `_flag_straight_quotes`, def
+//        ~629-657, called ~493/507/519 for every data row; en_twl db7ef2aad5,
+//        2026-07-24): `if "'" in raw_line or '"' in raw_line` → error (no
+//        `severity` kwarg; check 14, on by default since the workflows pass no
+//        `--checks`). It reads the whole raw line, so a straight quote in ANY
+//        column fails the run; the header row is exempt (`lines[1:]`). Added
+//        for #1334: #1327 refused a quote in TWLink, but one in OrigWords, Tags,
+//        Reference or ID still turned the -be- PR red with no banner. The
+//        reason names the column(s). A TWLink whose only fault is a quote gets
+//        this entry alone, not also the TWLink-shape one.
+//        en_tn (check 15, inlined ~646-716) and en_tq (check 13, ~604-632) run
+//        the same line check, but their render curls quotes only in Note /
+//        Question / Response (educateQuotes), so holding them needs its own
+//        prod count of the rendered bytes first; not done here.
 //
 // This operates on the RENDERED TSV, not on the D1 rows, and that is load-bearing.
 // `renderOccurrence` (occurrenceRule.ts, called by export.ts) heals an invalid
@@ -66,7 +80,9 @@
 // testable by the --experimental-strip-types runner, same shape as
 // shrinkGuard.ts / reimportSyncGate.ts.
 
-import { isMalformedTwLink } from "./twLinkShape.ts";
+import { isMalformedTwLink, STRAIGHT_QUOTE_RE } from "./twLinkShape.ts";
+
+const STRAIGHT_QUOTES_G = /['"]/g;
 
 // DCS's OCCURRENCE_RE, per resource. tn/tq accept -1 and 0; twl requires a
 // positive integer ("never 0 or blank" per its own message).
@@ -125,15 +141,49 @@ export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow
         out.push({ ref, rowId, reason: `Occurrence '${occ}' must be a positive integer` });
       }
       // Judged on the rendered cell, so a stored newline already shows as the
-      // literal backslash-n Door43 will see. "" is a warning and ships.
+      // literal backslash-n Door43 will see. "" is a warning and ships. Straight
+      // quotes are left to the whole-row rule below, so a link whose only
+      // fault is a quote gets one entry naming TWLink, not "not a full rc://
+      // link" (#1334).
       const link = linkIdx === -1 ? "" : (cells[linkIdx] ?? "");
-      if (isMalformedTwLink(link)) {
+      const unquoted = link.replace(STRAIGHT_QUOTES_G, "");
+      if (isMalformedTwLink(unquoted)) {
+        out.push({
+          ref,
+          rowId,
+          // Blank space is judged on the link as written: "' " is a quote
+          // plus a space, not blank.
+          reason:
+            link.trim() === ""
+              ? `TWLink '${link}' is only blank space, so open the row and clear it or pick the article from the list`
+              : `TWLink '${link}' is not a full rc:// link such as rc://*/tw/dict/bible/kt/god, ` +
+                `so open the row and pick the article from the list`,
+        });
+      }
+      // Door43's _flag_straight_quotes tests the whole raw data line, so a
+      // straight quote in any column fails the run. Checking every cell of the
+      // tab-split line covers exactly that line.
+      // A curly quote is the fix in OrigWords or Tags, but not in TWLink: no
+      // article slug contains a quote, so there the fix is the article itself.
+      const quoteIdxs = cells.flatMap((cell, i) => (STRAIGHT_QUOTE_RE.test(cell) ? [i] : []));
+      if (quoteIdxs.length > 0) {
+        const quotes = ["'", '"'].filter((q) => line.includes(q)).join(" and ");
+        const colName = (i: number) => header[i] ?? `column ${i + 1}`;
+        const textCols = quoteIdxs.filter((i) => i !== linkIdx).map(colName);
+        const inLink = quoteIdxs.includes(linkIdx);
+        const fix =
+          textCols.length === 0
+            ? "remove it from TWLink or pick the article from the list"
+            : !inLink
+              ? "use a curly quote (’ “ ”) or remove it"
+              : `use a curly quote (’ “ ”) or remove it in ${textCols.join(" and ")}, ` +
+                `and remove it from TWLink or pick the article from the list`;
         out.push({
           ref,
           rowId,
           reason:
-            `TWLink '${link}' is not a full rc:// link such as rc://*/tw/dict/bible/kt/god, ` +
-            `so open the row and pick the article from the list`,
+            `straight quote (${quotes}) in ${quoteIdxs.map(colName).join(" and ")}: Door43 accepts only curly quotes, ` +
+            `so open the row and ${fix}`,
         });
       }
       continue;
@@ -195,14 +245,22 @@ export function buildHardRejectAlertMessage(
   rejects: HardRejectRow[],
 ): string {
   const label = `${book} ${resource.toUpperCase()}`;
-  const shown = rejects
+  // hardRejectRows can report several problems for one row (Occurrence,
+  // TWLink shape, straight quotes), so group by row ID: one line per row with
+  // its reasons joined, and the sample cap and "+N more" count rows.
+  const byRow = new Map<string, { ref: string; reasons: string[] }>();
+  for (const r of rejects) {
+    const row = byRow.get(r.rowId);
+    if (row) row.reasons.push(r.reason);
+    else byRow.set(r.rowId, { ref: r.ref, reasons: [r.reason] });
+  }
+  const rows = [...byRow.entries()];
+  const shown = rows
     .slice(0, 6)
-    .map((r) => `${r.ref} (${r.rowId}): ${r.reason}`)
+    .map(([rowId, r]) => `${r.ref} (${rowId}): ${r.reasons.join(" and also ")}`)
     .join("; ");
-  const more = rejects.length > 6 ? `; +${rejects.length - 6} more` : "";
-  // hardRejectRows reports at most one problem per row today, but count rows by
-  // ID rather than entries so the banner stays right if a rule is ever added.
-  const rowCount = new Set(rejects.map((r) => r.rowId)).size;
+  const more = rows.length > 6 ? `; +${rows.length - 6} more` : "";
+  const rowCount = rows.length;
   return (
     `Benjamin — nightly export HELD ${label}: ${rowCount} row(s) would fail DCS ` +
     `validation as a hard error, so the -be- PR's check would go red and the merge bot would never merge it. ` +

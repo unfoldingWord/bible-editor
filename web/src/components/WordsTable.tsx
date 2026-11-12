@@ -19,7 +19,7 @@ import { TwArticleDialog } from "./TwArticleDialog";
 import { draftDirtyBorderSx } from "../sync/drafts";
 import { usePinnedRowEdit, type PinnedSaveOpts } from "../hooks/usePinnedRowEdit";
 import { directionForText } from "../lib/direction";
-import { isMalformedTwLink } from "../lib/twLinkShape";
+import { isMalformedTwLink, twLinkCharacterProblem } from "../lib/twLinkShape";
 
 // Occurrence is hidden in the schema but real (round-trips to the TSV
 // Occurrence column). Display null as 1: the export coerces an OL quote's
@@ -820,10 +820,13 @@ const WordRow = memo(function WordRow({
           display={(v) => (v ? twShort(v) : "+ TW article")}
           placeholder="names/, kt/, other/, …"
           // Typed text Door43 would reject (a bare word like "trouble") is
-          // refused here, not saved (issue #1316); the API refuses it too.
+          // refused here, not saved (issue #1316); the API refuses it too. A
+          // full link whose only fault is a straight quote, a line break or
+          // blank space gets a sentence naming that fault (issue #1334).
           validate={(typed) =>
             isMalformedTwLink(typed)
-              ? "Not a link. Type part of the article name and pick it from the list, or paste a full link like rc://*/tw/dict/bible/kt/god."
+              ? (twLinkCharacterProblem(typed) ??
+                "Not a link. Type part of the article name and pick it from the list, or paste a full link like rc://*/tw/dict/bible/kt/god.")
               : null
           }
           onChange={(next) => setTwLink(next)}

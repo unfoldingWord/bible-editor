@@ -47,3 +47,26 @@ export function isMalformedTwLink(link: string | null | undefined): boolean {
 // One sentence a translator can act on, shared by the lint flag and the 400.
 export const MALFORMED_TW_LINK_HINT =
   "A translationWords link must be a full rc:// link, for example rc://*/tw/dict/bible/kt/god. Pick the article from the list.";
+
+// Issue #1334. When a link's only fault is blank space, a straight quote, or a
+// line break / tab, "must be a full rc:// link" is no help: the translator is
+// looking at a full link. Returns one sentence naming that fault, or null when
+// the link is fine or its shape is wrong too (callers then use the general
+// hint). Shared by the 400, the lint flag and (via the web copy) the picker.
+export function twLinkCharacterProblem(link: string | null | undefined): string | null {
+  if (typeof link !== "string" || !isMalformedTwLink(link)) return null;
+  if (link.trim() === "") {
+    return "A translationWords link cannot be only blank space. Clear it, or pick the article from the list (a full link looks like rc://*/tw/dict/bible/kt/god).";
+  }
+  if (!TW_LINK_RE.test(link.replace(/['"\r\n\t]/g, ""))) return null;
+  const quotes = ["'", '"'].filter((q) => link.includes(q));
+  const faults: string[] = [];
+  if (quotes.length > 0) faults.push(`a straight quote (${quotes.join(" and ")})`);
+  if (TSV_REWRITTEN_RE.test(link)) faults.push("a line break or tab");
+  return `A translationWords link cannot contain ${faults.join(" or ")}. Remove it, or pick the article from the list.`;
+}
+
+// The sentence to show for a link isMalformedTwLink refuses.
+export function malformedTwLinkHint(link: string | null | undefined): string {
+  return twLinkCharacterProblem(link) ?? MALFORMED_TW_LINK_HINT;
+}
