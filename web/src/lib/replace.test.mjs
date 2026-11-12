@@ -3994,6 +3994,121 @@ function countAllMilestones(nodes) {
   }
 }
 
+// Case 96: a stored plain text out of step with a verse that has a header
+// label (#1339). Before #711 the plain text kept a `\sp` label's text inline,
+// so a row saved then reads `The woman said The man speaking the man ran.`
+// while the tree's own text reads `The woman said the man ran.`. The position
+// walk misses on such a text and the occurrence count runs: a label match
+// pushed it onto a later word, a `\S+` / `.` run counted onto the blanked
+// label, and a guarded range flattened the verse. Find/replace now places the
+// picked match in the tree's own text by the text the two share at the start
+// and the end, and refuses (`staleRefused`, shown in the overlay) when it
+// can't. Never another word, never the label, never label text in the body.
+// The 2026-11-12 prod check found no such row; hardening before Song of Songs.
+{
+  console.log("\n[Case 96] Stale stored plain text beside a header label: the picked match or a visible refusal (#1339)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const labels = (content) => JSON.stringify(content.verseObjects.filter((n) => n.tag === "sp").map((n) => n.text));
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const verse = { verseObjects: [zaln("H0", [w("The")]), t(" "), zaln("H1", [w("woman")]), t(" "), zaln("H2", [w("said")]), t("\n"), { tag: "sp", text: "The man speaking\n" }, { tag: "q1", type: "quote" },
+    zaln("H3", [w("the")]), t(" "), zaln("H4", [w("man")]), t(" "), zaln("H5", [w("ran")]), t(".")] };
+  const fresh = "The woman said the man ran.";
+  assert(extractPlainText(verse) === fresh, `setup: the tree's plain text (got ${JSON.stringify(extractPlainText(verse))})`);
+  const allWords = "The:H0|woman:H1|said:H2|the:H3|man:H4|ran:H5";
+  const unchanged = (r, s, what) => {
+    assert(r.staleRefused === true, `${what}: refused with the stale-text flag (got ${JSON.stringify(r.staleRefused)})`);
+    assert(r.plainText === s, `${what}: refused, plain text is the stored one (got ${JSON.stringify(r.plainText)})`);
+    assert(extractEditableText(r.content) === extractEditableText(verse) && words(r.content) === allWords && labels(r.content) === labels(verse),
+      `${what}: refused, the verse is untouched (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
+  };
+  const noLabelInBody = (r, what) =>
+    assert(!/speaking/.test(extractPlainText(r.content)) && labels(r.content) === labels(verse),
+      `${what}: label kept, no label text in the body (got ${JSON.stringify(extractPlainText(r.content))} ${labels(r.content)})`);
+  // The stored text as the extractor wrote it before #711: label text inline.
+  const withLabel = "The woman said The man speaking the man ran.";
+  // An earlier stale word as well (shape 1 of #1339).
+  const both = "The lady said The man speaking the man ran.";
+  for (const s of [withLabel, both]) {
+    const tag = s === both ? "stale word + label text" : "label text inline";
+    // The verse's own `man`, after the label: edited.
+    const r = findReplaceVerse(clone(verse), s, /man/g, s.lastIndexOf("man"), 3, "boy");
+    assert(extractEditableText(r.content) === "The woman said \\q1 the boy ran.", `${tag}: man -> boy edits the picked man (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(words(r.content) === "The:H0|woman:H1|said:H2|the:H3|boy:|ran:H5", `${tag}: man -> boy: untouched words keep their alignment (got ${words(r.content)})`);
+    noLabelInBody(r, `${tag}: man -> boy`);
+    // The label's `man`: not verse text. Main edited `woman` (shape 1).
+    unchanged(findReplaceVerse(clone(verse), s, /man/g, s.indexOf("man speaking"), 3, "boy"), s, `${tag}: the label's man -> boy`);
+  }
+  // `\W+`, `[^a-z]+`, `\S+` and `.` runs over the label-inline text (shape 2):
+  // every match either edits exactly what the same match edits in the tree's
+  // own text, or is refused. The label text sits at [15, 32) of `withLabel`.
+  const labelAt = withLabel.indexOf("The man speaking ");
+  const labelLen = "The man speaking ".length;
+  for (const re of [/\W+/g, /[^a-z]+/g, /\S+/g, /./g, /man/g, /the/gi]) {
+    for (const m of withLabel.matchAll(re)) {
+      const what = `label text inline, ${re} #${m.index} ${JSON.stringify(m[0])} -> "X"`;
+      const r = findReplaceVerse(clone(verse), withLabel, re, m.index, m[0].length, "X");
+      const end = m.index + m[0].length;
+      // Where the match truly sits in the tree's text, if it is verse text there.
+      const at = end <= labelAt ? m.index : m.index >= labelAt + labelLen ? m.index - labelLen : -1;
+      const sameInFresh = at >= 0 && [...fresh.matchAll(re)].some((f) => f.index === at && f[0] === m[0]);
+      if (r.staleRefused) {
+        unchanged(r, withLabel, what);
+        continue;
+      }
+      assert(sameInFresh, `${what}: edited only when the match is the same match in the tree's own text (got ${JSON.stringify(extractEditableText(r.content))})`);
+      if (!sameInFresh) continue;
+      const want = findReplaceVerse(clone(verse), fresh, re, at, m[0].length, "X");
+      assert(extractEditableText(r.content) === extractEditableText(want.content) && words(r.content) === words(want.content),
+        `${what}: as the same replace on the tree's own text (got ${JSON.stringify(extractEditableText(r.content))} ${words(r.content)}, want ${JSON.stringify(extractEditableText(want.content))})`);
+      noLabelInBody(r, what);
+    }
+  }
+  // Named picks from the sweep. `\S+` on the body's `the` edits it; on the
+  // label's `speaking` is refused; the space between the label text and the
+  // body is refused (it is shared by both sides, so it can't be placed).
+  {
+    const r = findReplaceVerse(clone(verse), withLabel, /\S+/g, withLabel.lastIndexOf("the"), 3, "a");
+    assert(extractEditableText(r.content) === "The woman said \\q1 a man ran." && words(r.content) === "The:H0|woman:H1|said:H2|a:|man:H4|ran:H5",
+      `label text inline, \\S+ the -> a (got ${JSON.stringify(extractEditableText(r.content))} ${words(r.content)})`);
+    unchanged(findReplaceVerse(clone(verse), withLabel, /\S+/g, withLabel.indexOf("speaking"), 8, "a"), withLabel, "label text inline, \\S+ speaking -> a");
+    unchanged(findReplaceVerse(clone(verse), withLabel, /\W+/g, withLabel.indexOf(" the"), 1, "_"), withLabel, "label text inline, \\W+ before the body's the -> _");
+  }
+  // A guarded match (it crosses the label in the tree) on a stale text
+  // (shape 3): `said the` -> `said a` across the label keeps the label, the
+  // line break and every untouched word, as on the tree's own text (Case 90).
+  // Main found no match in raw and flattened the verse.
+  {
+    const lady = "The lady said the man ran.";
+    const r = findReplaceVerse(clone(verse), lady, /said the/g, lady.indexOf("said the"), 8, "said a");
+    assert(extractEditableText(r.content) === "The woman said \\q1 a man ran.", `stale text, said the -> said a across the label (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(words(r.content) === "The:H0|woman:H1|said:H2|a:|man:H4|ran:H5", `stale text, said the -> said a: untouched words keep their alignment (got ${words(r.content)})`);
+    noLabelInBody(r, "stale text, said the -> said a");
+    // `\S+` and `.` after the label counted onto the blanked label on main.
+    const s = findReplaceVerse(clone(verse), lady, /\S+/g, lady.indexOf("the"), 3, "a");
+    assert(extractEditableText(s.content) === "The woman said \\q1 a man ran." && words(s.content) === "The:H0|woman:H1|said:H2|a:|man:H4|ran:H5",
+      `stale text, \\S+ the -> a (got ${JSON.stringify(extractEditableText(s.content))} ${words(s.content)})`);
+    const d = findReplaceVerse(clone(verse), lady, /./g, lady.indexOf("the"), 1, "T");
+    assert(extractEditableText(d.content) === "The woman said \\q1 The man ran.", `stale text, . t -> T (got ${JSON.stringify(extractEditableText(d.content))})`);
+    noLabelInBody(d, "stale text, . t -> T");
+    // The stale word itself is not in the tree: refused.
+    unchanged(findReplaceVerse(clone(verse), lady, /lady/g, 4, 4, "girl"), lady, "stale text, the stale word lady -> girl");
+  }
+  // Replace all on the label-inline text: the verse's own matches are
+  // replaced, the label's are not verse text. When a match the tree's text
+  // has can't be placed in the stored text, the whole verse is refused.
+  {
+    const all = replaceAllInVerse(clone(verse), withLabel, /man/g, 3, "boy");
+    assert(extractEditableText(all.content) === "The woboy said \\q1 the boy ran." && labels(all.content) === labels(verse) && !all.staleRefused,
+      `replace all man -> boy on the label-inline text (got ${JSON.stringify(extractEditableText(all.content))} ${labels(all.content)})`);
+    unchanged(replaceAllInVerse(clone(verse), withLabel, /said /g, 1, "spoke "), withLabel, "replace all said_ (its space is shared with the label text)");
+  }
+  // A fresh stored text never reaches the new path.
+  {
+    const r = findReplaceVerse(clone(verse), fresh, /man/g, fresh.lastIndexOf("man"), 3, "boy");
+    assert(r.staleRefused === undefined && extractEditableText(r.content) === "The woman said \\q1 the boy ran.", `fresh text: man -> boy as before (got ${JSON.stringify(extractEditableText(r.content))})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
