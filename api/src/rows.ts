@@ -20,7 +20,7 @@ import { reopenLaneChecks } from "./laneReopen";
 import { refParts, coveredVersesFromRef } from "./importParsers";
 import { requiredOccurrence } from "./occurrenceRule";
 import { findRawTabField } from "./rawTabGuard";
-import { isMalformedTwLink, malformedTwLinkHint, origWordsQuoteProblem } from "./twLinkShape";
+import { isMalformedTwLink, malformedTwLinkHint, origWordsQuoteProblem, tnTqQuoteProblem } from "./twLinkShape";
 import { isValidChapterZeroRef } from "./chapterZeroGuard";
 import { normalizeBookCode, CHAPTER_EXISTS_SQL } from "./rowsCreateGuard";
 import { isValidTwlRefRaw } from "./twlRefGuard";
@@ -117,6 +117,18 @@ function rowWithLatestSourceStatement(
          WHERE t.id = ?1${bookClause(2)}`,
     )
     .bind(id, book, kind);
+}
+
+// The 400 message for a straight quote in a tn Quote / SupportReference or a
+// tq Quote the request writes, or null (issue #1342, see tnTqQuoteProblem). A
+// column the body leaves out is undefined and never judged. Only the user write
+// routes call this; AI imports and reimports are covered by the lint flag.
+function rowQuoteProblem(kind: RowKind, body: Record<string, unknown>): string | null {
+  if (kind === "twl") return null;
+  return (
+    tnTqQuoteProblem("Quote", body.quote as string | null | undefined) ??
+    (kind === "tn" ? tnTqQuoteProblem("SupportReference", body.support_reference as string | null | undefined) : null)
+  );
 }
 
 // Reuse the Hono request lifecycle to pull "expected version" off the
@@ -305,7 +317,11 @@ rows.post("/:kind", requireEditor, async (c) => {
   }
   // A straight quote in OrigWords fails the book's TWL export the same way
   // (issue #1336). Only twl has orig_words.
-  const createQuoteProblem = kind === "twl" ? origWordsQuoteProblem(data.orig_words as string | null | undefined) : null;
+  // tn Quote / SupportReference and tq Quote fail it the same way (#1342).
+  const createQuoteProblem =
+    kind === "twl"
+      ? origWordsQuoteProblem(data.orig_words as string | null | undefined)
+      : rowQuoteProblem(kind, data as Record<string, unknown>);
   if (createQuoteProblem) {
     return c.json({ error: "invalid_body", message: createQuoteProblem }, 400);
   }
@@ -711,8 +727,12 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     );
   }
   // Same OrigWords straight-quote guard as the create route (issue #1336).
+  // tn/tq: same as the create route (#1342). Only a column the PATCH carries is
+  // judged, so a stored quote never blocks an edit of another field.
   const patchQuoteProblem =
-    kind === "twl" ? origWordsQuoteProblem((patch as Record<string, unknown>).orig_words as string | null | undefined) : null;
+    kind === "twl"
+      ? origWordsQuoteProblem((patch as Record<string, unknown>).orig_words as string | null | undefined)
+      : rowQuoteProblem(kind, patch as Record<string, unknown>);
   if (patchQuoteProblem) {
     return c.json({ error: "invalid_body", message: patchQuoteProblem }, 400);
   }

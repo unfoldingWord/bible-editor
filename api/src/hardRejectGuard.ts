@@ -26,6 +26,13 @@
 //   tq (`validate_tq_files.py`): `if occurrence != "" and not RE.fullmatch(...)`
 //        — a blank Occurrence is fine here, so tq has no Occurrence rule below;
 //        it is judged only for straight quotes (see the end of this list).
+//        A non-blank malformed one ("x") would be an error, but the render
+//        cannot produce it: buildTqTsv writes Occurrence through
+//        renderOccurrence("tq", …), which returns blank or a safe integer
+//        >= -1 for any stored value (a non-integer or < -1 becomes 1), and
+//        OCCURRENCE_RE there is ^(?:-1|[0-9]+)$ (en_tq 7b8c3ef510, fetched
+//        2026-11-12). The test "the real tq render (buildTqTsv) never writes
+//        an Occurrence Door43 would reject" holds that in place (#1342).
 //   twl TWLink (`validate_twl_files.py` TWLINK_RE, also no `severity` kwarg):
 //        `if not twlink` → warning, so "" ships; any other value must
 //        `fullmatch` TWLINK_RE or it is a hard error. The rule itself lives in
