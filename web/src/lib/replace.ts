@@ -3276,8 +3276,8 @@ function localizedRewriteVerse(
 
   const cloned = cloneVerseObjects(verseObjects);
   const rawTotal = rebuildRaw(cloned);
-  // Header-label text blanked, so the search below and the insertion mapping
-  // skip it as the plain and editable texts do (see blankHeaderLabels, #1311).
+  // Header-label text blanked, so the occurrence search below skips it as the
+  // plain and editable texts do (see blankHeaderLabels, #1311).
   const labelFree = blankHeaderLabels(rawTotal, walkLeaves(cloned).leaves);
 
   // Map plain-text positions to raw-text positions. For oldLen > 0 we find
@@ -3331,14 +3331,19 @@ function localizedRewriteVerse(
     // delta — splitting the neighbouring word when the insertion abuts it
     // (the letter-migration corruption). Fall back to the length proxy only
     // if the content streams disagree (shouldn't happen for a clean edit).
-    const mapped = mapStrippedPosToRaw(prefixNoMarkers, labelFree, prefixNoMarkers.length);
+    // Not label-blanked: the stripped text can't tell an insertion at the end
+    // of the line before a `\sp` label from one at the start of the labelled
+    // line, and blanking moved the line-end case after the label (measured
+    // over the samples with a label injected: 26 line-end insertions went to
+    // the wrong side, 7 line-start ones were fixed). Left as on main (#1311).
+    const mapped = mapStrippedPosToRaw(prefixNoMarkers, rawTotal, prefixNoMarkers.length);
     rawStart = mapped >= 0 ? mapped : Math.min(prefixNoMarkers.length, rawTotal.length);
     if (mapped >= 0 && newSubstring.length > 0) {
       const isWS = (c: string | undefined): boolean => c !== undefined && /\s/.test(c);
       padRight =
         isWS(oldPlain[start]) &&
         rawStart < rawTotal.length &&
-        !isWS(labelFree[rawStart]) &&
+        !isWS(rawTotal[rawStart]) &&
         !isWS(newSubstring[newSubstring.length - 1]);
     }
   }
