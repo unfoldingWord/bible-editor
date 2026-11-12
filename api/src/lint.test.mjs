@@ -755,6 +755,23 @@ t("whitespace-only TWLink is 'Malformed TWLink' only (Door43 hard-fails it; only
     assert.equal(i.filter((x) => x.check === "Empty TWLink").length, 0, JSON.stringify(link));
   }
 });
+// Issue #1334: a full link whose only fault is a straight quote (or a line
+// break/tab, or blank space) gets a message naming that fault, not "must be a
+// full rc:// link", which a translator looking at a full link cannot act on.
+t("Malformed TWLink names the fault when it is only a straight quote, a line break, or blank space", () => {
+  const msg = (link) => lintTwlRows([twl({ tw_link: link })]).find((x) => x.check === "Malformed TWLink")?.message ?? "";
+  for (const link of ["rc://*/tw/dict/bible/names/o'neil", 'rc://*/tw/dict/bible/kt/"god"']) {
+    assert.match(msg(link), /straight quote/, link);
+    assert.doesNotMatch(msg(link), /must be a full rc:\/\/ link/, link);
+  }
+  assert.match(msg("rc://*/tw/dict/bible/names/o'neil"), /straight quote \('\)/);
+  assert.match(msg("rc://*/tw/dict/bible/kt/god\n"), /line break or tab/);
+  assert.doesNotMatch(msg("rc://*/tw/dict/bible/kt/god\n"), /must be a full rc:\/\/ link/);
+  assert.match(msg("   "), /only blank space/);
+  // A wrong shape keeps the existing hint, quote or not.
+  assert.match(msg("trouble"), /must be a full rc:\/\/ link/);
+  assert.match(msg("o'neil"), /must be a full rc:\/\/ link/);
+});
 t("blank TWLink is only 'Empty TWLink', never also 'Malformed TWLink'", () => {
   for (const link of ["", null]) {
     const i = lintTwlRows([twl({ tw_link: link })]);

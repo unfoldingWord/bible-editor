@@ -94,6 +94,65 @@ t("the real twl render (buildTwlTsv) of a bad link is held; a good or blank one 
   assert.deepEqual(hardRejectRows("twl", tsv).map((r) => r.rowId).sort(), ["aaaa", "dddd"]);
 });
 
+console.log("\n[hardRejectRows — twl straight quotes in any column (validate_twl_files.py _flag_straight_quotes, an error; #1334)]");
+// Door43 checks the whole raw data line for ' or " (header exempt) with no
+// severity kwarg, so a straight quote in ANY column fails the -be- PR.
+t("a straight ' in OrigWords holds the book, names the row and says the column", () => {
+  const rows = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "fall'down", "1", "rc://*/tw/dict/bible/kt/god"]));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].ref, "3:5");
+  assert.equal(rows[0].rowId, "xf8f");
+  assert.match(rows[0].reason, /straight quote \('\) in OrigWords/);
+});
+t("a straight \" in Tags holds the book and names Tags", () => {
+  const rows = hardRejectRows("twl", twlTsv(["3:5", "xf8f", 'a"b', "fall down", "1", "rc://*/tw/dict/bible/kt/god"]));
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].reason, /straight quote \("\) in Tags/);
+});
+t("quotes in two columns are one entry naming both columns and both quotes", () => {
+  const rows = hardRejectRows("twl", twlTsv(["3:5", "xf8f", 'a"b', "it's", "1", "rc://*/tw/dict/bible/kt/god"]));
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].reason, /straight quote \(' and "\) in Tags and OrigWords/);
+});
+t("a straight quote in Reference or ID holds the book too (Door43 reads the whole line)", () => {
+  assert.equal(hardRejectRows("twl", twlTsv(["3:5'", "xf8f", "", "x", "1", "rc://*/tw/dict/bible/kt/god"])).length, 1);
+  assert.match(hardRejectRows("twl", twlTsv(["3:5", 'xf"f', "", "x", "1", "rc://*/tw/dict/bible/kt/god"]))[0].reason, /in ID/);
+});
+t("a TWLink whose only fault is a straight quote is one entry naming TWLink, not 'not a full rc:// link'", () => {
+  const rows = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "x", "1", "rc://*/tw/dict/bible/names/o'neil"]));
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].reason, /straight quote \('\) in TWLink/);
+  assert.doesNotMatch(rows[0].reason, /not a full rc:\/\//);
+});
+t("a TWLink with a quote AND a bad shape gets both entries", () => {
+  const rows = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "x", "1", "o'neil"]));
+  assert.equal(rows.length, 2);
+  assert.match(rows[0].reason, /TWLink 'o'neil' is not a full rc:\/\/ link/);
+  assert.match(rows[1].reason, /straight quote \('\) in TWLink/);
+});
+t("a whitespace-only TWLink says so instead of 'not a full rc:// link'", () => {
+  const rows = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "x", "1", "  "]));
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].reason, /TWLink '  ' is only blank space/);
+});
+t("curly quotes anywhere do not hold the book", () => {
+  assert.deepEqual(hardRejectRows("twl", twlTsv(["3:5", "xf8f", "“a”", "it’s", "1", "rc://*/tw/dict/bible/names/o’neil"])), []);
+});
+t("every link the save path refuses is still held by at least one entry", () => {
+  for (const link of ["trouble", "rc://*/tw/dict", " rc://*/tw/dict/bible/kt/god", "   ", "rc://*/tw/dict/bible/names/o'neil", 'rc://*/tw/dict/bible/kt/"god"', "'", "o'neil"]) {
+    assert.ok(hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "x", "1", link])).length >= 1, JSON.stringify(link));
+  }
+});
+t("the real twl render (buildTwlTsv) of a straight quote in orig_words or tags is held", () => {
+  const row = (id, over) => ({ ref_raw: "1:1", chapter: 1, verse: 1, id, tags: null, orig_words: "אֵת", occurrence: 1, tw_link: "rc://*/tw/dict/bible/kt/god", ...over });
+  const { tsv } = buildTwlTsv([row("aaaa", { orig_words: "אֵ'ת" }), row("bbbb", { tags: 'x"y' }), row("cccc", {})]);
+  assert.deepEqual(hardRejectRows("twl", tsv).map((r) => r.rowId).sort(), ["aaaa", "bbbb"]);
+});
+t("the banner names a straight-quote row and its column", () => {
+  const msg = buildHardRejectAlertMessage("DAN", "twl", hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "fall'down", "1", "rc://*/tw/dict/bible/kt/god"])));
+  assert.match(msg, /3:5 \(xf8f\): straight quote \('\) in OrigWords/);
+});
+
 console.log("\n[hardRejectRows — tn]");
 t("blank Occurrence with a non-blank Quote is rejected", () => {
   const rows = hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "the word", "", "a note"]));

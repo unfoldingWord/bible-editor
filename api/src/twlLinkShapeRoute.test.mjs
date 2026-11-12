@@ -168,6 +168,27 @@ for (const bad of [
   eq(logCount(sqlite), 0, "…and nothing is written to the audit log");
 }
 
+console.log("\n[the 400 names the fault when a full link's only problem is a straight quote (#1334)]");
+{
+  const { patch } = freshApp();
+  const res = await patch({ tw_link: "rc://*/tw/dict/bible/names/o'neil" });
+  const body = await res.json().catch(() => ({}));
+  eq(res.status, 400, "PATCH with a straight quote -> 400");
+  eq(/straight quote \('\)/.test(body.message ?? ""), true, "…and the message says 'straight quote (')'");
+  eq(/must be a full rc:\/\/ link/.test(body.message ?? ""), false, "…not 'must be a full rc:// link'");
+}
+{
+  const { create } = freshApp();
+  const res = await create({ tw_link: 'rc://*/tw/dict/bible/kt/"god"' });
+  const body = await res.json().catch(() => ({}));
+  eq(/straight quote \("\)/.test(body.message ?? ""), true, "POST with a straight double quote names it");
+}
+{
+  const { patch } = freshApp();
+  const body = await (await patch({ tw_link: "trouble" })).json().catch(() => ({}));
+  eq(/must be a full rc:\/\/ link/.test(body.message ?? ""), true, "a bare word keeps the full-rc:// hint");
+}
+
 console.log("\n[POST with a bare word as the link is refused and no row is inserted]");
 {
   const { sqlite, create } = freshApp();
