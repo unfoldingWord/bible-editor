@@ -25,7 +25,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildBookLintReport, LINT_REPORT_VERSION, parseLintChapter } from "./bookLintReport.ts";
-import { BOOK_WIDE_CHECKS } from "./lint.ts";
+import { BOOK_WIDE_CHECKS, LINT_CHECK_NAMES } from "./lint.ts";
 import { mergeChapterReport } from "../../web/src/hooks/mergeChapterReport.ts";
 
 const BOOK = "ZEC";
@@ -226,6 +226,71 @@ const { lintVersion: _v, ...unversioned } = f1;
 assert.equal(mergeChapterReport(unversioned, await chunk(1)), null, "a base from before the version stamp");
 const { lintVersion: _cv, ...unversionedChunk } = await chunk(1);
 assert.equal(mergeChapterReport(f1, unversionedChunk), null, "a chapter report without the version stamp");
+
+// #1344: a browser merges a chapter report into its cached whole-book report
+// only when both carry the same LINT_REPORT_VERSION. A deploy that adds,
+// removes or renames a check without a bump lets a pre-deploy base absorb
+// post-deploy chapter reports, so other chapters keep showing the old set of
+// flags until the next whole-book fetch. This pin makes the bump impossible to
+// forget: LINT_CHECK_NAMES is the type every LintIssue.check must come from,
+// so a new check name fails typecheck until it is listed there, and then fails
+// here until the version is bumped and this list updated.
+const PINNED_CHECKS = {
+  version: 2,
+  names: [
+    "12. Alternate translation Label",
+    "13. Paired Square Bracket",
+    "6. Footnote Syntax",
+    "6. Reference",
+    "7. SupportReference",
+    "Adapted note — verify",
+    "Alignment declares the wrong occurrence count",
+    "Alignment occurrence out of range",
+    "Bad character combination",
+    "Blank line without paragraph",
+    "Chapter opening marker",
+    "Doubled punctuation",
+    "Doubled space",
+    "Empty OrigWords",
+    "Empty TWLink",
+    "Empty note",
+    "Empty question",
+    "Empty response",
+    "Glued alignment",
+    "Invisible character",
+    "Kept over Door43 — verify",
+    "Malformed TWLink",
+    "Merged Door43 edit — verify",
+    "Opening punctuation inside alignment",
+    "Paired punctuation",
+    "Punctuation spacing",
+    "Quotation Mark",
+    "Quote does not appear in the source verse",
+    "Quote is missing word joiners present in the source",
+    "Quote parts are discontiguous but not separated by &",
+    "Quote repeats a source word",
+    "Quote words are not in source order",
+    "Reference differs from Door43 — verify",
+    "Reused source token",
+    "Straight quote",
+    "Straight quote in OrigWords",
+    "Straight quote in Quote",
+    "Straight quote in SupportReference",
+    "Unbalanced quotation marks",
+    "Unmerged Door43 edit — verify",
+  ],
+};
+assert.deepEqual(
+  [...(LINT_CHECK_NAMES ?? [])].sort(),
+  PINNED_CHECKS.names,
+  "check names changed: bump LINT_REPORT_VERSION and update this list (PINNED_CHECKS in bookLintReport.test.mjs)",
+);
+assert.equal(
+  LINT_REPORT_VERSION,
+  PINNED_CHECKS.version,
+  "LINT_REPORT_VERSION and PINNED_CHECKS.version differ: they move together, so update this list's version",
+);
+for (const name of BOOK_WIDE_CHECKS) assert.ok(PINNED_CHECKS.names.includes(name), `book-wide check ${name} is a listed check`);
 
 // ── parseLintChapter ────────────────────────────────────────────────────────
 assert.equal(parseLintChapter(undefined), null);
