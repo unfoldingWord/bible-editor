@@ -1209,6 +1209,7 @@ function NoteCardInner({
       quote: string | null;
       note: string | null;
       support_reference: string | null;
+      occurrence: number | null;
     },
     fromVersion: number,
   ) => {
@@ -1235,7 +1236,7 @@ function NoteCardInner({
     // Only patch the fields that actually differ from the saved server
     // state (see buildTnRestorePatch). Use savedRef (not row) because row
     // carries optimistic mid-typing values from stashEdit().
-    const patch = buildTnRestorePatch(snap, savedRef.current);
+    const patch = buildTnRestorePatch(snap, savedRef.current, row.occurrence);
     if (Object.keys(patch).length === 0) return;
     onChange(patch);
     onSave(patch, { restoredFromVersion: fromVersion });

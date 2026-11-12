@@ -5,6 +5,9 @@ interface NoteSnapshot {
   quote: string | null;
   note: string | null;
   support_reference: string | null;
+  // Not a history lane: carried so restoring a quote can bring back its
+  // Occurrence (#1330). Null when the snapshot holds no integer.
+  occurrence: number | null;
 }
 
 interface Props {
@@ -17,8 +20,9 @@ interface Props {
   onUseVersion: (snapshot: NoteSnapshot, fromVersion: number) => void;
 }
 
-// tn preset over the kind-agnostic dialog. The fields it restores are exactly
+// tn preset over the kind-agnostic dialog. The fields it shows are exactly
 // the three a NoteCard can edit — see RowHistoryDialog for the mechanics.
+// Occurrence rides along unshown; buildTnRestorePatch decides when it is sent.
 export function NoteHistoryDialog({
   open,
   noteId,
@@ -39,12 +43,15 @@ export function NoteHistoryDialog({
       currentVersion={currentVersion}
       effectiveVersion={effectiveVersion}
       onClose={onClose}
-      onUseVersion={(snapshot: RowSnapshot, fromVersion) =>
+      onUseVersion={(snapshot: RowSnapshot, fromVersion, fullSnapshot) =>
         onUseVersion(
           {
             quote: snapshot.quote ?? null,
             note: snapshot.note ?? null,
             support_reference: snapshot.support_reference ?? null,
+            occurrence: Number.isInteger(fullSnapshot.occurrence)
+              ? (fullSnapshot.occurrence as number)
+              : null,
           },
           fromVersion,
         )

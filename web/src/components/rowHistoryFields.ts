@@ -27,7 +27,9 @@ export interface HistoryFieldSpec {
 }
 
 // Field sets mirror what each editor actually lets a user change, so a
-// restore never resurrects a column the UI can't otherwise touch.
+// restore never resurrects a column the UI can't otherwise touch. One
+// exception: a tn restore that changes the quote also brings back that
+// version's Occurrence, which has no lane here (#1330, buildTnRestorePatch).
 export const TN_HISTORY_FIELDS: HistoryFieldSpec[] = [
   { key: "support_reference", label: "Support ref", raw: true },
   { key: "quote", label: "Quote", autoDirection: true },
