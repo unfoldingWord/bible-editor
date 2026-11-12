@@ -79,7 +79,25 @@ export function malformedTwLinkHint(link: string | null | undefined): string {
 // a real fix here. The value is not echoed: the outbox stores at most 200
 // characters of a refusal, and the fix must fit.
 export function origWordsQuoteProblem(words: string | null | undefined): string | null {
-  if (typeof words !== "string" || !STRAIGHT_QUOTE_RE.test(words)) return null;
-  const quotes = ["'", '"'].filter((q) => words.includes(q)).join(" and ");
-  return `OrigWords cannot contain a straight quote (${quotes}): Door43 accepts only curly quotes, so use a curly quote (’ “ ”) or remove it.`;
+  return columnQuoteProblem("OrigWords", words);
+}
+
+// Issue #1342. The same check is an error in tn (validate_tn_files.py check 15)
+// and tq (validate_tq_files.py check 13), and the export writes tn Quote /
+// SupportReference and tq Quote as stored, so since #1336 one holds the book's
+// export. Note / Question / Response are curled at export (educateQuotes), so
+// they are not judged. SupportReference is an rc:// link, where a curly quote
+// is no fix either, so it gets "remove it" alone.
+export function tnTqQuoteProblem(
+  column: "Quote" | "SupportReference",
+  value: string | null | undefined,
+): string | null {
+  return columnQuoteProblem(column, value);
+}
+
+function columnQuoteProblem(column: string, value: string | null | undefined): string | null {
+  if (typeof value !== "string" || !STRAIGHT_QUOTE_RE.test(value)) return null;
+  const quotes = ["'", '"'].filter((q) => value.includes(q)).join(" and ");
+  const fix = column === "SupportReference" ? "remove it" : "use a curly quote (’ “ ”) or remove it";
+  return `${column} cannot contain a straight quote (${quotes}): Door43 accepts only curly quotes, so ${fix}.`;
 }

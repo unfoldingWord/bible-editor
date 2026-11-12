@@ -28,7 +28,7 @@ import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
 import { extractPlainText, isInFlowMarker, isTsMilestone } from "./importParsers.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
-import { isMalformedTwLink, malformedTwLinkHint, origWordsQuoteProblem } from "./twLinkShape.ts";
+import { isMalformedTwLink, malformedTwLinkHint, origWordsQuoteProblem, tnTqQuoteProblem } from "./twLinkShape.ts";
 import { hasOpeningPunctInsideMilestone } from "./openingPunct.ts";
 import { bracketProblems } from "./hardRejectGuard.ts";
 
@@ -204,6 +204,17 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
     }
     if (r.support_reference && !SUPPORT_REFERENCE_RE.test(r.support_reference)) {
       issues.push({ check: "7. SupportReference", bucket: "flag", ref, rowId: r.id, message: `SupportReference '${r.support_reference}' is not a valid rc:// link.` });
+    }
+    // Issue #1342: a straight quote is an error-severity check in Door43, and
+    // the export writes Quote and SupportReference as stored, so it holds the
+    // book's TN export. AI imports and reimports are not gated by the rows API,
+    // so this is where such a row first shows.
+    const quoteProblems = [
+      ["Straight quote in Quote", tnTqQuoteProblem("Quote", r.quote)],
+      ["Straight quote in SupportReference", tnTqQuoteProblem("SupportReference", r.support_reference)],
+    ] as const;
+    for (const [check, problem] of quoteProblems) {
+      if (problem) issues.push({ check, bucket: "flag", ref, rowId: r.id, message: problem });
     }
     // A tn row with no note is invalid content: section-header rows carry their
     // `# Heading` text IN the note, so there is no legitimately note-less tn
@@ -797,6 +808,11 @@ export function lintTqRows(rows: TqRow[]): LintIssue[] {
     }
     if (isBlankRequired(r.response)) {
       issues.push({ check: "Empty response", bucket: "flag", ref, rowId: r.id, message: "Empty response — DCS only warns, so this row publishes blank on the next export. Add a response or delete the row." });
+    }
+    // Issue #1342: see lintTnRows' matching check.
+    const quoteProblem = tnTqQuoteProblem("Quote", r.quote);
+    if (quoteProblem) {
+      issues.push({ check: "Straight quote in Quote", bucket: "flag", ref, rowId: r.id, message: quoteProblem });
     }
     for (const field of [r.question, r.response]) {
       for (const p of textFieldProblems(field ?? "")) {
