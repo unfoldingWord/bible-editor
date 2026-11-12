@@ -23,3 +23,20 @@ export function isMalformedTwLink(link: string | null | undefined): boolean {
   if (link == null || link === "") return false;
   return TSV_REWRITTEN_RE.test(link) || STRAIGHT_QUOTE_RE.test(link) || !TW_LINK_RE.test(link);
 }
+
+// Issue #1334: one sentence naming the fault when it is only blank space, a
+// straight quote, or a line break / tab; null when the link is fine or its
+// shape is wrong too. Must return the same sentence as the api copy (the
+// test compares them), since the picker and the 400 name the same fault.
+export function twLinkCharacterProblem(link: string | null | undefined): string | null {
+  if (typeof link !== "string" || !isMalformedTwLink(link)) return null;
+  if (link.trim() === "") {
+    return "A translationWords link cannot be only blank space. Clear it, or pick the article from the list (a full link looks like rc://*/tw/dict/bible/kt/god).";
+  }
+  if (!TW_LINK_RE.test(link.replace(/['"\r\n\t]/g, ""))) return null;
+  const quotes = ["'", '"'].filter((q) => link.includes(q));
+  const faults: string[] = [];
+  if (quotes.length > 0) faults.push(`a straight quote (${quotes.join(" and ")})`);
+  if (TSV_REWRITTEN_RE.test(link)) faults.push("a line break or tab");
+  return `A translationWords link cannot contain ${faults.join(" or ")}. Remove it${quotes.length > 0 ? ", or use a curly quote (’ “ ”) instead" : ""}.`;
+}
