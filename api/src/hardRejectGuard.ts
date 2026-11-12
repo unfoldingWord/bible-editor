@@ -26,6 +26,14 @@
 //   tq (`validate_tq_files.py`): `if occurrence != "" and not RE.fullmatch(...)`
 //        — a blank Occurrence is fine here, so tq has no hard-reject rule and is
 //        deliberately absent below.
+//   twl TWLink (`validate_twl_files.py` TWLINK_RE, also no `severity` kwarg):
+//        `if not twlink` → warning, so "" ships; any other value must
+//        `fullmatch` TWLINK_RE or it is a hard error. The rule itself lives in
+//        twLinkShape.ts (`isMalformedTwLink`), shared with the save-path refusal
+//        and the lint flag, so this gate cannot drift from them. Added for #1324:
+//        #1316 made the editor refuse a malformed link on save and flag any
+//        already stored, but a link stored before #1316 still exported and
+//        would fail the -be- PR with no banner naming the row.
 //
 // This operates on the RENDERED TSV, not on the D1 rows, and that is load-bearing.
 // `renderOccurrence` (occurrenceRule.ts, called by export.ts) heals an invalid
@@ -38,10 +46,12 @@
 // correct. Judge the bytes.
 //
 // Since renderOccurrence applies the same per-kind rule this guard tests,
-// it should now find NOTHING: Occurrence is not editable in the UI, so holding a
-// book for a defect no translator can fix was never actionable. The guard stays
-// as a backstop — a hit here means the render and this module have drifted apart,
-// which is worth a HOLD.
+// it should find no Occurrence problem: Occurrence is not editable in the UI, so
+// holding a book for a defect no translator can fix was never actionable. That
+// check stays as a backstop — a hit means the render and this module have drifted
+// apart, which is worth a HOLD. TWLink is different: the export renders the
+// stored link as-is (only tsvCell's escaping), so a TWLink hit is a real row a
+// translator can fix by picking the article again.
 //
 // tn Note brackets (validate_tn_files.py check 13, `validate_paired_square_brackets`)
 // do NOT hold a book. They were a hard error when issue #1015 hit (JER 17:4 `ny7v`,
@@ -52,8 +62,11 @@
 // translator can fix a bracket, so it belongs in the in-app lint, which still
 // flags it through `bracketProblems` below.
 //
-// Pure and import-free so it is directly testable by the --experimental-strip-types
-// runner, same shape as shrinkGuard.ts / reimportSyncGate.ts.
+// Pure (its only import is the pure twLinkShape.ts leaf) so it is directly
+// testable by the --experimental-strip-types runner, same shape as
+// shrinkGuard.ts / reimportSyncGate.ts.
+
+import { isMalformedTwLink } from "./twLinkShape.ts";
 
 // DCS's OCCURRENCE_RE, per resource. tn/tq accept -1 and 0; twl requires a
 // positive integer ("never 0 or blank" per its own message).
@@ -86,6 +99,9 @@ export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow
   if (refIdx === -1 || idIdx === -1 || occIdx === -1) return [];
   const quoteIdx = kind === "tn" ? header.indexOf("Quote") : header.indexOf("OrigWords");
   if (quoteIdx === -1) return [];
+  // twl only. A header without TWLink skips just this rule (same reason as above:
+  // never judge a cell we cannot locate).
+  const linkIdx = kind === "twl" ? header.indexOf("TWLink") : -1;
 
   const out: HardRejectRow[] = [];
   for (const line of lines.slice(1)) {
@@ -107,6 +123,18 @@ export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow
         out.push({ ref, rowId, reason: "Occurrence is blank (twl requires a positive integer)" });
       } else if (!TWL_OCCURRENCE_RE.test(occ)) {
         out.push({ ref, rowId, reason: `Occurrence '${occ}' must be a positive integer` });
+      }
+      // Judged on the rendered cell, so a stored newline already shows as the
+      // literal backslash-n Door43 will see. "" is a warning and ships.
+      const link = linkIdx === -1 ? "" : (cells[linkIdx] ?? "");
+      if (isMalformedTwLink(link)) {
+        out.push({
+          ref,
+          rowId,
+          reason:
+            `TWLink '${link}' is not a full rc:// link such as rc://*/tw/dict/bible/kt/god, ` +
+            `so open the row and pick the article from the list`,
+        });
       }
       continue;
     }

@@ -3,6 +3,7 @@
 
 import assert from "node:assert/strict";
 import { bracketProblems, buildHardRejectAlertMessage, hardRejectRows } from "./hardRejectGuard.ts";
+import { buildTwlTsv } from "./export.ts";
 
 let passed = 0;
 function t(name, fn) {
@@ -33,21 +34,64 @@ t("blank Occurrence is rejected even when OrigWords IS present", () => {
   assert.equal(rows[0].rowId, "xf8f");
 });
 t("Occurrence 0 is rejected for twl (positive integer only)", () => {
-  assert.equal(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "דָּבָר", "0", "rc://x"])).length, 1);
+  assert.equal(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "דָּבָר", "0", "rc://*/tw/dict/bible/kt/god"])).length, 1);
 });
 t("Occurrence -1 is rejected for twl", () => {
-  assert.equal(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "דָּבָר", "-1", "rc://x"])).length, 1);
+  assert.equal(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "דָּבָר", "-1", "rc://*/tw/dict/bible/kt/god"])).length, 1);
 });
 t("non-numeric Occurrence is rejected for twl", () => {
-  const rows = hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "דָּבָר", "1a", "rc://x"]));
+  const rows = hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "דָּבָר", "1a", "rc://*/tw/dict/bible/kt/god"]));
   assert.equal(rows.length, 1);
   assert.match(rows[0].reason, /must be a positive integer/);
 });
 t("a valid twl row passes, and a blank OrigWords/TWLink alone does NOT hold the book", () => {
   // This is the whole point of the PR: OrigWords/TWLink blank are warnings, so
-  // they must NOT appear here. Only the Occurrence column holds.
+  // they must NOT appear here. A blank TWLink is not a malformed one (#1324).
   assert.deepEqual(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "", "1", ""])), []);
-  assert.deepEqual(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "דָּבָר", "2", "rc://x"])), []);
+  assert.deepEqual(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "דָּבָר", "2", "rc://*/tw/dict/bible/kt/god"])), []);
+});
+
+console.log("\n[hardRejectRows — twl TWLink shape (validate_twl_files.py TWLINK_RE, a hard error; #1316/#1324)]");
+// Door43 checks TWLink with `fullmatch` against TWLINK_RE and no severity kwarg,
+// so a malformed link fails the -be- PR and the book never merges. Only "" is
+// blank (a warning) and must not hold.
+t("a malformed TWLink ('trouble') holds the book and names the row", () => {
+  const rows = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "fall down", "1", "trouble"]));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].ref, "3:5");
+  assert.equal(rows[0].rowId, "xf8f");
+  assert.match(rows[0].reason, /TWLink 'trouble'/);
+});
+t("a well-formed TWLink does not hold the book", () => {
+  assert.deepEqual(hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "fall down", "1", "rc://*/tw/dict/bible/kt/god"])), []);
+});
+t("a blank TWLink does not hold the book (Door43 only warns)", () => {
+  assert.deepEqual(hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "fall down", "1", ""])), []);
+});
+t("a whitespace-only TWLink holds the book (Door43's blank test is `if not twlink`)", () => {
+  assert.equal(hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "fall down", "1", "  "])).length, 1);
+});
+t("a bad TWLink is reported even when the same row's Occurrence is also bad", () => {
+  const rows = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "fall down", "0", "trouble"]));
+  assert.equal(rows.length, 2);
+  assert.match(rows[0].reason, /Occurrence '0'/);
+  assert.match(rows[1].reason, /TWLink 'trouble'/);
+});
+t("a twl header with no TWLink column still judges Occurrence and nothing else", () => {
+  const tsv = "Reference\tID\tTags\tOrigWords\tOccurrence\n1:1\tabcd\t\tx\t0\n1:2\tbbbb\t\tx\t1\n";
+  assert.deepEqual(hardRejectRows("twl", tsv).map((r) => r.rowId), ["abcd"]);
+});
+t("the real twl render (buildTwlTsv) of a bad link is held; a good or blank one is not", () => {
+  // Judge the bytes the export would commit. A stored link with a newline
+  // renders as a literal backslash-n (tsvCell), which TWLINK_RE also rejects.
+  const row = (id, tw_link) => ({ ref_raw: "1:1", chapter: 1, verse: 1, id, tags: null, orig_words: "אֵת", occurrence: 1, tw_link });
+  const { tsv } = buildTwlTsv([
+    row("aaaa", "trouble"),
+    row("bbbb", "rc://*/tw/dict/bible/kt/god"),
+    row("cccc", ""),
+    row("dddd", "rc://*/tw/dict/bible/kt/god\nextra"),
+  ]);
+  assert.deepEqual(hardRejectRows("twl", tsv).map((r) => r.rowId).sort(), ["aaaa", "dddd"]);
 });
 
 console.log("\n[hardRejectRows — tn]");
@@ -91,12 +135,12 @@ t("a short row (missing trailing cells) does not throw and is judged on what's t
 t("multiple offenders are all reported, in row order", () => {
   const rows = hardRejectRows(
     "twl",
-    twlTsv(["1:1", "aaaa", "", "", "", ""], ["1:2", "bbbb", "", "x", "1", "rc://x"], ["2:3", "cccc", "", "y", "0", "rc://y"]),
+    twlTsv(["1:1", "aaaa", "", "", "", ""], ["1:2", "bbbb", "", "x", "1", "rc://*/tw/dict/bible/kt/god"], ["2:3", "cccc", "", "y", "0", "rc://*/tw/dict/bible/other/word"]),
   );
   assert.deepEqual(rows.map((r) => r.rowId), ["aaaa", "cccc"]);
 });
 t("whitespace-only Occurrence is rejected (it fails the digits-only regex)", () => {
-  assert.equal(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "x", "   ", "rc://x"])).length, 1);
+  assert.equal(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "x", "   ", "rc://*/tw/dict/bible/kt/god"])).length, 1);
 });
 // The cells are compared RAW, exactly as the validators do. Trimming the Quote
 // was too lax: validate_tn_files.py tests `_quote == ""` on the unmodified cell,
@@ -109,7 +153,7 @@ t("a whitespace-only tn Quote does NOT license a blank Occurrence", () => {
 });
 t("a whitespace-only twl OrigWords is still judged only on Occurrence", () => {
   // OrigWords blankness is only a validator WARNING, so it never drives a HOLD.
-  assert.deepEqual(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "   ", "1", "rc://x"])), []);
+  assert.deepEqual(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "   ", "1", "rc://*/tw/dict/bible/kt/god"])), []);
 });
 
 console.log("[hardRejectRows — tn Note brackets (validate_tn_files.py check 13, a WARNING since en_tn #7778)]");
@@ -151,6 +195,12 @@ t("names the ref, row id and the validator's reason", () => {
   const msg = buildHardRejectAlertMessage("JER", "tn", rejects);
   assert.match(msg, /JER TN/);
   assert.match(msg, /17:4 \(ny7v\): Occurrence 'x' must be a non-negative integer or -1\. Fix/);
+});
+t("names a malformed TWLink's row and says what to fix", () => {
+  const rejects = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "fall down", "1", "trouble"]));
+  const msg = buildHardRejectAlertMessage("DAN", "twl", rejects);
+  assert.match(msg, /HELD DAN TWL: 1 row\(s\)/);
+  assert.match(msg, /3:5 \(xf8f\): TWLink 'trouble' is not a full rc:\/\/ link .*rc:\/\/\*\/tw\/dict\/bible\/kt\/god.*pick the article from the list\. Fix/);
 });
 t("caps the sample at 6 rows and counts the rest", () => {
   const rejects = Array.from({ length: 8 }, (_, i) => ({ ref: `1:${i + 1}`, rowId: `r00${i}`, reason: "x" }));
