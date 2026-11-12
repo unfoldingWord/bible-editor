@@ -96,15 +96,16 @@ interface Props {
   book: string;
   chapter: number;
   activeVerse: number;
-  // Inclusive [start, end] of verses to surface in TN/TQ panels. Equals
+  // Inclusive [start, end] of verses to surface in the TN panel. Equals
   // [activeVerse, activeVerse] for the common singleton case; widens to the
   // span of any multi-verse row (e.g. UST 6-9) that covers activeVerse so
   // notes for verses 6,7,8,9 all show when the user navigates to v=7.
   displayVerseRange: readonly [number, number];
-  // Inclusive [start, end] for the Words (TWL) panel. TWL links point at ULT
-  // words only, so this is the ULT verse covering activeVerse: it widens only
-  // for a ULT bridge, never for a UST bridge or a bridged note.
-  twlVerseRange: readonly [number, number];
+  // Inclusive [start, end] for the Words (TWL) and Questions (TQ) panels: the
+  // ULT verse covering activeVerse. It widens only for a ULT bridge, never for
+  // a UST bridge or a bridged note, so each verse of a UST bridge shows its
+  // own links and questions.
+  ultVerseRange: readonly [number, number];
   tn: TnRow[];
   tq: TqRow[];
   twl: TwlRow[];
@@ -380,7 +381,7 @@ export function ResourceColumn({
   chapter,
   activeVerse,
   displayVerseRange,
-  twlVerseRange,
+  ultVerseRange,
   tn,
   tq,
   twl,
@@ -506,7 +507,7 @@ export function ResourceColumn({
   }, [panelMode]);
 
   const [rangeStart, rangeEnd] = displayVerseRange;
-  const [twlStart, twlEnd] = twlVerseRange;
+  const [ultStart, ultEnd] = ultVerseRange;
   // Feeds canonicalTwlOrder's headword anchoring (tw_link → TW article title).
   const { twTitles } = useCatalogs();
   // Derived from twlOrderLocks rather than taken as a second prop — two props
@@ -518,15 +519,15 @@ export function ResourceColumn({
   // Verses the current ULT bridge spans — the options for the Words "change
   // reference" dropdown. A singleton verse yields [] so the picker stays hidden
   // (no clutter on the dense word rows); only a real range surfaces it. Scoped
-  // to twlVerseRange (the ULT verse), not displayVerseRange: a UST bridge must
+  // to ultVerseRange (the ULT verse), not displayVerseRange: a UST bridge must
   // not pull neighbouring verses' links in. Memoized so WordsTable's compare
   // sees a stable ref except when the bridge actually changes.
   const twlBridgeVerses = useMemo(() => {
-    if (twlEnd <= twlStart) return [] as number[];
+    if (ultEnd <= ultStart) return [] as number[];
     const out: number[] = [];
-    for (let v = twlStart; v <= twlEnd; v++) if (v > 0) out.push(v);
+    for (let v = ultStart; v <= ultEnd; v++) if (v > 0) out.push(v);
     return out;
-  }, [twlStart, twlEnd]);
+  }, [ultStart, ultEnd]);
   // Verses the Suggestions panel scans: every verse of a ULT bridge, or just
   // the active verse otherwise. So a bridge surfaces each verse's suggested
   // links (each addable to its own verse) instead of only the leading verse's.
@@ -556,12 +557,15 @@ export function ResourceColumn({
     () => tnForVerseGroups.flatMap(([, rows]) => rows),
     [tnForVerseGroups],
   );
+  // Questions follow the ULT verse (ultVerseRange), like Words: a UST bridge
+  // must not pull the neighbouring verse's questions in. noteOverlapsRange
+  // still lets a bridged question ("1:3-4") show on each verse it covers.
   const tqForVerse = useMemo(
     () =>
-      groupByVerse(tq.filter((r) => noteOverlapsRange(r, rangeStart, rangeEnd))).flatMap(
+      groupByVerse(tq.filter((r) => noteOverlapsRange(r, ultStart, ultEnd))).flatMap(
         ([, rows]) => sortBySortOrder(rows),
       ),
-    [tq, rangeStart, rangeEnd],
+    [tq, ultStart, ultEnd],
   );
   // TWL links are ordered CANONICALLY — by the position of the Hebrew/Greek word
   // in the aligned ULT verse — not by stored sort_order. This is the same
@@ -570,10 +574,10 @@ export function ResourceColumn({
   // the fallback for links whose word isn't found in the ULT alignment.
   const twlForVerse = useMemo(
     () =>
-      groupByVerse(twl.filter((r) => r.verse >= twlStart && r.verse <= twlEnd)).flatMap(
+      groupByVerse(twl.filter((r) => r.verse >= ultStart && r.verse <= ultEnd)).flatMap(
         ([v, rows]) => twlDisplayOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles, lockedTwlVerses.has(v)),
       ),
-    [twl, twlStart, twlEnd, ultVerseObjectsFor, twTitles, lockedTwlVerses],
+    [twl, ultStart, ultEnd, ultVerseObjectsFor, twTitles, lockedTwlVerses],
   );
 
   // Pinned sections show the whole chapter, grouped by verse. Within each
@@ -632,18 +636,18 @@ export function ResourceColumn({
   // verses — the overwhelming majority — cost nothing extra here on every
   // keystroke elsewhere in the column. Scoped like twlForVerse: when nothing
   // is pinned, only the active verse's range needs a chip, so restricting the
-  // walk to twlStart..twlEnd avoids paying for every OTHER locked verse
+  // walk to ultStart..ultEnd avoids paying for every OTHER locked verse
   // in the chapter on each keystroke; pinned view still needs the full sweep.
   const automaticTwlByLockedVerse = useMemo(() => {
     const map = new Map<number, TwlRow[]>();
     if (lockedTwlVerses.size === 0) return map;
     for (const [v, rows] of groupByVerse(twl)) {
       if (!lockedTwlVerses.has(v)) continue;
-      if (!pinned.words && (v < twlStart || v > twlEnd)) continue;
+      if (!pinned.words && (v < ultStart || v > ultEnd)) continue;
       map.set(v, canonicalTwlOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles));
     }
     return map;
-  }, [twl, lockedTwlVerses, ultVerseObjectsFor, twTitles, pinned.words, twlStart, twlEnd]);
+  }, [twl, lockedTwlVerses, ultVerseObjectsFor, twTitles, pinned.words, ultStart, ultEnd]);
 
   // Verses currently showing a live "automatic order" preview from the chip
   // strip. Purely visual: swaps which row array a verse's WordsTable renders
