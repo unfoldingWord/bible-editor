@@ -3963,59 +3963,6 @@ function countAllMilestones(nodes) {
   }
 }
 
-// Case 94: a stored plain text out of step with a verse that has a header
-// label (#1321, item 2). Before #711 the plain text kept a `\sp` label's text
-// where the label sits in the tree; such a row's stored text no longer walks in
-// lockstep with the label-free raw text, so the occurrence count ran: label
-// matches in the stored text pushed it onto a later word, and a `\S+` or `.`
-// regex matched the blanked label's fill character in raw. Either way the edit
-// could land in the label, be refused, and flatten the verse (label text and
-// all into the body). No prod verse has this today; hardening before Song of
-// Songs is imported.
-{
-  console.log("\n[Case 94] Stale stored plain text beside a header label edits the picked match (#1321)");
-  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
-  const labels = (content) => JSON.stringify(content.verseObjects.filter((n) => n.tag === "sp").map((n) => n.text));
-  const clone = (c) => JSON.parse(JSON.stringify(c));
-  const verse = { verseObjects: [zaln("H0", [w("The")]), t(" "), zaln("H1", [w("woman")]), t(" "), zaln("H2", [w("said")]), t("\n"), { tag: "sp", text: "The man speaking\n" }, { tag: "q1", type: "quote" },
-    zaln("H3", [w("the")]), t(" "), zaln("H4", [w("man")]), t(" "), zaln("H5", [w("ran")]), t(".")] };
-  // The stored text as the extractor wrote it before #711: label text inline.
-  const withLabel = "The woman said The man speaking the man ran.";
-  for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
-    const r = fn(clone(verse), withLabel, /man/g, withLabel.lastIndexOf("man"), 3, "boy");
-    assert(extractEditableText(r.content) === "The woman said \\q1 the boy ran.", `${entry}: label text in the stored text, man -> boy edits the picked man (got ${JSON.stringify(extractEditableText(r.content))})`);
-    assert(labels(r.content) === labels(verse), `${entry}: label text in the stored text, man -> boy: the label is kept (got ${labels(r.content)})`);
-    assert(words(r.content) === "The:H0|woman:H1|said:H2|the:H3|boy:|ran:H5", `${entry}: label text in the stored text, man -> boy: untouched words keep their alignment (got ${words(r.content)})`);
-  }
-  // A match inside the stale label text itself: the label is not verse text,
-  // so find/replace leaves the verse as it is.
-  {
-    const at = withLabel.indexOf("man speaking");
-    const r = findReplaceVerse(clone(verse), withLabel, /man/g, at, 3, "boy");
-    assert(r.plainText === withLabel && extractEditableText(r.content) === extractEditableText(verse) && labels(r.content) === labels(verse),
-      `match inside the stale label text: no-op (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
-    // Replace all on the same stored text: the label's match is skipped (the
-    // no-op step), the verse's own matches are replaced, and the loop ends.
-    const all = replaceAllInVerse(clone(verse), withLabel, /man/g, 3, "boy");
-    assert(extractEditableText(all.content) === "The woboy said \\q1 the boy ran." && labels(all.content) === labels(verse),
-      `replace all man -> boy on the stale text: label kept (got ${JSON.stringify(extractEditableText(all.content))} ${labels(all.content)})`);
-  }
-  // A stale stored text with no label text in it (Case 90's): a `\S+` match
-  // after the label counted onto the label's blanked fill and flattened the verse.
-  {
-    const stale = "The lady said the man ran.";
-    const at = stale.indexOf("the");
-    const r = findReplaceVerse(clone(verse), stale, /\S+/g, at, 3, "a");
-    assert(extractEditableText(r.content) === "The woman said \\q1 a man ran.", `stale text, \\S+ after the label: edits the picked word (got ${JSON.stringify(extractEditableText(r.content))})`);
-    assert(labels(r.content) === labels(verse), `stale text, \\S+ after the label: the label is kept (got ${labels(r.content)})`);
-    assert(words(r.content) === "The:H0|woman:H1|said:H2|a:|man:H4|ran:H5", `stale text, \\S+ after the label: untouched words keep their alignment (got ${words(r.content)})`);
-    // `.` counted onto the label's first blanked character the same way.
-    const d = findReplaceVerse(clone(verse), stale, /./g, at, 1, "T");
-    assert(extractEditableText(d.content) === "The woman said \\q1 The man ran." && labels(d.content) === labels(verse),
-      `stale text, . after the label: edits the picked character, label kept (got ${JSON.stringify(extractEditableText(d.content))} ${labels(d.content)})`);
-  }
-}
-
 // Case 95: a typed edit that adds punctuation at a bare line break (#1321,
 // item 3). The exact-text guard picked its coordinates from the original
 // verse only: with no `them.\q1 And` seam the stored and stripped texts agree,

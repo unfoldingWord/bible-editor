@@ -435,25 +435,12 @@ function relaxWhitespace(regex: RegExp): RegExp {
 }
 
 // Find the Nth (1-based) occurrence of `regex` in `text`. Returns null if
-// fewer than `n` matches exist. A match over one of the `skip` ranges is not
-// counted, and the search goes on from that range's end.
-function nthMatchIn(
-  text: string,
-  regex: RegExp,
-  n: number,
-  skip: { start: number; end: number }[] = [],
-): { index: number; length: number } | null {
+// fewer than `n` matches exist.
+function nthMatchIn(text: string, regex: RegExp, n: number): { index: number; length: number } | null {
   const local = new RegExp(regex.source, regex.flags.includes("g") ? regex.flags : regex.flags + "g");
   let m: RegExpExecArray | null;
   let count = 0;
   while ((m = local.exec(text)) !== null) {
-    const start = m.index;
-    const end = start + Math.max(1, m[0].length);
-    const hit = skip.find((r) => r.start < end && r.end > start);
-    if (hit) {
-      local.lastIndex = Math.max(hit.end, start + 1);
-      continue;
-    }
     count++;
     if (count === n) return { index: m.index, length: m[0].length };
     if (m[0].length === 0) local.lastIndex++;
@@ -1445,22 +1432,7 @@ function smartReplaceVerseImpl(
   // see blankHeaderLabels for why the two copies blank it differently.
   const labelFree = blankHeaderLabels(raw, leaves, " ");
   const labelSearch = blankHeaderLabels(raw, leaves, LABEL_FILL);
-  let walked = locatePlainRangeInRaw(plainText, labelFree, matchStartInPlain, matchLenInPlain);
-  // A row stored before #711 kept a `\sp` label's text in its plain text, where
-  // the label sits in the tree, so the walk over the label-free text misses.
-  // Walk raw with the label text instead. The occurrence count below would
-  // count the label's matches in the stored text and edit a later word, or
-  // land in the label and flatten the verse (#1321). A match on the label's
-  // own text is not verse text: find/replace leaves the verse as it is.
-  if (!walked && leaves.some((l) => isHeaderLabelNode(l.node) && l.end > l.start)) {
-    const viaLabels = locatePlainRangeInRaw(plainText, raw, matchStartInPlain, matchLenInPlain);
-    if (viaLabels) {
-      const inLabel = leaves.some((l) => isHeaderLabelNode(l.node) && /\S/.test(raw.slice(Math.max(viaLabels.start, l.start), Math.min(viaLabels.end, l.end))));
-      if (!inLabel) walked = viaLabels;
-      else if (options.findReplace) return { content, plainText, preservedAlignment: true };
-    }
-  }
-  const mapped = keepLabelsOutOfEdges(walked, labelFree, leaves);
+  const mapped = keepLabelsOutOfEdges(locatePlainRangeInRaw(plainText, labelFree, matchStartInPlain, matchLenInPlain), labelFree, leaves);
   // A whitespace-only match at a marker with no text node beside it: the space
   // is in the plain text only (the marker is the separator), so the tree has
   // nothing to replace. For find/replace, leave the verse as it is; counting
@@ -1481,12 +1453,7 @@ function smartReplaceVerseImpl(
   const rawRegex = relaxWhitespace(regex);
   const rawMatch = located
     ? { index: located.start, length: located.end - located.start }
-    : // A match over a label's blanked text is not counted: a `\S+` or `.` regex
-      // matches LABEL_FILL, and the plain text it is counted against has no
-      // label. The search goes on after the label, so `\S+` still finds the
-      // word right after it (#1321).
-      nthMatchIn(labelSearch, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1,
-        leaves.filter((l) => isHeaderLabelNode(l.node) && l.end > l.start));
+    : nthMatchIn(labelSearch, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1);
 
   // If the raw search yields nothing (normalization wiped a match, or
   // the match text spans an inline marker token like "\p " that has no

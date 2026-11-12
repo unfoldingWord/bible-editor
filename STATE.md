@@ -217,9 +217,6 @@ Highlights that bite repeatedly:
   (`name\q1 this;set`), as on main (#1321): the stripped text reads `name;this` for both `name;\q1 this` and
   `name\q1 ;this`, so the edit is the stripped-only space -> `;`, which takes Case 87's typed fallback (the next raw
   space). A `,` diffs differently and is fine.
-  A row whose stored plain text predates #711 has a `\sp` label's text inline, where the label sits in the tree.
-  `smartReplaceVerseImpl` walks raw with the label text when the label-free walk misses; a find/replace match on
-  that label text is a no-op (#1321).
 
 - **A line marker with no text node on either side (`H1[say] \q1 H2[The]`) puts a space in the stripped text that
   the tree does not have (#1286).** `stripMarkerTokens` adds it so the two words don't fuse, so the engine diffs
