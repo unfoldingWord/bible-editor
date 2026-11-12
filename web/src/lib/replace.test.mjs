@@ -4101,6 +4101,9 @@ function countAllMilestones(nodes) {
     assert(extractEditableText(all.content) === "The woboy said \\q1 the boy ran." && labels(all.content) === labels(verse) && !all.staleRefused,
       `replace all man -> boy on the label-inline text (got ${JSON.stringify(extractEditableText(all.content))} ${labels(all.content)})`);
     unchanged(replaceAllInVerse(clone(verse), withLabel, /said /g, 1, "spoke "), withLabel, "replace all said_ (its space is shared with the label text)");
+    // Matches only in the label's text: nothing to replace in the verse, and the
+    // overlay must say so rather than show nothing.
+    unchanged(replaceAllInVerse(clone(verse), withLabel, /speaking/g, 1, "talking"), withLabel, "replace all speaking (only in the label text)");
   }
   // A fresh stored text never reaches the new path.
   {
