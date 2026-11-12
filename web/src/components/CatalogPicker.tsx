@@ -12,6 +12,10 @@ interface Props {
   // When false, the editor can only pick a value from `options` (no free text).
   // Defaults to true so callers keep the freeSolo behaviour unless they opt out.
   freeSolo?: boolean;
+  // Checks free text that is not one of `options` before it is committed.
+  // Return a message to refuse it: the picker stays open and shows the message
+  // under the input instead of calling onChange. Omit to accept any free text.
+  validate?: (typed: string) => string | null;
   onChange: (value: string | null) => void;
 }
 
@@ -33,9 +37,11 @@ export function CatalogPicker({
   color = "default",
   variant = "outlined",
   freeSolo = true,
+  validate,
   onChange,
 }: Props) {
   const [open, setOpen] = useState(false);
+  const [invalid, setInvalid] = useState<string | null>(null);
   const shown = display ? display(value) : (value ?? "—");
   // With freeSolo off, MUI requires the current value to be one of the options
   // or it warns and drops it. Inject a legacy off-list value so the row's
@@ -58,7 +64,10 @@ export function CatalogPicker({
         size={size}
         variant={variant}
         color={color}
-        onClick={() => setOpen(true)}
+        onClick={() => {
+          setInvalid(null);
+          setOpen(true);
+        }}
         // minWidth: 0 + maxWidth so the chip shrinks inside a constrained
         // grid/flex cell and ellipsis-truncates the label instead of pushing
         // neighbouring controls (e.g. the save button) off the row.
@@ -69,7 +78,9 @@ export function CatalogPicker({
 
   return (
     <Autocomplete<string, false, false, boolean>
-      open
+      // The option list would cover the refusal message under the input, so it
+      // steps aside while the message shows; the next keystroke brings it back.
+      open={invalid === null}
       freeSolo={freeSolo}
       autoFocus
       // null (not "") is MUI's canonical "no selection": with freeSolo off an
@@ -93,8 +104,18 @@ export function CatalogPicker({
           {display ? display(opt) : opt}
         </li>
       )}
+      onInputChange={() => {
+        if (invalid) setInvalid(null);
+      }}
       onChange={(_e, next, reason) => {
         const val = typeof next === "string" ? next : null;
+        if (validate && val !== null && !options.includes(val)) {
+          const problem = validate(val);
+          if (problem) {
+            setInvalid(problem);
+            return;
+          }
+        }
         onChange(val);
         if (reason === "clear") {
           // Stay open, eat the next blur-driven close, and grab focus
@@ -126,6 +147,8 @@ export function CatalogPicker({
           placeholder={placeholder ?? "type to filter…"}
           variant="outlined"
           size="small"
+          error={invalid !== null}
+          helperText={invalid ?? undefined}
         />
       )}
     />

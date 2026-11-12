@@ -28,6 +28,7 @@ import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
 import { extractPlainText, isInFlowMarker, isTsMilestone } from "./importParsers.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
+import { isMalformedTwLink, MALFORMED_TW_LINK_HINT } from "./twLinkShape.ts";
 import { hasOpeningPunctInsideMilestone } from "./openingPunct.ts";
 import { bracketProblems } from "./hardRejectGuard.ts";
 
@@ -852,6 +853,10 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
     }
     if (isBlankRequired(r.tw_link)) {
       issues.push({ check: "Empty TWLink", bucket: "flag", ref, rowId: r.id, message: "Empty TWLink — DCS only warns, so this row publishes with no link on the next export. Add a translationWords link or delete the row." });
+    } else if (isMalformedTwLink(r.tw_link)) {
+      // Issue #1316: unlike a blank link, a malformed one is a HARD error in
+      // validate_twl_files.py, so it blocks the book's whole TWL export.
+      issues.push({ check: "Malformed TWLink", bucket: "flag", ref, rowId: r.id, message: `TWLink "${r.tw_link}" is not a valid link, and Door43 will refuse this book's word links until it is fixed. ${MALFORMED_TW_LINK_HINT}` });
     }
     // Issue #544: see lintTnRows' matching branch.
     if (r.review_kind === "merge_no_base") {
