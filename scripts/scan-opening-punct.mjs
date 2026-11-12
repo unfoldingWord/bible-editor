@@ -103,7 +103,7 @@ const stats = new Map(); // `${book}/${version}` -> { verses, corrected }
 // web/src/lib/openingPunct.ts (duplicated for reporting only — the actual
 // fix comes from hoistOpeningPunctuation itself).
 function trailingGapsWithOpener(nodes) {
-  const OPENING_PUNCT_RE = /[“‘(\[{]/u;
+  const OPENING_PUNCT_RE = /[“‘(\[{¿]/u;
   const gaps = [];
   for (const n of nodes ?? []) {
     if (!n || typeof n !== "object") continue;
