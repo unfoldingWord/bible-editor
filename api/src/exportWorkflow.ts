@@ -1261,7 +1261,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // lint.ts flags it in-app (issue #1149, which reversed #1015's hold). A
     // clean render clears any stale HELD banner — on a dry run too, since the
     // clear only reads the bytes (the HOLD itself needs dcsAllowed).
-    if (resource === "tn" || resource === "twl") {
+    //
+    // tq joined for #1336: Door43's straight-quote check is an error in all
+    // three TSV validators (twl since #1334). tq has no Occurrence rule, so
+    // a straight quote is the only thing that holds it.
+    if (resource === "tn" || resource === "tq" || resource === "twl") {
       const rejects = hardRejectRows(resource, built.content);
       if (rejects.length === 0) {
         // The rows were fixed (or deleted): clear the HELD banner so it does not
@@ -3454,7 +3458,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
   // Banner alert when the hard-reject gate holds an export because the render
   // contains a row DCS's validator counts as a real error (a blank or malformed
-  // Occurrence, or a malformed twl TWLink). Unlike the blank-field banner this replaces, this one states a
+  // Occurrence, a malformed twl TWLink, or a straight quote in any tn/tq/twl
+  // row). Unlike the blank-field banner this replaces, this one states a
   // cause the code measured: it names the offending refs and the validator's own
   // reason for each. Wording claims only that WE refused — the DCS run has not
   // happened, so it must not say DCS rejected anything yet.

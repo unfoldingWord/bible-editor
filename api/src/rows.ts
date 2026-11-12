@@ -20,7 +20,7 @@ import { reopenLaneChecks } from "./laneReopen";
 import { refParts, coveredVersesFromRef } from "./importParsers";
 import { requiredOccurrence } from "./occurrenceRule";
 import { findRawTabField } from "./rawTabGuard";
-import { isMalformedTwLink, malformedTwLinkHint } from "./twLinkShape";
+import { isMalformedTwLink, malformedTwLinkHint, origWordsQuoteProblem } from "./twLinkShape";
 import { isValidChapterZeroRef } from "./chapterZeroGuard";
 import { normalizeBookCode, CHAPTER_EXISTS_SQL } from "./rowsCreateGuard";
 import { isValidTwlRefRaw } from "./twlRefGuard";
@@ -302,6 +302,12 @@ rows.post("/:kind", requireEditor, async (c) => {
       { error: "invalid_body", message: `TWLink "${data.tw_link}" is not a valid link. ${malformedTwLinkHint(data.tw_link as string)}` },
       400,
     );
+  }
+  // A straight quote in OrigWords fails the book's TWL export the same way
+  // (issue #1336). Only twl has orig_words.
+  const createQuoteProblem = kind === "twl" ? origWordsQuoteProblem(data.orig_words as string | null | undefined) : null;
+  if (createQuoteProblem) {
+    return c.json({ error: "invalid_body", message: createQuoteProblem }, 400);
   }
 
   // Chapter 0 is only ever legal as verse 0 with ref_raw "front:intro", and
@@ -703,6 +709,12 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
       { error: "invalid_body", message: `TWLink "${patchedTwLink}" is not a valid link. ${malformedTwLinkHint(patchedTwLink)}` },
       400,
     );
+  }
+  // Same OrigWords straight-quote guard as the create route (issue #1336).
+  const patchQuoteProblem =
+    kind === "twl" ? origWordsQuoteProblem((patch as Record<string, unknown>).orig_words as string | null | undefined) : null;
+  if (patchQuoteProblem) {
+    return c.json({ error: "invalid_body", message: patchQuoteProblem }, 400);
   }
 
   let fields = Object.keys(patch);

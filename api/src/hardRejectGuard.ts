@@ -24,8 +24,8 @@
 //        and _quote == "")` — blank Occurrence is allowed ONLY when Quote is also
 //        blank; otherwise it must match the pattern.
 //   tq (`validate_tq_files.py`): `if occurrence != "" and not RE.fullmatch(...)`
-//        — a blank Occurrence is fine here, so tq has no hard-reject rule and is
-//        deliberately absent below.
+//        — a blank Occurrence is fine here, so tq has no Occurrence rule below;
+//        it is judged only for straight quotes (see the end of this list).
 //   twl TWLink (`validate_twl_files.py` TWLINK_RE, also no `severity` kwarg):
 //        `if not twlink` → warning, so "" ships; any other value must
 //        `fullmatch` TWLINK_RE or it is a hard error. The rule itself lives in
@@ -44,10 +44,19 @@
 //        Reference or ID still turned the -be- PR red with no banner. The
 //        reason names the column(s). A TWLink whose only fault is a quote gets
 //        this entry alone, not also the TWLink-shape one.
-//        en_tn (check 15, inlined ~646-716) and en_tq (check 13, ~604-632) run
-//        the same line check, but their render curls quotes only in Note /
-//        Question / Response (educateQuotes), so holding them needs its own
-//        prod count of the rendered bytes first; not done here.
+//   tn and tq straight quotes (#1336): the same whole-raw-line check, error
+//        severity, header exempt, on by default (the workflows pass no
+//        `--check`). en_tn `validate_tn_files.py` check 15 is inlined three
+//        times (lines 647, 676, 703: unparseable row, wrong column count,
+//        normal row), so any row with a quote fails whatever its shape; en_tq
+//        `validate_tq_files.py` check 13 is `_flag_straight_quotes` (def 604,
+//        called 489/503/515). Both fetched from master 2026-11-12 (en_tn
+//        d6fc28c11c, en_tq 77f4018201). The render curls Note / Question /
+//        Response (educateQuotes) and blanks Tags (exportTags), so in
+//        practice only Reference, ID, SupportReference and Quote can carry
+//        one. A read-only prod count on 2026-11-12 found 0 live tn rows (of
+//        80,950) and 0 tq rows (of 13,968) with a straight quote in those
+//        columns, so wiring this held no book on the day it shipped.
 //
 // This operates on the RENDERED TSV, not on the D1 rows, and that is load-bearing.
 // `renderOccurrence` (occurrenceRule.ts, called by export.ts) heals an invalid
@@ -89,7 +98,7 @@ const STRAIGHT_QUOTES_G = /['"]/g;
 const TN_OCCURRENCE_RE = /^(?:-1|[0-9]+)$/;
 const TWL_OCCURRENCE_RE = /^[1-9][0-9]*$/;
 
-export type HardRejectKind = "tn" | "twl";
+export type HardRejectKind = "tn" | "tq" | "twl";
 
 export interface HardRejectRow {
   ref: string; // Reference cell, for the operator-facing banner
@@ -98,8 +107,7 @@ export interface HardRejectRow {
 }
 
 // Rows in a rendered TSV that DCS would reject as a hard error. Returns [] for
-// any resource with no hard-reject rule (tq), an unrecognized header, or an empty
-// render. Never throws — a malformed render is the USFM/TSV validators' problem,
+// an unrecognized header or an empty render. Never throws — a malformed render is the USFM/TSV validators' problem,
 // not this gate's, and a gate that throws would fail the export step it is
 // supposed to be protecting.
 export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow[] {
@@ -113,7 +121,7 @@ export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow
   // A header we don't recognize means we cannot locate the column; stay silent
   // rather than guess at indexes and hold a book on a misread cell.
   if (refIdx === -1 || idIdx === -1 || occIdx === -1) return [];
-  const quoteIdx = kind === "tn" ? header.indexOf("Quote") : header.indexOf("OrigWords");
+  const quoteIdx = kind === "twl" ? header.indexOf("OrigWords") : header.indexOf("Quote");
   if (quoteIdx === -1) return [];
   // twl only. A header without TWLink skips just this rule (same reason as above:
   // never judge a cell we cannot locate).
@@ -160,41 +168,43 @@ export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow
                 `so open the row and pick the article from the list`,
         });
       }
-      // Door43's _flag_straight_quotes tests the whole raw data line, so a
-      // straight quote in any column fails the run. Checking every cell of the
-      // tab-split line covers exactly that line.
-      // A curly quote is the fix in OrigWords or Tags, but not in TWLink: no
-      // article slug contains a quote, so there the fix is the article itself.
-      const quoteIdxs = cells.flatMap((cell, i) => (STRAIGHT_QUOTE_RE.test(cell) ? [i] : []));
-      if (quoteIdxs.length > 0) {
-        const quotes = ["'", '"'].filter((q) => line.includes(q)).join(" and ");
-        const colName = (i: number) => header[i] ?? `column ${i + 1}`;
-        const textCols = quoteIdxs.filter((i) => i !== linkIdx).map(colName);
-        const inLink = quoteIdxs.includes(linkIdx);
-        const fix =
-          textCols.length === 0
-            ? "remove it from TWLink or pick the article from the list"
-            : !inLink
-              ? "use a curly quote (’ “ ”) or remove it"
-              : `use a curly quote (’ “ ”) or remove it in ${textCols.join(" and ")}, ` +
-                `and remove it from TWLink or pick the article from the list`;
-        out.push({
-          ref,
-          rowId,
-          reason:
-            `straight quote (${quotes}) in ${quoteIdxs.map(colName).join(" and ")}: Door43 accepts only curly quotes, ` +
-            `so open the row and ${fix}`,
-        });
+    } else if (kind === "tn") {
+      // tn: blank Occurrence is legal only alongside a blank Quote.
+      if (occ === "") {
+        if (quote !== "") {
+          out.push({ ref, rowId, reason: "Occurrence is blank but Quote is not" });
+        }
+      } else if (!TN_OCCURRENCE_RE.test(occ)) {
+        out.push({ ref, rowId, reason: `Occurrence '${occ}' must be a non-negative integer or -1` });
       }
-      continue;
     }
-    // tn: blank Occurrence is legal only alongside a blank Quote.
-    if (occ === "") {
-      if (quote !== "") {
-        out.push({ ref, rowId, reason: "Occurrence is blank but Quote is not" });
-      }
-    } else if (!TN_OCCURRENCE_RE.test(occ)) {
-      out.push({ ref, rowId, reason: `Occurrence '${occ}' must be a non-negative integer or -1` });
+    // Every kind: Door43's straight-quote check (twl _flag_straight_quotes,
+    // tn check 15, tq check 13) tests the whole raw data line, so a straight
+    // quote in any column fails the run. Checking every cell of the tab-split
+    // line covers exactly that line.
+    // A curly quote is the fix in a text column, but not in TWLink: no article
+    // slug contains a quote, so there the fix is the article itself. tn and tq
+    // have no link column (linkIdx -1), so they always get the curly-quote fix.
+    const quoteIdxs = cells.flatMap((cell, i) => (STRAIGHT_QUOTE_RE.test(cell) ? [i] : []));
+    if (quoteIdxs.length > 0) {
+      const quotes = ["'", '"'].filter((q) => line.includes(q)).join(" and ");
+      const colName = (i: number) => header[i] ?? `column ${i + 1}`;
+      const textCols = quoteIdxs.filter((i) => i !== linkIdx).map(colName);
+      const inLink = quoteIdxs.includes(linkIdx);
+      const fix =
+        textCols.length === 0
+          ? "remove it from TWLink or pick the article from the list"
+          : !inLink
+            ? "use a curly quote (’ “ ”) or remove it"
+            : `use a curly quote (’ “ ”) or remove it in ${textCols.join(" and ")}, ` +
+              `and remove it from TWLink or pick the article from the list`;
+      out.push({
+        ref,
+        rowId,
+        reason:
+          `straight quote (${quotes}) in ${quoteIdxs.map(colName).join(" and ")}: Door43 accepts only curly quotes, ` +
+          `so open the row and ${fix}`,
+      });
     }
   }
   return out;

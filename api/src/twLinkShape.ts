@@ -70,3 +70,16 @@ export function twLinkCharacterProblem(link: string | null | undefined): string 
 export function malformedTwLinkHint(link: string | null | undefined): string {
   return twLinkCharacterProblem(link) ?? MALFORMED_TW_LINK_HINT;
 }
+
+// Issue #1336. The same _flag_straight_quotes check fails the book for a
+// straight quote in OrigWords, which the TWL export also writes unchanged.
+// The app's typing interceptor curls typed quotes, so this catches pastes and
+// direct API writes. Returns one sentence for the 400 and the lint flag, or
+// null when the value holds no straight quote. Unlike a link, a curly quote is
+// a real fix here. The value is not echoed: the outbox stores at most 200
+// characters of a refusal, and the fix must fit.
+export function origWordsQuoteProblem(words: string | null | undefined): string | null {
+  if (typeof words !== "string" || !STRAIGHT_QUOTE_RE.test(words)) return null;
+  const quotes = ["'", '"'].filter((q) => words.includes(q)).join(" and ");
+  return `OrigWords cannot contain a straight quote (${quotes}): Door43 accepts only curly quotes, so use a curly quote (’ “ ”) or remove it.`;
+}

@@ -212,6 +212,37 @@ console.log("\n[POST with a bare word as the link is refused and no row is inser
   eq(rowCount(sqlite), 1, "…no row is inserted");
 }
 
+console.log("\n[a straight quote in OrigWords is refused on PATCH and POST (#1336)]");
+// Door43's _flag_straight_quotes fails the whole TWL book for one straight
+// quote, and the export writes orig_words unchanged. The app's typing
+// interceptor curls typed quotes; this catches pastes and direct API writes.
+for (const bad of ["אֵ'ת", 'say "this"']) {
+  const { sqlite, patch } = freshApp();
+  const res = await patch({ orig_words: bad });
+  eq(res.status, 400, `PATCH orig_words=${JSON.stringify(bad)} -> 400`);
+  const body = await res.json().catch(() => ({}));
+  eq(body.error, "invalid_body", "…with the usual invalid_body code");
+  eq(/straight quote/.test(body.message ?? "") && /curly quote/.test(body.message ?? ""), true, "…and a message naming the fault and the fix");
+  eq((body.message ?? "").length <= 200, true, "…short enough for the outbox drawer's 200-character cap");
+  const r = row(sqlite);
+  eq(r.orig_words, "רָעָה", "…the stored OrigWords is unchanged");
+  eq(r.version, 3, "…the version does not move");
+  eq(logCount(sqlite), 0, "…and nothing is written to the audit log");
+}
+{
+  const { sqlite, create } = freshApp();
+  const res = await create({ orig_words: "it's", tw_link: GOOD });
+  eq(res.status, 400, "POST orig_words with a straight quote -> 400");
+  eq(rowCount(sqlite), 1, "…no row is inserted");
+  eq(logCount(sqlite), 0, "…and nothing is written to the audit log");
+}
+{
+  const { sqlite, patch } = freshApp();
+  const res = await patch({ orig_words: "it’s" });
+  eq(res.status, 200, "PATCH orig_words with a curly quote -> 200");
+  eq(row(sqlite).orig_words, "it’s", "…and it is stored");
+}
+
 console.log("\n[controls: a valid link, a blank link and null still save as before]");
 {
   const { sqlite, patch } = freshApp();
