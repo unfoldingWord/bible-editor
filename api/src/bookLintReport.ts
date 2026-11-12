@@ -61,7 +61,8 @@ export interface BookLintReportIssue extends LintIssue {
  *  case cannot slip through; the others still need a human to remember.
  *
  *  2 (#1344): catches up on checks added by #1326, #1341 and #1343 without a
- *  bump (straight quotes in TWL OrigWords, tn Quote/SupportReference, tq Quote). */
+ *  bump (Malformed TWLink; straight quotes in TWL OrigWords, tn Quote and
+ *  SupportReference, tq Quote). */
 export const LINT_REPORT_VERSION = 2;
 
 export interface BookLintReport {
