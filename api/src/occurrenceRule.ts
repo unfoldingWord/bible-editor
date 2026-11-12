@@ -58,6 +58,24 @@ export function requiredOccurrence(
   quote: unknown,
   occurrence: unknown,
 ): number | null {
+  // The RAW quote cell, deliberately not trimmed: the validators compare
+  // `_quote == ""`, so a whitespace-only Quote is NOT blank to them and does
+  // NOT license a blank Occurrence.
+  const q = typeof quote === "string" ? quote : "";
+
+  // tn general note (blank Quote): there is no quote to count, so the only
+  // meaningful Occurrence is blank or 0 — which is what en_tn master carries
+  // (tn_EZK.tsv: 53 blank, 23 zero, and one 1). Anything else becomes 0. This
+  // runs FIRST so even an illegal value (NaN, -2, "2") lands on 0 rather than
+  // the 1 the rules below would force, keeping save and render in agreement.
+  // A blank cell is left blank: legal (`occurrence_is_allowed_blank`), and
+  // filling it would churn the nightly diff. Prod tn EZK 33:7-9 `criy` is the
+  // case: its quote was cleared in the app, but its Occurrence stayed 1.
+  if (kind === "tn" && q === "") {
+    if (occurrence == null || occurrence === 0) return null;
+    return 0;
+  }
+
   // Anything that is not a finite integer counts as "no occurrence" and falls
   // through to the per-kind rule below. Zod already rejects NaN/"2" on the HTTP
   // path, but `typeof NaN === "number"` would otherwise sail past the null/0
@@ -75,11 +93,6 @@ export function requiredOccurrence(
   if (occurrence != null && !Number.isSafeInteger(occurrence)) return 1;
   // Past this point null means genuinely absent (`null` or `undefined`).
   const occ = Number.isSafeInteger(occurrence) ? (occurrence as number) : null;
-  // The RAW quote cell, deliberately not trimmed: the validators compare
-  // `_quote == ""`, so a whitespace-only Quote is NOT blank to them and does
-  // NOT license a blank Occurrence.
-  const q = typeof quote === "string" ? quote : "";
-
   // twl — legal iff a positive integer (^[1-9][0-9]*$). Blank, 0 and every
   // negative are errors, whatever OrigWords holds.
   if (kind === "twl") return occ != null && occ >= 1 ? null : 1;
@@ -89,11 +102,11 @@ export function requiredOccurrence(
   if (occ != null && occ < -1) return 1;
 
   if (occ == null) {
-    // A blank Occurrence. tn permits it ONLY alongside a blank Quote; tq always
-    // permits it. This is the clause that closes the JER 37:5 `bfyt` hole — the
-    // old rule tested `hasOrigLang(quote)`, so a Gateway-Language quote slipped
-    // through and rendered a blank cell.
-    if (kind === "tn" && q !== "") return 1;
+    // A blank Occurrence. tn permits it ONLY alongside a blank Quote (handled
+    // above); tq always permits it. This is the clause that closes the JER 37:5
+    // `bfyt` hole — the old rule tested `hasOrigLang(quote)`, so a
+    // Gateway-Language quote slipped through and rendered a blank cell.
+    if (kind === "tn") return 1;
     // The long-standing OL clause, kept for tq: an original-language quote gets
     // >= 1 even though tq's validator would accept the blank, because the
     // quote-builder can rewrite GL text to OL words without touching occurrence.
