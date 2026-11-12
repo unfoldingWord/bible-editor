@@ -3712,6 +3712,23 @@ function countAllMilestones(nodes) {
     assert(extractEditableText(r.content) === ed && labels(r.content) === labels(verse),
       `${JSON.stringify(find)} -> ${JSON.stringify(repl)} at the label: ${JSON.stringify(ed)}, label whole (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
   }
+  // A match whose leading space runs over the label, followed by a line marker
+  // carrying its own opener (ISA 13:2 UST with a label injected, found by the
+  // label differential: ` {to` -> ``). The start moved past the label, so the
+  // raw range lost the match's leading space, which read as a bare seam: the
+  // guard refused the result and the verse was flattened, label and all. Main
+  // dropped only the `\q2` (whose `{` the replace removed). Now as main.
+  {
+    const isaLike = { verseObjects: [zaln("H0", [w("bare")]), t(" "), zaln("H1", [w("hill")]), t("\n"), sp(), { tag: "q2", type: "quote", text: "{" },
+      zaln("H2", [w("to"), t(" "), w("signal")]), t("}!\n"), q1(), zaln("H3", [w("Shout")]), t(".")] };
+    const p = extractPlainText(isaLike);
+    const at = p.indexOf(" {to");
+    const r = findReplaceVerse(clone(isaLike), p, / \{to/g, at, 4, "");
+    assert(extractPlainText(r.content) === "bare hill signal}! Shout.", `" {to" -> "" after the label: text (got ${JSON.stringify(extractPlainText(r.content))})`);
+    assert(labels(r.content) === labels(isaLike), `" {to" -> "" after the label: label kept (got ${labels(r.content)})`);
+    assert(/\\q1/.test(extractEditableText(r.content)) && words(r.content).startsWith("bare:H0|hill:H1|"),
+      `" {to" -> "" after the label: the other line break and alignment kept (got ${JSON.stringify(extractEditableText(r.content))} ${words(r.content)})`);
+  }
   // A match just before the label leaves it alone too.
   {
     const r = findReplaceVerse(clone(verse), plain, /said/g, plain.indexOf("said"), 4, "spoke");
