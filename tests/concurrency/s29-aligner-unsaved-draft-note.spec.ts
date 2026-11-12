@@ -9,8 +9,8 @@ import { newUserContext } from "./helpers";
 const DRAFT_NOTE = "This verse has typed text that isn't saved; this screen shows the saved wording.";
 const OUTBOX_NOTE = "This verse has an edit that hasn't saved yet.";
 const BOTH_NOTE =
-  "This verse has an edit that hasn't saved yet, plus newer typed text that isn't saved; " +
-  "this screen shows the edit but not the newer typing.";
+  "This verse has an edit that hasn't saved yet, plus typed text that isn't saved; " +
+  "this screen shows the edit but not the typed text.";
 
 const cellFor = (page: Page, verse: number, bv: "ULT" | "UST") =>
   page.locator(`[contenteditable="true"][data-find-cell="1-${verse}-${bv}"]`);

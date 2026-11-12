@@ -371,7 +371,18 @@ assert.equal(alignmentPanelRowKey(null), "none");
     "This verse has typed text that isn't saved; this screen shows the saved wording.",
   );
   assert.equal(ALIGNER_UNSAVED_MESSAGE.outbox, "This verse has an edit that hasn't saved yet.");
-  assert.equal(typeof ALIGNER_UNSAVED_MESSAGE.both, "string");
+  assert.equal(
+    ALIGNER_UNSAVED_MESSAGE.both,
+    "This verse has an edit that hasn't saved yet, plus typed text that isn't saved; " +
+      "this screen shows the edit but not the typed text.",
+  );
+  // A find/replace carries no draft generation, so older typing under it is
+  // "both" too, which is why the note does not call the typing newer.
+  assert.equal(
+    alignerUnsavedNote([textOp({ patch: { content: {}, alignment_intent: "find_replace" } })], [draft()], at),
+    "both",
+    "a find/replace over unsaved typing: the combined note",
+  );
 }
 
 console.log("alignmentDraftSaveState: 43 passed, plus #1248 and #1254 cases");

@@ -192,8 +192,9 @@ export function hasUnsavedVerseTextOp(
 // - "draft": text typed in the rows/columns editor and not yet saved. Typing
 //   lives only in the drafts store until Save, so the aligner shows the saved
 //   wording, without the typing.
-// - "both": an edit is queued AND newer typing came after it. One note, not
-//   two stacked ones.
+// - "both": an edit is queued AND there is typing it did not capture (typed
+//   after Save, or older typing under a find/replace). One note, not two
+//   stacked ones. It does not say which came first: the helper cannot tell.
 // A draft that a queued save captured (its generation rides on the op, in any
 // status) is not newer typing: Save already put that text into the local copy
 // the aligner shows, and the draft stays only until the save's 200 clears it.
@@ -204,8 +205,8 @@ export const ALIGNER_UNSAVED_MESSAGE: Record<AlignerUnsavedNote, string | null> 
   outbox: "This verse has an edit that hasn't saved yet.",
   draft: "This verse has typed text that isn't saved; this screen shows the saved wording.",
   both:
-    "This verse has an edit that hasn't saved yet, plus newer typed text that isn't saved; " +
-    "this screen shows the edit but not the newer typing.",
+    "This verse has an edit that hasn't saved yet, plus typed text that isn't saved; " +
+    "this screen shows the edit but not the typed text.",
 };
 
 export function alignerUnsavedNote(
