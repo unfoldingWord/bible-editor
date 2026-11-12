@@ -1247,7 +1247,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // is also a Door43 hard error, but it is a real row a translator can fix, so
     // the HOLD names it.
     //
-    // The guard stays as a drift backstop: a hit here means the renderer and the
+    // For Occurrence the guard stays as a drift backstop: a hit means the renderer and the
     // guard's transcription of the validators have diverged, which IS worth a
     // hold. Note what this shifts — the twl "add word" stub (blank
     // OrigWords/TWLink, NULL occurrence) used to be caught incidentally by its

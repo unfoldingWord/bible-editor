@@ -32,8 +32,8 @@
 //        twLinkShape.ts (`isMalformedTwLink`), shared with the save-path refusal
 //        and the lint flag, so this gate cannot drift from them. Added for #1324:
 //        #1316 made the editor refuse a malformed link on save and flag any
-//        already stored, but a stored one (or one that slipped in by reimport)
-//        still exported and failed the -be- PR with no banner naming the row.
+//        already stored, but a link stored before #1316 still exported and
+//        would fail the -be- PR with no banner naming the row.
 //
 // This operates on the RENDERED TSV, not on the D1 rows, and that is load-bearing.
 // `renderOccurrence` (occurrenceRule.ts, called by export.ts) heals an invalid
