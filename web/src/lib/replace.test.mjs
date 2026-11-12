@@ -3914,6 +3914,55 @@ function countAllMilestones(nodes) {
   check("item 6 (pin): say “I -> say I (seam)", seam, "say “I", "say I", "say\\q1 I go.”");
 }
 
+// Case 93: a find/replace across a line break that sits after punctuation and a
+// newline, with a different word count, keeps the break beside the words it did
+// not change (#1321, item 1). ZEC 6:13 ULT as seeded stores `throne` `".\n"`
+// `\q1` `And he will be`. Raw `throne.\nAnd` reads like the plain text, so the
+// #1311 seam guard never ran, and smartRebuildRange's result went through with
+// the break moved after the new words and the `"\n"` dropped
+// (`throne. So then\q1 he`).
+{
+  console.log("\n[Case 93] Find/replace across a line break after punctuation keeps the break in place (#1321)");
+  const sig = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("+")}`).join("|");
+  const markers = (content) => (extractEditableText(content).match(/\\(q\d?|p|ts\\\*)(?![a-z])/g) ?? []).join(" ");
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+  const v613 = { verseObjects: zecUlt.chapters["6"]["13"].verseObjects };
+  const plain = extractPlainText(v613);
+  const find = "throne. And";
+  const at = plain.indexOf(find);
+  assert(at >= 0 && extractEditableText(v613).includes("throne. \\q1 And he"), `setup: ZEC 6:13 has the break after "throne." (got ${JSON.stringify(extractEditableText(v613))})`);
+  // Every word but the replaced `And` keeps its alignment; `So` and `then` are new.
+  const wantSig = sig(v613).replace(/\|And:[^|]*\|he:/, "|So:|then:|he:");
+  assert(wantSig !== sig(v613), "setup: the replaced And is aligned");
+  for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+    const r = fn(clone(v613), plain, /throne\. And/g, at, find.length, "throne. So then");
+    const ed = extractEditableText(r.content);
+    assert(ed.includes("throne. \\q1 So then he will be"), `${entry}: the break stays after "throne." (got ${JSON.stringify(ed)})`);
+    assert(markers(r.content) === markers(v613), `${entry}: every line marker survives (${markers(v613)} -> ${markers(r.content)})`);
+    assert(sig(r.content) === wantSig, `${entry}: untouched words keep their alignment (got ${sig(r.content)})`);
+    assert(extractPlainText(r.content) === plain.replace(find, "throne. So then"), `${entry}: plain text is the replaced text`);
+  }
+  // The same replace when the stored plain text is stale (the lockstep walk
+  // misses and the occurrence count runs): no exact result can be checked in
+  // the stored text's terms, so the result is main's, never the flat rebuild.
+  // Pinned as main's result, not as the right one.
+  {
+    const stale = plain.replace("Yahweh", "Yahwe");
+    const r = findReplaceVerse(clone(v613), stale, /throne\. And/g, stale.indexOf(find), find.length, "throne. So then");
+    const ed = extractEditableText(r.content);
+    assert(ed.includes("throne. So then\\q1 he will be"), `stale stored text: main's result (got ${JSON.stringify(ed)})`);
+    assert(markers(r.content) === markers(v613), `stale stored text: every line marker survives`);
+    assert(sig(r.content) === wantSig, `stale stored text: alignment as main (got ${sig(r.content)})`);
+  }
+  // Same word count (the preserve path): unchanged by this fix.
+  {
+    const r = findReplaceVerse(clone(v613), plain, /throne\. And/g, at, find.length, "throne. Then");
+    assert(extractEditableText(r.content).includes("throne. \\q1 Then he will be"), `throne. And -> throne. Then keeps the break (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(sig(r.content) === sig(v613).replace(/\|And:[^|]*\|he:/, "|Then:|he:"), `throne. And -> throne. Then: alignment (got ${sig(r.content)})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
