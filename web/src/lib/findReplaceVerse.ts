@@ -166,13 +166,16 @@ export function replaceAllInVerse(
   // shows at a placed position. Matches only the stored text has (in the
   // label's text) are not verse text and are left out. Any match that can't be
   // placed refuses the whole verse, so replace all never edits a match the
-  // user wasn't shown.
+  // user wasn't shown. So does a verse left unchanged while the stored text
+  // had matches that weren't placed (only in the label's text), or the
+  // overlay would show nothing at all.
   const fresh = staleBesideLabel(content, plainText);
+  let unplaced = false;
   if (fresh !== null) {
-    const placed = new Set(
-      freshMatches(plainText, regex).map((m) => placeInFresh(plainText, fresh, regex, m.index, m.length)),
-    );
+    const placedAt = freshMatches(plainText, regex).map((m) => placeInFresh(plainText, fresh, regex, m.index, m.length));
+    const placed = new Set(placedAt);
     if (!freshMatches(fresh, regex).every((m) => placed.has(m.index))) return staleRefusal(content, plainText);
+    unplaced = placedAt.includes(null);
     curPlain = fresh;
   }
   let preserved = true;
@@ -206,11 +209,12 @@ export function replaceAllInVerse(
     from = 0;
     applied++;
   }
-  return finalizeFindReplace(content, plainText, {
+  const out = finalizeFindReplace(content, plainText, {
     content: curContent,
     plainText: curPlain,
     preservedAlignment: preserved,
   });
+  return unplaced && out.plainText === plainText ? staleRefusal(content, plainText) : out;
 }
 
 // The overlay's scripture summary line after a replace. Counts come from the

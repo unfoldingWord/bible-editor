@@ -802,7 +802,7 @@ Highlights that bite repeatedly:
   the stored text differs: the match must sit in the text the two share at the start or the end (not where those
   runs overlap), and the regex must match the tree's text there with the same length. Otherwise nothing is saved and
   the overlay shows "its saved search text is out of date". Replace all refuses the verse unless every match in the
-  tree's text is a placed match. Counting occurrences in the stale text was the #1321 attempt that edited the wrong
+  tree's text is a placed match, and when it would change nothing while some stored-text match went unplaced. Counting occurrences in the stale text was the #1321 attempt that edited the wrong
   word; don't bring it back. The engine (`replace.ts`) never sees a stale text on this path.
 - **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in
   local D1 for a live test is overwritten before the test starts. Run a one-off spec with a config that spreads
