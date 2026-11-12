@@ -78,9 +78,7 @@ export function CatalogPicker({
 
   return (
     <Autocomplete<string, false, false, boolean>
-      // The option list would cover the refusal message under the input, so it
-      // steps aside while the message shows; the next keystroke brings it back.
-      open={invalid === null}
+      open
       freeSolo={freeSolo}
       autoFocus
       // null (not "") is MUI's canonical "no selection": with freeSolo off an
@@ -90,6 +88,11 @@ export function CatalogPicker({
       PopperComponent={FixedWidthPopper}
       size="small"
       filterOptions={(opts, state) => {
+        // The option list would cover the refusal message under the input, so
+        // it is emptied while the message shows (a freeSolo picker with no
+        // options draws no list). `open` stays true, so blur and Escape still
+        // close the picker; the next keystroke clears the message.
+        if (invalid !== null) return [];
         const q = state.inputValue.toLowerCase().trim();
         if (!q) return opts.slice(0, 50);
         return opts.filter((o) => o.toLowerCase().includes(q)).slice(0, 50);
