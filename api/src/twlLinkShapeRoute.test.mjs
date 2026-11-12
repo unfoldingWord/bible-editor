@@ -140,6 +140,13 @@ for (const bad of [
   "rc://*/tw/dict",
   " rc://*/tw/dict/bible/other/trouble",
   "rc://*/tw/dict/bible/other/big trouble",
+  // Door43's blank test is `if not twlink`: only "" is blank, so whitespace
+  // reaches TWLINK_RE and is a hard error.
+  "   ",
+  // TWLINK_RE's [^ \\] accepts a newline, but the export writes it as a
+  // literal backslash-n, which Door43 rejects.
+  "rc://*/tw/dict/bible/kt/god\n",
+  "rc://*/tw/dict/bible/kt/god\r",
 ]) {
   const { sqlite, patch } = freshApp();
   const res = await patch({ tw_link: bad });
@@ -164,6 +171,12 @@ console.log("\n[POST with a bare word as the link is refused and no row is inser
   eq(res.status, 400, 'POST tw_link="trouble" -> 400');
   eq(rowCount(sqlite), 1, "…no row is inserted");
   eq(logCount(sqlite), 0, "…and nothing is written to the audit log");
+}
+{
+  const { sqlite, create } = freshApp();
+  const res = await create({ tw_link: "   " });
+  eq(res.status, 400, 'POST tw_link="   " -> 400');
+  eq(rowCount(sqlite), 1, "…no row is inserted");
 }
 
 console.log("\n[controls: a valid link, a blank link and null still save as before]");

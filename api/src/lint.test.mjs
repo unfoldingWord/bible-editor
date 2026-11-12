@@ -720,9 +720,21 @@ t("twl links Door43 rejects are flagged; links it accepts are not", () => {
   assert.equal(malformed("tw/dict/bible/other/trouble"), 1, "no rc:// scheme");
   assert.equal(malformed(" rc://*/tw/dict/bible/other/trouble"), 1, "leading space");
   assert.equal(malformed("rc://*/tw/dict/bible/other/big trouble"), 1, "space in the slug");
+  // The regex's [^ \\] accepts control characters, but the export's tsvCell
+  // turns a newline into a literal backslash-n, which Door43 then rejects.
+  assert.equal(malformed("rc://*/tw/dict/bible/kt/god\n"), 1, "trailing newline");
+  assert.equal(malformed("rc://*/tw/dict/bible/kt/god\r"), 1, "carriage return");
+  assert.equal(malformed("rc://*/tw/dict/bible/kt/go\td"), 1, "tab");
+});
+t("whitespace-only TWLink is 'Malformed TWLink' only (Door43 hard-fails it; only \"\" is blank there)", () => {
+  for (const link of ["   ", " ", "\t"]) {
+    const i = lintTwlRows([twl({ tw_link: link })]);
+    assert.equal(i.filter((x) => x.check === "Malformed TWLink").length, 1, JSON.stringify(link));
+    assert.equal(i.filter((x) => x.check === "Empty TWLink").length, 0, JSON.stringify(link));
+  }
 });
 t("blank TWLink is only 'Empty TWLink', never also 'Malformed TWLink'", () => {
-  for (const link of ["", "   ", null]) {
+  for (const link of ["", null]) {
     const i = lintTwlRows([twl({ tw_link: link })]);
     assert.equal(i.filter((x) => x.check === "Malformed TWLink").length, 0);
     assert.equal(i.filter((x) => x.check === "Empty TWLink").length, 1);

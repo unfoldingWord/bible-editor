@@ -19,6 +19,9 @@ assert(isMalformedTwLink("rc://*/tw/dict"), "too few path segments is malformed"
 assert(isMalformedTwLink(" rc://*/tw/dict/bible/other/trouble"), "a leading space is malformed (Door43 does not strip)");
 assert(!isMalformedTwLink("rc://*/tw/dict/bible/other/trouble"), "a full rc:// link is fine");
 assert(!isMalformedTwLink("rc://en/tw/dict/bible/names/abraham"), "a language-pinned link is fine");
+assert(isMalformedTwLink("   "), "whitespace-only is malformed (Door43 treats only \"\" as blank)");
+assert(isMalformedTwLink("rc://*/tw/dict/bible/kt/god\n"), "a trailing newline is malformed (export writes a literal \\n)");
+assert(isMalformedTwLink("rc://*/tw/dict/bible/kt/go\td"), "a tab is malformed");
 assert(!isMalformedTwLink(""), "blank is not malformed (lint flags it as empty instead)");
 assert(!isMalformedTwLink(null), "null is not malformed");
 
