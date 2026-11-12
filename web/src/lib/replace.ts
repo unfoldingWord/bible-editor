@@ -1445,8 +1445,17 @@ function smartReplaceVerseImpl(
   // replacement and its line markers are all still there; otherwise fall to
   // the next path, and last to the flat rebuild the old code reached here.
   const plainMatchText = plainText.slice(matchStartInPlain, matchStartInPlain + matchLenInPlain);
-  const acrossSeam =
-    located !== null && raw.slice(rawStart, rawEnd).replace(/\s+/g, " ") !== plainMatchText.replace(/\s+/g, " ");
+  // An edge pulled back to a header label (keepLabelsOutOfEdges) left the
+  // match's whitespace on that side out of the range on purpose; compare
+  // without it there, or the leading space of ` {to` after a label reads as a
+  // bare seam and the guard flattens a verse main edited (review of #1311).
+  let seamText = plainMatchText;
+  if (located?.pulledStart) seamText = seamText.replace(/^\s+/, "");
+  if (located?.pulledEnd) seamText = seamText.replace(/\s+$/, "");
+  let rawSeamText = raw.slice(rawStart, rawEnd);
+  if (located?.pulledStart) rawSeamText = rawSeamText.replace(/^\s+/, "");
+  if (located?.pulledEnd) rawSeamText = rawSeamText.replace(/\s+$/, "");
+  const acrossSeam = located !== null && rawSeamText.replace(/\s+/g, " ") !== seamText.replace(/\s+/g, " ");
   const rawMatchText = acrossSeam ? plainMatchText : raw.slice(rawStart, rawEnd);
   const flatRebuild = (): SmartReplaceResult => {
     const newPlain = normalize(plainText.slice(0, matchStartInPlain) + replaceText + plainText.slice(matchStartInPlain + matchLenInPlain));
@@ -1762,22 +1771,31 @@ function rangeTouchesLabel(leaves: Leaf[], start: number, end: number): boolean 
 // match's text follows the label, otherwise the end to it (a whitespace-only
 // match keeps the whitespace before the label, as main replaced). A label with
 // matched text on both sides (`said the` around it) stays inside (#1311).
+// `pulledStart` / `pulledEnd` say which edge moved: the match's whitespace on
+// that side is then not in the range, which must not read as a bare seam.
 function keepLabelsOutOfEdges(
   range: { start: number; end: number } | null,
   labelFree: string,
   leaves: Leaf[],
-): { start: number; end: number } | null {
+): { start: number; end: number; pulledStart: boolean; pulledEnd: boolean } | null {
   if (!range) return range;
   let { start, end } = range;
+  let pulledStart = false;
+  let pulledEnd = false;
   for (const l of leaves) {
     if (!isHeaderLabelNode(l.node) || l.end <= l.start || l.end <= start || l.start >= end) continue;
     const textBefore = /\S/.test(labelFree.slice(start, Math.max(start, l.start)));
     const textAfter = /\S/.test(labelFree.slice(Math.min(end, l.end), end));
     if (textBefore && textAfter) continue;
-    if (textAfter) start = l.end;
-    else end = Math.max(start, l.start);
+    if (textAfter) {
+      start = l.end;
+      pulledStart = true;
+    } else {
+      end = Math.max(start, l.start);
+      pulledEnd = true;
+    }
   }
-  return { start, end: Math.max(start, end) };
+  return { start, end: Math.max(start, end), pulledStart, pulledEnd };
 }
 
 // Header-label texts in document order (see blankHeaderLabels).
