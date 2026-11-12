@@ -253,6 +253,16 @@ function countMilestones(nodes) {
   assert(rendered.includes("\\zaln-e\\*, ‘\\zaln-s"), `renders as \\zaln-e\\*, ‘\\zaln-s (got ${JSON.stringify(rendered)})`);
 }
 
+// ─── Case j (#1315): `¿` is an opener, hoisted like `‘` ─────────────────────
+{
+  console.log("\n[Case j] a stranded ¿ is hoisted out of the preceding milestone (#1315)");
+  const before = { verseObjects: [zaln("H1", [w("dijo"), t(": ¿")]), zaln("H2", [w("Quién")]), t(" es?")] };
+  const after = hoistOpeningPunctuation(before.verseObjects);
+  assert(concatText(after) === concatText(before.verseObjects), "concatenated text round-trips exactly");
+  assert(after.length === 4 && after[1].type === "text" && after[1].text === ": ¿", `": ¿" lands right after the milestone (got ${JSON.stringify(after[1])})`);
+  assert(after[0].children.length === 1, "the milestone keeps only its word");
+}
+
 console.log(`\n${ran} assertion(s) ran, ${failed} failed.`);
 if (failed > 0) {
   console.error(`\n${failed} failure(s).`);

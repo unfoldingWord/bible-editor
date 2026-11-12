@@ -3870,6 +3870,11 @@ function countAllMilestones(nodes) {
   assert(extractEditableText(blankAfterP) === "say, \\p \\q1 “I go.”", `item 1: setup: editable text (got ${JSON.stringify(extractEditableText(blankAfterP))})`);
   check("item 1: say, “I -> say; “I (blank line after \\p)", blankAfterP, "say, “I", "say; “I", "say; \\p \\q1 “I go.”");
   check("item 1: say, “I -> say, ‘I (blank line after \\p, opener changed)", blankAfterP, "say, “I", "say, ‘I", "say, \\p \\q1 ‘I go.”");
+  // The same blank line with nothing after the `\q1`: an added opener went
+  // into the blank leaf, between `\p` and `\q1` (`say, “ I`, on main too).
+  const blankAfterPBare = parsed(`${Z("H1", "say")},\n\\p\n\n\\q1 ${Z("H2", "I")} ${Z("H3", "go")}.`);
+  check("item 1: say, I -> say, “I (blank line after \\p, bare \\q1)", blankAfterPBare, "say, I", "say, “I", "say, \\p \\q1 “I go.");
+  check("item 1: say, I -> say; I (blank line after \\p, bare \\q1)", blankAfterPBare, "say, I", "say; I", "say; \\p \\q1 I go.");
 
   // Item 2 (pinned, main's behaviour kept): a `\ts\*` stays a split point. The
   // plain text puts a space at a bare `\ts\*` as at a `\q1`, so splitting
@@ -3903,6 +3908,10 @@ function countAllMilestones(nodes) {
   // the fallback dropped the `\q1` and unaligned every word.
   const seam = { verseObjects: [zaln("H1", [w("say")]), { tag: "q1", type: "quote", text: "“" }, zaln("H2", [w("I")]), t(" "), zaln("H3", [w("go")]), t(".”")] };
   check("item 6: say “I -> say, ‘I (seam, \\q1 carries the opener)", seam, "say “I", "say, ‘I", "say, \\q1 ‘I go.”");
+  // Its neighbours keep main's layout: with no closing punctuation added,
+  // nothing new goes before the break.
+  check("item 6 (pin): say “I -> say ‘I (seam)", seam, "say “I", "say ‘I", "say\\q1 ‘I go.”");
+  check("item 6 (pin): say “I -> say I (seam)", seam, "say “I", "say I", "say\\q1 I go.”");
 }
 
 if (failed > 0) {
