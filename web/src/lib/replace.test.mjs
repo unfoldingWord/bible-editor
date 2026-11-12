@@ -3674,6 +3674,44 @@ function countAllMilestones(nodes) {
     assert(labels(f.content) === labels(verse) && words(f.content) === "The:H0|woman:H1|the:H3|man:H4|ran:H5",
       `find "said " -> "" before the label keeps it and the alignment (got ${labels(f.content)} ${words(f.content)})`);
   }
+  // Whitespace next to the label (review of #1311). The label is blanked to
+  // spaces for the plain-to-raw walk, so the space after `said` mapped to the
+  // `\n` plus the whole label; pulling the start past the label left an empty
+  // range, and find/replace made it a silent no-op (main replaced the `\n`).
+  // Without the find/replace flag the same range dropped the label.
+  {
+    const at = plain.indexOf(" ", plain.indexOf("said"));
+    for (const re of [/ /g, /\s/g]) {
+      const r = findReplaceVerse(clone(verse), plain, re, at, 1, "_");
+      assert(extractEditableText(r.content) === "The woman said_\\q1 the man ran." && labels(r.content) === labels(verse),
+        `find ${re} after said -> _: replaced, label kept (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
+    }
+    const s = smartReplaceVerse(clone(verse), plain, / /g, at, 1, " - ");
+    assert(extractEditableText(s.content) === "The woman said - \\q1 the man ran." && labels(s.content) === labels(verse),
+      `space after said -> " - " (no find/replace flag): label kept (got ${JSON.stringify(extractEditableText(s.content))} ${labels(s.content)})`);
+  }
+  // A stale stored plain text (the lockstep walk fails, so the occurrence
+  // count in raw runs). The label was blanked to spaces there too, so a
+  // whitespace run merged with it: the space after `said` matched `\n` plus
+  // the label and dropped the label. The other spaces are counted as the
+  // plain text has them (main counted the label's own spaces).
+  {
+    const stale = "The lady said the man ran.";
+    const nth = (k) => { let at = -1; for (let i = 0; i <= k; i++) at = stale.indexOf(" ", at + 1); return at; };
+    const want = ["The_woman said \\q1 the man ran.", "The woman_said \\q1 the man ran.", "The woman said_\\q1 the man ran.",
+      "The woman said \\q1 the_man ran.", "The woman said \\q1 the man_ran."];
+    want.forEach((ed, k) => {
+      const r = findReplaceVerse(clone(verse), stale, / /g, nth(k), 1, "_");
+      assert(extractEditableText(r.content) === ed && labels(r.content) === labels(verse),
+        `stale plain text, space #${k} -> _: ${JSON.stringify(ed)}, label kept (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
+    });
+  }
+  // Edge whitespace that touches the label from either side keeps it whole.
+  for (const [find, repl, ed] of [["said ", "", "The woman \\q1 the man ran."], ["said ", "said, ", "The woman said, \\q1 the man ran."], [" the", "", "The woman said \\q1 man ran."]]) {
+    const r = findReplaceVerse(clone(verse), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
+    assert(extractEditableText(r.content) === ed && labels(r.content) === labels(verse),
+      `${JSON.stringify(find)} -> ${JSON.stringify(repl)} at the label: ${JSON.stringify(ed)}, label whole (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
+  }
   // A match just before the label leaves it alone too.
   {
     const r = findReplaceVerse(clone(verse), plain, /said/g, plain.indexOf("said"), 4, "spoke");
