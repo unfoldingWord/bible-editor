@@ -58,9 +58,12 @@ export function CatalogPicker({
   // clear so the dropdown stays mounted and the input keeps focus,
   // ready for the user to type a replacement.
   const justClearedRef = useRef(false);
-  // Set when validate refuses a value, so the close MUI fires right after a
-  // refused option pick (reason "selectOption") is skipped.
-  const justRefusedRef = useRef(false);
+  // The event of the last pick validate refused, so the "selectOption" close
+  // MUI fires right after it (with that same event) is skipped and the message
+  // stays visible. Cleared by every close and by reopening, and matched by
+  // event, so it cannot swallow a later close (issue #1327): a refused Enter
+  // closes with "createOption", and a Ctrl/Meta-click fires no close at all.
+  const refusedEventRef = useRef<unknown>(null);
 
   if (!open) {
     return (
@@ -71,6 +74,7 @@ export function CatalogPicker({
         color={color}
         onClick={() => {
           setInvalid(null);
+          refusedEventRef.current = null;
           setOpen(true);
         }}
         // minWidth: 0 + maxWidth so the chip shrinks inside a constrained
@@ -117,14 +121,14 @@ export function CatalogPicker({
         // label), not the editor typing, so it does not clear the message.
         if (invalid && reason !== "reset") setInvalid(null);
       }}
-      onChange={(_e, next, reason) => {
+      onChange={(e, next, reason) => {
         const val = typeof next === "string" ? next : null;
-        justRefusedRef.current = false;
+        refusedEventRef.current = null;
         if (validate && val !== null) {
           const problem = validate(val);
           if (problem) {
             setInvalid(problem);
-            justRefusedRef.current = true;
+            refusedEventRef.current = e;
             return;
           }
         }
@@ -144,14 +148,13 @@ export function CatalogPicker({
         }
         if (val !== null) setOpen(false);
       }}
-      onClose={(_e, reason) => {
+      onClose={(e, reason) => {
+        const refusedEvent = refusedEventRef.current;
+        refusedEventRef.current = null;
         if (justClearedRef.current) return;
         // Picking a listed option MUI then closes with "selectOption"; when
         // validate refused that option, stay open so its message is seen.
-        if (reason === "selectOption" && justRefusedRef.current) {
-          justRefusedRef.current = false;
-          return;
-        }
+        if (reason === "selectOption" && refusedEvent !== null && e === refusedEvent) return;
         if (reason === "blur" || reason === "escape" || reason === "selectOption") {
           setOpen(false);
         }
