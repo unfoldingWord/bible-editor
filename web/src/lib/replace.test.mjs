@@ -3994,6 +3994,11 @@ function countAllMilestones(nodes) {
     const r = findReplaceVerse(clone(verse), withLabel, /man/g, at, 3, "boy");
     assert(r.plainText === withLabel && extractEditableText(r.content) === extractEditableText(verse) && labels(r.content) === labels(verse),
       `match inside the stale label text: no-op (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
+    // Replace all on the same stored text: the label's match is skipped (the
+    // no-op step), the verse's own matches are replaced, and the loop ends.
+    const all = replaceAllInVerse(clone(verse), withLabel, /man/g, 3, "boy");
+    assert(extractEditableText(all.content) === "The woboy said \\q1 the boy ran." && labels(all.content) === labels(verse),
+      `replace all man -> boy on the stale text: label kept (got ${JSON.stringify(extractEditableText(all.content))} ${labels(all.content)})`);
   }
   // A stale stored text with no label text in it (Case 90's): a `\S+` match
   // after the label counted onto the label's blanked fill and flattened the verse.
