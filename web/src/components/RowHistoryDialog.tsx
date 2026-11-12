@@ -65,7 +65,13 @@ interface Props {
   // back to the card, which PATCHes through the normal save pipe. The
   // server marks that PATCH as a revert via the row's restored_from_version
   // column so this dialog can keep hiding it next time around.
-  onUseVersion: (snapshot: RowSnapshot, fromVersion: number) => void;
+  // `raw` is the version's full server snapshot, including fields the dialog
+  // does not show (a tn quote's occurrence, #1330).
+  onUseVersion: (
+    snapshot: RowSnapshot,
+    fromVersion: number,
+    raw: Record<string, unknown>,
+  ) => void;
 }
 
 const fmtTime = (epochSec: number) =>
@@ -388,7 +394,7 @@ export function RowHistoryDialog({
           disabled={!selected || isCurrent || loading || !canRestore}
           onClick={() => {
             if (!selected || !selectedSnapshot || !canRestore) return;
-            onUseVersion(selectedSnapshot, selected.version);
+            onUseVersion(selectedSnapshot, selected.version, selected.snapshot);
             onClose();
           }}
         >

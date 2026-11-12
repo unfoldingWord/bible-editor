@@ -69,6 +69,7 @@ import { parseNoteSegments, resolveNoteLinkHref } from "../lib/noteLinks";
 import type { NoteLinkTarget } from "../lib/noteLinks";
 import { NoteLinkPreview } from "./NoteLinkPreview";
 import { directionForText } from "../lib/direction";
+import { tnRestorePatch, type TnRestoreSnapshot } from "./tnRestorePatch";
 import {
   continueListOnEnter,
   indentLines,
@@ -1203,14 +1204,7 @@ function NoteCardInner({
   // edit_log, including the v(current) we're moving away from. Local
   // state is rewritten outright so any in-progress session is discarded
   // in favor of the chosen version.
-  const handleUseVersion = (
-    snap: {
-      quote: string | null;
-      note: string | null;
-      support_reference: string | null;
-    },
-    fromVersion: number,
-  ) => {
+  const handleUseVersion = (snap: TnRestoreSnapshot, fromVersion: number) => {
     const rawQuote = snap.quote ?? "";
     const rawNote = snap.note ?? "";
     const rawSr = snap.support_reference ?? null;
@@ -1234,11 +1228,9 @@ function NoteCardInner({
     // Only patch the fields that actually differ from the saved server
     // state so we don't trigger a needless version bump if the user picked
     // the current version somehow. Use savedRef (not row) because row
-    // carries optimistic mid-typing values from stashEdit().
-    const patch: Partial<TnRow> = {};
-    if (rawQuote !== (savedRef.current.quote ?? "")) patch.quote = rawQuote;
-    if (rawNote !== (savedRef.current.note ?? "")) patch.note = rawNote;
-    if (rawSr !== savedRef.current.support_reference) patch.support_reference = rawSr;
+    // carries optimistic mid-typing values from stashEdit(). A changed quote
+    // brings its occurrence along (#1330, see tnRestorePatch).
+    const patch: Partial<TnRow> = tnRestorePatch(snap, savedRef.current);
     if (Object.keys(patch).length === 0) return;
     onChange(patch);
     onSave(patch, { restoredFromVersion: fromVersion });
