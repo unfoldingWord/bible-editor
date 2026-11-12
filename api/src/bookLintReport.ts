@@ -47,12 +47,22 @@ export interface BookLintReportIssue extends LintIssue {
 }
 
 /** The report's schema version (#1135). Bump it whenever a change would make a
- *  report from the old code merge wrongly with one from the new: a check moved
- *  into or out of BOOK_WIDE_CHECKS, the section list reordered, or the chapter
- *  tagging changed. The client merges a chapter report into its cached
- *  whole-book report only when both carry the same version, so a deploy that
- *  lands between the two fetches costs one whole-book fetch, not a wrong chip. */
-export const LINT_REPORT_VERSION = 1;
+ *  report from the old code merge wrongly with one from the new:
+ *    - a check added, removed or renamed (LINT_CHECK_NAMES in lint.ts; #1344),
+ *    - an existing check changed so it flags different rows or verses,
+ *    - a check moved into or out of BOOK_WIDE_CHECKS,
+ *    - the section list reordered, or the chapter tagging changed.
+ *  The client merges a chapter report into its cached whole-book report only
+ *  when both carry the same version, so a deploy that lands between the two
+ *  fetches costs one whole-book fetch, not a wrong chip. Without a bump, a
+ *  browser holding a pre-deploy report merges post-deploy chapter reports into
+ *  it, and other chapters keep the old flags until the next whole-book fetch.
+ *  bookLintReport.test.mjs pins LINT_CHECK_NAMES to this version, so the first
+ *  case cannot slip through; the others still need a human to remember.
+ *
+ *  2 (#1344): catches up on checks added by #1326, #1341 and #1343 without a
+ *  bump (straight quotes in TWL OrigWords, tn Quote/SupportReference, tq Quote). */
+export const LINT_REPORT_VERSION = 2;
 
 export interface BookLintReport {
   book: string;
