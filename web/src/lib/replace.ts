@@ -1394,8 +1394,10 @@ function smartReplaceVerseImpl(
   // Both search a copy of raw with header-label text (`\sp The man speaking`)
   // blanked: raw keeps that text but the plain and editable texts skip it, so
   // the lockstep walk failed after a label and the occurrence count could land
-  // in it (`man` edited the label's `man`, #1311). Blanking keeps every offset.
-  const labelFree = blankHeaderLabels(raw, leaves);
+  // in it (`man` edited the label's `man`, #1311). Blanking keeps every offset;
+  // see blankHeaderLabels for why the two copies blank it differently.
+  const labelFree = blankHeaderLabels(raw, leaves, " ");
+  const labelSearch = blankHeaderLabels(raw, leaves, LABEL_FILL);
   const mapped = keepLabelsOutOfEdges(locatePlainRangeInRaw(plainText, labelFree, matchStartInPlain, matchLenInPlain), labelFree, leaves);
   // A whitespace-only match at a marker with no text node beside it: the space
   // is in the plain text only (the marker is the separator), so the tree has
@@ -1417,7 +1419,7 @@ function smartReplaceVerseImpl(
   const rawRegex = relaxWhitespace(regex);
   const rawMatch = located
     ? { index: located.start, length: located.end - located.start }
-    : nthMatchIn(labelFree, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1);
+    : nthMatchIn(labelSearch, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1);
 
   // If the raw search yields nothing (normalization wiped a match, or
   // the match text spans an inline marker token like "\p " that has no
@@ -1456,8 +1458,12 @@ function smartReplaceVerseImpl(
   // used, as it was before, rather than the flat rebuild, which drops every
   // line break and alignment.
   let movedMarker: SmartReplaceResult | null = null;
+  // A range over a header label's text gets the same guard, so no path drops
+  // the label unchecked (a user regex like `.` can still match the search
+  // copy's LABEL_FILL when the occurrence count runs).
+  const guarded = acrossSeam || rangeTouchesLabel(leaves, rawStart, rawEnd);
   const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null => {
-    if (!r || !acrossSeam) return r;
+    if (!r || !guarded) return r;
     if (isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) return r;
     // Copied: the paths below go on editing `cloned`, which it may share nodes with.
     if (!movedMarker && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, false)) {
@@ -1726,21 +1732,35 @@ function locatePlainRangeInRaw(plain: string, raw: string, start: number, len: n
 }
 
 // `raw` (walkLeaves over the same tree) with the text of each header-label
-// leaf (`\sp`, `\sr`, `\r`, `\cl`: isHeaderLabelNode) replaced by spaces of the
-// same length, so raw offsets still hold. The plain and editable texts skip
-// that text, so a lockstep walk or an occurrence count over it must too.
-function blankHeaderLabels(raw: string, leaves: Leaf[]): string {
+// leaf (`\sp`, `\sr`, `\r`, `\cl`: isHeaderLabelNode) replaced by `fill`, one
+// per UTF-16 unit, so raw offsets still hold. The plain and editable texts
+// skip that text, so the walk and the searches over raw must too.
+//   - The lockstep plain-to-raw walk takes spaces: it collapses whitespace
+//     runs, so the label reads as part of the gap it sits in, as in plain text.
+//   - A regex search takes LABEL_FILL, which is neither whitespace nor a word
+//     character: with spaces, a `\s+` (or a relaxed `said\s+the`) ran through
+//     the label, so the occurrence count merged it into a whitespace run and
+//     the replace dropped the label (review of #1311).
+const LABEL_FILL = "￿";
+function blankHeaderLabels(raw: string, leaves: Leaf[], fill: string): string {
   let out = raw;
   for (const l of leaves) {
-    if (isHeaderLabelNode(l.node) && l.end > l.start) out = out.slice(0, l.start) + " ".repeat(l.end - l.start) + out.slice(l.end);
+    if (isHeaderLabelNode(l.node) && l.end > l.start) out = out.slice(0, l.start) + fill.repeat(l.end - l.start) + out.slice(l.end);
   }
   return out;
 }
 
-// A located range whose leading or trailing whitespace runs over a blanked
-// header label (`said ` -> `` before `\sp The man speaking`): a match's edge
-// whitespace maps across the blanked text, so the range would cover the label
-// and the replace would drop it. Pull that edge back to the label. A label with
+// Is any header label's text inside or across raw [start, end)?
+function rangeTouchesLabel(leaves: Leaf[], start: number, end: number): boolean {
+  return leaves.some((l) => isHeaderLabelNode(l.node) && l.end > l.start && l.start < end && l.end > start);
+}
+
+// A located range whose edge whitespace runs over a blanked header label
+// (`said ` -> `` before `\sp The man speaking`): the walk maps that whitespace
+// across the blanked text, so the range would cover the label and the replace
+// would drop it. Pull the edge back to the label: the start past it when the
+// match's text follows the label, otherwise the end to it (a whitespace-only
+// match keeps the whitespace before the label, as main replaced). A label with
 // matched text on both sides (`said the` around it) stays inside (#1311).
 function keepLabelsOutOfEdges(
   range: { start: number; end: number } | null,
@@ -1750,9 +1770,12 @@ function keepLabelsOutOfEdges(
   if (!range) return range;
   let { start, end } = range;
   for (const l of leaves) {
-    if (!isHeaderLabelNode(l.node) || l.end <= l.start || l.start < start || l.end > end) continue;
-    if (!/\S/.test(labelFree.slice(start, l.start))) start = l.end;
-    else if (!/\S/.test(labelFree.slice(l.end, end))) end = l.start;
+    if (!isHeaderLabelNode(l.node) || l.end <= l.start || l.end <= start || l.start >= end) continue;
+    const textBefore = /\S/.test(labelFree.slice(start, Math.max(start, l.start)));
+    const textAfter = /\S/.test(labelFree.slice(Math.min(end, l.end), end));
+    if (textBefore && textAfter) continue;
+    if (textAfter) start = l.end;
+    else end = Math.max(start, l.start);
   }
   return { start, end: Math.max(start, end) };
 }
@@ -3277,8 +3300,9 @@ function localizedRewriteVerse(
   const cloned = cloneVerseObjects(verseObjects);
   const rawTotal = rebuildRaw(cloned);
   // Header-label text blanked, so the occurrence search below skips it as the
-  // plain and editable texts do (see blankHeaderLabels, #1311).
-  const labelFree = blankHeaderLabels(rawTotal, walkLeaves(cloned).leaves);
+  // plain and editable texts do, and no whitespace run reaches through it
+  // (see blankHeaderLabels, #1311).
+  const labelSearch = blankHeaderLabels(rawTotal, walkLeaves(cloned).leaves, LABEL_FILL);
 
   // Map plain-text positions to raw-text positions. For oldLen > 0 we find
   // the Nth occurrence of the matchText in raw, treating each literal space
@@ -3314,7 +3338,7 @@ function localizedRewriteVerse(
     const rawRegex = new RegExp(escaped.replace(/ /g, "\\s+"), "g");
     let m: RegExpExecArray | null;
     let count = 0;
-    while ((m = rawRegex.exec(labelFree)) !== null) {
+    while ((m = rawRegex.exec(labelSearch)) !== null) {
       count++;
       if (count === occurrence) {
         rawStart = m.index;
