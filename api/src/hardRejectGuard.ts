@@ -151,8 +151,10 @@ export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow
         out.push({
           ref,
           rowId,
+          // Blank space is judged on the link as written: "' " is a quote
+          // plus a space, not blank.
           reason:
-            unquoted.trim() === ""
+            link.trim() === ""
               ? `TWLink '${link}' is only blank space, so open the row and clear it or pick the article from the list`
               : `TWLink '${link}' is not a full rc:// link such as rc://*/tw/dict/bible/kt/god, ` +
                 `so open the row and pick the article from the list`,
@@ -161,15 +163,27 @@ export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow
       // Door43's _flag_straight_quotes tests the whole raw data line, so a
       // straight quote in any column fails the run. Checking every cell of the
       // tab-split line covers exactly that line.
-      const quoteCols = cells.flatMap((cell, i) => (STRAIGHT_QUOTE_RE.test(cell) ? [header[i] ?? `column ${i + 1}`] : []));
-      if (quoteCols.length > 0) {
+      // A curly quote is the fix in OrigWords or Tags, but not in TWLink: no
+      // article slug contains a quote, so there the fix is the article itself.
+      const quoteIdxs = cells.flatMap((cell, i) => (STRAIGHT_QUOTE_RE.test(cell) ? [i] : []));
+      if (quoteIdxs.length > 0) {
         const quotes = ["'", '"'].filter((q) => line.includes(q)).join(" and ");
+        const colName = (i: number) => header[i] ?? `column ${i + 1}`;
+        const textCols = quoteIdxs.filter((i) => i !== linkIdx).map(colName);
+        const inLink = quoteIdxs.includes(linkIdx);
+        const fix =
+          textCols.length === 0
+            ? "remove it from TWLink or pick the article from the list"
+            : !inLink
+              ? "use a curly quote (’ “ ”) or remove it"
+              : `use a curly quote (’ “ ”) or remove it in ${textCols.join(" and ")}, ` +
+                `and remove it from TWLink or pick the article from the list`;
         out.push({
           ref,
           rowId,
           reason:
-            `straight quote (${quotes}) in ${quoteCols.join(" and ")}: Door43 accepts only curly quotes, ` +
-            `so open the row and use a curly quote (’ “ ”) or remove it`,
+            `straight quote (${quotes}) in ${quoteIdxs.map(colName).join(" and ")}: Door43 accepts only curly quotes, ` +
+            `so open the row and ${fix}`,
         });
       }
       continue;
@@ -231,14 +245,22 @@ export function buildHardRejectAlertMessage(
   rejects: HardRejectRow[],
 ): string {
   const label = `${book} ${resource.toUpperCase()}`;
-  const shown = rejects
-    .slice(0, 6)
-    .map((r) => `${r.ref} (${r.rowId}): ${r.reason}`)
-    .join("; ");
-  const more = rejects.length > 6 ? `; +${rejects.length - 6} more` : "";
   // hardRejectRows can report several problems for one row (Occurrence,
-  // TWLink shape, straight quotes), so count rows by ID rather than entries.
-  const rowCount = new Set(rejects.map((r) => r.rowId)).size;
+  // TWLink shape, straight quotes), so group by row ID: one line per row with
+  // its reasons joined, and the sample cap and "+N more" count rows.
+  const byRow = new Map<string, { ref: string; reasons: string[] }>();
+  for (const r of rejects) {
+    const row = byRow.get(r.rowId);
+    if (row) row.reasons.push(r.reason);
+    else byRow.set(r.rowId, { ref: r.ref, reasons: [r.reason] });
+  }
+  const rows = [...byRow.entries()];
+  const shown = rows
+    .slice(0, 6)
+    .map(([rowId, r]) => `${r.ref} (${rowId}): ${r.reasons.join(" and also ")}`)
+    .join("; ");
+  const more = rows.length > 6 ? `; +${rows.length - 6} more` : "";
+  const rowCount = rows.length;
   return (
     `Benjamin — nightly export HELD ${label}: ${rowCount} row(s) would fail DCS ` +
     `validation as a hard error, so the -be- PR's check would go red and the merge bot would never merge it. ` +

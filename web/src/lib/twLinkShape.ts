@@ -38,5 +38,5 @@ export function twLinkCharacterProblem(link: string | null | undefined): string 
   const faults: string[] = [];
   if (quotes.length > 0) faults.push(`a straight quote (${quotes.join(" and ")})`);
   if (TSV_REWRITTEN_RE.test(link)) faults.push("a line break or tab");
-  return `A translationWords link cannot contain ${faults.join(" or ")}. Remove it${quotes.length > 0 ? ", or use a curly quote (’ “ ”) instead" : ""}.`;
+  return `A translationWords link cannot contain ${faults.join(" or ")}. Remove it, or pick the article from the list.`;
 }
