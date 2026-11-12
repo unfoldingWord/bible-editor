@@ -5,6 +5,8 @@ import {
   alignmentDraftRow,
   alignmentPanelRowKey,
   alignmentDraftKeyForOp,
+  alignerUnsavedNote,
+  ALIGNER_UNSAVED_MESSAGE,
   hasUnsavedVerseTextOp,
   isAlignerPanelSaveOp,
   isAlignmentSaveOp,
@@ -285,4 +287,91 @@ assert.equal(alignmentPanelRowKey(null), "none");
   assert.equal(hasUnsavedVerseTextOp([rangeOp], { ...at, verse: 10 }), false, "a verse past the range does not");
 }
 
-console.log("alignmentDraftSaveState: 43 passed, plus #1248 cases");
+// #1254: typed text in the rows/columns editor lives only in the drafts store
+// until Save, so the aligner (which shows the cached verse) needs its own note.
+{
+  const at = { book: "ZEC", chapter: 1, verse: 3, bibleVersion: "ULT", rowVerse: 3, rowVerseEnd: null };
+  const draft = (overrides = {}) => ({
+    key: "verse:ZEC:1:3:ULT",
+    payload: { plainText: "typed" },
+    expectedVersion: 2,
+    updatedAt: 10,
+    generation: "g-typed",
+    meta: { kind: "verse", book: "ZEC", chapter: 1, verse: 3, bibleVersion: "ULT" },
+    ...overrides,
+  });
+  const meta = (m) => ({ meta: { ...draft().meta, ...m } });
+  const textOp = (overrides = {}) =>
+    op({
+      target: { kind: "verse", book: "ZEC", chapter: 1, verse: 3, bibleVersion: "ULT" },
+      patch: { content: {}, alignment_intent: "text_edit" },
+      ...overrides,
+    });
+
+  assert.equal(alignerUnsavedNote([], [], at), "none", "nothing unsaved: no note");
+  assert.equal(alignerUnsavedNote([], [draft()], at), "draft", "typed, not saved: the draft note");
+  assert.equal(alignerUnsavedNote([textOp()], [], at), "outbox", "queued edit only: the #1250 note");
+  // Save clicked: the draft stays until the 200, and the op that captured it
+  // put the typed text in the local copy the aligner shows.
+  for (const status of ["pending", "in_flight", "conflict", "failed"]) {
+    assert.equal(
+      alignerUnsavedNote([textOp({ status, draftGeneration: "g-typed" })], [draft()], at),
+      "outbox",
+      `a ${status} save that captured the draft is the outbox note alone`,
+    );
+  }
+  assert.equal(
+    alignerUnsavedNote([textOp({ draftGeneration: "g-older" })], [draft()], at),
+    "both",
+    "typed again after Save: one combined note",
+  );
+  assert.equal(
+    alignerUnsavedNote([textOp({ draftGeneration: "legacy:10" })], [draft({ generation: undefined })], at),
+    "outbox",
+    "a draft without a generation matches by its legacy identity",
+  );
+  assert.equal(
+    alignerUnsavedNote([op({ alignmentDraftGeneration: "a1" })], [draft()], at),
+    "draft",
+    "the aligner's own save neither warns nor covers the typed text",
+  );
+
+  assert.equal(alignerUnsavedNote([], [draft(meta({ bibleVersion: "UST" }))], at), "none", "other version: no note");
+  assert.equal(alignerUnsavedNote([], [draft(meta({ chapter: 2 }))], at), "none", "other chapter: no note");
+  assert.equal(alignerUnsavedNote([], [draft(meta({ book: "MAL" }))], at), "none", "other book: no note");
+  assert.equal(alignerUnsavedNote([], [draft(meta({ verse: 4 }))], at), "none", "other verse: no note");
+  assert.equal(
+    alignerUnsavedNote(
+      [],
+      [{ ...draft(), meta: { kind: "row", rowKind: "tn", id: "ab12", book: "ZEC", chapter: 1, verse: 3 } }],
+      at,
+    ),
+    "none",
+    "a note draft on the verse is not verse text",
+  );
+
+  // Range row: UST 6-9 opened at verse 7. Editors key the draft by the row's
+  // first verse.
+  const range = { book: "ZEC", chapter: 1, verse: 7, bibleVersion: "UST", rowVerse: 6, rowVerseEnd: 9 };
+  const ust = (verse) => draft(meta({ verse, bibleVersion: "UST" }));
+  assert.equal(alignerUnsavedNote([], [ust(6)], range), "draft", "draft on the row start warns at verse 7");
+  assert.equal(alignerUnsavedNote([], [ust(7)], range), "draft", "draft on the opened verse warns");
+  assert.equal(alignerUnsavedNote([], [ust(9)], range), "draft", "draft on the row end warns");
+  assert.equal(alignerUnsavedNote([], [ust(5)], range), "none", "draft before the row: no note");
+  assert.equal(alignerUnsavedNote([], [ust(10)], range), "none", "draft after the row: no note");
+  assert.equal(
+    alignerUnsavedNote([], [ust(6)], { ...range, rowVerse: null, rowVerseEnd: null }),
+    "none",
+    "no row loaded: only the opened verse counts",
+  );
+
+  assert.equal(ALIGNER_UNSAVED_MESSAGE.none, null);
+  assert.equal(
+    ALIGNER_UNSAVED_MESSAGE.draft,
+    "This verse has typed text that isn't saved; this screen shows the saved wording.",
+  );
+  assert.equal(ALIGNER_UNSAVED_MESSAGE.outbox, "This verse has an edit that hasn't saved yet.");
+  assert.equal(typeof ALIGNER_UNSAVED_MESSAGE.both, "string");
+}
+
+console.log("alignmentDraftSaveState: 43 passed, plus #1248 and #1254 cases");

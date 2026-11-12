@@ -69,12 +69,15 @@ import {
   noteRefusalKeptInPanel,
   onAlignerSaveRefused,
 } from "../sync/alignmentDrafts";
-import { onOutboxResult, outbox } from "../sync/outbox";
+import { onOutboxResult, outbox, type OutboxOp } from "../sync/outbox";
+import { drafts, type DraftRecord } from "../sync/drafts";
 import {
+  ALIGNER_UNSAVED_MESSAGE,
+  alignerUnsavedNote,
   alignmentDraftFitsRow,
   alignmentDraftKeyForOp,
   alignmentDraftRow,
-  hasUnsavedVerseTextOp,
+  type AlignerUnsavedNote,
   isAlignerPanelSaveOp,
   refusedDraftMayRehydrate,
   refusedOpOrder,
@@ -434,19 +437,35 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     }, []);
     // #1248: warn (not block) while a text change to this verse is still in
     // the outbox. The panel shows the local copy, so a save stuck on auth
-    // otherwise looks saved here. Subscribed, so it clears when the op drains.
-    const [unsavedTextEdit, setUnsavedTextEdit] = useState(false);
+    // otherwise looks saved here. #1254: also while text typed in the
+    // rows/columns editor sits unsaved in the drafts store; the panel shows
+    // the saved wording without it. Both stores are subscribed, so the note
+    // follows a save, a discard or new typing while the panel is open.
+    const [unsavedNote, setUnsavedNote] = useState<AlignerUnsavedNote>("none");
+    const rowVerse = verse?.verse ?? null;
+    const rowVerseEnd = verse?.verse_end ?? null;
     useEffect(() => {
       let live = true;
-      const at = { book, chapter, verse: verseNum, bibleVersion };
-      const unsubscribe = outbox.subscribe((ops) => {
-        if (live) setUnsavedTextEdit(hasUnsavedVerseTextOp(ops, at));
+      const at = { book, chapter, verse: verseNum, bibleVersion, rowVerse, rowVerseEnd };
+      let ops: OutboxOp[] = [];
+      let draftList: DraftRecord[] = [];
+      const update = () => {
+        if (live) setUnsavedNote(alignerUnsavedNote(ops, draftList, at));
+      };
+      const unsubscribeOutbox = outbox.subscribe((next) => {
+        ops = next;
+        update();
+      });
+      const unsubscribeDrafts = drafts.subscribe((next) => {
+        draftList = next;
+        update();
       });
       return () => {
         live = false;
-        unsubscribe();
+        unsubscribeOutbox();
+        unsubscribeDrafts();
       };
-    }, [book, chapter, verseNum, bibleVersion]);
+    }, [book, chapter, verseNum, bibleVersion, rowVerse, rowVerseEnd]);
     const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
     const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
@@ -1188,9 +1207,13 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         // refuse; this keeps the drag ghost from appearing at all).
         onDragStartCapture={locked ? (e) => e.preventDefault() : undefined}
       >
-        {unsavedTextEdit && (
-          <Alert severity="warning" sx={{ borderRadius: 0, py: 0, flexShrink: 0 }}>
-            This verse has an edit that hasn't saved yet.
+        {unsavedNote !== "none" && (
+          <Alert
+            severity="warning"
+            sx={{ borderRadius: 0, py: 0, flexShrink: 0 }}
+            data-testid="aligner-unsaved-note"
+          >
+            {ALIGNER_UNSAVED_MESSAGE[unsavedNote]}
           </Alert>
         )}
         {!state && (
