@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { bracketProblems, buildHardRejectAlertMessage, hardRejectRows } from "./hardRejectGuard.ts";
-import { buildTwlTsv } from "./export.ts";
+import { buildTnTsv, buildTqTsv, buildTwlTsv } from "./export.ts";
 
 let passed = 0;
 function t(name, fn) {
@@ -196,6 +196,84 @@ t("a blank Note alone does NOT hold the book", () => {
   // The regression this PR exists to fix: blank Note is a warning, so an
   // otherwise-valid row with an empty Note must render and ship.
   assert.deepEqual(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "q", "1", ""])), []);
+});
+
+console.log("\n[hardRejectRows — tn/tq straight quotes (validate_tn_files.py check 15, validate_tq_files.py check 13, errors; #1336)]");
+// Same whole-raw-line check as twl (header exempt, no severity kwarg, on by
+// default). Note / Question / Response are curled by the render
+// (educateQuotes) and Tags is blanked (exportTags), so only Reference, ID,
+// SupportReference and Quote can carry one into the bytes.
+const TQ_H = ["Reference", "ID", "Tags", "Quote", "Occurrence", "Question", "Response"].join("\t");
+const tqTsv = (...rows) => `${TQ_H}\n${rows.map((r) => r.join("\t")).join("\n")}\n`;
+const tnRow = (id, over) => ({ ref_raw: "1:1", chapter: 1, verse: 1, id, tags: null, support_reference: "rc://*/ta/man/translate/figs-metaphor", quote: "אֵת", occurrence: 1, note: "a note", ...over });
+const tqRow = (id, over) => ({ ref_raw: "1:1", chapter: 1, verse: 1, id, tags: null, quote: "", occurrence: null, question: "Who?", response: "God.", ...over });
+t("a straight ' in a tn Quote holds the book, names the row and the column", () => {
+  const rows = hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "it's", "1", "a note"]));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].ref, "1:1");
+  assert.equal(rows[0].rowId, "abcd");
+  assert.match(rows[0].reason, /straight quote \('\) in Quote: Door43 accepts only curly quotes/);
+  assert.match(rows[0].reason, /use a curly quote \(’ “ ”\) or remove it/);
+});
+t("a straight quote in tn SupportReference, Reference or ID holds the book and names the column", () => {
+  assert.match(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", 'rc://*/ta/man/"x"', "q", "1", "n"]))[0].reason, /straight quote \("\) in SupportReference/);
+  assert.match(hardRejectRows("tn", tnTsv(["1:1'", "abcd", "", "", "q", "1", "n"]))[0].reason, /in Reference/);
+  assert.match(hardRejectRows("tn", tnTsv(["1:1", "ab'd", "", "", "q", "1", "n"]))[0].reason, /in ID/);
+});
+t("a tn row with a bad Occurrence AND a straight quote gets both entries", () => {
+  const rows = hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "it's", "x", "n"]));
+  assert.equal(rows.length, 2);
+  assert.match(rows[0].reason, /Occurrence 'x'/);
+  assert.match(rows[1].reason, /straight quote/);
+});
+t("curly quotes in a tn row do not hold the book; the header is exempt", () => {
+  assert.deepEqual(hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "it’s", "1", "“n”"])), []);
+  assert.deepEqual(hardRejectRows("tn", `${TN_H}\tX"Y\n1:1\tabcd\t\t\tq\t1\tn\n`), []);
+});
+t("a straight quote in a tq Quote or Question cell holds the book (tq now judged)", () => {
+  const rows = hardRejectRows("tq", tqTsv(["1:1", "abcd", "", "it's", "1", "Who?", "God."]));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].rowId, "abcd");
+  assert.match(rows[0].reason, /straight quote \('\) in Quote/);
+  assert.match(hardRejectRows("tq", tqTsv(["1:1", "abcd", "", "", "", 'Who "is"?', "God."]))[0].reason, /in Question/);
+});
+t("tq has no Occurrence rule: a blank or odd Occurrence alone does not hold", () => {
+  assert.deepEqual(hardRejectRows("tq", tqTsv(["1:1", "abcd", "", "q", "", "Who?", "God."])), []);
+  assert.deepEqual(hardRejectRows("tq", tqTsv(["1:1", "abcd", "", "", "", "Who?", "God."])), []);
+  assert.deepEqual(hardRejectRows("tq", `${TQ_H}\n`), []);
+});
+t("the real tn render (buildTnTsv): a quote in quote / support_reference / ref_raw / id holds; note and tags do not", () => {
+  const tsv = buildTnTsv([
+    tnRow("aaaa", { quote: "אֵ'ת" }),
+    tnRow("bbbb", { support_reference: 'rc://*/ta/man/translate/"x"' }),
+    tnRow("cccc", { ref_raw: "1:1'" }),
+    tnRow("dd'd", {}),
+    tnRow("eeee", { note: `He said "go" and it's done` }),
+    tnRow("ffff", { tags: 'x"y' }),
+    tnRow("gggg", {}),
+  ]);
+  assert.deepEqual(hardRejectRows("tn", tsv).map((r) => r.rowId).sort(), ["aaaa", "bbbb", "cccc", "dd'd"]);
+});
+t("the real tq render (buildTqTsv): a quote in quote / ref_raw holds; question, response and tags do not", () => {
+  const tsv = buildTqTsv([
+    tqRow("aaaa", { quote: "אֵ'ת", occurrence: 1 }),
+    tqRow("bbbb", { ref_raw: '1:1"' }),
+    tqRow("cccc", { question: `What did he say "go" for?` }),
+    tqRow("dddd", { response: "He's the one." }),
+    tqRow("eeee", { tags: "x'y" }),
+    tqRow("ffff", {}),
+  ]);
+  assert.deepEqual(hardRejectRows("tq", tsv).map((r) => r.rowId).sort(), ["aaaa", "bbbb"]);
+});
+t("the banner names a tn / tq straight-quote row and its column", () => {
+  assert.match(
+    buildHardRejectAlertMessage("JER", "tn", hardRejectRows("tn", tnTsv(["17:4", "ny7v", "", "", "it's", "1", "n"]))),
+    /JER TN.*17:4 \(ny7v\): straight quote \('\) in Quote/,
+  );
+  assert.match(
+    buildHardRejectAlertMessage("JER", "tq", hardRejectRows("tq", tqTsv(["17:4", "ny7v", "", "it's", "1", "Q?", "R."]))),
+    /JER TQ.*17:4 \(ny7v\): straight quote \('\) in Quote/,
+  );
 });
 
 console.log("\n[robustness — must never throw or over-hold]");

@@ -782,6 +782,27 @@ t("blank TWLink is only 'Empty TWLink', never also 'Malformed TWLink'", () => {
     assert.equal(i.filter((x) => x.check === "Empty TWLink").length, 1);
   }
 });
+// Issue #1336: Door43's _flag_straight_quotes is an error on any TWL row with a
+// straight ' or ", and the export writes OrigWords as stored (no curling), so
+// one in OrigWords holds the book's whole TWL export.
+t("twl OrigWords with a straight quote is flagged with the curly-quote fix", () => {
+  for (const words of ["אֵ'ת", 'say "this"']) {
+    const i = lintTwlRows([twl({ chapter: 3, verse: 5, id: "xf8f", orig_words: words })]);
+    const bad = i.filter((x) => x.check === "Straight quote in OrigWords");
+    assert.equal(bad.length, 1, words);
+    assert.equal(bad[0].bucket, "flag");
+    assert.equal(bad[0].ref, "3:5");
+    assert.equal(bad[0].rowId, "xf8f");
+    assert.match(bad[0].message, /use a curly quote \(’ “ ”\) or remove it/);
+  }
+  const msg = lintTwlRows([twl({ orig_words: "it's" })]).find((x) => x.check === "Straight quote in OrigWords").message;
+  assert.match(msg, /straight quote \('\)/);
+});
+t("twl OrigWords with curly quotes, or none, is not flagged for quotes", () => {
+  for (const words of ["it’s", "“this”", "אֵת", "", null]) {
+    assert.equal(lintTwlRows([twl({ orig_words: words })]).filter((x) => x.check === "Straight quote in OrigWords").length, 0, JSON.stringify(words));
+  }
+});
 
 // Chapter-opening paragraph marker (#378). Built from real usfm-js output so the
 // tests exercise the actual node placement: a `\p` before `\v 1` lands on the
