@@ -43,7 +43,7 @@ const cleared = { quote: "", note: "Some note.", support_reference: SR };
   check(patch.note === "Older note.", "a note-only restore sends the note");
   check(
     !("occurrence" in patch),
-    "a note-only restore sends no occurrence, so it cannot undo an occurrence-only repair",
+    "a note-only restore sends no occurrence, so it cannot undo a quote-builder re-anchor",
   );
 }
 
