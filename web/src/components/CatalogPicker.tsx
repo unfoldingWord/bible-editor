@@ -58,6 +58,9 @@ export function CatalogPicker({
   // clear so the dropdown stays mounted and the input keeps focus,
   // ready for the user to type a replacement.
   const justClearedRef = useRef(false);
+  // Set when validate refuses a value, so the close MUI fires right after a
+  // refused option pick (reason "selectOption") is skipped.
+  const justRefusedRef = useRef(false);
 
   if (!open) {
     return (
@@ -109,15 +112,19 @@ export function CatalogPicker({
           {display ? display(opt) : opt}
         </li>
       )}
-      onInputChange={() => {
-        if (invalid) setInvalid(null);
+      onInputChange={(_e, _text, reason) => {
+        // "reset" is MUI rewriting the input itself (e.g. to a picked option's
+        // label), not the editor typing, so it does not clear the message.
+        if (invalid && reason !== "reset") setInvalid(null);
       }}
       onChange={(_e, next, reason) => {
         const val = typeof next === "string" ? next : null;
+        justRefusedRef.current = false;
         if (validate && val !== null) {
           const problem = validate(val);
           if (problem) {
             setInvalid(problem);
+            justRefusedRef.current = true;
             return;
           }
         }
@@ -139,6 +146,12 @@ export function CatalogPicker({
       }}
       onClose={(_e, reason) => {
         if (justClearedRef.current) return;
+        // Picking a listed option MUI then closes with "selectOption"; when
+        // validate refused that option, stay open so its message is seen.
+        if (reason === "selectOption" && justRefusedRef.current) {
+          justRefusedRef.current = false;
+          return;
+        }
         if (reason === "blur" || reason === "escape" || reason === "selectOption") {
           setOpen(false);
         }
