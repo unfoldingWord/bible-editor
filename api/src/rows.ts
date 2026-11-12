@@ -293,9 +293,10 @@ rows.post("/:kind", requireEditor, async (c) => {
     );
   }
 
-  // A non-blank tw_link Door43 would reject blocks the book's whole TWL export
-  // (see twLinkShape.ts, issue #1316). Blank stays allowed: the "+" stub row is
+  // A tw_link Door43 would reject blocks the book's whole TWL export (see
+  // twLinkShape.ts, issue #1316). null and "" stay allowed: the "+" stub row is
   // created with tw_link "" and lint flags it until it is filled in.
+  // Whitespace-only is refused, since Door43 hard-fails it.
   if (isMalformedTwLink(data.tw_link as string | null | undefined)) {
     return c.json(
       { error: "invalid_body", message: `TWLink "${data.tw_link}" is not a valid link. ${MALFORMED_TW_LINK_HINT}` },

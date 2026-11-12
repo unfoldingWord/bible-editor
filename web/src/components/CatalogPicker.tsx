@@ -12,9 +12,11 @@ interface Props {
   // When false, the editor can only pick a value from `options` (no free text).
   // Defaults to true so callers keep the freeSolo behaviour unless they opt out.
   freeSolo?: boolean;
-  // Checks free text that is not one of `options` before it is committed.
-  // Return a message to refuse it: the picker stays open and shows the message
-  // under the input instead of calling onChange. Omit to accept any free text.
+  // Checks every value before it is committed, typed or picked: `options` can
+  // come from a stale cached catalog (useCatalogs keeps one in localStorage),
+  // so being on the list proves nothing. Return a message to refuse it: the
+  // picker stays open and shows the message under the input instead of
+  // calling onChange. Omit to accept anything.
   validate?: (typed: string) => string | null;
   onChange: (value: string | null) => void;
 }
@@ -112,7 +114,7 @@ export function CatalogPicker({
       }}
       onChange={(_e, next, reason) => {
         const val = typeof next === "string" ? next : null;
-        if (validate && val !== null && !options.includes(val)) {
+        if (validate && val !== null) {
           const problem = validate(val);
           if (problem) {
             setInvalid(problem);

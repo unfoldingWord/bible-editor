@@ -851,7 +851,10 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
     if (isBlankRequired(r.orig_words)) {
       issues.push({ check: "Empty OrigWords", bucket: "flag", ref, rowId: r.id, message: "Empty OrigWords — DCS only warns, so this row publishes blank on the next export. Add the original-language word(s) or delete the row." });
     }
-    if (isBlankRequired(r.tw_link)) {
+    // Issue #1316: only null and exactly "" are blank here, matching Door43's
+    // `if not twlink`. Whitespace-only fails TWLINK_RE there (a hard error), so
+    // it is reported as Malformed below, not as Empty.
+    if (r.tw_link == null || r.tw_link === "") {
       issues.push({ check: "Empty TWLink", bucket: "flag", ref, rowId: r.id, message: "Empty TWLink — DCS only warns, so this row publishes with no link on the next export. Add a translationWords link or delete the row." });
     } else if (isMalformedTwLink(r.tw_link)) {
       // Issue #1316: unlike a blank link, a malformed one is a HARD error in
