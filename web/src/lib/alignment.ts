@@ -1637,7 +1637,13 @@ export function serializeAlignment(state: AlignmentState): unknown[] {
   for (const item of state.stream) {
     const f = top();
     if (item.kind === "text") {
-      f.pendingText += item.text;
+      // A space outside a milestone plus a leading space inside the next one
+      // (or a trailing space inside plus one outside) arrive as two text
+      // items; joined as-is they save a doubled space (#1317). Drop one.
+      // Only a plain space meets a plain space: line breaks are untouched.
+      f.pendingText += f.pendingText.endsWith(" ") && item.text.startsWith(" ")
+        ? item.text.slice(1)
+        : item.text;
       continue;
     }
     if (item.kind === "marker") {
