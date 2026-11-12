@@ -69,6 +69,7 @@ import { parseNoteSegments, resolveNoteLinkHref } from "../lib/noteLinks";
 import type { NoteLinkTarget } from "../lib/noteLinks";
 import { NoteLinkPreview } from "./NoteLinkPreview";
 import { directionForText } from "../lib/direction";
+import { buildTnRestorePatch } from "../lib/tnRestorePatch";
 import {
   continueListOnEnter,
   indentLines,
@@ -1208,6 +1209,7 @@ function NoteCardInner({
       quote: string | null;
       note: string | null;
       support_reference: string | null;
+      occurrence: number | null;
     },
     fromVersion: number,
   ) => {
@@ -1232,13 +1234,9 @@ function NoteCardInner({
     }
 
     // Only patch the fields that actually differ from the saved server
-    // state so we don't trigger a needless version bump if the user picked
-    // the current version somehow. Use savedRef (not row) because row
+    // state (see buildTnRestorePatch). Use savedRef (not row) because row
     // carries optimistic mid-typing values from stashEdit().
-    const patch: Partial<TnRow> = {};
-    if (rawQuote !== (savedRef.current.quote ?? "")) patch.quote = rawQuote;
-    if (rawNote !== (savedRef.current.note ?? "")) patch.note = rawNote;
-    if (rawSr !== savedRef.current.support_reference) patch.support_reference = rawSr;
+    const patch = buildTnRestorePatch(snap, savedRef.current, row.occurrence);
     if (Object.keys(patch).length === 0) return;
     onChange(patch);
     onSave(patch, { restoredFromVersion: fromVersion });
