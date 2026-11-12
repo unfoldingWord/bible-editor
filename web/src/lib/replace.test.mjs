@@ -3736,6 +3736,24 @@ function countAllMilestones(nodes) {
   // No word of the match survives: the break stays between the untouched
   // `my` and `set` (pinned; it lands after the replacement).
   run("name this -> a b c", "name this", "a b c", "my a b c\\q1 set.", "my:H0|a:|b:|c:|set:H3");
+  // Deleting the word before the break: `this` is kept, so the break stays
+  // before it (main moved it after `this`).
+  run("name this -> this", "name this", "this", "my \\q1 this set.", "my:H0|this:H2|set:H3");
+  // Deleting the word after it: the break stays after `name`. (`name` comes
+  // back unaligned, as on main; the guard accepts that result, so no retry.)
+  run("name this -> name", "name this", "name", "my name\\q1 set.", "my:H0|name:|set:H3");
+  // The same deletion after an opening quote (ZEC 1:2 `“Yahweh\q1 was` with
+  // `Yahweh was` -> `was`, found by the differential). The narrowed retry
+  // gives `“\q1 this`, whose plain text has a space at the marker (`“ this`)
+  // that the expected `“this` lacks, so a guard reading only the plain text
+  // refused it and the verse was flattened.
+  {
+    const quoted = { verseObjects: [t("“"), zaln("H1", [w("name")]), q1(), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(".")] };
+    const qp = extractPlainText(quoted);
+    const r = findReplaceVerse(clone(quoted), qp, /name this/g, qp.indexOf("name this"), 9, "this");
+    assert(extractEditableText(r.content) === "“\\q1 this set.", `“name this -> “this: the break stays before this (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(words(r.content) === "this:H2|set:H3", `“name this -> “this: untouched words keep their alignment (got ${words(r.content)})`);
+  }
 }
 
 if (failed > 0) {
