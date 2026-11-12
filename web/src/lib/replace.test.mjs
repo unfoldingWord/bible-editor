@@ -3743,16 +3743,18 @@ function countAllMilestones(nodes) {
   // back unaligned, as on main; the guard accepts that result, so no retry.)
   run("name this -> name", "name this", "name", "my name\\q1 set.", "my:H0|name:|set:H3");
   // The same deletion after an opening quote (ZEC 1:2 `“Yahweh\q1 was` with
-  // `Yahweh was` -> `was`, found by the differential). The narrowed retry
-  // gives `“\q1 this`, whose plain text has a space at the marker (`“ this`)
-  // that the expected `“this` lacks, so a guard reading only the plain text
-  // refused it and the verse was flattened.
+  // `Yahweh was` -> `was`, found by the differential). No path keeps the
+  // break before `this` with the exact text: the narrowed retry gives
+  // `“\q1 this`, whose plain text reads `“ this`, not `“this`. The first cut
+  // of this fix then fell to the flat rebuild (every break and alignment
+  // gone); the result main saved (the break moved after `this`) is used
+  // instead. Pinned as main's result, not as the right one.
   {
     const quoted = { verseObjects: [t("“"), zaln("H1", [w("name")]), q1(), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(".")] };
     const qp = extractPlainText(quoted);
     const r = findReplaceVerse(clone(quoted), qp, /name this/g, qp.indexOf("name this"), 9, "this");
-    assert(extractEditableText(r.content) === "“\\q1 this set.", `“name this -> “this: the break stays before this (got ${JSON.stringify(extractEditableText(r.content))})`);
-    assert(words(r.content) === "this:H2|set:H3", `“name this -> “this: untouched words keep their alignment (got ${words(r.content)})`);
+    assert(extractEditableText(r.content) === "“this\\q1 set.", `“name this -> “this: not flattened, as main (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(words(r.content) === "this:|set:H3", `“name this -> “this: alignment as main (got ${words(r.content)})`);
   }
 }
 

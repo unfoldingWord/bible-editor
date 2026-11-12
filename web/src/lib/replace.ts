@@ -1450,13 +1450,24 @@ function smartReplaceVerseImpl(
     const newPlain = normalize(plainText.slice(0, matchStartInPlain) + replaceText + plainText.slice(matchStartInPlain + matchLenInPlain));
     return { content: { verseObjects: tokenizeEditableText(newPlain) }, plainText: newPlain, preservedAlignment: false };
   };
-  const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null =>
-    r && (!acrossSeam || isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText)) ? r : null;
+  // A result with the exact text and every marker, but a marker moved past a
+  // word the replace kept, is held back so the paths below and the narrowed
+  // retry get a chance to keep it in place (#1311). If none does, it is still
+  // used, as it was before, rather than the flat rebuild, which drops every
+  // line break and alignment.
+  let movedMarker: SmartReplaceResult | null = null;
+  const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null => {
+    if (!r || !acrossSeam) return r;
+    if (isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) return r;
+    if (!movedMarker && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, false)) movedMarker = r;
+    return null;
+  };
   // Every path refused a change across the seam. Retry it without the whole
   // words the match and the replacement share at one end, so a marker beside
   // such a word falls outside the change and stays put (`name this` -> `name
   // of that` becomes `this` -> `of that`, after the `\q1`; #1311). The retry
-  // must still pass the guard for the whole match; otherwise the flat rebuild.
+  // must still pass the guard for the whole match; otherwise the held-back
+  // result above, and last the flat rebuild.
   const refused = (): SmartReplaceResult => {
     for (const n of narrowedReplaces(plainMatchText, replaceText)) {
       const start = matchStartInPlain + n.trimStart;
@@ -1465,7 +1476,7 @@ function smartReplaceVerseImpl(
       const r = keep(smartReplaceVerseImpl(content, plainText, re, start, len, n.replaceText, options));
       if (r) return r;
     }
-    return flatRebuild();
+    return movedMarker ?? flatRebuild();
   };
 
   // Smart in-place path requires:
@@ -1748,6 +1759,9 @@ function isExactReplace(
   start: number,
   len: number,
   replaceText: string,
+  // Also require every line marker to keep its place (below); false checks
+  // only the text, the marker count and the labels, as before #1311.
+  checkPositions: boolean,
 ): boolean {
   const want = normalize(plainText.slice(0, start) + replaceText + plainText.slice(start + len));
   const lineMarkers = (nodes: unknown[]): number => {
@@ -1782,6 +1796,7 @@ function isExactReplace(
   ) {
     return false;
   }
+  if (!checkPositions) return true;
   // Each line marker keeps its place beside the words the replace did not
   // change. The count alone let `name this` -> `name of that` save `my name of
   // that\q1 set.`, the break moved past two words (#1311). Positions are counts
