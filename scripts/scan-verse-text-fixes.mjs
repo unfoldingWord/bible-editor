@@ -23,7 +23,8 @@
 //        BOOK_LOCKS=scripts/out/book-locks.json REPAIR_ACTOR=<users.id> \
 //          node --experimental-strip-types --no-warnings scripts/scan-verse-text-fixes.mjs <dumps…> --repair
 //      → scripts/out/repair-verse-text-fixes.sql    (apply: wrangler d1 execute bible_editor --remote --env production --file=…)
-//      → scripts/out/rollback-verse-text-fixes.sql  (undo, guarded on the repaired version and content)
+//      → scripts/out/rollback-verse-text-fixes-<time>.sql  (undo, guarded on the repaired version and content;
+//        named per run and never deleted, so it keeps the before-image)
 //
 // A verse is repaired only when the real lint (lintVerseTextQuality) shows
 // fewer straight-quote or doubled-space flags afterwards and no other check
@@ -35,7 +36,10 @@
 // is skipped; a short `changes` count means re-dump and re-run) and on the lock
 // state at apply time. REPAIR_ACTOR goes into updated_by because the nightly
 // DCS→D1 sync treats updated_by IS NULL as "master owns this row"
-// (reimportClassify.ts isReimportableRow) and would revert the fix. A locked
+// (reimportClassify.ts isReimportableRow) and would revert the fix. The
+// edit_log row carries source 'data_repair', as repair-canonize-alignment.mjs
+// does, so a Door43 change made after our export still wins the nightly
+// merge: export promptly after applying. A locked
 // book is never written: --repair refuses without the BOOK_LOCKS dump, and
 // withheld locked-book verses are printed so they can be fixed on Door43.
 
@@ -43,7 +47,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { curlifyVerseContent } from "../web/src/lib/curlyVerse.ts";
-import { lintVerseTextQuality } from "../api/src/lint.ts";
+import { lintVerseTextQuality, PROSE_EXCLUDED_TAGS } from "../api/src/lint.ts";
 import { PUBLISHED_BOOKS } from "../api/src/publishedGuard.ts";
 import { extractPlainText } from "../api/src/importParsers.ts";
 
@@ -69,6 +73,27 @@ function loadRows(path) {
 
 const rows = dumpPaths.flatMap((p) => loadRows(resolve(p)));
 
+// The SQL guards and the rollback need these columns; a narrower SELECT would
+// silently roll a verse back to NULLs. Dump with SELECT *.
+const NEEDED = ["book", "chapter", "verse", "bible_version", "content_json", "plain_text", "version", "updated_by",
+  "last_change_action", "last_change_source", "last_change_actor"];
+const missing = NEEDED.filter((c) => rows.length && !(c in rows[0]));
+if (missing.length) {
+  console.error(`dump is missing column(s) ${missing.join(", ")} — dump with SELECT * FROM verses`);
+  process.exit(1);
+}
+// Two dumps of the same book/version (an old and a fresh one) would give one
+// verse two conflicting UPDATEs.
+const seen = new Set();
+for (const r of rows) {
+  const k = `${r.book}/${r.bible_version}/${r.chapter}/${r.verse}`;
+  if (seen.has(k)) {
+    console.error(`verse ${k} appears in more than one dump — pass each book/version once`);
+    process.exit(1);
+  }
+  seen.add(k);
+}
+
 // Lock rule, mirroring effectiveBookLock: an explicit book_locks row wins,
 // otherwise a published book is locked.
 const locksArg = process.env.BOOK_LOCKS ?? "";
@@ -92,15 +117,33 @@ const isLocked = (book) => (explicitLock.has(book) ? explicitLock.get(book) : PU
 
 const TARGET_VERSIONS = new Set(["ULT", "UST", "GLT", "GST"]);
 const FIXED_CHECKS = ["Straight quote", "Doubled space"];
-// A run of 2+ spaces not at a line start (same exemption as the lint).
-const DOUBLED_SPACE_RE = /(?<![\n\u2029]) {2,}/g;
-
+// Collapse exactly the runs the lint flags. Walks the tree in the same order
+// and with the same context as flattenVerseProse (api/src/lint.ts): footnotes
+// and other excluded tags are skipped, a paragraph or quote marker starts a new
+// line, and a run is collapsed only when the character before it is visible
+// text. That leaves alone line-leading indentation and a node's leading spaces
+// after a space in the previous node (the lint folds that to one space).
 function collapseDoubledSpaces(nodes) {
-  for (const n of nodes ?? []) {
-    if (!n || typeof n !== "object") continue;
-    if (n.type === "text" && typeof n.text === "string") n.text = n.text.replace(DOUBLED_SPACE_RE, " ");
-    if (Array.isArray(n.children)) collapseDoubledSpaces(n.children);
-  }
+  let prev = ""; // last character of the prose so far
+  const walk = (list) => {
+    for (const n of list ?? []) {
+      if (!n || typeof n !== "object") continue;
+      if (PROSE_EXCLUDED_TAGS.has(n.tag)) continue;
+      if (n.type === "paragraph" || n.type === "section") prev = "\u2029";
+      else if (n.type === "quote") prev = "\n";
+      if (typeof n.text === "string" && n.text) {
+        if (n.type === "text") {
+          n.text = n.text.replace(/ {2,}/g, (run, at, s) => {
+            const before = at > 0 ? s[at - 1] : prev;
+            return before && /\S/.test(before) ? " " : run;
+          });
+        }
+        prev = n.text[n.text.length - 1];
+      }
+      if (Array.isArray(n.children)) walk(n.children);
+    }
+  };
+  walk(nodes);
 }
 
 // The tree with every text value blanked out and quote marks in word text
@@ -156,6 +199,7 @@ for (const r of rows) {
     oldContent: r.content_json,
     oldPlainText: r.plain_text,
     oldUpdatedBy: r.updated_by ?? null,
+    oldLastChange: [r.last_change_action, r.last_change_source, r.last_change_actor],
     newContent,
     newPlainText: extractPlainText(next),
   });
@@ -183,17 +227,31 @@ if (withheld.length) {
     [...byBook].map(([b, n]) => `${b} ${n}`).join(", "));
 }
 
+const actor = Number(process.env.REPAIR_ACTOR);
+if (doRepair && repairable.length > 0) {
+  if (!(Number.isInteger(actor) && actor > 0)) {
+    console.error("refusing to emit SQL: REPAIR_ACTOR must be a users.id (e.g. REPAIR_ACTOR=2) — see header");
+    process.exit(1);
+  }
+  const unversioned = repairable.filter((f) => !(Number.isInteger(f.rowVersion) && f.rowVersion >= 1));
+  if (unversioned.length) {
+    console.error(`refusing to emit SQL: ${unversioned.length} verse(s) have no usable version — the dump must include the version column.`);
+    process.exit(1);
+  }
+}
+
 const outDir = resolve(repoRoot, "scripts/out");
 const outPath = resolve(outDir, "repair-verse-text-fixes.sql");
-const rollbackPath = resolve(outDir, "rollback-verse-text-fixes.sql");
-// Remove an earlier run's SQL first, so a run that writes nothing cannot leave
+// The rollback file is named by run time and never removed, so a later run
+// cannot overwrite the before-image of verses an earlier run already repaired.
+const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+const rollbackPath = resolve(outDir, `rollback-verse-text-fixes-${stamp}.sql`);
+// Remove an earlier run's repair SQL, so a run that writes nothing cannot leave
 // a stale file holding UPDATEs this run would now withhold.
 if (doRepair) {
-  for (const p of [outPath, rollbackPath]) {
-    if (existsSync(p)) {
-      unlinkSync(p);
-      console.log(`removed stale ${p}`);
-    }
+  if (existsSync(outPath)) {
+    unlinkSync(outPath);
+    console.log(`removed stale ${outPath}`);
   }
   if (repairable.length === 0) console.log("\nNothing to repair in unlocked books — no SQL written.");
 }
@@ -204,17 +262,6 @@ if (doRepair && repairable.length > 0) {
     if (typeof v === "number") return String(v);
     return `'${String(v).replace(/'/g, "''")}'`;
   };
-  const actor = Number(process.env.REPAIR_ACTOR);
-  if (!(Number.isInteger(actor) && actor > 0)) {
-    console.error("refusing to emit SQL: REPAIR_ACTOR must be a users.id (e.g. REPAIR_ACTOR=2) — see header");
-    process.exit(1);
-  }
-  const unversioned = repairable.filter((f) => !(Number.isInteger(f.rowVersion) && f.rowVersion >= 1));
-  if (unversioned.length) {
-    console.error(`refusing to emit SQL: ${unversioned.length} verse(s) have no usable version — the dump must include the version column.`);
-    process.exit(1);
-  }
-  const now = Math.floor(Date.now() / 1000);
   const where = (f) =>
     `book = ${q(f.book)} AND chapter = ${q(f.chapter)} AND verse = ${q(f.verse)} AND bible_version = ${q(f.version)}`;
   // Apply-time lock guard (repair-canonize-alignment.mjs): an unpublished book
@@ -224,16 +271,20 @@ if (doRepair && repairable.length > 0) {
     PUBLISHED_BOOKS.has(f.book)
       ? `EXISTS (SELECT 1 FROM book_locks WHERE book = ${q(f.book)} AND locked = 0)`
       : `NOT EXISTS (SELECT 1 FROM book_locks WHERE book = ${q(f.book)} AND locked = 1)`;
-  // Same audit shape as a verse PATCH (verses.ts): action 'update', payload
-  // { content, plain_text }, written only when the UPDATE changed a row.
+  // Audit and provenance follow repair-canonize-alignment.mjs: edit_log action
+  // 'update' with source 'data_repair' and a { content, plain_text } payload
+  // (the reimport's three-way merge uses it as the ancestor), written only when
+  // the UPDATE changed a row; the row's last_change_* say a system repair did it.
   const statements = (f, from, to) => {
     const key = `${f.book}/${f.chapter}/${f.verse}/${f.version}`;
     const payload = JSON.stringify({ content: JSON.parse(to.content), plain_text: to.plainText });
+    const [action, source, who] = to.lastChange;
     return [
-      `UPDATE verses SET content_json = ${q(to.content)}, plain_text = ${q(to.plainText)}, version = version + 1, updated_at = ${now}, updated_by = ${to.updatedBy === null ? "NULL" : to.updatedBy}`,
+      `UPDATE verses SET content_json = ${q(to.content)}, plain_text = ${q(to.plainText)}, version = version + 1, updated_at = unixepoch(), updated_by = ${q(to.updatedBy)},` +
+        ` last_change_action = ${q(action)}, last_change_source = ${q(source)}, last_change_actor = ${q(who)}`,
       ` WHERE ${where(f)} AND version = ${from.version} AND content_json = ${q(from.content)} AND ${lockGuard(f)};`,
-      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)`,
-      `  SELECT 'verse', ${q(key)}, ${q(f.book)}, ${actor}, version - 1, version, 'update', ${q(payload)}`,
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)`,
+      `  SELECT 'verse', ${q(key)}, ${q(f.book)}, ${actor}, version - 1, version, 'update', ${q(payload)}, 'data_repair'`,
       `    FROM verses WHERE ${where(f)} AND changes() > 0;`,
     ];
   };
@@ -244,18 +295,26 @@ if (doRepair && repairable.length > 0) {
     `-- No BEGIN/COMMIT: remote D1 rejects explicit transactions and wraps the file atomically itself.`,
   ];
   const repair = header("Curl straight quotes and collapse doubled spaces in verse text.");
-  const rollback = header("ROLLBACK of repair-verse-text-fixes.sql: restores each verse's previous text and updated_by.");
+  const rollback = header("ROLLBACK of repair-verse-text-fixes.sql: restores each verse's previous text, updated_by and last_change_*.");
   for (const f of repairable) {
     repair.push(...statements(
       f,
       { version: f.rowVersion, content: f.oldContent },
-      { content: f.newContent, plainText: f.newPlainText, updatedBy: actor },
+      { content: f.newContent, plainText: f.newPlainText, updatedBy: actor, lastChange: ["update", "system", "scan-verse-text-fixes (#1274)"] },
     ));
     rollback.push(...statements(
       f,
       { version: f.rowVersion + 1, content: f.newContent },
-      { content: f.oldContent, plainText: f.oldPlainText, updatedBy: f.oldUpdatedBy },
+      { content: f.oldContent, plainText: f.oldPlainText, updatedBy: f.oldUpdatedBy, lastChange: f.oldLastChange },
     ));
+  }
+  // D1 rejects a statement over ~100 KB; refuse rather than half-apply.
+  const MAX_STATEMENT_BYTES = 90_000;
+  const tooBig = [repair, rollback].flatMap((ls) => ls.filter((l) => !l.startsWith("--")).join("\n").split(";\n"))
+    .filter((st) => Buffer.byteLength(st, "utf8") > MAX_STATEMENT_BYTES);
+  if (tooBig.length) {
+    console.error(`refusing to emit SQL: ${tooBig.length} statement(s) exceed ${MAX_STATEMENT_BYTES} bytes`);
+    process.exit(1);
   }
   if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
   writeFileSync(outPath, repair.join("\n") + "\n", "utf8");

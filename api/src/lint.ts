@@ -1761,7 +1761,7 @@ function lintUsfmVerseRows(
 // live in the node's `content` STRING (not children), so skipping the node
 // skips the body; they are excluded because footnotes quote source-language
 // text and references ("1:2") that would false-positive the prose checks.
-const PROSE_EXCLUDED_TAGS: ReadonlySet<string> = new Set(["f", "x", "fe", "ef", "ex", "rem"]);
+export const PROSE_EXCLUDED_TAGS: ReadonlySet<string> = new Set(["f", "x", "fe", "ef", "ex", "rem"]);
 
 // Flatten a verse's parsed nodes to the prose a reader sees: word/text node
 // text in document order, footnote/cross-ref subtrees dropped, alignment
