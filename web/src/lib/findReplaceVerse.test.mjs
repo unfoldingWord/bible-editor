@@ -298,6 +298,27 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   );
 }
 
+// #1311 (item 4): a same-text replace on a bare-marker verse (`H1[name] \q1
+// H2[this]`) that also holds a legacy straight quote elsewhere. The engine's
+// own plainText reads `namethis`, so the first no-op check missed it, the curl
+// rewrote the unrelated `'Go'`, and a save nobody asked for was queued.
+{
+  console.log("\n[#1311] same-text replace beside a bare line marker does not curl an unrelated quote");
+  const verse = {
+    verseObjects: [
+      zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), { type: "quote", tag: "q1" }, zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(". 'Go'"),
+    ],
+  };
+  const plain = extractPlainText(verse);
+  check(plain === "my name this set. 'Go'", `setup: stored plain text (got ${JSON.stringify(plain)})`);
+  const same = findReplaceVerse(verse, plain, /this/g, plain.indexOf("this"), 4, "this");
+  check(same.plainText === plain, `this -> this: no save queued (got ${JSON.stringify(same.plainText)})`);
+  check(same.content === verse, "this -> this: the verse is handed back unchanged");
+  // Replace all already skips a step with no visible change; pin it.
+  const all = replaceAllInVerse(verse, plain, /this/g, 1, "this");
+  check(all.plainText === plain && all.content === verse, `replace all this -> this: no save queued (got ${JSON.stringify(all.plainText)})`);
+}
+
 // #1285: the summary counts only verses queued for save. A verse the save's
 // alignment guard refused is reported as not replaced, never as "replaced".
 {

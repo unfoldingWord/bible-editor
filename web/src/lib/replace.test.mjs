@@ -3583,6 +3583,254 @@ function countAllMilestones(nodes) {
     "shepherd, \\q2 and", "shepherd; \\q2 and");
 }
 
+// Case 89: a typed edit across a bare line marker in a verse that also has a
+// line marker right after punctuation (`them.\q1 And`) (#1311, item 2). The
+// typed path diffs the marker-stripped text, which puts no space at
+// `them.\q1 And` (`them.And`: the two would not fuse), but the exact-text guard
+// for a change across the bare seam compared that with the tree's plain text,
+// which has a space at every marker (`them. And`). Every typed edit across the
+// seam failed the guard and fell to the flat rebuild, which dropped both line
+// breaks and unaligned the whole verse. The `\qs` wrapper keeps the reassembly
+// and relayout tiers out, so the diff tier runs (as in Case 87).
+{
+  console.log("\n[Case 89] Typed edit across a bare line marker keeps the line breaks beside punctuation (#1311)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const markers = (content) => (extractEditableText(content).match(/\\q1/g) ?? []).length;
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const selah = () => ({ tag: "qs", type: "quote", endTag: "qs*", children: [zaln("H9", [w("Selah")])] });
+  // `between`: what sits between `them.` and `And`.
+  const verse = (between) => ({ verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), { type: "quote", tag: "q1" }, zaln("H2", [w("this")]),
+    t(" "), zaln("H3", [w("them")]), ...between, zaln("H4", [w("And")]), t(" "), zaln("H5", [w("so")]), t(". "), selah()] });
+  const tight = verse([t("."), { type: "quote", tag: "q1" }]);
+  // Control: a space text node before the second marker, so both texts agree there.
+  const spaced = verse([t(". "), { type: "quote", tag: "q1" }]);
+  const old = extractEditableText(tight);
+  assert(old === "my name\\q1 this them.\\q1 And so. Selah", `setup: editable text (got ${JSON.stringify(old)})`);
+  for (const [from, to] of [["name\\q1 this", "nom\\q1 that"], ["name\\q1 this", "nam\\q1 his"]]) {
+    const r = smartEditVerse(clone(tight), old, old.replace(from, to), { capturedFromDom: true });
+    const got = extractEditableText(r.content);
+    const want = old.replace(from, to);
+    assert(got === want, `typed ${from} -> ${to}: ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
+    assert(markers(r.content) === 2, `typed ${from} -> ${to}: both line breaks survive`);
+    const oldSpaced = extractEditableText(spaced);
+    const ctl = smartEditVerse(clone(spaced), oldSpaced, oldSpaced.replace(from, to), { capturedFromDom: true });
+    assert(words(r.content) === words(ctl.content),
+      `typed ${from} -> ${to}: alignment as with a space before the second marker, ${words(ctl.content)} (got ${words(r.content)})`);
+  }
+}
+
+// Case 90: a `\sp` speaker label before the match (#1311, item 3). The plain
+// and editable texts skip the label (it lives in the header band), but the
+// engine's raw text keeps it, so the plain-to-raw mapping failed and the
+// fallback counted the match's occurrence in raw, label included. In Song of
+// Songs a find for `man` after `\sp The man speaking` edited the label's `man`
+// instead (`The woman said boy\q1 the man ran.`), and a bare-seam verse with a
+// label before the match got the #1307 wrong-word edit back.
+{
+  console.log("\n[Case 90] Find/replace and typed edits after a \\sp label edit the picked match (#1311)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const labels = (content) => JSON.stringify(content.verseObjects.filter((n) => n.tag === "sp" || n.tag === "qa").map((n) => n.text));
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const sp = () => ({ tag: "sp", text: "The man speaking\n" });
+  const q1 = () => ({ tag: "q1", type: "quote" });
+  const verse = { verseObjects: [zaln("H0", [w("The")]), t(" "), zaln("H1", [w("woman")]), t(" "), zaln("H2", [w("said")]), t("\n"), sp(), q1(),
+    zaln("H3", [w("the")]), t(" "), zaln("H4", [w("man")]), t(" "), zaln("H5", [w("ran")]), t(".")] };
+  const plain = extractPlainText(verse);
+  assert(plain === "The woman said the man ran.", `setup: plain text skips the label (got ${JSON.stringify(plain)})`);
+  const at = plain.indexOf(" man") + 1;
+  for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+    const r = fn(clone(verse), plain, /man/g, at, 3, "boy");
+    const ed = extractEditableText(r.content);
+    assert(ed === "The woman said \\q1 the boy ran.", `${entry}: man -> boy after the label edits the picked man (got ${JSON.stringify(ed)})`);
+    assert(labels(r.content) === labels(verse), `${entry}: man -> boy: the label is untouched (got ${labels(r.content)})`);
+    assert(words(r.content) === "The:H0|woman:H1|said:H2|the:H3|boy:|ran:H5", `${entry}: man -> boy: untouched words keep their alignment (got ${words(r.content)})`);
+  }
+  // The typed path reaches the same engine.
+  {
+    const old = extractEditableText(verse);
+    const r = smartEditVerse(clone(verse), old, old.replace("the man", "the boy"), { capturedFromDom: true });
+    assert(extractEditableText(r.content) === "The woman said \\q1 the boy ran.", `typed the man -> the boy (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(verse), `typed the man -> the boy: the label is untouched (got ${labels(r.content)})`);
+    // A word typed at the start of the labelled line. The typed path's
+    // marker-free text can't tell this from a word typed at the end of the line
+    // before the label; the insertion keeps main's placement (before the
+    // label), which is right for the line-end case and wrong here. Only the
+    // label is pinned.
+    const ins = smartEditVerse(clone(verse), old, old.replace("\\q1 the", "\\q1 now the"), { capturedFromDom: true });
+    assert(labels(ins.content) === labels(verse), `typed a word after the label: the label is untouched (got ${labels(ins.content)})`);
+  }
+  // Deleting the word right before the label (found by the differential:
+  // ZEC 8:10 with a label injected, `days` deleted). The deletion's trailing
+  // space mapped past the blanked label text, so the range covered the label,
+  // the guard refused every result that dropped it, and the flat rebuild lost
+  // the label, the line break and every alignment.
+  {
+    const old = extractEditableText(verse);
+    const r = smartEditVerse(clone(verse), old, old.replace("woman said", "woman"), { capturedFromDom: true });
+    assert(extractEditableText(r.content) === "The woman \\q1 the man ran.", `typed delete of the word before the label (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(verse), `typed delete before the label: the label is untouched (got ${labels(r.content)})`);
+    assert(words(r.content) === "The:H0|woman:H1|the:H3|man:H4|ran:H5", `typed delete before the label: untouched words keep their alignment (got ${words(r.content)})`);
+    const f = findReplaceVerse(clone(verse), plain, /said /g, plain.indexOf("said "), 5, "");
+    assert(labels(f.content) === labels(verse) && words(f.content) === "The:H0|woman:H1|the:H3|man:H4|ran:H5",
+      `find "said " -> "" before the label keeps it and the alignment (got ${labels(f.content)} ${words(f.content)})`);
+  }
+  // Whitespace next to the label (review of #1311). The label is blanked to
+  // spaces for the plain-to-raw walk, so the space after `said` mapped to the
+  // `\n` plus the whole label; pulling the start past the label left an empty
+  // range, and find/replace made it a silent no-op (main replaced the `\n`).
+  // Without the find/replace flag the same range dropped the label.
+  {
+    const at = plain.indexOf(" ", plain.indexOf("said"));
+    for (const re of [/ /g, /\s/g]) {
+      const r = findReplaceVerse(clone(verse), plain, re, at, 1, "_");
+      assert(extractEditableText(r.content) === "The woman said_\\q1 the man ran." && labels(r.content) === labels(verse),
+        `find ${re} after said -> _: replaced, label kept (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
+    }
+    const s = smartReplaceVerse(clone(verse), plain, / /g, at, 1, " - ");
+    assert(extractEditableText(s.content) === "The woman said - \\q1 the man ran." && labels(s.content) === labels(verse),
+      `space after said -> " - " (no find/replace flag): label kept (got ${JSON.stringify(extractEditableText(s.content))} ${labels(s.content)})`);
+  }
+  // A stale stored plain text (the lockstep walk fails, so the occurrence
+  // count in raw runs). The label was blanked to spaces there too, so a
+  // whitespace run merged with it: the space after `said` matched `\n` plus
+  // the label and dropped the label. The other spaces are counted as the
+  // plain text has them (main counted the label's own spaces).
+  {
+    const stale = "The lady said the man ran.";
+    const nth = (k) => { let at = -1; for (let i = 0; i <= k; i++) at = stale.indexOf(" ", at + 1); return at; };
+    const want = ["The_woman said \\q1 the man ran.", "The woman_said \\q1 the man ran.", "The woman said_\\q1 the man ran.",
+      "The woman said \\q1 the_man ran.", "The woman said \\q1 the man_ran."];
+    want.forEach((ed, k) => {
+      const r = findReplaceVerse(clone(verse), stale, / /g, nth(k), 1, "_");
+      assert(extractEditableText(r.content) === ed && labels(r.content) === labels(verse),
+        `stale plain text, space #${k} -> _: ${JSON.stringify(ed)}, label kept (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
+    });
+  }
+  // Edge whitespace that touches the label from either side keeps it whole.
+  for (const [find, repl, ed] of [["said ", "", "The woman \\q1 the man ran."], ["said ", "said, ", "The woman said, \\q1 the man ran."], [" the", "", "The woman said \\q1 man ran."]]) {
+    const r = findReplaceVerse(clone(verse), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
+    assert(extractEditableText(r.content) === ed && labels(r.content) === labels(verse),
+      `${JSON.stringify(find)} -> ${JSON.stringify(repl)} at the label: ${JSON.stringify(ed)}, label whole (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
+  }
+  // A match whose leading space runs over the label, followed by a line marker
+  // carrying its own opener (ISA 13:2 UST with a label injected, found by the
+  // label differential: ` {to` -> ``). The start moved past the label, so the
+  // raw range lost the match's leading space, which read as a bare seam: the
+  // guard refused the result and the verse was flattened, label and all. Main
+  // dropped only the `\q2` (whose `{` the replace removed). Now as main.
+  {
+    const isaLike = { verseObjects: [zaln("H0", [w("bare")]), t(" "), zaln("H1", [w("hill")]), t("\n"), sp(), { tag: "q2", type: "quote", text: "{" },
+      zaln("H2", [w("to"), t(" "), w("signal")]), t("}!\n"), q1(), zaln("H3", [w("Shout")]), t(".")] };
+    const p = extractPlainText(isaLike);
+    const at = p.indexOf(" {to");
+    const r = findReplaceVerse(clone(isaLike), p, / \{to/g, at, 4, "");
+    assert(extractPlainText(r.content) === "bare hill signal}! Shout.", `" {to" -> "" after the label: text (got ${JSON.stringify(extractPlainText(r.content))})`);
+    assert(labels(r.content) === labels(isaLike), `" {to" -> "" after the label: label kept (got ${labels(r.content)})`);
+    assert(/\\q1/.test(extractEditableText(r.content)) && words(r.content).startsWith("bare:H0|hill:H1|"),
+      `" {to" -> "" after the label: the other line break and alignment kept (got ${JSON.stringify(extractEditableText(r.content))} ${words(r.content)})`);
+  }
+  // A match just before the label leaves it alone too.
+  {
+    const r = findReplaceVerse(clone(verse), plain, /said/g, plain.indexOf("said"), 4, "spoke");
+    assert(extractEditableText(r.content) === "The woman spoke \\q1 the man ran.", `said -> spoke before the label (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(verse), `said -> spoke: the label is untouched (got ${labels(r.content)})`);
+  }
+  // A match that spans the label (and the line break after it) keeps both and
+  // every untouched word; main found no such text in raw and flattened the verse.
+  {
+    const r = findReplaceVerse(clone(verse), plain, /said the/g, plain.indexOf("said the"), 8, "said a");
+    assert(extractEditableText(r.content) === "The woman said \\q1 a man ran.", `said the -> said a across the label (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(verse), `said the -> said a: the label is untouched (got ${labels(r.content)})`);
+    assert(words(r.content) === "The:H0|woman:H1|said:H2|a:|man:H4|ran:H5", `said the -> said a: untouched words keep their alignment (got ${words(r.content)})`);
+  }
+  // A bare-seam verse (Case 87's shape) with a label before the match.
+  {
+    const bare = { verseObjects: [sp(), zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), q1(), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(".")] };
+    const p = extractPlainText(bare);
+    assert(p === "my name this set.", `setup: bare seam after a label (got ${JSON.stringify(p)})`);
+    const r = findReplaceVerse(clone(bare), p, /et/g, p.indexOf("et"), 2, "at");
+    assert(extractEditableText(r.content) === "my name\\q1 this sat.", `et -> at after a label and a bare seam (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(bare), `et -> at: the label is untouched (got ${labels(r.content)})`);
+    assert(words(r.content) === "my:H0|name:H1|this:H2|sat:", `et -> at: untouched words keep their alignment (got ${words(r.content)})`);
+  }
+  // `\qa` (the LAM acrostic heading, stored as usfm-js parses it): the plain
+  // text keeps its label, so find/replace maps through it. In the samples and
+  // in D1 it always ends the verse before the one it heads, so no match comes
+  // after it. A typed save moves the label to `content` first (liftMarkerText,
+  // #708), so the typed path never sees it in raw. Pinned, not changed.
+  {
+    const qa = { verseObjects: [zaln("H0", [w("the")]), t(" "), zaln("H1", [w("man")]), t(" "), zaln("H2", [w("ran")]), t(".\n"), { tag: "qa", type: "quote", text: "BETH\n" }, q1()] };
+    const p = extractPlainText(qa);
+    assert(p === "the man ran. BETH", `setup: \\qa label in the plain text (got ${JSON.stringify(p)})`);
+    const r = findReplaceVerse(clone(qa), p, /man/g, p.indexOf("man"), 3, "boy");
+    assert(extractPlainText(r.content) === "the boy ran. BETH" && labels(r.content) === labels(qa), `man -> boy before a \\qa label (got ${JSON.stringify(extractPlainText(r.content))} ${labels(r.content)})`);
+    const old = extractEditableText(qa);
+    const typed = smartEditVerse(clone(qa), old, old.replace("man", "boy"), { capturedFromDom: true });
+    const heading = typed.content.verseObjects.find((n) => n.tag === "qa");
+    assert(extractEditableText(typed.content) === "the boy ran. \\q1" && heading?.content === "BETH",
+      `typed man -> boy before a \\qa label: the label is kept on content (got ${JSON.stringify(extractEditableText(typed.content))} ${JSON.stringify(heading)})`);
+  }
+}
+
+// Case 91: a find/replace across a bare line marker that changes the word
+// count keeps the line break beside the words it did not change (#1311, item
+// 1). On Case 87's tree, `name this` -> `name of that`: smartRebuildRange bails
+// (raw `namethis` is one token) and the localized rewrite emitted the whole
+// replacement and then the zero-width `\q1`, saving `my name of that\q1 set.`.
+// The text was exact and the marker count unchanged, so the seam guard kept
+// it: the line break moved past two words (and unaligned `name`).
+{
+  console.log("\n[Case 91] Find/replace across a bare line marker keeps the break beside the untouched words (#1311)");
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.join("/")}`).join("|");
+  const markers = (content) => (extractEditableText(content).match(/\\q1/g) ?? []).length;
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const q1 = () => ({ type: "quote", tag: "q1" });
+  const aligned = { verseObjects: [zaln("H0", [w("my")]), t(" "), zaln("H1", [w("name")]), q1(), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(".")] };
+  const draft = { verseObjects: [w("my"), t(" "), w("name"), q1(), w("this"), t(" "), w("set"), t(".")] };
+  const plain = extractPlainText(aligned);
+  assert(plain === "my name this set." && extractPlainText(draft) === plain, `setup: plain text (got ${JSON.stringify(plain)})`);
+  const run = (label, find, repl, wantEditable, wantWords) => {
+    for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+      const r = fn(clone(aligned), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
+      const ed = extractEditableText(r.content);
+      assert(ed === wantEditable, `${label} (${entry}): ${JSON.stringify(wantEditable)} (got ${JSON.stringify(ed)})`);
+      assert(markers(r.content) === 1, `${label} (${entry}): the line break survives`);
+      assert(words(r.content) === wantWords, `${label} (${entry}): untouched words keep their alignment, ${wantWords} (got ${words(r.content)})`);
+    }
+    // An unaligned draft: the save guard has no alignment to protect here, so
+    // the engine's result is what saves.
+    const d = findReplaceVerse(clone(draft), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
+    assert(extractEditableText(d.content) === wantEditable, `${label} (unaligned draft): ${JSON.stringify(wantEditable)} (got ${JSON.stringify(extractEditableText(d.content))})`);
+  };
+  // The issue's repro: `name` is unchanged, so the break stays after it.
+  run("name this -> name of that", "name this", "name of that", "my name\\q1 of that set.", "my:H0|name:H1|of:|that:|set:H3");
+  // `this` is unchanged, so the break stays before it.
+  run("name this -> the name this", "name this", "the name this", "my the name\\q1 this set.", "my:H0|the:|name:H1|this:H2|set:H3");
+  // No word of the match survives: the break stays between the untouched
+  // `my` and `set` (pinned; it lands after the replacement).
+  run("name this -> a b c", "name this", "a b c", "my a b c\\q1 set.", "my:H0|a:|b:|c:|set:H3");
+  // Deleting the word before the break: `this` is kept, so the break stays
+  // before it (main moved it after `this`).
+  run("name this -> this", "name this", "this", "my \\q1 this set.", "my:H0|this:H2|set:H3");
+  // Deleting the word after it: the break stays after `name`. (`name` comes
+  // back unaligned, as on main; the guard accepts that result, so no retry.)
+  run("name this -> name", "name this", "name", "my name\\q1 set.", "my:H0|name:|set:H3");
+  // The same deletion after an opening quote (ZEC 1:2 `“Yahweh\q1 was` with
+  // `Yahweh was` -> `was`, found by the differential). No path keeps the
+  // break before `this` with the exact text: the narrowed retry gives
+  // `“\q1 this`, whose plain text reads `“ this`, not `“this`. The first cut
+  // of this fix then fell to the flat rebuild (every break and alignment
+  // gone); the result main saved (the break moved after `this`) is used
+  // instead. Pinned as main's result, not as the right one.
+  {
+    const quoted = { verseObjects: [t("“"), zaln("H1", [w("name")]), q1(), zaln("H2", [w("this")]), t(" "), zaln("H3", [w("set")]), t(".")] };
+    const qp = extractPlainText(quoted);
+    const r = findReplaceVerse(clone(quoted), qp, /name this/g, qp.indexOf("name this"), 9, "this");
+    assert(extractEditableText(r.content) === "“this\\q1 set.", `“name this -> “this: not flattened, as main (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(words(r.content) === "this:|set:H3", `“name this -> “this: alignment as main (got ${words(r.content)})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

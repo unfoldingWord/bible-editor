@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText, extractPlainText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, isHeaderLabelNode, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 import { hoistOpeningPunctuation, concatVerseText, OPENING_PUNCT_RE } from "./openingPunct.ts";
@@ -1389,10 +1389,16 @@ function smartReplaceVerseImpl(
   // reads `namethis`, so `et` matched across the seam first and the save
   // edited `name`/`this` instead of `set`, and a phrase spanning the marker
   // found nothing in raw and flattened the verse. When the two texts' characters
-  // don't line up (a stale stored plain text, or `\sp` label text that raw keeps
-  // and extractPlainText skips), it falls back to the old occurrence count, which
-  // counts in raw and so can still land on such text.
-  const mapped = locatePlainRangeInRaw(plainText, raw, matchStartInPlain, matchLenInPlain);
+  // don't line up (a stale stored plain text), it falls back to the old
+  // occurrence count in raw.
+  // Both search a copy of raw with header-label text (`\sp The man speaking`)
+  // blanked: raw keeps that text but the plain and editable texts skip it, so
+  // the lockstep walk failed after a label and the occurrence count could land
+  // in it (`man` edited the label's `man`, #1311). Blanking keeps every offset;
+  // see blankHeaderLabels for why the two copies blank it differently.
+  const labelFree = blankHeaderLabels(raw, leaves, " ");
+  const labelSearch = blankHeaderLabels(raw, leaves, LABEL_FILL);
+  const mapped = keepLabelsOutOfEdges(locatePlainRangeInRaw(plainText, labelFree, matchStartInPlain, matchLenInPlain), labelFree, leaves);
   // A whitespace-only match at a marker with no text node beside it: the space
   // is in the plain text only (the marker is the separator), so the tree has
   // nothing to replace. For find/replace, leave the verse as it is; counting
@@ -1413,7 +1419,7 @@ function smartReplaceVerseImpl(
   const rawRegex = relaxWhitespace(regex);
   const rawMatch = located
     ? { index: located.start, length: located.end - located.start }
-    : nthMatchIn(raw, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1);
+    : nthMatchIn(labelSearch, rawRegex, countMatchesBefore(plainText, regex, matchStartInPlain) + 1);
 
   // If the raw search yields nothing (normalization wiped a match, or
   // the match text spans an inline marker token like "\p " that has no
@@ -1439,15 +1445,58 @@ function smartReplaceVerseImpl(
   // replacement and its line markers are all still there; otherwise fall to
   // the next path, and last to the flat rebuild the old code reached here.
   const plainMatchText = plainText.slice(matchStartInPlain, matchStartInPlain + matchLenInPlain);
-  const acrossSeam =
-    located !== null && raw.slice(rawStart, rawEnd).replace(/\s+/g, " ") !== plainMatchText.replace(/\s+/g, " ");
+  // An edge pulled back to a header label (keepLabelsOutOfEdges) left the
+  // match's whitespace on that side out of the range on purpose; compare
+  // without it there, or the leading space of ` {to` after a label reads as a
+  // bare seam and the guard flattens a verse main edited (review of #1311).
+  let seamText = plainMatchText;
+  if (located?.pulledStart) seamText = seamText.replace(/^\s+/, "");
+  if (located?.pulledEnd) seamText = seamText.replace(/\s+$/, "");
+  let rawSeamText = raw.slice(rawStart, rawEnd);
+  if (located?.pulledStart) rawSeamText = rawSeamText.replace(/^\s+/, "");
+  if (located?.pulledEnd) rawSeamText = rawSeamText.replace(/\s+$/, "");
+  const acrossSeam = located !== null && rawSeamText.replace(/\s+/g, " ") !== seamText.replace(/\s+/g, " ");
   const rawMatchText = acrossSeam ? plainMatchText : raw.slice(rawStart, rawEnd);
   const flatRebuild = (): SmartReplaceResult => {
     const newPlain = normalize(plainText.slice(0, matchStartInPlain) + replaceText + plainText.slice(matchStartInPlain + matchLenInPlain));
     return { content: { verseObjects: tokenizeEditableText(newPlain) }, plainText: newPlain, preservedAlignment: false };
   };
-  const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null =>
-    r && (!acrossSeam || isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText)) ? r : null;
+  // A result with the exact text and every marker, but a marker moved past a
+  // word the replace kept, is held back so the paths below and the narrowed
+  // retry get a chance to keep it in place (#1311). If none does, it is still
+  // used, as it was before, rather than the flat rebuild, which drops every
+  // line break and alignment.
+  let movedMarker: SmartReplaceResult | null = null;
+  // A range over a header label's text gets the same guard, so no path drops
+  // the label unchecked (a user regex like `.` can still match the search
+  // copy's LABEL_FILL when the occurrence count runs).
+  const guarded = acrossSeam || rangeTouchesLabel(leaves, rawStart, rawEnd);
+  const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null => {
+    if (!r || !guarded) return r;
+    if (isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) return r;
+    // Copied: the paths below go on editing `cloned`, which it may share nodes with.
+    if (!movedMarker && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, false)) {
+      const vo = (r.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+      movedMarker = Array.isArray(vo) ? { ...r, content: { verseObjects: cloneVerseObjects(vo) } } : r;
+    }
+    return null;
+  };
+  // Every path refused a change across the seam. Retry it without the whole
+  // words the match and the replacement share at one end, so a marker beside
+  // such a word falls outside the change and stays put (`name this` -> `name
+  // of that` becomes `this` -> `of that`, after the `\q1`; #1311). The retry
+  // must still pass the guard for the whole match; otherwise the held-back
+  // result above, and last the flat rebuild.
+  const refused = (): SmartReplaceResult => {
+    for (const n of narrowedReplaces(plainMatchText, replaceText)) {
+      const start = matchStartInPlain + n.trimStart;
+      const len = matchLenInPlain - n.trimStart - n.trimEnd;
+      const re = new RegExp(plainText.slice(start, start + len).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+      const r = keep(smartReplaceVerseImpl(content, plainText, re, start, len, n.replaceText, options));
+      if (r) return r;
+    }
+    return movedMarker ?? flatRebuild();
+  };
 
   // Smart in-place path requires:
   //   (a) match boundaries align with leaf boundaries — no mid-leaf splits;
@@ -1537,10 +1586,11 @@ function smartReplaceVerseImpl(
     }
     const verseObjectsOut = anyChanged ? stripLiftedMarkers(liftEditedOutOfZaln(cloned)) : cloned;
     const newRaw = rebuildRaw(verseObjectsOut);
-    // `cloned` is edited in place, so a refused result can't fall through.
+    // `cloned` is edited in place, so a refused result can't fall through
+    // (the retry starts again from `content`).
     return (
       keep({ content: { verseObjects: verseObjectsOut }, plainText: normalize(newRaw), preservedAlignment: true }) ??
-      flatRebuild()
+      refused()
     );
   }
 
@@ -1668,7 +1718,7 @@ function smartReplaceVerseImpl(
   // above may have marked. Hand it the located range so it doesn't recount
   // occurrences itself (#1307).
   const rewritten = localizedRewriteVerse(content, plainText, matchStartInPlain, matchLenInPlain, replaceText, located ?? undefined);
-  return keep(rewritten) ?? flatRebuild();
+  return keep(rewritten) ?? refused();
 }
 
 // Map a match in the plain text (`start`, `len`) to its range in raw, the
@@ -1690,6 +1740,79 @@ function locatePlainRangeInRaw(plain: string, raw: string, start: number, len: n
   return { start: rs, end: Math.max(rs, e) };
 }
 
+// `raw` (walkLeaves over the same tree) with the text of each header-label
+// leaf (`\sp`, `\sr`, `\r`, `\cl`: isHeaderLabelNode) replaced by `fill`, one
+// per UTF-16 unit, so raw offsets still hold. The plain and editable texts
+// skip that text, so the walk and the searches over raw must too.
+//   - The lockstep plain-to-raw walk takes spaces: it collapses whitespace
+//     runs, so the label reads as part of the gap it sits in, as in plain text.
+//   - A regex search takes LABEL_FILL, which is neither whitespace nor a word
+//     character: with spaces, a `\s+` (or a relaxed `said\s+the`) ran through
+//     the label, so the occurrence count merged it into a whitespace run and
+//     the replace dropped the label (review of #1311).
+const LABEL_FILL = "￿";
+function blankHeaderLabels(raw: string, leaves: Leaf[], fill: string): string {
+  let out = raw;
+  for (const l of leaves) {
+    if (isHeaderLabelNode(l.node) && l.end > l.start) out = out.slice(0, l.start) + fill.repeat(l.end - l.start) + out.slice(l.end);
+  }
+  return out;
+}
+
+// Is any header label's text inside or across raw [start, end)?
+function rangeTouchesLabel(leaves: Leaf[], start: number, end: number): boolean {
+  return leaves.some((l) => isHeaderLabelNode(l.node) && l.end > l.start && l.start < end && l.end > start);
+}
+
+// A located range whose edge whitespace runs over a blanked header label
+// (`said ` -> `` before `\sp The man speaking`): the walk maps that whitespace
+// across the blanked text, so the range would cover the label and the replace
+// would drop it. Pull the edge back to the label: the start past it when the
+// match's text follows the label, otherwise the end to it (a whitespace-only
+// match keeps the whitespace before the label, as main replaced). A label with
+// matched text on both sides (`said the` around it) stays inside (#1311).
+// `pulledStart` / `pulledEnd` say which edge moved: the match's whitespace on
+// that side is then not in the range, which must not read as a bare seam.
+function keepLabelsOutOfEdges(
+  range: { start: number; end: number } | null,
+  labelFree: string,
+  leaves: Leaf[],
+): { start: number; end: number; pulledStart: boolean; pulledEnd: boolean } | null {
+  if (!range) return range;
+  let { start, end } = range;
+  let pulledStart = false;
+  let pulledEnd = false;
+  for (const l of leaves) {
+    if (!isHeaderLabelNode(l.node) || l.end <= l.start || l.end <= start || l.start >= end) continue;
+    const textBefore = /\S/.test(labelFree.slice(start, Math.max(start, l.start)));
+    const textAfter = /\S/.test(labelFree.slice(Math.min(end, l.end), end));
+    if (textBefore && textAfter) continue;
+    if (textAfter) {
+      start = l.end;
+      pulledStart = true;
+    } else {
+      end = Math.max(start, l.start);
+      pulledEnd = true;
+    }
+  }
+  return { start, end: Math.max(start, end), pulledStart, pulledEnd };
+}
+
+// Header-label texts in document order (see blankHeaderLabels).
+function headerLabelTexts(nodes: unknown[]): string[] {
+  const out: string[] = [];
+  const walk = (ns: unknown[]) => {
+    for (const n of ns ?? []) {
+      if (!n || typeof n !== "object") continue;
+      if (isHeaderLabelNode(n)) out.push(String((n as Record<string, unknown>)["text"] ?? ""));
+      const children = (n as Record<string, unknown>)["children"];
+      if (Array.isArray(children)) walk(children);
+    }
+  };
+  walk(nodes);
+  return out;
+}
+
 // Is `result` exactly the replacement the translator asked for: its visible
 // text is the plain text with the match replaced, and every line marker of the
 // original verse is still there? Guards the paths that read fused raw text
@@ -1701,6 +1824,9 @@ function isExactReplace(
   start: number,
   len: number,
   replaceText: string,
+  // Also require every line marker to keep its place (below); false checks
+  // only the text, the marker count and the labels, as before #1311.
+  checkPositions: boolean,
 ): boolean {
   const want = normalize(plainText.slice(0, start) + replaceText + plainText.slice(start + len));
   const lineMarkers = (nodes: unknown[]): number => {
@@ -1714,7 +1840,150 @@ function isExactReplace(
     return n;
   };
   const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  return Array.isArray(out) && extractPlainText(result.content) === want && lineMarkers(out) === lineMarkers(verseObjects);
+  if (!Array.isArray(out)) return false;
+  // Read the result in the caller's coordinates. Find/replace passes the
+  // tree's plain text, which has a space at every line marker; a typed save
+  // (smartEditVerse) passes the marker-stripped editable text, which has one
+  // only where the words would otherwise fuse (`them.\q1 And` reads
+  // `them.And`). Comparing the typed text with the tree's plain text failed
+  // every typed edit across a bare seam in a verse with such a marker, and
+  // the flat rebuild dropped all its line breaks (#1311).
+  const strippedText = (c: unknown) => normalize(normalizeEditable(stripMarkerTokens(extractEditableText(c))));
+  const original = { verseObjects };
+  const typedCoords = plainText !== extractPlainText(original) && plainText === strippedText(original);
+  const got = typedCoords ? strippedText(result.content) : extractPlainText(result.content);
+  // Neither text shows a header label, so check those separately: a match
+  // that spans one (`said the` around `\sp …`) must not rewrite it.
+  if (
+    got !== want ||
+    lineMarkers(out) !== lineMarkers(verseObjects) ||
+    JSON.stringify(headerLabelTexts(out)) !== JSON.stringify(headerLabelTexts(verseObjects))
+  ) {
+    return false;
+  }
+  if (!checkPositions) return true;
+  // Each line marker keeps its place beside the words the replace did not
+  // change. The count alone let `name this` -> `name of that` save `my name of
+  // that\q1 set.`, the break moved past two words (#1311). Positions are counts
+  // of non-whitespace characters before the marker, the same in either text.
+  // A marker before the change (or after `name`, which both texts start with)
+  // keeps its count; one after it shifts by the length change; one between
+  // changed words may sit anywhere inside the replacement.
+  const coordText = (vo: unknown[]) => (typedCoords ? strippedText({ verseObjects: vo }) : extractPlainText({ verseObjects: vo }));
+  const before = markerOffsets(coordText(withMarkerSentinels(verseObjects)));
+  const after = markerOffsets(coordText(withMarkerSentinels(out)));
+  if (before.length !== after.length) return false;
+  const matchText = plainText.slice(start, start + len);
+  const s = nonWsCount(plainText.slice(0, start));
+  const e = s + nonWsCount(matchText);
+  const r = nonWsCount(replaceText);
+  const { pre, post } = sharedWordEdges(matchText, replaceText);
+  return before.every((n, i) => {
+    const m = after[i];
+    if (n <= s + pre && m === n) return true;
+    if (n >= e - post && m === n + r - (e - s)) return true;
+    return n > s + pre && n < e - post && m >= s + pre && m <= s + r - post;
+  });
+}
+
+// Non-whitespace characters in `s`, by code point.
+function nonWsCount(s: string): number {
+  let n = 0;
+  for (const ch of s) if (!/\s/.test(ch)) n++;
+  return n;
+}
+
+// A copy of `nodes` with a sentinel text node before every line marker (as
+// isExactReplace counts them), so a text extractor shows where each one is.
+const MARKER_SENTINEL = "\u0001";
+function withMarkerSentinels(nodes: unknown[]): unknown[] {
+  const out: unknown[] = [];
+  for (const n of nodes ?? []) {
+    if (n && typeof n === "object") {
+      if (isInFlowMarker(n) && !isCharacterWrapper(n)) out.push({ type: "text", text: MARKER_SENTINEL });
+      const children = (n as Record<string, unknown>)["children"];
+      out.push(Array.isArray(children) ? { ...(n as Record<string, unknown>), children: withMarkerSentinels(children) } : n);
+    } else {
+      out.push(n);
+    }
+  }
+  return out;
+}
+
+// For each sentinel in `text`, the count of non-whitespace characters before it.
+function markerOffsets(text: string): number[] {
+  const out: number[] = [];
+  let n = 0;
+  for (const ch of text) {
+    if (ch === MARKER_SENTINEL) out.push(n);
+    else if (!/\s/.test(ch)) n++;
+  }
+  return out;
+}
+
+// `s` as alternating gap and word tokens (WORD_RUN_RE), starting and ending
+// with a gap, either possibly empty: `name this` -> ["", "name", " ", "this", ""].
+function wordTokens(s: string): string[] {
+  const out: string[] = [];
+  let last = 0;
+  for (const m of s.matchAll(WORD_RUN_RE)) {
+    const at = m.index ?? 0;
+    out.push(s.slice(last, at), m[0]);
+    last = at + m[0].length;
+  }
+  out.push(s.slice(last));
+  return out;
+}
+
+const sameToken = (a: string, b: string) => a.replace(/\s+/g, " ") === b.replace(/\s+/g, " ");
+
+// How many leading and trailing tokens `a` and `b` share, whole tokens only.
+function sharedTokenCounts(a: string[], b: string[]): { lead: number; trail: number } {
+  let lead = 0;
+  while (lead < a.length && lead < b.length && sameToken(a[lead], b[lead])) lead++;
+  let trail = 0;
+  while (trail < a.length && trail < b.length && sameToken(a[a.length - 1 - trail], b[b.length - 1 - trail])) trail++;
+  return { lead, trail };
+}
+
+// The words a match and its replacement share at the start and at the end,
+// as non-whitespace character counts (`name this` / `name of that`: 4 and 0).
+function sharedWordEdges(match: string, replacement: string): { pre: number; post: number } {
+  const a = wordTokens(match);
+  const { lead, trail } = sharedTokenCounts(a, wordTokens(replacement));
+  return {
+    pre: nonWsCount(a.slice(0, lead).join("")),
+    post: nonWsCount(a.slice(a.length - trail).join("")),
+  };
+}
+
+// Narrower versions of a replace: the match and the replacement each without
+// the whole tokens they share at the start, or else at the end, as long as
+// the narrowed match still holds a non-whitespace character. Character counts
+// are in the match (`trimStart`, `trimEnd`); `replaceText` is what replaces
+// the rest.
+function narrowedReplaces(match: string, replacement: string): { trimStart: number; trimEnd: number; replaceText: string }[] {
+  const a = wordTokens(match);
+  const b = wordTokens(replacement);
+  const { lead, trail } = sharedTokenCounts(a, b);
+  const out: { trimStart: number; trimEnd: number; replaceText: string }[] = [];
+  for (let k = Math.min(lead, a.length - 1); k > 0; k--) {
+    const rest = a.slice(k).join("");
+    if (!/\S/.test(rest)) continue;
+    const trimStart = a.slice(0, k).join("").length;
+    // Only a strictly narrower range (an empty leading gap trims nothing), so
+    // the retry this feeds always ends.
+    if (trimStart > 0) out.push({ trimStart, trimEnd: 0, replaceText: b.slice(k).join("") });
+    break;
+  }
+  for (let k = Math.min(trail, a.length - 1); k > 0; k--) {
+    const rest = a.slice(0, a.length - k).join("");
+    if (!/\S/.test(rest)) continue;
+    const trimEnd = a.slice(a.length - k).join("").length;
+    if (trimEnd > 0) out.push({ trimStart: 0, trimEnd, replaceText: b.slice(0, b.length - k).join("") });
+    break;
+  }
+  return out;
 }
 
 // Plain-text diff: the smallest contiguous substring change that turns
@@ -3048,6 +3317,10 @@ function localizedRewriteVerse(
 
   const cloned = cloneVerseObjects(verseObjects);
   const rawTotal = rebuildRaw(cloned);
+  // Header-label text blanked, so the occurrence search below skips it as the
+  // plain and editable texts do, and no whitespace run reaches through it
+  // (see blankHeaderLabels, #1311).
+  const labelSearch = blankHeaderLabels(rawTotal, walkLeaves(cloned).leaves, LABEL_FILL);
 
   // Map plain-text positions to raw-text positions. For oldLen > 0 we find
   // the Nth occurrence of the matchText in raw, treating each literal space
@@ -3083,7 +3356,7 @@ function localizedRewriteVerse(
     const rawRegex = new RegExp(escaped.replace(/ /g, "\\s+"), "g");
     let m: RegExpExecArray | null;
     let count = 0;
-    while ((m = rawRegex.exec(rawTotal)) !== null) {
+    while ((m = rawRegex.exec(labelSearch)) !== null) {
       count++;
       if (count === occurrence) {
         rawStart = m.index;
@@ -3100,6 +3373,11 @@ function localizedRewriteVerse(
     // delta — splitting the neighbouring word when the insertion abuts it
     // (the letter-migration corruption). Fall back to the length proxy only
     // if the content streams disagree (shouldn't happen for a clean edit).
+    // Not label-blanked: the stripped text can't tell an insertion at the end
+    // of the line before a `\sp` label from one at the start of the labelled
+    // line, and blanking moved the line-end case after the label (measured
+    // over the samples with a label injected: 26 line-end insertions went to
+    // the wrong side, 7 line-start ones were fixed). Left as on main (#1311).
     const mapped = mapStrippedPosToRaw(prefixNoMarkers, rawTotal, prefixNoMarkers.length);
     rawStart = mapped >= 0 ? mapped : Math.min(prefixNoMarkers.length, rawTotal.length);
     if (mapped >= 0 && newSubstring.length > 0) {
