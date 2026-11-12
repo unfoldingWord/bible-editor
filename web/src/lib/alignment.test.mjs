@@ -3888,6 +3888,51 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   assert(!verseHasUnalignedWork(null, svo), "non-array target: false");
 }
 
+{
+  console.log("\n[Case] a space outside a milestone plus a leading space inside it stays one space (#1317)");
+  // ECC UST shape (edit_log 482207 → 482210): a top-level " " followed by a
+  // milestone whose first child is another " ". The aligner's save joined the
+  // two into one "  " text node written outside the milestone.
+  const ms = (strong, content, children) => ({
+    tag: "zaln", type: "milestone", strong, lemma: content, morph: "He,Ncmsa",
+    occurrence: "1", occurrences: "1", content, children, endTag: "zaln-e\\*",
+  });
+  const w = (text) => ({ text, tag: "w", type: "word", occurrence: "1", occurrences: "1" });
+  const sp = () => ({ type: "text", text: " " });
+  const allTexts = (nodes) => nodes.flatMap((n) => [
+    ...(n.type === "text" ? [n.text] : []),
+    ...(Array.isArray(n.children) ? allTexts(n.children) : []),
+  ]);
+  // Raw text in document order (extractPlainText collapses whitespace, so it
+  // cannot see a doubled space).
+  const rawText = (nodes) => nodes.map((n) =>
+    (n.type === "text" || n.type === "word" ? n.text : "") +
+    (Array.isArray(n.children) ? rawText(n.children) : "")).join("");
+  const roundtrip = (tvo) => serializeAlignment(parseAlignment(tvo, null));
+
+  // Control: the single-space shape. Main keeps the space outside the milestone.
+  const single = roundtrip([ms("H1", "א", [w("the")]), sp(), ms("H2", "ב", [w("king")])]);
+  assert(JSON.stringify(allTexts(single)) === JSON.stringify([" "]), `single space: one " " text node (got ${JSON.stringify(allTexts(single))})`);
+  assert(single[1]?.type === "text" && single[1].text === " ", "single space: the space sits between the milestones");
+
+  // Leading space inside the second milestone.
+  const lead = roundtrip([ms("H1", "א", [w("the")]), sp(), ms("H2", "ב", [sp(), w("king")])]);
+  const leadTexts = allTexts(lead);
+  assert(!leadTexts.some((t) => t.includes("  ")), `leading space: no doubled-space text node (got ${JSON.stringify(leadTexts)})`);
+  assert(rawText(lead) === "the king", `leading space: exactly one space between the words (got ${JSON.stringify(rawText(lead))})`);
+  assert(JSON.stringify(lead) === JSON.stringify(single), "leading space: serializes the same as the single-space shape");
+
+  // Trailing space inside the first milestone, then a top-level space.
+  const trail = roundtrip([ms("H1", "א", [w("the"), sp()]), sp(), ms("H2", "ב", [w("king")])]);
+  const trailTexts = allTexts(trail);
+  assert(!trailTexts.some((t) => t.includes("  ")), `trailing space: no doubled-space text node (got ${JSON.stringify(trailTexts)})`);
+  assert(rawText(trail) === "the king", `trailing space: exactly one space between the words (got ${JSON.stringify(rawText(trail))})`);
+
+  // A line break before the milestone's leading space is not a space: keep both.
+  const nl = roundtrip([ms("H1", "א", [w("the")]), { type: "text", text: "\n" }, ms("H2", "ב", [sp(), w("king")])]);
+  assert(JSON.stringify(allTexts(nl)) === JSON.stringify(["\n "]), `line break then space: both kept (got ${JSON.stringify(allTexts(nl))})`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
