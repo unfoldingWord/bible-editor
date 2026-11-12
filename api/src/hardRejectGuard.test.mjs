@@ -152,6 +152,29 @@ t("the banner names a straight-quote row and its column", () => {
   const msg = buildHardRejectAlertMessage("DAN", "twl", hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "fall'down", "1", "rc://*/tw/dict/bible/kt/god"])));
   assert.match(msg, /3:5 \(xf8f\): straight quote \('\) in OrigWords/);
 });
+// Review of #1334: a curly quote is the right fix in OrigWords or Tags, but not
+// in TWLink (no article slug has one, and o’neil is not an article).
+t("a quote in TWLink says remove it or pick the article, not 'use a curly quote'", () => {
+  const [r] = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "x", "1", "rc://*/tw/dict/bible/names/o'neil"]));
+  assert.match(r.reason, /pick the article from the list/);
+  assert.doesNotMatch(r.reason, /curly quote \(/);
+});
+t("a quote in OrigWords keeps the curly-quote advice", () => {
+  const [r] = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "it's", "1", "rc://*/tw/dict/bible/kt/god"]));
+  assert.match(r.reason, /use a curly quote \(’ “ ”\) or remove it/);
+  assert.doesNotMatch(r.reason, /pick the article/);
+});
+t("quotes in OrigWords and TWLink give each column its own advice", () => {
+  const [r] = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "it's", "1", "rc://*/tw/dict/bible/names/o'neil"]));
+  assert.match(r.reason, /in OrigWords and TWLink/);
+  assert.match(r.reason, /use a curly quote \(’ “ ”\) or remove it in OrigWords/);
+  assert.match(r.reason, /remove it from TWLink or pick the article from the list/);
+});
+t("a TWLink of a quote and a space is not called 'only blank space'", () => {
+  const rows = hardRejectRows("twl", twlTsv(["3:5", "xf8f", "", "x", "1", "' "]));
+  assert.ok(rows.length >= 1);
+  for (const r of rows) assert.doesNotMatch(r.reason, /only blank space/);
+});
 
 console.log("\n[hardRejectRows — tn]");
 t("blank Occurrence with a non-blank Quote is rejected", () => {
@@ -275,6 +298,26 @@ t("two problems on one row count as one row", () => {
     { ref: "1:1", rowId: "abcd", reason: "y" },
   ];
   assert.match(buildHardRejectAlertMessage("JER", "tn", rejects), /HELD JER TN: 1 row\(s\)/);
+});
+// Review of #1334: rows with two entries (bad TWLink + straight quote) are now
+// common, so the sample and "+N more" must count rows, not entries.
+const twoEach = (n) =>
+  Array.from({ length: n }, (_, i) => [
+    { ref: `1:${i + 1}`, rowId: `r00${i}`, reason: `first${i}` },
+    { ref: `1:${i + 1}`, rowId: `r00${i}`, reason: `second${i}` },
+  ]).flat();
+t("4 rows with 2 problems each: all 4 rows named, each with both reasons, and no '+N more'", () => {
+  const msg = buildHardRejectAlertMessage("JER", "twl", twoEach(4));
+  assert.match(msg, /HELD JER TWL: 4 row\(s\)/);
+  for (let i = 0; i < 4; i++) assert.match(msg, new RegExp(`1:${i + 1} \\(r00${i}\\): first${i} and also second${i}`));
+  assert.doesNotMatch(msg, /more/);
+  assert.equal(msg.split("(r000)").length - 1, 1, "each row is named once");
+});
+t("8 rows with 2 problems each: 6 rows shown, '+2 more' counts rows", () => {
+  const msg = buildHardRejectAlertMessage("JER", "twl", twoEach(8));
+  assert.match(msg, /HELD JER TWL: 8 row\(s\)/);
+  assert.match(msg, /1:6 \(r005\): first5 and also second5; \+2 more/);
+  assert.doesNotMatch(msg, /r006/);
 });
 
 console.log(`\n${passed} hardRejectGuard tests passed`);

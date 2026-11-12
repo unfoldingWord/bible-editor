@@ -43,7 +43,14 @@ assert(/straight quote \("\)/.test(problem('rc://*/tw/dict/bible/kt/"god"') ?? "
 assert(/line break or tab/.test(problem("rc://*/tw/dict/bible/kt/god\n") ?? ""), "a newline in a full link is named");
 assert(/line break or tab/.test(problem("rc://*/tw/dict/bible/kt/go\td") ?? ""), "a tab in a full link is named");
 assert(/only blank space/.test(problem("   ") ?? ""), "whitespace-only is named");
-assert(problem("trouble") === null, "a bare word is a shape problem, not a character one (null)");
+// Review of #1334: no article slug has a quote, so a curly quote is the wrong
+// advice for a link; say to remove it or pick the article.
+for (const link of ["rc://*/tw/dict/bible/names/o'neil", 'rc://*/tw/dict/bible/kt/"god"']) {
+  assert(/pick the article from the list/.test(problem(link) ?? ""), `quote advice is 'pick the article' for ${link}`);
+  assert(!/curly/.test(problem(link) ?? "curly"), `no curly-quote advice for ${link}`);
+}
+assert(problem("' ") === null, "a quote and a space is a shape problem, not 'only blank space'");
+assert(problem("trouble") === null,"a bare word is a shape problem, not a character one (null)");
 assert(problem("o'neil") === null, "a bare word with a quote is still a shape problem (null)");
 assert(problem("rc://*/tw/dict/bible/kt/god") === null, "a good link has no problem (null)");
 assert(problem("") === null && problem(null) === null, "blank has no problem (null)");

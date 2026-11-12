@@ -765,6 +765,9 @@ t("Malformed TWLink names the fault when it is only a straight quote, a line bre
     assert.doesNotMatch(msg(link), /must be a full rc:\/\/ link/, link);
   }
   assert.match(msg("rc://*/tw/dict/bible/names/o'neil"), /straight quote \('\)/);
+  // Review of #1334: a curly quote is the wrong fix for a link.
+  assert.match(msg("rc://*/tw/dict/bible/names/o'neil"), /pick the article from the list/);
+  assert.doesNotMatch(msg("rc://*/tw/dict/bible/names/o'neil"), /curly/);
   assert.match(msg("rc://*/tw/dict/bible/kt/god\n"), /line break or tab/);
   assert.doesNotMatch(msg("rc://*/tw/dict/bible/kt/god\n"), /must be a full rc:\/\/ link/);
   assert.match(msg("   "), /only blank space/);

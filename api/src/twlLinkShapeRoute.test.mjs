@@ -176,6 +176,8 @@ console.log("\n[the 400 names the fault when a full link's only problem is a str
   eq(res.status, 400, "PATCH with a straight quote -> 400");
   eq(/straight quote \('\)/.test(body.message ?? ""), true, "…and the message says 'straight quote (')'");
   eq(/must be a full rc:\/\/ link/.test(body.message ?? ""), false, "…not 'must be a full rc:// link'");
+  eq(/pick the article from the list/.test(body.message ?? ""), true, "…and says to pick the article (review of #1334)");
+  eq(/curly/.test(body.message ?? ""), false, "…not to use a curly quote");
 }
 {
   const { create } = freshApp();
