@@ -1459,7 +1459,11 @@ function smartReplaceVerseImpl(
   const keep = (r: SmartReplaceResult | null): SmartReplaceResult | null => {
     if (!r || !acrossSeam) return r;
     if (isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, true)) return r;
-    if (!movedMarker && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, false)) movedMarker = r;
+    // Copied: the paths below go on editing `cloned`, which it may share nodes with.
+    if (!movedMarker && isExactReplace(verseObjects, r, plainText, matchStartInPlain, matchLenInPlain, replaceText, false)) {
+      const vo = (r.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+      movedMarker = Array.isArray(vo) ? { ...r, content: { verseObjects: cloneVerseObjects(vo) } } : r;
+    }
     return null;
   };
   // Every path refused a change across the seam. Retry it without the whole
