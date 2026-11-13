@@ -3691,20 +3691,20 @@ function countAllMilestones(nodes) {
       `space after said -> " - " (no find/replace flag): label kept (got ${JSON.stringify(extractEditableText(s.content))} ${labels(s.content)})`);
   }
   // A stale stored plain text (the lockstep walk fails, so the occurrence
-  // count in raw runs). The label was blanked to spaces there too, so a
-  // whitespace run merged with it: the space after `said` matched `\n` plus
-  // the label and dropped the label. The other spaces are counted as the
-  // plain text has them (main counted the label's own spaces).
+  // count in raw runs). #1311 made each space here edit the picked space. Since
+  // #1339 a verse with a header label and a stale stored text is refused
+  // whatever the pick (Case 96): on this same verse and text, main's count put
+  // `man` on `woman` and flattened `\S+`, `said the` and `lady` picks, label
+  // and all, and no rule on the verse and its text can keep the spaces while
+  // refusing those. So the spaces are refused too, visibly, and untouched.
   {
     const stale = "The lady said the man ran.";
     const nth = (k) => { let at = -1; for (let i = 0; i <= k; i++) at = stale.indexOf(" ", at + 1); return at; };
-    const want = ["The_woman said \\q1 the man ran.", "The woman_said \\q1 the man ran.", "The woman said_\\q1 the man ran.",
-      "The woman said \\q1 the_man ran.", "The woman said \\q1 the man_ran."];
-    want.forEach((ed, k) => {
+    for (let k = 0; k < 5; k++) {
       const r = findReplaceVerse(clone(verse), stale, / /g, nth(k), 1, "_");
-      assert(extractEditableText(r.content) === ed && labels(r.content) === labels(verse),
-        `stale plain text, space #${k} -> _: ${JSON.stringify(ed)}, label kept (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
-    });
+      assert(r.staleRefused === true && r.plainText === stale && JSON.stringify(r.content) === JSON.stringify(verse),
+        `stale plain text, space #${k} -> _: refused, verse untouched (got ${JSON.stringify(r.staleRefused)} ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
+    }
   }
   // Edge whitespace that touches the label from either side keeps it whole.
   for (const [find, repl, ed] of [["said ", "", "The woman \\q1 the man ran."], ["said ", "said, ", "The woman said, \\q1 the man ran."], [" the", "", "The woman said \\q1 man ran."]]) {
