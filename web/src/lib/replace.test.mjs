@@ -3820,7 +3820,9 @@ function countAllMilestones(nodes) {
     assert(extractEditableText(d.content) === wantEditable, `${label} (unaligned draft): ${JSON.stringify(wantEditable)} (got ${JSON.stringify(extractEditableText(d.content))})`);
   };
   // The issue's repro: `name` is unchanged, so the break stays after it.
-  run("name this -> name of that", "name this", "name of that", "my name\\q1 of that set.", "my:H0|name:H1|of:|that:|set:H3");
+  // (Since #1369 the new words are laid right after the break, and the space
+  // the range rebuild re-lays goes before it, as for `the name this` below.)
+  run("name this -> name of that", "name this", "name of that", "my name \\q1 of that set.", "my:H0|name:H1|of:|that:|set:H3");
   // `this` is unchanged, so the break stays before it. (The range rebuild
   // takes this seam since #1361 and writes the space it re-lays before the
   // break; the localized rewrite wrote none.)
@@ -3965,13 +3967,14 @@ function countAllMilestones(nodes) {
   }
   // The same replace when the stored plain text is stale (the lockstep walk
   // misses and the occurrence count runs): no exact result can be checked in
-  // the stored text's terms, so the result is main's, never the flat rebuild.
-  // Pinned as main's result, not as the right one.
+  // the stored text's terms, so the result is the range rebuild's, never the
+  // flat rebuild. Since #1369 that lays the new words after the break, where
+  // `And` was (it used to save `throne. So then\q1 he`).
   {
     const stale = plain.replace("Yahweh", "Yahwe");
     const r = findReplaceVerse(clone(v613), stale, /throne\. And/g, stale.indexOf(find), find.length, "throne. So then");
     const ed = extractEditableText(r.content);
-    assert(ed.includes("throne. So then\\q1 he will be"), `stale stored text: main's result (got ${JSON.stringify(ed)})`);
+    assert(ed.includes("throne. \\q1 So then he will be"), `stale stored text: the break stays after "throne." (got ${JSON.stringify(ed)})`);
     assert(markers(r.content) === markers(v613), `stale stored text: every line marker survives`);
     assert(sig(r.content) === wantSig, `stale stored text: alignment as main (got ${sig(r.content)})`);
   }
@@ -4679,9 +4682,18 @@ function countAllMilestones(nodes) {
     /use in wars;\s*\\q1 “the great king rules/, ["Your"]);
   check("item 3, wars. “Your -> wars; “the great", opener, "wars. “Your", "wars; “the great",
     /use in wars;\s*\\q1 “the great king rules/, ["Your"]);
+  // The same rule with no opener (this used to save `wars; The great\q1 king`),
+  // and its mirror: new words for an old word before the break stay before it.
+  const plainBreak = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1(), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.")] };
+  check("item 3 without an opener, wars. Your -> wars; The great", plainBreak, "wars. Your", "wars; The great",
+    /use in wars;\s*\\q1 The great king rules/, ["Your"]);
+  check("item 3 mirror, wars. Your -> great fights; Your", plainBreak, "wars. Your", "great fights; Your",
+    /use in great fights;\s*\\q1 Your king rules/, ["wars"]);
 
   // Item 4: typed saves in a verse the reassembly cannot rebuild (a `\qs`
-  // wrapper), so the edit takes the range tiers shared with find/replace.
+  // wrapper), so the edit takes the diff tiers. Outcome pins: the typed
+  // layout's marker reconcile is what keeps the break here (with the range
+  // rebuild's break handling switched off, all of these still pass).
   {
     const qs = () => ({ tag: "qs", type: "quote", endTag: "qs*", children: [zaln("H9", [w("Selah")])] });
     const mk = (sep, first = "wars") => ({ verseObjects: [t("use in "), zaln("H1", [w(first)]), ...sep, zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules. "), qs()] });

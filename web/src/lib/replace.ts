@@ -1219,10 +1219,11 @@ function smartRebuildRange(
   // the range defeats the 1:1 leaf↔word assumption and the whole edit unaligns.
   // A line marker with no text beside it fuses the words on either side in raw
   // (`warsYour`, read as `wars Your` from the plain text): cut the token there.
+  // Two markers at one offset (`wars\b \q1 Your`) cut it once (#1369).
   const breaks = lineBreakOffsets(cloned);
   const tokens = [...raw.slice(rawStart, rawEnd).matchAll(WORD_RUN_RE)].flatMap((m) => {
     const s = rawStart + (m.index ?? 0);
-    const cuts = [s, ...breaks.filter((p) => p > s && p < s + m[0].length), s + m[0].length];
+    const cuts = [s, ...new Set(breaks.filter((p) => p > s && p < s + m[0].length)), s + m[0].length];
     return cuts.slice(1).map((end, i) => ({ start: cuts[i], end }));
   });
   if (tokens.length !== matchWords.length) return null;
@@ -1267,8 +1268,18 @@ function smartRebuildRange(
     const gapOld = Array.from({ length: nextOld - prevOld - 1 }, (_, i) => prevOld + 1 + i);
     const gapStart = prevOld >= 0 ? tokens[prevOld].end : rawStart;
     const gapEnd = nextOld < matchWords.length ? tokens[nextOld].start : rawEnd;
-    const fromRight = gapOld.length > 0 && breakIn(gapStart, tokens[gapOld[0]].start);
-    const sub = (fromRight ? lcsLinkFromRight : lcsLink)(gapOld.map((k) => fold(matchWords[k])), replaceWords.slice(j, nextJ).map(fold));
+    // Split the gap's old words at its first break: those after it pair from
+    // the right, those before it from the left, among the new words left of
+    // the first one the after-break words took (#1369: `Wars. \q1 Your king`
+    // -> `wars that your enemies started; your king`, both words recased).
+    const gapBreak = breaks.find((p) => p >= gapStart && p <= gapEnd);
+    const nBefore = gapBreak === undefined ? gapOld.length : gapOld.filter((k) => tokens[k].end <= gapBreak).length;
+    const oldFolded = gapOld.map((k) => fold(matchWords[k]));
+    const newFolded = replaceWords.slice(j, nextJ).map(fold);
+    const right = lcsLinkFromRight(oldFolded.slice(nBefore), newFolded);
+    const firstRight = right.findIndex((g) => g >= 0);
+    const left = lcsLink(oldFolded.slice(0, nBefore), newFolded.slice(0, firstRight < 0 ? newFolded.length : firstRight));
+    const sub = newFolded.map((_, i) => (i < left.length ? left[i] : right[i] >= 0 ? nBefore + right[i] : -1));
     sub.forEach((g, i) => {
       const k = g >= 0 ? gapOld[g] : -1;
       if (k < 0 || !oneLeaf(k)) return;
@@ -1319,10 +1330,30 @@ function smartRebuildRange(
   // Anchor each new word to the nearest survivor unit edge (left unit's LAST leaf
   // → insert after; else right unit's FIRST leaf → insert before), so it lands
   // INSIDE that milestone and liftEditedOutOfZaln splits the milestone around it.
+  // A new word that replaces old words which all sat after a top-level line
+  // break goes right after that marker instead (the last one at that offset),
+  // so it stays on the old words' line (#1369: `wars. \q1 “Your king` ->
+  // `wars; “the great king` saved `wars; “the great \q1 king`).
+  const topMarkers: { at: number; node: Record<string, unknown> }[] = [];
+  for (let i = 0, pos = 0; i < cloned.length; pos += rebuildRaw([cloned[i]]).length, i++)
+    if (isInertLineBreakMarker(cloned[i])) topMarkers.push({ at: pos, node: cloned[i] as Record<string, unknown> });
+  const markerBefore = (j: number): Record<string, unknown> | null => {
+    let jL = j - 1;
+    while (jL >= 0 && link[jL] < 0) jL--;
+    let jR = j + 1;
+    while (jR < replaceWords.length && link[jR] < 0) jR++;
+    const oldL = jL >= 0 ? link[jL] : -1;
+    const oldR = jR < replaceWords.length ? link[jR] : matchWords.length;
+    if (oldR - oldL < 2) return null; // no old word dropped here
+    const from = oldL >= 0 ? tokens[oldL].end : rawStart;
+    const to = tokens[oldL + 1].start;
+    return topMarkers.filter((m) => m.at >= from && m.at <= to).pop()?.node ?? null;
+  };
   for (const nw of newWords) {
-    let anchor: Record<string, unknown> | null = null;
+    let anchor: Record<string, unknown> | null = markerBefore(nw.j);
     let key = "__insAfter";
-    for (let j2 = nw.j - 1; j2 >= 0; j2--) if (link[j2] >= 0) { const u = units[link[j2]]; anchor = u.leaves[u.leaves.length - 1].node; key = "__insAfter"; break; }
+    if (!anchor)
+      for (let j2 = nw.j - 1; j2 >= 0; j2--) if (link[j2] >= 0) { const u = units[link[j2]]; anchor = u.leaves[u.leaves.length - 1].node; key = "__insAfter"; break; }
     if (!anchor) for (let j2 = nw.j + 1; j2 < replaceWords.length; j2++) if (link[j2] >= 0) { const u = units[link[j2]]; anchor = u.leaves[0].node; key = "__insBefore"; break; }
     if (!anchor) return null; // unreachable (survivor exists) — be safe
     const list = (anchor[key] as unknown[] | undefined) ?? [];
@@ -1369,7 +1400,7 @@ function smartRebuildRange(
   for (let i = 0; i < cloned.length; i++) {
     const o = cloned[i] as Record<string, unknown> | null;
     if (!o || !isInertLineBreakMarker(o)) continue;
-    const bearer = firstGapLeafAfter(i + 1);
+    const bearer = (o["__insAfter"] as Record<string, unknown>[] | undefined)?.[0] ?? firstGapLeafAfter(i + 1);
     if (!bearer) continue; // trailing marker — its preceding word's __gapAfter
                             // already emits before it; nothing to split.
     const gap = String(bearer["__gapBefore"] ?? "");
@@ -1410,6 +1441,7 @@ function smartRebuildRange(
       if (o && isInertLineBreakMarker(o)) {
         if (o["__markerClosing"]) out.push({ type: "text", text: o["__markerClosing"] });
         out.push(stripRebuildMarks(o));
+        if (Array.isArray(o["__insAfter"])) for (const nw of o["__insAfter"] as Record<string, unknown>[]) pushWord(out, nw);
         continue;
       }
       if (o && Array.isArray(o["__insBefore"])) for (const nw of o["__insBefore"] as Record<string, unknown>[]) pushWord(out, nw);
