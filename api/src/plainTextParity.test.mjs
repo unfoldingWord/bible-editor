@@ -179,6 +179,62 @@ check(usfm.toJSON(src).chapters["1"]["2"].verseObjects.some((n) => n.tag === "sp
   check(rows.find((r) => r.verse === 2)?.plainText === "Next. Go", `footnote/char marker 1:2: stored plain text has no label word (got ${JSON.stringify(rows.find((r) => r.verse === 2)?.plainText)})`);
 }
 
+// Only character and note markers join a label's run (#1366 item 3): a `\va`,
+// `\vp`, `\ca` or `\fig` is a closed marker too, but no part of a speaker label.
+// Both copies keep them out of the label, identically; `\fe` and `\wj` join.
+{
+  const src = String.raw`\c 1
+\p
+\v 1 \w Body|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \w man|x-occurrence="1" x-occurrences="1"\w*
+\va 2\va*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*
+\v 2 \w B|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \fe + \ft end\fe* \wj \w man|x-occurrence="1" x-occurrences="1"\w*\wj*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*
+\v 3 \w C|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \vp 2a\vp* \ca 3\ca* \fig A|src="a.jpg" size="col"\fig*
+\q1 \w Go|x-occurrence="1" x-occurrences="1"\w*
+`;
+  const fx = usfm.toJSON(src).chapters["1"];
+  const kids = (vos) => vos.find((n) => n && n.tag === "sp").children.map((c) => c.tag ?? c.type);
+  for (const v of ["1", "2", "3"]) {
+    const vos = fx[v].verseObjects;
+    check(JSON.stringify(apiNest(vos)) === JSON.stringify(webNest(vos)), `marker list 1:${v}: api and web nestWordLabels agree`);
+  }
+  check(!kids(apiNest(fx["1"].verseObjects)).includes("va"), `\\va after a label stays in the verse (got ${JSON.stringify(kids(apiNest(fx["1"].verseObjects)))})`);
+  check(kids(apiNest(fx["2"].verseObjects)).includes("fe") && kids(apiNest(fx["2"].verseObjects)).includes("wj"), "\\fe and \\wj join the label");
+  check(!kids(apiNest(fx["3"].verseObjects)).some((k) => ["vp", "ca", "fig"].includes(k)), `\\vp, \\ca, \\fig stay out of the label (got ${JSON.stringify(kids(apiNest(fx["3"].verseObjects)))})`);
+  // Review of #1366: a nested character marker (`\+nd … \+nd*`, which usfm-js
+  // tags "+nd") and `\qs`, `\qac`, `\qt` (which usfm-js types "quote") are part
+  // of the label too; main nested a label holding them.
+  {
+    const nestedSrc = String.raw`\c 1
+\p
+\v 1 \w B|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \add \+nd \w Lord|x-occurrence="1" x-occurrences="1"\w*\+nd*\add* \+nd \w X|x-occurrence="1" x-occurrences="1"\w*\+nd* \qs \w Selah|x-occurrence="1" x-occurrences="1"\w*\qs* \qac \w A|x-occurrence="1" x-occurrences="1"\w*\qac* \qt \w q|x-occurrence="1" x-occurrences="1"\w*\qt*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*
+`;
+    const vos = usfm.toJSON(nestedSrc).chapters["1"]["1"].verseObjects;
+    const a = apiNest(vos);
+    const sp = a.find((n) => n && n.tag === "sp");
+    check(JSON.stringify(a) === JSON.stringify(webNest(vos)), "nested/quote-typed char markers: api and web agree");
+    check(Array.isArray(sp?.children) && ["add", "+nd", "qs", "qac", "qt"].every((tag) => sp.children.some((c) => c.tag === tag)) && a[a.indexOf(sp) + 1]?.tag === "q1",
+      `\\+nd, \\qs, \\qac, \\qt join the label, which ends at its \\q1 (got ${JSON.stringify(a.map((n) => (n?.tag === "sp" ? { sp: n.children?.map((c) => c.tag ?? c.type) } : n?.tag ?? n?.type)))})`);
+    check(apiExtract({ verseObjects: a }) === "B. Hi", `nested/quote-typed char markers: plain text has no label word (got ${JSON.stringify(apiExtract({ verseObjects: a }))})`);
+  }
+  // The two copies of the list agree tag by tag: a closed marker after a flat
+  // label's word, for every listed tag and the four that must stay out.
+  const tags = ["f", "fe", "x", "ef", "ex", "add", "addpn", "bd", "bdit", "bk", "dc", "em", "it", "jmp", "k", "nd", "ndx", "no", "ord", "pn", "png", "pro",
+    "qac", "qs", "qt", "rb", "rq", "sc", "sig", "sls", "sup", "tl", "wa", "wg", "wh", "wj", "xt", "va", "vp", "ca", "fig", "zz"];
+  for (const tag of tags) {
+    const vos = [{ tag: "sp" }, w("The"), { tag, endTag: `${tag}*`, content: "x" }, t("\n"), { tag: "q1", type: "quote" }, w("Hi")];
+    const a = apiNest(vos);
+    const joined = a[0].children?.some((c) => c.tag === tag) ?? false;
+    check(JSON.stringify(a) === JSON.stringify(webNest(vos)) && joined === !["va", "vp", "ca", "fig", "zz"].includes(tag), `\\${tag}: both copies ${joined ? "join" : "leave"} it, as listed`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\nplainTextParity: ${failed} check(s) failed, ${passed} passed.`);
   process.exit(1);

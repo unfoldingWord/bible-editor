@@ -889,6 +889,22 @@ Highlights that bite repeatedly:
   edit engine on the label's own words, so unchanged words keep their `\w` attributes and alignment. The label run
   crosses footnotes and character markers (the whole `\sp` line is the label), and a verse PATCH nests a flat label
   sent by an old queued op or a history restore.
+- **Speaker-label follow-ups (#1366).** The label run crosses only an explicit list of note and character markers
+  (`LABEL_INLINE_TAGS`, in both `web/src/lib/usfm.ts` and `api/src/importParsers.ts`; `plainTextParity.test.mjs`
+  checks them tag by tag): `\va`, `\vp`, `\ca`, `\fig` are closed markers too but stay out. usfm-js tags a nested
+  marker with its plus (`\+nd` -> `"+nd"`) and types `\qs`, `\qac`, `\qt` "quote"; both shapes count. usfm-js parks the space
+  or line break after `\f*` on the footnote's `nextChar`, which plain/editable text skip, so the words on either side
+  fuse (`The\f…\f*⏎woman` read "Thewoman" and a band edit saved one word "Thelady"); `headerLabelText` reads
+  `nextChar` and `editWordLabel` splits it into a text node for the edit. The same fusing exists in the verse
+  body (`\w Body\w*\f…\f*⏎\w more\w*` -> "Bodymore."), not fixed. A label's notes show read-only in the band
+  (`SectionHeader.notes`). In find/replace only, when the first word after a label's line break was replaced and
+  new words would sit before the label, the replace is refused (`speechStartRefused`, label-moved) unless the new
+  words are one for one with the old on each side. Moving the break was tried and dropped in review: no rule tells
+  "added to the narrator's line" (`home again. She`) from "added to the speech" (`home. Yes, she`). A typed edit
+  shows the break, so its placement holds. An insertion at the break with nothing replaced (`home. And he`) still
+  saves where the engine puts it, before the label (pinned). A held verse pin
+  (`advanceHeldVerseBase`) does not move onto a landed row when its base held a flat label: the server nested it,
+  so the box's text no longer matches and the label words would be saved into the body.
 - **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in
   local D1 for a live test is overwritten before the test starts. Run a one-off spec with a config that spreads
   `playwright.config.ts` and sets `globalSetup: undefined` (measured 2026-11-12).
