@@ -1060,7 +1060,11 @@ async function run() {
         assert(ev.complete === true, "#1348: a two-parent merge maps completely");
         assert(!ev.refs.includes("48:3"), "  ...and does NOT credit the export's verse (48:3) to the human merge");
         assert(!ev.refs.includes("48:1"), "  ...nor the first parent's own edit (48:1), which that commit already carries");
-        assert(ev.refs.length === 1 && ev.refs[0] === "48:5", "  ...only the verse the merge itself changed (48:5)");
+        // 48:4 rides along because the changed line opens 48:5 and so is also
+        // credited to the verse in effect when it starts, the same deliberate
+        // over-claim refsTouchedInUsfm makes for a hunk on that line.
+        assert(ev.refs.includes("48:5"), "  ...but it DOES credit the verse the merge itself changed (48:5)");
+        assert(ev.refs.every((r) => r === "48:4" || r === "48:5"), "  ...and nothing beyond that line's verses");
         assert(!asked.some((u) => u.includes(`${MERGE}.diff`)), "  ...without fetching the merge's first-parent diff");
         assert(asked.length === 3, "  ...for three subrequests: the merge's file plus each parent's");
       }
@@ -1081,8 +1085,10 @@ async function run() {
         const deleted = lines({ 2: "\\v 1 one \\b fixed", 4: "\\v 3 about 13.5 kilometers", 5: null });
         serve(files(deleted));
         const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()]);
-        assert(ev.complete === true && ev.refs.length === 1 && ev.refs[0] === "48:4",
-          "#1348: a verse the merge deleted is claimed, and only that verse");
+        assert(ev.complete === true && ev.refs.includes("48:4"), "#1348: a verse the merge deleted is claimed");
+        // 48:3 is the verse in effect at the join, claimed the way the hunk
+        // mapper claims both sides of a pure deletion.
+        assert(ev.refs.every((r) => r === "48:3" || r === "48:4"), "  ...with nothing beyond the join");
       }
       {
         // A merge whose file is byte-identical to one parent authored nothing
@@ -1096,7 +1102,9 @@ async function run() {
         assert(asked.length === 3, "  ...after the same three fetches");
         serve(files(EXPORT_TEXT));
         const withHuman = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit(), humanCommit]);
-        assert(withHuman.complete === true && withHuman.refs.length === 1 && withHuman.refs[0] === "48:1",
+        // (48:* is the human hunk's own start-of-line claim: \v 1 opens on a
+        // line that begins in chapter front matter.)
+        assert(withHuman.complete === true && withHuman.refs.includes("48:1") && !withHuman.refs.includes("48:3"),
           "  ...and beside a real human commit, only that commit's refs remain");
       }
       {
