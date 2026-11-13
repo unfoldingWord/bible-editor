@@ -16,6 +16,7 @@ import {
   extractVersesForRange,
   dropDuplicateSourceMilestones,
   healReplacementChars,
+  nestWordLabels,
   normalizeNoteWhitespace,
   parseTsv,
   recomputeTargetOccurrences,
@@ -2236,6 +2237,12 @@ async function applyVerseUpdate(
     try {
       const parsed = JSON.parse(contentJson) as { verseObjects?: unknown[] };
       if (Array.isArray(parsed?.verseObjects)) {
+        // Nest a `\sp` label written as words (#1350) first, so every healer
+        // below and the stored tree see it as a label, the same shape the
+        // staging step's extractVersesForRange gives. A no-op on a tree staged
+        // that way; it catches one staged before the nest existed, or flat
+        // from any other producer. The curl pass then leaves the label alone.
+        parsed.verseObjects = nestWordLabels(parsed.verseObjects);
         // Drop AI-mangled orphan `\zaln-e` end-markers / bare "-e" junk before
         // recompute, so the cleaned tree lands in D1 (and exports clean). See
         // stripOrphanAlignmentMarkers — MIC 6:10 UST.
