@@ -17,6 +17,8 @@ import { fileURLToPath } from "node:url";
 
 import { applyVerseRowsForTest, confirmedBasesForCutoffForTest, bookLockedForAlert, structureComponentForTest } from "./bookReimport.ts";
 import { MAX_STRUCTURE_COMPONENT_ROWS } from "./verseStructure.ts";
+import { fetchHumanTouchedRefs } from "./dcsSources.ts";
+import { classifyMasterCommit, compactLineage, summarizeLineage } from "./masterLineage.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 import { SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL, UPSERT_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictSql.ts";
 
@@ -400,6 +402,96 @@ console.log("\n[#540 item 2: an AI-only master movement never overwrites a later
     );
     eq(counts.merge_kept_ai, 0, "…and reports no kept AI conflict it did not measure");
   }
+}
+
+console.log("\n[#1348: a Door43 'Merge branch master' over our export does not replace a later app edit with the export's text]");
+{
+  // The EZK UST 48:13 journey (2026-11-12/13), end to end through the real
+  // lineage evidence and the real applyVerseRows. A translator edited 48:13
+  // after the export the watermark sits on; a later export published an
+  // intermediate version; a Door43 editor's local "Merge branch 'master'"
+  // (parents: his own \b-marker commit, our export) landed on master. Before
+  // #1348 the merge's first-parent diff was our export's diff, so 48:13 was
+  // credited to a human and the sync replaced the translator's newer text
+  // with the export's older one. Now the merge is credited only with what it
+  // changed itself, so 48:13 rests on our own export and the app edit stays.
+  const MERGE = "1088141100000000000000000000000000000000";
+  const HUMAN = "c20a06c500000000000000000000000000000000";
+  const EXPORT = "3aea90c600000000000000000000000000000000";
+  const BASE = "11c6654a00000000000000000000000000000000";
+  const PATH = "26-EZK.usfm";
+  // The human's own edit sits in another chapter: a hunk on a chapter's
+  // FIRST verse line also claims `c:*` (refsTouchedInUsfm's front-matter
+  // over-claim), which would protect all of chapter 48 for a reason
+  // unrelated to this issue.
+  const usfm = (v2, v13) =>
+    ["\\id EZK", "\\c 47", "\\v 1 one", `\\v 2 ${v2}`, "\\c 48", "\\v 12 twelve", `\\v 13 ${v13}`, "\\v 14 fourteen", ""].join("\n");
+  const OLD = "about 13.5 kilometers";
+  const EXPORTED = "13.5 kilometers in length [(east to west)]";
+  const APP = "13.5 kilometers in length {(east to west)}";
+  const texts = {
+    [BASE]: usfm("two", OLD),
+    [HUMAN]: usfm("two \\b fixed", OLD),
+    [EXPORT]: usfm("two", EXPORTED),
+    [MERGE]: usfm("two \\b fixed", EXPORTED),
+  };
+  const hdr = [`diff --git a/${PATH} b/${PATH}`, `--- a/${PATH}`, `+++ b/${PATH}`];
+  const humanDiff = [...hdr, "@@ -4 +4 @@", "-\\v 2 two", "+\\v 2 two \\b fixed", ""].join("\n");
+  // Door43's first-parent `.diff` of the merge: the export's own change.
+  const mergeDiff = [...hdr, "@@ -7 +7 @@", `-\\v 13 ${OLD}`, `+\\v 13 ${EXPORTED}`, ""].join("\n");
+  const body = (b) => ({ ok: true, headers: { get: () => null }, arrayBuffer: async () => new TextEncoder().encode(b).buffer });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes(`${MERGE}.diff`)) return body(mergeDiff);
+    if (u.includes(`${HUMAN}.diff`)) return body(humanDiff);
+    for (const [sha, t] of Object.entries(texts)) if (u.includes(`ref=${sha}`)) return body(t);
+    throw new Error(`unexpected fetch: ${u}`);
+  };
+  let lineage;
+  try {
+    const commits = [
+      { sha: MERGE, message: "Merge branch 'master' of git.door43.org:unfoldingWord/en_ust", authorEmail: "rich.mahn@unfoldingword.org", parentSha: HUMAN, allParentShas: [HUMAN, EXPORT] },
+      { sha: EXPORT, message: "bible-editor export: EZK", authorEmail: "editor@example.org", parentSha: BASE, allParentShas: [BASE] },
+      { sha: HUMAN, message: "Fixes for \\b markers", authorEmail: "rich.mahn@unfoldingword.org", parentSha: BASE, allParentShas: [BASE] },
+    ].map(classifyMasterCommit);
+    const humans = commits.filter((c) => c.kind === "human");
+    eq(humans.map((c) => c.sha), [MERGE, HUMAN], "the merge commit and the \\b-marker commit both stay human");
+    const oursShas = commits.filter((c) => c.kind === "ours").map((c) => c.sha);
+    eq(oursShas, [EXPORT], "our export commit classifies as ours");
+    const humanRefs = await fetchHumanTouchedRefs({}, "en_ust", PATH, humans, oursShas);
+    lineage = compactLineage(summarizeLineage(commits, { incomplete: false, incompleteReason: "", humanRefs }));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  eq(lineage.refsComplete, true, "the per-verse evidence is complete");
+  eq(lineage.humanRefs.includes("48:13"), false, "…and does not credit 48:13 (the export's verse) to a human");
+
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (36, 36, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 48, 13, NULL, ?, ?, ?, 9, 36)`,
+    )
+    .run(BOOK, VERSION, contentJson(APP), APP);
+  // The watermark's ancestor: the older export's text.
+  const boundary = Number(
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('verse', ?, ?, 'update', ?, 100)`,
+      )
+      .run(`${BOOK}/48/13/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson(OLD)) })).lastInsertRowid,
+  );
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(48, 13, EXPORTED)], null,
+    { confirmedAt: 200, editId: boundary, lineage }, false,
+  );
+  const row = sqlite.prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 48 AND verse = 13").get(BOOK);
+  eq(row.content_json, contentJson(APP), "the translator's later app edit survives; the export's older text is not adopted");
+  eq(row.version, 9, "…and nothing is written");
+  eq(counts.merge_adopted, 0, "…no adoption is counted");
 }
 
 console.log("\n[#537: a content-bearing 'baseline' edit_log row recovers an ancestor the id boundary alone would miss]");

@@ -4749,7 +4749,10 @@ async function loadMasterLineage(
       const humans = classified.filter((c) => c.kind === "human");
       let humanRefs: HumanRefEvidence | null = null;
       if (humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
-        humanRefs = await fetchHumanTouchedRefs(env, file.repo, file.path, humans);
+        // #1348: our export commits in the window, so a Door43 merge over one
+        // is not credited with the export's own verses.
+        const oursShas = classified.filter((c) => c.kind === "ours").map((c) => c.sha);
+        humanRefs = await fetchHumanTouchedRefs(env, file.repo, file.path, humans, oursShas);
       }
       const summary = compactLineage(summarizeLineage(classified, {
         incomplete: false,
@@ -4816,7 +4819,9 @@ async function loadMasterLineage(
   const humans = commits.filter((c) => c.kind === "human");
   let humanRefs: HumanRefEvidence | null = null;
   if (!page.incomplete && humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
-    humanRefs = await fetchHumanTouchedRefs(env, file.repo, file.path, humans);
+    // #1348: see the ledger branch above.
+    const oursShas = commits.filter((c) => c.kind === "ours").map((c) => c.sha);
+    humanRefs = await fetchHumanTouchedRefs(env, file.repo, file.path, humans, oursShas);
   }
   const lineage = summarizeLineage(commits, {
     incomplete: page.incomplete,

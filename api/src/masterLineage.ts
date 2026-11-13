@@ -102,7 +102,11 @@
 //    AI_MARKER is otherwise INERT in the history this module actually sees: it
 //    fires 339× repo-wide and ZERO times path-scoped, because all 339 are
 //    `Merge pull request …` commits and Gitea's path-scoped history
-//    simplification drops merge commits. Kept rather than retired — it is the
+//    simplification drops merge commits. (CORRECTED by issue #1348: it drops
+//    only a merge whose file equals one parent's. A local "Merge branch
+//    'master'" that combined changes from both sides to the file IS listed,
+//    e.g. en_ust 10881411 for 26-EZK.usfm; fetchHumanTouchedRefs maps such a
+//    merge against every parent.) Kept rather than retired — it is the
 //    one route that still recognizes a future bot pushing under an author
 //    BOT_EMAILS does not know (see the constant's own note) — but do not
 //    credit it with doing work today. (issue #612)
@@ -1388,6 +1392,154 @@ export function refsTouchedInTsv(fileText: string, hunks: HunkRange[]): HumanRef
   // `hunks.length > 0` guarantees `refs.size > 0` by construction — the shape
   // that guard exists to catch cannot occur on this per-line, stateless path.
   return { complete: true, refs: [...refs], reason: "" };
+}
+
+// ── Merge commits (issue #1348) ──────────────────────────────────────────
+//
+// A merge commit's `.diff` is taken against its FIRST parent only. When a
+// Door43 editor pushes a local "Merge branch 'master'" whose second parent is
+// our own export, that diff is our export's diff, and mapping it credits every
+// verse our export published to a human (EZK UST 48:13, 2026-11-12: commit
+// 10881411, parents [c20a06c5, 3aea90c6]). The fix compares the merge's file
+// with OUR EXPORT parent's file per ref: content equal to our export's is our
+// own render of D1, so only refs that differ from it can hold a Door43 edit.
+//
+// Deliberately NOT git's full combined-diff rule (differ from EVERY parent).
+// That rule also drops refs the merge carried in from a HUMAN parent, which is
+// an under-claim when that parent's commits fall outside the lineage window
+// (a feature branch committed before the watermark and merged after it): the
+// merge is then the only window commit carrying those edits. So a human
+// parent's side stays credited to the merge, as the first-parent diff did.
+
+// The bucket for lines we cannot place on a verse: USFM before the first `\c`,
+// TSV rows whose ref column will not parse (the header among them). A
+// difference in this bucket cannot be narrowed, same as the hunk mappers.
+const UNPLACED = "unplaced";
+
+interface RefSegments {
+  lines: string[];
+  /** ref key -> the indexes of the lines credited to it, in file order. */
+  byRef: Map<string, number[]>;
+}
+
+// Split a USFM file into per-ref line lists using the SAME walk and the same
+// over-broad crediting as refsTouchedInUsfm: a line goes to the verse in effect
+// when it starts and to every verse it opens; chapter front matter goes to
+// `c:*`. Identical crediting is what makes a ref compare equal across two
+// revisions exactly when the hunk mapper would not have claimed it.
+function segmentUsfmByRef(fileText: string): RefSegments | string {
+  const lines = fileText.split("\n");
+  const byRef = new Map<string, number[]>();
+  let chapter = 0;
+  let verseLo = -1;
+  let verseHi = -1;
+  const credit = (i: number) => {
+    const keys: string[] = [];
+    if (chapter <= 0) keys.push(UNPLACED);
+    else if (verseLo < 0) keys.push(`${chapter}:*`);
+    else for (let v = verseLo; v <= verseHi; v++) keys.push(`${chapter}:${v}`);
+    for (const k of keys) {
+      const list = byRef.get(k);
+      if (list) list.push(i);
+      else byRef.set(k, [i]);
+    }
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    credit(i);
+    if (!line.includes("\\c ") && !line.includes("\\v ")) continue;
+    for (const m of line.matchAll(CV_MARKER_RE)) {
+      const n = Number(m[2]);
+      if (!Number.isFinite(n)) return "unparseable_marker";
+      if (m[1] === "c") {
+        chapter = n;
+        verseLo = -1;
+        verseHi = -1;
+      } else {
+        const end = m[3] === undefined ? n : Number(m[3]);
+        if (
+          !Number.isFinite(end) ||
+          end < n ||
+          end - n > MAX_BRIDGE_WIDTH ||
+          n > MAX_VERSE_NUMBER ||
+          end > MAX_VERSE_NUMBER
+        ) {
+          return "unparseable_verse_bridge";
+        }
+        verseLo = n;
+        verseHi = end;
+      }
+      credit(i);
+    }
+  }
+  return { lines, byRef };
+}
+
+// Split a TSV file into per-ref row lists, keyed by parseTsvRefColumn exactly
+// as refsTouchedInTsv keys them.
+function segmentTsvByRef(fileText: string): RefSegments {
+  const lines = fileText.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  const byRef = new Map<string, number[]>();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const tab = line.indexOf("\t");
+    const keys = parseTsvRefColumn(tab === -1 ? line : line.slice(0, tab)) ?? [UNPLACED];
+    for (const k of keys) {
+      const list = byRef.get(k);
+      if (list) list.push(i);
+      else byRef.set(k, [i]);
+    }
+  }
+  return { lines, byRef };
+}
+
+function sameAtRef(a: RefSegments, b: RefSegments, key: string): boolean {
+  const ia = a.byRef.get(key);
+  const ib = b.byRef.get(key);
+  if (ia === undefined || ib === undefined) return ia === ib;
+  if (ia.length !== ib.length) return false;
+  for (let i = 0; i < ia.length; i++) if (a.lines[ia[i]] !== b.lines[ib[i]]) return false;
+  return true;
+}
+
+// The refs whose content in `mergeText` differs from the content in EVERY one
+// of `parentTexts` (the caller passes our export parents only; see above).
+// Iterates the union of refs across all revisions, so a verse the merge
+// deleted (present in the parent, absent in the merge) is claimed too. Every
+// text must be the file as it stood at that exact commit, as for the hunk
+// mappers.
+//
+// A complete answer with zero refs is real here (a merge identical to our
+// export at every ref), unlike the hunk mappers; the caller's window-level
+// no_refs_mapped guard still refuses a window where nothing mapped at all.
+export function refsDifferingFromEveryParent(
+  format: "usfm" | "tsv",
+  mergeText: string,
+  parentTexts: string[],
+): HumanRefEvidence {
+  if (parentTexts.length === 0) return REF_INCOMPLETE("no_merge_parents");
+  const segment = (t: string): RefSegments | string => (format === "usfm" ? segmentUsfmByRef(t) : segmentTsvByRef(t));
+  const merge = segment(mergeText);
+  if (typeof merge === "string") return REF_INCOMPLETE(merge);
+  const parents: RefSegments[] = [];
+  for (const t of parentTexts) {
+    const p = segment(t);
+    if (typeof p === "string") return REF_INCOMPLETE(p);
+    parents.push(p);
+  }
+  const keys = new Set<string>(merge.byRef.keys());
+  for (const p of parents) for (const k of p.byRef.keys()) keys.add(k);
+  const refs: string[] = [];
+  for (const key of keys) {
+    if (parents.some((p) => sameAtRef(merge, p, key))) continue;
+    if (key === UNPLACED) {
+      return REF_INCOMPLETE(format === "usfm" ? "before_first_chapter" : "unparseable_ref_column");
+    }
+    refs.push(key);
+    if (refs.length > LINEAGE_REF_CAP) return REF_INCOMPLETE("ref_cap_exceeded");
+  }
+  return { complete: true, refs, reason: "" };
 }
 
 // Union the per-commit evidence. One incomplete part makes the whole window

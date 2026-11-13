@@ -981,6 +981,164 @@ async function run() {
       assert(ev.complete === false, "one unfetchable commit makes the window incomplete");
       assert(ev.refs.length === 0, "  ...and carries no partial ref set");
     }
+
+    // ── Merge commits (issue #1348) ──────────────────────────────────────
+    // The EZK UST 48:13 shape, 2026-11-12: a Door43 editor's local
+    // "Merge branch 'master'" commit 10881411 has parents [c20a06c5 (his own
+    // \b fixes), 3aea90c6 (our export)]. Its `.diff` is taken against the
+    // FIRST parent, so it is exactly our export's diff, and mapping it
+    // credited every verse our export published to a human. Content the merge
+    // holds exactly as our export does is our own render, so for a merge with
+    // an export parent in the window only refs that differ from that export
+    // are credited. A HUMAN parent's side stays credited (its commits may be
+    // outside the window), just as the first-parent diff credited it.
+    {
+      const EZK = "26-EZK.usfm";
+      const MERGE = "1088141100000000000000000000000000000000";
+      const HUMAN = "c20a06c500000000000000000000000000000000"; // first parent: a human edit
+      const EXPORT = "3aea90c600000000000000000000000000000000"; // second parent: our export
+      const BASE = "11c6654a00000000000000000000000000000000";
+      const FEATURE = "feed000000000000000000000000000000000000";
+      const lines = (over = {}) => {
+        const l = ["\\id EZK", "\\c 48", "\\v 1 one", "\\v 2 two", "\\v 3 three", "\\v 4 four", "\\v 5 five", "\\v 6 six", ""];
+        for (const [i, v] of Object.entries(over)) l[Number(i)] = v;
+        return l.filter((x) => x !== null).join("\n");
+      };
+      const H = { 3: "\\v 2 two \\b fixed" }; // the human edits 48:2
+      const E = { 5: "\\v 4 about 13.5 kilometers" }; // our export edits 48:4
+      const BASE_TEXT = lines();
+      const HUMAN_TEXT = lines(H);
+      const EXPORT_TEXT = lines(E);
+      // The merge holds both sides, plus 48:6 changed in the merge itself.
+      const MERGE_TEXT = lines({ ...H, ...E, 7: "\\v 6 six merged" });
+      const hdr = [`diff --git a/${EZK} b/${EZK}`, `--- a/${EZK}`, `+++ b/${EZK}`];
+      // What Door43 serves as the merge's `.diff`: against the first parent,
+      // so the export's 48:4 hunk shows up as if the merge authored it.
+      const MERGE_DIFF = [...hdr, "@@ -6 +6 @@", "-\\v 4 four", "+\\v 4 about 13.5 kilometers",
+        "@@ -8 +8 @@", "-\\v 6 six", "+\\v 6 six merged", ""].join("\n");
+      const HUMAN_DIFF = [...hdr, "@@ -4 +4 @@", "-\\v 2 two", "+\\v 2 two \\b fixed", ""].join("\n");
+      const mergeCommit = (parents = [HUMAN, EXPORT]) => ({
+        sha: MERGE,
+        message: "Merge branch 'master' of git.door43.org:unfoldingWord/en_ust",
+        authorEmail: "rich.mahn@unfoldingword.org",
+        parentSha: parents[0],
+        allParentShas: parents,
+      });
+      const humanCommit = {
+        sha: HUMAN,
+        message: "Fixes for \\b markers",
+        authorEmail: "rich.mahn@unfoldingword.org",
+        parentSha: BASE,
+        allParentShas: [BASE],
+      };
+      const OURS = [EXPORT];
+      const raw = (sha, body) => [`raw/${EZK}?ref=${sha}`, () => res({ body, contentLength: body.length })];
+      const files = (mergeText = MERGE_TEXT) => [
+        [`git/commits/${MERGE}.diff`, () => res({ body: MERGE_DIFF })],
+        [`git/commits/${HUMAN}.diff`, () => res({ body: HUMAN_DIFF })],
+        raw(MERGE, mergeText),
+        raw(HUMAN, HUMAN_TEXT),
+        raw(EXPORT, EXPORT_TEXT),
+        raw(BASE, BASE_TEXT),
+      ];
+
+      {
+        serve(files());
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(ev.complete === true, "#1348: a merge over our export maps completely");
+        assert(!ev.refs.includes("48:4") && !ev.refs.includes("48:3"),
+          "  ...and does NOT credit the export's verse (48:4, nor 48:3 sharing its line) to the human merge");
+        assert(ev.refs.includes("48:6"), "  ...but credits the verse the merge itself changed (48:6)");
+        assert(ev.refs.includes("48:2"), "  ...and the human parent's side (48:2), as the first-parent diff did");
+        assert(!asked.some((u) => u.includes(`${MERGE}.diff`)), "  ...without fetching the merge's first-parent diff");
+        assert(asked.length === 2, "  ...for two subrequests: the merge's file and our export's");
+      }
+      {
+        // The whole incident window: the human's own commit plus the merge.
+        serve(files());
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit(), humanCommit], OURS);
+        assert(ev.complete === true, "#1348: a window holding the human commit and the merge maps completely");
+        assert(ev.refs.includes("48:2") && ev.refs.includes("48:6"), "  ...crediting the human's edit and the merge's own change");
+        assert(!ev.refs.includes("48:4"), "  ...but never the export-only verse (48:4)");
+      }
+      {
+        // A verse the merge DELETED (present in our export, gone in the merge)
+        // differs from the export, so it is claimed.
+        serve(files(lines({ ...H, ...E, 6: null })));
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(ev.complete === true && ev.refs.includes("48:5"), "#1348: a verse the merge deleted is claimed");
+      }
+      {
+        // A merge whose file is byte-identical to our export's adds nothing.
+        // Alone in a window, that zero-ref answer is still refused as
+        // evidence (no_refs_mapped), like any commit that maps to no verse:
+        // the file-level answer stands.
+        serve(files(EXPORT_TEXT));
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(ev.complete === false && ev.reason === "no_refs_mapped",
+          "#1348: a merge identical to our export adds no refs, and alone it stays fail-closed");
+        assert(asked.length === 2, "  ...after the same two fetches");
+        serve(files(EXPORT_TEXT));
+        const withHuman = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit(), humanCommit], OURS);
+        assert(withHuman.complete === true && withHuman.refs.includes("48:2") && !withHuman.refs.includes("48:4"),
+          "  ...and beside a real human commit, only that commit's refs remain");
+      }
+      {
+        // Any file that cannot be read keeps the fail-closed answer.
+        serve([raw(MERGE, MERGE_TEXT), [`raw/${EZK}?ref=${EXPORT}`, () => res({ ok: false })]]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(ev.complete === false && ev.reason === "parent_revision_fetch_failed",
+          "#1348: a failed fetch of our export parent's file is incomplete");
+        assert(ev.refs.length === 0, "  ...carrying no partial ref set");
+        serve([[`raw/${EZK}?ref=${MERGE}`, () => res({ ok: false })]]);
+        const own = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(own.complete === false && own.reason === "revision_fetch_failed",
+          "  ...and so is a failed fetch of the merge's own file");
+      }
+      {
+        // A difference in the book header (before the first \c) cannot be
+        // placed on a verse, same as the single-parent mapper.
+        serve(files(lines({ ...H, ...E, 0: "\\id EZK merged header" })));
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(ev.complete === false && ev.reason === "before_first_chapter",
+          "#1348: a change before the first chapter is incomplete");
+      }
+      {
+        // No export parent in the window (none passed, or a merge of two
+        // human sides): unchanged first-parent diff path.
+        serve(files());
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()]);
+        assert(ev.complete === true && ev.refs.includes("48:4") && ev.refs.includes("48:6"),
+          "#1348: a merge with no export parent in the window keeps the first-parent diff answer");
+        assert(asked.some((u) => u.includes(`${MERGE}.diff`)), "  ...fetched from the merge's .diff as before");
+      }
+      {
+        // The mirror orientation: a human feature branch merged INTO master
+        // after our export, its own commits predating the window. The merge is
+        // the only window commit carrying the feature's edit, so it must still
+        // be credited (git's full "differ from every parent" rule would drop it).
+        const FEATURE_TEXT = lines({ 3: "\\v 2 two feature edit" });
+        const mirrorMerge = lines({ 3: "\\v 2 two feature edit", ...E });
+        serve([raw(MERGE, mirrorMerge), raw(EXPORT, EXPORT_TEXT), raw(FEATURE, FEATURE_TEXT)]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit([EXPORT, FEATURE])], OURS);
+        assert(ev.complete === true && ev.refs.includes("48:2"),
+          "#1348: a feature branch merged over our export is still credited with the feature's edit");
+        assert(!ev.refs.includes("48:4"), "  ...and still not with the export's");
+      }
+      {
+        // TSV: rows are keyed by their Reference column.
+        const TP = "tn_JER.tsv";
+        const t = (r1, r2, r3) => ["Reference\tID\tNote", `40:1\taaaa\t${r1}`, `40:2\tbbbb\t${r2}`, `40:3\tcccc\t${r3}`].join("\n") + "\n";
+        serve([
+          [`raw/${TP}?ref=${MERGE}`, () => res({ body: t("human", "export", "merged") })],
+          [`raw/${TP}?ref=${EXPORT}`, () => res({ body: t("a", "export", "c") })],
+        ]);
+        const ev = await fetchHumanTouchedRefs(env, "en_tn", TP, [mergeCommit()], OURS);
+        assert(ev.complete === true && ev.refs.includes("40:3") && ev.refs.includes("40:1"),
+          "#1348: a TSV merge credits the rows that differ from our export");
+        assert(!ev.refs.includes("40:2"), "  ...and not the row our export changed");
+      }
+    }
   }
 
   // ── fileHeadCommit / fileCommitSha — issue #748 ─────────────────────────

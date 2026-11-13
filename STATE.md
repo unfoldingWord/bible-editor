@@ -386,6 +386,17 @@ Highlights that bite repeatedly:
   stopping too early is the failure. This bit the first version of the commit-lineage wiring, and both cold
   reviews found it independently.
 
+- **A git merge commit's `.diff` is against its first parent only, so it is never a merge's own change set
+  (#1348).** A Door43 editor's local "Merge branch 'master'" whose second parent is our export carries our
+  export's whole diff, and path-scoped history DOES list such a merge when it combined changes to the file from
+  both sides. Mapping that diff credited every verse our export published to a human, and the sync replaced a
+  later app edit with the export's older text (EZK UST 48:13). For a merge with one of OUR export commits in the
+  window as a parent, `fetchHumanTouchedRefs` now credits only refs where the merge's file differs from that
+  export's. NOT git's full combined-diff rule (differ from every parent): that also drops what a HUMAN parent
+  brought in, which under-claims when that branch's commits predate the window (a feature branch merged after
+  the watermark). The ledger path must carry `parent_shas_json` for this to fire; a row without it (pre-0078)
+  takes the old first-parent path. Any new per-commit evidence must ask "how many parents?" first.
+
 - **A merge outcome that reverses who wins needs its own `review_kind`, and its message needs its own first
   line.** The in-app cleanup chip titles itself from `review_kind` and clamps the message to two lines
   (`BookLintIndicator`), and the title was hardcoded per kind — so a row whose app-side edit was KEPT displayed

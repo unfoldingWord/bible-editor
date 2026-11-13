@@ -17,6 +17,8 @@ export interface LedgerLineageRow {
   repo: string;
   sha: string;
   parent_sha: string | null;
+  /** JSON array of every parent sha (migration 0078); NULL before it. Optional so hand-built rows still type. */
+  parent_shas_json?: string | null;
   author_name: string | null;
   author_email: string | null;
   committed_at: number | null;
@@ -72,6 +74,17 @@ function parseFiles(json: string | null): string[] | null {
   }
 }
 
+function parseParentShas(json: string | null | undefined): { allParentShas: string[] } | null {
+  if (typeof json !== "string") return null;
+  try {
+    const v: unknown = JSON.parse(json);
+    if (!Array.isArray(v) || !v.every((s) => typeof s === "string")) return null;
+    return { allParentShas: v as string[] };
+  } catch {
+    return null;
+  }
+}
+
 function classifyStored(row: LedgerLineageRow): ClassifiedCommit | null {
   if (row.classification !== "ours" && row.classification !== "ai" && row.classification !== "human") {
     return null;
@@ -83,6 +96,10 @@ function classifyStored(row: LedgerLineageRow): ClassifiedCommit | null {
     authorName: row.author_name,
     committerDate: row.committed_at == null ? null : new Date(row.committed_at * 1000).toISOString(),
     parentSha: row.parent_sha,
+    // Every parent, so fetchHumanTouchedRefs can tell a merge commit from an
+    // ordinary one (issue #1348). Unknown (NULL / malformed) stays absent,
+    // which keeps the single-parent path.
+    ...(parseParentShas(row.parent_shas_json) ?? {}),
   };
   // The stored classification is the result of classifyForLedger at poll time.
   // Re-running the classifier here would lose the commit body (the ledger
@@ -149,7 +166,7 @@ export async function readLedgerMasterLineage(
   // which only leans toward "human found".
   const rows = await db
     .prepare(
-      `SELECT repo, sha, parent_sha, author_name, author_email, committed_at, message,
+      `SELECT repo, sha, parent_sha, parent_shas_json, author_name, author_email, committed_at, message,
               classification, classification_reason, files_json
          FROM dcs_commits
         WHERE repo = ?1 AND (committed_at >= ?2 OR committed_at IS NULL OR seen_at > ?2)
