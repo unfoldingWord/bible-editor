@@ -4714,6 +4714,25 @@ function countAllMilestones(nodes) {
     "great fights; “the king", /use in \\q1 great fights; “the king rules/, ["wars", "Your"]);
   check("#1371 guard, opener dropped, wars. “Your -> great fights; Your", opener, "wars. “Your", "great fights; Your",
     /use in \\q1 great fights; Your king rules/, ["wars"]);
+  // #1378: a translator types a straight quote in the Replace box, and
+  // find/replace curls only the result tree, so both rules must read a
+  // straight `"`/`'` at the start of the new words as the opener it becomes.
+  const checkStraight = (label, content, find, replacement, curled, wantRe, unaligned) => {
+    const r = run(content, find, replacement);
+    const ed = extractEditableText(r.content);
+    assert(extractPlainText(r.content) === extractPlainText(content).replace(find, curled), `${label}: text is the curled replacement (got ${JSON.stringify(extractPlainText(r.content))})`);
+    assert(markers(r.content) === markers(content) && wantRe.test(ed), `${label}: every line marker kept, in place (got ${JSON.stringify(ed)})`);
+    onlyUnaligned(label, content, r.content, unaligned);
+  };
+  checkStraight("#1378 straight \" (#1369 rule), wars. “Your king -> wars; \"the great king", opener, "wars. “Your king", 'wars; "the great king',
+    "wars; “the great king", /use in wars;\s*\\q1 “the great king rules/, ["Your"]);
+  checkStraight("#1378 straight \" (#1371 rule), wars. “Your -> great fights; \"Your", opener, "wars. “Your", 'great fights; "Your',
+    "great fights; “Your", /use in great fights;\s*\\q1 “Your king rules/, ["wars"]);
+  const singleOpener = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1("‘"), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.’")] };
+  checkStraight("#1378 straight ' (#1369 rule), wars. ‘Your king -> wars; 'the great king", singleOpener, "wars. ‘Your king", "wars; 'the great king",
+    "wars; ‘the great king", /use in wars;\s*\\q1 ‘the great king rules/, ["Your"]);
+  checkStraight("#1378 straight ' (#1371 rule), wars. ‘Your -> great fights; 'Your", singleOpener, "wars. ‘Your", "great fights; 'Your",
+    "great fights; ‘Your", /use in great fights;\s*\\q1 ‘Your king rules/, ["wars"]);
   {
     const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
     const v613 = { verseObjects: zecUlt.chapters["6"]["13"].verseObjects };
