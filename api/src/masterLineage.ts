@@ -1400,15 +1400,16 @@ export function refsTouchedInTsv(fileText: string, hunks: HunkRange[]): HumanRef
 // Door43 editor pushes a local "Merge branch 'master'" whose second parent is
 // our own export, that diff is our export's diff, and mapping it credits every
 // verse our export published to a human (EZK UST 48:13, 2026-11-12: commit
-// 10881411, parents [c20a06c5, 3aea90c6]). Git's combined-diff rule is the
-// fix: a ref the merge holds exactly as one of its parents does was carried in
-// from that parent, so the merge authored only the refs that differ from EVERY
-// parent. Changes on a parent's side are not lost by this: a human parent is
-// its own commit in the window and is mapped from its own diff.
+// 10881411, parents [c20a06c5, 3aea90c6]). The fix compares the merge's file
+// with OUR EXPORT parent's file per ref: content equal to our export's is our
+// own render of D1, so only refs that differ from it can hold a Door43 edit.
 //
-// More than two parents (an octopus merge) costs a full-file fetch per parent
-// and has never been measured on Door43, so it is refused (fail-closed).
-export const MAX_MERGE_PARENTS = 2;
+// Deliberately NOT git's full combined-diff rule (differ from EVERY parent).
+// That rule also drops refs the merge carried in from a HUMAN parent, which is
+// an under-claim when that parent's commits fall outside the lineage window
+// (a feature branch committed before the watermark and merged after it): the
+// merge is then the only window commit carrying those edits. So a human
+// parent's side stays credited to the merge, as the first-parent diff did.
 
 // The bucket for lines we cannot place on a verse: USFM before the first `\c`,
 // TSV rows whose ref column will not parse (the header among them). A
@@ -1502,14 +1503,15 @@ function sameAtRef(a: RefSegments, b: RefSegments, key: string): boolean {
   return true;
 }
 
-// The refs a merge commit itself authored in one file: those whose content in
-// `mergeText` differs from the content in EVERY parent's text. Iterates the
-// union of refs across all revisions, so a verse the merge deleted (present in
-// every parent, absent in the merge) is claimed too. Every text must be the
-// file as it stood at that exact commit, as for the hunk mappers.
+// The refs whose content in `mergeText` differs from the content in EVERY one
+// of `parentTexts` (the caller passes our export parents only; see above).
+// Iterates the union of refs across all revisions, so a verse the merge
+// deleted (present in the parent, absent in the merge) is claimed too. Every
+// text must be the file as it stood at that exact commit, as for the hunk
+// mappers.
 //
-// A complete answer with zero refs is real here (a merge that only combined
-// its parents' changes), unlike the hunk mappers; the caller's window-level
+// A complete answer with zero refs is real here (a merge identical to our
+// export at every ref), unlike the hunk mappers; the caller's window-level
 // no_refs_mapped guard still refuses a window where nothing mapped at all.
 export function refsDifferingFromEveryParent(
   format: "usfm" | "tsv",

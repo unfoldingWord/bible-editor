@@ -457,7 +457,9 @@ console.log("\n[#1348: a Door43 'Merge branch master' over our export does not r
     ].map(classifyMasterCommit);
     const humans = commits.filter((c) => c.kind === "human");
     eq(humans.map((c) => c.sha), [MERGE, HUMAN], "the merge commit and the \\b-marker commit both stay human");
-    const humanRefs = await fetchHumanTouchedRefs({}, "en_ust", PATH, humans);
+    const oursShas = commits.filter((c) => c.kind === "ours").map((c) => c.sha);
+    eq(oursShas, [EXPORT], "our export commit classifies as ours");
+    const humanRefs = await fetchHumanTouchedRefs({}, "en_ust", PATH, humans, oursShas);
     lineage = compactLineage(summarizeLineage(commits, { incomplete: false, incompleteReason: "", humanRefs }));
   } finally {
     globalThis.fetch = realFetch;

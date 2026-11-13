@@ -6,7 +6,6 @@
 import type { Env } from "./index";
 import {
   LINEAGE_REFINE_MAX_HUMAN_COMMITS,
-  MAX_MERGE_PARENTS,
   mergeRefEvidence,
   parseDiffHunksForPath,
   refsDifferingFromEveryParent,
@@ -711,6 +710,10 @@ export async function fetchHumanTouchedRefs(
   repo: string,
   path: string,
   humanCommits: MasterCommit[],
+  // The shas of the window's commits classified `ours` (our own exports). Only
+  // a merge with one of these as a parent is mapped against its parents
+  // (issue #1348); empty keeps every commit on the first-parent diff path.
+  oursShas: Iterable<string> = [],
 ): Promise<HumanRefEvidence> {
   // USFM and TSV both map (issue #607: TSV used to refuse here and keep the
   // file-level answer — `not_usfm` — because only refsTouchedInUsfm existed).
@@ -732,45 +735,46 @@ export async function fetchHumanTouchedRefs(
 
   const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
   const parts: HumanRefEvidence[] = [];
+  const ours = new Set<string>();
+  for (const o of oursShas) if (typeof o === "string") ours.add(o.toLowerCase());
   for (const c of humanCommits) {
     const sha = (c.sha ?? "").toLowerCase();
     if (!FULL_SHA_RE.test(sha)) {
       parts.push({ complete: false, refs: [], reason: "abbreviated_sha" });
       break;
     }
-    // A merge commit (issue #1348). Its `.diff` is against the first parent
-    // only, so mapping it would credit the merge with everything its other
-    // parent brought in (our own export, in the EZK UST 48:13 incident). Read
-    // the file at the merge and at every parent instead, and keep only the refs
-    // that differ from all of them (refsDifferingFromEveryParent). Same
-    // subrequest count as an ordinary commit (diff + new + old = 3) for the
-    // usual two parents: the merge's file plus one per parent, no diff. A file
-    // byte-identical to one parent's means the merge authored nothing in it,
-    // which skips the per-ref compare. Parents unknown (undefined, e.g. a
-    // ledger row written before migration 0078) keep the single-parent path.
-    const mergeParents = Array.isArray(c.allParentShas) && c.allParentShas.length > 1 ? c.allParentShas : null;
-    if (mergeParents) {
-      if (mergeParents.length > MAX_MERGE_PARENTS) {
-        parts.push({ complete: false, refs: [], reason: "too_many_merge_parents" });
-        break;
-      }
-      const parentShas = mergeParents.map((p) => (typeof p === "string" ? p.toLowerCase() : ""));
-      if (parentShas.some((p) => !FULL_SHA_RE.test(p))) {
-        parts.push({ complete: false, refs: [], reason: "abbreviated_sha" });
-        break;
-      }
+    // A merge commit with one of OUR export commits as a parent (issue #1348).
+    // Its `.diff` is against the first parent only, so when our export is the
+    // other parent the diff is our export's own diff, and mapping it credits
+    // every verse we published to a human (EZK UST 48:13, 2026-11-12). Content
+    // the merge holds exactly as our export does is our own render of D1, so it
+    // is not a Door43 edit whoever merged it: read the file at the merge and at
+    // each of our export parents, and keep only the refs that differ from all
+    // of them (refsDifferingFromEveryParent). A human parent's side is NOT
+    // excluded: its commits may predate the window (a feature branch merged
+    // later), and the merge is the only commit in the window that carries them.
+    // Two fetches for the usual shape (merge + our export), against three for
+    // the diff path. A file byte-identical to our export's skips the compare.
+    // A merge with no export parent in the window, or parents unknown (a ledger
+    // row written before migration 0078), keeps the first-parent diff below.
+    const exportParents = Array.isArray(c.allParentShas) && c.allParentShas.length > 1
+      ? c.allParentShas.map((p) => (typeof p === "string" ? p.toLowerCase() : "")).filter((p) => ours.has(p))
+      : [];
+    if (exportParents.length > 0) {
       const mergeText = await fetchCappedText(env, dcsRawUrl(env, repo, path, sha), MAX_REVISION_FILE_BYTES);
       if (mergeText == null) {
         parts.push({ complete: false, refs: [], reason: "revision_fetch_failed" });
         break;
       }
       const parentTexts: string[] = [];
-      for (const p of parentShas) {
-        const t = await fetchCappedText(env, dcsRawUrl(env, repo, path, p), MAX_REVISION_FILE_BYTES);
+      for (const p of exportParents) {
+        const t = FULL_SHA_RE.test(p)
+          ? await fetchCappedText(env, dcsRawUrl(env, repo, path, p), MAX_REVISION_FILE_BYTES)
+          : null;
         if (t == null) break;
         parentTexts.push(t);
       }
-      if (parentTexts.length !== parentShas.length) {
+      if (parentTexts.length !== exportParents.length) {
         parts.push({ complete: false, refs: [], reason: "parent_revision_fetch_failed" });
         break;
       }

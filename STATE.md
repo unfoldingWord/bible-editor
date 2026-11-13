@@ -390,10 +390,12 @@ Highlights that bite repeatedly:
   (#1348).** A Door43 editor's local "Merge branch 'master'" whose second parent is our export carries our
   export's whole diff, and path-scoped history DOES list such a merge when it combined changes to the file from
   both sides. Mapping that diff credited every verse our export published to a human, and the sync replaced a
-  later app edit with the export's older text (EZK UST 48:13). `fetchHumanTouchedRefs` now reads the file at the
-  merge and at every parent and credits only refs that differ from all of them (git's combined-diff rule); the
-  ledger path must carry `parent_shas_json` for this to fire, and a row without it (pre-0078) silently takes the
-  old single-parent path. Any new per-commit evidence must ask "how many parents?" first.
+  later app edit with the export's older text (EZK UST 48:13). For a merge with one of OUR export commits in the
+  window as a parent, `fetchHumanTouchedRefs` now credits only refs where the merge's file differs from that
+  export's. NOT git's full combined-diff rule (differ from every parent): that also drops what a HUMAN parent
+  brought in, which under-claims when that branch's commits predate the window (a feature branch merged after
+  the watermark). The ledger path must carry `parent_shas_json` for this to fire; a row without it (pre-0078)
+  takes the old first-parent path. Any new per-commit evidence must ask "how many parents?" first.
 
 - **A merge outcome that reverses who wins needs its own `review_kind`, and its message needs its own first
   line.** The in-app cleanup chip titles itself from `review_kind` and clamps the message to two lines
