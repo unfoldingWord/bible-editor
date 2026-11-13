@@ -234,9 +234,10 @@ export function createNavHistory(
         (t - since >= SETTLE_MS ||
           (!sameVerse && t - verseSince >= SETTLE_MS) ||
           (landed !== null && sameSpot(landed, current)));
-      if (current && settled && !narrowed) {
+      const recorded = current !== null && settled && !narrowed;
+      if (recorded) {
         entries = entries.filter((e) => !sameSpot(e, current!));
-        entries.push(current);
+        entries.push(current!);
       }
       // Arriving at a place the list already holds (got there by hand)
       // retires that entry: the list never offers the place you stand on.
@@ -245,7 +246,8 @@ export function createNavHistory(
       const firstSight = current === null;
       current = spot;
       since = t;
-      if (!sameVerse) verseSince = t;
+      // A stay on a verse is credited once: once it has an entry, the clock restarts.
+      if (!sameVerse || recorded) verseSince = t;
       // Moving on by hand puts the marker back at the newest end; whatever was
       // ahead of it stays in the list as ordinary recent places.
       // The first position seen after a page load is not a move: leave the
