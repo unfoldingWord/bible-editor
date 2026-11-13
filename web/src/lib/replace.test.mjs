@@ -4689,6 +4689,31 @@ function countAllMilestones(nodes) {
     "wars and battles; the king", /use in wars and battles; the \\q1 king rules/, ["Your"]);
   check("item 3 mirror, wars. Your -> great fights; Your", plainBreak, "wars. Your", "great fights; Your",
     /use in great fights;\s*\\q1 Your king rules/, ["wars"]);
+  // #1371, the mirror with an opener: new words that replace only words
+  // before the break stay before it, and the line keeps its `“` (it saved
+  // `\q1 great fights; “Your king`).
+  check("#1371 mirror with an opener, wars. “Your -> great fights; “Your", opener, "wars. “Your", "great fights; “Your",
+    /use in great fights;\s*\\q1 “Your king rules/, ["wars"]);
+  check("#1371 mirror with an opener, wars. “Your king -> great fights; “Your king", opener, "wars. “Your king", "great fights; “Your king",
+    /use in great fights;\s*\\q1 “Your king rules/, ["wars"]);
+  const twoOpener = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), b(), q1("“"), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.”")] };
+  check("#1371 mirror with two markers, wars. “Your -> great fights; “Your", twoOpener, "wars. “Your", "great fights; “Your",
+    /use in great fights;\s*\\b\s*\\q1 “Your king rules/, ["wars"]);
+  // Guards, pinned as main's results: the real verse (already right on
+  // main), dropped words that straddle the break, and a replacement that
+  // drops the opener.
+  {
+    const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+    const real = { verseObjects: zecUlt.chapters["1"]["14"].verseObjects };
+    check("#1371 guard, ZEC 1:14 ULT Armies: “I -> the hosts: “I", real, "Armies: “I", "the hosts: “I",
+      /of the hosts:\s*\\q1 “I have been/, ["Armies"]);
+    check("#1371 guard, ZEC 1:14 ULT of Armies: “I -> the mighty hosts: “I", real, "of Armies: “I", "the mighty hosts: “I",
+      /Yahweh the mighty hosts:\s*\\q1 “I have been/, ["of", "Armies"]);
+  }
+  check("#1371 guard, dropped words straddle the break, wars. “Your king -> great fights; “the king", opener, "wars. “Your king",
+    "great fights; “the king", /use in \\q1 great fights; “the king rules/, ["wars", "Your"]);
+  check("#1371 guard, opener dropped, wars. “Your -> great fights; Your", opener, "wars. “Your", "great fights; Your",
+    /use in \\q1 great fights; Your king rules/, ["wars"]);
   {
     const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
     const v613 = { verseObjects: zecUlt.chapters["6"]["13"].verseObjects };
@@ -4741,6 +4766,8 @@ function countAllMilestones(nodes) {
       ["#1361 swap at a bare marker", bareQs, /wars\s*\\q1 Your/, "wars; \\q1 The", ["Your"]],
       ["item 1 recase on both sides", cap, /Wars\. \\q1 Your king/, "wars that your enemies started; \\q1 your king", ["Wars", "Your"]],
       ["item 3 unequal swap after an opener marker", openerQs, /wars\. \\q1 “Your/, "wars; \\q1 “the great", ["Your"]],
+      ["#1371 new words before an opener marker", openerQs, /wars\. \\q1 “Your/, "great fights; \\q1 “Your", ["wars"]],
+      ["#1371 new words typed after the opener marker", openerQs, /wars\. \\q1 “Your/, "\\q1 great fights; “Your", ["wars"]],
     ]) {
       const old = extractEditableText(content);
       const want = old.replace(from, to);
