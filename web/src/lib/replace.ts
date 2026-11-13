@@ -595,6 +595,46 @@ function rangeHoldsLineBreak(nodes: unknown[], rawStart: number, rawEnd: number)
   return found;
 }
 
+// Raw offset of every line-break marker, in document order.
+function lineBreakOffsets(nodes: unknown[]): number[] {
+  const out: number[] = [];
+  let pos = 0;
+  const walk = (arr: unknown[]) => {
+    for (const n of arr) {
+      const o = n as Record<string, unknown> | null;
+      if (!o) continue;
+      if (isLineBreakMarkerNode(o)) out.push(pos);
+      if (typeof o["text"] === "string") pos += (o["text"] as string).length;
+      if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
+    }
+  };
+  walk(nodes);
+  return out;
+}
+
+// A copy of top-level `nodes` with the text of each line-break marker whose
+// text overlaps raw [rawStart, rawEnd) moved to a text node right after it
+// (liftMarkerText's split, for those markers only); null when there is none.
+function liftLineBreakTextInRange(nodes: unknown[], rawStart: number, rawEnd: number): unknown[] | null {
+  let pos = 0;
+  let changed = false;
+  const out: unknown[] = [];
+  for (const n of nodes) {
+    const start = pos;
+    pos += rebuildRaw([n]).length;
+    const o = n as Record<string, unknown> | null;
+    const text = o && typeof o["text"] === "string" ? (o["text"] as string) : "";
+    if (o && text !== "" && isLineBreakMarkerNode(o) && !isAcrosticHeading(o) && start < rawEnd && pos > rawStart) {
+      const { text: _text, ...rest } = o;
+      out.push(rest, { type: "text", text });
+      changed = true;
+    } else {
+      out.push(n);
+    }
+  }
+  return changed ? out : null;
+}
+
 // Split a new gap's text at a line break, given the old gap's text before and
 // after it (#1309). Keep the part the replace did not change on its old side:
 // when the new gap still ends with the old after-text (`, “` against `:␤ | “`)
@@ -1029,6 +1069,15 @@ function lcsLink(oldWords: string[], newWords: string[]): number[] {
   return link;
 }
 
+// lcsLink, rightmost on ties.
+function lcsLinkFromRight(oldWords: string[], newWords: string[]): number[] {
+  const rev = lcsLink([...oldWords].reverse(), [...newWords].reverse());
+  return newWords.map((_, j) => {
+    const i = rev[newWords.length - 1 - j];
+    return i < 0 ? -1 : oldWords.length - 1 - i;
+  });
+}
+
 // An inert line-break marker: an in-flow `\q*`/`\p`/`\b` quote/paragraph node
 // (NOT a `\qs`/`\f` content wrapper) with zero raw width — no `text`, no
 // `children`, no `endTag`. These sit BETWEEN content nodes as pure position
@@ -1168,9 +1217,13 @@ function smartRebuildRange(
   // falls in its span, so a survivor is reused as a whole unit (all its leaves
   // + interior connector text stay put). Without this, a possessive anywhere in
   // the range defeats the 1:1 leaf↔word assumption and the whole edit unaligns.
-  const tokens = [...raw.slice(rawStart, rawEnd).matchAll(WORD_RUN_RE)].map((m) => {
+  // A line marker with no text beside it fuses the words on either side in raw
+  // (`warsYour`, read as `wars Your` from the plain text): cut the token there.
+  const breaks = lineBreakOffsets(cloned);
+  const tokens = [...raw.slice(rawStart, rawEnd).matchAll(WORD_RUN_RE)].flatMap((m) => {
     const s = rawStart + (m.index ?? 0);
-    return { start: s, end: s + m[0].length };
+    const cuts = [s, ...breaks.filter((p) => p > s && p < s + m[0].length), s + m[0].length];
+    return cuts.slice(1).map((end, i) => ({ start: cuts[i], end }));
   });
   if (tokens.length !== matchWords.length) return null;
   const units: { leaves: ParentLeaf[] }[] = tokens.map(() => ({ leaves: [] }));
@@ -1189,8 +1242,19 @@ function smartRebuildRange(
   // a word from after a line break before it (`wars; your\q1 king`, #1360).
   // Exact links win; only the words between two of them are paired, and only
   // a one-leaf unit that spells its token.
+  // Beside a line break, two more words keep their old word's leaf (#1361):
+  //   - of several case-blind candidates, the one nearest the break: an old
+  //     word after the break pairs with the LAST of them (`wars. \q1 Your
+  //     king` -> `wars that your enemies started; your king` kept the first
+  //     `your` and saved `wars that \q1 your enemies`);
+  //   - a swapped word: when the old and new words between two links are
+  //     equally many and none matched, they pair in order (`wars. \q1 Your` ->
+  //     `wars; The` saved `wars; The\q1`; the typed path keeps the break
+  //     before `The`). Unequal counts are left to the nearest survivor.
   const recased = new Set<number>();
   const fold = (s: string) => s.toLowerCase();
+  const oneLeaf = (k: number) => units[k].leaves.length === 1 && String(units[k].leaves[0].node["text"]) === matchWords[k];
+  const breakIn = (a: number, b: number) => breaks.some((p) => p >= a && p <= b);
   let prevOld = -1;
   for (let j = 0; j < replaceWords.length; j++) {
     if (link[j] >= 0) {
@@ -1201,13 +1265,22 @@ function smartRebuildRange(
     while (nextJ < replaceWords.length && link[nextJ] < 0) nextJ++;
     const nextOld = nextJ < replaceWords.length ? link[nextJ] : matchWords.length;
     const gapOld = Array.from({ length: nextOld - prevOld - 1 }, (_, i) => prevOld + 1 + i);
-    const sub = lcsLink(gapOld.map((k) => fold(matchWords[k])), replaceWords.slice(j, nextJ).map(fold));
+    const gapStart = prevOld >= 0 ? tokens[prevOld].end : rawStart;
+    const gapEnd = nextOld < matchWords.length ? tokens[nextOld].start : rawEnd;
+    const fromRight = gapOld.length > 0 && breakIn(gapStart, tokens[gapOld[0]].start);
+    const sub = (fromRight ? lcsLinkFromRight : lcsLink)(gapOld.map((k) => fold(matchWords[k])), replaceWords.slice(j, nextJ).map(fold));
     sub.forEach((g, i) => {
       const k = g >= 0 ? gapOld[g] : -1;
-      if (k < 0 || units[k].leaves.length !== 1 || String(units[k].leaves[0].node["text"]) !== matchWords[k]) return;
+      if (k < 0 || !oneLeaf(k)) return;
       link[j + i] = k;
       recased.add(j + i);
     });
+    if (sub.every((g) => g < 0) && gapOld.length === nextJ - j && gapOld.every(oneLeaf) && breakIn(gapStart, gapEnd)) {
+      gapOld.forEach((k, i) => {
+        link[j + i] = k;
+        recased.add(j + i);
+      });
+    }
     j = nextJ - 1; // the loop's next step is the exact link at nextJ (or the end)
   }
   for (const j of recased) {
@@ -1770,6 +1843,14 @@ function smartReplaceVerseImpl(
 
   const rawStart = rawMatch.index;
   const rawEnd = rawStart + rawMatch.length;
+  // A line marker carrying a line-leading opener (`\q1 “`, ZEC 1:14 ULT) in
+  // the range: the range rebuild can't re-lay a marker's text, and the
+  // localized rewrite dropped the marker (`wars. “Your` -> `wars; “your`,
+  // #1361). Split the text into a node after the marker, as smartEditVerse
+  // does up front (liftMarkerText), and start again on that tree; raw is the
+  // same, so the match lands on the same text.
+  const lifted = liftLineBreakTextInRange(verseObjects, rawStart, rawEnd);
+  if (lifted) return smartReplaceVerseImpl({ verseObjects: lifted }, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options);
   // A match that crosses such a marker has a space in the plain text that raw
   // lacks (`name this` against raw `namethis`). Read its words from the plain
   // text, and keep a result only when its visible text is exactly the
@@ -2310,9 +2391,14 @@ function sharedTokenCounts(a: string[], b: string[]): { lead: number; trail: num
 
 // The words a match and its replacement share at the start and at the end,
 // as non-whitespace character counts (`name this` / `name of that`: 4 and 0).
+// A word whose only change is its case counts as shared: it keeps its place
+// (#1360), so a marker beside it must too. Without this, a bare marker before
+// `Your` in `wars Your` -> `wars; your` had to keep its count right after
+// `wars`, before the new `;` (#1361).
 function sharedWordEdges(match: string, replacement: string): { pre: number; post: number } {
+  const fold = (s: string) => s.toLowerCase();
   const a = wordTokens(match);
-  const { lead, trail } = sharedTokenCounts(a, wordTokens(replacement));
+  const { lead, trail } = sharedTokenCounts(a.map(fold), wordTokens(replacement).map(fold));
   return {
     pre: nonWsCount(a.slice(0, lead).join("")),
     post: nonWsCount(a.slice(a.length - trail).join("")),
