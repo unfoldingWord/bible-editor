@@ -292,6 +292,21 @@ const v4 = nestWordLabels(verse("4"));
   }
   const ex = editHeaderBand(n2, { index: 0, tag: "sp", text: "The lady" });
   assert(labelBytes(ex) === labelBytes(n2).replace("\\w woman|", "\\w lady|"), `band edit of the word before a cross reference keeps it (got ${json(labelBytes(ex))})`);
+  // Found in the live test: a footnote at a line end (`\w The\w*\f …\f*⏎\w
+  // woman\w*`). usfm-js parks the line break on the footnote's `nextChar`, so
+  // the band read "Thewoman", and editing "woman" saved one word "Thelady".
+  const eol = nestWordLabels(usfm.toJSON(String.raw`\c 1
+\p
+\v 1 \w Song|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w*\f + \ft A note.\f*
+\w woman|x-occurrence="1" x-occurrences="1"\w*
+\w thinks|x-occurrence="1" x-occurrences="1"\w*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*
+`).chapters["1"]["1"].verseObjects);
+  assert(json(splitSectionHeaders(eol).sections) === json([{ tag: "sp", text: "The woman thinks", notes: ["A note."] }]), `footnote at a line end: the band reads "The woman thinks" (got ${json(splitSectionHeaders(eol).sections)})`);
+  const eolEdit = editHeaderBand(eol, { index: 0, tag: "sp", text: "The lady thinks" });
+  assert(labelBytes(eolEdit) === labelBytes(eol).replace("\\w woman|", "\\w lady|"), `footnote at a line end: editing the word after it changes only that word (got ${json(labelBytes(eolEdit))})`);
+  assert(editHeaderBand(eol, { index: 0, tag: "sp", text: "The woman thinks" }) === eol, "footnote at a line end: an unchanged band save hands back the same verse");
 }
 
 // #1366 item 3: only character and note markers join a label's run. `\va`,
