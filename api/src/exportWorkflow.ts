@@ -1069,6 +1069,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // silent revert. A fresh book with no watermark has nothing to clobber.
     // Only meaningful when we'd actually commit (dcsAllowed); a dry run renders
     // to R2 only and can't clobber anything.
+    // Captured before the gate asks Door43: bounds clearStaleSkipAlert below to
+    // rows written before this check began (system_alerts.created_at is
+    // unixepoch() seconds).
+    const gateStartedAt = Math.floor(Date.now() / 1000);
     const fresh = dcsAllowed ? await this.checkMasterFreshness(book, resource) : { ok: true as const, detail: "dry", masterSha: null, watermark: null, headIsOurExport: false };
     if (!fresh.ok) {
       await this.recordStaleSkipAlert(book, resource, fresh.detail, fresh.masterSha, fresh.watermark, instanceId);
@@ -1088,6 +1092,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         prReason: null,
       };
     }
+    // Only a measured pass clears: a dry run's `ok` above is synthetic.
+    if (dcsAllowed) await this.clearStaleSkipAlert(book, resource, gateStartedAt);
 
     // Shrink guard — refuse to commit a TSV render that would delete a large
     // fraction of master's rows (truncation backstop; see exportTsvShrinkRefused).
@@ -2483,6 +2489,37 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
+  // Issue #1364: the freshness gate just passed for this (book, resource), so
+  // an undismissed export_stale banner from an earlier night is no longer
+  // true. writeAlert only replaces it when a NEW stale alert is written, so
+  // without this it stood (red) after the pair exported cleanly. DELETE of the
+  // undismissed row, same as the file's other export-alert clears: these rows
+  // have no condition_key, so 0066's resolved_at machinery does not apply, and
+  // a dismissed row stays as writeAlert's dismissal memory (issue #458).
+  // Best-effort like the export_blank clear: a failed DELETE must not fail the
+  // export.
+  //
+  // Only rows written before `gateStartedAt` (this run's gate start, unix
+  // seconds): an overlapping run (a manual export alongside the nightly) can
+  // see master ahead and write a NEWER stale row while this gate waits on
+  // Door43, and that observation is not this run's to retire. Strict `<`
+  // because created_at has one-second granularity: a row stamped in the same
+  // second as the gate start may be newer, so it is kept, and the cost is an
+  // old row surviving until the next passing run. Fails toward keeping the
+  // alert. Assumes the Worker and D1 clocks agree to within a second.
+  private async clearStaleSkipAlert(book: string, resource: Resource, gateStartedAt: number): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        `DELETE FROM system_alerts
+          WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL AND created_at < ?3`,
+      )
+        .bind(EXPORT_ALERT_USERNAME, `export_stale:${book}:${resource}`, gateStartedAt)
+        .run();
+    } catch (err) {
+      console.error(`export_stale banner clear failed for ${book} ${resource}:`, err);
+    }
+  }
+
   // Fetch master's current TSV row count and decide whether this render would
   // shrink it dangerously (see export.ts exportTsvShrinkRefused). Fail closed
   // when master can't be read — a truncated master fetch now returns null,
@@ -3183,10 +3220,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // the export (already shipped by the time this fires) or claims a cause
   // beyond what was measured — only that master moved and by how much.
   //
-  // Deliberately never auto-cleared. A "review" alert here is exactly the
-  // sibling skip/guard alerts' convention (recordStaleSkipAlert,
-  // recordHardRejectAlert, recordAlignmentShrinkSkipAlert, …): it names an
-  // action a human needs to take and stays until a human dismisses it. An
+  // Deliberately never auto-cleared. A "review" alert here follows the
+  // sibling skip/guard alerts' convention (recordHardRejectAlert,
+  // recordAlignmentShrinkSkipAlert, …): it names an action a human needs to
+  // take and stays until a human dismisses it. recordStaleSkipAlert's
+  // export_stale banner is now the exception (issue #1364): it is cleared
+  // when the freshness gate passes for that pair, because a stale skip pushed
+  // nothing and a gate pass is the same authority the export uses to push.
+  // This revert-race alert has no such measurement and still is not. An
   // earlier revision auto-deleted this banner on the next run that didn't
   // re-detect a race — which is unsafe twice over: (a) "didn't re-detect"
   // includes "couldn't compare" (no watermark, a transient Door43 read
