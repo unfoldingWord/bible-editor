@@ -539,6 +539,19 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     const opener = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label(), { tag: "q1", type: "quote", text: "“" }, w("He"), t(" "), w("ran"), t(".”")] };
     const r8 = run(opener, "home. “He", "home; “she too");
     check(r8.labelRefusals === undefined && words(r8.content) === "A home; [SP] \\q1 “she too ran.”", `opening quote: saved after the label with the new words (got ${JSON.stringify(words(r8.content))})`);
+    // Review of #1366: a word added on the narrator's side stays there. The
+    // break goes after the last punctuation among the new words, so only the
+    // words that start the speech move after the label.
+    const r9 = run(beside, "home. He", "home again. She");
+    check(r9.labelRefusals === undefined && words(r9.content) === "A home again. [SP] \\q1 She ran home.", `"home again. She": "again" stays before the label (got ${JSON.stringify(words(r9.content))}, refused=${r9.labelRefusals})`);
+    // A word added in front of the kept first word of the speech ("He" -> "And
+    // he", "he" kept) goes after the label with it.
+    const r10 = run(beside, "home. He", "home. And he");
+    check(r10.labelRefusals === undefined && words(r10.content) === "A home. [SP] \\q1 And he ran home.", `"home. And he": "And" goes after the label (got ${JSON.stringify(words(r10.content))})`);
+    // No punctuation to tell where the speech starts, and its first word was
+    // replaced: refused rather than guessed.
+    const r11 = run(bare, "home He", "home she too");
+    check(r11.labelRefusals === 1 && r11.plainText === extractPlainText(bare), `"home she too" with no punctuation: refused (got ${JSON.stringify(words(r11.content))}, refused=${r11.labelRefusals})`);
     // A typed edit shows the line break, so the translator's placement holds:
     // words typed before it stay before the label.
     const old = extractEditableText(beside);

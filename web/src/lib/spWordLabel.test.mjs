@@ -18,7 +18,7 @@ import usfm from "usfm-js";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { nestWordLabels, splitSectionHeaders, extractPlainText, extractEditableText, rewriteHeaderLabel, isWordLabelNode, headerLabelText } from "./usfm.ts";
+import { nestWordLabels, splitSectionHeaders, extractPlainText, extractEditableText, rewriteHeaderLabel, isWordLabelNode, headerLabelText, labelNoteTexts } from "./usfm.ts";
 import { parseAlignment, serializeAlignment, countUnalignedTargetWords } from "./alignment.ts";
 import { curlifyVerseContent } from "./curlyVerse.ts";
 import { editHeaderBand, renumberTargetOccurrences } from "./replace.ts";
@@ -290,6 +290,9 @@ const v4 = nestWordLabels(verse("4"));
   const s2 = splitSectionHeaders(n2).sections;
   assert(json(s2) === json([{ tag: "sp", text: "The woman", notes: ["1:1 Gen 1:1"] }]), `the band lists the label's cross reference (got ${json(s2)})`);
   assert(json(splitSectionHeaders(v1).sections[0]) === json({ tag: "sp", text: "The woman thinks about the man she loves" }), "a label with no note has no notes field");
+  // Review of #1366: nested markers inside a note (`\+it`) are dropped too.
+  const nestedNote = { tag: "sp", endTag: "", children: [{ text: "The", tag: "w", type: "word" }, { tag: "f", type: "footnote", content: "+ \\ft A \\+it word\\+it* here.", endTag: "f*" }] };
+  assert(json(labelNoteTexts(nestedNote)) === json(["A word here."]), `a nested \\+it in a note is dropped from its text (got ${json(labelNoteTexts(nestedNote))})`);
   // The word right before the footnote, and the word right after it.
   const labelBytes = (vos) => render(labelsOf(vos));
   for (const [from, to] of [["woman", "lady"], ["speaking", "talking"]]) {

@@ -205,6 +205,24 @@ check(usfm.toJSON(src).chapters["1"]["2"].verseObjects.some((n) => n.tag === "sp
   check(!kids(apiNest(fx["1"].verseObjects)).includes("va"), `\\va after a label stays in the verse (got ${JSON.stringify(kids(apiNest(fx["1"].verseObjects)))})`);
   check(kids(apiNest(fx["2"].verseObjects)).includes("fe") && kids(apiNest(fx["2"].verseObjects)).includes("wj"), "\\fe and \\wj join the label");
   check(!kids(apiNest(fx["3"].verseObjects)).some((k) => ["vp", "ca", "fig"].includes(k)), `\\vp, \\ca, \\fig stay out of the label (got ${JSON.stringify(kids(apiNest(fx["3"].verseObjects)))})`);
+  // Review of #1366: a nested character marker (`\+nd … \+nd*`, which usfm-js
+  // tags "+nd") and `\qs`, `\qac`, `\qt` (which usfm-js types "quote") are part
+  // of the label too; main nested a label holding them.
+  {
+    const nestedSrc = String.raw`\c 1
+\p
+\v 1 \w B|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \add \+nd \w Lord|x-occurrence="1" x-occurrences="1"\w*\+nd*\add* \+nd \w X|x-occurrence="1" x-occurrences="1"\w*\+nd* \qs \w Selah|x-occurrence="1" x-occurrences="1"\w*\qs* \qac \w A|x-occurrence="1" x-occurrences="1"\w*\qac* \qt \w q|x-occurrence="1" x-occurrences="1"\w*\qt*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*
+`;
+    const vos = usfm.toJSON(nestedSrc).chapters["1"]["1"].verseObjects;
+    const a = apiNest(vos);
+    const sp = a.find((n) => n && n.tag === "sp");
+    check(JSON.stringify(a) === JSON.stringify(webNest(vos)), "nested/quote-typed char markers: api and web agree");
+    check(Array.isArray(sp?.children) && ["add", "+nd", "qs", "qac", "qt"].every((tag) => sp.children.some((c) => c.tag === tag)) && a[a.indexOf(sp) + 1]?.tag === "q1",
+      `\\+nd, \\qs, \\qac, \\qt join the label, which ends at its \\q1 (got ${JSON.stringify(a.map((n) => (n?.tag === "sp" ? { sp: n.children?.map((c) => c.tag ?? c.type) } : n?.tag ?? n?.type)))})`);
+    check(apiExtract({ verseObjects: a }) === "B. Hi", `nested/quote-typed char markers: plain text has no label word (got ${JSON.stringify(apiExtract({ verseObjects: a }))})`);
+  }
   // The two copies of the list agree tag by tag: a closed marker after a flat
   // label's word, for every listed tag and the four that must stay out.
   const tags = ["f", "fe", "x", "ef", "ex", "add", "addpn", "bd", "bdit", "bk", "dc", "em", "it", "jmp", "k", "nd", "ndx", "no", "ord", "pn", "png", "pro",
