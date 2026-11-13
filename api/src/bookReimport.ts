@@ -2495,16 +2495,22 @@ export async function applyTsvRows(
         // ("Unmerged Door43 edit — verify") and its outcome (nothing was
         // overwritten, the next export writes D1) are both true here, and its
         // auto-clear (clearResolvedMergeNoBase) retires it only when a complete
-        // walk of the flag's window finds no human commit, which is exactly
-        // when holding was right. Its message leads with its own outcome. Raised
-        // only over no flag, so a rerun never re-stamps it (#539's version rule).
+        // walk of the flag's window finds no human commit. That can retire a
+        // flag held for an INCOMPLETE walk (a later complete walk shows only AI
+        // or our export moved master, so holding was right). A flag held for a
+        // window with human-counted commits in it (human + AI, or a commit that
+        // is not positively human) is never retired that way: it stands until a
+        // translator acts on it, or until a later night adopts the row as a
+        // person's fix (which clears it, below). Its message leads with its own
+        // outcome. Raised only over no flag, so a rerun never re-stamps it
+        // (#539's version rule).
         heldPreserved = preservedAuthor === "unknown" && (merge.adopt || merge.conflict);
         if (heldPreserved) {
           counts.preserved_held++;
           if (cur.review_kind == null) {
             fields.review_kind = "merge_no_base";
             fields.review_reason =
-              "Kept this preserved note's text, and Door43 has a different version. If Door43's version is a " +
+              PRESERVED_HELD_REASON_PREFIX + ", and Door43 has a different version. If Door43's version is a " +
               "person's fix, change the note here to match it; the next export that runs for this file writes " +
               "what is here now. Why: Preserve blocks only the AI note writer, and the sync could not tell " +
               "whether a person or the AI note writer made this Door43 change.";
@@ -2899,6 +2905,25 @@ export async function applyTsvRows(
           // kept from the existing flag when this only re-words a merge_conflict.
           fields.review_master_json = masterReviewSnapshot(kind, row, keptOrNewMint(reviewKind));
         }
+      }
+
+      // #1347 review F3: an earlier night held this preserved row ("Kept this
+      // preserved note's text…"), and tonight a person's Door43 change was
+      // adopted. That flag now says the reverse of what the row holds, so the
+      // adopting write clears it. Only that flavor (a generic merge_no_base or
+      // any other flag stays), and only when nothing above already set a flag
+      // in this write (a both-changed adoption replaces it with merge_conflict).
+      if (
+        preservedAuthor === "human" &&
+        adopted &&
+        !("review_kind" in fields) &&
+        cur.review_kind === "merge_no_base" &&
+        typeof cur.review_reason === "string" &&
+        cur.review_reason.startsWith(PRESERVED_HELD_REASON_PREFIX)
+      ) {
+        fields.review_kind = null;
+        fields.review_reason = null;
+        fields.review_master_json = null;
       }
 
       // Torn-row self-heal (issue #672). Detected HERE, at `cur`'s TRUE
@@ -3366,6 +3391,11 @@ export async function applyTsvRows(
 // otherwise stays exactly what it always was here: never adopted FROM master.
 // Human-friendly names for the merge fields, for the conflict review_reason
 // (never expose a raw DB column name to a translator).
+// #1347: the opening of the review_reason a held preserved row is flagged with
+// (merge_no_base). Shared by the mint and by the clear that retires it when a
+// later night adopts the row, so the clear can tell this flavor apart.
+const PRESERVED_HELD_REASON_PREFIX = "Kept this preserved note's text";
+
 const TSV_FIELD_LABELS: Record<string, string> = {
   quote: "quote",
   note: "note",

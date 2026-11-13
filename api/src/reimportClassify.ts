@@ -171,6 +171,10 @@ export function preservedRowMasterAuthor(
   if (c == null || typeof c !== "object") return "unknown";
   if (!isCount(c.ours) || !isCount(c.ai) || !isCount(c.human)) return "unknown";
   if (c.ai !== 0 || c.human < 1) return "unknown";
+  // Review F1/F2: every human-counted commit must be positively a person's
+  // (masterLineage.ts isPositivelyHumanCommit). Absent on an older summary.
+  const unsure = (lineage as { humanUnsure?: unknown }).humanUnsure;
+  if (!isCount(unsure) || unsure !== 0) return "unknown";
   return "human";
 }
 

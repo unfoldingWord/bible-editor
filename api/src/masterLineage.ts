@@ -503,6 +503,36 @@ export function classifyMasterCommit(commit: MasterCommit): ClassifiedCommit {
   return { ...commit, kind: "human", reason: "unrecognized" };
 }
 
+// Issue #1347 review F1/F2. `human` above is the catch-all, which is the
+// protective direction for an ordinary row (master wins) and the permissive one
+// for a PRESERVED row (a human change is what gets through). So a preserved row
+// additionally asks whether every human-counted commit is POSITIVELY a
+// person's. Not one of these:
+//   - an address the bot or AI tooling pushes from. Deliberately a separate set
+//     from BOT_EMAILS: widening that one would reclassify commits for every row
+//     (see the note above it), while this one only withholds a preserved-row
+//     adoption, so "unsure" costs a flag, not a maintainer's edit;
+//   - a missing address (nothing to judge);
+//   - `@api.bp-assistant` anywhere in the subject, or in the address;
+//   - a revert of one of our own exports (`Revert "bible-editor: …"`): a person
+//     made it, but it rolls preserved notes back to their pre-export text, so a
+//     translator should decide (F2).
+// Never read for an ordinary row; classifyMasterCommit is unchanged.
+const PRESERVE_UNSURE_EMAILS = new Set(["bot@unfoldingword.org", "ai@unfoldingword.org"]);
+const PRESERVE_UNSURE_EMAIL_RE = /bookpackagebot@/;
+const REVERT_OF_OURS = /^reverts?\b.*\bbible-editor(?: export)?:/i;
+
+export function isPositivelyHumanCommit(c: ClassifiedCommit): boolean {
+  if (c.kind !== "human") return false;
+  const email = (c.authorEmail ?? "").trim().toLowerCase();
+  if (email === "" || PRESERVE_UNSURE_EMAILS.has(email) || PRESERVE_UNSURE_EMAIL_RE.test(email)) return false;
+  if (AI_MARKER.test(email)) return false;
+  const subject = firstLine(c.message);
+  if (AI_MARKER.test(subject)) return false;
+  if (REVERT_OF_OURS.test(subject)) return false;
+  return true;
+}
+
 // What the caller actually needs to decide with: did any HUMAN touch this file
 // on master since the ancestor?
 export interface MasterLineage {
@@ -813,6 +843,12 @@ export interface MasterLineageSummary {
   incomplete: boolean;
   incompleteReason: string;
   counts: { ours: number; ai: number; human: number };
+  /**
+   * #1347: how many of `counts.human` are NOT positively a person's
+   * (isPositivelyHumanCommit). Read only by preservedRowMasterAuthor. ABSENT on
+   * every summary built before #1347, which that reader treats as unknown.
+   */
+  humanUnsure?: number;
   /** Up to LINEAGE_EVIDENCE_CAP human commit shas, newest first. */
   humanShas: string[];
   /**
@@ -870,8 +906,10 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
   const humanShas: string[] = [];
   const humanCommits: LineageHumanCommit[] = [];
   const oursPrNumbers: number[] = [];
+  let humanUnsure = 0;
   for (const c of lineage.commits) {
     counts[c.kind]++;
+    if (c.kind === "human" && !isPositivelyHumanCommit(c)) humanUnsure++;
     if (c.kind === "ours" && oursPrNumbers.length < LINEAGE_OURS_PR_CAP) {
       // Same `(#N)` subject tag ownPublish.ts's findOurMergeForPr matches on.
       for (const m of firstLine(c.message).matchAll(/\(#(\d+)\)/g)) {
@@ -899,6 +937,7 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
     incomplete: lineage.incomplete,
     incompleteReason: lineage.incompleteReason,
     counts,
+    humanUnsure,
     humanShas,
     humanCommits,
     // Narrowing evidence only crosses the boundary when it is COMPLETE. A
