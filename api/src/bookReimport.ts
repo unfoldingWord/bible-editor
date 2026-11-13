@@ -106,6 +106,8 @@ import {
   computeEditedFieldMerge,
   isReissuedTombstone,
   AI_SOURCE,
+  preservedRowMasterAuthor,
+  type PreservedRowMasterAuthor,
 } from "./reimportClassify";
 import {
   classifyTsvRefMove,
@@ -475,6 +477,12 @@ export interface ReimportCounts {
   // from last night and so writes nothing, is counted here and skipped_edited
   // too.
   merge_kept_ai: number;
+  // Issue #1347: a preserved tn row whose Door43 side moved, where the sync
+  // could not tell whether a person or the AI note writer moved it. D1's text
+  // was kept and the row flagged (review_kind 'merge_no_base') instead of
+  // adopting. Counts decisions, like merge_kept_ai: it recurs each night the
+  // condition holds, even after the flag is already standing.
+  preserved_held: number;
   // Verse where computeVerseMerge returned "keep_no_base" — no ancestor was
   // recoverable for this specific verse (edit_log aged past the 180-day
   // retention, or the verse has no edit_log row before book_resource_syncs.
@@ -823,6 +831,7 @@ function zeroCounts(): ReimportCounts {
     merge_noop_skipped: 0,
     merge_refused: 0,
     merge_kept_ai: 0,
+    preserved_held: 0,
     merge_no_base: 0,
     merge_no_base_mint_skipped: 0,
     merge_no_base_cleared: 0,
@@ -1066,6 +1075,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_noop_skipped += from.merge_noop_skipped ?? 0;
   into.merge_refused += from.merge_refused ?? 0;
   into.merge_kept_ai += from.merge_kept_ai ?? 0;
+  into.preserved_held += from.preserved_held ?? 0;
   into.merge_no_base += from.merge_no_base ?? 0;
   into.merge_no_base_mint_skipped += from.merge_no_base_mint_skipped ?? 0;
   into.merge_no_base_cleared += from.merge_no_base_cleared ?? 0;
@@ -2021,6 +2031,14 @@ export async function applyTsvRows(
     // instead of this batch's "sync_merge"/"dcs_sync"/door43 one, so a pure
     // D1 self-correction is never misattributed to a Door43 commit.
     pureHeal: boolean;
+    // #1347: this write was decided under the preserved-row gate (a person
+    // moved master, or the author is unknown and this write is only the flag),
+    // so its WHERE drops `preserve = 0` and keeps every other protection and the
+    // version CAS. False for every other row, whose WHERE still re-asserts
+    // preserve = 0: a preserve toggle does not bump version, so that predicate
+    // is what stops a write decided on an unpreserved row (an AI one-sided
+    // adopt, say) from landing on a note preserved mid-run.
+    allowPreserved: boolean;
   }> = [];
   // Ids this pass has already INSERTED. `existing` is read once, before the
   // loop, and is never updated afterwards — so if master's own file carries the
@@ -2305,6 +2323,35 @@ export async function applyTsvRows(
         kind === "tn" &&
         (cur.trashed_at != null || Number(cur.preserve ?? 0) !== 0 || Number(cur.hint ?? 0) !== 0);
 
+      // Issue #1347, decision A (Benjamin, 2026-11-13): `preserve` blocks the AI
+      // note writer only. A row protected by preserve ALONE (not hint, not
+      // trashed) goes through the three-way merge when a person moved master's
+      // side ("human": adopt, or master wins + merge_conflict, preserve kept) or
+      // when the author cannot be told ("unknown": D1 kept and the row flagged,
+      // below). "no_human" — only the AI note writer or our own export moved
+      // master — keeps the pre-#1347 skip. See preservedRowMasterAuthor.
+      //
+      // Only when the two sides agree on the reference: classifyTsvRefMove
+      // never holds a protected row, so a merge here would adopt master's
+      // quote+occurrence at D1's verse with no hold — the mis-anchored pair
+      // block (a)'s own comment warns about. Such a row keeps today's skip.
+      // `protectedRow` itself is unchanged: the reference-move policy, the
+      // ref_moved flag clear and the torn-row heal still treat this row as
+      // protected.
+      const preserveOnly =
+        kind === "tn" && cur.trashed_at == null && Number(cur.hint ?? 0) === 0 && Number(cur.preserve ?? 0) !== 0;
+      const preservedAuthor: PreservedRowMasterAuthor | null =
+        preserveOnly && masterConfirmedAt != null && !tsvRefMoved(cur, row, false)
+          ? preservedRowMasterAuthor(cutoff?.lineage, [
+              { chapter: row.chapter, verse: row.verse },
+              { chapter: Number(cur.chapter), verse: Number(cur.verse) },
+            ])
+          : null;
+      const mergePreserved = preservedAuthor === "human" || preservedAuthor === "unknown";
+      // Set below when an "unknown" row's merge would have written master's
+      // value: nothing of master's is written, and the row is flagged instead.
+      let heldPreserved = false;
+
       // Does master's side of THIS row possibly carry a human's own edit?
       // Hoisted out of the merge call below (its full rationale is there).
       const masterMayHoldHuman =
@@ -2327,7 +2374,7 @@ export async function applyTsvRows(
       // (a) Substantive three-way merge (quote/note/support_reference /
       //     orig_words/tw_link/question/response), attributed against the
       //     reconstructed ancestor. Only when a watermark exists for this run.
-      if (masterConfirmedAt != null && !protectedRow) {
+      if (masterConfirmedAt != null && (!protectedRow || mergePreserved)) {
         const merge = computeTsvMerge(
           kind,
           bases.get(row.id)?.content ?? null,
@@ -2437,14 +2484,39 @@ export async function applyTsvRows(
             fields.review_master_json = masterReviewSnapshot(kind, row, { at: now, since: masterConfirmedAt });
           }
         }
+        // #1347: a preserved row whose master side moved, by an author the
+        // lineage cannot name (decision A: "when the system can't tell who made
+        // a change, it keeps the editor's text and flags the note"). Nothing of
+        // master's is written; adopt and conflict handling below are skipped.
+        //
+        // The flag reuses 'merge_no_base' on purpose: its chip title
+        // ("Unmerged Door43 edit — verify") and its outcome (nothing was
+        // overwritten, the next export writes D1) are both true here, and its
+        // auto-clear (clearResolvedMergeNoBase) retires it only when a complete
+        // walk of the flag's window finds no human commit, which is exactly
+        // when holding was right. Its message leads with its own outcome. Raised
+        // only over no flag, so a rerun never re-stamps it (#539's version rule).
+        heldPreserved = preservedAuthor === "unknown" && (merge.adopt || merge.conflict);
+        if (heldPreserved) {
+          counts.preserved_held++;
+          if (cur.review_kind == null) {
+            fields.review_kind = "merge_no_base";
+            fields.review_reason =
+              "Kept this preserved note's text, and Door43 has a different version. If Door43's version is a " +
+              "person's fix, change the note here to match it; the next export that runs for this file writes " +
+              "what is here now. Why: Preserve blocks only the AI note writer, and the sync could not tell " +
+              "whether a person or the AI note writer made this Door43 change.";
+            fields.review_master_json = masterReviewSnapshot(kind, row, { at: now, since: masterConfirmedAt });
+          }
+        }
         // #540 item 2: both sides moved a field, and the lineage found no human
         // commit behind master's side, so D1 keeps that field. See the counter's
         // declaration for why this must never join merge_refused.
-        if (merge.action === "keep_ai_master") {
+        if (!heldPreserved && merge.action === "keep_ai_master") {
           counts.merge_kept_ai++;
           keptAiConflict = true;
         }
-        if (merge.adopt) {
+        if (!heldPreserved && merge.adopt) {
           adopted = true;
           Object.assign(fields, merge.writeFields);
           // Occurrence is excluded from the field merge (renderOccurrence
@@ -2461,7 +2533,7 @@ export async function applyTsvRows(
         // while writing no content field at all — nesting this under `adopt`
         // (as it was when adopt_conflict was the only conflicting outcome)
         // would drop the flag for exactly the rows this policy protects.
-        if (merge.conflict) {
+        if (!heldPreserved && merge.conflict) {
           conflict = true;
           conflictFields = merge.conflictFields;
         }
@@ -2487,7 +2559,10 @@ export async function applyTsvRows(
         {
           deleted_at: cur.deleted_at as number | null,
           trashed_at: cur.trashed_at as number | null,
-          preserve: cur.preserve as number | null,
+          // #1347: a preserved row whose master side a person moved takes the
+          // same tags/whitespace merge as any human-edited row. Every other
+          // preserved row stays protected, as before.
+          preserve: preservedAuthor === "human" ? 0 : (cur.preserve as number | null),
           hint: cur.hint as number | null,
         },
       );
@@ -2893,6 +2968,7 @@ export async function applyTsvRows(
         keptAiConflict,
         healedRef: torn !== null,
         pureHeal,
+        allowPreserved: mergePreserved,
       });
     }
   }
@@ -3195,6 +3271,7 @@ export async function applyTsvRows(
           buildTsvEditedWriteStmt(
             env, book, kind, u.id, u.fields, u.oldVersion, now,
             u.pureHeal ? { action: "ref_heal", source: "system", actor: null } : { action: "sync_merge", source: "dcs_sync", actor: door43 },
+            u.allowPreserved,
           ),
         ),
       );
@@ -3326,6 +3403,10 @@ function buildTsvEditedWriteStmt(
   oldVersion: number,
   now: number,
   provenance: RowProvenance,
+  // #1347: true only for a write applyTsvRows decided under the preserved-row
+  // gate (see its editedWrites entry). Drops `preserve = 0` from the WHERE and
+  // nothing else: deleted/trashed/hint and the version CAS stay.
+  allowPreserved = false,
 ): D1PreparedStatement {
   const allowed = TSV_MERGE_WRITE_COLS[kind];
   const cols = Object.keys(fields).filter((c) => allowed.has(c));
@@ -3353,7 +3434,9 @@ function buildTsvEditedWriteStmt(
   }
   const protection =
     kind === "tn"
-      ? `deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
+      ? allowPreserved
+        ? `deleted_at IS NULL AND trashed_at IS NULL AND hint = 0`
+        : `deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
       : `deleted_at IS NULL`;
   const idParam = p++;
   const bookParam = p++;
