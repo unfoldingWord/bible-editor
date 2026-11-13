@@ -585,6 +585,9 @@ export function curlifyVerseObjects(verseObjects: unknown[]): boolean {
   const walk = (nodes: unknown[]): void => {
     for (const node of nodes) {
       if (!node || typeof node !== "object") continue;
+      // A `\sp` label written as words (#1350) is Door43's text: never curled.
+      // Same rule as web/src/lib/curlyVerse.ts.
+      if (isWordLabelNode(node)) continue;
       const o = node as Record<string, unknown>;
       const isLineMarker =
         o["type"] === "paragraph" ||
@@ -1369,6 +1372,14 @@ export function nestWordLabels(verseObjects: unknown[]): unknown[] {
     if (out) out.push(node);
   }
   return out ?? verseObjects;
+}
+
+// A `\sp` label as nestWordLabels stores it (words as `children`, no text or
+// content of its own). Mirror of isWordLabelNode in web/src/lib/usfm.ts.
+export function isWordLabelNode(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o || o["tag"] !== "sp" || !isHeaderLabelNode(o) || !Array.isArray(o["children"])) return false;
+  return o["content"] === undefined && (o["text"] === undefined || o["text"] === "");
 }
 
 function isEmptyLabelOpener(node: unknown): boolean {

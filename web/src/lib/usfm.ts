@@ -311,10 +311,12 @@ export function nestWordLabels(verseObjects: unknown[]): unknown[] {
 // A `\sp` label written as words, as nestWordLabels stores it: its words are
 // `children`, and it has no `content` or (non-empty) `text` of its own. The one
 // test every reader of that shape shares (headerLabelText, the edit engine's
-// withWordLabelsAsText, the print preview).
+// withWordLabelsAsText, the print preview, the save's quote curling, the
+// aligner's source coverage). Only `\sp`: nestWordLabels nests nothing else, so
+// another header-label node with `children` keeps its old handling.
 export function isWordLabelNode(node: unknown): boolean {
   const o = node as Record<string, unknown> | null;
-  if (!o || !isHeaderLabelNode(o) || !Array.isArray(o["children"])) return false;
+  if (!o || o["tag"] !== "sp" || !isHeaderLabelNode(o) || !Array.isArray(o["children"])) return false;
   return o["content"] === undefined && (o["text"] === undefined || o["text"] === "");
 }
 
