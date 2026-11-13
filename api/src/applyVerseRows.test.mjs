@@ -536,6 +536,13 @@ console.log("\n[#1351: a merge whose export is only an ancestor, or that equals 
       if (u.includes(`commits?sha=${TIP}&path=`)) return list([gitea(EXPORT, exportCommit.message, "2026-11-12T19:18:36Z", [BASE])]);
       if (u.includes(`commits?sha=${HUMAN}&path=`)) return list([]);
       if (u.includes(`${MERGE}.diff`)) return body(mergeDiff);
+      // Gitea's blob id of the file at a commit: the same text, the same id.
+      for (const [sha, t] of Object.entries(texts)) {
+        if (u.includes(`/git/trees/${sha}`)) {
+          const blob = (t === texts[EXPORT] ? "e" : t === texts[MERGE] ? "d" : "a").repeat(40);
+          return { ok: true, headers: { get: () => null }, json: async () => ({ truncated: false, tree: [{ path: PATH, type: "blob", sha: blob }] }) };
+        }
+      }
       for (const [sha, t] of Object.entries(texts)) if (u.includes(`ref=${sha}`)) return body(t);
       throw new Error(`unexpected fetch: ${u}`);
     };

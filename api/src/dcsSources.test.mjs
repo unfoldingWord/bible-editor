@@ -1033,7 +1033,13 @@ async function run() {
       };
       const OURS = [EXPORT];
       const raw = (sha, body) => [`raw/${EZK}?ref=${sha}`, () => res({ body, contentLength: body.length })];
+      // Gitea's blob id for the file at a commit (#1351 confirms an equal
+      // merge with it). Read only when the merge's text equals our export's.
+      const tree = (sha, blob) => [`git/trees/${sha}`, () => jsonRes({ body: { truncated: false, tree: [{ path: EZK, type: "blob", sha: blob }] } })];
+      const SAME_BLOB = "b10b000000000000000000000000000000000000";
       const files = (mergeText = MERGE_TEXT) => [
+        tree(MERGE, SAME_BLOB),
+        tree(EXPORT, SAME_BLOB),
         [`git/commits/${MERGE}.diff`, () => res({ body: MERGE_DIFF })],
         [`git/commits/${HUMAN}.diff`, () => res({ body: HUMAN_DIFF })],
         raw(MERGE, mergeText),
@@ -1079,7 +1085,7 @@ async function run() {
         // complete); see the shape-2 tests below.
         assert(ev.complete === false && ev.refs.length === 0,
           "#1348: a merge identical to our export adds no refs, and alone it stays fail-closed");
-        assert(asked.length === 2, "  ...after the same two fetches");
+        assert(asked.length === 4, "  ...after two file fetches and (#1351) two blob-id reads");
         serve(files(EXPORT_TEXT));
         const withHuman = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit(), humanCommit], OURS);
         assert(withHuman.complete === true && withHuman.refs.includes("48:2") && !withHuman.refs.includes("48:4"),
@@ -1180,14 +1186,16 @@ async function run() {
       }
       {
         // A HUMAN commit on the second-parent side AFTER our export, which the
-        // window did not list as a human commit of its own: its edit (48:5)
+        // window did not list as a human commit of its own: its edit (48:3)
         // reaches master only through this merge, so the merge keeps it.
+        // (48:3, not 48:5: a changed verse line also claims the verse before
+        // it, so 48:5 would credit 48:4 for a reason unrelated to this test.)
         const H2 = "4a2d000000000000000000000000000000000000";
-        const h2Listed = gc(H2, "Fixes verse 5", "2026-11-12T19:30:00Z", [EXPORT], "someone@example.org");
-        const merged = lines({ ...H, ...E, 6: "\\v 5 five fixed on master", 7: "\\v 6 six merged" });
+        const h2Listed = gc(H2, "Fixes verse 3", "2026-11-12T19:30:00Z", [EXPORT], "someone@example.org");
+        const merged = lines({ ...H, ...E, 4: "\\v 3 three fixed on master" });
         serve([...files(merged), listing(H2, [h2Listed, exportListed]), listing(HUMAN, [humanListed])]);
         const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit([HUMAN, H2])], OURS, SHAPE1);
-        assert(ev.complete === true && ev.refs.includes("48:5"),
+        assert(ev.complete === true && ev.refs.includes("48:3"),
           "#1351: a human edit on the second-parent side made after our export stays credited");
         assert(!ev.refs.includes("48:4"), "  ...while the export's own verse still is not");
       }
@@ -1271,10 +1279,23 @@ async function run() {
         assert(ev.complete === false && ev.refs.length === 0 && ev.reason === "export_equal_merges_only"
           && ev.exportEqualMergesOnly === true,
           "#1351: a merge identical to an ancestor export, alone in the window, is flagged export-equal");
+        assert(asked.length === 6, "  ...after six subrequests: two listings, two files, two blob ids");
         serve(files(EXPORT_TEXT));
         const direct = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
         assert(direct.complete === false && direct.reason === "export_equal_merges_only" && direct.exportEqualMergesOnly === true,
           "  ...and so is one identical to a direct export parent");
+      }
+      {
+        // Equal TEXTS are not enough to flag the file: two raw reads cut short
+        // at the same offset would compare equal. Gitea's blob ids decide.
+        serve([tree(EXPORT, "e0e0000000000000000000000000000000000000"), ...files(EXPORT_TEXT)]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(ev.complete === false && ev.reason === "revision_blob_mismatch" && ev.exportEqualMergesOnly !== true,
+          "#1351: equal texts with different blob ids are incomplete (our reads were wrong), unflagged");
+        serve([[`git/trees/${MERGE}`, () => jsonRes({ ok: false })], ...files(EXPORT_TEXT)]);
+        const unread = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(unread.complete === false && unread.reason === "no_refs_mapped" && unread.exportEqualMergesOnly !== true,
+          "#1351: an unreadable blob id leaves today's no_refs_mapped answer, unflagged");
       }
       {
         // Beside a commit that maps to no verse (a mode change), the window
@@ -1289,7 +1310,7 @@ async function run() {
       }
       {
         // Beside any incomplete part, the window stays incomplete, unflagged.
-        serve([...files(EXPORT_TEXT), [`git/commits/${HUMAN}.diff`, () => res({ ok: false })]]);
+        serve([[`git/commits/${HUMAN}.diff`, () => res({ ok: false })], ...files(EXPORT_TEXT)]);
         const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit(), humanCommit], OURS);
         assert(ev.complete === false && ev.reason === "diff_fetch_failed" && ev.exportEqualMergesOnly !== true,
           "#1351: an export-equal merge beside an unreadable commit stays incomplete, unflagged");

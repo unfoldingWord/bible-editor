@@ -395,7 +395,18 @@ Highlights that bite repeatedly:
   export's. NOT git's full combined-diff rule (differ from every parent): that also drops what a HUMAN parent
   brought in, which under-claims when that branch's commits predate the window (a feature branch merged after
   the watermark). The ledger path must carry `parent_shas_json` for this to fire; a row without it (pre-0078)
-  takes the old first-parent path. Any new per-commit evidence must ask "how many parents?" first.
+  takes the old first-parent path (it now logs that, #1351). Any new per-commit evidence must ask "how many
+  parents?" first.
+- **Gitea lists a merge commit's `files` against its FIRST parent, and path-scoped history hides a merge whose
+  file equals a parent's (#1351).** Measured read-only 2026-11-13 on en_ust 245ed073: the human side touched
+  PSA/LAM/HOS/AMO/MIC/HAB/ZEC, our export side 26-EZK, and the merge's `files` is only 26-EZK; Door43's
+  `commits?sha=<merge>&path=26-EZK.usfm` does not list it at all. So the ledger matches an editor's "Merge
+  branch 'master'" to every book our side brought in, books the human never touched, while the live walk does
+  not. `fetchHumanTouchedRefs` therefore also narrows a merge whose export is only an ANCESTOR of its second
+  parent (one path-scoped listing per parent: the export must be in the second parent's history and not the
+  first's), and a window whose every human commit is a merge byte-identical to such an export is flagged
+  `export_equal_merges_only`, read only by `masterMayHoldHumanEditForVerse`. A sha Door43 does not know answers
+  the commits listing with HTTP 500, not master's history (unlike the raw endpoint).
 
 - **A merge outcome that reverses who wins needs its own `review_kind`, and its message needs its own first
   line.** The in-app cleanup chip titles itself from `review_kind` and clamps the message to two lines

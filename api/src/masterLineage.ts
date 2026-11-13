@@ -832,6 +832,14 @@ export interface MasterLineageSummary {
   /** Why the narrowing did not complete, for the log. Empty when it did. */
   refsReason?: string;
   /**
+   * #1351: TRUE only when every human commit in the window is a merge whose
+   * file is byte-identical to one of our export commits it contains
+   * (HumanRefEvidence.exportEqualMergesOnly). `refsComplete` stays false, so
+   * only masterMayHoldHumanEditForVerse reads this. ABSENT otherwise, and on
+   * every summary built before #1351, which reads as "not proven".
+   */
+  refsExportEqualMergesOnly?: boolean;
+  /**
    * Issue #1005: the export PR numbers that `ours` commits in this window name
    * in their subject (`… (#N)`), newest first, capped at LINEAGE_OURS_PR_CAP.
    * This is how a consumer asks "did the publish recorded as
@@ -892,6 +900,7 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
     refsComplete: ev?.complete === true,
     humanRefs: ev?.complete === true ? ev.refs : [],
     refsReason: ev == null ? "not_measured" : ev.complete === true ? "" : ev.reason,
+    ...(exportEqualMergesOnly(lineage) ? { refsExportEqualMergesOnly: true } : {}),
     oursPrNumbers,
   };
 }
@@ -982,6 +991,13 @@ export interface HumanRefEvidence {
   refs: string[];
   /** Why it is incomplete. Empty when complete. */
   reason: string;
+  /**
+   * #1351: set (with `complete: false`, `refs: []`) only when EVERY human
+   * commit in the window is a merge whose file is byte-identical to one of our
+   * export commits it contains. Read only by masterMayHoldHumanEditForVerse;
+   * every other reader sees incomplete evidence, the fail-closed answer.
+   */
+  exportEqualMergesOnly?: boolean;
 }
 
 /** One unified-diff hunk, retaining both old and new sides for ref moves. */
@@ -1588,6 +1604,26 @@ function refsFrom(lineage: MasterLineage | MasterLineageSummary): HumanRefEviden
   return null;
 }
 
+// #1351: the window's EVERY human commit is a merge byte-identical to an export
+// of ours it contains, so per verse no human edit is held. Only a literal true
+// beside an empty ref set counts, and the evidence must not also claim to be a
+// complete ref map; anything else is "not proven".
+function exportEqualMergesOnly(lineage: MasterLineage | MasterLineageSummary): boolean {
+  const l = lineage as { humanRefs?: unknown; refsComplete?: unknown; refsExportEqualMergesOnly?: unknown };
+  const hr = l.humanRefs;
+  // The uncompacted lineage carries the evidence object itself.
+  if (hr != null && !Array.isArray(hr) && typeof hr === "object") {
+    const ev = hr as HumanRefEvidence;
+    return ev.exportEqualMergesOnly === true && ev.complete !== true && Array.isArray(ev.refs) && ev.refs.length === 0;
+  }
+  // The compacted summary carries the flattened flag.
+  return (
+    l.refsExportEqualMergesOnly === true &&
+    l.refsComplete !== true &&
+    (hr === undefined || (Array.isArray(hr) && hr.length === 0))
+  );
+}
+
 /** Does this evidence claim (chapter, verse)? "c:*" claims the whole chapter. */
 export function refEvidenceTouches(refs: string[], chapter: number, verse: number): boolean {
   return refs.includes(`${chapter}:*`) || refs.includes(`${chapter}:${verse}`);
@@ -1672,6 +1708,9 @@ export function completeHumanRefEvidenceTouches(
 //   - a ref set holding anything that is not a ref    -> true
 //   - human commits exist but mapped to zero refs     -> true (a mapping we do
 //     not believe: the commits touched the file, so they touched some verse)
+// with ONE flagged exception (#1351): every human commit is a merge whose file
+// is byte-identical to one of our export commits it contains -> false. Master
+// holds our render there, so no verse holds a human edit.
 //
 // `verseEnd` is for a BRIDGED row (a D1 verse covering 14-15, from `\v 14-15`).
 // The whole range is asked, and ANY verse in it being human-touched protects the
@@ -1687,9 +1726,6 @@ export function masterMayHoldHumanEditForVerse(
   if (lineage == null) return true;
   if (lineage.incomplete !== false) return true;
   if (!Number.isInteger(chapter) || !Number.isInteger(verse) || chapter < 0 || verse < 0) return true;
-  const ev = refsFrom(lineage);
-  if (ev === null) return true;
-  if (ev.refs.length === 0) return true;
   let end = verse;
   if (verseEnd != null) {
     // A bridge we cannot believe (backwards, absurd, or not a number) is not a
@@ -1697,6 +1733,11 @@ export function masterMayHoldHumanEditForVerse(
     if (!Number.isInteger(verseEnd) || verseEnd < verse || verseEnd - verse > MAX_BRIDGE_WIDTH) return true;
     end = verseEnd;
   }
+  // #1351: every human commit is a merge identical to an export of ours.
+  if (exportEqualMergesOnly(lineage)) return false;
+  const ev = refsFrom(lineage);
+  if (ev === null) return true;
+  if (ev.refs.length === 0) return true;
   for (let v = verse; v <= end; v++) if (refEvidenceTouches(ev.refs, chapter, v)) return true;
   return false;
 }
