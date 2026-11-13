@@ -38,6 +38,12 @@
 // classifyReimportRow says "edited" but computeEditedFieldMerge below finds
 // master-owned fields to adopt anyway. Named here so callers/tests share one
 // vocabulary for "edited, but partially merged" vs plain "edited".
+import {
+  masterMayHoldHumanEditForVerse,
+  type MasterLineage,
+  type MasterLineageSummary,
+} from "./masterLineage.ts";
+
 export type ReimportFate = "noop" | "edited" | "update" | "update_ai" | "merge_fields";
 
 export function classifyReimportRow(
@@ -108,6 +114,64 @@ export function isReimportableRow(r: ReimportableRow): boolean {
   }
   if (r.updated_by == null) return true; // pristine
   return r.latestSource === AI_SOURCE; // AI-only, never human-edited
+}
+
+// ── Who moved master on a preserved tn row (issue #1347, decision A) ────────
+//
+// `preserve` is the translator's "keep this note through AI runs" mark. Until
+// #1347 the sync read it as "keep this note through EVERY Door43 change", so a
+// maintainer's fix to a preserved note was skipped on the way in and reverted by
+// the next export (Richard Mahn's 56 EZK/JER notes, 2026-11-12). Decision A
+// (Benjamin, 2026-11-13): preserve blocks the AI note writer only.
+//   - "human":     a person moved master's side -> the row goes through the same
+//                  three-way merge as any human-edited row (adopt, or master wins
+//                  and the row is flagged merge_conflict); preserve stays 1.
+//   - "no_human":  the lineage proves no person touched this row's verse, so
+//                  master's side is the AI note writer or our own export ->
+//                  blocked, exactly as before #1347.
+//   - "unknown":   anything else -> keep D1's text AND flag the row.
+//
+// WHY "human" is file-level, not per-verse. The per-verse evidence
+// (refsTouchedInTsv) has no row-id filter: a person fixing note X at 40:12 and
+// the AI rewriting preserved note Y at 40:12 in the same window would read as
+// "human touched Y". Only human commits are ever mapped to refs, so the one
+// sound proof that master's side of THIS row is a person's is a complete walk
+// whose window holds no AI commit at all (counts.ai === 0). The per-verse
+// evidence is still used, but only to NARROW toward "no_human" (via
+// masterMayHoldHumanEditForVerse), never as a precondition for "human": the
+// refs are mapped for at most LINEAGE_REFINE_MAX_HUMAN_COMMITS (3) commits, and
+// a real cleanup pass is more than that.
+//
+// Fail direction: every uncertainty (no lineage, an incomplete walk, a
+// pre-summary lineage object, missing or malformed counts, an AI commit in the
+// window) is "unknown", which never writes master's text. Note the asymmetry
+// with masterMayHoldHumanEditForVerse, whose uncertainty answer is "a human may
+// have" (true): that answer is protective for an ordinary row and would be
+// exactly wrong here, where "human" is the answer that lets master through.
+export type PreservedRowMasterAuthor = "human" | "no_human" | "unknown";
+
+function isCount(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0;
+}
+
+export function preservedRowMasterAuthor(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+  refs: Array<{ chapter: number; verse: number }>,
+): PreservedRowMasterAuthor {
+  if (refs.length > 0 && refs.every((r) => masterMayHoldHumanEditForVerse(lineage, r.chapter, r.verse) === false)) {
+    return "no_human";
+  }
+  // Only the compacted summary carries `counts`, and only it is what the sync
+  // hands the merge; anything else cannot prove the window held no AI commit.
+  if (lineage == null || !("mayHoldHumanEdit" in lineage)) return "unknown";
+  if (lineage.incomplete !== false || lineage.hasHumanCommit !== true || lineage.mayHoldHumanEdit !== true) {
+    return "unknown";
+  }
+  const c = (lineage as { counts?: unknown }).counts as { ours?: unknown; ai?: unknown; human?: unknown } | null | undefined;
+  if (c == null || typeof c !== "object") return "unknown";
+  if (!isCount(c.ours) || !isCount(c.ai) || !isCount(c.human)) return "unknown";
+  if (c.ai !== 0 || c.human < 1) return "unknown";
+  return "human";
 }
 
 // ── Per-field ownership merge on human-edited rows ──────────────────────────
