@@ -28,7 +28,9 @@ import { extractPlainText, isHeaderLabelNode, isSpeakerLabelNode } from "./usfm.
 // withWordLabelsAsText); those matches are left as they are, and the overlay says so too.
 // `labelShapeRefusals`: how many of those were refused because the verse's
 // label has no line break after it (#1354), which the overlay words differently.
-export type FindReplaceResult = SmartReplaceResult & { staleRefused?: true; labelRefusals?: number; labelShapeRefusals?: number };
+// `labelLostRefusals`: how many were refused because the replace would drop or
+// change a `\sp` label (label-lost, #1366), also worded on its own.
+export type FindReplaceResult = SmartReplaceResult & { staleRefused?: true; labelRefusals?: number; labelShapeRefusals?: number; labelLostRefusals?: number };
 
 // A verse with a header label whose stored plain text is not its tree's own
 // (#1339). The server's extractor once kept a `\sp` label's text in the stored
@@ -105,7 +107,7 @@ export function findReplaceVerse(
   if (staleBesideLabel(content, plainText)) return staleRefusal(content, plainText);
   const result = smartReplaceVerse(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, { findReplace: true });
   const out: FindReplaceResult = finalizeFindReplace(content, plainText, result);
-  return withLabelCounts(out, result.labelRefused ? 1 : 0, result.labelRefusedReason === "label-shape" ? 1 : 0);
+  return withLabelCounts(out, result.labelRefused ? 1 : 0, result.labelRefusedReason === "label-shape" ? 1 : 0, result.labelRefusedReason === "label-lost" ? 1 : 0);
 }
 
 // Replace-all within one verse: replace one occurrence at a time with the
@@ -132,6 +134,9 @@ export function replaceAllInVerse(
   // Of those, the ones refused because the verse's label has no line break
   // after it (label-shape, #1354): the summary gives them their own reason.
   let labelShapeRefusals = 0;
+  // And the ones refused because a label would be dropped or changed
+  // (label-lost, #1366).
+  let labelLostRefusals = 0;
   // Where the next search starts. A step with no visible change is skipped
   // (not applied) and the search moves past its match, so a later match still
   // gets replaced; only applied steps count toward `maxIters`. Every pass
@@ -149,6 +154,7 @@ export function replaceAllInVerse(
     if (result.labelRefused) {
       labelRefusals++;
       if (result.labelRefusedReason === "label-shape") labelShapeRefusals++;
+      if (result.labelRefusedReason === "label-lost") labelLostRefusals++;
       from = next.index + Math.max(1, next[0].length);
       continue;
     }
@@ -170,6 +176,7 @@ export function replaceAllInVerse(
     from = 0;
     labelRefusals = 0;
     labelShapeRefusals = 0;
+    labelLostRefusals = 0;
     applied++;
   }
   // The cap ended the loop right after an applied step, so the last pass never
@@ -182,6 +189,7 @@ export function replaceAllInVerse(
       const r = smartReplaceVerse(curContent, curPlain, regex, m.index, m[0].length, replaceText, { findReplace: true });
       if (r.labelRefused) labelRefusals++;
       if (r.labelRefusedReason === "label-shape") labelShapeRefusals++;
+      if (r.labelRefusedReason === "label-lost") labelLostRefusals++;
       if (m[0].length === 0) countRe.lastIndex++;
     }
   }
@@ -190,11 +198,13 @@ export function replaceAllInVerse(
     plainText: curPlain,
     preservedAlignment: preserved,
   });
-  return withLabelCounts(out, labelRefusals, labelShapeRefusals);
+  return withLabelCounts(out, labelRefusals, labelShapeRefusals, labelLostRefusals);
 }
 
-const withLabelCounts = (out: FindReplaceResult, refusals: number, shape: number): FindReplaceResult =>
-  refusals > 0 ? { ...out, labelRefusals: refusals, ...(shape > 0 ? { labelShapeRefusals: shape } : {}) } : out;
+const withLabelCounts = (out: FindReplaceResult, refusals: number, shape: number, lost: number): FindReplaceResult =>
+  refusals > 0
+    ? { ...out, labelRefusals: refusals, ...(shape > 0 ? { labelShapeRefusals: shape } : {}), ...(lost > 0 ? { labelLostRefusals: lost } : {}) }
+    : out;
 
 // The overlay's scripture summary line after a replace. Counts come from the
 // save path, not the engine: `versesReplaced` is verses queued for save, and
@@ -206,7 +216,9 @@ const withLabelCounts = (out: FindReplaceResult, refusals: number, shape: number
 // label (#1339). `labelRefused` is MATCHES the engine left alone because the
 // replace would move a `\sp` speaker label written as words (#1350);
 // `labelShapeRefused` is how many of those were refused because the verse's
-// label has no line break after it (#1354), which gets its own reason.
+// label has no line break after it (#1354), which gets its own reason, as does
+// `labelLostRefused`: those refused because a label would be dropped or
+// changed (#1366).
 export interface BibleReplaceCounts {
   versesReplaced: number;
   alignmentLost: number;
@@ -215,6 +227,7 @@ export interface BibleReplaceCounts {
   staleRefused?: number;
   labelRefused?: number;
   labelShapeRefused?: number;
+  labelLostRefused?: number;
 }
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -238,7 +251,8 @@ export function bibleReplaceSummaryText(s: BibleReplaceCounts): string {
     );
   }
   const labelShapeRefused = Math.min(s.labelShapeRefused ?? 0, labelRefused);
-  const labelMoveRefused = labelRefused - labelShapeRefused;
+  const labelLostRefused = Math.min(s.labelLostRefused ?? 0, labelRefused - labelShapeRefused);
+  const labelMoveRefused = labelRefused - labelShapeRefused - labelLostRefused;
   if (labelMoveRefused > 0) {
     parts.push(
       `${plural(labelMoveRefused, "match", "matches")} not replaced: ${labelMoveRefused === 1 ? "it" : "they"} would move a speaker label`,
@@ -247,6 +261,11 @@ export function bibleReplaceSummaryText(s: BibleReplaceCounts): string {
   if (labelShapeRefused > 0) {
     parts.push(
       `${plural(labelShapeRefused, "match", "matches")} not replaced: ${labelShapeRefused === 1 ? "its verse has" : "their verse has"} a speaker label with no line break after it`,
+    );
+  }
+  if (labelLostRefused > 0) {
+    parts.push(
+      `${plural(labelLostRefused, "match", "matches")} not replaced: ${labelLostRefused === 1 ? "it" : "they"} would remove or change a speaker label`,
     );
   }
   if (s.readOnlySkipped > 0) {
