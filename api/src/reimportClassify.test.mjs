@@ -19,6 +19,7 @@ import {
   computeEditedFieldMerge,
   isReissuedTombstone,
   AI_SOURCE,
+  preservedRowMasterAuthor,
 } from "./reimportClassify.ts";
 
 let failed = 0;
@@ -420,6 +421,61 @@ eq(
   true,
   "both ref_raw blank, chapter/verse differ → reissued via the fallback",
 );
+
+// ── Who moved master on a preserved tn row (issue #1347, decision A) ────────
+console.log("\n[#1347: preservedRowMasterAuthor]");
+{
+  const AT = [{ chapter: 40, verse: 6 }];
+  const base = {
+    mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 6 }, humanUnsure: 0, humanShas: ["bff360f4"],
+  };
+  // Richard's shape: six human commits, so the per-verse refs were never mapped
+  // (LINEAGE_REFINE_MAX_HUMAN_COMMITS is 3). No AI commit in the window proves
+  // master's side is a person's without them.
+  eq(preservedRowMasterAuthor({ ...base, refsComplete: false, humanRefs: [], refsReason: "too_many_human_commits" }, AT),
+    "human", "complete walk, human commits, no AI commit, refs unmapped -> human");
+  eq(preservedRowMasterAuthor({ ...base, refsComplete: true, humanRefs: ["40:6"] }, AT),
+    "human", "...and with complete refs that name this verse -> human");
+  // Complete refs that MISS this verse: no person touched it, so master's side
+  // here is our export or a phantom -> blocked as before.
+  eq(preservedRowMasterAuthor({ ...base, refsComplete: true, humanRefs: ["41:3"] }, AT),
+    "no_human", "complete refs that miss this verse -> no_human (blocked)");
+  // The AI note writer alone moved master.
+  eq(preservedRowMasterAuthor({
+    mayHoldHumanEdit: false, hasHumanCommit: false, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 2, human: 0 }, humanShas: [],
+  }, AT), "no_human", "AI-only window -> no_human (blocked)");
+  // A MIXED window: a person touched this verse, but so did an AI push somewhere
+  // in the file. Verse-scoped evidence cannot say which one wrote THIS row.
+  eq(preservedRowMasterAuthor({ ...base, counts: { ours: 1, ai: 1, human: 1 }, refsComplete: true, humanRefs: ["40:6"] }, AT),
+    "unknown", "human + AI commits in the window -> unknown, even with a human ref at this verse");
+  eq(preservedRowMasterAuthor({ ...base, counts: { ours: 0, ai: 3, human: 2 }, refsComplete: false }, AT),
+    "unknown", "human + AI commits, refs unmapped -> unknown");
+  // Every other uncertainty is unknown, never human.
+  eq(preservedRowMasterAuthor(null, AT), "unknown", "no lineage -> unknown");
+  eq(preservedRowMasterAuthor(undefined, AT), "unknown", "undefined lineage -> unknown");
+  eq(preservedRowMasterAuthor({ ...base, incomplete: true, incompleteReason: "page_cap" }, AT),
+    "unknown", "incomplete walk -> unknown");
+  eq(preservedRowMasterAuthor({ ...base, counts: undefined }, AT), "unknown", "counts absent -> unknown");
+  eq(preservedRowMasterAuthor({ ...base, counts: { ours: 1, human: 1 } }, AT), "unknown", "counts.ai absent -> unknown");
+  eq(preservedRowMasterAuthor({ ...base, counts: { ours: 1, ai: "0", human: 1 } }, AT), "unknown", "counts.ai a string -> unknown");
+  eq(preservedRowMasterAuthor({ ...base, counts: { ours: 1, ai: 0, human: 0 } }, AT),
+    "unknown", "hasHumanCommit true but no human counted (inconsistent) -> unknown");
+  // The raw (uncompacted) lineage carries no counts, so it cannot prove "no AI".
+  eq(preservedRowMasterAuthor({ commits: [], hasHumanCommit: true, incomplete: false, incompleteReason: "" }, AT),
+    "unknown", "a raw MasterLineage (no summary) -> unknown");
+  // Review F1/F2: "human" is the classifier's catch-all. For a preserved row,
+  // every human-counted commit must be POSITIVELY human (humanUnsure === 0).
+  eq(preservedRowMasterAuthor({ ...base, humanUnsure: 1 }, AT),
+    "unknown", "a human-counted commit that is not positively human (bot address, revert of our export) -> unknown");
+  eq(preservedRowMasterAuthor({ ...base, humanUnsure: undefined }, AT),
+    "unknown", "humanUnsure absent (summary from before this field) -> unknown");
+  eq(preservedRowMasterAuthor({ ...base, humanUnsure: "0" }, AT), "unknown", "humanUnsure malformed -> unknown");
+  // Either ref keeps the row out of no_human: master's ref OR D1's.
+  eq(preservedRowMasterAuthor({ ...base, refsComplete: true, humanRefs: ["40:6"] }, [{ chapter: 41, verse: 1 }, { chapter: 40, verse: 6 }]),
+    "human", "a human ref at D1's ref (not master's) still keeps the row out of no_human");
+}
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);

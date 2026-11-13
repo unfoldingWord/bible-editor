@@ -53,6 +53,7 @@ import { contentPatchClearClauses } from "./contentPatchClauses.ts";
 import { lintTqRows } from "./lint.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 import { BRIDGE_DELETE_NEXT_SQL, BRIDGE_UPDATE_START_SQL } from "./verseBridge.ts";
+import { classifyMasterCommit, compactLineage, summarizeLineage } from "./masterLineage.ts";
 
 // ── Hermetic clock ─────────────────────────────────────────────────────────
 // Every merge_no_base / auto-clear block below seeds its walk windows RELATIVE
@@ -5817,6 +5818,294 @@ console.log("\n[#1255: a restore_maintainer_cleanup repair is part of the TSV me
     eq(row.note, "the translator's later wording", "a translator edit with Door43 untouched is KEPT, not overwritten by master");
     eq(row.review_kind, null, "…and not flagged");
     eq(counts.merge_conflicts, 0, "…no merge_conflicts counted");
+  }
+}
+
+// ── #1347 (decision A): preserve blocks the AI note writer only ─────────────
+// The incident: Richard Mahn fixed punctuation in 56 preserved EZK/JER notes on
+// Door43 (2026-11-12). D1 still held the previously exported text, the sync
+// skipped every preserved row outright, and the next export rendered D1 over
+// master, reverting his fixes with no flag. EZK 40:6 `ytm6` is the shape below.
+console.log("\n[#1347: a preserved note takes a person's Door43 fix, never the AI's]");
+{
+  const BASE = "…Alternate translation: [one reed wide] (2) [one reed deep]";
+  const RICHARD = "…Alternate translation: [one reed wide]; or (2) [one reed deep]";
+  const seed = (sqlite, { note = BASE, preserve = 1, hint = 0, reviewKind = null } = {}) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version, preserve, hint, review_kind)
+         VALUES ('ytm6', ?, 40, 6, '40:6', ?, 10, 7, 3, ?, ?, ?)`,
+      )
+      .run(BOOK, note, preserve, hint, reviewKind);
+    // The ancestor: what D1 held when our export last landed on master.
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tn', 'ytm6', ?, 'create', ?, 100)`,
+      )
+      .run(BOOK, JSON.stringify({ chapter: 40, verse: 6, ref_raw: "40:6", note: BASE }));
+    return Number(e.lastInsertRowid);
+  };
+  const masterTn = (note, { chapter = 40, verse = 6, refRaw = "40:6", quote = null } = {}) => ({
+    id: "ytm6", idCoerced: false, refRaw, chapter, verse,
+    occurrence: null, tags: null, support_reference: null, quote, note,
+  });
+  // Richard's night: six human commits to the file, so the per-verse refs were
+  // never mapped (the refine cap is 3), and no AI push in the window.
+  const HUMAN = {
+    mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 6 }, humanUnsure: 0, humanShas: ["bff360f4"],
+    refsComplete: false, humanRefs: [], refsReason: "too_many_human_commits",
+  };
+  const AI_ONLY = {
+    mayHoldHumanEdit: false, hasHumanCommit: false, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 1, human: 0 }, humanShas: [],
+  };
+  const MIXED = { ...HUMAN, counts: { ours: 1, ai: 1, human: 1 }, refsComplete: true, humanRefs: ["40:6"], refsReason: "" };
+  const readRow = (sqlite) =>
+    sqlite
+      .prepare(`SELECT note, preserve, hint, review_kind, review_reason, review_master_json, version FROM tn_rows WHERE book = ? AND id = 'ytm6'`)
+      .all(BOOK)[0];
+
+  // (1) One-sided human Door43 edit: adopted, and the note stays preserved.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+      confirmedAt: 200, editId: boundary, lineage: HUMAN,
+    });
+    const row = readRow(sqlite);
+    eq(row.note, RICHARD, "(1) a person's Door43 fix to a preserved note is adopted");
+    eq(row.preserve, 1, "(1) …and the note stays marked Preserve");
+    eq(row.review_kind, null, "(1) …with no flag: only master moved");
+    eq(counts.merge_adopted, 1, "(1) …counted as an adoption");
+    eq(counts.apply_incomplete, false, "(1) …and the write landed (no 0-change against a preserve = 0 guard)");
+    eq(row.version, 4, "(1) …one version bump");
+    // The export renders D1, which now equals master, so it has nothing to
+    // revert. A second run of the same night is a no-op.
+    const again = await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+      confirmedAt: 200, editId: boundary, lineage: HUMAN,
+    });
+    eq(again.skipped_noop, 1, "(1) a rerun sees D1 == master: no-op");
+    eq(readRow(sqlite).version, 4, "(1) …and bumps no version");
+  }
+
+  // (2) Both sides changed the note: master wins, flagged merge_conflict, preserve kept.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, { note: "the translator's own rewording" });
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+      confirmedAt: 200, editId: boundary, lineage: HUMAN,
+    });
+    const row = readRow(sqlite);
+    eq(row.note, RICHARD, "(2) both changed: the Door43 version wins");
+    eq(row.review_kind, "merge_conflict", "(2) …and the note is flagged for the translator");
+    eq(row.preserve, 1, "(2) …still preserved");
+    eq(counts.merge_master_wins, 1, "(2) …counted as a master-wins flag");
+    eq(counts.apply_incomplete, false, "(2) …and the write landed");
+  }
+
+  // (3) The AI note writer moved master: blocked, unflagged, untouched (today's behavior).
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn("the AI run's note")], null, {
+      confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
+    });
+    const row = readRow(sqlite);
+    eq(row.note, BASE, "(3) an AI-authored master change never reaches a preserved note");
+    eq(row.review_kind, null, "(3) …and nothing is flagged, as before");
+    eq(row.version, 3, "(3) …no write at all");
+    eq(counts.merge_adopted, 0, "(3) …no adoption counted");
+    eq(counts.skipped_edited, 1, "(3) …a plain skipped_edited");
+  }
+
+  // (4) Author unknown: D1 kept AND flagged. Each shape the sync cannot attribute.
+  for (const [label, lineage] of [
+    ["no lineage", null],
+    ["incomplete walk", { ...HUMAN, incomplete: true, incompleteReason: "page_cap" }],
+    ["human + AI in the window", MIXED],
+    ["counts absent", { ...HUMAN, counts: undefined }],
+  ]) {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn("someone's Door43 note")], null, {
+      confirmedAt: 200, editId: boundary, lineage,
+    });
+    const row = readRow(sqlite);
+    eq(row.note, BASE, `(4 ${label}) the editor's text is kept`);
+    eq(row.preserve, 1, `(4 ${label}) …still preserved`);
+    eq(row.review_kind, "merge_no_base", `(4 ${label}) …and the note is flagged for review`);
+    eq(String(row.review_reason).startsWith("Kept this preserved note's text"), true, `(4 ${label}) …leading with what happened`);
+    eq(JSON.parse(row.review_master_json ?? "{}")?.note, "someone's Door43 note", `(4 ${label}) …carrying Door43's version`);
+    eq(counts.preserved_held, 1, `(4 ${label}) …counted as preserved_held`);
+    eq(counts.merge_no_base, 0, `(4 ${label}) …not as a missing-ancestor row`);
+    eq(counts.merge_adopted, 0, `(4 ${label}) …and never as an adoption`);
+    eq(counts.apply_incomplete, false, `(4 ${label}) …the flag write landed`);
+    // A rerun the same night must not re-stamp the flag (no version churn).
+    const v = row.version;
+    await applyTsvRows(env, BOOK, "tn", [masterTn("someone's Door43 note")], null, {
+      confirmedAt: 200, editId: boundary, lineage,
+    });
+    eq(readRow(sqlite).version, v, `(4 ${label}) …and a rerun bumps no version`);
+  }
+
+  // (4b) Unknown, but master never moved this row's content: nothing to flag.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, { note: "the translator's own rewording" });
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(BASE)], null, {
+      confirmedAt: 200, editId: boundary, lineage: null,
+    });
+    const row = readRow(sqlite);
+    eq(row.note, "the translator's own rewording", "(4b) only D1 moved: kept");
+    eq(row.review_kind, null, "(4b) …and not flagged: Door43 holds nothing new");
+    eq(counts.preserved_held, 0, "(4b) …not counted as held");
+  }
+
+  // (5) hint and trashed_at are unchanged: still fully blocked, never flagged.
+  for (const [label, opts, extra] of [
+    ["preserve + hint", { hint: 1 }, null],
+    ["hint only", { preserve: 0, hint: 1 }, null],
+    ["preserve + trashed", {}, "trashed"],
+  ]) {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite, opts);
+    if (extra === "trashed") sqlite.prepare(`UPDATE tn_rows SET trashed_at = 1700000000 WHERE id = 'ytm6'`).run();
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+      confirmedAt: 200, editId: boundary, lineage: HUMAN,
+    });
+    const row = readRow(sqlite);
+    eq(row.note, BASE, `(5 ${label}) a human Door43 edit still does not land`);
+    eq(row.review_kind, null, `(5 ${label}) …and nothing is flagged`);
+    eq(counts.skipped_edited, 1, `(5 ${label}) …a plain skipped_edited`);
+    eq(counts.apply_incomplete, false, `(5 ${label}) …no watermark hold`);
+  }
+
+  // (5b) The real shapes of the ancestor. 47 of Richard's 50 EZK rows had a
+  //      translator edit (a PARTIAL `update` payload carrying the note), and 3
+  //      had no app edit at all. Neither has the full `create` row the seeds
+  //      above hand-write.
+  {
+    // A translator's note edit before the watermark, logged as rows.ts logs a
+    // PATCH (just the changed field), is enough of an ancestor for the note.
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version, preserve)
+         VALUES ('ytm6', ?, 40, 6, '40:6', ?, 10, 7, 3, 1)`,
+      )
+      .run(BOOK, BASE);
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tn', 'ytm6', ?, 'update', ?, 100)`,
+      )
+      .run(BOOK, JSON.stringify({ note: BASE }));
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+      confirmedAt: 200, editId: Number(e.lastInsertRowid), lineage: HUMAN,
+    });
+    eq(readRow(sqlite).note, RICHARD, "(5b) a partial note-edit ancestor is enough: the fix is adopted");
+    eq(counts.merge_adopted, 1, "(5b) …counted as an adoption");
+  }
+  {
+    // No app edit and no edit_log at all: no ancestor, so the sync cannot say
+    // which side moved. D1 is kept and flagged merge_no_base (before #1347 a
+    // preserved row got no flag here). The export still writes D1.
+    const { sqlite, env } = freshEnv();
+    sqlite
+      .prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version, preserve)
+         VALUES ('ytm6', ?, 40, 6, '40:6', ?, 10, NULL, 1, 1)`,
+      )
+      .run(BOOK, BASE);
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+      confirmedAt: 200, editId: 1, lineage: HUMAN,
+    });
+    const row = readRow(sqlite);
+    eq(row.note, BASE, "(5b) no ancestor at all: D1 is kept");
+    eq(row.review_kind, "merge_no_base", "(5b) …and flagged, so the Door43 fix is not lost silently");
+    eq(counts.merge_no_base, 1, "(5b) …counted as merge_no_base");
+    eq(counts.preserved_held, 0, "(5b) …not as preserved_held (the author was known)");
+  }
+
+  // (7) Review F1/F2: the classifier's `human` is a catch-all. For a preserved
+  //     row only a POSITIVELY human window lets master through; a bot-address
+  //     commit with no pipeline shape, an ai@ commit, or a maintainer's revert
+  //     of our own export (which would roll the note back to pre-export text)
+  //     keeps D1 and flags. Lineages built through the real classifier and
+  //     compactLineage, the way both lineage sources build them.
+  {
+    const ours = { sha: "o1", message: "bible-editor: EZK tn → master (#6711)", authorEmail: "pr-author@example.org" };
+    const person = { sha: "p1", message: "Puts a ; after one Alternate translation", authorEmail: "richard@example.org" };
+    const build = (...commits) => compactLineage(summarizeLineage(commits.map(classifyMasterCommit)));
+    for (const [label, other, expectHeld] of [
+      ["a person's commit", person, false],
+      ["bot@ with no pipeline shape", { sha: "b1", message: "Fix intro formatting", authorEmail: "bot@unfoldingword.org" }, true],
+      ["ai@unfoldingword.org", { sha: "a1", message: "Update tn_EZK.tsv", authorEmail: "ai@unfoldingword.org" }, true],
+      ["revert of our export", { sha: "r1", message: 'Revert "bible-editor: EZK tn → master (#6711)" (#6716)', authorEmail: "richard@example.org" }, true],
+    ]) {
+      const { sqlite, env } = freshEnv();
+      const boundary = seed(sqlite);
+      const lineage = build(ours, other);
+      eq(lineage.counts.ai, 0, `(7 ${label}) the classifier counts no AI commit (the gap this closes)`);
+      const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+        confirmedAt: 200, editId: boundary, lineage,
+      });
+      const row = readRow(sqlite);
+      if (expectHeld) {
+        eq(row.note, BASE, `(7 ${label}) the preserved note is NOT overwritten`);
+        eq(row.review_kind, "merge_no_base", `(7 ${label}) …and is flagged for review`);
+        eq(counts.preserved_held, 1, `(7 ${label}) …counted as preserved_held`);
+      } else {
+        eq(row.note, RICHARD, `(7 ${label}) a positively human commit is adopted`);
+        eq(row.review_kind, null, `(7 ${label}) …unflagged`);
+      }
+    }
+  }
+
+  // (8) Review F3: a note held on an earlier night ("Kept this preserved
+  //     note's text…") that a later night adopts as a person's fix must not keep
+  //     a flag saying the editor's text was kept. Only that flavor is cleared.
+  {
+    const HELD = "Kept this preserved note's text, and Door43 has a different version. (earlier night)";
+    for (const [label, kind, reason, expectKind] of [
+      ["held flavor", "merge_no_base", HELD, null],
+      ["generic merge_no_base", "merge_no_base", "Nothing was overwritten. Check this row against Door43's version…", "merge_no_base"],
+    ]) {
+      const { sqlite, env } = freshEnv();
+      const boundary = seed(sqlite, { reviewKind: kind });
+      sqlite.prepare(`UPDATE tn_rows SET review_reason = ? WHERE id = 'ytm6'`).run(reason);
+      await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+        confirmedAt: 200, editId: boundary, lineage: HUMAN,
+      });
+      const row = readRow(sqlite);
+      eq(row.note, RICHARD, `(8 ${label}) the person's fix is adopted`);
+      eq(row.review_kind, expectKind, `(8 ${label}) review_kind afterwards`);
+      if (expectKind == null) {
+        eq(row.review_reason, null, `(8 ${label}) …reason cleared`);
+        eq(row.review_master_json, null, `(8 ${label}) …snapshot cleared`);
+      }
+    }
+  }
+
+  // (6) A Door43 editor moved the preserved row's reference AND edited its
+  //     quote. A protected row never holds on a reference move (classifyTsvRef
+  //     Move is "none" for it), so adopting master's quote here would publish it
+  //     at D1's verse. Left on today's path: no merge, no flag.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite);
+    const counts = await applyTsvRows(
+      env, BOOK, "tn", [masterTn(RICHARD, { chapter: 40, verse: 7, refRaw: "40:7", quote: "new quote" })], null,
+      { confirmedAt: 200, editId: boundary, lineage: HUMAN },
+    );
+    const row = readRow(sqlite);
+    eq(row.note, BASE, "(6) a preserved row whose reference disagrees is not merged");
+    eq(row.review_kind, null, "(6) …and not flagged (today's behavior)");
+    eq(counts.merge_adopted, 0, "(6) …no adoption");
   }
 }
 

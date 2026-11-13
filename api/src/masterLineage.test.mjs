@@ -1861,6 +1861,29 @@ console.log("\n[#1351: a window whose only human commits are merges identical to
   eq(masterMayHoldHumanEditForVerse(summary, -1, 13), true, "an unusable verse still holds");
 }
 
+// ── #1347 review F1/F2: which human-counted commits are POSITIVELY human ────
+console.log("\n[#1347: compactLineage humanUnsure]");
+{
+  const c = (sha, message, authorEmail) => classifyMasterCommit({ sha, message, authorEmail });
+  const person = c("p1", "Puts a ; after one Alternate translation", "richard@example.org");
+  const handBot = c("b1", "Fix intro formatting", "bot@unfoldingword.org"); // bot, no pipeline shape
+  const aiAddr = c("a1", "Update tn_EZK.tsv", "ai@unfoldingword.org");
+  const bpBot = c("k1", "Update tn_EZK.tsv", "53472+bookpackagebot@noreply.example.org");
+  const noEmail = c("n1", "Update tn_EZK.tsv", null);
+  const revertOurs = c("r1", 'Revert "bible-editor: EZK tn → master (#6711)" (#6716)', "richard@example.org");
+  for (const k of [person, handBot, aiAddr, bpBot, noEmail, revertOurs]) {
+    eq(k.kind, "human", `classifier still calls ${k.sha} human (ordinary rows unchanged)`);
+  }
+  const ours = c("o1", "bible-editor: EZK tn → master (#6711)", "someone@example.org");
+  const only = compactLineage(summarizeLineage([ours, person]));
+  eq(only.humanUnsure, 0, "a person's commit is positively human: humanUnsure 0");
+  eq(JSON.stringify(only.counts), JSON.stringify({ ours: 1, ai: 0, human: 1 }), "counts unchanged by the new field");
+  for (const k of [handBot, aiAddr, bpBot, noEmail, revertOurs]) {
+    eq(compactLineage(summarizeLineage([person, k])).humanUnsure, 1, `${k.sha} (${k.message}) counts as humanUnsure`);
+  }
+  eq(compactLineage(summarizeLineage([])).humanUnsure, 0, "an empty window: humanUnsure 0");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) FAILED`);
   process.exit(1);
