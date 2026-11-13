@@ -28,6 +28,7 @@ import { fileURLToPath } from "node:url";
 import {
   normalizeWordPunctuation,
   splitGluedAlignmentWords,
+  isHeaderLabelNode,
 } from "../api/src/importParsers.ts";
 // Issue #686 item 5: a direct-SQL repair must not leave a row claiming its
 // PREVIOUS provenance (e.g. still reading as a Door43-pristine or in-app
@@ -53,6 +54,9 @@ function extractPlainText(verseObj) {
   const walk = (vos) => {
     for (const vo of vos || []) {
       if (!vo || typeof vo !== "object") continue;
+      // A `\sp` speaker label's text is not verse text (#1339); same skip as
+      // extractPlainText in api/src/importParsers.ts and web/src/lib/usfm.ts.
+      if (isHeaderLabelNode(vo)) continue;
       if (typeof vo.text === "string") parts.push(vo.text);
       if (Array.isArray(vo.children)) walk(vo.children);
     }

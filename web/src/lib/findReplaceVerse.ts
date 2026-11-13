@@ -18,7 +18,38 @@
 
 import { smartReplaceVerse, type SmartReplaceResult } from "./replace.ts";
 import { curlifyVerseContent } from "./curlyVerse.ts";
-import { extractPlainText } from "./usfm.ts";
+import { extractPlainText, isHeaderLabelNode } from "./usfm.ts";
+
+// A find/replace result. `staleRefused`: the verse was left as it is because
+// it has a header label and its stored plain text is out of step with its
+// tree (#1339). The overlay says so instead of dropping the click silently.
+export type FindReplaceResult = SmartReplaceResult & { staleRefused?: true };
+
+// A verse with a header label whose stored plain text is not its tree's own
+// (#1339). The server's extractor once kept a `\sp` label's text in the stored
+// plain text while the editor's left it out, so such a row reads
+// `said The man speaking the man` where the tree reads `said the man`. The
+// overlay's matches come from the stored text, and the engine's position walk
+// misses on it: its occurrence count then lands on another word, in the label,
+// or writes the label's text into the body. Guessing where the match sits in
+// the tree's text failed review twice (a pick in the label edited a body
+// word), so such a verse is refused. A stale verse with no header label takes
+// main's path unchanged.
+function staleBesideLabel(content: unknown, plainText: string): boolean {
+  const vos = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (!Array.isArray(vos)) return false;
+  const hasLabel = (nodes: unknown[]): boolean =>
+    nodes.some((n) => isHeaderLabelNode(n) || (Array.isArray((n as { children?: unknown[] } | null)?.children) && hasLabel((n as { children: unknown[] }).children)));
+  if (!hasLabel(vos)) return false;
+  return plainText.replace(/\s+/g, " ").trim() !== extractPlainText(content);
+}
+
+const staleRefusal = (content: unknown, plainText: string): FindReplaceResult => ({
+  content,
+  plainText,
+  preservedAlignment: true,
+  staleRefused: true,
+});
 
 // Turn the engine's result for `content` (the verse as saved, with its stored
 // `plainText`) into what gets saved: the curled tree and its plain text. When
@@ -64,7 +95,9 @@ export function findReplaceVerse(
   matchStartInPlain: number,
   matchLenInPlain: number,
   replaceText: string,
-): SmartReplaceResult {
+): FindReplaceResult {
+  // A stale stored text beside a header label: refuse, visibly (#1339).
+  if (staleBesideLabel(content, plainText)) return staleRefusal(content, plainText);
   const result = smartReplaceVerse(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, { findReplace: true });
   return finalizeFindReplace(content, plainText, result);
 }
@@ -81,7 +114,9 @@ export function replaceAllInVerse(
   regex: RegExp,
   maxIters: number,
   replaceText: string,
-): SmartReplaceResult {
+): FindReplaceResult {
+  // A stale stored text beside a header label: refuse the verse (#1339).
+  if (staleBesideLabel(content, plainText)) return staleRefusal(content, plainText);
   let curContent = content;
   let curPlain = plainText;
   let preserved = true;
@@ -127,25 +162,34 @@ export function replaceAllInVerse(
 // `alignmentRefused` is verses the save's alignment guard refused (it shows
 // its own toast; nothing is saved), so a refused replace is never reported as
 // replaced (#1285). With nothing replaced and a refusal, the line leads with
-// the refusal instead of "replaced 0 verses".
+// the refusal instead of "replaced 0 verses". `staleRefused` is verses the
+// engine left alone because their stored text is out of date beside a header
+// label (#1339).
 export interface BibleReplaceCounts {
   versesReplaced: number;
   alignmentLost: number;
   readOnlySkipped: number;
   alignmentRefused: number;
+  staleRefused?: number;
 }
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
 export function bibleReplaceSummaryText(s: BibleReplaceCounts): string {
   const parts: string[] = [];
-  if (s.versesReplaced > 0 || s.alignmentRefused === 0) {
+  const staleRefused = s.staleRefused ?? 0;
+  if (s.versesReplaced > 0 || (s.alignmentRefused === 0 && staleRefused === 0)) {
     parts.push(`replaced ${plural(s.versesReplaced, "verse", "verses")}`);
   }
   if (s.alignmentLost > 0) parts.push(`alignment milestones destroyed in ${s.alignmentLost}`);
   if (s.alignmentRefused > 0) {
     parts.push(
       `${plural(s.alignmentRefused, "verse", "verses")} not replaced: ${s.alignmentRefused === 1 ? "it" : "they"} would lose word alignment`,
+    );
+  }
+  if (staleRefused > 0) {
+    parts.push(
+      `${plural(staleRefused, "verse", "verses")} not replaced: ${staleRefused === 1 ? "its" : "their"} saved search text is out of date`,
     );
   }
   if (s.readOnlySkipped > 0) {

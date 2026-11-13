@@ -1308,6 +1308,23 @@ function collapseRedundantTsMilestones(verseObjects: unknown[]): unknown[] {
   return out.length === verseObjects.length ? verseObjects : out;
 }
 
+// Header/reference/label nodes that live in the header band, not the verse
+// body. Mirror of SECTION_HEADER_TAGS, HEADER_LABEL_TAGS and isHeaderLabelNode
+// in web/src/lib/usfm.ts (same cross-bundle reason as extractPlainText below;
+// keep in sync). `\s1`-`\s4`/`\ms*` carry `type:"section"`; `\sp`, `\sr`,
+// `\r` and `\cl` carry no `type`. `\d` (Psalm superscription) is deliberately
+// out: its text is alignable verse text.
+const SECTION_HEADER_TAGS: ReadonlySet<string> = new Set(["s1", "s2", "s3", "s4", "ms", "ms1", "ms2"]);
+const HEADER_LABEL_TAGS: ReadonlySet<string> = new Set(["sp", "sr", "r", "cl"]);
+export function isHeaderLabelNode(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o || typeof o["tag"] !== "string") return false;
+  const tag = o["tag"] as string;
+  if (o["type"] === "section") return SECTION_HEADER_TAGS.has(tag);
+  if (o["type"] !== undefined) return false;
+  return HEADER_LABEL_TAGS.has(tag);
+}
+
 // Walk verse-objects and concatenate all text. Same shape and behaviour
 // as the client-side `extractPlainText` in web/src/lib/usfm.ts — kept
 // duplicated because the Worker bundle and the web bundle are built
@@ -1343,6 +1360,11 @@ export function extractPlainText(verseObj: unknown): string {
         if (typeof v.text === "string") parts.push(v.text);
         continue;
       }
+      // Header/label nodes live in the header band, not the verse body. `\sp`
+      // parks its speaker label on `text`, so without this skip it leaked into
+      // the stored plain text while the editor's copy left it out, and every
+      // imported `\sp` verse started out stale for find/replace (#1339).
+      if (isHeaderLabelNode(vo)) continue;
       if (typeof v.text === "string") parts.push(v.text);
       if (Array.isArray(v.children)) walk(v.children);
     }

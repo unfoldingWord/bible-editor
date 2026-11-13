@@ -26,6 +26,7 @@ import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import usfm from "usfm-js";
+import { isHeaderLabelNode } from "../api/src/importParsers.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -70,6 +71,9 @@ function extractPlainText(verseObj) {
   const walk = (vos) => {
     for (const vo of vos || []) {
       if (!vo || typeof vo !== "object") continue;
+      // A `\sp` speaker label's text is not verse text (#1339); same skip as
+      // extractPlainText in api/src/importParsers.ts and web/src/lib/usfm.ts.
+      if (isHeaderLabelNode(vo)) continue;
       if (typeof vo.text === "string") parts.push(vo.text);
       if (Array.isArray(vo.children)) walk(vo.children);
     }

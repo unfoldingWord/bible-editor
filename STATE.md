@@ -796,6 +796,16 @@ Highlights that bite repeatedly:
   local `/api/pipelines/start` dispatches to the real bot unless `PIPELINE_API_BASE` points somewhere dead. Live-test
   pipeline UI with `wrangler dev ... --var PIPELINE_API_BASE:http://127.0.0.1:9`; a start then fails with 502
   `upstream_unreachable` (measured 2026-11-04).
+- **Find/replace refuses a verse with a header label whose stored plain text is stale (#1339).** The server and
+  script extractors (`api/src/importParsers.ts`, `scripts/import-book.mjs`) kept a plain-text `\sp` label's text
+  in `plain_text` while the editor's (`web/src/lib/usfm.ts`) skipped it; fixed here, and
+  `api/src/plainTextParity.test.mjs` pins the two copies together. Prod had no `\sp` verse as of 2026-11-12, and
+  all ~400 header-label verses matched. `findReplaceVerse` now refuses such a verse visibly ("saved search text is
+  out of date"): guessing where the match sits failed review twice, and counting occurrences edited the wrong word.
+  A label written as words (`\sp \w The\w* …`, most of en_ust SNG) parses as body words in every extractor.
+- **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in
+  local D1 for a live test is overwritten before the test starts. Run a one-off spec with a config that spreads
+  `playwright.config.ts` and sets `globalSetup: undefined` (measured 2026-11-12).
 
 ## Stop conditions / goals
 
