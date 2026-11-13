@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, isHeaderLabelNode, isWordLabelNode, isSpeakerLabelNode, headerLabelText, rewriteHeaderLabel, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, isHeaderLabelNode, isWordLabelNode, isSpeakerLabelNode, headerLabelText, rewriteHeaderLabel, liftMarkerText, extractPlainText, extractEditableText, noteHasTrailingSpace } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 import { hoistOpeningPunctuation, concatVerseText, OPENING_PUNCT_RE } from "./openingPunct.ts";
@@ -1855,6 +1855,45 @@ function editWordLabel(node: Record<string, unknown>, text: string): Record<stri
   return { ...node, children };
 }
 
+// usfm-js parks the line break after a footnote's `\f*` on the note's
+// `nextChar` (#1372), and every walker in this engine reads only `text`: at the
+// end of a USFM line (`\w Body\w*\f + \ft note\f*⏎\w more\w*`) the raw text
+// read "Bodymore." while plain and editable text read "Body more.", so a typed
+// "more" -> "less" saved "Bodyless." and unaligned both words. For the edit that
+// whitespace is a text node of its own, as editWordLabel does for a label
+// (#1366); usfm-js exports both shapes as the same bytes. Only where it is the
+// sole space: a text node starting with whitespace after the note already
+// parts the words. A verse with no such note comes back as the same object.
+function splitNoteSeparators(nodes: unknown[]): unknown[] {
+  let changed = false;
+  const out = nodes.flatMap((c, i) => {
+    const o = c as Record<string, unknown> | null;
+    if (!o) return [c];
+    if (Array.isArray(o["children"])) {
+      const kids = splitNoteSeparators(o["children"] as unknown[]);
+      if (kids !== o["children"]) {
+        changed = true;
+        return [{ ...o, children: kids }];
+      }
+      return [c];
+    }
+    if (!noteHasTrailingSpace(o)) return [c];
+    const next = nodes[i + 1] as Record<string, unknown> | null | undefined;
+    if (next && next["type"] === "text" && /^\s/.test(String(next["text"] ?? ""))) return [c];
+    changed = true;
+    const { nextChar, ...rest } = o;
+    return [rest, { type: "text", text: nextChar }];
+  });
+  return changed ? out : nodes;
+}
+
+function withNoteSeparators(content: unknown): unknown {
+  const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (!Array.isArray(vo)) return content;
+  const split = splitNoteSeparators(vo);
+  return split === vo ? content : { ...(content as object), verseObjects: split };
+}
+
 function smartReplaceVerseInner(
   content: unknown,
   plainText: string,
@@ -1870,6 +1909,7 @@ function smartReplaceVerseInner(
   // exact-text guard reads results in (isExactReplace).
   options: { findReplace?: boolean; typed?: boolean } = {},
 ): SmartReplaceResult {
+  content = withNoteSeparators(content);
   const result = smartReplaceVerseImpl(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options);
   const verseObjectsOut = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (Array.isArray(verseObjectsOut)) {
@@ -3548,6 +3588,8 @@ function smartEditVerseInner(
     const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (Array.isArray(vo)) content = { verseObjects: liftMarkerText(vo) };
   }
+  // The line break after a footnote, as a text node (#1372).
+  content = withNoteSeparators(content);
 
   // Inline markers (\p, \q1, \q2, \ts\*) are surfaced as text tokens in the
   // editable string but are inert position anchors with NO raw text in the

@@ -43,6 +43,8 @@ export function extractPlainText(verseObjects: unknown): string {
       if (isHeaderLabelNode(vo)) continue;
       if (typeof v.text === "string") parts.push(v.text);
       if (Array.isArray(v.children)) walk(v.children);
+      // The line break after a footnote's `\f*` (#1372, noteHasTrailingSpace).
+      if (noteHasTrailingSpace(vo)) parts.push(" ");
     }
   };
   const top = verseObjects as { verseObjects?: unknown[] } | null;
@@ -248,6 +250,21 @@ export function headerLabelText(node: unknown): string {
 // `\sp` line lives inside the label, so without this the translator could not
 // see it. Read-only: a band edit keeps the note node as it is.
 const NOTE_TAGS: ReadonlySet<string> = new Set(["f", "fe", "x", "ef", "ex"]);
+
+// A footnote or cross reference (`\f … \f*`, `\x … \x*`) whose `nextChar`
+// holds only whitespace (#1372). usfm-js parks the space or line break after
+// the note's closing marker there, not in a text node, so at the end of a USFM
+// line (`\w Body\w*\f + \ft note\f*⏎\w more\w*`) it is the only thing between
+// the words on either side: plain, editable and rendered text read it as a
+// space, and the edit engine splits it into a text node (splitNoteSeparators
+// in replace.ts). Mirror of the same rule in api/src/importParsers.ts
+// extractPlainText (plainTextParity.test.mjs).
+export function noteHasTrailingSpace(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o || typeof o["nextChar"] !== "string" || !/^\s+$/.test(o["nextChar"])) return false;
+  const tag = o["tag"];
+  return o["type"] === "footnote" || (o["type"] === undefined && typeof tag === "string" && NOTE_TAGS.has(tag));
+}
 export function labelNoteTexts(node: unknown): string[] {
   if (!isWordLabelNode(node)) return [];
   const out: string[] = [];
@@ -778,6 +795,8 @@ export function extractEditableText(verseObjects: unknown): string {
       if (isHeaderLabelNode(v)) continue;
       if (typeof v["text"] === "string") parts.push(v["text"] as string);
       if (Array.isArray(v["children"])) walk(v["children"] as unknown[]);
+      // The line break after a footnote's `\f*` (#1372, noteHasTrailingSpace).
+      if (noteHasTrailingSpace(v)) parts.push(" ");
     }
   };
   const top = verseObjects as { verseObjects?: unknown[] } | null;

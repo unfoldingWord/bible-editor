@@ -896,7 +896,11 @@ Highlights that bite repeatedly:
   or line break after `\f*` on the footnote's `nextChar`, which plain/editable text skip, so the words on either side
   fuse (`The\f…\f*⏎woman` read "Thewoman" and a band edit saved one word "Thelady"); `headerLabelText` reads
   `nextChar` and `editWordLabel` splits it into a text node for the edit. The same fusing exists in the verse
-  body (`\w Body\w*\f…\f*⏎\w more\w*` -> "Bodymore."), not fixed. A label's notes show read-only in the band
+  body (`\w Body\w*\f…\f*⏎\w more\w*` -> "Bodymore.", 22 of 12,566 verses in nine sampled en_ult/en_ust books);
+  fixed in #1372: `noteHasTrailingSpace` (web `usfm.ts`, mirrored in `importParsers.ts`) makes plain text, editable
+  text and the editable render read it as a space, and the engine splits it into a text node at entry
+  (`withNoteSeparators`). Rows stored before #1372 keep the fused plain_text until re-saved or re-imported (a
+  pristine row is rewritten by the nightly reimport once its book's master moves). A label's notes show read-only in the band
   (`SectionHeader.notes`). In find/replace only, when the first word after a label's line break was replaced and
   new words would sit before the label, the replace is refused (`speechStartRefused`, label-moved) unless the new
   words are one for one with the old on each side. Moving the break was tried and dropped in review: no rule tells
