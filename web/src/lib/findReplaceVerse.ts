@@ -18,7 +18,7 @@
 
 import { smartReplaceVerse, type SmartReplaceResult } from "./replace.ts";
 import { curlifyVerseContent } from "./curlyVerse.ts";
-import { extractPlainText, isHeaderLabelNode } from "./usfm.ts";
+import { extractPlainText, isHeaderLabelNode, isWordLabelNode } from "./usfm.ts";
 
 // A find/replace result. `staleRefused`: the verse was left as it is because
 // it has a header label and its stored plain text is out of step with its
@@ -133,7 +133,8 @@ export function replaceAllInVerse(
   // either applies a step or moves `from` forward, so the loop ends.
   let from = 0;
   const globalFlags = regex.flags.includes("g") ? regex.flags : regex.flags + "g";
-  for (let applied = 0; applied < maxIters; ) {
+  let applied = 0;
+  while (applied < maxIters) {
     const localRe = new RegExp(regex.source, globalFlags);
     localRe.lastIndex = from;
     const next = localRe.exec(curPlain);
@@ -163,6 +164,17 @@ export function replaceAllInVerse(
     from = 0;
     labelRefusals = 0;
     applied++;
+  }
+  // The cap ended the loop right after an applied step, so the last pass never
+  // met the refused matches again (a replacement that re-matches the pattern
+  // uses up the cap): count them on the final tree, applying nothing.
+  const vo = (curContent as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (applied >= maxIters && Array.isArray(vo) && vo.some(isWordLabelNode)) {
+    const countRe = new RegExp(regex.source, globalFlags);
+    for (let m = countRe.exec(curPlain); m; m = countRe.exec(curPlain)) {
+      if (smartReplaceVerse(curContent, curPlain, regex, m.index, m[0].length, replaceText, { findReplace: true }).labelRefused) labelRefusals++;
+      if (m[0].length === 0) countRe.lastIndex++;
+    }
   }
   const out: FindReplaceResult = finalizeFindReplace(content, plainText, {
     content: curContent,
