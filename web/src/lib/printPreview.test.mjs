@@ -158,6 +158,18 @@ const markersOf = (html) => [...html.matchAll(MARKER_RE)].map((m) => m[0].replac
   assert(raw.includes('class="wrappers_usfm_x">') && !raw.includes('onmouseover="alert'), "a malformed tag degrades to class x and never reaches an attribute");
 }
 
+// --- a \sp label written as words (#1350) prints like a plain-text one ---
+// The import nests the label's \w words into the sp node (nestWordLabels); the
+// heading must still carry them, and the next line must not flow into it.
+{
+  const body = [{ tag: "p", type: "paragraph" }, w("This"), t(" "), w("song"), t(".\n")];
+  const label = (sp) => render([mkVerse(1, 1, [...body, sp, { tag: "q1", type: "quote" }]), mkVerse(1, 2, [w("I"), t(" "), w("wish"), t(".")])]);
+  const plain = label({ tag: "sp", text: "The woman thinks\n" });
+  const nested = label({ tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("woman"), t(" "), w("thinks"), t("\n")], endTag: "" });
+  assert(nested.includes('<p class="paras_usfm_sp">The woman thinks</p>'), `word label prints as its heading (got ${nested})`);
+  assert(nested === plain, "word label prints exactly as the same label in plain text");
+}
+
 // --- standalone document ---
 {
   const doc = buildPrintPreviewDocument("ZEC 2 · ULT", "<p>x</p>", true);

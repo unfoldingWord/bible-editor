@@ -1407,7 +1407,10 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
     return { ...rest, text, [LABEL_WORDS]: { children, endTag } };
   });
   if (before.length === 0) return run(content);
-  const result = run({ ...(content as Record<string, unknown>), verseObjects: collapsed });
+  const shown = { ...(content as Record<string, unknown>), verseObjects: collapsed };
+  const result = run(shown);
+  // The engine changed nothing (it hands its input back): so does this.
+  if (result.content === shown) return { ...result, content };
   const refuse = (why: string): SmartReplaceResult => {
     console.warn(`[replace] edit refused: it would change a speaker label written as words (${why}) (#1350).`);
     return { content, plainText: extractPlainText(content), preservedAlignment: true };

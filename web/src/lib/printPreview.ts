@@ -30,7 +30,7 @@
 // chunk dividers are invisible except as markers (Door43 strips \s5 too).
 
 import type { VerseDto } from "../sync/api.ts";
-import { PARAGRAPH_TAGS, isInFlowMarker, isCharacterWrapper, isTsMilestone } from "./usfm.ts";
+import { PARAGRAPH_TAGS, isInFlowMarker, isCharacterWrapper, isTsMilestone, isHeaderLabelNode, headerLabelText } from "./usfm.ts";
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -233,6 +233,13 @@ export function renderPrintPreviewHtml({ verses }: PrintPreviewInput): string {
       // loses its text.
       if (isHeading || ((PARAGRAPH_TAGS.has(tag) || isInFlowMarker(o)) && !isCharacterWrapper(o))) {
         open(tag);
+        // A `\sp` label written as words holds them as `children` (nestWordLabels,
+        // #1350): print their text as the heading, complete like a text label.
+        if (isHeading && isHeaderLabelNode(o) && Array.isArray(o["children"]) && o["content"] === undefined && o["text"] === undefined) {
+          emit(impliedWords(escapeHtml(headerLabelText(o))));
+          cur = null;
+          continue;
+        }
         // Heading text usfm-js parked on `content`; leading punctuation (or a
         // whole bare line, `\li1 item`) it parked on the marker's own `text` /
         // `content` is verse content (see usfm.ts liftMarkerText).
