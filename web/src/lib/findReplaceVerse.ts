@@ -24,8 +24,8 @@ import { extractPlainText, isHeaderLabelNode } from "./usfm.ts";
 // it has a header label and its stored plain text is out of step with its
 // tree (#1339). The overlay says so instead of dropping the click silently.
 // `labelRefusals`: how many matches the engine refused because the replace
-// would run across a `\sp` speaker label written as words (#1350); those
-// matches are left as they are, and the overlay says so too.
+// would move a `\sp` speaker label written as words (#1350; see
+// withWordLabelsAsText); those matches are left as they are, and the overlay says so too.
 export type FindReplaceResult = SmartReplaceResult & { staleRefused?: true; labelRefusals?: number };
 
 // A verse with a header label whose stored plain text is not its tree's own
@@ -180,7 +180,7 @@ export function replaceAllInVerse(
 // the refusal instead of "replaced 0 verses". `staleRefused` is verses the
 // engine left alone because their stored text is out of date beside a header
 // label (#1339). `labelRefused` is MATCHES the engine left alone because the
-// replace would run across a `\sp` speaker label written as words (#1350).
+// replace would move a `\sp` speaker label written as words (#1350).
 export interface BibleReplaceCounts {
   versesReplaced: number;
   alignmentLost: number;
@@ -212,7 +212,7 @@ export function bibleReplaceSummaryText(s: BibleReplaceCounts): string {
   }
   if (labelRefused > 0) {
     parts.push(
-      `${plural(labelRefused, "match", "matches")} not replaced: ${labelRefused === 1 ? "it runs" : "they run"} across a speaker label`,
+      `${plural(labelRefused, "match", "matches")} not replaced: ${labelRefused === 1 ? "it" : "they"} would move a speaker label`,
     );
   }
   if (s.readOnlySkipped > 0) {

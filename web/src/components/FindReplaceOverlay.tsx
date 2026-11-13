@@ -699,7 +699,7 @@ export function FindReplaceOverlay({
       setReplaceSummary({ scope: "bible", versesReplaced: 0, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, staleRefused: 1 });
       return;
     }
-    // The match runs across a `\sp` speaker label written as words (#1350):
+    // The replace would move a `\sp` speaker label written as words (#1350):
     // nothing is saved; say so.
     if (result.labelRefusals) {
       setReplaceSummary({ scope: "bible", versesReplaced: 0, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, labelRefused: result.labelRefusals });

@@ -849,16 +849,17 @@ Highlights that bite repeatedly:
   (`nestWordLabels`, last step of `extractVersesForRange`, mirrored in `web/src/lib/usfm.ts` and called by the
   import scripts) moves the words into the node as `children` with `endTag: ""`, which usfm-js renders back byte
   for byte. Every skip keyed on `isHeaderLabelNode` then covers it, but any walker that descends `children`
-  generically still sees the label words: the edit engine does, so `smartEditVerse` / `smartReplaceVerse` show it
-  each word label as a plain-text `{tag:"sp", text}` for the edit and put the words back after. Door43 and the
-  export count `x-occurrence` over the whole verse, label words included, so an edit to a word a label also holds
-  renumbers the label's copy. One SNG 1:4 label holds `\zaln` milestones (label words aligned on Door43); they ride
-  along untouched. A header-band edit of a word label writes plain `\sp text` (the words are dropped).
-  The engine's marker tiers see a label only as invisible text: they re-place the `\q1` after a verse-final
-  label in front of it (`\q1 \sp …` on export would open the next verse inside the label), so the wrapper puts
-  it back and refuses any other label move; and the whole-verse punctuation relayout blanks a text label, so a
-  punctuation change right before a word label is refused (a plain-text label there loses its text silently).
-  Showing the label as `content` (like `\s1`) fixed the punctuation case but let reconcile move labels freely.
+  generically still sees the label words. So `smartEditVerse` / `smartReplaceVerse` take each word label out of
+  the verse for the edit, anchored to the Nth top-level line marker after it (or the verse end), and put it back
+  before the same Nth marker; an edit that changes the number of line markers in a labelled verse is refused
+  (`labelRefused`: toast, nothing queued; find/replace counts it). Showing the engine the label instead failed
+  twice: as plain-text `{tag:"sp", text}` the whole-verse punctuation relayout blanked it (any punctuation edit in
+  the verse) and the marker tiers moved the `\q1` after a verse-final label in front of it (`\q1 \sp …` opens the
+  next verse inside the label); as `content` (like `\s1`) reconcile moved labels freely. A plain-text `\sp` label
+  (main's handling, untouched here) still has the blanking fault. Door43 and the export count `x-occurrence` over
+  the whole verse, label words included, so an edit to a word a label also holds renumbers the label's copy. One
+  SNG 1:4 label holds `\zaln` milestones (label words aligned on Door43); they ride along untouched. A header-band
+  edit of a word label writes plain `\sp text` (the words are dropped).
 - **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in
   local D1 for a live test is overwritten before the test starts. Run a one-off spec with a config that spreads
   `playwright.config.ts` and sets `globalSetup: undefined` (measured 2026-11-12).

@@ -314,19 +314,29 @@ const sourceOf = (content, word) => (wordSources(content).find(([tx]) => tx === 
 // threadVersionToSiblings) leaves the op on its old version, so it 409s and
 // the conflict prompt asks; the user's resolve sends it as is (my edit wins).
 // Verbatim here would let the thread path re-send a stale tree with no prompt.
+// The engine refuses an edit that removes the line marker a label sits before
+// (here the op joined the two lines). A punctuation-only op rebases normally,
+// the label kept before its \q1 (review H1).
 {
   const label = () => ({ tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("man"), t("\n")], endTag: "" });
   const server = { verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(".\n"), label(), { tag: "q1", type: "quote" }, zaln("H3", [w("He")]), t(" "), zaln("H4", [w("ran")]), t(".")] };
-  const op = { verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(" and\n"), label(), { tag: "q1", type: "quote" }, w("he"), t(" "), zaln("H4", [w("ran")]), t(".")] };
+  const joined = { verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(" and "), label(), w("he"), t(" "), zaln("H4", [w("ran")]), t(".")] };
   const warn = console.warn;
   console.warn = () => {};
   try {
-    check(smartEditVerse(server, extractEditableText(server), extractEditableText(op)).labelRefused === true, "setup: the engine refuses this edit");
-    const out = rebaseVersePatch({ content: op }, server);
-    check(out.kind === "refuse_thread", `an edit across a word label the engine refuses is not threaded (got ${out.kind})`);
+    check(smartEditVerse(server, extractEditableText(server), extractEditableText(joined)).labelRefused === true, "setup: the engine refuses this edit");
+    const out = rebaseVersePatch({ content: joined }, server);
+    check(out.kind === "refuse_thread", `an edit the engine refuses beside a word label is not threaded (got ${out.kind})`);
   } finally {
     console.warn = warn;
   }
+  const punct = { verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(";\n"), label(), { tag: "q1", type: "quote" }, zaln("H3", [w("He")]), t(" "), zaln("H4", [w("ran")]), t(".")] };
+  const re = rebaseVersePatch({ content: punct }, server);
+  const vos = re.patch?.content?.verseObjects ?? [];
+  const li = vos.findIndex((n) => n.tag === "sp");
+  check(re.kind === "rebased" && extractEditableText(re.patch.content) === extractEditableText(punct) && vos[li + 1]?.tag === "q1" && sourceOf(re.patch.content, "He") === "H3",
+    `a punctuation-only op beside a word label rebases normally (got ${re.kind})`);
 }
+
 
 console.log(`\nverseRebase: all ${passed} checks passed.`);

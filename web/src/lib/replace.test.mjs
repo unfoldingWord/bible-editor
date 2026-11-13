@@ -4174,18 +4174,56 @@ function countAllMilestones(nodes) {
     const all = smartEditVerse(clone(v1), old1, "This is a song by King Solomon.", { capturedFromDom: true });
     assert(labels(all.content) === labels(v1), `typed rewrite of 1:1: the label is unchanged (got ${labels(all.content)})`);
     assert(all.labelRefused === true || followerOfLabel(all.content) === "q1", `typed rewrite of 1:1: label not moved (got ${followerOfLabel(all.content)})`);
+    // Where each label sits: the number of top-level line markers before it
+    // (so "before the 2nd \q1", not just "before a \q1"; review H4), and the
+    // tag of the marker right after it.
+    const lineMarker = (n) => n && (n.type === "quote" || n.type === "paragraph" || /^ts/.test(n.tag ?? "")) && n.tag !== "qs";
+    const anchors = (content) => {
+      const out = [];
+      let m = 0;
+      content.verseObjects.forEach((n, i, all) => {
+        if (n && n.tag === "sp") out.push(`${m}:${all[i + 1]?.tag ?? "end"}`);
+        else if (lineMarker(n)) m++;
+      });
+      return JSON.stringify(out);
+    };
+    // What the engine does with the same edit on the verse with its labels taken
+    // out: the labels must change nothing else.
+    const bare = (content) => ({ verseObjects: content.verseObjects.filter((n) => !(n && n.tag === "sp")) });
+    const sameAsBare = (content, typedText, result) => {
+      const b = bare(content);
+      const r = smartEditVerse(clone(b), extractEditableText(b), typedText, { capturedFromDom: true });
+      return extractEditableText(result.content) === extractEditableText(r.content);
+    };
     // Review G4: two edits on opposite sides of a label, diffed against an
     // older pinned base (a save typed before the previous one landed), are one
-    // ordinary save: not refused, both edits in, labels kept.
+    // ordinary save: not refused, both edits in, labels kept in place.
     const two = old.replace("take me to your home", "bring me to your home").replace("like a king", "like a ruler");
     const g4 = smartEditVerse(clone(v4), old, two, { capturedFromDom: true });
-    assert(!g4.labelRefused && extractEditableText(g4.content) === two && labelWords(g4.content) === labelWords(v4), "edits on both sides of a label against an old base: saved, labels kept");
-    // Known limit (pinned so it stays safe): changing the punctuation right
-    // before a label is refused, not saved. The engine's whole-verse
-    // punctuation relayout blanks a label's text; on a plain-text label that
-    // is silent data loss, here it is a refusal the translator sees.
-    const punct = smartEditVerse(clone(v4), old, old.replace("bedroom. \\q1", "bedroom; \\q1"), { capturedFromDom: true });
-    assert(punct.labelRefused === true && labels(punct.content) === labels(v4), "punctuation right before a label: refused, labels kept");
+    assert(!g4.labelRefused && sameAsBare(v4, two, g4) && labelWords(g4.content) === labelWords(v4) && anchors(g4.content) === anchors(v4),
+      `edits on both sides of a label against an old base: saved, labels kept in place (got ${anchors(g4.content)})`);
+    // Review H1: a punctuation-only edit used to be refused anywhere in a
+    // labelled verse (the whole-verse relayout blanked the label). Far from a
+    // label, right before one, and the verse-final one: saved, labels in place.
+    for (const [name, base, f] of [
+      ["far from a label (quickly; -> quickly,)", v4, (s) => s.replace("quickly;", "quickly,")],
+      ["right before a label (bedroom. -> bedroom;)", v4, (s) => s.replace("bedroom. \\q1", "bedroom; \\q1")],
+      ["deleting the period before a label", v4, (s) => s.replace("bedroom. \\q1", "bedroom \\q1")],
+      ["before the verse-final label (song. -> song!)", v1, (s) => s.replace("song.", "song!")],
+    ]) {
+      const o = extractEditableText(base);
+      const r = smartEditVerse(clone(base), o, f(o), { capturedFromDom: true });
+      assert(!r.labelRefused && sameAsBare(base, f(o), r) && labels(r.content) === labels(base) && anchors(r.content) === anchors(base),
+        `punctuation ${name}: saved, labels unchanged and in place (got ${anchors(r.content)})`);
+    }
+    // Review H5: retagging the line marker right after a label (\q1 -> \q2)
+    // keeps the label in front of it.
+    const retag = old.replace("bedroom. \\q1 We", "bedroom. \\q2 We");
+    const rt = smartEditVerse(clone(v4), old, retag, { capturedFromDom: true });
+    const wantRetag = JSON.parse(anchors(v4));
+    wantRetag[1] = wantRetag[1].replace(":q1", ":q2"); // label 2 sits before that \q1
+    assert(!rt.labelRefused && extractEditableText(rt.content) === retag && anchors(rt.content) === JSON.stringify(wantRetag),
+      `\\q1 -> \\q2 after a label: saved, label still before it (got ${anchors(rt.content)})`);
     // No change at all hands back the caller's own tree.
     const same = clone(v4);
     assert(smartEditVerse(same, old, old).content === same, "typed no-op: the same tree comes back");
@@ -4205,21 +4243,36 @@ function countAllMilestones(nodes) {
     const e = smartEditVerse(clone(withEmpty), old1, old1.replace(" beautiful", ""), { capturedFromDom: true });
     assert(extractEditableText(e.content) === old1.replace(" beautiful", "") && labels(e.content) === labels(withEmpty), `text "" label: edit applied, label kept exactly (got ${labels(e.content)})`);
   }
-  // An edit whose range crosses a label. With a plain-text label the engine
-  // drops every label in the verse here (a separate, older fault); a word
-  // label is kept, and an edit that would lose it is refused: the verse comes
-  // back unchanged (the find/replace overlay then queues nothing).
+  // An edit whose range crosses a label. Labels are anchored to the line
+  // marker after them, so a replace across one goes through like the same
+  // replace across a bare \q1 (H4: each label stays before the same marker).
+  // An edit that removes a line marker in a labelled verse can't keep that
+  // anchor and is refused: the verse comes back unchanged, flagged.
   {
+    const lineMarker = (n) => n && (n.type === "quote" || n.type === "paragraph" || /^ts/.test(n.tag ?? "")) && n.tag !== "qs";
+    const anchors = (content) => {
+      const out = [];
+      let m = 0;
+      content.verseObjects.forEach((n, i, all) => {
+        if (n && n.tag === "sp") out.push(`${m}:${all[i + 1]?.tag ?? "end"}`);
+        else if (lineMarker(n)) m++;
+      });
+      return JSON.stringify(out);
+    };
     const warn = console.warn;
     console.warn = () => {};
     try {
       const at = p4.indexOf("bedroom. We");
       const f = findReplaceVerse(clone(v4), p4, /bedroom\. We/g, at, 11, "bedroom; we");
-      assert(labels(f.content) === labels(v4) && f.plainText === p4 && f.labelRefused === true, `find across a label: refused (flagged), labels kept (got ${JSON.stringify(f.plainText.slice(0, 40))})`);
+      assert(!f.labelRefused && extractPlainText(f.content) === p4.replace("bedroom. We", "bedroom; we") && labelWords(f.content) === labelWords(v4),
+        `find across a label: replaced, labels kept (got ${JSON.stringify(extractPlainText(f.content).slice(90, 140))})`);
+      const ma = JSON.parse(anchors(v4)).map((a) => a.split(":")[0]);
+      const fa = JSON.parse(anchors(f.content)).map((a) => a.split(":")[0]);
+      assert(JSON.stringify(ma) === JSON.stringify(fa), `find across a label: every label still before the same line marker (got ${anchors(f.content)})`);
       const old = extractEditableText(v4);
       const d = smartEditVerse(clone(v4), old, old.replace("to your home. \\q1 He is like", "like"), { capturedFromDom: true });
-      assert(labels(d.content) === labels(v4) && d.labelRefused === true, "typed delete across a label: refused (flagged), labels kept");
-      // A replace across a label that keeps the text on both sides intact goes through.
+      assert(labels(d.content) === labels(v4) && d.labelRefused === true && d.content.verseObjects === v4.verseObjects || (d.labelRefused === true && labels(d.content) === labels(v4)),
+        "typed delete of a line marker in a labelled verse: refused (flagged), labels kept");
       const h = p4.indexOf("home. He is");
       const ok = findReplaceVerse(clone(v4), p4, /home\. He is/g, h, 11, "home. She is");
       assert(extractPlainText(ok.content) === p4.replace("home. He is", "home. She is") && labelWords(ok.content) === labelWords(v4), "find across a label, text kept on both sides: replaced, labels kept");

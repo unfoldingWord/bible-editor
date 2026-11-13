@@ -4289,19 +4289,25 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       saveDoneGuardRef.current.cancel();
       const where = `${book} ${chapterNum}:${verseNum} ${bibleVersion}`;
       const epoch = pinEpoch(key);
+      // What the engine refuses (see withWordLabelsAsText): adding or removing a
+      // line break in a verse with a word label, which would move the label.
+      const why = `would move a speaker label (a line break added or removed in a verse with a speaker label can't be saved yet)`;
       void drafts
         .get(key)
         .then((draft) => {
           if (!draft) unpinVerseBaseIfIdle(key, epoch);
           pushPipelineToast(
             draft
-              ? `Not saved: this edit in ${where} runs across a speaker label. Make the changes on each side of the label in separate saves. Your typed text is still in the editor.`
-              : `Not saved: this change to ${where} runs across a speaker label.`,
+              ? `Not saved: this edit in ${where} ${why}. Your typed text is still in the editor.`
+              : `Not saved: this change to ${where} ${why}.`,
             "error",
           );
         })
         .catch(() => {
-          pushPipelineToast(`Not saved: this change to ${where} runs across a speaker label.`, "error");
+          // The draft store is unreadable: release the pin anyway. The idle
+          // check keeps it if a draft session in this tab still depends on it.
+          unpinVerseBaseIfIdle(key, epoch);
+          pushPipelineToast(`Not saved: this change to ${where} ${why}.`, "error");
         });
       return;
     }

@@ -1373,108 +1373,73 @@ export function smartReplaceVerse(
 // A `\sp` label written as words (#1350) is stored with its `\w` words as the
 // label node's `children` (nestWordLabels in usfm.ts). Plain and editable text
 // skip the whole node, but every walker in this engine (walkLeaves, rebuildRaw,
-// the relayout and reassembly tiers) descends `children`, so its raw text would
-// hold the label's words and an edit could land on them (the #1311 failure).
-// So for the length of one edit, show the engine each word label as a node
-// with its text on `content` (the way `\s1` holds a heading): no raw text at
-// all, so raw and plain text agree with no masking, holding the real words
-// aside on the node, and put the words back afterwards. (The plain-text label
-// shape, `{tag:"sp", text}`, was tried first: the whole-verse punctuation
-// relayout blanks every such label's text, so a ". -> ;" typed before a label
-// could not be saved.) Then the occurrence numbers are recounted over the
-// whole verse, label words included, as Door43 and the export count them.
-// Each label must come back with the same text, in the same order, still
-// followed by the same kind of node (its `\q1` / `\ts\*`, or the verse end):
-// USFM ends a `\sp` label at the next paragraph marker, so a label moved in
-// front of words would swallow them on the next import. If any did not, the
-// edit is refused (content and plain text returned unchanged, labelRefused)
-// rather than saving a label in a different place or shape. A verse with no
-// word label runs the engine exactly as before.
-const LABEL_WORDS = "__beLabelWords";
-
-function rawTextOf(nodes: unknown[]): string {
-  let s = "";
-  for (const n of nodes) {
-    const o = n as Record<string, unknown> | null;
-    if (!o) continue;
-    if (typeof o["text"] === "string") s += o["text"];
-    if (Array.isArray(o["children"])) s += rawTextOf(o["children"] as unknown[]);
-  }
-  return s;
+// the relayout, reassembly and marker tiers) descends `children` or reads
+// `text`, so the label could be edited, blanked or moved: shown as a plain-text
+// label (`{tag:"sp", text}`), the whole-verse punctuation relayout overwrote
+// its text with gap punctuation (a "; -> ," anywhere in the verse), and the
+// marker tiers re-placed the `\q1` after it in front of it.
+//
+// So the engine never sees a word label. For the length of one edit each one
+// is taken out of the verse and anchored to the line marker right after it
+// (`\q1`, `\q2`, `\ts\*`: the Nth top-level line marker), or to the verse end.
+// USFM ends a `\sp` label at the next paragraph marker, so that is where it
+// belongs. After the edit each label goes back in front of the same Nth marker
+// (its tag may have changed, `\q1` -> `\q2`), or at the end. The occurrence
+// numbers are then recounted over the whole verse, label words included, as
+// Door43 and the export count them.
+//
+// The edit is refused (content and plain text returned unchanged,
+// labelRefused) when that can't be done exactly: the number of top-level line
+// markers changed (a line break added or removed in a labelled verse), or a
+// label is followed by something other than a line marker or the verse end. A
+// verse with no word label runs the engine exactly as before.
+function isTopLineMarker(n: unknown): boolean {
+  return isInFlowMarker(n) && !isCharacterWrapper(n);
 }
 
 function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult): SmartReplaceResult {
   const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  if (!Array.isArray(vo)) return run(content);
-  // What follows a label at the top level: a marker's tag, "text"/"word"/…,
-  // or "end" at the verse end.
-  const followerOf = (nodes: unknown[], i: number): string => {
-    const f = nodes[i + 1] as Record<string, unknown> | undefined;
-    if (!f) return "end";
-    return typeof f["tag"] === "string" ? (f["tag"] as string) : String(f["type"] ?? "?");
-  };
-  const before: string[] = [];
-  const followersBefore: string[] = [];
-  const collapsed = vo.map((n, i) => {
-    const o = n as Record<string, unknown> | null;
-    if (!o || !isWordLabelNode(o)) return n;
-    const { children, endTag, text: ownText, ...rest } = o;
-    const text = rawTextOf(children as unknown[]);
-    before.push(text);
-    followersBefore.push(followerOf(vo, i));
-    return { ...rest, text, [LABEL_WORDS]: { children, endTag, ...(ownText !== undefined ? { text: ownText } : {}) } };
-  });
-  if (before.length === 0) return run(content);
-  const shown = { ...(content as Record<string, unknown>), verseObjects: collapsed };
-  const result = run(shown);
-  // The engine changed nothing (it hands its input back): so does this.
-  if (result.content === shown) return { ...result, content };
+  if (!Array.isArray(vo) || !vo.some(isWordLabelNode)) return run(content);
   const refuse = (why: string): SmartReplaceResult => {
     console.warn(`[replace] edit refused: it would change a speaker label written as words (${why}) (#1350).`);
     return { content, plainText: extractPlainText(content), preservedAlignment: true, labelRefused: true };
   };
-  const engineOut = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  if (!Array.isArray(engineOut)) return refuse("no verse tree");
-  // The marker re-placing tiers know a label only as invisible text, so a
-  // label that sat just before a line marker (`\sp …` then the `\q1` that
-  // opens the next verse's line) can come back after it (`\q1` then `\sp …`).
-  // The two hold no editable text between them, so put the label back in
-  // front of its marker; any other move is refused below.
-  const out = [...engineOut];
-  let k = 0;
-  for (let i = 0; i < out.length; i++) {
-    const o = out[i] as Record<string, unknown> | null;
-    if (!o || o[LABEL_WORDS] === undefined) continue;
-    const want = followersBefore[k++];
-    const prev = out[i - 1] as Record<string, unknown> | undefined;
-    if (want !== undefined && followerOf(out, i) !== want && prev && prev["tag"] === want && isInFlowMarker(prev)) {
-      out[i - 1] = o;
-      out[i] = prev;
+  // Take the labels out; `anchor` is the ordinal of the line marker that
+  // follows (the markers seen so far), or "end".
+  const labels: { node: unknown; anchor: number | "end" }[] = [];
+  const stripped: unknown[] = [];
+  let markers = 0;
+  for (let i = 0; i < vo.length; i++) {
+    const n = vo[i];
+    if (isWordLabelNode(n)) {
+      let j = i + 1;
+      while (j < vo.length && isWordLabelNode(vo[j])) j++;
+      if (j >= vo.length) labels.push({ node: n, anchor: "end" });
+      else if (isTopLineMarker(vo[j])) labels.push({ node: n, anchor: markers });
+      else return refuse("a label not followed by a line marker");
+      continue;
     }
+    if (isTopLineMarker(n)) markers++;
+    stripped.push(n);
   }
-  const after: string[] = [];
-  const followersAfter: string[] = [];
-  const expand = (nodes: unknown[], depth: number): unknown[] =>
-    nodes.map((n, i) => {
-      const o = n as Record<string, unknown> | null;
-      if (!o) return n;
-      if (o[LABEL_WORDS] !== undefined) {
-        const { [LABEL_WORDS]: held, text, ...rest } = o;
-        after.push(depth === 0 ? String(text ?? "") : "\u0000nested");
-        followersAfter.push(depth === 0 ? followerOf(nodes, i) : "\u0000nested");
-        return { ...rest, ...(held as Record<string, unknown>) };
-      }
-      return Array.isArray(o["children"]) ? { ...o, children: expand(o["children"] as unknown[], depth + 1) } : n;
-    });
-  const expanded = expand(out, 0);
-  const norm = (s: string) => s.replace(/\s+/g, " ").trim();
-  if (after.length !== before.length || after.some((t, i) => norm(t) !== norm(before[i]))) {
-    return refuse(`labels before ${JSON.stringify(before.map(norm))}, after ${JSON.stringify(after.map(norm))}`);
+  const shown = { ...(content as Record<string, unknown>), verseObjects: stripped };
+  const result = run(shown);
+  // The engine changed nothing (it hands its input back): so does this.
+  if (result.content === shown) return { ...result, content };
+  const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (!Array.isArray(out)) return refuse("no verse tree");
+  if (out.filter(isTopLineMarker).length !== markers) return refuse("the verse's line markers changed");
+  const restored: unknown[] = [];
+  let m = 0;
+  for (const n of out) {
+    if (isTopLineMarker(n)) {
+      for (const l of labels) if (l.anchor === m) restored.push(l.node);
+      m++;
+    }
+    restored.push(n);
   }
-  if (followersAfter.some((f, i) => f !== followersBefore[i])) {
-    return refuse(`a label moved: followed by ${JSON.stringify(followersBefore)}, now ${JSON.stringify(followersAfter)}`);
-  }
-  return { ...result, content: { ...(result.content as Record<string, unknown>), verseObjects: renumberTargetOccurrences(expanded) } };
+  for (const l of labels) if (l.anchor === "end") restored.push(l.node);
+  return { ...result, content: { ...(result.content as Record<string, unknown>), verseObjects: renumberTargetOccurrences(restored) } };
 }
 
 function smartReplaceVerseInner(
