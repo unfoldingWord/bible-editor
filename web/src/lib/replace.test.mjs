@@ -4707,6 +4707,8 @@ function countAllMilestones(nodes) {
     const real = { verseObjects: zecUlt.chapters["1"]["14"].verseObjects };
     check("#1371 guard, ZEC 1:14 ULT Armies: “I -> the hosts: “I", real, "Armies: “I", "the hosts: “I",
       /of the hosts:\s*\\q1 “I have been/, ["Armies"]);
+    check("#1371 guard, ZEC 1:14 ULT of Armies: “I -> the mighty hosts: “I", real, "of Armies: “I", "the mighty hosts: “I",
+      /Yahweh the mighty hosts:\s*\\q1 “I have been/, ["of", "Armies"]);
   }
   check("#1371 guard, dropped words straddle the break, wars. “Your king -> great fights; “the king", opener, "wars. “Your king",
     "great fights; “the king", /use in \\q1 great fights; “the king rules/, ["wars", "Your"]);
@@ -4764,6 +4766,8 @@ function countAllMilestones(nodes) {
       ["#1361 swap at a bare marker", bareQs, /wars\s*\\q1 Your/, "wars; \\q1 The", ["Your"]],
       ["item 1 recase on both sides", cap, /Wars\. \\q1 Your king/, "wars that your enemies started; \\q1 your king", ["Wars", "Your"]],
       ["item 3 unequal swap after an opener marker", openerQs, /wars\. \\q1 “Your/, "wars; \\q1 “the great", ["Your"]],
+      ["#1371 new words before an opener marker", openerQs, /wars\. \\q1 “Your/, "great fights; \\q1 “Your", ["wars"]],
+      ["#1371 new words typed after the opener marker", openerQs, /wars\. \\q1 “Your/, "\\q1 great fights; “Your", ["wars"]],
     ]) {
       const old = extractEditableText(content);
       const want = old.replace(from, to);
