@@ -1538,8 +1538,10 @@ export function smartReplaceVerse(
   replaceText: string,
   options: { findReplace?: boolean; typed?: boolean } = {},
 ): SmartReplaceResult {
-  return withWordLabelsAsText(content, (c) =>
-    smartReplaceVerseInner(c, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options),
+  return withWordLabelsAsText(
+    content,
+    (c) => smartReplaceVerseInner(c, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options),
+    { speechStart: options.findReplace === true },
   );
 }
 
@@ -1726,7 +1728,7 @@ function moveLineMarkerBefore(vo: unknown[], ordinal: number, wordIndex: number)
   return null;
 }
 
-function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult): SmartReplaceResult {
+function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult, opts: { speechStart?: boolean } = {}): SmartReplaceResult {
   const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(vo) || !vo.some(isSpeakerLabelNode)) return run(content);
   const refuse = (reason: LabelRefusalReason, why: string): SmartReplaceResult => {
@@ -1772,9 +1774,10 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
     let after = bodyWordLayout(out);
     const map = matchWords(before.words, after.words);
     // New words replacing the first word of a speech go after its label
-    // (#1366): move the label's line marker back in front of them.
+    // (#1366): move the label's line marker back in front of them. Find/replace
+    // only: a typed edit shows the line break, so the translator placed it.
     for (const l of labels) {
-      if (l.anchor === "end") continue;
+      if (!opts.speechStart || l.anchor === "end") continue;
       const fix = speechStartFix(before, after, map, l.anchor);
       if (fix === null) continue;
       if (fix === "refuse") return refuse("label-moved", "words on both sides of a label's line break were replaced");

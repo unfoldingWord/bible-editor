@@ -530,6 +530,11 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     // word on its old word's side.
     const r6 = run(both, "now He", "then she");
     check(r6.labelRefusals === undefined && words(r6.content) === "A home then [SP] \\q1 she ran home.", `one for one across the break: saved in place (got ${JSON.stringify(words(r6.content))})`);
+    // A typed edit shows the line break, so the translator's placement holds:
+    // words typed before it stay before the label.
+    const old = extractEditableText(beside);
+    const typed = smartEditVerse(JSON.parse(JSON.stringify(beside)), old, old.replace("home. \\q1 He", "home; she too \\q1"), { capturedFromDom: true });
+    check(!typed.labelRefused && words(typed.content) === "A home; she too [SP] \\q1 ran home.", `typed: words placed before the break stay there (got ${JSON.stringify(words(typed.content))})`);
     // A plain deletion of the speech's first word still saves as before.
     const r5 = run(bare, "home He", "home");
     check(r5.labelRefusals === undefined && words(r5.content) === "A home [SP] \\q1 ran home.", `deleting "He": saved, label in place (got ${JSON.stringify(words(r5.content))})`);
