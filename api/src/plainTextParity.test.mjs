@@ -153,6 +153,32 @@ check(usfm.toJSON(src).chapters["1"]["2"].verseObjects.some((n) => n.tag === "sp
   check(apiExtract({ verseObjects: apiNest(emptyText) }) === "Hi", "empty-text opener: the label is out of the plain text");
 }
 
+// A footnote, cross reference or character marker inside a `\sp` line is part
+// of the label (#1354 item 2): both copies nest across it, identically, and
+// the stored plain text has no label word.
+{
+  const src = String.raw`\c 1
+\p
+\v 1 \w Body|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \w woman|x-occurrence="1" x-occurrences="1"\w*\f + \ft A note.\f* \add \w speaking|x-occurrence="1" x-occurrences="1"\w*\add* \nd \w Lord|x-occurrence="1" x-occurrences="1"\w*\nd*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w* there.
+\v 2 \w Next|x-occurrence="1" x-occurrences="1"\w*.
+\sp \add The\add* \w woman|x-occurrence="1" x-occurrences="1"\w* \x - \xo 1:1 \xt Gen 1:1\x*
+\q1 \w Go|x-occurrence="1" x-occurrences="1"\w*
+`;
+  const fx = usfm.toJSON(src).chapters["1"];
+  for (const v of ["1", "2"]) {
+    const vos = fx[v].verseObjects;
+    const nested = apiNest(vos);
+    check(JSON.stringify(nested) === JSON.stringify(webNest(vos)), `footnote/char marker 1:${v}: api and web nestWordLabels agree`);
+    check(nested.filter((n) => n && n.tag === "sp").length === 1 && nested[nested.findIndex((n) => n && n.tag === "sp") + 1]?.tag === "q1",
+      `footnote/char marker 1:${v}: the whole \\sp line is one label, followed by its \\q1 (got ${JSON.stringify(nested.map((n) => n?.tag ?? n?.type))})`);
+  }
+  const rows = extractVersesForRange(src, 1, 1);
+  check(rows.find((r) => r.verse === 1)?.plainText === "Body. Hi there.", `footnote/char marker 1:1: stored plain text has no label word (got ${JSON.stringify(rows.find((r) => r.verse === 1)?.plainText)})`);
+  check(rows.find((r) => r.verse === 2)?.plainText === "Next. Go", `footnote/char marker 1:2: stored plain text has no label word (got ${JSON.stringify(rows.find((r) => r.verse === 2)?.plainText)})`);
+}
+
 if (failed > 0) {
   console.error(`\nplainTextParity: ${failed} check(s) failed, ${passed} passed.`);
   process.exit(1);

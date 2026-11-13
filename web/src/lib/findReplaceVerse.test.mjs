@@ -421,6 +421,29 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     bibleReplaceSummaryText({ versesReplaced, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, labelRefused });
   check(lbl(0, 1) === "1 match not replaced: it would move a speaker label", `a label refusal leads with the refusal (got ${lbl(0, 1)})`);
   check(lbl(2, 3) === "replaced 2 verses — 3 matches not replaced: they would move a speaker label", `replace-all with label refusals counts both (got ${lbl(2, 3)})`);
+
+  // #1354 item 5a: a refusal because the label has no line break after it
+  // (label-shape) says that, not "would move a speaker label".
+  {
+    const warn2 = console.warn;
+    console.warn = () => {};
+    try {
+      const one = findReplaceVerse(odd, plain, /ran/g, plain.indexOf("ran"), 3, "went");
+      check(one.labelShapeRefusals === 1, `single replace in a label-shape verse: counted as a shape refusal (got ${one.labelShapeRefusals})`);
+      const all = replaceAllInVerse(odd, plain, /home/g, 2, "house");
+      check(all.labelShapeRefusals === 2, `replace-all in a label-shape verse: both counted as shape refusals (got ${all.labelShapeRefusals})`);
+      const moved = findReplaceVerse(verse, plain, /home\. He/g, plain.indexOf("home. He"), 8, "home and he");
+      check(moved.labelShapeRefusals === undefined, `a label-moved refusal is not a shape refusal (got ${moved.labelShapeRefusals})`);
+    } finally {
+      console.warn = warn2;
+    }
+    const shape = (versesReplaced, labelRefused, labelShapeRefused) =>
+      bibleReplaceSummaryText({ versesReplaced, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, labelRefused, labelShapeRefused });
+    check(shape(0, 1, 1) === "1 match not replaced: its verse has a speaker label with no line break after it",
+      `a shape refusal gives its own reason (got ${shape(0, 1, 1)})`);
+    check(shape(1, 3, 2) === "replaced 1 verse — 1 match not replaced: it would move a speaker label — 2 matches not replaced: their verse has a speaker label with no line break after it",
+      `both kinds of refusal, each with its reason (got ${shape(1, 3, 2)})`);
+  }
 }
 
 
