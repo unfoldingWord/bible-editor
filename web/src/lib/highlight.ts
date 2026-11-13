@@ -24,7 +24,7 @@
 // matches raw with no further work.
 
 import { nfc } from "./hebrew.ts";
-import { isAcrosticHeading, isCharacterWrapper, isHeaderLabelNode, isInFlowMarker, isTsMilestone, liftMarkerText } from "./usfm.ts";
+import { isAcrosticHeading, isCharacterWrapper, isHeaderLabelNode, isInFlowMarker, isTsMilestone, liftMarkerText, noteHasTrailingSpace } from "./usfm.ts";
 
 // U+2060 WORD JOINER glues UHB clitic morphemes to their host word
 // (הָ⁠אֶ֧בֶן); U+200D ZERO WIDTH JOINER plays the same role in some corpora.
@@ -1200,6 +1200,11 @@ function segmentByParagraphs(
       } else if (nodeIsMilestone(o)) {
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children);
+      } else if (noteHasTrailingSpace(o)) {
+        // The note itself is not drawn, but the line break after its `\f*`
+        // separates the words on either side (#1372); extractEditableText
+        // reads it the same, so the captured text lines up with the baseline.
+        current.html += " ";
       }
     }
   }

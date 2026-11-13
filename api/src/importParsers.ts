@@ -1441,6 +1441,16 @@ function labelRunKind(node: unknown): number | null {
   return words;
 }
 
+// A footnote or cross reference whose `nextChar` is only whitespace (#1372).
+// Mirror of noteHasTrailingSpace in web/src/lib/usfm.ts (keep in sync).
+const NOTE_TAGS: ReadonlySet<string> = new Set(["f", "fe", "x", "ef", "ex"]);
+function noteHasTrailingSpace(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o || typeof o["nextChar"] !== "string" || !/^\s+$/.test(o["nextChar"])) return false;
+  const tag = o["tag"];
+  return o["type"] === "footnote" || (o["type"] === undefined && typeof tag === "string" && NOTE_TAGS.has(tag));
+}
+
 // Walk verse-objects and concatenate all text. Same shape and behaviour
 // as the client-side `extractPlainText` in web/src/lib/usfm.ts — kept
 // duplicated because the Worker bundle and the web bundle are built
@@ -1483,6 +1493,11 @@ export function extractPlainText(verseObj: unknown): string {
       if (isHeaderLabelNode(vo)) continue;
       if (typeof v.text === "string") parts.push(v.text);
       if (Array.isArray(v.children)) walk(v.children);
+      // usfm-js parks the line break after a footnote's `\f*` on its
+      // `nextChar` (#1372): at the end of a USFM line it is the only thing
+      // between the words on either side ("Bodymore."). Mirror of
+      // noteHasTrailingSpace in web/src/lib/usfm.ts (keep in sync).
+      if (noteHasTrailingSpace(vo)) parts.push(" ");
     }
   };
   const top = verseObj as { verseObjects?: unknown[] };
