@@ -1394,14 +1394,22 @@ function isZalnMilestone(node: unknown): boolean {
   return !!o && o["type"] === "milestone" && o["tag"] === "zaln";
 }
 
-// A footnote (usfm-js type "footnote") or a closed character/note marker
-// (`\add`, `\nd`, `\k`, `\x`: no type, endTag = tag + "*"). Part of a `\sp`
-// line, so the run crosses it (#1354). Mirror of isLabelInlineMarker in
-// web/src/lib/usfm.ts.
+// A footnote (usfm-js type "footnote") or a closed character/note marker from
+// LABEL_INLINE_TAGS (`\add`, `\nd`, `\k`, `\x`, `\fe`: no type, endTag =
+// tag + "*"). Part of a `\sp` line, so the run crosses it (#1354). An explicit
+// list (#1366): `\va`, `\vp`, `\ca`, `\fig` stay out. Mirror of
+// isLabelInlineMarker / LABEL_INLINE_TAGS in web/src/lib/usfm.ts.
+const LABEL_INLINE_TAGS: ReadonlySet<string> = new Set([
+  // notes
+  "f", "fe", "x", "ef", "ex",
+  // character markers
+  "add", "addpn", "bd", "bdit", "bk", "dc", "em", "it", "jmp", "k", "nd", "ndx", "no", "ord", "pn", "png", "pro",
+  "qac", "qs", "qt", "rb", "rq", "sc", "sig", "sls", "sup", "tl", "wa", "wg", "wh", "wj", "xt",
+]);
 function isLabelInlineMarker(o: Record<string, unknown>): boolean {
   if (o["type"] === "footnote") return true;
   const tag = o["tag"];
-  return o["type"] === undefined && typeof tag === "string" && o["endTag"] === `${tag}*`;
+  return o["type"] === undefined && typeof tag === "string" && LABEL_INLINE_TAGS.has(tag) && o["endTag"] === `${tag}*`;
 }
 
 function isLabelRunContainer(node: unknown): boolean {

@@ -1899,6 +1899,7 @@ const VerseCell = memo(function VerseCell({
           key={`bv-sec-${i}`}
           tag={s.tag}
           text={s.text}
+          notes={s.notes}
           editable={!readOnly && !!onEditSection}
           onChange={
             onEditSection
