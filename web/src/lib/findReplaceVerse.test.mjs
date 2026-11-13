@@ -548,10 +548,16 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     // he", "he" kept) goes after the label with it.
     const r10 = run(beside, "home. He", "home. And he");
     check(r10.labelRefusals === undefined && words(r10.content) === "A home. [SP] \\q1 And he ran home.", `"home. And he": "And" goes after the label (got ${JSON.stringify(words(r10.content))})`);
-    // No punctuation to tell where the speech starts, and its first word was
-    // replaced: refused rather than guessed.
+    // No punctuation to tell where the speech starts: the speech's new words
+    // never land before the label (here the engine already puts them after it;
+    // had it put them before, the replace is refused rather than guessed).
     const r11 = run(bare, "home He", "home she too");
-    check(r11.labelRefusals === 1 && r11.plainText === extractPlainText(bare), `"home she too" with no punctuation: refused (got ${JSON.stringify(words(r11.content))}, refused=${r11.labelRefusals})`);
+    check(r11.labelRefusals === 1 ? r11.plainText === extractPlainText(bare) : words(r11.content) === "A home [SP] \\q1 she too ran home.",
+      `"home she too" with no punctuation: saved after the label or refused (got ${JSON.stringify(words(r11.content))}, refused=${r11.labelRefusals})`);
+    // The engine put the new words before the break and no punctuation says
+    // where the speech starts ("home. He" -> "home now she"): refused.
+    const r12 = run(beside, "home. He", "home now she");
+    check(r12.labelRefusals === 1 && r12.plainText === extractPlainText(beside), `"home now she": refused, verse untouched (got ${JSON.stringify(words(r12.content))}, refused=${r12.labelRefusals})`);
     // A typed edit shows the line break, so the translator's placement holds:
     // words typed before it stay before the label.
     const old = extractEditableText(beside);

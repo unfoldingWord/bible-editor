@@ -891,14 +891,17 @@ Highlights that bite repeatedly:
   sent by an old queued op or a history restore.
 - **Speaker-label follow-ups (#1366).** The label run crosses only an explicit list of note and character markers
   (`LABEL_INLINE_TAGS`, in both `web/src/lib/usfm.ts` and `api/src/importParsers.ts`; `plainTextParity.test.mjs`
-  checks them tag by tag): `\va`, `\vp`, `\ca`, `\fig` are closed markers too but stay out. usfm-js parks the space
+  checks them tag by tag): `\va`, `\vp`, `\ca`, `\fig` are closed markers too but stay out. usfm-js tags a nested
+  marker with its plus (`\+nd` -> `"+nd"`) and types `\qs`, `\qac`, `\qt` "quote"; both shapes count. usfm-js parks the space
   or line break after `\f*` on the footnote's `nextChar`, which plain/editable text skip, so the words on either side
   fuse (`The\f…\f*⏎woman` read "Thewoman" and a band edit saved one word "Thelady"); `headerLabelText` reads
   `nextChar` and `editWordLabel` splits it into a text node for the edit. The same fusing exists in the verse
   body (`\w Body\w*\f…\f*⏎\w more\w*` -> "Bodymore."), not fixed. A label's notes show read-only in the band
   (`SectionHeader.notes`). In find/replace only, new words that replace the first word after a label's line
-  break are moved after the label (`speechStartFix`; a typed edit shows the break, so its placement holds); words
-  replaced on both sides of the break, not one for one, are refused. A held verse pin
+  break are moved after the label (`speechStartFix`; a typed edit shows the break, so its placement holds). The
+  speech is taken to start after the last clause punctuation among the new words (`home again. She` keeps "again"
+  with the narrator); with none, a replaced first word is refused. Words replaced on both sides of the break, not
+  one for one, are refused. A held verse pin
   (`advanceHeldVerseBase`) does not move onto a landed row when its base held a flat label: the server nested it,
   so the box's text no longer matches and the label words would be saved into the body.
 - **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in

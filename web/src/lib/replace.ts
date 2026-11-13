@@ -1660,16 +1660,23 @@ function markerKeepsItsWords(before: { words: string[]; markerAt: number[] }, af
 // \q1 He ran` -> `home; she too ran` saved `she too` before the label and its
 // line break, in the narrator's line. Line marker `ordinal` sits between kept
 // words; this looks at the words between them:
-// - only words after the marker were replaced (none before it), and new words
-//   now sit before it: the after-word index the marker must move back to;
+// - no narrator word before the marker was replaced, and new words now sit
+//   before it: the speech starts after the last clause punctuation among them
+//   (`clauseBreaks`), so the marker moves back to that word. `home. He` ->
+//   `home; she too` moves it before "she"; `home again. She` before "She",
+//   keeping the added "again" on the narrator's side; `home. And he` ("he"
+//   kept) before "And". With no such punctuation, a replaced first word is
+//   refused (which new words start the speech can't be told), and a pure
+//   insertion is left where the engine put it;
 // - words on both sides were replaced, and the new words are not one for one
-//   on each side: "refuse" (which of them start the speech can't be told);
+//   on each side: "refuse";
 // - otherwise null: nothing to do.
 function speechStartFix(
   before: { words: string[]; markerAt: number[] },
   after: { words: string[]; markerAt: number[] },
   map: number[],
   ordinal: number,
+  breaks: boolean[],
 ): number | "refuse" | null {
   const p = before.markerAt[ordinal];
   const q = after.markerAt[ordinal];
@@ -1683,9 +1690,33 @@ function speechStartFix(
   const end = b < before.words.length ? map[b] : after.words.length;
   const newBefore = q - start;
   const newAfter = end - q;
-  if (oldAfter === 0 || newBefore <= 0) return null;
-  if (oldBefore === 0) return start;
+  if (newBefore <= 0) return null;
+  if (oldBefore === 0) {
+    for (let k = q; k >= start; k--) {
+      if (breaks[k]) return k === q ? null : k;
+    }
+    return oldAfter > 0 ? "refuse" : null;
+  }
+  if (oldAfter === 0) return null;
   return newBefore === oldBefore && newAfter === oldAfter ? null : "refuse";
+}
+
+// For each body word of a verse (as bodyWordLayout counts them), whether clause
+// punctuation (. ; : , ! ? …) stands between it and the word before: in the
+// text after the previous word's letters, or before this word's own.
+function clauseBreaks(vo: unknown[]): boolean[] {
+  const out: boolean[] = [];
+  let pending = "";
+  for (const tok of extractPlainText({ verseObjects: vo }).split(" ")) {
+    if (!wordKey(tok)) {
+      pending += tok;
+      continue;
+    }
+    const lead = /^[^\p{L}\p{N}\p{M}]*/u.exec(tok)?.[0] ?? "";
+    out.push(/[.;:,!?…]/.test(pending + lead));
+    pending = /[^\p{L}\p{N}\p{M}]*$/u.exec(tok)?.[0] ?? "";
+  }
+  return out;
 }
 
 // The verse with its `ordinal`-th top-level line marker moved back to just
@@ -1789,7 +1820,7 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
     // only: a typed edit shows the line break, so the translator placed it.
     for (const l of labels) {
       if (!opts.speechStart || l.anchor === "end") continue;
-      const fix = speechStartFix(before, after, map, l.anchor);
+      const fix = speechStartFix(before, after, map, l.anchor, clauseBreaks(out));
       if (fix === null) continue;
       if (fix === "refuse") return refuse("label-moved", "words on both sides of a label's line break were replaced");
       const moved = moveLineMarkerBefore(out, l.anchor, fix);
