@@ -1802,6 +1802,65 @@ const ISA_HUMANS = [
   eq(stripHumanCommitEvidence(base), base, "…and a reason with no clause survives the strip untouched");
 }
 
+console.log("\n[#1351: a window whose only human commits are merges identical to our export]");
+{
+  // fetchHumanTouchedRefs flags the evidence when EVERY human commit in the
+  // window is a merge whose file is byte-identical to one of our export
+  // commits it contains (en_ust 245ed073 on 26-EZK.usfm). Per verse, that is
+  // "no human edit"; every other reader still sees incomplete evidence.
+  const FLAGGED = { complete: false, refs: [], reason: "export_equal_merges_only", exportEqualMergesOnly: true };
+  const commits = [
+    classifyMasterCommit({ sha: "245ed073", message: "Merge branch 'master' of git.door43.org:unfoldingWord/en_ust", authorEmail: RICH }),
+    classifyMasterCommit({ sha: "bb9e15cf", message: "bible-editor: EZK ust → master (#4737)", authorEmail: BW }),
+  ];
+  const lineage = summarizeLineage(commits, { incomplete: false, incompleteReason: "", humanRefs: FLAGGED });
+  const summary = JSON.parse(JSON.stringify(compactLineage(lineage)));
+  eq(masterMayHoldHumanEditForVerse(lineage, 48, 13), false, "the uncompacted lineage: no verse is human-held");
+  eq(masterMayHoldHumanEditForVerse(summary, 48, 13), false, "the persisted summary: no verse is human-held");
+  eq(masterMayHoldHumanEditForVerse(summary, 48, 13, 14), false, "...a bridged row neither");
+  eq(summary.mayHoldHumanEdit, true, "the FILE-level answer is unchanged");
+  eq(summary.refsComplete, false, "...and the summary still reads as incomplete to every other reader");
+  eq(summary.refsReason, "export_equal_merges_only", "...naming why in the log");
+  eq(completeHumanRefEvidenceTouches(summary, 48, 13), false, "no positive human evidence for a master-byte adoption");
+  eq(humanRefEvidenceAtRef(summary, 48, 13), null, "the log-only question stays unmeasured");
+  eq(
+    computeVerseMerge({
+      base: JSON.stringify({ verseObjects: [{ type: "text", text: "the older export" }] }),
+      ours: JSON.stringify({ verseObjects: [{ type: "text", text: "the translator's later app edit" }] }),
+      theirs: JSON.stringify({ verseObjects: [{ type: "text", text: "the export the merge carried" }] }),
+      humanEditedSinceExport: true,
+      masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(summary, 48, 13),
+    }).action === "adopt_conflict",
+    false,
+    "the app edit is not replaced by the export text the merge carried",
+  );
+
+  // Everything else keeps the fail-closed answer.
+  const incompleteWalk = compactLineage(
+    summarizeLineage(commits, { incomplete: true, incompleteReason: "page_cap", humanRefs: FLAGGED }),
+  );
+  eq(masterMayHoldHumanEditForVerse(incompleteWalk, 48, 13), true, "an incomplete walk still holds every verse");
+  const unflagged = compactLineage(
+    summarizeLineage(commits, { humanRefs: { complete: false, refs: [], reason: "no_refs_mapped" } }),
+  );
+  eq(masterMayHoldHumanEditForVerse(unflagged, 48, 13), true, "no_refs_mapped (no flag) still holds every verse");
+  eq(masterMayHoldHumanEditForVerse({ ...summary, humanRefs: ["48:13"] }, 48, 13), true,
+    "a flag beside a non-empty ref set is not believed");
+  eq(masterMayHoldHumanEditForVerse({ ...summary, humanRefs: "48:13" }, 48, 13), true, "...nor beside a malformed one");
+  eq(masterMayHoldHumanEditForVerse({ ...summary, refsExportEqualMergesOnly: "yes" }, 48, 13), true,
+    "...and only a literal true counts");
+  eq(
+    masterMayHoldHumanEditForVerse(
+      summarizeLineage(commits, { humanRefs: { ...FLAGGED, refs: ["48:13"] } }),
+      48,
+      13,
+    ),
+    true,
+    "an evidence object flagged with refs is not believed either",
+  );
+  eq(masterMayHoldHumanEditForVerse(summary, -1, 13), true, "an unusable verse still holds");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) FAILED`);
   process.exit(1);

@@ -1033,7 +1033,13 @@ async function run() {
       };
       const OURS = [EXPORT];
       const raw = (sha, body) => [`raw/${EZK}?ref=${sha}`, () => res({ body, contentLength: body.length })];
+      // Gitea's blob id for the file at a commit (#1351 confirms an equal
+      // merge with it). Read only when the merge's text equals our export's.
+      const tree = (sha, blob) => [`git/trees/${sha}`, () => jsonRes({ body: { truncated: false, tree: [{ path: EZK, type: "blob", sha: blob }] } })];
+      const SAME_BLOB = "b10b000000000000000000000000000000000000";
       const files = (mergeText = MERGE_TEXT) => [
+        tree(MERGE, SAME_BLOB),
+        tree(EXPORT, SAME_BLOB),
         [`git/commits/${MERGE}.diff`, () => res({ body: MERGE_DIFF })],
         [`git/commits/${HUMAN}.diff`, () => res({ body: HUMAN_DIFF })],
         raw(MERGE, mergeText),
@@ -1075,9 +1081,11 @@ async function run() {
         // the file-level answer stands.
         serve(files(EXPORT_TEXT));
         const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
-        assert(ev.complete === false && ev.reason === "no_refs_mapped",
+        // #1351 names that answer instead of no_refs_mapped (still not
+        // complete); see the shape-2 tests below.
+        assert(ev.complete === false && ev.refs.length === 0,
           "#1348: a merge identical to our export adds no refs, and alone it stays fail-closed");
-        assert(asked.length === 2, "  ...after the same two fetches");
+        assert(asked.length === 4, "  ...after two file fetches and (#1351) two blob-id reads");
         serve(files(EXPORT_TEXT));
         const withHuman = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit(), humanCommit], OURS);
         assert(withHuman.complete === true && withHuman.refs.includes("48:2") && !withHuman.refs.includes("48:4"),
@@ -1137,6 +1145,175 @@ async function run() {
         assert(ev.complete === true && ev.refs.includes("40:3") && ev.refs.includes("40:1"),
           "#1348: a TSV merge credits the rows that differ from our export");
         assert(!ev.refs.includes("40:2"), "  ...and not the row our export changed");
+      }
+
+      // ── Our export is an ANCESTOR of the merge's second parent (#1351) ──
+      // Exports land per book. When an editor runs "Merge branch 'master'",
+      // the second parent is master's tip at that moment (another book's
+      // export, an AI push, a human fix), and this book's export is only an
+      // ancestor of it. The merge's first-parent `.diff` then still carries
+      // our export's change (48:4). Proof that the export is in the second
+      // parent's history, and NOT in the first parent's, comes from one
+      // path-scoped commit listing of each parent; any doubt keeps the old
+      // first-parent diff (over-crediting, never under-crediting).
+      const TIP = "7ee0000000000000000000000000000000000000"; // master's tip: another book's export
+      const SINCE = Math.floor(Date.parse("2026-11-12T00:00:00Z") / 1000);
+      const gc = (sha, message, date, parents, email = "editor@example.org") => ({
+        sha,
+        commit: { message, author: { email, name: "n", date }, committer: { date } },
+        parents: parents.map((p) => ({ sha: p })),
+      });
+      const listRes = (body, { hasMore = false } = {}) => ({
+        ok: true,
+        headers: { get: (k) => (k.toLowerCase() === "x-hasmore" ? String(hasMore) : null) },
+        json: async () => body,
+      });
+      const listing = (from, body, opts) => [`commits?sha=${from}&path=`, () => listRes(body, opts)];
+      const exportListed = gc(EXPORT, "bible-editor: EZK ust → master (#4886)", "2026-11-12T19:18:36Z", [BASE]);
+      const humanListed = gc(HUMAN, "Fixes for \\b markers", "2026-11-12T19:18:24Z", [BASE], "rich.mahn@unfoldingword.org");
+      const ancestorMerge = () => mergeCommit([HUMAN, TIP]);
+      const SHAPE1 = { sinceTime: SINCE };
+      {
+        serve([...files(), listing(TIP, [exportListed]), listing(HUMAN, [humanListed])]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [ancestorMerge()], OURS, SHAPE1);
+        assert(ev.complete === true, "#1351: a merge whose export is an ancestor of its second parent maps completely");
+        assert(!ev.refs.includes("48:4") && !ev.refs.includes("48:3"),
+          "  ...and does NOT credit the export's verse (48:4) to the human merge");
+        assert(ev.refs.includes("48:6") && ev.refs.includes("48:2"),
+          "  ...but credits the merge's own change (48:6) and the human parent's side (48:2)");
+        assert(!asked.some((u) => u.includes(`${MERGE}.diff`)), "  ...without fetching the merge's first-parent diff");
+        assert(asked.length === 4, "  ...for four subrequests: two parent listings, the merge's file, our export's file");
+      }
+      {
+        // A HUMAN commit on the second-parent side AFTER our export, which the
+        // window did not list as a human commit of its own: its edit (48:3)
+        // reaches master only through this merge, so the merge keeps it.
+        // (48:3, not 48:5: a changed verse line also claims the verse before
+        // it, so 48:5 would credit 48:4 for a reason unrelated to this test.)
+        const H2 = "4a2d000000000000000000000000000000000000";
+        const h2Listed = gc(H2, "Fixes verse 3", "2026-11-12T19:30:00Z", [EXPORT], "someone@example.org");
+        const merged = lines({ ...H, ...E, 4: "\\v 3 three fixed on master" });
+        serve([...files(merged), listing(H2, [h2Listed, exportListed]), listing(HUMAN, [humanListed])]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit([HUMAN, H2])], OURS, SHAPE1);
+        assert(ev.complete === true && ev.refs.includes("48:3"),
+          "#1351: a human edit on the second-parent side made after our export stays credited");
+        assert(!ev.refs.includes("48:4"), "  ...while the export's own verse still is not");
+      }
+      {
+        // A human commit BELOW the chosen export in the second parent's
+        // history that is not in the window's human commits: our export may
+        // have carried it forward, so comparing against that export could
+        // hide it. Keep the old first-parent diff.
+        const OLDER = "0e0e000000000000000000000000000000000000";
+        const HB = "b0b0000000000000000000000000000000000000";
+        serve([
+          ...files(),
+          listing(TIP, [
+            exportListed,
+            gc(HB, "Fixes a typo", "2026-11-12T10:00:00Z", [OLDER], "someone@example.org"),
+            gc(OLDER, "bible-editor: EZK ust → master (#4884)", "2026-11-12T05:43:25Z", [BASE]),
+          ]),
+          listing(HUMAN, [humanListed]),
+        ]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [ancestorMerge()], [EXPORT, OLDER], SHAPE1);
+        assert(asked.some((u) => u.includes(`${MERGE}.diff`)) && ev.refs.includes("48:4"),
+          "#1351: an unlisted human commit below our export keeps the first-parent diff answer");
+      }
+      {
+        // Our export is in the FIRST parent's history too (a pull request of
+        // a branch cut after our export): the first-parent diff does not hold
+        // the export's change, so it is already the right answer.
+        serve([...files(), listing(TIP, [exportListed]), listing(HUMAN, [humanListed, exportListed])]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [ancestorMerge()], OURS, SHAPE1);
+        assert(asked.some((u) => u.includes(`${MERGE}.diff`)) && ev.refs.includes("48:4"),
+          "#1351: an export in the first parent's history too keeps the first-parent diff answer");
+        assert(asked.length === 5, "  ...after five subrequests: two listings, then the diff path's three");
+      }
+      {
+        // An `ours` commit of the window that is NOT in the second parent's
+        // history (it landed after the merge) proves nothing.
+        serve([...files(), listing(TIP, [gc(TIP, "Fixes markers", "2026-11-12T19:00:00Z", [BASE], "someone@example.org")])]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [ancestorMerge()], OURS, SHAPE1);
+        assert(asked.some((u) => u.includes(`${MERGE}.diff`)) && ev.refs.includes("48:4"),
+          "#1351: an export not in the second parent's history keeps the first-parent diff answer");
+        assert(asked.length === 4, "  ...after four subrequests: one listing, then the diff path's three");
+      }
+      {
+        // Every listing failure keeps the old path, and never drops a ref.
+        const failures = [
+          ["a failed second-parent listing", [[`commits?sha=${TIP}&path=`, () => res({ ok: false })]]],
+          ["a second-parent listing that times out", [[`commits?sha=${TIP}&path=`, () => { throw new Error("The operation was aborted due to timeout"); }]]],
+          ["a second-parent listing cut short", [listing(TIP, [exportListed], { hasMore: true })]],
+          ["a failed first-parent listing", [listing(TIP, [exportListed]), [`commits?sha=${HUMAN}&path=`, () => res({ ok: false })]]],
+          ["a first-parent listing cut short", [listing(TIP, [exportListed]), listing(HUMAN, [humanListed], { hasMore: true })]],
+        ];
+        for (const [what, routes] of failures) {
+          serve([...routes, ...files()]);
+          const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [ancestorMerge()], OURS, SHAPE1);
+          assert(ev.complete === true && ev.refs.includes("48:4") && ev.refs.includes("48:6")
+            && asked.some((u) => u.includes(`${MERGE}.diff`)),
+            `#1351: ${what} keeps the first-parent diff answer`);
+        }
+      }
+      {
+        // No window bound passed (older callers): no listing, old path.
+        serve(files());
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [ancestorMerge()], OURS);
+        assert(ev.refs.includes("48:4") && !asked.some((u) => u.includes("commits?sha=")),
+          "#1351: without a window bound no listing is made and the first-parent diff stands");
+      }
+
+      // ── A merge byte-identical to our export (#1351 shape 2) ──────────────
+      // Measured read-only on Door43 2026-11-13: Gitea lists a merge's `files`
+      // against its FIRST parent (en_ust 245ed073: the human side touched
+      // PSA/LAM/HOS/AMO/MIC/HAB/ZEC, our export side 26-EZK, and the merge
+      // lists only 26-EZK). So the ledger matches such a merge to our
+      // export's book even though the human never touched it, and that book's
+      // file at the merge equals our export's. When EVERY human commit in the
+      // window is such a merge, the evidence says so explicitly; it stays
+      // `complete: false` so every reader that does not know the flag keeps
+      // today's fail-closed answer.
+      {
+        serve([...files(EXPORT_TEXT), listing(TIP, [exportListed]), listing(HUMAN, [humanListed])]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [ancestorMerge()], OURS, SHAPE1);
+        assert(ev.complete === false && ev.refs.length === 0 && ev.reason === "export_equal_merges_only"
+          && ev.exportEqualMergesOnly === true,
+          "#1351: a merge identical to an ancestor export, alone in the window, is flagged export-equal");
+        assert(asked.length === 6, "  ...after six subrequests: two listings, two files, two blob ids");
+        serve(files(EXPORT_TEXT));
+        const direct = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(direct.complete === false && direct.reason === "export_equal_merges_only" && direct.exportEqualMergesOnly === true,
+          "  ...and so is one identical to a direct export parent");
+      }
+      {
+        // Equal TEXTS are not enough to flag the file: two raw reads cut short
+        // at the same offset would compare equal. Gitea's blob ids decide.
+        serve([tree(EXPORT, "e0e0000000000000000000000000000000000000"), ...files(EXPORT_TEXT)]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(ev.complete === false && ev.reason === "revision_blob_mismatch" && ev.exportEqualMergesOnly !== true,
+          "#1351: equal texts with different blob ids are incomplete (our reads were wrong), unflagged");
+        serve([[`git/trees/${MERGE}`, () => jsonRes({ ok: false })], ...files(EXPORT_TEXT)]);
+        const unread = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit()], OURS);
+        assert(unread.complete === false && unread.reason === "no_refs_mapped" && unread.exportEqualMergesOnly !== true,
+          "#1351: an unreadable blob id leaves today's no_refs_mapped answer, unflagged");
+      }
+      {
+        // Beside a commit that maps to no verse (a mode change), the window
+        // is not proven: today's no_refs_mapped answer, no flag.
+        const MODE = "30de000000000000000000000000000000000000";
+        const modeDiff = [`diff --git a/${EZK} b/${EZK}`, "old mode 100644", "new mode 100755", ""].join("\n");
+        serve([...files(EXPORT_TEXT), [`git/commits/${MODE}.diff`, () => res({ body: modeDiff })]]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK,
+          [mergeCommit(), { sha: MODE, message: "chmod", authorEmail: "someone@example.org", parentSha: BASE, allParentShas: [BASE] }], OURS);
+        assert(ev.complete === false && ev.reason === "no_refs_mapped" && ev.exportEqualMergesOnly !== true,
+          "#1351: an export-equal merge beside a zero-hunk commit stays no_refs_mapped, unflagged");
+      }
+      {
+        // Beside any incomplete part, the window stays incomplete, unflagged.
+        serve([[`git/commits/${HUMAN}.diff`, () => res({ ok: false })], ...files(EXPORT_TEXT)]);
+        const ev = await fetchHumanTouchedRefs(env, "en_ust", EZK, [mergeCommit(), humanCommit], OURS);
+        assert(ev.complete === false && ev.reason === "diff_fetch_failed" && ev.exportEqualMergesOnly !== true,
+          "#1351: an export-equal merge beside an unreadable commit stays incomplete, unflagged");
       }
     }
   }

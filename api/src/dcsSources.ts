@@ -5,6 +5,7 @@
 
 import type { Env } from "./index";
 import {
+  classifyMasterCommit,
   LINEAGE_REFINE_MAX_HUMAN_COMMITS,
   mergeRefEvidence,
   parseDiffHunksForPath,
@@ -705,15 +706,70 @@ async function fetchCappedText(env: Env, url: string, maxBytes: number): Promise
 // file's lines.
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
+// One path-scoped commit listing of a merge parent (issue #1351). Measured on
+// Door43 2026-11-13: about 1 s, 50 commits a page, and a sha Gitea does not
+// know answers HTTP 500 (it does not fall back to master the way the raw
+// endpoint does), which the listing reads as incomplete.
+const LINEAGE_ANCESTRY_TIMEOUT_MS = 15_000;
+
+// Issue #1351: is one of OUR export commits for this path in a two-parent
+// merge's second-parent history, and not in its first-parent history? Only
+// then does the merge's first-parent `.diff` carry that export's change (the
+// editor's "Merge branch 'master'", where master's tip at that moment is
+// another book's export or any other commit, so this book's export is only an
+// ancestor). Returns that export's sha, or null with the reason the old
+// first-parent diff stays. Every doubt is null: null only ever keeps today's
+// over-crediting answer, never drops a ref.
+//
+// Which export: the NEWEST of the window's `ours` commits in the second
+// parent's listing. Commits above it (newer) changed the file after it, so
+// comparing against it keeps them credited. Commits below it (older) may have
+// been carried forward by it, so a human one the window does not list as its
+// own commit refuses the comparison. Then the first parent's listing must be
+// complete and must not hold that export: if it does (a pull request of a
+// branch cut after our export), the first-parent diff never held the
+// export's change and is already the narrower answer.
+async function exportAncestorForMerge(
+  env: Env,
+  repo: string,
+  path: string,
+  parents: string[],
+  ours: Set<string>,
+  humanShas: Set<string>,
+  sinceTime: number,
+): Promise<{ sha: string | null; reason: string }> {
+  const [first, second] = parents;
+  if (!FULL_SHA_RE.test(first) || !FULL_SHA_RE.test(second)) return { sha: null, reason: "parent_sha_unusable" };
+  const opts = { fromSha: second, sinceTime, pageLimit: 1, timeoutMs: LINEAGE_ANCESTRY_TIMEOUT_MS };
+  const side = await listMasterCommitsSince(env, repo, path, null, opts);
+  if (side.incomplete) return { sha: null, reason: `second_parent_listing_${side.incompleteReason}` };
+  const at = side.commits.findIndex((x) => ours.has(x.sha.toLowerCase()));
+  if (at < 0) return { sha: null, reason: "no_export_in_second_parent" };
+  const exportSha = side.commits[at].sha.toLowerCase();
+  for (const below of side.commits.slice(at + 1)) {
+    if (classifyMasterCommit(below).kind === "human" && !humanShas.has(below.sha.toLowerCase())) {
+      return { sha: null, reason: "unlisted_human_below_export" };
+    }
+  }
+  const mine = await listMasterCommitsSince(env, repo, path, null, { ...opts, fromSha: first });
+  if (mine.incomplete) return { sha: null, reason: `first_parent_listing_${mine.incompleteReason}` };
+  if (mine.commits.some((x) => x.sha.toLowerCase() === exportSha)) return { sha: null, reason: "export_in_first_parent" };
+  return { sha: exportSha, reason: "" };
+}
+
 export async function fetchHumanTouchedRefs(
   env: Env,
   repo: string,
   path: string,
   humanCommits: MasterCommit[],
   // The shas of the window's commits classified `ours` (our own exports). Only
-  // a merge with one of these as a parent is mapped against its parents
-  // (issue #1348); empty keeps every commit on the first-parent diff path.
+  // a merge with one of these as a parent, or (#1351) as a proven ancestor of
+  // its second parent, is mapped against that export; empty keeps every
+  // commit on the first-parent diff path.
   oursShas: Iterable<string> = [],
+  // #1351: the window's lower bound (unix seconds, the caller's confirmedAt),
+  // which bounds the parent listings. Absent skips the ancestor check.
+  opts: { sinceTime?: number | null } = {},
 ): Promise<HumanRefEvidence> {
   // USFM and TSV both map (issue #607: TSV used to refuse here and keep the
   // file-level answer — `not_usfm` — because only refsTouchedInUsfm existed).
@@ -737,11 +793,26 @@ export async function fetchHumanTouchedRefs(
   const parts: HumanRefEvidence[] = [];
   const ours = new Set<string>();
   for (const o of oursShas) if (typeof o === "string") ours.add(o.toLowerCase());
+  const humanShas = new Set(humanCommits.map((c) => (c.sha ?? "").toLowerCase()));
+  const sinceTime = typeof opts.sinceTime === "number" && Number.isFinite(opts.sinceTime) ? opts.sinceTime : null;
+  // #1351 shape 2: how many human commits were merges whose file is
+  // byte-identical to one of our export commits they contain.
+  let exportEqualMerges = 0;
   for (const c of humanCommits) {
     const sha = (c.sha ?? "").toLowerCase();
     if (!FULL_SHA_RE.test(sha)) {
       parts.push({ complete: false, refs: [], reason: "abbreviated_sha" });
       break;
+    }
+    // #1351 shape 3: a ledger row written before migration 0078 has no
+    // parents, so a merge there cannot be recognised and keeps the
+    // first-parent diff. Say so, rather than skip the fix silently.
+    if ((!Array.isArray(c.allParentShas) || c.allParentShas.length === 0) && /^Merge\b/.test(c.message ?? "")) {
+      console.log("lineage: merge-looking commit has no recorded parents; first-parent diff kept (#1351)", {
+        repo,
+        path,
+        sha,
+      });
     }
     // A merge commit with one of OUR export commits as a parent (issue #1348).
     // Its `.diff` is against the first parent only, so when our export is the
@@ -756,10 +827,28 @@ export async function fetchHumanTouchedRefs(
     // Two fetches for the usual shape (merge + our export), against three for
     // the diff path. A file byte-identical to our export's skips the compare.
     // A merge with no export parent in the window, or parents unknown (a ledger
-    // row written before migration 0078), keeps the first-parent diff below.
-    const exportParents = Array.isArray(c.allParentShas) && c.allParentShas.length > 1
-      ? c.allParentShas.map((p) => (typeof p === "string" ? p.toLowerCase() : "")).filter((p) => ours.has(p))
+    // row written before migration 0078), keeps the first-parent diff below,
+    // unless (#1351) one of our exports is a proven ancestor of its second
+    // parent and not of its first (exportAncestorForMerge). That check costs
+    // one listing per parent, so it runs only for a two-parent merge in a
+    // window holding an export of ours.
+    const parentShas = Array.isArray(c.allParentShas)
+      ? c.allParentShas.map((p) => (typeof p === "string" ? p.toLowerCase() : ""))
       : [];
+    let exportParents = parentShas.length > 1 ? parentShas.filter((p) => ours.has(p)) : [];
+    if (exportParents.length === 0 && parentShas.length === 2 && ours.size > 0 && sinceTime != null) {
+      const ancestor = await exportAncestorForMerge(env, repo, path, parentShas, ours, humanShas, sinceTime);
+      if (ancestor.sha) {
+        exportParents = [ancestor.sha];
+      } else {
+        console.log("lineage: merge has no proven export ancestor; first-parent diff kept (#1351)", {
+          repo,
+          path,
+          sha,
+          reason: ancestor.reason,
+        });
+      }
+    }
     if (exportParents.length > 0) {
       const mergeText = await fetchCappedText(env, dcsRawUrl(env, repo, path, sha), MAX_REVISION_FILE_BYTES);
       if (mergeText == null) {
@@ -778,9 +867,27 @@ export async function fetchHumanTouchedRefs(
         parts.push({ complete: false, refs: [], reason: "parent_revision_fetch_failed" });
         break;
       }
-      const mapped = parentTexts.includes(mergeText)
-        ? { complete: true, refs: [], reason: "" }
-        : refsDifferingFromEveryParent(isUsfm ? "usfm" : "tsv", mergeText, parentTexts);
+      const equalAt = parentTexts.indexOf(mergeText);
+      if (equalAt >= 0) {
+        // #1351: equal texts can flag the whole file as holding no human
+        // edit, so they must not rest on our two reads alone: two raw reads
+        // cut short at the same offset (a header-less body is accepted
+        // unverified above) would compare equal. Gitea's own blob ids settle
+        // it. Equal ids count the merge as export-equal; different ids mean
+        // our reads were wrong, which is incomplete; an unreadable id counts
+        // nothing (the merge adds no refs, as before #1351).
+        const timeout = { timeoutMs: LINEAGE_ANCESTRY_TIMEOUT_MS };
+        const mergeBlob = await fileBlobShaAtCommit(env, repo, path, sha, timeout);
+        const exportBlob = mergeBlob == null ? null : await fileBlobShaAtCommit(env, repo, path, exportParents[equalAt], timeout);
+        if (mergeBlob != null && exportBlob != null && mergeBlob !== exportBlob) {
+          parts.push({ complete: false, refs: [], reason: "revision_blob_mismatch" });
+          break;
+        }
+        if (mergeBlob != null && mergeBlob === exportBlob) exportEqualMerges++;
+        parts.push({ complete: true, refs: [], reason: "" });
+        continue;
+      }
+      const mapped = refsDifferingFromEveryParent(isUsfm ? "usfm" : "tsv", mergeText, parentTexts);
       parts.push(mapped);
       if (mapped.complete !== true) break;
       continue;
@@ -853,6 +960,19 @@ export async function fetchHumanTouchedRefs(
   // A window whose commits ALL mapped to zero refs is not evidence that no
   // verse was touched — those commits moved the file. Refuse to narrow on it.
   if (merged.complete && merged.refs.length === 0) {
+    // #1351 shape 2: the one exception is a window whose EVERY human commit is
+    // a merge whose file is byte-identical to an export of ours it contains
+    // (equal texts AND equal Gitea blob ids, above). Master's file then holds
+    // our render, whatever the merging side brought
+    // in, so no verse holds a human edit. Gitea lists a merge's `files`
+    // against its first parent (measured on en_ust 245ed073), so the ledger
+    // matches such a merge to our export's book even when the human never
+    // touched it. Still `complete: false`, so every reader that does not
+    // know this flag keeps the fail-closed answer; only
+    // masterMayHoldHumanEditForVerse reads it.
+    if (exportEqualMerges > 0 && exportEqualMerges === humanCommits.length) {
+      return { complete: false, refs: [], reason: "export_equal_merges_only", exportEqualMergesOnly: true };
+    }
     return { complete: false, refs: [], reason: "no_refs_mapped" };
   }
   return merged;
