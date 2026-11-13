@@ -692,8 +692,8 @@ export function FindReplaceOverlay({
       m.endIndex - m.startIndex,
       replace,
     );
-    // The verse's stored text is out of step with it and the match couldn't be
-    // placed (#1339): nothing is saved, but say so rather than do nothing.
+    // The verse has a header label and its stored text is out of step with it
+    // (#1339): nothing is saved, but say so rather than do nothing.
     if (result.staleRefused) {
       setReplaceSummary({ scope: "bible", versesReplaced: 0, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, staleRefused: 1 });
       return;

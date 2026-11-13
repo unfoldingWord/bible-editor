@@ -19,7 +19,7 @@ import usfm from "usfm-js";
 // Imported from the canonical importer rather than mirrored like
 // normalizeWordPunctuation below: the transform is large and must stay in
 // lockstep with extractVersesForRange. Node 24 strips the .ts types on import.
-import { splitGluedAlignmentWords } from "../api/src/importParsers.ts";
+import { splitGluedAlignmentWords, isHeaderLabelNode } from "../api/src/importParsers.ts";
 // Issue #686 item 5: this bootstrap importer left every row's 0060
 // provenance columns NULL and its edit_log 'create' rows carrying no `book`
 // — indistinguishable from "never touched" and, for the edit_log rows, not
@@ -215,6 +215,9 @@ function extractPlainText(verseObj) {
   const parts = [];
   const walk = (vos) => {
     for (const vo of vos || []) {
+      // A `\sp` speaker label's text is not verse text (#1339); same skip as
+      // extractPlainText in api/src/importParsers.ts and web/src/lib/usfm.ts.
+      if (isHeaderLabelNode(vo)) continue;
       if (vo.text) parts.push(vo.text);
       if (vo.children) walk(vo.children);
     }

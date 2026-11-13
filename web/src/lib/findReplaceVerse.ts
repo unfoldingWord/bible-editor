@@ -21,63 +21,27 @@ import { curlifyVerseContent } from "./curlyVerse.ts";
 import { extractPlainText, isHeaderLabelNode } from "./usfm.ts";
 
 // A find/replace result. `staleRefused`: the verse was left as it is because
-// its stored plain text is out of step with its tree beside a header label and
-// the match could not be placed in the tree's own text (#1339). The overlay
-// says so instead of dropping the click silently.
+// it has a header label and its stored plain text is out of step with its
+// tree (#1339). The overlay says so instead of dropping the click silently.
 export type FindReplaceResult = SmartReplaceResult & { staleRefused?: true };
 
-// A stored plain text out of step with the verse's tree, in a verse that has a
-// header label (#1339). Before #711 the extractor kept a `\sp` label's text
-// inline, so such a row reads `said The man speaking the man` where the tree's
-// own text reads `said the man`. The engine's position walk misses on it and
-// its occurrence count runs, which could land on another word, in the label,
-// or write the label's text into the body. Returns the tree's own plain text
-// when the stored one is stale this way, otherwise null (main's path).
-function staleBesideLabel(content: unknown, plainText: string): string | null {
+// A verse with a header label whose stored plain text is not its tree's own
+// (#1339). The server's extractor once kept a `\sp` label's text in the stored
+// plain text while the editor's left it out, so such a row reads
+// `said The man speaking the man` where the tree reads `said the man`. The
+// overlay's matches come from the stored text, and the engine's position walk
+// misses on it: its occurrence count then lands on another word, in the label,
+// or writes the label's text into the body. Guessing where the match sits in
+// the tree's text failed review twice (a pick in the label edited a body
+// word), so such a verse is refused. A stale verse with no header label takes
+// main's path unchanged.
+function staleBesideLabel(content: unknown, plainText: string): boolean {
   const vos = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  if (!Array.isArray(vos)) return null;
+  if (!Array.isArray(vos)) return false;
   const hasLabel = (nodes: unknown[]): boolean =>
     nodes.some((n) => isHeaderLabelNode(n) || (Array.isArray((n as { children?: unknown[] } | null)?.children) && hasLabel((n as { children: unknown[] }).children)));
-  if (!hasLabel(vos)) return null;
-  const fresh = extractPlainText(content);
-  return plainText.replace(/\s+/g, " ").trim() === fresh ? null : fresh;
-}
-
-// Place a match of the stale stored text in the tree's own text, or null.
-// Only by position, never by counting occurrences: the match must lie wholly
-// in the text the two share at the start or at the end. When those two runs
-// overlap (the label text repeats the text beside it), the overlapping part
-// could belong to either side, so a match there is not placed. Then the regex
-// must match the tree's text at exactly that spot with the same length, so a
-// `\W+` or `\S+` run that touched the label text, and is longer once the label
-// text is gone, is not placed either.
-function placeInFresh(stale: string, fresh: string, regex: RegExp, start: number, len: number): number | null {
-  if (len <= 0) return null;
-  const n = Math.min(stale.length, fresh.length);
-  let head = 0;
-  while (head < n && stale[head] === fresh[head]) head++;
-  let tail = 0;
-  while (tail < n && stale[stale.length - 1 - tail] === fresh[fresh.length - 1 - tail]) tail++;
-  const overlap = Math.max(0, head + tail - n);
-  head -= overlap;
-  tail -= overlap;
-  let at: number;
-  if (start + len <= head) at = start;
-  else if (start >= stale.length - tail) at = start - stale.length + fresh.length;
-  else return null;
-  const m = freshMatches(fresh, regex).find((x) => x.index >= at);
-  return m && m.index === at && m.length === len ? at : null;
-}
-
-// Every match of `regex` in `text`, as the overlay lists them.
-function freshMatches(text: string, regex: RegExp): { index: number; length: number }[] {
-  const re = new RegExp(regex.source, regex.flags.includes("g") ? regex.flags : regex.flags + "g");
-  const out: { index: number; length: number }[] = [];
-  for (let m = re.exec(text); m; m = re.exec(text)) {
-    out.push({ index: m.index, length: m[0].length });
-    if (m[0].length === 0) re.lastIndex++;
-  }
-  return out;
+  if (!hasLabel(vos)) return false;
+  return plainText.replace(/\s+/g, " ").trim() !== extractPlainText(content);
 }
 
 const staleRefusal = (content: unknown, plainText: string): FindReplaceResult => ({
@@ -132,16 +96,8 @@ export function findReplaceVerse(
   matchLenInPlain: number,
   replaceText: string,
 ): FindReplaceResult {
-  // A stale stored text beside a header label: run the engine on the tree's own
-  // text at the placed match, or refuse (#1339). The stored text is still what
-  // finalizeFindReplace compares against, so a no-op stays a no-op.
-  const fresh = staleBesideLabel(content, plainText);
-  if (fresh !== null) {
-    const at = placeInFresh(plainText, fresh, regex, matchStartInPlain, matchLenInPlain);
-    if (at === null) return staleRefusal(content, plainText);
-    const result = smartReplaceVerse(content, fresh, regex, at, matchLenInPlain, replaceText, { findReplace: true });
-    return finalizeFindReplace(content, plainText, result);
-  }
+  // A stale stored text beside a header label: refuse, visibly (#1339).
+  if (staleBesideLabel(content, plainText)) return staleRefusal(content, plainText);
   const result = smartReplaceVerse(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, { findReplace: true });
   return finalizeFindReplace(content, plainText, result);
 }
@@ -159,25 +115,10 @@ export function replaceAllInVerse(
   maxIters: number,
   replaceText: string,
 ): FindReplaceResult {
+  // A stale stored text beside a header label: refuse the verse (#1339).
+  if (staleBesideLabel(content, plainText)) return staleRefusal(content, plainText);
   let curContent = content;
   let curPlain = plainText;
-  // A stale stored text beside a header label (#1339): replace in the tree's
-  // own text, but only when each of its matches is a match the stored text
-  // shows at a placed position. Matches only the stored text has (in the
-  // label's text) are not verse text and are left out. Any match that can't be
-  // placed refuses the whole verse, so replace all never edits a match the
-  // user wasn't shown. So does a verse left unchanged while the stored text
-  // had matches that weren't placed (only in the label's text), or the
-  // overlay would show nothing at all.
-  const fresh = staleBesideLabel(content, plainText);
-  let unplaced = false;
-  if (fresh !== null) {
-    const placedAt = freshMatches(plainText, regex).map((m) => placeInFresh(plainText, fresh, regex, m.index, m.length));
-    const placed = new Set(placedAt);
-    if (!freshMatches(fresh, regex).every((m) => placed.has(m.index))) return staleRefusal(content, plainText);
-    unplaced = placedAt.includes(null);
-    curPlain = fresh;
-  }
   let preserved = true;
   // Where the next search starts. A step with no visible change is skipped
   // (not applied) and the search moves past its match, so a later match still
@@ -209,12 +150,11 @@ export function replaceAllInVerse(
     from = 0;
     applied++;
   }
-  const out = finalizeFindReplace(content, plainText, {
+  return finalizeFindReplace(content, plainText, {
     content: curContent,
     plainText: curPlain,
     preservedAlignment: preserved,
   });
-  return unplaced && out.plainText === plainText ? staleRefusal(content, plainText) : out;
 }
 
 // The overlay's scripture summary line after a replace. Counts come from the
@@ -249,7 +189,7 @@ export function bibleReplaceSummaryText(s: BibleReplaceCounts): string {
   }
   if (staleRefused > 0) {
     parts.push(
-      `${plural(staleRefused, "verse", "verses")} not replaced: ${staleRefused === 1 ? "its" : "their"} saved search text is out of date, so the match could not be placed`,
+      `${plural(staleRefused, "verse", "verses")} not replaced: ${staleRefused === 1 ? "its" : "their"} saved search text is out of date`,
     );
   }
   if (s.readOnlySkipped > 0) {

@@ -4,13 +4,19 @@
 // pipeline, lint) and web/src/lib/usfm.ts `extractPlainText` (every verse
 // save, find/replace) are kept as two copies because the Worker and the web
 // bundle are built separately. They drifted: the editor skipped a `\sp`
-// speaker label's text, the server kept it, so an imported Song of Songs verse
-// would start out with a stored plain text the editor calls stale. This test
-// feeds both the same verse trees and asserts the same text.
+// speaker label's text, the server kept it, so an imported verse with a
+// plain-text `\sp` label would start out with a stored plain text the editor
+// calls stale. This test feeds both the same verse trees and asserts the same
+// text.
+//
+// Not covered by either copy: a label written as words (`\sp \w The\w* …`,
+// 37 of the 41 labels in en_ust Song of Songs on 2026-11-13). usfm-js parses
+// that as an empty `sp` node followed by ordinary body words, so both copies
+// keep those words as verse text.
 //
 // scripts/import-book.mjs has a third copy. It runs top-level code on import
-// (reads argv, writes SQL), so it can't be imported here; it uses this file's
-// shared `isHeaderLabelNode` from importParsers.ts for the same skip.
+// (reads argv, writes SQL), so it can't be imported here; it uses the
+// `isHeaderLabelNode` exported by importParsers.ts for the same skip.
 //
 // Run from api/: node --experimental-strip-types --no-warnings src/plainTextParity.test.mjs
 
