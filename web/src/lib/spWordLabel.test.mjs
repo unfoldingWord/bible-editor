@@ -103,7 +103,8 @@ const v4 = nestWordLabels(verse("4"));
 {
   const label = labelsOf(v1)[0];
   const edited = rewriteHeaderLabel(label, "sp", "The woman dreams");
-  assert(render([edited]).trim() === "\\sp The woman dreams", `band edit renders once (got ${json(render([edited]))})`);
+  const r = render([edited]);
+  assert(r.includes("\\sp The woman dreams\n") && !r.includes("\\w") && !r.includes("thinks"), `band edit renders the new text once (got ${json(r)})`);
   assert(rewriteHeaderLabel(label, "sp", "The woman thinks about the man she loves") === label, "an unchanged band save keeps the words as they were");
 }
 

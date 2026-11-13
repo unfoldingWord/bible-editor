@@ -199,19 +199,112 @@ export function splitSectionHeaders(verseObjects: unknown[] | undefined | null):
   for (const node of verseObjects) {
     const o = node as Record<string, unknown> | null;
     if (o && isHeaderLabelNode(o)) {
-      // usfm-js stores the heading text as `content` on \s* nodes (not
-      // `text`, which is what \d uses); `\sp` parks its label on `text`.
-      // Try both — strip trailing newline that usfm-js often appends.
-      const raw = String(o["content"] ?? o["text"] ?? "");
-      sections.push({
-        tag: o["tag"] as string,
-        text: raw.replace(/\n+$/, "").trim(),
-      });
+      sections.push({ tag: o["tag"] as string, text: headerLabelText(o) });
       continue;
     }
     body.push(node);
   }
   return { sections, body };
+}
+
+// The text of a header/label node (isHeaderLabelNode) as the header band shows
+// it. usfm-js stores the heading text as `content` on \s* nodes (not `text`,
+// which is what \d uses); `\sp` parks its label on `text`; a label written as
+// words holds them as `children` (nestWordLabels). Trailing newlines that
+// usfm-js appends are dropped.
+export function headerLabelText(node: unknown): string {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return "";
+  if (o["content"] === undefined && o["text"] === undefined && Array.isArray(o["children"])) {
+    const parts: string[] = [];
+    const walk = (nodes: unknown[]): void => {
+      for (const n of nodes) {
+        const c = n as Record<string, unknown> | null;
+        if (!c) continue;
+        if (typeof c["text"] === "string") parts.push(c["text"]);
+        if (Array.isArray(c["children"])) walk(c["children"] as unknown[]);
+      }
+    };
+    walk(o["children"] as unknown[]);
+    return parts.join("").replace(/\s+/g, " ").trim();
+  }
+  return String(o["content"] ?? o["text"] ?? "").replace(/\n+$/, "").trim();
+}
+
+// A header band edit: the label node rewritten with a new tag and text.
+// usfm-js stores \s* heading text (and `\sr`/`\r`/`\cl` label text) in
+// `content` (with a trailing \n that the renderer/exporter expects); only `\sp`
+// parks it on `text` instead — splitSectionHeaders/isHeaderLabelNode read
+// either, but always WRITE `content` here so every tag round-trips the same way
+// (usfm-js's toUSFM accepts `content` for all of them — #710). The edit
+// dropdown only ever offers s1/s2/s3, so a `\sp`/`\sr`/`\r`/`\cl` label
+// retagged through it becomes a section heading and must gain
+// `type:"section"` — carrying the OLD node's (absent) type forward would make
+// isHeaderLabelNode stop recognizing the result on the next render (it's
+// typeless and "s1" isn't in HEADER_LABEL_TAGS), silently orphaning it from
+// the header band even though the data itself stays intact.
+// A label written as words (nestWordLabels, #1350) drops its words for the new
+// text: keeping `children` beside `content` would export the label twice. A
+// save that changes neither tag nor text keeps the words as they were.
+export function rewriteHeaderLabel(node: Record<string, unknown>, tag: string, text: string): Record<string, unknown> {
+  if (Array.isArray(node["children"]) && tag === node["tag"] && text === headerLabelText(node)) return node;
+  const { text: _drop, type: _dropType, children: _dropChildren, endTag: _dropEnd, ...rest } = node;
+  const type = SECTION_HEADER_TAGS.has(tag) ? "section" : undefined;
+  return { ...rest, ...(type ? { type } : {}), tag, content: `${text}\n` };
+}
+
+// A `\sp` speaker label written as words (#1350). Door43 en_ust Song of Songs
+// writes most of its labels as `\sp \w The|…\w* \w woman|…\w* …`; usfm-js
+// parses that as an EMPTY `sp` node followed by ordinary `\w` body words, so
+// every walker (plain text, the editable text, the aligner, the renderer) read
+// the label as verse body. Move the words into the `sp` node as `children`,
+// with `endTag: ""`: then isHeaderLabelNode's skip covers them everywhere, and
+// usfm-js renders the node back to exactly the same bytes (`\sp ` then the
+// children; the empty endTag stops it writing a closing `\sp-e\*`).
+// The run nested is what USFM gives the label: every `\w` word, text node and
+// `\zaln` milestone after the `sp` up to the next node of any other kind (the
+// `\q1` or `\ts\*` that follows it in every real case) or the verse end. Only
+// an `sp` with no text, content or children of its own, followed by at least
+// one word, is touched; every other tree is returned as is. Top-level only,
+// idempotent. Mirrors nestWordLabels in api/src/importParsers.ts, which the
+// import runs so the stored tree has this shape (plainTextParity.test.mjs pins
+// the two together).
+export function nestWordLabels(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  let out: unknown[] | null = null;
+  for (let i = 0; i < verseObjects.length; i++) {
+    const node = verseObjects[i];
+    if (isEmptyLabelOpener(node)) {
+      let j = i + 1;
+      let hasWord = false;
+      while (j < verseObjects.length && isLabelRunNode(verseObjects[j])) {
+        if ((verseObjects[j] as Record<string, unknown>)["type"] !== "text") hasWord = true;
+        j++;
+      }
+      if (hasWord) {
+        out ??= verseObjects.slice(0, i);
+        out.push({ ...(node as Record<string, unknown>), children: verseObjects.slice(i + 1, j), endTag: "" });
+        i = j - 1;
+        continue;
+      }
+    }
+    if (out) out.push(node);
+  }
+  return out ?? verseObjects;
+}
+
+function isEmptyLabelOpener(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o || o["tag"] !== "sp" || o["type"] !== undefined) return false;
+  return (o["text"] === undefined || o["text"] === "") && o["content"] === undefined && o["children"] === undefined;
+}
+
+function isLabelRunNode(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  if (o["type"] === "text") return typeof o["text"] === "string";
+  if (o["type"] === "word") return o["tag"] === "w";
+  return o["type"] === "milestone" && o["tag"] === "zaln";
 }
 
 // usfm-js stores poetry markers (\q1, \q2, \qm*) as `{type:"quote", tag}`

@@ -1325,6 +1325,55 @@ export function isHeaderLabelNode(node: unknown): boolean {
   return HEADER_LABEL_TAGS.has(tag);
 }
 
+// A `\sp` speaker label written as words (#1350): Door43 en_ust Song of Songs
+// writes most labels as `\sp \w The|…\w* \w woman|…\w* …`, which usfm-js parses
+// as an EMPTY `sp` node followed by ordinary `\w` body words. Move those words
+// (with the text nodes and `\zaln` milestones between them, up to the next node
+// of any other kind or the verse end) into the `sp` node as `children`, with
+// `endTag: ""`, so isHeaderLabelNode's skip covers them and usfm-js renders the
+// node back to the same bytes. Only an `sp` with no text, content or children
+// of its own, followed by at least one word, is touched. Top-level only,
+// idempotent. Mirror of nestWordLabels in web/src/lib/usfm.ts (same
+// cross-bundle reason as extractPlainText below; plainTextParity.test.mjs pins
+// the two together). Exported for scripts/import-book.mjs and its siblings.
+export function nestWordLabels(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  let out: unknown[] | null = null;
+  for (let i = 0; i < verseObjects.length; i++) {
+    const node = verseObjects[i];
+    if (isEmptyLabelOpener(node)) {
+      let j = i + 1;
+      let hasWord = false;
+      while (j < verseObjects.length && isLabelRunNode(verseObjects[j])) {
+        if ((verseObjects[j] as Record<string, unknown>)["type"] !== "text") hasWord = true;
+        j++;
+      }
+      if (hasWord) {
+        out ??= verseObjects.slice(0, i);
+        out.push({ ...(node as Record<string, unknown>), children: verseObjects.slice(i + 1, j), endTag: "" });
+        i = j - 1;
+        continue;
+      }
+    }
+    if (out) out.push(node);
+  }
+  return out ?? verseObjects;
+}
+
+function isEmptyLabelOpener(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o || o["tag"] !== "sp" || o["type"] !== undefined) return false;
+  return (o["text"] === undefined || o["text"] === "") && o["content"] === undefined && o["children"] === undefined;
+}
+
+function isLabelRunNode(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  if (o["type"] === "text") return typeof o["text"] === "string";
+  if (o["type"] === "word") return o["tag"] === "w";
+  return o["type"] === "milestone" && o["tag"] === "zaln";
+}
+
 // Walk verse-objects and concatenate all text. Same shape and behaviour
 // as the client-side `extractPlainText` in web/src/lib/usfm.ts — kept
 // duplicated because the Worker bundle and the web bundle are built
@@ -1500,6 +1549,9 @@ export function extractVersesForRange(
       verseObjects = dropDoubledLeadingMarkers(prevVerseObjects, verseObjects);
       verseObjects = collapseRedundantParagraphs(verseObjects);
       verseObjects = collapseRedundantTsMilestones(verseObjects);
+      // Last, so every normalizer above sees a word label's words exactly as
+      // before (#1350); the stored tree and plain text then treat it as a label.
+      verseObjects = nestWordLabels(verseObjects);
       prevVerseObjects = vNum >= 1 ? verseObjects : null;
       const normalized = { ...verseObj, verseObjects };
       out.push({
