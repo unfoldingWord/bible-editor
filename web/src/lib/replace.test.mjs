@@ -4534,6 +4534,70 @@ function countAllMilestones(nodes) {
   assert(!r.labelRefused && labelTo(r.content) === "2/5  4/5 5/5", `"king to me" -> "king for me": the label "to"s are renumbered 2/5, 4/5 and 5/5 (got ${JSON.stringify(labelTo(r.content))})`);
 }
 
+// Case 100: three more find/replace shapes beside a line break that moved a
+// word across it, dropped the `\q1`, or unaligned an untouched word (#1361).
+// Each keeps the break before the word that sat after it, and only the words
+// the replace changed leave their milestone.
+{
+  console.log("\n[Case 100] Find/replace beside a bare marker, a marker carrying an opener, and a swapped word keeps the break (#1361)");
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const q1 = (text) => (text === undefined ? { tag: "q1", nextChar: " ", type: "quote" } : { tag: "q1", nextChar: " ", type: "quote", text });
+  const strongsOf = (content) => alignedWords(content).filter((x) => x.strongs.length).map((x) => `${x.text}:${x.strongs.join("+")}`);
+  const markers = (content) => content.verseObjects.filter((n) => n && n.tag === "q1").length;
+  const run = (content, find, replacement) => {
+    const plain = extractPlainText(content);
+    const at = plain.indexOf(find);
+    assert(at >= 0, `setup: verse contains ${JSON.stringify(find)}`);
+    const re = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    return findReplaceVerse(clone(content), plain, re, at, find.length, replacement);
+  };
+  const check = (label, content, find, replacement, wantRe, unaligned) => {
+    const r = run(content, find, replacement);
+    const ed = extractEditableText(r.content);
+    const plain = extractPlainText(content);
+    assert(extractPlainText(r.content) === plain.replace(find, replacement), `${label}: text is the replacement (got ${JSON.stringify(extractPlainText(r.content))})`);
+    assert(markers(r.content) === markers(content) && wantRe.test(ed), `${label}: the \\q1 stays before the word after it (got ${JSON.stringify(ed)})`);
+    const before = strongsOf(content);
+    const after = strongsOf(r.content);
+    const kept = before.filter((s) => !unaligned.includes(s.split(":")[0]));
+    assert(kept.every((s) => after.includes(s)) && after.length === kept.length,
+      `${label}: only ${unaligned.join(", ")} unaligned (before ${JSON.stringify(before)}, after ${JSON.stringify(after)})`);
+  };
+  // 1. A bare line marker (no text node on either side): the match crosses
+  //    the seam, where raw reads `warsYour`.
+  const bare = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), q1(), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.")] };
+  check("bare marker, wars Your -> wars; your", bare, "wars Your", "wars; your", /wars;\s*\\q1 your king rules/, ["Your"]);
+  // 2. A line marker carrying the line-leading opener (usfm-js parks `“` on
+  //    the `\q1` node, as in ZEC 1:14 ULT).
+  const opener = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1("“"), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.”")] };
+  check("opener marker, wars. “Your -> wars; “your", opener, "wars. “Your", "wars; “your", /wars;\s*\\q1 “your king rules/, ["Your"]);
+  check("opener marker, mirror: wars. “Your -> Wars; “Your", opener, "wars. “Your", "Wars; “Your", /Wars;\s*\\q1 “Your king rules/, ["wars"]);
+  // The real verse: `Yahweh of Armies:` ⏎ `\q1 “I have been jealous`.
+  {
+    const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+    const real = { verseObjects: zecUlt.chapters["1"]["14"].verseObjects };
+    check("ZEC 1:14 ULT, Armies: “I -> armies; “I", real, "Armies: “I", "armies; “I", /of armies;\s*\\q1 “I have been/, ["Armies"]);
+  }
+  // With no surviving word the range rebuild can't run; the fallback may
+  // move the break but must never drop it (or its opener).
+  {
+    const r = run(opener, "wars. “Your", "fights; “the");
+    assert(markers(r.content) === 1 && extractPlainText(r.content) === "use in fights; “the king rules.”",
+      `opener marker, no surviving word: the \\q1 is kept (got ${JSON.stringify(extractEditableText(r.content))})`);
+  }
+  // 3. A word swapped right after a line break: the new word takes the old
+  //    one's place after the break, as the typed path saves it.
+  const swap = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1(), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.")] };
+  check("swap after a break, wars. Your -> wars; The", swap, "wars. Your", "wars; The", /wars;\s*\\q1 The king rules/, ["Your"]);
+  check("swap before a break, wars. Your -> fights; Your", swap, "wars. Your", "fights; Your", /fights;\s*\\q1 Your king rules/, ["wars"]);
+  // The same swap at a bare marker.
+  check("swap at a bare marker, wars Your -> wars; The", bare, "wars Your", "wars; The", /wars;\s*\\q1 The king rules/, ["Your"]);
+  // A repeated word in the replaced span (#1361 comment): the recased word
+  // that stays after the break is the one before `king`, not the first `your`.
+  check("repeated word, wars. Your king -> wars that your enemies started; your king", swap, "wars. Your king",
+    "wars that your enemies started; your king", /started;\s*\\q1 your king rules/, ["Your"]);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
