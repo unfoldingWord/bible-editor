@@ -780,6 +780,26 @@ Highlights that bite repeatedly:
   it re-reads the verse cutoff after the walk. Its TSV fetch stays unpinned on purpose: a `ref`-pinned TSV fetch
   comes back completeness-verified, which widens the prune's covered chapters, and that path's TSV cutoff is the
   pre-walk read anyway.
+- **With a human commit in the walk, the #658 stamp needs every commit around our merge proven by parent links (#1349).**
+  Until #1349 any human commit in the walk withheld it, so a maintainer committing after our export merged froze the
+  watermark on the export before, and the next sync's 3-way merge reverted his fix (2CH twl `av3p`) or dropped a
+  newer app edit (EZK tn `x7oy`). `judgeLineageStampAncestry` (ownPublish.ts) has two rules. No human commit in the
+  walk: the walk alone decides, as before, with no Door43 reads (a cut that made bot pushes prove descent hit the
+  read cap on #658's own production shape). A human commit: a sha is proven only when its parent list is complete
+  and well formed and every parent is proven, seeded by our merge alone; every commit above our merge must be
+  proven, every human commit below it withholds, and every bot/own commit below it must be on our merge's parent
+  chain. Five review rounds found holes in the earlier mixed evidence, so keep it to this one kind: a commit's
+  history LISTING reaching our merge proves our merge is AN ancestor, not that its other parents are clean (a
+  single-parent commit over an unwalked merge with a side line); `listMasterCommitsSince` without `files:true`
+  drops a malformed parent entry from `allParentShas`, so the judge reads parents only when the parser's
+  `parentsCheck` says "complete"; a malformed or empty list from any source withholds. Parents come from
+  the walk, then the ledger's `repoParents` (every repo commit in its window, other files included), then one
+  `git/commits/<sha>` lookup each, capped at 20. Cost on the live path is the repo commits between the previous
+  export and ours (2CH twl 11-12: 11 other-book exports, 12 reads in all; EZK tn night 1: 9, 15 in all), so a busy repo or a
+  long-frozen watermark withholds there and only the ledger path stamps it. Door43 has no push time, so "dated
+  before the render read" proves nothing for a commit below our merge, and the night after a stamp holds that
+  stamp's later human commits below tonight's merge: tonight waits for byte-for-byte convergence. Parallel-branch
+  human commits (EZK ust `c20a06c5`, JER tn `a45b1705`) still withhold by design; both are #1353.
 - **The dual aligner's reading line decides whether to resync from its dirty state, not from focus.** Until #1067
   the unfocused resync compared the box against text `onInput` keeps equal to the box, so any verse change replaced
   a dirty line that had merely lost focus (clicked into the alignment panel), marked it clean and released its pin.

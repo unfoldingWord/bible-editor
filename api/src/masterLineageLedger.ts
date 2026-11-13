@@ -6,6 +6,7 @@
 // is an explicit refusal, so callers can perform the existing live walk.
 
 import {
+  completeParentList,
   summarizeLineage,
   type ClassifiedCommit,
   type MasterCommit,
@@ -50,6 +51,13 @@ export interface LedgerLineageResult {
   reason: string;
   lineage: MasterLineage | null;
   commits: MasterCommit[];
+  /**
+   * Issue #1349: the recorded parents of EVERY repo commit this read covered,
+   * the ones that changed other files included, so the #658 stamp can walk a
+   * parent chain without a Door43 read. A row with no recorded list (before
+   * migration 0078) is absent; a malformed one is null. Empty when unusable.
+   */
+  repoParents: Map<string, string[] | null>;
 }
 
 const EMPTY = (reason: string): LedgerLineageResult => ({
@@ -57,6 +65,7 @@ const EMPTY = (reason: string): LedgerLineageResult => ({
   reason,
   lineage: null,
   commits: [],
+  repoParents: new Map(),
 });
 
 function parseFiles(json: string | null): string[] | null {
@@ -85,6 +94,15 @@ function parseParentShas(json: string | null | undefined): { allParentShas: stri
   }
 }
 
+// A stored parent list that proves something (issue #1349), else null.
+function storedParents(json: string): string[] | null {
+  try {
+    return completeParentList(JSON.parse(json));
+  } catch {
+    return null;
+  }
+}
+
 function classifyStored(row: LedgerLineageRow): ClassifiedCommit | null {
   if (row.classification !== "ours" && row.classification !== "ai" && row.classification !== "human") {
     return null;
@@ -100,6 +118,8 @@ function classifyStored(row: LedgerLineageRow): ClassifiedCommit | null {
     // ordinary one (issue #1348). Unknown (NULL / malformed) stays absent,
     // which keeps the single-parent path.
     ...(parseParentShas(row.parent_shas_json) ?? {}),
+    // Issue #1349: only a whole, well-formed recorded list proves ancestry.
+    ...(row.parent_shas_json == null ? {} : { parentsCheck: storedParents(row.parent_shas_json) ? "complete" : "malformed" }),
   };
   // The stored classification is the result of classifyForLedger at poll time.
   // Re-running the classifier here would lose the commit body (the ledger
@@ -191,6 +211,10 @@ export async function readLedgerMasterLineage(
   }
 
   const raw = rows.results ?? [];
+  const repoParents = new Map<string, string[] | null>();
+  for (const row of raw) {
+    if (row.parent_shas_json != null) repoParents.set(row.sha, storedParents(row.parent_shas_json));
+  }
   const commits: ClassifiedCommit[] = [];
   for (const row of raw) {
     if (row.committed_at == null) return EMPTY("ledger_commit_time_unknown");
@@ -205,6 +229,7 @@ export async function readLedgerMasterLineage(
     usable: true,
     reason: "ledger_complete",
     commits,
+    repoParents,
     // A repo-wide ledger can prove that no relevant commit was human even if
     // this file had no commits. Its empty commit list is therefore a complete
     // negative, unlike a failed live path walk.

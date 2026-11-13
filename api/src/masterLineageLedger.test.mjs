@@ -420,6 +420,32 @@ for (const [name, setup] of [
   );
   ok(bySha.legacy && bySha.legacy.allParentShas === undefined, "#1348: a pre-0078 row's parents stay unknown");
   ok(bySha.garbled && bySha.garbled.allParentShas === undefined, "#1348: a malformed parent list stays unknown");
+
+  // #1349: the #658 stamp walks parent chains through commits to OTHER files,
+  // so the ledger hands over the parents of every repo commit it read, not
+  // only the path's. Unknown (NULL) is absent; malformed is null.
+  sqlite
+    .prepare(
+      `INSERT INTO dcs_commits (repo, sha, parent_sha, parent_shas_json, author_name, author_email, committed_at,
+                                 message, classification, classification_reason, files_json, seen_at)
+       VALUES ('en_ust', ?, 'merge', ?, 'Bot', 'bot@example.org', ?, 'another book', 'ai', 'bot', ?, ?)`,
+    )
+    .run("other-file", JSON.stringify(["merge"]), 600, JSON.stringify(["01-GEN.usfm"]), 600);
+  sqlite
+    .prepare(
+      `INSERT INTO dcs_commits (repo, sha, parent_sha, parent_shas_json, author_name, author_email, committed_at,
+                                 message, classification, classification_reason, files_json, seen_at)
+       VALUES ('en_ust', ?, 'merge', ?, 'Bot', 'bot@example.org', ?, 'another book', 'ai', 'bot', ?, ?)`,
+    )
+    .run("empty-entry", JSON.stringify(["merge", ""]), 650, JSON.stringify(["01-GEN.usfm"]), 650);
+  const wide = await readLedgerMasterLineage(realDb, "en_ust", "24-JER.usfm", 200, "tip");
+  const rp = wide.repoParents;
+  ok(rp instanceof Map, "#1349: the ledger read returns its repo-wide parents");
+  ok(JSON.stringify(rp?.get("other-file")) === JSON.stringify(["merge"]), "#1349: …including a commit that changed only another file");
+  ok(!(wide.lineage?.commits ?? []).some((c) => c.sha === "other-file"), "#1349: …which still stays out of the path's lineage");
+  ok(JSON.stringify(rp?.get("merge")) === JSON.stringify(["p1", "p2"]), "#1349: …and the path's own commits");
+  ok(rp?.has("legacy") === false, "#1349: a pre-0078 row's parents are absent (unknown)");
+  ok(rp?.get("garbled") === null && rp?.get("empty-entry") === null, "#1349: a malformed parent list is null (withholds)");
 }
 
 if (failed) process.exit(1);

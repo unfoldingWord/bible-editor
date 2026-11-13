@@ -55,6 +55,8 @@
 // timeline end to end and asserts BOTH the pre-fix `adopt_conflict` and the
 // post-fix "app edit kept".
 
+import { completeParentList } from "./masterLineage.ts";
+
 // Git blob SHA of a string's UTF-8 bytes: sha1("blob " + byteLength + "\0" +
 // bytes), lowercase hex. Identical to `git hash-object <file>` and to the `sha`
 // Gitea returns for a file from its contents API.
@@ -72,6 +74,7 @@
 // security boundary, so SHA-1's collision weakness is not in play here: the
 // adversary would have to be our own export renderer, and a decline is
 // harmless anyway (see FAIL-SAFE DIRECTION above).
+
 export async function gitBlobSha(content: string): Promise<string> {
   const bytes = new TextEncoder().encode(content);
   const header = new TextEncoder().encode(`blob ${bytes.byteLength}\0`);
@@ -294,4 +297,190 @@ export function judgeOwnPublishDecline(input: {
         ? { kind: newest.kind, sha: newest.sha, author: newest.authorName ?? null, date: newest.date ?? null }
         : null,
   };
+}
+
+// Step 3 (#1349): may a PRESERVED merge's render be stamped as master's
+// ancestor? Until #1349 any human commit anywhere in the walk withheld the
+// stamp, so a maintainer committing after our merge froze the watermark on the
+// export before it. The next sync then judged both sides against that older
+// render: an app edit we had already published read as "D1 changed", the
+// maintainer's later fix as "master unchanged", and the merge reverted his fix
+// (2CH twl av3p, 2026-11-12) or dropped a newer app edit (EZK tn x7oy).
+//
+// TWO RULES, chosen by whether the walk holds a human commit.
+//
+// 1. No human commit anywhere in the walk: the rule #658 shipped with. The
+//    stamp stands on the walk alone and no ancestry is read, so a bot pushing
+//    on top of our merge never costs a Door43 read or hits a cap.
+//
+// 2. At least one human commit: strict proof, one kind of evidence. A sha is
+//    PROVEN when its parent list is complete and well formed and every parent
+//    is already proven; our merge is the only seed. Parents come from the walk
+//    (only when its parser saw a complete list), then from the ledger's
+//    repo-wide parents, then from one Door43 lookup per sha (`readParents`).
+//    A malformed, empty or missing list from any source is unknown and
+//    withholds. A commit's history LISTING reaching our merge is never used: it
+//    shows our merge is AN ancestor, never that the commit's other ancestry is
+//    clean (review: a single-parent commit over an unwalked merge of our merge
+//    and a side line). Then:
+//    - every human commit BELOW our merge withholds. It may have landed between
+//      our render read and our merge, and Door43 gives no push time to rule
+//      that out: a committer date does not move on a late push or on a PR
+//      merge of an older commit;
+//    - every commit ABOVE our merge, of any kind, must be proven. A parent that
+//      is a known ancestor of our merge (in the walk below it, or on our
+//      merge's own parent chain) is not a descendant, so the proof fails there
+//      without spending reads;
+//    - every non-human commit BELOW our merge must be on our merge's parent
+//      chain (a bot commit on a side branch older than our merge, joined by a
+//      merge the path walk does not show, is not).
+//    Every Door43 lookup counts toward `maxReads`; past it the stamp is
+//    withheld. On the live path the below-merge check walks every repo commit
+//    between the previous export and ours, one lookup each (2CH twl 11-12: 11
+//    commits to other books), so a busy repo or a long-frozen watermark
+//    exceeds the cap there; the ledger's repo-wide parents make that free.
+export type LineageStampAncestry =
+  | { ok: true; ancestryReads: number }
+  | {
+      ok: false;
+      reason:
+        | "merge_not_in_walk"
+        | "human_before_merge"
+        | "parents_unknown"
+        | "not_descendant"
+        | "below_merge_unproven"
+        | "read_failed"
+        | "read_cap";
+      sha: string | null;
+      ancestryReads: number;
+    };
+
+export interface LineageStampCommit {
+  sha: string;
+  kind: "ours" | "ai" | "human";
+  allParentShas?: string[];
+  parentsCheck?: "complete" | "malformed";
+}
+
+type ParentsFailure = "parents_unknown" | "read_failed" | "read_cap";
+
+export async function judgeLineageStampAncestry(
+  commits: readonly LineageStampCommit[],
+  mergeSha: string,
+  opts: {
+    /** The ledger's parents for every repo commit in its window; null = malformed. */
+    repoParents?: ReadonlyMap<string, readonly string[] | null>;
+    /** Every parent of one commit, from Door43; null when the read failed. */
+    readParents: (sha: string) => Promise<string[] | null>;
+    maxReads: number;
+  },
+): Promise<LineageStampAncestry> {
+  // Rule 1.
+  if (!commits.some((c) => c.kind === "human")) return { ok: true, ancestryReads: 0 };
+
+  // Rule 2.
+  const mergeIdx = commits.findIndex((c) => c.sha === mergeSha);
+  if (mergeIdx < 0) return { ok: false, reason: "merge_not_in_walk", sha: null, ancestryReads: 0 };
+  const below = commits.slice(mergeIdx + 1);
+  const humanBelow = below.find((c) => c.kind === "human");
+  if (humanBelow) return { ok: false, reason: "human_before_merge", sha: humanBelow.sha, ancestryReads: 0 };
+
+  const walkBySha = new Map(commits.map((c) => [c.sha, c]));
+  const known = new Map<string, string[]>();
+  let reads = 0;
+  // Parents of one sha, or why they are unknown. `free` refuses to spend a
+  // Door43 read (returns null when one would be needed).
+  const parentsOf = async (sha: string, free = false): Promise<string[] | ParentsFailure | null> => {
+    const cached = known.get(sha);
+    if (cached) return cached;
+    let list: string[] | null = null;
+    const w = walkBySha.get(sha);
+    if (w?.parentsCheck === "malformed") return "parents_unknown";
+    if (w?.parentsCheck === "complete") list = completeParentList(w.allParentShas);
+    if ((list == null || list.length === 0) && opts.repoParents?.has(sha)) {
+      const stored = opts.repoParents.get(sha);
+      if (stored == null) return "parents_unknown";
+      list = completeParentList(stored);
+      if (list == null) return "parents_unknown";
+    }
+    if (list == null || list.length === 0) {
+      if (free) return null;
+      if (reads >= opts.maxReads) return "read_cap";
+      reads++;
+      const read = await opts.readParents(sha);
+      if (read == null) return "read_failed";
+      list = completeParentList(read);
+    }
+    // No commit after our render read is a root, so an empty list is unknown.
+    if (list == null || list.length === 0) return "parents_unknown";
+    known.set(sha, list);
+    return list;
+  };
+  const fail = (reason: Exclude<LineageStampAncestry, { ok: true }>["reason"], sha: string | null): LineageStampAncestry =>
+    ({ ok: false, reason, sha, ancestryReads: reads });
+
+  // Our merge's ancestors reachable without a read. None of them descends
+  // from our merge, and neither (for this proof) does a commit below it in the
+  // walk, so a proof that reaches one fails at once.
+  const freeAncestors = new Set<string>();
+  {
+    const queue = [mergeSha];
+    for (let q = 0; q < queue.length; q++) {
+      const ps = await parentsOf(queue[q], true);
+      if (!Array.isArray(ps)) continue;
+      for (const p of ps) {
+        if (freeAncestors.has(p)) continue;
+        freeAncestors.add(p);
+        queue.push(p);
+      }
+    }
+  }
+  const notDescendant = new Set([...freeAncestors, ...below.map((c) => c.sha)]);
+
+  // Above our merge: prove each commit, oldest first, depth-first through its
+  // parents. `proven.add` below is the only place a sha becomes proven.
+  const proven = new Set([mergeSha]);
+  const expanded = new Set<string>();
+  for (let i = mergeIdx - 1; i >= 0; i--) {
+    const stack = [commits[i].sha];
+    while (stack.length > 0) {
+      const sha = stack[stack.length - 1];
+      if (proven.has(sha)) {
+        stack.pop();
+        continue;
+      }
+      if (notDescendant.has(sha)) return fail("not_descendant", sha);
+      const ps = await parentsOf(sha);
+      if (!Array.isArray(ps)) return fail(ps ?? "parents_unknown", sha);
+      const pending = ps.filter((p) => !proven.has(p));
+      if (pending.length === 0) {
+        proven.add(sha);
+        stack.pop();
+        continue;
+      }
+      // Seen before with a parent still unproven: only a cycle does that.
+      if (expanded.has(sha)) return fail("parents_unknown", sha);
+      expanded.add(sha);
+      stack.push(...pending);
+    }
+  }
+
+  // Below our merge (every commit there is non-human by now): each must be on
+  // our merge's parent chain. Breadth-first from our merge until all are found.
+  const targets = new Set(below.map((c) => c.sha).filter((sha) => !freeAncestors.has(sha)));
+  const queue = [mergeSha];
+  const seen = new Set(queue);
+  for (let q = 0; q < queue.length && targets.size > 0; q++) {
+    const ps = await parentsOf(queue[q]);
+    if (!Array.isArray(ps)) return fail("below_merge_unproven", queue[q]);
+    for (const p of ps) {
+      targets.delete(p);
+      if (!seen.has(p)) {
+        seen.add(p);
+        queue.push(p);
+      }
+    }
+  }
+  if (targets.size > 0) return fail("below_merge_unproven", [...targets][0]);
+  return { ok: true, ancestryReads: reads };
 }

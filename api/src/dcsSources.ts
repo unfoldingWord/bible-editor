@@ -6,6 +6,7 @@
 import type { Env } from "./index";
 import {
   classifyMasterCommit,
+  completeParentList,
   LINEAGE_REFINE_MAX_HUMAN_COMMITS,
   mergeRefEvidence,
   parseDiffHunksForPath,
@@ -412,6 +413,44 @@ export interface MasterCommitPage {
 //     route to a per-commit file list, and the per-commit fetch fanout the
 //     issue warned about is not needed. Default stays false so the nightly
 //     path's payload does not grow.
+// Every parent of ONE commit (`GET /repos/{owner}/{repo}/git/commits/{sha}`;
+// measured 2026-11-13: en_ust 1088141193 → [c20a06c5…, 3aea90c6…], en_twl
+// 12f3911ded → [45714ba1…]). Issue #1349 uses it for a commit that changed no
+// file we track, so no path-scoped listing shows its parents. Null on any
+// failure, a timeout, or a body without a `parents` array of shas: every caller
+// reads null as "unknown", never as "no parents".
+export async function fetchCommitParents(
+  env: Env,
+  repo: string,
+  sha: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<string[] | null> {
+  const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
+  const url =
+    `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
+    `/git/commits/${encodeURIComponent(sha)}?stat=false&verification=false&files=false`;
+  try {
+    const r = await fetch(url, {
+      headers,
+      ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+    });
+    if (!r.ok) return null;
+    const body = (await r.json()) as Record<string, unknown>;
+    if (!Array.isArray(body.parents)) return null;
+    const parents: string[] = [];
+    for (const p of body.parents as unknown[]) {
+      const s = p != null && typeof p === "object" ? (p as Record<string, unknown>).sha : null;
+      if (typeof s !== "string" || s === "") return null;
+      parents.push(s);
+    }
+    return parents;
+  } catch {
+    return null;
+  }
+}
+
 // The git blob sha of ONE file as of a given commit, from the commit's root tree
 // (`GET /repos/{owner}/{repo}/git/trees/{commit sha}` — Gitea resolves a commit
 // sha to its tree; measured 2026-09-02 on en_tq 744f2ee8: 73 entries, `truncated:
@@ -597,6 +636,14 @@ export async function listMasterCommitsSince(
       }
       const allParentShas = parents.map((p) => p?.sha).filter((s): s is string => typeof s === "string");
       const parentSha = allParentShas[0] ?? null;
+      // Issue #1349: allParentShas above silently drops a malformed entry (kept
+      // as is for its existing readers), so a merge can read as single-parent.
+      // Record whether the list was whole, for the reader that proves ancestry.
+      const parentsCheck: "complete" | "malformed" | null = Array.isArray(rawParents)
+        ? completeParentList(parents.map((p) => (p != null && typeof p === "object" && !Array.isArray(p) ? p.sha : null))) != null
+          ? "complete"
+          : "malformed"
+        : null;
       // Only present when the caller asked (`files: true`); `null` distinguishes
       // "asked and got none" from "never asked" (undefined).
       const rawFiles = Array.isArray(raw.files) ? (raw.files as Array<Record<string, unknown>>) : null;
@@ -616,6 +663,7 @@ export async function listMasterCommitsSince(
         committerDate: typeof committer.date === "string" ? committer.date : null,
         parentSha,
         allParentShas,
+        ...(parentsCheck ? { parentsCheck } : {}),
         ...(opts.files === true ? { files } : {}),
       });
     }
