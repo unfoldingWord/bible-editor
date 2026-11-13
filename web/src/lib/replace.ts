@@ -1227,6 +1227,12 @@ function smartRebuildRange(
     return cuts.slice(1).map((end, i) => ({ start: cuts[i], end }));
   });
   if (tokens.length !== matchWords.length) return null;
+  // Top-level line markers and their raw offsets, read before the pairing
+  // below rewrites any leaf's text (a 1:1 swap that changes a word's length
+  // would shift every later offset off the `tokens` coordinates).
+  const topMarkers: { at: number; node: Record<string, unknown> }[] = [];
+  for (let i = 0, pos = 0; i < cloned.length; pos += rebuildRaw([cloned[i]]).length, i++)
+    if (isInertLineBreakMarker(cloned[i])) topMarkers.push({ at: pos, node: cloned[i] as Record<string, unknown> });
   const units: { leaves: ParentLeaf[] }[] = tokens.map(() => ({ leaves: [] }));
   for (const l of inRange) {
     if (!isWordLeaf(l.node)) continue;
@@ -1330,13 +1336,15 @@ function smartRebuildRange(
   // Anchor each new word to the nearest survivor unit edge (left unit's LAST leaf
   // → insert after; else right unit's FIRST leaf → insert before), so it lands
   // INSIDE that milestone and liftEditedOutOfZaln splits the milestone around it.
-  // A new word that replaces old words which all sat after a top-level line
-  // break goes right after that marker instead (the last one at that offset),
-  // so it stays on the old words' line (#1369: `wars. \q1 “Your king` ->
-  // `wars; “the great king` saved `wars; “the great \q1 king`).
-  const topMarkers: { at: number; node: Record<string, unknown> }[] = [];
-  for (let i = 0, pos = 0; i < cloned.length; pos += rebuildRaw([cloned[i]]).length, i++)
-    if (isInertLineBreakMarker(cloned[i])) topMarkers.push({ at: pos, node: cloned[i] as Record<string, unknown> });
+  // A line-leading opener keeps its line: when new words replace old words
+  // that all sat after a top-level marker whose line starts with an opener
+  // (`\q1 “`, lifted off the marker above), and the new words start with an
+  // opener too, they go right after that marker (the last one at that
+  // offset) (#1369: `wars. \q1 “Your king` -> `wars; “the great king` saved
+  // `wars; “the great \q1 king`). With no opener the new words may belong on
+  // the line before (`throne. \q1 And he` -> `throne for ever; he`), so they
+  // keep the nearest-survivor anchoring.
+  const opensWith = (s: string) => s !== "" && OPENING_PUNCT_RE.test(s[0]);
   const markerBefore = (j: number): Record<string, unknown> | null => {
     let jL = j - 1;
     while (jL >= 0 && link[jL] < 0) jL--;
@@ -1345,9 +1353,11 @@ function smartRebuildRange(
     const oldL = jL >= 0 ? link[jL] : -1;
     const oldR = jR < replaceWords.length ? link[jR] : matchWords.length;
     if (oldR - oldL < 2) return null; // no old word dropped here
+    if (!opensWith(splitGapAtMarker(gaps[jL + 1]).rest)) return null;
     const from = oldL >= 0 ? tokens[oldL].end : rawStart;
     const to = tokens[oldL + 1].start;
-    return topMarkers.filter((m) => m.at >= from && m.at <= to).pop()?.node ?? null;
+    const m = topMarkers.filter((x) => x.at >= from && x.at <= to).pop();
+    return m && opensWith(raw.slice(m.at, to)) ? m.node : null;
   };
   for (const nw of newWords) {
     let anchor: Record<string, unknown> | null = markerBefore(nw.j);
