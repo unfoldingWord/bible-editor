@@ -478,13 +478,17 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
 }
 
 // #1366 item 7 (the issue's comment): `home He` -> `home; she too` beside a
-// word label whose line marker has no text beside it. The new words replace
-// `He`, the first word of the speech, but the engine anchored them to the kept
-// `home` and saved them before the label and its line break. They now go after
-// the label (`home; \sp … \q1 she too ran`), and the words the replace did not
-// touch keep their alignment.
+// word label. The new words replace `He`, the first word of the speech, but
+// the engine anchored them to the kept `home` and saved them before the label
+// and its line break, in the narrator's line. Which new words start the speech
+// can't be told in general (`home again. She`, `home. Yes, she`), so a
+// find/replace is saved only where that is unambiguous: a plain deletion, or a
+// one-for-one replacement on each side of the break (a recase too). Otherwise,
+// when a word right after the break was replaced or removed and new words would
+// sit before the label, it is refused (label-moved) and the verse is untouched.
+// A typed edit shows the break, so the translator's placement holds.
 {
-  console.log("\n[#1366 item 7] New words replacing the first word after a label's line break go after the label");
+  console.log("\n[#1366 item 7] Find/replace across a label's line break saves only where the speech's start is unambiguous");
   const label = () => ({ tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("man"), t("\n")], endTag: "" });
   const q1 = () => ({ tag: "q1", type: "quote" });
   const flat = (n) => (n.tag === "sp" ? " [SP] " : n.tag === "q1" ? " \\q1 " : (n.text ?? "") + (n.children ?? []).map(flat).join(""));
@@ -496,76 +500,53 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     const re = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
     return findReplaceVerse(JSON.parse(JSON.stringify(content)), plain, re, at, find.length, replacement);
   };
+  const bare = { verseObjects: [w("A"), t(" "), w("home"), label(), q1(), w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
+  const beside = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label(), q1(), w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
+  const aligned = {
+    verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), label(), q1(), zaln("H3", [w("He")]), t(" "), zaln("H4", [w("ran")]), t(" "), zaln("H5", [w("home")]), t(".")],
+  };
+  const both = { verseObjects: [w("A"), t(" "), w("home"), t(" "), w("now"), label(), q1(), w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
+  const opener = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label(), { tag: "q1", type: "quote", text: "“" }, w("He"), t(" "), w("ran"), t(".”")] };
   const warn = console.warn;
   console.warn = () => {};
   try {
-    // The issue's tree: unaligned words, a bare marker.
-    const bare = { verseObjects: [w("A"), t(" "), w("home"), label(), q1(), w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
-    const r1 = run(bare, "home He", "home; she too");
-    check(r1.labelRefusals === undefined && words(r1.content) === "A home; [SP] \\q1 she too ran home.",
-      `bare marker: "she too" saved after the label (got ${JSON.stringify(words(r1.content))}, refused=${r1.labelRefusals})`);
-    // Text beside the marker (`home.⏎ \sp … \q1 He`): the same move.
-    const beside = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label(), q1(), w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
-    const r2 = run(beside, "home. He", "home; she too");
-    check(r2.labelRefusals === undefined && words(r2.content) === "A home; [SP] \\q1 she too ran home.",
-      `text beside the marker: "she too" saved after the label (got ${JSON.stringify(words(r2.content))})`);
-    // Aligned words: only the replaced "He" loses its alignment.
-    const aligned = {
-      verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), label(), q1(), zaln("H3", [w("He")]), t(" "), zaln("H4", [w("ran")]), t(" "), zaln("H5", [w("home")]), t(".")],
-    };
-    const r3 = run(aligned, "home He", "home; she too");
-    check(r3.labelRefusals === undefined && words(r3.content) === "A home; [SP] \\q1 she too ran home.",
-      `aligned: "she too" saved after the label (got ${JSON.stringify(words(r3.content))})`);
-    check(JSON.stringify(alignedWords(r3.content).filter((x) => !x.endsWith(":"))) === JSON.stringify(["A:H1", "home:H2", "The:", "man:", "ran:H4", "home:H5"].filter((x) => !x.endsWith(":"))),
-      `aligned: every untouched word keeps its alignment (got ${JSON.stringify(alignedWords(r3.content))})`);
-    // Old words on both sides of the line break replaced by words the engine
-    // put all before it: which of them starts the speech can't be told, so
-    // the replace is refused rather than guessed.
-    const both = { verseObjects: [w("A"), t(" "), w("home"), t(" "), w("now"), label(), q1(), w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
-    const r4 = run(both, "now He", "then she too");
-    const kept4 = words(r4.content);
-    check(r4.labelRefusals === 1 || /\[SP\] \\q1 (she|then)/.test(kept4) && !/she.*\[SP\]/.test(kept4),
-      `old words on both sides of the break: refused, or no word of the speech before the label (got ${JSON.stringify(kept4)}, refused=${r4.labelRefusals})`);
-    // One for one on each side (#1361 pairs equal counts): saved, each new
-    // word on its old word's side.
-    const r6 = run(both, "now He", "then she");
-    check(r6.labelRefusals === undefined && words(r6.content) === "A home then [SP] \\q1 she ran home.", `one for one across the break: saved in place (got ${JSON.stringify(words(r6.content))})`);
-    // The first new word a recase of the old one ("He" -> "he too"): "he" is
-    // kept, so it and "too" stay after the label.
-    const r7 = run(bare, "home He", "home; he too");
-    check(r7.labelRefusals === undefined && words(r7.content) === "A home; [SP] \\q1 he too ran home.", `recase plus a new word: saved after the label (got ${JSON.stringify(words(r7.content))})`);
-    // The speech opens with a quote parked on the \q1 (`\q1 “He`): the quote
-    // goes after the break with the new words, not in front of the label.
-    const opener = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label(), { tag: "q1", type: "quote", text: "“" }, w("He"), t(" "), w("ran"), t(".”")] };
-    const r8 = run(opener, "home. “He", "home; “she too");
-    check(r8.labelRefusals === undefined && words(r8.content) === "A home; [SP] \\q1 “she too ran.”", `opening quote: saved after the label with the new words (got ${JSON.stringify(words(r8.content))})`);
-    // Review of #1366: a word added on the narrator's side stays there. The
-    // break goes after the last punctuation among the new words, so only the
-    // words that start the speech move after the label.
-    const r9 = run(beside, "home. He", "home again. She");
-    check(r9.labelRefusals === undefined && words(r9.content) === "A home again. [SP] \\q1 She ran home.", `"home again. She": "again" stays before the label (got ${JSON.stringify(words(r9.content))}, refused=${r9.labelRefusals})`);
-    // A word added in front of the kept first word of the speech ("He" -> "And
-    // he", "he" kept) goes after the label with it.
-    const r10 = run(beside, "home. He", "home. And he");
-    check(r10.labelRefusals === undefined && words(r10.content) === "A home. [SP] \\q1 And he ran home.", `"home. And he": "And" goes after the label (got ${JSON.stringify(words(r10.content))})`);
-    // No punctuation to tell where the speech starts: the speech's new words
-    // never land before the label (here the engine already puts them after it;
-    // had it put them before, the replace is refused rather than guessed).
-    const r11 = run(bare, "home He", "home she too");
-    check(r11.labelRefusals === 1 ? r11.plainText === extractPlainText(bare) : words(r11.content) === "A home [SP] \\q1 she too ran home.",
-      `"home she too" with no punctuation: saved after the label or refused (got ${JSON.stringify(words(r11.content))}, refused=${r11.labelRefusals})`);
-    // The engine put the new words before the break and no punctuation says
-    // where the speech starts ("home. He" -> "home now she"): refused.
-    const r12 = run(beside, "home. He", "home now she");
-    check(r12.labelRefusals === 1 && r12.plainText === extractPlainText(beside), `"home now she": refused, verse untouched (got ${JSON.stringify(words(r12.content))}, refused=${r12.labelRefusals})`);
+    // Refused: the speech's first word replaced, new words would sit before the label.
+    for (const [name, content, find, replacement] of [
+      ["the issue's case, bare marker", bare, "home He", "home; she too"],
+      ["text beside the marker", beside, "home. He", "home; she too"],
+      ["aligned words", aligned, "home He", "home; she too"],
+      ["a word added on the narrator's side", beside, "home. He", "home again. She"],
+      ["a word added in front of the speech", beside, "home. He", "home. Yes, she"],
+      ["no punctuation", beside, "home. He", "home now she"],
+      ["an opening quote on the \\q1", opener, "home. “He", "home; “she too"],
+      ["words on both sides, not one for one", both, "now He", "then she too"],
+    ]) {
+      const r = run(content, find, replacement);
+      check(r.labelRefusals === 1 && r.plainText === extractPlainText(content) && words(r.content) === words(content),
+        `${name}: "${find}" -> "${replacement}" refused, verse untouched (got ${JSON.stringify(words(r.content))}, refused=${r.labelRefusals})`);
+    }
+    // Saved, unambiguous.
+    for (const [name, content, find, replacement, want] of [
+      ["one for one after the break", beside, "home. He", "home. She", "A home. [SP] \\q1 She ran home."],
+      ["one for one on each side", both, "now He", "then she", "A home then [SP] \\q1 she ran home."],
+      ["a recase plus a new word (he kept)", bare, "home He", "home; he too", "A home; [SP] \\q1 he too ran home."],
+      ["the engine already puts the new words after the break", bare, "home He", "home she too", "A home [SP] \\q1 she too ran home."],
+      ["a word added before the kept \"he\", bare marker", bare, "He", "And he", "A home [SP] \\q1 And he ran home."],
+      ["a plain deletion", bare, "home He", "home", "A home [SP] \\q1 ran home."],
+    ]) {
+      const r = run(content, find, replacement);
+      check(r.labelRefusals === undefined && words(r.content) === want, `${name}: "${find}" -> "${replacement}" saved as ${JSON.stringify(want)} (got ${JSON.stringify(words(r.content))}, refused=${r.labelRefusals})`);
+    }
+    // An insertion at the break with nothing replaced is not refused: saved
+    // where the engine puts it, which here is before the label. Known gap,
+    // pinned so a change shows (review round 2 of #1366).
+    const ins = run(beside, "home. He", "home. And he");
+    check(ins.labelRefusals === undefined && words(ins.content) === "A home. And [SP] \\q1 he ran home.", `insertion at the break ("home. And he"): saved where the engine puts it (got ${JSON.stringify(words(ins.content))})`);
     // A typed edit shows the line break, so the translator's placement holds:
     // words typed before it stay before the label.
     const old = extractEditableText(beside);
     const typed = smartEditVerse(JSON.parse(JSON.stringify(beside)), old, old.replace("home. \\q1 He", "home; she too \\q1"), { capturedFromDom: true });
     check(!typed.labelRefused && words(typed.content) === "A home; she too [SP] \\q1 ran home.", `typed: words placed before the break stay there (got ${JSON.stringify(words(typed.content))})`);
-    // A plain deletion of the speech's first word still saves as before.
-    const r5 = run(bare, "home He", "home");
-    check(r5.labelRefusals === undefined && words(r5.content) === "A home [SP] \\q1 ran home.", `deleting "He": saved, label in place (got ${JSON.stringify(words(r5.content))})`);
   } finally {
     console.warn = warn;
   }

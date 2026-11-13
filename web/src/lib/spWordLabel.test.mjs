@@ -316,6 +316,15 @@ const v4 = nestWordLabels(verse("4"));
   const eolEdit = editHeaderBand(eol, { index: 0, tag: "sp", text: "The lady thinks" });
   assert(labelBytes(eolEdit) === labelBytes(eol).replace("\\w woman|", "\\w lady|"), `footnote at a line end: editing the word after it changes only that word (got ${json(labelBytes(eolEdit))})`);
   assert(editHeaderBand(eol, { index: 0, tag: "sp", text: "The woman thinks" }) === eol, "footnote at a line end: an unchanged band save hands back the same verse");
+  // Review round 2 of #1366: a `nextChar` that is not whitespace is not band
+  // text (the edit's baseline leaves it out too), so the two agree, an
+  // unchanged save changes nothing, and a word edit keeps it byte for byte.
+  const punct = [{ tag: "sp", endTag: "", children: [{ text: "The", tag: "w", type: "word", occurrence: "1", occurrences: "1" }, { tag: "f", type: "footnote", content: "+ \\ft N.", endTag: "f*", nextChar: ";" }, { type: "text", text: " " }, { text: "woman", tag: "w", type: "word", occurrence: "1", occurrences: "1" }, { type: "text", text: "\n" }] }, { tag: "q1", type: "quote" }, { text: "Hi", tag: "w", type: "word", occurrence: "1", occurrences: "1" }];
+  const pText = splitSectionHeaders(punct).sections[0].text;
+  assert(pText === "The woman", `a punctuation nextChar is not band text (got ${json(pText)})`);
+  assert(editHeaderBand(punct, { index: 0, tag: "sp", text: pText }) === punct, "punctuation nextChar: an unchanged band save hands back the same verse");
+  const pEdit = editHeaderBand(punct, { index: 0, tag: "sp", text: "The lady" });
+  assert(labelBytes(pEdit) === labelBytes(punct).replace("\\w woman|", "\\w lady|"), `punctuation nextChar: a word edit keeps it byte for byte (got ${json(labelBytes(pEdit))})`);
 }
 
 // #1366 item 3: only character and note markers join a label's run. `\va`,
