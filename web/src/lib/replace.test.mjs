@@ -14,7 +14,7 @@ import {
   __reanchorMarkersForTest as reanchorMarkers,
   __stripMarkerTokensForTest as stripMarkerTokens,
 } from "./replace.ts";
-import { extractEditableText, extractPlainText } from "./usfm.ts";
+import { extractEditableText, extractPlainText, nestWordLabels } from "./usfm.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 import { OPENING_PUNCT_RE } from "./openingPunct.ts";
 import { curlifyVerseContent } from "./curlyVerse.ts";
@@ -4084,6 +4084,67 @@ function countAllMilestones(nodes) {
     const main = smartReplaceVerse(clone(plain), lady, /man/g, lady.indexOf("man"), 3, "boy", { findReplace: true });
     assert(r.staleRefused === undefined && extractEditableText(r.content) === extractEditableText(main.content),
       `no header label, stale text: as main's engine (got ${JSON.stringify(extractEditableText(r.content))}, main ${JSON.stringify(extractEditableText(main.content))})`);
+  }
+}
+
+// Case 97: a `\sp` label written as words (#1350). The import nests the label's
+// `\w` words into the `sp` node (nestWordLabels), so plain and editable text
+// skip them; the engine must too, or its raw text holds the label words and an
+// edit lands on the wrong word (the #1311 failure). Real Door43 en_ust SNG 1:1
+// (label at the verse end) and 1:4 (four labels, one with \zaln milestones).
+// Every edit must leave each label node exactly as it was: same words, same
+// attributes, so the export still writes Door43's `\sp \w The\w* …` bytes.
+{
+  console.log("\n[Case 97] Edits beside a \\sp label written as words leave the label exactly as it was (#1350)");
+  const sng = usfm.toJSON(readFileSync(resolve(repoRoot, "api/src/fixtures/sng-sp-labels.usfm.txt"), "utf8")).chapters["1"];
+  const verseOf = (v) => ({ verseObjects: nestWordLabels(sng[v].verseObjects) });
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const labels = (content) => JSON.stringify(content.verseObjects.filter((n) => n && n.tag === "sp"));
+  const render = (content) => usfm.toUSFM({ headers: [], chapters: { 1: { 1: content } } }, { forcedNewLines: true });
+  const labelBlocks = (content) => content.verseObjects.filter((n) => n && n.tag === "sp").map((n) => render({ verseObjects: [n] }));
+  const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.length}`).join("|");
+  const v1 = verseOf("1");
+  const v4 = verseOf("4");
+  const p1 = extractPlainText(v1);
+  const p4 = extractPlainText(v4);
+  assert(p1 === "This is King Solomon’s most beautiful song.", `setup: 1:1 plain skips the label (got ${JSON.stringify(p1)})`);
+
+  // Find/replace after a label: "to" in "a king to me" (the label before it
+  // holds two "to"s of its own).
+  {
+    const at = p4.indexOf("king to") + 5;
+    for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+      const r = fn(clone(v4), p4, /to/g, at, 2, "for");
+      const want = p4.slice(0, at) + "for" + p4.slice(at + 2);
+      assert(extractPlainText(r.content) === want, `${entry}: to -> for after the labels edits the picked word (got ${JSON.stringify(extractPlainText(r.content))})`);
+      assert(labels(r.content) === labels(v4), `${entry}: to -> for: every label is unchanged`);
+      assert(JSON.stringify(labelBlocks(r.content)) === JSON.stringify(labelBlocks(v4)), `${entry}: to -> for: the labels render to the same USFM`);
+    }
+  }
+  // Find/replace of the last word before a label at the verse end.
+  {
+    const at = p1.indexOf("song");
+    const r = findReplaceVerse(clone(v1), p1, /song/g, at, 4, "poem");
+    assert(extractPlainText(r.content) === "This is King Solomon’s most beautiful poem.", `find song -> poem before the label (got ${JSON.stringify(extractPlainText(r.content))})`);
+    assert(labels(r.content) === labels(v1), "find song -> poem: the label is unchanged");
+  }
+  // Typed edits: a word change after a label, a deletion before one.
+  {
+    const old = extractEditableText(v4);
+    assert(!/speaking/.test(old), `setup: 1:4 editable text skips the labels (got ${JSON.stringify(old)})`);
+    const r = smartEditVerse(clone(v4), old, old.replace("king to me", "king for me"), { capturedFromDom: true });
+    assert(extractEditableText(r.content) === old.replace("king to me", "king for me"), `typed to -> for (got ${JSON.stringify(extractEditableText(r.content))})`);
+    assert(labels(r.content) === labels(v4), "typed to -> for: every label is unchanged");
+    const before = words(v4).split("|").filter((x) => !x.startsWith("to:")).join("|");
+    const after = words(r.content).split("|").filter((x) => !x.startsWith("to:") && !x.startsWith("for:")).join("|");
+    assert(after === before, `typed to -> for: untouched words keep their alignment (got ${after})`);
+    const old1 = extractEditableText(v1);
+    const d = smartEditVerse(clone(v1), old1, old1.replace(" beautiful", ""), { capturedFromDom: true });
+    assert(extractEditableText(d.content) === old1.replace(" beautiful", ""), `typed delete before the label (got ${JSON.stringify(extractEditableText(d.content))})`);
+    assert(labels(d.content) === labels(v1), "typed delete before the label: the label is unchanged");
+    // Retyping the whole verse runs the reassembly and diff tiers end to end.
+    const all = smartEditVerse(clone(v1), old1, "This is a song by King Solomon.", { capturedFromDom: true });
+    assert(labels(all.content) === labels(v1), `typed rewrite of 1:1: the label is unchanged (got ${labels(all.content)})`);
   }
 }
 

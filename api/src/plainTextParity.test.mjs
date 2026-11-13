@@ -9,10 +9,11 @@
 // calls stale. This test feeds both the same verse trees and asserts the same
 // text.
 //
-// Not covered by either copy: a label written as words (`\sp \w The\w* …`,
-// 37 of the 41 labels in en_ust Song of Songs on 2026-11-13). usfm-js parses
-// that as an empty `sp` node followed by ordinary body words, so both copies
-// keep those words as verse text.
+// A label written as words (`\sp \w The\w* …`, 37 of the 41 labels in en_ust
+// Song of Songs on 2026-11-13) parses as an empty `sp` node followed by
+// ordinary body words. The import nests those words into the `sp` node
+// (nestWordLabels, #1350), so both copies skip them; the real-SNG cases at the
+// end pin that.
 //
 // scripts/import-book.mjs has a third copy. It runs top-level code on import
 // (reads argv, writes SQL), so it can't be imported here; it uses the
@@ -21,8 +22,9 @@
 // Run from api/: node --experimental-strip-types --no-warnings src/plainTextParity.test.mjs
 
 import usfm from "usfm-js";
-import { extractPlainText as apiExtract, extractVersesForRange } from "./importParsers.ts";
-import { extractPlainText as webExtract } from "../../web/src/lib/usfm.ts";
+import { readFileSync } from "node:fs";
+import { extractPlainText as apiExtract, extractVersesForRange, nestWordLabels as apiNest } from "./importParsers.ts";
+import { extractPlainText as webExtract, nestWordLabels as webNest } from "../../web/src/lib/usfm.ts";
 
 let passed = 0;
 let failed = 0;
@@ -106,6 +108,27 @@ const v2 = verses.find((v) => v.verse === 2);
 check(v2 && !/The man/.test(v2.plainText), `import path 1:2: no \\sp label text in the stored plain text (got ${JSON.stringify(v2?.plainText)})`);
 // usfm-js itself parses the sample the way the hand-built cases assume.
 check(usfm.toJSON(src).chapters["1"]["2"].verseObjects.some((n) => n.tag === "sp" && typeof n.text === "string"), "usfm-js parks \\sp on text");
+
+// Real Song of Songs labels written as words (#1350): a trimmed copy of the
+// Door43 en_ust file (SNG 1:1 with one label, 1:4 with four, one of them
+// holding \zaln milestones). The stored plain text skips every label, and the
+// two copies of the nest agree.
+{
+  const sng = readFileSync(new URL("./fixtures/sng-sp-labels.usfm.txt", import.meta.url), "utf8");
+  const rows = extractVersesForRange(sng, 1, 1);
+  const byVerse = (n) => rows.find((r) => r.verse === n);
+  check(byVerse(1)?.plainText === "This is King Solomon’s most beautiful song.", `SNG 1:1 plain text skips the word label (got ${JSON.stringify(byVerse(1)?.plainText)})`);
+  check(byVerse(4) && !/speaking|herself|Jerusalem speaking/.test(byVerse(4).plainText), `SNG 1:4 plain text skips all four word labels (got ${JSON.stringify(byVerse(4)?.plainText)})`);
+  for (const r of rows) {
+    const tree = JSON.parse(r.contentJson);
+    check(r.plainText === apiExtract(tree) && r.plainText === webExtract(tree), `SNG ${r.chapter}:${r.verse}: stored, api and web plain text agree`);
+  }
+  const raw = usfm.toJSON(sng).chapters["1"];
+  for (const v of Object.keys(raw)) {
+    const vos = raw[v].verseObjects;
+    check(JSON.stringify(apiNest(vos)) === JSON.stringify(webNest(vos)), `SNG 1:${v}: api and web nestWordLabels agree`);
+  }
+}
 
 if (failed > 0) {
   console.error(`\nplainTextParity: ${failed} check(s) failed, ${passed} passed.`);
