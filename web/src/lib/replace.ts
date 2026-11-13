@@ -24,6 +24,7 @@ import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 import { hoistOpeningPunctuation, concatVerseText, OPENING_PUNCT_RE } from "./openingPunct.ts";
 import { WORD_CHAR, WORD_RUN_RE } from "./wordRun.ts";
+import { curlifyString } from "./curlyQuotes.ts";
 
 export interface SmartReplaceResult {
   content: unknown;
@@ -1345,6 +1346,13 @@ function smartRebuildRange(
   // the line before (`throne. \q1 And he` -> `throne for ever; he`), so they
   // keep the nearest-survivor anchoring.
   const opensWith = (s: string) => s !== "" && OPENING_PUNCT_RE.test(s[0]);
+  // The opener typed before new word j, curled as find/replace will curl
+  // the result tree (#1378): a translator types a straight `"`/`'` in the
+  // Replace box, and the stored line opener is curly.
+  const typedLead = (j: number): string => {
+    const { closing, rest } = splitGapAtMarker(gaps[j]);
+    return curlifyString(rest, closing !== "" ? closing[closing.length - 1] : j > 0 ? replaceWords[j - 1].slice(-1) : undefined);
+  };
   const markerBefore = (j: number): Record<string, unknown> | null => {
     let jL = j - 1;
     while (jL >= 0 && link[jL] < 0) jL--;
@@ -1353,7 +1361,7 @@ function smartRebuildRange(
     const oldL = jL >= 0 ? link[jL] : -1;
     const oldR = jR < replaceWords.length ? link[jR] : matchWords.length;
     if (oldR - oldL < 2) return null; // no old word dropped here
-    if (!opensWith(splitGapAtMarker(gaps[jL + 1]).rest)) return null;
+    if (!opensWith(typedLead(jL + 1))) return null;
     const from = oldL >= 0 ? tokens[oldL].end : rawStart;
     const to = tokens[oldL + 1].start;
     const m = topMarkers.filter((x) => x.at >= from && x.at <= to).pop();
@@ -1373,7 +1381,7 @@ function smartRebuildRange(
     const to = tokens[oldR].start;
     const m = topMarkers.find((x) => x.at >= from && x.at <= to);
     const lead = m ? raw.slice(m.at, to).trim() : "";
-    return m && opensWith(lead) && splitGapAtMarker(gaps[jR]).rest.trim() === lead ? m.node : null;
+    return m && opensWith(lead) && typedLead(jR).trim() === lead ? m.node : null;
   };
   for (const nw of newWords) {
     let anchor: Record<string, unknown> | null = markerBefore(nw.j);
