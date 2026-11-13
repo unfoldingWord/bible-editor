@@ -26,7 +26,7 @@
 // alignment), unchanged for callers / UI.
 
 import { nfc } from "./hebrew.ts";
-import { extractPlainText, PARAGRAPH_TAGS } from "./usfm.ts";
+import { extractPlainText, PARAGRAPH_TAGS, isWordLabelNode } from "./usfm.ts";
 import { tokenizeEditableText } from "./replace.ts";
 
 export interface SourceWord {
@@ -775,7 +775,25 @@ export function parseAlignment(
 
   const base = { stream, sourceGroups };
   if (!sourceVerseObjects) return finalize(base);
-  return finalize(withSourceCoverage(base, sourceVerseObjects));
+  return finalize(withSourceCoverage(base, sourceVerseObjects, labelSources(reformed)));
+}
+
+// The source words aligned inside `\sp` labels written as words (#1350; SNG
+// 1:4 aligns one). The label rides through the aligner as one opaque marker,
+// so its milestones make no card; without this their source words looked
+// unaligned and got an empty card, and aligning one again wrote a second
+// milestone for the same source word.
+function labelSources(nodes: ParsedNode[]): SourceWord[] {
+  const out: SourceWord[] = [];
+  const collect = (ns: ParsedNode[]): void => {
+    for (const n of ns ?? []) {
+      if (!n || typeof n !== "object") continue;
+      if (nodeIsZaln(n)) out.push(sourceOf(n));
+      if (Array.isArray(n["children"])) collect(n["children"] as ParsedNode[]);
+    }
+  };
+  for (const n of nodes) if (isWordLabelNode(n)) collect((n["children"] as ParsedNode[] | undefined) ?? []);
+  return out;
 }
 
 // Result cache for verseHasUnalignedWork, keyed on the identity of the target
@@ -1473,6 +1491,9 @@ function pickBestAssignment(
 function withSourceCoverage(
   base: Omit<AlignmentState, "groups" | "unaligned">,
   sourceVerseObjects: unknown[],
+  // Source words already aligned where the aligner shows no card (inside a
+  // word label): covered, so no placeholder.
+  alsoCovered: SourceWord[] = [],
 ): Omit<AlignmentState, "groups" | "unaligned"> {
   const sourceWords = collectAlignerSourceWords(sourceVerseObjects);
   if (sourceWords.length === 0) return base;
@@ -1507,6 +1528,9 @@ function withSourceCoverage(
     for (const s of g.source) {
       for (const p of coveredPositions(sourceWords, s)) covered.add(p);
     }
+  }
+  for (const s of alsoCovered) {
+    for (const p of coveredPositions(sourceWords, s)) covered.add(p);
   }
   // Keyed by textKey (NFC) — textOccurrence was counted per textKey in
   // collectAlignerSourceWords, so totals must use the same key or two raw-different
