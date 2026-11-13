@@ -1847,7 +1847,23 @@ export function editHeaderBand(verseObjects: unknown[], change: { index: number;
 }
 
 function editWordLabel(node: Record<string, unknown>, text: string): Record<string, unknown> {
-  const words = { verseObjects: node["children"] as unknown[] };
+  // usfm-js parks the whitespace after a closed marker (a footnote's `\f*`) on
+  // its `nextChar`, which the engine's text skips: the words on either side
+  // then read as one, and editing one of them merged both (#1366; `The\f…\f*⏎
+  // woman` -> "Thelady"). For the edit that whitespace is a text node of its
+  // own, as headerLabelText reads it; usfm-js renders both the same. Only where
+  // it is the sole space between them: a text node starting with whitespace
+  // after it already parts the words.
+  const all = node["children"] as unknown[];
+  const kids = all.flatMap((c, i) => {
+    const o = c as Record<string, unknown> | null;
+    if (!o || o["type"] === "word" || typeof o["nextChar"] !== "string" || !/^\s+$/.test(o["nextChar"] as string)) return [c];
+    const next = all[i + 1] as Record<string, unknown> | undefined;
+    if (next && next["type"] === "text" && /^\s/.test(String(next["text"] ?? ""))) return [c];
+    const { nextChar, ...rest } = o;
+    return [rest, { type: "text", text: nextChar }];
+  });
+  const words = { verseObjects: kids };
   const old = extractEditableText(words);
   if (normalizeEditable(text) === normalizeEditable(old)) return node;
   const result = smartEditVerse(words, old, text);
