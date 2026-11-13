@@ -72,6 +72,42 @@ function setup(storage) {
   assert(list(h) === "", "verse -> note in the same verse adds no entry");
 }
 
+// --- #1376: time on the verse counts for a note focused there ---
+// Sit on 4:8, click a note there, and follow its see-how link within a second.
+// The note is where Back must return, even though it was held under SETTLE_MS.
+{
+  const { h, visit, wait } = setup();
+  visit(verse(4, 8));
+  h.observe(note(4, 8, "ccxv"));
+  wait(800);
+  h.observe(verse(4, 6));
+  assert(list(h) === "4:8n" && h.view().entries[0].rowId === "ccxv", "note focused late on a settled verse is recorded when left quickly");
+}
+
+// --- #1376: clicking through notes on one verse adds one entry, not many ---
+{
+  const { h, visit, wait } = setup();
+  visit(verse(4, 8));
+  for (const id of ["a", "b", "c", "d"]) {
+    h.observe(note(4, 8, id));
+    wait(400);
+  }
+  h.observe(verse(4, 6));
+  assert(list(h) === "4:8n" && h.view().entries[0].rowId === "d", "rapid note focus on one verse records only the last note");
+}
+
+// --- #1376: the verse clock does not carry across verses ---
+{
+  const { h, visit, wait } = setup();
+  visit(verse(1, 1));
+  h.observe(verse(2, 2)); // records 1:1
+  wait(300);
+  h.observe(note(2, 2, "n1"));
+  wait(300);
+  h.observe(verse(2, 3));
+  assert(list(h) === "1:1", "a note focused on a passed-through verse is not recorded");
+}
+
 // --- going back keeps the entries ahead, and moves the marker ---
 {
   const { h, visit } = setup();
