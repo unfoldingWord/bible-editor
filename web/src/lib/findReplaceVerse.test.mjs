@@ -517,7 +517,6 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
       ["aligned words", aligned, "home He", "home; she too"],
       ["a word added on the narrator's side", beside, "home. He", "home again. She"],
       ["no punctuation", beside, "home. He", "home now she"],
-      ["an opening quote on the \\q1", opener, "home. “He", "home; “she too"],
       ["words on both sides, not one for one", both, "now He", "then she too"],
     ]) {
       const r = run(content, find, replacement);
@@ -533,6 +532,8 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
       ["the engine already puts the new words after the break", bare, "home He", "home she too", "A home [SP] \\q1 she too ran home."],
       ["a word added before the kept \"he\", bare marker", bare, "He", "And he", "A home [SP] \\q1 And he ran home."],
       ["a plain deletion", bare, "home He", "home", "A home [SP] \\q1 ran home."],
+      // #1373 lays new words after a quote-led line's marker, so they land after the label.
+      ["an opening quote on the \\q1 (after #1373)", opener, "home. “He", "home; “she too", "A home; [SP] \\q1 “she too ran.”"],
     ]) {
       const r = run(content, find, replacement);
       check(r.labelRefusals === undefined && words(r.content) === want, `${name}: "${find}" -> "${replacement}" saved as ${JSON.stringify(want)} (got ${JSON.stringify(words(r.content))}, refused=${r.labelRefusals})`);
