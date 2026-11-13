@@ -6,8 +6,10 @@
 import type { Env } from "./index";
 import {
   LINEAGE_REFINE_MAX_HUMAN_COMMITS,
+  MAX_MERGE_PARENTS,
   mergeRefEvidence,
   parseDiffHunksForPath,
+  refsDifferingFromEveryParent,
   refsTouchedInTsv,
   refsTouchedInUsfm,
   type HumanRefEvidence,
@@ -735,6 +737,49 @@ export async function fetchHumanTouchedRefs(
     if (!FULL_SHA_RE.test(sha)) {
       parts.push({ complete: false, refs: [], reason: "abbreviated_sha" });
       break;
+    }
+    // A merge commit (issue #1348). Its `.diff` is against the first parent
+    // only, so mapping it would credit the merge with everything its other
+    // parent brought in (our own export, in the EZK UST 48:13 incident). Read
+    // the file at the merge and at every parent instead, and keep only the refs
+    // that differ from all of them (refsDifferingFromEveryParent). Same
+    // subrequest count as an ordinary commit (diff + new + old = 3) for the
+    // usual two parents: the merge's file plus one per parent, no diff. A file
+    // byte-identical to one parent's means the merge authored nothing in it,
+    // which skips the per-ref compare. Parents unknown (undefined, e.g. a
+    // ledger row written before migration 0078) keep the single-parent path.
+    const mergeParents = Array.isArray(c.allParentShas) && c.allParentShas.length > 1 ? c.allParentShas : null;
+    if (mergeParents) {
+      if (mergeParents.length > MAX_MERGE_PARENTS) {
+        parts.push({ complete: false, refs: [], reason: "too_many_merge_parents" });
+        break;
+      }
+      const parentShas = mergeParents.map((p) => (typeof p === "string" ? p.toLowerCase() : ""));
+      if (parentShas.some((p) => !FULL_SHA_RE.test(p))) {
+        parts.push({ complete: false, refs: [], reason: "abbreviated_sha" });
+        break;
+      }
+      const mergeText = await fetchCappedText(env, dcsRawUrl(env, repo, path, sha), MAX_REVISION_FILE_BYTES);
+      if (mergeText == null) {
+        parts.push({ complete: false, refs: [], reason: "revision_fetch_failed" });
+        break;
+      }
+      const parentTexts: string[] = [];
+      for (const p of parentShas) {
+        const t = await fetchCappedText(env, dcsRawUrl(env, repo, path, p), MAX_REVISION_FILE_BYTES);
+        if (t == null) break;
+        parentTexts.push(t);
+      }
+      if (parentTexts.length !== parentShas.length) {
+        parts.push({ complete: false, refs: [], reason: "parent_revision_fetch_failed" });
+        break;
+      }
+      const mapped = parentTexts.includes(mergeText)
+        ? { complete: true, refs: [], reason: "" }
+        : refsDifferingFromEveryParent(isUsfm ? "usfm" : "tsv", mergeText, parentTexts);
+      parts.push(mapped);
+      if (mapped.complete !== true) break;
+      continue;
     }
     const diffUrl = `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}/git/commits/${sha}.diff`;
     const diff = await fetchCappedText(env, diffUrl, MAX_COMMIT_DIFF_BYTES);
