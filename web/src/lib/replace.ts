@@ -1652,6 +1652,80 @@ function markerKeepsItsWords(before: { words: string[]; markerAt: number[] }, af
   return true;
 }
 
+// New words that replace the first word(s) after a label's line marker belong
+// after the label (#1366). When the old and new word counts differ, the engine
+// anchors the new words to the nearest kept word before them, so `home \sp …
+// \q1 He ran` -> `home; she too ran` saved `she too` before the label and its
+// line break, in the narrator's line. Line marker `ordinal` sits between kept
+// words; this looks at the words between them:
+// - only words after the marker were replaced (none before it), and new words
+//   now sit before it: the after-word index the marker must move back to;
+// - words on both sides were replaced, and the new words are not one for one
+//   on each side: "refuse" (which of them start the speech can't be told);
+// - otherwise null: nothing to do.
+function speechStartFix(
+  before: { words: string[]; markerAt: number[] },
+  after: { words: string[]; markerAt: number[] },
+  map: number[],
+  ordinal: number,
+): number | "refuse" | null {
+  const p = before.markerAt[ordinal];
+  const q = after.markerAt[ordinal];
+  let a = p - 1;
+  while (a >= 0 && map[a] < 0) a--;
+  let b = p;
+  while (b < before.words.length && map[b] < 0) b++;
+  const oldBefore = p - a - 1;
+  const oldAfter = b - p;
+  const start = a >= 0 ? map[a] + 1 : 0;
+  const end = b < before.words.length ? map[b] : after.words.length;
+  const newBefore = q - start;
+  const newAfter = end - q;
+  if (oldAfter === 0 || newBefore <= 0) return null;
+  if (oldBefore === 0) return start;
+  return newBefore === oldBefore && newAfter === oldAfter ? null : "refuse";
+}
+
+// The verse with its `ordinal`-th top-level line marker moved back to just
+// before body word `wordIndex` (splitting a text node there if need be), or
+// null when that can't be done at the top level (the word sits inside a
+// milestone or wrapper, or another line marker is in the way). The words
+// themselves must come out exactly as they were.
+function moveLineMarkerBefore(vo: unknown[], ordinal: number, wordIndex: number): unknown[] | null {
+  const want = bodyWordLayout(vo).words;
+  let mi = -1;
+  for (let i = 0, m = 0; i < vo.length; i++) {
+    if (isTopLineMarker(vo[i]) && m++ === ordinal) {
+      mi = i;
+      break;
+    }
+  }
+  if (mi < 0) return null;
+  const marker = vo[mi];
+  const rest = [...vo.slice(0, mi), ...vo.slice(mi + 1)];
+  const fits = (candidate: unknown[]): boolean => {
+    const l = bodyWordLayout(candidate);
+    return l.markerAt[ordinal] === wordIndex && JSON.stringify(l.words) === JSON.stringify(want);
+  };
+  // From the marker backwards: the latest place where `wordIndex` words come
+  // before it, so punctuation after the kept word stays in front of the break.
+  for (let i = mi - 1; i >= 0; i--) {
+    if (isTopLineMarker(rest[i])) return null;
+    const n = rest[i] as Record<string, unknown> | null;
+    if (n && n["type"] === "text" && typeof n["text"] === "string") {
+      const text = n["text"] as string;
+      const starts = [...text.matchAll(/\S+/g)].map((m) => m.index ?? 0).filter((c) => c > 0).reverse();
+      for (const c of starts) {
+        const candidate = [...rest.slice(0, i), { ...n, text: text.slice(0, c) }, marker, { ...n, text: text.slice(c) }, ...rest.slice(i + 1)];
+        if (fits(candidate)) return candidate;
+      }
+    }
+    const candidate = [...rest.slice(0, i), marker, ...rest.slice(i)];
+    if (fits(candidate)) return candidate;
+  }
+  return null;
+}
+
 function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult): SmartReplaceResult {
   const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(vo) || !vo.some(isSpeakerLabelNode)) return run(content);
@@ -1685,15 +1759,31 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
   const result = run(shown);
   // The engine changed nothing (it hands its input back): so does this.
   if (result.content === shown) return { ...result, content };
-  const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  let out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(out)) return refuse("label-shape", "no verse tree");
+  // A label's line marker moved back over new words (speechStartFix): the
+  // plain text is then re-read from the final tree.
+  let markerMoved = false;
   const restored: unknown[] = [];
   if (labels.length === 0) restored.push(...out);
   else {
     if (out.filter(isTopLineMarker).length !== markers) return refuse("line-breaks", "the verse's line markers changed");
     const before = bodyWordLayout(stripped);
-    const after = bodyWordLayout(out);
+    let after = bodyWordLayout(out);
     const map = matchWords(before.words, after.words);
+    // New words replacing the first word of a speech go after its label
+    // (#1366): move the label's line marker back in front of them.
+    for (const l of labels) {
+      if (l.anchor === "end") continue;
+      const fix = speechStartFix(before, after, map, l.anchor);
+      if (fix === null) continue;
+      if (fix === "refuse") return refuse("label-moved", "words on both sides of a label's line break were replaced");
+      const moved = moveLineMarkerBefore(out, l.anchor, fix);
+      if (!moved) return refuse("label-moved", "new words before a label's line break can't be moved after it");
+      out = moved;
+      after = bodyWordLayout(out);
+      markerMoved = true;
+    }
     for (const l of labels) {
       if (l.anchor !== "end" && !markerKeepsItsWords(before, after, map, l.anchor)) {
         return refuse("label-moved", "a label's line marker moved to other words");
@@ -1715,7 +1805,8 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
   if (spTexts(restored) !== spTexts(vo)) return refuse("label-lost", "a label would be dropped or changed");
   // Renumbering the label words too is intended (#1354): Door43 counts a word
   // over the whole verse, label included, so the export must as well.
-  return { ...result, content: { ...(result.content as Record<string, unknown>), verseObjects: renumberTargetOccurrences(restored) } };
+  const final = { ...(result.content as Record<string, unknown>), verseObjects: renumberTargetOccurrences(restored) };
+  return { ...result, content: final, ...(markerMoved ? { plainText: extractPlainText(final) } : {}) };
 }
 
 // A header-band edit (Shell.tsx saveSectionEdit): the `change.index`-th header
@@ -1761,7 +1852,10 @@ function editWordLabel(node: Record<string, unknown>, text: string): Record<stri
   if (normalizeEditable(text) === normalizeEditable(old)) return node;
   const result = smartEditVerse(words, old, text);
   const children = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  return Array.isArray(children) ? { ...node, children } : node;
+  // The engine handed the words back unchanged (#1366): keep the label as it
+  // is, so editHeaderBand returns the verse itself and no save is queued.
+  if (!Array.isArray(children) || JSON.stringify(children) === JSON.stringify(node["children"])) return node;
+  return { ...node, children };
 }
 
 function smartReplaceVerseInner(

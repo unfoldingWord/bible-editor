@@ -487,15 +487,8 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   console.log("\n[#1366 item 7] New words replacing the first word after a label's line break go after the label");
   const label = () => ({ tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("man"), t("\n")], endTag: "" });
   const q1 = () => ({ tag: "q1", type: "quote" });
-  const words = (content) => {
-    const out = [];
-    for (const n of content.verseObjects) {
-      if (n.tag === "sp") out.push("[SP]");
-      else if (n.tag === "q1") out.push("\\q1");
-      else for (const x of extractPlainText({ verseObjects: [n] }).split(/\s+/).filter(Boolean)) out.push(x);
-    }
-    return out.join(" ");
-  };
+  const flat = (n) => (n.tag === "sp" ? " [SP] " : n.tag === "q1" ? " \\q1 " : (n.text ?? "") + (n.children ?? []).map(flat).join(""));
+  const words = (content) => content.verseObjects.map(flat).join("").replace(/\s+/g, " ").trim();
   const run = (content, find, replacement) => {
     const plain = extractPlainText(content);
     const at = plain.indexOf(find);
@@ -533,6 +526,10 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     const kept4 = words(r4.content);
     check(r4.labelRefusals === 1 || /\[SP\] \\q1 (she|then)/.test(kept4) && !/she.*\[SP\]/.test(kept4),
       `old words on both sides of the break: refused, or no word of the speech before the label (got ${JSON.stringify(kept4)}, refused=${r4.labelRefusals})`);
+    // One for one on each side (#1361 pairs equal counts): saved, each new
+    // word on its old word's side.
+    const r6 = run(both, "now He", "then she");
+    check(r6.labelRefusals === undefined && words(r6.content) === "A home then [SP] \\q1 she ran home.", `one for one across the break: saved in place (got ${JSON.stringify(words(r6.content))})`);
     // A plain deletion of the speech's first word still saves as before.
     const r5 = run(bare, "home He", "home");
     check(r5.labelRefusals === undefined && words(r5.content) === "A home [SP] \\q1 ran home.", `deleting "He": saved, label in place (got ${JSON.stringify(words(r5.content))})`);
