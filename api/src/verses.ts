@@ -12,7 +12,7 @@ import {
 } from "./chapterLock";
 import { bookLockStatement, evaluateBookLock, bookLockedResponseBody, BOOK_LOCKED_STATUS, type BookLockRow } from "./bookLock";
 import { broadcastChapter } from "./wsEvents";
-import { recomputeTargetOccurrences } from "./importParsers";
+import { recomputeTargetOccurrences, nestWordLabels, extractPlainText } from "./importParsers";
 import {
   CorruptContentJsonError,
   corruptContentJsonBody,
@@ -323,7 +323,20 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   // were rejected above. Mutates parsed.data.content.verseObjects in place.
   normalizeOccurrences(parsed.data.content);
 
-  const existing = (existingRes.results?.[0] as VerseRow | undefined) ?? null;
+  // A `\sp` label written as words, sent FLAT (an empty `sp` node, its words
+  // as body words): a queued op from before the nest that "my edit wins"
+  // sends as is, or a history restore of a pre-nest version. Store it nested
+  // like every import does (nestWordLabels, #1350), and re-derive plain_text
+  // from the nested tree, since the client's still holds the label words
+  // (#1354). A tree that is already nested, or has no such label, comes back
+  // as the same array and is stored exactly as sent.
+  const nestedVos = nestWordLabels(parsed.data.content.verseObjects);
+  if (nestedVos !== parsed.data.content.verseObjects) {
+    parsed.data.content.verseObjects = nestedVos as typeof parsed.data.content.verseObjects;
+    parsed.data.plain_text = extractPlainText(parsed.data.content);
+  }
+
+  const existing =(existingRes.results?.[0] as VerseRow | undefined) ?? null;
 
   // Create the chapter-intro row on first write (#379). A chapter's opening
   // paragraph marker lives BEFORE `\v 1`, so it is stored on the chapter-front
