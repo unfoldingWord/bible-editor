@@ -4860,10 +4860,11 @@ function countAllMilestones(nodes) {
   const typedUsfm = toUsfm(typed.content);
   assert(typedUsfm.includes(String.raw`\w Body|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\f + \ft note\f*` + "\n" + String.raw`\w less|`),
     `typed more -> less: the footnote and its line break export unchanged (got ${JSON.stringify(typedUsfm)})`);
-  // A typed punctuation edit away from the footnote: the export differs only
-  // there, and in the line break after `\f*`, which the whole-verse punctuation
-  // relayout re-lays as the typed space (it does the same to every gap; usfm-js
-  // already reads a line break inside a text node as a space).
+  // A typed punctuation edit away from the footnote: usfm-js's own toUSFM
+  // differs only there and in the line break after `\f*`, which the
+  // whole-verse punctuation relayout re-lays as the typed space. The real
+  // export (buildUsfm) writes a line break there either way; plainTextParity
+  // pins that the export differs only in the edit.
   const away = smartEditVerse(clone(content), old, "Body more!", { capturedFromDom: true });
   assert(toUsfm(away.content) === exported.replace(String.raw`\zaln-e\*.`, String.raw`\zaln-e\*!`).replace(String.raw`\f*` + "\n", String.raw`\f* `),
     `typed . -> !: the export is byte-identical apart from the edit (got ${JSON.stringify(toUsfm(away.content))})`);
@@ -4873,6 +4874,17 @@ function countAllMilestones(nodes) {
   assert(extractPlainText(fr.content) === "Body less." && fr.plainText === "Body less.", `find/replace more -> less saves "Body less." (got ${JSON.stringify(extractPlainText(fr.content))} / ${JSON.stringify(fr.plainText)})`);
   assert(strongsOf(fr.content).join() === "Body:H1", `find/replace more -> less: Body stays aligned (got ${JSON.stringify(strongsOf(fr.content))})`);
   assert(toUsfm(fr.content).includes(String.raw`\f + \ft note\f*` + "\n" + String.raw`\w less|`), `find/replace more -> less: the footnote and its line break export unchanged (got ${JSON.stringify(toUsfm(fr.content))})`);
+  // Rows stored before #1372 keep the fused "Bodymore." as their plain text,
+  // which find/replace matches on: the engine still finds the right words.
+  const staleMore = findReplaceVerse(clone(content), "Bodymore.", /more/g, 4, 4, "less");
+  assert(extractPlainText(staleMore.content) === "Body less." && strongsOf(staleMore.content).join() === "Body:H1",
+    `stale "Bodymore.": find/replace more -> less saves "Body less." with Body aligned (got ${JSON.stringify(extractPlainText(staleMore.content))}, ${JSON.stringify(strongsOf(staleMore.content))})`);
+  const staleBody = findReplaceVerse(clone(content), "Bodymore.", /Body/g, 0, 4, "Some");
+  assert(extractPlainText(staleBody.content) === "Some more." && strongsOf(staleBody.content).join() === "more:H2",
+    `stale "Bodymore.": find/replace Body -> Some saves "Some more." with more aligned (got ${JSON.stringify(extractPlainText(staleBody.content))}, ${JSON.stringify(strongsOf(staleBody.content))})`);
+  const staleAll = replaceAllInVerse(clone(content), "Bodymore.", /more/g, 1, "less");
+  assert(extractPlainText(staleAll.content) === "Body less." && strongsOf(staleAll.content).join() === "Body:H1" && toUsfm(staleAll.content).includes(String.raw`\f + \ft note\f*` + "\n" + String.raw`\w less|`),
+    `stale "Bodymore.": replace-all more -> less saves "Body less.", Body aligned, footnote kept (got ${JSON.stringify(toUsfm(staleAll.content))})`);
 }
 
 if (failed > 0) {

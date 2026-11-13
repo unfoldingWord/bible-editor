@@ -24,7 +24,8 @@
 import usfm from "usfm-js";
 import { readFileSync } from "node:fs";
 import { extractPlainText as apiExtract, extractVersesForRange, nestWordLabels as apiNest } from "./importParsers.ts";
-import { extractPlainText as webExtract, nestWordLabels as webNest } from "../../web/src/lib/usfm.ts";
+import { extractPlainText as webExtract, extractEditableText, nestWordLabels as webNest } from "../../web/src/lib/usfm.ts";
+import { smartEditVerse } from "../../web/src/lib/replace.ts";
 import { buildUsfm } from "./export.ts";
 
 let passed = 0;
@@ -239,8 +240,9 @@ check(usfm.toJSON(src).chapters["1"]["2"].verseObjects.some((n) => n.tag === "sp
 // A footnote at the end of a USFM line (#1372). usfm-js parks the line break
 // after `\f*` on the footnote's `nextChar`, not in a text node, so a walk that
 // reads only `text` fused the words on either side: "Bodymore.". Both copies
-// read a note's whitespace `nextChar` as the separator it is. 27 of 61
-// footnotes in nine sampled en_ult / en_ust books on 2026-11-13 had this shape.
+// read a note's whitespace `nextChar` as the separator it is. In nine sampled
+// en_ult / en_ust books on 2026-11-13: 83 footnotes, 61 with a whitespace
+// `nextChar`, 27 fusing two words, in 22 of 12,566 verses.
 {
   const src = String.raw`\c 1
 \p
@@ -260,6 +262,23 @@ check(usfm.toJSON(src).chapters["1"]["2"].verseObjects.some((n) => n.tag === "sp
   check(out.includes(String.raw`\zaln-e\*\f + \ft note\f*` + "\n" + String.raw`\zaln-s |x-strong="H2"`), `export keeps the line break after the line-end footnote (got ${JSON.stringify(out.slice(out.indexOf("\\v 1"), out.indexOf("\\v 2")))})`);
   const again = extractVersesForRange(out, 1, 1).filter((v) => v.verse >= 1);
   check(again[0]?.plainText === "Body more.", `line-end footnote: export -> import reads "Body more." (got ${JSON.stringify(again[0]?.plainText)})`);
+  // An edit in the editor splits the line break into a text node of its own
+  // (withNoteSeparators in web/src/lib/replace.ts). The export of the edited
+  // verse differs from the original only in the edit itself.
+  const exportOf = (content) => {
+    const o = buildUsfm({ book: "GEN", bibleVersion: "ULT", headers: null, verses: [{ ...rows[0], content_json: JSON.stringify(content), plain_text: webExtract(content) }] });
+    return o.slice(o.indexOf("\\v 1"));
+  };
+  const original = JSON.parse(ext[0].contentJson);
+  const base = exportOf(original);
+  const old = extractEditableText(original);
+  for (const [label, typed, want] of [
+    ["typed . -> !", "Body more!", base.replace(String.raw`\zaln-e\*.`, String.raw`\zaln-e\*!`)],
+    ["typed more -> less", "Body less.", base.replace(/\\zaln-s \|x-strong="H2"[^*]*\\\*\\w more\|([^\\]*)\\w\*\\zaln-e\\\*/, String.raw`\w less|$1\w*`)],
+  ]) {
+    const edited = smartEditVerse(JSON.parse(ext[0].contentJson), old, typed, { capturedFromDom: true }).content;
+    check(exportOf(edited) === want, `line-end footnote, ${label}: the export differs only in the edit (got ${JSON.stringify(exportOf(edited))}, want ${JSON.stringify(want)})`);
+  }
 }
 
 if (failed > 0) {
