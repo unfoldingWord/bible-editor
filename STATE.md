@@ -844,7 +844,16 @@ Highlights that bite repeatedly:
   `api/src/plainTextParity.test.mjs` pins the two copies together. Prod had no `\sp` verse as of 2026-11-12, and
   all ~400 header-label verses matched. `findReplaceVerse` now refuses such a verse visibly ("saved search text is
   out of date"): guessing where the match sits failed review twice, and counting occurrences edited the wrong word.
-  A label written as words (`\sp \w The\w* …`, most of en_ust SNG) parses as body words in every extractor.
+- **A `\sp` label written as words is stored nested in its label node (#1350).** Door43 en_ust SNG writes 37 of
+  its 41 labels as `\sp \w The|…\w* …`; usfm-js parses that as an empty `sp` node plus body words. The import
+  (`nestWordLabels`, last step of `extractVersesForRange`, mirrored in `web/src/lib/usfm.ts` and called by the
+  import scripts) moves the words into the node as `children` with `endTag: ""`, which usfm-js renders back byte
+  for byte. Every skip keyed on `isHeaderLabelNode` then covers it, but any walker that descends `children`
+  generically still sees the label words: the edit engine does, so `smartEditVerse` / `smartReplaceVerse` show it
+  each word label as a plain-text `{tag:"sp", text}` for the edit and put the words back after. Door43 and the
+  export count `x-occurrence` over the whole verse, label words included, so an edit to a word a label also holds
+  renumbers the label's copy. One SNG 1:4 label holds `\zaln` milestones (label words aligned on Door43); they ride
+  along untouched. A header-band edit of a word label writes plain `\sp text` (the words are dropped).
 - **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in
   local D1 for a live test is overwritten before the test starts. Run a one-off spec with a config that spreads
   `playwright.config.ts` and sets `globalSetup: undefined` (measured 2026-11-12).
