@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, isHeaderLabelNode, isWordLabelNode, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, isHeaderLabelNode, isWordLabelNode, isSpeakerLabelNode, headerLabelText, rewriteHeaderLabel, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 import { hoistOpeningPunctuation, concatVerseText, OPENING_PUNCT_RE } from "./openingPunct.ts";
@@ -47,8 +47,9 @@ export interface SmartReplaceResult {
 //   "label-moved"  a line break moved, so a label would no longer sit between
 //                  the same words (or a word would cross it);
 //   "label-shape"  the verse has a label that is not followed by a line break,
-//                  so no edit to it can keep the label in place.
-export type LabelRefusalReason = "line-breaks" | "label-moved" | "label-shape";
+//                  so no edit to it can keep the label in place;
+//   "label-lost"   the edit would drop a label or change its text (#1354).
+export type LabelRefusalReason = "line-breaks" | "label-moved" | "label-shape" | "label-lost";
 
 // The words a refusal toast gives for each reason ("Not saved: this edit in
 // SNG 1:4 UST <this>.").
@@ -58,6 +59,8 @@ export function labelRefusalText(reason: LabelRefusalReason | undefined): string
       return "would move a speaker label (a line break added or removed in a verse with a speaker label can't be saved yet)";
     case "label-shape":
       return "is in a verse whose speaker label has no line break after it (such a verse can't be edited here yet)";
+    case "label-lost":
+      return "would remove or change a speaker label";
     default:
       return "would move a speaker label, or a word to the other side of it";
   }
@@ -1455,8 +1458,13 @@ export function smartReplaceVerse(
 // find/replace "home He" -> "home; he" saves "he" before the line break,
 // which here would put a word of the speech in front of its label (the same
 // move at a marker with text beside it, ZEC 9:10 UST "wars. Your" -> "wars;
-// your", was fixed in smartRebuildRange, #1360). A verse with
-// no word label runs the engine exactly as before.
+// your", was fixed in smartRebuildRange, #1360).
+//
+// A `\sp` label written as plain text (`\sp The woman`, isSpeakerLabelNode) is
+// held aside the same way (#1354): shown to the engine, the punctuation
+// relayout blanked every such label in the verse, and an edit across one
+// ("bedroom. We" -> "bedroom; we", SNG 1:4) dropped all of them. A verse with
+// no `\sp` label runs the engine exactly as before.
 function isTopLineMarker(n: unknown): boolean {
   return isInFlowMarker(n) && !isCharacterWrapper(n);
 }
@@ -1531,24 +1539,28 @@ function markerKeepsItsWords(before: { words: string[]; markerAt: number[] }, af
 
 function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult): SmartReplaceResult {
   const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  if (!Array.isArray(vo) || !vo.some(isWordLabelNode)) return run(content);
+  if (!Array.isArray(vo) || !vo.some(isSpeakerLabelNode)) return run(content);
   const refuse = (reason: LabelRefusalReason, why: string): SmartReplaceResult => {
-    console.warn(`[replace] edit refused: it would change a speaker label written as words (${why}) (#1350).`);
+    console.warn(`[replace] edit refused: it would change a speaker label (${why}) (#1350, #1354).`);
     return { content, plainText: extractPlainText(content), preservedAlignment: true, labelRefused: true, labelRefusedReason: reason };
   };
   // Take the labels out; `anchor` is the ordinal of the line marker that
-  // follows (the markers seen so far), or "end".
+  // follows (the markers seen so far), or "end". A plain-text label in any
+  // other place (not a shape USFM gives, so not in Door43) stays in the verse
+  // for the engine, as before #1354; the check at the end still refuses an edit
+  // that would drop or change it.
   const labels: { node: unknown; anchor: number | "end" }[] = [];
   const stripped: unknown[] = [];
   let markers = 0;
   for (let i = 0; i < vo.length; i++) {
     const n = vo[i];
-    if (isWordLabelNode(n)) {
+    if (isSpeakerLabelNode(n)) {
       let j = i + 1;
-      while (j < vo.length && isWordLabelNode(vo[j])) j++;
+      while (j < vo.length && isSpeakerLabelNode(vo[j])) j++;
       if (j >= vo.length) labels.push({ node: n, anchor: "end" });
       else if (isTopLineMarker(vo[j])) labels.push({ node: n, anchor: markers });
-      else return refuse("label-shape", "a label not followed by a line marker");
+      else if (isWordLabelNode(n)) return refuse("label-shape", "a label not followed by a line marker");
+      else stripped.push(n);
       continue;
     }
     if (isTopLineMarker(n)) markers++;
@@ -1560,26 +1572,81 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
   if (result.content === shown) return { ...result, content };
   const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(out)) return refuse("label-shape", "no verse tree");
-  if (out.filter(isTopLineMarker).length !== markers) return refuse("line-breaks", "the verse's line markers changed");
-  const before = bodyWordLayout(stripped);
-  const after = bodyWordLayout(out);
-  const map = matchWords(before.words, after.words);
-  for (const l of labels) {
-    if (l.anchor !== "end" && !markerKeepsItsWords(before, after, map, l.anchor)) {
-      return refuse("label-moved", "a label's line marker moved to other words");
-    }
-  }
   const restored: unknown[] = [];
-  let m = 0;
-  for (const n of out) {
-    if (isTopLineMarker(n)) {
-      for (const l of labels) if (l.anchor === m) restored.push(l.node);
-      m++;
+  if (labels.length === 0) restored.push(...out);
+  else {
+    if (out.filter(isTopLineMarker).length !== markers) return refuse("line-breaks", "the verse's line markers changed");
+    const before = bodyWordLayout(stripped);
+    const after = bodyWordLayout(out);
+    const map = matchWords(before.words, after.words);
+    for (const l of labels) {
+      if (l.anchor !== "end" && !markerKeepsItsWords(before, after, map, l.anchor)) {
+        return refuse("label-moved", "a label's line marker moved to other words");
+      }
     }
-    restored.push(n);
+    let m = 0;
+    for (const n of out) {
+      if (isTopLineMarker(n)) {
+        for (const l of labels) if (l.anchor === m) restored.push(l.node);
+        m++;
+      }
+      restored.push(n);
+    }
+    for (const l of labels) if (l.anchor === "end") restored.push(l.node);
   }
-  for (const l of labels) if (l.anchor === "end") restored.push(l.node);
+  // Every `\sp` label comes back with its text, in order: an edit never drops
+  // or blanks one (#1354).
+  const spTexts = (nodes: unknown[]) => JSON.stringify(nodes.filter((n) => (n as { tag?: unknown } | null)?.tag === "sp").map(headerLabelText));
+  if (spTexts(restored) !== spTexts(vo)) return refuse("label-lost", "a label would be dropped or changed");
+  // Renumbering the label words too is intended (#1354): Door43 counts a word
+  // over the whole verse, label included, so the export must as well.
   return { ...result, content: { ...(result.content as Record<string, unknown>), verseObjects: renumberTargetOccurrences(restored) } };
+}
+
+// A header-band edit (Shell.tsx saveSectionEdit): the `change.index`-th header
+// label of the verse (in the order splitSectionHeaders lists them) gets a new
+// tag and text, or is removed when `tag` is null. Returns the verse's new
+// verseObjects, or `verseObjects` itself when nothing changed.
+//
+// A `\sp` label written as words keeps its words (#1354): the edit runs the
+// edit engine on the label's own words, so each unchanged word keeps its `\w`
+// attributes and any `\zaln` around it, and only a changed word loses its
+// alignment, the rule a body edit follows. Its footnotes and character markers
+// stay. The occurrence numbers are then counted over the whole verse, label
+// included, as Door43 counts them. Any other label, a retag (the dropdown
+// offers only s1/s2/s3, which hold plain text) or a blank text is written by
+// rewriteHeaderLabel as before.
+export function editHeaderBand(verseObjects: unknown[], change: { index: number; tag: string | null; text: string }): unknown[] {
+  const next: unknown[] = [];
+  let changed = false;
+  let wordLabel = false;
+  let at = 0;
+  for (const node of verseObjects) {
+    const o = node as Record<string, unknown> | null;
+    if (o && isHeaderLabelNode(o) && at++ === change.index) {
+      if (isWordLabelNode(o)) wordLabel = true;
+      if (change.tag === null) {
+        changed = true;
+        continue;
+      }
+      const edited = isWordLabelNode(o) && change.tag === o["tag"] && change.text.trim() !== "" ? editWordLabel(o, change.text) : rewriteHeaderLabel(o, change.tag, change.text);
+      if (edited !== o) changed = true;
+      next.push(edited);
+      continue;
+    }
+    next.push(node);
+  }
+  if (!changed) return verseObjects;
+  return wordLabel ? renumberTargetOccurrences(next) : next;
+}
+
+function editWordLabel(node: Record<string, unknown>, text: string): Record<string, unknown> {
+  const words = { verseObjects: node["children"] as unknown[] };
+  const old = extractEditableText(words);
+  if (normalizeEditable(text) === normalizeEditable(old)) return node;
+  const result = smartEditVerse(words, old, text);
+  const children = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  return Array.isArray(children) ? { ...node, children } : node;
 }
 
 function smartReplaceVerseInner(

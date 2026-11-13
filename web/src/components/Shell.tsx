@@ -57,9 +57,9 @@ import { BookLocksDialog } from "./BookLocksDialog";
 import { shouldApplyUpsert } from "./rowUpsertGuard";
 import { drafts, verseKey, rowKey as draftRowKey, pinVerseBase, pinEpoch, unpinVerseBaseIfIdle, holdVerseBaseForEditor, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
-import { smartEditVerse, labelRefusalText } from "../lib/replace";
+import { smartEditVerse, labelRefusalText, editHeaderBand } from "../lib/replace";
 import { adoptBaseQuotes, curlifyVerseContent } from "../lib/curlyVerse";
-import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, rewriteHeaderLabel } from "../lib/usfm";
+import { extractEditableText, extractPlainText, normalizeEditable } from "../lib/usfm";
 import { chapterOpensWithoutMarker, introEditBase } from "../lib/verseIntro";
 import { verseHasUnalignedWork, countUnalignedTargetWords } from "../lib/alignment";
 import { versionNeedingAlignment } from "../lib/alignerVersion";
@@ -4537,24 +4537,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   ) => {
     const verseObjects = (base.content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return;
-    // Walk verseObjects in order; the index counter advances each time
-    // we hit a section heading. On match: swap (tag/text) or splice out.
-    const next: unknown[] = [];
-    let sectionIdx = 0;
-    for (const node of verseObjects) {
-      const o = node as Record<string, unknown> | null;
-      if (o && isHeaderLabelNode(o)) {
-        if (sectionIdx === change.index) {
-          // Tag/text swap; see rewriteHeaderLabel for the node shape it writes.
-          if (change.tag !== null) next.push(rewriteHeaderLabel(o, change.tag, change.text));
-          // null tag → drop the node entirely.
-          sectionIdx++;
-          continue;
-        }
-        sectionIdx++;
-      }
-      next.push(node);
-    }
+    // Swap the change.index-th heading's tag/text, or drop it (null tag). A
+    // `\sp` label written as words keeps its words and their alignment; see
+    // editHeaderBand.
+    const next = editHeaderBand(verseObjects, change);
     const newContent = { ...(base.content as Record<string, unknown> | null), verseObjects: next };
     const newPlainText = extractPlainText(newContent);
     const newDto = {

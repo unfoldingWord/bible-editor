@@ -3709,7 +3709,10 @@ function countAllMilestones(nodes) {
     }
   }
   // Edge whitespace that touches the label from either side keeps it whole.
-  for (const [find, repl, ed] of [["said ", "", "The woman \\q1 the man ran."], ["said ", "said, ", "The woman said, \\q1 the man ran."], [" the", "", "The woman said \\q1 man ran."]]) {
+  // Since #1354 the label is held aside for the edit, so " the" -> "" gives
+  // what the engine gives on the same verse with no label: the "\n" before the
+  // \q1 goes with the space (the plain text is the same).
+  for (const [find, repl, ed] of [["said ", "", "The woman \\q1 the man ran."], ["said ", "said, ", "The woman said, \\q1 the man ran."], [" the", "", "The woman said\\q1 man ran."]]) {
     const r = findReplaceVerse(clone(verse), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
     assert(extractEditableText(r.content) === ed && labels(r.content) === labels(verse),
       `${JSON.stringify(find)} -> ${JSON.stringify(repl)} at the label: ${JSON.stringify(ed)}, label whole (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
@@ -3719,17 +3722,21 @@ function countAllMilestones(nodes) {
   // label differential: ` {to` -> ``). The start moved past the label, so the
   // raw range lost the match's leading space, which read as a bare seam: the
   // guard refused the result and the verse was flattened, label and all. Main
-  // dropped only the `\q2` (whose `{` the replace removed). Now as main.
+  // dropped only the `\q2` (whose `{` the replace removed). Since #1354 the
+  // label is anchored to that `\q2`, so dropping it is refused like any line
+  // break removed in a labelled verse: the verse comes back untouched.
   {
     const isaLike = { verseObjects: [zaln("H0", [w("bare")]), t(" "), zaln("H1", [w("hill")]), t("\n"), sp(), { tag: "q2", type: "quote", text: "{" },
       zaln("H2", [w("to"), t(" "), w("signal")]), t("}!\n"), q1(), zaln("H3", [w("Shout")]), t(".")] };
     const p = extractPlainText(isaLike);
     const at = p.indexOf(" {to");
+    const warn = console.warn;
+    console.warn = () => {};
     const r = findReplaceVerse(clone(isaLike), p, / \{to/g, at, 4, "");
-    assert(extractPlainText(r.content) === "bare hill signal}! Shout.", `" {to" -> "" after the label: text (got ${JSON.stringify(extractPlainText(r.content))})`);
+    console.warn = warn;
+    assert(r.labelRefusals === 1 && extractPlainText(r.content) === p, `" {to" -> "" after the label: refused, text kept (got ${JSON.stringify(extractPlainText(r.content))})`);
     assert(labels(r.content) === labels(isaLike), `" {to" -> "" after the label: label kept (got ${labels(r.content)})`);
-    assert(/\\q1/.test(extractEditableText(r.content)) && words(r.content).startsWith("bare:H0|hill:H1|"),
-      `" {to" -> "" after the label: the other line break and alignment kept (got ${JSON.stringify(extractEditableText(r.content))} ${words(r.content)})`);
+    assert(JSON.stringify(r.content) === JSON.stringify(isaLike), `" {to" -> "" after the label: the verse is untouched`);
   }
   // A match just before the label leaves it alone too.
   {

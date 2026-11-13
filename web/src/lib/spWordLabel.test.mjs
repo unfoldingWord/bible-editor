@@ -179,16 +179,16 @@ const v4 = nestWordLabels(verse("4"));
     `the aligned words changed: only they lose alignment (got ${zalnIn(labelsOf(girls)[2])})`);
   const noOcc = (k, v) => (k === "occurrence" || k === "occurrences" ? undefined : v);
   for (const [name, out] of [["talking", talk], ["girls", girls]]) {
-    assert(json(labelsOf(out).filter((_, i) => i !== 2), noOcc) === json(labelsOf(v4).filter((_, i) => i !== 2), noOcc), `${name}: the other labels keep their words`);
+    assert(JSON.stringify(labelsOf(out).filter((_, i) => i !== 2), noOcc) === JSON.stringify(labelsOf(v4).filter((_, i) => i !== 2), noOcc), `${name}: the other labels keep their words`);
     assert(renumberTargetOccurrences(out) === out, `${name}: occurrences counted over the whole verse, labels included`);
-    assert(json(out.filter((n) => n.tag !== "sp"), (k, v) => (k === "occurrence" || k === "occurrences" ? undefined : v)) ===
-      json(v4.filter((n) => n.tag !== "sp"), (k, v) => (k === "occurrence" || k === "occurrences" ? undefined : v)),
+    assert(JSON.stringify(out.filter((n) => n.tag !== "sp"), (k, v) => (k === "occurrence" || k === "occurrences" ? undefined : v)) ===
+      JSON.stringify(v4.filter((n) => n.tag !== "sp"), (k, v) => (k === "occurrence" || k === "occurrences" ? undefined : v)),
       `${name}: the body is untouched but for occurrence numbers`);
     const delta = analyzeAlignmentDelta({ verseObjects: v4 }, { verseObjects: out });
     assert(delta.unexpectedLosses.length === 0, `${name}: the save's alignment guard sees no collateral loss (got ${json(delta.unexpectedLosses)})`);
     // Export then import again: the same label, words and alignment.
     const again = nestWordLabels(usfm.toJSON(render(out)).chapters["1"]["1"].verseObjects);
-    assert(json(labelsOf(again)) === json(labelsOf(out)), `${name}: the edited label survives export and re-import`);
+    assert(render(labelsOf(again)) === render(labelsOf(out)) && zalnIn(labelsOf(again)[2]) === zalnIn(labelsOf(out)[2]), `${name}: the edited label survives export and re-import`);
   }
   // The guard sees label words: dropping an aligned label word's milestone with
   // the text unchanged is a loss it reports.
@@ -201,7 +201,7 @@ const v4 = nestWordLabels(verse("4"));
   const s1 = band(v1, 0, "s1", "A heading");
   assert(s1.some((n) => n.tag === "s1" && n.type === "section" && n.content === "A heading\n" && n.children === undefined), `retag to s1: plain heading (got ${json(s1.find((n) => n.tag === "s1"))})`);
   const del = band(v4, 1, null, "");
-  assert(labelsOf(del).length === 3 && json(labelsOf(del), noOcc) === json(labelsOf(v4).filter((_, i) => i !== 1), noOcc) && renumberTargetOccurrences(del) === del,
+  assert(labelsOf(del).length === 3 && JSON.stringify(labelsOf(del), noOcc) === JSON.stringify(labelsOf(v4).filter((_, i) => i !== 1), noOcc) && renumberTargetOccurrences(del) === del,
     "delete removes that one label; occurrences counted again without its words");
 
   // A plain-text label keeps today's band edit.
