@@ -642,6 +642,7 @@ export function FindReplaceOverlay({
         alignmentRefused: number;
         staleRefused?: number;
         labelRefused?: number;
+        labelShapeRefused?: number;
       }
     | {
         scope: "tn";
@@ -702,7 +703,7 @@ export function FindReplaceOverlay({
     // The replace would move a `\sp` speaker label written as words (#1350):
     // nothing is saved; say so.
     if (result.labelRefusals) {
-      setReplaceSummary({ scope: "bible", versesReplaced: 0, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, labelRefused: result.labelRefusals });
+      setReplaceSummary({ scope: "bible", versesReplaced: 0, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, labelRefused: result.labelRefusals, labelShapeRefused: result.labelShapeRefusals });
       return;
     }
     if (result.plainText === text) return;
@@ -747,6 +748,7 @@ export function FindReplaceOverlay({
     let alignmentRefused = 0;
     let staleRefused = 0;
     let labelRefused = 0;
+    let labelShapeRefused = 0;
     for (const [key, list] of byVerse) {
       const [chStr, vStr, bv] = key.split("|");
       const ch = parseInt(chStr, 10);
@@ -764,6 +766,7 @@ export function FindReplaceOverlay({
         preservedAlignment: preservedThisVerse,
         staleRefused: staleRefusedThisVerse,
         labelRefusals: labelRefusalsThisVerse,
+        labelShapeRefusals: labelShapeRefusalsThisVerse,
       } = replaceAllInVerse(verse.content, verse.plain_text ?? "", compiled.re, list.length, replace);
       if (staleRefusedThisVerse) {
         staleRefused += 1;
@@ -771,6 +774,7 @@ export function FindReplaceOverlay({
       }
       // Matches across a word label are left; the verse's other matches still go.
       labelRefused += labelRefusalsThisVerse ?? 0;
+      labelShapeRefused += labelShapeRefusalsThisVerse ?? 0;
       if (plainText === verse.plain_text) continue;
       if (!onReplaceVerse(ch, v, bv, content, plainText, verse)) {
         alignmentRefused += 1;
@@ -779,7 +783,7 @@ export function FindReplaceOverlay({
       versesReplaced += 1;
       if (!preservedThisVerse) alignmentLost += 1;
     }
-    setReplaceSummary({ scope: "bible", versesReplaced, alignmentLost, readOnlySkipped, alignmentRefused, staleRefused, labelRefused });
+    setReplaceSummary({ scope: "bible", versesReplaced, alignmentLost, readOnlySkipped, alignmentRefused, staleRefused, labelRefused, labelShapeRefused });
   };
 
   // ---- Translation-note replace ----------------------------------------
