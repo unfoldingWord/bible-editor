@@ -172,6 +172,12 @@ export function createNavHistory(
   let state: NavView = load(storage);
   let current: NavSpot | null = null;
   let since = 0;
+  // When the person arrived at the current verse. Focusing a note (or another
+  // note) at the same verse restarts `since` but not this, so a note opened
+  // after a long stay on its verse and left at once still counts as settled
+  // when the person moves to another verse (#1376). Moving between rows of one
+  // verse never counts it, so clicking through notes adds no entries.
+  let verseSince = 0;
   // After a jump: where we expect to land. Positions seen on the way there
   // (a chapter loading with the old verse) are not real departures.
   let restoring: { spot: NavSpot; at: number } | null = null;
@@ -203,6 +209,7 @@ export function createNavHistory(
         }
         current = spot;
         since = t;
+        verseSince = t;
         return;
       }
       restoring = null;
@@ -215,15 +222,18 @@ export function createNavHistory(
       }
       // Opening a note inside the verse you were on narrows that spot rather
       // than leaving it, so the bare verse is not worth an entry of its own.
-      const narrowed =
+      const sameVerse =
         current !== null &&
-        !current.kind &&
-        !!spot.kind &&
         current.book === spot.book &&
         current.chapter === spot.chapter &&
         current.verse === spot.verse;
+      const narrowed = sameVerse && !current!.kind && !!spot.kind;
       let entries = [...state.entries];
-      const settled = current !== null && (t - since >= SETTLE_MS || (landed !== null && sameSpot(landed, current)));
+      const settled =
+        current !== null &&
+        (t - since >= SETTLE_MS ||
+          (!sameVerse && t - verseSince >= SETTLE_MS) ||
+          (landed !== null && sameSpot(landed, current)));
       if (current && settled && !narrowed) {
         entries = entries.filter((e) => !sameSpot(e, current!));
         entries.push(current);
@@ -235,6 +245,7 @@ export function createNavHistory(
       const firstSight = current === null;
       current = spot;
       since = t;
+      if (!sameVerse) verseSince = t;
       // Moving on by hand puts the marker back at the newest end; whatever was
       // ahead of it stays in the list as ordinary recent places.
       // The first position seen after a page load is not a move: leave the
