@@ -21,6 +21,7 @@ import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 import { OPENING_PUNCT_RE } from "./openingPunct.ts";
 import { curlifyVerseContent } from "./curlyVerse.ts";
 import { findReplaceVerse, replaceAllInVerse } from "./findReplaceVerse.ts";
+import { renderEditableHTML } from "./highlight.ts";
 import usfm from "usfm-js";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -4820,6 +4821,55 @@ function countAllMilestones(nodes) {
   check("item 5, break at the gap's left edge, Your king -> Your realm", rightEdge, "Your king", "Your realm", /wars\. Your\s*\\q1 realm rules/, ["king"]);
   const leftEdge = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), q1(), zaln("H2", [w("Your")]), t(" "), zaln("H3", [w("king")]), t(" rules.")] };
   check("item 5, break at the gap's left edge, wars Your king -> wars; The king", leftEdge, "wars Your king", "wars; The king", /use in wars;\s*\\q1 The king rules/, ["Your"]);
+}
+
+// Case 102: a footnote at the end of a USFM line (#1372). usfm-js parks the
+// line break after `\f*` on the footnote's `nextChar`, so the words on either
+// side read as one ("Bodymore."): typing over "more" saved "Bodyless." and
+// unaligned both words. Plain, editable and rendered text read the break as a
+// space, and the engine edits with it split into a text node of its own, which
+// exports the same bytes.
+{
+  console.log("\n[Case 102] A footnote at the end of a USFM line separates the words on either side (#1372)");
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const strongsOf = (content) => alignedWords(content).filter((x) => x.strongs.length).map((x) => `${x.text}:${x.strongs.join("+")}`);
+  const toUsfm = (content) => usfm.toUSFM({ headers: [], chapters: { 1: { 1: content } } });
+  const src = String.raw`\c 1
+\p
+\v 1 \zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="a"\*\w Body|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\f + \ft note\f*
+\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="b"\*\w more|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*.
+`;
+  const content = usfm.toJSON(src).chapters["1"]["1"];
+  const note = content.verseObjects.find((n) => n.type === "footnote");
+  assert(note?.nextChar === "\n", `setup: the line break sits on the footnote's nextChar (got ${JSON.stringify(note?.nextChar)})`);
+  const exported = toUsfm(content);
+  const old = extractEditableText(content);
+  assert(extractPlainText(content) === "Body more.", `plain text reads "Body more." (got ${JSON.stringify(extractPlainText(content))})`);
+  assert(old === "Body more.", `editable text reads "Body more." (got ${JSON.stringify(old)})`);
+  // The editor diffs the contenteditable's text against the editable text, so
+  // the render must hold the same space or every save deletes it.
+  const rendered = renderEditableHTML(content.verseObjects, new Set()).replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+  assert(rendered === old, `the editable render reads the same text (got ${JSON.stringify(rendered)})`);
+  // No edit: the verse comes back as it was (nothing queued).
+  const same = smartEditVerse(content, old, old, { capturedFromDom: true });
+  assert(same.content === content, "an unchanged capture returns the verse itself");
+  // A typed edit of the word after the footnote.
+  const typed = smartEditVerse(clone(content), old, "Body less.", { capturedFromDom: true });
+  assert(extractEditableText(typed.content) === "Body less.", `typed more -> less saves "Body less." (got ${JSON.stringify(extractEditableText(typed.content))})`);
+  assert(strongsOf(typed.content).join() === "Body:H1", `typed more -> less: Body stays aligned, only "more" unaligned (got ${JSON.stringify(strongsOf(typed.content))})`);
+  const typedUsfm = toUsfm(typed.content);
+  assert(typedUsfm.includes(String.raw`\w Body|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\f + \ft note\f*` + "\n" + String.raw`\w less|`),
+    `typed more -> less: the footnote and its line break export unchanged (got ${JSON.stringify(typedUsfm)})`);
+  // A typed edit away from the footnote: the export differs only there.
+  const away = smartEditVerse(clone(content), old, "Body more!", { capturedFromDom: true });
+  assert(toUsfm(away.content) === exported.replace(String.raw`\zaln-e\*.`, String.raw`\zaln-e\*!`),
+    `typed . -> !: the export is byte-identical apart from the edit (got ${JSON.stringify(toUsfm(away.content))})`);
+  assert(strongsOf(away.content).join() === "Body:H1,more:H2", `typed . -> !: both words stay aligned (got ${JSON.stringify(strongsOf(away.content))})`);
+  // Find/replace of the word after the footnote, on the stored plain text.
+  const fr = findReplaceVerse(clone(content), "Body more.", /more/g, 5, 4, "less");
+  assert(extractPlainText(fr.content) === "Body less." && fr.plainText === "Body less.", `find/replace more -> less saves "Body less." (got ${JSON.stringify(extractPlainText(fr.content))} / ${JSON.stringify(fr.plainText)})`);
+  assert(strongsOf(fr.content).join() === "Body:H1", `find/replace more -> less: Body stays aligned (got ${JSON.stringify(strongsOf(fr.content))})`);
+  assert(toUsfm(fr.content).includes(String.raw`\f + \ft note\f*` + "\n" + String.raw`\w less|`), `find/replace more -> less: the footnote and its line break export unchanged (got ${JSON.stringify(toUsfm(fr.content))})`);
 }
 
 if (failed > 0) {

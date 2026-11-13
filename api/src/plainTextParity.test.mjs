@@ -25,6 +25,7 @@ import usfm from "usfm-js";
 import { readFileSync } from "node:fs";
 import { extractPlainText as apiExtract, extractVersesForRange, nestWordLabels as apiNest } from "./importParsers.ts";
 import { extractPlainText as webExtract, nestWordLabels as webNest } from "../../web/src/lib/usfm.ts";
+import { buildUsfm } from "./export.ts";
 
 let passed = 0;
 let failed = 0;
@@ -233,6 +234,32 @@ check(usfm.toJSON(src).chapters["1"]["2"].verseObjects.some((n) => n.tag === "sp
     const joined = a[0].children?.some((c) => c.tag === tag) ?? false;
     check(JSON.stringify(a) === JSON.stringify(webNest(vos)) && joined === !["va", "vp", "ca", "fig", "zz"].includes(tag), `\\${tag}: both copies ${joined ? "join" : "leave"} it, as listed`);
   }
+}
+
+// A footnote at the end of a USFM line (#1372). usfm-js parks the line break
+// after `\f*` on the footnote's `nextChar`, not in a text node, so a walk that
+// reads only `text` fused the words on either side: "Bodymore.". Both copies
+// read a note's whitespace `nextChar` as the separator it is. 27 of 61
+// footnotes in nine sampled en_ult / en_ust books on 2026-11-13 had this shape.
+{
+  const src = String.raw`\c 1
+\p
+\v 1 \zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="a"\*\w Body|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\f + \ft note\f*
+\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="b"\*\w more|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*.
+\v 2 \w Body|x-occurrence="1" x-occurrences="1"\w* \f + \ft note\f* \w more|x-occurrence="1" x-occurrences="1"\w*.
+`;
+  const fx = usfm.toJSON(src).chapters["1"];
+  same("footnote at line end, top level (#1372)", fx["1"], "Body more.");
+  same("footnote between spaces stays one space (#1372)", fx["2"], "Body more.");
+  const ext = extractVersesForRange(src, 1, 1).filter((v) => v.verse >= 1);
+  check(ext[0]?.plainText === "Body more.", `import stores "Body more." for a line-end footnote (got ${JSON.stringify(ext[0]?.plainText)})`);
+  // The fix reads the tree and never changes it, so the export keeps the line
+  // break, and the re-imported text reads the same.
+  const rows = ext.map((v) => ({ book: "GEN", chapter: v.chapter, verse: v.verse, verse_end: v.verseEnd, bible_version: "ULT", content_json: v.contentJson, plain_text: v.plainText, version: 1, updated_by: null }));
+  const out = buildUsfm({ book: "GEN", bibleVersion: "ULT", headers: null, verses: rows });
+  check(out.includes(String.raw`\zaln-e\*\f + \ft note\f*` + "\n" + String.raw`\zaln-s |x-strong="H2"`), `export keeps the line break after the line-end footnote (got ${JSON.stringify(out.slice(out.indexOf("\\v 1"), out.indexOf("\\v 2")))})`);
+  const again = extractVersesForRange(out, 1, 1).filter((v) => v.verse >= 1);
+  check(again[0]?.plainText === "Body more.", `line-end footnote: export -> import reads "Body more." (got ${JSON.stringify(again[0]?.plainText)})`);
 }
 
 if (failed > 0) {
