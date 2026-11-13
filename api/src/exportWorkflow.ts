@@ -1081,6 +1081,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         prReason: null,
       };
     }
+    // Only a measured pass clears: a dry run's `ok` above is synthetic.
+    if (dcsAllowed) await this.clearStaleSkipAlert(book, resource);
 
     // Shrink guard — refuse to commit a TSV render that would delete a large
     // fraction of master's rows (truncation backstop; see exportTsvShrinkRefused).
@@ -2474,6 +2476,27 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const withhold = await readSyncWithhold(this.env, book, resource, instanceId);
     const message = staleSkipAlertMessage(book, resource, detail, masterSha, watermark, withhold);
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // Issue #1364: the freshness gate just passed for this (book, resource), so
+  // an undismissed export_stale banner from an earlier night is no longer
+  // true. writeAlert only replaces it when a NEW stale alert is written, so
+  // without this it stood (red) after the pair exported cleanly. DELETE of the
+  // undismissed row, same as the file's other export-alert clears: these rows
+  // have no condition_key, so 0066's resolved_at machinery does not apply, and
+  // a dismissed row stays as writeAlert's dismissal memory (issue #458).
+  // Best-effort like the export_blank clear: a failed DELETE must not fail the
+  // export.
+  private async clearStaleSkipAlert(book: string, resource: Resource): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+      )
+        .bind(EXPORT_ALERT_USERNAME, `export_stale:${book}:${resource}`)
+        .run();
+    } catch (err) {
+      console.error(`export_stale banner clear failed for ${book} ${resource}:`, err);
+    }
   }
 
   // Fetch master's current TSV row count and decide whether this render would
