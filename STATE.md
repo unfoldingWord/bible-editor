@@ -225,9 +225,19 @@ Highlights that bite repeatedly:
   at the marker (#1361). A marker carrying a line-leading opener (`\q1 “`, ZEC 1:14 ULT) in a find/replace range
   is split into marker + text node first (as `liftMarkerText` does for typed saves): the localized rewrite
   dropped such a marker. Words swapped 1:1 across a break keep the old word's leaf (`wars. \q1 Your` ->
-  `wars; The` keeps `\q1 The`); unequal counts still anchor new words to the nearest survivor, so
-  `wars. Your` -> `wars; The great` still saves `The great` before the break. `isExactReplace`'s shared-edge
-  test is case-blind, so a marker beside a recased word must keep its place.
+  `wars; The` keeps `\q1 The`). With unequal counts, new words for old words that all sat after a top-level
+  marker whose line starts with an opener, when the new words start with an opener too, are laid right after
+  that marker (#1369: `wars. \q1 “Your` -> `wars; “the great` saved `wars; “the great\q1`); otherwise they
+  anchor to the nearest survivor, as on main. Do not widen that to every break: the new words may belong on the
+  line before (`throne. \q1 And he` -> `throne for ever; he` must save `throne for ever; \q1 he`), and
+  `isExactReplace` accepts either (the marker sits between changed words). Marker offsets for it are read
+  before the pairing rewrites a leaf's text. The case-blind pairing splits the
+  gap's old words at the break, pairing those after it from the right (`Wars. \q1 Your king` -> `wars that
+  your enemies started; your king`), and two markers at one offset cut a fused token once (a zero-width
+  token made the rebuild bail and unalign `wars`). A re-laid opener is the leading child of the next
+  milestone (`\q1\zaln-s …\*“\w I`), pinned in Case 101. `isExactReplace`'s shared-edge
+  test is case-blind, so a marker beside a recased word must keep its place. Still open: the mirror,
+  `wars. \q1 “Your` -> `great fights; “Your`, saves `\q1 great fights; “Your`.
 
 - **A line marker with no text node on either side (`H1[say] \q1 H2[The]`) puts a space in the stripped text that
   the tree does not have (#1286).** `stripMarkerTokens` adds it so the two words don't fuse, so the engine diffs

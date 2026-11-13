@@ -4604,6 +4604,169 @@ function countAllMilestones(nodes) {
     "wars that your enemies started; your king", /started;\s*\\q1 your king rules/, ["Your"]);
 }
 
+// Case 101: leftovers beside a line break after #1361 (#1369). Each keeps
+// every line marker, keeps the break before the word that sat after it, and
+// unaligns only the words the replace changed.
+{
+  console.log("\n[Case 101] Find/replace beside a line break: recased word before it, opener placement, typed saves, edges (#1369)");
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const q1 = (text) => (text === undefined ? { tag: "q1", nextChar: " ", type: "quote" } : { tag: "q1", nextChar: " ", type: "quote", text });
+  const b = () => ({ tag: "b", type: "paragraph" });
+  const strongsOf = (content) => alignedWords(content).filter((x) => x.strongs.length).map((x) => `${x.text}:${x.strongs.join("+")}`);
+  const markers = (content) => content.verseObjects.filter((n) => n && (n.tag === "q1" || n.tag === "b")).length;
+  const toUsfm = (content) => usfm.toUSFM({ headers: [], chapters: { 1: { 1: content } } });
+  const onlyUnaligned = (label, content, result, unaligned) => {
+    const before = strongsOf(content);
+    const after = strongsOf(result);
+    const kept = before.filter((s) => !unaligned.includes(s.split(":")[0]));
+    assert(kept.every((s) => after.includes(s)) && after.length === kept.length,
+      `${label}: only ${unaligned.join(", ") || "nothing"} unaligned (before ${JSON.stringify(before)}, after ${JSON.stringify(after)})`);
+  };
+  const run = (content, find, replacement) => {
+    const plain = extractPlainText(content);
+    const at = plain.indexOf(find);
+    assert(at >= 0, `setup: verse contains ${JSON.stringify(find)}`);
+    const re = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    return findReplaceVerse(clone(content), plain, re, at, find.length, replacement);
+  };
+  const check = (label, content, find, replacement, wantRe, unaligned) => {
+    const r = run(content, find, replacement);
+    const ed = extractEditableText(r.content);
+    const plain = extractPlainText(content);
+    assert(extractPlainText(r.content) === plain.replace(find, replacement), `${label}: text is the replacement (got ${JSON.stringify(extractPlainText(r.content))})`);
+    assert(markers(r.content) === markers(content) && wantRe.test(ed), `${label}: every line marker kept, in place (got ${JSON.stringify(ed)})`);
+    onlyUnaligned(label, content, r.content, unaligned);
+    return r;
+  };
+
+  // Item 1: the word before the break is recased too, so the case-blind
+  // pairing runs over `[Wars, Your]` with the break between them. `Your` must
+  // pair with the `your` right before `king`, not the first one.
+  const capSwap = { verseObjects: [t("use in "), zaln("H1", [w("Wars")]), t(".\n"), q1(), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.")] };
+  check("item 1, Wars. Your king -> wars that your enemies started; your king", capSwap, "Wars. Your king",
+    "wars that your enemies started; your king", /use in wars that your enemies started;\s*\\q1 your king rules/, ["Wars", "Your"]);
+  const capBare = { verseObjects: [t("use in "), zaln("H1", [w("Wars")]), q1(), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.")] };
+  check("item 1 at a bare marker, Wars Your king -> wars that your enemies started; your king", capBare, "Wars Your king",
+    "wars that your enemies started; your king", /use in wars that your enemies started;\s*\\q1 your king rules/, ["Wars", "Your"]);
+  // The real verse (ZEC 9:10 UST `wars.` ⏎ `\q1 Your king`), recasing `wars`.
+  {
+    const zecUst = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ust_38-ZEC.usfm"), "utf8"));
+    const real = { verseObjects: zecUst.chapters["9"]["10"].verseObjects };
+    check("item 1, ZEC 9:10 UST wars. Your king -> Wars that your enemies started; your king", real, "wars. Your king",
+      "Wars that your enemies started; your king", /in Wars that your enemies started;\s*\\q1 your king will/, ["wars", "Your"]);
+  }
+
+  // Item 2: after the opener split, ZEC 1:14 ULT's `“` is re-laid as the
+  // leading child of the next milestone (the form the AI pipeline writes),
+  // and the untouched `I` keeps its milestone, byte for byte.
+  {
+    const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+    const real = { verseObjects: zecUlt.chapters["1"]["14"].verseObjects };
+    const r = check("item 2, ZEC 1:14 ULT Armies: “I -> armies; “I", real, "Armies: “I", "armies; “I", /of armies;\s*\\q1 “I have been/, ["Armies"]);
+    const wI = '\\w I|x-occurrence="1" x-occurrences="1"\\w*';
+    const was = toUsfm(real);
+    const now = toUsfm(r.content);
+    const msI = was.match(/\\zaln-s \|x-strong="H7065"[^*]*\\\*/)?.[0] ?? "(no H7065 milestone)";
+    assert(was.includes(`\\zaln-e\\*:\n\\q1 “${msI}${wI}`), `item 2 setup: the original has the opener on the \\q1, before the milestone`);
+    assert(now.includes(`\\w*; \\q1${msI}“${wI} `),
+      `item 2: the opener leads I inside its milestone, which is unchanged (got ${JSON.stringify(now.slice(now.indexOf("armies") - 2, now.indexOf("armies") + 240))})`);
+  }
+
+  // Item 3: an unequal-count swap beside a marker carrying an opener. The
+  // opener and the new words stay after the break.
+  const opener = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1("“"), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.”")] };
+  check("item 3, wars. “Your king -> wars; “the great king", opener, "wars. “Your king", "wars; “the great king",
+    /use in wars;\s*\\q1 “the great king rules/, ["Your"]);
+  check("item 3, wars. “Your -> wars; “the great", opener, "wars. “Your", "wars; “the great",
+    /use in wars;\s*\\q1 “the great king rules/, ["Your"]);
+  // The rule is for an opener only. With no opener the new words may belong
+  // on the line before the break (`throne. \q1 And he` -> `throne for ever;
+  // he`), so they keep main's anchoring: pinned as main's results.
+  const plainBreak = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1(), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.")] };
+  check("item 3 without an opener (main's result), wars. Your -> wars; The great", plainBreak, "wars. Your", "wars; The great",
+    /use in wars; The great\\q1 king rules/, ["Your"]);
+  check("item 3 without an opener (main's result), wars. Your king -> wars and battles; the king", plainBreak, "wars. Your king",
+    "wars and battles; the king", /use in wars and battles; the \\q1 king rules/, ["Your"]);
+  check("item 3 mirror, wars. Your -> great fights; Your", plainBreak, "wars. Your", "great fights; Your",
+    /use in great fights;\s*\\q1 Your king rules/, ["wars"]);
+  {
+    const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+    const v613 = { verseObjects: zecUlt.chapters["6"]["13"].verseObjects };
+    // The verse holds other aligned `And`s, so count: exactly one word (the
+    // replaced `And`) leaves its milestone.
+    const label = "item 3 without an opener, ZEC 6:13 ULT throne. And he -> throne for ever; he";
+    const r = run(v613, "throne. And he", "throne for ever; he");
+    const ed = extractEditableText(r.content);
+    assert(markers(r.content) === markers(v613) && /his throne for ever; \\q1 he will be a priest/.test(ed), `${label}: break stays before "he" (got ${JSON.stringify(ed)})`);
+    const before = strongsOf(v613);
+    const after = strongsOf(r.content);
+    const left = [...before];
+    const extra = after.filter((s) => { const i = left.indexOf(s); if (i < 0) return true; left.splice(i, 1); return false; });
+    assert(extra.length === 0 && left.length === 1 && left[0].startsWith("And:"), `${label}: only the replaced And unaligned (lost ${JSON.stringify(left)}, extra ${JSON.stringify(extra)})`);
+  }
+  // Marker offsets are read on the tree before the pairing rewrites a leaf:
+  // an earlier 1:1 swap that changes a word's length (`A` -> `Mighty`) must
+  // not shift the `\q2` into a later gap.
+  const q2 = { tag: "q2", nextChar: " ", type: "quote" };
+  const shiftedWith = (gap) => ({ verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1(), zaln("H2", [w("A")]), t(" "), q2,
+    zaln("H3", [w("king")]), t(gap), zaln("H4", [w("His")]), t(" "), zaln("H5", [w("reign")]), t(" ends.")] });
+  const markers2 = (content) => content.verseObjects.filter((n) => n && (n.tag === "q1" || n.tag === "q2")).length;
+  for (const [shifted, find, replacement, wantRe] of [
+    [shiftedWith(". "), "wars. A king. His reign", "wars; Mighty king; the great reign", /use in wars; \\q1 Mighty \\q2 king; the great reign ends/],
+    // `Valiant` is 6 longer than `A`: a stale offset puts the `\q2` on the `“`.
+    [shiftedWith(". “"), "wars. A king. “His reign", "wars; Valiant king; “the great reign", /use in wars; \\q1 Valiant \\q2 king; “the great reign ends/],
+  ]) {
+    const r = run(shifted, find, replacement);
+    const ed = extractEditableText(r.content);
+    assert(markers2(r.content) === 2 && wantRe.test(ed), `marker offsets, ${find} -> ${replacement}: markers in place (got ${JSON.stringify(ed)})`);
+    onlyUnaligned(`marker offsets, ${find} -> ${replacement}`, shifted, r.content, ["A", "His"]);
+  }
+
+  // Item 4: typed saves in a verse the reassembly cannot rebuild (a `\qs`
+  // wrapper), so the edit takes the diff tiers. Outcome pins: the typed
+  // layout's marker reconcile is what keeps the break here (with the range
+  // rebuild's break handling switched off, all of these still pass).
+  {
+    const qs = () => ({ tag: "qs", type: "quote", endTag: "qs*", children: [zaln("H9", [w("Selah")])] });
+    const mk = (sep, first = "wars") => ({ verseObjects: [t("use in "), zaln("H1", [w(first)]), ...sep, zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules. "), qs()] });
+    const dot = mk([t(".\n"), q1()]);
+    const bareQs = mk([q1()]);
+    const openerQs = mk([t(".\n"), q1("“")]);
+    const cap = mk([t(".\n"), q1()], "Wars");
+    for (const [label, content, from, to, unaligned] of [
+      ["#1360 recase after the break", dot, /wars\. \\q1 Your/, "wars; \\q1 your", ["Your"]],
+      ["#1361 recase at a bare marker", bareQs, /wars\s*\\q1 Your/, "wars; \\q1 your", ["Your"]],
+      ["#1361 recase after an opener marker", openerQs, /wars\. \\q1 “Your/, "wars; \\q1 “your", ["Your"]],
+      ["#1361 swap after the break", dot, /wars\. \\q1 Your/, "wars; \\q1 The", ["Your"]],
+      ["#1361 swap at a bare marker", bareQs, /wars\s*\\q1 Your/, "wars; \\q1 The", ["Your"]],
+      ["item 1 recase on both sides", cap, /Wars\. \\q1 Your king/, "wars that your enemies started; \\q1 your king", ["Wars", "Your"]],
+      ["item 3 unequal swap after an opener marker", openerQs, /wars\. \\q1 “Your/, "wars; \\q1 “the great", ["Your"]],
+    ]) {
+      const old = extractEditableText(content);
+      const want = old.replace(from, to);
+      assert(want !== old, `item 4 setup (${label}): the edit applies`);
+      const r = smartEditVerse(clone(content), old, want, { capturedFromDom: true });
+      assert(extractEditableText(r.content) === want && markers(r.content) === markers(content),
+        `item 4, typed ${label}: saved as typed (want ${JSON.stringify(want)}, got ${JSON.stringify(extractEditableText(r.content))})`);
+      onlyUnaligned(`item 4, typed ${label}`, content, r.content, unaligned);
+    }
+  }
+
+  // Item 5: two bare markers at one offset (`wars\b \q1 Your`), and a break
+  // at either edge of the gap between two kept words.
+  const twoBare = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), b(), q1(), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.")] };
+  check("item 5, two bare markers, wars Your -> wars; your", twoBare, "wars Your", "wars; your", /use in wars;\s*\\b\s*\\q1 your king rules/, ["Your"]);
+  check("item 5, two bare markers, wars Your -> wars; The", twoBare, "wars Your", "wars; The", /use in wars;\s*\\b\s*\\q1 The king rules/, ["Your"]);
+  // The break at the gap's right edge: right before the next kept word.
+  const rightEdge = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(". "), zaln("H2", [w("Your")]), q1(), zaln("H3", [w("king")]), t(" rules.")] };
+  check("item 5, break at the gap's right edge, Your king -> The king", rightEdge, "Your king", "The king", /wars\. The\s*\\q1 king rules/, ["Your"]);
+  check("item 5, break at the gap's right edge, wars. Your king -> wars; The king", rightEdge, "wars. Your king", "wars; The king", /wars; The\s*\\q1 king rules/, ["Your"]);
+  // The break at the gap's left edge: right after the previous kept word.
+  check("item 5, break at the gap's left edge, Your king -> Your realm", rightEdge, "Your king", "Your realm", /wars\. Your\s*\\q1 realm rules/, ["king"]);
+  const leftEdge = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), q1(), zaln("H2", [w("Your")]), t(" "), zaln("H3", [w("king")]), t(" rules.")] };
+  check("item 5, break at the gap's left edge, wars Your king -> wars; The king", leftEdge, "wars Your king", "wars; The king", /use in wars;\s*\\q1 The king rules/, ["Your"]);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
