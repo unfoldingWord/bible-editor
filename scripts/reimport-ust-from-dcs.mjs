@@ -20,6 +20,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import usfm from "usfm-js";
+import { isHeaderLabelNode } from "../api/src/importParsers.ts";
 // Issue #686 item 5: this script wipes + reinserts a whole book/version's
 // verses straight from Door43, leaving every row's provenance columns at
 // whatever they held before the DELETE (or NULL, on a fresh table) — the row
@@ -109,6 +110,9 @@ function extractPlainText(verseObj) {
   const parts = [];
   const walk = (vos) => {
     for (const vo of vos || []) {
+      // A `\sp` speaker label's text is not verse text (#1339); same skip as
+      // extractPlainText in api/src/importParsers.ts and web/src/lib/usfm.ts.
+      if (isHeaderLabelNode(vo)) continue;
       if (vo.text) parts.push(vo.text);
       if (vo.children) walk(vo.children);
     }
