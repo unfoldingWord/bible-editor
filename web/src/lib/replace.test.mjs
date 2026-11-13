@@ -3727,9 +3727,10 @@ function countAllMilestones(nodes) {
   // label differential: ` {to` -> ``). The start moved past the label, so the
   // raw range lost the match's leading space, which read as a bare seam: the
   // guard refused the result and the verse was flattened, label and all. Main
-  // dropped only the `\q2` (whose `{` the replace removed). Since #1354 the
-  // label is anchored to that `\q2`, so dropping it is refused like any line
-  // break removed in a labelled verse: the verse comes back untouched.
+  // dropped only the `\q2` (whose `{` the replace removed), which #1354
+  // refused (the label is anchored to that `\q2`). Since #1361 the `{` is
+  // split off the `\q2` before the edit, so the marker stays: the replace
+  // saves, the label still before `\q2`, and only `to` leaves its milestone.
   {
     const isaLike = { verseObjects: [zaln("H0", [w("bare")]), t(" "), zaln("H1", [w("hill")]), t("\n"), sp(), { tag: "q2", type: "quote", text: "{" },
       zaln("H2", [w("to"), t(" "), w("signal")]), t("}!\n"), q1(), zaln("H3", [w("Shout")]), t(".")] };
@@ -3739,9 +3740,11 @@ function countAllMilestones(nodes) {
     console.warn = () => {};
     const r = findReplaceVerse(clone(isaLike), p, / \{to/g, at, 4, "");
     console.warn = warn;
-    assert(r.labelRefusals === 1 && extractPlainText(r.content) === p, `" {to" -> "" after the label: refused, text kept (got ${JSON.stringify(extractPlainText(r.content))})`);
+    assert(!r.labelRefusals && extractPlainText(r.content) === p.replace(" {to", ""), `" {to" -> "" after the label: replaced (got ${JSON.stringify(extractPlainText(r.content))})`);
     assert(labels(r.content) === labels(isaLike), `" {to" -> "" after the label: label kept (got ${labels(r.content)})`);
-    assert(JSON.stringify(r.content) === JSON.stringify(isaLike), `" {to" -> "" after the label: the verse is untouched`);
+    const tags = (c) => c.verseObjects.filter((n) => n.tag === "sp" || n.tag === "q1" || n.tag === "q2").map((n) => n.tag).join(" ");
+    assert(tags(r.content) === "sp q2 q1" && words(r.content) === "bare:H0|hill:H1|signal:H2|Shout:H3",
+      `" {to" -> "" after the label: the \\q2 stays after the label, untouched words aligned (got ${tags(r.content)} ${words(r.content)})`);
   }
   // A match just before the label leaves it alone too.
   {
@@ -3818,17 +3821,20 @@ function countAllMilestones(nodes) {
   };
   // The issue's repro: `name` is unchanged, so the break stays after it.
   run("name this -> name of that", "name this", "name of that", "my name\\q1 of that set.", "my:H0|name:H1|of:|that:|set:H3");
-  // `this` is unchanged, so the break stays before it.
-  run("name this -> the name this", "name this", "the name this", "my the name\\q1 this set.", "my:H0|the:|name:H1|this:H2|set:H3");
+  // `this` is unchanged, so the break stays before it. (The range rebuild
+  // takes this seam since #1361 and writes the space it re-lays before the
+  // break; the localized rewrite wrote none.)
+  run("name this -> the name this", "name this", "the name this", "my the name \\q1 this set.", "my:H0|the:|name:H1|this:H2|set:H3");
   // No word of the match survives: the break stays between the untouched
   // `my` and `set` (pinned; it lands after the replacement).
   run("name this -> a b c", "name this", "a b c", "my a b c\\q1 set.", "my:H0|a:|b:|c:|set:H3");
   // Deleting the word before the break: `this` is kept, so the break stays
   // before it (main moved it after `this`).
   run("name this -> this", "name this", "this", "my \\q1 this set.", "my:H0|this:H2|set:H3");
-  // Deleting the word after it: the break stays after `name`. (`name` comes
-  // back unaligned, as on main; the guard accepts that result, so no retry.)
-  run("name this -> name", "name this", "name", "my name\\q1 set.", "my:H0|name:|set:H3");
+  // Deleting the word after it: the break stays after `name`, which keeps its
+  // alignment since the range rebuild takes this seam (#1361; it came back
+  // unaligned before).
+  run("name this -> name", "name this", "name", "my name\\q1 set.", "my:H0|name:H1|set:H3");
   // The same deletion after an opening quote (ZEC 1:2 `“Yahweh\q1 was` with
   // `Yahweh was` -> `was`, found by the differential). No path keeps the
   // break before `this` with the exact text: the narrowed retry gives

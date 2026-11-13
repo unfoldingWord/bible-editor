@@ -221,7 +221,13 @@ Highlights that bite repeatedly:
   leaf (#1360): its exact-match LCS read it as a new word and anchored it to the nearest exact survivor, so
   `wars. Your` -> `wars; your` saved `wars; your\q1 king`, and `isExactReplace` let it through because a marker
   between two "changed" words may sit anywhere. Exact links still win (`the The cat` -> `The cat` keeps `The`).
-  A bare marker, a marker carrying an opener, and a swapped word still move or drop the break (#1361).
+  The same holds at a bare marker, where raw fuses the two words (`warsYour`): `smartRebuildRange` cuts the token
+  at the marker (#1361). A marker carrying a line-leading opener (`\q1 “`, ZEC 1:14 ULT) in a find/replace range
+  is split into marker + text node first (as `liftMarkerText` does for typed saves): the localized rewrite
+  dropped such a marker. Words swapped 1:1 across a break keep the old word's leaf (`wars. \q1 Your` ->
+  `wars; The` keeps `\q1 The`); unequal counts still anchor new words to the nearest survivor, so
+  `wars. Your` -> `wars; The great` still saves `The great` before the break. `isExactReplace`'s shared-edge
+  test is case-blind, so a marker beside a recased word must keep its place.
 
 - **A line marker with no text node on either side (`H1[say] \q1 H2[The]`) puts a space in the stripped text that
   the tree does not have (#1286).** `stripMarkerTokens` adds it so the two words don't fuse, so the engine diffs
@@ -860,8 +866,8 @@ Highlights that bite repeatedly:
   find/replace counts it) when it changes the number of line markers in a labelled verse, or when a label's
   marker no longer sits between the same body words (compared case- and punctuation-blind): a count check alone
   let "remove the `\q2` before a label, add one after it" put the label mid-speech, and the engine's own
-  marker moves would put a word of the speech before its label (`home He` -> `home; he` at a bare marker still
-  does, #1361; the "wars. Your" -> "wars; your" move was fixed in #1360). Showing the engine the label instead failed
+  marker moves would put a word of the speech before its label (`“home He` -> `He` at a bare marker still
+  does; the recase moves were fixed in #1360 and #1361). Showing the engine the label instead failed
   twice: as plain-text `{tag:"sp", text}` the whole-verse punctuation relayout blanked it (any punctuation edit in
   the verse) and the marker tiers moved the `\q1` after a verse-final label in front of it (`\q1 \sp …` opens the
   next verse inside the label); as `content` (like `\s1`) reconcile moved labels freely. A plain-text `\sp` label
