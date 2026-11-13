@@ -4353,6 +4353,79 @@ function countAllMilestones(nodes) {
   }
 }
 
+// Case 99: a replace that changes the punctuation before a line break AND the
+// case of a word next to it keeps that word on its own side of the break
+// (#1360). ZEC 9:10 UST `wars. Your` -> `wars; your` saved `wars; your\q1
+// king`: the range rebuild matched words case-sensitively, so `your` was a new
+// word, placed after `wars` (before the `\q1`), and `Your` was dropped. The
+// position check let it through because the marker sat between "changed" words.
+{
+  console.log("\n[Case 99] Punctuation + case change beside a line break keeps the word on its own line (#1360)");
+  const zecUst = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ust_38-ZEC.usfm"), "utf8"));
+  const clone = (c) => JSON.parse(JSON.stringify(c));
+  const real = { verseObjects: zecUst.chapters["9"]["10"].verseObjects };
+  // The same seam with the words aligned (the sample leaves `wars`/`Your`
+  // bare), so the aligned count says something: `they use in wars` under H1,
+  // `Your king` under H2, `will` under H3.
+  const q1 = { tag: "q1", nextChar: " ", type: "quote" };
+  const aligned = {
+    verseObjects: [
+      t("I break the bows "),
+      zaln("H1", [w("they"), t(" "), w("use"), t(" "), w("in"), t(" "), w("wars")]),
+      t(".\n"),
+      q1,
+      zaln("H2", [w("Your"), t(" "), w("king")]),
+      t(" "),
+      zaln("H3", [w("will")]),
+      t(" rule."),
+    ],
+  };
+  // Aligned words only, as `text:strongs`.
+  const strongsOf = (content) => alignedWords(content).filter((x) => x.strongs.length).map((x) => `${x.text}:${x.strongs.join("+")}`);
+  const run = (content, find, replacement, all = false) => {
+    const plain = extractPlainText(content);
+    const at = plain.indexOf(find);
+    assert(at >= 0, `setup: verse contains ${JSON.stringify(find)}`);
+    const re = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    return all ? replaceAllInVerse(clone(content), plain, re, 1, replacement) : findReplaceVerse(clone(content), plain, re, at, find.length, replacement);
+  };
+  const around = (content, word) => {
+    const ed = extractEditableText(content);
+    const i = ed.indexOf(word);
+    return ed.slice(i, i + 24);
+  };
+  // The issue's repro, on the real tree.
+  {
+    const r = run(real, "wars. Your", "wars; your");
+    assert(around(r.content, "wars") === "wars; \\q1 your king will", `ZEC 9:10 UST wars. Your -> wars; your: break stays before "your" (got ${JSON.stringify(around(r.content, "wars"))})`);
+    assert(alignedWords(r.content).filter((x) => x.strongs.length).length === alignedWords(real).filter((x) => x.strongs.length).length, "ZEC 9:10 UST: aligned word count unchanged");
+  }
+  // Aligned: only the recased word leaves its milestone; every other word keeps its strongs.
+  for (const [find, replacement, want, recased] of [
+    ["wars. Your", "wars; your", "wars; \\q1 your king will", ["your"]],
+    // The mirror: the word BEFORE the break is recased.
+    ["wars. Your", "Wars; Your", "Wars; \\q1 Your king will", ["Wars"]],
+    ["wars. Your", "Wars; your", "Wars; \\q1 your king will", ["Wars", "your"]],
+    ["wars. Your king", "wars; your King", "wars; \\q1 your King will", ["your", "King"]],
+    // Case only, no punctuation change (the preserve path, already right).
+    ["wars. Your", "wars. your", "wars. \\q1 your king will", ["your"]],
+  ]) {
+    const r = run(aligned, find, replacement);
+    assert(around(r.content, find.slice(0, 4).replace("w", replacement[0])) === want,
+      `aligned ${find} -> ${replacement}: break stays put (got ${JSON.stringify(extractEditableText(r.content))})`);
+    const before = strongsOf(aligned);
+    const after = strongsOf(r.content);
+    const kept = before.filter((s) => !recased.some((x) => s.toLowerCase().startsWith(`${x.toLowerCase()}:`)));
+    assert(kept.every((s) => after.includes(s)) && after.length === before.length - recased.length,
+      `aligned ${find} -> ${replacement}: only ${recased.join(", ")} unaligned (before ${JSON.stringify(before)}, after ${JSON.stringify(after)})`);
+  }
+  // Replace all takes the same path.
+  {
+    const r = run(aligned, "wars. Your", "wars; your", true);
+    assert(around(r.content, "wars") === "wars; \\q1 your king will", `replace all: break stays before "your" (got ${JSON.stringify(around(r.content, "wars"))})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
