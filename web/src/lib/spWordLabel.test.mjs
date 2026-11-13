@@ -20,6 +20,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { nestWordLabels, splitSectionHeaders, extractPlainText, extractEditableText, rewriteHeaderLabel, isWordLabelNode, headerLabelText } from "./usfm.ts";
 import { parseAlignment, serializeAlignment, countUnalignedTargetWords } from "./alignment.ts";
+import { curlifyVerseContent } from "./curlyVerse.ts";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const fixture = readFileSync(resolve(repoRoot, "api/src/fixtures/sng-sp-labels.usfm.txt"), "utf8");
@@ -144,6 +145,56 @@ const v4 = nestWordLabels(verse("4"));
   const r = render([edited]);
   assert(r.includes("\\sp The woman dreams\n") && !r.includes("\\w") && !r.includes("thinks"), `band edit renders the new text once (got ${json(r)})`);
   assert(rewriteHeaderLabel(label, "sp", "The woman thinks about the man she loves") === label, "an unchanged band save keeps the words as they were");
+}
+
+// Review round 4 of #1350. The labels are Door43's bytes: the save's quote
+// curling (curlifyVerseContent, run on every typed save) must not touch a quote
+// inside a word label, and a quote only in a label must not make the save
+// clone and re-lay the verse at all.
+{
+  const wq = (text, occ = "1", occs = "1") => ({ text, tag: "w", type: "word", occurrence: occ, occurrences: occs });
+  const tq = (text) => ({ type: "text", text });
+  const label = () => ({
+    tag: "sp", nextChar: " ", endTag: "",
+    children: [wq("The"), tq(" "), { tag: "zaln", type: "milestone", strong: "H1", content: "א", occurrence: "1", occurrences: "1", children: [wq("king's")], endTag: "zaln-e\\*" }, tq(" \"men\"\n")],
+  });
+  const body = (quote) => [wq("A"), tq(` ${quote}home`), tq(".\n"), label(), { tag: "q1", type: "quote" }, wq("He"), tq(" ran.")];
+  const both = { verseObjects: body("'") };
+  const curled = curlifyVerseContent(both);
+  assert(json(labelsOf(curled.verseObjects)) === json(labelsOf(both.verseObjects)), `curling a save leaves a word label's quotes as Door43 wrote them (got ${json(labelsOf(curled.verseObjects))})`);
+  assert(extractPlainText(curled).includes("‘home"), `the body quote is still curled (got ${json(extractPlainText(curled))})`);
+  const onlyLabel = { verseObjects: body("") };
+  assert(curlifyVerseContent(onlyLabel) === onlyLabel, "a quote only inside a word label: the save hands back the same tree");
+}
+
+// A source word aligned only inside a word label (SNG 1:4's label holds
+// `\zaln-s H0157`) is aligned: the aligner must not offer it as an empty card,
+// or aligning it again writes a second milestone for the same source word.
+// (In the real 1:4 that word is also aligned twice in the body, so it was
+// covered anyway; this pins the label-only case.)
+{
+  const src = (text, strong) => ({ tag: "w", type: "word", text, strong, lemma: text, morph: "He,Vqp3cp", occurrence: "1", occurrences: "1" });
+  const source = [src("אָב", "H0001"), { type: "text", text: " " }, src("אָהַב", "H0157")];
+  const zaln = (strong, content, kids) => ({ tag: "zaln", type: "milestone", strong, lemma: content, morph: "He,Vqp3cp", content, occurrence: "1", occurrences: "1", children: kids, endTag: "zaln-e\\*" });
+  const wd = (text) => ({ text, tag: "w", type: "word", occurrence: "1", occurrences: "1" });
+  const target = [
+    zaln("H0001", "אָב", [wd("Father")]), { type: "text", text: ".\n" },
+    { tag: "sp", nextChar: " ", endTag: "", children: [wd("The"), { type: "text", text: " " }, zaln("H0157", "אָהַב", [wd("lover")]), { type: "text", text: "\n" }] },
+    { tag: "q1", type: "quote" }, wd("Come"), { type: "text", text: "." },
+  ];
+  const st = parseAlignment(target, source);
+  const strongs = st.sourceGroups.map((g) => `${g.source.map((s) => s.strong).join("+")}:${g.targets?.length ?? 0}`);
+  assert(!st.sourceGroups.some((g) => g.source.some((s) => s.strong === "H0157")), `a source word aligned inside a word label gets no empty card (got ${json(strongs)})`);
+  assert(json(labelsOf(serializeAlignment(st))) === json(labelsOf(target)), "the label (and its milestone) round-trips the aligner untouched");
+}
+
+// Only `\sp` holds a label written as words. Another header-label node that
+// carries `children` (a `\r` or `\cl` usfm-js gave children) is not one, so
+// the edit engine and the header band treat it as before.
+{
+  assert(isWordLabelNode({ tag: "sp", children: [{ type: "word", tag: "w", text: "The" }], endTag: "" }), "an sp with word children is a word label");
+  assert(!isWordLabelNode({ tag: "r", children: [{ type: "text", text: "(Ps 23)" }] }), "an r with children is not a word label");
+  assert(!isWordLabelNode({ tag: "cl", children: [{ type: "text", text: "Psalm" }] }), "a cl with children is not a word label");
 }
 
 if (failed > 0) {
