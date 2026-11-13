@@ -190,6 +190,17 @@ const v4 = nestWordLabels(verse("4"));
     const again = nestWordLabels(usfm.toJSON(render(out)).chapters["1"]["1"].verseObjects);
     assert(render(labelsOf(again)) === render(labelsOf(out)) && zalnIn(labelsOf(again)[2]) === zalnIn(labelsOf(out)[2]), `${name}: the edited label survives export and re-import`);
   }
+  // The label's last word changed: it still ends the label, the \q2 still
+  // follows it, and export then import gives the same label back.
+  {
+    const last = band(v4, 2, "sp", t3.replace("Jerusalem", "Zion"));
+    const l = labelsOf(last)[2];
+    assert(headerLabelText(l) === t3.replace("Jerusalem", "Zion") && last[last.indexOf(l) + 1]?.tag === "q2", `last word changed: label text and its \\q2 kept (got ${json(headerLabelText(l))})`);
+    const again = nestWordLabels(usfm.toJSON(render(last)).chapters["1"]["1"].verseObjects);
+    const la = labelsOf(again)[2];
+    assert(headerLabelText(la) === headerLabelText(l) && again[again.indexOf(la) + 1]?.tag === "q2" && zalnIn(la) === zalnIn(l),
+      `last word changed: survives export and re-import, \\q2 right after (got ${json(headerLabelText(la))})`);
+  }
   // The guard sees label words: dropping an aligned label word's milestone with
   // the text unchanged is a loss it reports.
   const stripped = v4.map((n, i) => (n === l3 ? { ...n, children: n.children.map((c) => (c.tag === "zaln" ? c.children[0] : c)) } : n));

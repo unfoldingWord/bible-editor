@@ -3716,6 +3716,11 @@ function countAllMilestones(nodes) {
     const r = findReplaceVerse(clone(verse), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
     assert(extractEditableText(r.content) === ed && labels(r.content) === labels(verse),
       `${JSON.stringify(find)} -> ${JSON.stringify(repl)} at the label: ${JSON.stringify(ed)}, label whole (got ${JSON.stringify(extractEditableText(r.content))} ${labels(r.content)})`);
+    // The same replace on the verse with no label gives the same body.
+    const bare = { verseObjects: verse.verseObjects.filter((n) => n.tag !== "sp") };
+    const b = findReplaceVerse(clone(bare), plain, new RegExp(find, "g"), plain.indexOf(find), find.length, repl);
+    assert(extractEditableText(b.content) === ed && words(b.content) === words(r.content),
+      `${JSON.stringify(find)} -> ${JSON.stringify(repl)}: same result as on the verse without the label (got ${JSON.stringify(extractEditableText(b.content))})`);
   }
   // A match whose leading space runs over the label, followed by a line marker
   // carrying its own opener (ISA 13:2 UST with a label injected, found by the
