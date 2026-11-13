@@ -448,5 +448,97 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   }
 }
 
+// #1366 item 1: a match refused because it would drop or change a `\sp` label
+// (label-lost) is counted on its own and the summary gives that reason, not
+// "would move a speaker label". The verse: a plain-text label with body text
+// (not a line marker) after it, which the engine still sees; replacing across
+// it would drop it.
+{
+  console.log("\n[#1366 item 1] A label-lost refusal gets its own count and summary line");
+  const lost = { verseObjects: [t("A home. "), { tag: "sp", text: "The man\n" }, t("He ran.")] };
+  const plain = extractPlainText(lost);
+  check(plain === "A home. He ran.", `setup: plain text skips the label (got ${JSON.stringify(plain)})`);
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const one = findReplaceVerse(lost, plain, /home\. He/g, plain.indexOf("home. He"), 8, "home; he");
+    check(one.labelRefusals === 1 && one.labelLostRefusals === 1 && one.labelShapeRefusals === undefined && one.plainText === plain,
+      `single replace that would drop the label: refused, counted as label-lost (got lost=${one.labelLostRefusals}, all=${one.labelRefusals})`);
+    const all = replaceAllInVerse(lost, plain, /home\. He/g, 1, "home; he");
+    check(all.labelRefusals === 1 && all.labelLostRefusals === 1 && all.plainText === plain,
+      `replace-all: the same refusal counted as label-lost (got lost=${all.labelLostRefusals})`);
+  } finally {
+    console.warn = warn;
+  }
+  const sum = (versesReplaced, labelRefused, labelShapeRefused, labelLostRefused) =>
+    bibleReplaceSummaryText({ versesReplaced, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, labelRefused, labelShapeRefused, labelLostRefused });
+  check(sum(0, 1, 0, 1) === "1 match not replaced: it would remove or change a speaker label", `a label-lost refusal gives its own reason (got ${sum(0, 1, 0, 1)})`);
+  check(sum(1, 4, 1, 2) === "replaced 1 verse — 1 match not replaced: it would move a speaker label — 1 match not replaced: its verse has a speaker label with no line break after it — 2 matches not replaced: they would remove or change a speaker label",
+    `all three kinds of label refusal, each with its reason (got ${sum(1, 4, 1, 2)})`);
+}
+
+// #1366 item 7 (the issue's comment): `home He` -> `home; she too` beside a
+// word label whose line marker has no text beside it. The new words replace
+// `He`, the first word of the speech, but the engine anchored them to the kept
+// `home` and saved them before the label and its line break. They now go after
+// the label (`home; \sp … \q1 she too ran`), and the words the replace did not
+// touch keep their alignment.
+{
+  console.log("\n[#1366 item 7] New words replacing the first word after a label's line break go after the label");
+  const label = () => ({ tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("man"), t("\n")], endTag: "" });
+  const q1 = () => ({ tag: "q1", type: "quote" });
+  const words = (content) => {
+    const out = [];
+    for (const n of content.verseObjects) {
+      if (n.tag === "sp") out.push("[SP]");
+      else if (n.tag === "q1") out.push("\\q1");
+      else for (const x of extractPlainText({ verseObjects: [n] }).split(/\s+/).filter(Boolean)) out.push(x);
+    }
+    return out.join(" ");
+  };
+  const run = (content, find, replacement) => {
+    const plain = extractPlainText(content);
+    const at = plain.indexOf(find);
+    check(at >= 0, `setup: ${JSON.stringify(plain)} contains ${JSON.stringify(find)}`);
+    const re = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    return findReplaceVerse(JSON.parse(JSON.stringify(content)), plain, re, at, find.length, replacement);
+  };
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    // The issue's tree: unaligned words, a bare marker.
+    const bare = { verseObjects: [w("A"), t(" "), w("home"), label(), q1(), w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
+    const r1 = run(bare, "home He", "home; she too");
+    check(r1.labelRefusals === undefined && words(r1.content) === "A home; [SP] \\q1 she too ran home.",
+      `bare marker: "she too" saved after the label (got ${JSON.stringify(words(r1.content))}, refused=${r1.labelRefusals})`);
+    // Text beside the marker (`home.⏎ \sp … \q1 He`): the same move.
+    const beside = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label(), q1(), w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
+    const r2 = run(beside, "home. He", "home; she too");
+    check(r2.labelRefusals === undefined && words(r2.content) === "A home; [SP] \\q1 she too ran home.",
+      `text beside the marker: "she too" saved after the label (got ${JSON.stringify(words(r2.content))})`);
+    // Aligned words: only the replaced "He" loses its alignment.
+    const aligned = {
+      verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), label(), q1(), zaln("H3", [w("He")]), t(" "), zaln("H4", [w("ran")]), t(" "), zaln("H5", [w("home")]), t(".")],
+    };
+    const r3 = run(aligned, "home He", "home; she too");
+    check(r3.labelRefusals === undefined && words(r3.content) === "A home; [SP] \\q1 she too ran home.",
+      `aligned: "she too" saved after the label (got ${JSON.stringify(words(r3.content))})`);
+    check(JSON.stringify(alignedWords(r3.content).filter((x) => !x.endsWith(":"))) === JSON.stringify(["A:H1", "home:H2", "The:", "man:", "ran:H4", "home:H5"].filter((x) => !x.endsWith(":"))),
+      `aligned: every untouched word keeps its alignment (got ${JSON.stringify(alignedWords(r3.content))})`);
+    // Old words on both sides of the line break replaced by words the engine
+    // put all before it: which of them starts the speech can't be told, so
+    // the replace is refused rather than guessed.
+    const both = { verseObjects: [w("A"), t(" "), w("home"), t(" "), w("now"), label(), q1(), w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
+    const r4 = run(both, "now He", "then she too");
+    const kept4 = words(r4.content);
+    check(r4.labelRefusals === 1 || /\[SP\] \\q1 (she|then)/.test(kept4) && !/she.*\[SP\]/.test(kept4),
+      `old words on both sides of the break: refused, or no word of the speech before the label (got ${JSON.stringify(kept4)}, refused=${r4.labelRefusals})`);
+    // A plain deletion of the speech's first word still saves as before.
+    const r5 = run(bare, "home He", "home");
+    check(r5.labelRefusals === undefined && words(r5.content) === "A home [SP] \\q1 ran home.", `deleting "He": saved, label in place (got ${JSON.stringify(words(r5.content))})`);
+  } finally {
+    console.warn = warn;
+  }
+}
 
 console.log(`\nfindReplaceVerse: all ${passed} checks passed.`);

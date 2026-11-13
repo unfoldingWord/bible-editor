@@ -189,6 +189,30 @@ check("this tab's own save landing moves a live hold's pin forward to the landed
   assert.equal(peekPinnedVerseBase(K), undefined);
 });
 
+// #1366 item 4. The line's text came from a FLAT `\sp` label (its words read
+// as body words; a history restore or "my edit wins" can leave one). The
+// server nests the label on save, so the landed row's editable text no longer
+// holds those words. Moving the pin there would make the label words, still in
+// the box, read as typed text on the next save (they were saved into the body,
+// duplicating the label). The pin stays, so that save 409s instead.
+check("an own save that the server nested a flat label in does not move the pin", () => {
+  reset();
+  const w = (text) => ({ text, tag: "w", type: "word", occurrence: "1", occurrences: "1" });
+  const t = (text) => ({ type: "text", text });
+  const flat = { verseObjects: [w("Song"), t(".\n"), { tag: "sp" }, w("The"), t(" "), w("woman"), t("\n"), { tag: "q1", type: "quote" }, w("Come")] };
+  const nested = { verseObjects: [w("Song"), t(".\n"), { tag: "sp", children: [w("The"), t(" "), w("woman"), t("\n")], endTag: "" }, { tag: "q1", type: "quote" }, w("Come")] };
+  const hold = holdVerseBase(K, { version: 3, content: flat });
+  advanceHeldVerseBase(K, 3, { version: 4, content: nested });
+  assert.equal(peekPinnedVerseBase(K)?.version, 3);
+  assert.equal(peekPinnedVerseBase(K)?.content, flat);
+  hold.release();
+  // A base that was already nested moves forward as before.
+  const hold2 = holdVerseBase(K, { version: 3, content: nested });
+  advanceHeldVerseBase(K, 3, { version: 4, content: nested });
+  assert.equal(peekPinnedVerseBase(K)?.version, 4);
+  hold2.release();
+});
+
 check("an own save made against a different base does not move the pin (another change came between)", () => {
   reset();
   const hold = holdVerseBase(K, shown); // v3

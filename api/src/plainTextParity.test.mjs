@@ -179,6 +179,34 @@ check(usfm.toJSON(src).chapters["1"]["2"].verseObjects.some((n) => n.tag === "sp
   check(rows.find((r) => r.verse === 2)?.plainText === "Next. Go", `footnote/char marker 1:2: stored plain text has no label word (got ${JSON.stringify(rows.find((r) => r.verse === 2)?.plainText)})`);
 }
 
+// Only character and note markers join a label's run (#1366 item 3): a `\va`,
+// `\vp`, `\ca` or `\fig` is a closed marker too, but no part of a speaker label.
+// Both copies keep them out of the label, identically; `\fe` and `\wj` join.
+{
+  const src = String.raw`\c 1
+\p
+\v 1 \w Body|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \w man|x-occurrence="1" x-occurrences="1"\w*
+\va 2\va*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*
+\v 2 \w B|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \fe + \ft end\fe* \wj \w man|x-occurrence="1" x-occurrences="1"\w*\wj*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*
+\v 3 \w C|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \vp 2a\vp* \ca 3\ca* \fig A|src="a.jpg" size="col"\fig*
+\q1 \w Go|x-occurrence="1" x-occurrences="1"\w*
+`;
+  const fx = usfm.toJSON(src).chapters["1"];
+  const kids = (vos) => vos.find((n) => n && n.tag === "sp").children.map((c) => c.tag ?? c.type);
+  for (const v of ["1", "2", "3"]) {
+    const vos = fx[v].verseObjects;
+    check(JSON.stringify(apiNest(vos)) === JSON.stringify(webNest(vos)), `marker list 1:${v}: api and web nestWordLabels agree`);
+  }
+  check(!kids(apiNest(fx["1"].verseObjects)).includes("va"), `\\va after a label stays in the verse (got ${JSON.stringify(kids(apiNest(fx["1"].verseObjects)))})`);
+  check(kids(apiNest(fx["2"].verseObjects)).includes("fe") && kids(apiNest(fx["2"].verseObjects)).includes("wj"), "\\fe and \\wj join the label");
+  check(!kids(apiNest(fx["3"].verseObjects)).some((k) => ["vp", "ca", "fig"].includes(k)), `\\vp, \\ca, \\fig stay out of the label (got ${JSON.stringify(kids(apiNest(fx["3"].verseObjects)))})`);
+}
+
 if (failed > 0) {
   console.error(`\nplainTextParity: ${failed} check(s) failed, ${passed} passed.`);
   process.exit(1);

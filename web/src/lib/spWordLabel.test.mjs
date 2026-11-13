@@ -264,6 +264,76 @@ const v4 = nestWordLabels(verse("4"));
   assert(render(labelsOf(edited)).includes("\\f + \\ft A note.\\f*") && headerLabelText(el) === "The woman speaking Lord key person", `band edit with a footnote renders it (got ${json(render(labelsOf(edited)))})`);
 }
 
+// #1366 item 2: a footnote or cross reference inside a label shows in the
+// header band (read-only: its text beside the label's words), and a band edit
+// of the word right beside it keeps it in place, byte for byte.
+{
+  const fx = usfm.toJSON(String.raw`\c 1
+\p
+\v 1 \w Body|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \w woman|x-occurrence="1" x-occurrences="1"\w*\f + \ft A note.\f* \add \w speaking|x-occurrence="1" x-occurrences="1"\w*\add*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w* there.
+\v 2 \w Next|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \w woman|x-occurrence="1" x-occurrences="1"\w* \x - \xo 1:1 \xt Gen 1:1\x*
+\q1 \w Go|x-occurrence="1" x-occurrences="1"\w*
+`).chapters["1"];
+  const n1 = nestWordLabels(fx["1"].verseObjects);
+  const n2 = nestWordLabels(fx["2"].verseObjects);
+  const s1 = splitSectionHeaders(n1).sections;
+  assert(json(s1) === json([{ tag: "sp", text: "The woman speaking", notes: ["A note."] }]), `the band lists the label's footnote (got ${json(s1)})`);
+  const s2 = splitSectionHeaders(n2).sections;
+  assert(json(s2) === json([{ tag: "sp", text: "The woman", notes: ["1:1 Gen 1:1"] }]), `the band lists the label's cross reference (got ${json(s2)})`);
+  assert(json(splitSectionHeaders(v1).sections[0]) === json({ tag: "sp", text: "The woman thinks about the man she loves" }), "a label with no note has no notes field");
+  // The word right before the footnote, and the word right after it.
+  const labelBytes = (vos) => render(labelsOf(vos));
+  for (const [from, to] of [["woman", "lady"], ["speaking", "talking"]]) {
+    const e = editHeaderBand(n1, { index: 0, tag: "sp", text: "The woman speaking".replace(from, to) });
+    assert(labelBytes(e) === labelBytes(n1).replace(`\\w ${from}|`, `\\w ${to}|`), `band edit of "${from}" beside the footnote: only that word changes, the footnote stays (got ${json(labelBytes(e))})`);
+  }
+  const ex = editHeaderBand(n2, { index: 0, tag: "sp", text: "The lady" });
+  assert(labelBytes(ex) === labelBytes(n2).replace("\\w woman|", "\\w lady|"), `band edit of the word before a cross reference keeps it (got ${json(labelBytes(ex))})`);
+}
+
+// #1366 item 3: only character and note markers join a label's run. `\va`,
+// `\vp`, `\ca` and `\fig` are closed markers too, but not part of a speaker
+// label: a `\va` after a flat label stays in the verse (it used to be moved
+// into the label and vanish from the body). `\fe` and `\wj` still join.
+{
+  const fx = usfm.toJSON(String.raw`\c 1
+\p
+\v 1 \w Body|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \w man|x-occurrence="1" x-occurrences="1"\w*
+\va 2\va*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*
+\v 2 \w B|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \fe + \ft end\fe* \wj \w man|x-occurrence="1" x-occurrences="1"\w*\wj*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*
+\v 3 \w C|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \vp 2a\vp* \ca 3\ca* \fig A|src="a.jpg" size="col"\fig*
+\q1 \w Go|x-occurrence="1" x-occurrences="1"\w*
+`).chapters["1"];
+  const kids = (vos) => labelsOf(vos)[0].children.map((c) => c.tag ?? c.type);
+  const n1 = nestWordLabels(fx["1"].verseObjects);
+  assert(!kids(n1).includes("va") && n1[n1.indexOf(labelsOf(n1)[0]) + 1]?.tag === "va", `\\va after a label stays in the verse (got label ${json(kids(n1))})`);
+  assert(render(n1) === render(fx["1"].verseObjects), "\\va: renders byte-identical");
+  const n2 = nestWordLabels(fx["2"].verseObjects);
+  assert(kids(n2).includes("fe") && kids(n2).includes("wj") && n2[n2.indexOf(labelsOf(n2)[0]) + 1]?.tag === "q1", `\\fe and \\wj join the label (got ${json(kids(n2))})`);
+  const n3 = nestWordLabels(fx["3"].verseObjects);
+  assert(!kids(n3).some((k) => k === "vp" || k === "ca" || k === "fig"), `\\vp, \\ca, \\fig are not label markers (got ${json(kids(n3))})`);
+  assert(render(n3) === render(fx["3"].verseObjects), "\\vp/\\ca/\\fig: renders byte-identical");
+}
+
+// #1366 item 6 (kept as is, pinned): a band save with blank text writes the
+// label as plain text, so its words and their alignment go, as delete and a
+// retag already do (the body rule: deleting words drops their alignment).
+{
+  const blank = editHeaderBand(v4, { index: 2, tag: "sp", text: "" });
+  const l = labelsOf(blank)[2];
+  assert(json(l) === json({ tag: "sp", nextChar: " ", content: "\n" }) && labelsOf(blank).length === 4, `blank text: the label becomes an empty plain-text label (got ${json(l)})`);
+  assert(analyzeAlignmentDelta({ verseObjects: v4 }, { verseObjects: blank }).afterAligned < analyzeAlignmentDelta({ verseObjects: v4 }, { verseObjects: blank }).beforeAligned,
+    "blank text: the label's aligned words are gone");
+}
+
 // Review round 4 of #1350. The labels are Door43's bytes: the save's quote
 // curling (curlifyVerseContent, run on every typed save) must not touch a quote
 // inside a word label, and a quote only in a label must not make the save
