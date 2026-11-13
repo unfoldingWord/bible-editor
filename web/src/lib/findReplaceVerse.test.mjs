@@ -343,11 +343,11 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   const stale = (versesReplaced, staleRefused) =>
     bibleReplaceSummaryText({ versesReplaced, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, staleRefused });
   check(
-    stale(0, 1) === "1 verse not replaced: its saved search text is out of date, so the match could not be placed",
+    stale(0, 1) === "1 verse not replaced: its saved search text is out of date",
     "a stale-text refusal leads with the refusal, no \"replaced 0 verses\"",
   );
   check(
-    stale(2, 3) === "replaced 2 verses — 3 verses not replaced: their saved search text is out of date, so the match could not be placed",
+    stale(2, 3) === "replaced 2 verses — 3 verses not replaced: their saved search text is out of date",
     "replace-all with stale-text refusals: counts both",
   );
 }
