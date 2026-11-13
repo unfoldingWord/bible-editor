@@ -2312,7 +2312,9 @@ export async function applyTsvRows(
 
       // A human-protected tn row (preserve/hint/trashed — deleted_at is already
       // handled at the tombstone branch) must NEVER be overwritten from master,
-      // exactly as computeEditedFieldMerge enforces for the heuristic path. The
+      // exactly as computeEditedFieldMerge enforces for the heuristic path —
+      // except a preserve-only row whose master side a person moved (#1347,
+      // `preservedAuthor` below), which merges and writes with its own WHERE. The
       // three-way merge has no protection gate of its own, and buildTsvEditedWrite
       // Stmt's WHERE re-asserts these — so if we let a protected row become an
       // adopt, the write correctly 0-changes, but the lost-CAS branch below would
@@ -3389,7 +3391,9 @@ const TSV_MERGE_WRITE_COLS: Record<TsvKind, Set<string>> = {
 // human-owned) — and updated_by is never in the SET, so the row stays
 // attributed to that human. The same protections isReimportableRow checks are
 // re-asserted in the WHERE clause so a delete/trash/preserve/hint change landing
-// between the read and this batch blocks the write rather than racing it.
+// between the read and this batch blocks the write rather than racing it
+// (preserve excepted for a write decided under #1347's preserved-row gate —
+// see `allowPreserved`).
 // `provenance` (issue #686): this is the KEY attribution site — the one write
 // where master's content actually overwrites a human-owned row (the three-way
 // merge adoption). The actor must be the measured commit author, never a

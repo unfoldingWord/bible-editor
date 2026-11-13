@@ -5982,6 +5982,54 @@ console.log("\n[#1347: a preserved note takes a person's Door43 fix, never the A
     eq(counts.apply_incomplete, false, `(5 ${label}) …no watermark hold`);
   }
 
+  // (5b) The real shapes of the ancestor. 47 of Richard's 50 EZK rows had a
+  //      translator edit (a PARTIAL `update` payload carrying the note), and 3
+  //      had no app edit at all. Neither has the full `create` row the seeds
+  //      above hand-write.
+  {
+    // A translator's note edit before the watermark, logged as rows.ts logs a
+    // PATCH (just the changed field), is enough of an ancestor for the note.
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version, preserve)
+         VALUES ('ytm6', ?, 40, 6, '40:6', ?, 10, 7, 3, 1)`,
+      )
+      .run(BOOK, BASE);
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tn', 'ytm6', ?, 'update', ?, 100)`,
+      )
+      .run(BOOK, JSON.stringify({ note: BASE }));
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+      confirmedAt: 200, editId: Number(e.lastInsertRowid), lineage: HUMAN,
+    });
+    eq(readRow(sqlite).note, RICHARD, "(5b) a partial note-edit ancestor is enough: the fix is adopted");
+    eq(counts.merge_adopted, 1, "(5b) …counted as an adoption");
+  }
+  {
+    // No app edit and no edit_log at all: no ancestor, so the sync cannot say
+    // which side moved. D1 is kept and flagged merge_no_base (before #1347 a
+    // preserved row got no flag here). The export still writes D1.
+    const { sqlite, env } = freshEnv();
+    sqlite
+      .prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version, preserve)
+         VALUES ('ytm6', ?, 40, 6, '40:6', ?, 10, NULL, 1, 1)`,
+      )
+      .run(BOOK, BASE);
+    const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+      confirmedAt: 200, editId: 1, lineage: HUMAN,
+    });
+    const row = readRow(sqlite);
+    eq(row.note, BASE, "(5b) no ancestor at all: D1 is kept");
+    eq(row.review_kind, "merge_no_base", "(5b) …and flagged, so the Door43 fix is not lost silently");
+    eq(counts.merge_no_base, 1, "(5b) …counted as merge_no_base");
+    eq(counts.preserved_held, 0, "(5b) …not as preserved_held (the author was known)");
+  }
+
   // (6) A Door43 editor moved the preserved row's reference AND edited its
   //     quote. A protected row never holds on a reference move (classifyTsvRef
   //     Move is "none" for it), so adopting master's quote here would publish it

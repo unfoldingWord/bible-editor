@@ -908,6 +908,15 @@ Highlights that bite repeatedly:
 - **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in
   local D1 for a live test is overwritten before the test starts. Run a one-off spec with a config that spreads
   `playwright.config.ts` and sets `globalSetup: undefined` (measured 2026-11-12).
+- **Preserve blocks the AI note writer only, and "a person moved master" is proven per FILE, not per verse (#1347).**
+  Benjamin's decision A (2026-11-13). A preserve-only tn row merges like any human-edited row when the lineage is a
+  complete walk with a human commit and `counts.ai === 0` (`preservedRowMasterAuthor`); it is skipped as before when
+  the per-verse lineage says no human touched it; anything else keeps D1 and flags `merge_no_base`. Per-verse refs
+  cannot prove "human": `refsTouchedInTsv` has no row-id filter (a person fixing note X and the AI rewriting preserved
+  note Y at one verse look alike), and refs are mapped only for up to 3 human commits, so a real cleanup pass leaves
+  them unmapped. Two inversions to keep straight: `masterMayHoldHumanEditForVerse` answers "true" on doubt, which is
+  protective for an ordinary row and exactly wrong for a preserved one; and `buildTsvEditedWriteStmt` drops
+  `preserve = 0` only for writes decided under this gate, because a preserve toggle does not bump `version`.
 
 ## Stop conditions / goals
 
