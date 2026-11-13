@@ -9,6 +9,7 @@
 import {
   smartEditVerse,
   smartReplaceVerse,
+  renumberTargetOccurrences,
   tokenizePlainText,
   tokenizeEditableText,
   __reanchorMarkersForTest as reanchorMarkers,
@@ -4092,14 +4093,20 @@ function countAllMilestones(nodes) {
 // skip them; the engine must too, or its raw text holds the label words and an
 // edit lands on the wrong word (the #1311 failure). Real Door43 en_ust SNG 1:1
 // (label at the verse end) and 1:4 (four labels, one with \zaln milestones).
-// Every edit must leave each label node exactly as it was: same words, same
-// attributes, so the export still writes Door43's `\sp \w The\w* …` bytes.
+// Every edit must leave each label's words exactly as they were. Their
+// occurrence numbers are the one thing that may move: Door43 and the export
+// count a word over the whole verse, label included, so changing a body "to"
+// renumbers the label's "to"s too (the export would do the same). An edit to a
+// word no label holds leaves every label byte for byte.
 {
   console.log("\n[Case 97] Edits beside a \\sp label written as words leave the label exactly as it was (#1350)");
   const sng = usfm.toJSON(readFileSync(resolve(repoRoot, "api/src/fixtures/sng-sp-labels.usfm.txt"), "utf8")).chapters["1"];
   const verseOf = (v) => ({ verseObjects: nestWordLabels(sng[v].verseObjects) });
   const clone = (c) => JSON.parse(JSON.stringify(c));
   const labels = (content) => JSON.stringify(content.verseObjects.filter((n) => n && n.tag === "sp"));
+  const noOcc = (k, v) => (k === "occurrence" || k === "occurrences" ? undefined : v);
+  const labelWords = (content) => JSON.stringify(content.verseObjects.filter((n) => n && n.tag === "sp"), noOcc);
+  const countedWhole = (content) => renumberTargetOccurrences(content.verseObjects) === content.verseObjects;
   const render = (content) => usfm.toUSFM({ headers: [], chapters: { 1: { 1: content } } }, { forcedNewLines: true });
   const labelBlocks = (content) => content.verseObjects.filter((n) => n && n.tag === "sp").map((n) => render({ verseObjects: [n] }));
   const words = (content) => alignedWords(content).map((x) => `${x.text}:${x.strongs.length}`).join("|");
@@ -4117,8 +4124,16 @@ function countAllMilestones(nodes) {
       const r = fn(clone(v4), p4, /to/g, at, 2, "for");
       const want = p4.slice(0, at) + "for" + p4.slice(at + 2);
       assert(extractPlainText(r.content) === want, `${entry}: to -> for after the labels edits the picked word (got ${JSON.stringify(extractPlainText(r.content))})`);
-      assert(labels(r.content) === labels(v4), `${entry}: to -> for: every label is unchanged`);
-      assert(JSON.stringify(labelBlocks(r.content)) === JSON.stringify(labelBlocks(v4)), `${entry}: to -> for: the labels render to the same USFM`);
+      assert(labelWords(r.content) === labelWords(v4), `${entry}: to -> for: every label keeps its words`);
+      assert(countedWhole(r.content), `${entry}: to -> for: occurrences are counted over the whole verse, labels included`);
+    }
+    // "king" is in no label: every label stays byte for byte.
+    const k = p4.indexOf("king");
+    for (const [entry, fn] of [["smartReplaceVerse", smartReplaceVerse], ["findReplaceVerse", findReplaceVerse]]) {
+      const r = fn(clone(v4), p4, /king/g, k, 4, "ruler");
+      assert(extractPlainText(r.content) === p4.replace("king", "ruler"), `${entry}: king -> ruler (got ${JSON.stringify(extractPlainText(r.content))})`);
+      assert(labels(r.content) === labels(v4), `${entry}: king -> ruler: every label is unchanged`);
+      assert(JSON.stringify(labelBlocks(r.content)) === JSON.stringify(labelBlocks(v4)), `${entry}: king -> ruler: the labels render to the same USFM`);
     }
   }
   // Find/replace of the last word before a label at the verse end.
@@ -4134,7 +4149,9 @@ function countAllMilestones(nodes) {
     assert(!/speaking/.test(old), `setup: 1:4 editable text skips the labels (got ${JSON.stringify(old)})`);
     const r = smartEditVerse(clone(v4), old, old.replace("king to me", "king for me"), { capturedFromDom: true });
     assert(extractEditableText(r.content) === old.replace("king to me", "king for me"), `typed to -> for (got ${JSON.stringify(extractEditableText(r.content))})`);
-    assert(labels(r.content) === labels(v4), "typed to -> for: every label is unchanged");
+    assert(labelWords(r.content) === labelWords(v4) && countedWhole(r.content), "typed to -> for: every label keeps its words; occurrences counted over the whole verse");
+    const kr = smartEditVerse(clone(v4), old, old.replace("king", "ruler"), { capturedFromDom: true });
+    assert(labels(kr.content) === labels(v4), "typed king -> ruler: every label is unchanged");
     const before = words(v4).split("|").filter((x) => !x.startsWith("to:")).join("|");
     const after = words(r.content).split("|").filter((x) => !x.startsWith("to:") && !x.startsWith("for:")).join("|");
     assert(after === before, `typed to -> for: untouched words keep their alignment (got ${after})`);

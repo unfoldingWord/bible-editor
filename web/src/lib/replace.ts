@@ -1359,6 +1359,88 @@ export function smartReplaceVerse(
   matchStartInPlain: number,
   matchLenInPlain: number,
   replaceText: string,
+  options: { findReplace?: boolean; typed?: boolean } = {},
+): SmartReplaceResult {
+  return withWordLabelsAsText(content, (c) =>
+    smartReplaceVerseInner(c, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options),
+  );
+}
+
+// A `\sp` label written as words (#1350) is stored with its `\w` words as the
+// label node's `children` (nestWordLabels in usfm.ts). Plain and editable text
+// skip the whole node, but every walker in this engine (walkLeaves, rebuildRaw,
+// the relayout and reassembly tiers) descends `children`, so its raw text would
+// hold the label's words and an edit could land on them (the #1311 failure).
+// The engine already handles the usfm-js shape of a plain-text label
+// (`{tag:"sp", text}`): blankHeaderLabels and friends keep it out of the match
+// and out of every rewrite. So for the length of one edit, show it each word
+// label in that shape, holding the real words aside on the node, and put the
+// words back afterwards. Then the occurrence numbers are recounted over the
+// whole verse, label words included, as Door43 and the export count them.
+// The label must come back with the same text, in the same order; if any did
+// not, the edit is refused (content and plain text returned unchanged) rather
+// than saving a label in a different shape. A verse with no word label runs the
+// engine exactly as before.
+const LABEL_WORDS = "__beLabelWords";
+
+function rawTextOf(nodes: unknown[]): string {
+  let s = "";
+  for (const n of nodes) {
+    const o = n as Record<string, unknown> | null;
+    if (!o) continue;
+    if (typeof o["text"] === "string") s += o["text"];
+    if (Array.isArray(o["children"])) s += rawTextOf(o["children"] as unknown[]);
+  }
+  return s;
+}
+
+function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult): SmartReplaceResult {
+  const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (!Array.isArray(vo)) return run(content);
+  const before: string[] = [];
+  const collapsed = vo.map((n) => {
+    const o = n as Record<string, unknown> | null;
+    if (!o || !isHeaderLabelNode(o) || !Array.isArray(o["children"]) || o["text"] !== undefined || o["content"] !== undefined) return n;
+    const { children, endTag, ...rest } = o;
+    const text = rawTextOf(children as unknown[]);
+    before.push(text);
+    return { ...rest, text, [LABEL_WORDS]: { children, endTag } };
+  });
+  if (before.length === 0) return run(content);
+  const result = run({ ...(content as Record<string, unknown>), verseObjects: collapsed });
+  const refuse = (why: string): SmartReplaceResult => {
+    console.warn(`[replace] edit refused: it would change a speaker label written as words (${why}) (#1350).`);
+    return { content, plainText: extractPlainText(content), preservedAlignment: true };
+  };
+  const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (!Array.isArray(out)) return refuse("no verse tree");
+  const after: string[] = [];
+  const expand = (nodes: unknown[], depth: number): unknown[] =>
+    nodes.map((n) => {
+      const o = n as Record<string, unknown> | null;
+      if (!o) return n;
+      if (o[LABEL_WORDS] !== undefined) {
+        const { [LABEL_WORDS]: held, text, ...rest } = o;
+        after.push(depth === 0 ? String(text ?? "") : "\u0000nested");
+        return { ...rest, ...(held as Record<string, unknown>) };
+      }
+      return Array.isArray(o["children"]) ? { ...o, children: expand(o["children"] as unknown[], depth + 1) } : n;
+    });
+  const expanded = expand(out, 0);
+  const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+  if (after.length !== before.length || after.some((t, i) => norm(t) !== norm(before[i]))) {
+    return refuse(`labels before ${JSON.stringify(before.map(norm))}, after ${JSON.stringify(after.map(norm))}`);
+  }
+  return { ...result, content: { ...(result.content as Record<string, unknown>), verseObjects: renumberTargetOccurrences(expanded) } };
+}
+
+function smartReplaceVerseInner(
+  content: unknown,
+  plainText: string,
+  regex: RegExp,
+  matchStartInPlain: number,
+  matchLenInPlain: number,
+  replaceText: string,
   // Find/replace callers (findReplaceVerse.ts) pass `findReplace: true`: a
   // whitespace-only match at a bare marker is then a no-op (see the Impl).
   // Typed saves (smartEditVerse) don't, so a character typed beside the chip
@@ -2983,6 +3065,8 @@ function separateFusedSeams(verseObjects: unknown[], newStripped: string, layout
 //
 // First we try the preserve path via smartReplaceVerse on the diff; if the
 // word counts don't line up, we drop to localizedRewriteVerse.
+// A `\sp` label written as words is shown to the engine as a plain-text label
+// for the length of the edit (withWordLabelsAsText, #1350).
 export function smartEditVerse(
   content: unknown,
   oldPlain: string,
@@ -2994,6 +3078,15 @@ export function smartEditVerse(
   // markers is authoritative there. Defaults off so every non-DOM caller keeps
   // the old behavior. (#606)
   opts: { capturedFromDom?: boolean } = {},
+): SmartReplaceResult {
+  return withWordLabelsAsText(content, (c) => smartEditVerseInner(c, oldPlain, newPlain, opts));
+}
+
+function smartEditVerseInner(
+  content: unknown,
+  oldPlain: string,
+  newPlain: string,
+  opts: { capturedFromDom?: boolean },
 ): SmartReplaceResult {
   // The diff is character-exact (diffSingleChange), but `oldPlain` is the
   // whitespace-collapsed extractEditableText baseline while `newPlain` is
@@ -3160,7 +3253,7 @@ export function smartEditVerse(
         const matchText = oldStripped.slice(diff.start, diff.start + diff.oldLen);
         const escaped = matchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         const re = new RegExp(escaped, "g");
-        result = smartReplaceVerse(
+        result = smartReplaceVerseInner(
           content,
           oldStripped,
           re,

@@ -19,7 +19,7 @@ import usfm from "usfm-js";
 // Imported from the canonical importer rather than mirrored like
 // normalizeWordPunctuation below: the transform is large and must stay in
 // lockstep with extractVersesForRange. Node 24 strips the .ts types on import.
-import { splitGluedAlignmentWords, isHeaderLabelNode } from "../api/src/importParsers.ts";
+import { splitGluedAlignmentWords, isHeaderLabelNode, nestWordLabels } from "../api/src/importParsers.ts";
 // Issue #686 item 5: this bootstrap importer left every row's 0060
 // provenance columns NULL and its edit_log 'create' rows carrying no `book`
 // — indistinguishable from "never touched" and, for the edit_log rows, not
@@ -146,9 +146,10 @@ function importVerses(bibleVersion, srcPath) {
       const normalized = {
         ...verseObj,
         // Strip outer punctuation, then de-glue any punctuation-spanning `\w`
-        // (e.g. `\w out”—the\w*`) — same order as extractVersesForRange.
-        verseObjects: splitGluedAlignmentWords(
-          normalizeWordPunctuation(verseObj.verseObjects ?? []),
+        // (e.g. `\w out”—the\w*`) — same order as extractVersesForRange. Last,
+        // nest a `\sp` label written as words into its label node (#1350).
+        verseObjects: nestWordLabels(
+          splitGluedAlignmentWords(normalizeWordPunctuation(verseObj.verseObjects ?? [])),
         ),
       };
       const text = extractPlainText(normalized);
