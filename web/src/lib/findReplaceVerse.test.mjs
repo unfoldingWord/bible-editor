@@ -373,7 +373,7 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   // line break, so in front of the label too, and this was refused. The
   // recased word now stays after the break, so the replace saves with the
   // label still between "and" and "\q1 he".
-  const bareVerse = { verseObjects: [w("A"), t(" "), w("home"), label, { tag: "q1", type: "quote" }, w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
+  const bareVerse = { verseObjects: [t("“"), w("home"), label, { tag: "q1", type: "quote" }, w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
   const barePlain = extractPlainText(bareVerse);
   {
     const warn = console.warn;
@@ -384,12 +384,14 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
       const ki = kvos.findIndex((n) => n.tag === "sp");
       check(kept.labelRefusals === undefined && kept.plainText === "A home and he ran home." && kvos[ki + 1]?.tag === "q1" && kvos[ki + 2]?.text === "he",
         `a recase after the label's line break: saved, "he" still after the label (got ${JSON.stringify(kept.plainText)})`);
-      // A line marker with no text beside it (`home \sp … \q1 He`) still
-      // moves the recased word before the break (a separate gap, the
-      // engine's seam path), which would put it in front of the label.
-      // Refused and counted (review round 4 of #1350, item 1).
-      check(barePlain === "A home He ran home.", `setup: bare-marker label verse (got ${JSON.stringify(barePlain)})`);
-      const moved = findReplaceVerse(bareVerse, barePlain, /home He/g, barePlain.indexOf("home He"), 7, "home; he");
+      // A line marker with no text beside it (`“home \sp … \q1 He`):
+      // deleting the word before it moves the kept `He` before the break
+      // (replace.test.mjs Case 91 pins that for `“name\q1 this`), which would
+      // put it in front of the label. Refused and counted (review round 4 of
+      // #1350, item 1). A recase there (`home He` -> `home; he`) stays after
+      // the break since #1361, so it no longer serves here.
+      check(barePlain === "“home He ran home.", `setup: bare-marker label verse (got ${JSON.stringify(barePlain)})`);
+      const moved = findReplaceVerse(bareVerse, barePlain, /home He/g, barePlain.indexOf("home He"), 7, "He");
       check(moved.labelRefusals === 1 && moved.plainText === barePlain, `a replace that moves a word across the label: refused (got ${JSON.stringify(moved.plainText)})`);
     } finally {
       console.warn = warn;
@@ -412,7 +414,7 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     // meets the refused "home. He" again: that refusal must still be counted
     // (review round 4 of #1350).
     const re = /home He|ran/g;
-    const rematch = replaceAllInVerse(bareVerse, barePlain, re, 2, "home; he ran");
+    const rematch = replaceAllInVerse(bareVerse, barePlain, re, 2, "He ran");
     check(rematch.labelRefusals === 1, `replace-all whose replacement re-matches: the refused match is still counted (got ${rematch.labelRefusals})`);
   } finally {
     console.warn = warn;
