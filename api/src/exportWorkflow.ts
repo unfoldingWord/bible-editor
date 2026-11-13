@@ -969,15 +969,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // The message says whether anything actually pushed, so a dry-run
       // bypass and a live one are distinguishable in the audit trail.
       //
-      // The message MUST carry a per-run varying detail (here, instanceId).
-      // writeAlert (below) skips its insert when the most recent alert for
-      // this source was dismissed and carries an IDENTICAL message — a rule
-      // that exists so a nightly-retried failure doesn't reappear after being
-      // dismissed (issue #458). Unlike those failure alerts, this message used
-      // to be a constant string per (book, resource), so dismissing one bypass
-      // permanently silenced every future bypass of that book+resource — the
-      // "durable record" this alert exists to be stopped being written at all
-      // (issue #514). instanceId also gives 1's triage the run identity.
+      // kind 'record' (issue #1363): the bypass is something a human chose
+      // and that happened as expected — nothing left to decide — so it goes
+      // to the admin activity log (GET /api/admin/sync-activity), not the
+      // personal sync-warnings badge (GET /api/alerts/me). As 'review', every
+      // Lock & push put five info rows (one per resource) in the badge. The
+      // separate "locked push landed on Door43" note (issue #1127,
+      // lockedPushLanded) stays a review alert, since it fires only when a
+      // commit actually reached Door43.
+      //
+      // The message carries instanceId so each bypass leaves its own row and
+      // names its run (issue #514). The event key makes a retried step.do
+      // replay of the same run idempotent (INSERT OR IGNORE against the
+      // record event_key unique index), since a record row, unlike a review
+      // row, is appended rather than replaced.
       await this.writeAlert(
         `export_lock_override:${book}:${resource}`,
         `${book} ${resource.toUpperCase()}: book-lock guard bypassed by explicit request — ` +
@@ -985,6 +990,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           (dcsAllowed ? "." : " (dry run — no Door43 push, but D1 may still have been written)."),
         `${this.env.DCS_BASE_URL}/unfoldingWord`,
         "info",
+        "record",
+        `${instanceId}:export_lock_override:${book}:${resource}`,
       );
     }
 
@@ -3676,9 +3683,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // 'info' — `severity` already has an 'info' value, and reusing the literal
   // for a different axis invites a future caller to bind the wrong
   // parameter. Almost every alert in this file blocks or holds an export and
-  // is genuinely actionable, so 'review' stays the default; only the two
-  // callers that explicitly say "this does not block the export" pass
-  // 'record'.
+  // is genuinely actionable, so 'review' stays the default; only callers
+  // that explicitly say "this does not block the export" (the revert-report
+  // records, the lock-override bypass record) pass 'record'.
   private async writeAlert(
     source: string,
     message: string,
