@@ -352,4 +352,63 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   );
 }
 
+// A `\sp` label written as words (#1350). A replace across one goes through,
+// the label staying before its line marker. When the engine refuses a verse
+// (here: the label is followed by a footnote, not a line marker, so it has no
+// anchor), single replace and replace-all report the refused matches (the
+// overlay shows the count) instead of skipping them silently.
+{
+  const w = (text) => ({ text, tag: "w", type: "word", occurrence: "1", occurrences: "1" });
+  const t = (text) => ({ type: "text", text });
+  const label = { tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("man"), t("\n")], endTag: "" };
+  const verse = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label, { tag: "q1", type: "quote" }, w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
+  const plain = extractPlainText(verse);
+  check(plain === "A home. He ran home.", `setup: plain text skips the label (got ${JSON.stringify(plain)})`);
+  const across = findReplaceVerse(verse, plain, /home\. He/g, plain.indexOf("home. He"), 8, "home. She");
+  const vos = across.content.verseObjects;
+  const li = vos.findIndex((n) => n.tag === "sp");
+  check(across.labelRefusals === undefined && across.plainText === "A home. She ran home." && vos[li + 1]?.tag === "q1",
+    `replace across the label: replaced, label still before its \\q1 (got ${JSON.stringify(across.plainText)})`);
+  // "home. He" -> "home and he": the engine saves "he" before the line break
+  // (as it does with no label), which would put it before the label too.
+  // Refused and counted (review round 4 of #1350, item 1).
+  {
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      const moved = findReplaceVerse(verse, plain, /home\. He/g, plain.indexOf("home. He"), 8, "home and he");
+      check(moved.labelRefusals === 1 && moved.plainText === plain, `a replace that moves a word across the label: refused (got ${JSON.stringify(moved.plainText)})`);
+    } finally {
+      console.warn = warn;
+    }
+  }
+
+  const footnote = { tag: "f", type: "footnote", content: "+ \\ft a note", endTag: "f*" };
+  const odd = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label, footnote, { tag: "q1", type: "quote" }, w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const one = findReplaceVerse(odd, plain, /ran/g, plain.indexOf("ran"), 3, "went");
+    check(one.labelRefusals === 1 && one.plainText === plain && one.content === odd, `single replace in a verse whose label can't be anchored: refused, counted, verse untouched (got ${one.labelRefusals})`);
+    const all = replaceAllInVerse(odd, plain, /home/g, 2, "house");
+    check(all.labelRefusals === 2 && all.plainText === plain, `replace-all there: both matches counted once, nothing replaced (got ${all.labelRefusals})`);
+    const clean = replaceAllInVerse(verse, plain, /ran/g, 1, "went");
+    check(clean.labelRefusals === undefined && clean.plainText === "A home. He went home.", "no refusal: no count");
+    // A replacement that matches the pattern again ("ran" -> "and he ran")
+    // ends the loop at its cap right after an applied step, before the pass
+    // meets the refused "home. He" again: that refusal must still be counted
+    // (review round 4 of #1350).
+    const re = /home\. He|ran/g;
+    const rematch = replaceAllInVerse(verse, plain, re, 2, "and he ran");
+    check(rematch.labelRefusals === 1, `replace-all whose replacement re-matches: the refused match is still counted (got ${rematch.labelRefusals})`);
+  } finally {
+    console.warn = warn;
+  }
+  const lbl = (versesReplaced, labelRefused) =>
+    bibleReplaceSummaryText({ versesReplaced, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, labelRefused });
+  check(lbl(0, 1) === "1 match not replaced: it would move a speaker label", `a label refusal leads with the refusal (got ${lbl(0, 1)})`);
+  check(lbl(2, 3) === "replaced 2 verses — 3 matches not replaced: they would move a speaker label", `replace-all with label refusals counts both (got ${lbl(2, 3)})`);
+}
+
+
 console.log(`\nfindReplaceVerse: all ${passed} checks passed.`);

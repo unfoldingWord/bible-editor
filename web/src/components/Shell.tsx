@@ -57,9 +57,9 @@ import { BookLocksDialog } from "./BookLocksDialog";
 import { shouldApplyUpsert } from "./rowUpsertGuard";
 import { drafts, verseKey, rowKey as draftRowKey, pinVerseBase, pinEpoch, unpinVerseBaseIfIdle, holdVerseBaseForEditor, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
-import { smartEditVerse } from "../lib/replace";
+import { smartEditVerse, labelRefusalText } from "../lib/replace";
 import { adoptBaseQuotes, curlifyVerseContent } from "../lib/curlyVerse";
-import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, SECTION_HEADER_TAGS } from "../lib/usfm";
+import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, rewriteHeaderLabel } from "../lib/usfm";
 import { chapterOpensWithoutMarker, introEditBase } from "../lib/verseIntro";
 import { verseHasUnalignedWork, countUnalignedTargetWords } from "../lib/alignment";
 import { versionNeedingAlignment } from "../lib/alignerVersion";
@@ -4277,6 +4277,39 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const engineResult = smartEditVerse(effectiveBase.content, oldEditable, typedEditable, {
       capturedFromDom: true,
     });
+    // The engine refused: the edit would change, drop or move a `\sp` speaker
+    // label written as words (#1350). Queue nothing (no version bump, no
+    // history) and leave any keystroke draft alone, so typed text stays in the
+    // editor; like refuseCommit (and the reading line's book-lock refusal),
+    // afterCommit does not run and the "save, mark done, next" chain is freed.
+    // A draftless save (Copy T4T to UST, the dual aligner's reading line) still
+    // pinned a base above: release it as the no-op path does (#563), or the
+    // leaked pin poisons every later save of this verse.
+    if (engineResult.labelRefused) {
+      saveDoneGuardRef.current.cancel();
+      const where = `${book} ${chapterNum}:${verseNum} ${bibleVersion}`;
+      const epoch = pinEpoch(key);
+      // What the engine refused, and why (see withWordLabelsAsText).
+      const why = labelRefusalText(engineResult.labelRefusedReason);
+      void drafts
+        .get(key)
+        .then((draft) => {
+          if (!draft) unpinVerseBaseIfIdle(key, epoch);
+          pushPipelineToast(
+            draft
+              ? `Not saved: this edit in ${where} ${why}. Your typed text is still in the editor.`
+              : `Not saved: this change to ${where} ${why}.`,
+            "error",
+          );
+        })
+        .catch(() => {
+          // The draft store is unreadable: release the pin anyway. The idle
+          // check keeps it if a draft session in this tab still depends on it.
+          unpinVerseBaseIfIdle(key, epoch);
+          pushPipelineToast(`Not saved: this change to ${where} ${why}.`, "error");
+        });
+      return;
+    }
     // Curl any straight quote left in the verse (#1273): the typing
     // interceptor misses multi-character inserts, IME, drops and Copy T4T to
     // UST. Done on the engine's result, never on the typed text, which would
@@ -4512,24 +4545,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       const o = node as Record<string, unknown> | null;
       if (o && isHeaderLabelNode(o)) {
         if (sectionIdx === change.index) {
-          if (change.tag !== null) {
-            // usfm-js stores \s* heading text (and `\sr`/`\r`/`\cl` label
-            // text) in `content` (with a trailing \n that the renderer/
-            // exporter expects); only `\sp` parks it on `text` instead —
-            // splitSectionHeaders/isHeaderLabelNode read either, but always
-            // WRITE `content` here so every tag round-trips the same way
-            // (usfm-js's toUSFM accepts `content` for all of them — #710).
-            // The edit dropdown only ever offers s1/s2/s3, so a `\sp`/`\sr`/
-            // `\r`/`\cl` label retagged through it becomes a section heading
-            // and must gain `type:"section"` — carrying the OLD node's
-            // (absent) type forward would make isHeaderLabelNode stop
-            // recognizing the result on the next render (it's typeless and
-            // "s1" isn't in HEADER_LABEL_TAGS), silently orphaning it from
-            // the header band even though the data itself stays intact.
-            const { text: _drop, type: _dropType, ...rest } = o;
-            const type = SECTION_HEADER_TAGS.has(change.tag) ? "section" : undefined;
-            next.push({ ...rest, ...(type ? { type } : {}), tag: change.tag, content: `${change.text}\n` });
-          }
+          // Tag/text swap; see rewriteHeaderLabel for the node shape it writes.
+          if (change.tag !== null) next.push(rewriteHeaderLabel(o, change.tag, change.text));
           // null tag → drop the node entirely.
           sectionIdx++;
           continue;

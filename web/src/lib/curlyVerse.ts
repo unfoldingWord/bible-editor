@@ -23,6 +23,7 @@
 import { renumberTargetOccurrences } from "./replace.ts";
 import { hoistOpeningPunctuation } from "./openingPunct.ts";
 import { WORD_RUN_RE } from "./wordRun.ts";
+import { isWordLabelNode } from "./usfm.ts";
 
 const CURLY_LDQUO = "“";
 const CURLY_RDQUO = "”";
@@ -106,6 +107,10 @@ function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
   const walk = (nodes: unknown[]): void => {
     for (const node of nodes) {
       if (!node || typeof node !== "object") continue;
+      // A `\sp` label written as words (#1350) is Door43's text, kept byte for
+      // byte: never curled. It always sits right before a line marker, which
+      // resets the context, so skipping it changes nothing after it.
+      if (isWordLabelNode(node)) continue;
       const o = node as Record<string, unknown>;
       const isLineMarker =
         o["type"] === "paragraph" ||
@@ -135,6 +140,7 @@ function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
 function hasStraightQuoteText(nodes: unknown[]): boolean {
   for (const node of nodes) {
     if (!node || typeof node !== "object") continue;
+    if (isWordLabelNode(node)) continue; // never curled (above)
     const o = node as Record<string, unknown>;
     const isSourceMilestone = o["type"] === "milestone" && o["tag"] === "zaln";
     if (!isSourceMilestone && typeof o["text"] === "string" && /['"]/.test(o["text"])) return true;

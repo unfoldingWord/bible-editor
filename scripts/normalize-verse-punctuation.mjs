@@ -29,6 +29,7 @@ import {
   normalizeWordPunctuation,
   splitGluedAlignmentWords,
   isHeaderLabelNode,
+  nestWordLabels,
 } from "../api/src/importParsers.ts";
 // Issue #686 item 5: a direct-SQL repair must not leave a row claiming its
 // PREVIOUS provenance (e.g. still reading as a Door43-pristine or in-app
@@ -105,7 +106,9 @@ for (const row of rows) {
   }
   const before = parsedContent.verseObjects;
   if (!Array.isArray(before)) continue;
-  const after = splitGluedAlignmentWords(normalizeWordPunctuation(before));
+  // Last, as in extractVersesForRange: a `\sp` label written as words stays
+  // nested in its label node, never flat body words (#1350).
+  const after = nestWordLabels(splitGluedAlignmentWords(normalizeWordPunctuation(before)));
   const beforeStr = JSON.stringify(before);
   const afterStr = JSON.stringify(after);
   if (beforeStr === afterStr) continue;

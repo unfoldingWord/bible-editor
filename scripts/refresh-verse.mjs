@@ -17,7 +17,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import usfm from "usfm-js";
-import { isHeaderLabelNode } from "../api/src/importParsers.ts";
+import { isHeaderLabelNode, nestWordLabels } from "../api/src/importParsers.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -111,6 +111,8 @@ function extractPlainText(vObj) {
   return parts.join("").replace(/\s+/g, " ").trim();
 }
 
+// A `\sp` label written as words goes into its label node, as on import (#1350).
+verseObj = { ...verseObj, verseObjects: nestWordLabels(verseObj.verseObjects ?? []) };
 const text = extractPlainText(verseObj);
 const json_blob = JSON.stringify(verseObj);
 const q = (v) => {

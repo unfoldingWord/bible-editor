@@ -33,7 +33,7 @@
 // outboxTargeting.ts exists). See verseRebase.test.mjs.
 
 import { smartEditVerse } from "../lib/replace.ts";
-import { extractEditableText, extractPlainText } from "../lib/usfm.ts";
+import { extractEditableText, extractPlainText, nestWordLabels } from "../lib/usfm.ts";
 import { nfc } from "../lib/hebrew.ts";
 import { curlifyVerseContent } from "../lib/curlyVerse.ts";
 
@@ -67,7 +67,9 @@ export type VerseRebaseOutcome =
 // body's `content` on the thread path).
 //
 // Intent handling:
-//   - text_edit / find_replace / absent: rebase via smartEditVerse. NOTE the
+//   - text_edit / find_replace / absent: rebase via smartEditVerse, or
+//     refuse_thread when the engine refuses the edit beside a `\sp` label
+//     written as words (labelRefused, #1350). NOTE the
 //     rebase only carries what extractEditableText can see — content invisible
 //     to it (e.g. \f footnote prose) is adopted from the SERVER tree. Nothing
 //     user-editable travels that way in a text op today; a future producer of
@@ -94,15 +96,23 @@ export type VerseRebaseOutcome =
 //
 // Text compares go through nfc(): UHB-order combining marks vs NFC-order are
 // the same text to a translator and must not read as a text change.
+//
+// Both trees are read with any `\sp` label written as words nested first
+// (nestWordLabels, #1350): a tree stored or queued before the nest holds the
+// label's words as body words, and diffing it against a nested one read them
+// as typed text and copied the label into the body. A rebased tree is built on
+// the nested server tree.
 export function rebaseVersePatch(
   patch: Record<string, unknown>,
-  serverContent: unknown,
+  rawServerContent: unknown,
 ): VerseRebaseOutcome {
   const p = patch as VersePatchShape | null | undefined;
-  const content = p?.content;
-  if (content == null || serverContent == null || typeof serverContent !== "object") {
+  const rawContent = p?.content;
+  if (rawContent == null || rawServerContent == null || typeof rawServerContent !== "object") {
     return { kind: "verbatim" };
   }
+  const content = withNestedLabels(rawContent);
+  const serverContent = withNestedLabels(rawServerContent);
   let serverText: string;
   let opText: string;
   try {
@@ -152,6 +162,13 @@ export function rebaseVersePatch(
   }
   try {
     const result = smartEditVerse(curledServer, serverText, opText);
+    // The engine refused to apply the op's text beside a `\sp` label written as
+    // words (#1350) and handed back the server tree: rebasing to that would drop
+    // the queued edit silently. Refuse instead, as for an alignment_edit across
+    // a text change: the automatic thread path leaves the op on its old version
+    // so it 409s and the conflict prompt asks the user; the user's own resolve
+    // ("my edit wins") still sends the op's tree verbatim.
+    if (result.labelRefused) return { kind: "refuse_thread" };
     return {
       kind: "rebased",
       patch: {
@@ -163,4 +180,13 @@ export function rebaseVersePatch(
   } catch {
     return { kind: "verbatim" };
   }
+}
+
+// The tree with any flat `\sp` word label nested (see rebaseVersePatch). The
+// same object when there is nothing to nest.
+function withNestedLabels(content: unknown): unknown {
+  const vo = (content as { verseObjects?: unknown } | null)?.verseObjects;
+  if (!Array.isArray(vo)) return content;
+  const nested = nestWordLabels(vo);
+  return nested === vo ? content : { ...(content as Record<string, unknown>), verseObjects: nested };
 }

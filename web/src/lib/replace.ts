@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, isHeaderLabelNode, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, isHeaderLabelNode, isWordLabelNode, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 import { hoistOpeningPunctuation, concatVerseText, OPENING_PUNCT_RE } from "./openingPunct.ts";
@@ -34,6 +34,33 @@ export interface SmartReplaceResult {
   // surfaces this to the translator, because the override can also revert a
   // deliberate marker removal — see markerCaptureLooksDropped.
   markerCaptureGuarded?: boolean;
+  // Set when the edit was refused because it would change or drop a `\sp`
+  // label written as words (withWordLabelsAsText, #1350): `content` is the
+  // input, unchanged, and nothing should be saved. `labelRefusedReason` says
+  // why, for the message the translator sees.
+  labelRefused?: boolean;
+  labelRefusedReason?: LabelRefusalReason;
+}
+
+// Why withWordLabelsAsText refused an edit (#1350):
+//   "line-breaks"  a line break was added or removed in a verse with a label;
+//   "label-moved"  a line break moved, so a label would no longer sit between
+//                  the same words (or a word would cross it);
+//   "label-shape"  the verse has a label that is not followed by a line break,
+//                  so no edit to it can keep the label in place.
+export type LabelRefusalReason = "line-breaks" | "label-moved" | "label-shape";
+
+// The words a refusal toast gives for each reason ("Not saved: this edit in
+// SNG 1:4 UST <this>.").
+export function labelRefusalText(reason: LabelRefusalReason | undefined): string {
+  switch (reason) {
+    case "line-breaks":
+      return "would move a speaker label (a line break added or removed in a verse with a speaker label can't be saved yet)";
+    case "label-shape":
+      return "is in a verse whose speaker label has no line break after it (such a verse can't be edited here yet)";
+    default:
+      return "would move a speaker label, or a word to the other side of it";
+  }
 }
 
 interface Leaf {
@@ -1353,6 +1380,175 @@ export function renumberTargetOccurrences(nodes: unknown[]): unknown[] {
 // needs its own opening-punctuation hoist rather than relying on
 // smartEditVerse's final defense-in-depth block. See JER 31:10 / #777.
 export function smartReplaceVerse(
+  content: unknown,
+  plainText: string,
+  regex: RegExp,
+  matchStartInPlain: number,
+  matchLenInPlain: number,
+  replaceText: string,
+  options: { findReplace?: boolean; typed?: boolean } = {},
+): SmartReplaceResult {
+  return withWordLabelsAsText(content, (c) =>
+    smartReplaceVerseInner(c, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options),
+  );
+}
+
+// A `\sp` label written as words (#1350) is stored with its `\w` words as the
+// label node's `children` (nestWordLabels in usfm.ts). Plain and editable text
+// skip the whole node, but every walker in this engine (walkLeaves, rebuildRaw,
+// the relayout, reassembly and marker tiers) descends `children` or reads
+// `text`, so the label could be edited, blanked or moved: shown as a plain-text
+// label (`{tag:"sp", text}`), the whole-verse punctuation relayout overwrote
+// its text with gap punctuation (a "; -> ," anywhere in the verse), and the
+// marker tiers re-placed the `\q1` after it in front of it.
+//
+// So the engine never sees a word label. For the length of one edit each one
+// is taken out of the verse and anchored to the line marker right after it
+// (`\q1`, `\q2`, `\ts\*`: the Nth top-level line marker), or to the verse end.
+// USFM ends a `\sp` label at the next paragraph marker, so that is where it
+// belongs. After the edit each label goes back in front of the same Nth marker
+// (its tag may have changed, `\q1` -> `\q2`), or at the end. The occurrence
+// numbers are then recounted over the whole verse, label words included, as
+// Door43 and the export count them.
+//
+// The edit is refused (content and plain text returned unchanged,
+// labelRefused, labelRefusedReason) when that can't be done exactly: the number
+// of top-level line markers changed (a line break added or removed in a
+// labelled verse: "line-breaks"); a label's marker no longer sits between the
+// same words ("label-moved"); or a label is followed by something other than a
+// line marker or the verse end ("label-shape"). The count alone is not enough:
+// removing the `\q2` before a label and adding one after it keeps the count
+// but shifts every ordinal, so the label landed mid-speech. Nor is the
+// engine's own marker placement: a find/replace "bedroom. We" -> "bedroom; we"
+// saves "we" before the next line break (main does the same, ZEC 9:10 UST),
+// which here would put a word of the speech in front of its label. A verse with
+// no word label runs the engine exactly as before.
+function isTopLineMarker(n: unknown): boolean {
+  return isInFlowMarker(n) && !isCharacterWrapper(n);
+}
+
+// The body words of a verse, compared loosely (case and punctuation dropped, so
+// "We" and "we", "bedroom." and "bedroom;" are the same word), and for each
+// top-level line marker the number of those words before it. extractPlainText
+// puts a space at every line marker, so the words before a marker are exactly
+// the first ones of the whole verse.
+function wordKey(token: string): string {
+  return nfc(token).toLowerCase().replace(/[^\p{L}\p{N}\p{M}]/gu, "");
+}
+function bodyWordLayout(vo: unknown[]): { words: string[]; markerAt: number[] } {
+  const keys = (nodes: unknown[]) => extractPlainText({ verseObjects: nodes }).split(" ").map(wordKey).filter(Boolean);
+  const markerAt: number[] = [];
+  vo.forEach((n, i) => {
+    if (isTopLineMarker(n)) markerAt.push(keys(vo.slice(0, i)).length);
+  });
+  return { words: keys(vo), markerAt };
+}
+
+// For each old word, the index of the same word in the new list (or -1): the
+// common lead and tail, then a longest common subsequence of the middle.
+function matchWords(a: string[], b: string[]): number[] {
+  const map = new Array<number>(a.length).fill(-1);
+  let lead = 0;
+  while (lead < a.length && lead < b.length && a[lead] === b[lead]) map[lead] = lead++;
+  let tail = 0;
+  while (tail < a.length - lead && tail < b.length - lead && a[a.length - 1 - tail] === b[b.length - 1 - tail]) {
+    map[a.length - 1 - tail] = b.length - 1 - tail;
+    tail++;
+  }
+  const am = a.slice(lead, a.length - tail);
+  const bm = b.slice(lead, b.length - tail);
+  const lcs: number[][] = Array.from({ length: am.length + 1 }, () => new Array<number>(bm.length + 1).fill(0));
+  for (let i = am.length - 1; i >= 0; i--) {
+    for (let j = bm.length - 1; j >= 0; j--) {
+      lcs[i][j] = am[i] === bm[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+    }
+  }
+  for (let i = 0, j = 0; i < am.length && j < bm.length; ) {
+    if (am[i] === bm[j]) {
+      map[lead + i] = lead + j;
+      i++;
+      j++;
+    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) i++;
+    else j++;
+  }
+  return map;
+}
+
+// True when line marker `ordinal` sits between the same surviving words after
+// the edit as before: the nearest kept word before it is still before it, and
+// the nearest kept word after it still after it.
+function markerKeepsItsWords(before: { words: string[]; markerAt: number[] }, after: { words: string[]; markerAt: number[] }, map: number[], ordinal: number): boolean {
+  const p = before.markerAt[ordinal];
+  const q = after.markerAt[ordinal];
+  for (let i = p - 1; i >= 0; i--) {
+    if (map[i] >= 0) {
+      if (map[i] >= q) return false;
+      break;
+    }
+  }
+  for (let i = p; i < before.words.length; i++) {
+    if (map[i] >= 0) {
+      if (map[i] < q) return false;
+      break;
+    }
+  }
+  return true;
+}
+
+function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult): SmartReplaceResult {
+  const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (!Array.isArray(vo) || !vo.some(isWordLabelNode)) return run(content);
+  const refuse = (reason: LabelRefusalReason, why: string): SmartReplaceResult => {
+    console.warn(`[replace] edit refused: it would change a speaker label written as words (${why}) (#1350).`);
+    return { content, plainText: extractPlainText(content), preservedAlignment: true, labelRefused: true, labelRefusedReason: reason };
+  };
+  // Take the labels out; `anchor` is the ordinal of the line marker that
+  // follows (the markers seen so far), or "end".
+  const labels: { node: unknown; anchor: number | "end" }[] = [];
+  const stripped: unknown[] = [];
+  let markers = 0;
+  for (let i = 0; i < vo.length; i++) {
+    const n = vo[i];
+    if (isWordLabelNode(n)) {
+      let j = i + 1;
+      while (j < vo.length && isWordLabelNode(vo[j])) j++;
+      if (j >= vo.length) labels.push({ node: n, anchor: "end" });
+      else if (isTopLineMarker(vo[j])) labels.push({ node: n, anchor: markers });
+      else return refuse("label-shape", "a label not followed by a line marker");
+      continue;
+    }
+    if (isTopLineMarker(n)) markers++;
+    stripped.push(n);
+  }
+  const shown = { ...(content as Record<string, unknown>), verseObjects: stripped };
+  const result = run(shown);
+  // The engine changed nothing (it hands its input back): so does this.
+  if (result.content === shown) return { ...result, content };
+  const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (!Array.isArray(out)) return refuse("label-shape", "no verse tree");
+  if (out.filter(isTopLineMarker).length !== markers) return refuse("line-breaks", "the verse's line markers changed");
+  const before = bodyWordLayout(stripped);
+  const after = bodyWordLayout(out);
+  const map = matchWords(before.words, after.words);
+  for (const l of labels) {
+    if (l.anchor !== "end" && !markerKeepsItsWords(before, after, map, l.anchor)) {
+      return refuse("label-moved", "a label's line marker moved to other words");
+    }
+  }
+  const restored: unknown[] = [];
+  let m = 0;
+  for (const n of out) {
+    if (isTopLineMarker(n)) {
+      for (const l of labels) if (l.anchor === m) restored.push(l.node);
+      m++;
+    }
+    restored.push(n);
+  }
+  for (const l of labels) if (l.anchor === "end") restored.push(l.node);
+  return { ...result, content: { ...(result.content as Record<string, unknown>), verseObjects: renumberTargetOccurrences(restored) } };
+}
+
+function smartReplaceVerseInner(
   content: unknown,
   plainText: string,
   regex: RegExp,
@@ -2983,6 +3179,8 @@ function separateFusedSeams(verseObjects: unknown[], newStripped: string, layout
 //
 // First we try the preserve path via smartReplaceVerse on the diff; if the
 // word counts don't line up, we drop to localizedRewriteVerse.
+// A `\sp` label written as words is shown to the engine as a plain-text label
+// for the length of the edit (withWordLabelsAsText, #1350).
 export function smartEditVerse(
   content: unknown,
   oldPlain: string,
@@ -2994,6 +3192,15 @@ export function smartEditVerse(
   // markers is authoritative there. Defaults off so every non-DOM caller keeps
   // the old behavior. (#606)
   opts: { capturedFromDom?: boolean } = {},
+): SmartReplaceResult {
+  return withWordLabelsAsText(content, (c) => smartEditVerseInner(c, oldPlain, newPlain, opts));
+}
+
+function smartEditVerseInner(
+  content: unknown,
+  oldPlain: string,
+  newPlain: string,
+  opts: { capturedFromDom?: boolean },
 ): SmartReplaceResult {
   // The diff is character-exact (diffSingleChange), but `oldPlain` is the
   // whitespace-collapsed extractEditableText baseline while `newPlain` is
@@ -3160,7 +3367,7 @@ export function smartEditVerse(
         const matchText = oldStripped.slice(diff.start, diff.start + diff.oldLen);
         const escaped = matchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         const re = new RegExp(escaped, "g");
-        result = smartReplaceVerse(
+        result = smartReplaceVerseInner(
           content,
           oldStripped,
           re,

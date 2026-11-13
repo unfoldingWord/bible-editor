@@ -26,7 +26,7 @@ import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import usfm from "usfm-js";
-import { isHeaderLabelNode } from "../api/src/importParsers.ts";
+import { isHeaderLabelNode, nestWordLabels } from "../api/src/importParsers.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -101,8 +101,10 @@ async function frontRowsFor(book, num, bibleVersion, repo) {
     const chNum = parseInt(chapterKey, 10);
     if (!Number.isFinite(chNum)) continue;
     const chapterObj = json.chapters[chapterKey];
-    const front = chapterObj?.front;
-    if (!front) continue;
+    const rawFront = chapterObj?.front;
+    if (!rawFront) continue;
+    // A `\sp` label written as words goes into its label node, as on import (#1350).
+    const front = { ...rawFront, verseObjects: nestWordLabels(rawFront.verseObjects ?? []) };
     const objs = Array.isArray(front.verseObjects) ? front.verseObjects : [];
     if (objs.length === 0) continue;
     out.push({

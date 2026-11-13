@@ -23,6 +23,7 @@
 
 import assert from "node:assert/strict";
 import { rebaseVersePatch } from "./verseRebase.ts";
+import { smartEditVerse } from "../lib/replace.ts";
 import { analyzeAlignmentDelta, guardBlocksSave } from "../lib/alignmentDelta.ts";
 import { extractEditableText } from "../lib/usfm.ts";
 
@@ -306,5 +307,59 @@ const sourceOf = (content, word) => (wordSources(content).find(([tx]) => tx === 
   const restore = rebaseVersePatch({ content: server, alignment_intent: "alignment_edit" }, server);
   check(restore.kind === "verbatim", "an alignment_edit (restore) op is still sent verbatim");
 }
+
+// A rebase the engine refuses beside a `\sp` label written as words (#1350):
+// it hands back the server tree, and rebasing to that would drop the queued
+// edit silently. refuse_thread: the automatic thread path (outbox.ts
+// threadVersionToSiblings) leaves the op on its old version, so it 409s and
+// the conflict prompt asks; the user's resolve sends it as is (my edit wins).
+// Verbatim here would let the thread path re-send a stale tree with no prompt.
+// The engine refuses an edit that removes the line marker a label sits before
+// (here the op joined the two lines). A punctuation-only op rebases normally,
+// the label kept before its \q1 (review H1).
+{
+  const label = () => ({ tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("man"), t("\n")], endTag: "" });
+  const server = { verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(".\n"), label(), { tag: "q1", type: "quote" }, zaln("H3", [w("He")]), t(" "), zaln("H4", [w("ran")]), t(".")] };
+  const joined = { verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(" and "), label(), w("he"), t(" "), zaln("H4", [w("ran")]), t(".")] };
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    check(smartEditVerse(server, extractEditableText(server), extractEditableText(joined)).labelRefused === true, "setup: the engine refuses this edit");
+    const out = rebaseVersePatch({ content: joined }, server);
+    check(out.kind === "refuse_thread", `an edit the engine refuses beside a word label is not threaded (got ${out.kind})`);
+  } finally {
+    console.warn = warn;
+  }
+  const punct = { verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(";\n"), label(), { tag: "q1", type: "quote" }, zaln("H3", [w("He")]), t(" "), zaln("H4", [w("ran")]), t(".")] };
+  const re = rebaseVersePatch({ content: punct }, server);
+  const vos = re.patch?.content?.verseObjects ?? [];
+  const li = vos.findIndex((n) => n.tag === "sp");
+  check(re.kind === "rebased" && extractEditableText(re.patch.content) === extractEditableText(punct) && vos[li + 1]?.tag === "q1" && sourceOf(re.patch.content, "He") === "H3",
+    `a punctuation-only op beside a word label rebases normally (got ${re.kind})`);
+}
+
+// The re-nesting window (review round 4 of #1350): one side of a rebase holds
+// a word label nested (the import's shape), the other still flat (an empty
+// `sp` then the label's words as body words: a tree stored or queued before
+// the nest). Diffing them raw reads the label words as typed body text and
+// copies them into the body. Both sides are nested before the diff.
+{
+  const nested = () => ({ tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("man"), t("\n")], endTag: "" });
+  const flat = () => [{ tag: "sp", nextChar: " " }, w("The"), t(" "), w("man"), t("\n")];
+  const tree = (lbl, last) => ({ verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(".\n"), ...lbl, { tag: "q1", type: "quote" }, zaln("H3", [w("He")]), t(" "), zaln("H4", [w(last)]), t(".")] });
+  const bodyText = (c) => extractEditableText({ verseObjects: c.verseObjects.filter((n) => n.tag !== "sp") });
+  const labelCount = (c) => JSON.stringify(c).split('"man"').length - 1;
+  for (const [name, op, server] of [
+    ["flat op onto a nested server", tree(flat(), "went"), tree([nested()], "ran")],
+    ["nested op onto a flat server", tree([nested()], "went"), tree(flat(), "ran")],
+  ]) {
+    const out = rebaseVersePatch({ content: op }, server);
+    const c = out.patch?.content;
+    check(out.kind === "rebased" && c && extractEditableText(c) === "A home. \\q1 He went." && labelCount(c) === 1,
+      `${name}: the edit lands, the label stays a label, once (got ${out.kind} ${c ? JSON.stringify(extractEditableText(c)) : ""} labels=${c ? labelCount(c) : "-"})`);
+    check(c && !/man/.test(bodyText(c)), `${name}: no label word in the body`);
+  }
+}
+
 
 console.log(`\nverseRebase: all ${passed} checks passed.`);

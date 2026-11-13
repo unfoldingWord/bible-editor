@@ -20,7 +20,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import usfm from "usfm-js";
-import { isHeaderLabelNode } from "../api/src/importParsers.ts";
+import { isHeaderLabelNode, nestWordLabels } from "../api/src/importParsers.ts";
 // Issue #686 item 5: this script wipes + reinserts a whole book/version's
 // verses straight from Door43, leaving every row's provenance columns at
 // whatever they held before the DELETE (or NULL, on a fresh table) — the row
@@ -197,7 +197,7 @@ async function reimportVersion(book, num, version) {
       const verseObj = chapterObj[verseKey];
       const normalized = {
         ...verseObj,
-        verseObjects: normalizeWordPunctuation(verseObj.verseObjects ?? []),
+        verseObjects: nestWordLabels(normalizeWordPunctuation(verseObj.verseObjects ?? [])), // #1350: last, as in extractVersesForRange
       };
       const text = extractPlainText(normalized);
       const json_blob = JSON.stringify(normalized);
