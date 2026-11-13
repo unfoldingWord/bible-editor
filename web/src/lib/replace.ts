@@ -1723,7 +1723,18 @@ function moveLineMarkerBefore(vo: unknown[], ordinal: number, wordIndex: number)
       }
     }
     const candidate = [...rest.slice(0, i), marker, ...rest.slice(i)];
-    if (fits(candidate)) return candidate;
+    if (fits(candidate)) {
+      // An opening quote glued to the word (`; “` + `she`) opens the speech:
+      // it goes after the break with the word, not in front of the label.
+      const prev = rest[i - 1] as Record<string, unknown> | undefined;
+      const prevText = prev && prev["type"] === "text" && typeof prev["text"] === "string" ? (prev["text"] as string) : "";
+      const opener = /[“‘"'«‹(\[¿¡]+$/u.exec(prevText);
+      if (prev && opener && opener.index > 0) {
+        const split = [...rest.slice(0, i - 1), { ...prev, text: prevText.slice(0, opener.index) }, marker, { ...prev, text: opener[0] }, ...rest.slice(i)];
+        if (fits(split)) return split;
+      }
+      return candidate;
+    }
   }
   return null;
 }
@@ -1873,7 +1884,7 @@ function editWordLabel(node: Record<string, unknown>, text: string): Record<stri
   const children = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   // The engine handed the words back unchanged (#1366): keep the label as it
   // is, so editHeaderBand returns the verse itself and no save is queued.
-  if (!Array.isArray(children) || JSON.stringify(children) === JSON.stringify(node["children"])) return node;
+  if (!Array.isArray(children) || JSON.stringify(children) === JSON.stringify(kids)) return node;
   return { ...node, children };
 }
 

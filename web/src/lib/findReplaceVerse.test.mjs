@@ -530,6 +530,15 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     // word on its old word's side.
     const r6 = run(both, "now He", "then she");
     check(r6.labelRefusals === undefined && words(r6.content) === "A home then [SP] \\q1 she ran home.", `one for one across the break: saved in place (got ${JSON.stringify(words(r6.content))})`);
+    // The first new word a recase of the old one ("He" -> "he too"): "he" is
+    // kept, so it and "too" stay after the label.
+    const r7 = run(bare, "home He", "home; he too");
+    check(r7.labelRefusals === undefined && words(r7.content) === "A home; [SP] \\q1 he too ran home.", `recase plus a new word: saved after the label (got ${JSON.stringify(words(r7.content))})`);
+    // The speech opens with a quote parked on the \q1 (`\q1 “He`): the quote
+    // goes after the break with the new words, not in front of the label.
+    const opener = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label(), { tag: "q1", type: "quote", text: "“" }, w("He"), t(" "), w("ran"), t(".”")] };
+    const r8 = run(opener, "home. “He", "home; “she too");
+    check(r8.labelRefusals === undefined && words(r8.content) === "A home; [SP] \\q1 “she too ran.”", `opening quote: saved after the label with the new words (got ${JSON.stringify(words(r8.content))})`);
     // A typed edit shows the line break, so the translator's placement holds:
     // words typed before it stay before the label.
     const old = extractEditableText(beside);

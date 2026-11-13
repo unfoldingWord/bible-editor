@@ -262,6 +262,12 @@ const v4 = nestWordLabels(verse("4"));
   const el = labelsOf(edited)[0];
   assert(el.children.some((c) => c.type === "footnote" && c.content === "+ \\ft A note."), `band edit keeps the label's footnote (got ${json(el.children.map((c) => c.tag ?? c.type))})`);
   assert(render(labelsOf(edited)).includes("\\f + \\ft A note.\\f*") && headerLabelText(el) === "The woman speaking Lord key person", `band edit with a footnote renders it (got ${json(render(labelsOf(edited)))})`);
+  // #1366: a one-word band edit in these labels changes only that word's bytes
+  // (the footnote's whitespace is split out for the edit and rendered the same).
+  const lady1 = editHeaderBand(n1, { index: 0, tag: "sp", text: "The lady speaking Lord key man" });
+  assert(render(labelsOf(lady1)) === render(labelsOf(n1)).replace("\\w woman|", "\\w lady|"), `1:1 woman -> lady: only that word changes (got ${json(render(labelsOf(lady1)))})`);
+  const lady2 = editHeaderBand(n2, { index: 0, tag: "sp", text: "The lady" });
+  assert(render(labelsOf(lady2)) === render(labelsOf(n2)).replace("\\w woman|", "\\w lady|"), `1:2 woman -> lady beside \\add and \\x: only that word changes (got ${json(render(labelsOf(lady2)))})`);
 }
 
 // #1366 item 2: a footnote or cross reference inside a label shows in the

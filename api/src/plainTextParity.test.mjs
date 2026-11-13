@@ -205,6 +205,16 @@ check(usfm.toJSON(src).chapters["1"]["2"].verseObjects.some((n) => n.tag === "sp
   check(!kids(apiNest(fx["1"].verseObjects)).includes("va"), `\\va after a label stays in the verse (got ${JSON.stringify(kids(apiNest(fx["1"].verseObjects)))})`);
   check(kids(apiNest(fx["2"].verseObjects)).includes("fe") && kids(apiNest(fx["2"].verseObjects)).includes("wj"), "\\fe and \\wj join the label");
   check(!kids(apiNest(fx["3"].verseObjects)).some((k) => ["vp", "ca", "fig"].includes(k)), `\\vp, \\ca, \\fig stay out of the label (got ${JSON.stringify(kids(apiNest(fx["3"].verseObjects)))})`);
+  // The two copies of the list agree tag by tag: a closed marker after a flat
+  // label's word, for every listed tag and the four that must stay out.
+  const tags = ["f", "fe", "x", "ef", "ex", "add", "addpn", "bd", "bdit", "bk", "dc", "em", "it", "jmp", "k", "nd", "ndx", "no", "ord", "pn", "png", "pro",
+    "qac", "qs", "qt", "rb", "rq", "sc", "sig", "sls", "sup", "tl", "wa", "wg", "wh", "wj", "xt", "va", "vp", "ca", "fig", "zz"];
+  for (const tag of tags) {
+    const vos = [{ tag: "sp" }, w("The"), { tag, endTag: `${tag}*`, content: "x" }, t("\n"), { tag: "q1", type: "quote" }, w("Hi")];
+    const a = apiNest(vos);
+    const joined = a[0].children?.some((c) => c.tag === tag) ?? false;
+    check(JSON.stringify(a) === JSON.stringify(webNest(vos)) && joined === !["va", "vp", "ca", "fig", "zz"].includes(tag), `\\${tag}: both copies ${joined ? "join" : "leave"} it, as listed`);
+  }
 }
 
 if (failed > 0) {

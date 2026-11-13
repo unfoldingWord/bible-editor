@@ -889,6 +889,18 @@ Highlights that bite repeatedly:
   edit engine on the label's own words, so unchanged words keep their `\w` attributes and alignment. The label run
   crosses footnotes and character markers (the whole `\sp` line is the label), and a verse PATCH nests a flat label
   sent by an old queued op or a history restore.
+- **Speaker-label follow-ups (#1366).** The label run crosses only an explicit list of note and character markers
+  (`LABEL_INLINE_TAGS`, in both `web/src/lib/usfm.ts` and `api/src/importParsers.ts`; `plainTextParity.test.mjs`
+  checks them tag by tag): `\va`, `\vp`, `\ca`, `\fig` are closed markers too but stay out. usfm-js parks the space
+  or line break after `\f*` on the footnote's `nextChar`, which plain/editable text skip, so the words on either side
+  fuse (`The\f…\f*⏎woman` read "Thewoman" and a band edit saved one word "Thelady"); `headerLabelText` reads
+  `nextChar` and `editWordLabel` splits it into a text node for the edit. The same fusing exists in the verse
+  body (`\w Body\w*\f…\f*⏎\w more\w*` -> "Bodymore."), not fixed. A label's notes show read-only in the band
+  (`SectionHeader.notes`). In find/replace only, new words that replace the first word after a label's line
+  break are moved after the label (`speechStartFix`; a typed edit shows the break, so its placement holds); words
+  replaced on both sides of the break, not one for one, are refused. A held verse pin
+  (`advanceHeldVerseBase`) does not move onto a landed row when its base held a flat label: the server nested it,
+  so the box's text no longer matches and the label words would be saved into the body.
 - **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in
   local D1 for a live test is overwritten before the test starts. Run a one-off spec with a config that spreads
   `playwright.config.ts` and sets `globalSetup: undefined` (measured 2026-11-12).
