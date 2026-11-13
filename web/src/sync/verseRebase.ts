@@ -67,7 +67,9 @@ export type VerseRebaseOutcome =
 // body's `content` on the thread path).
 //
 // Intent handling:
-//   - text_edit / find_replace / absent: rebase via smartEditVerse. NOTE the
+//   - text_edit / find_replace / absent: rebase via smartEditVerse, or
+//     refuse_thread when the engine refuses the edit beside a `\sp` label
+//     written as words (labelRefused, #1350). NOTE the
 //     rebase only carries what extractEditableText can see — content invisible
 //     to it (e.g. \f footnote prose) is adopted from the SERVER tree. Nothing
 //     user-editable travels that way in a text op today; a future producer of
@@ -153,9 +155,12 @@ export function rebaseVersePatch(
   try {
     const result = smartEditVerse(curledServer, serverText, opText);
     // The engine refused to apply the op's text beside a `\sp` label written as
-    // words (#1350) and handed back the server tree. Rebasing to that would drop
-    // the queued edit silently; re-send the op's own tree, as before #564.
-    if (result.labelRefused) return { kind: "verbatim" };
+    // words (#1350) and handed back the server tree: rebasing to that would drop
+    // the queued edit silently. Refuse instead, as for an alignment_edit across
+    // a text change: the automatic thread path leaves the op on its old version
+    // so it 409s and the conflict prompt asks the user; the user's own resolve
+    // ("my edit wins") still sends the op's tree verbatim.
+    if (result.labelRefused) return { kind: "refuse_thread" };
     return {
       kind: "rebased",
       patch: {

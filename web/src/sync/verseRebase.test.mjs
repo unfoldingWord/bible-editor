@@ -310,7 +310,10 @@ const sourceOf = (content, word) => (wordSources(content).find(([tx]) => tx === 
 
 // A rebase the engine refuses beside a `\sp` label written as words (#1350):
 // it hands back the server tree, and rebasing to that would drop the queued
-// edit silently. The op is sent verbatim instead (pre-#564 behavior).
+// edit silently. refuse_thread: the automatic thread path (outbox.ts
+// threadVersionToSiblings) leaves the op on its old version, so it 409s and
+// the conflict prompt asks; the user's resolve sends it as is (my edit wins).
+// Verbatim here would let the thread path re-send a stale tree with no prompt.
 {
   const label = () => ({ tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("man"), t("\n")], endTag: "" });
   const server = { verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(".\n"), label(), { tag: "q1", type: "quote" }, zaln("H3", [w("He")]), t(" "), zaln("H4", [w("ran")]), t(".")] };
@@ -320,7 +323,7 @@ const sourceOf = (content, word) => (wordSources(content).find(([tx]) => tx === 
   try {
     check(smartEditVerse(server, extractEditableText(server), extractEditableText(op)).labelRefused === true, "setup: the engine refuses this edit");
     const out = rebaseVersePatch({ content: op }, server);
-    check(out.kind === "verbatim", `an edit across a word label the engine refuses is sent verbatim (got ${out.kind})`);
+    check(out.kind === "refuse_thread", `an edit across a word label the engine refuses is not threaded (got ${out.kind})`);
   } finally {
     console.warn = warn;
   }
