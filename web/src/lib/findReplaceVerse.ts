@@ -23,7 +23,10 @@ import { extractPlainText, isHeaderLabelNode } from "./usfm.ts";
 // A find/replace result. `staleRefused`: the verse was left as it is because
 // it has a header label and its stored plain text is out of step with its
 // tree (#1339). The overlay says so instead of dropping the click silently.
-export type FindReplaceResult = SmartReplaceResult & { staleRefused?: true };
+// `labelRefusals`: how many matches the engine refused because the replace
+// would run across a `\sp` speaker label written as words (#1350); those
+// matches are left as they are, and the overlay says so too.
+export type FindReplaceResult = SmartReplaceResult & { staleRefused?: true; labelRefusals?: number };
 
 // A verse with a header label whose stored plain text is not its tree's own
 // (#1339). The server's extractor once kept a `\sp` label's text in the stored
@@ -99,7 +102,8 @@ export function findReplaceVerse(
   // A stale stored text beside a header label: refuse, visibly (#1339).
   if (staleBesideLabel(content, plainText)) return staleRefusal(content, plainText);
   const result = smartReplaceVerse(content, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, { findReplace: true });
-  return finalizeFindReplace(content, plainText, result);
+  const out: FindReplaceResult = finalizeFindReplace(content, plainText, result);
+  return result.labelRefused ? { ...out, labelRefusals: 1 } : out;
 }
 
 // Replace-all within one verse: replace one occurrence at a time with the
@@ -120,6 +124,9 @@ export function replaceAllInVerse(
   let curContent = content;
   let curPlain = plainText;
   let preserved = true;
+  // Matches refused across a word label (#1350), counted in the current pass
+  // only: an applied step rescans from 0 and meets them again.
+  let labelRefusals = 0;
   // Where the next search starts. A step with no visible change is skipped
   // (not applied) and the search moves past its match, so a later match still
   // gets replaced; only applied steps count toward `maxIters`. Every pass
@@ -132,6 +139,12 @@ export function replaceAllInVerse(
     const next = localRe.exec(curPlain);
     if (!next) break;
     const result = smartReplaceVerse(curContent, curPlain, regex, next.index, next[0].length, replaceText, { findReplace: true });
+    // Refused across a word label (#1350): count it, leave it, move on.
+    if (result.labelRefused) {
+      labelRefusals++;
+      from = next.index + Math.max(1, next[0].length);
+      continue;
+    }
     // Re-scan the tree's own plain text, as the first step scanned the stored
     // one. The engine's plainText adds nothing at a line marker with no text
     // node beside it (`namethis` for `name \q1 this`), so the next step's
@@ -148,13 +161,15 @@ export function replaceAllInVerse(
     curContent = result.content;
     curPlain = nextPlain;
     from = 0;
+    labelRefusals = 0;
     applied++;
   }
-  return finalizeFindReplace(content, plainText, {
+  const out: FindReplaceResult = finalizeFindReplace(content, plainText, {
     content: curContent,
     plainText: curPlain,
     preservedAlignment: preserved,
   });
+  return labelRefusals > 0 ? { ...out, labelRefusals } : out;
 }
 
 // The overlay's scripture summary line after a replace. Counts come from the
@@ -164,13 +179,15 @@ export function replaceAllInVerse(
 // replaced (#1285). With nothing replaced and a refusal, the line leads with
 // the refusal instead of "replaced 0 verses". `staleRefused` is verses the
 // engine left alone because their stored text is out of date beside a header
-// label (#1339).
+// label (#1339). `labelRefused` is MATCHES the engine left alone because the
+// replace would run across a `\sp` speaker label written as words (#1350).
 export interface BibleReplaceCounts {
   versesReplaced: number;
   alignmentLost: number;
   readOnlySkipped: number;
   alignmentRefused: number;
   staleRefused?: number;
+  labelRefused?: number;
 }
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -178,7 +195,8 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
 export function bibleReplaceSummaryText(s: BibleReplaceCounts): string {
   const parts: string[] = [];
   const staleRefused = s.staleRefused ?? 0;
-  if (s.versesReplaced > 0 || (s.alignmentRefused === 0 && staleRefused === 0)) {
+  const labelRefused = s.labelRefused ?? 0;
+  if (s.versesReplaced > 0 || (s.alignmentRefused === 0 && staleRefused === 0 && labelRefused === 0)) {
     parts.push(`replaced ${plural(s.versesReplaced, "verse", "verses")}`);
   }
   if (s.alignmentLost > 0) parts.push(`alignment milestones destroyed in ${s.alignmentLost}`);
@@ -190,6 +208,11 @@ export function bibleReplaceSummaryText(s: BibleReplaceCounts): string {
   if (staleRefused > 0) {
     parts.push(
       `${plural(staleRefused, "verse", "verses")} not replaced: ${staleRefused === 1 ? "its" : "their"} saved search text is out of date`,
+    );
+  }
+  if (labelRefused > 0) {
+    parts.push(
+      `${plural(labelRefused, "match", "matches")} not replaced: ${labelRefused === 1 ? "it runs" : "they run"} across a speaker label`,
     );
   }
   if (s.readOnlySkipped > 0) {

@@ -854,6 +854,11 @@ Highlights that bite repeatedly:
   export count `x-occurrence` over the whole verse, label words included, so an edit to a word a label also holds
   renumbers the label's copy. One SNG 1:4 label holds `\zaln` milestones (label words aligned on Door43); they ride
   along untouched. A header-band edit of a word label writes plain `\sp text` (the words are dropped).
+  The engine's marker tiers see a label only as invisible text: they re-place the `\q1` after a verse-final
+  label in front of it (`\q1 \sp …` on export would open the next verse inside the label), so the wrapper puts
+  it back and refuses any other label move; and the whole-verse punctuation relayout blanks a text label, so a
+  punctuation change right before a word label is refused (a plain-text label there loses its text silently).
+  Showing the label as `content` (like `\s1`) fixed the punctuation case but let reconcile move labels freely.
 - **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in
   local D1 for a live test is overwritten before the test starts. Run a one-off spec with a config that spreads
   `playwright.config.ts` and sets `globalSetup: undefined` (measured 2026-11-12).

@@ -248,7 +248,10 @@ export function headerLabelText(node: unknown): string {
 // save that changes neither tag nor text keeps the words as they were.
 export function rewriteHeaderLabel(node: Record<string, unknown>, tag: string, text: string): Record<string, unknown> {
   if (isWordLabelNode(node) && tag === node["tag"] && text === headerLabelText(node)) return node;
-  const { text: _drop, type: _dropType, children: _dropChildren, endTag: _dropEnd, ...rest } = node;
+  const { text: _drop, type: _dropType, ...kept } = node;
+  // Only a word label's words are dropped; any other header node keeps its
+  // children as the band edit always did.
+  const rest = isWordLabelNode(node) ? (({ children: _c, endTag: _e, ...r }) => r)(kept) : kept;
   const type = SECTION_HEADER_TAGS.has(tag) ? "section" : undefined;
   return { ...rest, ...(type ? { type } : {}), tag, content: `${text}\n` };
 }

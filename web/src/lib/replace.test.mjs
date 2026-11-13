@@ -4159,9 +4159,33 @@ function countAllMilestones(nodes) {
     const d = smartEditVerse(clone(v1), old1, old1.replace(" beautiful", ""), { capturedFromDom: true });
     assert(extractEditableText(d.content) === old1.replace(" beautiful", ""), `typed delete before the label (got ${JSON.stringify(extractEditableText(d.content))})`);
     assert(labels(d.content) === labels(v1), "typed delete before the label: the label is unchanged");
+    // The label still sits just before the `\q1` that opens verse 2's line.
+    // The marker tiers re-place the `\q1` right after "song." (the label is
+    // invisible to them), i.e. after the label; left there, the export writes
+    // `\q1 \sp …` and verse 2 opens inside the speaker label (review of #1350).
+    const followerOfLabel = (content) => {
+      const vos = content.verseObjects;
+      const i = vos.findIndex((n) => n && n.tag === "sp");
+      return vos[i + 1]?.tag ?? "end";
+    };
+    assert(followerOfLabel(v1) === "q1" && followerOfLabel(d.content) === "q1", `typed delete before the label: label still followed by \\q1 (got ${followerOfLabel(d.content)})`);
     // Retyping the whole verse runs the reassembly and diff tiers end to end.
+    // Saved with the label in place, or refused; never saved with it moved.
     const all = smartEditVerse(clone(v1), old1, "This is a song by King Solomon.", { capturedFromDom: true });
     assert(labels(all.content) === labels(v1), `typed rewrite of 1:1: the label is unchanged (got ${labels(all.content)})`);
+    assert(all.labelRefused === true || followerOfLabel(all.content) === "q1", `typed rewrite of 1:1: label not moved (got ${followerOfLabel(all.content)})`);
+    // Review G4: two edits on opposite sides of a label, diffed against an
+    // older pinned base (a save typed before the previous one landed), are one
+    // ordinary save: not refused, both edits in, labels kept.
+    const two = old.replace("take me to your home", "bring me to your home").replace("like a king", "like a ruler");
+    const g4 = smartEditVerse(clone(v4), old, two, { capturedFromDom: true });
+    assert(!g4.labelRefused && extractEditableText(g4.content) === two && labelWords(g4.content) === labelWords(v4), "edits on both sides of a label against an old base: saved, labels kept");
+    // Known limit (pinned so it stays safe): changing the punctuation right
+    // before a label is refused, not saved. The engine's whole-verse
+    // punctuation relayout blanks a label's text; on a plain-text label that
+    // is silent data loss, here it is a refusal the translator sees.
+    const punct = smartEditVerse(clone(v4), old, old.replace("bedroom. \\q1", "bedroom; \\q1"), { capturedFromDom: true });
+    assert(punct.labelRefused === true && labels(punct.content) === labels(v4), "punctuation right before a label: refused, labels kept");
     // No change at all hands back the caller's own tree.
     const same = clone(v4);
     assert(smartEditVerse(same, old, old).content === same, "typed no-op: the same tree comes back");

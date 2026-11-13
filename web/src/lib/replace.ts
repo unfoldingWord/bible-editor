@@ -1375,16 +1375,21 @@ export function smartReplaceVerse(
 // skip the whole node, but every walker in this engine (walkLeaves, rebuildRaw,
 // the relayout and reassembly tiers) descends `children`, so its raw text would
 // hold the label's words and an edit could land on them (the #1311 failure).
-// The engine already handles the usfm-js shape of a plain-text label
-// (`{tag:"sp", text}`): blankHeaderLabels and friends keep it out of the match
-// and out of every rewrite. So for the length of one edit, show it each word
-// label in that shape, holding the real words aside on the node, and put the
-// words back afterwards. Then the occurrence numbers are recounted over the
+// So for the length of one edit, show the engine each word label as a node
+// with its text on `content` (the way `\s1` holds a heading): no raw text at
+// all, so raw and plain text agree with no masking, holding the real words
+// aside on the node, and put the words back afterwards. (The plain-text label
+// shape, `{tag:"sp", text}`, was tried first: the whole-verse punctuation
+// relayout blanks every such label's text, so a ". -> ;" typed before a label
+// could not be saved.) Then the occurrence numbers are recounted over the
 // whole verse, label words included, as Door43 and the export count them.
-// The label must come back with the same text, in the same order; if any did
-// not, the edit is refused (content and plain text returned unchanged) rather
-// than saving a label in a different shape. A verse with no word label runs the
-// engine exactly as before.
+// Each label must come back with the same text, in the same order, still
+// followed by the same kind of node (its `\q1` / `\ts\*`, or the verse end):
+// USFM ends a `\sp` label at the next paragraph marker, so a label moved in
+// front of words would swallow them on the next import. If any did not, the
+// edit is refused (content and plain text returned unchanged, labelRefused)
+// rather than saving a label in a different place or shape. A verse with no
+// word label runs the engine exactly as before.
 const LABEL_WORDS = "__beLabelWords";
 
 function rawTextOf(nodes: unknown[]): string {
@@ -1401,13 +1406,22 @@ function rawTextOf(nodes: unknown[]): string {
 function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult): SmartReplaceResult {
   const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(vo)) return run(content);
+  // What follows a label at the top level: a marker's tag, "text"/"word"/…,
+  // or "end" at the verse end.
+  const followerOf = (nodes: unknown[], i: number): string => {
+    const f = nodes[i + 1] as Record<string, unknown> | undefined;
+    if (!f) return "end";
+    return typeof f["tag"] === "string" ? (f["tag"] as string) : String(f["type"] ?? "?");
+  };
   const before: string[] = [];
-  const collapsed = vo.map((n) => {
+  const followersBefore: string[] = [];
+  const collapsed = vo.map((n, i) => {
     const o = n as Record<string, unknown> | null;
     if (!o || !isWordLabelNode(o)) return n;
     const { children, endTag, text: ownText, ...rest } = o;
     const text = rawTextOf(children as unknown[]);
     before.push(text);
+    followersBefore.push(followerOf(vo, i));
     return { ...rest, text, [LABEL_WORDS]: { children, endTag, ...(ownText !== undefined ? { text: ownText } : {}) } };
   });
   if (before.length === 0) return run(content);
@@ -1419,16 +1433,35 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
     console.warn(`[replace] edit refused: it would change a speaker label written as words (${why}) (#1350).`);
     return { content, plainText: extractPlainText(content), preservedAlignment: true, labelRefused: true };
   };
-  const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  if (!Array.isArray(out)) return refuse("no verse tree");
+  const engineOut = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (!Array.isArray(engineOut)) return refuse("no verse tree");
+  // The marker re-placing tiers know a label only as invisible text, so a
+  // label that sat just before a line marker (`\sp …` then the `\q1` that
+  // opens the next verse's line) can come back after it (`\q1` then `\sp …`).
+  // The two hold no editable text between them, so put the label back in
+  // front of its marker; any other move is refused below.
+  const out = [...engineOut];
+  let k = 0;
+  for (let i = 0; i < out.length; i++) {
+    const o = out[i] as Record<string, unknown> | null;
+    if (!o || o[LABEL_WORDS] === undefined) continue;
+    const want = followersBefore[k++];
+    const prev = out[i - 1] as Record<string, unknown> | undefined;
+    if (want !== undefined && followerOf(out, i) !== want && prev && prev["tag"] === want && isInFlowMarker(prev)) {
+      out[i - 1] = o;
+      out[i] = prev;
+    }
+  }
   const after: string[] = [];
+  const followersAfter: string[] = [];
   const expand = (nodes: unknown[], depth: number): unknown[] =>
-    nodes.map((n) => {
+    nodes.map((n, i) => {
       const o = n as Record<string, unknown> | null;
       if (!o) return n;
       if (o[LABEL_WORDS] !== undefined) {
         const { [LABEL_WORDS]: held, text, ...rest } = o;
         after.push(depth === 0 ? String(text ?? "") : "\u0000nested");
+        followersAfter.push(depth === 0 ? followerOf(nodes, i) : "\u0000nested");
         return { ...rest, ...(held as Record<string, unknown>) };
       }
       return Array.isArray(o["children"]) ? { ...o, children: expand(o["children"] as unknown[], depth + 1) } : n;
@@ -1437,6 +1470,9 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
   const norm = (s: string) => s.replace(/\s+/g, " ").trim();
   if (after.length !== before.length || after.some((t, i) => norm(t) !== norm(before[i]))) {
     return refuse(`labels before ${JSON.stringify(before.map(norm))}, after ${JSON.stringify(after.map(norm))}`);
+  }
+  if (followersAfter.some((f, i) => f !== followersBefore[i])) {
+    return refuse(`a label moved: followed by ${JSON.stringify(followersBefore)}, now ${JSON.stringify(followersAfter)}`);
   }
   return { ...result, content: { ...(result.content as Record<string, unknown>), verseObjects: renumberTargetOccurrences(expanded) } };
 }

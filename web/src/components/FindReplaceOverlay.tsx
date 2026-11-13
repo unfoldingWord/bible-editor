@@ -641,6 +641,7 @@ export function FindReplaceOverlay({
         readOnlySkipped: number;
         alignmentRefused: number;
         staleRefused?: number;
+        labelRefused?: number;
       }
     | {
         scope: "tn";
@@ -698,6 +699,12 @@ export function FindReplaceOverlay({
       setReplaceSummary({ scope: "bible", versesReplaced: 0, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, staleRefused: 1 });
       return;
     }
+    // The match runs across a `\sp` speaker label written as words (#1350):
+    // nothing is saved; say so.
+    if (result.labelRefusals) {
+      setReplaceSummary({ scope: "bible", versesReplaced: 0, alignmentLost: 0, readOnlySkipped: 0, alignmentRefused: 0, labelRefused: result.labelRefusals });
+      return;
+    }
     if (result.plainText === text) return;
     // The replace will trigger a matches reshape (the current match is
     // gone); flag the upcoming reshape so we scroll to whatever's next.
@@ -739,6 +746,7 @@ export function FindReplaceOverlay({
     let alignmentLost = 0;
     let alignmentRefused = 0;
     let staleRefused = 0;
+    let labelRefused = 0;
     for (const [key, list] of byVerse) {
       const [chStr, vStr, bv] = key.split("|");
       const ch = parseInt(chStr, 10);
@@ -755,11 +763,14 @@ export function FindReplaceOverlay({
         plainText,
         preservedAlignment: preservedThisVerse,
         staleRefused: staleRefusedThisVerse,
+        labelRefusals: labelRefusalsThisVerse,
       } = replaceAllInVerse(verse.content, verse.plain_text ?? "", compiled.re, list.length, replace);
       if (staleRefusedThisVerse) {
         staleRefused += 1;
         continue;
       }
+      // Matches across a word label are left; the verse's other matches still go.
+      labelRefused += labelRefusalsThisVerse ?? 0;
       if (plainText === verse.plain_text) continue;
       if (!onReplaceVerse(ch, v, bv, content, plainText, verse)) {
         alignmentRefused += 1;
@@ -768,7 +779,7 @@ export function FindReplaceOverlay({
       versesReplaced += 1;
       if (!preservedThisVerse) alignmentLost += 1;
     }
-    setReplaceSummary({ scope: "bible", versesReplaced, alignmentLost, readOnlySkipped, alignmentRefused, staleRefused });
+    setReplaceSummary({ scope: "bible", versesReplaced, alignmentLost, readOnlySkipped, alignmentRefused, staleRefused, labelRefused });
   };
 
   // ---- Translation-note replace ----------------------------------------
@@ -1378,7 +1389,8 @@ export function FindReplaceOverlay({
           (replaceSummary.versesReplaced > 0 ||
             replaceSummary.readOnlySkipped > 0 ||
             replaceSummary.alignmentRefused > 0 ||
-            (replaceSummary.staleRefused ?? 0) > 0)) ||
+            (replaceSummary.staleRefused ?? 0) > 0 ||
+            (replaceSummary.labelRefused ?? 0) > 0)) ||
           (replaceSummary.scope === "tn" &&
             (replaceSummary.matchesReplaced > 0 ||
               replaceSummary.structuralSkipped > 0 ||
@@ -1393,7 +1405,8 @@ export function FindReplaceOverlay({
               replaceSummary.scope === "bible"
                 ? replaceSummary.alignmentLost > 0 ||
                   replaceSummary.alignmentRefused > 0 ||
-                  (replaceSummary.staleRefused ?? 0) > 0
+                  (replaceSummary.staleRefused ?? 0) > 0 ||
+                  (replaceSummary.labelRefused ?? 0) > 0
                   ? "warning"
                   : "success"
                 : replaceSummary.scope === "tq"
