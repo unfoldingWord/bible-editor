@@ -25,6 +25,8 @@ test("look-back reaches its verse after Back, again and again", async ({ browser
   await gotoVerse(page, "ZEC", 4, 8);
   await page.locator('[data-note-id="ccxv"]').waitFor();
   for (let i = 0; i < 3; i++) {
+    // Back only remembers a spot held for navHistory's SETTLE_MS (2.5 s).
+    await page.waitForTimeout(3_000);
     await lookBack(page, "ccxv");
     await expect(activeLabel(page)).toHaveText("ZEC 4:6");
     await page.getByRole("button", { name: "Back", exact: true }).click();

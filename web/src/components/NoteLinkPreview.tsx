@@ -30,6 +30,21 @@ export function OpenChapterProvider({ data, children }: { data: ChapterPayload |
   return <OpenChapterContext.Provider value={data}>{children}</OpenChapterContext.Provider>;
 }
 
+// Follows a "see how you translated this" link. Shell provides one that moves
+// to the verse directly: picking a verse in the app doesn't rewrite the URL
+// hash, so the hash often already names the link's verse, and assigning it
+// again fires no hashchange (or parses to the verse Shell already had) and the
+// click did nothing. Outside Shell, fall back to the hash.
+const FollowNoteLinkContext = createContext<(target: NoteLinkTarget) => void>((t) => {
+  location.hash = `#/${t.book}/${t.chapter}/${t.verse}`;
+});
+
+export const FollowNoteLinkProvider = FollowNoteLinkContext.Provider;
+
+export function useFollowNoteLink(): (target: NoteLinkTarget) => void {
+  return useContext(FollowNoteLinkContext);
+}
+
 // Other chapters: one fetch per chapter per short window, so hovering several
 // links into the same chapter doesn't refetch but a preview opened a minute
 // later sees edits made since. Failed fetches are dropped so the next hover

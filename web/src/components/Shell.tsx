@@ -18,7 +18,8 @@ import {
 import GridViewIcon from "@mui/icons-material/GridView";
 import LockIcon from "@mui/icons-material/Lock";
 import { useChapter } from "../hooks/useChapter";
-import { OpenChapterProvider } from "./NoteLinkPreview";
+import { FollowNoteLinkProvider, OpenChapterProvider } from "./NoteLinkPreview";
+import type { NoteLinkTarget } from "../lib/noteLinks";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { ChapterState, UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
@@ -3118,6 +3119,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [runWithDirtyGate, book, chapter, onNavigate, requestJumpTab, requestScrollToActive],
   );
 
+  // A "see how you translated this" link in a note (the body link or the
+  // look-back icon by the SH chip). Same-chapter moves the verse here rather
+  // than through the URL: picking a verse in the app leaves the hash alone, so
+  // the hash can already name the link's verse and assigning it would do
+  // nothing (see FollowNoteLinkProvider).
+  const followNoteLink = useCallback(
+    (t: NoteLinkTarget) => {
+      runWithDirtyGate(() => {
+        if (t.book.toUpperCase() === book && t.chapter === chapter) {
+          setActiveVerse(t.verse);
+          setActiveNoteId(null);
+          setActiveWordId(null);
+          setActiveQuestionId(null);
+          requestScrollToActive();
+          return;
+        }
+        onNavigate?.(t.book.toUpperCase(), t.chapter, t.verse);
+      });
+    },
+    [runWithDirtyGate, book, chapter, onNavigate, requestScrollToActive],
+  );
+
   // Jump to a lint issue from the topbar indicator. `ref` is "chapter:verse"
   // (or bare "chapter"). TN/tq/twl findings carry a rowId, so reuse the
   // focus*Match helpers above — the same row-jump mechanism the find overlay
@@ -4568,6 +4591,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // Keyed on the payload's chapter so the whole view remounts when the fresh
     // payload lands, exactly as the old blank-then-load did, just later (#892).
     <OpenChapterProvider key={`${data.book}:${viewChapter}`} data={data}>
+    <FollowNoteLinkProvider value={followNoteLink}>
     <Box sx={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
       <TopBar
         book={book}
@@ -5862,6 +5886,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         />
       )}
     </Box>
+    </FollowNoteLinkProvider>
     </OpenChapterProvider>
   );
 }

@@ -67,7 +67,7 @@ import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { parseNoteSegments, resolveNoteLinkHref } from "../lib/noteLinks";
 import type { NoteLinkTarget } from "../lib/noteLinks";
-import { NoteLinkPreview } from "./NoteLinkPreview";
+import { NoteLinkPreview, useFollowNoteLink } from "./NoteLinkPreview";
 import { directionForText } from "../lib/direction";
 import { buildTnRestorePatch } from "../lib/tnRestorePatch";
 import {
@@ -311,6 +311,7 @@ function NoteBodyReadView({
   // segment(s) it falls in. A match overlapping a link segment highlights the
   // link as a unit (it stays clickable) rather than splitting it — the two
   // features compose without either regressing the other.
+  const followLink = useFollowNoteLink();
   const segments = useMemo(() => parseNoteSegments(text, book), [text, book]);
 
   const markSx = {
@@ -355,7 +356,7 @@ function NoteBodyReadView({
               // Don't also let this bubble into the outer Box's onActivate —
               // clicking a link navigates away, it doesn't mean "start editing".
               e.stopPropagation();
-              location.hash = `#/${seg.target.book}/${seg.target.chapter}/${seg.target.verse}`;
+              followLink(seg.target);
             }}
             sx={{
               color: "primary.main",
@@ -461,6 +462,7 @@ function NoteBodyMarkdownView({
 }) {
   const LinkComponent = useMemo(() => {
     function NoteMdLink({ href, children }: { href?: string; children?: React.ReactNode }) {
+      const followLink = useFollowNoteLink();
       if (!href) return <>{children}</>;
       const target = resolveNoteLinkHref(href, book);
       if (target) {
@@ -471,7 +473,7 @@ function NoteBodyMarkdownView({
               onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
               onClick={(e: React.MouseEvent) => {
                 e.stopPropagation();
-                location.hash = `#/${target.book}/${target.chapter}/${target.verse}`;
+                followLink(target);
               }}
               sx={{
                 color: "primary.main",
@@ -712,6 +714,7 @@ function NoteCardInner({
   // card to read it switches the body to the editor, where the links (and
   // their hover preview) are gone; the footer's look-back icon keeps the
   // preview reachable while editing.
+  const followLink = useFollowNoteLink();
   const seeHowTargets = useMemo(() => {
     const seen = new Set<string>();
     const out: NoteLinkTarget[] = [];
@@ -2238,7 +2241,7 @@ function NoteCardInner({
               }}
               onClick={(e: React.MouseEvent) => {
                 e.stopPropagation();
-                location.hash = `#/${t.book}/${t.chapter}/${t.verse}`;
+                followLink(t);
               }}
               sx={{ p: 0.25, color: "primary.main" }}
             >
