@@ -45,8 +45,57 @@ function parseLintVerse(row: VerseRow): unknown {
 
 export type IssueBucket = "flag" | "escalate";
 
+/** Every check name a LintIssue can carry (#1344). LintIssue.check is typed
+ *  from this list, so a new check fails typecheck until it is added here, and
+ *  bookLintReport.test.mjs pins the list against LINT_REPORT_VERSION, so the
+ *  list cannot change without a version bump. Add, remove or rename a check:
+ *  update this list, bump LINT_REPORT_VERSION, update the test's pin. */
+export const LINT_CHECK_NAMES = [
+  "12. Alternate translation Label",
+  "13. Paired Square Bracket",
+  "6. Footnote Syntax",
+  "6. Reference",
+  "7. SupportReference",
+  "Adapted note — verify",
+  "Alignment declares the wrong occurrence count",
+  "Alignment occurrence out of range",
+  "Bad character combination",
+  "Blank line without paragraph",
+  "Chapter opening marker",
+  "Doubled punctuation",
+  "Doubled space",
+  "Empty OrigWords",
+  "Empty TWLink",
+  "Empty note",
+  "Empty question",
+  "Empty response",
+  "Glued alignment",
+  "Invisible character",
+  "Kept over Door43 — verify",
+  "Malformed TWLink",
+  "Merged Door43 edit — verify",
+  "Opening punctuation inside alignment",
+  "Paired punctuation",
+  "Punctuation spacing",
+  "Quotation Mark",
+  "Quote does not appear in the source verse",
+  "Quote is missing word joiners present in the source",
+  "Quote parts are discontiguous but not separated by &",
+  "Quote repeats a source word",
+  "Quote words are not in source order",
+  "Reference differs from Door43 — verify",
+  "Reused source token",
+  "Straight quote",
+  "Straight quote in OrigWords",
+  "Straight quote in Quote",
+  "Straight quote in SupportReference",
+  "Unbalanced quotation marks",
+  "Unmerged Door43 edit — verify",
+] as const;
+export type LintCheckName = (typeof LINT_CHECK_NAMES)[number];
+
 export interface LintIssue {
-  check: string; // DCS check name
+  check: LintCheckName; // DCS check name
   bucket: IssueBucket; // flag = human decision in-app; escalate = admin banner
   ref: string; // chapter:verse (or chapter) for navigation
   rowId?: string; // row id (for jump-to-row)
@@ -133,7 +182,7 @@ function altLabelProblems(note: string): string[] {
 // Hard-coding "Merged Door43 edit" for every flag, as tq/twl did, told a reader
 // of the last two the reverse of what happened. `fallback` preserves each kind's
 // pre-existing wording for a flag with no mapping (tn's older "Adapted note").
-export function reviewFlagTitle(reviewKind: string | null | undefined, fallback: string): string {
+export function reviewFlagTitle(reviewKind: string | null | undefined, fallback: LintCheckName): LintCheckName {
   switch (reviewKind) {
     case "merge_conflict":
       return "Merged Door43 edit — verify";
@@ -652,7 +701,7 @@ function suggestQuote(positions: number[], tokens: SourceToken[]): string {
     .join(" & ");
 }
 
-const QUOTE_MESSAGES: Record<QuoteFailureKind, string> = {
+const QUOTE_MESSAGES: Record<QuoteFailureKind, LintCheckName> = {
   joiners: "Quote is missing word joiners present in the source",
   order: "Quote words are not in source order",
   duplicate: "Quote repeats a source word",
@@ -1615,8 +1664,8 @@ export function lintOrphanedBlankText(verses: VerseRow[]): LintIssue[] {
 // number of unconsumed opens. `entries` is sorted defensively (chapter, then
 // verse) rather than trusting caller order, since a mis-ordered scan could
 // consume a closer against an opener that doesn't actually precede it.
-const QUOTATION_MARK_CHECK = "Quotation Mark";
-const PAIRED_PUNCTUATION_CHECK = "Paired punctuation";
+const QUOTATION_MARK_CHECK: LintCheckName = "Quotation Mark";
+const PAIRED_PUNCTUATION_CHECK: LintCheckName = "Paired punctuation";
 
 /** The two checks whose result for any verse depends on verses before or after
  *  it in the book (quoteIssues and lintPairedPunctuation). An edit in one
@@ -1987,7 +2036,7 @@ export function lintVerseTextQuality(verses: VerseRow[]): LintIssue[] {
     const prose = flattenVerseProse(verseObjectsOf(v));
     if (!prose) continue;
     const ref = `${v.chapter}:${v.verse}`;
-    const push = (check: string, messages: string[]): void => {
+    const push = (check: LintCheckName, messages: string[]): void => {
       for (const message of messages) issues.push({ check, bucket: "flag", ref, message });
     };
     push("Straight quote", straightQuoteProblems(prose));
@@ -2108,8 +2157,8 @@ const BAD_TEXT_COMBINATIONS = ["\\[\\[", "\\]\\]", "] (http", "] (.", "] (/"] as
 // tsvFormat.ts — normalizeNoteWhitespace + educateQuotes), and the charter at
 // the top of this file keeps auto-fixed mechanical issues out of the lint.
 // Verse text has no such normalizer, so the verse checks DO cover them.
-function textFieldProblems(field: string): Array<{ check: string; message: string }> {
-  const out: Array<{ check: string; message: string }> = [];
+function textFieldProblems(field: string): Array<{ check: LintCheckName; message: string }> {
+  const out: Array<{ check: LintCheckName; message: string }> = [];
   for (const msg of invisibleCharProblems(field, true)) {
     out.push({ check: "Invisible character", message: msg });
   }
