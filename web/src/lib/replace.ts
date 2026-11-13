@@ -1359,11 +1359,28 @@ function smartRebuildRange(
     const m = topMarkers.filter((x) => x.at >= from && x.at <= to).pop();
     return m && opensWith(raw.slice(m.at, to)) ? m.node : null;
   };
+  // The mirror (#1371): new words with no kept word before them, replacing
+  // old words that all sat before such a marker, go right before it (the
+  // first one at that offset) when the replacement keeps the line's opener
+  // right before the first kept word after it (`wars. \q1 “Your king` ->
+  // `great fights; “Your king` saved `\q1 great fights; “Your king`).
+  const markerAfter = (j: number): Record<string, unknown> | null => {
+    let jR = j + 1;
+    while (jR < replaceWords.length && link[jR] < 0) jR++;
+    const oldR = jR < replaceWords.length ? link[jR] : -1;
+    if (oldR < 1) return null; // no kept word after, or no old word dropped before it
+    const from = tokens[oldR - 1].end;
+    const to = tokens[oldR].start;
+    const m = topMarkers.find((x) => x.at >= from && x.at <= to);
+    const lead = m ? raw.slice(m.at, to).trim() : "";
+    return m && opensWith(lead) && splitGapAtMarker(gaps[jR]).rest.trim() === lead ? m.node : null;
+  };
   for (const nw of newWords) {
     let anchor: Record<string, unknown> | null = markerBefore(nw.j);
     let key = "__insAfter";
     if (!anchor)
       for (let j2 = nw.j - 1; j2 >= 0; j2--) if (link[j2] >= 0) { const u = units[link[j2]]; anchor = u.leaves[u.leaves.length - 1].node; key = "__insAfter"; break; }
+    if (!anchor) { anchor = markerAfter(nw.j); key = "__insBefore"; }
     if (!anchor) for (let j2 = nw.j + 1; j2 < replaceWords.length; j2++) if (link[j2] >= 0) { const u = units[link[j2]]; anchor = u.leaves[0].node; key = "__insBefore"; break; }
     if (!anchor) return null; // unreachable (survivor exists) — be safe
     const list = (anchor[key] as unknown[] | undefined) ?? [];
@@ -1449,6 +1466,7 @@ function smartRebuildRange(
       // bare text node BEFORE it (so a trailing comma stays on the previous
       // line), then the marker verbatim. Its trailing gap leads the next word.
       if (o && isInertLineBreakMarker(o)) {
+        if (Array.isArray(o["__insBefore"])) for (const nw of o["__insBefore"] as Record<string, unknown>[]) pushWord(out, nw);
         if (o["__markerClosing"]) out.push({ type: "text", text: o["__markerClosing"] });
         out.push(stripRebuildMarks(o));
         if (Array.isArray(o["__insAfter"])) for (const nw of o["__insAfter"] as Record<string, unknown>[]) pushWord(out, nw);
@@ -1538,8 +1556,10 @@ export function smartReplaceVerse(
   replaceText: string,
   options: { findReplace?: boolean; typed?: boolean } = {},
 ): SmartReplaceResult {
-  return withWordLabelsAsText(content, (c) =>
-    smartReplaceVerseInner(c, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options),
+  return withWordLabelsAsText(
+    content,
+    (c) => smartReplaceVerseInner(c, plainText, regex, matchStartInPlain, matchLenInPlain, replaceText, options),
+    { speechStart: options.findReplace === true },
   );
 }
 
@@ -1652,7 +1672,41 @@ function markerKeepsItsWords(before: { words: string[]; markerAt: number[] }, af
   return true;
 }
 
-function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult): SmartReplaceResult {
+// New words that replace the first word(s) after a label's line marker must
+// not land before the label (#1366). When the old and new word counts differ,
+// the engine anchors the new words to the nearest kept word before them, so
+// `home \sp … \q1 He ran` -> `home; she too ran` saved `she too` before the
+// label and its line break, in the narrator's line. Which new words start the
+// speech can't be told in general (`home again. She`, `home. Yes, she`: no
+// punctuation rule separates "added to the narrator's line" from "added to the
+// speech"), so nothing is moved. Line marker `ordinal` sits between kept words;
+// a word right after it was replaced or removed, and new words now sit before
+// it: true (refuse), unless the new words are one for one with the old on each
+// side of the break. A plain deletion (no new word before the marker) and a
+// recase (the word is kept) are not refused.
+function speechStartRefused(
+  before: { words: string[]; markerAt: number[] },
+  after: { words: string[]; markerAt: number[] },
+  map: number[],
+  ordinal: number,
+): boolean {
+  const p = before.markerAt[ordinal];
+  const q = after.markerAt[ordinal];
+  let a = p - 1;
+  while (a >= 0 && map[a] < 0) a--;
+  let b = p;
+  while (b < before.words.length && map[b] < 0) b++;
+  const oldBefore = p - a - 1;
+  const oldAfter = b - p;
+  const start = a >= 0 ? map[a] + 1 : 0;
+  const end = b < before.words.length ? map[b] : after.words.length;
+  const newBefore = q - start;
+  const newAfter = end - q;
+  if (oldAfter === 0 || newBefore <= 0) return false;
+  return !(newBefore === oldBefore && newAfter === oldAfter);
+}
+
+function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult, opts: { speechStart?: boolean } = {}): SmartReplaceResult {
   const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(vo) || !vo.some(isSpeakerLabelNode)) return run(content);
   const refuse = (reason: LabelRefusalReason, why: string): SmartReplaceResult => {
@@ -1694,6 +1748,16 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
     const before = bodyWordLayout(stripped);
     const after = bodyWordLayout(out);
     const map = matchWords(before.words, after.words);
+    // New words replacing the first word of a speech would sit before its
+    // label (#1366): refused unless unambiguous (speechStartRefused). Find/
+    // replace only: a typed edit shows the line break, so the translator
+    // placed it.
+    for (const l of labels) {
+      if (!opts.speechStart || l.anchor === "end") continue;
+      if (speechStartRefused(before, after, map, l.anchor)) {
+        return refuse("label-moved", "new words replacing a speech's first word would sit before its label");
+      }
+    }
     for (const l of labels) {
       if (l.anchor !== "end" && !markerKeepsItsWords(before, after, map, l.anchor)) {
         return refuse("label-moved", "a label's line marker moved to other words");
@@ -1756,12 +1820,31 @@ export function editHeaderBand(verseObjects: unknown[], change: { index: number;
 }
 
 function editWordLabel(node: Record<string, unknown>, text: string): Record<string, unknown> {
-  const words = { verseObjects: node["children"] as unknown[] };
+  // usfm-js parks the whitespace after a closed marker (a footnote's `\f*`) on
+  // its `nextChar`, which the engine's text skips: the words on either side
+  // then read as one, and editing one of them merged both (#1366; `The\f…\f*⏎
+  // woman` -> "Thelady"). For the edit that whitespace is a text node of its
+  // own, as headerLabelText reads it; usfm-js renders both the same. Only where
+  // it is the sole space between them: a text node starting with whitespace
+  // after it already parts the words.
+  const all = node["children"] as unknown[];
+  const kids = all.flatMap((c, i) => {
+    const o = c as Record<string, unknown> | null;
+    if (!o || o["type"] === "word" || typeof o["nextChar"] !== "string" || !/^\s+$/.test(o["nextChar"] as string)) return [c];
+    const next = all[i + 1] as Record<string, unknown> | undefined;
+    if (next && next["type"] === "text" && /^\s/.test(String(next["text"] ?? ""))) return [c];
+    const { nextChar, ...rest } = o;
+    return [rest, { type: "text", text: nextChar }];
+  });
+  const words = { verseObjects: kids };
   const old = extractEditableText(words);
   if (normalizeEditable(text) === normalizeEditable(old)) return node;
   const result = smartEditVerse(words, old, text);
   const children = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  return Array.isArray(children) ? { ...node, children } : node;
+  // The engine handed the words back unchanged (#1366): keep the label as it
+  // is, so editHeaderBand returns the verse itself and no save is queued.
+  if (!Array.isArray(children) || JSON.stringify(children) === JSON.stringify(kids)) return node;
+  return { ...node, children };
 }
 
 function smartReplaceVerseInner(

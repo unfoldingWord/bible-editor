@@ -14,6 +14,8 @@
 // an IndexedDB connection and registers an outbox-result listener) so this
 // pure logic stays importable from a plain Node test.
 
+import { nestWordLabels } from "../lib/usfm.ts";
+
 export interface PinnedVerseBase {
   version: number;
   content: unknown;
@@ -184,8 +186,16 @@ export function unpinVerseBaseUnlessHeld(key: string, epoch?: number): void {
 export function advanceHeldVerseBase(key: string, fromVersion: number, landed: PinnedVerseBase): void {
   const state = holds.get(key);
   if (!state) return;
-  if (pinnedVerseBase.get(key)?.version !== fromVersion) return;
-  const next = { version: landed.version, content: landed.content };
+  const pinned = pinnedVerseBase.get(key);
+  if (pinned?.version !== fromVersion) return;
+  // The line's text came from a flat `\sp` word label (its words read as body
+  // words), which the server nests on save (#1366): the landed row is then not
+  // what the box shows, and its label words would read as typed on the next
+  // save (saved into the body, the label written twice). Keep the old base:
+  // that save 409s instead.
+  const vo = (pinned.content as { verseObjects?: unknown } | null)?.verseObjects;
+  if (Array.isArray(vo) && nestWordLabels(vo) !== vo) return;
+  const next ={ version: landed.version, content: landed.content };
   pinnedVerseBase.set(key, next);
   state.advanced = next;
 }

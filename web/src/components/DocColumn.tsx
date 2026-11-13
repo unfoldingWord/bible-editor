@@ -447,6 +447,7 @@ export function DocColumn({
                   key={`sec-${dto.verse}-${i}`}
                   tag={s.tag}
                   text={s.text}
+                  notes={s.notes}
                   editable={!readOnly && !!onEditSection}
                   onChange={
                     onEditSection

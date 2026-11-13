@@ -176,6 +176,10 @@ export function isHeaderLabelNode(node: unknown): boolean {
 export interface SectionHeader {
   tag: string;
   text: string;
+  // The text of each footnote or cross reference inside a `\sp` label written
+  // as words (labelNoteTexts), shown read-only beside the label (#1366).
+  // Absent when the label holds none.
+  notes?: string[];
 }
 
 export interface SplitContent {
@@ -199,7 +203,8 @@ export function splitSectionHeaders(verseObjects: unknown[] | undefined | null):
   for (const node of verseObjects) {
     const o = node as Record<string, unknown> | null;
     if (o && isHeaderLabelNode(o)) {
-      sections.push({ tag: o["tag"] as string, text: headerLabelText(o) });
+      const notes = labelNoteTexts(o);
+      sections.push({ tag: o["tag"] as string, text: headerLabelText(o), ...(notes.length > 0 ? { notes } : {}) });
       continue;
     }
     body.push(node);
@@ -223,12 +228,49 @@ export function headerLabelText(node: unknown): string {
         if (!c) continue;
         if (typeof c["text"] === "string") parts.push(c["text"]);
         if (Array.isArray(c["children"])) walk(c["children"] as unknown[]);
+        // usfm-js parks the space or line break after a closed marker (`\f*`)
+        // on its `nextChar` (#1366): without it the words on either side of a
+        // footnote read as one ("Thewoman"). Whitespace only: the band edit's
+        // baseline (editWordLabel) splits out just that, so the two agree.
+        if (c["type"] !== "word" && typeof c["nextChar"] === "string" && /^\s+$/.test(c["nextChar"])) parts.push(c["nextChar"]);
       }
     };
     walk(o["children"] as unknown[]);
     return parts.join("").replace(/\s+/g, " ").trim();
   }
   return String(o["content"] ?? o["text"] ?? "").replace(/\n+$/, "").trim();
+}
+
+// The footnotes and cross references inside a `\sp` label written as words
+// (#1366), as the band shows them: each note's text with its caller and
+// markers dropped (`+ \ft A note.` -> `A note.`, `- \xo 1:1 \xt Gen 1:1` ->
+// `1:1 Gen 1:1`). headerLabelText leaves them out, and since #1354 a note on a
+// `\sp` line lives inside the label, so without this the translator could not
+// see it. Read-only: a band edit keeps the note node as it is.
+const NOTE_TAGS: ReadonlySet<string> = new Set(["f", "fe", "x", "ef", "ex"]);
+export function labelNoteTexts(node: unknown): string[] {
+  if (!isWordLabelNode(node)) return [];
+  const out: string[] = [];
+  const walk = (nodes: unknown[]): void => {
+    for (const n of nodes) {
+      const c = n as Record<string, unknown> | null;
+      if (!c) continue;
+      const tag = c["tag"];
+      const isNote = c["type"] === "footnote" || (c["type"] === undefined && typeof tag === "string" && NOTE_TAGS.has(tag));
+      if (isNote && typeof c["content"] === "string") {
+        const text = c["content"]
+          .replace(/^\s*[^\s\\]\s+/, "")
+          .replace(/\\\+?[a-z]+\d*\*?/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (text) out.push(text);
+        continue;
+      }
+      if (Array.isArray(c["children"])) walk(c["children"] as unknown[]);
+    }
+  };
+  walk((node as Record<string, unknown>)["children"] as unknown[]);
+  return out;
 }
 
 // A header band edit: the label node rewritten with a new tag and text.
@@ -347,14 +389,31 @@ function isZalnMilestone(node: unknown): boolean {
   return !!o && o["type"] === "milestone" && o["tag"] === "zaln";
 }
 
-// A footnote (`\f … \f*`, which usfm-js types "footnote") or a closed
-// character or note marker (`\add … \add*`, `\nd`, `\k`, `\x … \x*`: no type,
-// and an `endTag` that is its tag plus `*`). In USFM the whole `\sp` line is
-// the label, so these are part of it (#1354): the run crosses them.
+// The markers that are part of a `\sp` line and so of its label (#1354): a
+// footnote (`\f … \f*`, which usfm-js types "footnote"), and a closed
+// character or note marker from this list (`\add … \add*`, `\nd`, `\k`,
+// `\x … \x*`, `\fe`: no type, and an `endTag` that is its tag plus `*`). An
+// explicit list (#1366): `\va`, `\vp`, `\ca` and `\fig` are closed markers
+// too, but no part of a label; a `\va` after a flat label was moved into it
+// and vanished from the body. Mirror of LABEL_INLINE_TAGS in
+// api/src/importParsers.ts (plainTextParity.test.mjs pins the two together).
+const LABEL_INLINE_TAGS: ReadonlySet<string> = new Set([
+  // notes
+  "f", "fe", "x", "ef", "ex",
+  // character markers
+  "add", "addpn", "bd", "bdit", "bk", "dc", "em", "it", "jmp", "k", "nd", "ndx", "no", "ord", "pn", "png", "pro",
+  "qac", "qs", "qt", "rb", "rq", "sc", "sig", "sls", "sup", "tl", "wa", "wg", "wh", "wj", "xt",
+]);
+// usfm-js tags a nested character marker with its `+` (`\+nd` -> "+nd"), and
+// types `\qs`, `\qac`, `\qt` "quote" (review of #1366): both still count.
+const QUOTE_TYPED_CHAR_TAGS: ReadonlySet<string> = new Set(["qs", "qac", "qt"]);
 function isLabelInlineMarker(o: Record<string, unknown>): boolean {
   if (o["type"] === "footnote") return true;
   const tag = o["tag"];
-  return o["type"] === undefined && typeof tag === "string" && o["endTag"] === `${tag}*`;
+  if (typeof tag !== "string" || o["endTag"] !== `${tag}*`) return false;
+  const bare = tag.startsWith("+") ? tag.slice(1) : tag;
+  if (o["type"] === "quote") return QUOTE_TYPED_CHAR_TAGS.has(bare);
+  return o["type"] === undefined && LABEL_INLINE_TAGS.has(bare);
 }
 
 // A node a label's run may hold that can itself hold other nodes.

@@ -2205,6 +2205,7 @@ function ActiveLine({
               key={`${s.tag}-${i}`}
               tag={s.tag}
               text={s.text}
+              notes={s.notes}
               editable={!!editable && !readOnly}
               onChange={(next) => {
                 // Splice the updated/removed section back into verseObjects
@@ -2354,7 +2355,7 @@ function NonActiveSections({ verse, column }: { verse: VerseDto; column: string 
   return (
     <Stack spacing={0.25} sx={{ mb: 0.25 }}>
       {sections.map((s, i) => (
-        <SectionHeaderBand key={`${column}-${verse.verse}-sec-${i}`} tag={s.tag} text={s.text} />
+        <SectionHeaderBand key={`${column}-${verse.verse}-sec-${i}`} tag={s.tag} text={s.text} notes={s.notes} />
       ))}
     </Stack>
   );

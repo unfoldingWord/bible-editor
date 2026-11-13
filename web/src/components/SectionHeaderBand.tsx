@@ -25,6 +25,10 @@ import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 interface Props {
   tag: string;
   text: string;
+  // Footnotes / cross references inside a `\sp` label (SectionHeader.notes,
+  // #1366). Shown read-only beside the label: a band edit keeps them as they
+  // are, so they are not part of the editable text.
+  notes?: string[];
   editable?: boolean;
   onChange?: (next: { tag: string; text: string } | { tag: null; text: "" }) => void;
 }
@@ -38,7 +42,7 @@ const LEVEL_OPTIONS = [
   { value: "s3", label: "\\s3" },
 ];
 
-export function SectionHeaderBand({ tag, text, editable, onChange }: Props) {
+export function SectionHeaderBand({ tag, text, notes, editable, onChange }: Props) {
   const [editing, setEditing] = useState(false);
   const [draftText, setDraftText] = useState(text);
   const [draftTag, setDraftTag] = useState(tag);
@@ -126,6 +130,7 @@ export function SectionHeaderBand({ tag, text, editable, onChange }: Props) {
         >
           {text}
         </Box>
+        <LabelNotes notes={notes} />
         <Tooltip title="save (enter)">
           <IconButton
             size="small"
@@ -202,6 +207,7 @@ export function SectionHeaderBand({ tag, text, editable, onChange }: Props) {
       >
         {text}
       </Typography>
+      <LabelNotes notes={notes} />
       {editable && (
         <Tooltip title="edit section header">
           <IconButton
@@ -214,5 +220,26 @@ export function SectionHeaderBand({ tag, text, editable, onChange }: Props) {
         </Tooltip>
       )}
     </Stack>
+  );
+}
+
+// A label's footnotes and cross references (#1366), read-only: each note's
+// text in small italics beside the label. The band edit leaves them untouched.
+function LabelNotes({ notes }: { notes?: string[] }) {
+  if (!notes || notes.length === 0) return null;
+  return (
+    <>
+      {notes.map((n, i) => (
+        <Tooltip key={i} title="note in this label (not editable here)">
+          <Typography
+            component="span"
+            data-testid="label-note"
+            sx={{ fontSize: 11, fontStyle: "italic", color: "#014263", opacity: 0.8, px: 0.5, borderLeft: "1px solid", borderColor: "divider" }}
+          >
+            {n}
+          </Typography>
+        </Tooltip>
+      ))}
+    </>
   );
 }
