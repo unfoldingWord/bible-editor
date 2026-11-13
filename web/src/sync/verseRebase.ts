@@ -152,6 +152,10 @@ export function rebaseVersePatch(
   }
   try {
     const result = smartEditVerse(curledServer, serverText, opText);
+    // The engine refused to apply the op's text beside a `\sp` label written as
+    // words (#1350) and handed back the server tree. Rebasing to that would drop
+    // the queued edit silently; re-send the op's own tree, as before #564.
+    if (result.labelRefused) return { kind: "verbatim" };
     return {
       kind: "rebased",
       patch: {

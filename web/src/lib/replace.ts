@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, isHeaderLabelNode, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, isHeaderLabelNode, isWordLabelNode, liftMarkerText, extractPlainText, extractEditableText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 import { hoistOpeningPunctuation, concatVerseText, OPENING_PUNCT_RE } from "./openingPunct.ts";
@@ -34,6 +34,10 @@ export interface SmartReplaceResult {
   // surfaces this to the translator, because the override can also revert a
   // deliberate marker removal — see markerCaptureLooksDropped.
   markerCaptureGuarded?: boolean;
+  // Set when the edit was refused because it would change or drop a `\sp`
+  // label written as words (withWordLabelsAsText, #1350): `content` is the
+  // input, unchanged, and nothing should be saved.
+  labelRefused?: boolean;
 }
 
 interface Leaf {
@@ -1400,11 +1404,11 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
   const before: string[] = [];
   const collapsed = vo.map((n) => {
     const o = n as Record<string, unknown> | null;
-    if (!o || !isHeaderLabelNode(o) || !Array.isArray(o["children"]) || o["text"] !== undefined || o["content"] !== undefined) return n;
-    const { children, endTag, ...rest } = o;
+    if (!o || !isWordLabelNode(o)) return n;
+    const { children, endTag, text: ownText, ...rest } = o;
     const text = rawTextOf(children as unknown[]);
     before.push(text);
-    return { ...rest, text, [LABEL_WORDS]: { children, endTag } };
+    return { ...rest, text, [LABEL_WORDS]: { children, endTag, ...(ownText !== undefined ? { text: ownText } : {}) } };
   });
   if (before.length === 0) return run(content);
   const shown = { ...(content as Record<string, unknown>), verseObjects: collapsed };
@@ -1413,7 +1417,7 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
   if (result.content === shown) return { ...result, content };
   const refuse = (why: string): SmartReplaceResult => {
     console.warn(`[replace] edit refused: it would change a speaker label written as words (${why}) (#1350).`);
-    return { content, plainText: extractPlainText(content), preservedAlignment: true };
+    return { content, plainText: extractPlainText(content), preservedAlignment: true, labelRefused: true };
   };
   const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(out)) return refuse("no verse tree");

@@ -30,7 +30,7 @@
 // chunk dividers are invisible except as markers (Door43 strips \s5 too).
 
 import type { VerseDto } from "../sync/api.ts";
-import { PARAGRAPH_TAGS, isInFlowMarker, isCharacterWrapper, isTsMilestone, isHeaderLabelNode, headerLabelText } from "./usfm.ts";
+import { PARAGRAPH_TAGS, isInFlowMarker, isCharacterWrapper, isTsMilestone, isWordLabelNode, headerLabelText } from "./usfm.ts";
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -235,7 +235,7 @@ export function renderPrintPreviewHtml({ verses }: PrintPreviewInput): string {
         open(tag);
         // A `\sp` label written as words holds them as `children` (nestWordLabels,
         // #1350): print their text as the heading, complete like a text label.
-        if (isHeading && isHeaderLabelNode(o) && Array.isArray(o["children"]) && o["content"] === undefined && o["text"] === undefined) {
+        if (isHeading && isWordLabelNode(o)) {
           emit(impliedWords(escapeHtml(headerLabelText(o))));
           cur = null;
           continue;

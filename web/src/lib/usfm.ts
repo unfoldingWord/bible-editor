@@ -215,7 +215,7 @@ export function splitSectionHeaders(verseObjects: unknown[] | undefined | null):
 export function headerLabelText(node: unknown): string {
   const o = node as Record<string, unknown> | null;
   if (!o) return "";
-  if (o["content"] === undefined && o["text"] === undefined && Array.isArray(o["children"])) {
+  if (isWordLabelNode(o)) {
     const parts: string[] = [];
     const walk = (nodes: unknown[]): void => {
       for (const n of nodes) {
@@ -247,7 +247,7 @@ export function headerLabelText(node: unknown): string {
 // text: keeping `children` beside `content` would export the label twice. A
 // save that changes neither tag nor text keeps the words as they were.
 export function rewriteHeaderLabel(node: Record<string, unknown>, tag: string, text: string): Record<string, unknown> {
-  if (Array.isArray(node["children"]) && tag === node["tag"] && text === headerLabelText(node)) return node;
+  if (isWordLabelNode(node) && tag === node["tag"] && text === headerLabelText(node)) return node;
   const { text: _drop, type: _dropType, children: _dropChildren, endTag: _dropEnd, ...rest } = node;
   const type = SECTION_HEADER_TAGS.has(tag) ? "section" : undefined;
   return { ...rest, ...(type ? { type } : {}), tag, content: `${text}\n` };
@@ -264,11 +264,15 @@ export function rewriteHeaderLabel(node: Record<string, unknown>, tag: string, t
 // The run nested is what USFM gives the label: every `\w` word, text node and
 // `\zaln` milestone after the `sp` up to the next node of any other kind (the
 // `\q1` or `\ts\*` that follows it in every real case) or the verse end. Only
-// an `sp` with no text, content or children of its own, followed by at least
-// one word, is touched; every other tree is returned as is. Top-level only,
-// idempotent. Mirrors nestWordLabels in api/src/importParsers.ts, which the
-// import runs so the stored tree has this shape (plainTextParity.test.mjs pins
-// the two together).
+// an `sp` with no text (an empty `text` counts as none and is dropped),
+// content or children of its own is touched, and only when the run holds at
+// least one `\w` word. A `\zaln` milestone may join the run only if everything
+// inside it is words, text and milestones: one that opens on a label word and
+// closes in the body holds the `\q1` and body words after it, so a label that
+// meets such a milestone is not nested at all and keeps main's shape. Every
+// other tree is returned as is. Top-level only, idempotent. Mirrors
+// nestWordLabels in api/src/importParsers.ts, which the import runs so the
+// stored tree has this shape (plainTextParity.test.mjs pins the two together).
 export function nestWordLabels(verseObjects: unknown[]): unknown[] {
   if (!Array.isArray(verseObjects)) return verseObjects;
   let out: unknown[] | null = null;
@@ -276,14 +280,22 @@ export function nestWordLabels(verseObjects: unknown[]): unknown[] {
     const node = verseObjects[i];
     if (isEmptyLabelOpener(node)) {
       let j = i + 1;
-      let hasWord = false;
-      while (j < verseObjects.length && isLabelRunNode(verseObjects[j])) {
-        if ((verseObjects[j] as Record<string, unknown>)["type"] !== "text") hasWord = true;
+      let words = 0;
+      let clean = true;
+      while (j < verseObjects.length) {
+        const kind = labelRunKind(verseObjects[j]);
+        if (kind === null) {
+          // A milestone that spans past the label: leave this label alone.
+          if (isZalnMilestone(verseObjects[j])) clean = false;
+          break;
+        }
+        words += kind;
         j++;
       }
-      if (hasWord) {
+      if (clean && words > 0) {
+        const { text: _empty, ...opener } = node as Record<string, unknown>;
         out ??= verseObjects.slice(0, i);
-        out.push({ ...(node as Record<string, unknown>), children: verseObjects.slice(i + 1, j), endTag: "" });
+        out.push({ ...opener, children: verseObjects.slice(i + 1, j), endTag: "" });
         i = j - 1;
         continue;
       }
@@ -293,18 +305,43 @@ export function nestWordLabels(verseObjects: unknown[]): unknown[] {
   return out ?? verseObjects;
 }
 
+// A `\sp` label written as words, as nestWordLabels stores it: its words are
+// `children`, and it has no `content` or (non-empty) `text` of its own. The one
+// test every reader of that shape shares (headerLabelText, the edit engine's
+// withWordLabelsAsText, the print preview).
+export function isWordLabelNode(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o || !isHeaderLabelNode(o) || !Array.isArray(o["children"])) return false;
+  return o["content"] === undefined && (o["text"] === undefined || o["text"] === "");
+}
+
 function isEmptyLabelOpener(node: unknown): boolean {
   const o = node as Record<string, unknown> | null;
   if (!o || o["tag"] !== "sp" || o["type"] !== undefined) return false;
   return (o["text"] === undefined || o["text"] === "") && o["content"] === undefined && o["children"] === undefined;
 }
 
-function isLabelRunNode(node: unknown): boolean {
+function isZalnMilestone(node: unknown): boolean {
   const o = node as Record<string, unknown> | null;
-  if (!o) return false;
-  if (o["type"] === "text") return typeof o["text"] === "string";
-  if (o["type"] === "word") return o["tag"] === "w";
-  return o["type"] === "milestone" && o["tag"] === "zaln";
+  return !!o && o["type"] === "milestone" && o["tag"] === "zaln";
+}
+
+// How a node counts in a label's run: the number of `\w` words it holds (0 for
+// a text node), or null when it ends the run — any other node, and a milestone
+// with anything but words, text and milestones inside it.
+function labelRunKind(node: unknown): number | null {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return null;
+  if (o["type"] === "text") return typeof o["text"] === "string" ? 0 : null;
+  if (o["type"] === "word") return o["tag"] === "w" ? 1 : null;
+  if (!isZalnMilestone(o)) return null;
+  let words = 0;
+  for (const c of (o["children"] as unknown[] | undefined) ?? []) {
+    const k = labelRunKind(c);
+    if (k === null) return null;
+    words += k;
+  }
+  return words;
 }
 
 // usfm-js stores poetry markers (\q1, \q2, \qm*) as `{type:"quote", tag}`

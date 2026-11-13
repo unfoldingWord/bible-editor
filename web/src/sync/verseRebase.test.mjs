@@ -23,6 +23,7 @@
 
 import assert from "node:assert/strict";
 import { rebaseVersePatch } from "./verseRebase.ts";
+import { smartEditVerse } from "../lib/replace.ts";
 import { analyzeAlignmentDelta, guardBlocksSave } from "../lib/alignmentDelta.ts";
 import { extractEditableText } from "../lib/usfm.ts";
 
@@ -305,6 +306,24 @@ const sourceOf = (content, word) => (wordSources(content).find(([tx]) => tx === 
   // Restores are tagged alignment_edit and must never be curled.
   const restore = rebaseVersePatch({ content: server, alignment_intent: "alignment_edit" }, server);
   check(restore.kind === "verbatim", "an alignment_edit (restore) op is still sent verbatim");
+}
+
+// A rebase the engine refuses beside a `\sp` label written as words (#1350):
+// it hands back the server tree, and rebasing to that would drop the queued
+// edit silently. The op is sent verbatim instead (pre-#564 behavior).
+{
+  const label = () => ({ tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("man"), t("\n")], endTag: "" });
+  const server = { verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(".\n"), label(), { tag: "q1", type: "quote" }, zaln("H3", [w("He")]), t(" "), zaln("H4", [w("ran")]), t(".")] };
+  const op = { verseObjects: [zaln("H1", [w("A")]), t(" "), zaln("H2", [w("home")]), t(" and\n"), label(), { tag: "q1", type: "quote" }, w("he"), t(" "), zaln("H4", [w("ran")]), t(".")] };
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    check(smartEditVerse(server, extractEditableText(server), extractEditableText(op)).labelRefused === true, "setup: the engine refuses this edit");
+    const out = rebaseVersePatch({ content: op }, server);
+    check(out.kind === "verbatim", `an edit across a word label the engine refuses is sent verbatim (got ${out.kind})`);
+  } finally {
+    console.warn = warn;
+  }
 }
 
 console.log(`\nverseRebase: all ${passed} checks passed.`);

@@ -168,6 +168,8 @@ const markersOf = (html) => [...html.matchAll(MARKER_RE)].map((m) => m[0].replac
   const nested = label({ tag: "sp", nextChar: " ", children: [w("The"), t(" "), w("woman"), t(" "), w("thinks"), t("\n")], endTag: "" });
   assert(nested.includes('<p class="paras_usfm_sp">The woman thinks</p>'), `word label prints as its heading (got ${nested})`);
   assert(nested === plain, "word label prints exactly as the same label in plain text");
+  const emptyText = label({ tag: "sp", nextChar: " ", text: "", children: [w("The"), t(" "), w("woman"), t(" "), w("thinks"), t("\n")], endTag: "" });
+  assert(emptyText === plain, `a word label carrying text "" prints the same (got ${emptyText})`);
 }
 
 // --- standalone document ---

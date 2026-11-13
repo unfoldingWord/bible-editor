@@ -4165,6 +4165,21 @@ function countAllMilestones(nodes) {
     // No change at all hands back the caller's own tree.
     const same = clone(v4);
     assert(smartEditVerse(same, old, old).content === same, "typed no-op: the same tree comes back");
+    // The caller's tree (often the pinned base / live React state) is never
+    // written to, even when the edit renumbers the label words' occurrences.
+    const input = clone(v4);
+    const snapshot = JSON.stringify(input);
+    const moved = smartEditVerse(input, old, old.replace("king to me", "king for me"), { capturedFromDom: true });
+    assert(JSON.stringify(input) === snapshot && labels(moved.content) !== labels(input), "typed to -> for: the input tree is unchanged though the result's label occurrences moved");
+    const finput = clone(v4);
+    findReplaceVerse(finput, p4, /to/g, p4.indexOf("king to") + 5, 2, "for");
+    assert(JSON.stringify(finput) === snapshot, "find to -> for: the input tree is unchanged");
+    // A nested label that still carries an empty `text` is a word label too,
+    // and comes back with it.
+    const withEmpty = clone(v1);
+    withEmpty.verseObjects.find((n) => n.tag === "sp").text = "";
+    const e = smartEditVerse(clone(withEmpty), old1, old1.replace(" beautiful", ""), { capturedFromDom: true });
+    assert(extractEditableText(e.content) === old1.replace(" beautiful", "") && labels(e.content) === labels(withEmpty), `text "" label: edit applied, label kept exactly (got ${labels(e.content)})`);
   }
   // An edit whose range crosses a label. With a plain-text label the engine
   // drops every label in the verse here (a separate, older fault); a word
@@ -4176,10 +4191,10 @@ function countAllMilestones(nodes) {
     try {
       const at = p4.indexOf("bedroom. We");
       const f = findReplaceVerse(clone(v4), p4, /bedroom\. We/g, at, 11, "bedroom; we");
-      assert(labels(f.content) === labels(v4) && f.plainText === p4, `find across a label: refused, labels kept (got ${JSON.stringify(f.plainText.slice(0, 40))})`);
+      assert(labels(f.content) === labels(v4) && f.plainText === p4 && f.labelRefused === true, `find across a label: refused (flagged), labels kept (got ${JSON.stringify(f.plainText.slice(0, 40))})`);
       const old = extractEditableText(v4);
       const d = smartEditVerse(clone(v4), old, old.replace("to your home. \\q1 He is like", "like"), { capturedFromDom: true });
-      assert(labels(d.content) === labels(v4), "typed delete across a label: labels kept");
+      assert(labels(d.content) === labels(v4) && d.labelRefused === true, "typed delete across a label: refused (flagged), labels kept");
       // A replace across a label that keeps the text on both sides intact goes through.
       const h = p4.indexOf("home. He is");
       const ok = findReplaceVerse(clone(v4), p4, /home\. He is/g, h, 11, "home. She is");

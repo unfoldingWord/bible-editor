@@ -4277,6 +4277,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const engineResult = smartEditVerse(effectiveBase.content, oldEditable, typedEditable, {
       capturedFromDom: true,
     });
+    // The engine refused: the edit would change or drop a `\sp` speaker label
+    // written as words (#1350). Queue nothing (no version bump, no history) and
+    // leave the keystroke draft alone, so the typed text stays in the editor;
+    // like refuseCommit, afterCommit does not run.
+    if (engineResult.labelRefused) {
+      pushPipelineToast(
+        `Not saved: this edit in ${book} ${chapterNum}:${verseNum} ${bibleVersion} runs across a speaker label. Make the changes on each side of the label in separate saves. Your typed text is still in the editor.`,
+        "error",
+      );
+      return;
+    }
     // Curl any straight quote left in the verse (#1273): the typing
     // interceptor misses multi-character inserts, IME, drops and Copy T4T to
     // UST. Done on the engine's result, never on the typed text, which would

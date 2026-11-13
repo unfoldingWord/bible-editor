@@ -18,7 +18,7 @@ import usfm from "usfm-js";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { nestWordLabels, splitSectionHeaders, extractPlainText, extractEditableText, rewriteHeaderLabel } from "./usfm.ts";
+import { nestWordLabels, splitSectionHeaders, extractPlainText, extractEditableText, rewriteHeaderLabel, isWordLabelNode, headerLabelText } from "./usfm.ts";
 import { parseAlignment, serializeAlignment, countUnalignedTargetWords } from "./alignment.ts";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -54,6 +54,44 @@ const v4 = nestWordLabels(verse("4"));
   assert(json(nestWordLabels(textLabel)) === json(textLabel), "a plain-text label is left alone");
   const noWord = [{ tag: "sp", nextChar: " " }, { type: "text", text: "\n" }, { tag: "q1", type: "quote" }];
   assert(json(nestWordLabels(noWord)) === json(noWord), "an empty sp with no word after it is left alone");
+}
+
+// Shapes that must NOT nest (review of #1350). Parsed by usfm-js:
+//   1:1  \sp \w The\w* \zaln-s …\*\w man\w*⏎\q1 \w Hi\w*\zaln-e\* \w there\w*
+//        → sp, w:The, " ", zaln[w:man "\n" q1 w:Hi], " ", w:there
+//        The milestone opens on a label word and closes in the body: nesting
+//        would swallow the \q1 and every body word to the verse end.
+//   1:2  \sp \zaln-s …\*\zaln-e\*⏎\q1 \w Go\w*  → sp, zaln[], "\n", q1, w:Go
+//        No \w word in the run at all.
+{
+  const odd = usfm.toJSON(String.raw`\c 1
+\p
+\v 1 \w Body|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \zaln-s |x-strong="H1" x-lemma="a" x-morph="He" x-occurrence="1" x-occurrences="1" x-content="א"\*\w man|x-occurrence="1" x-occurrences="1"\w*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \w there|x-occurrence="1" x-occurrences="1"\w*
+\v 2 \w Next|x-occurrence="1" x-occurrences="1"\w*.
+\sp \zaln-s |x-strong="H2" x-lemma="b" x-morph="He" x-occurrence="1" x-occurrences="1" x-content="ב"\*\zaln-e\*
+\q1 \w Go|x-occurrence="1" x-occurrences="1"\w*
+`).chapters["1"];
+  const spanning = odd["1"].verseObjects;
+  const zalnAt = spanning.findIndex((n) => n.tag === "zaln");
+  assert(spanning[zalnAt].children.some((n) => n.tag === "q1"), "setup: usfm-js puts the \\q1 inside the spanning milestone");
+  assert(nestWordLabels(spanning) === spanning, "a label whose run meets a milestone spanning into the body is not nested");
+  assert(extractPlainText(nestWordLabels(spanning)).includes("Hi there"), "…so the body words stay verse text");
+  const noWords = odd["2"].verseObjects;
+  assert(noWords.some((n) => n.tag === "zaln" && n.children === undefined || (n.tag === "zaln" && n.children.length === 0)), "setup: an empty milestone after the sp");
+  assert(nestWordLabels(noWords) === noWords, "a run with milestones but no \\w word is not nested");
+}
+
+// An opener with an empty `text` (review of #1350): nested, the empty text
+// dropped, and every reader treats it as a word label.
+{
+  const opener = [{ tag: "sp", text: "" }, { text: "The", tag: "w", type: "word", occurrence: "1", occurrences: "1" }, { type: "text", text: " " }, { text: "man", tag: "w", type: "word", occurrence: "1", occurrences: "1" }, { type: "text", text: "\n" }, { tag: "q1", type: "quote" }];
+  const nested = nestWordLabels(opener);
+  assert(nested[0].text === undefined && Array.isArray(nested[0].children), `empty text dropped when nesting (got ${json(nested[0])})`);
+  assert(render(nested) === render(opener), "…and it renders the same");
+  const handMade = { tag: "sp", text: "", children: nested[0].children, endTag: "" };
+  assert(isWordLabelNode(handMade) && headerLabelText(handMade) === "The man", `a nested label with text "" still reads as a word label (got ${json(headerLabelText(handMade))})`);
 }
 
 // Plain and editable text skip the label.

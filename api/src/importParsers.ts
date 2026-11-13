@@ -1331,11 +1331,15 @@ export function isHeaderLabelNode(node: unknown): boolean {
 // (with the text nodes and `\zaln` milestones between them, up to the next node
 // of any other kind or the verse end) into the `sp` node as `children`, with
 // `endTag: ""`, so isHeaderLabelNode's skip covers them and usfm-js renders the
-// node back to the same bytes. Only an `sp` with no text, content or children
-// of its own, followed by at least one word, is touched. Top-level only,
-// idempotent. Mirror of nestWordLabels in web/src/lib/usfm.ts (same
-// cross-bundle reason as extractPlainText below; plainTextParity.test.mjs pins
-// the two together). Exported for scripts/import-book.mjs and its siblings.
+// node back to the same bytes. Only an `sp` with no text (an empty `text`
+// counts as none and is dropped), content or children of its own is touched,
+// and only when the run holds at least one `\w` word. A `\zaln` milestone joins
+// the run only if everything inside it is words, text and milestones; a label
+// that meets one spanning into the body (it holds the `\q1` and body words) is
+// not nested at all. Top-level only, idempotent. Mirror of nestWordLabels in
+// web/src/lib/usfm.ts (same cross-bundle reason as extractPlainText below;
+// plainTextParity.test.mjs pins the two together). Exported for
+// scripts/import-book.mjs and its siblings.
 export function nestWordLabels(verseObjects: unknown[]): unknown[] {
   if (!Array.isArray(verseObjects)) return verseObjects;
   let out: unknown[] | null = null;
@@ -1343,14 +1347,21 @@ export function nestWordLabels(verseObjects: unknown[]): unknown[] {
     const node = verseObjects[i];
     if (isEmptyLabelOpener(node)) {
       let j = i + 1;
-      let hasWord = false;
-      while (j < verseObjects.length && isLabelRunNode(verseObjects[j])) {
-        if ((verseObjects[j] as Record<string, unknown>)["type"] !== "text") hasWord = true;
+      let words = 0;
+      let clean = true;
+      while (j < verseObjects.length) {
+        const kind = labelRunKind(verseObjects[j]);
+        if (kind === null) {
+          if (isZalnMilestone(verseObjects[j])) clean = false;
+          break;
+        }
+        words += kind;
         j++;
       }
-      if (hasWord) {
+      if (clean && words > 0) {
+        const { text: _empty, ...opener } = node as Record<string, unknown>;
         out ??= verseObjects.slice(0, i);
-        out.push({ ...(node as Record<string, unknown>), children: verseObjects.slice(i + 1, j), endTag: "" });
+        out.push({ ...opener, children: verseObjects.slice(i + 1, j), endTag: "" });
         i = j - 1;
         continue;
       }
@@ -1366,12 +1377,26 @@ function isEmptyLabelOpener(node: unknown): boolean {
   return (o["text"] === undefined || o["text"] === "") && o["content"] === undefined && o["children"] === undefined;
 }
 
-function isLabelRunNode(node: unknown): boolean {
+function isZalnMilestone(node: unknown): boolean {
   const o = node as Record<string, unknown> | null;
-  if (!o) return false;
-  if (o["type"] === "text") return typeof o["text"] === "string";
-  if (o["type"] === "word") return o["tag"] === "w";
-  return o["type"] === "milestone" && o["tag"] === "zaln";
+  return !!o && o["type"] === "milestone" && o["tag"] === "zaln";
+}
+
+// \w words a node adds to a label's run (0 for text), or null when it ends the
+// run: any other node, and a milestone holding anything but words/text/milestones.
+function labelRunKind(node: unknown): number | null {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return null;
+  if (o["type"] === "text") return typeof o["text"] === "string" ? 0 : null;
+  if (o["type"] === "word") return o["tag"] === "w" ? 1 : null;
+  if (!isZalnMilestone(o)) return null;
+  let words = 0;
+  for (const c of (o["children"] as unknown[] | undefined) ?? []) {
+    const k = labelRunKind(c);
+    if (k === null) return null;
+    words += k;
+  }
+  return words;
 }
 
 // Walk verse-objects and concatenate all text. Same shape and behaviour

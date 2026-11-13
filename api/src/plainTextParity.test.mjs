@@ -130,6 +130,29 @@ check(usfm.toJSON(src).chapters["1"]["2"].verseObjects.some((n) => n.tag === "sp
   }
 }
 
+// Shapes that must not nest, and an empty-text opener (review of #1350): a
+// milestone opening on a label word and closing in the body (usfm-js puts the
+// \q1 and the body word inside it), a run with no \w word, and `text: ""`.
+{
+  const odd = usfm.toJSON(String.raw`\c 1
+\p
+\v 1 \w Body|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \zaln-s |x-strong="H1" x-lemma="a" x-morph="He" x-occurrence="1" x-occurrences="1" x-content="א"\*\w man|x-occurrence="1" x-occurrences="1"\w*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \w there|x-occurrence="1" x-occurrences="1"\w*
+\v 2 \w Next|x-occurrence="1" x-occurrences="1"\w*.
+\sp \zaln-s |x-strong="H2" x-lemma="b" x-morph="He" x-occurrence="1" x-occurrences="1" x-content="ב"\*\zaln-e\*
+\q1 \w Go|x-occurrence="1" x-occurrences="1"\w*
+`).chapters["1"];
+  for (const v of ["1", "2"]) {
+    const vos = odd[v].verseObjects;
+    check(apiNest(vos) === vos && webNest(vos) === vos, `odd 1:${v}: neither copy nests it`);
+  }
+  check(apiExtract({ verseObjects: apiNest(odd["1"].verseObjects) }).includes("Hi there"), "odd 1:1: the body words stay verse text");
+  const emptyText = [{ tag: "sp", text: "" }, w("The"), t(" "), w("man"), t("\n"), { tag: "q1", type: "quote" }, w("Hi")];
+  check(JSON.stringify(apiNest(emptyText)) === JSON.stringify(webNest(emptyText)) && apiNest(emptyText)[0].text === undefined, "empty-text opener: both copies nest it and drop the empty text");
+  check(apiExtract({ verseObjects: apiNest(emptyText) }) === "Hi", "empty-text opener: the label is out of the plain text");
+}
+
 if (failed > 0) {
   console.error(`\nplainTextParity: ${failed} check(s) failed, ${passed} passed.`);
   process.exit(1);
