@@ -1,4 +1,5 @@
 import type { OutboxOp } from "./outbox.ts";
+import type { DraftRecord } from "./drafts.ts";
 import { sameVerseContent } from "../lib/alignmentDelta.ts";
 
 // Pure predicate factored out of alignmentDrafts.ts's onOutboxResult listener
@@ -184,4 +185,58 @@ export function hasUnsavedVerseTextOp(
     if (at.verse < t.verse || at.verse > (t.verseEnd ?? t.verse)) return false;
     return !isAlignerPanelSaveOp(op);
   });
+}
+
+// #1254: the one note the aligner shows about unsaved text on its verse.
+// - "outbox": an edit is queued but not saved (#1248). The aligner shows it.
+// - "draft": text typed in the rows/columns editor and not yet saved. Typing
+//   lives only in the drafts store until Save, so the aligner shows the saved
+//   wording, without the typing.
+// - "both": an edit is queued AND there is typing it did not capture (typed
+//   after Save, or older typing under a find/replace). One note, not two
+//   stacked ones. It does not say which came first: the helper cannot tell.
+// A draft that a queued save captured (its generation rides on the op, in any
+// status) is not newer typing: Save already put that text into the local copy
+// the aligner shows, and the draft stays only until the save's 200 clears it.
+export type AlignerUnsavedNote = "none" | "outbox" | "draft" | "both";
+
+export const ALIGNER_UNSAVED_MESSAGE: Record<AlignerUnsavedNote, string | null> = {
+  none: null,
+  outbox: "This verse has an edit that hasn't saved yet.",
+  draft: "This verse has typed text that isn't saved; this screen shows the saved wording.",
+  both:
+    "This verse has an edit that hasn't saved yet, plus typed text that isn't saved; " +
+    "this screen shows the edit but not the typed text.",
+};
+
+export function alignerUnsavedNote(
+  ops: ReadonlyArray<Pick<OutboxOp, "target" | "patch" | "alignmentDraftGeneration" | "draftGeneration">>,
+  drafts: ReadonlyArray<Pick<DraftRecord, "meta" | "generation" | "updatedAt">>,
+  at: {
+    book: string;
+    chapter: number;
+    verse: number;
+    bibleVersion: string;
+    // The row the panel shows. Editors key a range row's draft by its first
+    // verse, while the panel may be opened on a verse inside the row (UST 6-9
+    // at verse 7). Null when no row is loaded: only `verse` itself counts.
+    rowVerse: number | null;
+    rowVerseEnd: number | null;
+  },
+): AlignerUnsavedNote {
+  const queued = hasUnsavedVerseTextOp(ops, at);
+  const captured = new Set<string>();
+  for (const op of ops) if (op.draftGeneration) captured.add(op.draftGeneration);
+  const start = at.rowVerse ?? at.verse;
+  const end = at.rowVerse == null ? at.verse : (at.rowVerseEnd ?? at.rowVerse);
+  const typed = drafts.some((d) => {
+    const m = d.meta;
+    if (m.kind !== "verse") return false;
+    if (m.book !== at.book || m.chapter !== at.chapter || m.bibleVersion !== at.bibleVersion) return false;
+    if (m.verse !== at.verse && (m.verse < start || m.verse > end)) return false;
+    return !captured.has(d.generation ?? `legacy:${d.updatedAt}`);
+  });
+  if (queued && typed) return "both";
+  if (queued) return "outbox";
+  return typed ? "draft" : "none";
 }
