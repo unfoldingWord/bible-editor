@@ -369,5 +369,58 @@ for (const [name, setup] of [
   );
 }
 
+// Issue #1348: a merge commit's per-verse evidence needs EVERY parent (a ref
+// the merge carried unchanged from one parent was authored there, not in the
+// merge). The ledger stores them in parent_shas_json (migration 0078), and the
+// ledger path is the one the nightly prefers, so it must hand them through.
+// NULL (rows written before 0078) or malformed stays unknown: no field at all,
+// which keeps the single-parent behavior.
+{
+  const sqlite = new DatabaseSync(":memory:");
+  const dir = new URL("../migrations/", import.meta.url);
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    sqlite.exec(readFileSync(new URL(f, dir), "utf8"));
+  }
+  const mk = (sql, args) => ({
+    bind: (...a) => mk(sql, a),
+    async first() {
+      const r = sqlite.prepare(sql).all(...args);
+      return r.length ? r[0] : null;
+    },
+    async all() {
+      return { results: sqlite.prepare(sql).all(...args) };
+    },
+  });
+  const realDb = { prepare: (sql) => mk(sql, []) };
+  sqlite
+    .prepare(
+      `INSERT INTO dcs_repo_polls (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
+                                    last_status, gap_since_sha, gap_at, coverage_since)
+       VALUES ('en_ust', 'tip', 900, 900, 900, 'ok', NULL, NULL, 100)`,
+    )
+    .run();
+  const insert = (sha, parents, committedAt) =>
+    sqlite
+      .prepare(
+        `INSERT INTO dcs_commits (repo, sha, parent_sha, parent_shas_json, author_name, author_email, committed_at,
+                                   message, classification, classification_reason, files_json, seen_at)
+         VALUES ('en_ust', ?, 'p1', ?, 'Editor', 'editor@example.org', ?, 'Merge branch master', 'human',
+                 'unrecognized', ?, ?)`,
+      )
+      .run(sha, parents, committedAt, files, committedAt);
+  insert("merge", JSON.stringify(["p1", "p2"]), 500);
+  insert("legacy", null, 400);
+  insert("garbled", "{not json", 300);
+  const result = await readLedgerMasterLineage(realDb, "en_ust", "24-JER.usfm", 200, "tip");
+  ok(result.usable, "#1348: the ledger with parent_shas_json is usable");
+  const bySha = Object.fromEntries((result.lineage?.commits ?? []).map((c) => [c.sha, c]));
+  ok(
+    JSON.stringify(bySha.merge?.allParentShas) === JSON.stringify(["p1", "p2"]),
+    "#1348: a ledger merge commit carries every parent into the lineage",
+  );
+  ok(bySha.legacy && bySha.legacy.allParentShas === undefined, "#1348: a pre-0078 row's parents stay unknown");
+  ok(bySha.garbled && bySha.garbled.allParentShas === undefined, "#1348: a malformed parent list stays unknown");
+}
+
 if (failed) process.exit(1);
 console.log("masterLineageLedger: all assertions passed");
