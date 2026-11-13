@@ -67,11 +67,15 @@ const FOREIGN_HEAD = "b".repeat(40);
 // (master TSV fetch, contents API, …) is a 404, so the export stops at a
 // fail-closed guard after the freshness gate and never reaches a commit.
 // `heads` maps a URL-encoded file path fragment to the master head SHA.
-function installFetch(heads) {
+// `onHeadLookup` runs while the freshness gate is waiting on Door43, which is
+// where an overlapping run's write lands in the race the gate-start bound
+// guards against.
+function installFetch(heads, onHeadLookup = null) {
   globalThis.fetch = async (input) => {
     const url = String(typeof input === "string" ? input : input.url);
     if (!url.startsWith(DCS_BASE_URL)) throw new Error(`test fetch escaped the stub: ${url}`);
     if (url.includes("/commits?sha=master&path=")) {
+      if (onHeadLookup) onHeadLookup(url);
       for (const [frag, sha] of Object.entries(heads)) {
         if (url.includes(frag)) {
           return new Response(
@@ -149,14 +153,19 @@ function freshEnv() {
   const wf = new ExportWorkflow({}, env);
   const exportOne = (book, resource, { dcsAllowed = true, instanceId = "export-test" } = {}) =>
     wf.exportOne(book, resource, instanceId, dcsAllowed, false, new Set(), false);
-  return { sqlite, env, live, exportOne, flags };
+  // The clear removes only rows written before this run's gate started, at
+  // created_at's one-second granularity. Setup rows are written moments before
+  // the run under test, in the same second, so age them to read as an earlier
+  // night's alert, which is what they stand for.
+  const ageAlerts = () => sqlite.prepare(`UPDATE system_alerts SET created_at = created_at - 3600`).run();
+  return { sqlite, env, live, exportOne, flags, ageAlerts };
 }
 
 const tqPath = (book) => encodeURIComponent(`tq_${book}.tsv`);
 
 console.log("\n[a stale skip writes export_stale; a later run that passes the gate clears it (issue #1364)]");
 {
-  const { live, exportOne } = freshEnv();
+  const { live, exportOne, ageAlerts } = freshEnv();
   installFetch({ [tqPath("JER")]: FOREIGN_HEAD, [tqPath("LAM")]: FOREIGN_HEAD });
 
   const stale = await exportOne("JER", "tq", { instanceId: "export-night-1" });
@@ -167,6 +176,7 @@ console.log("\n[a stale skip writes export_stale; a later run that passes the ga
   // An unrelated pair also went stale the same night; it must survive JER TQ's clear.
   await exportOne("LAM", "tq", { instanceId: "export-night-1" });
   assert(live("export_stale:LAM:tq").length === 1, "setup: LAM TQ also has an undismissed export_stale alert");
+  ageAlerts();
 
   // Night 2: D1 caught up, master's head equals the watermark for JER TQ only.
   installFetch({ [tqPath("JER")]: WATERMARK, [tqPath("LAM")]: FOREIGN_HEAD });
@@ -181,13 +191,14 @@ console.log("\n[a stale skip writes export_stale; a later run that passes the ga
 
 console.log("\n[the clear is scoped to the exact (book, resource) that passed]");
 {
-  const { sqlite, live, exportOne } = freshEnv();
+  const { sqlite, live, exportOne, ageAlerts } = freshEnv();
   installFetch({ [tqPath("JER")]: FOREIGN_HEAD });
   await exportOne("JER", "tq");
   // Same book, different resource: a standing TN stale alert from an earlier night.
   sqlite
     .prepare(`INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?, 'error', ?, 'JER TN stale', ?)`)
     .run(EXPORT_ALERT_USERNAME, "export_stale:JER:tn", DCS_BASE_URL);
+  ageAlerts();
   installFetch({ [tqPath("JER")]: WATERMARK });
   await exportOne("JER", "tq");
   assert(live("export_stale:JER:tq").length === 0, "JER TQ's alert is cleared");
@@ -196,10 +207,11 @@ console.log("\n[the clear is scoped to the exact (book, resource) that passed]")
 
 console.log("\n[a dry run measures nothing, so it must not clear the alert]");
 {
-  const { live, exportOne } = freshEnv();
+  const { live, exportOne, ageAlerts } = freshEnv();
   installFetch({ [tqPath("JER")]: FOREIGN_HEAD });
   await exportOne("JER", "tq");
   assert(live("export_stale:JER:tq").length === 1, "setup: the stale alert stands");
+  ageAlerts();
   // Door43 would now say fresh, but a dry run never asks it.
   installFetch({ [tqPath("JER")]: WATERMARK });
   await exportOne("JER", "tq", { dcsAllowed: false });
@@ -217,10 +229,11 @@ console.log("\n[a still-stale run replaces the alert rather than clearing it]");
 
 console.log("\n[a dismissed export_stale row is history, not cleared]");
 {
-  const { sqlite, exportOne } = freshEnv();
+  const { sqlite, exportOne, ageAlerts } = freshEnv();
   installFetch({ [tqPath("JER")]: FOREIGN_HEAD });
   await exportOne("JER", "tq");
   sqlite.prepare(`UPDATE system_alerts SET dismissed_at = 5000 WHERE source = 'export_stale:JER:tq'`).run();
+  ageAlerts();
   installFetch({ [tqPath("JER")]: WATERMARK });
   await exportOne("JER", "tq");
   const n = sqlite.prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = 'export_stale:JER:tq' AND dismissed_at IS NOT NULL`).get().n;
@@ -229,10 +242,11 @@ console.log("\n[a dismissed export_stale row is history, not cleared]");
 
 console.log("\n[a failed clear never fails the export]");
 {
-  const { live, exportOne, flags } = freshEnv();
+  const { live, exportOne, flags, ageAlerts } = freshEnv();
   installFetch({ [tqPath("JER")]: FOREIGN_HEAD });
   await exportOne("JER", "tq");
   assert(live("export_stale:JER:tq").length === 1, "setup: the stale alert stands");
+  ageAlerts();
   flags.failAlertClear = true;
   installFetch({ [tqPath("JER")]: WATERMARK });
   let threw = null;
@@ -249,6 +263,39 @@ console.log("\n[a failed clear never fails the export]");
   assert(threw === null, `exportOne does not throw when the clear fails (threw: ${threw?.message})`);
   assert(result !== null && !String(result.dcsSkippedReason ?? "").startsWith("stale_master"), "…and it still runs past the gate");
   assert(live("export_stale:JER:tq").length === 1, "…the alert simply stays until a later clear succeeds");
+}
+
+console.log("\n[an overlapping run's NEWER export_stale row survives this run's clear; the older one goes (#1364 review)]");
+{
+  // A manual single-book export and the nightly overlap. This run's gate is
+  // waiting on Door43 when the other run, which saw master ahead, writes a
+  // fresh export_stale row for the same pair. That row describes a newer
+  // observation than this run's gate, so this run must not delete it.
+  const { sqlite, live, exportOne, ageAlerts } = freshEnv();
+  installFetch({ [tqPath("JER")]: FOREIGN_HEAD });
+  await exportOne("JER", "tq", { instanceId: "export-night-1" });
+  ageAlerts();
+  const olderId = live("export_stale:JER:tq")[0]?.id;
+  assert(olderId !== undefined, "setup: an earlier night's export_stale row stands");
+
+  let newerId = null;
+  installFetch({ [tqPath("JER")]: WATERMARK }, () => {
+    if (newerId !== null) return;
+    // Raw insert (created_at defaults to unixepoch(), as writeAlert's does),
+    // leaving the older row in place so one run shows both halves.
+    newerId = Number(
+      sqlite
+        .prepare(
+          `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?, 'error', ?, ?, ?)`,
+        )
+        .run(EXPORT_ALERT_USERNAME, "export_stale:JER:tq", "JER TQ stale (overlapping run)", DCS_BASE_URL).lastInsertRowid,
+    );
+  });
+  const passed = await exportOne("JER", "tq", { instanceId: "export-manual" });
+  assert(!String(passed.dcsSkippedReason ?? "").startsWith("stale_master"), "this run passes the freshness gate");
+  const ids = live("export_stale:JER:tq").map((r) => r.id);
+  assert(!ids.includes(olderId), "the row written before this run's gate started is deleted");
+  assert(newerId !== null && ids.includes(newerId), "the row written after this run's gate started survives");
 }
 
 if (failed > 0) {
