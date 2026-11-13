@@ -3124,6 +3124,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // than through the URL: picking a verse in the app leaves the hash alone, so
   // the hash can already name the link's verse and assigning it would do
   // nothing (see FollowNoteLinkProvider).
+  // onNavigate is a new function on every App render; read it through a ref
+  // so this handler (a context value every NoteCard consumes) stays stable and
+  // doesn't re-render every card past their memo comparator.
+  const onNavigateRef = useRef(onNavigate);
+  onNavigateRef.current = onNavigate;
   const followNoteLink = useCallback(
     (t: NoteLinkTarget) => {
       runWithDirtyGate(() => {
@@ -3135,10 +3140,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           requestScrollToActive();
           return;
         }
-        onNavigate?.(t.book.toUpperCase(), t.chapter, t.verse);
+        onNavigateRef.current?.(t.book.toUpperCase(), t.chapter, t.verse);
       });
     },
-    [runWithDirtyGate, book, chapter, onNavigate, requestScrollToActive],
+    [runWithDirtyGate, book, chapter, requestScrollToActive],
   );
 
   // Jump to a lint issue from the topbar indicator. `ref` is "chapter:verse"
