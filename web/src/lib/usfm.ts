@@ -230,8 +230,9 @@ export function headerLabelText(node: unknown): string {
         if (Array.isArray(c["children"])) walk(c["children"] as unknown[]);
         // usfm-js parks the space or line break after a closed marker (`\f*`)
         // on its `nextChar` (#1366): without it the words on either side of a
-        // footnote read as one ("Thewoman").
-        if (c["type"] !== "word" && typeof c["nextChar"] === "string") parts.push(c["nextChar"]);
+        // footnote read as one ("Thewoman"). Whitespace only: the band edit's
+        // baseline (editWordLabel) splits out just that, so the two agree.
+        if (c["type"] !== "word" && typeof c["nextChar"] === "string" && /^\s+$/.test(c["nextChar"])) parts.push(c["nextChar"]);
       }
     };
     walk(o["children"] as unknown[]);

@@ -1654,30 +1654,24 @@ function markerKeepsItsWords(before: { words: string[]; markerAt: number[] }, af
   return true;
 }
 
-// New words that replace the first word(s) after a label's line marker belong
-// after the label (#1366). When the old and new word counts differ, the engine
-// anchors the new words to the nearest kept word before them, so `home \sp …
-// \q1 He ran` -> `home; she too ran` saved `she too` before the label and its
-// line break, in the narrator's line. Line marker `ordinal` sits between kept
-// words; this looks at the words between them:
-// - no narrator word before the marker was replaced, and new words now sit
-//   before it: the speech starts after the last clause punctuation among them
-//   (`clauseBreaks`), so the marker moves back to that word. `home. He` ->
-//   `home; she too` moves it before "she"; `home again. She` before "She",
-//   keeping the added "again" on the narrator's side; `home. And he` ("he"
-//   kept) before "And". With no such punctuation, a replaced first word is
-//   refused (which new words start the speech can't be told), and a pure
-//   insertion is left where the engine put it;
-// - words on both sides were replaced, and the new words are not one for one
-//   on each side: "refuse";
-// - otherwise null: nothing to do.
-function speechStartFix(
+// New words that replace the first word(s) after a label's line marker must
+// not land before the label (#1366). When the old and new word counts differ,
+// the engine anchors the new words to the nearest kept word before them, so
+// `home \sp … \q1 He ran` -> `home; she too ran` saved `she too` before the
+// label and its line break, in the narrator's line. Which new words start the
+// speech can't be told in general (`home again. She`, `home. Yes, she`: no
+// punctuation rule separates "added to the narrator's line" from "added to the
+// speech"), so nothing is moved. Line marker `ordinal` sits between kept words;
+// a word right after it was replaced or removed, and new words now sit before
+// it: true (refuse), unless the new words are one for one with the old on each
+// side of the break. A plain deletion (no new word before the marker) and a
+// recase (the word is kept) are not refused.
+function speechStartRefused(
   before: { words: string[]; markerAt: number[] },
   after: { words: string[]; markerAt: number[] },
   map: number[],
   ordinal: number,
-  breaks: boolean[],
-): number | "refuse" | null {
+): boolean {
   const p = before.markerAt[ordinal];
   const q = after.markerAt[ordinal];
   let a = p - 1;
@@ -1690,84 +1684,8 @@ function speechStartFix(
   const end = b < before.words.length ? map[b] : after.words.length;
   const newBefore = q - start;
   const newAfter = end - q;
-  if (newBefore <= 0) return null;
-  if (oldBefore === 0) {
-    for (let k = q; k >= start; k--) {
-      if (breaks[k]) return k === q ? null : k;
-    }
-    return oldAfter > 0 ? "refuse" : null;
-  }
-  if (oldAfter === 0) return null;
-  return newBefore === oldBefore && newAfter === oldAfter ? null : "refuse";
-}
-
-// For each body word of a verse (as bodyWordLayout counts them), whether clause
-// punctuation (. ; : , ! ? …) stands between it and the word before: in the
-// text after the previous word's letters, or before this word's own.
-function clauseBreaks(vo: unknown[]): boolean[] {
-  const out: boolean[] = [];
-  let pending = "";
-  for (const tok of extractPlainText({ verseObjects: vo }).split(" ")) {
-    if (!wordKey(tok)) {
-      pending += tok;
-      continue;
-    }
-    const lead = /^[^\p{L}\p{N}\p{M}]*/u.exec(tok)?.[0] ?? "";
-    out.push(/[.;:,!?…]/.test(pending + lead));
-    pending = /[^\p{L}\p{N}\p{M}]*$/u.exec(tok)?.[0] ?? "";
-  }
-  return out;
-}
-
-// The verse with its `ordinal`-th top-level line marker moved back to just
-// before body word `wordIndex` (splitting a text node there if need be), or
-// null when that can't be done at the top level (the word sits inside a
-// milestone or wrapper, or another line marker is in the way). The words
-// themselves must come out exactly as they were.
-function moveLineMarkerBefore(vo: unknown[], ordinal: number, wordIndex: number): unknown[] | null {
-  const want = bodyWordLayout(vo).words;
-  let mi = -1;
-  for (let i = 0, m = 0; i < vo.length; i++) {
-    if (isTopLineMarker(vo[i]) && m++ === ordinal) {
-      mi = i;
-      break;
-    }
-  }
-  if (mi < 0) return null;
-  const marker = vo[mi];
-  const rest = [...vo.slice(0, mi), ...vo.slice(mi + 1)];
-  const fits = (candidate: unknown[]): boolean => {
-    const l = bodyWordLayout(candidate);
-    return l.markerAt[ordinal] === wordIndex && JSON.stringify(l.words) === JSON.stringify(want);
-  };
-  // From the marker backwards: the latest place where `wordIndex` words come
-  // before it, so punctuation after the kept word stays in front of the break.
-  for (let i = mi - 1; i >= 0; i--) {
-    if (isTopLineMarker(rest[i])) return null;
-    const n = rest[i] as Record<string, unknown> | null;
-    if (n && n["type"] === "text" && typeof n["text"] === "string") {
-      const text = n["text"] as string;
-      const starts = [...text.matchAll(/\S+/g)].map((m) => m.index ?? 0).filter((c) => c > 0).reverse();
-      for (const c of starts) {
-        const candidate = [...rest.slice(0, i), { ...n, text: text.slice(0, c) }, marker, { ...n, text: text.slice(c) }, ...rest.slice(i + 1)];
-        if (fits(candidate)) return candidate;
-      }
-    }
-    const candidate = [...rest.slice(0, i), marker, ...rest.slice(i)];
-    if (fits(candidate)) {
-      // An opening quote glued to the word (`; “` + `she`) opens the speech:
-      // it goes after the break with the word, not in front of the label.
-      const prev = rest[i - 1] as Record<string, unknown> | undefined;
-      const prevText = prev && prev["type"] === "text" && typeof prev["text"] === "string" ? (prev["text"] as string) : "";
-      const opener = /[“‘"'«‹(\[¿¡]+$/u.exec(prevText);
-      if (prev && opener && opener.index > 0) {
-        const split = [...rest.slice(0, i - 1), { ...prev, text: prevText.slice(0, opener.index) }, marker, { ...prev, text: opener[0] }, ...rest.slice(i)];
-        if (fits(split)) return split;
-      }
-      return candidate;
-    }
-  }
-  return null;
+  if (oldAfter === 0 || newBefore <= 0) return false;
+  return !(newBefore === oldBefore && newAfter === oldAfter);
 }
 
 function withWordLabelsAsText(content: unknown, run: (content: unknown) => SmartReplaceResult, opts: { speechStart?: boolean } = {}): SmartReplaceResult {
@@ -1803,31 +1721,24 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
   const result = run(shown);
   // The engine changed nothing (it hands its input back): so does this.
   if (result.content === shown) return { ...result, content };
-  let out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  const out = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (!Array.isArray(out)) return refuse("label-shape", "no verse tree");
-  // A label's line marker moved back over new words (speechStartFix): the
-  // plain text is then re-read from the final tree.
-  let markerMoved = false;
   const restored: unknown[] = [];
   if (labels.length === 0) restored.push(...out);
   else {
     if (out.filter(isTopLineMarker).length !== markers) return refuse("line-breaks", "the verse's line markers changed");
     const before = bodyWordLayout(stripped);
-    let after = bodyWordLayout(out);
+    const after = bodyWordLayout(out);
     const map = matchWords(before.words, after.words);
-    // New words replacing the first word of a speech go after its label
-    // (#1366): move the label's line marker back in front of them. Find/replace
-    // only: a typed edit shows the line break, so the translator placed it.
+    // New words replacing the first word of a speech would sit before its
+    // label (#1366): refused unless unambiguous (speechStartRefused). Find/
+    // replace only: a typed edit shows the line break, so the translator
+    // placed it.
     for (const l of labels) {
       if (!opts.speechStart || l.anchor === "end") continue;
-      const fix = speechStartFix(before, after, map, l.anchor, clauseBreaks(out));
-      if (fix === null) continue;
-      if (fix === "refuse") return refuse("label-moved", "words on both sides of a label's line break were replaced");
-      const moved = moveLineMarkerBefore(out, l.anchor, fix);
-      if (!moved) return refuse("label-moved", "new words before a label's line break can't be moved after it");
-      out = moved;
-      after = bodyWordLayout(out);
-      markerMoved = true;
+      if (speechStartRefused(before, after, map, l.anchor)) {
+        return refuse("label-moved", "new words replacing a speech's first word would sit before its label");
+      }
     }
     for (const l of labels) {
       if (l.anchor !== "end" && !markerKeepsItsWords(before, after, map, l.anchor)) {
@@ -1850,8 +1761,7 @@ function withWordLabelsAsText(content: unknown, run: (content: unknown) => Smart
   if (spTexts(restored) !== spTexts(vo)) return refuse("label-lost", "a label would be dropped or changed");
   // Renumbering the label words too is intended (#1354): Door43 counts a word
   // over the whole verse, label included, so the export must as well.
-  const final = { ...(result.content as Record<string, unknown>), verseObjects: renumberTargetOccurrences(restored) };
-  return { ...result, content: final, ...(markerMoved ? { plainText: extractPlainText(final) } : {}) };
+  return { ...result, content: { ...(result.content as Record<string, unknown>), verseObjects: renumberTargetOccurrences(restored) } };
 }
 
 // A header-band edit (Shell.tsx saveSectionEdit): the `change.index`-th header

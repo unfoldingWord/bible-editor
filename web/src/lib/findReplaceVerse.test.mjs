@@ -516,7 +516,6 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
       ["text beside the marker", beside, "home. He", "home; she too"],
       ["aligned words", aligned, "home He", "home; she too"],
       ["a word added on the narrator's side", beside, "home. He", "home again. She"],
-      ["a word added in front of the speech", beside, "home. He", "home. Yes, she"],
       ["no punctuation", beside, "home. He", "home now she"],
       ["an opening quote on the \\q1", opener, "home. “He", "home; “she too"],
       ["words on both sides, not one for one", both, "now He", "then she too"],
@@ -528,6 +527,7 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     // Saved, unambiguous.
     for (const [name, content, find, replacement, want] of [
       ["one for one after the break", beside, "home. He", "home. She", "A home. [SP] \\q1 She ran home."],
+      ["new words the engine puts after the break (\"Yes, she\")", beside, "home. He", "home. Yes, she", "A home. [SP] \\q1 Yes, she ran home."],
       ["one for one on each side", both, "now He", "then she", "A home then [SP] \\q1 she ran home."],
       ["a recase plus a new word (he kept)", bare, "home He", "home; he too", "A home; [SP] \\q1 he too ran home."],
       ["the engine already puts the new words after the break", bare, "home He", "home she too", "A home [SP] \\q1 she too ran home."],

@@ -897,11 +897,12 @@ Highlights that bite repeatedly:
   fuse (`The\f…\f*⏎woman` read "Thewoman" and a band edit saved one word "Thelady"); `headerLabelText` reads
   `nextChar` and `editWordLabel` splits it into a text node for the edit. The same fusing exists in the verse
   body (`\w Body\w*\f…\f*⏎\w more\w*` -> "Bodymore."), not fixed. A label's notes show read-only in the band
-  (`SectionHeader.notes`). In find/replace only, new words that replace the first word after a label's line
-  break are moved after the label (`speechStartFix`; a typed edit shows the break, so its placement holds). The
-  speech is taken to start after the last clause punctuation among the new words (`home again. She` keeps "again"
-  with the narrator); with none, a replaced first word is refused. Words replaced on both sides of the break, not
-  one for one, are refused. A held verse pin
+  (`SectionHeader.notes`). In find/replace only, when the first word after a label's line break was replaced and
+  new words would sit before the label, the replace is refused (`speechStartRefused`, label-moved) unless the new
+  words are one for one with the old on each side. Moving the break was tried and dropped in review: no rule tells
+  "added to the narrator's line" (`home again. She`) from "added to the speech" (`home. Yes, she`). A typed edit
+  shows the break, so its placement holds. An insertion at the break with nothing replaced (`home. And he`) still
+  saves where the engine puts it, before the label (pinned). A held verse pin
   (`advanceHeldVerseBase`) does not move onto a landed row when its base held a flat label: the server nested it,
   so the box's text no longer matches and the label words would be saved into the body.
 - **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in
