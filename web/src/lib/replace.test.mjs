@@ -4708,12 +4708,13 @@ function countAllMilestones(nodes) {
   // an earlier 1:1 swap that changes a word's length (`A` -> `Mighty`) must
   // not shift the `\q2` into a later gap.
   const q2 = { tag: "q2", nextChar: " ", type: "quote" };
-  const shifted = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1(), zaln("H2", [w("A")]), t(" "), q2,
-    zaln("H3", [w("king")]), t(". "), zaln("H4", [w("His")]), t(" "), zaln("H5", [w("reign")]), t(" ends.")] };
+  const shiftedWith = (gap) => ({ verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1(), zaln("H2", [w("A")]), t(" "), q2,
+    zaln("H3", [w("king")]), t(gap), zaln("H4", [w("His")]), t(" "), zaln("H5", [w("reign")]), t(" ends.")] });
   const markers2 = (content) => content.verseObjects.filter((n) => n && (n.tag === "q1" || n.tag === "q2")).length;
-  for (const [find, replacement, wantRe] of [
-    ["wars. A king. His reign", "wars; Mighty king; the great reign", /use in wars; \\q1 Mighty \\q2 king; the great reign ends/],
-    ["wars. A king. His reign", "wars; Mighty king; “the great reign", /use in wars; \\q1 Mighty \\q2 king; “the great reign ends/],
+  for (const [shifted, find, replacement, wantRe] of [
+    [shiftedWith(". "), "wars. A king. His reign", "wars; Mighty king; the great reign", /use in wars; \\q1 Mighty \\q2 king; the great reign ends/],
+    // `Valiant` is 6 longer than `A`: a stale offset puts the `\q2` on the `“`.
+    [shiftedWith(". “"), "wars. A king. “His reign", "wars; Valiant king; “the great reign", /use in wars; \\q1 Valiant \\q2 king; “the great reign ends/],
   ]) {
     const r = run(shifted, find, replacement);
     const ed = extractEditableText(r.content);
