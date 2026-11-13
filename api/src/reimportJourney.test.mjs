@@ -135,6 +135,8 @@ const giteaPage = (commits) => async () => ({
   json: async () =>
     commits.map((c) => ({
       sha: c.sha,
+      // The listing's `parents`, only when a fixture states them (#1349).
+      ...(c.allParentShas ? { parents: c.allParentShas.map((sha) => ({ sha })) } : {}),
       commit: {
         message: c.message,
         author: { email: c.authorEmail, name: c.authorName, date: c.date },
@@ -157,6 +159,41 @@ const withFetch = async (handler, fn) => {
   } finally {
     globalThis.fetch = real;
   }
+};
+
+// #1349: runs `fn` and returns the reason the #658 stamp's ancestry judge
+// logged for withholding (null when it did not withhold), so a withhold test
+// fails loudly if it starts passing for a different reason.
+const stampWithheldBy = async (fn) => {
+  const real = console.log;
+  let reason = null;
+  console.log = (...args) => {
+    if (typeof args[0] === "string" && args[0].includes("(#1349)")) reason = args[1]?.reason ?? null;
+    real(...args);
+  };
+  try {
+    await fn();
+  } finally {
+    console.log = real;
+  }
+  return reason;
+};
+
+// #1349: how many Door43 ancestry reads a stamp that LANDED spent (null when
+// the explained log did not run or carried none).
+const stampReadsBy = async (fn) => {
+  const real = console.log;
+  let reads = null;
+  console.log = (...args) => {
+    if (typeof args[0] === "string" && args[0].startsWith("reimport own-publish decline explained")) reads = args[1]?.ancestryReads ?? null;
+    real(...args);
+  };
+  try {
+    await fn();
+  } finally {
+    console.log = real;
+  }
+  return reads;
 };
 
 let failed = 0;
@@ -4328,10 +4365,16 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
     const { sqlite, env } = freshEnv();
     const sync = seedSync(sqlite, 2);
     const g = gitea(walked.commits, PUSHED);
-    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, walked, sync));
+    const reason = await stampWithheldBy(() => withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, walked, sync)));
     const s = readState(sqlite);
     eq(s.confirmedAt, 1000, `${label} lineage does not advance master_confirmed_at`);
     eq(s.confirmedEditId, 11, `${label} lineage does not advance master_confirmed_edit_id`);
+    // #1349: the human commit sits after our merge, and this mock serves no
+    // parent links (its commit lookup answers with the walk's list, which has
+    // no `parents`), so its descent from our merge cannot be proven. That, and
+    // only that, is why it withholds; the proven-descendant shape lives in the
+    // #1349 block below.
+    if (label === "human") eq(reason, "read_failed", "#1349: the human commit withholds because its descent is unproven");
   }
 
   // (a3) #1058: the stamp is only accepted for a merge at or before the commit
@@ -4485,6 +4528,778 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
       accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, { ...sync, pushedReadAt: null }),
     );
     eq(readState(sqlite).declines, 2, "no pushed_read_at → counter unchanged");
+  }
+}
+
+console.log("\n[#1349: a human commit AFTER our preserved merge no longer freezes the watermark — real SQL, mocked Gitea graph]");
+{
+  // PROD SHAPE (2CH twl, 2026-11-12, measured read-only on Door43): our export
+  // #1016 merged as 45714ba164 at 14:56:34Z. Richard Mahn then committed
+  // fa529ed8c4 (restores מֶֽלֶךְ in av3p) on top of master, merged master's
+  // tc-create PR 98465fd804 into it, and pushed the merge 175aec6030. Both of
+  // Richard's commits list 45714ba164 in their own path history, so they are
+  // descendants of our merge: our render is what they edited. Before #1349 any
+  // human commit in the walk withheld the #658 stamp, so the 3-way merge kept
+  // the 11-05 render as its ancestor and reverted his fix.
+  const B = "2CH";
+  const PATH = `twl_${B}.tsv`;
+  const FILE = { repo: "en_twl", path: PATH };
+  const at = (iso) => Date.parse(iso) / 1000;
+  const OLD_WATERMARK = at("2026-11-05T05:35:13Z");
+  const READ_AT = at("2026-11-12T05:31:00Z");
+  const PUSHED = "c0ffee0000000000000000000000000000001016";
+  const RICH = { authorEmail: "richmahn@example.org", authorName: "Richard Mahn" };
+  const OURS = { authorEmail: "b@x", authorName: "Benjamin Wright" };
+  const M = { sha: "45714ba164", message: "bible-editor: 2CH twl → master (#1016)", ...OURS, date: "2026-11-12T14:56:34Z", parents: ["4371c4f15c"] };
+  // Newest first, like Gitea. `touches: false` commits change other files: they
+  // are in the repo graph (so ancestry runs through them) but never in a
+  // path-scoped listing.
+  const GRAPH_2CH = [
+    { sha: "175aec6030", message: "Merge branch 'master' of git.door43.org:unfoldingWord/en_twl", ...RICH, date: "2026-11-12T15:25:54Z", parents: ["fa529ed8c4", "98465fd804"] },
+    { sha: "fa529ed8c4", message: "Fixes trouble TWL in 2CH", ...RICH, date: "2026-11-12T15:25:43Z", parents: ["12f3911ded"] },
+    { sha: "98465fd804", message: "Merge richmahn-tc-create-1 into master by richmahn (#1026)", ...RICH, date: "2026-11-12T15:25:21Z", parents: ["12f3911ded"] },
+    { sha: "12f3911ded", message: "another book", ...RICH, date: "2026-11-12T15:00:00Z", parents: ["45714ba164"], touches: false },
+    M,
+    // Between our merge and the export before it (#1012), master holds eleven
+    // commits to other books (measured 2026-11-13: a repo-scoped listing from
+    // 45714ba164, every one single-parent). Proving #1012 is an ancestor of
+    // our merge walks this chain.
+    ...[
+      ["4371c4f15c", "DEU", 1019, "2026-11-12T14:56:22Z"],
+      ["f0ad15e09a", "EZK", 1025, "2026-11-12T05:38:51Z"],
+      ["81dff507b0", "EZK", 1024, "2026-11-11T05:36:56Z"],
+      ["161dcd4db3", "EZK", 1023, "2026-11-10T05:39:26Z"],
+      ["f475e598d9", "EZK", 1022, "2026-11-07T05:39:18Z"],
+      ["eb30eaa001", "ECC", 1021, "2026-11-07T05:39:12Z"],
+      ["39406bacc7", "EZK", 1018, "2026-11-06T05:39:25Z"],
+      ["aa966ed1b0", "ECC", 1017, "2026-11-06T05:39:19Z"],
+      ["c4cf16abe9", "JER", 1015, "2026-11-05T05:37:01Z"],
+      ["b1a596deeb", "EZK", 1014, "2026-11-05T05:36:51Z"],
+      ["aab03419bb", "ECC", 1013, "2026-11-05T05:36:33Z"],
+    ].map(([sha, book, pr, date], i, all) => ({
+      sha, message: `bible-editor: ${book} twl → master (#${pr})`, ...OURS, date,
+      parents: [all[i + 1]?.[0] ?? "3ecc2f5ee0"], touches: false,
+    })),
+    { sha: "3ecc2f5ee0", message: "bible-editor: 2CH twl → master (#1012)", ...OURS, date: "2026-11-05T05:36:24Z", parents: ["dd6c2c8fd5"] },
+  ];
+
+  // A Gitea that answers `/commits?sha=X&path=P` with X's ANCESTORS that touch
+  // P (newest first), the way git.door43.org does — not the same list for every
+  // URL, so a proof of ancestry here can actually fail. The tree read returns
+  // `blobAtMerge` for the file.
+  const giteaGraph = (graph, blobAtMerge = PUSHED) => {
+    const bySha = new Map(graph.map((c) => [c.sha, c]));
+    const calls = { commits: 0, trees: 0, parents: 0, from: [] };
+    const fetchImpl = async (url) => {
+      const u = new URL(String(url));
+      // One commit's own metadata, with its parents (#1349 review C1).
+      if (u.pathname.includes("/git/commits/")) {
+        calls.parents++;
+        const node = bySha.get(decodeURIComponent(u.pathname.split("/").pop()));
+        if (!node) return { ok: false, status: 404, json: async () => ({}) };
+        return { ok: true, json: async () => ({ sha: node.sha, parents: node.rawParents ?? (node.servedParents ?? node.parents).map((sha) => ({ sha })) }) };
+      }
+      if (u.pathname.includes("/git/trees/")) {
+        calls.trees++;
+        return { ok: true, json: async () => ({ truncated: false, tree: [{ path: PATH, type: "blob", sha: blobAtMerge }] }) };
+      }
+      calls.commits++;
+      const from = u.searchParams.get("sha");
+      calls.from.push(from);
+      const start = from === "master" ? graph[0].sha : from;
+      if (!bySha.has(start)) return { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}) };
+      const seen = new Set();
+      const stack = [start];
+      while (stack.length) {
+        const s = stack.pop();
+        if (seen.has(s) || !bySha.has(s)) continue;
+        seen.add(s);
+        stack.push(...bySha.get(s).parents);
+      }
+      const listed = graph.filter((c) => seen.has(c.sha) && c.touches !== false);
+      return {
+        ok: true,
+        headers: { get: (h) => (h.toLowerCase() === "x-hasmore" ? "false" : null) },
+        json: async () =>
+          listed.map((c) => ({
+            sha: c.sha,
+            // `servedParents` lets a fixture serve a parent list other than
+            // the graph's real one (an empty list from Door43, say), and
+            // `rawParents` a wire value verbatim (a malformed entry).
+            parents: c.rawParents ?? (c.servedParents ?? c.parents).map((sha) => ({ sha })),
+            commit: { message: c.message, author: { email: c.authorEmail, name: c.authorName, date: c.date }, committer: { date: c.date } },
+          })),
+      };
+    };
+    return { calls, fetchImpl };
+  };
+  // The lineage walk as listMasterCommitsSince hands it over: path-scoped,
+  // newest first, every parent kept.
+  const walkFrom = (graph, sinceTime) => ({
+    commits: graph
+      .filter((c) => c.touches !== false && at(c.date) >= sinceTime)
+      .map((c) => ({ sha: c.sha, message: c.message, authorEmail: c.authorEmail, authorName: c.authorName, date: c.date, committerDate: c.date, parentSha: c.parents[0] ?? null, allParentShas: c.parents, parentsCheck: "complete" })),
+    incomplete: false,
+    incompleteReason: "",
+  });
+  // The dcs_commits ledger's parents for every REPO commit in its window, the
+  // ones that changed other files included (readLedgerMasterLineage's
+  // repoParents), as a map the stamp can walk without asking Door43.
+  const repoParentsOf = (graph) => new Map(graph.map((c) => [c.sha, c.parents]));
+  const seedSync = (sqlite, { resource = "twl", oldEditId, pushedEditId, prNumber = 1016, readAt = READ_AT }) =>
+    sqlite
+      .prepare(
+        `INSERT INTO book_resource_syncs
+           (book, resource, source_sha, origin, master_confirmed_at, master_confirmed_edit_id,
+            pushed_blob_sha, pushed_read_at, pushed_edit_id, own_publish_declines,
+            pushed_pr_number, pushed_pr_read_at)
+         VALUES (?, ?, 'sha0', 'reimport', ?, ?, ?, ?, ?, 0, ?, ?)`,
+      )
+      .run(B, resource, OLD_WATERMARK, oldEditId, PUSHED, readAt, pushedEditId, prNumber, readAt);
+  const syncState = (pushedEditId, readAt = READ_AT) => ({
+    sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: readAt, pushedEditId, declines: 0,
+  });
+  const watermark = (sqlite, resource = "twl") =>
+    sqlite
+      .prepare(`SELECT master_confirmed_at AS confirmedAt, master_confirmed_edit_id AS editId FROM book_resource_syncs WHERE book = ? AND resource = ?`)
+      .get(B, resource);
+  const HAS_HUMAN = {
+    mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+    counts: { ours: 2, ai: 0, human: 3 }, humanShas: ["fa529ed8c4", "98465fd804", "175aec6030"],
+  };
+
+  // ── The row journey. Three translator-owned twl rows:
+  //   av3p — the 2CH incident: an app edit BEFORE the export emptied OrigWords;
+  //          the export shipped it; Richard put מֶֽלֶךְ back after our merge.
+  //   aftr — an app edit AFTER the export, and a Door43 edit to the same field
+  //          after our merge: a genuine both-sides change.
+  //   x7oy — the EZK tn loss, in twl columns: edits before the export shipped,
+  //          a further app edit after it, and master untouched on this row
+  //          since our merge. D1's newer value must survive.
+  const KING = "מֶֽלֶךְ";
+  const seedRows = (sqlite) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (31, 3131, 'justplainjane47')`).run();
+    const row = (id, ch, vs, orig, link) =>
+      sqlite
+        .prepare(
+          `INSERT INTO twl_rows (id, book, chapter, verse, ref_raw, orig_words, occurrence, tw_link, sort_order, updated_by, version)
+           VALUES (?, ?, ?, ?, ?, ?, 1, ?, 10, 31, 1)`,
+        )
+        .run(id, B, ch, vs, `${ch}:${vs}`, orig, link);
+    const log = (id, action, payload, createdAt, version) =>
+      Number(
+        sqlite
+          .prepare(
+            `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+             VALUES ('twl', ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+          )
+          .run(id, B, action === "create" ? null : 31, action === "create" ? null : version - 1, action === "create" ? null : version, action, JSON.stringify(payload), createdAt)
+          .lastInsertRowid,
+      );
+    const edit = (id, field, value, createdAt) => {
+      const v = sqlite.prepare(`SELECT version FROM twl_rows WHERE book = ? AND id = ?`).get(B, id).version;
+      sqlite.prepare(`UPDATE twl_rows SET ${field} = ?, version = ? WHERE book = ? AND id = ?`).run(value, v + 1, B, id);
+      return log(id, "update", { [field]: value }, createdAt, v + 1);
+    };
+    const create = (id, ch, vs, orig, link) => {
+      row(id, ch, vs, orig, link);
+      return log(id, "create", { chapter: ch, verse: vs, ref_raw: `${ch}:${vs}`, orig_words: orig, occurrence: 1, tw_link: link }, at("2026-11-01T00:00:00Z"), 1);
+    };
+    create("av3p", 25, 23, KING, "rc://*/tw/dict/bible/other/king");
+    create("aftr", 25, 24, "וַיָּבֹא", "rc://*/tw/dict/bible/other/come");
+    const oldEditId = create("x7oy", 25, 25, "הָעִיר", "rc://*/tw/dict/bible/other/city-v2");
+    // Before the export read (READ_AT): shipped in #1016.
+    edit("av3p", "orig_words", "", at("2026-11-09T16:36:00Z"));
+    const pushedEditId = edit("x7oy", "tw_link", "rc://*/tw/dict/bible/other/city-v4", at("2026-11-11T20:43:00Z"));
+    // After the export read: not shipped.
+    edit("aftr", "orig_words", "וַיָּבֹא app", at("2026-11-12T10:00:00Z"));
+    edit("x7oy", "tw_link", "rc://*/tw/dict/bible/other/city-v5", at("2026-11-12T15:48:00Z"));
+    return { oldEditId, pushedEditId };
+  };
+  // Master as Richard left it: av3p restored, aftr edited, x7oy = our render (v4).
+  const masterRows = [
+    { id: "av3p", idCoerced: false, refRaw: "25:23", chapter: 25, verse: 23, occurrence: 1, tags: null, orig_words: KING, tw_link: "rc://*/tw/dict/bible/other/king" },
+    { id: "aftr", idCoerced: false, refRaw: "25:24", chapter: 25, verse: 24, occurrence: 1, tags: null, orig_words: "וַיָּבֹא door43", tw_link: "rc://*/tw/dict/bible/other/come" },
+    { id: "x7oy", idCoerced: false, refRaw: "25:25", chapter: 25, verse: 25, occurrence: 1, tags: null, orig_words: "הָעִיר", tw_link: "rc://*/tw/dict/bible/other/city-v4" },
+  ];
+  const readRows = (sqlite) =>
+    Object.fromEntries(
+      sqlite
+        .prepare(`SELECT id, orig_words, tw_link, review_kind FROM twl_rows WHERE book = ? ORDER BY id`)
+        .all(B)
+        .map((r) => [r.id, r]),
+    );
+
+  // Reads, as parents lookups. Above our merge: Richard's commits sit on
+  // 12f3911ded, which changed no 2CH file; its parents, read from Door43
+  // (measured: [45714ba1]), are our merge, so one lookup proves it and the
+  // rest link through the walk. Below it (the lineage walk starts at the 11-05
+  // watermark, so #1012 is in it): proving #1012 is an ancestor of our merge
+  // takes one lookup per commit of the eleven-commit chain. The ledger, which
+  // records every repo commit's parents, needs none.
+  for (const [label, walked, pinned, repoParents, expectReads] of [
+    ["lineage walk handed in", walkFrom(GRAPH_2CH, OLD_WATERMARK), undefined, undefined, 12],
+    ["fresh walk from pushed_read_at", null, undefined, undefined, 1],
+    // The nightly pins its file to the commit it fetched (#1058): the tip here.
+    ["lineage walk, file pinned at the tip", walkFrom(GRAPH_2CH, OLD_WATERMARK), "175aec6030", undefined, 12],
+    ["lineage walk from the ledger, with its repo-wide parents", walkFrom(GRAPH_2CH, OLD_WATERMARK), "175aec6030", repoParentsOf(GRAPH_2CH), 0],
+  ]) {
+    const { sqlite, env } = freshEnv();
+    const { oldEditId, pushedEditId } = seedRows(sqlite);
+    seedSync(sqlite, { oldEditId, pushedEditId });
+    const g = giteaGraph(GRAPH_2CH);
+    const reads = await stampReadsBy(() =>
+      withFetch(g.fetchImpl, () =>
+        accountOwnPublishDeclineForTest(env, B, "twl", FILE, walked, syncState(pushedEditId), Date.now(), pinned, repoParents),
+      ),
+    );
+    eq([reads, g.calls.parents], [expectReads, expectReads], `#1349 2CH (${label}): …after ${expectReads} Door43 reads, all parents lookups`);
+    eq(watermark(sqlite), { confirmedAt: READ_AT, editId: pushedEditId },
+      `#1349 2CH (${label}): Richard's commits descend from our merge, so the #658 stamp advances to our render`);
+    eq(g.calls.trees, 1, `#1349 2CH (${label}): …after one tree read at our merge`);
+
+    const cutoff = await getMasterConfirmedAtForTest(env, B, "twl");
+    await applyTsvRows(env, B, "twl", masterRows, null, { ...cutoff, lineage: HAS_HUMAN });
+    const rows = readRows(sqlite);
+    eq([rows.av3p.orig_words, rows.av3p.review_kind], [KING, null],
+      `#1349 2CH (${label}): av3p (edited in the app BEFORE the export) adopts Richard's מֶֽלֶךְ with no flag`);
+    eq([rows.aftr.orig_words, rows.aftr.review_kind], ["וַיָּבֹא door43", "merge_conflict"],
+      `#1349 2CH (${label}): a row edited in the app AFTER the export is flagged merge_conflict`);
+    eq([rows.x7oy.tw_link, rows.x7oy.review_kind], ["rc://*/tw/dict/bible/other/city-v5", null],
+      `#1349 2CH (${label}): x7oy shape (app edit after the export, master untouched) keeps D1's newer value, no flag`);
+  }
+
+  // ── Shapes that must still WITHHOLD. Stamp-only: the watermark stays at the
+  //    old render. EZK ust 2026-11-12 (measured): Richard's c20a06c5d8 was
+  //    committed 12 s BEFORE our export's merge 3aea90c6a7, on a branch from
+  //    the commit before it, then merged with 1088141193. It is not an
+  //    ancestor of our merge and not a descendant either: our render never
+  //    saw it, and its merge commit can carry a conflict resolution against
+  //    our render.
+  const M2 = { sha: "3aea90c6a7", message: "bible-editor: 2CH twl → master (#4886)", ...OURS, date: "2026-11-12T19:18:36Z", parents: ["11c6654ac3"] };
+  const EZK_PARALLEL = [
+    { sha: "1088141193", message: "Merge branch 'master' of git.door43.org:unfoldingWord/en_ust", ...RICH, date: "2026-11-12T19:18:49Z", parents: ["c20a06c5d8", "3aea90c6a7"] },
+    M2,
+    { sha: "c20a06c5d8", message: "Fixes for \\b markers", ...RICH, date: "2026-11-12T19:18:24Z", parents: ["11c6654ac3"] },
+    { sha: "11c6654ac3", message: "another book", ...RICH, date: "2026-11-12T19:00:00Z", parents: ["ea9659c35f"], touches: false },
+    { sha: "ea9659c35f", message: "bible-editor: 2CH twl → master (#4884)", ...OURS, date: "2026-11-12T05:43:25Z", parents: ["cfa4de0b29"] },
+  ];
+  // A parallel-branch commit dated AFTER our merge sits above it in the walk.
+  const LATE_PARALLEL = [
+    { sha: "beef000002", message: "Merge branch 'master'", ...RICH, date: "2026-11-12T20:00:10Z", parents: ["beef000001", "3aea90c6a7"] },
+    { sha: "beef000001", message: "A fix made on a stale checkout", ...RICH, date: "2026-11-12T20:00:00Z", parents: ["11c6654ac3"] },
+    M2,
+    { sha: "11c6654ac3", message: "another book", ...RICH, date: "2026-11-12T19:00:00Z", parents: ["ea9659c35f"], touches: false },
+    { sha: "ea9659c35f", message: "bible-editor: 2CH twl → master (#4884)", ...OURS, date: "2026-11-12T05:43:25Z", parents: ["cfa4de0b29"] },
+  ];
+  // A human commit our merge overwrote: landed after the render read, before our merge.
+  const BEFORE_MERGE = [
+    { ...M2, parents: ["abcd000001"] },
+    { sha: "abcd000001", message: "A fix our export then overwrote", ...RICH, date: "2026-11-12T19:10:00Z", parents: ["11c6654ac3"] },
+    { sha: "11c6654ac3", message: "another book", ...RICH, date: "2026-11-12T19:00:00Z", parents: ["ea9659c35f"], touches: false },
+    { sha: "ea9659c35f", message: "bible-editor: 2CH twl → master (#4884)", ...OURS, date: "2026-11-12T05:43:25Z", parents: ["cfa4de0b29"] },
+  ];
+  // Twenty-one maintainer commits after our merge, each on a parent the path
+  // walk cannot see: twenty-one reads (one parents lookup each), one more than
+  // a stamp may spend. Built newest first: i = 1 is unshifted last.
+  const MANY_AFTER = [];
+  {
+    let parent = "3aea90c6a7";
+    for (let i = 21; i >= 1; i--) {
+      const hidden = `0ff0000${String(i).padStart(2, "0")}0`;
+      const minute = String(40 - i).padStart(2, "0");
+      MANY_AFTER.unshift({ sha: hidden, message: "another book", ...RICH, date: `2026-11-12T20:${minute}:00Z`, parents: [parent], touches: false });
+      MANY_AFTER.unshift({ sha: `ca90000${String(i).padStart(3, "0")}`, message: `Fix ${i}`, ...RICH, date: `2026-11-12T20:${minute}:30Z`, parents: [hidden] });
+      parent = `ca90000${String(i).padStart(3, "0")}`;
+    }
+    MANY_AFTER.push(M2, ...BEFORE_MERGE.slice(2));
+  }
+  // A late push (review A1): Richard commits locally BEFORE our render read,
+  // pushes AFTER it, and our merge lands on top and overwrites him. His
+  // committer date says "before the read", but Door43 gives no push time, so a
+  // commit below our merge withholds whatever its date.
+  const LATE_PUSH = [
+    { ...M2, parents: ["dade000001"] },
+    { sha: "dade000001", message: "A fix committed early, pushed late", ...RICH, date: "2026-11-12T19:01:00Z", parents: ["11c6654ac3"] },
+    { sha: "11c6654ac3", message: "another book", ...RICH, date: "2026-11-12T19:00:00Z", parents: ["ea9659c35f"], touches: false },
+    { sha: "ea9659c35f", message: "bible-editor: 2CH twl → master (#4884)", ...OURS, date: "2026-11-12T05:43:25Z", parents: ["cfa4de0b29"] },
+  ];
+  // A nested merge (review A3): Richard's commit C sits on a merge IM of our
+  // merge and his side branch S, and IM never touches the file, so it is not
+  // in the path walk. S is in the walk above our merge and cannot be proven.
+  const NESTED_MERGE = [
+    { sha: "ce00000003", message: "A fix on top of a merge", ...RICH, date: "2026-11-12T19:40:00Z", parents: ["ce00000002"] },
+    { sha: "ce00000002", message: "Merge branch 'master'", ...RICH, date: "2026-11-12T19:35:00Z", parents: ["3aea90c6a7", "ce00000001"], touches: false },
+    { sha: "ce00000001", message: "Side-branch fix", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["11c6654ac3"] },
+    M2,
+    { sha: "11c6654ac3", message: "another book", ...RICH, date: "2026-11-12T19:00:00Z", parents: ["ea9659c35f"], touches: false },
+    { sha: "ea9659c35f", message: "bible-editor: 2CH twl → master (#4884)", ...OURS, date: "2026-11-12T05:43:25Z", parents: ["cfa4de0b29"] },
+  ];
+  // A non-human (our own) merge (review A3): held to the human rule, so its
+  // unproven side parent withholds.
+  const BOT_MERGE = [
+    { sha: "b0b0000002", message: "bible-editor: 2CH twl → master (#4890)", ...OURS, date: "2026-11-12T19:40:00Z", parents: ["3aea90c6a7", "b0b0000001"] },
+    { sha: "b0b0000001", message: "side", ...OURS, date: "2026-11-12T19:30:00Z", parents: ["11c6654ac3"], touches: false },
+    M2,
+    { sha: "11c6654ac3", message: "another book", ...RICH, date: "2026-11-12T19:00:00Z", parents: ["ea9659c35f"], touches: false },
+    { sha: "ea9659c35f", message: "bible-editor: 2CH twl → master (#4884)", ...OURS, date: "2026-11-12T05:43:25Z", parents: ["cfa4de0b29"] },
+  ];
+  // A merge whose own history does not reach our merge (review A4).
+  const MERGE_NOT_REACHING = [
+    { sha: "f00d000003", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:40:00Z", parents: ["f00d000001", "f00d000002"], noParentsInWalk: true },
+    { sha: "f00d000002", message: "side two", ...RICH, date: "2026-11-12T19:35:00Z", parents: ["11c6654ac3"], touches: false },
+    { sha: "f00d000001", message: "side one", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["11c6654ac3"], touches: false },
+    M2,
+    { sha: "11c6654ac3", message: "another book", ...RICH, date: "2026-11-12T19:00:00Z", parents: ["ea9659c35f"], touches: false },
+    { sha: "ea9659c35f", message: "bible-editor: 2CH twl → master (#4884)", ...OURS, date: "2026-11-12T05:43:25Z", parents: ["cfa4de0b29"] },
+  ];
+  const stripWalkParents = (walk) => ({
+    ...walk,
+    commits: walk.commits.map((c) => {
+      const node = [...BOT_MERGE, ...MERGE_NOT_REACHING].find((n) => n.sha === c.sha);
+      if (!node?.noParentsInWalk) return c;
+      const { allParentShas, ...rest } = c;
+      return rest;
+    }),
+  });
+  for (const [label, graph, readAt, walkStart, expectReason] of [
+    ["EZK ust parallel branch, side commit in the walk", EZK_PARALLEL, at("2026-11-12T19:00:00Z"), at("2026-11-12T19:00:00Z"), "human_before_merge"],
+    ["EZK ust parallel branch, side commit older than the read, in the lineage walk", EZK_PARALLEL, at("2026-11-12T19:18:30Z"), at("2026-11-12T05:00:00Z"), "human_before_merge"],
+    ["EZK ust parallel branch, side commit older than the read (absent from the walk)", EZK_PARALLEL, at("2026-11-12T19:18:30Z"), null, "not_descendant"],
+    ["parallel-branch commit dated after our merge", LATE_PARALLEL, at("2026-11-12T19:00:00Z"), null, "not_descendant"],
+    ["a human commit between the render read and our merge", BEFORE_MERGE, at("2026-11-12T19:05:00Z"), null, "human_before_merge"],
+    ["a commit dated before the render read but pushed after it", LATE_PUSH, at("2026-11-12T19:05:00Z"), at("2026-11-12T05:00:00Z"), "human_before_merge"],
+    ["a fix on a nested merge of our merge and a side branch", NESTED_MERGE, at("2026-11-12T19:05:00Z"), null, "not_descendant"],
+    ["a merge whose own history does not reach our merge", MERGE_NOT_REACHING, at("2026-11-12T19:05:00Z"), at("2026-11-12T19:05:00Z"), "not_descendant"],
+    ["more human commits after our merge than the ancestry reads allowed", MANY_AFTER, at("2026-11-12T19:00:00Z"), null, "read_cap"],
+  ]) {
+    const { sqlite, env } = freshEnv();
+    seedSync(sqlite, { oldEditId: 11, pushedEditId: 77, prNumber: 4886, readAt });
+    const g = giteaGraph(graph);
+    const walked = walkStart == null ? null : stripWalkParents(walkFrom(graph, walkStart));
+    const reason = await stampWithheldBy(() =>
+      withFetch(g.fetchImpl, () => accountOwnPublishDeclineForTest(env, B, "twl", FILE, walked, syncState(77, readAt))),
+    );
+    eq(watermark(sqlite), { confirmedAt: OLD_WATERMARK, editId: 11 }, `#1349 ${label}: the #658 stamp is withheld`);
+    eq(reason, expectReason, `#1349 ${label}: …for the reason "${expectReason}"`);
+    eq(
+      sqlite.prepare(`SELECT own_publish_declines AS d FROM book_resource_syncs WHERE book = ? AND resource = 'twl'`).get(B).d,
+      0,
+      `#1349 ${label}: …while the preserved verdict still stands`,
+    );
+  }
+
+  // Re-review B1: a bot commit whose parents the walk does not carry (a ledger
+  // row from before migration 0078). With no human commit in the walk the
+  // stamp follows the rule it had before #1349 (no ancestry reads at all), so
+  // both B1 shapes stamp, as they do on main. B2: a parent whose own lookup
+  // shows no parents is "unknown", not a non-merge.
+  {
+    const BOT = { authorEmail: "bot@bp-assistant", authorName: "BW Bot" };
+    const tail = [
+      M2,
+      { sha: "11c6654ac3", message: "another book", ...RICH, date: "2026-11-12T19:00:00Z", parents: ["ea9659c35f"], touches: false },
+      { sha: "ea9659c35f", message: "bible-editor: 2CH twl → master (#4884)", ...OURS, date: "2026-11-12T05:43:25Z", parents: ["cfa4de0b29"] },
+    ];
+    const readAt = at("2026-11-12T19:05:00Z");
+    const dropParentsOf = (walk, shas) => ({
+      ...walk,
+      commits: walk.commits.map((c) => {
+        if (!shas.includes(c.sha)) return c;
+        const { allParentShas, ...rest } = c;
+        return rest;
+      }),
+    });
+    for (const [label, graph, walkOf, expect] of [
+      [
+        "B1: a bot push with unknown parents that is not on top of our merge",
+        [{ sha: "b1b1000001", message: "TQ: 2CH 3 [jo..e@api.bp-assistant]", ...BOT, date: "2026-11-12T19:40:00Z", parents: ["11c6654ac3"] }, ...tail],
+        (g) => dropParentsOf(walkFrom(g, readAt), ["b1b1000001"]),
+        null,
+      ],
+      [
+        "B1: a bot push with unknown parents on top of our merge",
+        [{ sha: "b1b1000002", message: "TQ: 2CH 3 [jo..e@api.bp-assistant]", ...BOT, date: "2026-11-12T19:40:00Z", parents: ["3aea90c6a7"] }, ...tail],
+        (g) => dropParentsOf(walkFrom(g, readAt), ["b1b1000002"]),
+        null,
+      ],
+      [
+        "B2: a parent whose listing shows no parents",
+        [
+          { sha: "b2b2000002", message: "A fix", ...RICH, date: "2026-11-12T19:40:00Z", parents: ["b2b2000001"] },
+          { sha: "b2b2000001", message: "TQ: 2CH 3 [jo..e@api.bp-assistant]", ...BOT, date: "2026-11-12T19:30:00Z", parents: ["3aea90c6a7"], servedParents: [] },
+          ...tail,
+        ],
+        // The parent is not in the walk, so only its own listing can prove it.
+        (g) => ({ ...walkFrom(g, readAt), commits: walkFrom(g, readAt).commits.filter((c) => c.sha !== "b2b2000001") }),
+        "parents_unknown",
+      ],
+      [
+        // Review D1 (Grok's scenario): newest first, a bot push A on a side
+        // branch, Richard's fix H on our merge, our merge. The merge J joining
+        // A's branch changed no tracked file, so the path walk never shows it.
+        // H is proven; A must be proven too, and cannot be.
+        "D1: a bot push on a side branch joined by a merge the walk does not show",
+        [
+          { sha: "d1d1000004", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:50:00Z", parents: ["d1d1000002", "d1d1000003"], touches: false },
+          { sha: "d1d1000003", message: "TQ: 2CH 3 [jo..e@api.bp-assistant]", ...BOT, date: "2026-11-12T19:45:00Z", parents: ["d1d1000001"] },
+          { sha: "d1d1000002", message: "A fix", ...RICH, date: "2026-11-12T19:40:00Z", parents: ["3aea90c6a7"] },
+          { sha: "d1d1000001", message: "Side work", ...RICH, date: "2026-11-12T19:10:00Z", parents: ["11c6654ac3"], touches: false },
+          ...tail,
+        ],
+        (g) => walkFrom(g, readAt),
+        "not_descendant",
+      ],
+      [
+        // Review C1/C3: Richard's fix sits on a merge X of our merge and a side
+        // commit S. Neither X nor S touches the file, so neither is in the walk
+        // and X's history listing does reach our merge. X's own parents,
+        // looked up, show the side parent, which cannot be proven.
+        "C1: an unlisted parent that is a merge bringing in a side branch",
+        [
+          { sha: "c1c1000003", message: "A fix", ...RICH, date: "2026-11-12T19:40:00Z", parents: ["c1c1000002"] },
+          { sha: "c1c1000002", message: "Merge branch 'master'", ...RICH, date: "2026-11-12T19:35:00Z", parents: ["3aea90c6a7", "c1c1000001"], touches: false },
+          { sha: "c1c1000001", message: "Side fix", ...RICH, date: "2026-11-12T19:20:00Z", parents: ["11c6654ac3"], touches: false },
+          ...tail,
+        ],
+        (g) => walkFrom(g, readAt),
+        "not_descendant",
+      ],
+    ]) {
+      const { sqlite, env } = freshEnv();
+      seedSync(sqlite, { oldEditId: 11, pushedEditId: 77, prNumber: 4886, readAt });
+      const g = giteaGraph(graph);
+      const reason = await stampWithheldBy(() =>
+        withFetch(g.fetchImpl, () => accountOwnPublishDeclineForTest(env, B, "twl", FILE, walkOf(graph), syncState(77, readAt))),
+      );
+      eq(
+        [watermark(sqlite), reason],
+        [expect == null ? { confirmedAt: readAt, editId: 77 } : { confirmedAt: OLD_WATERMARK, editId: 11 }, expect],
+        `#1349 ${label}: ${expect == null ? "stamped" : `withheld for "${expect}"`}`,
+      );
+    }
+  }
+
+  // ── The restructured rule (#1349, after five review rounds). With no human
+  //    commit in the walk the stamp follows main's rule and reads nothing.
+  //    With one, every commit above our merge is proven by complete parent
+  //    lists only, back to our merge, and every non-human commit below it is
+  //    proven an ancestor of our merge the same way.
+  {
+    const BOT = { authorEmail: "bot@bp-assistant", authorName: "BW Bot" };
+    const AI_MSG = "TQ: 2CH 3 [jo..e@api.bp-assistant]";
+    const tail = [
+      M2,
+      { sha: "11c6654ac3", message: "another book", ...RICH, date: "2026-11-12T19:00:00Z", parents: ["ea9659c35f"], touches: false },
+      { sha: "ea9659c35f", message: "bible-editor: 2CH twl → master (#4884)", ...OURS, date: "2026-11-12T05:43:25Z", parents: ["cfa4de0b29"] },
+    ];
+    const readAt = at("2026-11-12T19:05:00Z");
+    const run = async (graph, walked, repoParents) => {
+      const { sqlite, env } = freshEnv();
+      seedSync(sqlite, { oldEditId: 11, pushedEditId: 77, prNumber: 4886, readAt });
+      const g = giteaGraph(graph);
+      let reads = null;
+      const reason = await stampWithheldBy(async () => {
+        reads = await stampReadsBy(() =>
+          withFetch(g.fetchImpl, () =>
+            accountOwnPublishDeclineForTest(env, B, "twl", FILE, walked, syncState(77, readAt), Date.now(), undefined, repoParents),
+          ),
+        );
+      });
+      const stamped = JSON.stringify(watermark(sqlite)) === JSON.stringify({ confirmedAt: readAt, editId: 77 });
+      return { stamped, reason, reads, calls: g.calls };
+    };
+
+    // Claude F1 (#658's own production shape): bp-assistant pushes on top of
+    // our merge, each on commits to other files the path walk cannot see.
+    // Main stamps this with no reads; it must not spend reads, or hit a cap.
+    {
+      const AI_ONLY = [];
+      let parent = "3aea90c6a7";
+      for (let i = 1; i <= 8; i++) {
+        const hour = 19 + Math.floor((20 + i * 5) / 60);
+        const min = (m) => String((20 + i * 5 + m) % 60).padStart(2, "0");
+        const h1 = { sha: `a1a1${i}0001`, message: "another book", ...BOT, date: `2026-11-12T${hour}:${min(0)}:00Z`, parents: [parent], touches: false };
+        const h2 = { sha: `a1a1${i}0002`, message: "another book", ...BOT, date: `2026-11-12T${hour}:${min(1)}:00Z`, parents: [h1.sha], touches: false };
+        const bot = { sha: `a1a1${i}0003`, message: AI_MSG, ...BOT, date: `2026-11-12T${hour}:${min(2)}:00Z`, parents: [h2.sha] };
+        AI_ONLY.unshift(bot, h2, h1);
+        parent = bot.sha;
+      }
+      AI_ONLY.push(...tail);
+      const r = await run(AI_ONLY, null);
+      eq([r.stamped, r.reason, r.reads, r.calls.parents, r.calls.commits], [true, null, 0, 0, 1],
+        "#1349 F1: eight bot pushes after our merge (no human commit) stamp with no ancestry reads, as on main");
+    }
+    // Human-free shapes an earlier cut held to the strict rule: they stamp as
+    // on main (no reads). Our own merge with a side parent:
+    {
+      const BOT_MERGE_ONLY = [
+        { sha: "b0b0000002", message: "bible-editor: 2CH twl → master (#4890)", ...OURS, date: "2026-11-12T19:40:00Z", parents: ["3aea90c6a7", "b0b0000001"] },
+        { sha: "b0b0000001", message: "side", ...OURS, date: "2026-11-12T19:30:00Z", parents: ["11c6654ac3"], touches: false },
+        ...tail,
+      ];
+      const r = await run(BOT_MERGE_ONLY, walkFrom(BOT_MERGE_ONLY, readAt));
+      eq([r.stamped, r.reads, r.calls.parents], [true, 0, 0], "#1349: our own merge with a side parent and no human commit stamps as on main");
+      // …and once a human commit is in the walk, the same merge is held to
+      // the strict rule: its side parent lands on our merge's own parent.
+      const WITH_HUMAN = [
+        { sha: "b0b0000003", message: "A fix", ...RICH, date: "2026-11-12T19:45:00Z", parents: ["b0b0000002"] },
+        ...BOT_MERGE_ONLY,
+      ];
+      const h = await run(WITH_HUMAN, walkFrom(WITH_HUMAN, readAt));
+      eq([h.stamped, h.reason], [false, "not_descendant"], "#1349: …with a human commit on top, its unproven side parent withholds");
+    }
+
+    // Grok / muse: a bot commit on a side branch OLDER than our merge, joined
+    // by a merge the path walk does not show. Richard's fix sits directly on
+    // our merge, so everything above our merge is proven; the bot commit
+    // below it is not an ancestor of our merge. The file is not pinned
+    // (#1058's check does not apply), so only the below-merge rule catches it.
+    {
+      const GROK = [
+        { sha: "6a0c000003", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:50:00Z", parents: ["6a0c000002", "6a0c000001"], touches: false },
+        { sha: "6a0c000002", message: "A fix", ...RICH, date: "2026-11-12T19:40:00Z", parents: ["3aea90c6a7"] },
+        M2,
+        { sha: "6a0c000001", message: AI_MSG, ...BOT, date: "2026-11-12T19:10:00Z", parents: ["ea9659c35f"] },
+        ...tail.slice(1),
+      ];
+      const r = await run(GROK, walkFrom(GROK, at("2026-11-12T05:00:00Z")));
+      eq([r.stamped, r.reason], [false, "below_merge_unproven"],
+        "#1349 Grok: a side-branch bot commit below our merge, joined by a hidden merge, withholds the stamp");
+      // The same walk, with the ledger's repo-wide parents: #4884 is proven
+      // an ancestor for free, the side commit still is not.
+      const l = await run(GROK, walkFrom(GROK, at("2026-11-12T05:00:00Z")), repoParentsOf(GROK));
+      eq([l.stamped, l.reason], [false, "below_merge_unproven"], "#1349 Grok: …from the ledger too");
+    }
+
+    // Claude F2: Richard's fix c sits on Q (other files, one parent), whose
+    // parent Mz is a merge of a side line and a descendant of our merge.
+    // Q's own history listing reaches our merge, but that never proves Mz's
+    // other parent: each parent is looked up until it lands on our merge or
+    // on an ancestor of it.
+    {
+      const F2 = [
+        { sha: "f2f2000005", message: "A fix", ...RICH, date: "2026-11-12T19:50:00Z", parents: ["f2f2000004"] },
+        { sha: "f2f2000004", message: "another book", ...RICH, date: "2026-11-12T19:45:00Z", parents: ["f2f2000003"], touches: false },
+        { sha: "f2f2000003", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:40:00Z", parents: ["f2f2000001", "f2f2000002"], touches: false },
+        { sha: "f2f2000002", message: "another book", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["3aea90c6a7"], touches: false },
+        { sha: "f2f2000001", message: "side work", ...RICH, date: "2026-11-12T19:20:00Z", parents: ["11c6654ac3"], touches: false },
+        ...tail,
+      ];
+      const r = await run(F2, null);
+      eq([r.stamped, r.reason], [false, "not_descendant"],
+        "#1349 F2: a single-parent commit over an unwalked merge with a side line withholds the stamp");
+    }
+
+    // Codex: Door43 lists a commit whose parents include a malformed entry.
+    // The parser must not read it as the one well-formed parent.
+    {
+      const CODEX = [
+        { sha: "cd0e000002", message: "A fix", ...RICH, date: "2026-11-12T19:40:00Z", parents: ["3aea90c6a7", "cd0e000001"], rawParents: [{ sha: "3aea90c6a7" }, {}] },
+        { sha: "cd0e000001", message: "side work", ...RICH, date: "2026-11-12T19:20:00Z", parents: ["11c6654ac3"], touches: false },
+        ...tail,
+      ];
+      const r = await run(CODEX, null);
+      eq([r.stamped, r.reason, r.calls.parents], [false, "parents_unknown", 0],
+        "#1349 Codex: a parent list with a malformed entry withholds the stamp (no lookup can repair it)");
+    }
+    // The same rule for the ledger: a recorded parent list that is malformed
+    // (null in repoParents) withholds, and no Door43 lookup replaces it.
+    {
+      const LEDGER_BAD = [
+        { sha: "e0e0000002", message: "A fix", ...RICH, date: "2026-11-12T19:40:00Z", parents: ["e0e0000001"] },
+        { sha: "e0e0000001", message: "another book", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["3aea90c6a7"], touches: false },
+        ...tail,
+      ];
+      const repoParents = repoParentsOf(LEDGER_BAD);
+      repoParents.set("e0e0000001", null);
+      const r = await run(LEDGER_BAD, walkFrom(LEDGER_BAD, readAt), repoParents);
+      eq([r.stamped, r.reason, r.calls.parents], [false, "parents_unknown", 0],
+        "#1349: a malformed parent list recorded in the ledger withholds the stamp");
+      const good = await run(LEDGER_BAD, walkFrom(LEDGER_BAD, readAt), repoParentsOf(LEDGER_BAD));
+      eq([good.stamped, good.reads, good.calls.parents], [true, 0, 0], "#1349: …and the well-formed one proves it with no reads");
+    }
+  }
+
+  // ── Two nights (EZK tn 2026-11-12/13, measured read-only). Night 1 stamps
+  //    #7986's render: Richard's commits after it descend from it. Night 2's
+  //    walk starts at that stamped watermark, so his commits sit BELOW
+  //    tonight's merge #7997. Door43 cannot show they were pushed before
+  //    tonight's render read (review A1), so tonight's stamp is withheld; it
+  //    lands on a night when master converges on our render byte for byte.
+  {
+    const N1_READ = at("2026-11-12T05:31:00Z");
+    const N2_READ = at("2026-11-13T05:40:00Z");
+    const N1 = { sha: "43dc8d9a47", message: "bible-editor: 2CH twl → master (#7986)", ...OURS, date: "2026-11-12T05:36:37Z", parents: ["db52bc31ec"] };
+    const N2 = { sha: "9f723ba215", message: "bible-editor: 2CH twl → master (#7997)", ...OURS, date: "2026-11-13T06:23:26Z", parents: ["cc799a717d"] };
+    const NIGHTS = [
+      { sha: "5dea704f45", message: "Re-applies note formatting", ...RICH, date: "2026-11-13T09:17:34Z", parents: ["c097884d61"] },
+      { sha: "c097884d61", message: "another book", ...OURS, date: "2026-11-13T06:23:58Z", parents: ["9f723ba215"], touches: false },
+      N2,
+      { sha: "cc799a717d", message: "another book", ...OURS, date: "2026-11-13T06:20:00Z", parents: ["bea8b2764f"], touches: false },
+      { sha: "bea8b2764f", message: "Puts a colon before the first numbered option", ...RICH, date: "2026-11-12T23:43:10Z", parents: ["f9ba77fbbf"] },
+      { sha: "f9ba77fbbf", message: "Fixes option markers", ...RICH, date: "2026-11-12T23:40:13Z", parents: ["c7d0ee564f"] },
+      { sha: "c7d0ee564f", message: "another book", ...RICH, date: "2026-11-12T23:30:00Z", parents: ["493d853c3b"], touches: false },
+      { sha: "493d853c3b", message: "Merge bethoakes-tc-create-1 into master (#7993)", ...RICH, date: "2026-11-12T23:20:00Z", parents: ["229cc91e96"], touches: false },
+      { sha: "229cc91e96", message: "Fixes broken bold markdown in notes", ...RICH, date: "2026-11-12T23:13:04Z", parents: ["28d471effb"] },
+      { sha: "28d471effb", message: "another book", ...RICH, date: "2026-11-12T23:12:00Z", parents: ["1bacc91c3e"], touches: false },
+      { sha: "1bacc91c3e", message: "Fixes cross-book Scripture links", ...RICH, date: "2026-11-12T23:10:53Z", parents: ["12d30afd62"] },
+      { sha: "12d30afd62", message: "Standardizes punctuation", ...RICH, date: "2026-11-12T23:09:02Z", parents: ["41c5b6ccae"] },
+      { sha: "41c5b6ccae", message: "another book", ...RICH, date: "2026-11-12T23:00:00Z", parents: ["968e3553d7"], touches: false },
+      { sha: "968e3553d7", message: "Adds '; or ' between numbered AT options", ...RICH, date: "2026-11-12T22:38:44Z", parents: ["bff360f4b0"] },
+      { sha: "bff360f4b0", message: "Puts a ; after one Alternate translation", ...RICH, date: "2026-11-12T22:32:48Z", parents: ["56b713a9c6"] },
+      { sha: "56b713a9c6", message: "Validation errors", ...RICH, date: "2026-11-12T22:00:00Z", parents: ["37d86fbada"], touches: false },
+      { sha: "37d86fbada", message: "another book", ...RICH, date: "2026-11-12T21:00:00Z", parents: ["43dc8d9a47"], touches: false },
+      N1,
+      // Between #7986 and the export before it (#7978, merged just after the
+      // 11-11 watermark, so in the walk below #7986): nine en_tn commits to
+      // other files (measured 2026-11-13, a repo-scoped listing from
+      // 43dc8d9a47, every one single-parent).
+      ...[
+        ["db52bc31ec", "2026-11-12T05:36:08Z"],
+        ["10b25eeb68", "2026-11-11T21:50:53Z"],
+        ["95d279d64d", "2026-11-11T21:47:05Z"],
+        ["219d9060a8", "2026-11-11T21:39:26Z"],
+        ["ac3bf1cb88", "2026-11-11T21:38:13Z"],
+        ["17592e4b52", "2026-11-11T21:11:13Z"],
+        ["9c605de67e", "2026-11-11T20:21:19Z"],
+        ["fdde7f087e", "2026-11-11T05:36:29Z"],
+        ["2fcd2bc234", "2026-11-11T05:35:44Z"],
+      ].map(([sha, date], i, all) => ({
+        sha, message: "another book", ...RICH, date, parents: [all[i + 1]?.[0] ?? "aed698ce01"], touches: false,
+      })),
+      { sha: "aed698ce01", message: "bible-editor: 2CH twl → master (#7978)", ...OURS, date: "2026-11-11T05:35:28Z", parents: ["9d6d0b0a47"] },
+    ];
+    const { sqlite, env } = freshEnv();
+    seedSync(sqlite, { oldEditId: 11, pushedEditId: 77, prNumber: 7986, readAt: N1_READ });
+    const g = giteaGraph(NIGHTS);
+    // Night 1 (11-13 05:46, before #7997 existed): only the commits up to then.
+    const night1 = NIGHTS.filter((c) => at(c.date) < at("2026-11-13T05:46:00Z"));
+    const g1 = giteaGraph(night1);
+    const night1Reads = await stampReadsBy(() =>
+      withFetch(g1.fetchImpl, () =>
+        accountOwnPublishDeclineForTest(env, B, "twl", FILE, walkFrom(night1, OLD_WATERMARK), syncState(77, N1_READ)),
+      ),
+    );
+    eq(watermark(sqlite), { confirmedAt: N1_READ, editId: 77 }, "#1349 night 1: Richard's commits after #7986 descend from it, so it is stamped");
+    // The parents measured on Door43: above #7986, one lookup for each of the
+    // six commits to other files between Richard's (56b713a9, 37d86fba,
+    // 41c5b6cc, 28d471ef, c7d0ee56, 493d853c); below it, one for each of the
+    // nine commits back to #7978.
+    eq(night1Reads, 15, "#1349 night 1: …after 15 Door43 reads (the measured EZK tn shape: 6 above our merge, 9 below)");
+    // Night 2: export #7997 recorded its render (read after Richard's commits).
+    sqlite
+      .prepare(
+        `UPDATE book_resource_syncs SET pushed_read_at = ?1, pushed_pr_read_at = ?1, pushed_edit_id = 90, pushed_pr_number = 7997
+          WHERE book = ?2 AND resource = 'twl'`,
+      )
+      .run(N2_READ, B);
+    const night2Reason = await stampWithheldBy(() =>
+      withFetch(g.fetchImpl, () =>
+        accountOwnPublishDeclineForTest(env, B, "twl", FILE, walkFrom(NIGHTS, N1_READ), syncState(90, N2_READ)),
+      ),
+    );
+    eq([watermark(sqlite), night2Reason], [{ confirmedAt: N1_READ, editId: 77 }, "human_before_merge"],
+      "#1349 night 2: commits below tonight's merge withhold its stamp (no push-time evidence); night 1's stamp stands");
+
+    // Night 1 again, from the dcs_commits ledger. Narrowed to commits that
+    // touch the file, with parents only as recorded in parent_shas_json, it
+    // costs what the live walk costs (15): one lookup per commit to another
+    // file. Without recorded parents (rows from before migration 0078) every
+    // commit is looked up, which passes the cap below our merge. With the
+    // ledger's parents for every repo commit in its window, it costs nothing.
+    const ledgerWalk = (withParents) => ({
+      commits: walkFrom(night1, OLD_WATERMARK).commits.map(({ allParentShas, parentsCheck, ...c }) =>
+        (withParents ? { ...c, allParentShas, parentsCheck } : c)),
+      incomplete: false,
+      incompleteReason: "",
+    });
+    for (const [label, withParents, repoParents, expectReads, expectReason] of [
+      ["with recorded parents", true, undefined, 15, null],
+      ["without parents", false, undefined, 20, "below_merge_unproven"],
+      ["with every repo commit's parents", true, repoParentsOf(night1), 0, null],
+    ]) {
+      const fresh = freshEnv();
+      seedSync(fresh.sqlite, { oldEditId: 11, pushedEditId: 77, prNumber: 7986, readAt: N1_READ });
+      let reads = null;
+      const reason = await stampWithheldBy(async () => {
+        reads = await stampReadsBy(() =>
+          withFetch(giteaGraph(night1).fetchImpl, () =>
+            accountOwnPublishDeclineForTest(fresh.env, B, "twl", FILE, ledgerWalk(withParents), syncState(77, N1_READ), Date.now(), undefined, repoParents),
+          ),
+        );
+      });
+      eq([watermark(fresh.sqlite), reads, reason],
+        [expectReason == null ? { confirmedAt: N1_READ, editId: 77 } : { confirmedAt: OLD_WATERMARK, editId: 11 }, expectReads, expectReason],
+        `#1349 night 1 from the ledger ${label}: ${expectReason == null ? `stamped after ${expectReads} reads` : `withheld for "${expectReason}"`}`);
+    }
+  }
+
+  // A failed ancestry read proves nothing: withhold.
+  {
+    const { sqlite, env } = freshEnv();
+    seedSync(sqlite, { oldEditId: 11, pushedEditId: 77 });
+    const g = giteaGraph(GRAPH_2CH);
+    const failing = async (url) =>
+      new URL(String(url)).searchParams.get("sha") === "master" || String(url).includes("/git/trees/")
+        ? g.fetchImpl(url)
+        : { ok: false, status: 500, headers: { get: () => null }, json: async () => ({}) };
+    await withFetch(failing, () =>
+      accountOwnPublishDeclineForTest(env, B, "twl", FILE, walkFrom(GRAPH_2CH, OLD_WATERMARK), syncState(77)),
+    );
+    eq(watermark(sqlite), { confirmedAt: OLD_WATERMARK, editId: 11 }, "#1349 a failed ancestry read withholds the stamp");
+  }
+
+  // Review C3: a parents lookup that fails proves nothing: withhold.
+  {
+    const { sqlite, env } = freshEnv();
+    seedSync(sqlite, { oldEditId: 11, pushedEditId: 77 });
+    const g = giteaGraph(GRAPH_2CH);
+    const lookupFails = async (url) =>
+      new URL(String(url)).pathname.includes("/commits/") && !new URL(String(url)).pathname.endsWith("/commits")
+        ? { ok: false, status: 500, json: async () => ({}) }
+        : g.fetchImpl(url);
+    const reason = await stampWithheldBy(() =>
+      withFetch(lookupFails, () =>
+        accountOwnPublishDeclineForTest(env, B, "twl", FILE, walkFrom(GRAPH_2CH, OLD_WATERMARK), syncState(77)),
+      ),
+    );
+    eq([watermark(sqlite), reason], [{ confirmedAt: OLD_WATERMARK, editId: 11 }, "read_failed"],
+      "#1349 C3: a failed parents lookup withholds the stamp");
+  }
+
+  // Review A2: an ancestry read that hangs is cut off by a timeout, and one that
+  // throws (an abort included) withholds the stamp; the decline accounting
+  // still finishes (counter reset, no exception into the sync).
+  {
+    const { sqlite, env } = freshEnv();
+    seedSync(sqlite, { oldEditId: 11, pushedEditId: 77 });
+    sqlite.prepare(`UPDATE book_resource_syncs SET own_publish_declines = 2 WHERE book = ? AND resource = 'twl'`).run(B);
+    const g = giteaGraph(GRAPH_2CH);
+    const signals = [];
+    const aborting = async (url, init) => {
+      if (new URL(String(url)).searchParams.get("sha") === "master" || String(url).includes("/git/trees/")) return g.fetchImpl(url);
+      signals.push(init?.signal ?? null);
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    };
+    let threw = null;
+    const reason = await stampWithheldBy(async () => {
+      try {
+        await withFetch(aborting, () =>
+          accountOwnPublishDeclineForTest(env, B, "twl", FILE, walkFrom(GRAPH_2CH, OLD_WATERMARK), syncState(77)),
+        );
+      } catch (e) {
+        threw = e;
+      }
+    });
+    eq(threw, null, "#1349 A2: an aborted ancestry read does not throw into the sync");
+    eq([watermark(sqlite), reason], [{ confirmedAt: OLD_WATERMARK, editId: 11 }, "read_failed"], "#1349 A2: …and withholds the stamp");
+    eq(signals.length > 0 && signals.every((s) => s instanceof AbortSignal), true, "#1349 A2: every ancestry read carries a timeout signal");
+    eq(
+      sqlite.prepare(`SELECT own_publish_declines AS d FROM book_resource_syncs WHERE book = ? AND resource = 'twl'`).get(B).d,
+      0,
+      "#1349 A2: …and the preserved verdict's counter reset still lands",
+    );
   }
 }
 console.log("\n[merge_kept retire: standing flags come down, D1-only, and nothing else is touched]");
