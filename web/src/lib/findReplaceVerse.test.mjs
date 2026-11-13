@@ -394,6 +394,13 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
     check(all.labelRefusals === 2 && all.plainText === plain, `replace-all there: both matches counted once, nothing replaced (got ${all.labelRefusals})`);
     const clean = replaceAllInVerse(verse, plain, /ran/g, 1, "went");
     check(clean.labelRefusals === undefined && clean.plainText === "A home. He went home.", "no refusal: no count");
+    // A replacement that matches the pattern again ("ran" -> "and he ran")
+    // ends the loop at its cap right after an applied step, before the pass
+    // meets the refused "home. He" again: that refusal must still be counted
+    // (review round 4 of #1350).
+    const re = /home\. He|ran/g;
+    const rematch = replaceAllInVerse(verse, plain, re, 2, "and he ran");
+    check(rematch.labelRefusals === 1, `replace-all whose replacement re-matches: the refused match is still counted (got ${rematch.labelRefusals})`);
   } finally {
     console.warn = warn;
   }

@@ -2255,6 +2255,93 @@ await (async () => {
   assert(result.applied?.verseUpdated === 1, "plain_text staleness: the job completes with 1 verse written");
 })();
 
+// ── A `\sp` label written as words on the AI verse ingest (#1350) ──────────
+// The staging step nests a word label (extractVersesForRange), but a verse
+// proposal staged before that (or by any other producer) still holds the
+// label flat: an empty `sp` node, then its words as body words. The apply's
+// own healers must store it nested, like every other import, and the curl pass
+// must leave the label's text as Door43 wrote it. Drives the real
+// importJobOutput -> applyVerseUpdate path.
+await (async () => {
+  const w = (text) => ({ type: "word", tag: "w", text, occurrence: "1", occurrences: "1" });
+  const t = (text) => ({ type: "text", text });
+  const contentJson = JSON.stringify({
+    verseObjects: [
+      w("Wine"), t(".\n"),
+      { tag: "sp", nextChar: " " }, w("The"), t(" "), w("man's"), t(" 'friends'\n"),
+      { tag: "q1", type: "quote" }, w("He"), t(" said, 'Go.'"),
+    ],
+  });
+  const dbState = { claimedAt: 7000 };
+  let insertedArgs = null;
+  function dispatch(sql, args) {
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql)) {
+      dbState.claimedAt += 1;
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) return { changes: 0, rows: [], single: { staged_at: 999999 } };
+    if (/SELECT state, error_kind FROM pipeline_jobs/.test(sql)) return { changes: 0, rows: [], single: { state: "running", error_kind: null } };
+    if (/SELECT user_id FROM pipeline_jobs/.test(sql)) return { changes: 0, rows: [], single: { user_id: 1 } };
+    if (/ORDER BY kind, chapter, verse, id/.test(sql)) {
+      return {
+        changes: 0,
+        rows: [{ id: 1, kind: "verse", book: "SNG", chapter: 1, verse: 1, bible_version: "UST", payload_json: JSON.stringify({ content_json: contentJson, plain_text: "stale" }) }],
+        single: null,
+      };
+    }
+    if (/SELECT chapter, verse, content_json FROM verses/.test(sql)) return { changes: 0, rows: [], single: null };
+    if (/SELECT version, content_json, plain_text, updated_at, verse_end FROM verses/.test(sql)) return { changes: 0, rows: [], single: null };
+    if (/INSERT INTO verses/.test(sql)) {
+      insertedArgs = args;
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/DELETE FROM verse_lane_checks/.test(sql)) return { changes: 0, rows: [], single: null };
+    if (/INSERT INTO edit_log/.test(sql)) return { changes: 1, rows: [], single: null };
+    if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) return { changes: 1, rows: [], single: null };
+    if (/MAX\(sort_order\)/.test(sql)) return { changes: 0, rows: [], single: null };
+    if (/UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(sql)) return { changes: 1, rows: [], single: null };
+    throw new Error(`fakeSpLabelDb: unhandled SQL: ${sql}`);
+  }
+  const stmt = (sql, args) => ({
+    sql,
+    args,
+    async run() {
+      const res = dispatch(sql, args);
+      return { meta: { changes: res.changes }, results: res.rows };
+    },
+    async first() { return dispatch(sql, args).single; },
+    async all() { return { results: dispatch(sql, args).rows }; },
+  });
+  const env = {
+    DB: {
+      prepare: (sql) => ({ ...stmt(sql, []), bind: (...args) => stmt(sql, args) }),
+      async batch(stmts) {
+        const out = [];
+        for (const s of stmts) out.push(await s.run());
+        return out;
+      },
+    },
+  };
+  const result = await importJobOutput(
+    env,
+    { jobId: "job-sp-label", pipelineType: "generate", book: "SNG", startChapter: 1, endChapter: 1 },
+    [],
+  );
+  assert(insertedArgs !== null && result.applied?.verseUpdated === 1, "sp word label ingest: the verse INSERT fired");
+  const stored = JSON.parse(insertedArgs[5]).verseObjects;
+  const label = stored.find((n) => n.tag === "sp");
+  assert(
+    label && Array.isArray(label.children) && label.endTag === "" && stored.filter((n) => n.tag === "w").length === 2,
+    `sp word label ingest: the label is stored nested, its words out of the body (got ${insertedArgs[5]})`,
+  );
+  assert(
+    JSON.stringify(label?.children) === JSON.stringify([w("The"), t(" "), w("man's"), t(" 'friends'\n")]),
+    `sp word label ingest: the label's quotes are left as written (got ${JSON.stringify(label?.children)})`,
+  );
+  assert(insertedArgs[5].includes("‘Go.’"), "sp word label ingest: the body's quotes are still curled");
+  assert(insertedArgs[6] === "Wine. He said, ‘Go.’", `sp word label ingest: plain_text leaves the label out (got ${JSON.stringify(insertedArgs[6])})`);
+})();
+
 // ── TQ candidate-id chain: an 8-long DETERMINISTIC chain (seedId, then
 //    deriveAltRowId(seedId, 1..7)) walked per proposal. Live-in-same-chapter
 //    -> UPDATE; live-in-different-chapter -> step past it; no live row ->
