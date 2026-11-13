@@ -2262,16 +2262,9 @@ await (async () => {
 // own healers must store it nested, like every other import, and the curl pass
 // must leave the label's text as Door43 wrote it. Drives the real
 // importJobOutput -> applyVerseUpdate path.
-await (async () => {
-  const w = (text) => ({ type: "word", tag: "w", text, occurrence: "1", occurrences: "1" });
-  const t = (text) => ({ type: "text", text });
-  const contentJson = JSON.stringify({
-    verseObjects: [
-      w("Wine"), t(".\n"),
-      { tag: "sp", nextChar: " " }, w("The"), t(" "), w("man's"), t(" 'friends'\n"),
-      { tag: "q1", type: "quote" }, w("He"), t(" said, 'Go.'"),
-    ],
-  });
+// Runs one SNG UST verse proposal through importJobOutput and returns the
+// verse INSERT's args (null if none fired) and the job result.
+async function ingestSpLabelVerse(contentJson) {
   const dbState = { claimedAt: 7000 };
   let insertedArgs = null;
   function dispatch(sql, args) {
@@ -2327,6 +2320,19 @@ await (async () => {
     { jobId: "job-sp-label", pipelineType: "generate", book: "SNG", startChapter: 1, endChapter: 1 },
     [],
   );
+  return { insertedArgs, result };
+}
+await (async () => {
+  const w = (text) => ({ type: "word", tag: "w", text, occurrence: "1", occurrences: "1" });
+  const t = (text) => ({ type: "text", text });
+  const contentJson = JSON.stringify({
+    verseObjects: [
+      w("Wine"), t(".\n"),
+      { tag: "sp", nextChar: " " }, w("The"), t(" "), w("man's"), t(" 'friends'\n"),
+      { tag: "q1", type: "quote" }, w("He"), t(" said, 'Go.'"),
+    ],
+  });
+  const { insertedArgs, result } = await ingestSpLabelVerse(contentJson);
   assert(insertedArgs !== null && result.applied?.verseUpdated === 1, "sp word label ingest: the verse INSERT fired");
   const stored = JSON.parse(insertedArgs[5]).verseObjects;
   const label = stored.find((n) => n.tag === "sp");
@@ -2340,6 +2346,31 @@ await (async () => {
   );
   assert(insertedArgs[5].includes("‘Go.’"), "sp word label ingest: the body's quotes are still curled");
   assert(insertedArgs[6] === "Wine. He said, ‘Go.’", `sp word label ingest: plain_text leaves the label out (got ${JSON.stringify(insertedArgs[6])})`);
+})();
+
+// #1354 item 5b: an AI-mangled orphan `\zaln-e` inside a flat label's run.
+// The nest used to run before stripOrphanAlignmentMarkers, so the orphan ended
+// the run after "The"; the strip then deleted it and "woman" stayed a body
+// word (in the body and in plain_text). Nested after the strip, the whole
+// label is nested.
+await (async () => {
+  const w = (text) => ({ type: "word", tag: "w", text, occurrence: "1", occurrences: "1" });
+  const t = (text) => ({ type: "text", text });
+  const contentJson = JSON.stringify({
+    verseObjects: [
+      w("Wine"), t(".\n"),
+      { tag: "sp", nextChar: " " }, w("The"), t(" "), { tag: "zaln-e\\*", content: "-e " }, w("woman"), t("\n"),
+      { tag: "q1", type: "quote" }, w("He"), t(" ran."),
+    ],
+  });
+  const { insertedArgs } = await ingestSpLabelVerse(contentJson);
+  assert(insertedArgs !== null, "orphan zaln-e in a label: the verse INSERT fired");
+  const stored = JSON.parse(insertedArgs?.[5] ?? "{}").verseObjects ?? [];
+  const label = stored.find((n) => n.tag === "sp");
+  const labelWords = (label?.children ?? []).filter((n) => n.tag === "w").map((n) => n.text);
+  assert(JSON.stringify(labelWords) === JSON.stringify(["The", "woman"]), `orphan zaln-e in a label: the whole label is nested (got ${insertedArgs?.[5]})`);
+  assert(!stored.some((n) => typeof n.tag === "string" && n.tag.startsWith("zaln-e")), "orphan zaln-e in a label: the orphan is still stripped");
+  assert(insertedArgs?.[6] === "Wine. He ran.", `orphan zaln-e in a label: plain_text leaves the whole label out (got ${JSON.stringify(insertedArgs?.[6])})`);
 })();
 
 // ── TQ candidate-id chain: an 8-long DETERMINISTIC chain (seedId, then

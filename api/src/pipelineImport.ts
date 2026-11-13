@@ -2237,16 +2237,19 @@ async function applyVerseUpdate(
     try {
       const parsed = JSON.parse(contentJson) as { verseObjects?: unknown[] };
       if (Array.isArray(parsed?.verseObjects)) {
-        // Nest a `\sp` label written as words (#1350) first, so every healer
-        // below and the stored tree see it as a label, the same shape the
-        // staging step's extractVersesForRange gives. A no-op on a tree staged
-        // that way; it catches one staged before the nest existed, or flat
-        // from any other producer. The curl pass then leaves the label alone.
-        parsed.verseObjects = nestWordLabels(parsed.verseObjects);
         // Drop AI-mangled orphan `\zaln-e` end-markers / bare "-e" junk before
         // recompute, so the cleaned tree lands in D1 (and exports clean). See
         // stripOrphanAlignmentMarkers — MIC 6:10 UST.
         parsed.verseObjects = stripOrphanAlignmentMarkers(parsed.verseObjects);
+        // Nest a `\sp` label written as words (#1350) next, so every healer
+        // below and the stored tree see it as a label, the same shape the
+        // staging step's extractVersesForRange gives. A no-op on a tree staged
+        // that way; it catches one staged before the nest existed, or flat
+        // from any other producer. The curl pass then leaves the label alone.
+        // After the strip, not before: an orphan `\zaln-e` inside a flat
+        // label's run ended the run, and the strip then deleted it, leaving
+        // the rest of the label as body words (#1354).
+        parsed.verseObjects = nestWordLabels(parsed.verseObjects);
         // Collapse any `\zaln-s` compound that wraps the same source token twice
         // (the doubled-source defect, e.g. JER 31:33 `אֶת אֶת בֵּית`) before it
         // lands in D1 / exports. No-op on clean output; source text untouched.

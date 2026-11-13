@@ -264,8 +264,9 @@ export function rewriteHeaderLabel(node: Record<string, unknown>, tag: string, t
 // with `endTag: ""`: then isHeaderLabelNode's skip covers them everywhere, and
 // usfm-js renders the node back to exactly the same bytes (`\sp ` then the
 // children; the empty endTag stops it writing a closing `\sp-e\*`).
-// The run nested is what USFM gives the label: every `\w` word, text node and
-// `\zaln` milestone after the `sp` up to the next node of any other kind (the
+// The run nested is what USFM gives the label: every `\w` word, text node,
+// `\zaln` milestone, footnote and character marker (`\add`, `\nd`, `\x`, …;
+// #1354) after the `sp` up to the next node of any other kind (the
 // `\q1` or `\ts\*` that follows it in every real case) or the verse end. Only
 // an `sp` with no text (an empty `text` counts as none and is dropped),
 // content or children of its own is touched, and only when the run holds at
@@ -288,8 +289,9 @@ export function nestWordLabels(verseObjects: unknown[]): unknown[] {
       while (j < verseObjects.length) {
         const kind = labelRunKind(verseObjects[j]);
         if (kind === null) {
-          // A milestone that spans past the label: leave this label alone.
-          if (isZalnMilestone(verseObjects[j])) clean = false;
+          // A milestone (or character marker) that spans past the label:
+          // leave this label alone.
+          if (isLabelRunContainer(verseObjects[j])) clean = false;
           break;
         }
         words += kind;
@@ -320,6 +322,20 @@ export function isWordLabelNode(node: unknown): boolean {
   return o["content"] === undefined && (o["text"] === undefined || o["text"] === "");
 }
 
+// A `\sp` speaker label of either shape: written as words (isWordLabelNode),
+// or as plain text (`\sp The woman`, usfm-js `{tag:"sp", text}`; a header-band
+// edit writes `content`). The edit engine holds both aside for an edit
+// (withWordLabelsAsText in replace.ts, #1354): shown to it, a plain-text label
+// was blanked by the punctuation relayout or dropped by an edit across it. An
+// empty `sp` that was not nested is neither: it keeps main's handling.
+export function isSpeakerLabelNode(node: unknown): boolean {
+  if (isWordLabelNode(node)) return true;
+  const o = node as Record<string, unknown> | null;
+  if (!o || o["tag"] !== "sp" || !isHeaderLabelNode(o) || o["children"] !== undefined) return false;
+  const label = typeof o["content"] === "string" ? o["content"] : o["text"];
+  return typeof label === "string" && label.trim() !== "";
+}
+
 function isEmptyLabelOpener(node: unknown): boolean {
   const o = node as Record<string, unknown> | null;
   if (!o || o["tag"] !== "sp" || o["type"] !== undefined) return false;
@@ -331,15 +347,31 @@ function isZalnMilestone(node: unknown): boolean {
   return !!o && o["type"] === "milestone" && o["tag"] === "zaln";
 }
 
+// A footnote (`\f … \f*`, which usfm-js types "footnote") or a closed
+// character or note marker (`\add … \add*`, `\nd`, `\k`, `\x … \x*`: no type,
+// and an `endTag` that is its tag plus `*`). In USFM the whole `\sp` line is
+// the label, so these are part of it (#1354): the run crosses them.
+function isLabelInlineMarker(o: Record<string, unknown>): boolean {
+  if (o["type"] === "footnote") return true;
+  const tag = o["tag"];
+  return o["type"] === undefined && typeof tag === "string" && o["endTag"] === `${tag}*`;
+}
+
+// A node a label's run may hold that can itself hold other nodes.
+function isLabelRunContainer(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  return !!o && (isZalnMilestone(o) || isLabelInlineMarker(o));
+}
+
 // How a node counts in a label's run: the number of `\w` words it holds (0 for
 // a text node), or null when it ends the run — any other node, and a milestone
-// with anything but words, text and milestones inside it.
+// or marker with anything but words, text, milestones and markers inside it.
 function labelRunKind(node: unknown): number | null {
   const o = node as Record<string, unknown> | null;
   if (!o) return null;
   if (o["type"] === "text") return typeof o["text"] === "string" ? 0 : null;
   if (o["type"] === "word") return o["tag"] === "w" ? 1 : null;
-  if (!isZalnMilestone(o)) return null;
+  if (!isLabelRunContainer(o)) return null;
   let words = 0;
   for (const c of (o["children"] as unknown[] | undefined) ?? []) {
     const k = labelRunKind(c);

@@ -21,6 +21,8 @@ import { fileURLToPath } from "node:url";
 import { nestWordLabels, splitSectionHeaders, extractPlainText, extractEditableText, rewriteHeaderLabel, isWordLabelNode, headerLabelText } from "./usfm.ts";
 import { parseAlignment, serializeAlignment, countUnalignedTargetWords } from "./alignment.ts";
 import { curlifyVerseContent } from "./curlyVerse.ts";
+import { editHeaderBand, renumberTargetOccurrences } from "./replace.ts";
+import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const fixture = readFileSync(resolve(repoRoot, "api/src/fixtures/sng-sp-labels.usfm.txt"), "utf8");
@@ -137,14 +139,129 @@ const v4 = nestWordLabels(verse("4"));
   }
 }
 
-// Editing the label in the header band writes plain label text once, never
-// the text plus the old words.
+// Editing the label in the header band (#1354 item 1): the label stays words,
+// written once. Each unchanged word keeps its `\w` attributes and any `\zaln`
+// around it; only a changed word loses its alignment (the body edit's rule).
+// The occurrence numbers are counted over the whole verse afterwards.
 {
   const label = labelsOf(v1)[0];
-  const edited = rewriteHeaderLabel(label, "sp", "The woman dreams");
-  const r = render([edited]);
-  assert(r.includes("\\sp The woman dreams\n") && !r.includes("\\w") && !r.includes("thinks"), `band edit renders the new text once (got ${json(r)})`);
+  const band = (vos, index, tag, text) => editHeaderBand(vos, { index, tag, text });
+  const e1 = band(v1, 0, "sp", "The woman dreams about the man she loves");
+  const r = render(labelsOf(e1));
+  assert(isWordLabelNode(labelsOf(e1)[0]) && r.includes("\\w dreams|") && !r.includes("thinks") && !/\\sp The woman/.test(r),
+    `band edit keeps the label as \\w words, new text once (got ${json(r)})`);
+  assert(headerLabelText(labelsOf(e1)[0]) === "The woman dreams about the man she loves", `band edit: the band shows the new text (got ${json(headerLabelText(labelsOf(e1)[0]))})`);
+  assert(json(e1.filter((n) => n.tag !== "sp")) === json(v1.filter((n) => n.tag !== "sp")), "band edit: the verse body is untouched");
   assert(rewriteHeaderLabel(label, "sp", "The woman thinks about the man she loves") === label, "an unchanged band save keeps the words as they were");
+  assert(band(v1, 0, "sp", "The woman thinks about the man she loves") === v1, "an unchanged band save hands back the same verse");
+
+  // SNG 1:4 label 3 holds two `\zaln H0157` milestones ("the", "young women").
+  const zalnIn = (node) => {
+    const out = [];
+    const walk = (ns, chain) => {
+      for (const n of ns ?? []) {
+        const next = n?.type === "milestone" && n.tag === "zaln" ? [...chain, n.strong] : chain;
+        if (n?.type === "word") out.push(`${n.text}:${next.join(">")}`);
+        if (Array.isArray(n?.children)) walk(n.children, next);
+      }
+    };
+    walk(node.children, []);
+    return out.join("|");
+  };
+  const l3 = labelsOf(v4)[2];
+  assert(zalnIn(l3) === "The:|woman:|speaking:|to:|the:H0157|man:|about:|the:|young:H0157|women:H0157|of:|Jerusalem:", `setup: label 3's alignment (got ${zalnIn(l3)})`);
+  const t3 = headerLabelText(l3);
+  const talk = band(v4, 2, "sp", t3.replace("speaking", "talking"));
+  assert(zalnIn(labelsOf(talk)[2]) === "The:|woman:|talking:|to:|the:H0157|man:|about:|the:|young:H0157|women:H0157|of:|Jerusalem:",
+    `a changed word beside aligned ones: every other word keeps its alignment (got ${zalnIn(labelsOf(talk)[2])})`);
+  const girls = band(v4, 2, "sp", t3.replace("the young women", "the girls"));
+  assert(zalnIn(labelsOf(girls)[2]) === "The:|woman:|speaking:|to:|the:H0157|man:|about:|the:|girls:|of:|Jerusalem:",
+    `the aligned words changed: only they lose alignment (got ${zalnIn(labelsOf(girls)[2])})`);
+  const noOcc = (k, v) => (k === "occurrence" || k === "occurrences" ? undefined : v);
+  for (const [name, out] of [["talking", talk], ["girls", girls]]) {
+    assert(JSON.stringify(labelsOf(out).filter((_, i) => i !== 2), noOcc) === JSON.stringify(labelsOf(v4).filter((_, i) => i !== 2), noOcc), `${name}: the other labels keep their words`);
+    assert(renumberTargetOccurrences(out) === out, `${name}: occurrences counted over the whole verse, labels included`);
+    assert(JSON.stringify(out.filter((n) => n.tag !== "sp"), (k, v) => (k === "occurrence" || k === "occurrences" ? undefined : v)) ===
+      JSON.stringify(v4.filter((n) => n.tag !== "sp"), (k, v) => (k === "occurrence" || k === "occurrences" ? undefined : v)),
+      `${name}: the body is untouched but for occurrence numbers`);
+    const delta = analyzeAlignmentDelta({ verseObjects: v4 }, { verseObjects: out });
+    assert(delta.unexpectedLosses.length === 0, `${name}: the save's alignment guard sees no collateral loss (got ${json(delta.unexpectedLosses)})`);
+    // Export then import again: the same label, words and alignment.
+    const again = nestWordLabels(usfm.toJSON(render(out)).chapters["1"]["1"].verseObjects);
+    assert(render(labelsOf(again)) === render(labelsOf(out)) && zalnIn(labelsOf(again)[2]) === zalnIn(labelsOf(out)[2]), `${name}: the edited label survives export and re-import`);
+  }
+  // The label's last word changed: it still ends the label, the \q2 still
+  // follows it, and export then import gives the same label back.
+  {
+    const last = band(v4, 2, "sp", t3.replace("Jerusalem", "Zion"));
+    const l = labelsOf(last)[2];
+    assert(headerLabelText(l) === t3.replace("Jerusalem", "Zion") && last[last.indexOf(l) + 1]?.tag === "q2", `last word changed: label text and its \\q2 kept (got ${json(headerLabelText(l))})`);
+    const again = nestWordLabels(usfm.toJSON(render(last)).chapters["1"]["1"].verseObjects);
+    const la = labelsOf(again)[2];
+    assert(headerLabelText(la) === headerLabelText(l) && again[again.indexOf(la) + 1]?.tag === "q2" && zalnIn(la) === zalnIn(l),
+      `last word changed: survives export and re-import, \\q2 right after (got ${json(headerLabelText(la))})`);
+  }
+  // The guard sees label words: dropping an aligned label word's milestone with
+  // the text unchanged is a loss it reports.
+  const stripped = v4.map((n, i) => (n === l3 ? { ...n, children: n.children.map((c) => (c.tag === "zaln" ? c.children[0] : c)) } : n));
+  assert(analyzeAlignmentDelta({ verseObjects: v4 }, { verseObjects: stripped }).beforeAligned > analyzeAlignmentDelta({ verseObjects: v4 }, { verseObjects: stripped }).afterAligned,
+    "the alignment guard counts aligned words inside a label");
+
+  // Retagging a word label to a section heading writes plain heading text (the
+  // dropdown's s1/s2/s3 take no words); deleting it removes the node.
+  const s1 = band(v1, 0, "s1", "A heading");
+  assert(s1.some((n) => n.tag === "s1" && n.type === "section" && n.content === "A heading\n" && n.children === undefined), `retag to s1: plain heading (got ${json(s1.find((n) => n.tag === "s1"))})`);
+  const del = band(v4, 1, null, "");
+  assert(labelsOf(del).length === 3 && JSON.stringify(labelsOf(del), noOcc) === JSON.stringify(labelsOf(v4).filter((_, i) => i !== 1), noOcc) && renumberTargetOccurrences(del) === del,
+    "delete removes that one label; occurrences counted again without its words");
+
+  // A plain-text label keeps today's band edit.
+  const plain = [{ tag: "sp", text: "The man\n" }, { tag: "q1", type: "quote" }, { text: "Hi", tag: "w", type: "word", occurrence: "1", occurrences: "1" }];
+  const pe = band(plain, 0, "sp", "The king");
+  assert(json(pe[0]) === json({ tag: "sp", content: "The king\n" }), `plain-text label: written as plain text (got ${json(pe[0])})`);
+}
+
+// A footnote, cross reference or character marker inside a `\sp` line is part
+// of the label (#1354 item 2): in USFM the whole line is the label. The run
+// crosses them, the label renders back byte for byte, and the body keeps only
+// body words.
+{
+  const fx = usfm.toJSON(String.raw`\c 1
+\p
+\v 1 \w Body|x-occurrence="1" x-occurrences="1"\w*.
+\sp \w The|x-occurrence="1" x-occurrences="1"\w* \w woman|x-occurrence="1" x-occurrences="1"\w*\f + \ft A note.\f* \add \w speaking|x-occurrence="1" x-occurrences="1"\w*\add* \nd \w Lord|x-occurrence="1" x-occurrences="1"\w*\nd* \k \w key|x-occurrence="1" x-occurrences="1"\w*\k* \zaln-s |x-strong="H1" x-lemma="a" x-morph="He" x-occurrence="1" x-occurrences="1" x-content="א"\*\w man|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+\q1 \w Hi|x-occurrence="1" x-occurrences="1"\w* there.
+\v 2 \w Next|x-occurrence="1" x-occurrences="1"\w*.
+\sp \add The\add* \w woman|x-occurrence="1" x-occurrences="1"\w* \x - \xo 1:1 \xt Gen 1:1\x*
+\q1 \w Go|x-occurrence="1" x-occurrences="1"\w*
+`).chapters["1"];
+  const f1 = fx["1"].verseObjects;
+  const n1 = nestWordLabels(f1);
+  const lab1 = labelsOf(n1)[0];
+  assert(labelsOf(n1).length === 1 && isWordLabelNode(lab1), "footnote/char markers: the label is nested");
+  assert(lab1.children.some((c) => c.type === "footnote") && lab1.children.some((c) => c.tag === "add") && lab1.children.some((c) => c.tag === "zaln"),
+    `the run crosses the footnote, \\add, \\nd, \\k and the milestone (got ${json(lab1.children.map((c) => c.tag ?? c.type))})`);
+  assert(n1[n1.indexOf(lab1) + 1]?.tag === "q1", "…up to the \\q1");
+  assert(render(n1) === render(f1), "footnote/char markers: renders byte-identical");
+  assert(extractPlainText(n1) === "Body. Hi there.", `footnote/char markers: plain text has no label word (got ${json(extractPlainText(n1))})`);
+  assert(headerLabelText(lab1) === "The woman speaking Lord key man", `the band shows the label's words, not the footnote (got ${json(headerLabelText(lab1))})`);
+  const f2 = fx["2"].verseObjects;
+  const n2 = nestWordLabels(f2);
+  const lab2 = labelsOf(n2)[0];
+  assert(isWordLabelNode(lab2) && lab2.children.some((c) => c.tag === "x") && n2[n2.indexOf(lab2) + 1]?.tag === "q1",
+    `a cross reference right before the \\q1 is inside the label (got ${json(n2.map((c) => c.tag ?? c.type))})`);
+  assert(render(n2) === render(f2), "cross reference: renders byte-identical");
+  assert(headerLabelText(lab2) === "The woman", `the band shows "The woman" (got ${json(headerLabelText(lab2))})`);
+  assert(json(nestWordLabels(n1)) === json(n1), "idempotent with footnotes");
+  // A character marker that holds a line marker ends the run, like a spanning
+  // milestone: such a label is not nested at all.
+  const bad = [{ tag: "sp", nextChar: " " }, { tag: "add", children: [{ text: "The", tag: "w", type: "word" }, { tag: "q1", type: "quote" }], endTag: "add*" }, { tag: "q1", type: "quote" }];
+  assert(nestWordLabels(bad) === bad, "a character marker holding a line marker: not nested");
+  // A band edit of such a label keeps its footnote.
+  const edited = editHeaderBand(n1, { index: 0, tag: "sp", text: "The woman speaking Lord key person" });
+  const el = labelsOf(edited)[0];
+  assert(el.children.some((c) => c.type === "footnote" && c.content === "+ \\ft A note."), `band edit keeps the label's footnote (got ${json(el.children.map((c) => c.tag ?? c.type))})`);
+  assert(render(labelsOf(edited)).includes("\\f + \\ft A note.\\f*") && headerLabelText(el) === "The woman speaking Lord key person", `band edit with a footnote renders it (got ${json(render(labelsOf(edited)))})`);
 }
 
 // Review round 4 of #1350. The labels are Door43's bytes: the save's quote

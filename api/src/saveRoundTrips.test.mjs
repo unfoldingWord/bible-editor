@@ -654,6 +654,56 @@ console.log("\n[isSelfLockCheckedRoute matches exactly the three hot routes]");
   eq(isSelfLockCheckedRoute("PATCH", "/api/chapters/JER/1"), false, "other book-scoped PATCH stays guarded");
 }
 
+// #1354 item 5c: a verse PATCH whose tree holds a `\sp` label written as
+// words FLAT (an empty `sp` node, its words as body words: a queued op from
+// before the nest sent by "my edit wins", or a history restore of a pre-nest
+// version) is stored nested, with plain_text re-derived without the label.
+// An already-nested save is stored exactly as sent.
+console.log("\n[verse PATCH nests a flat \\sp word label before storing (#1354)]");
+{
+  const { sqlite, req } = freshApp();
+  const w = (text, occ = "1", occs = "1") => ({ text, tag: "w", type: "word", occurrence: occ, occurrences: occs });
+  const t = (text) => ({ type: "text", text });
+  const zaln = (strong, children) => ({ tag: "zaln", type: "milestone", strong, lemma: "x", morph: "x", occurrence: "1", occurrences: "1", content: "א", children, endTag: "zaln-e\\*" });
+  const nestedTree = {
+    verseObjects: [
+      zaln("H1", [w("Wine")]), t(".\n"),
+      { tag: "sp", nextChar: " ", children: [w("The"), t(" "), zaln("H2", [w("man")]), t("\n")], endTag: "" },
+      { tag: "q1", type: "quote" }, w("He"), t(" ran."),
+    ],
+  };
+  sqlite
+    .prepare(`INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version) VALUES ('SNG', 1, 1, 'UST', ?, ?, 3)`)
+    .run(JSON.stringify(nestedTree), "Wine. He ran.");
+  // SNG is published, so locked by default: unlock it as an admin would.
+  sqlite.prepare(`INSERT INTO book_locks (book, locked) VALUES ('SNG', 0)`).run();
+  const flat = {
+    verseObjects: [
+      zaln("H1", [w("Wine")]), t(".\n"),
+      { tag: "sp", nextChar: " " }, w("The"), t(" "), zaln("H2", [w("man")]), t("\n"),
+      { tag: "q1", type: "quote" }, w("He"), t(" ran!"),
+    ],
+  };
+  const res = await req("PATCH", `/api/verses/SNG/1/1/UST`, { content: flat, plain_text: "Wine. The man He ran!" }, 3);
+  eq(res.status, 200, "flat label PATCH accepted");
+  const stored = sqlite.prepare(`SELECT content_json, plain_text FROM verses WHERE book = 'SNG' AND chapter = 1 AND verse = 1 AND bible_version = 'UST'`).get();
+  const storedVos = JSON.parse(stored.content_json).verseObjects;
+  const label = storedVos.find((n) => n.tag === "sp");
+  eq(Array.isArray(label?.children) && label.endTag === "" && storedVos.filter((n) => n.tag === "w").length === 1, true, "the flat label is stored nested, its words out of the body");
+  eq(stored.plain_text, "Wine. He ran!", "plain_text is re-derived without the label words");
+  eq(res.json?.plain_text, "Wine. He ran!", "the response carries the re-derived plain_text");
+  eq(res.json?.content?.verseObjects?.some((n) => n.tag === "sp" && Array.isArray(n.children)), true, "the response content is nested");
+
+  // Already nested: stored byte for byte as sent, plain_text as sent.
+  const nestedEdit = JSON.parse(JSON.stringify(nestedTree));
+  nestedEdit.verseObjects[nestedEdit.verseObjects.length - 1] = t(" ran away.");
+  const res2 = await req("PATCH", `/api/verses/SNG/1/1/UST`, { content: nestedEdit, plain_text: "Wine. He ran away." }, 4);
+  eq(res2.status, 200, "nested label PATCH accepted");
+  const stored2 = sqlite.prepare(`SELECT content_json, plain_text FROM verses WHERE book = 'SNG' AND chapter = 1 AND verse = 1 AND bible_version = 'UST'`).get();
+  eq(stored2.content_json, JSON.stringify(nestedEdit), "an already-nested tree is stored exactly as sent");
+  eq(stored2.plain_text, "Wine. He ran away.", "…with the plain_text as sent");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

@@ -1331,8 +1331,9 @@ export function isHeaderLabelNode(node: unknown): boolean {
 // A `\sp` speaker label written as words (#1350): Door43 en_ust Song of Songs
 // writes most labels as `\sp \w The|…\w* \w woman|…\w* …`, which usfm-js parses
 // as an EMPTY `sp` node followed by ordinary `\w` body words. Move those words
-// (with the text nodes and `\zaln` milestones between them, up to the next node
-// of any other kind or the verse end) into the `sp` node as `children`, with
+// (with the text nodes, `\zaln` milestones, footnotes and character markers
+// between them, #1354, up to the next node of any other kind or the verse end)
+// into the `sp` node as `children`, with
 // `endTag: ""`, so isHeaderLabelNode's skip covers them and usfm-js renders the
 // node back to the same bytes. Only an `sp` with no text (an empty `text`
 // counts as none and is dropped), content or children of its own is touched,
@@ -1355,7 +1356,7 @@ export function nestWordLabels(verseObjects: unknown[]): unknown[] {
       while (j < verseObjects.length) {
         const kind = labelRunKind(verseObjects[j]);
         if (kind === null) {
-          if (isZalnMilestone(verseObjects[j])) clean = false;
+          if (isLabelRunContainer(verseObjects[j])) clean = false;
           break;
         }
         words += kind;
@@ -1393,14 +1394,30 @@ function isZalnMilestone(node: unknown): boolean {
   return !!o && o["type"] === "milestone" && o["tag"] === "zaln";
 }
 
+// A footnote (usfm-js type "footnote") or a closed character/note marker
+// (`\add`, `\nd`, `\k`, `\x`: no type, endTag = tag + "*"). Part of a `\sp`
+// line, so the run crosses it (#1354). Mirror of isLabelInlineMarker in
+// web/src/lib/usfm.ts.
+function isLabelInlineMarker(o: Record<string, unknown>): boolean {
+  if (o["type"] === "footnote") return true;
+  const tag = o["tag"];
+  return o["type"] === undefined && typeof tag === "string" && o["endTag"] === `${tag}*`;
+}
+
+function isLabelRunContainer(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  return !!o && (isZalnMilestone(o) || isLabelInlineMarker(o));
+}
+
 // \w words a node adds to a label's run (0 for text), or null when it ends the
-// run: any other node, and a milestone holding anything but words/text/milestones.
+// run: any other node, and a milestone or marker holding anything but
+// words/text/milestones/markers.
 function labelRunKind(node: unknown): number | null {
   const o = node as Record<string, unknown> | null;
   if (!o) return null;
   if (o["type"] === "text") return typeof o["text"] === "string" ? 0 : null;
   if (o["type"] === "word") return o["tag"] === "w" ? 1 : null;
-  if (!isZalnMilestone(o)) return null;
+  if (!isLabelRunContainer(o)) return null;
   let words = 0;
   for (const c of (o["children"] as unknown[] | undefined) ?? []) {
     const k = labelRunKind(c);

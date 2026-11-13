@@ -865,10 +865,14 @@ Highlights that bite repeatedly:
   twice: as plain-text `{tag:"sp", text}` the whole-verse punctuation relayout blanked it (any punctuation edit in
   the verse) and the marker tiers moved the `\q1` after a verse-final label in front of it (`\q1 \sp …` opens the
   next verse inside the label); as `content` (like `\s1`) reconcile moved labels freely. A plain-text `\sp` label
-  (main's handling, untouched here) still has the blanking fault. Door43 and the export count `x-occurrence` over
-  the whole verse, label words included, so an edit to a word a label also holds renumbers the label's copy. One
-  SNG 1:4 label holds `\zaln` milestones (label words aligned on Door43); they ride along untouched. A header-band
-  edit of a word label writes plain `\sp text` (the words are dropped).
+  followed by a line marker is held aside the same way (#1354; shown to the engine it was blanked, or dropped by an
+  edit across it), and any edit that would drop or change a `\sp` label's text is refused (`label-lost`). Door43
+  and the export count `x-occurrence` over the whole verse, label words included, so an edit to a word a label
+  also holds renumbers the label's copy (intended, pinned). One SNG 1:4 label holds `\zaln` milestones (label words
+  aligned on Door43); they ride along untouched. A header-band edit of a word label (`editHeaderBand`) runs the
+  edit engine on the label's own words, so unchanged words keep their `\w` attributes and alignment. The label run
+  crosses footnotes and character markers (the whole `\sp` line is the label), and a verse PATCH nests a flat label
+  sent by an old queued op or a history restore.
 - **The Playwright suite re-imports ZEC on every run** (`tests/concurrency/global-setup.ts`), so a row you change in
   local D1 for a live test is overwritten before the test starts. Run a one-off spec with a config that spreads
   `playwright.config.ts` and sets `globalSetup: undefined` (measured 2026-11-12).
