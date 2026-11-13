@@ -494,6 +494,94 @@ console.log("\n[#1348: a Door43 'Merge branch master' over our export does not r
   eq(counts.merge_adopted, 0, "…no adoption is counted");
 }
 
+console.log("\n[#1351: a merge whose export is only an ancestor, or that equals our export, does not replace a later app edit]");
+{
+  // Two more shapes of the #1348 journey, through the real lineage evidence
+  // and the real applyVerseRows.
+  //   ancestor: the editor's "Merge branch 'master'" has master's tip at that
+  //     moment (another book's export) as its second parent; our EZK export is
+  //     only an ancestor of it. Its first-parent diff still carries 48:13.
+  //   equal: the merge's EZK file is byte-identical to our export (the editor
+  //     touched other books only; Gitea lists a merge's files against its
+  //     first parent, so the ledger still matches it to 26-EZK.usfm), and it
+  //     is the only human commit in the window.
+  const MERGE = "1088141100000000000000000000000000000000";
+  const HUMAN = "c20a06c500000000000000000000000000000000";
+  const EXPORT = "3aea90c600000000000000000000000000000000";
+  const TIP = "c151f0d600000000000000000000000000000000"; // master's tip: our JER export
+  const BASE = "11c6654a00000000000000000000000000000000";
+  const PATH = "26-EZK.usfm";
+  const SINCE = Math.floor(Date.parse("2026-11-12T00:00:00Z") / 1000);
+  const usfm = (v2, v13) =>
+    ["\\id EZK", "\\c 47", "\\v 1 one", `\\v 2 ${v2}`, "\\c 48", "\\v 12 twelve", `\\v 13 ${v13}`, "\\v 14 fourteen", ""].join("\n");
+  const OLD = "about 13.5 kilometers";
+  const EXPORTED = "13.5 kilometers in length [(east to west)]";
+  const APP = "13.5 kilometers in length {(east to west)}";
+  const hdr = [`diff --git a/${PATH} b/${PATH}`, `--- a/${PATH}`, `+++ b/${PATH}`];
+  const mergeDiff = [...hdr, "@@ -7 +7 @@", `-\\v 13 ${OLD}`, `+\\v 13 ${EXPORTED}`, ""].join("\n");
+  const body = (b) => ({ ok: true, headers: { get: () => null }, arrayBuffer: async () => new TextEncoder().encode(b).buffer });
+  const gitea = (sha, message, date, parents) => ({
+    sha,
+    commit: { message, author: { email: "e@example.org", name: "n", date }, committer: { date } },
+    parents: parents.map((p) => ({ sha: p })),
+  });
+  const list = (arr) => ({ ok: true, headers: { get: (k) => (k.toLowerCase() === "x-hasmore" ? "false" : null) }, json: async () => arr });
+  const exportCommit = { sha: EXPORT, message: "bible-editor: EZK ust → master (#4886)", authorEmail: "editor@example.org", parentSha: BASE, allParentShas: [BASE] };
+
+  const journey = async (label, mergeParents, mergeText) => {
+    const texts = { [BASE]: usfm("two", OLD), [HUMAN]: usfm("two", OLD), [EXPORT]: usfm("two", EXPORTED), [MERGE]: mergeText };
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes(`commits?sha=${TIP}&path=`)) return list([gitea(EXPORT, exportCommit.message, "2026-11-12T19:18:36Z", [BASE])]);
+      if (u.includes(`commits?sha=${HUMAN}&path=`)) return list([]);
+      if (u.includes(`${MERGE}.diff`)) return body(mergeDiff);
+      for (const [sha, t] of Object.entries(texts)) if (u.includes(`ref=${sha}`)) return body(t);
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+    let lineage;
+    try {
+      const commits = [
+        { sha: MERGE, message: "Merge branch 'master' of git.door43.org:unfoldingWord/en_ust", authorEmail: "rich.mahn@unfoldingword.org", parentSha: mergeParents[0], allParentShas: mergeParents },
+        exportCommit,
+      ].map(classifyMasterCommit);
+      const humans = commits.filter((c) => c.kind === "human");
+      const oursShas = commits.filter((c) => c.kind === "ours").map((c) => c.sha);
+      const humanRefs = await fetchHumanTouchedRefs({}, "en_ust", PATH, humans, oursShas, { sinceTime: SINCE });
+      lineage = compactLineage(summarizeLineage(commits, { incomplete: false, incompleteReason: "", humanRefs }));
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(lineage.mayHoldHumanEdit, true, `${label}: the file-level answer still says a human moved the file`);
+    const { env, sqlite } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (36, 36, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+         VALUES (?, 48, 13, NULL, ?, ?, ?, 9, 36)`,
+      )
+      .run(BOOK, VERSION, contentJson(APP), APP);
+    const boundary = Number(
+      sqlite
+        .prepare(
+          `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+           VALUES ('verse', ?, ?, 'update', ?, 100)`,
+        )
+        .run(`${BOOK}/48/13/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson(OLD)) })).lastInsertRowid,
+    );
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(48, 13, EXPORTED)], null,
+      { confirmedAt: 200, editId: boundary, lineage }, false,
+    );
+    const row = sqlite.prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 48 AND verse = 13").get(BOOK);
+    eq(row.content_json, contentJson(APP), `${label}: the translator's later app edit survives`);
+    eq(counts.merge_adopted, 0, `${label}: …no adoption is counted`);
+  };
+  // The merge also fixes 47:2 itself, so its evidence is a real ref set.
+  await journey("ancestor", [HUMAN, TIP], usfm("two \\b fixed", EXPORTED));
+  await journey("equal", [HUMAN, EXPORT], usfm("two", EXPORTED));
+}
+
 console.log("\n[#537: a content-bearing 'baseline' edit_log row recovers an ancestor the id boundary alone would miss]");
 {
   // pipelineImport.ts writes an action='baseline' row holding the pre-AI
