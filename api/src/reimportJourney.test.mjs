@@ -53,6 +53,7 @@ import { contentPatchClearClauses } from "./contentPatchClauses.ts";
 import { lintTqRows } from "./lint.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 import { BRIDGE_DELETE_NEXT_SQL, BRIDGE_UPDATE_START_SQL } from "./verseBridge.ts";
+import { classifyMasterCommit, compactLineage, summarizeLineage } from "./masterLineage.ts";
 
 // ── Hermetic clock ─────────────────────────────────────────────────────────
 // Every merge_no_base / auto-clear block below seeds its walk windows RELATIVE
@@ -5854,7 +5855,7 @@ console.log("\n[#1347: a preserved note takes a person's Door43 fix, never the A
   // never mapped (the refine cap is 3), and no AI push in the window.
   const HUMAN = {
     mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
-    counts: { ours: 1, ai: 0, human: 6 }, humanShas: ["bff360f4"],
+    counts: { ours: 1, ai: 0, human: 6 }, humanUnsure: 0, humanShas: ["bff360f4"],
     refsComplete: false, humanRefs: [], refsReason: "too_many_human_commits",
   };
   const AI_ONLY = {
@@ -6028,6 +6029,66 @@ console.log("\n[#1347: a preserved note takes a person's Door43 fix, never the A
     eq(row.review_kind, "merge_no_base", "(5b) …and flagged, so the Door43 fix is not lost silently");
     eq(counts.merge_no_base, 1, "(5b) …counted as merge_no_base");
     eq(counts.preserved_held, 0, "(5b) …not as preserved_held (the author was known)");
+  }
+
+  // (7) Review F1/F2: the classifier's `human` is a catch-all. For a preserved
+  //     row only a POSITIVELY human window lets master through; a bot-address
+  //     commit with no pipeline shape, an ai@ commit, or a maintainer's revert
+  //     of our own export (which would roll the note back to pre-export text)
+  //     keeps D1 and flags. Lineages built through the real classifier and
+  //     compactLineage, the way both lineage sources build them.
+  {
+    const ours = { sha: "o1", message: "bible-editor: EZK tn → master (#6711)", authorEmail: "pr-author@example.org" };
+    const person = { sha: "p1", message: "Puts a ; after one Alternate translation", authorEmail: "richard@example.org" };
+    const build = (...commits) => compactLineage(summarizeLineage(commits.map(classifyMasterCommit)));
+    for (const [label, other, expectHeld] of [
+      ["a person's commit", person, false],
+      ["bot@ with no pipeline shape", { sha: "b1", message: "Fix intro formatting", authorEmail: "bot@unfoldingword.org" }, true],
+      ["ai@unfoldingword.org", { sha: "a1", message: "Update tn_EZK.tsv", authorEmail: "ai@unfoldingword.org" }, true],
+      ["revert of our export", { sha: "r1", message: 'Revert "bible-editor: EZK tn → master (#6711)" (#6716)', authorEmail: "richard@example.org" }, true],
+    ]) {
+      const { sqlite, env } = freshEnv();
+      const boundary = seed(sqlite);
+      const lineage = build(ours, other);
+      eq(lineage.counts.ai, 0, `(7 ${label}) the classifier counts no AI commit (the gap this closes)`);
+      const counts = await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+        confirmedAt: 200, editId: boundary, lineage,
+      });
+      const row = readRow(sqlite);
+      if (expectHeld) {
+        eq(row.note, BASE, `(7 ${label}) the preserved note is NOT overwritten`);
+        eq(row.review_kind, "merge_no_base", `(7 ${label}) …and is flagged for review`);
+        eq(counts.preserved_held, 1, `(7 ${label}) …counted as preserved_held`);
+      } else {
+        eq(row.note, RICHARD, `(7 ${label}) a positively human commit is adopted`);
+        eq(row.review_kind, null, `(7 ${label}) …unflagged`);
+      }
+    }
+  }
+
+  // (8) Review F3: a note held on an earlier night ("Kept this preserved
+  //     note's text…") that a later night adopts as a person's fix must not keep
+  //     a flag saying the editor's text was kept. Only that flavor is cleared.
+  {
+    const HELD = "Kept this preserved note's text, and Door43 has a different version. (earlier night)";
+    for (const [label, kind, reason, expectKind] of [
+      ["held flavor", "merge_no_base", HELD, null],
+      ["generic merge_no_base", "merge_no_base", "Nothing was overwritten. Check this row against Door43's version…", "merge_no_base"],
+    ]) {
+      const { sqlite, env } = freshEnv();
+      const boundary = seed(sqlite, { reviewKind: kind });
+      sqlite.prepare(`UPDATE tn_rows SET review_reason = ? WHERE id = 'ytm6'`).run(reason);
+      await applyTsvRows(env, BOOK, "tn", [masterTn(RICHARD)], null, {
+        confirmedAt: 200, editId: boundary, lineage: HUMAN,
+      });
+      const row = readRow(sqlite);
+      eq(row.note, RICHARD, `(8 ${label}) the person's fix is adopted`);
+      eq(row.review_kind, expectKind, `(8 ${label}) review_kind afterwards`);
+      if (expectKind == null) {
+        eq(row.review_reason, null, `(8 ${label}) …reason cleared`);
+        eq(row.review_master_json, null, `(8 ${label}) …snapshot cleared`);
+      }
+    }
   }
 
   // (6) A Door43 editor moved the preserved row's reference AND edited its

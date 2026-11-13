@@ -428,7 +428,7 @@ console.log("\n[#1347: preservedRowMasterAuthor]");
   const AT = [{ chapter: 40, verse: 6 }];
   const base = {
     mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
-    counts: { ours: 1, ai: 0, human: 6 }, humanShas: ["bff360f4"],
+    counts: { ours: 1, ai: 0, human: 6 }, humanUnsure: 0, humanShas: ["bff360f4"],
   };
   // Richard's shape: six human commits, so the per-verse refs were never mapped
   // (LINEAGE_REFINE_MAX_HUMAN_COMMITS is 3). No AI commit in the window proves
@@ -465,6 +465,13 @@ console.log("\n[#1347: preservedRowMasterAuthor]");
   // The raw (uncompacted) lineage carries no counts, so it cannot prove "no AI".
   eq(preservedRowMasterAuthor({ commits: [], hasHumanCommit: true, incomplete: false, incompleteReason: "" }, AT),
     "unknown", "a raw MasterLineage (no summary) -> unknown");
+  // Review F1/F2: "human" is the classifier's catch-all. For a preserved row,
+  // every human-counted commit must be POSITIVELY human (humanUnsure === 0).
+  eq(preservedRowMasterAuthor({ ...base, humanUnsure: 1 }, AT),
+    "unknown", "a human-counted commit that is not positively human (bot address, revert of our export) -> unknown");
+  eq(preservedRowMasterAuthor({ ...base, humanUnsure: undefined }, AT),
+    "unknown", "humanUnsure absent (summary from before this field) -> unknown");
+  eq(preservedRowMasterAuthor({ ...base, humanUnsure: "0" }, AT), "unknown", "humanUnsure malformed -> unknown");
   // Either ref keeps the row out of no_human: master's ref OR D1's.
   eq(preservedRowMasterAuthor({ ...base, refsComplete: true, humanRefs: ["40:6"] }, [{ chapter: 41, verse: 1 }, { chapter: 40, verse: 6 }]),
     "human", "a human ref at D1's ref (not master's) still keeps the row out of no_human");
