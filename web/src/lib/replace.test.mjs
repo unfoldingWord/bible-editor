@@ -3820,9 +3820,7 @@ function countAllMilestones(nodes) {
     assert(extractEditableText(d.content) === wantEditable, `${label} (unaligned draft): ${JSON.stringify(wantEditable)} (got ${JSON.stringify(extractEditableText(d.content))})`);
   };
   // The issue's repro: `name` is unchanged, so the break stays after it.
-  // (Since #1369 the new words are laid right after the break, and the space
-  // the range rebuild re-lays goes before it, as for `the name this` below.)
-  run("name this -> name of that", "name this", "name of that", "my name \\q1 of that set.", "my:H0|name:H1|of:|that:|set:H3");
+  run("name this -> name of that", "name this", "name of that", "my name\\q1 of that set.", "my:H0|name:H1|of:|that:|set:H3");
   // `this` is unchanged, so the break stays before it. (The range rebuild
   // takes this seam since #1361 and writes the space it re-lays before the
   // break; the localized rewrite wrote none.)
@@ -3967,14 +3965,13 @@ function countAllMilestones(nodes) {
   }
   // The same replace when the stored plain text is stale (the lockstep walk
   // misses and the occurrence count runs): no exact result can be checked in
-  // the stored text's terms, so the result is the range rebuild's, never the
-  // flat rebuild. Since #1369 that lays the new words after the break, where
-  // `And` was (it used to save `throne. So then\q1 he`).
+  // the stored text's terms, so the result is main's, never the flat rebuild.
+  // Pinned as main's result, not as the right one.
   {
     const stale = plain.replace("Yahweh", "Yahwe");
     const r = findReplaceVerse(clone(v613), stale, /throne\. And/g, stale.indexOf(find), find.length, "throne. So then");
     const ed = extractEditableText(r.content);
-    assert(ed.includes("throne. \\q1 So then he will be"), `stale stored text: the break stays after "throne." (got ${JSON.stringify(ed)})`);
+    assert(ed.includes("throne. So then\\q1 he will be"), `stale stored text: main's result (got ${JSON.stringify(ed)})`);
     assert(markers(r.content) === markers(v613), `stale stored text: every line marker survives`);
     assert(sig(r.content) === wantSig, `stale stored text: alignment as main (got ${sig(r.content)})`);
   }
@@ -4682,13 +4679,47 @@ function countAllMilestones(nodes) {
     /use in wars;\s*\\q1 “the great king rules/, ["Your"]);
   check("item 3, wars. “Your -> wars; “the great", opener, "wars. “Your", "wars; “the great",
     /use in wars;\s*\\q1 “the great king rules/, ["Your"]);
-  // The same rule with no opener (this used to save `wars; The great\q1 king`),
-  // and its mirror: new words for an old word before the break stay before it.
+  // The rule is for an opener only. With no opener the new words may belong
+  // on the line before the break (`throne. \q1 And he` -> `throne for ever;
+  // he`), so they keep main's anchoring: pinned as main's results.
   const plainBreak = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1(), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.")] };
-  check("item 3 without an opener, wars. Your -> wars; The great", plainBreak, "wars. Your", "wars; The great",
-    /use in wars;\s*\\q1 The great king rules/, ["Your"]);
+  check("item 3 without an opener (main's result), wars. Your -> wars; The great", plainBreak, "wars. Your", "wars; The great",
+    /use in wars; The great\\q1 king rules/, ["Your"]);
+  check("item 3 without an opener (main's result), wars. Your king -> wars and battles; the king", plainBreak, "wars. Your king",
+    "wars and battles; the king", /use in wars and battles; the \\q1 king rules/, ["Your"]);
   check("item 3 mirror, wars. Your -> great fights; Your", plainBreak, "wars. Your", "great fights; Your",
     /use in great fights;\s*\\q1 Your king rules/, ["wars"]);
+  {
+    const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+    const v613 = { verseObjects: zecUlt.chapters["6"]["13"].verseObjects };
+    // The verse holds other aligned `And`s, so count: exactly one word (the
+    // replaced `And`) leaves its milestone.
+    const label = "item 3 without an opener, ZEC 6:13 ULT throne. And he -> throne for ever; he";
+    const r = run(v613, "throne. And he", "throne for ever; he");
+    const ed = extractEditableText(r.content);
+    assert(markers(r.content) === markers(v613) && /his throne for ever; \\q1 he will be a priest/.test(ed), `${label}: break stays before "he" (got ${JSON.stringify(ed)})`);
+    const before = strongsOf(v613);
+    const after = strongsOf(r.content);
+    const left = [...before];
+    const extra = after.filter((s) => { const i = left.indexOf(s); if (i < 0) return true; left.splice(i, 1); return false; });
+    assert(extra.length === 0 && left.length === 1 && left[0].startsWith("And:"), `${label}: only the replaced And unaligned (lost ${JSON.stringify(left)}, extra ${JSON.stringify(extra)})`);
+  }
+  // Marker offsets are read on the tree before the pairing rewrites a leaf:
+  // an earlier 1:1 swap that changes a word's length (`A` -> `Mighty`) must
+  // not shift the `\q2` into a later gap.
+  const q2 = { tag: "q2", nextChar: " ", type: "quote" };
+  const shifted = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), q1(), zaln("H2", [w("A")]), t(" "), q2,
+    zaln("H3", [w("king")]), t(". "), zaln("H4", [w("His")]), t(" "), zaln("H5", [w("reign")]), t(" ends.")] };
+  const markers2 = (content) => content.verseObjects.filter((n) => n && (n.tag === "q1" || n.tag === "q2")).length;
+  for (const [find, replacement, wantRe] of [
+    ["wars. A king. His reign", "wars; Mighty king; the great reign", /use in wars; \\q1 Mighty \\q2 king; the great reign ends/],
+    ["wars. A king. His reign", "wars; Mighty king; “the great reign", /use in wars; \\q1 Mighty \\q2 king; “the great reign ends/],
+  ]) {
+    const r = run(shifted, find, replacement);
+    const ed = extractEditableText(r.content);
+    assert(markers2(r.content) === 2 && wantRe.test(ed), `marker offsets, ${find} -> ${replacement}: markers in place (got ${JSON.stringify(ed)})`);
+    onlyUnaligned(`marker offsets, ${find} -> ${replacement}`, shifted, r.content, ["A", "His"]);
+  }
 
   // Item 4: typed saves in a verse the reassembly cannot rebuild (a `\qs`
   // wrapper), so the edit takes the diff tiers. Outcome pins: the typed
