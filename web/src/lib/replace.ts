@@ -1180,6 +1180,38 @@ function smartRebuildRange(
   if (units.some((u) => u.leaves.length === 0)) return null; // a word with no \w leaf
 
   const link = lcsLink(matchWords, replaceWords);
+  // A word whose only change is its case (`Your` -> `your`) stays in its own
+  // leaf, rewritten and unaligned like the preserve path's edits, instead of
+  // being dropped and re-inserted beside the nearest exact survivor: that put
+  // a word from after a line break before it (`wars; your\q1 king`, #1360).
+  // Exact links win; only the words between two of them are paired, and only
+  // a one-leaf unit that spells its token.
+  const recased = new Set<number>();
+  const fold = (s: string) => s.toLowerCase();
+  let prevOld = -1;
+  for (let j = 0; j < replaceWords.length; j++) {
+    if (link[j] >= 0) {
+      prevOld = link[j];
+      continue;
+    }
+    let nextJ = j;
+    while (nextJ < replaceWords.length && link[nextJ] < 0) nextJ++;
+    const nextOld = nextJ < replaceWords.length ? link[nextJ] : matchWords.length;
+    const gapOld = Array.from({ length: nextOld - prevOld - 1 }, (_, i) => prevOld + 1 + i);
+    const sub = lcsLink(gapOld.map((k) => fold(matchWords[k])), replaceWords.slice(j, nextJ).map(fold));
+    sub.forEach((g, i) => {
+      const k = g >= 0 ? gapOld[g] : -1;
+      if (k < 0 || units[k].leaves.length !== 1 || String(units[k].leaves[0].node["text"]) !== matchWords[k]) return;
+      link[j + i] = k;
+      recased.add(j + i);
+    });
+    j = nextJ - 1; // the loop's next step is the exact link at nextJ (or the end)
+  }
+  for (const j of recased) {
+    const leaf = units[link[j]].leaves[0].node;
+    leaf["text"] = replaceWords[j];
+    leaf["__edited"] = true;
+  }
   if (!link.some((x) => x >= 0)) return null; // no survivor → fall back
   const consumed = new Set<number>(link.filter((x) => x >= 0));
   const gaps = nonWordGaps(replaceText); // m+1 gaps; gaps[j] precedes word j
@@ -1419,9 +1451,11 @@ export function smartReplaceVerse(
 // line marker or the verse end ("label-shape"). The count alone is not enough:
 // removing the `\q2` before a label and adding one after it keeps the count
 // but shifts every ordinal, so the label landed mid-speech. Nor is the
-// engine's own marker placement: a find/replace "bedroom. We" -> "bedroom; we"
-// saves "we" before the next line break (main does the same, ZEC 9:10 UST),
-// which here would put a word of the speech in front of its label. A verse with
+// engine's own marker placement: at a line marker with no text beside it,
+// find/replace "home He" -> "home; he" saves "he" before the line break,
+// which here would put a word of the speech in front of its label (the same
+// move at a marker with text beside it, ZEC 9:10 UST "wars. Your" -> "wars;
+// your", was fixed in smartRebuildRange, #1360). A verse with
 // no word label runs the engine exactly as before.
 function isTopLineMarker(n: unknown): boolean {
   return isInFlowMarker(n) && !isCharacterWrapper(n);
