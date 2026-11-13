@@ -4696,6 +4696,9 @@ function countAllMilestones(nodes) {
     /use in great fights;\s*\\q1 “Your king rules/, ["wars"]);
   check("#1371 mirror with an opener, wars. “Your king -> great fights; “Your king", opener, "wars. “Your king", "great fights; “Your king",
     /use in great fights;\s*\\q1 “Your king rules/, ["wars"]);
+  const twoOpener = { verseObjects: [t("use in "), zaln("H1", [w("wars")]), t(".\n"), b(), q1("“"), zaln("H2", [w("Your"), t(" "), w("king")]), t(" rules.”")] };
+  check("#1371 mirror with two markers, wars. “Your -> great fights; “Your", twoOpener, "wars. “Your", "great fights; “Your",
+    /use in great fights;\s*\\b\s*\\q1 “Your king rules/, ["wars"]);
   // Guards, pinned as main's results: the real verse (already right on
   // main), dropped words that straddle the break, and a replacement that
   // drops the opener.

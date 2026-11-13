@@ -1359,11 +1359,28 @@ function smartRebuildRange(
     const m = topMarkers.filter((x) => x.at >= from && x.at <= to).pop();
     return m && opensWith(raw.slice(m.at, to)) ? m.node : null;
   };
+  // The mirror (#1371): new words with no kept word before them, replacing
+  // old words that all sat before such a marker, go right before it (the
+  // first one at that offset) when the replacement keeps the line's opener
+  // right before the first kept word after it (`wars. \q1 “Your king` ->
+  // `great fights; “Your king` saved `\q1 great fights; “Your king`).
+  const markerAfter = (j: number): Record<string, unknown> | null => {
+    let jR = j + 1;
+    while (jR < replaceWords.length && link[jR] < 0) jR++;
+    const oldR = jR < replaceWords.length ? link[jR] : -1;
+    if (oldR < 1) return null; // no kept word after, or no old word dropped before it
+    const from = tokens[oldR - 1].end;
+    const to = tokens[oldR].start;
+    const m = topMarkers.find((x) => x.at >= from && x.at <= to);
+    const lead = m ? raw.slice(m.at, to).trim() : "";
+    return m && opensWith(lead) && splitGapAtMarker(gaps[jR]).rest.trim() === lead ? m.node : null;
+  };
   for (const nw of newWords) {
     let anchor: Record<string, unknown> | null = markerBefore(nw.j);
     let key = "__insAfter";
     if (!anchor)
       for (let j2 = nw.j - 1; j2 >= 0; j2--) if (link[j2] >= 0) { const u = units[link[j2]]; anchor = u.leaves[u.leaves.length - 1].node; key = "__insAfter"; break; }
+    if (!anchor) { anchor = markerAfter(nw.j); key = "__insBefore"; }
     if (!anchor) for (let j2 = nw.j + 1; j2 < replaceWords.length; j2++) if (link[j2] >= 0) { const u = units[link[j2]]; anchor = u.leaves[0].node; key = "__insBefore"; break; }
     if (!anchor) return null; // unreachable (survivor exists) — be safe
     const list = (anchor[key] as unknown[] | undefined) ?? [];
@@ -1449,6 +1466,7 @@ function smartRebuildRange(
       // bare text node BEFORE it (so a trailing comma stays on the previous
       // line), then the marker verbatim. Its trailing gap leads the next word.
       if (o && isInertLineBreakMarker(o)) {
+        if (Array.isArray(o["__insBefore"])) for (const nw of o["__insBefore"] as Record<string, unknown>[]) pushWord(out, nw);
         if (o["__markerClosing"]) out.push({ type: "text", text: o["__markerClosing"] });
         out.push(stripRebuildMarks(o));
         if (Array.isArray(o["__insAfter"])) for (const nw of o["__insAfter"] as Record<string, unknown>[]) pushWord(out, nw);
