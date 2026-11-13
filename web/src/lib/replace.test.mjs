@@ -4263,15 +4263,18 @@ function countAllMilestones(nodes) {
     const warn = console.warn;
     console.warn = () => {};
     try {
-      // "bedroom. We" -> "bedroom; we": the engine (as on main, ZEC 9:10 UST
-      // "wars. Your" -> "wars; your") saves "we" at the end of the previous
-      // line, which here would put it before the label: "bedroom; we \sp The
-      // woman… \q1 are very happy". So it is refused, labels and text kept.
+      // "bedroom. We" -> "bedroom; we": before #1360 the engine saved "we" at
+      // the end of the previous line, in front of the label ("bedroom; we \sp
+      // The woman… \q1 are very happy"), so this was refused. The recased
+      // word now keeps its place after the `\q1`, so the replace saves, the
+      // label still between "bedroom;" and "we".
       const at = p4.indexOf("bedroom. We");
       const f = findReplaceVerse(clone(v4), p4, /bedroom\. We/g, at, 11, "bedroom; we");
       const fText = extractPlainText(f.content);
-      assert(f.labelRefusals === 1 && fText === p4 && labels(f.content) === labels(v4),
-        `find across a label that would move "we" in front of it: refused, verse kept (got ${JSON.stringify(fText.slice(90, 140))})`);
+      const fUsfm = render(f.content);
+      assert(!f.labelRefusals && fText === p4.replace("bedroom. We", "bedroom; we") && labelWords(f.content) === labelWords(v4) && anchors(f.content) === anchors(v4) &&
+        /bedroom\|[^\n]*\\zaln-e\\\*; \\sp /.test(fUsfm) && /\n\\q1 \\w we\|/.test(fUsfm),
+        `find across a label that recases the word after it: saved, label still before "\\q1 we" (got ${JSON.stringify(fText.slice(90, 140))})`);
       const old = extractEditableText(v4);
       const d = smartEditVerse(clone(v4), old, old.replace("to your home. \\q1 He is like", "like"), { capturedFromDom: true });
       assert(labels(d.content) === labels(v4) && d.labelRefused === true && d.content.verseObjects === v4.verseObjects || (d.labelRefused === true && labels(d.content) === labels(v4)),
@@ -4418,6 +4421,15 @@ function countAllMilestones(nodes) {
     const kept = before.filter((s) => !recased.some((x) => s.toLowerCase().startsWith(`${x.toLowerCase()}:`)));
     assert(kept.every((s) => after.includes(s)) && after.length === before.length - recased.length,
       `aligned ${find} -> ${replacement}: only ${recased.join(", ")} unaligned (before ${JSON.stringify(before)}, after ${JSON.stringify(after)})`);
+  }
+  // An exact match wins over a case-only one: deleting `the` from `the The
+  // cat` must keep the untouched `The` (H2) aligned, not recase `the` (H1)
+  // into its place.
+  {
+    const dup = { verseObjects: [zaln("H1", [w("the")]), t(" "), zaln("H2", [w("The")]), t(" "), zaln("H3", [w("cat")]), t(".")] };
+    const r = run(dup, "the The cat.", "The cat;");
+    assert(extractPlainText(r.content) === "The cat;" && JSON.stringify(strongsOf(r.content)) === JSON.stringify(["The:H2", "cat:H3"]),
+      `the The cat. -> The cat;: exact survivors keep their alignment (got ${JSON.stringify(extractPlainText(r.content))} ${JSON.stringify(strongsOf(r.content))})`);
   }
   // Replace all takes the same path.
   {

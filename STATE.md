@@ -217,6 +217,11 @@ Highlights that bite repeatedly:
   (`name\q1 this;set`), as on main (#1321): the stripped text reads `name;this` for both `name;\q1 this` and
   `name\q1 ;this`, so the edit is the stripped-only space -> `;`, which takes Case 87's typed fallback (the next raw
   space). A `,` diffs differently and is fine.
+  `smartRebuildRange` must link a word whose only change is its case (`Your` -> `your`) as a survivor kept in its own
+  leaf (#1360): its exact-match LCS read it as a new word and anchored it to the nearest exact survivor, so
+  `wars. Your` -> `wars; your` saved `wars; your\q1 king`, and `isExactReplace` let it through because a marker
+  between two "changed" words may sit anywhere. Exact links still win (`the The cat` -> `The cat` keeps `The`).
+  A bare marker, a marker carrying an opener, and a swapped word still move or drop the break (#1361).
 
 - **A line marker with no text node on either side (`H1[say] \q1 H2[The]`) puts a space in the stripped text that
   the tree does not have (#1286).** `stripMarkerTokens` adds it so the two words don't fuse, so the engine diffs
@@ -855,7 +860,8 @@ Highlights that bite repeatedly:
   find/replace counts it) when it changes the number of line markers in a labelled verse, or when a label's
   marker no longer sits between the same body words (compared case- and punctuation-blind): a count check alone
   let "remove the `\q2` before a label, add one after it" put the label mid-speech, and the engine's own
-  "wars. Your" -> "wars; your" move (main does it too) would put a word of the speech before its label. Showing the engine the label instead failed
+  marker moves would put a word of the speech before its label (`home He` -> `home; he` at a bare marker still
+  does, #1361; the "wars. Your" -> "wars; your" move was fixed in #1360). Showing the engine the label instead failed
   twice: as plain-text `{tag:"sp", text}` the whole-verse punctuation relayout blanked it (any punctuation edit in
   the verse) and the marker tiers moved the `\q1` after a verse-final label in front of it (`\q1 \sp …` opens the
   next verse inside the label); as `content` (like `\s1`) reconcile moved labels freely. A plain-text `\sp` label
