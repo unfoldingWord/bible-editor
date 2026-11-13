@@ -233,6 +233,14 @@ export interface MasterCommit {
    */
   allParentShas?: string[];
   /**
+   * Issue #1349: whether the source's parent list was COMPLETE and well formed
+   * ("complete": an array whose every entry carried a sha) or held a malformed
+   * entry ("malformed"). `allParentShas` silently drops a malformed entry, so
+   * a merge can read as single-parent there; a reader proving ancestry reads
+   * parents only when this says "complete". Absent means not checked.
+   */
+  parentsCheck?: "complete" | "malformed";
+  /**
    * In-repo paths the commit touched, from the list endpoint's own
    * `files=true`. Requested only by callers that pass `{ files: true }` to
    * listMasterCommitsSince; undefined means "not requested", null means
@@ -1740,4 +1748,13 @@ export function masterMayHoldHumanEditForVerse(
   if (ev.refs.length === 0) return true;
   for (let v = verse; v <= end; v++) if (refEvidenceTouches(ev.refs, chapter, v)) return true;
   return false;
+}
+
+// Issue #1349: a parent list that proves something. Every entry a non-empty
+// sha with no whitespace, or the whole list is unknown (null). An empty list
+// comes back empty; the caller decides what a root means to it.
+export function completeParentList(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  for (const s of value) if (typeof s !== "string" || !/^\S+$/.test(s)) return null;
+  return value as string[];
 }

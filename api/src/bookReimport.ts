@@ -51,6 +51,7 @@ import {
   fetchText,
   fetchDcsMasterTextVerified,
   fetchHumanTouchedRefs,
+  fetchCommitParents,
   listMasterCommitsSince,
   repoHeadCommitSha,
   NT_BOOKS,
@@ -77,6 +78,7 @@ import { DCS_POLL_FETCH_TIMEOUT_MS } from "./dcsCommitPoll.ts";
 import {
   findOurMergeForPr,
   gitBlobShaOrNull,
+  judgeLineageStampAncestry,
   judgeOwnPublishDecline,
   recognizeOwnPublish,
   type OwnPublishDeclineVerdict,
@@ -4745,7 +4747,9 @@ async function loadMasterLineage(
         incomplete: false,
         incompleteReason: "",
       };
-      if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt, stats, pinnedSha);
+      if (ownDecline) {
+        await accountOwnPublishDecline(env, book, resource, file, ledgerPage, ownDecline, observedAt, stats, pinnedSha, ledger.repoParents);
+      }
       const humans = classified.filter((c) => c.kind === "human");
       let humanRefs: HumanRefEvidence | null = null;
       if (humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
@@ -9122,6 +9126,18 @@ async function recognizePushedRender(raw: string, sync: ResourceSyncState): Prom
 // absent-measurement-as-evidence mistake this codebase has a standing rule
 // against. Best-effort throughout: this is observability, and it must never fail
 // a sync that is otherwise doing its job correctly.
+// #1349: Door43 reads one #658 stamp may spend on parent lookups when the walk
+// holds a human commit (judgeLineageStampAncestry). Each read is one commit's
+// own parents: one subrequest, timed out at DCS_POLL_FETCH_TIMEOUT_MS, and the
+// first failure ends the judgment, so a hanging Door43 costs one timeout.
+// Measured needs on the live path (2026-11-12/13): 2CH twl 12 (1 above our
+// merge, 11 for the chain of other books' exports back to #1012 below it),
+// EZK tn night 1: 15 (6 above, 9 below). Past the cap the stamp is withheld,
+// never assumed. 20 reads is 20 subrequests per declined (book, resource)
+// pair, the same ceiling the earlier cut (10 reads of up to 2 subrequests
+// each) was sized to. From the ledger the chain is free.
+const MAX_LINEAGE_ANCESTRY_READS = 20;
+
 async function accountOwnPublishDecline(
   env: Env,
   book: string,
@@ -9137,6 +9153,9 @@ async function accountOwnPublishDecline(
   // not pin its file and keeps the unpinned behavior; `null` means it pinned
   // but the sha is unknown, which proves nothing.
   pinnedSha?: string | null,
+  // #1349: the ledger's recorded parents for every repo commit in its window
+  // (readLedgerMasterLineage's repoParents), when the walk came from it.
+  repoParents?: ReadonlyMap<string, readonly string[] | null>,
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   try {
@@ -9225,13 +9244,15 @@ async function accountOwnPublishDecline(
       return;
     }
     if (judged.verdict === "preserved") {
-      // #658: a preserved own merge plus a complete human-free walk proves the
-      // pushed render is a safe ancestor even though a later AI commit made the
-      // current whole-file bytes differ. Use the pushed render's captured edit
-      // boundary, never an edit id observed during reimport. This happens before
-      // getMasterConfirmedAt is re-read for chunk apply, so tonight's merge can
-      // recover the newly confirmed ancestor. Absent/incomplete/human evidence
-      // deliberately declines to the existing conservative behavior.
+      // #658: a preserved own merge plus a complete walk proves the pushed
+      // render is a safe ancestor even though a later commit made the current
+      // whole-file bytes differ. Since #1349 a walk holding a human commit
+      // stamps only when every commit around our merge is proven by parent
+      // links (see the ancestry judge below). Use the pushed render's captured
+      // edit boundary, never an edit id observed during reimport. This happens
+      // before getMasterConfirmedAt is re-read for chunk apply, so tonight's
+      // merge can recover the newly confirmed ancestor. Absent/incomplete/
+      // unproven evidence deliberately declines to the conservative behavior.
       //
       // #1058: and only when our merge is at or before the commit the caller's
       // file was fetched at. Otherwise the stamp certifies a render that file
@@ -9252,11 +9273,37 @@ async function accountOwnPublishDecline(
           pinnedInWalk: pinIdx >= 0,
         });
       }
+      // #1349: with a human commit in the walk, the stamp needs every commit
+      // around our merge proven by complete parent lists (see
+      // judgeLineageStampAncestry); with none, the walk alone decides, as
+      // before #1349. Each Door43 lookup is timed out like the ledger poll's
+      // reads, and a failure only withholds the stamp, never fails the sync.
+      const ancestry =
+        mergeInPinnedFile && !page.incomplete && pushedReadAt != null
+          ? await judgeLineageStampAncestry(commits, judged.mergeSha, {
+              repoParents,
+              readParents: async (sha) => {
+                try {
+                  return await fetchCommitParents(env, file.repo, sha, { timeoutMs: DCS_POLL_FETCH_TIMEOUT_MS });
+                } catch {
+                  return null;
+                }
+              },
+              maxReads: MAX_LINEAGE_ANCESTRY_READS,
+            })
+          : null;
+      if (ancestry && !ancestry.ok) {
+        console.log("reimport #658 stamp withheld: the commits around our merge are not proven to build on it (#1349)", {
+          book,
+          resource,
+          mergeSha: judged.mergeSha,
+          reason: ancestry.reason,
+          sha: ancestry.sha,
+          ancestryReads: ancestry.ancestryReads,
+        });
+      }
       const lineageConfirmed =
-        mergeInPinnedFile &&
-        !page.incomplete &&
-        commits.every((commit) => commit.kind !== "human") &&
-        pushedReadAt != null
+        ancestry?.ok === true && pushedReadAt != null
           ? await markLineageConfirmedConverged(env, book, resource, {
               pushedBlobSha,
               pushedReadAt,
@@ -9290,6 +9337,7 @@ async function accountOwnPublishDecline(
         lineageComplete: !page.incomplete,
         lineageHumanCommits: commits.filter((commit) => commit.kind === "human").length,
         lineageConfirmed,
+        ancestryReads: ancestry?.ancestryReads ?? null,
       });
       return;
     }
@@ -9352,7 +9400,8 @@ export const accountOwnPublishDeclineForTest = (
   sync: ResourceSyncState,
   observedAt = Date.now(),
   pinnedSha?: string | null,
-): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync, observedAt, undefined, pinnedSha);
+  repoParents?: ReadonlyMap<string, readonly string[] | null>,
+): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync, observedAt, undefined, pinnedSha, repoParents);
 
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
