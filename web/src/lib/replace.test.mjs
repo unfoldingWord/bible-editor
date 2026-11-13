@@ -10,6 +10,7 @@ import {
   smartEditVerse,
   smartReplaceVerse,
   renumberTargetOccurrences,
+  labelRefusalText,
   tokenizePlainText,
   tokenizeEditableText,
   __reanchorMarkersForTest as reanchorMarkers,
@@ -4343,6 +4344,10 @@ function countAllMilestones(nodes) {
     // A line break added in a labelled verse: refused as line-breaks.
     const lb = smartEditVerse(clone(v4), old, old.replace("He is like a king", "He is like \\q2 a king"), { capturedFromDom: true });
     assert(lb.labelRefused === true && lb.labelRefusedReason === "line-breaks", `line break added: refused as line-breaks (got ${lb.labelRefusedReason})`);
+    // The toast names the actual reason: only a line-break change says so.
+    const texts = ["line-breaks", "label-moved", "label-shape"].map(labelRefusalText);
+    assert(new Set(texts).size === 3 && /added or removed/.test(texts[0]) && !/added or removed/.test(texts[1]) && !/added or removed/.test(texts[2]),
+      `each refusal reason has its own message (got ${JSON.stringify(texts)})`);
   } finally {
     console.warn = warn;
   }

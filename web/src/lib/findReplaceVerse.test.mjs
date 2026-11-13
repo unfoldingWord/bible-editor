@@ -364,11 +364,24 @@ const hasStraightQuote = (content) => /['"]/.test(alignedWords(content).join(" "
   const verse = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label, { tag: "q1", type: "quote" }, w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };
   const plain = extractPlainText(verse);
   check(plain === "A home. He ran home.", `setup: plain text skips the label (got ${JSON.stringify(plain)})`);
-  const across = findReplaceVerse(verse, plain, /home\. He/g, plain.indexOf("home. He"), 8, "home and he");
+  const across = findReplaceVerse(verse, plain, /home\. He/g, plain.indexOf("home. He"), 8, "home. She");
   const vos = across.content.verseObjects;
   const li = vos.findIndex((n) => n.tag === "sp");
-  check(across.labelRefusals === undefined && across.plainText === "A home and he ran home." && vos[li + 1]?.tag === "q1",
+  check(across.labelRefusals === undefined && across.plainText === "A home. She ran home." && vos[li + 1]?.tag === "q1",
     `replace across the label: replaced, label still before its \\q1 (got ${JSON.stringify(across.plainText)})`);
+  // "home. He" -> "home and he": the engine saves "he" before the line break
+  // (as it does with no label), which would put it before the label too.
+  // Refused and counted (review round 4 of #1350, item 1).
+  {
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      const moved = findReplaceVerse(verse, plain, /home\. He/g, plain.indexOf("home. He"), 8, "home and he");
+      check(moved.labelRefusals === 1 && moved.plainText === plain, `a replace that moves a word across the label: refused (got ${JSON.stringify(moved.plainText)})`);
+    } finally {
+      console.warn = warn;
+    }
+  }
 
   const footnote = { tag: "f", type: "footnote", content: "+ \\ft a note", endTag: "f*" };
   const odd = { verseObjects: [w("A"), t(" "), w("home"), t(".\n"), label, footnote, { tag: "q1", type: "quote" }, w("He"), t(" "), w("ran"), t(" "), w("home"), t(".")] };

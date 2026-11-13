@@ -851,8 +851,11 @@ Highlights that bite repeatedly:
   for byte. Every skip keyed on `isHeaderLabelNode` then covers it, but any walker that descends `children`
   generically still sees the label words. So `smartEditVerse` / `smartReplaceVerse` take each word label out of
   the verse for the edit, anchored to the Nth top-level line marker after it (or the verse end), and put it back
-  before the same Nth marker; an edit that changes the number of line markers in a labelled verse is refused
-  (`labelRefused`: toast, nothing queued; find/replace counts it). Showing the engine the label instead failed
+  before the same Nth marker. An edit is refused (`labelRefused` + `labelRefusedReason`: toast, nothing queued;
+  find/replace counts it) when it changes the number of line markers in a labelled verse, or when a label's
+  marker no longer sits between the same body words (compared case- and punctuation-blind): a count check alone
+  let "remove the `\q2` before a label, add one after it" put the label mid-speech, and the engine's own
+  "wars. Your" -> "wars; your" move (main does it too) would put a word of the speech before its label. Showing the engine the label instead failed
   twice: as plain-text `{tag:"sp", text}` the whole-verse punctuation relayout blanked it (any punctuation edit in
   the verse) and the marker tiers moved the `\q1` after a verse-final label in front of it (`\q1 \sp …` opens the
   next verse inside the label); as `content` (like `\s1`) reconcile moved labels freely. A plain-text `\sp` label

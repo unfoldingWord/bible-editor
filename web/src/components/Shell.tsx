@@ -57,7 +57,7 @@ import { BookLocksDialog } from "./BookLocksDialog";
 import { shouldApplyUpsert } from "./rowUpsertGuard";
 import { drafts, verseKey, rowKey as draftRowKey, pinVerseBase, pinEpoch, unpinVerseBaseIfIdle, holdVerseBaseForEditor, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
-import { smartEditVerse } from "../lib/replace";
+import { smartEditVerse, labelRefusalText } from "../lib/replace";
 import { adoptBaseQuotes, curlifyVerseContent } from "../lib/curlyVerse";
 import { extractEditableText, extractPlainText, normalizeEditable, isHeaderLabelNode, rewriteHeaderLabel } from "../lib/usfm";
 import { chapterOpensWithoutMarker, introEditBase } from "../lib/verseIntro";
@@ -4289,9 +4289,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       saveDoneGuardRef.current.cancel();
       const where = `${book} ${chapterNum}:${verseNum} ${bibleVersion}`;
       const epoch = pinEpoch(key);
-      // What the engine refuses (see withWordLabelsAsText): adding or removing a
-      // line break in a verse with a word label, which would move the label.
-      const why = `would move a speaker label (a line break added or removed in a verse with a speaker label can't be saved yet)`;
+      // What the engine refused, and why (see withWordLabelsAsText).
+      const why = labelRefusalText(engineResult.labelRefusedReason);
       void drafts
         .get(key)
         .then((draft) => {
