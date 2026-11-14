@@ -120,7 +120,9 @@ import {
   idBlockedOverrideAllowed,
   staleBaseOverrideAllowed,
   classifyReimportOutcome,
+  summarizeReimport,
 } from "./reimportSyncGate";
+import type { ReimportSummary } from "./reimportSyncGate";
 import { readSyncWithhold, staleSkipAlertMessage } from "./syncWithholds";
 import { lockedBooksIn } from "./bookLock";
 import {
@@ -242,25 +244,6 @@ export interface StepResult {
   // creation failed (see prReason).
   prNumber: number | null;
   prReason: string | null;
-}
-
-// Tally per-book reimport outcomes for the run's terminal ledger (#833 review):
-// success = clean sync, skip = deferred (lock / id-block, retried next run),
-// failure = a real error (a thrown/errored write that left D1 stale). Only
-// failure gates the run's completed_with_failures status; skip is neither green
-// nor red.
-function summarizeReimport(
-  outcomes: Array<{ status: "success" | "skip" | "failure" }>,
-): { successCount: number; skipCount: number; failureCount: number } {
-  let successCount = 0;
-  let skipCount = 0;
-  let failureCount = 0;
-  for (const o of outcomes) {
-    if (o.status === "failure") failureCount++;
-    else if (o.status === "skip") skipCount++;
-    else successCount++;
-  }
-  return { successCount, skipCount, failureCount };
 }
 
 const isResource = (s: string): s is Resource => (ALL_RESOURCES as string[]).includes(s);
@@ -396,7 +379,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     instanceId: string;
     totalSteps: number;
     results: StepResult[];
-    reimport: { successCount: number; skipCount: number; failureCount: number };
+    reimport: ReimportSummary;
   }> {
     const params = event.payload ?? {};
 

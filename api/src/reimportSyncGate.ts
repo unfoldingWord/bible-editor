@@ -532,3 +532,36 @@ export function staleBaseOverrideAllowed(
   if (params.resource !== resourceBeingChecked) return false;
   return resolvedBookCount === 1 && resolvedResourceCount === 1;
 }
+
+// Tally per-book reimport outcomes for the run's terminal ledger (#833 review):
+// success = clean sync, skip = deferred (lock / id-block, retried next run),
+// failure = a real error (a thrown/errored write that left D1 stale). Only
+// failure gates the run's completed_with_failures status; skip is neither green
+// nor red.
+//
+// failedBooks names the books behind failureCount (#1385). A nightly run writes
+// item_terminal rows only for its export steps, and the per-book
+// export_sync_fail alert is best-effort, so on 2026-11-14 — when D1 itself was
+// overloaded — this run_completed row was the only D1 record of the failure,
+// and it carried a bare count. It is best-effort too (appendSyncRunEvent), so
+// the watchdog treats a missing run_completed row as not clean.
+export type ReimportSummary = {
+  successCount: number;
+  skipCount: number;
+  failureCount: number;
+  failedBooks: string[];
+};
+
+export function summarizeReimport(
+  outcomes: ReadonlyArray<{ book: string; status: "success" | "skip" | "failure" }>,
+): ReimportSummary {
+  let successCount = 0;
+  let skipCount = 0;
+  const failedBooks: string[] = [];
+  for (const o of outcomes) {
+    if (o.status === "failure") failedBooks.push(o.book);
+    else if (o.status === "skip") skipCount++;
+    else successCount++;
+  }
+  return { successCount, skipCount, failureCount: failedBooks.length, failedBooks };
+}

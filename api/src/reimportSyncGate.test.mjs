@@ -27,6 +27,7 @@ import {
   idBlockedOverrideAllowed,
   computeWithholdReason,
   classifyReimportOutcome,
+  summarizeReimport,
 } from "./reimportSyncGate.ts";
 
 let failed = 0;
@@ -888,11 +889,34 @@ for (const field of ["own_publish_unstamped", "fetch_failed", "tsv_truncated"]) 
   );
 }
 
+
+// ---- summarizeReimport (#1385) ----
+// The run_completed ledger row must name the books whose pre-export sync
+// failed. On 2026-11-14 five books failed on "D1 DB is overloaded"; the alert
+// writes were lost and the ledger said only failureCount: 5.
+console.log("\nsummarizeReimport:");
+{
+  const s = summarizeReimport([
+    { book: "1CH", status: "success" },
+    { book: "DEU", status: "failure" },
+    { book: "EZK", status: "skip" },
+    { book: "GEN", status: "failure" },
+    { book: "PSA", status: "failure" },
+  ]);
+  eq(s.successCount, 1, "one success counted");
+  eq(s.skipCount, 1, "one skip counted");
+  eq(s.failureCount, 3, "three failures counted");
+  eq(JSON.stringify(s.failedBooks), JSON.stringify(["DEU", "GEN", "PSA"]), "failedBooks names each failed book, in run order");
+  const clean = summarizeReimport([{ book: "1CH", status: "success" }, { book: "EZK", status: "skip" }]);
+  eq(JSON.stringify(clean.failedBooks), "[]", "a clean run records an empty failedBooks list, not a missing one");
+  eq(clean.failureCount, 0, "a clean run has failureCount 0");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
 } else {
   console.log(
-    "\nAll shouldRecordResourceSync / isSystemicMergeRefusal / computeWithholdReason / classifyReimportOutcome checks passed.",
+    "\nAll shouldRecordResourceSync / isSystemicMergeRefusal / computeWithholdReason / classifyReimportOutcome / summarizeReimport checks passed.",
   );
 }

@@ -74,6 +74,10 @@ bundle.syncRun = step("sync_run_log", () => ({
                    WHERE run_id = 'nightly-${day}' AND status = 'skip' GROUP BY 1 ORDER BY n DESC`),
   notable: q(`SELECT book, resource, event_type, status, substr(details_json,1,400) details FROM sync_run_log
                WHERE run_id = 'nightly-${day}' AND event_type = 'item_terminal' AND status NOT IN ('success','skip') LIMIT 200`),
+  // The nightly writes item_terminal rows only for export steps, so a failed
+  // pre-export Door43 -> D1 sync shows up only here (#1385).
+  completed: q(`SELECT status, details_json FROM sync_run_log
+                 WHERE run_id = 'nightly-${day}' AND event_type = 'run_completed' LIMIT 1`),
 }));
 
 bundle.newAlerts = step("alerts raised since the sync", () =>
@@ -301,6 +305,28 @@ const notLoaded = (prefix) => {
 const revertLines = erc
   ? erc.revertSummaryLines(bundle.exportReverts, { failed: [...revertFailed] })
   : { loud: notLoaded("export_revert"), quiet: notLoaded("revert_probably_ours") };
+// run_completed: its status, and the books whose pre-export sync failed
+// (details_json.reimport.failedBooks, recorded since #1385; older rows carry
+// only failureCount).
+function runCompletedLine(rows) {
+  if (rows == null) return `- Run completed: unknown (query failed)`;
+  const row = rows[0];
+  if (!row) return `- Run completed: **NOT CLEAN** — no run_completed row (the run may still be going, may have died, or its ledger write was lost); run \`wrangler workflows instances describe bible-editor-export nightly-${day} --env production\``;
+  let reimport = null;
+  try {
+    reimport = JSON.parse(row.details_json ?? "{}").reimport ?? null;
+  } catch {
+    /* unparseable details: reported as unknown below */
+  }
+  const failures = reimport?.failureCount;
+  const books = Array.isArray(reimport?.failedBooks)
+    ? reimport.failedBooks.join(", ") || "none named"
+    : `not recorded in the ledger — run \`wrangler workflows instances describe bible-editor-export nightly-${day} --env production\``;
+  const sync = failures == null ? "pre-export sync failures: unknown" : `pre-export sync failures: ${failures}${failures ? ` (books: ${books})` : ""}`;
+  const loud = row.status === "completed" ? "" : "**NOT CLEAN** — ";
+  return `- Run completed: ${loud}${row.status}; ${sync}`;
+}
+
 const summary = [
   `# Sync watchdog ${day}`,
   ``,
@@ -317,6 +343,7 @@ const summary = [
   `- Deployed: ${bundle.deployed?.commit ?? "unknown"}`,
   `- Nightly run rows (nightly-${day}): ${byStatus == null ? "unknown" : byStatus.map((r) => `${r.event_type}/${r.status}=${r.n}`).join(", ") || "none"}`,
   `- Item rows not success/skip: ${n(bundle.syncRun?.notable?.length)}`,
+  runCompletedLine(bundle.syncRun?.completed),
   `- Skip reasons: ${bundle.syncRun?.skipReasons == null ? "unknown" : bundle.syncRun.skipReasons.map((r) => `${r.reason ?? "null"}=${r.n}`).join(", ") || "none"}`,
   `- Alerts raised since 05:30 UTC and still open: ${n(bundle.newAlerts?.length)}`,
   activeOk
