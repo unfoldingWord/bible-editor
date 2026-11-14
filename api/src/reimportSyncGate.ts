@@ -543,7 +543,8 @@ export function staleBaseOverrideAllowed(
 // item_terminal rows only for its export steps, and the per-book
 // export_sync_fail alert is best-effort, so on 2026-11-14 — when D1 itself was
 // overloaded — this run_completed row was the only D1 record of the failure,
-// and it carried a bare count.
+// and it carried a bare count. It is best-effort too (appendSyncRunEvent), so
+// the watchdog treats a missing run_completed row as not clean.
 export type ReimportSummary = {
   successCount: number;
   skipCount: number;

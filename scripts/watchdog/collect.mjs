@@ -311,7 +311,7 @@ const revertLines = erc
 function runCompletedLine(rows) {
   if (rows == null) return `- Run completed: unknown (query failed)`;
   const row = rows[0];
-  if (!row) return `- Run completed: no run_completed row`;
+  if (!row) return `- Run completed: **NOT CLEAN** — no run_completed row (the run may still be going, may have died, or its ledger write was lost); run \`wrangler workflows instances describe bible-editor-export nightly-${day} --env production\``;
   let reimport = null;
   try {
     reimport = JSON.parse(row.details_json ?? "{}").reimport ?? null;
