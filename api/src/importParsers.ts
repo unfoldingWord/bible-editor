@@ -617,8 +617,11 @@ export function curlifyVerseObjects(verseObjects: unknown[]): boolean {
       const text = o["text"];
       if (!isSourceMilestone && typeof text === "string" && text.length > 0) steps.push(o);
       if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
-      // A line marker's nextChar is the space after `\q1`, before its text.
-      if (!isLineMarker && typeof o["nextChar"] === "string" && /^\s/.test(o["nextChar"])) steps.push(" ");
+      // A line marker's nextChar is the space after `\q1`, before its text,
+      // and a character marker with children (`\add␣\w war…\add*`) parks the
+      // space after its OPENING tag there; the space after its closing tag is a
+      // text node of its own. So only a childless node's nextChar parts words.
+      if (!isLineMarker && !Array.isArray(o["children"]) && typeof o["nextChar"] === "string" && /^\s/.test(o["nextChar"])) steps.push(" ");
     }
   };
   walk(verseObjects);

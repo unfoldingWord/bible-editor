@@ -1807,7 +1807,11 @@ for (const n of ["", "1", "2", "3", "4", "5"]) {
     ["guard: a footnote at line end after closes", [t("war.\""), { type: "footnote", tag: "f", content: "+ \\ft note", endTag: "f*", nextChar: "\n" }, w("And")], "war.”|And"],
     ["guard: a footnote mid-line after closes", [t("war.\""), { type: "footnote", tag: "f", content: "+ \\ft note", endTag: "f*" }, w("And")], "war.”|And"],
     ["guard: a cross reference after closes", [t("war.\""), { tag: "x", content: "- \\xo 1:1 \\xt Gen 1:1", endTag: "x*" }, w("And")], "war.”|And"],
-    ["guard: a space after a closing marker closes", [{ tag: "add", type: "character", nextChar: " ", children: [t("war.\"")] }, w("And")], "war.”|And"],
+    // usfm-js shapes: `\add \w war\w*;"\add*\w the\w*` keeps the space after
+    // `\add` on its nextChar (so the quote still opens), and the space after
+    // `\add*` in `\add war."\add* \w And\w*` is a text node (so it closes).
+    ["a character marker's opening-tag space does not stop the look ahead", [{ tag: "add", type: "character", nextChar: " ", children: [w("war"), t(";\"")] }, w("the")], "war|;“|the"],
+    ["guard: a space after a closing marker closes", [{ tag: "add", type: "character", children: [t("war.\"")] }, t(" "), w("And")], "war.”| |And"],
   ];
   for (const [label, verseObjects, want] of cases) {
     curlifyVerseObjects(verseObjects);
