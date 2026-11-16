@@ -2428,10 +2428,43 @@ function isExactReplace(
   const original = { verseObjects };
   const typedCoords = (typed || plainText !== extractPlainText(original)) && plainText === strippedText(original);
   const got = typedCoords ? strippedText(result.content) : extractPlainText(result.content);
+  // The plain text reads a space at every line marker, so a marker laid in a
+  // gap typed with no space (`wars;“the` -> `wars;\q1 “the`) reads `wars;
+  // “the`: refusing that left only the narrowed retry, which saved the break
+  // after the new words (`wars;“the great\q1 king`, #1380). Allow whitespace
+  // the result has beside a marker where the replacement has none only where
+  // a line break belongs: after closing punctuation and before an opener
+  // (`;|“`). Anywhere else the marker would split a word, trail an opener
+  // (`“\q1 I`) or lead a closer (`name\q1 ,`).
+  // Typed coordinates have their own marker-space rule (strippedText).
+  const textMatches = (): boolean => {
+    if (got === want) return true;
+    if (typedCoords) return false;
+    // Each whitespace run that holds a marker becomes one MARKER_SPACE (a
+    // marker with no whitespace beside it drops out), so the walk sees which
+    // of got's spaces come from a marker. At the text's edges got is trimmed.
+    const MARKER_SPACE = "\u0002";
+    const marked = extractPlainText({ verseObjects: withMarkerSentinels(out) })
+      .replace(/[\s\u0001]*\u0001[\s\u0001]*/g, (run) => (/\s/.test(run) ? MARKER_SPACE : ""));
+    const breakSpot = (k: number) =>
+      MARKER_CLOSING_RE.test(want[k - 1]) && !/\s/.test(want[k - 1]) && OPENING_PUNCT_RE.test(want[k]);
+    let j = 0;
+    for (let i = 0; i < marked.length; i++) {
+      const ch = marked[i];
+      if (ch === MARKER_SPACE) {
+        if (want[j] === " ") j++;
+        else if (j > 0 && j < want.length && !breakSpot(j)) return false;
+        continue;
+      }
+      if (ch !== want[j]) return false;
+      j++;
+    }
+    return j === want.length;
+  };
   // Neither text shows a header label, so check those separately: a match
   // that spans one (`said the` around `\sp …`) must not rewrite it.
   if (
-    got !== want ||
+    !textMatches() ||
     lineMarkers(out) !== lineMarkers(verseObjects) ||
     JSON.stringify(headerLabelTexts(out)) !== JSON.stringify(headerLabelTexts(verseObjects))
   ) {

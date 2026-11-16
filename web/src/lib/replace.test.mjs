@@ -4742,6 +4742,65 @@ function countAllMilestones(nodes) {
     "great fights” king", /use in great \\q1 fights” king rules/, ["wars", "Your"]);
   checkStraight("#1378 guard, straight ' closer, wars. “Your king -> great kings' king", opener, "wars. “Your king", "great kings' king",
     "great kings’ king", /use in great \\q1 kings’ king rules/, ["wars", "Your"]);
+  // #1380: the opener typed with no space after the punctuation before it
+  // (`wars;“the`). The #1369 rule laid the new words after the marker, but
+  // the plain text reads a space at every line marker, so the result read
+  // `wars; “the`, the exact-text guard refused it, and the narrowed retry
+  // saved `wars;“the great\q1 king`. The right layout keeps the typed
+  // characters with the marker in the gap; its plain text gains only the
+  // marker's own space.
+  const checkNoSpace = (label, content, find, replacement, wantPlain, wantRe, unaligned) => {
+    const r = run(content, find, replacement);
+    const ed = extractEditableText(r.content);
+    assert(extractPlainText(r.content) === wantPlain, `${label}: text is the replacement, with the marker's space (got ${JSON.stringify(extractPlainText(r.content))})`);
+    assert(markers(r.content) === markers(content) && wantRe.test(ed), `${label}: every line marker kept, before the opener (got ${JSON.stringify(ed)})`);
+    onlyUnaligned(label, content, r.content, unaligned);
+  };
+  checkNoSpace("#1380 no space (#1369 rule), wars. “Your king -> wars;“the great king", opener, "wars. “Your king", "wars;“the great king",
+    "use in wars; “the great king rules.”", /use in wars;\\q1 “the great king rules/, ["Your"]);
+  checkNoSpace("#1380 no space, single opener (#1369 rule), wars. ‘Your king -> wars;‘the great king", singleOpener, "wars. ‘Your king", "wars;‘the great king",
+    "use in wars; ‘the great king rules.’", /use in wars;\\q1 ‘the great king rules/, ["Your"]);
+  // Guard: the mirror already saved right (`great fights;\q1 “Your`).
+  checkNoSpace("#1380 guard, no space (#1371 rule), wars. “Your -> great fights;“Your", opener, "wars. “Your", "great fights;“Your",
+    "use in great fights; “Your king rules.”", /use in great fights;\\q1 “Your king rules/, ["wars"]);
+  // Two markers in one gap (`\b \q1 “`): both stay before the opener.
+  checkNoSpace("#1380 no space, two markers, wars. “Your king -> wars;“the great king", twoOpener, "wars. “Your king", "wars;“the great king",
+    "use in wars; “the great king rules.”", /use in wars;\\b\s*\\q1 “the great king rules/, ["Your"]);
+  {
+    // Replace-all re-reads the plain text after each step: same layout.
+    const label = "#1380 replace-all, wars. “Your king -> wars;“the great king";
+    const r = replaceAllInVerse(clone(opener), extractPlainText(opener), /wars\. “Your king/g, 1, "wars;“the great king");
+    const ed = extractEditableText(r.content);
+    assert(/use in wars;\\q1 “the great king rules/.test(ed), `${label}: marker before the opener (got ${JSON.stringify(ed)})`);
+    onlyUnaligned(label, opener, r.content, ["Your"]);
+  }
+  {
+    // The real verse: the opener sits on the `\q1` node, and the verse ends
+    // in a second `\q1`, whose space the plain text trims.
+    const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
+    const real = { verseObjects: zecUlt.chapters["1"]["14"].verseObjects };
+    const label = "#1380 no space, ZEC 1:14 ULT Armies: “I have -> Armies;“we truly have";
+    const r = run(real, "Armies: “I have", "Armies;“we truly have");
+    const ed = extractEditableText(r.content);
+    assert(markers(r.content) === markers(real) && /Yahweh of Armies;\\q1 “we truly have been jealous/.test(ed), `${label}: marker before the opener (got ${JSON.stringify(ed)})`);
+    const before = strongsOf(real);
+    const after = strongsOf(r.content);
+    const left = [...before];
+    const extra = after.filter((s) => { const i = left.indexOf(s); if (i < 0) return true; left.splice(i, 1); return false; });
+    assert(extra.length === 0 && left.length === 1 && left[0].startsWith("I:"), `${label}: only the replaced I unaligned (lost ${JSON.stringify(left)}, extra ${JSON.stringify(extra)})`);
+  }
+  // Guards, pinned as main's results: the marker's space is allowed only
+  // between closing punctuation and an opener, so a no-space gap with no
+  // opener, or two words typed as one, still read as main does.
+  {
+    const bareSay = { verseObjects: [t("I "), zaln("H1", [w("say")]), q1(), zaln("H2", [w("The")]), t(" king.")] };
+    for (const [replacement, wantEd] of [["say,The", "I say,The\\q1 king."], ["sayThe", "I sayThe\\q1 king."]]) {
+      const label = `#1380 guard, bare marker, say The -> ${replacement}`;
+      const r = run(bareSay, "say The", replacement);
+      const ed = extractEditableText(r.content);
+      assert(ed === wantEd && markers(r.content) === markers(bareSay), `${label}: as main (got ${JSON.stringify(ed)})`);
+    }
+  }
   {
     const zecUlt = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ult_38-ZEC.usfm"), "utf8"));
     const v613 = { verseObjects: zecUlt.chapters["6"]["13"].verseObjects };
