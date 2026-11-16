@@ -4943,6 +4943,14 @@ console.log("\n[#1349: a human commit AFTER our preserved merge no longer freeze
     ["EZK ust parallel branch, side commit older than the read, in the lineage walk", EZK_PARALLEL, at("2026-11-12T19:18:30Z"), at("2026-11-12T05:00:00Z")],
     ["parallel-branch commit dated after our merge", LATE_PARALLEL, at("2026-11-12T19:00:00Z"), null],
     ["a fix on a nested merge of our merge and a side branch", NESTED_MERGE, at("2026-11-12T19:05:00Z"), null],
+    // Two side commits in a row, the older one dated before our merge.
+    ["a two-commit side branch", [
+      { sha: "2c00000003", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["3aea90c6a7", "2c00000002"] },
+      { sha: "2c00000002", message: "Side fix two", ...RICH, date: "2026-11-12T19:20:00Z", parents: ["2c00000001"] },
+      M2,
+      { sha: "2c00000001", message: "Side fix one", ...RICH, date: "2026-11-12T19:10:00Z", parents: ["11c6654ac3"] },
+      ...BEFORE_MERGE.slice(2),
+    ], at("2026-11-12T19:05:00Z"), at("2026-11-12T19:05:00Z")],
   ]) {
     const { sqlite, env } = freshEnv();
     seedSync(sqlite, { oldEditId: 11, pushedEditId: 77, prNumber: 4886, readAt });
