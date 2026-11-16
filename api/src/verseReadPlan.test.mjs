@@ -1,7 +1,9 @@
 // Query-plan guard for applyVerseRows' existing-verse read (issue #1386).
 //
 // Run from api/:
-//   node --experimental-strip-types --no-warnings src/verseReadPlan.test.mjs
+//   node --experimental-strip-types --experimental-sqlite --no-warnings \
+//     --import ./src/tsResolveHook.mjs src/verseReadPlan.test.mjs
+// (or `npm test`, which passes the same flags via scripts/run-tests.mjs)
 //
 // Not a test framework; failures exit non-zero.
 //
