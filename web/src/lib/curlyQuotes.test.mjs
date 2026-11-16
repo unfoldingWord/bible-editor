@@ -113,6 +113,28 @@ function assert(cond, msg) {
   );
 }
 
+// ─── #1380 decision A: a straight " after punctuation, before a letter, opens ─
+// Same rule as the verse-tree curlers (curlyVerse.ts, importParsers.ts).
+{
+  console.log("\n[#1380] straight \" after punctuation and before a letter opens");
+  for (const [args, want] of [
+    [['wars;"the'], "wars;“the"],
+    [['a."b c,"d e:"f g!"h i?"Jo'], "a.“b c,“d e:“f g!“h i?“Jo"],
+    [['"the', ";"], "“the"], // the character before comes from context
+    [['"', ";", "t"], "“"], // and the character after (the Replace box gap)
+    [['"', ";", " "], "”"],
+    [['"', ";"], "”"],
+    [['wars;" the'], "wars;” the"],
+    [['verse;"5'], "verse;”5"],
+    [['wars"the'], "wars”the"],
+    [["wars;'the"], "wars;’the"],
+  ]) {
+    const got = curlifyString(...args);
+    assert(got === want, `curlifyString(${args.map((a) => JSON.stringify(a)).join(", ")}) === ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
+  }
+  assert(pasteReplacement('wars;"the', "x", "field") === "wars;“the", "paste curls the same way");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

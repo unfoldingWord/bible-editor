@@ -301,6 +301,38 @@ console.log("an inline \\qs / \\qac / \\qt / \\+qt is not a line break (#1281)")
   assert(q1.verseObjects[1].text === "“Turn back.”\n", `\\q1 still opens (got ${JSON.stringify(q1.verseObjects[1].text)})`);
 }
 
+console.log("a straight \" after punctuation and before a letter opens (#1380 decision A)");
+{
+  // Same cases as the api copy (importParsers.test.mjs, curlifyVerseObjects):
+  // keep the two lists in step. The next character is read across nodes in
+  // document order (a \w word, a milestone's children); a line marker in
+  // between reads as a line break, so the quote closes.
+  const texts = (nodes) => {
+    const out = [];
+    const walk = (ns) => { for (const n of ns) { if (n.tag !== "zaln" && typeof n.text === "string") out.push(n.text); if (n.children) walk(n.children); } };
+    walk(nodes);
+    return out.join("|");
+  };
+  const cases = [
+    ["one text node", [t("wars;\"the great")], "wars;“the great"],
+    ["next word in its own node", [t("wars;\""), w("the"), t(" king")], "wars;“|the| king"],
+    ["next word inside a milestone", [t("wars;\""), zaln("H1", [w("the")]), t(".")], "wars;“|the|."],
+    ["after . , : ! ?", [t("a.\"b c,\"d e:\"f g!\"h i?\"Jo")], "a.“b c,“d e:“f g!“h i?“Jo"],
+    ["a non-Latin letter after", [t("say;\"Ἰησοῦς")], "say;“Ἰησοῦς"],
+    ["guard: a line marker after closes", [t("wars;\""), q("q1"), t("the")], "wars;”|the"],
+    ["guard: a space after closes", [t("wars;\" the")], "wars;” the"],
+    ["guard: a digit after closes", [t("verse;\"5")], "verse;”5"],
+    ["guard: a letter before closes", [t("wars\"the")], "wars”the"],
+    ["guard: end of verse closes", [t("wars;\"")], "wars;”"],
+    ["guard: a single quote is unchanged", [t("wars;'the")], "wars;’the"],
+    ["guard: \"\" still alternates", [t("wars;\"\"the")], "wars;”“the"],
+  ];
+  for (const [label, verseObjects, want] of cases) {
+    const out = curlifyVerseContent({ verseObjects });
+    assert(texts(out.verseObjects) === want, `${label}: ${JSON.stringify(want)} (got ${JSON.stringify(texts(out.verseObjects))})`);
+  }
+}
+
 console.log("adoptBaseQuotes");
 {
   assert(adoptBaseQuotes("a ’b’ c", "a 'b' c") === "a ’b’ c", "unchanged straight → base curly");
