@@ -243,6 +243,11 @@ Highlights that bite repeatedly:
   milestone (`\q1\zaln-s …\*“\w I`), pinned in Case 101. `isExactReplace`'s shared-edge
   test is case-blind, so a marker beside a recased word must keep its place. Still open: the mirror,
   `wars. \q1 “Your` -> `great fights; “Your`, saves `\q1 great fights; “Your`.
+  `isExactReplace` compares the tree's plain text, which reads a space at every line marker, so a right
+  layout with the marker in a gap typed with no space (`wars;“the` -> `wars;\q1 “the`) was refused and the
+  narrowed retry saved `wars;“the great\q1 king` (#1380). It now allows a marker's space the replacement
+  lacks only between closing punctuation and an opener (and at the trimmed text edges, ZEC 1:14's trailing
+  `\q1`); any wider ("any non-word neighbour") broke ~20 cases (`“\q1 I`, `name\q1 ,`).
 
 - **A line marker with no text node on either side (`H1[say] \q1 H2[The]`) puts a space in the stripped text that
   the tree does not have (#1286).** `stripMarkerTokens` adds it so the two words don't fuse, so the engine diffs

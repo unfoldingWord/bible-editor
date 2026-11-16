@@ -4763,6 +4763,9 @@ function countAllMilestones(nodes) {
   // Guard: the mirror already saved right (`great fights;\q1 “Your`).
   checkNoSpace("#1380 guard, no space (#1371 rule), wars. “Your -> great fights;“Your", opener, "wars. “Your", "great fights;“Your",
     "use in great fights; “Your king rules.”", /use in great fights;\\q1 “Your king rules/, ["wars"]);
+  // Two markers in one gap (`\b \q1 “`): both stay before the opener.
+  checkNoSpace("#1380 no space, two markers, wars. “Your king -> wars;“the great king", twoOpener, "wars. “Your king", "wars;“the great king",
+    "use in wars; “the great king rules.”", /use in wars;\\b\s*\\q1 “the great king rules/, ["Your"]);
   {
     // Replace-all re-reads the plain text after each step: same layout.
     const label = "#1380 replace-all, wars. “Your king -> wars;“the great king";
