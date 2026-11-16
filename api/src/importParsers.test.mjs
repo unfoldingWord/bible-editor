@@ -1770,4 +1770,63 @@ for (const n of ["", "1", "2", "3", "4", "5"]) {
   assert(plain === "“Thus says.", `extractPlainText reflects a curled tree (got ${JSON.stringify(plain)})`);
 }
 
+// #1380 decision A: a straight " after punctuation and before a letter opens.
+// Same cases as the web copy (web/src/lib/curlyVerse.test.mjs): keep the two
+// lists in step. The next character is read across nodes in document order;
+// a line marker in between reads as a line break, so the quote closes.
+{
+  const w = (text) => ({ type: "word", tag: "w", text, occurrence: "1", occurrences: "1" });
+  const t = (text) => ({ type: "text", text });
+  const q = (tag) => ({ type: "quote", tag });
+  const zaln = (strong, children) => ({
+    tag: "zaln", type: "milestone", strong, lemma: "x", morph: "x",
+    occurrence: "1", occurrences: "1", content: "x", children, endTag: "zaln-e\\*",
+  });
+  const texts = (nodes) => {
+    const out = [];
+    const walk = (ns) => { for (const n of ns) { if (n.tag !== "zaln" && typeof n.text === "string") out.push(n.text); if (n.children) walk(n.children); } };
+    walk(nodes);
+    return out.join("|");
+  };
+  const cases = [
+    ["one text node", [t("wars;\"the great")], "wars;“the great"],
+    ["next word in its own node", [t("wars;\""), w("the"), t(" king")], "wars;“|the| king"],
+    ["next word inside a milestone", [t("wars;\""), zaln("H1", [w("the")]), t(".")], "wars;“|the|."],
+    ["after . , : ! ?", [t("a.\"b c,\"d e:\"f g!\"h i?\"Jo")], "a.“b c,“d e:“f g!“h i?“Jo"],
+    ["a non-Latin letter after", [t("say;\"Ἰησοῦς")], "say;“Ἰησοῦς"],
+    ["guard: a line marker after closes", [t("wars;\""), q("q1"), t("the")], "wars;”|the"],
+    ["guard: a space after closes", [t("wars;\" the")], "wars;” the"],
+    ["guard: a digit after closes", [t("verse;\"5")], "verse;”5"],
+    ["guard: a letter before closes", [t("wars\"the")], "wars”the"],
+    ["guard: end of verse closes", [t("wars;\"")], "wars;”"],
+    ["guard: a single quote is unchanged", [t("wars;'the")], "wars;’the"],
+    ["guard: \"\" still alternates", [t("wars;\"\"the")], "wars;”“the"],
+    // usfm-js shape of `\w war\w*."\f + \ft note\f*⏎\w And\w*`: the note has
+    // no text, and the line break is its nextChar. A note stops the look
+    // ahead, so the quote before it still closes.
+    ["guard: a footnote at line end after closes", [t("war.\""), { type: "footnote", tag: "f", content: "+ \\ft note", endTag: "f*", nextChar: "\n" }, w("And")], "war.”|And"],
+    ["guard: a footnote mid-line after closes", [t("war.\""), { type: "footnote", tag: "f", content: "+ \\ft note", endTag: "f*" }, w("And")], "war.”|And"],
+    ["guard: a cross reference after closes", [t("war.\""), { tag: "x", content: "- \\xo 1:1 \\xt Gen 1:1", endTag: "x*" }, w("And")], "war.”|And"],
+    // usfm-js shapes: `\add \w war\w*;"\add*\w the\w*` keeps the space after
+    // `\add` on its nextChar (so the quote still opens), and the space after
+    // `\add*` in `\add war."\add* \w And\w*` is a text node (so it closes).
+    ["a character marker's opening-tag space does not stop the look ahead", [{ tag: "add", type: "character", nextChar: " ", children: [w("war"), t(";\"")] }, w("the")], "war|;“|the"],
+    ["guard: a space after a closing marker closes", [{ tag: "add", type: "character", children: [t("war.\"")] }, t(" "), w("And")], "war.”| |And"],
+  ];
+  for (const [label, verseObjects, want] of cases) {
+    curlifyVerseObjects(verseObjects);
+    assert(texts(verseObjects) === want, `#1380 ${label}: ${JSON.stringify(want)} (got ${JSON.stringify(texts(verseObjects))})`);
+  }
+  // AI-written note prose shares the rule (curlifyText).
+  for (const [input, want] of [
+    ['See:"the', "See:“the"],
+    ['See: "the', "See: “the"],
+    ['said."', "said.”"],
+    ['said." The', "said.” The"],
+    ["it;'s", "it;’s"],
+  ]) {
+    assert(curlifyText(input) === want, `#1380 curlifyText ${JSON.stringify(input)} -> ${JSON.stringify(want)} (got ${JSON.stringify(curlifyText(input))})`);
+  }
+}
+
 console.log("\nAll parser smoke checks passed.");

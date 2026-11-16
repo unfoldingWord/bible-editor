@@ -6,6 +6,11 @@
 // Decision rule: a quote is "opening" when the preceding character is
 // missing, whitespace, or another opener-ish punctuation; otherwise it's
 // closing. This makes ' double as a contextual apostrophe (don't → don’t).
+// One exception, for " only: sentence punctuation before it and a letter
+// right after it opens (#1380 decision A: `wars;"the` → `wars;“the`), the
+// same rule as the verse-tree curlers (curlyVerse.ts, importParsers.ts). A
+// keystroke at the end of the text has no letter after it yet, so it still
+// closes there.
 
 const LDQUO = "“";
 const RDQUO = "”";
@@ -19,20 +24,45 @@ function isOpeningContext(prev: string | undefined): boolean {
   return /[(\[{<\-–—/“‘]/.test(prev);
 }
 
-function curlyFor(ch: '"' | "'", prev: string | undefined): string {
+// The whole character (code point) starting at `i`, so a letter outside the
+// BMP reads as a letter, as in the verse-tree curlers.
+function charAt(s: string, i: number): string | undefined {
+  const cp = s.codePointAt(i);
+  return cp === undefined ? undefined : String.fromCodePoint(cp);
+}
+
+// The first character after the caret or selection in a contentEditable,
+// looking past the end of the current text node into the next one (`;|` in
+// one span, `the` in the next).
+function nextCharInEditable(range: Range, root: Node): string | undefined {
+  const { endContainer, endOffset } = range;
+  if (endContainer.nodeType === Node.TEXT_NODE && endOffset < (endContainer as Text).data.length) {
+    return charAt((endContainer as Text).data, endOffset);
+  }
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const data = (n as Text).data;
+    if (data.length > 0 && range.comparePoint(n, 0) === 1) return charAt(data, 0);
+  }
+  return undefined;
+}
+
+function curlyFor(ch: '"' | "'", prev: string | undefined, next?: string | undefined): string {
+  if (ch === '"' && prev !== undefined && /[.,;:!?]/.test(prev) && next !== undefined && /\p{L}/u.test(next)) return LDQUO;
   if (ch === '"') return isOpeningContext(prev) ? LDQUO : RDQUO;
   return isOpeningContext(prev) ? LSQUO : RSQUO;
 }
 
 // `prevContext` (optional) is the character immediately before the insertion
 // point in the surrounding document — it decides the curl direction of a quote
-// at position 0 without ever becoming part of the output.
-export function curlifyString(s: string, prevContext?: string): string {
+// at position 0 without ever becoming part of the output. `nextContext`
+// (optional) is the character right after the string, for a quote at its end.
+export function curlifyString(s: string, prevContext?: string, nextContext?: string): string {
   let out = "";
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (ch === '"' || ch === "'") {
-      out += curlyFor(ch as '"' | "'", out.length > 0 ? out[out.length - 1] : prevContext);
+      out += curlyFor(ch as '"' | "'", out.length > 0 ? out[out.length - 1] : prevContext, i + 1 < s.length ? charAt(s, i + 1) : nextContext);
     } else {
       out += ch;
     }
@@ -49,8 +79,10 @@ export function curlifyString(s: string, prevContext?: string): string {
 // merge the seed char into an ellipsis (prev "." + pasted "..." became "…",
 // and slicing off "the seed" deleted the ellipsis instead), so pasting "..."
 // after a period inserted nothing and "...abc" lost its ellipsis.
-export function curlifyPaste(text: string, prev: string | undefined): string {
-  return curlifyString(text, prev);
+// `next` is the character after the caret, so a pasted `"` before a word
+// can open (#1380).
+export function curlifyPaste(text: string, prev: string | undefined, next?: string): string {
+  return curlifyString(text, prev, next);
 }
 
 // What a paste should insert, or null to let the browser's default paste run.
@@ -66,12 +98,13 @@ export function pasteReplacement(
   text: string,
   prev: string | undefined,
   target: "field" | "editable",
+  next?: string,
 ): string | null {
   if (target === "field" && !/['"]/.test(text) && !/\.\.\.+/.test(text)) return null;
   // insertText turns a newline into a <br> or block split, which textContent
   // reads as nothing, so the words either side would save joined ("1:6But").
   const flat = target === "editable" ? text.replace(/[ \t]*[\r\n][ \t\r\n]*/g, " ") : text;
-  return curlifyPaste(flat, prev);
+  return curlifyPaste(flat, prev, next);
 }
 
 function isTextInput(el: EventTarget | null): el is HTMLInputElement {
@@ -124,7 +157,7 @@ function handleBeforeInput(e: Event) {
     }
 
     const prev = start > 0 ? target.value[start - 1] : undefined;
-    const curly = curlyFor(data, prev);
+    const curly = curlyFor(data, prev, charAt(target.value, end));
     ev.preventDefault();
     const before = target.value.slice(0, start);
     const after = target.value.slice(end);
@@ -157,7 +190,8 @@ function handleBeforeInput(e: Event) {
     if (startContainer.nodeType === Node.TEXT_NODE && startOffset > 0) {
       prev = (startContainer as Text).data[startOffset - 1];
     }
-    const curly = curlyFor(data, prev);
+    // The character after the caret (or selection), for `;|the` → `;“the`.
+    const curly = curlyFor(data, prev, nextCharInEditable(range, target));
     ev.preventDefault();
     document.execCommand("insertText", false, curly);
   }
@@ -173,7 +207,7 @@ function handlePaste(e: ClipboardEvent) {
     const start = target.selectionStart ?? target.value.length;
     const end = target.selectionEnd ?? start;
     const prev = start > 0 ? target.value[start - 1] : undefined;
-    const seeded = pasteReplacement(text, prev, "field");
+    const seeded = pasteReplacement(text, prev, "field", charAt(target.value, end));
     if (seeded === null) return;
     e.preventDefault();
     setNativeValue(target, target.value.slice(0, start) + seeded + target.value.slice(end));
@@ -185,13 +219,15 @@ function handlePaste(e: ClipboardEvent) {
   if (isContentEditable(target)) {
     const sel = window.getSelection();
     let prev: string | undefined;
+    let next: string | undefined;
     if (sel && sel.rangeCount > 0) {
       const r = sel.getRangeAt(0);
       if (r.startContainer.nodeType === Node.TEXT_NODE && r.startOffset > 0) {
         prev = (r.startContainer as Text).data[r.startOffset - 1];
       }
+      next = nextCharInEditable(r, target);
     }
-    const seeded = pasteReplacement(text, prev, "editable");
+    const seeded = pasteReplacement(text, prev, "editable", next);
     if (seeded === null) return;
     e.preventDefault();
     document.execCommand("insertText", false, seeded);

@@ -40,16 +40,23 @@ function isOpeningQuoteContext(prev: string | undefined, prevPrev?: string | und
 }
 
 // Two of the same straight quote back to back alternate (`""` → “”), since the
-// context rule alone would open twice. Otherwise the context rule decides.
+// context rule alone would open twice. A straight " with sentence punctuation
+// before it and a letter right after it (`next`) opens (#1380 decision A:
+// `wars;"the` → `wars;“the`); double quotes only, so ' stays an apostrophe.
+// Otherwise the context rule decides.
 function curlifyChar(
   ch: '"' | "'",
   prevRaw: string | undefined,
   prevCurled: string | undefined,
   prevCurled2?: string | undefined,
+  next?: string | undefined,
 ): string {
   if (prevRaw === ch) {
     if (ch === '"') return prevCurled === CURLY_LDQUO ? CURLY_RDQUO : CURLY_LDQUO;
     return prevCurled === CURLY_LSQUO ? CURLY_RSQUO : CURLY_LSQUO;
+  }
+  if (ch === '"' && prevCurled !== undefined && /[.,;:!?]/.test(prevCurled) && next !== undefined && /\p{L}/u.test(next)) {
+    return CURLY_LDQUO;
   }
   if (ch === '"') return isOpeningQuoteContext(prevCurled, prevCurled2) ? CURLY_LDQUO : CURLY_RDQUO;
   return isOpeningQuoteContext(prevCurled, prevCurled2) ? CURLY_LSQUO : CURLY_RSQUO;
@@ -59,15 +66,18 @@ function curlifyTextWithContext(
   text: string,
   prevCurled: string | undefined,
   prevRaw: string | undefined,
+  nextAfter?: string | undefined,
 ): { text: string; changed: boolean } {
   let out = "";
   let changed = false;
   let curled = prevCurled;
   let curled2: string | undefined = undefined;
   let raw = prevRaw;
-  for (const ch of text) {
+  const chars = [...text];
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
     if (ch === '"' || ch === "'") {
-      const curly = curlifyChar(ch, raw, curled, curled2);
+      const curly = curlifyChar(ch, raw, curled, curled2, i + 1 < chars.length ? chars[i + 1] : nextAfter);
       out += curly;
       if (curly !== ch) changed = true;
       curled2 = curled;
@@ -93,6 +103,10 @@ const INLINE_QUOTE_TAGS: ReadonlySet<string> = new Set([
   "qt-s", "qt1-s", "qt2-s", "qt3-s", "qt4-s", "qt5-s",
 ]);
 
+// Footnote and cross-reference tags (as usfm.ts noteHasTrailingSpace). Same
+// set in both copies.
+const NOTE_TAGS: ReadonlySet<string> = new Set(["f", "fe", "x", "ef", "ex"]);
+
 // Mutates in place. Walks every node's own `.text` in document order, except
 // `\zaln-s` milestones (source-owned attributes, never touched); milestone
 // children (the aligned target words) are walked normally.
@@ -102,8 +116,13 @@ const INLINE_QUOTE_TAGS: ReadonlySet<string> = new Set([
 // right after it opens even when the text before the marker ends in a letter
 // or comma ("said,\q1 'Turn" → ‘Turn, not ’Turn).
 function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
-  let prevCurled: string | undefined;
-  let prevRaw: string | undefined;
+  // Document order first, as line breaks ("\n") and text-bearing nodes, so a
+  // quote at the end of one node can see the next node's first character
+  // (`wars;"` then `\w the`, #1380). A " " step only stops that look ahead:
+  // a footnote or cross reference (its prose is not verse text; usfm-js may
+  // park the line break after `\f*` on its nextChar), or whitespace on a
+  // node's nextChar, so `war."\f …\f*⏎And` keeps its closing ”.
+  const steps: Array<"\n" | " " | Record<string, unknown>> = [];
   const walk = (nodes: unknown[]): void => {
     for (const node of nodes) {
       if (!node || typeof node !== "object") continue;
@@ -115,26 +134,42 @@ function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
       const isLineMarker =
         o["type"] === "paragraph" ||
         (o["type"] === "quote" && !(typeof o["tag"] === "string" && INLINE_QUOTE_TAGS.has(o["tag"])));
-      if (isLineMarker) {
-        prevCurled = "\n";
-        prevRaw = "\n";
-      }
+      if (isLineMarker) steps.push("\n");
+      if (o["type"] === "footnote" || (typeof o["tag"] === "string" && NOTE_TAGS.has(o["tag"]))) steps.push(" ");
       const isSourceMilestone = o["type"] === "milestone" && o["tag"] === "zaln";
       const text = o["text"];
-      if (!isSourceMilestone && typeof text === "string" && text.length > 0) {
-        if (/['"]/.test(text)) {
-          const result = curlifyTextWithContext(text, prevCurled, prevRaw);
-          if (result.changed) o["text"] = result.text;
-          prevCurled = result.text[result.text.length - 1];
-        } else {
-          prevCurled = text[text.length - 1];
-        }
-        prevRaw = text[text.length - 1];
-      }
+      if (!isSourceMilestone && typeof text === "string" && text.length > 0) steps.push(o);
       if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
+      // A line marker's nextChar is the space after `\q1`, before its text,
+      // and a character marker with children (`\add␣\w war…\add*`) parks the
+      // space after its OPENING tag there; the space after its closing tag is a
+      // text node of its own. So only a childless node's nextChar parts words.
+      if (!isLineMarker && !Array.isArray(o["children"]) && typeof o["nextChar"] === "string" && /^\s/.test(o["nextChar"])) steps.push(" ");
     }
   };
   walk(verseObjects);
+  let prevCurled: string | undefined;
+  let prevRaw: string | undefined;
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (step === " ") continue;
+    if (step === "\n") {
+      prevCurled = "\n";
+      prevRaw = "\n";
+      continue;
+    }
+    const text = step["text"] as string;
+    if (/['"]/.test(text)) {
+      const after = steps[i + 1];
+      const nextAfter = after === undefined ? undefined : typeof after === "string" ? after : String.fromCodePoint((after["text"] as string).codePointAt(0)!);
+      const result = curlifyTextWithContext(text, prevCurled, prevRaw, nextAfter);
+      if (result.changed) step["text"] = result.text;
+      prevCurled = result.text[result.text.length - 1];
+    } else {
+      prevCurled = text[text.length - 1];
+    }
+    prevRaw = text[text.length - 1];
+  }
 }
 
 function hasStraightQuoteText(nodes: unknown[]): boolean {

@@ -113,6 +113,42 @@ function assert(cond, msg) {
   );
 }
 
+// ─── #1380 decision A: a straight " after punctuation, before a letter, opens ─
+// Same rule as the verse-tree curlers (curlyVerse.ts, importParsers.ts).
+{
+  console.log("\n[#1380] straight \" after punctuation and before a letter opens");
+  for (const [args, want] of [
+    [['wars;"the'], "wars;“the"],
+    [['a."b c,"d e:"f g!"h i?"Jo'], "a.“b c,“d e:“f g!“h i?“Jo"],
+    [['"the', ";"], "“the"], // the character before comes from context
+    [['"', ";", "t"], "“"], // and the character after (the Replace box gap)
+    [['"', ";", " "], "”"],
+    [['"', ";"], "”"],
+    [['wars;" the'], "wars;” the"],
+    [['verse;"5'], "verse;”5"],
+    [['wars"the'], "wars”the"],
+    [["wars;'the"], "wars;’the"],
+  ]) {
+    const got = curlifyString(...args);
+    assert(got === want, `curlifyString(${args.map((a) => JSON.stringify(a)).join(", ")}) === ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
+  }
+  assert(pasteReplacement('wars;"the', "x", "field") === "wars;“the", "paste curls the same way");
+  // A letter outside the BMP is read as one character, as the tree curlers do.
+  assert(curlifyString(';"𐐀') === ";“𐐀", `a non-BMP letter after opens (got ${JSON.stringify(curlifyString(';"𐐀'))})`);
+  assert(curlifyString('"', ";", "𐐀") === "“", "a non-BMP letter as next context opens");
+  // Paste before an existing word: the character after the caret counts.
+  for (const [target, text, prev, next, want] of [
+    ["field", '"', ";", "t", "“"],
+    ["editable", '"', ";", "t", "“"],
+    ["field", 'wars;"', "x", "t", "wars;“"],
+    ["field", '"', ";", " ", "”"],
+    ["field", '"', ";", undefined, "”"],
+  ]) {
+    const got = pasteReplacement(text, prev, target, next);
+    assert(got === want, `paste ${JSON.stringify(text)} between ${JSON.stringify(prev)} and ${JSON.stringify(next)} (${target}) -> ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

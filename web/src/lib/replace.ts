@@ -1174,6 +1174,13 @@ function stripRebuildMarks(o: Record<string, unknown>): Record<string, unknown> 
 // sit after the marker: a cosmetic line-break, never a loss of alignment or text.
 const MARKER_CLOSING_RE = /[\s,.;:!?)\]}”’…]/;
 
+// The whole character (code point) at `i`, for curlifyString's look at what
+// follows a quote (#1380): a letter outside the BMP is still a letter.
+function firstCodePoint(s: string, i: number): string | undefined {
+  const cp = s.codePointAt(i);
+  return cp === undefined ? undefined : String.fromCodePoint(cp);
+}
+
 // Split a gap string into the CLOSING run that trails the previous word (belongs
 // BEFORE a line-break marker) and the remainder that leads the next word
 // (belongs AFTER it). Mirrors reconcileMarkers' "skip whitespace+closing, drop
@@ -1348,10 +1355,12 @@ function smartRebuildRange(
   const opensWith = (s: string) => s !== "" && OPENING_PUNCT_RE.test(s[0]);
   // The opener typed before new word j, curled as find/replace will curl
   // the result tree (#1378): a translator types a straight `"`/`'` in the
-  // Replace box, and the stored line opener is curly.
+  // Replace box, and the stored line opener is curly. The new word's first
+  // character is passed as what follows, so `;"the` reads as the opener it
+  // curls to (#1380).
   const typedLead = (j: number): string => {
     const { closing, rest } = splitGapAtMarker(gaps[j]);
-    return curlifyString(rest, closing !== "" ? closing[closing.length - 1] : j > 0 ? replaceWords[j - 1].slice(-1) : undefined);
+    return curlifyString(rest, closing !== "" ? closing[closing.length - 1] : j > 0 ? replaceWords[j - 1].slice(-1) : undefined, firstCodePoint(replaceWords[j] ?? "", 0));
   };
   const markerBefore = (j: number): Record<string, unknown> | null => {
     let jL = j - 1;
@@ -2486,8 +2495,10 @@ function isExactReplace(
     const MARKER_SPACE = "\u0002";
     const marked = extractPlainText({ verseObjects: withMarkerSentinels(out) })
       .replace(/[\s\u0001]*\u0001[\s\u0001]*/g, (run) => (/\s/.test(run) ? MARKER_SPACE : ""));
+    // A straight quote counts as the opener the save curls it to (`;"the`,
+    // #1380 part 2).
     const breakSpot = (k: number) =>
-      MARKER_CLOSING_RE.test(want[k - 1]) && !/\s/.test(want[k - 1]) && OPENING_PUNCT_RE.test(want[k]);
+      MARKER_CLOSING_RE.test(want[k - 1]) && !/\s/.test(want[k - 1]) && OPENING_PUNCT_RE.test(curlifyString(want[k], want[k - 1], firstCodePoint(want, k + 1)));
     let j = 0;
     for (let i = 0; i < marked.length; i++) {
       const ch = marked[i];

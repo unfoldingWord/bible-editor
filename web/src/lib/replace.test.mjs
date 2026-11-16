@@ -4767,6 +4767,25 @@ function countAllMilestones(nodes) {
   // Two markers in one gap (`\b \q1 “`): both stay before the opener.
   checkNoSpace("#1380 no space, two markers, wars. “Your king -> wars;“the great king", twoOpener, "wars. “Your king", "wars;“the great king",
     "use in wars; “the great king rules.”", /use in wars;\\b\s*\\q1 “the great king rules/, ["Your"]);
+  // #1380 part 2 (decision A): a straight `"` with punctuation before it and
+  // a letter right after it curls to an opener, so `;"the` saves exactly as
+  // `;“the` typed directly (it saved `wars;”the great \q1 king`).
+  checkNoSpace("#1380 straight \" no space (#1369 rule), wars. “Your king -> wars;\"the great king", opener, "wars. “Your king", 'wars;"the great king',
+    "use in wars; “the great king rules.”", /use in wars;\\q1 “the great king rules/, ["Your"]);
+  checkNoSpace("#1380 straight \" no space (#1371 rule), wars. “Your -> great fights;\"Your", opener, "wars. “Your", 'great fights;"Your',
+    "use in great fights; “Your king rules.”", /use in great fights;\\q1 “Your king rules/, ["wars"]);
+  // Guard: the change is for `"` only. A straight `'` there still curls to
+  // `’` (an apostrophe after punctuation is not read as an opener); pinned as
+  // main's results.
+  for (const [find, replacement, wantEd] of [
+    ["wars. ‘Your king", "wars;'the great king", "use in wars;’the great \\q1 king rules.’"],
+    ["wars. ‘Your", "great fights;'Your", "use in \\q1 great fights;’Your king rules.’"],
+  ]) {
+    const label = `#1380 guard, straight ' no space, ${find} -> ${replacement}`;
+    const r = run(singleOpener, find, replacement);
+    const ed = extractEditableText(r.content);
+    assert(ed === wantEd && markers(r.content) === markers(singleOpener), `${label}: as main (got ${JSON.stringify(ed)})`);
+  }
   {
     // Replace-all re-reads the plain text after each step: same layout.
     const label = "#1380 replace-all, wars. “Your king -> wars;“the great king";
