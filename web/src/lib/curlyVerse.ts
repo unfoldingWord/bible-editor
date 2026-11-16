@@ -103,6 +103,10 @@ const INLINE_QUOTE_TAGS: ReadonlySet<string> = new Set([
   "qt-s", "qt1-s", "qt2-s", "qt3-s", "qt4-s", "qt5-s",
 ]);
 
+// Footnote and cross-reference tags (as usfm.ts noteHasTrailingSpace). Same
+// set in both copies.
+const NOTE_TAGS: ReadonlySet<string> = new Set(["f", "fe", "x", "ef", "ex"]);
+
 // Mutates in place. Walks every node's own `.text` in document order, except
 // `\zaln-s` milestones (source-owned attributes, never touched); milestone
 // children (the aligned target words) are walked normally.
@@ -114,8 +118,11 @@ const INLINE_QUOTE_TAGS: ReadonlySet<string> = new Set([
 function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
   // Document order first, as line breaks ("\n") and text-bearing nodes, so a
   // quote at the end of one node can see the next node's first character
-  // (`wars;"` then `\w the`, #1380).
-  const steps: Array<"\n" | Record<string, unknown>> = [];
+  // (`wars;"` then `\w the`, #1380). A " " step only stops that look ahead:
+  // a footnote or cross reference (its prose is not verse text; usfm-js may
+  // park the line break after `\f*` on its nextChar), or whitespace on a
+  // node's nextChar, so `war."\f …\f*⏎And` keeps its closing ”.
+  const steps: Array<"\n" | " " | Record<string, unknown>> = [];
   const walk = (nodes: unknown[]): void => {
     for (const node of nodes) {
       if (!node || typeof node !== "object") continue;
@@ -128,10 +135,13 @@ function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
         o["type"] === "paragraph" ||
         (o["type"] === "quote" && !(typeof o["tag"] === "string" && INLINE_QUOTE_TAGS.has(o["tag"])));
       if (isLineMarker) steps.push("\n");
+      if (o["type"] === "footnote" || (typeof o["tag"] === "string" && NOTE_TAGS.has(o["tag"]))) steps.push(" ");
       const isSourceMilestone = o["type"] === "milestone" && o["tag"] === "zaln";
       const text = o["text"];
       if (!isSourceMilestone && typeof text === "string" && text.length > 0) steps.push(o);
       if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
+      // A line marker's nextChar is the space after `\q1`, before its text.
+      if (!isLineMarker && typeof o["nextChar"] === "string" && /^\s/.test(o["nextChar"])) steps.push(" ");
     }
   };
   walk(verseObjects);
@@ -139,6 +149,7 @@ function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
   let prevRaw: string | undefined;
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
+    if (step === " ") continue;
     if (step === "\n") {
       prevCurled = "\n";
       prevRaw = "\n";
@@ -147,7 +158,7 @@ function curlifyVerseObjectsInPlace(verseObjects: unknown[]): void {
     const text = step["text"] as string;
     if (/['"]/.test(text)) {
       const after = steps[i + 1];
-      const nextAfter = after === undefined ? undefined : after === "\n" ? "\n" : String.fromCodePoint((after["text"] as string).codePointAt(0)!);
+      const nextAfter = after === undefined ? undefined : typeof after === "string" ? after : String.fromCodePoint((after["text"] as string).codePointAt(0)!);
       const result = curlifyTextWithContext(text, prevCurled, prevRaw, nextAfter);
       if (result.changed) step["text"] = result.text;
       prevCurled = result.text[result.text.length - 1];
