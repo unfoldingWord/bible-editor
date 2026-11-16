@@ -824,8 +824,13 @@ Highlights that bite repeatedly:
   export and ours (2CH twl 11-12: 11 other-book exports, 12 reads in all; EZK tn night 1: 9, 15 in all), so a busy repo or a
   long-frozen watermark withholds there and only the ledger path stamps it. Door43 has no push time, so "dated
   before the render read" proves nothing for a commit below our merge, and the night after a stamp holds that
-  stamp's later human commits below tonight's merge: tonight waits for byte-for-byte convergence. Parallel-branch
-  human commits (EZK ust `c20a06c5`, JER tn `a45b1705`) still withhold by design; both are #1353.
+  stamp's later human commits below tonight's merge: tonight waits for byte-for-byte convergence (still open on
+  #1353: `pushed_read_at` is the D1 read time, so a push time "before the read" would not prove a commit reached
+  the render; a sound rule needs a fact recorded at export time). Side-branch human commits (EZK ust `c20a06c5`,
+  JER tn `a45b1705`, both forked from our merge's direct parent, measured) stamp since #1353 (Benjamin's decision
+  A): a human commit in the walk whose free, complete parents are only our single-parent merge's parent or other
+  such commits is provably not one our render overwrote, and must be joined by a merge proven to build on ours.
+  Accepted risk: a merge resolving a conflict in favour of the stale branch wins without a flag.
 - **The dual aligner's reading line decides whether to resync from its dirty state, not from focus.** Until #1067
   the unfocused resync compared the box against text `onInput` keeps equal to the box, so any verse change replaced
   a dirty line that had merely lost focus (clicked into the alignment panel), marked it clean and released its pin.
