@@ -76,6 +76,13 @@ function extractPlainText(verseObj) {
       if (isHeaderLabelNode(vo)) continue;
       if (typeof vo.text === "string") parts.push(vo.text);
       if (Array.isArray(vo.children)) walk(vo.children);
+      // The line break usfm-js parks on a footnote's `nextChar` separates the
+      // words on either side (#1372); same rule as noteHasTrailingSpace in
+      // web/src/lib/usfm.ts.
+      if (
+        typeof vo.nextChar === "string" && /^\s+$/.test(vo.nextChar) &&
+        (vo.type === "footnote" || (vo.type === undefined && ["f", "fe", "x", "ef", "ex"].includes(vo.tag)))
+      ) parts.push(" ");
     }
   };
   walk(verseObj?.verseObjects ?? []);
