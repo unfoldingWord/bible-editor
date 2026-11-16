@@ -250,6 +250,32 @@ console.log("\n[#1387: a set that shrinks to rows already dismissed stays dismis
   r = standing(db);
   ok(r.length === 1 && r[0].condition_key === editorKey(AFH), "#1387: a set that gains a row mints a new standing alert");
 
+  // The carried-forward key narrows the dismissal: G rejoining is a gain.
+  {
+    const { db, env } = fresh();
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AG), message: "seven", now: 10, observedAt: 10 });
+    db.prepare(`UPDATE system_alerts SET dismissed_at = 11`).run();
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AF), message: "six", now: 12, observedAt: 12, coveredByDismissed: covered(editorKey(AF)) });
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AG), message: "seven again", now: 13, observedAt: 13, coveredByDismissed: covered(editorKey(AG)) });
+    ok(standing(db).length === 1, "#1387: a verse that rejoins after the carry-forward alerts");
+  }
+  // The production sequence: {A..F} dismissed, superseded by {A..G}, that
+  // dismissed too, then {A..F} again. The carried-forward key equals the older
+  // resolved row's key; that row stays resolved history.
+  {
+    const { db, env } = fresh();
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AF), message: "six", now: 10, observedAt: 10 });
+    db.prepare(`UPDATE system_alerts SET dismissed_at = 11`).run();
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AG), message: "seven", now: 12, observedAt: 12, coveredByDismissed: covered(editorKey(AG)) });
+    ok(standing(db).length === 1, "#1387 prod sequence: the seventh verse alerts (1380)");
+    db.prepare(`UPDATE system_alerts SET dismissed_at = 13 WHERE dismissed_at IS NULL`).run();
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AF), message: "six", now: 14, observedAt: 14, coveredByDismissed: covered(editorKey(AF)) });
+    const all = rows(db);
+    ok(standing(db).length === 0, "#1387 prod sequence: the remaining six stay dismissed (no 1422)");
+    ok(all.length === 2 && all[0].resolved_at != null && all[1].resolved_at == null && all[1].condition_key === editorKey(AF),
+      "#1387 prod sequence: the old row stays resolved history; the dismissed row carries the six");
+  }
+
   // Wording flags must match: a shrunk set that gained the locked wording alerts.
   {
     const { db, env } = fresh();

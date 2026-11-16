@@ -1226,9 +1226,13 @@ export async function raiseVerseMergeConflictAlert(
         message: push ? `${msg} ${buildLockedPushSentence(book, resource, push)}` : msg,
         severity: "warning",
         observedAt: opts.observedAt,
-        // #1387: rows that only left a set the person dismissed keep it dismissed.
+        // #1387: rows that only left a set the person dismissed keep it
+        // dismissed. Not on a recording failure: the set is an undercount, and
+        // the editor key carries no flag that would show it.
         coveredByDismissed: (dismissedKey) =>
-          username === ALERT_USERNAME
+          opts.recordingFailed
+            ? false
+            : username === ALERT_USERNAME
             ? reviewConditionShrunk(conditionKey, dismissedKey, "verse_merge_conflict", { book, resource })
             : reviewConditionShrunk(conditionKey, dismissedKey, "verse_merge_conflict_editor", { book, resource, username }),
       });

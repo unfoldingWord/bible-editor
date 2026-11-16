@@ -3755,6 +3755,13 @@ console.log("\n[#1387: dismissed alert that shrinks stays dismissed (raise path)
   conflict(8, 400);
   await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: 400 });
   assert(standing().join() === "bethoakes,deferredreward", "#1387 raise: a new overwrite on an eighth verse alerts both again");
+
+  // A recording failure makes the measured set an undercount: it never keeps
+  // a dismissal, for the editor too, whose key carries no failure flag.
+  d.prepare(`UPDATE system_alerts SET dismissed_at = 450 WHERE dismissed_at IS NULL`).run();
+  d.prepare(`UPDATE verse_merge_conflicts SET resolved_at = 449, resolved_by = 2 WHERE verse = 8`).run();
+  await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: 500, recordingFailed: true });
+  assert(standing().join() === "bethoakes,deferredreward", "#1387 raise: a recording-failed run does not keep a shrunk set dismissed");
 }
 
 if (failed) {
