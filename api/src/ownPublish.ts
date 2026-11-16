@@ -334,6 +334,19 @@ export function judgeOwnPublishDecline(input: {
 //    - every non-human commit BELOW our merge must be on our merge's parent
 //      chain (a bot commit on a side branch older than our merge, joined by a
 //      merge the path walk does not show, is not).
+//    One exception (#1353, Benjamin's decision A): a maintainer's SIDE-BRANCH
+//    commit, merged after our merge, counts as made after our publish. A side
+//    commit is a human commit in the walk whose complete parent list (free:
+//    walk or ledger, never a read) holds only our merge's sole parent and
+//    other side commits. With one parent, our merge's ancestors are that
+//    parent and its ancestors, so a side commit is provably not one of them:
+//    our render never overwrote it (EZK ust c20a06c5, JER tn a45b1705). It may
+//    sit below our merge in the walk, it counts as proven-for-joining above
+//    it, and every side commit must be brought in by a merge proven to build
+//    on ours. Accepted risk: a merge that resolves a conflict in favour of the
+//    stale side branch then wins without a review flag. Anything messier (our
+//    merge with two parents, a branch from an older commit, a bot or unlisted
+//    side commit, a side commit no proven merge joins) still withholds.
 //    Every Door43 lookup counts toward `maxReads`; past it the stamp is
 //    withheld. On the live path the below-merge check walks every repo commit
 //    between the previous export and ours, one lookup each (2CH twl 11-12: 11
@@ -382,8 +395,6 @@ export async function judgeLineageStampAncestry(
   const mergeIdx = commits.findIndex((c) => c.sha === mergeSha);
   if (mergeIdx < 0) return { ok: false, reason: "merge_not_in_walk", sha: null, ancestryReads: 0 };
   const below = commits.slice(mergeIdx + 1);
-  const humanBelow = below.find((c) => c.kind === "human");
-  if (humanBelow) return { ok: false, reason: "human_before_merge", sha: humanBelow.sha, ancestryReads: 0 };
 
   const walkBySha = new Map(commits.map((c) => [c.sha, c]));
   const known = new Map<string, string[]>();
@@ -419,6 +430,27 @@ export async function judgeLineageStampAncestry(
   const fail = (reason: Exclude<LineageStampAncestry, { ok: true }>["reason"], sha: string | null): LineageStampAncestry =>
     ({ ok: false, reason, sha, ancestryReads: reads });
 
+  // Side commits (#1353, decision A), from free parent lists only.
+  const side = new Set<string>();
+  const mergeParents = await parentsOf(mergeSha, true);
+  if (Array.isArray(mergeParents) && mergeParents.length === 1) {
+    const base = mergeParents[0];
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const c of commits) {
+        if (c.kind !== "human" || c.sha === mergeSha || side.has(c.sha)) continue;
+        const ps = await parentsOf(c.sha, true);
+        if (Array.isArray(ps) && ps.every((p) => p === base || side.has(p))) {
+          side.add(c.sha);
+          grew = true;
+        }
+      }
+    }
+  }
+
+  const humanBelow = below.find((c) => c.kind === "human" && !side.has(c.sha));
+  if (humanBelow) return fail("human_before_merge", humanBelow.sha);
+
   // Our merge's ancestors reachable without a read. None of them descends
   // from our merge, and neither (for this proof) does a commit below it in the
   // walk, so a proof that reaches one fails at once.
@@ -435,25 +467,30 @@ export async function judgeLineageStampAncestry(
       }
     }
   }
-  const notDescendant = new Set([...freeAncestors, ...below.map((c) => c.sha)]);
+  const notDescendant = new Set([...freeAncestors, ...below.map((c) => c.sha)].filter((sha) => !side.has(sha)));
 
   // Above our merge: prove each commit, oldest first, depth-first through its
-  // parents. `proven.add` below is the only place a sha becomes proven.
+  // parents. `proven.add` below is the only place a sha becomes proven. A side
+  // commit is never proven, only accepted as a parent of a commit that has at
+  // least one proven parent; `joined` records the side commits so brought in.
   const proven = new Set([mergeSha]);
+  const joined = new Set<string>();
   const expanded = new Set<string>();
   for (let i = mergeIdx - 1; i >= 0; i--) {
     const stack = [commits[i].sha];
     while (stack.length > 0) {
       const sha = stack[stack.length - 1];
-      if (proven.has(sha)) {
+      if (proven.has(sha) || side.has(sha)) {
         stack.pop();
         continue;
       }
       if (notDescendant.has(sha)) return fail("not_descendant", sha);
       const ps = await parentsOf(sha);
       if (!Array.isArray(ps)) return fail(ps ?? "parents_unknown", sha);
-      const pending = ps.filter((p) => !proven.has(p));
+      const pending = ps.filter((p) => !proven.has(p) && !side.has(p));
       if (pending.length === 0) {
+        if (!ps.some((p) => proven.has(p))) return fail("not_descendant", sha);
+        for (const p of ps) if (side.has(p)) joined.add(p);
         proven.add(sha);
         stack.pop();
         continue;
@@ -465,9 +502,23 @@ export async function judgeLineageStampAncestry(
     }
   }
 
-  // Below our merge (every commit there is non-human by now): each must be on
-  // our merge's parent chain. Breadth-first from our merge until all are found.
-  const targets = new Set(below.map((c) => c.sha).filter((sha) => !freeAncestors.has(sha)));
+  // Every side commit must be brought in by a proven merge, directly or
+  // through the side commits it joins.
+  for (const work = [...joined]; work.length > 0; ) {
+    for (const p of known.get(work.pop()!) ?? []) {
+      if (side.has(p) && !joined.has(p)) {
+        joined.add(p);
+        work.push(p);
+      }
+    }
+  }
+  const unjoined = [...side].find((sha) => !joined.has(sha));
+  if (unjoined) return fail("not_descendant", unjoined);
+
+  // Below our merge (every commit there is non-human or a joined side commit
+  // by now): each non-side one must be on our merge's parent chain.
+  // Breadth-first from our merge until all are found.
+  const targets = new Set(below.map((c) => c.sha).filter((sha) => !freeAncestors.has(sha) && !side.has(sha)));
   const queue = [mergeSha];
   const seen = new Set(queue);
   for (let q = 0; q < queue.length && targets.size > 0; q++) {

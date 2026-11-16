@@ -4863,15 +4863,58 @@ console.log("\n[#1349: a human commit AFTER our preserved merge no longer freeze
       return rest;
     }),
   });
+  // #1353 adversarial shapes around decision A, all of which must withhold.
+  // A side branch forked from a human commit our merge overwrote: the side
+  // commit alone would pass, the overwritten commit below our merge does not.
+  const SIDE_OFF_OVERWRITTEN = [
+    { sha: "5d00000002", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["3aea90c6a7", "5d00000001"] },
+    { sha: "5d00000001", message: "Side fix", ...RICH, date: "2026-11-12T19:20:00Z", parents: ["abcd000001"] },
+    ...BEFORE_MERGE,
+  ];
+  // Our merge with two parents: a side commit off one of them is not shown to
+  // sit outside our merge's history by its parent alone.
+  const TWO_PARENT_MERGE = [
+    { sha: "7e00000002", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["3aea90c6a7", "7e00000001"] },
+    { sha: "7e00000001", message: "Side fix", ...RICH, date: "2026-11-12T19:20:00Z", parents: ["11c6654ac3"] },
+    { ...M2, parents: ["11c6654ac3", "7e0000000a"] },
+    { sha: "7e0000000a", message: "another book", ...OURS, date: "2026-11-12T19:10:00Z", parents: ["11c6654ac3"], touches: false },
+    ...BEFORE_MERGE.slice(2),
+  ];
+  // A bot (not a maintainer) commit on the side branch, joined by a visible merge.
+  const BOT_SIDE = [
+    { sha: "b5d0000002", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["3aea90c6a7", "b5d0000001"] },
+    { sha: "b5d0000001", message: "TQ: 2CH 3 [jo..e@api.bp-assistant]", authorEmail: "bot@bp-assistant", authorName: "BW Bot", date: "2026-11-12T19:20:00Z", parents: ["11c6654ac3"] },
+    M2,
+    ...BEFORE_MERGE.slice(2),
+  ];
+  // A side commit that no merge proven to build on ours brings in: the merge
+  // joining it is hidden, so the newest commit in the walk is the side commit.
+  const SIDE_UNJOINED = [
+    { sha: "50000000a2", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["3aea90c6a7", "50000000a1"], touches: false },
+    { sha: "50000000a1", message: "Side fix", ...RICH, date: "2026-11-12T19:20:00Z", parents: ["11c6654ac3"] },
+    M2,
+    ...BEFORE_MERGE.slice(2),
+  ];
+  // A side branch forked from an older commit than the one our merge sits on.
+  const SIDE_FROM_OLDER = [
+    { sha: "01d0000002", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["3aea90c6a7", "01d0000001"] },
+    { sha: "01d0000001", message: "Side fix on an old checkout", ...RICH, date: "2026-11-12T19:20:00Z", parents: ["ea9659c35f"] },
+    M2,
+    ...BEFORE_MERGE.slice(2),
+  ];
   for (const [label, graph, readAt, walkStart, expectReason] of [
-    ["EZK ust parallel branch, side commit in the walk", EZK_PARALLEL, at("2026-11-12T19:00:00Z"), at("2026-11-12T19:00:00Z"), "human_before_merge"],
-    ["EZK ust parallel branch, side commit older than the read, in the lineage walk", EZK_PARALLEL, at("2026-11-12T19:18:30Z"), at("2026-11-12T05:00:00Z"), "human_before_merge"],
+    // #1353 (decision A) stamps the parallel-branch shapes when the side commit
+    // is in the walk (block below). Absent from the walk (dated before the
+    // read, fresh walk) its author is unknown, so this one still withholds.
     ["EZK ust parallel branch, side commit older than the read (absent from the walk)", EZK_PARALLEL, at("2026-11-12T19:18:30Z"), null, "not_descendant"],
-    ["parallel-branch commit dated after our merge", LATE_PARALLEL, at("2026-11-12T19:00:00Z"), null, "not_descendant"],
     ["a human commit between the render read and our merge", BEFORE_MERGE, at("2026-11-12T19:05:00Z"), null, "human_before_merge"],
     ["a commit dated before the render read but pushed after it", LATE_PUSH, at("2026-11-12T19:05:00Z"), at("2026-11-12T05:00:00Z"), "human_before_merge"],
-    ["a fix on a nested merge of our merge and a side branch", NESTED_MERGE, at("2026-11-12T19:05:00Z"), null, "not_descendant"],
     ["a merge whose own history does not reach our merge", MERGE_NOT_REACHING, at("2026-11-12T19:05:00Z"), at("2026-11-12T19:05:00Z"), "not_descendant"],
+    ["#1353: a side branch forked from a human commit our merge overwrote", SIDE_OFF_OVERWRITTEN, at("2026-11-12T19:05:00Z"), null, "human_before_merge"],
+    ["#1353: a side branch off one parent of a two-parent merge of ours", TWO_PARENT_MERGE, at("2026-11-12T19:05:00Z"), null, "not_descendant"],
+    ["#1353: a bot commit on a side branch joined by a visible merge", BOT_SIDE, at("2026-11-12T19:05:00Z"), null, "not_descendant"],
+    ["#1353: a side commit no merge proven to build on ours brings in", SIDE_UNJOINED, at("2026-11-12T19:05:00Z"), null, "not_descendant"],
+    ["#1353: a side branch forked from an older commit than our merge's parent", SIDE_FROM_OLDER, at("2026-11-12T19:05:00Z"), at("2026-11-12T05:00:00Z"), "not_descendant"],
     ["more human commits after our merge than the ancestry reads allowed", MANY_AFTER, at("2026-11-12T19:00:00Z"), null, "read_cap"],
   ]) {
     const { sqlite, env } = freshEnv();
@@ -4888,6 +4931,71 @@ console.log("\n[#1349: a human commit AFTER our preserved merge no longer freeze
       0,
       `#1349 ${label}: …while the preserved verdict still stands`,
     );
+  }
+
+  // #1353 decision A: a maintainer's commit on a side branch from the commit
+  // our merge sits on, merged after our merge, counts as made after our
+  // publish, so the stamp advances. Accepted risk (Benjamin, #1353): a merge
+  // that resolves a conflict in favour of the stale side branch then wins
+  // without a review flag.
+  for (const [label, graph, readAt, walkStart] of [
+    ["EZK ust parallel branch, side commit in the walk", EZK_PARALLEL, at("2026-11-12T19:00:00Z"), at("2026-11-12T19:00:00Z")],
+    ["EZK ust parallel branch, side commit older than the read, in the lineage walk", EZK_PARALLEL, at("2026-11-12T19:18:30Z"), at("2026-11-12T05:00:00Z")],
+    ["parallel-branch commit dated after our merge", LATE_PARALLEL, at("2026-11-12T19:00:00Z"), null],
+    ["a fix on a nested merge of our merge and a side branch", NESTED_MERGE, at("2026-11-12T19:05:00Z"), null],
+    // Two side commits in a row, the older one dated before our merge.
+    ["a two-commit side branch", [
+      { sha: "2c00000003", message: "Merge branch 'side'", ...RICH, date: "2026-11-12T19:30:00Z", parents: ["3aea90c6a7", "2c00000002"] },
+      { sha: "2c00000002", message: "Side fix two", ...RICH, date: "2026-11-12T19:20:00Z", parents: ["2c00000001"] },
+      M2,
+      { sha: "2c00000001", message: "Side fix one", ...RICH, date: "2026-11-12T19:10:00Z", parents: ["11c6654ac3"] },
+      ...BEFORE_MERGE.slice(2),
+    ], at("2026-11-12T19:05:00Z"), at("2026-11-12T19:05:00Z")],
+  ]) {
+    const { sqlite, env } = freshEnv();
+    seedSync(sqlite, { oldEditId: 11, pushedEditId: 77, prNumber: 4886, readAt });
+    const g = giteaGraph(graph);
+    const walked = walkStart == null ? null : stripWalkParents(walkFrom(graph, walkStart));
+    const reason = await stampWithheldBy(() =>
+      withFetch(g.fetchImpl, () => accountOwnPublishDeclineForTest(env, B, "twl", FILE, walked, syncState(77, readAt))),
+    );
+    eq([watermark(sqlite), reason], [{ confirmedAt: readAt, editId: 77 }, null],
+      `#1353 ${label}: a maintainer's side branch merged after our merge no longer withholds the stamp`);
+  }
+
+  // #1353 row journey: the 2CH shape with Richard's fix on a side branch from
+  // the commit our merge sits on, joined by his merge after ours. Dated before
+  // our merge (below it in the walk) or after it, the fix is adopted with no
+  // flag, and the other rows the 2CH journey checks behave the same.
+  for (const [label, sideDate] of [
+    ["side commit dated before our merge", "2026-11-12T14:56:30Z"],
+    ["side commit dated after our merge", "2026-11-12T15:10:00Z"],
+  ]) {
+    const SIDE_2CH = [
+      { sha: "175aec6030", message: "Merge branch 'master' of git.door43.org:unfoldingWord/en_twl", ...RICH, date: "2026-11-12T15:25:54Z", parents: ["fa529ed8c4", "45714ba164"] },
+      { sha: "fa529ed8c4", message: "Fixes trouble TWL in 2CH", ...RICH, date: sideDate, parents: ["4371c4f15c"] },
+      ...GRAPH_2CH.slice(GRAPH_2CH.indexOf(M)),
+    ].sort((a, b) => at(b.date) - at(a.date));
+    const { sqlite, env } = freshEnv();
+    const { oldEditId, pushedEditId } = seedRows(sqlite);
+    seedSync(sqlite, { oldEditId, pushedEditId });
+    const g = giteaGraph(SIDE_2CH);
+    const reason = await stampWithheldBy(() =>
+      withFetch(g.fetchImpl, () =>
+        accountOwnPublishDeclineForTest(env, B, "twl", FILE, walkFrom(SIDE_2CH, OLD_WATERMARK), syncState(pushedEditId), Date.now(), "175aec6030", repoParentsOf(SIDE_2CH)),
+      ),
+    );
+    eq([watermark(sqlite), reason], [{ confirmedAt: READ_AT, editId: pushedEditId }, null],
+      `#1353 2CH side branch (${label}): the #658 stamp advances to our render`);
+    const cutoff = await getMasterConfirmedAtForTest(env, B, "twl");
+    await applyTsvRows(env, B, "twl", masterRows, null, { ...cutoff, lineage: HAS_HUMAN });
+    const rows = readRows(sqlite);
+    eq([rows.av3p.orig_words, rows.av3p.review_kind], [KING, null],
+      `#1353 2CH side branch (${label}): av3p adopts Richard's side-branch מֶֽלֶךְ with no flag`);
+    eq([rows.aftr.orig_words, rows.aftr.review_kind], ["וַיָּבֹא door43", "merge_conflict"],
+      `#1353 2CH side branch (${label}): a row edited in the app AFTER the export is flagged merge_conflict`);
+    eq([rows.x7oy.tw_link, rows.x7oy.review_kind], ["rc://*/tw/dict/bible/other/city-v5", null],
+      `#1353 2CH side branch (${label}): x7oy keeps D1's newer value, no flag`);
   }
 
   // Re-review B1: a bot commit whose parents the walk does not carry (a ledger
