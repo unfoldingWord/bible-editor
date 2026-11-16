@@ -9,6 +9,7 @@ import {
   appendSystemRecord,
   reviewConditionKey,
   verseMergeEditorConditionKey,
+  reviewConditionShrunk,
 } from "./reviewAlerts.ts";
 
 let failed = 0;
@@ -215,6 +216,88 @@ console.log("\n[Stage 7 migration: legacy duplicates are retained as history and
   const kept = migrated.find((r) => r.source === "reimport_kept_over_door43:JER:ust");
   ok(kept?.kind === "record", "legacy kept-over-Door43 rows are backfilled as non-actionable telemetry");
   ok(kept?.condition_key == null, "telemetry backfill does not invent a review condition key");
+}
+
+// Issue #1387: a dismissed alert whose remeasured set only lost rows stays
+// dismissed. Before the fix the shrunk set was a new key, so it resolved the
+// dismissed row and minted a fresh standing alert (EZK UST, four times).
+console.log("\n[#1387: a set that shrinks to rows already dismissed stays dismissed]");
+{
+  const refs = (...vs) => vs.map((v) => `1:${v}`);
+  const editorKey = (r, locked = false) => verseMergeEditorConditionKey("EZK", "ust", "ben", r, locked);
+  const identity = { book: "EZK", resource: "ust", username: "ben" };
+  const covered = (k) => (dismissedKey) => reviewConditionShrunk(k, dismissedKey, "verse_merge_conflict_editor", identity);
+  const standing = (db) => db.prepare(`SELECT * FROM system_alerts WHERE dismissed_at IS NULL AND resolved_at IS NULL`).all();
+  const source = "verse_merge_conflict:EZK:ust";
+  const AG = refs(1, 2, 3, 4, 5, 6, 7);
+  const AF = refs(1, 2, 3, 4, 5, 6);
+  const AFH = [...AF, "1:8"];
+
+  const { db, env } = fresh();
+  await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AG), message: "seven", now: 10, observedAt: 10 });
+  db.prepare(`UPDATE system_alerts SET dismissed_at = 11`).run();
+  // G resolved; tonight's sync measures A..F.
+  await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AF), message: "six", now: 12, observedAt: 12, coveredByDismissed: covered(editorKey(AF)) });
+  let r = rows(db);
+  ok(standing(db).length === 0, "#1387: the shrunk set raises no new standing alert");
+  ok(r.length === 1 && r[0].dismissed_at === 11 && r[0].resolved_at == null, "#1387: the dismissed row stays the one dismissed, unresolved row");
+  ok(r[0].condition_key === editorKey(AF) && r[0].message === "six", "#1387: the dismissed row now carries the remeasured key and message");
+  // Same set again tomorrow: exact match on the carried-forward key.
+  await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AF), message: "six", now: 13, observedAt: 13, coveredByDismissed: covered(editorKey(AF)) });
+  ok(standing(db).length === 0 && rows(db).length === 1, "#1387: an unchanged remeasure stays dismissed");
+  // A row the person never dismissed joins: alert.
+  await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AFH), message: "six plus H", now: 14, observedAt: 14, coveredByDismissed: covered(editorKey(AFH)) });
+  r = standing(db);
+  ok(r.length === 1 && r[0].condition_key === editorKey(AFH), "#1387: a set that gains a row mints a new standing alert");
+
+  // Wording flags must match: a shrunk set that gained the locked wording alerts.
+  {
+    const { db, env } = fresh();
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AG), message: "seven", now: 10, observedAt: 10 });
+    db.prepare(`UPDATE system_alerts SET dismissed_at = 11`).run();
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AF, true), message: "six locked", now: 12, observedAt: 12, coveredByDismissed: covered(editorKey(AF, true)) });
+    ok(standing(db).length === 1, "#1387: a subset with different wording flags still alerts");
+  }
+  // Sources that supply no predicate behave exactly as before.
+  {
+    const { db, env } = fresh();
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AG), message: "seven", now: 10, observedAt: 10 });
+    db.prepare(`UPDATE system_alerts SET dismissed_at = 11`).run();
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AF), message: "six", now: 12, observedAt: 12 });
+    ok(standing(db).length === 1, "#1387: without a predicate a changed key is still a new transition");
+  }
+  // A clean run resolves the dismissed row; a later recurrence alerts again.
+  {
+    const { db, env } = fresh();
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AG), message: "seven", now: 10, observedAt: 10 });
+    db.prepare(`UPDATE system_alerts SET dismissed_at = 11`).run();
+    await resolveReviewAlert(env, source, 12, "ben", 12);
+    await reconcileReviewAlert(env, { username: "ben", source, conditionKey: editorKey(AF), message: "six", now: 13, observedAt: 13, coveredByDismissed: covered(editorKey(AF)) });
+    ok(standing(db).length === 1, "#1387: a subset that recurs after a clean run alerts");
+  }
+  // Admin-shaped key: rows and noBase are compared as sets of whole entries.
+  {
+    const adminIdentity = { book: "EZK", resource: "ust" };
+    const row = (verse, overwrittenVersion = 3) => ({ chapter: 1, verse, action: "adopt_conflict", reason: "both_changed", overwrittenVersion });
+    const adminKey = (rs, extra = {}) => reviewConditionKey("verse_merge_conflict", adminIdentity, {
+      rows: rs, noBase: [], noBaseCount: 0, recordingFailed: false, ...extra,
+    });
+    const shrunk = (a, b) => reviewConditionShrunk(a, b, "verse_merge_conflict", adminIdentity);
+    const seven = [1, 2, 3, 4, 5, 6, 7].map((v) => row(v));
+    ok(shrunk(adminKey(seven.slice(0, 6)), adminKey(seven)), "#1387 admin: dropping a row is a shrink");
+    ok(!shrunk(adminKey([...seven.slice(0, 6), row(8)]), adminKey(seven)), "#1387 admin: gaining a row is not");
+    ok(!shrunk(adminKey([row(1, 9)]), adminKey(seven)), "#1387 admin: a re-overwritten verse (new version) is not");
+    ok(!shrunk(adminKey(seven.slice(0, 6), { recordingFailed: true }), adminKey(seven, { recordingFailed: true })),
+      "#1387 admin: an undercounted (recording failed) set never suppresses");
+    ok(!shrunk(adminKey(seven.slice(0, 6), { keptBookLocked: true }), adminKey(seven)), "#1387 admin: a changed wording flag is not");
+    const nb = (v) => ({ chapter: 2, verse: v, version: 4 });
+    ok(shrunk(adminKey([], { noBase: [nb(1)], noBaseCount: 1 }), adminKey([], { noBase: [nb(1), nb(2)], noBaseCount: 2 })),
+      "#1387 admin: a fully listed no-base set that shrinks is a shrink");
+    ok(!shrunk(adminKey([], { noBase: [nb(1)], noBaseCount: 5 }), adminKey([], { noBase: [nb(1), nb(2)], noBaseCount: 6 })),
+      "#1387 admin: a capped no-base list cannot prove a shrink");
+    ok(!shrunk(adminKey(seven), "legacy:v1:opaque") && !shrunk(adminKey(seven), null), "#1387 admin: unparseable stored keys never match");
+    ok(!shrunk(editorKey(AF), editorKey(AG).replace('"ben"', '"amy"')), "#1387: another recipient's key never matches");
+  }
 }
 
 if (failed) process.exitCode = 1;

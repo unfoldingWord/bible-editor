@@ -3706,6 +3706,57 @@ console.log("\n[editor overwrite alert: first-flagged dates per ref (issue #996)
   }
 }
 
+// Issue #1387, through the real raise path: the admin and the editor dismiss
+// the alert for seven overwritten verses, one verse is resolved, and the next
+// sync measures the remaining six. Neither alert comes back. A new overwrite
+// on an eighth verse still alerts both.
+console.log("\n[#1387: dismissed alert that shrinks stays dismissed (raise path)]");
+{
+  const d = verseDb();
+  d.exec(`ALTER TABLE system_alerts ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+    ALTER TABLE system_alerts ADD COLUMN condition_key TEXT;
+    ALTER TABLE system_alerts ADD COLUMN resolved_at INTEGER;
+    ALTER TABLE system_alerts ADD COLUMN condition_observed_at INTEGER;
+    CREATE UNIQUE INDEX system_alerts_one_standing_review_test
+      ON system_alerts(username, source)
+      WHERE kind='review' AND condition_key IS NOT NULL AND dismissed_at IS NULL AND resolved_at IS NULL;
+    CREATE TABLE users (id INTEGER PRIMARY KEY, dcs_username TEXT);
+    CREATE TABLE edit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+      user_id INTEGER, new_version INTEGER);`);
+  d.prepare(`INSERT INTO users (id, dcs_username) VALUES (7, 'bethoakes')`).run();
+  for (let v = 1; v <= 8; v++) {
+    d.prepare(`INSERT INTO edit_log (kind, row_key, book, user_id, new_version) VALUES ('verse', ?, 'EZK', 7, 3)`)
+      .run(`EZK/1/${v}/UST`);
+  }
+  const conflict = (verse, now) => upsertConflict(d, {
+    book: "EZK", resource: "ust", chapter: 1, verse,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 3, now,
+  });
+  const make = (sql, args = []) => ({
+    bind: (...next) => make(sql, next),
+    all: async () => ({ results: d.prepare(sql).all(...args) }),
+    run: async () => ({ meta: { changes: Number(d.prepare(sql).run(...args).changes) } }),
+  });
+  const env = { DB: { prepare: (sql) => make(sql) } };
+  const standing = () => d.prepare(
+    `SELECT username FROM system_alerts
+      WHERE source='verse_merge_conflict:EZK:ust' AND dismissed_at IS NULL AND resolved_at IS NULL ORDER BY username`,
+  ).all().map((r) => r.username);
+
+  for (let v = 1; v <= 7; v++) conflict(v, 100);
+  await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: 100 });
+  assert(standing().join() === "bethoakes,deferredreward", "#1387 raise: seven overwrites alert the admin and the editor");
+  d.prepare(`UPDATE system_alerts SET dismissed_at = 150`).run();
+  d.prepare(`UPDATE verse_merge_conflicts SET resolved_at = 149, resolved_by = 2 WHERE verse = 7`).run();
+  await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: 200 });
+  assert(standing().length === 0, `#1387 raise: the remaining six stay dismissed (standing: ${standing().join() || "none"})`);
+  await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: 300 });
+  assert(standing().length === 0, "#1387 raise: the next night's unchanged six stay dismissed");
+  conflict(8, 400);
+  await raiseVerseMergeConflictAlert(env, "EZK", "ust", { observedAt: 400 });
+  assert(standing().join() === "bethoakes,deferredreward", "#1387 raise: a new overwrite on an eighth verse alerts both again");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
