@@ -6,6 +6,11 @@
 // Decision rule: a quote is "opening" when the preceding character is
 // missing, whitespace, or another opener-ish punctuation; otherwise it's
 // closing. This makes ' double as a contextual apostrophe (don't → don’t).
+// One exception, for " only: sentence punctuation before it and a letter
+// right after it opens (#1380 decision A: `wars;"the` → `wars;“the`), the
+// same rule as the verse-tree curlers (curlyVerse.ts, importParsers.ts). A
+// keystroke at the end of the text has no letter after it yet, so it still
+// closes there.
 
 const LDQUO = "“";
 const RDQUO = "”";
@@ -19,20 +24,22 @@ function isOpeningContext(prev: string | undefined): boolean {
   return /[(\[{<\-–—/“‘]/.test(prev);
 }
 
-function curlyFor(ch: '"' | "'", prev: string | undefined): string {
+function curlyFor(ch: '"' | "'", prev: string | undefined, next?: string | undefined): string {
+  if (ch === '"' && prev !== undefined && /[.,;:!?]/.test(prev) && next !== undefined && /\p{L}/u.test(next)) return LDQUO;
   if (ch === '"') return isOpeningContext(prev) ? LDQUO : RDQUO;
   return isOpeningContext(prev) ? LSQUO : RSQUO;
 }
 
 // `prevContext` (optional) is the character immediately before the insertion
 // point in the surrounding document — it decides the curl direction of a quote
-// at position 0 without ever becoming part of the output.
-export function curlifyString(s: string, prevContext?: string): string {
+// at position 0 without ever becoming part of the output. `nextContext`
+// (optional) is the character right after the string, for a quote at its end.
+export function curlifyString(s: string, prevContext?: string, nextContext?: string): string {
   let out = "";
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (ch === '"' || ch === "'") {
-      out += curlyFor(ch as '"' | "'", out.length > 0 ? out[out.length - 1] : prevContext);
+      out += curlyFor(ch as '"' | "'", out.length > 0 ? out[out.length - 1] : prevContext, i + 1 < s.length ? s[i + 1] : nextContext);
     } else {
       out += ch;
     }
@@ -124,7 +131,7 @@ function handleBeforeInput(e: Event) {
     }
 
     const prev = start > 0 ? target.value[start - 1] : undefined;
-    const curly = curlyFor(data, prev);
+    const curly = curlyFor(data, prev, target.value[end]);
     ev.preventDefault();
     const before = target.value.slice(0, start);
     const after = target.value.slice(end);
@@ -157,7 +164,9 @@ function handleBeforeInput(e: Event) {
     if (startContainer.nodeType === Node.TEXT_NODE && startOffset > 0) {
       prev = (startContainer as Text).data[startOffset - 1];
     }
-    const curly = curlyFor(data, prev);
+    // The character after the caret (or selection), for `;|the` → `;“the`.
+    const next = range.endContainer.nodeType === Node.TEXT_NODE ? (range.endContainer as Text).data[range.endOffset] : undefined;
+    const curly = curlyFor(data, prev, next);
     ev.preventDefault();
     document.execCommand("insertText", false, curly);
   }
