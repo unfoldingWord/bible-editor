@@ -1801,6 +1801,13 @@ for (const n of ["", "1", "2", "3", "4", "5"]) {
     ["guard: end of verse closes", [t("wars;\"")], "wars;”"],
     ["guard: a single quote is unchanged", [t("wars;'the")], "wars;’the"],
     ["guard: \"\" still alternates", [t("wars;\"\"the")], "wars;”“the"],
+    // usfm-js shape of `\w war\w*."\f + \ft note\f*⏎\w And\w*`: the note has
+    // no text, and the line break is its nextChar. A note stops the look
+    // ahead, so the quote before it still closes.
+    ["guard: a footnote at line end after closes", [t("war.\""), { type: "footnote", tag: "f", content: "+ \\ft note", endTag: "f*", nextChar: "\n" }, w("And")], "war.”|And"],
+    ["guard: a footnote mid-line after closes", [t("war.\""), { type: "footnote", tag: "f", content: "+ \\ft note", endTag: "f*" }, w("And")], "war.”|And"],
+    ["guard: a cross reference after closes", [t("war.\""), { tag: "x", content: "- \\xo 1:1 \\xt Gen 1:1", endTag: "x*" }, w("And")], "war.”|And"],
+    ["guard: a space after a closing marker closes", [{ tag: "add", type: "character", nextChar: " ", children: [t("war.\"")] }, w("And")], "war.”|And"],
   ];
   for (const [label, verseObjects, want] of cases) {
     curlifyVerseObjects(verseObjects);
