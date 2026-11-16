@@ -76,6 +76,7 @@ const EXTRA_IMPORTS = new Map([
   ["src/unconfirmedRenders.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/reimportUnstampedBranches.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/lockAlertRefresh.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/verseReadPlan.test.mjs", "./src/tsResolveHook.mjs"],
   // saveRoundTrips.test.mjs drives the real rows.ts / verses.ts routers
   // (issue #905), which import their siblings extensionless.
   ["src/saveRoundTrips.test.mjs", "./src/tsResolveHook.mjs"],

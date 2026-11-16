@@ -174,6 +174,11 @@ Highlights that bite repeatedly:
   hands `GROUP BY row_key` its order for free; the sweep stayed at 21 s on a 1.5M-row synthetic table until
   `INDEXED BY` forced the new index (3.9 s, #928). Check `EXPLAIN QUERY PLAN` after adding an index, and pin
   the plan in a test (`editLogSweepPlan.test.mjs`). `INDEXED BY` makes the migration a hard prerequisite of the code.
+  The reverse also bites: a new index can pull *other* queries onto it. `edit_log_kind_action_created` (for
+  the sweep) let applyVerseRows' `... OR (action = 'baseline' AND created_at < ?)` sub-selects plan a
+  MULTI-INDEX OR that walks every verse baseline row per verse: ~7,000 rows read per verse, 70–138M rows a
+  night, and the nightly's reimport chunks failed with "D1 DB is overloaded" (#1386). After adding an index,
+  `grep` for queries whose filter it now matches, and check their plans too (`verseReadPlan.test.mjs`).
 
 - **A verse cell's "hydrate from a saved draft" branch must never run for a draft the user is creating right
   now.** All three verse views (`ScriptureColumn` `ActiveLine`, `BookView` `VerseCell`, `DocColumn`) subscribe to

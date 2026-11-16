@@ -6691,6 +6691,124 @@ function structureComponentStmts(
 
 export const structureComponentForTest = { size: structureComponentSize, stmts: structureComponentStmts };
 
+/**
+ * The SELECT applyVerseRows uses to read the current rows of the verses it is
+ * about to apply. `?1` book, `?2` bible_version, `?3..` the chapters. When
+ * `merge` is set (a confirmed export watermark exists) the merge-ancestor
+ * columns are appended; they bind the boundary at `?(chapterCount + 3)` (an
+ * edit_log id when `merge.idBoundary`, else a unix time) and the baseline
+ * boundary (a unix time) right after it. Exported for verseReadPlan.test.mjs.
+ */
+export function existingVerseRowsSql(
+  chapterCount: number,
+  merge: { idBoundary: boolean } | null,
+): string {
+  const chPlaceholders = Array.from({ length: chapterCount }, (_, i) => `?${i + 3}`).join(", ");
+  // Issue #1386: base_payload and base_row_exists name edit_log_row. Their
+  // `OR (action = 'baseline' AND created_at < ?)` arm is indexable on its own
+  // through edit_log_kind_action_created (migration 0073, for the sweep), so
+  // without the hint SQLite plans a MULTI-INDEX OR whose baseline arm walks
+  // every kind='verse' baseline row in the table for each verse, then filters
+  // on row_key. Measured on prod 2026-11-15, PSA ULT ch33 (23 verses): 153,179
+  // rows read and 694 ms unhinted, 61 rows and 0.5 ms hinted, same result. At
+  // that cost the nightly's chunk steps tripped "D1 DB is overloaded". Pinned
+  // by verseReadPlan.test.mjs.
+  const boundaryParam = chapterCount + 3;
+  const baseBoundary = merge?.idBoundary ? `id <= ?${boundaryParam}` : `created_at < ?${boundaryParam}`;
+  const sinceBoundary = merge?.idBoundary ? `id > ?${boundaryParam}` : `created_at >= ?${boundaryParam}`;
+  // Issue #537: `pipelineImport.ts` writes a content-bearing `action='baseline'`
+  // row (the pre-AI content) whose `created_at` is deliberately back-dated to
+  // that content's own timestamp, but whose `id` is assigned at AI-run time —
+  // so a baseline row's id is NOT chronological with its content, and the
+  // id-based `baseBoundary` above wrongly excludes it even when its real,
+  // back-dated timestamp predates the watermark. `baseline` rows are therefore
+  // matched on a parallel, always-timestamp boundary (never the id boundary,
+  // which cannot see them correctly). base_payload orders the combined
+  // candidates by `created_at DESC, id DESC` rather than `id DESC` alone —
+  // for the pre-existing `create`/`update` candidates this is equivalent (id
+  // is monotonic with created_at within one row's real-time history), and it
+  // lets a `baseline` row compete honestly against them for "most recent
+  // ancestor at/before the watermark". Measured against prod: 186 of 190
+  // verses that were permanently `keep_no_base` recover a real ancestor this
+  // way (see issue #537's comment thread for the corpus table).
+  const baselineBoundaryParam = boundaryParam + 1;
+  // Issue #727: `'bridge'` and `'split'` (verses.ts) are content-bearing —
+  // their payload holds the verse's full content at that version, in the same
+  // object shape verseHistory.ts's normalizeContent already absorbs — and
+  // human-authored (source NULL). They belong in BOTH sub-selects: as an
+  // ancestor candidate for base_payload (a bridge's payload is the last state
+  // both sides agreed on when nothing else was written since), and as the
+  // newest content row for latest_source (a human bridging an AI-drafted verse
+  // takes ownership of it; left out, the AI 'update' beneath it was the newest
+  // visible row and the verse re-seeded wholesale from master, un-bridging it).
+  // The TSV latest_source copies elsewhere in this file are untouched — those
+  // actions never occur on tn/tq/twl rows.
+  const mergeCols =
+    merge != null
+      ? `,
+            (SELECT payload_json FROM edit_log INDEXED BY edit_log_row
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND (
+                   (action IN ('create', 'update', 'bridge', 'split') AND ${baseBoundary})
+                   OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
+               )
+               ORDER BY created_at DESC, id DESC LIMIT 1) AS base_payload,
+            EXISTS (
+              SELECT 1 FROM edit_log INDEXED BY edit_log_row
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND (
+                   (action IN ('create', 'update', 'bridge', 'split') AND ${baseBoundary})
+                   OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
+                 )
+            ) AS base_row_exists,
+            EXISTS (
+              SELECT 1 FROM edit_log
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND source IS NULL
+                 -- Issue #537 fallout: a 'baseline' row is pipelineImport.ts's
+                 -- own pre-AI snapshot (user_id NULL, source NULL, but never a
+                 -- human touching the row), and its id is assigned at AI-run
+                 -- time regardless of how old its (back-dated) content is. Left
+                 -- unfiltered, recovering it as base_payload above would ALSO
+                 -- make it satisfy this "human edited since export" probe on
+                 -- its own id, defeating the clean case-5 adopt in
+                 -- computeVerseMerge and forcing every recovered-ancestor verse
+                 -- through the conflict-flagged both_changed path for no real
+                 -- reason — D1 never moved. Excluded here the same way it is
+                 -- deliberately INCLUDED, on its own timestamp boundary, above.
+                 AND action <> 'baseline'
+                 AND ${sinceBoundary}
+            ) AS human_edit_after_export,
+            (SELECT id FROM edit_log
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND action IN ('bridge', 'split')
+               ORDER BY id DESC LIMIT 1) AS structural_edit_id,
+            (SELECT created_at FROM edit_log
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND action IN ('bridge', 'split')
+               ORDER BY id DESC LIMIT 1) AS structural_edit_at`
+      : "";
+  return `SELECT chapter, verse, content_json, plain_text, verse_end, version, updated_by,
+            (SELECT source FROM edit_log
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND action IN ('create', 'update', 'bridge', 'split')
+               ORDER BY id DESC LIMIT 1) AS latest_source${mergeCols}
+       FROM verses
+      WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${chPlaceholders})`;
+}
+
 async function applyVerseRows(
   env: Env,
   book: string,
@@ -6735,7 +6853,6 @@ async function applyVerseRows(
   // 1. Read the current rows for exactly these verses' chapters in ONE query
   //    (callers pass a single chapter's verses, so the IN list is tiny).
   const chapters = [...new Set(verses.map((v) => v.chapter))];
-  const chPlaceholders = chapters.map((_, i) => `?${i + 3}`).join(", ");
 
   // 1a. FIX 1: the verse-merge ancestor cutoff for this (book, resource) —
   // passed in by the caller (getMasterConfirmedAt), which reads it ONCE per
@@ -6763,106 +6880,13 @@ async function applyVerseRows(
   // boundary exists (P1.3) both sub-selects cut on `id <= / > ?N` instead of
   // `created_at < / >= ?N`, so a same-second-as-the-export-read edit is
   // attributed correctly; ?N carries either value.
-  const boundaryParam = chapters.length + 3;
-  const baseBoundary = masterEditId != null ? `id <= ?${boundaryParam}` : `created_at < ?${boundaryParam}`;
-  const sinceBoundary = masterEditId != null ? `id > ?${boundaryParam}` : `created_at >= ?${boundaryParam}`;
   const boundaryBind = masterEditId != null ? masterEditId : lastExportAt;
-  // Issue #537: `pipelineImport.ts` writes a content-bearing `action='baseline'`
-  // row (the pre-AI content) whose `created_at` is deliberately back-dated to
-  // that content's own timestamp, but whose `id` is assigned at AI-run time —
-  // so a baseline row's id is NOT chronological with its content, and the
-  // id-based `baseBoundary` above wrongly excludes it even when its real,
-  // back-dated timestamp predates the watermark. `baseline` rows are therefore
-  // matched on a parallel, always-timestamp boundary (never the id boundary,
-  // which cannot see them correctly). base_payload orders the combined
-  // candidates by `created_at DESC, id DESC` rather than `id DESC` alone —
-  // for the pre-existing `create`/`update` candidates this is equivalent (id
-  // is monotonic with created_at within one row's real-time history), and it
-  // lets a `baseline` row compete honestly against them for "most recent
-  // ancestor at/before the watermark". Measured against prod: 186 of 190
-  // verses that were permanently `keep_no_base` recover a real ancestor this
-  // way (see issue #537's comment thread for the corpus table).
-  const baselineBoundaryParam = boundaryParam + 1;
-  // Issue #727: `'bridge'` and `'split'` (verses.ts) are content-bearing —
-  // their payload holds the verse's full content at that version, in the same
-  // object shape verseHistory.ts's normalizeContent already absorbs — and
-  // human-authored (source NULL). They belong in BOTH sub-selects: as an
-  // ancestor candidate for base_payload (a bridge's payload is the last state
-  // both sides agreed on when nothing else was written since), and as the
-  // newest content row for latest_source (a human bridging an AI-drafted verse
-  // takes ownership of it; left out, the AI 'update' beneath it was the newest
-  // visible row and the verse re-seeded wholesale from master, un-bridging it).
-  // The TSV latest_source copies elsewhere in this file are untouched — those
-  // actions never occur on tn/tq/twl rows.
-  const mergeCols =
-    lastExportAt != null
-      ? `,
-            (SELECT payload_json FROM edit_log
-               WHERE kind = 'verse'
-                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
-                 AND (book = ?1 OR book IS NULL)
-                 AND (
-                   (action IN ('create', 'update', 'bridge', 'split') AND ${baseBoundary})
-                   OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
-               )
-               ORDER BY created_at DESC, id DESC LIMIT 1) AS base_payload,
-            EXISTS (
-              SELECT 1 FROM edit_log
-               WHERE kind = 'verse'
-                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
-                 AND (book = ?1 OR book IS NULL)
-                 AND (
-                   (action IN ('create', 'update', 'bridge', 'split') AND ${baseBoundary})
-                   OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
-                 )
-            ) AS base_row_exists,
-            EXISTS (
-              SELECT 1 FROM edit_log
-               WHERE kind = 'verse'
-                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
-                 AND (book = ?1 OR book IS NULL)
-                 AND source IS NULL
-                 -- Issue #537 fallout: a 'baseline' row is pipelineImport.ts's
-                 -- own pre-AI snapshot (user_id NULL, source NULL, but never a
-                 -- human touching the row), and its id is assigned at AI-run
-                 -- time regardless of how old its (back-dated) content is. Left
-                 -- unfiltered, recovering it as base_payload above would ALSO
-                 -- make it satisfy this "human edited since export" probe on
-                 -- its own id, defeating the clean case-5 adopt in
-                 -- computeVerseMerge and forcing every recovered-ancestor verse
-                 -- through the conflict-flagged both_changed path for no real
-                 -- reason — D1 never moved. Excluded here the same way it is
-                 -- deliberately INCLUDED, on its own timestamp boundary, above.
-                 AND action <> 'baseline'
-                 AND ${sinceBoundary}
-            ) AS human_edit_after_export,
-            (SELECT id FROM edit_log
-               WHERE kind = 'verse'
-                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
-                 AND (book = ?1 OR book IS NULL)
-                 AND action IN ('bridge', 'split')
-               ORDER BY id DESC LIMIT 1) AS structural_edit_id,
-            (SELECT created_at FROM edit_log
-               WHERE kind = 'verse'
-                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
-                 AND (book = ?1 OR book IS NULL)
-                 AND action IN ('bridge', 'split')
-               ORDER BY id DESC LIMIT 1) AS structural_edit_at`
-      : "";
   const existingBind: unknown[] =
     lastExportAt != null
       ? [book, bibleVersion, ...chapters, boundaryBind, lastExportAt]
       : [book, bibleVersion, ...chapters];
   const existingRs = await env.DB.prepare(
-    `SELECT chapter, verse, content_json, plain_text, verse_end, version, updated_by,
-            (SELECT source FROM edit_log
-               WHERE kind = 'verse'
-                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
-                 AND (book = ?1 OR book IS NULL)
-                 AND action IN ('create', 'update', 'bridge', 'split')
-               ORDER BY id DESC LIMIT 1) AS latest_source${mergeCols}
-       FROM verses
-      WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${chPlaceholders})`,
+    existingVerseRowsSql(chapters.length, lastExportAt != null ? { idBoundary: masterEditId != null } : null),
   )
     .bind(...existingBind)
     .all<ExistingVerseRow>();
