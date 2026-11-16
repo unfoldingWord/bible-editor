@@ -111,6 +111,7 @@ import {
   reconcileReviewAlert,
   resolveReviewAlert,
   reviewConditionKey,
+  reviewConditionShrunk,
   reviewConditionState,
   verseMergeEditorConditionKey,
 } from "./reviewAlerts.ts";
@@ -1217,13 +1218,19 @@ export async function raiseVerseMergeConflictAlert(
       if (keepDismissed.has(username)) continue;
       const push = pushFor.get(username) ?? null;
       if (opts.notePush && !push) continue;
+      const conditionKey = conditionFor(username, push);
       await reconcileReviewAlert(env, {
         username,
         source,
-        conditionKey: conditionFor(username, push),
+        conditionKey,
         message: push ? `${msg} ${buildLockedPushSentence(book, resource, push)}` : msg,
         severity: "warning",
         observedAt: opts.observedAt,
+        // #1387: rows that only left a set the person dismissed keep it dismissed.
+        coveredByDismissed: (dismissedKey) =>
+          username === ALERT_USERNAME
+            ? reviewConditionShrunk(conditionKey, dismissedKey, "verse_merge_conflict", { book, resource })
+            : reviewConditionShrunk(conditionKey, dismissedKey, "verse_merge_conflict_editor", { book, resource, username }),
       });
     }
     // Fan-out recipients whose conflicts resolved are transitioned too;

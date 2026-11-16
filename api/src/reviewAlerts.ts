@@ -50,6 +50,47 @@ export function verseMergeEditorConditionKey(
   return reviewConditionKey("verse_merge_conflict_editor", { book, resource, username }, state);
 }
 
+/**
+ * Issue #1387: whether `key` measures the same condition as `previousKey`
+ * with only rows taken away, so a person who dismissed the larger set has
+ * already seen every row in it. Both keys must belong to `family` and
+ * `identity`. The set fields (`refs`, `rows`, `noBase`) compare as sets of
+ * whole entries; every other field must be equal, so a changed wording flag
+ * or a new overwrite version is a new condition. A recording failure makes
+ * the set an undercount, and a capped `noBase` list (count above its length)
+ * hides which verses left, so neither ever counts as a shrink.
+ */
+export function reviewConditionShrunk(
+  key: string,
+  previousKey: string | null | undefined,
+  family: string,
+  identity: Record<string, unknown>,
+): boolean {
+  const next = reviewConditionState(key, family, identity);
+  const prev = reviewConditionState(previousKey, family, identity);
+  const isObject = (v: unknown): v is Record<string, unknown> => v != null && typeof v === "object" && !Array.isArray(v);
+  if (!isObject(next) || !isObject(prev)) return false;
+  if (next.recordingFailed === true || prev.recordingFailed === true) return false;
+  const listed = (state: Record<string, unknown>) =>
+    state.noBaseCount === undefined || (Array.isArray(state.noBase) && state.noBase.length === state.noBaseCount);
+  if (!listed(next) || !listed(prev)) return false;
+  for (const field of new Set([...Object.keys(next), ...Object.keys(prev)])) {
+    const a = next[field];
+    const b = prev[field];
+    if (field === "refs" || field === "rows" || field === "noBase") {
+      if (!Array.isArray(a) || !Array.isArray(b)) return false;
+      const had = new Set(b.map(stableJson));
+      if (!a.every((entry) => had.has(stableJson(entry)))) return false;
+    } else if (field === "noBaseCount") {
+      // Equal to the noBase list's length (checked above), so the subset test covers it.
+      continue;
+    } else if (stableJson(a) !== stableJson(b)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function stableJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -72,6 +113,13 @@ export interface ReviewAlertInput {
   now?: number;
   /** Ordering token from the run; older observations may not overwrite newer ones. */
   observedAt?: number;
+  /**
+   * Issue #1387: given the key of the standing alert the person dismissed,
+   * whether this measurement is that condition with only rows taken away.
+   * When true the alert stays dismissed and carries the new key forward
+   * instead of minting a new standing alert. Omitted: any changed key alerts.
+   */
+  coveredByDismissed?: (dismissedKey: string | null) => boolean;
 }
 
 export interface SystemRecordInput {
@@ -202,6 +250,32 @@ export async function reconcileReviewAlert(env: Env, input: ReviewAlertInput): P
           AND (condition_observed_at IS NULL OR condition_observed_at <= ?5)`,
     )
       .bind(input.severity ?? "warning", input.message, input.linkUrl ?? null, matching.id, observedAt)
+      .run();
+    return;
+  }
+
+  // Issue #1387: the person dismissed a larger set and rows only left it. Keep
+  // the dismissal, carry the remeasured key and message forward onto that row
+  // (readers of the standing key, such as the #1127 push carry-forward, then
+  // see the current condition), and retire any stale active predecessor as
+  // the exact-match branch above does. A row that rejoins later is a gain
+  // against the carried-forward key and alerts.
+  const dismissedStanding = (rows.results ?? []).find((row) => row.dismissed_at != null && row.resolved_at == null);
+  if (dismissedStanding != null && input.coveredByDismissed?.(dismissedStanding.condition_key) === true) {
+    await env.DB.prepare(
+      `UPDATE system_alerts
+          SET condition_key = ?1, severity = ?2, message = ?3, link_url = ?4, condition_observed_at = ?5
+        WHERE id = ?6 AND dismissed_at IS NOT NULL AND resolved_at IS NULL
+          AND (condition_observed_at IS NULL OR condition_observed_at <= ?5)`,
+    )
+      .bind(input.conditionKey, input.severity ?? "warning", input.message, input.linkUrl ?? null, observedAt, dismissedStanding.id)
+      .run();
+    await env.DB.prepare(
+      `UPDATE system_alerts SET resolved_at = ?1
+        WHERE username = ?2 AND source = ?3 AND dismissed_at IS NULL AND resolved_at IS NULL
+          AND (condition_observed_at IS NULL OR condition_observed_at <= ?4)`,
+    )
+      .bind(now, input.username, input.source, observedAt)
       .run();
     return;
   }
