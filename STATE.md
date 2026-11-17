@@ -608,6 +608,17 @@ Highlights that bite repeatedly:
   - Validation is **per-book** (`--book` from the `-be-` branch name), so one bad book
     cannot block another's PR. The whole-repo behaviour noted elsewhere applies to the
     push-to-master workflow, which gates nothing.
+  - **One exception (#1403): the keep-master guard.** A tn/tq/twl row we did not change
+    since a push that provably reached master, but Door43 changed substantively, ships as
+    master's row; more than 20 such rows (or one Door43 also moved to another verse)
+    refuses the push (`master_moved_guard:*`). Two traps it had to avoid. (1) The base
+    must be a push that reached master (`master_confirmed_at === pushed_read_at`, or its
+    PR's squash merge in `dcs_commits`). The last push advances whether or not its PR
+    merged, and an unmerged render is our own unshipped work. (2) The base must be what
+    **D1** rendered, not the bytes pushed. After a keep, the pushed render holds master's
+    row, so comparing D1 to it reads as "we changed it" and the next export reverts it.
+    D1's render is stored beside the pushed one (`<r2Key>.d1-render`, R2 metadata ties
+    it to the pushed sha).
 
 - **A ported validator's FIDELITY is the gate's whole justification — diff it against the
   real source, don't eyeball it.** `usfmValidate.ts` had drifted from DCS in six places,
