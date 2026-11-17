@@ -124,8 +124,11 @@ in the app. Re-locking a book (going from unlocked to locked) offers a "Push
 to Door43 now?" prompt, so a fix made during the unlocked window doesn't sit
 in D1 until the next nightly export. Confirming calls
 `POST /api/books/:book/lock/push`, which fires one Workflow instance per
-resource (ult/ust/tn/tq/twl), each carrying `allowLocked: true` — see
-`books.post("/:book/lock/push", ...)` in `api/src/bookImport.ts`.
+chosen resource, each carrying `allowLocked: true` — see
+`books.post("/:book/lock/push", ...)` in `api/src/bookImport.ts`. The prompt
+has a checkbox per resource (ULT, UST, tN, tQ, tWL), all ticked by default;
+the body's optional `resources` list carries the choice, and leaving it out
+pushes all five (#1406).
 
 The prompt asks which of two things you mean, and **defaults to the safer one**:
 

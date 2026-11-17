@@ -1862,7 +1862,7 @@ export const api = {
       method: "DELETE",
     }),
 
-  // Push a currently-locked book to Door43 right now, across every resource,
+  // Push a currently-locked book to Door43 right now, for the chosen resources,
   // instead of waiting for the nightly export. Same lock-admin gate as
   // lockBook/unlockBook above (not requireAdmin) — server 400s with
   // { error: "book_not_locked" } if called on an unlocked book.
