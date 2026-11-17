@@ -29,6 +29,7 @@ import {
   type SourceWord,
 } from "./alignment.ts";
 import { nfc } from "./hebrew.ts";
+import { topLevelRefs } from "./bridgeSource.ts";
 import type { HoverHighlight, HighlightTone } from "./highlightTypes.ts";
 import type { VerseDto } from "../sync/api.ts";
 
@@ -40,6 +41,7 @@ import type { VerseDto } from "../sync/api.ts";
 export function resolveSourcePos(s: SourceWord, indexMap: Map<string, number>): number {
   const c = nfc(s.content ?? "");
   return (
+    refPos(s, indexMap) ??
     indexMap.get(`t:${c}|${s.occurrence}`) ??
     indexMap.get(`t:${c}|1`) ??
     indexMap.get(`s:${s.strong}|${s.occurrence}`) ??
@@ -151,6 +153,10 @@ export function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, n
   let idx = 0;
   const textCount = new Map<string, number>();
   const strongCount = new Map<string, number>();
+  // A joined bridge source also gets per-source-verse keys, `r:{x-ref}|{text}|
+  // {occurrence within that verse}`, for tCore's x-ref'd milestones (#1401).
+  let ref: string | undefined;
+  const refCount = new Map<string, number>();
   const walk = (nodes: unknown[]) => {
     for (const n of nodes ?? []) {
       const o = n as Record<string, unknown> | null;
@@ -166,6 +172,12 @@ export function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, n
         const strongKey = `s:${strong}|${sOcc}`;
         if (!map.has(textKey)) map.set(textKey, idx);
         if (!map.has(strongKey)) map.set(strongKey, idx);
+        if (ref !== undefined) {
+          const rc = `${ref}|${text}`;
+          const rOcc = (refCount.get(rc) ?? 0) + 1;
+          refCount.set(rc, rOcc);
+          map.set(`r:${rc}|${rOcc}`, idx);
+        }
         idx++;
       } else if (
         o["type"] === "milestone" ||
@@ -179,8 +191,24 @@ export function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, n
       }
     }
   };
-  walk(verseObjects);
+  const refs = topLevelRefs(verseObjects);
+  if (refs) {
+    verseObjects.forEach((n, i) => {
+      ref = refs[i];
+      walk([n]);
+    });
+  } else {
+    walk(verseObjects);
+  }
   return map;
+}
+
+// The exact position of an x-ref'd word inside a joined bridge source, where
+// its occurrence counts within its own source verse (#1401). Undefined when the
+// word has no x-ref or the source holds no such verse.
+function refPos(s: SourceWord, indexMap: Map<string, number>): number | undefined {
+  if (!s.ref) return undefined;
+  return indexMap.get(`r:${s.ref}|${nfc(s.content ?? "")}|${s.occurrence}`);
 }
 
 // Ids of source words claimed by 2+ distinct alignment groups — the
@@ -255,9 +283,9 @@ export function buildTargetIdToGroupId(displayGroups: AlignmentGroup[]): Map<str
 // See findReusedSourceWordIds.
 export function reusedTokenKey(s: SourceWord, indexMap: Map<string, number>): string | null {
   const content = nfc(s.content ?? "");
-  const pos = indexMap.get(`t:${content}|${s.occurrence}`);
+  const pos = refPos(s, indexMap) ?? indexMap.get(`t:${content}|${s.occurrence}`);
   if (pos !== undefined) return `p${pos}`;
-  return content === "" ? null : `c${content}|${s.occurrence}`;
+  return content === "" ? null : `c${content}|${s.occurrence}${s.ref ? `|${s.ref}` : ""}`;
 }
 
 export interface HoverPosMaps {

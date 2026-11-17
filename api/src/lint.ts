@@ -782,12 +782,15 @@ export function lintAlignmentOccurrences(
     // Inside a target bridge, tCore-aligned published UST (DEU, MAT) counts
     // occurrences per SOURCE verse, so אֶת once in 2CH 9:11 and once in 9:12 is
     // aligned 1/1 twice (#1396). bible-editor's own 2CH data also holds the
-    // span convention (1/2, 2/2). A milestone cannot say which source verse it
-    // came from, so a bridge accepts any declared total that equals the span
-    // count or the count in one bridged source verse, and checks each
-    // occurrence against its own declared total. Null unless the target bridge
+    // span convention (1/2, 2/2). A milestone with tCore's x-ref ("9:12") says
+    // which source verse it came from and is checked against that verse alone
+    // (#1401). One without it (or whose x-ref names no bridged verse holding
+    // the word) cannot say, so it passes on any declared total that equals the
+    // span count or the count in one bridged source verse, and each occurrence
+    // is checked against its own declared total. Null unless the target bridge
     // covers two or more separate source verses; that path is unchanged.
     let perVerse: Map<string, number>[] | null = null;
+    const perVerseByRef = new Map<string, Map<string, number>>();
     if (v.verse_end && v.verse_end > v.verse) {
       const seen = new Set<SourceToken[]>();
       const maps: Map<string, number>[] = [];
@@ -798,12 +801,13 @@ export function lintAlignmentOccurrences(
         const m = new Map<string, number>();
         for (const t of w) m.set(alignFold(t.text), (m.get(alignFold(t.text)) ?? 0) + 1);
         maps.push(m);
+        perVerseByRef.set(`${v.chapter}:${n}`, m);
       }
       if (maps.length > 1) perVerse = maps;
     }
 
-    // content → { declared totals seen, occurrence indices seen, per-milestone [occ, total] }
-    const groups = new Map<string, { totals: Set<number>; occs: Set<number>; pairs: [number, number][] }>();
+    // content → { declared totals seen, occurrence indices seen, per-milestone [occ, total, x-ref] }
+    const groups = new Map<string, { totals: Set<number>; occs: Set<number>; pairs: [number, number, string | null][] }>();
     const walk = (nodes: unknown[]): void => {
       for (const node of nodes) {
         if (!node || typeof node !== "object") continue;
@@ -819,7 +823,7 @@ export function lintAlignmentOccurrences(
             const occ = Number(o["occurrence"]);
             const tot = Number(o["occurrences"]);
             if (Number.isFinite(occ)) g.occs.add(occ);
-            g.pairs.push([occ, tot]);
+            g.pairs.push([occ, tot, typeof o["ref"] === "string" ? (o["ref"] as string) : null]);
             // A milestone with NO x-occurrences is UNKNOWN, not wrong. Reporting
             // it as "x-occurrences=?" turns missing metadata into a defect the
             // translator cannot act on — the same reasoning zalnLintKey applies
@@ -844,24 +848,61 @@ export function lintAlignmentOccurrences(
       // a translator cannot act on.
       if (!totals.length) continue;
       if (perVerse) {
+        // x-ref'd milestones whose verse is in this bridge and holds the word:
+        // checked against that verse's own count (#1401).
+        const fold = alignFold(content);
+        const ownVerse = new Map<string, { n: number; totals: Set<number>; occs: Set<number> }>();
+        const loose: [number, number][] = [];
+        for (const [o, t, r] of g.pairs) {
+          const n = r ? perVerseByRef.get(r)?.get(fold) : undefined;
+          if (!r || !n) { loose.push([o, t]); continue; }
+          const e = ownVerse.get(r) ?? { n, totals: new Set<number>(), occs: new Set<number>() };
+          if (Number.isFinite(t)) e.totals.add(t);
+          if (Number.isFinite(o)) e.occs.add(o);
+          ownVerse.set(r, e);
+        }
+        for (const [r, e] of ownVerse) {
+          const wrongOwn = [...e.totals].filter((t) => t !== e.n).sort((a, b) => a - b);
+          if (wrongOwn.length) {
+            issues.push({
+              check: "Alignment declares the wrong occurrence count",
+              bucket: "flag",
+              ref: `${v.chapter}:${v.verse}`,
+              message: `${v.bible_version} aligns "${content}" from ${r} with x-occurrences=${wrongOwn.join("/")}, but source verse ${r} contains it ${e.n} time(s).`,
+            });
+            continue;
+          }
+          const badOwn = [...e.occs].filter((o) => o < 1 || o > e.n).sort((a, b) => a - b);
+          if (badOwn.length) {
+            issues.push({
+              check: "Alignment occurrence out of range",
+              bucket: "flag",
+              ref: `${v.chapter}:${v.verse}`,
+              message: `${v.bible_version} aligns "${content}" from ${r} at x-occurrence ${badOwn.join(", ")}, but source verse ${r} contains it only ${e.n} time(s).`,
+            });
+          }
+        }
+        // Milestones without a usable x-ref: either convention.
+        const looseTotals = [...new Set(loose.map(([, t]) => t).filter((t) => Number.isFinite(t)))];
+        if (!looseTotals.length) continue;
         const single = new Set<number>();
         for (const m of perVerse) {
-          const n = m.get(alignFold(content));
+          const n = m.get(fold);
           if (n) single.add(n);
         }
-        const wrong = totals.filter((t) => t !== actual && !single.has(t));
+        const wrong = looseTotals.filter((t) => t !== actual && !single.has(t));
         if (wrong.length) {
           issues.push({
             check: "Alignment declares the wrong occurrence count",
             bucket: "flag",
             ref: `${v.chapter}:${v.verse}`,
-            message: `${v.bible_version} aligns "${content}" with x-occurrences=${totals.join("/")}, but the bridged source verses contain it ${actual} time(s) in all and ${[...single].sort((a, b) => a - b).join(" or ")} time(s) in any one verse.`,
+            message: `${v.bible_version} aligns "${content}" with x-occurrences=${looseTotals.join("/")}, but the bridged source verses contain it ${actual} time(s) in all and ${[...single].sort((a, b) => a - b).join(" or ")} time(s) in any one verse.`,
           });
           continue;
         }
         // Each occurrence against its own milestone's total; a milestone with
         // no total falls back to the span count.
-        const bad = [...new Set(g.pairs
+        const bad = [...new Set(loose
           .filter(([o, t]) => Number.isFinite(o) && (o < 1 || o > (Number.isFinite(t) ? t : actual)))
           .map(([o]) => o))].sort((a, b) => a - b);
         if (bad.length) {

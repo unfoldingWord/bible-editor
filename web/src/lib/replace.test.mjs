@@ -4965,6 +4965,40 @@ function countAllMilestones(nodes) {
     `stale "Bodymore.": replace-all more -> less saves "Body less.", Body aligned, footnote kept (got ${JSON.stringify(toUsfm(staleAll.content))})`);
 }
 
+// ─── #1401: inline edits in a tCore-aligned bridge keep every x-ref ─────────
+// 2CH 9:10-12 UST (Door43 master) counts source occurrences per source verse
+// and names that verse on each milestone (x-ref). An inline edit must leave
+// every milestone it did not touch exactly as it was, x-ref included.
+{
+  console.log("\n[#1401] 2CH 9:10-12 UST: inline edits keep x-ref and per-verse counts");
+  const raw = readFileSync(resolve(repoRoot, "docs/samples/en_ust_14-2CH-9_10-12.usfm"), "utf8");
+  const verse = () => ({ verseObjects: usfm.toJSON(raw).chapters["9"]["10-12"].verseObjects });
+  const sourceAttrs = (vo) => {
+    const out = [];
+    const walk = (ns) => {
+      for (const n of ns ?? []) {
+        if (n?.tag === "zaln") out.push(`${n.content}|${n.occurrence}/${n.occurrences}|${n.ref}`);
+        walk(n?.children);
+      }
+    };
+    walk(vo);
+    return out.sort();
+  };
+  const base = sourceAttrs(verse().verseObjects);
+  const oldPlain = extractEditableText(verse().verseObjects);
+  // Preserve path: one word for one word.
+  const swap = smartEditVerse(verse(), oldPlain, oldPlain.replace("admired", "praised"));
+  assert(swap.plainText.includes("praised"), "word swap applied");
+  assert(JSON.stringify(sourceAttrs(swap.content.verseObjects)) === JSON.stringify(base),
+    "word swap: every milestone keeps its x-ref, x-occurrence and x-occurrences");
+  // Localized rewrite: an insertion inside a milestone splits it.
+  const ins = smartEditVerse(verse(), oldPlain, oldPlain.replace("many things in Jerusalem", "many fine things in Jerusalem"));
+  assert(ins.plainText.includes("many fine things"), "insertion applied");
+  const after = sourceAttrs(ins.content.verseObjects);
+  assert(after.every((a) => !a.endsWith("|undefined")), "insertion: no milestone loses its x-ref");
+  assert(base.every((b) => after.includes(b)), "insertion: every original milestone identity survives");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
