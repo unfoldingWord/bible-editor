@@ -72,6 +72,7 @@ const ERROR_PREFIX_MAP: [string, string][] = [
   ["hard_reject_guard:", "Blocked: Door43 would reject this file"],
   ["align_shrink_guard:", "Blocked: alignment loss"],
   ["usfm_invalid_guard:", "Blocked: invalid USFM"],
+  ["master_moved_guard:", "Blocked: would undo Door43 edits"],
 ];
 const ERROR_EXACT_MAP: Record<string, string> = {
   no_rows: "Nothing to export",

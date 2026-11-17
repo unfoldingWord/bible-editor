@@ -57,6 +57,11 @@ import {
   exportRevertRaceAlertSource,
   masterIsOurLastPublish,
   priorPublishPointer,
+  planKeepMasterRows,
+  masterMovedGuardRefuses,
+  MASTER_MOVED_REFUSE_THRESHOLD,
+  type KeepMasterPlan,
+  type KeptMasterRow,
   RECORD_PUSHED_RENDER_SQL,
   isMasterConfirmed,
   lockedPushLanded,
@@ -70,6 +75,18 @@ import {
 // Banner target for export PR failures — same maintainer the post-export
 // validator alerts (see postExport.ts ValidatorConfig.alertTargetUsername).
 const EXPORT_ALERT_USERNAME = "deferredreward";
+
+// #1403: where the keep-master guard stores D1's own render beside a pushed
+// render that kept some of master's rows (see masterMovedGuard).
+export function d1RenderKey(r2Key: string): string {
+  return `${r2Key}.d1-render`;
+}
+
+// "id (ref), …" for the #1403 alerts, capped so a 79-row refusal stays readable.
+function describeKeptRows(rows: KeptMasterRow[]): string {
+  const shown = rows.slice(0, 12).map((r) => `${r.id} (${r.ref})`);
+  return shown.join(", ") + (rows.length > shown.length ? `, and ${rows.length - shown.length} more` : "");
+}
 
 // Legacy export branch, superseded by per-(book,resource) contributor branches.
 // Pruned best-effort on each export so it doesn't linger; safe to delete since
@@ -1190,6 +1207,65 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           prNumber: null,
           prReason: null,
         };
+      }
+    }
+
+    // Keep-master guard (#1403): a row Bible Editor has not changed since its
+    // last push that reached master, but that Door43 changed substantively,
+    // ships as master's row instead of reverting it. Too many such rows (or a
+    // row Door43 also moved to another verse) refuses the push. Runs before
+    // the hard-reject gate so every later step (that gate, the R2 copy,
+    // commitToDcs, recordPushedRender, a conflict rebuild, the revert report)
+    // sees the one content that actually ships. Not measured (no proven base,
+    // unreadable base or master, unparseable TSV) → ships as before.
+    if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl") && tsvMasterContentForRevertReport != null) {
+      const guard = await this.masterMovedGuard(book, resource, built.content, tsvMasterContentForRevertReport, r2Key);
+      if (guard.measured) {
+        const { plan } = guard;
+        if (masterMovedGuardRefuses(plan)) {
+          await this.recordMasterMovedRefusal(book, resource, plan);
+          const reason = `master_moved_guard:${plan.kept.length}_kept_${plan.moved.length}_moved`;
+          await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+          return {
+            book,
+            resource,
+            rowCount: built.rowCount,
+            bytes: built.content.length,
+            r2Key,
+            branch: null,
+            dcsCommitSha: null,
+            dcsChanged: false,
+            dcsSkippedReason: reason,
+            prNumber: null,
+            prReason: null,
+          };
+        }
+        await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
+        if (plan.kept.length > 0) {
+          const d1Render = built.content;
+          built.content = plan.content;
+          // The R2 copy at r2Key must hold the bytes that ship: it is the
+          // pushed render the next export and the sync read back by hash.
+          await this.env.BLOBS.put(r2Key, built.content, {
+            httpMetadata: { contentType: "text/tab-separated-values" },
+          });
+          // And D1's own render beside it, so the next export compares D1
+          // against what D1 was (not against the kept rows we pushed), which
+          // keeps the kept rows kept until D1 itself changes them. Tied to
+          // the pushed bytes by sha; baseBlobSha lets a step.do retry of this
+          // instance reuse this run's proof that the base reached master.
+          const pushedSha = await gitBlobSha(built.content);
+          await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
+            httpMetadata: { contentType: "text/tab-separated-values" },
+            customMetadata: { pushedBlobSha: pushedSha, baseBlobSha: guard.baseBlobSha },
+          });
+          console.log(
+            `export: kept Door43's version of ${plan.kept.length} ${book} ${resource} row(s) Bible Editor had not changed (#1403)`,
+          );
+          await this.recordKeptMasterRows(book, resource, plan.kept);
+        } else {
+          await this.clearExportAlert(`export_kept_master:${book}:${resource}`);
+        }
       }
     }
 
@@ -3436,6 +3512,164 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       issues,
     });
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // #1403: the keep-master guard's base and plan. The base is D1's render for
+  // our last push, and it counts only when that push provably reached master:
+  //   - master_confirmed_at === pushed_read_at: a byte comparison (at push or
+  //     by a later sync) found master holding exactly that render; or
+  //   - the export PR stamped for that render (pushed_pr_read_at ===
+  //     pushed_read_at) has our squash merge in the dcs_commits ledger. This
+  //     is the case that matters most: a person editing master right after
+  //     our merge defeats the byte comparison.
+  // Anything else is not a base. The last push advances every night whether
+  // or not its PR merged, and an unmerged render is our own unshipped work:
+  // treating it as base would read "master still has the old text" as
+  // "master moved" and keep master over a translator's edit.
+  //
+  // A step.do retry of this instance sees its own first attempt in pushed_*
+  // (priorPublishPointer then returns prev_*), and the confirmation columns no
+  // longer describe that previous render. The first attempt's proof is reused
+  // only when it kept rows, which is exactly when a fallback would push D1's
+  // raw render over the guarded branch: it left d1RenderKey(r2Key) carrying
+  // the base sha it measured. A retry of an attempt that kept nothing ships
+  // as before, the same as that attempt did.
+  //
+  // When the base push itself kept master rows, d1RenderKey(its r2Key) holds
+  // D1's render from that night; comparing against it (not the pushed bytes,
+  // which hold master's rows) keeps those rows kept until D1 changes them.
+  private async masterMovedGuard(
+    book: string,
+    resource: "tn" | "tq" | "twl",
+    rendered: string,
+    masterTsv: string,
+    r2Key: string,
+  ): Promise<{ measured: true; plan: KeepMasterPlan; baseBlobSha: string } | { measured: false; reason: string }> {
+    const notMeasured = (reason: string) => {
+      console.log(`export: keep-master guard not measured for ${book} ${resource} (${reason}); ships as before`);
+      return { measured: false as const, reason };
+    };
+    try {
+      const prior = await this.env.DB.prepare(
+        `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key,
+                pushed_read_at, master_confirmed_at, pushed_pr_number, pushed_pr_read_at
+           FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+      )
+        .bind(book, resource)
+        .first<{
+          pushed_blob_sha: string | null;
+          pushed_r2_key: string | null;
+          prev_pushed_blob_sha: string | null;
+          prev_pushed_r2_key: string | null;
+          pushed_read_at: number | null;
+          master_confirmed_at: number | null;
+          pushed_pr_number: number | null;
+          pushed_pr_read_at: number | null;
+        }>();
+      if (!prior) return notMeasured("no_sync_row");
+      const pointer = priorPublishPointer(prior, r2Key);
+      if (pointer.blobSha == null) return notMeasured("no_prior_push");
+      const retry = prior.pushed_r2_key != null && prior.pushed_r2_key === r2Key;
+      let reached = false;
+      if (retry) {
+        const marker = await this.env.BLOBS.head(d1RenderKey(r2Key));
+        reached = marker?.customMetadata?.baseBlobSha === pointer.blobSha;
+      } else if (prior.pushed_read_at != null && prior.master_confirmed_at === prior.pushed_read_at) {
+        reached = true;
+      } else if (
+        prior.pushed_read_at != null &&
+        prior.pushed_pr_number != null &&
+        prior.pushed_pr_read_at === prior.pushed_read_at
+      ) {
+        // The squash subject ends "(#N)" (findOurMergeForPr's match). The
+        // needle is built here, not in SQL: a number bound as REAL would
+        // concatenate as "77.0". The hour of slack covers clock skew between
+        // our D1 read and Door43's merge time.
+        const hit = await this.env.DB.prepare(
+          `SELECT 1 AS hit FROM dcs_commits
+            WHERE repo = ?1 AND classification = 'ours' AND committed_at >= ?3
+              AND instr(message, ?2) > 0
+            LIMIT 1`,
+        )
+          .bind(RESOURCE_TARGETS[resource].repo, `(#${prior.pushed_pr_number})`, prior.pushed_read_at - 3600)
+          .first<{ hit: number }>();
+        reached = hit != null;
+      }
+      if (!reached) return notMeasured("base_not_proven_on_master");
+      let baseText: string | null = null;
+      if (pointer.r2Key) {
+        const d1 = await this.env.BLOBS.get(d1RenderKey(pointer.r2Key));
+        if (d1 && d1.customMetadata?.pushedBlobSha === pointer.blobSha) baseText = await d1.text();
+      }
+      if (baseText == null) {
+        baseText = await readVerifiedPushedRenderText(this.env, book, resource, pointer.r2Key, pointer.blobSha);
+      }
+      if (baseText == null) return notMeasured("base_unreadable");
+      const plan = planKeepMasterRows(rendered, baseText, masterTsv, resource);
+      if (plan == null) return notMeasured("unparseable");
+      return { measured: true, plan, baseBlobSha: pointer.blobSha };
+    } catch (e) {
+      console.error("export: keep-master guard failed; ships as before", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return { measured: false, reason: "error" };
+    }
+  }
+
+  // Best-effort removal of one undismissed export alert (a condition measured
+  // clear this run). Same statement the hard-reject clear uses.
+  private async clearExportAlert(source: string): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+      )
+        .bind(EXPORT_ALERT_USERNAME, source)
+        .run();
+    } catch (err) {
+      console.error(`export alert clear failed for ${source}:`, err);
+    }
+  }
+
+  // #1403: the push shipped Door43's version of rows D1 had not changed. D1
+  // still holds the older text, so this stays up (re-written each push) until
+  // D1 catches up; a person pulling the book from Door43 clears it.
+  private async recordKeptMasterRows(book: string, resource: Resource, kept: KeptMasterRow[]): Promise<void> {
+    await this.writeAlert(
+      `export_kept_master:${book}:${resource}`,
+      `${book} ${resource.toUpperCase()}: kept Door43's version of ${kept.length} row(s) that Bible Editor ` +
+        `had not changed since its last push, instead of overwriting them with Bible Editor's older text: ` +
+        `${describeKeptRows(kept)}. Bible Editor still shows the older text for these rows. Pull ${book} ` +
+        `from Door43 to bring them in; editing one of them in Bible Editor instead makes that edit win on the next push.`,
+      `${this.env.DCS_BASE_URL}/unfoldingWord`,
+      "warning",
+    );
+  }
+
+  // #1403: the push was refused because it would undo too many Door43 edits
+  // (or one Door43 also moved to another verse).
+  private async recordMasterMovedRefusal(book: string, resource: Resource, plan: KeepMasterPlan): Promise<void> {
+    // The kept-rows banner from an earlier push is superseded by this one.
+    await this.clearExportAlert(`export_kept_master:${book}:${resource}`);
+    const why: string[] = [];
+    if (plan.kept.length > MASTER_MOVED_REFUSE_THRESHOLD) {
+      why.push(
+        `${plan.kept.length} rows is more than ${MASTER_MOVED_REFUSE_THRESHOLD}, which usually means Bible Editor's ` +
+          `copy of ${book} is out of date`,
+      );
+    }
+    if (plan.moved.length > 0) {
+      why.push(`${plan.moved.length} of them also moved to a different verse on Door43, which the export cannot place on its own`);
+    }
+    await this.writeAlert(
+      `export_master_moved:${book}:${resource}`,
+      `${book} ${resource.toUpperCase()}: not pushed to Door43. Door43 has changes to ${plan.kept.length + plan.moved.length} ` +
+        `row(s) that Bible Editor has not changed since its last push, and pushing would undo them (${why.join("; ")}). ` +
+        `Pull ${book} from Door43, check these rows, then push again: ${describeKeptRows([...plan.moved, ...plan.kept])}.`,
+      `${this.env.DCS_BASE_URL}/unfoldingWord`,
+      "error",
+    );
   }
 
   // Banner alert when the shrink guard blocks an export to avoid mass-deleting
