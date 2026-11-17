@@ -779,9 +779,31 @@ export function lintAlignmentOccurrences(
     if (!toks.length) continue;
     const counts = new Map<string, number>();
     for (const t of toks) counts.set(alignFold(t.text), (counts.get(alignFold(t.text)) ?? 0) + 1);
+    // Inside a target bridge, tCore-aligned published UST (DEU, MAT) counts
+    // occurrences per SOURCE verse, so אֶת once in 2CH 9:11 and once in 9:12 is
+    // aligned 1/1 twice (#1396). bible-editor's own 2CH data also holds the
+    // span convention (1/2, 2/2). A milestone cannot say which source verse it
+    // came from, so a bridge accepts any declared total that equals the span
+    // count or the count in one bridged source verse, and checks each
+    // occurrence against its own declared total. Null unless the target bridge
+    // covers two or more separate source verses; that path is unchanged.
+    let perVerse: Map<string, number>[] | null = null;
+    if (v.verse_end && v.verse_end > v.verse) {
+      const seen = new Set<SourceToken[]>();
+      const maps: Map<string, number>[] = [];
+      for (let n = v.verse; n <= v.verse_end; n++) {
+        const w = byRef.get(`${v.chapter}:${n}`);
+        if (!w || seen.has(w)) continue;
+        seen.add(w);
+        const m = new Map<string, number>();
+        for (const t of w) m.set(alignFold(t.text), (m.get(alignFold(t.text)) ?? 0) + 1);
+        maps.push(m);
+      }
+      if (maps.length > 1) perVerse = maps;
+    }
 
-    // content → { declared totals seen, occurrence indices seen }
-    const groups = new Map<string, { totals: Set<number>; occs: Set<number> }>();
+    // content → { declared totals seen, occurrence indices seen, per-milestone [occ, total] }
+    const groups = new Map<string, { totals: Set<number>; occs: Set<number>; pairs: [number, number][] }>();
     const walk = (nodes: unknown[]): void => {
       for (const node of nodes) {
         if (!node || typeof node !== "object") continue;
@@ -793,10 +815,11 @@ export function lintAlignmentOccurrences(
             // content differs only in NFC form would otherwise form separate
             // groups and each be compared against the merged count.
             const key = alignFold(content);
-            const g = groups.get(key) ?? { totals: new Set<number>(), occs: new Set<number>() };
+            const g = groups.get(key) ?? { totals: new Set<number>(), occs: new Set<number>(), pairs: [] };
             const occ = Number(o["occurrence"]);
             const tot = Number(o["occurrences"]);
             if (Number.isFinite(occ)) g.occs.add(occ);
+            g.pairs.push([occ, tot]);
             // A milestone with NO x-occurrences is UNKNOWN, not wrong. Reporting
             // it as "x-occurrences=?" turns missing metadata into a defect the
             // translator cannot act on — the same reasoning zalnLintKey applies
@@ -820,6 +843,37 @@ export function lintAlignmentOccurrences(
       // wrong. Reporting "x-occurrences=?" turns missing metadata into a defect
       // a translator cannot act on.
       if (!totals.length) continue;
+      if (perVerse) {
+        const single = new Set<number>();
+        for (const m of perVerse) {
+          const n = m.get(alignFold(content));
+          if (n) single.add(n);
+        }
+        const wrong = totals.filter((t) => t !== actual && !single.has(t));
+        if (wrong.length) {
+          issues.push({
+            check: "Alignment declares the wrong occurrence count",
+            bucket: "flag",
+            ref: `${v.chapter}:${v.verse}`,
+            message: `${v.bible_version} aligns "${content}" with x-occurrences=${totals.join("/")}, but the bridged source verses contain it ${actual} time(s) in all and ${[...single].sort((a, b) => a - b).join(" or ")} time(s) in any one verse.`,
+          });
+          continue;
+        }
+        // Each occurrence against its own milestone's total; a milestone with
+        // no total falls back to the span count.
+        const bad = [...new Set(g.pairs
+          .filter(([o, t]) => Number.isFinite(o) && (o < 1 || o > (Number.isFinite(t) ? t : actual)))
+          .map(([o]) => o))].sort((a, b) => a - b);
+        if (bad.length) {
+          issues.push({
+            check: "Alignment occurrence out of range",
+            bucket: "flag",
+            ref: `${v.chapter}:${v.verse}`,
+            message: `${v.bible_version} aligns "${content}" at x-occurrence ${bad.join(", ")}, beyond the x-occurrences its milestone declares.`,
+          });
+        }
+        continue;
+      }
       if (totals.length !== 1 || totals[0] !== actual) {
         issues.push({
           check: "Alignment declares the wrong occurrence count",
