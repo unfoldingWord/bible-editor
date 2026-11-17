@@ -40,6 +40,7 @@ function alignedVerse(chapter, verse, version, milestones) {
       verseObjects: milestones.map((m) => ({
         type: "milestone", tag: "zaln",
         content: m.content, occurrence: m.occurrence, occurrences: m.occurrences,
+        ...(m.ref ? { ref: m.ref } : {}),
         children: (m.words ?? ["x"]).map((t) => ({ type: "word", tag: "w", text: t })),
       })),
     }),
@@ -455,6 +456,52 @@ const only = (rows, src) => lintTnQuotes(rows, src);
   const oor = lintAlignmentOccurrences(outOfRange, src);
   assert(oor.length === 1 && oor[0].check === "Alignment occurrence out of range",
     "an occurrence beyond its own declared total in a bridge is flagged");
+
+  // ── x-ref names the milestone's own source verse (#1401) ──────────────────
+  // tCore writes x-ref="9:12" on each bridge milestone. When it is present and
+  // names a bridged verse holding the word, the milestone is checked against
+  // that verse alone, which catches totals the either-convention rule accepts.
+  const refOk = bridge([
+    { content: ET, occurrence: 1, occurrences: 1, ref: "9:11", words: ["the"] },
+    { content: ASHER, occurrence: 1, occurrences: 1, ref: "9:11", words: ["that"] },
+    { content: ET, occurrence: 1, occurrences: 1, ref: "9:12", words: ["everything"] },
+    { content: ASHER, occurrence: 1, occurrences: 2, ref: "9:12", words: ["that"] },
+    { content: ASHER, occurrence: 2, occurrences: 2, ref: "9:12", words: ["which"] },
+  ]);
+  const refOkIssues = lintAlignmentOccurrences(refOk, src);
+  assert(refOkIssues.length === 0,
+    `x-ref'd per-verse counts that match their own verse pass: ${JSON.stringify(refOkIssues.map((i) => i.message))}`);
+
+  // אֲשֶׁר occurs twice in 9:12; 1/1 is right for 9:11 but wrong for the verse
+  // this milestone names. The either-convention rule cannot see that.
+  const refWrongVerse = bridge([
+    { content: ASHER, occurrence: 1, occurrences: 1, ref: "9:12", words: ["that"] },
+    { content: ASHER, occurrence: 2, occurrences: 2, ref: "9:12", words: ["which"] },
+  ]);
+  const rwv = lintAlignmentOccurrences(refWrongVerse, src);
+  assert(rwv.length === 1 && rwv[0].check === "Alignment declares the wrong occurrence count" && rwv[0].message.includes("9:12"),
+    `an x-ref'd total that does not match its own verse is flagged: ${JSON.stringify(rwv.map((i) => i.message))}`);
+
+  // אֶת occurs once in 9:12; the span total 2 is not that verse's count.
+  const refSpanTotal = bridge([{ content: ET, occurrence: 1, occurrences: 2, ref: "9:12", words: ["the"] }]);
+  const rst = lintAlignmentOccurrences(refSpanTotal, src);
+  assert(rst.length === 1 && rst[0].check === "Alignment declares the wrong occurrence count",
+    "an x-ref'd milestone declaring the whole-bridge total is flagged");
+
+  // x-occurrence beyond the named verse's count.
+  const refOutOfRange = bridge([{ content: ASHER, occurrence: 3, occurrences: 2, ref: "9:12", words: ["that"] }]);
+  const ror = lintAlignmentOccurrences(refOutOfRange, src);
+  assert(ror.length === 1 && ror[0].check === "Alignment occurrence out of range",
+    "an x-ref'd occurrence beyond its own verse's count is flagged");
+
+  // An x-ref the bridge does not cover, or a verse without the word, falls
+  // back to the either-convention rule rather than adding a new flag.
+  const refUnresolved = bridge([
+    { content: ET, occurrence: 1, occurrences: 1, ref: "9:20", words: ["the"] },
+    { content: ET, occurrence: 1, occurrences: 1, ref: "9:10", words: ["everything"] },
+  ]);
+  assert(lintAlignmentOccurrences(refUnresolved, src).length === 0,
+    "an x-ref that names no bridged verse holding the word falls back to the old rule");
 }
 
 if (failures) { console.error(`\n${failures} assertion(s) failed`); process.exit(1); }

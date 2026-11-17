@@ -938,6 +938,13 @@ Highlights that bite repeatedly:
   them unmapped. Two inversions to keep straight: `masterMayHoldHumanEditForVerse` answers "true" on doubt, which is
   protective for an ordinary row and exactly wrong for a preserved one; and `buildTsvEditedWriteStmt` drops
   `preserve = 0` only for writes decided under this gate, because a preserve toggle does not bump `version`.
+- **Inside a bridged ULT/UST verse, tCore counts `x-occurrence` per SOURCE verse and names it in `x-ref`
+  ("9:12"); milestones without `x-ref` are the older whole-bridge convention (#1401).** Both exist on Door43
+  (2CH 9:10-12 has `x-ref` on all 65 milestones; 2CH 3:11-12 and 32:13-14 have none). The aligner learns where
+  each source verse starts only from `concatSourceRange` (side table in `web/src/lib/bridgeSource.ts`, keyed by
+  the joined array): a joined source built any other way, or a copy of that array, silently gets whole-bridge
+  behaviour, so x-ref'd milestones resolve against the wrong copy of a repeated word. Any identity key on a
+  source word (`content|occurrence`) must include `ref`, or the same 1/1 in two bridged verses collapses.
 
 ## Stop conditions / goals
 

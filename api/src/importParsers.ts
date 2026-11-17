@@ -927,7 +927,9 @@ export function stripOrphanAlignmentMarkers(verseObjects: unknown[]): unknown[] 
 function zalnDedupKey(node: Record<string, unknown>): string | null {
   const content = node["content"];
   if (typeof content !== "string" || content === "") return null;
-  return `${content.normalize("NFC")}|${String(node["occurrence"] ?? "1")}`;
+  const key = `${content.normalize("NFC")}|${String(node["occurrence"] ?? "1")}`;
+  // Per-verse occurrence inside a bridge (#1401): the x-ref verse is part of the token.
+  return node["ref"] !== undefined ? `${key}|${String(node["ref"])}` : key;
 }
 function isZalnNode(n: Record<string, unknown> | null): boolean {
   return !!n && n["type"] === "milestone" && n["tag"] === "zaln";
