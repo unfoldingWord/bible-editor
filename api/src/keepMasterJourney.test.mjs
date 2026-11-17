@@ -185,7 +185,7 @@ function editNote(tsv, id, note) {
     })
     .join("\n");
 }
-const noteOf = (tsv, id) => tsv.split("\n").find((l) => l.split("\t")[1] === id)?.split("\t")[6];
+const noteOf = (tsv, id) => (tsv ?? "").split("\n").find((l) => l.split("\t")[1] === id)?.split("\t")[6];
 
 const ROWS = [
   ["aa11", 1, "First note."],
