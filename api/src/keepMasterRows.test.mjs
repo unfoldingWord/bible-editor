@@ -95,6 +95,42 @@ console.log("\n[master moved the row to another verse → not kept, refuses]");
   ok(masterMovedGuardRefuses(plan), "a moved row refuses the push");
 }
 
+console.log("\n[review round 1: what still counts as our change, and as a Door43 move]");
+{
+  // A Door43 move to another verse with NO text change also refuses (Codex F2).
+  const base = tn([row("1:1", "aa11", "Same note.")]);
+  const movedOnly = planKeepMasterRows(base, base, tn([row("1:2", "aa11", "Same note.")]), "tn");
+  ok(movedOnly.moved.length === 1 && movedOnly.kept.length === 0, "a reference-only move is reported as moved");
+  ok(masterMovedGuardRefuses(movedOnly), "…and refuses the push");
+
+  // A translator's literal line break is our change, not whitespace churn.
+  const oursBreak = tn([row("1:1", "aa11", "Same\\nnote.")]);
+  const p1 = planKeepMasterRows(oursBreak, base, tn([row("1:1", "aa11", "Door43 wording.")]), "tn");
+  ok(p1.kept.length === 0 && p1.content === oursBreak, "a `\\n` line-break edit on our side keeps ours");
+
+  // twl: a translator's Tags-only edit is our change too (Codex F1).
+  const TWL = "Reference\tID\tTags\tOrigWords\tOccurrence\tTWLink";
+  const twl = (words, tags) => `${TWL}\n1:1\tw111\t${tags}\t${words}\t1\trc://*/tw/dict/bible/kt/god\n`;
+  const p2 = planKeepMasterRows(twl("אֱלֹהִים", "keyterm"), twl("אֱלֹהִים", ""), twl("אֱלֹהֵי", ""), "twl");
+  ok(p2.kept.length === 0, "a twl Tags edit on our side keeps ours");
+
+  // tn: a kept row ships with blank Tags, like every other exported tn row.
+  const masterTagged = [row("1:1", "aa11", "Door43 wording.")];
+  masterTagged[0][2] = "stale-tag";
+  const p3 = planKeepMasterRows(base, base, tn(masterTagged), "tn");
+  ok(p3.kept.length === 1 && p3.content.split("\n")[1].split("\t")[2] === "", "a kept tn row's Tags are blanked");
+
+  // Columns in another order are not read as ours (Claude F9).
+  const swapped = base.replace("SupportReference\tQuote", "Quote\tSupportReference");
+  ok(planKeepMasterRows(base, base, swapped, "tn") === null, "a master with reordered columns → null");
+
+  // onlyIds restricts the plan (carry mode).
+  const two = tn([row("1:1", "aa11", "A."), row("1:2", "bb22", "B.")]);
+  const twoMaster = tn([row("1:1", "aa11", "A fixed."), row("1:2", "bb22", "B fixed.")]);
+  const p4 = planKeepMasterRows(two, two, twoMaster, "tn", new Set(["bb22"]));
+  ok(p4.kept.map((k) => k.id).join() === "bb22", "onlyIds limits the kept rows");
+}
+
 console.log("\n[threshold]");
 {
   const n = MASTER_MOVED_REFUSE_THRESHOLD + 1;

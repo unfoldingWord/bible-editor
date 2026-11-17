@@ -82,6 +82,17 @@ export function d1RenderKey(r2Key: string): string {
   return `${r2Key}.d1-render`;
 }
 
+// IDs whose line differs between D1's render and the bytes pushed for it:
+// the rows that push kept from master (#1403 carry mode).
+function keptIdsBetween(d1Render: string, pushed: string): Set<string> {
+  const lines = (raw: string) =>
+    new Map(raw.split(/\r?\n/).slice(1).filter(Boolean).map((l) => [l.split("\t")[1]?.trim() ?? "", l] as const));
+  const a = lines(d1Render);
+  const out = new Set<string>();
+  for (const [id, line] of lines(pushed)) if (id && a.has(id) && a.get(id) !== line) out.add(id);
+  return out;
+}
+
 // "id (ref), …" for the #1403 alerts, capped so a 79-row refusal stays readable.
 function describeKeptRows(rows: KeptMasterRow[]): string {
   const shown = rows.slice(0, 12).map((r) => `${r.id} (${r.ref})`);
@@ -155,7 +166,7 @@ import {
   DcsReleaseListSchema,
   type DcsRelease,
 } from "./publishedGuard";
-import { BOOK_NUMBERS } from "./dcsSources";
+import { BOOK_NUMBERS, DCS_OWNER } from "./dcsSources";
 
 export interface ExportParams {
   // Restrict the run to one book. Useful for manual /api/exports/run.
@@ -1244,20 +1255,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         if (plan.kept.length > 0) {
           const d1Render = built.content;
           built.content = plan.content;
+          // D1's own render beside the pushed one, so the next export compares
+          // D1 against what D1 was (not against the kept rows we pushed), which
+          // keeps the kept rows kept until D1 itself changes them. Tied to the
+          // pushed bytes by sha; baseBlobSha/baseMode let a step.do retry of
+          // this instance reuse this run's verdict. Written FIRST: if the put
+          // below then fails, the step retries before anything is recorded.
+          const pushedSha = await gitBlobSha(built.content);
+          await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
+            httpMetadata: { contentType: "text/tab-separated-values" },
+            customMetadata: { pushedBlobSha: pushedSha, baseBlobSha: guard.baseBlobSha, baseMode: guard.mode },
+          });
           // The R2 copy at r2Key must hold the bytes that ship: it is the
           // pushed render the next export and the sync read back by hash.
           await this.env.BLOBS.put(r2Key, built.content, {
             httpMetadata: { contentType: "text/tab-separated-values" },
-          });
-          // And D1's own render beside it, so the next export compares D1
-          // against what D1 was (not against the kept rows we pushed), which
-          // keeps the kept rows kept until D1 itself changes them. Tied to
-          // the pushed bytes by sha; baseBlobSha lets a step.do retry of this
-          // instance reuse this run's proof that the base reached master.
-          const pushedSha = await gitBlobSha(built.content);
-          await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
-            httpMetadata: { contentType: "text/tab-separated-values" },
-            customMetadata: { pushedBlobSha: pushedSha, baseBlobSha: guard.baseBlobSha },
           });
           console.log(
             `export: kept Door43's version of ${plan.kept.length} ${book} ${resource} row(s) Bible Editor had not changed (#1403)`,
@@ -3515,36 +3527,48 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   }
 
   // #1403: the keep-master guard's base and plan. The base is D1's render for
-  // our last push, and it counts only when that push provably reached master:
+  // our last push, and it counts in full only when that push provably reached
+  // master:
   //   - master_confirmed_at === pushed_read_at: a byte comparison (at push or
   //     by a later sync) found master holding exactly that render; or
   //   - the export PR stamped for that render (pushed_pr_read_at ===
   //     pushed_read_at) has our squash merge in the dcs_commits ledger. This
   //     is the case that matters most: a person editing master right after
-  //     our merge defeats the byte comparison.
-  // Anything else is not a base. The last push advances every night whether
-  // or not its PR merged, and an unmerged render is our own unshipped work:
-  // treating it as base would read "master still has the old text" as
+  //     our merge defeats the byte comparison. The ledger tracks DCS_OWNER's
+  //     repos only, so it proves nothing when exports go to another owner.
+  // Otherwise the last push is not a full base. It advances every night
+  // whether or not its PR merged, and an unmerged render is our own unshipped
+  // work: treating it as base would read "master still has the old text" as
   // "master moved" and keep master over a translator's edit.
+  //
+  // "carry" mode: an unproven last push that itself kept rows (it has a
+  // d1-render sibling) still carries THOSE rows forward. They were measured
+  // against a proven base when first kept, and dropping them would push D1's
+  // old text over them onto the same branch (a lock & push before the PR
+  // merges, or a PR held red for days). Only rows that push kept are planned,
+  // against D1's render from that push; new Door43 edits wait for a proven base.
+  //
+  // When the base push kept rows, d1RenderKey(its r2Key) holds D1's render
+  // from that night; comparing against it (not the pushed bytes, which hold
+  // master's rows) keeps those rows kept until D1 changes them.
   //
   // A step.do retry of this instance sees its own first attempt in pushed_*
   // (priorPublishPointer then returns prev_*), and the confirmation columns no
-  // longer describe that previous render. The first attempt's proof is reused
-  // only when it kept rows, which is exactly when a fallback would push D1's
-  // raw render over the guarded branch: it left d1RenderKey(r2Key) carrying
-  // the base sha it measured. A retry of an attempt that kept nothing ships
-  // as before, the same as that attempt did.
-  //
-  // When the base push itself kept master rows, d1RenderKey(its r2Key) holds
-  // D1's render from that night; comparing against it (not the pushed bytes,
-  // which hold master's rows) keeps those rows kept until D1 changes them.
+  // longer describe that previous render. The first attempt's verdict is
+  // reused only when it kept rows, which is exactly when a fallback would push
+  // D1's raw render over the guarded branch: it left d1RenderKey(r2Key)
+  // carrying the base sha and mode it measured. A retry of an attempt that
+  // kept nothing ships as before, the same as that attempt did.
   private async masterMovedGuard(
     book: string,
     resource: "tn" | "tq" | "twl",
     rendered: string,
     masterTsv: string,
     r2Key: string,
-  ): Promise<{ measured: true; plan: KeepMasterPlan; baseBlobSha: string } | { measured: false; reason: string }> {
+  ): Promise<
+    | { measured: true; plan: KeepMasterPlan; baseBlobSha: string; mode: "full" | "carry" }
+    | { measured: false; reason: string }
+  > {
     const notMeasured = (reason: string) => {
       console.log(`export: keep-master guard not measured for ${book} ${resource} (${reason}); ships as before`);
       return { measured: false as const, reason };
@@ -3570,16 +3594,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       const pointer = priorPublishPointer(prior, r2Key);
       if (pointer.blobSha == null) return notMeasured("no_prior_push");
       const retry = prior.pushed_r2_key != null && prior.pushed_r2_key === r2Key;
-      let reached = false;
+      let mode: "full" | "carry" | null = null;
       if (retry) {
         const marker = await this.env.BLOBS.head(d1RenderKey(r2Key));
-        reached = marker?.customMetadata?.baseBlobSha === pointer.blobSha;
+        if (marker?.customMetadata?.baseBlobSha === pointer.blobSha) {
+          mode = marker.customMetadata?.baseMode === "carry" ? "carry" : "full";
+        }
       } else if (prior.pushed_read_at != null && prior.master_confirmed_at === prior.pushed_read_at) {
-        reached = true;
+        mode = "full";
       } else if (
         prior.pushed_read_at != null &&
         prior.pushed_pr_number != null &&
-        prior.pushed_pr_read_at === prior.pushed_read_at
+        prior.pushed_pr_read_at === prior.pushed_read_at &&
+        (this.env.DCS_EXPORT_OWNER ?? "unfoldingWord") === DCS_OWNER
       ) {
         // The squash subject ends "(#N)" (findOurMergeForPr's match). The
         // needle is built here, not in SQL: a number bound as REAL would
@@ -3593,21 +3620,32 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         )
           .bind(RESOURCE_TARGETS[resource].repo, `(#${prior.pushed_pr_number})`, prior.pushed_read_at - 3600)
           .first<{ hit: number }>();
-        reached = hit != null;
+        if (hit != null) mode = "full";
       }
-      if (!reached) return notMeasured("base_not_proven_on_master");
-      let baseText: string | null = null;
+      // D1's render for the base push, when that push kept rows.
+      let d1Base: string | null = null;
       if (pointer.r2Key) {
         const d1 = await this.env.BLOBS.get(d1RenderKey(pointer.r2Key));
-        if (d1 && d1.customMetadata?.pushedBlobSha === pointer.blobSha) baseText = await d1.text();
+        if (d1 && d1.customMetadata?.pushedBlobSha === pointer.blobSha) d1Base = await d1.text();
       }
-      if (baseText == null) {
+      if (mode == null) {
+        if (d1Base == null) return notMeasured("base_not_proven_on_master");
+        mode = "carry";
+      }
+      let baseText = d1Base;
+      let onlyIds: Set<string> | null = null;
+      if (mode === "carry") {
+        if (d1Base == null) return notMeasured("carry_base_missing");
+        const pushed = await readVerifiedPushedRenderText(this.env, book, resource, pointer.r2Key, pointer.blobSha);
+        if (pushed == null) return notMeasured("base_unreadable");
+        onlyIds = keptIdsBetween(d1Base, pushed);
+      } else if (baseText == null) {
         baseText = await readVerifiedPushedRenderText(this.env, book, resource, pointer.r2Key, pointer.blobSha);
       }
       if (baseText == null) return notMeasured("base_unreadable");
-      const plan = planKeepMasterRows(rendered, baseText, masterTsv, resource);
+      const plan = planKeepMasterRows(rendered, baseText, masterTsv, resource, onlyIds);
       if (plan == null) return notMeasured("unparseable");
-      return { measured: true, plan, baseBlobSha: pointer.blobSha };
+      return { measured: true, plan, baseBlobSha: pointer.blobSha, mode };
     } catch (e) {
       console.error("export: keep-master guard failed; ships as before", {
         book,

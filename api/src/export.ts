@@ -1272,14 +1272,15 @@ export function tsvRevertReport(
 //
 // "Substantive" is the revert report's class (tsvRevertReport): a content
 // field differs after canonicalizeForRevertCompare. Whitespace-only and
-// Tags-only moves stay ours, as today. "Ours unchanged" uses the same
-// canonical compare, so a renderer tweak that only reflows whitespace does
-// not switch the guard off. Reference and ID are not content; Reference must
-// be byte-equal between ours and base for the row to count as unchanged.
+// Tags-only moves stay ours, as today. "Ours unchanged" ignores only NFC and
+// whitespace runs, so a renderer reflow does not switch the guard off but a
+// translator's Tags or line-break edit still counts as ours. Reference must be
+// byte-equal between ours and base for the row to count as unchanged.
 //
-// A row whose master Reference also moved is NOT kept: substituting it in
-// place would leave it under the wrong verse in our ordering. It is returned
-// in `moved`, and the caller refuses the push so a person decides.
+// A row Door43 moved to another Reference (with or without a text change) is
+// NOT kept: substituting it in place would leave it under the wrong verse in
+// our ordering, and shipping ours would undo the move. It is returned in
+// `moved`, and the caller refuses the push so a person decides.
 //
 // Only IDs that appear exactly once in all three files are considered. Fails
 // open (null) when any side does not parse, so the caller ships as today.
@@ -1302,10 +1303,16 @@ export interface KeepMasterPlan {
 // person re-syncs first (#1403).
 export const MASTER_MOVED_REFUSE_THRESHOLD = 20;
 
-function tsvRowsByUniqueId(raw: string): { rows: Map<string, string[]>; dupes: Set<string> } | null {
+// Null unless the header starts with exactly `headers`: the plan indexes cells
+// by position and splices master's raw line into ours, so a reordered or
+// foreign column layout must not be read as ours.
+function tsvRowsByUniqueId(
+  raw: string,
+  headers: readonly string[],
+): { rows: Map<string, string[]>; dupes: Set<string> } | null {
   const lines = raw.split(/\r?\n/).filter((l) => l.length > 0);
   if (lines.length === 0) return null;
-  if (lines[0].split("\t")[1] !== "ID") return null;
+  if (lines[0].split("\t").slice(0, headers.length).join("\t") !== headers.join("\t")) return null;
   const rows = new Map<string, string[]>();
   const dupes = new Set<string>();
   for (const line of lines.slice(1)) {
@@ -1323,38 +1330,56 @@ export function planKeepMasterRows(
   baseTsv: string,
   masterTsv: string,
   kind: "tn" | "tq" | "twl",
+  // Restrict the plan to these IDs (the rows an unproven push kept; see
+  // ExportWorkflow.masterMovedGuard). Absent = every row.
+  onlyIds: ReadonlySet<string> | null = null,
 ): KeepMasterPlan | null {
   const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
   const refIdx = headers.indexOf("Reference");
+  const tagsIdx = headers.indexOf("Tags");
   const contentIdx = headers
     .map((h, i) => (h === "Reference" || h === "ID" || h === "Tags" ? -1 : i))
     .filter((i) => i >= 0);
-  const ours = tsvRowsByUniqueId(renderedTsv);
-  const base = tsvRowsByUniqueId(baseTsv);
-  const master = tsvRowsByUniqueId(masterTsv);
+  const ours = tsvRowsByUniqueId(renderedTsv, headers);
+  const base = tsvRowsByUniqueId(baseTsv, headers);
+  const master = tsvRowsByUniqueId(masterTsv, headers);
   if (ours === null || base === null || master === null) return null;
+  // Did master move? The revert report's "substantive" test.
   const same = (a: string[], b: string[], i: number) =>
     canonicalizeForRevertCompare(a[i] ?? "") === canonicalizeForRevertCompare(b[i] ?? "");
+  // Did we move? Stricter: only NFC and whitespace runs are ignored (renderer
+  // churn). A literal `\n` line break and a Tags edit are a translator's
+  // change and must still ship.
+  const ourCanon = (s: string) => s.normalize("NFC").replace(/\s+/g, " ").trim();
+  const oursSame = (a: string[], b: string[], i: number) => ourCanon(a[i] ?? "") === ourCanon(b[i] ?? "");
   const kept: KeptMasterRow[] = [];
   const moved: KeptMasterRow[] = [];
   const keepLine = new Map<string, string>();
   for (const [id, oursCells] of ours.rows) {
+    if (onlyIds && !onlyIds.has(id)) continue;
     if (ours.dupes.has(id) || base.dupes.has(id) || master.dupes.has(id)) continue;
     const baseCells = base.rows.get(id);
     const masterCells = master.rows.get(id);
     if (!baseCells || !masterCells) continue; // new or deleted row: the shrink guard's territory
     const oursUnchanged =
-      (oursCells[refIdx] ?? "") === (baseCells[refIdx] ?? "") && contentIdx.every((i) => same(oursCells, baseCells, i));
+      (oursCells[refIdx] ?? "") === (baseCells[refIdx] ?? "") &&
+      [...contentIdx, tagsIdx].every((i) => oursSame(oursCells, baseCells, i));
     if (!oursUnchanged) continue; // we changed it: today's behaviour
     const fields = contentIdx.filter((i) => !same(masterCells, baseCells, i)).map((i) => headers[i]);
-    if (fields.length === 0) continue; // master did not move substantively
-    const row = { id, ref: masterCells[refIdx] ?? "", fields };
-    if ((masterCells[refIdx] ?? "") !== (baseCells[refIdx] ?? "")) {
+    const refMoved = (masterCells[refIdx] ?? "") !== (baseCells[refIdx] ?? "");
+    if (fields.length === 0 && !refMoved) continue; // master did not move substantively
+    const row = { id, ref: masterCells[refIdx] ?? "", fields: refMoved ? ["Reference", ...fields] : fields };
+    if (refMoved) {
+      // Door43 put this row under another verse; we cannot place it in our
+      // order, and shipping ours would undo the move. A person decides.
       moved.push(row);
       continue;
     }
     kept.push(row);
-    keepLine.set(id, masterCells.join("\t"));
+    const line = masterCells.slice();
+    // tn/tq Tags are blanked on every export (exportTags); keep that true here.
+    line[tagsIdx] = exportTags(kind, line[tagsIdx]);
+    keepLine.set(id, line.join("\t"));
   }
   if (keepLine.size === 0) return { content: renderedTsv, kept, moved };
   const lines = renderedTsv.split("\n");

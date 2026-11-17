@@ -339,6 +339,29 @@ console.log("\n[7. a step.do retry of an export that kept rows keeps them again]
   ok(noteOf(d.branch, "bb22") === "Door43 fix.", "the retry does not push D1's old text over the kept row");
 }
 
+console.log("\n[8. a push that kept rows but has not merged yet: the next push still keeps them (review F1)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  // Night 1 happened earlier than this second (read times are whole seconds,
+  // so a same-second night 2 would otherwise read as already confirmed).
+  t.sqlite
+    .prepare(`UPDATE book_resource_syncs SET pushed_read_at = pushed_read_at - 100, master_confirmed_at = master_confirmed_at - 100 WHERE book = ?`)
+    .run(BOOK);
+  d.master = editNote(d.master, "bb22", "Door43 fix.");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  await t.exportOne("export-night-2"); // keeps bb22, pushes aa11; PR not merged
+  const syncs = t.sqlite.prepare(`SELECT pushed_read_at, master_confirmed_at FROM book_resource_syncs WHERE book = ?`).get(BOOK);
+  ok(syncs.master_confirmed_at !== syncs.pushed_read_at, "(setup: night 2's push is not proven on master)");
+  ok(noteOf(d.branch, "bb22") === "Door43 fix.", "night 2 kept bb22");
+  // A lock & push before the PR merges: master still lacks aa11's edit.
+  d.branch = null;
+  await t.exportOne("export-lockpush");
+  ok(noteOf(d.branch, "bb22") === "Door43 fix.", "the unproven push's kept row is carried forward");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's unshipped edit still ships");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
