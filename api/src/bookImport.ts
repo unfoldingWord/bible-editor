@@ -25,8 +25,9 @@ import { reimportBookFromDcs, recordResourceSync, ALL_RESOURCES, type Resource }
 import { buildBookLintReport, parseLintChapter } from "./bookLintReport";
 import { effectiveBookLock, canManageLocks, requireAutoMergeConfirmation, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
-import { exportBranchOverrideValid, lockPushExportParams } from "./export";
+import { exportBranchOverrideValid } from "./export";
 import { LockPushBody } from "./exportRequestBodies";
+import { dispatchLockPush, lockPushAuditReason } from "./lockPush";
 import { refreshVerseMergeAlertsAfterLockChange } from "./verseMergeConflicts";
 import { PROVENANCE_COLUMNS, provenanceValues, resolveActorUsername } from "./rowProvenance.ts";
 
@@ -202,7 +203,8 @@ books.delete("/:book/lock", requireEditor, async (c) => {
 });
 
 // POST /api/books/:book/lock/push — push a just-locked book to Door43 right
-// now, across every resource, instead of waiting for the nightly export.
+// now, for the resources the admin ticked (all five when the body names
+// none, #1406), instead of waiting for the nightly export.
 // Scenario this exists for: a book is unlocked for an editor to fix
 // something, then re-locked — without this, those edits sit in D1 until the
 // next 05:30 UTC cron, or someone remembers to trigger a manual export.
@@ -268,6 +270,8 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
   // web/src/sync/api.ts's request() sets it unconditionally — which is why this
   // reads text() and parses by hand rather than trusting the header.)
   let branchName: string | undefined;
+  // #1406: absent = every resource, which is what every push did before.
+  let resources: readonly Resource[] = ALL_RESOURCES;
   {
     const text = await c.req.text().catch(() => "");
     if (text.trim()) {
@@ -280,6 +284,7 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
       const parsed = LockPushBody.safeParse(parsedBody);
       if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
       branchName = parsed.data.branchName;
+      if (parsed.data.resources) resources = parsed.data.resources;
     }
   }
   // Rejected here rather than left for the workflow to ignore. A silently
@@ -321,46 +326,19 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
     );
   }
 
-  // Each resource lives in its own DCS repo (RESOURCE_TARGETS in export.ts —
-  // en_tn/en_tq/en_twl/en_ult/en_ust), so the 5 creates below share no
-  // mutable state and can safely run concurrently rather than one at a time.
+  // Dispatch lives in lockPush.ts so "exactly the chosen resources, once each"
+  // is unit-tested against a fake workflow (lockPush.test.mjs).
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const pushed = await Promise.all(
-    ALL_RESOURCES.map(async (resource) => {
-      try {
-        const instance = await c.env.EXPORT_WORKFLOW.create({
-          id: `lock-push-${book}-${resource}-${stamp}`,
-          // See lockPushExportParams in export.ts for why staging must turn
-          // validateAndMerge off, and for the test that pins it.
-          params: lockPushExportParams(book, resource, branchName),
-        });
-        return { resource, instanceId: instance.id };
-      } catch (e) {
-        return { resource, error: e instanceof Error ? e.message : String(e) };
-      }
-    }),
-  );
+  const pushed = await dispatchLockPush(c.env.EXPORT_WORKFLOW, { book, resources, branchName, stamp });
 
   // Append-only audit row (migration 0051) — see the PUT /lock handler
   // above. Records that the allowLocked converge-push was invoked, not
   // that the book's lock state changed (it doesn't). `reason` carries the
-  // dispatch outcome ("dispatched N/total") rather than NULL, so a future
-  // investigator can't mistake a push where every create failed for one
-  // that actually ran.
+  // dispatch outcome and the resources it named (lockPushAuditReason) rather
+  // than NULL, so a future investigator can't mistake a push where every
+  // create failed for one that actually ran.
   try {
-    const dispatched = pushed.filter((p) => "instanceId" in p).length;
-    // Records WHICH intent ran, not just how many fired — "did this push go
-    // straight to master or wait for review?" is the first question anyone asks
-    // of a published book afterwards.
-    // "staged on X" only when something actually dispatched — at 0/5 nothing was
-    // staged anywhere, and an audit row claiming otherwise is the one place a
-    // later investigator has no way to check.
-    const outcome =
-      branchName && dispatched > 0
-        ? `dispatched ${dispatched}/${pushed.length} staged on ${branchName}`
-        : branchName
-          ? `dispatched 0/${pushed.length} (intended to stage on ${branchName})`
-          : `dispatched ${dispatched}/${pushed.length}`;
+    const outcome = lockPushAuditReason(pushed, branchName);
     await c.env.DB.prepare(
       `INSERT INTO book_lock_events (book, locked, reason, action, user_id) VALUES (?1, 1, ?2, 'lock_push', ?3)`,
     )
